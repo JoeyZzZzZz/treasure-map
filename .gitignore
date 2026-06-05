@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.installed.cfg
+*.egg
+build/
+dist/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+coverage.xml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project-specific - never commit
+workspaces/
+internal_data/
+*.db
+*.db-shm
+*.db-wal
+.env
+.env.local
+
+# Benchmark firmware (only ground_truth files are tracked)
+benchmarks/raw_firmware/
+benchmarks/extracted/
+
+# Logs
+*.log
+logs/
