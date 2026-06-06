@@ -2,13 +2,14 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """CLI wrapper for the analyze capability.
 
-Actual analysis logic lives in lib/analyze/pipeline.py.
-This file is a thin Click wrapper only.
+Thin Click wrapper only — all logic lives in lib/analyze/pipeline.py.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -40,25 +41,33 @@ def analyze(
     """Analyze an extracted firmware filesystem root.
 
     Produces an analysis.db in the workspace directory.
+    Resume-safe: re-running with the same --workspace skips completed steps.
     """
+    from treasure_map.lib.analyze.pipeline import run_analyze
     from treasure_map.lib.config.config import load_config
+    from treasure_map.lib.errors import GhidraNotFoundError
+    from treasure_map.lib.workspace.workspace import Workspace
 
     cfg = load_config(config)
-    logger.info("Starting analysis: fs_root=%s", fs_root)
+    # max_cost will wire into LLM cost guard in Week 3 (no LLM calls yet)
 
-    # Workspace setup
     if workspace is None:
-        import uuid
-
         ws_name = f"analyze_{fs_root.name}_{uuid.uuid4().hex[:8]}"
         workspace = cfg.workspace_dir / ws_name
-
-    from treasure_map.lib.workspace.workspace import Workspace
 
     def _progress(step: str, meta: dict[str, Any]) -> None:
         click.echo(f"  [{step}] {meta}")
 
-    with Workspace(workspace, progress_callback=_progress):
-        click.echo(f"Workspace: {workspace}")
-        # Analyze pipeline will be wired in Week 2 (lib/analyze/pipeline.py)
-        click.echo("analyze pipeline: not yet implemented (Week 2)")
+    click.echo(f"Workspace: {workspace}")
+
+    try:
+        with Workspace(workspace, progress_callback=_progress) as ws:
+            result = asyncio.run(run_analyze(fs_root, ws, cfg, _progress))
+    except GhidraNotFoundError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    click.echo(f"\nDone in {result.elapsed:.1f}s")
+    click.echo(f"  Binaries : {result.binary_count}")
+    click.echo(f"  Ghidra OK: {result.ghidra_ok}")
+    click.echo(f"  Ghidra ✗ : {result.ghidra_failed}")
+    click.echo(f"  DB       : {result.db_path}")

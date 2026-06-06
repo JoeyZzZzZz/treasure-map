@@ -74,8 +74,6 @@ def test_find_headless_env_var(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     hl.parent.mkdir()
     hl.write_text("#!/bin/sh")
     monkeypatch.setenv("GHIDRA_HOME", str(tmp_path))
-    monkeypatch.delenv("GHIDRA_HOME", raising=False)
-    monkeypatch.setenv("GHIDRA_HOME", str(tmp_path))
     assert find_headless(GhidraConfig()) == hl
 
 
@@ -160,7 +158,9 @@ def test_run_ghidra_success(tmp_path: Path) -> None:
 
     runner = _make_runner(tmp_path)
     with patch(f"{MODULE}._run_subprocess", fake_sub):
-        result = runner.run_ghidra(binary, output_dir, timeout=60, sha8=sha8)
+        result = runner.run_ghidra(
+            binary, output_dir, timeout=60, arch="x86:LE:64:default", sha8=sha8
+        )
 
     assert result.success is True
     assert result.output_file == output_dir / f"httpd_{sha8}_ghidra.json"
@@ -179,7 +179,9 @@ def test_run_ghidra_failure_no_output(tmp_path: Path) -> None:
 
     runner = _make_runner(tmp_path)
     with patch(f"{MODULE}._run_subprocess", fake_sub):
-        result = runner.run_ghidra(binary, output_dir, timeout=60, sha8="00000000")
+        result = runner.run_ghidra(
+            binary, output_dir, timeout=60, arch="x86:LE:64:default", sha8="00000000"
+        )
 
     assert result.success is False
     assert result.output_file is None
@@ -197,7 +199,9 @@ def test_run_ghidra_timeout(tmp_path: Path) -> None:
 
     runner = _make_runner(tmp_path)
     with patch(f"{MODULE}._run_subprocess", fake_sub):
-        result = runner.run_ghidra(binary, output_dir, timeout=5, sha8="00000000")
+        result = runner.run_ghidra(
+            binary, output_dir, timeout=5, arch="x86:LE:64:default", sha8="00000000"
+        )
 
     assert result.success is False
 
@@ -233,7 +237,9 @@ def test_run_ghidra_retries_on_import_failed(tmp_path: Path) -> None:
         patch(f"{MODULE}._run_subprocess", fake_sub),
         patch(f"{MODULE}._patch_elf_for_ghidra", fake_patch),
     ):
-        result = runner.run_ghidra(binary, output_dir, timeout=60, sha8=sha8)
+        result = runner.run_ghidra(
+            binary, output_dir, timeout=60, arch="x86:LE:64:default", sha8=sha8
+        )
 
     assert call_count == 2, f"Expected 2 subprocess calls, got {call_count}"
     assert result.success is True
@@ -257,7 +263,9 @@ def test_run_ghidra_no_retry_without_import_failed(tmp_path: Path) -> None:
 
     runner = _make_runner(tmp_path)
     with patch(f"{MODULE}._run_subprocess", fake_sub):
-        result = runner.run_ghidra(binary, output_dir, timeout=60, sha8=sha8)
+        result = runner.run_ghidra(
+            binary, output_dir, timeout=60, arch="x86:LE:64:default", sha8=sha8
+        )
 
     assert call_count == 1
     assert result.success is False

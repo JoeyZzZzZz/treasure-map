@@ -42,6 +42,7 @@ class GhidraResult:
     elapsed: float
     retried: bool = False
     log_path: Path | None = None
+    stderr_tail: str | None = None  # last 500 chars of stderr for debugging
 
 
 def find_headless(config: GhidraConfig) -> Path:
@@ -256,7 +257,7 @@ class GhidraRunner:
         binary: Path,
         output_dir: Path,
         timeout: int,
-        arch: str = "x86:LE:64:default",
+        arch: str,
         sha8: str = "",
     ) -> GhidraResult:
         """Run analyzeHeadless on a single binary with at most one retry.
@@ -278,6 +279,7 @@ class GhidraRunner:
                 success=True,
                 elapsed=r1.elapsed,
                 log_path=r1.log_path,
+                stderr_tail=r1.stderr_tail,
             )
 
         import_failed = False
@@ -301,6 +303,7 @@ class GhidraRunner:
                             elapsed=r1.elapsed + r2.elapsed,
                             retried=True,
                             log_path=r2.log_path,
+                            stderr_tail=r2.stderr_tail,
                         )
                 finally:
                     shutil.rmtree(tmpdir, ignore_errors=True)
@@ -312,6 +315,7 @@ class GhidraRunner:
             elapsed=r1.elapsed,
             retried=import_failed,
             log_path=r1.log_path,
+            stderr_tail=r1.stderr_tail,
         )
 
     def _run_once(
@@ -341,8 +345,9 @@ class GhidraRunner:
             "JAVA_TOOL_OPTIONS": f"-Xmx{heap_mb}m -Xms{xms_mb}m -Duser.home={ghidra_home_dir}",
         }
 
+        stderr_raw = ""
         try:
-            _run_subprocess(cmd, env, timeout + 60)
+            _, stderr_raw = _run_subprocess(cmd, env, timeout + 60)
         finally:
             shutil.rmtree(proj_dir, ignore_errors=True)
             shutil.rmtree(ghidra_home_dir, ignore_errors=True)
@@ -358,6 +363,7 @@ class GhidraRunner:
             success=success,
             elapsed=elapsed,
             log_path=log_path if log_path.exists() else None,
+            stderr_tail=stderr_raw if stderr_raw else None,
         )
 
     def run_all(
@@ -366,7 +372,12 @@ class GhidraRunner:
         output_dir: Path,
         progress_callback: ProgressCallback | None = None,
     ) -> list[GhidraResult]:
-        """Parallel Ghidra dispatch; pool size = config.max_parallel_jvms."""
+        """Parallel Ghidra dispatch; pool size = config.max_parallel_jvms.
+
+        Discovers analyzeHeadless once before spawning threads so
+        GhidraNotFoundError is raised immediately rather than N times.
+        """
+        self.get_headless()  # fail-fast: raise GhidraNotFoundError before any thread work
         output_dir.mkdir(parents=True, exist_ok=True)
         results: list[GhidraResult] = []
         n = len(records)
