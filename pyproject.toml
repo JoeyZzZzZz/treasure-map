@@ -1,6 +1,6 @@
 [project]
 name = "treasure-map"
-version = "0.0.1"
+version = "0.1.0"
 description = "IoT firmware patch diff and exploit-path discovery"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -18,10 +18,21 @@ classifiers = [
 ]
 
 dependencies = [
-    # 暂时空,后续按需添加
+    "pyelftools>=0.31",
+    "openai>=1.30",
+    "anthropic>=0.28",
+    "pydantic>=2.7",
+    "pyyaml>=6.0",
+    "click>=8.1",
+    "aiohttp>=3.9",
+    "aiosqlite>=0.20",
 ]
 
 [project.optional-dependencies]
+rag = [
+    "chromadb>=0.5",
+    "sentence-transformers>=3.0",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
@@ -50,6 +61,7 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP"]
+ignore = ["N999"]
 
 [tool.mypy]
 python_version = "3.11"

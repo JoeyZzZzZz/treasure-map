@@ -1,0 +1,50 @@
+# Treasure Map configuration example
+# Copy to ~/.treasure-map/config.yaml and fill in your API keys.
+
+llm:
+  # Tier → provider+model mapping. This is the only place users need to configure.
+  tiers:
+    S:
+      provider: deepseek
+      model: deepseek-chat
+      base_url: https://api.deepseek.com
+      api_key_env: DEEPSEEK_API_KEY
+      max_cost_per_call_usd: 0.01
+    M:
+      provider: deepseek
+      model: deepseek-reasoner
+      base_url: https://api.deepseek.com
+      api_key_env: DEEPSEEK_API_KEY
+      max_cost_per_call_usd: 0.10
+    L:
+      provider: anthropic
+      model: claude-opus-4-7
+      base_url: https://api.anthropic.com/v1
+      api_key_env: ANTHROPIC_API_KEY
+      max_cost_per_call_usd: 1.00
+
+  cost_guards:
+    max_cost_per_run_usd: 5.0
+    max_cost_per_day_usd: 20.0
+    require_confirm_above_usd: 1.0
+
+  cache:
+    enabled: true
+    path: ~/.treasure-map/llm_cache.db
+
+  concurrency:
+    S: 50
+    M: 20
+    L: 5
+
+  retry:
+    max_attempts: 4
+    backoff_base_seconds: 5
+
+ghidra:
+  home: /opt/ghidra
+  headless_timeout_seconds: 300
+  max_parallel_jvms: 4
+
+workspace_dir: ~/.treasure-map/workspaces
+log_level: INFO
