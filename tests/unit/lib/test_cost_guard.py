@@ -40,9 +40,7 @@ def test_run_limit_triggers_stop(tmp_path):
 
 def test_l3_circuit_breaker(tmp_path):
     guard = _make_guard(tmp_path)
-    guard.record_call(
-        "function_summary", "S", 0.50, "deepseek-chat", max_cost_per_call_usd=0.01
-    )
+    guard.record_call("function_summary", "S", 0.50, "deepseek-chat", max_cost_per_call_usd=0.01)
     assert guard.is_task_blocked("function_summary")
 
 

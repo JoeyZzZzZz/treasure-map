@@ -6,6 +6,7 @@ These tests do NOT make real network requests. They verify that the full
 stack (cache → guard → provider → record → cache-write) works end-to-end
 using a mock provider.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass

@@ -1,6 +1,7 @@
 # Copyright (C) 2025-2026 JoeyZzZzZz
 # SPDX-License-Identifier: AGPL-3.0-only
 """Build a fully wired LLMRouter from a Config object."""
+
 from __future__ import annotations
 
 from pathlib import Path

@@ -30,9 +30,7 @@ class CostLimitReachedError(CostGuardError):
         self.limit_type = limit_type
         self.limit_usd = limit_usd
         self.actual_usd = actual_usd
-        super().__init__(
-            f"{limit_type} limit ${limit_usd:.4f} exceeded (actual ${actual_usd:.4f})"
-        )
+        super().__init__(f"{limit_type} limit ${limit_usd:.4f} exceeded (actual ${actual_usd:.4f})")
 
 
 class UnknownTaskError(TreasureMapError):

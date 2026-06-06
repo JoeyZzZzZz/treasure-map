@@ -140,8 +140,16 @@ class LLMCache:
                    (cache_key, task_type, input_hash, prompt_version,
                     model_id, tier, response_json, cost_usd)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (key, task_type, ih, prompt_version, model_id, tier, json.dumps(response),
-                 cost_usd),
+                (
+                    key,
+                    task_type,
+                    ih,
+                    prompt_version,
+                    model_id,
+                    tier,
+                    json.dumps(response),
+                    cost_usd,
+                ),
             )
             self._conn.commit()
         except sqlite3.Error as exc:

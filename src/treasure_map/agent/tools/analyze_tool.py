@@ -4,6 +4,7 @@
 
 Thin wrapper only — calls lib/analyze/pipeline.py (to be implemented in Week 2).
 """
+
 from __future__ import annotations
 
 import logging

@@ -38,7 +38,7 @@ dev = [
     "pytest-asyncio>=0.23",
     "pytest-cov>=4.1",
     "ruff>=0.4",
-    "mypy>=1.10",
+    "mypy>=1.10,<2.0",
 ]
 
 [project.scripts]
@@ -66,3 +66,11 @@ ignore = ["N999"]
 [tool.mypy]
 python_version = "3.11"
 strict = true
+
+[[tool.mypy.overrides]]
+module = "elftools.*"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "treasure_map.lib.analyze.elf_inventory"
+disable_error_code = ["no-untyped-call"]

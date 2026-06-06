@@ -18,8 +18,8 @@ logger = logging.getLogger(__name__)
 class ElfRecord:
     path: Path
     name: str
-    arch: str                          # Ghidra processor string, e.g. ARM:LE:32:v7
-    elf_type: str                      # executable / shared_library / relocatable
+    arch: str  # Ghidra processor string, e.g. ARM:LE:32:v7
+    elf_type: str  # executable / shared_library / relocatable
     sha256: str
     dt_needed: list[str] = field(default_factory=list)
     protections: dict[str, object] = field(default_factory=dict)
@@ -36,7 +36,7 @@ def detect_arch(elf_path: Path) -> str | None:
     """Return a Ghidra-compatible processor string, or None on failure."""
     try:
         with elf_path.open("rb") as f:
-            elf = ELFFile(f)  # type: ignore[no-untyped-call]
+            elf = ELFFile(f)
             mach = elf.header.e_machine
             ei_cls = elf.elfclass  # 32 or 64
             endian = "LE" if elf.little_endian else "BE"
@@ -62,7 +62,7 @@ def detect_arch(elf_path: Path) -> str | None:
 def get_elf_type(elf_path: Path) -> str:
     try:
         with elf_path.open("rb") as f:
-            elf = ELFFile(f)  # type: ignore[no-untyped-call]
+            elf = ELFFile(f)
             return {
                 "ET_EXEC": "executable",
                 "ET_DYN": "shared_library",
@@ -77,9 +77,9 @@ def has_loadable_segments(elf_path: Path) -> bool:
     try:
         file_size = elf_path.stat().st_size
         with elf_path.open("rb") as f:
-            elf = ELFFile(f)  # type: ignore[no-untyped-call]
+            elf = ELFFile(f)
             has_load = False
-            for seg in elf.iter_segments():  # type: ignore[no-untyped-call]
+            for seg in elf.iter_segments():
                 if seg.header.p_type != "PT_LOAD" or seg.header.p_filesz == 0:
                     continue
                 if seg.header.p_offset + seg.header.p_filesz > file_size:
@@ -95,8 +95,8 @@ def get_dt_needed(elf_path: Path) -> list[str]:
     deps: list[str] = []
     try:
         with elf_path.open("rb") as f:
-            elf = ELFFile(f)  # type: ignore[no-untyped-call]
-            dyn = elf.get_section_by_name(".dynamic")  # type: ignore[no-untyped-call]
+            elf = ELFFile(f)
+            dyn = elf.get_section_by_name(".dynamic")
             if dyn:
                 for tag in dyn.iter_tags():
                     if tag.entry.d_tag == "DT_NEEDED":
@@ -117,8 +117,8 @@ def get_protections(elf_path: Path) -> dict[str, object]:
     }
     try:
         with elf_path.open("rb") as f:
-            elf = ELFFile(f)  # type: ignore[no-untyped-call]
-            segments = list(elf.iter_segments())  # type: ignore[no-untyped-call]
+            elf = ELFFile(f)
+            segments = list(elf.iter_segments())
 
             # NX: PT_GNU_STACK present and PF_X not set
             for seg in segments:
@@ -133,7 +133,7 @@ def get_protections(elf_path: Path) -> dict[str, object]:
             # RELRO: PT_GNU_RELRO = partial; DT_BIND_NOW or DT_FLAGS BIND_NOW = full
             if any(s.header.p_type == "PT_GNU_RELRO" for s in segments):
                 result["relro"] = "partial"
-                dyn = elf.get_section_by_name(".dynamic")  # type: ignore[no-untyped-call]
+                dyn = elf.get_section_by_name(".dynamic")
                 if dyn:
                     for tag in dyn.iter_tags():
                         if tag.entry.d_tag == "DT_BIND_NOW":
@@ -144,7 +144,7 @@ def get_protections(elf_path: Path) -> dict[str, object]:
                             break
 
             # Canary + Fortify: look for undefined dynamic symbols
-            for section in elf.iter_sections():  # type: ignore[no-untyped-call]
+            for section in elf.iter_sections():
                 if section.header.sh_type == "SHT_DYNSYM":
                     for sym in section.iter_symbols():
                         if sym.entry.st_shndx == "SHN_UNDEF" and sym.name:

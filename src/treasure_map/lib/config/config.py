@@ -59,7 +59,7 @@ class CacheConfig(BaseModel):
 
 
 class ConcurrencyConfig(BaseModel):
-    S: int = 8   # conservative default; raise to 50 if your DeepSeek tier allows it
+    S: int = 8  # conservative default; raise to 50 if your DeepSeek tier allows it
     M: int = 20
     L: int = 5
 
@@ -78,7 +78,7 @@ class LLMConfig(BaseModel):
 
 
 class GhidraMode(StrEnum):
-    LOCAL = "local"    # M1 implemented
+    LOCAL = "local"  # M1 implemented
     DOCKER = "docker"  # M4 planned
     REMOTE = "remote"  # M4 planned
 

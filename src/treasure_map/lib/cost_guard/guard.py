@@ -57,7 +57,8 @@ class CostGuard:
         self._run_limit = (
             agent_max_cost_usd
             if agent_mode and agent_max_cost_usd is not None
-            else min(0.50, config.max_cost_per_run_usd) if agent_mode
+            else min(0.50, config.max_cost_per_run_usd)
+            if agent_mode
             else config.max_cost_per_run_usd
         )
 
@@ -153,12 +154,8 @@ class CostGuard:
 
         # Accumulate
         self._run_stats.total_calls += 1
-        self._run_stats.total_cost_usd = round(
-            self._run_stats.total_cost_usd + cost_usd, 6
-        )
-        self._run_stats.by_tier[tier] = round(
-            self._run_stats.by_tier.get(tier, 0.0) + cost_usd, 6
-        )
+        self._run_stats.total_cost_usd = round(self._run_stats.total_cost_usd + cost_usd, 6)
+        self._run_stats.by_tier[tier] = round(self._run_stats.by_tier.get(tier, 0.0) + cost_usd, 6)
         self._run_stats.by_task[task_type] = self._run_stats.by_task.get(task_type, 0) + 1
 
         # L5: persist to daily ledger

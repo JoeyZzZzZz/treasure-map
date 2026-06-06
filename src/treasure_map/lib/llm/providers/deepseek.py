@@ -1,6 +1,7 @@
 # Copyright (C) 2025-2026 JoeyZzZzZz
 # SPDX-License-Identifier: AGPL-3.0-only
 """DeepSeek provider — thin wrapper around OpenAICompatProvider."""
+
 from __future__ import annotations
 
 from treasure_map.lib.config.config import TierConfig

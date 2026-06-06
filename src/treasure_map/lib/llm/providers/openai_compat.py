@@ -1,6 +1,7 @@
 # Copyright (C) 2025-2026 JoeyZzZzZz
 # SPDX-License-Identifier: AGPL-3.0-only
 """OpenAI-compatible HTTP client (used by DeepSeek and any OpenAI-compat endpoint)."""
+
 from __future__ import annotations
 
 import logging
@@ -16,7 +17,7 @@ logger = logging.getLogger(__name__)
 # Pricing is approximate and changes over time; used only for cost estimation.
 # Actual cost is computed from usage tokens when the API returns them.
 _COST_PER_1M_TOKENS: dict[str, tuple[float, float]] = {
-    "deepseek-chat": (0.27, 1.10),       # input, output per 1M tokens
+    "deepseek-chat": (0.27, 1.10),  # input, output per 1M tokens
     "deepseek-reasoner": (0.55, 2.19),
 }
 _DEFAULT_COST = (0.50, 2.00)
@@ -82,6 +83,10 @@ class OpenAICompatProvider:
             cost_usd=cost,
             cached=False,
             tier=self._tier,
-            raw={"usage": {"prompt_tokens": usage.prompt_tokens if usage else 0,
-                           "completion_tokens": usage.completion_tokens if usage else 0}},
+            raw={
+                "usage": {
+                    "prompt_tokens": usage.prompt_tokens if usage else 0,
+                    "completion_tokens": usage.completion_tokens if usage else 0,
+                }
+            },
         )

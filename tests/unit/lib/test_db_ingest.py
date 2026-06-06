@@ -81,9 +81,7 @@ def test_open_db_creates_schema(tmp_path):
     conn = open_db(tmp_path / "new.db")
     tables = {
         row[0]
-        for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     }
     assert "binaries" in tables
     assert "functions" in tables

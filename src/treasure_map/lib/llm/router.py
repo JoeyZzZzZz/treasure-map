@@ -159,9 +159,7 @@ class LLMRouter:
                     return
                 prompt = prompt_builder([item])
                 try:
-                    results[idx] = await self.call(
-                        task, item.input_text, prompt, prompt_version
-                    )
+                    results[idx] = await self.call(task, item.input_text, prompt, prompt_version)
                 except (CostLimitReachedError, ProviderError) as exc:
                     logger.warning("Item %s failed: %s", item.id, exc)
                 finally:

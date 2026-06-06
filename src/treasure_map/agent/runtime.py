@@ -4,6 +4,7 @@
 
 Week 1 stub: scaffolds the class interface. Real implementation in Week 2+.
 """
+
 from __future__ import annotations
 
 import logging

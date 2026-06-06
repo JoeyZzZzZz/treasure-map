@@ -1,6 +1,7 @@
 # Copyright (C) 2025-2026 JoeyZzZzZz
 # SPDX-License-Identifier: AGPL-3.0-only
 """Anthropic (Claude) provider using the native Anthropic SDK."""
+
 from __future__ import annotations
 
 import logging
@@ -65,10 +66,12 @@ class AnthropicProvider:
             cost_usd=cost,
             cached=False,
             tier=self._tier,
-            raw={"usage": {
-                "input_tokens": usage.input_tokens,
-                "output_tokens": usage.output_tokens,
-            }},
+            raw={
+                "usage": {
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                }
+            },
         )
 
 

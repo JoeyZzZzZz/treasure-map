@@ -26,11 +26,13 @@ LIBZ_ELF = FIXTURES / "libz_x86_64.so"
 
 # ── helpers ────────────────────────────────────────────────────────────────────
 
+
 def _skip_if_missing(path: Path) -> pytest.MarkDecorator:
     return pytest.mark.skipif(not path.exists(), reason=f"fixture missing: {path}")
 
 
 # ── detect_arch ────────────────────────────────────────────────────────────────
+
 
 @_skip_if_missing(TRUE_ELF)
 def test_detect_arch_x86_64(tmp_path):
@@ -50,6 +52,7 @@ def test_detect_arch_non_elf(tmp_path):
 
 # ── get_elf_type ───────────────────────────────────────────────────────────────
 
+
 @_skip_if_missing(TRUE_ELF)
 def test_get_elf_type_executable():
     # true_x86_64 is a PIE (ET_DYN with interpreter), but raw type check is ET_DYN
@@ -64,6 +67,7 @@ def test_get_elf_type_shared_library():
 
 # ── has_loadable_segments ──────────────────────────────────────────────────────
 
+
 @_skip_if_missing(TRUE_ELF)
 def test_has_loadable_segments_real_elf():
     assert has_loadable_segments(TRUE_ELF) is True
@@ -77,6 +81,7 @@ def test_has_loadable_segments_empty_file(tmp_path):
 
 # ── sha256_file ────────────────────────────────────────────────────────────────
 
+
 def test_sha256_file(tmp_path):
     f = tmp_path / "data.bin"
     f.write_bytes(b"hello world")
@@ -85,6 +90,7 @@ def test_sha256_file(tmp_path):
 
 
 # ── get_dt_needed ──────────────────────────────────────────────────────────────
+
 
 @_skip_if_missing(TRUE_ELF)
 def test_get_dt_needed_has_entries():
@@ -95,6 +101,7 @@ def test_get_dt_needed_has_entries():
 
 
 # ── get_protections ────────────────────────────────────────────────────────────
+
 
 @_skip_if_missing(TRUE_ELF)
 def test_get_protections_keys():
@@ -110,6 +117,7 @@ def test_get_protections_true_has_pie():
 
 
 # ── scan_filesystem ────────────────────────────────────────────────────────────
+
 
 @_skip_if_missing(TRUE_ELF)
 def test_scan_filesystem_finds_elfs(tmp_path):
@@ -166,6 +174,7 @@ def test_scan_filesystem_skips_symlinks(tmp_path):
 
 # ── ElfRecord helpers ──────────────────────────────────────────────────────────
 
+
 def test_elf_record_json_helpers():
     rec = ElfRecord(
         path=Path("/fake/bin/foo"),
@@ -174,8 +183,13 @@ def test_elf_record_json_helpers():
         elf_type="executable",
         sha256="abc123",
         dt_needed=["libc.so.0", "libssl.so.1"],
-        protections={"nx": True, "pie": False, "canary": True, "relro": "partial",
-                     "fortify": False},
+        protections={
+            "nx": True,
+            "pie": False,
+            "canary": True,
+            "relro": "partial",
+            "fortify": False,
+        },
         size=12345,
     )
     assert '"libc.so.0"' in rec.dt_needed_json()

@@ -5,6 +5,7 @@
 Adding a new task: add one entry here. Calling router.call() with an
 unregistered task name raises UnknownTaskError immediately.
 """
+
 from __future__ import annotations
 
 from treasure_map.lib.llm.types import Tier
