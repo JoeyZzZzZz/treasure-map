@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Any
 
 import click
 
@@ -50,7 +51,7 @@ def analyze(
 
     from treasure_map.lib.workspace.workspace import Workspace
 
-    def _progress(step: str, meta: dict) -> None:
+    def _progress(step: str, meta: dict[str, Any]) -> None:
         click.echo(f"  [{step}] {meta}")
 
     with Workspace(workspace, progress_callback=_progress):

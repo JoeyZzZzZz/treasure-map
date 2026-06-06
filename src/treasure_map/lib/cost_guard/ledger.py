@@ -6,6 +6,7 @@ import json
 import logging
 from datetime import date
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +26,7 @@ class CostLedger:
 
     def __init__(self, ledger_path: Path) -> None:
         self.ledger_path = ledger_path
-        self._data: dict[str, dict] = {}
+        self._data: dict[str, dict[str, Any]] = {}
         self._load()
 
     def _load(self) -> None:
@@ -47,7 +48,8 @@ class CostLedger:
 
     def today_total(self) -> float:
         today = _today()
-        return self._data.get(today, {}).get("total_usd", 0.0)
+        day: dict[str, Any] = self._data.get(today, {})
+        return float(day.get("total_usd", 0.0))
 
     def record(self, tier: str, cost_usd: float) -> None:
         today = _today()
@@ -57,5 +59,5 @@ class CostLedger:
         tiers[tier] = round(tiers.get(tier, 0.0) + cost_usd, 6)
         self._save()
 
-    def snapshot(self) -> dict:
+    def snapshot(self) -> dict[str, Any]:
         return dict(self._data)

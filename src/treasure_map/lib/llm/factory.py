@@ -10,7 +10,7 @@ from treasure_map.lib.cost_guard.guard import CostGuard
 from treasure_map.lib.llm.providers.anthropic import build_anthropic_provider
 from treasure_map.lib.llm.providers.deepseek import build_deepseek_provider
 from treasure_map.lib.llm.providers.openai_compat import OpenAICompatProvider
-from treasure_map.lib.llm.router import LLMRouter
+from treasure_map.lib.llm.router import LLMProvider, LLMRouter
 from treasure_map.lib.llm.types import Tier
 from treasure_map.lib.llm_cache.cache import LLMCache
 
@@ -18,7 +18,7 @@ _ANTHROPIC_PROVIDERS = {"anthropic"}
 _DEEPSEEK_PROVIDERS = {"deepseek"}
 
 
-def _build_provider(tier: Tier, cfg: LLMConfig):
+def _build_provider(tier: Tier, cfg: LLMConfig) -> LLMProvider:
     tier_cfg = getattr(cfg.tiers, tier.value)
     provider_name = tier_cfg.provider.lower()
 

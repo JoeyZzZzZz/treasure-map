@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, cast
 
 from openai import APIError, AsyncOpenAI, RateLimitError
 
@@ -59,7 +59,7 @@ class OpenAICompatProvider:
         try:
             resp = await self._client.chat.completions.create(
                 model=self._model,
-                messages=messages,
+                messages=cast("Any", messages),
                 max_tokens=max_tokens,
                 temperature=0,
             )

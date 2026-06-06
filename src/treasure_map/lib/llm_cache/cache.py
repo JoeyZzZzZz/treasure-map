@@ -8,7 +8,7 @@ import logging
 import re
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from treasure_map.lib.errors import LLMCacheError
 
@@ -119,7 +119,7 @@ class LLMCache:
         except sqlite3.Error as exc:
             logger.warning("Failed to update hit metadata: %s", exc)
         logger.debug("Cache hit: task=%s pv=%s", task_type, prompt_version)
-        return json.loads(row["response_json"])  # type: ignore[return-value]
+        return cast("dict[str, Any]", json.loads(row["response_json"]))
 
     def set(
         self,
