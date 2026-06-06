@@ -33,7 +33,7 @@ llm:
     path: ~/.treasure-map/llm_cache.db
 
   concurrency:
-    S: 50
+    S: 8    # safe default for DeepSeek free tier; raise to 50 if you have a paid plan
     M: 20
     L: 5
 
@@ -42,9 +42,19 @@ llm:
     backoff_base_seconds: 5
 
 ghidra:
-  home: /opt/ghidra
+  mode: local    # local | docker (M4) | remote (M4)
   headless_timeout_seconds: 300
   max_parallel_jvms: 4
+
+  local:
+    home: ~      # null = auto-discover via GHIDRA_HOME env or PATH; or set explicit path
+    # home: /path/to/ghidra_11.2
+
+  docker:        # only used when mode: docker (M4)
+    image: ghcr.io/joeyz/treasure-map-ghidra:11.2
+
+  remote:        # only used when mode: remote (M4)
+    endpoint: http://localhost:8080
 
 workspace_dir: ~/.treasure-map/workspaces
 log_level: INFO

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -58,7 +59,7 @@ class CacheConfig(BaseModel):
 
 
 class ConcurrencyConfig(BaseModel):
-    S: int = 50
+    S: int = 8   # conservative default; raise to 50 if your DeepSeek tier allows it
     M: int = 20
     L: int = 5
 
@@ -76,15 +77,38 @@ class LLMConfig(BaseModel):
     retry: RetryConfig = Field(default_factory=RetryConfig)
 
 
-class GhidraConfig(BaseModel):
-    home: Path = Field(default_factory=lambda: Path("/opt/ghidra"))
-    headless_timeout_seconds: int = 300
-    max_parallel_jvms: int = 4
+class GhidraMode(StrEnum):
+    LOCAL = "local"    # M1 implemented
+    DOCKER = "docker"  # M4 planned
+    REMOTE = "remote"  # M4 planned
+
+
+class GhidraLocalConfig(BaseModel):
+    home: Path | None = None  # None = use discovery mechanism (see ghidra_runner.py)
 
     @field_validator("home", mode="before")
     @classmethod
-    def expand_path(cls, v: Any) -> Path:
+    def expand_home(cls, v: Any) -> Path | None:
+        if v is None:
+            return None
         return Path(os.path.expanduser(str(v)))
+
+
+class GhidraDockerConfig(BaseModel):
+    image: str = "ghcr.io/joeyz/treasure-map-ghidra:11.2"
+
+
+class GhidraRemoteConfig(BaseModel):
+    endpoint: str = "http://localhost:8080"
+
+
+class GhidraConfig(BaseModel):
+    mode: GhidraMode = GhidraMode.LOCAL
+    headless_timeout_seconds: int = 300
+    max_parallel_jvms: int = 4
+    local: GhidraLocalConfig = Field(default_factory=GhidraLocalConfig)
+    docker: GhidraDockerConfig = Field(default_factory=GhidraDockerConfig)
+    remote: GhidraRemoteConfig = Field(default_factory=GhidraRemoteConfig)
 
 
 class Config(BaseModel):
