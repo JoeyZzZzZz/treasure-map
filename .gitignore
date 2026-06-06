@@ -51,3 +51,11 @@ benchmarks/extracted/
 # Logs
 *.log
 logs/
+# Private content — never commit to public repo
+internal/
+private/
+.notes/
+SECRETS.md
+TODO-PRIVATE.md
+*-PRIVATE.md
+*.private.*
