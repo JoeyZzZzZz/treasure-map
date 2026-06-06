@@ -121,6 +121,13 @@ def _step_ghidra(
     logger.info("ghidra: analyzing %d binaries", len(records))
     results = runner.run_all(records, ghidra_output_dir, progress_callback)
 
+    if len(results) != len(records):
+        logger.warning(
+            "ghidra: run_all returned %d results for %d records — possible runner bug",
+            len(results),
+            len(records),
+        )
+
     ok = sum(1 for r in results if r.success)
     failed = len(results) - ok
     workspace.mark_done("ghidra", {"ok": ok, "failed": failed})

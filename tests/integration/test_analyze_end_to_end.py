@@ -61,10 +61,6 @@ def test_round1_find_elfs_self_test(tmp_path: Path) -> None:
     cfg = Config()
     runner = _mock_runner()
 
-    with patch(_PIPELINE_MODULE + ".GhidraRunner", return_value=runner):
-        with patch(_PIPELINE_MODULE + ".scan_filesystem", wraps=shutil.__class__) as _:
-            pass
-
     # Use real scan_filesystem; only mock GhidraRunner
     with patch(_PIPELINE_MODULE + ".GhidraRunner", return_value=runner) as mock_runner_cls:
         mock_runner_cls.return_value = runner
