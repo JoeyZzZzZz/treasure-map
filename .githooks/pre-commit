@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+SENSITIVE=$(git diff --cached --name-only | grep -E "^internal/|^private/|^\.notes/|\.private\.|SECRETS\.|-PRIVATE\.")
+if [ -n "$SENSITIVE" ]; then
+    echo ""
+    echo "❌ COMMIT BLOCKED — sensitive paths in staged changes:"
+    echo ""
+    echo "$SENSITIVE" | sed 's/^/  /'
+    echo ""
+    echo "If genuinely intentional:  git commit --no-verify"
+    echo ""
+    exit 1
+fi
