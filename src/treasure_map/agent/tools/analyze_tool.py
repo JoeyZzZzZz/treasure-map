@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+ProgressCallback = Callable[[str, dict[str, Any]], None]
 
 TOOL_SCHEMA = {
     "name": "analyze_firmware",
@@ -32,10 +35,6 @@ TOOL_SCHEMA = {
                 "type": "string",
                 "description": "Optional workspace directory path. Created if absent.",
             },
-            "max_cost_usd": {
-                "type": "number",
-                "description": "Maximum LLM spend for this call (default: 0.50).",
-            },
         },
         "required": ["fs_root"],
     },
@@ -45,7 +44,7 @@ TOOL_SCHEMA = {
 async def analyze_firmware(
     fs_root: str,
     workspace: str | None = None,
-    max_cost_usd: float = 0.50,
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     """Entry point called by the agent runtime."""
     from treasure_map.lib.analyze.pipeline import run_analyze
@@ -58,8 +57,6 @@ async def analyze_firmware(
         return {"status": "error", "message": f"fs_root is not a directory: {fs_root}"}
 
     cfg = load_config()
-    # max_cost_usd will wire into LLM cost guard in Week 3 (no LLM calls yet)
-
     ws_path = (
         Path(workspace)
         if workspace
@@ -68,7 +65,7 @@ async def analyze_firmware(
 
     try:
         with Workspace(ws_path) as ws:
-            result = await run_analyze(fs_path, ws, cfg)
+            result = await run_analyze(fs_path, ws, cfg, progress_callback)
     except GhidraNotFoundError as exc:
         return {"status": "error", "message": str(exc)}
     except Exception as exc:

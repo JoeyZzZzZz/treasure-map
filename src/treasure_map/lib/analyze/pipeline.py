@@ -9,7 +9,9 @@ ingestion and LLM calls are Week 3+.
 
 from __future__ import annotations
 
+import json
 import logging
+import sqlite3
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -58,8 +60,7 @@ async def run_analyze(
     runner = GhidraRunner(config.ghidra)
     runner.get_headless()
 
-    db_path = workspace.path / "analysis.db"
-    conn = open_db(db_path)
+    conn = open_db(workspace.db_path)
     try:
         records = _step_find_elfs(fs_root, conn, workspace, progress_callback)
         ghidra_ok, ghidra_failed = _step_ghidra(
@@ -69,7 +70,7 @@ async def run_analyze(
         conn.close()
 
     return AnalyzeResult(
-        db_path=db_path,
+        db_path=workspace.db_path,
         binary_count=len(records),
         ghidra_ok=ghidra_ok,
         ghidra_failed=ghidra_failed,
@@ -79,7 +80,7 @@ async def run_analyze(
 
 def _step_find_elfs(
     fs_root: Path,
-    conn: Any,
+    conn: sqlite3.Connection,
     workspace: Workspace,
     progress_callback: ProgressCallback | None,
 ) -> list[ElfRecord]:
@@ -127,17 +128,25 @@ def _step_ghidra(
     return ok, failed
 
 
-def _load_records_from_db(conn: Any) -> list[ElfRecord]:
-    """Reconstruct ElfRecord list from the binaries table for resume."""
-    rows = conn.execute("SELECT name, path, arch, sha256, file_type FROM binaries").fetchall()
+def _load_records_from_db(conn: sqlite3.Connection) -> list[ElfRecord]:
+    """Reconstruct ElfRecord list from the binaries table for resume.
+
+    Restores dt_needed and protections from their JSON columns so that
+    downstream steps (Week 3+ xrefs) have complete data without re-scanning.
+    """
+    rows = conn.execute(
+        "SELECT name, path, arch, sha256, file_type, dt_needed, protections FROM binaries"
+    ).fetchall()
     return [
         ElfRecord(
             path=Path(row["path"] or ""),
             name=row["name"],
-            arch=row["arch"] or "x86:LE:64:default",
+            arch=row["arch"],  # NULL rows already filtered below
             elf_type=row["file_type"] or "unknown",
             sha256=row["sha256"],
+            dt_needed=json.loads(row["dt_needed"]) if row["dt_needed"] else [],
+            protections=json.loads(row["protections"]) if row["protections"] else {},
         )
         for row in rows
-        if row["arch"]  # skip rows with NULL arch (shouldn't happen, but be safe)
+        if row["arch"]  # skip rows with NULL arch (shouldn't happen, but be defensive)
     ]

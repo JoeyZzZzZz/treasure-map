@@ -124,6 +124,11 @@ class Workspace:
 
     # ── internals ─────────────────────────────────────────────────────────────
 
+    @property
+    def db_path(self) -> Path:
+        """Path to the analysis SQLite database inside this workspace."""
+        return self.path / "analysis.db"
+
     def _assert_open(self) -> None:
         if self._conn is None:
             raise WorkspaceError("Workspace is closed")

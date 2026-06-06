@@ -25,7 +25,10 @@ logger = logging.getLogger(__name__)
     "-w",
     type=click.Path(path_type=Path),
     default=None,
-    help="Workspace directory (created if absent). Defaults to ~/.treasure-map/workspaces/<auto>.",
+    help=(
+        "Workspace directory (created if absent). "
+        "Pass the same path to resume a previous run from its last checkpoint."
+    ),
 )
 @click.option(
     "--config",
@@ -34,10 +37,7 @@ logger = logging.getLogger(__name__)
     default=None,
     help="Path to config.yaml (overrides ~/.treasure-map/config.yaml).",
 )
-@click.option("--max-cost", type=float, default=None, help="Override max_cost_per_run_usd.")
-def analyze(
-    fs_root: Path, workspace: Path | None, config: Path | None, max_cost: float | None
-) -> None:
+def analyze(fs_root: Path, workspace: Path | None, config: Path | None) -> None:
     """Analyze an extracted firmware filesystem root.
 
     Produces an analysis.db in the workspace directory.
@@ -45,11 +45,10 @@ def analyze(
     """
     from treasure_map.lib.analyze.pipeline import run_analyze
     from treasure_map.lib.config.config import load_config
-    from treasure_map.lib.errors import GhidraNotFoundError
+    from treasure_map.lib.errors import GhidraNotFoundError, TreasureMapError
     from treasure_map.lib.workspace.workspace import Workspace
 
     cfg = load_config(config)
-    # max_cost will wire into LLM cost guard in Week 3 (no LLM calls yet)
 
     if workspace is None:
         ws_name = f"analyze_{fs_root.name}_{uuid.uuid4().hex[:8]}"
@@ -65,6 +64,8 @@ def analyze(
             result = asyncio.run(run_analyze(fs_root, ws, cfg, _progress))
     except GhidraNotFoundError as exc:
         raise click.ClickException(str(exc)) from exc
+    except TreasureMapError as exc:
+        raise click.ClickException(f"{type(exc).__name__}: {exc}") from exc
 
     click.echo(f"\nDone in {result.elapsed:.1f}s")
     click.echo(f"  Binaries : {result.binary_count}")
