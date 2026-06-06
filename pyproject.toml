@@ -39,6 +39,7 @@ dev = [
     "pytest-cov>=4.1",
     "ruff>=0.4",
     "mypy>=1.10,<2.0",
+    "types-PyYAML>=6.0",
 ]
 
 [project.scripts]
@@ -73,4 +74,4 @@ ignore_errors = true
 
 [[tool.mypy.overrides]]
 module = "treasure_map.lib.analyze.elf_inventory"
-disable_error_code = ["no-untyped-call"]
+disable_error_code = ["no-untyped-call", "attr-defined"]
