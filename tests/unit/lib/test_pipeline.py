@@ -3,7 +3,7 @@
 """Unit tests for lib/analyze/pipeline.py.
 
 Ghidra is fully mocked — these tests never touch analyzeHeadless.
-They verify the checkpoint/skip logic, fail-fast behavior, and result fields.
+They verify fail-fast behaviour, dirty-set routing, and result fields.
 """
 
 from __future__ import annotations
@@ -14,13 +14,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from treasure_map.lib.analyze.db_ingest import ingest_elfs
 from treasure_map.lib.analyze.elf_inventory import ElfRecord
 from treasure_map.lib.analyze.ghidra_runner import GhidraResult
 from treasure_map.lib.analyze.pipeline import AnalyzeResult, run_analyze
 from treasure_map.lib.config.config import Config
 from treasure_map.lib.errors import GhidraNotFoundError
-from treasure_map.lib.storage.connection import open_db
 from treasure_map.lib.workspace.workspace import Workspace
 
 MODULE = "treasure_map.lib.analyze.pipeline"
@@ -62,6 +60,12 @@ def _mock_runner(run_all_return: list[GhidraResult] | None = None) -> MagicMock:
     return runner
 
 
+def _mock_ingest(dirty_shas: set[str]) -> MagicMock:
+    """Return a mock ingest_elfs that reports the given shas as dirty."""
+    sha_to_id = {sha: i + 1 for i, sha in enumerate(dirty_shas)}
+    return MagicMock(return_value=(sha_to_id, dirty_shas))
+
+
 # ── fail-fast ─────────────────────────────────────────────────────────────────
 
 
@@ -79,122 +83,70 @@ async def test_fail_fast_before_any_disk_work(tmp_path: Path) -> None:
             mock_scan.assert_not_called()
 
 
-# ── find_elfs checkpoint ──────────────────────────────────────────────────────
+# ── dirty set routing ─────────────────────────────────────────────────────────
 
 
-async def test_find_elfs_checkpoint_skips_scan(tmp_path: Path) -> None:
-    """When find_elfs is already done, scan_filesystem is not called."""
+async def test_dirty_set_empty_skips_ghidra(tmp_path: Path) -> None:
+    """When ingest_elfs reports 0 dirty shas, runner.run_all is not called."""
     rec = _rec()
-
-    # Pre-populate DB and mark step done
-    ws_path = tmp_path / "ws"
-    Workspace(ws_path).close()  # initialise workspace dir + DB schema
-    conn = open_db(ws_path / "analysis.db")
-    ingest_elfs(conn, [rec])
-    conn.close()
-    with Workspace(ws_path) as ws:
-        ws.mark_done("find_elfs", {"binary_count": 1})
-
     runner = _mock_runner()
+
     with patch(f"{MODULE}.GhidraRunner", return_value=runner):
-        with patch(f"{MODULE}.scan_filesystem") as mock_scan:
-            with Workspace(ws_path) as ws:
-                result = await run_analyze(tmp_path / "fs", ws, _cfg())
+        with patch(f"{MODULE}.scan_filesystem", return_value=[rec]):
+            with patch(f"{MODULE}.ingest_elfs", _mock_ingest(set())):
+                with Workspace(tmp_path / "ws") as ws:
+                    result = await run_analyze(tmp_path / "fs", ws, _cfg())
 
-            mock_scan.assert_not_called()
-
+    runner.run_all.assert_not_called()
     assert result.binary_count == 1
+    assert result.dirty_count == 0
+    assert result.ghidra_skipped == 1
+    assert result.ghidra_ok == 0
 
 
-async def test_find_elfs_checkpoint_restores_dt_needed(tmp_path: Path) -> None:
-    """Records loaded from DB have dt_needed and protections restored."""
-    rec = _rec()
-    ws_path = tmp_path / "ws"
-    Workspace(ws_path).close()
-    conn = open_db(ws_path / "analysis.db")
-    ingest_elfs(conn, [rec])
-    conn.close()
-    with Workspace(ws_path) as ws:
-        ws.mark_done("find_elfs")
+async def test_dirty_set_partial_only_runs_dirty(tmp_path: Path) -> None:
+    """With 2 records and 1 already done, run_all receives only the dirty one."""
+    rec1 = _rec("httpd", "aaa111")
+    rec2 = _rec("dropbear", "bbb222")
+    records = [rec1, rec2]
 
     captured: list[list[ElfRecord]] = []
+
     runner = _mock_runner()
-    runner.run_all.side_effect = lambda recs, *a, **kw: captured.append(recs) or []
+    runner.run_all.side_effect = lambda recs, *a, **kw: (
+        captured.append(list(recs)) or [_ok_ghidra(r) for r in recs]
+    )
 
     with patch(f"{MODULE}.GhidraRunner", return_value=runner):
-        with Workspace(ws_path) as ws:
-            await run_analyze(tmp_path / "fs", ws, _cfg())
+        with patch(f"{MODULE}.scan_filesystem", return_value=records):
+            # Only rec2 is dirty (rec1 has ghidra_ok=1 in DB)
+            with patch(f"{MODULE}.ingest_elfs", _mock_ingest({"bbb222"})):
+                with Workspace(tmp_path / "ws") as ws:
+                    result = await run_analyze(tmp_path / "fs", ws, _cfg())
 
     assert len(captured) == 1
-    loaded = captured[0][0]
-    assert loaded.dt_needed == ["libc.so.0"]
+    assert len(captured[0]) == 1
+    assert captured[0][0].sha256 == "bbb222"
+    assert result.binary_count == 2
+    assert result.dirty_count == 1
+    assert result.ghidra_skipped == 1
 
 
-# ── ghidra checkpoint ─────────────────────────────────────────────────────────
+# ── empty filesystem ──────────────────────────────────────────────────────────
 
 
-async def test_ghidra_checkpoint_skips_run_all(tmp_path: Path) -> None:
-    """When ghidra is already done, runner.run_all is not called."""
-    rec = _rec()
-    ws_path = tmp_path / "ws"
-    Workspace(ws_path).close()
-    conn = open_db(ws_path / "analysis.db")
-    ingest_elfs(conn, [rec])
-    conn.close()
-    with Workspace(ws_path) as ws:
-        ws.mark_done("find_elfs", {"binary_count": 1})
-        ws.mark_done("ghidra", {"ok": 1, "failed": 0})
-
-    runner = _mock_runner()
-    with patch(f"{MODULE}.GhidraRunner", return_value=runner):
-        with Workspace(ws_path) as ws:
-            result = await run_analyze(tmp_path / "fs", ws, _cfg())
-
-        runner.run_all.assert_not_called()
-
-    assert result.ghidra_ok == 0  # 0 because step was skipped this run
-    assert result.ghidra_failed == 0
-
-
-# ── empty records ─────────────────────────────────────────────────────────────
-
-
-async def test_empty_fs_ghidra_skipped_and_checkpointed(tmp_path: Path) -> None:
-    """Zero ELFs → ghidra step is skipped but both steps are checkpointed."""
+async def test_empty_fs_ghidra_skipped(tmp_path: Path) -> None:
+    """Zero ELFs found → Ghidra step is not called."""
     runner = _mock_runner()
     with patch(f"{MODULE}.GhidraRunner", return_value=runner):
         with patch(f"{MODULE}.scan_filesystem", return_value=[]):
             with Workspace(tmp_path / "ws") as ws:
                 result = await run_analyze(tmp_path / "fs", ws, _cfg())
 
-            runner.run_all.assert_not_called()
-
+    runner.run_all.assert_not_called()
     assert result.binary_count == 0
-
-    with Workspace(tmp_path / "ws") as ws:
-        assert ws.is_done("find_elfs")
-        assert ws.is_done("ghidra")
-
-
-# ── progress callback ─────────────────────────────────────────────────────────
-
-
-async def test_progress_callback_fires_on_both_steps(tmp_path: Path) -> None:
-    """Workspace fires progress_callback when each step is marked done."""
-    rec = _rec()
-    steps: list[str] = []
-
-    runner = _mock_runner([_ok_ghidra(rec)])
-    with patch(f"{MODULE}.GhidraRunner", return_value=runner):
-        with patch(f"{MODULE}.scan_filesystem", return_value=[rec]):
-            with patch(f"{MODULE}.ingest_elfs"):
-                with Workspace(
-                    tmp_path / "ws", progress_callback=lambda s, _m: steps.append(s)
-                ) as ws:
-                    await run_analyze(tmp_path / "fs", ws, _cfg())
-
-    assert "find_elfs" in steps
-    assert "ghidra" in steps
+    assert result.dirty_count == 0
+    assert result.ghidra_skipped == 0
 
 
 # ── AnalyzeResult fields ──────────────────────────────────────────────────────
@@ -209,19 +161,22 @@ async def test_analyze_result_fields(tmp_path: Path) -> None:
     runner = _mock_runner([_ok_ghidra(rec1), _fail_ghidra(rec2)])
     with patch(f"{MODULE}.GhidraRunner", return_value=runner):
         with patch(f"{MODULE}.scan_filesystem", return_value=records):
-            with patch(f"{MODULE}.ingest_elfs"):
+            # Both records are dirty
+            with patch(f"{MODULE}.ingest_elfs", _mock_ingest({"aaa111", "bbb222"})):
                 with Workspace(tmp_path / "ws") as ws:
                     result = await run_analyze(tmp_path / "fs", ws, _cfg())
 
     assert isinstance(result, AnalyzeResult)
     assert result.binary_count == 2
+    assert result.dirty_count == 2
     assert result.ghidra_ok == 1
     assert result.ghidra_failed == 1
+    assert result.ghidra_skipped == 0
     assert result.db_path == tmp_path / "ws" / "analysis.db"
     assert result.elapsed > 0
 
 
-# ── run_analyze propagates progress_callback to run_all ──────────────────────
+# ── progress callback ─────────────────────────────────────────────────────────
 
 
 async def test_progress_callback_passed_to_run_all(tmp_path: Path) -> None:
@@ -234,7 +189,7 @@ async def test_progress_callback_passed_to_run_all(tmp_path: Path) -> None:
 
     with patch(f"{MODULE}.GhidraRunner", return_value=runner):
         with patch(f"{MODULE}.scan_filesystem", return_value=[rec]):
-            with patch(f"{MODULE}.ingest_elfs"):
+            with patch(f"{MODULE}.ingest_elfs", _mock_ingest({rec.sha256})):
                 with Workspace(tmp_path / "ws") as ws:
                     await run_analyze(tmp_path / "fs", ws, _cfg(), progress_callback=cb)
 

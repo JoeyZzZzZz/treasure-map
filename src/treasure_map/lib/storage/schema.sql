@@ -5,18 +5,27 @@ PRAGMA foreign_keys = ON;
 
 -- 二进制文件
 CREATE TABLE IF NOT EXISTS binaries (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    name        TEXT    NOT NULL,
-    path        TEXT,
-    arch        TEXT,               -- Ghidra 处理器串: ARM:LE:32:v7
-    bits        INTEGER,            -- 32 or 64
-    sha256      TEXT    UNIQUE,
-    file_type   TEXT,               -- executable / shared_library / relocatable
-    dt_needed   TEXT    DEFAULT '[]',   -- JSON: DT_NEEDED 动态库依赖
-    capa_tags   TEXT    DEFAULT '[]',   -- JSON: 二进制级 Capa 能力标签
-    protections TEXT    DEFAULT '{}',   -- JSON: {nx, pie, canary, relro, fortify}
-    analyzed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    name         TEXT    NOT NULL,
+    path         TEXT,
+    arch         TEXT,                     -- Ghidra 处理器串: ARM:LE:32:v7
+    bits         INTEGER,                  -- 32 or 64
+    sha256       TEXT    UNIQUE,           -- content-identity; same content → one row
+    file_type    TEXT,                     -- executable / shared_library / relocatable
+    dt_needed    TEXT    DEFAULT '[]',     -- JSON: DT_NEEDED 动态库依赖
+    capa_tags    TEXT    DEFAULT '[]',     -- JSON: 二进制级 Capa 能力标签
+    protections  TEXT    DEFAULT '{}',     -- JSON: {nx, pie, canary, relro, fortify}
+    size_bytes   INTEGER DEFAULT 0,        -- ELF 文件大小 (bytes)
+    ghidra_ok    INTEGER NOT NULL DEFAULT 0, -- Round 2 partial-invalidation flag
+    last_seen_at DATETIME,                 -- timestamp of most recent ingest scan
+    analyzed_at  DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+
+-- current_binaries: rows whose last_seen_at equals the most recent scan
+-- Use this view for all "current firmware" queries; do not join binaries directly.
+CREATE VIEW IF NOT EXISTS current_binaries AS
+  SELECT * FROM binaries
+  WHERE last_seen_at = (SELECT MAX(last_seen_at) FROM binaries);
 
 -- 函数
 CREATE TABLE IF NOT EXISTS functions (

@@ -76,7 +76,9 @@ async def analyze_firmware(
         "status": "ok",
         "db_path": str(result.db_path),
         "binary_count": result.binary_count,
+        "dirty_count": result.dirty_count,
         "ghidra_ok": result.ghidra_ok,
         "ghidra_failed": result.ghidra_failed,
+        "ghidra_skipped": result.ghidra_skipped,
         "elapsed_s": round(result.elapsed, 1),
     }

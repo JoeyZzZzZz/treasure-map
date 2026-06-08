@@ -69,6 +69,8 @@ def analyze(fs_root: Path, workspace: Path | None, config: Path | None) -> None:
 
     click.echo(f"\nDone in {result.elapsed:.1f}s")
     click.echo(f"  Binaries : {result.binary_count}")
+    click.echo(f"  Dirty    : {result.dirty_count}")
     click.echo(f"  Ghidra OK: {result.ghidra_ok}")
-    click.echo(f"  Ghidra ✗ : {result.ghidra_failed}")
+    click.echo(f"  Failed   : {result.ghidra_failed}")
+    click.echo(f"  Skipped  : {result.ghidra_skipped} (cache hit)")
     click.echo(f"  DB       : {result.db_path}")
