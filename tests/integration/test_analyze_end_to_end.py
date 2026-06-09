@@ -133,6 +133,12 @@ def test_round1_self_test(tmp_path: Path) -> None:
     assert result2.imports_ingested == 0
     assert result2.exports_ingested == 0
     assert result2.strings_ingested == 0
+    # xrefs rebuild every run (wipe-and-rebuild); verify field coherence
+    assert result2.total_xrefs >= 0
+    assert result2.total_xrefs == (
+        result2.layer0_xrefs + result2.layer1_xrefs + result2.layer2_xrefs + result2.layer3_xrefs
+    )
+    assert result2.strings_classified >= 0
 
     # DB must have exactly 2 rows
     conn = open_db(workspace_path / "analysis.db")
@@ -209,6 +215,11 @@ def test_round2_partial_invalidation(tmp_path: Path) -> None:
     assert result2.dirty_count == 1, "Only libz should be dirty (sha256 changed)"
     assert result2.ghidra_skipped == 1, "true should be skipped (sha256 unchanged)"
     assert result2.functions_ingested == 1, "Only new libz ingested"
+    # xrefs rebuild after partial ingest; verify field coherence
+    assert result2.total_xrefs >= 0
+    assert result2.total_xrefs == (
+        result2.layer0_xrefs + result2.layer1_xrefs + result2.layer2_xrefs + result2.layer3_xrefs
+    )
     assert len(captured_records) == 1, "run_all called once"
     assert len(captured_records[0]) == 1, "exactly 1 record passed to run_all"
     assert captured_records[0][0].name == "libz.so"

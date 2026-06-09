@@ -176,6 +176,12 @@ async def test_analyze_result_fields(tmp_path: Path) -> None:
     assert result.imports_ingested == 0
     assert result.exports_ingested == 0
     assert result.strings_ingested == 0
+    assert result.layer0_xrefs == 0
+    assert result.layer1_xrefs == 0
+    assert result.layer2_xrefs == 0
+    assert result.layer3_xrefs == 0
+    assert result.strings_classified == 0
+    assert result.total_xrefs == 0
     assert result.db_path == tmp_path / "ws" / "analysis.db"
     assert result.elapsed > 0
 
