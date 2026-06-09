@@ -293,6 +293,11 @@ def _layer0_callees_exports(
 
     Primary layer — works without Ghidra ExternalManager, critical for
     stripped MIPS/ARM IoT firmware.
+
+    NOTE: Outer query uses .fetchall() because _safe_insert_xref reuses
+    the same cursor for INSERT/SELECT internally. Without materializing
+    the outer result set first, the outer iteration terminates after the
+    first row (SQLite cursor re-entry semantics).
     """
     export_index: dict[str, list[tuple[int, int | None]]] = defaultdict(list)
     rows = cur.execute(
@@ -306,11 +311,11 @@ def _layer0_callees_exports(
         export_index[exp_func_name].append((exp_binary_id, callee_func_id))
 
     func_count = 0
-    for row in cur.execute(
+    func_rows = cur.execute(
         """SELECT id, binary_id, callees FROM functions
            WHERE callees IS NOT NULL AND callees != '[]'"""
-    ):
-        caller_func_id, caller_binary_id, callees_json = row
+    ).fetchall()
+    for caller_func_id, caller_binary_id, callees_json in func_rows:
         try:
             callees = json.loads(callees_json)
         except json.JSONDecodeError:

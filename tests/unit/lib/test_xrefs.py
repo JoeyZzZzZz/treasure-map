@@ -122,6 +122,50 @@ def test_layer0_skips_intra_binary(tmp_path: Path) -> None:
     conn.close()
 
 
+def test_layer0_processes_all_callers(tmp_path: Path) -> None:
+    """Regression test for cursor re-entry bug.
+
+    Ensures Layer 0 iterates over ALL functions, not just the first one
+    (which is what happens if the cursor used for the outer SELECT is
+    reused by _safe_insert_xref internally).
+    """
+    conn = open_db(tmp_path / "analysis.db")
+    # 3 binaries: 2 callers + 1 exporter
+    for bid, name, sha in [
+        (1, "caller_a", "a" * 64),
+        (2, "caller_b", "b" * 64),
+        (3, "libc", "c" * 64),
+    ]:
+        conn.execute(
+            "INSERT INTO binaries (id, name, sha256, dt_needed) VALUES (?, ?, ?, ?)",
+            (bid, name, sha, "[]"),
+        )
+    conn.execute(
+        "INSERT INTO functions (id, binary_id, name, callees) VALUES (?, ?, ?, ?)",
+        (10, 1, "func_a", '["strcpy"]'),
+    )
+    conn.execute(
+        "INSERT INTO functions (id, binary_id, name, callees) VALUES (?, ?, ?, ?)",
+        (20, 2, "func_b", '["strcpy"]'),
+    )
+    conn.execute(
+        "INSERT INTO functions (id, binary_id, name, callees) VALUES (?, ?, ?, ?)",
+        (30, 3, "strcpy", "[]"),
+    )
+    conn.execute(
+        "INSERT INTO exports (binary_id, func_name, address) VALUES (?, ?, ?)",
+        (3, "strcpy", "00010000"),
+    )
+    conn.commit()
+    stats = build_xrefs(conn)
+    assert stats.layer0_callees_exports == 2, "Both callers must produce a xref"
+    distinct_callers = conn.execute(
+        "SELECT COUNT(DISTINCT caller_func_id) FROM xrefs WHERE xref_type='callees_exports'"
+    ).fetchone()[0]
+    assert distinct_callers == 2, "Layer 0 must process both callers"
+    conn.close()
+
+
 # ── Layer 2 ───────────────────────────────────────────────────────────────────
 
 
