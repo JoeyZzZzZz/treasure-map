@@ -115,7 +115,7 @@ def test_round2_partial_invalidation(tmp_path: Path) -> None:
 
     Real-world scenario: user analyzed firmware v1.058, vendor releases
     v1.060 with httpd patched for CVE-XXXX.  User re-extracts to same dir
-    and re-runs `tm analyze`.  Only httpd should re-run Ghidra.
+    and re-runs `tmap analyze`.  Only httpd should re-run Ghidra.
 
     Test technique: flip 1 byte in libz ELF header to change its sha256.
     This is a test shortcut that simulates "binary content changed by vendor

@@ -43,6 +43,7 @@ dev = [
 ]
 
 [project.scripts]
+tmap = "treasure_map.cli.main:main"
 tm = "treasure_map.cli.main:main"
 
 [build-system]
