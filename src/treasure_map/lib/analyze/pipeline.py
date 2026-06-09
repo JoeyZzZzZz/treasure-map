@@ -1,11 +1,11 @@
 # Copyright (C) 2025-2026 JoeyZzZzZz
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Analyze pipeline: scan_filesystem → ingest_elfs → ghidra_runner.run_all.
+"""Analyze pipeline: scan_filesystem → ingest_elfs → ghidra_runner.run_all → ghidra_ingest.
 
 Binary-level idempotency: scan_filesystem always runs (fast).  Ghidra runs
 only on dirty records — sha256 values that are new or still have ghidra_ok=0.
 DB is the truth source; workspace step checkpoints are not used here.
-Week 2 scope ends at Ghidra; function-level ingestion and LLM calls are Week 3+.
+Week 2 scope: Ghidra. Week 3 Round A: Ghidra JSON ingest.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from typing import Any
 
 from treasure_map.lib.analyze.db_ingest import ingest_elfs
 from treasure_map.lib.analyze.elf_inventory import ElfRecord, scan_filesystem
+from treasure_map.lib.analyze.ghidra_ingest import IngestStats, ingest_ghidra_output
 from treasure_map.lib.analyze.ghidra_runner import GhidraRunner
 from treasure_map.lib.config.config import Config
 from treasure_map.lib.storage.connection import open_db
@@ -31,12 +32,16 @@ ProgressCallback = Callable[[str, dict[str, Any]], None]
 
 @dataclass
 class AnalyzeResult:
+    db_path: Path
     binary_count: int  # unique ELFs found in current scan
     dirty_count: int  # binaries that needed Ghidra this run
     ghidra_ok: int  # of dirty, how many Ghidra succeeded
     ghidra_failed: int  # of dirty, how many Ghidra failed
     ghidra_skipped: int  # binary_count - dirty_count (cache hits)
-    db_path: Path
+    functions_ingested: int  # Round A: rows written to functions table
+    imports_ingested: int
+    exports_ingested: int
+    strings_ingested: int
     elapsed: float
 
 
@@ -49,6 +54,7 @@ async def run_analyze(
     """Orchestrate a full firmware analysis run.
 
     scan_filesystem always runs.  Ghidra runs only on dirty records.
+    After Ghidra, JSON output is ingested into functions/imports/exports/strings.
 
     Fail-fast: discovers analyzeHeadless before scanning so a missing Ghidra
     installation is reported immediately rather than after a long ELF scan.
@@ -65,8 +71,9 @@ async def run_analyze(
     dirty_records: list[ElfRecord] = []
     ghidra_ok = 0
     ghidra_failed = 0
+    ingest_stats = IngestStats()
     try:
-        _, dirty_shas = ingest_elfs(conn, records)
+        sha_to_id, dirty_shas = ingest_elfs(conn, records)
         dirty_records = [r for r in records if r.sha256 in dirty_shas]
 
         logger.info(
@@ -100,15 +107,27 @@ async def run_analyze(
             conn.commit()
         else:
             logger.info("ghidra: all binaries up-to-date (0 dirty)")
+
+        # Round A: ingest Ghidra JSON output into functions/imports/exports/strings
+        ingest_stats = ingest_ghidra_output(
+            conn,
+            workspace.path / "ghidra_output",
+            dirty_records,
+            sha_to_id,
+        )
     finally:
         conn.close()
 
     return AnalyzeResult(
+        db_path=workspace.db_path,
         binary_count=len(records),
         dirty_count=len(dirty_records),
         ghidra_ok=ghidra_ok,
         ghidra_failed=ghidra_failed,
         ghidra_skipped=len(records) - len(dirty_records),
-        db_path=workspace.db_path,
+        functions_ingested=ingest_stats.functions_ingested,
+        imports_ingested=ingest_stats.imports_ingested,
+        exports_ingested=ingest_stats.exports_ingested,
+        strings_ingested=ingest_stats.strings_ingested,
         elapsed=time.monotonic() - t0,
     )

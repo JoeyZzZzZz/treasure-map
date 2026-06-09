@@ -10,6 +10,7 @@ the full pipeline including real Ghidra.
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -41,11 +42,44 @@ def _mock_runner() -> MagicMock:
 
 
 def _succeed_all(recs: list[ElfRecord], *_a: object, **_kw: object) -> list[GhidraResult]:
-    """Mock run_all side_effect: return success for every record."""
+    """Mock run_all side_effect: return success for every record (no JSON written)."""
     return [
         GhidraResult(binary=r.path, output_file=Path("/fake"), success=True, elapsed=1.0)
         for r in recs
     ]
+
+
+def _run_all_with_json(
+    recs: list[ElfRecord], output_dir: Path, *_a: object, **_kw: object
+) -> list[GhidraResult]:
+    """Mock run_all: write minimal JSON for each record and return success."""
+    results = []
+    for r in recs:
+        sha8 = r.sha256[:8]
+        json_path = output_dir / f"{r.name}_{sha8}_ghidra.json"
+        json_path.write_text(
+            json.dumps(
+                {
+                    "functions": [
+                        {
+                            "name": f"func_{r.name}",
+                            "address": "1000",
+                            "size": 64,
+                            "is_exported": 1,
+                            "callees": [],
+                            "pseudocode": f"// {r.name}",
+                        }
+                    ],
+                    "imports": [],
+                    "exports": [],
+                    "strings": [],
+                }
+            )
+        )
+        results.append(
+            GhidraResult(binary=r.path, output_file=json_path, success=True, elapsed=1.0)
+        )
+    return results
 
 
 # ── Round 1 Self-Test (find_elfs + ingest, Ghidra mocked) ────────────────────
@@ -63,6 +97,7 @@ def test_round1_self_test(tmp_path: Path) -> None:
     - dirty_count == 0 on second run
     - ghidra_skipped == 2 on second run
     - DB has exactly 2 rows
+    - ingest counters are all 0 on second run (no-op)
     """
     fs_root = tmp_path / "rootfs"
     (fs_root / "bin").mkdir(parents=True)
@@ -94,6 +129,10 @@ def test_round1_self_test(tmp_path: Path) -> None:
     assert result2.binary_count == 2
     assert result2.dirty_count == 0
     assert result2.ghidra_skipped == 2
+    assert result2.functions_ingested == 0
+    assert result2.imports_ingested == 0
+    assert result2.exports_ingested == 0
+    assert result2.strings_ingested == 0
 
     # DB must have exactly 2 rows
     conn = open_db(workspace_path / "analysis.db")
@@ -129,9 +168,9 @@ def test_round2_partial_invalidation(tmp_path: Path) -> None:
     workspace_path = tmp_path / "workspace"
     cfg = Config()
 
-    # First run: both binaries are dirty → Ghidra succeeds for both
+    # First run: both binaries are dirty → Ghidra writes JSON + succeeds
     runner1 = _mock_runner()
-    runner1.run_all.side_effect = _succeed_all
+    runner1.run_all.side_effect = _run_all_with_json
 
     with patch(_PIPELINE_MODULE + ".GhidraRunner", return_value=runner1):
         with Workspace(workspace_path) as ws:
@@ -141,6 +180,7 @@ def test_round2_partial_invalidation(tmp_path: Path) -> None:
     assert result1.dirty_count == 2
     assert result1.ghidra_ok == 2
     assert result1.ghidra_skipped == 0
+    assert result1.functions_ingested == 2  # one function per binary
 
     # Flip 1 byte in e_type field (offset 0x10) of libz.so.
     # Simulates: vendor released a patched binary in new firmware version.
@@ -153,13 +193,13 @@ def test_round2_partial_invalidation(tmp_path: Path) -> None:
     runner2 = _mock_runner()
     captured_records: list[list[ElfRecord]] = []
 
-    def _capture_and_succeed(
-        recs: list[ElfRecord], *_a: object, **_kw: object
+    def fake_run_all(
+        recs: list[ElfRecord], output_dir: Path, *_a: object, **_kw: object
     ) -> list[GhidraResult]:
         captured_records.append(list(recs))
-        return _succeed_all(recs)
+        return _run_all_with_json(recs, output_dir)
 
-    runner2.run_all.side_effect = _capture_and_succeed
+    runner2.run_all.side_effect = fake_run_all
 
     with patch(_PIPELINE_MODULE + ".GhidraRunner", return_value=runner2):
         with Workspace(workspace_path) as ws:
@@ -168,6 +208,7 @@ def test_round2_partial_invalidation(tmp_path: Path) -> None:
     assert result2.binary_count == 2
     assert result2.dirty_count == 1, "Only libz should be dirty (sha256 changed)"
     assert result2.ghidra_skipped == 1, "true should be skipped (sha256 unchanged)"
+    assert result2.functions_ingested == 1, "Only new libz ingested"
     assert len(captured_records) == 1, "run_all called once"
     assert len(captured_records[0]) == 1, "exactly 1 record passed to run_all"
     assert captured_records[0][0].name == "libz.so"
@@ -183,6 +224,17 @@ def test_round2_partial_invalidation(tmp_path: Path) -> None:
         current = conn.execute("SELECT name FROM current_binaries").fetchall()
         current_names = sorted(row["name"] for row in current)
         assert current_names == ["libz.so", "true"]
+
+        # functions joined with current_binaries: true (run 1) + new libz (run 2) = 2
+        current_func_count = conn.execute(
+            """SELECT COUNT(*) FROM functions f
+               JOIN current_binaries cb ON f.binary_id = cb.id"""
+        ).fetchone()[0]
+        assert current_func_count == 2
+
+        # Old libz's function row is an orphan (not in current_binaries) but still exists
+        total_func_count = conn.execute("SELECT COUNT(*) FROM functions").fetchone()[0]
+        assert total_func_count == 3  # true + old libz + new libz
     finally:
         conn.close()
 

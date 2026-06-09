@@ -80,5 +80,9 @@ async def analyze_firmware(
         "ghidra_ok": result.ghidra_ok,
         "ghidra_failed": result.ghidra_failed,
         "ghidra_skipped": result.ghidra_skipped,
+        "functions_ingested": result.functions_ingested,
+        "imports_ingested": result.imports_ingested,
+        "exports_ingested": result.exports_ingested,
+        "strings_ingested": result.strings_ingested,
         "elapsed_s": round(result.elapsed, 1),
     }

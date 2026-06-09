@@ -1,0 +1,278 @@
+# Copyright (C) 2025-2026 JoeyZzZzZz
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Unit tests for ghidra_ingest module."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import sqlite3
+from pathlib import Path
+
+from treasure_map.lib.analyze.elf_inventory import ElfRecord
+from treasure_map.lib.analyze.ghidra_ingest import ingest_ghidra_output
+from treasure_map.lib.storage.connection import open_db
+
+
+def _make_record(name: str, sha256: str) -> ElfRecord:
+    return ElfRecord(
+        path=Path(f"/fake/{name}"),
+        name=name,
+        arch="MIPS:LE:32:default",
+        elf_type="executable",
+        sha256=sha256,
+        dt_needed=[],
+        protections={},
+        size=4096,
+    )
+
+
+def _setup_db(tmp_path: Path) -> tuple[sqlite3.Connection, dict[str, int]]:
+    """Create DB with one fake binary row, return conn and sha_to_id."""
+    conn = open_db(tmp_path / "analysis.db")
+    conn.execute(
+        "INSERT INTO binaries (name, sha256) VALUES (?, ?)",
+        ("test_bin", "a" * 64),
+    )
+    conn.commit()
+    binary_id = conn.execute("SELECT id FROM binaries WHERE sha256 = ?", ("a" * 64,)).fetchone()[0]
+    return conn, {"a" * 64: binary_id}
+
+
+def _write_ghidra_json(output_dir: Path, name: str, sha256: str, data: dict) -> None:  # type: ignore[type-arg]
+    output_dir.mkdir(parents=True, exist_ok=True)
+    sha8 = sha256[:8]
+    path = output_dir / f"{name}_{sha8}_ghidra.json"
+    path.write_text(json.dumps(data))
+
+
+def test_ingest_single_binary_writes_all_tables(tmp_path: Path) -> None:
+    conn, sha_to_id = _setup_db(tmp_path)
+    output_dir = tmp_path / "ghidra_output"
+    _write_ghidra_json(
+        output_dir,
+        "test_bin",
+        "a" * 64,
+        {
+            "functions": [
+                {
+                    "name": "main",
+                    "address": "1000",
+                    "size": 64,
+                    "is_exported": 1,
+                    "callees": ["puts"],
+                    "pseudocode": "int main(){}",
+                },
+            ],
+            "imports": [{"func_name": "puts", "lib_name": "libc.so.6"}],
+            "exports": [{"func_name": "main", "address": "1000"}],
+            "strings": [{"value": "hello", "address": "2000"}],
+        },
+    )
+
+    rec = _make_record("test_bin", "a" * 64)
+    stats = ingest_ghidra_output(conn, output_dir, [rec], sha_to_id)
+
+    assert stats.functions_ingested == 1
+    assert stats.imports_ingested == 1
+    assert stats.exports_ingested == 1
+    assert stats.strings_ingested == 1
+
+    assert conn.execute("SELECT COUNT(*) FROM functions").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM imports").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM exports").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM strings").fetchone()[0] == 1
+    conn.close()
+
+
+def test_ingest_maps_lib_name_to_lib_soname(tmp_path: Path) -> None:
+    """JSON has 'lib_name', DB column is 'lib_soname'."""
+    conn, sha_to_id = _setup_db(tmp_path)
+    output_dir = tmp_path / "ghidra_output"
+    _write_ghidra_json(
+        output_dir,
+        "test_bin",
+        "a" * 64,
+        {
+            "functions": [],
+            "imports": [{"func_name": "puts", "lib_name": "libc.so.6"}],
+            "exports": [],
+            "strings": [],
+        },
+    )
+
+    rec = _make_record("test_bin", "a" * 64)
+    ingest_ghidra_output(conn, output_dir, [rec], sha_to_id)
+
+    row = conn.execute("SELECT func_name, lib_soname FROM imports").fetchone()
+    assert row["func_name"] == "puts"
+    assert row["lib_soname"] == "libc.so.6"
+    conn.close()
+
+
+def test_ingest_computes_pseudocode_hash(tmp_path: Path) -> None:
+    conn, sha_to_id = _setup_db(tmp_path)
+    output_dir = tmp_path / "ghidra_output"
+    pseudocode = "int main(){}"
+    expected_hash = hashlib.md5(pseudocode.encode()).hexdigest()
+    _write_ghidra_json(
+        output_dir,
+        "test_bin",
+        "a" * 64,
+        {
+            "functions": [
+                {
+                    "name": "main",
+                    "address": "1000",
+                    "size": 64,
+                    "is_exported": 1,
+                    "callees": [],
+                    "pseudocode": pseudocode,
+                }
+            ],
+            "imports": [],
+            "exports": [],
+            "strings": [],
+        },
+    )
+
+    rec = _make_record("test_bin", "a" * 64)
+    ingest_ghidra_output(conn, output_dir, [rec], sha_to_id)
+
+    row = conn.execute("SELECT pseudocode_hash FROM functions").fetchone()
+    assert row["pseudocode_hash"] == expected_hash
+    conn.close()
+
+
+def test_ingest_handles_missing_json_file(tmp_path: Path) -> None:
+    """Dirty record with no JSON file → log warning, no crash."""
+    conn, sha_to_id = _setup_db(tmp_path)
+    output_dir = tmp_path / "ghidra_output"
+    output_dir.mkdir()
+
+    rec = _make_record("test_bin", "a" * 64)
+    stats = ingest_ghidra_output(conn, output_dir, [rec], sha_to_id)
+
+    assert stats.binaries_missing_json == 1
+    assert stats.functions_ingested == 0
+    conn.close()
+
+
+def test_ingest_handles_malformed_json(tmp_path: Path) -> None:
+    conn, sha_to_id = _setup_db(tmp_path)
+    output_dir = tmp_path / "ghidra_output"
+    output_dir.mkdir()
+    bad_path = output_dir / f"test_bin_{'a' * 8}_ghidra.json"
+    bad_path.write_text("{ not valid json")
+
+    rec = _make_record("test_bin", "a" * 64)
+    stats = ingest_ghidra_output(conn, output_dir, [rec], sha_to_id)
+
+    assert stats.binaries_malformed_json == 1
+    assert stats.functions_ingested == 0
+    conn.close()
+
+
+def test_ingest_empty_pseudocode_hash_null(tmp_path: Path) -> None:
+    conn, sha_to_id = _setup_db(tmp_path)
+    output_dir = tmp_path / "ghidra_output"
+    _write_ghidra_json(
+        output_dir,
+        "test_bin",
+        "a" * 64,
+        {
+            "functions": [
+                {
+                    "name": "thunk",
+                    "address": "1000",
+                    "size": 8,
+                    "is_exported": 0,
+                    "callees": [],
+                    "pseudocode": "",
+                }
+            ],
+            "imports": [],
+            "exports": [],
+            "strings": [],
+        },
+    )
+
+    rec = _make_record("test_bin", "a" * 64)
+    ingest_ghidra_output(conn, output_dir, [rec], sha_to_id)
+
+    row = conn.execute("SELECT pseudocode_hash FROM functions").fetchone()
+    assert row["pseudocode_hash"] is None
+    conn.close()
+
+
+def test_ingest_skips_when_dirty_empty(tmp_path: Path) -> None:
+    """dirty_records=[] → no DB writes, no errors."""
+    conn, sha_to_id = _setup_db(tmp_path)
+    output_dir = tmp_path / "ghidra_output"
+
+    stats = ingest_ghidra_output(conn, output_dir, [], sha_to_id)
+
+    assert stats.functions_ingested == 0
+    assert stats.binaries_processed == 0
+    conn.close()
+
+
+def test_ingest_replaces_existing_rows(tmp_path: Path) -> None:
+    """Re-ingest same binary → no duplicates (DELETE before INSERT)."""
+    conn, sha_to_id = _setup_db(tmp_path)
+    output_dir = tmp_path / "ghidra_output"
+    _write_ghidra_json(
+        output_dir,
+        "test_bin",
+        "a" * 64,
+        {
+            "functions": [
+                {
+                    "name": "main",
+                    "address": "1000",
+                    "size": 64,
+                    "is_exported": 1,
+                    "callees": [],
+                    "pseudocode": "v1",
+                }
+            ],
+            "imports": [],
+            "exports": [],
+            "strings": [],
+        },
+    )
+
+    rec = _make_record("test_bin", "a" * 64)
+
+    # First ingest
+    ingest_ghidra_output(conn, output_dir, [rec], sha_to_id)
+    assert conn.execute("SELECT COUNT(*) FROM functions").fetchone()[0] == 1
+
+    # Second ingest (different pseudocode)
+    _write_ghidra_json(
+        output_dir,
+        "test_bin",
+        "a" * 64,
+        {
+            "functions": [
+                {
+                    "name": "main",
+                    "address": "1000",
+                    "size": 64,
+                    "is_exported": 1,
+                    "callees": [],
+                    "pseudocode": "v2",
+                }
+            ],
+            "imports": [],
+            "exports": [],
+            "strings": [],
+        },
+    )
+    ingest_ghidra_output(conn, output_dir, [rec], sha_to_id)
+
+    # Still exactly 1 row, with new pseudocode
+    rows = conn.execute("SELECT pseudocode FROM functions").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["pseudocode"] == "v2"
+    conn.close()

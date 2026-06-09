@@ -1,0 +1,29 @@
+{
+  "functions": [
+    {
+      "name": "main",
+      "address": "004008e0",
+      "size": 128,
+      "is_exported": 1,
+      "callees": ["exit"],
+      "pseudocode": "int main(int argc, char **argv) {\n  exit(0);\n  return 0;\n}"
+    },
+    {
+      "name": "FUN_00400500",
+      "address": "00400500",
+      "size": 32,
+      "is_exported": 0,
+      "callees": [],
+      "pseudocode": ""
+    }
+  ],
+  "imports": [
+    {"func_name": "exit", "lib_name": "libc.so.6"}
+  ],
+  "exports": [
+    {"func_name": "main", "address": "004008e0"}
+  ],
+  "strings": [
+    {"value": "true", "address": "00408120"}
+  ]
+}

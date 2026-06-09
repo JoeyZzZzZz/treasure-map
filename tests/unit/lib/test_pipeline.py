@@ -172,6 +172,10 @@ async def test_analyze_result_fields(tmp_path: Path) -> None:
     assert result.ghidra_ok == 1
     assert result.ghidra_failed == 1
     assert result.ghidra_skipped == 0
+    assert result.functions_ingested == 0
+    assert result.imports_ingested == 0
+    assert result.exports_ingested == 0
+    assert result.strings_ingested == 0
     assert result.db_path == tmp_path / "ws" / "analysis.db"
     assert result.elapsed > 0
 

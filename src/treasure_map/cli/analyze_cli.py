@@ -73,4 +73,8 @@ def analyze(fs_root: Path, workspace: Path | None, config: Path | None) -> None:
     click.echo(f"  Ghidra OK: {result.ghidra_ok}")
     click.echo(f"  Failed   : {result.ghidra_failed}")
     click.echo(f"  Skipped  : {result.ghidra_skipped} (cache hit)")
+    click.echo(f"  Functions ingested: {result.functions_ingested}")
+    click.echo(f"  Imports   ingested: {result.imports_ingested}")
+    click.echo(f"  Exports   ingested: {result.exports_ingested}")
+    click.echo(f"  Strings   ingested: {result.strings_ingested}")
     click.echo(f"  DB       : {result.db_path}")

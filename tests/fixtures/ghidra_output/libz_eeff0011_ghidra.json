@@ -1,0 +1,33 @@
+{
+  "functions": [
+    {
+      "name": "deflate",
+      "address": "00012a00",
+      "size": 1024,
+      "is_exported": 1,
+      "callees": ["malloc", "memcpy"],
+      "pseudocode": "int deflate(z_streamp strm, int flush) {\n  /* ... */\n}"
+    },
+    {
+      "name": "inflate",
+      "address": "00013c00",
+      "size": 980,
+      "is_exported": 1,
+      "callees": ["free", "memcpy"],
+      "pseudocode": "int inflate(z_streamp strm, int flush) {\n  /* ... */\n}"
+    }
+  ],
+  "imports": [
+    {"func_name": "malloc", "lib_name": "libc.so.6"},
+    {"func_name": "memcpy", "lib_name": "libc.so.6"},
+    {"func_name": "free", "lib_name": "libc.so.6"}
+  ],
+  "exports": [
+    {"func_name": "deflate", "address": "00012a00"},
+    {"func_name": "inflate", "address": "00013c00"}
+  ],
+  "strings": [
+    {"value": "1.2.11", "address": "00020100"},
+    {"value": "incorrect header check", "address": "00020200"}
+  ]
+}
