@@ -166,6 +166,71 @@ def test_layer0_processes_all_callers(tmp_path: Path) -> None:
     conn.close()
 
 
+def test_layer0_skips_null_callee_func_id(tmp_path: Path) -> None:
+    """An export with no matching function record (PLT thunk) must NOT produce a xref."""
+    conn = open_db(tmp_path / "analysis.db")
+    conn.execute(
+        "INSERT INTO binaries (id, name, sha256, dt_needed) VALUES (?, ?, ?, ?)",
+        (1, "app", "a" * 64, "[]"),
+    )
+    conn.execute(
+        "INSERT INTO binaries (id, name, sha256, dt_needed) VALUES (?, ?, ?, ?)",
+        (2, "lib", "b" * 64, "[]"),
+    )
+    conn.execute(
+        "INSERT INTO functions (id, binary_id, name, callees) VALUES (?, ?, ?, ?)",
+        (10, 1, "caller", '["foo"]'),
+    )
+    # lib exports 'foo' but has NO corresponding function record (PLT thunk)
+    conn.execute(
+        "INSERT INTO exports (binary_id, func_name, address) VALUES (?, ?, ?)",
+        (2, "foo", "00010000"),
+    )
+    conn.commit()
+    stats = build_xrefs(conn)
+    assert stats.layer0_callees_exports == 0, "Unresolved callee (PLT thunk) should be skipped"
+    conn.close()
+
+
+def test_build_xrefs_performance_executemany(tmp_path: Path) -> None:
+    """Smoke test: 100 callers should build quickly (set-based dedup + executemany)."""
+    import time
+
+    conn = open_db(tmp_path / "analysis.db")
+    # Binary 200 is the shared library; binaries 1-100 are callers
+    conn.execute(
+        "INSERT INTO binaries (id, name, sha256, dt_needed) VALUES (?, ?, ?, ?)",
+        (200, "lib", "f" * 64, "[]"),
+    )
+    caller_bins = [(i, f"bin_{i}", f"{i:064d}", "[]") for i in range(1, 101)]
+    conn.executemany(
+        "INSERT INTO binaries (id, name, sha256, dt_needed) VALUES (?, ?, ?, ?)",
+        caller_bins,
+    )
+    caller_funcs = [(1000 + i, i, "caller", '["shared"]') for i in range(1, 101)]
+    conn.executemany(
+        "INSERT INTO functions (id, binary_id, name, callees) VALUES (?, ?, ?, ?)",
+        caller_funcs,
+    )
+    conn.execute(
+        "INSERT INTO functions (id, binary_id, name, callees) VALUES (?, ?, ?, ?)",
+        (2000, 200, "shared", "[]"),
+    )
+    conn.execute(
+        "INSERT INTO exports (binary_id, func_name, address) VALUES (?, ?, ?)",
+        (200, "shared", "0"),
+    )
+    conn.commit()
+
+    start = time.monotonic()
+    stats = build_xrefs(conn)
+    elapsed = time.monotonic() - start
+
+    assert stats.layer0_callees_exports == 100
+    assert elapsed < 2.0, f"100-caller build took {elapsed:.2f}s — perf regression"
+    conn.close()
+
+
 # ── Layer 2 ───────────────────────────────────────────────────────────────────
 
 

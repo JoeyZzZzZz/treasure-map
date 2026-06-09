@@ -26,15 +26,20 @@ import logging
 import re
 import sqlite3
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
+
+# Type alias for the dedup-and-queue function passed to layer helpers.
+# Signature: (caller_bid, caller_fid, callee_bid, callee_fid, xref_type, confidence) -> inserted
+_AddFn = Callable[[int, "int | None", int, "int | None", str, float], bool]
 
 
 # ── String classification rules (ordered, first-match-wins) ──────────────────
 # Ported from history/scripts/06_build_xrefs.py STRING_RULES.
 # No trailing \b on crypto_hint — C-style identifiers like AES_set_encrypt_key
-# must match (underscore is a word char so \b\bAES\b would not fire there).
+# must match (underscore is a word char so \bAES\b would not fire there).
 STRING_RULES: list[tuple[str, str]] = [
     (
         "crypto_hint",
@@ -186,63 +191,6 @@ def _build_caller_index(cur: sqlite3.Cursor, binary_id: int) -> dict[str, list[i
     return index
 
 
-# ── NULL-safe xref insertion ──────────────────────────────────────────────────
-
-
-def _safe_insert_xref(
-    cur: sqlite3.Cursor,
-    caller_binary_id: int,
-    caller_func_id: int | None,
-    callee_binary_id: int,
-    callee_func_id: int | None,
-    xref_type: str,
-    confidence: float,
-) -> bool:
-    """Insert xref if not already present. NULL-safe dedup.
-
-    SQLite: NULL = NULL is false but NULL IS NULL is true.
-    Uses IS ? for NULL-safe comparison.
-
-    Returns True if a row was inserted, False if it was a duplicate.
-    """
-    existing = cur.execute(
-        """SELECT id FROM xrefs
-           WHERE caller_binary_id = ?
-             AND callee_binary_id = ?
-             AND xref_type = ?
-             AND (caller_func_id IS ? OR caller_func_id = ?)
-             AND (callee_func_id IS ? OR callee_func_id = ?)
-           LIMIT 1""",
-        (
-            caller_binary_id,
-            callee_binary_id,
-            xref_type,
-            caller_func_id,
-            caller_func_id,
-            callee_func_id,
-            callee_func_id,
-        ),
-    ).fetchone()
-    if existing:
-        return False
-    cur.execute(
-        """INSERT INTO xrefs
-               (caller_binary_id, caller_func_id,
-                callee_binary_id, callee_func_id,
-                xref_type, confidence)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (
-            caller_binary_id,
-            caller_func_id,
-            callee_binary_id,
-            callee_func_id,
-            xref_type,
-            confidence,
-        ),
-    )
-    return True
-
-
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 
@@ -252,6 +200,11 @@ def build_xrefs(conn: sqlite3.Connection) -> XrefStats:
     Also classifies all strings whose category is currently NULL.
 
     Semantics: wipe-and-rebuild. See design note §4.
+
+    Dedup strategy: in-memory set keyed by
+    (caller_bid, caller_fid, callee_bid, callee_fid, xref_type).
+    All inserts are batched via executemany at the end — O(1) dedup,
+    no per-row SELECT overhead.
     """
     stats = XrefStats()
     cur = conn.cursor()
@@ -259,14 +212,49 @@ def build_xrefs(conn: sqlite3.Connection) -> XrefStats:
     cur.execute("DELETE FROM xrefs")
     conn.commit()
 
+    seen: set[tuple[int, int | None, int, int | None, str]] = set()
+    pending: list[tuple[int, int | None, int, int | None, str, float]] = []
+
+    def _try_add(
+        caller_binary_id: int,
+        caller_func_id: int | None,
+        callee_binary_id: int,
+        callee_func_id: int | None,
+        xref_type: str,
+        confidence: float,
+    ) -> bool:
+        key = (caller_binary_id, caller_func_id, callee_binary_id, callee_func_id, xref_type)
+        if key in seen:
+            return False
+        seen.add(key)
+        pending.append(
+            (
+                caller_binary_id,
+                caller_func_id,
+                callee_binary_id,
+                callee_func_id,
+                xref_type,
+                confidence,
+            )
+        )
+        return True
+
     soname_map = _build_soname_map(cur)
 
-    _layer0_callees_exports(cur, conn, stats)
-    _layer1_import_export(cur, conn, soname_map, stats)
-    _layer2_dt_needed(cur, conn, soname_map, stats)
+    _layer0_callees_exports(cur, _try_add, stats)
+    _layer1_import_export(cur, _try_add, soname_map, stats)
+    _layer2_dt_needed(cur, _try_add, soname_map, stats)
     _classify_strings(cur, conn, stats)
-    _layer3_string_ipc(cur, conn, stats)
+    _layer3_string_ipc(cur, _try_add, stats)
 
+    if pending:
+        cur.executemany(
+            """INSERT INTO xrefs
+               (caller_binary_id, caller_func_id, callee_binary_id,
+                callee_func_id, xref_type, confidence)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            pending,
+        )
     conn.commit()
 
     logger.info(
@@ -287,30 +275,36 @@ def build_xrefs(conn: sqlite3.Connection) -> XrefStats:
 
 
 def _layer0_callees_exports(
-    cur: sqlite3.Cursor, conn: sqlite3.Connection, stats: XrefStats
+    cur: sqlite3.Cursor,
+    add_fn: _AddFn,
+    stats: XrefStats,
 ) -> None:
     """Layer 0: function.callees × exports exact match.
 
     Primary layer — works without Ghidra ExternalManager, critical for
     stripped MIPS/ARM IoT firmware.
 
-    NOTE: Outer query uses .fetchall() because _safe_insert_xref reuses
-    the same cursor for INSERT/SELECT internally. Without materializing
-    the outer result set first, the outer iteration terminates after the
-    first row (SQLite cursor re-entry semantics).
+    NOTE: Outer query uses .fetchall() to materialize the result set before
+    iterating — add_fn uses the same cursor internally and would otherwise
+    invalidate the outer iteration after the first row (SQLite cursor
+    re-entry semantics).
+
+    NOTE: Export index is built with an INNER JOIN, so only exports that have
+    a concrete function record are included. PLT thunks (exports with no
+    matching function body) are excluded. Including them would bloat the xrefs
+    table ~10x with NULL-callee rows that convey no actionable information.
     """
-    export_index: dict[str, list[tuple[int, int | None]]] = defaultdict(list)
+    export_index: dict[str, list[tuple[int, int]]] = defaultdict(list)
     rows = cur.execute(
         """SELECT e.binary_id, e.func_name, f.id AS func_id
            FROM exports e
-           LEFT JOIN functions f
+           JOIN functions f
                ON f.binary_id = e.binary_id AND f.name = e.func_name
            WHERE e.func_name IS NOT NULL AND e.func_name != ''"""
     ).fetchall()
     for exp_binary_id, exp_func_name, callee_func_id in rows:
         export_index[exp_func_name].append((exp_binary_id, callee_func_id))
 
-    func_count = 0
     func_rows = cur.execute(
         """SELECT id, binary_id, callees FROM functions
            WHERE callees IS NOT NULL AND callees != '[]'"""
@@ -327,8 +321,7 @@ def _layer0_callees_exports(
             for callee_binary_id, callee_func_id in targets:
                 if callee_binary_id == caller_binary_id:
                     continue
-                if _safe_insert_xref(
-                    cur,
+                if add_fn(
                     caller_binary_id,
                     caller_func_id,
                     callee_binary_id,
@@ -337,15 +330,11 @@ def _layer0_callees_exports(
                     1.0,
                 ):
                     stats.layer0_callees_exports += 1
-        func_count += 1
-        if func_count % 2000 == 0:
-            conn.commit()
-    conn.commit()
 
 
 def _layer1_import_export(
     cur: sqlite3.Cursor,
-    conn: sqlite3.Connection,
+    add_fn: _AddFn,
     soname_map: dict[str, int],
     stats: XrefStats,
 ) -> None:
@@ -370,7 +359,7 @@ def _layer1_import_export(
 
     callee_func_cache: dict[tuple[int, str], int | None] = {}
 
-    for idx, (caller_bid, import_list) in enumerate(by_binary.items(), 1):
+    for caller_bid, import_list in by_binary.items():
         caller_index = _build_caller_index(cur, caller_bid)
 
         for func_name, soname in import_list:
@@ -390,36 +379,16 @@ def _layer1_import_export(
             caller_func_ids = caller_index.get(func_name, [])
             if caller_func_ids:
                 for cfid in caller_func_ids:
-                    if _safe_insert_xref(
-                        cur,
-                        caller_bid,
-                        cfid,
-                        dep_id,
-                        callee_func_id,
-                        "import_export",
-                        1.0,
-                    ):
+                    if add_fn(caller_bid, cfid, dep_id, callee_func_id, "import_export", 1.0):
                         stats.layer1_import_export_func += 1
             else:
-                if _safe_insert_xref(
-                    cur,
-                    caller_bid,
-                    None,
-                    dep_id,
-                    callee_func_id,
-                    "import_export",
-                    1.0,
-                ):
+                if add_fn(caller_bid, None, dep_id, callee_func_id, "import_export", 1.0):
                     stats.layer1_import_export_lib += 1
-
-        if idx % 20 == 0:
-            conn.commit()
-    conn.commit()
 
 
 def _layer2_dt_needed(
     cur: sqlite3.Cursor,
-    conn: sqlite3.Connection,
+    add_fn: _AddFn,
     soname_map: dict[str, int],
     stats: XrefStats,
 ) -> None:
@@ -434,9 +403,8 @@ def _layer2_dt_needed(
             dep_id = _resolve_soname(soname, soname_map)
             if dep_id is None or dep_id == bid:
                 continue
-            if _safe_insert_xref(cur, bid, None, dep_id, None, "dt_needed", 0.9):
+            if add_fn(bid, None, dep_id, None, "dt_needed", 0.9):
                 stats.layer2_dt_needed += 1
-    conn.commit()
 
 
 def _classify_strings(cur: sqlite3.Cursor, conn: sqlite3.Connection, stats: XrefStats) -> None:
@@ -451,7 +419,11 @@ def _classify_strings(cur: sqlite3.Cursor, conn: sqlite3.Connection, stats: Xref
     stats.strings_classified = len(rows)
 
 
-def _layer3_string_ipc(cur: sqlite3.Cursor, conn: sqlite3.Connection, stats: XrefStats) -> None:
+def _layer3_string_ipc(
+    cur: sqlite3.Cursor,
+    add_fn: _AddFn,
+    stats: XrefStats,
+) -> None:
     """Layer 3: pairwise xrefs for binaries sharing a useful IPC string."""
     ipc_rows = cur.execute(
         """SELECT value, GROUP_CONCAT(DISTINCT binary_id) AS bids
@@ -466,6 +438,5 @@ def _layer3_string_ipc(cur: sqlite3.Cursor, conn: sqlite3.Connection, stats: Xre
         bids = sorted({int(x) for x in bids_str.split(",")})
         for i in range(len(bids)):
             for j in range(i + 1, len(bids)):
-                if _safe_insert_xref(cur, bids[i], None, bids[j], None, "string_ipc", 0.5):
+                if add_fn(bids[i], None, bids[j], None, "string_ipc", 0.5):
                     stats.layer3_string_ipc += 1
-    conn.commit()
