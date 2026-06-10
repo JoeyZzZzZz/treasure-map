@@ -1,7 +1,8 @@
 # Copyright (C) 2025-2026 JoeyZzZzZz
 # SPDX-License-Identifier: AGPL-3.0-only
 """Unit tests for the non-binary ingester framework, ShellScript ingester (Round C),
-ConfigFile ingester (Round D), and Credential ingester (Round E)."""
+ConfigFile ingester (Round D), Credential ingester (Round E), and WebAsset ingester
+(Round F)."""
 
 from __future__ import annotations
 
@@ -24,6 +25,12 @@ from treasure_map.lib.analyze.non_binary.shell_script import (
     _detect_shell,
     _ingest_shell,
 )
+from treasure_map.lib.analyze.non_binary.web_asset import (
+    WEB_ENDPOINT_HINTS,
+    _classify_endpoint,
+    _detect_web_asset,
+    _ingest_web_asset,
+)
 from treasure_map.lib.storage.connection import open_db
 
 # ── Allowed vuln_hint vocabularies (§5.3) ────────────────────────────────────
@@ -31,6 +38,7 @@ from treasure_map.lib.storage.connection import open_db
 _ALLOWED_SHELL_HINTS = frozenset(label for label, _ in SHELL_RISK_RULES)
 _ALLOWED_CONFIG_HINTS = frozenset(label for label, _ in CONFIG_RISK_RULES)
 _ALLOWED_CRED_HINTS = CREDENTIAL_HINTS
+_ALLOWED_WEB_HINTS = WEB_ENDPOINT_HINTS
 _ALLOWED_HINTS = _ALLOWED_SHELL_HINTS  # legacy alias used by Round C tests
 
 
@@ -846,5 +854,297 @@ def test_orchestrator_skip_credential_ingester(tmp_path: Path) -> None:
     assert stats.by_kind.get("credential", 0) == 0
     assert "credential" not in stats.sub_rows
     assert conn.execute("SELECT COUNT(*) FROM credentials").fetchone()[0] == 0
+
+    conn.close()
+
+
+# ── Round F: _detect_web_asset ────────────────────────────────────────────────
+
+
+def test_detect_web_asset_js_extension(tmp_path: Path) -> None:
+    f = _make_file(tmp_path, "app.js", 'fetch("/api/status");\n')
+    assert _detect_web_asset(f) == "js"
+
+
+def test_detect_web_asset_html_extension(tmp_path: Path) -> None:
+    f = _make_file(tmp_path, "index.html", "<html></html>\n")
+    assert _detect_web_asset(f) == "html"
+
+
+def test_detect_web_asset_htm_normalizes_to_html(tmp_path: Path) -> None:
+    f = _make_file(tmp_path, "page.htm", "<html></html>\n")
+    assert _detect_web_asset(f) == "html"
+
+
+def test_detect_web_asset_mjs_normalizes_to_js(tmp_path: Path) -> None:
+    f = _make_file(tmp_path, "module.mjs", "export default {};\n")
+    assert _detect_web_asset(f) == "js"
+
+
+def test_detect_web_asset_cgi_extension(tmp_path: Path) -> None:
+    # non-shell .cgi (no shebang) → claimed by web_asset
+    f = _make_file(tmp_path, "handler.cgi", "Content-Type: text/html\n\nhello\n")
+    assert _detect_web_asset(f) == "cgi"
+
+
+def test_detect_web_asset_php_extension(tmp_path: Path) -> None:
+    f = _make_file(tmp_path, "index.php", "<?php echo 'ok'; ?>\n")
+    assert _detect_web_asset(f) == "php"
+
+
+def test_detect_web_asset_txt_returns_none(tmp_path: Path) -> None:
+    f = _make_file(tmp_path, "readme.txt", "plain text\n")
+    assert _detect_web_asset(f) is None
+
+
+def test_detect_web_asset_binary_returns_none(tmp_path: Path) -> None:
+    f = _make_binary_file(tmp_path, "firmware.bin")
+    assert _detect_web_asset(f) is None
+
+
+def test_detect_web_asset_no_extension_returns_none(tmp_path: Path) -> None:
+    f = _make_file(tmp_path, "Makefile", "all:\n\techo done\n")
+    assert _detect_web_asset(f) is None
+
+
+# ── Round F: _classify_endpoint ───────────────────────────────────────────────
+
+
+def test_classify_endpoint_api_path(tmp_path: Path) -> None:
+    assert _classify_endpoint("/api/status") == "api_endpoint"
+
+
+def test_classify_endpoint_cgi_bin(tmp_path: Path) -> None:
+    assert _classify_endpoint("/cgi-bin/handler") == "cgi_endpoint"
+
+
+def test_classify_endpoint_external_url(tmp_path: Path) -> None:
+    assert _classify_endpoint("http://example.com/api") == "external_url"
+
+
+def test_classify_endpoint_param_question_mark(tmp_path: Path) -> None:
+    assert _classify_endpoint("/api/search?q=test") == "param_in_endpoint"
+
+
+def test_classify_endpoint_param_template_var(tmp_path: Path) -> None:
+    assert _classify_endpoint("/api/${endpoint}") == "param_in_endpoint"
+
+
+# ── Round F: _ingest_web_asset — JS endpoint extraction ──────────────────────
+
+# Vendor-neutral generic fixtures (§5.5). Paths use /api/ and /cgi-bin/ conventions.
+_FIXTURE_JS_ENDPOINTS = """\
+// SPA API client
+fetch("/api/status");
+axios.post("/api/login", {data: "x"});
+xhr.open("POST", "/cgi-bin/handler", true);
+// repeated call — must deduplicate:
+fetch("/api/status");
+"""
+
+_FIXTURE_HTML_FORM = """\
+<!DOCTYPE html>
+<html>
+<body>
+<form action="/api/save" method="post">
+  <input type="text" name="data">
+  <button type="submit">Submit</button>
+</form>
+</body>
+</html>
+"""
+
+_FIXTURE_JS_DEDUP = """\
+fetch("/api/x");
+fetch("/api/x");
+fetch("/api/x");
+"""
+
+
+def test_ingest_web_asset_js_fetch_axios_xhr(tmp_path: Path) -> None:
+    """JS file: fetch, axios, XHR each produce a correctly attributed row."""
+    conn = open_db(tmp_path / "analysis.db")
+    f = _make_file(tmp_path, "app.js", _FIXTURE_JS_ENDPOINTS)
+    file_id = _insert_nbf(conn, "web_asset", "js", f)
+
+    count = _ingest_web_asset(conn, file_id, f)
+    conn.commit()
+
+    assert count >= 3
+
+    rows = conn.execute(
+        "SELECT source, method, path, vuln_hint FROM web_endpoints WHERE file_id = ?",
+        (file_id,),
+    ).fetchall()
+
+    sources = {r[0] for r in rows}
+    assert "fetch" in sources
+    assert "axios" in sources
+    assert "xhr" in sources
+
+    # axios row: method extracted from the verb
+    axios_rows = [r for r in rows if r[0] == "axios"]
+    assert len(axios_rows) >= 1
+    assert axios_rows[0][1] == "POST"
+    assert axios_rows[0][2] == "/api/login"
+    assert axios_rows[0][3] == "api_endpoint"
+
+    # xhr row: method and cgi-bin path
+    xhr_rows = [r for r in rows if r[0] == "xhr"]
+    assert len(xhr_rows) >= 1
+    assert xhr_rows[0][1] == "POST"
+    assert "/cgi-bin/handler" in xhr_rows[0][2]
+    assert xhr_rows[0][3] == "cgi_endpoint"
+
+    # fetch row: no method, api path
+    fetch_rows = [r for r in rows if r[0] == "fetch"]
+    assert len(fetch_rows) >= 1
+    assert fetch_rows[0][1] is None
+    assert fetch_rows[0][2] == "/api/status"
+
+    conn.close()
+
+
+def test_ingest_web_asset_html_form(tmp_path: Path) -> None:
+    """HTML form with action + method produces a single correct row."""
+    conn = open_db(tmp_path / "analysis.db")
+    f = _make_file(tmp_path, "save.html", _FIXTURE_HTML_FORM)
+    file_id = _insert_nbf(conn, "web_asset", "html", f)
+
+    count = _ingest_web_asset(conn, file_id, f)
+    conn.commit()
+
+    assert count >= 1
+
+    form_rows = conn.execute(
+        "SELECT method, path, vuln_hint FROM web_endpoints WHERE file_id = ? AND source = 'form'",
+        (file_id,),
+    ).fetchall()
+    assert len(form_rows) == 1
+    assert form_rows[0][0] == "POST"
+    assert form_rows[0][1] == "/api/save"
+    assert form_rows[0][2] == "api_endpoint"
+
+    conn.close()
+
+
+def test_ingest_web_asset_dedup_same_call(tmp_path: Path) -> None:
+    """Three identical fetch() calls produce exactly one row for that source+path."""
+    conn = open_db(tmp_path / "analysis.db")
+    f = _make_file(tmp_path, "dup.js", _FIXTURE_JS_DEDUP)
+    file_id = _insert_nbf(conn, "web_asset", "js", f)
+
+    _ingest_web_asset(conn, file_id, f)
+    conn.commit()
+
+    fetch_count = conn.execute(
+        "SELECT COUNT(*) FROM web_endpoints WHERE file_id = ? AND source = 'fetch'",
+        (file_id,),
+    ).fetchone()[0]
+    assert fetch_count == 1
+
+    conn.close()
+
+
+def test_ingest_web_asset_all_hints_categorical(tmp_path: Path) -> None:
+    """Every vuln_hint written to web_endpoints must be in the fixed vocabulary."""
+    conn = open_db(tmp_path / "analysis.db")
+    f = _make_file(tmp_path, "multi.js", _FIXTURE_JS_ENDPOINTS)
+    file_id = _insert_nbf(conn, "web_asset", "js", f)
+    _ingest_web_asset(conn, file_id, f)
+    conn.commit()
+
+    rows = conn.execute(
+        "SELECT vuln_hint FROM web_endpoints WHERE file_id = ? AND vuln_hint IS NOT NULL",
+        (file_id,),
+    ).fetchall()
+    assert len(rows) >= 1
+    for (hint,) in rows:
+        assert hint in _ALLOWED_WEB_HINTS, f"unexpected vuln_hint: {hint!r}"
+
+    conn.close()
+
+
+def test_ingest_web_asset_binary_returns_zero(tmp_path: Path) -> None:
+    conn = open_db(tmp_path / "analysis.db")
+    f = _make_binary_file(tmp_path, "blob.bin")
+    file_id = _insert_nbf(conn, "web_asset", "bin", f)
+
+    count = _ingest_web_asset(conn, file_id, f)
+    conn.commit()
+
+    assert count == 0
+    conn.close()
+
+
+# ── Round F: orchestrator integration — FD3 + sub_rows ───────────────────────
+
+
+def _build_web_fixture_tree(root: Path) -> None:
+    """Firmware tree with web assets and a shell-backed CGI for FD3 testing."""
+    (root / "www").mkdir()
+
+    (root / "www" / "app.js").write_text(
+        'fetch("/api/status");\naxios.post("/api/login");\n',
+        encoding="utf-8",
+    )
+    (root / "www" / "index.html").write_text(
+        '<form action="/api/save" method="post"></form>\n',
+        encoding="utf-8",
+    )
+    # FD3: shell shebang → claimed by shell_script, not web_asset
+    (root / "www" / "update.cgi").write_text(
+        "#!/bin/sh\necho Content-Type: text/html\necho\n",
+        encoding="utf-8",
+    )
+
+
+def test_orchestrator_web_asset_sub_rows(tmp_path: Path) -> None:
+    """Web asset tree: JS + HTML ingested; sub_rows['web_asset'] >= 1."""
+    fs_root = tmp_path / "firmware"
+    fs_root.mkdir()
+    _build_web_fixture_tree(fs_root)
+
+    conn = open_db(tmp_path / "analysis.db")
+    stats = run_all_ingesters(conn, fs_root)
+
+    # app.js and index.html are web assets; update.cgi goes to shell_script
+    assert stats.by_kind.get("web_asset", 0) >= 2
+    assert stats.sub_rows.get("web_asset", 0) >= 1
+
+    conn.close()
+
+
+def test_orchestrator_fd3_shell_cgi_claimed_by_shell_script(tmp_path: Path) -> None:
+    """FD3: a shell-shebang .cgi is claimed by shell_script, not web_asset."""
+    fs_root = tmp_path / "firmware"
+    fs_root.mkdir()
+    _build_web_fixture_tree(fs_root)
+
+    conn = open_db(tmp_path / "analysis.db")
+    run_all_ingesters(conn, fs_root)
+
+    # update.cgi has #!/bin/sh → shell_script ingester claims it first
+    cgi_rows = conn.execute(
+        "SELECT kind FROM non_binary_files WHERE name = 'update.cgi'"
+    ).fetchall()
+    assert len(cgi_rows) == 1
+    assert cgi_rows[0][0] == "shell_script"
+
+    conn.close()
+
+
+def test_orchestrator_skip_web_asset_ingester(tmp_path: Path) -> None:
+    """skip_ingesters={'web_asset'} must leave web_endpoints table empty."""
+    fs_root = tmp_path / "firmware"
+    fs_root.mkdir()
+    _build_web_fixture_tree(fs_root)
+
+    conn = open_db(tmp_path / "analysis.db")
+    stats = run_all_ingesters(conn, fs_root, skip_ingesters=frozenset({"web_asset"}))
+
+    assert stats.by_kind.get("web_asset", 0) == 0
+    assert "web_asset" not in stats.sub_rows
+    assert conn.execute("SELECT COUNT(*) FROM web_endpoints").fetchone()[0] == 0
 
     conn.close()

@@ -9,7 +9,7 @@ Current registry:
   [0] shell_script  — ShellScript ingester (Round C)
   [1] config_file   — ConfigFile ingester (Round D)
   [2] credential    — Credential ingester (Round E)
-  [ ] web_asset     — placeholder (Round F, M2)
+  [3] web_asset     — WebAsset ingester (Round F, M2)
   [ ] kernel_module — placeholder (Round G, M3)
 """
 
@@ -25,12 +25,13 @@ from treasure_map.lib.analyze.non_binary.framework import (
 )
 from treasure_map.lib.analyze.non_binary.orchestrator import NonBinaryStats, run_all_ingesters
 from treasure_map.lib.analyze.non_binary.shell_script import SHELL_SCRIPT_INGESTER
+from treasure_map.lib.analyze.non_binary.web_asset import WEB_ASSET_INGESTER
 
 INGESTER_REGISTRY: list[NonBinaryIngester] = [
-    SHELL_SCRIPT_INGESTER,
-    CONFIG_FILE_INGESTER,
-    CREDENTIAL_INGESTER,
-    # Round F: web_asset ingester (append here, M2)
+    SHELL_SCRIPT_INGESTER,  # [0] Round C
+    CONFIG_FILE_INGESTER,  # [1] Round D
+    CREDENTIAL_INGESTER,  # [2] Round E
+    WEB_ASSET_INGESTER,  # [3] Round F
     # Round G: kernel_module ingester (append here, M3)
 ]
 
@@ -43,5 +44,6 @@ __all__ = [
     "NonBinaryFile",
     "NonBinaryIngester",
     "NonBinaryStats",
+    "WEB_ASSET_INGESTER",
     "run_all_ingesters",
 ]

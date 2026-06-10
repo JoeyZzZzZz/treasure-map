@@ -114,4 +114,5 @@ def analyze(
     click.echo(f"  Script calls: {result.script_calls_ingested}")
     click.echo(f"  Config entries: {result.config_entries_ingested}")
     click.echo(f"  Credentials: {result.credentials_ingested}")
+    click.echo(f"  Web endpoints: {result.web_endpoints_ingested}")
     click.echo(f"  DB       : {result.db_path}")

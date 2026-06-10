@@ -94,5 +94,6 @@ async def analyze_firmware(
         "script_calls_ingested": result.script_calls_ingested,
         "config_entries_ingested": result.config_entries_ingested,
         "credentials_ingested": result.credentials_ingested,
+        "web_endpoints_ingested": result.web_endpoints_ingested,
         "elapsed_s": round(result.elapsed, 1),
     }

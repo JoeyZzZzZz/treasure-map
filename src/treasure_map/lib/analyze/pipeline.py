@@ -57,6 +57,7 @@ class AnalyzeResult:
     script_calls_ingested: int  # Round C: rows written to script_calls
     config_entries_ingested: int  # Round D: rows written to config_entries
     credentials_ingested: int  # Round E: rows written to credentials
+    web_endpoints_ingested: int  # Round F: rows written to web_endpoints
     elapsed: float
 
 
@@ -170,5 +171,6 @@ async def run_analyze(
         script_calls_ingested=nb_stats.sub_rows.get("shell_script", 0),
         config_entries_ingested=nb_stats.sub_rows.get("config_file", 0),
         credentials_ingested=nb_stats.sub_rows.get("credential", 0),
+        web_endpoints_ingested=nb_stats.sub_rows.get("web_asset", 0),
         elapsed=time.monotonic() - t0,
     )

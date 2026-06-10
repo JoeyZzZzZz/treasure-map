@@ -209,6 +209,23 @@ CREATE TABLE IF NOT EXISTS credentials (
 CREATE INDEX IF NOT EXISTS idx_credentials_file ON credentials(file_id);
 CREATE INDEX IF NOT EXISTS idx_credentials_type ON credentials(cred_type);
 CREATE INDEX IF NOT EXISTS idx_credentials_hint ON credentials(vuln_hint);
+
+-- Web 端点 (WebAsset ingester sub-table, Round F; FK -> non_binary_files)
+-- Attack-surface evidence: endpoints the firmware's web assets reference. path is the
+-- asset's OWN content (evidence), not generated. vuln_hint is categorical (§5.3).
+CREATE TABLE IF NOT EXISTS web_endpoints (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id     INTEGER NOT NULL,
+    asset_type  TEXT,                 -- subtype: html / js / cgi / php / asp / jsp / ...
+    method      TEXT,                 -- GET / POST / PUT / DELETE / NULL if not derivable
+    path        TEXT,                 -- the endpoint path or URL (evidence)
+    source      TEXT,                 -- fetch / xhr / axios / ajax / form / cgi_ref / literal
+    vuln_hint   TEXT,                 -- CATEGORICAL label only (§5.3); never a payload
+    FOREIGN KEY(file_id) REFERENCES non_binary_files(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_web_endpoints_file ON web_endpoints(file_id);
+CREATE INDEX IF NOT EXISTS idx_web_endpoints_hint ON web_endpoints(vuln_hint);
 CREATE INDEX IF NOT EXISTS idx_components_binary  ON components(binary_id);
 CREATE INDEX IF NOT EXISTS idx_components_product ON components(product);
 CREATE INDEX IF NOT EXISTS idx_cve_binary         ON cve_matches(binary_id);
