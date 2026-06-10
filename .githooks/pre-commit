@@ -12,10 +12,24 @@ if [ -n "$SENSITIVE" ]; then
 fi
 
 # ── §5.5 vendor-neutrality enforcement ───────────────────────────────────────
-WATCHLIST=".githooks/vendor-watchlist.txt"
+# Resolve watchlist: env override → local notes dir → local repo copy → example.
+WATCHLIST=""
+for cand in "$TM_VENDOR_WATCHLIST" \
+            "$HOME/treasure-map-notes/vendor-watchlist.txt" \
+            ".githooks/vendor-watchlist.txt" \
+            ".githooks/vendor-watchlist.example.txt"; do
+    if [ -n "$cand" ] && [ -f "$cand" ]; then WATCHLIST="$cand"; break; fi
+done
+if [ "$WATCHLIST" = ".githooks/vendor-watchlist.example.txt" ]; then
+    echo "ℹ️  vendor watchlist: using brand-free example (regex patterns only)."
+    echo "    Install the full local list at ~/treasure-map-notes/vendor-watchlist.txt"
+    echo "    (or set TM_VENDOR_WATCHLIST) for complete brand-name coverage."
+fi
 if [ -f "$WATCHLIST" ]; then
     ADDED=$(git diff --cached -U0 --diff-filter=ACM -- . \
-            ":(exclude)$WATCHLIST" ":(exclude).githooks/pre-commit" \
+            ":(exclude).githooks/vendor-watchlist.txt" \
+            ":(exclude).githooks/vendor-watchlist.example.txt" \
+            ":(exclude).githooks/pre-commit" \
             | grep '^+' | grep -v '^+++' || true)
     if [ -n "$ADDED" ]; then
         HITS=""
