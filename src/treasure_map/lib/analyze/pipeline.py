@@ -56,6 +56,7 @@ class AnalyzeResult:
     non_binary_files_ingested: int  # Round C: rows written to non_binary_files
     script_calls_ingested: int  # Round C: rows written to script_calls
     config_entries_ingested: int  # Round D: rows written to config_entries
+    credentials_ingested: int  # Round E: rows written to credentials
     elapsed: float
 
 
@@ -168,5 +169,6 @@ async def run_analyze(
         non_binary_files_ingested=nb_stats.files_ingested,
         script_calls_ingested=nb_stats.sub_rows.get("shell_script", 0),
         config_entries_ingested=nb_stats.sub_rows.get("config_file", 0),
+        credentials_ingested=nb_stats.sub_rows.get("credential", 0),
         elapsed=time.monotonic() - t0,
     )

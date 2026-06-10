@@ -188,6 +188,27 @@ CREATE INDEX IF NOT EXISTS idx_script_calls_cmd  ON script_calls(command);
 CREATE INDEX IF NOT EXISTS idx_script_calls_ui   ON script_calls(has_user_input);
 CREATE INDEX IF NOT EXISTS idx_config_entries_file ON config_entries(file_id);
 CREATE INDEX IF NOT EXISTS idx_config_entries_hint ON config_entries(vuln_hint);
+
+-- 凭据条目 (Credential ingester sub-table, Round E; FK -> non_binary_files)
+-- ED1: stores the observed artifact as verifiable evidence (deterministically
+-- re-derivable from the firmware, §13.3). is_sensitive=1 flags material that the
+-- export/case-study/commit path MUST redact before publishing (§5.5). Treasure Map
+-- never GENERATES attack output (PoC/cracker/key-recovery/decryption) — §5.2/§5.3.
+CREATE TABLE IF NOT EXISTS credentials (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id      INTEGER NOT NULL,
+    cred_type    TEXT,                -- private_key / certificate / public_key / passwd_entry / shadow_entry
+    identifier   TEXT,                -- username / cert subject / key label (non-secret); NULL if none
+    algorithm    TEXT,                -- rsa_private / ec_private / sha512crypt / md5crypt / des / yescrypt / ...
+    material     TEXT,                -- the observed artifact (PEM body / hash field) — evidence; redact on export
+    is_sensitive INTEGER DEFAULT 0,   -- 1 = private key or password hash present (redact before publishing)
+    vuln_hint    TEXT,                -- CATEGORICAL label only (§5.3); never a generated payload
+    FOREIGN KEY(file_id) REFERENCES non_binary_files(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_credentials_file ON credentials(file_id);
+CREATE INDEX IF NOT EXISTS idx_credentials_type ON credentials(cred_type);
+CREATE INDEX IF NOT EXISTS idx_credentials_hint ON credentials(vuln_hint);
 CREATE INDEX IF NOT EXISTS idx_components_binary  ON components(binary_id);
 CREATE INDEX IF NOT EXISTS idx_components_product ON components(product);
 CREATE INDEX IF NOT EXISTS idx_cve_binary         ON cve_matches(binary_id);

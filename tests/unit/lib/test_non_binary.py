@@ -1,7 +1,7 @@
 # Copyright (C) 2025-2026 JoeyZzZzZz
 # SPDX-License-Identifier: AGPL-3.0-only
 """Unit tests for the non-binary ingester framework, ShellScript ingester (Round C),
-and ConfigFile ingester (Round D)."""
+ConfigFile ingester (Round D), and Credential ingester (Round E)."""
 
 from __future__ import annotations
 
@@ -11,6 +11,11 @@ from treasure_map.lib.analyze.non_binary.config_file import (
     CONFIG_RISK_RULES,
     _detect_config,
     _ingest_config,
+)
+from treasure_map.lib.analyze.non_binary.credential import (
+    CREDENTIAL_HINTS,
+    _detect_credential,
+    _ingest_credential,
 )
 from treasure_map.lib.analyze.non_binary.framework import NonBinaryFile
 from treasure_map.lib.analyze.non_binary.orchestrator import run_all_ingesters
@@ -25,6 +30,7 @@ from treasure_map.lib.storage.connection import open_db
 
 _ALLOWED_SHELL_HINTS = frozenset(label for label, _ in SHELL_RISK_RULES)
 _ALLOWED_CONFIG_HINTS = frozenset(label for label, _ in CONFIG_RISK_RULES)
+_ALLOWED_CRED_HINTS = CREDENTIAL_HINTS
 _ALLOWED_HINTS = _ALLOWED_SHELL_HINTS  # legacy alias used by Round C tests
 
 
@@ -487,5 +493,358 @@ def test_orchestrator_skip_config_ingester(tmp_path: Path) -> None:
     assert stats.by_kind.get("config_file", 0) == 0
     assert "config_file" not in stats.sub_rows
     assert conn.execute("SELECT COUNT(*) FROM config_entries").fetchone()[0] == 0
+
+    conn.close()
+
+
+# ── Round E: _detect_credential ───────────────────────────────────────────────
+
+
+def test_detect_credential_pem_extension(tmp_path: Path) -> None:
+    content = "-----BEGIN RSA PRIVATE KEY-----\nFAKE\n-----END RSA PRIVATE KEY-----\n"
+    f = _make_file(tmp_path, "server.pem", content)
+    assert _detect_credential(f) == "pem"
+
+
+def test_detect_credential_key_extension_with_begin(tmp_path: Path) -> None:
+    content = "-----BEGIN EC PRIVATE KEY-----\nFAKE\n-----END EC PRIVATE KEY-----\n"
+    f = _make_file(tmp_path, "tls.key", content)
+    assert _detect_credential(f) == "pem"
+
+
+def test_detect_credential_shadow_basename(tmp_path: Path) -> None:
+    f = _make_file(tmp_path, "shadow", "root::18000:0:99999:7:::\n")
+    assert _detect_credential(f) == "shadow"
+
+
+def test_detect_credential_passwd_basename(tmp_path: Path) -> None:
+    f = _make_file(tmp_path, "passwd", "root:x:0:0:root:/root:/bin/sh\n")
+    assert _detect_credential(f) == "passwd"
+
+
+def test_detect_credential_txt_returns_none(tmp_path: Path) -> None:
+    f = _make_file(tmp_path, "readme.txt", "no credentials here\n")
+    assert _detect_credential(f) is None
+
+
+def test_detect_credential_conf_returns_none(tmp_path: Path) -> None:
+    f = _make_file(tmp_path, "httpd.conf", "port=80\n")
+    assert _detect_credential(f) is None
+
+
+def test_detect_credential_binary_returns_none(tmp_path: Path) -> None:
+    f = _make_binary_file(tmp_path, "daemon")
+    assert _detect_credential(f) is None
+
+
+# ── Round E: _ingest_credential — PEM blocks ──────────────────────────────────
+
+# Clearly fake truncated placeholders — not real or usable keys (committed to repo).
+_FIXTURE_PEM_PRIVKEY = (
+    "-----BEGIN RSA PRIVATE KEY-----\n"
+    "FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE\n"
+    "FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE\n"
+    "-----END RSA PRIVATE KEY-----\n"
+)
+
+_FIXTURE_PEM_CERT = (
+    "-----BEGIN CERTIFICATE-----\n"
+    "FAKECERTIFICATEFAKECERTIFICATEFAKECERTIFICATE\n"
+    "FAKECERTIFICATEFAKECERTIFICATEFAKECERTIFICATE\n"
+    "-----END CERTIFICATE-----\n"
+)
+
+_FIXTURE_PEM_PUBKEY = (
+    "-----BEGIN PUBLIC KEY-----\n"
+    "FAKEPUBLICKEYFAKEPUBLICKEYFAKEPUBLICKEY\n"
+    "-----END PUBLIC KEY-----\n"
+)
+
+
+def _insert_nbf(conn: object, kind: str, subtype: str, f: NonBinaryFile) -> int:
+    import sqlite3
+
+    assert isinstance(conn, sqlite3.Connection)
+    row_id = conn.execute(
+        "INSERT INTO non_binary_files (kind, subtype, name, path, sha256, size_bytes, detected_via)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (kind, subtype, f.name, f.rel_path, f.sha256, f.size_bytes, "test"),
+    ).lastrowid
+    conn.commit()
+    return int(row_id)  # type: ignore[arg-type]
+
+
+def test_ingest_credential_pem_private_key(tmp_path: Path) -> None:
+    """Private-key block → hardcoded_private_key, is_sensitive=1, material holds block."""
+    conn = open_db(tmp_path / "analysis.db")
+    f = _make_file(tmp_path, "server.pem", _FIXTURE_PEM_PRIVKEY)
+    file_id = _insert_nbf(conn, "credential", "pem", f)
+
+    count = _ingest_credential(conn, file_id, f)
+    conn.commit()
+
+    assert count == 1
+    row = conn.execute(
+        "SELECT cred_type, algorithm, is_sensitive, vuln_hint, material FROM credentials"
+        " WHERE file_id = ?",
+        (file_id,),
+    ).fetchone()
+    assert row[0] == "private_key"
+    assert row[1] == "rsa_private"
+    assert row[2] == 1
+    assert row[3] == "hardcoded_private_key"
+    # material must hold the observed block so findings are independently verifiable
+    assert row[4] is not None
+    assert "-----BEGIN RSA PRIVATE KEY-----" in row[4]
+    assert "-----END RSA PRIVATE KEY-----" in row[4]
+
+    conn.close()
+
+
+def test_ingest_credential_pem_certificate(tmp_path: Path) -> None:
+    conn = open_db(tmp_path / "analysis.db")
+    f = _make_file(tmp_path, "ca.crt", _FIXTURE_PEM_CERT)
+    file_id = _insert_nbf(conn, "credential", "pem", f)
+
+    count = _ingest_credential(conn, file_id, f)
+    conn.commit()
+
+    assert count == 1
+    row = conn.execute(
+        "SELECT cred_type, is_sensitive, vuln_hint FROM credentials WHERE file_id = ?",
+        (file_id,),
+    ).fetchone()
+    assert row[0] == "certificate"
+    assert row[1] == 0
+    assert row[2] == "certificate_present"
+
+    conn.close()
+
+
+def test_ingest_credential_pem_public_key(tmp_path: Path) -> None:
+    conn = open_db(tmp_path / "analysis.db")
+    f = _make_file(tmp_path, "id_rsa.pub", _FIXTURE_PEM_PUBKEY)
+    file_id = _insert_nbf(conn, "credential", "pem", f)
+
+    count = _ingest_credential(conn, file_id, f)
+    conn.commit()
+
+    assert count == 1
+    row = conn.execute(
+        "SELECT cred_type, is_sensitive, vuln_hint FROM credentials WHERE file_id = ?",
+        (file_id,),
+    ).fetchone()
+    assert row[0] == "public_key"
+    assert row[1] == 0
+    assert row[2] == "public_key_present"
+
+    conn.close()
+
+
+def test_ingest_credential_pem_multi_block(tmp_path: Path) -> None:
+    """A file with both a private key and a certificate produces two rows."""
+    content = _FIXTURE_PEM_PRIVKEY + _FIXTURE_PEM_CERT
+    conn = open_db(tmp_path / "analysis.db")
+    f = _make_file(tmp_path, "bundle.pem", content)
+    file_id = _insert_nbf(conn, "credential", "pem", f)
+
+    count = _ingest_credential(conn, file_id, f)
+    conn.commit()
+
+    assert count == 2
+    hints = {
+        r[0]
+        for r in conn.execute(
+            "SELECT vuln_hint FROM credentials WHERE file_id = ?", (file_id,)
+        ).fetchall()
+    }
+    assert "hardcoded_private_key" in hints
+    assert "certificate_present" in hints
+
+    conn.close()
+
+
+# ── Round E: _ingest_credential — shadow file ────────────────────────────────
+
+# Generic shadow fixture lines — vendor-neutral, clearly fake hashes (§5.5).
+_FIXTURE_SHADOW_EMPTY_ROOT = "root::18000:0:99999:7:::\n"
+_FIXTURE_SHADOW_MD5 = "webadmin:$1$" + "fakesalt$fakemd5hash123abc:18000:0:99999:7:::\n"
+_FIXTURE_SHADOW_SHA512 = "sysadmin:$6$" + "fakesalt$fakesha512hashfake:18000:0:99999:7:::\n"
+_FIXTURE_SHADOW_LOCKED_BANG = "guest:!:18000:0:99999:7:::\n"
+_FIXTURE_SHADOW_LOCKED_STAR = "daemon:*:18000:0:99999:7:::\n"
+
+
+def test_ingest_credential_shadow_empty_root(tmp_path: Path) -> None:
+    conn = open_db(tmp_path / "analysis.db")
+    f = _make_file(tmp_path, "shadow", _FIXTURE_SHADOW_EMPTY_ROOT)
+    file_id = _insert_nbf(conn, "credential", "shadow", f)
+
+    count = _ingest_credential(conn, file_id, f)
+    conn.commit()
+
+    assert count == 1
+    row = conn.execute(
+        "SELECT identifier, is_sensitive, vuln_hint FROM credentials WHERE file_id = ?",
+        (file_id,),
+    ).fetchone()
+    assert row[0] == "root"
+    assert row[1] == 0
+    assert row[2] == "empty_root_password"
+
+    conn.close()
+
+
+def test_ingest_credential_shadow_md5_hash(tmp_path: Path) -> None:
+    """md5crypt hash → weak_password_hash_algo, is_sensitive=1, material holds hash field."""
+    conn = open_db(tmp_path / "analysis.db")
+    f = _make_file(tmp_path, "shadow", _FIXTURE_SHADOW_MD5)
+    file_id = _insert_nbf(conn, "credential", "shadow", f)
+
+    count = _ingest_credential(conn, file_id, f)
+    conn.commit()
+
+    assert count == 1
+    row = conn.execute(
+        "SELECT algorithm, is_sensitive, vuln_hint, material FROM credentials WHERE file_id = ?",
+        (file_id,),
+    ).fetchone()
+    assert row[0] == "md5crypt"
+    assert row[1] == 1
+    assert row[2] == "weak_password_hash_algo"
+    # material must hold the observed hash field for verifiability (ED1)
+    assert row[3] is not None
+    assert row[3].startswith("$1$")
+
+    conn.close()
+
+
+def test_ingest_credential_shadow_sha512_hash(tmp_path: Path) -> None:
+    conn = open_db(tmp_path / "analysis.db")
+    f = _make_file(tmp_path, "shadow", _FIXTURE_SHADOW_SHA512)
+    file_id = _insert_nbf(conn, "credential", "shadow", f)
+
+    count = _ingest_credential(conn, file_id, f)
+    conn.commit()
+
+    assert count == 1
+    row = conn.execute(
+        "SELECT algorithm, vuln_hint FROM credentials WHERE file_id = ?", (file_id,)
+    ).fetchone()
+    assert row[0] == "sha512crypt"
+    assert row[1] == "present_password_hash"
+
+    conn.close()
+
+
+def test_ingest_credential_shadow_locked_skipped(tmp_path: Path) -> None:
+    """Locked entries (! and *) must produce zero rows."""
+    content = _FIXTURE_SHADOW_LOCKED_BANG + _FIXTURE_SHADOW_LOCKED_STAR
+    conn = open_db(tmp_path / "analysis.db")
+    f = _make_file(tmp_path, "shadow", content)
+    file_id = _insert_nbf(conn, "credential", "shadow", f)
+
+    count = _ingest_credential(conn, file_id, f)
+    conn.commit()
+
+    assert count == 0
+    n = conn.execute("SELECT COUNT(*) FROM credentials WHERE file_id=?", (file_id,)).fetchone()[0]
+    assert n == 0
+
+    conn.close()
+
+
+def test_ingest_credential_all_hints_categorical(tmp_path: Path) -> None:
+    """Every vuln_hint written to the DB must be in the fixed vocabulary."""
+    conn = open_db(tmp_path / "analysis.db")
+    combined = _FIXTURE_SHADOW_EMPTY_ROOT + _FIXTURE_SHADOW_MD5 + _FIXTURE_SHADOW_SHA512
+    f = _make_file(tmp_path, "shadow", combined)
+    file_id = _insert_nbf(conn, "credential", "shadow", f)
+    _ingest_credential(conn, file_id, f)
+    conn.commit()
+
+    rows = conn.execute(
+        "SELECT vuln_hint FROM credentials WHERE file_id = ? AND vuln_hint IS NOT NULL",
+        (file_id,),
+    ).fetchall()
+    for (hint,) in rows:
+        assert hint in _ALLOWED_CRED_HINTS, f"unexpected vuln_hint: {hint!r}"
+
+    conn.close()
+
+
+def test_ingest_credential_is_sensitive_correct(tmp_path: Path) -> None:
+    """is_sensitive=1 for private key + hash; 0 for cert, public key, empty password."""
+    conn = open_db(tmp_path / "analysis.db")
+
+    pem_bundle = _FIXTURE_PEM_PRIVKEY + _FIXTURE_PEM_CERT + _FIXTURE_PEM_PUBKEY
+    f_pem = _make_file(tmp_path, "bundle.pem", pem_bundle)
+    fid_pem = _insert_nbf(conn, "credential", "pem", f_pem)
+    _ingest_credential(conn, fid_pem, f_pem)
+
+    f_shadow = _make_file(tmp_path, "shadow", _FIXTURE_SHADOW_EMPTY_ROOT + _FIXTURE_SHADOW_MD5)
+    fid_shadow = _insert_nbf(conn, "credential", "shadow", f_shadow)
+    _ingest_credential(conn, fid_shadow, f_shadow)
+    conn.commit()
+
+    sensitive = {
+        r[0]
+        for r in conn.execute("SELECT vuln_hint FROM credentials WHERE is_sensitive = 1").fetchall()
+    }
+    non_sensitive = {
+        r[0]
+        for r in conn.execute(
+            "SELECT vuln_hint FROM credentials WHERE is_sensitive = 0 AND vuln_hint IS NOT NULL"
+        ).fetchall()
+    }
+
+    assert "hardcoded_private_key" in sensitive
+    assert "weak_password_hash_algo" in sensitive
+    assert "certificate_present" in non_sensitive
+    assert "public_key_present" in non_sensitive
+    assert "empty_root_password" in non_sensitive
+
+    conn.close()
+
+
+# ── Round E: orchestrator integration — skip credential ingester ──────────────
+
+
+def _build_credential_fixture_tree(root: Path) -> None:
+    """Firmware tree with a shadow file and a PEM key file."""
+    (root / "etc").mkdir()
+    (root / "etc" / "shadow").write_text(
+        _FIXTURE_SHADOW_EMPTY_ROOT + _FIXTURE_SHADOW_MD5,
+        encoding="utf-8",
+    )
+    (root / "etc" / "server.pem").write_text(_FIXTURE_PEM_PRIVKEY, encoding="utf-8")
+
+
+def test_orchestrator_credential_sub_rows(tmp_path: Path) -> None:
+    """Credential tree: both files ingested, sub_rows['credential'] >= 2."""
+    fs_root = tmp_path / "firmware"
+    fs_root.mkdir()
+    _build_credential_fixture_tree(fs_root)
+
+    conn = open_db(tmp_path / "analysis.db")
+    stats = run_all_ingesters(conn, fs_root)
+
+    assert stats.by_kind.get("credential", 0) == 2
+    assert stats.sub_rows.get("credential", 0) >= 2
+
+    conn.close()
+
+
+def test_orchestrator_skip_credential_ingester(tmp_path: Path) -> None:
+    """skip_ingesters={'credential'} must leave credentials table empty."""
+    fs_root = tmp_path / "firmware"
+    fs_root.mkdir()
+    _build_credential_fixture_tree(fs_root)
+
+    conn = open_db(tmp_path / "analysis.db")
+    stats = run_all_ingesters(conn, fs_root, skip_ingesters=frozenset({"credential"}))
+
+    assert stats.by_kind.get("credential", 0) == 0
+    assert "credential" not in stats.sub_rows
+    assert conn.execute("SELECT COUNT(*) FROM credentials").fetchone()[0] == 0
 
     conn.close()
