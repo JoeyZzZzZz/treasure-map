@@ -114,8 +114,8 @@ def _ingest_web_asset(conn: sqlite3.Connection, file_id: int, f: NonBinaryFile) 
     """Extract and insert web endpoint rows (FD1: relevant-only evidence).
 
     Stores the asset's OWN endpoint references verbatim -- never generates attack output.
-    Deduplicates within file on (method, path, source) to stay signal-dense (SPA code
-    tends to repeat the same calls).
+    Deduplicates within file on path: specific rules precede the literal catch-all, so
+    the first (most context-rich) match wins and literal never double-counts.
     """
     if f.text is None:
         return 0
@@ -125,7 +125,7 @@ def _ingest_web_asset(conn: sqlite3.Connection, file_id: int, f: NonBinaryFile) 
         return 0
 
     text = f.text
-    seen: set[tuple[str | None, str | None, str]] = set()
+    seen: set[str] = set()  # dedup on path; rule order ensures specific rules win
     rows: list[tuple[int, str, str | None, str, str, str]] = []
 
     for source, pattern in _RULES:
@@ -153,11 +153,11 @@ def _ingest_web_asset(conn: sqlite3.Connection, file_id: int, f: NonBinaryFile) 
             if not path:
                 continue
 
-            vuln_hint = _classify_endpoint(path)
-            key: tuple[str | None, str | None, str] = (method, path, source)
-            if key in seen:
+            if path in seen:
                 continue
-            seen.add(key)
+            seen.add(path)
+
+            vuln_hint = _classify_endpoint(path)
             rows.append((file_id, subtype, method, path, source, vuln_hint))
 
     if rows:

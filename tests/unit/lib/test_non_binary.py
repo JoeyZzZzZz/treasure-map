@@ -1046,6 +1046,31 @@ def test_ingest_web_asset_dedup_same_call(tmp_path: Path) -> None:
     conn.close()
 
 
+def test_ingest_web_asset_dedup_multi_rule_same_path(tmp_path: Path) -> None:
+    """A path matched by both a specific rule and the literal catch-all → one row only.
+
+    Regression for the (method,path,source) dedup scheme that allowed literal to
+    double-count paths already recorded by fetch/axios/xhr/form.
+    """
+    conn = open_db(tmp_path / "analysis.db")
+    # fetch("/api/x") is hit by the 'fetch' rule AND by the 'literal' catch-all.
+    f = _make_file(tmp_path, "api.js", 'fetch("/api/x");\n')
+    file_id = _insert_nbf(conn, "web_asset", "js", f)
+
+    count = _ingest_web_asset(conn, file_id, f)
+    conn.commit()
+
+    # Dedup on path: fetch rule wins (comes first); literal skipped → exactly 1 row.
+    assert count == 1
+    path_rows = conn.execute(
+        "SELECT COUNT(*) FROM web_endpoints WHERE file_id = ? AND path = '/api/x'",
+        (file_id,),
+    ).fetchone()[0]
+    assert path_rows == 1
+
+    conn.close()
+
+
 def test_ingest_web_asset_all_hints_categorical(tmp_path: Path) -> None:
     """Every vuln_hint written to web_endpoints must be in the fixed vocabulary."""
     conn = open_db(tmp_path / "analysis.db")
