@@ -33,7 +33,7 @@ class NonBinaryStats:
     files_scanned: int = 0
     files_ingested: int = 0
     by_kind: dict[str, int] = field(default_factory=dict)
-    script_calls: int = 0
+    sub_rows: dict[str, int] = field(default_factory=dict)
 
 
 def _walk_non_binary(fs_root: Path) -> list[NonBinaryFile]:
@@ -134,10 +134,10 @@ def run_all_ingesters(
             if subtype is None:
                 continue
             file_id = _register_file(conn, ingester, subtype, f)
-            sub_rows = ingester.ingest(conn, file_id, f)
+            sub_count = ingester.ingest(conn, file_id, f)
             stats.files_ingested += 1
             stats.by_kind[ingester.kind] = stats.by_kind.get(ingester.kind, 0) + 1
-            stats.script_calls += sub_rows
+            stats.sub_rows[ingester.kind] = stats.sub_rows.get(ingester.kind, 0) + sub_count
             break
 
     conn.commit()
@@ -147,16 +147,16 @@ def run_all_ingesters(
             "non_binary_done",
             {
                 "files_ingested": stats.files_ingested,
-                "script_calls": stats.script_calls,
+                "sub_rows": stats.sub_rows,
                 "by_kind": stats.by_kind,
             },
         )
 
     logger.info(
-        "non_binary: %d scanned, %d ingested (%s), %d script_calls",
+        "non_binary: %d scanned, %d ingested (%s), sub_rows=%s",
         stats.files_scanned,
         stats.files_ingested,
         stats.by_kind,
-        stats.script_calls,
+        stats.sub_rows,
     )
     return stats

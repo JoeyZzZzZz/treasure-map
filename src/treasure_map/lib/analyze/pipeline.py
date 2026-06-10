@@ -8,6 +8,7 @@ DB is the truth source; workspace step checkpoints are not used here.
 Week 2 scope: Ghidra. Week 3 Round A: Ghidra JSON ingest.
 Week 3 Round B: xrefs + string classification (wipe-and-rebuild each run).
 Week 3 Round C: non-binary ingester framework (wipe-and-rebuild each run).
+Week 3 Round D: config_file ingester + per-kind sub_rows stats.
 """
 
 from __future__ import annotations
@@ -54,6 +55,7 @@ class AnalyzeResult:
     total_xrefs: int  # Round B: sum of all layers
     non_binary_files_ingested: int  # Round C: rows written to non_binary_files
     script_calls_ingested: int  # Round C: rows written to script_calls
+    config_entries_ingested: int  # Round D: rows written to config_entries
     elapsed: float
 
 
@@ -164,6 +166,7 @@ async def run_analyze(
         strings_classified=xref_stats.strings_classified,
         total_xrefs=xref_stats.total_xrefs,
         non_binary_files_ingested=nb_stats.files_ingested,
-        script_calls_ingested=nb_stats.script_calls,
+        script_calls_ingested=nb_stats.sub_rows.get("shell_script", 0),
+        config_entries_ingested=nb_stats.sub_rows.get("config_file", 0),
         elapsed=time.monotonic() - t0,
     )

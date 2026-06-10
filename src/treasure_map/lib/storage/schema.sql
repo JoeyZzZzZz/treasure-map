@@ -126,6 +126,21 @@ CREATE TABLE IF NOT EXISTS script_calls (
     FOREIGN KEY(file_id) REFERENCES non_binary_files(id) ON DELETE CASCADE
 );
 
+-- 配置文件条目 (ConfigFile ingester sub-table, Round D; FK -> non_binary_files)
+-- Flagged-only: one row per security-relevant entry (DD1). value is evidence of
+-- firmware content, never a generated payload. Export/case-study paths MUST redact
+-- sensitive values + vendor strings (§5.5).
+CREATE TABLE IF NOT EXISTS config_entries (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id      INTEGER NOT NULL,
+    section      TEXT,                -- INI section, or NULL if sectionless
+    key          TEXT,
+    value        TEXT,                -- raw value (evidence of firmware content, DD1)
+    is_sensitive INTEGER DEFAULT 0,   -- 1 = hardcoded-credential candidate
+    vuln_hint    TEXT,                -- CATEGORICAL label only (§5.3); never a payload
+    FOREIGN KEY(file_id) REFERENCES non_binary_files(id) ON DELETE CASCADE
+);
+
 -- 第三方组件 + 版本（M5 CVE 匹配用）
 CREATE TABLE IF NOT EXISTS components (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -171,6 +186,8 @@ CREATE INDEX IF NOT EXISTS idx_nbf_sha256        ON non_binary_files(sha256);
 CREATE INDEX IF NOT EXISTS idx_script_calls_file ON script_calls(file_id);
 CREATE INDEX IF NOT EXISTS idx_script_calls_cmd  ON script_calls(command);
 CREATE INDEX IF NOT EXISTS idx_script_calls_ui   ON script_calls(has_user_input);
+CREATE INDEX IF NOT EXISTS idx_config_entries_file ON config_entries(file_id);
+CREATE INDEX IF NOT EXISTS idx_config_entries_hint ON config_entries(vuln_hint);
 CREATE INDEX IF NOT EXISTS idx_components_binary  ON components(binary_id);
 CREATE INDEX IF NOT EXISTS idx_components_product ON components(product);
 CREATE INDEX IF NOT EXISTS idx_cve_binary         ON cve_matches(binary_id);

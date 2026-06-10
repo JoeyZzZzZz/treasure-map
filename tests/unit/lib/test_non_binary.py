@@ -1,11 +1,17 @@
 # Copyright (C) 2025-2026 JoeyZzZzZz
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Unit tests for the non-binary ingester framework and ShellScript ingester."""
+"""Unit tests for the non-binary ingester framework, ShellScript ingester (Round C),
+and ConfigFile ingester (Round D)."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
+from treasure_map.lib.analyze.non_binary.config_file import (
+    CONFIG_RISK_RULES,
+    _detect_config,
+    _ingest_config,
+)
 from treasure_map.lib.analyze.non_binary.framework import NonBinaryFile
 from treasure_map.lib.analyze.non_binary.orchestrator import run_all_ingesters
 from treasure_map.lib.analyze.non_binary.shell_script import (
@@ -15,9 +21,11 @@ from treasure_map.lib.analyze.non_binary.shell_script import (
 )
 from treasure_map.lib.storage.connection import open_db
 
-# ── Allowed vuln_hint vocabulary (§5.3) ──────────────────────────────────────
+# ── Allowed vuln_hint vocabularies (§5.3) ────────────────────────────────────
 
-_ALLOWED_HINTS = frozenset(label for label, _ in SHELL_RISK_RULES)
+_ALLOWED_SHELL_HINTS = frozenset(label for label, _ in SHELL_RISK_RULES)
+_ALLOWED_CONFIG_HINTS = frozenset(label for label, _ in CONFIG_RISK_RULES)
+_ALLOWED_HINTS = _ALLOWED_SHELL_HINTS  # legacy alias used by Round C tests
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -193,8 +201,8 @@ def _build_fixture_tree(root: Path) -> None:
         '#!/bin/sh\nnvram get wan_ifname\neval "$CMD"\n', encoding="utf-8"
     )
 
-    # plain text — no matching ingester, should be silently skipped
-    (root / "etc" / "service.conf").write_text("[service]\nport=80\n", encoding="utf-8")
+    # plain text file — no matching ingester, should be silently skipped
+    (root / "etc" / "service.txt").write_text("[service]\nport=80\n", encoding="utf-8")
 
     # ELF magic stub — must be skipped by the walker
     elf_stub = root / "bin" / "main_service"
@@ -211,7 +219,7 @@ def test_orchestrator_ingests_shell_skips_elf(tmp_path: Path) -> None:
 
     assert stats.files_ingested == 1
     assert stats.by_kind.get("shell_script", 0) == 1
-    assert stats.script_calls >= 1
+    assert stats.sub_rows.get("shell_script", 0) >= 1
 
     rows = conn.execute("SELECT kind, name FROM non_binary_files").fetchall()
     names = {row[1] for row in rows}
@@ -232,7 +240,7 @@ def test_orchestrator_idempotent(tmp_path: Path) -> None:
     stats2 = run_all_ingesters(conn, fs_root)
 
     assert stats1.files_ingested == stats2.files_ingested
-    assert stats1.script_calls == stats2.script_calls
+    assert stats1.sub_rows == stats2.sub_rows
 
     count = conn.execute("SELECT COUNT(*) FROM non_binary_files").fetchone()[0]
     assert count == stats2.files_ingested
@@ -250,7 +258,234 @@ def test_orchestrator_skip_ingester(tmp_path: Path) -> None:
     stats = run_all_ingesters(conn, fs_root, skip_ingesters=frozenset({"shell_script"}))
 
     assert stats.files_ingested == 0
-    assert stats.script_calls == 0
+    assert stats.sub_rows == {}
     assert conn.execute("SELECT COUNT(*) FROM non_binary_files").fetchone()[0] == 0
+
+    conn.close()
+
+
+# ── Round D: _detect_config ───────────────────────────────────────────────────
+
+
+def test_detect_config_conf_extension(tmp_path: Path) -> None:
+    f = _make_file(tmp_path, "httpd.conf", "port=80\n")
+    assert _detect_config(f) == "conf"
+
+
+def test_detect_config_cfg_extension(tmp_path: Path) -> None:
+    f = _make_file(tmp_path, "system.cfg", "[net]\nip=192.168.1.1\n")
+    assert _detect_config(f) == "cfg"
+
+
+def test_detect_config_ini_extension(tmp_path: Path) -> None:
+    f = _make_file(tmp_path, "settings.ini", "[main]\ndebug=1\n")
+    assert _detect_config(f) == "ini"
+
+
+def test_detect_config_txt_returns_none(tmp_path: Path) -> None:
+    f = _make_file(tmp_path, "readme.txt", "some text\n")
+    assert _detect_config(f) is None
+
+
+def test_detect_config_binary_returns_none(tmp_path: Path) -> None:
+    f = _make_binary_file(tmp_path, "firmware.bin")
+    assert _detect_config(f) is None
+
+
+def test_detect_config_no_extension_returns_none(tmp_path: Path) -> None:
+    f = _make_file(tmp_path, "Makefile", "all:\n\techo done\n")
+    assert _detect_config(f) is None
+
+
+# ── Round D: _ingest_config — flagged rows, is_sensitive, categorical hints ──
+
+_FIXTURE_CONF = """\
+[web]
+port=80
+admin_password=changeme
+auth_required=off
+debug=1
+max_connections=100
+"""
+
+
+def test_ingest_config_flagged_only(tmp_path: Path) -> None:
+    conn = open_db(tmp_path / "analysis.db")
+    f = _make_file(tmp_path, "httpd.conf", _FIXTURE_CONF)
+
+    file_id = conn.execute(
+        "INSERT INTO non_binary_files (kind, subtype, name, path, sha256, size_bytes, detected_via)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("config_file", "conf", f.name, f.rel_path, f.sha256, f.size_bytes, "extension"),
+    ).lastrowid
+    conn.commit()
+
+    count = _ingest_config(conn, int(file_id), f)  # type: ignore[arg-type]
+    conn.commit()
+
+    # port, max_connections are benign — only the 3 flagged lines should be recorded
+    assert count == 3
+
+    rows = conn.execute(
+        "SELECT key, is_sensitive, vuln_hint FROM config_entries WHERE file_id = ?",
+        (file_id,),
+    ).fetchall()
+    hints = {row[2] for row in rows}
+    sensitive_keys = {row[0] for row in rows if row[1] == 1}
+
+    assert "hardcoded_credential" in hints
+    assert "auth_disabled" in hints
+    assert "debug_enabled" in hints
+    assert "admin_password" in sensitive_keys
+
+    for row in rows:
+        assert row[2] in _ALLOWED_CONFIG_HINTS, f"unexpected vuln_hint: {row[2]!r}"
+
+    conn.close()
+
+
+def test_ingest_config_is_sensitive_only_on_credential(tmp_path: Path) -> None:
+    """is_sensitive must be 1 for hardcoded_credential and 0 for other hints."""
+    conn = open_db(tmp_path / "analysis.db")
+    content = "auth_required=off\ndebug=1\n"
+    f = _make_file(tmp_path, "service.conf", content)
+
+    file_id = conn.execute(
+        "INSERT INTO non_binary_files (kind, subtype, name, path, sha256, size_bytes, detected_via)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("config_file", "conf", f.name, f.rel_path, f.sha256, f.size_bytes, "extension"),
+    ).lastrowid
+    conn.commit()
+    _ingest_config(conn, int(file_id), f)  # type: ignore[arg-type]
+    conn.commit()
+
+    rows = conn.execute(
+        "SELECT is_sensitive FROM config_entries WHERE file_id = ?", (file_id,)
+    ).fetchall()
+    for (s,) in rows:
+        assert s == 0
+
+    conn.close()
+
+
+def test_ingest_config_tolerant_sectionless(tmp_path: Path) -> None:
+    """A config file with no [section] header must parse without raising."""
+    conn = open_db(tmp_path / "analysis.db")
+    content = "admin_password=secret123\ndebug=1\n"
+    f = _make_file(tmp_path, "bare.conf", content)
+
+    file_id = conn.execute(
+        "INSERT INTO non_binary_files (kind, subtype, name, path, sha256, size_bytes, detected_via)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("config_file", "conf", f.name, f.rel_path, f.sha256, f.size_bytes, "extension"),
+    ).lastrowid
+    conn.commit()
+    count = _ingest_config(conn, int(file_id), f)  # type: ignore[arg-type]
+    conn.commit()
+
+    assert count >= 1
+    # section should be NULL for sectionless entries
+    rows = conn.execute(
+        "SELECT section FROM config_entries WHERE file_id = ?", (file_id,)
+    ).fetchall()
+    for (sec,) in rows:
+        assert sec is None
+
+    conn.close()
+
+
+def test_ingest_config_tolerant_key_space_value(tmp_path: Path) -> None:
+    """A 'key value' (space-separated) line must parse and be classified."""
+    conn = open_db(tmp_path / "analysis.db")
+    content = "debug 1\n"
+    f = _make_file(tmp_path, "openwrt.conf", content)
+
+    file_id = conn.execute(
+        "INSERT INTO non_binary_files (kind, subtype, name, path, sha256, size_bytes, detected_via)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("config_file", "conf", f.name, f.rel_path, f.sha256, f.size_bytes, "extension"),
+    ).lastrowid
+    conn.commit()
+    count = _ingest_config(conn, int(file_id), f)  # type: ignore[arg-type]
+    conn.commit()
+
+    assert count == 1
+    row = conn.execute(
+        "SELECT key, value, vuln_hint FROM config_entries WHERE file_id = ?", (file_id,)
+    ).fetchone()
+    assert row[0] == "debug"
+    assert row[1] == "1"
+    assert row[2] == "debug_enabled"
+
+    conn.close()
+
+
+def test_ingest_config_benign_lines_not_recorded(tmp_path: Path) -> None:
+    conn = open_db(tmp_path / "analysis.db")
+    content = "port=80\nmax_connections=100\nlisten_address=0.0.0.0\n"
+    f = _make_file(tmp_path, "benign.conf", content)
+
+    file_id = conn.execute(
+        "INSERT INTO non_binary_files (kind, subtype, name, path, sha256, size_bytes, detected_via)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("config_file", "conf", f.name, f.rel_path, f.sha256, f.size_bytes, "extension"),
+    ).lastrowid
+    conn.commit()
+    count = _ingest_config(conn, int(file_id), f)  # type: ignore[arg-type]
+    conn.commit()
+
+    assert count == 0
+    conn.close()
+
+
+# ── Round D: mixed shell + config tree, DD2 sub_rows mapping ─────────────────
+
+
+def _build_mixed_fixture_tree(root: Path) -> None:
+    """Firmware tree with one shell script and one config file."""
+    (root / "etc").mkdir()
+
+    (root / "etc" / "web_daemon_init.sh").write_text(
+        '#!/bin/sh\nnvram get wan_ifname\neval "$CMD"\n', encoding="utf-8"
+    )
+    (root / "etc" / "httpd.conf").write_text(
+        "admin_password=changeme\nauth_required=off\ndebug=1\n",
+        encoding="utf-8",
+    )
+
+
+def test_orchestrator_mixed_tree_sub_rows(tmp_path: Path) -> None:
+    """Mixed tree: sub_rows must separate shell and config counts."""
+    fs_root = tmp_path / "firmware"
+    fs_root.mkdir()
+    _build_mixed_fixture_tree(fs_root)
+
+    conn = open_db(tmp_path / "analysis.db")
+    stats = run_all_ingesters(conn, fs_root)
+
+    assert stats.files_ingested == 2
+    assert stats.by_kind.get("shell_script", 0) == 1
+    assert stats.by_kind.get("config_file", 0) == 1
+    assert "shell_script" in stats.sub_rows
+    assert "config_file" in stats.sub_rows
+    assert stats.sub_rows["shell_script"] >= 1
+    assert stats.sub_rows["config_file"] >= 1
+
+    conn.close()
+
+
+def test_orchestrator_skip_config_ingester(tmp_path: Path) -> None:
+    """skip_ingesters={'config_file'} processes shell but skips config."""
+    fs_root = tmp_path / "firmware"
+    fs_root.mkdir()
+    _build_mixed_fixture_tree(fs_root)
+
+    conn = open_db(tmp_path / "analysis.db")
+    stats = run_all_ingesters(conn, fs_root, skip_ingesters=frozenset({"config_file"}))
+
+    assert stats.by_kind.get("shell_script", 0) == 1
+    assert stats.by_kind.get("config_file", 0) == 0
+    assert "config_file" not in stats.sub_rows
+    assert conn.execute("SELECT COUNT(*) FROM config_entries").fetchone()[0] == 0
 
     conn.close()
