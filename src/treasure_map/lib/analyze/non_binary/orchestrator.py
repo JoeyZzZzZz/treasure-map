@@ -130,11 +130,28 @@ def run_all_ingesters(
 
     for f in candidates:
         for ingester in active:
-            subtype = ingester.detect(f)
+            try:
+                subtype = ingester.detect(f)
+            except Exception as exc:
+                logger.warning(
+                    "non_binary[%s]: detect failed on %s: %s", ingester.kind, f.rel_path, exc
+                )
+                continue
             if subtype is None:
                 continue
+
             file_id = _register_file(conn, ingester, subtype, f)
-            sub_count = ingester.ingest(conn, file_id, f)
+            try:
+                sub_count = ingester.ingest(conn, file_id, f)
+            except Exception as exc:
+                logger.warning(
+                    "non_binary[%s]: ingest failed on %s: %s", ingester.kind, f.rel_path, exc
+                )
+                # Roll back the orphan master row so the file leaves no partial entry
+                # and the next ingester does not double-register it.
+                conn.execute("DELETE FROM non_binary_files WHERE id = ?", (file_id,))
+                continue
+
             stats.files_ingested += 1
             stats.by_kind[ingester.kind] = stats.by_kind.get(ingester.kind, 0) + 1
             stats.sub_rows[ingester.kind] = stats.sub_rows.get(ingester.kind, 0) + sub_count

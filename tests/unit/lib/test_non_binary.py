@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from treasure_map.lib.analyze.non_binary.config_file import (
     CONFIG_RISK_RULES,
     _detect_config,
@@ -1171,5 +1173,49 @@ def test_orchestrator_skip_web_asset_ingester(tmp_path: Path) -> None:
     assert stats.by_kind.get("web_asset", 0) == 0
     assert "web_asset" not in stats.sub_rows
     assert conn.execute("SELECT COUNT(*) FROM web_endpoints").fetchone()[0] == 0
+
+    conn.close()
+
+
+# ── Exception isolation (orchestrator hardening) ──────────────────────────────
+
+
+def test_orchestrator_isolates_ingester_exceptions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A throwing ingester must not abort the run; healthy ingesters still process files.
+
+    Uses a synthetic throwing ingester injected via INGESTER_REGISTRY to verify:
+    - run_all_ingesters returns normally (no exception propagated)
+    - the healthy shell_script ingester still produces rows
+    - the failed file leaves no orphan master row in non_binary_files
+    """
+    root = tmp_path / "fs"
+    (root / "etc").mkdir(parents=True)
+    (root / "init.sh").write_text('#!/bin/sh\neval "$cmd"\n', encoding="utf-8")
+    (root / "etc" / "app.conf").write_text("admin_password=changeme\n", encoding="utf-8")
+
+    import treasure_map.lib.analyze.non_binary as nb_pkg
+    from treasure_map.lib.analyze.non_binary.config_file import _detect_config
+    from treasure_map.lib.analyze.non_binary.framework import NonBinaryIngester
+    from treasure_map.lib.analyze.non_binary.shell_script import SHELL_SCRIPT_INGESTER
+
+    def _boom(conn: object, file_id: int, f: object) -> int:
+        raise RuntimeError("synthetic ingest failure")
+
+    throwing_config = NonBinaryIngester(kind="config_file", detect=_detect_config, ingest=_boom)
+    monkeypatch.setattr(nb_pkg, "INGESTER_REGISTRY", [SHELL_SCRIPT_INGESTER, throwing_config])
+
+    conn = open_db(tmp_path / "analysis.db")
+    stats = run_all_ingesters(conn, root)
+
+    # Run completed without raising; healthy ingester produced rows.
+    assert stats.sub_rows.get("shell_script", 0) >= 1
+
+    # Failed file left no orphan master row.
+    leftover = conn.execute(
+        "SELECT COUNT(*) FROM non_binary_files WHERE kind = 'config_file'"
+    ).fetchone()[0]
+    assert leftover == 0
 
     conn.close()
