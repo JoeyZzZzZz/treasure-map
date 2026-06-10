@@ -21,7 +21,15 @@ if [ -f "$WATCHLIST" ]; then
         HITS=""
         while IFS= read -r pat; do
             case "$pat" in ''|\#*) continue ;; esac
-            MATCH=$(printf '%s\n' "$ADDED" | grep -iE -- "$pat" || true)
+            # Regex patterns (starting with [ or () use PCRE case-sensitive matching
+            # so that [A-Z]{2,4}-... only fires on UPPERCASE model numbers with
+            # digits (lookahead in pattern), not on words like "non-binary".
+            # Literal name patterns use -w (whole-word, case-insensitive) to avoid
+            # substring matches (e.g. "Ring" must not match "string").
+            case "$pat" in
+                \[*|\(*) MATCH=$(printf '%s\n' "$ADDED" | grep -P -- "$pat" || true) ;;
+                *)        MATCH=$(printf '%s\n' "$ADDED" | grep -iwE -- "$pat" || true) ;;
+            esac
             if [ -n "$MATCH" ]; then
                 HITS="${HITS}"$'\n'"  pattern: ${pat}"$'\n'"$(printf '%s' "$MATCH" | sed 's/^/    /')"
             fi

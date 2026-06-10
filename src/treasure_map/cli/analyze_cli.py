@@ -37,7 +37,25 @@ logger = logging.getLogger(__name__)
     default=None,
     help="Path to config.yaml (overrides ~/.treasure-map/config.yaml).",
 )
-def analyze(fs_root: Path, workspace: Path | None, config: Path | None) -> None:
+@click.option(
+    "--skip-non-binary",
+    is_flag=True,
+    default=False,
+    help="Skip the non-binary file analysis stage entirely.",
+)
+@click.option(
+    "--skip-ingester",
+    "skip_ingesters",
+    multiple=True,
+    help="Skip a specific ingester by kind (e.g. shell_script). Repeatable.",
+)
+def analyze(
+    fs_root: Path,
+    workspace: Path | None,
+    config: Path | None,
+    skip_non_binary: bool,
+    skip_ingesters: tuple[str, ...],
+) -> None:
     """Analyze an extracted firmware filesystem root.
 
     Produces an analysis.db in the workspace directory.
@@ -61,7 +79,16 @@ def analyze(fs_root: Path, workspace: Path | None, config: Path | None) -> None:
 
     try:
         with Workspace(workspace, progress_callback=_progress) as ws:
-            result = asyncio.run(run_analyze(fs_root, ws, cfg, _progress))
+            result = asyncio.run(
+                run_analyze(
+                    fs_root,
+                    ws,
+                    cfg,
+                    _progress,
+                    skip_non_binary=skip_non_binary,
+                    skip_ingesters=frozenset(skip_ingesters),
+                )
+            )
     except GhidraNotFoundError as exc:
         raise click.ClickException(str(exc)) from exc
     except TreasureMapError as exc:
@@ -83,4 +110,6 @@ def analyze(fs_root: Path, workspace: Path | None, config: Path | None) -> None:
     click.echo(f"  Xrefs (L3 string_ipc):      {result.layer3_xrefs}")
     click.echo(f"  Strings classified: {result.strings_classified}")
     click.echo(f"  Total xrefs: {result.total_xrefs}")
+    click.echo(f"  Non-binary files: {result.non_binary_files_ingested}")
+    click.echo(f"  Script calls: {result.script_calls_ingested}")
     click.echo(f"  DB       : {result.db_path}")

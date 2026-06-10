@@ -90,5 +90,7 @@ async def analyze_firmware(
         "layer3_xrefs": result.layer3_xrefs,
         "strings_classified": result.strings_classified,
         "total_xrefs": result.total_xrefs,
+        "non_binary_files_ingested": result.non_binary_files_ingested,
+        "script_calls_ingested": result.script_calls_ingested,
         "elapsed_s": round(result.elapsed, 1),
     }

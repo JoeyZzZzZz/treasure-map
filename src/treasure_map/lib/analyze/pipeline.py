@@ -7,6 +7,7 @@ only on dirty records — sha256 values that are new or still have ghidra_ok=0.
 DB is the truth source; workspace step checkpoints are not used here.
 Week 2 scope: Ghidra. Week 3 Round A: Ghidra JSON ingest.
 Week 3 Round B: xrefs + string classification (wipe-and-rebuild each run).
+Week 3 Round C: non-binary ingester framework (wipe-and-rebuild each run).
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from treasure_map.lib.analyze.db_ingest import ingest_elfs
 from treasure_map.lib.analyze.elf_inventory import ElfRecord, scan_filesystem
 from treasure_map.lib.analyze.ghidra_ingest import IngestStats, ingest_ghidra_output
 from treasure_map.lib.analyze.ghidra_runner import GhidraRunner
+from treasure_map.lib.analyze.non_binary.orchestrator import NonBinaryStats, run_all_ingesters
 from treasure_map.lib.analyze.xrefs import XrefStats, build_xrefs
 from treasure_map.lib.config.config import Config
 from treasure_map.lib.storage.connection import open_db
@@ -50,6 +52,8 @@ class AnalyzeResult:
     layer3_xrefs: int  # Round B: string_ipc soft links
     strings_classified: int  # Round B: strings.category filled
     total_xrefs: int  # Round B: sum of all layers
+    non_binary_files_ingested: int  # Round C: rows written to non_binary_files
+    script_calls_ingested: int  # Round C: rows written to script_calls
     elapsed: float
 
 
@@ -58,6 +62,8 @@ async def run_analyze(
     workspace: Workspace,
     config: Config,
     progress_callback: ProgressCallback | None = None,
+    skip_non_binary: bool = False,
+    skip_ingesters: frozenset[str] = frozenset(),
 ) -> AnalyzeResult:
     """Orchestrate a full firmware analysis run.
 
@@ -81,6 +87,7 @@ async def run_analyze(
     ghidra_failed = 0
     ingest_stats = IngestStats()
     xref_stats = XrefStats()
+    nb_stats = NonBinaryStats()
     try:
         sha_to_id, dirty_shas = ingest_elfs(conn, records)
         dirty_records = [r for r in records if r.sha256 in dirty_shas]
@@ -127,6 +134,15 @@ async def run_analyze(
 
         # Round B: build cross-binary xrefs + classify strings (wipe-and-rebuild)
         xref_stats = build_xrefs(conn)
+
+        # Round C: non-binary ingester framework (wipe-and-rebuild)
+        if not skip_non_binary:
+            nb_stats = run_all_ingesters(
+                conn,
+                fs_root,
+                skip_ingesters=skip_ingesters,
+                progress_callback=progress_callback,
+            )
     finally:
         conn.close()
 
@@ -147,5 +163,7 @@ async def run_analyze(
         layer3_xrefs=xref_stats.layer3_string_ipc,
         strings_classified=xref_stats.strings_classified,
         total_xrefs=xref_stats.total_xrefs,
+        non_binary_files_ingested=nb_stats.files_ingested,
+        script_calls_ingested=nb_stats.script_calls,
         elapsed=time.monotonic() - t0,
     )

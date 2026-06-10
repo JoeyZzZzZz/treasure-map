@@ -3,6 +3,10 @@
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
+-- Round C: supersede inherited standalone script tables (dormant, never populated).
+DROP TABLE IF EXISTS script_calls;
+DROP TABLE IF EXISTS scripts;
+
 -- 二进制文件
 CREATE TABLE IF NOT EXISTS binaries (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -95,28 +99,31 @@ CREATE TABLE IF NOT EXISTS library_summaries (
     FOREIGN KEY(binary_id) REFERENCES binaries(id) ON DELETE CASCADE
 );
 
--- 脚本文件（M3 启用）
-CREATE TABLE IF NOT EXISTS scripts (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    name        TEXT NOT NULL,
-    path        TEXT,
-    interpreter TEXT,   -- sh / bash / python / lua / perl
-    sha256      TEXT UNIQUE,
-    size_bytes  INTEGER,
-    analyzed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+-- 非二进制文件主表 (Round C framework; WIPE-AND-REBUILD each analyze run, §13.3)
+-- sha256 = cross-firmware identity key for the §13.6 knowledge base. Indexed,
+-- intentionally NOT unique (a file + its copy at another path are two findings).
+CREATE TABLE IF NOT EXISTS non_binary_files (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind         TEXT    NOT NULL,    -- shell_script / config_file / credential / web_asset / kernel_module
+    subtype      TEXT,                -- ingester-specific, e.g. shell interpreter: bash/sh/ash
+    name         TEXT    NOT NULL,
+    path         TEXT,                -- relative to firmware fs_root
+    sha256       TEXT,                -- content identity (§13.6)
+    size_bytes   INTEGER DEFAULT 0,
+    detected_via TEXT                 -- shebang / extension / heuristic
 );
 
--- 脚本命令调用（M3 启用）
+-- 脚本命令调用 (ShellScript ingester sub-table; FK -> non_binary_files)
 CREATE TABLE IF NOT EXISTS script_calls (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    script_id       INTEGER NOT NULL,
+    file_id         INTEGER NOT NULL,
     command         TEXT,
-    raw_line        TEXT,
+    raw_line        TEXT,             -- script's OWN source line; analysis evidence, never a generated payload (§5.3)
     line_number     INTEGER,
-    args_pattern    TEXT,
+    args_pattern    TEXT,             -- coarse structural token only: literal / var_expansion / piped
     has_user_input  INTEGER DEFAULT 0,
-    vuln_hint       TEXT,
-    FOREIGN KEY(script_id) REFERENCES scripts(id) ON DELETE CASCADE
+    vuln_hint       TEXT,             -- CATEGORICAL label only (§5.3); never a payload
+    FOREIGN KEY(file_id) REFERENCES non_binary_files(id) ON DELETE CASCADE
 );
 
 -- 第三方组件 + 版本（M5 CVE 匹配用）
@@ -159,9 +166,11 @@ CREATE INDEX IF NOT EXISTS idx_xrefs_caller       ON xrefs(caller_binary_id);
 CREATE INDEX IF NOT EXISTS idx_xrefs_callee       ON xrefs(callee_binary_id);
 CREATE INDEX IF NOT EXISTS idx_strings_category   ON strings(category);
 CREATE INDEX IF NOT EXISTS idx_strings_binary     ON strings(binary_id);
-CREATE INDEX IF NOT EXISTS idx_script_calls_cmd   ON script_calls(command);
-CREATE INDEX IF NOT EXISTS idx_script_calls_ui    ON script_calls(has_user_input);
-CREATE INDEX IF NOT EXISTS idx_scripts_name       ON scripts(name);
+CREATE INDEX IF NOT EXISTS idx_nbf_kind          ON non_binary_files(kind);
+CREATE INDEX IF NOT EXISTS idx_nbf_sha256        ON non_binary_files(sha256);
+CREATE INDEX IF NOT EXISTS idx_script_calls_file ON script_calls(file_id);
+CREATE INDEX IF NOT EXISTS idx_script_calls_cmd  ON script_calls(command);
+CREATE INDEX IF NOT EXISTS idx_script_calls_ui   ON script_calls(has_user_input);
 CREATE INDEX IF NOT EXISTS idx_components_binary  ON components(binary_id);
 CREATE INDEX IF NOT EXISTS idx_components_product ON components(product);
 CREATE INDEX IF NOT EXISTS idx_cve_binary         ON cve_matches(binary_id);
