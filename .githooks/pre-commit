@@ -10,3 +10,33 @@ if [ -n "$SENSITIVE" ]; then
     echo ""
     exit 1
 fi
+
+# ── §5.5 vendor-neutrality enforcement ───────────────────────────────────────
+WATCHLIST=".githooks/vendor-watchlist.txt"
+if [ -f "$WATCHLIST" ]; then
+    ADDED=$(git diff --cached -U0 --diff-filter=ACM -- . \
+            ":(exclude)$WATCHLIST" ":(exclude).githooks/pre-commit" \
+            | grep '^+' | grep -v '^+++' || true)
+    if [ -n "$ADDED" ]; then
+        HITS=""
+        while IFS= read -r pat; do
+            case "$pat" in ''|\#*) continue ;; esac
+            MATCH=$(printf '%s\n' "$ADDED" | grep -iE -- "$pat" || true)
+            if [ -n "$MATCH" ]; then
+                HITS="${HITS}"$'\n'"  pattern: ${pat}"$'\n'"$(printf '%s' "$MATCH" | sed 's/^/    /')"
+            fi
+        done < "$WATCHLIST"
+        if [ -n "$HITS" ]; then
+            echo ""
+            echo "❌ COMMIT BLOCKED — vendor identifier(s) in staged changes (§5.5):"
+            echo "$HITS"
+            echo ""
+            echo "Vendor names / model numbers must never enter committed artifacts."
+            echo "Fix: replace with a generic category term (e.g. 'IoT camera',"
+            echo "'consumer router', 'main web daemon'), re-stage, and retry."
+            echo "Bypassing this check is not authorized."
+            echo ""
+            exit 1
+        fi
+    fi
+fi
