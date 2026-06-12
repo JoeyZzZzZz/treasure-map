@@ -7,6 +7,7 @@ import logging
 import click
 
 from treasure_map.cli.analyze_cli import analyze
+from treasure_map.cli.init_cli import init
 
 
 @click.group()
@@ -18,6 +19,7 @@ def main(debug: bool) -> None:
 
 
 main.add_command(analyze)
+main.add_command(init)
 
 if __name__ == "__main__":
     main()

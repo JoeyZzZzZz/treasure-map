@@ -57,4 +57,10 @@ ghidra:
     endpoint: http://localhost:8080
 
 workspace_dir: ~/.treasure-map/workspaces
+
+# atlas: persistent cross-firmware pattern store (see lib/atlas/).
+# Moving atlas.db requires sqlite3.backup() — never a bare cp while WAL files exist.
+# atlas:
+#   db_path: ~/.treasure-map/atlas.db
+
 log_level: INFO

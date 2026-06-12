@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial project structure
 - AGPL-3.0 license
+- M2 Step 2 (R0): `tmap init` onboarding command (`cli/init_cli.py`, `lib/setup/`).
+  Provisions `~/.treasure-map/` tree (config.yaml, .env chmod 0600, workspaces/).
+  Runs preflight doctor: Ghidra, Java, binwalk, API keys, dir writability.
+  Flags: `--force` (overwrite existing config), `--non-interactive` (skip prompts),
+  `--check-only` (inspect only; exits non-zero on any red check).
+  `AtlasConfig` added to `Config`; `_source_env_file` wired into `load_config` as
+  first statement (non-override semantics; `TM_ENV_FILE` override for testability).
 - M2 Step 1 (R-KB): `atlas` cross-firmware pattern store (`lib/atlas/`) — persistent,
   append-and-corroborate cross-firmware pattern store (`atlas.db`).
   Schema (`lib/storage/atlas_schema.sql`) with two schema-level CHECK constraints:
