@@ -1,6 +1,6 @@
 # Copyright (C) 2025-2026 JoeyZzZzZz
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Unit tests for lib/atlas — moat container (M2 Step 1)."""
+"""Unit tests for lib/atlas — cross-firmware pattern store (M2 Step 1)."""
 
 from __future__ import annotations
 
@@ -438,23 +438,23 @@ def test_view_semantics_combined(atlas_conn: sqlite3.Connection) -> None:
 
 
 # ---------------------------------------------------------------------------
-# moat_breadth — COUNT(DISTINCT source_run_id), uncapped
+# recurrence_breadth — COUNT(DISTINCT source_run_id), uncapped
 # ---------------------------------------------------------------------------
 
 
-def test_moat_breadth_three_distinct_runs(atlas_conn: sqlite3.Connection) -> None:
+def test_recurrence_breadth_three_distinct_runs(atlas_conn: sqlite3.Connection) -> None:
     pid = upsert_pattern(atlas_conn, source_class="sc", sink_class="snk", call_sequence_shape="s")
 
     for run_id in ("run-A", "run-B", "run-C"):
         add_instance(atlas_conn, _base_instance(pid, run_id))
 
-    moat = atlas_conn.execute(
-        "SELECT moat_breadth FROM pattern WHERE pattern_id = ?", (pid,)
+    breadth = atlas_conn.execute(
+        "SELECT recurrence_breadth FROM pattern WHERE pattern_id = ?", (pid,)
     ).fetchone()[0]
-    assert moat == 3
+    assert breadth == 3
 
 
-def test_moat_breadth_fourth_same_run_does_not_increase(
+def test_recurrence_breadth_fourth_same_run_does_not_increase(
     atlas_conn: sqlite3.Connection,
 ) -> None:
     pid = upsert_pattern(atlas_conn, source_class="sc", sink_class="snk", call_sequence_shape="s")
@@ -467,21 +467,21 @@ def test_moat_breadth_fourth_same_run_does_not_increase(
         InstanceRow(pattern_id=pid, pseudocode_hash="alt-hash", source_run_id="run-A"),
     )
 
-    moat = atlas_conn.execute(
-        "SELECT moat_breadth FROM pattern WHERE pattern_id = ?", (pid,)
+    breadth = atlas_conn.execute(
+        "SELECT recurrence_breadth FROM pattern WHERE pattern_id = ?", (pid,)
     ).fetchone()[0]
-    assert moat == 3
+    assert breadth == 3
 
 
-def test_moat_breadth_starts_at_zero(atlas_conn: sqlite3.Connection) -> None:
+def test_recurrence_breadth_starts_at_zero(atlas_conn: sqlite3.Connection) -> None:
     pid = upsert_pattern(atlas_conn, source_class="sc", sink_class="snk", call_sequence_shape="s")
-    moat = atlas_conn.execute(
-        "SELECT moat_breadth FROM pattern WHERE pattern_id = ?", (pid,)
+    breadth = atlas_conn.execute(
+        "SELECT recurrence_breadth FROM pattern WHERE pattern_id = ?", (pid,)
     ).fetchone()[0]
-    assert moat == 0
+    assert breadth == 0
 
 
-def test_moat_breadth_separate_patterns_independent(atlas_conn: sqlite3.Connection) -> None:
+def test_recurrence_breadth_separate_patterns_independent(atlas_conn: sqlite3.Connection) -> None:
     pid1 = upsert_pattern(
         atlas_conn, source_class="sc1", sink_class="snk", call_sequence_shape="s1"
     )
@@ -493,14 +493,14 @@ def test_moat_breadth_separate_patterns_independent(atlas_conn: sqlite3.Connecti
         add_instance(atlas_conn, _base_instance(pid1, run_id))
     add_instance(atlas_conn, _base_instance(pid2, "run-X"))
 
-    moat1 = atlas_conn.execute(
-        "SELECT moat_breadth FROM pattern WHERE pattern_id = ?", (pid1,)
+    breadth1 = atlas_conn.execute(
+        "SELECT recurrence_breadth FROM pattern WHERE pattern_id = ?", (pid1,)
     ).fetchone()[0]
-    moat2 = atlas_conn.execute(
-        "SELECT moat_breadth FROM pattern WHERE pattern_id = ?", (pid2,)
+    breadth2 = atlas_conn.execute(
+        "SELECT recurrence_breadth FROM pattern WHERE pattern_id = ?", (pid2,)
     ).fetchone()[0]
-    assert moat1 == 2
-    assert moat2 == 1
+    assert breadth1 == 2
+    assert breadth2 == 1
 
 
 # ---------------------------------------------------------------------------
@@ -539,17 +539,17 @@ def test_add_instances_validates_before_insert(atlas_conn: sqlite3.Connection) -
     assert count == 0
 
 
-def test_add_instances_moat_breadth_updated(atlas_conn: sqlite3.Connection) -> None:
+def test_add_instances_recurrence_breadth_updated(atlas_conn: sqlite3.Connection) -> None:
     pid = upsert_pattern(atlas_conn, source_class="sc", sink_class="snk", call_sequence_shape="s")
     instances = [
         InstanceRow(pattern_id=pid, pseudocode_hash=f"h{i}", source_run_id=f"run-{i}")
         for i in range(5)
     ]
     add_instances(atlas_conn, instances)
-    moat = atlas_conn.execute(
-        "SELECT moat_breadth FROM pattern WHERE pattern_id = ?", (pid,)
+    breadth = atlas_conn.execute(
+        "SELECT recurrence_breadth FROM pattern WHERE pattern_id = ?", (pid,)
     ).fetchone()[0]
-    assert moat == 5
+    assert breadth == 5
 
 
 # ---------------------------------------------------------------------------

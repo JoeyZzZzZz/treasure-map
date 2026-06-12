@@ -10,7 +10,7 @@ Layer 3: string_ipc         (soft link, confidence=0.5)
 Also classifies all strings via STRING_RULES.
 
 Semantics: wipe-and-rebuild. xrefs is always derivable from current DB state.
-See ~/treasure-map-notes/week3_round_B_xrefs.md §4 for design rationale.
+See the private design notes for rationale.
 
 NOTE on imports=0 on stripped MIPS/ARM firmware:
   Ghidra's ExternalManager often returns nothing on stripped IoT firmware.

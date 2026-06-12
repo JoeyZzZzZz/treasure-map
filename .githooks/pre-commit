@@ -62,3 +62,18 @@ if [ -f "$WATCHLIST" ]; then
         fi
     fi
 fi
+
+# ── §2.8 strategy/judgment-vocabulary guard ──────────────────────────────────
+BANNED='\b(moat|shield)\b|盾|fix_quality|incomplete_patch_flag|fix_quality_score'
+HITS=$(git diff --cached --name-only --diff-filter=ACM \
+        -- 'src/*' 'docs/*' '*.md' ':!LICENSE' \
+       | xargs grep -nIE "$BANNED" 2>/dev/null || true)
+if [ -n "$HITS" ]; then
+  echo ""
+  echo "❌ COMMIT BLOCKED — strategy/judgment vocabulary in staged changes (§2.8):"
+  echo "$HITS"
+  echo ""
+  echo "Use mechanism-only naming; keep strategy framing in the private notes."
+  echo ""
+  exit 1
+fi

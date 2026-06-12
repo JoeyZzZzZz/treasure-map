@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Atlas row models — frozen dataclasses mirroring pattern + instance columns.
 
-No behavior. Field names are neutral (§2.8): mechanism, never judgment.
+No behavior. Field names are neutral (§2.8): they describe mechanism, not interpretation.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ class PatternRow:
     structural_fingerprint: str | None = None
     fingerprint_algo_version: str = "v0"
     device_category: str | None = None
-    moat_breadth: int = 0
+    recurrence_breadth: int = 0
     pattern_id: int | None = None
     first_seen_at: str | None = None
     last_updated_at: str | None = None

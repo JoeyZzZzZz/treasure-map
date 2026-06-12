@@ -1,7 +1,7 @@
--- Treasure Map atlas — cross-firmware pattern store (THE moat, PRD §13).
+-- Treasure Map atlas — persistent cross-firmware pattern store (§13).
 -- PERSISTENT, append-and-corroborate. NOT wipe-and-rebuild (that is analysis.db).
 -- Lives OUTSIDE any repo (default ~/.treasure-map/atlas.db). Zero vendor identity (§5.5).
--- Field names are NEUTRAL (§2.8): mechanism, never the shield's judgment.
+-- Field names are NEUTRAL (§2.8): they describe mechanism, not interpretation.
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS pattern (
     structural_fingerprint   TEXT,
     fingerprint_algo_version TEXT NOT NULL DEFAULT 'v0',
     device_category          TEXT,             -- generic ONLY: router/camera/nas; NEVER vendor/model (§5.5)
-    moat_breadth             INTEGER NOT NULL DEFAULT 0,  -- COUNT(DISTINCT source_run_id) — see writer
+    recurrence_breadth       INTEGER NOT NULL DEFAULT 0,  -- COUNT(DISTINCT source_run_id) — see writer
     first_seen_at            DATETIME DEFAULT CURRENT_TIMESTAMP,
     last_updated_at          DATETIME DEFAULT CURRENT_TIMESTAMP
 );
@@ -24,14 +24,14 @@ CREATE TABLE IF NOT EXISTS instance (
     pseudocode_hash     TEXT,             -- deterministic content hash of the evidence function
     source_anchor       TEXT,             -- located via name/address/string/diff (§6.7 stripped-safe)
     sink_anchor         TEXT,
-    source_run_id       TEXT,             -- NEUTRAL per-firmware-run id (moat_breadth unit, §13.7); §5.5-safe
+    source_run_id       TEXT,             -- NEUTRAL per-firmware-run id (recurrence_breadth unit, §13.7); §5.5-safe
     reachability_status TEXT NOT NULL DEFAULT 'unknown'
         CHECK (reachability_status IN ('confirmed','blocked','unknown')),
     blocking_mechanism  TEXT,             -- categorical: char_filter/length_check/... NULL if none
     provenance_level    TEXT NOT NULL DEFAULT 'L0'
         CHECK (provenance_level IN ('L0','L1','L2','L3')),
     external_anchor     TEXT,             -- external evidence authorizing L2/L3 (patch ref / CVE); NULL for L0/L1
-    fix_diff            TEXT,             -- NEUTRAL change region (NOT fix_quality_score); redact on export
+    fix_diff            TEXT,             -- neutral change region; redact on export
     scope_origin        TEXT,             -- intra_firmware | intra_vendor | cross_vendor (§4.4)
     evidence_ref        TEXT,             -- provenance trail to source analysis.db + binary/function
     created_at          DATETIME DEFAULT CURRENT_TIMESTAMP,

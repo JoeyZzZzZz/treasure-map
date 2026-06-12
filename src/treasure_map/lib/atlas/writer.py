@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Atlas writer — append-only insert + corroborate functions.
 
-Append-only (§A.2 / C.2): insert and corroborate only; no wipe path exists.
-Field names and query examples are neutral (§2.8); no judgment mapping anywhere.
+Append-only: insert and corroborate only; no wipe path exists.
+Field names and query examples are neutral (§2.8); they describe mechanism only.
 """
 
 from __future__ import annotations
@@ -84,24 +84,21 @@ def upsert_pattern(
 
 
 def _validate_instance(instance: InstanceRow, external_anchor: str | None) -> None:
-    """Raise ConfigError on any hard-rule violation (§C.2)."""
+    """Raise ConfigError on any hard-rule violation."""
     if not (instance.pseudocode_hash or instance.evidence_ref):
-        raise ConfigError(
-            "instance requires pseudocode_hash or evidence_ref (traceability §8.6/§13.7)"
-        )
+        raise ConfigError("instance requires pseudocode_hash or evidence_ref (traceability)")
     if not instance.source_run_id:
-        raise ConfigError("instance.source_run_id must be non-empty (moat_breadth unit §13.7)")
+        raise ConfigError("instance.source_run_id must be non-empty (recurrence_breadth unit)")
     if instance.provenance_level in {"L2", "L3"} and not external_anchor:
         raise ConfigError(
-            f"provenance_level={instance.provenance_level} requires a non-empty"
-            " external_anchor (§13.4 / §A.7)"
+            f"provenance_level={instance.provenance_level} requires a non-empty external_anchor"
         )
 
 
-def _recompute_moat_breadth(conn: sqlite3.Connection, pattern_id: int) -> None:
+def _recompute_recurrence_breadth(conn: sqlite3.Connection, pattern_id: int) -> None:
     conn.execute(
         """UPDATE pattern SET
-               moat_breadth = (
+               recurrence_breadth = (
                    SELECT COUNT(DISTINCT source_run_id)
                    FROM instance
                    WHERE pattern_id = ?
@@ -120,8 +117,8 @@ def add_instance(
 ) -> int:
     """Insert one instance; return instance_id. Commits.
 
-    Validates traceability, source_run_id, and L2/L3 anchor requirement (§A.7 / C.2).
-    Recomputes pattern.moat_breadth = COUNT(DISTINCT source_run_id) after insert.
+    Validates traceability, source_run_id, and L2/L3 anchor requirement.
+    Recomputes pattern.recurrence_breadth = COUNT(DISTINCT source_run_id) after insert.
     """
     _validate_instance(instance, external_anchor)
 
@@ -146,7 +143,7 @@ def add_instance(
             instance.evidence_ref,
         ),
     )
-    _recompute_moat_breadth(conn, instance.pattern_id)
+    _recompute_recurrence_breadth(conn, instance.pattern_id)
     conn.commit()
     return int(cur.lastrowid)  # type: ignore[arg-type]
 
@@ -160,7 +157,7 @@ def add_instances(
     """Insert a batch of instances in a single transaction; return AtlasStats. Commits.
 
     All instances share the same external_anchor. Validates each before any insert.
-    Recomputes moat_breadth for all touched patterns once at end.
+    Recomputes recurrence_breadth for all touched patterns once at end.
     """
     if not instances:
         return AtlasStats(patterns_touched=0, instances_added=0)
@@ -196,7 +193,7 @@ def add_instances(
 
     pattern_ids = {inst.pattern_id for inst in instances}
     for pid in pattern_ids:
-        _recompute_moat_breadth(conn, pid)
+        _recompute_recurrence_breadth(conn, pid)
     conn.commit()
 
     return AtlasStats(patterns_touched=len(pattern_ids), instances_added=len(instances))

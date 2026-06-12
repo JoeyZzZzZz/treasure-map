@@ -1,6 +1,6 @@
 # Copyright (C) 2025-2026 JoeyZzZzZz
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Atlas — cross-firmware pattern store (the moat, PRD §13).
+"""Atlas — persistent cross-firmware pattern store (§13).
 
 Append-and-corroborate; never wiped. Schema in lib/storage/atlas_schema.sql.
 """
