@@ -55,15 +55,15 @@ def test_generic_path_rejected() -> None:
 
 
 def _setup_synthetic_db(tmp_path: Path) -> sqlite3.Connection:
-    """Two binaries: alphapd calls strcpy; libuClibc exports strcpy."""
+    """Two binaries: appsvcd calls strcpy; libc_generic exports strcpy."""
     conn = open_db(tmp_path / "analysis.db")
     conn.execute(
         "INSERT INTO binaries (id, name, sha256, dt_needed) VALUES (?, ?, ?, ?)",
-        (1, "alphapd", "a" * 64, '["libuClibc.so"]'),
+        (1, "appsvcd", "a" * 64, '["libc_generic.so"]'),
     )
     conn.execute(
         "INSERT INTO binaries (id, name, sha256, dt_needed) VALUES (?, ?, ?, ?)",
-        (2, "libuClibc.so", "b" * 64, "[]"),
+        (2, "libc_generic.so", "b" * 64, "[]"),
     )
     conn.execute(
         "INSERT INTO functions (id, binary_id, name, callees) VALUES (?, ?, ?, ?)",
@@ -93,9 +93,9 @@ def test_layer0_creates_func_level_xref(tmp_path: Path) -> None:
                   callee_binary_id, callee_func_id, xref_type, confidence
            FROM xrefs WHERE xref_type = 'callees_exports'"""
     ).fetchone()
-    assert row[0] == 1  # alphapd
+    assert row[0] == 1  # appsvcd
     assert row[1] == 10  # do_request
-    assert row[2] == 2  # libuClibc
+    assert row[2] == 2  # libc_generic
     assert row[3] == 20  # strcpy
     assert row[4] == "callees_exports"
     assert row[5] == 1.0

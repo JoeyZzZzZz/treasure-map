@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `tmap init` now provisions the config-resolved directories (`workspace_dir`,
+  `atlas.db_path` parent, LLM cache parent) after loading config, and the preflight
+  doctor checks those same paths. Previously provisioning used `Path.home()` while the
+  doctor checked an `expanduser`-resolved path, so a `HOME` / `Path.home()` mismatch
+  reported a freshly-provisioned `workspace_dir` as "not provisioned".
+
+### Changed
+
+- Boundary hygiene: removed private-path / private-document references from committed
+  artifacts (`initializer.py` watchlist seeding now keys off `TM_VENDOR_WATCHLIST` only,
+  `xrefs.py` comments, `CONTRIBUTING.md`, pre-commit messages, watchlist example header).
+  Renamed a vendor-specific daemon name in a test fixture to a neutral placeholder.
+- pre-commit hook: added a private-document / private-path guard (blocks staged
+  `src/`, `docs/`, `*.md`, `.githooks/*`, `CONTRIBUTING.md` content that names private
+  notes or paths).
+
 ### Added
 
 - Initial project structure

@@ -7,7 +7,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -85,9 +85,21 @@ def _collect_default_env_vars() -> list[str]:
     return list(seen)
 
 
-def _provision_dirs(tm_home: Path) -> None:
-    for d in (tm_home, tm_home / "workspaces"):
+def _provision_dirs(paths: Iterable[Path]) -> None:
+    for d in paths:
         d.mkdir(parents=True, exist_ok=True)
+
+
+def _configured_dirs(cfg: Config) -> list[Path]:
+    """Resolve the directories named by the loaded config (provisioned == checked).
+
+    Using the config-resolved paths here — and the same ones in the doctor — keeps
+    provisioning and preflight consistent regardless of HOME vs Path.home() drift.
+    """
+    dirs = [cfg.workspace_dir, cfg.atlas.db_path.parent]
+    if cfg.llm is not None:
+        dirs.append(cfg.llm.cache.path.parent)
+    return dirs
 
 
 def _write_config(config_path: Path, *, force: bool) -> None:
@@ -119,9 +131,16 @@ def _write_env(
 
 
 def _seed_watchlist() -> None:
-    """Copy vendor-watchlist.example.txt to the private notes dir if absent."""
+    """Seed the vendor watchlist from the committed example if a destination is configured.
+
+    Destination is taken from the TM_VENDOR_WATCHLIST environment variable. If unset, this
+    is a no-op (the user chooses where the watchlist lives; the tool does not assume a path).
+    """
+    dst_env = os.environ.get("TM_VENDOR_WATCHLIST")
+    if not dst_env:
+        return
     src = Path(".githooks") / "vendor-watchlist.example.txt"
-    dst = Path.home() / "treasure-map-notes" / "vendor-watchlist.txt"
+    dst = Path(dst_env)
     if src.exists() and not dst.exists():
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
@@ -165,9 +184,10 @@ def _run_doctor(tm_home: Path, cfg: Config | None) -> tuple[tuple[str, bool, str
             except Exception:
                 checks.append((f"key:{tier.api_key_env}", False, f"{tier.api_key_env} not set"))
 
-    # Dirs writable
+    # Dirs writable — check the config-resolved locations (same ones run_init provisions).
     ws_path = cfg.workspace_dir if cfg is not None else tm_home / "workspaces"
-    for label, path in [("atlas_dir", tm_home), ("workspace_dir", ws_path)]:
+    atlas_path = cfg.atlas.db_path.parent if cfg is not None else tm_home
+    for label, path in [("atlas_dir", atlas_path), ("workspace_dir", ws_path)]:
         if path.exists():
             ok = os.access(path, os.W_OK)
             checks.append((label, ok, "writable" if ok else "not writable"))
@@ -194,7 +214,7 @@ def run_init(
     atlas_dir = tm_home
 
     if not check_only:
-        _provision_dirs(tm_home)
+        _provision_dirs([tm_home])
         _write_config(config_path, force=force)
         _write_env(
             env_path,
@@ -215,6 +235,11 @@ def run_init(
             cfg = Config.model_validate(raw)
         except Exception:
             logger.debug("run_init: config load failed at %s", config_path)
+
+    # Provision the config-resolved paths now that cfg is known, then run the doctor
+    # against those same paths — provision and check can no longer disagree.
+    if not check_only and cfg is not None:
+        _provision_dirs(_configured_dirs(cfg))
 
     checks = _run_doctor(tm_home, cfg)
     return InitResult(

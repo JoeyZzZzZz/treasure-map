@@ -1,13 +1,16 @@
 # Treasure Map vendor watchlist — EXAMPLE TEMPLATE (committed, brand-free).
 #
-# The real, full denylist of vendor brand names is NOT committed (it would leak
-# the project's device-analysis roadmap via git history — §5.5). It lives
-# locally at ~/treasure-map-notes/vendor-watchlist.txt (or set the env var
-# TM_VENDOR_WATCHLIST to its path) and is git-ignored as
-# .githooks/vendor-watchlist.txt.
+# The real, full denylist of vendor brand names is NOT committed (committing it
+# would leak the device-analysis roadmap via git history). Keep it in a local
+# file and point the hook at it with the TM_VENDOR_WATCHLIST env var; the local
+# copy may also live git-ignored at .githooks/vendor-watchlist.txt.
 #
 # The pre-commit hook uses the full local list if present, else falls back to
 # this template (generic model-number patterns only, plus the human reviewer).
+#
+# Vendor-specific daemon/binary names (e.g. a brand's main web service binary)
+# are NOT regex-detectable without false positives — add those literal names to
+# your local list, not to this committed template.
 #
 # One pattern per line; '#' and blank lines are ignored.
 # Lines starting with [ or ( are treated as PCRE regex (case-sensitive).

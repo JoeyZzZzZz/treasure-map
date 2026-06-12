@@ -38,17 +38,15 @@ Open an issue describing your use case and the feature you'd like to see.
 
 ## Vendor Denylist (pre-commit hook)
 
-The pre-commit hook enforces §5.5 vendor neutrality. The committed file
+The pre-commit hook enforces vendor neutrality. The committed file
 `.githooks/vendor-watchlist.example.txt` contains only generic model-number
-regex patterns (no brand names). For full brand-name coverage, install the
-complete local denylist:
+regex patterns (no brand names). For full brand-name coverage, obtain the
+complete local denylist from the project owner and point the hook at it:
 
 ```bash
-mkdir -p ~/treasure-map-notes
-# Obtain the full list from the project owner, then place it at:
-# ~/treasure-map-notes/vendor-watchlist.txt
+# Set TM_VENDOR_WATCHLIST to the path of your local denylist before committing:
+export TM_VENDOR_WATCHLIST=/path/to/your/vendor-watchlist.txt
 ```
 
-Alternatively, set `TM_VENDOR_WATCHLIST` to a custom path before committing.
 Without the full list the hook still blocks model-number-shaped strings via
 the example template and prints an informational notice.

@@ -11,19 +11,17 @@ if [ -n "$SENSITIVE" ]; then
     exit 1
 fi
 
-# ── §5.5 vendor-neutrality enforcement ───────────────────────────────────────
-# Resolve watchlist: env override → local notes dir → local repo copy → example.
+# ── vendor-neutrality enforcement ────────────────────────────────────────────
+# Resolve watchlist: env override → local repo copy (git-ignored) → committed example.
 WATCHLIST=""
 for cand in "$TM_VENDOR_WATCHLIST" \
-            "$HOME/treasure-map-notes/vendor-watchlist.txt" \
             ".githooks/vendor-watchlist.txt" \
             ".githooks/vendor-watchlist.example.txt"; do
     if [ -n "$cand" ] && [ -f "$cand" ]; then WATCHLIST="$cand"; break; fi
 done
 if [ "$WATCHLIST" = ".githooks/vendor-watchlist.example.txt" ]; then
     echo "ℹ️  vendor watchlist: using brand-free example (regex patterns only)."
-    echo "    Install the full local list at ~/treasure-map-notes/vendor-watchlist.txt"
-    echo "    (or set TM_VENDOR_WATCHLIST) for complete brand-name coverage."
+    echo "    Set TM_VENDOR_WATCHLIST to a full local list for complete brand-name coverage."
 fi
 if [ -f "$WATCHLIST" ]; then
     ADDED=$(git diff --cached -U0 --diff-filter=ACM -- . \
@@ -73,7 +71,26 @@ if [ -n "$HITS" ]; then
   echo "❌ COMMIT BLOCKED — strategy/judgment vocabulary in staged changes (§2.8):"
   echo "$HITS"
   echo ""
-  echo "Use mechanism-only naming; keep strategy framing in the private notes."
+  echo "Use mechanism-only naming; keep strategy framing out of committed code."
+  echo ""
+  exit 1
+fi
+
+# ── private-document / private-path guard ────────────────────────────────────
+# Committed code, docs, and hooks must stand on their own — never point at a
+# private document or name a private path. The hook excludes itself (its pattern
+# definition would otherwise self-match).
+PRIVDOC='treasure-map-notes|private (design )?notes|design note|PRD §|private notes dir'
+HITS=$(git diff --cached --name-only --diff-filter=ACM \
+        -- 'src/*' 'docs/*' '*.md' '.githooks/*' 'CONTRIBUTING.md' \
+           ':!LICENSE' ':!.githooks/pre-commit' \
+       | xargs grep -nIE "$PRIVDOC" 2>/dev/null || true)
+if [ -n "$HITS" ]; then
+  echo ""
+  echo "❌ COMMIT BLOCKED — committed artifacts must not reference private docs/paths:"
+  echo "$HITS"
+  echo ""
+  echo "State the mechanism inline; do not name private notes, private paths, or doc sections."
   echo ""
   exit 1
 fi

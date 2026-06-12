@@ -10,7 +10,6 @@ Layer 3: string_ipc         (soft link, confidence=0.5)
 Also classifies all strings via STRING_RULES.
 
 Semantics: wipe-and-rebuild. xrefs is always derivable from current DB state.
-See the private design notes for rationale.
 
 NOTE on imports=0 on stripped MIPS/ARM firmware:
   Ghidra's ExternalManager often returns nothing on stripped IoT firmware.
@@ -199,7 +198,7 @@ def build_xrefs(conn: sqlite3.Connection) -> XrefStats:
 
     Also classifies all strings whose category is currently NULL.
 
-    Semantics: wipe-and-rebuild. See design note §4.
+    Semantics: wipe-and-rebuild.
 
     Dedup strategy: in-memory set keyed by
     (caller_bid, caller_fid, callee_bid, callee_fid, xref_type).

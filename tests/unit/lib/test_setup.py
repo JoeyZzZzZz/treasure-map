@@ -13,6 +13,7 @@ import pytest
 import yaml
 
 from treasure_map.lib.setup.initializer import (
+    _DEFAULT_CONFIG_YAML,
     _collect_default_env_vars,
     _provision_dirs,
     _run_doctor,
@@ -26,8 +27,14 @@ from treasure_map.lib.setup.initializer import (
 
 @pytest.fixture()
 def fake_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Redirect Path.home() to tmp_path for the duration of the test."""
+    """Redirect home to tmp_path for the test.
+
+    Sets both Path.home() and $HOME so Path.home() and os.path.expanduser('~')
+    (used by the config path validators) resolve to the same directory — the
+    regression guard for the provision/check drift fix.
+    """
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
     return tmp_path
 
 
@@ -49,17 +56,17 @@ def test_collect_default_env_vars_returns_unique_names() -> None:
 # ── _provision_dirs ───────────────────────────────────────────────────────────
 
 
-def test_provision_dirs_creates_tm_home_and_workspaces(fake_home: Path) -> None:
+def test_provision_dirs_creates_each_path(fake_home: Path) -> None:
     tm_home = fake_home / ".treasure-map"
-    _provision_dirs(tm_home)
+    _provision_dirs([tm_home, tm_home / "workspaces"])
     assert tm_home.is_dir()
     assert (tm_home / "workspaces").is_dir()
 
 
 def test_provision_dirs_is_idempotent(fake_home: Path) -> None:
     tm_home = fake_home / ".treasure-map"
-    _provision_dirs(tm_home)
-    _provision_dirs(tm_home)  # must not raise
+    _provision_dirs([tm_home])
+    _provision_dirs([tm_home])  # must not raise
 
 
 # ── _write_config ─────────────────────────────────────────────────────────────
@@ -213,6 +220,25 @@ def test_run_init_atlas_dir_check_is_green_after_provisioning(fake_home: Path) -
 
 def test_run_init_workspace_dir_check_is_green_after_provisioning(fake_home: Path) -> None:
     result = run_init(force=False, non_interactive=True, prompt=_noop_prompt)
+    ws_check = next((c for c in result.checks if c[0] == "workspace_dir"), None)
+    assert ws_check is not None
+    assert ws_check[1] is True, f"workspace_dir check failed: {ws_check[2]}"
+
+
+def test_run_init_provisions_and_greens_custom_workspace_dir(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: a non-default workspace_dir must still be provisioned and green.
+
+    Guards the provision/check drift fix — run_init provisions the *config-resolved*
+    path, not a hardcoded tm_home/workspaces, so a customized location stays consistent.
+    """
+    custom_ws = fake_home / "elsewhere" / "ws"
+    custom_yaml = dict(_DEFAULT_CONFIG_YAML)
+    custom_yaml["workspace_dir"] = str(custom_ws)
+    monkeypatch.setattr("treasure_map.lib.setup.initializer._DEFAULT_CONFIG_YAML", custom_yaml)
+    result = run_init(force=False, non_interactive=True, prompt=_noop_prompt)
+    assert custom_ws.is_dir(), "custom workspace_dir must be provisioned"
     ws_check = next((c for c in result.checks if c[0] == "workspace_dir"), None)
     assert ws_check is not None
     assert ws_check[1] is True, f"workspace_dir check failed: {ws_check[2]}"
