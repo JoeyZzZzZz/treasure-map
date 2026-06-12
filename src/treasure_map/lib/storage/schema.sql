@@ -99,8 +99,8 @@ CREATE TABLE IF NOT EXISTS library_summaries (
     FOREIGN KEY(binary_id) REFERENCES binaries(id) ON DELETE CASCADE
 );
 
--- 非二进制文件主表 (Round C framework; WIPE-AND-REBUILD each analyze run, §13.3)
--- sha256 = cross-firmware identity key for the §13.6 knowledge base. Indexed,
+-- 非二进制文件主表 (Round C framework; WIPE-AND-REBUILD each analyze run)
+-- sha256 = cross-firmware identity key for the knowledge base. Indexed,
 -- intentionally NOT unique (a file + its copy at another path are two findings).
 CREATE TABLE IF NOT EXISTS non_binary_files (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -108,7 +108,7 @@ CREATE TABLE IF NOT EXISTS non_binary_files (
     subtype      TEXT,                -- ingester-specific, e.g. shell interpreter: bash/sh/ash
     name         TEXT    NOT NULL,
     path         TEXT,                -- relative to firmware fs_root
-    sha256       TEXT,                -- content identity (§13.6)
+    sha256       TEXT,                -- content identity
     size_bytes   INTEGER DEFAULT 0,
     detected_via TEXT                 -- shebang / extension / heuristic
 );
@@ -118,26 +118,26 @@ CREATE TABLE IF NOT EXISTS script_calls (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     file_id         INTEGER NOT NULL,
     command         TEXT,
-    raw_line        TEXT,             -- script's OWN source line; analysis evidence, never a generated payload (§5.3)
+    raw_line        TEXT,             -- script's OWN source line; analysis evidence, never a generated payload
     line_number     INTEGER,
     args_pattern    TEXT,             -- coarse structural token only: literal / var_expansion / piped
     has_user_input  INTEGER DEFAULT 0,
-    vuln_hint       TEXT,             -- CATEGORICAL label only (§5.3); never a payload
+    vuln_hint       TEXT,             -- CATEGORICAL label only; never a payload
     FOREIGN KEY(file_id) REFERENCES non_binary_files(id) ON DELETE CASCADE
 );
 
 -- 配置文件条目 (ConfigFile ingester sub-table, Round D; FK -> non_binary_files)
--- Flagged-only: one row per security-relevant entry (DD1). value is evidence of
+-- Flagged-only: one row per security-relevant entry. value is evidence of
 -- firmware content, never a generated payload. Export/case-study paths MUST redact
--- sensitive values + vendor strings (§5.5).
+-- sensitive values + vendor strings.
 CREATE TABLE IF NOT EXISTS config_entries (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     file_id      INTEGER NOT NULL,
     section      TEXT,                -- INI section, or NULL if sectionless
     key          TEXT,
-    value        TEXT,                -- raw value (evidence of firmware content, DD1)
+    value        TEXT,                -- raw value (evidence of firmware content)
     is_sensitive INTEGER DEFAULT 0,   -- 1 = hardcoded-credential candidate
-    vuln_hint    TEXT,                -- CATEGORICAL label only (§5.3); never a payload
+    vuln_hint    TEXT,                -- CATEGORICAL label only; never a payload
     FOREIGN KEY(file_id) REFERENCES non_binary_files(id) ON DELETE CASCADE
 );
 
@@ -190,10 +190,10 @@ CREATE INDEX IF NOT EXISTS idx_config_entries_file ON config_entries(file_id);
 CREATE INDEX IF NOT EXISTS idx_config_entries_hint ON config_entries(vuln_hint);
 
 -- 凭据条目 (Credential ingester sub-table, Round E; FK -> non_binary_files)
--- ED1: stores the observed artifact as verifiable evidence (deterministically
--- re-derivable from the firmware, §13.3). is_sensitive=1 flags material that the
--- export/case-study/commit path MUST redact before publishing (§5.5). Treasure Map
--- never GENERATES attack output (PoC/cracker/key-recovery/decryption) — §5.2/§5.3.
+-- Stores the observed artifact as verifiable evidence (deterministically
+-- re-derivable from the firmware). is_sensitive=1 flags material that the
+-- export/case-study/commit path MUST redact before publishing. Treasure Map
+-- never GENERATES attack output (PoC/cracker/key-recovery/decryption).
 CREATE TABLE IF NOT EXISTS credentials (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     file_id      INTEGER NOT NULL,
@@ -202,7 +202,7 @@ CREATE TABLE IF NOT EXISTS credentials (
     algorithm    TEXT,                -- rsa_private / ec_private / sha512crypt / md5crypt / des / yescrypt / ...
     material     TEXT,                -- the observed artifact (PEM body / hash field) — evidence; redact on export
     is_sensitive INTEGER DEFAULT 0,   -- 1 = private key or password hash present (redact before publishing)
-    vuln_hint    TEXT,                -- CATEGORICAL label only (§5.3); never a generated payload
+    vuln_hint    TEXT,                -- CATEGORICAL label only; never a generated payload
     FOREIGN KEY(file_id) REFERENCES non_binary_files(id) ON DELETE CASCADE
 );
 
@@ -212,7 +212,7 @@ CREATE INDEX IF NOT EXISTS idx_credentials_hint ON credentials(vuln_hint);
 
 -- Web 端点 (WebAsset ingester sub-table, Round F; FK -> non_binary_files)
 -- Attack-surface evidence: endpoints the firmware's web assets reference. path is the
--- asset's OWN content (evidence), not generated. vuln_hint is categorical (§5.3).
+-- asset's OWN content (evidence), not generated. vuln_hint is categorical.
 CREATE TABLE IF NOT EXISTS web_endpoints (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     file_id     INTEGER NOT NULL,
@@ -220,7 +220,7 @@ CREATE TABLE IF NOT EXISTS web_endpoints (
     method      TEXT,                 -- GET / POST / PUT / DELETE / NULL if not derivable
     path        TEXT,                 -- the endpoint path or URL (evidence)
     source      TEXT,                 -- fetch / xhr / axios / ajax / form / cgi_ref / literal
-    vuln_hint   TEXT,                 -- CATEGORICAL label only (§5.3); never a payload
+    vuln_hint   TEXT,                 -- CATEGORICAL label only; never a payload
     FOREIGN KEY(file_id) REFERENCES non_binary_files(id) ON DELETE CASCADE
 );
 

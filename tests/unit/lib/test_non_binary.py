@@ -35,7 +35,7 @@ from treasure_map.lib.analyze.non_binary.web_asset import (
 )
 from treasure_map.lib.storage.connection import open_db
 
-# ── Allowed vuln_hint vocabularies (§5.3) ────────────────────────────────────
+# ── Allowed vuln_hint vocabularies ───────────────────────────────────────────
 
 _ALLOWED_SHELL_HINTS = frozenset(label for label, _ in SHELL_RISK_RULES)
 _ALLOWED_CONFIG_HINTS = frozenset(label for label, _ in CONFIG_RISK_RULES)
@@ -454,7 +454,7 @@ def test_ingest_config_benign_lines_not_recorded(tmp_path: Path) -> None:
     conn.close()
 
 
-# ── Round D: mixed shell + config tree, DD2 sub_rows mapping ─────────────────
+# ── Round D: mixed shell + config tree, sub_rows mapping ─────────────────────
 
 
 def _build_mixed_fixture_tree(root: Path) -> None:
@@ -676,7 +676,7 @@ def test_ingest_credential_pem_multi_block(tmp_path: Path) -> None:
 
 # ── Round E: _ingest_credential — shadow file ────────────────────────────────
 
-# Generic shadow fixture lines — vendor-neutral, clearly fake hashes (§5.5).
+# Generic shadow fixture lines — vendor-neutral, clearly fake hashes.
 _FIXTURE_SHADOW_EMPTY_ROOT = "root::18000:0:99999:7:::\n"
 _FIXTURE_SHADOW_MD5 = "webadmin:$1$" + "fakesalt$fakemd5hash123abc:18000:0:99999:7:::\n"
 _FIXTURE_SHADOW_SHA512 = "sysadmin:$6$" + "fakesalt$fakesha512hashfake:18000:0:99999:7:::\n"
@@ -721,7 +721,7 @@ def test_ingest_credential_shadow_md5_hash(tmp_path: Path) -> None:
     assert row[0] == "md5crypt"
     assert row[1] == 1
     assert row[2] == "weak_password_hash_algo"
-    # material must hold the observed hash field for verifiability (ED1)
+    # material must hold the observed hash field for verifiability
     assert row[3] is not None
     assert row[3].startswith("$1$")
 
@@ -934,7 +934,7 @@ def test_classify_endpoint_param_template_var(tmp_path: Path) -> None:
 
 # ── Round F: _ingest_web_asset — JS endpoint extraction ──────────────────────
 
-# Vendor-neutral generic fixtures (§5.5). Paths use /api/ and /cgi-bin/ conventions.
+# Vendor-neutral generic fixtures. Paths use /api/ and /cgi-bin/ conventions.
 _FIXTURE_JS_ENDPOINTS = """\
 // SPA API client
 fetch("/api/status");
@@ -1104,11 +1104,11 @@ def test_ingest_web_asset_binary_returns_zero(tmp_path: Path) -> None:
     conn.close()
 
 
-# ── Round F: orchestrator integration — FD3 + sub_rows ───────────────────────
+# ── Round F: orchestrator integration — shebang precedence + sub_rows ────────
 
 
 def _build_web_fixture_tree(root: Path) -> None:
-    """Firmware tree with web assets and a shell-backed CGI for FD3 testing."""
+    """Firmware tree with web assets and a shell-backed CGI for shebang-precedence testing."""
     (root / "www").mkdir()
 
     (root / "www" / "app.js").write_text(
@@ -1119,7 +1119,7 @@ def _build_web_fixture_tree(root: Path) -> None:
         '<form action="/api/save" method="post"></form>\n',
         encoding="utf-8",
     )
-    # FD3: shell shebang → claimed by shell_script, not web_asset
+    # shell shebang → claimed by shell_script, not web_asset
     (root / "www" / "update.cgi").write_text(
         "#!/bin/sh\necho Content-Type: text/html\necho\n",
         encoding="utf-8",
@@ -1143,7 +1143,7 @@ def test_orchestrator_web_asset_sub_rows(tmp_path: Path) -> None:
 
 
 def test_orchestrator_fd3_shell_cgi_claimed_by_shell_script(tmp_path: Path) -> None:
-    """FD3: a shell-shebang .cgi is claimed by shell_script, not web_asset."""
+    """A shell-shebang .cgi is claimed by shell_script, not web_asset."""
     fs_root = tmp_path / "firmware"
     fs_root.mkdir()
     _build_web_fixture_tree(fs_root)

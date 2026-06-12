@@ -60,5 +60,5 @@ TODO-PRIVATE.md
 *-PRIVATE.md
 *.private.*
 
-# Local-only full vendor denylist (§5.5: brand names must not be committed)
+# Local-only full vendor denylist (brand names must not be committed)
 .githooks/vendor-watchlist.txt

@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - pre-commit hook: added a private-document / private-path guard (blocks staged
   `src/`, `docs/`, `*.md`, `.githooks/*`, `CONTRIBUTING.md` content that names private
   notes or paths).
+- boundary: removed private-document section and design-code citations from committed
+  code (comment/docstring/string edits only, no logic change); added a matching
+  self-contained-code guard to the pre-commit hook.
 
 ### Added
 

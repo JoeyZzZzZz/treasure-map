@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Non-binary ingester orchestrator: walk → detect → register → ingest.
 
-Semantics: WIPE-AND-REBUILD on every analyze run (§13.3), same as build_xrefs.
+Semantics: WIPE-AND-REBUILD on every analyze run, same as build_xrefs.
 DELETE FROM non_binary_files at the start cascades to script_calls via FK.
 Single conn.commit() at the end; orchestrator owns the transaction boundary.
 """

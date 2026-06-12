@@ -48,7 +48,7 @@ if [ -f "$WATCHLIST" ]; then
         done < "$WATCHLIST"
         if [ -n "$HITS" ]; then
             echo ""
-            echo "❌ COMMIT BLOCKED — vendor identifier(s) in staged changes (§5.5):"
+            echo "❌ COMMIT BLOCKED — vendor identifier(s) in staged changes:"
             echo "$HITS"
             echo ""
             echo "Vendor names / model numbers must never enter committed artifacts."
@@ -61,14 +61,14 @@ if [ -f "$WATCHLIST" ]; then
     fi
 fi
 
-# ── §2.8 strategy/judgment-vocabulary guard ──────────────────────────────────
+# ── strategy/judgment-vocabulary guard ───────────────────────────────────────
 BANNED='\b(moat|shield)\b|盾|fix_quality|incomplete_patch_flag|fix_quality_score'
 HITS=$(git diff --cached --name-only --diff-filter=ACM \
         -- 'src/*' 'docs/*' '*.md' ':!LICENSE' \
        | xargs grep -nIE "$BANNED" 2>/dev/null || true)
 if [ -n "$HITS" ]; then
   echo ""
-  echo "❌ COMMIT BLOCKED — strategy/judgment vocabulary in staged changes (§2.8):"
+  echo "❌ COMMIT BLOCKED — strategy/judgment vocabulary in staged changes:"
   echo "$HITS"
   echo ""
   echo "Use mechanism-only naming; keep strategy framing out of committed code."
@@ -91,6 +91,25 @@ if [ -n "$HITS" ]; then
   echo "$HITS"
   echo ""
   echo "State the mechanism inline; do not name private notes, private paths, or doc sections."
+  echo ""
+  exit 1
+fi
+
+# ── private-doc section-citation guard ───────────────────────────────────────
+# Committed code must be self-contained — no private-doc section/design-code refs
+# (§x.x, PRD §, DD/ED/FD codes). Excludes the guard machinery (.githooks/* and the
+# hook's own test) whose denylists must contain the very tokens they detect.
+SECTREF='§[0-9]|PRD §|\b(DD|ED|FD)[0-9]\b'
+HITS=$(git diff --cached --name-only --diff-filter=ACM \
+        -- 'src/*' 'docs/*' '*.md' ':!LICENSE' ':!.githooks/*' \
+           ':!tests/unit/test_precommit_hook.py' \
+       | xargs grep -nIE "$SECTREF" 2>/dev/null || true)
+if [ -n "$HITS" ]; then
+  echo ""
+  echo "❌ COMMIT BLOCKED — committed code must be self-contained — no private-doc/section refs:"
+  echo "$HITS"
+  echo ""
+  echo "State the mechanism inline; drop the citation (no §x.x / PRD § / DD-ED-FD codes)."
   echo ""
   exit 1
 fi

@@ -3,7 +3,7 @@
 """Atlas writer — append-only insert + corroborate functions.
 
 Append-only: insert and corroborate only; no wipe path exists.
-Field names and query examples are neutral (§2.8); they describe mechanism only.
+Field names and query examples are neutral; they describe mechanism only.
 """
 
 from __future__ import annotations

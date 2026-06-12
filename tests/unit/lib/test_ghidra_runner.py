@@ -56,7 +56,7 @@ def _good_json() -> str:
     )
 
 
-# ── find_headless: §5.3 priority order ───────────────────────────────────────
+# ── find_headless: priority order ────────────────────────────────────────────
 
 
 def test_find_headless_config_home(tmp_path: Path) -> None:

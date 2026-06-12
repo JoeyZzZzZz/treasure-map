@@ -5,15 +5,15 @@
 Detection: file extension in {html, htm, js, mjs, cgi, php, asp, aspx, jsp, jspx}.
 Ingestion: ordered regex extraction of HTTP endpoint references (fetch / axios / XHR /
 ajax / form action / cgi_ref / literal path). Stores each endpoint path verbatim as
-evidence (FD1 -- the firmware's OWN content; not generated). vuln_hint is categorical
-only (§5.3). No AST parser, no new dependency (FD2).
+evidence (the firmware's OWN content; not generated). vuln_hint is categorical
+only. No AST parser, no new dependency.
 
-FD3: a .cgi that begins with a shell shebang is claimed first by the shell_script
+A .cgi that begins with a shell shebang is claimed first by the shell_script
 ingester (registry index 0) -- its command-injection view is the higher-value analysis.
 web_asset covers pure web assets (html/js/templates) and non-shell CGI/PHP only.
 
 ENDPOINT_RULES note: goform and cgi-bin are generic embedded-web-server conventions
-(boa/GoAhead), not vendor brands. Do NOT add vendor-specific handler names (§5.5).
+(boa/GoAhead), not vendor brands. Do NOT add vendor-specific handler names.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ from treasure_map.lib.analyze.non_binary.framework import (
     NonBinaryIngester,
 )
 
-# Categorical vuln_hint vocabulary (§5.3). Observation labels only -- never a payload.
+# Categorical vuln_hint vocabulary. Observation labels only -- never a payload.
 WEB_ENDPOINT_HINTS: frozenset[str] = frozenset(
     {
         "api_endpoint",
@@ -100,7 +100,7 @@ def _detect_web_asset(f: NonBinaryFile) -> str | None:
 
 
 def _classify_endpoint(path: str) -> str:
-    """Return categorical vuln_hint for an endpoint path/URL (§5.3 labels only)."""
+    """Return categorical vuln_hint for an endpoint path/URL (labels only)."""
     if "/cgi-bin/" in path.lower():
         return "cgi_endpoint"
     if path.startswith(("http://", "https://")):
@@ -111,7 +111,7 @@ def _classify_endpoint(path: str) -> str:
 
 
 def _ingest_web_asset(conn: sqlite3.Connection, file_id: int, f: NonBinaryFile) -> int:
-    """Extract and insert web endpoint rows (FD1: relevant-only evidence).
+    """Extract and insert web endpoint rows (relevant-only evidence).
 
     Stores the asset's OWN endpoint references verbatim -- never generates attack output.
     Deduplicates within file on path: specific rules precede the literal catch-all, so

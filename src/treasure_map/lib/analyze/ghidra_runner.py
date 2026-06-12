@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Ghidra headless analysis runner.
 
-Path discovery follows §5.3: config.local.home → GHIDRA_HOME env → PATH.
+Path discovery order: config.local.home → GHIDRA_HOME env → PATH.
 Single-binary wrapper: GhidraRunner.run_ghidra().  Parallel dispatch: run_all().
 """
 
@@ -46,7 +46,7 @@ class GhidraResult:
 
 
 def find_headless(config: GhidraConfig) -> Path:
-    """Discover analyzeHeadless per §5.3 priority order.
+    """Discover analyzeHeadless in priority order.
 
     1. config.local.home / support / analyzeHeadless
     2. $GHIDRA_HOME / support / analyzeHeadless
@@ -247,7 +247,7 @@ class GhidraRunner:
         self._headless = headless  # None = lazy-discovered on first use
 
     def get_headless(self) -> Path:
-        """Return cached headless path, discovering it on first call (§5.3)."""
+        """Return cached headless path, discovering it on first call."""
         if self._headless is None:
             self._headless = find_headless(self._config)
         return self._headless

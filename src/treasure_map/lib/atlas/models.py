@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Atlas row models — frozen dataclasses mirroring pattern + instance columns.
 
-No behavior. Field names are neutral (§2.8): they describe mechanism, not interpretation.
+No behavior. Field names are neutral: they describe mechanism, not interpretation.
 """
 
 from __future__ import annotations
