@@ -30,6 +30,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- M2 Step 3 (R1): function summary filler (`lib/analyze/summarize.py`). Fills
+  `functions.summary` via the S-tier LLM router — the first real pipeline use of
+  router → cache → cost-guard → S-tier provider. Idempotent and resumable (selects
+  only `summary IS NULL` rows with pseudocode; failed items stay NULL for the next
+  run). Opt-in via `tmap analyze --summarize` / `--summary-limit N`; a plain key-less
+  `analyze` is unchanged and never builds a router. Missing/invalid S-tier key skips
+  with one message and analysis still succeeds. `PROMPT_VERSION` constant gates the
+  router cache. `build_router` gained a `tiers=` parameter so summarization needs only
+  the S-tier key.
 - Initial project structure
 - AGPL-3.0 license
 - M2 Step 2 (R0): `tmap init` onboarding command (`cli/init_cli.py`, `lib/setup/`).

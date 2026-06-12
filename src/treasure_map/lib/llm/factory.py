@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import Path
 
 from treasure_map.lib.config.config import LLMConfig
@@ -42,8 +43,14 @@ def build_router(
     *,
     agent_mode: bool = False,
     agent_max_cost_usd: float | None = None,
+    tiers: Iterable[Tier] | None = None,
 ) -> LLMRouter:
-    """Create a ready-to-use LLMRouter with cache, cost guard, and all providers wired up."""
+    """Create a ready-to-use LLMRouter with cache, cost guard, and providers wired up.
+
+    tiers limits which tier providers are built (and thus which API keys must
+    resolve). Default None builds all tiers; pass e.g. [Tier.S] for a task that
+    only uses the cheap tier so a missing M/L key does not block it.
+    """
     cache = LLMCache(llm_config.cache.path)
     guard = CostGuard(
         llm_config.cost_guards,
@@ -53,7 +60,7 @@ def build_router(
     )
     router = LLMRouter(llm_config, cache, guard)
 
-    for tier in Tier:
+    for tier in tiers if tiers is not None else list(Tier):
         router.register_provider(tier, _build_provider(tier, llm_config))
 
     return router
