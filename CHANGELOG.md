@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `lib/pattern/`: call-sequence shape primitive (`scan`). Given one analysis.db, it
+  finds functions whose callee set forms a coarse dangerous shape — a command-injection
+  shape (external-input source + string formatter + command sink, gated by a shell-ish
+  `%s` format literal) or an overflow shape (source + copy sink) — and computes a coarse
+  structural fingerprint (`callseq-v1`) aligned to the cross-firmware pattern columns.
+  Pure-static and hermetic: no LLM, no router, no tier. OSS/third-party binaries are
+  excluded data-driven first (components-table membership) then by a generic public-OSS
+  name list plus the `lib*` heuristic, so custom binaries surface without third-party
+  noise. Read-only on the input; returns in-memory candidate shapes only (a match is a
+  lead, never a claimed bug; evidence is raw firmware-derived text a persistence consumer
+  must neutralize). Library API only (no CLI). Detectors live in an explicit registry of
+  plain callables. Synthetic, network-free tests cover both shapes (positive + negative),
+  OSS exclusion, the fingerprint, read-only safety, and a vendor-/label-vocabulary
+  boundary check.
 - `lib/diff/`: cross-entity diff primitive (`run_diff`). Given two analysis databases and
   a neutral axis (version | mod | sibling), it matches functions across them
   (exact symbol → identical pseudocode hash → bounded M-tier assist on the residue, with a
