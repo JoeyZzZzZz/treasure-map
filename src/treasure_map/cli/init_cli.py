@@ -38,6 +38,7 @@ def init(force: bool, non_interactive: bool, check_only: bool) -> None:
             non_interactive=non_interactive,
             check_only=check_only,
             prompt=_prompt_fn,
+            echo=click.echo,
         )
     except FileExistsError as exc:
         raise click.ClickException(str(exc)) from exc

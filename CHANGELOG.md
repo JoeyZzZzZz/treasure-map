@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `tmap init` now CONFIGURES Ghidra, not only checks it. A new step runs between secrets
+  entry and the preflight doctor: it auto-detects `analyzeHeadless` (via `GHIDRA_HOME`/PATH)
+  and accepts it without prompting when found; otherwise it prompts for the install root,
+  validates that the path contains `support/analyzeHeadless`, and writes it to
+  `config.yaml` as `ghidra.local.home`. Non-interactive or blank input leaves the setting
+  unset (run-time auto-discovery), never blocking a scripted init. The path is written to
+  `config.yaml` only (non-secret); the `.env` secrets model is unchanged. Previously a user
+  with Ghidra installed elsewhere finished init with a red check and had to hand-edit config.
+
 - reachability (R2): tighten `confirmed` so it requires a provable in-function flow from a
   STRONG (network/request) source. A real-firmware run over-claimed `confirmed`; three
   causes are fixed: (1) taint now follows real flow, not co-occurrence — a source taints

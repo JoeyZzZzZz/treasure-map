@@ -12,6 +12,7 @@ from unittest.mock import patch
 import pytest
 import yaml
 
+from treasure_map.lib.errors import GhidraNotFoundError
 from treasure_map.lib.setup.initializer import (
     _DEFAULT_CONFIG_YAML,
     _collect_default_env_vars,
@@ -21,6 +22,22 @@ from treasure_map.lib.setup.initializer import (
     _write_env,
     run_init,
 )
+
+_FIND_HEADLESS = "treasure_map.lib.analyze.ghidra_runner.find_headless"
+
+
+def _make_ghidra_root(base: Path, name: str = "ghidra_11") -> Path:
+    """Create a fake Ghidra install root containing support/analyzeHeadless."""
+    root = base / name
+    (root / "support").mkdir(parents=True)
+    (root / "support" / "analyzeHeadless").write_text("#!/bin/sh\n")
+    return root
+
+
+def _ghidra_home(fake_home: Path) -> Any:
+    data = yaml.safe_load((fake_home / ".treasure-map" / "config.yaml").read_text())
+    return data["ghidra"]["local"]["home"]
+
 
 # ── fixtures ─────────────────────────────────────────────────────────────────
 
@@ -344,3 +361,76 @@ def test_run_doctor_api_key_check_green_when_set(
     key_checks = [c for c in checks if c[0].startswith("key:")]
     assert len(key_checks) == 1
     assert key_checks[0][1] is True
+
+
+# ── run_init — Ghidra configuration step (R0-fix) ─────────────────────────────
+
+
+def test_init_ghidra_autodetect_accepts_without_prompt(fake_home: Path) -> None:
+    msgs: list[str] = []
+
+    def _record_prompt(msg: str) -> str:
+        msgs.append(msg)
+        return ""
+
+    with patch(_FIND_HEADLESS, return_value=Path("/opt/ghidra/support/analyzeHeadless")):
+        run_init(non_interactive=False, prompt=_record_prompt)
+
+    # Auto-detected: no Ghidra prompt fired, and nothing written (run-time discovery).
+    assert not any("Ghidra install root" in m for m in msgs)
+    assert _ghidra_home(fake_home) is None
+
+
+def test_init_ghidra_prompt_validates_and_writes(fake_home: Path) -> None:
+    root = _make_ghidra_root(fake_home)
+    answers = iter([str(fake_home / "nope"), str(root)])  # invalid, then valid
+
+    def _prompt(msg: str) -> str:
+        return next(answers) if "Ghidra install root" in msg else ""
+
+    with patch(_FIND_HEADLESS, side_effect=GhidraNotFoundError("not found")):
+        run_init(non_interactive=False, prompt=_prompt)
+
+    assert _ghidra_home(fake_home) == str(root)
+
+
+def test_init_ghidra_invalid_path_not_written(fake_home: Path) -> None:
+    def _prompt(msg: str) -> str:
+        # Always return a path lacking support/analyzeHeadless.
+        return str(fake_home / "not-ghidra") if "Ghidra install root" in msg else ""
+
+    with patch(_FIND_HEADLESS, side_effect=GhidraNotFoundError("not found")):
+        run_init(non_interactive=False, prompt=_prompt)
+
+    assert _ghidra_home(fake_home) is None  # bad path never written
+
+
+def test_init_non_interactive_no_ghidra_leaves_unset(fake_home: Path) -> None:
+    msgs: list[str] = []
+
+    def _record_prompt(msg: str) -> str:
+        msgs.append(msg)
+        return ""
+
+    with patch(_FIND_HEADLESS, side_effect=GhidraNotFoundError("not found")):
+        result = run_init(non_interactive=True, prompt=_record_prompt)
+
+    assert not any("Ghidra install root" in m for m in msgs)  # never prompts
+    assert _ghidra_home(fake_home) is None
+    assert result.config_path.exists()  # init still succeeds
+
+
+def test_init_ghidra_path_goes_to_config_not_env(fake_home: Path) -> None:
+    root = _make_ghidra_root(fake_home)
+
+    def _prompt(msg: str) -> str:
+        return str(root) if "Ghidra install root" in msg else ""
+
+    with patch(_FIND_HEADLESS, side_effect=GhidraNotFoundError("not found")):
+        run_init(non_interactive=False, prompt=_prompt)
+
+    env_text = (fake_home / ".treasure-map" / ".env").read_text()
+    assert "ghidra" not in env_text.lower()  # secrets file is untouched by the Ghidra step
+    assert str(root) not in env_text
+    cfg_text = (fake_home / ".treasure-map" / "config.yaml").read_text()
+    assert str(root) in cfg_text  # the path (non-secret) belongs in config.yaml

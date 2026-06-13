@@ -146,6 +146,64 @@ def _seed_watchlist() -> None:
         shutil.copy2(src, dst)
 
 
+def _noop_echo(_msg: str) -> None:
+    return None
+
+
+def _set_ghidra_home(config_path: Path, home: Path) -> None:
+    """Write ghidra.local.home into config.yaml, preserving the rest of the file."""
+    data: dict[str, Any] = yaml.safe_load(config_path.read_text()) or {}
+    data.setdefault("ghidra", {}).setdefault("local", {})["home"] = str(home)
+    config_path.write_text(yaml.safe_dump(data, default_flow_style=False))
+
+
+def _configure_ghidra(
+    config_path: Path,
+    *,
+    non_interactive: bool,
+    prompt: Callable[[str], str],
+    echo: Callable[[str], None],
+) -> None:
+    """Detect Ghidra, or (interactively) prompt for and validate its install root.
+
+    Auto-detect first (GHIDRA_HOME / PATH via the headless discovery); if found, accept it
+    without prompting and write nothing (run-time discovery finds it again). If not found,
+    prompt for the install root and validate it contains support/analyzeHeadless before
+    writing ghidra.local.home. Non-interactive or blank input leaves config unset (run-time
+    auto-discovery), never blocking. This writes a path only — it never touches secrets.
+    """
+    from treasure_map.lib.analyze.ghidra_runner import find_headless
+    from treasure_map.lib.config.config import GhidraConfig
+    from treasure_map.lib.errors import GhidraNotFoundError
+
+    try:
+        headless = find_headless(GhidraConfig())
+        echo(f"  Ghidra : found at {headless}")
+        return
+    except GhidraNotFoundError:
+        pass
+
+    if non_interactive:
+        echo("  Ghidra : not found; left unset (auto-discovery runs at analyze time).")
+        return
+
+    echo("  Ghidra : not auto-detected.")
+    for _ in range(2):  # one prompt plus one retry on an invalid path
+        entered = prompt(
+            "Enter Ghidra install root (dir containing support/analyzeHeadless), Enter to skip: "
+        ).strip()
+        if not entered:
+            echo("  Ghidra : left unset (auto-discovery runs at analyze time).")
+            return
+        root = Path(os.path.expanduser(entered))
+        if (root / "support" / "analyzeHeadless").exists():
+            _set_ghidra_home(config_path, root)
+            echo(f"  Ghidra : configured {root}")
+            return
+        echo(f"  Ghidra : {root} has no support/analyzeHeadless — try again or Enter to skip.")
+    echo("  Ghidra : left unset (no valid path entered).")
+
+
 def _run_doctor(tm_home: Path, cfg: Config | None) -> tuple[tuple[str, bool, str], ...]:
     """Run preflight checks and return (name, ok, detail) triples."""
     checks: list[tuple[str, bool, str]] = []
@@ -203,10 +261,12 @@ def run_init(
     non_interactive: bool = False,
     check_only: bool = False,
     prompt: Callable[[str], str],
+    echo: Callable[[str], None] = _noop_echo,
 ) -> InitResult:
     """Set up ~/.treasure-map/ with config.yaml, .env, and run preflight checks.
 
     No network calls. check_only=True inspects existing state without writing anything.
+    echo, if given, receives human-readable progress lines (e.g. the Ghidra step).
     """
     tm_home = Path.home() / ".treasure-map"
     config_path = tm_home / "config.yaml"
@@ -223,6 +283,12 @@ def run_init(
             non_interactive=non_interactive,
         )
         _seed_watchlist()
+        _configure_ghidra(
+            config_path,
+            non_interactive=non_interactive,
+            prompt=prompt,
+            echo=echo,
+        )
 
     # Source env file (non-override semantics) so doctor can see API keys.
     _source_env_file(env_path)
