@@ -195,6 +195,45 @@ def test_off_path_validator_does_not_block() -> None:
     assert verdict.status == "unknown"
 
 
+# ── coverage: block only when ALL dangerous inputs to the sink are covered ──────────
+
+
+def test_mixed_sink_one_uncovered_input_does_not_block() -> None:
+    # The sink is built from a validated value and an UNVALIDATED weak (nvram) value;
+    # a covered sibling must not mask the uncovered input -> not blocked, grades unknown.
+    pseudo = (
+        'char* nv = nvram_get("k"); char* cv = websGetVar(wp, "v"); check_field(cv); '
+        'sprintf(cmd, "x %s %s", nv, cv); system(cmd);'
+    )
+    callees = ["nvram_get", "websGetVar", "check_field", "sprintf", "system"]
+    verdict = grade_candidate(pseudo, callees, "system")
+    assert verdict.status != "blocked"
+    assert verdict.status == "unknown"
+
+
+def test_fully_covered_multi_input_sink_blocks() -> None:
+    # Every input reaching the sink is validated (validated buffer copied before the sink).
+    pseudo = (
+        "char buf_a[64]; recv(fd, buf_a, 64); check_field(buf_a); "
+        "memcpy(buf_b, buf_a, n); system(buf_b);"
+    )
+    callees = ["recv", "check_field", "memcpy", "system"]
+    verdict = grade_candidate(pseudo, callees, "system")
+    assert verdict.status == "blocked"
+
+
+def test_mixed_sink_uncovered_strong_source_is_confirmed() -> None:
+    # One input is a validated value; the other is an UNCOVERED strong in-function source.
+    # The covered sibling must not mask the live strong path -> confirmed.
+    pseudo = (
+        'char x[64]; recv(fd, x, 64); char* cv = websGetVar(wp, "v"); check_field(cv); '
+        'sprintf(cmd, "%s %s", x, cv); system(cmd);'
+    )
+    callees = ["recv", "websGetVar", "check_field", "sprintf", "system"]
+    verdict = grade_candidate(pseudo, callees, "system")
+    assert verdict.status == "confirmed"
+
+
 # ── BOUNDARY: no vendor/spike symbols, no bug-labeling vocab, generic validators ────
 
 

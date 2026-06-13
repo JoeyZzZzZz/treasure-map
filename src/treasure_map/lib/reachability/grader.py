@@ -15,11 +15,12 @@ from __future__ import annotations
 
 from treasure_map.lib.reachability.filters import (
     has_inline_bound,
+    has_validator,
     validator_on_path,
     validator_present,
 )
 from treasure_map.lib.reachability.models import ReachabilityVerdict
-from treasure_map.lib.reachability.taint import flows_into, locate_sink_arg, origin_of
+from treasure_map.lib.reachability.taint import _taint_sets, flows_into, locate_sink_arg
 
 _BASIS_NO_CALLEES = "no callees were recorded for the function"
 _BASIS_NO_BODY = "no pseudocode was available for the function"
@@ -42,6 +43,7 @@ _BASIS_CONFIRMED = (
     "source and flows to the sink unfiltered, fully visible within this function"
 )
 _BASIS_ORIGIN_UNKNOWN = "the origin of the value reaching the sink could not be determined here"
+_BASIS_COVERED = "a validator covers every input reaching the sink"
 
 
 def grade_candidate(
@@ -66,28 +68,46 @@ def grade_candidate(
     if sink_arg is None:
         return ReachabilityVerdict("unknown", None, _BASIS_NO_SINK, degraded=True)
 
-    # A validator anywhere on the data-flow path into the sink blocks it — even when the
-    # validated value reaches the sink under renamed intermediates (copies/format calls).
-    path_vars = {sink_arg} | flows_into(pseudocode, sink_arg)
-    blocked, mechanism = validator_on_path(callees, pseudocode, path_vars)
-    if blocked:
-        return ReachabilityVerdict("blocked", mechanism, mechanism or "")
+    # Identify the tainted values that actually flow into the sink, and whether each is
+    # COVERED by a validator anywhere on its flow line to the sink. A sink blocks only when
+    # EVERY such input is covered — a covered input must never mask an uncovered sibling.
+    flow = flows_into(pseudocode, sink_arg)
+    path_vars = {sink_arg} | flow
+    strong, weak, par = _taint_sets(pseudocode)
 
-    origin = origin_of(pseudocode, sink_arg)
-    if origin == "parameter":
-        # Hard invariant: a parameter-sourced, unfiltered sink is NEVER confirmed.
+    flow_of = {var: flows_into(pseudocode, var) for var in path_vars}
+    covered_vars = {var for var in path_vars if has_validator(callees, pseudocode, var)[0]}
+
+    def _is_covered(value: str) -> bool:
+        # value is covered if a validated var sits on the same flow line (either direction):
+        # the var itself, a value it derives from, or a value that derives from it.
+        return any(
+            w == value or w in flow_of.get(value, set()) or value in flow_of.get(w, set())
+            for w in covered_vars
+        )
+
+    tainted = path_vars & (strong | weak | par)
+    uncovered = {value for value in tainted if not _is_covered(value)}
+
+    if tainted and not uncovered:
+        return ReachabilityVerdict("blocked", _BASIS_COVERED, _BASIS_COVERED)
+
+    # Grade by the most-severe UNCOVERED input — a covered sibling cannot rescue it.
+    if uncovered & par:
+        # Hard invariant: a parameter contribution makes the path unprovable -> never confirmed.
         return ReachabilityVerdict("unknown", None, _BASIS_PARAM)
-    if origin == "weak_source":
-        # Locally-influenced input: external controllability is not establishable here.
-        return ReachabilityVerdict("unknown", None, _BASIS_WEAK)
-    if origin == "strong_source":
+    if uncovered & strong:
         bounded, bound_mechanism = has_inline_bound(pseudocode)
         if bounded:
             # A demonstrable clamp limits the value — bounded, not an unfiltered flow.
             return ReachabilityVerdict("blocked", bound_mechanism, bound_mechanism or "")
-        if validator_present(callees):
-            # A validator exists but is not clearly on this value — prefer unknown.
+        if validator_present(callees) and not validator_on_path(callees, pseudocode, path_vars)[0]:
+            # A validator exists but touches nothing on the sink's flow path — cannot relate
+            # it; prefer unknown over a confident confirm (mis-block caution).
             return ReachabilityVerdict("unknown", None, _BASIS_AMBIGUOUS)
         return ReachabilityVerdict("confirmed", None, _BASIS_CONFIRMED)
+    if uncovered & weak:
+        # Locally-influenced input: external controllability is not establishable here.
+        return ReachabilityVerdict("unknown", None, _BASIS_WEAK)
 
     return ReachabilityVerdict("unknown", None, _BASIS_ORIGIN_UNKNOWN, degraded=True)

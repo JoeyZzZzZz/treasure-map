@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- reachability (R2): block only when ALL dangerous inputs reaching a sink are covered by a
+  validator. Previously the grader returned `blocked` as soon as ANY variable on the flow
+  path matched a validator, so a sink fed by [validated value + an unvalidated parameter or
+  weak/config value] was mislabeled `blocked` — mislabeling a live, unfiltered path as
+  dormant ("stop looking"). The grader now computes each tainted value reaching the sink,
+  marks it covered only if a validator sits on its flow line (either direction), and blocks
+  only when every such input is covered; otherwise it grades by the most-severe UNCOVERED
+  input (uncovered strong in-function source → `confirmed` subject to the existing guards;
+  uncovered parameter or weak source → `unknown`). A covered sibling can no longer mask an
+  uncovered input. Fully-covered sinks still block (precision, not retreat); the
+  never-auto-confirm invariant and mis-block caution are unchanged. Regression fixtures are
+  synthetic and vendor-neutral.
+
 - reachability (R2): recognize a validator applied anywhere on the data-flow path into the
   sink, not only on the sink argument's final name. A validated value that reaches the sink
   through renamed intermediates (copy/format calls) was graded `unknown` instead of
