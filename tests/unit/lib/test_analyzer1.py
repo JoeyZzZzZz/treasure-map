@@ -119,11 +119,12 @@ def test_pipeline_writes_unknown_instance_at_l0(tmp_path: Path) -> None:
     assert row["external_anchor"] is None
 
 
-# ── blocked -> dormant at L1, still no public finding ───────────────────────────────
+# ── validator-guarded candidate -> unknown in v1; dormant stays empty ───────────────
 
 
-def test_blocked_candidate_lands_in_dormant(tmp_path: Path) -> None:
-    # In-function source, but a validator guards the value -> R2 "blocked".
+def test_validator_guarded_candidate_is_unknown_dormant_empty(tmp_path: Path) -> None:
+    # A validator appears to guard the value, but R2 v1 never emits blocked (reserved for
+    # R2-deep) -> the instance grades unknown at L0, and the dormant partition stays empty.
     body = "void h(){ char buf[64]; recv(fd,buf,64); if(check_field(buf)){ system(buf); } }"
     calls = ["recv", "check_field", "system"]
     a = _one_fn_db(tmp_path, "a.db", fn="h", body=body, h="old", callees=calls)
@@ -131,12 +132,12 @@ def test_blocked_candidate_lands_in_dormant(tmp_path: Path) -> None:
     atlas = tmp_path / "atlas.db"
     stats = run_analyzer1(a, b, "version", atlas, FakeRouter(), run_id_a="rb", run_id_b="rc")
 
-    assert stats.by_status["blocked"] == 1
+    assert stats.by_status["blocked"] == 0
+    assert stats.by_status["unknown"] == 1
     (row,) = _instances(atlas)
-    assert row["reachability_status"] == "blocked"
-    assert row["provenance_level"] == "L1"
-    assert row["blocking_mechanism"]  # neutral mechanism set
-    assert _count(atlas, "dormant_instance") == 1
+    assert row["reachability_status"] == "unknown"
+    assert row["provenance_level"] == "L0"
+    assert _count(atlas, "dormant_instance") == 0  # honestly empty in M2 (no v1 blocked)
     assert _count(atlas, "public_finding") == 0
 
 

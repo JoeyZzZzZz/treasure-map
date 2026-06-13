@@ -20,15 +20,17 @@ from treasure_map.lib.reachability.filters import VALIDATOR_PATTERNS
 _REACH_PKG = Path(__file__).resolve().parents[3] / "src" / "treasure_map" / "lib" / "reachability"
 
 
-# ── blocked: validator applied to the value before the sink ─────────────────────────
+# ── covered (apparent validator) -> unknown in v1, never blocked ────────────────────
 
 
-def test_blocked_when_validator_applied() -> None:
+def test_covered_validator_is_unknown() -> None:
+    # A validator appears to cover the value, but v1 cannot prove non-reachability soundly,
+    # so it grades unknown (NOT blocked) — blocked is reserved for R2-deep.
     pseudo = "char* v = param_1; if (check_field(v)) { system(v); }"
     verdict = grade_candidate(pseudo, ["check_field", "system"], "system")
-    assert verdict.status == "blocked"
-    assert verdict.blocking_mechanism is not None
-    assert not verdict.degraded
+    assert verdict.status == "unknown"
+    assert verdict.blocking_mechanism is None
+    assert not verdict.degraded  # input was complete; v1 just cannot prove non-reachability
 
 
 # ── unknown: parameter-sourced sink (the section-6.4 invariant) ─────────────────────
@@ -167,12 +169,12 @@ def test_validator_not_on_value_prefers_unknown_not_blocked() -> None:
     assert verdict.status != "confirmed"
 
 
-# ── validator on the data-flow path (through renames) -> blocked ────────────────────
+# ── validator on the data-flow path (through renames) -> unknown in v1 ──────────────
 
 
-def test_validator_blocks_through_renaming_copies() -> None:
-    # The validated value reaches the sink under renamed intermediates (copy + format);
-    # the guard is real and on the path, so the verdict is blocked, not unknown.
+def test_validator_through_rename_is_unknown() -> None:
+    # The validator appears to cover the value (reached under renamed intermediates), but v1
+    # cannot prove non-reachability soundly -> unknown, not blocked (reserved for R2-deep).
     pseudo = (
         "char* buf_a = b64_decode(input); check_field(buf_a); "
         "memcpy(buf_b, buf_a, n); "
@@ -180,8 +182,7 @@ def test_validator_blocks_through_renaming_copies() -> None:
     )
     callees = ["b64_decode", "check_field", "memcpy", "sprintf", "system"]
     verdict = grade_candidate(pseudo, callees, "system")
-    assert verdict.status == "blocked"
-    assert verdict.blocking_mechanism is not None
+    assert verdict.status == "unknown"
 
 
 def test_off_path_validator_does_not_block() -> None:
@@ -213,15 +214,16 @@ def test_mixed_sink_one_uncovered_input_does_not_block() -> None:
     assert verdict.status == "unknown"
 
 
-def test_fully_covered_multi_input_sink_blocks() -> None:
-    # Every input reaching the sink is validated (validated buffer copied before the sink).
+def test_fully_covered_multi_input_is_unknown() -> None:
+    # Every input reaching the sink appears validated, but v1 grades unknown (not blocked) —
+    # proving the copy actually carries the validated content is R2-deep's job.
     pseudo = (
         "char buf_a[64]; recv(fd, buf_a, 64); check_field(buf_a); "
         "memcpy(buf_b, buf_a, n); system(buf_b);"
     )
     callees = ["recv", "check_field", "memcpy", "system"]
     verdict = grade_candidate(pseudo, callees, "system")
-    assert verdict.status == "blocked"
+    assert verdict.status == "unknown"
 
 
 def test_mixed_sink_uncovered_strong_source_is_confirmed() -> None:
@@ -278,12 +280,78 @@ def test_polluted_partial_coverage_does_not_block() -> None:
     assert verdict.status != "blocked"
 
 
-def test_clean_single_input_validator_still_blocks() -> None:
-    # The clean single-input shape: one input, validator directly on the value reaching the
-    # sink, no pollution. This must STAY blocked (raise the bar, do not remove blocked).
+def test_clean_single_input_validator_is_unknown() -> None:
+    # Even the clean single-input validated shape grades unknown in v1: blocked is not a v1
+    # verdict (it is reserved for R2-deep), so v1 never returns it.
     pseudo = "char buf[64]; recv(fd, buf, 64); check_field(buf); system(buf);"
     verdict = grade_candidate(pseudo, ["recv", "check_field", "system"], "system")
-    assert verdict.status == "blocked"
+    assert verdict.status == "unknown"
+    assert verdict.status != "blocked"
+
+
+# ── v1 hard invariant: blocked is never emitted; the two real-firmware shapes ────────
+
+_BLOCKED_PRONE_SHAPES: list[tuple[str, list[str], str]] = [
+    # apparent direct validator on the value
+    ("char* v = param_1; if (check_field(v)) { system(v); }", ["check_field", "system"], "system"),
+    # clean single input, validator on the value
+    (
+        "char buf[64]; recv(fd, buf, 64); check_field(buf); system(buf);",
+        ["recv", "check_field", "system"],
+        "system",
+    ),
+    # validated value renamed through a copy before the sink
+    (
+        'char* a = b64_decode(input); check_field(a); memcpy(b, a, n); sprintf(cmd, "%s", b);'
+        " system(cmd);",
+        ["b64_decode", "check_field", "memcpy", "sprintf", "system"],
+        "system",
+    ),
+    # cross-branch leakage: validator in one switch case, unfiltered sink in another, on a
+    # different offset of the same (collapsed) base name (the ipd_rcv regression shape).
+    (
+        "switch (op) { case 1: check_field(st + 0x12); break; case 2: system(st + 0x14); break; }",
+        ["check_field", "system"],
+        "system",
+    ),
+    # base+offset aliasing: validator on one struct field, sink fed from another field.
+    (
+        "check_field(base + 0x12); memcpy(dst, base + 0x14, n); system(dst);",
+        ["check_field", "memcpy", "system"],
+        "system",
+    ),
+]
+
+
+def test_v1_never_emits_blocked() -> None:
+    for pseudo, callees, sink in _BLOCKED_PRONE_SHAPES:
+        verdict = grade_candidate(pseudo, callees, sink)
+        assert verdict.status != "blocked", pseudo
+
+
+def test_cross_branch_validator_does_not_block() -> None:
+    # A check_* in one switch case must not be read as covering an unfiltered sink in a
+    # different case (whole-body validator scan is unsound) -> unknown, not blocked.
+    pseudo = (
+        "switch (op) { case 1: check_field(st + 0x12); break; case 2: system(st + 0x14); break; }"
+    )
+    verdict = grade_candidate(pseudo, ["check_field", "system"], "system")
+    assert verdict.status != "blocked"
+
+
+def test_offset_aliased_validator_does_not_block() -> None:
+    # Validating base+0x12 must not be read as validating base+0x14 (the tokenizer collapses
+    # both to "base") -> unknown, not blocked.
+    pseudo = "check_field(base + 0x12); memcpy(dst, base + 0x14, n); system(dst);"
+    verdict = grade_candidate(pseudo, ["check_field", "memcpy", "system"], "system")
+    assert verdict.status != "blocked"
+
+
+def test_confirmed_unchanged() -> None:
+    # The strong-source-unfiltered confirmed path is NOT touched by this round.
+    pseudo = "char buf[64]; recv(fd, buf, 64); system(buf);"
+    verdict = grade_candidate(pseudo, ["recv", "system"], "system")
+    assert verdict.status == "confirmed"
 
 
 # ── BOUNDARY: no vendor/spike symbols, no bug-labeling vocab, generic validators ────

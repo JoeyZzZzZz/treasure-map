@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- reachability (R2) v1 verdict set is now `confirmed` / `unknown` only; `blocked` is reserved
+  for the deep data-flow engine (R2-deep) and v1 never emits it. Deciding NON-reachability
+  soundly needs path-/alias-sensitivity an intra-procedural regex read does not have, and a
+  false `blocked` would route a live path into the dormant partition and halt investigation —
+  the one error v1 must never make. A would-be `blocked` (a validator appears to cover the
+  inputs reaching the sink) now grades `unknown` with an honest `basis`. `confirmed` is
+  unchanged. `blocked` stays a valid `ReachabilityStatus` and in the atlas schema and the
+  `dormant_instance` / `twin_candidate` views (R2-deep's slot); the taint / validator / clamp
+  helpers stay wired into the `confirmed` gate (a validator on the path, a parameter
+  contribution, or a clamp demotes a would-be `confirmed` to `unknown`). No new field added.
+- Gate amendments (M2): the R2 gate's landap-class case now expects `unknown` (apparent
+  filter v1 cannot verify), the filter-present vs filter-absent verdict deferred to R2-deep;
+  greendownload-class and stripped/empty-callee cases are unchanged. The A2 gate's `dormant`
+  and `twins` views are honestly EMPTY in M2 (both require a sound `blocked` v1 cannot
+  produce); the `density` view is unaffected and remains the A2 deliverable.
+
 ### Fixed
 
 - reachability (R2): `blocked` now requires clean, direct, unambiguous full coverage — a

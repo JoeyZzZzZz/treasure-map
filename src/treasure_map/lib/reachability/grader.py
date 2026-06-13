@@ -2,13 +2,23 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Intra-procedural reachability grading (honest v1).
 
-grade_candidate reads ONE function and returns confirmed / blocked / unknown. This is a
-single-function heuristic, NOT an inter-procedural data-flow engine: it cannot prove
-attacker control across call boundaries, so "confirmed" is rare and tightly gated and
-"unknown" is the expected, correct answer for most candidates. Under any doubt the
-verdict is "unknown". A "confirmed" verdict means a path confirmed within one function
-(provenance L1 at most) — it is not a claim that anything can be triggered, and nothing
-here may treat a verdict as a confirmed defect or a publishable result.
+grade_candidate reads ONE function. This is a single-function heuristic, NOT an
+inter-procedural data-flow engine: it cannot prove attacker control across call boundaries,
+so "confirmed" is rare and tightly gated and "unknown" is the expected, correct answer for
+most candidates. Under any doubt the verdict is "unknown".
+
+v1 emits only "confirmed" / "unknown". "blocked" stays a valid ReachabilityStatus and is
+reserved for the deep data-flow engine (R2-deep): deciding NON-reachability soundly needs
+path-/alias-sensitivity an intra-procedural regex read does not have, and a false "blocked"
+would route a live path into the dormant partition and halt investigation — the one error
+v1 must never make. So a would-be "blocked" (a validator appears to cover the inputs) grades
+"unknown" with an honest basis. The validator/clamp/taint machinery stays wired — it gates
+"confirmed" (a validator on the path, a parameter contribution, or a clamp demotes a
+would-be "confirmed" to "unknown") and is reused by R2-deep.
+
+A "confirmed" verdict means a path confirmed within one function (provenance L1 at most) —
+it is not a claim that anything can be triggered, and nothing here may treat a verdict as a
+confirmed defect or a publishable result.
 """
 
 from __future__ import annotations
@@ -43,7 +53,11 @@ _BASIS_CONFIRMED = (
     "source and flows to the sink unfiltered, fully visible within this function"
 )
 _BASIS_ORIGIN_UNKNOWN = "the origin of the value reaching the sink could not be determined here"
-_BASIS_COVERED = "a validator covers every input reaching the sink"
+_BASIS_COVERED_UNVERIFIED = (
+    "a validator-style call appears to cover the inputs reaching the sink, but an "
+    "intra-procedural read cannot prove this path is bounded; the verdict is unknown, "
+    "not blocked — deep data-flow analysis (R2-deep) is required to decide non-reachability"
+)
 _BASIS_CLAMP = (
     "a clamp may bound the value on the path; a clean unfiltered flow is not provable here, "
     "so the result is unknown rather than confirmed"
@@ -92,8 +106,12 @@ def grade_candidate(
     uncovered = {seed for seed in dangerous if not _is_covered(seed)}
 
     if dangerous and not uncovered:
-        # Clean, direct, full coverage over a trustworthy flow set — clearly fully blocked.
-        return ReachabilityVerdict("blocked", _BASIS_COVERED, _BASIS_COVERED)
+        # Appears fully covered — BUT an intra-procedural regex read cannot prove this is sound
+        # (cross-branch validator leakage, base+offset aliasing). Per the no-silent-miss rule,
+        # v1 NEVER downgrades a possibly-reachable path to blocked: the verdict is unknown (NOT
+        # degraded — the input was complete; v1 simply cannot prove non-reachability). The
+        # filter-present vs filter-absent verdict is deferred to the deep data-flow engine.
+        return ReachabilityVerdict("unknown", None, _BASIS_COVERED_UNVERIFIED)
 
     # Grade by the most-severe UNCOVERED seed. No path here may return blocked.
     if uncovered & par_seeds:
