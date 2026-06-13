@@ -1,0 +1,141 @@
+# Copyright (C) 2025-2026 JoeyZzZzZz
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Unit tests for the reachability grading primitive (R2, intra-procedural v1).
+
+Hermetic: synthetic, vendor-neutral pseudocode strings, no network, no LLM. Proves the
+grading table, the never-auto-confirm hard invariant, the mis-block caution, and
+degrade-and-flag.
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+import pytest
+
+from treasure_map.lib.reachability import grade_candidate
+from treasure_map.lib.reachability.filters import VALIDATOR_PATTERNS
+
+_REACH_PKG = Path(__file__).resolve().parents[3] / "src" / "treasure_map" / "lib" / "reachability"
+
+
+# ── blocked: validator applied to the value before the sink ─────────────────────────
+
+
+def test_blocked_when_validator_applied() -> None:
+    pseudo = "char* v = param_1; if (check_field(v)) { system(v); }"
+    verdict = grade_candidate(pseudo, ["check_field", "system"], "system")
+    assert verdict.status == "blocked"
+    assert verdict.blocking_mechanism is not None
+    assert not verdict.degraded
+
+
+# ── unknown: parameter-sourced sink (the section-6.4 invariant) ─────────────────────
+
+
+def test_unknown_when_parameter_sourced() -> None:
+    pseudo = (
+        "void run_external_tool(char* param_1){ char cmd[128]; "
+        'snprintf(cmd,128,"/usr/bin/x %s",param_1); system(cmd); }'
+    )
+    verdict = grade_candidate(pseudo, ["snprintf", "system"], "system")
+    assert verdict.status == "unknown"  # caller control unprovable intra-procedurally
+    assert verdict.status != "confirmed"
+    assert not verdict.degraded
+
+
+# ── confirmed: in-function source, unfiltered, fully visible ────────────────────────
+
+
+def test_confirmed_when_in_function_source_unfiltered() -> None:
+    pseudo = (
+        "char buf[64]; recv(fd,buf,64); char cmd[128]; "
+        'snprintf(cmd,128,"/usr/bin/x %s",buf); system(cmd);'
+    )
+    verdict = grade_candidate(pseudo, ["recv", "snprintf", "system"], "system")
+    assert verdict.status == "confirmed"
+    assert verdict.blocking_mechanism is None
+    assert not verdict.degraded
+
+
+def test_confirmed_via_return_value_source() -> None:
+    pseudo = 'char* v = getenv("X"); system(v);'
+    verdict = grade_candidate(pseudo, ["getenv", "system"], "system")
+    assert verdict.status == "confirmed"
+
+
+# ── degrade-and-flag ────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("pseudo", "callees", "sink"),
+    [
+        ("system(cmd);", [], "system"),  # no callees
+        ("", ["recv", "system"], "system"),  # no body
+        ("   ", ["recv", "system"], "system"),  # whitespace body
+        ("recv(fd,buf,64);", ["recv", "system"], "system"),  # sink not present
+    ],
+)
+def test_degrade_returns_unknown_flagged(pseudo: str, callees: list[str], sink: str) -> None:
+    verdict = grade_candidate(pseudo, callees, sink)
+    assert verdict.status == "unknown"
+    assert verdict.degraded is True
+
+
+# ── never-auto-confirm hard invariant ───────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "pseudo",
+    [
+        'char cmd[128]; snprintf(cmd,128,"/usr/bin/x %s",param_1); system(cmd);',
+        "system(param_1);",
+        'char* v = param_2; popen(v, "r");',
+        "char cmd[64]; strcpy(cmd, param_1); system(cmd);",
+    ],
+)
+def test_parameter_sourced_never_confirmed(pseudo: str) -> None:
+    sink = "popen" if "popen" in pseudo else "system"
+    verdict = grade_candidate(pseudo, ["snprintf", "strcpy", "popen", "system"], sink)
+    assert verdict.status != "confirmed"
+
+
+# ── mis-block caution: prefer unknown when the validator relationship is unclear ────
+
+
+def test_validator_not_on_value_prefers_unknown_not_blocked() -> None:
+    # check_field guards `other`, not the value reaching the sink; origin is in-function.
+    pseudo = (
+        "char buf[64]; recv(fd,buf,64); "
+        "char other[8]; check_field(other); "
+        'char cmd[128]; snprintf(cmd,128,"/usr/bin/x %s",buf); system(cmd);'
+    )
+    verdict = grade_candidate(pseudo, ["recv", "check_field", "snprintf", "system"], "system")
+    assert verdict.status == "unknown"  # neither a confident block nor a confirm
+    assert verdict.status != "blocked"
+    assert verdict.status != "confirmed"
+
+
+# ── BOUNDARY: no vendor/spike symbols, no bug-labeling vocab, generic validators ────
+
+
+def test_reachability_package_is_boundary_clean() -> None:
+    banned = re.compile(
+        r"\b(vuln\w*|exploit\w*|payload|\bpoc\b|finding|check_id_char|incomplete_patch|fix_quality)\b",
+        re.IGNORECASE,
+    )
+    section_ref = re.compile(r"§|PRD\s")
+    for path in _REACH_PKG.glob("*.py"):
+        text = path.read_text()
+        assert not banned.search(text), f"banned vocab/spike symbol in {path.name}"
+        assert not section_ref.search(text), f"section/private-doc ref in {path.name}"
+
+
+def test_validator_patterns_are_generic() -> None:
+    # Every validator pattern is a generic name shape, not a specific firmware symbol.
+    for pat in VALIDATOR_PATTERNS:
+        src = pat.pattern
+        assert src.startswith("^")
+        # Anchored prefix only; no literal full symbol like a specific check_id_char.
+        assert "id_char" not in src

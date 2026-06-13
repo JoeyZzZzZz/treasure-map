@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `lib/reachability/`: reachability grading primitive (`grade_candidate`). Given one
+  function's pseudocode + callees + the sink it reaches, grades the candidate
+  confirmed / blocked / unknown with a neutral `blocking_mechanism` / `basis`. Honest
+  intra-procedural v1: a single-function heuristic, deliberately NOT an inter-procedural
+  data-flow engine — `unknown` is first-class and expected to dominate, and `confirmed`
+  is tightly gated (in-function external-input origin + unfiltered + fully visible; a
+  parameter-sourced sink is never confirmed). Validator detection is a generic name
+  heuristic (`check_*`/`validate_*`/`saniti[sz]e_*`/…); ambiguity prefers `unknown` over
+  a confident `blocked`. Pure-static, hermetic (no LLM); degrade-and-flag on incomplete
+  input; returns a graded lead, never a claimed bug (a confirmed path is provenance L1 at
+  most, not a publishable result). Library API only (no CLI). Synthetic, network-free
+  tests cover the grading table, the never-auto-confirm invariant, mis-block caution,
+  degrade-and-flag, and a vendor-/label-vocabulary boundary check.
 - `lib/pattern/`: call-sequence shape primitive (`scan`). Given one analysis.db, it
   finds functions whose callee set forms a coarse dangerous shape — a command-injection
   shape (external-input source + string formatter + command sink, gated by a shell-ish
