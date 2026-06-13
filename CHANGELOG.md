@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- reachability (R2): `blocked` now requires clean, direct, unambiguous full coverage — a
+  possibly-reachable path is never downgraded to `blocked` (which would route it into the
+  dormant partition and stop investigation). Two mis-downgrade paths are removed: (1) the
+  function-wide inline-clamp `blocked` return is gone — a clamp may only downgrade a
+  would-be `confirmed` to `unknown` (the safe direction), never produce `blocked`; (2) the
+  flow/dependency set is now cleaned (callee names, C/Ghidra type words, and split-hex
+  fragments are no longer treated as flow edges), and coverage is judged per ORIGINATING
+  seed input with a single-direction test (a validator must sit on that seed's own path
+  into the sink) — a validated, unrelated intermediate can no longer spuriously cover a
+  dangerous input. `blocked` fires only when every dangerous seed reaching the sink is
+  cleanly covered; under any doubt the verdict is `unknown`. Clean single-input blocks are
+  preserved. Regression fixtures are synthetic and vendor-neutral.
+
 - reachability (R2): block only when ALL dangerous inputs reaching a sink are covered by a
   validator. Previously the grader returned `blocked` as soon as ANY variable on the flow
   path matched a validator, so a sink fed by [validated value + an unvalidated parameter or

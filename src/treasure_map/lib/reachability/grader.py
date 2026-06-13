@@ -20,7 +20,7 @@ from treasure_map.lib.reachability.filters import (
     validator_present,
 )
 from treasure_map.lib.reachability.models import ReachabilityVerdict
-from treasure_map.lib.reachability.taint import _taint_sets, flows_into, locate_sink_arg
+from treasure_map.lib.reachability.taint import _seed_sets, flows_into, locate_sink_arg
 
 _BASIS_NO_CALLEES = "no callees were recorded for the function"
 _BASIS_NO_BODY = "no pseudocode was available for the function"
@@ -44,6 +44,10 @@ _BASIS_CONFIRMED = (
 )
 _BASIS_ORIGIN_UNKNOWN = "the origin of the value reaching the sink could not be determined here"
 _BASIS_COVERED = "a validator covers every input reaching the sink"
+_BASIS_CLAMP = (
+    "a clamp may bound the value on the path; a clean unfiltered flow is not provable here, "
+    "so the result is unknown rather than confirmed"
+)
 
 
 def grade_candidate(
@@ -68,45 +72,47 @@ def grade_candidate(
     if sink_arg is None:
         return ReachabilityVerdict("unknown", None, _BASIS_NO_SINK, degraded=True)
 
-    # Identify the tainted values that actually flow into the sink, and whether each is
-    # COVERED by a validator anywhere on its flow line to the sink. A sink blocks only when
-    # EVERY such input is covered — a covered input must never mask an uncovered sibling.
-    flow = flows_into(pseudocode, sink_arg)
-    path_vars = {sink_arg} | flow
-    strong, weak, par = _taint_sets(pseudocode)
+    # The dangerous SEED inputs that reach the sink, and whether each is covered by a
+    # validator on its own path INTO the sink. blocked requires a trustworthy flow set and
+    # that EVERY dangerous seed is cleanly, directly covered; ANY doubt grades unknown so a
+    # possibly-reachable path is never hidden in the dormant partition.
+    flow = flows_into(pseudocode, sink_arg)  # cleaned flow set
+    path = {sink_arg} | flow
+    strong_seeds, weak_seeds, par_seeds = _seed_sets(pseudocode)
+    dangerous = (strong_seeds | weak_seeds | par_seeds) & path
 
-    flow_of = {var: flows_into(pseudocode, var) for var in path_vars}
-    covered_vars = {var for var in path_vars if has_validator(callees, pseudocode, var)[0]}
+    covered_vars = {var for var in path if has_validator(callees, pseudocode, var)[0]}
+    cover_flow = {w: flows_into(pseudocode, w) for w in covered_vars}
 
-    def _is_covered(value: str) -> bool:
-        # value is covered if a validated var sits on the same flow line (either direction):
-        # the var itself, a value it derives from, or a value that derives from it.
-        return any(
-            w == value or w in flow_of.get(value, set()) or value in flow_of.get(w, set())
-            for w in covered_vars
-        )
+    def _is_covered(seed: str) -> bool:
+        # Covered iff a validated variable W sits on the seed's path to the sink: W is the
+        # seed itself, or the seed flows into W (single direction, toward the sink).
+        return any(w == seed or seed in cover_flow[w] for w in covered_vars)
 
-    tainted = path_vars & (strong | weak | par)
-    uncovered = {value for value in tainted if not _is_covered(value)}
+    uncovered = {seed for seed in dangerous if not _is_covered(seed)}
 
-    if tainted and not uncovered:
+    if dangerous and not uncovered:
+        # Clean, direct, full coverage over a trustworthy flow set — clearly fully blocked.
         return ReachabilityVerdict("blocked", _BASIS_COVERED, _BASIS_COVERED)
 
-    # Grade by the most-severe UNCOVERED input — a covered sibling cannot rescue it.
-    if uncovered & par:
+    # Grade by the most-severe UNCOVERED seed. No path here may return blocked.
+    if uncovered & par_seeds:
         # Hard invariant: a parameter contribution makes the path unprovable -> never confirmed.
         return ReachabilityVerdict("unknown", None, _BASIS_PARAM)
-    if uncovered & strong:
-        bounded, bound_mechanism = has_inline_bound(pseudocode)
-        if bounded:
-            # A demonstrable clamp limits the value — bounded, not an unfiltered flow.
-            return ReachabilityVerdict("blocked", bound_mechanism, bound_mechanism or "")
-        if validator_present(callees) and not validator_on_path(callees, pseudocode, path_vars)[0]:
+    if uncovered & strong_seeds:
+        if validator_present(callees) and not validator_on_path(callees, pseudocode, path)[0]:
             # A validator exists but touches nothing on the sink's flow path — cannot relate
             # it; prefer unknown over a confident confirm (mis-block caution).
             return ReachabilityVerdict("unknown", None, _BASIS_AMBIGUOUS)
+        if par_seeds & path:
+            # A parameter also reaches the sink — caller contribution -> not confirmable.
+            return ReachabilityVerdict("unknown", None, _BASIS_PARAM)
+        if has_inline_bound(pseudocode)[0]:
+            # A clamp may bound the value: downgrade a would-be confirm to unknown (never
+            # blocked — a function-wide clamp does not prove THIS path is bounded).
+            return ReachabilityVerdict("unknown", None, _BASIS_CLAMP)
         return ReachabilityVerdict("confirmed", None, _BASIS_CONFIRMED)
-    if uncovered & weak:
+    if uncovered & weak_seeds:
         # Locally-influenced input: external controllability is not establishable here.
         return ReachabilityVerdict("unknown", None, _BASIS_WEAK)
 

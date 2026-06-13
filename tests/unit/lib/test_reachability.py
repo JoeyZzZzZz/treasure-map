@@ -77,19 +77,21 @@ def test_weak_env_source_is_unknown_not_confirmed() -> None:
     assert verdict.status != "confirmed"
 
 
-# ── inline bound: a clamp before a copy is bounded, never confirmed ─────────────────
+# ── inline bound: a clamp downgrades a would-be confirm to unknown, never blocked ───
 
 
-def test_inline_clamp_before_copy_is_not_confirmed() -> None:
-    # The "clamp-before-copy" shape: a strong source, but the length is clamped to a const
-    # before the copy — bounded, must not grade confirmed.
+def test_inline_clamp_before_copy_is_unknown_not_blocked() -> None:
+    # The "clamp-before-copy" shape: a strong source with a length clamp. A function-wide
+    # clamp does not prove THIS path is bounded, so it downgrades confirmed -> unknown; it
+    # must NEVER produce blocked (that would hide a possibly-reachable path).
     pseudo = (
         "char dst[32]; char src[64]; recv(fd,src,64); int len = get_len(); "
         "if (0x20 < len) len = 0x20; memcpy(dst, src, len);"
     )
     verdict = grade_candidate(pseudo, ["recv", "get_len", "memcpy"], "memcpy")
     assert verdict.status != "confirmed"
-    assert verdict.status == "blocked"
+    assert verdict.status != "blocked"
+    assert verdict.status == "unknown"
 
 
 # ── co-located source that does NOT flow to the sink -> not confirmed ───────────────
@@ -232,6 +234,56 @@ def test_mixed_sink_uncovered_strong_source_is_confirmed() -> None:
     callees = ["recv", "websGetVar", "check_field", "sprintf", "system"]
     verdict = grade_candidate(pseudo, callees, "system")
     assert verdict.status == "confirmed"
+
+
+# ── hard invariant: a possibly-reachable path is NEVER downgraded to blocked ────────
+
+
+def test_clamp_elsewhere_does_not_block_unfiltered_path() -> None:
+    # An unfiltered strong-source path to the sink, with an UNRELATED clamp elsewhere in
+    # the function. The clamp must not block this path (a function-wide clamp proves
+    # nothing about it) -> not blocked.
+    pseudo = (
+        "char buf[64]; recv(fd, buf, 64); int n = get_n(); if (n < 0x40) n = 0; "
+        'sprintf(cmd, "%s", buf); system(cmd);'
+    )
+    verdict = grade_candidate(pseudo, ["recv", "get_n", "sprintf", "system"], "system")
+    assert verdict.status != "blocked"
+
+
+def test_downstream_only_validator_does_not_block() -> None:
+    # The validator guards a value DERIVED FROM the sink value (downstream), not on its path
+    # into the sink. It must not block.
+    pseudo = (
+        "char buf[64]; recv(fd, buf, 64); "
+        'sprintf(cmd, "%s", buf); system(cmd); '
+        "char* d = derive(cmd); check_field(d);"
+    )
+    callees = ["recv", "sprintf", "system", "derive", "check_field"]
+    verdict = grade_candidate(pseudo, callees, "system")
+    assert verdict.status != "blocked"
+
+
+def test_polluted_partial_coverage_does_not_block() -> None:
+    # Two strong inputs reach the sink through copies (with function-name noise); only one
+    # is validated. The unvalidated input must not be masked as covered -> not blocked.
+    pseudo = (
+        "char buf_a[64]; recv(fd, buf_a, 64); char buf_b[64]; recv(fd, buf_b, 64); "
+        "check_field(buf_a); "
+        "memcpy(out_a, buf_a, strlen(buf_a)); memcpy(out_b, buf_b, strlen(buf_b)); "
+        'sprintf(cmd, "%s %s", out_a, out_b); system(cmd);'
+    )
+    callees = ["recv", "check_field", "memcpy", "strlen", "sprintf", "system"]
+    verdict = grade_candidate(pseudo, callees, "system")
+    assert verdict.status != "blocked"
+
+
+def test_clean_single_input_validator_still_blocks() -> None:
+    # The clean single-input shape: one input, validator directly on the value reaching the
+    # sink, no pollution. This must STAY blocked (raise the bar, do not remove blocked).
+    pseudo = "char buf[64]; recv(fd, buf, 64); check_field(buf); system(buf);"
+    verdict = grade_candidate(pseudo, ["recv", "check_field", "system"], "system")
+    assert verdict.status == "blocked"
 
 
 # ── BOUNDARY: no vendor/spike symbols, no bug-labeling vocab, generic validators ────

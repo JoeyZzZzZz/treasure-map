@@ -20,9 +20,59 @@ from __future__ import annotations
 import re
 from typing import Literal
 
-from treasure_map.lib.pattern.classes import COPY, FORMAT, SOURCE_STRONG, SOURCE_WEAK
+from treasure_map.lib.pattern.classes import CMD, COPY, FORMAT, SOURCE, SOURCE_STRONG, SOURCE_WEAK
 
 OriginKind = Literal["strong_source", "weak_source", "parameter", "unknown"]
+
+# Identifiers that are NOT variables and must not become flow edges (they pollute the flow
+# set and let an unrelated validator spuriously "cover" a dangerous input). Callee names are
+# detected per-function; these cover C/Ghidra type words and control keywords.
+_CALL_CLASS_NAMES = SOURCE | FORMAT | COPY | CMD
+_TYPE_WORDS = frozenset(
+    {
+        "char",
+        "int",
+        "uint",
+        "void",
+        "short",
+        "long",
+        "size_t",
+        "ssize_t",
+        "bool",
+        "unsigned",
+        "signed",
+        "float",
+        "double",
+        "const",
+        "static",
+        "struct",
+        "union",
+        "enum",
+        "sizeof",
+        "byte",
+        "word",
+        "dword",
+        "qword",
+        "code",
+        "undefined",
+        "return",
+        "if",
+        "else",
+        "for",
+        "while",
+        "do",
+        "switch",
+        "case",
+        "goto",
+        "break",
+        "continue",
+    }
+)
+# Ghidra-style sized type words (undefined4, uint32, int8, ...) and the leftover of a split
+# hex literal (0x96 -> "x96" once the leading 0 is dropped by the identifier regex).
+_SIZED_TYPE_RE = re.compile(r"^(?:undefined|uint|int|u|byte|word|dword|qword|ushort|uchar)\d+$")
+_HEX_FRAGMENT_RE = re.compile(r"^x[0-9a-fA-F]+$")
+_HEX_LITERAL_RE = re.compile(r"\b0[xX][0-9a-fA-F]+\b")
 
 # Return-value sources: the tainted value is the call's return, bound to the assigned LHS.
 _RETURN_SOURCES: frozenset[str] = frozenset(
@@ -156,26 +206,65 @@ def _taint_sets(pseudocode: str) -> tuple[set[str], set[str], set[str]]:
     return strong, weak, par
 
 
+def _dep_idents(text: str, call_names: set[str]) -> set[str]:
+    """Plausible variable identifiers in ``text`` — pollution (callee names, type words,
+    hex fragments) removed so the flow set stays trustworthy."""
+    cleaned = _HEX_LITERAL_RE.sub(" ", text)
+    out: set[str] = set()
+    for ident in _IDENT_RE.findall(cleaned):
+        if ident in call_names or ident in _CALL_CLASS_NAMES or ident in _TYPE_WORDS:
+            continue
+        if _SIZED_TYPE_RE.match(ident) or _HEX_FRAGMENT_RE.match(ident):
+            continue
+        out.add(ident)
+    return out
+
+
 def _derives_map(pseudocode: str) -> dict[str, set[str]]:
     """Map each variable to the variables it is directly assigned/built from.
 
     Edges come from the same real assignment/builder forms the forward taint uses:
     `lhs = ... X ...` and formatter/copy builders `f(dst, ... X ...)` (dst derives from
-    the remaining args). Conservative by construction — only explicit edges are recorded.
+    the remaining args). Identifiers are cleaned (callee names / type words / hex fragments
+    dropped) so the flow set is not polluted; conservative — only explicit edges recorded.
     """
+    call_names = {m.group(1) for m in _CALL_RE.finditer(pseudocode)}
     deps: dict[str, set[str]] = {}
     for stmt in re.split(r"[;\n{}]", pseudocode):
         assign = _ASSIGN_RE.match(stmt)
         if assign is not None:
             lhs, rhs = assign.group(1), assign.group(2)
-            deps.setdefault(lhs, set()).update(set(_IDENT_RE.findall(rhs)) - {lhs})
+            deps.setdefault(lhs, set()).update(_dep_idents(rhs, call_names) - {lhs})
         for name, args in _CALL_RE.findall(stmt):
             if name in FORMAT or name in COPY:
-                ids = _IDENT_RE.findall(args)
-                if ids:
-                    dst, rest = ids[0], set(ids[1:])
-                    deps.setdefault(dst, set()).update(rest - {dst})
+                parts = args.split(",")
+                dst_match = _IDENT_RE.search(parts[0]) if parts else None
+                if dst_match is not None:
+                    dst = dst_match.group(0)
+                    rest = _dep_idents(",".join(parts[1:]), call_names) - {dst}
+                    deps.setdefault(dst, set()).update(rest)
     return deps
+
+
+def _seed_sets(pseudocode: str) -> tuple[set[str], set[str], set[str]]:
+    """Return the directly-seeded (strong, weak, parameter) inputs — pre-propagation.
+
+    These are the ORIGINATING tainted values (a source's buffer/return, or a parameter),
+    not the propagated copies. Coverage is judged against these seeds so that validating a
+    seed (or any variable on its path to the sink) counts, while a validated, unrelated
+    intermediate cannot mask a seed.
+    """
+    strong: set[str] = set()
+    weak: set[str] = set()
+    par: set[str] = set(_PARAM_RE.findall(pseudocode))
+    for stmt in re.split(r"[;\n{}]", pseudocode):
+        assign = _ASSIGN_RE.match(stmt)
+        lhs = assign.group(1) if assign else None
+        rhs = assign.group(2) if assign else ""
+        for name, args in _CALL_RE.findall(stmt):
+            if name in SOURCE_STRONG or name in SOURCE_WEAK:
+                _seed_source(name, args, lhs, rhs, strong, weak)
+    return strong, weak, par
 
 
 def flows_into(pseudocode: str, sink_var: str) -> set[str]:
