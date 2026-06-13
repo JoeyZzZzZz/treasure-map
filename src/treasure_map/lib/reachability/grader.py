@@ -15,11 +15,11 @@ from __future__ import annotations
 
 from treasure_map.lib.reachability.filters import (
     has_inline_bound,
-    has_validator,
+    validator_on_path,
     validator_present,
 )
 from treasure_map.lib.reachability.models import ReachabilityVerdict
-from treasure_map.lib.reachability.taint import locate_sink_arg, origin_of
+from treasure_map.lib.reachability.taint import flows_into, locate_sink_arg, origin_of
 
 _BASIS_NO_CALLEES = "no callees were recorded for the function"
 _BASIS_NO_BODY = "no pseudocode was available for the function"
@@ -66,7 +66,10 @@ def grade_candidate(
     if sink_arg is None:
         return ReachabilityVerdict("unknown", None, _BASIS_NO_SINK, degraded=True)
 
-    blocked, mechanism = has_validator(callees, pseudocode, sink_arg)
+    # A validator anywhere on the data-flow path into the sink blocks it — even when the
+    # validated value reaches the sink under renamed intermediates (copies/format calls).
+    path_vars = {sink_arg} | flows_into(pseudocode, sink_arg)
+    blocked, mechanism = validator_on_path(callees, pseudocode, path_vars)
     if blocked:
         return ReachabilityVerdict("blocked", mechanism, mechanism or "")
 

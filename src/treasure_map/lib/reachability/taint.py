@@ -156,6 +156,47 @@ def _taint_sets(pseudocode: str) -> tuple[set[str], set[str], set[str]]:
     return strong, weak, par
 
 
+def _derives_map(pseudocode: str) -> dict[str, set[str]]:
+    """Map each variable to the variables it is directly assigned/built from.
+
+    Edges come from the same real assignment/builder forms the forward taint uses:
+    `lhs = ... X ...` and formatter/copy builders `f(dst, ... X ...)` (dst derives from
+    the remaining args). Conservative by construction — only explicit edges are recorded.
+    """
+    deps: dict[str, set[str]] = {}
+    for stmt in re.split(r"[;\n{}]", pseudocode):
+        assign = _ASSIGN_RE.match(stmt)
+        if assign is not None:
+            lhs, rhs = assign.group(1), assign.group(2)
+            deps.setdefault(lhs, set()).update(set(_IDENT_RE.findall(rhs)) - {lhs})
+        for name, args in _CALL_RE.findall(stmt):
+            if name in FORMAT or name in COPY:
+                ids = _IDENT_RE.findall(args)
+                if ids:
+                    dst, rest = ids[0], set(ids[1:])
+                    deps.setdefault(dst, set()).update(rest - {dst})
+    return deps
+
+
+def flows_into(pseudocode: str, sink_var: str) -> set[str]:
+    """Return the variables that flow into ``sink_var`` (its backward dependency set).
+
+    Walks the assignment/builder edges backward from sink_var to a fixed point. The
+    returned set does NOT include sink_var itself. Used to recognize a validator applied
+    to the value reaching the sink even after intermediate copies/format calls rename it.
+    """
+    deps = _derives_map(pseudocode)
+    seen: set[str] = set()
+    stack = [sink_var]
+    while stack:
+        current = stack.pop()
+        for src in deps.get(current, ()):
+            if src not in seen:
+                seen.add(src)
+                stack.append(src)
+    return seen
+
+
 def origin_of(pseudocode: str, var: str) -> OriginKind:
     """Classify where ``var`` reaching a sink originates, within this function.
 

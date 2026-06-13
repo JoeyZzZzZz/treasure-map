@@ -165,6 +165,36 @@ def test_validator_not_on_value_prefers_unknown_not_blocked() -> None:
     assert verdict.status != "confirmed"
 
 
+# ── validator on the data-flow path (through renames) -> blocked ────────────────────
+
+
+def test_validator_blocks_through_renaming_copies() -> None:
+    # The validated value reaches the sink under renamed intermediates (copy + format);
+    # the guard is real and on the path, so the verdict is blocked, not unknown.
+    pseudo = (
+        "char* buf_a = b64_decode(input); check_field(buf_a); "
+        "memcpy(buf_b, buf_a, n); "
+        'sprintf(cmd, "x %s", buf_b); system(cmd);'
+    )
+    callees = ["b64_decode", "check_field", "memcpy", "sprintf", "system"]
+    verdict = grade_candidate(pseudo, callees, "system")
+    assert verdict.status == "blocked"
+    assert verdict.blocking_mechanism is not None
+
+
+def test_off_path_validator_does_not_block() -> None:
+    # A validator guards an unrelated value; the sink arg derives from a parameter. The
+    # off-path guard must NOT block (no over-broad backward tainting) -> stays unknown.
+    pseudo = (
+        "char* buf_x = get_x(); check_other(buf_x); "
+        "char* val = param_1; "
+        'sprintf(cmd, "%s", val); system(cmd);'
+    )
+    verdict = grade_candidate(pseudo, ["check_other", "sprintf", "system"], "system")
+    assert verdict.status != "blocked"
+    assert verdict.status == "unknown"
+
+
 # ── BOUNDARY: no vendor/spike symbols, no bug-labeling vocab, generic validators ────
 
 

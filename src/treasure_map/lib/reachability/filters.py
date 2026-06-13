@@ -81,3 +81,21 @@ def has_validator(callees: list[str], pseudocode: str, var: str) -> tuple[bool, 
         if re.search(rf"\b{re.escape(name)}\s*\([^;{{}}]*\b{re.escape(var)}\b", pseudocode):
             return True, _BLOCKING_MECHANISM
     return False, None
+
+
+def validator_on_path(
+    callees: list[str], pseudocode: str, variables: set[str]
+) -> tuple[bool, str | None]:
+    """Whether a validator is applied to ANY variable on the flow path into the sink.
+
+    ``variables`` is the sink argument plus its backward dependency set (the values that
+    flow into the sink, possibly under renamed intermediates). The inner test is the same
+    literal-argument match as has_validator; only the set of variables it may match is
+    widened. If no validator ties to the path, returns (False, None) so the grader falls
+    through to its origin logic (mis-block caution preserved).
+    """
+    for var in sorted(variables):
+        applied, mechanism = has_validator(callees, pseudocode, var)
+        if applied:
+            return True, mechanism
+    return False, None

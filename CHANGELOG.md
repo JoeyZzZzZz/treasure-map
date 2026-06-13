@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- reachability (R2): recognize a validator applied anywhere on the data-flow path into the
+  sink, not only on the sink argument's final name. A validated value that reaches the sink
+  through renamed intermediates (copy/format calls) was graded `unknown` instead of
+  `blocked`; a new conservative backward dependency walk (`flows_into`) computes the sink's
+  in-function flow set and the validator check widens to any variable in it. This improves
+  blocked/dormant precision (genuinely filtered candidates leave the unknown pool) and is
+  purely a precision gain — it only moves some `unknown` → `blocked`, creates no new
+  `confirmed` (the never-auto-confirm invariant is unchanged), and an off-path validator
+  still does not block (mis-block caution preserved). Regression fixtures are synthetic and
+  vendor-neutral.
+
 - `tmap init` now CONFIGURES Ghidra, not only checks it. A new step runs between secrets
   entry and the preflight doctor: it auto-detects `analyzeHeadless` (via `GHIDRA_HOME`/PATH)
   and accepts it without prompting when found; otherwise it prompts for the install root,
