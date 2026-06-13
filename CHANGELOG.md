@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `lib/diff/`: cross-entity diff primitive (`run_diff`). Given two analysis databases and
+  a neutral axis (version | mod | sibling), it matches functions across them
+  (exact symbol → identical pseudocode hash → bounded M-tier assist on the residue, with a
+  degrade-and-flag overflow cap), classifies each as unchanged/added/removed/changed, and
+  for a changed function emits a one-sentence neutral, mechanism-level description of what
+  the diff changes (control flow, calls, buffer/length handling). Both inputs are opened
+  read-only; the primitive returns in-memory results only — it writes nothing and judges
+  nothing. Library API only (no CLI). Synthetic, mock-router tests cover the matching
+  passes, the verdict path, the assist budget, read-only safety, and a boundary check that
+  the package and its prompts stay mechanism-only.
 - LLM infra: per-tier `thinking` control for DeepSeek-V4. `TierConfig` gains
   `thinking: bool | None` (tri-state: `None` sends nothing — legacy/Anthropic unchanged;
   `false` sends an explicit disabled; `true` enables) and `reasoning_effort` (`high`|`max`).
