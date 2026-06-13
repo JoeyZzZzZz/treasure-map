@@ -7,6 +7,7 @@ import logging
 import click
 
 from treasure_map.cli.analyze_cli import analyze
+from treasure_map.cli.hunt_cli import hunt_diff
 from treasure_map.cli.init_cli import init
 
 
@@ -25,6 +26,7 @@ def main(debug: bool) -> None:
 
 main.add_command(analyze)
 main.add_command(init)
+main.add_command(hunt_diff)
 
 if __name__ == "__main__":
     main()

@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `lib/hunt/analyzer1.py` + `tmap hunt-diff`: Analyzer-1, the diff-driven analyzer and
+  the first thing that writes to the atlas. Composes R-diff (locate changed functions) +
+  R2 (grade reachability) end-to-end on one operator-supplied version pair and writes
+  neutral, graded instances into atlas.db. A1 writes provenance L0/L1 only (confirmed or
+  blocked → L1, unknown → L0); L2/L3 need an external anchor and are out of reach here, so
+  A1 never passes one — the writer and schema CHECK enforce this. It upserts a COARSE
+  pattern versioned `diff-coarse-v0` (deliberately distinct from R-pattern's `callseq-v1`)
+  to satisfy the instance→pattern link without running R-pattern. `public_finding`
+  (confirmed AND ≥ L2) is empty by construction; a blocked candidate shows in
+  `dormant_instance`. Both analysis DBs are read-only; the atlas is append-only.
+  `tmap hunt-diff <db_a> <db_b> --axis version --run-id-a A --run-id-b B` runs the chain
+  and prints the stats plus an honest note. Honest M2 scope: this validates the
+  primitive→scenario→write-atlas pipeline, not the cross-device find (only one firmware is
+  analyzed). Synthetic, mock-router tests cover the L0/L1 mapping, the empty-public_finding
+  gate, dormant population, the never-L2/L3 invariant, no-sink degrade, append-only
+  accumulation, and the boundary.
 - `lib/reachability/`: reachability grading primitive (`grade_candidate`). Given one
   function's pseudocode + callees + the sink it reaches, grades the candidate
   confirmed / blocked / unknown with a neutral `blocking_mechanism` / `basis`. Honest
