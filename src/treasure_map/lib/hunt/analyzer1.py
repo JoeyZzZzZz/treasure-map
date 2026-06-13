@@ -50,7 +50,8 @@ _SINK_CLASSES: tuple[tuple[str, frozenset[str]], ...] = (
 )
 
 _SOURCE_CLASS_BY_ORIGIN = {
-    "in_function_source": "external_input",
+    "strong_source": "external_input",
+    "weak_source": "local_input",
     "parameter": "parameter",
 }
 

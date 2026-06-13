@@ -9,11 +9,27 @@ generic, public C/libc and common-embedded API names; no vendor-proprietary symb
 
 from __future__ import annotations
 
-# External-input getters: data that originates outside the program.
-SOURCE: frozenset[str] = frozenset(
+# External-input getters, split by strength of external controllability (neutral,
+# mechanism-based). Strength gates reachability grading only; R-pattern's shape detection
+# uses the SOURCE union below and is unaffected by the split.
+
+# Strong: network / request input — externally controllable by a remote party.
+SOURCE_STRONG: frozenset[str] = frozenset(
     {
         "recv",
         "recvfrom",
+        # Generic web/CGI parameter getters (public webserver API style).
+        "websGetVar",
+        "webGetVar",
+        "getKeyValue",
+        "get_cgi",
+    }
+)
+
+# Weak: locally-influenced input — file/stream reads, environment, config/device-self
+# values. External controllability is not establishable within a single function.
+SOURCE_WEAK: frozenset[str] = frozenset(
+    {
         "read",
         "fread",
         "fgets",
@@ -26,16 +42,15 @@ SOURCE: frozenset[str] = frozenset(
         "nvram_get",
         "nvram_safe_get",
         "nvram_bufget",
-        # Generic web/CGI parameter getters (public webserver API style).
-        "websGetVar",
-        "webGetVar",
-        "getKeyValue",
-        "get_cgi",
         # Generic base64 decoders.
         "b64_decode",
         "base64_decode",
     }
 )
+
+# Union — the set R-pattern uses for "is this callee an external-input source" (shape, not
+# strength). Keep this equal to the historical SOURCE so R-pattern stays unchanged.
+SOURCE: frozenset[str] = SOURCE_STRONG | SOURCE_WEAK
 
 # String formatters: build a buffer from a format and arguments.
 FORMAT: frozenset[str] = frozenset(

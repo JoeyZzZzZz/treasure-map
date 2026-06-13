@@ -59,10 +59,58 @@ def test_confirmed_when_in_function_source_unfiltered() -> None:
     assert not verdict.degraded
 
 
-def test_confirmed_via_return_value_source() -> None:
-    pseudo = 'char* v = getenv("X"); system(v);'
-    verdict = grade_candidate(pseudo, ["getenv", "system"], "system")
+def test_confirmed_via_strong_return_value_source() -> None:
+    # A strong (request) return-value source flows straight into the sink, unfiltered.
+    pseudo = 'char* v = websGetVar(wp,"name"); system(v);'
+    verdict = grade_candidate(pseudo, ["websGetVar", "system"], "system")
     assert verdict.status == "confirmed"
+
+
+# ── source strength: a WEAK source unfiltered is unknown, NOT confirmed ─────────────
+
+
+def test_weak_env_source_is_unknown_not_confirmed() -> None:
+    # getenv is a locally-influenced (weak) source; unfiltered to a copy is still unknown.
+    pseudo = 'char dst[64]; char* e = getenv("PATH"); memcpy(dst, e, 64);'
+    verdict = grade_candidate(pseudo, ["getenv", "memcpy"], "memcpy")
+    assert verdict.status == "unknown"
+    assert verdict.status != "confirmed"
+
+
+# ── inline bound: a clamp before a copy is bounded, never confirmed ─────────────────
+
+
+def test_inline_clamp_before_copy_is_not_confirmed() -> None:
+    # The "clamp-before-copy" shape: a strong source, but the length is clamped to a const
+    # before the copy — bounded, must not grade confirmed.
+    pseudo = (
+        "char dst[32]; char src[64]; recv(fd,src,64); int len = get_len(); "
+        "if (0x20 < len) len = 0x20; memcpy(dst, src, len);"
+    )
+    verdict = grade_candidate(pseudo, ["recv", "get_len", "memcpy"], "memcpy")
+    assert verdict.status != "confirmed"
+    assert verdict.status == "blocked"
+
+
+# ── co-located source that does NOT flow to the sink -> not confirmed ───────────────
+
+
+def test_param_sink_with_unrelated_source_is_unknown() -> None:
+    # A strong source exists in the function, but the sink arg derives from a parameter;
+    # co-occurrence must not be read as flow.
+    pseudo = "void h(char* param_1){ char buf[64]; recv(fd,buf,64); system(param_1); }"
+    verdict = grade_candidate(pseudo, ["recv", "system"], "system")
+    assert verdict.status == "unknown"
+
+
+def test_device_self_builder_source_is_unknown() -> None:
+    # Sink fed by assembled device-self values (no external source flows to it).
+    pseudo = (
+        "void h(){ char info[64]; char ip[16]; get_lan_ip(ip); "
+        'snprintf(info,64,"%s",ip); system(info); }'
+    )
+    verdict = grade_candidate(pseudo, ["get_lan_ip", "snprintf", "system"], "system")
+    assert verdict.status == "unknown"
 
 
 # ── degrade-and-flag ────────────────────────────────────────────────────────────────

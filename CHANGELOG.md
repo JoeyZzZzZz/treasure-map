@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- reachability (R2): tighten `confirmed` so it requires a provable in-function flow from a
+  STRONG (network/request) source. A real-firmware run over-claimed `confirmed`; three
+  causes are fixed: (1) taint now follows real flow, not co-occurrence — a source taints
+  only the value it produces (assigned LHS for return-value sources; the specific buffer
+  argument for buffer-output sources), and `confirmed` requires the sink argument itself to
+  be tied to an in-function source by the assignment chain; (2) inline bounds/clamps (e.g.
+  `if (N < len) len = N;`, ternary clamps, `min(...)`) are now recognized, so a clamped copy
+  grades `blocked`, not `confirmed`; (3) sources are split into strength tiers
+  (`SOURCE_STRONG` network/request vs `SOURCE_WEAK` env/config/device-self/file) — only a
+  strong in-function source can grade `confirmed`; a weak one grades `unknown`. The `SOURCE`
+  union is unchanged, so R-pattern's shape detection is unaffected. Net effect: `confirmed`
+  is rare; under any gap the verdict is `unknown`. No public count was affected (all
+  instances are L1; `public_finding` needs confirmed AND ≥ L2, still empty). New regression
+  fixtures are synthetic and vendor-neutral (no real firmware strings).
+
 ### Added
 
 - `lib/hunt/analyzer2.py` + `tmap hunt-pattern` + `lib/query/` + `tmap atlas-view`: Analyzer-2,

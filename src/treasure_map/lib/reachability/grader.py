@@ -13,7 +13,11 @@ here may treat a verdict as a confirmed defect or a publishable result.
 
 from __future__ import annotations
 
-from treasure_map.lib.reachability.filters import has_validator, validator_present
+from treasure_map.lib.reachability.filters import (
+    has_inline_bound,
+    has_validator,
+    validator_present,
+)
 from treasure_map.lib.reachability.models import ReachabilityVerdict
 from treasure_map.lib.reachability.taint import locate_sink_arg, origin_of
 
@@ -24,13 +28,18 @@ _BASIS_PARAM = (
     "the value reaching the sink derives from a function parameter; caller control is "
     "not provable within a single function"
 )
+_BASIS_WEAK = (
+    "the value reaching the sink comes from a locally-influenced source "
+    "(environment/config/device-self/file); external controllability is not establishable "
+    "within a single function"
+)
 _BASIS_AMBIGUOUS = (
     "a validator-style call is present but its relationship to the value reaching the "
     "sink is unclear"
 )
 _BASIS_CONFIRMED = (
-    "the value reaching the sink originates from an in-function external-input call and "
-    "flows to the sink unfiltered, fully visible within this function"
+    "the value reaching the sink originates from an in-function strong (network/request) "
+    "source and flows to the sink unfiltered, fully visible within this function"
 )
 _BASIS_ORIGIN_UNKNOWN = "the origin of the value reaching the sink could not be determined here"
 
@@ -65,7 +74,14 @@ def grade_candidate(
     if origin == "parameter":
         # Hard invariant: a parameter-sourced, unfiltered sink is NEVER confirmed.
         return ReachabilityVerdict("unknown", None, _BASIS_PARAM)
-    if origin == "in_function_source":
+    if origin == "weak_source":
+        # Locally-influenced input: external controllability is not establishable here.
+        return ReachabilityVerdict("unknown", None, _BASIS_WEAK)
+    if origin == "strong_source":
+        bounded, bound_mechanism = has_inline_bound(pseudocode)
+        if bounded:
+            # A demonstrable clamp limits the value — bounded, not an unfiltered flow.
+            return ReachabilityVerdict("blocked", bound_mechanism, bound_mechanism or "")
         if validator_present(callees):
             # A validator exists but is not clearly on this value — prefer unknown.
             return ReachabilityVerdict("unknown", None, _BASIS_AMBIGUOUS)

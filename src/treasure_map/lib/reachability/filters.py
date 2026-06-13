@@ -27,9 +27,37 @@ VALIDATOR_PATTERNS: tuple[re.Pattern[str], ...] = (
 
 _BLOCKING_MECHANISM = "a validator-style call is applied to the value before the sink"
 
+# Inline bound/clamp shapes — a guard that limits a length/value in code, with no named
+# validator callee. Conservative and heuristic: presence means "do not treat the value as
+# demonstrably unbounded". Each clamps a variable against a numeric constant.
+_INLINE_BOUND_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # if (len > N) len = N;  /  if (N < len) len = N;  (comparison then re-assign)
+    re.compile(r"if\s*\(\s*\w+\s*[<>]=?\s*(?:0x[0-9a-fA-F]+|\d+)\s*\)\s*\w+\s*=\s*(?!=)"),
+    re.compile(r"if\s*\(\s*(?:0x[0-9a-fA-F]+|\d+)\s*[<>]=?\s*\w+\s*\)\s*\w+\s*=\s*(?!=)"),
+    # ternary clamp:  len = (len < N) ? len : N;  ->  "? <ident> : <const>"
+    re.compile(r"\?\s*\w+\s*:\s*(?:0x[0-9a-fA-F]+|\d+)"),
+    # min-style clamp helpers
+    re.compile(r"\b(?:min|MIN|fmin)\s*\("),
+)
+
+_INLINE_BOUND_MECHANISM = "an inline bound/clamp limits the value before the sink"
+
 
 def _is_validator_name(name: str) -> bool:
     return any(p.search(name) for p in VALIDATOR_PATTERNS)
+
+
+def has_inline_bound(pseudocode: str) -> tuple[bool, str | None]:
+    """Whether the body contains an inline bound/clamp (no named validator needed).
+
+    Returns (True, neutral mechanism) if any clamp shape is present, else (False, None).
+    Coarse by design: it does not prove the clamp guards the exact sink value, so the
+    grader uses it only to avoid over-claiming "confirmed" over a demonstrably-clamped flow.
+    """
+    for pattern in _INLINE_BOUND_PATTERNS:
+        if pattern.search(pseudocode):
+            return True, _INLINE_BOUND_MECHANISM
+    return False, None
 
 
 def validator_present(callees: list[str]) -> bool:
