@@ -50,6 +50,33 @@ CREATE VIEW IF NOT EXISTS public_finding AS
   SELECT * FROM instance
   WHERE reachability_status = 'confirmed' AND provenance_level IN ('L2','L3');
 
+-- density_candidate: neutral clustering of candidate instances — "where do dangerous-sink
+-- candidate shapes cluster". The atlas stores no binary identity (by design), so the scope
+-- dimension is the neutral source_run_id. Counts per run / sink_class / structural_fingerprint.
+-- All rows are LEADS; counts only, no scoring or ranking column.
+CREATE VIEW IF NOT EXISTS density_candidate AS
+  SELECT i.source_run_id          AS source_run_id,
+         p.sink_class             AS sink_class,
+         p.structural_fingerprint AS structural_fingerprint,
+         COUNT(*)                 AS instance_count
+  FROM instance i
+  JOIN pattern p ON p.pattern_id = i.pattern_id
+  GROUP BY i.source_run_id, p.sink_class, p.structural_fingerprint;
+
+-- twin_candidate: structural fingerprints observed with BOTH a blocked and a non-blocked
+-- instance — the same call-sequence shape once with a filter, once without. A neutral
+-- structural observation surfaced as a lead; any interpretation of it is out of scope here.
+CREATE VIEW IF NOT EXISTS twin_candidate AS
+  SELECT p.structural_fingerprint AS structural_fingerprint,
+         p.sink_class             AS sink_class,
+         SUM(CASE WHEN i.reachability_status =  'blocked' THEN 1 ELSE 0 END) AS blocked_count,
+         SUM(CASE WHEN i.reachability_status <> 'blocked' THEN 1 ELSE 0 END) AS non_blocked_count
+  FROM instance i
+  JOIN pattern p ON p.pattern_id = i.pattern_id
+  WHERE p.structural_fingerprint IS NOT NULL
+  GROUP BY p.structural_fingerprint, p.sink_class
+  HAVING blocked_count >= 1 AND non_blocked_count >= 1;
+
 CREATE INDEX IF NOT EXISTS idx_pattern_classes ON pattern(source_class, sink_class);
 CREATE INDEX IF NOT EXISTS idx_pattern_fp      ON pattern(structural_fingerprint);
 CREATE INDEX IF NOT EXISTS idx_instance_pattern ON instance(pattern_id);

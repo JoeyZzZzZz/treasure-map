@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `lib/hunt/analyzer2.py` + `tmap hunt-pattern` + `lib/query/` + `tmap atlas-view`: Analyzer-2,
+  the pattern-driven analyzer, and the neutral read-side views — the last M2 round. A2 composes
+  two hermetic primitives (no LLM): R-pattern scans one analysis.db for call-sequence shape
+  candidates (OSS excluded at scan time), R2 grades each, and A2 upserts the RICH `callseq-v1`
+  pattern + writes a graded instance into the atlas — the first time R-pattern's output reaches
+  the persistent store. L0/L1 only (never L2/L3, never an external anchor); raw firmware-derived
+  evidence is never persisted (traceability rides `pseudocode_hash`; `evidence_ref` holds only the
+  neutral structural fingerprint). New neutral atlas views `density_candidate` (candidate count per
+  run / sink_class / fingerprint) and `twin_candidate` (a fingerprint seen with both a blocked and
+  a non-blocked instance), plus a thin reader of the existing `dormant_instance`; `lib/query/`
+  exposes `density` / `twins` / `dormant` returning frozen rows. `tmap hunt-pattern <db> --run-id R`
+  runs the writer (hermetic, no key needed) and `tmap atlas-view {dormant|density|twins}` prints a
+  view; every row is a lead/candidate, never a confirmed result. `public_finding` stays empty.
+  Honest M2 scope: density runs for real intra-firmware, but with one device the recurrence stays
+  ~1 — A2 builds the machine, it does not produce a thick cross-firmware store from one device.
+  Synthetic, mock-free tests cover the write path, OSS exclusion, evidence neutralization, the
+  L0/L1 mapping, density/twins/dormant logic, append-only accumulation, and the boundary.
 - `lib/hunt/analyzer1.py` + `tmap hunt-diff`: Analyzer-1, the diff-driven analyzer and
   the first thing that writes to the atlas. Composes R-diff (locate changed functions) +
   R2 (grade reachability) end-to-end on one operator-supplied version pair and writes
