@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- LLM infra: per-tier `thinking` control for DeepSeek-V4. `TierConfig` gains
+  `thinking: bool | None` (tri-state: `None` sends nothing — legacy/Anthropic unchanged;
+  `false` sends an explicit disabled; `true` enables) and `reasoning_effort` (`high`|`max`).
+  Needed because V4 thinking defaults to ENABLED, so a non-thinking tier must explicitly
+  disable it. Example config now maps S = `deepseek-v4-flash` (no thinking), M =
+  `deepseek-v4-flash` (thinking, effort high), L = Claude.
+
+### Changed
+
+- Concurrency defaults raised to reflect DeepSeek-V4 capacity (flash up to 2500, pro up to
+  500): S 8→64, M 20→32, L 5→8. Still well under the provider caps; raise further per plan.
+
 ### Fixed
 
 - `tmap init` now provisions the config-resolved directories (`workspace_dir`,

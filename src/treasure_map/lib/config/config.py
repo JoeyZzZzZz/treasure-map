@@ -25,6 +25,23 @@ class TierConfig(BaseModel):
     base_url: str
     api_key_env: str
     max_cost_per_call_usd: float = 1.0
+    # Tri-state thinking control for DeepSeek-V4 (whose thinking defaults to ENABLED):
+    #   None  -> send no thinking param (legacy behavior; correct for Anthropic and any
+    #            endpoint we should not touch)
+    #   False -> send an explicit disabled (needed to override V4's default-on)
+    #   True  -> send enabled (plus reasoning_effort if set)
+    thinking: bool | None = None
+    reasoning_effort: str | None = None  # "high" | "max"; only sent when thinking is True
+
+    @field_validator("reasoning_effort")
+    @classmethod
+    def _check_reasoning_effort(cls, v: str | None) -> str | None:
+        if v is not None and v not in {"high", "max"}:
+            raise ValueError(
+                f"reasoning_effort must be 'high' or 'max' (got {v!r}); "
+                "per DeepSeek docs low/medium map to high"
+            )
+        return v
 
     def resolve_api_key(self) -> str:
         key = os.environ.get(self.api_key_env, "")
@@ -68,9 +85,12 @@ class AtlasConfig(BaseModel):
 
 
 class ConcurrencyConfig(BaseModel):
-    S: int = 8  # conservative default; raise to 50 if your DeepSeek tier allows it
-    M: int = 20
-    L: int = 5
+    # DeepSeek-V4 flash supports up to 2500 concurrent requests, pro up to 500. These
+    # defaults stay well under those caps (good throughput without hammering the API or a
+    # free-tier plan); raise toward the provider cap if your plan allows it.
+    S: int = 64  # flash, no thinking — fast; provider cap 2500
+    M: int = 32  # flash + thinking — slower per call; provider cap 2500
+    L: int = 8  # pro (cap 500) or a low-volume judgment tier (e.g. Claude)
 
 
 class RetryConfig(BaseModel):

@@ -19,4 +19,6 @@ def build_deepseek_provider(tier_cfg: TierConfig, tier: Tier) -> OpenAICompatPro
         base_url=tier_cfg.base_url,
         api_key=tier_cfg.resolve_api_key(),
         tier=tier,
+        thinking=tier_cfg.thinking,
+        reasoning_effort=tier_cfg.reasoning_effort,
     )

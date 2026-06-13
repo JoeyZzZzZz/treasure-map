@@ -6,15 +6,18 @@ llm:
   tiers:
     S:
       provider: deepseek
-      model: deepseek-chat
+      model: deepseek-v4-flash
       base_url: https://api.deepseek.com
       api_key_env: DEEPSEEK_API_KEY
+      thinking: false            # explicit: V4 thinking defaults ON; disable for the fast tier
       max_cost_per_call_usd: 0.01
     M:
       provider: deepseek
-      model: deepseek-reasoner
+      model: deepseek-v4-flash
       base_url: https://api.deepseek.com
       api_key_env: DEEPSEEK_API_KEY
+      thinking: true
+      reasoning_effort: high     # "high" | "max" (low/medium map to high per DeepSeek docs)
       max_cost_per_call_usd: 0.10
     L:
       provider: anthropic
@@ -33,9 +36,11 @@ llm:
     path: ~/.treasure-map/llm_cache.db
 
   concurrency:
-    S: 8    # safe default for DeepSeek free tier; raise to 50 if you have a paid plan
-    M: 20
-    L: 5
+    # DeepSeek-V4 flash supports up to 2500 concurrent requests, pro up to 500. These stay
+    # well under those caps; raise toward the cap if your plan allows it.
+    S: 64   # flash, no thinking — fast
+    M: 32   # flash + thinking — slower per call
+    L: 8    # pro (cap 500) or a low-volume judgment tier (e.g. Claude)
 
   retry:
     max_attempts: 4
