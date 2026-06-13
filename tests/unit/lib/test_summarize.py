@@ -38,6 +38,7 @@ class FakeRouter:
         self.seen_prompt_version: str | None = None
         self.seen_task: str | None = None
         self.call_count = 0
+        self.progress_events: list[tuple[int, int]] = []
 
     async def call_batch(
         self,
@@ -53,6 +54,7 @@ class FakeRouter:
         # Exercise the prompt builder the way the real router does (single-item).
         _ = prompt_builder(items[:1])
         results: list[LLMResponse | None] = []
+        done = 0
         for item in items:
             content = self._responder(item.input_text)
             if content is None:
@@ -67,6 +69,11 @@ class FakeRouter:
                         tier=Tier.S,
                     )
                 )
+                done += 1
+            # Mirror the real router: report (done-so-far, total) per completed item.
+            if progress_callback is not None:
+                progress_callback(done, len(items))
+                self.progress_events.append((done, len(items)))
         return results
 
 
@@ -220,6 +227,25 @@ def test_summarize_passes_prompt_version(tmp_path: Path) -> None:
 
     assert router.seen_prompt_version == PROMPT_VERSION
     assert router.seen_task == "function_summary"
+    conn.close()
+
+
+# ── progress callback forwarding ──────────────────────────────────────────────────
+
+
+def test_summarize_forwards_progress_callback(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    for fid in range(10, 13):
+        _add_function(conn, fid, pseudocode=f"void f{fid}(){{}}")
+    router = FakeRouter(_echo_responder)
+
+    seen: list[tuple[int, int]] = []
+    asyncio.run(summarize_functions(conn, router, progress=lambda d, t: seen.append((d, t))))
+
+    # Invoked once per item, total constant, done monotonically increasing up to total.
+    assert len(seen) == 3
+    assert all(t == 3 for _, t in seen)
+    assert [d for d, _ in seen] == [1, 2, 3]
     conn.close()
 
 

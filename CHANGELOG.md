@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Concurrency defaults raised to reflect DeepSeek-V4 capacity (flash up to 2500, pro up to
   500): S 8→64, M 20→32, L 5→8. Still well under the provider caps; raise further per plan.
+- `--summarize` UX: third-party HTTP loggers (`httpx`, `httpcore`, `openai`, `anthropic`) are
+  pinned to WARNING unless `--debug`, so per-request `"HTTP/1.1 200 OK"` noise no longer drowns
+  our own INFO lines. Summarization now shows an in-place `summarizing functions: done/total`
+  progress counter (stderr; generic counter only, no pseudocode/firmware strings) via the
+  router's existing per-item `progress_callback`. `summarize_functions` gained an optional
+  `progress` callback and stays presentation-free (it forwards, it does not print).
 
 ### Fixed
 

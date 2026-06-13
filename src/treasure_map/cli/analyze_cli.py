@@ -160,11 +160,18 @@ def _summarize(cfg: Any, workspace: Path, db_path: Path, limit: int | None) -> N
         click.echo("summary skipped: S-tier key not configured")
         return
 
+    def _on_progress(done: int, total: int) -> None:
+        # Generic counter only — never pseudocode/summary/firmware strings. Rewrites a
+        # single stderr line so it does not interleave with the final summary block; the
+        # \r is harmless when piped to a non-TTY log.
+        click.echo(f"\r  summarizing functions: {done}/{total}", nl=False, err=True)
+
     conn = open_db(db_path)
     try:
-        stats = asyncio.run(summarize_functions(conn, router, limit=limit))
+        stats = asyncio.run(summarize_functions(conn, router, limit=limit, progress=_on_progress))
     finally:
         conn.close()
+    click.echo("", err=True)  # finish the progress line with a newline
 
     click.echo(
         f"  Summaries: {stats.summarized} written, "

@@ -77,12 +77,17 @@ async def summarize_functions(
     router: _BatchRouter,
     *,
     limit: int | None = None,
+    progress: Callable[[int, int], None] | None = None,
 ) -> SummaryStats:
     """Fill functions.summary for un-summarized functions that have pseudocode.
 
     Selects only rows where summary IS NULL, partitions out those lacking pseudocode
     (counted as skipped), summarizes the rest via the router, and writes results back
     in a single executemany + commit. Never raises on a per-item failure.
+
+    progress, if given, is forwarded to the router and invoked as (done, total) per
+    completed item. This layer stays presentation-free: it takes a callback, it does
+    not print.
     """
     sql = "SELECT id, pseudocode FROM functions WHERE summary IS NULL ORDER BY id"
     params: tuple[int, ...] = ()
@@ -114,7 +119,11 @@ async def summarize_functions(
         )
 
     results = await router.call_batch(
-        "function_summary", items, build_summary_prompt, PROMPT_VERSION
+        "function_summary",
+        items,
+        build_summary_prompt,
+        PROMPT_VERSION,
+        progress_callback=progress,
     )
 
     updates: list[tuple[str, int]] = []
