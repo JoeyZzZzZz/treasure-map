@@ -168,28 +168,42 @@ public class ExportFunctions extends GhidraScript {
         funcsJson.append("]");
         println("[ExportFunctions] functions: " + funcCount);
 
-        // 2. Import symbols (via ExternalManager, for accurate library names)
+        // 2. Import symbols. Enumerate ALL external symbols via the SymbolTable, not only the
+        //    ones filed under a *named* library. On stripped IoT firmware — and on any headless
+        //    single-binary run, where there is no sibling program to resolve against — the
+        //    decompiler files PLT-resolved imports under the <EXTERNAL> placeholder rather than
+        //    a named .so. Walking getExternalLibraryNames() and skipping <EXTERNAL> therefore
+        //    dropped EVERY import (the imports=0 / L1-xref=0 symptom). getExternalSymbols()
+        //    returns the imports regardless of which namespace they ended up in; the library
+        //    name is recorded only when one was actually resolved (else "" — never "<EXTERNAL>").
         StringBuilder importsJson = new StringBuilder("[");
         boolean firstImp = true;
 
-        String[] libNames = extMgr.getExternalLibraryNames();
-        for (String libName : libNames) {
-            // Skip Ghidra internal placeholder library
-            if (libName == null || "<EXTERNAL>".equals(libName)) continue;
+        SymbolIterator extSyms = st.getExternalSymbols();
+        while (extSyms.hasNext()) {
+            Symbol sym = extSyms.next();
+            if (sym == null) continue;
+            // Keep the callable externals (PLT-imported functions); skip external data symbols.
+            SymbolType stype = sym.getSymbolType();
+            if (stype != SymbolType.FUNCTION && stype != SymbolType.LABEL) continue;
+            String label = sym.getName();
+            if (label == null || label.isEmpty()) continue;
 
-            ExternalLocationIterator iter = extMgr.getExternalLocations(libName);
-            while (iter.hasNext()) {
-                ExternalLocation loc   = iter.next();
-                String           label = loc.getLabel();
-                if (label == null || label.isEmpty()) continue;
+            String libName = "";
+            try {
+                ExternalLocation loc = extMgr.getExternalLocation(sym);
+                if (loc != null) {
+                    String ln = loc.getLibraryName();
+                    if (ln != null && !"<EXTERNAL>".equals(ln)) libName = ln;
+                }
+            } catch (Exception ignored) {}
 
-                if (!firstImp) importsJson.append(",");
-                firstImp = false;
-                importsJson.append("{")
-                           .append("\"func_name\":\"").append(esc(label))  .append("\",")
-                           .append("\"lib_name\":\""  ).append(esc(libName)).append("\"")
-                           .append("}");
-            }
+            if (!firstImp) importsJson.append(",");
+            firstImp = false;
+            importsJson.append("{")
+                       .append("\"func_name\":\"").append(esc(label)) .append("\",")
+                       .append("\"lib_name\":\"" ).append(esc(libName)).append("\"")
+                       .append("}");
         }
         importsJson.append("]");
 

@@ -11,11 +11,16 @@ Also classifies all strings via STRING_RULES.
 
 Semantics: wipe-and-rebuild. xrefs is always derivable from current DB state.
 
-NOTE on imports=0 on stripped MIPS/ARM firmware:
-  Ghidra's ExternalManager often returns nothing on stripped IoT firmware.
-  Layer 1 will produce 0 rows in this case — this is expected, not a bug.
-  Layer 0 (callees × exports) does not depend on ExternalManager and is the
-  primary source of cross-binary call graph data on IoT firmware.
+NOTE on imports and Layer 1 on stripped MIPS/ARM firmware:
+  Layer 0 (callees x exports) is the PRIMARY cross-binary call-graph source and does not
+  depend on the ExternalManager, so the graph stands even when imports are sparse.
+  Layer 1 (imports x exports) is a complementary, function-level signal and feeds component
+  fidelity. imports=0 is NOT expected on a dynamically-linked binary: it indicates the
+  extractor failed to enumerate external symbols (historically: the export script only
+  walked NAMED external libraries and skipped the <EXTERNAL> placeholder, where PLT-resolved
+  imports land on stripped firmware / headless single-binary runs). That has been fixed in
+  the export script; a binary that still reports imports=0 should be treated as a
+  data-quality gap to investigate, not as normal.
 """
 
 from __future__ import annotations
