@@ -16,7 +16,7 @@ import click
 logger = logging.getLogger(__name__)
 
 
-@click.command("hunt-diff")
+@click.command("hunt-diff", short_help="Diff two analysis.db builds; grade reachability.")
 @click.argument("db_a", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.argument("db_b", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option(
@@ -98,7 +98,7 @@ def hunt_diff(
     )
 
 
-@click.command("hunt-pattern")
+@click.command("hunt-pattern", short_help="Find call-sequence shape candidates in a build.")
 @click.argument("db", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--run-id", required=True, help="Neutral per-run id (the recurrence unit).")
 @click.option(
@@ -156,7 +156,7 @@ def hunt_pattern(
     )
 
 
-@click.command("atlas-view")
+@click.command("atlas-view", short_help="Neutral cross-firmware atlas aggregation views.")
 @click.argument("view", type=click.Choice(["dormant", "density", "twins"]))
 @click.option(
     "--config",

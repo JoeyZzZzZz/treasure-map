@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -17,17 +16,34 @@ import click
 
 logger = logging.getLogger(__name__)
 
+_ANALYZE_EPILOG = """\
+Examples:
 
-@click.command("analyze")
+\b
+  tmap analyze ./_fw.extracted -w router_v1          # managed name -> <base>/router_v1
+  tmap analyze ./_fw.extracted -w /mnt/scratch/fw1   # literal path (large/scratch disk)
+  tmap analyze ./_fw.extracted                       # auto name (re-run resumes)
+
+Re-running with the same -w (same name or path) resumes from the last checkpoint.
+"""
+
+
+@click.command(
+    "analyze",
+    short_help="Analyze an extracted firmware filesystem.",
+    epilog=_ANALYZE_EPILOG,
+)
 @click.argument("fs_root", type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.option(
     "--workspace",
     "-w",
-    type=click.Path(path_type=Path),
+    type=str,
     default=None,
     help=(
-        "Workspace directory (created if absent). "
-        "Pass the same path to resume a previous run from its last checkpoint."
+        "Workspace as a NAME (managed under your workspace base, e.g. -w router_v1) or a "
+        "PATH (used verbatim if it has a '/', '~', leading '.', or is absolute, e.g. "
+        "-w /mnt/scratch/fw1). Omitted: a deterministic auto name under the base. Re-run "
+        "with the same value to resume."
     ),
 )
 @click.option(
@@ -67,7 +83,7 @@ logger = logging.getLogger(__name__)
 )
 def analyze(
     fs_root: Path,
-    workspace: Path | None,
+    workspace: str | None,
     config: Path | None,
     skip_non_binary: bool,
     skip_ingesters: tuple[str, ...],
@@ -76,27 +92,37 @@ def analyze(
 ) -> None:
     """Analyze an extracted firmware filesystem root.
 
-    Produces an analysis.db in the workspace directory.
-    Resume-safe: re-running with the same --workspace skips completed steps.
+    Produces an analysis.db in the workspace directory. -w/--workspace takes a NAME
+    (managed under your workspace base) or a PATH (used verbatim); omitted, a deterministic
+    auto name is derived from the firmware dir. Resume-safe: re-running with the same -w
+    skips completed steps.
     """
     from treasure_map.lib.analyze.pipeline import run_analyze
     from treasure_map.lib.config.config import load_config
     from treasure_map.lib.errors import GhidraNotFoundError, TreasureMapError
+    from treasure_map.lib.workspace.resolver import resolve_workspace
     from treasure_map.lib.workspace.workspace import Workspace
 
     cfg = load_config(config)
 
-    if workspace is None:
-        ws_name = f"analyze_{fs_root.name}_{uuid.uuid4().hex[:8]}"
-        workspace = cfg.workspace_dir / ws_name
+    try:
+        resolved = resolve_workspace(workspace, workspace_dir=cfg.workspace_dir, fs_root=fs_root)
+    except TreasureMapError as exc:
+        raise click.ClickException(str(exc)) from exc
+    ws_path = resolved.path
 
     def _progress(step: str, meta: dict[str, Any]) -> None:
         click.echo(f"  [{step}] {meta}")
 
-    click.echo(f"Workspace: {workspace}")
+    if resolved.kind == "path":
+        click.echo(f"Workspace: {ws_path}  (explicit path)")
+    elif resolved.kind == "auto":
+        click.echo(f"Workspace: '{ws_path.name}'  (auto) → {ws_path}")
+    else:
+        click.echo(f"Workspace: '{workspace}' → {ws_path}")
 
     try:
-        with Workspace(workspace, progress_callback=_progress) as ws:
+        with Workspace(ws_path, progress_callback=_progress) as ws:
             result = asyncio.run(
                 run_analyze(
                     fs_root,
@@ -136,7 +162,7 @@ def analyze(
     click.echo(f"  DB       : {result.db_path}")
 
     if summarize:
-        _summarize(cfg, workspace, result.db_path, summary_limit)
+        _summarize(cfg, ws_path, result.db_path, summary_limit)
 
 
 def _summarize(cfg: Any, workspace: Path, db_path: Path, limit: int | None) -> None:

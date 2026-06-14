@@ -115,11 +115,20 @@ remembers it. Fix anything it marks `❌` (see [Troubleshooting](#troubleshootin
 1. **Point Treasure Map at your extracted firmware filesystem root.** (How you unpacked the
    firmware is up to you — outside Treasure Map's scope.) Say you extracted to `./_firmware.extracted/`.
 
-2. **Analyze.** Produces an `analysis.db` in the workspace; resume-safe (re-run with the same
-   `--workspace` to continue):
+2. **Analyze.** Produces an `analysis.db` in a workspace directory.
    ```bash
-   tmap analyze ./_firmware.extracted -w ./work
+   tmap analyze ./_firmware.extracted -w router_v1
    ```
+   **`-w/--workspace` takes a name *or* a path:**
+   - a **bare name** (`-w router_v1`) is managed for you under your workspace base —
+     `~/.treasure-map/workspaces/router_v1` (the base is set in `tmap init`);
+   - a value with a **slash, `~`, `.`, or an absolute path** (`-w /mnt/scratch/fw1`, `-w ./work`)
+     is used **as a literal path** — use this to put a workspace on a large/scratch/external disk;
+   - **omitted**, it defaults to an auto name under the base (derived from the firmware dir), shown
+     in the output.
+
+   The chosen workspace is **echoed** so you can see which form was used. Analysis is **resume-safe**:
+   re-run with the **same** `-w` (same name or same path) to continue from the last checkpoint.
    Useful flags: `--summarize` (function summaries via the S-tier LLM; needs an S-tier key),
    `--skip-non-binary`, `--skip-ingester <KIND>`, `-c <config.yaml>`.
 

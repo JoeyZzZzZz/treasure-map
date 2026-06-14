@@ -214,6 +214,54 @@ def _set_ghidra_home(config_path: Path, home: Path) -> None:
     config_path.write_text(yaml.safe_dump(data, default_flow_style=False))
 
 
+def _default_workspace_dir() -> str:
+    return str(_DEFAULT_CONFIG_YAML["workspace_dir"])
+
+
+def _configured_workspace_dir(config_path: Path) -> str:
+    """Return workspace_dir from an existing config.yaml, or the default if unset/unreadable."""
+    if not config_path.exists():
+        return _default_workspace_dir()
+    try:
+        data: dict[str, Any] = yaml.safe_load(config_path.read_text()) or {}
+    except Exception:
+        return _default_workspace_dir()
+    value = data.get("workspace_dir")
+    return str(value) if value else _default_workspace_dir()
+
+
+def _set_workspace_dir(config_path: Path, value: str) -> None:
+    """Write the top-level workspace_dir into config.yaml, preserving the rest of the file."""
+    data: dict[str, Any] = yaml.safe_load(config_path.read_text()) or {}
+    data["workspace_dir"] = value
+    config_path.write_text(yaml.safe_dump(data, default_flow_style=False))
+
+
+def _configure_workspace_dir(
+    config_path: Path,
+    *,
+    non_interactive: bool,
+    prompt: Callable[[str], str],
+    echo: Callable[[str], None],
+) -> None:
+    """Confirm (or change) the workspace base directory; persist any override to config.yaml.
+
+    Shows the current value (existing config value, else the default), lets the user press
+    Enter to keep it or type a new path. Idempotent per R0e: re-init shows the existing value
+    and does not clobber it; non-interactive keeps it with no prompt. Single-colon prompt (R0d).
+    """
+    current = _configured_workspace_dir(config_path)
+    if non_interactive:
+        echo(f"  Workspace base: {current}")
+        return
+    entered = prompt(f"Workspace base directory [{current}], Enter to keep").strip()
+    if not entered:
+        echo(f"  Workspace base: {current} (kept)")
+        return
+    _set_workspace_dir(config_path, entered)
+    echo(f"  Workspace base: {entered} (saved)")
+
+
 def _configure_ghidra(
     config_path: Path,
     *,
@@ -350,6 +398,12 @@ def run_init(
         )
         _seed_watchlist()
         _configure_ghidra(
+            config_path,
+            non_interactive=non_interactive,
+            prompt=prompt,
+            echo=echo,
+        )
+        _configure_workspace_dir(
             config_path,
             non_interactive=non_interactive,
             prompt=prompt,

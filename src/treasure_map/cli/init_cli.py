@@ -10,7 +10,7 @@ from treasure_map.lib.errors import TreasureMapError
 from treasure_map.lib.setup.initializer import run_init
 
 
-@click.command("init")
+@click.command("init", short_help="Set up ~/.treasure-map/ (config, keys, Ghidra, doctor).")
 @click.option("--force", is_flag=True, default=False, help="Overwrite existing config.yaml.")
 @click.option(
     "--non-interactive",

@@ -17,6 +17,7 @@ from treasure_map.lib.setup.initializer import (
     _DEFAULT_CONFIG_YAML,
     _collect_default_env_vars,
     _configure_ghidra,
+    _configure_workspace_dir,
     _provision_dirs,
     _run_doctor,
     _set_ghidra_home,
@@ -457,8 +458,11 @@ def test_prompt_messages_carry_no_trailing_colon(fake_home: Path) -> None:
     _write_config(config_path, force=True)
     with patch(_FIND_HEADLESS, side_effect=GhidraNotFoundError("not found")):
         _configure_ghidra(config_path, non_interactive=False, prompt=_capture, echo=lambda _m: None)
+    _configure_workspace_dir(
+        config_path, non_interactive=False, prompt=_capture, echo=lambda _m: None
+    )
 
-    assert captured  # both prompts actually fired
+    assert captured  # all prompts actually fired
     for msg in captured:
         assert not msg.rstrip().endswith(":"), f"message would double click's colon: {msg!r}"
 
@@ -513,3 +517,41 @@ def test_reinit_reuses_configured_ghidra_without_prompt(fake_home: Path) -> None
 
     assert not any("Ghidra install root" in m for m in msgs)  # not re-prompted
     assert _ghidra_home(fake_home) == str(root)  # still configured
+
+
+# ── run_init — workspace base dir confirm/persist (R0f) ───────────────────────
+
+
+def _workspace_dir(fake_home: Path) -> Any:
+    data = yaml.safe_load((fake_home / ".treasure-map" / "config.yaml").read_text())
+    return data.get("workspace_dir")
+
+
+def test_init_workspace_base_enter_keeps_default(fake_home: Path) -> None:
+    # Pressing Enter at the workspace prompt keeps the existing/default value untouched.
+    with patch(_FIND_HEADLESS, side_effect=GhidraNotFoundError("not found")):
+        run_init(non_interactive=False, prompt=_noop_prompt)
+    assert _workspace_dir(fake_home) == "~/.treasure-map/workspaces"
+
+
+def test_init_workspace_base_typed_path_persists(fake_home: Path) -> None:
+    custom = str(fake_home / "big-disk" / "ws")
+
+    def _prompt(msg: str) -> str:
+        return custom if "Workspace base" in msg else ""
+
+    with patch(_FIND_HEADLESS, side_effect=GhidraNotFoundError("not found")):
+        run_init(non_interactive=False, prompt=_prompt)
+    assert _workspace_dir(fake_home) == custom
+
+
+def test_init_workspace_base_non_interactive_no_prompt(fake_home: Path) -> None:
+    msgs: list[str] = []
+
+    def _record(msg: str) -> str:
+        msgs.append(msg)
+        return ""
+
+    run_init(non_interactive=True, prompt=_record)
+    assert not any("Workspace base" in m for m in msgs)  # never prompts
+    assert _workspace_dir(fake_home) == "~/.treasure-map/workspaces"

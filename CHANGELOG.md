@@ -38,6 +38,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deliberately keeps `~/.treasure-map/` (config, `.env`, the never-rebuilt `atlas.db`) — and
   the not-recommended full wipe (`rm -rf ~/.treasure-map`), with a warning about losing keys
   and the accumulated `atlas.db`. Removed the "Upgrading from earlier versions" section.
+- `tmap analyze -w/--workspace` now accepts a workspace **name** (managed under `workspace_dir`,
+  e.g. `-w router_v1` → `<base>/router_v1`) or a **path** (a value with a `/`, `~`, leading `.`,
+  or absolute is used verbatim, e.g. `-w /mnt/scratch/fw1`). Omitting it picks a **deterministic
+  auto name** derived from the firmware root (re-runs on the same firmware resume; the old random
+  uuid suffix is gone). The resolved workspace is echoed, showing which form was used. Resolution
+  is a tested pure function in `lib/workspace/`. `tmap init` now confirms/persists the workspace
+  base dir (`workspace_dir`), idempotent per the init rules. CLI help expanded: every command has
+  a `short_help`, so `tmap --help` no longer truncates the command list; `analyze --help` documents
+  the name/path rule with examples.
 
 ### Removed
 

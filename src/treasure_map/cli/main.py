@@ -11,7 +11,7 @@ from treasure_map.cli.hunt_cli import atlas_view, hunt_diff, hunt_pattern
 from treasure_map.cli.init_cli import init
 
 
-@click.group()
+@click.group(context_settings={"max_content_width": 100})
 @click.option("--debug", is_flag=True, default=False, help="Enable debug logging.")
 def main(debug: bool) -> None:
     """Treasure Map — IoT firmware exploit-path discovery."""
