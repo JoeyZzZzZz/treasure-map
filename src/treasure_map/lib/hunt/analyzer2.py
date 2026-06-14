@@ -14,7 +14,7 @@ Discipline (same as A1, enforced here and by the schema):
 - L0/L1 only (confirmed/blocked -> L1, unknown -> L0); never L2/L3, never an external_anchor.
 - Evidence neutralization: R-pattern's raw, firmware-derived evidence (a matched format
   literal may carry a device path) is NEVER persisted. Traceability rides pseudocode_hash;
-  evidence_ref, if set, holds only a neutral structural descriptor (the fingerprint).
+  evidence_ref holds only a neutral per-instance locator (a run-scoped function id).
 - Everything written is a graded lead, never a confirmed bug or a publishable result.
 """
 
@@ -122,8 +122,12 @@ def run_analyzer2(
                     reachability_status=status,
                     blocking_mechanism=blocking,
                     provenance_level=provenance,
-                    # Neutral structural descriptor only — never the raw evidence literal.
-                    evidence_ref=match.structural_fingerprint,
+                    # Per-instance neutral locator (run-scoped function id): unique and
+                    # traceable back to the source function, never a raw evidence literal.
+                    # The shared structural_fingerprint lives on the pattern (above), not
+                    # here — putting it on the instance collided across all same-shape
+                    # instances and gave no traceability.
+                    evidence_ref=f"{source_run_id}#fn{match.func_ref.func_id}",
                     scope_origin="intra",
                 ),
             )

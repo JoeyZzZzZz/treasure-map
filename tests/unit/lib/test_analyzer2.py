@@ -135,10 +135,36 @@ def test_raw_evidence_is_not_persisted(tmp_path: Path) -> None:
     run_analyzer2(db, atlas, source_run_id="run_dcs")
 
     (row,) = _instances(atlas)
-    # evidence_ref holds a neutral structural descriptor (the fingerprint), not the literal.
+    # evidence_ref holds a neutral per-instance locator (run-scoped function id), not the
+    # raw firmware literal.
     assert row["evidence_ref"] != RAW_EVIDENCE
     # The raw firmware-derived literal appears in NO column of the stored row.
     assert all(RAW_EVIDENCE not in str(row[k]) for k in row.keys())
+
+
+def test_evidence_ref_unique_per_instance(tmp_path: Path) -> None:
+    # Two functions of the SAME shape share one structural_fingerprint (one pattern) but are
+    # distinct instances. evidence_ref must locate each instance uniquely — it must NOT be the
+    # shared fingerprint (that collided across all same-shape instances and lost traceability).
+    db = _make_db(
+        tmp_path,
+        [{"name": "webd", "funcs": [_cmd_injection_fn("h1"), _cmd_injection_fn("h2")]}],
+    )
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_x")
+
+    rows = _instances(atlas)
+    assert len(rows) == 2
+    refs = [r["evidence_ref"] for r in rows]
+    assert len(set(refs)) == 2, f"evidence_ref collided across instances: {refs}"
+    # One shared pattern fingerprint underneath; the per-instance refs are never that value.
+    conn = open_atlas(atlas)
+    try:
+        fps = {r[0] for r in conn.execute("SELECT structural_fingerprint FROM pattern")}
+    finally:
+        conn.close()
+    assert len(fps) == 1  # same shape -> one pattern
+    assert all(fp not in refs for fp in fps)  # the instance ref is never the shared fingerprint
 
 
 # ── parameter-sourced -> unknown -> L0 (R2's hard invariant carried through) ─────────
