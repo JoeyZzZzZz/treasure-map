@@ -224,10 +224,6 @@ def _run_doctor(tm_home: Path, cfg: Config | None) -> tuple[tuple[str, bool, str
     java = shutil.which("java")
     checks.append(("java", java is not None, java or "not on PATH"))
 
-    # binwalk
-    bw = shutil.which("binwalk")
-    checks.append(("binwalk", bw is not None, bw or "not on PATH"))
-
     # API keys — per configured tier, deduplicated by api_key_env
     if cfg is not None and cfg.llm is not None:
         seen_keys: set[str] = set()

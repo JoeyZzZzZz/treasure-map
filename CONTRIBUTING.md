@@ -36,6 +36,27 @@ Please open an issue with:
 
 Open an issue describing your use case and the feature you'd like to see.
 
+## Development setup
+
+End users install with `pipx` (see the README); contributors work from a clone in an
+editable virtual environment instead:
+
+```bash
+git clone https://github.com/JoeyZzZzZz/treasure-map.git
+cd treasure-map
+python3.11 -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+```
+
+Run the same checks CI runs before pushing:
+
+```bash
+./scripts/ci-local.sh    # ruff, ruff format --check, mypy strict, pytest
+```
+
+You still need Ghidra 11.x + JDK 21 on the host for `tmap analyze` (README → Setup) and
+`tmap init` to configure them; the editable install does not bundle them.
+
 ## Vendor Denylist (pre-commit hook)
 
 The pre-commit hook enforces vendor neutrality. The committed file

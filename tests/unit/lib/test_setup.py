@@ -280,13 +280,6 @@ def test_run_doctor_java_check_reflects_path(tmp_path: Path) -> None:
     assert java_check[2] == "/usr/bin/java"
 
 
-def test_run_doctor_binwalk_red_when_absent(tmp_path: Path) -> None:
-    with patch("treasure_map.lib.setup.initializer.shutil.which", return_value=None):
-        checks = _run_doctor(tmp_path, None)
-    bw_check = next(c for c in checks if c[0] == "binwalk")
-    assert bw_check[1] is False
-
-
 def test_run_doctor_api_key_check_with_missing_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -53,6 +53,13 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# Non-.py runtime assets MUST be listed here or the built wheel silently omits them
+# (a pipx/pip install would then fail at analyze/schema time). Editable installs hide
+# this because they run from the source tree. Extend these globs for any new asset.
+[tool.setuptools.package-data]
+"treasure_map.lib.analyze.ghidra" = ["*.java"]
+"treasure_map.lib.storage" = ["*.sql"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
