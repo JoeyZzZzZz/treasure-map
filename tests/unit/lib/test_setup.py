@@ -16,6 +16,7 @@ from treasure_map.lib.errors import GhidraNotFoundError
 from treasure_map.lib.setup.initializer import (
     _DEFAULT_CONFIG_YAML,
     _collect_default_env_vars,
+    _configure_ghidra,
     _provision_dirs,
     _run_doctor,
     _write_config,
@@ -369,9 +370,10 @@ def test_init_ghidra_autodetect_accepts_without_prompt(fake_home: Path) -> None:
     with patch(_FIND_HEADLESS, return_value=Path("/opt/ghidra/support/analyzeHeadless")):
         run_init(non_interactive=False, prompt=_record_prompt)
 
-    # Auto-detected: no Ghidra prompt fired, and nothing written (run-time discovery).
+    # Auto-detected: no Ghidra prompt fired, and the resolved install root is PERSISTED to
+    # config.yaml so a later analyze in a new shell (no GHIDRA_HOME/PATH) still finds it.
     assert not any("Ghidra install root" in m for m in msgs)
-    assert _ghidra_home(fake_home) is None
+    assert _ghidra_home(fake_home) == "/opt/ghidra"
 
 
 def test_init_ghidra_prompt_validates_and_writes(fake_home: Path) -> None:
@@ -427,3 +429,31 @@ def test_init_ghidra_path_goes_to_config_not_env(fake_home: Path) -> None:
     assert str(root) not in env_text
     cfg_text = (fake_home / ".treasure-map" / "config.yaml").read_text()
     assert str(root) in cfg_text  # the path (non-secret) belongs in config.yaml
+
+
+def test_prompt_messages_carry_no_trailing_colon(fake_home: Path) -> None:
+    # click's prompt() appends its own ": " suffix, so a message that already ends in ": "
+    # would render a double colon. Guard both prompts: their messages must NOT end with a colon.
+    captured: list[str] = []
+
+    def _capture(msg: str) -> str:
+        captured.append(msg)
+        return ""  # skip / leave unset
+
+    env_path = fake_home / ".treasure-map" / ".env"
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_env(
+        env_path,
+        env_vars=["DEEPSEEK_API_KEY"],
+        prompt=_capture,
+        non_interactive=False,
+    )
+
+    config_path = fake_home / ".treasure-map" / "config.yaml"
+    _write_config(config_path, force=True)
+    with patch(_FIND_HEADLESS, side_effect=GhidraNotFoundError("not found")):
+        _configure_ghidra(config_path, non_interactive=False, prompt=_capture, echo=lambda _m: None)
+
+    assert captured  # both prompts actually fired
+    for msg in captured:
+        assert not msg.rstrip().endswith(":"), f"message would double click's colon: {msg!r}"

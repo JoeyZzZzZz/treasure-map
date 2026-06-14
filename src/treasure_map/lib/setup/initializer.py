@@ -122,7 +122,7 @@ def _write_env(
         value = (
             ""
             if non_interactive
-            else prompt(f"Enter value for {var_name} (press Enter to skip): ").strip()
+            else prompt(f"Enter value for {var_name} (press Enter to skip)").strip()
         )
         if value:
             lines.append(f"{var_name}={value}\n")
@@ -167,9 +167,10 @@ def _configure_ghidra(
     """Detect Ghidra, or (interactively) prompt for and validate its install root.
 
     Auto-detect first (GHIDRA_HOME / PATH via the headless discovery); if found, accept it
-    without prompting and write nothing (run-time discovery finds it again). If not found,
-    prompt for the install root and validate it contains support/analyzeHeadless before
-    writing ghidra.local.home. Non-interactive or blank input leaves config unset (run-time
+    without prompting and PERSIST the resolved install root to config.yaml, so a later analyze
+    in a new shell (where GHIDRA_HOME/PATH may be gone) still finds it. If not found, prompt for
+    the install root and validate it contains support/analyzeHeadless before writing
+    ghidra.local.home. Non-interactive or blank input leaves config unset (run-time
     auto-discovery), never blocking. This writes a path only — it never touches secrets.
     """
     from treasure_map.lib.analyze.ghidra_runner import find_headless
@@ -178,7 +179,10 @@ def _configure_ghidra(
 
     try:
         headless = find_headless(GhidraConfig())
-        echo(f"  Ghidra : found at {headless}")
+        # headless is <root>/support/analyzeHeadless; its grandparent is the install root.
+        root = headless.parent.parent
+        _set_ghidra_home(config_path, root)
+        echo(f"  Ghidra : found at {headless} — saved to config")
         return
     except GhidraNotFoundError:
         pass
@@ -190,7 +194,7 @@ def _configure_ghidra(
     echo("  Ghidra : not auto-detected.")
     for _ in range(2):  # one prompt plus one retry on an invalid path
         entered = prompt(
-            "Enter Ghidra install root (dir containing support/analyzeHeadless), Enter to skip: "
+            "Enter Ghidra install root (dir containing support/analyzeHeadless), Enter to skip"
         ).strip()
         if not entered:
             echo("  Ghidra : left unset (auto-discovery runs at analyze time).")

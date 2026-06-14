@@ -16,13 +16,12 @@ CLI: `tmap`. AGPL-3.0.
 
 | Dependency | Version | Why |
 |---|---|---|
-| Python | ≥ 3.11 | runs Treasure Map |
 | Ghidra | 11.x | decompiles every binary (headless) |
 | JDK | 21 | required by Ghidra 11.x (older JDKs make Ghidra fail to launch) |
 | API key(s) | — | only for LLM-assisted steps (`--summarize`, `hunt-*`); plain `tmap analyze` runs on Ghidra alone |
 
-You install these yourself — Treasure Map does not download them for you. (A zero-setup Docker
-image with everything bundled is planned; until then, follow the Setup below.)
+You install Ghidra and JDK yourself; the Setup below installs Treasure Map and the right Python
+for you. (A zero-setup Docker image with everything bundled is planned; until then, follow Setup.)
 
 Treasure Map's **input is an already-extracted firmware filesystem**. Unpacking the firmware image
 is outside its scope — use whatever extraction tool you prefer; Treasure Map takes the resulting
@@ -30,28 +29,25 @@ directory.
 
 ## Setup
 
-Do these **in order**. Each step starts with a quick check — if you already have it, skip to the
-next step. By the end, `tmap` is installed and configured.
+Do these **in order**. Each step starts with a quick check — if you already have it, skip ahead.
 
-### Step 1 — uv
+### Step 1 — Install uv
 
-[uv](https://github.com/astral-sh/uv) is the installer used below. It downloads and manages its
-own CPython 3.11 for you, so you need **no system Python** and **no deadsnakes/PPA** (the install
-works the same on locked-down networks where Launchpad's package index is unreachable).
+[uv](https://docs.astral.sh/uv/) is a single binary that installs Treasure Map and manages the
+correct Python for it (no system Python or apt/PPA needed).
 
-Check: `uv --version`. If it prints a version, skip to Step 2.
-
-Install:
 ```bash
-# Linux/macOS (no admin, no sudo):
-curl -LsSf https://astral.sh/uv/install.sh | sh        # then open a new shell
-# alternative if you already have any Python: pip install --user uv
+# Linux / macOS:
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source "$HOME/.local/bin/env"        # or just open a new shell so `uv` is on PATH
+# Windows (PowerShell):  irm https://astral.sh/uv/install.ps1 | iex
+# Already have it? `uv --version` → skip to Step 2.
 ```
 
 ### Step 2 — JDK 21
 
 Check: `java -version` — it must report **21**. If so, skip to Step 3. (Ghidra 11.x needs exactly
-21; JDK 11/17 make it fail at launch. If you have several JDKs installed, select 21 with
+21; JDK 11/17 make it fail at launch. With several JDKs installed, select 21 via
 `sudo update-alternatives --config java`.)
 
 Install:
@@ -65,8 +61,8 @@ sudo apt install -y openjdk-21-jdk
 ### Step 3 — Ghidra 11.x
 
 Check: if Ghidra 11.x is **already installed**, find its **install root** — the directory that
-directly contains `support/analyzeHeadless`. Note that path; you'll give it to `tmap init` in
-Step 5. Then skip to Step 4 (don't reinstall).
+directly contains `support/analyzeHeadless` — and go straight to "Make it discoverable" below
+(don't reinstall).
 
 Install (no installer — just download + unzip):
 ```bash
@@ -74,35 +70,50 @@ Install (no installer — just download + unzip):
 #   https://github.com/NationalSecurityAgency/ghidra/releases
 unzip ghidra_11.*_PUBLIC_*.zip -d ~/ghidra      # -> ~/ghidra/ghidra_11.x_PUBLIC/  (= the install root)
 ```
-No admin rights needed. Remember the install root path (the folder containing `support/`) for Step 5.
+No admin rights needed.
 
-### Step 4 — Install Treasure Map (uv)
+**Make it discoverable.** Point `GHIDRA_HOME` at the install root (the folder containing
+`support/`) so the next steps find Ghidra automatically:
+```bash
+export GHIDRA_HOME=~/ghidra/ghidra_11.x_PUBLIC      # use your actual install root
+```
+Run Steps 4–5 in **this same shell**. `tmap init` (Step 5) detects `GHIDRA_HOME` and **writes the
+path into `config.yaml`**, so it persists afterward — you don't need to keep `GHIDRA_HOME` set in
+future shells, and you don't paste any path by hand.
 
-uv gives a global `tmap` command with nothing to activate, on a Python 3.11 it fetches itself.
+### Step 4 — Install Treasure Map
+
+One command. uv fetches a managed CPython 3.11, builds Treasure Map in an isolated environment,
+and puts the `tmap` command on your PATH — nothing to activate.
+
 ```bash
 uv tool install --python 3.11 "git+https://github.com/JoeyZzZzZz/treasure-map.git"
+tmap --help
 ```
-The `git+…` URL is fetched with **git**, so make sure git is installed first (`sudo apt install -y
-git`). Later: `uv tool upgrade treasure-map` / `uv tool uninstall treasure-map`.
 
-**Alternative (pipx):** if you already use pipx on a system Python ≥ 3.11, `pipx install
-"git+https://github.com/JoeyZzZzZz/treasure-map.git"` works too.
+(The `git+…` URL is fetched with **git**, so make sure git is installed — `sudo apt install -y
+git`. Later: `uv tool upgrade treasure-map` / `uv tool uninstall treasure-map`.)
 
 ### Step 5 — Configure: `tmap init`
 
 ```bash
 tmap init
 ```
-This writes `~/.treasure-map/config.yaml` plus your API keys, **asks for your Ghidra install
-root** (paste the path from Step 3 — or it's accepted automatically if Ghidra is already on your
-`PATH`/`GHIDRA_HOME`), and runs a doctor preflight. Fix anything it marks `❌` (see
-[Troubleshooting](#troubleshooting)), then re-run `tmap init`. When it shows no `❌`, you're ready.
+This writes `~/.treasure-map/config.yaml` plus your API keys and runs a doctor preflight. If you
+set `GHIDRA_HOME` in Step 3 (or Ghidra is on your `PATH`), init **detects it and saves the path to
+`config.yaml` automatically — no prompt**. Otherwise it asks once for the install root and
+remembers it. Fix anything it marks `❌` (see [Troubleshooting](#troubleshooting)), then re-run
+`tmap init`. When it shows no `❌`, you're ready.
+
+> **Prefer pipx?** If you already have a Python ≥ 3.11 and use pipx, you can substitute Step 1+4
+> with `pipx install --python python3.11 "git+https://github.com/JoeyZzZzZz/treasure-map.git"`
+> (install a 3.11 first if needed — e.g. deadsnakes PPA, or `pyenv install 3.11`). uv is
+> recommended because it brings its own Python and needs no PPA.
 
 ## Using it
 
 1. **Point Treasure Map at your extracted firmware filesystem root.** (How you unpacked the
-   firmware is up to you — outside Treasure Map's scope.) Say you extracted to
-   `./_firmware.extracted/`.
+   firmware is up to you — outside Treasure Map's scope.) Say you extracted to `./_firmware.extracted/`.
 
 2. **Analyze.** Produces an `analysis.db` in the workspace; resume-safe (re-run with the same
    `--workspace` to continue):
@@ -140,8 +151,8 @@ ghidra:
     home: /path/to/ghidra_11.x_PUBLIC
 ```
 
-**Alternatives:** export `GHIDRA_HOME` (in the shell that runs `tmap`, e.g. via `.bashrc`/`.zshrc`),
-or add `<ghidra-root>/support` to your `PATH`.
+**Alternatives:** export `GHIDRA_HOME` (in the shell that runs `tmap`), or add
+`<ghidra-root>/support` to your `PATH`.
 
 Two things that trip people up:
 - **Point at the install *root*** — the directory that directly contains `support/`. The test is
@@ -156,13 +167,10 @@ Two things that trip people up:
 ## Troubleshooting
 
 **Install:**
-- `tmap: command not found` right after install — the tool's bin directory isn't on PATH yet.
-  Run `uv tool update-shell` (or `python3 -m pipx ensurepath` if you used pipx), open a new shell,
-  and confirm `~/.local/bin` is on your `PATH`. (If the shell suggests `apt install emboss`,
-  ignore it — an unrelated package shipping a different `tmap`.)
-- `requires a different Python: 3.8.x not in '>=3.11'` — the interpreter used to install is too
-  old. With uv this can't happen (`--python 3.11` fetches a managed 3.11); if you used pipx on an
-  old system Python, install with uv per Step 4 instead.
+- `tmap: command not found` after install — the tool's bin directory isn't on PATH yet. For uv:
+  `uv tool update-shell`, then open a new shell. For pipx: `pipx ensurepath`. Confirm
+  `~/.local/bin` is on your `PATH`. (If the shell suggests `apt install emboss`, ignore it — an
+  unrelated package shipping a different `tmap`.)
 
 **`tmap init` doctor** prints `name: ✅/❌ detail`. Common ❌ and fixes:
 
