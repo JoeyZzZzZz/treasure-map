@@ -376,3 +376,65 @@ def test_validator_patterns_are_generic() -> None:
         assert src.startswith("^")
         # Anchored prefix only; no literal full symbol like a specific check_id_char.
         assert "id_char" not in src
+
+
+# ── unrecovered calling convention (stripped MIPS/ARM) -> never confirmed ───────────
+# Root cause of the intra-procedural false-confirm: caller-supplied args/state render as
+# in_stack_*/unaff_*/in_<reg> rather than param_N, so the parameter-origin rule was missed.
+
+
+@pytest.mark.parametrize(
+    "pseudo,callees,sink",
+    [
+        # strong return-value source -> copy, but the request handle is an unrecovered stack arg
+        (
+            "uVar1 = websGetVar(wp, in_stack_0xffffff80); strcpy(acStack_120, uVar1);",
+            ["websGetVar", "strcpy"],
+            "strcpy",
+        ),
+        # strong buffer source -> copy, but the frame is unrecovered (unaff_/in_ placeholders)
+        (
+            "recvfrom(in_a0, auStack_88, 0x40, 0); memcpy(unaff_s0, auStack_88, 0x40);",
+            ["recvfrom", "memcpy"],
+            "memcpy",
+        ),
+        # a prior-call output the decompiler could not thread through normal flow
+        ("extraout_v0 = helper(); strcpy(dst, extraout_v0);", ["helper", "strcpy"], "strcpy"),
+    ],
+)
+def test_unrecovered_abi_never_confirmed(pseudo: str, callees: list[str], sink: str) -> None:
+    verdict = grade_candidate(pseudo, callees, sink)
+    assert verdict.status == "unknown"  # the flow is not fully visible within the function
+    assert verdict.status != "confirmed"
+    assert verdict.blocking_mechanism is None  # demote to unknown, never fabricate blocked
+
+
+def test_in_register_arg_is_caller_supplied() -> None:
+    # A caller-supplied value arriving in an arg register (in_a0) is a parameter, not an
+    # in-function source: caller control is unprovable here, so never confirmed.
+    pseudo = "void h(void){ char dst[64]; strcpy(dst, in_a0); }"
+    verdict = grade_candidate(pseudo, ["strcpy"], "strcpy")
+    assert verdict.status != "confirmed"
+
+
+def test_clean_recovered_frame_still_confirms() -> None:
+    # No placeholders: an in-function strong source flowing unfiltered to the sink must still
+    # confirm — the unrecovered-ABI guard must not suppress legitimate clean flows.
+    pseudo = "char buf[64]; recv(fd,buf,64); strcpy(dst,buf);"
+    assert grade_candidate(pseudo, ["recv", "strcpy"], "strcpy").status == "confirmed"
+    # A recovered frame with an ordinary web handle (wp is not a placeholder) still confirms.
+    pseudo2 = 'uVar1 = websGetVar(wp, "name"); system(uVar1);'
+    assert grade_candidate(pseudo2, ["websGetVar", "system"], "system").status == "confirmed"
+
+
+def test_abi_unrecovered_helper_precision() -> None:
+    # True only on real unrecovered-frame prefixes; ordinary stack locals and names like
+    # in_addr must NOT trip it (else every stripped function would be suppressed).
+    from treasure_map.lib.reachability.taint import abi_unrecovered
+
+    assert abi_unrecovered("strcpy(d, in_stack_0xffffff80);")
+    assert abi_unrecovered("x = unaff_s0;")
+    assert abi_unrecovered("y = extraout_v0;")
+    assert abi_unrecovered("/* WARNING: Unknown calling convention */ void f(){}")
+    assert not abi_unrecovered("char acStack_120[256]; char auStack_88[64]; int local_10;")
+    assert not abi_unrecovered("struct in_addr a; recv(fd, buf, 64);")

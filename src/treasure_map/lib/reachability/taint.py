@@ -103,7 +103,46 @@ _BUFFER_SOURCE_ARG: dict[str, int] = {
 _CALL_RE = re.compile(r"([A-Za-z_]\w*)\s*\(([^()]*)\)")
 _ASSIGN_RE = re.compile(r"\s*[^=]*?\b([A-Za-z_]\w*)\s*=\s*(?!=)(.*)")
 _IDENT_RE = re.compile(r"[A-Za-z_]\w*")
-_PARAM_RE = re.compile(r"param_\d+")
+
+# Caller-supplied values, including the ones the decompiler could not bind to a recovered
+# parameter slot. On MIPS/ARM with an unrecovered calling convention, arguments and
+# callee-saved caller state surface as in_stack_*/unaff_*/in_<reg> rather than param_N. They
+# are caller-supplied for grading purposes, so the parameter-origin rule (caller control is
+# unprovable within one function -> never confirmed) must apply to them too. param_\d+ alone
+# missed them, which is the root cause of intra-procedural false-confirms on stripped MIPS
+# firmware. The alternatives are anchored to the decompiler's generated prefixes and do NOT
+# match ordinary stack locals (acStack_*/auStack_*/local_*) or names like in_addr.
+_CALLER_SUPPLIED_RE = re.compile(
+    r"param_\d+"
+    r"|in_stack_[0-9a-fx]+"
+    r"|unaff_\w+"
+    r"|in_(?:a[0-3]|v[01]|t\d|s[0-8]|k[01]|at|gp|sp|fp|ra)\b",
+    re.IGNORECASE,
+)
+
+# Markers that the decompiler did NOT soundly recover the frame/ABI. A "confirmed" verdict
+# claims a clean source-to-sink flow fully visible within the function; that claim is unsound
+# when arguments / caller state surface as placeholders. extraout_* is a prior call's output
+# the decompiler could not thread through normal flow; the explicit "unknown calling
+# convention" comment is best-effort (only some decompiler versions emit it into getC()).
+_ABI_UNRECOVERED_RE = re.compile(
+    r"in_stack_[0-9a-fx]+"
+    r"|unaff_\w+"
+    r"|extraout_\w+"
+    r"|in_(?:a[0-3]|v[01]|t\d|s[0-8]|k[01]|at|gp|sp|fp|ra)\b"
+    r"|unknown calling convention",
+    re.IGNORECASE,
+)
+
+
+def abi_unrecovered(pseudocode: str) -> bool:
+    """True when the decompiler did not soundly recover this function's frame/ABI.
+
+    Used to demote a would-be ``confirmed`` to ``unknown`` (never to invent ``blocked``): a
+    confirmed flow must be fully visible within the function, which is not establishable when
+    arguments/caller state appear as in_stack_*/unaff_*/in_<reg>/extraout_* placeholders.
+    """
+    return _ABI_UNRECOVERED_RE.search(pseudocode) is not None
 
 
 def locate_sink_arg(pseudocode: str, sink_name: str) -> str | None:
@@ -164,7 +203,7 @@ def _taint_sets(pseudocode: str) -> tuple[set[str], set[str], set[str]]:
     statements = re.split(r"[;\n{}]", pseudocode)
     strong: set[str] = set()
     weak: set[str] = set()
-    par: set[str] = set(_PARAM_RE.findall(pseudocode))
+    par: set[str] = set(_CALLER_SUPPLIED_RE.findall(pseudocode))
 
     prev = (-1, -1, -1)
     for _ in range(len(statements) + 2):
@@ -256,7 +295,7 @@ def _seed_sets(pseudocode: str) -> tuple[set[str], set[str], set[str]]:
     """
     strong: set[str] = set()
     weak: set[str] = set()
-    par: set[str] = set(_PARAM_RE.findall(pseudocode))
+    par: set[str] = set(_CALLER_SUPPLIED_RE.findall(pseudocode))
     for stmt in re.split(r"[;\n{}]", pseudocode):
         assign = _ASSIGN_RE.match(stmt)
         lhs = assign.group(1) if assign else None
@@ -294,7 +333,7 @@ def origin_of(pseudocode: str, var: str) -> OriginKind:
     strong source outranks a weak one only when no parameter contributes.
     """
     strong, weak, par = _taint_sets(pseudocode)
-    if var in par or _PARAM_RE.fullmatch(var):
+    if var in par or _CALLER_SUPPLIED_RE.fullmatch(var):
         return "parameter"
     if var in strong:
         return "strong_source"

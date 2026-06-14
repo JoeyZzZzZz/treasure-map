@@ -30,7 +30,12 @@ from treasure_map.lib.reachability.filters import (
     validator_present,
 )
 from treasure_map.lib.reachability.models import ReachabilityVerdict
-from treasure_map.lib.reachability.taint import _seed_sets, flows_into, locate_sink_arg
+from treasure_map.lib.reachability.taint import (
+    _seed_sets,
+    abi_unrecovered,
+    flows_into,
+    locate_sink_arg,
+)
 
 _BASIS_NO_CALLEES = "no callees were recorded for the function"
 _BASIS_NO_BODY = "no pseudocode was available for the function"
@@ -61,6 +66,12 @@ _BASIS_COVERED_UNVERIFIED = (
 _BASIS_CLAMP = (
     "a clamp may bound the value on the path; a clean unfiltered flow is not provable here, "
     "so the result is unknown rather than confirmed"
+)
+_BASIS_ABI = (
+    "the decompiler did not soundly recover this function's frame (unrecovered calling "
+    "convention / in_stack/unaff/extraout placeholders); a clean source-to-sink flow is not "
+    "fully visible within the function, so the verdict is unknown, not confirmed — deep "
+    "data-flow analysis (R2-deep) is required"
 )
 
 
@@ -129,6 +140,13 @@ def grade_candidate(
             # A clamp may bound the value: downgrade a would-be confirm to unknown (never
             # blocked — a function-wide clamp does not prove THIS path is bounded).
             return ReachabilityVerdict("unknown", None, _BASIS_CLAMP)
+        if abi_unrecovered(pseudocode):
+            # The decompiler did not soundly recover the frame (unrecovered calling
+            # convention / in_stack/unaff/extraout placeholders). "confirmed" claims a clean
+            # flow fully visible in this function, which is not establishable here. Downgrade
+            # to unknown (never blocked); R2-deep must decide. Closes the intra-procedural
+            # false-confirm on stripped MIPS/ARM firmware.
+            return ReachabilityVerdict("unknown", None, _BASIS_ABI)
         return ReachabilityVerdict("confirmed", None, _BASIS_CONFIRMED)
     if uncovered & weak_seeds:
         # Locally-influenced input: external controllability is not establishable here.
