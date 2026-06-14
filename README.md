@@ -33,18 +33,19 @@ directory.
 Do these **in order**. Each step starts with a quick check — if you already have it, skip to the
 next step. By the end, `tmap` is installed and configured.
 
-### Step 1 — Python 3.11+
+### Step 1 — uv
 
-Check: `python3.11 --version` (or `python3 --version`). If it reports **3.11 or newer**, skip to Step 2.
+[uv](https://github.com/astral-sh/uv) is the installer used below. It downloads and manages its
+own CPython 3.11 for you, so you need **no system Python** and **no deadsnakes/PPA** (the install
+works the same on locked-down networks where Launchpad's package index is unreachable).
+
+Check: `uv --version`. If it prints a version, skip to Step 2.
 
 Install:
 ```bash
-# Debian/Ubuntu (20.04 ships 3.8, 22.04 ships 3.10 — too old):
-sudo apt update && sudo apt install -y software-properties-common
-sudo add-apt-repository -y ppa:deadsnakes/ppa
-sudo apt update && sudo apt install -y python3.11 python3.11-venv
-# macOS:                brew install python@3.11
-# any OS (alternative): pyenv install 3.11      (https://github.com/pyenv/pyenv)
+# Linux/macOS (no admin, no sudo):
+curl -LsSf https://astral.sh/uv/install.sh | sh        # then open a new shell
+# alternative if you already have any Python: pip install --user uv
 ```
 
 ### Step 2 — JDK 21
@@ -75,20 +76,17 @@ unzip ghidra_11.*_PUBLIC_*.zip -d ~/ghidra      # -> ~/ghidra/ghidra_11.x_PUBLIC
 ```
 No admin rights needed. Remember the install root path (the folder containing `support/`) for Step 5.
 
-### Step 4 — Install Treasure Map (pipx)
+### Step 4 — Install Treasure Map (uv)
 
-pipx gives a global `tmap` command with nothing to activate.
+uv gives a global `tmap` command with nothing to activate, on a Python 3.11 it fetches itself.
 ```bash
-# Install pipx if you don't have it (one-time, no sudo):
-python3 -m pip install --user pipx && python3 -m pipx ensurepath    # then open a new shell
-
-# Install Treasure Map, pinned to your Python 3.11 from Step 1:
-pipx install --python python3.11 "git+https://github.com/JoeyZzZzZz/treasure-map.git"
+uv tool install --python 3.11 "git+https://github.com/JoeyZzZzZz/treasure-map.git"
 ```
-If your `python3.11` is at a nonstandard path, pass it in full (`--python /path/to/python3.11`).
-If your default `python3` is already ≥ 3.11, you can omit `--python`. The `git+…` URL is fetched
-with **git**, so make sure git is installed first (`sudo apt install -y git`). Later: `pipx
-upgrade treasure-map` / `pipx uninstall treasure-map`.
+The `git+…` URL is fetched with **git**, so make sure git is installed first (`sudo apt install -y
+git`). Later: `uv tool upgrade treasure-map` / `uv tool uninstall treasure-map`.
+
+**Alternative (pipx):** if you already use pipx on a system Python ≥ 3.11, `pipx install
+"git+https://github.com/JoeyZzZzZz/treasure-map.git"` works too.
 
 ### Step 5 — Configure: `tmap init`
 
@@ -158,12 +156,13 @@ Two things that trip people up:
 ## Troubleshooting
 
 **Install:**
-- `tmap: command not found` right after `pipx install` — pipx's bin directory isn't on PATH yet.
-  Run `python3 -m pipx ensurepath`, open a new shell, and confirm `~/.local/bin` is on your
-  `PATH`. (If the shell suggests `apt install emboss`, ignore it — an unrelated package shipping
-  a different `tmap`.)
-- `requires a different Python: 3.8.x not in '>=3.11'` — your default Python is too old. Do Step 1,
-  then `pipx install --python python3.11 "git+https://github.com/JoeyZzZzZz/treasure-map.git"`.
+- `tmap: command not found` right after install — the tool's bin directory isn't on PATH yet.
+  Run `uv tool update-shell` (or `python3 -m pipx ensurepath` if you used pipx), open a new shell,
+  and confirm `~/.local/bin` is on your `PATH`. (If the shell suggests `apt install emboss`,
+  ignore it — an unrelated package shipping a different `tmap`.)
+- `requires a different Python: 3.8.x not in '>=3.11'` — the interpreter used to install is too
+  old. With uv this can't happen (`--python 3.11` fetches a managed 3.11); if you used pipx on an
+  old system Python, install with uv per Step 4 instead.
 
 **`tmap init` doctor** prints `name: ✅/❌ detail`. Common ❌ and fixes:
 
@@ -186,12 +185,6 @@ Treasure Map is at v0.x and the database schema is not yet stable. When
 upgrading, delete existing workspace directories and re-run `tmap analyze`:
 
     rm -rf <your-workspace-directory>
-
-## CLI alias
-
-The `tm` command is preserved as a deprecated alias for `tmap` to help
-existing users transition. It will be removed in v0.3. New documentation
-and examples use `tmap` exclusively.
 
 ## License
 

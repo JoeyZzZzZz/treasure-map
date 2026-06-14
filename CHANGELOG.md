@@ -24,6 +24,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   greendownload-class and stripped/empty-callee cases are unchanged. The A2 gate's `dormant`
   and `twins` views are honestly EMPTY in M2 (both require a sound `blocked` v1 cannot
   produce); the `density` view is unaffected and remains the A2 deliverable.
+- Docs: `uv` is now the recommended install method (`uv tool install --python 3.11
+  "git+…"`). uv brings its own managed CPython 3.11, so no system Python and no
+  deadsnakes/PPA is needed (the prior path failed on locked-down networks where Launchpad
+  is unreachable); pipx remains a one-line alternative.
+
+### Removed
+
+- **Breaking:** removed the `tm` command alias — only `tmap` ships now. (Pre-alpha with no
+  real user base; the README previously promised removal in v0.3, removed now instead.)
 
 ### Fixed
 
