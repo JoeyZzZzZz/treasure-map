@@ -102,11 +102,34 @@ def _configured_dirs(cfg: Config) -> list[Path]:
     return dirs
 
 
-def _write_config(config_path: Path, *, force: bool) -> None:
+def _noop_echo(_msg: str) -> None:
+    return None
+
+
+def _write_config(
+    config_path: Path, *, force: bool, echo: Callable[[str], None] = _noop_echo
+) -> None:
+    """Write the default config.yaml, or reuse an existing one (idempotent).
+
+    If the file is present and force is False, it is reused untouched — init is safe to
+    re-run and to run after a reinstall (the program is fresh but ~/.treasure-map/ persists).
+    force regenerates the default structure; it never touches .env or atlas.db.
+    """
     if config_path.exists() and not force:
-        raise FileExistsError(f"{config_path} already exists — pass --force to overwrite")
+        echo("  Config : config.yaml exists — reusing (pass --force to regenerate the structure).")
+        return
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(yaml.safe_dump(_DEFAULT_CONFIG_YAML, default_flow_style=False))
+
+
+def _existing_env_keys(env_path: Path) -> set[str]:
+    """Return the variable names already present in an existing .env (KEY=value lines)."""
+    keys: set[str] = set()
+    for line in env_path.read_text().splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            keys.add(stripped.split("=", 1)[0].strip())
+    return keys
 
 
 def _write_env(
@@ -115,8 +138,34 @@ def _write_env(
     env_vars: list[str],
     prompt: Callable[[str], str],
     non_interactive: bool,
+    echo: Callable[[str], None] = _noop_echo,
 ) -> None:
+    """Write .env on first run; on a re-run never clobber existing secrets (idempotent).
+
+    If .env already exists, present keys are preserved untouched and only configured vars
+    that are MISSING are prompted for and appended — pressing Enter on a re-run can never
+    wipe a saved key. This is independent of --force: init never regenerates or deletes .env.
+    """
     env_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if env_path.exists():
+        present = _existing_env_keys(env_path)
+        missing = [v for v in env_vars if v not in present]
+        if non_interactive or not missing:
+            echo(f"  Secrets: keeping existing .env ({len(present)} keys).")
+            return
+        appended: list[str] = []
+        for var_name in missing:
+            value = prompt(f"Enter value for {var_name} (press Enter to skip)").strip()
+            if value:
+                appended.append(f"{var_name}={value}\n")
+        if appended:
+            with env_path.open("a") as fh:
+                fh.write("".join(appended))
+        echo(f"  Secrets: kept existing .env ({len(present)} keys), added {len(appended)}.")
+        os.chmod(env_path, 0o600)
+        return
+
     lines: list[str] = []
     for var_name in env_vars:
         value = (
@@ -146,8 +195,16 @@ def _seed_watchlist() -> None:
         shutil.copy2(src, dst)
 
 
-def _noop_echo(_msg: str) -> None:
-    return None
+def _configured_ghidra_home(config_path: Path) -> Path | None:
+    """Return ghidra.local.home from an existing config.yaml, or None if unset/unreadable."""
+    if not config_path.exists():
+        return None
+    try:
+        data: dict[str, Any] = yaml.safe_load(config_path.read_text()) or {}
+    except Exception:
+        return None
+    home = (data.get("ghidra") or {}).get("local", {}).get("home")
+    return Path(os.path.expanduser(home)) if home else None
 
 
 def _set_ghidra_home(config_path: Path, home: Path) -> None:
@@ -176,6 +233,14 @@ def _configure_ghidra(
     from treasure_map.lib.analyze.ghidra_runner import find_headless
     from treasure_map.lib.config.config import GhidraConfig
     from treasure_map.lib.errors import GhidraNotFoundError
+
+    # Existing config wins: find_headless(GhidraConfig()) only checks GHIDRA_HOME/PATH, so a
+    # path already saved in config.yaml would otherwise be ignored and re-prompted in a new
+    # shell. Net effective order: existing config -> GHIDRA_HOME -> PATH -> prompt.
+    existing = _configured_ghidra_home(config_path)
+    if existing is not None and (existing / "support" / "analyzeHeadless").exists():
+        echo(f"  Ghidra : already configured at {existing}")
+        return
 
     try:
         headless = find_headless(GhidraConfig())
@@ -275,12 +340,13 @@ def run_init(
 
     if not check_only:
         _provision_dirs([tm_home])
-        _write_config(config_path, force=force)
+        _write_config(config_path, force=force, echo=echo)
         _write_env(
             env_path,
             env_vars=_collect_default_env_vars(),
             prompt=prompt,
             non_interactive=non_interactive,
+            echo=echo,
         )
         _seed_watchlist()
         _configure_ghidra(

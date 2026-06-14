@@ -187,12 +187,26 @@ Re-run `tmap init` after any fix to re-check.
 
 This project is in early development. APIs and behaviors will change.
 
-## Upgrading from earlier versions
+## Uninstalling
 
-Treasure Map is at v0.x and the database schema is not yet stable. When
-upgrading, delete existing workspace directories and re-run `tmap analyze`:
+Remove the tool itself — this leaves your data and config untouched:
+```bash
+uv tool uninstall treasure-map        # or, if you used pipx:  pipx uninstall treasure-map
+```
 
-    rm -rf <your-workspace-directory>
+Uninstalling **deliberately keeps `~/.treasure-map/`** — your `config.yaml`, API keys (`.env`),
+and especially **`atlas.db`**, the cross-firmware knowledge base that accumulates across runs and
+is never rebuilt. Reinstalling and running `tmap init` again simply reuses all of it (init is
+idempotent — it detects existing config and doesn't overwrite it; pass `--force` only if you want
+to regenerate `config.yaml`).
+
+If you truly want to wipe everything — keys, config, workspaces, **and the accumulated
+`atlas.db`**:
+```bash
+rm -rf ~/.treasure-map        # deletes your API keys AND atlas.db — not recoverable
+```
+**Not recommended.** `atlas.db` is the analysis data you've built up over time; deleting it throws
+that away for good. Across upgrades and reinstalls, prefer leaving `~/.treasure-map/` in place.
 
 ## License
 

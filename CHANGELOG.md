@@ -28,6 +28,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "git+…"`). uv brings its own managed CPython 3.11, so no system Python and no
   deadsnakes/PPA is needed (the prior path failed on locked-down networks where Launchpad
   is unreachable); pipx remains a one-line alternative.
+- `tmap init` is now idempotent: it reuses an existing `config.yaml` / `.env` / Ghidra
+  config instead of erroring (no more `FileExistsError` when reinstalling over a persisted
+  `~/.treasure-map/`). A re-run never clobbers `.env` (present keys are kept; only missing
+  ones are prompted for and appended); an already-configured + valid `ghidra.local.home` is
+  reused without re-prompting (effective order: existing config → `GHIDRA_HOME` → PATH →
+  prompt). `--force` regenerates `config.yaml` only — it never touches `.env` or `atlas.db`.
+- Docs: README documents how to uninstall (`uv tool uninstall treasure-map`) — which
+  deliberately keeps `~/.treasure-map/` (config, `.env`, the never-rebuilt `atlas.db`) — and
+  the not-recommended full wipe (`rm -rf ~/.treasure-map`), with a warning about losing keys
+  and the accumulated `atlas.db`. Removed the "Upgrading from earlier versions" section.
 
 ### Removed
 

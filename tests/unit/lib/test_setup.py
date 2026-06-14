@@ -19,6 +19,7 @@ from treasure_map.lib.setup.initializer import (
     _configure_ghidra,
     _provision_dirs,
     _run_doctor,
+    _set_ghidra_home,
     _write_config,
     _write_env,
     run_init,
@@ -113,12 +114,14 @@ def test_write_config_no_api_key_values(fake_home: Path) -> None:
             assert "sk-" not in line
 
 
-def test_write_config_raises_if_exists_without_force(fake_home: Path) -> None:
+def test_write_config_reuses_existing_without_force(fake_home: Path) -> None:
+    # Idempotent: an existing config.yaml is reused untouched, never an error (a fresh install
+    # over a persisted ~/.treasure-map/ must not read as "already initialized — aborting").
     config_path = fake_home / ".treasure-map" / "config.yaml"
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    _write_config(config_path, force=False)
-    with pytest.raises(FileExistsError, match="--force"):
-        _write_config(config_path, force=False)
+    config_path.write_text("custom: kept\n")
+    _write_config(config_path, force=False)  # must not raise
+    assert config_path.read_text() == "custom: kept\n"  # reused verbatim, not regenerated
 
 
 def test_write_config_force_overwrites(fake_home: Path) -> None:
@@ -205,10 +208,11 @@ def test_run_init_check_only_writes_nothing(fake_home: Path) -> None:
     assert not (fake_home / ".treasure-map" / ".env").exists()
 
 
-def test_run_init_raises_if_config_exists_without_force(fake_home: Path) -> None:
+def test_run_init_is_idempotent_second_call_succeeds(fake_home: Path) -> None:
+    # Re-running init (e.g. after a reinstall over a persisted ~/.treasure-map/) must succeed.
     run_init(force=False, non_interactive=True, prompt=_noop_prompt)
-    with pytest.raises(FileExistsError):
-        run_init(force=False, non_interactive=True, prompt=_noop_prompt)
+    run_init(force=False, non_interactive=True, prompt=_noop_prompt)  # must not raise
+    assert (fake_home / ".treasure-map" / "config.yaml").exists()
 
 
 def test_run_init_force_succeeds_on_second_call(fake_home: Path) -> None:
@@ -457,3 +461,55 @@ def test_prompt_messages_carry_no_trailing_colon(fake_home: Path) -> None:
     assert captured  # both prompts actually fired
     for msg in captured:
         assert not msg.rstrip().endswith(":"), f"message would double click's colon: {msg!r}"
+
+
+# ── run_init — idempotent re-run / reinstall (R0e) ────────────────────────────
+
+
+def test_reinit_preserves_existing_env_keys(fake_home: Path) -> None:
+    # A re-run where the user presses Enter must NOT wipe keys saved on the first run.
+    env_path = fake_home / ".treasure-map" / ".env"
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    env_path.write_text("DEEPSEEK_API_KEY=sk-saved-1\nANTHROPIC_API_KEY=sk-saved-2\n")
+
+    with patch(_FIND_HEADLESS, side_effect=GhidraNotFoundError("not found")):
+        run_init(non_interactive=False, prompt=_noop_prompt)  # Enter on every prompt
+
+    content = env_path.read_text()
+    assert "DEEPSEEK_API_KEY=sk-saved-1" in content
+    assert "ANTHROPIC_API_KEY=sk-saved-2" in content  # not clobbered
+
+
+def test_force_leaves_env_intact(fake_home: Path) -> None:
+    # --force regenerates config.yaml only; it must never touch .env (secrets).
+    env_path = fake_home / ".treasure-map" / ".env"
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    env_path.write_text("DEEPSEEK_API_KEY=sk-saved-1\n")
+
+    with patch(_FIND_HEADLESS, side_effect=GhidraNotFoundError("not found")):
+        run_init(force=True, non_interactive=True, prompt=_noop_prompt)
+
+    assert env_path.read_text() == "DEEPSEEK_API_KEY=sk-saved-1\n"
+
+
+def test_reinit_reuses_configured_ghidra_without_prompt(fake_home: Path) -> None:
+    # ghidra.local.home already set + valid: reuse it, do not re-prompt or re-detect.
+    root = _make_ghidra_root(fake_home)
+    config_path = fake_home / ".treasure-map" / "config.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_config(config_path, force=True)
+    _set_ghidra_home(config_path, root)
+
+    msgs: list[str] = []
+
+    def _record(msg: str) -> str:
+        msgs.append(msg)
+        return ""
+
+    # find_headless raises: if reuse fails, the only way to succeed would be the prompt — so a
+    # silent no-prompt run proves the existing config path was honored.
+    with patch(_FIND_HEADLESS, side_effect=GhidraNotFoundError("not found")):
+        _configure_ghidra(config_path, non_interactive=False, prompt=_record, echo=_noop_prompt)
+
+    assert not any("Ghidra install root" in m for m in msgs)  # not re-prompted
+    assert _ghidra_home(fake_home) == str(root)  # still configured
