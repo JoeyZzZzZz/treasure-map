@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from treasure_map.lib.atlas.models import InstanceRow
 from treasure_map.lib.errors import ConfigError
 
+_VALID_ORIGINS = ("custom", "vendor_modified_oss", "stock_oss_known", "unknown")
+
 
 @dataclass(frozen=True)
 class AtlasStats:
@@ -88,17 +90,21 @@ def _validate_instance(instance: InstanceRow, external_anchor: str | None) -> No
     if not (instance.pseudocode_hash or instance.evidence_ref):
         raise ConfigError("instance requires pseudocode_hash or evidence_ref (traceability)")
     if not instance.source_run_id:
-        raise ConfigError("instance.source_run_id must be non-empty (recurrence_breadth unit)")
+        raise ConfigError("instance.source_run_id must be non-empty (device_spread unit)")
+    if instance.origin not in _VALID_ORIGINS:
+        raise ConfigError(
+            f"instance.origin must be one of {list(_VALID_ORIGINS)}; got {instance.origin!r}"
+        )
     if instance.provenance_level in {"L2", "L3"} and not external_anchor:
         raise ConfigError(
             f"provenance_level={instance.provenance_level} requires a non-empty external_anchor"
         )
 
 
-def _recompute_recurrence_breadth(conn: sqlite3.Connection, pattern_id: int) -> None:
+def _recompute_device_spread(conn: sqlite3.Connection, pattern_id: int) -> None:
     conn.execute(
         """UPDATE pattern SET
-               recurrence_breadth = (
+               device_spread = (
                    SELECT COUNT(DISTINCT source_run_id)
                    FROM instance
                    WHERE pattern_id = ?
@@ -117,8 +123,8 @@ def add_instance(
 ) -> int:
     """Insert one instance; return instance_id. Commits.
 
-    Validates traceability, source_run_id, and L2/L3 anchor requirement.
-    Recomputes pattern.recurrence_breadth = COUNT(DISTINCT source_run_id) after insert.
+    Validates traceability, source_run_id, origin enum, and L2/L3 anchor requirement.
+    Recomputes pattern.device_spread = COUNT(DISTINCT source_run_id) after insert.
     """
     _validate_instance(instance, external_anchor)
 
@@ -126,8 +132,8 @@ def add_instance(
         """INSERT INTO instance
            (pattern_id, pseudocode_hash, source_anchor, sink_anchor, source_run_id,
             reachability_status, blocking_mechanism, provenance_level, external_anchor,
-            fix_diff, scope_origin, evidence_ref)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            fix_diff, scope_origin, evidence_ref, origin)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             instance.pattern_id,
             instance.pseudocode_hash,
@@ -141,9 +147,10 @@ def add_instance(
             instance.fix_diff,
             instance.scope_origin,
             instance.evidence_ref,
+            instance.origin,
         ),
     )
-    _recompute_recurrence_breadth(conn, instance.pattern_id)
+    _recompute_device_spread(conn, instance.pattern_id)
     conn.commit()
     return int(cur.lastrowid)  # type: ignore[arg-type]
 
@@ -157,7 +164,7 @@ def add_instances(
     """Insert a batch of instances in a single transaction; return AtlasStats. Commits.
 
     All instances share the same external_anchor. Validates each before any insert.
-    Recomputes recurrence_breadth for all touched patterns once at end.
+    Recomputes device_spread for all touched patterns once at end.
     """
     if not instances:
         return AtlasStats(patterns_touched=0, instances_added=0)
@@ -179,6 +186,7 @@ def add_instances(
             inst.fix_diff,
             inst.scope_origin,
             inst.evidence_ref,
+            inst.origin,
         )
         for inst in instances
     ]
@@ -186,14 +194,14 @@ def add_instances(
         """INSERT INTO instance
            (pattern_id, pseudocode_hash, source_anchor, sink_anchor, source_run_id,
             reachability_status, blocking_mechanism, provenance_level, external_anchor,
-            fix_diff, scope_origin, evidence_ref)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            fix_diff, scope_origin, evidence_ref, origin)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         rows,
     )
 
     pattern_ids = {inst.pattern_id for inst in instances}
     for pid in pattern_ids:
-        _recompute_recurrence_breadth(conn, pid)
+        _recompute_device_spread(conn, pid)
     conn.commit()
 
     return AtlasStats(patterns_touched=len(pattern_ids), instances_added=len(instances))

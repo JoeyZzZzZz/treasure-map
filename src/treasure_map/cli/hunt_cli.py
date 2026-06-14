@@ -100,7 +100,7 @@ def hunt_diff(
 
 @click.command("hunt-pattern", short_help="Find call-sequence shape candidates in a build.")
 @click.argument("db", type=click.Path(exists=True, dir_okay=False, path_type=Path))
-@click.option("--run-id", required=True, help="Neutral per-run id (the recurrence unit).")
+@click.option("--run-id", required=True, help="Neutral per-run id (the device_spread unit).")
 @click.option(
     "--device-category",
     default=None,
@@ -152,12 +152,12 @@ def hunt_pattern(
     )
     click.echo(
         "Note: every instance is a candidate/lead, not a confirmed result. With one firmware "
-        "the recurrence stays ~1 — cross-device recurrence needs more devices (future)."
+        "device_spread stays ~1 — cross-device spread needs more devices (future)."
     )
 
 
 @click.command("atlas-view", short_help="Neutral cross-firmware atlas aggregation views.")
-@click.argument("view", type=click.Choice(["dormant", "density", "twins"]))
+@click.argument("view", type=click.Choice(["dormant", "density", "twins", "ledger"]))
 @click.option(
     "--config",
     "-c",
@@ -176,7 +176,7 @@ def atlas_view(view: str, config: Path | None, atlas_path: Path | None) -> None:
     """Print a neutral atlas aggregation view. Every row is a lead/candidate, not a result."""
     from treasure_map.lib.atlas.connection import open_atlas
     from treasure_map.lib.config.config import load_config
-    from treasure_map.lib.query import density, dormant, twins
+    from treasure_map.lib.query import density, dormant, ledger, twins
 
     cfg = load_config(config)
     resolved_atlas = atlas_path if atlas_path is not None else cfg.atlas.db_path
@@ -199,13 +199,23 @@ def atlas_view(view: str, config: Path | None, atlas_path: Path | None) -> None:
                     f"  run={d.source_run_id} sink_class={d.sink_class} "
                     f"fp={d.structural_fingerprint} count={d.instance_count}"
                 )
-        else:  # twins
+        elif view == "twins":
             trows = twins(conn)
             click.echo(f"twins (same shape, mixed reachability status): {len(trows)}")
             for t in trows:
                 click.echo(
                     f"  fp={t.structural_fingerprint} sink_class={t.sink_class} "
                     f"blocked={t.blocked_count} non_blocked={t.non_blocked_count}"
+                )
+        else:  # ledger
+            lrows = ledger(conn)
+            click.echo(f"pattern ledger (device_spread vs pattern_breadth): {len(lrows)} patterns")
+            for lr in lrows:
+                click.echo(
+                    f"  pattern {lr.pattern_id} sink_class={lr.sink_class} "
+                    f"fp={lr.structural_fingerprint} "
+                    f"device_spread={lr.device_spread} pattern_breadth={lr.pattern_breadth} "
+                    f"algo={lr.fine_fp_algo_version}"
                 )
     finally:
         conn.close()

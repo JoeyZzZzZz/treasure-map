@@ -126,7 +126,7 @@ def run_analyzer1(
     """Diff db_a vs db_b, grade each changed function, and write neutral atlas instances.
 
     db_a is the baseline (where an unfixed flaw would live); run_id_a is the baseline's
-    neutral run id (the recurrence_breadth unit). Both analysis DBs are read-only; the
+    neutral run id (the device_spread unit). Both analysis DBs are read-only; the
     atlas is append-only. Never raises on a single bad lead — gaps are counted and logged.
     """
     result = run_diff(db_a, db_b, axis, router, max_assist=max_assist)

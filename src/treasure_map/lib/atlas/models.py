@@ -20,7 +20,7 @@ class PatternRow:
     structural_fingerprint: str | None = None
     fingerprint_algo_version: str = "v0"
     device_category: str | None = None
-    recurrence_breadth: int = 0
+    device_spread: int = 0
     pattern_id: int | None = None
     first_seen_at: str | None = None
     last_updated_at: str | None = None
@@ -42,5 +42,8 @@ class InstanceRow:
     fix_diff: str | None = None
     scope_origin: str | None = None
     evidence_ref: str | None = None
+    # Neutral origin dimension; not forced at ingest — defaults to 'unknown' (refined later
+    # at the aggregation layer). One of custom/vendor_modified_oss/stock_oss_known/unknown.
+    origin: str = "unknown"
     instance_id: int | None = None
     created_at: str | None = None

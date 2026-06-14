@@ -438,23 +438,23 @@ def test_view_semantics_combined(atlas_conn: sqlite3.Connection) -> None:
 
 
 # ---------------------------------------------------------------------------
-# recurrence_breadth — COUNT(DISTINCT source_run_id), uncapped
+# device_spread — COUNT(DISTINCT source_run_id), uncapped
 # ---------------------------------------------------------------------------
 
 
-def test_recurrence_breadth_three_distinct_runs(atlas_conn: sqlite3.Connection) -> None:
+def test_device_spread_three_distinct_runs(atlas_conn: sqlite3.Connection) -> None:
     pid = upsert_pattern(atlas_conn, source_class="sc", sink_class="snk", call_sequence_shape="s")
 
     for run_id in ("run-A", "run-B", "run-C"):
         add_instance(atlas_conn, _base_instance(pid, run_id))
 
     breadth = atlas_conn.execute(
-        "SELECT recurrence_breadth FROM pattern WHERE pattern_id = ?", (pid,)
+        "SELECT device_spread FROM pattern WHERE pattern_id = ?", (pid,)
     ).fetchone()[0]
     assert breadth == 3
 
 
-def test_recurrence_breadth_fourth_same_run_does_not_increase(
+def test_device_spread_fourth_same_run_does_not_increase(
     atlas_conn: sqlite3.Connection,
 ) -> None:
     pid = upsert_pattern(atlas_conn, source_class="sc", sink_class="snk", call_sequence_shape="s")
@@ -468,20 +468,20 @@ def test_recurrence_breadth_fourth_same_run_does_not_increase(
     )
 
     breadth = atlas_conn.execute(
-        "SELECT recurrence_breadth FROM pattern WHERE pattern_id = ?", (pid,)
+        "SELECT device_spread FROM pattern WHERE pattern_id = ?", (pid,)
     ).fetchone()[0]
     assert breadth == 3
 
 
-def test_recurrence_breadth_starts_at_zero(atlas_conn: sqlite3.Connection) -> None:
+def test_device_spread_starts_at_zero(atlas_conn: sqlite3.Connection) -> None:
     pid = upsert_pattern(atlas_conn, source_class="sc", sink_class="snk", call_sequence_shape="s")
     breadth = atlas_conn.execute(
-        "SELECT recurrence_breadth FROM pattern WHERE pattern_id = ?", (pid,)
+        "SELECT device_spread FROM pattern WHERE pattern_id = ?", (pid,)
     ).fetchone()[0]
     assert breadth == 0
 
 
-def test_recurrence_breadth_separate_patterns_independent(atlas_conn: sqlite3.Connection) -> None:
+def test_device_spread_separate_patterns_independent(atlas_conn: sqlite3.Connection) -> None:
     pid1 = upsert_pattern(
         atlas_conn, source_class="sc1", sink_class="snk", call_sequence_shape="s1"
     )
@@ -494,10 +494,10 @@ def test_recurrence_breadth_separate_patterns_independent(atlas_conn: sqlite3.Co
     add_instance(atlas_conn, _base_instance(pid2, "run-X"))
 
     breadth1 = atlas_conn.execute(
-        "SELECT recurrence_breadth FROM pattern WHERE pattern_id = ?", (pid1,)
+        "SELECT device_spread FROM pattern WHERE pattern_id = ?", (pid1,)
     ).fetchone()[0]
     breadth2 = atlas_conn.execute(
-        "SELECT recurrence_breadth FROM pattern WHERE pattern_id = ?", (pid2,)
+        "SELECT device_spread FROM pattern WHERE pattern_id = ?", (pid2,)
     ).fetchone()[0]
     assert breadth1 == 2
     assert breadth2 == 1
@@ -539,7 +539,7 @@ def test_add_instances_validates_before_insert(atlas_conn: sqlite3.Connection) -
     assert count == 0
 
 
-def test_add_instances_recurrence_breadth_updated(atlas_conn: sqlite3.Connection) -> None:
+def test_add_instances_device_spread_updated(atlas_conn: sqlite3.Connection) -> None:
     pid = upsert_pattern(atlas_conn, source_class="sc", sink_class="snk", call_sequence_shape="s")
     instances = [
         InstanceRow(pattern_id=pid, pseudocode_hash=f"h{i}", source_run_id=f"run-{i}")
@@ -547,9 +547,119 @@ def test_add_instances_recurrence_breadth_updated(atlas_conn: sqlite3.Connection
     ]
     add_instances(atlas_conn, instances)
     breadth = atlas_conn.execute(
-        "SELECT recurrence_breadth FROM pattern WHERE pattern_id = ?", (pid,)
+        "SELECT device_spread FROM pattern WHERE pattern_id = ?", (pid,)
     ).fetchone()[0]
     assert breadth == 5
+
+
+# ---------------------------------------------------------------------------
+# origin — default unknown, not forced at ingest; enum validated
+# ---------------------------------------------------------------------------
+
+
+def test_instance_origin_defaults_to_unknown(atlas_conn: sqlite3.Connection) -> None:
+    pid = upsert_pattern(atlas_conn, source_class="sc", sink_class="snk", call_sequence_shape="s")
+    iid = add_instance(atlas_conn, _base_instance(pid))
+    origin = atlas_conn.execute(
+        "SELECT origin FROM instance WHERE instance_id = ?", (iid,)
+    ).fetchone()[0]
+    assert origin == "unknown"
+
+
+def test_instance_origin_explicit_value_persists(atlas_conn: sqlite3.Connection) -> None:
+    pid = upsert_pattern(atlas_conn, source_class="sc", sink_class="snk", call_sequence_shape="s")
+    iid = add_instance(
+        atlas_conn,
+        InstanceRow(pattern_id=pid, pseudocode_hash="h", source_run_id="run-A", origin="custom"),
+    )
+    origin = atlas_conn.execute(
+        "SELECT origin FROM instance WHERE instance_id = ?", (iid,)
+    ).fetchone()[0]
+    assert origin == "custom"
+
+
+def test_add_instance_rejects_illegal_origin(atlas_conn: sqlite3.Connection) -> None:
+    pid = upsert_pattern(atlas_conn, source_class="sc", sink_class="snk", call_sequence_shape="s")
+    with pytest.raises(ConfigError, match="origin"):
+        add_instance(
+            atlas_conn,
+            InstanceRow(pattern_id=pid, pseudocode_hash="h", source_run_id="run-A", origin="bogus"),
+        )
+
+
+# ---------------------------------------------------------------------------
+# in-place migration — old atlas (no origin, recurrence_breadth) brought forward
+# ---------------------------------------------------------------------------
+
+# A minimal pre-migration atlas: pattern carries recurrence_breadth (old name), instance has
+# no origin column. open_atlas must add origin (default unknown) and rename the column without
+# dropping any rows.
+_OLD_SCHEMA = """
+CREATE TABLE pattern (
+    pattern_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_class TEXT NOT NULL, sink_class TEXT NOT NULL, call_sequence_shape TEXT NOT NULL,
+    structural_fingerprint TEXT, fingerprint_algo_version TEXT NOT NULL DEFAULT 'v0',
+    device_category TEXT, recurrence_breadth INTEGER NOT NULL DEFAULT 0,
+    first_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE instance (
+    instance_id INTEGER PRIMARY KEY AUTOINCREMENT, pattern_id INTEGER NOT NULL,
+    pseudocode_hash TEXT, source_anchor TEXT, sink_anchor TEXT, source_run_id TEXT,
+    reachability_status TEXT NOT NULL DEFAULT 'unknown', blocking_mechanism TEXT,
+    provenance_level TEXT NOT NULL DEFAULT 'L0', external_anchor TEXT, fix_diff TEXT,
+    scope_origin TEXT, evidence_ref TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+
+def _cols(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def test_open_atlas_migrates_old_schema_in_place(tmp_path: Path) -> None:
+    db_path = tmp_path / "atlas.db"
+    old = sqlite3.connect(db_path)
+    old.executescript(_OLD_SCHEMA)
+    old.execute(
+        "INSERT INTO pattern (source_class, sink_class, call_sequence_shape, recurrence_breadth) "
+        "VALUES ('sc', 'snk', 'shape', 2)"
+    )
+    old.execute(
+        "INSERT INTO instance (pattern_id, pseudocode_hash, source_run_id) VALUES (1, 'h1', 'r1')"
+    )
+    old.execute(
+        "INSERT INTO instance (pattern_id, pseudocode_hash, source_run_id) VALUES (1, 'h2', 'r2')"
+    )
+    old.commit()
+    old.close()
+
+    conn = open_atlas(db_path)
+    try:
+        inst_cols = _cols(conn, "instance")
+        pat_cols = _cols(conn, "pattern")
+        assert "origin" in inst_cols  # added
+        assert "device_spread" in pat_cols  # renamed
+        assert "recurrence_breadth" not in pat_cols  # old name gone
+        # existing rows preserved; the added column took its default on the old rows
+        rows = conn.execute("SELECT origin FROM instance ORDER BY instance_id").fetchall()
+        assert [r[0] for r in rows] == ["unknown", "unknown"]
+        assert conn.execute("SELECT COUNT(*) FROM instance").fetchone()[0] == 2
+        assert conn.execute("SELECT COUNT(*) FROM pattern").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_open_atlas_migration_is_idempotent(tmp_path: Path) -> None:
+    # Re-opening an already-migrated atlas is a no-op and never raises.
+    db_path = tmp_path / "atlas.db"
+    open_atlas(db_path).close()
+    conn = open_atlas(db_path)
+    try:
+        assert "origin" in _cols(conn, "instance")
+        assert "device_spread" in _cols(conn, "pattern")
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------

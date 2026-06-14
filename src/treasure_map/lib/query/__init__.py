@@ -8,6 +8,24 @@ nothing here scores, ranks, or judges.
 
 from __future__ import annotations
 
-from treasure_map.lib.query.views import DensityRow, TwinRow, density, dormant, twins
+from treasure_map.lib.query.views import (
+    FINE_FP_ALGO_VERSION,
+    DensityRow,
+    LedgerRow,
+    TwinRow,
+    density,
+    dormant,
+    ledger,
+    twins,
+)
 
-__all__ = ["DensityRow", "TwinRow", "density", "dormant", "twins"]
+__all__ = [
+    "FINE_FP_ALGO_VERSION",
+    "DensityRow",
+    "LedgerRow",
+    "TwinRow",
+    "density",
+    "dormant",
+    "ledger",
+    "twins",
+]

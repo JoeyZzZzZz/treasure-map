@@ -12,6 +12,10 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 
+# M2 fine fingerprint = instance.pseudocode_hash. Every surfaced pattern_breadth carries this
+# so the count is never read apart from the algorithm version it was computed under.
+FINE_FP_ALGO_VERSION = "fp0:pseudocode_hash"
+
 
 @dataclass(frozen=True)
 class DensityRow:
@@ -31,6 +35,25 @@ class TwinRow:
     sink_class: str
     blocked_count: int
     non_blocked_count: int
+
+
+@dataclass(frozen=True)
+class LedgerRow:
+    """The two derived recurrence ledgers for one pattern, computed on read.
+
+    device_spread   = distinct source_run_id over the pattern's instances (exposure; counts
+                      every instance).
+    pattern_breadth = distinct fine fingerprints (pseudocode_hash) over instances with origin
+                      in (custom, unknown); a provisional upper bound under
+                      fine_fp_algo_version (included origins = custom, unknown).
+    """
+
+    pattern_id: int
+    sink_class: str
+    structural_fingerprint: str | None
+    device_spread: int
+    pattern_breadth: int
+    fine_fp_algo_version: str
 
 
 def dormant(conn: sqlite3.Connection) -> list[sqlite3.Row]:
@@ -69,6 +92,31 @@ def twins(conn: sqlite3.Connection) -> list[TwinRow]:
             sink_class=r["sink_class"],
             blocked_count=int(r["blocked_count"]),
             non_blocked_count=int(r["non_blocked_count"]),
+        )
+        for r in rows
+    ]
+
+
+def ledger(conn: sqlite3.Connection) -> list[LedgerRow]:
+    """Return the two derived ledgers per pattern (computed on read, never stored frozen).
+
+    pattern_breadth = distinct fine fingerprints (pseudocode_hash) over origin in
+    (custom, unknown); a provisional upper bound under FINE_FP_ALGO_VERSION (included origins
+    = custom, unknown). device_spread = distinct source_run_id (exposure).
+    """
+    rows = conn.execute(
+        "SELECT pattern_id, sink_class, structural_fingerprint, device_spread, pattern_breadth "
+        "FROM pattern_ledger "
+        "ORDER BY pattern_breadth DESC, device_spread DESC, pattern_id"
+    ).fetchall()
+    return [
+        LedgerRow(
+            pattern_id=int(r["pattern_id"]),
+            sink_class=r["sink_class"],
+            structural_fingerprint=r["structural_fingerprint"],
+            device_spread=int(r["device_spread"]),
+            pattern_breadth=int(r["pattern_breadth"]),
+            fine_fp_algo_version=FINE_FP_ALGO_VERSION,
         )
         for r in rows
     ]

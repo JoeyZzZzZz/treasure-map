@@ -15,11 +15,42 @@ from pathlib import Path
 _SCHEMA_PATH = Path(__file__).parent.parent / "storage" / "atlas_schema.sql"
 
 
+def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Apply in-place, idempotent migrations the IF-NOT-EXISTS schema cannot.
+
+    CREATE TABLE IF NOT EXISTS never adds a column to (or renames a column on) a table that
+    already exists, so an atlas written by an older schema would keep its old shape. These
+    ALTER TABLEs run only when the target column is missing, so the rows are preserved.
+    """
+    inst_cols = _column_names(conn, "instance")
+    if inst_cols and "origin" not in inst_cols:
+        # SQLite >= 3.25 allows ADD COLUMN with NOT NULL DEFAULT and a column-level CHECK;
+        # if a build rejects the CHECK, fall back to the plain column and rely on the
+        # writer-side enum validation. Existing rows take the default 'unknown'.
+        try:
+            conn.execute(
+                "ALTER TABLE instance ADD COLUMN origin TEXT NOT NULL DEFAULT 'unknown' "
+                "CHECK (origin IN ('custom','vendor_modified_oss','stock_oss_known','unknown'))"
+            )
+        except sqlite3.OperationalError:
+            conn.execute("ALTER TABLE instance ADD COLUMN origin TEXT NOT NULL DEFAULT 'unknown'")
+
+    pat_cols = _column_names(conn, "pattern")
+    if "recurrence_breadth" in pat_cols and "device_spread" not in pat_cols:
+        conn.execute("ALTER TABLE pattern RENAME COLUMN recurrence_breadth TO device_spread")
+
+
 def open_atlas(db_path: Path) -> sqlite3.Connection:
     """Open (or create) the atlas SQLite database and apply the schema.
 
-    The schema uses IF NOT EXISTS throughout, so re-applying it to an existing
-    database is safe and preserves all rows.
+    The schema uses IF NOT EXISTS throughout, so re-applying it to an existing database is
+    safe and preserves all rows. An older atlas is then brought forward in place by _migrate
+    (adds instance.origin, renames pattern.recurrence_breadth -> device_spread) — never by a
+    table rebuild, so existing instance rows are never lost.
 
     WARNING: Moving atlas.db requires sqlite3 .backup() or wal_checkpoint(TRUNCATE)
     before any file-copy — never a bare cp while WAL side-files exist.
@@ -29,5 +60,6 @@ def open_atlas(db_path: Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     schema = _SCHEMA_PATH.read_text()
     conn.executescript(schema)
+    _migrate(conn)
     conn.commit()
     return conn

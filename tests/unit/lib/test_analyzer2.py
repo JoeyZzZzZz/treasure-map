@@ -181,7 +181,7 @@ def test_parameter_sourced_match_is_unknown_l0(tmp_path: Path) -> None:
     assert row["provenance_level"] == "L0"
 
 
-# ── append-only: second run accumulates, recurrence_breadth recomputed ──────────────
+# ── append-only: second run accumulates, device_spread recomputed ──────────────────
 
 
 def test_second_run_appends_and_recomputes_breadth(tmp_path: Path) -> None:
@@ -193,7 +193,7 @@ def test_second_run_appends_and_recomputes_breadth(tmp_path: Path) -> None:
     assert len(_instances(atlas)) == 2
     conn = open_atlas(atlas)
     try:
-        breadth = conn.execute("SELECT MAX(recurrence_breadth) FROM pattern").fetchone()[0]
+        breadth = conn.execute("SELECT MAX(device_spread) FROM pattern").fetchone()[0]
     finally:
         conn.close()
     assert breadth == 2  # two distinct source_run_id over the same fingerprint

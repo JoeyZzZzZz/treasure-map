@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS pattern (
     structural_fingerprint   TEXT,
     fingerprint_algo_version TEXT NOT NULL DEFAULT 'v0',
     device_category          TEXT,             -- generic ONLY: router/camera/nas; NEVER vendor/model
-    recurrence_breadth       INTEGER NOT NULL DEFAULT 0,  -- COUNT(DISTINCT source_run_id) — see writer
+    device_spread            INTEGER NOT NULL DEFAULT 0,  -- exposure ledger: COUNT(DISTINCT source_run_id); device distribution, NOT the pattern-recurrence number
     first_seen_at            DATETIME DEFAULT CURRENT_TIMESTAMP,
     last_updated_at          DATETIME DEFAULT CURRENT_TIMESTAMP
 );
@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS instance (
     pseudocode_hash     TEXT,             -- deterministic content hash of the evidence function
     source_anchor       TEXT,             -- located via name/address/string/diff (stripped-safe)
     sink_anchor         TEXT,
-    source_run_id       TEXT,             -- NEUTRAL per-firmware-run id (recurrence_breadth unit); vendor-free
+    source_run_id       TEXT,             -- NEUTRAL per-firmware-run id (device_spread unit); vendor-free
     reachability_status TEXT NOT NULL DEFAULT 'unknown'
         CHECK (reachability_status IN ('confirmed','blocked','unknown')),
     blocking_mechanism  TEXT,             -- categorical: char_filter/length_check/... NULL if none
@@ -34,6 +34,9 @@ CREATE TABLE IF NOT EXISTS instance (
     fix_diff            TEXT,             -- neutral change region; redact on export
     scope_origin        TEXT,             -- intra_firmware | intra_vendor | cross_vendor
     evidence_ref        TEXT,             -- provenance trail to source analysis.db + binary/function
+    -- origin is not forced at ingest; default unknown is expected (refined later at aggregation)
+    origin              TEXT NOT NULL DEFAULT 'unknown'
+        CHECK (origin IN ('custom','vendor_modified_oss','stock_oss_known','unknown')),
     created_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
     -- traceability (anti-orphan): an instance must trace to source evidence
     CHECK (pseudocode_hash IS NOT NULL OR evidence_ref IS NOT NULL),
@@ -76,6 +79,25 @@ CREATE VIEW IF NOT EXISTS twin_candidate AS
   WHERE p.structural_fingerprint IS NOT NULL
   GROUP BY p.structural_fingerprint, p.sink_class
   HAVING blocked_count >= 1 AND non_blocked_count >= 1;
+
+-- pattern_ledger: the two derived recurrence ledgers, computed on read (never frozen scalars).
+--   device_spread   = COUNT(DISTINCT source_run_id) over the pattern's instances.
+--   pattern_breadth = COUNT(DISTINCT pseudocode_hash) over the pattern's instances with
+--                     origin IN ('custom','unknown') and pseudocode_hash IS NOT NULL — the count
+--                     of distinct fine fingerprints (M2 fine fingerprint = pseudocode_hash).
+-- The stored pattern.device_spread column is a write-side convenience counter with the same
+-- definition; this view's device_spread is the read-side authority and should agree with it.
+CREATE VIEW IF NOT EXISTS pattern_ledger AS
+  SELECT p.pattern_id              AS pattern_id,
+         p.sink_class              AS sink_class,
+         p.structural_fingerprint  AS structural_fingerprint,
+         (SELECT COUNT(DISTINCT i.source_run_id) FROM instance i
+          WHERE i.pattern_id = p.pattern_id)                       AS device_spread,
+         (SELECT COUNT(DISTINCT i.pseudocode_hash) FROM instance i
+          WHERE i.pattern_id = p.pattern_id
+            AND i.origin IN ('custom','unknown')
+            AND i.pseudocode_hash IS NOT NULL)                     AS pattern_breadth
+  FROM pattern p;
 
 CREATE INDEX IF NOT EXISTS idx_pattern_classes ON pattern(source_class, sink_class);
 CREATE INDEX IF NOT EXISTS idx_pattern_fp      ON pattern(structural_fingerprint);

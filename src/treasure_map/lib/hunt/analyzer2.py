@@ -75,7 +75,7 @@ def run_analyzer2(
 ) -> Analyzer2Stats:
     """Scan one analysis.db for shape candidates, grade them, and write atlas instances.
 
-    source_run_id is the neutral per-run id (the recurrence_breadth unit). device_category,
+    source_run_id is the neutral per-run id (the device_spread unit). device_category,
     if given, must be a GENERIC category (router/camera/nas), never a vendor/model. The
     analysis DB is read-only; the atlas is append-only. Raw evidence is never persisted.
     """

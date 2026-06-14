@@ -226,8 +226,8 @@ def test_second_run_appends(tmp_path: Path) -> None:
     assert len(_instances(atlas)) == 2  # accumulated, not wiped
     conn = open_atlas(atlas)
     try:
-        # Same coarse pattern, two distinct run ids -> recurrence_breadth == 2.
-        breadth = conn.execute("SELECT MAX(recurrence_breadth) FROM pattern").fetchone()[0]
+        # Same coarse pattern, two distinct run ids -> device_spread == 2.
+        breadth = conn.execute("SELECT MAX(device_spread) FROM pattern").fetchone()[0]
     finally:
         conn.close()
     assert breadth == 2
