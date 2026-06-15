@@ -225,3 +225,83 @@ def test_cli_include_gated_shows_gated(tmp_path: Path) -> None:
     )
     assert result_all.exit_code == 0, result_all.output
     assert "gt_fn" in result_all.output
+
+
+# ── CLI: global ranking (highest score first), stable rank, --explain by # ──────────
+
+
+def _rank_of(output: str, fn: str) -> int | None:
+    for line in output.splitlines():
+        if f" {fn} (" in line:
+            return int(line.split()[0])
+    return None
+
+
+def _first_data_fn(output: str) -> str | None:
+    # the first row after the column header line
+    lines = output.splitlines()
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith("#") and "score" in line:
+            return lines[i + 1].split()[3]  # rank, score, status, function
+    return None
+
+
+def test_cli_highest_score_floats_to_top(tmp_path: Path) -> None:
+    # rc_fn (confirmed -> reachable, top score) must be rank 1 and the first row, ABOVE the
+    # lower-scored to-verify rows — the bug was reachable getting buried below to-verify.
+    atlas = _seed_for_cli(tmp_path)
+    result = CliRunner().invoke(triage_cmd, ["run_cli", "--atlas", str(atlas)])
+    assert result.exit_code == 0, result.output
+    assert _rank_of(result.output, "rc_fn") == 1
+    assert _first_data_fn(result.output) == "rc_fn"
+    assert result.output.index("rc_fn") < result.output.index("tv_fn")
+
+
+def test_cli_rank_is_stable_across_filters(tmp_path: Path) -> None:
+    atlas = _seed_for_cli(tmp_path)
+    out_all = CliRunner().invoke(triage_cmd, ["run_cli", "--status", "all", "--atlas", str(atlas)])
+    out_reach = CliRunner().invoke(
+        triage_cmd, ["run_cli", "--status", "reachable", "--atlas", str(atlas)]
+    )
+    out_top = CliRunner().invoke(triage_cmd, ["run_cli", "--top", "5", "--atlas", str(atlas)])
+    out_gated = CliRunner().invoke(
+        triage_cmd, ["run_cli", "--status", "gated", "--atlas", str(atlas)]
+    )
+    # rc_fn's global rank is identical no matter the filter/top.
+    assert _rank_of(out_all.output, "rc_fn") == 1
+    assert _rank_of(out_reach.output, "rc_fn") == 1
+    assert _rank_of(out_top.output, "rc_fn") == 1
+    # a gated-only view keeps the GLOBAL rank (3), not a per-view #1.
+    assert _rank_of(out_gated.output, "gt_fn") == 3
+
+
+def test_cli_top_n_is_global_front(tmp_path: Path) -> None:
+    # --top 1 shows the single highest-scored candidate globally (rc_fn), not "1 per section".
+    atlas = _seed_for_cli(tmp_path)
+    result = CliRunner().invoke(triage_cmd, ["run_cli", "--top", "1", "--atlas", str(atlas)])
+    assert result.exit_code == 0, result.output
+    assert "rc_fn" in result.output
+    assert "tv_fn" not in result.output
+
+
+def test_cli_explain_by_rank_matches_ref(tmp_path: Path) -> None:
+    atlas = _seed_for_cli(tmp_path)
+    conn = open_atlas(atlas)
+    try:
+        ref0 = triage(conn, run_id="run_cli")[0].evidence_ref  # rank-1 candidate's ref
+    finally:
+        conn.close()
+    by_rank = CliRunner().invoke(triage_cmd, ["run_cli", "--explain", "1", "--atlas", str(atlas)])
+    by_ref = CliRunner().invoke(
+        triage_cmd, ["run_cli", "--explain", str(ref0), "--atlas", str(atlas)]
+    )
+    assert by_rank.exit_code == 0, by_rank.output
+    assert by_ref.exit_code == 0, by_ref.output
+    assert by_rank.output == by_ref.output  # --explain N resolves to the same candidate as its ref
+
+
+def test_cli_explain_rank_out_of_range_errors(tmp_path: Path) -> None:
+    atlas = _seed_for_cli(tmp_path)
+    result = CliRunner().invoke(triage_cmd, ["run_cli", "--explain", "999", "--atlas", str(atlas)])
+    assert result.exit_code != 0
+    assert "out of range" in result.output

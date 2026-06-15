@@ -155,11 +155,6 @@ def hunt_pattern(
 
 
 _SECTION_ORDER = ("to-verify", "reachable", "gated")
-_SECTION_HEADER = {
-    "to-verify": "TO-VERIFY  (ranked — start reverse-engineering from the top)",
-    "reachable": "REACHABLE  (already path-confirmed within one function — verify by hand)",
-    "gated": "GATED  (a filter/guard was identified — likely dormant/false)",
-}
 
 
 def _render_triage(
@@ -171,15 +166,23 @@ def _render_triage(
     include_gated: bool,
     as_json: bool,
 ) -> None:
-    """Render a ranked triage candidate list. Shared by `tmap triage` and `tmap scan` so the
-    two emit byte-identical output (single source of truth, no drift)."""
+    """Render the ranked triage list. Shared by `tmap triage` and `tmap scan` so the two emit
+    byte-identical output (single source of truth, no drift).
+
+    candidates arrives in global score-descending order (triage() sorted it). The row number #
+    is the STABLE global rank (1 = highest score), fixed before any --top/--status/gated filter,
+    so #N always names the same candidate and is safe to pass to --explain. Rows are shown as one
+    global-descending list (highest score first); review_status is just a per-row label."""
     import json
 
     counts = {"reachable": 0, "to-verify": 0, "gated": 0}
     for c in candidates:
         counts[c.review_status] = counts.get(c.review_status, 0) + 1
 
-    # Decide which review statuses to display.
+    # Stable global rank, assigned over the FULL list before filtering/truncation.
+    ranked = list(enumerate(candidates, 1))  # [(rank, candidate), ...]
+
+    # Decide which review statuses to display (rank is unaffected by this).
     if status == "all":
         shown_statuses = set(_SECTION_ORDER)
     elif status is not None:
@@ -189,13 +192,14 @@ def _render_triage(
         if include_gated:
             shown_statuses.add("gated")
 
-    visible = [c for c in candidates if c.review_status in shown_statuses][:top_n]
+    visible = [(r, c) for r, c in ranked if c.review_status in shown_statuses][:top_n]
 
     if as_json:
         click.echo(
             json.dumps(
                 [
                     {
+                        "rank": r,
                         "score": c.score,
                         "review_status": c.review_status,
                         "reachability_status": c.reachability_status,
@@ -208,7 +212,7 @@ def _render_triage(
                         "source_run_id": c.source_run_id,
                         "evidence_ref": c.evidence_ref,
                     }
-                    for c in visible
+                    for r, c in visible
                 ],
                 indent=2,
             )
@@ -220,28 +224,19 @@ def _render_triage(
         f"{counts['reachable']} reachable, {counts['to-verify']} to-verify, "
         f"{counts['gated']} gated)"
     )
-    rank = 0
-    for section in _SECTION_ORDER:
-        if section not in shown_statuses:
-            continue
-        rows = [c for c in visible if c.review_status == section]
-        if not rows:
-            continue
-        click.echo(f"\n  {_SECTION_HEADER[section]}")
-        click.echo("  #   score  status      function (evidence_ref)        source->sink   filter")
-        for c in rows:
-            rank += 1
-            fltr = c.blocking_mechanism if c.blocking_mechanism else "none"
-            click.echo(
-                f"  {rank:<3} {c.score:<5.2f}  {c.review_status:<10}  "
-                f"{c.function or '?'} ({c.evidence_ref or '?'})   "
-                f"{c.source_class} -> {c.sink_anchor or '?'}   {fltr}"
-            )
+    click.echo("  #   score  status      function (evidence_ref)        source->sink   filter")
+    for r, c in visible:
+        fltr = c.blocking_mechanism if c.blocking_mechanism else "none"
+        click.echo(
+            f"  {r:<3} {c.score:<5.2f}  {c.review_status:<10}  "
+            f"{c.function or '?'} ({c.evidence_ref or '?'})   "
+            f"{c.source_class} -> {c.sink_anchor or '?'}   {fltr}"
+        )
     if "gated" not in shown_statuses and counts["gated"]:
         click.echo(f"\n  (gated: {counts['gated']} hidden; --include-gated to show)")
     click.echo(
         "\nNote: candidates are leads for manual review, ranked by how much they warrant "
-        "reverse-engineering — NOT confirmed results."
+        "reverse-engineering — NOT confirmed results. Lower # = look first."
     )
 
 
@@ -354,7 +349,7 @@ def _reachability_inline(status: str) -> str:
     "--explain",
     "explain_ref",
     default=None,
-    help="Explain ONE candidate by its evidence_ref (run#fnID): score breakdown, structure, "
+    help="Explain ONE candidate by its # (rank) or evidence_ref: score breakdown, structure, "
     "honest bounds, and a manual-verify checklist. Ignores --top/--status.",
 )
 @click.option(
@@ -384,10 +379,11 @@ def triage(
 ) -> None:
     """Rank atlas candidates by how much they warrant manual reverse-engineering.
 
-    Read-only: nothing is written back to the atlas and no field is altered. Each row carries
-    its evidence_ref ({run_id}#fn{func_id}) — the anchor to jump back to analysis.db / Ghidra.
-    Candidates are leads for manual review, NOT confirmed results. Use --explain <evidence_ref>
-    for a single-candidate breakdown.
+    Read-only: nothing is written back to the atlas and no field is altered. Rows are ranked by
+    score (highest first); the # is a stable global rank (lower # = look first) and each row also
+    carries its evidence_ref ({run_id}#fn{func_id}@{sink}) — the anchor to jump back to
+    analysis.db / Ghidra. Candidates are leads, NOT confirmed results. Use --explain <#|ref> for a
+    single-candidate breakdown.
     """
     from treasure_map.lib.atlas.connection import open_atlas
     from treasure_map.lib.config.config import load_config
@@ -397,16 +393,36 @@ def triage(
     selected_run = run_opt if run_opt is not None else run_id
     cfg = load_config(config)
     resolved_atlas = atlas_path if atlas_path is not None else cfg.atlas.db_path
+
+    explanation: CandidateExplanation | None = None
+    error: str | None = None
     conn = open_atlas(resolved_atlas)
     try:
         if explain_ref is not None:
-            explanation = explain_candidate(conn, explain_ref)
+            if explain_ref.isdigit():
+                # --explain N: resolve the Nth candidate in the SAME global score-descending order
+                # the rendered # uses, then reuse the evidence_ref path. No new explain logic.
+                cands = run_triage(conn, run_id=selected_run)
+                n = int(explain_ref)
+                if 1 <= n <= len(cands):
+                    ref = cands[n - 1].evidence_ref
+                    explanation = explain_candidate(conn, ref) if ref else None
+                else:
+                    run_hint = selected_run if selected_run is not None else "<run>"
+                    error = (
+                        f"rank {n} out of range; {len(cands)} candidates — "
+                        f"run `tmap triage {run_hint}` to list"
+                    )
+            else:
+                explanation = explain_candidate(conn, explain_ref)
         else:
             candidates = run_triage(conn, run_id=selected_run)
     finally:
         conn.close()
 
     if explain_ref is not None:
+        if error is not None:
+            raise click.ClickException(error)
         if explanation is None:
             run_hint = explain_ref.split("#", 1)[0] if "#" in explain_ref else "<run>"
             raise click.ClickException(

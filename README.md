@@ -141,16 +141,18 @@ the two stores decouple on purpose (`analysis.db` is wipe-and-rebuild; the atlas
 ```bash
 tmap analyze ./_firmware.extracted -w router_v1                                  # -> analysis.db
 tmap hunt-pattern router_v1/analysis.db --run-id router_v1                       # -> atlas
-tmap triage router_v1                                                            # ranked list
-tmap triage router_v1 --explain <evidence_ref>   # one candidate: why this score, structure, bounds, where to verify
+tmap triage router_v1                # ranked globally by score; lower # = look first (top reachable on top)
+tmap triage router_v1 --explain 1    # explain rank #1 (also accepts --explain <evidence_ref>)
 ```
 
-`--explain <evidence_ref>` (the `{run_id}#fn{func_id}` shown on each row) opens a single candidate:
-an itemized breakdown of **why its score is what it is** (each point maps to a real signal), the
-call structure, the **honest bounds** (reachability is single-function/L1, no caller traced, no
-cross-function flow; `external_input` is a class label, not a trace), and a **manual-verify
-checklist** with anchors. It explains evidence so you (or an AI) can judge and verify — it does
-**not** declare the candidate a real issue and prints **no triggering input**.
+`tmap triage` lists candidates in one global score-descending order — the `#` is a **stable rank**
+(1 = highest, look first) that names the same candidate regardless of `--top`/`--status`, so you can
+pass it straight to `--explain`. `--explain <#|evidence_ref>` opens a single candidate: an itemized
+breakdown of **why its score is what it is** (each point maps to a real signal), the call structure,
+the **honest bounds** (reachability is single-function/L1, no caller traced, no cross-function flow;
+`external_input` is a class label, not a trace), and a **manual-verify checklist** with anchors. It
+explains evidence so you (or an AI) can judge and verify — it does **not** declare the candidate a
+real issue and prints **no triggering input**.
 
 **`-w/--workspace` takes a name *or* a path:**
 - a **bare name** (`-w router_v1`) is managed for you under your workspace base —
