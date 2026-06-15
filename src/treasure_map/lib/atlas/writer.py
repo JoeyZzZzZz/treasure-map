@@ -33,7 +33,6 @@ def upsert_pattern(
     call_sequence_shape: str,
     structural_fingerprint: str | None = None,
     fingerprint_algo_version: str = "v0",
-    device_category: str | None = None,
 ) -> int:
     """Find-or-create a pattern row; return pattern_id. Commits.
 
@@ -70,15 +69,14 @@ def upsert_pattern(
     cur = conn.execute(
         """INSERT INTO pattern
            (source_class, sink_class, call_sequence_shape,
-            structural_fingerprint, fingerprint_algo_version, device_category)
-           VALUES (?, ?, ?, ?, ?, ?)""",
+            structural_fingerprint, fingerprint_algo_version)
+           VALUES (?, ?, ?, ?, ?)""",
         (
             source_class,
             sink_class,
             call_sequence_shape,
             structural_fingerprint,
             fingerprint_algo_version,
-            device_category,
         ),
     )
     conn.commit()

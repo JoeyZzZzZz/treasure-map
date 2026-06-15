@@ -71,13 +71,11 @@ def run_analyzer2(
     atlas_path: Path | str,
     *,
     source_run_id: str,
-    device_category: str | None = None,
 ) -> Analyzer2Stats:
     """Scan one analysis.db for shape candidates, grade them, and write atlas instances.
 
-    source_run_id is the neutral per-run id (the device_spread unit). device_category,
-    if given, must be a GENERIC category (router/camera/nas), never a vendor/model. The
-    analysis DB is read-only; the atlas is append-only. Raw evidence is never persisted.
+    source_run_id is the neutral per-run id (the device_spread unit). The analysis DB is
+    read-only; the atlas is append-only. Raw evidence is never persisted.
     """
     result = scan(db_path)
     funcs: dict[int, FuncRow] = {f.func_id: f for f in load_functions(db_path)}
@@ -109,7 +107,6 @@ def run_analyzer2(
                 call_sequence_shape=match.call_sequence_shape,
                 structural_fingerprint=match.structural_fingerprint,
                 fingerprint_algo_version=match.fingerprint_algo_version,
-                device_category=device_category,
             )
             add_instance(
                 atlas,

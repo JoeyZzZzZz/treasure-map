@@ -42,6 +42,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
     pat_cols = _column_names(conn, "pattern")
     if "recurrence_breadth" in pat_cols and "device_spread" not in pat_cols:
         conn.execute("ALTER TABLE pattern RENAME COLUMN recurrence_breadth TO device_spread")
+    if "device_category" in pat_cols:
+        # Hard-removed (no real consumer): drop the legacy column in place. SQLite >= 3.35
+        # supports DROP COLUMN; only evidence rows are protected from rebuild, not this
+        # hand-filled, unconsumed field. Idempotent — runs only while the column exists.
+        conn.execute("ALTER TABLE pattern DROP COLUMN device_category")
 
 
 def open_atlas(db_path: Path) -> sqlite3.Connection:
@@ -49,8 +54,8 @@ def open_atlas(db_path: Path) -> sqlite3.Connection:
 
     The schema uses IF NOT EXISTS throughout, so re-applying it to an existing database is
     safe and preserves all rows. An older atlas is then brought forward in place by _migrate
-    (adds instance.origin, renames pattern.recurrence_breadth -> device_spread) — never by a
-    table rebuild, so existing instance rows are never lost.
+    (adds instance.origin, renames pattern.recurrence_breadth -> device_spread,
+    drops legacy pattern.device_category) — never by a table rebuild, so instance rows are kept.
 
     WARNING: Moving atlas.db requires sqlite3 .backup() or wal_checkpoint(TRUNCATE)
     before any file-copy — never a bare cp while WAL side-files exist.

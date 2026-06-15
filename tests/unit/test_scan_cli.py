@@ -105,7 +105,7 @@ def _mkfs(tmp_path: Path) -> Path:
     return fs_root
 
 
-# ── 1. three steps, in order; run_id default = workspace name; device-category passthrough ──
+# ── 1. three steps, in order; run_id default = workspace name ────────────────────────
 
 
 def test_scan_runs_three_steps_in_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -117,10 +117,9 @@ def test_scan_runs_three_steps_in_order(tmp_path: Path, monkeypatch: pytest.Monk
         calls.append("analyze")
         return _fake_analyze_result(tmp_path / "analysis.db")
 
-    def _fake_hunt(db: Any, atlas: Any, *, source_run_id: str, device_category: str | None) -> Any:
+    def _fake_hunt(db: Any, atlas: Any, *, source_run_id: str) -> Any:
         calls.append("hunt")
         seen["run_id"] = source_run_id
-        seen["device_category"] = device_category
         return _hunt_stats()
 
     def _fake_triage(conn: Any, *, run_id: str | None = None) -> list[Any]:
@@ -139,8 +138,6 @@ def test_scan_runs_three_steps_in_order(tmp_path: Path, monkeypatch: pytest.Monk
             str(_mkfs(tmp_path)),
             "-w",
             str(ws),
-            "--device-category",
-            "router",
             "--atlas",
             str(tmp_path / "atlas.db"),
         ],
@@ -150,7 +147,6 @@ def test_scan_runs_three_steps_in_order(tmp_path: Path, monkeypatch: pytest.Monk
     assert calls == ["analyze", "hunt", "triage"]
     assert seen["run_id"] == "router_v1"  # default run-id = workspace name
     assert seen["triage_run_id"] == "router_v1"
-    assert seen["device_category"] == "router"
 
 
 def test_scan_explicit_run_id_overrides_default(
@@ -162,7 +158,7 @@ def test_scan_explicit_run_id_overrides_default(
     async def _fake_analyze(*_: Any, **__: Any) -> SimpleNamespace:
         return _fake_analyze_result(tmp_path / "analysis.db")
 
-    def _fake_hunt(db: Any, atlas: Any, *, source_run_id: str, device_category: str | None) -> Any:
+    def _fake_hunt(db: Any, atlas: Any, *, source_run_id: str) -> Any:
         seen["run_id"] = source_run_id
         return _hunt_stats()
 

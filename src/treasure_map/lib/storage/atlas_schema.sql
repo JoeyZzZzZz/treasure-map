@@ -12,7 +12,6 @@ CREATE TABLE IF NOT EXISTS pattern (
     call_sequence_shape      TEXT NOT NULL,
     structural_fingerprint   TEXT,
     fingerprint_algo_version TEXT NOT NULL DEFAULT 'v0',
-    device_category          TEXT,             -- generic ONLY: router/camera/nas; NEVER vendor/model
     device_spread            INTEGER NOT NULL DEFAULT 0,  -- exposure ledger: COUNT(DISTINCT source_run_id); device distribution, NOT the pattern-recurrence number
     first_seen_at            DATETIME DEFAULT CURRENT_TIMESTAMP,
     last_updated_at          DATETIME DEFAULT CURRENT_TIMESTAMP

@@ -591,8 +591,9 @@ def test_add_instance_rejects_illegal_origin(atlas_conn: sqlite3.Connection) -> 
 # in-place migration — old atlas (no origin, recurrence_breadth) brought forward
 # ---------------------------------------------------------------------------
 
-# A minimal pre-migration atlas: pattern carries recurrence_breadth (old name), instance has
-# no origin column. open_atlas must add origin (default unknown) and rename the column without
+# A minimal pre-migration atlas: pattern carries recurrence_breadth (old name) and the legacy
+# device_category column, instance has no origin column. open_atlas must add origin (default
+# unknown), rename recurrence_breadth -> device_spread, and DROP device_category — all without
 # dropping any rows.
 _OLD_SCHEMA = """
 CREATE TABLE pattern (
@@ -622,8 +623,9 @@ def test_open_atlas_migrates_old_schema_in_place(tmp_path: Path) -> None:
     old = sqlite3.connect(db_path)
     old.executescript(_OLD_SCHEMA)
     old.execute(
-        "INSERT INTO pattern (source_class, sink_class, call_sequence_shape, recurrence_breadth) "
-        "VALUES ('sc', 'snk', 'shape', 2)"
+        "INSERT INTO pattern "
+        "(source_class, sink_class, call_sequence_shape, recurrence_breadth, device_category) "
+        "VALUES ('sc', 'snk', 'shape', 2, 'router')"
     )
     old.execute(
         "INSERT INTO instance (pattern_id, pseudocode_hash, source_run_id) VALUES (1, 'h1', 'r1')"
@@ -641,11 +643,14 @@ def test_open_atlas_migrates_old_schema_in_place(tmp_path: Path) -> None:
         assert "origin" in inst_cols  # added
         assert "device_spread" in pat_cols  # renamed
         assert "recurrence_breadth" not in pat_cols  # old name gone
+        assert "device_category" not in pat_cols  # legacy column hard-dropped
         # existing rows preserved; the added column took its default on the old rows
         rows = conn.execute("SELECT origin FROM instance ORDER BY instance_id").fetchall()
         assert [r[0] for r in rows] == ["unknown", "unknown"]
         assert conn.execute("SELECT COUNT(*) FROM instance").fetchone()[0] == 2
         assert conn.execute("SELECT COUNT(*) FROM pattern").fetchone()[0] == 1
+        # the renamed column keeps the old value — no data lost in the drop/rename
+        assert conn.execute("SELECT device_spread FROM pattern").fetchone()[0] == 2
     finally:
         conn.close()
 

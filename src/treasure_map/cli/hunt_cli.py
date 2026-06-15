@@ -106,11 +106,6 @@ def hunt_diff(
 @click.argument("db", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--run-id", required=True, help="Neutral per-run id (the device_spread unit).")
 @click.option(
-    "--device-category",
-    default=None,
-    help="Optional GENERIC category (router/camera/nas) — never a vendor/model name.",
-)
-@click.option(
     "--config",
     "-c",
     type=click.Path(exists=True, path_type=Path),
@@ -127,7 +122,6 @@ def hunt_diff(
 def hunt_pattern(
     db: Path,
     run_id: str,
-    device_category: str | None,
     config: Path | None,
     atlas_path: Path | None,
 ) -> None:
@@ -141,7 +135,7 @@ def hunt_pattern(
 
     cfg = load_config(config)
     resolved_atlas = atlas_path if atlas_path is not None else cfg.atlas.db_path
-    stats = run_analyzer2(db, resolved_atlas, source_run_id=run_id, device_category=device_category)
+    stats = run_analyzer2(db, resolved_atlas, source_run_id=run_id)
 
     click.echo(f"Atlas: {resolved_atlas}")
     click.echo(f"  Functions scanned : {stats.scanned}")
@@ -402,11 +396,6 @@ def atlas_view(view: str, config: Path | None, atlas_path: Path | None) -> None:
     default=None,
     help="Neutral per-run id written to the atlas. Defaults to the workspace name.",
 )
-@click.option(
-    "--device-category",
-    default=None,
-    help="Optional GENERIC category (router/camera/nas) — never a vendor/model name.",
-)
 @click.option("--top", "top_n", type=int, default=20, help="Show at most N candidates.")
 @click.option(
     "--status",
@@ -451,7 +440,6 @@ def scan(
     fs_root: Path,
     workspace: str | None,
     run_id: str | None,
-    device_category: str | None,
     top_n: int,
     status: str | None,
     include_gated: bool,
@@ -531,7 +519,6 @@ def scan(
             result.db_path,
             resolved_atlas,
             source_run_id=effective_run_id,
-            device_category=device_category,
         )
     except TreasureMapError as exc:
         raise click.ClickException(f"{type(exc).__name__}: {exc}") from exc

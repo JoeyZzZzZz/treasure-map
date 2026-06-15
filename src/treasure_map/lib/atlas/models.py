@@ -19,7 +19,6 @@ class PatternRow:
     call_sequence_shape: str
     structural_fingerprint: str | None = None
     fingerprint_algo_version: str = "v0"
-    device_category: str | None = None
     device_spread: int = 0
     pattern_id: int | None = None
     first_seen_at: str | None = None
