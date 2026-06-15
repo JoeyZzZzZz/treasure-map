@@ -193,7 +193,11 @@ def run_analyzer1(
                     provenance_level=provenance,
                     fix_diff=fix_diff,
                     scope_origin=axis,
-                    evidence_ref=f"{run_id_a}#fn{lead.func_ref_a.func_id}",
+                    # Neutral per-instance locator = run + function + sink-class hit; the
+                    # sink-class suffix keeps it unique when a function matches multiple sinks
+                    # (the single anchor used by --explain and manual jump-back). Same format
+                    # as analyzer2.
+                    evidence_ref=f"{run_id_a}#fn{lead.func_ref_a.func_id}@{sink_class}",
                 ),
             )
             instances_written += 1

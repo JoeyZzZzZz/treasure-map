@@ -591,8 +591,8 @@ def scan(
         click.echo(f"  [{step}] {meta}")
 
     click.echo(
-        f"note: re-scanning run-id '{effective_run_id}' appends to atlas; "
-        "use a fresh run-id per device+version"
+        f"note: re-running run-id '{effective_run_id}' refreshes its atlas entries "
+        "(replace-by-run); keep one run-id per device+firmware version"
     )
 
     # [1/3] analyze — reuse the analyze command's resolve_workspace + Workspace + asyncio.run path.

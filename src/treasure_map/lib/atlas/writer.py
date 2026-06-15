@@ -25,6 +25,21 @@ class AtlasStats:
     instances_added: int
 
 
+def delete_run_instances(
+    conn: sqlite3.Connection, source_run_id: str, *, commit: bool = True
+) -> int:
+    """Delete all instances of one run (replace-by-run refresh). Returns rows deleted.
+
+    Touches ONLY this run_id's instance rows — other runs' append-and-corroborate evidence is
+    untouched, and pattern rows (the shared accumulation layer) are never deleted. With
+    commit=False the delete joins the caller's transaction (so a run refresh is atomic).
+    """
+    cur = conn.execute("DELETE FROM instance WHERE source_run_id = ?", (source_run_id,))
+    if commit:
+        conn.commit()
+    return cur.rowcount
+
+
 def upsert_pattern(
     conn: sqlite3.Connection,
     *,
@@ -33,13 +48,15 @@ def upsert_pattern(
     call_sequence_shape: str,
     structural_fingerprint: str | None = None,
     fingerprint_algo_version: str = "v0",
+    commit: bool = True,
 ) -> int:
-    """Find-or-create a pattern row; return pattern_id. Commits.
+    """Find-or-create a pattern row; return pattern_id. Commits unless commit=False.
 
     Dedup key:
     - non-None fingerprint: (structural_fingerprint, fingerprint_algo_version)
     - None fingerprint: class triple + structural_fingerprint IS NULL (never = NULL)
-    On corroboration bumps last_updated_at.
+    On corroboration bumps last_updated_at. commit=False lets the caller batch this into a
+    single transaction (e.g. replace-by-run).
     """
     if structural_fingerprint is not None:
         row = conn.execute(
@@ -63,7 +80,8 @@ def upsert_pattern(
             "UPDATE pattern SET last_updated_at = CURRENT_TIMESTAMP WHERE pattern_id = ?",
             (pattern_id,),
         )
-        conn.commit()
+        if commit:
+            conn.commit()
         return pattern_id
 
     cur = conn.execute(
@@ -79,7 +97,8 @@ def upsert_pattern(
             fingerprint_algo_version,
         ),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return int(cur.lastrowid)  # type: ignore[arg-type]
 
 
@@ -118,11 +137,13 @@ def add_instance(
     instance: InstanceRow,
     *,
     external_anchor: str | None = None,
+    commit: bool = True,
 ) -> int:
-    """Insert one instance; return instance_id. Commits.
+    """Insert one instance; return instance_id. Commits unless commit=False.
 
     Validates traceability, source_run_id, origin enum, and L2/L3 anchor requirement.
-    Recomputes pattern.device_spread = COUNT(DISTINCT source_run_id) after insert.
+    Recomputes pattern.device_spread = COUNT(DISTINCT source_run_id) after insert. commit=False
+    lets the caller batch many inserts (and a preceding delete) into one atomic transaction.
     """
     _validate_instance(instance, external_anchor)
 
@@ -149,7 +170,8 @@ def add_instance(
         ),
     )
     _recompute_device_spread(conn, instance.pattern_id)
-    conn.commit()
+    if commit:
+        conn.commit()
     return int(cur.lastrowid)  # type: ignore[arg-type]
 
 

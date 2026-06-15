@@ -15,8 +15,12 @@ import re
 import sqlite3
 from pathlib import Path
 
+import pytest
+
+import treasure_map.lib.hunt.analyzer2 as analyzer2_mod
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.hunt import run_analyzer2
+from treasure_map.lib.query import explain_candidate
 from treasure_map.lib.storage.connection import open_db
 
 _SRC = Path(__file__).resolve().parents[3] / "src" / "treasure_map"
@@ -197,6 +201,128 @@ def test_second_run_appends_and_recomputes_breadth(tmp_path: Path) -> None:
     finally:
         conn.close()
     assert breadth == 2  # two distinct source_run_id over the same fingerprint
+
+
+def _multi_sink_fn(name: str = "ma_utils_exec") -> dict[str, object]:
+    # One function that matches BOTH a cmd shape (recv->snprintf+%s literal->popen) and a copy
+    # shape (recv->strcpy) -> two distinct instances over the same function.
+    body = (
+        f"void {name}(char* param_1){{ char buf[64]; recv(fd,buf,64); char cmd[128]; "
+        f'snprintf(cmd,128,"{RAW_EVIDENCE}",param_1); popen(cmd,"r"); '
+        f"char dst[64]; strcpy(dst,param_1); }}"
+    )
+    return {
+        "name": name,
+        "pseudocode": body,
+        "hash": f"h_{name}",
+        "callees": ["recv", "snprintf", "popen", "strcpy"],
+    }
+
+
+# ── replace-by-run: re-running one run-id refreshes (never doubles) ──────────────────
+
+
+def test_same_run_rerun_is_idempotent(tmp_path: Path) -> None:
+    db = _make_db(tmp_path, [{"name": "webd", "funcs": [_cmd_injection_fn("handle")]}])
+    atlas = tmp_path / "atlas.db"
+    s1 = run_analyzer2(db, atlas, source_run_id="run_rb")
+    after_one = len(_instances(atlas))
+    s2 = run_analyzer2(db, atlas, source_run_id="run_rb")  # same run-id again
+
+    assert s2.instances_written == s1.instances_written
+    assert len(_instances(atlas)) == after_one  # refreshed, NOT doubled
+    refs = [r["evidence_ref"] for r in _instances(atlas)]
+    assert len(set(refs)) == len(refs)  # every ref unique within the run
+
+
+def test_rerun_does_not_touch_other_runs(tmp_path: Path) -> None:
+    db = _make_db(tmp_path, [{"name": "webd", "funcs": [_cmd_injection_fn("handle")]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_A")
+    a_rows_before = [tuple(r) for r in _instances(atlas) if r["source_run_id"] == "run_A"]
+    run_analyzer2(db, atlas, source_run_id="run_B")
+    run_analyzer2(db, atlas, source_run_id="run_B")  # refresh B twice
+    a_rows_after = [tuple(r) for r in _instances(atlas) if r["source_run_id"] == "run_A"]
+
+    assert a_rows_before == a_rows_after  # run A untouched by B's replace-by-run
+
+
+def test_rerun_failure_rolls_back_to_old_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = _make_db(tmp_path, [{"name": "webd", "funcs": [_cmd_injection_fn("handle")]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_rb")
+    before = [tuple(r) for r in _instances(atlas)]
+    assert before  # there is an old result to protect
+
+    real_add = analyzer2_mod.add_instance
+    calls = {"n": 0}
+
+    def _boom(*args: object, **kwargs: object) -> int:
+        calls["n"] += 1
+        if calls["n"] >= 1:  # fail during the re-run write
+            raise RuntimeError("write blew up mid-run")
+        return real_add(*args, **kwargs)  # type: ignore[no-any-return]
+
+    monkeypatch.setattr(analyzer2_mod, "add_instance", _boom)
+    with pytest.raises(RuntimeError):
+        run_analyzer2(db, atlas, source_run_id="run_rb")
+
+    after = [tuple(r) for r in _instances(atlas)]
+    assert after == before  # rolled back to the old result — never a half-written run
+
+
+def test_replace_by_run_keeps_pattern_rows(tmp_path: Path) -> None:
+    db = _make_db(tmp_path, [{"name": "webd", "funcs": [_cmd_injection_fn("handle")]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_rb")
+    conn = open_atlas(atlas)
+    try:
+        patterns_before = conn.execute("SELECT COUNT(*) FROM pattern").fetchone()[0]
+    finally:
+        conn.close()
+    run_analyzer2(db, atlas, source_run_id="run_rb")  # replace-by-run
+    conn = open_atlas(atlas)
+    try:
+        patterns_after = conn.execute("SELECT COUNT(*) FROM pattern").fetchone()[0]
+    finally:
+        conn.close()
+    assert patterns_after == patterns_before  # pattern (accumulation layer) never deleted
+
+
+# ── evidence_ref uniqueness: func + sink hit ─────────────────────────────────────────
+
+
+def test_multi_sink_function_has_unique_evidence_refs(tmp_path: Path) -> None:
+    db = _make_db(tmp_path, [{"name": "webd", "funcs": [_multi_sink_fn()]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_ms")
+
+    rows = _instances(atlas)
+    assert len(rows) >= 2  # one function, multiple sink hits -> multiple instances
+    refs = [r["evidence_ref"] for r in rows]
+    assert len(set(refs)) == len(refs), f"evidence_ref collided across sink hits: {refs}"
+    sink_classes = {r["evidence_ref"].split("@", 1)[1] for r in rows}
+    assert {"cmd", "copy"} <= sink_classes  # the ref carries the distinguishing sink class
+
+
+def test_explain_anchors_the_right_sink_hit(tmp_path: Path) -> None:
+    db = _make_db(tmp_path, [{"name": "webd", "funcs": [_multi_sink_fn()]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_ms")
+
+    conn = open_atlas(atlas)
+    try:
+        cmd_ref = next(
+            r["evidence_ref"] for r in _instances(atlas) if r["evidence_ref"].endswith("@cmd")
+        )
+        ex = explain_candidate(conn, cmd_ref)
+    finally:
+        conn.close()
+    assert ex is not None
+    assert ex.candidate.evidence_ref == cmd_ref
+    assert ex.candidate.sink_class == "cmd"  # the cmd ref resolves to the cmd hit, not the copy
 
 
 # ── BOUNDARY ────────────────────────────────────────────────────────────────────────

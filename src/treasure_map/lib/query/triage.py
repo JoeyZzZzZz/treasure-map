@@ -16,8 +16,11 @@ field is untouched.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 # Presentation-only relabel of the raw reachability_status schema values. This maps the
 # mechanism state to a word the reviewer can act on; it is NEVER written back to the atlas
@@ -312,16 +315,26 @@ def explain_candidate(conn: sqlite3.Connection, evidence_ref: str) -> CandidateE
     honest claim bounds, and a manual-verification checklist. Returns None when no instance
     carries the given evidence_ref (the caller turns that into a friendly error).
     """
-    row = conn.execute(
+    rows = conn.execute(
         "SELECT i.reachability_status, i.blocking_mechanism, i.origin, i.source_anchor, "
         "i.sink_anchor, i.source_run_id, i.evidence_ref, "
         "p.source_class, p.sink_class, p.call_sequence_shape "
         "FROM instance i JOIN pattern p ON p.pattern_id = i.pattern_id "
-        "WHERE i.evidence_ref = ?",
+        "WHERE i.evidence_ref = ? "
+        "ORDER BY i.instance_id",
         (evidence_ref,),
-    ).fetchone()
-    if row is None:
+    ).fetchall()
+    if not rows:
         return None
+    if len(rows) > 1:
+        # evidence_ref is meant to anchor one instance (run + function + sink); a duplicate is
+        # not expected. Defend deterministically: take the lowest instance_id, never a random one.
+        logger.warning(
+            "evidence_ref %s matched %d instances; using the lowest instance_id",
+            evidence_ref,
+            len(rows),
+        )
+    row = rows[0]
 
     candidate = _candidate(row)
     components = score_breakdown(

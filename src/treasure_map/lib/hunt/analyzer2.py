@@ -27,7 +27,7 @@ from pathlib import Path
 
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import InstanceRow
-from treasure_map.lib.atlas.writer import add_instance, upsert_pattern
+from treasure_map.lib.atlas.writer import add_instance, delete_run_instances, upsert_pattern
 from treasure_map.lib.diff.loader import FuncRow, load_functions
 from treasure_map.lib.pattern import scan
 from treasure_map.lib.pattern.classes import CMD, COPY, FORMAT
@@ -75,7 +75,10 @@ def run_analyzer2(
     """Scan one analysis.db for shape candidates, grade them, and write atlas instances.
 
     source_run_id is the neutral per-run id (the device_spread unit). The analysis DB is
-    read-only; the atlas is append-only. Raw evidence is never persisted.
+    read-only. Writing is REPLACE-BY-RUN: this run's old instances are deleted first and the
+    fresh result is written in ONE transaction (re-running a run refreshes it, never doubles
+    it). Other runs' append-and-corroborate evidence and all pattern rows are untouched. Raw
+    evidence is never persisted.
     """
     result = scan(db_path)
     funcs: dict[int, FuncRow] = {f.func_id: f for f in load_functions(db_path)}
@@ -85,51 +88,59 @@ def run_analyzer2(
 
     atlas = open_atlas(Path(atlas_path))
     try:
-        for match in result.matches:
-            row = funcs.get(match.func_ref.func_id)
-            if row is None or not (row.pseudocode and row.pseudocode.strip()):
-                logger.info("skipping match with no loadable function body (data gap)")
-                continue
+        # One transaction: drop this run's old rows + write the fresh result, or roll back to
+        # the prior result on any error (never leave a half-written run). Only this run_id's
+        # instances are deleted; pattern rows (shared accumulation layer) are not.
+        with atlas:
+            delete_run_instances(atlas, source_run_id, commit=False)
+            for match in result.matches:
+                row = funcs.get(match.func_ref.func_id)
+                if row is None or not (row.pseudocode and row.pseudocode.strip()):
+                    logger.info("skipping match with no loadable function body (data gap)")
+                    continue
 
-            callees = _parse_callees(row.callees)
-            sink_name = _sink_name_for(callees, match.sink_class)
-            if sink_name is None:
-                status, blocking = "unknown", None
-            else:
-                verdict = grade_candidate(row.pseudocode, callees, sink_name)
-                status, blocking = verdict.status, verdict.blocking_mechanism
+                callees = _parse_callees(row.callees)
+                sink_name = _sink_name_for(callees, match.sink_class)
+                if sink_name is None:
+                    status, blocking = "unknown", None
+                else:
+                    verdict = grade_candidate(row.pseudocode, callees, sink_name)
+                    status, blocking = verdict.status, verdict.blocking_mechanism
 
-            provenance = "L1" if status in {"confirmed", "blocked"} else "L0"
-            pattern_id = upsert_pattern(
-                atlas,
-                source_class=match.source_class,
-                sink_class=match.sink_class,
-                call_sequence_shape=match.call_sequence_shape,
-                structural_fingerprint=match.structural_fingerprint,
-                fingerprint_algo_version=match.fingerprint_algo_version,
-            )
-            add_instance(
-                atlas,
-                InstanceRow(
-                    pattern_id=pattern_id,
-                    pseudocode_hash=row.pseudocode_hash,
-                    source_anchor=match.func_ref.func_name,
-                    sink_anchor=sink_name,
-                    source_run_id=source_run_id,
-                    reachability_status=status,
-                    blocking_mechanism=blocking,
-                    provenance_level=provenance,
-                    # Per-instance neutral locator (run-scoped function id): unique and
-                    # traceable back to the source function, never a raw evidence literal.
-                    # The shared structural_fingerprint lives on the pattern (above), not
-                    # here — putting it on the instance collided across all same-shape
-                    # instances and gave no traceability.
-                    evidence_ref=f"{source_run_id}#fn{match.func_ref.func_id}",
-                    scope_origin="intra",
-                ),
-            )
-            instances_written += 1
-            by_status[status] += 1
+                provenance = "L1" if status in {"confirmed", "blocked"} else "L0"
+                pattern_id = upsert_pattern(
+                    atlas,
+                    source_class=match.source_class,
+                    sink_class=match.sink_class,
+                    call_sequence_shape=match.call_sequence_shape,
+                    structural_fingerprint=match.structural_fingerprint,
+                    fingerprint_algo_version=match.fingerprint_algo_version,
+                    commit=False,
+                )
+                add_instance(
+                    atlas,
+                    InstanceRow(
+                        pattern_id=pattern_id,
+                        pseudocode_hash=row.pseudocode_hash,
+                        source_anchor=match.func_ref.func_name,
+                        sink_anchor=sink_name,
+                        source_run_id=source_run_id,
+                        reachability_status=status,
+                        blocking_mechanism=blocking,
+                        provenance_level=provenance,
+                        # Neutral per-instance locator = run + function + sink-class hit. One
+                        # function can match multiple sinks (e.g. cmd and copy); each is a
+                        # distinct instance, so the sink-class suffix keeps the ref unique
+                        # (it is the single anchor used by --explain and manual jump-back).
+                        evidence_ref=(
+                            f"{source_run_id}#fn{match.func_ref.func_id}@{match.sink_class}"
+                        ),
+                        scope_origin="intra",
+                    ),
+                    commit=False,
+                )
+                instances_written += 1
+                by_status[status] += 1
     finally:
         atlas.close()
 
