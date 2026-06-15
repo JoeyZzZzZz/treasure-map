@@ -118,7 +118,7 @@ firmware is up to you — outside Treasure Map's scope.) Say you extracted to `.
 ### The main path — one command
 
 ```bash
-tmap scan ./_firmware.extracted -w router_v1 --device-category router
+tmap scan ./_firmware.extracted -w router_v1
 ```
 
 `tmap scan` runs the whole pipeline — **analyze → hunt → triage** — and ends by printing a
@@ -140,7 +140,7 @@ the two stores decouple on purpose (`analysis.db` is wipe-and-rebuild; the atlas
 
 ```bash
 tmap analyze ./_firmware.extracted -w router_v1                                  # -> analysis.db
-tmap hunt-pattern router_v1/analysis.db --run-id router_v1 --device-category router  # -> atlas
+tmap hunt-pattern router_v1/analysis.db --run-id router_v1                       # -> atlas
 tmap triage router_v1                                                            # ranked list
 ```
 
