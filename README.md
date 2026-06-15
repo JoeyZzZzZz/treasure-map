@@ -112,48 +112,55 @@ remembers it. Fix anything it marks `❌` (see [Troubleshooting](#troubleshootin
 
 ## Using it
 
-1. **Point Treasure Map at your extracted firmware filesystem root.** (How you unpacked the
-   firmware is up to you — outside Treasure Map's scope.) Say you extracted to `./_firmware.extracted/`.
+**Point Treasure Map at your extracted firmware filesystem root** first. (How you unpacked the
+firmware is up to you — outside Treasure Map's scope.) Say you extracted to `./_firmware.extracted/`.
 
-2. **Analyze.** Produces an `analysis.db` in a workspace directory.
-   ```bash
-   tmap analyze ./_firmware.extracted -w router_v1
-   ```
-   **`-w/--workspace` takes a name *or* a path:**
-   - a **bare name** (`-w router_v1`) is managed for you under your workspace base —
-     `~/.treasure-map/workspaces/router_v1` (the base is set in `tmap init`);
-   - a value with a **slash, `~`, `.`, or an absolute path** (`-w /mnt/scratch/fw1`, `-w ./work`)
-     is used **as a literal path** — use this to put a workspace on a large/scratch/external disk;
-   - **omitted**, it defaults to an auto name under the base (derived from the firmware dir), shown
-     in the output.
+### The main path — one command
 
-   The chosen workspace is **echoed** so you can see which form was used. Analysis is **resume-safe**:
-   re-run with the **same** `-w` (same name or same path) to continue from the last checkpoint.
-   Useful flags: `--summarize` (function summaries via the S-tier LLM; needs an S-tier key),
-   `--skip-non-binary`, `--skip-ingester <KIND>`, `-c <config.yaml>`.
+```bash
+tmap scan ./_firmware.extracted -w router_v1 --device-category router
+```
 
-3. **Hunt for dangerous call-sequence shapes.** Scans one `analysis.db` and writes neutral
-   candidate instances into the atlas.
-   ```bash
-   tmap hunt-pattern <ws>/analysis.db --run-id router_v1 --device-category router
-   ```
+`tmap scan` runs the whole pipeline — **analyze → hunt → triage** — and ends by printing a
+**ranked, ready-to-act candidate list**: the functions worth reverse-engineering first, each with
+an `evidence_ref` (`{run_id}#fn{func_id}`) anchor back to the source `analysis.db` / Ghidra. It is
+slow in the **analyze** stage (one Ghidra JVM per binary) and shows **per-stage progress** so you
+can see it working; the last stage is the same readable triage table as `tmap triage`.
 
-4. **★ Triage — the main path.** One command turns the scattered candidates into a ranked,
-   actionable to-verify list, so you know *which functions to reverse-engineer next*.
-   ```bash
-   tmap triage router_v1            # ranked candidates; start reverse-engineering from the top
-   ```
-   Each row carries an `evidence_ref` (`{run_id}#fn{func_id}`) — the anchor to jump straight back
-   to the source `analysis.db` / Ghidra. Gated (filtered/dormant) candidates are folded by default
-   (`--include-gated` to show); `--top N`, `--status`, and `--json` tune the output. The ranking is
-   a **review order** — triage scales up *finding candidates*; confirming a candidate into a real
-   issue is the manual reverse-engineering work, and stays yours.
+The ranking is a **review order** — `scan` scales up *finding candidates*; confirming a candidate
+into a real issue is the manual reverse-engineering work, and stays yours. Gated (filtered/dormant)
+candidates fold by default (`--include-gated` to show); `--top N`, `--status`, `--json` tune the
+output. `--run-id` defaults to the workspace name (keep it **one run-id per device + firmware
+version**).
 
-5. **Go further (optional)**, once you have one or more `analysis.db`:
-   ```bash
-   tmap hunt-diff <old.db> <new.db> ...   # diff two builds, grade reachability
-   tmap atlas-view ...                     # neutral cross-firmware aggregation
-   ```
+### Or run the steps individually
+
+Use these when you need to **re-run a single stage** — analyze is slow, hunt/triage are fast, and
+the two stores decouple on purpose (`analysis.db` is wipe-and-rebuild; the atlas is append-only).
+
+```bash
+tmap analyze ./_firmware.extracted -w router_v1                                  # -> analysis.db
+tmap hunt-pattern router_v1/analysis.db --run-id router_v1 --device-category router  # -> atlas
+tmap triage router_v1                                                            # ranked list
+```
+
+**`-w/--workspace` takes a name *or* a path:**
+- a **bare name** (`-w router_v1`) is managed for you under your workspace base —
+  `~/.treasure-map/workspaces/router_v1` (the base is set in `tmap init`);
+- a value with a **slash, `~`, `.`, or an absolute path** (`-w /mnt/scratch/fw1`, `-w ./work`)
+  is used **as a literal path** — use this to put a workspace on a large/scratch/external disk;
+- **omitted**, it defaults to an auto name under the base (derived from the firmware dir), shown
+  in the output.
+
+Analysis is **resume-safe**: re-run with the **same** `-w` to continue from the last checkpoint.
+Useful flags: `--summarize` (function summaries via the S-tier LLM; needs an S-tier key),
+`--skip-non-binary`, `--skip-ingester <KIND>`, `-c <config.yaml>`.
+
+**Go further (optional)**, once you have one or more `analysis.db`:
+```bash
+tmap hunt-diff <old.db> <new.db> ...   # diff two builds, grade reachability
+tmap atlas-view ...                     # neutral cross-firmware aggregation
+```
 
 ## Pointing Treasure Map at Ghidra
 

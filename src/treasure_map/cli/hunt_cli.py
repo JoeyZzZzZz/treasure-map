@@ -10,8 +10,12 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import click
+
+if TYPE_CHECKING:
+    from treasure_map.lib.query import TriageCandidate
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +168,89 @@ _SECTION_HEADER = {
 }
 
 
+def _render_triage(
+    candidates: list[TriageCandidate],
+    *,
+    run_label: str,
+    top_n: int,
+    status: str | None,
+    include_gated: bool,
+    as_json: bool,
+) -> None:
+    """Render a ranked triage candidate list. Shared by `tmap triage` and `tmap scan` so the
+    two emit byte-identical output (single source of truth, no drift)."""
+    import json
+
+    counts = {"reachable": 0, "to-verify": 0, "gated": 0}
+    for c in candidates:
+        counts[c.review_status] = counts.get(c.review_status, 0) + 1
+
+    # Decide which review statuses to display.
+    if status == "all":
+        shown_statuses = set(_SECTION_ORDER)
+    elif status is not None:
+        shown_statuses = {status}
+    else:
+        shown_statuses = {"to-verify", "reachable"}
+        if include_gated:
+            shown_statuses.add("gated")
+
+    visible = [c for c in candidates if c.review_status in shown_statuses][:top_n]
+
+    if as_json:
+        click.echo(
+            json.dumps(
+                [
+                    {
+                        "score": c.score,
+                        "review_status": c.review_status,
+                        "reachability_status": c.reachability_status,
+                        "function": c.function,
+                        "source_class": c.source_class,
+                        "sink_class": c.sink_class,
+                        "sink_anchor": c.sink_anchor,
+                        "blocking_mechanism": c.blocking_mechanism,
+                        "origin": c.origin,
+                        "source_run_id": c.source_run_id,
+                        "evidence_ref": c.evidence_ref,
+                    }
+                    for c in visible
+                ],
+                indent=2,
+            )
+        )
+        return
+
+    click.echo(
+        f"triage: {run_label}   ({len(candidates)} candidates: "
+        f"{counts['reachable']} reachable, {counts['to-verify']} to-verify, "
+        f"{counts['gated']} gated)"
+    )
+    rank = 0
+    for section in _SECTION_ORDER:
+        if section not in shown_statuses:
+            continue
+        rows = [c for c in visible if c.review_status == section]
+        if not rows:
+            continue
+        click.echo(f"\n  {_SECTION_HEADER[section]}")
+        click.echo("  #   score  status      function (evidence_ref)        source->sink   filter")
+        for c in rows:
+            rank += 1
+            fltr = c.blocking_mechanism if c.blocking_mechanism else "none"
+            click.echo(
+                f"  {rank:<3} {c.score:<5.2f}  {c.review_status:<10}  "
+                f"{c.function or '?'} ({c.evidence_ref or '?'})   "
+                f"{c.source_class} -> {c.sink_anchor or '?'}   {fltr}"
+            )
+    if "gated" not in shown_statuses and counts["gated"]:
+        click.echo(f"\n  (gated: {counts['gated']} hidden; --include-gated to show)")
+    click.echo(
+        "\nNote: candidates are leads for manual review, ranked by how much they warrant "
+        "reverse-engineering — NOT confirmed results."
+    )
+
+
 @click.command("triage", short_help="Rank to-verify candidates for manual reverse-engineering.")
 @click.argument("run_id", required=False, default=None)
 @click.option("--run", "run_opt", default=None, help="Restrict to one run id (overrides RUN_ID).")
@@ -211,8 +298,6 @@ def triage(
     its evidence_ref ({run_id}#fn{func_id}) — the anchor to jump back to analysis.db / Ghidra.
     Candidates are leads for manual review, NOT confirmed results.
     """
-    import json
-
     from treasure_map.lib.atlas.connection import open_atlas
     from treasure_map.lib.config.config import load_config
     from treasure_map.lib.query import triage as run_triage
@@ -226,74 +311,13 @@ def triage(
     finally:
         conn.close()
 
-    counts = {"reachable": 0, "to-verify": 0, "gated": 0}
-    for c in candidates:
-        counts[c.review_status] = counts.get(c.review_status, 0) + 1
-
-    # Decide which review statuses to display.
-    if status == "all":
-        shown_statuses = set(_SECTION_ORDER)
-    elif status is not None:
-        shown_statuses = {status}
-    else:
-        shown_statuses = {"to-verify", "reachable"}
-        if include_gated:
-            shown_statuses.add("gated")
-
-    visible = [c for c in candidates if c.review_status in shown_statuses][:top_n]
-
-    if as_json:
-        click.echo(
-            json.dumps(
-                [
-                    {
-                        "score": c.score,
-                        "review_status": c.review_status,
-                        "reachability_status": c.reachability_status,
-                        "function": c.function,
-                        "source_class": c.source_class,
-                        "sink_class": c.sink_class,
-                        "sink_anchor": c.sink_anchor,
-                        "blocking_mechanism": c.blocking_mechanism,
-                        "origin": c.origin,
-                        "source_run_id": c.source_run_id,
-                        "evidence_ref": c.evidence_ref,
-                    }
-                    for c in visible
-                ],
-                indent=2,
-            )
-        )
-        return
-
-    label = selected_run if selected_run is not None else "all runs"
-    click.echo(
-        f"triage: {label}   ({len(candidates)} candidates: "
-        f"{counts['reachable']} reachable, {counts['to-verify']} to-verify, "
-        f"{counts['gated']} gated)"
-    )
-    rank = 0
-    for section in _SECTION_ORDER:
-        if section not in shown_statuses:
-            continue
-        rows = [c for c in visible if c.review_status == section]
-        if not rows:
-            continue
-        click.echo(f"\n  {_SECTION_HEADER[section]}")
-        click.echo("  #   score  status      function (evidence_ref)        source->sink   filter")
-        for c in rows:
-            rank += 1
-            fltr = c.blocking_mechanism if c.blocking_mechanism else "none"
-            click.echo(
-                f"  {rank:<3} {c.score:<5.2f}  {c.review_status:<10}  "
-                f"{c.function or '?'} ({c.evidence_ref or '?'})   "
-                f"{c.source_class} -> {c.sink_anchor or '?'}   {fltr}"
-            )
-    if "gated" not in shown_statuses and counts["gated"]:
-        click.echo(f"\n  (gated: {counts['gated']} hidden; --include-gated to show)")
-    click.echo(
-        "\nNote: candidates are leads for manual review, ranked by how much they warrant "
-        "reverse-engineering — NOT confirmed results."
+    _render_triage(
+        candidates,
+        run_label=selected_run if selected_run is not None else "all runs",
+        top_n=top_n,
+        status=status,
+        include_gated=include_gated,
+        as_json=as_json,
     )
 
 
@@ -361,3 +385,175 @@ def atlas_view(view: str, config: Path | None, atlas_path: Path | None) -> None:
     finally:
         conn.close()
     click.echo("Note: rows are leads/candidates, not findings; interpretation is out of scope.")
+
+
+@click.command("scan", short_help="One command: analyze -> hunt -> triage, ending in a list.")
+@click.argument("fs_root", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option(
+    "--workspace",
+    "-w",
+    type=str,
+    default=None,
+    help="Workspace as a NAME (managed under your base) or a PATH (verbatim). Omitted: auto name.",
+)
+@click.option(
+    "--run-id",
+    "run_id",
+    default=None,
+    help="Neutral per-run id written to the atlas. Defaults to the workspace name.",
+)
+@click.option(
+    "--device-category",
+    default=None,
+    help="Optional GENERIC category (router/camera/nas) — never a vendor/model name.",
+)
+@click.option("--top", "top_n", type=int, default=20, help="Show at most N candidates.")
+@click.option(
+    "--status",
+    type=click.Choice(["to-verify", "reachable", "gated", "all"]),
+    default=None,
+    help="Show only this review status. Default shows to-verify + reachable (gated folded).",
+)
+@click.option(
+    "--include-gated",
+    is_flag=True,
+    default=False,
+    help="Also show gated candidates (folded by default — they are likely dormant/false).",
+)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit triage list as JSON.")
+@click.option(
+    "--skip-non-binary",
+    is_flag=True,
+    default=False,
+    help="Skip the non-binary file analysis stage entirely.",
+)
+@click.option(
+    "--skip-ingester",
+    "skip_ingesters",
+    multiple=True,
+    help="Skip a specific ingester by kind (e.g. shell_script). Repeatable.",
+)
+@click.option(
+    "--config",
+    "-c",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Path to config.yaml (overrides ~/.treasure-map/config.yaml).",
+)
+@click.option(
+    "--atlas",
+    "atlas_path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Atlas DB path (defaults to the configured atlas.db_path).",
+)
+def scan(
+    fs_root: Path,
+    workspace: str | None,
+    run_id: str | None,
+    device_category: str | None,
+    top_n: int,
+    status: str | None,
+    include_gated: bool,
+    as_json: bool,
+    skip_non_binary: bool,
+    skip_ingesters: tuple[str, ...],
+    config: Path | None,
+    atlas_path: Path | None,
+) -> None:
+    """Run the whole main path on one extracted firmware: analyze -> hunt -> triage.
+
+    Ends by printing the same ranked, evidence_ref-anchored triage list as `tmap triage`. The
+    three sub-commands stay independent for re-running a single step; this is the one-shot path.
+    Slow stage is analyze (one Ghidra JVM per binary) — progress is shown per stage.
+    """
+    import asyncio
+    from typing import Any
+
+    from treasure_map.lib.atlas.connection import open_atlas
+    from treasure_map.lib.config.config import load_config
+    from treasure_map.lib.errors import GhidraNotFoundError, TreasureMapError
+    from treasure_map.lib.hunt import run_analyzer2
+    from treasure_map.lib.query import triage as run_triage
+    from treasure_map.lib.workspace.resolver import resolve_workspace
+    from treasure_map.lib.workspace.workspace import Workspace
+
+    cfg = load_config(config)
+    try:
+        resolved = resolve_workspace(workspace, workspace_dir=cfg.workspace_dir, fs_root=fs_root)
+    except TreasureMapError as exc:
+        raise click.ClickException(str(exc)) from exc
+    ws_path = resolved.path
+
+    effective_run_id = run_id if run_id is not None else ws_path.name
+    resolved_atlas = atlas_path if atlas_path is not None else cfg.atlas.db_path
+
+    def _progress(step: str, meta: dict[str, Any]) -> None:
+        click.echo(f"  [{step}] {meta}")
+
+    click.echo(
+        f"note: re-scanning run-id '{effective_run_id}' appends to atlas; "
+        "use a fresh run-id per device+version"
+    )
+
+    # [1/3] analyze — reuse the analyze command's resolve_workspace + Workspace + asyncio.run path.
+    click.echo("\n[1/3] analyzing firmware (Ghidra) …")
+    from treasure_map.lib.analyze.pipeline import run_analyze
+
+    try:
+        with Workspace(ws_path, progress_callback=_progress) as ws:
+            result = asyncio.run(
+                run_analyze(
+                    fs_root,
+                    ws,
+                    cfg,
+                    _progress,
+                    skip_non_binary=skip_non_binary,
+                    skip_ingesters=frozenset(skip_ingesters),
+                )
+            )
+    except KeyboardInterrupt:
+        click.echo("\nAborted by user — all Ghidra processes terminated.", err=True)
+        raise SystemExit(130) from None
+    except GhidraNotFoundError as exc:
+        raise click.ClickException(str(exc)) from exc
+    except TreasureMapError as exc:
+        raise click.ClickException(f"{type(exc).__name__}: {exc}") from exc
+    click.echo(
+        f"      → analysis.db: {result.binary_count} binaries, "
+        f"{result.functions_ingested} functions"
+    )
+
+    # [2/3] hunt call-sequence shapes -> atlas.
+    click.echo(f"\n[2/3] hunting call-sequence shapes → atlas (run-id={effective_run_id}) …")
+    try:
+        h = run_analyzer2(
+            result.db_path,
+            resolved_atlas,
+            source_run_id=effective_run_id,
+            device_category=device_category,
+        )
+    except TreasureMapError as exc:
+        raise click.ClickException(f"{type(exc).__name__}: {exc}") from exc
+    click.echo(
+        f"      → {h.instances_written} candidates written "
+        f"(confirmed={h.by_status.get('confirmed', 0)}, "
+        f"blocked={h.by_status.get('blocked', 0)}, "
+        f"unknown={h.by_status.get('unknown', 0)})"
+    )
+
+    # [3/3] triage — the readable, ranked candidate list (same renderer as `tmap triage`).
+    click.echo("\n[3/3] triage — ranked candidates for manual review:\n")
+    conn = open_atlas(resolved_atlas)
+    try:
+        candidates = run_triage(conn, run_id=effective_run_id)
+    finally:
+        conn.close()
+    _render_triage(
+        candidates,
+        run_label=effective_run_id,
+        top_n=top_n,
+        status=status,
+        include_gated=include_gated,
+        as_json=as_json,
+    )

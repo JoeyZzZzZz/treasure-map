@@ -7,7 +7,7 @@ import logging
 import click
 
 from treasure_map.cli.analyze_cli import analyze
-from treasure_map.cli.hunt_cli import atlas_view, hunt_diff, hunt_pattern, triage
+from treasure_map.cli.hunt_cli import atlas_view, hunt_diff, hunt_pattern, scan, triage
 from treasure_map.cli.init_cli import init
 
 
@@ -24,6 +24,7 @@ def main(debug: bool) -> None:
             logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
+main.add_command(scan)
 main.add_command(analyze)
 main.add_command(init)
 main.add_command(hunt_diff)
