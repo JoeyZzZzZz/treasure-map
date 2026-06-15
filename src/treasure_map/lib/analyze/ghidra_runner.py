@@ -15,6 +15,7 @@ import signal
 import struct
 import subprocess
 import tempfile
+import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -27,6 +28,50 @@ from treasure_map.lib.config.config import GhidraConfig
 from treasure_map.lib.errors import GhidraNotFoundError
 
 logger = logging.getLogger(__name__)
+
+# --- live Ghidra process-group registry (for deterministic teardown on abort) ---
+# Each subprocess is started with start_new_session=True, so its pid == its pgid
+# (session/group leader). We track live pgids so an interrupt handler can killpg
+# the whole tree (analyzeHeadless wrapper + java + children) — terminal SIGINT does
+# NOT reach them because they are in their own session.
+_active_pgids: set[int] = set()
+_active_lock = threading.Lock()
+
+
+def _register_pgid(pgid: int) -> None:
+    with _active_lock:
+        _active_pgids.add(pgid)
+
+
+def _unregister_pgid(pgid: int) -> None:
+    with _active_lock:
+        _active_pgids.discard(pgid)
+
+
+def _killpg_quiet(pgid: int, sig: int) -> None:
+    try:
+        os.killpg(pgid, sig)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+def terminate_all(grace: float = 2.0) -> None:
+    """Tear down every live Ghidra process group: SIGTERM, brief grace, then SIGKILL.
+
+    Called on interrupt/abort so no orphan JVM survives. Idempotent and safe to
+    call when nothing is running (no-op, no sleep).
+    """
+    with _active_lock:
+        pgids = list(_active_pgids)
+    if not pgids:
+        return
+    for pgid in pgids:
+        _killpg_quiet(pgid, signal.SIGTERM)
+    time.sleep(grace)
+    for pgid in pgids:
+        _killpg_quiet(pgid, signal.SIGKILL)
+        _unregister_pgid(pgid)
+
 
 ProgressCallback = Callable[[str, dict[str, Any]], None]
 
@@ -197,13 +242,17 @@ def _build_cmd(
 
 
 def _run_subprocess(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
-    """Spawn cmd in a new process group; kill group on timeout.
+    """Spawn cmd in a new session/process group; kill the whole group on timeout
+    or interrupt.
 
-    Returns (returncode, stderr_tail).  returncode -1 = timeout or launch error.
-    analyzeHeadless is a shell wrapper that spawns Java without exec, so we must
-    kill the entire process group to avoid orphan JVMs.
+    Returns (returncode, stderr_tail). returncode -1 = timeout or launch error.
+    analyzeHeadless is a shell wrapper that spawns Java without exec, so the whole
+    process group must be killed to avoid orphan JVMs. The pgid is registered so a
+    top-level interrupt can tear every live group down (terminal SIGINT never
+    reaches them — they are in their own session).
     """
     proc: subprocess.Popen[bytes] | None = None
+    pgid: int | None = None
     try:
         proc = subprocess.Popen(
             cmd,
@@ -212,24 +261,32 @@ def _run_subprocess(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
+        pgid = proc.pid  # session leader: pgid == pid
+        _register_pgid(pgid)
         try:
             _, stderr_bytes = proc.communicate(timeout=timeout)
             snippet = stderr_bytes.decode(errors="replace")[-500:]
             return proc.returncode, snippet
         except subprocess.TimeoutExpired:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, OSError):
-                pass
+            _killpg_quiet(pgid, signal.SIGKILL)
             proc.communicate()
             return -1, "timeout"
-    except Exception as exc:
-        if proc is not None and proc.poll() is None:
+    except BaseException as exc:
+        # BaseException covers KeyboardInterrupt (NOT an Exception): never leak a
+        # live JVM group. Kill the group, reap, then decide whether to swallow.
+        if pgid is not None:
+            _killpg_quiet(pgid, signal.SIGKILL)
+        if proc is not None:
             try:
-                proc.kill()
-            except OSError:
+                proc.communicate(timeout=5)
+            except Exception:
                 pass
-        return -1, str(exc)
+        if isinstance(exc, Exception):
+            return -1, str(exc)  # ordinary launch error: behave as before
+        raise  # KeyboardInterrupt / SystemExit propagate
+    finally:
+        if pgid is not None:
+            _unregister_pgid(pgid)
 
 
 class GhidraRunner:
@@ -382,7 +439,8 @@ class GhidraRunner:
         results: list[GhidraResult] = []
         n = len(records)
 
-        with ThreadPoolExecutor(max_workers=self._config.max_parallel_jvms) as pool:
+        pool = ThreadPoolExecutor(max_workers=self._config.max_parallel_jvms)
+        try:
             future_to_rec = {
                 pool.submit(
                     self.run_ghidra,
@@ -394,22 +452,40 @@ class GhidraRunner:
                 ): rec
                 for rec in records
             }
-            for i, fut in enumerate(as_completed(future_to_rec), 1):
-                rec = future_to_rec[fut]
-                try:
-                    result = fut.result()
-                except Exception as exc:
-                    logger.error("Ghidra crashed for %s: %s", rec.name, exc)
-                    result = GhidraResult(
-                        binary=rec.path, output_file=None, success=False, elapsed=0.0
+            try:
+                for i, fut in enumerate(as_completed(future_to_rec), 1):
+                    rec = future_to_rec[fut]
+                    try:
+                        result = fut.result()
+                    except Exception as exc:
+                        logger.error("Ghidra crashed for %s: %s", rec.name, exc)
+                        result = GhidraResult(
+                            binary=rec.path, output_file=None, success=False, elapsed=0.0
+                        )
+                    results.append(result)
+                    if progress_callback is not None:
+                        progress_callback(
+                            "ghidra",
+                            {"done": i, "total": n, "name": rec.name, "ok": result.success},
+                        )
+                    status = (
+                        "ok" if result.success else ("retried_fail" if result.retried else "fail")
                     )
-                results.append(result)
-                if progress_callback is not None:
-                    progress_callback(
-                        "ghidra",
-                        {"done": i, "total": n, "name": rec.name, "ok": result.success},
-                    )
-                status = "ok" if result.success else ("retried_fail" if result.retried else "fail")
-                logger.info("[%d/%d] %s %s (%.0fs)", i, n, rec.name, status, result.elapsed)
+                    logger.info("[%d/%d] %s %s (%.0fs)", i, n, rec.name, status, result.elapsed)
+            except KeyboardInterrupt:
+                logger.warning(
+                    "interrupted — terminating %d live Ghidra process group(s)",
+                    len(_active_pgids),
+                )
+                terminate_all()
+                for f in future_to_rec:
+                    f.cancel()
+                raise
+        finally:
+            # On the interrupt path the JVMs are already dead, so each worker's
+            # communicate() returns immediately and shutdown(wait=True) does not hang;
+            # cancel_futures drops the not-yet-started ones (Python 3.9+).
+            terminate_all()
+            pool.shutdown(wait=True, cancel_futures=True)
 
         return results

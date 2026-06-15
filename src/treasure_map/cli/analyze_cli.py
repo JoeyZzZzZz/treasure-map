@@ -133,6 +133,9 @@ def analyze(
                     skip_ingesters=frozenset(skip_ingesters),
                 )
             )
+    except KeyboardInterrupt:
+        click.echo("\nAborted by user — all Ghidra processes terminated.", err=True)
+        raise SystemExit(130) from None
     except GhidraNotFoundError as exc:
         raise click.ClickException(str(exc)) from exc
     except TreasureMapError as exc:
