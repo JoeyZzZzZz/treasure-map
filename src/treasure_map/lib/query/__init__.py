@@ -8,6 +8,12 @@ nothing here scores, ranks, or judges.
 
 from __future__ import annotations
 
+from treasure_map.lib.query.triage import (
+    REVIEW_STATUS_BY_REACHABILITY,
+    TriageCandidate,
+    review_score,
+    triage,
+)
 from treasure_map.lib.query.views import (
     FINE_FP_ALGO_VERSION,
     DensityRow,
@@ -21,11 +27,15 @@ from treasure_map.lib.query.views import (
 
 __all__ = [
     "FINE_FP_ALGO_VERSION",
+    "REVIEW_STATUS_BY_REACHABILITY",
     "DensityRow",
     "LedgerRow",
+    "TriageCandidate",
     "TwinRow",
     "density",
     "dormant",
     "ledger",
+    "review_score",
+    "triage",
     "twins",
 ]

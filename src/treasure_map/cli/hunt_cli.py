@@ -156,6 +156,147 @@ def hunt_pattern(
     )
 
 
+_SECTION_ORDER = ("to-verify", "reachable", "gated")
+_SECTION_HEADER = {
+    "to-verify": "TO-VERIFY  (ranked — start reverse-engineering from the top)",
+    "reachable": "REACHABLE  (already path-confirmed within one function — verify by hand)",
+    "gated": "GATED  (a filter/guard was identified — likely dormant/false)",
+}
+
+
+@click.command("triage", short_help="Rank to-verify candidates for manual reverse-engineering.")
+@click.argument("run_id", required=False, default=None)
+@click.option("--run", "run_opt", default=None, help="Restrict to one run id (overrides RUN_ID).")
+@click.option("--top", "top_n", type=int, default=20, help="Show at most N candidates.")
+@click.option(
+    "--status",
+    type=click.Choice(["to-verify", "reachable", "gated", "all"]),
+    default=None,
+    help="Show only this review status. Default shows to-verify + reachable (gated folded).",
+)
+@click.option(
+    "--include-gated",
+    is_flag=True,
+    default=False,
+    help="Also show gated candidates (folded by default — they are likely dormant/false).",
+)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit structured JSON.")
+@click.option(
+    "--config",
+    "-c",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Path to config.yaml (overrides ~/.treasure-map/config.yaml).",
+)
+@click.option(
+    "--atlas",
+    "atlas_path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Atlas DB path (defaults to the configured atlas.db_path).",
+)
+def triage(
+    run_id: str | None,
+    run_opt: str | None,
+    top_n: int,
+    status: str | None,
+    include_gated: bool,
+    as_json: bool,
+    config: Path | None,
+    atlas_path: Path | None,
+) -> None:
+    """Rank atlas candidates by how much they warrant manual reverse-engineering.
+
+    Read-only: nothing is written back to the atlas and no field is altered. Each row carries
+    its evidence_ref ({run_id}#fn{func_id}) — the anchor to jump back to analysis.db / Ghidra.
+    Candidates are leads for manual review, NOT confirmed results.
+    """
+    import json
+
+    from treasure_map.lib.atlas.connection import open_atlas
+    from treasure_map.lib.config.config import load_config
+    from treasure_map.lib.query import triage as run_triage
+
+    selected_run = run_opt if run_opt is not None else run_id
+    cfg = load_config(config)
+    resolved_atlas = atlas_path if atlas_path is not None else cfg.atlas.db_path
+    conn = open_atlas(resolved_atlas)
+    try:
+        candidates = run_triage(conn, run_id=selected_run)
+    finally:
+        conn.close()
+
+    counts = {"reachable": 0, "to-verify": 0, "gated": 0}
+    for c in candidates:
+        counts[c.review_status] = counts.get(c.review_status, 0) + 1
+
+    # Decide which review statuses to display.
+    if status == "all":
+        shown_statuses = set(_SECTION_ORDER)
+    elif status is not None:
+        shown_statuses = {status}
+    else:
+        shown_statuses = {"to-verify", "reachable"}
+        if include_gated:
+            shown_statuses.add("gated")
+
+    visible = [c for c in candidates if c.review_status in shown_statuses][:top_n]
+
+    if as_json:
+        click.echo(
+            json.dumps(
+                [
+                    {
+                        "score": c.score,
+                        "review_status": c.review_status,
+                        "reachability_status": c.reachability_status,
+                        "function": c.function,
+                        "source_class": c.source_class,
+                        "sink_class": c.sink_class,
+                        "sink_anchor": c.sink_anchor,
+                        "blocking_mechanism": c.blocking_mechanism,
+                        "origin": c.origin,
+                        "source_run_id": c.source_run_id,
+                        "evidence_ref": c.evidence_ref,
+                    }
+                    for c in visible
+                ],
+                indent=2,
+            )
+        )
+        return
+
+    label = selected_run if selected_run is not None else "all runs"
+    click.echo(
+        f"triage: {label}   ({len(candidates)} candidates: "
+        f"{counts['reachable']} reachable, {counts['to-verify']} to-verify, "
+        f"{counts['gated']} gated)"
+    )
+    rank = 0
+    for section in _SECTION_ORDER:
+        if section not in shown_statuses:
+            continue
+        rows = [c for c in visible if c.review_status == section]
+        if not rows:
+            continue
+        click.echo(f"\n  {_SECTION_HEADER[section]}")
+        click.echo("  #   score  status      function (evidence_ref)        source->sink   filter")
+        for c in rows:
+            rank += 1
+            fltr = c.blocking_mechanism if c.blocking_mechanism else "none"
+            click.echo(
+                f"  {rank:<3} {c.score:<5.2f}  {c.review_status:<10}  "
+                f"{c.function or '?'} ({c.evidence_ref or '?'})   "
+                f"{c.source_class} -> {c.sink_anchor or '?'}   {fltr}"
+            )
+    if "gated" not in shown_statuses and counts["gated"]:
+        click.echo(f"\n  (gated: {counts['gated']} hidden; --include-gated to show)")
+    click.echo(
+        "\nNote: candidates are leads for manual review, ranked by how much they warrant "
+        "reverse-engineering — NOT confirmed results."
+    )
+
+
 @click.command("atlas-view", short_help="Neutral cross-firmware atlas aggregation views.")
 @click.argument("view", type=click.Choice(["dormant", "density", "twins", "ledger"]))
 @click.option(

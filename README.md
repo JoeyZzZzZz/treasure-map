@@ -132,9 +132,25 @@ remembers it. Fix anything it marks `❌` (see [Troubleshooting](#troubleshootin
    Useful flags: `--summarize` (function summaries via the S-tier LLM; needs an S-tier key),
    `--skip-non-binary`, `--skip-ingester <KIND>`, `-c <config.yaml>`.
 
-3. **Go further (optional)**, once you have one or more `analysis.db`:
+3. **Hunt for dangerous call-sequence shapes.** Scans one `analysis.db` and writes neutral
+   candidate instances into the atlas.
    ```bash
-   tmap hunt-pattern <analysis.db>        # call-sequence shape candidates
+   tmap hunt-pattern <ws>/analysis.db --run-id router_v1 --device-category router
+   ```
+
+4. **★ Triage — the main path.** One command turns the scattered candidates into a ranked,
+   actionable to-verify list, so you know *which functions to reverse-engineer next*.
+   ```bash
+   tmap triage router_v1            # ranked candidates; start reverse-engineering from the top
+   ```
+   Each row carries an `evidence_ref` (`{run_id}#fn{func_id}`) — the anchor to jump straight back
+   to the source `analysis.db` / Ghidra. Gated (filtered/dormant) candidates are folded by default
+   (`--include-gated` to show); `--top N`, `--status`, and `--json` tune the output. The ranking is
+   a **review order** — triage scales up *finding candidates*; confirming a candidate into a real
+   issue is the manual reverse-engineering work, and stays yours.
+
+5. **Go further (optional)**, once you have one or more `analysis.db`:
+   ```bash
    tmap hunt-diff <old.db> <new.db> ...   # diff two builds, grade reachability
    tmap atlas-view ...                     # neutral cross-firmware aggregation
    ```
