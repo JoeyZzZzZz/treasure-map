@@ -175,3 +175,183 @@ def triage(conn: sqlite3.Connection, *, run_id: str | None = None) -> list[Triag
     candidates = [_candidate(r) for r in rows]
     candidates.sort(key=lambda c: (-c.score, c.function or "", c.evidence_ref or ""))
     return candidates
+
+
+# ── single-candidate explanation (why the score; structure; honest bounds; where to verify) ──
+#
+# This view explains why a candidate ranks high and where to verify it by hand. It presents
+# evidence and bounds; it does NOT declare a candidate real, does NOT claim cross-function
+# reachability, and prints NO triggering input. The terminus is "a human/AI can read it and
+# knows where to verify".
+
+
+@dataclass(frozen=True)
+class ScoreComponent:
+    """One signal's contribution to the review-ordering score, with an honest mechanism note.
+
+    weight is the exact value the signal adds in _raw_score; the components sum to the raw score
+    and, normalized into [score_lo, score_hi], equal the candidate's review_score.
+    """
+
+    signal: str
+    value: str
+    weight: float
+    note: str
+
+
+@dataclass(frozen=True)
+class CandidateExplanation:
+    """A read-only, single-candidate analysis view. A lead with stated bounds, never a verdict."""
+
+    candidate: TriageCandidate
+    call_sequence_shape: str | None
+    components: tuple[ScoreComponent, ...]
+    raw_score: float
+    score_lo: float
+    score_hi: float
+    score: float
+    claims_does: tuple[str, ...]
+    claims_does_not: tuple[str, ...]
+    verify_steps: tuple[str, ...]
+
+
+def _reachability_note(status: str) -> str:
+    if status == "confirmed":
+        return (
+            "a source->sink flow was seen WITHIN ONE function (L1 at most); NOT caller-confirmed, "
+            "NOT cross-function — the tool did not trace who calls this function"
+        )
+    if status == "blocked":
+        return "a filter/guard was identified on the in-function path (likely dormant)"
+    return "not shown reachable within the function — a lead to verify, not a reachability result"
+
+
+def _origin_note(origin: str) -> str:
+    if origin == "custom":
+        return "custom code (likelier to hold a fresh lead than a known component)"
+    if origin == "stock_oss_known":
+        return "recognized stock OSS — a known component, not a new lead"
+    return "origin not decided (neutral)"
+
+
+def _source_note(source_class: str) -> str:
+    if source_class == "external_input":
+        return (
+            "a label that an external-input-class call appears in this function — NOT a proof the "
+            "external input reaches this sink's argument"
+        )
+    return "source class not recognized as external input (neutral)"
+
+
+def score_breakdown(
+    reachability_status: str,
+    blocking_mechanism: str | None,
+    origin: str,
+    source_class: str,
+    sink_class: str,
+    *,
+    sink_anchor: str | None = None,
+) -> list[ScoreComponent]:
+    """Itemize the score: one ScoreComponent per signal, each weight from the real tables.
+
+    The component weights sum to _raw_score(...); normalizing that sum into [score_lo, score_hi]
+    reproduces review_score(...) exactly. No item is invented — each maps to one stored field.
+    """
+    filter_value = "none" if blocking_mechanism is None else blocking_mechanism
+    filter_weight = _FILTER_ABSENT_WEIGHT if blocking_mechanism is None else _FILTER_PRESENT_WEIGHT
+    filter_note = (
+        "no sanitizer identified on the in-function path "
+        "(generic name match — may miss a custom guard)"
+        if blocking_mechanism is None
+        else f"a '{blocking_mechanism}'-class guard was identified "
+        "(generic name match; may misjudge)"
+    )
+    sink_value = sink_class if sink_anchor is None else f"{sink_class} ({sink_anchor})"
+    return [
+        ScoreComponent(
+            "reachability",
+            reachability_status,
+            _STATUS_WEIGHT.get(reachability_status, 0.0),
+            _reachability_note(reachability_status),
+        ),
+        ScoreComponent("filter", filter_value, filter_weight, filter_note),
+        ScoreComponent("origin", origin, _ORIGIN_WEIGHT.get(origin, 0.0), _origin_note(origin)),
+        ScoreComponent(
+            "source_class",
+            source_class,
+            _SOURCE_CLASS_WEIGHT.get(source_class, 0.0),
+            _source_note(source_class),
+        ),
+        ScoreComponent(
+            "sink_class",
+            sink_value,
+            _SINK_CLASS_WEIGHT.get(sink_class, 0.0),
+            "the operation the sink performs (an ordering weight, not a magnitude-of-harm claim)",
+        ),
+    ]
+
+
+def _verify_steps(candidate: TriageCandidate) -> tuple[str, ...]:
+    fn = candidate.function or "the function"
+    ref = candidate.evidence_ref or "<evidence_ref>"
+    sink = candidate.sink_anchor or "the sink"
+    return (
+        f"Open {fn} ({ref}) in Ghidra and confirm whether the argument reaching {sink} comes from "
+        "a truly externally-controllable input.",
+        f"Trace callers: which functions call {fn}, and whether any passes controllable data in "
+        "(cross-function flow is not done by the tool — verify by hand).",
+        "Confirm the path is genuinely unsanitized (the tool's filter check is a generic name "
+        "match and can miss a custom guard).",
+    )
+
+
+def explain_candidate(conn: sqlite3.Connection, evidence_ref: str) -> CandidateExplanation | None:
+    """Return a single-candidate explanation for the instance with this evidence_ref, or None.
+
+    Read-only. Builds the score breakdown from the real weights, the candidate structure, the
+    honest claim bounds, and a manual-verification checklist. Returns None when no instance
+    carries the given evidence_ref (the caller turns that into a friendly error).
+    """
+    row = conn.execute(
+        "SELECT i.reachability_status, i.blocking_mechanism, i.origin, i.source_anchor, "
+        "i.sink_anchor, i.source_run_id, i.evidence_ref, "
+        "p.source_class, p.sink_class, p.call_sequence_shape "
+        "FROM instance i JOIN pattern p ON p.pattern_id = i.pattern_id "
+        "WHERE i.evidence_ref = ?",
+        (evidence_ref,),
+    ).fetchone()
+    if row is None:
+        return None
+
+    candidate = _candidate(row)
+    components = score_breakdown(
+        candidate.reachability_status,
+        candidate.blocking_mechanism,
+        candidate.origin,
+        candidate.source_class,
+        candidate.sink_class,
+        sink_anchor=candidate.sink_anchor,
+    )
+    raw = sum(c.weight for c in components)
+    claims_does = (
+        "within one function, an external-input-class call reaches this sink with no identified "
+        "sanitizer — a shape that warrants reviewing this candidate early.",
+    )
+    claims_does_not = (
+        "confirm the caller passes a controllable value (caller / cross-function flow not done);",
+        "track the external input to this sink's argument (external_input is a class label, not a "
+        "trace);",
+        "establish this is a real, reachable, or controllable issue — it is a lead, not a verdict.",
+    )
+    return CandidateExplanation(
+        candidate=candidate,
+        call_sequence_shape=row["call_sequence_shape"],
+        components=tuple(components),
+        raw_score=raw,
+        score_lo=_SCORE_LO,
+        score_hi=_SCORE_HI,
+        score=candidate.score,
+        claims_does=claims_does,
+        claims_does_not=claims_does_not,
+        verify_steps=_verify_steps(candidate),
+    )

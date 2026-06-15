@@ -10,8 +10,12 @@ from __future__ import annotations
 
 from treasure_map.lib.query.triage import (
     REVIEW_STATUS_BY_REACHABILITY,
+    CandidateExplanation,
+    ScoreComponent,
     TriageCandidate,
+    explain_candidate,
     review_score,
+    score_breakdown,
     triage,
 )
 from treasure_map.lib.query.views import (
@@ -28,14 +32,18 @@ from treasure_map.lib.query.views import (
 __all__ = [
     "FINE_FP_ALGO_VERSION",
     "REVIEW_STATUS_BY_REACHABILITY",
+    "CandidateExplanation",
     "DensityRow",
     "LedgerRow",
+    "ScoreComponent",
     "TriageCandidate",
     "TwinRow",
     "density",
     "dormant",
+    "explain_candidate",
     "ledger",
     "review_score",
+    "score_breakdown",
     "triage",
     "twins",
 ]

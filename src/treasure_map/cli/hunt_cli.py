@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 import click
 
 if TYPE_CHECKING:
-    from treasure_map.lib.query import TriageCandidate
+    from treasure_map.lib.query import CandidateExplanation, TriageCandidate
 
 logger = logging.getLogger(__name__)
 
@@ -245,6 +245,94 @@ def _render_triage(
     )
 
 
+def _render_explain(ex: CandidateExplanation, *, as_json: bool) -> None:
+    """Render one candidate's score breakdown, structure, honest bounds, and verify checklist.
+
+    Presents evidence and bounds only — it does not declare the candidate real and prints no
+    triggering input. Shared shape for human and --json readers (no input-construction field)."""
+    import json
+
+    c = ex.candidate
+    if as_json:
+        click.echo(
+            json.dumps(
+                {
+                    "evidence_ref": c.evidence_ref,
+                    "function": c.function,
+                    "review_status": c.review_status,
+                    "reachability_status": c.reachability_status,
+                    "score": ex.score,
+                    "raw_score": ex.raw_score,
+                    "score_range": [ex.score_lo, ex.score_hi],
+                    "score_breakdown": [
+                        {"signal": s.signal, "value": s.value, "weight": s.weight, "note": s.note}
+                        for s in ex.components
+                    ],
+                    "structure": {
+                        "source_class": c.source_class,
+                        "sink_class": c.sink_class,
+                        "sink_anchor": c.sink_anchor,
+                        "call_sequence_shape": ex.call_sequence_shape,
+                        "blocking_mechanism": c.blocking_mechanism,
+                        "origin": c.origin,
+                    },
+                    "claims_does": list(ex.claims_does),
+                    "claims_does_not": list(ex.claims_does_not),
+                    "verify": list(ex.verify_steps),
+                },
+                indent=2,
+            )
+        )
+        return
+
+    click.echo(
+        f"explain: {c.evidence_ref}   function {c.function or '?'}   "
+        f"sink_class={c.sink_class} ({c.sink_anchor or '?'})"
+    )
+    click.echo(
+        f"\nscore {ex.score:.2f}   "
+        f"(raw {ex.raw_score:+.1f}, normalized into [{ex.score_lo:.1f}, {ex.score_hi:.1f}])"
+    )
+    for s in ex.components:
+        click.echo(f"  {s.signal:<13}= {s.value:<22} {s.weight:+.1f}   {s.note}")
+
+    click.echo("\nstructure:")
+    click.echo(f"  source_class = {c.source_class}")
+    click.echo(f"  sink         = {c.sink_anchor or '?'} ({c.sink_class})")
+    click.echo(f"  shape        = {ex.call_sequence_shape or '?'}")
+    click.echo(f"  function     = {c.function or '?'}")
+
+    click.echo("\nin-function dataflow & filter:")
+    click.echo(f"  {_reachability_inline(c.reachability_status)}")
+    click.echo(f"  filter: {c.blocking_mechanism or 'none identified'}")
+
+    click.echo("\nwhat this score does / does NOT claim:")
+    for line in ex.claims_does:
+        click.echo(f"  DOES: {line}")
+    for line in ex.claims_does_not:
+        click.echo(f"  DOES NOT: {line}")
+
+    click.echo("\nverify (manual — anchors point back to the source function):")
+    for i, step in enumerate(ex.verify_steps, 1):
+        click.echo(f"  {i}. {step}")
+
+    click.echo(
+        "\nNote: this explains why the candidate ranks high and where to verify it — it does NOT "
+        "confirm a real issue and prints no triggering input."
+    )
+
+
+def _reachability_inline(status: str) -> str:
+    if status == "confirmed":
+        return (
+            "a source->sink flow was seen within ONE function (L1 at most) — not caller-confirmed, "
+            "not cross-function"
+        )
+    if status == "blocked":
+        return "a filter/guard was identified on the in-function path"
+    return "not shown reachable within the function (a lead to verify)"
+
+
 @click.command("triage", short_help="Rank to-verify candidates for manual reverse-engineering.")
 @click.argument("run_id", required=False, default=None)
 @click.option("--run", "run_opt", default=None, help="Restrict to one run id (overrides RUN_ID).")
@@ -262,6 +350,13 @@ def _render_triage(
     help="Also show gated candidates (folded by default — they are likely dormant/false).",
 )
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit structured JSON.")
+@click.option(
+    "--explain",
+    "explain_ref",
+    default=None,
+    help="Explain ONE candidate by its evidence_ref (run#fnID): score breakdown, structure, "
+    "honest bounds, and a manual-verify checklist. Ignores --top/--status.",
+)
 @click.option(
     "--config",
     "-c",
@@ -283,6 +378,7 @@ def triage(
     status: str | None,
     include_gated: bool,
     as_json: bool,
+    explain_ref: str | None,
     config: Path | None,
     atlas_path: Path | None,
 ) -> None:
@@ -290,10 +386,12 @@ def triage(
 
     Read-only: nothing is written back to the atlas and no field is altered. Each row carries
     its evidence_ref ({run_id}#fn{func_id}) — the anchor to jump back to analysis.db / Ghidra.
-    Candidates are leads for manual review, NOT confirmed results.
+    Candidates are leads for manual review, NOT confirmed results. Use --explain <evidence_ref>
+    for a single-candidate breakdown.
     """
     from treasure_map.lib.atlas.connection import open_atlas
     from treasure_map.lib.config.config import load_config
+    from treasure_map.lib.query import explain_candidate
     from treasure_map.lib.query import triage as run_triage
 
     selected_run = run_opt if run_opt is not None else run_id
@@ -301,9 +399,22 @@ def triage(
     resolved_atlas = atlas_path if atlas_path is not None else cfg.atlas.db_path
     conn = open_atlas(resolved_atlas)
     try:
-        candidates = run_triage(conn, run_id=selected_run)
+        if explain_ref is not None:
+            explanation = explain_candidate(conn, explain_ref)
+        else:
+            candidates = run_triage(conn, run_id=selected_run)
     finally:
         conn.close()
+
+    if explain_ref is not None:
+        if explanation is None:
+            run_hint = explain_ref.split("#", 1)[0] if "#" in explain_ref else "<run>"
+            raise click.ClickException(
+                f"no candidate with evidence_ref {explain_ref}; "
+                f"run `tmap triage {run_hint}` to list refs"
+            )
+        _render_explain(explanation, as_json=as_json)
+        return
 
     _render_triage(
         candidates,
