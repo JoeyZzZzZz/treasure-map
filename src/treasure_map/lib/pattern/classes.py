@@ -18,6 +18,9 @@ SOURCE_STRONG: frozenset[str] = frozenset(
     {
         "recv",
         "recvfrom",
+        # Generic datagram / scatter-gather socket receives (IPC + network).
+        "recvmsg",
+        "recvmmsg",
         # Generic web/CGI parameter getters (public webserver API style).
         "websGetVar",
         "webGetVar",
@@ -26,8 +29,9 @@ SOURCE_STRONG: frozenset[str] = frozenset(
     }
 )
 
-# Weak: locally-influenced input — file/stream reads, environment, config/device-self
-# values. External controllability is not establishable within a single function.
+# Weak: locally-influenced input — file/stream reads, environment, command-line args,
+# config/device-self values. External controllability is not establishable within a single
+# function.
 SOURCE_WEAK: frozenset[str] = frozenset(
     {
         "read",
@@ -37,7 +41,19 @@ SOURCE_WEAK: frozenset[str] = frozenset(
         "scanf",
         "sscanf",
         "fscanf",
+        # Stream/line/scatter reads (file + socket response bodies).
+        "getline",
+        "getdelim",
+        "pread",
+        "readv",
         "getenv",
+        # Command-line / option parsing (the option argument is locally-influenced input).
+        "getopt",
+        "getopt_long",
+        "getopt_long_only",
+        # System-V / POSIX message-queue IPC receives.
+        "msgrcv",
+        "mq_receive",
         # Generic embedded config store ("non-volatile RAM") getters.
         "nvram_get",
         "nvram_safe_get",

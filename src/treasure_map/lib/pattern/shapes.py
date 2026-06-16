@@ -87,40 +87,84 @@ def _match(
     return replace(partial, structural_fingerprint=structural_fingerprint(partial))
 
 
+# Recall before precision: a dangerous sink callsite is a candidate even when no source is
+# recognized in this function (the controlled input may arrive through a caller — a cross-function
+# flow the intra-procedural scan cannot see). Source presence is a SCORING signal, not a detection
+# gate: it sets source_class (external_input vs unknown) and the shape label; its absence lowers the
+# downstream review score (see the analyzer / triage) rather than dropping the candidate. A bare
+# sink that is never listed would be the most hidden false negative.
+
+
+def _source_class(cc: CallClasses) -> str:
+    return "external_input" if cc.source else "unknown"
+
+
 def pattern_a(func_ref: FuncRef, callees: list[str], pseudocode: str) -> PatternMatch | None:
-    """Command-injection shape: source + format + command sink, with a shell-ish %s literal."""
+    """Command-injection shape: a shell-ish %s command string is built and run.
+
+    Requires format + command sink + a shell-ish %s literal (a constructed shell command).
+    Source is no longer a gate — when absent, source_class is 'unknown' and the shape drops the
+    'source->' prefix; the value may still arrive from a caller (e.g. an argv/optarg path)."""
     cc = classify(callees)
-    if not (cc.source and cc.fmt and cc.cmd):
+    if not (cc.fmt and cc.cmd):
         return None
     literal = _shellish_format_literal(pseudocode)
     if literal is None:
         return None
+    has_src = bool(cc.source)
     return _match(
         func_ref,
         "cmd_injection_shape",
-        "external_input",
+        _source_class(cc),
         "cmd",
-        "source->format->cmd",
+        "source->format->cmd" if has_src else "format->cmd",
         literal,
     )
 
 
-def pattern_b(func_ref: FuncRef, callees: list[str], pseudocode: str) -> PatternMatch | None:
-    """Overflow shape: source + a copy sink. Evidence is the matched copy callee name."""
+def bare_cmd(func_ref: FuncRef, callees: list[str], pseudocode: str) -> PatternMatch | None:
+    """Bare command-sink fallback: a command sink with NO constructed shell command.
+
+    Fires only when pattern_a does not (no shell-ish %s literal). This is the recall net for
+    command-exec sinks (system/popen/exec*) that pattern_a's shape gate would otherwise drop —
+    listed at a low score (the analyzer marks it / downweights it), never silently omitted."""
     cc = classify(callees)
-    if not (cc.source and cc.copy):
+    if not cc.cmd:
         return None
+    if cc.fmt and _shellish_format_literal(pseudocode) is not None:
+        return None  # pattern_a owns the constructed-shell-command case
+    return _match(
+        func_ref,
+        "bare_cmd_shape",
+        _source_class(cc),
+        "cmd",
+        "source->cmd" if cc.source else "cmd",
+        sorted(cc.cmd)[0],
+    )
+
+
+def pattern_b(func_ref: FuncRef, callees: list[str], pseudocode: str) -> PatternMatch | None:
+    """Copy/overflow shape: a copy sink. Source is a scoring signal, not a gate.
+
+    Evidence is the matched copy callee. When no source is recognized the shape is bare 'copy'
+    (source_class 'unknown') and is downweighted downstream, not dropped."""
+    cc = classify(callees)
+    if not cc.copy:
+        return None
+    has_src = bool(cc.source)
     return _match(
         func_ref,
         "overflow_shape",
-        "external_input",
+        _source_class(cc),
         "copy",
-        "source->copy",
+        "source->copy" if has_src else "copy",
         sorted(cc.copy)[0],
     )
 
 
 Detector = Callable[[FuncRef, list[str], str], "PatternMatch | None"]
 
-# Explicit registry — one entry per shape, plain callables only.
-DETECTORS: tuple[Detector, ...] = (pattern_a, pattern_b)
+# Explicit registry — one entry per shape, plain callables only. pattern_a and bare_cmd are
+# mutually exclusive on the same function (bare_cmd defers when pattern_a's shell-ish literal is
+# present), so each (function, sink class) yields at most one candidate.
+DETECTORS: tuple[Detector, ...] = (pattern_a, bare_cmd, pattern_b)

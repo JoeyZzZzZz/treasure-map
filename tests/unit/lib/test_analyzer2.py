@@ -33,10 +33,21 @@ _ATLAS_SCHEMA = _SRC / "lib" / "storage" / "atlas_schema.sql"
 RAW_EVIDENCE = "/usr/bin/tool %s"
 
 
-def _make_db(tmp_path: Path, binaries: list[dict[str, object]]) -> Path:
+def _make_db(
+    tmp_path: Path,
+    binaries: list[dict[str, object]],
+    *,
+    xrefs: list[tuple[int, int]] | None = None,
+) -> Path:
     db_path = tmp_path / "analysis.db"
     conn = open_db(db_path)
     fid = 0
+    for caller_fid, callee_fid in xrefs or []:
+        conn.execute(
+            "INSERT INTO xrefs (caller_func_id, callee_func_id, xref_type) "
+            "VALUES (?, ?, 'import_export')",
+            (caller_fid, callee_fid),
+        )
     for bid, spec in enumerate(binaries, start=1):
         conn.execute(
             "INSERT INTO binaries (id, name, path, sha256) VALUES (?, ?, ?, ?)",
@@ -499,6 +510,91 @@ def test_plain_shell_candidate_is_not_downweighted(tmp_path: Path) -> None:
     atlas = tmp_path / "atlas.db"
     run_analyzer2(db, atlas, source_run_id="run_a")
     assert _by_anchor(atlas)["clean_handle"]["blocking_mechanism"] is None
+
+
+# ── work item B: bare-sink recall + cross-function source (#8 reverse example) ──────
+
+
+def test_bare_sink_no_source_is_listed_and_downweighted(tmp_path: Path) -> None:
+    # A command sink with no in-function source and no constructed shell command is LISTED
+    # (recall) but downweighted (bare_sink) below a real shell-construction candidate.
+    bare = {
+        "name": "do_exec",
+        "pseudocode": "system(param_1);",
+        "hash": "h_bare",
+        "callees": ["system"],
+    }
+    db = _make_db(
+        tmp_path,
+        [{"name": "svcd", "funcs": [_cmd_injection_fn("real", param_sourced=False), bare]}],
+    )
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_b")
+
+    rows = _by_anchor(atlas)
+    assert "do_exec" in rows  # not silently dropped
+    assert rows["do_exec"]["blocking_mechanism"] == "bare_sink"
+    assert rows["do_exec"]["reachability_status"] != "blocked"  # listed, never graded blocked
+    assert _score_of(atlas, "do_exec") < _score_of(atlas, "real")
+
+
+def test_cross_function_source_system_enters_candidates(tmp_path: Path) -> None:
+    # The #8 reverse example: a real system("…%s…") built from an optarg/argv value that crosses a
+    # function boundary (source is in the caller). It MUST enter the candidate list, and — because
+    # it builds a shell command (cmd_injection_shape) — must NOT be downweighted to the bottom.
+    apply_mac = {
+        "name": "apply_mac",
+        "pseudocode": "void apply_mac(char* param_1){ char cmd[128]; "
+        'snprintf(cmd,128,"kickmac %s; reboot",param_1); system(cmd); }',
+        "hash": "h_apply",
+        "callees": ["snprintf", "system"],
+    }
+    parse_args = {
+        "name": "parse_args",
+        "pseudocode": "void parse_args(int argc,char** argv){ "
+        'getopt_long(argc,argv,"m:",0,0); apply_mac(optarg); }',
+        "hash": "h_parse",
+        "callees": ["getopt_long", "apply_mac"],
+    }
+    # caller_func_id=2 (parse_args) -> callee_func_id=1 (apply_mac)
+    db = _make_db(
+        tmp_path,
+        [{"name": "iotd", "funcs": [apply_mac, parse_args]}],
+        xrefs=[(2, 1)],
+    )
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_8")
+
+    rows = _by_anchor(atlas)
+    assert "apply_mac" in rows  # the cross-function shell sink is a candidate (recall win)
+    # caller passes a VARIABLE (optarg), not a constant -> NOT caller_constant; and a constructed
+    # shell command is exempt from bare_sink -> it is NOT downweighted to the bottom.
+    assert rows["apply_mac"]["blocking_mechanism"] is None
+    # ranks above a truly-bare constant-caller sink (the "suspicious but unproven" band).
+    assert _score_of(atlas, "apply_mac") > 0.4
+
+
+def test_caller_constant_downweights_constant_supplied_sink(tmp_path: Path) -> None:
+    # caller_constant (A) activates on B's bare-sink candidates: a sink fed only a constant by its
+    # sole one-hop caller ranks at the very bottom.
+    run_cmd = {
+        "name": "run_cmd",
+        "pseudocode": "void run_cmd(char* param_1){ system(param_1); }",
+        "hash": "h_run",
+        "callees": ["system"],
+    }
+    boot = {
+        "name": "boot",
+        "pseudocode": 'void boot(void){ run_cmd("/etc/init.d/rcS"); }',
+        "hash": "h_boot",
+        "callees": ["run_cmd"],
+    }
+    db = _make_db(tmp_path, [{"name": "initd", "funcs": [run_cmd, boot]}], xrefs=[(2, 1)])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_cc")
+
+    rows = _by_anchor(atlas)
+    assert rows["run_cmd"]["blocking_mechanism"] == "caller_constant"
 
 
 # ── BOUNDARY ────────────────────────────────────────────────────────────────────────

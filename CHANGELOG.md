@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Candidate generation — recall before precision: a recognized source is no longer a *gate* for
+  emitting a candidate, only a scoring signal. The command-injection shape now matches on a
+  constructed shell command (format + shell-ish `%s` + command sink) whether or not an
+  in-function source is recognized (the controlled value may arrive through a caller), and a new
+  bare command-sink fallback lists any `system`/`popen`/`exec*` callsite that has no constructed
+  shell command at all. The copy/overflow shape likewise lists any `strcpy`/`strncpy`/`memcpy`
+  callsite. A bare sink with no in-function source is listed but ranked low (`bare_sink`) instead
+  of being silently dropped — a never-listed candidate is the most hidden false negative. Source
+  coverage widened (getopt/getopt_long, recvmsg/recvmmsg, getline/getdelim/pread/readv, msgrcv/
+  mq_receive). On one real device this lifted command-exec recall from ~0 to ~all callsites while
+  the top of the ranked list stayed real source→sink shapes (the bare/exec/numeric forms sank to
+  the low band). The reachability grader is unchanged.
+
 ### Added
 
 - FP-suppression downweighting (recall-neutral): the pattern analyzer now recognizes known

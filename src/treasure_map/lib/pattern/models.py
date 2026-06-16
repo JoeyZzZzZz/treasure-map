@@ -14,7 +14,13 @@ from typing import Literal
 
 # The structural shape a function's call sequence matched. A shape is a lead, not a
 # verdict: whether any candidate is real is a separate, later reachability question.
-PatternKind = Literal["cmd_injection_shape", "overflow_shape"]
+# The bare_* kinds are the recall fallback: a dangerous sink callsite with no constructed
+# shell command (cmd) — listed at a low score rather than silently dropped.
+PatternKind = Literal[
+    "cmd_injection_shape",
+    "overflow_shape",
+    "bare_cmd_shape",
+]
 
 
 @dataclass(frozen=True)
@@ -52,6 +58,7 @@ class PatternStats:
     custom_functions: int  # functions in kept (non-OSS) binaries — the detector inputs
     pattern_a: int  # cmd_injection_shape matches
     pattern_b: int  # overflow_shape matches
+    bare_cmd: int = 0  # bare_cmd_shape matches (cmd sink, no constructed shell command)
 
 
 @dataclass(frozen=True)

@@ -159,10 +159,14 @@ statuses** — by callee (`--sink system`, `popen`, `execl`, `strcpy`) or class 
 format`). Use `--sink system` when a recalled sink you care about is scored low and would otherwise
 sit below the default cap.
 
-Known low-yield forms are **ranked low, never dropped**: an exec sink that bypasses the shell, a
-value the function numerically validates, a constant passed in by the sole caller, and code
-recognized as a third-party library (by symbol) all sink to the bottom of their tier so the real
-shapes float up — but every one stays a listed candidate you can still pull up with `--sink`/`--all`. `--explain <#|evidence_ref>` opens a single candidate: an itemized
+**Recall before precision.** A dangerous sink callsite (`system`/`popen`/`exec*`, `strcpy`/`memcpy`/…)
+is listed as a candidate even when no input source is recognized inside the function — the
+controlled value may arrive through a caller, and a candidate that is never listed is the most
+hidden false negative. Known low-yield forms are then **ranked low, never dropped**: a bare sink
+with no in-function source, an exec sink that bypasses the shell, a value the function numerically
+validates, a constant passed in by the sole caller, and code recognized as a third-party library
+(by symbol) all sink to the bottom of their tier so the real source→sink shapes float up — but
+every one stays a listed candidate you can still pull up with `--sink`/`--all`. `--explain <#|evidence_ref>` opens a single candidate: an itemized
 breakdown of **why its score is what it is** (each point maps to a real signal), the call structure,
 the **honest bounds** (reachability is single-function/L1, no caller traced, no cross-function flow;
 `external_input` is a class label, not a trace), and a **manual-verify checklist** with anchors. It

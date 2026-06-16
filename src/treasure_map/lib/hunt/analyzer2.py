@@ -157,6 +157,15 @@ def run_analyzer2(
                         func_name=match.func_ref.func_name,
                         callers_pseudocode=callers_pc,
                     )
+                # Recall fallback: a bare sink with no recognized in-function source (and no
+                # constructed shell command — cmd_injection_shape is exempt; its shell-ish literal
+                # is signal enough that the value may be caller-supplied) is listed but ranked low.
+                if (
+                    blocking is None
+                    and match.source_class == "unknown"
+                    and match.pattern_kind != "cmd_injection_shape"
+                ):
+                    blocking = "bare_sink"
 
                 provenance = "L1" if status in {"confirmed", "blocked"} else "L0"
                 pattern_id = upsert_pattern(

@@ -86,7 +86,7 @@ def test_pattern_a_positive(tmp_path: Path) -> None:
     assert m.func_ref.func_name == "handle_req"
 
 
-def test_pattern_a_negative_non_shellish_literal(tmp_path: Path) -> None:
+def test_pattern_a_non_shellish_literal_falls_back_to_bare_cmd(tmp_path: Path) -> None:
     db = _make_db(
         tmp_path,
         [
@@ -103,9 +103,83 @@ def test_pattern_a_negative_non_shellish_literal(tmp_path: Path) -> None:
         ],
     )
     res = scan(db)
-    # Same call classes, but the %s literal is not shell-ish → the predicate gates it.
-    assert res.matches == ()
+    # The %s literal is not shell-ish, so the rich cmd_injection shape does NOT match — but the
+    # command sink is NOT silently dropped (recall before precision, §15.2): it falls back to a
+    # bare_cmd candidate, to be ranked low downstream rather than omitted.
     assert res.stats.pattern_a == 0
+    assert res.stats.bare_cmd == 1
+    (m,) = res.matches
+    assert m.pattern_kind == "bare_cmd_shape"
+    assert m.sink_class == "cmd"
+
+
+def test_bare_cmd_with_no_source_is_listed(tmp_path: Path) -> None:
+    # A command sink with no recognized source and no constructed shell command: still a candidate
+    # (the controlled value may arrive via a caller). Never silently omitted.
+    db = _make_db(
+        tmp_path,
+        [
+            {
+                "name": "svcd",
+                "funcs": [
+                    {
+                        "name": "do_reboot",
+                        "pseudocode": "system(param_1);",
+                        "callees": ["system"],
+                    }
+                ],
+            }
+        ],
+    )
+    res = scan(db)
+    (m,) = res.matches
+    assert m.pattern_kind == "bare_cmd_shape"
+    assert m.source_class == "unknown"  # no in-function source recognized
+    assert m.call_sequence_shape == "cmd"
+
+
+def test_bare_copy_with_no_source_is_listed(tmp_path: Path) -> None:
+    db = _make_db(
+        tmp_path,
+        [
+            {
+                "name": "svcd",
+                "funcs": [{"name": "cpy", "pseudocode": "strcpy(d,s);", "callees": ["strcpy"]}],
+            }
+        ],
+    )
+    res = scan(db)
+    (m,) = res.matches
+    assert m.pattern_kind == "overflow_shape"
+    assert m.source_class == "unknown"
+    assert m.call_sequence_shape == "copy"
+
+
+def test_widened_source_recognizes_getopt(tmp_path: Path) -> None:
+    # getopt-family option parsing is a recognized (weak) source: a command sink in such a
+    # function is source-classified external_input, not bare.
+    db = _make_db(
+        tmp_path,
+        [
+            {
+                "name": "toold",
+                "funcs": [
+                    {
+                        "name": "main_opt",
+                        "pseudocode": (
+                            'getopt_long(argc,argv,"m:",0,0); '
+                            'snprintf(c,64,"/bin/x %s",optarg); system(c);'
+                        ),
+                        "callees": ["getopt_long", "snprintf", "system"],
+                    }
+                ],
+            }
+        ],
+    )
+    res = scan(db)
+    (m,) = res.matches
+    assert m.pattern_kind == "cmd_injection_shape"
+    assert m.source_class == "external_input"  # getopt_long recognized as a source
 
 
 # ── Pattern B — overflow shape ──────────────────────────────────────────────────────
