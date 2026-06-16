@@ -15,11 +15,13 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class FuncRow:
-    """One function row joined to its binary's name (presentation-neutral)."""
+    """One function row joined to its binary's name, path, and content hash (neutral)."""
 
     func_id: int
     binary_id: int
     binary_name: str
+    binary_path: str | None
+    binary_sha256: str | None
     name: str | None
     pseudocode: str | None
     pseudocode_hash: str | None
@@ -27,7 +29,8 @@ class FuncRow:
 
 
 _SELECT = """
-SELECT f.id, f.binary_id, b.name AS binary_name, f.name,
+SELECT f.id, f.binary_id, b.name AS binary_name, b.path AS binary_path,
+       b.sha256 AS binary_sha256, f.name,
        f.pseudocode, f.pseudocode_hash, f.callees
   FROM functions f
   JOIN binaries b ON b.id = f.binary_id
@@ -53,6 +56,8 @@ def load_functions(db_path: Path | str) -> list[FuncRow]:
             func_id=r["id"],
             binary_id=r["binary_id"],
             binary_name=r["binary_name"],
+            binary_path=r["binary_path"],
+            binary_sha256=r["binary_sha256"],
             name=r["name"],
             pseudocode=r["pseudocode"],
             pseudocode_hash=r["pseudocode_hash"],

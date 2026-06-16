@@ -33,6 +33,11 @@ CREATE TABLE IF NOT EXISTS instance (
     fix_diff            TEXT,             -- neutral change region; redact on export
     scope_origin        TEXT,             -- intra_firmware | intra_vendor | cross_vendor
     evidence_ref        TEXT,             -- provenance trail to source analysis.db + binary/function
+    binary_path         TEXT,             -- full path of the binary the evidence function lives in;
+                                          --   auto-filled from the source build so a candidate stays
+                                          --   locatable when analysis.db is gone. REDACT ON EXPORT.
+    binary_content_hash TEXT,             -- content hash of that binary (content-identity); auto-filled,
+                                          --   stored only this round (no metric consumes it yet). REDACT ON EXPORT.
     -- origin is not forced at ingest; default unknown is expected (refined later at aggregation)
     origin              TEXT NOT NULL DEFAULT 'unknown'
         CHECK (origin IN ('custom','vendor_modified_oss','stock_oss_known','unknown')),
@@ -53,9 +58,11 @@ CREATE VIEW IF NOT EXISTS public_finding AS
   WHERE reachability_status = 'confirmed' AND provenance_level IN ('L2','L3');
 
 -- density_candidate: neutral clustering of candidate instances — "where do dangerous-sink
--- candidate shapes cluster". The atlas stores no binary identity (by design), so the scope
--- dimension is the neutral source_run_id. Counts per run / sink_class / structural_fingerprint.
--- All rows are LEADS; counts only, no scoring or ranking column.
+-- candidate shapes cluster". The scope dimension is the neutral source_run_id. Counts per run /
+-- sink_class / structural_fingerprint. All rows are LEADS; counts only, no scoring or ranking
+-- column. (The atlas is a PRIVATE, out-of-repo runtime evidence store; it may hold neutral
+-- binary_path / binary_content_hash as private evidence — REDACTED before any export/publish.
+-- The zero-vendor-identity rule binds artifacts committed to the public repo, not this store.)
 CREATE VIEW IF NOT EXISTS density_candidate AS
   SELECT i.source_run_id          AS source_run_id,
          p.sink_class             AS sink_class,

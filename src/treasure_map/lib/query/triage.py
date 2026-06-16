@@ -102,6 +102,9 @@ class TriageCandidate:
     origin: str
     source_run_id: str | None
     evidence_ref: str | None
+    # Which binary to open in the decompiler. Read straight from the atlas (NOT a read-time
+    # join back to analysis.db), so a candidate is locatable even when the source build is gone.
+    binary_path: str | None
 
 
 def _raw_score(
@@ -152,6 +155,7 @@ def _candidate(row: sqlite3.Row) -> TriageCandidate:
         origin=row["origin"],
         source_run_id=row["source_run_id"],
         evidence_ref=row["evidence_ref"],
+        binary_path=row["binary_path"],
     )
 
 
@@ -166,7 +170,7 @@ def triage(conn: sqlite3.Connection, *, run_id: str | None = None) -> list[Triag
     """
     sql = (
         "SELECT i.reachability_status, i.blocking_mechanism, i.origin, i.source_anchor, "
-        "i.sink_anchor, i.source_run_id, i.evidence_ref, "
+        "i.sink_anchor, i.source_run_id, i.evidence_ref, i.binary_path, "
         "p.source_class, p.sink_class "
         "FROM instance i JOIN pattern p ON p.pattern_id = i.pattern_id"
     )
@@ -298,9 +302,10 @@ def _verify_steps(candidate: TriageCandidate) -> tuple[str, ...]:
     fn = candidate.function or "the function"
     ref = candidate.evidence_ref or "<evidence_ref>"
     sink = candidate.sink_anchor or "the sink"
+    where = f" in {candidate.binary_path}" if candidate.binary_path else ""
     return (
-        f"Open {fn} ({ref}) in Ghidra and confirm whether the argument reaching {sink} comes from "
-        "a truly externally-controllable input.",
+        f"Open {fn}{where} ({ref}) in Ghidra and confirm whether the argument reaching {sink} "
+        "comes from a truly externally-controllable input.",
         f"Trace callers: which functions call {fn}, and whether any passes controllable data in "
         "(cross-function flow is not done by the tool — verify by hand).",
         "Confirm the path is genuinely unsanitized (the tool's filter check is a generic name "
@@ -317,7 +322,7 @@ def explain_candidate(conn: sqlite3.Connection, evidence_ref: str) -> CandidateE
     """
     rows = conn.execute(
         "SELECT i.reachability_status, i.blocking_mechanism, i.origin, i.source_anchor, "
-        "i.sink_anchor, i.source_run_id, i.evidence_ref, "
+        "i.sink_anchor, i.source_run_id, i.evidence_ref, i.binary_path, "
         "p.source_class, p.sink_class, p.call_sequence_shape "
         "FROM instance i JOIN pattern p ON p.pattern_id = i.pattern_id "
         "WHERE i.evidence_ref = ? "

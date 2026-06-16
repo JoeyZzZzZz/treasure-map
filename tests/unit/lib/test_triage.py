@@ -50,6 +50,7 @@ def _inst(
     blocking: str | None = None,
     fn: str = "fn",
     sink_anchor: str = "system",
+    binary_path: str | None = None,
 ) -> None:
     _FID[0] += 1
     provenance = "L1" if status in {"confirmed", "blocked"} else "L0"
@@ -67,6 +68,7 @@ def _inst(
             evidence_ref=f"{run_id}#fn{_FID[0]}",
             scope_origin="intra",
             origin=origin,
+            binary_path=binary_path,
         ),
     )
 
@@ -305,3 +307,73 @@ def test_cli_explain_rank_out_of_range_errors(tmp_path: Path) -> None:
     result = CliRunner().invoke(triage_cmd, ["run_cli", "--explain", "999", "--atlas", str(atlas)])
     assert result.exit_code != 0
     assert "out of range" in result.output
+
+
+# ── CLI: candidate locatability (binary path) + intended-use notice ─────────────────
+
+
+def _seed_with_location(tmp_path: Path) -> Path:
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp")
+    _inst(
+        conn,
+        p,
+        status="unknown",
+        origin="custom",
+        fn="tv_fn",
+        run_id="run_loc",
+        binary_path="usr/sbin/webd",
+    )
+    conn.close()
+    return tmp_path / "atlas.db"
+
+
+def test_cli_triage_shows_binary_location(tmp_path: Path) -> None:
+    atlas = _seed_with_location(tmp_path)
+    result = CliRunner().invoke(triage_cmd, ["run_loc", "--atlas", str(atlas)])
+    assert result.exit_code == 0, result.output
+    assert "usr/sbin/webd" in result.output  # the binary to open is shown, actionable
+
+
+def test_cli_triage_json_includes_binary_path(tmp_path: Path) -> None:
+    import json
+
+    atlas = _seed_with_location(tmp_path)
+    result = CliRunner().invoke(triage_cmd, ["run_loc", "--json", "--atlas", str(atlas)])
+    assert result.exit_code == 0, result.output
+    rows = json.loads(result.output)  # --json must be clean JSON (no notice framing)
+    assert rows[0]["binary_path"] == "usr/sbin/webd"
+
+
+def test_cli_triage_prints_intended_use_notice(tmp_path: Path) -> None:
+    atlas = _seed_with_location(tmp_path)
+    result = CliRunner().invoke(triage_cmd, ["run_loc", "--atlas", str(atlas)])
+    assert result.exit_code == 0, result.output
+    assert "defensive firmware-audit" in result.output
+    assert "your responsibility" in result.output
+
+
+def test_cli_triage_json_omits_notice(tmp_path: Path) -> None:
+    atlas = _seed_with_location(tmp_path)
+    result = CliRunner().invoke(triage_cmd, ["run_loc", "--json", "--atlas", str(atlas)])
+    assert result.exit_code == 0, result.output
+    assert "defensive firmware-audit" not in result.output  # notice suppressed under --json
+
+
+def test_cli_explain_shows_binary_location(tmp_path: Path) -> None:
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp")
+    _inst(
+        conn,
+        p,
+        status="unknown",
+        origin="custom",
+        fn="tv_fn",
+        run_id="run_e",
+        binary_path="usr/sbin/webd",
+    )
+    conn.close()
+    atlas = tmp_path / "atlas.db"
+    result = CliRunner().invoke(triage_cmd, ["run_e", "--explain", "1", "--atlas", str(atlas)])
+    assert result.exit_code == 0, result.output
+    assert "usr/sbin/webd" in result.output

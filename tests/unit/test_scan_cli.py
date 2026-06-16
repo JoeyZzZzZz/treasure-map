@@ -234,9 +234,12 @@ def test_scan_triage_segment_matches_triage_command(
     assert scan_out.exit_code == 0, scan_out.output
     assert triage_out.exit_code == 0, triage_out.output
 
-    # scan's triage block (from the "triage: ..." header onward) must equal the triage command.
+    # scan's triage block (from the "triage: ..." header onward) must equal the triage command's
+    # rendered list. Both commands prepend the same intended-use notice; the shared renderer's
+    # output is what must not drift, so compare from the "triage: ..." header in both.
     block = scan_out.output[scan_out.output.index("triage: ") :]
-    assert block == triage_out.output
+    triage_block = triage_out.output[triage_out.output.index("triage: ") :]
+    assert block == triage_block
 
 
 # ── 4. triage presentation options pass through ─────────────────────────────────────

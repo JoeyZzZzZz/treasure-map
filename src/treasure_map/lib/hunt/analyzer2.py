@@ -135,6 +135,12 @@ def run_analyzer2(
                         evidence_ref=(
                             f"{source_run_id}#fn{match.func_ref.func_id}@{match.sink_class}"
                         ),
+                        # Candidate locatability: which binary to open in the decompiler. Carried
+                        # from the source build so the candidate stays locatable once analysis.db
+                        # is gone (atlas is the persistent store). Falls back to the bare name when
+                        # the source has no path. Content hash is stored only (no consumer yet).
+                        binary_path=row.binary_path or row.binary_name,
+                        binary_content_hash=row.binary_sha256,
                         scope_origin="intra",
                     ),
                     commit=False,

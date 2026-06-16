@@ -641,16 +641,27 @@ def test_open_atlas_migrates_old_schema_in_place(tmp_path: Path) -> None:
         inst_cols = _cols(conn, "instance")
         pat_cols = _cols(conn, "pattern")
         assert "origin" in inst_cols  # added
+        assert "binary_path" in inst_cols  # added this round (locatability)
+        assert "binary_content_hash" in inst_cols  # added this round (store-only)
         assert "device_spread" in pat_cols  # renamed
         assert "recurrence_breadth" not in pat_cols  # old name gone
         assert "device_category" not in pat_cols  # legacy column hard-dropped
-        # existing rows preserved; the added column took its default on the old rows
+        # existing rows preserved; the added columns took their defaults on the old rows
         rows = conn.execute("SELECT origin FROM instance ORDER BY instance_id").fetchall()
         assert [r[0] for r in rows] == ["unknown", "unknown"]
+        # the new nullable locator columns are NULL on pre-migration rows (no data invented)
+        loc = conn.execute(
+            "SELECT binary_path, binary_content_hash FROM instance ORDER BY instance_id"
+        ).fetchall()
+        assert all(r[0] is None and r[1] is None for r in loc)
         assert conn.execute("SELECT COUNT(*) FROM instance").fetchone()[0] == 2
         assert conn.execute("SELECT COUNT(*) FROM pattern").fetchone()[0] == 1
         # the renamed column keeps the old value — no data lost in the drop/rename
         assert conn.execute("SELECT device_spread FROM pattern").fetchone()[0] == 2
+        # the derived ledger still computes the same numbers (adding columns did not touch counts)
+        led = conn.execute("SELECT device_spread, pattern_breadth FROM pattern_ledger").fetchone()
+        assert led[0] == 2  # two distinct source_run_id
+        assert led[1] == 2  # two distinct pseudocode_hash, origin defaulted to unknown
     finally:
         conn.close()
 

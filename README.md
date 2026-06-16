@@ -123,9 +123,11 @@ tmap scan ./_firmware.extracted -w router_v1
 
 `tmap scan` runs the whole pipeline — **analyze → hunt → triage** — and ends by printing a
 **ranked, ready-to-act candidate list**: the functions worth reverse-engineering first, each with
-an `evidence_ref` (`{run_id}#fn{func_id}`) anchor back to the source `analysis.db` / Ghidra. It is
-slow in the **analyze** stage (one Ghidra JVM per binary) and shows **per-stage progress** so you
-can see it working; the last stage is the same readable triage table as `tmap triage`.
+an `evidence_ref` (`{run_id}#fn{func_id}@{sink}`) anchor and — printed under the row as `in: …` —
+the **full path of the binary to open** in your decompiler, so a candidate in a firmware of
+hundreds of binaries is directly actionable. It is slow in the **analyze** stage (one Ghidra JVM per
+binary) and shows **per-stage progress** so you can see it working; the last stage is the same
+readable triage table as `tmap triage`.
 
 The ranking is a **review order** — `scan` scales up *finding candidates*; confirming a candidate
 into a real issue is the manual reverse-engineering work, and stays yours. Gated (filtered/dormant)
@@ -147,7 +149,9 @@ tmap triage router_v1 --explain 1    # explain rank #1 (also accepts --explain <
 
 `tmap triage` lists candidates in one global score-descending order — the `#` is a **stable rank**
 (1 = highest, look first) that names the same candidate regardless of `--top`/`--status`, so you can
-pass it straight to `--explain`. `--explain <#|evidence_ref>` opens a single candidate: an itemized
+pass it straight to `--explain`. Each row prints, under it, `in: <binary path>` — the binary to open
+in your decompiler. That location is stored in the atlas, so candidates stay locatable **even after
+the per-firmware `analysis.db` is wiped/rebuilt**. `--explain <#|evidence_ref>` opens a single candidate: an itemized
 breakdown of **why its score is what it is** (each point maps to a real signal), the call structure,
 the **honest bounds** (reachability is single-function/L1, no caller traced, no cross-function flow;
 `external_input` is a class label, not a trace), and a **manual-verify checklist** with anchors. It
@@ -224,6 +228,29 @@ Two things that trip people up:
 | `atlas_dir` / `workspace_dir: not writable` | Ensure `~/.treasure-map/` (and any custom paths in `config.yaml`) are writable. |
 
 Re-run `tmap init` after any fix to re-check.
+
+## Intended Use & Legal
+
+**Purpose.** Treasure Map supports defensive security auditing and
+vulnerability research on firmware. It produces candidate findings and
+analysis leads; by design it does **not** generate proof-of-concept
+exploits, payloads, shellcode, or other directly weaponizable output.
+
+**Lawful use is yours to ensure.** Only analyze firmware you lawfully
+possess — e.g. a device you own, or firmware made genuinely public by its
+vendor and obtained **without** bypassing any login, paywall, or access
+control. Even lawfully obtained firmware may be subject to license,
+terms-of-service, or contractual restrictions on reverse engineering; you
+are responsible for reviewing them.
+
+**Findings are candidates, not verdicts.** Output requires independent
+human verification and is not a confirmed vulnerability.
+
+**No warranty; your responsibility.** The tool is provided "as is," without
+warranty of any kind. You are solely responsible for how you use it and for
+ensuring your activity is lawful in your jurisdiction. If you are unsure
+whether a given analysis is permitted, consult qualified legal counsel
+before proceeding.
 
 ## Status
 

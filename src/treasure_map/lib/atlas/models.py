@@ -41,6 +41,10 @@ class InstanceRow:
     fix_diff: str | None = None
     scope_origin: str | None = None
     evidence_ref: str | None = None
+    # Candidate locatability: the full path + content hash of the binary the evidence function
+    # lives in. Auto-filled from the source build; both REDACT ON EXPORT (private evidence).
+    binary_path: str | None = None
+    binary_content_hash: str | None = None
     # Neutral origin dimension; not forced at ingest — defaults to 'unknown' (refined later
     # at the aggregation layer). One of custom/vendor_modified_oss/stock_oss_known/unknown.
     origin: str = "unknown"

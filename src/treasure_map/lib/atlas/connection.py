@@ -38,6 +38,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
             )
         except sqlite3.OperationalError:
             conn.execute("ALTER TABLE instance ADD COLUMN origin TEXT NOT NULL DEFAULT 'unknown'")
+    # Candidate locatability (added this round): nullable TEXT columns, so existing rows simply
+    # carry NULL until re-hunted. Idempotent — each ADD runs only while its column is missing.
+    if inst_cols and "binary_path" not in inst_cols:
+        conn.execute("ALTER TABLE instance ADD COLUMN binary_path TEXT")
+    if inst_cols and "binary_content_hash" not in inst_cols:
+        conn.execute("ALTER TABLE instance ADD COLUMN binary_content_hash TEXT")
 
     pat_cols = _column_names(conn, "pattern")
     if "recurrence_breadth" in pat_cols and "device_spread" not in pat_cols:
@@ -54,8 +60,9 @@ def open_atlas(db_path: Path) -> sqlite3.Connection:
 
     The schema uses IF NOT EXISTS throughout, so re-applying it to an existing database is
     safe and preserves all rows. An older atlas is then brought forward in place by _migrate
-    (adds instance.origin, renames pattern.recurrence_breadth -> device_spread,
-    drops legacy pattern.device_category) — never by a table rebuild, so instance rows are kept.
+    (adds instance.origin / binary_path / binary_content_hash, renames
+    pattern.recurrence_breadth -> device_spread, drops legacy pattern.device_category) — never by
+    a table rebuild, so instance rows and all derived counts are kept.
 
     WARNING: Moving atlas.db requires sqlite3 .backup() or wal_checkpoint(TRUNCATE)
     before any file-copy — never a bare cp while WAL side-files exist.

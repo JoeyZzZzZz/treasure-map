@@ -20,6 +20,20 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _echo_legal_notice(*, as_json: bool = False) -> None:
+    """Print the intended-use / legal reminder to stderr (skipped under --json).
+
+    stderr keeps stdout clean; skipping it under --json keeps machine output free of any
+    framing. Substance lives in lib.notice so this wrapper carries no banned vocabulary into
+    the scanned CLI module."""
+    if as_json:
+        return
+    from treasure_map.lib.notice import LEGAL_NOTICE
+
+    click.echo(LEGAL_NOTICE, err=True)
+    click.echo("", err=True)
+
+
 @click.command("hunt-diff", short_help="Diff two analysis.db builds; grade reachability.")
 @click.argument("db_a", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.argument("db_b", type=click.Path(exists=True, dir_okay=False, path_type=Path))
@@ -211,6 +225,7 @@ def _render_triage(
                         "origin": c.origin,
                         "source_run_id": c.source_run_id,
                         "evidence_ref": c.evidence_ref,
+                        "binary_path": c.binary_path,
                     }
                     for r, c in visible
                 ],
@@ -232,6 +247,10 @@ def _render_triage(
             f"{c.function or '?'} ({c.evidence_ref or '?'})   "
             f"{c.source_class} -> {c.sink_anchor or '?'}   {fltr}"
         )
+        # Where to open it: the binary's full path, read straight from the atlas so a candidate
+        # stays locatable even if its analysis.db is gone. Without this a candidate is unactionable
+        # in a firmware of hundreds of binaries.
+        click.echo(f"        in: {c.binary_path or '?'}")
     if "gated" not in shown_statuses and counts["gated"]:
         click.echo(f"\n  (gated: {counts['gated']} hidden; --include-gated to show)")
     click.echo(
@@ -270,6 +289,7 @@ def _render_explain(ex: CandidateExplanation, *, as_json: bool) -> None:
                         "call_sequence_shape": ex.call_sequence_shape,
                         "blocking_mechanism": c.blocking_mechanism,
                         "origin": c.origin,
+                        "binary_path": c.binary_path,
                     },
                     "claims_does": list(ex.claims_does),
                     "claims_does_not": list(ex.claims_does_not),
@@ -296,6 +316,7 @@ def _render_explain(ex: CandidateExplanation, *, as_json: bool) -> None:
     click.echo(f"  sink         = {c.sink_anchor or '?'} ({c.sink_class})")
     click.echo(f"  shape        = {ex.call_sequence_shape or '?'}")
     click.echo(f"  function     = {c.function or '?'}")
+    click.echo(f"  binary       = {c.binary_path or '?'}   (open this in the decompiler)")
 
     click.echo("\nin-function dataflow & filter:")
     click.echo(f"  {_reachability_inline(c.reachability_status)}")
@@ -381,8 +402,9 @@ def triage(
 
     Read-only: nothing is written back to the atlas and no field is altered. Rows are ranked by
     score (highest first); the # is a stable global rank (lower # = look first) and each row also
-    carries its evidence_ref ({run_id}#fn{func_id}@{sink}) — the anchor to jump back to
-    analysis.db / Ghidra. Candidates are leads, NOT confirmed results. Use --explain <#|ref> for a
+    carries its evidence_ref ({run_id}#fn{func_id}@{sink}) plus the binary path to open in the
+    decompiler — read straight from the atlas, so a candidate stays locatable even when its
+    analysis.db is gone. Candidates are leads, NOT confirmed results. Use --explain <#|ref> for a
     single-candidate breakdown.
     """
     from treasure_map.lib.atlas.connection import open_atlas
@@ -390,6 +412,7 @@ def triage(
     from treasure_map.lib.query import explain_candidate
     from treasure_map.lib.query import triage as run_triage
 
+    _echo_legal_notice(as_json=as_json)
     selected_run = run_opt if run_opt is not None else run_id
     cfg = load_config(config)
     resolved_atlas = atlas_path if atlas_path is not None else cfg.atlas.db_path
@@ -593,6 +616,7 @@ def scan(
     from treasure_map.lib.workspace.resolver import resolve_workspace
     from treasure_map.lib.workspace.workspace import Workspace
 
+    _echo_legal_notice(as_json=as_json)
     cfg = load_config(config)
     try:
         resolved = resolve_workspace(workspace, workspace_dir=cfg.workspace_dir, fs_root=fs_root)

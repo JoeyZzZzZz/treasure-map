@@ -151,8 +151,8 @@ def add_instance(
         """INSERT INTO instance
            (pattern_id, pseudocode_hash, source_anchor, sink_anchor, source_run_id,
             reachability_status, blocking_mechanism, provenance_level, external_anchor,
-            fix_diff, scope_origin, evidence_ref, origin)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            fix_diff, scope_origin, evidence_ref, binary_path, binary_content_hash, origin)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             instance.pattern_id,
             instance.pseudocode_hash,
@@ -166,6 +166,8 @@ def add_instance(
             instance.fix_diff,
             instance.scope_origin,
             instance.evidence_ref,
+            instance.binary_path,
+            instance.binary_content_hash,
             instance.origin,
         ),
     )
@@ -206,6 +208,8 @@ def add_instances(
             inst.fix_diff,
             inst.scope_origin,
             inst.evidence_ref,
+            inst.binary_path,
+            inst.binary_content_hash,
             inst.origin,
         )
         for inst in instances
@@ -214,8 +218,8 @@ def add_instances(
         """INSERT INTO instance
            (pattern_id, pseudocode_hash, source_anchor, sink_anchor, source_run_id,
             reachability_status, blocking_mechanism, provenance_level, external_anchor,
-            fix_diff, scope_origin, evidence_ref, origin)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            fix_diff, scope_origin, evidence_ref, binary_path, binary_content_hash, origin)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         rows,
     )
 

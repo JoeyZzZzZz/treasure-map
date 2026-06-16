@@ -198,6 +198,11 @@ def run_analyzer1(
                     # (the single anchor used by --explain and manual jump-back). Same format
                     # as analyzer2.
                     evidence_ref=f"{run_id_a}#fn{lead.func_ref_a.func_id}@{sink_class}",
+                    # Candidate locatability: which binary (baseline build) to open in the
+                    # decompiler; carried from the source so the lead stays locatable when
+                    # analysis.db is gone. Content hash stored only (no consumer yet).
+                    binary_path=baseline.binary_path or baseline.binary_name,
+                    binary_content_hash=baseline.binary_sha256,
                 ),
             )
             instances_written += 1

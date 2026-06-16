@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Candidate locatability: every atlas `instance` now records the **full path** of the binary
+  its evidence function lives in plus that binary's **content hash**, both auto-filled from the
+  source build (no manual entry). `tmap triage`, `tmap scan`, and `tmap triage --explain` print
+  the binary path (`in: <path>` under each row; `binary` in the explain view; `binary_path` in
+  `--json`) so a high-ranked candidate in a firmware of hundreds of binaries is directly
+  actionable — which file to open in the decompiler. The location is read straight from the
+  atlas (no read-time join back to `analysis.db`), so candidates stay locatable even after the
+  per-firmware `analysis.db` is wiped/rebuilt. Both new columns are nullable, added by an
+  idempotent in-place migration (old atlases gain them with NULLs; rows and all derived ledger
+  counts are preserved), and marked **redact-on-export** as private evidence. The content hash
+  is **stored only** this round — no metric consumes it yet.
+- Intended-use / legal reminder: `tmap scan` and `tmap triage` print a short neutral notice
+  (defensive audit + research tool; output is leads, not attack code; lawful, authorized use is
+  the user's responsibility), and the README gains an "Intended Use & Legal" section. The notice
+  goes to stderr and is suppressed under `--json`, so machine output is unchanged.
+
 ### Changed
 
 - reachability (R2) v1 verdict set is now `confirmed` / `unknown` only; `blocked` is reserved

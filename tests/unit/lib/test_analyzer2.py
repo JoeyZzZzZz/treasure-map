@@ -39,8 +39,8 @@ def _make_db(tmp_path: Path, binaries: list[dict[str, object]]) -> Path:
     fid = 0
     for bid, spec in enumerate(binaries, start=1):
         conn.execute(
-            "INSERT INTO binaries (id, name, sha256) VALUES (?, ?, ?)",
-            (bid, spec["name"], str(bid).zfill(64)),
+            "INSERT INTO binaries (id, name, path, sha256) VALUES (?, ?, ?, ?)",
+            (bid, spec["name"], spec.get("path"), str(bid).zfill(64)),
         )
         if spec.get("oss"):
             conn.execute(
@@ -169,6 +169,56 @@ def test_evidence_ref_unique_per_instance(tmp_path: Path) -> None:
         conn.close()
     assert len(fps) == 1  # same shape -> one pattern
     assert all(fp not in refs for fp in fps)  # the instance ref is never the shared fingerprint
+
+
+# ── candidate locatability: binary_path + content hash auto-filled from the source ──
+
+
+def test_instance_carries_binary_location(tmp_path: Path) -> None:
+    # The instance records WHERE the evidence function lives (full path) + the binary's content
+    # hash, both auto-filled from the source build — so a candidate is locatable from the atlas.
+    db = _make_db(
+        tmp_path,
+        [{"name": "webd", "path": "usr/sbin/webd", "funcs": [_cmd_injection_fn("handle")]}],
+    )
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_loc")
+
+    (row,) = _instances(atlas)
+    assert row["binary_path"] == "usr/sbin/webd"  # full path, not the bare name
+    assert row["binary_content_hash"] == str(1).zfill(64)  # the source binary's sha256
+
+
+def test_binary_path_falls_back_to_name_when_source_has_no_path(tmp_path: Path) -> None:
+    # A degraded source with no path still yields a locator (the bare name) rather than NULL.
+    db = _make_db(tmp_path, [{"name": "webd", "funcs": [_cmd_injection_fn("handle")]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_np")
+
+    (row,) = _instances(atlas)
+    assert row["binary_path"] == "webd"
+
+
+def test_location_survives_source_db_removal(tmp_path: Path) -> None:
+    # Locatability must come from the atlas, NOT a read-time join back to analysis.db: delete the
+    # source build, then triage still shows the location.
+    from treasure_map.lib.query import triage
+
+    db = _make_db(
+        tmp_path,
+        [{"name": "webd", "path": "usr/sbin/webd", "funcs": [_cmd_injection_fn("handle")]}],
+    )
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_gone")
+    db.unlink()  # the source build is gone
+
+    conn = open_atlas(atlas)
+    try:
+        cands = triage(conn, run_id="run_gone")
+    finally:
+        conn.close()
+    assert len(cands) == 1
+    assert cands[0].binary_path == "usr/sbin/webd"  # served from the atlas alone
 
 
 # ── parameter-sourced -> unknown -> L0 (R2's hard invariant carried through) ─────────
