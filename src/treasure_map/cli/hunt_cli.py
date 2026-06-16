@@ -171,12 +171,35 @@ def hunt_pattern(
 _SECTION_ORDER = ("to-verify", "reachable", "gated")
 
 
+_DEFAULT_TOP = 20
+
+
+def _effective_top(top_n: int | None, *, show_all: bool, sink: str | None) -> int | None:
+    """Resolve the row cap. --all (or --sink, which surfaces one sink in full) lifts the cap;
+    an explicit --top wins; otherwise the default 20 keeps the list scannable."""
+    if show_all:
+        return None
+    if top_n is not None:
+        return top_n
+    if sink is not None:
+        return None
+    return _DEFAULT_TOP
+
+
+def _sink_matches(candidate: TriageCandidate, sink: str) -> bool:
+    """True if a --sink filter value names this candidate's sink — by concrete callee
+    (system / popen / execl …) OR by sink class (cmd / copy / format). Case-insensitive."""
+    needle = sink.lower()
+    return (candidate.sink_anchor or "").lower() == needle or candidate.sink_class.lower() == needle
+
+
 def _render_triage(
     candidates: list[TriageCandidate],
     *,
     run_label: str,
-    top_n: int,
+    top_n: int | None,
     status: str | None,
+    sink: str | None,
     include_gated: bool,
     as_json: bool,
 ) -> None:
@@ -184,9 +207,10 @@ def _render_triage(
     byte-identical output (single source of truth, no drift).
 
     candidates arrives in global score-descending order (triage() sorted it). The row number #
-    is the STABLE global rank (1 = highest score), fixed before any --top/--status/gated filter,
-    so #N always names the same candidate and is safe to pass to --explain. Rows are shown as one
-    global-descending list (highest score first); review_status is just a per-row label."""
+    is the STABLE global rank (1 = highest score), fixed before any --top/--status/--sink/gated
+    filter, so #N always names the same candidate and is safe to pass to --explain. Rows are shown
+    as one global-descending list (highest score first); review_status is just a per-row label.
+    top_n is None for an untruncated (full) view."""
     import json
 
     counts = {"reachable": 0, "to-verify": 0, "gated": 0}
@@ -196,8 +220,10 @@ def _render_triage(
     # Stable global rank, assigned over the FULL list before filtering/truncation.
     ranked = list(enumerate(candidates, 1))  # [(rank, candidate), ...]
 
-    # Decide which review statuses to display (rank is unaffected by this).
-    if status == "all":
+    # Decide which review statuses to display (rank is unaffected by this). A --sink filter for a
+    # specific class shows it across all statuses (so "--sink system" surfaces every system
+    # candidate, including gated ones, instead of being hidden by the default fold).
+    if status == "all" or sink is not None:
         shown_statuses = set(_SECTION_ORDER)
     elif status is not None:
         shown_statuses = {status}
@@ -206,7 +232,11 @@ def _render_triage(
         if include_gated:
             shown_statuses.add("gated")
 
-    visible = [(r, c) for r, c in ranked if c.review_status in shown_statuses][:top_n]
+    visible = [
+        (r, c)
+        for r, c in ranked
+        if c.review_status in shown_statuses and (sink is None or _sink_matches(c, sink))
+    ][:top_n]
 
     if as_json:
         click.echo(
@@ -239,6 +269,10 @@ def _render_triage(
         f"{counts['reachable']} reachable, {counts['to-verify']} to-verify, "
         f"{counts['gated']} gated)"
     )
+    if sink is not None:
+        click.echo(f"  filter: sink = {sink}   ({len(visible)} shown, all statuses)")
+    elif top_n is not None and len(candidates) > top_n:
+        click.echo(f"  showing top {top_n} of {len(candidates)} — use --all or --sink to see more")
     click.echo("  #   score  status      function (evidence_ref)        source->sink   filter")
     for r, c in visible:
         fltr = c.blocking_mechanism if c.blocking_mechanism else "none"
@@ -352,7 +386,19 @@ def _reachability_inline(status: str) -> str:
 @click.command("triage", short_help="Rank to-verify candidates for manual reverse-engineering.")
 @click.argument("run_id", required=False, default=None)
 @click.option("--run", "run_opt", default=None, help="Restrict to one run id (overrides RUN_ID).")
-@click.option("--top", "top_n", type=int, default=20, help="Show at most N candidates.")
+@click.option(
+    "--top", "top_n", type=int, default=None, help="Show at most N candidates (default 20)."
+)
+@click.option(
+    "--all", "show_all", is_flag=True, default=False, help="Show every candidate (no cap)."
+)
+@click.option(
+    "--sink",
+    default=None,
+    help="Show only candidates for this sink — by callee (system/popen/execl/strcpy/…) or class "
+    "(cmd/copy/format). Shows all statuses and is NOT capped, so a recalled-but-low-scored sink "
+    "(e.g. system) is never hidden by the default top-N.",
+)
 @click.option(
     "--status",
     type=click.Choice(["to-verify", "reachable", "gated", "all"]),
@@ -390,7 +436,9 @@ def _reachability_inline(status: str) -> str:
 def triage(
     run_id: str | None,
     run_opt: str | None,
-    top_n: int,
+    top_n: int | None,
+    show_all: bool,
+    sink: str | None,
     status: str | None,
     include_gated: bool,
     as_json: bool,
@@ -404,8 +452,10 @@ def triage(
     score (highest first); the # is a stable global rank (lower # = look first) and each row also
     carries its evidence_ref ({run_id}#fn{func_id}@{sink}) plus the binary path to open in the
     decompiler — read straight from the atlas, so a candidate stays locatable even when its
-    analysis.db is gone. Candidates are leads, NOT confirmed results. Use --explain <#|ref> for a
-    single-candidate breakdown.
+    analysis.db is gone. The list caps at 20 by default; --all shows everything and --sink <x>
+    shows every candidate for one sink (uncapped) so a recalled-but-low-scored sink is not hidden.
+    Candidates are leads, NOT confirmed results. Use --explain <#|ref> for a single-candidate
+    breakdown.
     """
     from treasure_map.lib.atlas.connection import open_atlas
     from treasure_map.lib.config.config import load_config
@@ -458,8 +508,9 @@ def triage(
     _render_triage(
         candidates,
         run_label=selected_run if selected_run is not None else "all runs",
-        top_n=top_n,
+        top_n=_effective_top(top_n, show_all=show_all, sink=sink),
         status=status,
+        sink=sink,
         include_gated=include_gated,
         as_json=as_json,
     )
@@ -546,7 +597,18 @@ def atlas_view(view: str, config: Path | None, atlas_path: Path | None) -> None:
     default=None,
     help="Neutral per-run id written to the atlas. Defaults to the workspace name.",
 )
-@click.option("--top", "top_n", type=int, default=20, help="Show at most N candidates.")
+@click.option(
+    "--top", "top_n", type=int, default=None, help="Show at most N candidates (default 20)."
+)
+@click.option(
+    "--all", "show_all", is_flag=True, default=False, help="Show every candidate (no cap)."
+)
+@click.option(
+    "--sink",
+    default=None,
+    help="Show only candidates for this sink — by callee (system/popen/…) or class (cmd/copy/"
+    "format); uncapped, all statuses.",
+)
 @click.option(
     "--status",
     type=click.Choice(["to-verify", "reachable", "gated", "all"]),
@@ -590,7 +652,9 @@ def scan(
     fs_root: Path,
     workspace: str | None,
     run_id: str | None,
-    top_n: int,
+    top_n: int | None,
+    show_all: bool,
+    sink: str | None,
     status: str | None,
     include_gated: bool,
     as_json: bool,
@@ -690,8 +754,9 @@ def scan(
     _render_triage(
         candidates,
         run_label=effective_run_id,
-        top_n=top_n,
+        top_n=_effective_top(top_n, show_all=show_all, sink=sink),
         status=status,
+        sink=sink,
         include_gated=include_gated,
         as_json=as_json,
     )

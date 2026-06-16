@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Triage view entry: `tmap triage` / `tmap scan` gain `--all` (show every candidate, no cap) and
+  `--sink <x>` (show every candidate for one sink — by callee `system`/`popen`/`execl`/`strcpy`/…
+  or class `cmd`/`copy`/`format` — uncapped and across all statuses). The default list still caps
+  at 20 but now says so when more exist. This keeps a recalled-but-low-scored sink (e.g. `system`)
+  reachable from the workflow instead of being hidden below the cap. Pure view/filter: scoring, the
+  atlas, candidate generation, and the stable global rank (assigned before any filter) are
+  unchanged; `--json` output is unchanged.
+
 - Candidate locatability: every atlas `instance` now records the **full path** of the binary
   its evidence function lives in plus that binary's **content hash**, both auto-filled from the
   source build (no manual entry). `tmap triage`, `tmap scan`, and `tmap triage --explain` print

@@ -148,10 +148,16 @@ tmap triage router_v1 --explain 1    # explain rank #1 (also accepts --explain <
 ```
 
 `tmap triage` lists candidates in one global score-descending order — the `#` is a **stable rank**
-(1 = highest, look first) that names the same candidate regardless of `--top`/`--status`, so you can
-pass it straight to `--explain`. Each row prints, under it, `in: <binary path>` — the binary to open
-in your decompiler. That location is stored in the atlas, so candidates stay locatable **even after
-the per-firmware `analysis.db` is wiped/rebuilt**. `--explain <#|evidence_ref>` opens a single candidate: an itemized
+(1 = highest, look first) that names the same candidate regardless of `--top`/`--status`/`--sink`, so
+you can pass it straight to `--explain`. Each row prints, under it, `in: <binary path>` — the binary
+to open in your decompiler. That location is stored in the atlas, so candidates stay locatable **even
+after the per-firmware `analysis.db` is wiped/rebuilt**.
+
+The list **caps at 20 by default** (it tells you when more exist). To see past the cap: `--all` shows
+every candidate, and **`--sink <x>` shows every candidate for one sink, uncapped and across all
+statuses** — by callee (`--sink system`, `popen`, `execl`, `strcpy`) or class (`--sink cmd|copy|
+format`). Use `--sink system` when a recalled sink you care about is scored low and would otherwise
+sit below the default cap. `--explain <#|evidence_ref>` opens a single candidate: an itemized
 breakdown of **why its score is what it is** (each point maps to a real signal), the call structure,
 the **honest bounds** (reachability is single-function/L1, no caller traced, no cross-function flow;
 `external_input` is a class label, not a trace), and a **manual-verify checklist** with anchors. It

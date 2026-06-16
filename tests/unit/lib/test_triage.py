@@ -360,6 +360,112 @@ def test_cli_triage_json_omits_notice(tmp_path: Path) -> None:
     assert "defensive firmware-audit" not in result.output  # notice suppressed under --json
 
 
+# ── CLI: view entry — default cap, --all, --sink (recall must stay visible) ─────────
+
+
+def _seed_many(tmp_path: Path, n_system: int = 25, n_copy: int = 3) -> Path:
+    conn = _atlas(tmp_path)
+    p_cmd = _pattern(conn, "fp_cmd", sink_class="cmd")
+    p_copy = _pattern(conn, "fp_copy", sink_class="copy")
+    for i in range(n_system):
+        _inst(
+            conn,
+            p_cmd,
+            status="unknown",
+            origin="custom",
+            fn=f"sys_fn{i}",
+            sink_anchor="system",
+            run_id="run_v",
+        )
+    for i in range(n_copy):
+        _inst(
+            conn,
+            p_copy,
+            status="unknown",
+            origin="custom",
+            fn=f"cp_fn{i}",
+            sink_anchor="strcpy",
+            run_id="run_v",
+        )
+    conn.close()
+    return tmp_path / "atlas.db"
+
+
+def _data_fns(output: str) -> list[str]:
+    fns = []
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) >= 4 and parts[0].isdigit() and "(" in line:
+            fns.append(parts[3])
+    return fns
+
+
+def test_cli_default_caps_at_20(tmp_path: Path) -> None:
+    atlas = _seed_many(tmp_path)
+    result = CliRunner().invoke(triage_cmd, ["run_v", "--atlas", str(atlas)])
+    assert result.exit_code == 0, result.output
+    assert len(_data_fns(result.output)) == 20  # default cap
+    assert "showing top 20 of 28" in result.output  # tells the operator more exist
+
+
+def test_cli_all_shows_everything(tmp_path: Path) -> None:
+    atlas = _seed_many(tmp_path)
+    result = CliRunner().invoke(triage_cmd, ["run_v", "--all", "--atlas", str(atlas)])
+    assert result.exit_code == 0, result.output
+    assert len(_data_fns(result.output)) == 28  # 25 system + 3 copy, uncapped
+
+
+def test_cli_sink_filter_uncapped_and_typed(tmp_path: Path) -> None:
+    atlas = _seed_many(tmp_path)
+    # --sink system: every one of the 25 system candidates, NOT capped at 20.
+    sys_out = CliRunner().invoke(triage_cmd, ["run_v", "--sink", "system", "--atlas", str(atlas)])
+    assert sys_out.exit_code == 0, sys_out.output
+    sys_fns = _data_fns(sys_out.output)
+    assert len(sys_fns) == 25
+    assert all(f.startswith("sys_fn") for f in sys_fns)
+    # --sink copy: filter by sink class; only the copy candidates.
+    cp_out = CliRunner().invoke(triage_cmd, ["run_v", "--sink", "copy", "--atlas", str(atlas)])
+    assert [f for f in _data_fns(cp_out.output)] == ["cp_fn0", "cp_fn1", "cp_fn2"]
+
+
+def test_cli_sink_filter_surfaces_gated(tmp_path: Path) -> None:
+    # A gated (blocked) system candidate is hidden by the default fold but must appear under
+    # --sink system — recall stays visible by sink even when low/gated.
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp", sink_class="cmd")
+    _inst(
+        conn,
+        p,
+        status="unknown",
+        origin="custom",
+        fn="live_sys",
+        sink_anchor="system",
+        run_id="run_g",
+    )
+    _inst(
+        conn,
+        p,
+        status="blocked",
+        blocking="char_filter",
+        fn="gated_sys",
+        sink_anchor="system",
+        run_id="run_g",
+    )
+    conn.close()
+    atlas = tmp_path / "atlas.db"
+    result = CliRunner().invoke(triage_cmd, ["run_g", "--sink", "system", "--atlas", str(atlas)])
+    assert result.exit_code == 0, result.output
+    assert "gated_sys" in result.output  # gated, but surfaced by the sink filter
+
+
+def test_cli_rank_stable_under_sink_filter(tmp_path: Path) -> None:
+    # The global rank is assigned before the --sink filter; a filtered row keeps its global #.
+    atlas = _seed_many(tmp_path, n_system=2, n_copy=1)
+    full = CliRunner().invoke(triage_cmd, ["run_v", "--all", "--atlas", str(atlas)])
+    cp = CliRunner().invoke(triage_cmd, ["run_v", "--sink", "copy", "--atlas", str(atlas)])
+    assert _rank_of(cp.output, "cp_fn0") == _rank_of(full.output, "cp_fn0")
+
+
 def test_cli_explain_shows_binary_location(tmp_path: Path) -> None:
     conn = _atlas(tmp_path)
     p = _pattern(conn, "fp")
