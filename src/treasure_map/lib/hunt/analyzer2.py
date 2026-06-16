@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,11 +30,36 @@ from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import InstanceRow
 from treasure_map.lib.atlas.writer import add_instance, delete_run_instances, upsert_pattern
 from treasure_map.lib.diff.loader import FuncRow, load_functions
+from treasure_map.lib.hunt.downweight import detect_form_signal, library_origin
 from treasure_map.lib.pattern import scan
 from treasure_map.lib.pattern.classes import CMD, COPY, FORMAT
 from treasure_map.lib.reachability import grade_candidate
+from treasure_map.lib.reachability.taint import locate_sink_arg
 
 logger = logging.getLogger(__name__)
+
+
+def _load_caller_ids(db_path: Path | str) -> dict[int, list[int]]:
+    """Map callee_func_id -> [caller_func_id, …] from the analysis.db xrefs (read-only).
+
+    One-hop only: the direct function-level callers recorded for each function. Used by the
+    caller-constant downweight; absent/empty xrefs simply yield no callers (no downweight)."""
+    uri = f"file:{Path(db_path)}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    callers: dict[int, list[int]] = {}
+    try:
+        rows = conn.execute(
+            "SELECT callee_func_id, caller_func_id FROM xrefs "
+            "WHERE callee_func_id IS NOT NULL AND caller_func_id IS NOT NULL"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return callers  # no xrefs table / shape mismatch -> no caller data
+    finally:
+        conn.close()
+    for callee_id, caller_id in rows:
+        callers.setdefault(int(callee_id), []).append(int(caller_id))
+    return callers
+
 
 _SINK_CLASS_MEMBERS: dict[str, frozenset[str]] = {"cmd": CMD, "copy": COPY, "format": FORMAT}
 
@@ -82,6 +108,7 @@ def run_analyzer2(
     """
     result = scan(db_path)
     funcs: dict[int, FuncRow] = {f.func_id: f for f in load_functions(db_path)}
+    callers_of = _load_caller_ids(db_path)
 
     by_status = {"confirmed": 0, "blocked": 0, "unknown": 0}
     instances_written = 0
@@ -101,11 +128,35 @@ def run_analyzer2(
 
                 callees = _parse_callees(row.callees)
                 sink_name = _sink_name_for(callees, match.sink_class)
+                sink_arg = (
+                    locate_sink_arg(row.pseudocode, sink_name) if sink_name is not None else None
+                )
                 if sink_name is None:
                     status, blocking = "unknown", None
                 else:
                     verdict = grade_candidate(row.pseudocode, callees, sink_name)
                     status, blocking = verdict.status, verdict.blocking_mechanism
+
+                # FP-suppression labels written into existing neutral fields (read-side ordering
+                # downweights them; nothing is removed or graded blocked). origin recognizes
+                # statically-linked third-party library code (function-symbol granularity, beyond
+                # the binary-level OSS exclusion); a form note marks a known low-yield shape. Only
+                # attach a form note when the grader left blocking_mechanism open.
+                origin = library_origin(match.func_ref.func_name) or "unknown"
+                if blocking is None:
+                    callers_pc = [
+                        funcs[cid].pseudocode or ""
+                        for cid in callers_of.get(match.func_ref.func_id, ())
+                        if cid in funcs
+                    ]
+                    blocking = detect_form_signal(
+                        sink_name=sink_name,
+                        pseudocode=row.pseudocode,
+                        callees=callees,
+                        sink_arg=sink_arg,
+                        func_name=match.func_ref.func_name,
+                        callers_pseudocode=callers_pc,
+                    )
 
                 provenance = "L1" if status in {"confirmed", "blocked"} else "L0"
                 pattern_id = upsert_pattern(
@@ -142,6 +193,7 @@ def run_analyzer2(
                         binary_path=row.binary_path or row.binary_name,
                         binary_content_hash=row.binary_sha256,
                         scope_origin="intra",
+                        origin=origin,
                     ),
                     commit=False,
                 )

@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- FP-suppression downweighting (recall-neutral): the pattern analyzer now recognizes known
+  low-yield candidate forms and ranks them low instead of dropping them — an exec sink that
+  bypasses the shell (`no_shell_exec`), a numeric validator on the value reaching the sink
+  (`numeric_sanitized`), and a constant supplied by the sole one-hop caller (`caller_constant`),
+  each recorded in the existing neutral `blocking_mechanism` field; plus function-symbol-level
+  third-party-library recognition (e.g. statically-linked openssl/mbedtls/json-c/thrift symbols
+  in a custom-named binary) which sets `origin=stock_oss_known` — beyond the existing
+  binary-level OSS exclusion, and routed out of the `pattern_breadth` ledger (which counts only
+  `custom`/`unknown`). Read-side
+  review ordering downweights these forms hard so they sink to the bottom of their tier; nothing
+  is removed and nothing is graded `blocked`. The reachability grader is untouched. Conservative:
+  under doubt no form note is attached and origin stays `unknown` (never defaults to `custom`).
+
 - Triage view entry: `tmap triage` / `tmap scan` gain `--all` (show every candidate, no cap) and
   `--sink <x>` (show every candidate for one sink — by callee `system`/`popen`/`execl`/`strcpy`/…
   or class `cmd`/`copy`/`format` — uncapped and across all statuses). The default list still caps

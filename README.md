@@ -157,7 +157,12 @@ The list **caps at 20 by default** (it tells you when more exist). To see past t
 every candidate, and **`--sink <x>` shows every candidate for one sink, uncapped and across all
 statuses** — by callee (`--sink system`, `popen`, `execl`, `strcpy`) or class (`--sink cmd|copy|
 format`). Use `--sink system` when a recalled sink you care about is scored low and would otherwise
-sit below the default cap. `--explain <#|evidence_ref>` opens a single candidate: an itemized
+sit below the default cap.
+
+Known low-yield forms are **ranked low, never dropped**: an exec sink that bypasses the shell, a
+value the function numerically validates, a constant passed in by the sole caller, and code
+recognized as a third-party library (by symbol) all sink to the bottom of their tier so the real
+shapes float up — but every one stays a listed candidate you can still pull up with `--sink`/`--all`. `--explain <#|evidence_ref>` opens a single candidate: an itemized
 breakdown of **why its score is what it is** (each point maps to a real signal), the call structure,
 the **honest bounds** (reachability is single-function/L1, no caller traced, no cross-function flow;
 `external_input` is a class label, not a trace), and a **manual-verify checklist** with anchors. It

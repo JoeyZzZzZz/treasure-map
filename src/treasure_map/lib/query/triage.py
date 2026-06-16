@@ -38,10 +38,30 @@ REVIEW_STATUS_BY_REACHABILITY: dict[str, str] = {
 # candidates WITHIN a tier. None of these weights is a security claim — they order review.
 _STATUS_WEIGHT: dict[str, float] = {"confirmed": 6.0, "unknown": 3.0, "blocked": 0.0}
 
-# A filter on the path (blocking_mechanism set) lowers review order — it is more likely a
-# false positive / already-mitigated. No identified filter raises it.
+# A filter on the path (blocking_mechanism set) lowers review order — it is more likely
+# already-mitigated. No identified filter raises it.
 _FILTER_ABSENT_WEIGHT = 0.5
 _FILTER_PRESENT_WEIGHT = -0.5
+
+# Specific neutral form notes (also stored in blocking_mechanism) that name a structural shape
+# manual review found rarely carries a live issue: an exec sink that bypasses the shell, a
+# numeric validator on the path, or a constant supplied by the sole caller. They downweight much
+# harder than a generic filter so the form sinks to the bottom of its tier — but it STAYS a listed
+# candidate (never removed, never graded blocked). Each maps a mechanism to ordering, not judgment.
+_FORM_DOWNWEIGHT: dict[str, float] = {
+    "no_shell_exec": -2.0,
+    "numeric_sanitized": -2.0,
+    "caller_constant": -2.5,
+}
+
+
+def _filter_weight(blocking_mechanism: str | None) -> float:
+    """Review-order contribution of the path-guard / form field. No mechanism raises order; a
+    recognized low-yield form downweights hard; any other identified guard downweights mildly."""
+    if blocking_mechanism is None:
+        return _FILTER_ABSENT_WEIGHT
+    return _FORM_DOWNWEIGHT.get(blocking_mechanism, _FILTER_PRESENT_WEIGHT)
+
 
 # Code provenance: custom code is likelier to hold a fresh lead; recognized stock OSS is a
 # known component, not a new lead. vendor_modified_oss / unknown are neutral.
@@ -65,7 +85,7 @@ _SINK_CLASS_WEIGHT: dict[str, float] = {"cmd": 0.4, "copy": 0.2, "format": 0.0}
 def _bounds() -> tuple[float, float]:
     """Min/max possible raw score, derived from the weight tables (for [0,1] display scaling)."""
     fine_lo = (
-        _FILTER_PRESENT_WEIGHT
+        min(_FILTER_PRESENT_WEIGHT, *_FORM_DOWNWEIGHT.values())
         + min(_ORIGIN_WEIGHT.values())
         + min(0.0, *_SOURCE_CLASS_WEIGHT.values())
         + min(_SINK_CLASS_WEIGHT.values())
@@ -115,7 +135,7 @@ def _raw_score(
     sink_class: str,
 ) -> float:
     score = _STATUS_WEIGHT.get(reachability_status, 0.0)
-    score += _FILTER_ABSENT_WEIGHT if blocking_mechanism is None else _FILTER_PRESENT_WEIGHT
+    score += _filter_weight(blocking_mechanism)
     score += _ORIGIN_WEIGHT.get(origin, 0.0)
     score += _SOURCE_CLASS_WEIGHT.get(source_class, 0.0)
     score += _SINK_CLASS_WEIGHT.get(sink_class, 0.0)
@@ -265,14 +285,22 @@ def score_breakdown(
     reproduces review_score(...) exactly. No item is invented — each maps to one stored field.
     """
     filter_value = "none" if blocking_mechanism is None else blocking_mechanism
-    filter_weight = _FILTER_ABSENT_WEIGHT if blocking_mechanism is None else _FILTER_PRESENT_WEIGHT
-    filter_note = (
-        "no sanitizer identified on the in-function path "
-        "(generic name match — may miss a custom guard)"
-        if blocking_mechanism is None
-        else f"a '{blocking_mechanism}'-class guard was identified "
-        "(generic name match; may misjudge)"
-    )
+    filter_weight = _filter_weight(blocking_mechanism)
+    if blocking_mechanism is None:
+        filter_note = (
+            "no sanitizer identified on the in-function path "
+            "(generic name match — may miss a custom guard)"
+        )
+    elif blocking_mechanism in _FORM_DOWNWEIGHT:
+        filter_note = (
+            f"a low-yield form was recognized ('{blocking_mechanism}'): a shape manual review "
+            "found rarely carries a live issue, so it ranks low — still a listed lead, verify it"
+        )
+    else:
+        filter_note = (
+            f"a '{blocking_mechanism}'-class guard was identified "
+            "(generic name match; may misjudge)"
+        )
     sink_value = sink_class if sink_anchor is None else f"{sink_class} ({sink_anchor})"
     return [
         ScoreComponent(

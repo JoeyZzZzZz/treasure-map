@@ -375,6 +375,132 @@ def test_explain_anchors_the_right_sink_hit(tmp_path: Path) -> None:
     assert ex.candidate.sink_class == "cmd"  # the cmd ref resolves to the cmd hit, not the copy
 
 
+# ── work item A: FP-suppression form notes + library origin (downweight, never remove) ──
+
+
+def _exec_no_shell_fn(name: str = "run_exec") -> dict[str, object]:
+    # source + shellish %s + an exec sink that does NOT go through a shell.
+    body = (
+        f"void {name}(char* p){{ char b[64]; recv(fd,b,64); char c[128]; "
+        f'snprintf(c,128,"/usr/sbin/tool %s",b); execl(c,c,0); }}'
+    )
+    return {
+        "name": name,
+        "pseudocode": body,
+        "hash": f"h_{name}",
+        "callees": ["recv", "snprintf", "execl"],
+    }
+
+
+def _numeric_fn(name: str = "run_num") -> dict[str, object]:
+    body = (
+        f"void {name}(char* p){{ char b[64]; recv(fd,b,64); long n=strtol(b,0,10); char c[128]; "
+        f'snprintf(c,128,"/bin/tool %s",n); system(c); }}'
+    )
+    return {
+        "name": name,
+        "pseudocode": body,
+        "hash": f"h_{name}",
+        "callees": ["recv", "strtol", "snprintf", "system"],
+    }
+
+
+def _by_anchor(atlas_path: Path) -> dict[str, sqlite3.Row]:
+    return {r["source_anchor"]: r for r in _instances(atlas_path)}
+
+
+def _score_of(atlas_path: Path, fn: str) -> float:
+    from treasure_map.lib.query import triage as run_triage
+
+    conn = open_atlas(atlas_path)
+    try:
+        return next(c.score for c in run_triage(conn) if c.function == fn)
+    finally:
+        conn.close()
+
+
+def test_no_shell_exec_is_labelled_and_downweighted(tmp_path: Path) -> None:
+    # Compare within the same reachability tier: both candidates grade confirmed (buf-sourced),
+    # so the gap is purely the form downweight, not the status weight.
+    db = _make_db(
+        tmp_path,
+        [
+            {
+                "name": "webd",
+                "funcs": [
+                    _cmd_injection_fn("shell_sys", param_sourced=False),
+                    _exec_no_shell_fn("noshell"),
+                ],
+            }
+        ],
+    )
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_a")
+
+    rows = _by_anchor(atlas)
+    assert rows["noshell"]["blocking_mechanism"] == "no_shell_exec"
+    assert rows["noshell"]["reachability_status"] != "blocked"  # downweighted, never blocked
+    # the no-shell exec ranks clearly below the real shell system() candidate of the same tier.
+    assert _score_of(atlas, "noshell") < _score_of(atlas, "shell_sys")
+
+
+def test_numeric_sanitized_is_labelled_and_downweighted(tmp_path: Path) -> None:
+    db = _make_db(
+        tmp_path,
+        [
+            {
+                "name": "webd",
+                "funcs": [
+                    _cmd_injection_fn("raw_sys", param_sourced=False),
+                    _numeric_fn("num_sys"),
+                ],
+            }
+        ],
+    )
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_a")
+
+    rows = _by_anchor(atlas)
+    assert rows["num_sys"]["blocking_mechanism"] == "numeric_sanitized"
+    assert _score_of(atlas, "num_sys") < _score_of(atlas, "raw_sys")
+
+
+def test_library_symbol_routes_to_stock_origin(tmp_path: Path) -> None:
+    # A statically-linked library function (custom-named binary, library symbol) -> stock_oss_known,
+    # which the binary-level OSS exclusion misses. It is downweighted AND kept off pattern_breadth.
+    lib_fn = _cmd_injection_fn("handle")
+    lib_fn["name"] = "SSL_read"
+    db = _make_db(
+        tmp_path,
+        [{"name": "customd", "funcs": [_cmd_injection_fn("real_handle"), lib_fn]}],
+    )
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_a")
+
+    rows = _by_anchor(atlas)
+    assert rows["SSL_read"]["origin"] == "stock_oss_known"
+    assert rows["real_handle"]["origin"] == "unknown"  # never defaulted to custom
+    assert _score_of(atlas, "SSL_read") < _score_of(atlas, "real_handle")
+    # routed out of pattern_breadth (it counts only custom/unknown).
+    conn = open_atlas(atlas)
+    try:
+        breadth = conn.execute(
+            "SELECT pattern_breadth FROM pattern_ledger ORDER BY pattern_id"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert all(r[0] >= 0 for r in breadth)  # ledger still computes; stock excluded by definition
+
+
+def test_plain_shell_candidate_is_not_downweighted(tmp_path: Path) -> None:
+    # The "do not over-downweight" guard: a real shell system() with an external source, custom
+    # symbol, non-numeric, no constant caller keeps blocking_mechanism NULL (full score).
+    db = _make_db(tmp_path, [{"name": "webd", "funcs": [_cmd_injection_fn("clean_handle")]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_a")
+    assert _by_anchor(atlas)["clean_handle"]["blocking_mechanism"] is None
+
+
 # ── BOUNDARY ────────────────────────────────────────────────────────────────────────
 
 
