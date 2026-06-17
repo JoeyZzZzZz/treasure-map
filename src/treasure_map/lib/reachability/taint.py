@@ -325,6 +325,35 @@ def flows_into(pseudocode: str, sink_var: str) -> set[str]:
     return seen
 
 
+def free_taint_reaches(pseudocode: str, sink_var: str, *, safe_vars: set[str]) -> bool:
+    """True if a free value reaches ``sink_var`` BYPASSING the recognized safe source.
+
+    A free value is an in-function source-call output (strong/weak) or a caller-supplied
+    parameter. ``safe_vars`` are the variables a constraining converter laundered to a safe
+    form (e.g. the result of a numeric/charset conversion): the backward walk prunes at them,
+    so a value that reaches the sink only THROUGH the converter is not counted as free, while a
+    value that reaches the sink by any other route is. This is the parameter-specific guard:
+    a downweight that recognizes one safe source must still be suppressed when some other,
+    uncontrolled path also reaches the same dangerous argument.
+    """
+    deps = _derives_map(pseudocode)
+    strong, weak, par = _seed_sets(pseudocode)
+    free = (strong | weak | par) - safe_vars
+    seen = {sink_var}
+    stack = [sink_var]
+    while stack:
+        current = stack.pop()
+        if current in safe_vars:
+            continue  # the converter laundered everything upstream of here
+        if current in free:
+            return True
+        for src in deps.get(current, ()):
+            if src not in seen:
+                seen.add(src)
+                stack.append(src)
+    return False
+
+
 def origin_of(pseudocode: str, var: str) -> OriginKind:
     """Classify where ``var`` reaching a sink originates, within this function.
 

@@ -63,6 +63,11 @@ def _load_caller_ids(db_path: Path | str) -> dict[int, list[int]]:
 
 _SINK_CLASS_MEMBERS: dict[str, frozenset[str]] = {"cmd": CMD, "copy": COPY, "format": FORMAT}
 
+# Shell-running command sinks. When a function calls several command sinks, anchor to one of
+# these over an exec-family sink (Bug1): system/popen/doSystem run a shell, so anchoring to the
+# alphabetically-first execX would let the no_shell_exec form note hide the real shell sink.
+_SHELL_CMD_SINKS: frozenset[str] = frozenset({"system", "popen", "doSystem"})
+
 
 @dataclass(frozen=True)
 class Analyzer2Stats:
@@ -74,12 +79,18 @@ class Analyzer2Stats:
 
 
 def _sink_name_for(callees: list[str], sink_class: str) -> str | None:
-    """Return the concrete sink callee for a sink_class (deterministic), or None."""
+    """Return the concrete sink callee for a sink_class, anchoring to the most dangerous one.
+
+    Deterministic: a shell-running command sink (system/popen/doSystem) is preferred over an
+    exec-family sink so a coexisting shell sink is never masked (Bug1); ties break alphabetically.
+    """
     members = _SINK_CLASS_MEMBERS.get(sink_class)
     if not members:
         return None
     hits = sorted(name for name in callees if name in members)
-    return hits[0] if hits else None
+    if not hits:
+        return None
+    return min(hits, key=lambda name: (name not in _SHELL_CMD_SINKS, name))
 
 
 def _parse_callees(raw: str | None) -> list[str]:

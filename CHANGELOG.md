@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Form-note downweighting is now **parameter-specific**: a candidate is ranked low only when the
+  sink's dangerous argument truly comes only from the recognized safe/constant source. If any free
+  value — an unsanitized string source or a caller-supplied parameter — also reaches that argument
+  by a route that bypasses the safe source, the downweight is suppressed (a new taint helper,
+  `free_taint_reaches`, prunes the backward walk at the converter's output). This fixes a family of
+  over-suppressions that shared one root cause ("a safe thing exists in the function" wrongly read
+  as "the dangerous argument is only that safe thing"): (1) a function calling both `system` and
+  `execl` now anchors to the shell-running sink and is never marked `no_shell_exec` (which requires
+  the whole command capability to be exec-without-a-shell); (2) the caller-constant note fires only
+  when EVERY caller argument is a literal, so `f("prefix", tainted)` is not downweighted; (3) a new
+  `const_sink_arg` note downweights a fixed `.rodata` command string (the highest-frequency command
+  false positive) while a branch-gating-but-not-value-flowing external input no longer suppresses a
+  real one; (4) a new `charset_constrained` note downweights a value rendered to a safe character
+  set (MAC/IP/base64-encode) only when no free value shares the same sink argument. Each fix ships
+  with a symmetric "looks-downweightable but is actually dangerous" regression so suppressing a
+  false positive never creates a false negative. On a real device, candidate volume is unchanged
+  (506) and the top score band stays free of downweighted forms; the over-broad numeric note
+  dropped from 21 to 1 candidate (those move back up, not down). The reachability grader is
+  untouched.
+
 ### Removed
 
 - Build-time LLM pre-judgment and dead placeholder fields dropped from `analysis.db` — the

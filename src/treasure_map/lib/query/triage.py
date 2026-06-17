@@ -52,6 +52,10 @@ _FORM_DOWNWEIGHT: dict[str, float] = {
     "no_shell_exec": -2.0,
     "numeric_sanitized": -2.0,
     "caller_constant": -2.5,
+    # the sink's dangerous argument is a fixed .rodata string constant (not a controllable value)
+    "const_sink_arg": -2.5,
+    # the value reaching the sink was constrained to a safe character set (MAC/IP/base64 form)
+    "charset_constrained": -2.0,
     # a dangerous sink with no recognized in-function source (the recall fallback): listed for
     # completeness but ranked low — the controlled input, if any, was not seen reaching it here.
     "bare_sink": -1.5,

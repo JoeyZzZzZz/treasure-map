@@ -13,6 +13,8 @@ from pathlib import Path
 
 from treasure_map.lib.hunt.downweight import (
     CALLER_CONSTANT,
+    CHARSET_CONSTRAINED,
+    CONST_SINK_ARG,
     NO_SHELL_EXEC,
     NUMERIC_SANITIZED,
     detect_form_signal,
@@ -55,6 +57,24 @@ def test_system_is_never_no_shell_exec() -> None:
     assert (
         detect_form_signal(
             sink_name="system", pseudocode=pc, callees=["snprintf", "system"], sink_arg="c"
+        )
+        is None
+    )
+
+
+def test_mixed_system_and_execl_is_not_no_shell_exec() -> None:
+    # Bug1 reverse: the function's cmd capability is NOT all exec-no-shell (it also calls system),
+    # so it is shell-capable and must not be downweighted no_shell — even though an exec is present.
+    pc = (
+        "void h(char* p){ char c[64]; snprintf(c,64,"
+        '"tool %s",p); if (p) execl(c,c,0); else system(c); }'
+    )
+    assert (
+        detect_form_signal(
+            sink_name="system",  # the danger-anchored sink
+            pseudocode=pc,
+            callees=["snprintf", "execl", "system"],
+            sink_arg="c",
         )
         is None
     )
@@ -154,6 +174,123 @@ def test_no_callers_is_not_caller_constant() -> None:
             sink_arg="param_1",
             func_name="run",
             callers_pseudocode=[],
+        )
+        is None
+    )
+
+
+def test_caller_all_constant_args_is_caller_constant() -> None:
+    # Every caller argument is a literal -> the dangerous parameter is a caller constant.
+    pc = "void run(char* param_1, char* param_2){ system(param_2); }"
+    caller = 'void boot(void){ run("prefix", "/etc/init.d/rcS start"); }'
+    assert (
+        detect_form_signal(
+            sink_name="system",
+            pseudocode=pc,
+            callees=["system"],
+            sink_arg="param_2",
+            func_name="run",
+            callers_pseudocode=[caller],
+        )
+        == CALLER_CONSTANT
+    )
+
+
+def test_caller_constant_plus_tainted_arg_is_not_caller_constant() -> None:
+    # Bug2 reverse: f("prefix", tainted) — one constant arg, one controllable arg. A constant in
+    # SOME slot is not enough; a controllable value can reach the dangerous parameter -> no drop.
+    pc = "void run(char* param_1, char* param_2){ system(param_2); }"
+    caller = 'void h(char* q){ run("prefix", q); }'
+    assert (
+        detect_form_signal(
+            sink_name="system",
+            pseudocode=pc,
+            callees=["system"],
+            sink_arg="param_2",
+            func_name="run",
+            callers_pseudocode=[caller],
+        )
+        is None
+    )
+
+
+# ── .rodata constant sink argument (#12: gate vs content) ─────────────────────────────
+
+
+def test_constant_sink_argument_is_const_sink_arg() -> None:
+    # The command string is a fixed .rodata constant — the highest-frequency cmd false positive.
+    pc = 'void f(void){ system("/sbin/reboot"); }'
+    assert (
+        detect_form_signal(sink_name="system", pseudocode=pc, callees=["system"], sink_arg="sbin")
+        == CONST_SINK_ARG
+    )
+
+
+def test_external_input_gating_a_branch_still_const_sink_arg() -> None:
+    # #12: external input EXISTS (getenv) and gates a branch, but it never flows INTO the sink's
+    # argument (a constant). Gate != content — the constant command is still downweighted.
+    pc = 'void f(void){ char* m = getenv("MODE"); if (m != 0) { system("/sbin/reboot"); } }'
+    assert (
+        detect_form_signal(
+            sink_name="system",
+            pseudocode=pc,
+            callees=["getenv", "system"],
+            sink_arg="sbin",
+        )
+        == CONST_SINK_ARG
+    )
+
+
+def test_external_input_flowing_into_sink_arg_is_not_downweighted() -> None:
+    # #12 reverse: the external value actually flows INTO the sink argument (content, not gate) —
+    # not a constant, not constrained -> must NOT be downweighted (source_class stays lit).
+    pc = 'void f(void){ char* m = getenv("X"); char c[64]; snprintf(c,64,"echo %s",m); system(c); }'
+    assert (
+        detect_form_signal(
+            sink_name="system",
+            pseudocode=pc,
+            callees=["getenv", "snprintf", "system"],
+            sink_arg="c",
+        )
+        is None
+    )
+
+
+# ── safe-charset-constrained source (②: ether_ntoa / inet_ntop / base64) ───────────────
+
+
+def test_ether_ntoa_constrained_value_is_charset_constrained() -> None:
+    # The value reaching the sink is a MAC address rendered by ether_ntoa -> constrained to a safe
+    # character set (hex + ':'), so it cannot carry shell syntax even via the %s command format.
+    pc = (
+        "void f(struct ether_addr* mac){ char* s = ether_ntoa(mac); char c[64]; "
+        'snprintf(c,64,"arp -s %s",s); system(c); }'
+    )
+    assert (
+        detect_form_signal(
+            sink_name="system",
+            pseudocode=pc,
+            callees=["ether_ntoa", "snprintf", "system"],
+            sink_arg="c",
+        )
+        == CHARSET_CONSTRAINED
+    )
+
+
+def test_charset_safe_plus_free_source_into_same_sink_is_not_downweighted() -> None:
+    # ② reverse: the SAME sink argument is built from BOTH a charset-safe value (ether_ntoa) AND a
+    # free string source (nvram_get). One safe contributor does not make the argument safe -> the
+    # free path bypassing the converter must suppress the downweight.
+    pc = (
+        "void f(struct ether_addr* mac){ char* s = ether_ntoa(mac); char* v = nvram_get(0); "
+        'char c[96]; snprintf(c,96,"set %s %s",s,v); system(c); }'
+    )
+    assert (
+        detect_form_signal(
+            sink_name="system",
+            pseudocode=pc,
+            callees=["ether_ntoa", "nvram_get", "snprintf", "system"],
+            sink_arg="c",
         )
         is None
     )

@@ -455,6 +455,28 @@ def test_no_shell_exec_is_labelled_and_downweighted(tmp_path: Path) -> None:
     assert _score_of(atlas, "noshell") < _score_of(atlas, "shell_sys")
 
 
+def test_mixed_system_and_execl_anchors_system_not_no_shell(tmp_path: Path) -> None:
+    # Bug1: a function that calls BOTH system and execl must anchor to the shell-running sink
+    # (system), and no_shell_exec must NOT fire (cmd capability is not all exec-no-shell) — the
+    # alphabetically-first execl must not mask the real shell sink.
+    mixed = {
+        "name": "mixed_exec",
+        "pseudocode": (
+            "void mixed_exec(char* p){ char b[64]; recv(fd,b,64); char c[128]; "
+            'snprintf(c,128,"/usr/sbin/tool %s",b); if (b[0]) execl(c,c,0); else system(c); }'
+        ),
+        "hash": "h_mixed",
+        "callees": ["recv", "snprintf", "execl", "system"],
+    }
+    db = _make_db(tmp_path, [{"name": "webd", "funcs": [mixed]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_a")
+
+    row = _by_anchor(atlas)["mixed_exec"]
+    assert row["sink_anchor"] == "system"  # danger-anchored, not the alphabetically-first execl
+    assert row["blocking_mechanism"] != "no_shell_exec"  # shell-capable -> not downweighted
+
+
 def test_numeric_sanitized_is_labelled_and_downweighted(tmp_path: Path) -> None:
     db = _make_db(
         tmp_path,
