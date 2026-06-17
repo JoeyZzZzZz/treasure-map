@@ -2,24 +2,22 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Change classification and the public run_diff entry point.
 
-run_diff opens both databases read-only, aligns functions (matcher), classifies each
-alignment into a neutral change_kind, and for a genuinely changed function asks for a
-neutral mechanism description (verdict). It returns in-memory results only — it never
-writes to either input, and it knows nothing about any downstream store.
+run_diff opens both databases read-only, aligns functions (matcher), and classifies each
+alignment into a neutral change_kind. It returns in-memory results only — it never writes
+to either input, and it knows nothing about any downstream store. The change itself is the
+deterministic unified diff; the primitive does not ask an LLM to describe it.
 """
 
 from __future__ import annotations
 
 import asyncio
 import difflib
-from dataclasses import replace
 from pathlib import Path
 from typing import get_args
 
 from treasure_map.lib.diff.loader import FuncRow, load_functions
 from treasure_map.lib.diff.matcher import Pair, _DiffRouter, match_functions
 from treasure_map.lib.diff.models import Axis, ChangeLead, DiffResult, DiffStats, FuncRef
-from treasure_map.lib.diff.verdict import describe_change
 
 # Default ceiling on M-tier function_match_assist calls per run (degrade-and-flag above).
 DEFAULT_MAX_ASSIST = 200
@@ -46,25 +44,38 @@ def _unified_diff(a: str, b: str) -> str:
 def classify(pair: Pair, axis: Axis) -> tuple[ChangeLead, str | None]:
     """Classify one alignment into a ChangeLead plus the diff text (None if not diffable).
 
-    A both-present pair with equal non-null hashes is unchanged; otherwise it is changed
-    (with a unified diff when both bodies are present, else no verdict is possible). A
-    one-sided pair is added/removed and never carries a verdict.
+    A both-present pair is decided in THREE states by whether each side has a body, so a
+    missing body (a decompilation timeout) is never mistaken for a change:
+      - both bodies present  -> compare hashes: equal = unchanged, else = changed + diff
+      - neither body present  -> skipped_no_body (no information, not a change)
+      - exactly one body      -> changed_unverifiable (cannot tell; flag, never guess)
+    A one-sided pair is added/removed.
     """
     ref_a, ref_b = _ref(pair.a), _ref(pair.b)
     hash_a = pair.a.pseudocode_hash if pair.a else None
     hash_b = pair.b.pseudocode_hash if pair.b else None
 
     if pair.a is not None and pair.b is not None:
-        if hash_a and hash_b and hash_a == hash_b:
-            kind: str = "unchanged"
+        a_body, b_body = _has_body(pair.a), _has_body(pair.b)
+        if a_body and b_body:
+            if hash_a and hash_b and hash_a == hash_b:
+                kind: str = "unchanged"
+                diff_text = None
+            else:
+                kind = "changed"
+                assert pair.a.pseudocode is not None and pair.b.pseudocode is not None
+                diff_text = _unified_diff(pair.a.pseudocode, pair.b.pseudocode)
+        elif not a_body and not b_body:
+            # Both decompilations are empty (e.g. both timed out): no information, not a
+            # change. Treated like unchanged — counted, never a lead.
+            kind = "skipped_no_body"
             diff_text = None
-        elif _has_body(pair.a) and _has_body(pair.b):
-            kind = "changed"
-            assert pair.a.pseudocode is not None and pair.b.pseudocode is not None
-            diff_text = _unified_diff(pair.a.pseudocode, pair.b.pseudocode)
         else:
-            # Matched, but at least one body is missing: a change we cannot describe.
-            kind = "changed"
+            # Exactly one side has a body: one version decompiled, the other did not. We
+            # cannot tell whether the function changed, so we flag it (degrade-and-flag) —
+            # never silently 'unchanged' (that would hide a real change) and never mixed into
+            # the main 'changed' (we cannot describe it).
+            kind = "changed_unverifiable"
             diff_text = None
     elif pair.a is not None:
         kind = "removed"
@@ -97,29 +108,27 @@ async def _run_diff_async(
     pairs, m_assist_calls = await match_functions(funcs_a, funcs_b, router, max_assist=max_assist)
 
     leads: list[ChangeLead] = []
-    matched = unchanged = added = removed = changed = verdict_calls = 0
+    matched = unchanged = added = removed = changed = 0
+    changed_unverifiable = skipped_no_body = 0
     for pair in pairs:
-        lead, diff_text = classify(pair, axis)
+        lead, _diff_text = classify(pair, axis)
         if pair.a is not None and pair.b is not None:
             matched += 1
         kind = lead.change_kind
         if kind == "unchanged":
             unchanged += 1
-            continue  # dropped: no lead, no LLM
+            continue  # dropped: no lead
+        if kind == "skipped_no_body":
+            skipped_no_body += 1
+            continue  # no information, not a change — dropped like unchanged
         if kind == "added":
             added += 1
         elif kind == "removed":
             removed += 1
+        elif kind == "changed_unverifiable":
+            changed_unverifiable += 1
         else:  # changed
             changed += 1
-            # The neutral L-tier description runs only when the LLM budget is on (max_assist > 0).
-            # At max_assist 0 the run is pure-static and makes no LLM call of any kind, leaving
-            # change_description None — a value the diff consumer already tolerates (it computes
-            # its own deterministic unified diff). Alignment and classification are unaffected.
-            if diff_text and max_assist > 0:
-                description = await describe_change(diff_text, router)
-                verdict_calls += 1
-                lead = replace(lead, change_description=description)
         leads.append(lead)
 
     stats = DiffStats(
@@ -128,8 +137,9 @@ async def _run_diff_async(
         added=added,
         removed=removed,
         changed=changed,
+        changed_unverifiable=changed_unverifiable,
+        skipped_no_body=skipped_no_body,
         m_assist_calls=m_assist_calls,
-        verdict_calls=verdict_calls,
     )
     return DiffResult(leads=tuple(leads), stats=stats)
 

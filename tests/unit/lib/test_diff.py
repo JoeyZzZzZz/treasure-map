@@ -130,10 +130,13 @@ def test_added_and_removed(tmp_path: Path) -> None:
     assert "patch_verdict" not in router.tasks()
 
 
-# ── changed (exact match, body differs) => one neutral verdict ──────────────────────
+# ── changed (exact match, body differs) => no LLM description ───────────────────────
 
 
-def test_changed_runs_one_verdict(tmp_path: Path) -> None:
+def test_changed_makes_no_llm_call(tmp_path: Path) -> None:
+    # Both bodies present and differ -> changed. The diff itself is the deterministic record;
+    # the primitive no longer asks an LLM to describe it, so an exact-matched changed pair
+    # makes NO LLM call at all and carries no change_description.
     db_a = _make_db(
         tmp_path,
         "a.db",
@@ -156,23 +159,75 @@ def test_changed_runs_one_verdict(tmp_path: Path) -> None:
             }
         ],
     )
-    router = FakeDiffRouter(verdict_text="adds a length check on the source before the copy")
+    router = FakeDiffRouter()
 
     res = run_diff(db_a, db_b, "version", router)
 
     assert res.stats.changed == 1
     assert res.stats.matched == 1
-    assert res.stats.verdict_calls == 1
     (lead,) = res.leads
     assert lead.change_kind == "changed"
     assert lead.scope_origin == "version"
-    assert lead.change_description == "adds a length check on the source before the copy"
+    assert lead.change_description is None  # no LLM description step
     assert lead.pseudocode_hash_a == "old" and lead.pseudocode_hash_b == "new"
-    # Exactly one verdict call, fed a unified diff (not the raw bodies).
-    verdict_inputs = [text for task, text in router.calls if task == "patch_verdict"]
-    assert len(verdict_inputs) == 1
-    assert "@@" in verdict_inputs[0]
-    assert router.tasks().count("patch_verdict") == 1
+    assert router.calls == []  # exact-matched + no description => zero LLM calls
+    assert "patch_verdict" not in router.tasks()
+
+
+# ── three-state body handling: a missing body is never mistaken for a change ────────
+
+
+def test_both_bodies_missing_is_skipped_not_changed(tmp_path: Path) -> None:
+    # Same symbol on both sides, but BOTH decompilations are empty (e.g. both timed out).
+    # No information => not a change. Must NOT inflate `changed`; counted as skipped_no_body
+    # and dropped from leads (like unchanged).
+    empty = {"name": "big_oss_fn", "pseudocode": "", "hash": None}
+    db_a = _make_db(tmp_path, "a.db", [empty])
+    db_b = _make_db(tmp_path, "b.db", [empty])
+
+    res = run_diff(db_a, db_b, "version", FakeDiffRouter())
+
+    assert res.stats.matched == 1  # symbol-aligned
+    assert res.stats.changed == 0  # the bug this fixes: NOT counted as changed
+    assert res.stats.changed_unverifiable == 0
+    assert res.stats.skipped_no_body == 1
+    assert res.leads == ()  # no information => no lead
+
+
+def test_one_side_missing_body_is_changed_unverifiable(tmp_path: Path) -> None:
+    # One version decompiled, the other timed out (empty). We cannot tell whether it changed,
+    # so it is flagged changed_unverifiable — never silently unchanged, never mixed into the
+    # main `changed` (no diff is possible).
+    db_a = _make_db(
+        tmp_path, "a.db", [{"name": "svc_init", "pseudocode": "void svc_init(){a();}", "hash": "h"}]
+    )
+    db_b = _make_db(tmp_path, "b.db", [{"name": "svc_init", "pseudocode": "", "hash": None}])
+
+    res = run_diff(db_a, db_b, "version", FakeDiffRouter())
+
+    assert res.stats.changed == 0  # not the describable main signal
+    assert res.stats.changed_unverifiable == 1
+    assert res.stats.skipped_no_body == 0
+    (lead,) = res.leads
+    assert lead.change_kind == "changed_unverifiable"
+
+
+def test_one_side_truly_changed_other_empty_is_not_unchanged(tmp_path: Path) -> None:
+    # Anti-false-negative: the present side is a substantively patched body, the other side is
+    # empty (timed out). A one-side-empty pair must NOT be judged unchanged just because the
+    # empty side gives nothing to compare — it stays changed_unverifiable so a real change is
+    # never hidden.
+    patched = "void rc(char*p){ if(validate(p)) system(p); }"  # clearly not a no-op
+    db_a = _make_db(tmp_path, "a.db", [{"name": "rc", "pseudocode": patched, "hash": "h"}])
+    db_b = _make_db(tmp_path, "b.db", [{"name": "rc", "pseudocode": "", "hash": None}])
+
+    res = run_diff(db_a, db_b, "version", FakeDiffRouter())
+
+    (lead,) = res.leads
+    assert lead.change_kind == "changed_unverifiable"  # NOT unchanged — the guarded false neg
+
+
+# ── max_assist 0 => pure static, no LLM call even for a changed pair ─────────────────
 
 
 def test_max_assist_zero_makes_no_llm_call_even_for_changed(tmp_path: Path) -> None:
@@ -194,7 +249,6 @@ def test_max_assist_zero_makes_no_llm_call_even_for_changed(tmp_path: Path) -> N
     res = run_diff(db_a, db_b, "version", router, max_assist=0)
 
     assert res.stats.changed == 1  # exact alignment + body differs
-    assert res.stats.verdict_calls == 0  # L-tier description skipped at max_assist 0
     assert router.calls == []  # NO LLM call of any kind (matching or description)
     (lead,) = res.leads
     assert lead.change_kind == "changed"
@@ -220,7 +274,7 @@ def _renamed_residue(tmp_path: Path) -> tuple[Path, Path]:
     return db_a, db_b
 
 
-def test_residue_assist_matches_then_verdict(tmp_path: Path) -> None:
+def test_residue_assist_matches(tmp_path: Path) -> None:
     db_a, db_b = _renamed_residue(tmp_path)
     router = FakeDiffRouter(match_decider=lambda _t: True)
 
@@ -229,8 +283,8 @@ def test_residue_assist_matches_then_verdict(tmp_path: Path) -> None:
     assert res.stats.m_assist_calls == 1  # one residue comparison, answered yes
     assert res.stats.matched == 1
     assert res.stats.changed == 1
-    assert res.stats.verdict_calls == 1
     assert "function_match_assist" in router.tasks()
+    assert "patch_verdict" not in router.tasks()  # no L-tier description step
 
 
 def test_residue_assist_overflow_leaves_unmatched(tmp_path: Path) -> None:
@@ -291,17 +345,6 @@ def test_diff_package_is_boundary_clean() -> None:
         text = path.read_text()
         assert not judgment.search(text), f"judgment vocab in {path.name}"
         assert not section_ref.search(text), f"section/private-doc ref in {path.name}"
-
-
-def test_patch_verdict_prompt_is_mechanism_only() -> None:
-    from treasure_map.lib.diff.verdict import _PATCH_VERDICT_PROMPT
-
-    low = _PATCH_VERDICT_PROMPT.lower()
-    assert "mechanism only" in low
-    assert "one neutral sentence" in low
-    # Asks for description, not assessment — no judgment terms anywhere in the prompt.
-    for banned in ("security", "severity", "exploit", "vulnerab", "fix quality", "priority"):
-        assert banned not in low
 
 
 # ── async entry is awaitable for future async consumers ─────────────────────────────

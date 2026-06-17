@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Diff change-classification is now three-state, so a missing decompilation is never mistaken for
+  a change. A both-present pair is decided by whether each side has a body: both bodies present →
+  compare hashes (equal = unchanged, else = changed + unified diff); neither side has a body (both
+  decompilations timed out) → `skipped_no_body` (no information, not a change, dropped like
+  unchanged); exactly one side has a body → `changed_unverifiable` (cannot tell — flagged, never
+  silently unchanged, never mixed into the describable `changed`). Previously a both-empty pair
+  fell through to `changed`, inflating the lead count and burying real patches. On the dcs932l
+  before/after pairs this removed hundreds of phantom changes: a self-diff (identical re-analysis)
+  went from 330 "changed" (all from timed-out functions) to 0; two near-identical v2.18 builds from
+  348 to 17; the real v2.17→v2.18 bump from 809 to 480 — while every both-bodies-present change is
+  unchanged-in-behavior (a substantively patched function whose counterpart timed out stays
+  `changed_unverifiable`, never `unchanged`). `DiffStats` and the `hunt-diff` summary now print
+  `changed` / `changed_unverifiable` / `skipped_no_body` separately.
+
+### Removed
+
+- The L-tier `patch_verdict` step (`describe_change`) is removed from the diff path: it produced a
+  neutral one-sentence description of each changed function that the `hunt-diff` writer discarded
+  (it keeps its own deterministic unified diff), so it was unused cost and "reading the facts for
+  the AI" — which the AI consumer does better itself. `lib/diff/verdict.py` is deleted, the
+  `verdict_calls` stat is gone, and the diff path now builds only the M-tier router
+  (`--max-assist > 0` no longer needs an L-tier key; `--max-assist 0` remains zero-LLM). The
+  `patch_verdict` cache/registry plumbing is left in place (generic, still tested). This actions
+  the L-tier item flagged in the previous round.
+
 ### Changed
 
 - `hunt-diff` no longer hard-gates on an LLM key. The LLM is only a fallback for the residue the

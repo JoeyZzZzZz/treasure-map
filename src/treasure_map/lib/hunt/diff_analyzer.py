@@ -58,10 +58,13 @@ _SOURCE_CLASS_BY_ORIGIN = {
 
 @dataclass(frozen=True)
 class AnalyzerStats:
-    leads: int  # change leads R-diff produced (changed / added / removed)
-    instances_written: int  # instances persisted into the atlas
+    leads: int  # change leads R-diff produced (changed / changed_unverifiable / added / removed)
+    instances_written: int  # instances persisted into the atlas (only describable 'changed')
     by_status: dict[str, int]  # reachability_status -> count, over written instances
     public_findings: int  # COUNT(*) FROM public_finding — expected 0 in M2
+    changed: int  # both sides had a body and differed (the graded main signal)
+    changed_unverifiable: int  # exactly one side had a body — flagged, not graded
+    skipped_no_body: int  # neither side had a body (both timed out) — not a change
 
 
 def _find_sink(callees: list[str]) -> tuple[str, str] | None:
@@ -141,7 +144,9 @@ def run_diff_analyzer(
     try:
         for lead in result.leads:
             if lead.change_kind != "changed" or lead.func_ref_a is None:
-                continue  # M2 A1 grades changed functions; added/removed counted as leads only
+                # M2 A1 grades only describable 'changed' (both bodies present); added /
+                # removed / changed_unverifiable are counted as leads but not graded.
+                continue
             baseline = funcs_a.get(lead.func_ref_a.func_id)
             if baseline is None or not (baseline.pseudocode and baseline.pseudocode.strip()):
                 gaps += 1
@@ -219,4 +224,7 @@ def run_diff_analyzer(
         instances_written=instances_written,
         by_status=by_status,
         public_findings=int(public_findings),
+        changed=result.stats.changed,
+        changed_unverifiable=result.stats.changed_unverifiable,
+        skipped_no_body=result.stats.skipped_no_body,
     )

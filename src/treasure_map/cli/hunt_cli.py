@@ -127,10 +127,10 @@ def hunt_diff(
             if cfg.llm is None:
                 raise click.ClickException(
                     f"--max-assist {effective_max_assist} needs an M-tier key "
-                    "(function_match_assist) and an L-tier key (the neutral change description); "
+                    "(function_match_assist for the stripped/renamed residue); "
                     "or run with --max-assist 0 for pure static alignment (no key)."
                 )
-            router = build_router(cfg.llm, ledger_path, tiers=[Tier.M, Tier.L])
+            router = build_router(cfg.llm, ledger_path, tiers=[Tier.M])
 
         stats = run_diff_analyzer(
             db_a,
@@ -147,6 +147,12 @@ def hunt_diff(
 
     click.echo(f"Atlas: {resolved_atlas}")
     click.echo(f"  Change leads      : {stats.leads}")
+    click.echo(
+        "  Of which          : "
+        f"changed={stats.changed} (graded), "
+        f"unverifiable={stats.changed_unverifiable} (one side had no body), "
+        f"skipped_no_body={stats.skipped_no_body} (neither side had a body)"
+    )
     click.echo(f"  Instances written : {stats.instances_written}")
     click.echo(
         "  By reachability   : "

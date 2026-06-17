@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Cross-entity diff primitive.
 
-Given two analysis databases and a neutral axis, locate functions that changed and
-describe each change in mechanism-only terms. Returns in-memory results; writes
+Given two analysis databases and a neutral axis, locate functions that changed (the
+change itself is the deterministic unified diff). Returns in-memory results; writes
 nothing, judges nothing, and depends on no downstream store.
 """
 

@@ -17,7 +17,15 @@ from typing import Literal
 Axis = Literal["version", "mod", "sibling"]
 
 # How a single function resolved across the two entities.
-ChangeKind = Literal["unchanged", "added", "removed", "changed"]
+#   changed              — both sides have a body and the bodies differ (the main signal)
+#   changed_unverifiable — exactly one side has a body (e.g. one version's decompilation
+#                          timed out): we cannot tell whether it changed, so we flag rather
+#                          than guess (degrade-and-flag; never silently 'unchanged')
+#   skipped_no_body      — neither side has a body (both timed out): no information, not a
+#                          change; dropped like 'unchanged' (counted, never a lead)
+ChangeKind = Literal[
+    "unchanged", "added", "removed", "changed", "changed_unverifiable", "skipped_no_body"
+]
 
 
 @dataclass(frozen=True)
@@ -34,8 +42,9 @@ class ChangeLead:
     """One located change between the two entities.
 
     func_ref_a / func_ref_b are None on the side where the function is absent
-    (added => a is None; removed => b is None). change_description is the neutral
-    mechanism-level sentence, present only for a 'changed' lead with a usable diff.
+    (added => a is None; removed => b is None). change_description is reserved and
+    always None now: the diff consumer recovers the change from the deterministic
+    unified diff itself, so the primitive no longer asks an LLM to describe it.
     """
 
     change_kind: ChangeKind
@@ -50,12 +59,13 @@ class ChangeLead:
 @dataclass(frozen=True)
 class DiffStats:
     matched: int  # functions resolved to a pairing (present on both sides)
-    unchanged: int  # hash-equal pairings (dropped, no lead, no LLM)
+    unchanged: int  # hash-equal pairings, both with a body (dropped, no lead)
     added: int  # present in B only
     removed: int  # present in A only
-    changed: int  # matched but pseudocode differs
+    changed: int  # both sides have a body and the bodies differ (the main signal)
+    changed_unverifiable: int  # exactly one side has a body — flagged, not described
+    skipped_no_body: int  # neither side has a body (both timed out) — not a change, dropped
     m_assist_calls: int  # M-tier function_match_assist calls actually made
-    verdict_calls: int  # L-tier patch_verdict calls actually made
 
 
 @dataclass(frozen=True)
