@@ -22,10 +22,9 @@ from treasure_map.lib.analyze.non_binary.framework import (
     NonBinaryIngester,
 )
 
-# Ordered rule table (categorical observation labels only).
-# Matched against the normalized "key=value" string (key=value or key value).
-# First-match-wins, compiled once at module load.
-# Labels are CATEGORICAL. Never put a payload or runnable instruction in vuln_hint.
+# Ordered rule table (categorical observation labels only). Matched against the
+# normalized "key=value" string; the match gates recording and drives is_sensitive,
+# but the label itself is not stored. First-match-wins, compiled once at module load.
 CONFIG_RISK_RULES: list[tuple[str, str]] = [
     (
         "hardcoded_credential",
@@ -78,7 +77,7 @@ def _ingest_config(conn: sqlite3.Connection, file_id: int, f: NonBinaryFile) -> 
     if f.text is None:
         return 0
 
-    rows: list[tuple[int, str | None, str | None, str | None, int, str]] = []
+    rows: list[tuple[int, str | None, str | None, str | None, int]] = []
     section: str | None = None
 
     for raw in f.text.splitlines():
@@ -108,23 +107,24 @@ def _ingest_config(conn: sqlite3.Connection, file_id: int, f: NonBinaryFile) -> 
             continue
 
         normalized = f"{key}={value}" if value is not None else key
-        vuln_hint: str | None = None
+        # The matched label gates recording and drives is_sensitive; it is not stored.
+        matched: str | None = None
         for label, pattern in _COMPILED_RULES:
             if pattern.search(normalized):
-                vuln_hint = label
+                matched = label
                 break
 
-        if vuln_hint is None:
+        if matched is None:
             continue
 
-        is_sensitive = 1 if vuln_hint == "hardcoded_credential" else 0
-        rows.append((file_id, section, key, value, is_sensitive, vuln_hint))
+        is_sensitive = 1 if matched == "hardcoded_credential" else 0
+        rows.append((file_id, section, key, value, is_sensitive))
 
     if rows:
         conn.executemany(
             """INSERT INTO config_entries
-               (file_id, section, key, value, is_sensitive, vuln_hint)
-               VALUES (?, ?, ?, ?, ?, ?)""",
+               (file_id, section, key, value, is_sensitive)
+               VALUES (?, ?, ?, ?, ?)""",
             rows,
         )
     return len(rows)

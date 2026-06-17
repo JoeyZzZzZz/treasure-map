@@ -75,7 +75,7 @@ def hunt_diff(
     """
     from treasure_map.lib.config.config import load_config
     from treasure_map.lib.errors import TreasureMapError
-    from treasure_map.lib.hunt import run_analyzer1
+    from treasure_map.lib.hunt import run_diff_analyzer
     from treasure_map.lib.llm.factory import build_router
     from treasure_map.lib.llm.types import Tier
 
@@ -88,7 +88,7 @@ def hunt_diff(
 
     try:
         router = build_router(cfg.llm, ledger_path, tiers=[Tier.M, Tier.L])
-        stats = run_analyzer1(
+        stats = run_diff_analyzer(
             db_a,
             db_b,
             axis,  # type: ignore[arg-type]  # Click constrains to the Axis literals

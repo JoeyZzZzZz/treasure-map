@@ -18,7 +18,7 @@ CLI: `tmap`. AGPL-3.0.
 |---|---|---|
 | Ghidra | 11.x | decompiles every binary (headless) |
 | JDK | 21 | required by Ghidra 11.x (older JDKs make Ghidra fail to launch) |
-| API key(s) | — | only for LLM-assisted steps (`--summarize`, `hunt-*`); plain `tmap analyze` runs on Ghidra alone |
+| API key(s) | — | only for LLM-assisted steps (`hunt-*`); plain `tmap analyze` runs on Ghidra alone |
 
 You install Ghidra and JDK yourself; the Setup below installs Treasure Map and the right Python
 for you. (A zero-setup Docker image with everything bundled is planned; until then, follow Setup.)
@@ -182,8 +182,7 @@ real issue and prints **no triggering input**.
   in the output.
 
 Analysis is **resume-safe**: re-run with the **same** `-w` to continue from the last checkpoint.
-Useful flags: `--summarize` (function summaries via the S-tier LLM; needs an S-tier key),
-`--skip-non-binary`, `--skip-ingester <KIND>`, `-c <config.yaml>`.
+Useful flags: `--skip-non-binary`, `--skip-ingester <KIND>`, `-c <config.yaml>`.
 
 **Go further (optional)**, once you have one or more `analysis.db`:
 ```bash

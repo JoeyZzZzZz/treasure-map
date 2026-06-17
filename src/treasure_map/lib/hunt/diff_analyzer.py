@@ -1,6 +1,6 @@
 # Copyright (C) 2025-2026 JoeyZzZzZz
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Analyzer-1 — the diff-driven analyzer (patch-diff scenario), the first atlas writer.
+"""diff_analyzer — the diff-driven analyzer (patch-diff scenario), the first atlas writer.
 
 Composes two primitives end-to-end and persists the result: R-diff locates the functions
 that changed between two analysis databases; R2 grades the reachability of the changed
@@ -112,7 +112,7 @@ def _unified_diff(before: str, after: str) -> str:
     )
 
 
-def run_analyzer1(
+def run_diff_analyzer(
     db_a: Path | str,
     db_b: Path | str,
     axis: Axis,
@@ -213,7 +213,7 @@ def run_analyzer1(
         atlas.close()
 
     if gaps:
-        logger.info("analyzer1: %d changed lead(s) skipped for missing baseline pseudocode", gaps)
+        logger.info("diff_analyzer: %d changed lead(s) skipped (no baseline pseudocode)", gaps)
     return AnalyzerStats(
         leads=len(result.leads),
         instances_written=instances_written,

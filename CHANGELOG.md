@@ -7,8 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- Build-time LLM pre-judgment and dead placeholder fields dropped from `analysis.db` — the
+  consumer of this base is an AI that reads the facts (pseudocode / disassembly / xrefs) and
+  judges for itself, faster and more accurately than re-reading our pre-chewed interpretation.
+  Removed the `--summarize` opt-in step and `lib/analyze/summarize.py` (LLM one-line
+  `functions.summary`), the never-read `library_summaries` table (and its `library_summary` LLM
+  task), the dead placeholder columns `functions.func_types` / `functions.vuln_hints` /
+  `functions.capa_tags`, the categorical `vuln_hint` columns on `script_calls` / `config_entries`
+  / `credentials` / `web_endpoints`, and the unverifiable predicted `script_calls.has_user_input`
+  flag. All were verified write-only / never-read before removal. Kept: the deterministic candidate
+  generation + grading (the product), the structural `script_calls.args_pattern`, the binary-level
+  `binaries.capa_tags` placeholder, and the rule matching that gates which lines are recorded
+  (signal density) and drives `is_sensitive` — only the stored label is gone. An idempotent
+  in-place migration removes these columns/table from older databases while preserving every
+  surviving column and all rows; building a fresh `analysis.db` no longer needs any LLM key.
+
 ### Changed
 
+- `lib/hunt/analyzer1.py` → `lib/hunt/diff_analyzer.py` (and `run_analyzer1` → `run_diff_analyzer`):
+  it is the diff-driven patch analyzer / first atlas writer, and the old name did not say so. No
+  behavior change.
 - Candidate generation — recall before precision: a recognized source is no longer a *gate* for
   emitting a candidate, only a scoring signal. The command-injection shape now matches on a
   constructed shell command (format + shell-ish `%s` + command sink) whether or not an

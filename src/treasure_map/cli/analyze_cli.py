@@ -65,30 +65,12 @@ Re-running with the same -w (same name or path) resumes from the last checkpoint
     multiple=True,
     help="Skip a specific ingester by kind (e.g. shell_script). Repeatable.",
 )
-@click.option(
-    "--summarize",
-    is_flag=True,
-    default=False,
-    help=(
-        "After analysis, fill functions.summary via the S-tier LLM. Opt-in; needs an "
-        "S-tier key. Skips with a message (analysis still succeeds) if the key is absent."
-    ),
-)
-@click.option(
-    "--summary-limit",
-    "summary_limit",
-    type=int,
-    default=None,
-    help="Limit summarization to N functions (use for prompt calibration).",
-)
 def analyze(
     fs_root: Path,
     workspace: str | None,
     config: Path | None,
     skip_non_binary: bool,
     skip_ingesters: tuple[str, ...],
-    summarize: bool,
-    summary_limit: int | None,
 ) -> None:
     """Analyze an extracted firmware filesystem root.
 
@@ -163,46 +145,3 @@ def analyze(
     click.echo(f"  Credentials: {result.credentials_ingested}")
     click.echo(f"  Web endpoints: {result.web_endpoints_ingested}")
     click.echo(f"  DB       : {result.db_path}")
-
-    if summarize:
-        _summarize(cfg, ws_path, result.db_path, summary_limit)
-
-
-def _summarize(cfg: Any, workspace: Path, db_path: Path, limit: int | None) -> None:
-    """Opt-in post-step: fill functions.summary via the S-tier router.
-
-    Never raises out of analyze — a missing/invalid S-tier key logs one message and
-    returns. The key-less analyze path never reaches here (gated on --summarize).
-    """
-    from treasure_map.lib.analyze.summarize import summarize_functions
-    from treasure_map.lib.errors import ConfigError
-    from treasure_map.lib.llm.factory import build_router
-    from treasure_map.lib.llm.types import Tier
-    from treasure_map.lib.storage.connection import open_db
-
-    if cfg.llm is None:
-        click.echo("summary skipped: LLM not configured")
-        return
-    try:
-        router = build_router(cfg.llm, workspace / "cost_ledger.json", tiers=[Tier.S])
-    except ConfigError:
-        click.echo("summary skipped: S-tier key not configured")
-        return
-
-    def _on_progress(done: int, total: int) -> None:
-        # Generic counter only — never pseudocode/summary/firmware strings. Rewrites a
-        # single stderr line so it does not interleave with the final summary block; the
-        # \r is harmless when piped to a non-TTY log.
-        click.echo(f"\r  summarizing functions: {done}/{total}", nl=False, err=True)
-
-    conn = open_db(db_path)
-    try:
-        stats = asyncio.run(summarize_functions(conn, router, limit=limit, progress=_on_progress))
-    finally:
-        conn.close()
-    click.echo("", err=True)  # finish the progress line with a newline
-
-    click.echo(
-        f"  Summaries: {stats.summarized} written, "
-        f"{stats.skipped_no_pseudocode} skipped (no pseudocode), {stats.failed} failed"
-    )

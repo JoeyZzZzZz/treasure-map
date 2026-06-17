@@ -68,7 +68,7 @@ def test_purge_by_prompt_version(tmp_path):
 def test_stats_by_task_and_model(tmp_path):
     cache = LLMCache(tmp_path / "cache.db")
     cache.set("function_summary", "x\n---CALLEES---\n[]", "v1", "deepseek-chat", "S", {}, 0.01)
-    cache.set("library_summary", "lib\n---SUMMARIES---\n[]", "v1", "deepseek-r1", "M", {}, 0.05)
+    cache.set("patch_verdict", "old\n---NEW---\nnew", "v1", "deepseek-r1", "M", {}, 0.05)
     cache.get("function_summary", "x\n---CALLEES---\n[]", "v1")
     stats = cache.stats()
     assert stats["total_entries"] == 2

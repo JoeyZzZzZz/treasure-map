@@ -17,7 +17,6 @@ TASK_TIER_MAP: dict[str, Tier] = {
     "wrapper_detect": Tier.S,
     # M1-Stretch
     "string_categorize": Tier.S,
-    "library_summary": Tier.M,
     # M2
     "function_match_assist": Tier.M,
     "patch_verdict": Tier.L,

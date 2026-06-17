@@ -23,35 +23,22 @@ from treasure_map.lib.analyze.non_binary.framework import (
     NonBinaryIngester,
 )
 
-# Categorical vuln_hint vocabulary. Observation labels only — never a
-# payload, PoC, attack instruction, or generated exploit of any kind.
-CREDENTIAL_HINTS: frozenset[str] = frozenset(
-    {
-        "hardcoded_private_key",
-        "certificate_present",
-        "public_key_present",
-        "empty_password",
-        "empty_root_password",
-        "weak_password_hash_algo",
-        "present_password_hash",
-    }
-)
-
 _PASSWD_BASENAMES = frozenset({"passwd", "master.passwd"})
 _SHADOW_BASENAMES = frozenset({"shadow", "gshadow"})
 _PEM_EXTENSIONS = frozenset({"pem", "crt", "cer", "key", "pub"})
 
-# Shadow $id$ prefix table → (algorithm, vuln_hint). Longer prefixes first.
-_SHADOW_ID_TABLE: tuple[tuple[str, str, str], ...] = (
-    ("$2a$", "bcrypt", "present_password_hash"),
-    ("$2b$", "bcrypt", "present_password_hash"),
-    ("$2y$", "bcrypt", "present_password_hash"),
-    ("$2$", "bcrypt", "present_password_hash"),
-    ("$1$", "md5crypt", "weak_password_hash_algo"),
-    ("$5$", "sha256crypt", "present_password_hash"),
-    ("$6$", "sha512crypt", "present_password_hash"),
-    ("$7$", "scrypt", "present_password_hash"),
-    ("$y$", "yescrypt", "present_password_hash"),
+# Shadow $id$ prefix table → algorithm. Longer prefixes first. The algorithm name
+# itself records the hash scheme (e.g. md5crypt) as structural evidence.
+_SHADOW_ID_TABLE: tuple[tuple[str, str], ...] = (
+    ("$2a$", "bcrypt"),
+    ("$2b$", "bcrypt"),
+    ("$2y$", "bcrypt"),
+    ("$2$", "bcrypt"),
+    ("$1$", "md5crypt"),
+    ("$5$", "sha256crypt"),
+    ("$6$", "sha512crypt"),
+    ("$7$", "scrypt"),
+    ("$y$", "yescrypt"),
 )
 
 
@@ -94,8 +81,8 @@ def _extract_pem_blocks(text: str) -> list[tuple[str, str]]:
     return blocks
 
 
-def _pem_header_to_meta(header: str) -> tuple[str, str | None, int, str] | None:
-    """Map a PEM type header to (cred_type, algorithm, is_sensitive, vuln_hint).
+def _pem_header_to_meta(header: str) -> tuple[str, str | None, int] | None:
+    """Map a PEM type header to (cred_type, algorithm, is_sensitive).
 
     Returns None for unrecognized types (e.g. PKCS7, CSR) to stay signal-dense.
     """
@@ -110,23 +97,23 @@ def _pem_header_to_meta(header: str) -> tuple[str, str | None, int, str] | None:
             algo = "openssh_private"
         else:
             algo = "private"
-        return ("private_key", algo, 1, "hardcoded_private_key")
+        return ("private_key", algo, 1)
     if "CERTIFICATE" in h and "REQUEST" not in h:
-        return ("certificate", None, 0, "certificate_present")
+        return ("certificate", None, 0)
     if "PUBLIC KEY" in h:
-        return ("public_key", None, 0, "public_key_present")
+        return ("public_key", None, 0)
     return None
 
 
-def _classify_hash(field: str) -> tuple[str, str]:
-    """Return (algorithm, vuln_hint) from a passwd/shadow hash field."""
-    for prefix, algo, hint in _SHADOW_ID_TABLE:
+def _classify_hash(field: str) -> str:
+    """Return the algorithm name for a passwd/shadow hash field."""
+    for prefix, algo in _SHADOW_ID_TABLE:
         if field.startswith(prefix):
-            return (algo, hint)
+            return algo
     # 13-char legacy DES crypt (no '$')
     if len(field) == 13 and "$" not in field:
-        return ("des", "weak_password_hash_algo")
-    return ("unknown", "present_password_hash")
+        return "des"
+    return "unknown"
 
 
 def _ingest_credential(conn: sqlite3.Connection, file_id: int, f: NonBinaryFile) -> int:
@@ -141,15 +128,15 @@ def _ingest_credential(conn: sqlite3.Connection, file_id: int, f: NonBinaryFile)
         return 0
 
     subtype = _detect_credential(f)
-    rows: list[tuple[int, str | None, str | None, str | None, str | None, int, str | None]] = []
+    rows: list[tuple[int, str | None, str | None, str | None, str | None, int]] = []
 
     if subtype == "pem":
         for header, block in _extract_pem_blocks(f.text):
             meta = _pem_header_to_meta(header)
             if meta is None:
                 continue
-            cred_type, algorithm, is_sensitive, vuln_hint = meta
-            rows.append((file_id, cred_type, None, algorithm, block, is_sensitive, vuln_hint))
+            cred_type, algorithm, is_sensitive = meta
+            rows.append((file_id, cred_type, None, algorithm, block, is_sensitive))
 
     elif subtype == "passwd":
         for raw in f.text.splitlines():
@@ -161,14 +148,14 @@ def _ingest_credential(conn: sqlite3.Connection, file_id: int, f: NonBinaryFile)
                 continue
             identifier, pw_field = fields[0], fields[1]
             if pw_field == "":
-                rows.append((file_id, "passwd_entry", identifier, None, None, 0, "empty_password"))
+                rows.append((file_id, "passwd_entry", identifier, None, None, 0))
             elif pw_field == "x":
                 # hash in shadow; record root as informational
                 if identifier == "root":
-                    rows.append((file_id, "passwd_entry", identifier, None, None, 0, None))
+                    rows.append((file_id, "passwd_entry", identifier, None, None, 0))
             elif pw_field not in {"*", "!"}:
-                algo, hint = _classify_hash(pw_field)
-                rows.append((file_id, "passwd_entry", identifier, algo, pw_field, 1, hint))
+                algo = _classify_hash(pw_field)
+                rows.append((file_id, "passwd_entry", identifier, algo, pw_field, 1))
 
     elif subtype == "shadow":
         for raw in f.text.splitlines():
@@ -180,19 +167,18 @@ def _ingest_credential(conn: sqlite3.Connection, file_id: int, f: NonBinaryFile)
                 continue
             identifier, hash_field = fields[0], fields[1]
             if hash_field == "":
-                hint = "empty_root_password" if identifier == "root" else "empty_password"
-                rows.append((file_id, "shadow_entry", identifier, None, None, 0, hint))
+                rows.append((file_id, "shadow_entry", identifier, None, None, 0))
             elif hash_field in {"*", "!", "!!"}:
                 continue
             else:
-                algo, h = _classify_hash(hash_field)
-                rows.append((file_id, "shadow_entry", identifier, algo, hash_field, 1, h))
+                algo = _classify_hash(hash_field)
+                rows.append((file_id, "shadow_entry", identifier, algo, hash_field, 1))
 
     if rows:
         conn.executemany(
             """INSERT INTO credentials
-               (file_id, cred_type, identifier, algorithm, material, is_sensitive, vuln_hint)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+               (file_id, cred_type, identifier, algorithm, material, is_sensitive)
+               VALUES (?, ?, ?, ?, ?, ?)""",
             rows,
         )
     return len(rows)

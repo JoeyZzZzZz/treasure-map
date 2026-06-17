@@ -1,9 +1,9 @@
 # Copyright (C) 2025-2026 JoeyZzZzZz
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Unit tests for the analyze CLI summarize wiring (R1).
+"""Unit tests for the analyze CLI wrapper.
 
-Covers the opt-in gating (no router built without --summarize) and the degrade
-paths (missing LLM config / missing S-tier key skip with a message, never raise).
+Stubs load_config / Workspace / run_analyze so the command runs without Ghidra,
+proving the thin wrapper drives the pipeline and prints the result block.
 """
 
 from __future__ import annotations
@@ -12,12 +12,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-import click
 import pytest
 from click.testing import CliRunner
 
-import treasure_map.cli.analyze_cli as analyze_cli
-from treasure_map.cli.analyze_cli import _summarize, analyze
+from treasure_map.cli.analyze_cli import analyze
 from treasure_map.lib.config.config import Config
 
 
@@ -84,93 +82,15 @@ def _patch_pipeline(monkeypatch: pytest.MonkeyPatch, db_path: Path) -> None:
     )
 
 
-def test_analyze_without_summarize_does_not_summarize(
+def test_analyze_runs_pipeline_and_prints_result(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _patch_pipeline(monkeypatch, tmp_path / "analysis.db")
-    called = {"n": 0}
-    monkeypatch.setattr(analyze_cli, "_summarize", lambda *a, **k: called.__setitem__("n", 1))
 
     fs_root = tmp_path / "fs"
     fs_root.mkdir()
     result = CliRunner().invoke(analyze, [str(fs_root), "--workspace", str(tmp_path / "ws")])
 
     assert result.exit_code == 0, result.output
-    assert called["n"] == 0  # opt-in: helper not invoked without the flag
-
-
-def test_analyze_with_summarize_invokes_helper(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _patch_pipeline(monkeypatch, tmp_path / "analysis.db")
-    seen: dict[str, Any] = {}
-
-    def _spy(cfg: Any, ws: Path, db: Path, limit: int | None) -> None:
-        seen["limit"] = limit
-
-    monkeypatch.setattr(analyze_cli, "_summarize", _spy)
-
-    fs_root = tmp_path / "fs"
-    fs_root.mkdir()
-    result = CliRunner().invoke(
-        analyze,
-        [str(fs_root), "--workspace", str(tmp_path / "ws"), "--summarize", "--summary-limit", "7"],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert seen.get("limit") == 7
-
-
-# ── degrade paths ───────────────────────────────────────────────────────────────
-
-
-def test_summarize_helper_skips_when_llm_unconfigured(tmp_path: Path) -> None:
-    cfg = Config(llm=None)
-
-    @click.command()
-    def _cmd() -> None:
-        _summarize(cfg, tmp_path, tmp_path / "analysis.db", None)
-
-    result = CliRunner().invoke(_cmd, [])
-    assert result.exit_code == 0
-    assert "summary skipped: LLM not configured" in result.output
-
-
-def test_summarize_helper_skips_on_missing_key(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.delenv("FAKE_S_KEY_TMTEST", raising=False)
-    cfg = Config.model_validate(
-        {
-            "llm": {
-                "tiers": {
-                    "S": {
-                        "provider": "deepseek",
-                        "model": "deepseek-chat",
-                        "base_url": "https://api.deepseek.com",
-                        "api_key_env": "FAKE_S_KEY_TMTEST",
-                    },
-                    "M": {
-                        "provider": "deepseek",
-                        "model": "deepseek-reasoner",
-                        "base_url": "https://api.deepseek.com",
-                        "api_key_env": "FAKE_S_KEY_TMTEST",
-                    },
-                    "L": {
-                        "provider": "anthropic",
-                        "model": "claude-x",
-                        "base_url": "https://api.anthropic.com/v1",
-                        "api_key_env": "FAKE_L_KEY_TMTEST",
-                    },
-                }
-            }
-        }
-    )
-
-    @click.command()
-    def _cmd() -> None:
-        _summarize(cfg, tmp_path, tmp_path / "analysis.db", None)
-
-    result = CliRunner().invoke(_cmd, [])
-    assert result.exit_code == 0
-    assert "summary skipped: S-tier key not configured" in result.output
+    assert "Functions ingested:" in result.output
+    assert "DB       :" in result.output

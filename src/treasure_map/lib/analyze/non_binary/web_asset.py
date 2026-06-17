@@ -5,8 +5,7 @@
 Detection: file extension in {html, htm, js, mjs, cgi, php, asp, aspx, jsp, jspx}.
 Ingestion: ordered regex extraction of HTTP endpoint references (fetch / axios / XHR /
 ajax / form action / cgi_ref / literal path). Stores each endpoint path verbatim as
-evidence (the firmware's OWN content; not generated). vuln_hint is categorical
-only. No AST parser, no new dependency.
+evidence (the firmware's OWN content; not generated). No AST parser, no new dependency.
 
 A .cgi that begins with a shell shebang is claimed first by the shell_script
 ingester (registry index 0) -- its command-injection view is the higher-value analysis.
@@ -24,16 +23,6 @@ import sqlite3
 from treasure_map.lib.analyze.non_binary.framework import (
     NonBinaryFile,
     NonBinaryIngester,
-)
-
-# Categorical vuln_hint vocabulary. Observation labels only -- never a payload.
-WEB_ENDPOINT_HINTS: frozenset[str] = frozenset(
-    {
-        "api_endpoint",
-        "cgi_endpoint",
-        "param_in_endpoint",
-        "external_url",
-    }
 )
 
 _WEB_EXTENSIONS = frozenset(
@@ -99,17 +88,6 @@ def _detect_web_asset(f: NonBinaryFile) -> str | None:
     return _EXT_NORMALIZE.get(ext, ext)
 
 
-def _classify_endpoint(path: str) -> str:
-    """Return categorical vuln_hint for an endpoint path/URL (labels only)."""
-    if "/cgi-bin/" in path.lower():
-        return "cgi_endpoint"
-    if path.startswith(("http://", "https://")):
-        return "external_url"
-    if "?" in path or "${" in path or "{{" in path:
-        return "param_in_endpoint"
-    return "api_endpoint"
-
-
 def _ingest_web_asset(conn: sqlite3.Connection, file_id: int, f: NonBinaryFile) -> int:
     """Extract and insert web endpoint rows (relevant-only evidence).
 
@@ -126,7 +104,7 @@ def _ingest_web_asset(conn: sqlite3.Connection, file_id: int, f: NonBinaryFile) 
 
     text = f.text
     seen: set[str] = set()  # dedup on path; rule order ensures specific rules win
-    rows: list[tuple[int, str, str | None, str, str, str]] = []
+    rows: list[tuple[int, str, str | None, str, str]] = []
 
     for source, pattern in _RULES:
         for m in pattern.finditer(text):
@@ -157,14 +135,13 @@ def _ingest_web_asset(conn: sqlite3.Connection, file_id: int, f: NonBinaryFile) 
                 continue
             seen.add(path)
 
-            vuln_hint = _classify_endpoint(path)
-            rows.append((file_id, subtype, method, path, source, vuln_hint))
+            rows.append((file_id, subtype, method, path, source))
 
     if rows:
         conn.executemany(
             """INSERT INTO web_endpoints
-               (file_id, asset_type, method, path, source, vuln_hint)
-               VALUES (?, ?, ?, ?, ?, ?)""",
+               (file_id, asset_type, method, path, source)
+               VALUES (?, ?, ?, ?, ?)""",
             rows,
         )
     return len(rows)

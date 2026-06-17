@@ -40,11 +40,7 @@ CREATE TABLE IF NOT EXISTS functions (
     size_bytes      INTEGER DEFAULT 0,
     pseudocode      TEXT,               -- Ghidra 反编译 C 伪代码
     pseudocode_hash TEXT,               -- MD5，用于去重
-    summary         TEXT,               -- AI 一句话描述
-    func_types      TEXT    DEFAULT '[]',   -- JSON: ["crypto","vuln_bof"]
     callees         TEXT    DEFAULT '[]',   -- JSON: 直接被调函数名
-    vuln_hints      TEXT    DEFAULT '[]',   -- JSON: AI 漏洞提示
-    capa_tags       TEXT    DEFAULT '[]',   -- JSON: 函数级 Capa 标签
     is_exported     INTEGER DEFAULT 0,      -- 1 = 导出符号
     FOREIGN KEY(binary_id) REFERENCES binaries(id) ON DELETE CASCADE
 );
@@ -88,17 +84,6 @@ CREATE TABLE IF NOT EXISTS strings (
     FOREIGN KEY(binary_id) REFERENCES binaries(id) ON DELETE CASCADE
 );
 
--- 库级摘要（AI 生成）
-CREATE TABLE IF NOT EXISTS library_summaries (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    binary_id       INTEGER UNIQUE,
-    purpose         TEXT,
-    key_algorithms  TEXT    DEFAULT '[]',   -- JSON: ["AES-128-CBC","SHA256"]
-    key_functions   TEXT    DEFAULT '[]',   -- JSON: 最重要的 5 个函数名
-    patch_notes     TEXT,
-    FOREIGN KEY(binary_id) REFERENCES binaries(id) ON DELETE CASCADE
-);
-
 -- 非二进制文件主表 (Round C framework; WIPE-AND-REBUILD each analyze run)
 -- sha256 = cross-firmware identity key for the knowledge base. Indexed,
 -- intentionally NOT unique (a file + its copy at another path are two findings).
@@ -121,8 +106,6 @@ CREATE TABLE IF NOT EXISTS script_calls (
     raw_line        TEXT,             -- script's OWN source line; analysis evidence, never a generated payload
     line_number     INTEGER,
     args_pattern    TEXT,             -- coarse structural token only: literal / var_expansion / piped
-    has_user_input  INTEGER DEFAULT 0,
-    vuln_hint       TEXT,             -- CATEGORICAL label only; never a payload
     FOREIGN KEY(file_id) REFERENCES non_binary_files(id) ON DELETE CASCADE
 );
 
@@ -137,7 +120,6 @@ CREATE TABLE IF NOT EXISTS config_entries (
     key          TEXT,
     value        TEXT,                -- raw value (evidence of firmware content)
     is_sensitive INTEGER DEFAULT 0,   -- 1 = hardcoded-credential candidate
-    vuln_hint    TEXT,                -- CATEGORICAL label only; never a payload
     FOREIGN KEY(file_id) REFERENCES non_binary_files(id) ON DELETE CASCADE
 );
 
@@ -171,9 +153,6 @@ CREATE TABLE IF NOT EXISTS cve_matches (
 -- 索引
 CREATE INDEX IF NOT EXISTS idx_functions_name     ON functions(name);
 CREATE INDEX IF NOT EXISTS idx_functions_binary   ON functions(binary_id);
-CREATE INDEX IF NOT EXISTS idx_functions_types    ON functions(func_types);
-CREATE INDEX IF NOT EXISTS idx_functions_summary  ON functions(summary);
-CREATE INDEX IF NOT EXISTS idx_functions_vuln     ON functions(vuln_hints);
 CREATE INDEX IF NOT EXISTS idx_exports_func       ON exports(func_name);
 CREATE INDEX IF NOT EXISTS idx_imports_binary     ON imports(binary_id);
 CREATE INDEX IF NOT EXISTS idx_imports_soname     ON imports(lib_soname);
@@ -185,9 +164,7 @@ CREATE INDEX IF NOT EXISTS idx_nbf_kind          ON non_binary_files(kind);
 CREATE INDEX IF NOT EXISTS idx_nbf_sha256        ON non_binary_files(sha256);
 CREATE INDEX IF NOT EXISTS idx_script_calls_file ON script_calls(file_id);
 CREATE INDEX IF NOT EXISTS idx_script_calls_cmd  ON script_calls(command);
-CREATE INDEX IF NOT EXISTS idx_script_calls_ui   ON script_calls(has_user_input);
 CREATE INDEX IF NOT EXISTS idx_config_entries_file ON config_entries(file_id);
-CREATE INDEX IF NOT EXISTS idx_config_entries_hint ON config_entries(vuln_hint);
 
 -- 凭据条目 (Credential ingester sub-table, Round E; FK -> non_binary_files)
 -- Stores the observed artifact as verifiable evidence (deterministically
@@ -202,13 +179,11 @@ CREATE TABLE IF NOT EXISTS credentials (
     algorithm    TEXT,                -- rsa_private / ec_private / sha512crypt / md5crypt / des / yescrypt / ...
     material     TEXT,                -- the observed artifact (PEM body / hash field) — evidence; redact on export
     is_sensitive INTEGER DEFAULT 0,   -- 1 = private key or password hash present (redact before publishing)
-    vuln_hint    TEXT,                -- CATEGORICAL label only; never a generated payload
     FOREIGN KEY(file_id) REFERENCES non_binary_files(id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_credentials_file ON credentials(file_id);
 CREATE INDEX IF NOT EXISTS idx_credentials_type ON credentials(cred_type);
-CREATE INDEX IF NOT EXISTS idx_credentials_hint ON credentials(vuln_hint);
 
 -- Web 端点 (WebAsset ingester sub-table, Round F; FK -> non_binary_files)
 -- Attack-surface evidence: endpoints the firmware's web assets reference. path is the
@@ -220,12 +195,10 @@ CREATE TABLE IF NOT EXISTS web_endpoints (
     method      TEXT,                 -- GET / POST / PUT / DELETE / NULL if not derivable
     path        TEXT,                 -- the endpoint path or URL (evidence)
     source      TEXT,                 -- fetch / xhr / axios / ajax / form / cgi_ref / literal
-    vuln_hint   TEXT,                 -- CATEGORICAL label only; never a payload
     FOREIGN KEY(file_id) REFERENCES non_binary_files(id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_web_endpoints_file ON web_endpoints(file_id);
-CREATE INDEX IF NOT EXISTS idx_web_endpoints_hint ON web_endpoints(vuln_hint);
 CREATE INDEX IF NOT EXISTS idx_components_binary  ON components(binary_id);
 CREATE INDEX IF NOT EXISTS idx_components_product ON components(product);
 CREATE INDEX IF NOT EXISTS idx_cve_binary         ON cve_matches(binary_id);

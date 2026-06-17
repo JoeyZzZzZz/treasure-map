@@ -11,38 +11,24 @@ from pathlib import Path
 import pytest
 
 from treasure_map.lib.analyze.non_binary.config_file import (
-    CONFIG_RISK_RULES,
     _detect_config,
     _ingest_config,
 )
 from treasure_map.lib.analyze.non_binary.credential import (
-    CREDENTIAL_HINTS,
     _detect_credential,
     _ingest_credential,
 )
 from treasure_map.lib.analyze.non_binary.framework import NonBinaryFile
 from treasure_map.lib.analyze.non_binary.orchestrator import run_all_ingesters
 from treasure_map.lib.analyze.non_binary.shell_script import (
-    SHELL_RISK_RULES,
     _detect_shell,
     _ingest_shell,
 )
 from treasure_map.lib.analyze.non_binary.web_asset import (
-    WEB_ENDPOINT_HINTS,
-    _classify_endpoint,
     _detect_web_asset,
     _ingest_web_asset,
 )
 from treasure_map.lib.storage.connection import open_db
-
-# ── Allowed vuln_hint vocabularies ───────────────────────────────────────────
-
-_ALLOWED_SHELL_HINTS = frozenset(label for label, _ in SHELL_RISK_RULES)
-_ALLOWED_CONFIG_HINTS = frozenset(label for label, _ in CONFIG_RISK_RULES)
-_ALLOWED_CRED_HINTS = CREDENTIAL_HINTS
-_ALLOWED_WEB_HINTS = WEB_ENDPOINT_HINTS
-_ALLOWED_HINTS = _ALLOWED_SHELL_HINTS  # legacy alias used by Round C tests
-
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -153,15 +139,14 @@ def test_ingest_shell_correct_rows(tmp_path: Path) -> None:
     assert count >= 2
 
     rows = conn.execute(
-        "SELECT command, vuln_hint FROM script_calls WHERE file_id = ?", (file_id,)
+        "SELECT command, args_pattern FROM script_calls WHERE file_id = ?", (file_id,)
     ).fetchall()
-    hints = {row[1] for row in rows}
+    commands = {row[0] for row in rows}
 
-    assert "eval_injection" in hints
-    assert "config_file_injection" in hints
-
-    for row in rows:
-        assert row[1] in _ALLOWED_HINTS, f"vuln_hint {row[1]!r} not in allowed vocabulary"
+    # Only the rule-matching (signal-dense) lines are recorded: nvram, eval, rm.
+    assert "nvram" in commands
+    assert "eval" in commands
+    assert "rm" in commands
 
     conn.close()
 
@@ -180,27 +165,6 @@ def test_ingest_shell_skips_benign_lines(tmp_path: Path) -> None:
     count = _ingest_shell(conn, int(file_id), f)  # type: ignore[arg-type]
     conn.commit()
     assert count == 0
-    conn.close()
-
-
-def test_ingest_shell_all_hints_categorical(tmp_path: Path) -> None:
-    """Every vuln_hint in the DB must come from the fixed label vocabulary."""
-    conn = open_db(tmp_path / "analysis.db")
-    script = '#!/bin/sh\neval "$x"\nbash -c "$cmd"\nnvram_get key\nrm -rf /tmp/$dir\n'
-    f = _make_file(tmp_path, "attack_surface.sh", script)
-
-    file_id = conn.execute(
-        "INSERT INTO non_binary_files (kind, subtype, name, path, sha256, size_bytes, detected_via)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?)",
-        ("shell_script", "sh", f.name, f.rel_path, f.sha256, f.size_bytes, "shebang"),
-    ).lastrowid
-    conn.commit()
-    _ingest_shell(conn, int(file_id), f)  # type: ignore[arg-type]
-    conn.commit()
-
-    rows = conn.execute("SELECT vuln_hint FROM script_calls").fetchall()
-    for (hint,) in rows:
-        assert hint in _ALLOWED_HINTS, f"unexpected vuln_hint: {hint!r}"
     conn.close()
 
 
@@ -343,19 +307,15 @@ def test_ingest_config_flagged_only(tmp_path: Path) -> None:
     assert count == 3
 
     rows = conn.execute(
-        "SELECT key, is_sensitive, vuln_hint FROM config_entries WHERE file_id = ?",
+        "SELECT key, is_sensitive FROM config_entries WHERE file_id = ?",
         (file_id,),
     ).fetchall()
-    hints = {row[2] for row in rows}
+    keys = {row[0] for row in rows}
     sensitive_keys = {row[0] for row in rows if row[1] == 1}
 
-    assert "hardcoded_credential" in hints
-    assert "auth_disabled" in hints
-    assert "debug_enabled" in hints
+    # The matched rule gates recording; the label is not stored.
+    assert "admin_password" in keys
     assert "admin_password" in sensitive_keys
-
-    for row in rows:
-        assert row[2] in _ALLOWED_CONFIG_HINTS, f"unexpected vuln_hint: {row[2]!r}"
 
     conn.close()
 
@@ -427,11 +387,10 @@ def test_ingest_config_tolerant_key_space_value(tmp_path: Path) -> None:
 
     assert count == 1
     row = conn.execute(
-        "SELECT key, value, vuln_hint FROM config_entries WHERE file_id = ?", (file_id,)
+        "SELECT key, value FROM config_entries WHERE file_id = ?", (file_id,)
     ).fetchone()
     assert row[0] == "debug"
     assert row[1] == "1"
-    assert row[2] == "debug_enabled"
 
     conn.close()
 
@@ -585,7 +544,7 @@ def _insert_nbf(conn: object, kind: str, subtype: str, f: NonBinaryFile) -> int:
 
 
 def test_ingest_credential_pem_private_key(tmp_path: Path) -> None:
-    """Private-key block → hardcoded_private_key, is_sensitive=1, material holds block."""
+    """Private-key block → cred_type private_key, is_sensitive=1, material holds block."""
     conn = open_db(tmp_path / "analysis.db")
     f = _make_file(tmp_path, "server.pem", _FIXTURE_PEM_PRIVKEY)
     file_id = _insert_nbf(conn, "credential", "pem", f)
@@ -595,18 +554,16 @@ def test_ingest_credential_pem_private_key(tmp_path: Path) -> None:
 
     assert count == 1
     row = conn.execute(
-        "SELECT cred_type, algorithm, is_sensitive, vuln_hint, material FROM credentials"
-        " WHERE file_id = ?",
+        "SELECT cred_type, algorithm, is_sensitive, material FROM credentials WHERE file_id = ?",
         (file_id,),
     ).fetchone()
     assert row[0] == "private_key"
     assert row[1] == "rsa_private"
     assert row[2] == 1
-    assert row[3] == "hardcoded_private_key"
     # material must hold the observed block so findings are independently verifiable
-    assert row[4] is not None
-    assert "-----BEGIN RSA PRIVATE KEY-----" in row[4]
-    assert "-----END RSA PRIVATE KEY-----" in row[4]
+    assert row[3] is not None
+    assert "-----BEGIN RSA PRIVATE KEY-----" in row[3]
+    assert "-----END RSA PRIVATE KEY-----" in row[3]
 
     conn.close()
 
@@ -621,12 +578,11 @@ def test_ingest_credential_pem_certificate(tmp_path: Path) -> None:
 
     assert count == 1
     row = conn.execute(
-        "SELECT cred_type, is_sensitive, vuln_hint FROM credentials WHERE file_id = ?",
+        "SELECT cred_type, is_sensitive FROM credentials WHERE file_id = ?",
         (file_id,),
     ).fetchone()
     assert row[0] == "certificate"
     assert row[1] == 0
-    assert row[2] == "certificate_present"
 
     conn.close()
 
@@ -641,12 +597,11 @@ def test_ingest_credential_pem_public_key(tmp_path: Path) -> None:
 
     assert count == 1
     row = conn.execute(
-        "SELECT cred_type, is_sensitive, vuln_hint FROM credentials WHERE file_id = ?",
+        "SELECT cred_type, is_sensitive FROM credentials WHERE file_id = ?",
         (file_id,),
     ).fetchone()
     assert row[0] == "public_key"
     assert row[1] == 0
-    assert row[2] == "public_key_present"
 
     conn.close()
 
@@ -662,14 +617,14 @@ def test_ingest_credential_pem_multi_block(tmp_path: Path) -> None:
     conn.commit()
 
     assert count == 2
-    hints = {
+    cred_types = {
         r[0]
         for r in conn.execute(
-            "SELECT vuln_hint FROM credentials WHERE file_id = ?", (file_id,)
+            "SELECT cred_type FROM credentials WHERE file_id = ?", (file_id,)
         ).fetchall()
     }
-    assert "hardcoded_private_key" in hints
-    assert "certificate_present" in hints
+    assert "private_key" in cred_types
+    assert "certificate" in cred_types
 
     conn.close()
 
@@ -694,18 +649,17 @@ def test_ingest_credential_shadow_empty_root(tmp_path: Path) -> None:
 
     assert count == 1
     row = conn.execute(
-        "SELECT identifier, is_sensitive, vuln_hint FROM credentials WHERE file_id = ?",
+        "SELECT identifier, is_sensitive FROM credentials WHERE file_id = ?",
         (file_id,),
     ).fetchone()
     assert row[0] == "root"
     assert row[1] == 0
-    assert row[2] == "empty_root_password"
 
     conn.close()
 
 
 def test_ingest_credential_shadow_md5_hash(tmp_path: Path) -> None:
-    """md5crypt hash → weak_password_hash_algo, is_sensitive=1, material holds hash field."""
+    """md5crypt hash → algorithm md5crypt, is_sensitive=1, material holds hash field."""
     conn = open_db(tmp_path / "analysis.db")
     f = _make_file(tmp_path, "shadow", _FIXTURE_SHADOW_MD5)
     file_id = _insert_nbf(conn, "credential", "shadow", f)
@@ -715,15 +669,14 @@ def test_ingest_credential_shadow_md5_hash(tmp_path: Path) -> None:
 
     assert count == 1
     row = conn.execute(
-        "SELECT algorithm, is_sensitive, vuln_hint, material FROM credentials WHERE file_id = ?",
+        "SELECT algorithm, is_sensitive, material FROM credentials WHERE file_id = ?",
         (file_id,),
     ).fetchone()
     assert row[0] == "md5crypt"
     assert row[1] == 1
-    assert row[2] == "weak_password_hash_algo"
     # material must hold the observed hash field for verifiability
-    assert row[3] is not None
-    assert row[3].startswith("$1$")
+    assert row[2] is not None
+    assert row[2].startswith("$1$")
 
     conn.close()
 
@@ -737,11 +690,8 @@ def test_ingest_credential_shadow_sha512_hash(tmp_path: Path) -> None:
     conn.commit()
 
     assert count == 1
-    row = conn.execute(
-        "SELECT algorithm, vuln_hint FROM credentials WHERE file_id = ?", (file_id,)
-    ).fetchone()
+    row = conn.execute("SELECT algorithm FROM credentials WHERE file_id = ?", (file_id,)).fetchone()
     assert row[0] == "sha512crypt"
-    assert row[1] == "present_password_hash"
 
     conn.close()
 
@@ -763,25 +713,6 @@ def test_ingest_credential_shadow_locked_skipped(tmp_path: Path) -> None:
     conn.close()
 
 
-def test_ingest_credential_all_hints_categorical(tmp_path: Path) -> None:
-    """Every vuln_hint written to the DB must be in the fixed vocabulary."""
-    conn = open_db(tmp_path / "analysis.db")
-    combined = _FIXTURE_SHADOW_EMPTY_ROOT + _FIXTURE_SHADOW_MD5 + _FIXTURE_SHADOW_SHA512
-    f = _make_file(tmp_path, "shadow", combined)
-    file_id = _insert_nbf(conn, "credential", "shadow", f)
-    _ingest_credential(conn, file_id, f)
-    conn.commit()
-
-    rows = conn.execute(
-        "SELECT vuln_hint FROM credentials WHERE file_id = ? AND vuln_hint IS NOT NULL",
-        (file_id,),
-    ).fetchall()
-    for (hint,) in rows:
-        assert hint in _ALLOWED_CRED_HINTS, f"unexpected vuln_hint: {hint!r}"
-
-    conn.close()
-
-
 def test_ingest_credential_is_sensitive_correct(tmp_path: Path) -> None:
     """is_sensitive=1 for private key + hash; 0 for cert, public key, empty password."""
     conn = open_db(tmp_path / "analysis.db")
@@ -798,20 +729,19 @@ def test_ingest_credential_is_sensitive_correct(tmp_path: Path) -> None:
 
     sensitive = {
         r[0]
-        for r in conn.execute("SELECT vuln_hint FROM credentials WHERE is_sensitive = 1").fetchall()
+        for r in conn.execute("SELECT cred_type FROM credentials WHERE is_sensitive = 1").fetchall()
     }
-    non_sensitive = {
+    non_sensitive_types = {
         r[0]
-        for r in conn.execute(
-            "SELECT vuln_hint FROM credentials WHERE is_sensitive = 0 AND vuln_hint IS NOT NULL"
-        ).fetchall()
+        for r in conn.execute("SELECT cred_type FROM credentials WHERE is_sensitive = 0").fetchall()
     }
 
-    assert "hardcoded_private_key" in sensitive
-    assert "weak_password_hash_algo" in sensitive
-    assert "certificate_present" in non_sensitive
-    assert "public_key_present" in non_sensitive
-    assert "empty_root_password" in non_sensitive
+    # private key + the hashed shadow entry are sensitive; cert/pubkey/empty-root are not.
+    assert "private_key" in sensitive
+    assert "shadow_entry" in sensitive
+    assert "certificate" in non_sensitive_types
+    assert "public_key" in non_sensitive_types
+    assert "shadow_entry" in non_sensitive_types  # the empty-root entry is non-sensitive
 
     conn.close()
 
@@ -909,29 +839,6 @@ def test_detect_web_asset_no_extension_returns_none(tmp_path: Path) -> None:
     assert _detect_web_asset(f) is None
 
 
-# ── Round F: _classify_endpoint ───────────────────────────────────────────────
-
-
-def test_classify_endpoint_api_path(tmp_path: Path) -> None:
-    assert _classify_endpoint("/api/status") == "api_endpoint"
-
-
-def test_classify_endpoint_cgi_bin(tmp_path: Path) -> None:
-    assert _classify_endpoint("/cgi-bin/handler") == "cgi_endpoint"
-
-
-def test_classify_endpoint_external_url(tmp_path: Path) -> None:
-    assert _classify_endpoint("http://example.com/api") == "external_url"
-
-
-def test_classify_endpoint_param_question_mark(tmp_path: Path) -> None:
-    assert _classify_endpoint("/api/search?q=test") == "param_in_endpoint"
-
-
-def test_classify_endpoint_param_template_var(tmp_path: Path) -> None:
-    assert _classify_endpoint("/api/${endpoint}") == "param_in_endpoint"
-
-
 # ── Round F: _ingest_web_asset — JS endpoint extraction ──────────────────────
 
 # Vendor-neutral generic fixtures. Paths use /api/ and /cgi-bin/ conventions.
@@ -975,7 +882,7 @@ def test_ingest_web_asset_js_fetch_axios_xhr(tmp_path: Path) -> None:
     assert count >= 3
 
     rows = conn.execute(
-        "SELECT source, method, path, vuln_hint FROM web_endpoints WHERE file_id = ?",
+        "SELECT source, method, path FROM web_endpoints WHERE file_id = ?",
         (file_id,),
     ).fetchall()
 
@@ -989,14 +896,12 @@ def test_ingest_web_asset_js_fetch_axios_xhr(tmp_path: Path) -> None:
     assert len(axios_rows) >= 1
     assert axios_rows[0][1] == "POST"
     assert axios_rows[0][2] == "/api/login"
-    assert axios_rows[0][3] == "api_endpoint"
 
     # xhr row: method and cgi-bin path
     xhr_rows = [r for r in rows if r[0] == "xhr"]
     assert len(xhr_rows) >= 1
     assert xhr_rows[0][1] == "POST"
     assert "/cgi-bin/handler" in xhr_rows[0][2]
-    assert xhr_rows[0][3] == "cgi_endpoint"
 
     # fetch row: no method, api path
     fetch_rows = [r for r in rows if r[0] == "fetch"]
@@ -1019,13 +924,12 @@ def test_ingest_web_asset_html_form(tmp_path: Path) -> None:
     assert count >= 1
 
     form_rows = conn.execute(
-        "SELECT method, path, vuln_hint FROM web_endpoints WHERE file_id = ? AND source = 'form'",
+        "SELECT method, path FROM web_endpoints WHERE file_id = ? AND source = 'form'",
         (file_id,),
     ).fetchall()
     assert len(form_rows) == 1
     assert form_rows[0][0] == "POST"
     assert form_rows[0][1] == "/api/save"
-    assert form_rows[0][2] == "api_endpoint"
 
     conn.close()
 
@@ -1069,25 +973,6 @@ def test_ingest_web_asset_dedup_multi_rule_same_path(tmp_path: Path) -> None:
         (file_id,),
     ).fetchone()[0]
     assert path_rows == 1
-
-    conn.close()
-
-
-def test_ingest_web_asset_all_hints_categorical(tmp_path: Path) -> None:
-    """Every vuln_hint written to web_endpoints must be in the fixed vocabulary."""
-    conn = open_db(tmp_path / "analysis.db")
-    f = _make_file(tmp_path, "multi.js", _FIXTURE_JS_ENDPOINTS)
-    file_id = _insert_nbf(conn, "web_asset", "js", f)
-    _ingest_web_asset(conn, file_id, f)
-    conn.commit()
-
-    rows = conn.execute(
-        "SELECT vuln_hint FROM web_endpoints WHERE file_id = ? AND vuln_hint IS NOT NULL",
-        (file_id,),
-    ).fetchall()
-    assert len(rows) >= 1
-    for (hint,) in rows:
-        assert hint in _ALLOWED_WEB_HINTS, f"unexpected vuln_hint: {hint!r}"
 
     conn.close()
 

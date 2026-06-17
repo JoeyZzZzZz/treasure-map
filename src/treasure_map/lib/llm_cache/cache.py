@@ -55,13 +55,6 @@ def _input_hash_for(task_type: str, input_text: str) -> str:
         callees: list[str] = json.loads(parts[1]) if len(parts) > 1 else []
         return _sha256(pcode + "\n" + json.dumps(sorted(callees)))
 
-    if task_type == "library_summary":
-        # input_text is expected to be "<binary_name>\n---SUMMARIES---\n<json list>"
-        parts = input_text.split("\n---SUMMARIES---\n", 1)
-        binary_name = parts[0].strip()
-        summaries: list[str] = json.loads(parts[1]) if len(parts) > 1 else []
-        return _sha256(binary_name + "\n" + json.dumps(sorted(summaries[:30])))
-
     if task_type == "patch_verdict":
         # input_text is expected to be "<old_pcode>\n---NEW---\n<new_pcode>"
         parts = input_text.split("\n---NEW---\n", 1)

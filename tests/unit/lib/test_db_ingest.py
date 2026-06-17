@@ -2,11 +2,12 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 from treasure_map.lib.analyze.db_ingest import ingest_elfs
 from treasure_map.lib.analyze.elf_inventory import ElfRecord
-from treasure_map.lib.storage.connection import open_db
+from treasure_map.lib.storage.connection import _SCHEMA_PATH, open_db
 
 
 def _make_record(name: str, sha: str, arch: str = "ARM:LE:32:v7") -> ElfRecord:
@@ -87,6 +88,120 @@ def test_open_db_creates_schema(tmp_path: Path) -> None:
     assert "binaries" in tables
     assert "functions" in tables
     assert "xrefs" in tables
+    conn.close()
+
+
+# ── R-cleanup: dropped pre-judgment columns/tables + idempotent migration ─────
+
+
+def _functions_columns(conn: sqlite3.Connection) -> set[str]:
+    return {row[1] for row in conn.execute("PRAGMA table_info(functions)")}
+
+
+def test_fresh_schema_omits_dropped_columns(tmp_path: Path) -> None:
+    """A newly created db carries none of the removed pre-judgment fields/tables,
+    but keeps the binary-level capa_tags placeholder."""
+    conn = open_db(tmp_path / "new.db")
+    fcols = _functions_columns(conn)
+    for gone in ("summary", "func_types", "vuln_hints", "capa_tags"):
+        assert gone not in fcols
+    for table, col in (
+        ("script_calls", "has_user_input"),
+        ("script_calls", "vuln_hint"),
+        ("config_entries", "vuln_hint"),
+        ("credentials", "vuln_hint"),
+        ("web_endpoints", "vuln_hint"),
+    ):
+        cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        assert col not in cols, f"{table}.{col} should be gone"
+
+    no_libsum = conn.execute(
+        "SELECT name FROM sqlite_master WHERE name='library_summaries'"
+    ).fetchone()
+    assert no_libsum is None
+
+    bcols = {row[1] for row in conn.execute("PRAGMA table_info(binaries)")}
+    assert "capa_tags" in bcols  # binary-level placeholder is retained
+    conn.close()
+
+
+def _build_pre_cleanup_db(db_path: Path) -> None:
+    """Create a db shaped like one built before R-cleanup: current schema plus the
+    columns/table/indexes this round removes, then a row of real data in each."""
+    conn = sqlite3.connect(db_path)
+    conn.executescript(_SCHEMA_PATH.read_text())
+    conn.executescript(
+        """
+        ALTER TABLE functions ADD COLUMN summary TEXT;
+        ALTER TABLE functions ADD COLUMN func_types TEXT DEFAULT '[]';
+        ALTER TABLE functions ADD COLUMN vuln_hints TEXT DEFAULT '[]';
+        ALTER TABLE functions ADD COLUMN capa_tags TEXT DEFAULT '[]';
+        CREATE INDEX idx_functions_summary ON functions(summary);
+        CREATE INDEX idx_functions_types   ON functions(func_types);
+        CREATE INDEX idx_functions_vuln    ON functions(vuln_hints);
+        CREATE TABLE library_summaries (id INTEGER PRIMARY KEY, purpose TEXT);
+        ALTER TABLE script_calls  ADD COLUMN has_user_input INTEGER DEFAULT 0;
+        ALTER TABLE script_calls  ADD COLUMN vuln_hint TEXT;
+        CREATE INDEX idx_script_calls_ui ON script_calls(has_user_input);
+        ALTER TABLE config_entries ADD COLUMN vuln_hint TEXT;
+        CREATE INDEX idx_config_entries_hint ON config_entries(vuln_hint);
+        ALTER TABLE credentials    ADD COLUMN vuln_hint TEXT;
+        CREATE INDEX idx_credentials_hint ON credentials(vuln_hint);
+        ALTER TABLE web_endpoints  ADD COLUMN vuln_hint TEXT;
+        CREATE INDEX idx_web_endpoints_hint ON web_endpoints(vuln_hint);
+        """
+    )
+    conn.execute("INSERT INTO binaries(name, capa_tags) VALUES('busybox', '[\"x\"]')")
+    conn.execute(
+        "INSERT INTO functions(binary_id, name, summary, func_types, callees) "
+        "VALUES(1, 'main', 'one-liner', '[]', '[\"helper\"]')"
+    )
+    conn.execute("INSERT INTO library_summaries(purpose) VALUES('p')")
+    conn.commit()
+    conn.close()
+
+
+def test_migration_drops_stale_columns_and_preserves_data(tmp_path: Path) -> None:
+    db_path = tmp_path / "old.db"
+    _build_pre_cleanup_db(db_path)
+
+    conn = open_db(db_path)  # triggers _migrate
+
+    fcols = _functions_columns(conn)
+    for gone in ("summary", "func_types", "vuln_hints", "capa_tags"):
+        assert gone not in fcols
+    assert {"name", "callees", "binary_id"} <= fcols  # surviving columns intact
+
+    # rows preserved through the column drops
+    frow = conn.execute("SELECT name, callees FROM functions").fetchone()
+    assert frow["name"] == "main"
+    assert frow["callees"] == '["helper"]'
+    brow = conn.execute("SELECT capa_tags FROM binaries").fetchone()
+    assert brow["capa_tags"] == '["x"]'  # binary capa_tags retained with its value
+
+    assert (
+        conn.execute("SELECT name FROM sqlite_master WHERE name='library_summaries'").fetchone()
+        is None
+    )
+    stale_indexes = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name IN "
+        "('idx_functions_summary','idx_functions_types','idx_functions_vuln',"
+        "'idx_script_calls_ui','idx_config_entries_hint','idx_credentials_hint',"
+        "'idx_web_endpoints_hint')"
+    ).fetchall()
+    assert stale_indexes == []
+    conn.close()
+
+
+def test_migration_is_idempotent(tmp_path: Path) -> None:
+    db_path = tmp_path / "old.db"
+    _build_pre_cleanup_db(db_path)
+    open_db(db_path).close()  # first migration
+    conn = open_db(db_path)  # re-run must not raise and leaves schema stable
+    fcols = _functions_columns(conn)
+    assert "summary" not in fcols
+    assert "name" in fcols
+    assert conn.execute("SELECT name FROM functions").fetchone()["name"] == "main"
     conn.close()
 
 

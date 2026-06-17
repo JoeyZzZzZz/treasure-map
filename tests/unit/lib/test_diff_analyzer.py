@@ -1,6 +1,6 @@
 # Copyright (C) 2025-2026 JoeyZzZzZz
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Unit tests for Analyzer-1 (A1) — the first end-to-end atlas writer.
+"""Unit tests for diff_analyzer (A1) — the first end-to-end atlas writer.
 
 Synthetic, vendor-neutral analysis databases + a mock router (no network). Proves the
 diff -> reachability -> write-atlas chain, the L0/L1-only mapping, the no-path-no-vuln
@@ -15,7 +15,7 @@ import sqlite3
 from pathlib import Path
 
 from treasure_map.lib.atlas.connection import open_atlas
-from treasure_map.lib.hunt import run_analyzer1
+from treasure_map.lib.hunt import run_diff_analyzer
 from treasure_map.lib.llm.types import LLMResponse, Tier
 from treasure_map.lib.storage.connection import open_db
 
@@ -101,7 +101,7 @@ def test_pipeline_writes_unknown_instance_at_l0(tmp_path: Path) -> None:
         callees=["system"],
     )
     atlas = tmp_path / "atlas.db"
-    stats = run_analyzer1(
+    stats = run_diff_analyzer(
         a, b, "version", atlas, FakeRouter(), run_id_a="run_base", run_id_b="run_cmp"
     )
 
@@ -130,7 +130,7 @@ def test_validator_guarded_candidate_is_unknown_dormant_empty(tmp_path: Path) ->
     a = _one_fn_db(tmp_path, "a.db", fn="h", body=body, h="old", callees=calls)
     b = _one_fn_db(tmp_path, "b.db", fn="h", body=body + " // changed", h="new", callees=calls)
     atlas = tmp_path / "atlas.db"
-    stats = run_analyzer1(a, b, "version", atlas, FakeRouter(), run_id_a="rb", run_id_b="rc")
+    stats = run_diff_analyzer(a, b, "version", atlas, FakeRouter(), run_id_a="rb", run_id_b="rc")
 
     assert stats.by_status["blocked"] == 0
     assert stats.by_status["unknown"] == 1
@@ -150,7 +150,7 @@ def test_confirmed_candidate_is_l1_not_public(tmp_path: Path) -> None:
     a = _one_fn_db(tmp_path, "a.db", fn="h", body=body, h="old", callees=calls)
     b = _one_fn_db(tmp_path, "b.db", fn="h", body=body + " // changed", h="new", callees=calls)
     atlas = tmp_path / "atlas.db"
-    stats = run_analyzer1(a, b, "version", atlas, FakeRouter(), run_id_a="rb", run_id_b="rc")
+    stats = run_diff_analyzer(a, b, "version", atlas, FakeRouter(), run_id_a="rb", run_id_b="rc")
 
     assert stats.by_status["confirmed"] == 1
     (row,) = _instances(atlas)
@@ -180,7 +180,7 @@ def test_no_sink_change_is_unknown(tmp_path: Path) -> None:
         callees=["helper"],
     )
     atlas = tmp_path / "atlas.db"
-    stats = run_analyzer1(a, b, "version", atlas, FakeRouter(), run_id_a="rb", run_id_b="rc")
+    stats = run_diff_analyzer(a, b, "version", atlas, FakeRouter(), run_id_a="rb", run_id_b="rc")
 
     assert stats.instances_written == 1
     assert stats.by_status["unknown"] == 1
@@ -199,7 +199,7 @@ def test_a1_never_writes_l2_l3_or_anchor(tmp_path: Path) -> None:
     a = _one_fn_db(tmp_path, "a.db", fn="h", body=body, h="o", callees=calls)
     b = _one_fn_db(tmp_path, "b.db", fn="h", body=body + " //x", h="n", callees=calls)
     atlas = tmp_path / "atlas.db"
-    run_analyzer1(a, b, "version", atlas, FakeRouter(), run_id_a="rb", run_id_b="rc")
+    run_diff_analyzer(a, b, "version", atlas, FakeRouter(), run_id_a="rb", run_id_b="rc")
 
     conn = open_atlas(atlas)
     try:
@@ -220,8 +220,8 @@ def test_second_run_appends(tmp_path: Path) -> None:
     a = _one_fn_db(tmp_path, "a.db", fn="h", body=body, h="o", callees=calls)
     b = _one_fn_db(tmp_path, "b.db", fn="h", body=body + " //x", h="n", callees=calls)
     atlas = tmp_path / "atlas.db"
-    run_analyzer1(a, b, "version", atlas, FakeRouter(), run_id_a="rb1", run_id_b="rc1")
-    run_analyzer1(a, b, "version", atlas, FakeRouter(), run_id_a="rb2", run_id_b="rc2")
+    run_diff_analyzer(a, b, "version", atlas, FakeRouter(), run_id_a="rb1", run_id_b="rc1")
+    run_diff_analyzer(a, b, "version", atlas, FakeRouter(), run_id_a="rb2", run_id_b="rc2")
 
     assert len(_instances(atlas)) == 2  # accumulated, not wiped
     conn = open_atlas(atlas)
