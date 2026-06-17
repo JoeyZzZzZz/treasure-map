@@ -14,6 +14,8 @@ import re
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.hunt import run_diff_analyzer
 from treasure_map.lib.llm.types import LLMResponse, Tier
@@ -231,6 +233,109 @@ def test_second_run_appends(tmp_path: Path) -> None:
     finally:
         conn.close()
     assert breadth == 2
+
+
+# ── CLI: --max-assist 0 is pure static alignment, no LLM key required ─────────────────
+
+
+def _named_fn_db(tmp_path: Path, name: str, funcs: list[tuple[str, str, str, list[str]]]) -> Path:
+    """Build an analysis.db with one binary and several (fn, body, hash, callees) functions."""
+    db_path = tmp_path / name
+    conn = open_db(db_path)
+    conn.execute("INSERT INTO binaries (id, name, sha256) VALUES (1, 'rcd', ?)", ("c" * 64,))
+    for i, (fn, body, h, callees) in enumerate(funcs, start=1):
+        conn.execute(
+            "INSERT INTO functions (id, binary_id, name, pseudocode, pseudocode_hash, callees) "
+            "VALUES (?, 1, ?, ?, ?, ?)",
+            (i, fn, body, h, json.dumps(callees)),
+        )
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+def test_hunt_diff_max_assist_zero_runs_without_llm_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Symbol-complete before/after pair: notify_rc aligns by exact symbol (its body changed),
+    # logmessage_normal is byte-identical (unchanged), and validate_rc_service is new (added).
+    # --max-assist 0 must run with NO LLM key — exact + hash only, residue degraded/reported.
+    from click.testing import CliRunner
+
+    from treasure_map.cli.hunt_cli import hunt_diff
+    from treasure_map.lib.config.config import Config
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "treasure_map.lib.config.config.load_config", lambda _c=None: Config(llm=None)
+    )
+
+    same_log = ("logmessage_normal", "void logmessage_normal(){ write(2,m,n); }", "hlog", ["write"])
+    db_a = _named_fn_db(
+        tmp_path,
+        "before.db",
+        [
+            ("notify_rc", "void notify_rc(char* p){ system(p); }", "rc_old", ["system"]),
+            same_log,
+        ],
+    )
+    db_b = _named_fn_db(
+        tmp_path,
+        "after.db",
+        [
+            ("notify_rc", "void notify_rc(char* p){ if(ok) system(p); }", "rc_new", ["system"]),
+            same_log,
+            ("validate_rc_service", "int validate_rc_service(char* p){ return p!=0; }", "vrs", []),
+        ],
+    )
+    atlas = tmp_path / "atlas.db"
+
+    result = CliRunner().invoke(
+        hunt_diff,
+        [
+            str(db_a),
+            str(db_b),
+            "--run-id-a",
+            "devA_base",
+            "--run-id-b",
+            "devA_cmp",
+            "--max-assist",
+            "0",
+            "--atlas",
+            str(atlas),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    # Two leads: notify_rc (changed, exact-aligned) + validate_rc_service (added) — purely static.
+    assert "Change leads      : 2" in result.output
+    # notify_rc was graded statically and written (exact alignment needed no LLM).
+    anchors = {r["source_anchor"] for r in _instances(atlas)}
+    assert "notify_rc" in anchors
+
+
+def test_hunt_diff_positive_max_assist_without_key_errors_clearly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The hard gate is gone but a >0 assist budget still needs a key — with a clear message that
+    # points at --max-assist 0 as the no-key escape hatch.
+    from click.testing import CliRunner
+
+    from treasure_map.cli.hunt_cli import hunt_diff
+    from treasure_map.lib.config.config import Config
+
+    monkeypatch.setattr(
+        "treasure_map.lib.config.config.load_config", lambda _c=None: Config(llm=None)
+    )
+
+    db = _named_fn_db(tmp_path, "x.db", [("f", "void f(){ a(); }", "h", [])])
+    result = CliRunner().invoke(
+        hunt_diff,
+        [str(db), str(db), "--run-id-a", "x", "--run-id-b", "y", "--atlas", str(tmp_path / "a.db")],
+    )
+    assert result.exit_code != 0
+    assert "--max-assist 0" in result.output  # the no-key path is named in the error
 
 
 # ── BOUNDARY ────────────────────────────────────────────────────────────────────────

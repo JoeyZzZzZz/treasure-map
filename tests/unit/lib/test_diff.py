@@ -175,6 +175,32 @@ def test_changed_runs_one_verdict(tmp_path: Path) -> None:
     assert router.tasks().count("patch_verdict") == 1
 
 
+def test_max_assist_zero_makes_no_llm_call_even_for_changed(tmp_path: Path) -> None:
+    # Pure static: a symbol-named function that changed body still aligns via exact match and is
+    # classified "changed", but with max_assist 0 the L-tier description is skipped — no LLM call
+    # of any kind, so a no-key run is possible. The lead is still emitted (just no description).
+    db_a = _make_db(
+        tmp_path,
+        "a.db",
+        [{"name": "notify_rc", "pseudocode": "void notify_rc(){a();}", "hash": "old"}],
+    )
+    db_b = _make_db(
+        tmp_path,
+        "b.db",
+        [{"name": "notify_rc", "pseudocode": "void notify_rc(){a();b();}", "hash": "new"}],
+    )
+    router = FakeDiffRouter()
+
+    res = run_diff(db_a, db_b, "version", router, max_assist=0)
+
+    assert res.stats.changed == 1  # exact alignment + body differs
+    assert res.stats.verdict_calls == 0  # L-tier description skipped at max_assist 0
+    assert router.calls == []  # NO LLM call of any kind (matching or description)
+    (lead,) = res.leads
+    assert lead.change_kind == "changed"
+    assert lead.change_description is None  # consumer tolerates this (computes its own diff)
+
+
 # ── residue: bounded M-assist + overflow degrade-and-flag ───────────────────────────
 
 

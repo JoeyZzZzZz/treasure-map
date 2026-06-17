@@ -112,7 +112,11 @@ async def _run_diff_async(
             removed += 1
         else:  # changed
             changed += 1
-            if diff_text:
+            # The neutral L-tier description runs only when the LLM budget is on (max_assist > 0).
+            # At max_assist 0 the run is pure-static and makes no LLM call of any kind, leaving
+            # change_description None — a value the diff consumer already tolerates (it computes
+            # its own deterministic unified diff). Alignment and classification are unaffected.
+            if diff_text and max_assist > 0:
                 description = await describe_change(diff_text, router)
                 verdict_calls += 1
                 lead = replace(lead, change_description=description)

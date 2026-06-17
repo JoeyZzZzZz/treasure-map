@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `hunt-diff` no longer hard-gates on an LLM key. The LLM is only a fallback for the residue the
+  two deterministic passes (exact symbol, then pseudocode hash) cannot align — a symbol-complete
+  before/after pair aligns fully statically. New `--max-assist N` exposes the match-assist budget
+  (default 200); `--max-assist 0` runs PURE STATIC alignment — exact + hash only, no LLM call of
+  any kind, no API key required — with the unmatched residue degraded to added/removed and
+  reported (the same degrade-and-flag path as exceeding the budget). With a positive budget the
+  command still builds the router, but the error when a key is missing now names `--max-assist 0`
+  as the no-key escape hatch. Provider dispatch is config-driven (a test pins that a `deepseek`
+  (or any OpenAI-compatible) tier builds without an Anthropic key). The matcher's alignment and
+  the differ's classification are unchanged; only the CLI and tier assembly moved.
+
+  L-tier note (recorded, not actioned this round): the L-tier `patch_verdict` call
+  (`describe_change`) produces a neutral one-sentence mechanism description of each changed
+  function, but the `hunt-diff` writer (`diff_analyzer`) does not consume it — it stores its own
+  deterministic unified diff. The description is therefore unused cost on this path and overlaps
+  the "the AI consumer reads the facts itself" principle that retired the build-time summaries.
+  It is gated off at `--max-assist 0` and left intact otherwise; flagged for the owner to decide
+  whether to remove `describe_change` from the diff path in a follow-up.
+
 - Form-note downweighting is now **parameter-specific**: a candidate is ranked low only when the
   sink's dangerous argument truly comes only from the recognized safe/constant source. If any free
   value — an unsanitized string source or a caller-supplied parameter — also reaches that argument

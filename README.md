@@ -18,7 +18,7 @@ CLI: `tmap`. AGPL-3.0.
 |---|---|---|
 | Ghidra | 11.x | decompiles every binary (headless) |
 | JDK | 21 | required by Ghidra 11.x (older JDKs make Ghidra fail to launch) |
-| API key(s) | — | only for LLM-assisted steps (`hunt-*`); plain `tmap analyze` runs on Ghidra alone |
+| API key(s) | — | only for the LLM fallback in `hunt-diff` (stripped/renamed residue); `tmap analyze`, `hunt-pattern`, and `hunt-diff --max-assist 0` run with no key |
 
 You install Ghidra and JDK yourself; the Setup below installs Treasure Map and the right Python
 for you. (A zero-setup Docker image with everything bundled is planned; until then, follow Setup.)
