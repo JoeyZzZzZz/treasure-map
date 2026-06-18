@@ -18,7 +18,7 @@ from pydantic import ValidationError
 
 from treasure_map.lib.config.config import TierConfig
 from treasure_map.lib.llm.providers.openai_compat import OpenAICompatProvider
-from treasure_map.lib.llm.types import Tier
+from treasure_map.lib.llm.types import LLMResponse, Tier
 
 
 class _RecordingClient:
@@ -37,7 +37,11 @@ class _RecordingClient:
 
 
 def _provider_with_recorder(
-    *, thinking: bool | None, reasoning_effort: str | None = None
+    *,
+    thinking: bool | None,
+    reasoning_effort: str | None = None,
+    input_price_per_1m: float | None = None,
+    output_price_per_1m: float | None = None,
 ) -> tuple[OpenAICompatProvider, _RecordingClient]:
     provider = OpenAICompatProvider(
         model="deepseek-v4-flash",
@@ -46,14 +50,16 @@ def _provider_with_recorder(
         tier=Tier.S,
         thinking=thinking,
         reasoning_effort=reasoning_effort,
+        input_price_per_1m=input_price_per_1m,
+        output_price_per_1m=output_price_per_1m,
     )
     recorder = _RecordingClient()
     provider._client = recorder  # type: ignore[assignment]
     return provider, recorder
 
 
-def _run(provider: OpenAICompatProvider) -> None:
-    asyncio.run(provider.complete("system prompt", "user input", max_tokens=128))
+def _run(provider: OpenAICompatProvider) -> LLMResponse:
+    return asyncio.run(provider.complete("system prompt", "user input", max_tokens=128))
 
 
 # ── thinking tri-state → create() kwargs ─────────────────────────────────────────
@@ -96,6 +102,33 @@ def test_common_kwargs_unchanged() -> None:
     assert rec.create_kwargs["temperature"] == 0
 
 
+# ── cost: operator-supplied prices, no built-in vendor numbers ────────────────────
+
+
+def test_cost_uses_operator_prices_times_tokens() -> None:
+    # Recorder returns prompt_tokens=10, completion_tokens=5. Synthetic prices (not a vendor's):
+    # cost = (10 * 2.0 + 5 * 10.0) / 1e6.
+    provider, _ = _provider_with_recorder(
+        thinking=None, input_price_per_1m=2.0, output_price_per_1m=10.0
+    )
+    resp = _run(provider)
+    assert resp.cost_usd == pytest.approx((10 * 2.0 + 5 * 10.0) / 1_000_000)
+
+
+def test_cost_is_none_when_prices_unset() -> None:
+    # No operator prices -> real cost is unknown -> None (the tool invents no dollar figure).
+    provider, _ = _provider_with_recorder(thinking=None)
+    resp = _run(provider)
+    assert resp.cost_usd is None
+
+
+def test_cost_is_none_when_only_one_price_set() -> None:
+    # Both prices are required; a single side is insufficient to compute a real cost.
+    provider, _ = _provider_with_recorder(thinking=None, input_price_per_1m=2.0)
+    resp = _run(provider)
+    assert resp.cost_usd is None
+
+
 # ── TierConfig round-trip ────────────────────────────────────────────────────────
 
 
@@ -112,6 +145,32 @@ def test_tierconfig_round_trips_thinking_fields() -> None:
     )
     assert cfg.thinking is True
     assert cfg.reasoning_effort == "high"
+
+
+def test_tierconfig_price_fields_round_trip_and_default_none() -> None:
+    priced = TierConfig.model_validate(
+        {
+            "provider": "deepseek",
+            "model": "deepseek-v4-flash",
+            "base_url": "https://api.deepseek.com",
+            "api_key_env": "DEEPSEEK_API_KEY",
+            "input_price_per_1m": 1.5,
+            "output_price_per_1m": 6.0,
+        }
+    )
+    assert priced.input_price_per_1m == 1.5
+    assert priced.output_price_per_1m == 6.0
+
+    unpriced = TierConfig.model_validate(
+        {
+            "provider": "deepseek",
+            "model": "deepseek-v4-flash",
+            "base_url": "https://api.deepseek.com",
+            "api_key_env": "DEEPSEEK_API_KEY",
+        }
+    )
+    assert unpriced.input_price_per_1m is None
+    assert unpriced.output_price_per_1m is None
 
 
 def test_tierconfig_defaults_preserve_none() -> None:

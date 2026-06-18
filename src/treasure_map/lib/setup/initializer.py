@@ -24,16 +24,19 @@ _DEFAULT_CONFIG_YAML: dict[str, Any] = {
         "tiers": {
             "S": {
                 "provider": "deepseek",
-                "model": "deepseek-chat",
+                "model": "deepseek-v4-flash",
                 "base_url": "https://api.deepseek.com",
                 "api_key_env": "DEEPSEEK_API_KEY",
+                "thinking": False,  # explicit: V4 thinking defaults ON; disable for the fast tier
                 "max_cost_per_call_usd": 0.01,
             },
             "M": {
                 "provider": "deepseek",
-                "model": "deepseek-reasoner",
+                "model": "deepseek-v4-flash",
                 "base_url": "https://api.deepseek.com",
                 "api_key_env": "DEEPSEEK_API_KEY",
+                "thinking": True,
+                "reasoning_effort": "high",
                 "max_cost_per_call_usd": 0.10,
             },
             "L": {

@@ -55,7 +55,7 @@ class _FakeLLMConfig:
 
 
 class MockProvider:
-    def __init__(self, response_content: str = "mock summary", cost: float = 0.001) -> None:
+    def __init__(self, response_content: str = "mock summary", cost: float | None = 0.001) -> None:
         self._content = response_content
         self._cost = cost
         self.call_count = 0
@@ -137,6 +137,18 @@ async def test_cost_recorded_after_call(tmp_path):
     report = guard.report()
     assert report["total_calls"] == 1
     assert report["total_cost_usd"] == pytest.approx(0.005)
+
+
+@pytest.mark.asyncio
+async def test_unpriced_call_degrades_to_per_call_quota(tmp_path):
+    # Provider returns cost None (operator set no prices). The guard must not crash and must
+    # charge one per-call quota unit (S tier max_cost_per_call_usd=0.01) — count-based.
+    provider = MockProvider(cost=None)
+    router, _, guard = _make_router(tmp_path, provider)
+    await router.call("function_summary", "fn\n---CALLEES---\n[]", "prompt", "v1")
+    report = guard.report()
+    assert report["total_calls"] == 1
+    assert report["total_cost_usd"] == pytest.approx(0.01)  # the S-tier per-call quota unit
 
 
 @pytest.mark.asyncio

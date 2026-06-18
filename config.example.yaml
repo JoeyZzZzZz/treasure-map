@@ -11,6 +11,11 @@ llm:
       api_key_env: DEEPSEEK_API_KEY
       thinking: false            # explicit: V4 thinking defaults ON; disable for the fast tier
       max_cost_per_call_usd: 0.01
+      # Optional: your account's USD price per 1M tokens. The tool ships NO vendor prices
+      # (they are external and account-specific). Set BOTH for real-cost guarding; leave
+      # unset and the cost-guard degrades to count-based (1 call = 1 max_cost_per_call_usd).
+      # input_price_per_1m: 0.00
+      # output_price_per_1m: 0.00
     M:
       provider: deepseek
       model: deepseek-v4-flash

@@ -22,7 +22,7 @@ from treasure_map.lib.llm.types import Tier
 def _deepseek_tier() -> dict[str, str]:
     return {
         "provider": "deepseek",
-        "model": "deepseek-chat",
+        "model": "deepseek-v4-flash",
         "base_url": "https://api.deepseek.com",
         "api_key_env": "DEEPSEEK_API_KEY",
     }
@@ -47,4 +47,4 @@ def test_build_router_provider_is_config_driven_not_anthropic(
     # deepseek dispatches through the OpenAI-compatible provider (config-driven, not anthropic).
     provider = router._providers[Tier.M]  # noqa: SLF001 — assert the wired provider type
     assert isinstance(provider, OpenAICompatProvider)
-    assert provider.model_id == "deepseek-chat"
+    assert provider.model_id == "deepseek-v4-flash"

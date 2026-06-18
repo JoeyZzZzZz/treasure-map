@@ -113,12 +113,17 @@ class LLMRouter:
         provider = self._get_provider(tier)
         response = await self._call_with_retry(provider, prompt, input_text, max_tokens, task)
 
-        # Step 4: record cost
+        # Step 4: record cost. When the provider could not price the call (operator set no
+        # prices for this tier), real cost is unknown — degrade to count-based accounting by
+        # charging one per-call quota unit, so the run/day caps still bound the call count.
         tier_cfg = getattr(self._cfg.tiers, tier.value)
+        effective_cost = (
+            response.cost_usd if response.cost_usd is not None else tier_cfg.max_cost_per_call_usd
+        )
         self._guard.record_call(
             task,
             tier.value,
-            response.cost_usd,
+            effective_cost,
             response.model_id,
             max_cost_per_call_usd=tier_cfg.max_cost_per_call_usd,
         )
@@ -131,7 +136,7 @@ class LLMRouter:
             response.model_id,
             tier.value,
             {"content": response.content, "model_id": response.model_id, **response.raw},
-            response.cost_usd,
+            effective_cost,
         )
 
         return response
@@ -144,7 +149,7 @@ class LLMRouter:
         prompt_version: str,
         progress_callback: Callable[[int, int], None] | None = None,
     ) -> list[LLMResponse | None]:
-        """Batch → single-item fallback pattern (adapted from 07_ai_summarize.py)."""
+        """Batch → single-item fallback pattern."""
         if task not in TASK_TIER_MAP:
             raise UnknownTaskError(task)
 

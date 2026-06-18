@@ -14,23 +14,6 @@ from treasure_map.lib.llm.types import LLMResponse, Tier
 
 logger = logging.getLogger(__name__)
 
-# Pricing is approximate and changes over time; used only for cost estimation.
-# Actual cost is computed from usage tokens when the API returns them.
-# Rough (input, output) USD-per-1M-token estimates, used only to feed the cost-guard and
-# ledger; the operator sets the actual budget via each tier's max_cost_per_call_usd. Vendor
-# rates change over time and are the operator's concern, so unknown models fall back to a
-# conservative default (over-estimating is safe for the guard; under-estimating is not).
-_COST_PER_1M_TOKENS: dict[str, tuple[float, float]] = {
-    "deepseek-chat": (0.27, 1.10),  # input, output per 1M tokens
-    "deepseek-reasoner": (0.55, 2.19),
-}
-_DEFAULT_COST = (0.50, 2.00)
-
-
-def _estimate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
-    input_rate, output_rate = _COST_PER_1M_TOKENS.get(model, _DEFAULT_COST)
-    return (prompt_tokens * input_rate + completion_tokens * output_rate) / 1_000_000
-
 
 class OpenAICompatProvider:
     """Wraps openai.AsyncOpenAI for any OpenAI-compatible endpoint."""
@@ -44,11 +27,15 @@ class OpenAICompatProvider:
         timeout: float = 120.0,
         thinking: bool | None = None,
         reasoning_effort: str | None = None,
+        input_price_per_1m: float | None = None,
+        output_price_per_1m: float | None = None,
     ) -> None:
         self._model = model
         self._tier = tier
         self._thinking = thinking
         self._reasoning_effort = reasoning_effort
+        self._input_price_per_1m = input_price_per_1m
+        self._output_price_per_1m = output_price_per_1m
         self._client = AsyncOpenAI(
             api_key=api_key,
             base_url=base_url,
@@ -59,6 +46,19 @@ class OpenAICompatProvider:
     @property
     def model_id(self) -> str:
         return self._model
+
+    def _estimate_cost(self, prompt_tokens: int, completion_tokens: int) -> float | None:
+        """Real cost from operator-supplied prices × token usage; None if prices unset.
+
+        The tool ships no vendor prices. When the operator has not configured both prices,
+        real cost is unknown — return None so the cost-guard falls back to count-based
+        accounting rather than inventing a dollar figure.
+        """
+        if self._input_price_per_1m is None or self._output_price_per_1m is None:
+            return None
+        return (
+            prompt_tokens * self._input_price_per_1m + completion_tokens * self._output_price_per_1m
+        ) / 1_000_000
 
     async def complete(self, prompt: str, input_text: str, max_tokens: int) -> LLMResponse:
         messages: list[dict[str, Any]] = [
@@ -92,9 +92,7 @@ class OpenAICompatProvider:
 
         content = resp.choices[0].message.content or ""
         usage = resp.usage
-        cost = 0.0
-        if usage:
-            cost = _estimate_cost(self._model, usage.prompt_tokens, usage.completion_tokens)
+        cost = self._estimate_cost(usage.prompt_tokens, usage.completion_tokens) if usage else None
 
         return LLMResponse(
             content=content,

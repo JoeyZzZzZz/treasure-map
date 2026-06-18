@@ -34,6 +34,8 @@ def _build_provider(tier: Tier, cfg: LLMConfig) -> LLMProvider:
         base_url=tier_cfg.base_url,
         api_key=tier_cfg.resolve_api_key(),
         tier=tier,
+        input_price_per_1m=tier_cfg.input_price_per_1m,
+        output_price_per_1m=tier_cfg.output_price_per_1m,
     )
 
 

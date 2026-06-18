@@ -25,6 +25,13 @@ class TierConfig(BaseModel):
     base_url: str
     api_key_env: str
     max_cost_per_call_usd: float = 1.0
+    # Optional per-1M-token prices, supplied by the operator (the tool ships no vendor
+    # prices — they are external, account-specific, and change over time). When both are
+    # set, the provider computes real cost = price × actual token usage. When either is
+    # unset, real cost is unknown and the cost-guard degrades to count-based accounting
+    # (each call counts as one max_cost_per_call_usd quota unit).
+    input_price_per_1m: float | None = None
+    output_price_per_1m: float | None = None
     # Tri-state thinking control for DeepSeek-V4 (whose thinking defaults to ENABLED):
     #   None  -> send no thinking param (legacy behavior; correct for Anthropic and any
     #            endpoint we should not touch)

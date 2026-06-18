@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- Five historical leftovers are cleared: (1) the empty `lib/verify/` placeholder is deleted (it
+  was the repo's only `verify`-named placeholder and will not be rebuilt); (2) the dead `agent/`
+  stub — a never-implemented natural-language tool-call loop plus its old analyze-tool wrapper —
+  is deleted, since exposing capabilities to an AI consumer is the (future) MCP layer's job, not
+  the tool's own loop (the CLI is untouched: it is the human/CI entry point, not an agent loop);
+  (3) the built-in per-1M-token price tables in both providers (`_COST_PER_1M*`, `_DEFAULT_COST`)
+  are removed — the tool no longer ships any vendor dollar figure; (4) the
+  `07_ai_summarize.py` provenance comment in `router.py` is dropped (the `--summarize` command was
+  already removed; the migration's `_DROPPED_COLUMNS` `functions.summary` entry is intentionally
+  kept). All deletions verified zero-reference.
+
+### Changed
+
+- LLM cost is now computed from operator-supplied prices, not built-in vendor rates. `TierConfig`
+  gains optional `input_price_per_1m` / `output_price_per_1m`; when both are set a provider
+  computes real cost = price × actual token usage. When either is unset, real cost is unknown
+  (`LLMResponse.cost_usd` is `None`) and the cost-guard degrades to count-based accounting — each
+  call is charged one `max_cost_per_call_usd` quota unit, so the run/day caps still bound the call
+  count without inventing a price. The cost-guard's confirm/circuit-breaker/ledger machinery is
+  unchanged; only the source of the cost number changed (built-in table → operator price or count).
+- `tmap init` now generates a config using the current model names and explicit thinking control
+  (S: `deepseek-v4-flash`, `thinking: false`; M: `deepseek-v4-flash`, `thinking: true`,
+  `reasoning_effort: high`; L unchanged), matching `config.example.yaml` and retiring the legacy
+  `deepseek-chat` / `deepseek-reasoner` aliases before their upstream removal. Price fields are
+  left unset (operator-supplied).
+
 ### Fixed
 
 - Diff change-classification is now three-state, so a missing decompilation is never mistaken for

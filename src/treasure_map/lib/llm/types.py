@@ -17,7 +17,7 @@ class Tier(StrEnum):
 class LLMResponse:
     content: str
     model_id: str
-    cost_usd: float
+    cost_usd: float | None  # None = real cost unknown (no operator-supplied prices)
     cached: bool
     tier: Tier
     raw: dict[str, Any] = field(default_factory=dict)

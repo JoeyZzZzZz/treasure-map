@@ -14,31 +14,40 @@ from treasure_map.lib.llm.types import LLMResponse, Tier
 
 logger = logging.getLogger(__name__)
 
-# Approximate pricing per 1M tokens for cost estimation (USD)
-_COST_PER_1M: dict[str, tuple[float, float]] = {
-    "claude-opus-4-7": (15.0, 75.0),
-    "claude-sonnet-4-6": (3.0, 15.0),
-    "claude-haiku-4-5-20251001": (0.25, 1.25),
-}
-_DEFAULT_COST = (3.0, 15.0)
-
-
-def _estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
-    in_rate, out_rate = _COST_PER_1M.get(model, _DEFAULT_COST)
-    return (input_tokens * in_rate + output_tokens * out_rate) / 1_000_000
-
 
 class AnthropicProvider:
     """Calls Anthropic Claude via the native SDK."""
 
-    def __init__(self, model: str, api_key: str, tier: Tier) -> None:
+    def __init__(
+        self,
+        model: str,
+        api_key: str,
+        tier: Tier,
+        input_price_per_1m: float | None = None,
+        output_price_per_1m: float | None = None,
+    ) -> None:
         self._model = model
         self._tier = tier
+        self._input_price_per_1m = input_price_per_1m
+        self._output_price_per_1m = output_price_per_1m
         self._client = sdk.AsyncAnthropic(api_key=api_key, max_retries=0)
 
     @property
     def model_id(self) -> str:
         return self._model
+
+    def _estimate_cost(self, input_tokens: int, output_tokens: int) -> float | None:
+        """Real cost from operator-supplied prices × token usage; None if prices unset.
+
+        The tool ships no vendor prices. When the operator has not configured both prices,
+        real cost is unknown — return None so the cost-guard falls back to count-based
+        accounting rather than inventing a dollar figure.
+        """
+        if self._input_price_per_1m is None or self._output_price_per_1m is None:
+            return None
+        return (
+            input_tokens * self._input_price_per_1m + output_tokens * self._output_price_per_1m
+        ) / 1_000_000
 
     async def complete(self, prompt: str, input_text: str, max_tokens: int) -> LLMResponse:
         try:
@@ -58,7 +67,7 @@ class AnthropicProvider:
         content_blocks = [b.text for b in resp.content if hasattr(b, "text")]
         content = "\n".join(content_blocks)
         usage = resp.usage
-        cost = _estimate_cost(self._model, usage.input_tokens, usage.output_tokens)
+        cost = self._estimate_cost(usage.input_tokens, usage.output_tokens)
 
         return LLMResponse(
             content=content,
@@ -80,4 +89,6 @@ def build_anthropic_provider(tier_cfg: TierConfig, tier: Tier) -> AnthropicProvi
         model=tier_cfg.model,
         api_key=tier_cfg.resolve_api_key(),
         tier=tier,
+        input_price_per_1m=tier_cfg.input_price_per_1m,
+        output_price_per_1m=tier_cfg.output_price_per_1m,
     )

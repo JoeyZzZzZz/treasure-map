@@ -21,4 +21,6 @@ def build_deepseek_provider(tier_cfg: TierConfig, tier: Tier) -> OpenAICompatPro
         tier=tier,
         thinking=tier_cfg.thinking,
         reasoning_effort=tier_cfg.reasoning_effort,
+        input_price_per_1m=tier_cfg.input_price_per_1m,
+        output_price_per_1m=tier_cfg.output_price_per_1m,
     )
