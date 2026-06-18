@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Scan the commit message for vendor identifiers / model numbers and strategy
+# vocabulary, using the same detection logic as pre-commit (.githooks/lib.sh).
+# $1 is the path to the file holding the proposed commit message.
+HERE="$(cd "$(dirname "$0")" && pwd)"
+. "$HERE/lib.sh"
+
+MSG_FILE="$1"
+[ -f "$MSG_FILE" ] || exit 0
+
+# Strip comment lines (git's default cleanup drops them) so the editor template
+# and scissors lines are not scanned as if they were the message.
+MSG=$(grep -v '^#' "$MSG_FILE" || true)
+
+# ── vendor-neutrality (commit message) ───────────────────────────────────────
+WATCHLIST="$(tm_resolve_watchlist || true)"
+if [ -n "$WATCHLIST" ]; then
+    if HITS=$(printf '%s' "$MSG" | tm_scan_text "$WATCHLIST"); then
+        :
+    else
+        echo ""
+        echo "❌ COMMIT BLOCKED — vendor identifier(s) in commit message:"
+        echo "$HITS"
+        echo ""
+        echo "Vendor names / model numbers must never enter commit messages."
+        echo "Fix: reword with a generic category term (e.g. 'IoT camera',"
+        echo "'consumer router'), then re-commit."
+        echo "Bypassing this check is not authorized."
+        echo ""
+        exit 1
+    fi
+fi
+
+# ── strategy/judgment-vocabulary guard (commit message) ──────────────────────
+SVHITS=$(printf '%s' "$MSG" | grep -nIE "$TM_BANNED_VOCAB" || true)
+if [ -n "$SVHITS" ]; then
+    echo ""
+    echo "❌ COMMIT BLOCKED — strategy/judgment vocabulary in commit message:"
+    echo "$SVHITS"
+    echo ""
+    echo "Use mechanism-only wording; keep strategy framing out of commit messages."
+    echo ""
+    exit 1
+fi

@@ -7,6 +7,26 @@ on:
     branches: [main]
 
 jobs:
+  vendor-neutrality:
+    name: Vendor Neutrality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # need history to diff the range and read commit messages
+      - name: Resolve commit range
+        id: range
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "base=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
+            echo "head=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "base=${{ github.event.before }}" >> "$GITHUB_OUTPUT"
+            echo "head=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Check vendor neutrality (diff + commit messages)
+        run: bash scripts/check-vendor-neutrality.sh "${{ steps.range.outputs.base }}" "${{ steps.range.outputs.head }}"
+
   lint:
     name: Lint
     runs-on: ubuntu-latest

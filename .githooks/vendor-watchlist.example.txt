@@ -20,3 +20,11 @@
 # words like WIPE-AND-REBUILD do not false-positive).
 [A-Z]{2,4}-(?=[A-Z0-9]*[0-9])[A-Z0-9]{2,6}[LWHABM]?
 (R|AX|AC|N|RT)[0-9]{3,5}
+
+# Lower-case run-together model form: a short letter prefix immediately followed
+# by >=3 digits (e.g. an IoT camera model written all-lowercase, no hyphen). The
+# leading (?i) makes it case-insensitive; the negative lookahead whitelists common
+# technical tokens of the same shape (hashes, charsets, int/float widths, arch and
+# OS tags) so they are NOT flagged. >=3 digits is required so 2-digit tech words
+# (base64, arm32, crc32, int64, ...) never reach the regex at all.
+(?i)\b(?!(?:sha1|sha224|sha256|sha384|sha512|sha3|md4|md5|crc8|crc16|crc32|crc64|base32|base64|utf8|utf16|utf32|int8|int16|int32|int64|int128|uint8|uint16|uint32|uint64|float16|float32|float64|ipv4|ipv6|arm32|arm64|aarch64|x86|mips32|mips64|win32|win64|py311)\b)[a-z]{2,6}[0-9]{3,}\b

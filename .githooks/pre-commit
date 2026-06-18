@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Shared detection logic lives in .githooks/lib.sh (also used by commit-msg + CI).
+HERE="$(cd "$(dirname "$0")" && pwd)"
+. "$HERE/lib.sh"
+
 SENSITIVE=$(git diff --cached --name-only | grep -E "^internal/|^private/|^\.notes/|\.private\.|SECRETS\.|-PRIVATE\.")
 if [ -n "$SENSITIVE" ]; then
     echo ""
@@ -11,61 +15,40 @@ if [ -n "$SENSITIVE" ]; then
     exit 1
 fi
 
-# ── vendor-neutrality enforcement ────────────────────────────────────────────
-# Resolve watchlist: env override → local repo copy (git-ignored) → committed example.
-WATCHLIST=""
-for cand in "$TM_VENDOR_WATCHLIST" \
-            ".githooks/vendor-watchlist.txt" \
-            ".githooks/vendor-watchlist.example.txt"; do
-    if [ -n "$cand" ] && [ -f "$cand" ]; then WATCHLIST="$cand"; break; fi
-done
-if [ "$WATCHLIST" = ".githooks/vendor-watchlist.example.txt" ]; then
-    echo "ℹ️  vendor watchlist: using brand-free example (regex patterns only)."
-    echo "    Set TM_VENDOR_WATCHLIST to a full local list for complete brand-name coverage."
-fi
-if [ -f "$WATCHLIST" ]; then
+# ── vendor-neutrality enforcement (diff content) ─────────────────────────────
+# Resolve the watchlist and scan the staged ADDED lines via the shared scanner.
+# The hook machinery, the watchlists, and the hook's own test are excluded so the
+# denylist patterns do not self-match.
+WATCHLIST="$(tm_resolve_watchlist || true)"
+if [ -n "$WATCHLIST" ]; then
     ADDED=$(git diff --cached -U0 --diff-filter=ACM -- . \
             ":(exclude).githooks/vendor-watchlist.txt" \
             ":(exclude).githooks/vendor-watchlist.example.txt" \
             ":(exclude).githooks/pre-commit" \
+            ":(exclude).githooks/commit-msg" \
+            ":(exclude).githooks/lib.sh" \
+            ":(exclude)tests/unit/test_precommit_hook.py" \
             | grep '^+' | grep -v '^+++' || true)
-    if [ -n "$ADDED" ]; then
-        HITS=""
-        while IFS= read -r pat; do
-            case "$pat" in ''|\#*) continue ;; esac
-            # Regex patterns (starting with [ or () use PCRE case-sensitive matching
-            # so that [A-Z]{2,4}-... only fires on UPPERCASE model numbers with
-            # digits (lookahead in pattern), not on words like "non-binary".
-            # Literal name patterns use -w (whole-word, case-insensitive) to avoid
-            # substring matches (e.g. "Ring" must not match "string").
-            case "$pat" in
-                \[*|\(*) MATCH=$(printf '%s\n' "$ADDED" | grep -P -- "$pat" || true) ;;
-                *)        MATCH=$(printf '%s\n' "$ADDED" | grep -iwE -- "$pat" || true) ;;
-            esac
-            if [ -n "$MATCH" ]; then
-                HITS="${HITS}"$'\n'"  pattern: ${pat}"$'\n'"$(printf '%s' "$MATCH" | sed 's/^/    /')"
-            fi
-        done < "$WATCHLIST"
-        if [ -n "$HITS" ]; then
-            echo ""
-            echo "❌ COMMIT BLOCKED — vendor identifier(s) in staged changes:"
-            echo "$HITS"
-            echo ""
-            echo "Vendor names / model numbers must never enter committed artifacts."
-            echo "Fix: replace with a generic category term (e.g. 'IoT camera',"
-            echo "'consumer router', 'main web daemon'), re-stage, and retry."
-            echo "Bypassing this check is not authorized."
-            echo ""
-            exit 1
-        fi
+    if HITS=$(printf '%s' "$ADDED" | tm_scan_text "$WATCHLIST"); then
+        :
+    else
+        echo ""
+        echo "❌ COMMIT BLOCKED — vendor identifier(s) in staged changes:"
+        echo "$HITS"
+        echo ""
+        echo "Vendor names / model numbers must never enter committed artifacts."
+        echo "Fix: replace with a generic category term (e.g. 'IoT camera',"
+        echo "'consumer router', 'main web daemon'), re-stage, and retry."
+        echo "Bypassing this check is not authorized."
+        echo ""
+        exit 1
     fi
 fi
 
 # ── strategy/judgment-vocabulary guard ───────────────────────────────────────
-BANNED='\b(moat|shield)\b|盾|fix_quality|incomplete_patch_flag|fix_quality_score'
 HITS=$(git diff --cached --name-only --diff-filter=ACM \
         -- 'src/*' 'docs/*' '*.md' ':!LICENSE' \
-       | xargs grep -nIE "$BANNED" 2>/dev/null || true)
+       | xargs grep -nIE "$TM_BANNED_VOCAB" 2>/dev/null || true)
 if [ -n "$HITS" ]; then
   echo ""
   echo "❌ COMMIT BLOCKED — strategy/judgment vocabulary in staged changes:"
@@ -80,11 +63,10 @@ fi
 # Committed code, docs, and hooks must stand on their own — never point at a
 # private document or name a private path. The hook excludes itself (its pattern
 # definition would otherwise self-match).
-PRIVDOC='treasure-map-notes|private (design )?notes|design note|PRD §|private notes dir'
 HITS=$(git diff --cached --name-only --diff-filter=ACM \
         -- 'src/*' 'docs/*' '*.md' '.githooks/*' 'CONTRIBUTING.md' \
-           ':!LICENSE' ':!.githooks/pre-commit' \
-       | xargs grep -nIE "$PRIVDOC" 2>/dev/null || true)
+           ':!LICENSE' ':!.githooks/pre-commit' ':!.githooks/commit-msg' ':!.githooks/lib.sh' \
+       | xargs grep -nIE "$TM_PRIVDOC" 2>/dev/null || true)
 if [ -n "$HITS" ]; then
   echo ""
   echo "❌ COMMIT BLOCKED — committed artifacts must not reference private docs/paths:"
@@ -99,11 +81,10 @@ fi
 # Committed code must be self-contained — no private-doc section/design-code refs
 # (§x.x, PRD §, DD/ED/FD codes). Excludes the guard machinery (.githooks/* and the
 # hook's own test) whose denylists must contain the very tokens they detect.
-SECTREF='§[0-9]|PRD §|\b(DD|ED|FD)[0-9]\b'
 HITS=$(git diff --cached --name-only --diff-filter=ACM \
         -- 'src/*' 'docs/*' '*.md' ':!LICENSE' ':!.githooks/*' \
            ':!tests/unit/test_precommit_hook.py' \
-       | xargs grep -nIE "$SECTREF" 2>/dev/null || true)
+       | xargs grep -nIE "$TM_SECTREF" 2>/dev/null || true)
 if [ -n "$HITS" ]; then
   echo ""
   echo "❌ COMMIT BLOCKED — committed code must be self-contained — no private-doc/section refs:"

@@ -46,7 +46,16 @@ git clone https://github.com/JoeyZzZzZz/treasure-map.git
 cd treasure-map
 python3.11 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
+./scripts/install-hooks.sh   # REQUIRED: activates the git hooks (see below)
 ```
+
+**You must run `./scripts/install-hooks.sh` after cloning.** It points
+`core.hooksPath` at `.githooks/` so the `pre-commit` and `commit-msg` checks
+actually run. Git does not pick up `.githooks/` on its own — without this step the
+hooks are inert and a vendor name or model number can slip into a commit or its
+message locally. CI re-runs the same checks (the `vendor-neutrality` job) as a
+backstop, so an un-installed hook surfaces as a failed PR rather than a clean
+local commit, but installing the hooks catches it before you push.
 
 Run the same checks CI runs before pushing:
 
@@ -57,17 +66,25 @@ Run the same checks CI runs before pushing:
 You still need Ghidra 11.x + JDK 21 on the host for `tmap analyze` (README → Setup) and
 `tmap init` to configure them; the editable install does not bundle them.
 
-## Vendor Denylist (pre-commit hook)
+## Vendor Denylist (git hooks + CI)
 
-The pre-commit hook enforces vendor neutrality. The committed file
-`.githooks/vendor-watchlist.example.txt` contains only generic model-number
-regex patterns (no brand names). For full brand-name coverage, obtain the
-complete local denylist from the project owner and point the hook at it:
+Vendor neutrality is enforced in three layers (all sharing `.githooks/lib.sh`):
+
+- **`pre-commit`** scans the staged diff content.
+- **`commit-msg`** scans the commit message (a model number must not hide there).
+- **CI `vendor-neutrality`** re-scans both the diff and every commit message over
+  the pushed range — the backstop for an un-installed hook or `--no-verify`.
+
+The committed file `.githooks/vendor-watchlist.example.txt` contains only generic
+model-number regex patterns (no brand names), including a lower-case run-together
+form that whitelists common technical tokens (`sha256`, `base64`, `arm32`, …) so
+they are not flagged. For full brand-name coverage, obtain the complete local
+denylist from the project owner and point the hooks at it:
 
 ```bash
 # Set TM_VENDOR_WATCHLIST to the path of your local denylist before committing:
 export TM_VENDOR_WATCHLIST=/path/to/your/vendor-watchlist.txt
 ```
 
-Without the full list the hook still blocks model-number-shaped strings via
-the example template and prints an informational notice.
+Without the full list the hooks and CI still block model-number-shaped strings via
+the example template and print an informational notice.

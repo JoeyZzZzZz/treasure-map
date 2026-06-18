@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Vendor-neutrality enforcement is now wired to actually run, in three layers sharing one
+  detection library (`.githooks/lib.sh`): the existing `pre-commit` (scans staged diff content),
+  a new `commit-msg` hook (scans the commit message — a model number must not hide there), and a
+  new CI `vendor-neutrality` job that re-scans both the diff and every commit message over the
+  pushed range as a backstop when the local hooks were never installed or were bypassed. A new
+  `scripts/install-hooks.sh` sets `core.hooksPath`, and `CONTRIBUTING.md` makes running it a
+  required post-clone step. The example watchlist gains a lower-case run-together model pattern
+  (short letter prefix + ≥3 digits) with a negative lookahead whitelisting common technical tokens
+  of the same shape (`sha256`, `base64`, `arm32`, `ipv4`, `crc32`, int/float widths, arch/OS tags)
+  so they are never flagged; covered by false-positive tests.
+
 ### Removed
 
 - Five historical leftovers are cleared: (1) the empty `lib/verify/` placeholder is deleted (it
