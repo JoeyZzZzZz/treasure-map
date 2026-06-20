@@ -619,6 +619,67 @@ def test_caller_constant_downweights_constant_supplied_sink(tmp_path: Path) -> N
     assert rows["run_cmd"]["blocking_mechanism"] == "caller_constant"
 
 
+# ── inline charset on the cmd path + the thin-command-wrapper fact (R-L3·prep) ───────
+
+
+def _charset_inline_cmd_fn(name: str = "arp_set") -> dict[str, object]:
+    # A cmd_injection_shape whose command string is built inline from a charset-safe converter
+    # (ether_ntoa -> MAC text). The recv buffer never reaches the command -> the command's
+    # dynamic part is charset-constrained, so the cmd candidate must be downweighted.
+    body = (
+        f"void {name}(struct ether_addr* mac){{ char buf[64]; recv(fd,buf,64); char cmd[128]; "
+        f'snprintf(cmd,128,"arp -s %s",ether_ntoa(mac)); system(cmd); }}'
+    )
+    return {
+        "name": name,
+        "pseudocode": body,
+        "hash": f"h_{name}",
+        "callees": ["recv", "ether_ntoa", "snprintf", "system"],
+    }
+
+
+def _thin_wrapper_fn(name: str = "exec_sh") -> dict[str, object]:
+    # A bare_cmd_shape candidate that is also a thin forwarding wrapper: body ≈ system(param).
+    return {
+        "name": name,
+        "pseudocode": f"void {name}(char* param_1){{ system(param_1); }}",
+        "hash": f"h_{name}",
+        "callees": ["system"],
+    }
+
+
+def test_inline_charset_cmd_candidate_is_downweighted_end_to_end(tmp_path: Path) -> None:
+    # The cmd-path inline charset downweight reaches the persisted instance: the system()
+    # candidate built from ether_ntoa is labelled charset_constrained (not bare_sink / None).
+    db = _make_db(tmp_path, [{"name": "netd", "funcs": [_charset_inline_cmd_fn()]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_cs")
+    row = _by_anchor(atlas)["arp_set"]
+    assert row["blocking_mechanism"] == "charset_constrained"
+    assert row["is_thin_cmd_wrapper"] == 0  # builds a command; not a verbatim forwarder
+
+
+def test_thin_wrapper_fact_is_recorded_without_changing_score(tmp_path: Path) -> None:
+    # The wrapper fact is stored on the candidate; its review-ordering label is untouched
+    # (still bare_sink) — recording the fact does not change recall or rank.
+    db = _make_db(tmp_path, [{"name": "initd", "funcs": [_thin_wrapper_fn()]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_w")
+    row = _by_anchor(atlas)["exec_sh"]
+    assert row["is_thin_cmd_wrapper"] == 1
+    assert row["wrapped_sink"] == "system"
+    assert row["blocking_mechanism"] == "bare_sink"  # unchanged by the fact
+
+
+def test_wrapper_fact_does_not_add_candidates(tmp_path: Path) -> None:
+    # ★ recall/count neutrality: the fact is a label on existing candidates, never a new one.
+    # The wrapper function yields exactly one instance (its bare_cmd_shape match), no extra row.
+    db = _make_db(tmp_path, [{"name": "initd", "funcs": [_thin_wrapper_fn()]}])
+    atlas = tmp_path / "atlas.db"
+    stats = run_analyzer2(db, atlas, source_run_id="run_w1")
+    assert stats.instances_written == len(_instances(atlas)) == stats.matches == 1
+
+
 # ── BOUNDARY ────────────────────────────────────────────────────────────────────────
 
 

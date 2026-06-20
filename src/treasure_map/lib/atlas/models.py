@@ -48,5 +48,10 @@ class InstanceRow:
     # Neutral origin dimension; not forced at ingest — defaults to 'unknown' (refined later
     # at the aggregation layer). One of custom/vendor_modified_oss/stock_oss_known/unknown.
     origin: str = "unknown"
+    # Neutral structural fact: the function is a thin wrapper forwarding a parameter to a shell
+    # command sink, and which sink (system/popen/doSystem). Recorded for a later analysis layer;
+    # no recall/downweight/triage path reads these — a fact, not a verdict or a score input.
+    is_thin_cmd_wrapper: bool = False
+    wrapped_sink: str | None = None
     instance_id: int | None = None
     created_at: str | None = None

@@ -296,6 +296,134 @@ def test_charset_safe_plus_free_source_into_same_sink_is_not_downweighted() -> N
     )
 
 
+# ── inline charset-safe converter on the cmd path (②: same口径 as the assigned form) ───
+#
+# The assigned form (lhs = conv(...)) above already downweights a system() candidate. These
+# cover the realistic command-building shape where the converter RESULT is passed inline into
+# the format builder with no intermediate variable — the form a cmd_injection_shape candidate
+# typically takes, and the one that previously escaped the downweight on the cmd path.
+
+
+def test_inline_ether_ntoa_into_system_is_charset_constrained() -> None:
+    # snprintf(c,...,ether_ntoa(mac)); system(c) — no `s = ether_ntoa(...)` to name the result.
+    pc = (
+        "void f(struct ether_addr* mac){ char c[64]; "
+        'snprintf(c,64,"arp -s %s",ether_ntoa(mac)); system(c); }'
+    )
+    assert (
+        detect_form_signal(
+            sink_name="system",
+            pseudocode=pc,
+            callees=["ether_ntoa", "snprintf", "system"],
+            sink_arg="c",
+        )
+        == CHARSET_CONSTRAINED
+    )
+
+
+def test_inline_inet_ntop_into_system_is_charset_constrained() -> None:
+    pc = (
+        "void f(int fd){ char c[80]; char ip[16]; "
+        'snprintf(c,80,"route add %s",inet_ntop(2,&fd,ip,16)); system(c); }'
+    )
+    assert (
+        detect_form_signal(
+            sink_name="system",
+            pseudocode=pc,
+            callees=["inet_ntop", "snprintf", "system"],
+            sink_arg="c",
+        )
+        == CHARSET_CONSTRAINED
+    )
+
+
+def test_inline_charset_on_copy_path_is_unchanged() -> None:
+    # Same口径 on the copy path (no regression / same recognition): a strcpy destination built
+    # inline from a charset-safe converter is charset_constrained just like the cmd path.
+    pc = "void f(struct ether_addr* mac){ char d[64]; strcpy(d, ether_ntoa(mac)); }"
+    assert (
+        detect_form_signal(
+            sink_name="strcpy",
+            pseudocode=pc,
+            callees=["ether_ntoa", "strcpy"],
+            sink_arg="d",
+        )
+        == CHARSET_CONSTRAINED
+    )
+
+
+def test_inline_charset_then_free_append_is_not_downweighted() -> None:
+    # ★ recall-neutral: an inline converter builds the buffer, but a later strcat appends a free
+    # parameter to the SAME buffer. The all-writes rule disqualifies the buffer -> no downweight.
+    pc = (
+        "void f(struct ether_addr* mac, char* p){ char c[96]; "
+        'snprintf(c,96,"x %s",ether_ntoa(mac)); strcat(c,p); system(c); }'
+    )
+    assert (
+        detect_form_signal(
+            sink_name="system",
+            pseudocode=pc,
+            callees=["ether_ntoa", "snprintf", "strcat", "system"],
+            sink_arg="c",
+        )
+        is None
+    )
+
+
+def test_inline_charset_mixed_with_free_arg_is_not_downweighted() -> None:
+    # ★ recall-neutral: the SAME builder mixes a charset-safe converter with a free nvram value.
+    # One benign contributor does not make the command safe -> no downweight.
+    pc = (
+        "void f(struct ether_addr* mac){ char* v = nvram_get(0); char c[96]; "
+        'snprintf(c,96,"%s %s",ether_ntoa(mac),v); system(c); }'
+    )
+    assert (
+        detect_form_signal(
+            sink_name="system",
+            pseudocode=pc,
+            callees=["ether_ntoa", "nvram_get", "snprintf", "system"],
+            sink_arg="c",
+        )
+        is None
+    )
+
+
+def test_inline_charset_mixed_with_raw_param_is_not_downweighted() -> None:
+    # ★ recall-neutral: a raw parameter sits alongside the converter result in the command -> the
+    # free param bypasses the converter, so the command must NOT be downweighted.
+    pc = (
+        "void f(struct ether_addr* mac, char* raw){ char c[96]; "
+        'snprintf(c,96,"%s %s",ether_ntoa(mac),raw); system(c); }'
+    )
+    assert (
+        detect_form_signal(
+            sink_name="system",
+            pseudocode=pc,
+            callees=["ether_ntoa", "snprintf", "system"],
+            sink_arg="c",
+        )
+        is None
+    )
+
+
+def test_buffer_seeded_by_param_then_inline_converter_is_not_downweighted() -> None:
+    # ★ recall-neutral: the buffer is first aliased to a free parameter, then a converter writes
+    # it. The plain-assignment write (c = p) is not charset-benign -> the buffer is disqualified.
+    pc = (
+        "void f(struct ether_addr* mac, char* p){ char* c = p; "
+        'snprintf(c,64,"%s",ether_ntoa(mac)); system(c); }'
+    )
+    assert (
+        detect_form_signal(
+            sink_name="system",
+            pseudocode=pc,
+            callees=["ether_ntoa", "snprintf", "system"],
+            sink_arg="c",
+        )
+        is None
+    )
+
+
 # ── library / symbol recognition (function granularity) ──────────────────────────────
 
 

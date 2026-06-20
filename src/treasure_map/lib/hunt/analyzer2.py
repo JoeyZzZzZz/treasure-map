@@ -31,6 +31,7 @@ from treasure_map.lib.atlas.models import InstanceRow
 from treasure_map.lib.atlas.writer import add_instance, delete_run_instances, upsert_pattern
 from treasure_map.lib.diff.loader import FuncRow, load_functions
 from treasure_map.lib.hunt.downweight import detect_form_signal, library_origin
+from treasure_map.lib.hunt.facts import is_thin_cmd_wrapper
 from treasure_map.lib.pattern import scan
 from treasure_map.lib.pattern.classes import CMD, COPY, FORMAT
 from treasure_map.lib.reachability import grade_candidate
@@ -178,6 +179,13 @@ def run_analyzer2(
                 ):
                     blocking = "bare_sink"
 
+                # Neutral STRUCTURAL fact about the function this candidate lives in: is it a thin
+                # wrapper that forwards a parameter straight to a shell command sink, and to which
+                # sink. Recorded for a later analysis layer to consume; it is NOT read here, by the
+                # form-note downweight, or by the read-side score — recording it changes neither
+                # this candidate's recall nor its review-ordering rank.
+                thin_wrapper, wrapped_sink = is_thin_cmd_wrapper(row.pseudocode, callees)
+
                 provenance = "L1" if status in {"confirmed", "blocked"} else "L0"
                 pattern_id = upsert_pattern(
                     atlas,
@@ -214,6 +222,8 @@ def run_analyzer2(
                         binary_content_hash=row.binary_sha256,
                         scope_origin="intra",
                         origin=origin,
+                        is_thin_cmd_wrapper=thin_wrapper,
+                        wrapped_sink=wrapped_sink,
                     ),
                     commit=False,
                 )

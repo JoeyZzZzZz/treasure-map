@@ -151,8 +151,9 @@ def add_instance(
         """INSERT INTO instance
            (pattern_id, pseudocode_hash, source_anchor, sink_anchor, source_run_id,
             reachability_status, blocking_mechanism, provenance_level, external_anchor,
-            fix_diff, scope_origin, evidence_ref, binary_path, binary_content_hash, origin)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            fix_diff, scope_origin, evidence_ref, binary_path, binary_content_hash, origin,
+            is_thin_cmd_wrapper, wrapped_sink)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             instance.pattern_id,
             instance.pseudocode_hash,
@@ -169,6 +170,8 @@ def add_instance(
             instance.binary_path,
             instance.binary_content_hash,
             instance.origin,
+            int(instance.is_thin_cmd_wrapper),
+            instance.wrapped_sink,
         ),
     )
     _recompute_device_spread(conn, instance.pattern_id)
@@ -211,6 +214,8 @@ def add_instances(
             inst.binary_path,
             inst.binary_content_hash,
             inst.origin,
+            int(inst.is_thin_cmd_wrapper),
+            inst.wrapped_sink,
         )
         for inst in instances
     ]
@@ -218,8 +223,9 @@ def add_instances(
         """INSERT INTO instance
            (pattern_id, pseudocode_hash, source_anchor, sink_anchor, source_run_id,
             reachability_status, blocking_mechanism, provenance_level, external_anchor,
-            fix_diff, scope_origin, evidence_ref, binary_path, binary_content_hash, origin)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            fix_diff, scope_origin, evidence_ref, binary_path, binary_content_hash, origin,
+            is_thin_cmd_wrapper, wrapped_sink)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         rows,
     )
 

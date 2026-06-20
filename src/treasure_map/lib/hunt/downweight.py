@@ -27,8 +27,11 @@ from __future__ import annotations
 
 import re
 
-from treasure_map.lib.pattern.classes import CMD, SOURCE
-from treasure_map.lib.reachability.taint import flows_into, free_taint_reaches
+from treasure_map.lib.pattern.classes import CMD, COPY, FORMAT, SOURCE
+from treasure_map.lib.reachability.taint import _IDENT_RE, flows_into, free_taint_reaches
+
+# Leading callee name of a call expression (used to find builder calls in a statement).
+_CALL_RE_HEAD = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
 
 # Neutral categorical form notes stored in blocking_mechanism. Each describes a mechanism, not
 # a quality judgment. The read-side review-ordering table maps these to a strong downweight.
@@ -162,11 +165,74 @@ def _constrained_results(pseudocode: str, path: set[str], converters: frozenset[
     return results
 
 
+def _is_converter_call(text: str, converters: frozenset[str]) -> bool:
+    """True when ``text`` (one call argument or assignment RHS) is a single inline converter
+    call — `conv(...)`, allowing a leading cast `(type)` / address-of `&` / deref `*`. The
+    converter's OUTPUT is charset-constrained by construction regardless of its inputs, so this
+    recognizes the laundering even when the result is never bound to its own variable."""
+    m = re.match(r"^[&*]?\s*(?:\([^)]*\)\s*)?([A-Za-z_]\w*)\s*\(", text.strip())
+    return m is not None and m.group(1) in converters
+
+
+def _is_charset_benign(text: str, converters: frozenset[str]) -> bool:
+    """True when ``text`` cannot introduce a free value: a literal (string/char/numeric/size
+    constant) or a single inline charset-safe converter call. A bare identifier or any
+    non-converter call is NOT benign — it may carry a free, uncontrolled value."""
+    return bool(_LITERAL_ARG_RE.match(text.strip())) or _is_converter_call(text, converters)
+
+
+def _inline_constrained_results(pseudocode: str, converters: frozenset[str]) -> set[str]:
+    """Variables built ONLY from charset-safe converter results / literals, where the converter
+    result is passed inline (never bound to its own `lhs = conv(...)` variable).
+
+    Handles the common command-building shape `snprintf(c,"...%s",ether_ntoa(x)); system(c)`,
+    which `_constrained_results` misses because there is no intermediate assignment to name the
+    converter output. Recall-safe by an all-writes rule: a variable qualifies ONLY when EVERY
+    write to it (format/copy builder destination OR plain assignment) is charset-benign AND at
+    least one write involves a converter. So a later free write — `strcat(c, user_input)` — or a
+    free value mixed into the same builder — `snprintf(c,"%s %s",ether_ntoa(x),raw)` — disqualifies
+    the variable, leaving the candidate at its normal score (never a false downweight)."""
+    builders = FORMAT | COPY
+    all_benign: dict[str, bool] = {}
+    has_converter: dict[str, bool] = {}
+
+    def _note(var: str, benign: bool, converter: bool) -> None:
+        all_benign[var] = all_benign.get(var, True) and benign
+        has_converter[var] = has_converter.get(var, False) or converter
+
+    for stmt in re.split(r"[;\n{}]", pseudocode):
+        for name in {m.group(1) for m in _CALL_RE_HEAD.finditer(stmt)} & builders:
+            args = _call_arglist(stmt, name)
+            if args is None:
+                continue
+            parts = _split_args(args)
+            if not parts:
+                continue
+            dst_ident = _IDENT_RE.search(parts[0])
+            if dst_ident is None:
+                continue
+            value_args = parts[1:]
+            benign = all(_is_charset_benign(a, converters) for a in value_args)
+            converter = any(_is_converter_call(a, converters) for a in value_args)
+            _note(dst_ident.group(0), benign, converter)
+        assign = re.match(r"\s*[^=]*?\b([A-Za-z_]\w*)\s*=\s*(?!=)(.*)", stmt)
+        if assign is not None:
+            lhs, rhs = assign.group(1), assign.group(2)
+            _note(lhs, _is_charset_benign(rhs, converters), _is_converter_call(rhs, converters))
+
+    return {var for var, benign in all_benign.items() if benign and has_converter.get(var)}
+
+
 def _value_is_constrained(pseudocode: str, sink_arg: str, converters: frozenset[str]) -> bool:
     """The sink argument's value is the result of a ``converters`` conversion AND no free value
     bypasses it. Parameter-specific: a converter merely appearing in the function is not enough."""
     path = {sink_arg} | flows_into(pseudocode, sink_arg)
     safe = _constrained_results(pseudocode, path, converters)
+    # Inline form: a value built directly from charset-safe converter results / literals, with no
+    # intermediate `lhs = conv(...)` to name the output. Intersected with the sink path and still
+    # guarded by free_taint_reaches below (the all-writes rule in the helper closes the
+    # multi-write / mixed-free cases), so this only ADDS recognitions, never relaxes the guard.
+    safe |= _inline_constrained_results(pseudocode, converters) & path
     if not safe:
         return False
     return not free_taint_reaches(pseudocode, sink_arg, safe_vars=safe)

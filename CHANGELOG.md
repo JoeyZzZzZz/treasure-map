@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The pattern analyzer now records a neutral STRUCTURAL fact on each candidate: whether the
+  function is a thin command-forwarding wrapper (its body does little more than hand one of its
+  own parameters straight to a shell command sink) and which sink it forwards to. Stored on the
+  instance (`is_thin_cmd_wrapper` / `wrapped_sink`, with an in-place atlas migration); it is a
+  fact, not a verdict — no recall, downweight, or review-ordering path reads it this round (it is
+  recorded for a later analysis layer to consume). Conservative under doubt; synthetic fixtures.
+- The charset-constrained-source downweight now also fires on the command-sink path for the
+  inline shape — a command string built directly from a charset-safe converter result
+  (`snprintf(cmd, "...%s", ether_ntoa(x)); system(cmd)`) with no intermediate variable to name
+  the result — matching the buffer-copy path's standard. Recall-neutral by an all-writes rule: a
+  buffer qualifies only when every write to it is a literal or an inline charset-safe converter,
+  so a later free append or a free value mixed into the same builder leaves the candidate at its
+  normal score (never a false downweight).
+
 - Vendor-neutrality enforcement is now wired to actually run, in three layers sharing one
   detection library (`.githooks/lib.sh`): the existing `pre-commit` (scans staged diff content),
   a new `commit-msg` hook (scans the commit message — a model number must not hide there), and a

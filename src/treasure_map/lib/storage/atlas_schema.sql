@@ -38,6 +38,11 @@ CREATE TABLE IF NOT EXISTS instance (
                                           --   locatable when analysis.db is gone. REDACT ON EXPORT.
     binary_content_hash TEXT,             -- content hash of that binary (content-identity); auto-filled,
                                           --   stored only this round (no metric consumes it yet). REDACT ON EXPORT.
+    -- Neutral STRUCTURAL fact: the function is a thin wrapper forwarding a parameter to a shell
+    --   command sink, and which sink it forwards to. Recorded for a later analysis layer; NO
+    --   recall/downweight/triage path reads these (a fact, not a verdict or a score input).
+    is_thin_cmd_wrapper INTEGER NOT NULL DEFAULT 0 CHECK (is_thin_cmd_wrapper IN (0,1)),
+    wrapped_sink        TEXT,
     -- origin is not forced at ingest; default unknown is expected (refined later at aggregation)
     origin              TEXT NOT NULL DEFAULT 'unknown'
         CHECK (origin IN ('custom','vendor_modified_oss','stock_oss_known','unknown')),

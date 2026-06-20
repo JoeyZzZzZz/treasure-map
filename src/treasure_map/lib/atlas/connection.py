@@ -44,6 +44,20 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE instance ADD COLUMN binary_path TEXT")
     if inst_cols and "binary_content_hash" not in inst_cols:
         conn.execute("ALTER TABLE instance ADD COLUMN binary_content_hash TEXT")
+    # Neutral structural fact (added this round): thin command-forwarding wrapper + the sink it
+    # forwards to. Existing rows take the default 0 / NULL until re-hunted. Idempotent.
+    if inst_cols and "is_thin_cmd_wrapper" not in inst_cols:
+        try:
+            conn.execute(
+                "ALTER TABLE instance ADD COLUMN is_thin_cmd_wrapper INTEGER NOT NULL "
+                "DEFAULT 0 CHECK (is_thin_cmd_wrapper IN (0,1))"
+            )
+        except sqlite3.OperationalError:
+            conn.execute(
+                "ALTER TABLE instance ADD COLUMN is_thin_cmd_wrapper INTEGER NOT NULL DEFAULT 0"
+            )
+    if inst_cols and "wrapped_sink" not in inst_cols:
+        conn.execute("ALTER TABLE instance ADD COLUMN wrapped_sink TEXT")
 
     pat_cols = _column_names(conn, "pattern")
     if "recurrence_breadth" in pat_cols and "device_spread" not in pat_cols:
@@ -60,9 +74,10 @@ def open_atlas(db_path: Path) -> sqlite3.Connection:
 
     The schema uses IF NOT EXISTS throughout, so re-applying it to an existing database is
     safe and preserves all rows. An older atlas is then brought forward in place by _migrate
-    (adds instance.origin / binary_path / binary_content_hash, renames
-    pattern.recurrence_breadth -> device_spread, drops legacy pattern.device_category) — never by
-    a table rebuild, so instance rows and all derived counts are kept.
+    (adds instance.origin / binary_path / binary_content_hash / is_thin_cmd_wrapper /
+    wrapped_sink, renames pattern.recurrence_breadth -> device_spread, drops legacy
+    pattern.device_category) — never by a table rebuild, so instance rows and all derived counts
+    are kept.
 
     WARNING: Moving atlas.db requires sqlite3 .backup() or wal_checkpoint(TRUNCATE)
     before any file-copy — never a bare cp while WAL side-files exist.
