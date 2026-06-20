@@ -181,25 +181,52 @@ def _is_charset_benign(text: str, converters: frozenset[str]) -> bool:
     return bool(_LITERAL_ARG_RE.match(text.strip())) or _is_converter_call(text, converters)
 
 
+def _names_var(text: str, names: set[str]) -> bool:
+    """True when ``text`` is a bare reference to a variable in ``names`` (optional cast / & / *),
+    and NOT a call. Distinguishes `buf_a` (a copied-in value) from `conv(buf_a)` (a call)."""
+    if not names:
+        return False
+    m = re.match(r"^[&*]?\s*(?:\([^)]*\)\s*)?([A-Za-z_]\w*)\s*$", text.strip())
+    return m is not None and m.group(1) in names
+
+
+# Bounded string-copy callees that move a value into their FIRST-argument buffer but are NOT in
+# the global COPY set the taint graph uses. Recognizing them HERE — only to grow the charset-safe
+# set under the all-writes rule + the free_taint_reaches guard — lets a one-hop intermediate
+# buffer be recognized even when the global taint graph does not track the copy callee (e.g.
+# strlcpy breaks the dependency edge). Never used for recall, shape detection, or grading.
+_CHARSET_COPY_EXTRA: frozenset[str] = frozenset({"strlcpy", "strlcat", "stpcpy", "stpncpy"})
+
+# One converter round + ONE intermediate-buffer hop (conv -> buf -> sink). The chain is capped at
+# a single intermediate variable on purpose: a longer chain (conv -> buf1 -> buf2 -> sink) is a
+# known blind spot — the structured flow evidence records it as untraced rather than the recognizer
+# silently following it. (The free-value guard below still applies at every depth, so recall is
+# never reduced regardless of the cap.)
+_CHARSET_CHAIN_ROUNDS = 2
+
+
 def _inline_constrained_results(pseudocode: str, converters: frozenset[str]) -> set[str]:
-    """Variables built ONLY from charset-safe converter results / literals, where the converter
-    result is passed inline (never bound to its own `lhs = conv(...)` variable).
+    """Variables built ONLY from charset-safe converter results / literals — including one hop
+    through an intermediate buffer — where the converter result is not bound to its own
+    `lhs = conv(...)` variable.
 
-    Handles the common command-building shape `snprintf(c,"...%s",ether_ntoa(x)); system(c)`,
-    which `_constrained_results` misses because there is no intermediate assignment to name the
-    converter output. Recall-safe by an all-writes rule: a variable qualifies ONLY when EVERY
-    write to it (format/copy builder destination OR plain assignment) is charset-benign AND at
-    least one write involves a converter. So a later free write — `strcat(c, user_input)` — or a
-    free value mixed into the same builder — `snprintf(c,"%s %s",ether_ntoa(x),raw)` — disqualifies
-    the variable, leaving the candidate at its normal score (never a false downweight)."""
-    builders = FORMAT | COPY
-    all_benign: dict[str, bool] = {}
-    has_converter: dict[str, bool] = {}
+    Handles `snprintf(c,"...%s",ether_ntoa(x)); system(c)` (inline, no intermediate) AND the
+    one-hop intermediate-buffer shape `strncpy(buf,ether_ntoa(x),n); snprintf(c,"...%s",buf);
+    system(c)` (the value laundered through a bounded copy before the command builder), even when
+    the copy callee is one the global taint graph does not track.
 
-    def _note(var: str, benign: bool, converter: bool) -> None:
-        all_benign[var] = all_benign.get(var, True) and benign
-        has_converter[var] = has_converter.get(var, False) or converter
-
+    Recall-safe by an all-writes rule applied at EVERY level: a variable qualifies ONLY when each
+    write to it (a format/copy builder destination or a plain assignment) is a literal, an inline
+    charset-safe converter, or a copy from an already-qualified variable — AND its lineage involves
+    a converter. So a later free write (`strcat(c,user)`), a free value mixed into the same builder
+    (`snprintf(c,"%s %s",ether_ntoa(x),raw)`), or a free seed feeding the intermediate buffer
+    (`strncpy(buf,nvram_get(0),n)`) disqualifies the variable. The propagation is capped at one
+    intermediate hop; a deeper chain is left unrecognized (a blind spot), never followed silently.
+    The free_taint_reaches guard in the caller still applies at every depth."""
+    builders = FORMAT | COPY | _CHARSET_COPY_EXTRA
+    # Collect every write once: (destination, [value-arg, ...]). Builder destinations are the
+    # first argument; a plain assignment's single "value arg" is its RHS.
+    writes: list[tuple[str, list[str]]] = []
     for stmt in re.split(r"[;\n{}]", pseudocode):
         for name in {m.group(1) for m in _CALL_RE_HEAD.finditer(stmt)} & builders:
             args = _call_arglist(stmt, name)
@@ -211,16 +238,30 @@ def _inline_constrained_results(pseudocode: str, converters: frozenset[str]) -> 
             dst_ident = _IDENT_RE.search(parts[0])
             if dst_ident is None:
                 continue
-            value_args = parts[1:]
-            benign = all(_is_charset_benign(a, converters) for a in value_args)
-            converter = any(_is_converter_call(a, converters) for a in value_args)
-            _note(dst_ident.group(0), benign, converter)
+            writes.append((dst_ident.group(0), parts[1:]))
         assign = re.match(r"\s*[^=]*?\b([A-Za-z_]\w*)\s*=\s*(?!=)(.*)", stmt)
         if assign is not None:
-            lhs, rhs = assign.group(1), assign.group(2)
-            _note(lhs, _is_charset_benign(rhs, converters), _is_converter_call(rhs, converters))
+            writes.append((assign.group(1), [assign.group(2)]))
 
-    return {var for var, benign in all_benign.items() if benign and has_converter.get(var)}
+    qualified: set[str] = set()
+    for _ in range(_CHARSET_CHAIN_ROUNDS):
+        all_benign: dict[str, bool] = {}
+        has_converter: dict[str, bool] = {}
+        for dst, value_args in writes:
+            benign = True
+            converter = False
+            for arg in value_args:
+                if _is_converter_call(arg, converters) or _names_var(arg, qualified):
+                    converter = True  # a converter, or a value copied from an already-safe var
+                elif not _is_charset_benign(arg, converters):
+                    benign = False
+            all_benign[dst] = all_benign.get(dst, True) and benign
+            has_converter[dst] = has_converter.get(dst, False) or converter
+        new_qualified = {v for v, ok in all_benign.items() if ok and has_converter.get(v)}
+        if new_qualified == qualified:
+            break
+        qualified = new_qualified
+    return qualified
 
 
 def _value_is_constrained(pseudocode: str, sink_arg: str, converters: frozenset[str]) -> bool:

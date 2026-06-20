@@ -31,6 +31,7 @@ from treasure_map.lib.atlas.models import InstanceRow
 from treasure_map.lib.atlas.writer import add_instance, delete_run_instances, upsert_pattern
 from treasure_map.lib.diff.loader import FuncRow, load_functions
 from treasure_map.lib.hunt.downweight import detect_form_signal, library_origin
+from treasure_map.lib.hunt.evidence import EntryIndex, build_flow_evidence, load_entry_index
 from treasure_map.lib.hunt.facts import is_thin_cmd_wrapper
 from treasure_map.lib.pattern import scan
 from treasure_map.lib.pattern.classes import CMD, COPY, FORMAT
@@ -60,6 +61,17 @@ def _load_caller_ids(db_path: Path | str) -> dict[int, list[int]]:
     for callee_id, caller_id in rows:
         callers.setdefault(int(callee_id), []).append(int(caller_id))
     return callers
+
+
+def _load_entry_index(db_path: Path | str) -> EntryIndex:
+    """Load the rootfs entry-evidence index (L0.5 script_calls / web_endpoints) once, read-only."""
+    uri = f"file:{Path(db_path)}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        return load_entry_index(conn)
+    finally:
+        conn.close()
 
 
 _SINK_CLASS_MEMBERS: dict[str, frozenset[str]] = {"cmd": CMD, "copy": COPY, "format": FORMAT}
@@ -121,6 +133,7 @@ def run_analyzer2(
     result = scan(db_path)
     funcs: dict[int, FuncRow] = {f.func_id: f for f in load_functions(db_path)}
     callers_of = _load_caller_ids(db_path)
+    entry_index = _load_entry_index(db_path)
 
     by_status = {"confirmed": 0, "blocked": 0, "unknown": 0}
     instances_written = 0
@@ -186,6 +199,23 @@ def run_analyzer2(
                 # this candidate's recall nor its review-ordering rank.
                 thin_wrapper, wrapped_sink = is_thin_cmd_wrapper(row.pseudocode, callees)
 
+                # Structured flow EVIDENCE for command-sink candidates (the partition L3 is about):
+                # source classification, one-hop value flow, sanitizer presence (coverage=unjudged),
+                # rootfs entry sites, and the honest trace boundary. Material for a later agent —
+                # NOT a verdict; nothing here reads it back into recall, the score, or the grade.
+                flow_evidence: str | None = None
+                if match.sink_class == "cmd":
+                    sites = entry_index.sites_for(row.binary_name, row.binary_path)
+                    flow_evidence = json.dumps(
+                        build_flow_evidence(
+                            pseudocode=row.pseudocode,
+                            callees=callees,
+                            sink_arg=sink_arg,
+                            entry_sites=sites,
+                        ),
+                        sort_keys=True,
+                    )
+
                 provenance = "L1" if status in {"confirmed", "blocked"} else "L0"
                 pattern_id = upsert_pattern(
                     atlas,
@@ -224,6 +254,7 @@ def run_analyzer2(
                         origin=origin,
                         is_thin_cmd_wrapper=thin_wrapper,
                         wrapped_sink=wrapped_sink,
+                        flow_evidence=flow_evidence,
                     ),
                     commit=False,
                 )

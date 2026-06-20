@@ -58,6 +58,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
             )
     if inst_cols and "wrapped_sink" not in inst_cols:
         conn.execute("ALTER TABLE instance ADD COLUMN wrapped_sink TEXT")
+    # Structured flow evidence (added this round): nullable JSON TEXT; existing rows carry NULL
+    # until re-hunted. Idempotent — runs only while the column is missing.
+    if inst_cols and "flow_evidence" not in inst_cols:
+        conn.execute("ALTER TABLE instance ADD COLUMN flow_evidence TEXT")
 
     pat_cols = _column_names(conn, "pattern")
     if "recurrence_breadth" in pat_cols and "device_spread" not in pat_cols:
@@ -75,9 +79,9 @@ def open_atlas(db_path: Path) -> sqlite3.Connection:
     The schema uses IF NOT EXISTS throughout, so re-applying it to an existing database is
     safe and preserves all rows. An older atlas is then brought forward in place by _migrate
     (adds instance.origin / binary_path / binary_content_hash / is_thin_cmd_wrapper /
-    wrapped_sink, renames pattern.recurrence_breadth -> device_spread, drops legacy
-    pattern.device_category) — never by a table rebuild, so instance rows and all derived counts
-    are kept.
+    wrapped_sink / flow_evidence, renames pattern.recurrence_breadth -> device_spread, drops
+    legacy pattern.device_category) — never by a table rebuild, so instance rows and all derived
+    counts are kept.
 
     WARNING: Moving atlas.db requires sqlite3 .backup() or wal_checkpoint(TRUNCATE)
     before any file-copy — never a bare cp while WAL side-files exist.

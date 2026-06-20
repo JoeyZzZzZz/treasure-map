@@ -43,6 +43,11 @@ CREATE TABLE IF NOT EXISTS instance (
     --   recall/downweight/triage path reads these (a fact, not a verdict or a score input).
     is_thin_cmd_wrapper INTEGER NOT NULL DEFAULT 0 CHECK (is_thin_cmd_wrapper IN (0,1)),
     wrapped_sink        TEXT,
+    -- Structured flow EVIDENCE for a command-sink candidate (JSON: source_kind / flow_path /
+    --   sanitizer_seen[coverage=unjudged] / entry_reach / trace_boundary). Material for a
+    --   downstream agent — NOT a verdict; no recall/score/grade path reads it. May hold neutral
+    --   rootfs paths as private evidence. REDACT ON EXPORT.
+    flow_evidence       TEXT,
     -- origin is not forced at ingest; default unknown is expected (refined later at aggregation)
     origin              TEXT NOT NULL DEFAULT 'unknown'
         CHECK (origin IN ('custom','vendor_modified_oss','stock_oss_known','unknown')),

@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Command-sink candidates now carry structured flow EVIDENCE (`flow_evidence` JSON on the
+  instance, with an in-place atlas migration): `source_kind` (charset_safe / free_string /
+  unknown), `flow_path` (the one-hop value flow, real variables only), `sanitizer_seen` (any
+  sanitizer-shaped call + whether it sits on the sink path, coverage ALWAYS `unjudged`),
+  `entry_reach` (rootfs invocation sites consumed from the L0.5 `script_calls` / `web_endpoints`
+  tables — every site listed; none-found is reported as `unknown`, never "unreachable"), and
+  `trace_boundary` (an honest statement of where the structured trace stopped:
+  reached_sink / one_hop_limit / two_hop_untraced / indirect_call / ipc_global /
+  copy_alias_untraced). It is material for a downstream agent — it states facts and blind spots,
+  never a "sanitized" / "triggerable" verdict, and no recall, review-ordering score, or
+  reachability grade reads it.
+- The charset-constrained-source downweight now also recognizes the value laundered through ONE
+  intermediate buffer (`conv(); strncpy(buf,…); snprintf(cmd,…,buf); system(cmd)`), including
+  bounded copies the global taint graph does not track (e.g. `strlcpy`). Recall-neutral by an
+  all-writes rule applied at every level plus the existing free-value guard, so a free string
+  laundered through the same buffer shape — or a later free append — is never downweighted; the
+  propagation is capped at one hop (a deeper chain is left to the `trace_boundary` evidence).
+
 - The pattern analyzer now records a neutral STRUCTURAL fact on each candidate: whether the
   function is a thin command-forwarding wrapper (its body does little more than hand one of its
   own parameters straight to a shell command sink) and which sink it forwards to. Stored on the

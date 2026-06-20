@@ -424,6 +424,137 @@ def test_buffer_seeded_by_param_then_inline_converter_is_not_downweighted() -> N
     )
 
 
+# ── charset through a ONE-HOP intermediate buffer (factor ②: conv -> buf -> sink) ─────
+#
+# A command built from a value laundered through one intermediate buffer (the realistic
+# `conv(); strncpy(buf,...); snprintf(cmd,...,buf); system(cmd)` shape). Recall-neutral: the
+# all-writes rule + free_taint_reaches still suppress any free value, at any hop.
+
+
+def _charset_via_buffer(copy: str) -> str:
+    return (
+        f"void f(struct ether_addr* x){{ char b[32]; char cmd[128]; char* p=ether_ntoa(x); "
+        f'{copy}(b,p,32); snprintf(cmd,128,"echo %s",b); system(cmd); }}'
+    )
+
+
+def test_charset_via_strncpy_buffer_is_constrained() -> None:
+    assert (
+        detect_form_signal(
+            sink_name="system",
+            pseudocode=_charset_via_buffer("strncpy"),
+            callees=["ether_ntoa", "strncpy", "snprintf", "system"],
+            sink_arg="cmd",
+        )
+        == CHARSET_CONSTRAINED
+    )
+
+
+def test_charset_via_strlcpy_buffer_is_constrained() -> None:
+    # strlcpy is not in the global COPY set (the dependency graph cannot follow it). The one-hop
+    # charset recognizer handles it explicitly, so this realistic shape is now downweighted.
+    assert (
+        detect_form_signal(
+            sink_name="system",
+            pseudocode=_charset_via_buffer("strlcpy"),
+            callees=["ether_ntoa", "strlcpy", "snprintf", "system"],
+            sink_arg="cmd",
+        )
+        == CHARSET_CONSTRAINED
+    )
+
+
+def test_free_source_via_buffer_is_not_downweighted() -> None:
+    # ★ recall-neutral: a free nvram string laundered through the SAME buffer shape must NOT be
+    # downweighted (this is the function-B class — a free string through an intermediate buffer).
+    pc = (
+        "void g(void){ char b[32]; char cmd[128]; char* v=nvram_get(0); "
+        'strlcpy(b,v,32); snprintf(cmd,128,"echo %s",b); system(cmd); }'
+    )
+    assert (
+        detect_form_signal(
+            sink_name="system",
+            pseudocode=pc,
+            callees=["nvram_get", "strlcpy", "snprintf", "system"],
+            sink_arg="cmd",
+        )
+        is None
+    )
+
+
+def test_charset_buffer_with_later_free_append_is_not_downweighted() -> None:
+    # ★ recall-neutral: a charset buffer that later receives a free strcat append is disqualified
+    # by the all-writes rule.
+    pc = (
+        "void f(struct ether_addr* x, char* u){ char b[64]; char cmd[128]; "
+        'strlcpy(b,ether_ntoa(x),32); strcat(b,u); snprintf(cmd,128,"echo %s",b); system(cmd); }'
+    )
+    assert (
+        detect_form_signal(
+            sink_name="system",
+            pseudocode=pc,
+            callees=["ether_ntoa", "strlcpy", "strcat", "snprintf", "system"],
+            sink_arg="cmd",
+        )
+        is None
+    )
+
+
+def test_free_source_two_buffers_deep_is_not_downweighted() -> None:
+    # ★ recall-neutral at depth: a free recv buffer copied through two intermediate buffers still
+    # reaches the command unconstrained -> not downweighted (the guard holds at every hop).
+    pc = (
+        "void f(int fd){ char b1[32]; char b2[32]; char cmd[128]; char raw[64]; recv(fd,raw,64); "
+        'strncpy(b1,raw,32); strncpy(b2,b1,32); snprintf(cmd,128,"echo %s",b2); system(cmd); }'
+    )
+    assert (
+        detect_form_signal(
+            sink_name="system",
+            pseudocode=pc,
+            callees=["recv", "strncpy", "snprintf", "system"],
+            sink_arg="cmd",
+        )
+        is None
+    )
+
+
+# ── factor ⑤: one-hop caller-constant downweight covers the cmd path ──────────────────
+
+
+def test_caller_constant_covers_cmd_sink() -> None:
+    # A function whose sole one-hop caller invokes it with only a string literal -> the cmd sink's
+    # dangerous parameter is a caller constant (downweighted). Confirms cmd-path coverage.
+    pc = "void run(char* param_1){ system(param_1); }"
+    caller = 'void boot(void){ run("/etc/init.d/rcS"); }'
+    assert (
+        detect_form_signal(
+            sink_name="system",
+            pseudocode=pc,
+            callees=["system"],
+            sink_arg="param_1",
+            func_name="run",
+            callers_pseudocode=[caller],
+        )
+        == CALLER_CONSTANT
+    )
+
+
+def test_caller_variable_does_not_make_cmd_caller_constant() -> None:
+    pc = "void run(char* param_1){ system(param_1); }"
+    caller = "void boot(char* v){ run(v); }"
+    assert (
+        detect_form_signal(
+            sink_name="system",
+            pseudocode=pc,
+            callees=["system"],
+            sink_arg="param_1",
+            func_name="run",
+            callers_pseudocode=[caller],
+        )
+        is None
+    )
+
+
 # ── library / symbol recognition (function granularity) ──────────────────────────────
 
 

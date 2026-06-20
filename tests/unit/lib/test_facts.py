@@ -203,13 +203,15 @@ def test_migration_adds_columns_to_legacy_atlas(tmp_path: Path) -> None:
     try:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(instance)").fetchall()}
         row = conn.execute(
-            "SELECT is_thin_cmd_wrapper, wrapped_sink FROM instance WHERE source_run_id='run_old'"
+            "SELECT is_thin_cmd_wrapper, wrapped_sink, flow_evidence FROM instance "
+            "WHERE source_run_id='run_old'"
         ).fetchone()
     finally:
         conn.close()
-    assert {"is_thin_cmd_wrapper", "wrapped_sink"} <= cols
+    assert {"is_thin_cmd_wrapper", "wrapped_sink", "flow_evidence"} <= cols
     assert row["is_thin_cmd_wrapper"] == 0
     assert row["wrapped_sink"] is None
+    assert row["flow_evidence"] is None
 
 
 def test_no_recall_or_score_path_reads_the_fact() -> None:

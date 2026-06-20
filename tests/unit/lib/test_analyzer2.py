@@ -680,6 +680,128 @@ def test_wrapper_fact_does_not_add_candidates(tmp_path: Path) -> None:
     assert stats.instances_written == len(_instances(atlas)) == stats.matches == 1
 
 
+# ── flow evidence (R-L3·B): structured evidence on cmd candidates ─────────────────────
+
+
+def _charset_buffer_cmd_fn(name: str = "arp_run") -> dict[str, object]:
+    # cmd_injection_shape whose command is built from a charset-safe converter laundered through
+    # one intermediate buffer. The copy uses strlcpy (not in the global COPY set) so the function
+    # matches ONLY the command shape, not an overflow/copy shape — so it is a single cmd candidate.
+    body = (
+        f"void {name}(struct ether_addr* mac){{ char b[32]; char* p=ether_ntoa(mac); "
+        f'strlcpy(b,p,32); char cmd[128]; snprintf(cmd,128,"arp -s %s",b); system(cmd); }}'
+    )
+    return {
+        "name": name,
+        "pseudocode": body,
+        "hash": f"h_{name}",
+        "callees": ["ether_ntoa", "strlcpy", "snprintf", "system"],
+    }
+
+
+def _add_script_call(
+    db_path: Path, script_path: str, command: str, line: int, args_pattern: str
+) -> None:
+    # Raw connect (NOT open_db): the analysis schema DROPs script_calls on every apply, so opening
+    # via open_db between inserts would wipe earlier rows. The tables already exist from _make_db.
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO non_binary_files (kind, name, path) VALUES ('shell_script', ?, ?)",
+            (Path(script_path).name, script_path),
+        )
+        fid = conn.execute("SELECT id FROM non_binary_files ORDER BY id DESC LIMIT 1").fetchone()[0]
+        conn.execute(
+            "INSERT INTO script_calls (file_id, command, raw_line, line_number, args_pattern) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (fid, command, f"{command} $X", line, args_pattern),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _evidence_of(atlas_path: Path, fn: str) -> dict:
+    row = _by_anchor(atlas_path)[fn]
+    return json.loads(row["flow_evidence"])
+
+
+def test_cmd_candidate_carries_flow_evidence(tmp_path: Path) -> None:
+    db = _make_db(tmp_path, [{"name": "netd", "funcs": [_charset_buffer_cmd_fn()]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_fe")
+    ev = _evidence_of(atlas, "arp_run")
+    assert set(ev) == {
+        "source_kind",
+        "flow_path",
+        "sanitizer_seen",
+        "entry_reach",
+        "trace_boundary",
+    }
+    assert ev["source_kind"] == "charset_safe"  # laundered through the one-hop buffer
+    # And the candidate is downweighted on the cmd path (one-hop charset, factor ②).
+    assert _by_anchor(atlas)["arp_run"]["blocking_mechanism"] == "charset_constrained"
+
+
+def test_copy_candidate_has_no_flow_evidence(tmp_path: Path) -> None:
+    # Flow evidence is built for the command-sink partition only; a pure copy candidate gets none.
+    fn = {
+        "name": "cp_fn",
+        "pseudocode": (
+            "void cp_fn(char* param_1){ char d[64]; recv(fd,param_1,64); strcpy(d,param_1); }"
+        ),
+        "hash": "h_cp",
+        "callees": ["recv", "strcpy"],
+    }
+    db = _make_db(tmp_path, [{"name": "webd", "funcs": [fn]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_cp")
+    assert _by_anchor(atlas)["cp_fn"]["flow_evidence"] is None
+
+
+def test_flow_evidence_records_entry_sites_from_script_calls(tmp_path: Path) -> None:
+    db = _make_db(tmp_path, [{"name": "netd", "funcs": [_charset_buffer_cmd_fn()]}])
+    _add_script_call(db, "/etc/init.d/netd.sh", "/sbin/netd", 7, "var_expansion")
+    _add_script_call(db, "/etc/init.d/netd.sh", "netd", 19, "literal")
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_er")
+    er = _evidence_of(atlas, "arp_run")["entry_reach"]
+    assert er["status"] == "found"
+    # give-all: both call sites (path form + bare-name form) are listed with their arg source.
+    assert {(s["line"], s["arg_source"]) for s in er["sites"]} == {
+        (7, "var_expansion"),
+        (19, "literal"),
+    }
+
+
+def test_flow_evidence_entry_unknown_when_no_script_calls(tmp_path: Path) -> None:
+    # No invocation found is reported as unknown, NOT unreachable; the candidate is not dropped.
+    db = _make_db(tmp_path, [{"name": "netd", "funcs": [_charset_buffer_cmd_fn()]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_noer")
+    assert _evidence_of(atlas, "arp_run")["entry_reach"]["status"] == "unknown"
+
+
+def test_flow_evidence_survives_source_db_removal(tmp_path: Path) -> None:
+    db = _make_db(tmp_path, [{"name": "netd", "funcs": [_charset_buffer_cmd_fn()]}])
+    _add_script_call(db, "/etc/init.d/netd.sh", "netd", 5, "var_expansion")
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_rm")
+    db.unlink()  # source analysis.db gone — atlas is the persistent store
+    ev = _evidence_of(atlas, "arp_run")
+    assert ev["source_kind"] == "charset_safe"
+    assert ev["entry_reach"]["sites"][0]["line"] == 5
+
+
+def test_flow_evidence_does_not_add_candidates(tmp_path: Path) -> None:
+    # ★ count neutrality: evidence is a field on existing cmd candidates, never a new candidate.
+    db = _make_db(tmp_path, [{"name": "netd", "funcs": [_charset_buffer_cmd_fn()]}])
+    _add_script_call(db, "/etc/init.d/netd.sh", "netd", 5, "literal")
+    atlas = tmp_path / "atlas.db"
+    s1 = run_analyzer2(db, atlas, source_run_id="run_n1")
+    assert s1.instances_written == len(_instances(atlas)) == s1.matches == 1
+
+
 # ── BOUNDARY ────────────────────────────────────────────────────────────────────────
 
 
