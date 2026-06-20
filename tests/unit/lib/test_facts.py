@@ -55,6 +55,22 @@ def test_wrapper_with_a_guard_check_still_thin() -> None:
     assert is_thin_cmd_wrapper(pc, ["system"]) == (True, "system")
 
 
+def test_real_command_shell_with_return_value_parsing_is_thin() -> None:
+    # The real shape that the strict bound of 6 missed: forward system(param) verbatim, THEN parse
+    # the return value (WEXITSTATUS pattern). ~14 statements, all about the result, none building
+    # the argument -> still a thin command wrapper under the 20 bound.
+    pc = (
+        "int run(char* param_1){ uint r; int s; r = system(param_1); "
+        "if (r == 0xffffffff) { return -1; } "
+        "s = r & 0x7f; "
+        "if (s == 0) { s = (r >> 8) & 0xff; return s; } "
+        "if (s == 0x7f) { return -2; } "
+        "if ((s + 1 >> 1) > 0) { return -3; } "
+        "return 0; }"
+    )
+    assert is_thin_cmd_wrapper(pc, ["system"]) == (True, "system")
+
+
 # ── negatives: not a verbatim forward, not thin, or not a shell sink ──────────────────
 
 
@@ -97,7 +113,9 @@ def test_no_command_sink_is_not_wrapper() -> None:
 
 def test_threshold_is_fixed_and_documented() -> None:
     # The thinness bound (N) is a fixed structural threshold, asserted so a change is deliberate.
-    assert _WRAPPER_MAX_STATEMENTS == 6
+    # 20 (raised from 6) admits a real command shell that parses its return value; five-device
+    # measurement confirmed it does not over-label (verbatim-forward ④ is the real bound).
+    assert _WRAPPER_MAX_STATEMENTS == 20
 
 
 # ── persistence: the fact round-trips through the atlas and survives source removal ───

@@ -61,6 +61,11 @@ SOURCE_WEAK: frozenset[str] = frozenset(
         # Generic base64 decoders.
         "b64_decode",
         "base64_decode",
+        # JSON string getters — pull a string/buffer out of a parsed external object (a common
+        # modern IoT request-input path). Only the value GETTERS are sources; the parser
+        # (json_tokener_parse) yields an object, not a final string, and is not listed here.
+        "json_object_get_string",
+        "json_object_get_string_len",
     }
 )
 

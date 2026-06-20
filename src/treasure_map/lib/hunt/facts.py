@@ -44,11 +44,14 @@ _FORWARD_CMD_SINKS: frozenset[str] = frozenset({"system", "popen", "doSystem"})
 _BUILDERS: frozenset[str] = FORMAT | COPY
 
 # N — a thin wrapper does ~one thing. We bound the function by its non-empty statement count
-# (statements split on ; and block braces). Chosen conservatively and FIXED here (and asserted
-# in the tests): a forwarder that also does a few guard checks still qualifies, while a function
-# that does real work (many statements) does not. This is a structural threshold, not a tuned
-# parameter; raising it only admits larger wrappers, it never changes recall of any candidate.
-_WRAPPER_MAX_STATEMENTS = 6
+# (statements split on ; and block braces). FIXED here (and asserted in the tests). 20 (not the
+# original 6) because a real command shell forwards `system(param)` AND then parses the return
+# value (the WEXITSTATUS pattern: `r = system(p); if (r == -1) …; else if ((r & 0x7f) == 0) …`),
+# which is ~14 statements unrelated to whether the argument is forwarded verbatim — the strict 6
+# missed those real shells and recovered nothing. Five-device measurement confirmed 20 does not
+# over-label: real command shells stay single-digit-to-low-teens per firmware (the verbatim-forward
+# judgment ④ is what bounds it, not the statement count). Raising it only admits larger forwarders.
+_WRAPPER_MAX_STATEMENTS = 20
 
 _STMT_SPLIT_RE = re.compile(r"[;\n{}]")
 

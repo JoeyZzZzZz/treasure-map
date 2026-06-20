@@ -75,6 +75,81 @@ def test_source_kind_unknown_when_unresolved() -> None:
     assert _ev(pc, ["helper", "snprintf", "system"])["source_kind"] == "unknown"
 
 
+def test_json_string_getter_is_a_free_source() -> None:
+    # json_object_get_string is now a registered free source (a common modern IoT request path).
+    pc = (
+        "void f(void){ char* s=json_object_get_string(o); char cmd[128]; "
+        'snprintf(cmd,128,"echo %s",s); system(cmd); }'
+    )
+    assert _ev(pc, ["json_object_get_string", "snprintf", "system"])["source_kind"] == "free_string"
+
+
+# ── conservative source_kind for wrapper candidates (free wins; symmetric to charset_maybe) ──
+
+_WRAPPER = {"name": "do_cmd", "wrapped_sink": "system"}
+
+
+def _evw(pc: str, callees: list[str], sink_arg: str):
+    return build_flow_evidence(
+        pseudocode=pc, callees=callees, sink_arg=sink_arg, entry_sites=None, wrapper=_WRAPPER
+    )
+
+
+def test_wrapper_free_source_via_intermediate_is_free_string() -> None:
+    # ★ 0x6b90 shape: json -> intermediate var -> snprintf -> forwarded to wrapper. The free source
+    # is reported as free_string (conservative — do not miss a danger), so it floats high.
+    pc = (
+        "void f(void){ char* s=json_object_get_string(o); char cmd[128]; "
+        'snprintf(cmd,128,"route %s",s); do_cmd(cmd); }'
+    )
+    ev = _evw(pc, ["json_object_get_string", "snprintf", "do_cmd"], "cmd")
+    assert ev["source_kind"] == "free_string"
+    assert ev["flow_path"]["sink_via_wrapper"] is True
+
+
+def test_wrapper_free_source_through_untracked_copy_is_free_string() -> None:
+    # Even when the value runs through a bounded copy the graph cannot follow (strlcpy), a free
+    # source called in the function makes the wrapper candidate free_string (not missed).
+    pc = (
+        "void f(void){ char b[64]; char* s=json_object_get_string(o); strlcpy(b,s,64); do_cmd(b); }"
+    )
+    assert _evw(pc, ["json_object_get_string", "strlcpy", "do_cmd"], "b")["source_kind"] == (
+        "free_string"
+    )
+
+
+def test_wrapper_charset_via_intermediate_is_not_upgraded() -> None:
+    # ★ charset (no free source) through an intermediate stays charset_maybe — the conservative
+    # free rule does not wrongly upgrade a safe converter value.
+    pc = (
+        "void f(struct ether_addr* m){ char b[32]; char* p=ether_ntoa(m); "
+        "strncpy(b,p,32); do_cmd(b); }"
+    )
+    assert _evw(pc, ["ether_ntoa", "strncpy", "do_cmd"], "b")["source_kind"] == "charset_maybe"
+
+
+def test_wrapper_mixed_free_and_charset_is_free_string() -> None:
+    # Free wins over a co-present charset converter (real danger first).
+    pc = (
+        "void f(struct ether_addr* m){ char* s=json_object_get_string(o); char* p=ether_ntoa(m); "
+        'char c[96]; snprintf(c,96,"%s %s",p,s); do_cmd(c); }'
+    )
+    callees = ["json_object_get_string", "ether_ntoa", "snprintf", "do_cmd"]
+    assert _evw(pc, callees, "c")["source_kind"] == "free_string"
+
+
+def test_direct_candidate_charset_via_intermediate_unaffected() -> None:
+    # The conservative free rule is wrapper-only: a DIRECT candidate (no wrapper) keeps the B-fix
+    # behaviour — charset through an intermediate stays charset_maybe.
+    pc = (
+        "void f(struct ether_addr* m){ char b[32]; char* p=ether_ntoa(m); strncpy(b,p,32); "
+        'char cmd[128]; snprintf(cmd,128,"echo %s",b); system(cmd); }'
+    )
+    assert (
+        _ev(pc, ["ether_ntoa", "strncpy", "snprintf", "system"])["source_kind"] == "charset_maybe"
+    )
+
+
 # ── flow_path: real one-hop variables only (no format-literal noise) ─────────────────
 
 

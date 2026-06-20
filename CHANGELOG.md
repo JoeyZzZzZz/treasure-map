@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   command wrapper (factor ①): a function that builds a string and forwards it to a function marked
   `is_thin_cmd_wrapper` — with no command sink among its own callees — becomes a command candidate
   whose sink is the wrapper's `wrapped_sink`. This recovers the recall blind spot where the real
-  `system` lives in a 3-12-instruction forwarding shell, invisible to the direct-callee shape scan.
+  `system` lives in a small forwarding shell, invisible to the direct-callee shape scan.
   Deliberately narrow (the only recall-amplifying step): ONE hop, INTRA-binary, and only for
   functions with no direct command sink of their own; multi-hop, indirect/function-pointer, and
   cross-binary wrappers are not propagated (blind spots left to the agent). New candidates run
@@ -21,8 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the wrapper is downweighted (`const_sink_arg` / `charset_constrained`), so a safe fanout stays
   low while a free / constructed string surfaces high. They are graded unknown / L0 (the sink is
   across a call boundary) and their flow evidence marks `sink_via_wrapper` + the wrapper name and a
-  `reached_sink_via_one_hop_wrapper` boundary. A `wrapper_propagated` stat reports how many were
-  recovered (so an over-broad wrapper judgment surfaces as a count to tighten, not a silent flood).
+  `reached_sink_via_one_hop_wrapper` boundary, and classifies the forwarded value conservatively —
+  a free source present but not fully traceable through intermediate variables is reported
+  `free_string` (do not miss a danger; the mirror of charset's `charset_maybe`). A
+  `wrapper_propagated` stat reports how many were recovered (so an over-broad wrapper judgment
+  surfaces as a count to tighten, not a silent flood). The thin-wrapper bound is 20 statements
+  (a real command shell forwards `system(param)` then parses the return value); five-device
+  measurement confirmed this does not over-label (the verbatim-forward judgment is the real bound).
+- `json_object_get_string` / `json_object_get_string_len` are now recognized as external-input
+  sources (a common modern IoT request-input path), so a command built from a JSON-getter value is
+  classified `free_string` and surfaces high rather than being missed as `unknown`.
 - Command-sink candidates now carry structured flow EVIDENCE (`flow_evidence` JSON on the
   instance, with an in-place atlas migration): `source_kind` (charset_safe / free_string /
   charset_maybe / unknown), `flow_path` (the one-hop value flow, real variables only),

@@ -87,6 +87,9 @@ _RETURN_SOURCES: frozenset[str] = frozenset(
         "get_cgi",
         "b64_decode",
         "base64_decode",
+        # JSON string getters: the returned pointer carries the external value (see classes.py).
+        "json_object_get_string",
+        "json_object_get_string_len",
     }
 )
 

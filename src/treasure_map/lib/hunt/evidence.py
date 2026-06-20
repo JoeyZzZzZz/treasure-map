@@ -36,6 +36,7 @@ from treasure_map.lib.hunt.downweight import (
     _CHARSET_SAFE,
     _charset_inline_constrained,
 )
+from treasure_map.lib.pattern.classes import SOURCE
 from treasure_map.lib.reachability.filters import _is_validator_name
 from treasure_map.lib.reachability.taint import (
     _CALLER_SUPPLIED_RE,
@@ -58,24 +59,39 @@ def _charset_converter_called(pseudocode: str) -> bool:
     return any(re.search(rf"\b{re.escape(c)}\s*\(", pseudocode) for c in _CHARSET_SAFE)
 
 
-def _source_kind(pseudocode: str, sink_arg: str | None) -> str:
+def _free_source_called(pseudocode: str) -> bool:
+    """Existence check: a free-input source (network/env/config/json getter) is CALLED in the
+    function body. NOT a flow claim — used only for the conservative wrapper-candidate fallback."""
+    return any(re.search(rf"\b{re.escape(s)}\s*\(", pseudocode) for s in SOURCE)
+
+
+def _source_kind(pseudocode: str, sink_arg: str | None, *, conservative_free: bool = False) -> str:
     """Classify the source reaching the sink argument (mechanism, not a verdict).
 
     Order matters — a free source wins over a charset converter so a genuinely dangerous candidate
     is never washed into a "maybe safe" lead just because some converter is also called in the
     function:
       charset_safe  — the converter builds the sink argument INLINE (downweighted elsewhere).
-      free_string   — a free source (network/env/config/parameter) reaches the sink argument.
+      free_string   — a free source (network/env/config/json/parameter) reaches the sink argument.
       charset_maybe — NOT inline and NO free source, but a charset-safe converter is called in the
                       function: the value MAY be charset-constrained through an intermediate
                       variable, but it is not value-tracked here — a lead for the agent, not safe.
-      unknown       — none of the above could be established."""
+      unknown       — none of the above could be established.
+
+    ``conservative_free`` (set for wrapper-propagated candidates, where the value reaches the
+    forwarded argument possibly through intermediate variables an intra read cannot fully follow):
+    a free source merely CALLED in the function is enough to classify free_string even when the
+    flow is not fully traced. This is the deliberate, asymmetric "do not miss a danger" direction —
+    the mirror of charset's "do not drop a suspect" (charset_maybe). A free source still wins over a
+    charset converter, so a real free string is never washed into charset_maybe."""
     if sink_arg is None:
         return "unknown"
     if _charset_inline_constrained(pseudocode, sink_arg):
         return "charset_safe"
     if free_taint_reaches(pseudocode, sink_arg, safe_vars=set()):
         return "free_string"
+    if conservative_free and _free_source_called(pseudocode):
+        return "free_string"  # free source present; flow not fully traced -> report, don't miss
     if _charset_converter_called(pseudocode):
         return "charset_maybe"
     return "unknown"
@@ -207,7 +223,9 @@ def build_flow_evidence(
     one hop. ``source_kind`` still classifies the forwarded argument (the dangerous value)."""
     deps = _derives_map(pseudocode)
     path = ({sink_arg} | flows_into(pseudocode, sink_arg)) if sink_arg is not None else set()
-    source_kind = _source_kind(pseudocode, sink_arg)
+    # Wrapper-propagated candidates reach the forwarded argument possibly through intermediate
+    # variables, so a present-but-not-fully-traced free source is reported conservatively.
+    source_kind = _source_kind(pseudocode, sink_arg, conservative_free=wrapper is not None)
     flow_path = _flow_path(pseudocode, sink_arg, deps)
     if wrapper is not None:
         flow_path = {**flow_path, "sink_via_wrapper": True, "wrapper": wrapper}

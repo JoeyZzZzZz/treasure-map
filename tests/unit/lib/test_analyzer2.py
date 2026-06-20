@@ -876,6 +876,38 @@ def test_free_string_via_wrapper_becomes_high_band_candidate(tmp_path: Path) -> 
     assert row["evidence_ref"].endswith("@cmd_via_wrapper")
 
 
+def _json_free_via_wrapper_fn(name: str = "set_wifi") -> dict[str, object]:
+    # The exact 0x6b90 shape: a json string getter -> intermediate var -> snprintf -> wrapper.
+    body = (
+        f"void {name}(void){{ char* s=json_object_get_string(o); char cmd[256]; "
+        f'snprintf(cmd,256,"netctl set %s",s); do_cmd(cmd); }}'
+    )
+    return {
+        "name": name,
+        "pseudocode": body,
+        "hash": f"h_{name}",
+        "callees": ["json_object_get_string", "snprintf", "do_cmd"],
+    }
+
+
+def test_json_free_string_via_wrapper_floats_high(tmp_path: Path) -> None:
+    # ★ D-2 anchor: json external input -> intermediate var -> wrapper -> system. Recovered as a
+    # cmd candidate, classified free_string (json is a source), high band, not downweighted.
+    db = _make_db(
+        tmp_path,
+        [{"name": "netd", "funcs": [_thin_cmd_wrapper_fn(), _json_free_via_wrapper_fn()]}],
+    )
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_json")
+    row = _by_anchor(atlas)["set_wifi"]
+    assert row["blocking_mechanism"] is None  # free string -> not downweighted
+    ev = json.loads(row["flow_evidence"])
+    assert ev["source_kind"] == "free_string"
+    assert ev["flow_path"]["sink_via_wrapper"] is True
+    # high band: above the const/charset safe fanout
+    assert _score_of(atlas, "set_wifi") >= 0.6
+
+
 def test_safe_fanout_to_wrapper_is_suppressed_below_real_concat(tmp_path: Path) -> None:
     # ★ §2.2: the real free-string-via-wrapper outranks the safe fanout (constant / charset
     # argument forwarded to the wrapper), which the existing FP-suppression downweights.
