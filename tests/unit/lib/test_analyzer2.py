@@ -804,6 +804,138 @@ def test_flow_evidence_does_not_add_candidates(tmp_path: Path) -> None:
     assert s1.instances_written == len(_instances(atlas)) == s1.matches == 1
 
 
+# ── factor ① one-hop wrapper propagation (R-L3·A): recover the D-2 blind spot ─────────
+
+
+def _thin_cmd_wrapper_fn(name: str = "do_cmd") -> dict[str, object]:
+    return {
+        "name": name,
+        "pseudocode": f"void {name}(char* param_1){{ system(param_1); }}",
+        "hash": f"h_{name}",
+        "callees": ["system"],
+    }
+
+
+def _free_via_wrapper_fn(name: str = "set_route") -> dict[str, object]:
+    # The D-2 / 0x6b90 shape: builds a free string and forwards it to the thin wrapper — NO direct
+    # command sink among its callees, so the shape scan never surfaces it.
+    body = (
+        f"void {name}(void){{ char* v=nvram_get(0); char cmd[128]; "
+        f'snprintf(cmd,128,"route add %s",v); do_cmd(cmd); }}'
+    )
+    return {
+        "name": name,
+        "pseudocode": body,
+        "hash": f"h_{name}",
+        "callees": ["nvram_get", "snprintf", "do_cmd"],
+    }
+
+
+def _const_via_wrapper_fn(name: str = "reboot_now") -> dict[str, object]:
+    return {
+        "name": name,
+        "pseudocode": f'void {name}(void){{ do_cmd("/sbin/reboot"); }}',
+        "hash": f"h_{name}",
+        "callees": ["do_cmd"],
+    }
+
+
+def _charset_via_wrapper_fn(name: str = "arp_set") -> dict[str, object]:
+    body = (
+        f"void {name}(struct ether_addr* m){{ char c[64]; "
+        f'snprintf(c,64,"arp -s %s",ether_ntoa(m)); do_cmd(c); }}'
+    )
+    return {
+        "name": name,
+        "pseudocode": body,
+        "hash": f"h_{name}",
+        "callees": ["snprintf", "ether_ntoa", "do_cmd"],
+    }
+
+
+def test_free_string_via_wrapper_becomes_high_band_candidate(tmp_path: Path) -> None:
+    # ★ D-2 target: a function whose sink hides in a thin wrapper becomes a cmd candidate, with
+    # evidence noting the one-hop wrapper, and floats to the high band (free string, no downweight).
+    db = _make_db(
+        tmp_path,
+        [{"name": "netd", "funcs": [_thin_cmd_wrapper_fn(), _free_via_wrapper_fn()]}],
+    )
+    atlas = tmp_path / "atlas.db"
+    stats = run_analyzer2(db, atlas, source_run_id="run_a")
+    assert stats.wrapper_propagated == 1
+
+    row = _by_anchor(atlas)["set_route"]
+    assert row["sink_anchor"] == "system"  # the real sink, reached via the wrapper
+    assert row["provenance_level"] == "L0"  # cross-function: not graded, honest
+    assert row["blocking_mechanism"] is None  # free string -> not downweighted
+    ev = json.loads(row["flow_evidence"])
+    assert ev["source_kind"] == "free_string"
+    assert ev["flow_path"]["sink_via_wrapper"] is True
+    assert ev["flow_path"]["wrapper"]["name"] == "do_cmd"
+    assert ev["trace_boundary"] == "reached_sink_via_one_hop_wrapper"
+    assert row["evidence_ref"].endswith("@cmd_via_wrapper")
+
+
+def test_safe_fanout_to_wrapper_is_suppressed_below_real_concat(tmp_path: Path) -> None:
+    # ★ §2.2: the real free-string-via-wrapper outranks the safe fanout (constant / charset
+    # argument forwarded to the wrapper), which the existing FP-suppression downweights.
+    db = _make_db(
+        tmp_path,
+        [
+            {
+                "name": "netd",
+                "funcs": [
+                    _thin_cmd_wrapper_fn(),
+                    _free_via_wrapper_fn(),
+                    _const_via_wrapper_fn(),
+                    _charset_via_wrapper_fn(),
+                ],
+            }
+        ],
+    )
+    atlas = tmp_path / "atlas.db"
+    stats = run_analyzer2(db, atlas, source_run_id="run_b")
+    assert stats.wrapper_propagated == 3  # the three callers; the wrapper itself is a direct match
+
+    rows = _by_anchor(atlas)
+    assert rows["reboot_now"]["blocking_mechanism"] == "const_sink_arg"
+    assert rows["arp_set"]["blocking_mechanism"] == "charset_constrained"
+    # the real concat outranks both safe-fanout candidates
+    assert _score_of(atlas, "set_route") > _score_of(atlas, "reboot_now")
+    assert _score_of(atlas, "set_route") > _score_of(atlas, "arp_set")
+
+
+def test_wrapper_itself_kept_as_distinct_bare_sink_candidate(tmp_path: Path) -> None:
+    # No double counting: the wrapper is its own bare_sink candidate (@cmd); the caller is the
+    # wrapper-recovered candidate (@cmd_via_wrapper). Two distinct instances.
+    db = _make_db(
+        tmp_path,
+        [{"name": "netd", "funcs": [_thin_cmd_wrapper_fn(), _free_via_wrapper_fn()]}],
+    )
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_c")
+    rows = _by_anchor(atlas)
+    assert rows["do_cmd"]["blocking_mechanism"] == "bare_sink"
+    assert rows["do_cmd"]["evidence_ref"].endswith("@cmd")
+    assert rows["set_route"]["evidence_ref"].endswith("@cmd_via_wrapper")
+    refs = [r["evidence_ref"] for r in _instances(atlas)]
+    assert len(set(refs)) == len(refs)  # unique
+
+
+def test_wrapper_propagation_is_deterministic(tmp_path: Path) -> None:
+    funcs = [_thin_cmd_wrapper_fn(), _free_via_wrapper_fn(), _charset_via_wrapper_fn()]
+    db = _make_db(tmp_path, [{"name": "netd", "funcs": funcs}])
+    a1 = tmp_path / "a1.db"
+    a2 = tmp_path / "a2.db"
+    run_analyzer2(db, a1, source_run_id="r")
+    run_analyzer2(db, a2, source_run_id="r")
+
+    def _ev_by_fn(atlas: Path) -> dict[str, str]:
+        return {r["source_anchor"]: (r["flow_evidence"] or "") for r in _instances(atlas)}
+
+    assert _ev_by_fn(a1) == _ev_by_fn(a2)
+
+
 # ── BOUNDARY ────────────────────────────────────────────────────────────────────────
 
 

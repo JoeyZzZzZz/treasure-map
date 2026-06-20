@@ -373,3 +373,24 @@ def detect_form_signal(
     if _exec_is_no_shell(callees, pseudocode):
         return NO_SHELL_EXEC
     return None
+
+
+def wrapper_propagation_form_note(
+    pseudocode: str, wrapper_name: str, sink_arg: str | None
+) -> str | None:
+    """Form note for a wrapper-propagated command candidate (factor ①).
+
+    The candidate's dangerous value is the argument the function forwards to a thin command
+    wrapper, so the WRAPPER CALL stands in for the sink (its first argument is the forwarded
+    command). The same FP-suppression as a direct sink applies, so a safe fanout — a function that
+    just hands the wrapper a constant or a charset-constrained value — is downweighted and does not
+    crowd the high band: a literal forwarded to the wrapper is a constant command; a numeric- or
+    inline-charset-constrained argument cannot carry shell syntax. Returns None (no downweight) when
+    the forwarded value is a free / constructed string — the real lead this recall step recovers."""
+    if re.search(rf'\b{re.escape(wrapper_name)}\s*\(\s*"', pseudocode):
+        return CONST_SINK_ARG
+    if sink_arg is not None and _value_is_constrained(pseudocode, sink_arg, _NUMERIC_VALIDATORS):
+        return NUMERIC_SANITIZED
+    if sink_arg is not None and _charset_inline_constrained(pseudocode, sink_arg):
+        return CHARSET_CONSTRAINED
+    return None

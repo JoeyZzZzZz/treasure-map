@@ -192,24 +192,37 @@ def build_flow_evidence(
     callees: list[str],
     sink_arg: str | None,
     entry_sites: list[dict[str, Any]] | None,
+    wrapper: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble the five-field flow evidence for one command-sink candidate (JSON-serializable).
 
     Pure and deterministic. ``entry_sites`` is the rootfs invocation evidence gathered separately
     (see ``find_entry_sites``); None or [] means none was found — reported as ``unknown``, NOT as
-    "unreachable"."""
+    "unreachable".
+
+    ``wrapper`` is set for a factor-① wrapper-propagated candidate (the real sink is one hop away
+    inside a thin wrapper): it carries the wrapper's name + wrapped_sink, and here ``sink_arg`` is
+    the argument the function forwards to that wrapper. When set, flow_path marks the wrapper hop
+    and trace_boundary states `reached_sink_via_one_hop_wrapper` — honest about following exactly
+    one hop. ``source_kind`` still classifies the forwarded argument (the dangerous value)."""
     deps = _derives_map(pseudocode)
     path = ({sink_arg} | flows_into(pseudocode, sink_arg)) if sink_arg is not None else set()
     source_kind = _source_kind(pseudocode, sink_arg)
+    flow_path = _flow_path(pseudocode, sink_arg, deps)
+    if wrapper is not None:
+        flow_path = {**flow_path, "sink_via_wrapper": True, "wrapper": wrapper}
+        trace_boundary = "reached_sink_via_one_hop_wrapper"
+    else:
+        trace_boundary = _trace_boundary(pseudocode, sink_arg, source_kind, deps)
     return {
         "source_kind": source_kind,
-        "flow_path": _flow_path(pseudocode, sink_arg, deps),
+        "flow_path": flow_path,
         "sanitizer_seen": _sanitizer_seen(callees, pseudocode, path),
         "entry_reach": {
             "status": "found" if entry_sites else "unknown",
             "sites": entry_sites or [],
         },
-        "trace_boundary": _trace_boundary(pseudocode, sink_arg, source_kind, deps),
+        "trace_boundary": trace_boundary,
     }
 
 

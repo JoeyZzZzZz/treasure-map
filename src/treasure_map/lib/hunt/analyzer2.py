@@ -20,6 +20,7 @@ Discipline (same as A1, enforced here and by the schema):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import sqlite3
@@ -30,9 +31,16 @@ from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import InstanceRow
 from treasure_map.lib.atlas.writer import add_instance, delete_run_instances, upsert_pattern
 from treasure_map.lib.diff.loader import FuncRow, load_functions
-from treasure_map.lib.hunt.downweight import detect_form_signal, library_origin
+from treasure_map.lib.hunt.downweight import (
+    detect_form_signal,
+    library_origin,
+    wrapper_propagation_form_note,
+)
 from treasure_map.lib.hunt.evidence import EntryIndex, build_flow_evidence, load_entry_index
 from treasure_map.lib.hunt.facts import is_thin_cmd_wrapper
+from treasure_map.lib.hunt.wrapper_propagation import (
+    find_wrapper_propagated_candidates,
+)
 from treasure_map.lib.pattern import scan
 from treasure_map.lib.pattern.classes import CMD, COPY, FORMAT
 from treasure_map.lib.reachability import grade_candidate
@@ -89,6 +97,29 @@ class Analyzer2Stats:
     instances_written: int  # graded instances persisted into the atlas
     by_status: dict[str, int]  # reachability_status -> count, over written instances
     oss_excluded: int  # distinct OSS/third-party binaries R-pattern excluded
+    wrapper_propagated: int = 0  # cmd candidates recovered via one-hop thin-wrapper propagation
+
+
+def _load_known_components(db_path: Path | str) -> set[str]:
+    """The OSS-binary name set (components-table membership) the shape scan also excludes."""
+    uri = f"file:{Path(db_path)}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT b.name FROM components c JOIN binaries b ON b.id = c.binary_id"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return set()
+    finally:
+        conn.close()
+    return {r[0] for r in rows}
+
+
+def _wrapper_fingerprint(source_class: str, wrapped_sink: str) -> str:
+    """Deterministic coarse fingerprint for the wrapper-propagated cmd shape (one per
+    source_class + wrapped sink), distinct from the rich call-sequence fingerprints."""
+    basis = f"wrapper-cmd|{source_class}|{wrapped_sink}"
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
 
 
 def _sink_name_for(callees: list[str], sink_class: str) -> str | None:
@@ -131,12 +162,19 @@ def run_analyzer2(
     evidence is never persisted.
     """
     result = scan(db_path)
-    funcs: dict[int, FuncRow] = {f.func_id: f for f in load_functions(db_path)}
+    all_funcs = load_functions(db_path)
+    funcs: dict[int, FuncRow] = {f.func_id: f for f in all_funcs}
     callers_of = _load_caller_ids(db_path)
     entry_index = _load_entry_index(db_path)
+    # Factor ① (recall): functions whose only command sink is reached one hop through a thin
+    # wrapper — invisible to the shape scan (no command sink among their own callees).
+    wrapper_candidates = find_wrapper_propagated_candidates(
+        all_funcs, _load_known_components(db_path)
+    )
 
     by_status = {"confirmed": 0, "blocked": 0, "unknown": 0}
     instances_written = 0
+    wrapper_propagated = 0
 
     atlas = open_atlas(Path(atlas_path))
     try:
@@ -260,6 +298,64 @@ def run_analyzer2(
                 )
                 instances_written += 1
                 by_status[status] += 1
+
+            # ── Factor ① recall pass: one-hop thin-wrapper propagation ──────────────────
+            # A function whose command sink hides inside a thin wrapper it calls becomes a cmd
+            # candidate here (the shape scan could not see the sink among its own callees). The
+            # candidate is graded "unknown"/L0 — the real sink is across a call boundary, so an
+            # intra-procedural confirmation does not hold; the wrapper hop is stated in evidence.
+            # New candidates run through the SAME FP-suppression (a constant / charset-constrained
+            # argument forwarded to the wrapper is downweighted) so a safe fanout stays low.
+            for wc in wrapper_candidates:
+                f = wc.func
+                f_pseudocode = f.pseudocode or ""
+                f_callees = _parse_callees(f.callees)
+                sink_arg = locate_sink_arg(f_pseudocode, wc.wrapper_name)
+                blocking = wrapper_propagation_form_note(f_pseudocode, wc.wrapper_name, sink_arg)
+                evidence = build_flow_evidence(
+                    pseudocode=f_pseudocode,
+                    callees=f_callees,
+                    sink_arg=sink_arg,
+                    entry_sites=entry_index.sites_for(f.binary_name, f.binary_path),
+                    wrapper={"name": wc.wrapper_name, "wrapped_sink": wc.wrapped_sink},
+                )
+                source_class = (
+                    "external_input" if evidence["source_kind"] == "free_string" else ("unknown")
+                )
+                pattern_id = upsert_pattern(
+                    atlas,
+                    source_class=source_class,
+                    sink_class="cmd",
+                    call_sequence_shape=f"wrapper-cmd:{wc.wrapped_sink}",
+                    structural_fingerprint=_wrapper_fingerprint(source_class, wc.wrapped_sink),
+                    fingerprint_algo_version="callseq-v1",
+                    commit=False,
+                )
+                add_instance(
+                    atlas,
+                    InstanceRow(
+                        pattern_id=pattern_id,
+                        pseudocode_hash=f.pseudocode_hash,
+                        source_anchor=f.name,
+                        sink_anchor=wc.wrapped_sink,  # the real sink, one hop via the wrapper
+                        source_run_id=source_run_id,
+                        reachability_status="unknown",
+                        blocking_mechanism=blocking,
+                        provenance_level="L0",
+                        # Distinct suffix so a function that is ALSO a direct candidate (it is not,
+                        # by construction) never collides; this is the wrapper-recovered instance.
+                        evidence_ref=f"{source_run_id}#fn{f.func_id}@cmd_via_wrapper",
+                        binary_path=f.binary_path or f.binary_name,
+                        binary_content_hash=f.binary_sha256,
+                        scope_origin="intra",
+                        origin=library_origin(f.name) or "unknown",
+                        flow_evidence=json.dumps(evidence, sort_keys=True),
+                    ),
+                    commit=False,
+                )
+                instances_written += 1
+                wrapper_propagated += 1
+                by_status["unknown"] += 1
     finally:
         atlas.close()
 
@@ -269,4 +365,5 @@ def run_analyzer2(
         instances_written=instances_written,
         by_status=by_status,
         oss_excluded=result.stats.oss_binaries_excluded,
+        wrapper_propagated=wrapper_propagated,
     )
