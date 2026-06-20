@@ -259,9 +259,10 @@ def test_external_input_flowing_into_sink_arg_is_not_downweighted() -> None:
 # ── safe-charset-constrained source (②: ether_ntoa / inet_ntop / base64) ───────────────
 
 
-def test_ether_ntoa_constrained_value_is_charset_constrained() -> None:
-    # The value reaching the sink is a MAC address rendered by ether_ntoa -> constrained to a safe
-    # character set (hex + ':'), so it cannot carry shell syntax even via the %s command format.
+def test_ether_ntoa_via_intermediate_variable_is_not_downweighted() -> None:
+    # Charset is INLINE-ONLY: once the converter result is bound to an intermediate variable (s)
+    # before the command builder, the value is no longer value-tracked here -> NOT downweighted
+    # (the evidence layer marks it charset_maybe instead). Retracted from the prep behaviour.
     pc = (
         "void f(struct ether_addr* mac){ char* s = ether_ntoa(mac); char c[64]; "
         'snprintf(c,64,"arp -s %s",s); system(c); }'
@@ -273,7 +274,7 @@ def test_ether_ntoa_constrained_value_is_charset_constrained() -> None:
             callees=["ether_ntoa", "snprintf", "system"],
             sink_arg="c",
         )
-        == CHARSET_CONSTRAINED
+        is None
     )
 
 
@@ -424,11 +425,11 @@ def test_buffer_seeded_by_param_then_inline_converter_is_not_downweighted() -> N
     )
 
 
-# ── charset through a ONE-HOP intermediate buffer (factor ②: conv -> buf -> sink) ─────
+# ── charset is INLINE-ONLY: a value through an intermediate buffer is NOT downweighted ─
 #
-# A command built from a value laundered through one intermediate buffer (the realistic
-# `conv(); strncpy(buf,...); snprintf(cmd,...,buf); system(cmd)` shape). Recall-neutral: the
-# all-writes rule + free_taint_reaches still suppress any free value, at any hop.
+# The retraction: charset recognition does not value-track through any intermediate variable
+# (no one-hop, no two-hop). A command built from a converter laundered through a buffer is left
+# at its normal score and surfaced to the agent as `charset_maybe` (see test_evidence.py).
 
 
 def _charset_via_buffer(copy: str) -> str:
@@ -438,7 +439,9 @@ def _charset_via_buffer(copy: str) -> str:
     )
 
 
-def test_charset_via_strncpy_buffer_is_constrained() -> None:
+def test_charset_via_strncpy_buffer_is_not_downweighted() -> None:
+    # Intermediate buffer (strncpy) -> the converter no longer reaches the sink inline -> NOT
+    # downweighted (retracted from the brief one-hop-chaining behaviour).
     assert (
         detect_form_signal(
             sink_name="system",
@@ -446,13 +449,11 @@ def test_charset_via_strncpy_buffer_is_constrained() -> None:
             callees=["ether_ntoa", "strncpy", "snprintf", "system"],
             sink_arg="cmd",
         )
-        == CHARSET_CONSTRAINED
+        is None
     )
 
 
-def test_charset_via_strlcpy_buffer_is_constrained() -> None:
-    # strlcpy is not in the global COPY set (the dependency graph cannot follow it). The one-hop
-    # charset recognizer handles it explicitly, so this realistic shape is now downweighted.
+def test_charset_via_strlcpy_buffer_is_not_downweighted() -> None:
     assert (
         detect_form_signal(
             sink_name="system",
@@ -460,7 +461,7 @@ def test_charset_via_strlcpy_buffer_is_constrained() -> None:
             callees=["ether_ntoa", "strlcpy", "snprintf", "system"],
             sink_arg="cmd",
         )
-        == CHARSET_CONSTRAINED
+        is None
     )
 
 

@@ -738,9 +738,11 @@ def test_cmd_candidate_carries_flow_evidence(tmp_path: Path) -> None:
         "entry_reach",
         "trace_boundary",
     }
-    assert ev["source_kind"] == "charset_safe"  # laundered through the one-hop buffer
-    # And the candidate is downweighted on the cmd path (one-hop charset, factor ②).
-    assert _by_anchor(atlas)["arp_run"]["blocking_mechanism"] == "charset_constrained"
+    # The converter is laundered through an intermediate buffer -> charset_maybe (a lead for the
+    # agent), with an honest trace boundary -- and NOT downweighted (charset is inline-only).
+    assert ev["source_kind"] == "charset_maybe"
+    assert ev["trace_boundary"] == "charset_via_intermediate_untraced"
+    assert _by_anchor(atlas)["arp_run"]["blocking_mechanism"] != "charset_constrained"
 
 
 def test_copy_candidate_has_no_flow_evidence(tmp_path: Path) -> None:
@@ -789,7 +791,7 @@ def test_flow_evidence_survives_source_db_removal(tmp_path: Path) -> None:
     run_analyzer2(db, atlas, source_run_id="run_rm")
     db.unlink()  # source analysis.db gone — atlas is the persistent store
     ev = _evidence_of(atlas, "arp_run")
-    assert ev["source_kind"] == "charset_safe"
+    assert ev["source_kind"] == "charset_maybe"
     assert ev["entry_reach"]["sites"][0]["line"] == 5
 
 

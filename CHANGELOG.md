@@ -11,21 +11,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Command-sink candidates now carry structured flow EVIDENCE (`flow_evidence` JSON on the
   instance, with an in-place atlas migration): `source_kind` (charset_safe / free_string /
-  unknown), `flow_path` (the one-hop value flow, real variables only), `sanitizer_seen` (any
-  sanitizer-shaped call + whether it sits on the sink path, coverage ALWAYS `unjudged`),
-  `entry_reach` (rootfs invocation sites consumed from the L0.5 `script_calls` / `web_endpoints`
-  tables — every site listed; none-found is reported as `unknown`, never "unreachable"), and
-  `trace_boundary` (an honest statement of where the structured trace stopped:
-  reached_sink / one_hop_limit / two_hop_untraced / indirect_call / ipc_global /
-  copy_alias_untraced). It is material for a downstream agent — it states facts and blind spots,
-  never a "sanitized" / "triggerable" verdict, and no recall, review-ordering score, or
-  reachability grade reads it.
-- The charset-constrained-source downweight now also recognizes the value laundered through ONE
-  intermediate buffer (`conv(); strncpy(buf,…); snprintf(cmd,…,buf); system(cmd)`), including
-  bounded copies the global taint graph does not track (e.g. `strlcpy`). Recall-neutral by an
-  all-writes rule applied at every level plus the existing free-value guard, so a free string
-  laundered through the same buffer shape — or a later free append — is never downweighted; the
-  propagation is capped at one hop (a deeper chain is left to the `trace_boundary` evidence).
+  charset_maybe / unknown), `flow_path` (the one-hop value flow, real variables only),
+  `sanitizer_seen` (any sanitizer-shaped call + whether it sits on the sink path, coverage ALWAYS
+  `unjudged`), `entry_reach` (rootfs invocation sites consumed from the L0.5 `script_calls` /
+  `web_endpoints` tables — every site listed; none-found is reported as `unknown`, never
+  "unreachable"), and `trace_boundary` (an honest statement of where the structured trace stopped:
+  reached_sink / charset_via_intermediate_untraced / one_hop_limit / two_hop_untraced /
+  indirect_call / ipc_global / copy_alias_untraced). It is material for a downstream agent — it
+  states facts and blind spots, never a "sanitized" / "triggerable" verdict, and no recall,
+  review-ordering score, or reachability grade reads it.
+- The charset-constrained-source downweight is INLINE-ONLY: it fires only when the converter
+  builds the sink argument directly within one expression (`snprintf(cmd,"…%s",ether_ntoa(x))`).
+  A value laundered through any intermediate variable (`conv(); strncpy(buf,…); snprintf(cmd,…,buf)`)
+  is deliberately NOT value-tracked or downweighted — charset recognition does not chase a value
+  across one hop, two hops, … (the slippery slope of value tracking). Such a candidate is instead
+  surfaced to the agent as a `charset_maybe` lead with a `charset_via_intermediate_untraced`
+  boundary. A free source reaching the sink always wins over a charset converter also present in
+  the function, so a genuinely dangerous candidate is never washed into `charset_maybe`.
 
 - The pattern analyzer now records a neutral STRUCTURAL fact on each candidate: whether the
   function is a thin command-forwarding wrapper (its body does little more than hand one of its

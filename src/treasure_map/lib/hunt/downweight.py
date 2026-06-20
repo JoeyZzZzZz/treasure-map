@@ -181,52 +181,35 @@ def _is_charset_benign(text: str, converters: frozenset[str]) -> bool:
     return bool(_LITERAL_ARG_RE.match(text.strip())) or _is_converter_call(text, converters)
 
 
-def _names_var(text: str, names: set[str]) -> bool:
-    """True when ``text`` is a bare reference to a variable in ``names`` (optional cast / & / *),
-    and NOT a call. Distinguishes `buf_a` (a copied-in value) from `conv(buf_a)` (a call)."""
-    if not names:
-        return False
-    m = re.match(r"^[&*]?\s*(?:\([^)]*\)\s*)?([A-Za-z_]\w*)\s*$", text.strip())
-    return m is not None and m.group(1) in names
-
-
 # Bounded string-copy callees that move a value into their FIRST-argument buffer but are NOT in
-# the global COPY set the taint graph uses. Recognizing them HERE — only to grow the charset-safe
-# set under the all-writes rule + the free_taint_reaches guard — lets a one-hop intermediate
-# buffer be recognized even when the global taint graph does not track the copy callee (e.g.
-# strlcpy breaks the dependency edge). Never used for recall, shape detection, or grading.
+# the global COPY set the taint graph uses (e.g. strlcpy breaks the dependency edge). The charset
+# downweight does NOT use this — it is consumed only by the evidence layer to flag a copy/alias the
+# dependency graph cannot follow (a trace boundary, not a downweight). Never used for recall.
 _CHARSET_COPY_EXTRA: frozenset[str] = frozenset({"strlcpy", "strlcat", "stpcpy", "stpncpy"})
-
-# One converter round + ONE intermediate-buffer hop (conv -> buf -> sink). The chain is capped at
-# a single intermediate variable on purpose: a longer chain (conv -> buf1 -> buf2 -> sink) is a
-# known blind spot — the structured flow evidence records it as untraced rather than the recognizer
-# silently following it. (The free-value guard below still applies at every depth, so recall is
-# never reduced regardless of the cap.)
-_CHARSET_CHAIN_ROUNDS = 2
 
 
 def _inline_constrained_results(pseudocode: str, converters: frozenset[str]) -> set[str]:
-    """Variables built ONLY from charset-safe converter results / literals — including one hop
-    through an intermediate buffer — where the converter result is not bound to its own
-    `lhs = conv(...)` variable.
+    """Variables whose value is built INLINE from charset-safe converter results / literals within
+    a single builder/assignment expression — no intermediate-variable value tracking.
 
-    Handles `snprintf(c,"...%s",ether_ntoa(x)); system(c)` (inline, no intermediate) AND the
-    one-hop intermediate-buffer shape `strncpy(buf,ether_ntoa(x),n); snprintf(c,"...%s",buf);
-    system(c)` (the value laundered through a bounded copy before the command builder), even when
-    the copy callee is one the global taint graph does not track.
+    A variable qualifies when EVERY write to it (a format/copy builder destination or a plain
+    assignment) is a literal or an inline converter call, AND at least one write involves a
+    converter — `snprintf(c,"...%s",ether_ntoa(x))` qualifies c. A value first copied into an
+    intermediate variable and only then into this one (`strncpy(buf,ether_ntoa(x),n);
+    snprintf(c,"%s",buf)`) does NOT qualify c: `buf` is a bare identifier in c's builder, not an
+    inline converter. That is deliberate — charset recognition is inline-only; a value that passes
+    through any intermediate variable is not value-tracked here (the evidence layer marks it
+    `charset_maybe` instead). A later free write (`strcat(c,user)`) or a free value mixed into the
+    same builder (`snprintf(c,"%s %s",ether_ntoa(x),raw)`) disqualifies the variable (all-writes
+    rule)."""
+    builders = FORMAT | COPY
+    all_benign: dict[str, bool] = {}
+    has_converter: dict[str, bool] = {}
 
-    Recall-safe by an all-writes rule applied at EVERY level: a variable qualifies ONLY when each
-    write to it (a format/copy builder destination or a plain assignment) is a literal, an inline
-    charset-safe converter, or a copy from an already-qualified variable — AND its lineage involves
-    a converter. So a later free write (`strcat(c,user)`), a free value mixed into the same builder
-    (`snprintf(c,"%s %s",ether_ntoa(x),raw)`), or a free seed feeding the intermediate buffer
-    (`strncpy(buf,nvram_get(0),n)`) disqualifies the variable. The propagation is capped at one
-    intermediate hop; a deeper chain is left unrecognized (a blind spot), never followed silently.
-    The free_taint_reaches guard in the caller still applies at every depth."""
-    builders = FORMAT | COPY | _CHARSET_COPY_EXTRA
-    # Collect every write once: (destination, [value-arg, ...]). Builder destinations are the
-    # first argument; a plain assignment's single "value arg" is its RHS.
-    writes: list[tuple[str, list[str]]] = []
+    def _note(var: str, benign: bool, converter: bool) -> None:
+        all_benign[var] = all_benign.get(var, True) and benign
+        has_converter[var] = has_converter.get(var, False) or converter
+
     for stmt in re.split(r"[;\n{}]", pseudocode):
         for name in {m.group(1) for m in _CALL_RE_HEAD.finditer(stmt)} & builders:
             args = _call_arglist(stmt, name)
@@ -238,41 +221,33 @@ def _inline_constrained_results(pseudocode: str, converters: frozenset[str]) -> 
             dst_ident = _IDENT_RE.search(parts[0])
             if dst_ident is None:
                 continue
-            writes.append((dst_ident.group(0), parts[1:]))
+            value_args = parts[1:]
+            benign = all(_is_charset_benign(a, converters) for a in value_args)
+            converter = any(_is_converter_call(a, converters) for a in value_args)
+            _note(dst_ident.group(0), benign, converter)
         assign = re.match(r"\s*[^=]*?\b([A-Za-z_]\w*)\s*=\s*(?!=)(.*)", stmt)
         if assign is not None:
-            writes.append((assign.group(1), [assign.group(2)]))
+            lhs, rhs = assign.group(1), assign.group(2)
+            _note(lhs, _is_charset_benign(rhs, converters), _is_converter_call(rhs, converters))
 
-    qualified: set[str] = set()
-    for _ in range(_CHARSET_CHAIN_ROUNDS):
-        all_benign: dict[str, bool] = {}
-        has_converter: dict[str, bool] = {}
-        for dst, value_args in writes:
-            benign = True
-            converter = False
-            for arg in value_args:
-                if _is_converter_call(arg, converters) or _names_var(arg, qualified):
-                    converter = True  # a converter, or a value copied from an already-safe var
-                elif not _is_charset_benign(arg, converters):
-                    benign = False
-            all_benign[dst] = all_benign.get(dst, True) and benign
-            has_converter[dst] = has_converter.get(dst, False) or converter
-        new_qualified = {v for v, ok in all_benign.items() if ok and has_converter.get(v)}
-        if new_qualified == qualified:
-            break
-        qualified = new_qualified
-    return qualified
+    return {var for var, benign in all_benign.items() if benign and has_converter.get(var)}
+
+
+def _charset_inline_constrained(pseudocode: str, sink_arg: str) -> bool:
+    """True when the SINK ARGUMENT itself is built inline from a charset-safe converter — the only
+    case charset downweight fires. Inline-only by design: a value laundered through any
+    intermediate variable is not value-tracked here (it is left to the evidence layer to mark as a
+    `charset_maybe` lead). The all-writes rule inside `_inline_constrained_results` already rules
+    out a free value written to the sink argument, so no separate free-bypass guard is needed."""
+    return sink_arg in _inline_constrained_results(pseudocode, _CHARSET_SAFE)
 
 
 def _value_is_constrained(pseudocode: str, sink_arg: str, converters: frozenset[str]) -> bool:
     """The sink argument's value is the result of a ``converters`` conversion AND no free value
-    bypasses it. Parameter-specific: a converter merely appearing in the function is not enough."""
+    bypasses it (used by the numeric-sanitizer downweight). Parameter-specific: a converter merely
+    appearing in the function is not enough. Charset uses the stricter inline-only check above."""
     path = {sink_arg} | flows_into(pseudocode, sink_arg)
     safe = _constrained_results(pseudocode, path, converters)
-    # Inline form: a value built directly from charset-safe converter results / literals, with no
-    # intermediate `lhs = conv(...)` to name the output. Intersected with the sink path and still
-    # guarded by free_taint_reaches below (the all-writes rule in the helper closes the
-    # multi-write / mixed-free cases), so this only ADDS recognitions, never relaxes the guard.
     safe |= _inline_constrained_results(pseudocode, converters) & path
     if not safe:
         return False
@@ -390,7 +365,10 @@ def detect_form_signal(
         return CONST_SINK_ARG
     if sink_arg is not None and _value_is_constrained(pseudocode, sink_arg, _NUMERIC_VALIDATORS):
         return NUMERIC_SANITIZED
-    if sink_arg is not None and _value_is_constrained(pseudocode, sink_arg, _CHARSET_SAFE):
+    if sink_arg is not None and _charset_inline_constrained(pseudocode, sink_arg):
+        # Charset downweight is INLINE-ONLY: the converter must build the sink argument directly. A
+        # value laundered through an intermediate variable is not value-tracked (no chain to two
+        # hops, three hops, …); the evidence layer marks it `charset_maybe` for the agent instead.
         return CHARSET_CONSTRAINED
     if _exec_is_no_shell(callees, pseudocode):
         return NO_SHELL_EXEC

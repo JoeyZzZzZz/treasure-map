@@ -28,12 +28,38 @@ def _ev(pc: str, callees: list[str], sink_arg: str | None = "cmd", entry_sites=N
 # ── source_kind: classification, not a verdict ───────────────────────────────────────
 
 
-def test_source_kind_charset_safe_one_hop() -> None:
+def test_source_kind_charset_safe_inline() -> None:
+    # Inline converter directly in the sink builder -> resolved to a charset source.
+    pc = (
+        "void f(struct ether_addr* x){ char cmd[128]; "
+        'snprintf(cmd,128,"arp -s %s",ether_ntoa(x)); system(cmd); }'
+    )
+    assert _ev(pc, ["ether_ntoa", "snprintf", "system"])["source_kind"] == "charset_safe"
+
+
+def test_source_kind_charset_maybe_via_intermediate() -> None:
+    # 0x13578 shape: a charset converter is in the function but the value reaches the sink through
+    # an intermediate variable -> NOT value-tracked here. Marked charset_maybe (a lead), not safe,
+    # and the boundary is stated honestly.
     pc = (
         "void f(struct ether_addr* x){ char b[32]; char cmd[128]; char* p=ether_ntoa(x); "
         'strncpy(b,p,32); snprintf(cmd,128,"echo %s",b); system(cmd); }'
     )
-    assert _ev(pc, ["ether_ntoa", "strncpy", "snprintf", "system"])["source_kind"] == "charset_safe"
+    ev = _ev(pc, ["ether_ntoa", "strncpy", "snprintf", "system"])
+    assert ev["source_kind"] == "charset_maybe"
+    assert ev["trace_boundary"] == "charset_via_intermediate_untraced"
+
+
+def test_free_source_wins_over_charset_converter() -> None:
+    # ★ a genuinely dangerous candidate is NEVER washed into charset_maybe: when a free source AND
+    # a charset converter both flow toward the sink, source_kind is free_string (free wins).
+    pc = (
+        "void f(struct ether_addr* x){ char* s=ether_ntoa(x); char* v=nvram_get(0); "
+        'char cmd[96]; snprintf(cmd,96,"%s %s",s,v); system(cmd); }'
+    )
+    assert _ev(pc, ["ether_ntoa", "nvram_get", "snprintf", "system"])["source_kind"] == (
+        "free_string"
+    )
 
 
 def test_source_kind_free_string() -> None:
@@ -153,13 +179,14 @@ def test_trace_boundary_global_ipc() -> None:
 
 
 def test_trace_boundary_copy_alias_untraced() -> None:
-    # strlcpy is a bounded copy the dependency graph does not track -> the structured chain may be
-    # incomplete, so the boundary is flagged honestly even though the source resolved.
+    # An unknown-source value moved by strlcpy (a bounded copy the dependency graph does not track)
+    # -> the structured chain is incomplete, flagged honestly. (A charset converter here would make
+    # it charset_maybe instead; this fixture has no converter, so the source stays unknown.)
     pc = (
-        "void f(struct ether_addr* x){ char b[32]; char cmd[128]; strlcpy(b,ether_ntoa(x),32); "
+        "void f(void){ char b[32]; char cmd[128]; strlcpy(b,helper(),32); "
         'snprintf(cmd,128,"echo %s",b); system(cmd); }'
     )
-    assert _ev(pc, ["ether_ntoa", "strlcpy", "snprintf", "system"])["trace_boundary"] == (
+    assert _ev(pc, ["helper", "strlcpy", "snprintf", "system"])["trace_boundary"] == (
         "copy_alias_untraced"
     )
 

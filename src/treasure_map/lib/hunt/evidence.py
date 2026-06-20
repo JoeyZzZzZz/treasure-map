@@ -34,7 +34,7 @@ from typing import Any
 from treasure_map.lib.hunt.downweight import (
     _CHARSET_COPY_EXTRA,
     _CHARSET_SAFE,
-    _value_is_constrained,
+    _charset_inline_constrained,
 )
 from treasure_map.lib.reachability.filters import _is_validator_name
 from treasure_map.lib.reachability.taint import (
@@ -52,14 +52,32 @@ _GLOBAL_IPC_RE = re.compile(r"\b(?:DAT_[0-9a-fA-F]+|g_\w+|extraout_\w+|_?_bss_\w
 _INDIRECT_CALL_RE = re.compile(r"\(\s*\*\s*\w+\s*\)\s*\(")
 
 
+def _charset_converter_called(pseudocode: str) -> bool:
+    """Existence check: a charset-safe converter is CALLED somewhere in this function body. NOT a
+    flow claim — it does not assert the converter's result actually reaches the sink."""
+    return any(re.search(rf"\b{re.escape(c)}\s*\(", pseudocode) for c in _CHARSET_SAFE)
+
+
 def _source_kind(pseudocode: str, sink_arg: str | None) -> str:
-    """Classify the source reaching the sink argument (mechanism, not a verdict)."""
+    """Classify the source reaching the sink argument (mechanism, not a verdict).
+
+    Order matters — a free source wins over a charset converter so a genuinely dangerous candidate
+    is never washed into a "maybe safe" lead just because some converter is also called in the
+    function:
+      charset_safe  — the converter builds the sink argument INLINE (downweighted elsewhere).
+      free_string   — a free source (network/env/config/parameter) reaches the sink argument.
+      charset_maybe — NOT inline and NO free source, but a charset-safe converter is called in the
+                      function: the value MAY be charset-constrained through an intermediate
+                      variable, but it is not value-tracked here — a lead for the agent, not safe.
+      unknown       — none of the above could be established."""
     if sink_arg is None:
         return "unknown"
-    if _value_is_constrained(pseudocode, sink_arg, _CHARSET_SAFE):
+    if _charset_inline_constrained(pseudocode, sink_arg):
         return "charset_safe"
     if free_taint_reaches(pseudocode, sink_arg, safe_vars=set()):
         return "free_string"
+    if _charset_converter_called(pseudocode):
+        return "charset_maybe"
     return "unknown"
 
 
@@ -110,22 +128,27 @@ def _trace_boundary(
 ) -> str:
     """Honest statement of where the structured trace stops and why.
 
-    reached_sink      — the source reaching the sink was resolved (to a charset converter or a
-                        free source) and no untraceable construct lies in the way.
-    one_hop_limit     — the source was not resolved; one intermediate buffer was followed and the
-                        trace stopped at the one-hop cap.
-    two_hop_untraced  — the source was not resolved and passes through >=2 intermediate buffers
-                        (beyond the one-hop cap — a known blind spot, not followed).
+    reached_sink      — the source was resolved to the bottom WITHIN this function (an inline
+                        charset converter, an inline free source, or a literal).
+    charset_via_intermediate_untraced — a charset-safe converter is in the function but the value
+                        reaches the sink through an intermediate variable that was NOT followed
+                        (the `charset_maybe` lead: looked through a converter, did not trace it).
+    one_hop_limit     — source not resolved; one intermediate buffer followed, stopped at the cap.
+    two_hop_untraced  — source not resolved; >=2 intermediate buffers (beyond the cap).
     indirect_call     — an indirect (function-pointer) call is present (a value may arrive through
                         it; intra read cannot follow it).
     ipc_global        — a global / shared-state / un-threaded value is present.
     copy_alias_untraced — a bounded copy the dependency graph does not track moved a value, so the
                         structured flow chain may be incomplete.
 
-    Cautious by design: a present-but-maybe-unrelated indirect call / global / untracked copy is
-    reported as a boundary rather than silently claiming a clean resolution."""
+    Honest by design — it NEVER claims `reached_sink` when a converter was seen but the value ran
+    through an intermediate variable (that would pretend not to have seen the converter). A
+    present-but-maybe-unrelated indirect call / global / untracked copy is reported as a boundary
+    rather than silently claiming a clean resolution."""
     if sink_arg is None:
         return "reached_sink"
+    if source_kind == "charset_maybe":
+        return "charset_via_intermediate_untraced"
     if _INDIRECT_CALL_RE.search(pseudocode):
         return "indirect_call"
     if _GLOBAL_IPC_RE.search(pseudocode):
