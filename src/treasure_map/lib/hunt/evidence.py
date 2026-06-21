@@ -287,14 +287,20 @@ def _size_trace_boundary(
     return "two_hop_untraced"
 
 
-def build_size_evidence(*, pseudocode: str, sink_name: str) -> dict[str, Any]:
+def build_size_evidence(
+    *, pseudocode: str, sink_name: str, entry_sites: list[dict[str, Any]] | None = None
+) -> dict[str, Any]:
     """Assemble the size-flow evidence for one copy-sink candidate (JSON-serializable).
 
     Pure and deterministic. Like ``build_flow_evidence`` this is EVIDENCE, never a judgement: it
     classifies the write-length source (mechanism), reports the reliable one-hop size flow, lists
     any upper-bound/guard shapes seen (each ``coverage=unjudged`` — presence only, never a
     dominance claim), and states honestly where the size trace stops. It NEVER decides
-    "bounded / not" — that judgement is the agent's."""
+    "bounded / not" — that judgement is the agent's.
+
+    ``entry_reach`` carries the same rootfs-invocation evidence as the command-sink path so a copy
+    candidate ranks evenly with cmd/fmt on entry reachability (None/[] is reported ``unknown``,
+    NEVER "unreachable")."""
     cs = classify_copy_size(pseudocode, sink_name)
     deps = _derives_map(pseudocode)
     if cs.size_var is not None:
@@ -306,6 +312,10 @@ def build_size_evidence(*, pseudocode: str, sink_name: str) -> dict[str, Any]:
         "size_kind": cs.kind,
         "size_flow": {"size_arg": cs.size_text, "size_var": cs.size_var, "one_hop": one_hop},
         "clamp_seen": [{"shape": s, "coverage": "unjudged"} for s in cs.clamps],
+        "entry_reach": {
+            "status": "found" if entry_sites else "unknown",
+            "sites": entry_sites or [],
+        },
         "trace_boundary": _size_trace_boundary(pseudocode, cs.kind, cs.size_var, deps),
     }
 

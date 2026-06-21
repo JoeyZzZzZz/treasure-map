@@ -9,6 +9,7 @@ import click
 from treasure_map.cli.analyze_cli import analyze
 from treasure_map.cli.hunt_cli import atlas_view, hunt_diff, hunt_pattern, scan, triage
 from treasure_map.cli.init_cli import init
+from treasure_map.cli.mcp_cli import fact, mcp_serve
 
 
 @click.group(context_settings={"max_content_width": 100})
@@ -31,6 +32,8 @@ main.add_command(hunt_diff)
 main.add_command(hunt_pattern)
 main.add_command(triage)
 main.add_command(atlas_view)
+main.add_command(fact)
+main.add_command(mcp_serve)
 
 if __name__ == "__main__":
     main()

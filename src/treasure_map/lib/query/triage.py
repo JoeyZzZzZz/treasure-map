@@ -16,6 +16,7 @@ field is untouched.
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from dataclasses import dataclass
@@ -98,6 +99,16 @@ _SOURCE_CLASS_WEIGHT: dict[str, float] = {"external_input": 0.3}
 # ordering weight, not a magnitude-of-harm claim.
 _SINK_CLASS_WEIGHT: dict[str, float] = {"cmd": 0.4, "fmt_string": 0.4, "copy": 0.2, "format": 0.0}
 
+# Entry-reach: whether a rootfs entry point (a startup/maintenance script, a web asset) was found
+# to invoke this candidate's binary (derived from the L0.5 script_calls / web_endpoints evidence,
+# carried in flow_evidence.entry_reach). A proven entry path PROMOTES a candidate within its tier
+# so a network/script-reachable sink surfaces above a same-class same-status local-only one. It is
+# a SECOND-LEVEL key, deliberately smaller than the sink-class gap, so it never reverses the
+# status or sink-class order. ★ Asymmetric on purpose: only ``found`` promotes; ``unknown`` is
+# strictly neutral and NEVER demotes — an unknown may just be a coverage gap (no script parsed
+# that calls the binary), and demoting it could bury a real lead. Promote-proven, never punish.
+_ENTRY_REACH_WEIGHT: dict[str, float] = {"found": 0.15}
+
 
 def _bounds() -> tuple[float, float]:
     """Min/max possible raw score, derived from the weight tables (for [0,1] display scaling)."""
@@ -112,6 +123,7 @@ def _bounds() -> tuple[float, float]:
         + max(_ORIGIN_WEIGHT.values())
         + max(0.0, *_SOURCE_CLASS_WEIGHT.values())
         + max(_SINK_CLASS_WEIGHT.values())
+        + max(0.0, *_ENTRY_REACH_WEIGHT.values())  # entry-reach only promotes (never negative)
     )
     return min(_STATUS_WEIGHT.values()) + fine_lo, max(_STATUS_WEIGHT.values()) + fine_hi
 
@@ -142,6 +154,26 @@ class TriageCandidate:
     # Which binary to open in the decompiler. Read straight from the atlas (NOT a read-time
     # join back to analysis.db), so a candidate is locatable even when the source build is gone.
     binary_path: str | None
+    # entry-reach status (found / unknown) parsed from the stored flow_evidence — a derived,
+    # evidence-backed signal, NOT a verdict. found promotes within the tier; unknown is neutral.
+    entry_reach: str = "unknown"
+
+
+def _entry_reach_status(flow_evidence: str | None) -> str:
+    """Parse ``entry_reach.status`` from the stored flow_evidence JSON; ``unknown`` when absent.
+
+    Conservative: any missing/unparsable evidence or absent entry_reach reports ``unknown`` (a
+    coverage gap, never "unreachable"), so the asymmetric scorer leaves it untouched."""
+    if not flow_evidence:
+        return "unknown"
+    try:
+        data = json.loads(flow_evidence)
+    except (ValueError, TypeError):
+        return "unknown"
+    reach = data.get("entry_reach") if isinstance(data, dict) else None
+    if isinstance(reach, dict) and reach.get("status") == "found":
+        return "found"
+    return "unknown"
 
 
 def _raw_score(
@@ -150,12 +182,14 @@ def _raw_score(
     origin: str,
     source_class: str,
     sink_class: str,
+    entry_reach: str = "unknown",
 ) -> float:
     score = _STATUS_WEIGHT.get(reachability_status, 0.0)
     score += _filter_weight(blocking_mechanism)
     score += _ORIGIN_WEIGHT.get(origin, 0.0)
     score += _SOURCE_CLASS_WEIGHT.get(source_class, 0.0)
     score += _SINK_CLASS_WEIGHT.get(sink_class, 0.0)
+    score += _ENTRY_REACH_WEIGHT.get(entry_reach, 0.0)  # found promotes; unknown -> 0 (neutral)
     return score
 
 
@@ -165,15 +199,19 @@ def review_score(
     origin: str,
     source_class: str,
     sink_class: str,
+    entry_reach: str = "unknown",
 ) -> float:
     """Deterministic review-ordering score in [0, 1] (ordering signal only, never stored)."""
-    raw = _raw_score(reachability_status, blocking_mechanism, origin, source_class, sink_class)
+    raw = _raw_score(
+        reachability_status, blocking_mechanism, origin, source_class, sink_class, entry_reach
+    )
     norm = (raw - _SCORE_LO) / (_SCORE_HI - _SCORE_LO)
     return round(min(1.0, max(0.0, norm)), 2)
 
 
 def _candidate(row: sqlite3.Row) -> TriageCandidate:
     reach = row["reachability_status"]
+    entry_reach = _entry_reach_status(_row_get(row, "flow_evidence"))
     return TriageCandidate(
         score=review_score(
             reach,
@@ -181,6 +219,7 @@ def _candidate(row: sqlite3.Row) -> TriageCandidate:
             row["origin"],
             row["source_class"],
             row["sink_class"],
+            entry_reach,
         ),
         review_status=REVIEW_STATUS_BY_REACHABILITY.get(reach, reach),
         reachability_status=reach,
@@ -193,7 +232,13 @@ def _candidate(row: sqlite3.Row) -> TriageCandidate:
         source_run_id=row["source_run_id"],
         evidence_ref=row["evidence_ref"],
         binary_path=row["binary_path"],
+        entry_reach=entry_reach,
     )
+
+
+def _row_get(row: sqlite3.Row, key: str) -> str | None:
+    """Read an optional column from a sqlite Row (returns None when the column is not selected)."""
+    return row[key] if key in row.keys() else None
 
 
 def triage(conn: sqlite3.Connection, *, run_id: str | None = None) -> list[TriageCandidate]:
@@ -207,7 +252,7 @@ def triage(conn: sqlite3.Connection, *, run_id: str | None = None) -> list[Triag
     """
     sql = (
         "SELECT i.reachability_status, i.blocking_mechanism, i.origin, i.source_anchor, "
-        "i.sink_anchor, i.source_run_id, i.evidence_ref, i.binary_path, "
+        "i.sink_anchor, i.source_run_id, i.evidence_ref, i.binary_path, i.flow_evidence, "
         "p.source_class, p.sink_class "
         "FROM instance i JOIN pattern p ON p.pattern_id = i.pattern_id"
     )
@@ -287,6 +332,19 @@ def _source_note(source_class: str) -> str:
     return "source class not recognized as external input (neutral)"
 
 
+def _entry_reach_note(entry_reach: str) -> str:
+    if entry_reach == "found":
+        return (
+            "a rootfs entry point (startup/maintenance script or web asset) was found to invoke "
+            "this binary — a derived, evidence-backed reachability signal (promotes within tier); "
+            "NOT a proof the candidate's input arrives from that entry"
+        )
+    return (
+        "no rootfs entry point invoking this binary was found — reported as unknown, NOT "
+        "unreachable (may be a coverage gap); neutral, never lowers the order"
+    )
+
+
 def score_breakdown(
     reachability_status: str,
     blocking_mechanism: str | None,
@@ -295,6 +353,7 @@ def score_breakdown(
     sink_class: str,
     *,
     sink_anchor: str | None = None,
+    entry_reach: str = "unknown",
 ) -> list[ScoreComponent]:
     """Itemize the score: one ScoreComponent per signal, each weight from the real tables.
 
@@ -340,6 +399,12 @@ def score_breakdown(
             _SINK_CLASS_WEIGHT.get(sink_class, 0.0),
             "the operation the sink performs (an ordering weight, not a magnitude-of-harm claim)",
         ),
+        ScoreComponent(
+            "entry_reach",
+            entry_reach,
+            _ENTRY_REACH_WEIGHT.get(entry_reach, 0.0),
+            _entry_reach_note(entry_reach),
+        ),
     ]
 
 
@@ -367,7 +432,7 @@ def explain_candidate(conn: sqlite3.Connection, evidence_ref: str) -> CandidateE
     """
     rows = conn.execute(
         "SELECT i.reachability_status, i.blocking_mechanism, i.origin, i.source_anchor, "
-        "i.sink_anchor, i.source_run_id, i.evidence_ref, i.binary_path, "
+        "i.sink_anchor, i.source_run_id, i.evidence_ref, i.binary_path, i.flow_evidence, "
         "p.source_class, p.sink_class, p.call_sequence_shape "
         "FROM instance i JOIN pattern p ON p.pattern_id = i.pattern_id "
         "WHERE i.evidence_ref = ? "
@@ -394,6 +459,7 @@ def explain_candidate(conn: sqlite3.Connection, evidence_ref: str) -> CandidateE
         candidate.source_class,
         candidate.sink_class,
         sink_anchor=candidate.sink_anchor,
+        entry_reach=candidate.entry_reach,
     )
     raw = sum(c.weight for c in components)
     claims_does = (

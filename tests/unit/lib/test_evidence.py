@@ -390,14 +390,25 @@ def test_fmtstr_evidence_printf_position_zero() -> None:
 
 
 def test_evidence_signals_do_not_feed_score_or_grade() -> None:
-    # The flow evidence (and its sanitizer signal) is material for an agent, never a score/grade
-    # input. The read-side score, the form-note downweight, and the grader must not consume the
-    # evidence fields nor import the evidence module.
-    fields = ("flow_evidence", "sanitizer_seen", "entry_reach", "trace_boundary", "source_kind")
+    # The INTERPRETIVE evidence signals (a converter/sanitizer judgement-shaped read) are material
+    # for an agent, never a score/grade input. The read-side score, the form-note downweight, and
+    # the grader must not consume them nor import the evidence module.
+    #
+    # entry_reach is the deliberate exception (round R-L4·mcp, factor 6b): it is a FACT (a rootfs
+    # entry point was found to invoke the binary), not an interpretation, so the read-side ranking
+    # MAY use it as a second-level ordering key — but only the read-side triage, never the grader
+    # or the form-note downweight, and never the interpretive fields below.
+    interpretive = ("sanitizer_seen", "trace_boundary", "source_kind", "size_kind")
     for rel in ("lib/query/triage.py", "lib/hunt/downweight.py", "lib/reachability/grader.py"):
         text = (_SRC / rel).read_text()
         assert "hunt.evidence" not in text and "import evidence" not in text, (
             f"{rel} unexpectedly imports the evidence module"
         )
-        for field in fields:
+        for field in interpretive:
             assert field not in text, f"{rel} unexpectedly references evidence field {field!r}"
+    # The grader and the downweight must not consume entry_reach / flow_evidence either — only the
+    # presentation-layer triage ranking may (and does, by design).
+    for rel in ("lib/hunt/downweight.py", "lib/reachability/grader.py"):
+        text = (_SRC / rel).read_text()
+        for field in ("entry_reach", "flow_evidence"):
+            assert field not in text, f"{rel} unexpectedly references {field!r}"

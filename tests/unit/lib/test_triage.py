@@ -9,6 +9,7 @@ gated fold in the CLI, the evidence_ref anchor on every row, and that triage wri
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -51,9 +52,14 @@ def _inst(
     fn: str = "fn",
     sink_anchor: str = "system",
     binary_path: str | None = None,
+    entry_reach: str | None = None,
 ) -> None:
     _FID[0] += 1
     provenance = "L1" if status in {"confirmed", "blocked"} else "L0"
+    # entry_reach (None -> no flow_evidence; else a minimal entry_reach.status payload).
+    flow_evidence = None
+    if entry_reach is not None:
+        flow_evidence = json.dumps({"entry_reach": {"status": entry_reach, "sites": []}})
     add_instance(
         conn,
         InstanceRow(
@@ -69,6 +75,7 @@ def _inst(
             scope_origin="intra",
             origin=origin,
             binary_path=binary_path,
+            flow_evidence=flow_evidence,
         ),
     )
 
@@ -111,6 +118,81 @@ def test_confirmed_ranks_above_same_class_unknown(tmp_path: Path) -> None:
 
     ranked = triage(conn)
     assert [c.function for c in ranked] == ["c_fn", "u_fn"]  # reachable above to-verify
+    conn.close()
+
+
+# ── entry-reach ranking (v2 lever, factor 6b): proven promotes, unknown never demotes ──
+
+
+def test_entry_reach_found_promotes_within_tier(tmp_path: Path) -> None:
+    # Two same-class same-status candidates differing ONLY in entry-reach: the one with a proven
+    # rootfs entry path (network/script-reachable) ranks above the local-only/unknown one.
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp", sink_class="fmt_string", source_class="external_input")
+    _inst(conn, p, status="unknown", fn="local_only", entry_reach="unknown")
+    _inst(conn, p, status="unknown", fn="net_reachable", entry_reach="found")
+
+    ranked = triage(conn)
+    assert [c.function for c in ranked] == ["net_reachable", "local_only"]
+    assert next(c for c in ranked if c.function == "net_reachable").entry_reach == "found"
+    conn.close()
+
+
+def test_entry_reach_does_not_reverse_sink_class_order(tmp_path: Path) -> None:
+    # A proven-entry COPY must not overtake an unknown-entry CMD of the same status: entry-reach is
+    # a SECOND-LEVEL key, smaller than the sink-class gap.
+    conn = _atlas(tmp_path)
+    cmd_p = _pattern(conn, "fp_cmd", sink_class="cmd", source_class="external_input")
+    copy_p = _pattern(conn, "fp_copy", sink_class="copy", source_class="external_input")
+    _inst(conn, cmd_p, status="unknown", fn="cmd_no_entry", entry_reach="unknown")
+    _inst(conn, copy_p, status="unknown", fn="copy_found", entry_reach="found")
+
+    ranked = triage(conn)
+    assert [c.function for c in ranked] == ["cmd_no_entry", "copy_found"]
+    conn.close()
+
+
+def test_entry_reach_unknown_is_never_demoted(tmp_path: Path) -> None:
+    # ★ prove-the-asymmetry: an external_input candidate with entry_reach=unknown must NOT score
+    # below the same candidate scored WITHOUT any entry-reach lever (only ``found`` ever adds).
+    base = review_score("unknown", None, "custom", "external_input", "cmd")
+    as_unknown = review_score("unknown", None, "custom", "external_input", "cmd", "unknown")
+    as_found = review_score("unknown", None, "custom", "external_input", "cmd", "found")
+    assert as_unknown == base  # unknown is strictly neutral — no demotion
+    assert as_found >= as_unknown  # found can only promote
+    # the weight table itself carries no negative entry-reach contribution
+    from treasure_map.lib.query.triage import _ENTRY_REACH_WEIGHT
+
+    assert all(w >= 0.0 for w in _ENTRY_REACH_WEIGHT.values())
+    assert _ENTRY_REACH_WEIGHT.get("unknown", 0.0) == 0.0
+
+
+def test_entry_reach_unknown_external_lead_not_buried(tmp_path: Path) -> None:
+    # An entry_reach=unknown but external_input cmd lead still ranks above a found-but-weaker
+    # (format-sink, stock-oss, filtered) lead — the lever does not bury an unknown real lead.
+    conn = _atlas(tmp_path)
+    strong = _pattern(conn, "fp_s", sink_class="cmd", source_class="external_input")
+    weak = _pattern(conn, "fp_w", sink_class="format", source_class="unknown")
+    _inst(
+        conn,
+        strong,
+        status="unknown",
+        origin="custom",
+        fn="unknown_entry_lead",
+        entry_reach="unknown",
+    )
+    _inst(
+        conn,
+        weak,
+        status="unknown",
+        origin="stock_oss_known",
+        blocking="length_check",
+        fn="found_but_weak",
+        entry_reach="found",
+    )
+
+    ranked = triage(conn)
+    assert ranked[0].function == "unknown_entry_lead"
     conn.close()
 
 

@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- An AI-facing **MCP server** (`tmap mcp-serve`, optional `treasure-map[mcp]` extra) exposes the
+  analysis knowledge base as read-only tools: `list_candidates` / `explain_candidate` (recall
+  candidates + derived, evidence-backed review-ordering signals), `get_pseudocode`, `get_callees`,
+  `get_xrefs`, `get_strings`, `get_imports_exports`, `get_script_callsites`, `get_components_cves`,
+  and `get_disassembly`. A new shared read layer (`treasure_map.lib.facts`) backs both the server
+  and the `tmap fact …` CLI commands, so a fact fetched either way is identical (one query, two
+  thin wrappers). Two contracts hold on every tool: no anchor → no output (a miss returns a
+  "not found" record, never a guess), and facts/chains/reachability-evidence/trigger-conditions
+  only — never a payload, trigger bytes, or PoC. `get_disassembly` is produced on demand and, when
+  same-source address alignment cannot be established, degrades honestly to "unavailable" rather
+  than emit possibly-misaligned addresses. Derived signals are labelled "derived, evidence-backed,
+  not a verdict"; no interpretation column is reconstructed.
+- **entry-reach review-ordering** (a second-level ranking key): the review score now reads the
+  per-candidate `entry_reach` evidence (a rootfs startup/maintenance script or web asset was found
+  to invoke the candidate's binary) and PROMOTES a candidate within its tier when an entry path is
+  proven, so a network/script-reachable sink surfaces above a same-class same-status local-only
+  one. Strictly asymmetric: only `found` promotes — `unknown` is neutral and NEVER demotes (an
+  unknown may be a coverage gap, and demoting it could bury a real lead). It is a presentation-only
+  ordering key, smaller than the sink-class gap (never reverses the status/sink-class order) and
+  never alters a stored reachability state or adds/removes a candidate. Copy-sink candidates now
+  also carry `entry_reach` in their size evidence so the ranking is even across cmd/copy/format/
+  fmt_string.
 - Format-string-injection sinks (`printf` / `fprintf` / `dprintf` / `syslog` / `vsyslog` / `err` /
   `warn` / `asprintf` and their `v*` variants) are now recalled as a new `fmt_string` sink class —
   an entire sink category that was previously absent (it builds no buffer, runs no command, copies

@@ -173,6 +173,7 @@ def test_cli_explain_json_is_structured_without_payload(tmp_path: Path) -> None:
         "origin",
         "source_class",
         "sink_class",
+        "entry_reach",
     }
     assert "verify" in data and "claims_does_not" in data
     assert _has_weapon_word(json.dumps(data)) is None

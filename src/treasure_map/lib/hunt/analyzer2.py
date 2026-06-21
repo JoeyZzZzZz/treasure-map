@@ -279,10 +279,14 @@ def run_analyzer2(
                 elif match.sink_class == "copy" and sink_name is not None:
                     # Copy candidates carry SIZE evidence (the danger axis): the length source
                     # classification, the one-hop size flow, any clamp/guard seen (coverage
-                    # unjudged), and the honest trace boundary. Material for a later agent — never a
-                    # verdict; nothing reads it back into recall, the score, or the grade.
+                    # unjudged), the rootfs entry sites (so copy ranks evenly with cmd/fmt on
+                    # entry-reach), and the honest trace boundary. Material for a later agent —
+                    # never a verdict; nothing reads it back into recall or the grade.
+                    sites = entry_index.sites_for(row.binary_name, row.binary_path)
                     flow_evidence = json.dumps(
-                        build_size_evidence(pseudocode=row.pseudocode, sink_name=sink_name),
+                        build_size_evidence(
+                            pseudocode=row.pseudocode, sink_name=sink_name, entry_sites=sites
+                        ),
                         sort_keys=True,
                     )
                 elif match.sink_class == "fmt_string" and sink_name is not None:

@@ -33,6 +33,11 @@ rag = [
     "chromadb>=0.5",
     "sentence-transformers>=3.0",
 ]
+# The AI-facing MCP server. Optional: the analysis/CLI core does not require it, so the server
+# module imports `mcp` lazily and only `tmap mcp-serve` / the MCP entry point pulls it in.
+mcp = [
+    "mcp>=1.0",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
@@ -40,10 +45,12 @@ dev = [
     "ruff>=0.4",
     "mypy>=1.10,<2.0",
     "types-PyYAML>=6.0",
+    "mcp>=1.0",
 ]
 
 [project.scripts]
 tmap = "treasure_map.cli.main:main"
+treasure-map-mcp = "treasure_map.mcp_app:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

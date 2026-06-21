@@ -190,6 +190,31 @@ tmap hunt-diff <old.db> <new.db> ...   # diff two builds, grade reachability
 tmap atlas-view ...                     # neutral cross-firmware aggregation
 ```
 
+### AI-facing access (MCP server)
+
+Treasure Map exposes its analysis facts to an AI client through a [Model Context
+Protocol](https://modelcontextprotocol.io) server, so an assistant can chase a lead across an
+entire firmware — pull a candidate, read its pseudocode, follow callees/xrefs to the next hop,
+check the strings, the cross-artifact script call sites, and the SBOM/CVE matches — and form its
+own judgement on a reproducible, cross-artifact substrate. It is **not** an arbitrary disassembly
+proxy: the value is the full, deterministically re-derivable structure plus the derived,
+evidence-backed review-ordering signals.
+
+```bash
+pip install "treasure-map[mcp]"        # the server is an optional extra
+tmap mcp-serve --analysis-db router_v1/analysis.db --atlas router_v1/atlas.db
+```
+
+The server runs over stdio and offers read-only tools: `list_candidates`, `explain_candidate`,
+`get_pseudocode`, `get_callees`, `get_xrefs`, `get_strings`, `get_imports_exports`,
+`get_script_callsites`, `get_components_cves`, and `get_disassembly`. Two contracts hold on every
+tool: **every result carries an evidence anchor** (binary + function + address, or script + line)
+— a lookup that resolves nothing returns a "not found" record, never a guess — and the output is
+**facts, chains, reachability evidence, and trigger conditions only; never a payload, trigger
+bytes, or PoC**. The ordering signals (`score`, `entry_reach`, `blocking_mechanism`) are labelled
+derived and evidence-backed — a lead to verify, never a verdict. The CLI's `tmap fact …` commands
+read the same layer, so a fact fetched on the command line and over MCP are identical.
+
 ## Pointing Treasure Map at Ghidra
 
 Used in Step 5 and at analyze time. Treasure Map locates Ghidra's `analyzeHeadless` by checking,
