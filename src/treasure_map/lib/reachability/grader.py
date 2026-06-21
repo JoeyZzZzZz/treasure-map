@@ -23,6 +23,18 @@ confirmed defect or a publishable result.
 
 from __future__ import annotations
 
+from treasure_map.lib.pattern.classes import COPY
+from treasure_map.lib.reachability.copy_size import (
+    SIZE_CLAMP,
+    SIZE_CONST,
+    SIZE_POINTER_GUARD,
+    SIZE_SIZEOF,
+    SIZE_SOURCE_LEN,
+    SIZE_UNTRACED,
+    SIZE_VARIABLE,
+    classify_copy_size,
+    copy_size_form_note,
+)
 from treasure_map.lib.reachability.filters import (
     has_inline_bound,
     has_validator,
@@ -74,6 +86,43 @@ _BASIS_ABI = (
     "data-flow analysis (R2-deep) is required"
 )
 
+# Copy sinks are graded on the WRITE LENGTH (the danger axis), not on whether taint reaches the
+# destination pointer. A copy never confirms within one function: proving the length is truly
+# unbounded and externally controllable needs cross-function (protocol/caller) context, so the
+# verdict is always unknown — with a size-source form note for the provably-bounded cases.
+_COPY_BASIS: dict[str, str] = {
+    SIZE_CONST: (
+        "the copy's write length is a literal constant; the write is bounded and the length is "
+        "not externally controllable"
+    ),
+    SIZE_SIZEOF: (
+        "the copy's write length is a sizeof() of an object; the write is bounded to the object "
+        "size, not externally controllable"
+    ),
+    SIZE_CLAMP: (
+        "an upper-bound clamp referencing the copy's length variable is present, but an "
+        "intra-procedural read cannot prove it dominates this copy; the verdict is unknown, not "
+        "confirmed"
+    ),
+    SIZE_POINTER_GUARD: (
+        "a pointer/bound guard referencing the copy's length is present, but an intra-procedural "
+        "read cannot prove it dominates this copy; the verdict is unknown, not confirmed"
+    ),
+    SIZE_SOURCE_LEN: (
+        "the copy's write length is the source string's own length; this is bounded only if an "
+        "upstream caller limited the source, which is not establishable within one function — a "
+        "lead to verify, not a bounded-safe form"
+    ),
+    SIZE_VARIABLE: (
+        "the copy's write length is a variable with no visible upper bound within this function; "
+        "whether it is externally controllable and unbounded is for a later layer to decide"
+    ),
+    SIZE_UNTRACED: (
+        "the copy's length argument could not be resolved within this function; kept as a lead "
+        "rather than assumed bounded"
+    ),
+}
+
 
 def grade_candidate(
     pseudocode: str,
@@ -92,6 +141,15 @@ def grade_candidate(
         return ReachabilityVerdict("unknown", None, _BASIS_NO_CALLEES, degraded=True)
     if not pseudocode or not pseudocode.strip():
         return ReachabilityVerdict("unknown", None, _BASIS_NO_BODY, degraded=True)
+
+    if sink_name in COPY:
+        # Copy sinks are graded on the write length (danger axis), never confirmed in one
+        # function. classify_copy_size reads the length source; a provably-bounded length
+        # (const/sizeof/clamp/pointer_guard) carries a downweight form note, a suspect or
+        # unbounded length carries none (kept at its normal rank — never silently demoted).
+        cs = classify_copy_size(pseudocode, sink_name)
+        basis = _COPY_BASIS.get(cs.kind, _BASIS_ORIGIN_UNKNOWN)
+        return ReachabilityVerdict("unknown", copy_size_form_note(cs.kind), basis)
 
     sink_arg = locate_sink_arg(pseudocode, sink_name)
     if sink_arg is None:

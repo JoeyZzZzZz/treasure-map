@@ -101,11 +101,13 @@ CMD: frozenset[str] = frozenset(
     }
 )
 
-# Copies: move bytes into a destination buffer (length-taking or not).
+# Copies: move bytes into a destination buffer (length-taking or not). memmove has the same
+# (dst, src, n) danger shape as memcpy and is graded on the same write-length axis.
 COPY: frozenset[str] = frozenset(
     {
         "strcpy",
         "strncpy",
         "memcpy",
+        "memmove",
     }
 )

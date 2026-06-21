@@ -14,7 +14,12 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-from treasure_map.lib.hunt.evidence import EntryIndex, build_flow_evidence, load_entry_index
+from treasure_map.lib.hunt.evidence import (
+    EntryIndex,
+    build_flow_evidence,
+    build_size_evidence,
+    load_entry_index,
+)
 
 _SRC = Path(__file__).resolve().parents[3] / "src" / "treasure_map"
 
@@ -317,6 +322,44 @@ def test_load_entry_index_missing_tables_is_empty() -> None:
     idx = load_entry_index(conn)
     assert idx.sites_for("anything", None) == []
     conn.close()
+
+
+# ── copy-sink SIZE evidence: classification + reliable flow + honest boundary ────────
+
+
+def test_size_evidence_const_resolves() -> None:
+    ev = build_size_evidence(pseudocode="memcpy(dst, src, 0x20);", sink_name="memcpy")
+    assert ev["size_kind"] == "const"
+    assert ev["size_flow"]["size_var"] is None
+    assert ev["clamp_seen"] == []
+    assert ev["trace_boundary"] == "reached_sink"
+
+
+def test_size_evidence_variable_keeps_var_and_flow() -> None:
+    pc = "n = recv(fd, src, 0x400); memcpy(dst, src, n);"
+    ev = build_size_evidence(pseudocode=pc, sink_name="memcpy")
+    assert ev["size_kind"] == "variable"
+    assert ev["size_flow"]["size_var"] == "n"
+    assert ev["clamp_seen"] == []
+
+
+def test_size_evidence_clamp_seen_is_unjudged() -> None:
+    pc = "n = get_len(); if (0x100 < n) goto fail; memcpy(dst, src, n);"
+    ev = build_size_evidence(pseudocode=pc, sink_name="memcpy")
+    assert ev["size_kind"] == "clamp"
+    assert ev["clamp_seen"]  # at least one shape
+    assert all(c["coverage"] == "unjudged" for c in ev["clamp_seen"])  # never a dominance claim
+
+
+def test_size_evidence_source_len_is_suspect() -> None:
+    ev = build_size_evidence(pseudocode="strncpy(dst, src, strlen(src));", sink_name="strncpy")
+    assert ev["size_kind"] == "source_len"
+
+
+def test_size_evidence_untraced_when_absent() -> None:
+    ev = build_size_evidence(pseudocode='snprintf(c, 64, "%s", x);', sink_name="memcpy")
+    assert ev["size_kind"] == "untraced"
+    assert ev["trace_boundary"] == "size_arg_untraced"
 
 
 # ── ★ blind-spot guard: evidence never feeds recall / score / grade ──────────────────

@@ -37,6 +37,12 @@ from treasure_map.lib.hunt.downweight import (
     _charset_inline_constrained,
 )
 from treasure_map.lib.pattern.classes import SOURCE
+from treasure_map.lib.reachability.copy_size import (
+    SIZE_CONST,
+    SIZE_SIZEOF,
+    SIZE_UNTRACED,
+    classify_copy_size,
+)
 from treasure_map.lib.reachability.filters import _is_validator_name
 from treasure_map.lib.reachability.taint import (
     _CALLER_SUPPLIED_RE,
@@ -241,6 +247,61 @@ def build_flow_evidence(
             "sites": entry_sites or [],
         },
         "trace_boundary": trace_boundary,
+    }
+
+
+def _size_trace_boundary(
+    pseudocode: str, kind: str, size_var: str | None, deps: dict[str, set[str]]
+) -> str:
+    """Honest statement of where the size trace stops and why (mirror of ``_trace_boundary``).
+
+    reached_sink        — the length resolved within the function (a constant, a sizeof, or a
+                          length variable with no further backward chain).
+    size_arg_untraced   — the length argument could not be resolved here.
+    indirect_call       — an indirect (function-pointer) call is present; a length may arrive
+                          through it and an intra read cannot follow it.
+    copy_alias_untraced — a bounded copy the dependency graph does not track moved a value, so the
+                          structured size chain may be incomplete.
+    one_hop_limit       — the length came through one intermediate variable, stopped at the cap.
+    two_hop_untraced    — the length came through >=2 intermediates (beyond the cap)."""
+    if kind in (SIZE_CONST, SIZE_SIZEOF):
+        return "reached_sink"
+    if kind == SIZE_UNTRACED:
+        return "size_arg_untraced"
+    if _INDIRECT_CALL_RE.search(pseudocode):
+        return "indirect_call"
+    if any(re.search(rf"\b{re.escape(c)}\s*\(", pseudocode) for c in _CHARSET_COPY_EXTRA):
+        return "copy_alias_untraced"
+    if size_var is None:
+        return "reached_sink"
+    depth = _chain_depth(deps, size_var)
+    if depth <= 1:
+        return "reached_sink"
+    if depth == 2:
+        return "one_hop_limit"
+    return "two_hop_untraced"
+
+
+def build_size_evidence(*, pseudocode: str, sink_name: str) -> dict[str, Any]:
+    """Assemble the size-flow evidence for one copy-sink candidate (JSON-serializable).
+
+    Pure and deterministic. Like ``build_flow_evidence`` this is EVIDENCE, never a judgement: it
+    classifies the write-length source (mechanism), reports the reliable one-hop size flow, lists
+    any upper-bound/guard shapes seen (each ``coverage=unjudged`` — presence only, never a
+    dominance claim), and states honestly where the size trace stops. It NEVER decides
+    "bounded / not" — that judgement is the agent's."""
+    cs = classify_copy_size(pseudocode, sink_name)
+    deps = _derives_map(pseudocode)
+    if cs.size_var is not None:
+        real = _real_vars(pseudocode, deps)
+        one_hop = sorted(v for v in deps.get(cs.size_var, set()) if v in real)
+    else:
+        one_hop = []
+    return {
+        "size_kind": cs.kind,
+        "size_flow": {"size_arg": cs.size_text, "size_var": cs.size_var, "one_hop": one_hop},
+        "clamp_seen": [{"shape": s, "coverage": "unjudged"} for s in cs.clamps],
+        "trace_boundary": _size_trace_boundary(pseudocode, cs.kind, cs.size_var, deps),
     }
 
 

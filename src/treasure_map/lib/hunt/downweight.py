@@ -102,6 +102,7 @@ _THIRD_PARTY_SYMBOL_RE = re.compile(
     r"|^cJSON_"  # cJSON
     r"|^curl_|^Curl_"  # curl
     r"|^xmlParse|^xmlNode|^xmlDoc|^xmlFree"  # libxml2
+    r"|^_ZN5boost|^boost::"  # boost (mangled / demangled)
     r")"
 )
 

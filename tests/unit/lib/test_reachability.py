@@ -354,6 +354,35 @@ def test_confirmed_unchanged() -> None:
     assert verdict.status == "confirmed"
 
 
+# ── copy sinks: graded on write length, never confirmed; bounded kinds get a form note ──
+
+
+@pytest.mark.parametrize(
+    ("pseudo", "sink", "callees", "note"),
+    [
+        # provably-bounded lengths -> a downweight form note, still unknown (never confirmed)
+        ("memcpy(dst, src, 0x20);", "memcpy", ["memcpy"], "const_size"),
+        ("memcpy(dst, src, sizeof(dst));", "memcpy", ["memcpy"], "sizeof_bound"),
+        (
+            "n = recv(fd, src, 0x400); if (0x100 < n) goto fail; memcpy(dst, src, n);",
+            "memcpy",
+            ["recv", "memcpy"],
+            "clamp_size",
+        ),
+        # lengths not proven bounded -> NO note (kept at normal rank, recall-neutral)
+        ("n = recv(fd, src, 0x400); memcpy(dst, src, n);", "memcpy", ["recv", "memcpy"], None),
+        ("strncpy(dst, src, strlen(src));", "strncpy", ["strncpy", "strlen"], None),
+    ],
+)
+def test_copy_graded_on_size_never_confirmed(
+    pseudo: str, sink: str, callees: list[str], note: str | None
+) -> None:
+    verdict = grade_candidate(pseudo, callees, sink)
+    assert verdict.status == "unknown"  # a copy never confirms within one function
+    assert verdict.status != "confirmed"
+    assert verdict.blocking_mechanism == note
+
+
 # ── BOUNDARY: no vendor/spike symbols, no bug-labeling vocab, generic validators ────
 
 
@@ -392,9 +421,10 @@ def test_validator_patterns_are_generic() -> None:
             ["websGetVar", "strcpy"],
             "strcpy",
         ),
-        # strong buffer source -> copy, but the frame is unrecovered (unaff_/in_ placeholders)
+        # strong buffer source -> copy, but the frame is unrecovered (unaff_/in_ placeholders).
+        # The copy length is a variable (no bound shown) so no size form note is attached.
         (
-            "recvfrom(in_a0, auStack_88, 0x40, 0); memcpy(unaff_s0, auStack_88, 0x40);",
+            "recvfrom(in_a0, auStack_88, n, 0); memcpy(unaff_s0, auStack_88, n);",
             ["recvfrom", "memcpy"],
             "memcpy",
         ),
@@ -418,13 +448,21 @@ def test_in_register_arg_is_caller_supplied() -> None:
 
 
 def test_clean_recovered_frame_still_confirms() -> None:
-    # No placeholders: an in-function strong source flowing unfiltered to the sink must still
-    # confirm — the unrecovered-ABI guard must not suppress legitimate clean flows.
-    pseudo = "char buf[64]; recv(fd,buf,64); strcpy(dst,buf);"
-    assert grade_candidate(pseudo, ["recv", "strcpy"], "strcpy").status == "confirmed"
-    # A recovered frame with an ordinary web handle (wp is not a placeholder) still confirms.
+    # No placeholders: an in-function strong source flowing unfiltered to a COMMAND sink still
+    # confirms — the unrecovered-ABI guard must not suppress legitimate clean flows. A recovered
+    # frame with an ordinary web handle (wp is not a placeholder) confirms.
     pseudo2 = 'uVar1 = websGetVar(wp, "name"); system(uVar1);'
     assert grade_candidate(pseudo2, ["websGetVar", "system"], "system").status == "confirmed"
+
+
+def test_copy_sink_is_never_confirmed() -> None:
+    # A copy sink is graded on its write length and never confirms within one function (proving
+    # the length is unbounded/controllable needs cross-function context). A clean strong-source
+    # copy with a source-length write is unknown + suspect, NOT confirmed.
+    pseudo = "char buf[64]; recv(fd,buf,64); strcpy(dst,buf);"
+    verdict = grade_candidate(pseudo, ["recv", "strcpy"], "strcpy")
+    assert verdict.status == "unknown"
+    assert verdict.blocking_mechanism is None  # source_len is a suspect; no bounded-safe downweight
 
 
 def test_abi_unrecovered_helper_precision() -> None:

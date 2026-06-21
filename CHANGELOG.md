@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Copy sinks (`memcpy` / `memmove` / `strncpy` / `strcpy`) are now graded on their WRITE LENGTH
+  (the danger axis), not on whether taint reaches the destination pointer. A copy never confirms
+  within one function (proving a length is truly unbounded and externally controllable needs
+  cross-function context), so the verdict is always `unknown` — with a size-source classification:
+  a literal constant (`const_size`) or `sizeof` (`sizeof_bound`) length is non-controllable
+  (downweighted hard, out of the high band); a clamp / pointer guard REFERENCING the length
+  (`clamp_size` / `pointer_guard_size`, including the check-then-abort form `if (CONST < n) ...`)
+  is a coverage-unjudged signal (downweighted mildly — the candidate stays visible); a variable
+  with no visible upper bound, a length taken from the source string's own length (`strncpy(dst,
+  src, strlen(src))` — equivalent to unbounded), or an untraced length gets NO downweight and keeps
+  its normal rank. Prove-bounded-to-demote, never prove-dangerous-to-keep: a copy not proven
+  bounded is never silently demoted (a clamp tied to a *different* variable, or a `> 0` non-bound,
+  does not count). This clears the false `confirmed` copies (a constant-length copy of tainted
+  bytes is bounded) so a real command candidate is no longer ranked beneath them. `memmove` is now
+  in the copy class. Copy candidates carry structured SIZE evidence (`size_kind`, `size_flow`,
+  `clamp_seen` with `coverage=unjudged`, `trace_boundary`) in the same `flow_evidence` field —
+  material for an agent, never a verdict.
 - The pattern analyzer now recovers command candidates whose sink hides one hop inside a thin
   command wrapper (factor ①): a function that builds a string and forwards it to a function marked
   `is_thin_cmd_wrapper` — with no command sink among its own callees — becomes a command candidate

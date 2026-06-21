@@ -36,7 +36,12 @@ from treasure_map.lib.hunt.downweight import (
     library_origin,
     wrapper_propagation_form_note,
 )
-from treasure_map.lib.hunt.evidence import EntryIndex, build_flow_evidence, load_entry_index
+from treasure_map.lib.hunt.evidence import (
+    EntryIndex,
+    build_flow_evidence,
+    build_size_evidence,
+    load_entry_index,
+)
 from treasure_map.lib.hunt.facts import is_thin_cmd_wrapper
 from treasure_map.lib.hunt.wrapper_propagation import (
     find_wrapper_propagated_candidates,
@@ -206,7 +211,11 @@ def run_analyzer2(
                 # the binary-level OSS exclusion); a form note marks a known low-yield shape. Only
                 # attach a form note when the grader left blocking_mechanism open.
                 origin = library_origin(match.func_ref.func_name) or "unknown"
-                if blocking is None:
+                # detect_form_signal reads the cmd/format danger axis (arg1). Copy sinks are graded
+                # on the write length by the grader (which already set blocking to a size form note,
+                # or left it None for a length not proven bounded), so the cmd-axis form notes must
+                # not run for them.
+                if blocking is None and match.sink_class != "copy":
                     callers_pc = [
                         funcs[cid].pseudocode or ""
                         for cid in callers_of.get(match.func_ref.func_id, ())
@@ -251,6 +260,15 @@ def run_analyzer2(
                             sink_arg=sink_arg,
                             entry_sites=sites,
                         ),
+                        sort_keys=True,
+                    )
+                elif match.sink_class == "copy" and sink_name is not None:
+                    # Copy candidates carry SIZE evidence (the danger axis): the length source
+                    # classification, the one-hop size flow, any clamp/guard seen (coverage
+                    # unjudged), and the honest trace boundary. Material for a later agent — never a
+                    # verdict; nothing reads it back into recall, the score, or the grade.
+                    flow_evidence = json.dumps(
+                        build_size_evidence(pseudocode=row.pseudocode, sink_name=sink_name),
                         sort_keys=True,
                     )
 

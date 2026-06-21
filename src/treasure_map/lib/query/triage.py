@@ -59,6 +59,15 @@ _FORM_DOWNWEIGHT: dict[str, float] = {
     # a dangerous sink with no recognized in-function source (the recall fallback): listed for
     # completeness but ranked low — the controlled input, if any, was not seen reaching it here.
     "bare_sink": -1.5,
+    # copy-sink size-source notes: the write length was shown bounded, so the copy is a low-yield
+    # form. A literal / sizeof length is non-controllable (demote hard, like a constant arg); a
+    # clamp / pointer guard only REFERENCES the length (coverage unjudged — demote mildly so the
+    # candidate stays visible, never buried). A variable / source-length / untraced length gets NO
+    # note and keeps its normal rank (a copy not proven bounded is never silently downweighted).
+    "const_size": -2.5,
+    "sizeof_bound": -2.5,
+    "clamp_size": -1.0,
+    "pointer_guard_size": -1.0,
 }
 
 

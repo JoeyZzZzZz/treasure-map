@@ -726,6 +726,52 @@ def _evidence_of(atlas_path: Path, fn: str) -> dict:
     return json.loads(row["flow_evidence"])
 
 
+def _copy_fn(name: str, copy_call: str, callees: list[str]) -> dict[str, object]:
+    # A copy candidate with a recognized source (recv) so R-pattern source-classifies it
+    # external_input; the copy_call decides the size-source grade.
+    body = f"void {name}(void){{ char d[64]; char s[256]; recv(fd,s,256); {copy_call} }}"
+    return {"name": name, "pseudocode": body, "hash": f"h_{name}", "callees": callees}
+
+
+def test_copy_size_bands_const_drops_variable_and_cmd_stay_high(tmp_path: Path) -> None:
+    # The copy-size danger axis in action. Four candidates in one run:
+    #   cc  — memcpy with a CONSTANT length      -> const_size, demoted out of the high band
+    #   cv  — memcpy with a VARIABLE length       -> no note, kept high (recall-neutral)
+    #   csl — strncpy(dst, src, strlen(src))      -> source_len suspect, kept high (#13: not safe)
+    #   cmd — an external->command candidate       -> floats ABOVE the de-confirmed copies
+    db = _make_db(
+        tmp_path,
+        [
+            {
+                "name": "svcd",
+                "funcs": [
+                    _copy_fn("cc", "memcpy(d,s,0x20);", ["recv", "memcpy"]),
+                    _copy_fn("cv", "n = recv(fd,s,256); memcpy(d,s,n);", ["recv", "memcpy"]),
+                    _copy_fn("csl", "strncpy(d,s,strlen(s));", ["recv", "strncpy", "strlen"]),
+                    _cmd_injection_fn("cmd", param_sourced=True),
+                ],
+            }
+        ],
+    )
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_band")
+
+    rows = _by_anchor(atlas)
+    # Copy sinks never confirm; the constant length is downweighted, the unproven lengths are not.
+    assert rows["cc"]["reachability_status"] == "unknown"
+    assert rows["cc"]["blocking_mechanism"] == "const_size"
+    assert rows["cv"]["blocking_mechanism"] is None
+    assert rows["csl"]["blocking_mechanism"] is None
+
+    s_cc, s_cv, s_csl, s_cmd = (_score_of(atlas, fn) for fn in ("cc", "cv", "csl", "cmd"))
+    # The constant-size copy is demoted out of the high band; the unbounded / source-length copies
+    # stay high (a true overflow is never silently demoted); the command candidate floats above.
+    assert s_cc < s_cv
+    assert s_cc < s_csl
+    assert s_cv >= 0.6 and s_csl >= 0.6
+    assert s_cmd > s_cv  # cmd no longer sits under a false-confirmed copy
+
+
 def test_cmd_candidate_carries_flow_evidence(tmp_path: Path) -> None:
     db = _make_db(tmp_path, [{"name": "netd", "funcs": [_charset_buffer_cmd_fn()]}])
     atlas = tmp_path / "atlas.db"
@@ -745,8 +791,9 @@ def test_cmd_candidate_carries_flow_evidence(tmp_path: Path) -> None:
     assert _by_anchor(atlas)["arp_run"]["blocking_mechanism"] != "charset_constrained"
 
 
-def test_copy_candidate_has_no_flow_evidence(tmp_path: Path) -> None:
-    # Flow evidence is built for the command-sink partition only; a pure copy candidate gets none.
+def test_copy_candidate_has_size_evidence(tmp_path: Path) -> None:
+    # A copy candidate carries SIZE evidence (the danger axis), not cmd flow evidence: strcpy's
+    # write length is the source string's length -> size_kind source_len (a suspect, not safe).
     fn = {
         "name": "cp_fn",
         "pseudocode": (
@@ -758,7 +805,9 @@ def test_copy_candidate_has_no_flow_evidence(tmp_path: Path) -> None:
     db = _make_db(tmp_path, [{"name": "webd", "funcs": [fn]}])
     atlas = tmp_path / "atlas.db"
     run_analyzer2(db, atlas, source_run_id="run_cp")
-    assert _by_anchor(atlas)["cp_fn"]["flow_evidence"] is None
+    ev = json.loads(_by_anchor(atlas)["cp_fn"]["flow_evidence"])
+    assert ev["size_kind"] == "source_len"
+    assert "size_flow" in ev and "clamp_seen" in ev and "trace_boundary" in ev
 
 
 def test_flow_evidence_records_entry_sites_from_script_calls(tmp_path: Path) -> None:
