@@ -72,7 +72,12 @@ def scan(db_path: Path | str) -> ScanResult:
     excluded_binaries: set[str] = set()
     functions_scanned = 0
     custom_functions = 0
-    hits = {"cmd_injection_shape": 0, "overflow_shape": 0, "bare_cmd_shape": 0}
+    hits = {
+        "cmd_injection_shape": 0,
+        "overflow_shape": 0,
+        "bare_cmd_shape": 0,
+        "fmt_string_shape": 0,
+    }
 
     for row in rows:
         functions_scanned += 1
@@ -102,5 +107,6 @@ def scan(db_path: Path | str) -> ScanResult:
         pattern_a=hits["cmd_injection_shape"],
         pattern_b=hits["overflow_shape"],
         bare_cmd=hits["bare_cmd_shape"],
+        fmt_string=hits["fmt_string_shape"],
     )
     return ScanResult(matches=tuple(matches), stats=stats)

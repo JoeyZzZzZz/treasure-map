@@ -9,6 +9,8 @@ generic, public C/libc and common-embedded API names; no vendor-proprietary symb
 
 from __future__ import annotations
 
+import re
+
 # External-input getters, split by strength of external controllability (neutral,
 # mechanism-based). Strength gates reachability grading only; R-pattern's shape detection
 # uses the SOURCE union below and is unaffected by the split.
@@ -111,3 +113,148 @@ COPY: frozenset[str] = frozenset(
         "memmove",
     }
 )
+
+# Format-string-injection sinks: pass a format string to a logger / printf-family interpreter.
+# The danger axis is the FORMAT-STRING argument position (NOT the destination/stream/level):
+# a non-literal format argument is a format-string-injection suspect (%n write, %s/%x read). These
+# do not build a buffer (so they are NOT in FORMAT, the buffer-formatter set) and are not commands.
+# snprintf/sprintf are deliberately excluded — they are buffer formatters handled as copy/overflow.
+FMT_STRING: frozenset[str] = frozenset(
+    {
+        "printf",
+        "vprintf",
+        "fprintf",
+        "vfprintf",
+        "dprintf",
+        "vdprintf",
+        "syslog",
+        "vsyslog",
+        "err",
+        "errx",
+        "verr",
+        "verrx",
+        "warn",
+        "warnx",
+        "vwarn",
+        "vwarnx",
+        "asprintf",
+        "vasprintf",
+    }
+)
+
+# The format-string argument index for each format-string sink (0-based). MUST be per-sink and
+# correct: fprintf's format is arg1 (arg0 is the FILE*), syslog's is arg1 (arg0 is the log level),
+# printf's is arg0. Blindly reading arg0 would treat a FILE*/level as the format — missing the
+# real sink and mis-judging the safe ones. asprintf/vasprintf write to arg0 (char**) so the format
+# is arg1.
+FMT_STRING_ARG: dict[str, int] = {
+    "printf": 0,
+    "vprintf": 0,
+    "warn": 0,
+    "warnx": 0,
+    "vwarn": 0,
+    "vwarnx": 0,
+    "fprintf": 1,
+    "vfprintf": 1,
+    "dprintf": 1,
+    "vdprintf": 1,
+    "syslog": 1,
+    "vsyslog": 1,
+    "err": 1,
+    "errx": 1,
+    "verr": 1,
+    "verrx": 1,
+    "asprintf": 1,
+    "vasprintf": 1,
+}
+
+# A whole argument that is a plain string literal (optionally an L"..." wide literal). A format
+# argument matching this is a fixed format string — the overwhelmingly common, safe shape.
+_FMT_LITERAL_RE = re.compile(r'^\s*L?"(?:[^"\\]|\\.)*"\s*$')
+_IDENT_RE = re.compile(r"[A-Za-z_]\w*")
+
+
+def _split_top_args(arglist: str) -> list[str]:
+    """Split a call's argument text on top-level commas (respecting strings / parens / brackets)."""
+    parts: list[str] = []
+    depth = 0
+    in_str = False
+    buf: list[str] = []
+    i = 0
+    while i < len(arglist):
+        ch = arglist[i]
+        if in_str:
+            buf.append(ch)
+            if ch == "\\" and i + 1 < len(arglist):
+                buf.append(arglist[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+            buf.append(ch)
+        elif ch in "([":
+            depth += 1
+            buf.append(ch)
+        elif ch in ")]":
+            depth -= 1
+            buf.append(ch)
+        elif ch == "," and depth == 0:
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+        i += 1
+    if buf:
+        parts.append("".join(buf))
+    return parts
+
+
+def _iter_format_args(pseudocode: str, sink_name: str) -> list[str | None]:
+    """The format-argument text of EVERY call to ``sink_name`` (None when its position is absent).
+
+    Iterates each call (balanced parentheses) so a function that calls a sink both with a literal
+    and with a variable format is judged on all calls, never just the first."""
+    pos = FMT_STRING_ARG.get(sink_name)
+    if pos is None:
+        return []
+    out: list[str | None] = []
+    for m in re.finditer(rf"\b{re.escape(sink_name)}\s*\(", pseudocode):
+        i = m.end() - 1  # at the '('
+        depth = 0
+        for j in range(i, len(pseudocode)):
+            ch = pseudocode[j]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    args = _split_top_args(pseudocode[i + 1 : j])
+                    out.append(args[pos].strip() if pos < len(args) else None)
+                    break
+    return out
+
+
+def all_format_calls_literal(pseudocode: str, sink_name: str) -> bool:
+    """True only when EVERY call to ``sink_name`` passes a string-literal format argument.
+
+    This is the exemption test (prove-safe-to-exempt): a sink is exempt only when all of its calls
+    have a fixed format string. If any call's format argument is non-literal — or its position is
+    unreadable — the function is NOT exempt (kept for recall; never miss a controllable format)."""
+    fmt_args = _iter_format_args(pseudocode, sink_name)
+    if not fmt_args:
+        return False  # the call could not be located -> do not exempt
+    return all(a is not None and bool(_FMT_LITERAL_RE.match(a)) for a in fmt_args)
+
+
+def format_string_ident(pseudocode: str, sink_name: str) -> str | None:
+    """Leading identifier of the FIRST non-literal format argument of ``sink_name`` (the danger
+    axis), or None when every call's format argument is a literal / unreadable."""
+    for arg in _iter_format_args(pseudocode, sink_name):
+        if arg is None or _FMT_LITERAL_RE.match(arg):
+            continue
+        ident = _IDENT_RE.search(arg)
+        if ident is not None:
+            return ident.group(0)
+    return None

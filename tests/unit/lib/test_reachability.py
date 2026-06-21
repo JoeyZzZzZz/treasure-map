@@ -383,6 +383,37 @@ def test_copy_graded_on_size_never_confirmed(
     assert verdict.blocking_mechanism == note
 
 
+# ── format-string sinks: graded on the FORMAT argument (per-sink position) ───────────
+
+
+def test_fmtstr_confirmed_when_strong_source_is_the_format() -> None:
+    # syslog's format is arg1; a strong in-function source flows into it unfiltered -> confirmed.
+    pseudo = "char buf[64]; recv(fd, buf, 64); syslog(3, buf);"
+    verdict = grade_candidate(pseudo, ["recv", "syslog"], "syslog")
+    assert verdict.status == "confirmed"
+
+
+def test_fmtstr_parameter_format_is_unknown() -> None:
+    # The CVE shape with a caller-supplied format: caller control is unprovable here -> unknown.
+    pseudo = "void h(char* param_1){ syslog(3, param_1); }"
+    verdict = grade_candidate(pseudo, ["syslog"], "syslog")
+    assert verdict.status == "unknown"
+    assert verdict.status != "confirmed"
+
+
+def test_fmtstr_position_arg1_not_arg0_for_fprintf() -> None:
+    # fprintf's format is arg1: a strong source in arg1 confirms; the FILE* in arg0 is not the axis.
+    pseudo = "char buf[64]; recv(fd, buf, 64); fprintf(fp, buf);"
+    assert grade_candidate(pseudo, ["recv", "fprintf"], "fprintf").status == "confirmed"
+
+
+def test_fmtstr_literal_format_grades_unknown_degraded() -> None:
+    # A literal format has no controllable identifier on the danger axis -> no sink arg located.
+    pseudo = 'syslog(3, "msg %s", x);'
+    verdict = grade_candidate(pseudo, ["syslog"], "syslog")
+    assert verdict.status == "unknown"
+
+
 # ── BOUNDARY: no vendor/spike symbols, no bug-labeling vocab, generic validators ────
 
 

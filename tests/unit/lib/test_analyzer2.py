@@ -772,6 +772,55 @@ def test_copy_size_bands_const_drops_variable_and_cmd_stay_high(tmp_path: Path) 
     assert s_cmd > s_cv  # cmd no longer sits under a false-confirmed copy
 
 
+def test_fmtstr_cve_recalled_and_literal_not_flooded(tmp_path: Path) -> None:
+    # Dual acceptance of the recall round: (1) the public format-string-injection shape
+    # syslog(level, buf) with a non-literal format is RECALLED as an fmt_string candidate;
+    # (2) the common literal-format logger produces NO candidate (the FP gate; band not flooded).
+    db = _make_db(
+        tmp_path,
+        [
+            {
+                "name": "logd",
+                "funcs": [
+                    {
+                        "name": "risky_log",  # synthetic name; the shape is syslog(level, buf)
+                        "pseudocode": "void risky_log(char* param_1){ syslog(0, param_1); }",
+                        "hash": "h_vl",
+                        "callees": ["syslog"],
+                    },
+                    {
+                        "name": "safe_log",
+                        "pseudocode": 'void safe_log(char* x){ syslog(3, "event %s", x); }',
+                        "hash": "h_sl",
+                        "callees": ["syslog"],
+                    },
+                ],
+            }
+        ],
+    )
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_fmt")
+    rows = _by_anchor(atlas)
+    # (1) recalled, as an fmt_string candidate anchored to syslog, with format evidence.
+    assert "risky_log" in rows
+    ev = json.loads(rows["risky_log"]["flow_evidence"])
+    assert ev["fmt_arg_pos"] == 1 and ev["fmt_arg_literal"] is False
+    assert rows["risky_log"]["sink_anchor"] == "syslog"
+    # (2) the literal-format logger is exempt -> not a candidate at all.
+    assert "safe_log" not in rows
+
+
+def test_fmtstr_class_outranks_copy_when_same_status(tmp_path: Path) -> None:
+    # A format-string sink (RCE-class) carries the same sink weight as cmd, above copy/format.
+    from treasure_map.lib.query.triage import review_score
+
+    s_fmt = review_score("unknown", None, "unknown", "external_input", "fmt_string")
+    s_copy = review_score("unknown", None, "unknown", "external_input", "copy")
+    s_cmd = review_score("unknown", None, "unknown", "external_input", "cmd")
+    assert s_fmt > s_copy
+    assert s_fmt == s_cmd
+
+
 def test_cmd_candidate_carries_flow_evidence(tmp_path: Path) -> None:
     db = _make_db(tmp_path, [{"name": "netd", "funcs": [_charset_buffer_cmd_fn()]}])
     atlas = tmp_path / "atlas.db"

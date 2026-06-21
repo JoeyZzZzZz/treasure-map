@@ -17,6 +17,7 @@ from pathlib import Path
 from treasure_map.lib.hunt.evidence import (
     EntryIndex,
     build_flow_evidence,
+    build_fmtstr_evidence,
     build_size_evidence,
     load_entry_index,
 )
@@ -360,6 +361,29 @@ def test_size_evidence_untraced_when_absent() -> None:
     ev = build_size_evidence(pseudocode='snprintf(c, 64, "%s", x);', sink_name="memcpy")
     assert ev["size_kind"] == "untraced"
     assert ev["trace_boundary"] == "size_arg_untraced"
+
+
+# ── format-string evidence: flow on the format arg + format-position facts ───────────
+
+
+def test_fmtstr_evidence_records_position_and_source() -> None:
+    # syslog format is arg1; a free source reaches it -> free_string, plus format-position facts.
+    pc = "void f(void){ char* v=nvram_get(0); syslog(3, v); }"
+    ev = build_fmtstr_evidence(
+        pseudocode=pc, callees=["nvram_get", "syslog"], sink_name="syslog", entry_sites=None
+    )
+    assert ev["source_kind"] == "free_string"
+    assert ev["fmt_arg_pos"] == 1
+    assert ev["fmt_arg_literal"] is False  # a candidate's format must be non-literal
+    assert "trace_boundary" in ev and "sanitizer_seen" in ev
+
+
+def test_fmtstr_evidence_printf_position_zero() -> None:
+    ev = build_fmtstr_evidence(
+        pseudocode="printf(user);", callees=["printf"], sink_name="printf", entry_sites=None
+    )
+    assert ev["fmt_arg_pos"] == 0
+    assert ev["fmt_arg_literal"] is False
 
 
 # ── ★ blind-spot guard: evidence never feeds recall / score / grade ──────────────────

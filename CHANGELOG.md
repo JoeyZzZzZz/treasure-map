@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Format-string-injection sinks (`printf` / `fprintf` / `dprintf` / `syslog` / `vsyslog` / `err` /
+  `warn` / `asprintf` and their `v*` variants) are now recalled as a new `fmt_string` sink class —
+  an entire sink category that was previously absent (it builds no buffer, runs no command, copies
+  nothing). The danger axis is each sink's own FORMAT-STRING argument position (per-sink map:
+  `printf` arg0, `fprintf` / `syslog` / `err` arg1, …) — never a blind arg0, which would read a
+  `FILE*` / log level as the format. The literal-format exemption GATES the recall (the
+  FP-suppression that makes this safe to turn on): a sink is a candidate only when not all of its
+  calls pass a literal format string — the overwhelmingly common `syslog(level, "msg %s", x)` /
+  `printf("%s", x)` is exempt and never floods the candidate set, while `syslog(level, buf)` /
+  `printf(user)` (a non-literal, controllable-shaped format) is recalled. Prove-safe-to-exempt: a
+  format that cannot be shown literal (any non-literal call, or an unreadable position) is kept.
+  Format-string candidates are graded on the format argument (a strong in-function source flowing
+  to it confirms; a caller-supplied format is unknown) and carry flow evidence on that argument
+  plus the format-position facts (`fmt_arg_pos`, `fmt_arg_literal`); the `fmt_string` sink class
+  ranks alongside `cmd` (both RCE-class interpreters), above copy/format. This closes the L0 recall
+  floor for the format-string-injection class.
 - Copy sinks (`memcpy` / `memmove` / `strncpy` / `strcpy`) are now graded on their WRITE LENGTH
   (the danger axis), not on whether taint reaches the destination pointer. A copy never confirms
   within one function (proving a length is truly unbounded and externally controllable needs

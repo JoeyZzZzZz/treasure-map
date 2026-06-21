@@ -16,7 +16,15 @@ import sqlite3
 from pathlib import Path
 
 from treasure_map.lib.pattern import scan
-from treasure_map.lib.pattern.classes import CMD, COPY, FORMAT, SOURCE
+from treasure_map.lib.pattern.classes import (
+    CMD,
+    COPY,
+    FMT_STRING,
+    FORMAT,
+    SOURCE,
+    all_format_calls_literal,
+    format_string_ident,
+)
 from treasure_map.lib.pattern.fingerprint import FINGERPRINT_ALGO_VERSION
 from treasure_map.lib.pattern.oss import GENERIC_OSS_NAMES, is_oss_binary
 from treasure_map.lib.storage.connection import open_db
@@ -211,6 +219,80 @@ def test_pattern_b_positive(tmp_path: Path) -> None:
     assert m.evidence == "strcpy"
 
 
+# ── Pattern fmtstr — format-string-injection shape (recall gated by literal exemption) ──
+
+
+def _fmt_match(tmp_path: Path, name: str, pseudocode: str, callees: list[str]):
+    db = _make_db(
+        tmp_path,
+        [{"name": "logd", "funcs": [{"name": name, "pseudocode": pseudocode, "callees": callees}]}],
+    )
+    return [m for m in scan(db).matches if m.sink_class == "fmt_string"]
+
+
+def test_fmtstr_non_literal_format_is_recalled(tmp_path: Path) -> None:
+    # printf(user) — the format argument is a variable -> a format-string-injection candidate.
+    (m,) = _fmt_match(tmp_path, "log_it", "printf(user);", ["printf"])
+    assert m.pattern_kind == "fmt_string_shape"
+    assert m.sink_class == "fmt_string"
+    assert m.evidence == "printf"
+
+
+def test_fmtstr_literal_format_is_exempt(tmp_path: Path) -> None:
+    # printf("%s", user) — fixed format string -> NOT a candidate (the FP gate: the common case).
+    assert _fmt_match(tmp_path, "log_it", 'printf("%s", user);', ["printf"]) == []
+
+
+def test_fmtstr_syslog_cve_shape_is_recalled(tmp_path: Path) -> None:
+    # The public format-string-injection shape: syslog(level, buf) with a non-literal format ->
+    # recalled. syslog's format is arg1 (arg0 is the level) — the danger axis is read correctly.
+    (m,) = _fmt_match(tmp_path, "do_log", "syslog(3, buf);", ["syslog"])
+    assert m.evidence == "syslog"
+
+
+def test_fmtstr_syslog_literal_is_exempt(tmp_path: Path) -> None:
+    assert _fmt_match(tmp_path, "do_log", 'syslog(3, "msg %s", x);', ["syslog"]) == []
+
+
+def test_fmtstr_position_correct_fprintf_literal_not_recalled(tmp_path: Path) -> None:
+    # ★ format position: fprintf's format is arg1. fprintf(fp, "lit") has a non-literal arg0 (fp)
+    # but a LITERAL format -> must NOT be recalled (arg0 is not the danger axis).
+    assert _fmt_match(tmp_path, "wr", 'fprintf(fp, "lit");', ["fprintf"]) == []
+
+
+def test_fmtstr_position_correct_fprintf_variable_recalled(tmp_path: Path) -> None:
+    (m,) = _fmt_match(tmp_path, "wr", "fprintf(fp, buf);", ["fprintf"])
+    assert m.evidence == "fprintf"
+
+
+def test_fmtstr_bare_no_source_still_listed(tmp_path: Path) -> None:
+    # Source presence is a scoring signal, not a gate: non-literal format, no source, still listed.
+    (m,) = _fmt_match(tmp_path, "wr", "vprintf(fmt, ap);", ["vprintf"])
+    assert m.source_class == "unknown"
+    assert m.call_sequence_shape == "fmt_string"
+
+
+def test_fmtstr_mixed_calls_recalled_conservatively(tmp_path: Path) -> None:
+    # One literal call + one variable call to the same sink -> recalled (never miss the risky one).
+    (m,) = _fmt_match(tmp_path, "wr", 'syslog(3, "ok"); syslog(3, buf);', ["syslog"])
+    assert m.evidence == "syslog"
+
+
+def test_fmtstr_helpers_literal_and_ident() -> None:
+    assert all_format_calls_literal('printf("%s", x);', "printf") is True
+    assert all_format_calls_literal("printf(user);", "printf") is False
+    assert all_format_calls_literal('fprintf(fp, "lit");', "fprintf") is True
+    assert all_format_calls_literal("fprintf(fp, buf);", "fprintf") is False
+    assert format_string_ident("syslog(3, buf);", "syslog") == "buf"
+    assert format_string_ident('syslog(3, "lit");', "syslog") is None
+    # mixed: returns the first NON-literal format identifier
+    assert format_string_ident('printf("ok"); printf(other);', "printf") == "other"
+
+
+def test_fmtstr_sink_set_disjoint_from_other_classes() -> None:
+    assert not (FMT_STRING & (CMD | COPY | FORMAT | SOURCE))
+
+
 # ── OSS exclusion (the iteration-1 lesson) ──────────────────────────────────────────
 
 
@@ -387,7 +469,7 @@ def test_pattern_package_is_boundary_clean() -> None:
 
 def test_call_class_and_oss_sets_are_generic_identifiers() -> None:
     ident = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-    for name in SOURCE | FORMAT | CMD | COPY:
+    for name in SOURCE | FORMAT | CMD | COPY | FMT_STRING:
         assert ident.match(name), f"non-identifier call-class entry: {name!r}"
     oss_ident = re.compile(r"^[a-z0-9_]+$")
     for name in GENERIC_OSS_NAMES:

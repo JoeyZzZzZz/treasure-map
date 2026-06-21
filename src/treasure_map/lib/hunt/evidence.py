@@ -36,7 +36,12 @@ from treasure_map.lib.hunt.downweight import (
     _CHARSET_SAFE,
     _charset_inline_constrained,
 )
-from treasure_map.lib.pattern.classes import SOURCE
+from treasure_map.lib.pattern.classes import (
+    FMT_STRING_ARG,
+    SOURCE,
+    all_format_calls_literal,
+    format_string_ident,
+)
 from treasure_map.lib.reachability.copy_size import (
     SIZE_CONST,
     SIZE_SIZEOF,
@@ -303,6 +308,30 @@ def build_size_evidence(*, pseudocode: str, sink_name: str) -> dict[str, Any]:
         "clamp_seen": [{"shape": s, "coverage": "unjudged"} for s in cs.clamps],
         "trace_boundary": _size_trace_boundary(pseudocode, cs.kind, cs.size_var, deps),
     }
+
+
+def build_fmtstr_evidence(
+    *,
+    pseudocode: str,
+    callees: list[str],
+    sink_name: str,
+    entry_sites: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Assemble the flow evidence for one format-string-injection candidate (JSON-serializable).
+
+    The danger axis is the FORMAT argument (per-sink position). This reuses the command-sink flow
+    evidence on that argument (source_kind / flow_path / sanitizer_seen / entry_reach /
+    trace_boundary) and adds two format-specific facts: which positional argument is the format
+    string, and whether every call passes a literal format (it must NOT, or this would not be a
+    candidate — recorded for the agent's transparency). EVIDENCE, never a verdict — it does not
+    decide the format is truly controllable; that judgement is the agent's."""
+    fmt_arg = format_string_ident(pseudocode, sink_name)
+    ev = build_flow_evidence(
+        pseudocode=pseudocode, callees=callees, sink_arg=fmt_arg, entry_sites=entry_sites
+    )
+    ev["fmt_arg_pos"] = FMT_STRING_ARG.get(sink_name)
+    ev["fmt_arg_literal"] = all_format_calls_literal(pseudocode, sink_name)
+    return ev
 
 
 class EntryIndex:

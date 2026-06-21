@@ -39,6 +39,7 @@ from treasure_map.lib.hunt.downweight import (
 from treasure_map.lib.hunt.evidence import (
     EntryIndex,
     build_flow_evidence,
+    build_fmtstr_evidence,
     build_size_evidence,
     load_entry_index,
 )
@@ -47,7 +48,7 @@ from treasure_map.lib.hunt.wrapper_propagation import (
     find_wrapper_propagated_candidates,
 )
 from treasure_map.lib.pattern import scan
-from treasure_map.lib.pattern.classes import CMD, COPY, FORMAT
+from treasure_map.lib.pattern.classes import CMD, COPY, FMT_STRING, FORMAT
 from treasure_map.lib.reachability import grade_candidate
 from treasure_map.lib.reachability.taint import locate_sink_arg
 
@@ -87,7 +88,12 @@ def _load_entry_index(db_path: Path | str) -> EntryIndex:
         conn.close()
 
 
-_SINK_CLASS_MEMBERS: dict[str, frozenset[str]] = {"cmd": CMD, "copy": COPY, "format": FORMAT}
+_SINK_CLASS_MEMBERS: dict[str, frozenset[str]] = {
+    "cmd": CMD,
+    "copy": COPY,
+    "format": FORMAT,
+    "fmt_string": FMT_STRING,
+}
 
 # Shell-running command sinks. When a function calls several command sinks, anchor to one of
 # these over an exec-family sink (Bug1): system/popen/doSystem run a shell, so anchoring to the
@@ -195,7 +201,14 @@ def run_analyzer2(
                     continue
 
                 callees = _parse_callees(row.callees)
-                sink_name = _sink_name_for(callees, match.sink_class)
+                # For a format-string candidate the risky (non-literal) sink was already chosen by
+                # the recall detector and carried in evidence; anchor to it so a literal-exempt
+                # sibling sink (e.g. a printf("lit") alongside a syslog(buf)) is never anchored.
+                sink_name: str | None
+                if match.sink_class == "fmt_string":
+                    sink_name = match.evidence
+                else:
+                    sink_name = _sink_name_for(callees, match.sink_class)
                 sink_arg = (
                     locate_sink_arg(row.pseudocode, sink_name) if sink_name is not None else None
                 )
@@ -211,11 +224,12 @@ def run_analyzer2(
                 # the binary-level OSS exclusion); a form note marks a known low-yield shape. Only
                 # attach a form note when the grader left blocking_mechanism open.
                 origin = library_origin(match.func_ref.func_name) or "unknown"
-                # detect_form_signal reads the cmd/format danger axis (arg1). Copy sinks are graded
-                # on the write length by the grader (which already set blocking to a size form note,
-                # or left it None for a length not proven bounded), so the cmd-axis form notes must
-                # not run for them.
-                if blocking is None and match.sink_class != "copy":
+                # detect_form_signal reads the cmd danger axis (arg0). Copy sinks are graded on the
+                # write length, and format-string sinks on their per-sink format argument, by the
+                # grader — so the cmd-axis form notes must not run for either (they would read the
+                # wrong argument). Their FP-suppression lives elsewhere: copy in the size grade, the
+                # format-string literal exemption in the recall detector.
+                if blocking is None and match.sink_class not in ("copy", "fmt_string"):
                     callers_pc = [
                         funcs[cid].pseudocode or ""
                         for cid in callers_of.get(match.func_ref.func_id, ())
@@ -269,6 +283,19 @@ def run_analyzer2(
                     # verdict; nothing reads it back into recall, the score, or the grade.
                     flow_evidence = json.dumps(
                         build_size_evidence(pseudocode=row.pseudocode, sink_name=sink_name),
+                        sort_keys=True,
+                    )
+                elif match.sink_class == "fmt_string" and sink_name is not None:
+                    # Format-string candidates carry flow evidence on the FORMAT argument plus the
+                    # format-position facts (which arg is the format; literal-only or not).
+                    sites = entry_index.sites_for(row.binary_name, row.binary_path)
+                    flow_evidence = json.dumps(
+                        build_fmtstr_evidence(
+                            pseudocode=row.pseudocode,
+                            callees=callees,
+                            sink_name=sink_name,
+                            entry_sites=sites,
+                        ),
                         sort_keys=True,
                     )
 

@@ -20,6 +20,7 @@ PatternKind = Literal[
     "cmd_injection_shape",
     "overflow_shape",
     "bare_cmd_shape",
+    "fmt_string_shape",
 ]
 
 
@@ -59,6 +60,7 @@ class PatternStats:
     pattern_a: int  # cmd_injection_shape matches
     pattern_b: int  # overflow_shape matches
     bare_cmd: int = 0  # bare_cmd_shape matches (cmd sink, no constructed shell command)
+    fmt_string: int = 0  # fmt_string_shape matches (non-literal format-string sink)
 
 
 @dataclass(frozen=True)

@@ -14,7 +14,14 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 
-from treasure_map.lib.pattern.classes import CMD, COPY, FORMAT, SOURCE
+from treasure_map.lib.pattern.classes import (
+    CMD,
+    COPY,
+    FMT_STRING,
+    FORMAT,
+    SOURCE,
+    all_format_calls_literal,
+)
 from treasure_map.lib.pattern.fingerprint import (
     FINGERPRINT_ALGO_VERSION,
     structural_fingerprint,
@@ -37,16 +44,18 @@ class CallClasses:
     fmt: frozenset[str]
     cmd: frozenset[str]
     copy: frozenset[str]
+    fmt_string: frozenset[str]
 
 
 def classify(callees: list[str]) -> CallClasses:
-    """Bucket callee names into source / format / cmd / copy classes."""
+    """Bucket callee names into source / format / cmd / copy / fmt_string classes."""
     names = {c.strip() for c in callees if isinstance(c, str) and c.strip()}
     return CallClasses(
         source=frozenset(names & SOURCE),
         fmt=frozenset(names & FORMAT),
         cmd=frozenset(names & CMD),
         copy=frozenset(names & COPY),
+        fmt_string=frozenset(names & FMT_STRING),
     )
 
 
@@ -162,9 +171,36 @@ def pattern_b(func_ref: FuncRef, callees: list[str], pseudocode: str) -> Pattern
     )
 
 
+def pattern_fmtstr(func_ref: FuncRef, callees: list[str], pseudocode: str) -> PatternMatch | None:
+    """Format-string-injection shape: a logger/printf-family sink with a NON-LITERAL format arg.
+
+    The literal-format exemption is the FP-suppression that GATES this recall (the overwhelmingly
+    common syslog/printf passes a fixed format string and must not flood the candidate set): a sink
+    is a candidate only when not all of its calls pass a literal format argument — i.e. at least one
+    call's format-string position is a variable / constructed value (a format-string-injection
+    suspect). Source presence is a SCORING signal, not a gate (same as pattern_b): a non-literal
+    format with no recognized in-function source is still listed, just lower. The risky sink is
+    chosen deterministically (sorted) so the evidence anchor is stable."""
+    cc = classify(callees)
+    if not cc.fmt_string:
+        return None
+    risky = sorted(s for s in cc.fmt_string if not all_format_calls_literal(pseudocode, s))
+    if not risky:
+        return None  # every format-string sink uses a fixed format -> exempt (no candidate)
+    has_src = bool(cc.source)
+    return _match(
+        func_ref,
+        "fmt_string_shape",
+        _source_class(cc),
+        "fmt_string",
+        "source->fmt_string" if has_src else "fmt_string",
+        risky[0],
+    )
+
+
 Detector = Callable[[FuncRef, list[str], str], "PatternMatch | None"]
 
 # Explicit registry — one entry per shape, plain callables only. pattern_a and bare_cmd are
 # mutually exclusive on the same function (bare_cmd defers when pattern_a's shell-ish literal is
 # present), so each (function, sink class) yields at most one candidate.
-DETECTORS: tuple[Detector, ...] = (pattern_a, bare_cmd, pattern_b)
+DETECTORS: tuple[Detector, ...] = (pattern_a, bare_cmd, pattern_b, pattern_fmtstr)

@@ -93,9 +93,10 @@ _ORIGIN_WEIGHT: dict[str, float] = {
 # stored source_class is the only signal available here.)
 _SOURCE_CLASS_WEIGHT: dict[str, float] = {"external_input": 0.3}
 
-# Sink class, ordered by the operation the sink performs (command execution above buffer copy
-# above string formatting). This is an ordering weight, not a magnitude-of-harm claim.
-_SINK_CLASS_WEIGHT: dict[str, float] = {"cmd": 0.4, "copy": 0.2, "format": 0.0}
+# Sink class, ordered by the operation the sink performs (command execution and format-string
+# injection — both RCE-class interpreters — above buffer copy above string formatting). This is an
+# ordering weight, not a magnitude-of-harm claim.
+_SINK_CLASS_WEIGHT: dict[str, float] = {"cmd": 0.4, "fmt_string": 0.4, "copy": 0.2, "format": 0.0}
 
 
 def _bounds() -> tuple[float, float]:

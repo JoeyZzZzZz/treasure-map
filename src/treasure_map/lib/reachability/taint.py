@@ -20,14 +20,23 @@ from __future__ import annotations
 import re
 from typing import Literal
 
-from treasure_map.lib.pattern.classes import CMD, COPY, FORMAT, SOURCE, SOURCE_STRONG, SOURCE_WEAK
+from treasure_map.lib.pattern.classes import (
+    CMD,
+    COPY,
+    FMT_STRING,
+    FORMAT,
+    SOURCE,
+    SOURCE_STRONG,
+    SOURCE_WEAK,
+    format_string_ident,
+)
 
 OriginKind = Literal["strong_source", "weak_source", "parameter", "unknown"]
 
 # Identifiers that are NOT variables and must not become flow edges (they pollute the flow
 # set and let an unrelated validator spuriously "cover" a dangerous input). Callee names are
 # detected per-function; these cover C/Ghidra type words and control keywords.
-_CALL_CLASS_NAMES = SOURCE | FORMAT | COPY | CMD
+_CALL_CLASS_NAMES = SOURCE | FORMAT | COPY | CMD | FMT_STRING
 _TYPE_WORDS = frozenset(
     {
         "char",
@@ -159,6 +168,15 @@ def locate_sink_arg(pseudocode: str, sink_name: str) -> str | None:
         return None
     ident = _IDENT_RE.search(match.group(1))
     return ident.group(0) if ident else None
+
+
+def locate_format_arg(pseudocode: str, sink_name: str) -> str | None:
+    """Return the identifier feeding a format-string sink's FORMAT argument (the danger axis).
+
+    The format position is per-sink (fprintf -> arg1, printf -> arg0, …); a literal format
+    argument is safe and yields None. Returns the first non-literal format argument's identifier,
+    or None when every call passes a literal / the call is unreadable."""
+    return format_string_ident(pseudocode, sink_name)
 
 
 def _arg_ident(args: str, pos: int) -> str | None:

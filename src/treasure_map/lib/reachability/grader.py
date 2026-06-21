@@ -23,7 +23,7 @@ confirmed defect or a publishable result.
 
 from __future__ import annotations
 
-from treasure_map.lib.pattern.classes import COPY
+from treasure_map.lib.pattern.classes import COPY, FMT_STRING
 from treasure_map.lib.reachability.copy_size import (
     SIZE_CLAMP,
     SIZE_CONST,
@@ -46,6 +46,7 @@ from treasure_map.lib.reachability.taint import (
     _seed_sets,
     abi_unrecovered,
     flows_into,
+    locate_format_arg,
     locate_sink_arg,
 )
 
@@ -151,7 +152,13 @@ def grade_candidate(
         basis = _COPY_BASIS.get(cs.kind, _BASIS_ORIGIN_UNKNOWN)
         return ReachabilityVerdict("unknown", copy_size_form_note(cs.kind), basis)
 
-    sink_arg = locate_sink_arg(pseudocode, sink_name)
+    # Format-string sinks are graded on the FORMAT argument (the danger axis), per-sink position;
+    # a literal format yields no identifier (safe). Every other sink is graded on arg0 (command
+    # string) exactly as before — the cmd path is byte-for-byte unchanged.
+    if sink_name in FMT_STRING:
+        sink_arg = locate_format_arg(pseudocode, sink_name)
+    else:
+        sink_arg = locate_sink_arg(pseudocode, sink_name)
     if sink_arg is None:
         return ReachabilityVerdict("unknown", None, _BASIS_NO_SINK, degraded=True)
 
