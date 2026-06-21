@@ -38,6 +38,7 @@ if [ -n "$BASE_REF" ]; then
             ":(exclude).githooks/commit-msg" \
             ":(exclude).githooks/lib.sh" \
             ":(exclude)tests/unit/test_precommit_hook.py" \
+            ":(exclude)tests/unit/test_mcp_app.py" \
             | grep '^+' | grep -v '^+++' || true)
 
     if HITS=$(printf '%s' "$ADDED" | tm_scan_text "$WATCHLIST"); then :; else

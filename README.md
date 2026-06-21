@@ -155,11 +155,14 @@ after the per-firmware `analysis.db` is wiped/rebuilt**.
 
 The list **caps at 20 by default** (it tells you when more exist). To see past the cap: `--all` shows
 every candidate, and **`--sink <x>` shows every candidate for one sink, uncapped and across all
-statuses** — by callee (`--sink system`, `popen`, `execl`, `strcpy`) or class (`--sink cmd|copy|
-format`). Use `--sink system` when a recalled sink you care about is scored low and would otherwise
-sit below the default cap.
+statuses** — by callee (`--sink system`, `popen`, `execl`, `strcpy`, `syslog`) or class (`--sink
+cmd|copy|fmt_string|format`). Use `--sink system` when a recalled sink you care about is scored low
+and would otherwise sit below the default cap.
 
-**Recall before precision.** A dangerous sink callsite (`system`/`popen`/`exec*`, `strcpy`/`memcpy`/…)
+**Recall before precision.** A dangerous sink callsite — command execution (`system`/`popen`/`exec*`),
+a buffer copy (`strcpy`/`memcpy`/…), or a format-string-injection sink (`syslog`/`printf`/`fprintf`/
+`err`/`warn`/…, flagged when the **format-string argument is non-literal** — a fixed format string is
+exempt; an uncontrolled format is RCE-class, ranked alongside command injection) —
 is listed as a candidate even when no input source is recognized inside the function — the
 controlled value may arrive through a caller, and a candidate that is never listed is the most
 hidden false negative. Known low-yield forms are then **ranked low, never dropped**: a bare sink
