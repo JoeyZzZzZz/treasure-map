@@ -18,7 +18,7 @@ CLI: `tmap`. AGPL-3.0.
 |---|---|---|
 | Ghidra | 11.x | decompiles every binary (headless) |
 | JDK | 21 | required by Ghidra 11.x (older JDKs make Ghidra fail to launch) |
-| API key(s) | — | only for the LLM fallback in `hunt-diff` (stripped/renamed residue); `tmap analyze`, `hunt-pattern`, and `hunt-diff --max-assist 0` run with no key |
+| API key(s) | — | only for the LLM fallback in `diff` (stripped/renamed residue); `tmap analyze`, `hunt`, and `diff --max-assist 0` run with no key |
 
 You install Ghidra and JDK yourself; the Setup below installs Treasure Map and the right Python
 for you. (A zero-setup Docker image with everything bundled is planned; until then, follow Setup.)
@@ -87,9 +87,14 @@ One command. uv fetches a managed CPython 3.11, builds Treasure Map in an isolat
 and puts the `tmap` command on your PATH — nothing to activate.
 
 ```bash
-uv tool install --python 3.11 "git+https://github.com/JoeyZzZzZz/treasure-map.git"
+uv tool install --python 3.11 --with mcp "git+https://github.com/JoeyZzZzZz/treasure-map.git"
 tmap --help
 ```
+
+`--with mcp` bundles the optional AI-facing [MCP server](#ai-facing-access-mcp-server) so it works
+out of the box; omit it if you only want the CLI. Already installed without it?
+`uv tool upgrade treasure-map --with mcp` adds it. (Not using uv? `pip install
+"treasure-map[mcp]"` installs the same extra.)
 
 (The `git+…` URL is fetched with **git**, so make sure git is installed — `sudo apt install -y
 git`. Later: `uv tool upgrade treasure-map` / `uv tool uninstall treasure-map`.)
@@ -142,7 +147,7 @@ the two stores decouple on purpose (`analysis.db` is wipe-and-rebuild; the atlas
 
 ```bash
 tmap analyze ./_firmware.extracted -w router_v1                                  # -> analysis.db
-tmap hunt-pattern router_v1/analysis.db --run-id router_v1                       # -> atlas
+tmap hunt router_v1/analysis.db --run-id router_v1                               # -> atlas
 tmap triage router_v1                # ranked globally by score; lower # = look first (top reachable on top)
 tmap triage router_v1 --explain 1    # explain rank #1 (also accepts --explain <evidence_ref>)
 ```
@@ -189,7 +194,7 @@ Useful flags: `--skip-non-binary`, `--skip-ingester <KIND>`, `-c <config.yaml>`.
 
 **Go further (optional)**, once you have one or more `analysis.db`:
 ```bash
-tmap hunt-diff <old.db> <new.db> ...   # diff two builds, grade reachability
+tmap diff <old.db> <new.db> ...        # diff two builds, grade reachability
 tmap atlas-view ...                     # neutral cross-firmware aggregation
 ```
 
@@ -203,20 +208,79 @@ own judgement on a reproducible, cross-artifact substrate. It is **not** an arbi
 proxy: the value is the full, deterministically re-derivable structure plus the derived,
 evidence-backed review-ordering signals.
 
+The server ships in the optional `mcp` extra — installed already if you ran Step 4 with `--with
+mcp` (otherwise `uv tool upgrade treasure-map --with mcp`).
+
 ```bash
-pip install "treasure-map[mcp]"        # the server is an optional extra
-tmap mcp-serve --analysis-db router_v1/analysis.db --atlas router_v1/atlas.db
+tmap mcp        # serve the most recent scan (no paths needed)
 ```
 
-The server runs over stdio and offers read-only tools: `list_candidates`, `explain_candidate`,
-`get_pseudocode`, `get_callees`, `get_xrefs`, `get_strings`, `get_imports_exports`,
-`get_script_callsites`, `get_components_cves`, and `get_disassembly`. Two contracts hold on every
-tool: **every result carries an evidence anchor** (binary + function + address, or script + line)
-— a lookup that resolves nothing returns a "not found" record, never a guess — and the output is
-**facts, chains, reachability evidence, and trigger conditions only; never a payload, trigger
-bytes, or PoC**. The ordering signals (`score`, `entry_reach`, `blocking_mechanism`) are labelled
-derived and evidence-backed — a lead to verify, never a verdict. The CLI's `tmap fact …` commands
-read the same layer, so a fact fetched on the command line and over MCP are identical.
+`scan` / `hunt` / `analyze` record a **last-run pointer**, so a bare `tmap mcp` serves the
+analysis from your latest scan — no flags. To serve a specific run instead, pass absolute paths:
+`tmap mcp --analysis-db /abs/router_v1/analysis.db --atlas /abs/router_v1/atlas.db`.
+
+`tmap mcp` is a **stdio server meant to be launched by an MCP client**, not a daemon you keep
+running — started by hand it just waits on stdin. Register it once with your client (next section)
+and the client spawns it on demand.
+
+It offers read-only tools over the same fact layer the CLI's `tmap fact …` commands use (so a fact
+fetched either way is identical):
+
+- **`list_candidates`** — the ranked leads for the firmware the server is bound to (it isolates to
+  the current run, so a shared atlas doesn't mix in another image); filter by `sink` / `sink_class`
+  / `status`, and page with `limit` + `offset`.
+- **`explain_candidate`** — one candidate's score breakdown, honest bounds, and where to verify.
+- **`get_pseudocode` / `get_callees` / `get_xrefs` / `get_strings` / `get_imports_exports` /
+  `get_script_callsites` / `get_components_cves` / `get_disassembly`** — the structured facts to
+  chase a lead across the whole firmware.
+- **`cross_firmware_patterns` / `pattern_density`** (plus `pattern_twins` / `dormant_candidates`) —
+  cross-firmware recurrence signals to judge which lead is worth your time first.
+- **`legal_notice`** — the intended-use notice.
+
+Two contracts hold on every tool: **every result carries an evidence anchor** (binary + function +
+address, or script + line) — a lookup that resolves nothing returns a "not found" record, never a
+guess — and the output is **facts, chains, reachability evidence, and trigger conditions only;
+never a payload, trigger bytes, or PoC**. The ordering signals (`score`, `entry_reach`,
+`device_spread`, `blocking_mechanism`) are labelled derived and evidence-backed — a lead to verify,
+never a verdict.
+
+### Using it from an AI agent
+
+**Register it with Claude Code once.** Use **absolute paths** (a client spawns the server in an
+environment where `~` may not expand) and the `user` scope so it's available from any directory:
+
+```bash
+claude mcp add -s user treasure-map -- tmap mcp \
+  --analysis-db /abs/path/to/analysis.db --atlas /abs/path/to/atlas.db
+claude mcp list      # treasure-map ✓ Connected
+```
+
+Registered once, Claude Code **spawns the server automatically** every session — no manual `tmap
+mcp`. You can even drop the two paths (`-- tmap mcp`) to follow the last-run pointer instead.
+**Switching firmware:** with the no-paths form a fresh `tmap scan` is picked up automatically;
+otherwise re-`add` with the new `--analysis-db`. Cursor and other MCP clients work the same way —
+point their "command" at `tmap mcp …`.
+
+**A prompt to start the agent off** (the server also carries a workflow hint, but a nudge helps):
+
+> Audit this firmware with the treasure-map MCP. Start with `list_candidates` (filter by
+> `sink_class` / `status`) and read down the ranked list from the top. Pick one, take its
+> `evidence_ref` (or its function name / address) and call `get_pseudocode`, then follow the
+> callers with `get_xrefs` (direction `callers`) to trace upstream. Candidates are **leads, not
+> conclusions** — recall is wide so expect false positives; read the pseudocode and judge for
+> yourself. Use `cross_firmware_patterns` to see whether a lead recurs across firmware images.
+
+**A typical loop:**
+
+1. `list_candidates` → scan the top of the ranked list, pick a lead.
+2. take its `evidence_ref` (or function name + address) → `get_pseudocode`.
+3. `get_callees` to step into the sink, `get_xrefs` (direction `callers`) to trace upstream.
+4. read the code and decide — the tools draw no conclusion for you.
+
+Two honest edges that match how the tools behave: an **empty caller set is not "unreachable"** —
+the function may be reached through an indirect / dispatch-table call static analysis can't resolve
+(the result says so). And **which function references a given string is not indexed** — `get_strings`
+locates the string and its address; resolve the reference site in your disassembler's xref view.
 
 ## Pointing Treasure Map at Ghidra
 
@@ -296,7 +360,9 @@ before proceeding.
 
 ## Status
 
-This project is in early development. APIs and behaviors will change.
+This project is in early development. APIs and behaviors will change. Current coverage: command-
+execution, buffer-copy, and format-string-injection sinks, with an AI-facing MCP server over the
+shared fact layer.
 
 ## Uninstalling
 
