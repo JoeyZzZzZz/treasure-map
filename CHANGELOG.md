@@ -7,7 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Command names shortened** to their common form: `hunt-pattern` → `hunt`, `hunt-diff` →
+  `diff`, `mcp-serve` → `mcp`. The previous names stay resolvable as hidden aliases (not shown in
+  `--help`) so existing scripts keep working; command behavior, options, and output are unchanged.
+
 ### Added
+
+- `tmap mcp` now starts **without explicit paths**: `scan` / `hunt` / `analyze` record a last-run
+  pointer (`~/.treasure-map/last_run.json`, the analysis.db + atlas absolute paths + run id), and
+  `tmap mcp` serves that most-recent run when `--analysis-db` / `--atlas` are omitted (explicit
+  paths still win). A missing pointer is a friendly message, not a traceback; a missing `mcp`
+  optional dependency prints a one-line install hint and exits non-zero; and the stdio server
+  prints a "launch me from an MCP client" hint to **stderr** (stdout stays clean JSON-RPC).
+- The MCP server gained the capabilities the CLI already had, plus the cross-firmware views:
+  - `list_candidates` defaults to the **firmware the server is bound to** (the current run), so a
+    shared cross-firmware atlas no longer mixes another image's leads into the session; a
+    stale/mismatched binding falls back to all runs annotated with `is_current_run` and a per-run
+    `runs` summary. It also gained the `tmap triage` filters (`sink` by callee or class, exact
+    `sink_class`, `status`, `include_gated`) and **pagination** (`limit` capped at 200 + `offset`,
+    with `total` / `returned` / `truncated` / `next_offset` metadata replacing the ambiguous
+    `count`). The sink/status filter logic now lives in `lib.query` so the CLI and MCP share it.
+  - New read-only aggregation tools over the atlas: `cross_firmware_patterns` (per-pattern
+    `device_spread` × `pattern_breadth` — the highest-value cross-firmware recurrence signal),
+    `pattern_density`, `pattern_twins`, and `dormant_candidates`. Each carries the derived-not-a-
+    verdict note; twins/dormant may be empty depending on the atlas's firmware mix.
+  - The MCP protocol `instructions` are now the agent **workflow guide** (recall → fetch facts →
+    judge; candidates are leads not verdicts; `evidence_ref` is the cross-tool anchor; empty
+    callers may be an indirect call) instead of just the legal banner, which stays reachable via
+    the `legal_notice` tool.
 
 - An AI-facing **MCP server** (`tmap mcp-serve`, optional `treasure-map[mcp]` extra) exposes the
   analysis knowledge base as read-only tools: `list_candidates` / `explain_candidate` (recall

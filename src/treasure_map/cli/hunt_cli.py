@@ -52,7 +52,7 @@ def _echo_legal_notice(*, as_json: bool = False) -> None:
     click.echo("", err=True)
 
 
-@click.command("hunt-diff", short_help="Diff two analysis.db builds; grade reachability.")
+@click.command("diff", short_help="Diff two analysis.db builds; grade reachability.")
 @click.argument("db_a", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.argument("db_b", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option(
@@ -167,7 +167,7 @@ def hunt_diff(
     )
 
 
-@click.command("hunt-pattern", short_help="Find call-sequence shape candidates in a build.")
+@click.command("hunt", short_help="Find call-sequence shape candidates in a build.")
 @click.argument("db", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--run-id", required=True, help="Neutral per-run id (the device_spread unit).")
 @click.option(
@@ -197,10 +197,13 @@ def hunt_pattern(
     """
     from treasure_map.lib.config.config import load_config
     from treasure_map.lib.hunt import run_analyzer2
+    from treasure_map.lib.last_run import write_last_run
 
     cfg = load_config(config)
     resolved_atlas = atlas_path if atlas_path is not None else cfg.atlas.db_path
     stats = run_analyzer2(db, resolved_atlas, source_run_id=run_id)
+    # Record this as the last run so `tmap mcp` can serve it without explicit paths.
+    write_last_run(db, resolved_atlas, run_id)
 
     click.echo(f"Atlas: {resolved_atlas}")
     click.echo(f"  Functions scanned : {stats.scanned}")
@@ -219,9 +222,6 @@ def hunt_pattern(
     )
 
 
-_SECTION_ORDER = ("to-verify", "reachable", "gated")
-
-
 _DEFAULT_TOP = 20
 
 
@@ -235,13 +235,6 @@ def _effective_top(top_n: int | None, *, show_all: bool, sink: str | None) -> in
     if sink is not None:
         return None
     return _DEFAULT_TOP
-
-
-def _sink_matches(candidate: TriageCandidate, sink: str) -> bool:
-    """True if a --sink filter value names this candidate's sink — by concrete callee
-    (system / popen / execl …) OR by sink class (cmd / copy / format). Case-insensitive."""
-    needle = sink.lower()
-    return (candidate.sink_anchor or "").lower() == needle or candidate.sink_class.lower() == needle
 
 
 def _render_triage(
@@ -264,6 +257,9 @@ def _render_triage(
     top_n is None for an untruncated (full) view."""
     import json
 
+    from treasure_map.lib.query import shown_statuses as _shown_statuses
+    from treasure_map.lib.query import sink_matches as _sink_matches
+
     counts = {"reachable": 0, "to-verify": 0, "gated": 0}
     for c in candidates:
         counts[c.review_status] = counts.get(c.review_status, 0) + 1
@@ -271,22 +267,14 @@ def _render_triage(
     # Stable global rank, assigned over the FULL list before filtering/truncation.
     ranked = list(enumerate(candidates, 1))  # [(rank, candidate), ...]
 
-    # Decide which review statuses to display (rank is unaffected by this). A --sink filter for a
-    # specific class shows it across all statuses (so "--sink system" surfaces every system
-    # candidate, including gated ones, instead of being hidden by the default fold).
-    if status == "all" or sink is not None:
-        shown_statuses = set(_SECTION_ORDER)
-    elif status is not None:
-        shown_statuses = {status}
-    else:
-        shown_statuses = {"to-verify", "reachable"}
-        if include_gated:
-            shown_statuses.add("gated")
+    # Decide which review statuses to display (rank is unaffected by this) — shared with the MCP
+    # candidate list so the two fold/show identically. A --sink filter shows all statuses.
+    visible_statuses = _shown_statuses(status, include_gated=include_gated, sink=sink)
 
     visible = [
         (r, c)
         for r, c in ranked
-        if c.review_status in shown_statuses and (sink is None or _sink_matches(c, sink))
+        if c.review_status in visible_statuses and (sink is None or _sink_matches(c, sink))
     ][:top_n]
 
     if as_json:
@@ -336,7 +324,7 @@ def _render_triage(
         # stays locatable even if its analysis.db is gone. Without this a candidate is unactionable
         # in a firmware of hundreds of binaries.
         click.echo(f"        in: {c.binary_path or '?'}")
-    if "gated" not in shown_statuses and counts["gated"]:
+    if "gated" not in visible_statuses and counts["gated"]:
         click.echo(f"\n  (gated: {counts['gated']} hidden; --include-gated to show)")
     click.echo(
         "\nNote: candidates are leads for manual review, ranked by how much they warrant "
@@ -794,6 +782,10 @@ def scan(
         f"blocked={h.by_status.get('blocked', 0)}, "
         f"unknown={h.by_status.get('unknown', 0)})"
     )
+    # Record this as the last run so `tmap mcp` (no args) serves this firmware's analysis.db.
+    from treasure_map.lib.last_run import write_last_run
+
+    write_last_run(result.db_path, resolved_atlas, effective_run_id)
 
     # [3/3] triage — the readable, ranked candidate list (same renderer as `tmap triage`).
     click.echo("\n[3/3] triage — ranked candidates for manual review:\n")

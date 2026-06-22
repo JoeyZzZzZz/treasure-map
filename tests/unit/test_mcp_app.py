@@ -27,6 +27,10 @@ from treasure_map.lib.storage.connection import open_db
 _EXPECTED_TOOLS = {
     "list_candidates",
     "explain_candidate",
+    "cross_firmware_patterns",
+    "pattern_density",
+    "pattern_twins",
+    "dormant_candidates",
     "get_pseudocode",
     "get_callees",
     "get_xrefs",
@@ -179,8 +183,51 @@ def test_list_candidates_carries_anchor_entry_reach_and_note(tmp_path: Path) -> 
 
 def test_list_candidates_sink_class_filter(tmp_path: Path) -> None:
     tools = _tools(tmp_path)
-    assert tools["list_candidates"](sink_class="copy")["count"] == 0
-    assert tools["list_candidates"](sink_class="cmd")["count"] == 1
+    assert tools["list_candidates"](sink_class="copy")["total"] == 0
+    assert tools["list_candidates"](sink_class="cmd")["total"] == 1
+
+
+def test_list_candidates_sink_and_pagination_metadata(tmp_path: Path) -> None:
+    tools = _tools(tmp_path)
+    # B2: --sink semantics (concrete callee OR class) align with the CLI.
+    assert tools["list_candidates"](sink="do_fwd")["total"] == 1  # by sink_anchor
+    assert tools["list_candidates"](sink="cmd")["total"] == 1  # by class
+    assert tools["list_candidates"](sink="nope")["total"] == 0
+    # B5: pagination metadata + limit clamp.
+    out = tools["list_candidates"](limit=1, offset=0)
+    assert out["total"] == 1 and out["returned"] == 1 and out["truncated"] is False
+    assert out["next_offset"] is None
+    page2 = tools["list_candidates"](limit=1, offset=1)
+    assert page2["returned"] == 0
+    assert tools["list_candidates"](limit=9999)["limit"] <= 200  # clamped
+
+
+def test_list_candidates_run_isolation(tmp_path: Path) -> None:
+    # B1: a server bound to run_m only surfaces run_m candidates by default; an explicit run_id
+    # for another run isolates to it (here empty), and is_current_run flags the bound run.
+    analysis, atlas = _mk_analysis(tmp_path), _mk_atlas(tmp_path)
+    tools = mcp_app.make_tools(analysis, atlas, run_id="run_m")
+    out = tools["list_candidates"]()
+    assert out["current_run_id"] == "run_m"
+    assert out["isolated_to_run"] == "run_m"
+    assert all(c["is_current_run"] for c in out["candidates"])
+    # a bound run that has no candidates falls back to all runs, annotated (not an empty list)
+    tools_stale = mcp_app.make_tools(analysis, atlas, run_id="does_not_exist")
+    fb = tools_stale["list_candidates"]()
+    assert fb["isolated_to_run"] is None and fb["total"] == 1
+    assert fb["runs"] is not None  # firmware split shown when not isolated
+
+
+def test_cross_firmware_and_aggregation_tools(tmp_path: Path) -> None:
+    # B3: the atlas-view aggregations are reachable as tools and carry the derived note.
+    tools = _tools(tmp_path)
+    xf = tools["cross_firmware_patterns"]()
+    assert "DERIVED" in xf["note"]
+    (pat,) = xf["patterns"]
+    assert "device_spread" in pat and "pattern_breadth" in pat
+    for name in ("pattern_density", "pattern_twins", "dormant_candidates"):
+        r = tools[name]()
+        assert "note" in r and "count" in r  # may be empty, but always anchored + noted
 
 
 # ── ★ milestone: recall -> fetch facts -> follow the chain (AI then judges) ─────────
@@ -211,6 +258,18 @@ def test_disassembly_unavailable_is_honest(tmp_path: Path) -> None:
 
 def test_legal_notice_present(tmp_path: Path) -> None:
     tools = _tools(tmp_path)
+    assert "defensive" in tools["legal_notice"]()["notice"].lower()
+
+
+def test_server_instructions_are_workflow_not_just_legalese(tmp_path: Path) -> None:
+    # B4: the standing instructions are the agent workflow guide; the legal notice stays reachable
+    # via the legal_notice tool.
+    analysis, atlas = _mk_analysis(tmp_path), _mk_atlas(tmp_path)
+    server = mcp_app.build_server(analysis, atlas)
+    instr = server.instructions or ""
+    assert "evidence_ref" in instr and "cross_firmware_patterns" in instr
+    assert "RECALL" in instr  # the loop, not just the banner
+    tools = mcp_app.make_tools(analysis, atlas)
     assert "defensive" in tools["legal_notice"]()["notice"].lower()
 
 

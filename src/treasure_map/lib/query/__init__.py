@@ -14,8 +14,11 @@ from treasure_map.lib.query.triage import (
     ScoreComponent,
     TriageCandidate,
     explain_candidate,
+    filter_candidates,
     review_score,
     score_breakdown,
+    shown_statuses,
+    sink_matches,
     triage,
 )
 from treasure_map.lib.query.views import (
@@ -41,9 +44,12 @@ __all__ = [
     "density",
     "dormant",
     "explain_candidate",
+    "filter_candidates",
     "ledger",
     "review_score",
     "score_breakdown",
+    "shown_statuses",
+    "sink_matches",
     "triage",
     "twins",
 ]

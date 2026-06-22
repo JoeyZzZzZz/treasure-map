@@ -123,6 +123,14 @@ def analyze(
     except TreasureMapError as exc:
         raise click.ClickException(f"{type(exc).__name__}: {exc}") from exc
 
+    # Record the produced analysis.db as the last run so `tmap mcp` can serve it without explicit
+    # paths. analyze writes no atlas instances itself, so the run id is the workspace name (the
+    # default a later `hunt`/`scan` would use); a subsequent hunt with an explicit --run-id updates
+    # the pointer.
+    from treasure_map.lib.last_run import write_last_run
+
+    write_last_run(result.db_path, cfg.atlas.db_path, ws_path.name)
+
     click.echo(f"\nDone in {result.elapsed:.1f}s")
     click.echo(f"  Binaries : {result.binary_count}")
     click.echo(f"  Dirty    : {result.dirty_count}")

@@ -35,18 +35,46 @@ from typing import Any
 from treasure_map.lib import facts
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.notice import LEGAL_NOTICE
+from treasure_map.lib.query import density as _density
+from treasure_map.lib.query import dormant as _dormant
 from treasure_map.lib.query import explain_candidate as _explain_candidate
+from treasure_map.lib.query import filter_candidates as _filter_candidates
+from treasure_map.lib.query import ledger as _ledger
 from treasure_map.lib.query import triage as _triage
+from treasure_map.lib.query import twins as _twins
 
-# A standing reminder attached to every candidate-listing result: the ordering signals are derived
-# from neutral stored facts, carry their evidence, and are NOT a security verdict.
+# A standing reminder attached to every candidate-listing / aggregation result: the ordering and
+# recurrence signals are derived from neutral stored facts, carry their evidence, and are NOT a
+# security verdict.
 _DERIVED_SIGNAL_NOTE = (
-    "score / entry_reach / blocking_mechanism are DERIVED, evidence-backed review-ordering "
-    "signals — NOT a verdict. A candidate is a lead to verify, never a confirmed issue."
+    "score / entry_reach / device_spread / blocking_mechanism are DERIVED, evidence-backed "
+    "review-ordering signals — NOT a verdict. A candidate is a lead to verify, never a confirmed "
+    "issue."
+)
+
+# Hard cap on a single list_candidates page so an over-large limit cannot blow up the context.
+_MAX_LIMIT = 200
+
+# The server's standing instruction to an AI client: the working loop, not legalese. The legal
+# notice stays reachable via the legal_notice tool (B4).
+_AGENT_INSTRUCTIONS = (
+    "Treasure Map exposes a firmware analysis knowledge base as read-only fact tools. Work the "
+    "loop: RECALL -> FETCH FACTS -> JUDGE. (1) list_candidates gives leads ranked by a derived "
+    "review-ordering score for the firmware this server is bound to (the current run); it is NOT "
+    "a verdict — recall is deliberately wide, so expect false positives and DEMOTE a candidate "
+    "yourself once the pseudocode shows it benign. (2) For a lead, follow its evidence_ref (the "
+    "cross-tool anchor) and read facts: get_pseudocode (func = a name OR an address in any form; "
+    "binary = short name OR full path), get_callees / get_xrefs to walk the call chain (an empty "
+    "caller set may mean an indirect/dispatch-table call, not 'unreachable'), get_strings, "
+    "get_imports_exports, get_script_callsites, get_components_cves. (3) Judge value with the "
+    "cross-firmware signals: cross_firmware_patterns (a pattern recurring across many firmware "
+    "images) and get_components_cves (known-CVE components). Prefer narrow filters (run_id / sink "
+    "/ status) and paging over pulling everything; fetch detail per evidence_ref. The tools draw "
+    "no conclusion and emit no payload/PoC — that judgement is yours."
 )
 
 
-def _candidate_dict(c: Any) -> dict[str, Any]:
+def _candidate_dict(c: Any, current_run_id: str | None = None) -> dict[str, Any]:
     """One triage candidate as a flat, JSON-serializable record (anchor + derived signals)."""
     return {
         "evidence_ref": c.evidence_ref,  # the anchor
@@ -62,16 +90,35 @@ def _candidate_dict(c: Any) -> dict[str, Any]:
         "entry_reach": c.entry_reach,  # found promotes within tier; unknown is neutral
         "score": c.score,  # derived review-ordering signal, NOT a verdict
         "source_run_id": c.source_run_id,
+        # True when this candidate belongs to the firmware run the server is bound to (None when
+        # the server is not bound to a specific run, e.g. explicit db paths with no run pointer).
+        "is_current_run": (None if current_run_id is None else c.source_run_id == current_run_id),
     }
 
 
-def make_tools(analysis_db: Path | str, atlas_db: Path | str) -> dict[str, Callable[..., Any]]:
-    """Build the tool callables bound to one workspace's databases.
+def _run_summary(candidates: list[Any]) -> list[dict[str, Any]]:
+    """Per-run candidate counts, so an unisolated listing still shows the firmware split."""
+    counts: dict[str | None, int] = {}
+    for c in candidates:
+        counts[c.source_run_id] = counts.get(c.source_run_id, 0) + 1
+    return [
+        {"source_run_id": run, "count": n}
+        for run, n in sorted(counts.items(), key=lambda kv: (-kv[1], str(kv[0])))
+    ]
 
-    Returned as plain functions so the CLI, the MCP registration, and the tests all invoke the
-    SAME code path (parity by construction)."""
+
+def make_tools(
+    analysis_db: Path | str, atlas_db: Path | str, run_id: str | None = None
+) -> dict[str, Callable[..., Any]]:
+    """Build the tool callables bound to one workspace's databases (and optionally one run).
+
+    ``run_id`` is the firmware this server is bound to; list_candidates defaults to it so a shared
+    cross-firmware atlas does not mix another image's leads into this session. Returned as plain
+    functions so the CLI, the MCP registration, and the tests all invoke the SAME code path
+    (parity by construction)."""
     analysis_path = Path(analysis_db)
     atlas_path = Path(atlas_db)
+    current_run_id = run_id
 
     def _with_analysis(
         fn: Callable[[sqlite3.Connection], dict[str, Any]],
@@ -83,24 +130,122 @@ def make_tools(analysis_db: Path | str, atlas_db: Path | str) -> dict[str, Calla
             conn.close()
 
     def list_candidates(
-        run_id: str | None = None, sink_class: str | None = None, limit: int = 50
+        run_id: str | None = None,
+        sink: str | None = None,
+        sink_class: str | None = None,
+        status: str | None = None,
+        include_gated: bool = False,
+        limit: int = 50,
+        offset: int = 0,
     ) -> dict[str, Any]:
         """List recall candidates with their derived, evidence-backed review-ordering signals.
 
-        Each candidate carries its anchor (evidence_ref), sink/source class, reachability status,
-        blocking_mechanism, entry_reach, and the review score. Signals are DERIVED and NOT a
-        verdict. Optional ``sink_class`` filter (cmd / fmt_string / copy / format) and ``limit``."""
+        Defaults to the firmware this server is bound to (the current run), so a shared atlas does
+        not surface another image's leads. Filters mirror `tmap triage`: ``sink`` (a concrete
+        callee like ``syslog`` OR a class like ``cmd``), ``sink_class`` (exact class), ``status``
+        (to-verify / reachable / gated / all — default folds gated unless ``include_gated``).
+        Paged: ``limit`` (capped at 200) + ``offset``; the result carries ``total`` / ``returned``
+        / ``truncated`` / ``next_offset``. Each candidate carries its anchor (evidence_ref) and
+        is_current_run. Signals are DERIVED, NOT a verdict. Prefer a narrow filter and the head of
+        the list, then fetch detail per evidence_ref — do not pull the whole list at once."""
+        effective = run_id if run_id is not None else current_run_id
         conn = open_atlas(atlas_path)
         try:
-            ranked = _triage(conn, run_id=run_id)
+            ranked = _triage(conn, run_id=effective)
+            isolated_to = effective
+            # A stale/mismatched pointer can isolate to a run with no candidates. Rather than show
+            # an empty list, fall back to all runs and annotate which one is current (B1 fallback).
+            if run_id is None and current_run_id is not None and not ranked:
+                ranked = _triage(conn, run_id=None)
+                isolated_to = None
         finally:
             conn.close()
+        ranked = _filter_candidates(ranked, sink=sink, status=status, include_gated=include_gated)
         if sink_class is not None:
             ranked = [c for c in ranked if c.sink_class == sink_class]
+        total = len(ranked)
+        lim = max(0, min(limit, _MAX_LIMIT))
+        off = max(0, offset)
+        page = ranked[off : off + lim]
+        end = off + len(page)
         return {
             "note": _DERIVED_SIGNAL_NOTE,
-            "count": len(ranked),
-            "candidates": [_candidate_dict(c) for c in ranked[: max(0, limit)]],
+            "current_run_id": current_run_id,
+            "isolated_to_run": isolated_to,
+            # the firmware split, shown only when NOT isolated to a single run (else all one run)
+            "runs": _run_summary(ranked) if isolated_to is None else None,
+            "total": total,
+            "returned": len(page),
+            "offset": off,
+            "limit": lim,
+            "truncated": end < total,
+            "next_offset": end if end < total else None,
+            "candidates": [_candidate_dict(c, current_run_id) for c in page],
+        }
+
+    def cross_firmware_patterns(limit: int = 50) -> dict[str, Any]:
+        """Per-pattern recurrence ledger — the highest-value cross-firmware signal.
+
+        For each pattern: ``device_spread`` (how many distinct firmware runs it appears in) and
+        ``pattern_breadth`` (distinct fine fingerprints). A candidate whose pattern recurs across
+        many firmware images is worth reviewing sooner. DERIVED, evidence-backed, NOT a verdict."""
+        conn = open_atlas(atlas_path)
+        try:
+            rows = _ledger(conn)
+        finally:
+            conn.close()
+        return {
+            "note": _DERIVED_SIGNAL_NOTE,
+            "count": len(rows),
+            "patterns": [asdict(r) for r in rows[: max(0, limit)]],
+        }
+
+    def pattern_density(limit: int = 100) -> dict[str, Any]:
+        """Candidate-instance density per (run, sink_class, fingerprint).
+
+        A count difference for the same fingerprint across runs (e.g. present in one build, absent
+        in another) is an early recurrence signal. DERIVED counts only, NOT a verdict."""
+        conn = open_atlas(atlas_path)
+        try:
+            rows = _density(conn)
+        finally:
+            conn.close()
+        return {
+            "note": _DERIVED_SIGNAL_NOTE,
+            "count": len(rows),
+            "density": [asdict(r) for r in rows[: max(0, limit)]],
+        }
+
+    def pattern_twins(limit: int = 100) -> dict[str, Any]:
+        """Fingerprints seen with BOTH a blocked and a non-blocked instance (same shape, mixed).
+
+        A mixed-reachability fingerprint can flag a guard present in one place and absent in
+        another. May be empty depending on the atlas's firmware mix. DERIVED, NOT a verdict."""
+        conn = open_atlas(atlas_path)
+        try:
+            rows = _twins(conn)
+        finally:
+            conn.close()
+        return {
+            "note": _DERIVED_SIGNAL_NOTE,
+            "count": len(rows),
+            "twins": [asdict(r) for r in rows[: max(0, limit)]],
+        }
+
+    def dormant_candidates(limit: int = 100) -> dict[str, Any]:
+        """Candidates whose in-function path carries an identified guard (blocked, L0/L1).
+
+        Useful to spot a guard that may be absent elsewhere. May be empty depending on the atlas's
+        firmware mix. Each row is a lead, NOT a confirmed mitigation. DERIVED, NOT a verdict."""
+        conn = open_atlas(atlas_path)
+        try:
+            rows = _dormant(conn)
+        finally:
+            conn.close()
+        return {
+            "note": _DERIVED_SIGNAL_NOTE,
+            "count": len(rows),
+            "dormant": [dict(r) for r in rows[: max(0, limit)]],
         }
 
     def explain_candidate(evidence_ref: str) -> dict[str, Any]:
@@ -171,6 +316,10 @@ def make_tools(analysis_db: Path | str, atlas_db: Path | str) -> dict[str, Calla
     return {
         "list_candidates": list_candidates,
         "explain_candidate": explain_candidate,
+        "cross_firmware_patterns": cross_firmware_patterns,
+        "pattern_density": pattern_density,
+        "pattern_twins": pattern_twins,
+        "dormant_candidates": dormant_candidates,
         "get_pseudocode": get_pseudocode,
         "get_callees": get_callees,
         "get_xrefs": get_xrefs,
@@ -183,23 +332,37 @@ def make_tools(analysis_db: Path | str, atlas_db: Path | str) -> dict[str, Calla
     }
 
 
-def build_server(analysis_db: Path | str, atlas_db: Path | str) -> Any:
+def build_server(analysis_db: Path | str, atlas_db: Path | str, run_id: str | None = None) -> Any:
     """Construct a FastMCP server exposing the fact tools bound to one workspace.
 
-    Imported lazily so the rest of the package does not require the ``mcp`` dependency."""
+    The server's standing instructions are the agent workflow guide; the legal notice stays
+    reachable via the legal_notice tool. Imported lazily so the rest of the package does not
+    require the ``mcp`` dependency."""
     from mcp.server.fastmcp import FastMCP
 
-    server = FastMCP("treasure-map", instructions=LEGAL_NOTICE)
-    for fn in make_tools(analysis_db, atlas_db).values():
+    server = FastMCP("treasure-map", instructions=_AGENT_INSTRUCTIONS)
+    for fn in make_tools(analysis_db, atlas_db, run_id).values():
         server.add_tool(fn)
     return server
 
 
 def main() -> None:
-    """Entry point: serve over stdio. DB paths from TREASURE_MAP_ANALYSIS_DB / _ATLAS_DB."""
-    analysis_db = os.environ.get("TREASURE_MAP_ANALYSIS_DB", "analysis.db")
-    atlas_db = os.environ.get("TREASURE_MAP_ATLAS_DB", "atlas.db")
-    build_server(analysis_db, atlas_db).run()
+    """Entry point: serve over stdio.
+
+    DB paths and run id come from TREASURE_MAP_ANALYSIS_DB / _ATLAS_DB / _RUN_ID; when the db env
+    vars are unset, fall back to the last-run pointer a prior scan recorded."""
+    from treasure_map.lib.last_run import read_last_run
+
+    analysis_db = os.environ.get("TREASURE_MAP_ANALYSIS_DB")
+    atlas_db = os.environ.get("TREASURE_MAP_ATLAS_DB")
+    run_id = os.environ.get("TREASURE_MAP_RUN_ID")
+    if analysis_db is None or atlas_db is None:
+        ptr = read_last_run()
+        if ptr is not None:
+            analysis_db = analysis_db or str(ptr.analysis_db)
+            atlas_db = atlas_db or str(ptr.atlas_db)
+            run_id = run_id or ptr.run_id
+    build_server(analysis_db or "analysis.db", atlas_db or "atlas.db", run_id).run()
 
 
 if __name__ == "__main__":

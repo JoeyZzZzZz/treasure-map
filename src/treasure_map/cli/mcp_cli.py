@@ -10,6 +10,7 @@ construction (the CLI and MCP are two thin wrappers over one query, never two im
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import click
 
@@ -83,11 +84,73 @@ def script_callsites(binary: str, analysis_db: str) -> None:
         conn.close()
 
 
-@click.command(name="mcp-serve")
-@click.option("--analysis-db", default="analysis.db", help="Path to the analysis database.")
-@click.option("--atlas", "atlas_db", default="atlas.db", help="Path to the atlas database.")
-def mcp_serve(analysis_db: str, atlas_db: str) -> None:
-    """Run the Treasure Map MCP server over stdio (exposes the fact substrate to an AI client)."""
-    from treasure_map.mcp_app import build_server
+def _resolve_mcp_target(
+    analysis_db: str | None, atlas_db: str | None
+) -> tuple[str, str, str | None]:
+    """Resolve (analysis_db, atlas_db, run_id) from explicit args or the last-run pointer.
 
-    build_server(analysis_db, atlas_db).run()
+    Explicit paths always win. When either is omitted, the pointer a prior `tmap scan` recorded
+    fills it in (the common "I just scanned, now serve it" case). The run id is bound only when
+    the resolved analysis.db matches the recorded run, so list_candidates isolates to the right
+    firmware. A missing pointer with no explicit path is a friendly error, not a traceback."""
+    from treasure_map.lib.last_run import read_last_run
+
+    ptr = read_last_run()
+    if (analysis_db is None or atlas_db is None) and ptr is None:
+        raise click.ClickException(
+            "no --analysis-db given and no recorded run found. Run `tmap scan <firmware>` first, "
+            "or pass --analysis-db <path> --atlas <path>."
+        )
+    a = analysis_db or (str(ptr.analysis_db) if ptr else None)
+    x = atlas_db or (str(ptr.atlas_db) if ptr else None)
+    assert a is not None and x is not None  # guaranteed by the check above
+    bound = ptr is not None and Path(a).resolve() == ptr.analysis_db.resolve()
+    run_id = ptr.run_id if bound and ptr is not None else None
+    return a, x, run_id
+
+
+@click.command(name="mcp")
+@click.option(
+    "--analysis-db",
+    default=None,
+    help="Path to the analysis database (default: the last `tmap scan`'s analysis.db).",
+)
+@click.option(
+    "--atlas",
+    "atlas_db",
+    default=None,
+    help="Path to the atlas database (default: the last run's atlas).",
+)
+def mcp_serve(analysis_db: str | None, atlas_db: str | None) -> None:
+    """Run the Treasure Map MCP server over stdio (exposes the fact substrate to an AI client).
+
+    With no paths, serves the last `tmap scan`'s databases (recorded pointer). Launch this from an
+    MCP client, not by hand — it speaks JSON-RPC on stdin/stdout.
+    """
+    import sys
+
+    analysis_db, atlas_db, run_id = _resolve_mcp_target(analysis_db, atlas_db)
+    try:
+        from treasure_map.mcp_app import build_server
+
+        server = build_server(analysis_db, atlas_db, run_id)
+    except ModuleNotFoundError as exc:
+        # The `mcp` SDK is an optional extra; missing it should be a one-liner, not a traceback.
+        if exc.name and exc.name.split(".")[0] == "mcp":
+            click.echo(
+                "MCP support isn't installed. Install it with:  "
+                "uv tool install treasure-map --with mcp   "
+                '(or, with pip:  pip install "treasure-map[mcp]")',
+                err=True,
+            )
+            sys.exit(2)
+        raise
+    # Tell a human who ran this by hand what is happening — on stderr, so stdout stays clean
+    # JSON-RPC for the client.
+    click.echo(
+        "treasure-map MCP server (stdio). Launch this from an MCP client, e.g.:  "
+        f"claude mcp add treasure-map -- tmap mcp --analysis-db {analysis_db} --atlas {atlas_db}"
+        "   — now waiting for JSON-RPC on stdin (Ctrl-C to exit).",
+        err=True,
+    )
+    server.run()

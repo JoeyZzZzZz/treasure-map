@@ -241,6 +241,50 @@ def _row_get(row: sqlite3.Row, key: str) -> str | None:
     return row[key] if key in row.keys() else None
 
 
+# Display order of the presentation review statuses (highest-intent first). Shared by the CLI
+# renderer and the MCP candidate list so the two fold/show the same statuses.
+_SECTION_ORDER = ("to-verify", "reachable", "gated")
+
+
+def sink_matches(candidate: TriageCandidate, sink: str) -> bool:
+    """True if a --sink value names this candidate's sink — by concrete callee (system / popen /
+    syslog / strcpy …) OR by sink class (cmd / fmt_string / copy / format). Case-insensitive."""
+    needle = sink.lower()
+    return (candidate.sink_anchor or "").lower() == needle or candidate.sink_class.lower() == needle
+
+
+def shown_statuses(status: str | None, *, include_gated: bool, sink: str | None) -> set[str]:
+    """Which review statuses to display, matching the CLI triage semantics exactly.
+
+    A --sink filter or status='all' shows every status (so a recalled-but-low sink is never hidden
+    by the default fold); an explicit status shows only that one; otherwise the default shows
+    to-verify + reachable, with gated folded unless include_gated."""
+    if status == "all" or sink is not None:
+        return set(_SECTION_ORDER)
+    if status is not None:
+        return {status}
+    base = {"to-verify", "reachable"}
+    if include_gated:
+        base.add("gated")
+    return base
+
+
+def filter_candidates(
+    candidates: list[TriageCandidate],
+    *,
+    sink: str | None = None,
+    status: str | None = None,
+    include_gated: bool = False,
+) -> list[TriageCandidate]:
+    """Apply the shared sink/status/include_gated filters to a ranked list (input order kept)."""
+    statuses = shown_statuses(status, include_gated=include_gated, sink=sink)
+    return [
+        c
+        for c in candidates
+        if c.review_status in statuses and (sink is None or sink_matches(c, sink))
+    ]
+
+
 def triage(conn: sqlite3.Connection, *, run_id: str | None = None) -> list[TriageCandidate]:
     """Return atlas candidates ranked by review-ordering score (descending).
 

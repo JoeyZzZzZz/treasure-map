@@ -12,7 +12,20 @@ from treasure_map.cli.init_cli import init
 from treasure_map.cli.mcp_cli import fact, mcp_serve
 
 
-@click.group(context_settings={"max_content_width": 100})
+class _AliasGroup(click.Group):
+    """Top-level group that still resolves the pre-rename command names.
+
+    The commands were shortened (hunt-pattern -> hunt, hunt-diff -> diff, mcp-serve -> mcp). The
+    old names stay resolvable for back-compat with existing scripts/notes, but are NOT listed in
+    --help (they are mapped here, never registered as their own commands)."""
+
+    _ALIASES = {"hunt-pattern": "hunt", "hunt-diff": "diff", "mcp-serve": "mcp"}
+
+    def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
+        return super().get_command(ctx, self._ALIASES.get(cmd_name, cmd_name))
+
+
+@click.group(cls=_AliasGroup, context_settings={"max_content_width": 100})
 @click.option("--debug", is_flag=True, default=False, help="Enable debug logging.")
 def main(debug: bool) -> None:
     """Treasure Map — IoT firmware exploit-path discovery."""
