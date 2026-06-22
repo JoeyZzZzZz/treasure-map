@@ -48,18 +48,55 @@ def _parse_callees(raw: str | None) -> list[str]:
     return [str(x) for x in data] if isinstance(data, list) else []
 
 
+def _addr_candidates(func: str) -> set[str]:
+    """Canonical stored-address forms ``func`` could denote.
+
+    The analysis schema stores a function address as zero-padded 8-digit lowercase hex (e.g.
+    ``00038de8``). A consumer may type the same address many ways: ``0x38de8`` / ``38de8`` /
+    ``00038de8`` / ``232424`` (decimal) / ``FUN_00038de8`` (the decompiler's address-named symbol).
+    Each is normalized to the stored form so any of them resolves the function. An ``0x`` or
+    ``FUN_`` prefix marks the token as unambiguously hex; a bare all-digit token is offered as BOTH
+    hex and decimal (only the form that actually exists can match, so offering both is safe)."""
+    tok = func.strip()
+    explicit_hex = False
+    if tok[:4].upper() == "FUN_":
+        tok = tok[4:]
+        explicit_hex = True
+    if tok[:2].lower() == "0x":
+        tok = tok[2:]
+        explicit_hex = True
+    out: set[str] = set()
+    try:
+        out.add(format(int(tok, 16), "08x"))
+    except ValueError:
+        return out
+    if not explicit_hex and tok.isdigit():
+        out.add(format(int(tok, 10), "08x"))
+    return out
+
+
 def _match_functions(conn: sqlite3.Connection, func: str, binary: str | None) -> list[sqlite3.Row]:
-    """Functions whose name OR address equals ``func`` (optionally scoped to one binary)."""
-    sql = (
-        "SELECT f.id, f.name, f.address, f.size_bytes, f.pseudocode, f.callees, f.is_exported, "
-        "b.name AS binary_name, b.path AS binary_path "
-        "FROM functions f JOIN binaries b ON b.id = f.binary_id "
-        "WHERE (f.name = ? OR f.address = ?)"
-    )
+    """Functions whose name OR address denotes ``func`` (optionally scoped to one binary).
+
+    Address matching is twofold: the literal ``func`` as stored (covers a DB that keeps the typed
+    form) AND any normalized 8-hex candidate (covers the zero-padded stored form). ``binary`` is
+    matched against the short name OR the full path, so the binary_path a candidate listing returns
+    resolves directly."""
+    addrs = sorted(_addr_candidates(func))
+    where = ["f.name = ?", "f.address = ?"]
     params: list[str] = [func, func]
+    if addrs:
+        where.append(f"f.address IN ({','.join('?' for _ in addrs)})")
+        params.extend(addrs)
+    sql = (
+        "SELECT f.id, f.binary_id, f.name, f.address, f.size_bytes, f.pseudocode, f.callees, "
+        "f.is_exported, b.name AS binary_name, b.path AS binary_path "
+        "FROM functions f JOIN binaries b ON b.id = f.binary_id "
+        f"WHERE ({' OR '.join(where)})"  # noqa: S608 -- placeholders only; values stay bound params
+    )
     if binary is not None:
-        sql += " AND b.name = ?"
-        params.append(binary)
+        sql += " AND (b.name = ? OR b.path = ?)"
+        params.extend([binary, binary])
     sql += " ORDER BY b.name, f.address"
     return conn.execute(sql, params).fetchall()
 
@@ -89,8 +126,10 @@ def get_pseudocode(
 ) -> dict[str, Any]:
     """Decompiler pseudocode for one function (the default read view), with its anchor.
 
-    ``func`` may be a function name or an address. Returns a not-found record (never a guess) when
-    the function does not resolve uniquely."""
+    ``func`` may be a function name or an address in any common form (``0x38de8`` / ``38de8`` /
+    ``00038de8`` / ``232424`` decimal / ``FUN_00038de8``). ``binary`` accepts the short name or the
+    full path. Returns a not-found record (never a guess) when the function does not resolve
+    uniquely; an ambiguous name lists the candidate anchors to disambiguate."""
     row, miss = _resolve_one(conn, func, binary)
     if row is None:
         assert miss is not None
@@ -142,11 +181,17 @@ def get_xrefs(
     direction: XrefDirection = "callers",
     binary: str | None = None,
 ) -> dict[str, Any]:
-    """Cross-reference edges for one function from the xref table.
+    """Cross-reference edges for one function.
 
     direction='callers' returns the functions that reference this one; 'callees' returns the
     functions it references. Cross-binary edges (an import resolved to another binary's export)
-    are included — that is the value over a single decompiler view."""
+    are included — that is the value over a single decompiler view.
+
+    The xref table only records cross-binary edges, so for 'callers' a same-binary caller is
+    recovered as a fallback by reverse-scanning each function's recorded callee list (xref_type
+    ``intra_callees``). When that still finds nothing, a ``note`` says so honestly and flags that
+    the function may yet be reached via an indirect / dispatch-table / function-pointer call that
+    static analysis cannot resolve — a true unresolved caller is NOT silently the same as 'none'."""
     row, miss = _resolve_one(conn, func, binary)
     if row is None:
         assert miss is not None
@@ -176,12 +221,56 @@ def get_xrefs(
                 "library_level": of is None,  # NULL func id = a binary/library-level reference
             }
         )
-    return {
+    note: str | None = None
+    if direction == "callers":
+        _append_callee_reverse_callers(conn, row, edges)
+        if not edges:
+            note = (
+                "no direct callers found; may be reached via an indirect/dispatch-table/"
+                "function-pointer call that static analysis cannot resolve"
+            )
+    result: dict[str, Any] = {
         "found": True,
         "anchor": _anchor(row["binary_name"], row["name"], row["address"]),
         "direction": direction,
         "edges": edges,
     }
+    if note is not None:
+        result["note"] = note
+    return result
+
+
+def _append_callee_reverse_callers(
+    conn: sqlite3.Connection, row: sqlite3.Row, edges: list[dict[str, Any]]
+) -> None:
+    """Append same-binary direct callers recovered by reverse-scanning callee lists.
+
+    The xref table carries no intra-binary function->function edge, but ``functions.callees`` does
+    (each function's own out-edges). A function whose callee list contains the target by an exact
+    name match is a direct caller. ``LIKE`` is only a prefilter; the membership test is on parsed
+    JSON elements so a name that is a substring of another callee does not false-match."""
+    target = row["name"]
+    if not target:
+        return
+    seen = {(e["anchor"]["function"], e["anchor"]["binary"]) for e in edges}
+    for fr in conn.execute(
+        "SELECT f.name, f.address, f.callees, b.name AS bn FROM functions f "
+        "JOIN binaries b ON b.id = f.binary_id WHERE f.binary_id = ? AND f.callees LIKE ?",
+        (row["binary_id"], f"%{target}%"),
+    ):
+        if target not in _parse_callees(fr["callees"]):
+            continue
+        key = (fr["name"], fr["bn"])
+        if key in seen:
+            continue
+        seen.add(key)
+        edges.append(
+            {
+                "anchor": _anchor(fr["bn"], fr["name"], fr["address"]),
+                "xref_type": "intra_callees",  # reverse-resolved from the caller's callee list
+                "library_level": False,
+            }
+        )
 
 
 def _binary_name(conn: sqlite3.Connection, binary_id: int | None) -> str | None:
@@ -205,14 +294,60 @@ def _addr_int(address: str | None) -> int | None:
         return None
 
 
-def get_strings(
-    conn: sqlite3.Connection, *, binary: str, func: str | None = None
-) -> dict[str, Any]:
-    """Recorded strings for a binary (value/address/category).
+# The schema records each string's own location, never which function references it (Ghidra does
+# not export string xrefs). Said honestly on every result so a consumer does not assume a reverse
+# lookup the substrate cannot back.
+_STRING_REF_NOTE = (
+    "string reference sites (which function uses this string) are not indexed; resolve the "
+    "address in a disassembler's xref view"
+)
 
-    When ``func`` is given and the function's address range is known, only strings whose address
-    falls in that range are returned (best-effort by address; the schema has no string->func link),
-    otherwise all of the binary's strings."""
+
+def get_strings(
+    conn: sqlite3.Connection,
+    *,
+    binary: str | None = None,
+    func: str | None = None,
+    value: str | None = None,
+) -> dict[str, Any]:
+    """Recorded strings (value/address/category), located one step for the consumer.
+
+    Two modes: (1) ``value`` searches by string CONTENT (substring), returning every hit with its
+    address + owning binary so a consumer locates "this string lives in <binary> at <address>" in
+    one call — optionally narrowed to ``binary``; (2) without ``value``, lists a binary's strings,
+    optionally narrowed to ``func``'s address range (best-effort by address; the schema has no
+    string->func link). The ``note`` states honestly that the reverse "which function references
+    this string" lookup is NOT provided — that index does not exist, and we do not fake it."""
+    if value is not None:
+        sql = (
+            "SELECT s.value, s.address, s.category, b.name AS bn FROM strings s "
+            "JOIN binaries b ON b.id = s.binary_id WHERE s.value LIKE ?"
+        )
+        params: list[Any] = [f"%{value}%"]
+        if binary is not None:
+            bid = _binary_id(conn, binary)
+            if bid is None:
+                return {"found": False, "query": {"binary": binary, "value": value}}
+            sql += " AND s.binary_id = ?"
+            params.append(bid)
+        sql += " ORDER BY b.name, s.address"
+        hits = [
+            {
+                "value": r["value"],
+                "address": r["address"],
+                "binary": r["bn"],
+                "category": r["category"],
+            }
+            for r in conn.execute(sql, params)
+        ]
+        return {
+            "found": True,
+            "query": {"value": value, "binary": binary},
+            "strings": hits,
+            "note": _STRING_REF_NOTE,
+        }
+    if binary is None:
+        return {"found": False, "query": {"binary": binary, "value": value}}
     bid = _binary_id(conn, binary)
     if bid is None:
         return {"found": False, "query": {"binary": binary}}
@@ -234,7 +369,13 @@ def get_strings(
             if a is None or not (lo <= a < hi):
                 continue
         items.append({"value": r["value"], "address": r["address"], "category": r["category"]})
-    return {"found": True, "binary": binary, "function": func, "strings": items}
+    return {
+        "found": True,
+        "binary": binary,
+        "function": func,
+        "strings": items,
+        "note": _STRING_REF_NOTE,
+    }
 
 
 def get_imports_exports(conn: sqlite3.Connection, *, binary: str) -> dict[str, Any]:

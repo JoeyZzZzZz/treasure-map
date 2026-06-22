@@ -41,6 +41,12 @@ def _mkdb(tmp_path: Path) -> Path:
         "INSERT INTO functions (id, binary_id, name, address, pseudocode, callees, is_exported) "
         "VALUES (3, 2, 'foo_entry', '0x500', 'int foo_entry(){}', '[]', 1)"
     )
+    # a function whose address is stored in the real zero-padded 8-hex form (00038de8), with no
+    # caller of any kind: exercises address normalization (item 1) and the indirect-call note (2).
+    conn.execute(
+        "INSERT INTO functions (id, binary_id, name, address, pseudocode, callees, is_exported) "
+        "VALUES (4, 1, 'netool_handler', '00038de8', 'int netool_handler(){}', '[]', 0)"
+    )
     # cross-binary xref: webd.handle_req -> libfoo.foo_entry
     conn.execute(
         "INSERT INTO xrefs (caller_binary_id, caller_func_id, callee_binary_id, callee_func_id, "
@@ -49,6 +55,10 @@ def _mkdb(tmp_path: Path) -> Path:
     conn.execute(
         "INSERT INTO strings (binary_id, value, address, category) "
         "VALUES (1, '/tmp/state', '0x1010', 'path')"
+    )
+    conn.execute(
+        "INSERT INTO strings (binary_id, value, address, category) "
+        "VALUES (1, '/var/run/netool_socket', '00073d5c', 'path')"
     )
     conn.execute(
         "INSERT INTO imports (binary_id, func_name, lib_soname) "
@@ -129,7 +139,8 @@ def test_get_xrefs_callers_and_callees_cross_binary(tmp_path: Path) -> None:
 
 def test_get_strings_and_imports_exports(tmp_path: Path) -> None:
     conn = _ro(tmp_path)
-    assert facts.get_strings(conn, binary="webd")["strings"][0]["value"] == "/tmp/state"
+    values = {s["value"] for s in facts.get_strings(conn, binary="webd")["strings"]}
+    assert "/tmp/state" in values
     ie = facts.get_imports_exports(conn, binary="webd")
     assert ie["imports"][0]["func_name"] == "foo_entry"
     conn.close()
@@ -149,6 +160,58 @@ def test_get_components_cves(tmp_path: Path) -> None:
     r = facts.get_components_cves(conn, binary="webd")
     assert r["components"][0]["product"] == "genlib"
     assert r["cve_matches"][0]["cve_id"] == "synthetic-cve"
+    conn.close()
+
+
+def test_get_pseudocode_address_forms_all_resolve(tmp_path: Path) -> None:
+    # The real schema stores 00038de8; a consumer may type the address any of these ways.
+    conn = _ro(tmp_path)
+    # 0x38de8 == 232936 decimal; all forms must resolve to the same stored 00038de8.
+    for form in ("0x38de8", "38de8", "00038de8", "232936", "FUN_00038de8"):
+        r = facts.get_pseudocode(conn, func=form)
+        assert r["found"] is True, form
+        assert r["anchor"]["function"] == "netool_handler", form
+    conn.close()
+
+
+def test_get_pseudocode_binary_path_resolves(tmp_path: Path) -> None:
+    # binary accepts the short name OR the full path a candidate listing returns.
+    conn = _ro(tmp_path)
+    assert facts.get_pseudocode(conn, func="handle_req", binary="usr/sbin/webd")["found"] is True
+    assert facts.get_pseudocode(conn, func="handle_req", binary="webd")["found"] is True
+    conn.close()
+
+
+def test_get_xrefs_callers_recovered_from_callee_lists(tmp_path: Path) -> None:
+    # The xref table has no intra-binary edge; helper's caller is recovered by reverse-scanning
+    # functions.callees (handle_req lists "helper").
+    conn = _ro(tmp_path)
+    r = facts.get_xrefs(conn, func="helper", direction="callers")
+    callers = {(e["anchor"]["function"], e["xref_type"]) for e in r["edges"]}
+    assert ("handle_req", "intra_callees") in callers
+    assert "note" not in r  # callers were found, so no indirect-call note
+    conn.close()
+
+
+def test_get_xrefs_no_callers_is_honest_about_indirect(tmp_path: Path) -> None:
+    # netool_handler has no caller of any kind -> none found, with the indirect-call note so a
+    # true unresolved (dispatch-table) caller is not mistaken for "genuinely uncalled".
+    conn = _ro(tmp_path)
+    r = facts.get_xrefs(conn, func="netool_handler", direction="callers")
+    assert r["edges"] == []
+    assert "indirect" in r["note"] and "dispatch-table" in r["note"]
+    conn.close()
+
+
+def test_get_strings_by_value_locates_with_binary_and_note(tmp_path: Path) -> None:
+    conn = _ro(tmp_path)
+    r = facts.get_strings(conn, value="netool_socket")
+    (hit,) = r["strings"]
+    assert hit["value"] == "/var/run/netool_socket"
+    assert hit["address"] == "00073d5c"
+    assert hit["binary"] == "webd"
+    # honest boundary: reverse "which function references this string" is not provided
+    assert "not indexed" in r["note"]
     conn.close()
 
 

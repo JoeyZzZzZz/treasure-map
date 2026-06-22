@@ -21,6 +21,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same-source address alignment cannot be established, degrades honestly to "unavailable" rather
   than emit possibly-misaligned addresses. Derived signals are labelled "derived, evidence-backed,
   not a verdict"; no interpretation column is reconstructed.
+- The shared read layer (`treasure_map.lib.facts`, used by both the MCP server and the `tmap
+  fact …` CLI) gained three lookups so verification rarely has to leave the substrate: (1)
+  `get_pseudocode` / `get_callees` / `get_xrefs` / `get_disassembly` now resolve a function address
+  typed in any common form — `0x38de8` / `38de8` / `00038de8` / decimal / `FUN_00038de8` — by
+  normalizing to the stored zero-padded hex, and `binary` accepts either the short name or the full
+  path (so a candidate listing's `binary_path` resolves directly); (2) `get_xrefs(direction=
+  "callers")` recovers a same-binary caller the xref table does not record by reverse-scanning each
+  function's recorded callee list, and when none is found it says so HONESTLY with a note that the
+  function may yet be reached via an indirect / dispatch-table / function-pointer call static
+  analysis cannot resolve (a true unresolved caller is never silently the same as "uncalled"); (3)
+  `get_strings` can search by string CONTENT, returning each hit with its address and owning binary
+  in one call, and states honestly that the reverse "which function references this string" lookup
+  is not indexed. No analyze/index change; recall, scoring, and sink logic are untouched.
 - **entry-reach review-ordering** (a second-level ranking key): the review score now reads the
   per-candidate `entry_reach` evidence (a rootfs startup/maintenance script or web asset was found
   to invoke the candidate's binary) and PROMOTES a candidate within its tier when an entry path is

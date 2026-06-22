@@ -136,9 +136,17 @@ def make_tools(analysis_db: Path | str, atlas_db: Path | str) -> dict[str, Calla
             lambda c: facts.get_xrefs(c, func=function, direction=d, binary=binary)
         )
 
-    def get_strings(binary: str, function: str | None = None) -> dict[str, Any]:
-        """Recorded strings for a binary (optionally narrowed to a function's address range)."""
-        return _with_analysis(lambda c: facts.get_strings(c, binary=binary, func=function))
+    def get_strings(
+        binary: str | None = None, function: str | None = None, value: str | None = None
+    ) -> dict[str, Any]:
+        """Recorded strings: by binary, narrowed to a function's range, or searched by ``value``.
+
+        ``value`` searches string CONTENT and returns each hit with its address + owning binary
+        (one-call locate); reference-site (which function uses a string) is not indexed — the
+        result says so honestly."""
+        return _with_analysis(
+            lambda c: facts.get_strings(c, binary=binary, func=function, value=value)
+        )
 
     def get_imports_exports(binary: str) -> dict[str, Any]:
         """Import and export symbol tables of one binary (cross-binary edge endpoints)."""
