@@ -89,6 +89,9 @@ def _candidate_dict(c: Any, current_run_id: str | None = None) -> dict[str, Any]
         "origin": c.origin,
         "entry_reach": c.entry_reach,  # found promotes within tier; unknown is neutral
         "score": c.score,  # derived review-ordering signal, NOT a verdict
+        # The pattern fingerprint — pivot a cross_firmware_patterns hit to its instances via the
+        # list_candidates(fingerprint=…) filter (same key density / ledger group by).
+        "structural_fingerprint": c.structural_fingerprint,
         "source_run_id": c.source_run_id,
         # True when this candidate belongs to the firmware run the server is bound to (None when
         # the server is not bound to a specific run, e.g. explicit db paths with no run pointer).
@@ -129,12 +132,27 @@ def make_tools(
         finally:
             conn.close()
 
+    def _incomplete_binaries() -> list[str]:
+        """Names of current-scan binaries whose analysis is incomplete (0 functions, not code-free).
+
+        ★ Red-line: attached to the candidate/aggregation views so a consumer never mistakes a
+        binary Ghidra failed on for one with nothing to find. Empty when the DB is unreadable."""
+        try:
+            conn = facts.open_analysis_ro(analysis_path)
+        except sqlite3.OperationalError:
+            return []
+        try:
+            return facts.list_incomplete_binaries(conn)
+        finally:
+            conn.close()
+
     def list_candidates(
         run_id: str | None = None,
         sink: str | None = None,
         sink_class: str | None = None,
         status: str | None = None,
         include_gated: bool = False,
+        fingerprint: str | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> dict[str, Any]:
@@ -144,8 +162,10 @@ def make_tools(
         not surface another image's leads. Filters mirror `tmap triage`: ``sink`` (a concrete
         callee like ``syslog`` OR a class like ``cmd``), ``sink_class`` (exact class), ``status``
         (to-verify / reachable / gated / all — default folds gated unless ``include_gated``).
-        Paged: ``limit`` (capped at 200) + ``offset``; the result carries ``total`` / ``returned``
-        / ``truncated`` / ``next_offset``. Each candidate carries its anchor (evidence_ref) and
+        ``fingerprint`` narrows to one pattern's structural_fingerprint — pivot here from a
+        cross_firmware_patterns hit to see its instances. Paged: ``limit`` (capped at 200) +
+        ``offset``; the result carries ``total`` / ``returned`` / ``truncated`` / ``next_offset``.
+        Each candidate carries its anchor (evidence_ref), structural_fingerprint, and
         is_current_run. Signals are DERIVED, NOT a verdict. Prefer a narrow filter and the head of
         the list, then fetch detail per evidence_ref — do not pull the whole list at once."""
         effective = run_id if run_id is not None else current_run_id
@@ -163,6 +183,8 @@ def make_tools(
         ranked = _filter_candidates(ranked, sink=sink, status=status, include_gated=include_gated)
         if sink_class is not None:
             ranked = [c for c in ranked if c.sink_class == sink_class]
+        if fingerprint is not None:
+            ranked = [c for c in ranked if c.structural_fingerprint == fingerprint]
         total = len(ranked)
         lim = max(0, min(limit, _MAX_LIMIT))
         off = max(0, offset)
@@ -174,6 +196,10 @@ def make_tools(
             "isolated_to_run": isolated_to,
             # the firmware split, shown only when NOT isolated to a single run (else all one run)
             "runs": _run_summary(ranked) if isolated_to is None else None,
+            # ★ Red-line: binaries whose analysis is incomplete (0 functions, not code-free) — a
+            # non-empty list means the firmware is NOT fully analyzed, so absence of a candidate is
+            # not proof of cleanliness. Re-run `tmap scan --reanalyze` to recover them.
+            "incomplete_binaries": _incomplete_binaries(),
             "total": total,
             "returned": len(page),
             "offset": off,
@@ -196,6 +222,7 @@ def make_tools(
             conn.close()
         return {
             "note": _DERIVED_SIGNAL_NOTE,
+            "incomplete_binaries": _incomplete_binaries(),  # analysis-completeness honesty flag
             "count": len(rows),
             "patterns": [asdict(r) for r in rows[: max(0, limit)]],
         }
@@ -212,6 +239,7 @@ def make_tools(
             conn.close()
         return {
             "note": _DERIVED_SIGNAL_NOTE,
+            "incomplete_binaries": _incomplete_binaries(),  # analysis-completeness honesty flag
             "count": len(rows),
             "density": [asdict(r) for r in rows[: max(0, limit)]],
         }

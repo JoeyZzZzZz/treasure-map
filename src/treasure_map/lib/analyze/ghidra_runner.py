@@ -8,6 +8,7 @@ Single-binary wrapper: GhidraRunner.run_ghidra().  Parallel dispatch: run_all().
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -23,7 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from treasure_map.lib.analyze.elf_inventory import ElfRecord
+from treasure_map.lib.analyze.elf_inventory import ElfRecord, has_substantial_text
 from treasure_map.lib.config.config import GhidraConfig
 from treasure_map.lib.errors import GhidraNotFoundError
 
@@ -88,6 +89,12 @@ class GhidraResult:
     retried: bool = False
     log_path: Path | None = None
     stderr_tail: str | None = None  # last 500 chars of stderr for debugging
+    # ★ Red-line (degrade must be visible): the tri-state analysis outcome, so a partial/empty run
+    # is never frozen as "clean". "ok" = functions produced; "ok_empty" = a legitimately code-free
+    # object (no substantial .text) with 0 functions (do not re-churn); "failed" = no usable output
+    # OR code present but 0 functions decompiled. ``success`` is True for ok / ok_empty only.
+    analysis_status: str = "failed"
+    function_count: int = 0  # functions in the output JSON (0 for ok_empty / failed)
 
 
 def find_headless(config: GhidraConfig) -> Path:
@@ -207,6 +214,36 @@ def _patch_elf_for_ghidra(src: Path) -> tuple[Path, Path] | None:
     except Exception:
         shutil.rmtree(tmpdir, ignore_errors=True)
         return None
+
+
+def _probe_function_count(output_file: Path) -> int | None:
+    """Number of functions in a Ghidra output JSON, or None when it is missing/unparseable.
+
+    None signals a hard failure (no usable output); 0 is a valid parsed-but-empty result the caller
+    judges against the ELF's code presence. The output files are modest, so a full parse is fine."""
+    try:
+        with output_file.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    funcs = data.get("functions") if isinstance(data, dict) else None
+    return len(funcs) if isinstance(funcs, list) else None
+
+
+def _classify_analysis(output_file: Path, binary: Path) -> tuple[str, int]:
+    """Classify a finished run into (analysis_status, function_count).
+
+    ★ Red-line: success requires a NON-EMPTY functions array, not merely a >200-byte file — a
+    truncated/partial run can leave a well-formed-but-empty shell (``{"functions": []}``), and
+    counting that as success froze the binary as analyzed so it never re-ran. A code-free object
+    (no substantial .text) with 0 functions is ``ok_empty`` (legitimate; do not re-churn); a binary
+    with code but 0 functions is ``failed`` (not clean)."""
+    count = _probe_function_count(output_file) if output_file.exists() else None
+    if count is None:
+        return "failed", 0
+    if count > 0:
+        return "ok", count
+    return ("failed", 0) if has_substantial_text(binary) else ("ok_empty", 0)
 
 
 def _build_cmd(
@@ -335,6 +372,8 @@ class GhidraRunner:
                 output_file=r1.output_file,
                 success=True,
                 elapsed=r1.elapsed,
+                analysis_status=r1.analysis_status,
+                function_count=r1.function_count,
                 log_path=r1.log_path,
                 stderr_tail=r1.stderr_tail,
             )
@@ -359,6 +398,8 @@ class GhidraRunner:
                             success=True,
                             elapsed=r1.elapsed + r2.elapsed,
                             retried=True,
+                            analysis_status=r2.analysis_status,
+                            function_count=r2.function_count,
                             log_path=r2.log_path,
                             stderr_tail=r2.stderr_tail,
                         )
@@ -413,12 +454,15 @@ class GhidraRunner:
         expected_out = output_dir / f"{binary.name}_{sha8}_ghidra.json"
         log_path = output_dir / f"{binary.name}_{sha8}.log"
 
-        success = expected_out.exists() and expected_out.stat().st_size > 200
+        analysis_status, function_count = _classify_analysis(expected_out, binary)
+        success = analysis_status in ("ok", "ok_empty")
         return GhidraResult(
             binary=binary,
             output_file=expected_out if success else None,
             success=success,
             elapsed=elapsed,
+            analysis_status=analysis_status,
+            function_count=function_count,
             log_path=log_path if log_path.exists() else None,
             stderr_tail=stderr_raw if stderr_raw else None,
         )

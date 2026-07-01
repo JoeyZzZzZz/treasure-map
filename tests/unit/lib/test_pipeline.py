@@ -106,8 +106,8 @@ async def test_dirty_set_empty_skips_ghidra(tmp_path: Path) -> None:
 
 async def test_dirty_set_partial_only_runs_dirty(tmp_path: Path) -> None:
     """With 2 records and 1 already done, run_all receives only the dirty one."""
-    rec1 = _rec("httpd", "aaa111")
-    rec2 = _rec("dropbear", "bbb222")
+    rec1 = _rec("httpd", "deadbeef")
+    rec2 = _rec("dropbear", "cafebabe")
     records = [rec1, rec2]
 
     captured: list[list[ElfRecord]] = []
@@ -120,13 +120,13 @@ async def test_dirty_set_partial_only_runs_dirty(tmp_path: Path) -> None:
     with patch(f"{MODULE}.GhidraRunner", return_value=runner):
         with patch(f"{MODULE}.scan_filesystem", return_value=records):
             # Only rec2 is dirty (rec1 has ghidra_ok=1 in DB)
-            with patch(f"{MODULE}.ingest_elfs", _mock_ingest({"bbb222"})):
+            with patch(f"{MODULE}.ingest_elfs", _mock_ingest({"cafebabe"})):
                 with Workspace(tmp_path / "ws") as ws:
                     result = await run_analyze(tmp_path / "fs", ws, _cfg())
 
     assert len(captured) == 1
     assert len(captured[0]) == 1
-    assert captured[0][0].sha256 == "bbb222"
+    assert captured[0][0].sha256 == "cafebabe"
     assert result.binary_count == 2
     assert result.dirty_count == 1
     assert result.ghidra_skipped == 1
@@ -154,15 +154,15 @@ async def test_empty_fs_ghidra_skipped(tmp_path: Path) -> None:
 
 async def test_analyze_result_fields(tmp_path: Path) -> None:
     """AnalyzeResult carries correct counts and db_path."""
-    rec1 = _rec("httpd", "aaa111")
-    rec2 = _rec("dropbear", "bbb222")
+    rec1 = _rec("httpd", "deadbeef")
+    rec2 = _rec("dropbear", "cafebabe")
     records = [rec1, rec2]
 
     runner = _mock_runner([_ok_ghidra(rec1), _fail_ghidra(rec2)])
     with patch(f"{MODULE}.GhidraRunner", return_value=runner):
         with patch(f"{MODULE}.scan_filesystem", return_value=records):
             # Both records are dirty
-            with patch(f"{MODULE}.ingest_elfs", _mock_ingest({"aaa111", "bbb222"})):
+            with patch(f"{MODULE}.ingest_elfs", _mock_ingest({"deadbeef", "cafebabe"})):
                 with Workspace(tmp_path / "ws") as ws:
                     result = await run_analyze(tmp_path / "fs", ws, _cfg())
 

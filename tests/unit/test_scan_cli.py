@@ -42,7 +42,9 @@ class _DummyWorkspace:
 
 
 def _fake_analyze_result(db_path: Path) -> SimpleNamespace:
-    return SimpleNamespace(db_path=db_path, binary_count=2, functions_ingested=9)
+    return SimpleNamespace(
+        db_path=db_path, binary_count=2, functions_ingested=9, incomplete_binaries=[]
+    )
 
 
 def _hunt_stats(written: int = 0) -> SimpleNamespace:

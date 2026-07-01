@@ -134,17 +134,32 @@ def _exec_is_no_shell(callees: list[str], pseudocode: str) -> bool:
     return not _SHELL_TARGET_RE.search(pseudocode)
 
 
-def _sink_arg_is_literal(pseudocode: str, sink_name: str) -> bool:
-    """True when the sink's first argument is a direct string literal (a .rodata constant).
+def _sink_arg_is_literal(pseudocode: str, sink_name: str, sink_arg: str | None) -> bool:
+    """True when THIS candidate's sink argument is a fixed .rodata constant with no free value
+    reaching it — `system("/sbin/reboot")`, the highest-frequency command false positive.
 
-    `system("/sbin/reboot")` — the dangerous argument is a fixed string, not a controllable
-    value, so it is the highest-frequency command false positive. Matching the literal directly
-    (not via a variable) keeps this parameter-specific: a variable argument that a free value can
-    reach does not match here, so it is never wrongly downweighted. Restricted to shell-running
-    sinks — an exec-family first argument is the program path, not the command."""
+    ★ Red-line (never wrongly downweight): parameter-specific, tied to the anchored candidate's
+    OWN sink_arg — NOT a whole-function search. Both guards are required:
+      1. a shell-running sink is called with a DIRECT string literal (`system("...")`), so a
+         constant command form exists at some callsite; and
+      2. no free value (an in-function source output or a caller-supplied parameter) reaches this
+         candidate's sink argument (`free_taint_reaches`).
+    A whole-function regex satisfied only (1): a function with both `system("const")` and
+    `system(free_var)` matched and wrongly downweighted the free candidate. Guard (2) closes that:
+    when a free value reaches the anchored sink_arg the literal belongs to a DIFFERENT callsite, so
+    the downweight is suppressed (fail-safe: keep the candidate at its normal score). A free-tainted
+    argument therefore never coexists with a const_sink_arg note (Gate A), by construction.
+    Restricted to shell-running sinks; an exec-family first argument is the program path, not the
+    command."""
     if sink_name not in _SHELL_RUN_SINKS:
         return False
-    return re.search(rf'\b{re.escape(sink_name)}\s*\(\s*"', pseudocode) is not None
+    if re.search(rf'\b{re.escape(sink_name)}\s*\(\s*"', pseudocode) is None:
+        return False
+    # Parameter-specific guard: a free value reaching this candidate's sink argument means the
+    # literal above is a different callsite — do not downweight this (tainted) candidate.
+    if sink_arg is not None and free_taint_reaches(pseudocode, sink_arg, safe_vars=set()):
+        return False
+    return True
 
 
 def _constrained_results(pseudocode: str, path: set[str], converters: frozenset[str]) -> set[str]:
@@ -362,7 +377,7 @@ def detect_form_signal(
     a candidate at its normal score."""
     if _caller_only_constants(func_name, callees, callers_pseudocode or []):
         return CALLER_CONSTANT
-    if sink_name is not None and _sink_arg_is_literal(pseudocode, sink_name):
+    if sink_name is not None and _sink_arg_is_literal(pseudocode, sink_name, sink_arg):
         return CONST_SINK_ARG
     if sink_arg is not None and _value_is_constrained(pseudocode, sink_arg, _NUMERIC_VALIDATORS):
         return NUMERIC_SANITIZED
@@ -388,7 +403,12 @@ def wrapper_propagation_form_note(
     crowd the high band: a literal forwarded to the wrapper is a constant command; a numeric- or
     inline-charset-constrained argument cannot carry shell syntax. Returns None (no downweight) when
     the forwarded value is a free / constructed string — the real lead this recall step recovers."""
-    if re.search(rf'\b{re.escape(wrapper_name)}\s*\(\s*"', pseudocode):
+    # ★ Red-line: same parameter-specific guard as a direct sink. A literal forwarded to the
+    # wrapper is a constant command ONLY when no free value also reaches this candidate's forwarded
+    # argument — otherwise the literal is a different callsite and downweighting hides the lead.
+    if re.search(rf'\b{re.escape(wrapper_name)}\s*\(\s*"', pseudocode) and not (
+        sink_arg is not None and free_taint_reaches(pseudocode, sink_arg, safe_vars=set())
+    ):
         return CONST_SINK_ARG
     if sink_arg is not None and _value_is_constrained(pseudocode, sink_arg, _NUMERIC_VALIDATORS):
         return NUMERIC_SANITIZED

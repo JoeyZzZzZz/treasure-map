@@ -157,6 +157,10 @@ class TriageCandidate:
     # entry-reach status (found / unknown) parsed from the stored flow_evidence — a derived,
     # evidence-backed signal, NOT a verdict. found promotes within the tier; unknown is neutral.
     entry_reach: str = "unknown"
+    # The pattern's structural fingerprint (the same key cross_firmware_patterns / pattern_density
+    # group by), surfaced so a consumer can pivot from a recurring pattern to its instances. A
+    # presentation-only field — it never affects the score or ordering.
+    structural_fingerprint: str | None = None
 
 
 def _entry_reach_status(flow_evidence: str | None) -> str:
@@ -233,6 +237,7 @@ def _candidate(row: sqlite3.Row) -> TriageCandidate:
         evidence_ref=row["evidence_ref"],
         binary_path=row["binary_path"],
         entry_reach=entry_reach,
+        structural_fingerprint=_row_get(row, "structural_fingerprint"),
     )
 
 
@@ -297,7 +302,7 @@ def triage(conn: sqlite3.Connection, *, run_id: str | None = None) -> list[Triag
     sql = (
         "SELECT i.reachability_status, i.blocking_mechanism, i.origin, i.source_anchor, "
         "i.sink_anchor, i.source_run_id, i.evidence_ref, i.binary_path, i.flow_evidence, "
-        "p.source_class, p.sink_class "
+        "p.source_class, p.sink_class, p.structural_fingerprint "
         "FROM instance i JOIN pattern p ON p.pattern_id = i.pattern_id"
     )
     params: list[str] = []
@@ -477,7 +482,7 @@ def explain_candidate(conn: sqlite3.Connection, evidence_ref: str) -> CandidateE
     rows = conn.execute(
         "SELECT i.reachability_status, i.blocking_mechanism, i.origin, i.source_anchor, "
         "i.sink_anchor, i.source_run_id, i.evidence_ref, i.binary_path, i.flow_evidence, "
-        "p.source_class, p.sink_class, p.call_sequence_shape "
+        "p.source_class, p.sink_class, p.call_sequence_shape, p.structural_fingerprint "
         "FROM instance i JOIN pattern p ON p.pattern_id = i.pattern_id "
         "WHERE i.evidence_ref = ? "
         "ORDER BY i.instance_id",

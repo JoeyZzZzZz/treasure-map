@@ -14,6 +14,7 @@ from treasure_map.lib.analyze.elf_inventory import ElfRecord
 from treasure_map.lib.analyze.ghidra_runner import (
     GhidraRunner,
     _build_cmd,
+    _classify_analysis,
     _patch_elf_for_ghidra,
     find_headless,
 )
@@ -138,9 +139,46 @@ def test_build_cmd_structure(tmp_path: Path) -> None:
     assert "-log" in cmd
 
 
-# ── run_ghidra: subprocess mocked ─────────────────────────────────────────────
+# ── _classify_analysis (red-line: success requires produced functions, not file size) ──
 
 MODULE = "treasure_map.lib.analyze.ghidra_runner"
+
+
+def test_classify_ok_when_functions_present(tmp_path: Path) -> None:
+    out = tmp_path / "b_ghidra.json"
+    out.write_text(_good_json())
+    assert _classify_analysis(out, tmp_path / "b") == ("ok", 1)
+
+
+def test_classify_failed_when_output_missing(tmp_path: Path) -> None:
+    assert _classify_analysis(tmp_path / "absent.json", tmp_path / "b") == ("failed", 0)
+
+
+def test_classify_failed_when_malformed(tmp_path: Path) -> None:
+    out = tmp_path / "b_ghidra.json"
+    out.write_text("{ truncated shell, not json")
+    assert _classify_analysis(out, tmp_path / "b") == ("failed", 0)
+
+
+def test_classify_empty_functions_on_code_binary_is_failed(tmp_path: Path) -> None:
+    # ★ Red-line: a >200-byte but functionless shell for a binary that HAS code is a FAILED
+    # analysis, never "clean" — it must not be frozen as done.
+    out = tmp_path / "b_ghidra.json"
+    out.write_text(json.dumps({"functions": [], "imports": [], "exports": [], "strings": []}))
+    with patch(f"{MODULE}.has_substantial_text", lambda _b: True):
+        assert _classify_analysis(out, tmp_path / "b") == ("failed", 0)
+
+
+def test_classify_empty_functions_on_codefree_object_is_ok_empty(tmp_path: Path) -> None:
+    # A genuinely code-free object (no substantial .text) with 0 functions is legitimately empty —
+    # ok_empty so it is not re-analyzed forever.
+    out = tmp_path / "b_ghidra.json"
+    out.write_text(json.dumps({"functions": [], "imports": [], "exports": [], "strings": []}))
+    with patch(f"{MODULE}.has_substantial_text", lambda _b: False):
+        assert _classify_analysis(out, tmp_path / "b") == ("ok_empty", 0)
+
+
+# ── run_ghidra: subprocess mocked ─────────────────────────────────────────────
 
 
 def test_run_ghidra_success(tmp_path: Path) -> None:

@@ -27,6 +27,21 @@ jobs:
       - name: Check vendor neutrality (diff + commit messages)
         run: bash scripts/check-vendor-neutrality.sh "${{ steps.range.outputs.base }}" "${{ steps.range.outputs.head }}"
 
+  recall-integrity:
+    name: Recall Integrity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Red-line gates (never wrongly downweight; degrade must be visible)
+        run: python scripts/check_recall_integrity.py --self-test
+
   lint:
     name: Lint
     runs-on: ubuntu-latest

@@ -181,6 +181,25 @@ def test_list_candidates_carries_anchor_entry_reach_and_note(tmp_path: Path) -> 
     assert cand["score"] is not None
 
 
+def test_list_candidates_carries_fingerprint_and_incomplete_field(tmp_path: Path) -> None:
+    # ★ Work item 6 + red-line honesty: each candidate carries its structural_fingerprint (pivot
+    # from cross_firmware_patterns), and the result carries an incomplete_binaries flag.
+    tools = _tools(tmp_path)
+    out = tools["list_candidates"]()
+    assert out["incomplete_binaries"] == []  # the synthetic webd has functions
+    (cand,) = out["candidates"]
+    assert cand["structural_fingerprint"] == "fp_demo"
+    # the fingerprint filter round-trips (cross_firmware_patterns -> list_candidates(fingerprint=))
+    assert tools["list_candidates"](fingerprint="fp_demo")["total"] == 1
+    assert tools["list_candidates"](fingerprint="no_such_fp")["total"] == 0
+
+
+def test_cross_firmware_views_carry_incomplete_flag(tmp_path: Path) -> None:
+    tools = _tools(tmp_path)
+    assert "incomplete_binaries" in tools["cross_firmware_patterns"]()
+    assert "incomplete_binaries" in tools["pattern_density"]()
+
+
 def test_list_candidates_sink_class_filter(tmp_path: Path) -> None:
     tools = _tools(tmp_path)
     assert tools["list_candidates"](sink_class="copy")["total"] == 0

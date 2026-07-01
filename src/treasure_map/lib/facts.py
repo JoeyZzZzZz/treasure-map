@@ -34,6 +34,25 @@ def open_analysis_ro(db_path: Path | str) -> sqlite3.Connection:
     return conn
 
 
+def list_incomplete_binaries(conn: sqlite3.Connection) -> list[str]:
+    """Current-scan binaries that produced 0 functions and are NOT legitimately code-free.
+
+    ★ Red-line (degrade must be visible): a binary Ghidra failed on holds 0 functions, so it looks
+    'clean' to every reader. This surfaces those names so a consumer knows the analysis is
+    INCOMPLETE for them — not that there is nothing to find. Empty on an older analysis.db that
+    predates the ``ghidra_status`` column (the read degrades quietly rather than error)."""
+    try:
+        rows = conn.execute(
+            "SELECT b.name FROM current_binaries b "
+            "WHERE COALESCE(b.ghidra_status, '') != 'ok_empty' "
+            "AND NOT EXISTS (SELECT 1 FROM functions f WHERE f.binary_id = b.id) "
+            "ORDER BY b.name"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return [r["name"] for r in rows]
+
+
 def _anchor(binary: str | None, name: str | None, address: str | None) -> dict[str, Any]:
     return {"binary": binary, "function": name, "address": address}
 

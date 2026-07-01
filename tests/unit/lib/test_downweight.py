@@ -241,6 +241,26 @@ def test_external_input_gating_a_branch_still_const_sink_arg() -> None:
     )
 
 
+def test_free_string_alongside_a_constant_call_is_not_downweighted() -> None:
+    # ★ Red-line regression: the function has BOTH a constant system("...") and a system(free_var)
+    # whose argument is a free-string source. The old whole-function regex saw the constant and
+    # wrongly downweighted the tainted candidate to const_sink_arg. Parameter-specific now: the
+    # anchored candidate's OWN sink_arg is free-reached, so const_sink_arg must NOT fire (Gate A).
+    pc = (
+        'void f(void){ system("ubus call system board"); '
+        "char* cmd = json_object_get_string(o); system(cmd); }"
+    )
+    assert (
+        detect_form_signal(
+            sink_name="system",
+            pseudocode=pc,
+            callees=["system", "json_object_get_string"],
+            sink_arg="cmd",
+        )
+        is None
+    )
+
+
 def test_external_input_flowing_into_sink_arg_is_not_downweighted() -> None:
     # #12 reverse: the external value actually flows INTO the sink argument (content, not gate) —
     # not a constant, not constrained -> must NOT be downweighted (source_class stays lit).

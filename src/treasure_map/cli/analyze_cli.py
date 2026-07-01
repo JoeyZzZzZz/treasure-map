@@ -16,6 +16,24 @@ import click
 
 logger = logging.getLogger(__name__)
 
+
+def _warn_incomplete(incomplete: list[str]) -> None:
+    """Warn (on stderr) when binaries produced no functions — analysis is incomplete, NOT clean.
+
+    ★ Red-line (degrade must be visible): a binary Ghidra failed on holds 0 functions, so it looks
+    'clean' to every downstream reader. Naming it here — and pointing at --reanalyze — stops a
+    failed analysis from being mistaken for 'nothing to find'."""
+    if not incomplete:
+        return
+    shown = ", ".join(incomplete[:20]) + (" …" if len(incomplete) > 20 else "")
+    click.echo(
+        f"\n⚠ {len(incomplete)} binaries produced no functions "
+        f"(analysis incomplete, NOT clean): {shown}\n"
+        "  rerun with --reanalyze (or --reanalyze <name>) to retry them.",
+        err=True,
+    )
+
+
 _ANALYZE_EPILOG = """\
 Examples:
 
@@ -65,12 +83,22 @@ Re-running with the same -w (same name or path) resumes from the last checkpoint
     multiple=True,
     help="Skip a specific ingester by kind (e.g. shell_script). Repeatable.",
 )
+@click.option(
+    "--reanalyze",
+    is_flag=False,
+    flag_value="__all__",
+    default=None,
+    help="Force re-analysis ignoring the Ghidra cache: bare --reanalyze redoes ALL binaries; "
+    "--reanalyze <name|path> redoes only that binary (escape hatch for a binary stuck in a bad "
+    "cached state).",
+)
 def analyze(
     fs_root: Path,
     workspace: str | None,
     config: Path | None,
     skip_non_binary: bool,
     skip_ingesters: tuple[str, ...],
+    reanalyze: str | None,
 ) -> None:
     """Analyze an extracted firmware filesystem root.
 
@@ -113,6 +141,7 @@ def analyze(
                     _progress,
                     skip_non_binary=skip_non_binary,
                     skip_ingesters=frozenset(skip_ingesters),
+                    reanalyze=reanalyze,
                 )
             )
     except KeyboardInterrupt:
@@ -153,3 +182,4 @@ def analyze(
     click.echo(f"  Credentials: {result.credentials_ingested}")
     click.echo(f"  Web endpoints: {result.web_endpoints_ingested}")
     click.echo(f"  DB       : {result.db_path}")
+    _warn_incomplete(result.incomplete_binaries)

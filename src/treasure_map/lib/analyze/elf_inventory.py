@@ -90,6 +90,37 @@ def has_loadable_segments(elf_path: Path) -> bool:
         return False
 
 
+# Minimum bytes of executable code below which a 0-function Ghidra result is read as a
+# legitimately code-free object (a data-only / stub ELF) rather than a failed analysis. A real
+# code binary's .text is many KB; this only exempts genuinely code-free objects from re-analysis.
+_MIN_TEXT_BYTES = 64
+
+
+def has_substantial_text(elf_path: Path) -> bool:
+    """True when the ELF carries an executable code section large enough that a decompiler should
+    recover at least one function.
+
+    ★ Red-line (degrade must be visible): this tells a FAILED empty analysis (code present but 0
+    functions produced) from a LEGITIMATELY empty one (a data-only / stub object). Conservative —
+    any parse error returns False (treat as code-free, never manufacture a spurious failure that
+    would re-analyze forever)."""
+    try:
+        with elf_path.open("rb") as f:
+            elf = ELFFile(f)
+            for section in elf.iter_sections():
+                # SHT_PROGBITS carries real bytes (SHT_NOBITS does not); SHF_EXECINSTR (0x4) marks
+                # it executable. A sizable executable-PROGBITS section (normally .text) means code.
+                if (
+                    section.header.sh_type == "SHT_PROGBITS"
+                    and (section.header.sh_flags & 0x4)
+                    and section.header.sh_size >= _MIN_TEXT_BYTES
+                ):
+                    return True
+            return False
+    except Exception:
+        return False
+
+
 def get_dt_needed(elf_path: Path) -> list[str]:
     """Extract DT_NEEDED entries from the .dynamic section."""
     deps: list[str] = []

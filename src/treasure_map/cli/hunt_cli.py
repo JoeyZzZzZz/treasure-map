@@ -674,6 +674,14 @@ def atlas_view(view: str, config: Path | None, atlas_path: Path | None) -> None:
     help="Skip a specific ingester by kind (e.g. shell_script). Repeatable.",
 )
 @click.option(
+    "--reanalyze",
+    is_flag=False,
+    flag_value="__all__",
+    default=None,
+    help="Force re-analysis ignoring the Ghidra cache: bare --reanalyze redoes ALL binaries; "
+    "--reanalyze <name|path> redoes only that binary.",
+)
+@click.option(
     "--config",
     "-c",
     type=click.Path(exists=True, path_type=Path),
@@ -699,6 +707,7 @@ def scan(
     as_json: bool,
     skip_non_binary: bool,
     skip_ingesters: tuple[str, ...],
+    reanalyze: str | None,
     config: Path | None,
     atlas_path: Path | None,
 ) -> None:
@@ -711,6 +720,7 @@ def scan(
     import asyncio
     from typing import Any
 
+    from treasure_map.cli.analyze_cli import _warn_incomplete
     from treasure_map.lib.atlas.connection import open_atlas
     from treasure_map.lib.config.config import load_config
     from treasure_map.lib.errors import GhidraNotFoundError, TreasureMapError
@@ -752,6 +762,7 @@ def scan(
                     _progress,
                     skip_non_binary=skip_non_binary,
                     skip_ingesters=frozenset(skip_ingesters),
+                    reanalyze=reanalyze,
                 )
             )
     except KeyboardInterrupt:
@@ -765,6 +776,7 @@ def scan(
         f"      → analysis.db: {result.binary_count} binaries, "
         f"{result.functions_ingested} functions"
     )
+    _warn_incomplete(result.incomplete_binaries)
 
     # [2/3] hunt call-sequence shapes -> atlas.
     click.echo(f"\n[2/3] hunting call-sequence shapes → atlas (run-id={effective_run_id}) …")

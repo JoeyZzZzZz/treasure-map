@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +59,10 @@ class AnalyzeResult:
     credentials_ingested: int  # Round E: rows written to credentials
     web_endpoints_ingested: int  # Round F: rows written to web_endpoints
     elapsed: float
+    # ★ Red-line (degrade must be visible): current-scan binaries that hold 0 functions but are NOT
+    # legitimately code-free (ghidra_status != ok_empty) — analysis is incomplete for them, NOT
+    # clean. The CLI warns and names them so they are never mistaken for "nothing to find".
+    incomplete_binaries: list[str] = field(default_factory=list)
 
 
 async def run_analyze(
@@ -68,11 +72,14 @@ async def run_analyze(
     progress_callback: ProgressCallback | None = None,
     skip_non_binary: bool = False,
     skip_ingesters: frozenset[str] = frozenset(),
+    reanalyze: str | None = None,
 ) -> AnalyzeResult:
     """Orchestrate a full firmware analysis run.
 
     scan_filesystem always runs.  Ghidra runs only on dirty records.
     After Ghidra, JSON output is ingested into functions/imports/exports/strings.
+
+    ``reanalyze`` (REANALYZE_ALL or a binary name/path) forces re-analysis ignoring the cache.
 
     Fail-fast: discovers analyzeHeadless before scanning so a missing Ghidra
     installation is reported immediately rather than after a long ELF scan.
@@ -89,11 +96,12 @@ async def run_analyze(
     dirty_records: list[ElfRecord] = []
     ghidra_ok = 0
     ghidra_failed = 0
+    incomplete_binaries: list[str] = []
     ingest_stats = IngestStats()
     xref_stats = XrefStats()
     nb_stats = NonBinaryStats()
     try:
-        sha_to_id, dirty_shas = ingest_elfs(conn, records)
+        sha_to_id, dirty_shas = ingest_elfs(conn, records, reanalyze=reanalyze)
         dirty_records = [r for r in records if r.sha256 in dirty_shas]
 
         logger.info(
@@ -116,11 +124,14 @@ async def run_analyze(
                 )
 
             for rec, res in zip(dirty_records, results, strict=False):
+                # ★ Red-line: persist the tri-state outcome. ghidra_ok stays a 0/1 usability flag
+                # (ok/ok_empty -> 1) for back-compat; ghidra_status records WHICH of the three, so a
+                # failed run is visibly not "clean" (ghidra_ok=0) and is retried next run.
+                conn.execute(
+                    "UPDATE binaries SET ghidra_ok=?, ghidra_status=? WHERE sha256=?",
+                    (1 if res.success else 0, res.analysis_status, rec.sha256),
+                )
                 if res.success:
-                    conn.execute(
-                        "UPDATE binaries SET ghidra_ok=1 WHERE sha256=?",
-                        (rec.sha256,),
-                    )
                     ghidra_ok += 1
                 else:
                     ghidra_failed += 1
@@ -138,6 +149,20 @@ async def run_analyze(
 
         # Round B: build cross-binary xrefs + classify strings (wipe-and-rebuild)
         xref_stats = build_xrefs(conn)
+
+        # ★ Red-line visibility: current-scan binaries that hold 0 functions and are NOT a
+        # legitimately code-free object (ghidra_status != ok_empty). Truthful DB-derived set — it
+        # includes a freshly-failed run AND any stale bad row not re-run — so "incomplete" is never
+        # silently presented as "clean".
+        incomplete_binaries = [
+            row["name"]
+            for row in conn.execute(
+                "SELECT b.name FROM current_binaries b "
+                "WHERE COALESCE(b.ghidra_status, '') != 'ok_empty' "
+                "AND NOT EXISTS (SELECT 1 FROM functions f WHERE f.binary_id = b.id) "
+                "ORDER BY b.name"
+            ).fetchall()
+        ]
 
         # Round C: non-binary ingester framework (wipe-and-rebuild)
         if not skip_non_binary:
@@ -173,4 +198,5 @@ async def run_analyze(
         credentials_ingested=nb_stats.sub_rows.get("credential", 0),
         web_endpoints_ingested=nb_stats.sub_rows.get("web_asset", 0),
         elapsed=time.monotonic() - t0,
+        incomplete_binaries=incomplete_binaries,
     )

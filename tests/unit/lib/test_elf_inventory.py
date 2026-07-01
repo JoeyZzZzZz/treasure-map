@@ -15,6 +15,7 @@ from treasure_map.lib.analyze.elf_inventory import (
     get_elf_type,
     get_protections,
     has_loadable_segments,
+    has_substantial_text,
     scan_filesystem,
     sha256_file,
 )
@@ -29,6 +30,24 @@ LIBZ_ELF = FIXTURES / "libz_x86_64.so"
 
 def _skip_if_missing(path: Path) -> pytest.MarkDecorator:
     return pytest.mark.skipif(not path.exists(), reason=f"fixture missing: {path}")
+
+
+# ── has_substantial_text (red-line: tell a failed empty from a code-free empty) ──────
+
+
+@_skip_if_missing(LIBZ_ELF)
+def test_has_substantial_text_true_on_code_binary() -> None:
+    # A real shared library carries an executable .text section -> a 0-function result would be a
+    # FAILED analysis, not "clean".
+    assert has_substantial_text(LIBZ_ELF) is True
+
+
+def test_has_substantial_text_false_on_non_elf(tmp_path: Path) -> None:
+    # A non-ELF / unreadable file cannot be judged to have code -> conservatively False (never
+    # manufacture a spurious "failed" that would re-analyze forever).
+    garbage = tmp_path / "notelf"
+    garbage.write_bytes(b"not an elf at all")
+    assert has_substantial_text(garbage) is False
 
 
 # ── detect_arch ────────────────────────────────────────────────────────────────

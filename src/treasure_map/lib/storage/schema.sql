@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS binaries (
     capa_tags    TEXT    DEFAULT '[]',     -- JSON: 二进制级 Capa 能力标签
     protections  TEXT    DEFAULT '{}',     -- JSON: {nx, pie, canary, relro, fortify}
     size_bytes   INTEGER DEFAULT 0,        -- ELF 文件大小 (bytes)
-    ghidra_ok    INTEGER NOT NULL DEFAULT 0, -- Round 2 partial-invalidation flag
+    ghidra_ok    INTEGER NOT NULL DEFAULT 0, -- Round 2 partial-invalidation flag (1 = usable output)
+    ghidra_status TEXT,                    -- tri-state analysis outcome: ok / ok_empty / failed / NULL
     last_seen_at DATETIME,                 -- timestamp of most recent ingest scan
     analyzed_at  DATETIME DEFAULT CURRENT_TIMESTAMP
 );

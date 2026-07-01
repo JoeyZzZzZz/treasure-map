@@ -44,6 +44,7 @@ def _fake_result(db_path: Path) -> SimpleNamespace:
         "credentials_ingested": 0,
         "web_endpoints_ingested": 0,
         "elapsed": 0.1,
+        "incomplete_binaries": [],
     }
     return SimpleNamespace(**fields)
 

@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Never wrongly downweight (recall red line).** The `const_sink_arg` form-downweight matched a
+  string literal ANYWHERE in the function body, so a function containing both a constant
+  `system("…")` and a `system(free_var)` wrongly downweighted the real, tainted candidate. It is
+  now parameter-specific: the note fires only when a free value (an in-function source output or a
+  caller-supplied parameter) does NOT reach the anchored candidate's own sink argument, and the
+  analyzer additionally drops any note that contradicts the candidate's evidence at write time. A
+  command candidate whose argument comes from a free string is no longer buried.
+- **Analysis failure is no longer silent (degrade red line).** Ghidra success was decided purely by
+  output-file size (> 200 bytes), so a truncated/partial run that left a well-formed-but-empty shell
+  was frozen as "analyzed" and never re-ran — a code binary with 0 recovered functions masqueraded
+  as clean. Success now requires a NON-EMPTY functions array; a binary that carries real code but
+  yields 0 functions is recorded `failed` (and retried), while a genuinely code-free object is
+  recorded `ok_empty` (and left alone). Binaries `binaries.ghidra_status` gains a tri-state
+  (`ok` / `ok_empty` / `failed`).
+
+### Added
+
+- A new `ghidra_status` tri-state, a **self-heal** on re-analysis (a cached binary marked done but
+  holding 0 functions despite real code is re-analyzed — no database rebuild needed), and a
+  `--reanalyze` escape hatch on `scan` / `analyze` (bare = all binaries; `--reanalyze <name|path>` =
+  one) to force past the cache.
+- **Analysis-incompleteness is surfaced, not hidden.** `scan` / `analyze` print a warning naming any
+  binary that produced no functions ("analysis incomplete, NOT clean … rerun with --reanalyze"), and
+  the MCP `list_candidates` / `cross_firmware_patterns` / `pattern_density` results carry an
+  `incomplete_binaries` field so an AI never mistakes a failed analysis for "nothing to find".
+- **CI red-line gates** (`scripts/check_recall_integrity.py`, plus a `Recall Integrity` CI job): two
+  machine-enforced invariants — no `const_sink_arg` candidate may have a `free_string` sink argument
+  (Gate A), and no `ghidra_status='ok'` binary may have 0 functions (Gate B). Runs against real
+  `--atlas` / `--analysis` databases, or `--self-test` for CI. These turn two previously
+  docstring-only contracts into a build that fails red on violation.
+- Each candidate now carries its `structural_fingerprint`, and MCP `list_candidates` gained a
+  `fingerprint=` filter, so an AI can pivot from a `cross_firmware_patterns` hit straight to that
+  pattern's instances.
+
 ### Changed
 
 - **Command names shortened** to their common form: `hunt-pattern` → `hunt`, `hunt-diff` →

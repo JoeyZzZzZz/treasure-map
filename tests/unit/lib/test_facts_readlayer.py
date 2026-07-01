@@ -215,6 +215,33 @@ def test_get_strings_by_value_locates_with_binary_and_note(tmp_path: Path) -> No
     conn.close()
 
 
+def test_list_incomplete_binaries_flags_failed_not_codefree(tmp_path: Path) -> None:
+    # ★ Red-line: a code binary Ghidra failed on (0 functions, status != ok_empty) is surfaced as
+    # incomplete; a legitimately code-free ok_empty object and a binary with functions are not.
+    from treasure_map.lib.storage.connection import open_db
+
+    db = tmp_path / "incomplete.db"
+    conn = open_db(db)
+    conn.execute(
+        "INSERT INTO binaries (id, name, path, sha256, ghidra_status, last_seen_at) "
+        "VALUES (1, 'rc', 'sbin/rc', 'x', 'failed', '2026-01-01')"
+    )
+    conn.execute(
+        "INSERT INTO binaries (id, name, path, sha256, ghidra_status, last_seen_at) "
+        "VALUES (2, 'data.so', 'lib/data.so', 'y', 'ok_empty', '2026-01-01')"
+    )
+    conn.execute(
+        "INSERT INTO binaries (id, name, path, sha256, ghidra_status, last_seen_at) "
+        "VALUES (3, 'httpd', 'usr/sbin/httpd', 'z', 'ok', '2026-01-01')"
+    )
+    conn.execute("INSERT INTO functions (binary_id, name) VALUES (3, 'main')")
+    conn.commit()
+    conn.close()
+    ro = facts.open_analysis_ro(db)
+    assert facts.list_incomplete_binaries(ro) == ["rc"]
+    ro.close()
+
+
 def test_get_disassembly_degrades_honestly(tmp_path: Path) -> None:
     conn = _ro(tmp_path)
     r = facts.get_disassembly(conn, func="handle_req")

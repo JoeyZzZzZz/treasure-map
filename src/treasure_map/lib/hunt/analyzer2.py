@@ -32,6 +32,7 @@ from treasure_map.lib.atlas.models import InstanceRow
 from treasure_map.lib.atlas.writer import add_instance, delete_run_instances, upsert_pattern
 from treasure_map.lib.diff.loader import FuncRow, load_functions
 from treasure_map.lib.hunt.downweight import (
+    CONST_SINK_ARG,
     detect_form_signal,
     library_origin,
     wrapper_propagation_form_note,
@@ -99,6 +100,19 @@ _SINK_CLASS_MEMBERS: dict[str, frozenset[str]] = {
 # these over an exec-family sink (Bug1): system/popen/doSystem run a shell, so anchoring to the
 # alphabetically-first execX would let the no_shell_exec form note hide the real shell sink.
 _SHELL_CMD_SINKS: frozenset[str] = frozenset({"system", "popen", "doSystem"})
+
+
+def _form_note_contradicts_source(blocking_mechanism: str | None, source_kind: str | None) -> bool:
+    """True when a form-downweight note contradicts the candidate's OWN evidence source_kind.
+
+    ★ Red-line invariant (Gate A), enforced at the WRITE path as defense-in-depth: a const_sink_arg
+    note must never sit on a candidate whose sink argument is a free_string source — exactly the
+    whole-function-regex bug (a constant elsewhere in the function wrongly downweighting a tainted
+    callsite). The parameter-specific downweight already prevents this; dropping any note this flags
+    guarantees a contradiction can never be persisted even if a future path reintroduces one
+    (fail-safe: keep the candidate at its normal score rather than silently bury a real lead). This
+    lives on the write side, not in the form-note module, so that module never consumes evidence."""
+    return blocking_mechanism == CONST_SINK_ARG and source_kind == "free_string"
 
 
 @dataclass(frozen=True)
@@ -267,15 +281,19 @@ def run_analyzer2(
                 flow_evidence: str | None = None
                 if match.sink_class == "cmd":
                     sites = entry_index.sites_for(row.binary_name, row.binary_path)
-                    flow_evidence = json.dumps(
-                        build_flow_evidence(
-                            pseudocode=row.pseudocode,
-                            callees=callees,
-                            sink_arg=sink_arg,
-                            entry_sites=sites,
-                        ),
-                        sort_keys=True,
+                    ev = build_flow_evidence(
+                        pseudocode=row.pseudocode,
+                        callees=callees,
+                        sink_arg=sink_arg,
+                        entry_sites=sites,
                     )
+                    # ★ Red-line write-side reconciliation (Gate A): never persist a const_sink_arg
+                    # note on a candidate whose sink argument is a free_string source. Drop the
+                    # contradicting note (fail-safe: keep the candidate at its normal score). The
+                    # parameter-specific downweight already prevents this; this is defense-in-depth.
+                    if _form_note_contradicts_source(blocking, ev.get("source_kind")):
+                        blocking = None
+                    flow_evidence = json.dumps(ev, sort_keys=True)
                 elif match.sink_class == "copy" and sink_name is not None:
                     # Copy candidates carry SIZE evidence (the danger axis): the length source
                     # classification, the one-hop size flow, any clamp/guard seen (coverage
@@ -368,6 +386,10 @@ def run_analyzer2(
                     entry_sites=entry_index.sites_for(f.binary_name, f.binary_path),
                     wrapper={"name": wc.wrapper_name, "wrapped_sink": wc.wrapped_sink},
                 )
+                # ★ Red-line write-side reconciliation (Gate A): a wrapper-forwarded free_string
+                # must never carry a const_sink_arg note (drop it; keep its normal rank).
+                if _form_note_contradicts_source(blocking, evidence.get("source_kind")):
+                    blocking = None
                 source_class = (
                     "external_input" if evidence["source_kind"] == "free_string" else ("unknown")
                 )

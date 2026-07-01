@@ -26,6 +26,15 @@ _DROPPED_COLUMNS: tuple[tuple[str, str, str | None], ...] = (
 # Tables dropped entirely (never read; no writer). DROP TABLE IF EXISTS is idempotent.
 _DROPPED_TABLES: tuple[str, ...] = ("library_summaries",)
 
+# Columns ADDED after the initial schema. CREATE TABLE IF NOT EXISTS does not alter an existing
+# table, so a database built before the column existed needs an explicit, idempotent ALTER. Each
+# entry is (table, column, column_def). Guarded by a presence check so it runs at most once.
+_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    # tri-state Ghidra outcome (ok / ok_empty / failed); back-fills as NULL on older DBs, which the
+    # ingest self-heal treats as needing re-analysis when a claimed-done binary has 0 functions.
+    ("binaries", "ghidra_status", "TEXT"),
+)
+
 
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     """Column names of *table*; empty set if the table does not exist."""
@@ -46,6 +55,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
             # A column cannot be dropped while an index references it.
             conn.execute(f"DROP INDEX IF EXISTS {index}")
         conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+
+    for table, column, coldef in _ADDED_COLUMNS:
+        if _columns(conn, table) and column not in _columns(conn, table):
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coldef}")
 
 
 def open_db(db_path: Path) -> sqlite3.Connection:
