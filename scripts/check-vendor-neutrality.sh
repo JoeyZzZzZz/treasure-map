@@ -67,7 +67,11 @@ fi
 # the message even when the diff is clean.
 RANGE_SPEC="${HEAD_REF}"
 [ -n "$BASE_REF" ] && RANGE_SPEC="${BASE_REF}..${HEAD_REF}"
-MSGS=$(git log --no-merges --format='commit %h: %s%n%b' "$RANGE_SPEC" 2>/dev/null || true)
+# Scan ONLY the human-written subject + body (%s%n%b). The git-generated short hash (%h) is
+# deliberately NOT included: a hex short hash can incidentally match the model-number regex
+# ([a-z]{2,6}[0-9]{3,}) — that is unrelated to vendor neutrality and would redden CI on a false
+# positive (also the source of test_ci_backstop_passes_clean_range's intermittent flake).
+MSGS=$(git log --no-merges --format='%s%n%b' "$RANGE_SPEC" 2>/dev/null || true)
 
 if HITS=$(printf '%s' "$MSGS" | tm_scan_text "$WATCHLIST"); then :; else
     echo "❌ vendor identifier(s) in commit message(s) ($RANGE):"
