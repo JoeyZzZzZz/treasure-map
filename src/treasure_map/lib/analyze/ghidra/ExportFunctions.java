@@ -49,6 +49,42 @@ public class ExportFunctions extends GhidraScript {
         return sb.toString();
     }
 
+    // Resolve a call-target address to {calleeName, edgeKind}, following thunks and GOT pointers.
+    // Returns null only when there is no statically recoverable target (register-indirect /
+    // runtime-computed). This is what lets PIC intra-.so calls (PLT stub / GOT slot) resolve to the
+    // real callee body instead of being dropped when getFunctionAt() returns null on the stub.
+    private String[] resolveCallee(Address to, RefType rt, FunctionManager fm,
+                                   SymbolTable symtab, Listing listing) {
+        if (to == null) return null;
+        // 1. A function is defined at the target.
+        Function f = fm.getFunctionAt(to);
+        if (f != null) {
+            if (f.isThunk()) {                                   // PLT stub → follow to the real callee
+                Function thunked = f.getThunkedFunction(true);
+                if (thunked != null) return new String[]{ thunked.getName(), "thunk" };
+                return new String[]{ f.getName(), "thunk" };     // thunk name if the target can't be followed
+            }
+            return new String[]{ f.getName(), rt.isComputed() ? "indirect" : "direct" };
+        }
+        // 2. A pointer (GOT slot) is defined at the target — follow it.
+        Data d = listing.getDefinedDataAt(to);
+        if (d != null && d.isPointer()) {
+            Object val = null;
+            try { val = d.getValue(); } catch (Exception ignore) {}
+            if (val instanceof Address) {
+                Address pa = (Address) val;
+                Function pf = fm.getFunctionAt(pa);
+                if (pf != null) return new String[]{ pf.getName(), "ptr" };
+                Symbol ps = symtab.getPrimarySymbol(pa);
+                if (ps != null) return new String[]{ ps.getName(), "ptr" };
+            }
+        }
+        // 3. A symbol/label at the target (external stub without a Function object).
+        Symbol s = symtab.getPrimarySymbol(to);
+        if (s != null) return new String[]{ s.getName(), rt.isComputed() ? "indirect" : "direct" };
+        return null;
+    }
+
     @Override
     public void run() throws Exception {
 
@@ -125,33 +161,46 @@ public class ExportFunctions extends GhidraScript {
                 pseudocode = "/* decompile_error: " + e.getMessage() + " */";
             }  // end if (funcSize >= 10)
 
-            // Collect callee names (up to 200) via CALL-type references
-            // Using ReferenceManager instead of getCalledFunctions() for OSGi compatibility
-            StringBuilder calleesArr = new StringBuilder("[");
+            // Collect callee edges. Broaden beyond "CALL ref whose target is a Function AT that
+            // address": PIC intra-.so calls go through PLT stubs / GOT slots, so the ref target is a
+            // thunk/pointer/label, not the callee body → old getFunctionAt() returned null → the
+            // edge was dropped (observed: an exported wrapper's callees came back empty while a
+            // shared library showed a far higher empty-callees rate than its main daemon). Resolve
+            // the target through: Function → thunked function → GOT pointer → symbol. Genuinely
+            // register-indirect / runtime-computed targets stay omitted (honest: no static target).
+            // ReferenceManager is used (not getCalledFunctions()) for OSGi compatibility.
+            StringBuilder calleesArr = new StringBuilder("[");   // names only — existing consumer format, unchanged
+            StringBuilder edgesArr   = new StringBuilder("[");   // {name,kind} — staged for optional call_edges, unemitted for now
             boolean firstCallee = true;
             int calleeCount = 0;
             try {
                 ReferenceManager refMgr = currentProgram.getReferenceManager();
+                SymbolTable       symtab = currentProgram.getSymbolTable();
+                Listing           listing = currentProgram.getListing();
                 Set<String> seenCallees = new HashSet<>();
-                InstructionIterator instrIter =
-                    currentProgram.getListing().getInstructions(func.getBody(), true);
-                while (instrIter.hasNext() && calleeCount < 200) {
+                InstructionIterator instrIter = listing.getInstructions(func.getBody(), true);
+                while (instrIter.hasNext() && calleeCount < 300) {   // was 200; dispatchers fan out wide
                     Instruction instr = instrIter.next();
                     Reference[] refs = refMgr.getReferencesFrom(instr.getAddress());
                     for (Reference ref : refs) {
-                        if (!ref.getReferenceType().isCall()) continue;
-                        Function callee = fm.getFunctionAt(ref.getToAddress());
-                        if (callee == null) continue;
-                        String calleeName = callee.getName();
-                        if (!seenCallees.add(calleeName)) continue;
-                        if (!firstCallee) calleesArr.append(",");
+                        RefType rt = ref.getReferenceType();
+                        if (!rt.isCall()) continue;                  // isCall() already includes COMPUTED_CALL
+                        String[] nk = resolveCallee(ref.getToAddress(), rt, fm, symtab, listing);
+                        if (nk == null) continue;                    // unresolved indirect — honest omission
+                        String calleeName = nk[0];
+                        if (calleeName == null || calleeName.isEmpty()) continue;
+                        if (!seenCallees.add(calleeName)) continue;   // dedupe by name
+                        if (!firstCallee) { calleesArr.append(","); edgesArr.append(","); }
                         firstCallee = false;
                         calleesArr.append("\"").append(esc(calleeName)).append("\"");
+                        edgesArr.append("{\"name\":\"").append(esc(calleeName))
+                                .append("\",\"kind\":\"").append(esc(nk[1])).append("\"}");
                         calleeCount++;
                     }
                 }
             } catch (Exception ignored) {}
             calleesArr.append("]");
+            edgesArr.append("]");
 
             if (!firstFunc) funcsJson.append(",");
             firstFunc = false;
