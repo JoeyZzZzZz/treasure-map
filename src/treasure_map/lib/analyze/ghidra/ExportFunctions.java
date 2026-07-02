@@ -219,6 +219,7 @@ public class ExportFunctions extends GhidraScript {
                         if (nk == null) continue;                    // unresolved indirect — honest omission
                         String calleeName = nk[0];
                         if (calleeName == null || calleeName.isEmpty()) continue;
+                        if (calleeName.equals(funcName)) continue;    // drop self-name (self-ref noise)
                         if (!seenCallees.add(calleeName)) continue;   // dedupe by name
                         if (!firstCallee) { calleesArr.append(","); edgesArr.append(","); }
                         firstCallee = false;
@@ -247,6 +248,7 @@ public class ExportFunctions extends GhidraScript {
                         if (cand == null || cand.isEmpty()) continue;
                         if (C_KEYWORDS.contains(cand)) continue;
                         if (!knownNames.contains(cand)) continue;   // the real filter
+                        if (cand.equals(funcName)) continue;         // drop self-name (self-ref noise)
                         if (!seenCallees.add(cand)) continue;        // dedupe vs the reference source
                         if (!firstCallee) { calleesArr.append(","); edgesArr.append(","); }
                         firstCallee = false;
