@@ -21,8 +21,21 @@ import ghidra.program.model.address.*;
 import java.io.*;
 import java.nio.file.*;
 import java.util.*;
+import java.util.regex.*;
 
 public class ExportFunctions extends GhidraScript {
+
+    // Second callee data source (used in the callee block): recover `name(` call forms straight
+    // from the decompiled text. PIC intra-.so calls via PLT/GOT frequently carry no call
+    // reference, so the reference scan alone misses them. Intersecting the scanned identifiers
+    // with the binary's known function + import names is the real filter — keywords, casts, pcode
+    // helpers, and locals are simply absent from that set. The whitespace-free `name(` shape
+    // matches call syntax while `if (` / `while (` (space before the paren) do not; C_KEYWORDS is
+    // a cheap explicit belt-and-suspenders guard on top of the name intersection.
+    private static final Pattern CALL_NAME = Pattern.compile("([A-Za-z_][A-Za-z0-9_]*)\\(");
+    private static final Set<String> C_KEYWORDS = new HashSet<>(Arrays.asList(
+        "if", "for", "while", "switch", "return", "sizeof", "do", "else", "goto",
+        "case", "default", "break", "continue", "typedef", "struct", "union", "enum"));
 
     // Escape a string for JSON: handles control chars, quotes, backslashes
     private static String esc(String s) {
@@ -133,6 +146,23 @@ public class ExportFunctions extends GhidraScript {
         boolean firstFunc = true;
         int funcCount = 0;
 
+        // Name universe for the pseudocode-derived callee source: every defined function name in
+        // THIS binary (thunks/externals included — a call to a thunked libc import is a real edge)
+        // plus every imported symbol name. A scanned `name(` counts as a callee only if it lands
+        // in here, so struct fields, locals, casts, and pcode helpers never leak in.
+        Set<String> knownNames = new HashSet<>();
+        for (Function fn : fm.getFunctions(true)) {
+            String n = fn.getName();
+            if (n != null && !n.isEmpty()) knownNames.add(n);
+        }
+        SymbolIterator knownExt = st.getExternalSymbols();
+        while (knownExt.hasNext()) {
+            Symbol esym = knownExt.next();
+            if (esym == null) continue;
+            String n = esym.getName();
+            if (n != null && !n.isEmpty()) knownNames.add(n);
+        }
+
         for (Function func : fm.getFunctions(true)) {
             if (monitor.isCancelled()) break;
 
@@ -173,11 +203,11 @@ public class ExportFunctions extends GhidraScript {
             StringBuilder edgesArr   = new StringBuilder("[");   // {name,kind} — staged for optional call_edges, unemitted for now
             boolean firstCallee = true;
             int calleeCount = 0;
+            Set<String> seenCallees = new HashSet<>();   // shared across both callee data sources
             try {
                 ReferenceManager refMgr = currentProgram.getReferenceManager();
                 SymbolTable       symtab = currentProgram.getSymbolTable();
                 Listing           listing = currentProgram.getListing();
-                Set<String> seenCallees = new HashSet<>();
                 InstructionIterator instrIter = listing.getInstructions(func.getBody(), true);
                 while (instrIter.hasNext() && calleeCount < 300) {   // was 200; dispatchers fan out wide
                     Instruction instr = instrIter.next();
@@ -195,6 +225,34 @@ public class ExportFunctions extends GhidraScript {
                         calleesArr.append("\"").append(esc(calleeName)).append("\"");
                         edgesArr.append("{\"name\":\"").append(esc(calleeName))
                                 .append("\",\"kind\":\"").append(esc(nk[1])).append("\"}");
+                        calleeCount++;
+                    }
+                }
+            } catch (Exception ignored) {}
+
+            // Second data source: recover callee names from the decompiled text itself. PIC
+            // intra-.so calls via PLT/GOT often carry NO call reference, so the reference scan
+            // above misses them even though the pseudocode plainly shows name(...) calls. Scan for
+            // `identifier(` and keep only tokens that are known function / import names (the
+            // intersection is the filter). Merge-deduped into the shared seenCallees set, so a name
+            // already found via reference is never repeated. Boundary: a failed decompile leaves no
+            // usable text, and function-pointer calls `(*p)(...)` expose no name — both honestly
+            // omitted here.
+            try {
+                if (pseudocode != null && !pseudocode.isEmpty()
+                        && !pseudocode.startsWith("/* decompile_error")) {
+                    Matcher m = CALL_NAME.matcher(pseudocode);
+                    while (m.find() && calleeCount < 300) {
+                        String cand = m.group(1);
+                        if (cand == null || cand.isEmpty()) continue;
+                        if (C_KEYWORDS.contains(cand)) continue;
+                        if (!knownNames.contains(cand)) continue;   // the real filter
+                        if (!seenCallees.add(cand)) continue;        // dedupe vs the reference source
+                        if (!firstCallee) { calleesArr.append(","); edgesArr.append(","); }
+                        firstCallee = false;
+                        calleesArr.append("\"").append(esc(cand)).append("\"");
+                        edgesArr.append("{\"name\":\"").append(esc(cand))
+                                .append("\",\"kind\":\"pcode\"}");
                         calleeCount++;
                     }
                 }
