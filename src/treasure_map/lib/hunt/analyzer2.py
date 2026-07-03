@@ -122,7 +122,7 @@ class Analyzer2Stats:
     instances_written: int  # graded instances persisted into the atlas
     by_status: dict[str, int]  # reachability_status -> count, over written instances
     oss_excluded: int  # distinct OSS/third-party binaries R-pattern excluded
-    wrapper_propagated: int = 0  # cmd candidates recovered via one-hop thin-wrapper propagation
+    wrapper_propagated: int = 0  # cmd/fmt candidates recovered via one-hop thin-wrapper propagation
 
 
 def _load_known_components(db_path: Path | str) -> set[str]:
@@ -140,10 +140,19 @@ def _load_known_components(db_path: Path | str) -> set[str]:
     return {r[0] for r in rows}
 
 
-def _wrapper_fingerprint(source_class: str, wrapped_sink: str) -> str:
-    """Deterministic coarse fingerprint for the wrapper-propagated cmd shape (one per
-    source_class + wrapped sink), distinct from the rich call-sequence fingerprints."""
-    basis = f"wrapper-cmd|{source_class}|{wrapped_sink}"
+# Per-axis labels for a wrapper-propagated candidate: (call_sequence_shape prefix, evidence_ref
+# suffix). Keyed by the candidate's sink_class. "cmd" keeps its historical strings byte-for-byte.
+_WRAPPER_AXIS: dict[str, tuple[str, str]] = {
+    "cmd": ("wrapper-cmd", "cmd_via_wrapper"),
+    "fmt_string": ("wrapper-fmt", "fmt_via_wrapper"),
+}
+
+
+def _wrapper_fingerprint(sink_class: str, source_class: str, wrapped_sink: str) -> str:
+    """Deterministic coarse fingerprint for a wrapper-propagated shape (one per sink axis +
+    source_class + wrapped sink), distinct from the rich call-sequence fingerprints. The "cmd"
+    axis reproduces the historical `wrapper-cmd|…` basis exactly (no fingerprint churn)."""
+    basis = f"{_WRAPPER_AXIS[sink_class][0]}|{source_class}|{wrapped_sink}"
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
 
 
@@ -367,16 +376,20 @@ def run_analyzer2(
                 by_status[status] += 1
 
             # ── Factor ① recall pass: one-hop thin-wrapper propagation ──────────────────
-            # A function whose command sink hides inside a thin wrapper it calls becomes a cmd
-            # candidate here (the shape scan could not see the sink among its own callees). The
-            # candidate is graded "unknown"/L0 — the real sink is across a call boundary, so an
-            # intra-procedural confirmation does not hold; the wrapper hop is stated in evidence.
-            # New candidates run through the SAME FP-suppression (a constant / charset-constrained
-            # argument forwarded to the wrapper is downweighted) so a safe fanout stays low.
+            # A function whose sink hides inside a thin wrapper it calls becomes a candidate here
+            # (the shape scan could not see the sink among its own callees), on either the command
+            # or the format-string axis (wc.sink_class). The candidate is graded "unknown"/L0 — the
+            # real sink is across a call boundary, so an intra-procedural confirmation cannot hold;
+            # the wrapper hop is stated in evidence. New candidates run through the SAME
+            # FP-suppression (a constant / charset-constrained argument forwarded to the wrapper is
+            # downweighted) so a safe fanout stays low. The forwarded-value flow evidence is
+            # axis-agnostic: it classifies the value f hands to the wrapper (the danger axis lives
+            # inside the wrapper, named by wrapped_sink), so both axes share build_flow_evidence.
             for wc in wrapper_candidates:
                 f = wc.func
                 f_pseudocode = f.pseudocode or ""
                 f_callees = _parse_callees(f.callees)
+                shape_prefix, ref_suffix = _WRAPPER_AXIS[wc.sink_class]
                 sink_arg = locate_sink_arg(f_pseudocode, wc.wrapper_name)
                 blocking = wrapper_propagation_form_note(f_pseudocode, wc.wrapper_name, sink_arg)
                 evidence = build_flow_evidence(
@@ -396,9 +409,11 @@ def run_analyzer2(
                 pattern_id = upsert_pattern(
                     atlas,
                     source_class=source_class,
-                    sink_class="cmd",
-                    call_sequence_shape=f"wrapper-cmd:{wc.wrapped_sink}",
-                    structural_fingerprint=_wrapper_fingerprint(source_class, wc.wrapped_sink),
+                    sink_class=wc.sink_class,
+                    call_sequence_shape=f"{shape_prefix}:{wc.wrapped_sink}",
+                    structural_fingerprint=_wrapper_fingerprint(
+                        wc.sink_class, source_class, wc.wrapped_sink
+                    ),
                     fingerprint_algo_version="callseq-v1",
                     commit=False,
                 )
@@ -415,7 +430,9 @@ def run_analyzer2(
                         provenance_level="L0",
                         # Distinct suffix so a function that is ALSO a direct candidate (it is not,
                         # by construction) never collides; this is the wrapper-recovered instance.
-                        evidence_ref=f"{source_run_id}#fn{f.func_id}@cmd_via_wrapper",
+                        # The axis suffix also keeps a cmd- and a fmt-via-wrapper recovery of the
+                        # same function from colliding.
+                        evidence_ref=f"{source_run_id}#fn{f.func_id}@{ref_suffix}",
                         binary_path=f.binary_path or f.binary_name,
                         binary_content_hash=f.binary_sha256,
                         scope_origin="intra",

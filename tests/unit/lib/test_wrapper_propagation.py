@@ -40,6 +40,9 @@ def _fn(
 # The thin wrapper present in most fixtures: body ≈ system(param).
 _WRAPPER = _fn(1, "do_cmd", "void do_cmd(char* param_1){ system(param_1); }", ["system"])
 
+# The thin FORMAT-STRING wrapper: forwards a parameter into printf's format position (arg0).
+_FMT_WRAPPER = _fn(1, "log_msg", "void log_msg(char* param_1){ printf(param_1); }", ["printf"])
+
 
 def _names(cands) -> set[str]:
     return {c.func.name for c in cands}
@@ -141,3 +144,68 @@ def test_deterministic_wrapper_pick_when_several() -> None:
     )
     (c,) = find_wrapper_propagated_candidates([_WRAPPER, w2, caller], set())
     assert c.wrapper_name == "do_cmd"  # 'do_cmd' < 'run_sh'
+
+
+# ── the format-string axis (缺口①): symmetric one-hop propagation through a thin fmt wrapper ──
+
+
+def test_caller_of_thin_fmt_wrapper_becomes_fmt_candidate() -> None:
+    # The D-2 blind spot on the format-string axis: f builds a message and forwards it to a thin
+    # format wrapper; the printf-family sink lives inside the wrapper, invisible to the shape scan.
+    caller = _fn(
+        2,
+        "handle_req",
+        'void handle_req(void){ char m[128]; snprintf(m,128,"got %s",x); log_msg(m); }',
+        ["snprintf", "log_msg"],
+    )
+    (c,) = find_wrapper_propagated_candidates([_FMT_WRAPPER, caller], set())
+    assert c.func.name == "handle_req"
+    assert c.wrapper_name == "log_msg"
+    assert c.wrapped_sink == "printf"
+    assert c.sink_class == "fmt_string"
+
+
+def test_function_with_direct_fmt_sink_is_not_propagated() -> None:
+    # Already a direct format-string candidate (the shape scan owns it) -> not recovered here.
+    direct = _fn(
+        2,
+        "has_fmt",
+        "void has_fmt(char* p){ fprintf(stderr, p, 0); log_msg(p); }",
+        ["fprintf", "log_msg"],
+    )
+    assert find_wrapper_propagated_candidates([_FMT_WRAPPER, direct], set()) == []
+
+
+def test_cross_binary_fmt_wrapper_is_not_propagated() -> None:
+    wrapper_libb = _fn(
+        1,
+        "log_msg",
+        "void log_msg(char* param_1){ printf(param_1); }",
+        ["printf"],
+        binary_id=2,
+        binary="libb",
+    )
+    caller_a = _fn(
+        2,
+        "caller",
+        'void caller(void){ char m[64]; snprintf(m,64,"%s",x); log_msg(m); }',
+        ["snprintf", "log_msg"],
+    )
+    assert find_wrapper_propagated_candidates([wrapper_libb, caller_a], set()) == []
+
+
+def test_cmd_and_fmt_axes_both_recovered_for_one_function() -> None:
+    # A function that forwards through BOTH a cmd wrapper and a fmt wrapper (and has neither sink
+    # directly) is recovered once per axis — two candidates, distinct sink classes.
+    caller = _fn(
+        2,
+        "dispatch",
+        'void dispatch(void){ char m[64]; snprintf(m,64,"%s",x); do_cmd(m); log_msg(m); }',
+        ["snprintf", "do_cmd", "log_msg"],
+    )
+    cands = find_wrapper_propagated_candidates([_WRAPPER, _FMT_WRAPPER, caller], set())
+    assert {c.sink_class for c in cands} == {"cmd", "fmt_string"}
+    assert {c.func.name for c in cands} == {"dispatch"}
+    by_axis = {c.sink_class: c for c in cands}
+    assert by_axis["cmd"].wrapped_sink == "system"
+    assert by_axis["fmt_string"].wrapped_sink == "printf"

@@ -10,10 +10,12 @@ not read these fields).
 
 is_thin_cmd_wrapper recognizes a "thin forwarding wrapper": a function whose body does little
 more than hand one of its own parameters straight to a shell command sink
-(system / popen / doSystem). This is a structural fact about the call graph and the function's
-shape — it deliberately does NOT claim the forwarded value is attacker-controlled; that
-judgement is left to a later layer's positive evidence. Conservative by construction: under
-any doubt it returns (False, None), so a false fact is never asserted.
+(system / popen / doSystem). is_thin_fmt_wrapper is its format-string counterpart: a thin
+function that forwards a parameter straight into the FORMAT-STRING position of a printf-family
+sink (fprintf's arg1, printf's arg0, syslog's arg1, …). Both are structural facts about the
+call graph and the function's shape — they deliberately do NOT claim the forwarded value is
+attacker-controlled; that judgement is left to a later layer's positive evidence. Conservative
+by construction: under any doubt they return (False, None), so a false fact is never asserted.
 
 Name-based and intra-procedural by design (like the validator/downweight filters): it can
 miss, and it prefers to stay silent rather than mislabel.
@@ -23,11 +25,12 @@ from __future__ import annotations
 
 import re
 
-from treasure_map.lib.pattern.classes import COPY, FORMAT
+from treasure_map.lib.pattern.classes import COPY, FMT_STRING, FORMAT
 from treasure_map.lib.reachability.taint import (
     _CALLER_SUPPLIED_RE,
     _IDENT_RE,
     _TYPE_WORDS,
+    locate_format_arg,
     locate_sink_arg,
 )
 
@@ -146,3 +149,53 @@ def is_thin_cmd_wrapper(
         return False, None
 
     return True, wrapped
+
+
+def is_thin_fmt_wrapper(
+    pseudocode: str,
+    callees: list[str],
+    *,
+    max_statements: int = _WRAPPER_MAX_STATEMENTS,
+) -> tuple[bool, str | None]:
+    """Recognize a thin format-string-forwarding wrapper. Returns (is_wrapper, wrapped_sink).
+
+    The format-string counterpart of is_thin_cmd_wrapper. A function is a thin format wrapper
+    when ALL hold:
+      1. it calls a format-string sink (printf / fprintf / syslog / err / asprintf / …);
+      2. that sink's FORMAT-STRING argument — the per-sink danger position (fprintf's arg1,
+         printf's arg0, syslog's arg1, …), NOT merely the first argument — is one of the
+         function's own parameters (or a decompiler caller-supplied placeholder param_N /
+         in_<reg>), forwarded verbatim: not built locally AND not a string literal;
+      3. the body is thin (<= max_statements non-empty statements).
+
+    The literal exclusion is the load-bearing difference from the command axis. A command sink's
+    whole first argument is the danger, so forwarding a parameter there is the wrapper. A format
+    sink's data arguments are harmless; only the FORMAT position propagates format-string
+    injection. `fprintf(f, "literal", param_1)` forwards a parameter into a DATA slot while the
+    format is a fixed literal — a safe call, NOT a wrapper — so a literal in the format position
+    (even with a forwarded data argument) is rejected. locate_format_arg enforces this: it skips
+    every literal-format call and yields an identifier only from a non-literal format position.
+
+    Structural fact only: it does NOT assert the forwarded format is attacker-controlled. Returns
+    (False, None) under any doubt. See the module docstring."""
+    fmt_sinks = sorted({c.strip() for c in callees} & FMT_STRING)
+    if not fmt_sinks:
+        return False, None
+
+    if _statement_count(pseudocode) > max_statements:
+        return False, None
+
+    params = _signature_params(pseudocode)
+    for sink in fmt_sinks:
+        # The identifier at the FORMAT position (per-sink index), skipping literal-format calls.
+        # None => every call to this sink passed a literal format (safe) or was unreadable.
+        arg = locate_format_arg(pseudocode, sink)
+        if arg is None:
+            continue
+        is_param = arg in params or _CALLER_SUPPLIED_RE.fullmatch(arg) is not None
+        if not is_param:
+            continue
+        if not _arg_is_forwarded_verbatim(pseudocode, arg):
+            continue
+        return True, sink
+    return False, None

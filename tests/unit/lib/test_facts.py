@@ -16,7 +16,11 @@ from pathlib import Path
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import InstanceRow
 from treasure_map.lib.atlas.writer import add_instance, upsert_pattern
-from treasure_map.lib.hunt.facts import _WRAPPER_MAX_STATEMENTS, is_thin_cmd_wrapper
+from treasure_map.lib.hunt.facts import (
+    _WRAPPER_MAX_STATEMENTS,
+    is_thin_cmd_wrapper,
+    is_thin_fmt_wrapper,
+)
 
 _SRC = Path(__file__).resolve().parents[3] / "src" / "treasure_map"
 
@@ -116,6 +120,75 @@ def test_threshold_is_fixed_and_documented() -> None:
     # 20 (raised from 6) admits a real command shell that parses its return value; five-device
     # measurement confirmed it does not over-label (verbatim-forward ④ is the real bound).
     assert _WRAPPER_MAX_STATEMENTS == 20
+
+
+# ── is_thin_fmt_wrapper: the format-string counterpart (danger axis = the FORMAT position) ──
+
+
+def test_fmt_format_position_param_is_wrapper() -> None:
+    # ① fprintf's format is arg1: a parameter there is forwarded into the format position.
+    pc = "void log_it(FILE* f, char* param_1){ fprintf(f, param_1, 0); }"
+    assert is_thin_fmt_wrapper(pc, ["fprintf"]) == (True, "fprintf")
+
+
+def test_fmt_literal_format_with_forwarded_data_is_not_wrapper() -> None:
+    # ② THE FP-defense core (the fixed-format-logger safe form): the format position is a fixed
+    # literal, the parameter is only in a DATA slot -> a safe call, NOT a format wrapper.
+    pc = 'void log_it(FILE* f, char* param_1){ fprintf(f, "literal", param_1); }'
+    assert is_thin_fmt_wrapper(pc, ["fprintf"]) == (False, None)
+
+
+def test_fmt_printf_format_is_arg0() -> None:
+    # ③ printf's format is arg0: a parameter in the first slot is the format forward.
+    pc = "void log_it(char* param_1){ printf(param_1); }"
+    assert is_thin_fmt_wrapper(pc, ["printf"]) == (True, "printf")
+
+
+def test_fmt_syslog_format_is_arg1() -> None:
+    # syslog's format is arg1 (arg0 is the level) — the per-sink index must be honored.
+    pc = "void log_it(int level, char* param_1){ syslog(level, param_1); }"
+    assert is_thin_fmt_wrapper(pc, ["syslog"]) == (True, "syslog")
+
+
+def test_fmt_named_parameter_forward_is_wrapper() -> None:
+    # A human-named parameter (not a param_N placeholder) in the format position still counts.
+    pc = "void log_it(char *fmt){ printf(fmt); }"
+    assert is_thin_fmt_wrapper(pc, ["printf"]) == (True, "printf")
+
+
+def test_fmt_percent_s_literal_format_is_not_wrapper() -> None:
+    # A "%s" format is still a literal (fixed format) -> not a format-string wrapper.
+    pc = 'void log_it(char* param_1){ printf("%s", param_1); }'
+    assert is_thin_fmt_wrapper(pc, ["printf"]) == (False, None)
+
+
+def test_fmt_locally_built_format_is_not_verbatim() -> None:
+    # The format is a parameter but it was built locally (strcpy destination) -> not verbatim.
+    pc = 'void log_it(char* param_1){ strcpy(param_1, "x %s"); printf(param_1); }'
+    assert is_thin_fmt_wrapper(pc, ["strcpy", "printf"]) == (False, None)
+
+
+def test_fmt_reassigned_format_is_not_verbatim() -> None:
+    pc = "void log_it(char* param_1){ param_1 = fixup(param_1); printf(param_1); }"
+    assert is_thin_fmt_wrapper(pc, ["fixup", "printf"]) == (False, None)
+
+
+def test_fmt_local_sourced_format_is_not_parameter_forward() -> None:
+    # The format value is an in-function source, not a parameter -> not a parameter forward.
+    pc = "void log_it(void){ char* c = get_cgi(); printf(c); }"
+    assert is_thin_fmt_wrapper(pc, ["get_cgi", "printf"]) == (False, None)
+
+
+def test_fmt_large_body_is_not_thin() -> None:
+    stmts = " ".join(f"int v{i} = step{i}();" for i in range(_WRAPPER_MAX_STATEMENTS + 2))
+    pc = f"void log_it(char* param_1){{ {stmts} printf(param_1); }}"
+    callees = [f"step{i}" for i in range(_WRAPPER_MAX_STATEMENTS + 2)] + ["printf"]
+    assert is_thin_fmt_wrapper(pc, callees) == (False, None)
+
+
+def test_fmt_no_format_sink_is_not_wrapper() -> None:
+    pc = "void log_it(char* param_1){ system(param_1); }"
+    assert is_thin_fmt_wrapper(pc, ["system"]) == (False, None)
 
 
 # ── persistence: the fact round-trips through the atlas and survives source removal ───

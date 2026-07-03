@@ -1066,6 +1066,85 @@ def test_wrapper_propagation_is_deterministic(tmp_path: Path) -> None:
     assert _ev_by_fn(a1) == _ev_by_fn(a2)
 
 
+# ── factor ① on the format-string axis (缺口①): symmetric fmt-wrapper propagation ──────
+
+
+def _thin_fmt_wrapper_fn(name: str = "log_msg") -> dict[str, object]:
+    # A thin format wrapper: forwards a parameter into printf's format position (arg0).
+    return {
+        "name": name,
+        "pseudocode": f"void {name}(char* param_1){{ printf(param_1); }}",
+        "hash": f"h_{name}",
+        "callees": ["printf"],
+    }
+
+
+def _free_via_fmt_wrapper_fn(name: str = "handle_req") -> dict[str, object]:
+    # Builds a free string and forwards it to the thin format wrapper — NO direct format-string
+    # sink among its callees, so the shape scan never surfaces it (the D-2 blind spot, fmt axis).
+    body = (
+        f"void {name}(void){{ char* v=nvram_get(0); char m[128]; "
+        f'snprintf(m,128,"got %s",v); log_msg(m); }}'
+    )
+    return {
+        "name": name,
+        "pseudocode": body,
+        "hash": f"h_{name}",
+        "callees": ["nvram_get", "snprintf", "log_msg"],
+    }
+
+
+def test_free_string_via_fmt_wrapper_becomes_fmt_candidate(tmp_path: Path) -> None:
+    # ★ 缺口① target: a function whose format-string sink hides in a thin format wrapper becomes a
+    # fmt_string candidate (NOT a cmd one), with evidence noting the one-hop wrapper.
+    db = _make_db(
+        tmp_path,
+        [{"name": "netd", "funcs": [_thin_fmt_wrapper_fn(), _free_via_fmt_wrapper_fn()]}],
+    )
+    atlas = tmp_path / "atlas.db"
+    stats = run_analyzer2(db, atlas, source_run_id="run_fmt")
+    assert stats.wrapper_propagated == 1
+
+    row = _by_anchor(atlas)["handle_req"]
+    assert row["sink_anchor"] == "printf"  # the real format-string sink, reached via the wrapper
+    assert row["provenance_level"] == "L0"  # cross-function: not graded, honest
+    assert row["blocking_mechanism"] is None  # free string -> not downweighted
+    ev = json.loads(row["flow_evidence"])
+    assert ev["source_kind"] == "free_string"
+    assert ev["flow_path"]["sink_via_wrapper"] is True
+    assert ev["flow_path"]["wrapper"]["name"] == "log_msg"
+    assert ev["flow_path"]["wrapper"]["wrapped_sink"] == "printf"
+    assert ev["trace_boundary"] == "reached_sink_via_one_hop_wrapper"
+    assert row["evidence_ref"].endswith("@fmt_via_wrapper")
+
+    # The candidate is on the fmt_string axis (its pattern), never mislabeled as cmd.
+    conn = open_atlas(atlas)
+    try:
+        sink_class = conn.execute(
+            "SELECT p.sink_class FROM instance i JOIN pattern p ON p.pattern_id = i.pattern_id "
+            "WHERE i.source_anchor = 'handle_req'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert sink_class == "fmt_string"
+
+
+def test_fmt_wrapper_itself_kept_as_distinct_candidate(tmp_path: Path) -> None:
+    # No double counting: the wrapper is its own direct fmt candidate (@fmt_string); the caller is
+    # the wrapper-recovered candidate (@fmt_via_wrapper). Two distinct, uniquely-referenced rows.
+    db = _make_db(
+        tmp_path,
+        [{"name": "netd", "funcs": [_thin_fmt_wrapper_fn(), _free_via_fmt_wrapper_fn()]}],
+    )
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_fmt2")
+    rows = _by_anchor(atlas)
+    assert rows["log_msg"]["evidence_ref"].endswith("@fmt_string")
+    assert rows["handle_req"]["evidence_ref"].endswith("@fmt_via_wrapper")
+    refs = [r["evidence_ref"] for r in _instances(atlas)]
+    assert len(set(refs)) == len(refs)  # unique
+
+
 # ── BOUNDARY ────────────────────────────────────────────────────────────────────────
 
 
