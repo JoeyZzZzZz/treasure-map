@@ -26,7 +26,11 @@ rounds, so it must not re-explode the candidate set):
   name resolves to a wrapper only when a thin wrapper of that name exists in the SAME binary.
 
 This finds a structural call-graph link; it makes no controllability or triggerability claim —
-the source classification and blind-spot honesty ride on the per-candidate flow evidence.
+the source classification and blind-spot honesty ride on the per-candidate flow evidence. That
+per-candidate source classification is also where the analyzer applies a precision gate on the
+FORMAT-STRING axis: a recovered fmt candidate whose forwarded value is not a controllable source
+is dropped there (variadic loggers are ubiquitous, so recall amplification must rest on a
+controllable input) — this finder stays purely structural and returns the candidate regardless.
 """
 
 from __future__ import annotations

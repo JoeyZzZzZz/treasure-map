@@ -406,6 +406,19 @@ def run_analyzer2(
                 source_class = (
                     "external_input" if evidence["source_kind"] == "free_string" else ("unknown")
                 )
+                # 缺口① precision gate (format-string axis only): wrapper propagation is
+                # L3's sole recall-amplifying step, so on the fmt axis it must rest on a
+                # controllable source. A fmt candidate whose forwarded value is not a free
+                # (externally-influenced) string is dropped: variadic loggers (vsyslog /
+                # vfprintf) are ubiquitous, so without this the amplification floods the set
+                # with calls into legitimate logging wrappers whose input is unconfirmed
+                # (measured ~90% of fmt wrapper candidates), diluting the real controllable-
+                # input deep chains. Dropping an unknown-source candidate creates NO false-
+                # negative — an uncontrollable source is not a real format-string-injection
+                # path. The command axis is deliberately unchanged: a constant / charset-
+                # constrained argument forwarded to a shell wrapper stays a downweighted lead.
+                if wc.sink_class == "fmt_string" and source_class == "unknown":
+                    continue
                 pattern_id = upsert_pattern(
                     atlas,
                     source_class=source_class,

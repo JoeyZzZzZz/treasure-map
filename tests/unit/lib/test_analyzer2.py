@@ -1145,6 +1145,72 @@ def test_fmt_wrapper_itself_kept_as_distinct_candidate(tmp_path: Path) -> None:
     assert len(set(refs)) == len(refs)  # unique
 
 
+def _unknown_via_fmt_wrapper_fn(name: str = "emit_state") -> dict[str, object]:
+    # Forwards a non-free value (a global-ish name — no source call, not a parameter) into the thin
+    # fmt wrapper, so the source stays "unknown". This is the field-dominant fmt wrapper shape (a
+    # caller of a variadic logger with an unconfirmed source) that the precision gate drops.
+    return {
+        "name": name,
+        "pseudocode": f"void {name}(void){{ log_msg(g_state); }}",
+        "hash": f"h_{name}",
+        "callees": ["log_msg"],
+    }
+
+
+def test_unknown_source_fmt_wrapper_candidate_is_dropped(tmp_path: Path) -> None:
+    # ★ 缺口① precision gate: a fmt wrapper candidate whose forwarded value is not a controllable
+    # (free) source is dropped — no false-negative, pure denoise of legit-logger fanout.
+    db = _make_db(
+        tmp_path,
+        [{"name": "netd", "funcs": [_thin_fmt_wrapper_fn(), _unknown_via_fmt_wrapper_fn()]}],
+    )
+    atlas = tmp_path / "atlas.db"
+    stats = run_analyzer2(db, atlas, source_run_id="run_fmt_drop")
+    assert stats.wrapper_propagated == 0  # the unknown-source caller is not recovered
+    anchors = set(_by_anchor(atlas))
+    assert "emit_state" not in anchors  # dropped: no @fmt_via_wrapper instance for it
+    assert "log_msg" in anchors  # the wrapper stays its own direct fmt candidate (printf param)
+
+
+def test_fmt_wrapper_gate_keeps_controllable_drops_unknown(tmp_path: Path) -> None:
+    # The gate is source-selective, not blanket: in one binary the free-string caller survives and
+    # the unknown-source caller is dropped — recall amplification kept on controllable input only.
+    db = _make_db(
+        tmp_path,
+        [
+            {
+                "name": "netd",
+                "funcs": [
+                    _thin_fmt_wrapper_fn(),
+                    _free_via_fmt_wrapper_fn(),
+                    _unknown_via_fmt_wrapper_fn(),
+                ],
+            }
+        ],
+    )
+    atlas = tmp_path / "atlas.db"
+    stats = run_analyzer2(db, atlas, source_run_id="run_fmt_gate")
+    assert stats.wrapper_propagated == 1  # only the free-string caller survives the gate
+    anchors = set(_by_anchor(atlas))
+    assert "handle_req" in anchors  # external_input -> kept
+    assert "emit_state" not in anchors  # unknown -> dropped
+
+
+def test_cmd_axis_unknown_source_wrapper_is_still_kept(tmp_path: Path) -> None:
+    # Regression guard: the precision gate is fmt-axis only. A constant forwarded to a shell wrapper
+    # (source_class "unknown" on the cmd axis) stays a graded, downweighted lead — NOT dropped.
+    db = _make_db(
+        tmp_path,
+        [{"name": "netd", "funcs": [_thin_cmd_wrapper_fn(), _const_via_wrapper_fn()]}],
+    )
+    atlas = tmp_path / "atlas.db"
+    stats = run_analyzer2(db, atlas, source_run_id="run_cmd_unknown")
+    assert stats.wrapper_propagated == 1  # the const-forwarding cmd caller is still recovered
+    row = _by_anchor(atlas)["reboot_now"]
+    assert row["evidence_ref"].endswith("@cmd_via_wrapper")
+    assert row["blocking_mechanism"] == "const_sink_arg"  # downweighted, not dropped
+
+
 # ── BOUNDARY ────────────────────────────────────────────────────────────────────────
 
 
