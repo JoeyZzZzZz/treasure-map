@@ -11,6 +11,9 @@ __pycache__/
 build/
 dist/
 .eggs/
+# uv writes a lockfile when run in the project root; this tool is distributed via pyproject
+# and does not track a lock — ignore the generated artifact so it never lands in a commit.
+uv.lock
 
 # Virtual environments
 venv/
