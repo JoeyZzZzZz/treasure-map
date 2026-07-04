@@ -19,7 +19,7 @@ from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import InstanceRow
 from treasure_map.lib.atlas.writer import add_instance, upsert_pattern
 from treasure_map.lib.query import explain_candidate, get_sink_provenance
-from treasure_map.lib.query.triage import _sink_provenance_summary
+from treasure_map.lib.query.triage import _fmt_arity, _sink_provenance_summary
 
 # One representative record per source kind (the JSON contract ExportFunctions emits).
 _PROV = [
@@ -176,7 +176,9 @@ def test_explain_summary_one_entry_per_sink_and_compact(tmp_path: Path) -> None:
                 "kind",
                 "resolved",
                 "writer_count",
+                "dominating_writer_count",
                 "nearest_dominating_writer",
+                "nearest_dominating_writer_fmt",
             }
         )
         assert "writers" not in s
@@ -301,3 +303,111 @@ def test_provenance_is_not_a_score_component(tmp_path: Path) -> None:
     signals = " ".join(c.signal for c in ex.components).lower()
     assert "provenance" not in signals
     assert "writer" not in signals
+
+
+# ── polish: readability of a reused-buffer stack_buf (dominating count / inline fmt / ordering /
+#    fmt-arity vararg trim) ───────────────────────────────────────────────────────────────────
+
+# A reused scratch buffer: 16 writers, only 3 sound-dominating (placed AFTER the noise to exercise
+# reordering). The nearest dominating writer carries an echo fmt with 2 conversions but 4 varargs
+# (the last two are uninitialized-slot noise, to exercise the fmt-arity trim).
+_NEAREST = "snprintf@0x0f0"
+_STACK16 = [
+    {
+        "sink_idx": 0,
+        "sink": "system",
+        "sink_addr": "0x100",
+        "arg_idx": 0,
+        "provenance": {
+            "kind": "stack_buf",
+            "stack_key": "frame[84]+0x10",
+            "writer_count": 16,
+            "nearest_dominating_writer": _NEAREST,
+            "writers": (
+                [
+                    {
+                        "writer": f"snprintf@0x{i:03x}",
+                        "dominates_sink": False,
+                        "fmt": "noise",
+                        "varargs": [],
+                    }
+                    for i in range(1, 14)  # 13 mutually-exclusive branch writers (noise)
+                ]
+                + [
+                    {"writer": "snprintf@0x0a0", "dominates_sink": True, "fmt": "a", "varargs": []},
+                    {"writer": "snprintf@0x0c0", "dominates_sink": True, "fmt": "b", "varargs": []},
+                    {
+                        "writer": _NEAREST,
+                        "dominates_sink": True,
+                        "fmt": "echo %s to %s",
+                        "varargs": [
+                            {"pos": 3, "spec": "%s", "source": {"kind": "constant", "value": "x"}},
+                            {"pos": 4, "spec": "%s", "source": {"kind": "param", "name": "p"}},
+                            {"pos": 5, "source": {"kind": "indirect_unresolved"}},  # past arity
+                            {"pos": 6, "source": {"kind": "indirect_unresolved"}},  # past arity
+                        ],
+                    },
+                ]
+            ),
+            "attribution": "chk_dominance",
+        },
+    }
+]
+
+
+def test_summary_has_dominating_writer_count(tmp_path: Path) -> None:
+    # 16 raw writers but only 3 sound-dominating — the summary must show both so a high writer_count
+    # reads as "resolved to 3", not "ambiguous among 16".
+    summary = _sink_provenance_summary(json.dumps({"sink_arg_provenance": _STACK16}))
+    s = summary[0]
+    assert s["writer_count"] == 16
+    assert s["dominating_writer_count"] == 3
+
+
+def test_summary_inlines_only_nearest_dominating_fmt(tmp_path: Path) -> None:
+    summary = _sink_provenance_summary(json.dumps({"sink_arg_provenance": _STACK16}))
+    s = summary[0]
+    # the nearest dominating writer's fmt is inlined (judge controllability with zero extra fetch)
+    assert s["nearest_dominating_writer_fmt"] == "echo %s to %s"
+    # summary-first: no full writer list / other writers' fmts leak into the summary
+    assert "writers" not in s
+    assert "b" not in s.values()  # a different writer's fmt is not present
+
+
+def test_get_sink_provenance_dominating_first_and_only(tmp_path: Path) -> None:
+    atlas = _seed(tmp_path, provenance=_STACK16, ref="run_x#fn7@cmd")
+    conn = open_atlas(atlas)
+    try:
+        full = get_sink_provenance(conn, "run_x#fn7@cmd", 0)
+        only = get_sink_provenance(conn, "run_x#fn7@cmd", 0, dominating_only=True)
+    finally:
+        conn.close()
+    fw = full["record"]["provenance"]["writers"]
+    assert len(fw) == 16
+    # the 3 dominating writers lead the array (read the sound ones without scanning to the tail)
+    assert [w["dominates_sink"] for w in fw[:3]] == [True, True, True]
+    assert all(not w["dominates_sink"] for w in fw[3:])
+    ow = only["record"]["provenance"]["writers"]
+    assert len(ow) == 3 and all(w["dominates_sink"] for w in ow)
+
+
+def test_get_sink_provenance_trims_varargs_to_fmt_arity(tmp_path: Path) -> None:
+    atlas = _seed(tmp_path, provenance=_STACK16, ref="run_x#fn7@cmd")
+    conn = open_atlas(atlas)
+    try:
+        one = get_sink_provenance(conn, "run_x#fn7@cmd", 0, dominating_only=True)
+    finally:
+        conn.close()
+    nearest = next(w for w in one["record"]["provenance"]["writers"] if w["writer"] == _NEAREST)
+    # 'echo %s to %s' consumes 2 args; the 2 noise varargs past arity are dropped, marked honestly
+    assert len(nearest["varargs"]) == 2
+    assert nearest["varargs_trimmed_to_fmt_arity"] is True
+    assert [v["spec"] for v in nearest["varargs"]] == ["%s", "%s"]
+
+
+def test_fmt_arity_counts_conversions_and_star_args() -> None:
+    assert _fmt_arity("echo %s to %s") == 2
+    assert _fmt_arity("%d%% done %s") == 2  # %% is a literal, not an argument
+    assert _fmt_arity("%*d") == 2  # width from an argument + the value
+    assert _fmt_arity("plain text") == 0
+    assert _fmt_arity("%05.2f %-10s") == 2

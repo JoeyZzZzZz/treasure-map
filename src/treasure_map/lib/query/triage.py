@@ -243,19 +243,122 @@ def _sink_provenance_summary(flow_evidence: str | None) -> tuple[dict[str, Any],
         }
         if "writer_count" in prov:
             summary["writer_count"] = prov.get("writer_count")
+        writers = prov.get("writers")
+        if isinstance(writers, list):
+            # How many writers are on EVERY path to the sink (sound CHK-dominating). Distinguishes
+            # "already resolved to 1-3 dominating writers" from the raw writer_count, which also
+            # counts the mutually-exclusive branch writers (noise) — a high writer_count with a low
+            # dominating_writer_count is resolved, not ambiguous.
+            summary["dominating_writer_count"] = sum(
+                1 for w in writers if isinstance(w, dict) and w.get("dominates_sink")
+            )
         if prov.get("nearest_dominating_writer"):
-            summary["nearest_dominating_writer"] = prov.get("nearest_dominating_writer")
+            ndw = prov.get("nearest_dominating_writer")
+            summary["nearest_dominating_writer"] = ndw
+            # Inline ONLY the nearest dominating writer's format string: an all-constant fmt is
+            # often judgeable (not controllable) with zero extra fetch; one fmt stays compact.
+            if isinstance(writers, list):
+                for w in writers:
+                    if isinstance(w, dict) and w.get("writer") == ndw and w.get("fmt") is not None:
+                        summary["nearest_dominating_writer_fmt"] = w.get("fmt")
+                        break
         out.append(summary)
     return tuple(out)
 
 
+def _fmt_arity(fmt: str) -> int:
+    """Number of arguments a printf-style format string consumes: one per conversion specifier
+    (``%%`` excluded), plus one for each ``*`` width/precision taken from an argument. Mirrors the
+    ExportFunctions specifier scan so the read-side trim never drops a genuinely-consumed arg."""
+    n = 0
+    i = 0
+    length = len(fmt)
+    while i < length:
+        if fmt[i] != "%":
+            i += 1
+            continue
+        j = i + 1
+        if j < length and fmt[j] == "%":  # literal %%
+            i = j + 1
+            continue
+        stars = 0
+        while j < length and fmt[j] in "-+ 0#":  # flags
+            j += 1
+        while j < length and (fmt[j].isdigit() or fmt[j] == "*"):  # width
+            if fmt[j] == "*":
+                stars += 1
+            j += 1
+        if j < length and fmt[j] == ".":  # precision
+            j += 1
+            while j < length and (fmt[j].isdigit() or fmt[j] == "*"):
+                if fmt[j] == "*":
+                    stars += 1
+                j += 1
+        while j < length and fmt[j] in "hljztL":  # length modifiers
+            j += 1
+        if j >= length:
+            break
+        n += 1 + stars  # the conversion char + any *-supplied width/precision
+        i = j + 1
+    return n
+
+
+def _trim_writer_varargs(writer: dict[str, Any]) -> dict[str, Any]:
+    """Drop varargs the format string never consumes. A snprintf/echo call site may pass more stack
+    slots than its fmt uses (uninitialized-slot noise the decompiler surfaces); leaving them in
+    reads as 'unresolved inputs' and wrongly inflates controllability. Only trims when a fmt is
+    present and there are demonstrably more varargs than it consumes."""
+    fmt = writer.get("fmt")
+    varargs = writer.get("varargs")
+    if not isinstance(fmt, str) or not isinstance(varargs, list):
+        return writer
+    arity = _fmt_arity(fmt)
+    if len(varargs) <= arity:
+        return writer
+    out = dict(writer)
+    out["varargs"] = varargs[:arity]
+    # honest marker: args past the format's arity were dropped as fmt-unconsumed, NOT lost origin.
+    out["varargs_trimmed_to_fmt_arity"] = True
+    return out
+
+
+def _present_provenance(prov: dict[str, Any], *, dominating_only: bool) -> dict[str, Any]:
+    """Read-side presentation of a stack_buf provenance: dominating writers first (so the agent
+    reads the sound ones without scanning the branch-noise tail), fmt-arity vararg trim applied, and
+    optionally only the dominating writers. Non-stack_buf provenance is returned unchanged."""
+    writers = prov.get("writers")
+    if not isinstance(writers, list):
+        return prov
+    trimmed = [_trim_writer_varargs(w) if isinstance(w, dict) else w for w in writers]
+    dom = [w for w in trimmed if isinstance(w, dict) and w.get("dominates_sink")]
+    non = [w for w in trimmed if not (isinstance(w, dict) and w.get("dominates_sink"))]
+    out = dict(prov)
+    out["writers"] = dom if dominating_only else dom + non
+    return out
+
+
+def _present_record(rec: dict[str, Any], *, dominating_only: bool) -> dict[str, Any]:
+    prov = rec.get("provenance")
+    if not isinstance(prov, dict):
+        return rec
+    out = dict(rec)
+    out["provenance"] = _present_provenance(prov, dominating_only=dominating_only)
+    return out
+
+
 def get_sink_provenance(
-    conn: sqlite3.Connection, evidence_ref: str, sink_idx: int | None = None
+    conn: sqlite3.Connection,
+    evidence_ref: str,
+    sink_idx: int | None = None,
+    *,
+    dominating_only: bool = False,
 ) -> dict[str, Any]:
     """Full sink_arg_provenance detail for a candidate (the on-demand companion to the explain
     summary). Returns every sink's record when ``sink_idx`` is None, otherwise the one record with
-    that idx. Read-only; a surfaced def-use fact, never a verdict. Unknown ref / idx is reported
-    honestly, never as an empty-but-successful result."""
+    that idx. Writers are presented dominating-first with fmt-arity vararg trimming; pass
+    ``dominating_only`` to return only the sound dominating writers. Read-only; a surfaced def-use
+    fact, never a verdict. Unknown ref / idx is reported honestly, never as an empty-but-successful
+    result."""
     row = conn.execute(
         "SELECT flow_evidence FROM instance WHERE evidence_ref = ? ORDER BY instance_id LIMIT 1",
         (evidence_ref,),
@@ -266,14 +369,18 @@ def get_sink_provenance(
     if not records:
         return {"evidence_ref": evidence_ref, "found": False, "note": "no_sink_provenance"}
     if sink_idx is None:
-        return {"evidence_ref": evidence_ref, "found": True, "records": records}
+        return {
+            "evidence_ref": evidence_ref,
+            "found": True,
+            "records": [_present_record(r, dominating_only=dominating_only) for r in records],
+        }
     for rec in records:
         if rec.get("sink_idx") == sink_idx:
             return {
                 "evidence_ref": evidence_ref,
                 "found": True,
                 "sink_idx": sink_idx,
-                "record": rec,
+                "record": _present_record(rec, dominating_only=dominating_only),
             }
     return {
         "evidence_ref": evidence_ref,

@@ -306,20 +306,26 @@ def make_tools(
         data["note"] = _DERIVED_SIGNAL_NOTE
         return data
 
-    def get_sink_provenance(evidence_ref: str, sink_idx: int | None = None) -> dict[str, Any]:
+    def get_sink_provenance(
+        evidence_ref: str, sink_idx: int | None = None, dominating_only: bool = False
+    ) -> dict[str, Any]:
         """Full sink-argument def-use provenance for a candidate — the on-demand detail behind the
         explain_candidate summary (which stays compact to fit the token budget).
 
         Omit ``sink_idx`` to get every sink's record for the function; pass one (the sink_idx from
         the explain summary) for a single sink's full detail: the writer set with sound CHK
         dominance ordering (``dominates_sink`` + ``nearest_dominating_writer``), each writer's
-        format string and vararg sources, getter ``const_args``, or an honest ``unresolved``. A
-        surfaced Ghidra def-use FACT of where a sink argument's value comes from — never a verdict,
-        and an unreachable origin is stated (``resolved: false``/``indirect_unresolved``), never
-        dropped."""
+        format string and vararg sources, getter ``const_args``, or an honest ``unresolved``.
+        Writers come dominating-first (the sound ones lead; the branch-noise tail follows) with each
+        writer's varargs trimmed to what its format string actually consumes; pass
+        ``dominating_only`` to return only the dominating writers. A surfaced Ghidra def-use FACT of
+        where a sink argument's value comes from — never a verdict, and an unreachable origin is
+        stated (``resolved: false``/``indirect_unresolved``), never dropped."""
         conn = open_atlas(atlas_path)
         try:
-            result: dict[str, Any] = _get_sink_provenance(conn, evidence_ref, sink_idx)
+            result: dict[str, Any] = _get_sink_provenance(
+                conn, evidence_ref, sink_idx, dominating_only=dominating_only
+            )
         finally:
             conn.close()
         result["note"] = _DERIVED_SIGNAL_NOTE
