@@ -26,6 +26,7 @@ import logging
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import InstanceRow
@@ -181,6 +182,35 @@ def _parse_callees(raw: str | None) -> list[str]:
     return [str(x) for x in data] if isinstance(data, list) else []
 
 
+def _load_sink_provenance(db_path: Path | str) -> dict[int, list[dict[str, Any]]]:
+    """Map func_id -> parsed sink_arg_provenance list (Ghidra def-use fact) from analysis.db.
+
+    Transport read: ExportFunctions computed the provenance and ghidra_ingest stored it
+    it on functions.sink_provenance; here it is loaded so the hunt merges it into the atlas
+    instance's flow_evidence (the persistent home). A missing column (older analysis.db) or an
+    unparsable cell yields no entry — provenance is additive; its absence never blocks a candidate.
+    """
+    uri = f"file:{Path(db_path)}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    out: dict[int, list[dict[str, Any]]] = {}
+    try:
+        rows = conn.execute("SELECT id, sink_provenance FROM functions").fetchall()
+    except sqlite3.OperationalError:
+        return out  # no column (pre-provenance analysis.db) -> no data
+    finally:
+        conn.close()
+    for func_id, raw in rows:
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(data, list) and data:
+            out[func_id] = data
+    return out
+
+
 def run_analyzer2(
     db_path: Path | str,
     atlas_path: Path | str,
@@ -205,6 +235,9 @@ def run_analyzer2(
     wrapper_candidates = find_wrapper_propagated_candidates(
         all_funcs, _load_known_components(db_path)
     )
+    # Ghidra def-use provenance per function (merged into cmd/fmt flow_evidence below). Function-
+    # level fact; keyed by func_id. Empty when the analysis.db predates the provenance column.
+    sink_prov_by_func = _load_sink_provenance(db_path)
 
     by_status = {"confirmed": 0, "blocked": 0, "unknown": 0}
     instances_written = 0
@@ -302,6 +335,10 @@ def run_analyzer2(
                     # parameter-specific downweight already prevents this; this is defense-in-depth.
                     if _form_note_contradicts_source(blocking, ev.get("source_kind")):
                         blocking = None
+                    # Merge the Ghidra def-use provenance: the function's per-sink
+                    # value-origin facts ride alongside the text-level source_kind/flow_path. A
+                    # value-origin facts. A surfaced fact only, never read into recall/score/grade.
+                    ev["sink_arg_provenance"] = sink_prov_by_func.get(match.func_ref.func_id, [])
                     flow_evidence = json.dumps(ev, sort_keys=True)
                 elif match.sink_class == "copy" and sink_name is not None:
                     # Copy candidates carry SIZE evidence (the danger axis): the length source
@@ -320,15 +357,18 @@ def run_analyzer2(
                     # Format-string candidates carry flow evidence on the FORMAT argument plus the
                     # format-position facts (which arg is the format; literal-only or not).
                     sites = entry_index.sites_for(row.binary_name, row.binary_path)
-                    flow_evidence = json.dumps(
-                        build_fmtstr_evidence(
-                            pseudocode=row.pseudocode,
-                            callees=callees,
-                            sink_name=sink_name,
-                            entry_sites=sites,
-                        ),
-                        sort_keys=True,
+                    fmt_ev = build_fmtstr_evidence(
+                        pseudocode=row.pseudocode,
+                        callees=callees,
+                        sink_name=sink_name,
+                        entry_sites=sites,
                     )
+                    # Same def-use provenance merge as the cmd axis (format-string sinks are in the
+                    # provenance lexicon too; key arg = the format position).
+                    fmt_ev["sink_arg_provenance"] = sink_prov_by_func.get(
+                        match.func_ref.func_id, []
+                    )
+                    flow_evidence = json.dumps(fmt_ev, sort_keys=True)
 
                 provenance = "L1" if status in {"confirmed", "blocked"} else "L0"
                 pattern_id = upsert_pattern(
@@ -419,6 +459,10 @@ def run_analyzer2(
                 # constrained argument forwarded to a shell wrapper stays a downweighted lead.
                 if wc.sink_class == "fmt_string" and source_class == "unknown":
                     continue
+                # Def-use provenance for the wrapper function's own sinks. The real
+                # sink is one hop away, but the forwarding function's provenance still tells the
+                # agent where the forwarded value comes from. A surfaced fact, never scored.
+                evidence["sink_arg_provenance"] = sink_prov_by_func.get(f.func_id, [])
                 pattern_id = upsert_pattern(
                     atlas,
                     source_class=source_class,

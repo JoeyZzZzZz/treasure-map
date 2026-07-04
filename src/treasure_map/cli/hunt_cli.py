@@ -365,6 +365,7 @@ def _render_explain(ex: CandidateExplanation, *, as_json: bool) -> None:
                         "origin": c.origin,
                         "binary_path": c.binary_path,
                     },
+                    "sink_arg_provenance_summary": list(ex.sink_arg_provenance_summary),
                     "claims_does": list(ex.claims_does),
                     "claims_does_not": list(ex.claims_does_not),
                     "verify": list(ex.verify_steps),
@@ -396,6 +397,20 @@ def _render_explain(ex: CandidateExplanation, *, as_json: bool) -> None:
     click.echo("\nin-function dataflow & filter:")
     click.echo(f"  {_reachability_inline(c.reachability_status)}")
     click.echo(f"  filter: {c.blocking_mechanism or 'none identified'}")
+
+    if ex.sink_arg_provenance_summary:
+        click.echo("\nsink-arg provenance (def-use; get_sink_provenance for full detail):")
+        for sp in ex.sink_arg_provenance_summary:
+            extra = ""
+            if sp.get("nearest_dominating_writer"):
+                extra = f"   nearest_dominating_writer={sp['nearest_dominating_writer']}"
+            elif sp.get("writer_count") is not None:
+                extra = f"   writers={sp['writer_count']}"
+            mark = "" if sp.get("resolved") else "   [unresolved — a boundary, not 'safe']"
+            click.echo(
+                f"  [{sp.get('sink_idx')}] {sp.get('sink') or '?'}@{sp.get('sink_addr') or '?'} "
+                f"kind={sp.get('kind')}{extra}{mark}"
+            )
 
     click.echo("\nwhat this score does / does NOT claim:")
     for line in ex.claims_does:

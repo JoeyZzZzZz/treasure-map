@@ -43,6 +43,11 @@ CREATE TABLE IF NOT EXISTS functions (
     pseudocode_hash TEXT,               -- MD5，用于去重
     callees         TEXT    DEFAULT '[]',   -- JSON: 直接被调函数名
     is_exported     INTEGER DEFAULT 0,      -- 1 = 导出符号
+    -- sink_arg_provenance: Ghidra def-use fact per command/format sink in this function (JSON array,
+    -- one record per sink; see ExportFunctions.buildSinkProvenance / the provenance design). TRANSPORT column:
+    -- analysis.db is wipe-and-rebuild, so this rides with the function here and is merged into the
+    -- atlas instance's flow_evidence at hunt time (the persistent home). Empty '[]' when none.
+    sink_provenance TEXT    DEFAULT '[]',
     FOREIGN KEY(binary_id) REFERENCES binaries(id) ON DELETE CASCADE
 );
 

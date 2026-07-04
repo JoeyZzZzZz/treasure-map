@@ -141,14 +141,18 @@ def _ingest_one_binary(
                 ph,
                 json.dumps(func.get("callees", []), ensure_ascii=False),
                 int(func.get("is_exported", 0)),
+                # sink_arg_provenance transport: the Ghidra-computed def-use fact for this
+                # function's command/format sinks, carried verbatim to be merged into the atlas
+                # instance's flow_evidence at hunt time. Missing/old exports -> '[]' (never null).
+                json.dumps(func.get("sink_provenance", []), ensure_ascii=False),
             )
         )
     if func_rows:
         conn.executemany(
             """INSERT INTO functions
                (binary_id, name, address, size_bytes, pseudocode,
-                pseudocode_hash, callees, is_exported)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                pseudocode_hash, callees, is_exported, sink_provenance)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             func_rows,
         )
         stats.functions_ingested += len(func_rows)

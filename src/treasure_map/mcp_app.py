@@ -41,6 +41,7 @@ from treasure_map.lib.query import density as _density
 from treasure_map.lib.query import dormant as _dormant
 from treasure_map.lib.query import explain_candidate as _explain_candidate
 from treasure_map.lib.query import filter_candidates as _filter_candidates
+from treasure_map.lib.query import get_sink_provenance as _get_sink_provenance
 from treasure_map.lib.query import ledger as _ledger
 from treasure_map.lib.query import triage as _triage
 from treasure_map.lib.query import twins as _twins
@@ -65,7 +66,12 @@ _AGENT_INSTRUCTIONS = (
     "review-ordering score for the firmware this server is bound to (the current run); it is NOT "
     "a verdict — recall is deliberately wide, so expect false positives and DEMOTE a candidate "
     "yourself once the pseudocode shows it benign. (2) For a lead, follow its evidence_ref (the "
-    "cross-tool anchor) and read facts: get_pseudocode (func = a name OR an address in any form; "
+    "cross-tool anchor). explain_candidate carries a sink_arg_provenance_summary (per sink: where "
+    "the sink argument's value comes from, by Ghidra def-use — kind, whether it resolved, and the "
+    "sound nearest_dominating_writer for a reused stack buffer); get_sink_provenance(evidence_ref, "
+    "sink_idx) then pulls that sink's full writers + format string + vararg sources, so you read "
+    "the value origin from a table instead of rebuilding it by hand. Read facts: get_pseudocode "
+    "(func = a name OR an address in any form; "
     "binary = short name OR full path), get_callees / get_xrefs to walk the call chain (an empty "
     "caller set may mean an indirect/dispatch-table call, not 'unreachable'), get_strings, "
     "get_functions_referencing_string (which functions mention a string, by pseudocode text "
@@ -300,6 +306,25 @@ def make_tools(
         data["note"] = _DERIVED_SIGNAL_NOTE
         return data
 
+    def get_sink_provenance(evidence_ref: str, sink_idx: int | None = None) -> dict[str, Any]:
+        """Full sink-argument def-use provenance for a candidate — the on-demand detail behind the
+        explain_candidate summary (which stays compact to fit the token budget).
+
+        Omit ``sink_idx`` to get every sink's record for the function; pass one (the sink_idx from
+        the explain summary) for a single sink's full detail: the writer set with sound CHK
+        dominance ordering (``dominates_sink`` + ``nearest_dominating_writer``), each writer's
+        format string and vararg sources, getter ``const_args``, or an honest ``unresolved``. A
+        surfaced Ghidra def-use FACT of where a sink argument's value comes from — never a verdict,
+        and an unreachable origin is stated (``resolved: false``/``indirect_unresolved``), never
+        dropped."""
+        conn = open_atlas(atlas_path)
+        try:
+            result: dict[str, Any] = _get_sink_provenance(conn, evidence_ref, sink_idx)
+        finally:
+            conn.close()
+        result["note"] = _DERIVED_SIGNAL_NOTE
+        return result
+
     def get_pseudocode(function: str, binary: str | None = None) -> dict[str, Any]:
         """Decompiler pseudocode for one function (name or address); the default read view."""
         return _with_analysis(lambda c: facts.get_pseudocode(c, func=function, binary=binary))
@@ -364,6 +389,7 @@ def make_tools(
     return {
         "list_candidates": list_candidates,
         "explain_candidate": explain_candidate,
+        "get_sink_provenance": get_sink_provenance,
         "cross_firmware_patterns": cross_firmware_patterns,
         "pattern_density": pattern_density,
         "pattern_twins": pattern_twins,

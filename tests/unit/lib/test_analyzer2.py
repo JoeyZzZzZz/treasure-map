@@ -832,7 +832,11 @@ def test_cmd_candidate_carries_flow_evidence(tmp_path: Path) -> None:
         "sanitizer_seen",
         "entry_reach",
         "trace_boundary",
+        # Ghidra def-use provenance merged in (design §一). Empty [] here: the synthetic function
+        # has no exported sink_provenance, so it is present-but-empty, never absent.
+        "sink_arg_provenance",
     }
+    assert ev["sink_arg_provenance"] == []
     # The converter is laundered through an intermediate buffer -> charset_maybe (a lead for the
     # agent), with an honest trace boundary -- and NOT downweighted (charset is inline-only).
     assert ev["source_kind"] == "charset_maybe"

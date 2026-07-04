@@ -18,6 +18,10 @@ import ghidra.program.model.listing.*;
 import ghidra.program.model.symbol.*;
 import ghidra.app.decompiler.*;
 import ghidra.program.model.address.*;
+import ghidra.program.model.mem.*;
+import ghidra.program.model.pcode.*;
+import ghidra.graph.*;
+import ghidra.graph.algo.ChkDominanceAlgorithm;
 import java.io.*;
 import java.nio.file.*;
 import java.util.*;
@@ -36,6 +40,45 @@ public class ExportFunctions extends GhidraScript {
     private static final Set<String> C_KEYWORDS = new HashSet<>(Arrays.asList(
         "if", "for", "while", "switch", "return", "sizeof", "do", "else", "goto",
         "case", "default", "break", "continue", "typedef", "struct", "union", "enum"));
+
+    // ---- sink_arg_provenance sink lexicon (mirrors lib/pattern/classes.py CMD + FMT_STRING) ----
+    // The "key argument" whose value origin we trace back: command sinks forward arg0 (the command
+    // / path); format-string sinks carry the format string at a per-sink position (FMT_STRING_ARG).
+    // Buffer formatters (snprintf/sprintf) are WRITERS, not provenance sinks. Value = 0-based key
+    // arg index. Extra sinks (firmware-specific wrappers) can be appended via TMAP_EXTRA_SINKS.
+    private static final Map<String, Integer> SINK_KEYARG = new HashMap<>();
+    static {
+        for (String s : new String[]{
+                "system", "popen", "execl", "execlp", "execle", "execv", "execvp", "execve", "doSystem"})
+            SINK_KEYARG.put(s, 0);
+        SINK_KEYARG.put("printf", 0);  SINK_KEYARG.put("vprintf", 0);
+        SINK_KEYARG.put("warn", 0);    SINK_KEYARG.put("warnx", 0);
+        SINK_KEYARG.put("vwarn", 0);   SINK_KEYARG.put("vwarnx", 0);
+        SINK_KEYARG.put("fprintf", 1); SINK_KEYARG.put("vfprintf", 1);
+        SINK_KEYARG.put("dprintf", 1); SINK_KEYARG.put("vdprintf", 1);
+        SINK_KEYARG.put("syslog", 1);  SINK_KEYARG.put("vsyslog", 1);
+        SINK_KEYARG.put("err", 1);     SINK_KEYARG.put("errx", 1);
+        SINK_KEYARG.put("verr", 1);    SINK_KEYARG.put("verrx", 1);
+        SINK_KEYARG.put("asprintf", 1); SINK_KEYARG.put("vasprintf", 1);
+    }
+    // Functions that fill a destination buffer — candidate writers of a stack_buf sink argument.
+    private static final Set<String> WRITERS = new HashSet<>(Arrays.asList(
+        "snprintf", "sprintf", "vsnprintf", "vsprintf", "strcpy", "strncpy", "strcat", "strncat",
+        "memcpy", "memmove", "stpcpy", "__sprintf_chk", "__snprintf_chk"));
+    // Format-string argument index for the printf-family writers (0-based over the callee's args):
+    // sprintf(dst, fmt, ...) → 1; snprintf(dst, n, fmt, ...) → 2; __sprintf_chk(dst, flag, n, fmt) → 3.
+    private static final Map<String, Integer> WRITER_FMTARG = new HashMap<>();
+    static {
+        WRITER_FMTARG.put("sprintf", 1);   WRITER_FMTARG.put("vsprintf", 1);
+        WRITER_FMTARG.put("snprintf", 2);  WRITER_FMTARG.put("vsnprintf", 2);
+        WRITER_FMTARG.put("__sprintf_chk", 3); WRITER_FMTARG.put("__snprintf_chk", 4);
+    }
+    private static final Set<String> TOKENIZERS = new HashSet<>(Arrays.asList(
+        "strtok", "strtok_r", "strsep", "sscanf"));
+    private static final int PROV_MAX_DEPTH = 2;   // vararg / nested-source recursion cap (the provenance design)
+
+    // Per-run sink map = static lexicon + optional TMAP_EXTRA_SINKS (comma-separated, key arg 0).
+    private Map<String, Integer> sinkKeyArg = SINK_KEYARG;
 
     // Escape a string for JSON: handles control chars, quotes, backslashes
     private static String esc(String s) {
@@ -98,6 +141,528 @@ public class ExportFunctions extends GhidraScript {
         return null;
     }
 
+    // ============================ sink_arg_provenance (the provenance design) ============================
+    // Backward def-use over the HighFunction Varnode graph + Ghidra CHK dominance over its block
+    // graph. Pure fact extraction: where does each command/format sink's key argument come from.
+    // Never a verdict; unresolved is reported honestly (a surfaced fact, never scored), never silently dropped.
+
+    // Lazy CHK dominance over the decompiler block graph. Built once per function, only if a
+    // stack_buf sink actually needs it. Ghidra owns the dominator algorithm; we only wrap the
+    // pcode block CFG (getOut edges) into a GDirectedGraph — no alias analysis.
+    private final class DomCtx {
+        private final HighFunction hf;
+        private ChkDominanceAlgorithm<PcodeBlockBasic, GEdge<PcodeBlockBasic>> algo;
+        private final Map<Integer, Set<Integer>> cache = new HashMap<>();
+        private boolean built = false, failed = false;
+
+        DomCtx(HighFunction hf) { this.hf = hf; }
+
+        private void build() {
+            if (built || failed) return;
+            try {
+                GDirectedGraph<PcodeBlockBasic, GEdge<PcodeBlockBasic>> g =
+                        GraphFactory.createDirectedGraph();
+                ArrayList<PcodeBlockBasic> blocks = hf.getBasicBlocks();
+                for (PcodeBlockBasic b : blocks) g.addVertex(b);
+                for (PcodeBlockBasic b : blocks) {
+                    for (int i = 0; i < b.getOutSize(); i++) {
+                        PcodeBlock o = b.getOut(i);
+                        if (o instanceof PcodeBlockBasic) {
+                            g.addEdge(new DefaultGEdge<>(b, (PcodeBlockBasic) o));
+                        }
+                    }
+                }
+                algo = new ChkDominanceAlgorithm<>(g, monitor);
+                built = true;
+            } catch (Exception e) {
+                failed = true;
+            }
+        }
+
+        Set<Integer> dominatorsOf(PcodeBlockBasic sb) {
+            build();
+            if (!built) return Collections.emptySet();
+            Integer idx = sb.getIndex();
+            Set<Integer> c = cache.get(idx);
+            if (c != null) return c;
+            Set<Integer> res = new HashSet<>();
+            try {
+                for (PcodeBlockBasic b : algo.getDominators(sb)) res.add(b.getIndex());
+            } catch (Exception e) { /* leave empty on failure */ }
+            cache.put(idx, res);
+            return res;
+        }
+    }
+
+    // Build the per-function sink_provenance JSON array (one record per command/format sink call,
+    // ordered by call-site address = sink_idx).
+    private String buildSinkProvenance(HighFunction hf) {
+        List<PcodeOpAST> ops = new ArrayList<>();
+        Iterator<PcodeOpAST> it = hf.getPcodeOps();
+        while (it.hasNext()) ops.add(it.next());
+
+        List<PcodeOpAST> sinks = new ArrayList<>();
+        for (PcodeOpAST op : ops) {
+            int oc = op.getOpcode();
+            if (oc != PcodeOp.CALL && oc != PcodeOp.CALLIND) continue;
+            String cn = calleeNameOf(op);
+            if (cn != null && sinkKeyArg.containsKey(cn)) sinks.add(op);
+        }
+        if (sinks.isEmpty()) return "[]";
+        sinks.sort(new Comparator<PcodeOpAST>() {
+            public int compare(PcodeOpAST a, PcodeOpAST b) {
+                return Long.compare(a.getSeqnum().getTarget().getOffset(),
+                                    b.getSeqnum().getTarget().getOffset());
+            }
+        });
+
+        DomCtx dom = new DomCtx(hf);
+        StringBuilder arr = new StringBuilder("[");
+        int sinkIdx = 0;
+        boolean first = true;
+        for (PcodeOpAST sink : sinks) {
+            String cn = calleeNameOf(sink);
+            int keyArg = sinkKeyArg.get(cn);
+            Varnode arg = (keyArg + 1 < sink.getNumInputs()) ? sink.getInput(keyArg + 1) : null;
+            String prov = (arg == null)
+                    ? "{\"kind\":\"unresolved\",\"note\":\"arg_absent\"}"
+                    : classify(arg, sink, ops, dom, 0);
+            if (!first) arr.append(",");
+            first = false;
+            arr.append("{\"sink_idx\":").append(sinkIdx)
+               .append(",\"sink\":\"").append(esc(cn)).append("\"")
+               .append(",\"sink_addr\":\"").append(esc(addr0x(sink))).append("\"")
+               .append(",\"arg_idx\":").append(keyArg)
+               .append(",\"provenance\":").append(prov)
+               .append("}");
+            sinkIdx++;
+        }
+        arr.append("]");
+        return arr.toString();
+    }
+
+    // Full backward classification of a value varnode → provenance kind object (the provenance design).
+    private String classify(Varnode v, PcodeOpAST sink, List<PcodeOpAST> ops, DomCtx dom, int depth) {
+        if (v == null) return "{\"kind\":\"unresolved\",\"note\":\"null_varnode\"}";
+        if (depth > PROV_MAX_DEPTH) return "{\"kind\":\"unresolved\",\"truncated\":true}";
+        if (v.isConstant()) {
+            String t = constText(v);
+            if (t != null) return "{\"kind\":\"constant\",\"value\":\"" + esc(t) + "\"}";
+            return "{\"kind\":\"constant\",\"value\":\"0x" + Long.toHexString(v.getOffset()) + "\"}";
+        }
+        PcodeOp def = v.getDef();
+        if (def == null) {
+            HighVariable hv = v.getHigh();
+            HighSymbol hs = hv != null ? hv.getSymbol() : null;
+            if (hs != null && hs.isParameter())
+                return "{\"kind\":\"param\",\"name\":\"" + esc(hs.getName()) + "\"}";
+            String g = globalText(v);
+            if (g != null) return g;
+            return "{\"kind\":\"unresolved\",\"note\":\"input_no_def\"}";
+        }
+        switch (def.getOpcode()) {
+            case PcodeOp.CAST:
+            case PcodeOp.COPY:
+                return classify(def.getInput(0), sink, ops, dom, depth);
+            case PcodeOp.CALL:
+            case PcodeOp.CALLIND: {
+                String cn = calleeNameOf(def);
+                if (cn != null && TOKENIZERS.contains(cn)) return tokenizerOut(def, cn, depth);
+                return callReturn(def, cn);
+            }
+            case PcodeOp.MULTIEQUAL: {
+                StringBuilder sb = new StringBuilder("{\"kind\":\"multiple\",\"sources\":[");
+                int n = 0;
+                for (int i = 0; i < def.getNumInputs() && n < 6; i++) {
+                    if (n > 0) sb.append(",");
+                    sb.append(classify(def.getInput(i), sink, ops, dom, depth + 1));
+                    n++;
+                }
+                sb.append("]}");
+                return sb.toString();
+            }
+            case PcodeOp.INDIRECT:
+                return indirectUnresolved(v, ops);
+            case PcodeOp.PTRSUB:
+            case PcodeOp.PTRADD:
+            case PcodeOp.INT_ADD: {
+                String key = stackKey(v);
+                if (key != null) return stackBuf(key, sink, ops, dom, depth);
+                String g = globalText(v);
+                if (g != null) return g;
+                return classify(def.getInput(0), sink, ops, dom, depth);
+            }
+            case PcodeOp.LOAD: {
+                String key = stackKey(def.getInput(1));
+                if (key != null) return stackBuf(key, sink, ops, dom, depth);
+                return "{\"kind\":\"unresolved\",\"note\":\"mem_load\"}";
+            }
+            default: {
+                String key = stackKey(v);
+                if (key != null) return stackBuf(key, sink, ops, dom, depth);
+                return "{\"kind\":\"unresolved\",\"note\":\"" + esc(def.getMnemonic()) + "\"}";
+            }
+        }
+    }
+
+    // call_return with the callsite's constant arguments (the getter key — the provenance design, gap ③).
+    private String callReturn(PcodeOp callDef, String cn) {
+        StringBuilder sb = new StringBuilder("{\"kind\":\"call_return\",\"callee\":\"");
+        sb.append(esc(cn == null ? "?" : cn)).append("\",\"const_args\":[");
+        int n = 0;
+        for (int i = 1; i < callDef.getNumInputs(); i++) {
+            // A constant arg often reaches the callsite through a unique/COPY/CAST (Ghidra models
+            // `getter("some_key")` as a unique that COPYs the string address), so resolve the chain.
+            String val = resolveConst(callDef.getInput(i), 0);
+            if (val == null) continue;   // non-constant arg (e.g. another call's return) — skip
+            if (n > 0) sb.append(",");
+            sb.append("\"").append(esc(val)).append("\"");
+            n++;
+        }
+        sb.append("]}");
+        return sb.toString();
+    }
+
+    // Follow COPY/CAST/zext/sext back to a constant; return its string (if it addresses one) or hex.
+    private String resolveConst(Varnode v, int depth) {
+        if (v == null || depth > 6) return null;
+        if (v.isConstant()) {
+            String t = constText(v);
+            return (t != null) ? t : ("0x" + Long.toHexString(v.getOffset()));
+        }
+        PcodeOp def = v.getDef();
+        if (def == null) return null;
+        switch (def.getOpcode()) {
+            case PcodeOp.COPY:
+            case PcodeOp.CAST:
+            case PcodeOp.INT_ZEXT:
+            case PcodeOp.INT_SEXT:
+            case PcodeOp.SUBPIECE:
+                return resolveConst(def.getInput(0), depth + 1);
+            default:
+                return null;
+        }
+    }
+
+    // stack_buf: writer set (stackKey equal-match) + sound CHK-dominance ordering (the provenance design, gap ①).
+    private String stackBuf(String key, PcodeOpAST sink, List<PcodeOpAST> ops, DomCtx dom, int depth) {
+        List<PcodeOpAST> writers = new ArrayList<>();
+        for (PcodeOpAST op : ops) {
+            int oc = op.getOpcode();
+            if (oc != PcodeOp.CALL && oc != PcodeOp.CALLIND) continue;
+            String cn = calleeNameOf(op);
+            if (cn == null || !WRITERS.contains(cn)) continue;
+            for (int j = 1; j < op.getNumInputs(); j++) {
+                if (key.equals(stackKey(op.getInput(j)))) { writers.add(op); break; }
+            }
+        }
+        Set<Integer> domBlocks = dom.dominatorsOf(sink.getParent());
+        int sinkBlk = sink.getParent().getIndex();
+        long sinkAddr = sink.getSeqnum().getTarget().getOffset();
+
+        PcodeOpAST nearest = null;
+        long best = Long.MIN_VALUE;
+        StringBuilder wsb = new StringBuilder("[");
+        boolean firstW = true;
+        for (PcodeOpAST w : writers) {
+            int wblk = w.getParent().getIndex();
+            long wa = w.getSeqnum().getTarget().getOffset();
+            boolean dominates = domBlocks.contains(wblk);
+            // Same block as the sink: a writer only precedes the sink if it is earlier by address.
+            if (dominates && wblk == sinkBlk && wa >= sinkAddr) dominates = false;
+            if (dominates && wa > best) { best = wa; nearest = w; }
+            String cn = calleeNameOf(w);
+            if (!firstW) wsb.append(",");
+            firstW = false;
+            wsb.append("{\"writer\":\"").append(esc(cn + "@" + addr0x(w))).append("\"")
+               .append(",\"dominates_sink\":").append(dominates)
+               .append(fmtAndVarargs(w, cn, depth))
+               .append("}");
+        }
+        wsb.append("]");
+
+        StringBuilder sb = new StringBuilder("{\"kind\":\"stack_buf\",\"stack_key\":\"");
+        sb.append(esc(key)).append("\",\"writer_count\":").append(writers.size());
+        if (nearest != null) {
+            sb.append(",\"nearest_dominating_writer\":\"")
+              .append(esc(calleeNameOf(nearest) + "@" + addr0x(nearest))).append("\"");
+        } else {
+            sb.append(",\"nearest_dominating_writer\":null");
+        }
+        sb.append(",\"writers\":").append(wsb).append(",\"attribution\":\"chk_dominance\"}");
+        return sb.toString();
+    }
+
+    // A writer's format string + its varargs' shallow source classification. The fmt reaches the
+    // callsite through a unique/COPY like any other constant, so resolve it (not raw constText); the
+    // fmt is the agent's key signal ("read the dominating writer's fmt").
+    private String fmtAndVarargs(PcodeOpAST writer, String cn, int depth) {
+        StringBuilder sb = new StringBuilder();
+        Integer fi = WRITER_FMTARG.get(cn);
+        if (fi != null && fi + 1 < writer.getNumInputs()) {
+            String fmt = constStrOf(writer.getInput(fi + 1), 0);
+            List<String> specs = (fmt != null) ? formatSpecs(fmt) : Collections.<String>emptyList();
+            if (fmt != null) sb.append(",\"fmt\":\"").append(esc(fmt)).append("\"");
+            sb.append(",\"varargs\":[");
+            boolean f = true;
+            int vi = 0;
+            for (int i = fi + 2; i < writer.getNumInputs(); i++) {
+                if (!f) sb.append(",");
+                f = false;
+                sb.append("{\"pos\":").append(i - 1);
+                if (vi < specs.size()) sb.append(",\"spec\":\"").append(esc(specs.get(vi))).append("\"");
+                sb.append(",\"source\":").append(shallowSource(writer.getInput(i), depth + 1)).append("}");
+                vi++;
+            }
+            sb.append("]");
+        } else if (writer.getNumInputs() > 2) {
+            // copy family (strcpy/memcpy/…): the "source" is the src argument (arg1).
+            sb.append(",\"src_source\":").append(shallowSource(writer.getInput(2), depth + 1));
+        }
+        return sb.toString();
+    }
+
+    // Follow COPY/CAST/zext/sext back to a constant that addresses a string; return the string only.
+    private String constStrOf(Varnode v, int depth) {
+        if (v == null || depth > 6) return null;
+        if (v.isConstant()) return constText(v);
+        PcodeOp def = v.getDef();
+        if (def == null) return null;
+        switch (def.getOpcode()) {
+            case PcodeOp.COPY:
+            case PcodeOp.CAST:
+            case PcodeOp.INT_ZEXT:
+            case PcodeOp.INT_SEXT:
+            case PcodeOp.SUBPIECE:
+                return constStrOf(def.getInput(0), depth + 1);
+            default:
+                return null;
+        }
+    }
+
+    // Ordered printf conversion specifiers in a format string (skips %%). Maps position -> vararg.
+    private List<String> formatSpecs(String fmt) {
+        List<String> out = new ArrayList<>();
+        for (int i = 0; i < fmt.length(); i++) {
+            if (fmt.charAt(i) != '%') continue;
+            int j = i + 1;
+            if (j < fmt.length() && fmt.charAt(j) == '%') { i = j; continue; }   // literal %%
+            while (j < fmt.length() && "-+ 0#".indexOf(fmt.charAt(j)) >= 0) j++;  // flags
+            while (j < fmt.length() && (Character.isDigit(fmt.charAt(j)) || fmt.charAt(j) == '*')) j++;
+            if (j < fmt.length() && fmt.charAt(j) == '.') {
+                j++;
+                while (j < fmt.length() && (Character.isDigit(fmt.charAt(j)) || fmt.charAt(j) == '*')) j++;
+            }
+            while (j < fmt.length() && "hljztL".indexOf(fmt.charAt(j)) >= 0) j++;  // length mods
+            if (j < fmt.length()) {
+                out.add("%" + fmt.charAt(j));
+                i = j;
+            }
+        }
+        return out;
+    }
+
+    // Shallow (non-recursive-into-writers) classification for a nested source — bounded output.
+    private String shallowSource(Varnode v, int depth) {
+        if (v == null) return "{\"kind\":\"unresolved\",\"note\":\"null\"}";
+        if (depth > PROV_MAX_DEPTH) return "{\"kind\":\"unresolved\",\"truncated\":true}";
+        if (v.isConstant()) {
+            String t = constText(v);
+            if (t != null) return "{\"kind\":\"constant\",\"value\":\"" + esc(t) + "\"}";
+            return "{\"kind\":\"constant\",\"value\":\"0x" + Long.toHexString(v.getOffset()) + "\"}";
+        }
+        PcodeOp def = v.getDef();
+        if (def == null) {
+            HighVariable hv = v.getHigh();
+            HighSymbol hs = hv != null ? hv.getSymbol() : null;
+            if (hs != null && hs.isParameter())
+                return "{\"kind\":\"param\",\"name\":\"" + esc(hs.getName()) + "\"}";
+            String g = globalText(v);
+            if (g != null) return g;
+            return "{\"kind\":\"unresolved\",\"note\":\"input_no_def\"}";
+        }
+        switch (def.getOpcode()) {
+            case PcodeOp.CAST:
+            case PcodeOp.COPY:
+            case PcodeOp.INT_ZEXT:
+            case PcodeOp.INT_SEXT:
+            case PcodeOp.SUBPIECE:
+                return shallowSource(def.getInput(0), depth);
+            case PcodeOp.CALL:
+            case PcodeOp.CALLIND:
+                return callReturn(def, calleeNameOf(def));
+            case PcodeOp.INDIRECT:
+                return "{\"kind\":\"indirect_unresolved\",\"reason\":\"call_clobbered_stack_slot\"}";
+            case PcodeOp.PTRSUB:
+            case PcodeOp.PTRADD:
+            case PcodeOp.INT_ADD: {
+                String key = stackKey(v);
+                if (key != null) return "{\"kind\":\"stack_buf\",\"stack_key\":\"" + esc(key)
+                        + "\",\"truncated_writers\":true}";
+                String g = globalText(v);
+                if (g != null) return g;
+                return "{\"kind\":\"unresolved\",\"note\":\"ptr\"}";
+            }
+            default: {
+                String g = globalText(v);
+                if (g != null) return g;
+                return "{\"kind\":\"unresolved\",\"note\":\"" + esc(def.getMnemonic()) + "\"}";
+            }
+        }
+    }
+
+    // tokenizer_output (the provenance design, gap ②): the value is a strtok/strsep/sscanf return used directly.
+    private String tokenizerOut(PcodeOp def, String cn, int depth) {
+        Varnode inp = def.getNumInputs() > 1 ? def.getInput(1) : null;
+        String inSrc = (inp != null) ? shallowSource(inp, depth + 1) : "{\"kind\":\"unresolved\"}";
+        return "{\"kind\":\"tokenizer_output\",\"tokenizer\":\"" + esc(cn + "@" + addr0x(def))
+             + "\",\"input_source\":" + inSrc + ",\"sink_to_token\":\"resolved\"}";
+    }
+
+    // indirect_unresolved (the provenance design): a call clobbered the stack slot (array-element / cross-call
+    // opaque). Best-effort last_writer as an honest handle; never claimed as the definition.
+    private String indirectUnresolved(Varnode v, List<PcodeOpAST> ops) {
+        String key = stackKey(v);
+        String lastWriter = null;
+        long bestAddr = Long.MIN_VALUE;
+        if (key != null) {
+            for (PcodeOpAST op : ops) {
+                int oc = op.getOpcode();
+                if (oc != PcodeOp.CALL && oc != PcodeOp.CALLIND) continue;
+                String cn = calleeNameOf(op);
+                if (cn == null) continue;
+                boolean hit = false;
+                for (int j = 1; j < op.getNumInputs(); j++)
+                    if (key.equals(stackKey(op.getInput(j)))) { hit = true; break; }
+                if (hit) {
+                    long a = op.getSeqnum().getTarget().getOffset();
+                    if (a > bestAddr) { bestAddr = a; lastWriter = cn + "@" + addr0x(op); }
+                }
+            }
+        }
+        StringBuilder sb = new StringBuilder(
+                "{\"kind\":\"indirect_unresolved\",\"reason\":\"call_clobbered_stack_slot\"");
+        if (lastWriter != null) sb.append(",\"last_writer\":\"").append(esc(lastWriter)).append("\"");
+        sb.append("}");
+        return sb.toString();
+    }
+
+    // ---- provenance leaf helpers ----
+
+    // Ghidra's canonical &stack_var idiom is PTRSUB(base_reg, const). Return a stable key
+    // (base-reg offset + const) so a writer and a sink referencing the SAME slot match. Reading the
+    // decompiler's already-resolved offsets — NOT alias analysis.
+    private String stackKey(Varnode v) {
+        return stackKey(v, 0);
+    }
+
+    private String stackKey(Varnode v, int depth) {
+        if (v == null || depth > 20) return null;
+        Address a = v.getAddress();
+        if (a != null && a.isStackAddress()) return "stackvn:" + v.getOffset();
+        PcodeOp def = v.getDef();
+        if (def == null) return null;
+        int oc = def.getOpcode();
+        if (oc == PcodeOp.PTRSUB || oc == PcodeOp.PTRADD || oc == PcodeOp.INT_ADD) {
+            Varnode base = def.getInput(0);
+            Varnode off = def.getInput(1);
+            if (base != null && off != null && off.isConstant() && base.isRegister()) {
+                return "frame[" + base.getOffset() + "]+0x" + Long.toHexString(off.getOffset());
+            }
+        }
+        // A reused stack buffer is often reached through an intermediate CAST/COPY (common when the
+        // decompiler's type propagation does not settle) — follow it, as the def-use probe did.
+        if (oc == PcodeOp.CAST || oc == PcodeOp.COPY) return stackKey(def.getInput(0), depth + 1);
+        return null;
+    }
+
+    // A constant varnode that addresses a defined/readable string → the string; else null.
+    private String constText(Varnode v) {
+        if (v == null || !v.isConstant()) return null;
+        long off = v.getOffset();
+        if (off == 0) return null;
+        try {
+            return strAt(toAddr(off));
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    // A varnode addressing a global (.data/.rodata/.bss) → global_buf record; else null.
+    private String globalText(Varnode v) {
+        if (v == null) return null;
+        Address a = null;
+        if (v.isConstant() && v.getOffset() != 0) {
+            try { a = toAddr(v.getOffset()); } catch (Exception e) { a = null; }
+        } else if (v.isAddress()) {
+            a = v.getAddress();
+        }
+        if (a == null) return null;
+        MemoryBlock blk = currentProgram.getMemory().getBlock(a);
+        if (blk == null || blk.isExecute()) return null;   // not a data reference
+        Symbol s = currentProgram.getSymbolTable().getPrimarySymbol(a);
+        String ref = (s != null) ? s.getName() : ("DAT_" + a.toString());
+        String txt = null;
+        try { txt = strAt(a); } catch (Exception e) { txt = null; }
+        StringBuilder sb = new StringBuilder("{\"kind\":\"global_buf\",\"data_ref\":\"").append(esc(ref)).append("\"");
+        if (txt != null) sb.append(",\"text\":\"").append(esc(txt)).append("\"");
+        sb.append("}");
+        return sb.toString();
+    }
+
+    // Read a NUL-terminated printable string at an address: defined Data first, then raw bytes.
+    private String strAt(Address a) {
+        if (a == null) return null;
+        Data d = currentProgram.getListing().getDefinedDataAt(a);
+        if (d != null) {
+            Object val = d.getValue();
+            if (val instanceof String) return (String) val;
+        }
+        try {
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < 200; i++) {
+                byte b = currentProgram.getMemory().getByte(a.add(i));
+                if (b == 0) break;
+                if (b < 0x20 || b > 0x7e) {
+                    if (i == 0) return null;   // not a string at all
+                    break;
+                }
+                sb.append((char) b);
+            }
+            return sb.length() > 0 ? sb.toString() : null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    // Resolve a CALL op's target to a callee name (follows thunks); null if not statically known.
+    private String calleeNameOf(PcodeOp call) {
+        Varnode t = call.getInput(0);
+        if (t == null) return null;
+        Address to = null;
+        if (t.isConstant() && t.getOffset() != 0) {
+            try { to = toAddr(t.getOffset()); } catch (Exception e) { to = null; }
+        } else if (t.isAddress()) {
+            to = t.getAddress();
+        }
+        if (to == null) return null;
+        FunctionManager fm = currentProgram.getFunctionManager();
+        Function f = fm.getFunctionAt(to);
+        if (f != null) {
+            if (f.isThunk()) {
+                Function th = f.getThunkedFunction(true);
+                if (th != null) return th.getName();
+            }
+            return f.getName();
+        }
+        Symbol s = currentProgram.getSymbolTable().getPrimarySymbol(to);
+        return s != null ? s.getName() : null;
+    }
+
+    private String addr0x(PcodeOp op) {
+        return "0x" + Long.toHexString(op.getSeqnum().getTarget().getOffset());
+    }
+
     @Override
     public void run() throws Exception {
 
@@ -136,6 +701,17 @@ public class ExportFunctions extends GhidraScript {
         opts.setMaxPayloadMBytes(64);   // prevent OOM on large files
         decomp.setOptions(opts);
         decomp.openProgram(currentProgram);
+
+        // Optional extra provenance sinks (firmware-specific command wrappers), comma-separated.
+        // Key arg defaults to 0. Keeps the committed default lexicon vendor-neutral (CMD + FMT).
+        String extraSinks = System.getenv("TMAP_EXTRA_SINKS");
+        if (extraSinks != null && !extraSinks.trim().isEmpty()) {
+            sinkKeyArg = new HashMap<>(SINK_KEYARG);
+            for (String s : extraSinks.split(",")) {
+                String n = s.trim();
+                if (!n.isEmpty()) sinkKeyArg.put(n, 0);
+            }
+        }
 
         FunctionManager  fm     = currentProgram.getFunctionManager();
         SymbolTable      st     = currentProgram.getSymbolTable();
@@ -177,6 +753,7 @@ public class ExportFunctions extends GhidraScript {
             // Skip micro-functions (< 10 bytes): trampolines, alignment stubs, etc.
             // Not worth decompiling; they carry no logic and slow down the batch.
             String pseudocode = "";
+            HighFunction hf = null;   // Varnode/def-use + block graph from the SAME decompile (design B)
             if (funcSize < 10) {
                 // Leave pseudocode empty — populate_db.py handles null pseudocode fine.
             } else try {
@@ -186,6 +763,7 @@ public class ExportFunctions extends GhidraScript {
                     if (df != null) {
                         pseudocode = df.getC();
                     }
+                    hf = dr.getHighFunction();   // reused, not a second decompile
                 }
             } catch (Exception e) {
                 pseudocode = "/* decompile_error: " + e.getMessage() + " */";
@@ -262,6 +840,16 @@ public class ExportFunctions extends GhidraScript {
             calleesArr.append("]");
             edgesArr.append("]");
 
+            // sink_arg_provenance: Ghidra def-use fact for each command/format sink's key argument.
+            // Reuses the decompile above (hf); empty [] when unavailable or no sink present. Never
+            // throws out of the loop — provenance is additive evidence, not a gate.
+            String sinkProv = "[]";
+            try {
+                if (hf != null) sinkProv = buildSinkProvenance(hf);
+            } catch (Throwable ignore) {
+                sinkProv = "[]";
+            }
+
             if (!firstFunc) funcsJson.append(",");
             firstFunc = false;
             funcsJson.append("{")
@@ -270,6 +858,7 @@ public class ExportFunctions extends GhidraScript {
                      .append("\"size\":")        .append(funcSize).append(",")
                      .append("\"is_exported\":") .append(isExported).append(",")
                      .append("\"callees\":")     .append(calleesArr).append(",")
+                     .append("\"sink_provenance\":").append(sinkProv).append(",")
                      .append("\"pseudocode\":")  .append("\"").append(esc(pseudocode)).append("\"")
                      .append("}");
             funcCount++;

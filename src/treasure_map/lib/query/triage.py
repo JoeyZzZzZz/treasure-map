@@ -20,6 +20,7 @@ import json
 import logging
 import sqlite3
 from dataclasses import dataclass
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -204,6 +205,85 @@ def _source_kind_from_evidence(flow_evidence: str | None) -> str:
     return kind if isinstance(kind, str) and kind else "unknown"
 
 
+def _sink_provenance_records(flow_evidence: str | None) -> list[dict[str, Any]]:
+    """The full sink_arg_provenance list (Ghidra def-use fact) from the stored flow_evidence.
+
+    A pure read of what the analysis layer already recorded; empty list when the evidence is
+    absent, unparsable, or carries no provenance. Never recomputes or invents provenance."""
+    if not flow_evidence:
+        return []
+    try:
+        data = json.loads(flow_evidence)
+    except (ValueError, TypeError):
+        return []
+    prov = data.get("sink_arg_provenance") if isinstance(data, dict) else None
+    if not isinstance(prov, list):
+        return []
+    return [r for r in prov if isinstance(r, dict)]
+
+
+def _sink_provenance_summary(flow_evidence: str | None) -> tuple[dict[str, Any], ...]:
+    """Per-sink summary of sink_arg_provenance (summary-first: the FULL writer/vararg detail is
+    fetched on demand via ``get_sink_provenance``, so a multi-sink candidate never blows the token
+    budget). One compact dict per sink: idx / name / addr / kind / resolved / writer_count? /
+    nearest_dominating_writer?. A surfaced fact only — never a verdict, never a score input."""
+    out: list[dict[str, Any]] = []
+    for rec in _sink_provenance_records(flow_evidence):
+        prov = rec.get("provenance")
+        prov = prov if isinstance(prov, dict) else {}
+        kind = prov.get("kind", "unknown")
+        summary: dict[str, Any] = {
+            "sink_idx": rec.get("sink_idx"),
+            "sink": rec.get("sink"),
+            "sink_addr": rec.get("sink_addr"),
+            "kind": kind,
+            # "resolved" states only whether def-use reached a concrete origin; a false value is an
+            # honest boundary marker, NEVER a downweight or a "safe" verdict.
+            "resolved": kind not in ("indirect_unresolved", "unresolved"),
+        }
+        if "writer_count" in prov:
+            summary["writer_count"] = prov.get("writer_count")
+        if prov.get("nearest_dominating_writer"):
+            summary["nearest_dominating_writer"] = prov.get("nearest_dominating_writer")
+        out.append(summary)
+    return tuple(out)
+
+
+def get_sink_provenance(
+    conn: sqlite3.Connection, evidence_ref: str, sink_idx: int | None = None
+) -> dict[str, Any]:
+    """Full sink_arg_provenance detail for a candidate (the on-demand companion to the explain
+    summary). Returns every sink's record when ``sink_idx`` is None, otherwise the one record with
+    that idx. Read-only; a surfaced def-use fact, never a verdict. Unknown ref / idx is reported
+    honestly, never as an empty-but-successful result."""
+    row = conn.execute(
+        "SELECT flow_evidence FROM instance WHERE evidence_ref = ? ORDER BY instance_id LIMIT 1",
+        (evidence_ref,),
+    ).fetchone()
+    if row is None:
+        return {"evidence_ref": evidence_ref, "found": False, "note": "no_such_evidence_ref"}
+    records = _sink_provenance_records(row[0])
+    if not records:
+        return {"evidence_ref": evidence_ref, "found": False, "note": "no_sink_provenance"}
+    if sink_idx is None:
+        return {"evidence_ref": evidence_ref, "found": True, "records": records}
+    for rec in records:
+        if rec.get("sink_idx") == sink_idx:
+            return {
+                "evidence_ref": evidence_ref,
+                "found": True,
+                "sink_idx": sink_idx,
+                "record": rec,
+            }
+    return {
+        "evidence_ref": evidence_ref,
+        "found": False,
+        "sink_idx": sink_idx,
+        "note": "sink_idx_out_of_range",
+        "available_sink_idx": [r.get("sink_idx") for r in records],
+    }
+
+
 def _raw_score(
     reachability_status: str,
     blocking_mechanism: str | None,
@@ -382,6 +462,12 @@ class CandidateExplanation:
     # here, not only nested inside ``candidate``. Both echo the same-named candidate fields.
     source_class: str
     source_kind: str
+    # Summary-first sink_arg_provenance (Ghidra def-use fact) at the explain TOP LEVEL: one compact
+    # entry per command/format sink in this candidate's function (idx / kind / resolved /
+    # nearest_dominating_writer). The full writer + fmt + vararg detail is fetched on demand with
+    # ``get_sink_provenance`` so a many-sink candidate never overruns the token budget. A surfaced
+    # fact only; nothing here feeds recall, the score, or the grade.
+    sink_arg_provenance_summary: tuple[dict[str, Any], ...]
 
 
 def _reachability_note(status: str) -> str:
@@ -565,4 +651,5 @@ def explain_candidate(conn: sqlite3.Connection, evidence_ref: str) -> CandidateE
         verify_steps=_verify_steps(candidate),
         source_class=candidate.source_class,
         source_kind=candidate.source_kind,
+        sink_arg_provenance_summary=_sink_provenance_summary(_row_get(row, "flow_evidence")),
     )

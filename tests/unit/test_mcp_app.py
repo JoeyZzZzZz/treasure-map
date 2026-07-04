@@ -27,6 +27,7 @@ from treasure_map.lib.storage.connection import open_db
 _EXPECTED_TOOLS = {
     "list_candidates",
     "explain_candidate",
+    "get_sink_provenance",
     "cross_firmware_patterns",
     "pattern_density",
     "pattern_twins",
