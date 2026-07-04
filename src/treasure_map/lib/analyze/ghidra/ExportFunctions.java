@@ -531,6 +531,11 @@ public class ExportFunctions extends GhidraScript {
                 if (oc != PcodeOp.CALL && oc != PcodeOp.CALLIND) continue;
                 String cn = calleeNameOf(op);
                 if (cn == null) continue;
+                // Only a call that WRITES or PRODUCES this slot is an honest last_writer. A pure
+                // consumer that merely reads the slot as an argument (atoi/system/strlen on the same
+                // token) is NOT a writer — including it points the agent the wrong way. Match only
+                // buffer writers and tokenizers (whose token result lands in the slot).
+                if (!WRITERS.contains(cn) && !TOKENIZERS.contains(cn)) continue;
                 boolean hit = false;
                 for (int j = 1; j < op.getNumInputs(); j++)
                     if (key.equals(stackKey(op.getInput(j)))) { hit = true; break; }
