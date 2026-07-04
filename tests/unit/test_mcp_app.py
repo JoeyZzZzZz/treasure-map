@@ -335,10 +335,24 @@ def test_explain_and_list_surface_source_kind(tmp_path: Path) -> None:
     tools = mcp_app.make_tools(analysis, atlas)
     ex = tools["explain_candidate"]("run_m#fn1@cmd")
     assert ex["found"] is True
-    assert ex["candidate"]["source_kind"] == "free_string"  # surfaced next to source_class
-    assert ex["candidate"]["source_class"] == "external_input"  # the coarse field is intact
+    # ★ TOP-LEVEL visibility (the shipped bug): an agent reads the explain top level, so BOTH the
+    # fine source_kind and the coarse source_class must be directly there — not only in candidate.
+    assert ex["source_kind"] == "free_string"
+    assert ex["source_class"] == "external_input"
+    # still also carried on the nested candidate (unchanged)
+    assert ex["candidate"]["source_kind"] == "free_string"
     (cand,) = tools["list_candidates"]()["candidates"]
     assert cand["source_kind"] == "free_string"
+
+
+def test_explain_top_level_exposes_source_kind_and_class(tmp_path: Path) -> None:
+    # ★ regression guard for the shipped bug: source_kind was reachable ONLY via the nested
+    # candidate object, invisible at the explain TOP LEVEL an agent actually reads. Pin that the
+    # top-level dict itself carries both keys (this is the path A-group tests missed).
+    tools = _tools(tmp_path)
+    ex = tools["explain_candidate"]("run_m#fn1@cmd")
+    assert "source_kind" in ex  # top-level key, NOT ex["candidate"]["source_kind"]
+    assert "source_class" in ex  # coarse class also top-level — both agent-visible
 
 
 def test_source_kind_defaults_unknown_and_no_regression(tmp_path: Path) -> None:
@@ -346,8 +360,9 @@ def test_source_kind_defaults_unknown_and_no_regression(tmp_path: Path) -> None:
     # and every pre-existing field is unchanged — source_kind was ADDED, nothing renamed/removed.
     tools = _tools(tmp_path)  # _mk_atlas evidence has entry_reach but no source_kind
     ex = tools["explain_candidate"]("run_m#fn1@cmd")
-    assert ex["candidate"]["source_kind"] == "unknown"
-    assert ex["candidate"]["source_class"] == "external_input"  # existing fields unchanged
+    assert ex["source_kind"] == "unknown"  # top-level default when evidence carries none
+    assert ex["source_class"] == "external_input"  # coarse class still top-level, not regressed
+    assert ex["candidate"]["source_kind"] == "unknown"  # nested value agrees
     assert ex["candidate"]["entry_reach"] == "found"
     assert ex["candidate"]["score"] is not None
     cand = tools["list_candidates"]()["candidates"][0]

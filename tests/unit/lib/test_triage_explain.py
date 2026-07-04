@@ -36,7 +36,13 @@ def _has_weapon_word(text: str) -> str | None:
     return None
 
 
-def _seed(tmp_path: Path, *, status: str = "confirmed", origin: str = "unknown") -> Path:
+def _seed(
+    tmp_path: Path,
+    *,
+    status: str = "confirmed",
+    origin: str = "unknown",
+    source_kind: str | None = None,
+) -> Path:
     conn = open_atlas(tmp_path / "atlas.db")
     p = upsert_pattern(
         conn,
@@ -47,6 +53,9 @@ def _seed(tmp_path: Path, *, status: str = "confirmed", origin: str = "unknown")
         fingerprint_algo_version="callseq-v1",
     )
     _FID[0] += 1
+    import json
+
+    flow_evidence = json.dumps({"source_kind": source_kind}) if source_kind is not None else None
     add_instance(
         conn,
         InstanceRow(
@@ -61,6 +70,7 @@ def _seed(tmp_path: Path, *, status: str = "confirmed", origin: str = "unknown")
             evidence_ref="run_x#fn7",
             scope_origin="intra",
             origin=origin,
+            flow_evidence=flow_evidence,
         ),
     )
     conn.close()
@@ -179,6 +189,39 @@ def test_cli_explain_json_is_structured_without_payload(tmp_path: Path) -> None:
     assert _has_weapon_word(json.dumps(data)) is None
     # no input-construction field smuggled in
     assert not any(k in data for k in ("payload", "input", "trigger", "poc"))
+
+
+# ── source_kind / source_class surfaced at the explanation TOP LEVEL (缺口③ bug fix) ──
+
+
+def test_explanation_surfaces_source_signals_at_top_level(tmp_path: Path) -> None:
+    # The bug: source_kind was reachable only via ex.candidate, invisible at the top level a
+    # consumer (the MCP asdict, an agent) reads. Pin BOTH source signals on the CandidateExplanation
+    # itself, echoing the same-named candidate fields.
+    atlas = _seed(tmp_path, status="unknown", source_kind="free_string")
+    conn = open_atlas(atlas)
+    try:
+        ex = explain_candidate(conn, "run_x#fn7")
+    finally:
+        conn.close()
+    assert ex is not None
+    assert ex.source_kind == "free_string"  # top-level field, not only ex.candidate.source_kind
+    assert ex.source_class == "external_input"  # coarse class also top-level
+    assert ex.source_kind == ex.candidate.source_kind  # echoes the candidate, no divergence
+    assert ex.source_class == ex.candidate.source_class
+
+
+def test_explanation_source_kind_defaults_unknown_at_top_level(tmp_path: Path) -> None:
+    # No source_kind in flow_evidence -> top-level "unknown" (never fabricated); source_class stays.
+    atlas = _seed(tmp_path, status="unknown")  # no flow_evidence at all
+    conn = open_atlas(atlas)
+    try:
+        ex = explain_candidate(conn, "run_x#fn7")
+    finally:
+        conn.close()
+    assert ex is not None
+    assert ex.source_kind == "unknown"
+    assert ex.source_class == "external_input"
 
 
 # ── 5. read-only: --explain changes nothing in the atlas ────────────────────────────

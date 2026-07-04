@@ -376,6 +376,12 @@ class CandidateExplanation:
     claims_does: tuple[str, ...]
     claims_does_not: tuple[str, ...]
     verify_steps: tuple[str, ...]
+    # The source signals promoted to the explain TOP LEVEL (mirrors ``score``, which likewise
+    # duplicates candidate.score): a consumer reads the top of the explain record, so the coarse
+    # controllability class (source_class) and the fine one (source_kind) must be directly visible
+    # here, not only nested inside ``candidate``. Both echo the same-named candidate fields.
+    source_class: str
+    source_kind: str
 
 
 def _reachability_note(status: str) -> str:
@@ -557,4 +563,6 @@ def explain_candidate(conn: sqlite3.Connection, evidence_ref: str) -> CandidateE
         claims_does=claims_does,
         claims_does_not=claims_does_not,
         verify_steps=_verify_steps(candidate),
+        source_class=candidate.source_class,
+        source_kind=candidate.source_kind,
     )
