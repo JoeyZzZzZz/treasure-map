@@ -224,6 +224,53 @@ def test_migration_adds_ghidra_status_to_old_db(tmp_path: Path) -> None:
     conn.close()
 
 
+def _legacy_functions_db(db_path: Path) -> None:
+    """A functions table with the pre-sink_provenance columns (simulates an old analysis.db)."""
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "CREATE TABLE functions (id INTEGER PRIMARY KEY, binary_id INTEGER, name TEXT, "
+        "address TEXT, size_bytes INTEGER, pseudocode TEXT, pseudocode_hash TEXT, "
+        "callees TEXT DEFAULT '[]', is_exported INTEGER DEFAULT 0)"
+    )
+    raw.execute(
+        "INSERT INTO functions (id, binary_id, name, address) VALUES (1, 7, 'main', '0x1000')"
+    )
+    raw.commit()
+    raw.close()
+
+
+def test_migration_adds_sink_provenance_to_old_db(tmp_path: Path) -> None:
+    # ★ Regression: 25041e9 added functions.sink_provenance to schema.sql (new DBs) but not to
+    # _ADDED_COLUMNS (old DBs), so CREATE TABLE IF NOT EXISTS left the column missing on any
+    # pre-existing analysis.db and ghidra_ingest crashed with "no column named sink_provenance".
+    # A database built before the column must gain it on open, with existing rows preserved.
+    db_path = tmp_path / "legacy.db"
+    _legacy_functions_db(db_path)
+    conn = open_db(db_path)  # triggers the additive migration
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(functions)")}
+        assert "sink_provenance" in cols
+        # existing data survives and the new column back-fills to the '[]' default
+        row = conn.execute("SELECT name, sink_provenance FROM functions WHERE id = 1").fetchone()
+        assert row["name"] == "main"
+        assert row["sink_provenance"] == "[]"
+    finally:
+        conn.close()
+
+
+def test_migration_sink_provenance_is_idempotent(tmp_path: Path) -> None:
+    # Re-running the migration on a DB that already has the column must not raise or duplicate it.
+    db_path = tmp_path / "legacy2.db"
+    _legacy_functions_db(db_path)
+    open_db(db_path).close()  # first migration adds the column
+    conn = open_db(db_path)  # second run must be a no-op
+    try:
+        cols = [row[1] for row in conn.execute("PRAGMA table_info(functions)")]
+        assert cols.count("sink_provenance") == 1  # added exactly once, never duplicated
+    finally:
+        conn.close()
+
+
 # ── Round 2: new ingest_elfs behaviour ───────────────────────────────────────
 
 

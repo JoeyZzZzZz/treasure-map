@@ -33,6 +33,9 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # tri-state Ghidra outcome (ok / ok_empty / failed); back-fills as NULL on older DBs, which the
     # ingest self-heal treats as needing re-analysis when a claimed-done binary has 0 functions.
     ("binaries", "ghidra_status", "TEXT"),
+    # sink_arg_provenance transport column; back-fills as '[]' on DBs built before it existed so
+    # ghidra_ingest can write it without "no column named sink_provenance". Must match schema.sql.
+    ("functions", "sink_provenance", "TEXT DEFAULT '[]'"),
 )
 
 
