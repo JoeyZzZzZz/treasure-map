@@ -357,6 +357,7 @@ def _render_explain(ex: CandidateExplanation, *, as_json: bool) -> None:
                     ],
                     "structure": {
                         "source_class": c.source_class,
+                        "source_kind": c.source_kind,
                         "sink_class": c.sink_class,
                         "sink_anchor": c.sink_anchor,
                         "call_sequence_shape": ex.call_sequence_shape,
@@ -386,6 +387,7 @@ def _render_explain(ex: CandidateExplanation, *, as_json: bool) -> None:
 
     click.echo("\nstructure:")
     click.echo(f"  source_class = {c.source_class}")
+    click.echo(f"  source_kind  = {c.source_kind}")
     click.echo(f"  sink         = {c.sink_anchor or '?'} ({c.sink_class})")
     click.echo(f"  shape        = {ex.call_sequence_shape or '?'}")
     click.echo(f"  function     = {c.function or '?'}")

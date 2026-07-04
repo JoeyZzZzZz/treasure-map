@@ -53,13 +53,18 @@ def _inst(
     sink_anchor: str = "system",
     binary_path: str | None = None,
     entry_reach: str | None = None,
+    source_kind: str | None = None,
 ) -> None:
     _FID[0] += 1
     provenance = "L1" if status in {"confirmed", "blocked"} else "L0"
-    # entry_reach (None -> no flow_evidence; else a minimal entry_reach.status payload).
-    flow_evidence = None
+    # flow_evidence: None when neither signal is set; else the minimal payload for whichever of
+    # entry_reach.status / source_kind was requested (both parsed back by the read view).
+    evidence: dict[str, object] = {}
     if entry_reach is not None:
-        flow_evidence = json.dumps({"entry_reach": {"status": entry_reach, "sites": []}})
+        evidence["entry_reach"] = {"status": entry_reach, "sites": []}
+    if source_kind is not None:
+        evidence["source_kind"] = source_kind
+    flow_evidence = json.dumps(evidence) if evidence else None
     add_instance(
         conn,
         InstanceRow(
@@ -193,6 +198,60 @@ def test_entry_reach_unknown_external_lead_not_buried(tmp_path: Path) -> None:
 
     ranked = triage(conn)
     assert ranked[0].function == "unknown_entry_lead"
+    conn.close()
+
+
+# ── source_kind exposure (缺口③): the fine-grained controllability signal, surfaced not scored ──
+
+
+def test_source_kind_parsed_from_flow_evidence(tmp_path: Path) -> None:
+    # The read view surfaces the source_kind the evidence layer stored, verbatim.
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp")
+    _inst(conn, p, fn="free_fn", source_kind="free_string")
+    _inst(conn, p, fn="charset_fn", source_kind="charset_maybe")
+    by_fn = {c.function: c for c in triage(conn)}
+    assert by_fn["free_fn"].source_kind == "free_string"
+    assert by_fn["charset_fn"].source_kind == "charset_maybe"
+    conn.close()
+
+
+def test_source_kind_defaults_to_unknown_when_absent(tmp_path: Path) -> None:
+    # flow_evidence present but with no source_kind, and flow_evidence absent entirely: both report
+    # "unknown" — a missing signal is never fabricated into a class.
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp")
+    _inst(conn, p, fn="entry_only", entry_reach="found")  # evidence present, no source_kind
+    _inst(conn, p, fn="no_evidence")  # no flow_evidence at all
+    by_fn = {c.function: c for c in triage(conn)}
+    assert by_fn["entry_only"].source_kind == "unknown"
+    assert by_fn["no_evidence"].source_kind == "unknown"
+    conn.close()
+
+
+def test_source_kind_parser_is_conservative() -> None:
+    # The parser never raises and never fabricates: bad JSON, a non-dict, a non-string value, and a
+    # missing key all degrade to "unknown"; a real string passes through verbatim.
+    from treasure_map.lib.query.triage import _source_kind_from_evidence
+
+    assert _source_kind_from_evidence(json.dumps({"source_kind": "free_string"})) == "free_string"
+    assert _source_kind_from_evidence(None) == "unknown"
+    assert _source_kind_from_evidence("") == "unknown"
+    assert _source_kind_from_evidence("{not json") == "unknown"
+    assert _source_kind_from_evidence(json.dumps(["list", "not", "dict"])) == "unknown"
+    assert _source_kind_from_evidence(json.dumps({"source_kind": 7})) == "unknown"
+    assert _source_kind_from_evidence(json.dumps({"entry_reach": {}})) == "unknown"
+
+
+def test_source_kind_does_not_affect_score(tmp_path: Path) -> None:
+    # ★ exposure-only: source_kind is surfaced, never scored. Two candidates identical except for
+    # source_kind rank equally — source_class alone drives ordering.
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp", sink_class="cmd", source_class="external_input")
+    _inst(conn, p, fn="free_fn", source_kind="free_string")
+    _inst(conn, p, fn="unknown_fn", source_kind="unknown")
+    by_fn = {c.function: c for c in triage(conn)}
+    assert by_fn["free_fn"].score == by_fn["unknown_fn"].score
     conn.close()
 
 

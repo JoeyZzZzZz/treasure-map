@@ -397,6 +397,86 @@ def get_strings(
     }
 
 
+# A pseudocode substring search is a TEXT match, not a resolved symbol/xref reference: the schema
+# indexes no string->function link (Ghidra exports no string xrefs), but functions.pseudocode is
+# stored in full, so "which functions mention this text" is answerable by scanning that text. Said
+# honestly on every result — the text may occur in a comment or an unrelated string literal, so
+# each hit is a lead to confirm, not a proven reference.
+_PSEUDO_TEXT_NOTE = (
+    "MATCHES BY PSEUDOCODE TEXT SUBSTRING, not a resolved symbol/xref reference: the text may "
+    "appear in a comment or an unrelated string literal — confirm each hit in the pseudocode"
+)
+
+
+def _like_escape(text: str) -> str:
+    """Escape LIKE wildcards so a literal substring matches literally.
+
+    Function names routinely contain ``_`` (a single-char LIKE wildcard) and code contains ``%``;
+    without escaping, ``LIKE`` would over-match. Paired with ``ESCAPE '\\'`` at the call site."""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _first_match_line(pseudocode: str | None, text: str) -> str | None:
+    """The first pseudocode line containing ``text`` (case-insensitive, mirroring SQLite LIKE),
+    trimmed — a locating snippet, not the whole body. None when no single line contains it."""
+    if not pseudocode:
+        return None
+    needle = text.lower()
+    for line in pseudocode.splitlines():
+        if needle in line.lower():
+            return line.strip()
+    return None
+
+
+def get_functions_referencing_string(
+    conn: sqlite3.Connection, *, text: str, binary: str | None = None, limit: int = 50
+) -> dict[str, Any]:
+    """Functions whose pseudocode TEXT contains ``text`` (a substring reverse-lookup).
+
+    The schema stores no string->function link, but functions.pseudocode is kept in full, so this
+    answers "which functions mention this text" by scanning that pseudocode — the same manual
+    ``LIKE`` reverse-lookup a reviewer runs by hand, wrapped as one call. ``binary`` (short name OR
+    full path) narrows to one binary; omitted, it scans every binary. Capped at ``limit`` hits
+    (default 50); the result carries ``truncated`` when more exist. HONEST BOUND: this is a TEXT
+    match, not a resolved symbol reference — the ``note`` says so; the text can occur in a comment
+    or an unrelated string literal, so each hit is a lead to confirm. Each hit carries its anchor
+    (binary + function + address) and the first matching pseudocode line."""
+    if not text.strip():
+        return {"found": False, "reason": "empty search text", "query": {"text": text}}
+    lim = max(1, limit)
+    sql = (
+        "SELECT f.name, f.address, f.pseudocode, b.name AS binary_name, b.path AS binary_path "
+        "FROM functions f JOIN binaries b ON b.id = f.binary_id "
+        "WHERE f.pseudocode LIKE ? ESCAPE '\\'"
+    )
+    params: list[Any] = [f"%{_like_escape(text)}%"]
+    if binary is not None:
+        sql += " AND (b.name = ? OR b.path = ?)"
+        params.extend([binary, binary])
+    sql += " ORDER BY b.name, f.address LIMIT ?"
+    params.append(lim + 1)  # fetch one extra to detect truncation without a second COUNT query
+    rows = conn.execute(sql, params).fetchall()
+    truncated = len(rows) > lim
+    functions = [
+        {
+            **_anchor(r["binary_name"], r["name"], r["address"]),
+            "binary_path": r["binary_path"],
+            "match_line": _first_match_line(r["pseudocode"], text),
+        }
+        for r in rows[:lim]
+    ]
+    return {
+        "found": True,
+        "query": {"text": text, "binary": binary},
+        "match_kind": "pseudocode_text_substring",  # honest: a text match, not a symbol reference
+        "functions": functions,
+        "returned": len(functions),
+        "limit": lim,
+        "truncated": truncated,
+        "note": _PSEUDO_TEXT_NOTE,
+    }
+
+
 def get_imports_exports(conn: sqlite3.Connection, *, binary: str) -> dict[str, Any]:
     """The import and export symbol tables of one binary (the cross-binary edge endpoints)."""
     bid = _binary_id(conn, binary)

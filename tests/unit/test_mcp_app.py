@@ -35,6 +35,7 @@ _EXPECTED_TOOLS = {
     "get_callees",
     "get_xrefs",
     "get_strings",
+    "get_functions_referencing_string",
     "get_imports_exports",
     "get_script_callsites",
     "get_components_cves",
@@ -290,6 +291,84 @@ def test_server_instructions_are_workflow_not_just_legalese(tmp_path: Path) -> N
     assert "RECALL" in instr  # the loop, not just the banner
     tools = mcp_app.make_tools(analysis, atlas)
     assert "defensive" in tools["legal_notice"]()["notice"].lower()
+
+
+# ── 缺口③: source_kind (fine-grained controllability) surfaced on explain + list ───────
+
+
+def test_explain_and_list_surface_source_kind(tmp_path: Path) -> None:
+    # The source_kind the evidence layer stored in flow_evidence is surfaced on BOTH the
+    # explain_candidate and list_candidates MCP surfaces (a free, controllable string here),
+    # alongside the coarse source_class it refines.
+    analysis = _mk_analysis(tmp_path)
+    atlas = tmp_path / "atlas.db"
+    conn = open_atlas(atlas)
+    pid = upsert_pattern(
+        conn,
+        source_class="external_input",
+        sink_class="cmd",
+        call_sequence_shape="source->cmd",
+        structural_fingerprint="fp_demo",
+        fingerprint_algo_version="callseq-v1",
+    )
+    add_instance(
+        conn,
+        InstanceRow(
+            pattern_id=pid,
+            pseudocode_hash="h1",
+            source_anchor="handle_req",
+            sink_anchor="do_fwd",
+            source_run_id="run_m",
+            reachability_status="unknown",
+            blocking_mechanism=None,
+            provenance_level="L0",
+            evidence_ref="run_m#fn1@cmd",
+            scope_origin="intra",
+            origin="custom",
+            binary_path="usr/sbin/webd",
+            flow_evidence=json.dumps(
+                {"source_kind": "free_string", "entry_reach": {"status": "found", "sites": []}}
+            ),
+        ),
+    )
+    conn.close()
+    tools = mcp_app.make_tools(analysis, atlas)
+    ex = tools["explain_candidate"]("run_m#fn1@cmd")
+    assert ex["found"] is True
+    assert ex["candidate"]["source_kind"] == "free_string"  # surfaced next to source_class
+    assert ex["candidate"]["source_class"] == "external_input"  # the coarse field is intact
+    (cand,) = tools["list_candidates"]()["candidates"]
+    assert cand["source_kind"] == "free_string"
+
+
+def test_source_kind_defaults_unknown_and_no_regression(tmp_path: Path) -> None:
+    # A candidate whose flow_evidence carries NO source_kind surfaces "unknown" (never fabricated),
+    # and every pre-existing field is unchanged — source_kind was ADDED, nothing renamed/removed.
+    tools = _tools(tmp_path)  # _mk_atlas evidence has entry_reach but no source_kind
+    ex = tools["explain_candidate"]("run_m#fn1@cmd")
+    assert ex["candidate"]["source_kind"] == "unknown"
+    assert ex["candidate"]["source_class"] == "external_input"  # existing fields unchanged
+    assert ex["candidate"]["entry_reach"] == "found"
+    assert ex["candidate"]["score"] is not None
+    cand = tools["list_candidates"]()["candidates"][0]
+    assert cand["source_kind"] == "unknown"
+    for key in ("evidence_ref", "source_class", "score", "entry_reach", "sink_class"):
+        assert key in cand  # no prior key dropped
+
+
+# ── 缺口①: pseudocode-text reverse lookup (which functions mention a string) ────────────
+
+
+def test_get_functions_referencing_string_tool(tmp_path: Path) -> None:
+    # Reachable as a tool, matches by pseudocode text (handle_req's body calls do_fwd), and states
+    # its honest bound (a TEXT match, not a resolved symbol xref). A missing binary yields no hits.
+    tools = _tools(tmp_path)
+    r = tools["get_functions_referencing_string"]("do_fwd")
+    assert r["found"] is True
+    assert "handle_req" in {f["function"] for f in r["functions"]}
+    assert r["match_kind"] == "pseudocode_text_substring"
+    assert "text" in r["note"].lower()
+    assert tools["get_functions_referencing_string"]("do_fwd", "libc.so")["functions"] == []
 
 
 # ── public-surface neutrality: the server is a published artifact, stricter discipline ──

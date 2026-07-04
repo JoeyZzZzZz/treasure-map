@@ -249,3 +249,143 @@ def test_get_disassembly_degrades_honestly(tmp_path: Path) -> None:
     assert r["available"] is False  # never emit possibly-misaligned addresses
     assert r["anchor"]["function"] == "handle_req"  # but the anchor is still given
     conn.close()
+
+
+# ── get_functions_referencing_string: pseudocode-text reverse lookup (缺口①) ────────────
+
+
+def _mk_refdb(tmp_path: Path) -> Path:
+    """Two binaries: 'caller' invokes the target string, 'other' does not, and 'commented' mentions
+    it ONLY inside a comment — the fixture for the text-match honesty test."""
+    db = tmp_path / "refs.db"
+    conn = open_db(db)
+    conn.execute(
+        "INSERT INTO binaries (id, name, path, sha256) VALUES (1, 'webd', 'sbin/webd', ?)",
+        ("a" * 64,),
+    )
+    conn.execute(
+        "INSERT INTO binaries (id, name, path, sha256) VALUES (2, 'apid', 'sbin/apid', ?)",
+        ("b" * 64,),
+    )
+    conn.execute(
+        "INSERT INTO functions (id, binary_id, name, address, pseudocode, callees) "
+        "VALUES (1, 1, 'caller', '0x100', 'void caller(){ set_iperf3_svr(v); }', '[]')"
+    )
+    conn.execute(
+        "INSERT INTO functions (id, binary_id, name, address, pseudocode, callees) "
+        "VALUES (2, 1, 'other', '0x200', 'void other(){ do_thing(); }', '[]')"
+    )
+    conn.execute(
+        "INSERT INTO functions (id, binary_id, name, address, pseudocode, callees) VALUES "
+        "(3, 2, 'commented', '0x300', 'void commented(){ /* calls set_iperf3_svr later */ x(); }', "
+        "'[]')"
+    )
+    conn.commit()
+    conn.close()
+    return db
+
+
+def test_referencing_string_matches_only_referencing_functions(tmp_path: Path) -> None:
+    conn = facts.open_analysis_ro(_mk_refdb(tmp_path))
+    try:
+        r = facts.get_functions_referencing_string(conn, text="set_iperf3_svr")
+    finally:
+        conn.close()
+    names = {f["function"] for f in r["functions"]}
+    assert names == {"caller", "commented"}  # 'other' never mentions the text
+    assert r["found"] is True and r["truncated"] is False
+    # each hit carries its anchor (binary + function + address) + the matching line
+    (caller_hit,) = [f for f in r["functions"] if f["function"] == "caller"]
+    assert caller_hit["binary"] == "webd" and caller_hit["address"] == "0x100"
+
+
+def test_referencing_string_binary_filter(tmp_path: Path) -> None:
+    conn = facts.open_analysis_ro(_mk_refdb(tmp_path))
+    try:
+        webd = facts.get_functions_referencing_string(conn, text="set_iperf3_svr", binary="webd")
+        apid = facts.get_functions_referencing_string(conn, text="set_iperf3_svr", binary="apid")
+        by_path = facts.get_functions_referencing_string(
+            conn, text="set_iperf3_svr", binary="sbin/apid"
+        )
+    finally:
+        conn.close()
+    assert {f["function"] for f in webd["functions"]} == {"caller"}
+    assert {f["function"] for f in apid["functions"]} == {"commented"}
+    assert {f["function"] for f in by_path["functions"]} == {"commented"}  # full path resolves too
+
+
+def test_referencing_string_hit_in_comment_is_a_text_match(tmp_path: Path) -> None:
+    # Honest boundary: the text sits ONLY in a comment of 'commented', yet it matches — proving this
+    # is a pseudocode TEXT substring match, not a resolved symbol reference. The result says so.
+    conn = facts.open_analysis_ro(_mk_refdb(tmp_path))
+    try:
+        r = facts.get_functions_referencing_string(conn, text="set_iperf3_svr", binary="apid")
+    finally:
+        conn.close()
+    (hit,) = r["functions"]
+    assert hit["function"] == "commented"
+    assert "calls set_iperf3_svr later" in hit["match_line"]  # the matched line snippet
+    assert r["match_kind"] == "pseudocode_text_substring"
+    assert "text" in r["note"].lower() and "not a resolved symbol" in r["note"].lower()
+
+
+def test_referencing_string_underscore_is_literal_not_wildcard(tmp_path: Path) -> None:
+    # LIKE treats '_' as a single-char wildcard; the reverse lookup escapes it so a name full of
+    # underscores does not over-match. 'set_iperf3_svr' must NOT match 'setXiperf3Ysvr'.
+    db = tmp_path / "esc.db"
+    conn = open_db(db)
+    conn.execute(
+        "INSERT INTO binaries (id, name, path, sha256) VALUES (1, 'webd', 'sbin/webd', ?)",
+        ("a" * 64,),
+    )
+    conn.execute(
+        "INSERT INTO functions (id, binary_id, name, address, pseudocode, callees) "
+        "VALUES (1, 1, 'exact', '0x1', 'void exact(){ set_iperf3_svr(v); }', '[]')"
+    )
+    conn.execute(
+        "INSERT INTO functions (id, binary_id, name, address, pseudocode, callees) "
+        "VALUES (2, 1, 'wild', '0x2', 'void wild(){ setXiperf3Ysvr(v); }', '[]')"
+    )
+    conn.commit()
+    conn.close()
+    ro = facts.open_analysis_ro(db)
+    try:
+        r = facts.get_functions_referencing_string(ro, text="set_iperf3_svr")
+    finally:
+        ro.close()
+    assert {f["function"] for f in r["functions"]} == {"exact"}  # underscore matched literally
+
+
+def test_referencing_string_limit_and_truncation(tmp_path: Path) -> None:
+    db = tmp_path / "many.db"
+    conn = open_db(db)
+    conn.execute(
+        "INSERT INTO binaries (id, name, path, sha256) VALUES (1, 'webd', 'sbin/webd', ?)",
+        ("a" * 64,),
+    )
+    for i in range(60):  # 60 functions all mentioning the marker -> default cap of 50 truncates
+        conn.execute(
+            "INSERT INTO functions (id, binary_id, name, address, pseudocode, callees) "
+            "VALUES (?, 1, ?, ?, ?, '[]')",
+            (i + 1, f"fn_{i:02d}", f"0x{i:04x}", f"void fn_{i:02d}(){{ common_marker(); }}"),
+        )
+    conn.commit()
+    conn.close()
+    ro = facts.open_analysis_ro(db)
+    try:
+        capped = facts.get_functions_referencing_string(ro, text="common_marker")
+        small = facts.get_functions_referencing_string(ro, text="common_marker", limit=5)
+    finally:
+        ro.close()
+    assert capped["returned"] == 50 and capped["limit"] == 50 and capped["truncated"] is True
+    assert small["returned"] == 5 and small["truncated"] is True
+
+
+def test_referencing_string_empty_text_is_rejected(tmp_path: Path) -> None:
+    # An empty/whitespace search is refused rather than matched against every function ('%%').
+    conn = facts.open_analysis_ro(_mk_refdb(tmp_path))
+    try:
+        r = facts.get_functions_referencing_string(conn, text="   ")
+    finally:
+        conn.close()
+    assert r["found"] is False

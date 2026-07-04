@@ -394,21 +394,26 @@ def test_evidence_signals_do_not_feed_score_or_grade() -> None:
     # for an agent, never a score/grade input. The read-side score, the form-note downweight, and
     # the grader must not consume them nor import the evidence module.
     #
-    # entry_reach is the deliberate exception (round R-L4·mcp, factor 6b): it is a FACT (a rootfs
-    # entry point was found to invoke the binary), not an interpretation, so the read-side ranking
-    # MAY use it as a second-level ordering key — but only the read-side triage, never the grader
-    # or the form-note downweight, and never the interpretive fields below.
-    interpretive = ("sanitizer_seen", "trace_boundary", "source_kind", "size_kind")
+    # Two evidence facts are SURFACED by the read-side triage (and ONLY there — never the grader or
+    # the form-note downweight):
+    #   - entry_reach (round R-L4·mcp, factor 6b): a rootfs entry point was found to invoke the
+    #     binary — a FACT the read-side ranking MAY use as a second-level ordering key.
+    #   - source_kind (缺口③): the fine-grained controllability class — surfaced to the agent next
+    #     to source_class but NEVER scored. review_score consumes source_class, not source_kind, and
+    #     test_source_kind_does_not_affect_score pins that it changes no review order.
+    # The purely interpretive fields below are surfaced by NO ranking-layer file.
+    never_surfaced = ("sanitizer_seen", "trace_boundary", "size_kind")
     for rel in ("lib/query/triage.py", "lib/hunt/downweight.py", "lib/reachability/grader.py"):
         text = (_SRC / rel).read_text()
         assert "hunt.evidence" not in text and "import evidence" not in text, (
             f"{rel} unexpectedly imports the evidence module"
         )
-        for field in interpretive:
+        for field in never_surfaced:
             assert field not in text, f"{rel} unexpectedly references evidence field {field!r}"
-    # The grader and the downweight must not consume entry_reach / flow_evidence either — only the
-    # presentation-layer triage ranking may (and does, by design).
+    # The grader and the downweight must consume NONE of the evidence signals — not even the two the
+    # triage surfaces (entry_reach / source_kind) nor the raw flow_evidence. Only the presentation-
+    # layer triage ranking may surface a fact, and it does so without letting it feed the score.
     for rel in ("lib/hunt/downweight.py", "lib/reachability/grader.py"):
         text = (_SRC / rel).read_text()
-        for field in ("entry_reach", "flow_evidence"):
+        for field in ("entry_reach", "source_kind", "flow_evidence"):
             assert field not in text, f"{rel} unexpectedly references {field!r}"

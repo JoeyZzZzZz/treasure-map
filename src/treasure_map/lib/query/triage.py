@@ -157,6 +157,13 @@ class TriageCandidate:
     # entry-reach status (found / unknown) parsed from the stored flow_evidence — a derived,
     # evidence-backed signal, NOT a verdict. found promotes within the tier; unknown is neutral.
     entry_reach: str = "unknown"
+    # source_kind (free_string / charset_safe / charset_maybe / unknown) parsed from the stored
+    # flow_evidence — the FINE-GRAINED controllability signal the coarse source_class folds away
+    # (free_string = a free, controllable string reached the sink argument). Surfaced so a consumer
+    # can tell a genuinely controllable source from a globals/constant forward; it is a read-only
+    # fact, NOT a verdict, and it never affects the score (source_class alone drives ordering).
+    # ``unknown`` when the evidence is absent or carries no source_kind.
+    source_kind: str = "unknown"
     # The pattern's structural fingerprint (the same key cross_firmware_patterns / pattern_density
     # group by), surfaced so a consumer can pivot from a recurring pattern to its instances. A
     # presentation-only field — it never affects the score or ordering.
@@ -178,6 +185,23 @@ def _entry_reach_status(flow_evidence: str | None) -> str:
     if isinstance(reach, dict) and reach.get("status") == "found":
         return "found"
     return "unknown"
+
+
+def _source_kind_from_evidence(flow_evidence: str | None) -> str:
+    """Surface ``source_kind`` from the stored flow_evidence JSON; ``unknown`` when absent.
+
+    A pure read of the value the evidence layer already recorded (free_string / charset_safe /
+    charset_maybe / unknown) — this does NOT recompute the classification, it only exposes it.
+    Conservative: any missing / unparsable evidence, or an absent / non-string source_kind, reports
+    ``unknown`` (never fabricates a class)."""
+    if not flow_evidence:
+        return "unknown"
+    try:
+        data = json.loads(flow_evidence)
+    except (ValueError, TypeError):
+        return "unknown"
+    kind = data.get("source_kind") if isinstance(data, dict) else None
+    return kind if isinstance(kind, str) and kind else "unknown"
 
 
 def _raw_score(
@@ -237,6 +261,7 @@ def _candidate(row: sqlite3.Row) -> TriageCandidate:
         evidence_ref=row["evidence_ref"],
         binary_path=row["binary_path"],
         entry_reach=entry_reach,
+        source_kind=_source_kind_from_evidence(_row_get(row, "flow_evidence")),
         structural_fingerprint=_row_get(row, "structural_fingerprint"),
     )
 

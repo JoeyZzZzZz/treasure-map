@@ -66,7 +66,9 @@ _AGENT_INSTRUCTIONS = (
     "cross-tool anchor) and read facts: get_pseudocode (func = a name OR an address in any form; "
     "binary = short name OR full path), get_callees / get_xrefs to walk the call chain (an empty "
     "caller set may mean an indirect/dispatch-table call, not 'unreachable'), get_strings, "
-    "get_imports_exports, get_script_callsites, get_components_cves. (3) Judge value with the "
+    "get_functions_referencing_string (which functions mention a string, by pseudocode text "
+    "match — not a resolved symbol xref), get_imports_exports, get_script_callsites, "
+    "get_components_cves. (3) Judge value with the "
     "cross-firmware signals: cross_firmware_patterns (a pattern recurring across many firmware "
     "images) and get_components_cves (known-CVE components). Prefer narrow filters (run_id / sink "
     "/ status) and paging over pulling everything; fetch detail per evidence_ref. The tools draw "
@@ -83,6 +85,10 @@ def _candidate_dict(c: Any, current_run_id: str | None = None) -> dict[str, Any]
         "sink_anchor": c.sink_anchor,
         "sink_class": c.sink_class,
         "source_class": c.source_class,
+        # fine-grained controllability of the source reaching the sink argument (free_string /
+        # charset_safe / charset_maybe / unknown), surfaced from the candidate's flow_evidence —
+        # the signal source_class folds away. DERIVED evidence, NOT a verdict.
+        "source_kind": c.source_kind,
         "reachability_status": c.reachability_status,  # raw mechanism state (unknown/confirmed/…)
         "review_status": c.review_status,  # presentation relabel (to-verify / reachable / gated)
         "blocking_mechanism": c.blocking_mechanism,
@@ -325,6 +331,18 @@ def make_tools(
         """Import and export symbol tables of one binary (cross-binary edge endpoints)."""
         return _with_analysis(lambda c: facts.get_imports_exports(c, binary=binary))
 
+    def get_functions_referencing_string(text: str, binary: str | None = None) -> dict[str, Any]:
+        """Functions whose pseudocode TEXT contains a string (substring reverse-lookup).
+
+        The schema indexes no string->function link, but functions.pseudocode is stored in full, so
+        this answers "which functions mention this text". ``binary`` (short name or full path)
+        narrows the scan; omitted, it scans every binary. Capped (``truncated`` when more exist).
+        HONEST BOUND: a TEXT match, not a resolved symbol reference — the text may sit in a comment
+        or an unrelated string literal; confirm each hit in the pseudocode."""
+        return _with_analysis(
+            lambda c: facts.get_functions_referencing_string(c, text=text, binary=binary)
+        )
+
     def get_script_callsites(binary: str) -> dict[str, Any]:
         """Rootfs scripts that invoke this binary — entry-reach evidence (script + line + args)."""
         return _with_analysis(lambda c: facts.get_script_callsites(c, binary=binary))
@@ -352,6 +370,7 @@ def make_tools(
         "get_callees": get_callees,
         "get_xrefs": get_xrefs,
         "get_strings": get_strings,
+        "get_functions_referencing_string": get_functions_referencing_string,
         "get_imports_exports": get_imports_exports,
         "get_script_callsites": get_script_callsites,
         "get_components_cves": get_components_cves,
