@@ -87,14 +87,13 @@ One command. uv fetches a managed CPython 3.11, builds Treasure Map in an isolat
 and puts the `tmap` command on your PATH — nothing to activate.
 
 ```bash
-uv tool install --python 3.11 --with mcp "git+https://github.com/JoeyZzZzZz/treasure-map.git"
+uv tool install --python 3.11 "git+https://github.com/JoeyZzZzZz/treasure-map.git"
 tmap --help
 ```
 
-`--with mcp` bundles the optional AI-facing [MCP server](#ai-facing-access-mcp-server) so it works
-out of the box; omit it if you only want the CLI. Already installed without it?
-`uv tool upgrade treasure-map --with mcp` adds it. (Not using uv? `pip install
-"treasure-map[mcp]"` installs the same extra.)
+The AI-facing [MCP server](#ai-facing-access-mcp-server) is a core dependency, bundled on every
+install — `tmap mcp` connects out of the box, no extra flag. (Not using uv? `pip install
+"git+https://github.com/JoeyZzZzZz/treasure-map.git"` pulls the same core set.)
 
 (The `git+…` URL is fetched with **git**, so make sure git is installed — `sudo apt install -y
 git`. Later: `uv tool upgrade treasure-map` / `uv tool uninstall treasure-map`.)
@@ -208,8 +207,8 @@ own judgement on a reproducible, cross-artifact substrate. It is **not** an arbi
 proxy: the value is the full, deterministically re-derivable structure plus the derived,
 evidence-backed review-ordering signals.
 
-The server ships in the optional `mcp` extra — installed already if you ran Step 4 with `--with
-mcp` (otherwise `uv tool upgrade treasure-map --with mcp`).
+The server is a core dependency — installed with Treasure Map on every install, so `tmap mcp`
+works out of the box with no extra flag.
 
 ```bash
 tmap mcp        # serve the most recent scan (no paths needed)

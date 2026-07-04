@@ -74,7 +74,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     callers may be an indirect call) instead of just the legal banner, which stays reachable via
     the `legal_notice` tool.
 
-- An AI-facing **MCP server** (`tmap mcp-serve`, optional `treasure-map[mcp]` extra) exposes the
+- An AI-facing **MCP server** (`tmap mcp`, a core dependency — the substrate's primary consumer,
+  bundled on every install) exposes the
   analysis knowledge base as read-only tools: `list_candidates` / `explain_candidate` (recall
   candidates + derived, evidence-backed review-ordering signals), `get_pseudocode`, `get_callees`,
   `get_xrefs`, `get_strings`, `get_imports_exports`, `get_script_callsites`, `get_components_cves`,

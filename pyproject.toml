@@ -26,17 +26,16 @@ dependencies = [
     "click>=8.1",
     "aiohttp>=3.9",
     "aiosqlite>=0.20",
+    # The AI-facing MCP server is the substrate's primary consumer entry point, not an add-on:
+    # `tmap mcp` must connect out of the box on any install, so its SDK is a core dependency
+    # (imported at module top level like every other core dep, never behind an extra).
+    "mcp>=1.0",
 ]
 
 [project.optional-dependencies]
 rag = [
     "chromadb>=0.5",
     "sentence-transformers>=3.0",
-]
-# The AI-facing MCP server. Optional: the analysis/CLI core does not require it, so the server
-# module imports `mcp` lazily and only `tmap mcp-serve` / the MCP entry point pulls it in.
-mcp = [
-    "mcp>=1.0",
 ]
 dev = [
     "pytest>=8.0",
@@ -45,7 +44,6 @@ dev = [
     "ruff>=0.4",
     "mypy>=1.10,<2.0",
     "types-PyYAML>=6.0",
-    "mcp>=1.0",
 ]
 
 [project.scripts]

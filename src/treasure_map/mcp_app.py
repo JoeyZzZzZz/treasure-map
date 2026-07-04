@@ -32,6 +32,8 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from mcp.server.fastmcp import FastMCP
+
 from treasure_map.lib import facts
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.notice import LEGAL_NOTICE
@@ -383,10 +385,8 @@ def build_server(analysis_db: Path | str, atlas_db: Path | str, run_id: str | No
     """Construct a FastMCP server exposing the fact tools bound to one workspace.
 
     The server's standing instructions are the agent workflow guide; the legal notice stays
-    reachable via the legal_notice tool. Imported lazily so the rest of the package does not
-    require the ``mcp`` dependency."""
-    from mcp.server.fastmcp import FastMCP
-
+    reachable via the legal_notice tool. ``mcp`` is a core dependency (the server is the
+    substrate's primary consumer), so FastMCP is imported at module top level, not lazily."""
     server = FastMCP("treasure-map", instructions=_AGENT_INSTRUCTIONS)
     for fn in make_tools(analysis_db, atlas_db, run_id).values():
         server.add_tool(fn)

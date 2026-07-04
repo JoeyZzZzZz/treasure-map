@@ -127,24 +127,13 @@ def mcp_serve(analysis_db: str | None, atlas_db: str | None) -> None:
     With no paths, serves the last `tmap scan`'s databases (recorded pointer). Launch this from an
     MCP client, not by hand — it speaks JSON-RPC on stdin/stdout.
     """
-    import sys
-
     analysis_db, atlas_db, run_id = _resolve_mcp_target(analysis_db, atlas_db)
-    try:
-        from treasure_map.mcp_app import build_server
+    # `mcp` is a core dependency, so build_server is imported like any other module. A missing
+    # `mcp` here means a corrupted install, not an unselected extra — let it surface as a normal
+    # ImportError (the same as a missing click/pyelftools), never a "go install the extra" hint.
+    from treasure_map.mcp_app import build_server
 
-        server = build_server(analysis_db, atlas_db, run_id)
-    except ModuleNotFoundError as exc:
-        # The `mcp` SDK is an optional extra; missing it should be a one-liner, not a traceback.
-        if exc.name and exc.name.split(".")[0] == "mcp":
-            click.echo(
-                "MCP support isn't installed. Install it with:  "
-                "uv tool install treasure-map --with mcp   "
-                '(or, with pip:  pip install "treasure-map[mcp]")',
-                err=True,
-            )
-            sys.exit(2)
-        raise
+    server = build_server(analysis_db, atlas_db, run_id)
     # Tell a human who ran this by hand what is happening — on stderr, so stdout stays clean
     # JSON-RPC for the client.
     click.echo(

@@ -75,21 +75,7 @@ def test_mcp_missing_pointer_is_friendly_error(
     assert "tmap scan" in str(exc.value)  # tells the user what to do, not a traceback
 
 
-# ── A3 / A4: missing-extra one-liner + stderr launch hint ────────────────────────────────
-
-
-def test_mcp_missing_extra_is_one_liner(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(mcp_cli, "_resolve_mcp_target", lambda a, x: ("a.db", "x.db", None))
-
-    def _raise(*_a: object, **_k: object) -> object:
-        raise ModuleNotFoundError("No module named 'mcp'", name="mcp")
-
-    import treasure_map.mcp_app as mcp_app
-
-    monkeypatch.setattr(mcp_app, "build_server", _raise)
-    r = CliRunner().invoke(main, ["mcp"])
-    assert r.exit_code == 2
-    assert "MCP support isn't installed" in r.stderr
+# ── A3: stderr launch hint (mcp is a core dep — no missing-extra path to test) ───────────
 
 
 def test_mcp_stderr_launch_hint(monkeypatch: pytest.MonkeyPatch) -> None:
