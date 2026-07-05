@@ -79,7 +79,11 @@ def test_exact_cross_binary_writers_and_readers(tmp_path: Path) -> None:
 
     assert res["found"] is True
     assert res["match"] == "exact"
-    assert res["completeness"] == "complete"  # no unresolved ops in the atlas
+    # both sides present + no unresolved -> no specific blind spot, but NEVER a bare "complete":
+    # wrapper-indirect access is structurally unresolved, so the graph is 'direct_only'.
+    assert res["completeness"] == "direct_only"
+    assert res["notes"] == []
+    assert "DIRECT nvram_get/set" in res["coverage"]  # standing boundary always stated
     assert [w["binary"] for w in res["writers"]] == ["rc"]
     assert [r["binary"] for r in res["readers"]] == ["httpd"]
     # write-side value source is parsed and surfaced (a controllability signal)
@@ -156,24 +160,51 @@ def test_unresolved_ops_drive_completeness_not_the_graph(tmp_path: Path) -> None
 
     # the unresolved ops are NOT attributed to sw_mode (they could touch any key)...
     assert [w["func"] for w in res["writers"]] == ["set_mode"]
-    # ...but they are exposed: the result is honestly marked possibly-incomplete with a count
+    # ...but they are exposed: the result is honestly marked possibly-incomplete with a count,
+    # and the dynamic-key note is kept SEPARATE from the wrapper-indirect note.
     assert res["completeness"] == "may_be_incomplete"
     assert res["unresolved_count"] == 2
-    assert "2 unresolved-key" in res["unresolved_note"]
+    dyn = [n for n in res["notes"] if "unresolved/dynamically-built" in n]
+    assert len(dyn) == 1 and "2 nvram ops" in dyn[0]
+    # sw_mode has a direct writer but no direct reader -> a distinct wrapper-indirect note fires
+    assert any("empty readers" in n and "wrapper" in n for n in res["notes"])
 
 
-def test_absent_key_with_no_unresolved_is_complete_and_not_found(tmp_path: Path) -> None:
+# ── the red line: empty readers/writers is NEVER "confirmed no consumer" ────────────
+
+
+def test_absent_key_is_never_confirmed_unused(tmp_path: Path) -> None:
+    # The oauth-code audit case: a key with no DIRECT reader must NOT read as "unused" — a wrapper
+    # could read it. No unresolved ops in the atlas, yet completeness stays may_be_incomplete and a
+    # note explicitly warns that absence is not proof, because wrapper-indirect access is uncaptured.
     atlas = _seed(tmp_path, [_flow("other_key", "constant", "rc", "f", "write")])
     conn = open_atlas(atlas)
     try:
-        res = get_nvram_key_flow(conn, "sw_mode")
+        res = get_nvram_key_flow(conn, "oauth_auth_code")
     finally:
         conn.close()
     assert res["found"] is False
     assert res["match"] == "none"
-    assert res["completeness"] == "complete"  # no unresolved ops -> absence is trustworthy
-    assert res["unresolved_count"] == 0
-    assert "unresolved_note" not in res
+    assert res["completeness"] == "may_be_incomplete"  # NOT "complete" — wrapper blind spot
+    assert res["unresolved_count"] == 0  # the caveat is NOT (mis)attributed to dynamic keys
+    wrapper_note = [n for n in res["notes"] if "wrapper" in n]
+    assert wrapper_note and "NOT proof the key is unused" in wrapper_note[0]
+    assert "does NOT mean the key is unused" in res["coverage"]
+
+
+def test_direct_writer_but_no_direct_reader_warns_wrapper(tmp_path: Path) -> None:
+    # A key written directly but read only via a wrapper: readers is empty, but the tool must warn
+    # that a wrapper reader is uncaptured — never letting readers:[] read as "no consumer".
+    atlas = _seed(tmp_path, [_flow("oauth_auth_code", "constant", "httpd", "save", "write")])
+    conn = open_atlas(atlas)
+    try:
+        res = get_nvram_key_flow(conn, "oauth_auth_code")
+    finally:
+        conn.close()
+    assert [w["binary"] for w in res["writers"]] == ["httpd"]
+    assert res["readers"] == []
+    assert res["completeness"] == "may_be_incomplete"
+    assert any("empty readers" in n and "not yet resolved" in n for n in res["notes"])
 
 
 # ── template-to-regex grammar (unit) ────────────────────────────────────────────────

@@ -133,14 +133,32 @@ def _entry(row: sqlite3.Row) -> dict[str, Any]:
     return entry
 
 
+# The standing coverage boundary of the key graph, stated on EVERY result so a consumer can never
+# read an empty writers/readers list as "confirmed no one touches this key". The extractor only
+# recognizes a DIRECT nvram_get/set call with a literal key; a key reached through a business
+# wrapper (a helper that internally calls nvram_get/set and forwards a caller-supplied key) is NOT
+# captured yet, and a dynamically-built key is a separate blind spot. This is the honesty red line
+# a real audit exposed: a key showed empty readers while a wrapper read it into a shell command
+# sink. Absence here means "no DIRECT call found", never "unused".
+COVERAGE_NOTE = (
+    "This key graph captures only DIRECT nvram_get/set calls with a literal key. A key reached "
+    "through a wrapper function (a helper that internally calls nvram_get/set) is NOT captured "
+    "here, and dynamically-built keys are a separate blind spot. Empty writers/readers means no "
+    "DIRECT call was found — it does NOT mean the key is unused; a wrapper may read or write it."
+)
+
+
 def get_nvram_key_flow(conn: sqlite3.Connection, key: str) -> dict[str, Any]:
     """Assemble the cross-binary read/write graph for one concrete nvram key.
 
-    Returns exact writers/readers (constant key match), a separate flagged template_matches list
-    (parametric templates the key satisfies), and a completeness flag driven by the count of
-    unresolved-key ops. ``found`` is False only when nothing — exact or template — references the
-    key; the completeness/unresolved fields are still populated so absence is never mistaken for
-    "the key is unused" when unresolved ops could reach it. A surfaced fact, never a verdict.
+    Returns exact writers/readers (constant key match) and a separate flagged template_matches list
+    (parametric templates the key satisfies). ``found`` is False only when nothing — exact or
+    template — DIRECTLY references the key. Every result carries ``coverage`` (the standing
+    boundary: direct calls only, wrapper-indirect not captured) and ``notes`` (the specific blind
+    spots that apply). ``completeness`` is never a bare "complete": empty writers/readers or
+    unresolved keys make it ``may_be_incomplete``, and even a populated graph is ``direct_only``
+    because wrapper-indirect access is not resolved. Absence is NEVER "the key is unused". A fact,
+    never a verdict.
     """
     exact_rows = conn.execute(
         "SELECT source_run_id, key, key_kind, binary, func, op, value_source, api "
@@ -177,6 +195,28 @@ def get_nvram_key_flow(conn: sqlite3.Connection, key: str) -> dict[str, Any]:
         match_state = "template"
     else:
         match_state = "none"
+    # Honest incompleteness — two DISTINCT blind spots, never conflated into one cause:
+    #  (1) wrapper-indirect: an empty writers/readers side is "no DIRECT call found", not proof of
+    #      no consumer — a wrapper reading/writing this key is invisible to the extractor.
+    #  (2) dynamic key: unresolved/dynamically-built keys could touch any key.
+    notes: list[str] = []
+    missing = [side for side, rows in (("writers", writers), ("readers", readers)) if not rows]
+    if missing:
+        notes.append(
+            f"empty {' and '.join(missing)}: no DIRECT nvram_get/set(literal) call was found, but "
+            "a wrapper function accessing this key is NOT captured by this graph — absence is NOT "
+            "proof the key is unused (wrapper-indirect nvram access is not yet resolved)"
+        )
+    if unresolved_count:
+        notes.append(
+            f"{unresolved_count} nvram ops have an unresolved/dynamically-built key "
+            "(key_from_caller) and could touch any key — a SEPARATE blind spot from "
+            "wrapper-indirect access above"
+        )
+    # completeness never claims a bare "complete": a populated direct graph is still only
+    # 'direct_only' (wrapper-indirect unresolved); any applicable blind spot -> 'may_be_incomplete'.
+    completeness = "may_be_incomplete" if notes else "direct_only"
+
     result: dict[str, Any] = {
         "key": key,
         "found": bool(writers or readers or template_matches),
@@ -185,13 +225,8 @@ def get_nvram_key_flow(conn: sqlite3.Connection, key: str) -> dict[str, Any]:
         "readers": readers,
         "template_matches": template_matches,
         "unresolved_count": unresolved_count,
+        "coverage": COVERAGE_NOTE,
+        "completeness": completeness,
+        "notes": notes,
     }
-    if unresolved_count:
-        result["completeness"] = "may_be_incomplete"
-        result["unresolved_note"] = (
-            f"{unresolved_count} unresolved-key nvram ops (key_from_caller) exist and could touch "
-            "any key; this key's writers/readers may be incomplete"
-        )
-    else:
-        result["completeness"] = "complete"
     return result

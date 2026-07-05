@@ -221,8 +221,13 @@ def test_get_nvram_key_flow_tool(tmp_path: Path) -> None:
     # an unresolved-key op exists -> the tool honestly flags possible incompleteness
     assert res["completeness"] == "may_be_incomplete"
     assert res["unresolved_count"] == 1
-    # a missing key still returns honestly (no fabrication)
-    assert tools["get_nvram_key_flow"]("no_such_key")["found"] is False
+    assert "DIRECT nvram_get/set" in res["coverage"]  # standing coverage boundary always present
+    # a missing key still returns honestly (no fabrication) AND never reads as "unused": the
+    # wrapper blind spot is stated so an empty result is not mistaken for "no consumer".
+    miss = tools["get_nvram_key_flow"]("no_such_key")
+    assert miss["found"] is False
+    assert miss["completeness"] == "may_be_incomplete"
+    assert any("wrapper" in n for n in miss["notes"])
 
 
 # ── list_candidates: anchored, entry-reach carried, derived-not-verdict note ────────
