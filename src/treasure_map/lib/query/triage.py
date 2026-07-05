@@ -222,6 +222,104 @@ def _sink_provenance_records(flow_evidence: str | None) -> list[dict[str, Any]]:
     return [r for r in prov if isinstance(r, dict)]
 
 
+# Vararg source kinds that are a CONFIRMED controllable origin (an attacker-influenceable value can
+# reach the format argument). external_input/multiple are included defensively for other firmwares /
+# upstream layers even though the current extractor emits call_return/param.
+_CONTROLLABLE_VARARG_KINDS = frozenset({"call_return", "param", "multiple", "external_input"})
+# printf conversions that consume a POINTER argument (the value is an address, its pointee unknown).
+_STRING_PTR_CONVERSIONS = frozenset({"s", "p"})
+
+
+def _is_hex_literal(value: Any) -> bool:
+    """True if ``value`` is a 0x-form hex literal string (e.g. "0x432f"). Belt-and-suspenders for
+    provenance produced before the extractor emitted value_kind: a bare 0x value is ambiguous."""
+    if not isinstance(value, str) or len(value) <= 2 or value[:2].lower() != "0x":
+        return False
+    return all(c in "0123456789abcdefABCDEF" for c in value[2:])
+
+
+def _is_ambiguous_0x(source: dict[str, Any]) -> bool:
+    """True if a constant source's value is an ambiguous 0x — the extractor confirmed a constant
+    value 0x… but could NOT tell an integer literal from a pointer address (DataType unavailable:
+    a two-firmware probe found 0 pointers over 13162 such constants). Trusts the extractor's
+    ``value_kind`` when present; falls back to detecting a bare 0x value for older provenance."""
+    vk = source.get("value_kind")
+    if vk == "ambiguous_0x":
+        return True
+    if vk == "literal_string":
+        return False
+    return _is_hex_literal(source.get("value"))
+
+
+def _conversion_char(spec: Any) -> str | None:
+    """The conversion character of a spec like "%s"/"%ld"/"%d" (the last letter), or None."""
+    if not isinstance(spec, str):
+        return None
+    for ch in reversed(spec):
+        if ch.isalpha():
+            return ch.lower()
+    return None
+
+
+def _classify_vararg(vararg: Any) -> str:
+    """Classify ONE format vararg as 'controllable' | 'const' | 'unknown' — spec-precise, honest
+    about the boundary: anything not CONFIRMED constant or CONFIRMED controllable is 'unknown',
+    never silently folded into constant. An ambiguous_0x constant is judged BY THE SPEC (the
+    reliable oracle): an integer conversion pins it to a known integer literal; a %s/%p leaves it a
+    constant pointer whose pointee is unknown; no spec leaves it undetermined. See below."""
+    source = vararg.get("source") if isinstance(vararg, dict) else None
+    source = source if isinstance(source, dict) else {}
+    kind = source.get("kind")
+    if kind in _CONTROLLABLE_VARARG_KINDS:
+        return "controllable"
+    if kind != "constant":
+        # unresolved / indirect_unresolved / stack_buf / missing / None / anything unconfirmed:
+        # not pinned to a known literal -> honest "unknown", never assumed constant.
+        return "unknown"
+    if not _is_ambiguous_0x(source):
+        return "const"  # a confirmed literal-string constant (value known, not controllable)
+    # ambiguous_0x: the SPEC, not the value, decides what the 0x means (the red line).
+    conv = _conversion_char(vararg.get("spec"))
+    if conv is None or conv in _STRING_PTR_CONVERSIONS:
+        # %s/%p -> constant POINTER, pointee unknown -> unknown; no spec -> cannot disambiguate.
+        return "unknown"
+    # %d/%x/%u/%i/%c/%o/... -> a by-value spec: the 0x is a KNOWN integer literal (e.g. 0x432f).
+    return "const"
+
+
+def _fmt_args_provenance(fmt: Any, varargs: Any) -> str:
+    """Three-state, spec-precise verdict on the format arguments of the nearest dominating writer:
+
+    - ``all_constant``   — every vararg is a CONFIRMED literal constant (a known literal string, or
+      an ambiguous_0x pinned to an integer literal by an integer spec), or the fmt consumes no
+      arguments at all. Asserts only that the format arguments introduce no CONTROLLABLE injection
+      (format-string / command injection); it does NOT assert the command is safe under other threat
+      models (a controllable integer's overflow/length issues land in has_controllable, not here).
+      Read as "arguments not controllable, no injection surface", not "harmless".
+    - ``has_controllable`` — at least one vararg is a confirmed controllable source (call_return /
+      param / multiple / external_input): a real controllable injection surface.
+    - ``undetermined``   — at least one vararg cannot be confirmed constant AND none is confirmed
+      controllable: an untraceable source (unresolved/stack_buf/missing), an ambiguous_0x under a
+      %s/%p or with no spec (a constant pointer, pointee unknown), or an arity shortfall (fewer
+      varargs extracted than the fmt consumes). An honest "don't know", never coerced to yes/no.
+
+    tmap is a data substrate: each state is a FACT, never a guess, and never a score input.
+    Precedence has_controllable > undetermined > all_constant — a confirmed controllable arg is the
+    actionable headline even if another arg is also undetermined."""
+    varargs = varargs if isinstance(varargs, list) else []
+    classes = [_classify_vararg(va) for va in varargs]
+    # Arity shortfall: the fmt consumes more args than were extracted -> the missing ones are
+    # unknown. Never conclude "all constant" on incomplete data.
+    arity = _fmt_arity(fmt) if isinstance(fmt, str) else 0
+    if len(varargs) < arity:
+        classes.append("unknown")
+    if "controllable" in classes:
+        return "has_controllable"
+    if "unknown" in classes:
+        return "undetermined"
+    return "all_constant"
+
+
 def _sink_provenance_summary(flow_evidence: str | None) -> tuple[dict[str, Any], ...]:
     """Per-sink summary of sink_arg_provenance (summary-first: the FULL writer/vararg detail is
     fetched on demand via ``get_sink_provenance``, so a multi-sink candidate never blows the token
@@ -261,6 +359,12 @@ def _sink_provenance_summary(flow_evidence: str | None) -> tuple[dict[str, Any],
                 for w in writers:
                     if isinstance(w, dict) and w.get("writer") == ndw and w.get("fmt") is not None:
                         summary["nearest_dominating_writer_fmt"] = w.get("fmt")
+                        # Three-state, spec-precise: are the inlined command's format arguments
+                        # constant / controllable / undetermined? Lets the agent judge the args'
+                        # controllability without fetching the full writer detail.
+                        summary["fmt_args_provenance"] = _fmt_args_provenance(
+                            w.get("fmt"), w.get("varargs")
+                        )
                         break
         out.append(summary)
     return tuple(out)

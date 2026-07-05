@@ -14,12 +14,17 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import InstanceRow
 from treasure_map.lib.atlas.writer import add_instance, upsert_pattern
 from treasure_map.lib.query import explain_candidate, get_sink_provenance
-from treasure_map.lib.query.triage import _fmt_arity, _sink_provenance_summary
+from treasure_map.lib.query.triage import (
+    _fmt_args_provenance,
+    _fmt_arity,
+    _sink_provenance_summary,
+)
 
 # One representative record per source kind (the JSON contract ExportFunctions emits).
 _PROV = [
@@ -179,6 +184,7 @@ def test_explain_summary_one_entry_per_sink_and_compact(tmp_path: Path) -> None:
                 "dominating_writer_count",
                 "nearest_dominating_writer",
                 "nearest_dominating_writer_fmt",
+                "fmt_args_provenance",
             }
         )
         assert "writers" not in s
@@ -411,3 +417,113 @@ def test_fmt_arity_counts_conversions_and_star_args() -> None:
     assert _fmt_arity("%*d") == 2  # width from an argument + the value
     assert _fmt_arity("plain text") == 0
     assert _fmt_arity("%05.2f %-10s") == 2
+
+
+# ── fmt_args_provenance: three-state, spec-precise, value_kind-aware ───────────
+
+
+def _lit(value: str, spec: str = "%s") -> dict[str, Any]:  # confirmed literal-string constant
+    src = {"kind": "constant", "value": value, "value_kind": "literal_string"}
+    return {"spec": spec, "source": src}
+
+
+def _amb(spec: str, value: str = "0x432f") -> dict[str, Any]:  # ambiguous_0x constant
+    src = {"kind": "constant", "value": value, "value_kind": "ambiguous_0x"}
+    return {"spec": spec, "source": src}
+
+
+def _src(kind: str, spec: str = "%s") -> dict[str, Any]:  # a vararg of a given source kind
+    return {"spec": spec, "source": {"kind": kind}}
+
+
+def test_fmt_args_all_literal_strings_is_all_constant() -> None:
+    assert _fmt_args_provenance("%s to %s", [_lit("wl"), _lit("down")]) == "all_constant"
+
+
+def test_fmt_args_no_varargs_is_all_constant() -> None:
+    assert _fmt_args_provenance("reboot now", []) == "all_constant"
+
+
+def test_fmt_args_controllable_kinds() -> None:
+    assert _fmt_args_provenance("%s", [_src("call_return")]) == "has_controllable"
+    assert _fmt_args_provenance("run %s", [_src("param")]) == "has_controllable"
+
+
+def test_fmt_args_unresolved_and_stack_buf_are_undetermined() -> None:
+    assert _fmt_args_provenance("%s", [_src("unresolved")]) == "undetermined"
+    assert _fmt_args_provenance("%s", [_src("stack_buf")]) == "undetermined"
+
+
+def test_fmt_args_ambiguous0x_under_integer_spec_is_constant() -> None:
+    # %d + ambiguous_0x = a known INTEGER literal (value pinned by the spec) -> constant.
+    # The acceptance case: 0x432f under %d must NOT flip the verdict to undetermined.
+    assert (
+        _fmt_args_provenance("[%s:(%d)]", [_lit("handle_notifications"), _amb("%d", "0x432f")])
+        == "all_constant"
+    )
+    assert _fmt_args_provenance("%x", [_amb("%x", "0xf002")]) == "all_constant"
+
+
+def test_fmt_args_ambiguous0x_under_string_spec_is_undetermined() -> None:
+    # %s + ambiguous_0x = a constant POINTER, pointee unknown -> undetermined (the red line).
+    assert _fmt_args_provenance("%s", [_amb("%s", "0x1525f0")]) == "undetermined"
+
+
+def test_fmt_args_ambiguous0x_with_no_spec_is_undetermined() -> None:
+    # no spec context to disambiguate int-vs-pointer -> honest undetermined, never assumed safe.
+    va = {"source": {"kind": "constant", "value": "0x1234", "value_kind": "ambiguous_0x"}}
+    assert _fmt_args_provenance("%s and more", [va]) == "undetermined"
+
+
+def test_fmt_args_arity_shortfall_is_undetermined() -> None:
+    assert _fmt_args_provenance("%s and %s", [_lit("only_one")]) == "undetermined"
+
+
+def test_fmt_args_controllable_wins_over_undetermined() -> None:
+    assert _fmt_args_provenance("%s %s", [_src("param"), _src("unresolved")]) == "has_controllable"
+
+
+def test_fmt_args_missing_source_is_undetermined() -> None:
+    assert _fmt_args_provenance("%s", [{"spec": "%s"}]) == "undetermined"
+
+
+def test_fmt_args_bare_0x_without_value_kind_falls_back() -> None:
+    # provenance produced BEFORE the extractor emitted value_kind: a bare 0x value is still treated
+    # as ambiguous by the fallback, so old data is judged honestly too.
+    amb_d = {"spec": "%d", "source": {"kind": "constant", "value": "0x432f"}}  # no value_kind
+    amb_s = {"spec": "%s", "source": {"kind": "constant", "value": "0x1525f0"}}  # no value_kind
+    assert _fmt_args_provenance("%d", [amb_d]) == "all_constant"  # %d -> integer
+    assert _fmt_args_provenance("%s", [amb_s]) == "undetermined"  # %s -> pointer, unknown
+
+
+def test_get_sink_provenance_detail_surfaces_value_kind(tmp_path: Path) -> None:
+    # Part 3 honesty: the detail view must pass value_kind through, so an agent reading a vararg's
+    # source sees "this 0x is int-or-pointer undecided", not a bare constant it misreads as certain.
+    prov = [
+        {
+            "sink_idx": 0,
+            "sink": "system",
+            "sink_addr": "0x100",
+            "arg_idx": 0,
+            "provenance": {
+                "kind": "stack_buf",
+                "nearest_dominating_writer": "snprintf@0xa0",
+                "writers": [
+                    {
+                        "writer": "snprintf@0xa0",
+                        "dominates_sink": True,
+                        "fmt": "[%d]",
+                        "varargs": [_amb("%d", "0x432f")],
+                    }
+                ],
+            },
+        }
+    ]
+    atlas = _seed(tmp_path, provenance=prov, ref="run_x#fn7@cmd")
+    conn = open_atlas(atlas)
+    try:
+        detail = get_sink_provenance(conn, "run_x#fn7@cmd", 0)
+    finally:
+        conn.close()
+    va = detail["record"]["provenance"]["writers"][0]["varargs"][0]
+    assert va["source"]["value_kind"] == "ambiguous_0x"  # not stripped — the limitation is visible

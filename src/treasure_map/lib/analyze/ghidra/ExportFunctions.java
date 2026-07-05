@@ -245,11 +245,7 @@ public class ExportFunctions extends GhidraScript {
     private String classify(Varnode v, PcodeOpAST sink, List<PcodeOpAST> ops, DomCtx dom, int depth) {
         if (v == null) return "{\"kind\":\"unresolved\",\"note\":\"null_varnode\"}";
         if (depth > PROV_MAX_DEPTH) return "{\"kind\":\"unresolved\",\"truncated\":true}";
-        if (v.isConstant()) {
-            String t = constText(v);
-            if (t != null) return "{\"kind\":\"constant\",\"value\":\"" + esc(t) + "\"}";
-            return "{\"kind\":\"constant\",\"value\":\"0x" + Long.toHexString(v.getOffset()) + "\"}";
-        }
+        if (v.isConstant()) return constNode(v);
         PcodeOp def = v.getDef();
         if (def == null) {
             HighVariable hv = v.getHigh();
@@ -342,6 +338,22 @@ public class ExportFunctions extends GhidraScript {
             default:
                 return null;
         }
+    }
+
+    // Honest constant record. A readable literal string is a CONFIRMED real constant
+    // (value_kind:"literal_string"). A bare 0x that no string reads out of is value_kind:
+    // "ambiguous_0x": Ghidra confirms this is a constant value 0x… but CANNOT tell an integer literal
+    // from a pointer address — a two-firmware DataType probe found 0 pointers over 13162 such
+    // constants (type unavailable here). Report what is certain (it IS a constant, value 0x…) and
+    // flag what is NOT (integer vs pointer undecided). A consumer WITH spec/type context (%d=integer,
+    // %s=pointer) must judge by it; a consumer WITHOUT such context must treat it as undetermined,
+    // NEVER as a safe constant.
+    private String constNode(Varnode v) {
+        String t = constText(v);
+        if (t != null)
+            return "{\"kind\":\"constant\",\"value\":\"" + esc(t) + "\",\"value_kind\":\"literal_string\"}";
+        return "{\"kind\":\"constant\",\"value\":\"0x" + Long.toHexString(v.getOffset())
+             + "\",\"value_kind\":\"ambiguous_0x\"}";
     }
 
     // stack_buf: writer set (stackKey equal-match) + sound CHK-dominance ordering (the provenance design, gap ①).
@@ -466,11 +478,7 @@ public class ExportFunctions extends GhidraScript {
     private String shallowSource(Varnode v, int depth) {
         if (v == null) return "{\"kind\":\"unresolved\",\"note\":\"null\"}";
         if (depth > PROV_MAX_DEPTH) return "{\"kind\":\"unresolved\",\"truncated\":true}";
-        if (v.isConstant()) {
-            String t = constText(v);
-            if (t != null) return "{\"kind\":\"constant\",\"value\":\"" + esc(t) + "\"}";
-            return "{\"kind\":\"constant\",\"value\":\"0x" + Long.toHexString(v.getOffset()) + "\"}";
-        }
+        if (v.isConstant()) return constNode(v);
         PcodeOp def = v.getDef();
         if (def == null) {
             HighVariable hv = v.getHigh();
