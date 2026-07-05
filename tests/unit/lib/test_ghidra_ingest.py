@@ -330,8 +330,14 @@ def test_ingest_missing_nvram_ops_defaults_empty(tmp_path: Path) -> None:
         "a" * 64,
         {
             "functions": [
-                {"name": "f", "address": "1000", "size": 8, "is_exported": 0,
-                 "callees": [], "pseudocode": "x"}
+                {
+                    "name": "f",
+                    "address": "1000",
+                    "size": 8,
+                    "is_exported": 0,
+                    "callees": [],
+                    "pseudocode": "x",
+                }
             ],
             "imports": [],
             "exports": [],
