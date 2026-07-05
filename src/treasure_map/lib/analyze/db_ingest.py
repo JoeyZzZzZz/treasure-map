@@ -19,6 +19,7 @@ def ingest_elfs(
     records: list[ElfRecord],
     *,
     reanalyze: str | None = None,
+    pass_version: str | None = None,
 ) -> tuple[dict[str, int], set[str]]:
     """Ingest ELF records into the binaries table.
 
@@ -30,11 +31,16 @@ def ingest_elfs(
     a name or path re-runs only the matching binary. It is the escape hatch for a binary frozen in
     a bad cached state.
 
+    ``pass_version`` is the current extraction-pass content hash. When given, a prior-done row whose
+    stored pass_version differs (or is NULL, i.e. unknown) is treated as NOT done, so editing the
+    Ghidra pass re-extracts every binary automatically without any manual JSON/db deletion. When
+    None (callers that do not track the pass), only sha256 / ghidra_ok gate the cache, as before.
+
     Returns:
         sha_to_id:  sha256 → binaries.id for all records in this scan
         dirty_shas: sha256 values that need Ghidra analysis — new rows, rows not yet marked usable
-                    (ghidra_ok=0), rows force-selected by ``reanalyze``, or rows that claim to be
-                    done but hold 0 functions despite carrying real code (the self-heal below)
+                    (ghidra_ok=0), rows whose stored pass_version is stale, rows force-selected by
+                    ``reanalyze``, or rows that claim done but hold 0 functions despite real code
     """
     scan_timestamp = datetime.now(UTC).isoformat()
     shas = [r.sha256 for r in records]
@@ -42,12 +48,21 @@ def ingest_elfs(
 
     # Step 1: find which sha256 are already analyzed (a usable prior run: ghidra_ok=1, i.e. ok or
     # ok_empty). ghidra_status='failed' keeps ghidra_ok=0, so a failed run is never "already done".
+    # When a pass_version is supplied, a row produced by a DIFFERENT pass (or an unknown/NULL one)
+    # is excluded here so it re-dirties — the extraction logic is a cache-key dimension too.
     already_done: set[str] = set()
     if shas:
-        done_rows = conn.execute(
-            f"SELECT sha256 FROM binaries WHERE sha256 IN ({ph}) AND ghidra_ok = 1",
-            shas,
-        ).fetchall()
+        if pass_version is None:
+            done_rows = conn.execute(
+                f"SELECT sha256 FROM binaries WHERE sha256 IN ({ph}) AND ghidra_ok = 1",
+                shas,
+            ).fetchall()
+        else:
+            done_rows = conn.execute(
+                f"SELECT sha256 FROM binaries WHERE sha256 IN ({ph}) AND ghidra_ok = 1 "  # noqa: S608
+                "AND COALESCE(pass_version, '') = ?",
+                [*shas, pass_version],
+            ).fetchall()
         already_done = {row["sha256"] for row in done_rows}
 
     # Step 1a: --reanalyze escape hatch — drop force-selected shas so they re-run.

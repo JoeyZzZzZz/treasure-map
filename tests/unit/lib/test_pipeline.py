@@ -57,6 +57,7 @@ def _mock_runner(run_all_return: list[GhidraResult] | None = None) -> MagicMock:
     runner = MagicMock()
     runner.get_headless.return_value = Path("/fake/headless")
     runner.run_all.return_value = run_all_return or []
+    runner.pass_version.return_value = "testpass"  # real str: stamped into binaries.pass_version
     return runner
 
 

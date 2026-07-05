@@ -8,6 +8,7 @@ Single-binary wrapper: GhidraRunner.run_ghidra().  Parallel dispatch: run_all().
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -78,6 +79,30 @@ ProgressCallback = Callable[[str, dict[str, Any]], None]
 
 _SCRIPT_DIR = Path(__file__).parent / "ghidra"
 _GHIDRA_RELEASES_URL = "https://github.com/NationalSecurityAgency/ghidra/releases"
+
+
+def compute_pass_version(script_dir: Path) -> str:
+    """Content hash of the Ghidra extraction pass — every .java in the script dir (ExportFunctions
+    plus any sibling).
+
+    This is a cache-key dimension: the per-binary Ghidra output depends on the pass logic as much as
+    on the binary bytes, so editing the pass must invalidate the cache and re-extract automatically
+    (no manual JSON/db deletion). A missing/unreadable script dir yields a stable sentinel so a scan
+    still runs (and treats everything as needing a first extraction) rather than crashing."""
+    h = hashlib.sha256()
+    try:
+        scripts = sorted(script_dir.glob("*.java"))
+    except OSError:
+        scripts = []
+    for p in scripts:
+        try:
+            body = p.read_bytes()
+        except OSError:
+            continue
+        h.update(p.name.encode("utf-8"))
+        h.update(b"\0")
+        h.update(body)
+    return h.hexdigest()[:16]
 
 
 @dataclass
@@ -345,6 +370,10 @@ class GhidraRunner:
         if self._headless is None:
             self._headless = find_headless(self._config)
         return self._headless
+
+    def pass_version(self) -> str:
+        """Content hash of the extraction pass this runner will execute (its script dir's .java)."""
+        return compute_pass_version(self._script_dir)
 
     def run_ghidra(
         self,

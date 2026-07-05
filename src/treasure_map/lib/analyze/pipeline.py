@@ -90,6 +90,10 @@ async def run_analyze(
     runner = GhidraRunner(config.ghidra)
     runner.get_headless()
 
+    # Content hash of the extraction pass: a cache-key dimension alongside sha256, so editing
+    # ExportFunctions re-extracts every binary automatically (no manual JSON/db deletion).
+    pass_version = runner.pass_version()
+
     records = scan_filesystem(fs_root, progress_callback=progress_callback)
 
     conn = open_db(workspace.db_path)
@@ -101,7 +105,9 @@ async def run_analyze(
     xref_stats = XrefStats()
     nb_stats = NonBinaryStats()
     try:
-        sha_to_id, dirty_shas = ingest_elfs(conn, records, reanalyze=reanalyze)
+        sha_to_id, dirty_shas = ingest_elfs(
+            conn, records, reanalyze=reanalyze, pass_version=pass_version
+        )
         dirty_records = [r for r in records if r.sha256 in dirty_shas]
 
         logger.info(
@@ -127,10 +133,19 @@ async def run_analyze(
                 # ★ Red-line: persist the tri-state outcome. ghidra_ok stays a 0/1 usability flag
                 # (ok/ok_empty -> 1) for back-compat; ghidra_status records WHICH of the three, so a
                 # failed run is visibly not "clean" (ghidra_ok=0) and is retried next run.
-                conn.execute(
-                    "UPDATE binaries SET ghidra_ok=?, ghidra_status=? WHERE sha256=?",
-                    (1 if res.success else 0, res.analysis_status, rec.sha256),
-                )
+                # Stamp the pass_version that produced this output, but ONLY on success: a failed
+                # run leaves pass_version untouched (still stale/NULL) so it stays dirty next time.
+                if res.success:
+                    conn.execute(
+                        "UPDATE binaries SET ghidra_ok=?, ghidra_status=?, pass_version=? "
+                        "WHERE sha256=?",
+                        (1, res.analysis_status, pass_version, rec.sha256),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE binaries SET ghidra_ok=?, ghidra_status=? WHERE sha256=?",
+                        (0, res.analysis_status, rec.sha256),
+                    )
                 if res.success:
                     ghidra_ok += 1
                 else:

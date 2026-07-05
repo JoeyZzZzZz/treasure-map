@@ -16,6 +16,7 @@ from treasure_map.lib.analyze.ghidra_runner import (
     _build_cmd,
     _classify_analysis,
     _patch_elf_for_ghidra,
+    compute_pass_version,
     find_headless,
 )
 from treasure_map.lib.config.config import GhidraConfig, GhidraLocalConfig
@@ -455,3 +456,46 @@ def test_patch_elf_patched_file_has_same_name(tmp_path: Path) -> None:
         assert patched_file.exists()
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ── Fix A: extraction-pass content hash (cache-key dimension) ─────────────────
+
+
+def test_compute_pass_version_changes_when_pass_edited(tmp_path: Path) -> None:
+    # Editing the extraction pass must change its content hash so the cache re-dirties. Even a
+    # one-character comment change flips the hash (content hash, not a hand-bumped constant).
+    d = tmp_path / "scripts"
+    d.mkdir()
+    java = d / "ExportFunctions.java"
+    java.write_text("// v1\nclass ExportFunctions {}\n")
+    v1 = compute_pass_version(d)
+    java.write_text("// v2 (one comment char changed)\nclass ExportFunctions {}\n")
+    v2 = compute_pass_version(d)
+    assert v1 != v2
+    # stable: recomputing over identical content yields the same hash (deterministic cache key)
+    java.write_text("// v1\nclass ExportFunctions {}\n")
+    assert compute_pass_version(d) == v1
+
+
+def test_compute_pass_version_covers_sibling_scripts(tmp_path: Path) -> None:
+    # A helper .java added beside ExportFunctions changes the pass too, so it is part of the hash.
+    d = tmp_path / "scripts"
+    d.mkdir()
+    (d / "ExportFunctions.java").write_text("class ExportFunctions {}\n")
+    base = compute_pass_version(d)
+    (d / "Helper.java").write_text("class Helper {}\n")
+    assert compute_pass_version(d) != base
+
+
+def test_compute_pass_version_missing_dir_is_stable(tmp_path: Path) -> None:
+    # A missing script dir yields a stable sentinel (never raises) so a scan still runs.
+    missing = tmp_path / "nope"
+    assert compute_pass_version(missing) == compute_pass_version(missing)
+
+
+def test_runner_pass_version_matches_its_script_dir(tmp_path: Path) -> None:
+    d = tmp_path / "scripts"
+    d.mkdir()
+    (d / "ExportFunctions.java").write_text("class ExportFunctions {}\n")
+    runner = GhidraRunner(GhidraConfig(), script_dir=d, headless=tmp_path / "hl")
+    assert runner.pass_version() == compute_pass_version(d)

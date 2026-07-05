@@ -300,6 +300,79 @@ def test_ingest_skips_already_done_in_dirty_set(tmp_path: Path) -> None:
     conn.close()
 
 
+def _mark_done_with_pass_version(conn: sqlite3.Connection, sha: str, pv: str) -> None:
+    conn.execute(
+        "UPDATE binaries SET ghidra_ok=1, ghidra_status='ok', pass_version=? WHERE sha256=?",
+        (pv, sha),
+    )
+    conn.commit()
+
+
+def test_ingest_pass_version_unchanged_stays_cached(tmp_path: Path) -> None:
+    # Fix A: a binary analyzed by the CURRENT pass is a cache hit — normal incremental scans stay
+    # fast when the extraction pass has not changed.
+    conn = open_db(tmp_path / "analysis.db")
+    rec = _make_record("httpd", "deadbeef")
+    ingest_elfs(conn, [rec], pass_version="passv1")
+    _mark_done_with_pass_version(conn, "deadbeef", "passv1")
+
+    _, dirty = ingest_elfs(conn, [rec], pass_version="passv1")
+    assert "deadbeef" not in dirty  # same pass -> skip (no re-extraction)
+    conn.close()
+
+
+def test_ingest_pass_version_change_redirties_without_deletion(tmp_path: Path) -> None:
+    # Fix A core: editing the extraction pass (new pass_version) re-dirties an already-done binary
+    # even though sha256 and ghidra_ok are unchanged — no manual JSON/db deletion needed.
+    conn = open_db(tmp_path / "analysis.db")
+    rec = _make_record("httpd", "deadbeef")
+    ingest_elfs(conn, [rec], pass_version="passv1")
+    _mark_done_with_pass_version(conn, "deadbeef", "passv1")
+
+    _, dirty = ingest_elfs(conn, [rec], pass_version="passv2")
+    assert "deadbeef" in dirty  # pass changed -> re-extract automatically
+    conn.close()
+
+
+def test_ingest_null_pass_version_redirties_once(tmp_path: Path) -> None:
+    # Upgrade path: a row analyzed before Fix A has pass_version=NULL ("unknown pass"), so the first
+    # pass-aware scan re-extracts it once; after it is stamped, the same pass is a cache hit.
+    conn = open_db(tmp_path / "analysis.db")
+    rec = _make_record("httpd", "deadbeef")
+    ingest_elfs(conn, [rec])  # legacy call: no pass_version -> stored NULL
+    conn.execute("UPDATE binaries SET ghidra_ok=1, ghidra_status='ok' WHERE sha256='deadbeef'")
+    conn.commit()
+
+    _, dirty1 = ingest_elfs(conn, [rec], pass_version="passv1")
+    assert "deadbeef" in dirty1  # NULL != current -> one-time re-extraction
+
+    _mark_done_with_pass_version(conn, "deadbeef", "passv1")
+    _, dirty2 = ingest_elfs(conn, [rec], pass_version="passv1")
+    assert "deadbeef" not in dirty2  # now stamped -> cached
+
+
+def test_migration_adds_pass_version_to_old_db(tmp_path: Path) -> None:
+    # Fix A upgrade path: a binaries table predating pass_version must gain it on open (schema.sql +
+    # _ADDED_COLUMNS both changed), preserving existing rows.
+    db_path = tmp_path / "legacy.db"
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "CREATE TABLE binaries (id INTEGER PRIMARY KEY, name TEXT, sha256 TEXT UNIQUE, "
+        "ghidra_ok INTEGER NOT NULL DEFAULT 0)"
+    )
+    raw.execute("INSERT INTO binaries (id, name, sha256, ghidra_ok) VALUES (1, 'httpd', 'ab', 1)")
+    raw.commit()
+    raw.close()
+    conn = open_db(db_path)  # triggers the additive migration
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(binaries)")}
+        assert "pass_version" in cols
+        row = conn.execute("SELECT name, pass_version FROM binaries WHERE id = 1").fetchone()
+        assert row["name"] == "httpd" and row["pass_version"] is None  # back-fills NULL
+    finally:
+        conn.close()
+
+
 _DB_INGEST = "treasure_map.lib.analyze.db_ingest.has_substantial_text"
 
 

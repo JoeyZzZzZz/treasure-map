@@ -22,6 +22,9 @@ CREATE TABLE IF NOT EXISTS binaries (
     size_bytes   INTEGER DEFAULT 0,        -- ELF 文件大小 (bytes)
     ghidra_ok    INTEGER NOT NULL DEFAULT 0, -- Round 2 partial-invalidation flag (1 = usable output)
     ghidra_status TEXT,                    -- tri-state analysis outcome: ok / ok_empty / failed / NULL
+    pass_version TEXT,                     -- content hash of the ExportFunctions pass that produced
+                                           --   this row's output; a mismatch re-dirties it so a pass
+                                           --   edit re-extracts automatically (no manual JSON delete)
     last_seen_at DATETIME,                 -- timestamp of most recent ingest scan
     analyzed_at  DATETIME DEFAULT CURRENT_TIMESTAMP
 );
