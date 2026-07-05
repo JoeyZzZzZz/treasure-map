@@ -176,7 +176,7 @@ def test_unresolved_ops_drive_completeness_not_the_graph(tmp_path: Path) -> None
 def test_absent_key_is_never_confirmed_unused(tmp_path: Path) -> None:
     # The oauth-code audit case: a key with no DIRECT reader must NOT read as "unused" — a wrapper
     # could read it. No unresolved ops in the atlas, yet completeness stays may_be_incomplete and a
-    # note explicitly warns that absence is not proof, because wrapper-indirect access is uncaptured.
+    # note warns that absence is not proof (wrapper-indirect access is uncaptured).
     atlas = _seed(tmp_path, [_flow("other_key", "constant", "rc", "f", "write")])
     conn = open_atlas(atlas)
     try:
