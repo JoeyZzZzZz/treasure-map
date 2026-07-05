@@ -276,3 +276,68 @@ def test_ingest_replaces_existing_rows(tmp_path: Path) -> None:
     assert len(rows) == 1
     assert rows[0]["pseudocode"] == "v2"
     conn.close()
+
+
+def test_ingest_persists_nvram_ops(tmp_path: Path) -> None:
+    """gap② transport: a function's nvram_ops array round-trips into the column verbatim."""
+    conn, sha_to_id = _setup_db(tmp_path)
+    output_dir = tmp_path / "ghidra_output"
+    ops = [
+        {
+            "api": "nvram_set",
+            "op": "write",
+            "key": "sw_mode",
+            "key_kind": "constant",
+            "value_source": {"kind": "param", "name": "param_2"},
+        },
+        {"api": "nvram_commit", "op": "commit"},
+    ]
+    _write_ghidra_json(
+        output_dir,
+        "test_bin",
+        "a" * 64,
+        {
+            "functions": [
+                {
+                    "name": "set_mode",
+                    "address": "1000",
+                    "size": 64,
+                    "is_exported": 0,
+                    "callees": [],
+                    "pseudocode": "void set_mode(){}",
+                    "nvram_ops": ops,
+                }
+            ],
+            "imports": [],
+            "exports": [],
+            "strings": [],
+        },
+    )
+    ingest_ghidra_output(conn, output_dir, [_make_record("test_bin", "a" * 64)], sha_to_id)
+
+    stored = conn.execute("SELECT nvram_ops FROM functions").fetchone()["nvram_ops"]
+    assert json.loads(stored) == ops
+    conn.close()
+
+
+def test_ingest_missing_nvram_ops_defaults_empty(tmp_path: Path) -> None:
+    """A function exported before nvram_ops existed (key absent) ingests as '[]', never null."""
+    conn, sha_to_id = _setup_db(tmp_path)
+    output_dir = tmp_path / "ghidra_output"
+    _write_ghidra_json(
+        output_dir,
+        "test_bin",
+        "a" * 64,
+        {
+            "functions": [
+                {"name": "f", "address": "1000", "size": 8, "is_exported": 0,
+                 "callees": [], "pseudocode": "x"}
+            ],
+            "imports": [],
+            "exports": [],
+            "strings": [],
+        },
+    )
+    ingest_ghidra_output(conn, output_dir, [_make_record("test_bin", "a" * 64)], sha_to_id)
+    assert conn.execute("SELECT nvram_ops FROM functions").fetchone()["nvram_ops"] == "[]"
+    conn.close()

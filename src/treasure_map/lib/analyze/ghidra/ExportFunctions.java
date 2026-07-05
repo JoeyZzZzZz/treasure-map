@@ -77,6 +77,40 @@ public class ExportFunctions extends GhidraScript {
         "strtok", "strtok_r", "strsep", "sscanf"));
     private static final int PROV_MAX_DEPTH = 2;   // vararg / nested-source recursion cap (the provenance design)
 
+    // ---- gap② nvram op lexicon (measured on real firmware: 6 APIs = 98% of calls, + pf family +
+    // long tail; missing one = a missed key = a false negative, so the tail is included). Per API:
+    //   op    read / write / commit / getall
+    //   keyIdx  0-based arg holding the key (-1 = whole-store op, no key: commit/getall)
+    //   nameIdx pf family only — the composite key is prefix(keyIdx)+name(nameIdx); -1 otherwise
+    //   valIdx  write value arg (-1 = key-only write like unset, or a read)
+    private static final class NvSpec {
+        final String op; final int keyIdx, nameIdx, valIdx;
+        NvSpec(String op, int keyIdx, int nameIdx, int valIdx) {
+            this.op = op; this.keyIdx = keyIdx; this.nameIdx = nameIdx; this.valIdx = valIdx;
+        }
+    }
+    private static final Map<String, NvSpec> NVRAM = new HashMap<>();
+    static {
+        for (String r : new String[]{"nvram_get", "nvram_get_int", "nvram_default_get",
+                "nvram_contains_word", "nvram_get_hex", "nvram_get_r", "nvram_split_get",
+                "wlcsm_nvram_get", "jffs_nvram_get", "nvram_is_empty", "nvram_valid_get_int",
+                "nvram_get_bitflag", "nvram_get_double", "nvram_get_file", "internal_nvram_get_int"})
+            NVRAM.put(r, new NvSpec("read", 0, -1, -1));
+        for (String w : new String[]{"nvram_set", "nvram_set_int", "nvram_set_hex",
+                "nvram_restore_var", "wlcsm_nvram_set", "jffs_nvram_set"})
+            NVRAM.put(w, new NvSpec("write", 0, -1, 1));                 // key=arg0, value=arg1
+        for (String w : new String[]{"nvram_unset", "jffs_nvram_unset"})
+            NVRAM.put(w, new NvSpec("write", 0, -1, -1));                // key-only write (no value)
+        for (String r : new String[]{"nvram_pf_get", "nvram_pf_get_int", "nvram_pf_match"})
+            NVRAM.put(r, new NvSpec("read", 0, 1, -1));                  // composite key prefix+name
+        for (String w : new String[]{"nvram_pf_set", "nvram_pf_set_int"})
+            NVRAM.put(w, new NvSpec("write", 0, 1, 2));                  // prefix+name, value=arg2
+        for (String c : new String[]{"nvram_commit", "nvram_commit_x", "wlcsm_nvram_commit"})
+            NVRAM.put(c, new NvSpec("commit", -1, -1, -1));
+        for (String g : new String[]{"nvram_getall", "jffs_nvram_getall"})
+            NVRAM.put(g, new NvSpec("getall", -1, -1, -1));
+    }
+
     // Per-run sink map = static lexicon + optional TMAP_EXTRA_SINKS (comma-separated, key arg 0).
     private Map<String, Integer> sinkKeyArg = SINK_KEYARG;
 
@@ -239,6 +273,109 @@ public class ExportFunctions extends GhidraScript {
         }
         arr.append("]");
         return arr.toString();
+    }
+
+    // gap② phase 1: per-function nvram read/write ops. One record per nvram API call:
+    //   {api, op, key + honest key three-state (constant / parametric-template / unresolved), and for
+    //    writes value_source via the SAME classify as sink_provenance (a controllability signal;
+    //    143/143 accurate on that axis in the probe)}. A surfaced def-use FACT — a key that cannot be
+    //    read is marked parametric/unresolved, NEVER silently dropped. No cross-function key chasing
+    //    (an unresolved key is flagged key_from_caller and left to the agent).
+    private String buildNvramOps(HighFunction hf) {
+        List<PcodeOpAST> ops = new ArrayList<>();
+        Iterator<PcodeOpAST> it = hf.getPcodeOps();
+        while (it.hasNext()) ops.add(it.next());
+        DomCtx dom = new DomCtx(hf);
+        StringBuilder arr = new StringBuilder("[");
+        boolean first = true;
+        for (PcodeOpAST op : ops) {
+            int oc = op.getOpcode();
+            if (oc != PcodeOp.CALL && oc != PcodeOp.CALLIND) continue;
+            String cn = calleeNameOf(op);
+            if (cn == null) continue;
+            NvSpec spec = NVRAM.get(cn);
+            if (spec == null) continue;
+            if (!first) arr.append(",");
+            first = false;
+            arr.append("{\"api\":\"").append(esc(cn)).append("\",\"op\":\"").append(spec.op).append("\"");
+            if (spec.keyIdx >= 0) arr.append(nvramKeyJson(op, spec, ops));
+            if (spec.valIdx >= 0) {
+                Varnode val = (spec.valIdx + 1 < op.getNumInputs()) ? op.getInput(spec.valIdx + 1) : null;
+                String vs = (val == null) ? "{\"kind\":\"unresolved\",\"note\":\"arg_absent\"}"
+                                          : classify(val, op, ops, dom, 0);
+                arr.append(",\"value_source\":").append(vs);
+            }
+            arr.append("}");
+        }
+        arr.append("]");
+        return arr.toString();
+    }
+
+    // Classify ONE key varnode into {"constant","<key>"} / {"parametric","<template>"} /
+    // {"unresolved", null}. resolveConst reads a constant string key; a stack slot built by a string
+    // writer is a parametric (built) key whose printf template is recovered when available.
+    private String[] keyClass(Varnode kv, List<PcodeOpAST> ops) {
+        if (kv == null) return new String[]{"unresolved", null};
+        String k = resolveConst(kv, 0);
+        if (k != null && !k.startsWith("0x")) return new String[]{"constant", k};
+        String tmpl = nvramKeyTemplate(kv, ops);
+        if (tmpl != null) return new String[]{"parametric", tmpl};
+        return new String[]{"unresolved", null};
+    }
+
+    // Emit the key JSON fields for one nvram call (leading comma included). pf family emits a
+    // composite key = prefix+name with per-part kinds; a single-key API emits one key.
+    private String nvramKeyJson(PcodeOpAST op, NvSpec spec, List<PcodeOpAST> ops) {
+        Varnode kv = (spec.keyIdx + 1 < op.getNumInputs()) ? op.getInput(spec.keyIdx + 1) : null;
+        String[] kc = keyClass(kv, ops);
+        if (spec.nameIdx < 0) return keyFields(kc, "key");
+        // pf composite key: prefix + name. Composite kind is constant iff BOTH parts are constant;
+        // unresolved iff both unresolved; parametric otherwise (a resolvable template with holes).
+        Varnode nvn = (spec.nameIdx + 1 < op.getNumInputs()) ? op.getInput(spec.nameIdx + 1) : null;
+        String[] nc = keyClass(nvn, ops);
+        StringBuilder sb = new StringBuilder(",\"pf\":true");
+        sb.append(",\"prefix\":\"").append(esc(kc[1] == null ? "?" : kc[1])).append("\"");
+        sb.append(",\"name\":\"").append(esc(nc[1] == null ? "?" : nc[1])).append("\"");
+        String composite = (kc[1] == null ? "?" : kc[1]) + (nc[1] == null ? "?" : nc[1]);
+        if (kc[0].equals("constant") && nc[0].equals("constant"))
+            sb.append(",\"key\":\"").append(esc(composite)).append("\",\"key_kind\":\"constant\"");
+        else if (kc[0].equals("unresolved") && nc[0].equals("unresolved"))
+            sb.append(",\"key_kind\":\"unresolved\",\"reason\":\"key_from_caller\"");
+        else
+            sb.append(",\"key\":\"").append(esc(composite))
+              .append("\",\"key_kind\":\"parametric\",\"template\":\"").append(esc(composite)).append("\"");
+        return sb.toString();
+    }
+
+    private String keyFields(String[] kc, String keyField) {
+        if (kc[0].equals("constant"))
+            return ",\"" + keyField + "\":\"" + esc(kc[1]) + "\",\"key_kind\":\"constant\"";
+        if (kc[0].equals("parametric"))
+            return ",\"" + keyField + "\":\"" + esc(kc[1]) + "\",\"key_kind\":\"parametric\",\"template\":\""
+                 + esc(kc[1]) + "\"";
+        return ",\"key_kind\":\"unresolved\",\"reason\":\"key_from_caller\"";
+    }
+
+    // A key arg is PARAMETRIC (built) when its stack slot is the destination of a string writer in
+    // the same function; returns the printf template (e.g. "wl%d_ssid") when the writer is a
+    // printf-family, else "<built:strcpy>" (built, no recoverable template). null if not built.
+    private String nvramKeyTemplate(Varnode kv, List<PcodeOpAST> ops) {
+        String key = stackKey(kv);
+        if (key == null) return null;
+        for (PcodeOpAST op : ops) {
+            int oc = op.getOpcode();
+            if (oc != PcodeOp.CALL && oc != PcodeOp.CALLIND) continue;
+            String cn = calleeNameOf(op);
+            if (cn == null || !WRITERS.contains(cn) || op.getNumInputs() < 2) continue;
+            if (!key.equals(stackKey(op.getInput(1)))) continue;   // writes this slot (dst = arg0)
+            Integer fi = WRITER_FMTARG.get(cn);
+            if (fi != null && fi + 1 < op.getNumInputs()) {
+                String fmt = constStrOf(op.getInput(fi + 1), 0);
+                if (fmt != null) return fmt;
+            }
+            return "<built:" + cn + ">";
+        }
+        return null;
     }
 
     // Full backward classification of a value varnode → provenance kind object (the provenance design).
@@ -618,7 +755,15 @@ public class ExportFunctions extends GhidraScript {
         String txt = null;
         try { txt = strAt(a); } catch (Exception e) { txt = null; }
         StringBuilder sb = new StringBuilder("{\"kind\":\"global_buf\",\"data_ref\":\"").append(esc(ref)).append("\"");
-        if (txt != null) sb.append(",\"text\":\"").append(esc(txt)).append("\"");
+        // problem②: report content honesty. A readable string is a known constant; no readable
+        // string means the CONTENT is unknown (not "no value") — mark it so a consumer never reads a
+        // global with unknown content as a fixed constant. A writable block is an extra caution flag.
+        if (txt != null) {
+            sb.append(",\"content\":\"known_string\",\"text\":\"").append(esc(txt)).append("\"");
+        } else {
+            sb.append(",\"content\":\"unknown\"");
+            if (blk.isWrite()) sb.append(",\"writable\":true");
+        }
         sb.append("}");
         return sb.toString();
     }
@@ -863,6 +1008,14 @@ public class ExportFunctions extends GhidraScript {
                 sinkProv = "[]";
             }
 
+            // gap② phase 1: per-function nvram read/write ops. Additive evidence, never a gate.
+            String nvramOps = "[]";
+            try {
+                if (hf != null) nvramOps = buildNvramOps(hf);
+            } catch (Throwable ignore) {
+                nvramOps = "[]";
+            }
+
             if (!firstFunc) funcsJson.append(",");
             firstFunc = false;
             funcsJson.append("{")
@@ -872,6 +1025,7 @@ public class ExportFunctions extends GhidraScript {
                      .append("\"is_exported\":") .append(isExported).append(",")
                      .append("\"callees\":")     .append(calleesArr).append(",")
                      .append("\"sink_provenance\":").append(sinkProv).append(",")
+                     .append("\"nvram_ops\":")   .append(nvramOps).append(",")
                      .append("\"pseudocode\":")  .append("\"").append(esc(pseudocode)).append("\"")
                      .append("}");
             funcCount++;

@@ -51,6 +51,9 @@ CREATE TABLE IF NOT EXISTS functions (
     -- analysis.db is wipe-and-rebuild, so this rides with the function here and is merged into the
     -- atlas instance's flow_evidence at hunt time (the persistent home). Empty '[]' when none.
     sink_provenance TEXT    DEFAULT '[]',
+    -- gap② phase 1: per-function nvram read/write ops (which key this function reads/writes + the
+    -- written value's source). Feeds the phase-2 cross-binary key graph. Empty '[]' when none.
+    nvram_ops       TEXT    DEFAULT '[]',
     FOREIGN KEY(binary_id) REFERENCES binaries(id) ON DELETE CASCADE
 );
 

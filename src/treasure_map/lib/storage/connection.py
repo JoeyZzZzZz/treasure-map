@@ -36,6 +36,9 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # sink_arg_provenance transport column; back-fills as '[]' on DBs built before it existed so
     # ghidra_ingest can write it without "no column named sink_provenance". Must match schema.sql.
     ("functions", "sink_provenance", "TEXT DEFAULT '[]'"),
+    # gap② nvram_ops transport column (per-function nvram read/write ops); back-fills '[]' on older
+    # DBs so ghidra_ingest can write it without "no column named nvram_ops". Must match schema.sql.
+    ("functions", "nvram_ops", "TEXT DEFAULT '[]'"),
     # extraction-pass content hash; back-fills NULL on older DBs, which reads as "unknown pass" and
     # re-dirties every binary once (a correct one-time re-extraction) until the current hash is
     # stored. Must match schema.sql.

@@ -38,15 +38,10 @@ def _mock_runner() -> MagicMock:
     runner = MagicMock()
     runner.get_headless.return_value = Path("/fake/headless")
     runner.run_all.return_value = []
+    # Fix A: the pipeline binds runner.pass_version() as a SQL param; a bare MagicMock is
+    # unbindable. A stable string keeps it constant across runners (no spurious re-dirty).
+    runner.pass_version.return_value = "testpass"
     return runner
-
-
-def _succeed_all(recs: list[ElfRecord], *_a: object, **_kw: object) -> list[GhidraResult]:
-    """Mock run_all side_effect: return success for every record (no JSON written)."""
-    return [
-        GhidraResult(binary=r.path, output_file=Path("/fake"), success=True, elapsed=1.0)
-        for r in recs
-    ]
 
 
 def _run_all_with_json(
@@ -107,9 +102,11 @@ def test_round1_self_test(tmp_path: Path) -> None:
     workspace_path = tmp_path / "workspace"
     cfg = Config()
 
-    # First run: Ghidra succeeds for both binaries → both ghidra_ok=1
+    # First run: Ghidra succeeds for both binaries → both ghidra_ok=1. Use the JSON-writing mock so
+    # functions are actually ingested; a success that produces 0 functions is (correctly) re-dirtied
+    # by the pipeline self-heal, which would make the second run re-invoke Ghidra.
     runner1 = _mock_runner()
-    runner1.run_all.side_effect = _succeed_all
+    runner1.run_all.side_effect = _run_all_with_json
 
     with patch(_PIPELINE_MODULE + ".GhidraRunner", return_value=runner1):
         with Workspace(workspace_path) as ws:

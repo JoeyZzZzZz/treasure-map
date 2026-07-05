@@ -258,6 +258,23 @@ def test_migration_adds_sink_provenance_to_old_db(tmp_path: Path) -> None:
         conn.close()
 
 
+def test_migration_adds_nvram_ops_to_old_db(tmp_path: Path) -> None:
+    # gap②: functions.nvram_ops was added to schema.sql AND _ADDED_COLUMNS together. A database
+    # built before it must gain the column on open (back-filling '[]'), so ghidra_ingest can write
+    # it without "no column named nvram_ops"; existing rows are preserved.
+    db_path = tmp_path / "legacy_nvram.db"
+    _legacy_functions_db(db_path)
+    conn = open_db(db_path)
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(functions)")}
+        assert "nvram_ops" in cols
+        row = conn.execute("SELECT name, nvram_ops FROM functions WHERE id = 1").fetchone()
+        assert row["name"] == "main"
+        assert row["nvram_ops"] == "[]"
+    finally:
+        conn.close()
+
+
 def test_migration_sink_provenance_is_idempotent(tmp_path: Path) -> None:
     # Re-running the migration on a DB that already has the column must not raise or duplicate it.
     db_path = tmp_path / "legacy2.db"
