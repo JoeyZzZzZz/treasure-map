@@ -57,6 +57,7 @@ from treasure_map.lib.hunt.wrapper_propagation import (
 )
 from treasure_map.lib.pattern import scan
 from treasure_map.lib.pattern.classes import CMD, COPY, FMT_STRING, FORMAT
+from treasure_map.lib.query.nvram import template_has_anchor
 from treasure_map.lib.reachability import grade_candidate
 from treasure_map.lib.reachability.taint import locate_sink_arg
 
@@ -275,14 +276,24 @@ def _flatten_nvram_ops(
             key_kind = op.get("key_kind")
             if key_kind not in ("constant", "parametric", "unresolved"):
                 key_kind = "unresolved"  # honesty: an odd/absent kind is unknown, never dropped
-            key = op.get("key") if key_kind in ("constant", "parametric") else None
+            key = op.get("key")
+            key = key if isinstance(key, str) else None
+            if key_kind == "parametric" and not template_has_anchor(key or ""):
+                # A 'template' with no fixed-literal anchor (%s, %s%s, <built:*>) regex-matches ANY
+                # key -> it carries no information about the key, so it is really key-unknown.
+                # Store as unresolved: it then drives completeness (never masquerading as a possible
+                # match for an arbitrary concrete key). wl%d_ssid keeps its anchor and stays a real
+                # parametric template.
+                key_kind = "unresolved"
+            if key_kind == "unresolved":
+                key = None
             value_source = None
             if opkind == "write" and op.get("value_source") is not None:
                 value_source = json.dumps(op.get("value_source"), sort_keys=True)
             rows.append(
                 NvramFlowRow(
                     source_run_id=source_run_id,
-                    key=key if isinstance(key, str) else None,
+                    key=key,
                     key_kind=key_kind,
                     binary=f.binary_name,
                     func=f.name,

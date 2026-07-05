@@ -12,7 +12,11 @@ from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import NvramFlowRow
 from treasure_map.lib.atlas.writer import add_nvram_flow_rows
 from treasure_map.lib.query import get_nvram_key_flow
-from treasure_map.lib.query.nvram import _template_matches, _template_to_regex
+from treasure_map.lib.query.nvram import (
+    _template_matches,
+    _template_to_regex,
+    template_has_anchor,
+)
 
 
 def _seed(tmp_path: Path, rows: list[NvramFlowRow]) -> Path:
@@ -101,12 +105,35 @@ def test_parametric_template_match_is_flagged_separately(tmp_path: Path) -> None
     # a concrete key satisfying the template surfaces ONLY under template_matches, never as exact
     assert hit["writers"] == [] and hit["readers"] == []
     assert hit["found"] is True
+    assert hit["match"] == "template"  # top-level match reflects: only template hits, no exact
     assert len(hit["template_matches"]) == 1
     tm = hit["template_matches"][0]
     assert tm["template"] == "wl%d_ssid" and tm["match"] == "template" and tm["binary"] == "rc"
     # a key that does NOT satisfy the template matches nothing
     assert miss["template_matches"] == []
     assert miss["found"] is False
+    assert miss["match"] == "none"
+
+
+def test_anchorless_template_never_false_matches(tmp_path: Path) -> None:
+    # 缺口 (probe): an over-broad %s%s "template" regex-matches ANY key. It must NOT surface as a
+    # possible match for a random key — the query rejects anchorless templates (defense-in-depth,
+    # even if a stale row stored one as parametric).
+    atlas = _seed(
+        tmp_path,
+        [
+            _flow("%s%s", "parametric", "rc", "f1", "write"),
+            _flow("%s", "parametric", "rc", "f2", "write"),
+        ],
+    )
+    conn = open_atlas(atlas)
+    try:
+        res = get_nvram_key_flow(conn, "foobar123")
+    finally:
+        conn.close()
+    assert res["template_matches"] == []
+    assert res["found"] is False
+    assert res["match"] == "none"
 
 
 # ── unresolved: never connected to a concrete key, but exposed via completeness ─────
@@ -143,6 +170,7 @@ def test_absent_key_with_no_unresolved_is_complete_and_not_found(tmp_path: Path)
     finally:
         conn.close()
     assert res["found"] is False
+    assert res["match"] == "none"
     assert res["completeness"] == "complete"  # no unresolved ops -> absence is trustworthy
     assert res["unresolved_count"] == 0
     assert "unresolved_note" not in res
@@ -160,3 +188,19 @@ def test_template_matching_grammar() -> None:
     # an opaque strcpy-built key is not a decidable template -> never matches
     assert _template_to_regex("<built:strcpy>") is None
     assert not _template_matches("<built:strcpy>", "anything")
+    # anchorless templates match ANY key by regex, but are rejected as "key unknown" (no anchor)
+    assert not _template_matches("%s%s", "foobar123")
+    assert not _template_matches("%s", "anything")
+
+
+def test_template_has_anchor() -> None:
+    # real templates: a fixed-literal part survives placeholder removal (>= 2 chars)
+    assert template_has_anchor("wl%d_ssid")  # -> wl_ssid
+    assert template_has_anchor("%s_bss_enabled")  # -> _bss_enabled
+    assert template_has_anchor("wan%d_ifname")  # -> wan_ifname
+    # anchorless: only placeholders, or an opaque marker -> not a meaningful template
+    assert not template_has_anchor("%s%s")
+    assert not template_has_anchor("%s")
+    assert not template_has_anchor("%d")
+    assert not template_has_anchor("<built:strcpy>")
+    assert not template_has_anchor("a%s")  # 1 fixed char < threshold

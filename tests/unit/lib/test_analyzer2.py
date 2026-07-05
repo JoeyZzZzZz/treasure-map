@@ -276,6 +276,54 @@ def test_nvram_ops_flattened_cross_binary(tmp_path: Path) -> None:
     assert rd["value_source"] is None
 
 
+def test_anchorless_parametric_reclassified_unresolved(tmp_path: Path) -> None:
+    # An over-broad "template" with no fixed-literal anchor (%s%s, <built:*>) is really key-unknown;
+    # it must be STORED as unresolved (so it drives completeness) rather than a parametric that
+    # regex-matches any key. A real template (wl%d_ssid) keeps its anchor and stays parametric.
+    db = _make_db(
+        tmp_path,
+        [
+            {
+                "name": "httpd",
+                "funcs": [
+                    _nvram_fn(
+                        "f",
+                        [
+                            {
+                                "api": "nvram_set",
+                                "op": "write",
+                                "key": "%s%s",
+                                "key_kind": "parametric",
+                            },
+                            {
+                                "api": "nvram_set",
+                                "op": "write",
+                                "key": "<built:strcpy>",
+                                "key_kind": "parametric",
+                            },
+                            {
+                                "api": "nvram_set",
+                                "op": "write",
+                                "key": "wl%d_ssid",
+                                "key_kind": "parametric",
+                            },
+                        ],
+                    )
+                ],
+            }
+        ],
+    )
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_anchor")
+    rows = _nvram_rows(atlas)
+    by_kind = {r["key_kind"] for r in rows}
+    # the two anchorless templates -> unresolved (key NULL); only wl%d_ssid stays parametric
+    assert sorted(r["key"] for r in rows if r["key_kind"] == "parametric") == ["wl%d_ssid"]
+    unresolved = [r for r in rows if r["key_kind"] == "unresolved"]
+    assert len(unresolved) == 2 and all(r["key"] is None for r in unresolved)
+    assert by_kind == {"parametric", "unresolved"}
+
+
 def test_nvram_flow_replace_by_run_is_idempotent(tmp_path: Path) -> None:
     # Re-running the same run refreshes its nvram rows (delete-own-then-insert), never doubles them.
     spec = [

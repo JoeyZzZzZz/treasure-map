@@ -32,6 +32,29 @@ from typing import Any
 # char. Mirrors a subset of the C format grammar sufficient for nvram key templates.
 _SPEC_RE = re.compile(r"%[-+ 0#]*\d*(?:\.\d+)?[hljztL]*([diouxXscp%])")
 
+# Minimum count of fixed (non-specifier) characters a parametric template must carry to be a
+# MEANINGFUL key pattern. Below this a "template" is only placeholders (%s, %s%s) or an opaque
+# strcpy-built marker — it regex-matches ANY key, which is really "key completely unknown", not a
+# known pattern. Such templates are treated as unresolved (see template_has_anchor).
+_MIN_TEMPLATE_ANCHOR = 2
+
+
+def template_has_anchor(template: str) -> bool:
+    """True when a parametric template has a fixed-literal anchor (>= _MIN_TEMPLATE_ANCHOR
+    non-specifier, non-space chars), so it can meaningfully constrain which concrete keys match.
+
+    A template that is only conversion specifiers (``%s``, ``%s%s``) or an opaque strcpy-built
+    marker (``<built:...>``) matches any string — it carries NO information about the key, so it is
+    really "key completely unknown" and must be classified unresolved, never surfaced as a
+    parametric that silently matches an arbitrary key (the honesty red line). ``wl%d_ssid`` keeps
+    its ``wl``/``_ssid`` anchor and stays a real template.
+    """
+    if not isinstance(template, str) or "<built:" in template:
+        return False
+    fixed = _SPEC_RE.sub("", template)  # drop every %-specifier, leaving only the literal parts
+    fixed = "".join(ch for ch in fixed if not ch.isspace())
+    return len(fixed) >= _MIN_TEMPLATE_ANCHOR
+
 
 def _template_to_regex(template: str) -> str | None:
     """Convert a printf-style nvram key template to a full-match regex, or None if it cannot be
@@ -70,7 +93,12 @@ def _template_to_regex(template: str) -> str | None:
 
 
 def _template_matches(template: str, key: str) -> bool:
-    """True when a concrete key satisfies a parametric template (a possible, not exact, match)."""
+    """True when a concrete key satisfies a parametric template (a possible, not exact, match).
+
+    Defense-in-depth: an anchorless template (%s, %s%s, <built:*>) never matches — even if a stale
+    row stored one as parametric (fresh hunts reclassify these to unresolved at flatten time)."""
+    if not template_has_anchor(template):
+        return False
     regex = _template_to_regex(template)
     if regex is None:
         return False
@@ -140,10 +168,19 @@ def get_nvram_key_flow(conn: sqlite3.Connection, key: str) -> dict[str, Any]:
         ).fetchone()[0]
     )
 
+    # match reflects the ACTUAL match state, never an unconditional "exact": a concrete (constant)
+    # writer/reader is an exact connection; only template hits is a flagged possible match; neither
+    # is "none" (found is False).
+    if writers or readers:
+        match_state = "exact"
+    elif template_matches:
+        match_state = "template"
+    else:
+        match_state = "none"
     result: dict[str, Any] = {
         "key": key,
         "found": bool(writers or readers or template_matches),
-        "match": "exact",
+        "match": match_state,
         "writers": writers,
         "readers": readers,
         "template_matches": template_matches,
