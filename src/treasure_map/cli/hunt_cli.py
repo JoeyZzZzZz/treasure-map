@@ -695,8 +695,11 @@ def atlas_view(view: str, config: Path | None, atlas_path: Path | None) -> None:
     is_flag=False,
     flag_value="__all__",
     default=None,
-    help="Force re-analysis ignoring the Ghidra cache: bare --reanalyze redoes ALL binaries; "
-    "--reanalyze <name|path> redoes only that binary.",
+    help="Force re-analysis, ignoring the Ghidra cache. Bare --reanalyze redoes ALL binaries. "
+    "--reanalyze <name|path> scopes the run to ONLY that binary, ignoring every other binary's "
+    "staleness — after editing the Ghidra extraction pass, '--reanalyze rc' re-runs just rc (the "
+    "fast iteration path); a plain run with no flag re-runs every binary the edited pass "
+    "invalidated (the full-update path).",
 )
 @click.option(
     "--config",

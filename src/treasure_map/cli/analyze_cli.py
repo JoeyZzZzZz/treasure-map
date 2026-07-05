@@ -43,6 +43,18 @@ Examples:
   tmap analyze ./_fw.extracted                       # auto name (re-run resumes)
 
 Re-running with the same -w (same name or path) resumes from the last checkpoint.
+
+Iterating on the Ghidra extraction pass (ExportFunctions):
+
+\b
+  # after editing the pass, validate on ONE binary (fast — ~that binary only):
+  tmap analyze ./_fw.extracted -w router_v1 --reanalyze rc
+  # validated? full update — the edited pass re-runs every binary automatically:
+  tmap analyze ./_fw.extracted -w router_v1
+
+Editing the pass changes its content hash (pass_version), so a plain re-run
+re-extracts every binary with no manual file/db deletion; --reanalyze <name>
+scopes that to just the binary you are validating.
 """
 
 
@@ -88,9 +100,12 @@ Re-running with the same -w (same name or path) resumes from the last checkpoint
     is_flag=False,
     flag_value="__all__",
     default=None,
-    help="Force re-analysis ignoring the Ghidra cache: bare --reanalyze redoes ALL binaries; "
-    "--reanalyze <name|path> redoes only that binary (escape hatch for a binary stuck in a bad "
-    "cached state).",
+    help="Force re-analysis, ignoring the Ghidra cache. Bare --reanalyze redoes ALL binaries. "
+    "--reanalyze <name|path> scopes the run to ONLY that binary, ignoring every other binary's "
+    "staleness. Use it to iterate on the Ghidra extraction pass: after editing ExportFunctions, "
+    "'--reanalyze rc' re-runs just rc (~one binary) instead of the whole firmware. A plain run "
+    "with no flag re-runs every binary the edited pass invalidated (the full-update path). Also "
+    "the escape hatch for a single binary stuck in a bad cached state.",
 )
 def analyze(
     fs_root: Path,

@@ -402,6 +402,43 @@ def test_reanalyze_by_name_forces_only_that_binary(tmp_path: Path) -> None:
     conn.close()
 
 
+def test_reanalyze_name_scopes_over_pass_version_staleness(tmp_path: Path) -> None:
+    # ★ The A + --reanalyze interaction: after editing the extraction pass (pass_version bumped),
+    # Fix A marks EVERY binary stale. --reanalyze <name> must still re-run ONLY the named binary,
+    # not the whole firmware — this is the fast iteration path. A subtractive "drop from
+    # already_done" could not do this (A empties already_done), so targeting is required.
+    conn = open_db(tmp_path / "analysis.db")
+    recs = [_make_record("httpd", "deadbeef"), _make_record("rc", "cafebabe")]
+    ingest_elfs(conn, recs, pass_version="passv1")
+    _mark_done_with_functions(conn)  # both done under passv1
+    conn.execute("UPDATE binaries SET pass_version='passv1'")
+    conn.commit()
+
+    # pass edited -> passv2: A alone would make BOTH dirty; --reanalyze rc must scope to rc only.
+    _, dirty = ingest_elfs(conn, recs, reanalyze="rc", pass_version="passv2")
+    assert dirty == {"cafebabe"}  # only rc, despite httpd also being pass-stale
+    conn.close()
+
+
+def test_reanalyze_name_ignores_other_new_binaries(tmp_path: Path) -> None:
+    # Targeting means ONLY the match runs, even ignoring a genuinely-new (never-analyzed) binary.
+    conn = open_db(tmp_path / "analysis.db")
+    recs = [_make_record("rc", "cafebabe"), _make_record("newcomer", "0badf00d")]
+    _, dirty = ingest_elfs(conn, recs, reanalyze="rc", pass_version="passv1")
+    assert dirty == {"cafebabe"}  # the new binary is deliberately skipped under a scoped re-run
+    conn.close()
+
+
+def test_reanalyze_name_no_match_runs_nothing(tmp_path: Path) -> None:
+    # A name matching no binary re-runs nothing (scoped to an empty set), rather than falling back
+    # to "all stale" — the warning is logged so a typo does not silently masquerade as success.
+    conn = open_db(tmp_path / "analysis.db")
+    recs = [_make_record("httpd", "deadbeef"), _make_record("rc", "cafebabe")]
+    _, dirty = ingest_elfs(conn, recs, reanalyze="does_not_exist", pass_version="passv1")
+    assert dirty == set()
+    conn.close()
+
+
 def test_self_heal_redirties_zero_function_code_binary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

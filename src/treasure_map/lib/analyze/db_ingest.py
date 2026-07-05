@@ -27,9 +27,11 @@ def ingest_elfs(
     last_seen_at for every sha256 in the current scan so the current_binaries
     view reflects this run.
 
-    ``reanalyze`` forces re-analysis ignoring the cache: ``REANALYZE_ALL`` re-runs every binary;
-    a name or path re-runs only the matching binary. It is the escape hatch for a binary frozen in
-    a bad cached state.
+    ``reanalyze`` forces re-analysis ignoring the cache. ``REANALYZE_ALL`` re-runs every binary. A
+    name or path SCOPES the run to only the matching binary/binaries and ignores all other
+    staleness — including Fix A's pass_version invalidation — so editing the extraction pass and
+    then ``--reanalyze rc`` re-runs just rc (the fast iteration path), not the whole firmware. It
+    is also the escape hatch for a single binary frozen in a bad cached state.
 
     ``pass_version`` is the current extraction-pass content hash. When given, a prior-done row whose
     stored pass_version differs (or is NULL, i.e. unknown) is treated as NOT done, so editing the
@@ -65,12 +67,13 @@ def ingest_elfs(
             ).fetchall()
         already_done = {row["sha256"] for row in done_rows}
 
-    # Step 1a: --reanalyze escape hatch — drop force-selected shas so they re-run.
+    # Step 1a: --reanalyze escape hatch. REANALYZE_ALL clears already_done so every binary re-runs.
+    # A SPECIFIC name/path is NOT handled by subtracting from already_done — that only narrows the
+    # dirty set when everything else is already_done, and Fix A's pass_version invalidation empties
+    # already_done after a pass edit, so a subtractive drop would leave the whole firmware dirty.
+    # A specific target is scoped in Step 5 instead (run ONLY the match).
     if reanalyze == REANALYZE_ALL:
         already_done = set()
-    elif reanalyze:
-        forced = {r.sha256 for r in records if reanalyze in (r.name, str(r.path))}
-        already_done -= forced
 
     # Step 1b: ★ Red-line self-heal — a row marked done but holding 0 functions despite carrying
     # real code is a frozen bad state (a partial/empty run wrongly cached, e.g. a >200-byte shell).
@@ -148,8 +151,18 @@ def ingest_elfs(
         ).fetchall()
         sha_to_id = {row["sha256"]: row["id"] for row in id_rows}
 
-    # Step 5: dirty = records not in already_done
-    dirty_shas = {r.sha256 for r in records if r.sha256 not in already_done}
+    # Step 5: dirty set.
+    if reanalyze and reanalyze != REANALYZE_ALL:
+        # Targeted re-extraction — the fast iteration path. Run ONLY the binary/binaries whose name
+        # or path matches, ignoring every other binary's staleness, INCLUDING Fix A's pass_version
+        # invalidation that marks all binaries stale after a pass edit. This is what lets
+        # `--reanalyze rc` re-run just rc after editing ExportFunctions, instead of the whole
+        # firmware (which the plain, no-flag scan does — that is the full-update path).
+        dirty_shas = {r.sha256 for r in records if reanalyze in (r.name, str(r.path))}
+        if not dirty_shas:
+            logger.warning("reanalyze target %r matched no binary — nothing to re-run", reanalyze)
+    else:
+        dirty_shas = {r.sha256 for r in records if r.sha256 not in already_done}
 
     logger.info(
         "ingest_elfs: %d records, %d already done, %d dirty",
