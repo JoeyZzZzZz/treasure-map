@@ -51,6 +51,7 @@ def _hunt_stats(written: int = 0) -> SimpleNamespace:
     return SimpleNamespace(
         instances_written=written,
         by_status={"confirmed": 0, "blocked": 0, "unknown": written},
+        data_gap_skipped=0,
     )
 
 

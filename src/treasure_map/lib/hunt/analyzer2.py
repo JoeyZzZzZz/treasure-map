@@ -124,6 +124,7 @@ class Analyzer2Stats:
     by_status: dict[str, int]  # reachability_status -> count, over written instances
     oss_excluded: int  # distinct OSS/third-party binaries R-pattern excluded
     wrapper_propagated: int = 0  # cmd/fmt candidates recovered via one-hop thin-wrapper propagation
+    data_gap_skipped: int = 0  # shape matches dropped with no decompilable body (Ghidra gap)
 
 
 def _load_known_components(db_path: Path | str) -> set[str]:
@@ -242,6 +243,7 @@ def run_analyzer2(
     by_status = {"confirmed": 0, "blocked": 0, "unknown": 0}
     instances_written = 0
     wrapper_propagated = 0
+    data_gap_skipped = 0
 
     atlas = open_atlas(Path(atlas_path))
     try:
@@ -253,6 +255,12 @@ def run_analyzer2(
             for match in result.matches:
                 row = funcs.get(match.func_ref.func_id)
                 if row is None or not (row.pseudocode and row.pseudocode.strip()):
+                    # Never silent: a shape-matched sink candidate whose function body Ghidra could
+                    # not decompile is dropped here, but COUNTED so the candidate set is honestly
+                    # marked incomplete (surfaced in the hunt summary). A malformed/complex function
+                    # is exactly where a real sink can hide, so the agent must know it went
+                    # unanalyzed rather than assume the candidate set was complete.
+                    data_gap_skipped += 1
                     logger.info("skipping match with no loadable function body (data gap)")
                     continue
 
@@ -511,4 +519,5 @@ def run_analyzer2(
         by_status=by_status,
         oss_excluded=result.stats.oss_binaries_excluded,
         wrapper_propagated=wrapper_propagated,
+        data_gap_skipped=data_gap_skipped,
     )

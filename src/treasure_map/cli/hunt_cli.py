@@ -216,6 +216,12 @@ def hunt_pattern(
         f"blocked={stats.by_status.get('blocked', 0)}, "
         f"unknown={stats.by_status.get('unknown', 0)}"
     )
+    if stats.data_gap_skipped:
+        # Honesty flag: the candidate set is incomplete — these matches had no decompilable body.
+        click.echo(
+            f"  Data-gap skipped  : {stats.data_gap_skipped} "
+            "(shape matches with no decompilable body — candidate set is INCOMPLETE)"
+        )
     click.echo(
         "Note: every instance is a candidate/lead, not a confirmed result. With one firmware "
         "device_spread stays ~1 — cross-device spread needs more devices (future)."
@@ -814,6 +820,13 @@ def scan(
         f"blocked={h.by_status.get('blocked', 0)}, "
         f"unknown={h.by_status.get('unknown', 0)})"
     )
+    if h.data_gap_skipped:
+        # Honesty flag: matches whose body Ghidra could not decompile were dropped — candidate
+        # set is incomplete for this run (a real sink can hide in an un-decompilable function).
+        click.echo(
+            f"      → {h.data_gap_skipped} shape matches skipped (data gap: no decompilable "
+            "body) — candidate set INCOMPLETE"
+        )
     # Record this as the last run so `tmap mcp` (no args) serves this firmware's analysis.db.
     from treasure_map.lib.last_run import write_last_run
 

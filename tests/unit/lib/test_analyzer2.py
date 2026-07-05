@@ -94,6 +94,20 @@ def _cmd_injection_fn(name: str, *, param_sourced: bool = True) -> dict[str, obj
     }
 
 
+def _data_gap_cmd_fn(name: str) -> dict[str, object]:
+    """A function whose call graph shows a command sink but whose body Ghidra could not
+    decompile (whitespace-only pseudocode). It forms a bare_cmd shape match on its callees, so
+    analyzer2 must SKIP it (no decompilable body) yet COUNT it — never a silent drop. The
+    whitespace is non-NULL so it passes the scan's `pseudocode IS NOT NULL` filter, then strips
+    to empty at the analyzer2 data-gap guard."""
+    return {
+        "name": name,
+        "pseudocode": "   ",
+        "hash": None,
+        "callees": ["system"],
+    }
+
+
 def _instances(atlas_path: Path) -> list[sqlite3.Row]:
     conn = open_atlas(atlas_path)
     try:
@@ -139,6 +153,23 @@ def test_writer_populates_atlas_oss_excluded(tmp_path: Path) -> None:
     assert all(r[0] == "callseq-v1" for r in algo)  # the RICH pattern, not diff-coarse
     assert all(lvl in ("L0", "L1") for lvl in levels)
     assert all(anchor is None for anchor in anchors)
+
+
+# ── honesty: data-gap matches are counted, never silently dropped ───────────────────
+
+
+def test_data_gap_matches_are_counted_not_silent(tmp_path: Path) -> None:
+    # A shape-matched sink candidate whose function body Ghidra could not decompile is dropped
+    # (no body to grade), but it must be COUNTED so the candidate set is honestly marked
+    # incomplete — a real sink can hide in exactly such an un-decompilable function.
+    db = _make_db(tmp_path, [{"name": "webd", "funcs": [_data_gap_cmd_fn("handle")]}])
+    atlas = tmp_path / "atlas.db"
+    stats = run_analyzer2(db, atlas, source_run_id="run_gap")
+
+    assert stats.matches == 1  # the shape scan saw the candidate
+    assert stats.instances_written == 0  # but its body was un-decompilable -> not written
+    assert stats.data_gap_skipped == 1  # and it is COUNTED, never silently dropped
+    assert _count(atlas, "instance") == 0
 
 
 # ── evidence neutralization: raw literal never persisted ────────────────────────────

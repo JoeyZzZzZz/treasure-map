@@ -242,6 +242,40 @@ def test_get_sink_provenance_returns_full_writer_detail(tmp_path: Path) -> None:
     assert allrecs["found"] is True and len(allrecs["records"]) == len(_PROV)
 
 
+def test_call_return_unresolved_args_flag_survives_to_agent(tmp_path: Path) -> None:
+    # Honesty (缺口 A): a getter callsite with a non-constant argument omits it from const_args
+    # but flags has_unresolved_args + arg_count (ExportFunctions). The read side must pass BOTH
+    # through verbatim so the agent never reads const_args as the FULL argument list — e.g.
+    # custom_get("some_key", param_2) where param_2 is caller-controlled.
+    prov = [
+        {
+            "sink_idx": 0,
+            "sink": "system",
+            "sink_addr": "0x100",
+            "arg_idx": 0,
+            "provenance": {
+                "kind": "call_return",
+                "callee": "custom_get",
+                "const_args": ["some_key"],
+                "arg_count": 2,
+                "has_unresolved_args": True,
+            },
+        }
+    ]
+    atlas = _seed(tmp_path, provenance=prov)
+    conn = open_atlas(atlas)
+    try:
+        full = get_sink_provenance(conn, "run_x#fn7@cmd", 0)
+    finally:
+        conn.close()
+    assert full["found"] is True
+    p = full["record"]["provenance"]
+    assert p["kind"] == "call_return" and p["const_args"] == ["some_key"]
+    # the honesty signals are NOT dropped by the read-side presentation
+    assert p["arg_count"] == 2
+    assert p["has_unresolved_args"] is True
+
+
 def test_get_sink_provenance_unknown_ref_and_out_of_range(tmp_path: Path) -> None:
     atlas = _seed(tmp_path)
     conn = open_atlas(atlas)

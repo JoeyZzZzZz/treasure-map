@@ -442,17 +442,25 @@ public class ExportFunctions extends GhidraScript {
     private String callReturn(PcodeOp callDef, String cn) {
         StringBuilder sb = new StringBuilder("{\"kind\":\"call_return\",\"callee\":\"");
         sb.append(esc(cn == null ? "?" : cn)).append("\",\"const_args\":[");
+        // input 0 is the call target; inputs 1.. are the callsite's actual arguments.
+        int argCount = Math.max(0, callDef.getNumInputs() - 1);
         int n = 0;
         for (int i = 1; i < callDef.getNumInputs(); i++) {
             // A constant arg often reaches the callsite through a unique/COPY/CAST (Ghidra models
             // `getter("some_key")` as a unique that COPYs the string address), so resolve the chain.
             String val = resolveConst(callDef.getInput(i), 0);
-            if (val == null) continue;   // non-constant arg (e.g. another call's return) — skip
+            if (val == null) continue;   // non-constant arg — NOT dropped: flagged via has_unresolved_args
             if (n > 0) sb.append(",");
             sb.append("\"").append(esc(val)).append("\"");
             n++;
         }
-        sb.append("]}");
+        sb.append("],\"arg_count\":").append(argCount);
+        // Honesty (never silently drop): const_args lists ONLY the args that resolved to a constant.
+        // When some args were non-constant they are absent from const_args, so flag it here — a
+        // consumer must never read const_args as the full argument list. e.g. getter(key, param_2)
+        // with a caller-controlled param_2 would otherwise look like a lone constant key.
+        if (n < argCount) sb.append(",\"has_unresolved_args\":true");
+        sb.append("}");
         return sb.toString();
     }
 
