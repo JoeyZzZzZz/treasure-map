@@ -62,8 +62,8 @@ def _make_db(
             fid += 1
             conn.execute(
                 "INSERT INTO functions "
-                "(id, binary_id, name, pseudocode, pseudocode_hash, callees) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "(id, binary_id, name, pseudocode, pseudocode_hash, callees, nvram_ops) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     fid,
                     bid,
@@ -71,6 +71,7 @@ def _make_db(
                     func["pseudocode"],
                     func.get("hash"),
                     json.dumps(func["callees"]),
+                    json.dumps(func.get("nvram_ops", [])),
                 ),
             )
     conn.commit()
@@ -106,6 +107,29 @@ def _data_gap_cmd_fn(name: str) -> dict[str, object]:
         "hash": None,
         "callees": ["system"],
     }
+
+
+def _nvram_fn(name: str, ops: list[dict[str, object]]) -> dict[str, object]:
+    """A function carrying nvram_ops but no shape-relevant callees — it is flattened into
+    nvram_key_flow independent of the shape scan (the flatten runs over ALL functions)."""
+    return {
+        "name": name,
+        "pseudocode": f"void {name}(){{}}",
+        "hash": f"h_{name}",
+        "callees": [],
+        "nvram_ops": ops,
+    }
+
+
+def _nvram_rows(atlas_path: Path) -> list[sqlite3.Row]:
+    conn = open_atlas(atlas_path)
+    try:
+        return conn.execute(
+            "SELECT key, key_kind, binary, func, op, value_source, api "
+            "FROM nvram_key_flow ORDER BY binary, func, op"
+        ).fetchall()
+    finally:
+        conn.close()
 
 
 def _instances(atlas_path: Path) -> list[sqlite3.Row]:
@@ -170,6 +194,106 @@ def test_data_gap_matches_are_counted_not_silent(tmp_path: Path) -> None:
     assert stats.instances_written == 0  # but its body was un-decompilable -> not written
     assert stats.data_gap_skipped == 1  # and it is COUNTED, never silently dropped
     assert _count(atlas, "instance") == 0
+
+
+# ── gap② phase 2: nvram_ops flattened into the cross-binary nvram_key_flow table ────
+
+
+def test_nvram_ops_flattened_cross_binary(tmp_path: Path) -> None:
+    # rc writes sw_mode; httpd reads it — a real cross-process config flow. A parametric and an
+    # unresolved op ride along; the keyless commit op is NOT flattened (no key -> not a key fact).
+    db = _make_db(
+        tmp_path,
+        [
+            {
+                "name": "rc",
+                "funcs": [
+                    _nvram_fn(
+                        "set_mode",
+                        [
+                            {
+                                "api": "nvram_set",
+                                "op": "write",
+                                "key": "sw_mode",
+                                "key_kind": "constant",
+                                "value_source": {"kind": "param", "name": "param_2"},
+                            },
+                            {
+                                "api": "nvram_set",
+                                "op": "write",
+                                "key": "wl%d_ssid",
+                                "key_kind": "parametric",
+                                "template": "wl%d_ssid",
+                                "value_source": {"kind": "constant", "value": "x"},
+                            },
+                            {
+                                "api": "nvram_set",
+                                "op": "write",
+                                "key_kind": "unresolved",
+                                "reason": "key_from_caller",
+                                "value_source": {"kind": "param", "name": "param_1"},
+                            },
+                            {"api": "nvram_commit", "op": "commit"},  # keyless -> not flattened
+                        ],
+                    )
+                ],
+            },
+            {
+                "name": "httpd",
+                "funcs": [
+                    _nvram_fn(
+                        "read_mode",
+                        [
+                            {
+                                "api": "nvram_get",
+                                "op": "read",
+                                "key": "sw_mode",
+                                "key_kind": "constant",
+                            }
+                        ],
+                    )
+                ],
+            },
+        ],
+    )
+    atlas = tmp_path / "atlas.db"
+    stats = run_analyzer2(db, atlas, source_run_id="run_nv")
+
+    assert stats.nvram_flows_written == 4  # 3 writes + 1 read; the commit op is dropped
+    rows = _nvram_rows(atlas)
+    as_tuples = [(r["key"], r["key_kind"], r["binary"], r["func"], r["op"]) for r in rows]
+    # cross-binary: rc writes sw_mode (constant), httpd reads sw_mode (constant)
+    assert ("sw_mode", "constant", "rc", "set_mode", "write") in as_tuples
+    assert ("sw_mode", "constant", "httpd", "read_mode", "read") in as_tuples
+    assert {r["key_kind"] for r in rows} == {"constant", "parametric", "unresolved"}
+    # unresolved key is stored with NULL key — never masquerading as a concrete key
+    unresolved = [r for r in rows if r["key_kind"] == "unresolved"]
+    assert len(unresolved) == 1 and unresolved[0]["key"] is None
+    # write-side value source rides along as JSON (controllability signal); reads carry none
+    w = next(r for r in rows if r["key"] == "sw_mode" and r["op"] == "write")
+    assert json.loads(w["value_source"]) == {"kind": "param", "name": "param_2"}
+    rd = next(r for r in rows if r["key"] == "sw_mode" and r["op"] == "read")
+    assert rd["value_source"] is None
+
+
+def test_nvram_flow_replace_by_run_is_idempotent(tmp_path: Path) -> None:
+    # Re-running the same run refreshes its nvram rows (delete-own-then-insert), never doubles them.
+    spec = [
+        {
+            "name": "rc",
+            "funcs": [
+                _nvram_fn(
+                    "f",
+                    [{"api": "nvram_set", "op": "write", "key": "k", "key_kind": "constant"}],
+                )
+            ],
+        }
+    ]
+    db = _make_db(tmp_path, spec)
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_x")
+    run_analyzer2(db, atlas, source_run_id="run_x")
+    assert len(_nvram_rows(atlas)) == 1  # not 2
 
 
 # ── evidence neutralization: raw literal never persisted ────────────────────────────

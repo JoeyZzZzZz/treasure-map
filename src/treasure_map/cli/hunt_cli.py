@@ -222,6 +222,8 @@ def hunt_pattern(
             f"  Data-gap skipped  : {stats.data_gap_skipped} "
             "(shape matches with no decompilable body — candidate set is INCOMPLETE)"
         )
+    if stats.nvram_flows_written:
+        click.echo(f"  nvram key-flow    : {stats.nvram_flows_written} ops flattened")
     click.echo(
         "Note: every instance is a candidate/lead, not a confirmed result. With one firmware "
         "device_spread stays ~1 — cross-device spread needs more devices (future)."
@@ -827,6 +829,8 @@ def scan(
             f"      → {h.data_gap_skipped} shape matches skipped (data gap: no decompilable "
             "body) — candidate set INCOMPLETE"
         )
+    if h.nvram_flows_written:
+        click.echo(f"      → {h.nvram_flows_written} nvram key-flow ops flattened → atlas")
     # Record this as the last run so `tmap mcp` (no args) serves this firmware's analysis.db.
     from treasure_map.lib.last_run import write_last_run
 

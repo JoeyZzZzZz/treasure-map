@@ -684,20 +684,23 @@ def test_open_atlas_migration_is_idempotent(tmp_path: Path) -> None:
 
 
 def test_static_no_unscoped_wipe_in_atlas() -> None:
-    # No table-wide wipe path. DROP is always forbidden. The ONLY permitted DELETE is the
-    # run-scoped replace-by-run refresh (DELETE FROM instance WHERE source_run_id = ?), which
-    # touches one run's rows — not §0.6 cross-run accumulation. Any other DELETE FROM fails.
+    # No table-wide wipe path. DROP is always forbidden. The ONLY permitted DELETEs are the
+    # run-scoped replace-by-run refreshes (DELETE FROM <table> WHERE source_run_id = ?), each
+    # touching one run's rows — not cross-run accumulation. Any other DELETE FROM fails.
     forbidden_sql = ("DROP TABLE", "DROP VIEW", "DROP INDEX")
-    permitted_delete = "DELETE FROM instance WHERE source_run_id = ?"
+    permitted_deletes = (
+        "DELETE FROM instance WHERE source_run_id = ?",
+        "DELETE FROM nvram_key_flow WHERE source_run_id = ?",
+    )
     for py_file in _ATLAS_SRC.glob("*.py"):
         text = py_file.read_text()
         upper = text.upper()
         for token in forbidden_sql:
             assert token not in upper, f"SQL {token!r} found in {py_file.name}"
         delete_count = upper.count("DELETE FROM")
-        scoped_count = text.count(permitted_delete)
+        scoped_count = sum(text.count(p) for p in permitted_deletes)
         assert delete_count == scoped_count, (
-            f"{py_file.name} has a DELETE that is not the run-scoped refresh {permitted_delete!r}"
+            f"{py_file.name} has a DELETE that is not a run-scoped replace-by-run refresh"
         )
 
 

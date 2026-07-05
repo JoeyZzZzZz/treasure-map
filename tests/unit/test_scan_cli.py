@@ -52,6 +52,7 @@ def _hunt_stats(written: int = 0) -> SimpleNamespace:
         instances_written=written,
         by_status={"confirmed": 0, "blocked": 0, "unknown": written},
         data_gap_skipped=0,
+        nvram_flows_written=0,
     )
 
 

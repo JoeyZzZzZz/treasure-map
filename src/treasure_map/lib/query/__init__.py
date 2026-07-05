@@ -8,6 +8,7 @@ nothing here scores, ranks, or judges.
 
 from __future__ import annotations
 
+from treasure_map.lib.query.nvram import get_nvram_key_flow
 from treasure_map.lib.query.triage import (
     REVIEW_STATUS_BY_REACHABILITY,
     CandidateExplanation,
@@ -46,6 +47,7 @@ __all__ = [
     "dormant",
     "explain_candidate",
     "filter_candidates",
+    "get_nvram_key_flow",
     "get_sink_provenance",
     "ledger",
     "review_score",

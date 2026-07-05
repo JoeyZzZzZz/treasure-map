@@ -41,6 +41,7 @@ from treasure_map.lib.query import density as _density
 from treasure_map.lib.query import dormant as _dormant
 from treasure_map.lib.query import explain_candidate as _explain_candidate
 from treasure_map.lib.query import filter_candidates as _filter_candidates
+from treasure_map.lib.query import get_nvram_key_flow as _get_nvram_key_flow
 from treasure_map.lib.query import get_sink_provenance as _get_sink_provenance
 from treasure_map.lib.query import ledger as _ledger
 from treasure_map.lib.query import triage as _triage
@@ -70,7 +71,10 @@ _AGENT_INSTRUCTIONS = (
     "the sink argument's value comes from, by Ghidra def-use — kind, whether it resolved, and the "
     "sound nearest_dominating_writer for a reused stack buffer); get_sink_provenance(evidence_ref, "
     "sink_idx) then pulls that sink's full writers + format string + vararg sources, so you read "
-    "the value origin from a table instead of rebuilding it by hand. Read facts: get_pseudocode "
+    "the value origin from a table instead of rebuilding it by hand. get_nvram_key_flow(key) gives "
+    "one nvram key's cross-binary writers/readers (exact constant matches + separately flagged "
+    "parametric template matches), each writer's value_source, and an honest completeness flag "
+    "when caller-supplied keys could also touch it. Read facts: get_pseudocode "
     "(func = a name OR an address in any form; "
     "binary = short name OR full path), get_callees / get_xrefs to walk the call chain (an empty "
     "caller set may mean an indirect/dispatch-table call, not 'unreachable'), get_strings, "
@@ -331,6 +335,29 @@ def make_tools(
         result["note"] = _DERIVED_SIGNAL_NOTE
         return result
 
+    def get_nvram_key_flow(key: str) -> dict[str, Any]:
+        """Cross-binary nvram key graph: who WRITES and who READS one nvram key (gap② phase 2).
+
+        Turns "trace this config value across processes" from two manual reverse-lookups into one
+        table read. For the concrete ``key``: ``writers`` / ``readers`` are EXACT (constant-key)
+        matches, each carrying its binary + func + api and, for a writer, ``value_source`` (the
+        Ghidra def-use origin of the written value — a controllability signal, so you see at a
+        glance whether a caller-controlled value reaches this key). ``template_matches`` lists
+        PARAMETRIC templates the key satisfies (e.g. ``wl%d_ssid`` for ``wl0_ssid``) — a POSSIBLE
+        match flagged ``match:"template"``, never an exact connection; confirm the wildcard
+        yourself. ``completeness`` is ``may_be_incomplete`` when unresolved-key ops exist
+        (``unresolved_note`` says how many): a key that came from a caller could touch ANY key, so
+        the writers/readers here may be incomplete — never read an empty result as "unused". Each
+        entry carries ``source_run_id`` so a cross-firmware atlas stays legible. A surfaced FACT,
+        never a verdict."""
+        conn = open_atlas(atlas_path)
+        try:
+            result = _get_nvram_key_flow(conn, key)
+        finally:
+            conn.close()
+        result["note"] = _DERIVED_SIGNAL_NOTE
+        return result
+
     def get_pseudocode(function: str, binary: str | None = None) -> dict[str, Any]:
         """Decompiler pseudocode for one function (name or address); the default read view."""
         return _with_analysis(lambda c: facts.get_pseudocode(c, func=function, binary=binary))
@@ -396,6 +423,7 @@ def make_tools(
         "list_candidates": list_candidates,
         "explain_candidate": explain_candidate,
         "get_sink_provenance": get_sink_provenance,
+        "get_nvram_key_flow": get_nvram_key_flow,
         "cross_firmware_patterns": cross_firmware_patterns,
         "pattern_density": pattern_density,
         "pattern_twins": pattern_twins,

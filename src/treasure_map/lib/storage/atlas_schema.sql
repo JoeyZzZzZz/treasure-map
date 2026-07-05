@@ -115,6 +115,40 @@ CREATE VIEW IF NOT EXISTS pattern_ledger AS
             AND i.pseudocode_hash IS NOT NULL)                     AS pattern_breadth
   FROM pattern p;
 
+-- nvram_key_flow: per-op nvram read/write facts, flattened from functions.nvram_ops at hunt time,
+-- so an agent can trace "who writes / who reads this nvram key" across binaries (cross-process
+-- config dataflow) as a table lookup instead of two manual reverse-lookups. These are ROW-LEVEL raw
+-- facts; the KEY GRAPH is the QUERY over them (get_nvram_key_flow), exactly as the density/twins
+-- views are read-side queries over instance rows. Honesty is enforced at the QUERY, not the store:
+--   key_kind='constant'   -> a concrete key; connected EXACTLY across binaries.
+--   key_kind='parametric' -> a printf/strcpy template (e.g. wl%d_ssid); a POSSIBLE match, surfaced
+--                            separately and flagged, never treated as an exact connection.
+--   key_kind='unresolved' -> the key came from a caller (untraceable here); key IS NULL. The query
+--                            NEVER attributes these to a concrete key (that would connect the wrong
+--                            key), but they are STORED so they can be exposed and drive the
+--                            completeness flag -- the agent is told "N unresolved-key ops could
+--                            touch any key", never left to assume the graph is complete.
+-- source_run_id is the neutral per-firmware-run id (append-and-corroborate; a re-run of one run
+-- deletes its own rows first, like instance). May hold neutral binary/func names as private
+-- evidence -- REDACT ON EXPORT (this is a private, out-of-repo runtime store).
+CREATE TABLE IF NOT EXISTS nvram_key_flow (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_run_id TEXT,
+    key           TEXT,   -- concrete key (constant) or template text (parametric); NULL if unresolved
+    key_kind      TEXT NOT NULL DEFAULT 'unresolved'
+        CHECK (key_kind IN ('constant','parametric','unresolved')),
+    binary        TEXT,
+    func          TEXT,
+    op            TEXT NOT NULL DEFAULT 'read' CHECK (op IN ('read','write')),
+    value_source  TEXT,   -- write-side value provenance JSON (controllability signal); NULL for reads
+    api           TEXT,   -- the concrete nvram API (nvram_set / nvram_get / ...)
+    created_at    DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_nvram_key      ON nvram_key_flow(key);
+CREATE INDEX IF NOT EXISTS idx_nvram_run      ON nvram_key_flow(source_run_id);
+CREATE INDEX IF NOT EXISTS idx_nvram_key_kind ON nvram_key_flow(key_kind);
+
 CREATE INDEX IF NOT EXISTS idx_pattern_classes ON pattern(source_class, sink_class);
 CREATE INDEX IF NOT EXISTS idx_pattern_fp      ON pattern(structural_fingerprint);
 CREATE INDEX IF NOT EXISTS idx_instance_pattern ON instance(pattern_id);

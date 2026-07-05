@@ -11,7 +11,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 
-from treasure_map.lib.atlas.models import InstanceRow
+from treasure_map.lib.atlas.models import InstanceRow, NvramFlowRow
 from treasure_map.lib.errors import ConfigError
 
 _VALID_ORIGINS = ("custom", "vendor_modified_oss", "stock_oss_known", "unknown")
@@ -38,6 +38,51 @@ def delete_run_instances(
     if commit:
         conn.commit()
     return cur.rowcount
+
+
+def delete_run_nvram_flow(
+    conn: sqlite3.Connection, source_run_id: str, *, commit: bool = True
+) -> int:
+    """Delete all nvram_key_flow rows of one run (replace-by-run refresh). Returns rows deleted.
+
+    Touches ONLY this run_id's rows — other runs' nvram facts are untouched. With commit=False the
+    delete joins the caller's transaction (so a run's flatten is atomic with its instance write)."""
+    cur = conn.execute("DELETE FROM nvram_key_flow WHERE source_run_id = ?", (source_run_id,))
+    if commit:
+        conn.commit()
+    return cur.rowcount
+
+
+def add_nvram_flow_rows(
+    conn: sqlite3.Connection, rows: list[NvramFlowRow], *, commit: bool = True
+) -> int:
+    """Insert flattened nvram op rows in one batch; return the count. Commits unless commit=False.
+
+    Neutral per-op facts (key + key_kind three-state + write value source). No validation beyond the
+    schema CHECKs — these are surfaced Ghidra def-use facts, never a scored verdict."""
+    if not rows:
+        return 0
+    conn.executemany(
+        """INSERT INTO nvram_key_flow
+           (source_run_id, key, key_kind, binary, func, op, value_source, api)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        [
+            (
+                r.source_run_id,
+                r.key,
+                r.key_kind,
+                r.binary,
+                r.func,
+                r.op,
+                r.value_source,
+                r.api,
+            )
+            for r in rows
+        ],
+    )
+    if commit:
+        conn.commit()
+    return len(rows)
 
 
 def upsert_pattern(

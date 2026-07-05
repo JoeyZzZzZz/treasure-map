@@ -20,14 +20,15 @@ from treasure_map import mcp_app
 from treasure_map.cli.mcp_cli import fact as fact_group
 from treasure_map.lib import facts
 from treasure_map.lib.atlas.connection import open_atlas
-from treasure_map.lib.atlas.models import InstanceRow
-from treasure_map.lib.atlas.writer import add_instance, upsert_pattern
+from treasure_map.lib.atlas.models import InstanceRow, NvramFlowRow
+from treasure_map.lib.atlas.writer import add_instance, add_nvram_flow_rows, upsert_pattern
 from treasure_map.lib.storage.connection import open_db
 
 _EXPECTED_TOOLS = {
     "list_candidates",
     "explain_candidate",
     "get_sink_provenance",
+    "get_nvram_key_flow",
     "cross_firmware_patterns",
     "pattern_density",
     "pattern_twins",
@@ -168,6 +169,60 @@ def test_outputs_carry_no_payload(tmp_path: Path) -> None:
     text = json.dumps(blobs).lower()
     # No input-construction vocabulary smuggled into any tool output.
     assert not re.search(r"\b(payload|poc|exploit code|trigger bytes|shellcode)\b", text)
+
+
+# ── get_nvram_key_flow: cross-binary key graph with three-tier honesty ──────────────
+
+
+def test_get_nvram_key_flow_tool(tmp_path: Path) -> None:
+    atlas = _mk_atlas(tmp_path)
+    conn = open_atlas(atlas)
+    add_nvram_flow_rows(
+        conn,
+        [
+            NvramFlowRow(
+                source_run_id="run_m",
+                key="sw_mode",
+                key_kind="constant",
+                binary="rc",
+                func="set_mode",
+                op="write",
+                value_source='{"kind": "param", "name": "param_2"}',
+                api="nvram_set",
+            ),
+            NvramFlowRow(
+                source_run_id="run_m",
+                key="sw_mode",
+                key_kind="constant",
+                binary="httpd",
+                func="read_mode",
+                op="read",
+                api="nvram_get",
+            ),
+            NvramFlowRow(
+                source_run_id="run_m",
+                key=None,
+                key_kind="unresolved",
+                binary="httpd",
+                func="fwd",
+                op="write",
+                api="nvram_set",
+            ),
+        ],
+    )
+    conn.close()
+    tools = mcp_app.make_tools(_mk_analysis(tmp_path), atlas)
+
+    res = tools["get_nvram_key_flow"]("sw_mode")
+    assert res["found"] is True
+    assert [w["binary"] for w in res["writers"]] == ["rc"]
+    assert [r["binary"] for r in res["readers"]] == ["httpd"]
+    assert res["writers"][0]["value_source"] == {"kind": "param", "name": "param_2"}
+    # an unresolved-key op exists -> the tool honestly flags possible incompleteness
+    assert res["completeness"] == "may_be_incomplete"
+    assert res["unresolved_count"] == 1
+    # a missing key still returns honestly (no fabrication)
+    assert tools["get_nvram_key_flow"]("no_such_key")["found"] is False
 
 
 # ── list_candidates: anchored, entry-reach carried, derived-not-verdict note ────────

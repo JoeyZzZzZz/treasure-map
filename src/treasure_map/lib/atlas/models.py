@@ -58,3 +58,25 @@ class InstanceRow:
     flow_evidence: str | None = None
     instance_id: int | None = None
     created_at: str | None = None
+
+
+@dataclass(frozen=True)
+class NvramFlowRow:
+    """Mirrors one nvram_key_flow row: a single nvram read/write op flattened from a function's
+    nvram_ops. Neutral per-op fact; the key graph is a query over these, not a stored graph.
+
+    key_kind is the honesty axis: 'constant' (concrete key), 'parametric' (a template, e.g.
+    wl%d_ssid — a possible not exact match), or 'unresolved' (key came from a caller, key is None —
+    never connected to a concrete key by the query, but stored so it is exposed + counted).
+    """
+
+    source_run_id: str | None
+    key: str | None
+    key_kind: str
+    binary: str | None
+    func: str | None
+    op: str
+    value_source: str | None = None  # write-side value provenance JSON; None for reads
+    api: str | None = None
+    id: int | None = None
+    created_at: str | None = None

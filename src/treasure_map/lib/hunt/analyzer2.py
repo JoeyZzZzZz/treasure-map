@@ -29,8 +29,14 @@ from pathlib import Path
 from typing import Any
 
 from treasure_map.lib.atlas.connection import open_atlas
-from treasure_map.lib.atlas.models import InstanceRow
-from treasure_map.lib.atlas.writer import add_instance, delete_run_instances, upsert_pattern
+from treasure_map.lib.atlas.models import InstanceRow, NvramFlowRow
+from treasure_map.lib.atlas.writer import (
+    add_instance,
+    add_nvram_flow_rows,
+    delete_run_instances,
+    delete_run_nvram_flow,
+    upsert_pattern,
+)
 from treasure_map.lib.diff.loader import FuncRow, load_functions
 from treasure_map.lib.hunt.downweight import (
     CONST_SINK_ARG,
@@ -125,6 +131,7 @@ class Analyzer2Stats:
     oss_excluded: int  # distinct OSS/third-party binaries R-pattern excluded
     wrapper_propagated: int = 0  # cmd/fmt candidates recovered via one-hop thin-wrapper propagation
     data_gap_skipped: int = 0  # shape matches dropped with no decompilable body (Ghidra gap)
+    nvram_flows_written: int = 0  # gap② per-op nvram read/write rows flattened into the atlas
 
 
 def _load_known_components(db_path: Path | str) -> set[str]:
@@ -212,6 +219,81 @@ def _load_sink_provenance(db_path: Path | str) -> dict[int, list[dict[str, Any]]
     return out
 
 
+def _load_nvram_ops(db_path: Path | str) -> dict[int, list[dict[str, Any]]]:
+    """Map func_id -> parsed nvram_ops list (Ghidra def-use fact) from analysis.db.
+
+    Transport read (mirrors _load_sink_provenance): ExportFunctions.buildNvramOps computed the
+    per-function nvram read/write ops and ghidra_ingest stored them on functions.nvram_ops; here
+    they are loaded so the hunt flattens them into the atlas nvram_key_flow table. A missing column
+    (older analysis.db) or an unparsable cell yields no entry — the key graph is additive.
+    """
+    uri = f"file:{Path(db_path)}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    out: dict[int, list[dict[str, Any]]] = {}
+    try:
+        rows = conn.execute("SELECT id, nvram_ops FROM functions").fetchall()
+    except sqlite3.OperationalError:
+        return out  # no column (pre-gap② analysis.db) -> no data
+    finally:
+        conn.close()
+    for func_id, raw in rows:
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(data, list) and data:
+            out[func_id] = data
+    return out
+
+
+def _flatten_nvram_ops(
+    all_funcs: list[FuncRow],
+    ops_by_func: dict[int, list[dict[str, Any]]],
+    source_run_id: str,
+) -> list[NvramFlowRow]:
+    """Flatten every function's nvram read/write ops into per-op nvram_key_flow rows.
+
+    Only key-bearing ops (op read/write) become rows; commit/getall carry no key and are not part
+    of a key graph. key_kind is preserved verbatim as the honesty three-state — an op with no or an
+    unexpected key_kind is treated as 'unresolved' (never silently dropped). A concrete/template key
+    rides in `key`; an unresolved key stores key=None. The write-side value source (a
+    controllability signal) is carried as JSON on writes; reads carry none.
+    """
+    rows: list[NvramFlowRow] = []
+    for f in all_funcs:
+        ops = ops_by_func.get(f.func_id)
+        if not ops:
+            continue
+        for op in ops:
+            if not isinstance(op, dict):
+                continue
+            opkind = op.get("op")
+            if opkind not in ("read", "write"):
+                continue  # commit / getall carry no key -> not a key-flow fact
+            key_kind = op.get("key_kind")
+            if key_kind not in ("constant", "parametric", "unresolved"):
+                key_kind = "unresolved"  # honesty: an odd/absent kind is unknown, never dropped
+            key = op.get("key") if key_kind in ("constant", "parametric") else None
+            value_source = None
+            if opkind == "write" and op.get("value_source") is not None:
+                value_source = json.dumps(op.get("value_source"), sort_keys=True)
+            rows.append(
+                NvramFlowRow(
+                    source_run_id=source_run_id,
+                    key=key if isinstance(key, str) else None,
+                    key_kind=key_kind,
+                    binary=f.binary_name,
+                    func=f.name,
+                    op=opkind,
+                    value_source=value_source,
+                    api=op.get("api") if isinstance(op.get("api"), str) else None,
+                )
+            )
+    return rows
+
+
 def run_analyzer2(
     db_path: Path | str,
     atlas_path: Path | str,
@@ -239,6 +321,10 @@ def run_analyzer2(
     # Ghidra def-use provenance per function (merged into cmd/fmt flow_evidence below). Function-
     # level fact; keyed by func_id. Empty when the analysis.db predates the provenance column.
     sink_prov_by_func = _load_sink_provenance(db_path)
+    # gap② phase 2: per-function nvram read/write ops, flattened into the atlas nvram_key_flow
+    # table below so an agent can trace a key's writers/readers across binaries. Empty when the
+    # analysis.db predates the nvram_ops column.
+    nvram_flow_rows = _flatten_nvram_ops(all_funcs, _load_nvram_ops(db_path), source_run_id)
 
     by_status = {"confirmed": 0, "blocked": 0, "unknown": 0}
     instances_written = 0
@@ -252,6 +338,10 @@ def run_analyzer2(
         # instances are deleted; pattern rows (shared accumulation layer) are not.
         with atlas:
             delete_run_instances(atlas, source_run_id, commit=False)
+            # gap② phase 2: refresh this run's nvram key-flow rows in the SAME transaction as its
+            # instances (replace-by-run: delete own rows, then insert the fresh flatten).
+            delete_run_nvram_flow(atlas, source_run_id, commit=False)
+            add_nvram_flow_rows(atlas, nvram_flow_rows, commit=False)
             for match in result.matches:
                 row = funcs.get(match.func_ref.func_id)
                 if row is None or not (row.pseudocode and row.pseudocode.strip()):
@@ -520,4 +610,5 @@ def run_analyzer2(
         oss_excluded=result.stats.oss_binaries_excluded,
         wrapper_propagated=wrapper_propagated,
         data_gap_skipped=data_gap_skipped,
+        nvram_flows_written=len(nvram_flow_rows),
     )
