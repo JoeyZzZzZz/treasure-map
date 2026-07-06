@@ -133,6 +133,10 @@ class Analyzer2Stats:
     wrapper_propagated: int = 0  # cmd/fmt candidates recovered via one-hop thin-wrapper propagation
     data_gap_skipped: int = 0  # shape matches dropped with no decompilable body (Ghidra gap)
     nvram_flows_written: int = 0  # gap② per-op nvram read/write rows flattened into the atlas
+    # fmt-wrapper candidates dropped by the precision gate (uncontrollable/unknown forwarded value).
+    # A deliberate recall trim — but COUNTED, not silent, so the summary shows the fmt axis was
+    # narrowed (parity with data_gap_skipped; never let a drop imply the candidate set is complete).
+    fmt_wrapper_unknown_source_skipped: int = 0
 
 
 def _load_known_components(db_path: Path | str) -> set[str]:
@@ -341,6 +345,7 @@ def run_analyzer2(
     instances_written = 0
     wrapper_propagated = 0
     data_gap_skipped = 0
+    fmt_wrapper_unknown_source_skipped = 0
 
     atlas = open_atlas(Path(atlas_path))
     try:
@@ -355,12 +360,17 @@ def run_analyzer2(
             add_nvram_flow_rows(atlas, nvram_flow_rows, commit=False)
             for match in result.matches:
                 row = funcs.get(match.func_ref.func_id)
-                if row is None or not (row.pseudocode and row.pseudocode.strip()):
-                    # Never silent: a shape-matched sink candidate whose function body Ghidra could
-                    # not decompile is dropped here, but COUNTED so the candidate set is honestly
-                    # marked incomplete (surfaced in the hunt summary). A malformed/complex function
-                    # is exactly where a real sink can hide, so the agent must know it went
-                    # unanalyzed rather than assume the candidate set was complete.
+                # A data gap = no loadable body OR a decompile-error comment (non-empty
+                # text, no analyzable code). Both are dropped but COUNTED, so the candidate
+                # set is honestly marked incomplete (shown in the hunt summary) — a real sink
+                # can hide in exactly such an un-decompilable function, so the agent must know
+                # it went unanalyzed. (The `row.pseudocode and` chain narrows the type below,
+                # so the error-comment test rides the same guard.)
+                if (
+                    row is None
+                    or not (row.pseudocode and row.pseudocode.strip())
+                    or row.pseudocode.strip().startswith("/* decompile_error")
+                ):
                     data_gap_skipped += 1
                     logger.info("skipping match with no loadable function body (data gap)")
                     continue
@@ -567,6 +577,9 @@ def run_analyzer2(
                 # path. The command axis is deliberately unchanged: a constant / charset-
                 # constrained argument forwarded to a shell wrapper stays a downweighted lead.
                 if wc.sink_class == "fmt_string" and source_class == "unknown":
+                    # Counted, not silent: the fmt axis was intentionally narrowed here, and the
+                    # summary must show it rather than let the candidate set read as complete.
+                    fmt_wrapper_unknown_source_skipped += 1
                     continue
                 # Def-use provenance for the wrapper function's own sinks. The real
                 # sink is one hop away, but the forwarding function's provenance still tells the
@@ -622,4 +635,5 @@ def run_analyzer2(
         wrapper_propagated=wrapper_propagated,
         data_gap_skipped=data_gap_skipped,
         nvram_flows_written=len(nvram_flow_rows),
+        fmt_wrapper_unknown_source_skipped=fmt_wrapper_unknown_source_skipped,
     )

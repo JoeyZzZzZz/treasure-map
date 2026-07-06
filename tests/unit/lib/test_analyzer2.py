@@ -109,6 +109,18 @@ def _data_gap_cmd_fn(name: str) -> dict[str, object]:
     }
 
 
+def _decompile_error_cmd_fn(name: str) -> dict[str, object]:
+    """A command-sink function whose body is a decompile-error COMMENT (non-empty text, but no
+    analyzable code). It must still count as a data gap — the error comment must not slip past the
+    guard as an 'analyzed' body (Ghidra emits exactly this on a decompile exception)."""
+    return {
+        "name": name,
+        "pseudocode": "/* decompile_error: timed out */",
+        "hash": None,
+        "callees": ["system"],
+    }
+
+
 def _nvram_fn(name: str, ops: list[dict[str, object]]) -> dict[str, object]:
     """A function carrying nvram_ops but no shape-relevant callees — it is flattened into
     nvram_key_flow independent of the shape scan (the flatten runs over ALL functions)."""
@@ -193,6 +205,19 @@ def test_data_gap_matches_are_counted_not_silent(tmp_path: Path) -> None:
     assert stats.matches == 1  # the shape scan saw the candidate
     assert stats.instances_written == 0  # but its body was un-decompilable -> not written
     assert stats.data_gap_skipped == 1  # and it is COUNTED, never silently dropped
+    assert _count(atlas, "instance") == 0
+
+
+def test_decompile_error_body_is_a_counted_data_gap(tmp_path: Path) -> None:
+    # A "/* decompile_error ... */" body is non-empty text but carries no analyzable code — it must
+    # be caught as a data gap (counted), not slip past the guard and read as an analyzed function.
+    db = _make_db(tmp_path, [{"name": "webd", "funcs": [_decompile_error_cmd_fn("handle")]}])
+    atlas = tmp_path / "atlas.db"
+    stats = run_analyzer2(db, atlas, source_run_id="run_err")
+
+    assert stats.matches == 1
+    assert stats.instances_written == 0
+    assert stats.data_gap_skipped == 1
     assert _count(atlas, "instance") == 0
 
 
@@ -1334,6 +1359,33 @@ def test_free_string_via_fmt_wrapper_becomes_fmt_candidate(tmp_path: Path) -> No
     finally:
         conn.close()
     assert sink_class == "fmt_string"
+
+
+def _unknown_via_fmt_wrapper_fn(name: str = "log_status") -> dict[str, object]:
+    # Forwards a value with NO recognized free source (built from a constant) into the thin fmt
+    # wrapper. It has no direct fmt sink, so it is a fmt-wrapper candidate — but its source is
+    # 'unknown', so the fmt precision gate DROPS it. The drop must be COUNTED, not silent.
+    body = f'void {name}(void){{ char m[64]; snprintf(m,64,"status ok"); log_msg(m); }}'
+    return {
+        "name": name,
+        "pseudocode": body,
+        "hash": f"h_{name}",
+        "callees": ["snprintf", "log_msg"],
+    }
+
+
+def test_fmt_wrapper_unknown_source_drop_is_counted_not_silent(tmp_path: Path) -> None:
+    # The fmt axis is intentionally narrowed to controllable sources — but the drop must be
+    # surfaced (parity with data_gap_skipped), never let the candidate set read as complete.
+    db = _make_db(
+        tmp_path,
+        [{"name": "netd", "funcs": [_thin_fmt_wrapper_fn(), _unknown_via_fmt_wrapper_fn()]}],
+    )
+    atlas = tmp_path / "atlas.db"
+    stats = run_analyzer2(db, atlas, source_run_id="run_fmt_unk")
+    assert stats.fmt_wrapper_unknown_source_skipped == 1  # counted
+    # the dropped caller wrote no instance (only the direct wrapper match, log_msg, persists)
+    assert "log_status" not in _by_anchor(atlas)
 
 
 def test_fmt_wrapper_itself_kept_as_distinct_candidate(tmp_path: Path) -> None:

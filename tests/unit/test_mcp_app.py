@@ -311,6 +311,22 @@ def test_cross_firmware_and_aggregation_tools(tmp_path: Path) -> None:
         assert "note" in r and "count" in r  # may be empty, but always anchored + noted
 
 
+def test_aggregation_paging_never_silently_drops_the_tail(tmp_path: Path) -> None:
+    # Finding 7: a limited aggregation must expose the capped tail as REACHABLE (offset/truncated/
+    # next_offset), never count rows it silently omits.
+    tools = _tools(tmp_path)
+    full = tools["cross_firmware_patterns"](limit=1)
+    assert full["count"] == 1 and full["returned"] == 1
+    assert full["truncated"] is False and full["next_offset"] is None
+    # a cap below the count is honestly truncated with a reachable next_offset
+    capped = tools["cross_firmware_patterns"](limit=0)
+    assert capped["count"] == 1 and capped["returned"] == 0
+    assert capped["truncated"] is True and capped["next_offset"] == 0
+    # paging past the end is empty but still states the true total
+    past = tools["cross_firmware_patterns"](limit=5, offset=1)
+    assert past["returned"] == 0 and past["count"] == 1 and past["truncated"] is False
+
+
 # ── ★ milestone: recall -> fetch facts -> follow the chain (AI then judges) ─────────
 
 

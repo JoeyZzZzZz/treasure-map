@@ -222,6 +222,12 @@ def hunt_pattern(
             f"  Data-gap skipped  : {stats.data_gap_skipped} "
             "(shape matches with no decompilable body — candidate set is INCOMPLETE)"
         )
+    if stats.fmt_wrapper_unknown_source_skipped:
+        # Honesty flag: the fmt axis was intentionally narrowed (uncontrollable forwarded source).
+        click.echo(
+            f"  fmt-wrapper trim  : {stats.fmt_wrapper_unknown_source_skipped} "
+            "(fmt wrapper candidates dropped — unknown/uncontrollable source; fmt recall NARROWED)"
+        )
     if stats.nvram_flows_written:
         click.echo(f"  nvram key-flow    : {stats.nvram_flows_written} ops flattened")
     click.echo(
@@ -828,6 +834,12 @@ def scan(
         click.echo(
             f"      → {h.data_gap_skipped} shape matches skipped (data gap: no decompilable "
             "body) — candidate set INCOMPLETE"
+        )
+    if h.fmt_wrapper_unknown_source_skipped:
+        # Honesty flag: the fmt axis was intentionally narrowed (uncontrollable forwarded source).
+        click.echo(
+            f"      → {h.fmt_wrapper_unknown_source_skipped} fmt-wrapper candidates dropped "
+            "(unknown/uncontrollable source) — fmt recall NARROWED"
         )
     if h.nvram_flows_written:
         click.echo(f"      → {h.nvram_flows_written} nvram key-flow ops flattened → atlas")

@@ -128,6 +128,25 @@ def _run_summary(candidates: list[Any]) -> list[dict[str, Any]]:
     ]
 
 
+def _page(rows: list[Any], limit: int, offset: int) -> tuple[list[Any], dict[str, Any]]:
+    """Slice ``rows`` to a page and return (page, paging-meta) with explicit paging parity with
+    list_candidates: ``count`` (full total), ``returned``, ``offset``, ``truncated``, and
+    ``next_offset`` so the capped tail is REACHABLE — a limited aggregation never silently hides
+    rows past the cap (the tail was previously counted but unreachable)."""
+    lo = max(0, offset)
+    hi = lo + max(0, limit)
+    page = rows[lo:hi]
+    truncated = hi < len(rows)
+    meta = {
+        "count": len(rows),
+        "returned": len(page),
+        "offset": lo,
+        "truncated": truncated,
+        "next_offset": hi if truncated else None,
+    }
+    return page, meta
+
+
 def make_tools(
     analysis_db: Path | str, atlas_db: Path | str, run_id: str | None = None
 ) -> dict[str, Callable[..., Any]]:
@@ -227,71 +246,79 @@ def make_tools(
             "candidates": [_candidate_dict(c, current_run_id) for c in page],
         }
 
-    def cross_firmware_patterns(limit: int = 50) -> dict[str, Any]:
+    def cross_firmware_patterns(limit: int = 50, offset: int = 0) -> dict[str, Any]:
         """Per-pattern recurrence ledger — the highest-value cross-firmware signal.
 
         For each pattern: ``device_spread`` (how many distinct firmware runs it appears in) and
         ``pattern_breadth`` (distinct fine fingerprints). A candidate whose pattern recurs across
-        many firmware images is worth reviewing sooner. DERIVED, evidence-backed, NOT a verdict."""
+        many firmware images is worth reviewing sooner. Paged (``offset`` + ``truncated`` +
+        ``next_offset``) so the tail past ``limit`` is reachable. DERIVED, NOT a verdict."""
         conn = open_atlas(atlas_path)
         try:
             rows = _ledger(conn)
         finally:
             conn.close()
+        page, meta = _page(rows, limit, offset)
         return {
             "note": _DERIVED_SIGNAL_NOTE,
             "incomplete_binaries": _incomplete_binaries(),  # analysis-completeness honesty flag
-            "count": len(rows),
-            "patterns": [asdict(r) for r in rows[: max(0, limit)]],
+            **meta,
+            "patterns": [asdict(r) for r in page],
         }
 
-    def pattern_density(limit: int = 100) -> dict[str, Any]:
+    def pattern_density(limit: int = 100, offset: int = 0) -> dict[str, Any]:
         """Candidate-instance density per (run, sink_class, fingerprint).
 
         A count difference for the same fingerprint across runs (e.g. present in one build, absent
-        in another) is an early recurrence signal. DERIVED counts only, NOT a verdict."""
+        in another) is an early recurrence signal. Paged (``offset`` + ``truncated`` +
+        ``next_offset``). DERIVED counts only, NOT a verdict."""
         conn = open_atlas(atlas_path)
         try:
             rows = _density(conn)
         finally:
             conn.close()
+        page, meta = _page(rows, limit, offset)
         return {
             "note": _DERIVED_SIGNAL_NOTE,
             "incomplete_binaries": _incomplete_binaries(),  # analysis-completeness honesty flag
-            "count": len(rows),
-            "density": [asdict(r) for r in rows[: max(0, limit)]],
+            **meta,
+            "density": [asdict(r) for r in page],
         }
 
-    def pattern_twins(limit: int = 100) -> dict[str, Any]:
+    def pattern_twins(limit: int = 100, offset: int = 0) -> dict[str, Any]:
         """Fingerprints seen with BOTH a blocked and a non-blocked instance (same shape, mixed).
 
         A mixed-reachability fingerprint can flag a guard present in one place and absent in
-        another. May be empty depending on the atlas's firmware mix. DERIVED, NOT a verdict."""
+        another. May be empty depending on the atlas's firmware mix. Paged (``offset`` +
+        ``truncated`` + ``next_offset``). DERIVED, NOT a verdict."""
         conn = open_atlas(atlas_path)
         try:
             rows = _twins(conn)
         finally:
             conn.close()
+        page, meta = _page(rows, limit, offset)
         return {
             "note": _DERIVED_SIGNAL_NOTE,
-            "count": len(rows),
-            "twins": [asdict(r) for r in rows[: max(0, limit)]],
+            **meta,
+            "twins": [asdict(r) for r in page],
         }
 
-    def dormant_candidates(limit: int = 100) -> dict[str, Any]:
+    def dormant_candidates(limit: int = 100, offset: int = 0) -> dict[str, Any]:
         """Candidates whose in-function path carries an identified guard (blocked, L0/L1).
 
         Useful to spot a guard that may be absent elsewhere. May be empty depending on the atlas's
-        firmware mix. Each row is a lead, NOT a confirmed mitigation. DERIVED, NOT a verdict."""
+        firmware mix. Paged (``offset`` + ``truncated`` + ``next_offset``). Each row is a lead, NOT
+        a confirmed mitigation. DERIVED, NOT a verdict."""
         conn = open_atlas(atlas_path)
         try:
             rows = _dormant(conn)
         finally:
             conn.close()
+        page, meta = _page(rows, limit, offset)
         return {
             "note": _DERIVED_SIGNAL_NOTE,
-            "count": len(rows),
-            "dormant": [dict(r) for r in rows[: max(0, limit)]],
+            **meta,
+            "dormant": [dict(r) for r in page],
         }
 
     def explain_candidate(evidence_ref: str) -> dict[str, Any]:
