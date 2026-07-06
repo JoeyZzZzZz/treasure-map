@@ -39,6 +39,7 @@ def _flow(
     value_source: str | None = None,
     api: str = "nvram_set",
     run: str = "run_a",
+    via_wrapper: str | None = None,
 ) -> NvramFlowRow:
     return NvramFlowRow(
         source_run_id=run,
@@ -49,6 +50,7 @@ def _flow(
         op=op,
         value_source=value_source,
         api=api,
+        via_wrapper=via_wrapper,
     )
 
 
@@ -140,6 +142,43 @@ def test_anchorless_template_never_false_matches(tmp_path: Path) -> None:
     assert res["match"] == "none"
 
 
+# ── A2: a one-hop wrapper-indirect edge is surfaced, flagged via_wrapper ─────────────
+
+
+def test_wrapper_indirect_edge_is_surfaced_and_flagged(tmp_path: Path) -> None:
+    # A2: the caller reads a key THROUGH a thin wrapper; the key was a literal at the call site, so
+    # it resolves as a constant reader — but flagged via_wrapper + indirect so it is never mistaken
+    # for a direct call. This is the oauth-code case A2 recovers (readers no longer falsely empty).
+    atlas = _seed(
+        tmp_path,
+        [
+            _flow("oauth_auth_code", "constant", "rc", "save", "write", api="nvram_set"),
+            _flow(
+                "oauth_auth_code",
+                "constant",
+                "rc",
+                "biz_caller",
+                "read",
+                api="nvram_get",
+                via_wrapper="FUN_indirect_getter",
+            ),
+        ],
+    )
+    conn = open_atlas(atlas)
+    try:
+        res = get_nvram_key_flow(conn, "oauth_auth_code")
+    finally:
+        conn.close()
+    assert res["match"] == "exact"
+    (reader,) = res["readers"]
+    assert reader["func"] == "biz_caller"
+    assert reader["via_wrapper"] == "FUN_indirect_getter"
+    assert reader["indirect"] is True
+    # both sides present -> no empty-side note; coverage now states one-hop wrappers ARE captured
+    assert "via_wrapper" in res["coverage"] and "one-hop" in res["coverage"]
+    assert not any("empty readers" in n for n in res["notes"])
+
+
 # ── unresolved: never connected to a concrete key, but exposed via completeness ─────
 
 
@@ -204,7 +243,7 @@ def test_direct_writer_but_no_direct_reader_warns_wrapper(tmp_path: Path) -> Non
     assert [w["binary"] for w in res["writers"]] == ["httpd"]
     assert res["readers"] == []
     assert res["completeness"] == "may_be_incomplete"
-    assert any("empty readers" in n and "not yet resolved" in n for n in res["notes"])
+    assert any("empty readers" in n and "non-literal" in n for n in res["notes"])
 
 
 # ── template-to-regex grammar (unit) ────────────────────────────────────────────────

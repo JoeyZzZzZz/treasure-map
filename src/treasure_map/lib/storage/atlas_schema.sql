@@ -142,6 +142,8 @@ CREATE TABLE IF NOT EXISTS nvram_key_flow (
     op            TEXT NOT NULL DEFAULT 'read' CHECK (op IN ('read','write')),
     value_source  TEXT,   -- write-side value provenance JSON (controllability signal); NULL for reads
     api           TEXT,   -- the concrete nvram API (nvram_set / nvram_get / ...)
+    via_wrapper   TEXT,   -- A2: the thin nvram wrapper this indirect edge was resolved through (the
+                          --   key was a literal at the wrapper call site); NULL for a DIRECT nvram call
     created_at    DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 

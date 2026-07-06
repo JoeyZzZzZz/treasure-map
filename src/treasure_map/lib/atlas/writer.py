@@ -64,8 +64,8 @@ def add_nvram_flow_rows(
         return 0
     conn.executemany(
         """INSERT INTO nvram_key_flow
-           (source_run_id, key, key_kind, binary, func, op, value_source, api)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+           (source_run_id, key, key_kind, binary, func, op, value_source, api, via_wrapper)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         [
             (
                 r.source_run_id,
@@ -76,6 +76,7 @@ def add_nvram_flow_rows(
                 r.op,
                 r.value_source,
                 r.api,
+                r.via_wrapper,
             )
             for r in rows
         ],

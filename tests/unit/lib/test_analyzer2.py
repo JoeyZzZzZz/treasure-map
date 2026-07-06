@@ -60,10 +60,12 @@ def _make_db(
             )
         for func in spec.get("funcs", []):  # type: ignore[union-attr]
             fid += 1
+            nvram_wrapper = func.get("nvram_wrapper")
             conn.execute(
                 "INSERT INTO functions "
-                "(id, binary_id, name, pseudocode, pseudocode_hash, callees, nvram_ops) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "(id, binary_id, name, pseudocode, pseudocode_hash, callees, nvram_ops, "
+                "nvram_wrapper, wrapper_call_args) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     fid,
                     bid,
@@ -72,6 +74,8 @@ def _make_db(
                     func.get("hash"),
                     json.dumps(func["callees"]),
                     json.dumps(func.get("nvram_ops", [])),
+                    json.dumps(nvram_wrapper) if nvram_wrapper else None,
+                    json.dumps(func.get("wrapper_call_args", [])),
                 ),
             )
     conn.commit()
@@ -137,7 +141,7 @@ def _nvram_rows(atlas_path: Path) -> list[sqlite3.Row]:
     conn = open_atlas(atlas_path)
     try:
         return conn.execute(
-            "SELECT key, key_kind, binary, func, op, value_source, api "
+            "SELECT key, key_kind, binary, func, op, value_source, api, via_wrapper "
             "FROM nvram_key_flow ORDER BY binary, func, op"
         ).fetchall()
     finally:
@@ -367,6 +371,99 @@ def test_nvram_flow_replace_by_run_is_idempotent(tmp_path: Path) -> None:
     run_analyzer2(db, atlas, source_run_id="run_x")
     run_analyzer2(db, atlas, source_run_id="run_x")
     assert len(_nvram_rows(atlas)) == 1  # not 2
+
+
+# ── gap② A2: wrapper-indirect key edges recovered from constant call-site literals ──
+
+
+def _wrapper_reader_fn(name: str) -> dict[str, object]:
+    """A thin nvram wrapper: a caller-supplied key read (key_from_caller) + the nvram_wrapper flag
+    the extractor emits. Its own direct op is unresolved; the edge is resolved at its call sites."""
+    return {
+        "name": name,
+        "pseudocode": f"char* {name}(void){{ return nvram_get(); }}",
+        "hash": f"h_{name}",
+        "callees": ["nvram_get"],
+        "nvram_ops": [{"api": "nvram_get", "op": "read", "key_kind": "unresolved"}],
+        "nvram_wrapper": {"op": "read", "api": "nvram_get"},
+    }
+
+
+def _wrapper_caller_fn(name: str, callee: str, key: str) -> dict[str, object]:
+    """A business caller that passes a constant literal key to the wrapper (the resolvable edge)."""
+    return {
+        "name": name,
+        "pseudocode": f'void {name}(void){{ {callee}("{key}"); }}',
+        "hash": f"h_{name}",
+        "callees": [callee],
+        "wrapper_call_args": [{"callee": callee, "key": key, "key_kind": "constant"}],
+    }
+
+
+def test_wrapper_indirect_edge_recovered_with_via_wrapper(tmp_path: Path) -> None:
+    # A2 headline: the caller's constant-literal call into a recognized nvram wrapper becomes an
+    # indirect read edge for that key, flagged via_wrapper — the readers:[] blind spot, resolved.
+    db = _make_db(
+        tmp_path,
+        [
+            {
+                "name": "rc",
+                "funcs": [
+                    _wrapper_reader_fn("wget"),
+                    _wrapper_caller_fn("biz", "wget", "oauth_auth_code"),
+                ],
+            }
+        ],
+    )
+    atlas = tmp_path / "atlas.db"
+    stats = run_analyzer2(db, atlas, source_run_id="run_a2")
+    assert stats.nvram_wrapper_edges == 1
+    edge = next(r for r in _nvram_rows(atlas) if r["via_wrapper"] is not None)
+    assert edge["key"] == "oauth_auth_code"
+    assert edge["func"] == "biz" and edge["op"] == "read"
+    assert edge["via_wrapper"] == "wget" and edge["key_kind"] == "constant"
+
+
+def test_call_to_non_wrapper_makes_no_edge(tmp_path: Path) -> None:
+    # ★ zero false-connection: a constant-literal call whose callee is NOT a recognized wrapper
+    # produces NO edge — A2 never fabricates a key connection from an ordinary call.
+    db = _make_db(
+        tmp_path,
+        [
+            {
+                "name": "rc",
+                "funcs": [
+                    # 'helper' has no nvram_wrapper flag -> not a wrapper
+                    {
+                        "name": "helper",
+                        "pseudocode": "void helper(char* k){}",
+                        "hash": "h_helper",
+                        "callees": [],
+                    },
+                    _wrapper_caller_fn("biz", "helper", "some_key"),
+                ],
+            }
+        ],
+    )
+    atlas = tmp_path / "atlas.db"
+    stats = run_analyzer2(db, atlas, source_run_id="run_a2b")
+    assert stats.nvram_wrapper_edges == 0
+    assert all(r["via_wrapper"] is None for r in _nvram_rows(atlas))
+
+
+def test_wrapper_edge_does_not_cross_binaries(tmp_path: Path) -> None:
+    # A wrapper binds by (binary, name): a caller only resolves against a wrapper in its OWN binary,
+    # so a same-named function in another binary never mints a spurious cross-binary edge.
+    db = _make_db(
+        tmp_path,
+        [
+            {"name": "rc", "funcs": [_wrapper_reader_fn("wget")]},
+            {"name": "httpd", "funcs": [_wrapper_caller_fn("biz", "wget", "k")]},
+        ],
+    )
+    atlas = tmp_path / "atlas.db"
+    stats = run_analyzer2(db, atlas, source_run_id="run_a2c")
+    assert stats.nvram_wrapper_edges == 0  # rc's wrapper is not httpd's
 
 
 # ── evidence neutralization: raw literal never persisted ────────────────────────────

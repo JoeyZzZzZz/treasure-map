@@ -61,6 +61,12 @@ CREATE TABLE IF NOT EXISTS functions (
     -- gap② phase 1: per-function nvram read/write ops (which key this function reads/writes + the
     -- written value's source). Feeds the phase-2 cross-binary key graph. Empty '[]' when none.
     nvram_ops       TEXT    DEFAULT '[]',
+    -- gap② A2: JSON {op,api} when this function is a THIN nvram wrapper (forwards a caller-supplied
+    -- key into one nvram accessor); NULL otherwise. Feeds hunt-time wrapper-indirect edge recovery.
+    nvram_wrapper   TEXT,
+    -- gap② A2: JSON [{callee,key,key_kind}] — calls to a local function passing a CONSTANT literal
+    -- as arg0. Resolved against nvram_wrapper cross-function at hunt time into wrapper-indirect edges.
+    wrapper_call_args TEXT DEFAULT '[]',
     FOREIGN KEY(binary_id) REFERENCES binaries(id) ON DELETE CASCADE
 );
 

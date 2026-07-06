@@ -133,6 +133,7 @@ class Analyzer2Stats:
     wrapper_propagated: int = 0  # cmd/fmt candidates recovered via one-hop thin-wrapper propagation
     data_gap_skipped: int = 0  # shape matches dropped with no decompilable body (Ghidra gap)
     nvram_flows_written: int = 0  # gap② per-op nvram read/write rows flattened into the atlas
+    nvram_wrapper_edges: int = 0  # gap② A2 indirect key edges recovered through thin nvram wrappers
     # fmt-wrapper candidates dropped by the precision gate (uncontrollable/unknown forwarded value).
     # A deliberate recall trim — but COUNTED, not silent, so the summary shows the fmt axis was
     # narrowed (parity with data_gap_skipped; never let a drop imply the candidate set is complete).
@@ -309,6 +310,105 @@ def _flatten_nvram_ops(
     return rows
 
 
+def _load_wrapper_data(
+    db_path: Path | str,
+) -> tuple[dict[int, dict[str, Any]], dict[int, list[dict[str, Any]]]]:
+    """Load the A2 transport columns: func_id -> nvram_wrapper {op,api}, and func_id -> the calls
+    that pass a constant literal to a local function. A missing column (older analysis.db) or an
+    unparsable cell yields no entry — wrapper-indirect recovery is additive."""
+    uri = f"file:{Path(db_path)}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    wrappers: dict[int, dict[str, Any]] = {}
+    call_args: dict[int, list[dict[str, Any]]] = {}
+    try:
+        rows = conn.execute("SELECT id, nvram_wrapper, wrapper_call_args FROM functions").fetchall()
+    except sqlite3.OperationalError:
+        return wrappers, call_args  # pre-A2 analysis.db -> no data
+    finally:
+        conn.close()
+    for func_id, w_raw, ca_raw in rows:
+        if w_raw:
+            try:
+                w = json.loads(w_raw)
+            except (ValueError, TypeError):
+                w = None
+            if isinstance(w, dict) and w.get("op") in ("read", "write"):
+                wrappers[func_id] = w
+        if ca_raw:
+            try:
+                ca = json.loads(ca_raw)
+            except (ValueError, TypeError):
+                ca = None
+            if isinstance(ca, list) and ca:
+                call_args[func_id] = ca
+    return wrappers, call_args
+
+
+def _flatten_wrapper_edges(
+    all_funcs: list[FuncRow],
+    wrappers_by_func_id: dict[int, dict[str, Any]],
+    call_args_by_func_id: dict[int, list[dict[str, Any]]],
+    source_run_id: str,
+) -> list[NvramFlowRow]:
+    """A2: resolve each caller's constant-literal wrapper call into an INDIRECT nvram key edge.
+
+    A recognized thin nvram wrapper forwards a caller-supplied key into one nvram accessor, so
+    direct extraction records that key as key_from_caller (unresolved). Here, the caller passed a
+    resolved constant literal at the CALL SITE (wrapper_call_args), so the caller reads/writes THAT
+    key through the wrapper — a real edge the direct graph missed. Marked ``via_wrapper`` so a
+    consumer tells a one-hop indirect edge from a direct call. ONE hop only: only a literal at the
+    immediate call site is resolved; a forwarded caller-param stays uncaptured (honesty > coverage,
+    never a fabricated edge). Wrapper identity is (binary, name) — a caller binds to its own binary.
+    """
+    by_id = {f.func_id: f for f in all_funcs}
+    wrapper_by_bin_name: dict[tuple[str | None, str], dict[str, Any]] = {}
+    for fid, w in wrappers_by_func_id.items():
+        f = by_id.get(fid)
+        if f is not None and f.name:
+            wrapper_by_bin_name[(f.binary_name, f.name)] = w
+    rows: list[NvramFlowRow] = []
+    for f in all_funcs:
+        cas = call_args_by_func_id.get(f.func_id)
+        if not cas:
+            continue
+        for ca in cas:
+            if not isinstance(ca, dict):
+                continue
+            callee = ca.get("callee")
+            if not isinstance(callee, str):
+                continue
+            wrap = wrapper_by_bin_name.get((f.binary_name, callee))
+            if wrap is None:
+                continue  # callee is not a recognized nvram wrapper -> not an indirect edge
+            key = ca.get("key")
+            key = key if isinstance(key, str) else None
+            key_kind = ca.get("key_kind")
+            if key_kind not in ("constant", "parametric", "unresolved"):
+                key_kind = "unresolved"
+            if key_kind == "parametric" and not template_has_anchor(key or ""):
+                key_kind = "unresolved"
+            if key_kind == "unresolved" or not key:
+                continue  # no resolved key -> nothing concrete to connect (never fabricate an edge)
+            op = wrap.get("op")
+            if op not in ("read", "write"):
+                continue
+            api = wrap.get("api")
+            rows.append(
+                NvramFlowRow(
+                    source_run_id=source_run_id,
+                    key=key,
+                    key_kind=key_kind,
+                    binary=f.binary_name,
+                    func=f.name,
+                    op=op,
+                    value_source=None,  # written value lives inside the wrapper, unresolved here
+                    api=api if isinstance(api, str) else None,
+                    via_wrapper=callee,
+                )
+            )
+    return rows
+
+
 def run_analyzer2(
     db_path: Path | str,
     atlas_path: Path | str,
@@ -340,6 +440,12 @@ def run_analyzer2(
     # table below so an agent can trace a key's writers/readers across binaries. Empty when the
     # analysis.db predates the nvram_ops column.
     nvram_flow_rows = _flatten_nvram_ops(all_funcs, _load_nvram_ops(db_path), source_run_id)
+    # gap② A2: resolve each caller's constant-literal call into a recognized thin nvram wrapper into
+    # an INDIRECT key edge (via_wrapper) — the wrapper-indirect reads/writes the direct graph
+    # misses. Empty when the analysis.db predates the A2 columns. Appended to the run's flow rows.
+    _wrappers, _call_args = _load_wrapper_data(db_path)
+    wrapper_edge_rows = _flatten_wrapper_edges(all_funcs, _wrappers, _call_args, source_run_id)
+    nvram_flow_rows = nvram_flow_rows + wrapper_edge_rows
 
     by_status = {"confirmed": 0, "blocked": 0, "unknown": 0}
     instances_written = 0
@@ -635,5 +741,6 @@ def run_analyzer2(
         wrapper_propagated=wrapper_propagated,
         data_gap_skipped=data_gap_skipped,
         nvram_flows_written=len(nvram_flow_rows),
+        nvram_wrapper_edges=len(wrapper_edge_rows),
         fmt_wrapper_unknown_source_skipped=fmt_wrapper_unknown_source_skipped,
     )

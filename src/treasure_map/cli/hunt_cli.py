@@ -230,6 +230,10 @@ def hunt_pattern(
         )
     if stats.nvram_flows_written:
         click.echo(f"  nvram key-flow    : {stats.nvram_flows_written} ops flattened")
+    if stats.nvram_wrapper_edges:
+        click.echo(
+            f"  nvram wrapper edge: {stats.nvram_wrapper_edges} indirect key edges (via wrappers)"
+        )
     click.echo(
         "Note: every instance is a candidate/lead, not a confirmed result. With one firmware "
         "device_spread stays ~1 — cross-device spread needs more devices (future)."
@@ -843,6 +847,10 @@ def scan(
         )
     if h.nvram_flows_written:
         click.echo(f"      → {h.nvram_flows_written} nvram key-flow ops flattened → atlas")
+    if h.nvram_wrapper_edges:
+        click.echo(
+            f"      → {h.nvram_wrapper_edges} nvram wrapper-indirect key edges recovered (A2)"
+        )
     # Record this as the last run so `tmap mcp` (no args) serves this firmware's analysis.db.
     from treasure_map.lib.last_run import write_last_run
 

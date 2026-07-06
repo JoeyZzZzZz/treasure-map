@@ -78,5 +78,8 @@ class NvramFlowRow:
     op: str
     value_source: str | None = None  # write-side value provenance JSON; None for reads
     api: str | None = None
+    via_wrapper: str | None = (
+        None  # A2: thin nvram wrapper an indirect edge resolved through; None=direct
+    )
     id: int | None = None
     created_at: str | None = None

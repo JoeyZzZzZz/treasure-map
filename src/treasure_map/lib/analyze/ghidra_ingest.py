@@ -151,6 +151,13 @@ def _ingest_one_binary(
                 # gap② nvram_ops transport: per-function nvram read/write ops (key + written
                 # value source), carried verbatim for the phase-2 key graph. Old exports -> '[]'.
                 json.dumps(func.get("nvram_ops", []), ensure_ascii=False),
+                # gap② A2 transport: thin-nvram-wrapper flag (JSON obj or NULL) + this function's
+                # calls that pass a constant literal to a local function (resolved at hunt time into
+                # wrapper-indirect key edges). Old exports -> NULL / '[]'.
+                json.dumps(func["nvram_wrapper"], ensure_ascii=False)
+                if func.get("nvram_wrapper")
+                else None,
+                json.dumps(func.get("wrapper_call_args", []), ensure_ascii=False),
             )
         )
     if func_rows:
@@ -158,8 +165,8 @@ def _ingest_one_binary(
             """INSERT INTO functions
                (binary_id, name, address, size_bytes, pseudocode,
                 pseudocode_hash, callees, callees_truncated, is_exported,
-                sink_provenance, nvram_ops)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                sink_provenance, nvram_ops, nvram_wrapper, wrapper_call_args)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             func_rows,
         )
         stats.functions_ingested += len(func_rows)

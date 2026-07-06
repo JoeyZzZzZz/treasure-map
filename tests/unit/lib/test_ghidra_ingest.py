@@ -142,6 +142,51 @@ def test_ingest_string_truncation_defaults_complete(tmp_path: Path) -> None:
     conn.close()
 
 
+def test_ingest_stores_a2_wrapper_fields(tmp_path: Path) -> None:
+    """The A2 transport columns round-trip: a thin wrapper carries nvram_wrapper, a caller carries
+    wrapper_call_args; a plain function defaults NULL/'[]' (no wrapper data until re-scan)."""
+    conn, sha_to_id = _setup_db(tmp_path)
+    output_dir = tmp_path / "ghidra_output"
+    _write_ghidra_json(
+        output_dir,
+        "test_bin",
+        "a" * 64,
+        {
+            "functions": [
+                {
+                    "name": "wget",
+                    "address": "1000",
+                    "callees": ["nvram_get"],
+                    "pseudocode": "char* wget(void){}",
+                    "nvram_wrapper": {"op": "read", "api": "nvram_get"},
+                },
+                {
+                    "name": "biz",
+                    "address": "2000",
+                    "callees": ["wget"],
+                    "pseudocode": "void biz(void){}",
+                    "wrapper_call_args": [
+                        {"callee": "wget", "key": "sw_mode", "key_kind": "constant"}
+                    ],
+                },
+                {"name": "plain", "address": "3000", "callees": [], "pseudocode": "void p(){}"},
+            ],
+            "imports": [],
+            "exports": [],
+            "strings": [],
+        },
+    )
+    ingest_ghidra_output(conn, output_dir, [_make_record("test_bin", "a" * 64)], sha_to_id)
+    rows = {
+        r[0]: (r[1], r[2])
+        for r in conn.execute("SELECT name, nvram_wrapper, wrapper_call_args FROM functions")
+    }
+    assert json.loads(rows["wget"][0]) == {"op": "read", "api": "nvram_get"}
+    assert json.loads(rows["biz"][1])[0]["key"] == "sw_mode"
+    assert rows["plain"][0] is None and json.loads(rows["plain"][1]) == []
+    conn.close()
+
+
 def test_ingest_stores_callees_truncated_flag(tmp_path: Path) -> None:
     """A wide dispatcher whose callee list hit the cap carries callees_truncated=1 so the call
     graph is never read as complete; a normal function defaults to 0."""

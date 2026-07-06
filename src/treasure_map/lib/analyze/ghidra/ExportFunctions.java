@@ -311,6 +311,79 @@ public class ExportFunctions extends GhidraScript {
         return arr.toString();
     }
 
+    // gap② A2: recognize a THIN nvram wrapper — a function whose sole job is to forward a
+    // caller-supplied key into ONE nvram accessor (so phase-1 records that key as key_from_caller
+    // and the direct key graph misses the wrapper's callers). Conservative by construction, because
+    // a mis-recognition would mint a FALSE key edge (worse than a missing one):
+    //   • exactly ONE keyed nvram read/write op in the body,
+    //   • that op's key is key_from_caller (unresolved — a register/param, not a constant/template),
+    //   • the function takes <= 1 parameter, so the forwarded key is unambiguously arg0 (a
+    //     multi-parameter wrapper could key on a non-first arg — NOT recognized, to avoid a
+    //     wrong-arg false edge), and
+    //   • the body is thin (few calls).
+    // The indirect key is resolved at the CALL SITE (buildWrapperCallArgs), ONE hop only — this just
+    // flags the shape. Emits the leading-comma JSON field, or "" when not a recognized wrapper.
+    private static final int WRAPPER_CALL_LIMIT = 6;
+
+    private String buildNvramWrapper(HighFunction hf) {
+        List<PcodeOpAST> ops = new ArrayList<>();
+        Iterator<PcodeOpAST> it = hf.getPcodeOps();
+        while (it.hasNext()) ops.add(it.next());
+        int nvramKeyed = 0, callCount = 0;
+        String theOp = null, theApi = null;
+        boolean keyFromCaller = false;
+        for (PcodeOpAST op : ops) {
+            int oc = op.getOpcode();
+            if (oc != PcodeOp.CALL && oc != PcodeOp.CALLIND) continue;
+            callCount++;
+            String cn = calleeNameOf(op);
+            if (cn == null) continue;
+            NvSpec spec = NVRAM.get(cn);
+            if (spec == null || spec.keyIdx < 0) continue;   // only single-key read/write accessors
+            nvramKeyed++;
+            theApi = cn; theOp = spec.op;
+            Varnode kv = (spec.keyIdx + 1 < op.getNumInputs()) ? op.getInput(spec.keyIdx + 1) : null;
+            keyFromCaller = keyClass(kv, ops)[0].equals("unresolved");
+        }
+        int params;
+        try { params = hf.getFunction().getParameterCount(); } catch (Exception e) { params = 99; }
+        if (nvramKeyed == 1 && keyFromCaller && params <= 1 && callCount <= WRAPPER_CALL_LIMIT) {
+            return ",\"nvram_wrapper\":{\"op\":\"" + theOp + "\",\"api\":\"" + esc(theApi) + "\"}";
+        }
+        return "";
+    }
+
+    // gap② A2: at each CALL to a known LOCAL/imported function, resolve the FIRST argument to a
+    // CONSTANT string. If that callee is a recognized nvram wrapper (decided cross-function at hunt
+    // time), this literal is the indirect key the caller reads/writes through it — the wrapper edge
+    // that direct extraction misses. Only a resolved constant is emitted (the resolvable majority);
+    // a non-constant arg0 is a caller-param one more hop up and is left for the agent (honesty >
+    // coverage, ONE hop). resolveConst is cheap, so this stays bounded. Direct nvram calls are
+    // skipped (already in nvram_ops — not a wrapper hop). Emits ",\"wrapper_call_args\":[...]".
+    private String buildWrapperCallArgs(HighFunction hf, Set<String> knownNames) {
+        StringBuilder arr = new StringBuilder(",\"wrapper_call_args\":[");
+        boolean first = true;
+        Iterator<PcodeOpAST> it = hf.getPcodeOps();
+        while (it.hasNext()) {
+            PcodeOpAST op = it.next();
+            int oc = op.getOpcode();
+            if (oc != PcodeOp.CALL && oc != PcodeOp.CALLIND) continue;
+            String cn = calleeNameOf(op);
+            if (cn == null || !knownNames.contains(cn)) continue;   // only a known callee name
+            if (NVRAM.containsKey(cn)) continue;                    // a direct nvram call, not a hop
+            Varnode a0 = (op.getNumInputs() > 1) ? op.getInput(1) : null;
+            if (a0 == null) continue;
+            String k = resolveConst(a0, 0);
+            if (k == null || k.startsWith("0x")) continue;          // only a resolved literal key
+            if (!first) arr.append(",");
+            first = false;
+            arr.append("{\"callee\":\"").append(esc(cn)).append("\",\"key\":\"").append(esc(k))
+               .append("\",\"key_kind\":\"constant\"}");
+        }
+        arr.append("]");
+        return arr.toString();
+    }
+
     // Classify ONE key varnode into {"constant","<key>"} / {"parametric","<template>"} /
     // {"unresolved", null}. resolveConst reads a constant string key; a stack slot built by a string
     // writer is a parametric (built) key whose printf template is recovered when available.
@@ -1059,6 +1132,21 @@ public class ExportFunctions extends GhidraScript {
                 nvramOps = "[]";
             }
 
+            // gap② A2: thin-nvram-wrapper flag + its callers' resolved literal keys. Additive and
+            // isolated — a wrapper edge is recovered cross-function at hunt time; a failure here
+            // just yields no wrapper data, never breaking the scan (honesty > coverage).
+            String nvramWrapper = "";
+            String wrapperCallArgs = ",\"wrapper_call_args\":[]";
+            try {
+                if (hf != null) {
+                    nvramWrapper = buildNvramWrapper(hf);
+                    wrapperCallArgs = buildWrapperCallArgs(hf, knownNames);
+                }
+            } catch (Throwable ignore) {
+                nvramWrapper = "";
+                wrapperCallArgs = ",\"wrapper_call_args\":[]";
+            }
+
             if (!firstFunc) funcsJson.append(",");
             firstFunc = false;
             funcsJson.append("{")
@@ -1069,7 +1157,10 @@ public class ExportFunctions extends GhidraScript {
                      .append("\"callees\":")     .append(calleesArr).append(",")
                      .append("\"callees_truncated\":").append(calleesTruncated).append(",")
                      .append("\"sink_provenance\":").append(sinkProv).append(",")
-                     .append("\"nvram_ops\":")   .append(nvramOps).append(",")
+                     .append("\"nvram_ops\":")   .append(nvramOps)
+                     .append(nvramWrapper)       // ",\"nvram_wrapper\":{...}" or ""
+                     .append(wrapperCallArgs)    // ",\"wrapper_call_args\":[...]"
+                     .append(",")
                      .append("\"pseudocode\":")  .append("\"").append(esc(pseudocode)).append("\"")
                      .append("}");
             funcCount++;

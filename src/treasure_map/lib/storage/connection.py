@@ -52,6 +52,10 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # dispatcher), so get_callees / synthesized reverse-callers must not read it as complete. Back-
     # fills 0 on older DBs (pre-cap default = complete). Must match schema.sql.
     ("functions", "callees_truncated", "INTEGER DEFAULT 0"),
+    # gap② A2 transport (thin nvram wrapper flag + callers' resolved literal keys). Back-fill
+    # NULL/'[]' on older DBs (no wrapper data until re-scan). Must match schema.sql.
+    ("functions", "nvram_wrapper", "TEXT"),
+    ("functions", "wrapper_call_args", "TEXT DEFAULT '[]'"),
 )
 
 

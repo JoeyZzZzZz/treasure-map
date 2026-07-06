@@ -72,6 +72,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # hand-filled, unconsumed field. Idempotent — runs only while the column exists.
         conn.execute("ALTER TABLE pattern DROP COLUMN device_category")
 
+    # gap② A2 (added this round): the thin nvram wrapper a wrapper-indirect key edge was resolved
+    # through. Nullable TEXT — existing rows carry NULL (a DIRECT edge) until re-hunted. Idempotent.
+    nvkf_cols = _column_names(conn, "nvram_key_flow")
+    if nvkf_cols and "via_wrapper" not in nvkf_cols:
+        conn.execute("ALTER TABLE nvram_key_flow ADD COLUMN via_wrapper TEXT")
+
 
 def open_atlas(db_path: Path) -> sqlite3.Connection:
     """Open (or create) the atlas SQLite database and apply the schema.

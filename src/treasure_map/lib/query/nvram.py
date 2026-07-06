@@ -127,8 +127,17 @@ def _entry(row: sqlite3.Row) -> dict[str, Any]:
         "op": row["op"],
         "source_run_id": row["source_run_id"],
     }
+    via = row["via_wrapper"]
+    if via:
+        # A2: an INDIRECT edge — the key was a literal at a thin-nvram-wrapper call site, resolved
+        # one hop. func is the CALLER; it reads/writes the key THROUGH via_wrapper. Flagged so a
+        # consumer never mistakes a one-hop indirect access for a direct call.
+        entry["via_wrapper"] = via
+        entry["indirect"] = True
     if row["op"] == "write":
         # value_source is the write-side controllability signal (param/call_return/constant/...).
+        # For an indirect (via_wrapper) write the value lives inside the wrapper and is not resolved
+        # here, so value_source is None — not a claim of "no source".
         entry["value_source"] = _parse_value_source(row["value_source"])
     return entry
 
@@ -141,10 +150,12 @@ def _entry(row: sqlite3.Row) -> dict[str, Any]:
 # a real audit exposed: a key showed empty readers while a wrapper read it into a shell command
 # sink. Absence here means "no DIRECT call found", never "unused".
 COVERAGE_NOTE = (
-    "This key graph captures only DIRECT nvram_get/set calls with a literal key. A key reached "
-    "through a wrapper function (a helper that internally calls nvram_get/set) is NOT captured "
-    "here, and dynamically-built keys are a separate blind spot. Empty writers/readers means no "
-    "DIRECT call was found — it does NOT mean the key is unused; a wrapper may read or write it."
+    "This key graph captures DIRECT nvram_get/set calls with a literal key, PLUS one-hop "
+    "wrapper-indirect edges where the key was a literal at a thin-nvram-wrapper call site (each "
+    "such edge is flagged via_wrapper). NOT captured: a wrapper key forwarded from the caller's "
+    "own parameter (non-literal), deeper multi-hop wrapper nesting, and dynamic keys. Empty "
+    "writers/readers means no such edge was found — it does NOT mean the key is unused; a "
+    "non-literal or deeper wrapper path may still read or write it."
 )
 
 
@@ -161,7 +172,7 @@ def get_nvram_key_flow(conn: sqlite3.Connection, key: str) -> dict[str, Any]:
     never a verdict.
     """
     exact_rows = conn.execute(
-        "SELECT source_run_id, key, key_kind, binary, func, op, value_source, api "
+        "SELECT source_run_id, key, key_kind, binary, func, op, value_source, api, via_wrapper "
         "FROM nvram_key_flow WHERE key_kind = 'constant' AND key = ? "
         "ORDER BY binary, func",
         (key,),
@@ -170,7 +181,7 @@ def get_nvram_key_flow(conn: sqlite3.Connection, key: str) -> dict[str, Any]:
     readers = [_entry(r) for r in exact_rows if r["op"] == "read"]
 
     param_rows = conn.execute(
-        "SELECT source_run_id, key, key_kind, binary, func, op, value_source, api "
+        "SELECT source_run_id, key, key_kind, binary, func, op, value_source, api, via_wrapper "
         "FROM nvram_key_flow WHERE key_kind = 'parametric' AND key IS NOT NULL "
         "ORDER BY binary, func"
     ).fetchall()
@@ -203,9 +214,10 @@ def get_nvram_key_flow(conn: sqlite3.Connection, key: str) -> dict[str, Any]:
     missing = [side for side, rows in (("writers", writers), ("readers", readers)) if not rows]
     if missing:
         notes.append(
-            f"empty {' and '.join(missing)}: no DIRECT nvram_get/set(literal) call was found, but "
-            "a wrapper function accessing this key is NOT captured by this graph — absence is NOT "
-            "proof the key is unused (wrapper-indirect nvram access is not yet resolved)"
+            f"empty {' and '.join(missing)}: no DIRECT nvram_get/set(literal) call and no one-hop "
+            "constant-key wrapper edge was found — but a wrapper path with a non-literal "
+            "(caller-parameter) key or deeper nesting is NOT captured, so absence is NOT proof the "
+            "key is unused"
         )
     if unresolved_count:
         notes.append(
