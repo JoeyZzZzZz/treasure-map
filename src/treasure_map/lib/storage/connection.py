@@ -48,6 +48,10 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # NULL/0 on older DBs (a genuinely complete list is the pre-cap default). Must match schema.sql.
     ("binaries", "strings_total", "INTEGER"),
     ("binaries", "strings_truncated", "INTEGER DEFAULT 0"),
+    # honest callee-graph truncation: 1 = this function's callee list hit the extractor cap (a wide
+    # dispatcher), so get_callees / synthesized reverse-callers must not read it as complete. Back-
+    # fills 0 on older DBs (pre-cap default = complete). Must match schema.sql.
+    ("functions", "callees_truncated", "INTEGER DEFAULT 0"),
 )
 
 

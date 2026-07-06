@@ -142,6 +142,45 @@ def test_ingest_string_truncation_defaults_complete(tmp_path: Path) -> None:
     conn.close()
 
 
+def test_ingest_stores_callees_truncated_flag(tmp_path: Path) -> None:
+    """A wide dispatcher whose callee list hit the cap carries callees_truncated=1 so the call
+    graph is never read as complete; a normal function defaults to 0."""
+    conn, sha_to_id = _setup_db(tmp_path)
+    output_dir = tmp_path / "ghidra_output"
+    _write_ghidra_json(
+        output_dir,
+        "test_bin",
+        "a" * 64,
+        {
+            "functions": [
+                {
+                    "name": "dispatch",
+                    "address": "1000",
+                    "callees": ["h1", "h2"],
+                    "callees_truncated": True,
+                    "pseudocode": "void dispatch(){}",
+                },
+                {
+                    "name": "small",
+                    "address": "2000",
+                    "callees": ["puts"],
+                    "pseudocode": "void small(){}",
+                },
+            ],
+            "imports": [],
+            "exports": [],
+            "strings": [],
+        },
+    )
+    ingest_ghidra_output(conn, output_dir, [_make_record("test_bin", "a" * 64)], sha_to_id)
+    rows = dict(
+        conn.execute("SELECT name, callees_truncated FROM functions ORDER BY name").fetchall()
+    )
+    assert rows["dispatch"] == 1
+    assert rows["small"] == 0
+    conn.close()
+
+
 def test_ingest_maps_lib_name_to_lib_soname(tmp_path: Path) -> None:
     """JSON has 'lib_name', DB column is 'lib_soname'."""
     conn, sha_to_id = _setup_db(tmp_path)

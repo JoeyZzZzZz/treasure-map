@@ -201,6 +201,57 @@ def test_get_strings_by_value_search_flags_truncated_binaries(tmp_path: Path) ->
     conn.close()
 
 
+def _callee_trunc_db(tmp_path: Path) -> Path:
+    """A binary with a wide dispatcher whose callee list was truncated at the cap, plus a target
+    function it reaches — exercises the callee/caller silent-drop guards."""
+    db = tmp_path / "ct.db"
+    conn = open_db(db)
+    conn.execute(
+        "INSERT INTO binaries (id, name, path, sha256) VALUES (1, 'rc', 'sbin/rc', ?)",
+        ("a" * 64,),
+    )
+    conn.execute(
+        "INSERT INTO functions (id, binary_id, name, address, callees, callees_truncated, "
+        "pseudocode, is_exported) VALUES (1, 1, 'dispatch', '0x1000', ?, 1, 'void d(){}', 0)",
+        (json.dumps(["handler_a", "handler_b"]),),
+    )
+    conn.execute(
+        "INSERT INTO functions (id, binary_id, name, address, callees, callees_truncated, "
+        "pseudocode, is_exported) VALUES (2, 1, 'handler_a', '0x2000', '[]', 0, 'int h(){}', 0)"
+    )
+    conn.commit()
+    conn.close()
+    return db
+
+
+def test_get_callees_flags_truncated_dispatcher(tmp_path: Path) -> None:
+    conn = facts.open_analysis_ro(_callee_trunc_db(tmp_path))
+    res = facts.get_callees(conn, func="dispatch", binary="rc")
+    assert res["callees_truncated"] is True
+    assert "TRUNCATED" in res["note"] and "complete set" in res["note"]
+    # a normal function is honestly NOT truncated and carries no scary note
+    ok = facts.get_callees(conn, func="handler_a", binary="rc")
+    assert ok["callees_truncated"] is False and "note" not in ok
+    conn.close()
+
+
+def test_get_pseudocode_carries_callee_truncation(tmp_path: Path) -> None:
+    conn = facts.open_analysis_ro(_callee_trunc_db(tmp_path))
+    res = facts.get_pseudocode(conn, func="dispatch", binary="rc")
+    assert res["callees_truncated"] is True and "TRUNCATED" in res["note"]
+    conn.close()
+
+
+def test_get_xrefs_callers_warns_when_binary_has_truncated_callees(tmp_path: Path) -> None:
+    # handler_a's callers are reverse-resolved from callee lists; the dispatcher's list was
+    # truncated and could have dropped handler_a, so the caller set may be incomplete — say so.
+    conn = facts.open_analysis_ro(_callee_trunc_db(tmp_path))
+    res = facts.get_xrefs(conn, func="handler_a", direction="callers", binary="rc")
+    assert "TRUNCATED callee list" in res["note"]
+    assert "not proof of no caller" in res["note"]
+    conn.close()
+
+
 def test_get_script_callsites_is_entry_evidence(tmp_path: Path) -> None:
     conn = _ro(tmp_path)
     sites = facts.get_script_callsites(conn, binary="webd")["callsites"]

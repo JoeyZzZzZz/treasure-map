@@ -49,6 +49,9 @@ CREATE TABLE IF NOT EXISTS functions (
     pseudocode      TEXT,               -- Ghidra 反编译 C 伪代码
     pseudocode_hash TEXT,               -- MD5，用于去重
     callees         TEXT    DEFAULT '[]',   -- JSON: 直接被调函数名
+    callees_truncated INTEGER DEFAULT 0,    -- 1 = callee list hit the extractor cap (a wide dispatcher):
+                                            --   the list is a prefix, so get_callees / reverse-caller
+                                            --   synthesis must not read it as the complete call graph
     is_exported     INTEGER DEFAULT 0,      -- 1 = 导出符号
     -- sink_arg_provenance: Ghidra def-use fact per command/format sink in this function (JSON array,
     -- one record per sink; see ExportFunctions.buildSinkProvenance / the provenance design). TRANSPORT column:

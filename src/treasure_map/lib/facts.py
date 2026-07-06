@@ -109,7 +109,7 @@ def _match_functions(conn: sqlite3.Connection, func: str, binary: str | None) ->
         params.extend(addrs)
     sql = (
         "SELECT f.id, f.binary_id, f.name, f.address, f.size_bytes, f.pseudocode, f.callees, "
-        "f.is_exported, b.name AS binary_name, b.path AS binary_path "
+        "f.callees_truncated, f.is_exported, b.name AS binary_name, b.path AS binary_path "
         "FROM functions f JOIN binaries b ON b.id = f.binary_id "
         f"WHERE ({' OR '.join(where)})"  # noqa: S608 -- placeholders only; values stay bound params
     )
@@ -140,6 +140,14 @@ def _resolve_one(
     return rows[0], None
 
 
+# A callee list that hit the extractor cap is a PREFIX, not the whole call graph — said on every
+# result that carries a truncated list so the missing edges are never read as "no such callee".
+_CALLEES_TRUNC_NOTE = (
+    "callees TRUNCATED: this function's callee list hit the extractor cap (a wide dispatcher), so "
+    "it is a prefix — a callee NOT listed may still exist; do not read this as the complete set"
+)
+
+
 def get_pseudocode(
     conn: sqlite3.Connection, *, func: str, binary: str | None = None
 ) -> dict[str, Any]:
@@ -153,15 +161,20 @@ def get_pseudocode(
     if row is None:
         assert miss is not None
         return miss
-    return {
+    truncated = bool(row["callees_truncated"])
+    result: dict[str, Any] = {
         "found": True,
         "anchor": _anchor(row["binary_name"], row["name"], row["address"]),
         "binary_path": row["binary_path"],
         "size_bytes": row["size_bytes"],
         "is_exported": bool(row["is_exported"]),
         "callees": _parse_callees(row["callees"]),
+        "callees_truncated": truncated,
         "pseudocode": row["pseudocode"],
     }
+    if truncated:
+        result["note"] = _CALLEES_TRUNC_NOTE
+    return result
 
 
 def get_callees(
@@ -186,11 +199,16 @@ def get_callees(
         )
     }
     callees = _parse_callees(row["callees"])
-    return {
+    truncated = bool(row["callees_truncated"])
+    result: dict[str, Any] = {
         "found": True,
         "anchor": _anchor(binary_name, row["name"], row["address"]),
         "callees": [{"name": c, "resolved_in_binary": c in same_binary} for c in callees],
+        "callees_truncated": truncated,
     }
+    if truncated:
+        result["note"] = _CALLEES_TRUNC_NOTE
+    return result
 
 
 def get_xrefs(
@@ -240,13 +258,25 @@ def get_xrefs(
                 "library_level": of is None,  # NULL func id = a binary/library-level reference
             }
         )
-    note: str | None = None
+    notes: list[str] = []
     if direction == "callers":
         _append_callee_reverse_callers(conn, row, edges)
         if not edges:
-            note = (
+            notes.append(
                 "no direct callers found; may be reached via an indirect/dispatch-table/"
                 "function-pointer call that static analysis cannot resolve"
+            )
+        # Same-binary callers are reverse-resolved from callee lists; a caller whose OWN callee list
+        # was truncated at the cap may have dropped this target, so it is silently absent here. Warn
+        # whenever the binary has any truncated list — an empty/short caller set is not proof.
+        if conn.execute(
+            "SELECT 1 FROM functions WHERE binary_id = ? AND callees_truncated = 1 LIMIT 1",
+            (row["binary_id"],),
+        ).fetchone():
+            notes.append(
+                "some functions in this binary have a TRUNCATED callee list (a wide dispatcher hit "
+                "the extractor cap), so a same-binary caller reverse-resolved from callee lists "
+                "can be MISSING; an empty or short caller set is not proof of no caller"
             )
     result: dict[str, Any] = {
         "found": True,
@@ -254,8 +284,8 @@ def get_xrefs(
         "direction": direction,
         "edges": edges,
     }
-    if note is not None:
-        result["note"] = note
+    if notes:
+        result["note"] = " | ".join(notes)
     return result
 
 

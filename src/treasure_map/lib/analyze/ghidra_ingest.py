@@ -140,6 +140,9 @@ def _ingest_one_binary(
                 pseudocode,
                 ph,
                 json.dumps(func.get("callees", []), ensure_ascii=False),
+                # honest callee-graph truncation flag: 1 = the callee list is a prefix (cap hit), so
+                # consumers never read a clipped dispatcher's callees/callers as the complete graph.
+                1 if func.get("callees_truncated") else 0,
                 int(func.get("is_exported", 0)),
                 # sink_arg_provenance transport: the Ghidra-computed def-use fact for this
                 # function's command/format sinks, carried verbatim to be merged into the atlas
@@ -154,8 +157,9 @@ def _ingest_one_binary(
         conn.executemany(
             """INSERT INTO functions
                (binary_id, name, address, size_bytes, pseudocode,
-                pseudocode_hash, callees, is_exported, sink_provenance, nvram_ops)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                pseudocode_hash, callees, callees_truncated, is_exported,
+                sink_provenance, nvram_ops)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             func_rows,
         )
         stats.functions_ingested += len(func_rows)

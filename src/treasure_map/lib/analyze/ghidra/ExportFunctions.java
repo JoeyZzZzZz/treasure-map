@@ -404,14 +404,21 @@ public class ExportFunctions extends GhidraScript {
                 return callReturn(def, cn);
             }
             case PcodeOp.MULTIEQUAL: {
+                // A phi merge: classify each origin, but cap the fan-out at 6 to bound recursion.
+                // Past the cap the remaining origins are NOT silently dropped — sources_truncated +
+                // total_sources say the list is a prefix, so a controllable origin at input #7+ can
+                // never hide behind a "sources" array read as complete (the silent-drop red line).
                 StringBuilder sb = new StringBuilder("{\"kind\":\"multiple\",\"sources\":[");
+                int total = def.getNumInputs();
                 int n = 0;
-                for (int i = 0; i < def.getNumInputs() && n < 6; i++) {
+                for (int i = 0; i < total && n < 6; i++) {
                     if (n > 0) sb.append(",");
                     sb.append(classify(def.getInput(i), sink, ops, dom, depth + 1));
                     n++;
                 }
-                sb.append("]}");
+                sb.append("]");
+                if (total > n) sb.append(",\"sources_truncated\":true,\"total_sources\":").append(total);
+                sb.append("}");
                 return sb.toString();
             }
             case PcodeOp.INDIRECT:
@@ -495,8 +502,11 @@ public class ExportFunctions extends GhidraScript {
     // NEVER as a safe constant.
     private String constNode(Varnode v) {
         String t = constText(v);
-        if (t != null)
-            return "{\"kind\":\"constant\",\"value\":\"" + esc(t) + "\",\"value_kind\":\"literal_string\"}";
+        if (t != null) {
+            String trunc = strAtTruncated ? ",\"text_truncated\":true" : "";
+            return "{\"kind\":\"constant\",\"value\":\"" + esc(t)
+                 + "\",\"value_kind\":\"literal_string\"" + trunc + "}";
+        }
         return "{\"kind\":\"constant\",\"value\":\"0x" + Long.toHexString(v.getOffset())
              + "\",\"value_kind\":\"ambiguous_0x\"}";
     }
@@ -768,6 +778,7 @@ public class ExportFunctions extends GhidraScript {
         // global with unknown content as a fixed constant. A writable block is an extra caution flag.
         if (txt != null) {
             sb.append(",\"content\":\"known_string\",\"text\":\"").append(esc(txt)).append("\"");
+            if (strAtTruncated) sb.append(",\"text_truncated\":true");
         } else {
             sb.append(",\"content\":\"unknown\"");
             if (blk.isWrite()) sb.append(",\"writable\":true");
@@ -776,25 +787,39 @@ public class ExportFunctions extends GhidraScript {
         return sb.toString();
     }
 
+    // Set by strAt when its raw-byte fallback hits the cap mid-string (no NUL / non-printable
+    // terminator seen). Reset at the start of every strAt call; a caller reads it right after to
+    // surface text_truncated, so a clipped constant/format string is never emitted as a full value.
+    private boolean strAtTruncated = false;
+
+    // Cap on the raw-byte fallback (defined Data returns the full value untruncated). Raised from
+    // 200: real constant keys / format strings fit well under this, so truncation is now a rare
+    // edge — and when it DOES bite, strAtTruncated flags it rather than silently clipping.
+    private static final int STR_TEXT_LIMIT = 512;
+
     // Read a NUL-terminated printable string at an address: defined Data first, then raw bytes.
     private String strAt(Address a) {
+        strAtTruncated = false;
         if (a == null) return null;
         Data d = currentProgram.getListing().getDefinedDataAt(a);
         if (d != null) {
             Object val = d.getValue();
-            if (val instanceof String) return (String) val;
+            if (val instanceof String) return (String) val;   // defined Data: the full string
         }
         try {
             StringBuilder sb = new StringBuilder();
-            for (int i = 0; i < 200; i++) {
+            boolean terminated = false;
+            for (int i = 0; i < STR_TEXT_LIMIT; i++) {
                 byte b = currentProgram.getMemory().getByte(a.add(i));
-                if (b == 0) break;
+                if (b == 0) { terminated = true; break; }
                 if (b < 0x20 || b > 0x7e) {
                     if (i == 0) return null;   // not a string at all
+                    terminated = true;         // a printable run ended at a boundary — complete
                     break;
                 }
                 sb.append((char) b);
             }
+            if (!terminated) strAtTruncated = true;   // ran to the cap with no terminator: clipped
             return sb.length() > 0 ? sb.toString() : null;
         } catch (Exception e) {
             return null;
@@ -947,13 +972,20 @@ public class ExportFunctions extends GhidraScript {
             StringBuilder edgesArr   = new StringBuilder("[");   // {name,kind} — staged for optional call_edges, unemitted for now
             boolean firstCallee = true;
             int calleeCount = 0;
+            // CALLEE_LIMIT caps the callee list (was 200 -> 300; dispatchers fan out wide). When it
+            // IS hit the extra edges are NOT silently dropped: callees_truncated flags the record so
+            // get_callees / get_xrefs never read a clipped callee (or synthesized-caller) set as the
+            // complete call graph — the same silent-drop red line as strings/readers/data-gap.
+            final int CALLEE_LIMIT = 300;
+            boolean calleesTruncated = false;
             Set<String> seenCallees = new HashSet<>();   // shared across both callee data sources
             try {
                 ReferenceManager refMgr = currentProgram.getReferenceManager();
                 SymbolTable       symtab = currentProgram.getSymbolTable();
                 Listing           listing = currentProgram.getListing();
                 InstructionIterator instrIter = listing.getInstructions(func.getBody(), true);
-                while (instrIter.hasNext() && calleeCount < 300) {   // was 200; dispatchers fan out wide
+                scanRefs:
+                while (instrIter.hasNext()) {
                     Instruction instr = instrIter.next();
                     Reference[] refs = refMgr.getReferencesFrom(instr.getAddress());
                     for (Reference ref : refs) {
@@ -965,6 +997,7 @@ public class ExportFunctions extends GhidraScript {
                         if (calleeName == null || calleeName.isEmpty()) continue;
                         if (calleeName.equals(funcName)) continue;    // drop self-name (self-ref noise)
                         if (!seenCallees.add(calleeName)) continue;   // dedupe by name
+                        if (calleeCount >= CALLEE_LIMIT) { calleesTruncated = true; break scanRefs; }
                         if (!firstCallee) { calleesArr.append(","); edgesArr.append(","); }
                         firstCallee = false;
                         calleesArr.append("\"").append(esc(calleeName)).append("\"");
@@ -987,13 +1020,15 @@ public class ExportFunctions extends GhidraScript {
                 if (pseudocode != null && !pseudocode.isEmpty()
                         && !pseudocode.startsWith("/* decompile_error")) {
                     Matcher m = CALL_NAME.matcher(pseudocode);
-                    while (m.find() && calleeCount < 300) {
+                    scanText:
+                    while (m.find()) {
                         String cand = m.group(1);
                         if (cand == null || cand.isEmpty()) continue;
                         if (C_KEYWORDS.contains(cand)) continue;
                         if (!knownNames.contains(cand)) continue;   // the real filter
                         if (cand.equals(funcName)) continue;         // drop self-name (self-ref noise)
                         if (!seenCallees.add(cand)) continue;        // dedupe vs the reference source
+                        if (calleeCount >= CALLEE_LIMIT) { calleesTruncated = true; break scanText; }
                         if (!firstCallee) { calleesArr.append(","); edgesArr.append(","); }
                         firstCallee = false;
                         calleesArr.append("\"").append(esc(cand)).append("\"");
@@ -1032,6 +1067,7 @@ public class ExportFunctions extends GhidraScript {
                      .append("\"size\":")        .append(funcSize).append(",")
                      .append("\"is_exported\":") .append(isExported).append(",")
                      .append("\"callees\":")     .append(calleesArr).append(",")
+                     .append("\"callees_truncated\":").append(calleesTruncated).append(",")
                      .append("\"sink_provenance\":").append(sinkProv).append(",")
                      .append("\"nvram_ops\":")   .append(nvramOps).append(",")
                      .append("\"pseudocode\":")  .append("\"").append(esc(pseudocode)).append("\"")
