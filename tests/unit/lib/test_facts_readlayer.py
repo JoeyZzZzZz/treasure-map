@@ -146,6 +146,61 @@ def test_get_strings_and_imports_exports(tmp_path: Path) -> None:
     conn.close()
 
 
+def _trunc_db(tmp_path: Path) -> Path:
+    """A DB with one TRUNCATED binary (rc: stored a prefix of 5000) and one complete (httpd)."""
+    db = tmp_path / "trunc.db"
+    conn = open_db(db)
+    conn.execute(
+        "INSERT INTO binaries (id, name, path, sha256, strings_total, strings_truncated) "
+        "VALUES (1, 'rc', 'sbin/rc', ?, 5000, 1)",
+        ("a" * 64,),
+    )
+    conn.execute(
+        "INSERT INTO binaries (id, name, path, sha256, strings_total, strings_truncated) "
+        "VALUES (2, 'httpd', 'usr/sbin/httpd', ?, 2, 0)",
+        ("b" * 64,),
+    )
+    conn.execute("INSERT INTO strings (binary_id, value, address) VALUES (1, 'sw_mode', '0x10')")
+    conn.execute("INSERT INTO strings (binary_id, value, address) VALUES (2, 'lan_ip', '0x20')")
+    conn.execute("INSERT INTO strings (binary_id, value, address) VALUES (2, 'wan_ip', '0x24')")
+    conn.commit()
+    conn.close()
+    return db
+
+
+def test_get_strings_by_binary_surfaces_truncation(tmp_path: Path) -> None:
+    # A truncated binary must NEVER read as a complete list: absence of a string is not proof.
+    conn = facts.open_analysis_ro(_trunc_db(tmp_path))
+    trunc = facts.get_strings(conn, binary="rc")
+    assert trunc["truncated"] is True
+    assert trunc["total"] == 5000
+    assert trunc["stored"] == 1
+    note = trunc["truncation_note"]
+    assert "TRUNCATED" in note and "NOT proven absent" in note
+    # a complete binary is honestly marked NOT truncated, with no scary note
+    full = facts.get_strings(conn, binary="httpd")
+    assert full["truncated"] is False
+    assert full["total"] == 2
+    assert "truncation_note" not in full
+    conn.close()
+
+
+def test_get_strings_by_value_search_flags_truncated_binaries(tmp_path: Path) -> None:
+    # A content search that finds nothing must warn if a scanned binary was capped — the string
+    # could be a dropped tail entry, so "no hit" is not "absent".
+    conn = facts.open_analysis_ro(_trunc_db(tmp_path))
+    res = facts.get_strings(conn, value="oauth_missing")
+    assert res["strings"] == []
+    assert res["search_may_be_incomplete"] is True
+    assert res["truncated_binaries"] == ["rc"]
+    vnote = res["truncation_note"]
+    assert "rc" in vnote and "does NOT prove the string is absent" in vnote
+    # narrowing the search to the COMPLETE binary carries no incompleteness warning
+    scoped = facts.get_strings(conn, value="lan_ip", binary="httpd")
+    assert scoped["strings"] and "search_may_be_incomplete" not in scoped
+    conn.close()
+
+
 def test_get_script_callsites_is_entry_evidence(tmp_path: Path) -> None:
     conn = _ro(tmp_path)
     sites = facts.get_script_callsites(conn, binary="webd")["callsites"]

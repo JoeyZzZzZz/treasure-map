@@ -43,6 +43,11 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # re-dirties every binary once (a correct one-time re-extraction) until the current hash is
     # stored. Must match schema.sql.
     ("binaries", "pass_version", "TEXT"),
+    # honest string-truncation transport: true match count + a prefix flag, so get_strings surfaces
+    # a capped/searched binary's dropped strings instead of reading them as "absent". Back-fill
+    # NULL/0 on older DBs (a genuinely complete list is the pre-cap default). Must match schema.sql.
+    ("binaries", "strings_total", "INTEGER"),
+    ("binaries", "strings_truncated", "INTEGER DEFAULT 0"),
 )
 
 

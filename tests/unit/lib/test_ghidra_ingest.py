@@ -85,6 +85,63 @@ def test_ingest_single_binary_writes_all_tables(tmp_path: Path) -> None:
     conn.close()
 
 
+def test_ingest_stores_string_truncation_flags(tmp_path: Path) -> None:
+    """A truncated string export carries strings_total/strings_truncated onto the binaries row so
+    get_strings can tell a consumer the stored list is only a prefix (the silent-drop red line)."""
+    conn, sha_to_id = _setup_db(tmp_path)
+    output_dir = tmp_path / "ghidra_output"
+    _write_ghidra_json(
+        output_dir,
+        "test_bin",
+        "a" * 64,
+        {
+            "functions": [],
+            "imports": [],
+            "exports": [],
+            "strings": [{"value": "hello", "address": "2000"}],
+            "strings_total": 5000,
+            "strings_truncated": True,
+        },
+    )
+    ingest_ghidra_output(conn, output_dir, [_make_record("test_bin", "a" * 64)], sha_to_id)
+    row = conn.execute(
+        "SELECT strings_total, strings_truncated FROM binaries WHERE id = ?",
+        (sha_to_id["a" * 64],),
+    ).fetchone()
+    assert row[0] == 5000
+    assert row[1] == 1
+    conn.close()
+
+
+def test_ingest_string_truncation_defaults_complete(tmp_path: Path) -> None:
+    """An export WITHOUT the truncation fields (old pass) reads as complete: total = stored count,
+    truncated = 0 — never a spurious 'incomplete' on a genuinely full list."""
+    conn, sha_to_id = _setup_db(tmp_path)
+    output_dir = tmp_path / "ghidra_output"
+    _write_ghidra_json(
+        output_dir,
+        "test_bin",
+        "a" * 64,
+        {
+            "functions": [],
+            "imports": [],
+            "exports": [],
+            "strings": [
+                {"value": "hello", "address": "2000"},
+                {"value": "world", "address": "2008"},
+            ],
+        },
+    )
+    ingest_ghidra_output(conn, output_dir, [_make_record("test_bin", "a" * 64)], sha_to_id)
+    row = conn.execute(
+        "SELECT strings_total, strings_truncated FROM binaries WHERE id = ?",
+        (sha_to_id["a" * 64],),
+    ).fetchone()
+    assert row[0] == 2
+    assert row[1] == 0
+    conn.close()
+
+
 def test_ingest_maps_lib_name_to_lib_soname(tmp_path: Path) -> None:
     """JSON has 'lib_name', DB column is 'lib_soname'."""
     conn, sha_to_id = _setup_db(tmp_path)

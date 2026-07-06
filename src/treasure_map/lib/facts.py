@@ -322,6 +322,21 @@ _STRING_REF_NOTE = (
 )
 
 
+def _truncated_binaries(conn: sqlite3.Connection, binary_id: int | None = None) -> list[str]:
+    """Names of binaries whose string export was truncated at the extractor cap (scoped to one
+    binary when ``binary_id`` is given). A silent-drop guard: a value search over any of these can
+    MISS a string dropped past the cap, so the result must say so rather than imply completeness."""
+    if binary_id is not None:
+        rows = conn.execute(
+            "SELECT name FROM binaries WHERE id = ? AND strings_truncated = 1", (binary_id,)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT name FROM binaries WHERE strings_truncated = 1 ORDER BY name"
+        ).fetchall()
+    return [r["name"] for r in rows]
+
+
 def get_strings(
     conn: sqlite3.Connection,
     *,
@@ -359,12 +374,25 @@ def get_strings(
             }
             for r in conn.execute(sql, params)
         ]
-        return {
+        result: dict[str, Any] = {
             "found": True,
             "query": {"value": value, "binary": binary},
             "strings": hits,
             "note": _STRING_REF_NOTE,
         }
+        # Silent-drop guard: if a binary in scope was truncated at the export cap, a content search
+        # can MISS a hit dropped past the cap — an empty/short result is NOT proof of absence there.
+        trunc_bins = _truncated_binaries(conn, bid if binary is not None else None)
+        if trunc_bins:
+            result["search_may_be_incomplete"] = True
+            result["truncated_binaries"] = trunc_bins
+            result["truncation_note"] = (
+                "string export was TRUNCATED at the extractor cap for: "
+                + ", ".join(trunc_bins)
+                + " — a value search over a truncated binary can miss hits dropped past the cap, "
+                "so no match here does NOT prove the string is absent in that binary"
+            )
+        return result
     if binary is None:
         return {"found": False, "query": {"binary": binary, "value": value}}
     bid = _binary_id(conn, binary)
@@ -388,13 +416,30 @@ def get_strings(
             if a is None or not (lo <= a < hi):
                 continue
         items.append({"value": r["value"], "address": r["address"], "category": r["category"]})
-    return {
+    meta = conn.execute(
+        "SELECT strings_total, strings_truncated FROM binaries WHERE id = ?", (bid,)
+    ).fetchone()
+    truncated = bool(meta and meta["strings_truncated"])
+    total = int(meta["strings_total"]) if meta and meta["strings_total"] is not None else len(rows)
+    out: dict[str, Any] = {
         "found": True,
         "binary": binary,
         "function": func,
         "strings": items,
+        "stored": len(rows),  # strings held for this binary (before any func-range narrowing)
+        "total": total,  # true count of matching defined strings in the binary
+        "truncated": truncated,
         "note": _STRING_REF_NOTE,
     }
+    # Silent-drop guard: a truncated binary's stored list is only a prefix, so a string NOT listed
+    # is NOT proven absent — it may have been dropped past the export cap. Never imply completeness.
+    if truncated:
+        out["truncation_note"] = (
+            f"this binary's string export was TRUNCATED at the extractor cap ({len(rows)} of "
+            f"{total} stored): a string NOT listed is NOT proven absent — it may have been dropped "
+            "past the cap"
+        )
+    return out
 
 
 # A pseudocode substring search is a TEXT match, not a resolved symbol/xref reference: the schema

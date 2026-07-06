@@ -25,6 +25,10 @@ CREATE TABLE IF NOT EXISTS binaries (
     pass_version TEXT,                     -- content hash of the ExportFunctions pass that produced
                                            --   this row's output; a mismatch re-dirties it so a pass
                                            --   edit re-extracts automatically (no manual JSON delete)
+    strings_total     INTEGER,             -- true count of matching defined strings (>= stored); NULL
+                                           --   on binaries exported before honest truncation existed
+    strings_truncated INTEGER DEFAULT 0,   -- 1 = the stored strings list is a prefix (cap/cancel hit),
+                                           --   so get_strings must not read a missing string as absent
     last_seen_at DATETIME,                 -- timestamp of most recent ingest scan
     analyzed_at  DATETIME DEFAULT CURRENT_TIMESTAMP
 );

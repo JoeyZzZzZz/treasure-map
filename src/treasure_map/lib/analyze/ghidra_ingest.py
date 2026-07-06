@@ -191,3 +191,16 @@ def _ingest_one_binary(
             str_rows,
         )
         stats.strings_ingested += len(str_rows)
+
+    # Honest truncation flags: the extractor reports the true match count and whether the stored
+    # list is only a prefix (cap/cancel hit). Carry both onto the binaries row so get_strings can
+    # tell a consumer "this binary's strings are incomplete" instead of implying a clean, full list.
+    # Absent (old exports) -> total = stored, truncated = 0 (a complete list, the pre-cap default).
+    strings_total = data.get("strings_total")
+    if strings_total is None:
+        strings_total = len(str_rows)
+    strings_truncated = 1 if data.get("strings_truncated") else 0
+    conn.execute(
+        "UPDATE binaries SET strings_total = ?, strings_truncated = ? WHERE id = ?",
+        (int(strings_total), strings_truncated, binary_id),
+    )

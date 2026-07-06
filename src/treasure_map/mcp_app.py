@@ -382,7 +382,9 @@ def make_tools(
 
         ``value`` searches string CONTENT and returns each hit with its address + owning binary
         (one-call locate); reference-site (which function uses a string) is not indexed — the
-        result says so honestly."""
+        result says so honestly. HONEST BOUND: a binary's string export is capped, so results carry
+        ``truncated`` / ``total`` (by-binary) or ``search_may_be_incomplete`` (by-value) when a
+        scanned binary was capped — a string NOT found there is NOT proven absent."""
         return _with_analysis(
             lambda c: facts.get_strings(c, binary=binary, func=function, value=value)
         )

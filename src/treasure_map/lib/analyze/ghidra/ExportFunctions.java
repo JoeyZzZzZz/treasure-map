@@ -1099,15 +1099,23 @@ public class ExportFunctions extends GhidraScript {
         }
         exportsJson.append("]");
 
-        // 4. Strings from Ghidra defined Data (up to 2000 entries)
+        // 4. Strings from Ghidra defined Data.
+        // STR_LIMIT raised from 2000: real config binaries (rc / libshared) carry several thousand
+        // defined strings and were silently HALVED at 2000, so get_strings read a capped binary's
+        // dropped string as "absent" (a fake-empty — the same silent-drop red line as readers:[] and
+        // data-gap). Iterating defined string Data is cheap (not the decompile cost), so the cap is a
+        // large safety bound, not a tuning knob. When it IS still hit, truncation is SURFACED
+        // (strings_truncated / strings_total below) so a consumer never mistakes a cap for absence.
         StringBuilder stringsJson = new StringBuilder("[");
         boolean firstStr = true;
-        int     strCount = 0;
-        final int STR_LIMIT = 2000;
+        int     strCount = 0;   // strings actually stored (bounded by STR_LIMIT)
+        int     strTotal = 0;   // total matching strings seen (uncapped) — drives honest truncation
+        boolean strCancelled = false;
+        final int STR_LIMIT = 20000;
 
         DataIterator dataIter = currentProgram.getListing().getDefinedData(true);
-        while (dataIter.hasNext() && strCount < STR_LIMIT) {
-            if (monitor.isCancelled()) break;
+        while (dataIter.hasNext()) {
+            if (monitor.isCancelled()) { strCancelled = true; break; }
 
             Data   data   = dataIter.next();
             String dtName = data.getDataType().getName().toLowerCase();
@@ -1139,6 +1147,11 @@ public class ExportFunctions extends GhidraScript {
             if (val.length() < 5 || val.length() > 300) continue;
             if (!val.matches(".*[a-zA-Z0-9/._\\-].*")) continue;
 
+            // A matching string: always count it toward the true total; store it only under the cap.
+            // Past the cap we keep iterating (cheap) so strTotal is exact and truncation is honest.
+            strTotal++;
+            if (strCount >= STR_LIMIT) continue;
+
             if (!firstStr) stringsJson.append(",");
             firstStr = false;
             stringsJson.append("{")
@@ -1148,7 +1161,11 @@ public class ExportFunctions extends GhidraScript {
             strCount++;
         }
         stringsJson.append("]");
-        println("[ExportFunctions] strings: " + strCount);
+        // Truncated if the cap dropped matches OR a cancel cut the count short (then strTotal is a
+        // lower bound and completeness is unknown — flag it rather than imply a clean count).
+        boolean strTruncated = strTotal > strCount || strCancelled;
+        println("[ExportFunctions] strings: " + strCount + " stored / " + strTotal + " total"
+                + (strTruncated ? " (TRUNCATED)" : ""));
 
         // 5. Write JSON output file — atomically.
         // Write to a .tmp sibling first, then ATOMIC_MOVE into place so an
@@ -1166,7 +1183,12 @@ public class ExportFunctions extends GhidraScript {
             pw.print("\"functions\":"  + funcsJson   + ",");
             pw.print("\"imports\":"    + importsJson  + ",");
             pw.print("\"exports\":"    + exportsJson  + ",");
-            pw.print("\"strings\":"    + stringsJson);
+            pw.print("\"strings\":"    + stringsJson + ",");
+            // Honest truncation transport: strings_total is the true match count (>= stored), and
+            // strings_truncated says the stored list is a prefix. get_strings surfaces both so a
+            // capped/searched binary never reads its missing string as "absent".
+            pw.print("\"strings_total\":"     + strTotal + ",");
+            pw.print("\"strings_truncated\":" + strTruncated);
             pw.print("}");
         }
         try {
