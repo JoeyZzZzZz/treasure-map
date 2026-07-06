@@ -11,7 +11,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 
-from treasure_map.lib.atlas.models import InstanceRow, NvramFlowRow
+from treasure_map.lib.atlas.models import InstanceRow, NvramDefaultRow, NvramFlowRow
 from treasure_map.lib.errors import ConfigError
 
 _VALID_ORIGINS = ("custom", "vendor_modified_oss", "stock_oss_known", "unknown")
@@ -77,6 +77,48 @@ def add_nvram_flow_rows(
                 r.value_source,
                 r.api,
                 r.via_wrapper,
+            )
+            for r in rows
+        ],
+    )
+    if commit:
+        conn.commit()
+    return len(rows)
+
+
+def delete_run_nvram_defaults(
+    conn: sqlite3.Connection, source_run_id: str, *, commit: bool = True
+) -> int:
+    """Delete all nvram_defaults rows of one run (replace-by-run refresh). Returns rows deleted.
+
+    Touches ONLY this run_id's rows. With commit=False the delete joins the caller's transaction."""
+    cur = conn.execute("DELETE FROM nvram_defaults WHERE source_run_id = ?", (source_run_id,))
+    if commit:
+        conn.commit()
+    return cur.rowcount
+
+
+def add_nvram_default_rows(
+    conn: sqlite3.Connection, rows: list[NvramDefaultRow], *, commit: bool = True
+) -> int:
+    """Insert flattened router_defaults member rows in one batch; return the count.
+
+    Neutral data-segment facts (key + default + flags). A key=NULL row records an unresolved member
+    (keeps a located-but-incomplete table honest). No verdict — web_settable queries these."""
+    if not rows:
+        return 0
+    conn.executemany(
+        """INSERT INTO nvram_defaults
+           (source_run_id, key, default_value, flags, member_index, binary)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        [
+            (
+                r.source_run_id,
+                r.key,
+                r.default_value,
+                r.flags,
+                r.member_index,
+                r.binary,
             )
             for r in rows
         ],

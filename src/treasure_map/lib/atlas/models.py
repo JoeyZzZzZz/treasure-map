@@ -83,3 +83,20 @@ class NvramFlowRow:
     )
     id: int | None = None
     created_at: str | None = None
+
+
+@dataclass(frozen=True)
+class NvramDefaultRow:
+    """Mirrors one nvram_defaults row: a member of the router_defaults web-settable-key table,
+    flattened from analysis.db. key is the default key name (None for an unresolved/unparsed member,
+    which keeps a located-but-incomplete table honest). A neutral data-segment fact — the
+    web_settable answer is a query over these rows, never a stored verdict."""
+
+    source_run_id: str | None
+    key: str | None
+    default_value: str | None = None
+    flags: int | None = None
+    member_index: int | None = None
+    binary: str | None = None
+    id: int | None = None
+    created_at: str | None = None

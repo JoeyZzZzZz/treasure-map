@@ -159,6 +159,52 @@ COVERAGE_NOTE = (
 )
 
 
+def _web_settable(conn: sqlite3.Connection, key: str) -> dict[str, Any]:
+    """Source-side writability: is ``key`` in the router_defaults web-settable-key table?
+
+    THREE-STATE, with a false-negative red line — ``in_router_defaults`` is:
+      True       — the key IS a located member (confirmed web-settable via the config apply path).
+      False      — the table was located AND complete AND the key is not a member.
+      "uncertain"— the table was NOT located in this atlas, OR it was located but parse incomplete
+                   (the key could be an unresolved member). Table-not-located is NEVER False:
+                   inability to locate the table is not proof the key is not settable.
+    A surfaced fact only (in-table + default + flags); any judgement drawn from it is the agent's.
+    """
+    try:
+        located = conn.execute("SELECT 1 FROM nvram_defaults LIMIT 1").fetchone() is not None
+    except sqlite3.OperationalError:
+        located = False  # table absent (older atlas) -> unknown, never "not settable"
+    if not located:
+        return {
+            "in_router_defaults": "uncertain",
+            "reason": "router_defaults table not located in this atlas — web-settability is "
+            "unknown, NOT 'not settable' (a false-negative would be a red-line violation)",
+        }
+    hit = conn.execute(
+        "SELECT default_value, flags, binary FROM nvram_defaults WHERE key = ? "
+        "ORDER BY binary LIMIT 1",
+        (key,),
+    ).fetchone()
+    if hit is not None:
+        return {
+            "in_router_defaults": True,
+            "default_value": hit["default_value"],
+            "flags": hit["flags"],
+            "source": f"{hit['binary'] or 'libshared'} router_defaults",
+        }
+    incomplete = (
+        conn.execute("SELECT 1 FROM nvram_defaults WHERE key IS NULL LIMIT 1").fetchone()
+        is not None
+    )
+    if incomplete:
+        return {
+            "in_router_defaults": "uncertain",
+            "reason": "router_defaults located but parse is incomplete (some members unresolved) — "
+            "this key could be an unparsed member",
+        }
+    return {"in_router_defaults": False, "source": "router_defaults (located, complete)"}
+
+
 def get_nvram_key_flow(conn: sqlite3.Connection, key: str) -> dict[str, Any]:
     """Assemble the cross-binary read/write graph for one concrete nvram key.
 
@@ -237,6 +283,10 @@ def get_nvram_key_flow(conn: sqlite3.Connection, key: str) -> dict[str, Any]:
         "readers": readers,
         "template_matches": template_matches,
         "unresolved_count": unresolved_count,
+        # source-side writability: is this key web-settable via the router_defaults table? A
+        # three-state fact (True / False / "uncertain") — never asserts "not settable" from a
+        # not-located table (false-negative red line).
+        "web_settable": _web_settable(conn, key),
         "coverage": COVERAGE_NOTE,
         "completeness": completeness,
         "notes": notes,

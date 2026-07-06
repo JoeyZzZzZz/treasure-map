@@ -9,8 +9,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from treasure_map.lib.atlas.connection import open_atlas
-from treasure_map.lib.atlas.models import NvramFlowRow
-from treasure_map.lib.atlas.writer import add_nvram_flow_rows
+from treasure_map.lib.atlas.models import NvramDefaultRow, NvramFlowRow
+from treasure_map.lib.atlas.writer import add_nvram_default_rows, add_nvram_flow_rows
 from treasure_map.lib.query import get_nvram_key_flow
 from treasure_map.lib.query.nvram import (
     _template_matches,
@@ -19,14 +19,39 @@ from treasure_map.lib.query.nvram import (
 )
 
 
-def _seed(tmp_path: Path, rows: list[NvramFlowRow]) -> Path:
+def _seed(
+    tmp_path: Path,
+    rows: list[NvramFlowRow],
+    defaults: list[NvramDefaultRow] | None = None,
+) -> Path:
     atlas = tmp_path / "atlas.db"
     conn = open_atlas(atlas)
     try:
         add_nvram_flow_rows(conn, rows)
+        if defaults:
+            add_nvram_default_rows(conn, defaults)
     finally:
         conn.close()
     return atlas
+
+
+def _default(
+    key: str | None,
+    *,
+    default_value: str | None = None,
+    flags: int | None = None,
+    member_index: int = 0,
+    binary: str = "libshared.so",
+    run: str = "run_a",
+) -> NvramDefaultRow:
+    return NvramDefaultRow(
+        source_run_id=run,
+        key=key,
+        default_value=default_value,
+        flags=flags,
+        member_index=member_index,
+        binary=binary,
+    )
 
 
 def _flow(
@@ -244,6 +269,78 @@ def test_direct_writer_but_no_direct_reader_warns_wrapper(tmp_path: Path) -> Non
     assert res["readers"] == []
     assert res["completeness"] == "may_be_incomplete"
     assert any("empty readers" in n and "non-literal" in n for n in res["notes"])
+
+
+# ── web_settable: source-side writability from router_defaults (naming-bridge phase 1) ──
+
+
+def test_web_settable_true_carries_default_and_flags(tmp_path: Path) -> None:
+    # The OAuth acceptance shape: the key IS a router_defaults member -> in_router_defaults True,
+    # with its default (an empty string, distinct from null) and flags surfaced as facts.
+    atlas = _seed(
+        tmp_path,
+        [_flow("oauth_auth_code", "constant", "httpd", "save", "write")],
+        defaults=[_default("oauth_auth_code", default_value="", flags=0x80, member_index=894)],
+    )
+    conn = open_atlas(atlas)
+    try:
+        res = get_nvram_key_flow(conn, "oauth_auth_code")
+    finally:
+        conn.close()
+    ws = res["web_settable"]
+    assert ws["in_router_defaults"] is True
+    assert ws["default_value"] == ""  # a real empty-string default, not null
+    assert ws["flags"] == 0x80
+    assert "router_defaults" in ws["source"]
+
+
+def test_web_settable_false_only_when_located_and_complete(tmp_path: Path) -> None:
+    # Table located (has members) AND complete (no unresolved) AND key absent -> a definite False.
+    atlas = _seed(
+        tmp_path,
+        [],
+        defaults=[_default("sw_mode", default_value="0", flags=0, member_index=0)],
+    )
+    conn = open_atlas(atlas)
+    try:
+        res = get_nvram_key_flow(conn, "not_a_member")
+    finally:
+        conn.close()
+    assert res["web_settable"]["in_router_defaults"] is False
+
+
+def test_web_settable_uncertain_when_table_not_located(tmp_path: Path) -> None:
+    # ★ false-negative red line: no router_defaults rows in the atlas -> uncertain, NEVER False.
+    atlas = _seed(tmp_path, [_flow("sw_mode", "constant", "rc", "set_mode", "write")])
+    conn = open_atlas(atlas)
+    try:
+        res = get_nvram_key_flow(conn, "sw_mode")
+    finally:
+        conn.close()
+    ws = res["web_settable"]
+    assert ws["in_router_defaults"] == "uncertain"
+    assert ws["in_router_defaults"] is not False
+    assert "not located" in ws["reason"]
+
+
+def test_web_settable_uncertain_when_located_but_incomplete(tmp_path: Path) -> None:
+    # Table located but a member failed to parse (key NULL row) -> a not-found key is uncertain (it
+    # could be the unparsed member), never a false "not settable".
+    atlas = _seed(
+        tmp_path,
+        [],
+        defaults=[
+            _default("sw_mode", default_value="0", flags=0, member_index=0),
+            _default(None, member_index=500),  # an unresolved member -> table is incomplete
+        ],
+    )
+    conn = open_atlas(atlas)
+    try:
+        res = get_nvram_key_flow(conn, "some_other_key")
+    finally:
+        conn.close()
+    assert res["web_settable"]["in_router_defaults"] == "uncertain"
+    assert "incomplete" in res["web_settable"]["reason"]
 
 
 # ── template-to-regex grammar (unit) ────────────────────────────────────────────────

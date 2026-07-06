@@ -54,6 +54,7 @@ def _hunt_stats(written: int = 0) -> SimpleNamespace:
         data_gap_skipped=0,
         nvram_flows_written=0,
         nvram_wrapper_edges=0,
+        nvram_defaults_written=0,
         fmt_wrapper_unknown_source_skipped=0,
     )
 

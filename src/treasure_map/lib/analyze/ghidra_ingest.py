@@ -123,7 +123,7 @@ def _ingest_one_binary(
     """Replace this binary's rows in functions/imports/exports/strings."""
 
     # DELETE existing rows for this binary_id (idempotent re-ingest)
-    for table in ("functions", "imports", "exports", "strings"):
+    for table in ("functions", "imports", "exports", "strings", "nvram_defaults"):
         conn.execute(f"DELETE FROM {table} WHERE binary_id = ?", (binary_id,))
 
     # functions
@@ -215,3 +215,34 @@ def _ingest_one_binary(
         "UPDATE binaries SET strings_total = ?, strings_truncated = ? WHERE id = ?",
         (int(strings_total), strings_truncated, binary_id),
     )
+
+    # naming-bridge phase 1: the router_defaults web-settable-key table. Only a binary where the
+    # symbol was LOCATED contributes rows (a resolved member -> key=name; a member whose name ptr
+    # was unreadable -> key=NULL, so a located-but-incomplete table stays honest). A binary without
+    # the symbol (located=false) contributes NO rows — absence reads as "not located" (unknown),
+    # never as "no web-settable keys".
+    defaults = data.get("nvram_defaults")
+    if isinstance(defaults, dict) and defaults.get("located"):
+        def_rows: list[tuple[Any, ...]] = [
+            (
+                binary_id,
+                m.get("key"),
+                m.get("default_value"),
+                m.get("flags"),
+                m.get("index"),
+            )
+            for m in defaults.get("members", [])
+            if isinstance(m, dict)
+        ]
+        # unresolved members: name ptr non-null but unreadable — recorded (key NULL), never silent
+        def_rows += [
+            (binary_id, None, None, None, u.get("index"))
+            for u in defaults.get("unresolved_members", [])
+            if isinstance(u, dict)
+        ]
+        if def_rows:
+            conn.executemany(
+                "INSERT INTO nvram_defaults "
+                "(binary_id, key, default_value, flags, member_index) VALUES (?, ?, ?, ?, ?)",
+                def_rows,
+            )

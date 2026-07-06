@@ -78,6 +78,12 @@ def _make_db(
                     json.dumps(func.get("wrapper_call_args", [])),
                 ),
             )
+        for m in spec.get("nvram_defaults", []):  # type: ignore[union-attr]
+            conn.execute(
+                "INSERT INTO nvram_defaults "
+                "(binary_id, key, default_value, flags, member_index) VALUES (?, ?, ?, ?, ?)",
+                (bid, m.get("key"), m.get("default_value"), m.get("flags"), m.get("index")),
+            )
     conn.commit()
     conn.close()
     return db_path
@@ -464,6 +470,60 @@ def test_wrapper_edge_does_not_cross_binaries(tmp_path: Path) -> None:
     atlas = tmp_path / "atlas.db"
     stats = run_analyzer2(db, atlas, source_run_id="run_a2c")
     assert stats.nvram_wrapper_edges == 0  # rc's wrapper is not httpd's
+
+
+# ── naming-bridge phase 1: router_defaults flattened analysis.db -> atlas ────────────
+
+
+def _nvram_defaults_rows(atlas_path: Path) -> list[sqlite3.Row]:
+    conn = open_atlas(atlas_path)
+    try:
+        return conn.execute(
+            "SELECT key, default_value, flags, member_index, binary FROM nvram_defaults "
+            "ORDER BY member_index"
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def test_router_defaults_flattened_to_atlas(tmp_path: Path) -> None:
+    db = _make_db(
+        tmp_path,
+        [
+            {
+                "name": "libshared.so",
+                "funcs": [_nvram_fn("noop", [])],
+                "nvram_defaults": [
+                    {"key": "sw_mode", "default_value": "0", "flags": 0, "index": 0},
+                    {"key": "oauth_auth_code", "default_value": "", "flags": 128, "index": 894},
+                    {"key": None, "default_value": None, "flags": None, "index": 900},  # unresolved
+                ],
+            }
+        ],
+    )
+    atlas = tmp_path / "atlas.db"
+    stats = run_analyzer2(db, atlas, source_run_id="run_rd")
+    assert stats.nvram_defaults_written == 3  # resolved members + the unresolved one (not dropped)
+    rows = _nvram_defaults_rows(atlas)
+    hit = next(r for r in rows if r["key"] == "oauth_auth_code")
+    assert hit["default_value"] == "" and hit["flags"] == 128 and hit["binary"] == "libshared.so"
+    # the unresolved member is preserved as a key=NULL row (keeps the table honestly incomplete)
+    assert any(r["key"] is None for r in rows)
+
+
+def test_router_defaults_replace_by_run_is_idempotent(tmp_path: Path) -> None:
+    spec = [
+        {
+            "name": "libshared.so",
+            "funcs": [_nvram_fn("noop", [])],
+            "nvram_defaults": [{"key": "sw_mode", "default_value": "0", "flags": 0, "index": 0}],
+        }
+    ]
+    db = _make_db(tmp_path, spec)
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_rd2")
+    run_analyzer2(db, atlas, source_run_id="run_rd2")
+    assert len(_nvram_defaults_rows(atlas)) == 1  # not 2
 
 
 # ── evidence neutralization: raw literal never persisted ────────────────────────────

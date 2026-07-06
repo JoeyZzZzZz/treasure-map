@@ -384,6 +384,93 @@ public class ExportFunctions extends GhidraScript {
         return arr.toString();
     }
 
+    // Naming-bridge phase 1: parse the router_defaults data-segment table — the array of
+    // {char* name, char* value(default), int flags, ...} 20-byte members that enumerates every
+    // web-settable nvram default key (libshared). A PURE data-segment fact (no code / no
+    // pseudocode), the source-side key-writability signal the decompiler cannot surface. Probe-nailed
+    // layout: 20-byte stride, offset 0 = name ptr (.rodata), offset 4 = value ptr (default, nullable),
+    // offset 8 = flags int; walk from the symbol until a NULL/invalid name ptr (the table-end
+    // sentinel). Emits a JSON object. A binary WITHOUT the symbol emits {"located":false} — NOT an
+    // error, and NEVER "no web-settable keys" (symbol absence is unknown, not proof: a false-negative
+    // red line). Honesty: a value that can't be read is default_value:null (not ""); a member whose
+    // name is non-null but unreadable is recorded in unresolved_members (not silently skipped) and
+    // stops the walk (never reads past the table into garbage).
+    private static final int NVDEF_STRIDE = 20;
+    private static final int NVDEF_MAX_MEMBERS = 8000;
+
+    private String buildNvramDefaults() {
+        SymbolIterator si = currentProgram.getSymbolTable().getSymbols("router_defaults");
+        Symbol sym = si.hasNext() ? si.next() : null;
+        if (sym == null || sym.getAddress() == null)
+            return "{\"located\":false}";   // symbol absent -> unknown, never "no keys"
+        Address base = sym.getAddress();
+        Memory mem = currentProgram.getMemory();
+        StringBuilder members = new StringBuilder("[");
+        StringBuilder unresolved = new StringBuilder("[");
+        boolean firstM = true, firstU = true, truncated = false;
+        int idx = 0;
+        for (; idx < NVDEF_MAX_MEMBERS; idx++) {
+            Address memAddr;
+            int namePtr;
+            try {
+                memAddr = base.add((long) idx * NVDEF_STRIDE);
+                namePtr = mem.getInt(memAddr);
+            } catch (Exception e) {
+                break;   // unreadable member slot -> table end / edge of segment
+            }
+            if (namePtr == 0) break;   // NULL name ptr = the clean table-end sentinel
+            String key = null;
+            try { key = strAtRodata(toAddr(namePtr & 0xFFFFFFFFL), mem); } catch (Exception ignore) {}
+            if (key == null) {
+                // name ptr is non-null but does not resolve to a readable .rodata string: an anomaly,
+                // NOT silently skipped. Record it and stop (do not read past into post-table garbage).
+                if (!firstU) unresolved.append(",");
+                firstU = false;
+                unresolved.append("{\"index\":").append(idx).append("}");
+                break;
+            }
+            // Default value (nullable). Distinguish an EMPTY-STRING default (value ptr → a NUL byte
+            // in .rodata → "") from an UNREADABLE one (value ptr 0 / into invalid memory → null): the
+            // honesty red line is default_value=null only when it truly can't be read, never a
+            // hard-coded "" — and never "" masquerading as null (the oauth default is a real "").
+            String def = null;
+            try {
+                int valPtr = mem.getInt(memAddr.add(4));
+                if (valPtr != 0) {
+                    Address valAddr = toAddr(valPtr & 0xFFFFFFFFL);
+                    MemoryBlock vblk = mem.getBlock(valAddr);
+                    if (vblk != null && vblk.isInitialized() && !vblk.isExecute()) {
+                        def = (mem.getByte(valAddr) == 0) ? "" : strAt(valAddr);
+                    }
+                }
+            } catch (Exception ignore) {}
+            int flags = 0;
+            try { flags = mem.getInt(memAddr.add(8)); } catch (Exception ignore) {}
+            if (!firstM) members.append(",");
+            firstM = false;
+            members.append("{\"index\":").append(idx)
+                   .append(",\"key\":\"").append(esc(key)).append("\",\"flags\":").append(flags);
+            if (def != null) members.append(",\"default_value\":\"").append(esc(def)).append("\"");
+            members.append("}");
+        }
+        if (idx >= NVDEF_MAX_MEMBERS) truncated = true;
+        members.append("]");
+        unresolved.append("]");
+        return "{\"located\":true,\"symbol_addr\":\"" + esc(base.toString())
+             + "\",\"members\":" + members + ",\"unresolved_members\":" + unresolved
+             + ",\"truncated\":" + truncated + "}";
+    }
+
+    // Read a NUL-terminated printable string ONLY when the address lands in an initialized,
+    // non-executable memory block (.rodata/.data) — so following a struct pointer never reads code or
+    // an unmapped address. Uses .rodata section bounds implicitly (getBlock), never a hardcoded range.
+    private String strAtRodata(Address a, Memory mem) {
+        if (a == null) return null;
+        MemoryBlock blk = mem.getBlock(a);
+        if (blk == null || !blk.isInitialized() || blk.isExecute()) return null;
+        try { return strAt(a); } catch (Exception e) { return null; }
+    }
+
     // Classify ONE key varnode into {"constant","<key>"} / {"parametric","<template>"} /
     // {"unresolved", null}. resolveConst reads a constant string key; a stack slot built by a string
     // writer is a parametric (built) key whose printf template is recovered when available.
@@ -1294,6 +1381,16 @@ public class ExportFunctions extends GhidraScript {
         println("[ExportFunctions] strings: " + strCount + " stored / " + strTotal + " total"
                 + (strTruncated ? " (TRUNCATED)" : ""));
 
+        // 4b. Naming-bridge phase 1: parse the router_defaults data-segment table (the web-settable
+        // nvram default keys). A pure data-segment fact the decompiler cannot surface. Additive +
+        // isolated: any failure yields {"located":false}, never breaking the scan.
+        String nvramDefaults = "{\"located\":false}";
+        try {
+            nvramDefaults = buildNvramDefaults();
+        } catch (Throwable ignore) {
+            nvramDefaults = "{\"located\":false}";
+        }
+
         // 5. Write JSON output file — atomically.
         // Write to a .tmp sibling first, then ATOMIC_MOVE into place so an
         // interrupted JVM (killpg on timeout / OOM) can never leave a partial
@@ -1315,7 +1412,10 @@ public class ExportFunctions extends GhidraScript {
             // strings_truncated says the stored list is a prefix. get_strings surfaces both so a
             // capped/searched binary never reads its missing string as "absent".
             pw.print("\"strings_total\":"     + strTotal + ",");
-            pw.print("\"strings_truncated\":" + strTruncated);
+            pw.print("\"strings_truncated\":" + strTruncated + ",");
+            // Naming-bridge phase 1: the router_defaults web-settable key table (located:false when
+            // the symbol is absent — NOT "no web-settable keys", which would be a false negative).
+            pw.print("\"nvram_defaults\":"    + nvramDefaults);
             pw.print("}");
         }
         try {

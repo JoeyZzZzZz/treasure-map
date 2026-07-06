@@ -142,6 +142,65 @@ def test_ingest_string_truncation_defaults_complete(tmp_path: Path) -> None:
     conn.close()
 
 
+def test_ingest_parses_router_defaults_located(tmp_path: Path) -> None:
+    """A located router_defaults table ingests its members (resolved -> key=name; unresolved ->
+    key=NULL, recorded not dropped). An empty-string default stays "" (distinct from a null)."""
+    conn, sha_to_id = _setup_db(tmp_path)
+    output_dir = tmp_path / "ghidra_output"
+    _write_ghidra_json(
+        output_dir,
+        "test_bin",
+        "a" * 64,
+        {
+            "functions": [],
+            "imports": [],
+            "exports": [],
+            "strings": [],
+            "nvram_defaults": {
+                "located": True,
+                "symbol_addr": "0x884e4",
+                "members": [
+                    {"index": 0, "key": "sw_mode", "flags": 0, "default_value": "0"},
+                    {"index": 894, "key": "oauth_auth_code", "flags": 128, "default_value": ""},
+                ],
+                "unresolved_members": [{"index": 900}],
+                "truncated": False,
+            },
+        },
+    )
+    ingest_ghidra_output(conn, output_dir, [_make_record("test_bin", "a" * 64)], sha_to_id)
+    rows = {
+        r[0]: (r[1], r[2])
+        for r in conn.execute("SELECT member_index, key, default_value FROM nvram_defaults")
+    }
+    assert rows[0] == ("sw_mode", "0")
+    assert rows[894] == ("oauth_auth_code", "")  # empty-string default preserved, not null
+    assert rows[900] == (None, None)  # unresolved member recorded as a key=NULL row
+    conn.close()
+
+
+def test_ingest_router_defaults_not_located_writes_nothing(tmp_path: Path) -> None:
+    """A binary WITHOUT the symbol (located:false) contributes NO rows — absence reads as
+    'not located' (unknown), never as 'no web-settable keys'."""
+    conn, sha_to_id = _setup_db(tmp_path)
+    output_dir = tmp_path / "ghidra_output"
+    _write_ghidra_json(
+        output_dir,
+        "test_bin",
+        "a" * 64,
+        {
+            "functions": [],
+            "imports": [],
+            "exports": [],
+            "strings": [],
+            "nvram_defaults": {"located": False},
+        },
+    )
+    ingest_ghidra_output(conn, output_dir, [_make_record("test_bin", "a" * 64)], sha_to_id)
+    assert conn.execute("SELECT COUNT(*) FROM nvram_defaults").fetchone()[0] == 0
+    conn.close()
+
+
 def test_ingest_stores_a2_wrapper_fields(tmp_path: Path) -> None:
     """The A2 transport columns round-trip: a thin wrapper carries nvram_wrapper, a caller carries
     wrapper_call_args; a plain function defaults NULL/'[]' (no wrapper data until re-scan)."""

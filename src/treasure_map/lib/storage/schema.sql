@@ -109,6 +109,21 @@ CREATE TABLE IF NOT EXISTS strings (
     FOREIGN KEY(binary_id) REFERENCES binaries(id) ON DELETE CASCADE
 );
 
+-- naming-bridge phase 1: the router_defaults data-segment table — one row per web-settable nvram
+-- default key (parsed from libshared's 20-byte struct array). A resolved member has key=name; a
+-- member whose name ptr was unreadable is recorded with key=NULL (not silently skipped), so a
+-- located-but-incomplete table is honest. NO rows for a binary means the symbol was not located
+-- there (unknown — NEVER "no web-settable keys").
+CREATE TABLE IF NOT EXISTS nvram_defaults (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    binary_id     INTEGER,
+    key           TEXT,           -- member name (web-settable default key); NULL = unresolved member
+    default_value TEXT,           -- member value (nullable — a null default is legitimate)
+    flags         INTEGER,        -- member third field (offset 8)
+    member_index  INTEGER,        -- position in the table (reproducible / debug)
+    FOREIGN KEY(binary_id) REFERENCES binaries(id) ON DELETE CASCADE
+);
+
 -- 非二进制文件主表 (Round C framework; WIPE-AND-REBUILD each analyze run)
 -- sha256 = cross-firmware identity key for the knowledge base. Indexed,
 -- intentionally NOT unique (a file + its copy at another path are two findings).

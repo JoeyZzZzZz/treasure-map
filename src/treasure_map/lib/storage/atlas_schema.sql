@@ -151,6 +151,26 @@ CREATE INDEX IF NOT EXISTS idx_nvram_key      ON nvram_key_flow(key);
 CREATE INDEX IF NOT EXISTS idx_nvram_run      ON nvram_key_flow(source_run_id);
 CREATE INDEX IF NOT EXISTS idx_nvram_key_kind ON nvram_key_flow(key_kind);
 
+-- naming-bridge phase 1: the router_defaults web-settable-key table, flattened from analysis.db at
+-- hunt time (mirrors nvram_key_flow). get_nvram_key_flow reads it to answer "is this source key
+-- web-settable?" — a source-side controllability fact. A key row (key NOT NULL) is a located member;
+-- a key=NULL row marks a member whose name could not be parsed (located-but-incomplete). NO rows for
+-- a run means the table was not located (uncertain — NEVER "not web-settable"): a false-negative red
+-- line. member_index is kept for reproducibility; the query draws no verdict from these facts.
+CREATE TABLE IF NOT EXISTS nvram_defaults (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_run_id TEXT,
+    key           TEXT,   -- web-settable default key; NULL = an unresolved (unparsed) member
+    default_value TEXT,   -- member default value (nullable)
+    flags         INTEGER,
+    member_index  INTEGER,
+    binary        TEXT,
+    created_at    DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_nvdef_key ON nvram_defaults(key);
+CREATE INDEX IF NOT EXISTS idx_nvdef_run ON nvram_defaults(source_run_id);
+
 CREATE INDEX IF NOT EXISTS idx_pattern_classes ON pattern(source_class, sink_class);
 CREATE INDEX IF NOT EXISTS idx_pattern_fp      ON pattern(structural_fingerprint);
 CREATE INDEX IF NOT EXISTS idx_instance_pattern ON instance(pattern_id);

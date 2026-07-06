@@ -29,11 +29,13 @@ from pathlib import Path
 from typing import Any
 
 from treasure_map.lib.atlas.connection import open_atlas
-from treasure_map.lib.atlas.models import InstanceRow, NvramFlowRow
+from treasure_map.lib.atlas.models import InstanceRow, NvramDefaultRow, NvramFlowRow
 from treasure_map.lib.atlas.writer import (
     add_instance,
+    add_nvram_default_rows,
     add_nvram_flow_rows,
     delete_run_instances,
+    delete_run_nvram_defaults,
     delete_run_nvram_flow,
     upsert_pattern,
 )
@@ -134,6 +136,7 @@ class Analyzer2Stats:
     data_gap_skipped: int = 0  # shape matches dropped with no decompilable body (Ghidra gap)
     nvram_flows_written: int = 0  # gap② per-op nvram read/write rows flattened into the atlas
     nvram_wrapper_edges: int = 0  # gap② A2 indirect key edges recovered through thin nvram wrappers
+    nvram_defaults_written: int = 0  # naming-bridge phase 1: router_defaults members flattened
     # fmt-wrapper candidates dropped by the precision gate (uncontrollable/unknown forwarded value).
     # A deliberate recall trim — but COUNTED, not silent, so the summary shows the fmt axis was
     # narrowed (parity with data_gap_skipped; never let a drop imply the candidate set is complete).
@@ -409,6 +412,37 @@ def _flatten_wrapper_edges(
     return rows
 
 
+def _load_nvram_defaults(db_path: Path | str, source_run_id: str) -> list[NvramDefaultRow]:
+    """Load the router_defaults members from analysis.db into atlas rows (naming-bridge phase 1).
+
+    A resolved member carries key=name (+ default/flags); an unresolved member carries key=None
+    (recorded, not dropped, so a located-but-incomplete table stays honest). A missing table (older
+    analysis.db) yields no rows — web_settable then reads as 'uncertain', never 'not web-settable'.
+    """
+    uri = f"file:{Path(db_path)}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        rows = conn.execute(
+            "SELECT d.key, d.default_value, d.flags, d.member_index, b.name AS binary "
+            "FROM nvram_defaults d LEFT JOIN binaries b ON b.id = d.binary_id"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []  # pre-naming-bridge analysis.db -> no data
+    finally:
+        conn.close()
+    return [
+        NvramDefaultRow(
+            source_run_id=source_run_id,
+            key=r[0] if isinstance(r[0], str) else None,
+            default_value=r[1] if isinstance(r[1], str) else None,
+            flags=r[2] if isinstance(r[2], int) else None,
+            member_index=r[3] if isinstance(r[3], int) else None,
+            binary=r[4],
+        )
+        for r in rows
+    ]
+
+
 def run_analyzer2(
     db_path: Path | str,
     atlas_path: Path | str,
@@ -446,6 +480,10 @@ def run_analyzer2(
     _wrappers, _call_args = _load_wrapper_data(db_path)
     wrapper_edge_rows = _flatten_wrapper_edges(all_funcs, _wrappers, _call_args, source_run_id)
     nvram_flow_rows = nvram_flow_rows + wrapper_edge_rows
+    # naming-bridge phase 1: the router_defaults web-settable-key table, flattened into the atlas so
+    # get_nvram_key_flow answers "is this source key web-settable?". Empty when analysis.db predates
+    # the nvram_defaults table (web_settable then reads 'uncertain', never 'not web-settable').
+    nvram_default_rows = _load_nvram_defaults(db_path, source_run_id)
 
     by_status = {"confirmed": 0, "blocked": 0, "unknown": 0}
     instances_written = 0
@@ -464,6 +502,9 @@ def run_analyzer2(
             # instances (replace-by-run: delete own rows, then insert the fresh flatten).
             delete_run_nvram_flow(atlas, source_run_id, commit=False)
             add_nvram_flow_rows(atlas, nvram_flow_rows, commit=False)
+            # naming-bridge phase 1: refresh this run's router_defaults rows in the same txn.
+            delete_run_nvram_defaults(atlas, source_run_id, commit=False)
+            add_nvram_default_rows(atlas, nvram_default_rows, commit=False)
             for match in result.matches:
                 row = funcs.get(match.func_ref.func_id)
                 # A data gap = no loadable body OR a decompile-error comment (non-empty
@@ -742,5 +783,6 @@ def run_analyzer2(
         data_gap_skipped=data_gap_skipped,
         nvram_flows_written=len(nvram_flow_rows),
         nvram_wrapper_edges=len(wrapper_edge_rows),
+        nvram_defaults_written=len(nvram_default_rows),
         fmt_wrapper_unknown_source_skipped=fmt_wrapper_unknown_source_skipped,
     )

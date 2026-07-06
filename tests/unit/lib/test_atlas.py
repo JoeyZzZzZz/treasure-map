@@ -691,6 +691,7 @@ def test_static_no_unscoped_wipe_in_atlas() -> None:
     permitted_deletes = (
         "DELETE FROM instance WHERE source_run_id = ?",
         "DELETE FROM nvram_key_flow WHERE source_run_id = ?",
+        "DELETE FROM nvram_defaults WHERE source_run_id = ?",
     )
     for py_file in _ATLAS_SRC.glob("*.py"):
         text = py_file.read_text()
