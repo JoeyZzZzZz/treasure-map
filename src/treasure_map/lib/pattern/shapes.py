@@ -19,6 +19,7 @@ from treasure_map.lib.pattern.classes import (
     COPY,
     FMT_STRING,
     FORMAT,
+    PATH_SINK,
     SOURCE,
     all_format_calls_literal,
 )
@@ -45,10 +46,11 @@ class CallClasses:
     cmd: frozenset[str]
     copy: frozenset[str]
     fmt_string: frozenset[str]
+    path_sink: frozenset[str]
 
 
 def classify(callees: list[str]) -> CallClasses:
-    """Bucket callee names into source / format / cmd / copy / fmt_string classes."""
+    """Bucket callee names into source / format / cmd / copy / fmt_string / path_sink classes."""
     names = {c.strip() for c in callees if isinstance(c, str) and c.strip()}
     return CallClasses(
         source=frozenset(names & SOURCE),
@@ -56,6 +58,7 @@ def classify(callees: list[str]) -> CallClasses:
         cmd=frozenset(names & CMD),
         copy=frozenset(names & COPY),
         fmt_string=frozenset(names & FMT_STRING),
+        path_sink=frozenset(names & PATH_SINK),
     )
 
 
@@ -198,9 +201,31 @@ def pattern_fmtstr(func_ref: FuncRef, callees: list[str], pseudocode: str) -> Pa
     )
 
 
+def pattern_path(func_ref: FuncRef, callees: list[str], pseudocode: str) -> PatternMatch | None:
+    """Path/file-sink shape: a path/file sink (fopen/open/unlink/rename/...). Recall net for the
+    whole path-sink class (a controllable path enables traversal / arbitrary file read-write).
+
+    Source is a scoring signal, not a gate (same as pattern_b): the path may arrive from a caller,
+    so a bare path sink with no recognized in-function source is still listed. The concrete sink is
+    chosen deterministically (sorted) so the evidence anchor is stable. Controllability of the path
+    argument (constant / free / unknown) is decided downstream on the per-sink PATH argument."""
+    cc = classify(callees)
+    if not cc.path_sink:
+        return None
+    has_src = bool(cc.source)
+    return _match(
+        func_ref,
+        "path_sink_shape",
+        _source_class(cc),
+        "path_sink",
+        "source->path_sink" if has_src else "path_sink",
+        sorted(cc.path_sink)[0],
+    )
+
+
 Detector = Callable[[FuncRef, list[str], str], "PatternMatch | None"]
 
 # Explicit registry — one entry per shape, plain callables only. pattern_a and bare_cmd are
 # mutually exclusive on the same function (bare_cmd defers when pattern_a's shell-ish literal is
 # present), so each (function, sink class) yields at most one candidate.
-DETECTORS: tuple[Detector, ...] = (pattern_a, bare_cmd, pattern_b, pattern_fmtstr)
+DETECTORS: tuple[Detector, ...] = (pattern_a, bare_cmd, pattern_b, pattern_fmtstr, pattern_path)

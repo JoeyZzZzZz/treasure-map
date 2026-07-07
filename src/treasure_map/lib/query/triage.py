@@ -52,8 +52,9 @@ DEFAULT_LENS_LABEL = (
 PHASE1_CAVEATS: tuple[str, ...] = (
     "demotion gate ~= only provably-constant this phase; proven-blocked / filter-dominates almost "
     "never fire, so junk that is merely 'washed' is NOT sunk",
-    "'free' is OPTIMISTIC: path convergence-transforms are not subtracted yet, so a value "
-    "washed by inet_ntop / a whitelist / a fixed-width parse can still read as free",
+    "'free' is OPTIMISTIC: convergence-transforms are not subtracted yet, so a value washed by "
+    "inet_ntop / a whitelist / a fixed-width parse — or a PATH sanitized by basename / realpath / "
+    "a traversal check — can still read as free",
     "nvram-source 'free' is doubly optimistic: web_settable proves only the KEY is web-settable, "
     "NOT that the getter->sink path is transform-free",
     "filtering is ~= always '?': tmap does a generic name-match only and cannot prove a sanitizer "

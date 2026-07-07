@@ -58,7 +58,15 @@ from treasure_map.lib.hunt.wrapper_propagation import (
     find_wrapper_propagated_candidates,
 )
 from treasure_map.lib.pattern import scan
-from treasure_map.lib.pattern.classes import CMD, COPY, FMT_STRING, FORMAT
+from treasure_map.lib.pattern.classes import (
+    CMD,
+    COPY,
+    FMT_STRING,
+    FORMAT,
+    PATH_SINK,
+    all_path_calls_literal,
+    path_arg_ident,
+)
 from treasure_map.lib.query.nvram import template_has_anchor
 from treasure_map.lib.reachability import grade_candidate
 from treasure_map.lib.reachability.taint import locate_sink_arg
@@ -104,6 +112,7 @@ _SINK_CLASS_MEMBERS: dict[str, frozenset[str]] = {
     "copy": COPY,
     "format": FORMAT,
     "fmt_string": FMT_STRING,
+    "path_sink": PATH_SINK,
 }
 
 # Shell-running command sinks. When a function calls several command sinks, anchor to one of
@@ -531,9 +540,15 @@ def run_analyzer2(
                     sink_name = match.evidence
                 else:
                     sink_name = _sink_name_for(callees, match.sink_class)
-                sink_arg = (
-                    locate_sink_arg(row.pseudocode, sink_name) if sink_name is not None else None
-                )
+                # The danger axis differs by sink: a path/file sink is graded on its per-sink PATH
+                # argument (fopen arg0, openat/unlinkat arg1, …), NOT arg0. Every other sink keeps
+                # the historical arg0 command-string axis, byte-for-byte.
+                if sink_name is None:
+                    sink_arg = None
+                elif match.sink_class == "path_sink":
+                    sink_arg = path_arg_ident(row.pseudocode, sink_name)
+                else:
+                    sink_arg = locate_sink_arg(row.pseudocode, sink_name)
                 if sink_name is None:
                     status, blocking = "unknown", None
                 else:
@@ -565,6 +580,17 @@ def run_analyzer2(
                         func_name=match.func_ref.func_name,
                         callers_pseudocode=callers_pc,
                     )
+                # Path/file sinks: a string-literal PATH argument is a compile-time constant
+                # (proven-safe). _sink_arg_is_literal (the cmd axis) is shell-gated and reads arg0,
+                # so it misses a path literal; mark it on the path axis here. The demotion iron law
+                # then sinks a hard-coded path (fopen("/etc/x")) out of the first screen.
+                if (
+                    blocking is None
+                    and match.sink_class == "path_sink"
+                    and sink_name is not None
+                    and all_path_calls_literal(row.pseudocode, sink_name)
+                ):
+                    blocking = CONST_SINK_ARG
                 # Recall fallback: a bare sink with no recognized in-function source (and no
                 # constructed shell command — cmd_injection_shape is exempt; its shell-ish literal
                 # is signal enough that the value may be caller-supplied) is listed but ranked low.
@@ -635,6 +661,26 @@ def run_analyzer2(
                         match.func_ref.func_id, []
                     )
                     flow_evidence = json.dumps(fmt_ev, sort_keys=True)
+                elif match.sink_class == "path_sink" and sink_name is not None:
+                    # Path/file candidates carry flow evidence on the PATH argument (the danger
+                    # axis): its source_kind, the one-hop value flow, any sanitizer seen (coverage
+                    # unjudged), the rootfs entry sites, and the honest trace boundary. Material for
+                    # a later agent — never a verdict; nothing reads it back into recall/grade.
+                    sites = entry_index.sites_for(row.binary_name, row.binary_path)
+                    path_ev = build_flow_evidence(
+                        pseudocode=row.pseudocode,
+                        callees=callees,
+                        sink_arg=sink_arg,
+                        entry_sites=sites,
+                    )
+                    # Gate A (same as the cmd axis): never persist a const_sink_arg note on a path
+                    # whose argument is a free_string source.
+                    if _form_note_contradicts_source(blocking, path_ev.get("source_kind")):
+                        blocking = None
+                    # No Ghidra def-use provenance for path sinks this phase — the writer layer
+                    # stays not_traced (an honest '?', never sunk). Controllability comes from the
+                    # text-level source_kind above.
+                    flow_evidence = json.dumps(path_ev, sort_keys=True)
 
                 provenance = "L1" if status in {"confirmed", "blocked"} else "L0"
                 pattern_id = upsert_pattern(

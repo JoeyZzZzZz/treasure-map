@@ -21,6 +21,7 @@ PatternKind = Literal[
     "overflow_shape",
     "bare_cmd_shape",
     "fmt_string_shape",
+    "path_sink_shape",
 ]
 
 
@@ -61,6 +62,7 @@ class PatternStats:
     pattern_b: int  # overflow_shape matches
     bare_cmd: int = 0  # bare_cmd_shape matches (cmd sink, no constructed shell command)
     fmt_string: int = 0  # fmt_string_shape matches (non-literal format-string sink)
+    path_sink: int = 0  # path_sink_shape matches (path/file sink — fopen/open/unlink/rename/…)
 
 
 @dataclass(frozen=True)

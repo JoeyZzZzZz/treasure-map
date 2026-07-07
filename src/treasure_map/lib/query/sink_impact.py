@@ -30,6 +30,11 @@ DEFAULT_IMPACT_TIER = 0
 DEFAULT_SINK_IMPACT: dict[str, int] = {
     "cmd": IMPACT_HIGH,  # system / popen / exec* / doSystem — command execution (RCE)
     "fmt_string": IMPACT_HIGH,  # controllable printf-family format string — info leak / write
+    # fopen / open / unlink / rename / … — a controllable path enables directory traversal or
+    # arbitrary file read/write/delete (write a startup script -> RCE; read /etc/* -> leak). Placed
+    # HIGH — an OVERRIDABLE judgement (an agent may split write>read via --impact-order once mode is
+    # classified), not a magnitude-of-harm claim.
+    "path_sink": IMPACT_HIGH,
     "copy": IMPACT_MEDIUM,  # memcpy / strcpy / strncpy — buffer overflow
     "format": IMPACT_LOW,  # plain string formatting into a buffer
     "log": IMPACT_LOW,  # syslog and similar — lowest

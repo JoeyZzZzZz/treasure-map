@@ -77,6 +77,7 @@ def scan(db_path: Path | str) -> ScanResult:
         "overflow_shape": 0,
         "bare_cmd_shape": 0,
         "fmt_string_shape": 0,
+        "path_sink_shape": 0,
     }
 
     for row in rows:
@@ -108,5 +109,6 @@ def scan(db_path: Path | str) -> ScanResult:
         pattern_b=hits["overflow_shape"],
         bare_cmd=hits["bare_cmd_shape"],
         fmt_string=hits["fmt_string_shape"],
+        path_sink=hits["path_sink_shape"],
     )
     return ScanResult(matches=tuple(matches), stats=stats)

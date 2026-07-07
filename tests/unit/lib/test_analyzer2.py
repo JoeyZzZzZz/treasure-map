@@ -1667,6 +1667,131 @@ def test_cmd_axis_unknown_source_wrapper_is_still_kept(tmp_path: Path) -> None:
     assert row["blocking_mechanism"] == "const_sink_arg"  # downweighted, not dropped
 
 
+# ── path/file sinks (recall extension: fopen/open/unlink/… — a controllable path) ──
+
+
+def _path_sink_fn(
+    name: str, *, sink: str = "fopen", path: str = "const", mode: str = '"r"'
+) -> dict[str, object]:
+    """A function calling a path/file ``sink``. ``path`` picks the PATH-argument form:
+    const (a string literal), free (a recv-sourced buffer), or unknown (an untraceable local)."""
+    if path == "const":
+        params, pre, arg, callees = "", "", '"/tmp/nc/nc.conf"', [sink]
+    elif path == "free":
+        params, pre, arg, callees = "", "char buf[64]; recv(fd,buf,64); ", "buf", ["recv", sink]
+    else:  # unknown: a local with no recognized source, not a parameter, not a literal
+        params, pre, arg, callees = "", "char *p = lookup_path(); ", "p", ["lookup_path", sink]
+    body = f"void {name}({params}){{ {pre}{sink}({arg},{mode}); }}"
+    return {"name": name, "pseudocode": body, "hash": f"h_{name}", "callees": callees}
+
+
+def test_path_sink_class_generates_candidates(tmp_path: Path) -> None:
+    # The whole path-sink class went from zero coverage to a candidate: a fopen with a controllable
+    # (recv-sourced) path is now recalled as sink_class=path_sink, anchored to the concrete callee.
+    db = _make_db(tmp_path, [{"name": "httpd", "funcs": [_path_sink_fn("open_free", path="free")]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="r")
+    cand = _cand_of(atlas, "open_free")
+    assert cand.sink_class == "path_sink"
+    assert cand.sink_anchor == "fopen"
+
+
+def test_path_sink_controllability_three_state(tmp_path: Path) -> None:
+    # The path argument's controllability is honest three-state, exactly like cmd/fmt reuse the same
+    # def-use: a constant literal path -> constant (proven-safe, sunk); a free source -> free
+    # (active); an untraceable local -> unknown (a '?', never sunk).
+    db = _make_db(
+        tmp_path,
+        [
+            {
+                "name": "httpd",
+                "funcs": [
+                    _path_sink_fn("p_const", path="const"),
+                    _path_sink_fn("p_free", path="free"),
+                    _path_sink_fn("p_unknown", path="unknown"),
+                ],
+            }
+        ],
+    )
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="r")
+    assert _ctrl_of(atlas, "p_const") == "constant" and _is_safe(atlas, "p_const")
+    assert _ctrl_of(atlas, "p_free") == "free" and not _is_safe(atlas, "p_free")
+    assert _ctrl_of(atlas, "p_unknown") == "unknown" and not _is_safe(atlas, "p_unknown")
+
+
+def test_path_sink_reads_per_sink_arg_position(tmp_path: Path) -> None:
+    # openat's path is arg1 (arg0 is the dirfd). A literal path at arg1 must be read as the constant
+    # (proving PATH_SINK_ARG is honoured) — blindly reading arg0 (the dirfd) would miss it and the
+    # candidate would wrongly stay in the active region instead of sinking.
+    fn = {
+        "name": "oa",
+        "pseudocode": 'void oa(){ openat(0xffffff9c, "/etc/passwd", 0); }',
+        "hash": "h_oa",
+        "callees": ["openat"],
+    }
+    db = _make_db(tmp_path, [{"name": "svcd", "funcs": [fn]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="r")
+    assert _by_anchor(atlas)["oa"]["blocking_mechanism"] == "const_sink_arg"
+    assert _ctrl_of(atlas, "oa") == "constant" and _is_safe(atlas, "oa")
+
+
+def test_path_sink_writer_is_honestly_not_traced(tmp_path: Path) -> None:
+    # This phase there is no Ghidra def-use provenance for path sinks, so the writer layer is an
+    # honest 'not_traced' ('?') — never faked 'located', and a '?' never sinks the candidate.
+    db = _make_db(tmp_path, [{"name": "httpd", "funcs": [_path_sink_fn("p_free", path="free")]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="r")
+    writer = _cand_of(atlas, "p_free").dim("writer")
+    assert writer.value == "not_traced" and writer.state == "unknown"
+
+
+def test_path_sink_impact_is_high_and_filterable(tmp_path: Path) -> None:
+    # path_sink enters the map at a high impact tier (above copy) and is filterable via the
+    # sink_impact dimension — the triage SORT code did not change (extensibility: one config row).
+    from treasure_map.lib.query import filter_by_dimension, impact_tier
+    from treasure_map.lib.query import triage as run_triage
+
+    assert impact_tier("path_sink") == impact_tier("cmd")  # high tier
+    assert impact_tier("path_sink") > impact_tier("copy")
+    db = _make_db(tmp_path, [{"name": "httpd", "funcs": [_path_sink_fn("p_free", path="free")]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="r")
+    conn = open_atlas(atlas)
+    try:
+        only_path = filter_by_dimension(run_triage(conn), "sink_impact", "path_sink")
+    finally:
+        conn.close()
+    assert [c.function for c in only_path] == ["p_free"]
+
+
+def test_path_sink_is_additive_no_regression(tmp_path: Path) -> None:
+    # A function with BOTH a cmd sink and a path sink yields the cmd candidate unchanged PLUS a new
+    # path candidate — the path class is additive, never cannibalizing the existing sink classes.
+    fn = {
+        "name": "both",
+        "pseudocode": (
+            "void both(){ char buf[64]; recv(fd,buf,64); char cmd[128]; "
+            'snprintf(cmd,128,"/bin/x %s",buf); system(cmd); fopen(buf,"r"); }'
+        ),
+        "hash": "h_both",
+        "callees": ["recv", "snprintf", "system", "fopen"],
+    }
+    db = _make_db(tmp_path, [{"name": "webd", "funcs": [fn]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="r")
+    from treasure_map.lib.query import triage as run_triage
+
+    conn = open_atlas(atlas)
+    try:
+        pairs = {(c.function, c.sink_class) for c in run_triage(conn)}
+    finally:
+        conn.close()
+    assert ("both", "cmd") in pairs  # the pre-existing cmd candidate is untouched
+    assert ("both", "path_sink") in pairs  # the new path candidate coexists
+
+
 # ── BOUNDARY ────────────────────────────────────────────────────────────────────────
 
 

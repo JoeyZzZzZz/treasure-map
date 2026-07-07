@@ -21,9 +21,12 @@ from treasure_map.lib.pattern.classes import (
     COPY,
     FMT_STRING,
     FORMAT,
+    PATH_SINK,
     SOURCE,
     all_format_calls_literal,
+    all_path_calls_literal,
     format_string_ident,
+    path_arg_ident,
 )
 from treasure_map.lib.pattern.fingerprint import FINGERPRINT_ALGO_VERSION
 from treasure_map.lib.pattern.oss import GENERIC_OSS_NAMES, is_oss_binary
@@ -293,6 +296,57 @@ def test_fmtstr_sink_set_disjoint_from_other_classes() -> None:
     assert not (FMT_STRING & (CMD | COPY | FORMAT | SOURCE))
 
 
+# ── Path/file sinks — the recall extension ──────────────────────────────────────────
+
+
+def _path_match(tmp_path: Path, name: str, pseudocode: str, callees: list[str]):
+    db = _make_db(
+        tmp_path,
+        [{"name": "svcd", "funcs": [{"name": name, "pseudocode": pseudocode, "callees": callees}]}],
+    )
+    return [m for m in scan(db).matches if m.sink_class == "path_sink"]
+
+
+def test_path_sink_recalled(tmp_path: Path) -> None:
+    # fopen with a variable path -> a path-sink candidate (the previously zero-coverage class).
+    (m,) = _path_match(tmp_path, "open_it", 'fopen(path, "r");', ["fopen"])
+    assert m.pattern_kind == "path_sink_shape"
+    assert m.sink_class == "path_sink"
+    assert m.source_class == "unknown"  # no in-function source -> still listed (not a gate)
+
+
+def test_path_sink_with_source_labels_external_input(tmp_path: Path) -> None:
+    (m,) = _path_match(
+        tmp_path, "open_it", 'recv(fd, buf, 64); fopen(buf, "r");', ["recv", "fopen"]
+    )
+    assert m.source_class == "external_input"
+    assert m.call_sequence_shape == "source->path_sink"
+
+
+def test_path_sink_anchor_is_deterministic(tmp_path: Path) -> None:
+    # Several path sinks in one function -> anchor to the alphabetically-first (stable evidence).
+    (m,) = _path_match(tmp_path, "fs_op", 'unlink(a); fopen(b, "w");', ["unlink", "fopen"])
+    assert m.evidence == "fopen"  # sorted(cc.path_sink)[0]
+
+
+def test_path_helpers_literal_ident_and_position() -> None:
+    # all_path_calls_literal: constant path only when EVERY call's path arg is a literal.
+    assert all_path_calls_literal('fopen("/tmp/x", "w");', "fopen") is True
+    assert all_path_calls_literal('fopen(p, "w");', "fopen") is False
+    # ★ per-sink position: openat's path is arg1 (arg0 is the dirfd). A literal at arg1 is constant;
+    # blindly reading arg0 (the dirfd) would misjudge it.
+    assert all_path_calls_literal('openat(AT_FDCWD, "/etc/x", 0);', "openat") is True
+    assert all_path_calls_literal("openat(AT_FDCWD, p, 0);", "openat") is False
+    # path_arg_ident: leading identifier of the first NON-literal path arg (per-sink position).
+    assert path_arg_ident('fopen(p, "r");', "fopen") == "p"
+    assert path_arg_ident('fopen("/tmp/x", "r");', "fopen") is None
+    assert path_arg_ident("openat(AT_FDCWD, buf, 0);", "openat") == "buf"
+
+
+def test_path_sink_set_disjoint_from_other_classes() -> None:
+    assert not (PATH_SINK & (CMD | COPY | FORMAT | FMT_STRING | SOURCE))
+
+
 # ── OSS exclusion (the iteration-1 lesson) ──────────────────────────────────────────
 
 
@@ -469,7 +523,7 @@ def test_pattern_package_is_boundary_clean() -> None:
 
 def test_call_class_and_oss_sets_are_generic_identifiers() -> None:
     ident = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-    for name in SOURCE | FORMAT | CMD | COPY | FMT_STRING:
+    for name in SOURCE | FORMAT | CMD | COPY | FMT_STRING | PATH_SINK:
         assert ident.match(name), f"non-identifier call-class entry: {name!r}"
     oss_ident = re.compile(r"^[a-z0-9_]+$")
     for name in GENERIC_OSS_NAMES:
