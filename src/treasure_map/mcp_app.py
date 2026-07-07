@@ -268,7 +268,12 @@ def make_tools(
 
         Switch the lens (the list is re-ranked, never reduced — every candidate stays queryable):
         - ``sort_by``: pivot axis — impact (default) / controllability / reachability / by-sink.
-        - ``view``: preset {filter,spine} — default / by-sink / nvram-source / reachable-only.
+        - ``view``: preset lens for a hunting goal — ``default`` (balanced start), ``by-sink``
+          (sweep one sink class, e.g. all system()), ``nvram-source`` (hunt nvram-mediated bugs —
+          the router-bug hotspot), ``reachable-only`` (prune to web-asset-linked candidates; NOTE
+          this is string-level asp association, NOT call-graph reachability, so it drops
+          reachability-'?' candidates that may still be reachable). The result's ``available_views``
+          lists every preset with its when-to-use note.
         - ``filters``: dimension filters, ``"dim=value,dim2=value2"`` (controllability=free /
           sink_impact=cmd / source=nvram / reachability=found / writer=located ...).
         - ``impact_order``: override the impact tiers, e.g. ``"cmd=fmt_string,copy,log"``.
@@ -323,6 +328,12 @@ def make_tools(
                 "impact_order": impact_order or "default (cmd=fmt_string>copy>log)",
                 "switchable": "sort_by / view / filters / impact_order — re-ranks, never reduces",
             },
+            # The preset lenses the agent can switch to, each with its when-to-use note, so views
+            # are DISCOVERABLE from the result itself (not only from this tool's docstring).
+            "available_views": [
+                {"view": name, "spine": preset["spine"], "when_to_use": preset["desc"]}
+                for name, preset in _VIEWS.items()
+            ],
             # The honest phase-1 blind spots — surfaced so the map is never read as complete.
             "caveats": list(_LENS_CAVEATS),
             "current_run_id": current_run_id,

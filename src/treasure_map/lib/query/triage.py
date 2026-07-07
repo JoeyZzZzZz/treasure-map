@@ -979,14 +979,39 @@ def filter_by_dimension(
     return candidates
 
 
-# Preset lenses: {filter, spine}. Each is just a starting {filter, spine} — the iron law + composite
-# key ride under all of them. A convergence-transform ("close-the-gap") lens is deliberately
-# deferred to a later phase; the value set stays open, so a new preset is one row here.
+# Preset lenses: {filter, spine, desc}. Each is a starting {filter, spine} plus a when-to-use note
+# (``desc``) so a consumer knows which lens fits which hunting goal — the iron law + composite key
+# ride under all of them. A convergence-transform ("close-the-gap") lens is deliberately deferred to
+# a later phase; the value set stays open, so a new preset is one row here.
 VIEWS: dict[str, dict[str, Any]] = {
-    "default": {"filter": None, "spine": "impact"},
-    "by-sink": {"filter": None, "spine": "by-sink"},
-    "nvram-source": {"filter": ("source", "nvram"), "spine": "impact"},
-    "reachable-only": {"filter": ("reachability", "found"), "spine": "impact"},
+    "default": {
+        "filter": None,
+        "spine": "impact",
+        "desc": "Balanced starting lens: high-impact sinks first, controllability-certainty first "
+        "within a tier. Use when you don't yet know where to look.",
+    },
+    "by-sink": {
+        "filter": None,
+        "spine": "by-sink",
+        "desc": "Sweep one sink class systematically: use when walking every sink of a kind (e.g. "
+        "read every system()/exec command sink). Controllable first within a class; constant junk "
+        "sinks to the bottom.",
+    },
+    "nvram-source": {
+        "filter": ("source", "nvram"),
+        "spine": "impact",
+        "desc": "Hunt nvram-mediated bugs — the router-bug hotspot. Only candidates whose source "
+        "is an nvram getter; web_settable becomes the most informative controllability signal.",
+    },
+    "reachable-only": {
+        "filter": ("reachability", "found"),
+        "spine": "impact",
+        "desc": "Prune to the web-asset-linked attack surface: only entry_reach=found candidates. "
+        "NOTE this is string-level web-asset (asp) association, NOT call-graph reachability (the "
+        "true reachability of an indirect/dispatch call is still '?' this phase), so this view "
+        "DROPS reachability-'?' candidates that may still be reachable — do not read it as 'all "
+        "reachable candidates'.",
+    },
 }
 
 

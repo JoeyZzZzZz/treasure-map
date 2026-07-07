@@ -706,3 +706,29 @@ def test_cli_filter_does_not_reduce_reachability(tmp_path: Path) -> None:
     assert "free_lead" in out.output
     assert "opaque_lead" not in out.output
     assert "filter=controllability=free" in out.output  # the lens is labelled
+
+
+# ── every preset view states WHEN to use it (and reachable-only states its honest limit) ──
+
+
+def test_every_view_carries_a_when_to_use_note() -> None:
+    from treasure_map.lib.query import VIEWS
+
+    for name, preset in VIEWS.items():
+        assert preset.get("desc"), f"view {name} is missing a when-to-use desc"
+        assert "spine" in preset
+    # reachable-only must be honest that it is a web-asset (asp) link, NOT call-graph reachability,
+    # so an agent does not mistake it for 'all reachable candidates'.
+    ro = VIEWS["reachable-only"]["desc"].lower()
+    assert "asp" in ro or "web-asset" in ro
+    assert "not call-graph reachability" in ro
+    assert "drops" in ro  # states that it can drop reachability-'?' candidates
+
+
+def test_cli_view_help_lists_when_to_use() -> None:
+    result = CliRunner().invoke(triage_cmd, ["--help"])
+    assert result.exit_code == 0, result.output
+    out = result.output.lower()
+    assert "hunt" in out  # "hunting goal" phrasing present
+    assert "nvram-mediated" in out  # nvram-source usage surfaced
+    assert "not call-graph reachability" in out  # reachable-only honest limit surfaced

@@ -248,6 +248,24 @@ def test_list_candidates_carries_anchor_entry_reach_and_note(tmp_path: Path) -> 
     assert "controllability" in names and "sink_impact" in names
 
 
+def test_list_candidates_exposes_view_catalog_with_when_to_use(tmp_path: Path) -> None:
+    # Views are DISCOVERABLE from the result: available_views lists every preset with its spine
+    # and a when-to-use note, so an agent knows which lens fits its goal (not just how to switch).
+    tools = _tools(tmp_path)
+    out = tools["list_candidates"]()
+    views = {v["view"]: v for v in out["available_views"]}
+    assert set(views) == {"default", "by-sink", "nvram-source", "reachable-only"}
+    for v in views.values():
+        assert v["when_to_use"] and v["spine"]  # each carries a goal note + its spine
+    assert "nvram-mediated" in views["nvram-source"]["when_to_use"].lower()
+    # reachable-only stays honest: asp link, NOT call-graph reachability.
+    ro = views["reachable-only"]["when_to_use"].lower()
+    assert "not call-graph reachability" in ro and "drops" in ro
+    # and the tool docstring points the agent at the catalog + the reachable-only caveat.
+    doc = tools["list_candidates"].__doc__.lower()
+    assert "available_views" in doc and "not call-graph reachability" in doc
+
+
 def test_list_candidates_carries_fingerprint_and_incomplete_field(tmp_path: Path) -> None:
     # ★ Work item 6 + red-line honesty: each candidate carries its structural_fingerprint (pivot
     # from cross_firmware_patterns), and the result carries an incomplete_binaries flag.

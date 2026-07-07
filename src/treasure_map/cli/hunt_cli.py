@@ -577,7 +577,10 @@ def _reachability_inline(status: str) -> str:
     "view",
     type=click.Choice(["default", "by-sink", "nvram-source", "reachable-only"]),
     default=None,
-    help="A preset {filter, spine} lens.",
+    help="A preset lens for a hunting goal: default (balanced start) | by-sink (sweep one sink "
+    "class, e.g. all system()) | nvram-source (hunt nvram-mediated bugs — the router-bug hotspot) "
+    "| reachable-only (prune to web-asset-linked candidates — NOTE string-level asp association, "
+    "NOT call-graph reachability, so it drops reachability-'?' candidates that may still reach).",
 )
 @click.option(
     "--filter",
