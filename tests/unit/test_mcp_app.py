@@ -249,6 +249,8 @@ def test_list_candidates_carries_fingerprint_and_incomplete_field(tmp_path: Path
     tools = _tools(tmp_path)
     out = tools["list_candidates"]()
     assert out["incomplete_binaries"] == []  # the synthetic webd has functions
+    # partial-completeness honesty: webd's functions all have pseudocode, so none are flagged
+    assert out["partially_incomplete_binaries"] == []
     (cand,) = out["candidates"]
     assert cand["structural_fingerprint"] == "fp_demo"
     # the fingerprint filter round-trips (cross_firmware_patterns -> list_candidates(fingerprint=))
@@ -258,8 +260,10 @@ def test_list_candidates_carries_fingerprint_and_incomplete_field(tmp_path: Path
 
 def test_cross_firmware_views_carry_incomplete_flag(tmp_path: Path) -> None:
     tools = _tools(tmp_path)
-    assert "incomplete_binaries" in tools["cross_firmware_patterns"]()
-    assert "incomplete_binaries" in tools["pattern_density"]()
+    for view in ("cross_firmware_patterns", "pattern_density"):
+        out = tools[view]()
+        assert "incomplete_binaries" in out
+        assert "partially_incomplete_binaries" in out
 
 
 def test_list_candidates_sink_class_filter(tmp_path: Path) -> None:

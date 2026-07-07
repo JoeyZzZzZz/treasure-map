@@ -183,6 +183,22 @@ def make_tools(
         finally:
             conn.close()
 
+    def _partially_incomplete_binaries() -> list[dict[str, Any]]:
+        """Current-scan binaries analyzed 'ok' but with some functions that never decompiled.
+
+        ★ Red-line: complements _incomplete_binaries (which only catches 0-function total failures).
+        Each entry is {binary, functions_total, functions_empty} so a consumer knows a binary was
+        analyzed yet is INCOMPLETE on those N functions — a candidate there is not proof of
+        cleanliness. Empty when the DB is unreadable."""
+        try:
+            conn = facts.open_analysis_ro(analysis_path)
+        except sqlite3.OperationalError:
+            return []
+        try:
+            return facts.list_partially_incomplete_binaries(conn)
+        finally:
+            conn.close()
+
     def list_candidates(
         run_id: str | None = None,
         sink: str | None = None,
@@ -237,6 +253,10 @@ def make_tools(
             # non-empty list means the firmware is NOT fully analyzed, so absence of a candidate is
             # not proof of cleanliness. Re-run `tmap scan --reanalyze` to recover them.
             "incomplete_binaries": _incomplete_binaries(),
+            # ★ Red-line: binaries analyzed 'ok' but where some functions never decompiled —
+            # {binary, functions_total, functions_empty}. The candidate set is incomplete on those
+            # functions, so absence of a candidate there is likewise not proof of cleanliness.
+            "partially_incomplete_binaries": _partially_incomplete_binaries(),
             "total": total,
             "returned": len(page),
             "offset": off,
@@ -262,6 +282,7 @@ def make_tools(
         return {
             "note": _DERIVED_SIGNAL_NOTE,
             "incomplete_binaries": _incomplete_binaries(),  # analysis-completeness honesty flag
+            "partially_incomplete_binaries": _partially_incomplete_binaries(),  # partial-decompile
             **meta,
             "patterns": [asdict(r) for r in page],
         }
@@ -281,6 +302,7 @@ def make_tools(
         return {
             "note": _DERIVED_SIGNAL_NOTE,
             "incomplete_binaries": _incomplete_binaries(),  # analysis-completeness honesty flag
+            "partially_incomplete_binaries": _partially_incomplete_binaries(),  # partial-decompile
             **meta,
             "density": [asdict(r) for r in page],
         }

@@ -348,6 +348,41 @@ def test_list_incomplete_binaries_flags_failed_not_codefree(tmp_path: Path) -> N
     ro.close()
 
 
+def test_list_partially_incomplete_binaries_counts_failed_decompiles(tmp_path: Path) -> None:
+    # ★ Red-line: a binary analyzed 'ok' with functions is still INCOMPLETE if some >=10-byte
+    # functions never decompiled (empty pseudocode). A <10-byte thunk with no pseudocode is
+    # legitimate and must NOT be counted; a fully-decompiled binary must NOT appear at all.
+    from treasure_map.lib.storage.connection import open_db
+
+    db = tmp_path / "partial.db"
+    conn = open_db(db)
+    conn.execute(
+        "INSERT INTO binaries (id, name, path, sha256, ghidra_status, last_seen_at) "
+        "VALUES (1, 'rc', 'sbin/rc', 'x', 'ok', '2026-01-01')"
+    )
+    conn.execute(
+        "INSERT INTO binaries (id, name, path, sha256, ghidra_status, last_seen_at) "
+        "VALUES (2, 'httpd', 'usr/sbin/httpd', 'z', 'ok', '2026-01-01')"
+    )
+    conn.executemany(
+        "INSERT INTO functions (binary_id, name, size_bytes, pseudocode) VALUES (?, ?, ?, ?)",
+        [
+            (1, "handle_req", 200, "int handle_req(void){return 0;}"),  # decompiled
+            (1, "big_fail_a", 120, ""),  # >=10, empty  -> failed decompile
+            (1, "big_fail_b", 88, None),  # >=10, NULL  -> failed decompile
+            (1, "thunk", 4, ""),  # <10, empty  -> legitimate micro-func, not counted
+            (2, "main", 300, "int main(void){return 0;}"),  # httpd fully decompiled
+        ],
+    )
+    conn.commit()
+    conn.close()
+    ro = facts.open_analysis_ro(db)
+    rows = facts.list_partially_incomplete_binaries(ro)
+    ro.close()
+    # only rc is partially incomplete (2 of its 4 functions failed); httpd is absent (fully done)
+    assert rows == [{"binary": "rc", "functions_total": 4, "functions_empty": 2}]
+
+
 def test_get_disassembly_degrades_honestly(tmp_path: Path) -> None:
     conn = _ro(tmp_path)
     r = facts.get_disassembly(conn, func="handle_req")

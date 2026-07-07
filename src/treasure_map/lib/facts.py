@@ -53,6 +53,49 @@ def list_incomplete_binaries(conn: sqlite3.Connection) -> list[str]:
     return [r["name"] for r in rows]
 
 
+# A function large enough that Ghidra should have produced pseudocode. Sub-threshold bodies (thunks,
+# PLT stubs, tiny leaf trampolines) are legitimately decompile-free, so an empty one there is NOT a
+# failure. Mirrors ExportFunctions' own funcSize>=10 judgement, so this read counts the same set.
+_DECOMPILE_MIN_SIZE = 10
+
+
+def list_partially_incomplete_binaries(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Current-scan binaries that HAVE functions but where some failed to decompile.
+
+    ★ Red-line (partial completeness must be visible): a binary can carry hundreds of functions and
+    still read ``ghidra_status='ok'`` while N of its functions never decompiled (empty pseudocode).
+    ``list_incomplete_binaries`` only catches the all-or-nothing 0-function failures, so those N
+    silently-missing functions look analyzed. This surfaces each such binary with
+    ``{binary, functions_total, functions_empty}`` so a consumer knows the candidate set is
+    INCOMPLETE on those functions — not that they are clean.
+
+    Only functions at/above ``_DECOMPILE_MIN_SIZE`` bytes count as failures; smaller bodies (thunks,
+    PLT stubs) are legitimately pseudocode-free and are excluded, so a normal micro-function is
+    never mis-reported as an incomplete decompile. Empty on an older analysis.db lacking columns."""
+    try:
+        rows = conn.execute(
+            "SELECT b.name AS binary, COUNT(*) AS functions_total, "
+            "SUM(CASE WHEN f.size_bytes >= ? "
+            "         AND (f.pseudocode IS NULL OR f.pseudocode = '') "
+            "    THEN 1 ELSE 0 END) AS functions_empty "
+            "FROM current_binaries b JOIN functions f ON f.binary_id = b.id "
+            "GROUP BY b.id, b.name "
+            "HAVING functions_empty > 0 "
+            "ORDER BY functions_empty DESC, b.name",
+            (_DECOMPILE_MIN_SIZE,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return [
+        {
+            "binary": r["binary"],
+            "functions_total": r["functions_total"],
+            "functions_empty": r["functions_empty"],
+        }
+        for r in rows
+    ]
+
+
 def _anchor(binary: str | None, name: str | None, address: str | None) -> dict[str, Any]:
     return {"binary": binary, "function": name, "address": address}
 
