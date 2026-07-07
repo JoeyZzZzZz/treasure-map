@@ -237,10 +237,15 @@ def test_list_candidates_carries_anchor_entry_reach_and_note(tmp_path: Path) -> 
     tools = _tools(tmp_path)
     out = tools["list_candidates"]()
     assert "DERIVED" in out["note"] and "NOT a verdict" in out["note"]
+    # the map carries a switchable lens + honest caveats, no collapsed score
+    assert out["lens"]["label"] and out["lens"]["spine"] == "impact"
+    assert any("optimistic" in c.lower() for c in out["caveats"])
     (cand,) = out["candidates"]
     assert cand["evidence_ref"] == "run_m#fn1@cmd"  # anchor present
     assert cand["entry_reach"] == "found"  # entry-reach surfaced as a derived signal
-    assert cand["score"] is not None
+    assert "score" not in cand  # the collapsed score is gone
+    names = {d["name"] for d in cand["dimensions"]}  # replaced by first-class dimension layers
+    assert "controllability" in names and "sink_impact" in names
 
 
 def test_list_candidates_carries_fingerprint_and_incomplete_field(tmp_path: Path) -> None:
@@ -445,11 +450,13 @@ def test_source_kind_defaults_unknown_and_no_regression(tmp_path: Path) -> None:
     assert ex["source_class"] == "external_input"  # coarse class still top-level, not regressed
     assert ex["candidate"]["source_kind"] == "unknown"  # nested value agrees
     assert ex["candidate"]["entry_reach"] == "found"
-    assert ex["candidate"]["score"] is not None
+    assert "score" not in ex["candidate"]  # collapsed score gone; dimension layers replace it
+    assert {d["name"] for d in ex["candidate"]["dimensions"]}  # non-empty layer set
     cand = tools["list_candidates"]()["candidates"][0]
     assert cand["source_kind"] == "unknown"
-    for key in ("evidence_ref", "source_class", "score", "entry_reach", "sink_class"):
-        assert key in cand  # no prior key dropped
+    for key in ("evidence_ref", "source_class", "dimensions", "entry_reach", "sink_class"):
+        assert key in cand  # no prior key dropped (score replaced by dimensions)
+    assert "score" not in cand
 
 
 # ── 缺口①: pseudocode-text reverse lookup (which functions mention a string) ────────────

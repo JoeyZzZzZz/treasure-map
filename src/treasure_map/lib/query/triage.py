@@ -1,17 +1,18 @@
 # Copyright (C) 2025-2026 JoeyZzZzZz
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Triage read view — rank atlas candidate instances for manual reverse-engineering.
+"""Triage read view — a multi-dimensional, honestly-annotated map of atlas candidate instances.
 
-Pure read path over the atlas: it selects instances, computes a deterministic
-review-ordering score from already-stored neutral fields, and presents each
-candidate with a human-actionable review status and its evidence_ref anchor.
+Pure read path over the atlas. Each candidate is a point on the map carrying a three-state
+annotation on every dimension layer (controllability / source_writability / reachability /
+filtering / sink_impact / writer / completeness). There is NO collapsed score: a single composable
+sort spec (``sort_candidates`` / ``apply_view``) projects the layers into a lens. The DEFAULT lens
+spines on sink-impact, bands by impact x controllability, and sinks ONLY provably-safe
+candidates — a '?' never sinks (the demotion iron law). Every lens rides that same iron law, so no
+angle can bury a candidate by "not yet known".
 
-The score orders how much a candidate warrants manual reverse-engineering; it is a
-review-ordering signal only (NOT a security judgment), it is never written back to
-the atlas, and it never alters the stored reachability_status (a mechanism state).
-The review-status words (to-verify / reachable / gated) are a presentation-only
-relabel of the raw schema values (unknown / confirmed / blocked); the underlying
-field is untouched.
+Nothing here is a verdict or a written-back value; the review-status words (to-verify / reachable /
+gated) remain a presentation-only relabel of the raw reachability_status, kept for the status
+filter. tmap annotates facts; the security judgement is the consumer's.
 """
 
 from __future__ import annotations
@@ -19,8 +20,16 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
+
+from treasure_map.lib.query.nvram import _web_settable
+from treasure_map.lib.query.sink_impact import (
+    CONSTRAINED_MARKERS,
+    NVRAM_GETTERS,
+    PROVABLY_CONSTANT_MARKERS,
+    impact_tier,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,115 +42,55 @@ REVIEW_STATUS_BY_REACHABILITY: dict[str, str] = {
     "blocked": "gated",  # a filter/guard was identified on the path (likely dormant/false)
 }
 
-# --- review-ordering weight table (deterministic; ordering signal only, never stored) ---
-# All inputs are existing neutral fields. The status gaps are intentionally larger than the
-# total spread of the fine signals, so a pure score-descending order keeps the tiers stacked
-# (every reachable above every to-verify above every gated) while the fine signals rank
-# candidates WITHIN a tier. None of these weights is a security claim — they order review.
-_STATUS_WEIGHT: dict[str, float] = {"confirmed": 6.0, "unknown": 3.0, "blocked": 0.0}
-
-# A filter on the path (blocking_mechanism set) lowers review order — it is more likely
-# already-mitigated. No identified filter raises it.
-_FILTER_ABSENT_WEIGHT = 0.5
-_FILTER_PRESENT_WEIGHT = -0.5
-
-# Specific neutral form notes (also stored in blocking_mechanism) that name a structural shape
-# manual review found rarely carries a live issue: an exec sink that bypasses the shell, a
-# numeric validator on the path, or a constant supplied by the sole caller. They downweight much
-# harder than a generic filter so the form sinks to the bottom of its tier — but it STAYS a listed
-# candidate (never removed, never graded blocked). Each maps a mechanism to ordering, not judgment.
-_FORM_DOWNWEIGHT: dict[str, float] = {
-    "no_shell_exec": -2.0,
-    "numeric_sanitized": -2.0,
-    "caller_constant": -2.5,
-    # the sink's dangerous argument is a fixed .rodata string constant (not a controllable value)
-    "const_sink_arg": -2.5,
-    # the value reaching the sink was constrained to a safe character set (MAC/IP/base64 form)
-    "charset_constrained": -2.0,
-    # a dangerous sink with no recognized in-function source (the recall fallback): listed for
-    # completeness but ranked low — the controlled input, if any, was not seen reaching it here.
-    "bare_sink": -1.5,
-    # copy-sink size-source notes: the write length was shown bounded, so the copy is a low-yield
-    # form. A literal / sizeof length is non-controllable (demote hard, like a constant arg); a
-    # clamp / pointer guard only REFERENCES the length (coverage unjudged — demote mildly so the
-    # candidate stays visible, never buried). A variable / source-length / untraced length gets NO
-    # note and keeps its normal rank (a copy not proven bounded is never silently downweighted).
-    "const_size": -2.5,
-    "sizeof_bound": -2.5,
-    "clamp_size": -1.0,
-    "pointer_guard_size": -1.0,
-}
+# The map's default lens label + the honest phase-1 caveats. Surfaced verbatim in every candidate
+# listing so a consumer never reads the map as complete: the demotion gate, the optimistic 'free',
+# the nvram double-optimism, the near-always-'?' filtering, and the no-reduction contract.
+DEFAULT_LENS_LABEL = (
+    "current lens: sink-impact x controllability-exposure, only PROVEN-SAFE sinks leave the first "
+    "screen — switchable (--sort-by / --filter / --view)"
+)
+PHASE1_CAVEATS: tuple[str, ...] = (
+    "demotion gate ~= only provably-constant this phase; proven-blocked / filter-dominates almost "
+    "never fire, so junk that is merely 'washed' is NOT sunk",
+    "'free' is OPTIMISTIC: path convergence-transforms are not subtracted yet, so a value "
+    "washed by inet_ntop / a whitelist / a fixed-width parse can still read as free",
+    "nvram-source 'free' is doubly optimistic: web_settable proves only the KEY is web-settable, "
+    "NOT that the getter->sink path is transform-free",
+    "filtering is ~= always '?': tmap does a generic name-match only and cannot prove a sanitizer "
+    "covers the path — it does NOT save you from reading the filter code",
+    "triage RE-RANKS the view, it does not reduce candidates: only provably-safe items leave the "
+    "first screen; every candidate stays listed and queryable",
+)
 
 
-def _filter_weight(blocking_mechanism: str | None) -> float:
-    """Review-order contribution of the path-guard / form field. No mechanism raises order; a
-    recognized low-yield form downweights hard; any other identified guard downweights mildly."""
-    if blocking_mechanism is None:
-        return _FILTER_ABSENT_WEIGHT
-    return _FORM_DOWNWEIGHT.get(blocking_mechanism, _FILTER_PRESENT_WEIGHT)
+@dataclass(frozen=True)
+class Dimension:
+    """One map layer's honest three-state annotation for a candidate — a FACT, never a verdict.
 
+    ``state`` is the glyph-level three-state: ``proven`` (✓ established, ``value`` carries the
+    reading), ``excluded`` (✗ established not-applicable / ruled out), ``unknown`` (? not
+    established — ``note`` says what is missing and why). ``value`` is the concrete reading (e.g.
+    ``free`` / ``cmd`` / ``found``); ``source`` names where it came from; ``note`` carries the
+    reason for a ? or an honest caveat on a ✓. The red line: a ? is NEVER rendered as ✓ or ✗."""
 
-# Code provenance: custom code is likelier to hold a fresh lead; recognized stock OSS is a
-# known component, not a new lead. vendor_modified_oss / unknown are neutral.
-_ORIGIN_WEIGHT: dict[str, float] = {
-    "custom": 0.4,
-    "stock_oss_known": -0.6,
-    "vendor_modified_oss": 0.0,
-    "unknown": 0.0,
-}
-
-# Input source class as stored on the pattern. A recognized external-input shape ranks above
-# an unclassified one. (The strong/weak source split is not persisted on the instance, so the
-# stored source_class is the only signal available here.)
-_SOURCE_CLASS_WEIGHT: dict[str, float] = {"external_input": 0.3}
-
-# Sink class, ordered by the operation the sink performs (command execution and format-string
-# injection — both RCE-class interpreters — above buffer copy above string formatting). This is an
-# ordering weight, not a magnitude-of-harm claim.
-_SINK_CLASS_WEIGHT: dict[str, float] = {"cmd": 0.4, "fmt_string": 0.4, "copy": 0.2, "format": 0.0}
-
-# Entry-reach: whether a rootfs entry point (a startup/maintenance script, a web asset) was found
-# to invoke this candidate's binary (derived from the L0.5 script_calls / web_endpoints evidence,
-# carried in flow_evidence.entry_reach). A proven entry path PROMOTES a candidate within its tier
-# so a network/script-reachable sink surfaces above a same-class same-status local-only one. It is
-# a SECOND-LEVEL key, deliberately smaller than the sink-class gap, so it never reverses the
-# status or sink-class order. ★ Asymmetric on purpose: only ``found`` promotes; ``unknown`` is
-# strictly neutral and NEVER demotes — an unknown may just be a coverage gap (no script parsed
-# that calls the binary), and demoting it could bury a real lead. Promote-proven, never punish.
-_ENTRY_REACH_WEIGHT: dict[str, float] = {"found": 0.15}
-
-
-def _bounds() -> tuple[float, float]:
-    """Min/max possible raw score, derived from the weight tables (for [0,1] display scaling)."""
-    fine_lo = (
-        min(_FILTER_PRESENT_WEIGHT, *_FORM_DOWNWEIGHT.values())
-        + min(_ORIGIN_WEIGHT.values())
-        + min(0.0, *_SOURCE_CLASS_WEIGHT.values())
-        + min(_SINK_CLASS_WEIGHT.values())
-    )
-    fine_hi = (
-        _FILTER_ABSENT_WEIGHT
-        + max(_ORIGIN_WEIGHT.values())
-        + max(0.0, *_SOURCE_CLASS_WEIGHT.values())
-        + max(_SINK_CLASS_WEIGHT.values())
-        + max(0.0, *_ENTRY_REACH_WEIGHT.values())  # entry-reach only promotes (never negative)
-    )
-    return min(_STATUS_WEIGHT.values()) + fine_lo, max(_STATUS_WEIGHT.values()) + fine_hi
-
-
-_SCORE_LO, _SCORE_HI = _bounds()
+    name: str
+    state: str  # "proven" | "excluded" | "unknown"
+    value: str
+    source: str
+    note: str = ""
 
 
 @dataclass(frozen=True)
 class TriageCandidate:
-    """One ranked candidate for manual review. A lead, never a confirmed result.
+    """One candidate = a point on the map, with a three-state annotation on every dimension layer.
 
-    score is a deterministic review-ordering value in [0, 1] (higher = warrants
-    reverse-engineering sooner); review_status is the presentation relabel; reachability_status
-    is the untouched raw schema value.
+    A lead, never a confirmed result. There is NO collapsed score: ``dimensions`` carries the
+    honest per-layer facts (controllability / source_writability / reachability / filtering /
+    sink_impact / writer / completeness), and the composable sort spec (see ``sort_candidates``)
+    projects them into a lens. ``review_status`` is the presentation relabel of the raw
+    ``reachability_status`` schema value (both untouched, kept for the status filter).
     """
 
-    score: float
     review_status: str
     reachability_status: str
     function: str | None
@@ -156,19 +105,30 @@ class TriageCandidate:
     # join back to analysis.db), so a candidate is locatable even when the source build is gone.
     binary_path: str | None
     # entry-reach status (found / unknown) parsed from the stored flow_evidence — a derived,
-    # evidence-backed signal, NOT a verdict. found promotes within the tier; unknown is neutral.
+    # evidence-backed signal, NOT a verdict. Feeds the reachability dimension.
     entry_reach: str = "unknown"
     # source_kind (free_string / charset_safe / charset_maybe / unknown) parsed from the stored
-    # flow_evidence — the FINE-GRAINED controllability signal the coarse source_class folds away
-    # (free_string = a free, controllable string reached the sink argument). Surfaced so a consumer
-    # can tell a genuinely controllable source from a globals/constant forward; it is a read-only
-    # fact, NOT a verdict, and it never affects the score (source_class alone drives ordering).
-    # ``unknown`` when the evidence is absent or carries no source_kind.
+    # flow_evidence — the FINE-GRAINED controllability signal the coarse source_class folds away.
+    # Feeds the controllability dimension. ``unknown`` when the evidence carries no source_kind.
     source_kind: str = "unknown"
     # The pattern's structural fingerprint (the same key cross_firmware_patterns / pattern_density
-    # group by), surfaced so a consumer can pivot from a recurring pattern to its instances. A
-    # presentation-only field — it never affects the score or ordering.
+    # group by), surfaced so a consumer can pivot from a recurring pattern to its instances.
     structural_fingerprint: str | None = None
+    # The nvram key feeding the sink argument, when the def-use provenance resolved the source to an
+    # nvram getter: its web-settability drives the controllability annotation. None when the
+    # source is not a resolved nvram getter. A surfaced fact, never a verdict.
+    nvram_source_key: str | None = None
+    # The honest three-state map layers. Every dimension is a first-class, queryable /
+    # sortable / filterable annotation here — NOT buried in flow_evidence JSON for the agent to dig.
+    dimensions: tuple[Dimension, ...] = field(default_factory=tuple)
+
+    def dim(self, name: str) -> Dimension:
+        """The named dimension layer; a ``unknown`` placeholder if it was not computed (defensive —
+        every candidate normally carries all layers)."""
+        for d in self.dimensions:
+            if d.name == name:
+                return d
+        return Dimension(name, "unknown", "unknown", "not computed")
 
 
 def _entry_reach_status(flow_evidence: str | None) -> str:
@@ -290,18 +250,18 @@ def _classify_vararg(vararg: Any) -> str:
 def _fmt_args_provenance(fmt: Any, varargs: Any) -> str:
     """Three-state, spec-precise verdict on the format arguments of the nearest dominating writer:
 
-    - ``all_constant``   — every vararg is a CONFIRMED literal constant (a known literal string, or
-      an ambiguous_0x pinned to an integer literal by an integer spec), or the fmt consumes no
-      arguments at all. Asserts only that the format arguments introduce no CONTROLLABLE injection
-      (format-string / command injection); it does NOT assert the command is safe under other threat
-      models (a controllable integer's overflow/length issues land in has_controllable, not here).
-      Read as "arguments not controllable, no injection surface", not "harmless".
+    - ``all_constant``  — every vararg is a CONFIRMED literal constant (a known literal string, or
+     an ambiguous_0x pinned to an integer literal by an integer spec), or the fmt consumes no
+     arguments at all. Asserts only that the format arguments introduce no CONTROLLABLE injection
+     (format-string / command injection); it does NOT assert the command is safe under other threat
+     models (a controllable integer's overflow/length issues land in has_controllable, not here).
+     Read as "arguments not controllable, no injection surface", not "harmless".
     - ``has_controllable`` — at least one vararg is a confirmed controllable source (call_return /
-      param / multiple / external_input): a real controllable injection surface.
-    - ``undetermined``   — at least one vararg cannot be confirmed constant AND none is confirmed
-      controllable: an untraceable source (unresolved/stack_buf/missing), an ambiguous_0x under a
-      %s/%p or with no spec (a constant pointer, pointee unknown), or an arity shortfall (fewer
-      varargs extracted than the fmt consumes). An honest "don't know", never coerced to yes/no.
+     param / multiple / external_input): a real controllable injection surface.
+    - ``undetermined``  — at least one vararg cannot be confirmed constant AND none is confirmed
+     controllable: an untraceable source (unresolved/stack_buf/missing), an ambiguous_0x under a
+     %s/%p or with no spec (a constant pointer, pointee unknown), or an arity shortfall (fewer
+     varargs extracted than the fmt consumes). An honest "don't know", never coerced to yes/no.
 
     tmap is a data substrate: each state is a FACT, never a guess, and never a score input.
     Precedence has_controllable > undetermined > all_constant — a confirmed controllable arg is the
@@ -495,65 +455,366 @@ def get_sink_provenance(
     }
 
 
-def _raw_score(
-    reachability_status: str,
-    blocking_mechanism: str | None,
-    origin: str,
-    source_class: str,
-    sink_class: str,
-    entry_reach: str = "unknown",
-) -> float:
-    score = _STATUS_WEIGHT.get(reachability_status, 0.0)
-    score += _filter_weight(blocking_mechanism)
-    score += _ORIGIN_WEIGHT.get(origin, 0.0)
-    score += _SOURCE_CLASS_WEIGHT.get(source_class, 0.0)
-    score += _SINK_CLASS_WEIGHT.get(sink_class, 0.0)
-    score += _ENTRY_REACH_WEIGHT.get(entry_reach, 0.0)  # found promotes; unknown -> 0 (neutral)
-    return score
+# ── nvram fact transport: recover the nvram key feeding the sink from stored provenance ──
 
 
-def review_score(
-    reachability_status: str,
-    blocking_mechanism: str | None,
-    origin: str,
-    source_class: str,
-    sink_class: str,
-    entry_reach: str = "unknown",
-) -> float:
-    """Deterministic review-ordering score in [0, 1] (ordering signal only, never stored)."""
-    raw = _raw_score(
-        reachability_status, blocking_mechanism, origin, source_class, sink_class, entry_reach
+def _nvram_key_from_source(source: Any) -> str | None:
+    """The nvram key if ``source`` is a call_return from an nvram getter, else None.
+
+    The key is the getter's first constant string argument (``const_args[0]``) — the exact shape the
+    def-use extractor records for ``nvram_get("wan_proto")``. A getter with no resolved const key
+    yields None (honest: the key was not recovered), never a fabricated key."""
+    if not isinstance(source, dict) or source.get("kind") != "call_return":
+        return None
+    if source.get("callee") not in NVRAM_GETTERS:
+        return None
+    const_args = source.get("const_args")
+    if isinstance(const_args, list) and const_args and isinstance(const_args[0], str):
+        return const_args[0] or None
+    return None
+
+
+def _nvram_source_key(flow_evidence: str | None) -> str | None:
+    """Scan the stored sink_arg_provenance for a resolved nvram-getter source and return its key.
+
+    Looks at each sink's top-level provenance AND the varargs of its stack-buffer writers (where an
+    nvram value most often enters, via ``snprintf("...%s...", nvram_get(key))``). Returns the first
+    resolved key; None when no sink's value came from a recognized nvram getter."""
+    for rec in _sink_provenance_records(flow_evidence):
+        prov = rec.get("provenance")
+        prov = prov if isinstance(prov, dict) else {}
+        key = _nvram_key_from_source(prov)
+        if key is not None:
+            return key
+        for w in prov.get("writers") or []:
+            if not isinstance(w, dict):
+                continue
+            for va in w.get("varargs") or []:
+                if isinstance(va, dict):
+                    key = _nvram_key_from_source(va.get("source"))
+                    if key is not None:
+                        return key
+    return None
+
+
+def _flow_path_obj(flow_evidence: str | None) -> dict[str, Any]:
+    """The stored flow_evidence.flow_path dict (sink_arg / one_hop / wrapper markers); {} when
+    absent or unparsable."""
+    if not flow_evidence:
+        return {}
+    try:
+        data = json.loads(flow_evidence)
+    except (ValueError, TypeError):
+        return {}
+    fp = data.get("flow_path") if isinstance(data, dict) else None
+    return fp if isinstance(fp, dict) else {}
+
+
+def _sanitizer_records(flow_evidence: str | None) -> list[dict[str, Any]]:
+    """The stored flow_evidence.sanitizer_seen list; [] when absent or unparsable."""
+    if not flow_evidence:
+        return []
+    try:
+        data = json.loads(flow_evidence)
+    except (ValueError, TypeError):
+        return []
+    san = data.get("sanitizer_seen") if isinstance(data, dict) else None
+    return [s for s in san if isinstance(s, dict)] if isinstance(san, list) else []
+
+
+# ── the seven map layers: each an honest three-state Dimension, never a verdict ──
+
+
+def _dim_controllability(
+    source_kind: str, blocking_mechanism: str | None, web_settable: dict[str, Any] | None
+) -> Dimension:
+    """Attacker byte-freedom over the sink argument: free / constrained / constant / unknown.
+
+    Order (fact transport): a provably-constant marker wins (constant, the only proven-safe
+    controllability this phase); else if the source is an nvram getter, combine its web-settability
+    (free / constrained / unknown); else fall back to the text-level source_kind."""
+    if blocking_mechanism in PROVABLY_CONSTANT_MARKERS:
+        return Dimension(
+            "controllability",
+            "proven",
+            "constant",
+            f"blocking_mechanism={blocking_mechanism}",
+            "provably-constant sink argument (compile-time constant, not attacker-controllable) — "
+            "the only 'safe' controllability tmap asserts this phase; this is what sinks a "
+            "candidate out of the first screen",
+        )
+    if web_settable is not None:  # source resolved to an nvram getter with a key
+        st = web_settable.get("in_router_defaults")
+        if st is True:
+            return Dimension(
+                "controllability",
+                "proven",
+                "free",
+                "nvram source key web_settable=true (router_defaults)",
+                "free via source-writability: the key IS web-settable. DOUBLE-OPTIMISTIC — proves "
+                "only the source is writable, NOT that the getter->sink path is transform-free "
+                "",
+            )
+        if st is False:
+            return Dimension(
+                "controllability",
+                "proven",
+                "constrained",
+                "nvram source key not in router_defaults (located, complete)",
+                "the source key is not web-settable (router_defaults located + complete)",
+            )
+        return Dimension(
+            "controllability",
+            "unknown",
+            "unknown",
+            "nvram source key web-settability uncertain",
+            "cannot combine source-writability: router_defaults not located / incomplete — not "
+            "assumed controllable nor safe",
+        )
+    if source_kind == "free_string":
+        return Dimension(
+            "controllability",
+            "proven",
+            "free",
+            "source_kind=free_string",
+            "OPTIMISTIC: convergence-transforms not subtracted — a value washed by "
+            "inet_ntop / a whitelist / a fixed-width parse may still read as free",
+        )
+    if source_kind == "charset_safe":
+        return Dimension(
+            "controllability",
+            "proven",
+            "constrained",
+            "source_kind=charset_safe",
+            "sink argument built inline by a charset-safe converter (MAC / IP / base64 shape)",
+        )
+    if blocking_mechanism in CONSTRAINED_MARKERS:
+        return Dimension(
+            "controllability",
+            "proven",
+            "constrained",
+            f"blocking_mechanism={blocking_mechanism}",
+            "the value was constrained to a safe charset / numeric shape",
+        )
+    return Dimension(
+        "controllability",
+        "unknown",
+        "unknown",
+        f"source_kind={source_kind}",
+        "controllable direction not established — NOT proven safe, NOT proven controllable; a ? "
+        "never sinks",
     )
-    norm = (raw - _SCORE_LO) / (_SCORE_HI - _SCORE_LO)
-    return round(min(1.0, max(0.0, norm)), 2)
 
 
-def _candidate(row: sqlite3.Row) -> TriageCandidate:
+def _dim_source_writability(
+    nvram_key: str | None, web_settable: dict[str, Any] | None
+) -> Dimension:
+    """If the source is an nvram key, can the web UI set it? web_settable / not_settable /
+    table_not_located. ✗ not-applicable when the source is not a resolved nvram key."""
+    if nvram_key is None or web_settable is None:
+        return Dimension(
+            "source_writability",
+            "excluded",
+            "n/a",
+            "source is not a resolved nvram key",
+            "web-settability applies only when the sink source is an nvram getter with a key",
+        )
+    st = web_settable.get("in_router_defaults")
+    src = web_settable.get("source") or ""
+    if st is True:
+        return Dimension(
+            "source_writability",
+            "proven",
+            "web_settable",
+            f"router_defaults[{nvram_key}]",
+            f"key '{nvram_key}' is a web-settable member ({src})",
+        )
+    if st is False:
+        return Dimension(
+            "source_writability",
+            "excluded",
+            "not_settable",
+            f"router_defaults (located, complete): '{nvram_key}' absent",
+            f"key '{nvram_key}' is not web-settable",
+        )
+    return Dimension(
+        "source_writability",
+        "unknown",
+        "table_not_located",
+        "router_defaults",
+        web_settable.get("reason") or "web-settability uncertain (table not located / incomplete)",
+    )
+
+
+def _dim_reachability(entry_reach: str) -> Dimension:
+    """Is there an external entry to this binary? found / unknown (from flow_evidence.entry_reach).
+    A ? is a coverage gap, NEVER 'unreachable' — it never sinks."""
+    if entry_reach == "found":
+        return Dimension(
+            "reachability",
+            "proven",
+            "found",
+            "flow_evidence.entry_reach (rootfs script / web-asset invocation)",
+            "a rootfs entry invokes this binary — NOT proof the input arrives from that entry",
+        )
+    return Dimension(
+        "reachability",
+        "unknown",
+        "unknown",
+        "flow_evidence.entry_reach",
+        "no rootfs entry found — reported unknown, NOT unreachable (a coverage gap or an "
+        "indirect/dispatch-table call); a ? never sinks",
+    )
+
+
+def _dim_filtering(flow_evidence: str | None) -> Dimension:
+    """Is there sanitization on the path? Near-always '?' this phase: tmap does a generic
+    name-match only and cannot prove a sanitizer covers the path, so it claims neither present
+    or proven-absent — it does not save the agent from reading the filter code."""
+    san = _sanitizer_records(flow_evidence)
+    if any(s.get("on_path") for s in san):
+        note = (
+            "a sanitizer-shaped call sits on the path, but coverage is UNJUDGED (a static read "
+            "cannot prove it covers the path) — still '?', read the filter code yourself"
+        )
+    elif san:
+        note = (
+            "sanitizer-shaped calls exist but none on the sink's path (generic name-match; a "
+            "custom guard may still exist) — '?'"
+        )
+    else:
+        note = (
+            "no sanitizer-shaped callee recognized (generic name-match only; a custom guard may "
+            "still exist) — '?', tmap does not save you from reading the filter code"
+        )
+    return Dimension("filtering", "unknown", "unknown", "flow_evidence.sanitizer_seen", note)
+
+
+def _dim_sink_impact(sink_class: str, overrides: dict[str, int] | None = None) -> Dimension:
+    """What sink is this + its potential-impact tier. The value is the OPEN-set sink_class;
+    the tier is a visible, OVERRIDABLE judgement (default cmd=fmt>copy>log)."""
+    tier = impact_tier(sink_class, overrides)
+    tname = {3: "high", 2: "medium", 1: "low"}.get(tier, "lowest (unmapped class)")
+    return Dimension(
+        "sink_impact",
+        "proven",
+        sink_class or "unknown",
+        "sink callee classification",
+        f"impact tier {tier} ({tname}); default order cmd=fmt>copy>log — a visible, OVERRIDABLE "
+        "judgement, not a magnitude-of-harm claim",
+    )
+
+
+def _dim_writer(flow_evidence: str | None) -> Dimension:
+    """Who writes the sink argument's value? located / via_wrapper / not_traced, from the def-use
+    provenance. A ? (not_traced) never sinks."""
+    if _flow_path_obj(flow_evidence).get("sink_via_wrapper"):
+        return Dimension(
+            "writer",
+            "proven",
+            "via_wrapper",
+            "flow_evidence.flow_path.wrapper",
+            "the value is forwarded one hop through a thin wrapper to the real sink",
+        )
+    for rec in _sink_provenance_records(flow_evidence):
+        prov = rec.get("provenance")
+        prov = prov if isinstance(prov, dict) else {}
+        if prov.get("kind") == "constant":
+            return Dimension(
+                "writer",
+                "proven",
+                "located",
+                "sink_arg_provenance (constant)",
+                "the sink argument resolves to a constant writer",
+            )
+        if prov.get("nearest_dominating_writer"):
+            return Dimension(
+                "writer",
+                "proven",
+                "located",
+                f"sink_arg_provenance (dominating writer {prov.get('nearest_dominating_writer')})",
+                "a sound dominating writer for the sink argument was located",
+            )
+    return Dimension(
+        "writer",
+        "unknown",
+        "not_traced",
+        "sink_arg_provenance",
+        "no dominating writer resolved (unresolved / untraced stack buffer) — who writes the value "
+        "was not established; a ? never sinks",
+    )
+
+
+def _dim_completeness() -> Dimension:
+    """Was the containing function fully decompiled? '?' this phase: the per-function A4 signal
+    lives in analysis.db, and triage is atlas-only. Honestly deferred, never faked complete."""
+    return Dimension(
+        "completeness",
+        "unknown",
+        "unknown",
+        "A4 per-function decompile completeness (not wired into the atlas-only triage this phase)",
+        "cross-check partially_incomplete_binaries at the listing top level (A4) for this binary — "
+        "a partial binary means some of its functions never decompiled",
+    )
+
+
+def _build_dimensions(
+    conn: sqlite3.Connection,
+    *,
+    flow_evidence: str | None,
+    source_kind: str,
+    blocking_mechanism: str | None,
+    sink_class: str,
+    entry_reach: str,
+    nvram_key: str | None,
+) -> tuple[Dimension, ...]:
+    """The seven honest map layers for one candidate. web_settable is looked up once (atlas
+    nvram_defaults) when the source resolved to an nvram key, and shared by two layers."""
+    web_settable = _web_settable(conn, nvram_key) if nvram_key else None
+    return (
+        _dim_controllability(source_kind, blocking_mechanism, web_settable),
+        _dim_source_writability(nvram_key, web_settable),
+        _dim_reachability(entry_reach),
+        _dim_filtering(flow_evidence),
+        _dim_sink_impact(sink_class),
+        _dim_writer(flow_evidence),
+        _dim_completeness(),
+    )
+
+
+def _candidate(conn: sqlite3.Connection, row: sqlite3.Row) -> TriageCandidate:
     reach = row["reachability_status"]
-    entry_reach = _entry_reach_status(_row_get(row, "flow_evidence"))
+    fe = _row_get(row, "flow_evidence")
+    entry_reach = _entry_reach_status(fe)
+    source_kind = _source_kind_from_evidence(fe)
+    sink_class = row["sink_class"]
+    blocking = row["blocking_mechanism"]
+    nvram_key = _nvram_source_key(fe)
     return TriageCandidate(
-        score=review_score(
-            reach,
-            row["blocking_mechanism"],
-            row["origin"],
-            row["source_class"],
-            row["sink_class"],
-            entry_reach,
-        ),
         review_status=REVIEW_STATUS_BY_REACHABILITY.get(reach, reach),
         reachability_status=reach,
         function=row["source_anchor"],
         sink_anchor=row["sink_anchor"],
         source_class=row["source_class"],
-        sink_class=row["sink_class"],
-        blocking_mechanism=row["blocking_mechanism"],
+        sink_class=sink_class,
+        blocking_mechanism=blocking,
         origin=row["origin"],
         source_run_id=row["source_run_id"],
         evidence_ref=row["evidence_ref"],
         binary_path=row["binary_path"],
         entry_reach=entry_reach,
-        source_kind=_source_kind_from_evidence(_row_get(row, "flow_evidence")),
+        source_kind=source_kind,
         structural_fingerprint=_row_get(row, "structural_fingerprint"),
+        nvram_source_key=nvram_key,
+        dimensions=_build_dimensions(
+            conn,
+            flow_evidence=fe,
+            source_kind=source_kind,
+            blocking_mechanism=blocking,
+            sink_class=sink_class,
+            entry_reach=entry_reach,
+            nvram_key=nvram_key,
+        ),
     )
 
 
@@ -606,12 +867,162 @@ def filter_candidates(
     ]
 
 
-def triage(conn: sqlite3.Connection, *, run_id: str | None = None) -> list[TriageCandidate]:
-    """Return atlas candidates ranked by review-ordering score (descending).
+# ── composable sort spec: ONE sort function projected into lenses ──
+#
+# A view = {filter predicate, spine axis}. Everything else RIDES under every view, not overridable:
+#  - the composite secondary key (impact x controllability-certainty), same meaning in any lens
+#  - the only-UP tertiary keys (found / located / complete promote; their ? never demotes)
+#  - the demotion IRON LAW: only a PROVEN-SAFE fact sinks a candidate; a ? NEVER sinks
+# The agent changes only the spine (--sort-by) and the filters; the iron law is fixed. This is what
+# makes every lens safe: no angle can bury a candidate by "not yet known".
 
-    Read-only: selects instances joined to their pattern, scores each, and sorts by score
-    descending with a deterministic tie-break. Returns every candidate (gated included); the
-    caller decides whether to fold the gated rows. Nothing is written back to the atlas.
+_CONTROLLABILITY_RANK: dict[str, int] = {"free": 3, "constrained": 2, "unknown": 1, "constant": 0}
+_REACH_RANK: dict[str, int] = {"found": 2, "unknown": 1, "blocked": 0}
+_VALID_SPINES = frozenset({"impact", "sink_impact", "reachability", "controllability", "by-sink"})
+
+
+def _is_proven_safe(c: TriageCandidate) -> bool:
+    """Does the candidate carry a PROVEN-SAFE fact (the only thing that may sink it)?
+
+    This phase the sole reliably-provable safe fact is a compile-time-constant controllability:
+    proven-blocked reachability and filter-dominates are not computable yet. When they are,
+    OR them in here — the sort and every view inherit the change with no other edit."""
+    return c.dim("controllability").value == "constant"
+
+
+def _sort_atoms(c: TriageCandidate, overrides: dict[str, int] | None) -> dict[str, int]:
+    ctrl = c.dim("controllability").value
+    reach = c.dim("reachability").value
+    return {
+        "proven_safe": int(_is_proven_safe(c)),
+        "impact": impact_tier(c.sink_class, overrides),
+        "controllability": _CONTROLLABILITY_RANK.get(ctrl, 1),
+        "reach_rank": _REACH_RANK.get(reach, 1),
+        "reach_promote": 1 if reach == "found" else 0,
+        "writer_promote": 1 if c.dim("writer").value == "located" else 0,
+        "completeness_promote": 1 if c.dim("completeness").value == "complete" else 0,
+    }
+
+
+def _sort_key(
+    c: TriageCandidate, *, spine: str, overrides: dict[str, int] | None
+) -> tuple[Any, ...]:
+    a = _sort_atoms(c, overrides)
+    # [0] iron law: not-safe (0) before proven-safe (1) — proven-safe always sinks, in EVERY lens.
+    key: list[Any] = [a["proven_safe"]]
+    # [1..] the spine (the pivot axis; negated so higher rank ranks earlier)
+    if spine == "reachability":
+        key.append(-a["reach_rank"])
+    elif spine == "controllability":
+        key.append(-a["controllability"])
+    elif spine == "by-sink":
+        key.append(-a["impact"])
+        key.append(c.sink_class or "")  # group by exact class within a tier
+    else:  # impact / sink_impact / default
+        key.append(-a["impact"])
+    # composite secondary (rides under every lens): band by impact, then controllability-certainty
+    key.append(-a["impact"])
+    key.append(-a["controllability"])
+    # tertiary only-UP promotes (a proven positive lifts; its ? stays put, never demotes)
+    key.append(-a["reach_promote"])
+    key.append(-a["writer_promote"])
+    key.append(-a["completeness_promote"])
+    # deterministic tiebreak
+    key.append(c.function or "")
+    key.append(c.evidence_ref or "")
+    return tuple(key)
+
+
+def sort_candidates(
+    candidates: list[TriageCandidate],
+    *,
+    spine: str = "impact",
+    impact_overrides: dict[str, int] | None = None,
+) -> list[TriageCandidate]:
+    """Project the candidate map into one lens. ``spine`` picks the pivot axis (default ``impact``);
+    the composite key, the only-up tertiary keys, and the demotion iron law ride under EVERY spine
+    and are not overridable. ``impact_overrides`` (from ``parse_impact_order``) re-orders the impact
+    tiers only — the ordering STRUCTURE (impact then controllability) stays fixed."""
+    sp = spine if spine in _VALID_SPINES else "impact"
+    return sorted(candidates, key=lambda c: _sort_key(c, spine=sp, overrides=impact_overrides))
+
+
+_DIMENSION_NAMES = frozenset(
+    {
+        "controllability",
+        "source_writability",
+        "reachability",
+        "filtering",
+        "sink_impact",
+        "writer",
+        "completeness",
+    }
+)
+
+
+def filter_by_dimension(
+    candidates: list[TriageCandidate], dim: str, value: str
+) -> list[TriageCandidate]:
+    """Filter by one dimension's value: ``controllability=free`` / ``sink_impact=cmd`` /
+    ``reachability=found`` / ``writer=located`` / ``source=nvram`` ... ``source=nvram`` is the
+    shorthand for a resolved nvram source key. An unknown dimension name is a no-op (returns all).
+    """
+    v = value.lower()
+    if dim == "source":
+        if v == "nvram":
+            return [c for c in candidates if c.nvram_source_key is not None]
+        return candidates
+    if dim in ("sink_impact", "sink_class", "sink"):
+        return [c for c in candidates if (c.sink_class or "").lower() == v]
+    if dim in _DIMENSION_NAMES:
+        return [c for c in candidates if c.dim(dim).value.lower() == v]
+    return candidates
+
+
+# Preset lenses: {filter, spine}. Each is just a starting {filter, spine} — the iron law + composite
+# key ride under all of them. A convergence-transform ("close-the-gap") lens is deliberately
+# deferred to a later phase; the value set stays open, so a new preset is one row here.
+VIEWS: dict[str, dict[str, Any]] = {
+    "default": {"filter": None, "spine": "impact"},
+    "by-sink": {"filter": None, "spine": "by-sink"},
+    "nvram-source": {"filter": ("source", "nvram"), "spine": "impact"},
+    "reachable-only": {"filter": ("reachability", "found"), "spine": "impact"},
+}
+
+
+def apply_view(
+    candidates: list[TriageCandidate],
+    *,
+    view: str | None = None,
+    sort_by: str | None = None,
+    dim_filters: list[tuple[str, str]] | None = None,
+    impact_overrides: dict[str, int] | None = None,
+) -> list[TriageCandidate]:
+    """Resolve a ``view`` preset (+ explicit ``sort_by`` / ``dim_filters`` overrides) into a
+    filtered, sorted list. ``dim_filters`` is a list of (dim, value). The demotion iron law rides
+    regardless of the chosen spine — no lens can bury a ? candidate."""
+    spine = "impact"
+    filters: list[tuple[str, str]] = []
+    if view and view in VIEWS:
+        preset = VIEWS[view]
+        spine = preset["spine"]
+        if preset["filter"]:
+            filters.append(preset["filter"])
+    if sort_by:
+        spine = sort_by
+    if dim_filters:
+        filters.extend(dim_filters)
+    out = list(candidates)
+    for d, val in filters:
+        out = filter_by_dimension(out, d, val)
+    return sort_candidates(out, spine=spine, impact_overrides=impact_overrides)
+
+
+def triage(conn: sqlite3.Connection, *, run_id: str | None = None) -> list[TriageCandidate]:
+    """Return the atlas candidate map — each candidate with its honest dimension layers — ordered by
+    the DEFAULT lens: sink-impact spine, impact x controllability composite, only-up tertiary
+    keys, and the demotion iron law (only a proven-safe fact sinks; a ? never sinks). Re-project
+    with ``sort_candidates`` / ``apply_view``. Read-only; nothing is written back.
 
     run_id, if given, restricts to one firmware run (source_run_id); otherwise all runs.
     """
@@ -626,163 +1037,49 @@ def triage(conn: sqlite3.Connection, *, run_id: str | None = None) -> list[Triag
         sql += " WHERE i.source_run_id = ?"
         params.append(run_id)
     rows = conn.execute(sql, params).fetchall()
-    candidates = [_candidate(r) for r in rows]
-    candidates.sort(key=lambda c: (-c.score, c.function or "", c.evidence_ref or ""))
-    return candidates
+    candidates = [_candidate(conn, r) for r in rows]
+    return sort_candidates(candidates, spine="impact")
 
 
-# ── single-candidate explanation (why the score; structure; honest bounds; where to verify) ──
+# ── single-candidate explanation (the dimension layers; honest bounds; where to verify) ──
 #
-# This view explains why a candidate ranks high and where to verify it by hand. It presents
-# evidence and bounds; it does NOT declare a candidate real, does NOT claim cross-function
-# reachability, and prints NO triggering input. The terminus is "a human/AI can read it and
-# knows where to verify".
-
-
-@dataclass(frozen=True)
-class ScoreComponent:
-    """One signal's contribution to the review-ordering score, with an honest mechanism note.
-
-    weight is the exact value the signal adds in _raw_score; the components sum to the raw score
-    and, normalized into [score_lo, score_hi], equal the candidate's review_score.
-    """
-
-    signal: str
-    value: str
-    weight: float
-    note: str
+# This view presents every dimension layer's honest three-state annotation (state + value +
+# source), the lens caveats, and where to verify by hand. There is NO score to decompose — the
+# dimensions ARE the explanation. It does NOT declare a candidate real, does NOT claim
+# cross-function reachability, and prints NO triggering input.
 
 
 @dataclass(frozen=True)
 class CandidateExplanation:
-    """A read-only, single-candidate analysis view. A lead with stated bounds, never a verdict."""
+    """A read-only, single-candidate map view. A lead with stated bounds, never a verdict.
+
+    ``dimensions`` carries every layer's honest three-state annotation; ``caveats`` states the
+    phase-1 optimism/blind-spots. No score, no score breakdown — the layers are the fact."""
 
     candidate: TriageCandidate
     call_sequence_shape: str | None
-    components: tuple[ScoreComponent, ...]
-    raw_score: float
-    score_lo: float
-    score_hi: float
-    score: float
+    # Every map layer's honest annotation (state / value / source / note) — the explanation itself.
+    dimensions: tuple[Dimension, ...]
+    # The current lens label + the honest phase-1 caveats, surfaced so the explain view never reads
+    # as complete (optimistic 'free', near-always-'?' filtering, no-reduction contract).
+    lens_label: str
+    caveats: tuple[str, ...]
     claims_does: tuple[str, ...]
     claims_does_not: tuple[str, ...]
     verify_steps: tuple[str, ...]
-    # The source signals promoted to the explain TOP LEVEL (mirrors ``score``, which likewise
-    # duplicates candidate.score): a consumer reads the top of the explain record, so the coarse
-    # controllability class (source_class) and the fine one (source_kind) must be directly visible
-    # here, not only nested inside ``candidate``. Both echo the same-named candidate fields.
+    # Signals promoted to the explain TOP LEVEL so a consumer reads them without descending into
+    # ``candidate``: the coarse source class, the fine source_kind, the controllability annotation,
+    # and the sink-impact class. Each echoes the same-named candidate field / dimension value.
     source_class: str
     source_kind: str
+    controllability: str
+    sink_impact: str
     # Summary-first sink_arg_provenance (Ghidra def-use fact) at the explain TOP LEVEL: one compact
     # entry per command/format sink in this candidate's function (idx / kind / resolved /
     # nearest_dominating_writer). The full writer + fmt + vararg detail is fetched on demand with
     # ``get_sink_provenance`` so a many-sink candidate never overruns the token budget. A surfaced
-    # fact only; nothing here feeds recall, the score, or the grade.
+    # fact only; nothing here feeds recall or a grade.
     sink_arg_provenance_summary: tuple[dict[str, Any], ...]
-
-
-def _reachability_note(status: str) -> str:
-    if status == "confirmed":
-        return (
-            "a source->sink flow was seen WITHIN ONE function (L1 at most); NOT caller-confirmed, "
-            "NOT cross-function — the tool did not trace who calls this function"
-        )
-    if status == "blocked":
-        return "a filter/guard was identified on the in-function path (likely dormant)"
-    return "not shown reachable within the function — a lead to verify, not a reachability result"
-
-
-def _origin_note(origin: str) -> str:
-    if origin == "custom":
-        return "custom code (likelier to hold a fresh lead than a known component)"
-    if origin == "stock_oss_known":
-        return "recognized stock OSS — a known component, not a new lead"
-    return "origin not decided (neutral)"
-
-
-def _source_note(source_class: str) -> str:
-    if source_class == "external_input":
-        return (
-            "a label that an external-input-class call appears in this function — NOT a proof the "
-            "external input reaches this sink's argument"
-        )
-    return "source class not recognized as external input (neutral)"
-
-
-def _entry_reach_note(entry_reach: str) -> str:
-    if entry_reach == "found":
-        return (
-            "a rootfs entry point (startup/maintenance script or web asset) was found to invoke "
-            "this binary — a derived, evidence-backed reachability signal (promotes within tier); "
-            "NOT a proof the candidate's input arrives from that entry"
-        )
-    return (
-        "no rootfs entry point invoking this binary was found — reported as unknown, NOT "
-        "unreachable (may be a coverage gap); neutral, never lowers the order"
-    )
-
-
-def score_breakdown(
-    reachability_status: str,
-    blocking_mechanism: str | None,
-    origin: str,
-    source_class: str,
-    sink_class: str,
-    *,
-    sink_anchor: str | None = None,
-    entry_reach: str = "unknown",
-) -> list[ScoreComponent]:
-    """Itemize the score: one ScoreComponent per signal, each weight from the real tables.
-
-    The component weights sum to _raw_score(...); normalizing that sum into [score_lo, score_hi]
-    reproduces review_score(...) exactly. No item is invented — each maps to one stored field.
-    """
-    filter_value = "none" if blocking_mechanism is None else blocking_mechanism
-    filter_weight = _filter_weight(blocking_mechanism)
-    if blocking_mechanism is None:
-        filter_note = (
-            "no sanitizer identified on the in-function path "
-            "(generic name match — may miss a custom guard)"
-        )
-    elif blocking_mechanism in _FORM_DOWNWEIGHT:
-        filter_note = (
-            f"a low-yield form was recognized ('{blocking_mechanism}'): a shape manual review "
-            "found rarely carries a live issue, so it ranks low — still a listed lead, verify it"
-        )
-    else:
-        filter_note = (
-            f"a '{blocking_mechanism}'-class guard was identified "
-            "(generic name match; may misjudge)"
-        )
-    sink_value = sink_class if sink_anchor is None else f"{sink_class} ({sink_anchor})"
-    return [
-        ScoreComponent(
-            "reachability",
-            reachability_status,
-            _STATUS_WEIGHT.get(reachability_status, 0.0),
-            _reachability_note(reachability_status),
-        ),
-        ScoreComponent("filter", filter_value, filter_weight, filter_note),
-        ScoreComponent("origin", origin, _ORIGIN_WEIGHT.get(origin, 0.0), _origin_note(origin)),
-        ScoreComponent(
-            "source_class",
-            source_class,
-            _SOURCE_CLASS_WEIGHT.get(source_class, 0.0),
-            _source_note(source_class),
-        ),
-        ScoreComponent(
-            "sink_class",
-            sink_value,
-            _SINK_CLASS_WEIGHT.get(sink_class, 0.0),
-            "the operation the sink performs (an ordering weight, not a magnitude-of-harm claim)",
-        ),
-        ScoreComponent(
-            "entry_reach",
-            entry_reach,
-            _ENTRY_REACH_WEIGHT.get(entry_reach, 0.0),
-            _entry_reach_note(entry_reach),
-        ),
-    ]
 
 
 def _verify_steps(candidate: TriageCandidate) -> tuple[str, ...]:
@@ -803,8 +1100,8 @@ def _verify_steps(candidate: TriageCandidate) -> tuple[str, ...]:
 def explain_candidate(conn: sqlite3.Connection, evidence_ref: str) -> CandidateExplanation | None:
     """Return a single-candidate explanation for the instance with this evidence_ref, or None.
 
-    Read-only. Builds the score breakdown from the real weights, the candidate structure, the
-    honest claim bounds, and a manual-verification checklist. Returns None when no instance
+    Read-only. Presents every dimension layer's honest three-state annotation, the lens caveats,
+    the honest claim bounds, and a manual-verification checklist. Returns None when no instance
     carries the given evidence_ref (the caller turns that into a friendly error).
     """
     rows = conn.execute(
@@ -828,39 +1125,30 @@ def explain_candidate(conn: sqlite3.Connection, evidence_ref: str) -> CandidateE
         )
     row = rows[0]
 
-    candidate = _candidate(row)
-    components = score_breakdown(
-        candidate.reachability_status,
-        candidate.blocking_mechanism,
-        candidate.origin,
-        candidate.source_class,
-        candidate.sink_class,
-        sink_anchor=candidate.sink_anchor,
-        entry_reach=candidate.entry_reach,
-    )
-    raw = sum(c.weight for c in components)
+    candidate = _candidate(conn, row)
     claims_does = (
-        "within one function, an external-input-class call reaches this sink with no identified "
-        "sanitizer — a shape that warrants reviewing this candidate early.",
+        "present each dimension layer as an observed FACT about this candidate (controllability, "
+        "source-writability, reachability, filtering, sink impact, writer, completeness) with its "
+        "three-state, value, and source.",
     )
     claims_does_not = (
-        "confirm the caller passes a controllable value (caller / cross-function flow not done);",
-        "track the external input to this sink's argument (external_input is a class label, not a "
-        "trace);",
-        "establish this is a real, reachable, or controllable issue — it is a lead, not a verdict.",
+        "declare the candidate attackable, reachable, or real — every layer is a fact; the "
+        "judgement is yours;",
+        "trace cross-function flow (who calls this function is not followed here);",
+        "prove safety on a '?' layer — a '?' is a coverage gap, never 'safe'.",
     )
     return CandidateExplanation(
         candidate=candidate,
         call_sequence_shape=row["call_sequence_shape"],
-        components=tuple(components),
-        raw_score=raw,
-        score_lo=_SCORE_LO,
-        score_hi=_SCORE_HI,
-        score=candidate.score,
+        dimensions=candidate.dimensions,
+        lens_label=DEFAULT_LENS_LABEL,
+        caveats=PHASE1_CAVEATS,
         claims_does=claims_does,
         claims_does_not=claims_does_not,
         verify_steps=_verify_steps(candidate),
         source_class=candidate.source_class,
         source_kind=candidate.source_kind,
+        controllability=candidate.dim("controllability").value,
+        sink_impact=candidate.dim("sink_impact").value,
         sink_arg_provenance_summary=_sink_provenance_summary(_row_get(row, "flow_evidence")),
     )

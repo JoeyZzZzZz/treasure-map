@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import click
 
@@ -259,40 +259,78 @@ def _effective_top(top_n: int | None, *, show_all: bool, sink: str | None) -> in
     return _DEFAULT_TOP
 
 
+def _parse_dim_filters(specs: tuple[str, ...]) -> list[tuple[str, str]]:
+    """Parse repeated --filter ``dim=value`` options into (dim, value) pairs; malformed skipped."""
+    out: list[tuple[str, str]] = []
+    for spec in specs:
+        d, sep, v = spec.partition("=")
+        if sep and d.strip() and v.strip():
+            out.append((d.strip(), v.strip()))
+    return out
+
+
+def _lens_label(
+    base: str,
+    *,
+    view: str | None,
+    sort_by: str | None,
+    dim_filters: list[tuple[str, str]],
+    impact_order: str | None,
+) -> str:
+    """The current-lens label: the base default plus any active view / spine / filter / order so a
+    reader always sees exactly which lens produced this ordering."""
+    parts: list[str] = []
+    if view:
+        parts.append(f"view={view}")
+    if sort_by:
+        parts.append(f"spine={sort_by}")
+    if dim_filters:
+        parts.append("filter=" + ",".join(f"{d}={v}" for d, v in dim_filters))
+    if impact_order:
+        parts.append(f"impact-order={impact_order}")
+    return base if not parts else f"{base}  [{' ; '.join(parts)}]"
+
+
+# Display a dimension's value compactly: the concrete reading, or a bare '?' when unknown so a
+# not-established layer never reads as a value. Shared by the list row and the JSON row.
+def _dv(c: TriageCandidate, name: str, *, unknown_as: str = "?") -> str:
+    d = c.dim(name)
+    return unknown_as if d.state == "unknown" else d.value
+
+
 def _render_triage(
     candidates: list[TriageCandidate],
     *,
     run_label: str,
+    lens_label: str,
+    caveats: tuple[str, ...],
     top_n: int | None,
     status: str | None,
     sink: str | None,
     include_gated: bool,
     as_json: bool,
 ) -> None:
-    """Render the ranked triage list. Shared by `tmap triage` and `tmap scan` so the two emit
-    byte-identical output (single source of truth, no drift).
+    """Render the candidate map under the current lens. Shared by `tmap triage` and `tmap scan`.
 
-    candidates arrives in global score-descending order (triage() sorted it). The row number #
-    is the STABLE global rank (1 = highest score), fixed before any --top/--status/--sink/gated
-    filter, so #N always names the same candidate and is safe to pass to --explain. Rows are shown
-    as one global-descending list (highest score first); review_status is just a per-row label.
-    top_n is None for an untruncated (full) view."""
+    candidates arrives already projected into the active lens (apply_view sorted+filtered it). The
+    row number # is the position in THAT lens order, so #N is safe to pass to --explain (which
+    resolves it under the same lens). There is no score column — each row shows its dimension
+    layers' three-state. top_n is None for an untruncated (full) view."""
     import json
 
+    from treasure_map.lib.query import impact_tier as _impact_tier
     from treasure_map.lib.query import shown_statuses as _shown_statuses
     from treasure_map.lib.query import sink_matches as _sink_matches
+
+    tier_name = {3: "hi", 2: "med", 1: "lo", 0: "?"}
 
     counts = {"reachable": 0, "to-verify": 0, "gated": 0}
     for c in candidates:
         counts[c.review_status] = counts.get(c.review_status, 0) + 1
 
-    # Stable global rank, assigned over the FULL list before filtering/truncation.
+    # Rank over the lens-ordered list, before the status/sink visibility fold + truncation.
     ranked = list(enumerate(candidates, 1))  # [(rank, candidate), ...]
-
-    # Decide which review statuses to display (rank is unaffected by this) — shared with the MCP
-    # candidate list so the two fold/show identically. A --sink filter shows all statuses.
     visible_statuses = _shown_statuses(status, include_gated=include_gated, sink=sink)
-
     visible = [
         (r, c)
         for r, c in ranked
@@ -305,13 +343,23 @@ def _render_triage(
                 [
                     {
                         "rank": r,
-                        "score": c.score,
-                        "review_status": c.review_status,
-                        "reachability_status": c.reachability_status,
                         "function": c.function,
-                        "source_class": c.source_class,
                         "sink_class": c.sink_class,
                         "sink_anchor": c.sink_anchor,
+                        "nvram_source_key": c.nvram_source_key,
+                        "dimensions": [
+                            {
+                                "name": d.name,
+                                "state": d.state,
+                                "value": d.value,
+                                "source": d.source,
+                                "note": d.note,
+                            }
+                            for d in c.dimensions
+                        ],
+                        "review_status": c.review_status,
+                        "reachability_status": c.reachability_status,
+                        "source_class": c.source_class,
                         "blocking_mechanism": c.blocking_mechanism,
                         "origin": c.origin,
                         "source_run_id": c.source_run_id,
@@ -330,35 +378,47 @@ def _render_triage(
         f"{counts['reachable']} reachable, {counts['to-verify']} to-verify, "
         f"{counts['gated']} gated)"
     )
+    click.echo(f"  lens: {lens_label}")
     if sink is not None:
         click.echo(f"  filter: sink = {sink}   ({len(visible)} shown, all statuses)")
     elif top_n is not None and len(candidates) > top_n:
         click.echo(f"  showing top {top_n} of {len(candidates)} — use --all or --sink to see more")
-    click.echo("  #   score  status      function (evidence_ref)        source->sink   filter")
+    click.echo(
+        "  #   sink(impact)   ctrl        reach   filter  writer      function (evidence_ref)"
+    )
     for r, c in visible:
-        fltr = c.blocking_mechanism if c.blocking_mechanism else "none"
+        sink_tag = f"{c.sink_class}/{tier_name.get(_impact_tier(c.sink_class), '?')}"
         click.echo(
-            f"  {r:<3} {c.score:<5.2f}  {c.review_status:<10}  "
-            f"{c.function or '?'} ({c.evidence_ref or '?'})   "
-            f"{c.source_class} -> {c.sink_anchor or '?'}   {fltr}"
+            f"  {r:<3} {sink_tag:<14} {_dv(c, 'controllability'):<11} "
+            f"{_dv(c, 'reachability'):<7} {_dv(c, 'filtering'):<7} {_dv(c, 'writer'):<11} "
+            f"{c.function or '?'} ({c.evidence_ref or '?'})"
         )
         # Where to open it: the binary's full path, read straight from the atlas so a candidate
-        # stays locatable even if its analysis.db is gone. Without this a candidate is unactionable
-        # in a firmware of hundreds of binaries.
-        click.echo(f"        in: {c.binary_path or '?'}")
+        # stays locatable even if its analysis.db is gone.
+        loc = f"        in: {c.binary_path or '?'}"
+        if c.nvram_source_key:
+            loc += f"   nvram_source_key={c.nvram_source_key}"
+        click.echo(loc)
     if "gated" not in visible_statuses and counts["gated"]:
         click.echo(f"\n  (gated: {counts['gated']} hidden; --include-gated to show)")
+    click.echo("\ncaveats (this map is honest but low-resolution — do not read it as complete):")
+    for cav in caveats:
+        click.echo(f"  - {cav}")
     click.echo(
-        "\nNote: candidates are leads for manual review, ranked by how much they warrant "
-        "reverse-engineering — NOT confirmed results. Lower # = look first."
+        "\nNote: candidates are leads for manual review, arranged by the current lens (switch it "
+        "with --sort-by / --view / --filter) — NOT confirmed results, and the list is re-ranked, "
+        "never reduced."
     )
 
 
-def _render_explain(ex: CandidateExplanation, *, as_json: bool) -> None:
-    """Render one candidate's score breakdown, structure, honest bounds, and verify checklist.
+_STATE_GLYPH = {"proven": "✓", "excluded": "✗", "unknown": "?"}
 
-    Presents evidence and bounds only — it does not declare the candidate real and prints no
-    triggering input. Shared shape for human and --json readers (no input-construction field)."""
+
+def _render_explain(ex: CandidateExplanation, *, as_json: bool) -> None:
+    """Render one candidate's dimension layers, honest caveats, bounds, and verify checklist.
+
+    Presents each layer's three-state (state / value / source / note) — no score. It does not
+    declare the candidate real and prints no triggering input. Shared shape for human and --json."""
     import json
 
     c = ex.candidate
@@ -370,18 +430,26 @@ def _render_explain(ex: CandidateExplanation, *, as_json: bool) -> None:
                     "function": c.function,
                     "review_status": c.review_status,
                     "reachability_status": c.reachability_status,
-                    "score": ex.score,
-                    "raw_score": ex.raw_score,
-                    "score_range": [ex.score_lo, ex.score_hi],
-                    "score_breakdown": [
-                        {"signal": s.signal, "value": s.value, "weight": s.weight, "note": s.note}
-                        for s in ex.components
+                    "lens_label": ex.lens_label,
+                    "caveats": list(ex.caveats),
+                    "controllability": ex.controllability,
+                    "sink_impact": ex.sink_impact,
+                    "dimensions": [
+                        {
+                            "name": d.name,
+                            "state": d.state,
+                            "value": d.value,
+                            "source": d.source,
+                            "note": d.note,
+                        }
+                        for d in ex.dimensions
                     ],
                     "structure": {
                         "source_class": c.source_class,
                         "source_kind": c.source_kind,
                         "sink_class": c.sink_class,
                         "sink_anchor": c.sink_anchor,
+                        "nvram_source_key": c.nvram_source_key,
                         "call_sequence_shape": ex.call_sequence_shape,
                         "blocking_mechanism": c.blocking_mechanism,
                         "origin": c.origin,
@@ -401,16 +469,19 @@ def _render_explain(ex: CandidateExplanation, *, as_json: bool) -> None:
         f"explain: {c.evidence_ref}   function {c.function or '?'}   "
         f"sink_class={c.sink_class} ({c.sink_anchor or '?'})"
     )
-    click.echo(
-        f"\nscore {ex.score:.2f}   "
-        f"(raw {ex.raw_score:+.1f}, normalized into [{ex.score_lo:.1f}, {ex.score_hi:.1f}])"
-    )
-    for s in ex.components:
-        click.echo(f"  {s.signal:<13}= {s.value:<22} {s.weight:+.1f}   {s.note}")
+    click.echo(f"\nlens: {ex.lens_label}")
+    click.echo("\ndimension layers (state / value / source):")
+    for d in ex.dimensions:
+        glyph = _STATE_GLYPH.get(d.state, "?")
+        click.echo(f"  {glyph} {d.name:<18} = {d.value:<16} [{d.source}]")
+        if d.note:
+            click.echo(f"      {d.note}")
 
     click.echo("\nstructure:")
     click.echo(f"  source_class = {c.source_class}")
     click.echo(f"  source_kind  = {c.source_kind}")
+    if c.nvram_source_key:
+        click.echo(f"  nvram_key    = {c.nvram_source_key}")
     click.echo(f"  sink         = {c.sink_anchor or '?'} ({c.sink_class})")
     click.echo(f"  shape        = {ex.call_sequence_shape or '?'}")
     click.echo(f"  function     = {c.function or '?'}")
@@ -434,7 +505,11 @@ def _render_explain(ex: CandidateExplanation, *, as_json: bool) -> None:
                 f"kind={sp.get('kind')}{extra}{mark}"
             )
 
-    click.echo("\nwhat this score does / does NOT claim:")
+    click.echo("\ncaveats (honest but low-resolution — do not read the map as complete):")
+    for cav in ex.caveats:
+        click.echo(f"  - {cav}")
+
+    click.echo("\nwhat this view does / does NOT claim:")
     for line in ex.claims_does:
         click.echo(f"  DOES: {line}")
     for line in ex.claims_does_not:
@@ -445,8 +520,8 @@ def _render_explain(ex: CandidateExplanation, *, as_json: bool) -> None:
         click.echo(f"  {i}. {step}")
 
     click.echo(
-        "\nNote: this explains why the candidate ranks high and where to verify it — it does NOT "
-        "confirm a real issue and prints no triggering input."
+        "\nNote: this presents the candidate's dimension layers and where to verify it — it does "
+        "NOT confirm a real issue and prints no triggering input."
     )
 
 
@@ -489,13 +564,42 @@ def _reachability_inline(status: str) -> str:
     default=False,
     help="Also show gated candidates (folded by default — they are likely dormant/false).",
 )
+@click.option(
+    "--sort-by",
+    "sort_by",
+    type=click.Choice(["impact", "controllability", "reachability", "sink_impact", "by-sink"]),
+    default=None,
+    help="Pivot axis (the spine). Default: impact. The demotion iron law rides under every spine, "
+    "so a '?' is never buried by switching the lens.",
+)
+@click.option(
+    "--view",
+    "view",
+    type=click.Choice(["default", "by-sink", "nvram-source", "reachable-only"]),
+    default=None,
+    help="A preset {filter, spine} lens.",
+)
+@click.option(
+    "--filter",
+    "dim_filter_specs",
+    multiple=True,
+    help="Filter by a dimension: dim=value (controllability=free / sink_impact=cmd / source=nvram "
+    "/ reachability=found / writer=located). Repeatable.",
+)
+@click.option(
+    "--impact-order",
+    "impact_order",
+    default=None,
+    help="Override the impact tiers, e.g. 'cmd=fmt_string,copy,log' (comma = descending tier, "
+    "'=' co-ranks). Overridable judgement.",
+)
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit structured JSON.")
 @click.option(
     "--explain",
     "explain_ref",
     default=None,
-    help="Explain ONE candidate by its # (rank) or evidence_ref: score breakdown, structure, "
-    "honest bounds, and a manual-verify checklist. Ignores --top/--status.",
+    help="Explain ONE candidate by its # (rank, under the current lens) or evidence_ref: the "
+    "dimension layers, honest caveats, and a manual-verify checklist. Ignores --top/--status.",
 )
 @click.option(
     "--config",
@@ -519,25 +623,31 @@ def triage(
     sink: str | None,
     status: str | None,
     include_gated: bool,
+    sort_by: str | None,
+    view: str | None,
+    dim_filter_specs: tuple[str, ...],
+    impact_order: str | None,
     as_json: bool,
     explain_ref: str | None,
     config: Path | None,
     atlas_path: Path | None,
 ) -> None:
-    """Rank atlas candidates by how much they warrant manual reverse-engineering.
+    """Map atlas candidates across honest dimension layers, ordered by a switchable lens.
 
-    Read-only: nothing is written back to the atlas and no field is altered. Rows are ranked by
-    score (highest first); the # is a stable global rank (lower # = look first) and each row also
-    carries its evidence_ref ({run_id}#fn{func_id}@{sink}) plus the binary path to open in the
-    decompiler — read straight from the atlas, so a candidate stays locatable even when its
-    analysis.db is gone. The list caps at 20 by default; --all shows everything and --sink <x>
-    shows every candidate for one sink (uncapped) so a recalled-but-low-scored sink is not hidden.
-    Candidates are leads, NOT confirmed results. Use --explain <#|ref> for a single-candidate
-    breakdown.
+    Read-only: nothing is written back to the atlas and no field is altered. There is NO score —
+    each row shows its dimension layers' three-state, ordered by the current lens (default: spine
+    on sink-impact, band by impact x controllability, only PROVEN-safe sinks demoted; a '?' never
+    sinks). Switch the lens with --sort-by / --view / --filter / --impact-order — the list is
+    re-ranked, NEVER reduced. The # is the row's position under the current lens; --explain <#|ref>
+    resolves it under the SAME lens. Each row carries its evidence_ref plus the binary path to open
+    in the decompiler. The list caps at 20 by default; --all shows everything and --sink <x> shows
+    every candidate for one sink (uncapped). Candidates are leads, NOT confirmed results.
     """
     from treasure_map.lib.atlas.connection import open_atlas
     from treasure_map.lib.config.config import load_config
-    from treasure_map.lib.query import explain_candidate
+    from treasure_map.lib.query import DEFAULT_LENS_LABEL, PHASE1_CAVEATS, explain_candidate
+    from treasure_map.lib.query import apply_view as run_apply_view
+    from treasure_map.lib.query import parse_impact_order as run_parse_impact_order
     from treasure_map.lib.query import triage as run_triage
 
     _echo_legal_notice(as_json=as_json)
@@ -545,15 +655,36 @@ def triage(
     cfg = load_config(config)
     resolved_atlas = atlas_path if atlas_path is not None else cfg.atlas.db_path
 
+    dim_filters = _parse_dim_filters(dim_filter_specs)
+    overrides = run_parse_impact_order(impact_order) if impact_order else None
+    lens_label = _lens_label(
+        DEFAULT_LENS_LABEL,
+        view=view,
+        sort_by=sort_by,
+        dim_filters=dim_filters,
+        impact_order=impact_order,
+    )
+
+    def _lensed(cands: list[TriageCandidate]) -> list[TriageCandidate]:
+        """Project the full candidate list into the current lens (sort + dimension filters). The
+        SAME projection feeds the rendered list and the --explain N index, so #N is consistent."""
+        return run_apply_view(
+            cands,
+            view=view,
+            sort_by=sort_by,
+            dim_filters=dim_filters,
+            impact_overrides=overrides or None,
+        )
+
     explanation: CandidateExplanation | None = None
     error: str | None = None
     conn = open_atlas(resolved_atlas)
     try:
         if explain_ref is not None:
             if explain_ref.isdigit():
-                # --explain N: resolve the Nth candidate in the SAME global score-descending order
-                # the rendered # uses, then reuse the evidence_ref path. No new explain logic.
-                cands = run_triage(conn, run_id=selected_run)
+                # --explain N: resolve the Nth candidate in the SAME lens order the rendered # uses,
+                # then reuse the evidence_ref path. No new explain logic.
+                cands = _lensed(run_triage(conn, run_id=selected_run))
                 n = int(explain_ref)
                 if 1 <= n <= len(cands):
                     ref = cands[n - 1].evidence_ref
@@ -567,7 +698,7 @@ def triage(
             else:
                 explanation = explain_candidate(conn, explain_ref)
         else:
-            candidates = run_triage(conn, run_id=selected_run)
+            candidates = _lensed(run_triage(conn, run_id=selected_run))
     finally:
         conn.close()
 
@@ -586,6 +717,8 @@ def triage(
     _render_triage(
         candidates,
         run_label=selected_run if selected_run is not None else "all runs",
+        lens_label=lens_label,
+        caveats=PHASE1_CAVEATS,
         top_n=_effective_top(top_n, show_all=show_all, sink=sink),
         status=status,
         sink=sink,
@@ -760,13 +893,13 @@ def scan(
     Slow stage is analyze (one Ghidra JVM per binary) — progress is shown per stage.
     """
     import asyncio
-    from typing import Any
 
     from treasure_map.cli.analyze_cli import _warn_incomplete
     from treasure_map.lib.atlas.connection import open_atlas
     from treasure_map.lib.config.config import load_config
     from treasure_map.lib.errors import GhidraNotFoundError, TreasureMapError
     from treasure_map.lib.hunt import run_analyzer2
+    from treasure_map.lib.query import DEFAULT_LENS_LABEL, PHASE1_CAVEATS
     from treasure_map.lib.query import triage as run_triage
     from treasure_map.lib.workspace.resolver import resolve_workspace
     from treasure_map.lib.workspace.workspace import Workspace
@@ -872,6 +1005,8 @@ def scan(
     _render_triage(
         candidates,
         run_label=effective_run_id,
+        lens_label=DEFAULT_LENS_LABEL,
+        caveats=PHASE1_CAVEATS,
         top_n=_effective_top(top_n, show_all=show_all, sink=sink),
         status=status,
         sink=sink,

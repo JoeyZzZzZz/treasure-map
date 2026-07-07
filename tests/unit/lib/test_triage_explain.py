@@ -1,10 +1,11 @@
 # Copyright (C) 2025-2026 JoeyZzZzZz
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Unit tests for the triage --explain single-candidate view.
+"""Unit tests for the triage --explain single-candidate map view.
 
-Proves the score breakdown is honest (items sum to the real score), the reachability bound
-footnote is present (and no self-declared verdict), evidence_ref resolves exactly (friendly
-error otherwise), no triggering-input/weapon vocabulary leaks, and the view is read-only.
+Proves every dimension layer is surfaced as an honest three-state fact (no collapsed score), the
+honest reachability/cross-function bound is stated (and no self-declared verdict), evidence_ref
+resolves exactly (friendly error otherwise), no triggering-input/weapon vocabulary leaks, and the
+view is read-only.
 """
 
 from __future__ import annotations
@@ -18,13 +19,22 @@ from treasure_map.cli.hunt_cli import triage as triage_cmd
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import InstanceRow
 from treasure_map.lib.atlas.writer import add_instance, upsert_pattern
-from treasure_map.lib.query import explain_candidate, review_score, score_breakdown
-from treasure_map.lib.query.triage import _SCORE_HI, _SCORE_LO
+from treasure_map.lib.query import explain_candidate
 
 _FID = [0]
 
 _WEAPON_WORDS = ("payload", "exploit", "send", "poc", "rce")  # checked as whole words
 _SELF_VERDICT = ("high-confidence vulnerability", "confirmed exploit", "confirmed vulnerability")
+
+_DIMENSION_NAMES = {
+    "controllability",
+    "source_writability",
+    "reachability",
+    "filtering",
+    "sink_impact",
+    "writer",
+    "completeness",
+}
 
 
 def _has_weapon_word(text: str) -> str | None:
@@ -77,23 +87,10 @@ def _seed(
     return tmp_path / "atlas.db"
 
 
-# ── 1. breakdown is honest: items sum, normalized, to the real score ────────────────
+# ── 1. every dimension layer is surfaced as a three-state fact (no score) ────────────
 
 
-def test_breakdown_sums_to_score() -> None:
-    cases = [
-        ("confirmed", None, "custom", "external_input", "cmd"),
-        ("unknown", "length_check", "stock_oss_known", "unknown", "format"),
-        ("blocked", "char_filter", "vendor_modified_oss", "external_input", "copy"),
-    ]
-    for args in cases:
-        comps = score_breakdown(*args)
-        raw = sum(c.weight for c in comps)
-        norm = round(min(1.0, max(0.0, (raw - _SCORE_LO) / (_SCORE_HI - _SCORE_LO))), 2)
-        assert norm == review_score(*args)  # every item maps to a real weight; sum reproduces score
-
-
-def test_explanation_score_matches_breakdown(tmp_path: Path) -> None:
+def test_explanation_carries_all_dimension_layers(tmp_path: Path) -> None:
     atlas = _seed(tmp_path, status="confirmed")
     conn = open_atlas(atlas)
     try:
@@ -101,12 +98,36 @@ def test_explanation_score_matches_breakdown(tmp_path: Path) -> None:
     finally:
         conn.close()
     assert ex is not None
-    assert abs(sum(c.weight for c in ex.components) - ex.raw_score) < 1e-9
-    norm = round(min(1.0, max(0.0, (ex.raw_score - ex.score_lo) / (ex.score_hi - ex.score_lo))), 2)
-    assert norm == ex.score == ex.candidate.score
+    names = {d.name for d in ex.dimensions}
+    assert names == _DIMENSION_NAMES  # all seven layers present
+    for d in ex.dimensions:  # each layer is an honest three-state fact
+        assert d.state in {"proven", "excluded", "unknown"}
+        assert d.value and d.source
+    # top-level echoes of the two most-consulted layers
+    assert ex.controllability == ex.candidate.dim("controllability").value
+    assert ex.sink_impact == ex.candidate.sink_class
+    # there is no score attribute anywhere on the explanation
+    assert not hasattr(ex, "score")
+    assert not hasattr(ex, "raw_score")
 
 
-# ── 2. honest reachability bound present; no self-declared verdict ──────────────────
+def test_explanation_surfaces_lens_and_caveats(tmp_path: Path) -> None:
+    # The explain view carries the active lens label and the honest phase-1 caveats so it never
+    # reads as complete (optimistic 'free', near-always-'?' filtering, no-reduction).
+    atlas = _seed(tmp_path)
+    conn = open_atlas(atlas)
+    try:
+        ex = explain_candidate(conn, "run_x#fn7")
+    finally:
+        conn.close()
+    assert ex is not None
+    assert "sink-impact" in ex.lens_label
+    blob = " ".join(ex.caveats).lower()
+    assert "optimistic" in blob  # 'free' is optimistic
+    assert "?" in blob  # filtering is near-always '?'
+
+
+# ── 2. honest reachability / cross-function bound present; no self-declared verdict ──
 
 
 def test_confirmed_explanation_states_bounds_not_verdict(tmp_path: Path) -> None:
@@ -117,12 +138,16 @@ def test_confirmed_explanation_states_bounds_not_verdict(tmp_path: Path) -> None
     finally:
         conn.close()
     assert ex is not None
-    reach = next(c for c in ex.components if c.signal == "reachability")
-    note = reach.note.lower()
-    assert "one function" in note  # single-function bound
-    assert "cross-function" in note  # explicitly not cross-function
-    assert "caller" in note  # caller not confirmed
-    blob = (reach.note + " ".join(ex.claims_does) + " ".join(ex.claims_does_not)).lower()
+    # the honest bound lives in claims_does_not: cross-function flow is NOT traced, and a '?' is
+    # never proven safe.
+    does_not = " ".join(ex.claims_does_not).lower()
+    assert "cross-function" in does_not
+    assert "coverage gap" in does_not or "never 'safe'" in does_not
+    # the reachability layer states 'unknown != unreachable'.
+    reach = ex.candidate.dim("reachability")
+    assert reach.state == "unknown"
+    assert "unreachable" in reach.note.lower()
+    blob = (does_not + " " + " ".join(ex.claims_does)).lower()
     for phrase in _SELF_VERDICT:
         assert phrase not in blob
 
@@ -162,9 +187,9 @@ def test_cli_explain_text_has_no_weapon_vocab(tmp_path: Path) -> None:
     )
     assert result.exit_code == 0, result.output
     assert _has_weapon_word(result.output) is None
-    # it still has to be useful: breakdown + verify checklist present
+    # it still has to be useful: dimension layers + verify checklist present
     out = result.output.lower()
-    assert "score" in out and "verify" in out and "memcpy" in result.output
+    assert "dimension layers" in out and "verify" in out and "memcpy" in result.output
 
 
 def test_cli_explain_json_is_structured_without_payload(tmp_path: Path) -> None:
@@ -177,27 +202,20 @@ def test_cli_explain_json_is_structured_without_payload(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     data = json.loads(result.output)
     assert data["evidence_ref"] == "run_x#fn7"
-    assert {s["signal"] for s in data["score_breakdown"]} == {
-        "reachability",
-        "filter",
-        "origin",
-        "source_class",
-        "sink_class",
-        "entry_reach",
-    }
-    assert "verify" in data and "claims_does_not" in data
+    assert {d["name"] for d in data["dimensions"]} == _DIMENSION_NAMES
+    assert "score" not in data and "score_breakdown" not in data  # the collapsed score is gone
+    assert "verify" in data and "claims_does_not" in data and "caveats" in data
     assert _has_weapon_word(json.dumps(data)) is None
     # no input-construction field smuggled in
     assert not any(k in data for k in ("payload", "input", "trigger", "poc"))
 
 
-# ── source_kind / source_class surfaced at the explanation TOP LEVEL (缺口③ bug fix) ──
+# ── source_kind / source_class / controllability surfaced at explanation TOP LEVEL ──
 
 
 def test_explanation_surfaces_source_signals_at_top_level(tmp_path: Path) -> None:
-    # The bug: source_kind was reachable only via ex.candidate, invisible at the top level a
-    # consumer (the MCP asdict, an agent) reads. Pin BOTH source signals on the CandidateExplanation
-    # itself, echoing the same-named candidate fields.
+    # source_kind / source_class / controllability / sink_impact are pinned on the explanation
+    # itself so a consumer (the MCP asdict, an agent) reads them without descending into candidate.
     atlas = _seed(tmp_path, status="unknown", source_kind="free_string")
     conn = open_atlas(atlas)
     try:
@@ -205,8 +223,10 @@ def test_explanation_surfaces_source_signals_at_top_level(tmp_path: Path) -> Non
     finally:
         conn.close()
     assert ex is not None
-    assert ex.source_kind == "free_string"  # top-level field, not only ex.candidate.source_kind
-    assert ex.source_class == "external_input"  # coarse class also top-level
+    assert ex.source_kind == "free_string"
+    assert ex.source_class == "external_input"
+    assert ex.controllability == "free"  # free_string source -> controllability free
+    assert ex.sink_impact == "copy"
     assert ex.source_kind == ex.candidate.source_kind  # echoes the candidate, no divergence
     assert ex.source_class == ex.candidate.source_class
 
@@ -222,6 +242,7 @@ def test_explanation_source_kind_defaults_unknown_at_top_level(tmp_path: Path) -
     assert ex is not None
     assert ex.source_kind == "unknown"
     assert ex.source_class == "external_input"
+    assert ex.controllability == "unknown"  # no free/nvram signal -> unknown, never fabricated
 
 
 # ── 5. read-only: --explain changes nothing in the atlas ────────────────────────────

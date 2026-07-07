@@ -23,6 +23,7 @@ from treasure_map.lib.query import explain_candidate, get_sink_provenance
 from treasure_map.lib.query.triage import (
     _fmt_args_provenance,
     _fmt_arity,
+    _is_proven_safe,
     _sink_provenance_summary,
 )
 
@@ -302,9 +303,9 @@ def test_get_sink_provenance_no_provenance_reported_honestly(tmp_path: Path) -> 
 # ── the non-scoring boundary invariant: provenance never changes score or drops a lead ──
 
 
-def test_unresolved_provenance_does_not_change_score_or_drop(tmp_path: Path) -> None:
-    # Two candidates identical in every scoring input, differing ONLY in provenance: one fully
-    # resolved (stack_buf with a dominating writer), one fully unresolved.
+def test_unresolved_provenance_feeds_writer_layer_never_sinks_or_drops(tmp_path: Path) -> None:
+    # Two candidates identical except provenance: one resolved (stack_buf + dominating writer), one
+    # fully unresolved. Provenance feeds the WRITER dimension, not a score.
     resolved = [_PROV[3]]  # stack_buf, resolved
     unresolved = [_PROV[7]]  # indirect_unresolved
 
@@ -324,14 +325,17 @@ def test_unresolved_provenance_does_not_change_score_or_drop(tmp_path: Path) -> 
         ca.close()
         cb.close()
     assert ex_a is not None and ex_b is not None
-    # provenance resolution must not move the review score
-    assert ex_a.score == ex_b.score
-    assert ex_a.raw_score == ex_b.raw_score
+    # resolution moves the WRITER layer (located vs not_traced), not a collapsed score.
+    assert ex_a.candidate.dim("writer").value == "located"
+    assert ex_b.candidate.dim("writer").value == "not_traced"
+    # an unresolved writer is a '?' — a coverage gap that NEVER sinks the candidate.
+    assert ex_b.candidate.dim("writer").state == "unknown"
+    assert not _is_proven_safe(ex_a.candidate) and not _is_proven_safe(ex_b.candidate)
     # and the unresolved candidate is still a surfaced lead (never silently dropped)
     assert ex_b.sink_arg_provenance_summary[0]["resolved"] is False
 
 
-def test_provenance_is_not_a_score_component(tmp_path: Path) -> None:
+def test_provenance_is_surfaced_as_writer_layer_not_a_score(tmp_path: Path) -> None:
     atlas = _seed(tmp_path)
     conn = open_atlas(atlas)
     try:
@@ -339,10 +343,14 @@ def test_provenance_is_not_a_score_component(tmp_path: Path) -> None:
     finally:
         conn.close()
     assert ex is not None
-    # no score component is derived from provenance — it is evidence, not a weighted signal
-    signals = " ".join(c.signal for c in ex.components).lower()
-    assert "provenance" not in signals
-    assert "writer" not in signals
+    # provenance is EVIDENCE surfaced as the writer dimension (a three-state fact), never a weight.
+    writer = ex.candidate.dim("writer")
+    assert writer.name == "writer"
+    assert writer.value in {"located", "via_wrapper", "not_traced"}
+    assert writer.state in {"proven", "unknown"}
+    # there is no collapsed score / weighted component anywhere on the explanation.
+    assert not hasattr(ex, "components")
+    assert not hasattr(ex, "score")
 
 
 # ── polish: readability of a reused-buffer stack_buf (dominating count / inline fmt / ordering /

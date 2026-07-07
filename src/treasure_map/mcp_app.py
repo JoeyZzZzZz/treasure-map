@@ -37,6 +37,10 @@ from mcp.server.fastmcp import FastMCP
 from treasure_map.lib import facts
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.notice import LEGAL_NOTICE
+from treasure_map.lib.query import DEFAULT_LENS_LABEL as _LENS_LABEL
+from treasure_map.lib.query import PHASE1_CAVEATS as _LENS_CAVEATS
+from treasure_map.lib.query import VIEWS as _VIEWS
+from treasure_map.lib.query import apply_view as _apply_view
 from treasure_map.lib.query import density as _density
 from treasure_map.lib.query import dormant as _dormant
 from treasure_map.lib.query import explain_candidate as _explain_candidate
@@ -44,6 +48,7 @@ from treasure_map.lib.query import filter_candidates as _filter_candidates
 from treasure_map.lib.query import get_nvram_key_flow as _get_nvram_key_flow
 from treasure_map.lib.query import get_sink_provenance as _get_sink_provenance
 from treasure_map.lib.query import ledger as _ledger
+from treasure_map.lib.query import parse_impact_order as _parse_impact_order
 from treasure_map.lib.query import triage as _triage
 from treasure_map.lib.query import twins as _twins
 
@@ -51,9 +56,9 @@ from treasure_map.lib.query import twins as _twins
 # recurrence signals are derived from neutral stored facts, carry their evidence, and are NOT a
 # security verdict.
 _DERIVED_SIGNAL_NOTE = (
-    "score / entry_reach / device_spread / blocking_mechanism are DERIVED, evidence-backed "
-    "review-ordering signals — NOT a verdict. A candidate is a lead to verify, never a confirmed "
-    "issue."
+    "the dimension layers / entry_reach / device_spread / lens ordering are DERIVED, "
+    "evidence-backed facts — NOT a verdict. A candidate is a lead to verify, never a confirmed "
+    "issue; a '?' layer is a coverage gap, never 'safe'."
 )
 
 # Hard cap on a single list_candidates page so an over-large limit cannot blow up the context.
@@ -63,10 +68,13 @@ _MAX_LIMIT = 200
 # notice stays reachable via the legal_notice tool (B4).
 _AGENT_INSTRUCTIONS = (
     "Treasure Map exposes a firmware analysis knowledge base as read-only fact tools. Work the "
-    "loop: RECALL -> FETCH FACTS -> JUDGE. (1) list_candidates gives leads ranked by a derived "
-    "review-ordering score for the firmware this server is bound to (the current run); it is NOT "
-    "a verdict — recall is deliberately wide, so expect false positives and DEMOTE a candidate "
-    "yourself once the pseudocode shows it benign. (2) For a lead, follow its evidence_ref (the "
+    "loop: RECALL -> FETCH FACTS -> JUDGE. (1) list_candidates is a multi-dimensional map: each "
+    "lead carries an honest three-state annotation on every layer (controllability / "
+    "source_writability / reachability / filtering / sink_impact / writer / completeness), ordered "
+    "by a SWITCHABLE lens (sort_by / view / filters / impact_order) whose default sinks only "
+    "provably-safe candidates and NEVER buries a '?'. It is NOT a verdict — recall is deliberately "
+    "wide, so expect false positives and DEMOTE a candidate yourself once the pseudocode shows it "
+    "benign. (2) For a lead, follow its evidence_ref (the "
     "cross-tool anchor). explain_candidate carries a sink_arg_provenance_summary (per sink: where "
     "the sink argument's value comes from, by Ghidra def-use — kind, whether it resolved, and the "
     "sound nearest_dominating_writer for a reused stack buffer); get_sink_provenance(evidence_ref, "
@@ -88,8 +96,16 @@ _AGENT_INSTRUCTIONS = (
 )
 
 
+def _dimension_dict(d: Any) -> dict[str, Any]:
+    """One map-layer annotation as a flat record: the honest three-state, value, source, note."""
+    return {"name": d.name, "state": d.state, "value": d.value, "source": d.source, "note": d.note}
+
+
 def _candidate_dict(c: Any, current_run_id: str | None = None) -> dict[str, Any]:
-    """One triage candidate as a flat, JSON-serializable record (anchor + derived signals)."""
+    """One candidate as a flat, JSON-serializable map point: anchor + every dimension layer.
+
+    There is NO score — ``dimensions`` carries the honest per-layer three-state facts, and the
+    listing order is the current lens (see the top-level ``lens`` field). Each layer is a FACT."""
     return {
         "evidence_ref": c.evidence_ref,  # the anchor
         "function": c.function,
@@ -98,15 +114,19 @@ def _candidate_dict(c: Any, current_run_id: str | None = None) -> dict[str, Any]
         "sink_class": c.sink_class,
         "source_class": c.source_class,
         # fine-grained controllability of the source reaching the sink argument (free_string /
-        # charset_safe / charset_maybe / unknown), surfaced from the candidate's flow_evidence —
-        # the signal source_class folds away. DERIVED evidence, NOT a verdict.
+        # charset_safe / charset_maybe / unknown), surfaced from the candidate's flow_evidence.
         "source_kind": c.source_kind,
+        # the nvram key feeding the sink (when the def-use provenance resolved an nvram getter);
+        # None otherwise. Its web-settability drives the controllability layer.
+        "nvram_source_key": c.nvram_source_key,
+        # the honest map layers — every dimension a first-class annotation {state, value, source,
+        # note}, NOT buried in flow_evidence. This REPLACES the old collapsed score.
+        "dimensions": [_dimension_dict(d) for d in c.dimensions],
         "reachability_status": c.reachability_status,  # raw mechanism state (unknown/confirmed/…)
         "review_status": c.review_status,  # presentation relabel (to-verify / reachable / gated)
         "blocking_mechanism": c.blocking_mechanism,
         "origin": c.origin,
-        "entry_reach": c.entry_reach,  # found promotes within tier; unknown is neutral
-        "score": c.score,  # derived review-ordering signal, NOT a verdict
+        "entry_reach": c.entry_reach,
         # The pattern fingerprint — pivot a cross_firmware_patterns hit to its instances via the
         # list_candidates(fingerprint=…) filter (same key density / ledger group by).
         "structural_fingerprint": c.structural_fingerprint,
@@ -126,6 +146,31 @@ def _run_summary(candidates: list[Any]) -> list[dict[str, Any]]:
         {"source_run_id": run, "count": n}
         for run, n in sorted(counts.items(), key=lambda kv: (-kv[1], str(kv[0])))
     ]
+
+
+def _parse_dim_filters(spec: str | None) -> list[tuple[str, str]]:
+    """Parse a ``"dim=value,dim2=value2"`` filter string into (dim, value) pairs; blank/None -> [].
+
+    Used for the map's dimension filters (controllability=free / sink_impact=cmd / source=nvram /
+    reachability=found ...). Malformed fragments (no '=') are skipped, never guessed."""
+    if not spec:
+        return []
+    out: list[tuple[str, str]] = []
+    for part in spec.split(","):
+        d, sep, v = part.strip().partition("=")
+        if sep and d.strip() and v.strip():
+            out.append((d.strip(), v.strip()))
+    return out
+
+
+def _effective_spine(sort_by: str | None, view: str | None) -> str:
+    """The pivot axis actually in force: explicit sort_by wins, else the view preset's spine, else
+    the default 'impact' spine."""
+    if sort_by:
+        return sort_by
+    if view and view in _VIEWS:
+        return str(_VIEWS[view]["spine"])
+    return "impact"
 
 
 def _page(rows: list[Any], limit: int, offset: int) -> tuple[list[Any], dict[str, Any]]:
@@ -206,21 +251,33 @@ def make_tools(
         status: str | None = None,
         include_gated: bool = False,
         fingerprint: str | None = None,
+        sort_by: str | None = None,
+        view: str | None = None,
+        filters: str | None = None,
+        impact_order: str | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> dict[str, Any]:
-        """List recall candidates with their derived, evidence-backed review-ordering signals.
+        """A multi-dimensional map of recall candidates, ordered by a switchable lens.
 
-        Defaults to the firmware this server is bound to (the current run), so a shared atlas does
-        not surface another image's leads. Filters mirror `tmap triage`: ``sink`` (a concrete
-        callee like ``syslog`` OR a class like ``cmd``), ``sink_class`` (exact class), ``status``
-        (to-verify / reachable / gated / all — default folds gated unless ``include_gated``).
-        ``fingerprint`` narrows to one pattern's structural_fingerprint — pivot here from a
-        cross_firmware_patterns hit to see its instances. Paged: ``limit`` (capped at 200) +
-        ``offset``; the result carries ``total`` / ``returned`` / ``truncated`` / ``next_offset``.
-        Each candidate carries its anchor (evidence_ref), structural_fingerprint, and
-        is_current_run. Signals are DERIVED, NOT a verdict. Prefer a narrow filter and the head of
-        the list, then fetch detail per evidence_ref — do not pull the whole list at once."""
+        Every candidate carries a three-state annotation on each dimension layer (controllability /
+        source_writability / reachability / filtering / sink_impact / writer / completeness) —
+        there is NO collapsed score. The DEFAULT lens spines on sink-impact, bands by
+        impact x controllability, and sinks ONLY provably-safe candidates out of the first screen; a
+        '?' never sinks (the demotion iron law rides under EVERY lens).
+
+        Switch the lens (the list is re-ranked, never reduced — every candidate stays queryable):
+        - ``sort_by``: pivot axis — impact (default) / controllability / reachability / by-sink.
+        - ``view``: preset {filter,spine} — default / by-sink / nvram-source / reachable-only.
+        - ``filters``: dimension filters, ``"dim=value,dim2=value2"`` (controllability=free /
+          sink_impact=cmd / source=nvram / reachability=found / writer=located ...).
+        - ``impact_order``: override the impact tiers, e.g. ``"cmd=fmt_string,copy,log"``.
+
+        Legacy filters still apply: ``sink`` (callee OR class), ``sink_class`` (exact), ``status``
+        (to-verify / reachable / gated / all), ``fingerprint`` (pivot from cross_firmware_patterns).
+        Paged (``limit`` capped 200 + ``offset``). The result's ``lens`` names the active view and
+        ``caveats`` states the honest phase-1 blind spots (optimistic 'free', near-always-'?'
+        filtering). DERIVED facts, NOT a verdict — read the head, then fetch detail per ref."""
         effective = run_id if run_id is not None else current_run_id
         conn = open_atlas(atlas_path)
         try:
@@ -238,6 +295,17 @@ def make_tools(
             ranked = [c for c in ranked if c.sink_class == sink_class]
         if fingerprint is not None:
             ranked = [c for c in ranked if c.structural_fingerprint == fingerprint]
+        # Apply the map lens: dimension filters + spine + impact-tier override. The composite key
+        # and the demotion iron law ride under whatever spine is chosen (a ? is never buried).
+        dim_filters = _parse_dim_filters(filters)
+        overrides = _parse_impact_order(impact_order) if impact_order else None
+        ranked = _apply_view(
+            ranked,
+            view=view,
+            sort_by=sort_by,
+            dim_filters=dim_filters,
+            impact_overrides=overrides or None,
+        )
         total = len(ranked)
         lim = max(0, min(limit, _MAX_LIMIT))
         off = max(0, offset)
@@ -245,6 +313,18 @@ def make_tools(
         end = off + len(page)
         return {
             "note": _DERIVED_SIGNAL_NOTE,
+            # The active lens: a good default that does not lock the agent in. Switch it with
+            # sort_by / view / filters / impact_order; the demotion iron law holds under them all.
+            "lens": {
+                "label": _LENS_LABEL,
+                "spine": _effective_spine(sort_by, view),
+                "view": view or "default",
+                "filters": [f"{d}={v}" for d, v in dim_filters],
+                "impact_order": impact_order or "default (cmd=fmt_string>copy>log)",
+                "switchable": "sort_by / view / filters / impact_order — re-ranks, never reduces",
+            },
+            # The honest phase-1 blind spots — surfaced so the map is never read as complete.
+            "caveats": list(_LENS_CAVEATS),
             "current_run_id": current_run_id,
             "isolated_to_run": isolated_to,
             # the firmware split, shown only when NOT isolated to a single run (else all one run)
@@ -344,7 +424,9 @@ def make_tools(
         }
 
     def explain_candidate(evidence_ref: str) -> dict[str, Any]:
-        """Single-candidate fact view: score breakdown, honest claim bounds, where to verify.
+        """Single-candidate fact view: every dimension layer's honest three-state annotation
+        (controllability / source_writability / reachability / filtering / sink_impact / writer /
+        completeness), the lens caveats, the claim bounds, and where to verify — no score.
 
         Returns a not-found record when no instance carries ``evidence_ref`` (no fabrication)."""
         conn = open_atlas(atlas_path)

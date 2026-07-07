@@ -1,10 +1,14 @@
 # Copyright (C) 2025-2026 JoeyZzZzZz
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Unit tests for lib/query/triage — the read-only review-ordering of atlas candidates.
+"""Unit tests for lib/query/triage — the read-only dimension MAP of atlas candidates.
 
-Builds a synthetic atlas directly (no analyzer), then asserts the deterministic ranking,
-the presentation-only relabel (raw schema field stays confirmed/blocked/unknown), the
-gated fold in the CLI, the evidence_ref anchor on every row, and that triage writes nothing.
+Builds a synthetic atlas directly (no analyzer), then asserts the default-lens ordering (spine
+on sink-impact, band by impact x controllability, only-up promotes, demotion iron law), the
+presentation-only relabel (raw schema field stays confirmed/blocked/unknown), the gated fold in
+the CLI, the evidence_ref anchor on every row, and that triage writes nothing.
+
+There is NO collapsed score: ordering is a lens over first-class dimension layers, and a '?' layer
+never sinks a candidate.
 """
 
 from __future__ import annotations
@@ -19,7 +23,7 @@ from treasure_map.cli.hunt_cli import triage as triage_cmd
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import InstanceRow
 from treasure_map.lib.atlas.writer import add_instance, upsert_pattern
-from treasure_map.lib.query import review_score, triage
+from treasure_map.lib.query import sort_candidates, triage
 
 _FID = [0]
 
@@ -89,49 +93,48 @@ def _atlas(tmp_path: Path) -> sqlite3.Connection:
     return open_atlas(tmp_path / "atlas.db")
 
 
-# ── ranking ───────────────────────────────────────────────────────────────────────
+def _ctrl(c: object) -> str:
+    return c.dim("controllability").value  # type: ignore[attr-defined]
 
 
-def test_strong_lead_ranks_above_weak_lead(tmp_path: Path) -> None:
+# ── default-lens ordering ───────────────────────────────────────────────────────────
+
+
+def test_high_impact_lead_ranks_above_low_impact_lead(tmp_path: Path) -> None:
+    # Default lens spines on sink-impact: a cmd (RCE, tier 3) sink ranks above a format (tier 1)
+    # sink of the same everything-else — impact is the pivot axis.
     conn = _atlas(tmp_path)
     strong_p = _pattern(conn, "fp_strong", sink_class="cmd", source_class="external_input")
     weak_p = _pattern(conn, "fp_weak", sink_class="format", source_class="unknown")
-    # strong: custom code, no filter, external input, cmd sink, unknown(=to-verify).
-    _inst(conn, strong_p, status="unknown", origin="custom", blocking=None, fn="strong_fn")
-    # weak: recognized stock OSS, a filter on the path, unclassified source, format sink.
-    _inst(
-        conn,
-        weak_p,
-        status="unknown",
-        origin="stock_oss_known",
-        blocking="length_check",
-        fn="weak_fn",
-    )
+    _inst(conn, strong_p, status="unknown", origin="custom", fn="strong_fn")
+    _inst(conn, weak_p, status="unknown", origin="stock_oss_known", fn="weak_fn")
 
     ranked = triage(conn)
     assert [c.function for c in ranked] == ["strong_fn", "weak_fn"]
-    assert ranked[0].score > ranked[1].score
     conn.close()
 
 
-def test_confirmed_ranks_above_same_class_unknown(tmp_path: Path) -> None:
+def test_free_controllability_ranks_above_unknown_within_a_tier(tmp_path: Path) -> None:
+    # Within one impact tier, controllability certainty bands the map: a free source ranks above an
+    # unknown one (the composite key's second axis). Neither is sunk — both stay active.
     conn = _atlas(tmp_path)
     p = _pattern(conn, "fp", sink_class="cmd", source_class="external_input")
-    # identical fine signals; only the reachability tier differs.
-    _inst(conn, p, status="unknown", origin="custom", fn="u_fn")
-    _inst(conn, p, status="confirmed", origin="custom", fn="c_fn")
+    _inst(conn, p, fn="unknown_src")  # no source_kind -> controllability unknown
+    _inst(conn, p, fn="free_src", source_kind="free_string")  # -> controllability free
 
     ranked = triage(conn)
-    assert [c.function for c in ranked] == ["c_fn", "u_fn"]  # reachable above to-verify
+    assert [c.function for c in ranked] == ["free_src", "unknown_src"]
+    assert _ctrl(ranked[0]) == "free"
+    assert _ctrl(ranked[1]) == "unknown"
     conn.close()
 
 
-# ── entry-reach ranking (v2 lever, factor 6b): proven promotes, unknown never demotes ──
+# ── reachability dimension (entry_reach): proven promotes, ? never demotes ──
 
 
 def test_entry_reach_found_promotes_within_tier(tmp_path: Path) -> None:
-    # Two same-class same-status candidates differing ONLY in entry-reach: the one with a proven
-    # rootfs entry path (network/script-reachable) ranks above the local-only/unknown one.
+    # Two same-impact same-controllability candidates differing ONLY in entry-reach: the one with a
+    # proven rootfs entry ranks above the unknown-entry one (an only-up tertiary promote).
     conn = _atlas(tmp_path)
     p = _pattern(conn, "fp", sink_class="fmt_string", source_class="external_input")
     _inst(conn, p, status="unknown", fn="local_only", entry_reach="unknown")
@@ -143,9 +146,9 @@ def test_entry_reach_found_promotes_within_tier(tmp_path: Path) -> None:
     conn.close()
 
 
-def test_entry_reach_does_not_reverse_sink_class_order(tmp_path: Path) -> None:
-    # A proven-entry COPY must not overtake an unknown-entry CMD of the same status: entry-reach is
-    # a SECOND-LEVEL key, smaller than the sink-class gap.
+def test_entry_reach_does_not_reverse_sink_impact_order(tmp_path: Path) -> None:
+    # A proven-entry COPY must not overtake an unknown-entry CMD: entry-reach is an only-up tertiary
+    # key, ranked BELOW the impact spine and the controllability band.
     conn = _atlas(tmp_path)
     cmd_p = _pattern(conn, "fp_cmd", sink_class="cmd", source_class="external_input")
     copy_p = _pattern(conn, "fp_copy", sink_class="copy", source_class="external_input")
@@ -157,51 +160,43 @@ def test_entry_reach_does_not_reverse_sink_class_order(tmp_path: Path) -> None:
     conn.close()
 
 
-def test_entry_reach_unknown_is_never_demoted(tmp_path: Path) -> None:
-    # ★ prove-the-asymmetry: an external_input candidate with entry_reach=unknown must NOT score
-    # below the same candidate scored WITHOUT any entry-reach lever (only ``found`` ever adds).
-    base = review_score("unknown", None, "custom", "external_input", "cmd")
-    as_unknown = review_score("unknown", None, "custom", "external_input", "cmd", "unknown")
-    as_found = review_score("unknown", None, "custom", "external_input", "cmd", "found")
-    assert as_unknown == base  # unknown is strictly neutral — no demotion
-    assert as_found >= as_unknown  # found can only promote
-    # the weight table itself carries no negative entry-reach contribution
-    from treasure_map.lib.query.triage import _ENTRY_REACH_WEIGHT
+def test_unknown_reachability_is_never_demoted(tmp_path: Path) -> None:
+    # ★ prove-the-asymmetry: entry_reach only ever PROMOTES 'found'; an 'unknown' (a '?') is
+    # strictly neutral and is never demoted below an otherwise-identical no-signal candidate.
+    from treasure_map.lib.query.triage import _REACH_RANK, _candidate
 
-    assert all(w >= 0.0 for w in _ENTRY_REACH_WEIGHT.values())
-    assert _ENTRY_REACH_WEIGHT.get("unknown", 0.0) == 0.0
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp", sink_class="cmd", source_class="external_input")
+    _inst(conn, p, fn="unknown_entry", entry_reach="unknown")
+    _inst(conn, p, fn="no_signal")  # no entry_reach at all -> also 'unknown'
+    _inst(conn, p, fn="found_entry", entry_reach="found")
+    ranked = triage(conn)
+    order = [c.function for c in ranked]
+    # found promotes to the top; unknown and no-signal tie (neither demoted) below it.
+    assert order[0] == "found_entry"
+    assert set(order[1:]) == {"unknown_entry", "no_signal"}
+    # the rank table carries no negative reachability contribution.
+    assert all(w >= 0 for w in _REACH_RANK.values())
+    assert _REACH_RANK["unknown"] >= _REACH_RANK["blocked"]
+    assert _candidate  # imported symbol still present (dimension builder entry point)
+    conn.close()
 
 
-def test_entry_reach_unknown_external_lead_not_buried(tmp_path: Path) -> None:
-    # An entry_reach=unknown but external_input cmd lead still ranks above a found-but-weaker
-    # (format-sink, stock-oss, filtered) lead — the lever does not bury an unknown real lead.
+def test_unknown_entry_external_lead_not_buried(tmp_path: Path) -> None:
+    # An entry_reach=unknown cmd lead still ranks above a found-but-lower-impact (format) lead — the
+    # promote lever does not let a proven-entry weak sink bury an unknown-entry strong one.
     conn = _atlas(tmp_path)
     strong = _pattern(conn, "fp_s", sink_class="cmd", source_class="external_input")
     weak = _pattern(conn, "fp_w", sink_class="format", source_class="unknown")
-    _inst(
-        conn,
-        strong,
-        status="unknown",
-        origin="custom",
-        fn="unknown_entry_lead",
-        entry_reach="unknown",
-    )
-    _inst(
-        conn,
-        weak,
-        status="unknown",
-        origin="stock_oss_known",
-        blocking="length_check",
-        fn="found_but_weak",
-        entry_reach="found",
-    )
+    _inst(conn, strong, fn="unknown_entry_lead", entry_reach="unknown")
+    _inst(conn, weak, fn="found_but_weak", entry_reach="found")
 
     ranked = triage(conn)
     assert ranked[0].function == "unknown_entry_lead"
     conn.close()
 
 
-# ── source_kind exposure (缺口③): the fine-grained controllability signal, surfaced not scored ──
+# ── source_kind exposure -> controllability layer ──
 
 
 def test_source_kind_parsed_from_flow_evidence(tmp_path: Path) -> None:
@@ -243,30 +238,39 @@ def test_source_kind_parser_is_conservative() -> None:
     assert _source_kind_from_evidence(json.dumps({"entry_reach": {}})) == "unknown"
 
 
-def test_source_kind_does_not_affect_score(tmp_path: Path) -> None:
-    # ★ exposure-only: source_kind is surfaced, never scored. Two candidates identical except for
-    # source_kind rank equally — source_class alone drives ordering.
+def test_source_kind_drives_controllability(tmp_path: Path) -> None:
+    # ★ the map USES source_kind (unlike the old score, which ignored it): a free_string source is
+    # controllability=free and ranks at or above the unknown-source candidate of the same tier.
     conn = _atlas(tmp_path)
     p = _pattern(conn, "fp", sink_class="cmd", source_class="external_input")
     _inst(conn, p, fn="free_fn", source_kind="free_string")
     _inst(conn, p, fn="unknown_fn", source_kind="unknown")
     by_fn = {c.function: c for c in triage(conn)}
-    assert by_fn["free_fn"].score == by_fn["unknown_fn"].score
+    assert _ctrl(by_fn["free_fn"]) == "free"
+    assert _ctrl(by_fn["unknown_fn"]) == "unknown"
+    ranked = [c.function for c in triage(conn)]
+    assert ranked.index("free_fn") < ranked.index("unknown_fn")
     conn.close()
 
 
-def test_blocked_sinks_to_the_bottom(tmp_path: Path) -> None:
+# ── gating is a presentation fold, NOT a sort demotion ──
+
+
+def test_blocked_is_relabelled_gated_not_sunk(tmp_path: Path) -> None:
+    # A blocked candidate is relabelled review_status='gated' (folded in the CLI), but the MAP still
+    # orders it by its dimensions — gating is presentation; the sort never reads the raw status
+    # (the sort key contains no reachability_status term at all).
     conn = _atlas(tmp_path)
-    p = _pattern(conn, "fp", sink_class="cmd", source_class="external_input")
-    # a "best possible" blocked vs a "worst possible" unknown: blocked must still be last.
-    _inst(conn, p, status="blocked", origin="custom", blocking="char_filter", fn="blk_best")
-    _inst(
-        conn, p, status="unknown", origin="stock_oss_known", blocking="length_check", fn="unk_worst"
-    )
+    cmd_p = _pattern(conn, "fp_cmd", sink_class="cmd", source_class="external_input")
+    copy_p = _pattern(conn, "fp_copy", sink_class="copy", source_class="external_input")
+    _inst(conn, cmd_p, status="blocked", blocking="char_filter", fn="blk_cmd")
+    _inst(conn, copy_p, status="unknown", fn="live_copy")
 
     ranked = triage(conn)
-    assert ranked[-1].function == "blk_best"  # gated sinks below any to-verify
-    assert ranked[-1].review_status == "gated"
+    by_fn = {c.function: c for c in ranked}
+    assert by_fn["blk_cmd"].review_status == "gated"
+    # the gated cmd (impact 3) still sorts ABOVE the live copy (impact 2) — not sunk by its status.
+    assert [c.function for c in ranked] == ["blk_cmd", "live_copy"]
     conn.close()
 
 
@@ -312,9 +316,16 @@ def test_every_candidate_carries_evidence_ref(tmp_path: Path) -> None:
 # ── determinism ─────────────────────────────────────────────────────────────────────
 
 
-def test_score_is_deterministic() -> None:
-    args = ("unknown", None, "custom", "external_input", "cmd")
-    assert review_score(*args) == review_score(*args)
+def test_sort_is_deterministic(tmp_path: Path) -> None:
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp", sink_class="cmd")
+    for i in range(5):
+        _inst(conn, p, fn=f"fn{i}", source_kind="free_string" if i % 2 else None)
+    cands = triage(conn)
+    a = [c.evidence_ref for c in sort_candidates(cands)]
+    b = [c.evidence_ref for c in sort_candidates(cands)]
+    assert a == b  # same input -> byte-identical order
+    conn.close()
 
 
 # ── read-only: triage writes nothing ─────────────────────────────────────────────────
@@ -339,11 +350,31 @@ def test_triage_does_not_write_back(tmp_path: Path) -> None:
 
 
 def _seed_for_cli(tmp_path: Path) -> Path:
+    # A dimension-driven ranking: rc_fn (cmd + free + found) is the clear #1; tv_fn (cmd, unknown)
+    # #2; gt_fn (copy sink, blocked -> gated) #3 and folded by default.
     conn = _atlas(tmp_path)
-    p = _pattern(conn, "fp")
-    _inst(conn, p, status="unknown", origin="custom", fn="tv_fn", run_id="run_cli")
-    _inst(conn, p, status="confirmed", origin="custom", fn="rc_fn", run_id="run_cli")
-    _inst(conn, p, status="blocked", blocking="char_filter", fn="gt_fn", run_id="run_cli")
+    cmd_p = _pattern(conn, "fp_cmd", sink_class="cmd")
+    copy_p = _pattern(conn, "fp_copy", sink_class="copy")
+    _inst(
+        conn,
+        cmd_p,
+        status="confirmed",
+        origin="custom",
+        fn="rc_fn",
+        run_id="run_cli",
+        source_kind="free_string",
+        entry_reach="found",
+    )
+    _inst(conn, cmd_p, status="unknown", origin="custom", fn="tv_fn", run_id="run_cli")
+    _inst(
+        conn,
+        copy_p,
+        status="blocked",
+        blocking="char_filter",
+        fn="gt_fn",
+        sink_anchor="strcpy",
+        run_id="run_cli",
+    )
     conn.close()
     return tmp_path / "atlas.db"
 
@@ -370,7 +401,7 @@ def test_cli_include_gated_shows_gated(tmp_path: Path) -> None:
     assert "gt_fn" in result_all.output
 
 
-# ── CLI: global ranking (highest score first), stable rank, --explain by # ──────────
+# ── CLI: lens ordering (dimension-driven), stable rank, --explain by # ──────────
 
 
 def _rank_of(output: str, fn: str) -> int | None:
@@ -381,17 +412,16 @@ def _rank_of(output: str, fn: str) -> int | None:
 
 
 def _first_data_fn(output: str) -> str | None:
-    # the first row after the column header line
+    # the first row after the column header line (header names the sink(impact) column)
     lines = output.splitlines()
     for i, line in enumerate(lines):
-        if line.lstrip().startswith("#") and "score" in line:
-            return lines[i + 1].split()[3]  # rank, score, status, function
+        if line.lstrip().startswith("#") and "sink(impact)" in line:
+            return lines[i + 1].split()[-2]  # ... function (evidence_ref)
     return None
 
 
-def test_cli_highest_score_floats_to_top(tmp_path: Path) -> None:
-    # rc_fn (confirmed -> reachable, top score) must be rank 1 and the first row, ABOVE the
-    # lower-scored to-verify rows — the bug was reachable getting buried below to-verify.
+def test_cli_top_lead_floats_to_top(tmp_path: Path) -> None:
+    # rc_fn (cmd + free + found) is the dimension-driven #1 and the first row, above tv_fn.
     atlas = _seed_for_cli(tmp_path)
     result = CliRunner().invoke(triage_cmd, ["run_cli", "--atlas", str(atlas)])
     assert result.exit_code == 0, result.output
@@ -419,7 +449,7 @@ def test_cli_rank_is_stable_across_filters(tmp_path: Path) -> None:
 
 
 def test_cli_top_n_is_global_front(tmp_path: Path) -> None:
-    # --top 1 shows the single highest-scored candidate globally (rc_fn), not "1 per section".
+    # --top 1 shows the single highest-ranked candidate globally (rc_fn), not "1 per section".
     atlas = _seed_for_cli(tmp_path)
     result = CliRunner().invoke(triage_cmd, ["run_cli", "--top", "1", "--atlas", str(atlas)])
     assert result.exit_code == 0, result.output
@@ -477,13 +507,23 @@ def test_cli_triage_shows_binary_location(tmp_path: Path) -> None:
 
 
 def test_cli_triage_json_includes_binary_path(tmp_path: Path) -> None:
-    import json
-
     atlas = _seed_with_location(tmp_path)
     result = CliRunner().invoke(triage_cmd, ["run_loc", "--json", "--atlas", str(atlas)])
     assert result.exit_code == 0, result.output
     rows = json.loads(result.output)  # --json must be clean JSON (no notice framing)
     assert rows[0]["binary_path"] == "usr/sbin/webd"
+
+
+def test_cli_triage_json_carries_dimensions_not_score(tmp_path: Path) -> None:
+    atlas = _seed_with_location(tmp_path)
+    result = CliRunner().invoke(triage_cmd, ["run_loc", "--json", "--atlas", str(atlas)])
+    assert result.exit_code == 0, result.output
+    rows = json.loads(result.output)
+    assert "score" not in rows[0]  # the collapsed score is gone
+    names = {d["name"] for d in rows[0]["dimensions"]}
+    assert "controllability" in names and "sink_impact" in names
+    for d in rows[0]["dimensions"]:  # every layer is a three-state fact
+        assert d["state"] in {"proven", "excluded", "unknown"}
 
 
 def test_cli_triage_prints_intended_use_notice(tmp_path: Path) -> None:
@@ -536,8 +576,9 @@ def _data_fns(output: str) -> list[str]:
     fns = []
     for line in output.splitlines():
         parts = line.split()
-        if len(parts) >= 4 and parts[0].isdigit() and "(" in line:
-            fns.append(parts[3])
+        # a data row starts with the rank number and ends with "function (evidence_ref)".
+        if len(parts) >= 7 and parts[0].isdigit() and "(" in line:
+            fns.append(parts[-2])
     return fns
 
 
@@ -566,12 +607,12 @@ def test_cli_sink_filter_uncapped_and_typed(tmp_path: Path) -> None:
     assert all(f.startswith("sys_fn") for f in sys_fns)
     # --sink copy: filter by sink class; only the copy candidates.
     cp_out = CliRunner().invoke(triage_cmd, ["run_v", "--sink", "copy", "--atlas", str(atlas)])
-    assert [f for f in _data_fns(cp_out.output)] == ["cp_fn0", "cp_fn1", "cp_fn2"]
+    assert sorted(_data_fns(cp_out.output)) == ["cp_fn0", "cp_fn1", "cp_fn2"]
 
 
 def test_cli_sink_filter_surfaces_gated(tmp_path: Path) -> None:
     # A gated (blocked) system candidate is hidden by the default fold but must appear under
-    # --sink system — recall stays visible by sink even when low/gated.
+    # --sink system — recall stays visible by sink even when gated.
     conn = _atlas(tmp_path)
     p = _pattern(conn, "fp", sink_class="cmd")
     _inst(
@@ -624,3 +665,44 @@ def test_cli_explain_shows_binary_location(tmp_path: Path) -> None:
     result = CliRunner().invoke(triage_cmd, ["run_e", "--explain", "1", "--atlas", str(atlas)])
     assert result.exit_code == 0, result.output
     assert "usr/sbin/webd" in result.output
+
+
+# ── CLI: the switchable lens (spine / view / filter) re-ranks, never reduces ──
+
+
+def test_cli_sort_by_reachability_preserves_iron_law(tmp_path: Path) -> None:
+    # Switching the spine to reachability must NOT bury an unknown-reachability candidate: the only
+    # thing that ever sinks is a proven-safe (constant) controllability, under EVERY spine.
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp", sink_class="cmd", source_class="external_input")
+    _inst(conn, p, fn="found_lead", entry_reach="found", run_id="run_s")
+    _inst(conn, p, fn="unknown_lead", entry_reach="unknown", run_id="run_s")
+    conn.close()
+    atlas = tmp_path / "atlas.db"
+    out = CliRunner().invoke(
+        triage_cmd, ["run_s", "--sort-by", "reachability", "--all", "--atlas", str(atlas)]
+    )
+    assert out.exit_code == 0, out.output
+    # both are still listed (re-ranked, never reduced); found leads, unknown is not dropped.
+    assert _rank_of(out.output, "found_lead") is not None
+    assert _rank_of(out.output, "unknown_lead") is not None
+    assert "lens:" in out.output  # the active lens is named
+    assert "spine=reachability" in out.output
+
+
+def test_cli_filter_does_not_reduce_reachability(tmp_path: Path) -> None:
+    # --filter controllability=free narrows the view but the underlying map is unchanged: a free
+    # candidate shows, a non-free one does not appear under that filter.
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp", sink_class="cmd", source_class="external_input")
+    _inst(conn, p, fn="free_lead", source_kind="free_string", run_id="run_f")
+    _inst(conn, p, fn="opaque_lead", run_id="run_f")  # controllability unknown
+    conn.close()
+    atlas = tmp_path / "atlas.db"
+    out = CliRunner().invoke(
+        triage_cmd, ["run_f", "--filter", "controllability=free", "--all", "--atlas", str(atlas)]
+    )
+    assert out.exit_code == 0, out.output
+    assert "free_lead" in out.output
+    assert "opaque_lead" not in out.output
+    assert "filter=controllability=free" in out.output  # the lens is labelled

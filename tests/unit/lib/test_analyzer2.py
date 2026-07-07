@@ -805,14 +805,39 @@ def _by_anchor(atlas_path: Path) -> dict[str, sqlite3.Row]:
     return {r["source_anchor"]: r for r in _instances(atlas_path)}
 
 
-def _score_of(atlas_path: Path, fn: str) -> float:
+def _cand_of(atlas_path: Path, fn: str):  # type: ignore[no-untyped-def]
+    """The TriageCandidate for function ``fn`` under the default lens."""
     from treasure_map.lib.query import triage as run_triage
 
     conn = open_atlas(atlas_path)
     try:
-        return next(c.score for c in run_triage(conn) if c.function == fn)
+        return next(c for c in run_triage(conn) if c.function == fn)
     finally:
         conn.close()
+
+
+def _rank_of(atlas_path: Path, fn: str) -> int:
+    """Position of ``fn`` in the default-lens order (lower = ranks earlier / more prominent)."""
+    from treasure_map.lib.query import triage as run_triage
+
+    conn = open_atlas(atlas_path)
+    try:
+        cands = run_triage(conn)
+        return next(i for i, c in enumerate(cands) if c.function == fn)
+    finally:
+        conn.close()
+
+
+def _is_safe(atlas_path: Path, fn: str) -> bool:
+    """True when ``fn``'s only-proven-safe demotion fires (it sinks out of the first screen)."""
+    from treasure_map.lib.query.triage import _is_proven_safe
+
+    return _is_proven_safe(_cand_of(atlas_path, fn))
+
+
+def _ctrl_of(atlas_path: Path, fn: str) -> str:
+    """The controllability dimension value for ``fn`` (free / constrained / constant / unknown)."""
+    return _cand_of(atlas_path, fn).dim("controllability").value
 
 
 def test_no_shell_exec_is_labelled_and_downweighted(tmp_path: Path) -> None:
@@ -835,9 +860,10 @@ def test_no_shell_exec_is_labelled_and_downweighted(tmp_path: Path) -> None:
 
     rows = _by_anchor(atlas)
     assert rows["noshell"]["blocking_mechanism"] == "no_shell_exec"
-    assert rows["noshell"]["reachability_status"] != "blocked"  # downweighted, never blocked
-    # the no-shell exec ranks clearly below the real shell system() candidate of the same tier.
-    assert _score_of(atlas, "noshell") < _score_of(atlas, "shell_sys")
+    assert rows["noshell"]["reachability_status"] != "blocked"  # labelled, never blocked
+    # no_shell_exec is a labelled form, but it is NOT provably-constant — so it is NOT sunk out of
+    # the first screen. Only a proven-safe fact demotes now; a form heuristic never buries a lead.
+    assert not _is_safe(atlas, "noshell")
 
 
 def test_mixed_system_and_execl_anchors_system_not_no_shell(tmp_path: Path) -> None:
@@ -880,12 +906,15 @@ def test_numeric_sanitized_is_labelled_and_downweighted(tmp_path: Path) -> None:
 
     rows = _by_anchor(atlas)
     assert rows["num_sys"]["blocking_mechanism"] == "numeric_sanitized"
-    assert _score_of(atlas, "num_sys") < _score_of(atlas, "raw_sys")
+    # a numeric validator is an UNPROVEN filter this phase (convergence-transform subtraction is
+    # deferred), so it neither downgrades the free source nor sinks the candidate — it stays active.
+    assert not _is_safe(atlas, "num_sys")
 
 
 def test_library_symbol_routes_to_stock_origin(tmp_path: Path) -> None:
     # A statically-linked library function (custom-named binary, library symbol) -> stock_oss_known,
-    # which the binary-level OSS exclusion misses. It is downweighted AND kept off pattern_breadth.
+    # which the binary-level OSS exclusion misses. It is routed off pattern_breadth (origin no
+    # longer affects the map order; the routing is what still matters for cross-firmware breadth).
     lib_fn = _cmd_injection_fn("handle")
     lib_fn["name"] = "SSL_read"
     db = _make_db(
@@ -898,8 +927,9 @@ def test_library_symbol_routes_to_stock_origin(tmp_path: Path) -> None:
     rows = _by_anchor(atlas)
     assert rows["SSL_read"]["origin"] == "stock_oss_known"
     assert rows["real_handle"]["origin"] == "unknown"  # never defaulted to custom
-    assert _score_of(atlas, "SSL_read") < _score_of(atlas, "real_handle")
-    # routed out of pattern_breadth (it counts only custom/unknown).
+    # origin is no longer a ranking dimension (the map layers are controllability / reachability /
+    # sink_impact / ..., not code provenance); stock routing still drives pattern_breadth below
+    # (it counts only custom/unknown).
     conn = open_atlas(atlas)
     try:
         breadth = conn.execute(
@@ -922,9 +952,10 @@ def test_plain_shell_candidate_is_not_downweighted(tmp_path: Path) -> None:
 # ── work item B: bare-sink recall + cross-function source (#8 reverse example) ──────
 
 
-def test_bare_sink_no_source_is_listed_and_downweighted(tmp_path: Path) -> None:
-    # A command sink with no in-function source and no constructed shell command is LISTED
-    # (recall) but downweighted (bare_sink) below a real shell-construction candidate.
+def test_bare_sink_no_source_is_listed_not_sunk(tmp_path: Path) -> None:
+    # A command sink with no in-function source is LISTED (recall) and labelled bare_sink — but it
+    # is NOT sunk. The old score buried bare_sink (structurally demoting a real lead); the map only
+    # sinks provably-constant, so bare_sink stays in the active region (its controllability is '?').
     bare = {
         "name": "do_exec",
         "pseudocode": "system(param_1);",
@@ -942,7 +973,10 @@ def test_bare_sink_no_source_is_listed_and_downweighted(tmp_path: Path) -> None:
     assert "do_exec" in rows  # not silently dropped
     assert rows["do_exec"]["blocking_mechanism"] == "bare_sink"
     assert rows["do_exec"]["reachability_status"] != "blocked"  # listed, never graded blocked
-    assert _score_of(atlas, "do_exec") < _score_of(atlas, "real")
+    # the fix: a bare_sink is NOT provably-safe, so it is NOT sunk out of the first screen. Here the
+    # bare argument is itself a caller-supplied param (a free source), so it stays fully active.
+    assert not _is_safe(atlas, "do_exec")
+    assert _ctrl_of(atlas, "do_exec") == "free"
 
 
 def test_cross_function_source_system_enters_candidates(tmp_path: Path) -> None:
@@ -977,8 +1011,9 @@ def test_cross_function_source_system_enters_candidates(tmp_path: Path) -> None:
     # caller passes a VARIABLE (optarg), not a constant -> NOT caller_constant; and a constructed
     # shell command is exempt from bare_sink -> it is NOT downweighted to the bottom.
     assert rows["apply_mac"]["blocking_mechanism"] is None
-    # ranks above a truly-bare constant-caller sink (the "suspicious but unproven" band).
-    assert _score_of(atlas, "apply_mac") > 0.4
+    # a constructed shell command from a variable caller-arg -> not provably-constant, so it stays
+    # in the active region (never sunk to the bottom).
+    assert not _is_safe(atlas, "apply_mac")
 
 
 def test_caller_constant_downweights_constant_supplied_sink(tmp_path: Path) -> None:
@@ -1148,13 +1183,15 @@ def test_copy_size_bands_const_drops_variable_and_cmd_stay_high(tmp_path: Path) 
     assert rows["cv"]["blocking_mechanism"] is None
     assert rows["csl"]["blocking_mechanism"] is None
 
-    s_cc, s_cv, s_csl, s_cmd = (_score_of(atlas, fn) for fn in ("cc", "cv", "csl", "cmd"))
-    # The constant-size copy is demoted out of the high band; the unbounded / source-length copies
-    # stay high (a true overflow is never silently demoted); the command candidate floats above.
-    assert s_cc < s_cv
-    assert s_cc < s_csl
-    assert s_cv >= 0.6 and s_csl >= 0.6
-    assert s_cmd > s_cv  # cmd no longer sits under a false-confirmed copy
+    # The constant-size copy is provably-constant -> sunk out of the first screen; the unbounded /
+    # source-length copies are NOT (a true overflow is never silently demoted); the command
+    # candidate (higher impact tier) floats above the copies.
+    assert _ctrl_of(atlas, "cc") == "constant" and _is_safe(atlas, "cc")
+    assert not _is_safe(atlas, "cv")
+    assert not _is_safe(atlas, "csl")
+    assert _rank_of(atlas, "cc") > _rank_of(atlas, "cv")  # constant copy sunk below unproven one
+    assert _rank_of(atlas, "cc") > _rank_of(atlas, "csl")
+    assert _rank_of(atlas, "cmd") < _rank_of(atlas, "cv")  # cmd (impact tier) above the copies
 
 
 def test_fmtstr_cve_recalled_and_literal_not_flooded(tmp_path: Path) -> None:
@@ -1196,14 +1233,12 @@ def test_fmtstr_cve_recalled_and_literal_not_flooded(tmp_path: Path) -> None:
 
 
 def test_fmtstr_class_outranks_copy_when_same_status(tmp_path: Path) -> None:
-    # A format-string sink (RCE-class) carries the same sink weight as cmd, above copy/format.
-    from treasure_map.lib.query.triage import review_score
+    # A format-string sink (RCE-class) sits at the same impact tier as cmd, above copy/format.
+    from treasure_map.lib.query import impact_tier
 
-    s_fmt = review_score("unknown", None, "unknown", "external_input", "fmt_string")
-    s_copy = review_score("unknown", None, "unknown", "external_input", "copy")
-    s_cmd = review_score("unknown", None, "unknown", "external_input", "cmd")
-    assert s_fmt > s_copy
-    assert s_fmt == s_cmd
+    assert impact_tier("fmt_string") > impact_tier("copy")
+    assert impact_tier("fmt_string") == impact_tier("cmd")
+    assert impact_tier("cmd") > impact_tier("format")
 
 
 def test_cmd_candidate_carries_flow_evidence(tmp_path: Path) -> None:
@@ -1391,8 +1426,9 @@ def test_json_free_string_via_wrapper_floats_high(tmp_path: Path) -> None:
     ev = json.loads(row["flow_evidence"])
     assert ev["source_kind"] == "free_string"
     assert ev["flow_path"]["sink_via_wrapper"] is True
-    # high band: above the const/charset safe fanout
-    assert _score_of(atlas, "set_wifi") >= 0.6
+    # free string -> controllability=free (top of the impact band), never sunk
+    assert _ctrl_of(atlas, "set_wifi") == "free"
+    assert not _is_safe(atlas, "set_wifi")
 
 
 def test_safe_fanout_to_wrapper_is_suppressed_below_real_concat(tmp_path: Path) -> None:
@@ -1419,9 +1455,13 @@ def test_safe_fanout_to_wrapper_is_suppressed_below_real_concat(tmp_path: Path) 
     rows = _by_anchor(atlas)
     assert rows["reboot_now"]["blocking_mechanism"] == "const_sink_arg"
     assert rows["arp_set"]["blocking_mechanism"] == "charset_constrained"
-    # the real concat outranks both safe-fanout candidates
-    assert _score_of(atlas, "set_route") > _score_of(atlas, "reboot_now")
-    assert _score_of(atlas, "set_route") > _score_of(atlas, "arp_set")
+    # the real free concat (controllability=free) outranks both safe fanouts: const_sink_arg is
+    # provably-constant -> sunk; arp_set's charset_safe source -> constrained (below free).
+    assert _ctrl_of(atlas, "set_route") == "free"
+    assert _ctrl_of(atlas, "reboot_now") == "constant" and _is_safe(atlas, "reboot_now")
+    assert _ctrl_of(atlas, "arp_set") == "constrained"
+    assert _rank_of(atlas, "set_route") < _rank_of(atlas, "reboot_now")
+    assert _rank_of(atlas, "set_route") < _rank_of(atlas, "arp_set")
 
 
 def test_wrapper_itself_kept_as_distinct_bare_sink_candidate(tmp_path: Path) -> None:

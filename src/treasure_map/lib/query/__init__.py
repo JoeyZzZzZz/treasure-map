@@ -9,18 +9,27 @@ nothing here scores, ranks, or judges.
 from __future__ import annotations
 
 from treasure_map.lib.query.nvram import get_nvram_key_flow
+from treasure_map.lib.query.sink_impact import (
+    DEFAULT_SINK_IMPACT,
+    impact_tier,
+    parse_impact_order,
+)
 from treasure_map.lib.query.triage import (
+    DEFAULT_LENS_LABEL,
+    PHASE1_CAVEATS,
     REVIEW_STATUS_BY_REACHABILITY,
+    VIEWS,
     CandidateExplanation,
-    ScoreComponent,
+    Dimension,
     TriageCandidate,
+    apply_view,
     explain_candidate,
+    filter_by_dimension,
     filter_candidates,
     get_sink_provenance,
-    review_score,
-    score_breakdown,
     shown_statuses,
     sink_matches,
+    sort_candidates,
     triage,
 )
 from treasure_map.lib.query.views import (
@@ -35,25 +44,32 @@ from treasure_map.lib.query.views import (
 )
 
 __all__ = [
+    "DEFAULT_LENS_LABEL",
+    "DEFAULT_SINK_IMPACT",
     "FINE_FP_ALGO_VERSION",
+    "PHASE1_CAVEATS",
     "REVIEW_STATUS_BY_REACHABILITY",
+    "VIEWS",
     "CandidateExplanation",
     "DensityRow",
+    "Dimension",
     "LedgerRow",
-    "ScoreComponent",
     "TriageCandidate",
     "TwinRow",
+    "apply_view",
     "density",
     "dormant",
     "explain_candidate",
+    "filter_by_dimension",
     "filter_candidates",
     "get_nvram_key_flow",
     "get_sink_provenance",
+    "impact_tier",
     "ledger",
-    "review_score",
-    "score_breakdown",
+    "parse_impact_order",
     "shown_statuses",
     "sink_matches",
+    "sort_candidates",
     "triage",
     "twins",
 ]

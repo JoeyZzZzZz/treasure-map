@@ -390,19 +390,17 @@ def test_fmtstr_evidence_printf_position_zero() -> None:
 
 
 def test_evidence_signals_do_not_feed_score_or_grade() -> None:
-    # The INTERPRETIVE evidence signals (a converter/sanitizer judgement-shaped read) are material
-    # for an agent, never a score/grade input. The read-side score, the form-note downweight, and
-    # the grader must not consume them nor import the evidence module.
+    # The INTERPRETIVE evidence signals are material for an agent, never a grade input. There is no
+    # collapsed score anymore — the read-side triage surfaces facts as honest dimension LAYERS, and
+    # the grader / form-note downweight must consume none of them nor import the evidence module.
     #
-    # Two evidence facts are SURFACED by the read-side triage (and ONLY there — never the grader or
-    # the form-note downweight):
-    #   - entry_reach (round R-L4·mcp, factor 6b): a rootfs entry point was found to invoke the
-    #     binary — a FACT the read-side ranking MAY use as a second-level ordering key.
-    #   - source_kind (缺口③): the fine-grained controllability class — surfaced to the agent next
-    #     to source_class but NEVER scored. review_score consumes source_class, not source_kind, and
-    #     test_source_kind_does_not_affect_score pins that it changes no review order.
-    # The purely interpretive fields below are surfaced by NO ranking-layer file.
-    never_surfaced = ("sanitizer_seen", "trace_boundary", "size_kind")
+    # The read-side triage MAY surface (as first-class dimension facts, never as a grade):
+    #   - entry_reach: a rootfs entry point was found to invoke the binary — the reachability layer.
+    #   - source_kind: the fine-grained controllability class — the controllability layer.
+    #   - sanitizer_seen: a sanitizer-shaped call on the path — the filtering layer (near-always
+    #     '?'; it can never prove coverage, so it neither ranks nor sinks a candidate).
+    # The purely interpretive fields below are surfaced by NO ranking-layer file at all.
+    never_surfaced = ("trace_boundary", "size_kind")
     for rel in ("lib/query/triage.py", "lib/hunt/downweight.py", "lib/reachability/grader.py"):
         text = (_SRC / rel).read_text()
         assert "hunt.evidence" not in text and "import evidence" not in text, (
@@ -410,10 +408,10 @@ def test_evidence_signals_do_not_feed_score_or_grade() -> None:
         )
         for field in never_surfaced:
             assert field not in text, f"{rel} unexpectedly references evidence field {field!r}"
-    # The grader and the downweight must consume NONE of the evidence signals — not even the two the
-    # triage surfaces (entry_reach / source_kind) nor the raw flow_evidence. Only the presentation-
-    # layer triage ranking may surface a fact, and it does so without letting it feed the score.
+    # The grader and the downweight must consume NONE of the evidence signals — not the layers the
+    # triage surfaces (entry_reach / source_kind / sanitizer_seen) nor the raw flow_evidence. Only
+    # the presentation-layer triage may surface a fact, and it drives no grade (there is no score).
     for rel in ("lib/hunt/downweight.py", "lib/reachability/grader.py"):
         text = (_SRC / rel).read_text()
-        for field in ("entry_reach", "source_kind", "flow_evidence"):
+        for field in ("entry_reach", "source_kind", "sanitizer_seen", "flow_evidence"):
             assert field not in text, f"{rel} unexpectedly references {field!r}"
