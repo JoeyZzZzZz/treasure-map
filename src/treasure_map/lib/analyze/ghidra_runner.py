@@ -385,9 +385,14 @@ class GhidraRunner:
     ) -> GhidraResult:
         """Run analyzeHeadless on a single binary with at most one retry.
 
-        On 'Import failed', patches problematic ELF sections (Ghidra 11.1.2
-        StringIndexOutOfBoundsException on GNU notes / ARM attributes) and
-        retries once with 2× the original timeout.
+        A failed first attempt is retried exactly once at 2× the original timeout:
+        - 'Import failed'  -> patch the problematic ELF sections (Ghidra 11.1.2
+          StringIndexOutOfBoundsException on GNU notes / ARM attributes) and re-run the patched
+          copy.
+        - any other failure (chiefly a per-file timeout on a large binary) -> re-run the ORIGINAL
+          binary with the doubled budget, no patch.
+        A retry that still fails returns success=False — a real failure is reported honestly, never
+        frozen as a fake 'ok'.
         """
         headless = self.get_headless()
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -414,18 +419,32 @@ class GhidraRunner:
             except OSError:
                 pass
 
+        # r1 failed. One retry either way — but the recovery differs by cause:
+        #   • import failure -> patch the problematic ELF sections (GNU notes / ARM attributes) and
+        #     re-run the PATCHED copy at 2× timeout.
+        #   • any other failure -> chiefly a per-file timeout: a large binary whose analysis+export
+        #     budget exceeded the timeout leaves NO json and is not an import problem, so re-run
+        #     the ORIGINAL binary at 2× timeout (no patch). This is why a one-shot timeout is not a
+        #     death sentence for big binaries (e.g. a ~2700-function libc whose analysis+export
+        #     needs >360s but finishes comfortably inside 720s).
+        # Honesty red-line: a still-failing retry (incl. one that times out again) returns
+        # success=False — never a fabricated 'ok'.
+        did_retry = False
+        total_elapsed = r1.elapsed
         if import_failed:
             patch_result = _patch_elf_for_ghidra(binary)
             if patch_result is not None:
                 patched_file, tmpdir = patch_result
                 try:
                     r2 = self._run_once(patched_file, output_dir, arch, sha8, timeout * 2, headless)
+                    did_retry = True
+                    total_elapsed += r2.elapsed
                     if r2.success:
                         return GhidraResult(
                             binary=binary,
                             output_file=r2.output_file,
                             success=True,
-                            elapsed=r1.elapsed + r2.elapsed,
+                            elapsed=total_elapsed,
                             retried=True,
                             analysis_status=r2.analysis_status,
                             function_count=r2.function_count,
@@ -434,13 +453,29 @@ class GhidraRunner:
                         )
                 finally:
                     shutil.rmtree(tmpdir, ignore_errors=True)
+        else:
+            r2 = self._run_once(binary, output_dir, arch, sha8, timeout * 2, headless)
+            did_retry = True
+            total_elapsed += r2.elapsed
+            if r2.success:
+                return GhidraResult(
+                    binary=binary,
+                    output_file=r2.output_file,
+                    success=True,
+                    elapsed=total_elapsed,
+                    retried=True,
+                    analysis_status=r2.analysis_status,
+                    function_count=r2.function_count,
+                    log_path=r2.log_path,
+                    stderr_tail=r2.stderr_tail,
+                )
 
         return GhidraResult(
             binary=binary,
             output_file=None,
             success=False,
-            elapsed=r1.elapsed,
-            retried=import_failed,
+            elapsed=total_elapsed,
+            retried=did_retry,
             log_path=r1.log_path,
             stderr_tail=r1.stderr_tail,
         )

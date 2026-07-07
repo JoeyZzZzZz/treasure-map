@@ -285,20 +285,22 @@ def test_run_ghidra_retries_on_import_failed(tmp_path: Path) -> None:
     assert result.retried is True
 
 
-def test_run_ghidra_no_retry_without_import_failed(tmp_path: Path) -> None:
-    """Only one attempt when failure log does NOT contain 'Import failed'."""
+def test_run_ghidra_retries_once_on_non_import_failure(tmp_path: Path) -> None:
+    """A non-import failure (chiefly a timeout) retries exactly once at a doubled budget.
+
+    A large binary whose analysis+export overran the per-file timeout leaves no JSON; the failure
+    is not an import problem, so it must not be a one-shot death sentence. Here the retry still
+    fails, so the result is an honest failure — but retried is True and a 2× budget was used."""
     output_dir = tmp_path / "output"
     output_dir.mkdir()
     binary = tmp_path / "httpd"
     _write_small_elf(binary)
     sha8 = "deadc0de"
-    call_count = 0
+    timeouts: list[int] = []
 
     def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
-        nonlocal call_count
-        call_count += 1
-        (output_dir / f"httpd_{sha8}.log").write_text("ERROR: OutOfMemoryError")
-        return 1, "OOM"
+        timeouts.append(timeout)
+        return -1, "timeout"
 
     runner = _make_runner(tmp_path)
     with patch(f"{MODULE}._run_subprocess", fake_sub):
@@ -306,9 +308,39 @@ def test_run_ghidra_no_retry_without_import_failed(tmp_path: Path) -> None:
             binary, output_dir, timeout=60, arch="x86:LE:64:default", sha8=sha8
         )
 
-    assert call_count == 1
-    assert result.success is False
-    assert result.retried is False
+    assert len(timeouts) == 2, f"Expected 2 subprocess calls, got {len(timeouts)}"
+    assert timeouts[1] > timeouts[0], "retry must use a larger (2×) budget than the first attempt"
+    assert result.success is False  # a still-failing retry is honestly a failure
+    assert result.retried is True
+
+
+def test_run_ghidra_timeout_retry_then_success(tmp_path: Path) -> None:
+    """First attempt times out (no output); the 2× retry finishes and produces valid output."""
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    binary = tmp_path / "httpd"
+    _write_small_elf(binary)
+    sha8 = "0badf00d"
+    call_count = 0
+
+    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return -1, "timeout"  # first budget exhausted, no JSON written
+        (output_dir / f"httpd_{sha8}_ghidra.json").write_text(_good_json())
+        return 0, ""
+
+    runner = _make_runner(tmp_path)
+    with patch(f"{MODULE}._run_subprocess", fake_sub):
+        result = runner.run_ghidra(
+            binary, output_dir, timeout=60, arch="x86:LE:64:default", sha8=sha8
+        )
+
+    assert call_count == 2
+    assert result.success is True
+    assert result.retried is True
+    assert result.output_file == output_dir / f"httpd_{sha8}_ghidra.json"
 
 
 # ── run_all ───────────────────────────────────────────────────────────────────
