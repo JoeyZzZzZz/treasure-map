@@ -519,3 +519,134 @@ def test_call_return_classifier_registry_is_extensible(tmp_path: Path) -> None:
     finally:
         mod._CALL_RETURN_CLASSIFIERS = original
     conn.close()
+
+
+# ── 支配传导 (dominance propagation): only a dominating writer decides a stack_buf sink ──
+
+
+def _writer(fmt: str, varargs: list, *, dominates: bool) -> dict:  # type: ignore[type-arg]
+    return {"writer": "snprintf@0x1", "dominates_sink": dominates, "fmt": fmt, "varargs": varargs}
+
+
+def _writer_no_dom_field(fmt: str, varargs: list) -> dict:  # type: ignore[type-arg]
+    # a writer with NO dominates_sink field at all (pre-field / older provenance)
+    return {"writer": "snprintf@0x2", "fmt": fmt, "varargs": varargs}
+
+
+def _const_va(value: str = "fixed") -> dict:  # type: ignore[type-arg]
+    return {
+        "pos": 3,
+        "spec": "%s",
+        "source": {"kind": "constant", "value": value, "value_kind": "literal_string"},
+    }
+
+
+def _param_va() -> dict:  # type: ignore[type-arg]
+    return {"pos": 3, "spec": "%s", "source": {"kind": "param", "name": "p"}}
+
+
+def _stack_buf_multi(sink: str, writers: list) -> dict:  # type: ignore[type-arg]
+    return {
+        "sink_arg_provenance": [
+            {"sink": sink, "sink_idx": 0, "provenance": {"kind": "stack_buf", "writers": writers}}
+        ]
+    }
+
+
+def test_dominating_const_beats_nondominating_controllable_is_const(tmp_path: Path) -> None:
+    # M2 case 3 (the wrs_cc_t core): a DOMINATING const writer + a NON-dominating writer carrying a
+    # web-settable key -> const, NOT controllable. The non-dominating key flows to a different sink.
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp_case3", sink_class="cmd")
+    prov = _stack_buf_multi(
+        "system",
+        [
+            _writer("fixed cmd %s", [_const_va()], dominates=True),  # dominating: all const
+            _writer(
+                "SELECT %s", [_getter_vararg("fb_comment")], dominates=False
+            ),  # web key, non-dom
+        ],
+    )
+    ref = _inst(conn, p, sink_anchor="system", flow_evidence=prov, source_kind="unknown")
+    conn.close()
+    c = _find(triage(open_atlas(tmp_path / "atlas.db")), ref)
+    assert _ctrl(c) == "constant"  # only the dominating (const) writer decided the sink
+
+
+def test_all_dominating_writers_non_controllable_is_not_controllable(tmp_path: Path) -> None:
+    # ★ seam property #8 (wrs_cc_t shape): if every DOMINATING writer lacks a controllable source,
+    # the verdict is not controllable — even though a controllable web key sits in a non-dominating
+    # writer. Guards against the dominance filter being bypassed / reverted to ANY-writer.
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp_wrs", sink_class="cmd")
+    prov = _stack_buf_multi(
+        "system",
+        [
+            _writer(
+                "echo [BWMON]%s", [_param_va()], dominates=True
+            ),  # dominating: unknown (DPI echo)
+            _writer("SELECT %s", [_getter_vararg("wrs_cc_t")], dominates=False),  # web key, non-dom
+        ],
+    )
+    ref = _inst(conn, p, sink_anchor="system", flow_evidence=prov, source_kind="unknown")
+    conn.close()
+    c = _find(triage(open_atlas(tmp_path / "atlas.db")), ref)
+    assert _ctrl(c) != "controllable"
+
+
+def test_dominating_web_key_is_controllable_despite_nondominating_noise(tmp_path: Path) -> None:
+    # ★ seam property #7 (Chain 3 shape): the UNIQUE dominating writer's vararg is a web_settable
+    # =YES key -> controllable, even with non-dominating noise writers present. Guards against a
+    # future regression to ANY-writer (which would still pass) AND over-filtering that drops it.
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp_chain3", sink_class="fmt_string")
+    prov = _stack_buf_multi(
+        "fprintf",
+        [
+            _writer("Feedback: %s", [_getter_vararg("fb_comment")], dominates=True),  # web key, dom
+            _writer("noise %s", [_const_va()], dominates=False),  # non-dominating const noise
+        ],
+    )
+    ref = _inst(conn, p, sink_anchor="fprintf", flow_evidence=prov, source_kind="unknown")
+    conn.close()
+    c = _find(triage(open_atlas(tmp_path / "atlas.db")), ref)
+    assert _ctrl(c) == "controllable"
+
+
+def test_no_dominating_writer_falls_back_to_all_not_unknown(tmp_path: Path) -> None:
+    # M2 case 2 (evidence-absent never infers safe): NO writer is marked dominating -> fall back to
+    # ALL writers, so a web key still lights controllable instead of collapsing to unknown/safe.
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp_fallback", sink_class="cmd")
+    prov = _stack_buf_multi(
+        "system", [_writer("%s", [_getter_vararg("fb_comment")], dominates=False)]
+    )
+    ref = _inst(conn, p, sink_anchor="system", flow_evidence=prov, source_kind="unknown")
+    conn.close()
+    c = _find(triage(open_atlas(tmp_path / "atlas.db")), ref)
+    assert _ctrl(c) == "controllable"  # fallback preserved the pre-fix behavior, did not hide it
+
+
+def test_pre_field_provenance_without_dominates_sink_falls_back(tmp_path: Path) -> None:
+    # graceful degradation: older provenance whose writers have NO dominates_sink field at all ->
+    # w.get() is None -> falsy -> dominating empty -> fall back to all writers (old semantics).
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp_prefield", sink_class="cmd")
+    prov = _stack_buf_multi("system", [_writer_no_dom_field("%s", [_getter_vararg("fb_comment")])])
+    ref = _inst(conn, p, sink_anchor="system", flow_evidence=prov, source_kind="unknown")
+    conn.close()
+    c = _find(triage(open_atlas(tmp_path / "atlas.db")), ref)
+    assert _ctrl(c) == "controllable"
+
+
+def test_single_dominating_writer_behavior_unchanged(tmp_path: Path) -> None:
+    # M2 case 5: a single dominating writer -> dominating == [that one] == judged, no change.
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp_single", sink_class="fmt_string")
+    prov = _stack_buf_multi(
+        "fprintf", [_writer("Feedback: %s", [_getter_vararg("fb_comment")], dominates=True)]
+    )
+    ref = _inst(conn, p, sink_anchor="fprintf", flow_evidence=prov, source_kind="unknown")
+    conn.close()
+    c = _find(triage(open_atlas(tmp_path / "atlas.db")), ref)
+    assert _ctrl(c) == "controllable"

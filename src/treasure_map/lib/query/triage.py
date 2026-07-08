@@ -350,25 +350,49 @@ _MULTI_ARG_COMMAND_SINKS: frozenset[str] = frozenset(
 )
 
 
+def _judged_writers(prov: dict[str, Any]) -> list[dict[str, Any]]:
+    """The stack_buf writers whose source decides THIS sink's controllability.
+
+    Dominance propagation: only a CHK-dominating writer (``dominates_sink``) lies on EVERY path to
+    the sink, so only it forwards a value that actually reaches the sink argument. A non-dominating
+    writer is a mutually-exclusive branch — it may carry a controllable source that flows to a
+    DIFFERENT sink (e.g. a wrs_cc_t query into sqlite3_exec, not into this system() call), and must
+    NOT light up this sink.
+
+    ★ Boundary — no dominating writer marked (dominating empty) -> FALL BACK to ALL writers. A
+    missing dominance mark is analysis-incomplete (a truncated/MULTIEQUAL def-use) or pre-field
+    provenance (older data without ``dominates_sink`` -> w.get() is None -> falsy), NOT proof that
+    no writer reaches the sink. Evidence-absent never infers safe (the asymmetric burden): the
+    fallback preserves the pre-fix behavior (judge all writers = a possible over-promote, safe),
+    never collapsing to unknown (a possible under-promote = a hidden bug). This safety rests on the
+    load-bearing invariant that CHK marks ``dominates_sink`` true ONLY when it truly kills every
+    other reaching definition — if that mark is ever over-asserted, a real controllable
+    non-dominating writer would be wrongly dropped (property test #8 guards this direction)."""
+    writers = [w for w in (prov.get("writers") or []) if isinstance(w, dict)]
+    dominating = [w for w in writers if w.get("dominates_sink")]
+    return dominating if dominating else writers
+
+
 def _record_class(conn: sqlite3.Connection, rec: dict[str, Any]) -> str:
     """One sink record's controllability: 'controllable' | 'const' | 'unknown'.
 
     constant / call_return sink arg -> _classify_source directly. A stack_buf is judged over its
-    writers (a value-forwarding snprintf/echo): controllable if ANY writer is controllable, 'const'
-    only if EVERY writer is const (a branch writer could inject on another path), else 'unknown'.
-    Unresolved / indirect_unresolved -> 'unknown'. A multi-arg exec sink is NEVER 'const' on partial
-    provenance (the iron law) — a would-be 'const' is downgraded to 'unknown'."""
+    DOMINATING writers only (see _judged_writers — a non-dominating branch writer may inject into a
+    different sink, so it does not decide this one): controllable if any judged writer is
+    controllable, 'const' only if EVERY judged writer is const, else 'unknown'. With no writer at
+    all -> 'unknown'. Unresolved / indirect_unresolved -> 'unknown'. A multi-arg exec sink is NEVER
+    'const' on partial provenance (the iron law) — a would-be 'const' is downgraded to 'unknown'."""
     prov = rec.get("provenance")
     prov = prov if isinstance(prov, dict) else {}
     kind = prov.get("kind")
     if kind in ("constant", "call_return"):
         cls = _classify_source(conn, prov)
     elif kind == "stack_buf":
-        writers = [w for w in (prov.get("writers") or []) if isinstance(w, dict)]
-        if not writers:
+        judged = _judged_writers(prov)
+        if not judged:
             cls = "unknown"
         else:
-            wclasses = [_writer_args_class(conn, w.get("fmt"), w.get("varargs")) for w in writers]
+            wclasses = [_writer_args_class(conn, w.get("fmt"), w.get("varargs")) for w in judged]
             if "controllable" in wclasses:
                 cls = "controllable"
             else:
@@ -431,9 +455,9 @@ def _web_settable_keys_reaching_sink(
         prov = rec.get("provenance")
         prov = prov if isinstance(prov, dict) else {}
         add(_source_web_settable_key(conn, prov))
-        for w in prov.get("writers") or []:
-            if not isinstance(w, dict):
-                continue
+        # Only DOMINATING writers reach the sink (same filter as the verdict, _judged_writers) — so
+        # the note never names a key sitting in a non-dominating branch the verdict already ignored.
+        for w in _judged_writers(prov):
             for va in w.get("varargs") or []:
                 if isinstance(va, dict):
                     add(_source_web_settable_key(conn, va.get("source")))
