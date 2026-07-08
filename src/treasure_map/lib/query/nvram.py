@@ -189,6 +189,15 @@ def _frontend_settable(conn: sqlite3.Connection, key: str) -> bool | str:
     # A naming-variant editable field (starts with ``key_`` — e.g. http_username_x for
     # http_username) may be the editable mirror; report uncertain, not False. GLOB '_' is literal
     # (only * ? [ are special) and nvram keys carry none of those, so the pattern is safe.
+    #
+    # ⑥ PROMOTION-RECALL — the known collection gap, stated explicitly (NOT hidden as "已知漏"):
+    #   http_username / http_passwd land here because their editable field is a ``_x`` MIRROR field
+    #   (http_username_x, http_passwd_x, http_passwd_2_x) — the form-input copy of the committed
+    #   nvram key. The COLLECTION RULE TO ADD (next phase) is a generic ``X_x`` / ``X_N_x`` suffix
+    #   normalization (mirror of the wl-index _wl_normalize) that would promote these to an exact
+    #   match -> web_settable=yes. Deferred this phase (kept 'uncertain', never a false 'no'); a key
+    #   with NO editable field at all (e.g. modem_apn: no name="modem_apn*" in the assets) is a true
+    #   absence, not a mappable miss, and stays uncertain honestly.
     variant = conn.execute(
         "SELECT 1 FROM web_form_fields WHERE field_keyword GLOB ? LIMIT 1",
         (key + "_*",),
@@ -248,37 +257,31 @@ def _web_settable(conn: sqlite3.Connection, key: str) -> dict[str, Any]:
     """Source-side web-settability by a SaTC front/back cross — is ``key`` editable via the web?
 
     Crosses the front-end editable form fields (M1 web_form_fields) against the back-end nvram op
-    keys (nvram_key_flow constant, ALL binaries). THREE-STATE ``web_settable``, with a
-    false-negative red line:
+    keys (nvram_key_flow constant, ALL binaries). TWO-STATE ``web_settable`` — deliberately NO "no":
       "yes"       — front-end editable AND back-end nvram key: a real, user-settable web key.
-      "no"        — back-end key but no editable front-end field (a read-only display, e.g. a
-                    firmware-version echo), OR an editable field with no back-end nvram op (a pure
-                    UI control). A located-and-complete negative, not an unknown.
-      "uncertain" — either side was NOT collected (front-end table empty / nvram table absent), or
-                    only a naming-variant field exists. NEVER "no": inability to collect is not
-                    proof the key is unsettable (a false-negative would be a red-line violation).
-    Direction-safe but possibly slightly WIDE: the all-binary back-end cross may attribute a key to
-    the web when another service is the real writer — a stated caveat, not a precise single-service
-    proof. ``router_defaults`` rides along as an auxiliary reference. A surfaced fact only.
+      "uncertain" — EVERYTHING ELSE (front-end field / back-end constant key / naming map not all
+                    present). NOT "no": inferring "not settable" from a missing side is a
+                    false-negative — a truly settable key written via a DYNAMIC-key op is absent
+                    from the constant back-end set, and a front-end miss is not proof of read-only.
+                    A "no" would also behave identically to "uncertain" downstream (both -> verdict
+                    unknown), so it is a decorative state that only adds false-negative risk.
+    The single failure direction is a MISSED promote (the candidate stays visible, iron-law-safe),
+    NEVER a false one. Direction-safe but possibly slightly WIDE (the all-binary cross may attribute
+    a key to the web when another service is the real writer — a caveat, not a single-service).
+    ``router_defaults`` rides along as an auxiliary reference. A surfaced fact only.
     """
     frontend = _frontend_settable(conn, key)
     backend = _backend_nvram_key(conn, key)
     router = _router_defaults_lookup(conn, key)
-    if frontend == "uncertain" or backend == "uncertain":
-        verdict = "uncertain"
-        source = (
-            "front-end or back-end surface not fully collected (or a naming-variant field) — "
-            "web-settability unknown, NOT 'not settable' (false-negative red line)"
-        )
-    elif frontend is True and backend is True:
+    if frontend is True and backend is True:
         verdict = "yes"
         source = "front-end editable field x back-end nvram key (SaTC cross)"
     else:
-        verdict = "no"
+        verdict = "uncertain"
         source = (
-            "back-end nvram key with no editable front-end field (read-only display)"
-            if backend is True
-            else "editable front-end field with no back-end nvram op (UI control)"
+            "not a proven web-settable key (an editable front-end field, a back-end constant nvram "
+            "key, and the naming map are not all present) — uncertain, NOT 'not settable' (a "
+            "false-negative would be a red-line violation)"
         )
     return {
         "web_settable": verdict,
@@ -370,8 +373,8 @@ def get_nvram_key_flow(conn: sqlite3.Connection, key: str) -> dict[str, Any]:
         "template_matches": template_matches,
         "unresolved_count": unresolved_count,
         # source-side writability by the SaTC front-end x back-end cross: is this a USER-EDITABLE
-        # nvram key? A three-state fact ("yes" / "no" / "uncertain") — never asserts "no" from an
-        # uncollected surface (false-negative red line). router_defaults rides along as auxiliary.
+        # nvram key? A TWO-state fact ("yes" / "uncertain") — there is no "no": non-YES is always
+        # uncertain, never a "not settable" inferred from a missing side. router_defaults auxiliary.
         "web_settable": _web_settable(conn, key),
         "coverage": COVERAGE_NOTE,
         "completeness": completeness,

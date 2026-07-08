@@ -165,7 +165,8 @@ def test_web_settable_key_reaching_sink_is_controllable(tmp_path: Path) -> None:
 
 
 def test_non_web_settable_getter_key_is_not_promoted(tmp_path: Path) -> None:
-    # firmver: a back-end key but a read-only hidden display (web_settable=no) -> NOT controllable.
+    # firmver: a back-end key but not an editable front-end field -> web_settable=uncertain (④: no
+    # 'no' state) -> NOT controllable -> falls through to source_kind.
     conn = _atlas(tmp_path)
     p = _pattern(conn, "fp_fw", sink_class="fmt_string")
     ref = _inst(
@@ -412,3 +413,109 @@ def test_reranking_never_reduces_candidate_count(tmp_path: Path) -> None:
     cands = triage(open_atlas(tmp_path / "atlas.db"))
     assert len(cands) == 3
     assert len(sort_candidates(cands, spine="controllability")) == len(cands)
+
+
+# ── ⑤ detection fallback chain: source_kind=free_string is NOT abandoned ────────────────
+
+
+def test_provenance_shallow_free_string_stays_free_not_unknown(tmp_path: Path) -> None:
+    # The 263-argv protection: a candidate with NO provenance depth (no web-key, not provably const)
+    # and source_kind=free_string must read 'free' via the fallback, NOT collapse to unknown.
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp_argv", sink_class="cmd")
+    ref = _inst(conn, p, sink_anchor="system", source_kind="free_string")  # no provenance
+    conn.close()
+    c = _find(triage(open_atlas(tmp_path / "atlas.db")), ref)
+    assert _ctrl(c) == "free"
+
+
+def test_provenance_deep_const_beats_source_kind_free_fallback(tmp_path: Path) -> None:
+    # Ordering: a provenance-DEEP all-const candidate (ipsec strcpy) reads constant, even though its
+    # top-level source_kind is free_string — the provenance verdict is checked before the fallback.
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp_deep", sink_class="cmd")
+    prov = {
+        "sink_arg_provenance": [
+            {
+                "sink": "popen",
+                "sink_idx": 0,
+                "provenance": {
+                    "kind": "call_return",
+                    "callee": "strcpy",
+                    "const_args": ["fixed cmd"],
+                    "arg_count": 2,
+                    "has_unresolved_args": True,
+                },
+            }
+        ]
+    }
+    ref = _inst(conn, p, sink_anchor="popen", flow_evidence=prov, source_kind="free_string")
+    conn.close()
+    c = _find(triage(open_atlas(tmp_path / "atlas.db")), ref)
+    assert _ctrl(c) == "constant"  # const (step 2) wins over the free_string fallback (step 3)
+
+
+# ── ⑥ promotion-recall: the fixed label set crosses YES (else the rule is named) ────────
+
+
+def test_promotion_recall_label_set_crosses_yes(tmp_path: Path) -> None:
+    # ⑥: the promote path now rides on M1 recall. A fixed label set of known-editable keys must all
+    # cross to web_settable=yes once seeded (both sides present). A miss would be a silent埋没 the
+    # demotion audit cannot catch (it is a missed promote, not a bad demote).
+    from treasure_map.lib.query.nvram import _web_settable
+
+    conn = open_atlas(tmp_path / "atlas.db")
+    labels = ["fb_comment", "wl_ssid", "wl0_ssid", "ddns_hostname_x"]
+    add_web_form_field_rows(
+        conn,
+        [
+            WebFormFieldRow("run_1", k if k != "wl0_ssid" else "wl_ssid", "F.asp", "input")
+            for k in labels
+        ],
+    )
+    add_nvram_flow_rows(
+        conn, [NvramFlowRow("run_1", k, "constant", "httpd", "save", "write") for k in labels]
+    )
+    for k in labels:
+        assert _web_settable(conn, k)["web_settable"] == "yes", f"{k} did not cross YES"
+    conn.close()
+
+
+def test_promotion_recall_x_suffix_variant_is_uncertain_with_named_rule(tmp_path: Path) -> None:
+    # ⑥ known gap, NAMED not hidden: http_username's editable field is the _x mirror
+    # (http_username_x) -> uncertain this phase (never a false 'no'). Rule to add: an X_x suffix.
+    from treasure_map.lib.query.nvram import _web_settable
+
+    conn = open_atlas(tmp_path / "atlas.db")
+    add_web_form_field_rows(conn, [WebFormFieldRow("run_1", "http_username_x", "F.asp", "input")])
+    add_nvram_flow_rows(
+        conn, [NvramFlowRow("run_1", "http_username", "constant", "httpd", "cred", "read")]
+    )
+    assert _web_settable(conn, "http_username")["web_settable"] == "uncertain"
+    conn.close()
+
+
+# ── ⑦ callee classification is an extensible registry (nvram is class #1) ────────────────
+
+
+def test_call_return_classifier_registry_is_extensible(tmp_path: Path) -> None:
+    # ⑦: adding a FUTURE call_return class (e.g. getenv->controllable) is a registry row, with the
+    # verdict logic unchanged. Prove the registry is the extension seam and classification is data.
+    import importlib
+
+    mod = importlib.import_module("treasure_map.lib.query.triage")  # the module (not the function)
+
+    conn = open_atlas(tmp_path / "atlas.db")
+    getenv_src = {"kind": "call_return", "callee": "getenv", "const_args": ["HTTP_USER_AGENT"]}
+    assert mod._classify_source(conn, getenv_src) == "unknown"  # unclassified this phase
+
+    def _cr_getenv(_conn: object, source: dict) -> str | None:  # type: ignore[type-arg]
+        return "controllable" if source.get("callee") == "getenv" else None
+
+    original = mod._CALL_RETURN_CLASSIFIERS
+    mod._CALL_RETURN_CLASSIFIERS = (*original, _cr_getenv)
+    try:
+        assert mod._classify_source(conn, getenv_src) == "controllable"  # one row, logic unchanged
+    finally:
+        mod._CALL_RETURN_CLASSIFIERS = original
+    conn.close()

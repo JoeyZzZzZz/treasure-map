@@ -470,14 +470,22 @@ def test_fmt_arity_counts_conversions_and_star_args() -> None:
 
 
 # ── _writer_args_class: the SINGLE classifier (const / controllable / unknown), value_kind-aware ─
-# This is where the single verdict's de-optimism is pinned: a bare call_return / param is NO LONGER
-# controllable (only a web-settable key or a named external reader is). Uses an EMPTY atlas conn —
-# no web-settable keys — so a getter's key reads as uncertain, never a false 'controllable'.
+# The single verdict's de-optimism: a bare call_return / param is NO LONGER controllable. This phase
+# the ONLY controllable class is a WEB-SETTABLE key (⑦ registry) — external readers (getenv/recv)
+# are a FUTURE class, so they read 'unknown' now. The acon fixture seeds one web-settable key
+# (fb_comment) so a controllable case is testable; an unseeded key reads uncertain -> not control.
 
 
 @pytest.fixture
 def acon(tmp_path: Path) -> Any:
+    from treasure_map.lib.atlas.models import NvramFlowRow, WebFormFieldRow
+    from treasure_map.lib.atlas.writer import add_nvram_flow_rows, add_web_form_field_rows
+
     conn = open_atlas(tmp_path / "atlas.db")
+    add_web_form_field_rows(conn, [WebFormFieldRow("r", "fb_comment", "F.asp", "textarea")])
+    add_nvram_flow_rows(
+        conn, [NvramFlowRow("r", "fb_comment", "constant", "httpd", "save", "write")]
+    )
     yield conn
     conn.close()
 
@@ -496,6 +504,10 @@ def _src(kind: str, spec: str = "%s", **extra: Any) -> dict[str, Any]:  # a vara
     return {"spec": spec, "source": {"kind": kind, **extra}}
 
 
+def _webkey(key: str, spec: str = "%s") -> dict[str, Any]:  # a getter call_return with an nvram key
+    return {"spec": spec, "source": {"kind": "call_return", "callee": "FUN_x", "const_args": [key]}}
+
+
 def test_wac_all_literal_strings_is_const(acon: Any) -> None:
     assert _writer_args_class(acon, "%s to %s", [_lit("wl"), _lit("down")]) == "const"
 
@@ -510,10 +522,16 @@ def test_wac_bare_call_return_and_param_are_unknown_not_controllable(acon: Any) 
     assert _writer_args_class(acon, "run %s", [_src("param")]) == "unknown"
 
 
-def test_wac_named_external_reader_is_controllable(acon: Any) -> None:
-    # A named external input (getenv / recv) IS controllable — the legit 'free' is not downgraded.
-    assert _writer_args_class(acon, "%s", [_src("call_return", callee="getenv")]) == "controllable"
-    assert _writer_args_class(acon, "%s", [_src("external_input")]) == "controllable"
+def test_wac_web_settable_key_is_controllable(acon: Any) -> None:
+    # This phase's ONLY controllable class: a const_args key that crosses to web_settable=yes.
+    assert _writer_args_class(acon, "%s", [_webkey("fb_comment")]) == "controllable"
+
+
+def test_wac_external_reader_is_deferred_not_controllable_this_phase(acon: Any) -> None:
+    # ⑦ getenv/recv/external are a FUTURE registry class -> 'unknown' now (a row in
+    # _CALL_RETURN_CLASSIFIERS later), never silently promoted before their class exists.
+    assert _writer_args_class(acon, "%s", [_src("call_return", callee="getenv")]) == "unknown"
+    assert _writer_args_class(acon, "%s", [_src("external_input")]) == "unknown"
 
 
 def test_wac_unresolved_and_stack_buf_are_unknown(acon: Any) -> None:
@@ -546,7 +564,7 @@ def test_wac_arity_shortfall_is_unknown(acon: Any) -> None:
 
 def test_wac_controllable_wins_over_unknown(acon: Any) -> None:
     assert (
-        _writer_args_class(acon, "%s %s", [_src("external_input"), _src("unresolved")])
+        _writer_args_class(acon, "%s %s", [_webkey("fb_comment"), _src("unresolved")])
         == "controllable"
     )
 

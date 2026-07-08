@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -184,15 +185,6 @@ def _sink_provenance_records(flow_evidence: str | None) -> list[dict[str, Any]]:
     return [r for r in prov if isinstance(r, dict)]
 
 
-# Source KINDS / CALLEES that are a proven DIRECT external input (attacker-reachable without a
-# config round-trip) -> proven controllable. A bare 'param' or a generic call_return (getpid, an
-# unknown FUN_) is deliberately NOT here: it could carry anything, so it is the optimistic 'free'
-# reading (via source_kind) or 'unknown', never assumed controllable. Name-neutral, extensible
-# mechanism lists — not a verdict. This is the de-optimism the single verdict introduces: the old
-# rollup called ANY call_return controllable (getpid included); now only a web-settable key or a
-# named external reader is.
-_EXTERNAL_INPUT_KINDS: frozenset[str] = frozenset({"external_input"})
-_EXTERNAL_INPUT_CALLEES: frozenset[str] = frozenset({"getenv", "recv", "recvfrom", "recvmsg"})
 # call_return callees that FORWARD a source-argument value unchanged (strcpy/memcpy-family REPLACE
 # the destination with a source argument), so a constant source argument makes the RESULT a proven
 # constant even though the destination-pointer argument reads as unresolved (has_unresolved_args
@@ -243,19 +235,19 @@ def _classify_source(conn: sqlite3.Connection, source: Any, spec: Any = None) ->
 
     - constant: a literal string -> 'const'; an ambiguous_0x -> 'const' under an integer spec, else
       'unknown' (a constant pointer whose pointee is unknown; no spec -> cannot disambiguate).
-    - a named external reader (getenv / recv / ...) or an external_input kind -> 'controllable'.
-    - call_return: a WEB-SETTABLE key in const_args (SaTC cross, getter-name-agnostic) ->
-      'controllable'; a value-forwarding copy (strcpy-family) of a constant -> 'const'; ANYTHING
-      else (a getter of a non-settable key, getpid, an unknown FUN_) -> 'unknown', NEITHER a proven
-      constant NOR proven controllable. This is the de-optimism: an arbitrary call_return is no
-      longer assumed controllable.
+    - call_return: dispatched through the EXTENSIBLE classifier registry (see
+      _CALL_RETURN_CLASSIFIERS). This phase the registry carries ONE controllable class — a
+      WEB-SETTABLE nvram key in const_args (SaTC cross, getter-name-agnostic) — plus a constant
+      value-forwarding copy. An UNCLASSIFIED call_return (getpid, an unknown FUN_, a getenv/recv a
+      a FUTURE class will cover) -> 'unknown': NEITHER proven constant NOR proven controllable, it
+      falls through to the source_kind chain honestly. This is the de-optimism: an arbitrary
+      call_return is no longer assumed controllable.
     - param / stack_buf(as a leaf) / unresolved / indirect_unresolved / missing / None -> 'unknown'.
     Nothing here assumes constant on incomplete data — the demotion iron law lives in this default.
     """
     if not isinstance(source, dict):
         return "unknown"
     kind = source.get("kind")
-    callee = source.get("callee")
     if kind == "constant":
         if not _is_ambiguous_0x(source):
             return "const"  # a confirmed literal-string constant (value known, not controllable)
@@ -263,15 +255,12 @@ def _classify_source(conn: sqlite3.Connection, source: Any, spec: Any = None) ->
         if conv is None or conv in _STRING_PTR_CONVERSIONS:
             return "unknown"  # %s/%p -> constant pointer, pointee unknown; no spec -> undecidable
         return "const"  # %d/%x/%u/... -> the 0x is a KNOWN integer literal
-    if kind in _EXTERNAL_INPUT_KINDS or callee in _EXTERNAL_INPUT_CALLEES:
-        return "controllable"
     if kind == "call_return":
-        if _source_web_settable_key(conn, source) is not None:
-            return "controllable"
-        keys = [k for k in (source.get("const_args") or []) if isinstance(k, str) and k]
-        if callee in _VALUE_FORWARDING_COPIES and keys:
-            return "const"  # value = the forwarded constant literal (dst-unresolved is irrelevant)
-        return "unknown"
+        for classifier in _CALL_RETURN_CLASSIFIERS:
+            verdict = classifier(conn, source)
+            if verdict is not None:
+                return verdict
+        return "unknown"  # unclassified call_return -> fall through to the source_kind chain
     return "unknown"
 
 
@@ -287,6 +276,38 @@ def _source_web_settable_key(conn: sqlite3.Connection, source: Any) -> str | Non
         if isinstance(k, str) and k and _web_settable(conn, k).get("web_settable") == "yes":
             return k
     return None
+
+
+# ── the EXTENSIBLE call_return source-classification registry (⑦) ──────────────────────────────
+# Each classifier maps a call_return source to a controllability class ('controllable' / 'const') or
+# None (not my class -> try the next). THIS PHASE carries exactly two rows: a web-settable nvram key
+# (the SaTC cross) and a value-forwarding copy of a constant. A FUTURE phase (item A: call_return
+# generalization — the WAN pre-auth surface) adds rows here WITHOUT touching _classify_source or the
+# verdict:  getenv + const_args HTTP_*/QUERY_STRING -> controllable ; recv / recvfrom -> external
+# (a WAN-daemon entry) ; getpeername + inet_ntop -> constrained. Hardcoding "only nvram" into the
+# classifier would force a rewrite then; a registry makes it additive. First non-None wins.
+
+
+def _cr_web_settable_nvram(conn: sqlite3.Connection, source: dict[str, Any]) -> str | None:
+    """Class #1 (this phase): a const_args key that is web_settable='yes' -> controllable. The
+    getter's identity does not matter — the SaTC cross decides."""
+    return "controllable" if _source_web_settable_key(conn, source) is not None else None
+
+
+def _cr_value_forwarding_copy(conn: sqlite3.Connection, source: dict[str, Any]) -> str | None:
+    """A strcpy-family copy of a constant literal -> const (the RESULT is the forwarded literal; the
+    unresolved destination pointer is irrelevant to the value)."""
+    keys = [k for k in (source.get("const_args") or []) if isinstance(k, str) and k]
+    if source.get("callee") in _VALUE_FORWARDING_COPIES and keys:
+        return "const"
+    return None
+
+
+_CallReturnClassifier = Callable[[sqlite3.Connection, dict[str, Any]], "str | None"]
+_CALL_RETURN_CLASSIFIERS: tuple[_CallReturnClassifier, ...] = (
+    _cr_web_settable_nvram,
+    _cr_value_forwarding_copy,
+)
 
 
 def _writer_args_class(conn: sqlite3.Connection, fmt: Any, varargs: Any) -> str:
@@ -687,28 +708,35 @@ def _dim_controllability(
     """Attacker byte-freedom over the sink argument, from the SINGLE verdict: controllable / free /
     constrained / constant / unknown.
 
-    Precedence (M3, monotone toward not missing a bug):
-      1. controllable — the def-use provenance shows a WEB-SETTABLE key (SaTC cross) or a direct
-         external input reaching the sink argument (the strongest controllability, above 'free').
+    Detection FALLBACK CHAIN (⑤), in precedence order — 'single verdict' means PROVENANCE-FIRST,
+    source_kind as a fallback, NOT source_kind abandoned:
+      1. controllable — provenance shows a WEB-SETTABLE key (SaTC cross) reaching the sink argument
+         (this phase's only controllable class; a future getenv/recv class rides the ⑦ registry).
       2. constant     — a provably-constant marker, OR the provenance is COMPLETE and every source
-         is a proven constant (the demotion iron law: incomplete provenance never reads constant).
-      3. free         — the optimistic text-level source_kind=free_string.
+         is a proven constant. Checked BEFORE the source_kind fallback so a provenance-DEEP
+         all-const candidate (e.g. an ipsec strcpy of a literal) reads constant, not free (demotion
+         iron law: incomplete provenance never reads constant).
+      3. free         — FALLBACK to the text-level source_kind=free_string. This is the ONLY path
+         that keeps a provenance-SHALLOW legit argv-free candidate (a nanddump/mtdinfo printf whose
+         only signal is source_kind) as 'free' instead of collapsing it to unknown — do NOT drop it.
       4. constrained  — a charset-safe / numeric-shape source.
       5. unknown      — nothing established; a ? never sinks.
-    The provenance verdict is computed by _verdict_from_provenance — the SAME classifier the explain
-    rollup uses, so a candidate carries one controllability reading, never two that disagree."""
+    (An 'external -> free' step for a provenance external marker is reserved for a future phase; the
+    extractor emits no such marker today, so argv-free rides step 3.) The provenance verdict is
+    computed by _verdict_from_provenance — the SAME classifier the explain rollup uses, so a
+    candidate carries one controllability reading, never two that disagree."""
     prov_verdict = _verdict_from_provenance(conn, flow_evidence, sink_anchor)
     if prov_verdict == "controllable":
         keys = _web_settable_keys_reaching_sink(conn, flow_evidence, sink_anchor)
-        via = f"web-settable key '{keys[0]}'" if keys else "a direct external input"
+        via = f"web-settable key '{keys[0]}'" if keys else "a user-settable source"
         return Dimension(
             "controllability",
             "proven",
             "controllable",
             f"sink_arg_provenance: {via} reaches the sink argument",
-            "PROVEN controllable: a user-settable source (SaTC front-end x back-end cross) or a "
-            "direct external input reaches the sink argument — the strongest controllability the "
-            "map asserts, ranked above the optimistic 'free'",
+            "PROVEN controllable: a user-settable source (SaTC front-end x back-end cross) reaches "
+            "the sink argument — the strongest controllability the map asserts, ranked above the "
+            "optimistic 'free'",
         )
     if blocking_mechanism in PROVABLY_CONSTANT_MARKERS:
         return Dimension(
@@ -735,8 +763,10 @@ def _dim_controllability(
             "controllability",
             "proven",
             "free",
-            "source_kind=free_string",
-            "OPTIMISTIC: convergence-transforms not subtracted — a value washed by "
+            "source_kind=free_string (provenance-shallow fallback)",
+            "OPTIMISTIC fallback: no provenance verdict, so the text-level source_kind carries it, "
+            "keeping a legit argv-free candidate (e.g. a nanddump printf) 'free' instead of "
+            "collapsing to unknown. Convergence-transforms not subtracted, so a value washed by "
             "inet_ntop / a whitelist / a fixed-width parse may still read as free",
         )
     if source_kind == "charset_safe":
@@ -768,9 +798,11 @@ def _dim_controllability(
 def _dim_source_writability(
     nvram_key: str | None, web_settable: dict[str, Any] | None
 ) -> Dimension:
-    """If the source is an nvram key, can the web UI set it? By the SaTC front↔back cross:
-    web_settable / not_settable / uncertain. ✗ not-applicable when the source is not a resolved key.
-    """
+    """If the source is an nvram key, can the web UI set it? By the SaTC front↔back cross —
+    TWO-STATE (④): web_settable / uncertain. There is NO 'not_settable': inferring 'not settable'
+    from a missing front-end field or a missing back-end constant key is a false-negative (a key
+    written via a dynamic-key op is absent from the constant set yet still settable). ✗
+    not-applicable when the source is not a resolved nvram key."""
     if nvram_key is None or web_settable is None:
         return Dimension(
             "source_writability",
@@ -789,20 +821,14 @@ def _dim_source_writability(
             f"SaTC cross[{nvram_key}]",
             f"key '{nvram_key}' is a user-editable web key ({src})",
         )
-    if st == "no":
-        return Dimension(
-            "source_writability",
-            "excluded",
-            "not_settable",
-            f"SaTC cross: '{nvram_key}' {src}",
-            f"key '{nvram_key}' is not web-settable ({src})",
-        )
     return Dimension(
         "source_writability",
         "unknown",
         "uncertain",
         "SaTC cross",
-        web_settable.get("source") or "web-settability uncertain (surface not fully collected)",
+        f"'{nvram_key}' not proven web-settable — uncertain, NOT 'not settable' ({src})"
+        if src
+        else "web-settability uncertain (surface not fully collected)",
     )
 
 

@@ -306,39 +306,26 @@ def test_web_settable_yes_when_frontend_editable_and_backend_key(tmp_path: Path)
     assert res["web_settable"]["web_settable"] == "yes"  # surfaced through the key-flow reader
 
 
-def test_web_settable_no_backend_key_but_no_editable_field_is_readonly_display(
-    tmp_path: Path,
-) -> None:
-    # firmver: a real back-end nvram key, but the front-end only ever shows it (hidden input) ->
-    # not collected as editable -> a read-only DISPLAY, a definite 'no' (front-end table non-empty).
+def test_web_settable_two_state_never_emits_no(tmp_path: Path) -> None:
+    # ④ TWO-STATE: back-end-only (firmver, a read-only display) and front-end-only (Connect_btn, a
+    # UI control) both land 'uncertain', NEVER 'no' — inferring 'not settable' from a missing side
+    # is a false-negative (a key written via a dynamic-key op is absent from the constant set yet
+    # settable). The frontend/backend flags still expose which side was present, honestly.
     atlas = _seed(
         tmp_path,
         [_flow("firmver", "constant", "httpd", "show", "read")],
-        form_fields=[_field("fb_comment", rule="textarea")],  # a non-empty front-end surface
+        form_fields=[_field("fb_comment", rule="textarea"), _field("Connect_btn")],
     )
     conn = open_atlas(atlas)
     try:
-        ws = _web_settable(conn, "firmver")
+        firmver = _web_settable(conn, "firmver")  # back-end only
+        btn = _web_settable(conn, "Connect_btn")  # front-end only
     finally:
         conn.close()
-    assert ws["web_settable"] == "no"
-    assert ws["backend"] is True and ws["frontend"] is False
-
-
-def test_web_settable_no_editable_field_but_no_backend_op_is_ui_control(tmp_path: Path) -> None:
-    # Connect_btn: an editable-looking field with no back-end nvram op -> a pure UI control -> 'no'.
-    atlas = _seed(
-        tmp_path,
-        [_flow("fb_comment", "constant", "httpd", "save", "write")],  # non-empty back-end surface
-        form_fields=[_field("Connect_btn")],
-    )
-    conn = open_atlas(atlas)
-    try:
-        ws = _web_settable(conn, "Connect_btn")
-    finally:
-        conn.close()
-    assert ws["web_settable"] == "no"
-    assert ws["frontend"] is True and ws["backend"] is False
+    assert firmver["web_settable"] == "uncertain" and firmver["web_settable"] != "no"
+    assert firmver["backend"] is True and firmver["frontend"] is False
+    assert btn["web_settable"] == "uncertain" and btn["web_settable"] != "no"
+    assert btn["frontend"] is True and btn["backend"] is False
 
 
 def test_web_settable_uncertain_when_frontend_not_collected(tmp_path: Path) -> None:
