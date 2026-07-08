@@ -159,27 +159,70 @@ COVERAGE_NOTE = (
 )
 
 
-def _web_settable(conn: sqlite3.Connection, key: str) -> dict[str, Any]:
-    """Source-side writability: is ``key`` in the router_defaults web-settable-key table?
+def _wl_normalize(key: str) -> str:
+    """Collapse an indexed wireless-interface prefix (``wl0_`` / ``wl1_`` / ``wl%d_``) to the
+    generic ``wl_`` the front-end templates use, so a back-end ``wl0_ssid`` can match a front-end
+    ``wl_ssid``. A generic naming rule (aligned with the analyzer's ``wl%d_`` template concept), not
+    a hardcoded key list; a key without that prefix is returned unchanged."""
+    return re.sub(r"^wl\d+_", "wl_", key)
 
-    THREE-STATE, with a false-negative red line — ``in_router_defaults`` is:
-      True       — the key IS a located member (confirmed web-settable via the config apply path).
-      False      — the table was located AND complete AND the key is not a member.
-      "uncertain"— the table was NOT located in this atlas, OR it was located but parse incomplete
-                   (the key could be an unresolved member). Table-not-located is NEVER False:
-                   inability to locate the table is not proof the key is not settable.
-    A surfaced fact only (in-table + default + flags); any judgement drawn from it is the agent's.
-    """
+
+def _frontend_settable(conn: sqlite3.Connection, key: str) -> bool | str:
+    """Is ``key`` an editable front-end form field (web_form_fields, M1)? True/False/'uncertain'.
+
+    ``uncertain`` when the front-end table is EMPTY (M1 not collected) — NEVER False (a
+    false-negative red line), OR when only a NAMING-VARIANT field exists (a front-end
+    ``http_username_x`` for a back-end ``http_username``): a variant MIGHT be the editable mirror,
+    so 'not settable' is not asserted. A hit is exact or via the generic wl-index normalization."""
+    try:
+        collected = conn.execute("SELECT 1 FROM web_form_fields LIMIT 1").fetchone() is not None
+    except sqlite3.OperationalError:
+        return "uncertain"  # table absent (older atlas / M1 not run) -> never 'not settable'
+    if not collected:
+        return "uncertain"  # front-end not collected -> unknown, never 'not settable'
+    exact = conn.execute(
+        "SELECT 1 FROM web_form_fields WHERE field_keyword IN (?, ?) LIMIT 1",
+        (key, _wl_normalize(key)),
+    ).fetchone()
+    if exact is not None:
+        return True
+    # A naming-variant editable field (starts with ``key_`` — e.g. http_username_x for
+    # http_username) may be the editable mirror; report uncertain, not False. GLOB '_' is literal
+    # (only * ? [ are special) and nvram keys carry none of those, so the pattern is safe.
+    variant = conn.execute(
+        "SELECT 1 FROM web_form_fields WHERE field_keyword GLOB ? LIMIT 1",
+        (key + "_*",),
+    ).fetchone()
+    return "uncertain" if variant is not None else False
+
+
+def _backend_nvram_key(conn: sqlite3.Connection, key: str) -> bool | str:
+    """Is ``key`` a back-end nvram op key — a constant key in nvram_key_flow, ANY binary, read or
+    write? True / False / 'uncertain' ('uncertain' only when the table is absent, an older atlas).
+
+    ALL binaries (not just the web server): a key the web server writes through a generic loop can
+    be invisible in the httpd binary yet read by another daemon — the all-binary cross recovers it.
+    A constant back-end key confirms this is a real nvram key, not a pure UI control."""
+    try:
+        hit = conn.execute(
+            "SELECT 1 FROM nvram_key_flow WHERE key_kind = 'constant' AND key = ? LIMIT 1",
+            (key,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return "uncertain"
+    return hit is not None
+
+
+def _router_defaults_lookup(conn: sqlite3.Connection, key: str) -> dict[str, Any]:
+    """The legacy router_defaults membership fact, kept as an AUXILIARY reference field (not the
+    primary web-settability judgement). Same three-state honesty as before (True / False /
+    'uncertain'); a not-located table is 'uncertain', never False."""
     try:
         located = conn.execute("SELECT 1 FROM nvram_defaults LIMIT 1").fetchone() is not None
     except sqlite3.OperationalError:
-        located = False  # table absent (older atlas) -> unknown, never "not settable"
+        located = False
     if not located:
-        return {
-            "in_router_defaults": "uncertain",
-            "reason": "router_defaults table not located in this atlas — web-settability is "
-            "unknown, NOT 'not settable' (a false-negative would be a red-line violation)",
-        }
+        return {"in_router_defaults": "uncertain", "reason": "router_defaults not located"}
     hit = conn.execute(
         "SELECT default_value, flags, binary FROM nvram_defaults WHERE key = ? "
         "ORDER BY binary LIMIT 1",
@@ -197,12 +240,55 @@ def _web_settable(conn: sqlite3.Connection, key: str) -> dict[str, Any]:
         is not None
     )
     if incomplete:
-        return {
-            "in_router_defaults": "uncertain",
-            "reason": "router_defaults located but parse is incomplete (some members unresolved) — "
-            "this key could be an unparsed member",
-        }
+        return {"in_router_defaults": "uncertain", "reason": "router_defaults parse incomplete"}
     return {"in_router_defaults": False, "source": "router_defaults (located, complete)"}
+
+
+def _web_settable(conn: sqlite3.Connection, key: str) -> dict[str, Any]:
+    """Source-side web-settability by a SaTC front/back cross — is ``key`` editable via the web?
+
+    Crosses the front-end editable form fields (M1 web_form_fields) against the back-end nvram op
+    keys (nvram_key_flow constant, ALL binaries). THREE-STATE ``web_settable``, with a
+    false-negative red line:
+      "yes"       — front-end editable AND back-end nvram key: a real, user-settable web key.
+      "no"        — back-end key but no editable front-end field (a read-only display, e.g. a
+                    firmware-version echo), OR an editable field with no back-end nvram op (a pure
+                    UI control). A located-and-complete negative, not an unknown.
+      "uncertain" — either side was NOT collected (front-end table empty / nvram table absent), or
+                    only a naming-variant field exists. NEVER "no": inability to collect is not
+                    proof the key is unsettable (a false-negative would be a red-line violation).
+    Direction-safe but possibly slightly WIDE: the all-binary back-end cross may attribute a key to
+    the web when another service is the real writer — a stated caveat, not a precise single-service
+    proof. ``router_defaults`` rides along as an auxiliary reference. A surfaced fact only.
+    """
+    frontend = _frontend_settable(conn, key)
+    backend = _backend_nvram_key(conn, key)
+    router = _router_defaults_lookup(conn, key)
+    if frontend == "uncertain" or backend == "uncertain":
+        verdict = "uncertain"
+        source = (
+            "front-end or back-end surface not fully collected (or a naming-variant field) — "
+            "web-settability unknown, NOT 'not settable' (false-negative red line)"
+        )
+    elif frontend is True and backend is True:
+        verdict = "yes"
+        source = "front-end editable field x back-end nvram key (SaTC cross)"
+    else:
+        verdict = "no"
+        source = (
+            "back-end nvram key with no editable front-end field (read-only display)"
+            if backend is True
+            else "editable front-end field with no back-end nvram op (UI control)"
+        )
+    return {
+        "web_settable": verdict,
+        "frontend": frontend,
+        "backend": backend,
+        "source": source,
+        "caveat": "all-binary back-end cross is direction-safe but may be slightly wide (another "
+        "service could be the real writer of a web-editable-looking key)",
+        "router_defaults": router,
+    }
 
 
 def get_nvram_key_flow(conn: sqlite3.Connection, key: str) -> dict[str, Any]:
@@ -283,9 +369,9 @@ def get_nvram_key_flow(conn: sqlite3.Connection, key: str) -> dict[str, Any]:
         "readers": readers,
         "template_matches": template_matches,
         "unresolved_count": unresolved_count,
-        # source-side writability: is this key web-settable via the router_defaults table? A
-        # three-state fact (True / False / "uncertain") — never asserts "not settable" from a
-        # not-located table (false-negative red line).
+        # source-side writability by the SaTC front-end x back-end cross: is this a USER-EDITABLE
+        # nvram key? A three-state fact ("yes" / "no" / "uncertain") — never asserts "no" from an
+        # uncollected surface (false-negative red line). router_defaults rides along as auxiliary.
         "web_settable": _web_settable(conn, key),
         "coverage": COVERAGE_NOTE,
         "completeness": completeness,

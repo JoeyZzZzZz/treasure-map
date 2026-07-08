@@ -171,6 +171,26 @@ CREATE TABLE IF NOT EXISTS nvram_defaults (
 CREATE INDEX IF NOT EXISTS idx_nvdef_key ON nvram_defaults(key);
 CREATE INDEX IF NOT EXISTS idx_nvdef_run ON nvram_defaults(source_run_id);
 
+-- SaTC front-end surface: user-editable web form field names, flattened from analysis.db at hunt
+-- time (mirrors nvram_defaults). web_settable crosses these (front-end editable) against
+-- nvram_key_flow constant keys (back-end nvram ops, all binaries) to separate an editable web key
+-- from a read-only display key: a key present on BOTH sides is web-settable; back-end-only is a
+-- read-only display; front-end-only is a UI control. field_keyword is the asset's OWN content
+-- (evidence). NO rows for a run means the front-end was not collected -> web_settable reads
+-- 'uncertain', NEVER 'not settable' (the false-negative red line). May hold neutral asset paths as
+-- private evidence -- REDACT ON EXPORT.
+CREATE TABLE IF NOT EXISTS web_form_fields (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_run_id TEXT,
+    field_keyword TEXT,   -- editable web form field name (front-end attack surface)
+    source_asset  TEXT,   -- the web asset the field was seen in
+    source_rule   TEXT,   -- input / textarea / select / js_assign / nvram_ascii
+    created_at    DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_wff_key ON web_form_fields(field_keyword);
+CREATE INDEX IF NOT EXISTS idx_wff_run ON web_form_fields(source_run_id);
+
 CREATE INDEX IF NOT EXISTS idx_pattern_classes ON pattern(source_class, sink_class);
 CREATE INDEX IF NOT EXISTS idx_pattern_fp      ON pattern(structural_fingerprint);
 CREATE INDEX IF NOT EXISTS idx_instance_pattern ON instance(pattern_id);

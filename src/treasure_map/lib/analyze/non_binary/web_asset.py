@@ -77,6 +77,63 @@ _RULES: list[tuple[str, re.Pattern[str]]] = [
 _FORM_ACTION_RE = re.compile(r"""\baction\s*=\s*['"]([^'"]+)['"]""", re.IGNORECASE)
 _FORM_METHOD_RE = re.compile(r"""\bmethod\s*=\s*['"]([^'"]+)['"]""", re.IGNORECASE)
 
+# ── SaTC front-end surface: USER-EDITABLE form field names (M1) ────────────────────────────────
+# A field name is collected only when it is EDITABLE. The name/type attributes sit before any value,
+# so matching a tag up to its first '>' is enough even when the value carries a server-side <% %>
+# template (which itself contains '>'). Field names are nvram-key-shaped ([A-Za-z0-9_]).
+_NAME_ATTR_RE = re.compile(r"""\bname\s*=\s*['"]?([A-Za-z0-9_]+)""", re.IGNORECASE)
+_TYPE_ATTR_RE = re.compile(r"""\btype\s*=\s*['"]?([A-Za-z]+)""", re.IGNORECASE)
+_INPUT_TAG_RE = re.compile(r"""<input\b([^>]*)>""", re.IGNORECASE)
+_TEXTAREA_TAG_RE = re.compile(r"""<textarea\b([^>]*)>""", re.IGNORECASE)
+_SELECT_TAG_RE = re.compile(r"""<select\b([^>]*)>""", re.IGNORECASE)
+# A JS assignment that WRITES a form field's value (the field is scripted, hence settable).
+_JS_FORM_ASSIGN_RE = re.compile(r"""\bdocument\.form\.([A-Za-z0-9_]+)\.value\s*=""", re.IGNORECASE)
+# A form-fill helper: nvram_char_to_ascii("area", "key") pre-populates a field from an nvram value —
+# the 2nd argument names the key. Catches editable keys a hidden mirror field would otherwise hide.
+_NVRAM_ASCII_RE = re.compile(
+    r"""nvram_char_to_ascii\(\s*['"][^'"]*['"]\s*,\s*['"]([A-Za-z0-9_]+)['"]""",
+    re.IGNORECASE,
+)
+
+
+def _extract_form_fields(text: str) -> list[tuple[str, str]]:
+    """Extract (field_keyword, source_rule) pairs for USER-EDITABLE web form fields.
+
+    Editable = a <textarea>/<select> (always user-entry), a NON-hidden <input>, a JS form-value
+    assignment, or an nvram_char_to_ascii form-fill. A ``<input type="hidden">`` is a read-only
+    round-trip value (e.g. a firmware-version echo from nvram_get) — DELIBERATELY excluded, so a
+    displayed-but-not-settable key never enters the front-end surface. Deduped on (keyword, rule).
+    """
+    out: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def emit(keyword: str | None, rule: str) -> None:
+        if not keyword:
+            return
+        pair = (keyword, rule)
+        if pair in seen:
+            return
+        seen.add(pair)
+        out.append(pair)
+
+    for attrs in _INPUT_TAG_RE.findall(text):
+        tm = _TYPE_ATTR_RE.search(attrs)
+        if tm is not None and tm.group(1).lower() == "hidden":
+            continue  # a hidden input is a read-only round-trip value, not user-editable
+        nm = _NAME_ATTR_RE.search(attrs)
+        emit(nm.group(1) if nm else None, "input")
+    for attrs in _TEXTAREA_TAG_RE.findall(text):
+        nm = _NAME_ATTR_RE.search(attrs)
+        emit(nm.group(1) if nm else None, "textarea")
+    for attrs in _SELECT_TAG_RE.findall(text):
+        nm = _NAME_ATTR_RE.search(attrs)
+        emit(nm.group(1) if nm else None, "select")
+    for kw in _JS_FORM_ASSIGN_RE.findall(text):
+        emit(kw, "js_assign")
+    for kw in _NVRAM_ASCII_RE.findall(text):
+        emit(kw, "nvram_ascii")
+    return out
+
 
 def _detect_web_asset(f: NonBinaryFile) -> str | None:
     """Return normalized extension subtype if the file is a web asset, else None."""
@@ -143,6 +200,17 @@ def _ingest_web_asset(conn: sqlite3.Connection, file_id: int, f: NonBinaryFile) 
                (file_id, asset_type, method, path, source)
                VALUES (?, ?, ?, ?, ?)""",
             rows,
+        )
+
+    # M1 SaTC front-end surface: user-editable form field names (a separate table; does not affect
+    # the endpoint count this returns). Read-only <input type=hidden> round-trip fields are excluded
+    # inside _extract_form_fields, so a displayed-but-not-settable key never enters the surface.
+    field_rows = [(file_id, kw, rule) for kw, rule in _extract_form_fields(text)]
+    if field_rows:
+        conn.executemany(
+            """INSERT INTO web_form_fields (file_id, field_keyword, source_rule)
+               VALUES (?, ?, ?)""",
+            field_rows,
         )
     return len(rows)
 

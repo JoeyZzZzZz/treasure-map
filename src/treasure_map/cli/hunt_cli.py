@@ -238,6 +238,10 @@ def hunt_pattern(
         click.echo(
             f"  router_defaults   : {stats.nvram_defaults_written} web-settable default keys"
         )
+    if stats.web_form_fields_written:
+        click.echo(
+            f"  web form fields   : {stats.web_form_fields_written} editable front-end fields"
+        )
     click.echo(
         "Note: every instance is a candidate/lead, not a confirmed result. With one firmware "
         "device_spread stays ~1 — cross-device spread needs more devices (future)."
@@ -993,6 +997,8 @@ def scan(
         )
     if h.nvram_defaults_written:
         click.echo(f"      → {h.nvram_defaults_written} router_defaults web-settable keys → atlas")
+    if h.web_form_fields_written:
+        click.echo(f"      → {h.web_form_fields_written} editable web form fields → atlas")
     # Record this as the last run so `tmap mcp` (no args) serves this firmware's analysis.db.
     from treasure_map.lib.last_run import write_last_run
 

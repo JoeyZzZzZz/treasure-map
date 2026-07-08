@@ -55,6 +55,7 @@ def _hunt_stats(written: int = 0) -> SimpleNamespace:
         nvram_flows_written=0,
         nvram_wrapper_edges=0,
         nvram_defaults_written=0,
+        web_form_fields_written=0,
         fmt_wrapper_unknown_source_skipped=0,
     )
 

@@ -29,14 +29,21 @@ from pathlib import Path
 from typing import Any
 
 from treasure_map.lib.atlas.connection import open_atlas
-from treasure_map.lib.atlas.models import InstanceRow, NvramDefaultRow, NvramFlowRow
+from treasure_map.lib.atlas.models import (
+    InstanceRow,
+    NvramDefaultRow,
+    NvramFlowRow,
+    WebFormFieldRow,
+)
 from treasure_map.lib.atlas.writer import (
     add_instance,
     add_nvram_default_rows,
     add_nvram_flow_rows,
+    add_web_form_field_rows,
     delete_run_instances,
     delete_run_nvram_defaults,
     delete_run_nvram_flow,
+    delete_run_web_form_fields,
     upsert_pattern,
 )
 from treasure_map.lib.diff.loader import FuncRow, load_functions
@@ -146,6 +153,7 @@ class Analyzer2Stats:
     nvram_flows_written: int = 0  # gap② per-op nvram read/write rows flattened into the atlas
     nvram_wrapper_edges: int = 0  # gap② A2 indirect key edges recovered through thin nvram wrappers
     nvram_defaults_written: int = 0  # naming-bridge phase 1: router_defaults members flattened
+    web_form_fields_written: int = 0  # M1 SaTC front-end: editable web form fields flattened
     # fmt-wrapper candidates dropped by the precision gate (uncontrollable/unknown forwarded value).
     # A deliberate recall trim — but COUNTED, not silent, so the summary shows the fmt axis was
     # narrowed (parity with data_gap_skipped; never let a drop imply the candidate set is complete).
@@ -452,6 +460,35 @@ def _load_nvram_defaults(db_path: Path | str, source_run_id: str) -> list[NvramD
     ]
 
 
+def _load_web_form_fields(db_path: Path | str, source_run_id: str) -> list[WebFormFieldRow]:
+    """Load editable web form field names from analysis.db into atlas rows (M1 SaTC front-end).
+
+    Each row is a USER-EDITABLE field name + the asset it came from. A missing table (an analysis.db
+    built before M1, or one with no web assets) yields no rows — web_settable then reads
+    'uncertain', NEVER 'not settable' (the false-negative red line)."""
+    uri = f"file:{Path(db_path)}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        rows = conn.execute(
+            "SELECT w.field_keyword, f.path, w.source_rule "
+            "FROM web_form_fields w LEFT JOIN non_binary_files f ON f.id = w.file_id"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []  # pre-M1 analysis.db -> no data (web_settable reads 'uncertain', never 'not')
+    finally:
+        conn.close()
+    return [
+        WebFormFieldRow(
+            source_run_id=source_run_id,
+            field_keyword=r[0] if isinstance(r[0], str) else None,
+            source_asset=r[1] if isinstance(r[1], str) else None,
+            source_rule=r[2] if isinstance(r[2], str) else None,
+        )
+        for r in rows
+        if isinstance(r[0], str) and r[0]
+    ]
+
+
 def run_analyzer2(
     db_path: Path | str,
     atlas_path: Path | str,
@@ -493,6 +530,10 @@ def run_analyzer2(
     # get_nvram_key_flow answers "is this source key web-settable?". Empty when analysis.db predates
     # the nvram_defaults table (web_settable then reads 'uncertain', never 'not web-settable').
     nvram_default_rows = _load_nvram_defaults(db_path, source_run_id)
+    # M1 SaTC front-end surface: editable web form fields, flattened into the atlas so web_settable
+    # can cross them against the back-end nvram_key_flow constant keys. Empty when the analysis.db
+    # predates M1 (web_settable then reads 'uncertain', never 'not settable').
+    web_form_field_rows = _load_web_form_fields(db_path, source_run_id)
 
     by_status = {"confirmed": 0, "blocked": 0, "unknown": 0}
     instances_written = 0
@@ -514,6 +555,9 @@ def run_analyzer2(
             # naming-bridge phase 1: refresh this run's router_defaults rows in the same txn.
             delete_run_nvram_defaults(atlas, source_run_id, commit=False)
             add_nvram_default_rows(atlas, nvram_default_rows, commit=False)
+            # M1: refresh this run's editable-web-form-field rows in the same txn (replace-by-run).
+            delete_run_web_form_fields(atlas, source_run_id, commit=False)
+            add_web_form_field_rows(atlas, web_form_field_rows, commit=False)
             for match in result.matches:
                 row = funcs.get(match.func_ref.func_id)
                 # A data gap = no loadable body OR a decompile-error comment (non-empty
@@ -830,5 +874,6 @@ def run_analyzer2(
         nvram_flows_written=len(nvram_flow_rows),
         nvram_wrapper_edges=len(wrapper_edge_rows),
         nvram_defaults_written=len(nvram_default_rows),
+        web_form_fields_written=len(web_form_field_rows),
         fmt_wrapper_unknown_source_skipped=fmt_wrapper_unknown_source_skipped,
     )

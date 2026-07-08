@@ -16,15 +16,17 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import InstanceRow
 from treasure_map.lib.atlas.writer import add_instance, upsert_pattern
 from treasure_map.lib.query import explain_candidate, get_sink_provenance
 from treasure_map.lib.query.triage import (
-    _fmt_args_provenance,
     _fmt_arity,
     _is_proven_safe,
     _sink_provenance_summary,
+    _writer_args_class,
 )
 
 # One representative record per source kind (the JSON contract ExportFunctions emits).
@@ -197,7 +199,9 @@ def test_explain_summary_one_entry_per_sink_and_compact(tmp_path: Path) -> None:
 
 
 def test_summary_kind_and_resolved_per_kind(tmp_path: Path) -> None:
-    summary = _sink_provenance_summary(json.dumps({"sink_arg_provenance": _PROV}))
+    conn = open_atlas(tmp_path / "atlas.db")
+    summary = _sink_provenance_summary(conn, json.dumps({"sink_arg_provenance": _PROV}))
+    conn.close()
     by_idx = {s["sink_idx"]: s for s in summary}
     assert by_idx[0]["kind"] == "constant" and by_idx[0]["resolved"] is True
     assert by_idx[1]["kind"] == "call_return"
@@ -406,14 +410,18 @@ _STACK16 = [
 def test_summary_has_dominating_writer_count(tmp_path: Path) -> None:
     # 16 raw writers but only 3 sound-dominating — the summary must show both so a high writer_count
     # reads as "resolved to 3", not "ambiguous among 16".
-    summary = _sink_provenance_summary(json.dumps({"sink_arg_provenance": _STACK16}))
+    conn = open_atlas(tmp_path / "atlas.db")
+    summary = _sink_provenance_summary(conn, json.dumps({"sink_arg_provenance": _STACK16}))
+    conn.close()
     s = summary[0]
     assert s["writer_count"] == 16
     assert s["dominating_writer_count"] == 3
 
 
 def test_summary_inlines_only_nearest_dominating_fmt(tmp_path: Path) -> None:
-    summary = _sink_provenance_summary(json.dumps({"sink_arg_provenance": _STACK16}))
+    conn = open_atlas(tmp_path / "atlas.db")
+    summary = _sink_provenance_summary(conn, json.dumps({"sink_arg_provenance": _STACK16}))
+    conn.close()
     s = summary[0]
     # the nearest dominating writer's fmt is inlined (judge controllability with zero extra fetch)
     assert s["nearest_dominating_writer_fmt"] == "echo %s to %s"
@@ -461,7 +469,17 @@ def test_fmt_arity_counts_conversions_and_star_args() -> None:
     assert _fmt_arity("%05.2f %-10s") == 2
 
 
-# ── fmt_args_provenance: three-state, spec-precise, value_kind-aware ───────────
+# ── _writer_args_class: the SINGLE classifier (const / controllable / unknown), value_kind-aware ─
+# This is where the single verdict's de-optimism is pinned: a bare call_return / param is NO LONGER
+# controllable (only a web-settable key or a named external reader is). Uses an EMPTY atlas conn —
+# no web-settable keys — so a getter's key reads as uncertain, never a false 'controllable'.
+
+
+@pytest.fixture
+def acon(tmp_path: Path) -> Any:
+    conn = open_atlas(tmp_path / "atlas.db")
+    yield conn
+    conn.close()
 
 
 def _lit(value: str, spec: str = "%s") -> dict[str, Any]:  # confirmed literal-string constant
@@ -474,68 +492,74 @@ def _amb(spec: str, value: str = "0x432f") -> dict[str, Any]:  # ambiguous_0x co
     return {"spec": spec, "source": src}
 
 
-def _src(kind: str, spec: str = "%s") -> dict[str, Any]:  # a vararg of a given source kind
-    return {"spec": spec, "source": {"kind": kind}}
+def _src(kind: str, spec: str = "%s", **extra: Any) -> dict[str, Any]:  # a vararg of a source kind
+    return {"spec": spec, "source": {"kind": kind, **extra}}
 
 
-def test_fmt_args_all_literal_strings_is_all_constant() -> None:
-    assert _fmt_args_provenance("%s to %s", [_lit("wl"), _lit("down")]) == "all_constant"
+def test_wac_all_literal_strings_is_const(acon: Any) -> None:
+    assert _writer_args_class(acon, "%s to %s", [_lit("wl"), _lit("down")]) == "const"
 
 
-def test_fmt_args_no_varargs_is_all_constant() -> None:
-    assert _fmt_args_provenance("reboot now", []) == "all_constant"
+def test_wac_no_varargs_literal_fmt_is_const(acon: Any) -> None:
+    assert _writer_args_class(acon, "reboot now", []) == "const"
 
 
-def test_fmt_args_controllable_kinds() -> None:
-    assert _fmt_args_provenance("%s", [_src("call_return")]) == "has_controllable"
-    assert _fmt_args_provenance("run %s", [_src("param")]) == "has_controllable"
+def test_wac_bare_call_return_and_param_are_unknown_not_controllable(acon: Any) -> None:
+    # THE de-optimism: an arbitrary call_return (getpid-shape) or a bare param is NOT controllable.
+    assert _writer_args_class(acon, "%s", [_src("call_return")]) == "unknown"
+    assert _writer_args_class(acon, "run %s", [_src("param")]) == "unknown"
 
 
-def test_fmt_args_unresolved_and_stack_buf_are_undetermined() -> None:
-    assert _fmt_args_provenance("%s", [_src("unresolved")]) == "undetermined"
-    assert _fmt_args_provenance("%s", [_src("stack_buf")]) == "undetermined"
+def test_wac_named_external_reader_is_controllable(acon: Any) -> None:
+    # A named external input (getenv / recv) IS controllable — the legit 'free' is not downgraded.
+    assert _writer_args_class(acon, "%s", [_src("call_return", callee="getenv")]) == "controllable"
+    assert _writer_args_class(acon, "%s", [_src("external_input")]) == "controllable"
 
 
-def test_fmt_args_ambiguous0x_under_integer_spec_is_constant() -> None:
-    # %d + ambiguous_0x = a known INTEGER literal (value pinned by the spec) -> constant.
-    # The acceptance case: 0x432f under %d must NOT flip the verdict to undetermined.
+def test_wac_unresolved_and_stack_buf_are_unknown(acon: Any) -> None:
+    assert _writer_args_class(acon, "%s", [_src("unresolved")]) == "unknown"
+    assert _writer_args_class(acon, "%s", [_src("stack_buf")]) == "unknown"
+
+
+def test_wac_ambiguous0x_under_integer_spec_is_const(acon: Any) -> None:
+    # %d + ambiguous_0x = a known INTEGER literal (value pinned by the spec) -> const.
     assert (
-        _fmt_args_provenance("[%s:(%d)]", [_lit("handle_notifications"), _amb("%d", "0x432f")])
-        == "all_constant"
+        _writer_args_class(acon, "[%s:(%d)]", [_lit("handle_notifications"), _amb("%d", "0x432f")])
+        == "const"
     )
-    assert _fmt_args_provenance("%x", [_amb("%x", "0xf002")]) == "all_constant"
+    assert _writer_args_class(acon, "%x", [_amb("%x", "0xf002")]) == "const"
 
 
-def test_fmt_args_ambiguous0x_under_string_spec_is_undetermined() -> None:
-    # %s + ambiguous_0x = a constant POINTER, pointee unknown -> undetermined (the red line).
-    assert _fmt_args_provenance("%s", [_amb("%s", "0x1525f0")]) == "undetermined"
+def test_wac_ambiguous0x_under_string_spec_is_unknown(acon: Any) -> None:
+    # %s + ambiguous_0x = a constant POINTER, pointee unknown -> unknown (the red line).
+    assert _writer_args_class(acon, "%s", [_amb("%s", "0x1525f0")]) == "unknown"
 
 
-def test_fmt_args_ambiguous0x_with_no_spec_is_undetermined() -> None:
-    # no spec context to disambiguate int-vs-pointer -> honest undetermined, never assumed safe.
+def test_wac_ambiguous0x_with_no_spec_is_unknown(acon: Any) -> None:
     va = {"source": {"kind": "constant", "value": "0x1234", "value_kind": "ambiguous_0x"}}
-    assert _fmt_args_provenance("%s and more", [va]) == "undetermined"
+    assert _writer_args_class(acon, "%s and more", [va]) == "unknown"
 
 
-def test_fmt_args_arity_shortfall_is_undetermined() -> None:
-    assert _fmt_args_provenance("%s and %s", [_lit("only_one")]) == "undetermined"
+def test_wac_arity_shortfall_is_unknown(acon: Any) -> None:
+    assert _writer_args_class(acon, "%s and %s", [_lit("only_one")]) == "unknown"
 
 
-def test_fmt_args_controllable_wins_over_undetermined() -> None:
-    assert _fmt_args_provenance("%s %s", [_src("param"), _src("unresolved")]) == "has_controllable"
+def test_wac_controllable_wins_over_unknown(acon: Any) -> None:
+    assert (
+        _writer_args_class(acon, "%s %s", [_src("external_input"), _src("unresolved")])
+        == "controllable"
+    )
 
 
-def test_fmt_args_missing_source_is_undetermined() -> None:
-    assert _fmt_args_provenance("%s", [{"spec": "%s"}]) == "undetermined"
+def test_wac_missing_source_is_unknown(acon: Any) -> None:
+    assert _writer_args_class(acon, "%s", [{"spec": "%s"}]) == "unknown"
 
 
-def test_fmt_args_bare_0x_without_value_kind_falls_back() -> None:
-    # provenance produced BEFORE the extractor emitted value_kind: a bare 0x value is still treated
-    # as ambiguous by the fallback, so old data is judged honestly too.
+def test_wac_bare_0x_without_value_kind_falls_back(acon: Any) -> None:
     amb_d = {"spec": "%d", "source": {"kind": "constant", "value": "0x432f"}}  # no value_kind
     amb_s = {"spec": "%s", "source": {"kind": "constant", "value": "0x1525f0"}}  # no value_kind
-    assert _fmt_args_provenance("%d", [amb_d]) == "all_constant"  # %d -> integer
-    assert _fmt_args_provenance("%s", [amb_s]) == "undetermined"  # %s -> pointer, unknown
+    assert _writer_args_class(acon, "%d", [amb_d]) == "const"  # %d -> integer
+    assert _writer_args_class(acon, "%s", [amb_s]) == "unknown"  # %s -> pointer, unknown
 
 
 def test_get_sink_provenance_detail_surfaces_value_kind(tmp_path: Path) -> None:

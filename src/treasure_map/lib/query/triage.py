@@ -55,8 +55,9 @@ PHASE1_CAVEATS: tuple[str, ...] = (
     "'free' is OPTIMISTIC: convergence-transforms are not subtracted yet, so a value washed by "
     "inet_ntop / a whitelist / a fixed-width parse — or a PATH sanitized by basename / realpath / "
     "a traversal check — can still read as free",
-    "nvram-source 'free' is doubly optimistic: web_settable proves only the KEY is web-settable, "
-    "NOT that the getter->sink path is transform-free",
+    "proven-'controllable' via web_settable proves only the KEY is user-settable (SaTC front-end x "
+    "back-end cross), NOT that the getter->sink path is transform-free — a sanitizer between the "
+    "getter and the sink can still neutralize it; and the all-binary cross may be slightly wide",
     "filtering is ~= always '?': tmap does a generic name-match only and cannot prove a sanitizer "
     "covers the path — it does NOT save you from reading the filter code",
     "triage RE-RANKS the view, it does not reduce candidates: only provably-safe items leave the "
@@ -183,10 +184,23 @@ def _sink_provenance_records(flow_evidence: str | None) -> list[dict[str, Any]]:
     return [r for r in prov if isinstance(r, dict)]
 
 
-# Vararg source kinds that are a CONFIRMED controllable origin (an attacker-influenceable value can
-# reach the format argument). external_input/multiple are included defensively for other firmwares /
-# upstream layers even though the current extractor emits call_return/param.
-_CONTROLLABLE_VARARG_KINDS = frozenset({"call_return", "param", "multiple", "external_input"})
+# Source KINDS / CALLEES that are a proven DIRECT external input (attacker-reachable without a
+# config round-trip) -> proven controllable. A bare 'param' or a generic call_return (getpid, an
+# unknown FUN_) is deliberately NOT here: it could carry anything, so it is the optimistic 'free'
+# reading (via source_kind) or 'unknown', never assumed controllable. Name-neutral, extensible
+# mechanism lists — not a verdict. This is the de-optimism the single verdict introduces: the old
+# rollup called ANY call_return controllable (getpid included); now only a web-settable key or a
+# named external reader is.
+_EXTERNAL_INPUT_KINDS: frozenset[str] = frozenset({"external_input"})
+_EXTERNAL_INPUT_CALLEES: frozenset[str] = frozenset({"getenv", "recv", "recvfrom", "recvmsg"})
+# call_return callees that FORWARD a source-argument value unchanged (strcpy/memcpy-family REPLACE
+# the destination with a source argument), so a constant source argument makes the RESULT a proven
+# constant even though the destination-pointer argument reads as unresolved (has_unresolved_args
+# flags the DST buffer, not the value). strcat/strncat are EXCLUDED — they append, so the value is
+# not solely the constant source. Generic libc names, not a vendor list.
+_VALUE_FORWARDING_COPIES: frozenset[str] = frozenset(
+    {"strcpy", "strncpy", "strlcpy", "strdup", "strndup", "memcpy", "memmove"}
+)
 # printf conversions that consume a POINTER argument (the value is an address, its pointee unknown).
 _STRING_PTR_CONVERSIONS = frozenset({"s", "p"})
 
@@ -222,66 +236,201 @@ def _conversion_char(spec: Any) -> str | None:
     return None
 
 
-def _classify_vararg(vararg: Any) -> str:
-    """Classify ONE format vararg as 'controllable' | 'const' | 'unknown' — spec-precise, honest
-    about the boundary: anything not CONFIRMED constant or CONFIRMED controllable is 'unknown',
-    never silently folded into constant. An ambiguous_0x constant is judged BY THE SPEC (the
-    reliable oracle): an integer conversion pins it to a known integer literal; a %s/%p leaves it a
-    constant pointer whose pointee is unknown; no spec leaves it undetermined. See below."""
-    source = vararg.get("source") if isinstance(vararg, dict) else None
-    source = source if isinstance(source, dict) else {}
+def _classify_source(conn: sqlite3.Connection, source: Any, spec: Any = None) -> str:
+    """One value source's controllability: 'controllable' | 'const' | 'unknown'. THE single
+    classifier both the triage verdict (M3) and the explain rollup call — so a candidate carries one
+    controllability reading, never two that disagree.
+
+    - constant: a literal string -> 'const'; an ambiguous_0x -> 'const' under an integer spec, else
+      'unknown' (a constant pointer whose pointee is unknown; no spec -> cannot disambiguate).
+    - a named external reader (getenv / recv / ...) or an external_input kind -> 'controllable'.
+    - call_return: a WEB-SETTABLE key in const_args (SaTC cross, getter-name-agnostic) ->
+      'controllable'; a value-forwarding copy (strcpy-family) of a constant -> 'const'; ANYTHING
+      else (a getter of a non-settable key, getpid, an unknown FUN_) -> 'unknown', NEITHER a proven
+      constant NOR proven controllable. This is the de-optimism: an arbitrary call_return is no
+      longer assumed controllable.
+    - param / stack_buf(as a leaf) / unresolved / indirect_unresolved / missing / None -> 'unknown'.
+    Nothing here assumes constant on incomplete data — the demotion iron law lives in this default.
+    """
+    if not isinstance(source, dict):
+        return "unknown"
     kind = source.get("kind")
-    if kind in _CONTROLLABLE_VARARG_KINDS:
+    callee = source.get("callee")
+    if kind == "constant":
+        if not _is_ambiguous_0x(source):
+            return "const"  # a confirmed literal-string constant (value known, not controllable)
+        conv = _conversion_char(spec)
+        if conv is None or conv in _STRING_PTR_CONVERSIONS:
+            return "unknown"  # %s/%p -> constant pointer, pointee unknown; no spec -> undecidable
+        return "const"  # %d/%x/%u/... -> the 0x is a KNOWN integer literal
+    if kind in _EXTERNAL_INPUT_KINDS or callee in _EXTERNAL_INPUT_CALLEES:
         return "controllable"
-    if kind != "constant":
-        # unresolved / indirect_unresolved / stack_buf / missing / None / anything unconfirmed:
-        # not pinned to a known literal -> honest "unknown", never assumed constant.
+    if kind == "call_return":
+        if _source_web_settable_key(conn, source) is not None:
+            return "controllable"
+        keys = [k for k in (source.get("const_args") or []) if isinstance(k, str) and k]
+        if callee in _VALUE_FORWARDING_COPIES and keys:
+            return "const"  # value = the forwarded constant literal (dst-unresolved is irrelevant)
         return "unknown"
-    if not _is_ambiguous_0x(source):
-        return "const"  # a confirmed literal-string constant (value known, not controllable)
-    # ambiguous_0x: the SPEC, not the value, decides what the 0x means (the red line).
-    conv = _conversion_char(vararg.get("spec"))
-    if conv is None or conv in _STRING_PTR_CONVERSIONS:
-        # %s/%p -> constant POINTER, pointee unknown -> unknown; no spec -> cannot disambiguate.
-        return "unknown"
-    # %d/%x/%u/%i/%c/%o/... -> a by-value spec: the 0x is a KNOWN integer literal (e.g. 0x432f).
-    return "const"
+    return "unknown"
 
 
-def _fmt_args_provenance(fmt: Any, varargs: Any) -> str:
-    """Three-state, spec-precise verdict on the format arguments of the nearest dominating writer:
+def _source_web_settable_key(conn: sqlite3.Connection, source: Any) -> str | None:
+    """The FIRST web_settable='yes' key among a call_return source's const_args, else None.
 
-    - ``all_constant``  — every vararg is a CONFIRMED literal constant (a known literal string, or
-     an ambiguous_0x pinned to an integer literal by an integer spec), or the fmt consumes no
-     arguments at all. Asserts only that the format arguments introduce no CONTROLLABLE injection
-     (format-string / command injection); it does NOT assert the command is safe under other threat
-     models (a controllable integer's overflow/length issues land in has_controllable, not here).
-     Read as "arguments not controllable, no injection surface", not "harmless".
-    - ``has_controllable`` — at least one vararg is a confirmed controllable source (call_return /
-     param / multiple / external_input): a real controllable injection surface.
-    - ``undetermined``  — at least one vararg cannot be confirmed constant AND none is confirmed
-     controllable: an untraceable source (unresolved/stack_buf/missing), an ambiguous_0x under a
-     %s/%p or with no spec (a constant pointer, pointee unknown), or an arity shortfall (fewer
-     varargs extracted than the fmt consumes). An honest "don't know", never coerced to yes/no.
+    Getter-name-AGNOSTIC: the SaTC cross (front-end editable x back-end nvram key) decides, so a
+    custom getter wrapper — not in any known getter list — still yields its web-settable key. This
+    is why the single verdict sees keys the old NVRAM_GETTERS-gated path missed."""
+    if not isinstance(source, dict) or source.get("kind") != "call_return":
+        return None
+    for k in source.get("const_args") or []:
+        if isinstance(k, str) and k and _web_settable(conn, k).get("web_settable") == "yes":
+            return k
+    return None
 
-    tmap is a data substrate: each state is a FACT, never a guess, and never a score input.
-    Precedence has_controllable > undetermined > all_constant — a confirmed controllable arg is the
-    actionable headline even if another arg is also undetermined."""
+
+def _writer_args_class(conn: sqlite3.Connection, fmt: Any, varargs: Any) -> str:
+    """One writer's format-argument controllability: 'controllable' | 'const' | 'unknown'.
+
+    Reuses _classify_source per vararg (spec-aware), with an arity shortfall (fmt consumes more than
+    were extracted) contributing an 'unknown' — never conclude 'const' on incomplete data. A
+    literal-format write with no args is 'const'; an origin-less writer (no fmt, no args) is
+    'unknown'. Precedence controllable > unknown > const."""
     varargs = varargs if isinstance(varargs, list) else []
-    classes = [_classify_vararg(va) for va in varargs]
-    # Arity shortfall: the fmt consumes more args than were extracted -> the missing ones are
-    # unknown. Never conclude "all constant" on incomplete data.
-    arity = _fmt_arity(fmt) if isinstance(fmt, str) else 0
-    if len(varargs) < arity:
+    arity = _fmt_arity(fmt) if isinstance(fmt, str) else len(varargs)
+    considered = varargs[:arity] if isinstance(fmt, str) else varargs
+    classes = [
+        _classify_source(
+            conn,
+            va.get("source") if isinstance(va, dict) else None,
+            va.get("spec") if isinstance(va, dict) else None,
+        )
+        for va in considered
+    ]
+    if isinstance(fmt, str) and len(varargs) < arity:
         classes.append("unknown")
     if "controllable" in classes:
-        return "has_controllable"
+        return "controllable"
     if "unknown" in classes:
-        return "undetermined"
-    return "all_constant"
+        return "unknown"
+    if classes:
+        return "const"
+    return "const" if isinstance(fmt, str) else "unknown"
 
 
-def _sink_provenance_summary(flow_evidence: str | None) -> tuple[dict[str, Any], ...]:
+# Command-exec sinks whose command spans MULTIPLE argv arguments (execl("/bin/sh","sh","-c",cmd)):
+# a single constant arg record (arg0="/bin/sh") does NOT prove the command constant — the real
+# command is in a later arg the provenance may not have captured. Never demote these to 'constant'
+# on a partial (arg0-only) view (the demotion iron law: a variadic exec seen only at arg0 ->
+# unknown, never constant — the agent's blood-earned counter-example). system/popen take the whole
+# command in one arg, so they are NOT here — a single constant record legitimately proves them.
+_MULTI_ARG_COMMAND_SINKS: frozenset[str] = frozenset(
+    {"execl", "execlp", "execle", "execv", "execvp", "execvpe"}
+)
+
+
+def _record_class(conn: sqlite3.Connection, rec: dict[str, Any]) -> str:
+    """One sink record's controllability: 'controllable' | 'const' | 'unknown'.
+
+    constant / call_return sink arg -> _classify_source directly. A stack_buf is judged over its
+    writers (a value-forwarding snprintf/echo): controllable if ANY writer is controllable, 'const'
+    only if EVERY writer is const (a branch writer could inject on another path), else 'unknown'.
+    Unresolved / indirect_unresolved -> 'unknown'. A multi-arg exec sink is NEVER 'const' on partial
+    provenance (the iron law) — a would-be 'const' is downgraded to 'unknown'."""
+    prov = rec.get("provenance")
+    prov = prov if isinstance(prov, dict) else {}
+    kind = prov.get("kind")
+    if kind in ("constant", "call_return"):
+        cls = _classify_source(conn, prov)
+    elif kind == "stack_buf":
+        writers = [w for w in (prov.get("writers") or []) if isinstance(w, dict)]
+        if not writers:
+            cls = "unknown"
+        else:
+            wclasses = [_writer_args_class(conn, w.get("fmt"), w.get("varargs")) for w in writers]
+            if "controllable" in wclasses:
+                cls = "controllable"
+            else:
+                cls = "const" if all(c == "const" for c in wclasses) else "unknown"
+    else:
+        cls = "unknown"
+    # Iron law: a variadic exec proven constant only at arg0 is NOT a constant command.
+    if cls == "const" and rec.get("sink") in _MULTI_ARG_COMMAND_SINKS:
+        return "unknown"
+    return cls
+
+
+def _scoped_records(flow_evidence: str | None, sink_anchor: str | None) -> list[dict[str, Any]]:
+    """The sink_arg_provenance records for the candidate's ANCHORED sink (rec.sink == sink_anchor).
+
+    Falls back to ALL records when the anchor matches none — a LIBERAL fallback: it may promote a
+    constant sibling, but it never HIDES a controllable key by a failed anchor match (the demotion
+    iron law is asymmetric — a wrong promote is safe, a wrong demote hides a bug)."""
+    recs = _sink_provenance_records(flow_evidence)
+    if sink_anchor:
+        scoped = [r for r in recs if r.get("sink") == sink_anchor]
+        if scoped:
+            return scoped
+    return recs
+
+
+def _verdict_from_provenance(
+    conn: sqlite3.Connection, flow_evidence: str | None, sink_anchor: str | None
+) -> str | None:
+    """The single controllability verdict from the anchored sink's def-use provenance:
+    'controllable' (a web-settable / external source reaches the sink arg), 'const' (EVERY record is
+    a proven constant — the demotion iron law: complete + all-constant), or None (undetermined ->
+    the caller falls back to the top-level source_kind)."""
+    recs = _scoped_records(flow_evidence, sink_anchor)
+    if not recs:
+        return None
+    classes = [_record_class(conn, r) for r in recs]
+    if "controllable" in classes:
+        return "controllable"
+    if all(c == "const" for c in classes):
+        return "const"
+    return None
+
+
+def _web_settable_keys_reaching_sink(
+    conn: sqlite3.Connection, flow_evidence: str | None, sink_anchor: str | None
+) -> list[str]:
+    """The web-settable keys that reach the anchored sink argument (order-preserving, deduped) —
+    surfaced so the controllability note names the key and the source_writability layer can show it.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add(k: str | None) -> None:
+        if k and k not in seen:
+            seen.add(k)
+            out.append(k)
+
+    for rec in _scoped_records(flow_evidence, sink_anchor):
+        prov = rec.get("provenance")
+        prov = prov if isinstance(prov, dict) else {}
+        add(_source_web_settable_key(conn, prov))
+        for w in prov.get("writers") or []:
+            if not isinstance(w, dict):
+                continue
+            for va in w.get("varargs") or []:
+                if isinstance(va, dict):
+                    add(_source_web_settable_key(conn, va.get("source")))
+    return out
+
+
+# The explain-summary vocabulary for a writer's format-argument controllability, mapped from the
+# single _writer_args_class so the explain rollup and the triage verdict never disagree.
+_ARGS_CLASS_TO_STATE: dict[str, str] = {
+    "controllable": "has_controllable",
+    "const": "all_constant",
+    "unknown": "undetermined",
+}
+
+
+def _sink_provenance_summary(
+    conn: sqlite3.Connection, flow_evidence: str | None
+) -> tuple[dict[str, Any], ...]:
     """Per-sink summary of sink_arg_provenance (summary-first: the FULL writer/vararg detail is
     fetched on demand via ``get_sink_provenance``, so a multi-sink candidate never blows the token
     budget). One compact dict per sink: idx / name / addr / kind / resolved / writer_count? /
@@ -320,12 +469,13 @@ def _sink_provenance_summary(flow_evidence: str | None) -> tuple[dict[str, Any],
                 for w in writers:
                     if isinstance(w, dict) and w.get("writer") == ndw and w.get("fmt") is not None:
                         summary["nearest_dominating_writer_fmt"] = w.get("fmt")
-                        # Three-state, spec-precise: are the inlined command's format arguments
-                        # constant / controllable / undetermined? Lets the agent judge the args'
-                        # controllability without fetching the full writer detail.
-                        summary["fmt_args_provenance"] = _fmt_args_provenance(
-                            w.get("fmt"), w.get("varargs")
-                        )
+                        # Three-state, web-settable-aware: are the inlined command's format args
+                        # constant / controllable / undetermined? By the SAME classifier the
+                        # triage verdict uses (so explain and triage agree), so a call_return like
+                        # getpid reads 'undetermined', not the old optimistic 'has_controllable'.
+                        summary["fmt_args_provenance"] = _ARGS_CLASS_TO_STATE[
+                            _writer_args_class(conn, w.get("fmt"), w.get("varargs"))
+                        ]
                         break
         out.append(summary)
     return tuple(out)
@@ -527,13 +677,39 @@ def _sanitizer_records(flow_evidence: str | None) -> list[dict[str, Any]]:
 
 
 def _dim_controllability(
-    source_kind: str, blocking_mechanism: str | None, web_settable: dict[str, Any] | None
+    conn: sqlite3.Connection,
+    *,
+    flow_evidence: str | None,
+    sink_anchor: str | None,
+    source_kind: str,
+    blocking_mechanism: str | None,
 ) -> Dimension:
-    """Attacker byte-freedom over the sink argument: free / constrained / constant / unknown.
+    """Attacker byte-freedom over the sink argument, from the SINGLE verdict: controllable / free /
+    constrained / constant / unknown.
 
-    Order (fact transport): a provably-constant marker wins (constant, the only proven-safe
-    controllability this phase); else if the source is an nvram getter, combine its web-settability
-    (free / constrained / unknown); else fall back to the text-level source_kind."""
+    Precedence (M3, monotone toward not missing a bug):
+      1. controllable — the def-use provenance shows a WEB-SETTABLE key (SaTC cross) or a direct
+         external input reaching the sink argument (the strongest controllability, above 'free').
+      2. constant     — a provably-constant marker, OR the provenance is COMPLETE and every source
+         is a proven constant (the demotion iron law: incomplete provenance never reads constant).
+      3. free         — the optimistic text-level source_kind=free_string.
+      4. constrained  — a charset-safe / numeric-shape source.
+      5. unknown      — nothing established; a ? never sinks.
+    The provenance verdict is computed by _verdict_from_provenance — the SAME classifier the explain
+    rollup uses, so a candidate carries one controllability reading, never two that disagree."""
+    prov_verdict = _verdict_from_provenance(conn, flow_evidence, sink_anchor)
+    if prov_verdict == "controllable":
+        keys = _web_settable_keys_reaching_sink(conn, flow_evidence, sink_anchor)
+        via = f"web-settable key '{keys[0]}'" if keys else "a direct external input"
+        return Dimension(
+            "controllability",
+            "proven",
+            "controllable",
+            f"sink_arg_provenance: {via} reaches the sink argument",
+            "PROVEN controllable: a user-settable source (SaTC front-end x back-end cross) or a "
+            "direct external input reaches the sink argument — the strongest controllability the "
+            "map asserts, ranked above the optimistic 'free'",
+        )
     if blocking_mechanism in PROVABLY_CONSTANT_MARKERS:
         return Dimension(
             "controllability",
@@ -544,33 +720,15 @@ def _dim_controllability(
             "the only 'safe' controllability tmap asserts this phase; this is what sinks a "
             "candidate out of the first screen",
         )
-    if web_settable is not None:  # source resolved to an nvram getter with a key
-        st = web_settable.get("in_router_defaults")
-        if st is True:
-            return Dimension(
-                "controllability",
-                "proven",
-                "free",
-                "nvram source key web_settable=true (router_defaults)",
-                "free via source-writability: the key IS web-settable. DOUBLE-OPTIMISTIC — proves "
-                "only the source is writable, NOT that the getter->sink path is transform-free "
-                "",
-            )
-        if st is False:
-            return Dimension(
-                "controllability",
-                "proven",
-                "constrained",
-                "nvram source key not in router_defaults (located, complete)",
-                "the source key is not web-settable (router_defaults located + complete)",
-            )
+    if prov_verdict == "const":
         return Dimension(
             "controllability",
-            "unknown",
-            "unknown",
-            "nvram source key web-settability uncertain",
-            "cannot combine source-writability: router_defaults not located / incomplete — not "
-            "assumed controllable nor safe",
+            "proven",
+            "constant",
+            "sink_arg_provenance: every source resolves to a proven constant (provenance complete)",
+            "provably-constant via def-use (all sources constant literals, none unresolved) — "
+            "demotes out of the first screen; incomplete provenance / a variadic exec seen only at "
+            "arg0 would read unknown, NEVER constant (the demotion iron law)",
         )
     if source_kind == "free_string":
         return Dimension(
@@ -610,40 +768,41 @@ def _dim_controllability(
 def _dim_source_writability(
     nvram_key: str | None, web_settable: dict[str, Any] | None
 ) -> Dimension:
-    """If the source is an nvram key, can the web UI set it? web_settable / not_settable /
-    table_not_located. ✗ not-applicable when the source is not a resolved nvram key."""
+    """If the source is an nvram key, can the web UI set it? By the SaTC front↔back cross:
+    web_settable / not_settable / uncertain. ✗ not-applicable when the source is not a resolved key.
+    """
     if nvram_key is None or web_settable is None:
         return Dimension(
             "source_writability",
             "excluded",
             "n/a",
             "source is not a resolved nvram key",
-            "web-settability applies only when the sink source is an nvram getter with a key",
+            "web-settability applies only when the sink source is a resolved nvram key",
         )
-    st = web_settable.get("in_router_defaults")
+    st = web_settable.get("web_settable")
     src = web_settable.get("source") or ""
-    if st is True:
+    if st == "yes":
         return Dimension(
             "source_writability",
             "proven",
             "web_settable",
-            f"router_defaults[{nvram_key}]",
-            f"key '{nvram_key}' is a web-settable member ({src})",
+            f"SaTC cross[{nvram_key}]",
+            f"key '{nvram_key}' is a user-editable web key ({src})",
         )
-    if st is False:
+    if st == "no":
         return Dimension(
             "source_writability",
             "excluded",
             "not_settable",
-            f"router_defaults (located, complete): '{nvram_key}' absent",
-            f"key '{nvram_key}' is not web-settable",
+            f"SaTC cross: '{nvram_key}' {src}",
+            f"key '{nvram_key}' is not web-settable ({src})",
         )
     return Dimension(
         "source_writability",
         "unknown",
-        "table_not_located",
-        "router_defaults",
-        web_settable.get("reason") or "web-settability uncertain (table not located / incomplete)",
+        "uncertain",
+        "SaTC cross",
+        web_settable.get("source") or "web-settability uncertain (surface not fully collected)",
     )
 
 
@@ -768,12 +927,20 @@ def _build_dimensions(
     sink_class: str,
     entry_reach: str,
     nvram_key: str | None,
+    sink_anchor: str | None,
 ) -> tuple[Dimension, ...]:
-    """The seven honest map layers for one candidate. web_settable is looked up once (atlas
-    nvram_defaults) when the source resolved to an nvram key, and shared by two layers."""
+    """The seven honest map layers for one candidate. web_settable is the SaTC front↔back cross,
+    looked up once when the source resolved to an nvram key (shared by source_writability); the
+    controllability layer runs the single verdict over the anchored sink's def-use provenance."""
     web_settable = _web_settable(conn, nvram_key) if nvram_key else None
     return (
-        _dim_controllability(source_kind, blocking_mechanism, web_settable),
+        _dim_controllability(
+            conn,
+            flow_evidence=flow_evidence,
+            sink_anchor=sink_anchor,
+            source_kind=source_kind,
+            blocking_mechanism=blocking_mechanism,
+        ),
         _dim_source_writability(nvram_key, web_settable),
         _dim_reachability(entry_reach),
         _dim_filtering(flow_evidence),
@@ -790,7 +957,15 @@ def _candidate(conn: sqlite3.Connection, row: sqlite3.Row) -> TriageCandidate:
     source_kind = _source_kind_from_evidence(fe)
     sink_class = row["sink_class"]
     blocking = row["blocking_mechanism"]
+    sink_anchor = row["sink_anchor"]
+    # The resolved nvram key for the source_writability layer: a recognized nvram getter
+    # (NVRAM_GETTERS) first, else the first web-settable key the verdict found reaching the sink —
+    # so a custom getter wrapper's web-settable key still shows in source_writability, coherent with
+    # the controllability='controllable' reading.
     nvram_key = _nvram_source_key(fe)
+    if nvram_key is None:
+        web_keys = _web_settable_keys_reaching_sink(conn, fe, sink_anchor)
+        nvram_key = web_keys[0] if web_keys else None
     return TriageCandidate(
         review_status=REVIEW_STATUS_BY_REACHABILITY.get(reach, reach),
         reachability_status=reach,
@@ -815,6 +990,7 @@ def _candidate(conn: sqlite3.Connection, row: sqlite3.Row) -> TriageCandidate:
             sink_class=sink_class,
             entry_reach=entry_reach,
             nvram_key=nvram_key,
+            sink_anchor=sink_anchor,
         ),
     )
 
@@ -877,7 +1053,16 @@ def filter_candidates(
 # The agent changes only the spine (--sort-by) and the filters; the iron law is fixed. This is what
 # makes every lens safe: no angle can bury a candidate by "not yet known".
 
-_CONTROLLABILITY_RANK: dict[str, int] = {"free": 3, "constrained": 2, "unknown": 1, "constant": 0}
+# Controllability bands, high rank first. proven-controllable (web-settable / external input) is the
+# NEW top band, ABOVE the optimistic 'free' (source_kind=free_string): a hard SaTC fact outranks an
+# optimistic guess. constant stays the bottom (the demotion iron law sinks it via _is_proven_safe).
+_CONTROLLABILITY_RANK: dict[str, int] = {
+    "controllable": 4,
+    "free": 3,
+    "constrained": 2,
+    "unknown": 1,
+    "constant": 0,
+}
 _REACH_RANK: dict[str, int] = {"found": 2, "unknown": 1, "blocked": 0}
 _VALID_SPINES = frozenset({"impact", "sink_impact", "reachability", "controllability", "by-sink"})
 
@@ -1176,5 +1361,5 @@ def explain_candidate(conn: sqlite3.Connection, evidence_ref: str) -> CandidateE
         source_kind=candidate.source_kind,
         controllability=candidate.dim("controllability").value,
         sink_impact=candidate.dim("sink_impact").value,
-        sink_arg_provenance_summary=_sink_provenance_summary(_row_get(row, "flow_evidence")),
+        sink_arg_provenance_summary=_sink_provenance_summary(conn, _row_get(row, "flow_evidence")),
     )

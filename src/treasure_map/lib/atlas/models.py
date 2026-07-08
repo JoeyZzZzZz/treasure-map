@@ -100,3 +100,18 @@ class NvramDefaultRow:
     binary: str | None = None
     id: int | None = None
     created_at: str | None = None
+
+
+@dataclass(frozen=True)
+class WebFormFieldRow:
+    """Mirrors one web_form_fields row: a USER-EDITABLE web form field name, flattened from
+    analysis.db (SaTC front-end surface). field_keyword is the asset's OWN content. A neutral
+    front-end fact — the web_settable answer is a QUERY crossing these against the back-end
+    nvram_key_flow constant keys, never a stored verdict."""
+
+    source_run_id: str | None
+    field_keyword: str | None
+    source_asset: str | None = None
+    source_rule: str | None = None
+    id: int | None = None
+    created_at: str | None = None

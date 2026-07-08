@@ -38,6 +38,7 @@ def _make_db(
     binaries: list[dict[str, object]],
     *,
     xrefs: list[tuple[int, int]] | None = None,
+    web_form_fields: list[dict[str, object]] | None = None,
 ) -> Path:
     db_path = tmp_path / "analysis.db"
     conn = open_db(db_path)
@@ -84,6 +85,15 @@ def _make_db(
                 "(binary_id, key, default_value, flags, member_index) VALUES (?, ?, ?, ?, ?)",
                 (bid, m.get("key"), m.get("default_value"), m.get("flags"), m.get("index")),
             )
+    for ff in web_form_fields or []:
+        cur = conn.execute(
+            "INSERT INTO non_binary_files (kind, name, path) VALUES ('web_asset', ?, ?)",
+            (ff.get("asset", "Form.asp"), ff.get("asset", "Form.asp")),
+        )
+        conn.execute(
+            "INSERT INTO web_form_fields (file_id, field_keyword, source_rule) VALUES (?, ?, ?)",
+            (cur.lastrowid, ff.get("key"), ff.get("rule", "input")),
+        )
     conn.commit()
     conn.close()
     return db_path
@@ -524,6 +534,54 @@ def test_router_defaults_replace_by_run_is_idempotent(tmp_path: Path) -> None:
     run_analyzer2(db, atlas, source_run_id="run_rd2")
     run_analyzer2(db, atlas, source_run_id="run_rd2")
     assert len(_nvram_defaults_rows(atlas)) == 1  # not 2
+
+
+# ── M1: editable web form fields flattened to the atlas ──────────────────────────────
+
+
+def test_web_form_fields_flattened_to_atlas(tmp_path: Path) -> None:
+    db = _make_db(
+        tmp_path,
+        [{"name": "webd", "funcs": [_nvram_fn("noop", [])]}],
+        web_form_fields=[
+            {"key": "fb_comment", "rule": "textarea", "asset": "Feedback.asp"},
+            {"key": "wl_ssid", "rule": "input", "asset": "Wireless.asp"},
+        ],
+    )
+    atlas = tmp_path / "atlas.db"
+    stats = run_analyzer2(db, atlas, source_run_id="run_wff")
+    assert stats.web_form_fields_written == 2
+    conn = open_atlas(atlas)
+    try:
+        rows = {
+            r["field_keyword"]: r["source_asset"]
+            for r in conn.execute(
+                "SELECT field_keyword, source_asset FROM web_form_fields "
+                "WHERE source_run_id='run_wff'"
+            )
+        }
+    finally:
+        conn.close()
+    assert rows == {"fb_comment": "Feedback.asp", "wl_ssid": "Wireless.asp"}
+
+
+def test_web_form_fields_replace_by_run_is_idempotent(tmp_path: Path) -> None:
+    db = _make_db(
+        tmp_path,
+        [{"name": "webd", "funcs": [_nvram_fn("noop", [])]}],
+        web_form_fields=[{"key": "fb_comment", "rule": "textarea"}],
+    )
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_wff2")
+    run_analyzer2(db, atlas, source_run_id="run_wff2")
+    conn = open_atlas(atlas)
+    try:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM web_form_fields WHERE source_run_id='run_wff2'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert n == 1  # not 2
 
 
 # ── evidence neutralization: raw literal never persisted ────────────────────────────

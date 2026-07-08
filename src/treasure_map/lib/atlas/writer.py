@@ -11,7 +11,12 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 
-from treasure_map.lib.atlas.models import InstanceRow, NvramDefaultRow, NvramFlowRow
+from treasure_map.lib.atlas.models import (
+    InstanceRow,
+    NvramDefaultRow,
+    NvramFlowRow,
+    WebFormFieldRow,
+)
 from treasure_map.lib.errors import ConfigError
 
 _VALID_ORIGINS = ("custom", "vendor_modified_oss", "stock_oss_known", "unknown")
@@ -122,6 +127,38 @@ def add_nvram_default_rows(
             )
             for r in rows
         ],
+    )
+    if commit:
+        conn.commit()
+    return len(rows)
+
+
+def delete_run_web_form_fields(
+    conn: sqlite3.Connection, source_run_id: str, *, commit: bool = True
+) -> int:
+    """Delete all web_form_fields rows of one run (replace-by-run refresh). Returns rows deleted.
+
+    Touches ONLY this run_id's rows. With commit=False the delete joins the caller's transaction."""
+    cur = conn.execute("DELETE FROM web_form_fields WHERE source_run_id = ?", (source_run_id,))
+    if commit:
+        conn.commit()
+    return cur.rowcount
+
+
+def add_web_form_field_rows(
+    conn: sqlite3.Connection, rows: list[WebFormFieldRow], *, commit: bool = True
+) -> int:
+    """Insert flattened editable-web-form-field rows in one batch; return the count.
+
+    Neutral front-end facts (an editable field name + the asset it came from). No verdict —
+    web_settable crosses these against the back-end nvram_key_flow constant keys."""
+    if not rows:
+        return 0
+    conn.executemany(
+        """INSERT INTO web_form_fields
+           (source_run_id, field_keyword, source_asset, source_rule)
+           VALUES (?, ?, ?, ?)""",
+        [(r.source_run_id, r.field_keyword, r.source_asset, r.source_rule) for r in rows],
     )
     if commit:
         conn.commit()

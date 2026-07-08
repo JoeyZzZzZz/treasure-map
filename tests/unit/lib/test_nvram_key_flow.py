@@ -9,12 +9,17 @@ from __future__ import annotations
 from pathlib import Path
 
 from treasure_map.lib.atlas.connection import open_atlas
-from treasure_map.lib.atlas.models import NvramDefaultRow, NvramFlowRow
-from treasure_map.lib.atlas.writer import add_nvram_default_rows, add_nvram_flow_rows
+from treasure_map.lib.atlas.models import NvramDefaultRow, NvramFlowRow, WebFormFieldRow
+from treasure_map.lib.atlas.writer import (
+    add_nvram_default_rows,
+    add_nvram_flow_rows,
+    add_web_form_field_rows,
+)
 from treasure_map.lib.query import get_nvram_key_flow
 from treasure_map.lib.query.nvram import (
     _template_matches,
     _template_to_regex,
+    _web_settable,
     template_has_anchor,
 )
 
@@ -23,6 +28,7 @@ def _seed(
     tmp_path: Path,
     rows: list[NvramFlowRow],
     defaults: list[NvramDefaultRow] | None = None,
+    form_fields: list[WebFormFieldRow] | None = None,
 ) -> Path:
     atlas = tmp_path / "atlas.db"
     conn = open_atlas(atlas)
@@ -30,9 +36,17 @@ def _seed(
         add_nvram_flow_rows(conn, rows)
         if defaults:
             add_nvram_default_rows(conn, defaults)
+        if form_fields:
+            add_web_form_field_rows(conn, form_fields)
     finally:
         conn.close()
     return atlas
+
+
+def _field(keyword: str, *, rule: str = "input", run: str = "run_a") -> WebFormFieldRow:
+    return WebFormFieldRow(
+        source_run_id=run, field_keyword=keyword, source_asset="Feedback.asp", source_rule=rule
+    )
 
 
 def _default(
@@ -271,76 +285,121 @@ def test_direct_writer_but_no_direct_reader_warns_wrapper(tmp_path: Path) -> Non
     assert any("empty readers" in n and "non-literal" in n for n in res["notes"])
 
 
-# ── web_settable: source-side writability from router_defaults (naming-bridge phase 1) ──
+# ── web_settable: source-side writability by the SaTC front-end x back-end cross (M2) ──
 
 
-def test_web_settable_true_carries_default_and_flags(tmp_path: Path) -> None:
-    # The OAuth acceptance shape: the key IS a router_defaults member -> in_router_defaults True,
-    # with its default (an empty string, distinct from null) and flags surfaced as facts.
+def test_web_settable_yes_when_frontend_editable_and_backend_key(tmp_path: Path) -> None:
+    # The money path: an editable front-end field AND a back-end nvram key -> a web-settable key.
     atlas = _seed(
         tmp_path,
-        [_flow("oauth_auth_code", "constant", "httpd", "save", "write")],
-        defaults=[_default("oauth_auth_code", default_value="", flags=0x80, member_index=894)],
+        [_flow("fb_comment", "constant", "httpd", "save", "write")],
+        form_fields=[_field("fb_comment", rule="textarea")],
     )
     conn = open_atlas(atlas)
     try:
-        res = get_nvram_key_flow(conn, "oauth_auth_code")
+        ws = _web_settable(conn, "fb_comment")
+        res = get_nvram_key_flow(conn, "fb_comment")
     finally:
         conn.close()
-    ws = res["web_settable"]
-    assert ws["in_router_defaults"] is True
-    assert ws["default_value"] == ""  # a real empty-string default, not null
-    assert ws["flags"] == 0x80
-    assert "router_defaults" in ws["source"]
+    assert ws["web_settable"] == "yes"
+    assert ws["frontend"] is True and ws["backend"] is True
+    assert res["web_settable"]["web_settable"] == "yes"  # surfaced through the key-flow reader
 
 
-def test_web_settable_false_only_when_located_and_complete(tmp_path: Path) -> None:
-    # Table located (has members) AND complete (no unresolved) AND key absent -> a definite False.
+def test_web_settable_no_backend_key_but_no_editable_field_is_readonly_display(
+    tmp_path: Path,
+) -> None:
+    # firmver: a real back-end nvram key, but the front-end only ever shows it (hidden input) ->
+    # not collected as editable -> a read-only DISPLAY, a definite 'no' (front-end table non-empty).
     atlas = _seed(
         tmp_path,
-        [],
-        defaults=[_default("sw_mode", default_value="0", flags=0, member_index=0)],
+        [_flow("firmver", "constant", "httpd", "show", "read")],
+        form_fields=[_field("fb_comment", rule="textarea")],  # a non-empty front-end surface
     )
     conn = open_atlas(atlas)
     try:
-        res = get_nvram_key_flow(conn, "not_a_member")
+        ws = _web_settable(conn, "firmver")
     finally:
         conn.close()
-    assert res["web_settable"]["in_router_defaults"] is False
+    assert ws["web_settable"] == "no"
+    assert ws["backend"] is True and ws["frontend"] is False
 
 
-def test_web_settable_uncertain_when_table_not_located(tmp_path: Path) -> None:
-    # ★ false-negative red line: no router_defaults rows in the atlas -> uncertain, NEVER False.
+def test_web_settable_no_editable_field_but_no_backend_op_is_ui_control(tmp_path: Path) -> None:
+    # Connect_btn: an editable-looking field with no back-end nvram op -> a pure UI control -> 'no'.
+    atlas = _seed(
+        tmp_path,
+        [_flow("fb_comment", "constant", "httpd", "save", "write")],  # non-empty back-end surface
+        form_fields=[_field("Connect_btn")],
+    )
+    conn = open_atlas(atlas)
+    try:
+        ws = _web_settable(conn, "Connect_btn")
+    finally:
+        conn.close()
+    assert ws["web_settable"] == "no"
+    assert ws["frontend"] is True and ws["backend"] is False
+
+
+def test_web_settable_uncertain_when_frontend_not_collected(tmp_path: Path) -> None:
+    # ★ false-negative red line: no web_form_fields rows (M1 not run) -> uncertain, NEVER 'no'.
     atlas = _seed(tmp_path, [_flow("sw_mode", "constant", "rc", "set_mode", "write")])
     conn = open_atlas(atlas)
     try:
-        res = get_nvram_key_flow(conn, "sw_mode")
+        ws = _web_settable(conn, "sw_mode")
     finally:
         conn.close()
-    ws = res["web_settable"]
-    assert ws["in_router_defaults"] == "uncertain"
-    assert ws["in_router_defaults"] is not False
-    assert "not located" in ws["reason"]
+    assert ws["web_settable"] == "uncertain"
+    assert ws["web_settable"] != "no"
 
 
-def test_web_settable_uncertain_when_located_but_incomplete(tmp_path: Path) -> None:
-    # Table located but a member failed to parse (key NULL row) -> a not-found key is uncertain (it
-    # could be the unparsed member), never a false "not settable".
+def test_web_settable_yes_via_wl_index_normalization(tmp_path: Path) -> None:
+    # The wl mapping: a front-end generic 'wl_ssid' matches a back-end indexed 'wl0_ssid'.
     atlas = _seed(
         tmp_path,
-        [],
-        defaults=[
-            _default("sw_mode", default_value="0", flags=0, member_index=0),
-            _default(None, member_index=500),  # an unresolved member -> table is incomplete
-        ],
+        [_flow("wl0_ssid", "constant", "httpd", "save", "write")],
+        form_fields=[_field("wl_ssid", rule="input")],
     )
     conn = open_atlas(atlas)
     try:
-        res = get_nvram_key_flow(conn, "some_other_key")
+        ws = _web_settable(conn, "wl0_ssid")
     finally:
         conn.close()
-    assert res["web_settable"]["in_router_defaults"] == "uncertain"
-    assert "incomplete" in res["web_settable"]["reason"]
+    assert ws["web_settable"] == "yes"
+
+
+def test_web_settable_uncertain_for_naming_variant_field(tmp_path: Path) -> None:
+    # http_username: the editable field is http_username_x (a naming variant); the bare key is
+    # front-end-missed -> uncertain, NOT a false 'no' (a variant may be the editable mirror).
+    atlas = _seed(
+        tmp_path,
+        [_flow("http_username", "constant", "httpd", "read_cred", "read")],
+        form_fields=[_field("http_username_x", rule="input")],
+    )
+    conn = open_atlas(atlas)
+    try:
+        ws = _web_settable(conn, "http_username")
+    finally:
+        conn.close()
+    assert ws["web_settable"] == "uncertain"
+    assert ws["web_settable"] != "no"
+
+
+def test_web_settable_router_defaults_rides_along_as_auxiliary(tmp_path: Path) -> None:
+    # router_defaults is kept as an auxiliary reference field, not the primary judgement.
+    atlas = _seed(
+        tmp_path,
+        [_flow("fb_comment", "constant", "httpd", "save", "write")],
+        defaults=[_default("fb_comment", default_value="", flags=0x80, member_index=894)],
+        form_fields=[_field("fb_comment", rule="textarea")],
+    )
+    conn = open_atlas(atlas)
+    try:
+        ws = _web_settable(conn, "fb_comment")
+    finally:
+        conn.close()
+    assert ws["web_settable"] == "yes"
+    assert ws["router_defaults"]["in_router_defaults"] is True  # auxiliary, still surfaced
 
 
 # ── template-to-regex grammar (unit) ────────────────────────────────────────────────

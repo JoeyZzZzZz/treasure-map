@@ -239,6 +239,26 @@ CREATE TABLE IF NOT EXISTS web_endpoints (
 );
 
 CREATE INDEX IF NOT EXISTS idx_web_endpoints_file ON web_endpoints(file_id);
+
+-- Web 表单可编辑字段 (WebAsset ingester sub-table; FK -> non_binary_files)
+-- SaTC front-end surface: the names of USER-EDITABLE form fields the firmware's own web assets
+-- expose (<input> non-hidden / <textarea> / <select> / a JS form-value assignment / an
+-- nvram_char_to_ascii form-fill). field_keyword is the asset's OWN content (evidence), never
+-- generated. A read-only round-trip field (<input type=hidden> populated from nvram_get, e.g. a
+-- firmware-version echo) is DELIBERATELY excluded: it is displayed, not settable. web_settable
+-- crosses these against the back-end nvram_key_flow constant keys to tell an editable web key from a
+-- read-only display key. NO rows for a run means the front-end was not collected (web_settable then
+-- reads 'uncertain', NEVER 'not settable' — the false-negative red line).
+CREATE TABLE IF NOT EXISTS web_form_fields (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id       INTEGER NOT NULL,
+    field_keyword TEXT,                 -- editable form field name (the asset's OWN content)
+    source_rule   TEXT,                 -- input / textarea / select / js_assign / nvram_ascii
+    FOREIGN KEY(file_id) REFERENCES non_binary_files(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_web_form_fields_file ON web_form_fields(file_id);
+CREATE INDEX IF NOT EXISTS idx_web_form_fields_kw   ON web_form_fields(field_keyword);
 CREATE INDEX IF NOT EXISTS idx_components_binary  ON components(binary_id);
 CREATE INDEX IF NOT EXISTS idx_components_product ON components(product);
 CREATE INDEX IF NOT EXISTS idx_cve_binary         ON cve_matches(binary_id);
