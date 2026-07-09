@@ -22,6 +22,7 @@ from treasure_map.lib import facts
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import InstanceRow, NvramFlowRow
 from treasure_map.lib.atlas.writer import add_instance, add_nvram_flow_rows, upsert_pattern
+from treasure_map.lib.query.triage import Dimension, TriageCandidate
 from treasure_map.lib.storage.connection import open_db
 
 _EXPECTED_TOOLS = {
@@ -249,10 +250,15 @@ def test_list_candidates_carries_anchor_entry_reach_and_note(tmp_path: Path) -> 
     assert any("optimistic" in c.lower() for c in out["caveats"])
     (cand,) = out["candidates"]
     assert cand["evidence_ref"] == "run_m#fn1@cmd"  # anchor present
-    assert cand["entry_reach"] == "entry:web"  # entry-reach surfaced as a derived mechanistic label
     assert "score" not in cand  # the collapsed score is gone
-    names = {d["name"] for d in cand["dimensions"]}  # replaced by first-class dimension layers
-    assert "controllability" in names and "sink_impact" in names
+    # compact row (M1): controllability is a spine state:value label (ALWAYS present); every other
+    # axis rides the AXIS-AGNOSTIC carry rule. entry:web is an established mechanistic label, so the
+    # row carries reachability=proven:entry:web — the cross-step seam (step-2's Dimension reaches
+    # the compact serializer) and sink_impact rides the same rule.
+    assert cand["controllability"] == "unknown:unknown"
+    assert cand["dimensions"]["reachability"] == "proven:entry:web"
+    assert cand["dimensions"]["sink_impact"] == "proven:cmd"
+    assert "reachability" not in cand  # the raw entry_reach top-level field is folded into the axis
 
 
 def test_list_candidates_exposes_view_catalog_with_when_to_use(tmp_path: Path) -> None:
@@ -529,7 +535,10 @@ def test_explain_and_list_surface_source_kind(tmp_path: Path) -> None:
     # still also carried on the nested candidate (unchanged)
     assert ex["candidate"]["source_kind"] == "free_string"
     (cand,) = tools["list_candidates"]()["candidates"]
-    assert cand["source_kind"] == "free_string"
+    # the compact row folds source_kind into the resolved controllability label (free_string with no
+    # provenance verdict -> proven:free); the RAW source_kind stays on explain, not the list row.
+    assert cand["controllability"] == "proven:free"
+    assert "source_kind" not in cand
 
 
 def test_explain_top_level_exposes_source_kind_and_class(tmp_path: Path) -> None:
@@ -554,9 +563,19 @@ def test_source_kind_defaults_unknown_and_no_regression(tmp_path: Path) -> None:
     assert "score" not in ex["candidate"]  # collapsed score gone; dimension layers replace it
     assert {d["name"] for d in ex["candidate"]["dimensions"]}  # non-empty layer set
     cand = tools["list_candidates"]()["candidates"][0]
-    assert cand["source_kind"] == "unknown"
-    for key in ("evidence_ref", "source_class", "dimensions", "entry_reach", "sink_class"):
-        assert key in cand  # no prior key dropped (score replaced by dimensions)
+    # compact row: source_kind unknown + no verdict -> controllability unknown:unknown (folded, not
+    # a raw row field); the raw source_kind now lives on explain only.
+    assert cand["controllability"] == "unknown:unknown"
+    assert "source_kind" not in cand
+    for key in (
+        "evidence_ref",
+        "controllability",
+        "dimensions",
+        "sink_class",
+        "binary",
+        "function",
+    ):
+        assert key in cand  # the compact spine keys are present
     assert "score" not in cand
 
 
@@ -573,6 +592,148 @@ def test_get_functions_referencing_string_tool(tmp_path: Path) -> None:
     assert r["match_kind"] == "pseudocode_text_substring"
     assert "text" in r["note"].lower()
     assert tools["get_functions_referencing_string"]("do_fwd", "libc.so")["functions"] == []
+
+
+# ── compact-row serializer contract (compact_row_contract.md C1–C8) ────────────────────
+
+
+def _mk_candidate(dimensions: list[Dimension], **over: object) -> TriageCandidate:
+    """A synthetic TriageCandidate for the compact-row serializer contract tests (no DB)."""
+    base: dict[str, object] = dict(
+        review_status="to-verify",
+        reachability_status="unknown",
+        function="FUN_1",
+        sink_anchor="system",
+        source_class="external_input",
+        sink_class="cmd",
+        blocking_mechanism=None,
+        origin="custom",
+        source_run_id="run_m",
+        evidence_ref="run_m#fn1@cmd",
+        binary_path="usr/sbin/webd",
+        structural_fingerprint="fp_1",
+        nvram_source_key=None,
+        dimensions=tuple(dimensions),
+    )
+    base.update(over)
+    return TriageCandidate(**base)  # type: ignore[arg-type]
+
+
+def test_compact_row_carries_established_dims_and_omits_unknown() -> None:
+    # ★ C8-1 general carry: a non-spine dimension with an established state joins the row; an
+    # unknown one is omitted (the baseline). controllability is spine — always present, never in the
+    # carried dict.
+    dims = [
+        Dimension("controllability", "unknown", "unknown", "src"),
+        Dimension("reachability", "proven", "entry:web", "src"),
+        Dimension("filtering", "unknown", "unknown", "src"),
+    ]
+    row = mcp_app._candidate_row(_mk_candidate(dims), rank=0)
+    assert row["dimensions"] == {"reachability": "proven:entry:web"}
+    assert "filtering" not in row["dimensions"]  # unknown state omitted
+    assert "controllability" not in row["dimensions"]  # promoted to spine, not double-emitted
+    assert row["controllability"] == "unknown:unknown"  # spine: present even when unknown
+
+
+def test_compact_row_carries_a_new_axis_without_a_whitelist() -> None:
+    # ★ C8-4 marker-aware (anti-'hidden marker', the recurring root cause): a BRAND-NEW axis that
+    # is a Dimension with an established state MUST reach the compact row automatically — the carry
+    # loop hardcodes NO dimension whitelist, so a future source=param axis is picked up for free.
+    dims = [
+        Dimension("controllability", "unknown", "unknown", "src"),
+        Dimension("source", "proven", "param", "pattern.source_class=external_input"),
+    ]
+    row = mcp_app._candidate_row(_mk_candidate(dims), rank=3)
+    assert row["dimensions"]["source"] == "proven:param"
+
+
+def test_compact_row_baseline_is_unknown_state_not_a_modal_value() -> None:
+    # ★ C8-3 baseline semantics: carry keys on the UNKNOWN state, never on a per-firmware modal
+    # value. A dimension whose VALUE looks like a common reading but whose STATE is unknown is
+    # omitted; only an established state is carried.
+    dims = [
+        Dimension("controllability", "unknown", "unknown", "src"),
+        Dimension("reachability", "unknown", "entry:web", "src"),  # value looks 'found', state ?
+        Dimension("sink_impact", "proven", "cmd", "src"),
+    ]
+    row = mcp_app._candidate_row(_mk_candidate(dims), rank=0)
+    assert (
+        "reachability" not in row["dimensions"]
+    )  # unknown state omitted despite a real-looking value
+    assert row["dimensions"]["sink_impact"] == "proven:cmd"
+
+
+def test_compact_row_keeps_excluded_visible() -> None:
+    # ★ C8-2 demotion iron law: a proven-safe (excluded) dimension is DEMOTED but stays VISIBLE —
+    # hiding it would read as 'not judged' (a re-review waste) or 'still dangerous'.
+    dims = [
+        Dimension("controllability", "unknown", "unknown", "src"),
+        Dimension("filtering", "excluded", "sanitized", "src"),
+    ]
+    row = mcp_app._candidate_row(_mk_candidate(dims), rank=0)
+    assert row["dimensions"]["filtering"] == "excluded:sanitized"
+
+
+def test_compact_row_axis_prefixes_do_not_mix() -> None:
+    # ★ C8-5 axis prefixes: controllability (spine) and reachability (carried) both established —
+    # each label reads its own axis, none collapsed into the other.
+    dims = [
+        Dimension("controllability", "proven", "controllable", "src"),
+        Dimension("reachability", "proven", "entry:script", "src"),
+    ]
+    row = mcp_app._candidate_row(_mk_candidate(dims), rank=0)
+    assert row["controllability"] == "proven:controllable"
+    assert row["dimensions"]["reachability"] == "proven:entry:script"
+
+
+def test_compact_list_envelope_carries_legend(tmp_path: Path) -> None:
+    # ★ C8-6: the compact list envelope states once that an omitted dimension is unknown, NOT proven
+    # safe (unknown ≠ safe), and points at explain for the full note.
+    tools = _tools(tmp_path)
+    out = tools["list_candidates"]()
+    legend = out["legend"].lower()
+    assert "unknown" in legend and "not proven safe" in legend
+    assert "explain_candidate" in out["legend"]
+
+
+def test_compact_row_reachability_seam_real_dimension(tmp_path: Path) -> None:
+    # ★ cross-step seam (the contract anchor): reachability became a Dimension in step 2, but the
+    # compact serializer did not exist then. Verify with the REAL dimension (not a synthetic one):
+    # an entry:web candidate carries reachability=proven:entry:web; a no-site candidate OMITS it.
+    d_web = tmp_path / "web"
+    d_web.mkdir()
+    d_no = tmp_path / "nosite"
+    d_no.mkdir()
+    web = mcp_app.make_tools(_mk_analysis(d_web), _mk_atlas(d_web))["list_candidates"]()
+    (web_cand,) = web["candidates"]
+    assert web_cand["dimensions"]["reachability"] == "proven:entry:web"
+    nosite = mcp_app.make_tools(_mk_analysis(d_no), _mk_multi_atlas(d_no), run_id="run_m")[
+        "list_candidates"
+    ]()
+    assert nosite["candidates"]  # the corpus is non-empty
+    assert all("reachability" not in c["dimensions"] for c in nosite["candidates"])
+
+
+def test_note_moves_from_list_to_explain(tmp_path: Path) -> None:
+    # ★ M2: the per-dimension note is DROPPED from the compact list row (each dim is one bare
+    # state:value label) and preserved IN FULL on explain_candidate — moved, never deleted.
+    tools = _tools(tmp_path)
+    (cand,) = tools["list_candidates"]()["candidates"]
+    assert all(
+        isinstance(v, str) for v in cand["dimensions"].values()
+    )  # bare labels, no note dicts
+    assert "note" not in cand  # the row carries no per-candidate note dump
+    ex = tools["explain_candidate"]("run_m#fn1@cmd")
+    dims = [d for d in ex["candidate"]["dimensions"]]
+    assert any(d["note"] for d in dims)  # explain keeps the full per-dimension note
+
+
+def test_mcp_get_strings_accepts_offset_and_returns_paging(tmp_path: Path) -> None:
+    # ★ M6: the MCP get_strings wrapper threads ``offset`` into the lossless byte-paging envelope.
+    tools = _tools(tmp_path)
+    r = tools["get_strings"](binary="webd", offset=0)
+    assert "paging" in r and r["paging"]["offset"] == 0
+    assert r["paging"]["next_offset"] is None  # the synthetic webd fits one page
 
 
 # ── public-surface neutrality: the server is a published artifact, stricter discipline ──

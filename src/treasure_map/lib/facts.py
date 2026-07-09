@@ -410,52 +410,129 @@ def _truncated_binaries(conn: sqlite3.Connection, binary_id: int | None = None) 
     return [r["name"] for r in rows]
 
 
+# Default byte budget for ONE fact-tool page. A wide dispatcher's string table (400k+ chars in one
+# result) overruns a single MCP return, so a large result is paged LOSSLESSLY by cumulative
+# serialized size: the tail stays REACHABLE via next_offset and is NEVER summarized away. A summary
+# would let the tool decide which string matters and could drop the one the consumer is hunting —
+# violating "surface facts, don't decide". Summaries are opt-in only, never the default.
+_FACT_PAGE_CHARS = 20000
+
+
+def _byte_page(
+    rows: list[dict[str, Any]], offset: int, max_chars: int
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Slice ``rows`` from ``offset`` into a page whose serialized size stays within ``max_chars``.
+
+    Lossless byte-pagination shared across fact tools: pages by ROW INDEX (a stable offset), never
+    dropping or summarizing a row, and always emits at least one row so a single oversized row still
+    makes progress. Returns (page, envelope) where the envelope is the STABLE shape:
+    ``returned`` / ``offset`` / ``next_offset`` / ``truncated`` (this result was byte-paged, a tail
+    follows) / ``total_matched`` (rows in the full set) / ``total_chars`` (its serialized size) /
+    ``how_to_get_rest``. Distinct from any export-cap ``truncated`` a caller reports up top."""
+    lo = max(0, offset)
+    total = len(rows)
+    total_chars = sum(len(str(r)) for r in rows)
+    page: list[dict[str, Any]] = []
+    used = 0
+    i = lo
+    while i < total:
+        cost = len(str(rows[i]))
+        if page and used + cost > max_chars:
+            break
+        page.append(rows[i])
+        used += cost
+        i += 1
+    truncated = i < total
+    envelope = {
+        "returned": len(page),
+        "offset": lo,
+        "next_offset": i if truncated else None,
+        "truncated": truncated,
+        "total_matched": total,
+        "total_chars": total_chars,
+        "how_to_get_rest": (
+            f"more rows remain — call again with offset={i} to page the tail losslessly "
+            "(no summary; every row is preserved)"
+            if truncated
+            else None
+        ),
+    }
+    return page, envelope
+
+
 def get_strings(
     conn: sqlite3.Connection,
     *,
     binary: str | None = None,
     func: str | None = None,
     value: str | None = None,
+    offset: int = 0,
+    max_chars: int = _FACT_PAGE_CHARS,
 ) -> dict[str, Any]:
     """Recorded strings (value/address/category), located one step for the consumer.
 
     Two modes: (1) ``value`` searches by string CONTENT (substring), returning every hit with its
     address + owning binary so a consumer locates "this string lives in <binary> at <address>" in
-    one call — optionally narrowed to ``binary``; (2) without ``value``, lists a binary's strings,
-    optionally narrowed to ``func``'s address range (best-effort by address; the schema has no
-    string->func link). The ``note`` states honestly that the reverse "which function references
-    this string" lookup is NOT provided — that index does not exist, and we do not fake it."""
+    one call — optionally narrowed to ``binary`` and/or to ``func``'s address range; (2) without
+    ``value``, lists a binary's strings, optionally narrowed to ``func``'s address range
+    (best-effort by address; the schema has no string->func link). Large results are paged
+    LOSSLESSLY by byte size under ``paging`` (``offset`` / ``next_offset``) — the tail is reachable,
+    never summarized. The ``note`` states honestly that the reverse "which function references this
+    string" lookup is NOT provided — that index does not exist, and we do not fake it."""
     if value is not None:
+        # ★ M6: value mode now honours ``func`` (previously it was silently dropped — a search
+        # could not be scoped to a function). Resolve func first; a non-resolving func is SURFACED
+        # (not-found / ambiguous), never ignored. func narrows the search to its address range.
+        fbin: str | None = None
+        lo = hi = None
+        if func is not None:
+            frow, miss = _resolve_one(conn, func, binary)
+            if frow is None:
+                assert miss is not None
+                return miss
+            fbin = frow["binary_name"]
+            lo = _addr_int(frow["address"])
+            if lo is not None and frow["size_bytes"]:
+                hi = lo + int(frow["size_bytes"])
         sql = (
             "SELECT s.value, s.address, s.category, b.name AS bn FROM strings s "
             "JOIN binaries b ON b.id = s.binary_id WHERE s.value LIKE ?"
         )
         params: list[Any] = [f"%{value}%"]
-        if binary is not None:
-            bid = _binary_id(conn, binary)
+        scope_bin = binary if binary is not None else fbin
+        bid: int | None = None
+        if scope_bin is not None:
+            bid = _binary_id(conn, scope_bin)
             if bid is None:
-                return {"found": False, "query": {"binary": binary, "value": value}}
+                return {"found": False, "query": {"binary": scope_bin, "value": value}}
             sql += " AND s.binary_id = ?"
             params.append(bid)
         sql += " ORDER BY b.name, s.address"
-        hits = [
-            {
-                "value": r["value"],
-                "address": r["address"],
-                "binary": r["bn"],
-                "category": r["category"],
-            }
-            for r in conn.execute(sql, params)
-        ]
+        hits: list[dict[str, Any]] = []
+        for r in conn.execute(sql, params):
+            if lo is not None and hi is not None:
+                a = _addr_int(r["address"])
+                if a is None or not (lo <= a < hi):
+                    continue
+            hits.append(
+                {
+                    "value": r["value"],
+                    "address": r["address"],
+                    "binary": r["bn"],
+                    "category": r["category"],
+                }
+            )
+        page, paging = _byte_page(hits, offset, max_chars)
         result: dict[str, Any] = {
             "found": True,
-            "query": {"value": value, "binary": binary},
-            "strings": hits,
+            "query": {"value": value, "binary": binary, "func": func},
+            "strings": page,
+            "paging": paging,
             "note": _STRING_REF_NOTE,
         }
         # Silent-drop guard: if a binary in scope was truncated at the export cap, a content search
         # can MISS a hit dropped past the cap — an empty/short result is NOT proof of absence there.
-        trunc_bins = _truncated_binaries(conn, bid if binary is not None else None)
+        trunc_bins = _truncated_binaries(conn, bid if scope_bin is not None else None)
         if trunc_bins:
             result["search_may_be_incomplete"] = True
             result["truncated_binaries"] = trunc_bins
@@ -494,14 +571,19 @@ def get_strings(
     ).fetchone()
     truncated = bool(meta and meta["strings_truncated"])
     total = int(meta["strings_total"]) if meta and meta["strings_total"] is not None else len(rows)
+    # ★ M6: byte-paginate the (func-narrowed) items so a huge by-binary listing (a wide dispatcher's
+    # 400k+ of strings) is reachable page by page. ``paging.truncated`` (byte-paging) is DISTINCT
+    # from the top-level ``truncated`` below (the export-cap prefix flag) — both can hold at once.
+    page_items, paging = _byte_page(items, offset, max_chars)
     out: dict[str, Any] = {
         "found": True,
         "binary": binary,
         "function": func,
-        "strings": items,
+        "strings": page_items,
+        "paging": paging,
         "stored": len(rows),  # strings held for this binary (before any func-range narrowing)
         "total": total,  # true count of matching defined strings in the binary
-        "truncated": truncated,
+        "truncated": truncated,  # EXPORT-CAP prefix flag (not the byte-paging one in ``paging``)
         "note": _STRING_REF_NOTE,
     }
     # Silent-drop guard: a truncated binary's stored list is only a prefix, so a string NOT listed

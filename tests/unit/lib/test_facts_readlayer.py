@@ -321,6 +321,87 @@ def test_get_strings_by_value_locates_with_binary_and_note(tmp_path: Path) -> No
     conn.close()
 
 
+def _strings_db(tmp_path: Path) -> Path:
+    """One binary 'rc' with a function spanning [0x1000, 0x1100) and three 'oauth' strings — two
+    inside that range, one outside — to exercise func-scoped value search and byte-pagination."""
+    db = tmp_path / "s.db"
+    conn = open_db(db)
+    conn.execute(
+        "INSERT INTO binaries (id, name, path, sha256) VALUES (1, 'rc', 'sbin/rc', ?)",
+        ("a" * 64,),
+    )
+    conn.execute(
+        "INSERT INTO functions (id, binary_id, name, address, size_bytes, pseudocode) "
+        "VALUES (1, 1, 'dispatch', '0x1000', 256, 'void d(){}')"
+    )
+    conn.execute(
+        "INSERT INTO strings (binary_id, value, address) VALUES (1, 'oauth_in_a', '0x1010')"
+    )
+    conn.execute(
+        "INSERT INTO strings (binary_id, value, address) VALUES (1, 'oauth_in_b', '0x1080')"
+    )
+    conn.execute(
+        "INSERT INTO strings (binary_id, value, address) VALUES (1, 'oauth_out', '0x2000')"
+    )
+    conn.commit()
+    conn.close()
+    return db
+
+
+def test_get_strings_value_mode_honours_func(tmp_path: Path) -> None:
+    # ★ M6: value mode now scopes to a function's address range (func was previously DROPPED, so
+    # "a substring inside this function" could not be asked — forcing a full-binary page).
+    conn = facts.open_analysis_ro(_strings_db(tmp_path))
+    scoped = facts.get_strings(conn, binary="rc", func="dispatch", value="oauth")
+    assert {s["value"] for s in scoped["strings"]} == {
+        "oauth_in_a",
+        "oauth_in_b",
+    }  # out-of-range cut
+    # without func the same search returns all three — func is what narrows it
+    allv = facts.get_strings(conn, binary="rc", value="oauth")
+    assert {s["value"] for s in allv["strings"]} == {"oauth_in_a", "oauth_in_b", "oauth_out"}
+    conn.close()
+
+
+def test_get_strings_value_mode_unresolved_func_is_surfaced(tmp_path: Path) -> None:
+    # a func that does not resolve is REPORTED (not-found), never silently ignored (the old bug).
+    conn = facts.open_analysis_ro(_strings_db(tmp_path))
+    miss = facts.get_strings(conn, binary="rc", func="no_such_fn", value="oauth")
+    assert miss["found"] is False
+    conn.close()
+
+
+def test_get_strings_byte_pagination_reaches_the_tail_losslessly(tmp_path: Path) -> None:
+    # ★ M6: a large result is paged LOSSLESSLY by byte size — the tail is REACHABLE via
+    # paging.next_offset, NOTHING summarized. A tiny max_chars forces one row per page.
+    conn = facts.open_analysis_ro(_strings_db(tmp_path))
+    p1 = facts.get_strings(conn, binary="rc", max_chars=1)
+    assert p1["paging"]["truncated"] is True
+    assert p1["paging"]["returned"] == 1  # at least one row despite the 1-char budget
+    assert p1["paging"]["next_offset"] == 1
+    assert p1["paging"]["total_matched"] == 3
+    assert "no summary" in p1["paging"]["how_to_get_rest"]
+    # walk pages to the tail, collecting every value — lossless, nothing dropped or summarized
+    seen = list(p1["strings"])
+    off = p1["paging"]["next_offset"]
+    while off is not None:
+        pg = facts.get_strings(conn, binary="rc", max_chars=1, offset=off)
+        seen += pg["strings"]
+        off = pg["paging"]["next_offset"]
+    assert {s["value"] for s in seen} == {"oauth_in_a", "oauth_in_b", "oauth_out"}
+    conn.close()
+
+
+def test_get_strings_default_returns_full_page_no_summary(tmp_path: Path) -> None:
+    # the default byte budget is generous, so a small binary returns in ONE page with no summary and
+    # a terminal next_offset=None — pagination is a tail-safety net, not always-on chunking.
+    conn = facts.open_analysis_ro(_strings_db(tmp_path))
+    r = facts.get_strings(conn, binary="rc")
+    assert r["paging"]["truncated"] is False and r["paging"]["next_offset"] is None
+    assert len(r["strings"]) == 3  # every row, no summarization
+    conn.close()
+
+
 def test_list_incomplete_binaries_flags_failed_not_codefree(tmp_path: Path) -> None:
     # ★ Red-line: a code binary Ghidra failed on (0 functions, status != ok_empty) is surfaced as
     # incomplete; a legitimately code-free ok_empty object and a binary with functions are not.

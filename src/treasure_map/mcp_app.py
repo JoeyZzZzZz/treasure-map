@@ -99,43 +99,68 @@ _AGENT_INSTRUCTIONS = (
 )
 
 
-def _dimension_dict(d: Any) -> dict[str, Any]:
-    """One map-layer annotation as a flat record: the honest three-state, value, source, note."""
-    return {"name": d.name, "state": d.state, "value": d.value, "source": d.source, "note": d.note}
+# Dimensions promoted to a top-level spine label on the compact row: ALWAYS shown (even
+# unknown:unknown), so the carry loop skips them to avoid emitting the same axis twice. Only
+# controllability is promoted — every OTHER axis rides the axis-agnostic carry rule below, so a new
+# Dimension (e.g. a future source=param axis) joins the row automatically without editing this set.
+_SPINE_DIMENSIONS = frozenset({"controllability"})
+
+# The compact-list legend (C8-6): a compact row OMITS any dimension whose state is ``unknown``,
+# and an omitted dimension is a coverage gap — NEVER proven safe. Surfaced
+# once on the envelope so a careless reader does not misread "not shown" as "no problem"
+# (the per-row '?' reminder of the verbose view is gone; this restores it globally).
+_COMPACT_ROW_LEGEND = (
+    "compact rows = spine facts + every dimension with an ESTABLISHED state (state:value, no "
+    "note). A dimension NOT shown on a row is state=unknown: a coverage gap, NOT proven safe. "
+    "Fetch explain_candidate(evidence_ref) for that candidate's full per-dimension note."
+)
 
 
-def _candidate_dict(c: Any, current_run_id: str | None = None) -> dict[str, Any]:
-    """One candidate as a flat, JSON-serializable map point: anchor + every dimension layer.
+def _dim_label(d: Any) -> str:
+    """One dimension compressed to a single ``state:value`` label (no note) for the compact row."""
+    return f"{d.state}:{d.value}"
 
-    There is NO score — ``dimensions`` carries the honest per-layer three-state facts, and the
-    listing order is the current lens (see the top-level ``lens`` field). Each layer is a FACT."""
+
+def _short_binary(binary_path: str | None) -> str | None:
+    """The binary's short name (last path segment) for the compact row; None passes through."""
+    if binary_path is None:
+        return None
+    return binary_path.rsplit("/", 1)[-1] or binary_path
+
+
+def _candidate_row(c: Any, rank: int, current_run_id: str | None = None) -> dict[str, Any]:
+    """One candidate as a COMPACT triage row (the compact-row carry contract C1-C3).
+
+    Spine facts (always present) + every non-spine dimension whose state is ESTABLISHED
+    (``state != "unknown"``), each compressed to one ``state:value`` label with NO note — the full
+    per-dimension note lives in explain_candidate. The carry loop is AXIS-AGNOSTIC: it walks
+    ``c.dimensions`` and never hardcodes a dimension whitelist, so any future axis that is a
+    Dimension with an established state joins the row automatically (the anti-'hidden marker'
+    invariant). The baseline it omits is the UNKNOWN semantics (not proven safe), never a
+    per-firmware modal value."""
+    carried = {
+        d.name: _dim_label(d)
+        for d in c.dimensions
+        if d.name not in _SPINE_DIMENSIONS and d.state != "unknown"
+    }
     return {
-        "evidence_ref": c.evidence_ref,  # the anchor
-        "function": c.function,
-        "binary_path": c.binary_path,
-        "sink_anchor": c.sink_anchor,
+        # the anchor — pass to explain_candidate / get_sink_provenance
+        "evidence_ref": c.evidence_ref,
+        # position under the current lens (0-based, absolute; re-ranked on a lens switch)
+        "rank": rank,
         "sink_class": c.sink_class,
-        "source_class": c.source_class,
-        # fine-grained controllability of the source reaching the sink argument (free_string /
-        # charset_safe / charset_maybe / unknown), surfaced from the candidate's flow_evidence.
-        "source_kind": c.source_kind,
-        # the nvram key feeding the sink (when the def-use provenance resolved an nvram getter);
-        # None otherwise. Its web-settability drives the controllability layer.
-        "nvram_source_key": c.nvram_source_key,
-        # the honest map layers — every dimension a first-class annotation {state, value, source,
-        # note}, NOT buried in flow_evidence. This REPLACES the old collapsed score.
-        "dimensions": [_dimension_dict(d) for d in c.dimensions],
-        "reachability_status": c.reachability_status,  # raw mechanism state (unknown/confirmed/…)
-        "review_status": c.review_status,  # presentation relabel (to-verify / reachable / gated)
-        "blocking_mechanism": c.blocking_mechanism,
-        "origin": c.origin,
-        "entry_reach": c.entry_reach,
-        # The pattern fingerprint — pivot a cross_firmware_patterns hit to its instances via the
-        # list_candidates(fingerprint=…) filter (same key density / ledger group by).
+        "sink": c.sink_anchor,
+        # controllability is spine: ALWAYS present as one state:value label, even unknown:unknown.
+        "controllability": _dim_label(c.dim("controllability")),
+        "nvram_source_key": c.nvram_source_key,  # the key feeding the sink (spots an nvram cluster)
+        "binary": _short_binary(c.binary_path),
+        "function": c.function,
         "structural_fingerprint": c.structural_fingerprint,
-        "source_run_id": c.source_run_id,
-        # True when this candidate belongs to the firmware run the server is bound to (None when
-        # the server is not bound to a specific run, e.g. explicit db paths with no run pointer).
+        # Non-spine dimensions with an established state, each "state:value" (no note). A dimension
+        # NOT here is state=unknown — a coverage gap, NOT proven safe (see the envelope legend).
+        "dimensions": carried,
+        # True when this candidate belongs to the firmware run the server is bound to (None when the
+        # server is not bound to a specific run) — per-row firmware attribution for a shared atlas.
         "is_current_run": (None if current_run_id is None else c.source_run_id == current_run_id),
     }
 
@@ -293,7 +318,14 @@ def make_tools(
         (to-verify / reachable / gated / all), ``fingerprint`` (pivot from cross_firmware_patterns).
         Paged (``limit`` capped 200 + ``offset``). The result's ``lens`` names the active view and
         ``caveats`` states the honest phase-1 blind spots (optimistic 'free', near-always-'?'
-        filtering). DERIVED facts, NOT a verdict — read the head, then fetch detail per ref."""
+        filtering).
+
+        Rows are COMPACT: spine facts (evidence_ref / rank / sink_class / sink / controllability /
+        nvram_source_key / binary / function / structural_fingerprint) plus each dimension whose
+        state is ESTABLISHED, as one ``state:value`` label — the per-dimension note is dropped here
+        to keep the list directly readable, and fetched on demand via ``explain_candidate``. A
+        dimension NOT shown on a row is state=unknown (a coverage gap, NOT proven safe) — see the
+        result's ``legend``. DERIVED facts, NOT a verdict — read the head, then explain per ref."""
         effective = run_id if run_id is not None else current_run_id
         conn = open_atlas(atlas_path)
         try:
@@ -337,6 +369,9 @@ def make_tools(
         end = off + len(page)
         return {
             "note": _DERIVED_SIGNAL_NOTE,
+            # ★ C8-6: rows are compact (spine + established dimensions only); an omitted dimension
+            # is state=unknown, NOT proven safe. Said once on the envelope, not per row.
+            "legend": _COMPACT_ROW_LEGEND,
             # The active lens: a good default that does not lock the agent in. Switch it with
             # sort_by / view / filters / impact_order; the demotion iron law holds under them all.
             "lens": {
@@ -382,7 +417,10 @@ def make_tools(
             "limit": lim,
             "truncated": end < total,
             "next_offset": end if end < total else None,
-            "candidates": [_candidate_dict(c, current_run_id) for c in page],
+            # ★ compact rows (M1): spine facts + established dimensions, no per-dimension note. The
+            # full per-candidate note is on demand via explain_candidate(evidence_ref) (M2);
+            # ``rank`` is the absolute position under the active lens.
+            "candidates": [_candidate_row(c, off + i, current_run_id) for i, c in enumerate(page)],
         }
 
     def cross_firmware_patterns(limit: int = 50, offset: int = 0) -> dict[str, Any]:
@@ -546,17 +584,23 @@ def make_tools(
         )
 
     def get_strings(
-        binary: str | None = None, function: str | None = None, value: str | None = None
+        binary: str | None = None,
+        function: str | None = None,
+        value: str | None = None,
+        offset: int = 0,
     ) -> dict[str, Any]:
         """Recorded strings: by binary, narrowed to a function's range, or searched by ``value``.
 
         ``value`` searches string CONTENT and returns each hit with its address + owning binary
-        (one-call locate); reference-site (which function uses a string) is not indexed — the
-        result says so honestly. HONEST BOUND: a binary's string export is capped, so results carry
-        ``truncated`` / ``total`` (by-binary) or ``search_may_be_incomplete`` (by-value) when a
-        scanned binary was capped — a string NOT found there is NOT proven absent."""
+        (one-call locate), and honours ``function`` to scope the search to that function's range;
+        reference-site (which function uses a string) is not indexed — the result says so honestly.
+        Large results are paged LOSSLESSLY by byte size under ``paging``: pass ``offset`` =
+        ``paging.next_offset`` to page the tail (never summarized). HONEST BOUND: a binary's string
+        export is capped, so results carry ``truncated`` / ``total`` (by-binary) or
+        ``search_may_be_incomplete`` (by-value) when a scanned binary was capped — a string NOT
+        found there is NOT proven absent."""
         return _with_analysis(
-            lambda c: facts.get_strings(c, binary=binary, func=function, value=value)
+            lambda c: facts.get_strings(c, binary=binary, func=function, value=value, offset=offset)
         )
 
     def get_imports_exports(binary: str) -> dict[str, Any]:
