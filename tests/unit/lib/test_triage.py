@@ -522,8 +522,8 @@ def test_cli_triage_json_carries_dimensions_not_score(tmp_path: Path) -> None:
     assert "score" not in rows[0]  # the collapsed score is gone
     names = {d["name"] for d in rows[0]["dimensions"]}
     assert "controllability" in names and "sink_impact" in names
-    for d in rows[0]["dimensions"]:  # every layer is a three-state fact
-        assert d["state"] in {"proven", "excluded", "unknown"}
+    for d in rows[0]["dimensions"]:  # every layer is a four-state fact (likely = M2 tier)
+        assert d["state"] in {"proven", "likely", "excluded", "unknown"}
 
 
 def test_cli_triage_prints_intended_use_notice(tmp_path: Path) -> None:

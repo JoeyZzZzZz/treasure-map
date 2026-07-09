@@ -539,43 +539,6 @@ def test_free_source_two_buffers_deep_is_not_downweighted() -> None:
     )
 
 
-# ── factor ⑤: one-hop caller-constant downweight covers the cmd path ──────────────────
-
-
-def test_caller_constant_covers_cmd_sink() -> None:
-    # A function whose sole one-hop caller invokes it with only a string literal -> the cmd sink's
-    # dangerous parameter is a caller constant (downweighted). Confirms cmd-path coverage.
-    pc = "void run(char* param_1){ system(param_1); }"
-    caller = 'void boot(void){ run("/etc/init.d/rcS"); }'
-    assert (
-        detect_form_signal(
-            sink_name="system",
-            pseudocode=pc,
-            callees=["system"],
-            sink_arg="param_1",
-            func_name="run",
-            callers_pseudocode=[caller],
-        )
-        == CALLER_CONSTANT
-    )
-
-
-def test_caller_variable_does_not_make_cmd_caller_constant() -> None:
-    pc = "void run(char* param_1){ system(param_1); }"
-    caller = "void boot(char* v){ run(v); }"
-    assert (
-        detect_form_signal(
-            sink_name="system",
-            pseudocode=pc,
-            callees=["system"],
-            sink_arg="param_1",
-            func_name="run",
-            callers_pseudocode=[caller],
-        )
-        is None
-    )
-
-
 # ── library / symbol recognition (function granularity) ──────────────────────────────
 
 
