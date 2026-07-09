@@ -1556,17 +1556,29 @@ VIEWS: dict[str, dict[str, Any]] = {
         "the corpus stays WHOLE — an unattributed source is unknown, never a proven non-nvram, so "
         "nothing is pruned (a wrapper-read key that resolves late must not be hidden now).",
     },
-    "reachable-only": {
+    "reachable-first": {
         "filter": ("reachability", "found"),
         "spine": "impact",
         "desc": "FLOATS candidates with a direct rootfs entry reference — a web-asset endpoint or "
         "a boot script naming the binary — to the first screen; the corpus stays WHOLE, nothing is "
-        "pruned. A MECHANISTIC reference, NOT call-graph reachability: an INCOMPLETE slice that "
-        "misses candidates reachable only via an unmodeled service-dispatch bridge (notify_rc / "
-        "rc_service), so do not read the top as 'all reachable candidates'. Split by kind with "
-        "reachability=entry:web / reachability=entry:script.",
+        "pruned (renamed from 'reachable-only', which now aliases here). A MECHANISTIC reference, "
+        "NOT call-graph reachability: an INCOMPLETE slice that misses candidates reachable only "
+        "via an unmodeled service-dispatch bridge (notify_rc / rc_service), so do not read the "
+        "top as 'all reachable candidates'. Split by kind with "
+        "reachability=entry:web / entry:script.",
     },
 }
+
+# Deprecated view aliases: an old name resolves to its canonical preset so existing callers
+# (--view / MCP view=) keep working without a hard break. reachable-only -> reachable-first, because
+# after step 2.5 that lens FLOATS (never prunes), so "only" was a misnomer.
+_VIEW_ALIASES: dict[str, str] = {"reachable-only": "reachable-first"}
+
+
+def canonical_view(view: str | None) -> str | None:
+    """Resolve a (possibly deprecated) view name to its canonical VIEWS key; passthrough
+    otherwise."""
+    return _VIEW_ALIASES.get(view, view) if view is not None else None
 
 
 def _float_by_dimension(
@@ -1621,6 +1633,7 @@ def apply_view(
       optimistic dimension and silently hide candidates)."""
     spine = "impact"
     float_filters: list[tuple[str, str]] = []
+    view = canonical_view(view)  # resolve a deprecated alias (reachable-only -> reachable-first)
     if view and view in VIEWS:
         preset = VIEWS[view]
         spine = preset["spine"]

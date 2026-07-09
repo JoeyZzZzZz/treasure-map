@@ -346,7 +346,7 @@ def test_reachability_source_has_no_pre_auth_vocabulary() -> None:
         [
             mod._REACH_CAVEAT_STANDARD_FLOW,
             mod._REACH_CAVEAT_COMPLETENESS,
-            mod.VIEWS["reachable-only"]["desc"],
+            mod.VIEWS["reachable-first"]["desc"],
         ]
     ).lower()
     assert "pre-auth" not in reach_strings
@@ -675,7 +675,8 @@ def test_cli_only_refuses_optimistic_dimension(tmp_path: Path) -> None:
     out = CliRunner().invoke(
         triage_cmd, ["run_1", "--only", "controllability=free", "--atlas", str(atlas)]
     )
-    assert out.exit_code != 0
+    # exit 2 (not the generic-error 1) so agents/scripts can tell a refuse from a failure.
+    assert out.exit_code == 2
     assert "refused" in out.output and "Use --filter" in out.output
 
 
@@ -1193,20 +1194,23 @@ def test_cli_filter_controllability_floats_never_reduces(tmp_path: Path) -> None
     assert out.output.index("free_lead") < out.output.index("opaque_lead")  # free floated on top
 
 
-# ── every preset view states WHEN to use it (and reachable-only states its honest limit) ──
+# ── every preset view states WHEN to use it (and reachable-first states its honest limit) ──
 
 
 def test_every_view_carries_a_when_to_use_note() -> None:
-    from treasure_map.lib.query import VIEWS
+    from treasure_map.lib.query import VIEWS, canonical_view
 
     for name, preset in VIEWS.items():
         assert preset.get("desc"), f"view {name} is missing a when-to-use desc"
         assert "spine" in preset
-    # reachable-only FLOATS (not prunes) and must stay honest: a mechanistic reference (web-asset
+    # the canonical key is reachable-first now; reachable-only is a deprecated alias that resolves.
+    assert "reachable-only" not in VIEWS
+    assert canonical_view("reachable-only") == "reachable-first"
+    # reachable-first FLOATS (not prunes) and must stay honest: a mechanistic reference (web-asset
     # endpoint or boot script), NOT call-graph reachability, an INCOMPLETE slice (service-dispatch
     # bridges like notify_rc are unmodeled), corpus whole — so an agent never reads the top as
     # 'all reachable candidates'.
-    ro = VIEWS["reachable-only"]["desc"].lower()
+    ro = VIEWS["reachable-first"]["desc"].lower()
     assert "web-asset" in ro
     assert "not call-graph reachability" in ro
     assert "incomplete" in ro and "notify_rc" in ro  # names the unmodeled service-dispatch gap
@@ -1220,7 +1224,29 @@ def test_every_view_carries_a_when_to_use_note() -> None:
 def test_cli_view_help_lists_when_to_use() -> None:
     result = CliRunner().invoke(triage_cmd, ["--help"])
     assert result.exit_code == 0, result.output
-    out = result.output.lower()
+    # collapse click's word-wrap whitespace so a multi-word phrase split across lines still matches.
+    out = " ".join(result.output.lower().split())
     assert "hunt" in out  # "hunting goal" phrasing present
     assert "nvram-mediated" in out  # nvram-source usage surfaced
-    assert "not call-graph reachability" in out  # reachable-only honest limit surfaced
+    assert "not call-graph reachability" in out  # reachable-first honest limit surfaced
+    assert "reachable-first" in out  # the canonical preset name is shown
+
+
+def test_cli_view_reachable_only_alias_resolves_to_reachable_first(tmp_path: Path) -> None:
+    # ★ 2.5.1: reachable-only is a deprecated alias — both --view spellings resolve to the same
+    # preset, produce byte-identical output, and keep the corpus whole (float, never prune).
+    conn = _atlas(tmp_path)
+    _mk_reach_corpus(conn)
+    conn.close()
+    atlas = tmp_path / "atlas.db"
+
+    first = CliRunner().invoke(
+        triage_cmd, ["run_1", "--all", "--view", "reachable-first", "--atlas", str(atlas)]
+    )
+    alias = CliRunner().invoke(
+        triage_cmd, ["run_1", "--all", "--view", "reachable-only", "--atlas", str(atlas)]
+    )
+    assert first.exit_code == 0, first.output
+    assert alias.exit_code == 0, alias.output
+    assert alias.output == first.output  # alias is transparent — same float lens, same rows
+    assert "(5 candidates:" in first.output  # corpus stays whole under either spelling

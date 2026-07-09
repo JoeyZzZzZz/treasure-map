@@ -302,6 +302,13 @@ def _dv(c: TriageCandidate, name: str, *, unknown_as: str = "?") -> str:
     return unknown_as if d.state == "unknown" else d.value
 
 
+class _OnlyRefused(click.ClickException):
+    """An ``--only`` prune refused on a non-reducible dimension. Exits 2 (not the generic 1) so
+    automation / an agent can distinguish a refusal from success (0) and other failures (1)."""
+
+    exit_code = 2
+
+
 def _render_triage(
     candidates: list[TriageCandidate],
     *,
@@ -595,13 +602,13 @@ def _reachability_inline(status: str) -> str:
 @click.option(
     "--view",
     "view",
-    type=click.Choice(["default", "by-sink", "nvram-source", "reachable-only"]),
+    type=click.Choice(["default", "by-sink", "nvram-source", "reachable-first", "reachable-only"]),
     default=None,
     help="A preset lens for a hunting goal: default (balanced start) | by-sink (sweep one sink "
     "class, e.g. all system()) | nvram-source (hunt nvram-mediated bugs — the router-bug hotspot) "
-    "| reachable-only (prune to candidates with a direct rootfs entry reference — a MECHANISTIC "
-    "reference, NOT call-graph reachability, an incomplete slice that drops candidates reachable "
-    "only via an unmodeled service-dispatch bridge like notify_rc).",
+    "| reachable-first (FLOATS candidates with a direct rootfs entry reference to the top — a "
+    "MECHANISTIC reference, NOT call-graph reachability, an incomplete slice; corpus whole). "
+    "reachable-only is a deprecated alias for reachable-first.",
 )
 @click.option(
     "--filter",
@@ -683,6 +690,7 @@ def triage(
     from treasure_map.lib.query import (
         DEFAULT_LENS_LABEL,
         PHASE1_CAVEATS,
+        canonical_view,
         explain_candidate,
         filter_match_count,
         only_refusal,
@@ -699,6 +707,9 @@ def triage(
     dim_filters = _parse_dim_filters(dim_filter_specs)
     only_filters = _parse_dim_filters(only_specs)
     overrides = run_parse_impact_order(impact_order) if impact_order else None
+    # A deprecated alias (reachable-only) resolves to its canonical name everywhere the lens is
+    # named, so the header nudges the reader onto the current spelling instead of echoing the old.
+    view = canonical_view(view)
     lens_label = _lens_label(
         DEFAULT_LENS_LABEL,
         view=view,
@@ -722,6 +733,7 @@ def triage(
 
     explanation: CandidateExplanation | None = None
     error: str | None = None
+    refusal: str | None = None
     corpus_size = 0
     conn = open_atlas(resolved_atlas)
     try:
@@ -731,8 +743,8 @@ def triage(
             full = run_triage(conn, run_id=selected_run)
             # --only prune is refused on a dimension that is not a proven ground truth on THIS
             # corpus (would silently hide unknown/null candidates) — same refusal for CLI and MCP.
-            error = only_refusal(only_filters, full)
-            if error is None:
+            refusal = only_refusal(only_filters, full)
+            if refusal is None:
                 corpus_size = len(full)
                 candidates = _lensed(full)
                 if explain_ref is not None:  # --explain N: resolve N under the SAME lens order
@@ -749,6 +761,10 @@ def triage(
     finally:
         conn.close()
 
+    if refusal is not None:
+        # exit 2 (distinct from a generic error's 1) so automation/an agent can tell an --only
+        # refusal apart from success (0) and from other failures (1).
+        raise _OnlyRefused(refusal)
     if error is not None:
         raise click.ClickException(error)
 

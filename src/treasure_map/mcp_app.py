@@ -41,6 +41,7 @@ from treasure_map.lib.query import DEFAULT_LENS_LABEL as _LENS_LABEL
 from treasure_map.lib.query import PHASE1_CAVEATS as _LENS_CAVEATS
 from treasure_map.lib.query import VIEWS as _VIEWS
 from treasure_map.lib.query import apply_view as _apply_view
+from treasure_map.lib.query import canonical_view as _canonical_view
 from treasure_map.lib.query import density as _density
 from treasure_map.lib.query import dormant as _dormant
 from treasure_map.lib.query import explain_candidate as _explain_candidate
@@ -167,11 +168,12 @@ def _parse_dim_filters(spec: str | None) -> list[tuple[str, str]]:
 
 def _effective_spine(sort_by: str | None, view: str | None) -> str:
     """The pivot axis actually in force: explicit sort_by wins, else the view preset's spine, else
-    the default 'impact' spine."""
+    the default 'impact' spine. A deprecated view alias is resolved first."""
     if sort_by:
         return sort_by
-    if view and view in _VIEWS:
-        return str(_VIEWS[view]["spine"])
+    resolved = _canonical_view(view)
+    if resolved and resolved in _VIEWS:
+        return str(_VIEWS[resolved]["spine"])
     return "impact"
 
 
@@ -273,9 +275,10 @@ def make_tools(
         - ``sort_by``: pivot axis — impact (default) / controllability / reachability / by-sink.
         - ``view``: preset lens for a hunting goal — ``default`` (balanced start), ``by-sink``
           (sweep one sink class, e.g. all system()), ``nvram-source`` (hunt nvram-mediated bugs —
-          the router-bug hotspot), ``reachable-only`` (FLOATS candidates with a direct rootfs entry
+          the router-bug hotspot), ``reachable-first`` (FLOATS candidates with a direct rootfs entry
           reference to the top — MECHANISTIC, NOT call-graph reachability, an INCOMPLETE slice that
-          misses the notify_rc bridge; the corpus stays whole). ``available_views`` lists each.
+          misses the notify_rc bridge; the corpus stays whole; ``reachable-only`` is a deprecated
+          alias). ``available_views`` lists each.
         - ``filters``: circle-and-weight dimension filters, ``"dim=value,dim2=value2"``
           (controllability=free / sink_impact=cmd / source=nvram / reachability=entry:web ...).
           Matches FLOAT to the first screen; the corpus is NEVER reduced (``corpus`` stays the full

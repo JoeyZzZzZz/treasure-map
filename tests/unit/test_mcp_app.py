@@ -261,13 +261,13 @@ def test_list_candidates_exposes_view_catalog_with_when_to_use(tmp_path: Path) -
     tools = _tools(tmp_path)
     out = tools["list_candidates"]()
     views = {v["view"]: v for v in out["available_views"]}
-    assert set(views) == {"default", "by-sink", "nvram-source", "reachable-only"}
+    assert set(views) == {"default", "by-sink", "nvram-source", "reachable-first"}
     for v in views.values():
         assert v["when_to_use"] and v["spine"]  # each carries a goal note + its spine
     assert "nvram-mediated" in views["nvram-source"]["when_to_use"].lower()
-    # reachable-only stays honest: a mechanistic reference, NOT call-graph reachability; it FLOATS
+    # reachable-first stays honest: a mechanistic reference, NOT call-graph reachability; it FLOATS
     # (corpus whole), never prunes.
-    ro = views["reachable-only"]["when_to_use"].lower()
+    ro = views["reachable-first"]["when_to_use"].lower()
     assert "not call-graph reachability" in ro and "floats" in ro
     # and the tool docstring points the agent at the catalog + the reachable-only caveat.
     doc = tools["list_candidates"].__doc__.lower()
