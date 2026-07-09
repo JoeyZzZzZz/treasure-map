@@ -15,9 +15,15 @@ import sqlite3
 from pathlib import Path
 
 from treasure_map.lib.atlas.connection import open_atlas
-from treasure_map.lib.atlas.models import InstanceRow, NvramFlowRow, WebFormFieldRow
+from treasure_map.lib.atlas.models import (
+    InstanceRow,
+    NvramDefaultRow,
+    NvramFlowRow,
+    WebFormFieldRow,
+)
 from treasure_map.lib.atlas.writer import (
     add_instance,
+    add_nvram_default_rows,
     add_nvram_flow_rows,
     add_web_form_field_rows,
     upsert_pattern,
@@ -650,3 +656,218 @@ def test_single_dominating_writer_behavior_unchanged(tmp_path: Path) -> None:
     conn.close()
     c = _find(triage(open_atlas(tmp_path / "atlas.db")), ref)
     assert _ctrl(c) == "controllable"
+
+
+# ── Phase 4: wrapper-aware source attribution (M1) + in_router_defaults likely recall (M2/M3) ──
+#
+# The false-low fix: a real web-controllable command injection (the OAuth class) reads its nvram key
+# through a THIN WRAPPER, not a bare getter. Candidate-layer attribution used to recognise only
+# direct getters, so the wrapper-read key was attributed to nothing and the sink collapsed to
+# unknown. M1 reuses A2's already-materialised wrapper set (nvram_key_flow.via_wrapper); M2 adds a
+# ``likely`` web_settable tier for a router_defaults member; M3 ranks likely-controllable below
+# proven-controllable and above optimistic 'free'.
+
+
+def _register_wrapper(conn: sqlite3.Connection, callee: str, key: str) -> None:
+    """Materialise ``callee`` as an A2 thin nvram wrapper reading ``key`` — the atlas shape triage
+    reads back as ``wrapper_names`` (SELECT DISTINCT via_wrapper). The read edge also makes ``key``
+    a back-end nvram key (so it is a genuine nvram read, exactly as M1's gate requires)."""
+    add_nvram_flow_rows(
+        conn,
+        [NvramFlowRow("run_1", key, "constant", "httpd", "wrap_read", "read", via_wrapper=callee)],
+    )
+
+
+def _seed_default(conn: sqlite3.Connection, *keys: str) -> None:
+    """Make ``keys`` router_defaults members (and locate+complete the table, so any OTHER key reads
+    a definite in_router_defaults=False rather than 'uncertain')."""
+    add_nvram_default_rows(conn, [NvramDefaultRow("run_1", k) for k in keys])
+
+
+def test_wrapper_read_key_resolves_nvram_source_key(tmp_path: Path) -> None:
+    # ★ SEAM #12: a wrapper-read nvram candidate whose getter-return const_args[0] is the key ⇒
+    # nvram_source_key is non-None. Guards against M1 regressing to direct-getter-only attribution.
+    conn = _atlas(tmp_path)
+    _register_wrapper(conn, "FUN_000b2e80", "oauth_auth_code")
+    p = _pattern(conn, "fp_wrap", sink_class="cmd")
+    ref = _inst(
+        conn,
+        p,
+        sink_anchor="system",
+        flow_evidence=_stack_buf_prov(
+            "system", [_getter_vararg("oauth_auth_code", callee="FUN_000b2e80")]
+        ),
+        source_kind="unknown",
+    )
+    conn.close()
+    c = _find(triage(open_atlas(tmp_path / "atlas.db")), ref)
+    assert c.nvram_source_key == "oauth_auth_code"  # wrapper-read key attributed, not None
+
+
+def test_unregistered_callee_leaves_nvram_source_key_unresolved(tmp_path: Path) -> None:
+    # The honest boundary of M1: an nvram-shaped call_return whose callee is NEITHER a known getter
+    # NOR an A2 thin wrapper is not trusted as an nvram read -> nvram_source_key stays None (the
+    # pre-fix state, kept honest — we do not fabricate a key from any incidental const string).
+    conn = _atlas(tmp_path)  # no wrapper registered
+    p = _pattern(conn, "fp_unreg", sink_class="cmd")
+    ref = _inst(
+        conn,
+        p,
+        sink_anchor="system",
+        flow_evidence=_stack_buf_prov(
+            "system", [_getter_vararg("some_key", callee="FUN_not_a_wrapper")]
+        ),
+        source_kind="unknown",
+    )
+    conn.close()
+    c = _find(triage(open_atlas(tmp_path / "atlas.db")), ref)
+    assert c.nvram_source_key is None
+
+
+def test_router_defaults_member_wrapper_key_is_likely_controllable(tmp_path: Path) -> None:
+    # M2/M3 verdict: a wrapper-read key that is a router_defaults member but NOT a proven SaTC cross
+    # -> controllability value 'controllable' with state 'likely' (the OAuth shape).
+    conn = _atlas(tmp_path)
+    _register_wrapper(conn, "FUN_000b2e80", "oauth_auth_code")
+    _seed_default(conn, "oauth_auth_code")
+    p = _pattern(conn, "fp_oauth", sink_class="cmd")
+    ref = _inst(
+        conn,
+        p,
+        sink_anchor="system",
+        flow_evidence=_stack_buf_prov(
+            "system", [_getter_vararg("oauth_auth_code", callee="FUN_000b2e80")]
+        ),
+        source_kind="unknown",
+    )
+    conn.close()
+    c = _find(triage(open_atlas(tmp_path / "atlas.db")), ref)
+    d = c.dim("controllability")
+    assert (d.state, d.value) == ("likely", "controllable")
+    swr = c.dim("source_writability")
+    assert (swr.state, swr.value) == ("likely", "web_settable")
+
+
+def test_wrapper_read_non_default_key_stays_unknown(tmp_path: Path) -> None:
+    # ★ M4.5 guardrail: a wrapper-read key that is NOT a router_defaults member (table located) must
+    # NOT be promoted to likely -- the in_router_defaults gate holds internal keys out. It falls
+    # through to unknown, never a false 'likely' (the log_wlstat_dir / productid case).
+    conn = _atlas(tmp_path)
+    _register_wrapper(conn, "FUN_000b2e80", "log_wlstat_dir")
+    _seed_default(conn, "http_passwd")  # table located+complete; log_wlstat_dir is NOT a member
+    p = _pattern(conn, "fp_internal", sink_class="cmd")
+    ref = _inst(
+        conn,
+        p,
+        sink_anchor="system",
+        flow_evidence=_stack_buf_prov(
+            "system", [_getter_vararg("log_wlstat_dir", callee="FUN_000b2e80")]
+        ),
+        source_kind="unknown",
+    )
+    conn.close()
+    c = _find(triage(open_atlas(tmp_path / "atlas.db")), ref)
+    d = c.dim("controllability")
+    assert (d.state, d.value) == ("unknown", "unknown")  # gate held: no false promote
+
+
+def test_proven_controllable_outranks_likely_controllable(tmp_path: Path) -> None:
+    # M3.8: within the SAME sink-impact tier, a proven SaTC cross (state proven) ranks above a
+    # likely router_defaults key (state likely) -- the certainty tiebreak, proven micro-leads.
+    conn = _atlas(tmp_path)
+    _register_wrapper(conn, "FUN_000b2e80", "oauth_auth_code")
+    _seed_default(conn, "oauth_auth_code")
+    pv = _pattern(conn, "fp_proven", sink_class="cmd")
+    lk = _pattern(conn, "fp_likely", sink_class="cmd")
+    proven_ref = _inst(
+        conn,
+        pv,
+        sink_anchor="system",
+        flow_evidence=_stack_buf_prov("system", [_getter_vararg("fb_comment")]),
+    )
+    likely_ref = _inst(
+        conn,
+        lk,
+        sink_anchor="system",
+        flow_evidence=_stack_buf_prov(
+            "system", [_getter_vararg("oauth_auth_code", callee="FUN_000b2e80")]
+        ),
+    )
+    conn.close()
+    cands = triage(open_atlas(tmp_path / "atlas.db"))
+    order = [c.evidence_ref for c in sort_candidates(cands, spine="impact")]
+    assert _ctrl(_find(cands, proven_ref)) == "controllable"
+    assert _find(cands, proven_ref).dim("controllability").state == "proven"
+    assert _find(cands, likely_ref).dim("controllability").state == "likely"
+    assert order.index(proven_ref) < order.index(likely_ref)
+
+
+def test_likely_controllable_outranks_free(tmp_path: Path) -> None:
+    # M3: within the same sink-impact tier, likely-controllable (a real-but-unconfirmed nvram key)
+    # outranks the optimistic 'free' (source_kind=free_string). A router_defaults RCE lead beats a
+    # bare argv guess -- harm plus a real key both point up.
+    conn = _atlas(tmp_path)
+    _register_wrapper(conn, "FUN_000b2e80", "oauth_auth_code")
+    _seed_default(conn, "oauth_auth_code")
+    lk = _pattern(conn, "fp_lk", sink_class="cmd")
+    fr = _pattern(conn, "fp_fr", sink_class="cmd")
+    likely_ref = _inst(
+        conn,
+        lk,
+        sink_anchor="system",
+        flow_evidence=_stack_buf_prov(
+            "system", [_getter_vararg("oauth_auth_code", callee="FUN_000b2e80")]
+        ),
+    )
+    free_ref = _inst(conn, fr, sink_anchor="system", source_kind="free_string")
+    conn.close()
+    cands = triage(open_atlas(tmp_path / "atlas.db"))
+    order = [c.evidence_ref for c in sort_candidates(cands, spine="impact")]
+    assert _find(cands, likely_ref).dim("controllability").state == "likely"
+    assert _ctrl(_find(cands, free_ref)) == "free"
+    assert order.index(likely_ref) < order.index(free_ref)
+
+
+def test_likely_cmd_outranks_proven_free_lower_impact(tmp_path: Path) -> None:
+    # M3 harm-respect (impact is the OUTER axis): a likely-controllable cmd sink outranks a
+    # proven-'free' LOG sink -- a high-impact unconfirmed lead beats a low-impact confirmed one, so
+    # the worst bug never falls off the top screen behind a wholesale 'proven' band.
+    conn = _atlas(tmp_path)
+    _register_wrapper(conn, "FUN_000b2e80", "oauth_auth_code")
+    _seed_default(conn, "oauth_auth_code")
+    lk = _pattern(conn, "fp_lkcmd", sink_class="cmd")
+    lg = _pattern(conn, "fp_provenlog", sink_class="log")
+    likely_ref = _inst(
+        conn,
+        lk,
+        sink_anchor="system",
+        flow_evidence=_stack_buf_prov(
+            "system", [_getter_vararg("oauth_auth_code", callee="FUN_000b2e80")]
+        ),
+    )
+    log_ref = _inst(conn, lg, sink_anchor="syslog", source_kind="free_string")
+    conn.close()
+    cands = triage(open_atlas(tmp_path / "atlas.db"))
+    order = [c.evidence_ref for c in sort_candidates(cands, spine="impact")]
+    assert _find(cands, likely_ref).dim("controllability").state == "likely"
+    assert order.index(likely_ref) < order.index(log_ref)  # impact outer axis: cmd over log
+
+
+def test_proven_controllable_not_regressed_by_likely_tier(tmp_path: Path) -> None:
+    # NO-REGRESSION: adding the likely tier must not change a proven SaTC cross's reading. Even
+    # with router_defaults seeded (so the key is ALSO a member), a proven cross stays
+    # proven-controllable, never demoted to likely (the 'yes' branch precedes the likely branch).
+    conn = _atlas(tmp_path)
+    _seed_default(conn, "fb_comment")  # fb_comment is BOTH a proven cross AND a defaults member
+    p = _pattern(conn, "fp_noreg", sink_class="fmt_string")
+    ref = _inst(
+        conn,
+        p,
+        sink_anchor="fprintf",
+        flow_evidence=_stack_buf_prov("fprintf", [_getter_vararg("fb_comment")]),
+        source_kind="unknown",
+    )
+    conn.close()
+    c = _find(triage(open_atlas(tmp_path / "atlas.db")), ref)
+    d = c.dim("controllability")
+    assert (d.state, d.value) == ("proven", "controllable")  # proven wins over likely

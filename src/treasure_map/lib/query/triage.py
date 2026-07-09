@@ -70,14 +70,16 @@ PHASE1_CAVEATS: tuple[str, ...] = (
 class Dimension:
     """One map layer's honest three-state annotation for a candidate — a FACT, never a verdict.
 
-    ``state`` is the glyph-level three-state: ``proven`` (✓ established, ``value`` carries the
-    reading), ``excluded`` (✗ established not-applicable / ruled out), ``unknown`` (? not
-    established — ``note`` says what is missing and why). ``value`` is the concrete reading (e.g.
-    ``free`` / ``cmd`` / ``found``); ``source`` names where it came from; ``note`` carries the
-    reason for a ? or an honest caveat on a ✓. The red line: a ? is NEVER rendered as ✓ or ✗."""
+    ``state`` is the glyph-level certainty: ``proven`` (✓ established, ``value`` carries the
+    reading), ``likely`` (~ an optimistic-but-unconfirmed reading, e.g. a router_defaults-member
+    controllability — carries ``value`` but never claims proof), ``excluded`` (✗ established
+    not-applicable / ruled out), ``unknown`` (? not established — ``note`` says what is missing and
+    why). ``value`` is the concrete reading (e.g. ``free`` / ``cmd`` / ``found``); ``source`` names
+    where it came from; ``note`` carries the reason for a ? or an honest caveat. The red line: a ?
+    is NEVER rendered as ✓, and a ~ never as ✓ — an unconfirmed reading must not read as proven."""
 
     name: str
-    state: str  # "proven" | "excluded" | "unknown"
+    state: str  # "proven" | "likely" | "excluded" | "unknown"
     value: str
     source: str
     note: str = ""
@@ -464,6 +466,48 @@ def _web_settable_keys_reaching_sink(
     return out
 
 
+def _likely_settable_keys_reaching_sink(
+    conn: sqlite3.Connection,
+    flow_evidence: str | None,
+    sink_anchor: str | None,
+    wrapper_names: frozenset[str],
+) -> list[str]:
+    """nvram keys reaching the anchored sink argument that are web_settable=='likely' (M2: an
+    in_router_defaults member — the middle tier below a proven SaTC 'yes').
+
+    Two gates, both DELIBERATELY narrower than the proven 'yes' path (``_source_web_settable_key``,
+    which is getter-agnostic because a front-end x back-end cross is a hard fact on any const
+    string):
+      1. GETTER/WRAPPER-gated. 'likely' is only router_defaults membership — a weaker signal that
+         includes read-only internal keys — so it is trusted ONLY for a key genuinely READ from
+         nvram (a direct getter or an A2 thin wrapper, via ``_nvram_key_from_source``), never any
+         const literal that merely happens to sit in router_defaults. This gate is exactly what M1's
+         wrapper attribution buys: without it the likely tier could not tell an nvram read from an
+         incidental string.
+      2. DOMINANCE-filtered (``_judged_writers``, the SAME filter as the verdict): a likely key in a
+         non-dominating branch flows to a different sink and must not light this one.
+    Order-preserving, deduped. Empty when nothing qualifies (the caller then falls through the
+    controllability chain — never a false 'safe')."""
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def consider(source: Any) -> None:
+        k = _nvram_key_from_source(source, wrapper_names)
+        if k and k not in seen and _web_settable(conn, k).get("web_settable") == "likely":
+            seen.add(k)
+            out.append(k)
+
+    for rec in _scoped_records(flow_evidence, sink_anchor):
+        prov = rec.get("provenance")
+        prov = prov if isinstance(prov, dict) else {}
+        consider(prov)
+        for w in _judged_writers(prov):
+            for va in w.get("varargs") or []:
+                if isinstance(va, dict):
+                    consider(va.get("source"))
+    return out
+
+
 # The explain-summary vocabulary for a writer's format-argument controllability, mapped from the
 # single _writer_args_class so the explain rollup and the triage verdict never disagree.
 _ARGS_CLASS_TO_STATE: dict[str, str] = {
@@ -654,15 +698,43 @@ def get_sink_provenance(
 # ── nvram fact transport: recover the nvram key feeding the sink from stored provenance ──
 
 
-def _nvram_key_from_source(source: Any) -> str | None:
-    """The nvram key if ``source`` is a call_return from an nvram getter, else None.
+def _nvram_wrapper_names(conn: sqlite3.Connection) -> frozenset[str]:
+    """The thin nvram-wrapper function names A2 recognised, read back from the atlas.
 
-    The key is the getter's first constant string argument (``const_args[0]``) — the exact shape the
-    def-use extractor records for ``nvram_get("wan_proto")``. A getter with no resolved const key
-    yields None (honest: the key was not recovered), never a fabricated key."""
+    A2 marks a caller's constant-key call THROUGH a thin nvram wrapper as an indirect key edge and
+    stores the wrapper's name in ``nvram_key_flow.via_wrapper``. The candidate-layer source
+    attribution never consumed that capability — so a key read via a wrapper (the COMMON case on
+    this class of firmware, where almost every nvram access goes through a shared accessor rather
+    than a bare nvram_get) was attributed to nothing and its sink collapsed to unknown. Reusing the
+    SAME wrapper set here (not re-recognising wrappers — the one A2 capability the candidate layer
+    lacked, isomorphic to the dominance case: a lower layer computed it, this one didn't read it)
+    closes that gap. Name-only match, cross-binary: an over-match over-promotes a key (the SAFE
+    direction — a wrong promote stays visible, a wrong demote hides a bug), it never hides one; the
+    downstream web_settable gate, not this set, is what actually decides controllability."""
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT via_wrapper FROM nvram_key_flow WHERE via_wrapper IS NOT NULL"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return frozenset()
+    return frozenset(r[0] for r in rows if r[0])
+
+
+def _nvram_key_from_source(source: Any, wrapper_names: frozenset[str] = frozenset()) -> str | None:
+    """The nvram key if ``source`` is a call_return reading nvram — via a direct getter OR a thin
+    wrapper (``wrapper_names``, from A2) — else None.
+
+    The key is the accessor's first constant string argument (``const_args[0]``) — the exact shape
+    the def-use extractor records for ``nvram_get("wan_proto")`` AND for a thin wrapper forwarding a
+    caller-supplied constant key (a real thin forwarder passes that key straight to one nvram
+    accessor, so the wrapper's const_args[0] IS the key — A2's is_thin test is what earns that
+    equivalence; a non-thin function that computes its own key is never in ``wrapper_names``). An
+    accessor with no resolved const key yields None (honest: the key was not recovered), never a
+    fabricated key."""
     if not isinstance(source, dict) or source.get("kind") != "call_return":
         return None
-    if source.get("callee") not in NVRAM_GETTERS:
+    callee = source.get("callee")
+    if callee not in NVRAM_GETTERS and callee not in wrapper_names:
         return None
     const_args = source.get("const_args")
     if isinstance(const_args, list) and const_args and isinstance(const_args[0], str):
@@ -670,16 +742,22 @@ def _nvram_key_from_source(source: Any) -> str | None:
     return None
 
 
-def _nvram_source_key(flow_evidence: str | None) -> str | None:
-    """Scan the stored sink_arg_provenance for a resolved nvram-getter source and return its key.
+def _nvram_source_key(
+    flow_evidence: str | None, wrapper_names: frozenset[str] = frozenset()
+) -> str | None:
+    """Scan the stored sink_arg_provenance for a resolved nvram-accessor source and return its key.
 
     Looks at each sink's top-level provenance AND the varargs of its stack-buffer writers (where an
-    nvram value most often enters, via ``snprintf("...%s...", nvram_get(key))``). Returns the first
-    resolved key; None when no sink's value came from a recognized nvram getter."""
+    nvram value most often enters, via ``snprintf("...%s...", nvram_get(key))`` or a wrapper of it).
+    Returns the first resolved key; None when no sink's value came from a recognised nvram getter or
+    thin wrapper (``wrapper_names``). A surfaced FIELD (which key is involved) — deliberately broad
+    (not dominance-scoped): naming a key here only makes the candidate visible in the nvram-source
+    view and its source_writability layer; the controllability VERDICT is judged separately and is
+    dominance-scoped, so a broad field can never over-assert control."""
     for rec in _sink_provenance_records(flow_evidence):
         prov = rec.get("provenance")
         prov = prov if isinstance(prov, dict) else {}
-        key = _nvram_key_from_source(prov)
+        key = _nvram_key_from_source(prov, wrapper_names)
         if key is not None:
             return key
         for w in prov.get("writers") or []:
@@ -687,7 +765,7 @@ def _nvram_source_key(flow_evidence: str | None) -> str | None:
                 continue
             for va in w.get("varargs") or []:
                 if isinstance(va, dict):
-                    key = _nvram_key_from_source(va.get("source"))
+                    key = _nvram_key_from_source(va.get("source"), wrapper_names)
                     if key is not None:
                         return key
     return None
@@ -728,25 +806,33 @@ def _dim_controllability(
     sink_anchor: str | None,
     source_kind: str,
     blocking_mechanism: str | None,
+    wrapper_names: frozenset[str] = frozenset(),
 ) -> Dimension:
     """Attacker byte-freedom over the sink argument, from the SINGLE verdict: controllable / free /
-    constrained / constant / unknown.
+    constrained / constant / unknown. A ``controllable`` reading carries a certainty in ``state``:
+    ``proven`` (a hard SaTC cross) or ``likely`` (a weaker router_defaults signal, M2).
 
     Detection FALLBACK CHAIN (⑤), in precedence order — 'single verdict' means PROVENANCE-FIRST,
     source_kind as a fallback, NOT source_kind abandoned:
-      1. controllable — provenance shows a WEB-SETTABLE key (SaTC cross) reaching the sink argument
-         (this phase's only controllable class; a future getenv/recv class rides the ⑦ registry).
-      2. constant     — a provably-constant marker, OR the provenance is COMPLETE and every source
+      1. controllable/proven — provenance shows a proven WEB-SETTABLE key (SaTC front x back cross)
+         reaching the sink argument. The strongest controllability the map asserts.
+      2. controllable/likely — a key READ from nvram (getter or A2 thin wrapper) that reaches the
+         sink is a router_defaults member but NOT a proven cross (M2). Gated to a genuine nvram read
+         and dominance-scoped (via _likely_settable_keys_reaching_sink); ranked below
+         proven-controllable and above the optimistic 'free'. Placed before the constant steps: a
+         dynamic nvram key reaching the arg cannot co-occur with a proven-constant reading — and if
+         the data ever conflicts, promoting is the safe direction.
+      3. constant     — a provably-constant marker, OR the provenance is COMPLETE and every source
          is a proven constant. Checked BEFORE the source_kind fallback so a provenance-DEEP
          all-const candidate (e.g. an ipsec strcpy of a literal) reads constant, not free (demotion
          iron law: incomplete provenance never reads constant).
-      3. free         — FALLBACK to the text-level source_kind=free_string. This is the ONLY path
+      4. free         — FALLBACK to the text-level source_kind=free_string. This is the ONLY path
          that keeps a provenance-SHALLOW legit argv-free candidate (a nanddump/mtdinfo printf whose
          only signal is source_kind) as 'free' instead of collapsing it to unknown — do NOT drop it.
-      4. constrained  — a charset-safe / numeric-shape source.
-      5. unknown      — nothing established; a ? never sinks.
+      5. constrained  — a charset-safe / numeric-shape source.
+      6. unknown      — nothing established; a ? never sinks.
     (An 'external -> free' step for a provenance external marker is reserved for a future phase; the
-    extractor emits no such marker today, so argv-free rides step 3.) The provenance verdict is
+    extractor emits no such marker today, so argv-free rides step 4.) The provenance verdict is
     computed by _verdict_from_provenance — the SAME classifier the explain rollup uses, so a
     candidate carries one controllability reading, never two that disagree."""
     prov_verdict = _verdict_from_provenance(conn, flow_evidence, sink_anchor)
@@ -761,6 +847,23 @@ def _dim_controllability(
             "PROVEN controllable: a user-settable source (SaTC front-end x back-end cross) reaches "
             "the sink argument — the strongest controllability the map asserts, ranked above the "
             "optimistic 'free'",
+        )
+    likely_keys = _likely_settable_keys_reaching_sink(
+        conn, flow_evidence, sink_anchor, wrapper_names
+    )
+    if likely_keys:
+        return Dimension(
+            "controllability",
+            "likely",
+            "controllable",
+            f"sink_arg_provenance: nvram key '{likely_keys[0]}' (a router_defaults member) reaches "
+            "the sink argument",
+            "LIKELY controllable: an nvram key read (via a getter or a thin wrapper) into the sink "
+            "argument is a router_defaults member — an optimistic web-settable signal, not a "
+            "proven SaTC front x back cross. A lead to confirm: ranked below proven-controllable, "
+            "above optimistic 'free'. It may instead be a read-only internal default, and the "
+            "getter value may be shape-constrained — confirm web-settability and an untransformed "
+            "value",
         )
     if blocking_mechanism in PROVABLY_CONSTANT_MARKERS:
         return Dimension(
@@ -823,9 +926,11 @@ def _dim_source_writability(
     nvram_key: str | None, web_settable: dict[str, Any] | None
 ) -> Dimension:
     """If the source is an nvram key, can the web UI set it? By the SaTC front↔back cross —
-    TWO-STATE (④): web_settable / uncertain. There is NO 'not_settable': inferring 'not settable'
-    from a missing front-end field or a missing back-end constant key is a false-negative (a key
-    written via a dynamic-key op is absent from the constant set yet still settable). ✗
+    web_settable (proven) / web_settable (likely, M2) / uncertain. There is NO 'not_settable':
+    inferring 'not settable' from a missing front-end field or a missing back-end constant key is a
+    false-negative (a key written via a dynamic-key op is absent from the constant set yet still
+    settable). The ``likely`` state (router_defaults membership) carries the same value word
+    ``web_settable`` with an honest caveat in ``state``/``note`` — it never masquerades as proven. ✗
     not-applicable when the source is not a resolved nvram key."""
     if nvram_key is None or web_settable is None:
         return Dimension(
@@ -844,6 +949,15 @@ def _dim_source_writability(
             "web_settable",
             f"SaTC cross[{nvram_key}]",
             f"key '{nvram_key}' is a user-editable web key ({src})",
+        )
+    if st == "likely":
+        return Dimension(
+            "source_writability",
+            "likely",
+            "web_settable",
+            f"router_defaults[{nvram_key}]",
+            f"key '{nvram_key}' is LIKELY web-settable — a router_defaults member ({src}); an "
+            "optimistic signal, NOT a proven SaTC cross (may be a read-only internal default)",
         )
     return Dimension(
         "source_writability",
@@ -978,6 +1092,7 @@ def _build_dimensions(
     entry_reach: str,
     nvram_key: str | None,
     sink_anchor: str | None,
+    wrapper_names: frozenset[str] = frozenset(),
 ) -> tuple[Dimension, ...]:
     """The seven honest map layers for one candidate. web_settable is the SaTC front↔back cross,
     looked up once when the source resolved to an nvram key (shared by source_writability); the
@@ -990,6 +1105,7 @@ def _build_dimensions(
             sink_anchor=sink_anchor,
             source_kind=source_kind,
             blocking_mechanism=blocking_mechanism,
+            wrapper_names=wrapper_names,
         ),
         _dim_source_writability(nvram_key, web_settable),
         _dim_reachability(entry_reach),
@@ -1000,7 +1116,11 @@ def _build_dimensions(
     )
 
 
-def _candidate(conn: sqlite3.Connection, row: sqlite3.Row) -> TriageCandidate:
+def _candidate(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    wrapper_names: frozenset[str] = frozenset(),
+) -> TriageCandidate:
     reach = row["reachability_status"]
     fe = _row_get(row, "flow_evidence")
     entry_reach = _entry_reach_status(fe)
@@ -1008,11 +1128,12 @@ def _candidate(conn: sqlite3.Connection, row: sqlite3.Row) -> TriageCandidate:
     sink_class = row["sink_class"]
     blocking = row["blocking_mechanism"]
     sink_anchor = row["sink_anchor"]
-    # The resolved nvram key for the source_writability layer: a recognized nvram getter
-    # (NVRAM_GETTERS) first, else the first web-settable key the verdict found reaching the sink —
-    # so a custom getter wrapper's web-settable key still shows in source_writability, coherent with
-    # the controllability='controllable' reading.
-    nvram_key = _nvram_source_key(fe)
+    # The resolved nvram key for the source_writability layer: a recognized nvram accessor — a
+    # direct getter (NVRAM_GETTERS) OR an A2 thin wrapper (wrapper_names) — first, else the first
+    # web-settable key the verdict found reaching the sink. Wrapper-aware (M1) so a key read through
+    # a shared accessor (the common case) still shows in source_writability and the nvram-source
+    # view, coherent with the controllability reading.
+    nvram_key = _nvram_source_key(fe, wrapper_names)
     if nvram_key is None:
         web_keys = _web_settable_keys_reaching_sink(conn, fe, sink_anchor)
         nvram_key = web_keys[0] if web_keys else None
@@ -1041,6 +1162,7 @@ def _candidate(conn: sqlite3.Connection, row: sqlite3.Row) -> TriageCandidate:
             entry_reach=entry_reach,
             nvram_key=nvram_key,
             sink_anchor=sink_anchor,
+            wrapper_names=wrapper_names,
         ),
     )
 
@@ -1103,16 +1225,35 @@ def filter_candidates(
 # The agent changes only the spine (--sort-by) and the filters; the iron law is fixed. This is what
 # makes every lens safe: no angle can bury a candidate by "not yet known".
 
-# Controllability bands, high rank first. proven-controllable (web-settable / external input) is the
-# NEW top band, ABOVE the optimistic 'free' (source_kind=free_string): a hard SaTC fact outranks an
-# optimistic guess. constant stays the bottom (the demotion iron law sinks it via _is_proven_safe).
+# Controllability bands, high rank first. proven-controllable (a hard SaTC cross) is the top band;
+# likely-controllable (M2: a router_defaults-member nvram key reaching the sink — value
+# 'controllable' with state 'likely') sits just below it via _LIKELY_CONTROLLABLE_RANK, ABOVE the
+# optimistic 'free' (source_kind=free_string): a real-but-unconfirmed nvram key outranks an
+# optimistic guess, and both outrank unknown. constant stays the bottom (the demotion iron law sinks
+# it via _is_proven_safe). Within a sink-impact tier this is the certainty tiebreak; impact is the
+# outer axis, so a likely-controllable cmd still outranks a proven-safe log — harm is respected.
 _CONTROLLABILITY_RANK: dict[str, int] = {
-    "controllable": 4,
+    "controllable": 5,
     "free": 3,
     "constrained": 2,
     "unknown": 1,
     "constant": 0,
 }
+# A 'controllable' reading with state=='likely' (M2) ranks here — between proven-controllable (5)
+# and 'free' (3). The value word stays 'controllable' (so a controllability=controllable filter sees
+# both proven and likely); only state distinguishes the certainty, and only the sort consumes it.
+_LIKELY_CONTROLLABLE_RANK = 4
+
+
+def _controllability_rank(dim: Dimension) -> int:
+    """The sort rank for a controllability dimension: proven-controllable (5) >
+    likely-controllable (4) > free (3) > constrained (2) > unknown (1) > constant (0). The
+    likely/proven split reads the certainty from ``state``; every other value reads from the map."""
+    if dim.value == "controllable" and dim.state == "likely":
+        return _LIKELY_CONTROLLABLE_RANK
+    return _CONTROLLABILITY_RANK.get(dim.value, 1)
+
+
 _REACH_RANK: dict[str, int] = {"found": 2, "unknown": 1, "blocked": 0}
 _VALID_SPINES = frozenset({"impact", "sink_impact", "reachability", "controllability", "by-sink"})
 
@@ -1127,12 +1268,11 @@ def _is_proven_safe(c: TriageCandidate) -> bool:
 
 
 def _sort_atoms(c: TriageCandidate, overrides: dict[str, int] | None) -> dict[str, int]:
-    ctrl = c.dim("controllability").value
     reach = c.dim("reachability").value
     return {
         "proven_safe": int(_is_proven_safe(c)),
         "impact": impact_tier(c.sink_class, overrides),
-        "controllability": _CONTROLLABILITY_RANK.get(ctrl, 1),
+        "controllability": _controllability_rank(c.dim("controllability")),
         "reach_rank": _REACH_RANK.get(reach, 1),
         "reach_promote": 1 if reach == "found" else 0,
         "writer_promote": 1 if c.dim("writer").value == "located" else 0,
@@ -1298,7 +1438,10 @@ def triage(conn: sqlite3.Connection, *, run_id: str | None = None) -> list[Triag
         sql += " WHERE i.source_run_id = ?"
         params.append(run_id)
     rows = conn.execute(sql, params).fetchall()
-    candidates = [_candidate(conn, r) for r in rows]
+    # Compute the A2 thin-nvram-wrapper set ONCE per run (not per candidate) and thread it down —
+    # the candidate-layer source attribution reuses it to recognise wrapper-read keys (M1).
+    wrapper_names = _nvram_wrapper_names(conn)
+    candidates = [_candidate(conn, r, wrapper_names) for r in rows]
     return sort_candidates(candidates, spine="impact")
 
 
@@ -1386,7 +1529,7 @@ def explain_candidate(conn: sqlite3.Connection, evidence_ref: str) -> CandidateE
         )
     row = rows[0]
 
-    candidate = _candidate(conn, row)
+    candidate = _candidate(conn, row, _nvram_wrapper_names(conn))
     claims_does = (
         "present each dimension layer as an observed FACT about this candidate (controllability, "
         "source-writability, reachability, filtering, sink impact, writer, completeness) with its "

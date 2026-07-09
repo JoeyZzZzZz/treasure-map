@@ -306,11 +306,12 @@ def test_web_settable_yes_when_frontend_editable_and_backend_key(tmp_path: Path)
     assert res["web_settable"]["web_settable"] == "yes"  # surfaced through the key-flow reader
 
 
-def test_web_settable_two_state_never_emits_no(tmp_path: Path) -> None:
-    # ④ TWO-STATE: back-end-only (firmver, a read-only display) and front-end-only (Connect_btn, a
-    # UI control) both land 'uncertain', NEVER 'no' — inferring 'not settable' from a missing side
-    # is a false-negative (a key written via a dynamic-key op is absent from the constant set yet
-    # settable). The frontend/backend flags still expose which side was present, honestly.
+def test_web_settable_three_state_never_emits_no(tmp_path: Path) -> None:
+    # ④/M2 THREE-STATE {yes, likely, uncertain}: back-end-only (firmver, a read-only display) and
+    # front-end-only (Connect_btn, a UI control), NEITHER a router_defaults member (no defaults
+    # seeded -> table not located), both land 'uncertain' — NEVER 'no' (inferring 'not settable'
+    # from a missing side is a false-negative) and NEVER 'likely' (not a defaults member). The
+    # frontend/backend flags still expose which side was present, honestly.
     atlas = _seed(
         tmp_path,
         [_flow("firmver", "constant", "httpd", "show", "read")],
@@ -322,10 +323,51 @@ def test_web_settable_two_state_never_emits_no(tmp_path: Path) -> None:
         btn = _web_settable(conn, "Connect_btn")  # front-end only
     finally:
         conn.close()
-    assert firmver["web_settable"] == "uncertain" and firmver["web_settable"] != "no"
+    assert firmver["web_settable"] == "uncertain"
+    assert firmver["web_settable"] not in ("no", "likely")
     assert firmver["backend"] is True and firmver["frontend"] is False
-    assert btn["web_settable"] == "uncertain" and btn["web_settable"] != "no"
+    assert btn["web_settable"] == "uncertain"
+    assert btn["web_settable"] not in ("no", "likely")
     assert btn["frontend"] is True and btn["backend"] is False
+
+
+def test_web_settable_likely_when_router_defaults_member_but_not_a_cross(tmp_path: Path) -> None:
+    # M2 positive: a key that is NOT a proven SaTC cross (back-end read only, no editable front-end
+    # field) but IS a router_defaults member -> 'likely' (the OAuth shape: oauth_auth_code is
+    # read back-end and sits in router_defaults, but is not a front-end form field).
+    atlas = _seed(
+        tmp_path,
+        [_flow("oauth_auth_code", "constant", "httpd", "wrap_read", "read")],
+        defaults=[_default("oauth_auth_code", default_value="")],
+    )
+    conn = open_atlas(atlas)
+    try:
+        ws = _web_settable(conn, "oauth_auth_code")
+        res = get_nvram_key_flow(conn, "oauth_auth_code")
+    finally:
+        conn.close()
+    assert ws["web_settable"] == "likely"  # router_defaults member, not a proven cross
+    assert res["web_settable"]["web_settable"] == "likely"  # surfaced through the key-flow reader
+
+
+def test_web_settable_not_likely_when_not_a_router_defaults_member(tmp_path: Path) -> None:
+    # ★ SEAM #13 guardrail: a key that is NOT a router_defaults member (the table is located AND
+    # complete, another key is present) must NOT read 'likely' — it stays 'uncertain'. This is the
+    # M3 red line in test form: the likely gate is in_router_defaults membership ONLY, never
+    # widened. log_wlstat_dir / productid are exactly this internal-key case.
+    atlas = _seed(
+        tmp_path,
+        [_flow("log_wlstat_dir", "constant", "httpd", "wrap_read", "read")],
+        defaults=[_default("http_passwd", default_value="")],  # located+complete, other key present
+    )
+    conn = open_atlas(atlas)
+    try:
+        ws = _web_settable(conn, "log_wlstat_dir")
+    finally:
+        conn.close()
+    assert ws["router_defaults"]["in_router_defaults"] is False  # definite non-member
+    assert ws["web_settable"] == "uncertain"
+    assert ws["web_settable"] != "likely"  # gate held: membership-only, no false promote
 
 
 def test_web_settable_uncertain_when_frontend_not_collected(tmp_path: Path) -> None:

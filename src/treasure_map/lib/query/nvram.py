@@ -257,18 +257,23 @@ def _web_settable(conn: sqlite3.Connection, key: str) -> dict[str, Any]:
     """Source-side web-settability by a SaTC front/back cross — is ``key`` editable via the web?
 
     Crosses the front-end editable form fields (M1 web_form_fields) against the back-end nvram op
-    keys (nvram_key_flow constant, ALL binaries). TWO-STATE ``web_settable`` — deliberately NO "no":
-      "yes"       — front-end editable AND back-end nvram key: a real, user-settable web key.
-      "uncertain" — EVERYTHING ELSE (front-end field / back-end constant key / naming map not all
-                    present). NOT "no": inferring "not settable" from a missing side is a
-                    false-negative — a truly settable key written via a DYNAMIC-key op is absent
-                    from the constant back-end set, and a front-end miss is not proof of read-only.
-                    A "no" would also behave identically to "uncertain" downstream (both -> verdict
-                    unknown), so it is a decorative state that only adds false-negative risk.
+    keys (nvram_key_flow constant, ALL binaries). THREE-STATE ``web_settable`` — deliberately NO
+    "no":
+      "yes"       — front-end editable AND back-end nvram key: a real, PROVEN user-settable web key.
+      "likely"    — NOT a proven cross, but the key is a ``router_defaults`` member (M2). An
+                    optimistic web-settable signal — most router_defaults keys are user-facing — but
+                    the table also holds read-only internal defaults (nvramver / *_state / *_time),
+                    so it is a LEAD, not proof. Ranked below "yes" everywhere it is consumed.
+      "uncertain" — EVERYTHING ELSE (not a proven cross AND not a router_defaults member). NOT "no":
+                    inferring "not settable" from a missing side is a false-negative — a truly
+                    settable key written via a DYNAMIC-key op is absent from the constant back-end
+                    set, and a front-end miss is not proof of read-only.
     The single failure direction is a MISSED promote (the candidate stays visible, iron-law-safe),
-    NEVER a false one. Direction-safe but possibly slightly WIDE (the all-binary cross may attribute
-    a key to the web when another service is the real writer — a caveat, not a single-service).
-    ``router_defaults`` rides along as an auxiliary reference. A surfaced fact only.
+    NEVER a false one. "likely" only ever ADDS visibility over "uncertain"; it never demotes. The
+    cross is direction-safe but possibly slightly WIDE (the all-binary cross may attribute a key to
+    the web when another service is the real writer — a caveat, not a single-service). A surfaced
+    fact only. RED LINE (M3): the likely tier is a source-side MEMBERSHIP signal — never narrow it
+    with a key-side filter (flags / write-side value / name), which would false-demote a real key.
     """
     frontend = _frontend_settable(conn, key)
     backend = _backend_nvram_key(conn, key)
@@ -276,12 +281,17 @@ def _web_settable(conn: sqlite3.Connection, key: str) -> dict[str, Any]:
     if frontend is True and backend is True:
         verdict = "yes"
         source = "front-end editable field x back-end nvram key (SaTC cross)"
+    elif router.get("in_router_defaults") is True:
+        verdict = "likely"
+        source = (
+            "not a proven SaTC cross, but a router_defaults member — LIKELY web-settable "
+            "(optimistic membership signal, needs review: may also be a read-only internal default)"
+        )
     else:
         verdict = "uncertain"
         source = (
-            "not a proven web-settable key (an editable front-end field, a back-end constant nvram "
-            "key, and the naming map are not all present) — uncertain, NOT 'not settable' (a "
-            "false-negative would be a red-line violation)"
+            "not a proven web-settable key and not a router_defaults member — uncertain, NOT 'not "
+            "settable' (a false-negative would be a red-line violation)"
         )
     return {
         "web_settable": verdict,
@@ -373,8 +383,9 @@ def get_nvram_key_flow(conn: sqlite3.Connection, key: str) -> dict[str, Any]:
         "template_matches": template_matches,
         "unresolved_count": unresolved_count,
         # source-side writability by the SaTC front-end x back-end cross: is this a USER-EDITABLE
-        # nvram key? A TWO-state fact ("yes" / "uncertain") — there is no "no": non-YES is always
-        # uncertain, never a "not settable" inferred from a missing side. router_defaults auxiliary.
+        # nvram key? A THREE-state fact ("yes" / "likely" / "uncertain") — there is no "no":
+        # "likely" is a router_defaults-member signal (M2), non-YES/likely is always uncertain,
+        # never a "not settable" inferred from a missing side. router_defaults drives likely.
         "web_settable": _web_settable(conn, key),
         "coverage": COVERAGE_NOTE,
         "completeness": completeness,
