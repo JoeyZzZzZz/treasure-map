@@ -109,8 +109,9 @@ class TriageCandidate:
     # Which binary to open in the decompiler. Read straight from the atlas (NOT a read-time
     # join back to analysis.db), so a candidate is locatable even when the source build is gone.
     binary_path: str | None
-    # entry-reach status (found / unknown) parsed from the stored flow_evidence — a derived,
-    # evidence-backed signal, NOT a verdict. Feeds the reachability dimension.
+    # entry-reach mechanistic label (entry:web / entry:script / entry:web+script / unknown) parsed
+    # from the stored flow_evidence.entry_reach.sites by site kind — a derived, evidence-backed
+    # signal, NOT a reachability verdict. Feeds the reachability dimension.
     entry_reach: str = "unknown"
     # source_kind (free_string / charset_safe / charset_maybe / unknown) parsed from the stored
     # flow_evidence — the FINE-GRAINED controllability signal the coarse source_class folds away.
@@ -136,21 +137,66 @@ class TriageCandidate:
         return Dimension(name, "unknown", "unknown", "not computed")
 
 
-def _entry_reach_status(flow_evidence: str | None) -> str:
-    """Parse ``entry_reach.status`` from the stored flow_evidence JSON; ``unknown`` when absent.
-
-    Conservative: any missing/unparsable evidence or absent entry_reach reports ``unknown`` (a
-    coverage gap, never "unreachable"), so the asymmetric scorer leaves it untouched."""
+def _entry_reach_sites(flow_evidence: str | None) -> list[dict[str, Any]]:
+    """The ``entry_reach.sites`` list (rootfs invocation evidence) from the stored flow_evidence; []
+    when the evidence is missing, unparsable, or carries no sites. Each site carries a ``kind``
+    (``web_endpoint`` / ``script_call``) — the fact the evidence layer already recorded."""
     if not flow_evidence:
-        return "unknown"
+        return []
     try:
         data = json.loads(flow_evidence)
     except (ValueError, TypeError):
-        return "unknown"
+        return []
     reach = data.get("entry_reach") if isinstance(data, dict) else None
-    if isinstance(reach, dict) and reach.get("status") == "found":
-        return "found"
+    sites = reach.get("sites") if isinstance(reach, dict) else None
+    if not isinstance(sites, list):
+        return []
+    return [s for s in sites if isinstance(s, dict)]
+
+
+def _entry_reach_status(flow_evidence: str | None) -> str:
+    """Classify the rootfs entry evidence into an HONEST, multi-valued MECHANISTIC label, reading
+    each ``entry_reach.sites`` entry's ``kind`` (the fact the evidence layer recorded) — NOT
+    collapsing every site to a single misleading "found":
+
+      ``entry:web``         a web-asset endpoint references this binary (boundary match)
+      ``entry:script``      a boot/rootfs script invokes this binary (exact tail match)
+      ``entry:web+script``  both kinds of reference exist — reported TOGETHER, neither one
+                            preferred over the other (collapsing to one recreates "found")
+      ``unknown``           no site found: a coverage gap, NEVER "unreachable"
+
+    This is a MECHANISTIC label ("the binary name appears on this kind of rootfs edge"), NOT a
+    reachability verdict — it does not decide whether an attacker's input actually arrives here.
+    The caveats live in ``_dim_reachability``'s note. It answers the entry level only; entry->sink
+    flow is a separate, unmodeled question. Conservative: no parseable site reports ``unknown``."""
+    kinds = {s.get("kind") for s in _entry_reach_sites(flow_evidence)}
+    web = "web_endpoint" in kinds
+    script = "script_call" in kinds
+    if web and script:
+        return "entry:web+script"
+    if web:
+        return "entry:web"
+    if script:
+        return "entry:script"
     return "unknown"
+
+
+def _entry_web_triggers(flow_evidence: str | None, *, limit: int = 3) -> tuple[str, ...]:
+    """Short ``"METHOD endpoint"`` labels for the web_endpoint entry sites, so an entry:web reading
+    shows WHICH endpoint triggered it (the consumer confirms the dispatch themselves — a textual
+    reference is not proof). Capped at ``limit``; script sites carry no endpoint and are omitted."""
+    out: list[str] = []
+    for s in _entry_reach_sites(flow_evidence):
+        if s.get("kind") != "web_endpoint":
+            continue
+        ep = s.get("endpoint") or s.get("path") or ""
+        method = s.get("method") or ""
+        label = f"{method} {ep}".strip() if method else str(ep)
+        if label and label not in out:
+            out.append(label)
+        if len(out) >= limit:
+            break
+    return tuple(out)
 
 
 def _source_kind_from_evidence(flow_evidence: str | None) -> str:
@@ -970,24 +1016,53 @@ def _dim_source_writability(
     )
 
 
-def _dim_reachability(entry_reach: str) -> Dimension:
-    """Is there an external entry to this binary? found / unknown (from flow_evidence.entry_reach).
-    A ? is a coverage gap, NEVER 'unreachable' — it never sinks."""
-    if entry_reach == "found":
+# The two mandatory reachability caveats (contract C7 note). Kept as constants so the dimension
+# note, the explain view, and the seam tests read one source of truth. Neither ever collapses into
+# state/value — they stay in the note. The standard-flow caveat is the always-true honest note (a
+# textual reference is not a dispatch proof); the completeness caveat names the unmodeled bridge.
+_REACH_CAVEAT_STANDARD_FLOW = (
+    "a rootfs entry references this binary — a textual reference, NOT proof the input arrives from "
+    "that entry; confirm the endpoint/script actually dispatches here"
+)
+_REACH_CAVEAT_COMPLETENESS = (
+    "service-dispatch / IPC bridges (notify_rc / rc_service: httpd->rc) are NOT modeled, so a "
+    "binary reachable only via that bridge shows entry:script or unknown, never entry:web — "
+    "entry:web is an INCOMPLETE slice of the web-reachable set, and entry:script is not evidence "
+    "of lower reachability"
+)
+
+
+def _dim_reachability(entry_reach: str, web_triggers: tuple[str, ...] = ()) -> Dimension:
+    """Which kind of rootfs entry references this binary? A MECHANISTIC label — entry:web /
+    entry:script / entry:web+script / unknown — NEVER a reachability verdict (it does not decide
+    whether the input arrives) and never a claim about an authentication boundary. ``state`` is
+    proven for any SOUND entry reference (the boundary-matched web edge and the exact-tail script
+    edge are both sound); unknown for a coverage gap. A ? is NEVER 'unreachable' and never sinks.
+    The two caveats (standard-flow + completeness) always ride in ``note`` and never collapse into
+    state/value (contract C7). This answers the ENTRY level only — entry->sink flow within a
+    function is a separate, unmodeled question."""
+    if entry_reach.startswith("entry:"):
+        trig = f" ({', '.join(web_triggers)})" if web_triggers else ""
+        note = (
+            f"{entry_reach}{trig}: {_REACH_CAVEAT_STANDARD_FLOW}. Completeness: "
+            f"{_REACH_CAVEAT_COMPLETENESS}. Entry-level only — tmap does not connect entry->sink "
+            "within a function (sink-level reachability unknown)."
+        )
         return Dimension(
             "reachability",
             "proven",
-            "found",
-            "flow_evidence.entry_reach (rootfs script / web-asset invocation)",
-            "a rootfs entry invokes this binary — NOT proof the input arrives from that entry",
+            entry_reach,
+            "flow_evidence.entry_reach.sites (rootfs script / web-asset reference)",
+            note,
         )
     return Dimension(
         "reachability",
         "unknown",
         "unknown",
-        "flow_evidence.entry_reach",
-        "no rootfs entry found — reported unknown, NOT unreachable (a coverage gap or an "
-        "indirect/dispatch-table call); a ? never sinks",
+        "flow_evidence.entry_reach.sites",
+        "no rootfs script/web entry found — reported unknown (a coverage gap), NOT unreachable: "
+        "the binary may be invoked indirectly, via another binary's exec, or over an unmodeled "
+        "service-dispatch/IPC bridge (notify_rc); a ? never sinks",
     )
 
 
@@ -1090,6 +1165,7 @@ def _build_dimensions(
     blocking_mechanism: str | None,
     sink_class: str,
     entry_reach: str,
+    web_triggers: tuple[str, ...],
     nvram_key: str | None,
     sink_anchor: str | None,
     wrapper_names: frozenset[str] = frozenset(),
@@ -1108,7 +1184,7 @@ def _build_dimensions(
             wrapper_names=wrapper_names,
         ),
         _dim_source_writability(nvram_key, web_settable),
-        _dim_reachability(entry_reach),
+        _dim_reachability(entry_reach, web_triggers),
         _dim_filtering(flow_evidence),
         _dim_sink_impact(sink_class),
         _dim_writer(flow_evidence),
@@ -1124,6 +1200,7 @@ def _candidate(
     reach = row["reachability_status"]
     fe = _row_get(row, "flow_evidence")
     entry_reach = _entry_reach_status(fe)
+    web_triggers = _entry_web_triggers(fe)
     source_kind = _source_kind_from_evidence(fe)
     sink_class = row["sink_class"]
     blocking = row["blocking_mechanism"]
@@ -1160,6 +1237,7 @@ def _candidate(
             blocking_mechanism=blocking,
             sink_class=sink_class,
             entry_reach=entry_reach,
+            web_triggers=web_triggers,
             nvram_key=nvram_key,
             sink_anchor=sink_anchor,
             wrapper_names=wrapper_names,
@@ -1254,7 +1332,22 @@ def _controllability_rank(dim: Dimension) -> int:
     return _CONTROLLABILITY_RANK.get(dim.value, 1)
 
 
-_REACH_RANK: dict[str, int] = {"found": 2, "unknown": 1, "blocked": 0}
+def _reach_is_entry(reach: str) -> bool:
+    """A reachability value that names at least one found rootfs entry edge (entry:web /
+    entry:script / entry:web+script). ``unknown`` (a coverage gap) is not an entry. This is the
+    only-up promote predicate: an entry promotes; an ``unknown`` is strictly NEUTRAL — never
+    demoted (the reachability asymmetry: a proven entry lifts, a ? never sinks)."""
+    return reach.startswith("entry:")
+
+
+def _reach_rank(reach: str) -> int:
+    """Reachability SPINE rank: any found entry edge (2) ranks above ``unknown`` (1). Every entry:*
+    is EQUAL — reachability does not tiebreak web above script (it is an orthogonal filter axis, not
+    a verdict). This preserves the pre-split found>unknown ordering exactly, so reachability never
+    changes the default sort order (contract C5)."""
+    return 2 if _reach_is_entry(reach) else 1
+
+
 _VALID_SPINES = frozenset({"impact", "sink_impact", "reachability", "controllability", "by-sink"})
 
 
@@ -1273,8 +1366,8 @@ def _sort_atoms(c: TriageCandidate, overrides: dict[str, int] | None) -> dict[st
         "proven_safe": int(_is_proven_safe(c)),
         "impact": impact_tier(c.sink_class, overrides),
         "controllability": _controllability_rank(c.dim("controllability")),
-        "reach_rank": _REACH_RANK.get(reach, 1),
-        "reach_promote": 1 if reach == "found" else 0,
+        "reach_rank": _reach_rank(reach),
+        "reach_promote": 1 if _reach_is_entry(reach) else 0,
         "writer_promote": 1 if c.dim("writer").value == "located" else 0,
         "completeness_promote": 1 if c.dim("completeness").value == "complete" else 0,
     }
@@ -1336,12 +1429,35 @@ _DIMENSION_NAMES = frozenset(
 )
 
 
+def _entry_kinds(reach: str) -> frozenset[str]:
+    """The entry kinds named by a reachability value: ``entry:web+script`` -> {web, script},
+    ``entry:web`` -> {web}, ``unknown`` -> {}."""
+    if not reach.startswith("entry:"):
+        return frozenset()
+    return frozenset(reach[len("entry:") :].split("+"))
+
+
+def _reach_filter_match(cand_value: str, filter_value: str) -> bool:
+    """Reachability filter matching — an orthogonal LENS axis that never reduces the map's contents,
+    only the view. ``entry:web`` matches entry:web AND entry:web+script (the candidate has web among
+    its kinds); ``entry:script`` matches entry:script AND entry:web+script; ``entry:web+script``
+    matches only both; ``unknown`` matches unknown. ``found`` is a backward-compatible alias for any
+    found entry edge."""
+    if filter_value in ("unknown", ""):
+        return cand_value == "unknown"
+    if filter_value == "found":  # legacy alias: any found entry edge
+        return _reach_is_entry(cand_value)
+    want = _entry_kinds(filter_value)
+    return bool(want) and want <= _entry_kinds(cand_value)
+
+
 def filter_by_dimension(
     candidates: list[TriageCandidate], dim: str, value: str
 ) -> list[TriageCandidate]:
     """Filter by one dimension's value: ``controllability=free`` / ``sink_impact=cmd`` /
-    ``reachability=found`` / ``writer=located`` / ``source=nvram`` ... ``source=nvram`` is the
-    shorthand for a resolved nvram source key. An unknown dimension name is a no-op (returns all).
+    ``reachability=entry:web`` / ``writer=located`` / ``source=nvram`` ... ``source=nvram`` is the
+    shorthand for a resolved nvram source key; reachability matches by entry kind (see
+    ``_reach_filter_match``). An unknown dimension name is a no-op (returns all).
     """
     v = value.lower()
     if dim == "source":
@@ -1350,6 +1466,10 @@ def filter_by_dimension(
         return candidates
     if dim in ("sink_impact", "sink_class", "sink"):
         return [c for c in candidates if (c.sink_class or "").lower() == v]
+    if dim == "reachability":
+        return [
+            c for c in candidates if _reach_filter_match(c.dim("reachability").value.lower(), v)
+        ]
     if dim in _DIMENSION_NAMES:
         return [c for c in candidates if c.dim(dim).value.lower() == v]
     return candidates
@@ -1382,11 +1502,12 @@ VIEWS: dict[str, dict[str, Any]] = {
     "reachable-only": {
         "filter": ("reachability", "found"),
         "spine": "impact",
-        "desc": "Prune to the web-asset-linked attack surface: only entry_reach=found candidates. "
-        "NOTE this is string-level web-asset (asp) association, NOT call-graph reachability (the "
-        "true reachability of an indirect/dispatch call is still '?' this phase), so this view "
-        "DROPS reachability-'?' candidates that may still be reachable — do not read it as 'all "
-        "reachable candidates'.",
+        "desc": "Prune to candidates with a direct rootfs entry reference — a web-asset endpoint "
+        "or a boot script naming the binary. This is a MECHANISTIC reference, NOT call-graph "
+        "reachability: it is an INCOMPLETE slice — candidates reachable only via an unmodeled "
+        "service-dispatch bridge (notify_rc / rc_service) show entry:script or unknown, so this "
+        "view DROPS them; do not read it as 'all reachable candidates'. Split by reference kind "
+        "with reachability=entry:web / reachability=entry:script.",
     },
 }
 

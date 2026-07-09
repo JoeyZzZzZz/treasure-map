@@ -102,7 +102,14 @@ def _mk_atlas(tmp_path: Path) -> Path:
             scope_origin="intra",
             origin="custom",
             binary_path="usr/sbin/webd",
-            flow_evidence=json.dumps({"entry_reach": {"status": "found", "sites": []}}),
+            flow_evidence=json.dumps(
+                {
+                    "entry_reach": {
+                        "status": "found",
+                        "sites": [{"kind": "web_endpoint", "method": "POST", "endpoint": "/x.cgi"}],
+                    }
+                }
+            ),
         ),
     )
     conn.close()
@@ -242,7 +249,7 @@ def test_list_candidates_carries_anchor_entry_reach_and_note(tmp_path: Path) -> 
     assert any("optimistic" in c.lower() for c in out["caveats"])
     (cand,) = out["candidates"]
     assert cand["evidence_ref"] == "run_m#fn1@cmd"  # anchor present
-    assert cand["entry_reach"] == "found"  # entry-reach surfaced as a derived signal
+    assert cand["entry_reach"] == "entry:web"  # entry-reach surfaced as a derived mechanistic label
     assert "score" not in cand  # the collapsed score is gone
     names = {d["name"] for d in cand["dimensions"]}  # replaced by first-class dimension layers
     assert "controllability" in names and "sink_impact" in names
@@ -258,7 +265,7 @@ def test_list_candidates_exposes_view_catalog_with_when_to_use(tmp_path: Path) -
     for v in views.values():
         assert v["when_to_use"] and v["spine"]  # each carries a goal note + its spine
     assert "nvram-mediated" in views["nvram-source"]["when_to_use"].lower()
-    # reachable-only stays honest: asp link, NOT call-graph reachability.
+    # reachable-only stays honest: a mechanistic reference, NOT call-graph reachability.
     ro = views["reachable-only"]["when_to_use"].lower()
     assert "not call-graph reachability" in ro and "drops" in ro
     # and the tool docstring points the agent at the catalog + the reachable-only caveat.
@@ -431,7 +438,13 @@ def test_explain_and_list_surface_source_kind(tmp_path: Path) -> None:
             origin="custom",
             binary_path="usr/sbin/webd",
             flow_evidence=json.dumps(
-                {"source_kind": "free_string", "entry_reach": {"status": "found", "sites": []}}
+                {
+                    "source_kind": "free_string",
+                    "entry_reach": {
+                        "status": "found",
+                        "sites": [{"kind": "web_endpoint", "method": "POST", "endpoint": "/x.cgi"}],
+                    },
+                }
             ),
         ),
     )
@@ -467,7 +480,7 @@ def test_source_kind_defaults_unknown_and_no_regression(tmp_path: Path) -> None:
     assert ex["source_kind"] == "unknown"  # top-level default when evidence carries none
     assert ex["source_class"] == "external_input"  # coarse class still top-level, not regressed
     assert ex["candidate"]["source_kind"] == "unknown"  # nested value agrees
-    assert ex["candidate"]["entry_reach"] == "found"
+    assert ex["candidate"]["entry_reach"] == "entry:web"
     assert "score" not in ex["candidate"]  # collapsed score gone; dimension layers replace it
     assert {d["name"] for d in ex["candidate"]["dimensions"]}  # non-empty layer set
     cand = tools["list_candidates"]()["candidates"][0]

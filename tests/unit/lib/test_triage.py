@@ -45,6 +45,26 @@ def _pattern(
     )
 
 
+def _entry_sites(spec: str) -> list[dict[str, object]]:
+    """Build entry_reach.sites for a requested reachability outcome, so the read view derives the
+    matching mechanistic label from real site kinds. ``found`` is a legacy alias for a lone web
+    endpoint; ``entry:web`` / ``entry:script`` / ``entry:web+script`` build the named kinds;
+    ``unknown`` builds none."""
+    kinds: set[str] = set()
+    if spec == "found":
+        kinds = {"web"}
+    elif spec.startswith("entry:"):
+        kinds = set(spec[len("entry:") :].split("+"))
+    sites: list[dict[str, object]] = []
+    if "web" in kinds:
+        sites.append(
+            {"kind": "web_endpoint", "method": "POST", "endpoint": "/apply.cgi", "asset": "www/x"}
+        )
+    if "script" in kinds:
+        sites.append({"kind": "script_call", "script": "/etc/init.d/rcS", "line": 3})
+    return sites
+
+
 def _inst(
     conn: sqlite3.Connection,
     pattern_id: int,
@@ -62,10 +82,13 @@ def _inst(
     _FID[0] += 1
     provenance = "L1" if status in {"confirmed", "blocked"} else "L0"
     # flow_evidence: None when neither signal is set; else the minimal payload for whichever of
-    # entry_reach.status / source_kind was requested (both parsed back by the read view).
+    # entry_reach.sites / source_kind was requested (both parsed back by the read view). entry_reach
+    # is now derived from the sites' kinds, so the fixture builds real sites (web_endpoint /
+    # script_call) rather than only a status word.
     evidence: dict[str, object] = {}
     if entry_reach is not None:
-        evidence["entry_reach"] = {"status": entry_reach, "sites": []}
+        sites = _entry_sites(entry_reach)
+        evidence["entry_reach"] = {"status": "found" if sites else "unknown", "sites": sites}
     if source_kind is not None:
         evidence["source_kind"] = source_kind
     flow_evidence = json.dumps(evidence) if evidence else None
@@ -138,11 +161,11 @@ def test_entry_reach_found_promotes_within_tier(tmp_path: Path) -> None:
     conn = _atlas(tmp_path)
     p = _pattern(conn, "fp", sink_class="fmt_string", source_class="external_input")
     _inst(conn, p, status="unknown", fn="local_only", entry_reach="unknown")
-    _inst(conn, p, status="unknown", fn="net_reachable", entry_reach="found")
+    _inst(conn, p, status="unknown", fn="net_reachable", entry_reach="entry:web")
 
     ranked = triage(conn)
     assert [c.function for c in ranked] == ["net_reachable", "local_only"]
-    assert next(c for c in ranked if c.function == "net_reachable").entry_reach == "found"
+    assert next(c for c in ranked if c.function == "net_reachable").entry_reach == "entry:web"
     conn.close()
 
 
@@ -153,7 +176,7 @@ def test_entry_reach_does_not_reverse_sink_impact_order(tmp_path: Path) -> None:
     cmd_p = _pattern(conn, "fp_cmd", sink_class="cmd", source_class="external_input")
     copy_p = _pattern(conn, "fp_copy", sink_class="copy", source_class="external_input")
     _inst(conn, cmd_p, status="unknown", fn="cmd_no_entry", entry_reach="unknown")
-    _inst(conn, copy_p, status="unknown", fn="copy_found", entry_reach="found")
+    _inst(conn, copy_p, status="unknown", fn="copy_found", entry_reach="entry:web")
 
     ranked = triage(conn)
     assert [c.function for c in ranked] == ["cmd_no_entry", "copy_found"]
@@ -161,23 +184,24 @@ def test_entry_reach_does_not_reverse_sink_impact_order(tmp_path: Path) -> None:
 
 
 def test_unknown_reachability_is_never_demoted(tmp_path: Path) -> None:
-    # ★ prove-the-asymmetry: entry_reach only ever PROMOTES 'found'; an 'unknown' (a '?') is
+    # ★ prove-the-asymmetry: a found rootfs entry only ever PROMOTES; an 'unknown' (a '?') is
     # strictly neutral and is never demoted below an otherwise-identical no-signal candidate.
-    from treasure_map.lib.query.triage import _REACH_RANK, _candidate
+    from treasure_map.lib.query.triage import _candidate, _reach_is_entry, _reach_rank
 
     conn = _atlas(tmp_path)
     p = _pattern(conn, "fp", sink_class="cmd", source_class="external_input")
     _inst(conn, p, fn="unknown_entry", entry_reach="unknown")
     _inst(conn, p, fn="no_signal")  # no entry_reach at all -> also 'unknown'
-    _inst(conn, p, fn="found_entry", entry_reach="found")
+    _inst(conn, p, fn="found_entry", entry_reach="entry:web")
     ranked = triage(conn)
     order = [c.function for c in ranked]
-    # found promotes to the top; unknown and no-signal tie (neither demoted) below it.
+    # an entry promotes to the top; unknown and no-signal tie (neither demoted) below it.
     assert order[0] == "found_entry"
     assert set(order[1:]) == {"unknown_entry", "no_signal"}
-    # the rank table carries no negative reachability contribution.
-    assert all(w >= 0 for w in _REACH_RANK.values())
-    assert _REACH_RANK["unknown"] >= _REACH_RANK["blocked"]
+    # the asymmetry: an entry outranks unknown, but unknown is strictly neutral (never negative).
+    assert _reach_rank("entry:web") > _reach_rank("unknown")
+    assert _reach_rank("unknown") >= 1  # a ? carries no negative reachability contribution
+    assert _reach_is_entry("entry:web") and not _reach_is_entry("unknown")
     assert _candidate  # imported symbol still present (dimension builder entry point)
     conn.close()
 
@@ -189,11 +213,144 @@ def test_unknown_entry_external_lead_not_buried(tmp_path: Path) -> None:
     strong = _pattern(conn, "fp_s", sink_class="cmd", source_class="external_input")
     weak = _pattern(conn, "fp_w", sink_class="format", source_class="unknown")
     _inst(conn, strong, fn="unknown_entry_lead", entry_reach="unknown")
-    _inst(conn, weak, fn="found_but_weak", entry_reach="found")
+    _inst(conn, weak, fn="found_but_weak", entry_reach="entry:web")
 
     ranked = triage(conn)
     assert ranked[0].function == "unknown_entry_lead"
     conn.close()
+
+
+# ── reachability honest split: entry:web / entry:script / entry:web+script / unknown (step 2) ──
+
+
+def _reach_by_fn(conn: sqlite3.Connection) -> dict[str, str]:
+    return {c.function: c.dim("reachability").value for c in triage(conn)}  # type: ignore[misc]
+
+
+def test_reachability_splits_found_by_site_kind(tmp_path: Path) -> None:
+    # The old collapsed 'found' splits into an honest, multi-valued mechanistic label read from the
+    # site kinds: web endpoint -> entry:web, boot script -> entry:script, none -> unknown.
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp", sink_class="cmd", source_class="external_input")
+    _inst(conn, p, fn="web_fn", entry_reach="entry:web")
+    _inst(conn, p, fn="script_fn", entry_reach="entry:script")
+    _inst(conn, p, fn="none_fn", entry_reach="unknown")
+    reach = _reach_by_fn(conn)
+    assert reach["web_fn"] == "entry:web"
+    assert reach["script_fn"] == "entry:script"
+    assert reach["none_fn"] == "unknown"
+    conn.close()
+
+
+def test_reachability_multi_value_not_collapsed_to_single_kind(tmp_path: Path) -> None:
+    # A binary referenced by BOTH a web endpoint and a boot script is reported as entry:web+script —
+    # both kinds stated together, neither preferred over the other (collapsing recreates 'found').
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp", sink_class="cmd", source_class="external_input")
+    _inst(conn, p, fn="both_fn", entry_reach="entry:web+script")
+    (c,) = triage(conn)
+    assert c.dim("reachability").value == "entry:web+script"  # not collapsed to entry:web
+    conn.close()
+
+
+def test_reachability_only_ever_proven_or_unknown_four_state(tmp_path: Path) -> None:
+    # ★ contract C4/C7: the reachability axis uses only proven (any sound entry) or unknown (a
+    # coverage gap) — never a fifth state, and never 'likely' (that tier is controllability's).
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp", sink_class="cmd", source_class="external_input")
+    for i, val in enumerate(("entry:web", "entry:script", "entry:web+script", "unknown")):
+        _inst(conn, p, fn=f"fn{i}", entry_reach=val)
+    for c in triage(conn):
+        d = c.dim("reachability")
+        assert d.state in {"proven", "unknown"}  # never likely / excluded on this axis
+        assert (d.state == "proven") == d.value.startswith("entry:")
+        assert "sink:" not in d.value  # entry-level only — never asserts sink-level reachability
+
+
+def test_reachability_web_note_carries_endpoint_and_method(tmp_path: Path) -> None:
+    # entry:web / entry:web+script presentation names the triggering endpoint + method so the
+    # consumer can confirm the dispatch themselves.
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp", sink_class="cmd", source_class="external_input")
+    _inst(conn, p, fn="web_fn", entry_reach="entry:web")
+    (c,) = triage(conn)
+    note = c.dim("reachability").note
+    assert "POST" in note and "/apply.cgi" in note
+    conn.close()
+
+
+def test_reachability_entry_note_has_two_caveats_and_no_pre_auth(tmp_path: Path) -> None:
+    # ★ seam (contract C7 note, mechanistic-label invariant): an entry:web note carries BOTH the
+    # standard-flow caveat (textual reference != dispatch proof) and the completeness caveat
+    # (service-dispatch/notify_rc unmodeled), and NEVER a pre-auth/attack-surface claim.
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp", sink_class="cmd", source_class="external_input")
+    _inst(conn, p, fn="web_fn", entry_reach="entry:web")
+    _inst(conn, p, fn="script_fn", entry_reach="entry:script")
+    by_fn = {c.function: c for c in triage(conn)}
+    for fn in ("web_fn", "script_fn"):
+        note = by_fn[fn].dim("reachability").note.lower()
+        assert "not proof" in note or "textual reference" in note  # standard-flow caveat
+        assert "notify_rc" in note and "not modeled" in note  # completeness caveat
+        assert "pre-auth" not in note  # mechanistic label, never a pre-auth attack-surface claim
+    # entry:script must NOT read as 'probably unreachable' (a gap is not lower reachability).
+    assert "probably unreachable" not in by_fn["script_fn"].dim("reachability").note.lower()
+    conn.close()
+
+
+def test_reachability_filter_axis_matches_by_kind_without_reducing_map(tmp_path: Path) -> None:
+    # ★ reachability is an orthogonal filter axis: entry:web matches entry:web AND entry:web+script;
+    # entry:script matches entry:script AND entry:web+script. The underlying map is never reduced —
+    # filtering is a lens over the same candidates.
+    from treasure_map.lib.query.triage import filter_by_dimension
+
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp", sink_class="cmd", source_class="external_input")
+    _inst(conn, p, fn="web_fn", entry_reach="entry:web")
+    _inst(conn, p, fn="script_fn", entry_reach="entry:script")
+    _inst(conn, p, fn="both_fn", entry_reach="entry:web+script")
+    _inst(conn, p, fn="none_fn", entry_reach="unknown")
+    cands = triage(conn)
+    assert len(cands) == 4  # the full map
+    web = {c.function for c in filter_by_dimension(cands, "reachability", "entry:web")}
+    script = {c.function for c in filter_by_dimension(cands, "reachability", "entry:script")}
+    unknown = {c.function for c in filter_by_dimension(cands, "reachability", "unknown")}
+    assert web == {"web_fn", "both_fn"}  # web+script has web among its kinds
+    assert script == {"script_fn", "both_fn"}
+    assert unknown == {"none_fn"}
+    assert len(triage(conn)) == 4  # the map itself is unchanged by any filter
+    conn.close()
+
+
+def test_reachability_does_not_change_default_sort_web_vs_script(tmp_path: Path) -> None:
+    # ★ contract C5: reachability does not tiebreak — entry:web and entry:script are equal on the
+    # sort. Two otherwise-identical candidates keep the deterministic (function-name) order
+    # regardless of which entry kind each carries.
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp", sink_class="cmd", source_class="external_input")
+    _inst(conn, p, fn="aaa_script", entry_reach="entry:script")
+    _inst(conn, p, fn="bbb_web", entry_reach="entry:web")
+    order = [c.function for c in triage(conn)]
+    assert order == ["aaa_script", "bbb_web"]  # web not lifted above script; tiebreak is the name
+    conn.close()
+
+
+def test_reachability_source_has_no_pre_auth_vocabulary() -> None:
+    # ★ mechanistic-label red line (grep): no reachability-axis string attaches a 'pre-auth attack
+    # surface' claim to an entry reference (scoped to the reachability strings — other axes may
+    # legitimately note a wan-daemon's pre-auth exposure on the controllability side).
+    import importlib
+
+    mod = importlib.import_module("treasure_map.lib.query.triage")  # module, not the shadowed fn
+    reach_strings = " ".join(
+        [
+            mod._REACH_CAVEAT_STANDARD_FLOW,
+            mod._REACH_CAVEAT_COMPLETENESS,
+            mod.VIEWS["reachable-only"]["desc"],
+        ]
+    ).lower()
+    assert "pre-auth" not in reach_strings
+    assert "attack surface" not in reach_strings
 
 
 # ── source_kind exposure -> controllability layer ──
@@ -216,7 +373,7 @@ def test_source_kind_defaults_to_unknown_when_absent(tmp_path: Path) -> None:
     # "unknown" — a missing signal is never fabricated into a class.
     conn = _atlas(tmp_path)
     p = _pattern(conn, "fp")
-    _inst(conn, p, fn="entry_only", entry_reach="found")  # evidence present, no source_kind
+    _inst(conn, p, fn="entry_only", entry_reach="entry:web")  # evidence present, no source_kind
     _inst(conn, p, fn="no_evidence")  # no flow_evidence at all
     by_fn = {c.function: c for c in triage(conn)}
     assert by_fn["entry_only"].source_kind == "unknown"
@@ -363,7 +520,7 @@ def _seed_for_cli(tmp_path: Path) -> Path:
         fn="rc_fn",
         run_id="run_cli",
         source_kind="free_string",
-        entry_reach="found",
+        entry_reach="entry:web",
     )
     _inst(conn, cmd_p, status="unknown", origin="custom", fn="tv_fn", run_id="run_cli")
     _inst(
@@ -675,7 +832,7 @@ def test_cli_sort_by_reachability_preserves_iron_law(tmp_path: Path) -> None:
     # thing that ever sinks is a proven-safe (constant) controllability, under EVERY spine.
     conn = _atlas(tmp_path)
     p = _pattern(conn, "fp", sink_class="cmd", source_class="external_input")
-    _inst(conn, p, fn="found_lead", entry_reach="found", run_id="run_s")
+    _inst(conn, p, fn="found_lead", entry_reach="entry:web", run_id="run_s")
     _inst(conn, p, fn="unknown_lead", entry_reach="unknown", run_id="run_s")
     conn.close()
     atlas = tmp_path / "atlas.db"
@@ -717,12 +874,15 @@ def test_every_view_carries_a_when_to_use_note() -> None:
     for name, preset in VIEWS.items():
         assert preset.get("desc"), f"view {name} is missing a when-to-use desc"
         assert "spine" in preset
-    # reachable-only must be honest that it is a web-asset (asp) link, NOT call-graph reachability,
-    # so an agent does not mistake it for 'all reachable candidates'.
+    # reachable-only must be honest that it is a mechanistic reference (web-asset endpoint or boot
+    # script), NOT call-graph reachability, and an INCOMPLETE slice (service-dispatch bridges like
+    # notify_rc are unmodeled) — so an agent does not mistake it for 'all reachable candidates'.
     ro = VIEWS["reachable-only"]["desc"].lower()
-    assert "asp" in ro or "web-asset" in ro
+    assert "web-asset" in ro
     assert "not call-graph reachability" in ro
-    assert "drops" in ro  # states that it can drop reachability-'?' candidates
+    assert "incomplete" in ro and "notify_rc" in ro  # names the unmodeled service-dispatch gap
+    assert "drops" in ro  # states that it can drop service-dispatch-only candidates
+    assert "pre-auth" not in ro  # mechanistic label, never a pre-auth attack-surface claim
 
 
 def test_cli_view_help_lists_when_to_use() -> None:

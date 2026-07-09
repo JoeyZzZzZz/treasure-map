@@ -152,7 +152,7 @@ def _parse_dim_filters(spec: str | None) -> list[tuple[str, str]]:
     """Parse a ``"dim=value,dim2=value2"`` filter string into (dim, value) pairs; blank/None -> [].
 
     Used for the map's dimension filters (controllability=free / sink_impact=cmd / source=nvram /
-    reachability=found ...). Malformed fragments (no '=') are skipped, never guessed."""
+    reachability=entry:web ...). Malformed fragments (no '=') are skipped, never guessed."""
     if not spec:
         return []
     out: list[tuple[str, str]] = []
@@ -270,12 +270,12 @@ def make_tools(
         - ``sort_by``: pivot axis — impact (default) / controllability / reachability / by-sink.
         - ``view``: preset lens for a hunting goal — ``default`` (balanced start), ``by-sink``
           (sweep one sink class, e.g. all system()), ``nvram-source`` (hunt nvram-mediated bugs —
-          the router-bug hotspot), ``reachable-only`` (prune to web-asset-linked candidates; NOTE
-          this is string-level asp association, NOT call-graph reachability, so it drops
-          reachability-'?' candidates that may still be reachable). The result's ``available_views``
-          lists every preset with its when-to-use note.
+          the router-bug hotspot), ``reachable-only`` (prune to candidates with a direct rootfs
+          entry reference — a MECHANISTIC reference, NOT call-graph reachability; an INCOMPLETE
+          slice that drops candidates reachable only via an unmodeled service-dispatch bridge like
+          notify_rc). The result's ``available_views`` lists every preset with its when-to-use note.
         - ``filters``: dimension filters, ``"dim=value,dim2=value2"`` (controllability=free /
-          sink_impact=cmd / source=nvram / reachability=found / writer=located ...).
+          sink_impact=cmd / source=nvram / reachability=entry:web / writer=located ...).
         - ``impact_order``: override the impact tiers, e.g. ``"cmd=fmt_string,copy,log"``.
 
         Legacy filters still apply: ``sink`` (callee OR class), ``sink_class`` (exact), ``status``

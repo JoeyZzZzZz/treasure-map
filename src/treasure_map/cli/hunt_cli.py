@@ -583,15 +583,16 @@ def _reachability_inline(status: str) -> str:
     default=None,
     help="A preset lens for a hunting goal: default (balanced start) | by-sink (sweep one sink "
     "class, e.g. all system()) | nvram-source (hunt nvram-mediated bugs — the router-bug hotspot) "
-    "| reachable-only (prune to web-asset-linked candidates — NOTE string-level asp association, "
-    "NOT call-graph reachability, so it drops reachability-'?' candidates that may still reach).",
+    "| reachable-only (prune to candidates with a direct rootfs entry reference — a MECHANISTIC "
+    "reference, NOT call-graph reachability, an incomplete slice that drops candidates reachable "
+    "only via an unmodeled service-dispatch bridge like notify_rc).",
 )
 @click.option(
     "--filter",
     "dim_filter_specs",
     multiple=True,
     help="Filter by a dimension: dim=value (controllability=free / sink_impact=cmd / source=nvram "
-    "/ reachability=found / writer=located). Repeatable.",
+    "/ reachability=entry:web / writer=located). Repeatable.",
 )
 @click.option(
     "--impact-order",
