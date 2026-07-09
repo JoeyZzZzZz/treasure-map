@@ -353,6 +353,133 @@ def test_reachability_source_has_no_pre_auth_vocabulary() -> None:
     assert "attack surface" not in reach_strings
 
 
+# ── circle-and-weight: --filter reachability FLOATS matches, NEVER reduces the corpus (修法1) ──
+
+
+def _mk_reach_corpus(conn: sqlite3.Connection) -> None:
+    p = _pattern(conn, "fp", sink_class="cmd", source_class="external_input")
+    _inst(conn, p, fn="web_fn", entry_reach="entry:web")
+    _inst(conn, p, fn="script_fn", entry_reach="entry:script")
+    _inst(conn, p, fn="both_fn", entry_reach="entry:web+script")
+    _inst(conn, p, fn="none_a", entry_reach="unknown")
+    _inst(conn, p, fn="none_b", entry_reach="unknown")
+
+
+def test_filter_reachability_never_reduces_corpus(tmp_path: Path) -> None:
+    # ★ 修法1 seam: an explicit reachability filter is a circle-and-weight lens — the candidate
+    # corpus is IDENTICAL to the no-filter corpus for EVERY value, including entry:web (which on
+    # this corpus matches web_fn/both_fn) and an entry that matches nothing.
+    from treasure_map.lib.query import apply_view
+
+    conn = _atlas(tmp_path)
+    _mk_reach_corpus(conn)
+    base = len(triage(conn))
+    assert base == 5
+    for val in ("entry:web", "entry:script", "entry:web+script", "unknown", "found"):
+        lensed = apply_view(triage(conn), dim_filters=[("reachability", val)])
+        assert len(lensed) == base, f"reachability={val} reduced the corpus to {len(lensed)}"
+    conn.close()
+
+
+def test_filter_reachability_floats_matches_to_top(tmp_path: Path) -> None:
+    # Matched candidates float to the first screen; non-matching stay listed after (never dropped).
+    from treasure_map.lib.query import apply_view
+
+    conn = _atlas(tmp_path)
+    _mk_reach_corpus(conn)
+    lensed = apply_view(triage(conn), dim_filters=[("reachability", "entry:web")])
+    fns = [c.function for c in lensed]
+    assert set(fns[:2]) == {"web_fn", "both_fn"}  # both carry a web reference -> floated
+    assert set(fns) == {"web_fn", "script_fn", "both_fn", "none_a", "none_b"}  # nothing dropped
+    conn.close()
+
+
+def test_filter_reachability_empty_match_keeps_full_list(tmp_path: Path) -> None:
+    # A reachability value with ZERO matches keeps the WHOLE list (in normal lens order) — never an
+    # empty view, never "0 candidates".
+    from treasure_map.lib.query import apply_view
+
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp", sink_class="cmd", source_class="external_input")
+    _inst(conn, p, fn="s1", entry_reach="entry:script")
+    _inst(conn, p, fn="s2", entry_reach="unknown")
+    lensed = apply_view(triage(conn), dim_filters=[("reachability", "entry:web")])
+    assert {c.function for c in lensed} == {"s1", "s2"}  # 0 web matches, but the list is whole
+    conn.close()
+
+
+def test_reachability_match_count_counts_without_reducing(tmp_path: Path) -> None:
+    from treasure_map.lib.query import reachability_match_count
+
+    conn = _atlas(tmp_path)
+    _mk_reach_corpus(conn)
+    corpus = triage(conn)
+    assert reachability_match_count(corpus, ["entry:web"]) == 2  # web_fn + both_fn
+    assert reachability_match_count(corpus, ["entry:script"]) == 2  # script_fn + both_fn
+    assert reachability_match_count(corpus, ["entry:web+script"]) == 1  # both_fn only
+    assert len(corpus) == 5  # counting never touched the corpus
+    conn.close()
+
+
+def test_property_reachability_filter_corpus_invariant(tmp_path: Path) -> None:
+    # ★ property guard (修法1): for ANY reachability value — including an unrecognized one — the
+    # corpus size equals the no-filter size. The anti-regression lock: a future reachability value
+    # can never take a reduce path. (Reachability is the circle-and-weight axis this fix owns.)
+    from treasure_map.lib.query import apply_view
+
+    conn = _atlas(tmp_path)
+    _mk_reach_corpus(conn)
+    base = len(triage(conn))
+    for val in ("entry:web", "entry:script", "entry:web+script", "unknown", "found", "nonsense"):
+        got = len(apply_view(triage(conn), dim_filters=[("reachability", val)]))
+        assert got == base, f"reachability={val} changed the corpus size ({got} != {base})"
+    conn.close()
+
+
+def test_other_dim_filters_still_reduce_known_debt(tmp_path: Path) -> None:
+    # KNOWN OLD DEBT (pre-existing, NOT introduced by the reachability split): every OTHER --filter
+    # dimension (controllability / source / writer / sink_impact) still REDUCES the corpus via
+    # filter_by_dimension. Documented here so the debt is visible + green and flagged for Joey to
+    # decide (fix uniformly, or ledger). The reachability fix deliberately did NOT touch these.
+    from treasure_map.lib.query import apply_view
+
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp", sink_class="cmd", source_class="external_input")
+    _inst(conn, p, fn="free_fn", source_kind="free_string")  # controllability free
+    _inst(conn, p, fn="opaque_fn")  # controllability unknown
+    base = len(triage(conn))
+    assert base == 2
+    reduced = apply_view(triage(conn), dim_filters=[("controllability", "free")])
+    assert len(reduced) == 1  # controllability=free STILL reduces the corpus (documented old debt)
+    conn.close()
+
+
+def test_cli_filter_reachability_header_shows_full_corpus(tmp_path: Path) -> None:
+    # ★ 修法1 CLI seam (the reported bug): the header candidate total is the FULL corpus under a
+    # reachability filter, with a separate match count — never the matched count masquerading as the
+    # candidate base.
+    import re
+
+    conn = _atlas(tmp_path)
+    _mk_reach_corpus(conn)
+    conn.close()
+    atlas = tmp_path / "atlas.db"
+
+    def total(out: str) -> int:
+        m = re.search(r"\((\d+) candidates:", out)
+        assert m is not None, out
+        return int(m.group(1))
+
+    base = CliRunner().invoke(triage_cmd, ["run_1", "--all", "--atlas", str(atlas)])
+    web = CliRunner().invoke(
+        triage_cmd, ["run_1", "--all", "--filter", "reachability=entry:web", "--atlas", str(atlas)]
+    )
+    assert total(base.output) == 5
+    assert total(web.output) == 5  # NOT reduced to the 2 matches
+    assert "2 match of 5" in web.output  # match count shown separately, not as the base
+    assert "corpus NOT reduced" in web.output
+
+
 # ── source_kind exposure -> controllability layer ──
 
 

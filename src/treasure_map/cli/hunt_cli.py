@@ -313,6 +313,7 @@ def _render_triage(
     sink: str | None,
     include_gated: bool,
     as_json: bool,
+    reach_note: str | None = None,
 ) -> None:
     """Render the candidate map under the current lens. Shared by `tmap triage` and `tmap scan`.
 
@@ -383,6 +384,8 @@ def _render_triage(
         f"{counts['gated']} gated)"
     )
     click.echo(f"  lens: {lens_label}")
+    if reach_note is not None:
+        click.echo(f"  {reach_note}")
     if sink is not None:
         click.echo(f"  filter: sink = {sink}   ({len(visible)} shown, all statuses)")
     elif top_n is not None and len(candidates) > top_n:
@@ -653,7 +656,12 @@ def triage(
     """
     from treasure_map.lib.atlas.connection import open_atlas
     from treasure_map.lib.config.config import load_config
-    from treasure_map.lib.query import DEFAULT_LENS_LABEL, PHASE1_CAVEATS, explain_candidate
+    from treasure_map.lib.query import (
+        DEFAULT_LENS_LABEL,
+        PHASE1_CAVEATS,
+        explain_candidate,
+        reachability_match_count,
+    )
     from treasure_map.lib.query import apply_view as run_apply_view
     from treasure_map.lib.query import parse_impact_order as run_parse_impact_order
     from treasure_map.lib.query import triage as run_triage
@@ -722,6 +730,17 @@ def triage(
         _render_explain(explanation, as_json=as_json)
         return
 
+    # A reachability --filter is a circle-and-weight lens, not a reducer: report how many candidates
+    # match while the corpus (candidate total) stays whole.
+    reach_vals = [v for d, v in dim_filters if d == "reachability"]
+    reach_note = None
+    if reach_vals:
+        n_match = reachability_match_count(candidates, reach_vals)
+        reach_note = (
+            f"reachability={'/'.join(reach_vals)} → {n_match} match of {len(candidates)} "
+            "(circle-and-weight lens: matches float to the top, corpus NOT reduced)"
+        )
+
     _render_triage(
         candidates,
         run_label=selected_run if selected_run is not None else "all runs",
@@ -732,6 +751,7 @@ def triage(
         sink=sink,
         include_gated=include_gated,
         as_json=as_json,
+        reach_note=reach_note,
     )
 
 

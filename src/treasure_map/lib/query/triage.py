@@ -1512,6 +1512,38 @@ VIEWS: dict[str, dict[str, Any]] = {
 }
 
 
+def _float_reachability(
+    candidates: list[TriageCandidate], reach_filters: list[tuple[str, str]]
+) -> list[TriageCandidate]:
+    """Circle-and-weight the reachability lens: candidates matching an explicit ``--filter
+    reachability=<x>`` FLOAT to the first screen but the corpus is NEVER reduced — every candidate
+    stays listed (the triage iron law: re-rank, never reduce). The demotion iron law still rides:
+    a proven-safe candidate stays sunk even when it matches. Stable, so the lens order within each
+    band is preserved."""
+    values = [v for _, v in reach_filters]
+
+    def band(c: TriageCandidate) -> int:
+        if _is_proven_safe(c):
+            return 2  # proven-safe sinks in every lens, matched or not
+        matched = all(
+            _reach_filter_match(c.dim("reachability").value.lower(), v.lower()) for v in values
+        )
+        return 0 if matched else 1
+
+    return sorted(candidates, key=band)
+
+
+def reachability_match_count(candidates: list[TriageCandidate], values: list[str]) -> int:
+    """How many candidates match ALL of the given reachability filter values — a COUNT only, never
+    a reduction of the map. Lets a consumer annotate the lens header (matched N of the whole corpus)
+    while the corpus itself stays whole."""
+    return sum(
+        1
+        for c in candidates
+        if all(_reach_filter_match(c.dim("reachability").value.lower(), v.lower()) for v in values)
+    )
+
+
 def apply_view(
     candidates: list[TriageCandidate],
     *,
@@ -1520,24 +1552,35 @@ def apply_view(
     dim_filters: list[tuple[str, str]] | None = None,
     impact_overrides: dict[str, int] | None = None,
 ) -> list[TriageCandidate]:
-    """Resolve a ``view`` preset (+ explicit ``sort_by`` / ``dim_filters`` overrides) into a
-    filtered, sorted list. ``dim_filters`` is a list of (dim, value). The demotion iron law rides
-    regardless of the chosen spine — no lens can bury a ? candidate."""
+    """Resolve a ``view`` preset (+ explicit ``sort_by`` / ``dim_filters`` overrides) into a sorted
+    lens. ``dim_filters`` is a list of (dim, value). The demotion iron law rides regardless of the
+    chosen spine — no lens can bury a ? candidate.
+
+    An explicit ``--filter reachability=<x>`` is a circle-and-weight FLOAT: it lifts matches to the
+    first screen but NEVER reduces the corpus (re-rank, never reduce). Every OTHER explicit
+    dimension filter still narrows the set (existing behavior), as does a preset ``view``'s own
+    filter (a preset like ``reachable-only`` is an explicit prune)."""
     spine = "impact"
-    filters: list[tuple[str, str]] = []
+    hard_filters: list[tuple[str, str]] = []
     if view and view in VIEWS:
         preset = VIEWS[view]
         spine = preset["spine"]
         if preset["filter"]:
-            filters.append(preset["filter"])
+            hard_filters.append(preset["filter"])
     if sort_by:
         spine = sort_by
-    if dim_filters:
-        filters.extend(dim_filters)
+    # Split explicit dimension filters: reachability floats (never reduces the corpus); the rest
+    # narrow the set as before.
+    reach_floats: list[tuple[str, str]] = []
+    for d, v in dim_filters or []:
+        (reach_floats if d == "reachability" else hard_filters).append((d, v))
     out = list(candidates)
-    for d, val in filters:
+    for d, val in hard_filters:
         out = filter_by_dimension(out, d, val)
-    return sort_candidates(out, spine=spine, impact_overrides=impact_overrides)
+    out = sort_candidates(out, spine=spine, impact_overrides=impact_overrides)
+    if reach_floats:
+        out = _float_reachability(out, reach_floats)
+    return out
 
 
 def triage(conn: sqlite3.Connection, *, run_id: str | None = None) -> list[TriageCandidate]:
