@@ -313,9 +313,15 @@ def _render_triage(
     sink: str | None,
     include_gated: bool,
     as_json: bool,
-    reach_note: str | None = None,
+    corpus_size: int | None = None,
+    filter_note: str | None = None,
 ) -> None:
     """Render the candidate map under the current lens. Shared by `tmap triage` and `tmap scan`.
+
+    ``corpus_size`` is the full corpus count (the invariant total); when an ``--only`` sweep has
+    reduced the displayed view below it, the header shows ``corpus N · sweep shows M``. Absent (or
+    equal to the shown count), the header reads ``N candidates`` as before. ``filter_note`` is the
+    circle-and-weight ``--filter`` line (match count while the corpus stays whole).
 
     candidates arrives already projected into the active lens (apply_view sorted+filtered it). The
     row number # is the position in THAT lens order, so #N is safe to pass to --explain (which
@@ -378,14 +384,21 @@ def _render_triage(
         )
         return
 
-    click.echo(
-        f"triage: {run_label}   ({len(candidates)} candidates: "
-        f"{counts['reachable']} reachable, {counts['to-verify']} to-verify, "
-        f"{counts['gated']} gated)"
+    counts_str = (
+        f"{counts['reachable']} reachable, {counts['to-verify']} to-verify, {counts['gated']} gated"
     )
+    if corpus_size is not None and corpus_size != len(candidates):
+        # --only prune: the corpus stays whole, the sweep is a reduced VIEW (its own honest header,
+        # never the "never reduce" footer's promise).
+        click.echo(
+            f"triage: {run_label}   (corpus {corpus_size} · sweep shows {len(candidates)} "
+            f"(pruned view): {counts_str})"
+        )
+    else:
+        click.echo(f"triage: {run_label}   ({len(candidates)} candidates: {counts_str})")
     click.echo(f"  lens: {lens_label}")
-    if reach_note is not None:
-        click.echo(f"  {reach_note}")
+    if filter_note is not None:
+        click.echo(f"  {filter_note}")
     if sink is not None:
         click.echo(f"  filter: sink = {sink}   ({len(visible)} shown, all statuses)")
     elif top_n is not None and len(candidates) > top_n:
@@ -594,8 +607,18 @@ def _reachability_inline(status: str) -> str:
     "--filter",
     "dim_filter_specs",
     multiple=True,
-    help="Filter by a dimension: dim=value (controllability=free / sink_impact=cmd / source=nvram "
-    "/ reachability=entry:web / writer=located). Repeatable.",
+    help="Circle-and-weight a dimension: dim=value (controllability=free / sink_impact=cmd / "
+    "source=nvram / reachability=entry:web / writer=located). Matches FLOAT to the first screen; "
+    "the corpus is never reduced (every candidate stays listed). Repeatable (AND).",
+)
+@click.option(
+    "--only",
+    "only_specs",
+    multiple=True,
+    help="SWEEP mode — prune the view to dim=value (e.g. sink_class=cmd). Reduces the shown set, "
+    "but the corpus total stays whole in the header. Accepted only on a ground-truth dimension "
+    "(sink_class/sink_impact); refused on an optimistic one (controllability/source/...) — use "
+    "--filter there. Repeatable; combinable with --filter (sweep, then float within it).",
 )
 @click.option(
     "--impact-order",
@@ -637,6 +660,7 @@ def triage(
     sort_by: str | None,
     view: str | None,
     dim_filter_specs: tuple[str, ...],
+    only_specs: tuple[str, ...],
     impact_order: str | None,
     as_json: bool,
     explain_ref: str | None,
@@ -660,7 +684,8 @@ def triage(
         DEFAULT_LENS_LABEL,
         PHASE1_CAVEATS,
         explain_candidate,
-        reachability_match_count,
+        filter_match_count,
+        only_refusal,
     )
     from treasure_map.lib.query import apply_view as run_apply_view
     from treasure_map.lib.query import parse_impact_order as run_parse_impact_order
@@ -672,6 +697,7 @@ def triage(
     resolved_atlas = atlas_path if atlas_path is not None else cfg.atlas.db_path
 
     dim_filters = _parse_dim_filters(dim_filter_specs)
+    only_filters = _parse_dim_filters(only_specs)
     overrides = run_parse_impact_order(impact_order) if impact_order else None
     lens_label = _lens_label(
         DEFAULT_LENS_LABEL,
@@ -682,45 +708,51 @@ def triage(
     )
 
     def _lensed(cands: list[TriageCandidate]) -> list[TriageCandidate]:
-        """Project the full candidate list into the current lens (sort + dimension filters). The
-        SAME projection feeds the rendered list and the --explain N index, so #N is consistent."""
+        """Project the full candidate list into the current lens (sort + --filter float + --only
+        sweep). The SAME projection feeds the rendered list and the --explain N index, so #N is
+        consistent."""
         return run_apply_view(
             cands,
             view=view,
             sort_by=sort_by,
             dim_filters=dim_filters,
+            only_filters=only_filters,
             impact_overrides=overrides or None,
         )
 
     explanation: CandidateExplanation | None = None
     error: str | None = None
+    corpus_size = 0
     conn = open_atlas(resolved_atlas)
     try:
-        if explain_ref is not None:
-            if explain_ref.isdigit():
-                # --explain N: resolve the Nth candidate in the SAME lens order the rendered # uses,
-                # then reuse the evidence_ref path. No new explain logic.
-                cands = _lensed(run_triage(conn, run_id=selected_run))
-                n = int(explain_ref)
-                if 1 <= n <= len(cands):
-                    ref = cands[n - 1].evidence_ref
-                    explanation = explain_candidate(conn, ref) if ref else None
-                else:
-                    run_hint = selected_run if selected_run is not None else "<run>"
-                    error = (
-                        f"rank {n} out of range; {len(cands)} candidates — "
-                        f"run `tmap triage {run_hint}` to list"
-                    )
-            else:
-                explanation = explain_candidate(conn, explain_ref)
+        if explain_ref is not None and not explain_ref.isdigit():
+            explanation = explain_candidate(conn, explain_ref)
         else:
-            candidates = _lensed(run_triage(conn, run_id=selected_run))
+            full = run_triage(conn, run_id=selected_run)
+            # --only prune is refused on a dimension that is not a proven ground truth on THIS
+            # corpus (would silently hide unknown/null candidates) — same refusal for CLI and MCP.
+            error = only_refusal(only_filters, full)
+            if error is None:
+                corpus_size = len(full)
+                candidates = _lensed(full)
+                if explain_ref is not None:  # --explain N: resolve N under the SAME lens order
+                    n = int(explain_ref)
+                    if 1 <= n <= len(candidates):
+                        ref = candidates[n - 1].evidence_ref
+                        explanation = explain_candidate(conn, ref) if ref else None
+                    else:
+                        run_hint = selected_run if selected_run is not None else "<run>"
+                        error = (
+                            f"rank {n} out of range; {len(candidates)} candidates — "
+                            f"run `tmap triage {run_hint}` to list"
+                        )
     finally:
         conn.close()
 
+    if error is not None:
+        raise click.ClickException(error)
+
     if explain_ref is not None:
-        if error is not None:
-            raise click.ClickException(error)
         if explanation is None:
             run_hint = explain_ref.split("#", 1)[0] if "#" in explain_ref else "<run>"
             raise click.ClickException(
@@ -730,16 +762,19 @@ def triage(
         _render_explain(explanation, as_json=as_json)
         return
 
-    # A reachability --filter is a circle-and-weight lens, not a reducer: report how many candidates
-    # match while the corpus (candidate total) stays whole.
-    reach_vals = [v for d, v in dim_filters if d == "reachability"]
-    reach_note = None
-    if reach_vals:
-        n_match = reachability_match_count(candidates, reach_vals)
-        reach_note = (
-            f"reachability={'/'.join(reach_vals)} → {n_match} match of {len(candidates)} "
-            "(circle-and-weight lens: matches float to the top, corpus NOT reduced)"
-        )
+    # --filter is a circle-and-weight lens, not a reducer: report how many candidates match (within
+    # the sweep, if --only is also active) while the corpus total stays whole.
+    filter_note = None
+    if dim_filters:
+        spec = ",".join(f"{d}={v}" for d, v in dim_filters)
+        n_match = filter_match_count(candidates, dim_filters)
+        if only_filters:
+            filter_note = f"--filter {spec} → {n_match} floated within sweep"
+        else:
+            filter_note = (
+                f"--filter {spec} → {n_match} match of {len(candidates)} "
+                "(circle-and-weight lens: matches float to the top, corpus NOT reduced)"
+            )
 
     _render_triage(
         candidates,
@@ -751,7 +786,8 @@ def triage(
         sink=sink,
         include_gated=include_gated,
         as_json=as_json,
-        reach_note=reach_note,
+        corpus_size=corpus_size,
+        filter_note=filter_note,
     )
 
 

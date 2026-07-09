@@ -436,11 +436,10 @@ def test_property_reachability_filter_corpus_invariant(tmp_path: Path) -> None:
     conn.close()
 
 
-def test_other_dim_filters_still_reduce_known_debt(tmp_path: Path) -> None:
-    # KNOWN OLD DEBT (pre-existing, NOT introduced by the reachability split): every OTHER --filter
-    # dimension (controllability / source / writer / sink_impact) still REDUCES the corpus via
-    # filter_by_dimension. Documented here so the debt is visible + green and flagged for Joey to
-    # decide (fix uniformly, or ledger). The reachability fix deliberately did NOT touch these.
+def test_all_dim_filters_float_never_reduce(tmp_path: Path) -> None:
+    # ★ 步骤 2.5: DEBT PAID — every --filter dimension now FLOATS (circle-and-weight), never reduces
+    # the corpus. Formerly this test recorded the opposite (controllability=free reduced 2->1); now
+    # ALL optimistic dimensions keep the corpus whole and only float their matches to the top.
     from treasure_map.lib.query import apply_view
 
     conn = _atlas(tmp_path)
@@ -449,8 +448,13 @@ def test_other_dim_filters_still_reduce_known_debt(tmp_path: Path) -> None:
     _inst(conn, p, fn="opaque_fn")  # controllability unknown
     base = len(triage(conn))
     assert base == 2
-    reduced = apply_view(triage(conn), dim_filters=[("controllability", "free")])
-    assert len(reduced) == 1  # controllability=free STILL reduces the corpus (documented old debt)
+    for dim, val in (("controllability", "free"), ("source", "nvram"), ("writer", "located")):
+        lensed = apply_view(triage(conn), dim_filters=[(dim, val)])
+        assert len(lensed) == base, f"--filter {dim}={val} reduced the corpus"
+    # controllability=free floats the free candidate to the top but keeps the opaque one listed.
+    floated = apply_view(triage(conn), dim_filters=[("controllability", "free")])
+    assert floated[0].function == "free_fn"
+    assert {c.function for c in floated} == {"free_fn", "opaque_fn"}  # nothing dropped
     conn.close()
 
 
@@ -478,6 +482,201 @@ def test_cli_filter_reachability_header_shows_full_corpus(tmp_path: Path) -> Non
     assert total(web.output) == 5  # NOT reduced to the 2 matches
     assert "2 match of 5" in web.output  # match count shown separately, not as the base
     assert "corpus NOT reduced" in web.output
+
+
+# ── 步骤 2.5: --filter uniformly floats; --only is the explicit ground-truth prune ──
+
+
+def _mk_mixed_corpus(conn: sqlite3.Connection) -> None:
+    # 2 cmd (one free), 3 copy — sink_class is a ground truth here (no null), the optimistic
+    # dimensions carry unknowns.
+    pc = _pattern(conn, "fp_cmd", sink_class="cmd", source_class="external_input")
+    pp = _pattern(conn, "fp_copy", sink_class="copy", source_class="external_input")
+    _inst(conn, pc, fn="cmd_free", sink_anchor="system", source_kind="free_string")
+    _inst(conn, pc, fn="cmd_opaque", sink_anchor="system")
+    _inst(conn, pp, fn="copy_a", sink_anchor="strcpy")
+    _inst(conn, pp, fn="copy_b", sink_anchor="strcpy")
+    _inst(conn, pp, fn="copy_c", sink_anchor="strcpy")
+
+
+def test_all_filters_preserve_corpus(tmp_path: Path) -> None:
+    # ★ M5-8 property (debt paid): for ANY --filter <dim>=<val>, the corpus equals the no-filter
+    # corpus. The anti-regression lock across every dimension — no --filter can take a reduce path.
+    from treasure_map.lib.query import apply_view
+
+    conn = _atlas(tmp_path)
+    _mk_mixed_corpus(conn)
+    base = len(triage(conn))
+    assert base == 5
+    for dim, val in [
+        ("controllability", "free"),
+        ("source", "nvram"),
+        ("writer", "located"),
+        ("filtering", "?"),
+        ("sink_impact", "cmd"),
+        ("sink_class", "copy"),
+        ("reachability", "entry:web"),
+        ("completeness", "complete"),
+    ]:
+        got = len(apply_view(triage(conn), dim_filters=[(dim, val)]))
+        assert got == base, f"--filter {dim}={val} reduced the corpus ({got} != {base})"
+    conn.close()
+
+
+def test_source_filter_does_not_hide_non_nvram(tmp_path: Path) -> None:
+    # ★ M5-2 (the OAuth-hiding regression, synthetic): --filter source=nvram floats nvram-source
+    # candidates but keeps EVERY non-nvram one (an unattributed source is unknown, never proven
+    # non-nvram) — the exact bug where a 'clean nvram list' would drop the severe unresolved case.
+    from treasure_map.lib.query import apply_view
+
+    conn = _atlas(tmp_path)
+    _mk_mixed_corpus(conn)
+    lensed = apply_view(triage(conn), dim_filters=[("source", "nvram")])
+    assert len(lensed) == 5  # nothing hidden — the corpus stays whole
+    conn.close()
+
+
+def test_reducible_predicate_and_only_refusal(tmp_path: Path) -> None:
+    # ★★ M5-9: reducible is a per-corpus predicate. Ground-truth sink dims are reducible; optimistic
+    # dims (unknown state) and source are not, and --only refuses them with guidance to --filter.
+    from treasure_map.lib.query import only_refusal, reducible
+
+    conn = _atlas(tmp_path)
+    _mk_mixed_corpus(conn)
+    corpus = triage(conn)
+    assert reducible("sink_class", corpus) is True
+    assert reducible("sink_impact", corpus) is True
+    assert reducible("controllability", corpus) is False  # unknown state present
+    assert reducible("source", corpus) is False  # optimistic attribution, never reducible
+    assert only_refusal([("sink_class", "cmd")], corpus) is None
+    msg = only_refusal([("controllability", "free")], corpus)
+    assert msg is not None and "refused" in msg and "Use --filter" in msg
+    conn.close()
+
+
+def test_reducible_flips_false_on_null_sink_class() -> None:
+    # ★★ M5-9 (gap #2): ONE predicate covers explicit-unknown AND implicit-None. A synthetic
+    # candidate with sink_class=None flips sink_class NON-reducible, so null can't smuggle a prune.
+    from treasure_map.lib.query import Dimension, TriageCandidate, only_refusal, reducible
+
+    def cand(sink_class: str | None) -> TriageCandidate:
+        return TriageCandidate(
+            review_status="to-verify",
+            reachability_status="unknown",
+            function="f",
+            sink_anchor="system",
+            source_class="external_input",
+            sink_class=sink_class,  # type: ignore[arg-type]
+            blocking_mechanism=None,
+            origin="custom",
+            source_run_id="r",
+            evidence_ref="r#f",
+            binary_path=None,
+            dimensions=(Dimension("sink_impact", "proven", sink_class or "unknown", "x"),),
+        )
+
+    assert reducible("sink_class", [cand("cmd"), cand("copy")]) is True
+    with_null = [cand("cmd"), cand(None)]
+    assert reducible("sink_class", with_null) is False  # the None flips it out
+    assert only_refusal([("sink_class", "cmd")], with_null) is not None
+
+
+def test_filter_partition_match_floats_above_higher_impact_nonmatch(tmp_path: Path) -> None:
+    # ★ M5-10 (gap #5): float is a hard PARTITION — a low-impact (copy) MATCH sits ABOVE a
+    # high-impact (cmd) non-match. Matches band to the top; impact orders only WITHIN a band.
+    from treasure_map.lib.query import apply_view
+
+    conn = _atlas(tmp_path)
+    pc = _pattern(conn, "fp_cmd", sink_class="cmd", source_class="external_input")
+    pp = _pattern(conn, "fp_copy", sink_class="copy", source_class="external_input")
+    _inst(conn, pc, fn="cmd_hi", sink_anchor="system")
+    _inst(conn, pp, fn="copy_lo", sink_anchor="strcpy")
+    lensed = apply_view(triage(conn), dim_filters=[("sink_impact", "copy")])
+    assert (
+        lensed[0].function == "copy_lo"
+    )  # low-impact match floats above the high-impact non-match
+    conn.close()
+
+
+def test_filter_compound_and_intersection_floats(tmp_path: Path) -> None:
+    # ★ M5-11 (gap #3): filters="controllability=free,sink_impact=cmd" floats ONLY the candidate
+    # matching BOTH (AND) to the very top — not those matching just one.
+    from treasure_map.lib.query import apply_view
+
+    conn = _atlas(tmp_path)
+    pc = _pattern(conn, "fp_cmd", sink_class="cmd", source_class="external_input")
+    pp = _pattern(conn, "fp_copy", sink_class="copy", source_class="external_input")
+    _inst(conn, pc, fn="cmd_free", sink_anchor="system", source_kind="free_string")  # matches BOTH
+    _inst(conn, pc, fn="cmd_opaque", sink_anchor="system")  # matches sink only
+    _inst(conn, pp, fn="copy_free", sink_anchor="strcpy", source_kind="free_string")  # ctrl only
+    lensed = apply_view(
+        triage(conn), dim_filters=[("controllability", "free"), ("sink_impact", "cmd")]
+    )
+    assert lensed[0].function == "cmd_free"  # only the AND-both match is in the top band
+    assert len(lensed) == 3  # corpus whole — the partial matches stay listed, just lower
+    conn.close()
+
+
+def test_cli_only_and_filter_three_part_header(tmp_path: Path) -> None:
+    # ★ M5-12 (gap #4): --only X --filter Y → header reads corpus N · sweep shows M, with the
+    # --filter floating within the sweep. The corpus stays invariant.
+    conn = _atlas(tmp_path)
+    _mk_mixed_corpus(conn)
+    conn.close()
+    atlas = tmp_path / "atlas.db"
+    out = (
+        CliRunner()
+        .invoke(
+            triage_cmd,
+            [
+                "run_1",
+                "--all",
+                "--only",
+                "sink_class=cmd",
+                "--filter",
+                "controllability=free",
+                "--atlas",
+                str(atlas),
+            ],
+        )
+        .output
+    )
+    assert "corpus 5 · sweep shows 2" in out  # corpus whole, sweep pruned to the 2 cmd sinks
+    assert "floated within sweep" in out  # the --filter floats within the sweep
+
+
+def test_cli_only_ground_truth_sweeps_cmd_and_copy(tmp_path: Path) -> None:
+    # ★ M5-4: --only on a ground-truth dimension sweeps; both cmd AND copy must work (copy is the
+    # majority class where --only actually helps). The corpus total stays whole in the header.
+    conn = _atlas(tmp_path)
+    _mk_mixed_corpus(conn)
+    conn.close()
+    atlas = tmp_path / "atlas.db"
+    cmd = (
+        CliRunner()
+        .invoke(triage_cmd, ["run_1", "--all", "--only", "sink_class=cmd", "--atlas", str(atlas)])
+        .output
+    )
+    copy = (
+        CliRunner()
+        .invoke(triage_cmd, ["run_1", "--all", "--only", "sink_class=copy", "--atlas", str(atlas)])
+        .output
+    )
+    assert "corpus 5 · sweep shows 2" in cmd
+    assert "corpus 5 · sweep shows 3" in copy
+
+
+def test_cli_only_refuses_optimistic_dimension(tmp_path: Path) -> None:
+    # ★ M5-4: --only on an optimistic dimension errors (never silently prunes) with a --filter hint.
+    conn = _atlas(tmp_path)
+    _mk_mixed_corpus(conn)
+    conn.close()
+    atlas = tmp_path / "atlas.db"
+    out = CliRunner().invoke(
+        triage_cmd, ["run_1", "--only", "controllability=free", "--atlas", str(atlas)]
+    )
+    assert out.exit_code != 0
+    assert "refused" in out.output and "Use --filter" in out.output
 
 
 # ── source_kind exposure -> controllability layer ──
@@ -974,9 +1173,9 @@ def test_cli_sort_by_reachability_preserves_iron_law(tmp_path: Path) -> None:
     assert "spine=reachability" in out.output
 
 
-def test_cli_filter_does_not_reduce_reachability(tmp_path: Path) -> None:
-    # --filter controllability=free narrows the view but the underlying map is unchanged: a free
-    # candidate shows, a non-free one does not appear under that filter.
+def test_cli_filter_controllability_floats_never_reduces(tmp_path: Path) -> None:
+    # ★ 步骤 2.5: --filter controllability=free is now a circle-and-weight lens — the free candidate
+    # FLOATS to the top, but the non-free one STAYS listed (corpus whole, header shows the full 2).
     conn = _atlas(tmp_path)
     p = _pattern(conn, "fp", sink_class="cmd", source_class="external_input")
     _inst(conn, p, fn="free_lead", source_kind="free_string", run_id="run_f")
@@ -988,8 +1187,10 @@ def test_cli_filter_does_not_reduce_reachability(tmp_path: Path) -> None:
     )
     assert out.exit_code == 0, out.output
     assert "free_lead" in out.output
-    assert "opaque_lead" not in out.output
-    assert "filter=controllability=free" in out.output  # the lens is labelled
+    assert "opaque_lead" in out.output  # NOT dropped — circle-and-weight, never reduce
+    assert "(2 candidates:" in out.output  # header shows the whole corpus, not the 1 match
+    assert "→ 1 match of 2" in out.output  # the match count as a separate, honest field
+    assert out.output.index("free_lead") < out.output.index("opaque_lead")  # free floated on top
 
 
 # ── every preset view states WHEN to use it (and reachable-only states its honest limit) ──
@@ -1001,15 +1202,19 @@ def test_every_view_carries_a_when_to_use_note() -> None:
     for name, preset in VIEWS.items():
         assert preset.get("desc"), f"view {name} is missing a when-to-use desc"
         assert "spine" in preset
-    # reachable-only must be honest that it is a mechanistic reference (web-asset endpoint or boot
-    # script), NOT call-graph reachability, and an INCOMPLETE slice (service-dispatch bridges like
-    # notify_rc are unmodeled) — so an agent does not mistake it for 'all reachable candidates'.
+    # reachable-only FLOATS (not prunes) and must stay honest: a mechanistic reference (web-asset
+    # endpoint or boot script), NOT call-graph reachability, an INCOMPLETE slice (service-dispatch
+    # bridges like notify_rc are unmodeled), corpus whole — so an agent never reads the top as
+    # 'all reachable candidates'.
     ro = VIEWS["reachable-only"]["desc"].lower()
     assert "web-asset" in ro
     assert "not call-graph reachability" in ro
     assert "incomplete" in ro and "notify_rc" in ro  # names the unmodeled service-dispatch gap
-    assert "drops" in ro  # states that it can drop service-dispatch-only candidates
+    assert "floats" in ro and "whole" in ro  # a float lens: corpus stays whole, nothing pruned
     assert "pre-auth" not in ro  # mechanistic label, never a pre-auth attack-surface claim
+    # nvram-source likewise floats (never prunes an optimistic, late-resolving source attribution).
+    ns = VIEWS["nvram-source"]["desc"].lower()
+    assert "floats" in ns and "whole" in ns
 
 
 def test_cli_view_help_lists_when_to_use() -> None:

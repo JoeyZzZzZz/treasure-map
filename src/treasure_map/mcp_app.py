@@ -45,9 +45,11 @@ from treasure_map.lib.query import density as _density
 from treasure_map.lib.query import dormant as _dormant
 from treasure_map.lib.query import explain_candidate as _explain_candidate
 from treasure_map.lib.query import filter_candidates as _filter_candidates
+from treasure_map.lib.query import filter_match_count as _filter_match_count
 from treasure_map.lib.query import get_nvram_key_flow as _get_nvram_key_flow
 from treasure_map.lib.query import get_sink_provenance as _get_sink_provenance
 from treasure_map.lib.query import ledger as _ledger
+from treasure_map.lib.query import only_refusal as _only_refusal
 from treasure_map.lib.query import parse_impact_order as _parse_impact_order
 from treasure_map.lib.query import triage as _triage
 from treasure_map.lib.query import twins as _twins
@@ -254,6 +256,7 @@ def make_tools(
         sort_by: str | None = None,
         view: str | None = None,
         filters: str | None = None,
+        only: str | None = None,
         impact_order: str | None = None,
         limit: int = 50,
         offset: int = 0,
@@ -270,12 +273,17 @@ def make_tools(
         - ``sort_by``: pivot axis — impact (default) / controllability / reachability / by-sink.
         - ``view``: preset lens for a hunting goal — ``default`` (balanced start), ``by-sink``
           (sweep one sink class, e.g. all system()), ``nvram-source`` (hunt nvram-mediated bugs —
-          the router-bug hotspot), ``reachable-only`` (prune to candidates with a direct rootfs
-          entry reference — a MECHANISTIC reference, NOT call-graph reachability; an INCOMPLETE
-          slice that drops candidates reachable only via an unmodeled service-dispatch bridge like
-          notify_rc). The result's ``available_views`` lists every preset with its when-to-use note.
-        - ``filters``: dimension filters, ``"dim=value,dim2=value2"`` (controllability=free /
-          sink_impact=cmd / source=nvram / reachability=entry:web / writer=located ...).
+          the router-bug hotspot), ``reachable-only`` (FLOATS candidates with a direct rootfs entry
+          reference to the top — MECHANISTIC, NOT call-graph reachability, an INCOMPLETE slice that
+          misses the notify_rc bridge; the corpus stays whole). ``available_views`` lists each.
+        - ``filters``: circle-and-weight dimension filters, ``"dim=value,dim2=value2"``
+          (controllability=free / sink_impact=cmd / source=nvram / reachability=entry:web ...).
+          Matches FLOAT to the first screen; the corpus is NEVER reduced (``corpus`` stays the full
+          total, ``filter_match`` counts how many matched). "No match" is not "absent".
+        - ``only``: SWEEP mode — prune the view to ``"dim=value"`` (e.g. sink_class=cmd). ``total``
+          becomes the pruned view, but ``corpus`` stays whole. Accepted ONLY on a ground-truth
+          dimension (sink_class/sink_impact); refused on an optimistic one (controllability / source
+          / ...) with guidance to use ``filters`` instead. Combinable with ``filters``.
         - ``impact_order``: override the impact tiers, e.g. ``"cmd=fmt_string,copy,log"``.
 
         Legacy filters still apply: ``sink`` (callee OR class), ``sink_class`` (exact), ``status``
@@ -300,18 +308,26 @@ def make_tools(
             ranked = [c for c in ranked if c.sink_class == sink_class]
         if fingerprint is not None:
             ranked = [c for c in ranked if c.structural_fingerprint == fingerprint]
-        # Apply the map lens: dimension filters + spine + impact-tier override. The composite key
-        # and the demotion iron law ride under whatever spine is chosen (a ? is never buried).
+        # Apply the map lens: --filter dimensions circle-and-weight FLOAT (corpus never reduced); an
+        # --only sweep prunes, refused on an optimistic/null-bearing dimension (which would silently
+        # hide candidates). The composite key and demotion iron law ride under any spine.
         dim_filters = _parse_dim_filters(filters)
+        only_filters = _parse_dim_filters(only)
+        refusal = _only_refusal(only_filters, ranked)
+        if refusal is not None:
+            return {"note": _DERIVED_SIGNAL_NOTE, "error": refusal, "corpus": len(ranked)}
+        corpus = len(ranked)  # the invariant total — a --filter float never changes it
         overrides = _parse_impact_order(impact_order) if impact_order else None
         ranked = _apply_view(
             ranked,
             view=view,
             sort_by=sort_by,
             dim_filters=dim_filters,
+            only_filters=only_filters,
             impact_overrides=overrides or None,
         )
         total = len(ranked)
+        filter_match = _filter_match_count(ranked, dim_filters) if dim_filters else None
         lim = max(0, min(limit, _MAX_LIMIT))
         off = max(0, offset)
         page = ranked[off : off + lim]
@@ -325,8 +341,13 @@ def make_tools(
                 "spine": _effective_spine(sort_by, view),
                 "view": view or "default",
                 "filters": [f"{d}={v}" for d, v in dim_filters],
+                # --filter circle-and-weights (floats matches, corpus whole); --only sweeps (prunes,
+                # ground-truth dims only). filter_match = how many the --filter matched.
+                "filter_match": filter_match,
+                "only": [f"{d}={v}" for d, v in only_filters],
                 "impact_order": impact_order or "default (cmd=fmt_string>copy>log)",
-                "switchable": "sort_by / view / filters / impact_order — re-ranks, never reduces",
+                "switchable": "sort_by / view / filters (float) / only (sweep) — re-ranks; "
+                "--filter never reduces the corpus, --only prunes the view but corpus stays whole",
             },
             # The preset lenses the agent can switch to, each with its when-to-use note, so views
             # are DISCOVERABLE from the result itself (not only from this tool's docstring).
@@ -348,6 +369,10 @@ def make_tools(
             # {binary, functions_total, functions_empty}. The candidate set is incomplete on those
             # functions, so absence of a candidate there is likewise not proof of cleanliness.
             "partially_incomplete_binaries": _partially_incomplete_binaries(),
+            # ``corpus`` is the INVARIANT candidate total — a --filter float never changes it. Under
+            # an --only sweep, ``total`` is the (smaller) pruned view; ``corpus`` still shows the
+            # whole set so "no match" is never read as "absent".
+            "corpus": corpus,
             "total": total,
             "returned": len(page),
             "offset": off,

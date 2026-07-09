@@ -1451,28 +1451,83 @@ def _reach_filter_match(cand_value: str, filter_value: str) -> bool:
     return bool(want) and want <= _entry_kinds(cand_value)
 
 
+def _matches(c: TriageCandidate, dim: str, value: str) -> bool:
+    """Does candidate ``c`` match ``dim=value``? The SINGLE predicate behind both the reducing
+    ``filter_by_dimension`` (used by ``--only`` and the legacy filters) and the circle-and-weight
+    float. ``source=nvram`` = a resolved nvram source key; ``sink_impact/sink_class/sink`` read the
+    sink_class field; reachability matches by entry kind (see ``_reach_filter_match``); an unknown
+    dimension name matches everything (a no-op, mirroring the old ``filter_by_dimension``)."""
+    v = value.lower()
+    if dim == "source":
+        return c.nvram_source_key is not None if v == "nvram" else True
+    if dim in ("sink_impact", "sink_class", "sink"):
+        return (c.sink_class or "").lower() == v
+    if dim == "reachability":
+        return _reach_filter_match(c.dim("reachability").value.lower(), v)
+    if dim in _DIMENSION_NAMES:
+        return c.dim(dim).value.lower() == v
+    return True
+
+
 def filter_by_dimension(
     candidates: list[TriageCandidate], dim: str, value: str
 ) -> list[TriageCandidate]:
-    """Filter by one dimension's value: ``controllability=free`` / ``sink_impact=cmd`` /
-    ``reachability=entry:web`` / ``writer=located`` / ``source=nvram`` ... ``source=nvram`` is the
-    shorthand for a resolved nvram source key; reachability matches by entry kind (see
-    ``_reach_filter_match``). An unknown dimension name is a no-op (returns all).
-    """
-    v = value.lower()
-    if dim == "source":
-        if v == "nvram":
-            return [c for c in candidates if c.nvram_source_key is not None]
-        return candidates
+    """REDUCE to the candidates matching ``dim=value`` — used by ``--only`` (the explicit prune) and
+    the legacy filters. See ``_matches`` for the per-dimension predicate. An unknown dimension name
+    is a no-op (returns all). NOTE ``--filter`` no longer routes here: it FLOATS (see ``apply_view``
+    / ``_float_by_dimension``) so it never reduces the corpus."""
+    return [c for c in candidates if _matches(c, dim, value)]
+
+
+# Values that mean "not established" — an unknown STATE renders as one of these, and a null/empty
+# ground-truth field collapses to one too. One set covers the explicit-unknown AND the implicit-null
+# case, so there is no drifting seam between "scan for state==unknown" and "hand-check for null".
+_UNRESOLVED_VALUES: frozenset[str] = frozenset({"unknown", "?", "undetermined", ""})
+
+
+def _is_resolved(c: TriageCandidate, dim: str) -> bool:
+    """Does ``c`` carry a RESOLVED ground-truth value on ``dim`` — no unknown state, no null/empty/
+    '?' value? The ground-truth sink dimensions read the sink_class field directly (a null there is
+    unresolved); an optimistic dimension reads its layer's state+value (an ``unknown`` state, or a
+    proven layer whose value is still ``unknown`` — e.g. sink_impact over a null sink_class — is
+    unresolved). ``source`` attribution is optimistic (unknown when unresolved), never a truth."""
     if dim in ("sink_impact", "sink_class", "sink"):
-        return [c for c in candidates if (c.sink_class or "").lower() == v]
-    if dim == "reachability":
-        return [
-            c for c in candidates if _reach_filter_match(c.dim("reachability").value.lower(), v)
-        ]
+        sc = (c.sink_class or "").lower()
+        return bool(sc) and sc not in _UNRESOLVED_VALUES
+    if dim == "source":
+        return False
     if dim in _DIMENSION_NAMES:
-        return [c for c in candidates if c.dim(dim).value.lower() == v]
-    return candidates
+        d = c.dim(dim)
+        return d.state != "unknown" and bool(d.value) and d.value.lower() not in _UNRESOLVED_VALUES
+    return False
+
+
+def reducible(dim: str, candidates: list[TriageCandidate]) -> bool:
+    """Is ``dim`` REDUCIBLE (safe for an ``--only`` prune) on THIS corpus? True iff EVERY candidate
+    carries a resolved ground-truth value on it (see ``_is_resolved``). Optimistic dimensions (any
+    unknown state) and null-bearing dimensions are NOT reducible — pruning them would silently hide
+    candidates the analysis could not classify (the UI version of the recall red line: "no match"
+    is not "absent", as "untraced" is not "safe"). Computed PER CORPUS, never a static whitelist: a
+    firmware whose sink_class carries a null flips sink_class out automatically, so a coverage gap
+    cannot smuggle a prune back in on the next image."""
+    return bool(candidates) and all(_is_resolved(c, dim) for c in candidates)
+
+
+def only_refusal(
+    only_filters: list[tuple[str, str]], candidates: list[TriageCandidate]
+) -> str | None:
+    """The refusal message when an ``--only`` prune targets a non-reducible dimension on this
+    corpus, else None. Shared by the CLI and MCP so both refuse identically and steer the caller to
+    ``--filter`` (float, which never hides a candidate)."""
+    for dim, value in only_filters:
+        if not reducible(dim, candidates):
+            n = len(candidates)
+            k = sum(1 for c in candidates if not _is_resolved(c, dim))
+            return (
+                f"--only {dim}={value} refused: {k} of {n} candidates have unknown/null {dim} — "
+                f"pruning would silently hide them. Use --filter {dim}={value} (float) instead."
+            )
+    return None
 
 
 # Preset lenses: {filter, spine, desc}. Each is a starting {filter, spine} plus a when-to-use note
@@ -1496,52 +1551,52 @@ VIEWS: dict[str, dict[str, Any]] = {
     "nvram-source": {
         "filter": ("source", "nvram"),
         "spine": "impact",
-        "desc": "Hunt nvram-mediated bugs — the router-bug hotspot. Only candidates whose source "
-        "is an nvram getter; web_settable becomes the most informative controllability signal.",
+        "desc": "Hunt nvram-mediated bugs — the router-bug hotspot. FLOATS nvram-source candidates "
+        "to the first screen (web_settable becomes the most informative controllability signal); "
+        "the corpus stays WHOLE — an unattributed source is unknown, never a proven non-nvram, so "
+        "nothing is pruned (a wrapper-read key that resolves late must not be hidden now).",
     },
     "reachable-only": {
         "filter": ("reachability", "found"),
         "spine": "impact",
-        "desc": "Prune to candidates with a direct rootfs entry reference — a web-asset endpoint "
-        "or a boot script naming the binary. This is a MECHANISTIC reference, NOT call-graph "
-        "reachability: it is an INCOMPLETE slice — candidates reachable only via an unmodeled "
-        "service-dispatch bridge (notify_rc / rc_service) show entry:script or unknown, so this "
-        "view DROPS them; do not read it as 'all reachable candidates'. Split by reference kind "
-        "with reachability=entry:web / reachability=entry:script.",
+        "desc": "FLOATS candidates with a direct rootfs entry reference — a web-asset endpoint or "
+        "a boot script naming the binary — to the first screen; the corpus stays WHOLE, nothing is "
+        "pruned. A MECHANISTIC reference, NOT call-graph reachability: an INCOMPLETE slice that "
+        "misses candidates reachable only via an unmodeled service-dispatch bridge (notify_rc / "
+        "rc_service), so do not read the top as 'all reachable candidates'. Split by kind with "
+        "reachability=entry:web / reachability=entry:script.",
     },
 }
 
 
-def _float_reachability(
-    candidates: list[TriageCandidate], reach_filters: list[tuple[str, str]]
+def _float_by_dimension(
+    candidates: list[TriageCandidate], filters: list[tuple[str, str]]
 ) -> list[TriageCandidate]:
-    """Circle-and-weight the reachability lens: candidates matching an explicit ``--filter
-    reachability=<x>`` FLOAT to the first screen but the corpus is NEVER reduced — every candidate
-    stays listed (the triage iron law: re-rank, never reduce). The demotion iron law still rides:
-    a proven-safe candidate stays sunk even when it matches. Stable, so the lens order within each
-    band is preserved."""
-    values = [v for _, v in reach_filters]
+    """Circle-and-weight one or more ``--filter`` dimensions: candidates matching ALL of them (AND)
+    FLOAT to the top band, but the corpus is NEVER reduced — every candidate stays listed (the
+    triage iron law: re-rank, never reduce). A hard PARTITION, not a soft weight: matches sit in a
+    distinct top band, non-matches below (so a high-impact non-match never sits above a matched
+    row), with the demotion iron law still riding — a proven-safe candidate stays sunk even when it
+    matches. Stable, so the lens order within each band is preserved."""
 
     def band(c: TriageCandidate) -> int:
         if _is_proven_safe(c):
             return 2  # proven-safe sinks in every lens, matched or not
-        matched = all(
-            _reach_filter_match(c.dim("reachability").value.lower(), v.lower()) for v in values
-        )
-        return 0 if matched else 1
+        return 0 if all(_matches(c, d, v) for d, v in filters) else 1
 
     return sorted(candidates, key=band)
 
 
+def filter_match_count(candidates: list[TriageCandidate], filters: list[tuple[str, str]]) -> int:
+    """How many candidates match ALL of the given ``--filter`` (dim, value) pairs (AND) — a COUNT
+    only, never a reduction. Lets a consumer annotate the lens header (matched M of the whole corpus
+    N) while the corpus stays whole."""
+    return sum(1 for c in candidates if all(_matches(c, d, v) for d, v in filters))
+
+
 def reachability_match_count(candidates: list[TriageCandidate], values: list[str]) -> int:
-    """How many candidates match ALL of the given reachability filter values — a COUNT only, never
-    a reduction of the map. Lets a consumer annotate the lens header (matched N of the whole corpus)
-    while the corpus itself stays whole."""
-    return sum(
-        1
-        for c in candidates
-        if all(_reach_filter_match(c.dim("reachability").value.lower(), v.lower()) for v in values)
-    )
+    """Back-compat shim: reachability match count via the general ``filter_match_count``."""
+    return filter_match_count(candidates, [("reachability", v) for v in values])
 
 
 def apply_view(
@@ -1550,36 +1605,37 @@ def apply_view(
     view: str | None = None,
     sort_by: str | None = None,
     dim_filters: list[tuple[str, str]] | None = None,
+    only_filters: list[tuple[str, str]] | None = None,
     impact_overrides: dict[str, int] | None = None,
 ) -> list[TriageCandidate]:
-    """Resolve a ``view`` preset (+ explicit ``sort_by`` / ``dim_filters`` overrides) into a sorted
-    lens. ``dim_filters`` is a list of (dim, value). The demotion iron law rides regardless of the
-    chosen spine — no lens can bury a ? candidate.
+    """Resolve a ``view`` preset (+ explicit ``sort_by`` / ``dim_filters`` / ``only_filters``) into
+    a sorted lens. The demotion iron law rides regardless of the chosen spine — no lens buries a ?.
 
-    An explicit ``--filter reachability=<x>`` is a circle-and-weight FLOAT: it lifts matches to the
-    first screen but NEVER reduces the corpus (re-rank, never reduce). Every OTHER explicit
-    dimension filter still narrows the set (existing behavior), as does a preset ``view``'s own
-    filter (a preset like ``reachable-only`` is an explicit prune)."""
+    Filter epistemology (the semantics follow the dimension, not a one-size predicate):
+    - ``dim_filters`` (``--filter``) and a preset ``view``'s own filter are a circle-and-weight
+      FLOAT: matches lift to the first screen but the corpus is NEVER reduced (re-rank, never
+      reduce). This is the ONLY safe mode for optimistic dimensions, whose predicate can miss.
+    - ``only_filters`` (``--only``) is the explicit prune: it reduces the view to the matching
+      subset. Accepted ONLY on a reducible ground-truth dimension — validate with ``only_refusal``
+      before calling (this function does not re-check; a caller that skips validation may prune an
+      optimistic dimension and silently hide candidates)."""
     spine = "impact"
-    hard_filters: list[tuple[str, str]] = []
+    float_filters: list[tuple[str, str]] = []
     if view and view in VIEWS:
         preset = VIEWS[view]
         spine = preset["spine"]
         if preset["filter"]:
-            hard_filters.append(preset["filter"])
+            float_filters.append(preset["filter"])
     if sort_by:
         spine = sort_by
-    # Split explicit dimension filters: reachability floats (never reduces the corpus); the rest
-    # narrow the set as before.
-    reach_floats: list[tuple[str, str]] = []
-    for d, v in dim_filters or []:
-        (reach_floats if d == "reachability" else hard_filters).append((d, v))
+    if dim_filters:
+        float_filters.extend(dim_filters)
     out = list(candidates)
-    for d, val in hard_filters:
+    for d, val in only_filters or []:  # explicit prune (eligibility validated by the caller)
         out = filter_by_dimension(out, d, val)
     out = sort_candidates(out, spine=spine, impact_overrides=impact_overrides)
-    if reach_floats:
-        out = _float_reachability(out, reach_floats)
+    if float_filters:
+        out = _float_by_dimension(out, float_filters)
     return out
 
 

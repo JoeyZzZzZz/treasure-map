@@ -265,12 +265,82 @@ def test_list_candidates_exposes_view_catalog_with_when_to_use(tmp_path: Path) -
     for v in views.values():
         assert v["when_to_use"] and v["spine"]  # each carries a goal note + its spine
     assert "nvram-mediated" in views["nvram-source"]["when_to_use"].lower()
-    # reachable-only stays honest: a mechanistic reference, NOT call-graph reachability.
+    # reachable-only stays honest: a mechanistic reference, NOT call-graph reachability; it FLOATS
+    # (corpus whole), never prunes.
     ro = views["reachable-only"]["when_to_use"].lower()
-    assert "not call-graph reachability" in ro and "drops" in ro
+    assert "not call-graph reachability" in ro and "floats" in ro
     # and the tool docstring points the agent at the catalog + the reachable-only caveat.
     doc = tools["list_candidates"].__doc__.lower()
     assert "available_views" in doc and "not call-graph reachability" in doc
+
+
+def _mk_multi_atlas(tmp_path: Path) -> Path:
+    # 2 cmd + 3 copy candidates over run_m, so corpus/sweep/float counts are observable on the MCP
+    # face (the surface the agent actually calls).
+    atlas = tmp_path / "atlas.db"
+    conn = open_atlas(atlas)
+
+    def mk(sink_class: str, fn: str, source_kind: str | None = None) -> None:
+        pid = upsert_pattern(
+            conn,
+            source_class="external_input",
+            sink_class=sink_class,
+            call_sequence_shape="s",
+            structural_fingerprint=f"fp_{sink_class}",
+            fingerprint_algo_version="callseq-v1",
+        )
+        ev = json.dumps({"source_kind": source_kind}) if source_kind else None
+        add_instance(
+            conn,
+            InstanceRow(
+                pattern_id=pid,
+                pseudocode_hash=fn,
+                source_anchor=fn,
+                sink_anchor="system" if sink_class == "cmd" else "strcpy",
+                source_run_id="run_m",
+                reachability_status="unknown",
+                blocking_mechanism=None,
+                provenance_level="L0",
+                evidence_ref=f"run_m#{fn}",
+                scope_origin="intra",
+                origin="custom",
+                flow_evidence=ev,
+            ),
+        )
+
+    mk("cmd", "c1", source_kind="free_string")
+    mk("cmd", "c2")
+    mk("copy", "p1")
+    mk("copy", "p2")
+    mk("copy", "p3")
+    conn.close()
+    return atlas
+
+
+def test_list_candidates_filter_floats_corpus_invariant(tmp_path: Path) -> None:
+    # ★★ 步骤 2.5 M5-1b (gap #1 — the agent's ACTUAL surface): on MCP a --filter FLOATS, never
+    # reduces the corpus. source=nvram (the OAuth-hiding regression) keeps all 5; sink_impact=cmd
+    # returns the corpus (5) floated, NOT the 2 matches.
+    tools = mcp_app.make_tools(_mk_analysis(tmp_path), _mk_multi_atlas(tmp_path), run_id="run_m")
+    base = tools["list_candidates"]()
+    assert base["corpus"] == 5 and base["total"] == 5
+    src = tools["list_candidates"](filters="source=nvram")
+    assert src["corpus"] == 5 and src["total"] == 5  # NOT reduced — no candidate hidden
+    assert src["lens"]["filter_match"] == 0
+    si = tools["list_candidates"](filters="sink_impact=cmd")
+    assert si["corpus"] == 5 and si["total"] == 5  # floated, not the 2 reduced
+    assert si["lens"]["filter_match"] == 2
+
+
+def test_list_candidates_only_sweeps_and_refuses_on_mcp(tmp_path: Path) -> None:
+    # ★ 步骤 2.5 M2 on MCP: --only sweeps a ground-truth dim (corpus stays whole via `corpus`) and
+    # REFUSES an optimistic one with an error, never silently pruning it.
+    tools = mcp_app.make_tools(_mk_analysis(tmp_path), _mk_multi_atlas(tmp_path), run_id="run_m")
+    swept = tools["list_candidates"](only="sink_class=cmd")
+    assert swept["corpus"] == 5 and swept["total"] == 2  # corpus whole, view pruned to the sweep
+    refused = tools["list_candidates"](only="controllability=free")
+    assert "error" in refused and "refused" in refused["error"]
+    assert refused["corpus"] == 5  # the refusal still reports the whole corpus
 
 
 def test_list_candidates_carries_fingerprint_and_incomplete_field(tmp_path: Path) -> None:
