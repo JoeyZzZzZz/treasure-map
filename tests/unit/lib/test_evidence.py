@@ -16,6 +16,7 @@ from pathlib import Path
 
 from treasure_map.lib.hunt.evidence import (
     EntryIndex,
+    _ref_at_boundary,
     build_flow_evidence,
     build_fmtstr_evidence,
     build_size_evidence,
@@ -313,6 +314,47 @@ def test_entry_index_matches_web_endpoint_by_path() -> None:
 def test_entry_index_no_match_is_empty() -> None:
     idx = EntryIndex(script_calls=[("/s", "telnetd", 1, "literal")], web_endpoints=[])
     assert idx.sites_for("httpd", None) == []
+
+
+# ── web match at path/word boundary, NOT bare substring (kills percent→rc false positive) ──
+
+
+def test_ref_at_boundary_rejects_word_internal_substring() -> None:
+    # The real false positive: "rc" inside per(rc)ent — a firmware-upgrade ajax endpoint that has
+    # nothing to do with sbin/rc. A bare substring test attached it; boundary matching rejects it.
+    assert _ref_at_boundary("rc", "/ajax_fwdl_percent.asp") is False
+    assert _ref_at_boundary("rc", "search.asp") is False  # sea-rc-h, word-internal
+
+
+def test_ref_at_boundary_accepts_real_segment_references() -> None:
+    # A binary name bordered by non-alphanumerics is a genuine reference and still matches.
+    assert _ref_at_boundary("rc", "/rc.cgi") is True
+    assert _ref_at_boundary("rc", "rc?x=1") is True
+    assert _ref_at_boundary("rc", "/cgi-bin/rc") is True
+    assert _ref_at_boundary("rc", "start_apply.cgi?rc=1") is True
+
+
+def test_ref_at_boundary_underscore_is_word_internal_strict() -> None:
+    # "_" counts as a word-internal character, so start_rc is a distinct token, not a rc reference.
+    # The web side stays deliberately strict (narrow-but-real beats wide-but-false).
+    assert _ref_at_boundary("rc", "/start_rc.asp") is False
+
+
+def test_sites_for_web_boundary_drops_substring_false_positive() -> None:
+    # sites_for level: the percent endpoint must NOT attach to binary "rc"; only the real /rc.cgi
+    # endpoint does. Mirrors a real-firmware OAuth finding whose lone site was the bogus percent
+    # match.
+    idx = EntryIndex(
+        script_calls=[],
+        web_endpoints=[
+            ("www/fwdl.html", "asp", "GET", "/ajax_fwdl_percent.asp", "ajax"),
+            ("www/rc.html", "cgi", "POST", "/rc.cgi", "form"),
+        ],
+    )
+    sites = idx.sites_for("rc", None)
+    assert len(sites) == 1
+    assert sites[0]["kind"] == "web_endpoint"
+    assert sites[0]["endpoint"] == "/rc.cgi"
 
 
 def test_load_entry_index_missing_tables_is_empty() -> None:

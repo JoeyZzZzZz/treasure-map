@@ -344,6 +344,18 @@ def build_fmtstr_evidence(
     return ev
 
 
+def _ref_at_boundary(name: str, ep: str) -> bool:
+    """True when ``name`` sits on a word/path-segment boundary inside endpoint ``ep``.
+
+    A bare substring test falsely matches a short binary name buried inside a longer word — e.g.
+    ``"rc"`` inside ``per(rc)ent``. We require the character on each side of ``name`` to be a
+    non-alphanumeric (string edge, ``/``, ``.``, ``-``, ``?``, ``=``, ``&``, space, …), so ``rc``
+    matches ``/rc.cgi`` and ``rc?x=1`` but not ``percent`` or ``search``. ``_`` counts as a
+    word-internal character (``start_rc`` does NOT match ``rc``): the web side stays deliberately
+    strict — narrow-but-real beats wide-but-false. Case-sensitive, matching Python ``in``."""
+    return re.search(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])", ep) is not None
+
+
 class EntryIndex:
     """In-memory index of rootfs entry evidence (L0.5 ``script_calls`` + ``web_endpoints``).
 
@@ -382,7 +394,9 @@ class EntryIndex:
                 )
         for asset, asset_type, method, endpoint, source in self._web_endpoints:
             ep = endpoint or ""
-            if any(n in ep for n in names):
+            # Path/word-boundary match, NOT bare substring: a short binary name ("rc") must sit on
+            # a segment boundary of the endpoint, so per(rc)ent does not spuriously attach.
+            if any(_ref_at_boundary(n, ep) for n in names):
                 sites.append(
                     {
                         "kind": "web_endpoint",
