@@ -736,6 +736,26 @@ def test_mcp_get_strings_accepts_offset_and_returns_paging(tmp_path: Path) -> No
     assert r["paging"]["next_offset"] is None  # the synthetic webd fits one page
 
 
+def test_compact_row_carries_param_source_when_controllability_unknown(tmp_path: Path) -> None:
+    # ★ step-4 param contract seam (C1/C6, anti-'hidden marker'): a controllability=unknown
+    # external_input candidate STILL surfaces source=proven:param on the compact row — the
+    # axis-agnostic carry from step 3 picks the new axis up with no serializer edit.
+    tools = _tools(tmp_path)  # _mk_atlas uses source_class=external_input
+    (cand,) = tools["list_candidates"]()["candidates"]
+    assert cand["controllability"] == "unknown:unknown"
+    assert cand["dimensions"]["source"] == "proven:param"
+
+
+def test_explain_carries_param_source_with_unproven_note(tmp_path: Path) -> None:
+    # ★ step-4 guardrail 2: the source dimension + its UNPROVEN note ride on explain too (not only
+    # the compact list), so a drill-down never loses the "controllability UNPROVEN" caveat.
+    tools = _tools(tmp_path)
+    ex = tools["explain_candidate"]("run_m#fn1@cmd")
+    src = next(d for d in ex["candidate"]["dimensions"] if d["name"] == "source")
+    assert src["value"] == "param" and src["state"] == "proven"
+    assert "UNPROVEN" in src["note"]
+
+
 def test_mcp_get_strings_function_scope_flag(tmp_path: Path) -> None:
     # ★ 3.1 on the MCP face (the surface the agent uses): passing `function` yields
     # func_scope_applied:false + the honest "does NOT narrow" note — the echoed function is never a

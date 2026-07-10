@@ -737,6 +737,142 @@ def test_source_kind_drives_controllability(tmp_path: Path) -> None:
     conn.close()
 
 
+# ── param-taint: orthogonal source=param signal from A2 external_input (step 4) ──
+
+
+def test_external_input_builds_param_source_and_floats_above_nonparam(tmp_path: Path) -> None:
+    # ★ M4-1/9: A2 source_class=external_input on a system sink builds source=proven:param, and the
+    # candidate floats ABOVE a same-certainty non-param peer (out of the unknown pile), so it is no
+    # longer buried. The non-param peer carries NO param dimension.
+    conn = _atlas(tmp_path)
+    ext = _pattern(conn, "fp_ext", sink_class="cmd", source_class="external_input")
+    non = _pattern(conn, "fp_non", sink_class="cmd", source_class="unknown")
+    _inst(conn, ext, fn="netool")  # external_input, source_kind unknown -> controllability unknown
+    _inst(conn, non, fn="plain_unknown")  # non-external, controllability unknown
+    ranked = triage(conn)
+    param = next(c for c in ranked if c.function == "netool")
+    assert param.dim("source").state == "proven" and param.dim("source").value == "param"
+    assert [c.function for c in ranked] == ["netool", "plain_unknown"]  # param floats above
+    plain = next(c for c in ranked if c.function == "plain_unknown")
+    assert plain.dim("source").value != "param"  # non-external: no param signal
+    conn.close()
+
+
+def test_param_source_not_swallowed_by_free_fallback(tmp_path: Path) -> None:
+    # ★ M4-3b (the execution-order trap): an external_input+free_string candidate is judged
+    # certainty=free by the fallback chain AND carries source=proven:param — the orthogonal signal
+    # is built OUTSIDE the chain, so free never short-circuits it (both present, not only unknowns).
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp", sink_class="cmd", source_class="external_input")
+    _inst(conn, p, fn="free_ext", source_kind="free_string")
+    c = triage(conn)[0]
+    assert _ctrl(c) == "free"  # certainty chain still judges free
+    assert c.dim("source").value == "param" and c.dim("source").state == "proven"
+    conn.close()
+
+
+def test_param_float_lifts_unconstrained_external_over_name_tiebreak(tmp_path: Path) -> None:
+    # ★ M4-3c(a): the param float lifts an unconstrained-charset external_input lead above a
+    # same-certainty non-param peer even against the deterministic name tiebreak.
+    conn = _atlas(tmp_path)
+    ext = _pattern(conn, "fp_ext", sink_class="cmd", source_class="external_input")
+    non = _pattern(conn, "fp_non", sink_class="cmd", source_class="unknown")
+    _inst(conn, ext, fn="z_unknown_ext")  # external unknown -> floated; name sorts LAST
+    _inst(conn, non, fn="a_unknown_non")  # non-external unknown; name sorts FIRST
+    order = [c.function for c in triage(conn)]
+    assert order == ["z_unknown_ext", "a_unknown_non"]  # float beats the name tiebreak
+    conn.close()
+
+
+def test_charset_safe_external_is_not_param_floated(tmp_path: Path) -> None:
+    # ★ M4-3c(b) guardrail (param-internal demotion iron law): a charset_safe external_input (a
+    # converter constrained the value inline -> metachars blocked -> can't inject) is NOT floated,
+    # even though it still honestly carries source=proven:param. With no float, the name tiebreak
+    # stands, so the external one does NOT jump its non-param peer.
+    conn = _atlas(tmp_path)
+    ext = _pattern(conn, "fp_ext", sink_class="cmd", source_class="external_input")
+    non = _pattern(conn, "fp_non", sink_class="cmd", source_class="unknown")
+    _inst(conn, ext, fn="z_safe_ext", source_kind="charset_safe")  # external safe; name LAST
+    _inst(conn, non, fn="a_safe_non", source_kind="charset_safe")  # non-external safe; name FIRST
+    ranked = triage(conn)
+    order = [c.function for c in ranked]
+    assert order == ["a_safe_non", "z_safe_ext"]  # NOT floated: name tiebreak stands
+    z = next(c for c in ranked if c.function == "z_safe_ext")
+    assert z.dim("source").value == "param"  # still honestly marked, just not floated
+    conn.close()
+
+
+def test_param_never_claims_controllable(tmp_path: Path) -> None:
+    # ★ M4-4/10: source=param is a structural signal, NEVER a controllability claim — no param
+    # candidate reads controllability=controllable (proven OR likely), and its note says UNPROVEN.
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp", sink_class="cmd", source_class="external_input")
+    _inst(conn, p, fn="ext_free", source_kind="free_string")
+    _inst(conn, p, fn="ext_unknown")
+    for c in triage(conn):
+        assert c.dim("source").value == "param"
+        assert c.dim("controllability").value != "controllable"  # never impersonates controllable
+        assert "UNPROVEN" in c.dim("source").note
+    conn.close()
+
+
+def test_non_external_source_leaves_verdict_unchanged(tmp_path: Path) -> None:
+    # ★ M4-7: a non-external_input candidate builds NO param dimension and its controllability
+    # verdict is untouched (param never touches the certainty computation).
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp", sink_class="cmd", source_class="unknown")
+    _inst(conn, p, fn="fn", source_kind="free_string")
+    c = triage(conn)[0]
+    assert c.dim("source").state == "unknown" and c.dim("source").value != "param"
+    assert _ctrl(c) == "free"  # verdict unchanged
+    conn.close()
+
+
+def test_param_marks_argv_form_exec_family(tmp_path: Path) -> None:
+    # ★ M4-11 guardrail 1: exec-family (execl/execv) is argv-form, not fmt-form — the param mark is
+    # based on A2 source_class, NOT an fmt %s scan, so an argv-form command-injection sink is NOT
+    # missed (it is the core injection sink).
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp", sink_class="cmd", source_class="external_input")
+    _inst(conn, p, fn="exec_fn", sink_anchor="execl")
+    assert triage(conn)[0].dim("source").value == "param"
+    conn.close()
+
+
+def test_param_float_preserves_nonparam_relative_order(tmp_path: Path) -> None:
+    # ★ M4-6 (contract C5, param's sort obligation): param floats external_input leads up, but the
+    # relative order of NON-param candidates is unchanged (impact tier still governs; a param cmd
+    # sits inside the cmd tier, above a log, but never past a higher-certainty non-param free cmd).
+    conn = _atlas(tmp_path)
+    non_cmd = _pattern(conn, "fp_ncmd", sink_class="cmd", source_class="unknown")
+    non_log = _pattern(conn, "fp_nlog", sink_class="log", source_class="unknown")
+    ext_cmd = _pattern(conn, "fp_ecmd", sink_class="cmd", source_class="external_input")
+    _inst(conn, non_cmd, fn="b_non_cmd", source_kind="free_string")  # non-param free cmd
+    _inst(conn, non_log, fn="c_non_log", source_kind="free_string")  # non-param free log
+    _inst(conn, ext_cmd, fn="a_ext_cmd")  # param unknown cmd (name would sort first)
+    ranked = [c.function for c in triage(conn)]
+    assert ranked.index("b_non_cmd") < ranked.index("c_non_log")  # non-param order preserved
+    assert ranked.index("b_non_cmd") < ranked.index("a_ext_cmd")  # free(3) beats param-unknown(1)
+    assert ranked.index("a_ext_cmd") < ranked.index("c_non_log")  # cmd tier above log tier
+    conn.close()
+
+
+def test_source_param_filter_matches_and_floats(tmp_path: Path) -> None:
+    # ★ source=param is a filter lens (float): it matches external_input candidates and leaves the
+    # nvram-source lens (source=nvram) intact.
+    from treasure_map.lib.query.triage import _matches
+
+    conn = _atlas(tmp_path)
+    ext = _pattern(conn, "fp_ext", sink_class="cmd", source_class="external_input")
+    non = _pattern(conn, "fp_non", sink_class="cmd", source_class="unknown")
+    _inst(conn, ext, fn="ext_fn")
+    _inst(conn, non, fn="non_fn")
+    by_fn = {c.function: c for c in triage(conn)}
+    assert _matches(by_fn["ext_fn"], "source", "param") is True
+    assert _matches(by_fn["non_fn"], "source", "param") is False
+    conn.close()
+
+
 # ── gating is a presentation fold, NOT a sort demotion ──
 
 

@@ -1157,10 +1157,45 @@ def _dim_completeness() -> Dimension:
     )
 
 
+def _dim_source(source_class: str, source_kind: str) -> Dimension:
+    """The ORTHOGONAL source axis: is the sink argument fed by A2-confirmed external input (a
+    request/POST param)? ``source_class == external_input`` => ``proven:param`` — a structural
+    command/exec-injection lead whose controllability is UNPROVEN (no key-side web_settable
+    evidence), WEAKER than an nvram 'likely' reading.
+
+    Orthogonal to controllability, and consumes the COARSE ``source_class`` (A2 pattern layer), NOT
+    the fine flow_evidence marker: it is built whenever A2 marked external_input, EVEN when the
+    certainty verdict fell to unknown/free — so the param signal is never swallowed by the certainty
+    fallback chain (source=param and controllability=unknown:unknown co-exist). It NEVER claims
+    controllable: a source is not a controllability proof (asymmetry — mark weak, never overclaim).
+    ``charset`` (from source_kind) carries the injection feasibility. Non-external => unknown (not
+    carried; the demotion-visible rule leaves a real source untouched)."""
+    if source_class == "external_input":
+        return Dimension(
+            "source",
+            "proven",
+            "param",
+            "pattern.source_class = external_input (A2)",
+            "external input reaches the sink (a POST/request param); NOT proven web-controllable "
+            f"(no key-side web_settable evidence). charset={source_kind}. Controllability "
+            "UNPROVEN — weaker than an nvram 'likely' reading; a structural lead, confirm the "
+            "concrete request field and reachability by hand.",
+        )
+    return Dimension(
+        "source",
+        "unknown",
+        "unknown",
+        "pattern.source_class",
+        "source is not an A2-confirmed external input — the param signal does not apply; "
+        "controllability stands on its own evidence",
+    )
+
+
 def _build_dimensions(
     conn: sqlite3.Connection,
     *,
     flow_evidence: str | None,
+    source_class: str,
     source_kind: str,
     blocking_mechanism: str | None,
     sink_class: str,
@@ -1170,9 +1205,11 @@ def _build_dimensions(
     sink_anchor: str | None,
     wrapper_names: frozenset[str] = frozenset(),
 ) -> tuple[Dimension, ...]:
-    """The seven honest map layers for one candidate. web_settable is the SaTC front↔back cross,
-    looked up once when the source resolved to an nvram key (shared by source_writability); the
-    controllability layer runs the single verdict over the anchored sink's def-use provenance."""
+    """The honest map layers for one candidate. web_settable is the SaTC front↔back cross, looked
+    up once when the source resolved to an nvram key (shared by source_writability); the
+    controllability layer runs the single verdict over the anchored sink's def-use provenance. The
+    orthogonal ``source`` layer consumes the coarse ``source_class`` and is INDEPENDENT of the
+    controllability verdict (never a certainty-chain step)."""
     web_settable = _web_settable(conn, nvram_key) if nvram_key else None
     return (
         _dim_controllability(
@@ -1183,6 +1220,7 @@ def _build_dimensions(
             blocking_mechanism=blocking_mechanism,
             wrapper_names=wrapper_names,
         ),
+        _dim_source(source_class, source_kind),
         _dim_source_writability(nvram_key, web_settable),
         _dim_reachability(entry_reach, web_triggers),
         _dim_filtering(flow_evidence),
@@ -1233,6 +1271,7 @@ def _candidate(
         dimensions=_build_dimensions(
             conn,
             flow_evidence=fe,
+            source_class=row["source_class"],
             source_kind=source_kind,
             blocking_mechanism=blocking,
             sink_class=sink_class,
@@ -1332,6 +1371,46 @@ def _controllability_rank(dim: Dimension) -> int:
     return _CONTROLLABILITY_RANK.get(dim.value, 1)
 
 
+# Command/exec-injection FEASIBILITY of an external_input source, by its charset (source_kind),
+# strongest first — the honest layering within the orthogonal param signal (spec M2). free_string
+# (no charset constraint, metachars pass) is most feasible; charset_safe (a converter constrained
+# the value inline) is least — proven-safe against injection, so the param float excludes it.
+_CHARSET_FEASIBILITY_RANK: dict[str, int] = {
+    "free_string": 3,
+    "charset_maybe": 2,
+    "unknown": 1,
+    "charset_safe": 0,
+}
+
+
+def _is_param_source(c: TriageCandidate) -> bool:
+    """True when A2 marked this candidate's source external_input (source=proven:param)."""
+    d = c.dim("source")
+    return d.state == "proven" and d.value == "param"
+
+
+def _param_float(c: TriageCandidate) -> int:
+    """1 when an A2 external_input reaches the sink with an UNCONSTRAINED-or-unknown charset — a
+    structural command/exec-injection lead that floats ABOVE same-certainty non-param peers (lifting
+    the 59 external_input×unknown out of the unknown pile, and the 41 ×free_string to the top of the
+    'free' band). Placed AFTER the certainty key so it NEVER overrides controllability (a
+    proven/likely-controllable candidate still wins its tier — guardrail 3). Gated OUT for
+    charset_safe (the param-internal demotion iron law: a converter-constrained value cannot inject,
+    so it is never floated)."""
+    if not _is_param_source(c):
+        return 0
+    return 1 if c.source_kind in ("free_string", "charset_maybe", "unknown") else 0
+
+
+def _charset_rank(c: TriageCandidate) -> int:
+    """Injection-feasibility tiebreak WITHIN the floated param band (free_string > charset_maybe >
+    unknown > charset_safe); 0 for a non-param candidate (they are separated earlier by
+    ``_param_float``, so this only orders param candidates among themselves)."""
+    if not _is_param_source(c):
+        return 0
+    return _CHARSET_FEASIBILITY_RANK.get(c.source_kind, 1)
+
+
 def _reach_is_entry(reach: str) -> bool:
     """A reachability value that names at least one found rootfs entry edge (entry:web /
     entry:script / entry:web+script). ``unknown`` (a coverage gap) is not an entry. This is the
@@ -1366,6 +1445,10 @@ def _sort_atoms(c: TriageCandidate, overrides: dict[str, int] | None) -> dict[st
         "proven_safe": int(_is_proven_safe(c)),
         "impact": impact_tier(c.sink_class, overrides),
         "controllability": _controllability_rank(c.dim("controllability")),
+        # orthogonal param signal (spec M2): floats an external_input lead above same-certainty
+        # peers, then layers by charset feasibility — both AFTER certainty (guardrail 3).
+        "param_float": _param_float(c),
+        "charset_rank": _charset_rank(c),
         "reach_rank": _reach_rank(reach),
         "reach_promote": 1 if _reach_is_entry(reach) else 0,
         "writer_promote": 1 if c.dim("writer").value == "located" else 0,
@@ -1392,6 +1475,11 @@ def _sort_key(
     # composite secondary (rides under every lens): band by impact, then controllability-certainty
     key.append(-a["impact"])
     key.append(-a["controllability"])
+    # orthogonal param float (spec M2, rides under every lens): AFTER certainty so a
+    # proven/likely-controllable candidate always outranks a source=param one in the same tier
+    # (guardrail 3); floats external_input leads above same-certainty peers, then layers by charset.
+    key.append(-a["param_float"])
+    key.append(-a["charset_rank"])
     # tertiary only-UP promotes (a proven positive lifts; its ? stays put, never demotes)
     key.append(-a["reach_promote"])
     key.append(-a["writer_promote"])
@@ -1459,7 +1547,14 @@ def _matches(c: TriageCandidate, dim: str, value: str) -> bool:
     dimension name matches everything (a no-op, mirroring the old ``filter_by_dimension``)."""
     v = value.lower()
     if dim == "source":
-        return c.nvram_source_key is not None if v == "nvram" else True
+        # 'source' carries two orthogonal lenses: ``source=nvram`` = a resolved nvram source key;
+        # ``source=param`` = the A2 external_input signal (the source Dimension). Any other value is
+        # a no-op (matches all), mirroring the permissive legacy behaviour.
+        if v == "nvram":
+            return c.nvram_source_key is not None
+        if v == "param":
+            return _is_param_source(c)
+        return True
     if dim in ("sink_impact", "sink_class", "sink"):
         return (c.sink_class or "").lower() == v
     if dim == "reachability":

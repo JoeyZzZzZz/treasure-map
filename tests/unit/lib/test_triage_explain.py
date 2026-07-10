@@ -28,6 +28,7 @@ _SELF_VERDICT = ("high-confidence vulnerability", "confirmed exploit", "confirme
 
 _DIMENSION_NAMES = {
     "controllability",
+    "source",
     "source_writability",
     "reachability",
     "filtering",
@@ -99,7 +100,7 @@ def test_explanation_carries_all_dimension_layers(tmp_path: Path) -> None:
         conn.close()
     assert ex is not None
     names = {d.name for d in ex.dimensions}
-    assert names == _DIMENSION_NAMES  # all seven layers present
+    assert names == _DIMENSION_NAMES  # all eight layers present (source = orthogonal param axis)
     for d in ex.dimensions:  # each layer is an honest four-state fact (likely = M2 optimistic tier)
         assert d.state in {"proven", "likely", "excluded", "unknown"}
         assert d.value and d.source

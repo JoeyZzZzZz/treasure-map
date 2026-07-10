@@ -353,6 +353,55 @@ def test_controllable_ranks_above_free(tmp_path: Path) -> None:
     assert order.index(ctrl_ref) < order.index(free_ref)  # controllable band above free band
 
 
+def test_proven_controllable_ranks_above_param_unknown_same_tier(tmp_path: Path) -> None:
+    # ★ param guardrail 3 (spec M3b): the orthogonal source=param float NEVER overrides certainty —
+    # in the same impact tier (cmd) a proven-controllable nvram candidate outranks an external_input
+    # source=param one whose controllability is only unknown. param lifts a lead to "worth a look";
+    # it does not vault it past a proven-controllable verdict.
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp_ctrl", sink_class="cmd")  # source_class=unknown -> NOT a param source
+    ctrl_ref = _inst(
+        conn,
+        p,
+        sink_anchor="system",
+        flow_evidence=_stack_buf_prov("system", [_getter_vararg("wrs_cc_t")]),
+    )
+    ext_pid = upsert_pattern(
+        conn,
+        source_class="external_input",
+        sink_class="cmd",
+        call_sequence_shape="source->sink",
+        structural_fingerprint="fp_param",
+        fingerprint_algo_version="callseq-v1",
+    )
+    _FID[0] += 1
+    param_ref = f"run_1#fn{_FID[0]}@system"
+    add_instance(
+        conn,
+        InstanceRow(
+            pattern_id=ext_pid,
+            pseudocode_hash=f"h{_FID[0]}",
+            source_anchor=f"fn{_FID[0]}",
+            sink_anchor="system",
+            source_run_id="run_1",
+            reachability_status="unknown",
+            blocking_mechanism=None,
+            provenance_level="L0",
+            evidence_ref=param_ref,
+            scope_origin="intra",
+            origin="unknown",
+            flow_evidence=None,
+        ),
+    )
+    conn.close()
+    cands = triage(open_atlas(tmp_path / "atlas.db"))
+    order = [c.evidence_ref for c in sort_candidates(cands, spine="impact")]
+    ctrl, param = _find(cands, ctrl_ref), _find(cands, param_ref)
+    assert _ctrl(ctrl) == "controllable"
+    assert param.dim("source").value == "param" and _ctrl(param) == "unknown"
+    assert order.index(ctrl_ref) < order.index(param_ref)  # certainty wins over the param float
+
+
 # ── M5.13 demotion audit + M5.14 re-rank invariant ─────────────────────────────────────
 
 
