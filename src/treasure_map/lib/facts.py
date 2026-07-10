@@ -96,6 +96,48 @@ def list_partially_incomplete_binaries(conn: sqlite3.Connection) -> list[dict[st
     ]
 
 
+def analysis_run_counts(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Scan-lineage facts from an analysis.db: binary/function counts + the extraction build hash.
+
+    Written into the atlas ``run`` row so list_runs / ``tmap runs`` can show a scan's size and
+    detect a STALE scan. ``build_hash`` is the DISTINCT ``pass_version`` over the current scan's
+    binaries (the extraction-pass content hash): one value = a uniform build; ``mixed:<n>`` = the
+    scan spans more than one pass version; None when unknown. ``functions_empty`` reuses the
+    partial-decompile red-line count. Every field degrades to None/0 on an older analysis.db that
+    lacks a column (the lineage is best-effort, never a hard failure of the scan)."""
+    try:
+        binaries = conn.execute("SELECT COUNT(*) FROM current_binaries").fetchone()[0]
+        functions = conn.execute(
+            "SELECT COUNT(*) FROM functions f JOIN current_binaries b ON b.id = f.binary_id"
+        ).fetchone()[0]
+    except sqlite3.OperationalError:
+        return {"binaries": None, "functions": None, "functions_empty": None, "build_hash": None}
+    functions_empty = sum(b["functions_empty"] for b in list_partially_incomplete_binaries(conn))
+    build_hash: str | None
+    try:
+        versions = [
+            r[0]
+            for r in conn.execute(
+                "SELECT DISTINCT pass_version FROM current_binaries "
+                "WHERE pass_version IS NOT NULL ORDER BY pass_version"
+            ).fetchall()
+        ]
+    except sqlite3.OperationalError:
+        versions = []
+    if len(versions) == 1:
+        build_hash = versions[0]
+    elif len(versions) > 1:
+        build_hash = f"mixed:{len(versions)}"
+    else:
+        build_hash = None
+    return {
+        "binaries": binaries,
+        "functions": functions,
+        "functions_empty": functions_empty,
+        "build_hash": build_hash,
+    }
+
+
 def _anchor(binary: str | None, name: str | None, address: str | None) -> dict[str, Any]:
     return {"binary": binary, "function": name, "address": address}
 

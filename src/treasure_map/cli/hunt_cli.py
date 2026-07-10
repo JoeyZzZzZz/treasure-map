@@ -1044,6 +1044,7 @@ def scan(
             result.db_path,
             resolved_atlas,
             source_run_id=effective_run_id,
+            firmware_path=str(fs_root),
         )
     except TreasureMapError as exc:
         raise click.ClickException(f"{type(exc).__name__}: {exc}") from exc

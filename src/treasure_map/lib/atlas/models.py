@@ -61,6 +61,38 @@ class InstanceRow:
 
 
 @dataclass(frozen=True)
+class RunRow:
+    """Mirrors one ``run`` row: a scan's lineage + the run_id -> analysis.db resolver.
+
+    ``analysis_db_path`` is the authority a run-aware fact tool routes on (the run_id -> analysis.db
+    map is STORED, not derived — there is no reliable workspaces/<run_id> convention).
+    ``build_hash`` is the extraction pass_version, the stale-scan signal. ``scan_status`` is the
+    lifecycle honesty axis: 'in_progress' (started, not finished — a crash leaves it here),
+    'complete', 'partial', or 'failed'. ``resolved`` is a synthesized flag (NOT a column): False for
+    a run seen only via instance.source_run_id with no run-table row (a pre-existing scan — visible
+    but unresolved)."""
+
+    run_id: str
+    analysis_db_path: str | None = None
+    firmware_path: str | None = None
+    firmware_sha256: str | None = None
+    build_hash: str | None = None
+    tool_version: str | None = None
+    ghidra_version: str | None = None
+    machine: str | None = None
+    binaries: int | None = None
+    functions: int | None = None
+    functions_empty: int | None = None
+    scan_status: str = "in_progress"
+    scanned_at: str | None = None
+    updated_at: str | None = None
+    # Synthesized (not a column): True when a real run-table row backs this run; False for a run
+    # seen only via instance.source_run_id (a pre-existing scan with no lineage row) — surfaced so
+    # list_runs never hides a run yet stays honest that its analysis.db/lineage is unresolved.
+    resolved: bool = True
+
+
+@dataclass(frozen=True)
 class NvramFlowRow:
     """Mirrors one nvram_key_flow row: a single nvram read/write op flattened from a function's
     nvram_ops. Neutral per-op fact; the key graph is a query over these, not a stored graph.

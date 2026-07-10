@@ -165,6 +165,92 @@ def add_web_form_field_rows(
     return len(rows)
 
 
+def begin_run(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    analysis_db_path: str | None = None,
+    firmware_path: str | None = None,
+    firmware_sha256: str | None = None,
+    build_hash: str | None = None,
+    tool_version: str | None = None,
+    ghidra_version: str | None = None,
+    machine: str | None = None,
+    commit: bool = True,
+) -> None:
+    """Mark a run's scan STARTED: upsert its ``run`` row with scan_status='in_progress'.
+
+    Written BEFORE the run's instances, so a crash mid-scan leaves 'in_progress' (the honest "did
+    not finish" signal) rather than a silently-missing run behind half-written candidates. A re-scan
+    resets the row to in_progress with the fresh lineage (its old instances are being replaced).
+    ``analysis_db_path`` is the run_id -> analysis.db resolver a run-aware fact tool routes on."""
+    conn.execute(
+        """INSERT INTO run
+               (run_id, analysis_db_path, firmware_path, firmware_sha256, build_hash,
+                tool_version, ghidra_version, machine, scan_status, scanned_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+           ON CONFLICT(run_id) DO UPDATE SET
+               analysis_db_path = excluded.analysis_db_path,
+               firmware_path    = excluded.firmware_path,
+               firmware_sha256  = excluded.firmware_sha256,
+               build_hash       = excluded.build_hash,
+               tool_version     = excluded.tool_version,
+               ghidra_version   = excluded.ghidra_version,
+               machine          = excluded.machine,
+               scan_status      = 'in_progress',
+               scanned_at       = CURRENT_TIMESTAMP,
+               updated_at       = CURRENT_TIMESTAMP""",
+        (
+            run_id,
+            analysis_db_path,
+            firmware_path,
+            firmware_sha256,
+            build_hash,
+            tool_version,
+            ghidra_version,
+            machine,
+        ),
+    )
+    if commit:
+        conn.commit()
+
+
+def finish_run(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    scan_status: str = "complete",
+    binaries: int | None = None,
+    functions: int | None = None,
+    functions_empty: int | None = None,
+    commit: bool = True,
+) -> None:
+    """Mark a run's scan FINISHED: set scan_status (default 'complete') + the analysis counts.
+
+    Called AFTER the run's instances are committed. If the row is missing (a code path that skipped
+    begin_run) it is inserted, so a finished run is never invisible in list_runs."""
+    if scan_status not in ("in_progress", "complete", "partial", "failed"):
+        raise ConfigError(
+            f"scan_status must be in_progress/complete/partial/failed; got {scan_status!r}"
+        )
+    cur = conn.execute(
+        """UPDATE run SET scan_status = ?, binaries = ?, functions = ?, functions_empty = ?,
+               updated_at = CURRENT_TIMESTAMP
+           WHERE run_id = ?""",
+        (scan_status, binaries, functions, functions_empty, run_id),
+    )
+    if cur.rowcount == 0:
+        conn.execute(
+            """INSERT INTO run
+                   (run_id, scan_status, binaries, functions, functions_empty,
+                    scanned_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)""",
+            (run_id, scan_status, binaries, functions, functions_empty),
+        )
+    if commit:
+        conn.commit()
+
+
 def upsert_pattern(
     conn: sqlite3.Connection,
     *,

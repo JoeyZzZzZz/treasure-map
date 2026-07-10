@@ -59,6 +59,34 @@ CREATE TABLE IF NOT EXISTS instance (
     FOREIGN KEY(pattern_id) REFERENCES pattern(pattern_id) ON DELETE CASCADE
 );
 
+-- run: per-scan lineage + the run_id -> analysis.db RESOLVER. One row per source_run_id.
+-- Written by the scan pipeline (run_analyzer2): scan_status='in_progress' at START, 'complete' at
+-- END. A crash between leaves 'in_progress' — the honest "did not finish, do NOT trust this run"
+-- signal (a run whose instances exist but never resolved to a finished scan must stay VISIBLE, not
+-- silently look complete). This table is the AUTHORITY mapping a neutral run_id to its analysis.db:
+-- there is NO reliable workspaces/<run_id> path convention (run_id may be a custom label, and a
+-- workspace may be a literal path anywhere), so the absolute path is STORED here, not derived.
+-- build_hash (the extraction pass_version) is the STALE-scan signal: two scans of one firmware with
+-- different build_hash means one was produced by an older analysis pass. analysis_db_path /
+-- firmware_path are private evidence — REDACT ON EXPORT.
+CREATE TABLE IF NOT EXISTS run (
+    run_id            TEXT PRIMARY KEY,
+    analysis_db_path  TEXT,             -- absolute path to this run's analysis.db (the resolver)
+    firmware_path     TEXT,             -- the scanned firmware root, when known; else NULL
+    firmware_sha256   TEXT,             -- run-identity content hash (manifest/firmware); NULL if unknown
+    build_hash        TEXT,             -- extraction-pass content hash (pass_version) — STALE-scan signal
+    tool_version      TEXT,             -- treasure_map __version__ that produced this run
+    ghidra_version    TEXT,             -- decompiler version, when known; else NULL
+    machine           TEXT,             -- host that ran the scan, when known; else NULL
+    binaries          INTEGER,          -- binaries in the analysis.db
+    functions         INTEGER,          -- functions in the analysis.db
+    functions_empty   INTEGER,          -- functions that never decompiled (partial-analysis count)
+    scan_status       TEXT NOT NULL DEFAULT 'in_progress'
+        CHECK (scan_status IN ('in_progress','complete','partial','failed')),
+    scanned_at        DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at        DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE VIEW IF NOT EXISTS dormant_instance AS
   SELECT * FROM instance
   WHERE reachability_status = 'blocked' AND provenance_level IN ('L0','L1');

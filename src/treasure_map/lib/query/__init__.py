@@ -9,6 +9,11 @@ nothing here scores, ranks, or judges.
 from __future__ import annotations
 
 from treasure_map.lib.query.nvram import get_nvram_key_flow
+from treasure_map.lib.query.runs import (
+    get_run,
+    list_runs,
+    runs_where_function_exists,
+)
 from treasure_map.lib.query.sink_impact import (
     DEFAULT_SINK_IMPACT,
     impact_tier,
@@ -70,13 +75,16 @@ __all__ = [
     "filter_candidates",
     "filter_match_count",
     "get_nvram_key_flow",
+    "get_run",
     "get_sink_provenance",
     "impact_tier",
     "ledger",
+    "list_runs",
     "only_refusal",
     "parse_impact_order",
     "reachability_match_count",
     "reducible",
+    "runs_where_function_exists",
     "shown_statuses",
     "sink_matches",
     "sort_candidates",

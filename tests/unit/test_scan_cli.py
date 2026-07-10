@@ -125,9 +125,12 @@ def test_scan_runs_three_steps_in_order(tmp_path: Path, monkeypatch: pytest.Monk
         calls.append("analyze")
         return _fake_analyze_result(tmp_path / "analysis.db")
 
-    def _fake_hunt(db: Any, atlas: Any, *, source_run_id: str) -> Any:
+    def _fake_hunt(
+        db: Any, atlas: Any, *, source_run_id: str, firmware_path: str | None = None
+    ) -> Any:
         calls.append("hunt")
         seen["run_id"] = source_run_id
+        seen["firmware_path"] = firmware_path
         return _hunt_stats()
 
     def _fake_triage(conn: Any, *, run_id: str | None = None) -> list[Any]:
@@ -155,6 +158,7 @@ def test_scan_runs_three_steps_in_order(tmp_path: Path, monkeypatch: pytest.Monk
     assert calls == ["analyze", "hunt", "triage"]
     assert seen["run_id"] == "router_v1"  # default run-id = workspace name
     assert seen["triage_run_id"] == "router_v1"
+    assert seen["firmware_path"] is not None  # scan wires the firmware root into the run lineage
 
 
 def test_scan_explicit_run_id_overrides_default(
@@ -166,7 +170,9 @@ def test_scan_explicit_run_id_overrides_default(
     async def _fake_analyze(*_: Any, **__: Any) -> SimpleNamespace:
         return _fake_analyze_result(tmp_path / "analysis.db")
 
-    def _fake_hunt(db: Any, atlas: Any, *, source_run_id: str) -> Any:
+    def _fake_hunt(
+        db: Any, atlas: Any, *, source_run_id: str, firmware_path: str | None = None
+    ) -> Any:
         seen["run_id"] = source_run_id
         return _hunt_stats()
 

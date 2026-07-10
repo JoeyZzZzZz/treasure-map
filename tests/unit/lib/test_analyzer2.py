@@ -20,7 +20,7 @@ import pytest
 import treasure_map.lib.hunt.analyzer2 as analyzer2_mod
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.hunt import run_analyzer2
-from treasure_map.lib.query import explain_candidate
+from treasure_map.lib.query import explain_candidate, get_run
 from treasure_map.lib.storage.connection import open_db
 
 _SRC = Path(__file__).resolve().parents[3] / "src" / "treasure_map"
@@ -209,6 +209,64 @@ def test_writer_populates_atlas_oss_excluded(tmp_path: Path) -> None:
     assert all(r[0] == "callseq-v1" for r in algo)  # the RICH pattern, not diff-coarse
     assert all(lvl in ("L0", "L1") for lvl in levels)
     assert all(anchor is None for anchor in anchors)
+
+
+# ── run lineage: the run_id -> analysis.db resolver + scan_status lifecycle ──────────
+
+
+def test_run_analyzer2_records_run_lineage(tmp_path: Path) -> None:
+    # A clean scan records its lineage row: scan_status='complete', the analysis.db resolver path,
+    # the caller's firmware_path, the build hash (pass_version), and the analysis counts — this is
+    # what a run-aware fact tool routes on and what list_runs / `tmap runs` shows.
+    db = _make_db(tmp_path, [{"name": "webd", "funcs": [_cmd_injection_fn("handle")]}])
+    # current_binaries = the most-recent-scan rows (last_seen_at = MAX); stamp last_seen_at + a
+    # uniform pass_version so the lineage counts + build hash exercise the real scan-scoped path.
+    stamp = sqlite3.connect(db)
+    stamp.execute("UPDATE binaries SET last_seen_at = '2026-01-01 00:00:00', pass_version = 'pv_x'")
+    stamp.commit()
+    stamp.close()
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_lin", firmware_path="/fw/router")
+
+    conn = open_atlas(atlas)
+    try:
+        run = get_run(conn, "run_lin")
+    finally:
+        conn.close()
+    assert run is not None
+    assert run.scan_status == "complete"  # finished cleanly
+    assert run.resolved is True
+    assert run.analysis_db_path == str(db.resolve())  # the run_id -> analysis.db resolver
+    assert run.firmware_path == "/fw/router"
+    assert run.binaries == 1 and run.functions == 1
+    assert run.build_hash == "pv_x"  # DISTINCT pass_version = the stale-scan signal
+    assert run.tool_version is not None
+
+
+def _boom(*_a: object, **_k: object) -> None:
+    raise RuntimeError("boom")
+
+
+def test_run_analyzer2_crash_leaves_run_in_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A crash DURING the instance write must leave scan_status='in_progress' (the honest "did not
+    # finish" signal) with the instance transaction rolled back — never a run silently reading
+    # complete, and never half-written candidates behind a missing run row.
+    db = _make_db(tmp_path, [{"name": "webd", "funcs": [_cmd_injection_fn("handle")]}])
+    atlas = tmp_path / "atlas.db"
+    monkeypatch.setattr(analyzer2_mod, "add_instance", _boom)
+    with pytest.raises(RuntimeError):
+        run_analyzer2(db, atlas, source_run_id="run_crash")
+
+    conn = open_atlas(atlas)
+    try:
+        run = get_run(conn, "run_crash")
+        n_inst = conn.execute("SELECT COUNT(*) FROM instance").fetchone()[0]
+    finally:
+        conn.close()
+    assert run is not None and run.scan_status == "in_progress"  # honest half-finished signal
+    assert n_inst == 0  # the instance transaction rolled back
 
 
 # ── honesty: data-gap matches are counted, never silently dropped ───────────────────

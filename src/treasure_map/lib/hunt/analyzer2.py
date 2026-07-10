@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from treasure_map.lib import facts
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import (
     InstanceRow,
@@ -40,10 +41,12 @@ from treasure_map.lib.atlas.writer import (
     add_nvram_default_rows,
     add_nvram_flow_rows,
     add_web_form_field_rows,
+    begin_run,
     delete_run_instances,
     delete_run_nvram_defaults,
     delete_run_nvram_flow,
     delete_run_web_form_fields,
+    finish_run,
     upsert_pattern,
 )
 from treasure_map.lib.diff.loader import FuncRow, load_functions
@@ -77,6 +80,7 @@ from treasure_map.lib.pattern.classes import (
 from treasure_map.lib.query.nvram import template_has_anchor
 from treasure_map.lib.reachability import grade_candidate
 from treasure_map.lib.reachability.taint import locate_sink_arg
+from treasure_map.version import __version__
 
 logger = logging.getLogger(__name__)
 
@@ -494,6 +498,7 @@ def run_analyzer2(
     atlas_path: Path | str,
     *,
     source_run_id: str,
+    firmware_path: str | None = None,
 ) -> Analyzer2Stats:
     """Scan one analysis.db for shape candidates, grade them, and write atlas instances.
 
@@ -502,6 +507,12 @@ def run_analyzer2(
     fresh result is written in ONE transaction (re-running a run refreshes it, never doubles
     it). Other runs' append-and-corroborate evidence and all pattern rows are untouched. Raw
     evidence is never persisted.
+
+    Also records this run's lineage in the atlas ``run`` table — the run_id -> analysis.db
+    RESOLVER a run-aware fact tool routes on. ``begin_run`` marks it 'in_progress' BEFORE the
+    instance write, ``finish_run`` marks it 'complete' AFTER: a crash between leaves 'in_progress'
+    (the honest "did not finish" signal), never a run silently missing behind half-written rows.
+    ``firmware_path`` is the scanned firmware root when the caller knows it (else NULL).
     """
     result = scan(db_path)
     all_funcs = load_functions(db_path)
@@ -541,8 +552,27 @@ def run_analyzer2(
     data_gap_skipped = 0
     fmt_wrapper_unknown_source_skipped = 0
 
+    # Scan-lineage facts (binary/function counts + extraction build hash) for the run row. Read
+    # from the analysis.db (best-effort; degrades to None on an older schema, never a hard failure).
+    lineage_conn = facts.open_analysis_ro(db_path)
+    try:
+        lineage = facts.analysis_run_counts(lineage_conn)
+    finally:
+        lineage_conn.close()
+
     atlas = open_atlas(Path(atlas_path))
     try:
+        # Record the run STARTED (scan_status='in_progress') + its analysis.db path BEFORE writing
+        # any instance. A crash mid-write then leaves 'in_progress' (the honest "did not finish"
+        # signal), and the run_id -> analysis.db resolver is already recorded. Committed on its own.
+        begin_run(
+            atlas,
+            source_run_id,
+            analysis_db_path=str(Path(db_path).resolve()),
+            firmware_path=firmware_path,
+            build_hash=lineage["build_hash"],
+            tool_version=__version__,
+        )
         # One transaction: drop this run's old rows + write the fresh result, or roll back to
         # the prior result on any error (never leave a half-written run). Only this run_id's
         # instances are deleted; pattern rows (shared accumulation layer) are not.
@@ -860,6 +890,17 @@ def run_analyzer2(
                 instances_written += 1
                 wrapper_propagated += 1
                 by_status["unknown"] += 1
+        # The instance write committed cleanly: mark the run 'complete' + record its analysis
+        # counts. Reached only if the transaction above did NOT raise (an exception skips this and
+        # leaves scan_status='in_progress' — the honest half-finished signal).
+        finish_run(
+            atlas,
+            source_run_id,
+            scan_status="complete",
+            binaries=lineage["binaries"],
+            functions=lineage["functions"],
+            functions_empty=lineage["functions_empty"],
+        )
     finally:
         atlas.close()
 
