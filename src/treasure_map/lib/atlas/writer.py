@@ -15,6 +15,7 @@ from treasure_map.lib.atlas.models import (
     InstanceRow,
     NvramDefaultRow,
     NvramFlowRow,
+    PublicCvePatternRow,
     WebFormFieldRow,
 )
 from treasure_map.lib.errors import ConfigError
@@ -163,6 +164,87 @@ def add_web_form_field_rows(
     if commit:
         conn.commit()
     return len(rows)
+
+
+def add_private_exploit(
+    conn: sqlite3.Connection,
+    *,
+    evidence_ref: str,
+    pattern: str,
+    exploit_note: str,
+    patch_form: str | None = None,
+    cve_id: str | None = None,
+    redact: str = "vendor_sensitive",
+    attributed_to: str | None = None,
+    commit: bool = True,
+) -> int:
+    """Append one exploited-hole record (admission bar = EXPLOITED); return the row id.
+
+    Storage-side guard for the bar: ``evidence_ref`` / ``pattern`` / ``exploit_note`` must be
+    non-blank after stripping (SQLite's NOT NULL only blocks NULL, letting ''/'   ' through — the
+    bar is "an exploited hole with proof", so a blank proof field is rejected here too). This does
+    NOT verify the exploit is real — that is a human's judgement, never asserted by the tool.
+    Append-only: one evidence_ref may gather several rows (corroboration), a later write never
+    overwrites."""
+    for field, val in (
+        ("evidence_ref", evidence_ref),
+        ("pattern", pattern),
+        ("exploit_note", exploit_note),
+    ):
+        if not (val and val.strip()):
+            raise ConfigError(
+                f"private_exploit.{field} must be non-blank (the admission bar is a proven exploit)"
+            )
+    cur = conn.execute(
+        """INSERT INTO private_exploit
+               (evidence_ref, pattern, exploit_note, patch_form, cve_id, redact, attributed_to)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            evidence_ref.strip(),
+            pattern.strip(),
+            exploit_note.strip(),
+            patch_form,
+            cve_id,
+            redact,
+            attributed_to,
+        ),
+    )
+    if commit:
+        conn.commit()
+    return int(cur.lastrowid)  # type: ignore[arg-type]
+
+
+def add_public_cve_patterns(
+    conn: sqlite3.Connection, rows: list[PublicCvePatternRow], *, commit: bool = True
+) -> dict[str, int]:
+    """Idempotent import of public-CVE exploit forms; return {inserted, skipped}.
+
+    A row whose ``(cve_id, pattern, source, sink)`` already exists is SKIPPED, so re-running the
+    same import never silently doubles the rows (which would not inflate barrier depth — that counts
+    private only — but would pollute the public listing). ``pattern`` must be non-blank."""
+    inserted = skipped = 0
+    for r in rows:
+        if not (r.pattern and r.pattern.strip()):
+            raise ConfigError("public_cve_pattern.pattern must be non-blank")
+        exists = conn.execute(
+            """SELECT 1 FROM public_cve_pattern
+               WHERE IFNULL(cve_id, '') = IFNULL(?, '') AND pattern = ?
+                 AND IFNULL(source, '') = IFNULL(?, '') AND IFNULL(sink, '') = IFNULL(?, '')
+               LIMIT 1""",
+            (r.cve_id, r.pattern, r.source, r.sink),
+        ).fetchone()
+        if exists is not None:
+            skipped += 1
+            continue
+        conn.execute(
+            """INSERT INTO public_cve_pattern (cve_id, pattern, source, sink, ref, notes)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (r.cve_id, r.pattern, r.source, r.sink, r.ref, r.notes),
+        )
+        inserted += 1
+    if commit:
+        conn.commit()
+    return {"inserted": inserted, "skipped": skipped}
 
 
 def begin_run(

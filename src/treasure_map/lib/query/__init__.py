@@ -8,6 +8,7 @@ nothing here scores, ranks, or judges.
 
 from __future__ import annotations
 
+from treasure_map.lib.query.exploit_ledger import list_cve_patterns, list_moat
 from treasure_map.lib.query.nvram import get_nvram_key_flow
 from treasure_map.lib.query.runs import (
     get_run,
@@ -79,6 +80,8 @@ __all__ = [
     "get_sink_provenance",
     "impact_tier",
     "ledger",
+    "list_cve_patterns",
+    "list_moat",
     "list_runs",
     "only_refusal",
     "parse_impact_order",

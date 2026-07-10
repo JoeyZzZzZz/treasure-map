@@ -8,11 +8,18 @@ Append-and-corroborate; never wiped. Schema in lib/storage/atlas_schema.sql.
 from __future__ import annotations
 
 from treasure_map.lib.atlas.connection import open_atlas
-from treasure_map.lib.atlas.models import InstanceRow, PatternRow, RunRow
+from treasure_map.lib.atlas.models import (
+    InstanceRow,
+    PatternRow,
+    PublicCvePatternRow,
+    RunRow,
+)
 from treasure_map.lib.atlas.writer import (
     AtlasStats,
     add_instance,
     add_instances,
+    add_private_exploit,
+    add_public_cve_patterns,
     begin_run,
     finish_run,
     upsert_pattern,
@@ -22,9 +29,12 @@ __all__ = [
     "AtlasStats",
     "InstanceRow",
     "PatternRow",
+    "PublicCvePatternRow",
     "RunRow",
     "add_instance",
     "add_instances",
+    "add_private_exploit",
+    "add_public_cve_patterns",
     "begin_run",
     "finish_run",
     "open_atlas",

@@ -50,6 +50,10 @@ _EXPECTED_TOOLS = {
     "get_script_callsites",
     "get_components_cves",
     "get_disassembly",
+    "mark_exploited",
+    "list_moat",
+    "list_cve_patterns",
+    "import_cve_patterns",
     "legal_notice",
 }
 
@@ -924,6 +928,128 @@ def test_mcp_get_strings_function_scope_flag(tmp_path: Path) -> None:
     r = tools["get_strings"](binary="webd", function="handle_req", run_id="run_m")
     assert r["func_scope_applied"] is False
     assert "does NOT narrow" in r["note"]
+
+
+# ── the two exploit-barrier buckets on the MCP face (mark_exploited + the read tools) ──
+
+
+def test_mark_exploited_rejects_blank_proof(tmp_path: Path) -> None:
+    # ★ verification 2: the admission bar is EXPLOITED. A blank / whitespace proof (or pattern) is
+    # rejected at the tool layer — written:False, nothing lands in the ledger.
+    tools = _tools(tmp_path)
+    for bad in ("", "   ", "\t"):
+        r = tools["mark_exploited"](
+            evidence_ref="run_m#fn1@cmd", pattern="cmd inj", exploit_note=bad
+        )
+        assert r["written"] is False and "error" in r
+    r = tools["mark_exploited"](
+        evidence_ref="run_m#fn1@cmd", pattern="   ", exploit_note="triggered"
+    )
+    assert r["written"] is False
+    assert tools["list_moat"]()["holes"] == 0  # nothing admitted
+
+
+def test_mark_exploited_resolved_ref_echoes_no_warning(tmp_path: Path) -> None:
+    # ★ verification 5 (state 1/3): a ref that anchors a real candidate in a scanned run → written,
+    # a `resolved` label, and NO warning (the write is not blind).
+    tools = _tools(tmp_path)
+    r = tools["mark_exploited"](
+        evidence_ref="run_m#fn1@cmd", pattern="cmd inj", exploit_note="POST /x.cgi -> system()"
+    )
+    assert r["written"] is True and "id" in r
+    assert "handle_req" in r["resolved"] and "run_m" in r["resolved"]
+    assert "warning" not in r
+
+
+def test_mark_exploited_ref_not_in_atlas_blind_write_warns(tmp_path: Path) -> None:
+    # ★ verification 5 (state 2/3): a ref that anchors NOTHING in the atlas → STILL written
+    # (recording before the scan is allowed), but the result carries a BLIND WRITE warning.
+    tools = _tools(tmp_path)
+    r = tools["mark_exploited"](
+        evidence_ref="ghost#nope", pattern="cmd inj", exploit_note="proved by hand"
+    )
+    assert r["written"] is True
+    assert "warning" in r and "BLIND WRITE" in r["warning"]
+    assert "resolved" not in r  # nothing to resolve to
+
+
+def test_mark_exploited_no_lineage_run_blind_write_warns(tmp_path: Path) -> None:
+    # ★ verification 5 (state 3/3): the ref DOES anchor a candidate, but its run has no recorded
+    # analysis.db (a pre-existing / un-scanned run) → written, with a warning that inherits the
+    # no-lineage honesty (a run we cannot re-open must not read as a clean write).
+    atlas = _mk_atlas(tmp_path)
+    conn = open_atlas(atlas)
+    pid = upsert_pattern(
+        conn,
+        source_class="external_input",
+        sink_class="cmd",
+        call_sequence_shape="source->cmd",
+        structural_fingerprint="fp_ghost",
+        fingerprint_algo_version="callseq-v1",
+    )
+    add_instance(
+        conn,
+        InstanceRow(
+            pattern_id=pid,
+            pseudocode_hash="hg",
+            source_anchor="ghost_fn",
+            sink_anchor="do_x",
+            source_run_id="ghost_run",  # an instance whose run row is never begin_run'd
+            reachability_status="unknown",
+            blocking_mechanism=None,
+            provenance_level="L0",
+            evidence_ref="ghost_run#fn@cmd",
+            scope_origin="intra",
+            origin="custom",
+            binary_path="usr/sbin/ghostd",
+        ),
+    )
+    conn.close()
+    tools = mcp_app.make_tools(atlas)
+    r = tools["mark_exploited"](
+        evidence_ref="ghost_run#fn@cmd", pattern="cmd inj", exploit_note="proved"
+    )
+    assert r["written"] is True
+    assert "warning" in r and "no recorded" in r["warning"]
+
+
+def test_list_moat_default_withholds_note_reveal_includes_it(tmp_path: Path) -> None:
+    # ★ verification 4: the default read never sprays exploit_note; reveal=True is the one channel.
+    tools = _tools(tmp_path)
+    tools["mark_exploited"](
+        evidence_ref="run_m#fn1@cmd", pattern="cmd", exploit_note="POST x=;reboot; -> reboot"
+    )
+    default = tools["list_moat"]()
+    (entry,) = default["exploits"]
+    assert "exploit_note" not in entry and entry["has_exploit_evidence"] is True
+    revealed = tools["list_moat"](reveal=True)
+    assert revealed["exploits"][0]["exploit_note"] == "POST x=;reboot; -> reboot"
+
+
+def test_list_moat_depth_is_distinct_ref_via_tool(tmp_path: Path) -> None:
+    # ★ verification 3: two rows on the SAME ref → holes stays 1 (COUNT DISTINCT), records is 2.
+    tools = _tools(tmp_path)
+    tools["mark_exploited"](evidence_ref="run_m#fn1@cmd", pattern="cmd", exploit_note="via web")
+    tools["mark_exploited"](evidence_ref="run_m#fn1@cmd", pattern="cmd", exploit_note="via cli too")
+    m = tools["list_moat"]()
+    assert m["holes"] == 1 and m["records"] == 2
+
+
+def test_import_cve_patterns_idempotent_via_tool(tmp_path: Path) -> None:
+    # ★ verification 8: public import fills the front-stage table and re-running never doubles;
+    # public volume never enters barrier depth.
+    tools = _tools(tmp_path)
+    payload = [
+        {"pattern": "nvram->system", "cve_id": "CVE-1", "source": "lan_ip", "sink": "system"},
+        {"pattern": "post->popen", "cve_id": "CVE-2", "sink": "popen"},
+    ]
+    first = tools["import_cve_patterns"](payload)
+    assert first["inserted"] == 2 and first["skipped"] == 0
+    again = tools["import_cve_patterns"](payload)
+    assert again["inserted"] == 0 and again["skipped"] == 2  # idempotent
+    assert tools["list_cve_patterns"]()["count"] == 2
+    assert tools["list_cve_patterns"](sink="pop")["count"] == 1  # substring filter
+    assert tools["list_moat"]()["holes"] == 0  # public volume is off the barrier
 
 
 # ── public-surface neutrality: the server is a published artifact, stricter discipline ──

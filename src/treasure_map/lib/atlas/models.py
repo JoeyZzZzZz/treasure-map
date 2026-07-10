@@ -135,6 +135,24 @@ class NvramDefaultRow:
 
 
 @dataclass(frozen=True)
+class PublicCvePatternRow:
+    """Mirrors one public_cve_pattern row: a public-CVE exploit form (front-stage material).
+
+    Agent-fillable, not sensitive, and NOT counted in barrier depth. ``pattern``/``source``/``sink``
+    are free text — no structured match key is presumed. Physically separate from the private
+    exploited-hole ledger."""
+
+    pattern: str
+    cve_id: str | None = None
+    source: str | None = None
+    sink: str | None = None
+    ref: str | None = None
+    notes: str | None = None
+    id: int | None = None
+    created_at: str | None = None
+
+
+@dataclass(frozen=True)
 class WebFormFieldRow:
     """Mirrors one web_form_fields row: a USER-EDITABLE web form field name, flattened from
     analysis.db (SaTC front-end surface). field_keyword is the asset's OWN content. A neutral

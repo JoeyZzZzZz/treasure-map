@@ -1912,14 +1912,27 @@ def test_path_sink_is_additive_no_regression(tmp_path: Path) -> None:
 
 
 def test_a2_sources_are_boundary_clean() -> None:
-    banned = re.compile(
-        r"\b(vuln\w*|exploit\w*|payload|\bpoc\b|finding|defect|incomplete_patch|fix_quality|"
+    # The neutral A2 + aggregation layer carries no offensive/judgement framing and no section /
+    # private-doc refs. The private exploited-hole ledger (exploit_ledger.py + its private_exploit /
+    # exploit_note storage in the schema) is the ONE sanctioned non-neutral store the moat feature
+    # adds: the domain term "exploit" is permitted THERE only. Every harder framing word stays
+    # banned across the whole layer — including the ledger and the schema — so the carve-out is
+    # exactly one word, exactly two surfaces.
+    hard = re.compile(
+        r"\b(vuln\w*|payload|\bpoc\b|finding|defect|incomplete_patch|fix_quality|"
         r"priority|risk[_ ]?score)\b",
         re.IGNORECASE,
     )
     section_ref = re.compile(r"§|PRD\s")
-    targets = [_HUNT_A2, *_QUERY_PKG.glob("*.py"), _ATLAS_SCHEMA]
-    for path in targets:
+    # "exploit*" framing is still banned in every NEUTRAL file; the two sanctioned storage
+    # identifiers (the exploit_ledger import path, the exploit_note column) are the only exceptions.
+    stray_exploit = re.compile(r"\bexploit(?!_ledger\b|_note\b)\w*", re.IGNORECASE)
+    exploit_exempt = {"exploit_ledger.py"}  # the private ledger read module (non-neutral by design)
+    for path in [_HUNT_A2, *_QUERY_PKG.glob("*.py"), _ATLAS_SCHEMA]:
         text = path.read_text()
-        assert not banned.search(text), f"banned vocab in {path.name}"
+        assert not hard.search(text), f"offensive framing in {path.name}"
         assert not section_ref.search(text), f"section/private-doc ref in {path.name}"
+        # the schema stores the exploit ledger (its whole moat DDL block is "exploit" prose), so the
+        # exploit-word check applies to the neutral files only, never the two sanctioned surfaces.
+        if path.name not in exploit_exempt and path.name != _ATLAS_SCHEMA.name:
+            assert not stray_exploit.search(text), f"stray 'exploit' framing in {path.name}"
