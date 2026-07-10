@@ -589,16 +589,18 @@ def make_tools(
         value: str | None = None,
         offset: int = 0,
     ) -> dict[str, Any]:
-        """Recorded strings: by binary, narrowed to a function's range, or searched by ``value``.
+        """Recorded strings: by binary, or searched by ``value`` (substring).
 
         ``value`` searches string CONTENT and returns each hit with its address + owning binary
-        (one-call locate), and honours ``function`` to scope the search to that function's range;
-        reference-site (which function uses a string) is not indexed — the result says so honestly.
-        Large results are paged LOSSLESSLY by byte size under ``paging``: pass ``offset`` =
-        ``paging.next_offset`` to page the tail (never summarized). HONEST BOUND: a binary's string
-        export is capped, so results carry ``truncated`` / ``total`` (by-binary) or
-        ``search_may_be_incomplete`` (by-value) when a scanned binary was capped — a string NOT
-        found there is NOT proven absent."""
+        (one-call locate); reference-site (which function uses a string) is not indexed — the result
+        says so honestly. ★ ``function`` does NOT scope the results (no string->function index, and
+        .rodata addresses fall outside code ranges): the response carries ``func_scope_applied:
+        false`` and a note whenever ``function`` is passed, and in value mode ``function`` only
+        gates existence (unresolvable name -> found:false). Large results are paged LOSSLESSLY by
+        byte size under ``paging``: pass ``offset`` = ``paging.next_offset`` to page the tail (never
+        summarized). HONEST BOUND: a binary's string export is capped, so results carry
+        ``truncated`` / ``total`` (by-binary) or ``search_may_be_incomplete`` (by-value) when a
+        scanned binary was capped — a string NOT found there is NOT proven absent."""
         return _with_analysis(
             lambda c: facts.get_strings(c, binary=binary, func=function, value=value, offset=offset)
         )

@@ -394,6 +394,20 @@ _STRING_REF_NOTE = (
     "address in a disassembler's xref view"
 )
 
+# ★ Honesty (declared≠actual): `function` is ECHOED on a strings result but does NOT scope it. A
+# differential test confirmed results are binary-wide in BOTH modes: there is no string->function
+# reference index, and code-range address filtering cannot reach .rodata string constants (their
+# addresses fall outside any code function's range). Surfaced as this note PLUS a machine-readable
+# ``func_scope_applied: false`` whenever `function` is passed, so a consumer (machine, which skims
+# prose) never reads the echoed `function` field as a scoping guarantee.
+_STRING_FUNC_SCOPE_NOTE = (
+    "`function` does NOT narrow string results in EITHER mode (by-binary or value). There is no "
+    "string->function reference index, and code-range address filtering cannot reach .rodata "
+    "string constants — results are binary-wide regardless of `function`. `function` currently "
+    "only gates existence in value mode (unresolvable name -> found:false). To scope strings to a "
+    "function, resolve the address in a disassembler's xref view."
+)
+
 
 def _truncated_binaries(conn: sqlite3.Connection, binary_id: int | None = None) -> list[str]:
     """Names of binaries whose string export was truncated at the extractor cap (scoped to one
@@ -473,12 +487,14 @@ def get_strings(
 
     Two modes: (1) ``value`` searches by string CONTENT (substring), returning every hit with its
     address + owning binary so a consumer locates "this string lives in <binary> at <address>" in
-    one call — optionally narrowed to ``binary`` and/or to ``func``'s address range; (2) without
-    ``value``, lists a binary's strings, optionally narrowed to ``func``'s address range
-    (best-effort by address; the schema has no string->func link). Large results are paged
-    LOSSLESSLY by byte size under ``paging`` (``offset`` / ``next_offset``) — the tail is reachable,
-    never summarized. The ``note`` states honestly that the reverse "which function references this
-    string" lookup is NOT provided — that index does not exist, and we do not fake it."""
+    one call — optionally narrowed to ``binary``; (2) without ``value``, lists a binary's strings.
+    ★ ``func`` does NOT scope the results (there is no string->func index and .rodata addresses fall
+    outside code ranges): results are binary-wide, flagged honestly with ``func_scope_applied:
+    false`` + a note, and in value mode ``func`` only gates existence (unresolvable name ->
+    found:false). Large results are paged LOSSLESSLY by byte size under ``paging`` (``offset`` /
+    ``next_offset``) — the tail is reachable, never summarized. The ``note`` also states that the
+    reverse "which function references this string" lookup is NOT provided (that index does not
+    exist, and we do not fake it)."""
     if value is not None:
         # ★ M6: value mode now honours ``func`` (previously it was silently dropped — a search
         # could not be scoped to a function). Resolve func first; a non-resolving func is SURFACED
@@ -528,8 +544,12 @@ def get_strings(
             "query": {"value": value, "binary": binary, "func": func},
             "strings": page,
             "paging": paging,
-            "note": _STRING_REF_NOTE,
+            # ★ 3.1 declared≠actual: `func` is echoed but does NOT scope strings (see the note). The
+            # boolean is the machine-readable guarantee — false whenever `func` was passed.
+            "note": _STRING_FUNC_SCOPE_NOTE if func is not None else _STRING_REF_NOTE,
         }
+        if func is not None:
+            result["func_scope_applied"] = False
         # Silent-drop guard: if a binary in scope was truncated at the export cap, a content search
         # can MISS a hit dropped past the cap — an empty/short result is NOT proof of absence there.
         trunc_bins = _truncated_binaries(conn, bid if scope_bin is not None else None)
@@ -584,8 +604,11 @@ def get_strings(
         "stored": len(rows),  # strings held for this binary (before any func-range narrowing)
         "total": total,  # true count of matching defined strings in the binary
         "truncated": truncated,  # EXPORT-CAP prefix flag (not the byte-paging one in ``paging``)
-        "note": _STRING_REF_NOTE,
+        # ★ 3.1 declared≠actual: `func` is echoed above but does NOT scope strings (see the note).
+        "note": _STRING_FUNC_SCOPE_NOTE if func is not None else _STRING_REF_NOTE,
     }
+    if func is not None:
+        out["func_scope_applied"] = False
     # Silent-drop guard: a truncated binary's stored list is only a prefix, so a string NOT listed
     # is NOT proven absent — it may have been dropped past the export cap. Never imply completeness.
     if truncated:

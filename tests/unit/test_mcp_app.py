@@ -736,6 +736,16 @@ def test_mcp_get_strings_accepts_offset_and_returns_paging(tmp_path: Path) -> No
     assert r["paging"]["next_offset"] is None  # the synthetic webd fits one page
 
 
+def test_mcp_get_strings_function_scope_flag(tmp_path: Path) -> None:
+    # ★ 3.1 on the MCP face (the surface the agent uses): passing `function` yields
+    # func_scope_applied:false + the honest "does NOT narrow" note — the echoed function is never a
+    # scoping guarantee.
+    tools = _tools(tmp_path)
+    r = tools["get_strings"](binary="webd", function="handle_req")
+    assert r["func_scope_applied"] is False
+    assert "does NOT narrow" in r["note"]
+
+
 # ── public-surface neutrality: the server is a published artifact, stricter discipline ──
 
 

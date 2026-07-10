@@ -392,6 +392,24 @@ def test_get_strings_byte_pagination_reaches_the_tail_losslessly(tmp_path: Path)
     conn.close()
 
 
+def test_get_strings_function_scope_is_honest_not_applied(tmp_path: Path) -> None:
+    # ★ 3.1 declared≠actual: `function` is echoed but does NOT scope strings (no string->func index;
+    # .rodata addresses fall outside code ranges). BOTH modes carry func_scope_applied:false + a
+    # note that says so, so a machine consumer never reads the echoed function as a scoping promise.
+    conn = facts.open_analysis_ro(_strings_db(tmp_path))
+    by_binary = facts.get_strings(conn, binary="rc", func="dispatch")
+    assert by_binary["func_scope_applied"] is False
+    assert "does NOT narrow" in by_binary["note"]
+    by_value = facts.get_strings(conn, binary="rc", func="dispatch", value="oauth")
+    assert by_value["func_scope_applied"] is False
+    assert "does NOT narrow" in by_value["note"]
+    # a call WITHOUT function carries neither the flag nor the narrowing note (unchanged)
+    plain = facts.get_strings(conn, binary="rc")
+    assert "func_scope_applied" not in plain
+    assert "does NOT narrow" not in plain["note"]
+    conn.close()
+
+
 def test_get_strings_default_returns_full_page_no_summary(tmp_path: Path) -> None:
     # the default byte budget is generous, so a small binary returns in ONE page with no summary and
     # a terminal next_offset=None — pagination is a tail-safety net, not always-on chunking.
