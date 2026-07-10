@@ -21,12 +21,19 @@ from treasure_map.cli.mcp_cli import fact as fact_group
 from treasure_map.lib import facts
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import InstanceRow, NvramFlowRow
-from treasure_map.lib.atlas.writer import add_instance, add_nvram_flow_rows, upsert_pattern
+from treasure_map.lib.atlas.writer import (
+    add_instance,
+    add_nvram_flow_rows,
+    begin_run,
+    finish_run,
+    upsert_pattern,
+)
 from treasure_map.lib.query.triage import Dimension, TriageCandidate
 from treasure_map.lib.storage.connection import open_db
 
 _EXPECTED_TOOLS = {
     "list_candidates",
+    "list_runs",
     "explain_candidate",
     "get_sink_provenance",
     "get_nvram_key_flow",
@@ -113,19 +120,25 @@ def _mk_atlas(tmp_path: Path) -> Path:
             ),
         ),
     )
+    # Record the run_id -> analysis.db resolver so the run-aware fact tools can route to run_m's db
+    # (the analysis.db _mk_analysis writes in the same tmp_path).
+    begin_run(conn, "run_m", analysis_db_path=str((tmp_path / "analysis.db").resolve()))
+    finish_run(conn, "run_m", binaries=1, functions=2)
     conn.close()
     return atlas
 
 
 def _tools(tmp_path: Path):
-    return mcp_app.make_tools(_mk_analysis(tmp_path), _mk_atlas(tmp_path))
+    _mk_analysis(tmp_path)  # the analysis.db the run_m lineage row resolves to
+    return mcp_app.make_tools(_mk_atlas(tmp_path))
 
 
 # ── discoverability ──────────────────────────────────────────────────────────────────
 
 
 def test_server_registers_all_tools(tmp_path: Path) -> None:
-    server = mcp_app.build_server(_mk_analysis(tmp_path), _mk_atlas(tmp_path))
+    _mk_analysis(tmp_path)
+    server = mcp_app.build_server(_mk_atlas(tmp_path))
     names = {t.name for t in asyncio.run(server.list_tools())}
     assert names == _EXPECTED_TOOLS
 
@@ -133,22 +146,33 @@ def test_server_registers_all_tools(tmp_path: Path) -> None:
 # ── CLI / MCP / lib parity: one shared query, identical result ──────────────────────
 
 
+_RUN_ENVELOPE_KEYS = {"atlas", "resolved_run", "run_source", "run_lineage", "warning"}
+
+
+def _fact_payload(result: dict) -> dict:
+    """A run-aware fact result minus the run-routing envelope (resolved_run / run_lineage / …), so
+    it can be compared against the raw lib/CLI fact it wraps (the shared query is identical)."""
+    return {k: v for k, v in result.items() if k not in _RUN_ENVELOPE_KEYS}
+
+
 def test_cli_mcp_lib_parity_pseudocode(tmp_path: Path) -> None:
     analysis = _mk_analysis(tmp_path)
-    tools = mcp_app.make_tools(analysis, _mk_atlas(tmp_path))
+    tools = mcp_app.make_tools(_mk_atlas(tmp_path))
     # lib directly
     conn = facts.open_analysis_ro(analysis)
     lib_result = facts.get_pseudocode(conn, func="handle_req")
     conn.close()
-    # MCP tool
-    mcp_result = tools["get_pseudocode"]("handle_req")
+    # MCP tool (run-aware: routed by run_id, then stamped with the run envelope)
+    mcp_result = tools["get_pseudocode"]("handle_req", run_id="run_m")
+    assert mcp_result["resolved_run"] == "run_m"  # echoed the run it answered from
     # CLI
     cli = CliRunner().invoke(
         fact_group, ["pseudocode", "handle_req", "--analysis-db", str(analysis)]
     )
     assert cli.exit_code == 0, cli.output
     cli_result = json.loads(cli.output)
-    assert lib_result == mcp_result == cli_result
+    # the underlying fact (minus the MCP run envelope) is identical across lib / MCP / CLI
+    assert lib_result == _fact_payload(mcp_result) == cli_result
 
 
 # ── contract 1: no anchor, no output ────────────────────────────────────────────────
@@ -156,7 +180,7 @@ def test_cli_mcp_lib_parity_pseudocode(tmp_path: Path) -> None:
 
 def test_no_anchor_no_output(tmp_path: Path) -> None:
     tools = _tools(tmp_path)
-    assert tools["get_pseudocode"]("does_not_exist")["found"] is False
+    assert tools["get_pseudocode"]("does_not_exist", run_id="run_m")["found"] is False
     assert tools["explain_candidate"]("run_m#nope")["found"] is False
 
 
@@ -168,10 +192,10 @@ def test_outputs_carry_no_payload(tmp_path: Path) -> None:
     blobs = [
         tools["list_candidates"](),
         tools["explain_candidate"]("run_m#fn1@cmd"),
-        tools["get_pseudocode"]("handle_req"),
-        tools["get_callees"]("handle_req"),
-        tools["get_script_callsites"]("webd"),
-        tools["get_disassembly"]("handle_req"),
+        tools["get_pseudocode"]("handle_req", run_id="run_m"),
+        tools["get_callees"]("handle_req", run_id="run_m"),
+        tools["get_script_callsites"]("webd", run_id="run_m"),
+        tools["get_disassembly"]("handle_req", run_id="run_m"),
         tools["legal_notice"](),
     ]
     text = json.dumps(blobs).lower()
@@ -219,7 +243,7 @@ def test_get_nvram_key_flow_tool(tmp_path: Path) -> None:
         ],
     )
     conn.close()
-    tools = mcp_app.make_tools(_mk_analysis(tmp_path), atlas)
+    tools = mcp_app.make_tools(atlas)
 
     res = tools["get_nvram_key_flow"]("sw_mode")
     assert res["found"] is True
@@ -319,6 +343,8 @@ def _mk_multi_atlas(tmp_path: Path) -> Path:
     mk("copy", "p1")
     mk("copy", "p2")
     mk("copy", "p3")
+    begin_run(conn, "run_m", analysis_db_path=str((tmp_path / "analysis.db").resolve()))
+    finish_run(conn, "run_m", binaries=1, functions=2)
     conn.close()
     return atlas
 
@@ -327,7 +353,7 @@ def test_list_candidates_filter_floats_corpus_invariant(tmp_path: Path) -> None:
     # ★★ 步骤 2.5 M5-1b (gap #1 — the agent's ACTUAL surface): on MCP a --filter FLOATS, never
     # reduces the corpus. source=nvram (the OAuth-hiding regression) keeps all 5; sink_impact=cmd
     # returns the corpus (5) floated, NOT the 2 matches.
-    tools = mcp_app.make_tools(_mk_analysis(tmp_path), _mk_multi_atlas(tmp_path), run_id="run_m")
+    tools = mcp_app.make_tools(_mk_multi_atlas(tmp_path))
     base = tools["list_candidates"]()
     assert base["corpus"] == 5 and base["total"] == 5
     src = tools["list_candidates"](filters="source=nvram")
@@ -341,7 +367,7 @@ def test_list_candidates_filter_floats_corpus_invariant(tmp_path: Path) -> None:
 def test_list_candidates_only_sweeps_and_refuses_on_mcp(tmp_path: Path) -> None:
     # ★ 步骤 2.5 M2 on MCP: --only sweeps a ground-truth dim (corpus stays whole via `corpus`) and
     # REFUSES an optimistic one with an error, never silently pruning it.
-    tools = mcp_app.make_tools(_mk_analysis(tmp_path), _mk_multi_atlas(tmp_path), run_id="run_m")
+    tools = mcp_app.make_tools(_mk_multi_atlas(tmp_path))
     swept = tools["list_candidates"](only="sink_class=cmd")
     assert swept["corpus"] == 5 and swept["total"] == 2  # corpus whole, view pruned to the sweep
     refused = tools["list_candidates"](only="controllability=free")
@@ -353,7 +379,8 @@ def test_list_candidates_carries_fingerprint_and_incomplete_field(tmp_path: Path
     # ★ Work item 6 + red-line honesty: each candidate carries its structural_fingerprint (pivot
     # from cross_firmware_patterns), and the result carries an incomplete_binaries flag.
     tools = _tools(tmp_path)
-    out = tools["list_candidates"]()
+    # scoped to run_m, the per-scan completeness red-line is computed from its analysis.db
+    out = tools["list_candidates"](run_id="run_m")
     assert out["incomplete_binaries"] == []  # the synthetic webd has functions
     # partial-completeness honesty: webd's functions all have pseudocode, so none are flagged
     assert out["partially_incomplete_binaries"] == []
@@ -364,12 +391,17 @@ def test_list_candidates_carries_fingerprint_and_incomplete_field(tmp_path: Path
     assert tools["list_candidates"](fingerprint="no_such_fp")["total"] == 0
 
 
-def test_cross_firmware_views_carry_incomplete_flag(tmp_path: Path) -> None:
+def test_per_scan_completeness_rides_scoped_list_not_cross_run_views(tmp_path: Path) -> None:
+    # The analysis-completeness red-line is a per-SCAN fact — it now rides list_candidates(run_id=…)
+    # (which resolves ONE run's analysis.db), NOT the cross-run aggregations (there is no single
+    # analysis.db to read across all firmware). The aggregations stay reachable + noted.
     tools = _tools(tmp_path)
+    scoped = tools["list_candidates"](run_id="run_m")
+    assert "incomplete_binaries" in scoped and "partially_incomplete_binaries" in scoped
     for view in ("cross_firmware_patterns", "pattern_density"):
         out = tools[view]()
-        assert "incomplete_binaries" in out
-        assert "partially_incomplete_binaries" in out
+        assert "incomplete_binaries" not in out  # moved to the scoped per-run listing
+        assert "DERIVED" in out["note"]
 
 
 def test_list_candidates_sink_class_filter(tmp_path: Path) -> None:
@@ -393,20 +425,57 @@ def test_list_candidates_sink_and_pagination_metadata(tmp_path: Path) -> None:
     assert tools["list_candidates"](limit=9999)["limit"] <= 200  # clamped
 
 
-def test_list_candidates_run_isolation(tmp_path: Path) -> None:
-    # B1: a server bound to run_m only surfaces run_m candidates by default; an explicit run_id
-    # for another run isolates to it (here empty), and is_current_run flags the bound run.
-    analysis, atlas = _mk_analysis(tmp_path), _mk_atlas(tmp_path)
-    tools = mcp_app.make_tools(analysis, atlas, run_id="run_m")
-    out = tools["list_candidates"]()
-    assert out["current_run_id"] == "run_m"
-    assert out["isolated_to_run"] == "run_m"
-    assert all(c["is_current_run"] for c in out["candidates"])
-    # a bound run that has no candidates falls back to all runs, annotated (not an empty list)
-    tools_stale = mcp_app.make_tools(analysis, atlas, run_id="does_not_exist")
-    fb = tools_stale["list_candidates"]()
-    assert fb["isolated_to_run"] is None and fb["total"] == 1
-    assert fb["runs"] is not None  # firmware split shown when not isolated
+def test_list_candidates_scopes_by_run_and_carries_runs_in_atlas(tmp_path: Path) -> None:
+    # M7/M-A1: the listing scopes to an explicit run_id (canonical resolved_run), each row carries
+    # its own ``run`` (no ambient current_run_id / is_current_run), and runs_in_atlas is ALWAYS
+    # present (even when scoped) so switching firmware is one glance.
+    tools = _tools(tmp_path)
+    out = tools["list_candidates"](run_id="run_m")
+    assert out["resolved_run"] == "run_m"
+    assert "current_run_id" not in out and "isolated_to_run" not in out  # ambient binding gone
+    assert out["runs_in_atlas"] == ["run_m"]  # bare id list, always present
+    assert all(c["run"] == "run_m" for c in out["candidates"])
+    assert all("is_current_run" not in c for c in out["candidates"])  # per-row flag gone
+    # unscoped spans every run; runs_in_atlas still lists them
+    allruns = tools["list_candidates"]()
+    assert allruns["resolved_run"] is None and allruns["runs_in_atlas"] == ["run_m"]
+
+
+def test_fact_tool_requires_run_and_hard_errors_on_the_four_modes(tmp_path: Path) -> None:
+    # M2/Q1: a fact tool has NO ambient default and hard-errors (never a silent empty) across the
+    # four failure modes, distinguishing "wrong run" from "no such function".
+    tools = _tools(tmp_path)
+    # (0) no run_id and no evidence_ref -> refuses, names how to supply one
+    none = tools["get_pseudocode"]("handle_req")
+    assert none["found"] is False and "evidence_ref" in none["error"]
+    assert none["runs_in_atlas"] == ["run_m"]
+    # (1) misspelled run -> not-in-atlas, lists the available runs (G3)
+    bad_run = tools["get_pseudocode"]("handle_req", run_id="run_typo")
+    assert "not in this atlas" in bad_run["error"] and "run_m" in bad_run["error"]
+    # (3) function in a DIFFERENT run than the one asked -> names the owning run (Q1-a)
+    wrong = tools["get_pseudocode"]("handle_req", run_id="run_m")  # handle_req IS in run_m -> found
+    assert wrong["found"] is True and wrong["resolved_run"] == "run_m"
+    # (4) a function in NO run -> "not in ANY run" (Q1-b), the miss is diagnosed not silent
+    absent = tools["get_pseudocode"]("nope_fn", run_id="run_m")
+    assert absent["found"] is False and "not in ANY run" in absent["cross_run_note"]
+
+
+def test_fact_tool_missing_analysis_db_hard_errors(tmp_path: Path) -> None:
+    # G4: a run whose analysis.db was never recorded (a pre-existing scan) hard-errors — never a
+    # silent empty that reads as "no findings".
+    atlas = _mk_multi_atlas(tmp_path)  # writes run_m -> tmp_path/analysis.db, which does NOT exist
+    tools = mcp_app.make_tools(atlas)
+    r = tools["get_pseudocode"]("c1", run_id="run_m")
+    assert r["found"] is False and "not found" in r["error"]
+    assert r["resolved_run"] == "run_m"  # still stamped with the run it refers to
+
+
+def test_fact_tool_routes_by_evidence_ref(tmp_path: Path) -> None:
+    # M4: an evidence_ref self-resolves the run (+ binary + function) — no run_id needed. run_source
+    # reflects via_ref, and resolved_run is the ref's run.
+    tools = _tools(tmp_path)
+    r = tools["get_pseudocode"](evidence_ref="run_m#fn1@cmd")
+    assert r["resolved_run"] == "run_m" and r["run_source"] == "via_ref"
 
 
 def test_cross_firmware_and_aggregation_tools(tmp_path: Path) -> None:
@@ -445,21 +514,22 @@ def test_milestone_recall_to_facts_chain(tmp_path: Path) -> None:
     # 1. recall
     cand = tools["list_candidates"]()["candidates"][0]
     assert cand["function"] == "handle_req"
-    # 2. fetch the candidate function's facts (by its address anchor)
-    pc = tools["get_pseudocode"]("0x6b90")
+    # 2. fetch the candidate function's facts (by its address anchor) — the ref self-routes the run
+    pc = tools["get_pseudocode"](evidence_ref=cand["evidence_ref"])
     assert pc["found"] and "do_fwd" in pc["pseudocode"]
-    # 3. follow callees to the wrapper
-    callees = tools["get_callees"]("handle_req")
+    assert pc["resolved_run"] == "run_m"  # the ref carried the run — no retyping
+    # 3. follow callees to the wrapper (run_id explicit this time)
+    callees = tools["get_callees"]("handle_req", run_id="run_m")
     assert {c["name"] for c in callees["callees"]} == {"do_fwd"}
     # 4. fetch the wrapper's facts (the one-hop sink lives here)
-    wrapper = tools["get_pseudocode"]("do_fwd")
+    wrapper = tools["get_pseudocode"]("do_fwd", run_id="run_m")
     assert wrapper["found"] and "system(a)" in wrapper["pseudocode"]
     # the AI now has the full chain to judge — the tool draws no conclusion for it
 
 
 def test_disassembly_unavailable_is_honest(tmp_path: Path) -> None:
     tools = _tools(tmp_path)
-    r = tools["get_disassembly"]("handle_req")
+    r = tools["get_disassembly"]("handle_req", run_id="run_m")
     assert r["available"] is False and r["anchor"]["function"] == "handle_req"
 
 
@@ -471,12 +541,13 @@ def test_legal_notice_present(tmp_path: Path) -> None:
 def test_server_instructions_are_workflow_not_just_legalese(tmp_path: Path) -> None:
     # B4: the standing instructions are the agent workflow guide; the legal notice stays reachable
     # via the legal_notice tool.
-    analysis, atlas = _mk_analysis(tmp_path), _mk_atlas(tmp_path)
-    server = mcp_app.build_server(analysis, atlas)
+    atlas = _mk_atlas(tmp_path)
+    server = mcp_app.build_server(atlas)
     instr = server.instructions or ""
     assert "evidence_ref" in instr and "cross_firmware_patterns" in instr
     assert "RECALL" in instr  # the loop, not just the banner
-    tools = mcp_app.make_tools(analysis, atlas)
+    assert "run_id" in instr and "list_runs" in instr  # the run-aware routing guidance
+    tools = mcp_app.make_tools(atlas)
     assert "defensive" in tools["legal_notice"]()["notice"].lower()
 
 
@@ -487,7 +558,6 @@ def test_explain_and_list_surface_source_kind(tmp_path: Path) -> None:
     # The source_kind the evidence layer stored in flow_evidence is surfaced on BOTH the
     # explain_candidate and list_candidates MCP surfaces (a free, controllable string here),
     # alongside the coarse source_class it refines.
-    analysis = _mk_analysis(tmp_path)
     atlas = tmp_path / "atlas.db"
     conn = open_atlas(atlas)
     pid = upsert_pattern(
@@ -525,7 +595,7 @@ def test_explain_and_list_surface_source_kind(tmp_path: Path) -> None:
         ),
     )
     conn.close()
-    tools = mcp_app.make_tools(analysis, atlas)
+    tools = mcp_app.make_tools(atlas)
     ex = tools["explain_candidate"]("run_m#fn1@cmd")
     assert ex["found"] is True
     # ★ TOP-LEVEL visibility (the shipped bug): an agent reads the explain top level, so BOTH the
@@ -586,12 +656,13 @@ def test_get_functions_referencing_string_tool(tmp_path: Path) -> None:
     # Reachable as a tool, matches by pseudocode text (handle_req's body calls do_fwd), and states
     # its honest bound (a TEXT match, not a resolved symbol xref). A missing binary yields no hits.
     tools = _tools(tmp_path)
-    r = tools["get_functions_referencing_string"]("do_fwd")
+    r = tools["get_functions_referencing_string"]("do_fwd", run_id="run_m")
     assert r["found"] is True
     assert "handle_req" in {f["function"] for f in r["functions"]}
     assert r["match_kind"] == "pseudocode_text_substring"
     assert "text" in r["note"].lower()
-    assert tools["get_functions_referencing_string"]("do_fwd", "libc.so")["functions"] == []
+    empty = tools["get_functions_referencing_string"]("do_fwd", "libc.so", run_id="run_m")
+    assert empty["functions"] == []
 
 
 # ── compact-row serializer contract (compact_row_contract.md C1–C8) ────────────────────
@@ -704,12 +775,12 @@ def test_compact_row_reachability_seam_real_dimension(tmp_path: Path) -> None:
     d_web.mkdir()
     d_no = tmp_path / "nosite"
     d_no.mkdir()
-    web = mcp_app.make_tools(_mk_analysis(d_web), _mk_atlas(d_web))["list_candidates"]()
+    _mk_analysis(d_web)
+    web = mcp_app.make_tools(_mk_atlas(d_web))["list_candidates"]()
     (web_cand,) = web["candidates"]
     assert web_cand["dimensions"]["reachability"] == "proven:entry:web"
-    nosite = mcp_app.make_tools(_mk_analysis(d_no), _mk_multi_atlas(d_no), run_id="run_m")[
-        "list_candidates"
-    ]()
+    _mk_analysis(d_no)
+    nosite = mcp_app.make_tools(_mk_multi_atlas(d_no))["list_candidates"]()
     assert nosite["candidates"]  # the corpus is non-empty
     assert all("reachability" not in c["dimensions"] for c in nosite["candidates"])
 
@@ -731,7 +802,7 @@ def test_note_moves_from_list_to_explain(tmp_path: Path) -> None:
 def test_mcp_get_strings_accepts_offset_and_returns_paging(tmp_path: Path) -> None:
     # ★ M6: the MCP get_strings wrapper threads ``offset`` into the lossless byte-paging envelope.
     tools = _tools(tmp_path)
-    r = tools["get_strings"](binary="webd", offset=0)
+    r = tools["get_strings"](binary="webd", offset=0, run_id="run_m")
     assert "paging" in r and r["paging"]["offset"] == 0
     assert r["paging"]["next_offset"] is None  # the synthetic webd fits one page
 
@@ -761,7 +832,7 @@ def test_mcp_get_strings_function_scope_flag(tmp_path: Path) -> None:
     # func_scope_applied:false + the honest "does NOT narrow" note — the echoed function is never a
     # scoping guarantee.
     tools = _tools(tmp_path)
-    r = tools["get_strings"](binary="webd", function="handle_req")
+    r = tools["get_strings"](binary="webd", function="handle_req", run_id="run_m")
     assert r["func_scope_applied"] is False
     assert "does NOT narrow" in r["note"]
 

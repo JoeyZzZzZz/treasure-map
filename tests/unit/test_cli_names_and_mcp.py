@@ -7,7 +7,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import click
 import pytest
 from click.testing import CliRunner
 
@@ -38,10 +37,12 @@ def test_old_names_still_resolve(old: str, new: str) -> None:
     assert r_old.output.split("\n", 1)[1] == r_new.output.split("\n", 1)[1]
 
 
-# ── A2: `tmap mcp` resolves paths from the last-run pointer; explicit wins ───────────────
+# ── A2: `tmap mcp` binds the ATLAS (from pointer/config); no firmware preselected ────────
 
 
-def test_mcp_target_from_pointer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mcp_target_atlas_from_pointer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The server binds the ATLAS (not one firmware): when no --atlas is given, the last-run
+    # pointer's atlas is used; the workspaces root defaults to the configured workspace directory.
     adb, atlas = tmp_path / "analysis.db", tmp_path / "atlas.db"
     adb.touch()
     atlas.touch()
@@ -50,38 +51,36 @@ def test_mcp_target_from_pointer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 
     last_run.write_last_run(adb, atlas, "run_z", path=ptr)
     monkeypatch.setattr(last_run, "_POINTER_PATH", ptr)
-    a, x, run_id = mcp_cli._resolve_mcp_target(None, None)
-    assert Path(a) == adb.resolve() and Path(x) == atlas.resolve()
-    assert run_id == "run_z"  # bound because the resolved analysis.db matches the pointer
+    atlas_out, ws = mcp_cli._resolve_mcp_target(None, None)
+    assert Path(atlas_out) == atlas.resolve()  # atlas from the pointer
+    assert ws is not None  # a workspaces-root fallback resolver is always provided (from config)
 
 
-def test_mcp_explicit_paths_win(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mcp_explicit_atlas_and_ws_win(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from treasure_map.lib import last_run
 
     monkeypatch.setattr(last_run, "_POINTER_PATH", tmp_path / "absent.json")
-    a, x, run_id = mcp_cli._resolve_mcp_target("/custom/a.db", "/custom/x.db")
-    assert a == "/custom/a.db" and x == "/custom/x.db"
-    assert run_id is None  # no pointer to bind a run from
+    atlas_out, ws = mcp_cli._resolve_mcp_target("/custom/x.db", "/custom/ws")
+    assert atlas_out == "/custom/x.db" and ws == "/custom/ws"
 
 
-def test_mcp_missing_pointer_is_friendly_error(
+def test_mcp_no_pointer_falls_back_to_configured_atlas(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # With no pointer AND no --atlas, the model does NOT error (the old single-firmware precondition
+    # is gone): it binds the configured atlas.db, so `tmap mcp` starts zero-config over the atlas.
     from treasure_map.lib import last_run
 
     monkeypatch.setattr(last_run, "_POINTER_PATH", tmp_path / "absent.json")
-    with pytest.raises(click.ClickException) as exc:
-        mcp_cli._resolve_mcp_target(None, None)
-    assert "tmap scan" in str(exc.value)  # tells the user what to do, not a traceback
+    atlas_out, ws = mcp_cli._resolve_mcp_target(None, None)
+    assert atlas_out.endswith("atlas.db")  # the configured atlas, not a traceback
 
 
 # ── A3: stderr launch hint (mcp is a core dep — no missing-extra path to test) ───────────
 
 
 def test_mcp_stderr_launch_hint(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        mcp_cli, "_resolve_mcp_target", lambda a, x: ("/abs/a.db", "/abs/x.db", None)
-    )
+    monkeypatch.setattr(mcp_cli, "_resolve_mcp_target", lambda a, x: ("/abs/x.db", "/abs/ws"))
 
     class _FakeServer:
         def run(self) -> None:  # the client would drive JSON-RPC; here we just return

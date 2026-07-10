@@ -36,6 +36,7 @@ from mcp.server.fastmcp import FastMCP
 
 from treasure_map.lib import facts
 from treasure_map.lib.atlas.connection import open_atlas
+from treasure_map.lib.atlas.models import RunRow
 from treasure_map.lib.notice import LEGAL_NOTICE
 from treasure_map.lib.query import DEFAULT_LENS_LABEL as _LENS_LABEL
 from treasure_map.lib.query import PHASE1_CAVEATS as _LENS_CAVEATS
@@ -48,10 +49,13 @@ from treasure_map.lib.query import explain_candidate as _explain_candidate
 from treasure_map.lib.query import filter_candidates as _filter_candidates
 from treasure_map.lib.query import filter_match_count as _filter_match_count
 from treasure_map.lib.query import get_nvram_key_flow as _get_nvram_key_flow
+from treasure_map.lib.query import get_run as _get_run
 from treasure_map.lib.query import get_sink_provenance as _get_sink_provenance
 from treasure_map.lib.query import ledger as _ledger
+from treasure_map.lib.query import list_runs as _list_runs
 from treasure_map.lib.query import only_refusal as _only_refusal
 from treasure_map.lib.query import parse_impact_order as _parse_impact_order
+from treasure_map.lib.query import runs_where_function_exists as _runs_where_function_exists
 from treasure_map.lib.query import triage as _triage
 from treasure_map.lib.query import twins as _twins
 
@@ -85,8 +89,12 @@ _AGENT_INSTRUCTIONS = (
     "the value origin from a table instead of rebuilding it by hand. get_nvram_key_flow(key) gives "
     "one nvram key's cross-binary writers/readers (exact constant matches + separately flagged "
     "parametric template matches), each writer's value_source, and an honest completeness flag "
-    "when caller-supplied keys could also touch it. Read facts: get_pseudocode "
-    "(func = a name OR an address in any form; "
+    "when caller-supplied keys could also touch it. The fact tools are RUN-AWARE: a shared atlas "
+    "holds many firmware, so pass run_id (from list_runs) OR an evidence_ref (a candidate row's "
+    "anchor, which self-resolves the run + binary + function); there is NO ambient default. Every "
+    "result echoes resolved_run + run_lineage (build/scanned_at/scan_status) so you see which "
+    "scan answered and whether it is stale — check list_runs before trusting an old scan. Read "
+    "facts: get_pseudocode (func = a name OR an address in any form; "
     "binary = short name OR full path), get_callees / get_xrefs to walk the call chain (an empty "
     "caller set may mean an indirect/dispatch-table call, not 'unreachable'), get_strings, "
     "get_functions_referencing_string (which functions mention a string, by pseudocode text "
@@ -116,9 +124,32 @@ _COMPACT_ROW_LEGEND = (
 )
 
 
+# A one-line legend on the list envelope (M-A3): how to pull ANY row's code without typing three
+# args. evidence_ref is already on every row and self-resolves run+binary+function, so this replaces
+# a per-row fetch hint (which would bloat the list and go stale against the tool signature).
+_FETCH_CODE_LEGEND = (
+    "to read any candidate's code/callees/xrefs, pass that row's evidence_ref: "
+    "get_pseudocode(evidence_ref=<row.evidence_ref>) — it resolves the run + binary + function for "
+    "you (no need to retype run_id). Or pass run_id + function explicitly."
+)
+
+
 def _dim_label(d: Any) -> str:
     """One dimension compressed to a single ``state:value`` label (no note) for the compact row."""
     return f"{d.state}:{d.value}"
+
+
+def _lineage_inline(run: RunRow) -> dict[str, Any]:
+    """The run's scan lineage, inlined on EVERY fact return (M6) so a consumer spots a STALE scan
+    without a separate list_runs call (a stale scan is silent — the lineage must be printed, not
+    fetched). ``resolved`` is False for a pre-existing run with no lineage row."""
+    return {
+        "build_hash": run.build_hash,
+        "scanned_at": run.scanned_at,
+        "scan_status": run.scan_status,
+        "tool_version": run.tool_version,
+        "resolved": run.resolved,
+    }
 
 
 def _short_binary(binary_path: str | None) -> str | None:
@@ -128,7 +159,7 @@ def _short_binary(binary_path: str | None) -> str | None:
     return binary_path.rsplit("/", 1)[-1] or binary_path
 
 
-def _candidate_row(c: Any, rank: int, current_run_id: str | None = None) -> dict[str, Any]:
+def _candidate_row(c: Any, rank: int) -> dict[str, Any]:
     """One candidate as a COMPACT triage row (the compact-row carry contract C1-C3).
 
     Spine facts (always present) + every non-spine dimension whose state is ESTABLISHED
@@ -137,14 +168,18 @@ def _candidate_row(c: Any, rank: int, current_run_id: str | None = None) -> dict
     ``c.dimensions`` and never hardcodes a dimension whitelist, so any future axis that is a
     Dimension with an established state joins the row automatically (the anti-'hidden marker'
     invariant). The baseline it omits is the UNKNOWN semantics (not proven safe), never a
-    per-firmware modal value."""
+    per-firmware modal value.
+
+    ``run`` names the candidate's firmware run (source_run_id) explicitly — a shared atlas mixes
+    firmware, so a row must carry its own run rather than lean on an ambient 'current run' (the
+    ambient marker was the run-binding hazard; there is no is_current_run flag any more)."""
     carried = {
         d.name: _dim_label(d)
         for d in c.dimensions
         if d.name not in _SPINE_DIMENSIONS and d.state != "unknown"
     }
     return {
-        # the anchor — pass to explain_candidate / get_sink_provenance
+        # the anchor — pass to explain_candidate / get_sink_provenance / get_pseudocode(ref)
         "evidence_ref": c.evidence_ref,
         # position under the current lens (0-based, absolute; re-ranked on a lens switch)
         "rank": rank,
@@ -153,15 +188,13 @@ def _candidate_row(c: Any, rank: int, current_run_id: str | None = None) -> dict
         # controllability is spine: ALWAYS present as one state:value label, even unknown:unknown.
         "controllability": _dim_label(c.dim("controllability")),
         "nvram_source_key": c.nvram_source_key,  # the key feeding the sink (spots an nvram cluster)
+        "run": c.source_run_id,  # this candidate's firmware run (explicit; no ambient current run)
         "binary": _short_binary(c.binary_path),
         "function": c.function,
         "structural_fingerprint": c.structural_fingerprint,
         # Non-spine dimensions with an established state, each "state:value" (no note). A dimension
         # NOT here is state=unknown — a coverage gap, NOT proven safe (see the envelope legend).
         "dimensions": carried,
-        # True when this candidate belongs to the firmware run the server is bound to (None when the
-        # server is not bound to a specific run) — per-row firmware attribution for a shared atlas.
-        "is_current_run": (None if current_run_id is None else c.source_run_id == current_run_id),
     }
 
 
@@ -222,54 +255,230 @@ def _page(rows: list[Any], limit: int, offset: int) -> tuple[list[Any], dict[str
 
 
 def make_tools(
-    analysis_db: Path | str, atlas_db: Path | str, run_id: str | None = None
+    atlas_db: Path | str, *, workspaces_root: Path | str | None = None
 ) -> dict[str, Callable[..., Any]]:
-    """Build the tool callables bound to one workspace's databases (and optionally one run).
+    """Build the tool callables bound to ONE atlas (not one firmware).
 
-    ``run_id`` is the firmware this server is bound to; list_candidates defaults to it so a shared
-    cross-firmware atlas does not mix another image's leads into this session. Returned as plain
-    functions so the CLI, the MCP registration, and the tests all invoke the SAME code path
-    (parity by construction)."""
-    analysis_path = Path(analysis_db)
+    The server binds the shared, persistent atlas — NOT a single analysis.db. A run-aware fact tool
+    resolves ``run_id`` -> analysis.db through the atlas ``run`` table (the stored resolver), so one
+    server serves every firmware in the atlas and never silently answers from the wrong scan. There
+    is NO ambient 'current run' default: a fact tool takes an explicit ``run_id`` or an
+    ``evidence_ref`` (which self-resolves the run), else it errors. ``workspaces_root`` is an
+    OPTIONAL fallback resolver (``<root>/<run_id>/analysis.db``) for the common
+    run_id==workspace-name case; the run table is the authority. Returned as plain functions so the
+    CLI, the MCP registration, and the tests all invoke the SAME code path (parity by
+    construction)."""
     atlas_path = Path(atlas_db)
-    current_run_id = run_id
+    ws_root = Path(workspaces_root) if workspaces_root is not None else None
 
-    def _with_analysis(
-        fn: Callable[[sqlite3.Connection], dict[str, Any]],
+    def _error(atlas: sqlite3.Connection, msg: str) -> dict[str, Any]:
+        """A hard-error fact result: never a silent empty. Carries ``runs_in_atlas`` (M-A1) so the
+        consumer can immediately see which runs DO exist and re-issue against the right one."""
+        return {
+            "found": False,
+            "error": msg,
+            "runs_in_atlas": [r.run_id for r in _list_runs(atlas)],
+            "note": _DERIVED_SIGNAL_NOTE,
+        }
+
+    def _resolve_ref(
+        atlas: sqlite3.Connection, evidence_ref: str
+    ) -> tuple[str | None, str | None, str | None] | None:
+        """An evidence_ref -> (run_id, binary, function) from its atlas instance, or None if absent.
+
+        Lets a fact tool take a candidate row's evidence_ref and self-resolve the run + binary +
+        function (no retyping) — the same anchor explain_candidate resolves, reused here."""
+        row = atlas.execute(
+            "SELECT source_run_id, binary_path, source_anchor FROM instance "
+            "WHERE evidence_ref = ? ORDER BY instance_id LIMIT 1",
+            (evidence_ref,),
+        ).fetchone()
+        if row is None:
+            return None
+        return (row["source_run_id"], _short_binary(row["binary_path"]), row["source_anchor"])
+
+    def _resolve_locus(
+        atlas: sqlite3.Connection,
+        run_id: str | None,
+        evidence_ref: str | None,
+        function: str | None,
+        binary: str | None,
     ) -> dict[str, Any]:
-        conn = facts.open_analysis_ro(analysis_path)
+        """Resolve the target run (+ effective function/binary) with NO ambient default.
+
+        evidence_ref (via_ref) self-resolves run+binary+function; else an explicit run_id; else a
+        hard error. Returns {run, run_source, function, binary, warning} or an error dict (has
+        'error'). A run absent from the atlas is the run-not-found hard error (G3)."""
+        fn, bn, warning = function, binary, None
+        if evidence_ref is not None:
+            ref = _resolve_ref(atlas, evidence_ref)
+            if ref is None:
+                return _error(
+                    atlas,
+                    f"evidence_ref '{evidence_ref}' does not anchor any candidate in this atlas.",
+                )
+            ref_run, ref_bin, ref_fn = ref
+            if run_id is not None and run_id != ref_run:
+                warning = (
+                    f"⚠ run_id='{run_id}' but evidence_ref belongs to run '{ref_run}'; "
+                    f"using the ref's run '{ref_run}'."
+                )
+            target_run, run_source = ref_run, "via_ref"
+            fn = function if function is not None else ref_fn
+            bn = binary if binary is not None else ref_bin
+        elif run_id is not None:
+            target_run, run_source = run_id, "explicit"
+        else:
+            return _error(
+                atlas,
+                "no run_id and no evidence_ref — a fact tool needs one (no ambient default "
+                "binding). Pass run_id=<id> (see list_runs) or evidence_ref=<a candidate's ref>.",
+            )
+        if target_run is None:
+            return _error(
+                atlas, "evidence_ref resolved to a null run — its instance has no run id."
+            )
+        run = _get_run(atlas, target_run)
+        if run is None:
+            avail = [r.run_id for r in _list_runs(atlas)]
+            return _error(atlas, f"run '{target_run}' not in this atlas; available runs: {avail}")
+        return {
+            "run": run,
+            "run_source": run_source,
+            "function": fn,
+            "binary": bn,
+            "warning": warning,
+        }
+
+    def _resolve_db(atlas: sqlite3.Connection, run: RunRow) -> Path | dict[str, Any]:
+        """The run's analysis.db Path, or a hard error (G4) — never a silent empty.
+
+        Prefers the stored ``analysis_db_path`` resolver; falls back to
+        ``<workspaces_root>/<run_id>/analysis.db`` when configured. Distinguishes "no path was ever
+        recorded" (a pre-existing scan) from "path recorded but the file is gone" (moved)."""
+        candidates: list[Path] = []
+        if run.analysis_db_path:
+            candidates.append(Path(run.analysis_db_path))
+        if ws_root is not None:
+            candidates.append(ws_root / run.run_id / "analysis.db")
+        for p in candidates:
+            if p.exists():
+                return p
+        if not candidates:
+            return _error(
+                atlas,
+                f"run '{run.run_id}' has no recorded analysis.db (a pre-existing scan with no "
+                "lineage row) — re-scan it to enable fact tools on this run.",
+            )
+        return _error(
+            atlas,
+            f"analysis.db for run '{run.run_id}' not found at {candidates[0]} (moved, or the "
+            "workspace deleted?) — re-scan to restore it. NOT read as 'no findings'.",
+        )
+
+    def _augment_cross_run(
+        atlas: sqlite3.Connection,
+        result: dict[str, Any],
+        run_id: str,
+        function: str,
+        binary: str | None,
+    ) -> None:
+        """Distinguish "wrong run" from "no such function" on a function miss (Q1-a vs Q1-b).
+
+        If ``function`` was not found in ``run_id`` but its instances appear in OTHER runs, name
+        them (you are likely querying the wrong run). If it is in NO run, say so (a typo / a
+        function with no recorded candidate). A cheap atlas-index diagnosis, best-effort — never a
+        decompile."""
+        hits = _runs_where_function_exists(atlas, binary=binary, function=function)
+        others = [h for h in hits if h != run_id]
+        if others:
+            result["found_in_runs"] = others
+            result["cross_run_note"] = (
+                f"'{function}' was not found in run '{run_id}', but its instances appear in "
+                f"run(s): {others} — you may be querying the wrong run."
+            )
+        elif not hits:
+            result["cross_run_note"] = (
+                f"'{function}' is not in ANY run in this atlas — check the name/binary (a typo, or "
+                "a function that carries no recorded candidate)."
+            )
+
+    def _fact(
+        call: Callable[[sqlite3.Connection, str | None, str | None], dict[str, Any]],
+        *,
+        run_id: str | None,
+        evidence_ref: str | None,
+        function: str | None = None,
+        binary: str | None = None,
+        diagnose: bool = False,
+    ) -> dict[str, Any]:
+        """Run one analysis.db fact under run-aware routing (the shared body of every fact tool).
+
+        Resolves the run (or errors), opens THAT run's analysis.db (or errors), runs ``call`` with
+        the effective (function, binary), then stamps ``resolved_run`` + ``run_source`` + inline
+        ``run_lineage`` (M6) so the consumer sees which scan answered and whether it is stale.
+        ``diagnose`` turns on the wrong-run/no-such-function cross-run note for function lookups."""
+        atlas = open_atlas(atlas_path)
         try:
-            return fn(conn)
+            locus = _resolve_locus(atlas, run_id, evidence_ref, function, binary)
+            if "error" in locus:
+                return locus
+            run = locus["run"]
+            fn, bn = locus["function"], locus["binary"]
+            if diagnose and fn is None:
+                # A function-anchored tool with no function (and no ref supplying one) — a usage
+                # error, not a silent empty. The run IS resolved, so stamp it.
+                err = _error(
+                    atlas,
+                    "this tool needs function=<name/addr> (or an evidence_ref that supplies one).",
+                )
+                err["resolved_run"] = run.run_id
+                err["run_lineage"] = _lineage_inline(run)
+                return err
+            db = _resolve_db(atlas, run)
+            if isinstance(db, dict):  # hard error (G4) — still stamped with the run it refers to
+                db["resolved_run"] = run.run_id
+                db["run_lineage"] = _lineage_inline(run)
+                return db
+            conn = facts.open_analysis_ro(db)
+            try:
+                result = call(conn, fn, bn)
+            finally:
+                conn.close()
+            if diagnose and fn is not None and result.get("found") is False:
+                if result.get("reason") != "ambiguous":  # ambiguous == it IS in this run
+                    _augment_cross_run(atlas, result, run.run_id, fn, bn)
+            result["atlas"] = str(atlas_path)
+            result["resolved_run"] = run.run_id
+            result["run_source"] = locus["run_source"]
+            result["run_lineage"] = _lineage_inline(run)
+            if locus.get("warning"):
+                result["warning"] = locus["warning"]
+            return result
         finally:
-            conn.close()
+            atlas.close()
 
-    def _incomplete_binaries() -> list[str]:
-        """Names of current-scan binaries whose analysis is incomplete (0 functions, not code-free).
+    def _incomplete_for_run(
+        atlas: sqlite3.Connection, run_id: str | None
+    ) -> tuple[list[str], list[dict[str, Any]]]:
+        """The analysis-completeness red-lines for a SINGLE resolved run (they are a per-scan fact).
 
-        ★ Red-line: attached to the candidate/aggregation views so a consumer never mistakes a
-        binary Ghidra failed on for one with nothing to find. Empty when the DB is unreadable."""
+        Computed only when list_candidates is scoped to one resolvable run; empty across an all-runs
+        listing (the red-line is per firmware, not a single value over a shared atlas)."""
+        if run_id is None:
+            return [], []
+        run = _get_run(atlas, run_id)
+        if run is None:
+            return [], []
+        db = _resolve_db(atlas, run)
+        if isinstance(db, dict):
+            return [], []
+        conn = facts.open_analysis_ro(db)
         try:
-            conn = facts.open_analysis_ro(analysis_path)
-        except sqlite3.OperationalError:
-            return []
-        try:
-            return facts.list_incomplete_binaries(conn)
-        finally:
-            conn.close()
-
-    def _partially_incomplete_binaries() -> list[dict[str, Any]]:
-        """Current-scan binaries analyzed 'ok' but with some functions that never decompiled.
-
-        ★ Red-line: complements _incomplete_binaries (which only catches 0-function total failures).
-        Each entry is {binary, functions_total, functions_empty} so a consumer knows a binary was
-        analyzed yet is INCOMPLETE on those N functions — a candidate there is not proof of
-        cleanliness. Empty when the DB is unreadable."""
-        try:
-            conn = facts.open_analysis_ro(analysis_path)
-        except sqlite3.OperationalError:
-            return []
-        try:
-            return facts.list_partially_incomplete_binaries(conn)
+            return (
+                facts.list_incomplete_binaries(conn),
+                facts.list_partially_incomplete_binaries(conn),
+            )
         finally:
             conn.close()
 
@@ -326,18 +535,16 @@ def make_tools(
         to keep the list directly readable, and fetched on demand via ``explain_candidate``. A
         dimension NOT shown on a row is state=unknown (a coverage gap, NOT proven safe) — see the
         result's ``legend``. DERIVED facts, NOT a verdict — read the head, then explain per ref."""
-        effective = run_id if run_id is not None else current_run_id
-        conn = open_atlas(atlas_path)
+        atlas = open_atlas(atlas_path)
         try:
-            ranked = _triage(conn, run_id=effective)
-            isolated_to = effective
-            # A stale/mismatched pointer can isolate to a run with no candidates. Rather than show
-            # an empty list, fall back to all runs and annotate which one is current (B1 fallback).
-            if run_id is None and current_run_id is not None and not ranked:
-                ranked = _triage(conn, run_id=None)
-                isolated_to = None
+            # run_id scopes the listing to one firmware; None spans every run in the atlas. There is
+            # NO ambient 'current run' fallback — the old current_run_id binding (which could
+            # silently isolate to the wrong scan) is gone; each row carries its own ``run``.
+            ranked = _triage(atlas, run_id=run_id)
+            runs_in_atlas = [r.run_id for r in _list_runs(atlas)]
+            incomplete, partially_incomplete = _incomplete_for_run(atlas, run_id)
         finally:
-            conn.close()
+            atlas.close()
         ranked = _filter_candidates(ranked, sink=sink, status=status, include_gated=include_gated)
         if sink_class is not None:
             ranked = [c for c in ranked if c.sink_class == sink_class]
@@ -395,18 +602,21 @@ def make_tools(
             ],
             # The honest phase-1 blind spots — surfaced so the map is never read as complete.
             "caveats": list(_LENS_CAVEATS),
-            "current_run_id": current_run_id,
-            "isolated_to_run": isolated_to,
-            # the firmware split, shown only when NOT isolated to a single run (else all one run)
-            "runs": _run_summary(ranked) if isolated_to is None else None,
-            # ★ Red-line: binaries whose analysis is incomplete (0 functions, not code-free) — a
-            # non-empty list means the firmware is NOT fully analyzed, so absence of a candidate is
-            # not proof of cleanliness. Re-run `tmap scan --reanalyze` to recover them.
-            "incomplete_binaries": _incomplete_binaries(),
-            # ★ Red-line: binaries analyzed 'ok' but where some functions never decompiled —
-            # {binary, functions_total, functions_empty}. The candidate set is incomplete on those
-            # functions, so absence of a candidate there is likewise not proof of cleanliness.
-            "partially_incomplete_binaries": _partially_incomplete_binaries(),
+            # ★ M7: the run this listing was scoped to (None = every run), the canonical name every
+            # tool uses. The old ambient current_run_id + per-row is_current_run are GONE — an
+            # ambient 'current run' was the run-binding hazard; each row carries its own ``run``.
+            "resolved_run": run_id,
+            # ★ M-A1: the bare run-id list — ALWAYS present (even when scoped) so switching firmware
+            # is one glance; ``runs`` is the per-run count split of THIS listing.
+            "runs_in_atlas": runs_in_atlas,
+            "runs": _run_summary(ranked),
+            # ★ M-A3: pull any row's code without retyping args — its evidence_ref self-resolves.
+            "how_to_fetch": _FETCH_CODE_LEGEND,
+            # ★ Red-line (per-scan fact): binaries with incomplete/partial analysis, so absence of a
+            # candidate is not proof of cleanliness. Only meaningful when scoped to one resolvable
+            # run (empty across an all-runs listing — the red-line is per firmware, not one value).
+            "incomplete_binaries": incomplete,
+            "partially_incomplete_binaries": partially_incomplete,
             # ``corpus`` is the INVARIANT candidate total — a --filter float never changes it. Under
             # an --only sweep, ``total`` is the (smaller) pruned view; ``corpus`` still shows the
             # whole set so "no match" is never read as "absent".
@@ -420,7 +630,7 @@ def make_tools(
             # ★ compact rows (M1): spine facts + established dimensions, no per-dimension note. The
             # full per-candidate note is on demand via explain_candidate(evidence_ref) (M2);
             # ``rank`` is the absolute position under the active lens.
-            "candidates": [_candidate_row(c, off + i, current_run_id) for i, c in enumerate(page)],
+            "candidates": [_candidate_row(c, off + i) for i, c in enumerate(page)],
         }
 
     def cross_firmware_patterns(limit: int = 50, offset: int = 0) -> dict[str, Any]:
@@ -438,8 +648,8 @@ def make_tools(
         page, meta = _page(rows, limit, offset)
         return {
             "note": _DERIVED_SIGNAL_NOTE,
-            "incomplete_binaries": _incomplete_binaries(),  # analysis-completeness honesty flag
-            "partially_incomplete_binaries": _partially_incomplete_binaries(),  # partial-decompile
+            # The analysis-completeness red-line is a per-SCAN fact; it is surfaced per run via
+            # list_candidates(run_id=…), not on this cross-run aggregation (no single analysis.db).
             **meta,
             "patterns": [asdict(r) for r in page],
         }
@@ -458,8 +668,7 @@ def make_tools(
         page, meta = _page(rows, limit, offset)
         return {
             "note": _DERIVED_SIGNAL_NOTE,
-            "incomplete_binaries": _incomplete_binaries(),  # analysis-completeness honesty flag
-            "partially_incomplete_binaries": _partially_incomplete_binaries(),  # partial-decompile
+            # Per-scan completeness rides list_candidates(run_id=…); this aggregation is cross-run.
             **meta,
             "density": [asdict(r) for r in page],
         }
@@ -505,17 +714,25 @@ def make_tools(
         (controllability / source_writability / reachability / filtering / sink_impact / writer /
         completeness), the lens caveats, the claim bounds, and where to verify — no score.
 
-        Returns a not-found record when no instance carries ``evidence_ref`` (no fabrication)."""
+        Returns a not-found record when no instance carries ``evidence_ref`` (no fabrication).
+        Echoes the canonical ``resolved_run`` + inline ``run_lineage`` (M6/M7): a ref anchors ONE
+        firmware run, so the explanation names the scan it came from (never an ambient run)."""
         conn = open_atlas(atlas_path)
         try:
             ex = _explain_candidate(conn, evidence_ref)
+            ref = _resolve_ref(conn, evidence_ref)
+            run = _get_run(conn, ref[0]) if ref is not None and ref[0] is not None else None
         finally:
             conn.close()
         if ex is None:
-            return {"found": False, "evidence_ref": evidence_ref}
+            return {"found": False, "evidence_ref": evidence_ref, "atlas": str(atlas_path)}
         data = asdict(ex)
         data["found"] = True
         data["note"] = _DERIVED_SIGNAL_NOTE
+        data["atlas"] = str(atlas_path)
+        if run is not None:
+            data["resolved_run"] = run.run_id
+            data["run_lineage"] = _lineage_inline(run)
         return data
 
     def get_sink_provenance(
@@ -538,9 +755,17 @@ def make_tools(
             result: dict[str, Any] = _get_sink_provenance(
                 conn, evidence_ref, sink_idx, dominating_only=dominating_only
             )
+            ref = _resolve_ref(conn, evidence_ref)
+            run = _get_run(conn, ref[0]) if ref is not None and ref[0] is not None else None
         finally:
             conn.close()
         result["note"] = _DERIVED_SIGNAL_NOTE
+        result["atlas"] = str(atlas_path)
+        # ★ G1/verification 1b: this reads the atlas by ref, so it routes to the RIGHT firmware even
+        # under a mismatched session — echo the canonical resolved_run + lineage to prove it.
+        if run is not None:
+            result["resolved_run"] = run.run_id
+            result["run_lineage"] = _lineage_inline(run)
         return result
 
     def get_nvram_key_flow(key: str) -> dict[str, Any]:
@@ -566,21 +791,63 @@ def make_tools(
         result["note"] = _DERIVED_SIGNAL_NOTE
         return result
 
-    def get_pseudocode(function: str, binary: str | None = None) -> dict[str, Any]:
-        """Decompiler pseudocode for one function (name or address); the default read view."""
-        return _with_analysis(lambda c: facts.get_pseudocode(c, func=function, binary=binary))
+    def get_pseudocode(
+        function: str | None = None,
+        binary: str | None = None,
+        run_id: str | None = None,
+        evidence_ref: str | None = None,
+    ) -> dict[str, Any]:
+        """Decompiler pseudocode for one function (name or address); the default read view.
 
-    def get_callees(function: str, binary: str | None = None) -> dict[str, Any]:
-        """Direct callee names of one function (intra-binary edges flagged resolved to follow)."""
-        return _with_analysis(lambda c: facts.get_callees(c, func=function, binary=binary))
+        Run-aware: pass ``run_id`` (see list_runs) + ``function``, OR just ``evidence_ref`` (a
+        candidate row's ref self-resolves run + binary + function). Every result echoes
+        ``resolved_run`` + ``run_lineage`` so you always see which scan answered (and if it is
+        stale). A miss says whether the function lives in a DIFFERENT run or in none."""
+        return _fact(
+            lambda c, fn, bn: facts.get_pseudocode(c, func=fn or "", binary=bn),
+            run_id=run_id,
+            evidence_ref=evidence_ref,
+            function=function,
+            binary=binary,
+            diagnose=True,
+        )
+
+    def get_callees(
+        function: str | None = None,
+        binary: str | None = None,
+        run_id: str | None = None,
+        evidence_ref: str | None = None,
+    ) -> dict[str, Any]:
+        """Direct callee names of one function (intra-binary edges flagged resolved to follow).
+
+        Run-aware: ``run_id`` + ``function`` or ``evidence_ref``; echoes ``resolved_run``."""
+        return _fact(
+            lambda c, fn, bn: facts.get_callees(c, func=fn or "", binary=bn),
+            run_id=run_id,
+            evidence_ref=evidence_ref,
+            function=function,
+            binary=binary,
+            diagnose=True,
+        )
 
     def get_xrefs(
-        function: str, direction: str = "callers", binary: str | None = None
+        function: str | None = None,
+        direction: str = "callers",
+        binary: str | None = None,
+        run_id: str | None = None,
+        evidence_ref: str | None = None,
     ) -> dict[str, Any]:
-        """Cross-reference edges: direction='callers' or 'callees' (includes cross-binary edges)."""
+        """Cross-reference edges: direction='callers' or 'callees' (includes cross-binary edges).
+
+        Run-aware: ``run_id`` + ``function`` or ``evidence_ref``; echoes ``resolved_run``."""
         d: facts.XrefDirection = "callees" if direction == "callees" else "callers"
-        return _with_analysis(
-            lambda c: facts.get_xrefs(c, func=function, direction=d, binary=binary)
+        return _fact(
+            lambda c, fn, bn: facts.get_xrefs(c, func=fn or "", direction=d, binary=bn),
+            run_id=run_id,
+            evidence_ref=evidence_ref,
+            function=function,
+            binary=binary,
+            diagnose=True,
         )
 
     def get_strings(
@@ -588,50 +855,132 @@ def make_tools(
         function: str | None = None,
         value: str | None = None,
         offset: int = 0,
+        run_id: str | None = None,
+        evidence_ref: str | None = None,
     ) -> dict[str, Any]:
         """Recorded strings: by binary, or searched by ``value`` (substring).
 
-        ``value`` searches string CONTENT and returns each hit with its address + owning binary
-        (one-call locate); reference-site (which function uses a string) is not indexed — the result
-        says so honestly. ★ ``function`` does NOT scope the results (no string->function index, and
-        .rodata addresses fall outside code ranges): the response carries ``func_scope_applied:
-        false`` and a note whenever ``function`` is passed, and in value mode ``function`` only
-        gates existence (unresolvable name -> found:false). Large results are paged LOSSLESSLY by
-        byte size under ``paging``: pass ``offset`` = ``paging.next_offset`` to page the tail (never
-        summarized). HONEST BOUND: a binary's string export is capped, so results carry
-        ``truncated`` / ``total`` (by-binary) or ``search_may_be_incomplete`` (by-value) when a
-        scanned binary was capped — a string NOT found there is NOT proven absent."""
-        return _with_analysis(
-            lambda c: facts.get_strings(c, binary=binary, func=function, value=value, offset=offset)
+        Run-aware: pass ``run_id`` (or an ``evidence_ref`` that supplies run + binary). ``value``
+        searches string CONTENT and returns each hit with its address + owning binary (one-call
+        locate); reference-site (which function uses a string) is not indexed — the result says so
+        honestly. ★ ``function`` does NOT scope the results (no string->function index, and .rodata
+        addresses fall outside code ranges): the response carries ``func_scope_applied: false`` +
+        note whenever ``function`` is passed, and in value mode ``function`` only gates existence
+        (unresolvable name -> found:false). Large results are paged LOSSLESSLY by byte size under
+        ``paging``: pass ``offset`` = ``paging.next_offset`` to page the tail (never summarized).
+        HONEST BOUND: a binary's string export is capped, so results carry ``truncated`` / ``total``
+        (by-binary) or ``search_may_be_incomplete`` (by-value) when a scanned binary was capped — a
+        string NOT found there is NOT proven absent."""
+        return _fact(
+            lambda c, fn, bn: facts.get_strings(c, binary=bn, func=fn, value=value, offset=offset),
+            run_id=run_id,
+            evidence_ref=evidence_ref,
+            function=function,
+            binary=binary,
         )
 
-    def get_imports_exports(binary: str) -> dict[str, Any]:
-        """Import and export symbol tables of one binary (cross-binary edge endpoints)."""
-        return _with_analysis(lambda c: facts.get_imports_exports(c, binary=binary))
+    def get_imports_exports(
+        binary: str | None = None,
+        run_id: str | None = None,
+        evidence_ref: str | None = None,
+    ) -> dict[str, Any]:
+        """Import and export symbol tables of one binary (cross-binary edge endpoints).
 
-    def get_functions_referencing_string(text: str, binary: str | None = None) -> dict[str, Any]:
+        Run-aware: ``run_id`` + ``binary`` or ``evidence_ref``; echoes ``resolved_run``."""
+        return _fact(
+            lambda c, fn, bn: facts.get_imports_exports(c, binary=bn or ""),
+            run_id=run_id,
+            evidence_ref=evidence_ref,
+            binary=binary,
+        )
+
+    def get_functions_referencing_string(
+        text: str,
+        binary: str | None = None,
+        run_id: str | None = None,
+        evidence_ref: str | None = None,
+    ) -> dict[str, Any]:
         """Functions whose pseudocode TEXT contains a string (substring reverse-lookup).
 
-        The schema indexes no string->function link, but functions.pseudocode is stored in full, so
-        this answers "which functions mention this text". ``binary`` (short name or full path)
-        narrows the scan; omitted, it scans every binary. Capped (``truncated`` when more exist).
-        HONEST BOUND: a TEXT match, not a resolved symbol reference — the text may sit in a comment
-        or an unrelated string literal; confirm each hit in the pseudocode."""
-        return _with_analysis(
-            lambda c: facts.get_functions_referencing_string(c, text=text, binary=binary)
+        Run-aware: ``run_id`` (or an ``evidence_ref``). The schema indexes no string->function link,
+        but functions.pseudocode is stored in full, so this answers "which functions mention this
+        text". ``binary`` (short name or full path) narrows the scan; omitted, it scans every
+        binary. Capped (``truncated`` when more exist). HONEST BOUND: a TEXT match, not a resolved
+        symbol reference — the text may sit in a comment or unrelated literal; confirm each hit."""
+        return _fact(
+            lambda c, fn, bn: facts.get_functions_referencing_string(c, text=text, binary=bn),
+            run_id=run_id,
+            evidence_ref=evidence_ref,
+            binary=binary,
         )
 
-    def get_script_callsites(binary: str) -> dict[str, Any]:
-        """Rootfs scripts that invoke this binary — entry-reach evidence (script + line + args)."""
-        return _with_analysis(lambda c: facts.get_script_callsites(c, binary=binary))
+    def get_script_callsites(
+        binary: str | None = None,
+        run_id: str | None = None,
+        evidence_ref: str | None = None,
+    ) -> dict[str, Any]:
+        """Rootfs scripts that invoke this binary — entry-reach evidence (script + line + args).
 
-    def get_components_cves(binary: str) -> dict[str, Any]:
-        """SBOM components recognized in a binary + their CVE-table matches (a query result)."""
-        return _with_analysis(lambda c: facts.get_components_cves(c, binary=binary))
+        Run-aware: ``run_id`` + ``binary`` or ``evidence_ref``; echoes ``resolved_run``."""
+        return _fact(
+            lambda c, fn, bn: facts.get_script_callsites(c, binary=bn or ""),
+            run_id=run_id,
+            evidence_ref=evidence_ref,
+            binary=binary,
+        )
 
-    def get_disassembly(function: str, binary: str | None = None) -> dict[str, Any]:
-        """On-demand disassembly — same-source aligned, or an honest 'unavailable' (never wrong)."""
-        return _with_analysis(lambda c: facts.get_disassembly(c, func=function, binary=binary))
+    def get_components_cves(
+        binary: str | None = None,
+        run_id: str | None = None,
+        evidence_ref: str | None = None,
+    ) -> dict[str, Any]:
+        """SBOM components recognized in a binary + their CVE-table matches (a query result).
+
+        Run-aware: ``run_id`` + ``binary`` or ``evidence_ref``; echoes ``resolved_run``."""
+        return _fact(
+            lambda c, fn, bn: facts.get_components_cves(c, binary=bn or ""),
+            run_id=run_id,
+            evidence_ref=evidence_ref,
+            binary=binary,
+        )
+
+    def get_disassembly(
+        function: str | None = None,
+        binary: str | None = None,
+        run_id: str | None = None,
+        evidence_ref: str | None = None,
+    ) -> dict[str, Any]:
+        """On-demand disassembly — same-source aligned, or an honest 'unavailable' (never wrong).
+
+        Run-aware: ``run_id`` + ``function`` or ``evidence_ref``; echoes ``resolved_run``."""
+        return _fact(
+            lambda c, fn, bn: facts.get_disassembly(c, func=fn or "", binary=bn),
+            run_id=run_id,
+            evidence_ref=evidence_ref,
+            function=function,
+            binary=binary,
+            diagnose=True,
+        )
+
+    def list_runs() -> dict[str, Any]:
+        """Every firmware run (scan) in this atlas + its lineage — the switch + staleness face.
+
+        Each run carries ``scan_status`` (in_progress / complete / partial / failed / unknown),
+        ``build_hash`` (extraction pass_version — differing build_hash for the same firmware means a
+        STALE scan), ``scanned_at``, counts, and ``resolved`` (False for a pre-existing run with no
+        lineage row: visible but its analysis.db is not recorded — re-scan to enable fact tools).
+        Use this to pick a ``run_id`` for the fact tools and to catch "auditing an old scan"."""
+        atlas = open_atlas(atlas_path)
+        try:
+            runs = _list_runs(atlas)
+        finally:
+            atlas.close()
+        return {
+            "note": _DERIVED_SIGNAL_NOTE,
+            "atlas": str(atlas_path),
+            "count": len(runs),
+            "runs": [asdict(r) for r in runs],
+        }
 
     def legal_notice() -> dict[str, Any]:
         """The tool's intended-use / legal notice."""
@@ -639,6 +988,7 @@ def make_tools(
 
     return {
         "list_candidates": list_candidates,
+        "list_runs": list_runs,
         "explain_candidate": explain_candidate,
         "get_sink_provenance": get_sink_provenance,
         "get_nvram_key_flow": get_nvram_key_flow,
@@ -659,14 +1009,15 @@ def make_tools(
     }
 
 
-def build_server(analysis_db: Path | str, atlas_db: Path | str, run_id: str | None = None) -> Any:
-    """Construct a FastMCP server exposing the fact tools bound to one workspace.
+def build_server(atlas_db: Path | str, *, workspaces_root: Path | str | None = None) -> Any:
+    """Construct a FastMCP server exposing the fact tools bound to one ATLAS (not one firmware).
 
-    The server's standing instructions are the agent workflow guide; the legal notice stays
-    reachable via the legal_notice tool. ``mcp`` is a core dependency (the server is the
-    substrate's primary consumer), so FastMCP is imported at module top level, not lazily."""
+    A fact tool resolves run_id -> analysis.db through the atlas ``run`` table; ``workspaces_root``
+    is an optional fallback resolver. The server's standing instructions are the agent workflow
+    guide; the legal notice stays reachable via the legal_notice tool. ``mcp`` is a core dependency
+    (the server is the substrate's primary consumer), so FastMCP is imported at top level."""
     server = FastMCP("treasure-map", instructions=_AGENT_INSTRUCTIONS)
-    for fn in make_tools(analysis_db, atlas_db, run_id).values():
+    for fn in make_tools(atlas_db, workspaces_root=workspaces_root).values():
         server.add_tool(fn)
     return server
 
@@ -674,20 +1025,18 @@ def build_server(analysis_db: Path | str, atlas_db: Path | str, run_id: str | No
 def main() -> None:
     """Entry point: serve over stdio.
 
-    DB paths and run id come from TREASURE_MAP_ANALYSIS_DB / _ATLAS_DB / _RUN_ID; when the db env
-    vars are unset, fall back to the last-run pointer a prior scan recorded."""
+    The atlas path comes from TREASURE_MAP_ATLAS_DB (else the last-run pointer's atlas); the
+    optional workspaces root from TREASURE_MAP_WORKSPACES_ROOT (a fallback run_id -> analysis.db
+    resolver). The server binds the ATLAS, not one firmware — a fact tool routes by run_id."""
     from treasure_map.lib.last_run import read_last_run
 
-    analysis_db = os.environ.get("TREASURE_MAP_ANALYSIS_DB")
     atlas_db = os.environ.get("TREASURE_MAP_ATLAS_DB")
-    run_id = os.environ.get("TREASURE_MAP_RUN_ID")
-    if analysis_db is None or atlas_db is None:
+    workspaces_root = os.environ.get("TREASURE_MAP_WORKSPACES_ROOT")
+    if atlas_db is None:
         ptr = read_last_run()
         if ptr is not None:
-            analysis_db = analysis_db or str(ptr.analysis_db)
-            atlas_db = atlas_db or str(ptr.atlas_db)
-            run_id = run_id or ptr.run_id
-    build_server(analysis_db or "analysis.db", atlas_db or "atlas.db", run_id).run()
+            atlas_db = str(ptr.atlas_db)
+    build_server(atlas_db or "atlas.db", workspaces_root=workspaces_root).run()
 
 
 if __name__ == "__main__":

@@ -10,7 +10,6 @@ construction (the CLI and MCP are two thin wrappers over one query, never two im
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import click
 
@@ -85,61 +84,60 @@ def script_callsites(binary: str, analysis_db: str) -> None:
 
 
 def _resolve_mcp_target(
-    analysis_db: str | None, atlas_db: str | None
-) -> tuple[str, str, str | None]:
-    """Resolve (analysis_db, atlas_db, run_id) from explicit args or the last-run pointer.
+    atlas_db: str | None, workspaces_root: str | None
+) -> tuple[str, str | None]:
+    """Resolve (atlas_db, workspaces_root) from explicit args, the last-run pointer, and config.
 
-    Explicit paths always win. When either is omitted, the pointer a prior `tmap scan` recorded
-    fills it in (the common "I just scanned, now serve it" case). The run id is bound only when
-    the resolved analysis.db matches the recorded run, so list_candidates isolates to the right
-    firmware. A missing pointer with no explicit path is a friendly error, not a traceback."""
+    The server binds the ATLAS, not one firmware — a fact tool routes run_id -> analysis.db through
+    the atlas ``run`` table (there is no single bound analysis.db, and no ambient 'current run').
+    Explicit ``--atlas`` wins; else the last-run pointer's atlas; else the configured atlas.db.
+    ``workspaces_root`` (an OPTIONAL fallback resolver, ``<root>/<run_id>/analysis.db``) is
+    ``--workspaces-root``, else the configured workspace directory."""
+    from treasure_map.lib.config.config import load_config
     from treasure_map.lib.last_run import read_last_run
 
-    ptr = read_last_run()
-    if (analysis_db is None or atlas_db is None) and ptr is None:
-        raise click.ClickException(
-            "no --analysis-db given and no recorded run found. Run `tmap scan <firmware>` first, "
-            "or pass --analysis-db <path> --atlas <path>."
-        )
-    a = analysis_db or (str(ptr.analysis_db) if ptr else None)
-    x = atlas_db or (str(ptr.atlas_db) if ptr else None)
-    assert a is not None and x is not None  # guaranteed by the check above
-    bound = ptr is not None and Path(a).resolve() == ptr.analysis_db.resolve()
-    run_id = ptr.run_id if bound and ptr is not None else None
-    return a, x, run_id
+    cfg = load_config(None)
+    atlas = atlas_db
+    if atlas is None:
+        ptr = read_last_run()
+        atlas = str(ptr.atlas_db) if ptr is not None else str(cfg.atlas.db_path)
+    ws = workspaces_root if workspaces_root is not None else str(cfg.workspace_dir)
+    return atlas, ws
 
 
 @click.command(name="mcp")
 @click.option(
-    "--analysis-db",
-    default=None,
-    help="Path to the analysis database (default: the last `tmap scan`'s analysis.db).",
-)
-@click.option(
     "--atlas",
     "atlas_db",
     default=None,
-    help="Path to the atlas database (default: the last run's atlas).",
+    help="Atlas DB path (default: the last run's atlas, else the configured atlas.db).",
 )
-def mcp_serve(analysis_db: str | None, atlas_db: str | None) -> None:
+@click.option(
+    "--workspaces-root",
+    default=None,
+    help="Fallback root for resolving run_id -> <root>/<run_id>/analysis.db "
+    "(default: the configured workspace directory). The atlas run table is the authority.",
+)
+def mcp_serve(atlas_db: str | None, workspaces_root: str | None) -> None:
     """Run the Treasure Map MCP server over stdio (exposes the fact substrate to an AI client).
 
-    With no paths, serves the last `tmap scan`'s databases (recorded pointer). Launch this from an
-    MCP client, not by hand — it speaks JSON-RPC on stdin/stdout.
+    Binds the ATLAS (not one firmware): a fact tool routes run_id -> analysis.db through the atlas
+    run table, so one server serves every scanned firmware. No firmware is preselected. Launch this
+    from an MCP client, not by hand — it speaks JSON-RPC on stdin/stdout.
     """
-    analysis_db, atlas_db, run_id = _resolve_mcp_target(analysis_db, atlas_db)
+    atlas_db, workspaces_root = _resolve_mcp_target(atlas_db, workspaces_root)
     # `mcp` is a core dependency, so build_server is imported like any other module. A missing
     # `mcp` here means a corrupted install, not an unselected extra — let it surface as a normal
     # ImportError (the same as a missing click/pyelftools), never a "go install the extra" hint.
     from treasure_map.mcp_app import build_server
 
-    server = build_server(analysis_db, atlas_db, run_id)
+    server = build_server(atlas_db, workspaces_root=workspaces_root)
     # Tell a human who ran this by hand what is happening — on stderr, so stdout stays clean
     # JSON-RPC for the client.
     click.echo(
-        "treasure-map MCP server (stdio). Launch this from an MCP client, e.g.:  "
-        f"claude mcp add treasure-map -- tmap mcp --analysis-db {analysis_db} --atlas {atlas_db}"
-        "   — now waiting for JSON-RPC on stdin (Ctrl-C to exit).",
+        "treasure-map MCP server (stdio). Binds the atlas; fact tools route by run_id (see "
+        f"list_runs). Launch from an MCP client, e.g.:  claude mcp add treasure-map -- tmap mcp "
+        f"--atlas {atlas_db}   — now waiting for JSON-RPC on stdin (Ctrl-C to exit).",
         err=True,
     )
     server.run()
