@@ -478,6 +478,95 @@ def test_fact_tool_routes_by_evidence_ref(tmp_path: Path) -> None:
     assert r["resolved_run"] == "run_m" and r["run_source"] == "via_ref"
 
 
+def test_no_lineage_run_never_revived_by_ws_root_fallback(tmp_path: Path) -> None:
+    # ★ §6.5 honesty red-line: a run in the atlas but with NO lineage row (never trustworthily
+    # analyzed) must NOT be revived by a residual old analysis.db in the workspaces root. It
+    # short-circuits to re-scan BEFORE any db is opened — so a miss reads as UNKNOWN ("never
+    # analyzed"), never NO ("analyzed and absent").
+    atlas_p = tmp_path / "atlas.db"
+    conn = open_atlas(atlas_p)
+    pid = upsert_pattern(
+        conn, source_class="external_input", sink_class="cmd", call_sequence_shape="s"
+    )
+    # 'miwifi' is instance-only -> resolved=False, analysis_db_path=None (a pre-existing scan)
+    add_instance(
+        conn,
+        InstanceRow(
+            pattern_id=pid,
+            pseudocode_hash="h_m",
+            sink_anchor="FUN_m",
+            source_run_id="miwifi",
+            evidence_ref="miwifi#fn1",
+        ),
+    )
+    # 'rt' carries an instance for FUN_present -> it exists in ANOTHER run (the lethal-probe target)
+    add_instance(
+        conn,
+        InstanceRow(
+            pattern_id=pid,
+            pseudocode_hash="h_r",
+            sink_anchor="FUN_present",
+            source_run_id="rt",
+            evidence_ref="rt#fn1",
+        ),
+    )
+    conn.close()
+    # a residual OLD analysis.db sitting exactly where the ws_root fallback would find it
+    ws_root = tmp_path / "workspaces"
+    (ws_root / "miwifi").mkdir(parents=True)
+    old = open_db(ws_root / "miwifi" / "analysis.db")
+    old.execute(
+        "INSERT INTO binaries (id, name, path, sha256) VALUES (1, 'mtd', 'sbin/mtd', ?)",
+        ("z" * 64,),
+    )
+    old.commit()
+    old.close()
+    tools = mcp_app.make_tools(atlas_p, workspaces_root=ws_root)
+
+    # any function on the no-lineage run -> no-DB re-scan, NOT a search-miss; residual db not opened
+    r = tools["get_pseudocode"]("main", run_id="miwifi")
+    assert r["found"] is False
+    assert "no recorded analysis.db" in r["error"] and "re-scan" in r["error"]
+    assert "cross_run_note" not in r  # never ran a function search on the residual db
+    assert r["run_lineage"]["resolved"] is False
+
+    # ★ lethal probe: a function that exists in ANOTHER run STILL yields no-DB on the no-lineage run
+    # (never "wrong run / not in ANY run") — this is what separates UNKNOWN from NO.
+    lethal = tools["get_pseudocode"]("FUN_present", run_id="miwifi")
+    assert "no recorded analysis.db" in lethal["error"]
+    assert "cross_run_note" not in lethal and "found_in_runs" not in lethal
+
+
+def test_ws_root_fallback_still_recovers_a_moved_lineage_run(tmp_path: Path) -> None:
+    # The ws_root fallback keeps its LEGITIMATE purpose: a run WITH a lineage row whose recorded
+    # path file has moved is recovered from <ws_root>/<run>/analysis.db (a real migration). Only a
+    # NO-lineage run is refused — that asymmetry IS the honesty fix.
+    atlas_p = tmp_path / "atlas.db"
+    conn = open_atlas(atlas_p)
+    begin_run(
+        conn, "rt", analysis_db_path=str(tmp_path / "gone" / "analysis.db")
+    )  # path now absent
+    finish_run(conn, "rt", binaries=1, functions=1)
+    conn.close()
+    ws_root = tmp_path / "workspaces"
+    (ws_root / "rt").mkdir(parents=True)
+    db = open_db(ws_root / "rt" / "analysis.db")
+    db.execute(
+        "INSERT INTO binaries (id, name, path, sha256) VALUES (1, 'webd', 'sbin/webd', ?)",
+        ("a" * 64,),
+    )
+    db.execute(
+        "INSERT INTO functions (id, binary_id, name, address, pseudocode, callees) "
+        "VALUES (1, 1, 'handle', '0x10', 'void handle(){}', ?)",
+        (json.dumps([]),),
+    )
+    db.commit()
+    db.close()
+    tools = mcp_app.make_tools(atlas_p, workspaces_root=ws_root)
+    r = tools["get_pseudocode"]("handle", run_id="rt")
+    assert r["found"] is True and r["resolved_run"] == "rt"
+
+
 def test_cross_firmware_and_aggregation_tools(tmp_path: Path) -> None:
     # B3: the atlas-view aggregations are reachable as tools and carry the derived note.
     tools = _tools(tmp_path)

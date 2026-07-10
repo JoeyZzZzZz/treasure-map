@@ -353,26 +353,31 @@ def make_tools(
     def _resolve_db(atlas: sqlite3.Connection, run: RunRow) -> Path | dict[str, Any]:
         """The run's analysis.db Path, or a hard error (G4) — never a silent empty.
 
-        Prefers the stored ``analysis_db_path`` resolver; falls back to
-        ``<workspaces_root>/<run_id>/analysis.db`` when configured. Distinguishes "no path was ever
-        recorded" (a pre-existing scan) from "path recorded but the file is gone" (moved)."""
-        candidates: list[Path] = []
-        if run.analysis_db_path:
-            candidates.append(Path(run.analysis_db_path))
-        if ws_root is not None:
-            candidates.append(ws_root / run.run_id / "analysis.db")
-        for p in candidates:
-            if p.exists():
-                return p
-        if not candidates:
+        ★ Honesty red-line (non-match must not collapse into absent): a run in the atlas but with NO
+        recorded analysis.db (``analysis_db_path`` empty = a pre-existing scan never trustworthily
+        analyzed by this tool chain) short-circuits to re-scan BEFORE any db is opened. A residual
+        old analysis.db sitting in the workspaces root carries NO lineage backing (unknown build /
+        status / completeness); reviving it via the ws_root fallback and then MISSING a function
+        would masquerade UNKNOWN ("never analyzed") as NO ("analyzed and absent") — the exact
+        collapse this tool exists to prevent. So the ws_root fallback ONLY recovers a run that HAS a
+        lineage row whose authoritative path file moved (a legitimate migration), never a no-lineage
+        run."""
+        if not run.analysis_db_path:
             return _error(
                 atlas,
                 f"run '{run.run_id}' has no recorded analysis.db (a pre-existing scan with no "
                 "lineage row) — re-scan it to enable fact tools on this run.",
             )
+        authoritative = Path(run.analysis_db_path)
+        if authoritative.exists():
+            return authoritative
+        # The authoritative path was recorded but the file is gone (a legitimate move) — the ws_root
+        # fallback may recover THE SAME run's db; else it is honestly 'moved', never 'no findings'.
+        if ws_root is not None and (ws_root / run.run_id / "analysis.db").exists():
+            return ws_root / run.run_id / "analysis.db"
         return _error(
             atlas,
-            f"analysis.db for run '{run.run_id}' not found at {candidates[0]} (moved, or the "
+            f"analysis.db for run '{run.run_id}' not found at {authoritative} (moved, or the "
             "workspace deleted?) — re-scan to restore it. NOT read as 'no findings'.",
         )
 
