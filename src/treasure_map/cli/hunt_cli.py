@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 import click
 
 if TYPE_CHECKING:
+    from treasure_map.lib.atlas.models import RunRow
     from treasure_map.lib.diff.matcher import _DiffRouter
     from treasure_map.lib.llm.types import LLMResponse
     from treasure_map.lib.query import CandidateExplanation, TriageCandidate
@@ -567,9 +568,128 @@ def _reachability_inline(status: str) -> str:
     return "not shown reachable within the function (a lead to verify)"
 
 
+def _run_lineage_line(r: RunRow) -> str:
+    """One human line of a run's lineage (M8a/M8c): id + status + scan date + build + counts.
+
+    A run with no lineage row (a pre-existing scan) is shown but flagged — never hidden."""
+    if not r.resolved:
+        return f"{r.run_id}   [no lineage row — pre-existing scan; re-scan to record it]"
+    parts = [r.run_id, r.scan_status or "unknown"]
+    if r.scanned_at:
+        parts.append(f"scanned {str(r.scanned_at).split(' ')[0]}")
+    if r.build_hash:
+        parts.append(f"build {r.build_hash}")
+    if r.binaries is not None or r.functions is not None:
+        parts.append(f"{r.binaries or 0} bins / {r.functions or 0} fns")
+    return "   ".join(parts)
+
+
+def _complete_run_ids(ctx: click.Context, param: click.Parameter, incomplete: str) -> list[str]:
+    """Shell-completion for a run id (M8b): the atlas's run ids starting with ``incomplete``.
+
+    Best-effort — reads the --atlas value if already parsed, else the configured atlas. Any failure
+    yields no completions (never an error), and there is no short-prefix auto-match (a partial that
+    is ambiguous would silently pick wrong — tab completion lets the user SEE and choose)."""
+    try:
+        from treasure_map.lib.atlas.connection import open_atlas
+        from treasure_map.lib.config.config import load_config
+        from treasure_map.lib.query import list_runs as run_list_runs
+
+        atlas_path = ctx.params.get("atlas_path") or load_config(None).atlas.db_path
+        conn = open_atlas(Path(atlas_path))
+        try:
+            ids = [r.run_id for r in run_list_runs(conn)]
+        finally:
+            conn.close()
+    except Exception:
+        return []
+    return [rid for rid in ids if rid.startswith(incomplete)]
+
+
+def _echo_run_lineage(atlas_path: Path, selected_run: str | None) -> None:
+    """Print the run's scan lineage at the top of a CLI view (M8c) — the stale-scan guard.
+
+    When scoped to one run, print its lineage line so its build/date/status is in front of the
+    reader (a stale scan is otherwise silent); unscoped, print the run count + how to scope.
+    Best-effort: any read failure is silent (a lineage banner never breaks the command)."""
+    try:
+        from treasure_map.lib.atlas.connection import open_atlas
+        from treasure_map.lib.query import get_run as run_get_run
+        from treasure_map.lib.query import list_runs as run_list_runs
+
+        conn = open_atlas(atlas_path)
+        try:
+            if selected_run is not None:
+                r = run_get_run(conn, selected_run)
+                if r is not None:
+                    click.echo(f"run: {_run_lineage_line(r)}")
+                    return
+            n = len(run_list_runs(conn))
+        finally:
+            conn.close()
+    except Exception:
+        return
+    click.echo(f"atlas: {n} run(s) — `tmap runs` for lineage, --run <id> to scope")
+
+
+@click.command("runs", short_help="List the firmware runs (scans) recorded in the atlas.")
+@click.option(
+    "--config",
+    "-c",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Path to config.yaml (overrides ~/.treasure-map/config.yaml).",
+)
+@click.option(
+    "--atlas",
+    "atlas_path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Atlas DB path (defaults to the configured atlas.db_path).",
+)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit structured JSON.")
+def runs(config: Path | None, atlas_path: Path | None, as_json: bool) -> None:
+    """List every firmware run (scan) in the atlas with its lineage.
+
+    Each run shows its scan_status (in_progress / complete / partial / failed / unknown), build
+    hash (the extraction pass_version — a differing build for the same firmware means a STALE
+    scan), scan date, and binary/function counts. Use a run id here as ``--run`` for ``tmap
+    triage`` or as run_id for the MCP fact tools. A run with no lineage row (a pre-existing scan) is
+    shown but flagged, never hidden."""
+    import json
+    from dataclasses import asdict
+
+    from treasure_map.lib.atlas.connection import open_atlas
+    from treasure_map.lib.config.config import load_config
+    from treasure_map.lib.query import list_runs as run_list_runs
+
+    cfg = load_config(config)
+    resolved_atlas = atlas_path if atlas_path is not None else cfg.atlas.db_path
+    conn = open_atlas(resolved_atlas)
+    try:
+        run_rows = run_list_runs(conn)
+    finally:
+        conn.close()
+    if as_json:
+        click.echo(json.dumps([asdict(r) for r in run_rows], indent=2, default=str))
+        return
+    if not run_rows:
+        click.echo("no runs in this atlas yet — run `tmap scan <firmware>` first.")
+        return
+    click.echo(f"{len(run_rows)} run(s) in {resolved_atlas}:")
+    for r in run_rows:
+        click.echo(f"  {_run_lineage_line(r)}")
+
+
 @click.command("triage", short_help="Rank to-verify candidates for manual reverse-engineering.")
-@click.argument("run_id", required=False, default=None)
-@click.option("--run", "run_opt", default=None, help="Restrict to one run id (overrides RUN_ID).")
+@click.argument("run_id", required=False, default=None, shell_complete=_complete_run_ids)
+@click.option(
+    "--run",
+    "run_opt",
+    default=None,
+    help="Restrict to one run id (overrides RUN_ID).",
+    shell_complete=_complete_run_ids,
+)
 @click.option(
     "--top", "top_n", type=int, default=None, help="Show at most N candidates (default 20)."
 )
@@ -707,6 +827,10 @@ def triage(
     selected_run = run_opt if run_opt is not None else run_id
     cfg = load_config(config)
     resolved_atlas = atlas_path if atlas_path is not None else cfg.atlas.db_path
+    # ★ M8c: print the current run's scan lineage (build / date / status) at the top — a stale scan
+    # is otherwise silent, and this is exactly where a reader forgets an old build was scanned.
+    if not as_json:
+        _echo_run_lineage(resolved_atlas, selected_run)
 
     dim_filters = _parse_dim_filters(dim_filter_specs)
     only_filters = _parse_dim_filters(only_specs)

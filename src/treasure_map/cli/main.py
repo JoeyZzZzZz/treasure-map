@@ -7,7 +7,7 @@ import logging
 import click
 
 from treasure_map.cli.analyze_cli import analyze
-from treasure_map.cli.hunt_cli import atlas_view, hunt_diff, hunt_pattern, scan, triage
+from treasure_map.cli.hunt_cli import atlas_view, hunt_diff, hunt_pattern, runs, scan, triage
 from treasure_map.cli.init_cli import init
 from treasure_map.cli.mcp_cli import fact, mcp_serve
 
@@ -44,6 +44,7 @@ main.add_command(init)
 main.add_command(hunt_diff)
 main.add_command(hunt_pattern)
 main.add_command(triage)
+main.add_command(runs)
 main.add_command(atlas_view)
 main.add_command(fact)
 main.add_command(mcp_serve)
