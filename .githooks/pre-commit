@@ -60,14 +60,12 @@ if [ -n "$HITS" ]; then
   exit 1
 fi
 
-# ── private-document / private-path guard ────────────────────────────────────
-# Committed code, docs, and hooks must stand on their own — never point at a
-# private document or name a private path. The hook excludes itself (its pattern
-# definition would otherwise self-match).
-HITS=$(git diff --cached --name-only --diff-filter=ACM \
-        -- 'src/*' 'docs/*' '*.md' '.githooks/*' 'CONTRIBUTING.md' \
-           ':!LICENSE' ':!.githooks/pre-commit' ':!.githooks/commit-msg' ':!.githooks/lib.sh' \
-       | xargs grep -nIE "$TM_PRIVDOC" 2>/dev/null || true)
+# ── private-document / private-path guard (added lines, whole tree) ───────────
+# Same ADDED_FRAMING view as the strategy-vocab guard above (whole tree minus the
+# pattern-holding machinery AND the self-referential neutrality tests, whose
+# denylists embed these very tokens). Covers tests/ too — a private-doc/path
+# reference is caught here at commit time instead of one CI round-trip later.
+HITS=$(printf '%s' "$ADDED_FRAMING" | grep -nIE "$TM_PRIVDOC" || true)
 if [ -n "$HITS" ]; then
   echo ""
   echo "❌ COMMIT BLOCKED — committed artifacts must not reference private docs/paths:"
@@ -78,20 +76,16 @@ if [ -n "$HITS" ]; then
   exit 1
 fi
 
-# ── private-doc section-citation guard ───────────────────────────────────────
-# Committed code must be self-contained — no private-doc section/design-code refs
-# (§x.x, PRD §, DD/ED/FD codes). Excludes the guard machinery (.githooks/* and the
-# hook's own test) whose denylists must contain the very tokens they detect.
-HITS=$(git diff --cached --name-only --diff-filter=ACM \
-        -- 'src/*' 'docs/*' '*.md' ':!LICENSE' ':!.githooks/*' \
-           ':!tests/unit/test_precommit_hook.py' \
-       | xargs grep -nIE "$TM_SECTREF" 2>/dev/null || true)
+# ── private-doc section-citation guard (added lines, whole tree) ──────────────
+# Same ADDED_FRAMING view: no private-doc section/design-code refs (section marks,
+# PRD refs, DD/ED/FD codes) in any committed added line, tests included.
+HITS=$(printf '%s' "$ADDED_FRAMING" | grep -nIE "$TM_SECTREF" || true)
 if [ -n "$HITS" ]; then
   echo ""
   echo "❌ COMMIT BLOCKED — committed code must be self-contained — no private-doc/section refs:"
   echo "$HITS"
   echo ""
-  echo "State the mechanism inline; drop the citation (no §x.x / PRD § / DD-ED-FD codes)."
+  echo "State the mechanism inline; drop the citation (section marks / PRD refs / DD-ED-FD codes)."
   echo ""
   exit 1
 fi

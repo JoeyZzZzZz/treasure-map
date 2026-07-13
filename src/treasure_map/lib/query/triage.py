@@ -125,7 +125,7 @@ class TriageCandidate:
     # source is not a resolved nvram getter. A surfaced fact, never a verdict.
     nvram_source_key: str | None = None
     # The honest three-state map layers. Every dimension is a first-class, queryable /
-    # sortable / filterable annotation here — NOT buried in flow_evidence JSON for the agent to dig.
+    # sortable / filterable annotation here — NOT buried in flow_evidence JSON to dig out.
     dimensions: tuple[Dimension, ...] = field(default_factory=tuple)
 
     def dim(self, name: str) -> Dimension:

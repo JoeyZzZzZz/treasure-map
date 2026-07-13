@@ -1368,7 +1368,7 @@ def test_cmd_candidate_carries_flow_evidence(tmp_path: Path) -> None:
         "sanitizer_seen",
         "entry_reach",
         "trace_boundary",
-        # Ghidra def-use provenance merged in (design §一). Empty [] here: the synthetic function
+        # Ghidra def-use provenance merged in. Empty [] here: the synthetic function
         # has no exported sink_provenance, so it is present-but-empty, never absent.
         "sink_arg_provenance",
     }
@@ -1407,7 +1407,7 @@ def test_flow_evidence_records_entry_sites_from_script_calls(tmp_path: Path) -> 
     run_analyzer2(db, atlas, source_run_id="run_er")
     er = _evidence_of(atlas, "arp_run")["entry_reach"]
     assert er["status"] == "found"
-    # give-all: both call sites (path form + bare-name form) are listed with their arg source.
+    # both call sites (path form + bare-name form) are listed with their arg source.
     assert {(s["line"], s["arg_source"]) for s in er["sites"]} == {
         (7, "var_expansion"),
         (19, "literal"),
@@ -1548,7 +1548,7 @@ def test_json_free_string_via_wrapper_floats_high(tmp_path: Path) -> None:
 
 
 def test_safe_fanout_to_wrapper_is_suppressed_below_real_concat(tmp_path: Path) -> None:
-    # ★ §2.2: the real free-string-via-wrapper outranks the safe fanout (constant / charset
+    # ★ the real free-string-via-wrapper outranks the safe fanout (constant / charset
     # argument forwarded to the wrapper), which the existing FP-suppression downweights.
     db = _make_db(
         tmp_path,
@@ -1914,9 +1914,10 @@ def test_path_sink_is_additive_no_regression(tmp_path: Path) -> None:
 def test_a2_sources_are_boundary_clean() -> None:
     # The neutral A2 + aggregation layer carries no offensive/judgement framing and no section /
     # private-doc refs. The private exploited-hole ledger (exploit_ledger.py + its private_exploit /
-    # exploit_note storage in the schema) is the ONE sanctioned non-neutral store the moat feature
-    # adds: the domain term "exploit" is permitted THERE only. Every harder framing word stays
-    # banned across the whole layer — including the ledger and the schema — so the carve-out is
+    # exploit_note storage in the schema) is the ONE sanctioned non-neutral store the
+    # exploit-barrier ledger feature adds: the domain term "exploit" is permitted THERE only. Every
+    # harder framing word stays banned across the whole layer — including the ledger and the schema
+    # — so the carve-out is
     # exactly one word, exactly two surfaces.
     hard = re.compile(
         r"\b(vuln\w*|payload|\bpoc\b|finding|defect|incomplete_patch|fix_quality|"
@@ -1932,7 +1933,8 @@ def test_a2_sources_are_boundary_clean() -> None:
         text = path.read_text()
         assert not hard.search(text), f"offensive framing in {path.name}"
         assert not section_ref.search(text), f"section/private-doc ref in {path.name}"
-        # the schema stores the exploit ledger (its whole moat DDL block is "exploit" prose), so the
-        # exploit-word check applies to the neutral files only, never the two sanctioned surfaces.
+        # the schema stores the exploit ledger (its whole barrier DDL block is "exploit" prose), so
+        # the exploit-word check applies to the neutral files only, never the two sanctioned
+        # surfaces.
         if path.name not in exploit_exempt and path.name != _ATLAS_SCHEMA.name:
             assert not stray_exploit.search(text), f"stray 'exploit' framing in {path.name}"

@@ -34,7 +34,7 @@ fail=0
 #                   every such test was verified brand-clean.
 #   ADDED_FRAMING — ADDED_ALL minus the self-referential neutrality tests, which
 #                   embed the strategy-vocab / private-doc literals they detect.
-#                   The framing scans (strategy-vocab + private-doc) run here.
+#                   The framing scans (strategy-vocab + private-doc + section-ref) run here.
 if [ -n "$BASE_REF" ]; then
     ADDED_ALL=$(git diff "$BASE_REF" "$HEAD_REF" -U0 --diff-filter=ACM -- . \
             "${TM_DIFF_MACHINERY_EXCLUDES[@]}" \
@@ -60,6 +60,13 @@ if [ -n "$BASE_REF" ]; then
     if [ -n "$PRIVHITS" ]; then
         echo "❌ private-doc/path reference in diff content ($RANGE):"
         echo "$PRIVHITS"
+        fail=1
+    fi
+
+    SECTHITS=$(printf '%s' "$ADDED_FRAMING" | grep -nIE "$TM_SECTREF" || true)
+    if [ -n "$SECTHITS" ]; then
+        echo "❌ private-doc section/design-code reference in diff content ($RANGE):"
+        echo "$SECTHITS"
         fail=1
     fi
 fi

@@ -483,7 +483,7 @@ def test_fact_tool_routes_by_evidence_ref(tmp_path: Path) -> None:
 
 
 def test_no_lineage_run_never_revived_by_ws_root_fallback(tmp_path: Path) -> None:
-    # ★ §6.5 honesty red-line: a run in the atlas but with NO lineage row (never trustworthily
+    # ★ honesty red-line: a run in the atlas but with NO lineage row (never trustworthily
     # analyzed) must NOT be revived by a residual old analysis.db in the workspaces root. It
     # short-circuits to re-scan BEFORE any db is opened — so a miss reads as UNKNOWN ("never
     # analyzed"), never NO ("analyzed and absent").
@@ -1056,9 +1056,9 @@ def test_import_cve_patterns_idempotent_via_tool(tmp_path: Path) -> None:
 
 
 def test_public_server_files_are_neutral() -> None:
-    # The MCP server + its read layer + CLI are published ("the public spear"); they must carry no
-    # strategy vocabulary, no private-doc/section citation, and the defensive legal notice must be
-    # wired into the server instructions.
+    # The MCP server + its read layer + CLI are published ("the public-facing surface"); they must
+    # carry no strategy vocabulary, no private-doc/section citation, and the defensive legal notice
+    # must be wired into the server instructions.
     src = Path(__file__).resolve().parents[2] / "src" / "treasure_map"
     banned = re.compile(r"\b(moat|shield|fix_quality|incomplete_patch)\b|盾|§|PRD\s", re.IGNORECASE)
     privdoc = re.compile(r"private (design )?notes|treasure-map-notes", re.IGNORECASE)

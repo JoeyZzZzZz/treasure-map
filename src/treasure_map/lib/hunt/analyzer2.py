@@ -684,8 +684,8 @@ def run_analyzer2(
 
                 # Structured flow EVIDENCE for command-sink candidates (the partition L3 is about):
                 # source classification, one-hop value flow, sanitizer presence (coverage=unjudged),
-                # rootfs entry sites, and the honest trace boundary. Material for a later agent —
-                # NOT a verdict; nothing here reads it back into recall, the score, or the grade.
+                # rootfs entry sites, and the honest trace boundary. NOT a verdict —
+                # nothing here reads it back into recall, the score, or the grade.
                 flow_evidence: str | None = None
                 if match.sink_class == "cmd":
                     sites = entry_index.sites_for(row.binary_name, row.binary_path)
@@ -710,8 +710,8 @@ def run_analyzer2(
                     # Copy candidates carry SIZE evidence (the danger axis): the length source
                     # classification, the one-hop size flow, any clamp/guard seen (coverage
                     # unjudged), the rootfs entry sites (so copy ranks evenly with cmd/fmt on
-                    # entry-reach), and the honest trace boundary. Material for a later agent —
-                    # never a verdict; nothing reads it back into recall or the grade.
+                    # entry-reach), and the honest trace boundary. Never a verdict —
+                    # nothing reads it back into recall or the grade.
                     sites = entry_index.sites_for(row.binary_name, row.binary_path)
                     flow_evidence = json.dumps(
                         build_size_evidence(
@@ -738,8 +738,8 @@ def run_analyzer2(
                 elif match.sink_class == "path_sink" and sink_name is not None:
                     # Path/file candidates carry flow evidence on the PATH argument (the danger
                     # axis): its source_kind, the one-hop value flow, any sanitizer seen (coverage
-                    # unjudged), the rootfs entry sites, and the honest trace boundary. Material for
-                    # a later agent — never a verdict; nothing reads it back into recall/grade.
+                    # unjudged), the rootfs entry sites, and the honest trace boundary. Never a
+                    # verdict — nothing reads it back into recall/grade.
                     sites = entry_index.sites_for(row.binary_name, row.binary_path)
                     path_ev = build_flow_evidence(
                         pseudocode=row.pseudocode,

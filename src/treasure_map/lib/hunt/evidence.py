@@ -1,13 +1,13 @@
 # Copyright (C) 2025-2026 JoeyZzZzZz
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Flow evidence for a command-sink candidate — structured material for a downstream agent.
+"""Flow evidence for a command-sink candidate — structured, per-candidate mechanism facts.
 
-This module produces EVIDENCE, never a judgement. It follows "give enough, give all + honest
-blind spots": it hands a reviewer the reliable facts it can establish intra-procedurally (the
+This module produces EVIDENCE, never a judgement. It reports all facts it can establish plus
+explicit blind spots: it hands a reviewer the reliable facts it finds intra-procedurally (the
 source classification, the one-hop value flow, which sanitizer-shaped calls exist and whether
 they sit on the sink's path, which rootfs entry points were found to invoke the binary) AND the
 boundary where its tracing stops — but it NEVER decides "sanitized / not sanitized" or
-"triggerable / not". Each field is a neutral mechanism fact; the judgement is the agent's.
+"triggerable / not". Each field is a neutral mechanism fact.
 
 Hard rules (do not relax):
 - `sanitizer_seen` records only that a sanitizer-shaped call exists and whether it lies on the
@@ -86,7 +86,7 @@ def _source_kind(pseudocode: str, sink_arg: str | None, *, conservative_free: bo
       free_string   — a free source (network/env/config/json/parameter) reaches the sink argument.
       charset_maybe — NOT inline and NO free source, but a charset-safe converter is called in the
                       function: the value MAY be charset-constrained through an intermediate
-                      variable, but it is not value-tracked here — a lead for the agent, not safe.
+                      variable, but it is not value-tracked here — a lead, not proven safe.
       unknown       — none of the above could be established.
 
     ``conservative_free`` (set for wrapper-propagated candidates, where the value reaches the
@@ -333,8 +333,8 @@ def build_fmtstr_evidence(
     evidence on that argument (source_kind / flow_path / sanitizer_seen / entry_reach /
     trace_boundary) and adds two format-specific facts: which positional argument is the format
     string, and whether every call passes a literal format (it must NOT, or this would not be a
-    candidate — recorded for the agent's transparency). EVIDENCE, never a verdict — it does not
-    decide the format is truly controllable; that judgement is the agent's."""
+    candidate — recorded for transparency). EVIDENCE, never a verdict — it does not
+    decide the format is truly controllable."""
     fmt_arg = format_string_ident(pseudocode, sink_name)
     ev = build_flow_evidence(
         pseudocode=pseudocode, callees=callees, sink_arg=fmt_arg, entry_sites=entry_sites
@@ -371,7 +371,7 @@ class EntryIndex:
         self._web_endpoints = web_endpoints
 
     def sites_for(self, binary_name: str | None, binary_path: str | None) -> list[dict[str, Any]]:
-        """Every entry site referencing the binary (give-all). Each script site carries the script
+        """Every entry site referencing the binary (all sites). Each script site carries the script
         path, line, and coarse argument pattern (literal / var_expansion / piped) so the parameter
         source is visible. [] means none found — the caller reports ``unknown``, NOT "unreachable".
         """

@@ -384,7 +384,7 @@ def detect_form_signal(
     if sink_arg is not None and _charset_inline_constrained(pseudocode, sink_arg):
         # Charset downweight is INLINE-ONLY: the converter must build the sink argument directly. A
         # value laundered through an intermediate variable is not value-tracked (no chain to two
-        # hops, three hops, …); the evidence layer marks it `charset_maybe` for the agent instead.
+        # hops, three hops, …); the evidence layer marks it `charset_maybe` instead.
         return CHARSET_CONSTRAINED
     if _exec_is_no_shell(callees, pseudocode):
         return NO_SHELL_EXEC

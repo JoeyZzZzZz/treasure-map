@@ -115,7 +115,7 @@ def test_pattern_a_non_shellish_literal_falls_back_to_bare_cmd(tmp_path: Path) -
     )
     res = scan(db)
     # The %s literal is not shell-ish, so the rich cmd_injection shape does NOT match — but the
-    # command sink is NOT silently dropped (recall before precision, §15.2): it falls back to a
+    # command sink is NOT silently dropped (recall before precision): it falls back to a
     # bare_cmd candidate, to be ranked low downstream rather than omitted.
     assert res.stats.pattern_a == 0
     assert res.stats.bare_cmd == 1

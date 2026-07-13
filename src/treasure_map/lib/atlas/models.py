@@ -54,7 +54,7 @@ class InstanceRow:
     is_thin_cmd_wrapper: bool = False
     wrapped_sink: str | None = None
     # Structured flow evidence for a command-sink candidate (JSON string; see lib/hunt/evidence.py).
-    # Read-only material for a later agent layer — no recall/score/grade path consumes it.
+    # Read-only structured facts — no recall/score/grade path consumes it.
     flow_evidence: str | None = None
     instance_id: int | None = None
     created_at: str | None = None

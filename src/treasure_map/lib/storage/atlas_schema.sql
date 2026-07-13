@@ -224,8 +224,8 @@ CREATE INDEX IF NOT EXISTS idx_wff_run ON web_form_fields(source_run_id);
 -- barrier depth; the split makes those three un-mixable at the storage layer (a public row can never
 -- be mis-exported as private, and public volume can never inflate depth — depth counts private only).
 
--- public_cve_pattern (FRONT-STAGE): public-CVE exploit forms. An agent may fill it (the entry
--- ticket). NOT counted in barrier depth (it is breadth/material, not a barrier). Not sensitive.
+-- public_cve_pattern (FRONT-STAGE): public-CVE exploit forms. An agent may fill it. NOT counted
+-- in barrier depth (it is breadth/material, not a barrier). Not sensitive.
 -- pattern/source/sink are FREE TEXT — no structured match key is presumed (the fingerprint key is
 -- unproven; no fuzzy match is built here, only exact human-readable lookup).
 CREATE TABLE IF NOT EXISTS public_cve_pattern (

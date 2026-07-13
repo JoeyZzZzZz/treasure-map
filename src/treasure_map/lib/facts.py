@@ -469,8 +469,8 @@ def _truncated_binaries(conn: sqlite3.Connection, binary_id: int | None = None) 
 # Default byte budget for ONE fact-tool page. A wide dispatcher's string table (400k+ chars in one
 # result) overruns a single MCP return, so a large result is paged LOSSLESSLY by cumulative
 # serialized size: the tail stays REACHABLE via next_offset and is NEVER summarized away. A summary
-# would let the tool decide which string matters and could drop the one the consumer is hunting —
-# violating "surface facts, don't decide". Summaries are opt-in only, never the default.
+# could drop the exact string the consumer is hunting. Summaries are opt-in only, never
+# the default.
 _FACT_PAGE_CHARS = 20000
 
 

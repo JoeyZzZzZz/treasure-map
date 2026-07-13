@@ -3,7 +3,7 @@
 """Unit tests for lib/hunt/evidence — structured flow evidence for a command-sink candidate.
 
 Synthetic, vendor-neutral pseudocode + an in-memory entry index. The module produces EVIDENCE,
-never a judgement: these tests pin the give-enough-give-all behaviour (reliable flow + all entry
+never a judgement: these tests pin its exhaustive listing (reliable flow + all entry
 sites) and the honest blind spots (sanitizer coverage always unjudged, entry-not-found is
 unknown not unreachable, trace boundary states where it stopped), and guard that nothing here
 feeds the score / recall / grade.
@@ -172,7 +172,7 @@ def test_flow_path_one_hop_drops_literal_noise() -> None:
 
 
 def test_flow_path_gives_all_real_one_hop_vars() -> None:
-    # give-all within the reliable one-hop range: both buffers feeding the command are listed.
+    # exhaustive within the reliable one-hop range: both buffers feeding the command are listed.
     pc = (
         "void f(struct ether_addr* x, struct ether_addr* y){ char ba[32]; char bb[32]; "
         "char cmd[128]; char* p; p=ether_ntoa(x); strncpy(ba,p,32); p=ether_ntoa(y); "
@@ -236,7 +236,7 @@ def test_entry_reach_lists_all_sites() -> None:
     pc = 'void f(char* param_1){ char cmd[128]; snprintf(cmd,128,"echo %s",param_1); system(cmd); }'
     er = _ev(pc, ["snprintf", "system"], entry_sites=sites)["entry_reach"]
     assert er["status"] == "found"
-    assert er["sites"] == sites  # give-all: every site preserved
+    assert er["sites"] == sites  # every site preserved (none dropped)
 
 
 # ── trace_boundary: honest about where the structured trace stops ────────────────────
@@ -432,7 +432,7 @@ def test_fmtstr_evidence_printf_position_zero() -> None:
 
 
 def test_evidence_signals_do_not_feed_score_or_grade() -> None:
-    # The INTERPRETIVE evidence signals are material for an agent, never a grade input. There is no
+    # The INTERPRETIVE evidence signals are facts, never a grade input. There is no
     # collapsed score anymore — the read-side triage surfaces facts as honest dimension LAYERS, and
     # the grader / form-note downweight must consume none of them nor import the evidence module.
     #
