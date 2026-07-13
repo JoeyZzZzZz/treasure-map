@@ -28,33 +28,35 @@ fi
 fail=0
 
 # ── 1) diff content over the range ───────────────────────────────────────────
-# Exclude the hook machinery, the watchlists, and the hook's own test, whose
-# denylist patterns would otherwise self-match.
+# Two diff views sharing one source of truth (.githooks/lib.sh):
+#   ADDED_ALL     — everything but the pattern-holding machinery. The vendor-name
+#                   scan runs here; a neutrality test must never name a brand, and
+#                   every such test was verified brand-clean.
+#   ADDED_FRAMING — ADDED_ALL minus the self-referential neutrality tests, which
+#                   embed the strategy-vocab / private-doc literals they detect.
+#                   The framing scans (strategy-vocab + private-doc) run here.
 if [ -n "$BASE_REF" ]; then
-    ADDED=$(git diff "$BASE_REF" "$HEAD_REF" -U0 --diff-filter=ACM -- . \
-            ":(exclude).githooks/vendor-watchlist.txt" \
-            ":(exclude).githooks/vendor-watchlist.example.txt" \
-            ":(exclude).githooks/pre-commit" \
-            ":(exclude).githooks/commit-msg" \
-            ":(exclude).githooks/lib.sh" \
-            ":(exclude)tests/unit/test_precommit_hook.py" \
-            ":(exclude)tests/unit/test_mcp_app.py" \
+    ADDED_ALL=$(git diff "$BASE_REF" "$HEAD_REF" -U0 --diff-filter=ACM -- . \
+            "${TM_DIFF_MACHINERY_EXCLUDES[@]}" \
+            | grep '^+' | grep -v '^+++' || true)
+    ADDED_FRAMING=$(git diff "$BASE_REF" "$HEAD_REF" -U0 --diff-filter=ACM -- . \
+            "${TM_DIFF_MACHINERY_EXCLUDES[@]}" "${TM_DIFF_NEUTRALITY_TEST_EXCLUDES[@]}" \
             | grep '^+' | grep -v '^+++' || true)
 
-    if HITS=$(printf '%s' "$ADDED" | tm_scan_text "$WATCHLIST"); then :; else
+    if HITS=$(printf '%s' "$ADDED_ALL" | tm_scan_text "$WATCHLIST"); then :; else
         echo "❌ vendor identifier(s) in diff content ($RANGE):"
         echo "$HITS"
         fail=1
     fi
 
-    SVHITS=$(printf '%s' "$ADDED" | grep -nIE "$TM_BANNED_VOCAB" || true)
+    SVHITS=$(printf '%s' "$ADDED_FRAMING" | grep -nIE "$TM_BANNED_VOCAB" || true)
     if [ -n "$SVHITS" ]; then
         echo "❌ strategy/judgment vocabulary in diff content ($RANGE):"
         echo "$SVHITS"
         fail=1
     fi
 
-    PRIVHITS=$(printf '%s' "$ADDED" | grep -nIE "$TM_PRIVDOC" || true)
+    PRIVHITS=$(printf '%s' "$ADDED_FRAMING" | grep -nIE "$TM_PRIVDOC" || true)
     if [ -n "$PRIVHITS" ]; then
         echo "❌ private-doc/path reference in diff content ($RANGE):"
         echo "$PRIVHITS"

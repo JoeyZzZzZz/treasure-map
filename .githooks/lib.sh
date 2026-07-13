@@ -11,6 +11,46 @@ TM_BANNED_VOCAB='\b(moat|shield)\b|盾|fix_quality|incomplete_patch_flag|fix_qua
 TM_PRIVDOC='treasure-map-notes|private (design )?notes|design note|PRD §|private notes dir'
 TM_SECTREF='§[0-9]|PRD §|\b(DD|ED|FD)[0-9]\b'
 
+# ── shared diff pathspec exclude sets ────────────────────────────────────────
+# One source of truth for BOTH the local hooks (git diff --cached) and the CI
+# backstop (git diff BASE HEAD), so the two can never drift. Each site runs its
+# own `git diff … -- . "${set[@]}"` and picks the set per the scan it is running.
+
+# MACHINERY: files whose whole job is to hold denylist patterns / real brand
+# names verbatim — the hook scripts, the watchlists, and the hook's own test
+# (which embeds real vendor tokens to prove detection). Exempt from EVERY scan;
+# scanning them would only match their own pattern definitions.
+TM_DIFF_MACHINERY_EXCLUDES=(
+    ":(exclude).githooks/vendor-watchlist.txt"
+    ":(exclude).githooks/vendor-watchlist.example.txt"
+    ":(exclude).githooks/pre-commit"
+    ":(exclude).githooks/commit-msg"
+    ":(exclude).githooks/lib.sh"
+    ":(exclude)tests/unit/test_precommit_hook.py"
+)
+
+# NEUTRALITY TESTS: self-referential tests that read project source and assert it
+# is free of framing/judgment vocabulary — so each one NECESSARILY embeds that
+# vocabulary as denylist literals (e.g. fix_quality, moat, shield, "private
+# notes"). They are exempt from the FRAMING scans (strategy-vocab + private-doc)
+# ONLY. The vendor-name scan still covers them — a neutrality test has no business
+# naming a brand — and each was verified brand-clean.
+#
+# ADMISSION RULE — the ONLY thing that may enter this list: a test whose body
+# scans project source for the ABSENCE of banned framing/judgment words. This is
+# NOT a general escape hatch: anything else that trips a scan must be fixed in the
+# source, never parked here.
+TM_DIFF_NEUTRALITY_TEST_EXCLUDES=(
+    ":(exclude)tests/unit/test_mcp_app.py"
+    ":(exclude)tests/unit/lib/test_analyzer2.py"
+    ":(exclude)tests/unit/lib/test_diff.py"
+    ":(exclude)tests/unit/lib/test_diff_analyzer.py"
+    ":(exclude)tests/unit/lib/test_downweight.py"
+    ":(exclude)tests/unit/lib/test_pattern.py"
+    ":(exclude)tests/unit/lib/test_reachability.py"
+    ":(exclude)tests/unit/lib/test_triage_explain.py"
+)
+
 # Echo the watchlist path to use (env override -> local full list -> committed
 # brand-free example). When falling back to the example, print a notice to stderr.
 # Returns non-zero only if no watchlist file exists at all.
