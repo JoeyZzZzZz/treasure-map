@@ -1,55 +1,6 @@
 # Treasure Map configuration example
-# Copy to ~/.treasure-map/config.yaml and fill in your API keys.
-
-llm:
-  # Tier → provider+model mapping. This is the only place users need to configure.
-  tiers:
-    S:
-      provider: deepseek
-      model: deepseek-v4-flash
-      base_url: https://api.deepseek.com
-      api_key_env: DEEPSEEK_API_KEY
-      thinking: false            # explicit: V4 thinking defaults ON; disable for the fast tier
-      max_cost_per_call_usd: 0.01
-      # Optional: your account's USD price per 1M tokens. The tool ships NO vendor prices
-      # (they are external and account-specific). Set BOTH for real-cost guarding; leave
-      # unset and the cost-guard degrades to count-based (1 call = 1 max_cost_per_call_usd).
-      # input_price_per_1m: 0.00
-      # output_price_per_1m: 0.00
-    M:
-      provider: deepseek
-      model: deepseek-v4-flash
-      base_url: https://api.deepseek.com
-      api_key_env: DEEPSEEK_API_KEY
-      thinking: true
-      reasoning_effort: high     # "high" | "max" (low/medium map to high per DeepSeek docs)
-      max_cost_per_call_usd: 0.10
-    L:
-      provider: anthropic
-      model: claude-opus-4-7
-      base_url: https://api.anthropic.com/v1
-      api_key_env: ANTHROPIC_API_KEY
-      max_cost_per_call_usd: 1.00
-
-  cost_guards:
-    max_cost_per_run_usd: 5.0
-    max_cost_per_day_usd: 20.0
-    require_confirm_above_usd: 1.0
-
-  cache:
-    enabled: true
-    path: ~/.treasure-map/llm_cache.db
-
-  concurrency:
-    # DeepSeek-V4 flash supports up to 2500 concurrent requests, pro up to 500. These stay
-    # well under those caps; raise toward the cap if your plan allows it.
-    S: 64   # flash, no thinking — fast
-    M: 32   # flash + thinking — slower per call
-    L: 8    # pro (cap 500) or a low-volume judgment tier (e.g. Claude)
-
-  retry:
-    max_attempts: 4
-    backoff_base_seconds: 5
+# Copy to ~/.treasure-map/config.yaml. Analysis is hermetic (no network calls) — there are no
+# API keys to fill in.
 
 ghidra:
   mode: local    # local | docker (M4) | remote (M4)

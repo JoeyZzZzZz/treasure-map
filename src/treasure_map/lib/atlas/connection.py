@@ -62,6 +62,27 @@ def _migrate(conn: sqlite3.Connection) -> None:
     # until re-hunted. Idempotent — runs only while the column is missing.
     if inst_cols and "flow_evidence" not in inst_cols:
         conn.execute("ALTER TABLE instance ADD COLUMN flow_evidence TEXT")
+    # exposure_shape (added this round): an exposure SHAPE (e.g. bare_sink), moved out of
+    # blocking_mechanism so a danger form is never read as a mitigation. Nullable TEXT — old rows
+    # carry NULL until re-hunted. Idempotent — runs only while the column is missing.
+    if inst_cols and "exposure_shape" not in inst_cols:
+        conn.execute("ALTER TABLE instance ADD COLUMN exposure_shape TEXT")
+
+    # public_cve_pattern.origin (added this round): marks rows as externally imported material (not
+    # tmap deterministic extraction). NOT NULL DEFAULT 'external_import'; existing rows take the
+    # default. Idempotent — runs only while the column is missing. CHECK falls back to plain column.
+    pcp_cols = _column_names(conn, "public_cve_pattern")
+    if pcp_cols and "origin" not in pcp_cols:
+        try:
+            conn.execute(
+                "ALTER TABLE public_cve_pattern ADD COLUMN origin TEXT NOT NULL "
+                "DEFAULT 'external_import' CHECK (origin IN ('external_import'))"
+            )
+        except sqlite3.OperationalError:
+            conn.execute(
+                "ALTER TABLE public_cve_pattern ADD COLUMN origin TEXT NOT NULL "
+                "DEFAULT 'external_import'"
+            )
 
     pat_cols = _column_names(conn, "pattern")
     if "recurrence_breadth" in pat_cols and "device_spread" not in pat_cols:

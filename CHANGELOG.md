@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **LLM infrastructure removed — the fact substrate is now purely deterministic.** The `lib/llm/`
+  and `lib/llm_cache/` packages (router, providers, task registry, cache) and the orphaned
+  `lib/cost_guard/` are gone, along with the `llm` config block and its API-key onboarding. The core
+  analysis layers were already hermetic; the LLM's only real use was an optional fallback in the
+  cross-version function matcher, which the deterministic exact + pseudocode-hash passes fully
+  cover. The matcher's stripped/renamed residue now surfaces honestly as added/removed instead of
+  being force-matched, and `diff` needs no API key. Drops the `openai` / `anthropic` / `aiohttp` /
+  `aiosqlite` runtime dependencies and the `--max-assist` flag.
+
+### Added
+
+- **`public_cve_pattern.origin` provenance guard.** Every externally imported CVE-pattern row is
+  now tagged `origin='external_import'` — a machine-readable guard (on top of the existing physical
+  table separation) so external/agent-imported material can never be read as deterministic tmap
+  extraction. CI-assertable: no row may carry any other origin.
+
+### Changed
+
+- **`bare_sink` moved out of `blocking_mechanism` into a new `exposure_shape` column.** `bare_sink`
+  is a danger form (a raw command/format sink with no recognized in-function source), not a
+  mitigation, so filing it under `blocking_mechanism` risked a consumer reading it as "blocked". It
+  now lives in its own `instance.exposure_shape` column, surfaced distinctly by the CLI, the JSON,
+  and `explain_candidate`. Controllability is unchanged (such candidates still read a live `?`).
+
 ### Fixed
 
 - **Never wrongly downweight (recall red line).** The `const_sink_arg` form-downweight matched a

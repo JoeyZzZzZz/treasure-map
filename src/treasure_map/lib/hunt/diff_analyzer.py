@@ -30,9 +30,7 @@ from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import InstanceRow, PatternRow
 from treasure_map.lib.atlas.writer import add_instance, upsert_pattern
 from treasure_map.lib.diff import Axis, run_diff
-from treasure_map.lib.diff.differ import DEFAULT_MAX_ASSIST
 from treasure_map.lib.diff.loader import FuncRow, load_functions
-from treasure_map.lib.diff.matcher import _DiffRouter
 from treasure_map.lib.pattern.classes import CMD, COPY, FORMAT
 from treasure_map.lib.reachability import grade_candidate
 from treasure_map.lib.reachability.taint import locate_sink_arg, origin_of
@@ -120,11 +118,9 @@ def run_diff_analyzer(
     db_b: Path | str,
     axis: Axis,
     atlas_path: Path | str,
-    router: _DiffRouter,
     *,
     run_id_a: str,
     run_id_b: str,
-    max_assist: int = DEFAULT_MAX_ASSIST,
 ) -> AnalyzerStats:
     """Diff db_a vs db_b, grade each changed function, and write neutral atlas instances.
 
@@ -132,7 +128,7 @@ def run_diff_analyzer(
     neutral run id (the device_spread unit). Both analysis DBs are read-only; the
     atlas is append-only. Never raises on a single bad lead — gaps are counted and logged.
     """
-    result = run_diff(db_a, db_b, axis, router, max_assist=max_assist)
+    result = run_diff(db_a, db_b, axis)
     funcs_a: dict[int, FuncRow] = {f.func_id: f for f in load_functions(db_a)}
     funcs_b: dict[int, FuncRow] = {f.func_id: f for f in load_functions(db_b)}
 

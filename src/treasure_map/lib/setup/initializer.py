@@ -20,42 +20,6 @@ logger = logging.getLogger(__name__)
 
 # Default config matching config.example.yaml; stores env var names, never values.
 _DEFAULT_CONFIG_YAML: dict[str, Any] = {
-    "llm": {
-        "tiers": {
-            "S": {
-                "provider": "deepseek",
-                "model": "deepseek-v4-flash",
-                "base_url": "https://api.deepseek.com",
-                "api_key_env": "DEEPSEEK_API_KEY",
-                "thinking": False,  # explicit: V4 thinking defaults ON; disable for the fast tier
-                "max_cost_per_call_usd": 0.01,
-            },
-            "M": {
-                "provider": "deepseek",
-                "model": "deepseek-v4-flash",
-                "base_url": "https://api.deepseek.com",
-                "api_key_env": "DEEPSEEK_API_KEY",
-                "thinking": True,
-                "reasoning_effort": "high",
-                "max_cost_per_call_usd": 0.10,
-            },
-            "L": {
-                "provider": "anthropic",
-                "model": "claude-opus-4-7",
-                "base_url": "https://api.anthropic.com/v1",
-                "api_key_env": "ANTHROPIC_API_KEY",
-                "max_cost_per_call_usd": 1.00,
-            },
-        },
-        "cost_guards": {
-            "max_cost_per_run_usd": 5.0,
-            "max_cost_per_day_usd": 20.0,
-            "require_confirm_above_usd": 1.0,
-        },
-        "cache": {"enabled": True, "path": "~/.treasure-map/llm_cache.db"},
-        "concurrency": {"S": 8, "M": 20, "L": 5},
-        "retry": {"max_attempts": 4, "backoff_base_seconds": 5.0},
-    },
     "ghidra": {
         "mode": "local",
         "headless_timeout_seconds": 300,
@@ -79,13 +43,13 @@ class InitResult:
 
 
 def _collect_default_env_vars() -> list[str]:
-    """Return unique api_key_env names from _DEFAULT_CONFIG_YAML tiers, in order."""
-    seen: dict[str, None] = {}
-    for tier in _DEFAULT_CONFIG_YAML.get("llm", {}).get("tiers", {}).values():
-        name = str(tier.get("api_key_env", ""))
-        if name:
-            seen[name] = None
-    return list(seen)
+    """API key env var names to scaffold into .env.
+
+    The tool ships no built-in secrets — analysis is hermetic (no network calls), so there
+    are no default keys to provision. Returns an empty list; the .env scaffold stays a bare
+    placeholder the operator can add their own TM_* / env vars to.
+    """
+    return []
 
 
 def _provision_dirs(paths: Iterable[Path]) -> None:
@@ -99,10 +63,7 @@ def _configured_dirs(cfg: Config) -> list[Path]:
     Using the config-resolved paths here — and the same ones in the doctor — keeps
     provisioning and preflight consistent regardless of HOME vs Path.home() drift.
     """
-    dirs = [cfg.workspace_dir, cfg.atlas.db_path.parent]
-    if cfg.llm is not None:
-        dirs.append(cfg.llm.cache.path.parent)
-    return dirs
+    return [cfg.workspace_dir, cfg.atlas.db_path.parent]
 
 
 def _noop_echo(_msg: str) -> None:
@@ -343,20 +304,6 @@ def _run_doctor(tm_home: Path, cfg: Config | None) -> tuple[tuple[str, bool, str
     # JDK 21
     java = shutil.which("java")
     checks.append(("java", java is not None, java or "not on PATH"))
-
-    # API keys — per configured tier, deduplicated by api_key_env
-    if cfg is not None and cfg.llm is not None:
-        seen_keys: set[str] = set()
-        for tier_name in ("S", "M", "L"):
-            tier = getattr(cfg.llm.tiers, tier_name)
-            if tier.api_key_env in seen_keys:
-                continue
-            seen_keys.add(tier.api_key_env)
-            try:
-                tier.resolve_api_key()
-                checks.append((f"key:{tier.api_key_env}", True, "set"))
-            except Exception:
-                checks.append((f"key:{tier.api_key_env}", False, f"{tier.api_key_env} not set"))
 
     # Dirs writable — check the config-resolved locations (same ones run_init provisions).
     ws_path = cfg.workspace_dir if cfg is not None else tm_home / "workspaces"

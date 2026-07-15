@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Unit tests for diff_analyzer (A1) — the first end-to-end atlas writer.
 
-Synthetic, vendor-neutral analysis databases + a mock router (no network). Proves the
-diff -> reachability -> write-atlas chain, the L0/L1-only mapping, the no-path-no-vuln
-discipline (public_finding stays empty), append-only behavior, and the boundary.
+Synthetic, vendor-neutral analysis databases, fully deterministic (no network, no LLM).
+Proves the diff -> reachability -> write-atlas chain, the L0/L1-only mapping, the
+no-path-no-vuln discipline (public_finding stays empty), append-only behavior, and the boundary.
 """
 
 from __future__ import annotations
@@ -18,27 +18,10 @@ import pytest
 
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.hunt import run_diff_analyzer
-from treasure_map.lib.llm.types import LLMResponse, Tier
 from treasure_map.lib.storage.connection import open_db
 
 _HUNT_PKG = Path(__file__).resolve().parents[3] / "src" / "treasure_map" / "lib" / "hunt"
 _HUNT_CLI = Path(__file__).resolve().parents[3] / "src" / "treasure_map" / "cli" / "hunt_cli.py"
-
-
-class FakeRouter:
-    """Async call() stub for R-diff: canned verdict text, never matters to A1's grade."""
-
-    async def call(
-        self,
-        task: str,
-        input_text: str,
-        prompt: str,
-        prompt_version: str,
-        max_tokens: int = 1500,
-    ) -> LLMResponse:
-        content = "yes" if task == "function_match_assist" else "a neutral change description"
-        tier = Tier.M if task == "function_match_assist" else Tier.L
-        return LLMResponse(content=content, model_id="fake", cost_usd=0.0, cached=False, tier=tier)
 
 
 def _one_fn_db(
@@ -103,9 +86,7 @@ def test_pipeline_writes_unknown_instance_at_l0(tmp_path: Path) -> None:
         callees=["system"],
     )
     atlas = tmp_path / "atlas.db"
-    stats = run_diff_analyzer(
-        a, b, "version", atlas, FakeRouter(), run_id_a="run_base", run_id_b="run_cmp"
-    )
+    stats = run_diff_analyzer(a, b, "version", atlas, run_id_a="run_base", run_id_b="run_cmp")
 
     assert stats.instances_written == 1
     assert stats.by_status["unknown"] == 1
@@ -132,7 +113,7 @@ def test_validator_guarded_candidate_is_unknown_dormant_empty(tmp_path: Path) ->
     a = _one_fn_db(tmp_path, "a.db", fn="h", body=body, h="old", callees=calls)
     b = _one_fn_db(tmp_path, "b.db", fn="h", body=body + " // changed", h="new", callees=calls)
     atlas = tmp_path / "atlas.db"
-    stats = run_diff_analyzer(a, b, "version", atlas, FakeRouter(), run_id_a="rb", run_id_b="rc")
+    stats = run_diff_analyzer(a, b, "version", atlas, run_id_a="rb", run_id_b="rc")
 
     assert stats.by_status["blocked"] == 0
     assert stats.by_status["unknown"] == 1
@@ -152,7 +133,7 @@ def test_confirmed_candidate_is_l1_not_public(tmp_path: Path) -> None:
     a = _one_fn_db(tmp_path, "a.db", fn="h", body=body, h="old", callees=calls)
     b = _one_fn_db(tmp_path, "b.db", fn="h", body=body + " // changed", h="new", callees=calls)
     atlas = tmp_path / "atlas.db"
-    stats = run_diff_analyzer(a, b, "version", atlas, FakeRouter(), run_id_a="rb", run_id_b="rc")
+    stats = run_diff_analyzer(a, b, "version", atlas, run_id_a="rb", run_id_b="rc")
 
     assert stats.by_status["confirmed"] == 1
     (row,) = _instances(atlas)
@@ -182,7 +163,7 @@ def test_no_sink_change_is_unknown(tmp_path: Path) -> None:
         callees=["helper"],
     )
     atlas = tmp_path / "atlas.db"
-    stats = run_diff_analyzer(a, b, "version", atlas, FakeRouter(), run_id_a="rb", run_id_b="rc")
+    stats = run_diff_analyzer(a, b, "version", atlas, run_id_a="rb", run_id_b="rc")
 
     assert stats.instances_written == 1
     assert stats.by_status["unknown"] == 1
@@ -201,7 +182,7 @@ def test_a1_never_writes_l2_l3_or_anchor(tmp_path: Path) -> None:
     a = _one_fn_db(tmp_path, "a.db", fn="h", body=body, h="o", callees=calls)
     b = _one_fn_db(tmp_path, "b.db", fn="h", body=body + " //x", h="n", callees=calls)
     atlas = tmp_path / "atlas.db"
-    run_diff_analyzer(a, b, "version", atlas, FakeRouter(), run_id_a="rb", run_id_b="rc")
+    run_diff_analyzer(a, b, "version", atlas, run_id_a="rb", run_id_b="rc")
 
     conn = open_atlas(atlas)
     try:
@@ -222,8 +203,8 @@ def test_second_run_appends(tmp_path: Path) -> None:
     a = _one_fn_db(tmp_path, "a.db", fn="h", body=body, h="o", callees=calls)
     b = _one_fn_db(tmp_path, "b.db", fn="h", body=body + " //x", h="n", callees=calls)
     atlas = tmp_path / "atlas.db"
-    run_diff_analyzer(a, b, "version", atlas, FakeRouter(), run_id_a="rb1", run_id_b="rc1")
-    run_diff_analyzer(a, b, "version", atlas, FakeRouter(), run_id_a="rb2", run_id_b="rc2")
+    run_diff_analyzer(a, b, "version", atlas, run_id_a="rb1", run_id_b="rc1")
+    run_diff_analyzer(a, b, "version", atlas, run_id_a="rb2", run_id_b="rc2")
 
     assert len(_instances(atlas)) == 2  # accumulated, not wiped
     conn = open_atlas(atlas)
@@ -235,7 +216,7 @@ def test_second_run_appends(tmp_path: Path) -> None:
     assert breadth == 2
 
 
-# ── CLI: --max-assist 0 is pure static alignment, no LLM key required ─────────────────
+# ── CLI: diff runs with no LLM key (fully static alignment) ──────────────────────────
 
 
 def _named_fn_db(tmp_path: Path, name: str, funcs: list[tuple[str, str, str, list[str]]]) -> Path:
@@ -254,12 +235,10 @@ def _named_fn_db(tmp_path: Path, name: str, funcs: list[tuple[str, str, str, lis
     return db_path
 
 
-def test_hunt_diff_max_assist_zero_runs_without_llm_key(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # Symbol-complete before/after pair: notify_rc aligns by exact symbol (its body changed),
-    # logmessage_normal is byte-identical (unchanged), and validate_rc_service is new (added).
-    # --max-assist 0 must run with NO LLM key — exact + hash only, residue degraded/reported.
+def test_hunt_diff_runs_without_llm_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Function alignment is fully deterministic: notify_rc aligns by exact symbol (body changed),
+    # logmessage_normal is byte-identical (unchanged), and validate_rc_service is new (added). The
+    # diff runs with NO LLM key — exact + hash only, residue reported as added/removed.
     from click.testing import CliRunner
 
     from treasure_map.cli.hunt_cli import hunt_diff
@@ -267,9 +246,7 @@ def test_hunt_diff_max_assist_zero_runs_without_llm_key(
 
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
-    monkeypatch.setattr(
-        "treasure_map.lib.config.config.load_config", lambda _c=None: Config(llm=None)
-    )
+    monkeypatch.setattr("treasure_map.lib.config.config.load_config", lambda _c=None: Config())
 
     same_log = ("logmessage_normal", "void logmessage_normal(){ write(2,m,n); }", "hlog", ["write"])
     db_a = _named_fn_db(
@@ -300,8 +277,6 @@ def test_hunt_diff_max_assist_zero_runs_without_llm_key(
             "devA_base",
             "--run-id-b",
             "devA_cmp",
-            "--max-assist",
-            "0",
             "--atlas",
             str(atlas),
         ],
@@ -313,29 +288,6 @@ def test_hunt_diff_max_assist_zero_runs_without_llm_key(
     # notify_rc was graded statically and written (exact alignment needed no LLM).
     anchors = {r["source_anchor"] for r in _instances(atlas)}
     assert "notify_rc" in anchors
-
-
-def test_hunt_diff_positive_max_assist_without_key_errors_clearly(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # The hard gate is gone but a >0 assist budget still needs a key — with a clear message that
-    # points at --max-assist 0 as the no-key escape hatch.
-    from click.testing import CliRunner
-
-    from treasure_map.cli.hunt_cli import hunt_diff
-    from treasure_map.lib.config.config import Config
-
-    monkeypatch.setattr(
-        "treasure_map.lib.config.config.load_config", lambda _c=None: Config(llm=None)
-    )
-
-    db = _named_fn_db(tmp_path, "x.db", [("f", "void f(){ a(); }", "h", [])])
-    result = CliRunner().invoke(
-        hunt_diff,
-        [str(db), str(db), "--run-id-a", "x", "--run-id-b", "y", "--atlas", str(tmp_path / "a.db")],
-    )
-    assert result.exit_code != 0
-    assert "--max-assist 0" in result.output  # the no-key path is named in the error
 
 
 # ── BOUNDARY ────────────────────────────────────────────────────────────────────────

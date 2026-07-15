@@ -3,8 +3,8 @@
 """Autouse guard: no test may touch the real ~/.treasure-map/.
 
 Production code defaults several paths to the user's home directory. Some resolve ``Path.home()``
-at CALL time (the config default_factory for atlas.db / llm_cache / workspaces, the ``.env``
-lookup); others FREEZE a home path at IMPORT time into a module constant. A test that calls
+at CALL time (the config default_factory for atlas.db / workspaces, the ``.env`` lookup); others
+FREEZE a home path at IMPORT time into a module constant. A test that calls
 ``write_last_run(...)`` without ``path=``, or uses the default config's ``atlas.db_path``, would
 otherwise write into the user's real ~/.treasure-map/ — a pytest run has wiped a real atlas.db and
 left last_run.json pointing at a deleted /tmp path, breaking a live MCP binding.

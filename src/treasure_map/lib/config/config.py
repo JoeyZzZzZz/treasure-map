@@ -19,69 +19,6 @@ _DEFAULT_CONFIG_PATH = Path.home() / ".treasure-map" / "config.yaml"
 _LOCAL_CONFIG_PATH = Path("config.yaml")
 
 
-class TierConfig(BaseModel):
-    provider: str
-    model: str
-    base_url: str
-    api_key_env: str
-    max_cost_per_call_usd: float = 1.0
-    # Optional per-1M-token prices, supplied by the operator (the tool ships no vendor
-    # prices — they are external, account-specific, and change over time). When both are
-    # set, the provider computes real cost = price × actual token usage. When either is
-    # unset, real cost is unknown and the cost-guard degrades to count-based accounting
-    # (each call counts as one max_cost_per_call_usd quota unit).
-    input_price_per_1m: float | None = None
-    output_price_per_1m: float | None = None
-    # Tri-state thinking control for DeepSeek-V4 (whose thinking defaults to ENABLED):
-    #   None  -> send no thinking param (legacy behavior; correct for Anthropic and any
-    #            endpoint we should not touch)
-    #   False -> send an explicit disabled (needed to override V4's default-on)
-    #   True  -> send enabled (plus reasoning_effort if set)
-    thinking: bool | None = None
-    reasoning_effort: str | None = None  # "high" | "max"; only sent when thinking is True
-
-    @field_validator("reasoning_effort")
-    @classmethod
-    def _check_reasoning_effort(cls, v: str | None) -> str | None:
-        if v is not None and v not in {"high", "max"}:
-            raise ValueError(
-                f"reasoning_effort must be 'high' or 'max' (got {v!r}); "
-                "per DeepSeek docs low/medium map to high"
-            )
-        return v
-
-    def resolve_api_key(self) -> str:
-        key = os.environ.get(self.api_key_env, "")
-        if not key:
-            raise ConfigError(
-                f"Environment variable '{self.api_key_env}' is not set "
-                f"(required for provider '{self.provider}' tier)"
-            )
-        return key
-
-
-class TiersConfig(BaseModel):
-    S: TierConfig
-    M: TierConfig
-    L: TierConfig
-
-
-class CostGuardConfig(BaseModel):
-    max_cost_per_run_usd: float = 5.0
-    max_cost_per_day_usd: float = 20.0
-    require_confirm_above_usd: float = 1.0
-
-
-class CacheConfig(BaseModel):
-    enabled: bool = True
-    path: Path = Field(default_factory=lambda: Path.home() / ".treasure-map" / "llm_cache.db")
-
-    @field_validator("path", mode="before")
-    @classmethod
-    def expand_path(cls, v: Any) -> Path:
-        return Path(os.path.expanduser(str(v)))
-
-
 class AtlasConfig(BaseModel):
     db_path: Path = Field(default_factory=lambda: Path.home() / ".treasure-map" / "atlas.db")
 
@@ -89,28 +26,6 @@ class AtlasConfig(BaseModel):
     @classmethod
     def expand_path(cls, v: Any) -> Path:
         return Path(os.path.expanduser(str(v)))
-
-
-class ConcurrencyConfig(BaseModel):
-    # DeepSeek-V4 flash supports up to 2500 concurrent requests, pro up to 500. These
-    # defaults stay well under those caps (good throughput without hammering the API or a
-    # free-tier plan); raise toward the provider cap if your plan allows it.
-    S: int = 64  # flash, no thinking — fast; provider cap 2500
-    M: int = 32  # flash + thinking — slower per call; provider cap 2500
-    L: int = 8  # pro (cap 500) or a low-volume judgment tier (e.g. Claude)
-
-
-class RetryConfig(BaseModel):
-    max_attempts: int = 4
-    backoff_base_seconds: float = 5.0
-
-
-class LLMConfig(BaseModel):
-    tiers: TiersConfig
-    cost_guards: CostGuardConfig = Field(default_factory=CostGuardConfig)
-    cache: CacheConfig = Field(default_factory=CacheConfig)
-    concurrency: ConcurrencyConfig = Field(default_factory=ConcurrencyConfig)
-    retry: RetryConfig = Field(default_factory=RetryConfig)
 
 
 class GhidraMode(StrEnum):
@@ -148,7 +63,6 @@ class GhidraConfig(BaseModel):
 
 
 class Config(BaseModel):
-    llm: LLMConfig | None = None
     ghidra: GhidraConfig = Field(default_factory=GhidraConfig)
     workspace_dir: Path = Field(
         default_factory=lambda: Path.home() / ".treasure-map" / "workspaces"

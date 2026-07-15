@@ -19,13 +19,9 @@ classifiers = [
 
 dependencies = [
     "pyelftools>=0.31",
-    "openai>=1.30",
-    "anthropic>=0.28",
     "pydantic>=2.7",
     "pyyaml>=6.0",
     "click>=8.1",
-    "aiohttp>=3.9",
-    "aiosqlite>=0.20",
     # The AI-facing MCP server is the substrate's primary consumer entry point, not an add-on:
     # `tmap mcp` must connect out of the box on any install, so its SDK is a core dependency
     # (imported at module top level like every other core dep, never behind an extra).

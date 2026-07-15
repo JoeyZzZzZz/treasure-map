@@ -10,17 +10,13 @@ deterministic unified diff; the primitive does not ask an LLM to describe it.
 
 from __future__ import annotations
 
-import asyncio
 import difflib
 from pathlib import Path
 from typing import get_args
 
 from treasure_map.lib.diff.loader import FuncRow, load_functions
-from treasure_map.lib.diff.matcher import Pair, _DiffRouter, match_functions
+from treasure_map.lib.diff.matcher import Pair, match_functions
 from treasure_map.lib.diff.models import Axis, ChangeLead, DiffResult, DiffStats, FuncRef
-
-# Default ceiling on M-tier function_match_assist calls per run (degrade-and-flag above).
-DEFAULT_MAX_ASSIST = 200
 
 
 def _ref(row: FuncRow | None) -> FuncRef | None:
@@ -95,17 +91,23 @@ def classify(pair: Pair, axis: Axis) -> tuple[ChangeLead, str | None]:
     return lead, diff_text
 
 
-async def _run_diff_async(
+def run_diff(
     db_a: Path | str,
     db_b: Path | str,
     axis: Axis,
-    router: _DiffRouter,
-    *,
-    max_assist: int,
 ) -> DiffResult:
+    """Locate and neutrally describe changes between two analysis databases.
+
+    axis (version | mod | sibling) is recorded as each lead's scope_origin; the real
+    pairing identity stays in the operator's external notes. Both DBs are read-only.
+    Fully deterministic: functions align by exact symbol then pseudocode hash, and the
+    change itself is the deterministic unified diff.
+    """
+    if axis not in get_args(Axis):
+        raise ValueError(f"axis must be one of {get_args(Axis)} (got {axis!r})")
     funcs_a = load_functions(db_a)
     funcs_b = load_functions(db_b)
-    pairs, m_assist_calls = await match_functions(funcs_a, funcs_b, router, max_assist=max_assist)
+    pairs = match_functions(funcs_a, funcs_b)
 
     leads: list[ChangeLead] = []
     matched = unchanged = added = removed = changed = 0
@@ -139,24 +141,5 @@ async def _run_diff_async(
         changed=changed,
         changed_unverifiable=changed_unverifiable,
         skipped_no_body=skipped_no_body,
-        m_assist_calls=m_assist_calls,
     )
     return DiffResult(leads=tuple(leads), stats=stats)
-
-
-def run_diff(
-    db_a: Path | str,
-    db_b: Path | str,
-    axis: Axis,
-    router: _DiffRouter,
-    *,
-    max_assist: int = DEFAULT_MAX_ASSIST,
-) -> DiffResult:
-    """Locate and neutrally describe changes between two analysis databases.
-
-    axis (version | mod | sibling) is recorded as each lead's scope_origin; the real
-    pairing identity stays in the operator's external notes. Both DBs are read-only.
-    """
-    if axis not in get_args(Axis):
-        raise ValueError(f"axis must be one of {get_args(Axis)} (got {axis!r})")
-    return asyncio.run(_run_diff_async(db_a, db_b, axis, router, max_assist=max_assist))

@@ -37,6 +37,10 @@ class InstanceRow:
     sink_anchor: str | None = None
     source_run_id: str | None = None
     blocking_mechanism: str | None = None
+    # An exposure SHAPE (e.g. bare_sink = a raw command/format sink with no recognized in-function
+    # source), kept OUT of blocking_mechanism so a danger form is never read as a mitigation. NULL
+    # when no shape is flagged.
+    exposure_shape: str | None = None
     external_anchor: str | None = None
     fix_diff: str | None = None
     scope_origin: str | None = None
@@ -140,7 +144,8 @@ class PublicCvePatternRow:
 
     Agent-fillable, not sensitive, and NOT counted in barrier depth. ``pattern``/``source``/``sink``
     are free text — no structured match key is presumed. Physically separate from the private
-    exploited-hole ledger."""
+    exploited-hole ledger. ``origin`` marks the row as externally imported (not tmap deterministic
+    extraction) — always 'external_import'."""
 
     pattern: str
     cve_id: str | None = None
@@ -148,6 +153,7 @@ class PublicCvePatternRow:
     sink: str | None = None
     ref: str | None = None
     notes: str | None = None
+    origin: str = "external_import"
     id: int | None = None
     created_at: str | None = None
 

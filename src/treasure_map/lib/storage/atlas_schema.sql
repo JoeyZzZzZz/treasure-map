@@ -27,6 +27,10 @@ CREATE TABLE IF NOT EXISTS instance (
     reachability_status TEXT NOT NULL DEFAULT 'unknown'
         CHECK (reachability_status IN ('confirmed','blocked','unknown')),
     blocking_mechanism  TEXT,             -- categorical: char_filter/length_check/... NULL if none
+    -- exposure_shape is an exposure SHAPE (e.g. bare_sink = a raw command/format sink with no
+    --   recognized in-function source), NOT a blocking mechanism. Kept in its own column so a
+    --   consumer never reads a danger form as a mitigation. NULL when no shape is flagged.
+    exposure_shape      TEXT,
     provenance_level    TEXT NOT NULL DEFAULT 'L0'
         CHECK (provenance_level IN ('L0','L1','L2','L3')),
     external_anchor     TEXT,             -- external evidence authorizing L2/L3 (patch ref / CVE); NULL for L0/L1
@@ -228,6 +232,9 @@ CREATE INDEX IF NOT EXISTS idx_wff_run ON web_form_fields(source_run_id);
 -- in barrier depth (it is breadth/material, not a barrier). Not sensitive.
 -- pattern/source/sink are FREE TEXT — no structured match key is presumed (the fingerprint key is
 -- unproven; no fuzzy match is built here, only exact human-readable lookup).
+-- origin marks these rows as EXTERNALLY IMPORTED material, not tmap deterministic extraction — a
+-- machine-readable guard (on top of the physical table separation) so external/fuzzy-source rows can
+-- never be read as deterministic facts. Every import writes 'external_import'; CI asserts it.
 CREATE TABLE IF NOT EXISTS public_cve_pattern (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     cve_id      TEXT,                 -- the public CVE this form belongs to (many rows may share one)
@@ -236,6 +243,8 @@ CREATE TABLE IF NOT EXISTS public_cve_pattern (
     sink        TEXT,                 -- dangerous sink (system / popen / SQL / …)
     ref         TEXT,                 -- writeup / public source link
     notes       TEXT,
+    origin      TEXT NOT NULL DEFAULT 'external_import'  -- non-deterministic import provenance
+        CHECK (origin IN ('external_import')),
     created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 

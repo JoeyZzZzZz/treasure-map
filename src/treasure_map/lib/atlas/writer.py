@@ -237,8 +237,8 @@ def add_public_cve_patterns(
             skipped += 1
             continue
         conn.execute(
-            """INSERT INTO public_cve_pattern (cve_id, pattern, source, sink, ref, notes)
-               VALUES (?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO public_cve_pattern (cve_id, pattern, source, sink, ref, notes, origin)
+               VALUES (?, ?, ?, ?, ?, ?, 'external_import')""",
             (r.cve_id, r.pattern, r.source, r.sink, r.ref, r.notes),
         )
         inserted += 1
@@ -443,10 +443,10 @@ def add_instance(
     cur = conn.execute(
         """INSERT INTO instance
            (pattern_id, pseudocode_hash, source_anchor, sink_anchor, source_run_id,
-            reachability_status, blocking_mechanism, provenance_level, external_anchor,
-            fix_diff, scope_origin, evidence_ref, binary_path, binary_content_hash, origin,
-            is_thin_cmd_wrapper, wrapped_sink, flow_evidence)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            reachability_status, blocking_mechanism, exposure_shape, provenance_level,
+            external_anchor, fix_diff, scope_origin, evidence_ref, binary_path,
+            binary_content_hash, origin, is_thin_cmd_wrapper, wrapped_sink, flow_evidence)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             instance.pattern_id,
             instance.pseudocode_hash,
@@ -455,6 +455,7 @@ def add_instance(
             instance.source_run_id,
             instance.reachability_status,
             instance.blocking_mechanism,
+            instance.exposure_shape,
             instance.provenance_level,
             external_anchor,
             instance.fix_diff,
@@ -500,6 +501,7 @@ def add_instances(
             inst.source_run_id,
             inst.reachability_status,
             inst.blocking_mechanism,
+            inst.exposure_shape,
             inst.provenance_level,
             external_anchor,
             inst.fix_diff,
@@ -517,10 +519,10 @@ def add_instances(
     conn.executemany(
         """INSERT INTO instance
            (pattern_id, pseudocode_hash, source_anchor, sink_anchor, source_run_id,
-            reachability_status, blocking_mechanism, provenance_level, external_anchor,
-            fix_diff, scope_origin, evidence_ref, binary_path, binary_content_hash, origin,
-            is_thin_cmd_wrapper, wrapped_sink, flow_evidence)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            reachability_status, blocking_mechanism, exposure_shape, provenance_level,
+            external_anchor, fix_diff, scope_origin, evidence_ref, binary_path,
+            binary_content_hash, origin, is_thin_cmd_wrapper, wrapped_sink, flow_evidence)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         rows,
     )
 

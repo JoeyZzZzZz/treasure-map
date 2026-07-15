@@ -1087,7 +1087,10 @@ def test_bare_sink_no_source_is_listed_not_sunk(tmp_path: Path) -> None:
 
     rows = _by_anchor(atlas)
     assert "do_exec" in rows  # not silently dropped
-    assert rows["do_exec"]["blocking_mechanism"] == "bare_sink"
+    # bare_sink is a danger SHAPE, carried in exposure_shape — NOT in blocking_mechanism (a shape is
+    # not a mitigation). blocking_mechanism stays NULL so controllability still reads a live '?'.
+    assert rows["do_exec"]["exposure_shape"] == "bare_sink"
+    assert rows["do_exec"]["blocking_mechanism"] is None
     assert rows["do_exec"]["reachability_status"] != "blocked"  # listed, never graded blocked
     # the fix: a bare_sink is NOT provably-safe, so it is NOT sunk out of the first screen. Here the
     # bare argument is itself a caller-supplied param (a free source), so it stays fully active.
@@ -1204,7 +1207,8 @@ def test_thin_wrapper_fact_is_recorded_without_changing_score(tmp_path: Path) ->
     row = _by_anchor(atlas)["exec_sh"]
     assert row["is_thin_cmd_wrapper"] == 1
     assert row["wrapped_sink"] == "system"
-    assert row["blocking_mechanism"] == "bare_sink"  # unchanged by the fact
+    assert row["exposure_shape"] == "bare_sink"  # unchanged by the fact (a shape, not a filter)
+    assert row["blocking_mechanism"] is None
 
 
 def test_wrapper_fact_does_not_add_candidates(tmp_path: Path) -> None:
@@ -1590,7 +1594,8 @@ def test_wrapper_itself_kept_as_distinct_bare_sink_candidate(tmp_path: Path) -> 
     atlas = tmp_path / "atlas.db"
     run_analyzer2(db, atlas, source_run_id="run_c")
     rows = _by_anchor(atlas)
-    assert rows["do_cmd"]["blocking_mechanism"] == "bare_sink"
+    assert rows["do_cmd"]["exposure_shape"] == "bare_sink"
+    assert rows["do_cmd"]["blocking_mechanism"] is None
     assert rows["do_cmd"]["evidence_ref"].endswith("@cmd")
     assert rows["set_route"]["evidence_ref"].endswith("@cmd_via_wrapper")
     refs = [r["evidence_ref"] for r in _instances(atlas)]

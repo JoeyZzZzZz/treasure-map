@@ -16,27 +16,9 @@ import click
 
 if TYPE_CHECKING:
     from treasure_map.lib.atlas.models import RunRow
-    from treasure_map.lib.diff.matcher import _DiffRouter
-    from treasure_map.lib.llm.types import LLMResponse
     from treasure_map.lib.query import CandidateExplanation, TriageCandidate
 
 logger = logging.getLogger(__name__)
-
-
-class _StaticOnlyRouter:
-    """Router stand-in for ``--max-assist 0`` (pure static alignment).
-
-    With max_assist 0 the matcher runs exact + hash passes only (it never reaches the bounded
-    M-tier assist) and the differ skips the L-tier change description, so the diff makes no LLM
-    call and needs no API key. This object fills the diff primitive's router slot; reaching it
-    would be a logic error, hence the raise."""
-
-    async def call(
-        self, task: str, input_text: str, prompt: str, prompt_version: str
-    ) -> LLMResponse:
-        raise RuntimeError(
-            "--max-assist 0 runs pure static alignment and must not invoke the LLM router"
-        )
 
 
 def _echo_legal_notice(*, as_json: bool = False) -> None:
@@ -78,15 +60,6 @@ def _echo_legal_notice(*, as_json: bool = False) -> None:
     default=None,
     help="Atlas DB path (defaults to the configured atlas.db_path).",
 )
-@click.option(
-    "--max-assist",
-    "max_assist",
-    type=int,
-    default=None,
-    help="Ceiling on M-tier function-match-assist calls for the stripped/renamed residue "
-    "(degrade-and-flag above it; default 200). 0 = PURE STATIC alignment (exact + hash only): "
-    "no LLM call, no API key needed; the residue degrades to added/removed and is reported.",
-)
 def hunt_diff(
     db_a: Path,
     db_b: Path,
@@ -95,53 +68,28 @@ def hunt_diff(
     run_id_b: str,
     config: Path | None,
     atlas_path: Path | None,
-    max_assist: int | None,
 ) -> None:
     """Diff two analysis databases, grade reachability, and write neutral atlas instances.
 
-    The LLM is only a fallback for the residue the two deterministic passes (exact symbol, then
-    pseudocode hash) cannot align — it is NOT a hard gate. Symbol-complete builds align fully
-    statically: run with --max-assist 0 to skip the LLM entirely (no API key needed). Writes
+    Function alignment is fully deterministic (exact symbol, then pseudocode hash); the
+    stripped/renamed residue neither pass resolves surfaces honestly as added/removed. Writes
     graded leads at provenance L0/L1 only; public_finding is expected to be EMPTY in M2.
     """
     from treasure_map.lib.config.config import load_config
-    from treasure_map.lib.diff.differ import DEFAULT_MAX_ASSIST
     from treasure_map.lib.errors import TreasureMapError
     from treasure_map.lib.hunt import run_diff_analyzer
 
     cfg = load_config(config)
     resolved_atlas = atlas_path if atlas_path is not None else cfg.atlas.db_path
-    ledger_path = resolved_atlas.parent / "cost_ledger.json"
-    effective_max_assist = DEFAULT_MAX_ASSIST if max_assist is None else max_assist
 
-    router: _DiffRouter
     try:
-        if effective_max_assist <= 0:
-            # Pure static alignment: exact + hash only. No LLM call is made (the matcher never
-            # reaches the assist budget and the differ skips the L-tier description), so no key
-            # is required; the unmatched residue becomes added/removed and is reported.
-            router = _StaticOnlyRouter()
-        else:
-            from treasure_map.lib.llm.factory import build_router
-            from treasure_map.lib.llm.types import Tier
-
-            if cfg.llm is None:
-                raise click.ClickException(
-                    f"--max-assist {effective_max_assist} needs an M-tier key "
-                    "(function_match_assist for the stripped/renamed residue); "
-                    "or run with --max-assist 0 for pure static alignment (no key)."
-                )
-            router = build_router(cfg.llm, ledger_path, tiers=[Tier.M])
-
         stats = run_diff_analyzer(
             db_a,
             db_b,
             axis,  # type: ignore[arg-type]  # Click constrains to the Axis literals
             resolved_atlas,
-            router,
             run_id_a=run_id_a,
             run_id_b=run_id_b,
-            max_assist=effective_max_assist,
         )
     except TreasureMapError as exc:
         raise click.ClickException(f"{type(exc).__name__}: {exc}") from exc
@@ -380,6 +328,7 @@ def _render_triage(
                         "reachability_status": c.reachability_status,
                         "source_class": c.source_class,
                         "blocking_mechanism": c.blocking_mechanism,
+                        "exposure_shape": c.exposure_shape,
                         "origin": c.origin,
                         "source_run_id": c.source_run_id,
                         "evidence_ref": c.evidence_ref,
@@ -484,6 +433,7 @@ def _render_explain(ex: CandidateExplanation, *, as_json: bool) -> None:
                         "nvram_source_key": c.nvram_source_key,
                         "call_sequence_shape": ex.call_sequence_shape,
                         "blocking_mechanism": c.blocking_mechanism,
+                        "exposure_shape": c.exposure_shape,
                         "origin": c.origin,
                         "binary_path": c.binary_path,
                     },
@@ -522,6 +472,10 @@ def _render_explain(ex: CandidateExplanation, *, as_json: bool) -> None:
     click.echo("\nin-function dataflow & filter:")
     click.echo(f"  {_reachability_inline(c.reachability_status)}")
     click.echo(f"  filter: {c.blocking_mechanism or 'none identified'}")
+    if c.exposure_shape:
+        # A danger SHAPE (e.g. bare_sink), not a mitigation — shown on its own line so it is never
+        # read as a filter that blocks the value.
+        click.echo(f"  exposure shape: {c.exposure_shape} (danger form, not a mitigation)")
 
     if ex.sink_arg_provenance_summary:
         click.echo("\nsink-arg provenance (def-use; get_sink_provenance for full detail):")

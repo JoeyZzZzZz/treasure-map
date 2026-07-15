@@ -65,12 +65,10 @@ def _noop_prompt(msg: str) -> str:  # noqa: ARG001
 # ── _collect_default_env_vars ─────────────────────────────────────────────────
 
 
-def test_collect_default_env_vars_returns_unique_names() -> None:
-    names = _collect_default_env_vars()
-    assert "DEEPSEEK_API_KEY" in names
-    assert "ANTHROPIC_API_KEY" in names
-    # Each name appears exactly once
-    assert len(names) == len(set(names))
+def test_collect_default_env_vars_is_empty() -> None:
+    # The tool ships no built-in secrets — analysis is hermetic (no network calls), so there are no
+    # default API-key env vars to scaffold. The .env stays a bare operator-owned placeholder.
+    assert _collect_default_env_vars() == []
 
 
 # ── _provision_dirs ───────────────────────────────────────────────────────────
@@ -97,22 +95,18 @@ def test_write_config_creates_valid_yaml(fake_home: Path) -> None:
     config_path.parent.mkdir(parents=True, exist_ok=True)
     _write_config(config_path, force=False)
     data: dict[str, Any] = yaml.safe_load(config_path.read_text())
-    assert "llm" in data
+    assert "ghidra" in data
     assert "atlas" in data
     assert data["atlas"]["db_path"] == "~/.treasure-map/atlas.db"
 
 
-def test_write_config_no_api_key_values(fake_home: Path) -> None:
+def test_write_config_carries_no_secret_values(fake_home: Path) -> None:
     config_path = fake_home / ".treasure-map" / "config.yaml"
     config_path.parent.mkdir(parents=True, exist_ok=True)
     _write_config(config_path, force=False)
     content = config_path.read_text()
-    # Values like sk-... or actual secrets must not be present
-    assert "api_key_env" in content
-    # The file must not contain any inline key values (only env var names)
-    for line in content.splitlines():
-        if "api_key_env" in line:
-            assert "sk-" not in line
+    # The default config ships no secrets of any kind (no inline key values, no key placeholders).
+    assert "sk-" not in content
 
 
 def test_write_config_reuses_existing_without_force(fake_home: Path) -> None:
@@ -131,7 +125,8 @@ def test_write_config_force_overwrites(fake_home: Path) -> None:
     config_path.write_text("old: content\n")
     _write_config(config_path, force=True)
     data: dict[str, Any] = yaml.safe_load(config_path.read_text())
-    assert "llm" in data
+    assert "ghidra" in data
+    assert "old" not in data  # regenerated, not merged
 
 
 # ── _write_env ────────────────────────────────────────────────────────────────
@@ -284,82 +279,6 @@ def test_run_doctor_java_check_reflects_path(tmp_path: Path) -> None:
     java_check = next(c for c in checks if c[0] == "java")
     assert java_check[1] is True
     assert java_check[2] == "/usr/bin/java"
-
-
-def test_run_doctor_api_key_check_with_missing_key(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from treasure_map.lib.config.config import Config
-
-    monkeypatch.delenv("FAKE_API_KEY_TMTEST", raising=False)
-    cfg = Config.model_validate(
-        {
-            "llm": {
-                "tiers": {
-                    "S": {
-                        "provider": "test",
-                        "model": "t",
-                        "base_url": "http://x",
-                        "api_key_env": "FAKE_API_KEY_TMTEST",
-                    },
-                    "M": {
-                        "provider": "test",
-                        "model": "t",
-                        "base_url": "http://x",
-                        "api_key_env": "FAKE_API_KEY_TMTEST",
-                    },
-                    "L": {
-                        "provider": "test",
-                        "model": "t",
-                        "base_url": "http://x",
-                        "api_key_env": "FAKE_API_KEY_TMTEST",
-                    },
-                }
-            }
-        }
-    )
-    checks = _run_doctor(tmp_path, cfg)
-    key_checks = [c for c in checks if c[0].startswith("key:")]
-    assert len(key_checks) == 1  # deduplicated
-    assert key_checks[0][1] is False
-
-
-def test_run_doctor_api_key_check_green_when_set(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from treasure_map.lib.config.config import Config
-
-    monkeypatch.setenv("FAKE_API_KEY_TMTEST2", "present-value")
-    cfg = Config.model_validate(
-        {
-            "llm": {
-                "tiers": {
-                    "S": {
-                        "provider": "test",
-                        "model": "t",
-                        "base_url": "http://x",
-                        "api_key_env": "FAKE_API_KEY_TMTEST2",
-                    },
-                    "M": {
-                        "provider": "test",
-                        "model": "t",
-                        "base_url": "http://x",
-                        "api_key_env": "FAKE_API_KEY_TMTEST2",
-                    },
-                    "L": {
-                        "provider": "test",
-                        "model": "t",
-                        "base_url": "http://x",
-                        "api_key_env": "FAKE_API_KEY_TMTEST2",
-                    },
-                }
-            }
-        }
-    )
-    checks = _run_doctor(tmp_path, cfg)
-    key_checks = [c for c in checks if c[0].startswith("key:")]
-    assert len(key_checks) == 1
-    assert key_checks[0][1] is True
 
 
 # ── run_init — Ghidra configuration step (R0-fix) ─────────────────────────────

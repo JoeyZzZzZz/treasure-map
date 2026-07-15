@@ -65,7 +65,6 @@ class DiffStats:
     changed: int  # both sides have a body and the bodies differ (the main signal)
     changed_unverifiable: int  # exactly one side has a body — flagged, not described
     skipped_no_body: int  # neither side has a body (both timed out) — not a change, dropped
-    m_assist_calls: int  # M-tier function_match_assist calls actually made
 
 
 @dataclass(frozen=True)

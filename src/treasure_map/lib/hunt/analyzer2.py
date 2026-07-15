@@ -668,12 +668,16 @@ def run_analyzer2(
                 # Recall fallback: a bare sink with no recognized in-function source (and no
                 # constructed shell command — cmd_injection_shape is exempt; its shell-ish literal
                 # is signal enough that the value may be caller-supplied) is listed but ranked low.
+                # bare_sink is an exposure SHAPE (a danger signal), NOT a blocking mechanism — it
+                # goes in exposure_shape, not blocking_mechanism, so a consumer never reads a danger
+                # shape as a mitigation. blocking stays None, so controllability still reads '?'.
+                exposure_shape: str | None = None
                 if (
                     blocking is None
                     and match.source_class == "unknown"
                     and match.pattern_kind != "cmd_injection_shape"
                 ):
-                    blocking = "bare_sink"
+                    exposure_shape = "bare_sink"
 
                 # Neutral STRUCTURAL fact about the function this candidate lives in: is it a thin
                 # wrapper that forwards a parameter straight to a shell command sink, and to which
@@ -776,6 +780,7 @@ def run_analyzer2(
                         source_run_id=source_run_id,
                         reachability_status=status,
                         blocking_mechanism=blocking,
+                        exposure_shape=exposure_shape,
                         provenance_level=provenance,
                         # Neutral per-instance locator = run + function + sink-class hit. One
                         # function can match multiple sinks (e.g. cmd and copy); each is a
