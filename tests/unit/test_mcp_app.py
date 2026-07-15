@@ -37,6 +37,7 @@ _EXPECTED_TOOLS = {
     "explain_candidate",
     "get_sink_provenance",
     "get_nvram_key_flow",
+    "get_string_keyed_edges",
     "cross_firmware_patterns",
     "pattern_density",
     "pattern_twins",

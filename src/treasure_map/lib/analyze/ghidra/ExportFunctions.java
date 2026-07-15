@@ -311,6 +311,273 @@ public class ExportFunctions extends GhidraScript {
         return arr.toString();
     }
 
+    // ============ string-keyed edges (detector B: strcmp-ladder dispatch enumeration) ============
+    // For each same-variable strcmp/strncmp/strcasecmp ladder in this function, enumerate the edge
+    // key -> {direct callees gated by strcmp(var, key)==0}. A DETERMINISTIC EDGE FACT, never a
+    // reachability verdict (the reachability layer keeps a candidate that is an edge callee at
+    // 'unknown'; the key is a lead the agent confirms). Works over the P-Code AST, so a decompiler
+    // that wraps a strcmp across several lines is still ONE CALL op (no text-regex miss), and reuses
+    // the SAME CHK dominance as sink_provenance: a callee is attributed to a key ONLY when the key's
+    // matched block dominates it — so it executes ONLY when that key matched (sound, no cross-key
+    // contamination). Never picks a "real" handler: every dominated callee is emitted; the agent
+    // filters. Low-signal (a lone key on a variable) is not dropped — ladder_size flags it.
+    private static final Set<String> STRCMP = new HashSet<>(Arrays.asList(
+        "strcmp", "strncmp", "strcasecmp", "strncasecmp"));
+
+    // A raw strcmp comparison recovered from the ladder, before ladder_size is known.
+    private static final class StrEdge {
+        String key, varId, gateApi, gateAddr;
+        PcodeBlockBasic matched;   // block entered when strcmp(var,key)==0; null = gate unresolved
+    }
+
+    private String buildStringKeyedEdges(HighFunction hf) {
+        List<PcodeOpAST> ops = new ArrayList<>();
+        Iterator<PcodeOpAST> it = hf.getPcodeOps();
+        while (it.hasNext()) ops.add(it.next());
+
+        // Function-region completeness: an indirect branch (jump table / switch) is a dispatch shape
+        // this detector does NOT parse, so the region may hold undetected edges — mark it incomplete
+        // (a cross-version diff then reads an edge delta in this region as undetermined, not real).
+        boolean hasBranchInd = false;
+        List<PcodeOpAST> calls = new ArrayList<>();
+        for (PcodeOpAST op : ops) {
+            int oc = op.getOpcode();
+            if (oc == PcodeOp.BRANCHIND) hasBranchInd = true;
+            if (oc == PcodeOp.CALL || oc == PcodeOp.CALLIND) calls.add(op);
+        }
+
+        DomCtx dom = new DomCtx(hf);
+        List<StrEdge> edges = new ArrayList<>();
+        for (PcodeOpAST op : ops) {
+            int oc = op.getOpcode();
+            if (oc != PcodeOp.CALL && oc != PcodeOp.CALLIND) continue;
+            String cn = calleeNameOf(op);
+            if (cn == null || !STRCMP.contains(cn)) continue;
+            if (op.getNumInputs() < 3) continue;            // input 0 = target; 1,2 = the compared args
+            Varnode a = op.getInput(1), b = op.getInput(2);
+            String ka = constStrOf(a, 0), kb = constStrOf(b, 0);
+            String key; Varnode var;
+            if (ka != null && kb == null) { key = ka; var = b; }
+            else if (kb != null && ka == null) { key = kb; var = a; }
+            else continue;   // both constant or neither: not a variable-vs-constant dispatch strcmp
+            String varId = stackKey(var);
+            if (varId == null) varId = highId(var);
+            StrEdge e = new StrEdge();
+            e.key = key; e.varId = (varId != null ? varId : "?");
+            e.gateApi = cn; e.gateAddr = addr0x(op);
+            e.matched = matchedBlockForZero(op.getOutput(), ops);
+            edges.add(e);
+        }
+        if (edges.isEmpty()) {
+            // Still report the region completeness so a diff sees it was scanned (and whether a
+            // switch was present) even with zero strcmp edges.
+            return "{\"edges\":[]" + funcCompletenessJson(hf, hasBranchInd) + "}";
+        }
+
+        // ladder_size = distinct keys compared against the SAME variable (the dispatch-vs-noise
+        // structural signal — a lone key is low-signal but NOT dropped, only flagged by ladder_size).
+        Map<String, Set<String>> keysByVar = new HashMap<>();
+        for (StrEdge e : edges) keysByVar.computeIfAbsent(e.varId, k -> new HashSet<>()).add(e.key);
+
+        StringBuilder arr = new StringBuilder("{\"edges\":[");
+        boolean first = true;
+        for (StrEdge e : edges) {
+            int ladder = keysByVar.get(e.varId).size();
+            if (!first) arr.append(",");
+            first = false;
+            arr.append("{\"key\":\"").append(esc(e.key)).append("\"")
+               .append(",\"mechanism\":\"strcmp_gate\"")
+               .append(",\"gate_api\":\"").append(esc(e.gateApi)).append("\"")
+               .append(",\"gate_addr\":\"").append(esc(e.gateAddr)).append("\"")
+               .append(",\"var_id\":\"").append(esc(e.varId)).append("\"")
+               .append(",\"ladder_size\":").append(ladder);
+            if (e.matched == null) {
+                // The gate branch could not be resolved (an unmodeled boolean chain): a PARTIAL edge
+                // — the key is seen, the callee set is unknown (never a silently empty complete edge).
+                arr.append(",\"callees\":[],\"completeness\":{\"status\":\"partial\",")
+                   .append("\"reason\":\"gate_branch_unresolved\"}");
+            } else {
+                arr.append(",\"callees\":[");
+                appendGatedCallees(arr, e.matched, calls, dom);
+                arr.append("],\"completeness\":{\"status\":\"complete\"}");
+            }
+            arr.append("}");
+        }
+        arr.append("]").append(funcCompletenessJson(hf, hasBranchInd)).append("}");
+        return arr.toString();
+    }
+
+    // The block entered when strcmp(var,key)==0. Trace the strcmp return through its ==0 test (or a
+    // short-circuit / BOOL_OR ladder guard) to the CBRANCH, then pick the true/false successor by the
+    // recovered polarity. Returns null when the gate structure is not one of the modeled shapes.
+    private PcodeBlockBasic matchedBlockForZero(Varnode strcmpOut, List<PcodeOpAST> ops) {
+        if (strcmpOut == null) return null;
+        for (PcodeOpAST op : ops) {
+            if (op.getOpcode() != PcodeOp.CBRANCH) continue;
+            Varnode cond = op.getNumInputs() > 1 ? op.getInput(1) : null;
+            if (cond == null) continue;
+            Boolean trueMeansZero = polarityToZero(cond, strcmpOut, 0);
+            if (trueMeansZero == null) continue;
+            PcodeBlock parent = op.getParent();
+            if (parent == null) return null;
+            PcodeBlock target = trueMeansZero ? parent.getTrueOut() : parent.getFalseOut();
+            return (target instanceof PcodeBlockBasic) ? (PcodeBlockBasic) target : null;
+        }
+        return null;
+    }
+
+    // Does "cond is nonzero" mean strcmp==0 (TRUE), strcmp!=0 (FALSE), or is cond unrelated (null)?
+    //   if (strcmp(...))            -> cond IS the strcmp result: nonzero == strcmp!=0 -> FALSE
+    //   if (strcmp(...) == 0)       -> INT_EQUAL(strcmp,0): nonzero == strcmp==0       -> TRUE
+    //   if (strcmp(...) != 0)       -> INT_NOTEQUAL(strcmp,0)                          -> FALSE
+    //   !cond                       -> BOOL_NEGATE flips the inner polarity
+    //   strcmp(a)==0 || strcmp(b)==0 -> BOOL_OR: if EITHER arm is ==0 to this strcmp, matched=TRUE
+    private Boolean polarityToZero(Varnode cond, Varnode strcmpOut, int depth) {
+        if (cond == null || depth > 8) return null;
+        if (sameVarnode(cond, strcmpOut)) return Boolean.FALSE;
+        PcodeOp def = cond.getDef();
+        if (def == null) return null;
+        switch (def.getOpcode()) {
+            case PcodeOp.COPY:
+            case PcodeOp.CAST:
+            case PcodeOp.INT_ZEXT:
+            case PcodeOp.INT_SEXT:
+            case PcodeOp.SUBPIECE:
+                return polarityToZero(def.getInput(0), strcmpOut, depth + 1);
+            case PcodeOp.BOOL_NEGATE: {
+                Boolean inner = polarityToZero(def.getInput(0), strcmpOut, depth + 1);
+                return inner == null ? null : !inner;
+            }
+            case PcodeOp.BOOL_OR: {
+                Boolean l = polarityToZero(def.getInput(0), strcmpOut, depth + 1);
+                Boolean r = polarityToZero(def.getInput(1), strcmpOut, depth + 1);
+                // OR-fused guard: strcmp==0 on either arm still routes to the true successor.
+                return (Boolean.TRUE.equals(l) || Boolean.TRUE.equals(r)) ? Boolean.TRUE : null;
+            }
+            case PcodeOp.INT_EQUAL:
+            case PcodeOp.INT_NOTEQUAL: {
+                Varnode x = def.getInput(0), y = def.getInput(1);
+                boolean xIsCmp = relatesTo(x, strcmpOut, 0);
+                boolean yIsCmp = relatesTo(y, strcmpOut, 0);
+                Varnode other = xIsCmp ? y : (yIsCmp ? x : null);
+                if (other == null || !isConstZero(other)) return null;  // only compared-to-zero
+                return def.getOpcode() == PcodeOp.INT_EQUAL ? Boolean.TRUE : Boolean.FALSE;
+            }
+            default:
+                return null;
+        }
+    }
+
+    private boolean relatesTo(Varnode v, Varnode target, int depth) {
+        if (v == null || depth > 8) return false;
+        if (sameVarnode(v, target)) return true;
+        PcodeOp def = v.getDef();
+        if (def == null) return false;
+        switch (def.getOpcode()) {
+            case PcodeOp.COPY:
+            case PcodeOp.CAST:
+            case PcodeOp.INT_ZEXT:
+            case PcodeOp.INT_SEXT:
+            case PcodeOp.SUBPIECE:
+                return relatesTo(def.getInput(0), target, depth + 1);
+            default:
+                return false;
+        }
+    }
+
+    private boolean sameVarnode(Varnode a, Varnode b) {
+        return a != null && b != null && a.equals(b);
+    }
+
+    private boolean isConstZero(Varnode v) {
+        return v != null && v.isConstant() && v.getOffset() == 0;
+    }
+
+    // Emit the direct callees gated by the matched block: a CALL is attributed to this key ONLY when
+    // the matched block dominates the CALL's block (it executes only if the key matched). The
+    // recognized gate primitives (strcmp family) are excluded — they are structural gates, never
+    // handlers. Each callee is a BinDiff-alignable anchor (name + entry addr + kind), deduped.
+    private void appendGatedCallees(StringBuilder sb, PcodeBlockBasic matched,
+                                    List<PcodeOpAST> calls, DomCtx dom) {
+        int mIdx = matched.getIndex();
+        Set<String> seen = new HashSet<>();
+        boolean first = true;
+        for (PcodeOpAST c : calls) {
+            String cn = calleeNameOf(c);
+            if (cn == null || STRCMP.contains(cn)) continue;
+            PcodeBlock pb = c.getParent();
+            if (!(pb instanceof PcodeBlockBasic)) continue;
+            if (!dom.dominatorsOf((PcodeBlockBasic) pb).contains(mIdx)) continue;
+            String[] anchor = calleeAnchor(c);
+            if (anchor == null) continue;
+            if (!seen.add(anchor[0] + "@" + anchor[1])) continue;
+            if (!first) sb.append(",");
+            first = false;
+            sb.append("{\"name\":\"").append(esc(anchor[0]))
+              .append("\",\"addr\":\"").append(esc(anchor[1]))
+              .append("\",\"kind\":\"").append(esc(anchor[2])).append("\"}");
+        }
+    }
+
+    // Resolve a CALL's target to a {name, entry-addr (0x…), kind} BinDiff-alignable anchor. The entry
+    // address (not the call-site) is what a cross-version function alignment maps, so a bare address
+    // that drifts across a recompile is never the sole handle.
+    private String[] calleeAnchor(PcodeOp call) {
+        Varnode t = call.getInput(0);
+        if (t == null) return null;
+        Address to = null;
+        if (t.isConstant() && t.getOffset() != 0) {
+            try { to = toAddr(t.getOffset()); } catch (Exception e) { to = null; }
+        } else if (t.isAddress()) {
+            to = t.getAddress();
+        }
+        if (to == null) return null;
+        FunctionManager fm = currentProgram.getFunctionManager();
+        Function f = fm.getFunctionAt(to);
+        if (f != null) {
+            if (f.isThunk()) {
+                Function th = f.getThunkedFunction(true);
+                if (th != null)
+                    return new String[]{ th.getName(),
+                        "0x" + Long.toHexString(th.getEntryPoint().getOffset()), "thunk" };
+            }
+            String kind = (call.getOpcode() == PcodeOp.CALLIND) ? "indirect" : "direct";
+            return new String[]{ f.getName(),
+                "0x" + Long.toHexString(f.getEntryPoint().getOffset()), kind };
+        }
+        Symbol s = currentProgram.getSymbolTable().getPrimarySymbol(to);
+        if (s != null)
+            return new String[]{ s.getName(), "0x" + Long.toHexString(to.getOffset()), "ptr" };
+        return null;
+    }
+
+    // A stable variable identity when stackKey() cannot key it (a register/param dispatch variable):
+    // the HighVariable symbol name, else the varnode's storage. Only used to GROUP a ladder (compute
+    // ladder_size) — not a cross-function key.
+    private String highId(Varnode v) {
+        if (v == null) return null;
+        HighVariable hv = v.getHigh();
+        if (hv != null) {
+            HighSymbol hs = hv.getSymbol();
+            if (hs != null && hs.getName() != null && !hs.getName().isEmpty())
+                return "hv:" + hs.getName();
+        }
+        Address a = v.getAddress();
+        return (a != null) ? ("vn:" + a.toString() + ":" + v.getSize()) : null;
+    }
+
+    private String funcCompletenessJson(HighFunction hf, boolean hasBranchInd) {
+        String scope = "?";
+        try {
+            scope = hf.getFunction().getName() + "@" + hf.getFunction().getEntryPoint().toString();
+        } catch (Exception ignore) {}
+        if (hasBranchInd) {
+            return ",\"completeness\":{\"status\":\"incomplete\",\"reason\":"
+                 + "\"switch_form_unrecognized\",\"scope\":\"" + esc(scope) + "\"}";
+        }
+        return ",\"completeness\":{\"status\":\"complete\",\"scope\":\"" + esc(scope) + "\"}";
+    }
+
     // gap② A2: recognize a THIN nvram wrapper — a function whose sole job is to forward a
     // caller-supplied key into ONE nvram accessor (so phase-1 records that key as key_from_caller
     // and the direct key graph misses the wrapper's callers). Conservative by construction, because
@@ -1219,6 +1486,15 @@ public class ExportFunctions extends GhidraScript {
                 nvramOps = "[]";
             }
 
+            // detector B: string-keyed edges (strcmp-ladder dispatch). Additive, isolated fact
+            // enumeration; a failure here just yields no edges, never breaking the scan.
+            String strKeyedEdges = "{\"edges\":[]}";
+            try {
+                if (hf != null) strKeyedEdges = buildStringKeyedEdges(hf);
+            } catch (Throwable ignore) {
+                strKeyedEdges = "{\"edges\":[]}";
+            }
+
             // gap② A2: thin-nvram-wrapper flag + its callers' resolved literal keys. Additive and
             // isolated — a wrapper edge is recovered cross-function at hunt time; a failure here
             // just yields no wrapper data, never breaking the scan (honesty > coverage).
@@ -1248,6 +1524,7 @@ public class ExportFunctions extends GhidraScript {
                      .append(nvramWrapper)       // ",\"nvram_wrapper\":{...}" or ""
                      .append(wrapperCallArgs)    // ",\"wrapper_call_args\":[...]"
                      .append(",")
+                     .append("\"string_keyed_edges\":").append(strKeyedEdges).append(",")
                      .append("\"pseudocode\":")  .append("\"").append(esc(pseudocode)).append("\"")
                      .append("}");
             funcCount++;

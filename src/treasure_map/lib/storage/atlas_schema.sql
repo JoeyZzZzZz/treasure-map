@@ -223,6 +223,59 @@ CREATE TABLE IF NOT EXISTS web_form_fields (
 CREATE INDEX IF NOT EXISTS idx_wff_key ON web_form_fields(field_keyword);
 CREATE INDEX IF NOT EXISTS idx_wff_run ON web_form_fields(source_run_id);
 
+-- string_keyed_edge: a deterministic "string-keyed edge" fact — a string key (attacker-influenceable)
+-- gates or dispatches to a set of callees, recovered structurally (NOT a per-firmware handler name).
+-- One ROW per (key, callee) so the reachability layer can look up "is this function a callee of some
+-- edge?" by callee_name, and a cross-version diff can enumerate by run + align by key. mechanism
+-- distinguishes the recovering detector (strcmp_gate = a same-variable strcmp ladder; static_string_table
+-- = a {string_ptr, func_ptr} data-segment table). ★ IRON LAW: this is an ENUMERATED EDGE (a fact),
+-- NEVER a reachability verdict — a candidate that is an edge callee stays reachability=unknown (the
+-- key is a lead the agent confirms). callee_addr + callee_name + callee_kind together are the
+-- BinDiff-alignable anchor (a bare address drifts across a recompile). completeness is FINE-GRAINED
+-- (status + reason + scope) so a diff can tell "this region was incomplete on one side" from "a real
+-- edge delta". Flattened from analysis.db (functions.string_keyed_edges) at hunt time, replace-by-run.
+CREATE TABLE IF NOT EXISTS string_keyed_edge (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_run_id       TEXT,
+    binary              TEXT,
+    from_function       TEXT,   -- the dispatcher/table function (strcmp ladder) or NULL (static table)
+    from_func_addr      TEXT,
+    key                 TEXT,   -- the gating string (strcmp constant) or table entry name
+    mechanism           TEXT NOT NULL DEFAULT 'strcmp_gate'
+        CHECK (mechanism IN ('strcmp_gate','static_string_table')),
+    callee_name         TEXT,   -- BinDiff-alignable anchor: Ghidra name + addr + kind (NOT bare addr)
+    callee_addr         TEXT,
+    callee_kind         TEXT,   -- direct / thunk / ptr / pcode / static_ptr
+    ladder_size         INTEGER,  -- strcmp_gate: distinct keys gated on the same variable; NULL for A
+    table_addr          TEXT,     -- static_string_table: the table's base address; NULL for B
+    completeness_status TEXT NOT NULL DEFAULT 'complete'
+        CHECK (completeness_status IN ('complete','incomplete','partial')),
+    completeness_reason TEXT,   -- switch_form_unrecognized / gate_branch_unresolved / got_relative_table_skipped / …
+    completeness_scope  TEXT,   -- function@addr or region id, so a diff can match by region
+    created_at          DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_ske_key    ON string_keyed_edge(key);
+CREATE INDEX IF NOT EXISTS idx_ske_run    ON string_keyed_edge(source_run_id);
+CREATE INDEX IF NOT EXISTS idx_ske_callee ON string_keyed_edge(callee_name);
+CREATE INDEX IF NOT EXISTS idx_ske_from   ON string_keyed_edge(from_function);
+
+-- run_capability: a per-run capability registry — the deterministic fact that a given tmap version's
+-- scan/hunt produced a given analysis sub-dimension. present=1 is registered UNCONDITIONALLY when the
+-- detector code runs (absence-of-findings ≠ absence-of-capability), so a cross-version diff iterates
+-- capabilities instead of hardcoding sub-dimension names, and treats an edge delta as undetermined
+-- when one side lacks the capability. Replace-by-run at hunt time. CI-assertable.
+CREATE TABLE IF NOT EXISTS run_capability (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id       TEXT,
+    capability   TEXT,      -- e.g. 'reachability.string_keyed_edge'
+    present      INTEGER NOT NULL DEFAULT 1 CHECK (present IN (0,1)),
+    created_at   DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_runcap_run ON run_capability(run_id);
+CREATE INDEX IF NOT EXISTS idx_runcap_cap ON run_capability(capability);
+
 -- exploit-barrier buckets — the two are PHYSICALLY SEPARATE tables on purpose (not one table + a
 -- source column). They differ in sensitivity, who can produce them, and whether they count toward
 -- barrier depth; the split makes those three un-mixable at the storage layer (a public row can never

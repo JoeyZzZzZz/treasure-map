@@ -20,6 +20,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **String-keyed edges exposed (detector B: strcmp-ladder dispatch).** A string-keyed edge is a
+  deterministic fact — an attacker-influenceable string key gates or dispatches to a set of callees.
+  A new Ghidra P-Code detector enumerates each same-variable `strcmp`/`strncmp`/`strcasecmp` ladder
+  (multi-line strcmp is one CALL op, so decompiler line-wrapping never hides it), attributes callees
+  to a key by CHK dominance (a callee is the key's only when the key's matched block dominates it —
+  sound, no cross-key contamination), and records `ladder_size`, the callee anchor (`{name, addr,
+  kind}`, BinDiff-alignable), and fine-grained completeness (a per-edge `gate_branch_unresolved` →
+  `partial`; an unrecognized switch region → `incomplete`). Facts land in a new cross-run
+  `string_keyed_edge` atlas table (one row per `(key, callee)`; a key whose gate resolved no callee
+  keeps a callee-less lead row, never dropped) plus a `run_capability` registry that records the
+  detector ran even when it found zero edges (absence-of-findings ≠ absence-of-capability). Read via
+  the `get_string_keyed_edges` MCP tool (by run / binary / key / callee / from_function) and, on the
+  reachability layer, as a key lead appended to a candidate's note. **★ IRON LAW: these are
+  ENUMERATED edges, never a reachability verdict — a candidate that is an edge callee stays
+  `reachability=unknown`; the key is a lead the agent confirms.**
 - **`public_cve_pattern.origin` provenance guard.** Every externally imported CVE-pattern row is
   now tagged `origin='external_import'` — a machine-readable guard (on top of the existing physical
   table separation) so external/agent-imported material can never be read as deterministic tmap

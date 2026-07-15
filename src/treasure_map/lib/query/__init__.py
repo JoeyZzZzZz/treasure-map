@@ -20,6 +20,10 @@ from treasure_map.lib.query.sink_impact import (
     impact_tier,
     parse_impact_order,
 )
+from treasure_map.lib.query.string_edges import (
+    edges_reaching_callee,
+    get_string_keyed_edges,
+)
 from treasure_map.lib.query.triage import (
     DEFAULT_LENS_LABEL,
     PHASE1_CAVEATS,
@@ -71,7 +75,9 @@ __all__ = [
     "canonical_view",
     "density",
     "dormant",
+    "edges_reaching_callee",
     "explain_candidate",
+    "get_string_keyed_edges",
     "filter_by_dimension",
     "filter_candidates",
     "filter_match_count",

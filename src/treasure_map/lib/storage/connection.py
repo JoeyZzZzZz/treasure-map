@@ -56,6 +56,9 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # NULL/'[]' on older DBs (no wrapper data until re-scan). Must match schema.sql.
     ("functions", "nvram_wrapper", "TEXT"),
     ("functions", "wrapper_call_args", "TEXT DEFAULT '[]'"),
+    # string-keyed-edge transport (detector B: same-variable strcmp ladder → {key, callees}).
+    # Back-fills '{}' on older DBs (no edges until re-scan). Must match schema.sql.
+    ("functions", "string_keyed_edges", "TEXT DEFAULT '{}'"),
 )
 
 

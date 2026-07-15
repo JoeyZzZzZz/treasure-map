@@ -171,3 +171,45 @@ class WebFormFieldRow:
     source_rule: str | None = None
     id: int | None = None
     created_at: str | None = None
+
+
+@dataclass(frozen=True)
+class StringKeyedEdgeRow:
+    """Mirrors one string_keyed_edge row: ONE (key, callee) of an enumerated string-keyed edge.
+
+    An attacker-influenceable string ``key`` gates/dispatches to ``callee_name`` — a deterministic
+    fact recovered structurally (strcmp ladder or a {string, func_ptr} table), NEVER a reachability
+    verdict. callee_name + callee_addr + callee_kind are the BinDiff-alignable anchor (a bare addr
+    drifts across a recompile). ``completeness`` is fine-grained so a cross-version diff tells an
+    incomplete scan region from a real edge delta. One flattened row per (key, callee)."""
+
+    source_run_id: str | None
+    binary: str | None
+    from_function: str | None
+    key: str | None
+    mechanism: str  # 'strcmp_gate' | 'static_string_table'
+    callee_name: str | None = None
+    callee_addr: str | None = None
+    callee_kind: str | None = None
+    from_func_addr: str | None = None
+    ladder_size: int | None = None
+    table_addr: str | None = None
+    completeness_status: str = "complete"
+    completeness_reason: str | None = None
+    completeness_scope: str | None = None
+    id: int | None = None
+    created_at: str | None = None
+
+
+@dataclass(frozen=True)
+class RunCapabilityRow:
+    """Mirrors one run_capability row: the deterministic fact that a run produced a given analysis
+    sub-dimension (e.g. 'reachability.string_keyed_edge'). present=1 is registered UNCONDITIONALLY
+    when the detector code runs — absence-of-findings is not absence-of-capability — so a diff can
+    iterate capabilities instead of hardcoding sub-dimension names."""
+
+    run_id: str | None
+    capability: str
+    present: int = 1
+    id: int | None = None
+    created_at: str | None = None

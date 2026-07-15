@@ -67,6 +67,10 @@ CREATE TABLE IF NOT EXISTS functions (
     -- gap② A2: JSON [{callee,key,key_kind}] — calls to a local function passing a CONSTANT literal
     -- as arg0. Resolved against nvram_wrapper cross-function at hunt time into wrapper-indirect edges.
     wrapper_call_args TEXT DEFAULT '[]',
+    -- string-keyed edges: JSON {edges:[{key,mechanism,callees:[{name,addr,kind}],...}],completeness}
+    -- recovered from a same-variable strcmp ladder in this function (detector B). TRANSPORT column,
+    -- flattened into the atlas string_keyed_edge table at hunt time. Empty '{}' when none.
+    string_keyed_edges TEXT DEFAULT '{}',
     FOREIGN KEY(binary_id) REFERENCES binaries(id) ON DELETE CASCADE
 );
 

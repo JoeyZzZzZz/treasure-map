@@ -941,3 +941,48 @@ def test_proven_controllable_not_regressed_by_likely_tier(tmp_path: Path) -> Non
     c = _find(triage(open_atlas(tmp_path / "atlas.db")), ref)
     d = c.dim("controllability")
     assert (d.state, d.value) == ("proven", "controllable")  # proven wins over likely
+
+
+# ── detector B iron law: a string-keyed edge is a KEY LEAD, never a reachability grant ──
+
+
+def test_string_keyed_edge_never_flips_reachability_to_proven() -> None:
+    # ★ THE IRON LAW, asserted directly on the dimension: a detected string-keyed edge (this
+    # function is a dispatch callee) is a KEY LEAD, never a reachability verdict. With NO entry
+    # reference, reachability STAYS unknown even when an edge points at the function — tmap
+    # ENUMERATES the edge (a fact); the agent JUDGES reachability. Neutral key only.
+    from treasure_map.lib.query.triage import _dim_reachability
+
+    edge = {
+        "key": "oauth_auth_code",
+        "from_function": "handle_dispatch",
+        "mechanism": "strcmp_gate",
+    }
+    d = _dim_reachability("unknown", (), (edge,))
+    assert d.state == "unknown"  # NOT proven / reachable — the edge does not grant reach
+    assert d.value == "unknown"
+    assert "oauth_auth_code" in d.note  # the key lead is surfaced for the agent
+    assert "STAYS unknown" in d.note  # explicit: enumerated edge, not a reachability judgement
+
+
+def test_string_keyed_edge_note_rides_on_proven_entry_without_causing_it() -> None:
+    # When an entry reference already makes reachability 'proven' (the ENTRY reason), the edge lead
+    # still rides in the note — but the edge did NOT cause the proven state (entry sourced it).
+    from treasure_map.lib.query.triage import _dim_reachability
+
+    edge = {"key": "reboot", "from_function": "router", "mechanism": "strcmp_gate"}
+    d = _dim_reachability("entry:web", ("Form.asp",), (edge,))
+    assert (d.state, d.value) == (
+        "proven",
+        "entry:web",
+    )  # from the entry ref, unchanged by the edge
+    assert "reboot" in d.note  # the edge lead still surfaces
+
+
+def test_no_string_keyed_edge_leaves_reachability_note_edge_free() -> None:
+    # The annotation is purely ADDITIVE: with no edge, no edge note is appended.
+    from treasure_map.lib.query.triage import _dim_reachability
+
+    d = _dim_reachability("unknown", (), ())
+    assert d.state == "unknown"
+    assert "STRING-KEYED EDGE" not in d.note

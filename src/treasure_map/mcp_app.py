@@ -53,6 +53,7 @@ from treasure_map.lib.query import filter_match_count as _filter_match_count
 from treasure_map.lib.query import get_nvram_key_flow as _get_nvram_key_flow
 from treasure_map.lib.query import get_run as _get_run
 from treasure_map.lib.query import get_sink_provenance as _get_sink_provenance
+from treasure_map.lib.query import get_string_keyed_edges as _get_string_keyed_edges
 from treasure_map.lib.query import ledger as _ledger
 from treasure_map.lib.query import list_cve_patterns as _list_cve_patterns
 from treasure_map.lib.query import list_moat as _list_moat
@@ -800,6 +801,42 @@ def make_tools(
         result["note"] = _DERIVED_SIGNAL_NOTE
         return result
 
+    def get_string_keyed_edges(
+        binary: str | None = None,
+        key: str | None = None,
+        callee: str | None = None,
+        from_function: str | None = None,
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Enumerate STRING-KEYED EDGES — an attacker-influenceable string key gates/dispatches to a
+        callee, recovered structurally (a same-variable strcmp ladder, or a {string, func_ptr}
+        table). Answers "what does string key X reach?" and "is function Y reached via a string-key
+        dispatch?" from a table instead of hand-tracing an empty-xref dispatcher.
+
+        Filter by any of: ``key`` (the gating string), ``callee`` (a Ghidra function name — find
+        the edges that dispatch to it), ``from_function`` (the dispatcher), ``binary``, ``run_id``.
+        Each edge carries the callee anchor (name + addr + kind — alignable across a recompile, not
+        a bare address), ``ladder_size`` / ``table_addr``, and a fine-grained ``completeness`` (an
+        incomplete region — e.g. an unparsed switch — means undetected edges may exist there).
+
+        ★ These are ENUMERATED FACTS, NOT a reachability verdict: a candidate that is an edge callee
+        stays reachability=unknown — the key is a lead you confirm, tmap does not judge whether the
+        input actually arrives. Empty is NOT proof of unreachability (most functions are simply not
+        string-key-dispatched)."""
+        conn = open_atlas(atlas_path)
+        try:
+            result = _get_string_keyed_edges(
+                conn,
+                run_id=run_id,
+                binary=binary,
+                key=key,
+                callee=callee,
+                from_function=from_function,
+            )
+        finally:
+            conn.close()
+        return result
+
     def get_pseudocode(
         function: str | None = None,
         binary: str | None = None,
@@ -1119,6 +1156,7 @@ def make_tools(
         "explain_candidate": explain_candidate,
         "get_sink_provenance": get_sink_provenance,
         "get_nvram_key_flow": get_nvram_key_flow,
+        "get_string_keyed_edges": get_string_keyed_edges,
         "cross_firmware_patterns": cross_firmware_patterns,
         "pattern_density": pattern_density,
         "pattern_twins": pattern_twins,

@@ -158,6 +158,10 @@ def _ingest_one_binary(
                 if func.get("nvram_wrapper")
                 else None,
                 json.dumps(func.get("wrapper_call_args", []), ensure_ascii=False),
+                # string-keyed-edge transport (detector B): the strcmp-ladder {key -> callees} edges
+                # recovered in this function, carried verbatim to be flattened into the atlas
+                # string_keyed_edge table at hunt time. Old exports -> '{}' (never null).
+                json.dumps(func.get("string_keyed_edges", {}), ensure_ascii=False),
             )
         )
     if func_rows:
@@ -165,8 +169,9 @@ def _ingest_one_binary(
             """INSERT INTO functions
                (binary_id, name, address, size_bytes, pseudocode,
                 pseudocode_hash, callees, callees_truncated, is_exported,
-                sink_provenance, nvram_ops, nvram_wrapper, wrapper_call_args)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                sink_provenance, nvram_ops, nvram_wrapper, wrapper_call_args,
+                string_keyed_edges)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             func_rows,
         )
         stats.functions_ingested += len(func_rows)

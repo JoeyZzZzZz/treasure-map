@@ -64,19 +64,21 @@ def _make_db(
             nvram_wrapper = func.get("nvram_wrapper")
             conn.execute(
                 "INSERT INTO functions "
-                "(id, binary_id, name, pseudocode, pseudocode_hash, callees, nvram_ops, "
-                "nvram_wrapper, wrapper_call_args) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "(id, binary_id, name, address, pseudocode, pseudocode_hash, callees, nvram_ops, "
+                "nvram_wrapper, wrapper_call_args, string_keyed_edges) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     fid,
                     bid,
                     func["name"],
+                    func.get("address"),
                     func["pseudocode"],
                     func.get("hash"),
                     json.dumps(func["callees"]),
                     json.dumps(func.get("nvram_ops", [])),
                     json.dumps(nvram_wrapper) if nvram_wrapper else None,
                     json.dumps(func.get("wrapper_call_args", [])),
+                    json.dumps(func.get("string_keyed_edges", {})),
                 ),
             )
         for m in spec.get("nvram_defaults", []):  # type: ignore[union-attr]
@@ -640,6 +642,310 @@ def test_web_form_fields_replace_by_run_is_idempotent(tmp_path: Path) -> None:
     finally:
         conn.close()
     assert n == 1  # not 2
+
+
+# ── detector B: string-keyed edges (strcmp-ladder dispatch enumeration) ──────────────
+# ★ IRON LAW: these tests assert the atlas rows are ENUMERATED FACTS (key gates callee) with a
+# BinDiff-alignable callee anchor + fine-grained completeness — NEVER a reachability verdict. The
+# reachability-stays-unknown invariant is proven directly on _dim_reachability (test_triage_*).
+
+
+def _ske_fn(
+    name: str,
+    edges: list[dict[str, object]],
+    *,
+    address: str = "0x00010000",
+    completeness: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """A function carrying a detector-B string_keyed_edges object (no shape-relevant callees —
+    the flatten runs over ALL functions, independent of the sink scan)."""
+    obj: dict[str, object] = {"edges": edges}
+    if completeness is not None:
+        obj["completeness"] = completeness
+    return {
+        "name": name,
+        "address": address,
+        "pseudocode": f"void {name}(){{}}",
+        "hash": f"h_{name}",
+        "callees": [],
+        "string_keyed_edges": obj,
+    }
+
+
+def _ske_rows(atlas_path: Path) -> list[sqlite3.Row]:
+    conn = open_atlas(atlas_path)
+    try:
+        return conn.execute(
+            "SELECT binary, from_function, from_func_addr, key, mechanism, callee_name, "
+            "callee_addr, callee_kind, ladder_size, completeness_status, completeness_reason, "
+            "completeness_scope FROM string_keyed_edge ORDER BY key, callee_name"
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def test_string_keyed_edges_flattened_per_key_callee(tmp_path: Path) -> None:
+    # A 2-key strcmp ladder on one dispatch variable; each key gates one direct callee. The flatten
+    # emits one row per (key, callee), each carrying the BinDiff-alignable callee anchor and the
+    # ladder_size (2 = a real dispatch ladder, not a lone compare). Neutral keys only.
+    db = _make_db(
+        tmp_path,
+        [
+            {
+                "name": "rc",
+                "funcs": [
+                    _ske_fn(
+                        "handle_dispatch",
+                        [
+                            {
+                                "key": "oauth_auth_code",
+                                "mechanism": "strcmp_gate",
+                                "gate_api": "strcmp",
+                                "gate_addr": "0x00010040",
+                                "var_id": "sp+0x20",
+                                "ladder_size": 2,
+                                "callees": [
+                                    {
+                                        "name": "process_token",
+                                        "addr": "0x000b643c",
+                                        "kind": "direct",
+                                    }
+                                ],
+                                "completeness": {"status": "complete"},
+                            },
+                            {
+                                "key": "reboot",
+                                "mechanism": "strcmp_gate",
+                                "gate_api": "strcmp",
+                                "gate_addr": "0x00010080",
+                                "var_id": "sp+0x20",
+                                "ladder_size": 2,
+                                "callees": [
+                                    {"name": "do_reboot", "addr": "0x00011000", "kind": "direct"}
+                                ],
+                                "completeness": {"status": "complete"},
+                            },
+                        ],
+                        completeness={"status": "complete", "scope": "handle_dispatch@0x00010000"},
+                    )
+                ],
+            }
+        ],
+    )
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_ske")
+    rows = _ske_rows(atlas)
+    assert len(rows) == 2
+    by_key = {r["key"]: r for r in rows}
+    tok = by_key["oauth_auth_code"]
+    assert tok["mechanism"] == "strcmp_gate"
+    assert tok["binary"] == "rc"
+    assert tok["from_function"] == "handle_dispatch"
+    assert tok["from_func_addr"] == "0x00010000"  # source anchor rides from functions.address
+    # the callee anchor is the BinDiff-alignable {name, addr, kind}, not a bare address
+    assert tok["callee_name"] == "process_token"
+    assert tok["callee_addr"] == "0x000b643c"
+    assert tok["callee_kind"] == "direct"
+    assert tok["ladder_size"] == 2
+    assert tok["completeness_status"] == "complete"
+    assert by_key["reboot"]["callee_name"] == "do_reboot"
+
+
+def test_string_keyed_edge_partial_gate_keeps_key_as_callee_less_row(tmp_path: Path) -> None:
+    # A key whose gate branch could not be resolved to a callee set is NEVER dropped — it emits a
+    # callee-less row (the key stays a lead) with the per-edge partial status taking precedence.
+    db = _make_db(
+        tmp_path,
+        [
+            {
+                "name": "rc",
+                "funcs": [
+                    _ske_fn(
+                        "opaque",
+                        [
+                            {
+                                "key": "cfg_mode",
+                                "mechanism": "strcmp_gate",
+                                "ladder_size": 1,
+                                "callees": [],
+                                "completeness": {
+                                    "status": "partial",
+                                    "reason": "gate_branch_unresolved",
+                                },
+                            }
+                        ],
+                        completeness={"status": "complete", "scope": "opaque@0x00010000"},
+                    )
+                ],
+            }
+        ],
+    )
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_partial")
+    rows = _ske_rows(atlas)
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["key"] == "cfg_mode"
+    assert (
+        r["callee_name"] is None
+    )  # callee-less: the key is kept as a lead, never silently dropped
+    assert r["completeness_status"] == "partial"  # per-edge issue wins over the complete region
+    assert r["completeness_reason"] == "gate_branch_unresolved"
+
+
+def test_string_keyed_edge_switch_region_marked_incomplete(tmp_path: Path) -> None:
+    # A function with an unrecognized indirect-branch (switch) dispatch marks its REGION incomplete;
+    # an edge without its own per-edge status inherits it, so a cross-version edge delta in this
+    # region reads as undetermined (not a real add/remove).
+    db = _make_db(
+        tmp_path,
+        [
+            {
+                "name": "httpd",
+                "funcs": [
+                    _ske_fn(
+                        "router",
+                        [
+                            {
+                                "key": "status",
+                                "mechanism": "strcmp_gate",
+                                "ladder_size": 1,
+                                "callees": [
+                                    {"name": "show_status", "addr": "0x00022000", "kind": "direct"}
+                                ],
+                            }
+                        ],
+                        completeness={
+                            "status": "incomplete",
+                            "reason": "switch_form_unrecognized",
+                            "scope": "router@0x00020000",
+                        },
+                    )
+                ],
+            }
+        ],
+    )
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_switch")
+    rows = _ske_rows(atlas)
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["completeness_status"] == "incomplete"
+    assert r["completeness_reason"] == "switch_form_unrecognized"
+    assert r["completeness_scope"] == "router@0x00020000"
+
+
+def test_string_keyed_edges_replace_by_run_is_idempotent(tmp_path: Path) -> None:
+    db = _make_db(
+        tmp_path,
+        [
+            {
+                "name": "rc",
+                "funcs": [
+                    _ske_fn(
+                        "d",
+                        [
+                            {
+                                "key": "k",
+                                "mechanism": "strcmp_gate",
+                                "ladder_size": 1,
+                                "callees": [{"name": "h", "addr": "0x1", "kind": "direct"}],
+                                "completeness": {"status": "complete"},
+                            }
+                        ],
+                    )
+                ],
+            }
+        ],
+    )
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_idem")
+    run_analyzer2(db, atlas, source_run_id="run_idem")
+    conn = open_atlas(atlas)
+    try:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM string_keyed_edge WHERE source_run_id='run_idem'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert n == 1  # replace-by-run: not 2
+
+
+def test_run_capability_registered_even_with_zero_edges(tmp_path: Path) -> None:
+    # ★ absence-of-findings is NOT absence-of-capability: the detector code ran in this tmap
+    # version, so the capability is registered present=1 even for a run that found ZERO edges. A
+    # cross-version diff reads this to tell "no edges" apart from "this build cannot see edges".
+    db = _make_db(tmp_path, [{"name": "rc", "funcs": [_nvram_fn("noop", [])]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_cap")
+    conn = open_atlas(atlas)
+    try:
+        assert _ske_rows(atlas) == []  # no edges at all
+        cap = conn.execute(
+            "SELECT present FROM run_capability WHERE run_id='run_cap' AND "
+            "capability='reachability.string_keyed_edge'"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert cap is not None and cap["present"] == 1
+
+
+def test_string_keyed_edges_query_by_callee_and_by_run(tmp_path: Path) -> None:
+    # The two read faces over the produced atlas: edges_reaching_callee (the reachability layer's
+    # "is this function a dispatch callee?" lookup) and get_string_keyed_edges (the agent/diff
+    # enumeration by run + key). Both return enumerated FACTS, never a reachability verdict.
+    from treasure_map.lib.query import edges_reaching_callee, get_string_keyed_edges
+
+    db = _make_db(
+        tmp_path,
+        [
+            {
+                "name": "rc",
+                "funcs": [
+                    _ske_fn(
+                        "handle_dispatch",
+                        [
+                            {
+                                "key": "oauth_auth_code",
+                                "mechanism": "strcmp_gate",
+                                "ladder_size": 1,
+                                "callees": [
+                                    {
+                                        "name": "process_token",
+                                        "addr": "0x000b643c",
+                                        "kind": "direct",
+                                    }
+                                ],
+                                "completeness": {"status": "complete"},
+                            }
+                        ],
+                    )
+                ],
+            }
+        ],
+    )
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_q")
+    conn = open_atlas(atlas)
+    try:
+        # by callee (reachability lookup): the callee's function is reached via a keyed edge
+        hits = edges_reaching_callee(conn, "rc", "process_token")
+        assert len(hits) == 1
+        assert hits[0]["key"] == "oauth_auth_code"
+        assert hits[0]["callee"] == {
+            "name": "process_token",
+            "addr": "0x000b643c",
+            "kind": "direct",
+        }
+        # a function that is NOT any edge's callee returns [] (NOT a proof of unreachability)
+        assert edges_reaching_callee(conn, "rc", "handle_dispatch") == []
+        # by run + key (agent / diff enumeration)
+        out = get_string_keyed_edges(conn, run_id="run_q", key="oauth_auth_code")
+        assert out["count"] == 1
+        assert out["edges"][0]["from_function"] == "handle_dispatch"
+        assert out["edges"][0]["mechanism"] == "strcmp_gate"
+    finally:
+        conn.close()
 
 
 # ── evidence neutralization: raw literal never persisted ────────────────────────────

@@ -34,17 +34,23 @@ from treasure_map.lib.atlas.models import (
     InstanceRow,
     NvramDefaultRow,
     NvramFlowRow,
+    RunCapabilityRow,
+    StringKeyedEdgeRow,
     WebFormFieldRow,
 )
 from treasure_map.lib.atlas.writer import (
     add_instance,
     add_nvram_default_rows,
     add_nvram_flow_rows,
+    add_run_capabilities,
+    add_string_keyed_edges,
     add_web_form_field_rows,
     begin_run,
+    delete_run_capabilities,
     delete_run_instances,
     delete_run_nvram_defaults,
     delete_run_nvram_flow,
+    delete_run_string_keyed_edges,
     delete_run_web_form_fields,
     finish_run,
     upsert_pattern,
@@ -334,6 +340,118 @@ def _flatten_nvram_ops(
     return rows
 
 
+def _load_string_keyed_edges(db_path: Path | str) -> dict[int, dict[str, Any]]:
+    """Map func_id -> parsed string_keyed_edges object (detector B strcmp-ladder edges), with the
+    function's address injected as ``_from_func_addr``.
+
+    Transport read (mirrors _load_nvram_ops): ExportFunctions.buildStringKeyedEdges computed the
+    per-function {edges, completeness} and ghidra_ingest stored it on functions.string_keyed_edges;
+    here it is loaded so the hunt flattens it into the atlas string_keyed_edge table. A missing
+    column (older analysis.db) or an unparsable cell yields no entry — the edge layer is additive.
+    """
+    uri = f"file:{Path(db_path)}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    out: dict[int, dict[str, Any]] = {}
+    try:
+        rows = conn.execute("SELECT id, address, string_keyed_edges FROM functions").fetchall()
+    except sqlite3.OperationalError:
+        return out  # no column (pre-detector-B analysis.db) -> no data
+    finally:
+        conn.close()
+    for func_id, addr, raw in rows:
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(data, dict) and data.get("edges"):
+            data["_from_func_addr"] = addr
+            out[func_id] = data
+    return out
+
+
+def _flatten_string_keyed_edges(
+    all_funcs: list[FuncRow],
+    edges_by_func: dict[int, dict[str, Any]],
+    source_run_id: str,
+) -> list[StringKeyedEdgeRow]:
+    """Flatten each function's strcmp-ladder edges into per-(key, callee) string_keyed_edge rows.
+
+    ★ IRON LAW: an enumerated edge is a FACT, never a reachability verdict — the reachability layer
+    reads these as a lead (key X gates callee Y), the candidate stays reachability=unknown. Each row
+    carries the callee anchor (name + addr + kind, BinDiff-alignable) and a fine-grained status
+    the diff matches by region: the per-edge gate-resolution issue (partial) takes precedence, else
+    the function-region completeness (an unparsed switch marks the region incomplete, so a
+    cross-version edge delta in it reads as undetermined, not a real add/remove). A key whose gate
+    did not resolve to a callee set is NOT dropped — it emits a callee-less row, keeping the lead.
+    """
+    rows: list[StringKeyedEdgeRow] = []
+    for f in all_funcs:
+        data = edges_by_func.get(f.func_id)
+        if not data:
+            continue
+        func_addr = data.get("_from_func_addr")
+        _fc = data.get("completeness")
+        func_comp: dict[str, Any] = _fc if isinstance(_fc, dict) else {}
+        scope = func_comp.get("scope") or (f"{f.name}@{func_addr}" if f.name else func_addr)
+        edges = data.get("edges")
+        if not isinstance(edges, list):
+            continue
+        for edge in edges:
+            if not isinstance(edge, dict):
+                continue
+            key = edge.get("key")
+            key = key if isinstance(key, str) else None
+            mechanism = edge.get("mechanism")
+            if mechanism not in ("strcmp_gate", "static_string_table"):
+                mechanism = "strcmp_gate"
+            ladder_size = edge.get("ladder_size")
+            ladder_size = ladder_size if isinstance(ladder_size, int) else None
+            _ta = edge.get("table_addr")
+            table_addr = _ta if isinstance(_ta, str) else None
+            _ec = edge.get("completeness")
+            edge_comp: dict[str, Any] = _ec if isinstance(_ec, dict) else {}
+            # The per-edge gate issue is the most specific signal; else the function-region status.
+            if edge_comp.get("status") in ("partial", "incomplete"):
+                c_status = edge_comp["status"]
+                c_reason = edge_comp.get("reason")
+            else:
+                c_status = func_comp.get("status", "complete")
+                c_reason = func_comp.get("reason")
+            if c_status not in ("complete", "incomplete", "partial"):
+                c_status = "complete"
+            common: dict[str, Any] = {
+                "source_run_id": source_run_id,
+                "binary": f.binary_name,
+                "from_function": f.name,
+                "from_func_addr": func_addr if isinstance(func_addr, str) else None,
+                "key": key,
+                "mechanism": mechanism,
+                "ladder_size": ladder_size,
+                "table_addr": table_addr,
+                "completeness_status": c_status,
+                "completeness_reason": c_reason if isinstance(c_reason, str) else None,
+                "completeness_scope": scope if isinstance(scope, str) else None,
+            }
+            callees = edge.get("callees")
+            valid = [c for c in callees if isinstance(c, dict)] if isinstance(callees, list) else []
+            if not valid:
+                # Gate resolved no callee set: keep the key as a lead (callee-less row), never drop.
+                rows.append(StringKeyedEdgeRow(**common))
+                continue
+            for callee in valid:
+                rows.append(
+                    StringKeyedEdgeRow(
+                        callee_name=callee.get("name"),
+                        callee_addr=callee.get("addr"),
+                        callee_kind=callee.get("kind"),
+                        **common,
+                    )
+                )
+    return rows
+
+
 def _load_wrapper_data(
     db_path: Path | str,
 ) -> tuple[dict[int, dict[str, Any]], dict[int, list[dict[str, Any]]]]:
@@ -545,6 +663,20 @@ def run_analyzer2(
     # can cross them against the back-end nvram_key_flow constant keys. Empty when the analysis.db
     # predates M1 (web_settable then reads 'uncertain', never 'not settable').
     web_form_field_rows = _load_web_form_fields(db_path, source_run_id)
+    # detector B: strcmp-ladder string-keyed edges, flattened into the atlas string_keyed_edge table
+    # so the reachability layer can annotate a candidate that is an edge callee (a key lead, still
+    # unknown). Empty when the analysis.db predates the detector (no re-scan yet).
+    string_keyed_edge_rows = _flatten_string_keyed_edges(
+        all_funcs, _load_string_keyed_edges(db_path), source_run_id
+    )
+    # Capability registry: register that this run produced string-keyed-edge facts. UNCONDITIONAL —
+    # the detector code ran in this tmap version, so the capability is present even if it found zero
+    # edges (absence-of-findings is not absence-of-capability). A cross-version diff iterates these.
+    capability_rows = [
+        RunCapabilityRow(
+            run_id=source_run_id, capability="reachability.string_keyed_edge", present=1
+        )
+    ]
 
     by_status = {"confirmed": 0, "blocked": 0, "unknown": 0}
     instances_written = 0
@@ -588,6 +720,12 @@ def run_analyzer2(
             # M1: refresh this run's editable-web-form-field rows in the same txn (replace-by-run).
             delete_run_web_form_fields(atlas, source_run_id, commit=False)
             add_web_form_field_rows(atlas, web_form_field_rows, commit=False)
+            # detector B: refresh this run's string-keyed-edge rows + capability registration in the
+            # same txn (replace-by-run). The capability is registered even with zero edges.
+            delete_run_string_keyed_edges(atlas, source_run_id, commit=False)
+            add_string_keyed_edges(atlas, string_keyed_edge_rows, commit=False)
+            delete_run_capabilities(atlas, source_run_id, commit=False)
+            add_run_capabilities(atlas, capability_rows, commit=False)
             for match in result.matches:
                 row = funcs.get(match.func_ref.func_id)
                 # A data gap = no loadable body OR a decompile-error comment (non-empty

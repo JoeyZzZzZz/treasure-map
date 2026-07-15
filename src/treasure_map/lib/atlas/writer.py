@@ -16,6 +16,8 @@ from treasure_map.lib.atlas.models import (
     NvramDefaultRow,
     NvramFlowRow,
     PublicCvePatternRow,
+    RunCapabilityRow,
+    StringKeyedEdgeRow,
     WebFormFieldRow,
 )
 from treasure_map.lib.errors import ConfigError
@@ -86,6 +88,85 @@ def add_nvram_flow_rows(
             )
             for r in rows
         ],
+    )
+    if commit:
+        conn.commit()
+    return len(rows)
+
+
+def delete_run_string_keyed_edges(
+    conn: sqlite3.Connection, source_run_id: str, *, commit: bool = True
+) -> int:
+    """Delete all string_keyed_edge rows of one run (replace-by-run refresh). Returns rows deleted.
+
+    Touches ONLY this run_id's rows — other runs' edge facts are untouched. commit=False joins the
+    caller's transaction so a run's flatten is atomic with its instance write."""
+    cur = conn.execute("DELETE FROM string_keyed_edge WHERE source_run_id = ?", (source_run_id,))
+    if commit:
+        conn.commit()
+    return cur.rowcount
+
+
+def add_string_keyed_edges(
+    conn: sqlite3.Connection, rows: list[StringKeyedEdgeRow], *, commit: bool = True
+) -> int:
+    """Insert flattened string-keyed-edge rows (one per key,callee) in one batch; return the count.
+
+    Neutral enumerated-edge facts (key gates a callee), NEVER a reachability verdict. No validation
+    beyond the schema CHECKs. commit=False lets the caller batch delete+insert into one txn."""
+    if not rows:
+        return 0
+    conn.executemany(
+        """INSERT INTO string_keyed_edge
+           (source_run_id, binary, from_function, from_func_addr, key, mechanism,
+            callee_name, callee_addr, callee_kind, ladder_size, table_addr,
+            completeness_status, completeness_reason, completeness_scope)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        [
+            (
+                r.source_run_id,
+                r.binary,
+                r.from_function,
+                r.from_func_addr,
+                r.key,
+                r.mechanism,
+                r.callee_name,
+                r.callee_addr,
+                r.callee_kind,
+                r.ladder_size,
+                r.table_addr,
+                r.completeness_status,
+                r.completeness_reason,
+                r.completeness_scope,
+            )
+            for r in rows
+        ],
+    )
+    if commit:
+        conn.commit()
+    return len(rows)
+
+
+def delete_run_capabilities(conn: sqlite3.Connection, run_id: str, *, commit: bool = True) -> int:
+    """Delete all run_capability rows of one run (replace-by-run refresh). Returns rows deleted."""
+    cur = conn.execute("DELETE FROM run_capability WHERE run_id = ?", (run_id,))
+    if commit:
+        conn.commit()
+    return cur.rowcount
+
+
+def add_run_capabilities(
+    conn: sqlite3.Connection, rows: list[RunCapabilityRow], *, commit: bool = True
+) -> int:
+    """Register a run's capabilities (present=1) in one batch; return the count.
+
+    A per-run deterministic fact that a given tmap version produced a sub-dimension. Registered
+    UNCONDITIONALLY when the detector runs — absence-of-findings is not absence-of-capability."""
+    if not rows:
+        return 0
+    conn.executemany(
+        "INSERT INTO run_capability (run_id, capability, present) VALUES (?, ?, ?)",
+        [(r.run_id, r.capability, r.present) for r in rows],
     )
     if commit:
         conn.commit()

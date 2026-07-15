@@ -22,6 +22,7 @@ import logging
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from treasure_map.lib.query.nvram import _web_settable
@@ -31,6 +32,7 @@ from treasure_map.lib.query.sink_impact import (
     PROVABLY_CONSTANT_MARKERS,
     impact_tier,
 )
+from treasure_map.lib.query.string_edges import edges_reaching_callee
 
 logger = logging.getLogger(__name__)
 
@@ -1049,7 +1051,35 @@ _REACH_CAVEAT_COMPLETENESS = (
 )
 
 
-def _dim_reachability(entry_reach: str, web_triggers: tuple[str, ...] = ()) -> Dimension:
+def _string_keyed_edge_note(edges: tuple[dict[str, Any], ...]) -> str:
+    """A one-line summary of the string-keyed edge(s) whose callee is this candidate's function — a
+    KEY LEAD, never a reachability verdict. Empty when there are none. ★ IRON LAW: this text ADDS a
+    lead to the note; it must NEVER change the reachability state to proven/reachable — tmap
+    ENUMERATES the edge (a fact), the agent JUDGES reachability."""
+    if not edges:
+        return ""
+    shown = edges[:3]
+    parts = [
+        f"key='{e.get('key') or '?'}' from {e.get('from_function') or '?'} "
+        f"[{e.get('mechanism') or '?'}]"
+        for e in shown
+    ]
+    more = f" (+{len(edges) - len(shown)} more)" if len(edges) > len(shown) else ""
+    return (
+        " Also: this function is the callee of a STRING-KEYED EDGE — "
+        + "; ".join(parts)
+        + more
+        + ". That is a key lead you confirm (an attacker-influenceable string key dispatches "
+        "here); reachability STAYS unknown — tmap enumerates the edge, it does not judge "
+        "reachability. Use get_string_keyed_edges to drill in; check the edge's completeness."
+    )
+
+
+def _dim_reachability(
+    entry_reach: str,
+    web_triggers: tuple[str, ...] = (),
+    string_keyed_edges: tuple[dict[str, Any], ...] = (),
+) -> Dimension:
     """Which kind of rootfs entry references this binary? A MECHANISTIC label — entry:web /
     entry:script / entry:web+script / unknown — NEVER a reachability verdict (it does not decide
     whether the input arrives) and never a claim about an authentication boundary. ``state`` is
@@ -1057,7 +1087,12 @@ def _dim_reachability(entry_reach: str, web_triggers: tuple[str, ...] = ()) -> D
     edge are both sound); unknown for a coverage gap. A ? is NEVER 'unreachable' and never sinks.
     The two caveats (standard-flow + completeness) always ride in ``note`` and never collapse into
     state/value (contract C7). This answers the ENTRY level only — entry->sink flow within a
-    function is a separate, unmodeled question."""
+    function is a separate, unmodeled question.
+
+    ★ IRON LAW: a detected string-keyed edge (this function is a dispatch callee) is APPENDED to the
+    note as a key lead — it NEVER changes ``state``/``value``. A candidate with no entry stays
+    unknown even when an edge points at it; the edge is a fact the agent confirms, not a grant."""
+    edge_note = _string_keyed_edge_note(string_keyed_edges)
     if entry_reach.startswith("entry:"):
         trig = f" ({', '.join(web_triggers)})" if web_triggers else ""
         note = (
@@ -1070,7 +1105,7 @@ def _dim_reachability(entry_reach: str, web_triggers: tuple[str, ...] = ()) -> D
             "proven",
             entry_reach,
             "flow_evidence.entry_reach.sites (rootfs script / web-asset reference)",
-            note,
+            note + edge_note,
         )
     return Dimension(
         "reachability",
@@ -1079,7 +1114,7 @@ def _dim_reachability(entry_reach: str, web_triggers: tuple[str, ...] = ()) -> D
         "flow_evidence.entry_reach.sites",
         "no rootfs script/web entry found — reported unknown (a coverage gap), NOT unreachable: "
         "the binary may be invoked indirectly, via another binary's exec, or over an unmodeled "
-        "service-dispatch/IPC bridge (notify_rc); a ? never sinks",
+        "service-dispatch/IPC bridge (notify_rc); a ? never sinks" + edge_note,
     )
 
 
@@ -1221,6 +1256,7 @@ def _build_dimensions(
     nvram_key: str | None,
     sink_anchor: str | None,
     wrapper_names: frozenset[str] = frozenset(),
+    string_keyed_edges: tuple[dict[str, Any], ...] = (),
 ) -> tuple[Dimension, ...]:
     """The honest map layers for one candidate. web_settable is the SaTC front↔back cross, looked
     up once when the source resolved to an nvram key (shared by source_writability); the
@@ -1239,7 +1275,7 @@ def _build_dimensions(
         ),
         _dim_source(source_class, source_kind),
         _dim_source_writability(nvram_key, web_settable),
-        _dim_reachability(entry_reach, web_triggers),
+        _dim_reachability(entry_reach, web_triggers, string_keyed_edges),
         _dim_filtering(flow_evidence),
         _dim_sink_impact(sink_class),
         _dim_writer(flow_evidence),
@@ -1269,6 +1305,15 @@ def _candidate(
     if nvram_key is None:
         web_keys = _web_settable_keys_reaching_sink(conn, fe, sink_anchor)
         nvram_key = web_keys[0] if web_keys else None
+    # ★ Reachability lead (iron-law-safe): is this candidate's function the callee of a string-keyed
+    # edge (a strcmp ladder / static table gates it behind an attacker-influenceable key)? Scoped to
+    # this candidate's binary (basename of binary_path == the edge's short binary name) so a
+    # same-named function in another binary does not bleed in. This ANNOTATES the reachability note
+    # with the key lead; it NEVER flips reachability to proven — the agent judges reachability.
+    function = row["source_anchor"]
+    binary_path = row["binary_path"]
+    binary_name = Path(binary_path).name if binary_path else None
+    string_keyed_edges = tuple(edges_reaching_callee(conn, binary_name, function))
     return TriageCandidate(
         review_status=REVIEW_STATUS_BY_REACHABILITY.get(reach, reach),
         reachability_status=reach,
@@ -1298,6 +1343,7 @@ def _candidate(
             nvram_key=nvram_key,
             sink_anchor=sink_anchor,
             wrapper_names=wrapper_names,
+            string_keyed_edges=string_keyed_edges,
         ),
     )
 
