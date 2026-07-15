@@ -24,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now tagged `origin='external_import'` — a machine-readable guard (on top of the existing physical
   table separation) so external/agent-imported material can never be read as deterministic tmap
   extraction. CI-assertable: no row may carry any other origin.
+- **`web_settable` now carries drill-down evidence.** The source-writability reading previously
+  collapsed the front-end match to a bool; it now exposes the concrete `web_form_fields` rows behind
+  it — `{field_keyword, source_asset, source_rule, match_kind}` — under a new `evidence` key. It
+  rides through `get_nvram_key_flow` and the `source_writability` dimension of `explain_candidate`,
+  so an agent can confirm the web reach or demote a keyword collision (SaTC keyword joins are
+  collision-prone) without re-deriving. The yes/likely/uncertain verdict is unchanged.
 
 ### Changed
 

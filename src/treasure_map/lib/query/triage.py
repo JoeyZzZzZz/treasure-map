@@ -83,6 +83,12 @@ class Dimension:
     value: str
     source: str
     note: str = ""
+    # Optional structured evidence rows behind this layer's reading — e.g. the web_form_fields
+    # {field_keyword, source_asset, source_rule, match_kind} rows behind a source_writability
+    # ``web_settable`` value, so an agent drills in to CONFIRM the web reach or DEMOTE a keyword
+    # collision without re-deriving. Empty for layers that carry no drill-down rows. Evidence, never
+    # a verdict — it never changes ``state``/``value``.
+    evidence: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -992,6 +998,10 @@ def _dim_source_writability(
         )
     st = web_settable.get("web_settable")
     src = web_settable.get("source") or ""
+    # The web_form_fields rows behind the front-end match (field / asset / rule / match_kind), so an
+    # agent drills in to confirm the web reach or demote a keyword collision. Carried on every state
+    # (empty when the front end contributed nothing); it never changes the verdict.
+    ev = tuple(web_settable.get("evidence") or ())
     if st == "yes":
         return Dimension(
             "source_writability",
@@ -999,6 +1009,7 @@ def _dim_source_writability(
             "web_settable",
             f"SaTC cross[{nvram_key}]",
             f"key '{nvram_key}' is a user-editable web key ({src})",
+            evidence=ev,
         )
     if st == "likely":
         return Dimension(
@@ -1008,6 +1019,7 @@ def _dim_source_writability(
             f"router_defaults[{nvram_key}]",
             f"key '{nvram_key}' is LIKELY web-settable — a router_defaults member ({src}); an "
             "optimistic signal, NOT a proven SaTC cross (may be a read-only internal default)",
+            evidence=ev,
         )
     return Dimension(
         "source_writability",
@@ -1017,6 +1029,7 @@ def _dim_source_writability(
         f"'{nvram_key}' not proven web-settable — uncertain, NOT 'not settable' ({src})"
         if src
         else "web-settability uncertain (surface not fully collected)",
+        evidence=ev,
     )
 
 

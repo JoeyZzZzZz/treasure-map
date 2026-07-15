@@ -797,6 +797,27 @@ def test_router_defaults_member_wrapper_key_is_likely_controllable(tmp_path: Pat
     assert (swr.state, swr.value) == ("likely", "web_settable")
 
 
+def test_source_writability_dimension_carries_web_evidence() -> None:
+    # explain_candidate drill-down: the source_writability dimension exposes the web_form_fields
+    # rows behind a web_settable reading, so an agent confirms the web reach or demotes a keyword
+    # collision without re-deriving. Evidence rides along; the verdict (state/value) is unchanged.
+    from treasure_map.lib.query.triage import _dim_source_writability
+
+    ev = [
+        {
+            "field_keyword": "fb_comment",
+            "source_asset": "Feedback_Info.asp",
+            "source_rule": "textarea",
+            "match_kind": "exact",
+        }
+    ]
+    d = _dim_source_writability(
+        "fb_comment", {"web_settable": "yes", "source": "x", "evidence": ev}
+    )
+    assert (d.state, d.value) == ("proven", "web_settable")  # verdict unchanged by evidence
+    assert d.evidence == tuple(ev)  # the concrete drill-down rows are surfaced
+
+
 def test_wrapper_read_non_default_key_stays_unknown(tmp_path: Path) -> None:
     # ★ M4.5 guardrail: a wrapper-read key that is NOT a router_defaults member (table located) must
     # NOT be promoted to likely -- the in_router_defaults gate holds internal keys out. It falls

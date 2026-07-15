@@ -306,6 +306,59 @@ def test_web_settable_yes_when_frontend_editable_and_backend_key(tmp_path: Path)
     assert res["web_settable"]["web_settable"] == "yes"  # surfaced through the key-flow reader
 
 
+def test_web_settable_carries_frontend_evidence_rows(tmp_path: Path) -> None:
+    # Drill-down: web_settable exposes the CONCRETE web_form_fields rows behind the front-end match
+    # (real field / asset / rule), not just the bool — so an agent can confirm the web reach or
+    # demote a keyword collision. The verdict itself is unchanged (still 'yes').
+    atlas = _seed(
+        tmp_path,
+        [_flow("fb_comment", "constant", "httpd", "save", "write")],
+        form_fields=[_field("fb_comment", rule="textarea")],
+    )
+    conn = open_atlas(atlas)
+    try:
+        ws = _web_settable(conn, "fb_comment")
+        res = get_nvram_key_flow(conn, "fb_comment")
+    finally:
+        conn.close()
+    assert ws["web_settable"] == "yes"  # verdict unchanged by exposing evidence
+    assert ws["evidence"] == [
+        {
+            "field_keyword": "fb_comment",
+            "source_asset": "Feedback.asp",
+            "source_rule": "textarea",
+            "match_kind": "exact",
+        }
+    ]
+    # The same evidence rides through the key-flow reader (the free drill-down surface).
+    assert res["web_settable"]["evidence"] == ws["evidence"]
+
+
+def test_web_settable_naming_variant_evidence_is_tagged(tmp_path: Path) -> None:
+    # A key whose only front-end field is a naming-variant mirror (http_username -> http_username_x)
+    # is 'uncertain', but the evidence still exposes the variant row tagged naming_variant, so an
+    # agent sees WHY it is uncertain — a mirror field, not an exact editable field.
+    atlas = _seed(
+        tmp_path,
+        [_flow("http_username", "constant", "httpd", "auth", "read")],
+        form_fields=[_field("http_username_x")],
+    )
+    conn = open_atlas(atlas)
+    try:
+        ws = _web_settable(conn, "http_username")
+    finally:
+        conn.close()
+    assert ws["web_settable"] == "uncertain"  # variant is not a proven exact editable field
+    assert ws["evidence"] == [
+        {
+            "field_keyword": "http_username_x",
+            "source_asset": "Feedback.asp",
+            "source_rule": "input",
+            "match_kind": "naming_variant",
+        }
+    ]
+
+
 def test_web_settable_three_state_never_emits_no(tmp_path: Path) -> None:
     # ④/M2 THREE-STATE {yes, likely, uncertain}: back-end-only (firmver, a read-only display) and
     # front-end-only (Connect_btn, a UI control), NEITHER a router_defaults member (no defaults

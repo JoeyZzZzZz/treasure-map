@@ -205,6 +205,49 @@ def _frontend_settable(conn: sqlite3.Connection, key: str) -> bool | str:
     return "uncertain" if variant is not None else False
 
 
+def _frontend_evidence(conn: sqlite3.Connection, key: str) -> list[dict[str, Any]]:
+    """The web_form_fields rows backing a front-end match for ``key`` — the concrete evidence an
+    agent drills into to CONFIRM the web reach or DEMOTE a keyword collision (``type`` etc. recur
+    across assets). Each row carries the matched ``field_keyword`` + the ``source_asset`` it was
+    seen in + the ``source_rule`` (input / textarea / select / …), tagged with ``match_kind``
+    (``exact`` or ``naming_variant``). Exact + wl-normalized hits first; only when there is no exact
+    hit are the naming-variant (``key_*``) mirrors returned. [] when the table is absent/empty or
+    nothing matches. This is the SAME join ``_frontend_settable`` decides the verdict from — the
+    verdict is unchanged; this only exposes the rows behind it so the agent judges collisions."""
+    try:
+        exact = conn.execute(
+            "SELECT field_keyword, source_asset, source_rule FROM web_form_fields "
+            "WHERE field_keyword IN (?, ?)",
+            (key, _wl_normalize(key)),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []  # table absent (older atlas / M1 not run)
+    if exact:
+        return [
+            {
+                "field_keyword": r["field_keyword"],
+                "source_asset": r["source_asset"],
+                "source_rule": r["source_rule"],
+                "match_kind": "exact",
+            }
+            for r in exact
+        ]
+    variant = conn.execute(
+        "SELECT field_keyword, source_asset, source_rule FROM web_form_fields "
+        "WHERE field_keyword GLOB ?",
+        (key + "_*",),
+    ).fetchall()
+    return [
+        {
+            "field_keyword": r["field_keyword"],
+            "source_asset": r["source_asset"],
+            "source_rule": r["source_rule"],
+            "match_kind": "naming_variant",
+        }
+        for r in variant
+    ]
+
+
 def _backend_nvram_key(conn: sqlite3.Connection, key: str) -> bool | str:
     """Is ``key`` a back-end nvram op key — a constant key in nvram_key_flow, ANY binary, read or
     write? True / False / 'uncertain' ('uncertain' only when the table is absent, an older atlas).
@@ -278,6 +321,7 @@ def _web_settable(conn: sqlite3.Connection, key: str) -> dict[str, Any]:
     frontend = _frontend_settable(conn, key)
     backend = _backend_nvram_key(conn, key)
     router = _router_defaults_lookup(conn, key)
+    evidence = _frontend_evidence(conn, key)
     if frontend is True and backend is True:
         verdict = "yes"
         source = "front-end editable field x back-end nvram key (SaTC cross)"
@@ -298,6 +342,11 @@ def _web_settable(conn: sqlite3.Connection, key: str) -> dict[str, Any]:
         "frontend": frontend,
         "backend": backend,
         "source": source,
+        # The concrete web_form_fields rows behind the front-end match (field / asset / rule), so an
+        # agent can drill in to confirm the web reach or demote a keyword collision. Empty when the
+        # front end contributed nothing (a likely/uncertain verdict resting on router_defaults, or a
+        # true absence). Evidence, never a verdict — the verdict above is unchanged by it.
+        "evidence": evidence,
         "caveat": "all-binary back-end cross is direction-safe but may be slightly wide (another "
         "service could be the real writer of a web-editable-looking key)",
         "router_defaults": router,
