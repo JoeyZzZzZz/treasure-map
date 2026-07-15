@@ -87,6 +87,26 @@ def _make_db(
                 "(binary_id, key, default_value, flags, member_index) VALUES (?, ?, ?, ?, ?)",
                 (bid, m.get("key"), m.get("default_value"), m.get("flags"), m.get("index")),
             )
+        for i, e in enumerate(spec.get("string_tables", [])):  # type: ignore[arg-type]
+            conn.execute(
+                "INSERT INTO string_tables "
+                "(binary_id, table_addr, stride, entry_index, key, func_name, func_addr, "
+                "func_kind, completeness_status, completeness_reason, completeness_scope) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    bid,
+                    e.get("table_addr", "0x74920"),
+                    e.get("stride", 8),
+                    e.get("index", i),
+                    e.get("key"),
+                    e.get("func_name"),
+                    e.get("func_addr"),
+                    e.get("func_kind", "direct"),
+                    e.get("status", "incomplete"),
+                    e.get("reason", "got_relative_and_three_field_and_mips_not_detected"),
+                    e.get("scope", "absolute_2field_only"),
+                ),
+            )
     for ff in web_form_fields or []:
         cur = conn.execute(
             "INSERT INTO non_binary_files (kind, name, path) VALUES ('web_asset', ?, ?)",
@@ -944,6 +964,105 @@ def test_string_keyed_edges_query_by_callee_and_by_run(tmp_path: Path) -> None:
         assert out["count"] == 1
         assert out["edges"][0]["from_function"] == "handle_dispatch"
         assert out["edges"][0]["mechanism"] == "strcmp_gate"
+    finally:
+        conn.close()
+
+
+# ── detector A: static {string -> funcptr} dispatch tables (same atlas edge table) ───
+
+
+def test_static_string_table_flattened_to_edges(tmp_path: Path) -> None:
+    # A static {string -> handler} dispatch table (detector A) lands in the SAME string_keyed_edge
+    # table with mechanism='static_string_table', table_addr set, no source function, ladder_size
+    # NULL, and the detector-level completeness (incomplete — absolute-2-field only) on each row.
+    db = _make_db(
+        tmp_path,
+        [
+            {
+                "name": "httpd",
+                "funcs": [_nvram_fn("noop", [])],
+                "string_tables": [
+                    {
+                        "key": "nvram_dump",
+                        "func_name": "FUN_000561e4",
+                        "func_addr": "0x000561e4",
+                        "table_addr": "0x74920",
+                    },
+                    {
+                        "key": "sys_reboot",
+                        "func_name": "do_reboot",
+                        "func_addr": "0x00011000",
+                        "table_addr": "0x74920",
+                    },
+                ],
+            }
+        ],
+    )
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_a")
+    rows = _ske_rows(atlas)
+    assert len(rows) == 2
+    by_key = {r["key"]: r for r in rows}
+    dump = by_key["nvram_dump"]
+    assert dump["mechanism"] == "static_string_table"
+    assert dump["binary"] == "httpd"
+    assert dump["from_function"] is None  # a static table has no source function
+    assert dump["callee_name"] == "FUN_000561e4"
+    assert dump["callee_addr"] == "0x000561e4"
+    assert dump["ladder_size"] is None  # N/A for a static table
+    assert dump["completeness_status"] == "incomplete"
+    assert dump["completeness_scope"] == "absolute_2field_only"
+
+
+def test_static_table_and_strcmp_gate_share_query_and_capability(tmp_path: Path) -> None:
+    # Both detectors write the SAME table, so one query + one capability key serve both. The
+    # mechanism field distinguishes them; edges_reaching_callee finds a static-table handler too.
+    from treasure_map.lib.query import edges_reaching_callee, get_string_keyed_edges
+
+    db = _make_db(
+        tmp_path,
+        [
+            {
+                "name": "httpd",
+                "funcs": [
+                    _ske_fn(
+                        "dispatch",
+                        [
+                            {
+                                "key": "status",
+                                "mechanism": "strcmp_gate",
+                                "ladder_size": 1,
+                                "callees": [
+                                    {"name": "show_status", "addr": "0x2000", "kind": "direct"}
+                                ],
+                                "completeness": {"status": "complete"},
+                            }
+                        ],
+                    )
+                ],
+                "string_tables": [
+                    {"key": "nvram_dump", "func_name": "FUN_000561e4", "func_addr": "0x000561e4"}
+                ],
+            }
+        ],
+    )
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_ab")
+    conn = open_atlas(atlas)
+    try:
+        # the static-table handler is reachable-via-key like a strcmp callee (same lookup)
+        a_hit = edges_reaching_callee(conn, "httpd", "FUN_000561e4")
+        assert len(a_hit) == 1 and a_hit[0]["mechanism"] == "static_string_table"
+        # both mechanisms live under one enumeration surface
+        allq = get_string_keyed_edges(conn, run_id="run_ab")
+        mechs = {e["mechanism"] for e in allq["edges"]}
+        assert mechs == {"strcmp_gate", "static_string_table"}
+        # one capability key covers both detectors
+        cap = conn.execute(
+            "SELECT COUNT(*) FROM run_capability WHERE run_id='run_ab' AND "
+            "capability='reachability.string_keyed_edge'"
+        ).fetchone()[0]
+        assert cap == 1
     finally:
         conn.close()
 

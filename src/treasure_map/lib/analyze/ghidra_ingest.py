@@ -123,7 +123,7 @@ def _ingest_one_binary(
     """Replace this binary's rows in functions/imports/exports/strings."""
 
     # DELETE existing rows for this binary_id (idempotent re-ingest)
-    for table in ("functions", "imports", "exports", "strings", "nvram_defaults"):
+    for table in ("functions", "imports", "exports", "strings", "nvram_defaults", "string_tables"):
         conn.execute(f"DELETE FROM {table} WHERE binary_id = ?", (binary_id,))
 
     # functions
@@ -250,4 +250,48 @@ def _ingest_one_binary(
                 "INSERT INTO nvram_defaults "
                 "(binary_id, key, default_value, flags, member_index) VALUES (?, ?, ?, ?, ?)",
                 def_rows,
+            )
+
+    # detector A: static {string -> funcptr} dispatch tables. One row per entry; the detector-level
+    # completeness (incomplete by construction — MVP absolute-2-field only) is denormalized onto
+    # each row so the hunt flatten carries it without re-reading a table-level object. An empty or
+    # absent list contributes NO rows — "none of THIS form found", never "no dispatch tables exist".
+    string_tables = data.get("string_tables")
+    if isinstance(string_tables, dict):
+        comp = string_tables.get("completeness")
+        comp = comp if isinstance(comp, dict) else {}
+        c_status = comp.get("status")
+        c_reason = comp.get("reason")
+        c_scope = comp.get("scope")
+        st_rows: list[tuple[Any, ...]] = []
+        for t in string_tables.get("tables", []):
+            if not isinstance(t, dict):
+                continue
+            table_addr = t.get("table_addr")
+            stride = t.get("stride")
+            for i, e in enumerate(t.get("entries", [])):
+                if not isinstance(e, dict):
+                    continue
+                st_rows.append(
+                    (
+                        binary_id,
+                        table_addr,
+                        stride,
+                        i,
+                        e.get("key"),
+                        e.get("func_name"),
+                        e.get("func_addr"),
+                        e.get("func_kind"),
+                        c_status,
+                        c_reason,
+                        c_scope,
+                    )
+                )
+        if st_rows:
+            conn.executemany(
+                "INSERT INTO string_tables "
+                "(binary_id, table_addr, stride, entry_index, key, func_name, func_addr, "
+                "func_kind, completeness_status, completeness_reason, completeness_scope) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                st_rows,
             )

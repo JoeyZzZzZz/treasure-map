@@ -128,6 +128,27 @@ CREATE TABLE IF NOT EXISTS nvram_defaults (
     FOREIGN KEY(binary_id) REFERENCES binaries(id) ON DELETE CASCADE
 );
 
+-- string_tables (detector A transport): static {string -> funcptr} dispatch tables recovered from
+-- the data segments (one row per entry). A deterministic edge fact (a string key selects a handler),
+-- flattened at hunt time into the atlas string_keyed_edge table (mechanism='static_string_table').
+-- The detector is incomplete by construction (MVP absolute-2-field only) — the completeness_* columns
+-- carry that honestly onto every row. WIPE-AND-REBUILD per binary each analyze run.
+CREATE TABLE IF NOT EXISTS string_tables (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    binary_id           INTEGER,
+    table_addr          TEXT,       -- table base address (groups a table's entries)
+    stride              INTEGER,    -- record stride in bytes (2*ptrsize for the MVP form)
+    entry_index         INTEGER,    -- position within the table (reproducible / debug)
+    key                 TEXT,       -- the dispatch string key (attacker-influenceable)
+    func_name           TEXT,       -- the handler function name (BinDiff-alignable anchor)
+    func_addr           TEXT,       -- the handler entry address (0x…)
+    func_kind           TEXT,       -- direct | thunk
+    completeness_status TEXT,       -- always 'incomplete' this phase (MVP absolute-2-field only)
+    completeness_reason TEXT,
+    completeness_scope  TEXT,
+    FOREIGN KEY(binary_id) REFERENCES binaries(id) ON DELETE CASCADE
+);
+
 -- 非二进制文件主表 (Round C framework; WIPE-AND-REBUILD each analyze run)
 -- sha256 = cross-firmware identity key for the knowledge base. Indexed,
 -- intentionally NOT unique (a file + its copy at another path are two findings).

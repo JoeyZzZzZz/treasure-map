@@ -452,6 +452,54 @@ def _flatten_string_keyed_edges(
     return rows
 
 
+def _flatten_string_tables(db_path: Path | str, source_run_id: str) -> list[StringKeyedEdgeRow]:
+    """Flatten detector A's static {string -> funcptr} dispatch-table entries into the SAME atlas
+    string_keyed_edge table (mechanism='static_string_table'), one row per entry.
+
+    ★ IRON LAW: a table entry is an ENUMERATED edge (key -> handler), never a reachability verdict.
+    The reachability layer reads it as a key lead, the candidate stays unknown. A static table has
+    no source function (it lives in .rodata), so from_function/from_func_addr are None and the
+    table_addr is set; the callee anchor is the handler's {name, addr, kind}. The detector-level
+    completeness rides on every row (incomplete by construction — MVP absolute-2-field only), so a
+    cross-version delta in an unhandled table form reads as undetermined, not a real add/remove. A
+    missing table (older analysis.db) yields no rows — the capability is still registered anyway.
+    """
+    uri = f"file:{Path(db_path)}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        rows = conn.execute(
+            "SELECT s.table_addr, s.key, s.func_name, s.func_addr, s.func_kind, "
+            "s.completeness_status, s.completeness_reason, s.completeness_scope, b.name AS binary "
+            "FROM string_tables s LEFT JOIN binaries b ON b.id = s.binary_id"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []  # pre-detector-A analysis.db -> no data (capability still registered)
+    finally:
+        conn.close()
+    out: list[StringKeyedEdgeRow] = []
+    for r in rows:
+        c_status = r[5] if r[5] in ("complete", "incomplete", "partial") else "incomplete"
+        out.append(
+            StringKeyedEdgeRow(
+                source_run_id=source_run_id,
+                binary=r[8],
+                from_function=None,  # a static table has no source function (it lives in .rodata)
+                from_func_addr=None,
+                key=r[1] if isinstance(r[1], str) else None,
+                mechanism="static_string_table",
+                callee_name=r[2] if isinstance(r[2], str) else None,
+                callee_addr=r[3] if isinstance(r[3], str) else None,
+                callee_kind=r[4] if isinstance(r[4], str) else None,
+                ladder_size=None,  # ladder_size is a strcmp-ladder concept; N/A for a static table
+                table_addr=r[0] if isinstance(r[0], str) else None,
+                completeness_status=c_status,
+                completeness_reason=r[6] if isinstance(r[6], str) else None,
+                completeness_scope=r[7] if isinstance(r[7], str) else None,
+            )
+        )
+    return out
+
+
 def _load_wrapper_data(
     db_path: Path | str,
 ) -> tuple[dict[int, dict[str, Any]], dict[int, list[dict[str, Any]]]]:
@@ -669,6 +717,9 @@ def run_analyzer2(
     string_keyed_edge_rows = _flatten_string_keyed_edges(
         all_funcs, _load_string_keyed_edges(db_path), source_run_id
     )
+    # detector A: static {string -> funcptr} dispatch tables land in the SAME atlas edge table
+    # (mechanism='static_string_table'), so both detectors share one query + MCP surface + cap key.
+    string_keyed_edge_rows += _flatten_string_tables(db_path, source_run_id)
     # Capability registry: register that this run produced string-keyed-edge facts. UNCONDITIONAL —
     # the detector code ran in this tmap version, so the capability is present even if it found zero
     # edges (absence-of-findings is not absence-of-capability). A cross-version diff iterates these.

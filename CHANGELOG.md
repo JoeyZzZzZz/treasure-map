@@ -35,6 +35,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reachability layer, as a key lead appended to a candidate's note. **★ IRON LAW: these are
   ENUMERATED edges, never a reachability verdict — a candidate that is an edge callee stays
   `reachability=unknown`; the key is a lead the agent confirms.**
+- **String-keyed edges from static dispatch tables (detector A).** A companion Ghidra detector walks
+  the initialized, non-executable data segments for a static `{string, funcptr}` dispatch table — a
+  run of ≥4 records at a fixed `2*ptrsize` stride where one word resolves to a `.rodata` string (the
+  key) and the next to a `.text` function entry (the handler). ★ rather-miss-than-err: a table is
+  collected only when *every* record resolves both pointers, so a random `{ptr,ptr}` array or a data
+  fragment is never mistaken for a table. It lands in the same `string_keyed_edge` atlas table
+  (`mechanism='static_string_table'`), so one query, one MCP tool, and one capability key serve both
+  detectors. The MVP recognizes absolute-addressed 2-field tables only; GOT/PIC-relative, MIPS, and
+  3-field forms are not detected and are marked `incomplete` on every row (missed honestly, never
+  misreported). Same iron law: a table entry is an enumerated edge, never a reachability verdict.
 - **`public_cve_pattern.origin` provenance guard.** Every externally imported CVE-pattern row is
   now tagged `origin='external_import'` — a machine-readable guard (on top of the existing physical
   table separation) so external/agent-imported material can never be read as deterministic tmap

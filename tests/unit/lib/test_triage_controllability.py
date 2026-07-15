@@ -986,3 +986,15 @@ def test_no_string_keyed_edge_leaves_reachability_note_edge_free() -> None:
     d = _dim_reachability("unknown", (), ())
     assert d.state == "unknown"
     assert "STRING-KEYED EDGE" not in d.note
+
+
+def test_static_string_table_edge_also_stays_unknown() -> None:
+    # The iron law is mechanism-agnostic: a detector-A static {string -> funcptr} table entry is a
+    # key lead exactly like a strcmp gate — the candidate stays reachability=unknown.
+    from treasure_map.lib.query.triage import _dim_reachability
+
+    edge = {"key": "nvram_dump", "from_function": None, "mechanism": "static_string_table"}
+    d = _dim_reachability("unknown", (), (edge,))
+    assert d.state == "unknown"
+    assert d.value == "unknown"
+    assert "nvram_dump" in d.note

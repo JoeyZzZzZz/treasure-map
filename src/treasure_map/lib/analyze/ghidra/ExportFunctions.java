@@ -738,6 +738,119 @@ public class ExportFunctions extends GhidraScript {
         try { return strAt(a); } catch (Exception e) { return null; }
     }
 
+    // ============ static string tables (detector A: {string, funcptr} dispatch tables) ============
+    // Scan initialized, non-executable data blocks (.rodata/.data) for a run of >= MIN_RUN records at
+    // a fixed 2*ptrsize stride where word[0] resolves to a .rodata string (the key) and word[ptrsize]
+    // resolves to a .text function entry (the handler). A DETERMINISTIC EDGE FACT — a static
+    // {key -> handler} dispatch table — never a reachability verdict; the reachability layer reads it
+    // as a key lead, the candidate stays unknown. ★ rather-miss-than-err: a table is collected ONLY
+    // when EVERY record in the run resolves BOTH pointers (a string AND a real function), so a random
+    // {ptr,ptr} array or a data/JSON fragment is never mistaken for a table. MVP recognizes
+    // ABSOLUTE-addressed 2-field tables only; GOT/PIC-relative, MIPS, and 3-field ({name,int,func})
+    // forms are NOT detected and are marked incomplete (missed honestly, never misreported).
+    private static final int STRTBL_MIN_RUN = 4;             // >= 4 consecutive records = a real table
+    private static final int STRTBL_MAX_ENTRIES = 4096;      // per-table cap (bounds a runaway walk)
+    private static final long STRTBL_MAX_PROBES = 2_000_000L; // total aligned probes per binary
+
+    private String buildStringTables() {
+        Memory mem = currentProgram.getMemory();
+        FunctionManager fm = currentProgram.getFunctionManager();
+        int ps = currentProgram.getDefaultPointerSize();
+        long stride = 2L * ps;
+        StringBuilder tables = new StringBuilder("[");
+        boolean firstT = true;
+        long probes = 0;
+        for (MemoryBlock blk : mem.getBlocks()) {
+            if (!blk.isInitialized() || blk.isExecute()) continue;   // data only, never code
+            Address end = blk.getEnd();
+            Address a = blk.getStart();
+            while (a != null && end.subtract(a) >= stride - 1) {
+                if (probes++ > STRTBL_MAX_PROBES) { a = null; break; }
+                String[] rec = tableRecord(a, ps, mem, fm);
+                if (rec == null) { a = safeAdd(a, ps); continue; }
+                // A record resolved: greedily extend the run at this stride until one fails.
+                List<String[]> entries = new ArrayList<>();
+                entries.add(rec);
+                Address b = safeAdd(a, stride);
+                while (b != null && end.subtract(b) >= stride - 1
+                       && entries.size() < STRTBL_MAX_ENTRIES) {
+                    String[] r2 = tableRecord(b, ps, mem, fm);
+                    if (r2 == null) break;
+                    entries.add(r2);
+                    b = safeAdd(b, stride);
+                }
+                if (entries.size() >= STRTBL_MIN_RUN) {
+                    if (!firstT) tables.append(",");
+                    firstT = false;
+                    tables.append("{\"table_addr\":\"0x").append(Long.toHexString(a.getOffset()))
+                          .append("\",\"stride\":").append(stride)
+                          .append(",\"count\":").append(entries.size()).append(",\"entries\":[");
+                    for (int i = 0; i < entries.size(); i++) {
+                        String[] e = entries.get(i);
+                        if (i > 0) tables.append(",");
+                        tables.append("{\"key\":\"").append(esc(e[0]))
+                              .append("\",\"func_name\":\"").append(esc(e[1]))
+                              .append("\",\"func_addr\":\"").append(esc(e[2]))
+                              .append("\",\"func_kind\":\"").append(esc(e[3])).append("\"}");
+                    }
+                    tables.append("]}");
+                    a = b;   // resume past the whole run (b may be null at the block edge)
+                } else {
+                    a = safeAdd(a, ps);   // too short to be a table: advance minimally
+                }
+            }
+        }
+        tables.append("]");
+        // The detector is structurally incomplete (MVP absolute-2-field only); say so on EVERY run so
+        // a cross-version table delta in an unhandled form reads as undetermined, not a real change.
+        return "{\"tables\":" + tables + ",\"completeness\":{\"status\":\"incomplete\",\"reason\":"
+             + "\"got_relative_and_three_field_and_mips_not_detected\",\"scope\":"
+             + "\"absolute_2field_only\"}}";
+    }
+
+    // One {string_ptr, func_ptr} record at address a -> {key, func_name, func_addr, func_kind}, or
+    // null when either pointer does not resolve. The key ptr is read + resolved FIRST (the cheap,
+    // usually-failing test) so the common non-record probe costs one read, not a function lookup.
+    private String[] tableRecord(Address a, int ps, Memory mem, FunctionManager fm) {
+        long p0;
+        try { p0 = readPtr(a, ps, mem); } catch (Exception e) { return null; }
+        if (p0 == 0) return null;
+        String key;
+        try { key = strAtRodata(toAddr(p0), mem); } catch (Exception e) { key = null; }
+        if (key == null || key.isEmpty()) return null;
+        long p1;
+        try { p1 = readPtr(a.add(ps), ps, mem); } catch (Exception e) { return null; }
+        if (p1 == 0) return null;
+        String[] fn = funcAtPtr(toAddr(p1), fm);
+        if (fn == null) return null;
+        return new String[]{ key, fn[0], fn[1], fn[2] };
+    }
+
+    private long readPtr(Address a, int ps, Memory mem) throws Exception {
+        if (ps == 8) return mem.getLong(a);
+        return mem.getInt(a) & 0xFFFFFFFFL;
+    }
+
+    // Resolve a data pointer to a {name, entry-addr, kind} function anchor, or null when it is not an
+    // EXACT function entry — so a {string_ptr, non-function-ptr} pair is rejected (rather-miss-than-err).
+    private String[] funcAtPtr(Address to, FunctionManager fm) {
+        if (to == null) return null;
+        Function f = fm.getFunctionAt(to);
+        if (f == null) return null;   // must be a function entry, not a mid-body / non-function ptr
+        if (f.isThunk()) {
+            Function th = f.getThunkedFunction(true);
+            if (th != null)
+                return new String[]{ th.getName(),
+                    "0x" + Long.toHexString(th.getEntryPoint().getOffset()), "thunk" };
+        }
+        return new String[]{ f.getName(),
+            "0x" + Long.toHexString(f.getEntryPoint().getOffset()), "direct" };
+    }
+
+    private Address safeAdd(Address a, long delta) {
+        try { return a.add(delta); } catch (Exception e) { return null; }
+    }
+
     // Classify ONE key varnode into {"constant","<key>"} / {"parametric","<template>"} /
     // {"unresolved", null}. resolveConst reads a constant string key; a stack slot built by a string
     // writer is a parametric (built) key whose printf template is recovered when available.
@@ -1668,6 +1781,16 @@ public class ExportFunctions extends GhidraScript {
             nvramDefaults = "{\"located\":false}";
         }
 
+        // 4c. Detector A: static {string -> funcptr} dispatch tables in the data segments. A pure
+        // data-segment fact (no function body carries it). Additive + isolated: any failure yields an
+        // empty table list with the honest incomplete flag, never breaking the scan.
+        String stringTables = "{\"tables\":[]}";
+        try {
+            stringTables = buildStringTables();
+        } catch (Throwable ignore) {
+            stringTables = "{\"tables\":[]}";
+        }
+
         // 5. Write JSON output file — atomically.
         // Write to a .tmp sibling first, then ATOMIC_MOVE into place so an
         // interrupted JVM (killpg on timeout / OOM) can never leave a partial
@@ -1692,7 +1815,10 @@ public class ExportFunctions extends GhidraScript {
             pw.print("\"strings_truncated\":" + strTruncated + ",");
             // Naming-bridge phase 1: the router_defaults web-settable key table (located:false when
             // the symbol is absent — NOT "no web-settable keys", which would be a false negative).
-            pw.print("\"nvram_defaults\":"    + nvramDefaults);
+            pw.print("\"nvram_defaults\":"    + nvramDefaults + ",");
+            // Detector A: static {string -> funcptr} dispatch tables (incomplete by construction —
+            // MVP absolute-2-field only; an empty list is "none of THAT form", never "no dispatch").
+            pw.print("\"string_tables\":"     + stringTables);
             pw.print("}");
         }
         try {

@@ -201,6 +201,94 @@ def test_ingest_router_defaults_not_located_writes_nothing(tmp_path: Path) -> No
     conn.close()
 
 
+def test_ingest_parses_string_tables(tmp_path: Path) -> None:
+    """Detector A: a top-level string_tables object ingests one row per entry, carrying the callee
+    anchor and the detector-level completeness denormalized onto each row (neutral keys)."""
+    conn, sha_to_id = _setup_db(tmp_path)
+    output_dir = tmp_path / "ghidra_output"
+    _write_ghidra_json(
+        output_dir,
+        "test_bin",
+        "a" * 64,
+        {
+            "functions": [],
+            "imports": [],
+            "exports": [],
+            "strings": [],
+            "string_tables": {
+                "tables": [
+                    {
+                        "table_addr": "0x74920",
+                        "stride": 8,
+                        "count": 2,
+                        "entries": [
+                            {
+                                "key": "nvram_dump",
+                                "func_name": "FUN_000561e4",
+                                "func_addr": "0x000561e4",
+                                "func_kind": "direct",
+                            },
+                            {
+                                "key": "sys_reboot",
+                                "func_name": "do_reboot",
+                                "func_addr": "0x00011000",
+                                "func_kind": "direct",
+                            },
+                        ],
+                    }
+                ],
+                "completeness": {
+                    "status": "incomplete",
+                    "reason": "got_relative_and_three_field_and_mips_not_detected",
+                    "scope": "absolute_2field_only",
+                },
+            },
+        },
+    )
+    ingest_ghidra_output(conn, output_dir, [_make_record("test_bin", "a" * 64)], sha_to_id)
+    rows = {
+        r[0]: (r[1], r[2], r[3], r[4], r[5])
+        for r in conn.execute(
+            "SELECT key, func_name, func_addr, func_kind, entry_index, completeness_status, "
+            "completeness_scope FROM string_tables"
+        )
+    }
+    assert rows["nvram_dump"][:4] == ("FUN_000561e4", "0x000561e4", "direct", 0)
+    assert rows["sys_reboot"][:4] == ("do_reboot", "0x00011000", "direct", 1)
+    # the detector-level completeness rides on every row (incomplete by construction)
+    st = conn.execute(
+        "SELECT completeness_status, completeness_scope FROM string_tables WHERE key='nvram_dump'"
+    ).fetchone()
+    assert st[0] == "incomplete"
+    assert st[1] == "absolute_2field_only"
+    conn.close()
+
+
+def test_ingest_string_tables_empty_writes_nothing(tmp_path: Path) -> None:
+    """An empty table list (the Java detector found no absolute-2-field table, or rejected noise)
+    contributes NO rows — 'none of THIS form', never a spurious dispatch fact."""
+    conn, sha_to_id = _setup_db(tmp_path)
+    output_dir = tmp_path / "ghidra_output"
+    _write_ghidra_json(
+        output_dir,
+        "test_bin",
+        "a" * 64,
+        {
+            "functions": [],
+            "imports": [],
+            "exports": [],
+            "strings": [],
+            "string_tables": {
+                "tables": [],
+                "completeness": {"status": "incomplete", "scope": "absolute_2field_only"},
+            },
+        },
+    )
+    ingest_ghidra_output(conn, output_dir, [_make_record("test_bin", "a" * 64)], sha_to_id)
+    assert conn.execute("SELECT COUNT(*) FROM string_tables").fetchone()[0] == 0
+    conn.close()
+
+
 def test_ingest_stores_a2_wrapper_fields(tmp_path: Path) -> None:
     """The A2 transport columns round-trip: a thin wrapper carries nvram_wrapper, a caller carries
     wrapper_call_args; a plain function defaults NULL/'[]' (no wrapper data until re-scan)."""
