@@ -1006,6 +1006,116 @@ def test_string_keyed_edges_query_by_callee_and_by_run(tmp_path: Path) -> None:
         conn.close()
 
 
+# ── one-hop string-key leads: downward from the edge callee, annotation only ─────────
+
+
+def _fat_handler_fw() -> list[dict[str, object]]:
+    """The flagship shape: a strcmp ladder dispatches key -> handler; the handler is FAT (it builds
+    a command and calls TWO sinks). Each sink is one hop below the edge callee."""
+    return [
+        {
+            "name": "rc",
+            "funcs": [
+                _ske_fn(
+                    "handle_notifications",
+                    [
+                        {
+                            "key": "oauth_auth_code",
+                            "mechanism": "strcmp_gate",
+                            "ladder_size": 3,
+                            "callees": [
+                                {"name": "gen_token_email", "addr": "0x000b643c", "kind": "direct"}
+                            ],
+                            "completeness": {"status": "complete"},
+                        }
+                    ],
+                    address="000b6000",
+                ),
+                {  # the FAT edge callee: calls two sinks, plus unrelated work
+                    "name": "gen_token_email",
+                    "address": "000b643c",
+                    "pseudocode": "void gen_token_email(void){}",
+                    "hash": "h_gen",
+                    "callees": ["run_cmd", "log_status", "strlen"],
+                },
+                {**_cmd_injection_fn("run_cmd"), "address": "000b32a0"},
+                {**_cmd_injection_fn("log_status"), "address": "000b2ec0"},
+            ],
+        }
+    ]
+
+
+def _leads_of(atlas: Path, source_anchor: str) -> list[dict[str, object]]:
+    conn = open_atlas(atlas)
+    try:
+        row = conn.execute(
+            "SELECT flow_evidence FROM instance WHERE source_anchor = ? LIMIT 1", (source_anchor,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None or not row["flow_evidence"]:
+        return []
+    leads = json.loads(row["flow_evidence"]).get("reachability_leads", [])
+    return list(leads)
+
+
+def test_one_hop_lead_reaches_the_sink_below_a_fat_edge_callee(tmp_path: Path) -> None:
+    # ★ The capability: the sink one call below the edge callee gets the key lead. The edge callee
+    # here is deliberately FAT — a thinness gate (right for wrapper propagation, which CREATES
+    # candidates) would kill exactly this lead, so this layer must not have one.
+    db = _make_db(tmp_path, _fat_handler_fw())
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_lead")
+    leads = _leads_of(atlas, "run_cmd")
+    assert len(leads) == 1
+    assert leads[0] == {
+        "via": "string_keyed_edge",
+        "key": "oauth_auth_code",
+        "hops": 1,
+        "through": "gen_token_email",
+        "mechanism": "strcmp_gate",
+    }
+
+
+def test_fanout_edge_callee_hands_the_key_to_both_sinks_below(tmp_path: Path) -> None:
+    # One pass over the edge-callee set: a fan-out handler hands its key to EVERY candidate below.
+    db = _make_db(tmp_path, _fat_handler_fw())
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_fan")
+    for sink in ("run_cmd", "log_status"):
+        leads = _leads_of(atlas, sink)
+        assert [x["key"] for x in leads] == ["oauth_auth_code"], sink
+        assert leads[0]["through"] == "gen_token_email"
+
+
+def test_one_hop_leads_are_pure_annotation(tmp_path: Path) -> None:
+    # No new candidates, no reachability upgrade, no rank change — the leads only ANNOTATE.
+    fw = _fat_handler_fw()
+    db = _make_db(tmp_path, fw)
+    atlas = tmp_path / "atlas.db"
+    stats = run_analyzer2(db, atlas, source_run_id="run_ann")
+
+    # same firmware with the edge stripped out -> the candidate corpus must be identical
+    bare = [{**fw[0], "funcs": [{**f} for f in fw[0]["funcs"]]}]  # type: ignore[index,dict-item]
+    bare[0]["funcs"][0]["string_keyed_edges"] = {}  # type: ignore[index]
+    db2 = _make_db(tmp_path / "b", bare)
+    (tmp_path / "b").mkdir(exist_ok=True)
+    atlas2 = tmp_path / "atlas2.db"
+    stats2 = run_analyzer2(db2, atlas2, source_run_id="run_ann")
+
+    assert stats.instances_written == stats2.instances_written  # corpus unchanged by the leads
+    conn = open_atlas(atlas)
+    try:
+        # every candidate that got a lead still reads reachability_status unknown (never upgraded)
+        statuses = {
+            r["source_anchor"]: r["reachability_status"]
+            for r in conn.execute("SELECT source_anchor, reachability_status FROM instance")
+        }
+    finally:
+        conn.close()
+    assert statuses["run_cmd"] == "unknown"
+
+
 # ── detector A: static {string -> funcptr} dispatch tables (same atlas edge table) ───
 
 

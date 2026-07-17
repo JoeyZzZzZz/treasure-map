@@ -53,6 +53,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Reachability leads: string-key edges now reach one hop down, structurally.** A candidate that
+  IS an edge callee already carried its key as a prose note. A candidate one direct call BELOW an
+  edge callee — where the flagship command sink actually sits — carried nothing. Both now surface as
+  machine-readable rows on the reachability layer's `evidence`: `{via, key, hops, through}`. Zero-hop
+  is read straight from the atlas edge table; one-hop is walked downward at hunt time from each edge
+  callee into its direct callees (the atlas holds no call graph) and rides on `flow_evidence`, so one
+  pass lets a fan-out handler hand its key to every candidate below it. **The two hop depths are
+  worded differently on purpose:** zero hop means the key dispatches *here*, but one hop only means
+  the edge callee *calls* this function — an edge callee is often a fat handler, so the note states
+  outright that the key-selected data's ARRIVAL is unproven. Deliberately **no thinness gate**: that
+  is right for wrapper propagation, which creates candidates and must cross a thin forwarder, but the
+  edge callees worth following here are exactly the fat handlers. Pure annotation — no new candidates,
+  no rank change. **★ IRON LAW: `reachability` stays `unknown`; a lead is a fact, never a grant, and
+  the word "reached" never appears.**
+
 - **String-keyed edges exposed (detector B: strcmp-ladder dispatch).** A string-keyed edge is a
   deterministic fact — an attacker-influenceable string key gates or dispatches to a set of callees.
   A new Ghidra P-Code detector enumerates each same-variable `strcmp`/`strncmp`/`strcasecmp` ladder

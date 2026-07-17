@@ -988,6 +988,86 @@ def test_no_string_keyed_edge_leaves_reachability_note_edge_free() -> None:
     assert "STRING-KEYED EDGE" not in d.note
 
 
+def _one_hop_ev(*leads: dict[str, object]) -> str:
+    return json.dumps({"reachability_leads": list(leads)})
+
+
+def test_one_hop_lead_is_structured_and_carries_the_data_arrival_caveat() -> None:
+    # ★ THE new capability: the flagship sink sits one call BELOW the edge callee. It gets a
+    # structured lead {via, key, hops:1, through} an agent reads without parsing prose, and a note
+    # that says outright the hop is STRUCTURAL — the edge callee calls it, but whether the
+    # key-selected data arrives is unproven (its edge callee is a fat handler).
+    from treasure_map.lib.query.triage import _dim_reachability
+
+    ev = _one_hop_ev(
+        {"via": "string_keyed_edge", "key": "oauth_auth_code", "hops": 1, "through": "FUN_000b643c"}
+    )
+    d = _dim_reachability("unknown", (), (), ev)
+    assert d.state == "unknown" and d.value == "unknown"  # ★ IRON LAW: a lead is not a grant
+    lead = next(x for x in d.evidence if x["hops"] == 1)
+    assert lead["key"] == "oauth_auth_code"
+    assert lead["through"] == "FUN_000b643c"
+    assert lead["via"] == "string_keyed_edge"
+    assert "NOT proven" in d.note  # the data-arrival caveat is mandatory on a 1-hop lead
+    assert "STAYS unknown" in d.note
+    assert "reached" not in d.note.lower()  # never the word that reads as a verdict
+
+
+def test_fanout_edge_callee_hands_its_key_to_every_candidate_below() -> None:
+    # A fat edge callee calls several sinks; each of them gets the same key lead through it.
+    from treasure_map.lib.query.triage import _dim_reachability
+
+    for sink in ("FUN_000b32a0", "FUN_000b2ec0"):
+        ev = _one_hop_ev(
+            {
+                "via": "string_keyed_edge",
+                "key": "oauth_auth_code",
+                "hops": 1,
+                "through": "FUN_000b643c",
+            }
+        )
+        d = _dim_reachability("unknown", (), (), ev)
+        assert d.state == "unknown", sink
+        assert d.evidence[0]["through"] == "FUN_000b643c"
+
+
+def test_zero_hop_keeps_its_tight_wording_and_gains_a_structured_lead() -> None:
+    # REGRESSION GUARD: zero hop already worked in prose. Its tight wording ("dispatches HERE") must
+    # not be loosened into the 1-hop caveat, and it now also carries hops:0 structurally.
+    from treasure_map.lib.query.triage import _dim_reachability
+
+    edge = {
+        "key": "oauth_auth_code",
+        "from_function": "handle_dispatch",
+        "mechanism": "strcmp_gate",
+    }
+    d = _dim_reachability("unknown", (), (edge,))
+    assert d.state == "unknown"
+    assert "callee of a STRING-KEYED EDGE" in d.note  # the existing tight 0-hop wording, unchanged
+    assert "one call above" not in d.note  # the loose 1-hop wording must NOT leak onto 0 hop
+    assert d.evidence[0]["hops"] == 0
+    assert d.evidence[0]["key"] == "oauth_auth_code"
+
+
+def test_zero_and_one_hop_leads_coexist_without_changing_state() -> None:
+    from treasure_map.lib.query.triage import _dim_reachability
+
+    edge = {"key": "k0", "from_function": "d", "mechanism": "strcmp_gate"}
+    ev = _one_hop_ev({"via": "string_keyed_edge", "key": "k1", "hops": 1, "through": "E"})
+    d = _dim_reachability("unknown", (), (edge,), ev)
+    assert d.state == "unknown" and d.value == "unknown"
+    assert {x["hops"] for x in d.evidence} == {0, 1}
+
+
+def test_lead_free_candidate_carries_no_lead_evidence() -> None:
+    # Purely additive: no edge, no leads, and the note is untouched.
+    from treasure_map.lib.query.triage import _dim_reachability
+
+    d = _dim_reachability("unknown", (), (), json.dumps({"source_kind": "free_string"}))
+    assert d.evidence == ()
+    assert "one call above" not in d.note
+
+
 def test_static_string_table_edge_also_stays_unknown() -> None:
     # The iron law is mechanism-agnostic: a detector-A static {string -> funcptr} table entry is a
     # key lead exactly like a strcmp gate — the candidate stays reachability=unknown.

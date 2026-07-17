@@ -842,6 +842,19 @@ def _flow_path_obj(flow_evidence: str | None) -> dict[str, Any]:
     return fp if isinstance(fp, dict) else {}
 
 
+def _flow_list(flow_evidence: str | None, key: str) -> list[Any]:
+    """A top-level LIST stored on flow_evidence under ``key``; [] when absent or unparsable (so a
+    candidate written before the field existed simply carries none)."""
+    if not flow_evidence:
+        return []
+    try:
+        data = json.loads(flow_evidence)
+    except (ValueError, TypeError):
+        return []
+    val = data.get(key) if isinstance(data, dict) else None
+    return val if isinstance(val, list) else []
+
+
 def _sanitizer_records(flow_evidence: str | None) -> list[dict[str, Any]]:
     """The stored flow_evidence.sanitizer_seen list; [] when absent or unparsable."""
     if not flow_evidence:
@@ -1051,6 +1064,58 @@ _REACH_CAVEAT_COMPLETENESS = (
 )
 
 
+def _edge_leads(
+    edges: tuple[dict[str, Any], ...], flow_evidence: str | None
+) -> tuple[dict[str, Any], ...]:
+    """The structured string-key leads for this candidate — machine-readable, unambiguous.
+
+    Merges the two sources, which answer two different hop depths:
+      * hops=0 — this function IS an edge callee (read straight from the atlas edge table).
+      * hops=1 — this function sits one direct call below an edge callee (precomputed at hunt time
+        onto flow_evidence, since the atlas holds no call graph), carrying ``through``.
+
+    ★ IRON LAW: a lead is a FACT, never a reachability verdict. It NEVER changes the dimension's
+    state/value — it rides in ``evidence`` so an agent reads the key without parsing prose.
+    """
+    leads: list[dict[str, Any]] = [
+        {
+            "via": "string_keyed_edge",
+            "key": e.get("key"),
+            "hops": 0,
+            "from_function": e.get("from_function"),
+            "mechanism": e.get("mechanism"),
+        }
+        for e in edges
+        if e.get("key")
+    ]
+    for lead in _flow_list(flow_evidence, "reachability_leads"):
+        if isinstance(lead, dict) and lead.get("key"):
+            leads.append(lead)
+    return tuple(leads)
+
+
+def _one_hop_lead_note(leads: tuple[dict[str, Any], ...]) -> str:
+    """The one-hop line. ★ Deliberately LOOSER than the zero-hop wording, and never reuse that one:
+    zero hop means the key dispatches straight HERE, but one hop only means the edge callee CALLS
+    this function — an edge callee is often a fat handler, so the key's data may never arrive. Say
+    that outright: a fan-out handler otherwise mass-produces leads that read as proven."""
+    one_hop = [x for x in leads if x.get("hops") == 1]
+    if not one_hop:
+        return ""
+    shown = one_hop[:3]
+    parts = [f"key='{x.get('key')}' through {x.get('through') or '?'}" for x in shown]
+    more = f" (+{len(one_hop) - len(shown)} more)" if len(one_hop) > len(shown) else ""
+    return (
+        " Also: a STRING-KEYED EDGE lands one call above this function — "
+        + "; ".join(parts)
+        + more
+        + ". STRUCTURAL one hop only: the edge callee CALLS this function, but whether the "
+        "key-selected data ARRIVES here is NOT proven (an edge callee is often a fat handler that "
+        "calls much unrelated to the key it matched). reachability STAYS unknown — confirm the "
+        "hop yourself. See the layer's evidence for the structured leads."
+    )
+
+
 def _string_keyed_edge_note(edges: tuple[dict[str, Any], ...]) -> str:
     """A one-line summary of the string-keyed edge(s) whose callee is this candidate's function — a
     KEY LEAD, never a reachability verdict. Empty when there are none. ★ IRON LAW: this text ADDS a
@@ -1079,6 +1144,7 @@ def _dim_reachability(
     entry_reach: str,
     web_triggers: tuple[str, ...] = (),
     string_keyed_edges: tuple[dict[str, Any], ...] = (),
+    flow_evidence: str | None = None,
 ) -> Dimension:
     """Which kind of rootfs entry references this binary? A MECHANISTIC label — entry:web /
     entry:script / entry:web+script / unknown — NEVER a reachability verdict (it does not decide
@@ -1089,10 +1155,14 @@ def _dim_reachability(
     state/value (contract C7). This answers the ENTRY level only — entry->sink flow within a
     function is a separate, unmodeled question.
 
-    ★ IRON LAW: a detected string-keyed edge (this function is a dispatch callee) is APPENDED to the
-    note as a key lead — it NEVER changes ``state``/``value``. A candidate with no entry stays
-    unknown even when an edge points at it; the edge is a fact the agent confirms, not a grant."""
+    ★ IRON LAW: a string-keyed edge — whether it dispatches straight here (0 hops) or lands one call
+    above (1 hop) — is APPENDED to the note as a key lead and mirrored into ``evidence`` as a
+    structured row. It NEVER changes ``state``/``value``. A candidate with no entry stays unknown
+    even when an edge points at it; the edge is a fact the agent confirms, not a grant. The two hop
+    depths get deliberately DIFFERENT wording — see _one_hop_lead_note."""
     edge_note = _string_keyed_edge_note(string_keyed_edges)
+    leads = _edge_leads(string_keyed_edges, flow_evidence)
+    edge_note += _one_hop_lead_note(leads)
     if entry_reach.startswith("entry:"):
         trig = f" ({', '.join(web_triggers)})" if web_triggers else ""
         note = (
@@ -1106,6 +1176,7 @@ def _dim_reachability(
             entry_reach,
             "flow_evidence.entry_reach.sites (rootfs script / web-asset reference)",
             note + edge_note,
+            leads,
         )
     return Dimension(
         "reachability",
@@ -1115,6 +1186,7 @@ def _dim_reachability(
         "no rootfs script/web entry found — reported unknown (a coverage gap), NOT unreachable: "
         "the binary may be invoked indirectly, via another binary's exec, or over an unmodeled "
         "service-dispatch/IPC bridge (notify_rc); a ? never sinks" + edge_note,
+        leads,
     )
 
 
@@ -1275,7 +1347,7 @@ def _build_dimensions(
         ),
         _dim_source(source_class, source_kind),
         _dim_source_writability(nvram_key, web_settable),
-        _dim_reachability(entry_reach, web_triggers, string_keyed_edges),
+        _dim_reachability(entry_reach, web_triggers, string_keyed_edges, flow_evidence),
         _dim_filtering(flow_evidence),
         _dim_sink_impact(sink_class),
         _dim_writer(flow_evidence),

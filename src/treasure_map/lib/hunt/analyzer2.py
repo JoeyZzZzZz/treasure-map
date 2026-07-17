@@ -501,6 +501,77 @@ def _flatten_string_tables(db_path: Path | str, source_run_id: str) -> list[Stri
     return out
 
 
+def _one_hop_edge_leads(
+    all_funcs: list[FuncRow],
+    edge_rows: list[StringKeyedEdgeRow],
+) -> dict[tuple[str | None, str], list[dict[str, Any]]]:
+    """Map (binary, function) -> the string-key leads that structurally reach it in ONE hop.
+
+    DOWNWARD traversal — the same direction wrapper propagation reads: start at each edge's CALLEE
+    and read ITS direct callees. One pass over the edge-callee set, so a fan-out handler naturally
+    hands its key to every function below it. Zero-hop (the edge callee itself) is NOT produced
+    here: the reachability layer already answers that straight from the atlas edge table.
+
+    ★ IRON LAW: a lead is a FACT (a key's dispatch structurally selects this code path), never a
+    reachability verdict — the reader keeps reachability=unknown.
+
+    ★ And one hop is STRUCTURAL ONLY. "E calls C" does NOT mean the key's data reaches C: an edge
+    callee is often a fat handler that calls plenty of things unrelated to the key it matched. The
+    lead says where to look; the note that carries it must say the data arrival is unproven.
+
+    Deliberately NO thinness gate. Wrapper propagation needs one because it CREATES candidates, and
+    it must pass through a THIN forwarder. This only ANNOTATES an existing candidate, and the edge
+    callees worth following are exactly the FAT handlers — a thinness filter would drop them.
+    """
+    by_bin_name: dict[tuple[str | None, str], FuncRow] = {
+        (f.binary_name, f.name): f for f in all_funcs if f.name
+    }
+    out: dict[tuple[str | None, str], list[dict[str, Any]]] = {}
+    seen: set[tuple[str | None, str, str, str]] = set()
+    for e in edge_rows:
+        if not e.callee_name or not e.key:
+            continue
+        callee_row = by_bin_name.get((e.binary, e.callee_name))
+        if callee_row is None:
+            continue  # the edge callee is not a known function here -> nothing to walk down into
+        for callee in _parse_callees(callee_row.callees):
+            if not callee or callee == e.callee_name:
+                continue
+            sig = (e.binary, callee, e.key, e.callee_name)
+            if sig in seen:
+                continue  # one function may be called several times / by several ladder arms
+            seen.add(sig)
+            out.setdefault((e.binary, callee), []).append(
+                {
+                    "via": "string_keyed_edge",
+                    "key": e.key,
+                    "hops": 1,
+                    "through": e.callee_name,
+                    "mechanism": e.mechanism,
+                }
+            )
+    return out
+
+
+def _attach_edge_leads(
+    ev: dict[str, Any],
+    edge_leads: dict[tuple[str | None, str], list[dict[str, Any]]],
+    binary: str | None,
+    func_name: str | None,
+) -> None:
+    """Ride this function's one-hop string-key leads along on its flow evidence.
+
+    A surfaced FACT only: nothing reads it back into recall, the grade, or the rank — it is an
+    annotation the reachability layer renders, and the candidate's reachability stays unknown.
+    Absent when there are none (never an empty key), so old evidence reads identically.
+    """
+    if not func_name:
+        return
+    leads = edge_leads.get((binary, func_name))
+    if leads:
+        ev["reachability_leads"] = leads
+
+
 def _load_wrapper_data(
     db_path: Path | str,
 ) -> tuple[dict[int, dict[str, Any]], dict[int, list[dict[str, Any]]]]:
@@ -721,6 +792,11 @@ def run_analyzer2(
     # detector A: static {string -> funcptr} dispatch tables land in the SAME atlas edge table
     # (mechanism='static_string_table'), so both detectors share one query + MCP surface + cap key.
     string_keyed_edge_rows += _flatten_string_tables(db_path, source_run_id)
+    # ONE-HOP string-key leads: which candidates sit one direct call below an edge callee. Computed
+    # here because the call graph lives in the analysis DB (the atlas holds no callgraph), and rides
+    # to the reachability layer on flow_evidence — the same compute-at-hunt/read-at-triage path as
+    # entry_reach. Zero-hop needs no precompute: it is a direct atlas edge lookup at read time.
+    edge_leads = _one_hop_edge_leads(all_funcs, string_keyed_edge_rows)
     # Capability registry: register that this run produced string-keyed-edge facts. UNCONDITIONAL —
     # the detector code ran in this tmap version, so the capability is present even if it found zero
     # edges (absence-of-findings is not absence-of-capability). A cross-version diff iterates these.
@@ -899,6 +975,7 @@ def run_analyzer2(
                     # value-origin facts ride alongside the text-level source_kind/flow_path. A
                     # value-origin facts. A surfaced fact only, never read into recall/score/grade.
                     ev["sink_arg_provenance"] = sink_prov_by_func.get(match.func_ref.func_id, [])
+                    _attach_edge_leads(ev, edge_leads, row.binary_name, match.func_ref.func_name)
                     flow_evidence = json.dumps(ev, sort_keys=True)
                 elif match.sink_class == "copy" and sink_name is not None:
                     # Copy candidates carry SIZE evidence (the danger axis): the length source
@@ -907,12 +984,13 @@ def run_analyzer2(
                     # entry-reach), and the honest trace boundary. Never a verdict —
                     # nothing reads it back into recall or the grade.
                     sites = entry_index.sites_for(row.binary_name, row.binary_path)
-                    flow_evidence = json.dumps(
-                        build_size_evidence(
-                            pseudocode=row.pseudocode, sink_name=sink_name, entry_sites=sites
-                        ),
-                        sort_keys=True,
+                    size_ev = build_size_evidence(
+                        pseudocode=row.pseudocode, sink_name=sink_name, entry_sites=sites
                     )
+                    _attach_edge_leads(
+                        size_ev, edge_leads, row.binary_name, match.func_ref.func_name
+                    )
+                    flow_evidence = json.dumps(size_ev, sort_keys=True)
                 elif match.sink_class == "fmt_string" and sink_name is not None:
                     # Format-string candidates carry flow evidence on the FORMAT argument plus the
                     # format-position facts (which arg is the format; literal-only or not).
@@ -927,6 +1005,9 @@ def run_analyzer2(
                     # provenance lexicon too; key arg = the format position).
                     fmt_ev["sink_arg_provenance"] = sink_prov_by_func.get(
                         match.func_ref.func_id, []
+                    )
+                    _attach_edge_leads(
+                        fmt_ev, edge_leads, row.binary_name, match.func_ref.func_name
                     )
                     flow_evidence = json.dumps(fmt_ev, sort_keys=True)
                 elif match.sink_class == "path_sink" and sink_name is not None:
@@ -948,6 +1029,9 @@ def run_analyzer2(
                     # No Ghidra def-use provenance for path sinks this phase — the writer layer
                     # stays not_traced (an honest '?', never sunk). Controllability comes from the
                     # text-level source_kind above.
+                    _attach_edge_leads(
+                        path_ev, edge_leads, row.binary_name, match.func_ref.func_name
+                    )
                     flow_evidence = json.dumps(path_ev, sort_keys=True)
 
                 provenance = "L1" if status in {"confirmed", "blocked"} else "L0"
