@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`evidence_ref` no longer drifts across a re-scan.** The per-instance locator was built from
+  `functions.id`, an AUTOINCREMENT rowid — and the analysis DB is delete-and-reingest per binary,
+  so SQLite (which never reuses a number) shifted every id by the whole function count on **every**
+  re-scan, with no code change required. Measured on real firmware: a four-times-scanned DB held
+  88,178 functions numbered 266,156..354,333, and one unchanged function's ref moved from
+  `#fn109348@cmd` to `#fn199770@cmd`. Any judgement stored against a ref therefore lost its anchor
+  on the next scan. The ref is now built from facts belonging to the **binary** — its content-hash
+  prefix plus the function's entry address (`<run>#<sha8>:<addr>@<sink>`) — via one shared builder
+  used by every writer. Validated against real firmware: 88,178 functions → 88,178 collision-free
+  refs. Anchoring the binary by *name* was rejected (real firmware ships distinct binaries sharing
+  one name, which collided 4,460 refs) and by *path* (it carries the vendor/model string, and a ref
+  must stay neutral). Scope is deliberately re-scan stability, not cross-recompile alignment — that
+  remains the diff layer's problem. Refs from earlier scans change shape; re-run the hunt to refresh.
+
 ### Removed
 
 - **LLM infrastructure removed — the fact substrate is now purely deterministic.** The `lib/llm/`

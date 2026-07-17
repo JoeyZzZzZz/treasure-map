@@ -31,6 +31,7 @@ def _fn(
         binary_path=f"sbin/{binary}",
         binary_sha256=str(binary_id).zfill(64),
         name=name,
+        address=f"{func_id:08x}",
         pseudocode=pseudocode,
         pseudocode_hash=f"h{func_id}",
         callees=json.dumps(callees),

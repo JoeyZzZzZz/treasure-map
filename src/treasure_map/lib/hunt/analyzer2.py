@@ -14,7 +14,7 @@ Discipline (same as A1, enforced here and by the schema):
 - L0/L1 only (confirmed/blocked -> L1, unknown -> L0); never L2/L3, never an external_anchor.
 - Evidence neutralization: R-pattern's raw, firmware-derived evidence (a matched format
   literal may carry a device path) is NEVER persisted. Traceability rides pseudocode_hash;
-  evidence_ref holds only a neutral per-instance locator (a run-scoped function id).
+  evidence_ref holds only a neutral per-instance locator (run + binary/function anchor).
 - Everything written is a graded lead, never a confirmed bug or a publishable result.
 """
 
@@ -70,6 +70,7 @@ from treasure_map.lib.hunt.evidence import (
     load_entry_index,
 )
 from treasure_map.lib.hunt.facts import is_thin_cmd_wrapper
+from treasure_map.lib.hunt.refs import build_evidence_ref
 from treasure_map.lib.hunt.wrapper_propagation import (
     find_wrapper_propagated_candidates,
 )
@@ -971,12 +972,20 @@ def run_analyzer2(
                         blocking_mechanism=blocking,
                         exposure_shape=exposure_shape,
                         provenance_level=provenance,
-                        # Neutral per-instance locator = run + function + sink-class hit. One
-                        # function can match multiple sinks (e.g. cmd and copy); each is a
-                        # distinct instance, so the sink-class suffix keeps the ref unique
-                        # (it is the single anchor used by --explain and manual jump-back).
-                        evidence_ref=(
-                            f"{source_run_id}#fn{match.func_ref.func_id}@{match.sink_class}"
+                        # Neutral, RE-SCAN-STABLE per-instance locator = run + binary/function
+                        # anchor + sink-class hit. One function can match multiple sinks (e.g. cmd
+                        # and copy); each is a distinct instance, so the sink-class suffix keeps the
+                        # ref unique (it is the single anchor used by --explain, manual jump-back,
+                        # and any durable per-ref judgement store — which is why it must not drift
+                        # across a re-scan; see build_evidence_ref).
+                        evidence_ref=build_evidence_ref(
+                            source_run_id,
+                            suffix=match.sink_class,
+                            binary_sha256=row.binary_sha256,
+                            binary_name=row.binary_name,
+                            address=row.address,
+                            func_name=match.func_ref.func_name,
+                            func_id=match.func_ref.func_id,
                         ),
                         # Candidate locatability: which binary to open in the decompiler. Carried
                         # from the source build so the candidate stays locatable once analysis.db
@@ -1071,8 +1080,16 @@ def run_analyzer2(
                         # Distinct suffix so a function that is ALSO a direct candidate (it is not,
                         # by construction) never collides; this is the wrapper-recovered instance.
                         # The axis suffix also keeps a cmd- and a fmt-via-wrapper recovery of the
-                        # same function from colliding.
-                        evidence_ref=f"{source_run_id}#fn{f.func_id}@{ref_suffix}",
+                        # same function from colliding. Same re-scan-stable anchor as above.
+                        evidence_ref=build_evidence_ref(
+                            source_run_id,
+                            suffix=ref_suffix,
+                            binary_sha256=f.binary_sha256,
+                            binary_name=f.binary_name,
+                            address=f.address,
+                            func_name=f.name,
+                            func_id=f.func_id,
+                        ),
                         binary_path=f.binary_path or f.binary_name,
                         binary_content_hash=f.binary_sha256,
                         scope_origin="intra",

@@ -10,6 +10,7 @@ boundary.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -33,6 +34,62 @@ _ATLAS_SCHEMA = _SRC / "lib" / "storage" / "atlas_schema.sql"
 RAW_EVIDENCE = "/usr/bin/tool %s"
 
 
+def _sha(name: str) -> str:
+    """A content-shaped sha256 for a fixture binary. Derived from the name so distinct binaries get
+    distinct hashes IN THEIR FIRST 8 CHARS — evidence_ref anchors the binary by that prefix, so a
+    fixture whose hashes shared a prefix (the old str(bid).zfill(64)) would collide refs."""
+    return hashlib.sha256(name.encode()).hexdigest()
+
+
+def _insert_func(
+    conn: sqlite3.Connection, bid: int, func: dict[str, object], *, fid: int | None = None
+) -> None:
+    """Insert one fixture function. ``fid=None`` omits the id so SQLite's AUTOINCREMENT assigns it —
+    exactly what ghidra_ingest does, which is what makes func_id climb on every re-ingest."""
+    nvram_wrapper = func.get("nvram_wrapper")
+    cols = "binary_id, name, address, pseudocode, pseudocode_hash, callees, nvram_ops, "
+    cols += "nvram_wrapper, wrapper_call_args, string_keyed_edges"
+    vals: tuple[object, ...] = (
+        bid,
+        func["name"],
+        func.get("address"),
+        func["pseudocode"],
+        func.get("hash"),
+        json.dumps(func["callees"]),
+        json.dumps(func.get("nvram_ops", [])),
+        json.dumps(nvram_wrapper) if nvram_wrapper else None,
+        json.dumps(func.get("wrapper_call_args", [])),
+        json.dumps(func.get("string_keyed_edges", {})),
+    )
+    if fid is not None:
+        cols = "id, " + cols
+        vals = (fid, *vals)
+    conn.execute(f"INSERT INTO functions ({cols}) VALUES ({','.join('?' * len(vals))})", vals)
+
+
+def _rescan_funcs(
+    db_path: Path, binaries: list[dict[str, object]], *, reverse: bool = False
+) -> None:
+    """Re-ingest the same firmware's functions into the SAME analysis.db — what a re-scan does.
+
+    Mirrors ghidra_ingest: DELETE this binary's function rows, then re-INSERT them WITHOUT an
+    explicit id. Because the id is AUTOINCREMENT (never reused after a delete), every func_id lands
+    past the old high-water mark — the drift that made a func_id-derived evidence_ref useless.
+    ``reverse`` additionally flips the enumeration order (what changing the extractor can do), the
+    second, smaller drift mechanism.
+    """
+    conn = open_db(db_path)
+    for bid, spec in enumerate(binaries, start=1):
+        conn.execute("DELETE FROM functions WHERE binary_id = ?", (bid,))
+        funcs = list(spec.get("funcs", []))  # type: ignore[arg-type]
+        if reverse:
+            funcs.reverse()
+        for func in funcs:
+            _insert_func(conn, bid, func)  # no explicit id -> AUTOINCREMENT assigns
+    conn.commit()
+    conn.close()
+
+
 def _make_db(
     tmp_path: Path,
     binaries: list[dict[str, object]],
@@ -52,7 +109,7 @@ def _make_db(
     for bid, spec in enumerate(binaries, start=1):
         conn.execute(
             "INSERT INTO binaries (id, name, path, sha256) VALUES (?, ?, ?, ?)",
-            (bid, spec["name"], spec.get("path"), str(bid).zfill(64)),
+            (bid, spec["name"], spec.get("path"), _sha(str(spec["name"]))),
         )
         if spec.get("oss"):
             conn.execute(
@@ -61,26 +118,7 @@ def _make_db(
             )
         for func in spec.get("funcs", []):  # type: ignore[union-attr]
             fid += 1
-            nvram_wrapper = func.get("nvram_wrapper")
-            conn.execute(
-                "INSERT INTO functions "
-                "(id, binary_id, name, address, pseudocode, pseudocode_hash, callees, nvram_ops, "
-                "nvram_wrapper, wrapper_call_args, string_keyed_edges) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    fid,
-                    bid,
-                    func["name"],
-                    func.get("address"),
-                    func["pseudocode"],
-                    func.get("hash"),
-                    json.dumps(func["callees"]),
-                    json.dumps(func.get("nvram_ops", [])),
-                    json.dumps(nvram_wrapper) if nvram_wrapper else None,
-                    json.dumps(func.get("wrapper_call_args", [])),
-                    json.dumps(func.get("string_keyed_edges", {})),
-                ),
-            )
+            _insert_func(conn, bid, func, fid=fid)
         for m in spec.get("nvram_defaults", []):  # type: ignore[union-attr]
             conn.execute(
                 "INSERT INTO nvram_defaults "
@@ -1067,6 +1105,158 @@ def test_static_table_and_strcmp_gate_share_query_and_capability(tmp_path: Path)
         conn.close()
 
 
+# ── evidence_ref is RE-SCAN STABLE (a durable per-ref judgement store depends on it) ──
+# Real-firmware root cause these guard: func_id is an AUTOINCREMENT rowid and the analysis DB is
+# delete-and-reingest per binary, so a re-scanned DB held 88,178 functions numbered 266,156..354,333
+# — every id shifted by the function count on EVERY re-scan, with zero code change. A ref built on
+# it drifts, and every judgement stored against the old ref silently loses its anchor.
+
+
+def _rc_dispatch_fw() -> list[dict[str, object]]:
+    """Two command-sink candidates in one binary, each at a fixed entry address."""
+    return [
+        {
+            "name": "rc",
+            "funcs": [
+                {**_cmd_injection_fn("FUN_000b32a0"), "address": "000b32a0"},
+                {**_cmd_injection_fn("FUN_000b643c"), "address": "000b643c"},
+            ],
+        }
+    ]
+
+
+def _ref_of(atlas: Path, source_anchor: str) -> str:
+    conn = open_atlas(atlas)
+    try:
+        row = conn.execute(
+            "SELECT evidence_ref FROM instance WHERE source_anchor = ? LIMIT 1", (source_anchor,)
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is not None, f"no instance anchored at {source_anchor}"
+    return str(row["evidence_ref"])
+
+
+def _func_id_of(db: Path, name: str) -> int:
+    conn = open_db(db)
+    try:
+        return int(conn.execute("SELECT id FROM functions WHERE name = ?", (name,)).fetchone()[0])
+    finally:
+        conn.close()
+
+
+def test_evidence_ref_survives_a_rescan(tmp_path: Path) -> None:
+    # ★ THE property: re-scan the same firmware, get the SAME ref for the same function. The old
+    # func_id-derived ref failed exactly here (fn109348 -> fn199770 on real firmware, one function).
+    fw = _rc_dispatch_fw()
+    db = _make_db(tmp_path, fw)
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_1")
+    ref_before = _ref_of(atlas, "FUN_000b32a0")
+    id_before = _func_id_of(db, "FUN_000b32a0")
+
+    _rescan_funcs(db, fw)  # same firmware, same order — only the ingest bookkeeping moves
+    run_analyzer2(db, atlas, source_run_id="run_1")
+    ref_after = _ref_of(atlas, "FUN_000b32a0")
+    id_after = _func_id_of(db, "FUN_000b32a0")
+
+    # The drift mechanism really fired (else this test would pass vacuously on any scheme):
+    assert id_after != id_before, "fixture did not reproduce func_id drift — test is vacuous"
+    # ...and the ref did NOT move with it.
+    assert ref_after == ref_before
+    assert "000b32a0" in ref_before  # anchored on the entry address, not on ingest bookkeeping
+    assert f"fn{id_before}" not in ref_before  # never the rowid
+
+
+def test_evidence_ref_survives_enumeration_order_change(tmp_path: Path) -> None:
+    # Adding/removing a detector can reorder the extractor's function enumeration. That reorders the
+    # AUTOINCREMENT ids; the ref must not care (spec acceptance 2).
+    fw = _rc_dispatch_fw()
+    db = _make_db(tmp_path, fw)
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_1")
+    ref_before = _ref_of(atlas, "FUN_000b32a0")
+
+    _rescan_funcs(db, fw, reverse=True)  # enumeration order flipped
+    run_analyzer2(db, atlas, source_run_id="run_1")
+
+    assert _ref_of(atlas, "FUN_000b32a0") == ref_before
+
+
+def test_stored_judgement_keeps_its_anchor_across_a_rescan(tmp_path: Path) -> None:
+    # The reason the property matters: the durable judgement store keys its records by evidence_ref.
+    # Record one against a candidate, re-scan, and it must still resolve to that same live candidate
+    # (spec acceptance 3). Under the old func_id ref this silently went dangling on every re-scan.
+    from treasure_map.lib.atlas.writer import add_private_exploit
+    from treasure_map.lib.query.exploit_ledger import list_moat
+
+    fw = _rc_dispatch_fw()
+    db = _make_db(tmp_path, fw)
+    atlas_p = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas_p, source_run_id="run_1")
+    ref = _ref_of(atlas_p, "FUN_000b32a0")
+
+    conn = open_atlas(atlas_p)
+    add_private_exploit(conn, evidence_ref=ref, pattern="p", exploit_note="verified by hand")
+    conn.close()
+
+    _rescan_funcs(db, fw, reverse=True)  # re-scan: func_ids climb AND the order flips
+    run_analyzer2(db, atlas_p, source_run_id="run_1")
+
+    conn = open_atlas(atlas_p)
+    try:
+        moat = list_moat(conn)
+        # the record still anchors a LIVE candidate — it did not go dangling
+        still_anchored = conn.execute(
+            "SELECT COUNT(*) FROM instance WHERE evidence_ref = ?", (ref,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert moat["holes"] == 1, "the stored judgement lost its anchor after a re-scan"
+    assert still_anchored == 1
+    assert _ref_of(atlas_p, "FUN_000b32a0") == ref  # the candidate still carries the same ref
+
+
+def test_evidence_ref_distinguishes_same_named_binaries(tmp_path: Path) -> None:
+    # Real firmware ships DISTINCT binaries under one name (measured: 479 binaries, 475 names —
+    # libstdc++.so.6/mtdinfo/nanddump/ubinfo each twice). Anchoring the binary by NAME would collide
+    # 4,460 functions' refs; the content-hash prefix keeps them apart even at the same address.
+    fw: list[dict[str, object]] = [
+        {
+            "name": "mtdinfo",
+            "path": "bin/mtdinfo",
+            "funcs": [{**_cmd_injection_fn("handler"), "address": "00400100"}],
+        },
+        {
+            "name": "mtdinfo",
+            "path": "usr/sbin/mtdinfo",
+            "funcs": [{**_cmd_injection_fn("handler"), "address": "00400100"}],
+        },
+    ]
+    # distinct content -> distinct sha; _make_db derives sha from the name, so vary it by path here
+    db = tmp_path / "analysis.db"
+    conn = open_db(db)
+    for bid, spec in enumerate(fw, start=1):
+        conn.execute(
+            "INSERT INTO binaries (id, name, path, sha256) VALUES (?, ?, ?, ?)",
+            (bid, spec["name"], spec["path"], _sha(str(spec["path"]))),
+        )
+        for func in spec["funcs"]:  # type: ignore[union-attr]
+            _insert_func(conn, bid, func)  # type: ignore[arg-type]
+    conn.commit()
+    conn.close()
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_1")
+
+    conn = open_atlas(atlas)
+    try:
+        refs = [r["evidence_ref"] for r in conn.execute("SELECT evidence_ref FROM instance")]
+    finally:
+        conn.close()
+    assert len(refs) == 2
+    assert len(set(refs)) == 2, f"same-named binaries collided at the same address: {refs}"
+
+
 # ── evidence neutralization: raw literal never persisted ────────────────────────────
 
 
@@ -1123,7 +1313,7 @@ def test_instance_carries_binary_location(tmp_path: Path) -> None:
 
     (row,) = _instances(atlas)
     assert row["binary_path"] == "usr/sbin/webd"  # full path, not the bare name
-    assert row["binary_content_hash"] == str(1).zfill(64)  # the source binary's sha256
+    assert row["binary_content_hash"] == _sha("webd")  # the source binary's sha256
 
 
 def test_binary_path_falls_back_to_name_when_source_has_no_path(tmp_path: Path) -> None:

@@ -31,6 +31,7 @@ from treasure_map.lib.atlas.models import InstanceRow, PatternRow
 from treasure_map.lib.atlas.writer import add_instance, upsert_pattern
 from treasure_map.lib.diff import Axis, run_diff
 from treasure_map.lib.diff.loader import FuncRow, load_functions
+from treasure_map.lib.hunt.refs import build_evidence_ref
 from treasure_map.lib.pattern.classes import CMD, COPY, FORMAT
 from treasure_map.lib.reachability import grade_candidate
 from treasure_map.lib.reachability.taint import locate_sink_arg, origin_of
@@ -194,11 +195,19 @@ def run_diff_analyzer(
                     provenance_level=provenance,
                     fix_diff=fix_diff,
                     scope_origin=axis,
-                    # Neutral per-instance locator = run + function + sink-class hit; the
-                    # sink-class suffix keeps it unique when a function matches multiple sinks
-                    # (the single anchor used by --explain and manual jump-back). Same format
-                    # as analyzer2.
-                    evidence_ref=f"{run_id_a}#fn{lead.func_ref_a.func_id}@{sink_class}",
+                    # Neutral, RE-SCAN-STABLE per-instance locator = run + binary/function anchor +
+                    # sink-class hit; the sink-class suffix keeps it unique when a function matches
+                    # multiple sinks (the single anchor used by --explain and manual jump-back).
+                    # Same builder as analyzer2, so one ref scheme spans every writer.
+                    evidence_ref=build_evidence_ref(
+                        run_id_a,
+                        suffix=sink_class,
+                        binary_sha256=baseline.binary_sha256,
+                        binary_name=baseline.binary_name,
+                        address=baseline.address,
+                        func_name=lead.func_ref_a.func_name,
+                        func_id=lead.func_ref_a.func_id,
+                    ),
                     # Candidate locatability: which binary (baseline build) to open in the
                     # decompiler; carried from the source so the lead stays locatable when
                     # analysis.db is gone. Content hash stored only (no consumer yet).
