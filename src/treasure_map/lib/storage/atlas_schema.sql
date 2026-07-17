@@ -245,7 +245,9 @@ CREATE TABLE IF NOT EXISTS string_keyed_edge (
         CHECK (mechanism IN ('strcmp_gate','static_string_table')),
     callee_name         TEXT,   -- BinDiff-alignable anchor: Ghidra name + addr + kind (NOT bare addr)
     callee_addr         TEXT,
-    callee_kind         TEXT,   -- direct / thunk / ptr / pcode / static_ptr
+    callee_kind         TEXT,   -- direct / thunk / indirect / ptr / undefined_text. undefined_text =
+                                --   a .text entry with no Ghidra Function object (a dispatch table
+                                --   is often its only reference); the address is still the anchor.
     ladder_size         INTEGER,  -- strcmp_gate: distinct keys gated on the same variable; NULL for A
     table_addr          TEXT,     -- static_string_table: the table's base address; NULL for B
     completeness_status TEXT NOT NULL DEFAULT 'complete'

@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Detector A no longer shatters a real dispatch table (systematic handler loss).** The per-slot
+  handler test required Ghidra to have already created a `Function` object at the target. But a
+  dispatch table is very often the *only* reference to its handler, so nothing calls it directly and
+  auto-analysis never defines one — the run terminated at every such slot, splitting one real table
+  into fragments and dropping every fragment below the run minimum, which lost even *defined*
+  handlers whose undefined neighbours broke the run around them. Measured on real firmware: a
+  32-entry handler table is strictly contiguous with every `word0` a `.rodata` string and every
+  `word1` inside `.text`, yet only 17 of 32 targets were Ghidra-defined. The test is now "points at
+  a plausible function ENTRY in `.text`" — an initialized executable block, instruction-aligned, and
+  not into another function's body — anchored by address and marked `callee_kind='undefined_text'`
+  when no `Function` object backs it. Rather-miss-than-err holds: `.rodata`/`.data` targets are
+  still rejected (so `{str,str}` and `{ptr,ptr}` arrays are), on top of the unchanged
+  consecutive-slot minimum. Replayed over the real data segment: **13 fragmented tables / 80 entries
+  → 1 contiguous table / 203 entries**, with no new spurious table, recovering the previously lost
+  `nvram_dump` handler. Completeness still reports `incomplete` — the relaxation recovers
+  absolute-2-field entries that were mis-cut, it does not start reading GOT/MIPS/3-field forms.
+
 - **`evidence_ref` no longer drifts across a re-scan.** The per-instance locator was built from
   `functions.id`, an AUTOINCREMENT rowid — and the analysis DB is delete-and-reingest per binary,
   so SQLite (which never reuses a number) shifted every id by the whole function count on **every**

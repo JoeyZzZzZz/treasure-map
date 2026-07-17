@@ -821,7 +821,7 @@ public class ExportFunctions extends GhidraScript {
         long p1;
         try { p1 = readPtr(a.add(ps), ps, mem); } catch (Exception e) { return null; }
         if (p1 == 0) return null;
-        String[] fn = funcAtPtr(toAddr(p1), fm);
+        String[] fn = funcAtPtr(toAddr(p1), fm, mem);
         if (fn == null) return null;
         return new String[]{ key, fn[0], fn[1], fn[2] };
     }
@@ -831,20 +831,50 @@ public class ExportFunctions extends GhidraScript {
         return mem.getInt(a) & 0xFFFFFFFFL;
     }
 
-    // Resolve a data pointer to a {name, entry-addr, kind} function anchor, or null when it is not an
-    // EXACT function entry — so a {string_ptr, non-function-ptr} pair is rejected (rather-miss-than-err).
-    private String[] funcAtPtr(Address to, FunctionManager fm) {
+    // Resolve a data pointer to a {name, entry-addr, kind} handler anchor, or null when it is not a
+    // plausible .text function ENTRY — so a {string_ptr, non-handler-ptr} pair is rejected.
+    //
+    // ★ The predicate is "points at a function ENTRY IN .text", NOT "Ghidra already made a Function
+    // object here". A dispatch table is very often the ONLY reference to its handler, so nothing
+    // calls it directly and auto-analysis never defines it. Requiring a defined Function silently
+    // TERMINATED a table at every such slot, cutting one real table into fragments and dropping any
+    // fragment shorter than the run minimum — measured on real firmware: of one 32-entry handler
+    // table (all 32 strictly contiguous, every word0 a .rodata string, every word1 inside .text),
+    // only 17 handlers were Ghidra-defined, so the table shattered and even DEFINED handlers were
+    // lost when their undefined neighbours broke the run around them.
+    //
+    // rather-miss-than-err is preserved by keeping the entry test strict: the target must sit in an
+    // initialized EXECUTABLE block (a .rodata/.data pointer is still rejected — that kills {str,str}
+    // and {ptr,ptr} arrays), be instruction-aligned, and not point into the middle of an existing
+    // function's body. Combined with the >= MIN_RUN consecutive-slot requirement, a false table
+    // stays vanishingly unlikely.
+    private String[] funcAtPtr(Address to, FunctionManager fm, Memory mem) {
         if (to == null) return null;
         Function f = fm.getFunctionAt(to);
-        if (f == null) return null;   // must be a function entry, not a mid-body / non-function ptr
-        if (f.isThunk()) {
-            Function th = f.getThunkedFunction(true);
-            if (th != null)
-                return new String[]{ th.getName(),
-                    "0x" + Long.toHexString(th.getEntryPoint().getOffset()), "thunk" };
+        if (f != null) {
+            if (f.isThunk()) {
+                Function th = f.getThunkedFunction(true);
+                if (th != null)
+                    return new String[]{ th.getName(), addrHex(th.getEntryPoint()), "thunk" };
+            }
+            return new String[]{ f.getName(), addrHex(f.getEntryPoint()), "direct" };
         }
-        return new String[]{ f.getName(),
-            "0x" + Long.toHexString(f.getEntryPoint().getOffset()), "direct" };
+        // No Function object here. Accept it only as a plausible, undefined .text entry.
+        MemoryBlock blk = mem.getBlock(to);
+        if (blk == null || !blk.isInitialized() || !blk.isExecute()) return null;  // not code
+        int align = 1;
+        try { align = currentProgram.getLanguage().getInstructionAlignment(); } catch (Exception ignore) {}
+        if (align > 1 && (to.getOffset() % align) != 0) return null;   // not an instruction boundary
+        Function host = fm.getFunctionContaining(to);
+        if (host != null && !to.equals(host.getEntryPoint())) return null;  // mid-body, not an entry
+        // Name it the way Ghidra names an undefined function (address-derived, so the anchor is the
+        // address either way); kind says plainly that no Function object backs it.
+        return new String[]{ String.format("FUN_%08x", to.getOffset()), addrHex(to),
+                             "undefined_text" };
+    }
+
+    private String addrHex(Address a) {
+        return "0x" + Long.toHexString(a.getOffset());
     }
 
     private Address safeAdd(Address a, long delta) {

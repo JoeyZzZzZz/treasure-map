@@ -142,7 +142,9 @@ CREATE TABLE IF NOT EXISTS string_tables (
     key                 TEXT,       -- the dispatch string key (attacker-influenceable)
     func_name           TEXT,       -- the handler function name (BinDiff-alignable anchor)
     func_addr           TEXT,       -- the handler entry address (0x…)
-    func_kind           TEXT,       -- direct | thunk
+    func_kind           TEXT,       -- direct | thunk | undefined_text (a .text entry Ghidra never
+                                    --   turned into a function — a dispatch table is often the
+                                    --   handler's ONLY reference, so nothing calls it directly)
     completeness_status TEXT,       -- always 'incomplete' this phase (MVP absolute-2-field only)
     completeness_reason TEXT,
     completeness_scope  TEXT,

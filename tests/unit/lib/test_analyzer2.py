@@ -1052,6 +1052,46 @@ def test_static_string_table_flattened_to_edges(tmp_path: Path) -> None:
     assert dump["completeness_scope"] == "absolute_2field_only"
 
 
+def test_static_table_undefined_text_handler_survives_to_the_edge(tmp_path: Path) -> None:
+    # A handler the dispatch table is the ONLY reference to gets no Ghidra Function object, so the
+    # detector anchors it by address and marks kind='undefined_text'. Real firmware measurement: 15
+    # of one 32-entry handler table's targets were undefined, and requiring a defined function there
+    # shattered the table (13 fragments / 80 entries -> 1 table / 203 entries once relaxed). The
+    # honest kind must reach the agent rather than be dropped or silently recoloured as 'direct'.
+    db = _make_db(
+        tmp_path,
+        [
+            {
+                "name": "httpd",
+                "funcs": [_nvram_fn("noop", [])],
+                "string_tables": [
+                    {
+                        "key": "nvram_dump",
+                        "func_name": "FUN_000561e4",
+                        "func_addr": "0x561e4",
+                        "func_kind": "direct",
+                    },
+                    {
+                        "key": "select_channel",
+                        "func_name": "FUN_0002a774",
+                        "func_addr": "0x2a774",
+                        "func_kind": "undefined_text",
+                    },
+                ],
+            }
+        ],
+    )
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_ut")
+    by_key = {r["key"]: r for r in _ske_rows(atlas)}
+    assert by_key["nvram_dump"]["callee_kind"] == "direct"
+    # the undefined-but-real handler is an edge like any other, honestly kinded
+    ut = by_key["select_channel"]
+    assert ut["callee_kind"] == "undefined_text"
+    assert ut["callee_addr"] == "0x2a774"  # the address is the anchor, defined or not
+    assert ut["mechanism"] == "static_string_table"
+
+
 def test_static_table_and_strcmp_gate_share_query_and_capability(tmp_path: Path) -> None:
     # Both detectors write the SAME table, so one query + one capability key serve both. The
     # mechanism field distinguishes them; edges_reaching_callee finds a static-table handler too.
