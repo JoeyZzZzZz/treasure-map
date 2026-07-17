@@ -171,11 +171,12 @@ def hunt_pattern(
             f"  Data-gap skipped  : {stats.data_gap_skipped} "
             "(shape matches with no decompilable body — candidate set is INCOMPLETE)"
         )
-    if stats.fmt_wrapper_unknown_source_skipped:
-        # Honesty flag: the fmt axis was intentionally narrowed (uncontrollable forwarded source).
+    if stats.fmt_wrapper_unknown_source_demoted:
+        # Not a recall flag: these candidates are IN the set, just ranked below a controllable
+        # source. Shown so the reader knows how much of the fmt axis rests on an unknown.
         click.echo(
-            f"  fmt-wrapper trim  : {stats.fmt_wrapper_unknown_source_skipped} "
-            "(fmt wrapper candidates dropped — unknown/uncontrollable source; fmt recall NARROWED)"
+            f"  fmt-wrapper demote: {stats.fmt_wrapper_unknown_source_demoted} "
+            "(fmt wrapper candidates KEPT but ranked low — forwarded source unknown)"
         )
     if stats.nvram_flows_written:
         click.echo(f"  nvram key-flow    : {stats.nvram_flows_written} ops flattened")
@@ -1139,11 +1140,11 @@ def scan(
             f"      → {h.data_gap_skipped} shape matches skipped (data gap: no decompilable "
             "body) — candidate set INCOMPLETE"
         )
-    if h.fmt_wrapper_unknown_source_skipped:
-        # Honesty flag: the fmt axis was intentionally narrowed (uncontrollable forwarded source).
+    if h.fmt_wrapper_unknown_source_demoted:
+        # Not a recall flag: kept in the set, only ranked lower (a '?' is never removed).
         click.echo(
-            f"      → {h.fmt_wrapper_unknown_source_skipped} fmt-wrapper candidates dropped "
-            "(unknown/uncontrollable source) — fmt recall NARROWED"
+            f"      → {h.fmt_wrapper_unknown_source_demoted} fmt-wrapper candidates KEPT but "
+            "ranked low (forwarded source unknown)"
         )
     if h.nvram_flows_written:
         click.echo(f"      → {h.nvram_flows_written} nvram key-flow ops flattened → atlas")

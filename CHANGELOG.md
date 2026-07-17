@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The format-string wrapper gate now demotes instead of dropping (a `?` is never removed).** A
+  recovered fmt-wrapper candidate whose forwarded value was "not a controllable source" was dropped
+  from the corpus. But the forwarded `source_kind` here is only ever `free_string` or `unknown` —
+  there is no proven-uncontrollable reading — so the gate was discarding candidates whose
+  controllability is **unknown**, i.e. 100% `?`. The same function found *directly* keeps its unknown
+  candidate, so removing it when found through a wrapper was a pure false negative that also let the
+  set read as complete. The candidate now stays in the corpus and stays queryable. The original
+  motive — variadic loggers are ubiquitous and would flood the high band — is a **ranking** concern
+  the read-side ladder already serves: an unknown controllability ranks below `free`, while the
+  demotion iron law keeps it off the floor (only a proven-safe fact sinks a candidate). The stat
+  `fmt_wrapper_unknown_source_skipped` becomes `fmt_wrapper_unknown_source_demoted`, and the CLI no
+  longer reports it as a recall narrowing.
+
 - **Detector A no longer shatters a real dispatch table (systematic handler loss).** The per-slot
   handler test required Ghidra to have already created a `Function` object at the target. But a
   dispatch table is very often the *only* reference to its handler, so nothing calls it directly and

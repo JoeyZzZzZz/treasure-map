@@ -22,6 +22,7 @@ import treasure_map.lib.hunt.analyzer2 as analyzer2_mod
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.hunt import run_analyzer2
 from treasure_map.lib.query import explain_candidate, get_run
+from treasure_map.lib.query.triage import _CONTROLLABILITY_RANK, _controllability_rank
 from treasure_map.lib.storage.connection import open_db
 
 _SRC = Path(__file__).resolve().parents[3] / "src" / "treasure_map"
@@ -2457,18 +2458,18 @@ def _unknown_via_fmt_wrapper_fn(name: str = "log_status") -> dict[str, object]:
     }
 
 
-def test_fmt_wrapper_unknown_source_drop_is_counted_not_silent(tmp_path: Path) -> None:
-    # The fmt axis is intentionally narrowed to controllable sources — but the drop must be
-    # surfaced (parity with data_gap_skipped), never let the candidate set read as complete.
+def test_fmt_wrapper_unknown_source_is_demoted_and_counted_not_dropped(tmp_path: Path) -> None:
+    # ★ A '?' is never silently removed. An unknown forwarded controllability is DEMOTED, not
+    # dropped: it stays in the corpus (and stays queryable), and the count reports the demotion so
+    # a reader knows how much of the fmt axis rests on an unknown.
     db = _make_db(
         tmp_path,
         [{"name": "netd", "funcs": [_thin_fmt_wrapper_fn(), _unknown_via_fmt_wrapper_fn()]}],
     )
     atlas = tmp_path / "atlas.db"
     stats = run_analyzer2(db, atlas, source_run_id="run_fmt_unk")
-    assert stats.fmt_wrapper_unknown_source_skipped == 1  # counted
-    # the dropped caller wrote no instance (only the direct wrapper match, log_msg, persists)
-    assert "log_status" not in _by_anchor(atlas)
+    assert stats.fmt_wrapper_unknown_source_demoted == 1  # counted as demoted
+    assert "emit_state" in _by_anchor(atlas)  # SURVIVES — the corpus did not shrink
 
 
 def test_fmt_wrapper_itself_kept_as_distinct_candidate(tmp_path: Path) -> None:
@@ -2499,24 +2500,27 @@ def _unknown_via_fmt_wrapper_fn(name: str = "emit_state") -> dict[str, object]:
     }
 
 
-def test_unknown_source_fmt_wrapper_candidate_is_dropped(tmp_path: Path) -> None:
-    # ★ 缺口① precision gate: a fmt wrapper candidate whose forwarded value is not a controllable
-    # (free) source is dropped — no false-negative, pure denoise of legit-logger fanout.
+def test_unknown_source_fmt_wrapper_candidate_survives_in_corpus(tmp_path: Path) -> None:
+    # ★ The precision gate is a RANKING job, not a corpus job. source_kind here is only ever
+    # free_string or unknown — there is no proven-uncontrollable reading — so dropping on "not
+    # controllable" discarded 100% '?'. The same function found DIRECTLY keeps its unknown
+    # candidate, so removing it when found through a wrapper was a pure false negative.
     db = _make_db(
         tmp_path,
         [{"name": "netd", "funcs": [_thin_fmt_wrapper_fn(), _unknown_via_fmt_wrapper_fn()]}],
     )
     atlas = tmp_path / "atlas.db"
     stats = run_analyzer2(db, atlas, source_run_id="run_fmt_drop")
-    assert stats.wrapper_propagated == 0  # the unknown-source caller is not recovered
+    assert stats.wrapper_propagated == 1  # recovered, not discarded
     anchors = set(_by_anchor(atlas))
-    assert "emit_state" not in anchors  # dropped: no @fmt_via_wrapper instance for it
+    assert "emit_state" in anchors  # queryable: it has its own @fmt_via_wrapper instance
     assert "log_msg" in anchors  # the wrapper stays its own direct fmt candidate (printf param)
 
 
-def test_fmt_wrapper_gate_keeps_controllable_drops_unknown(tmp_path: Path) -> None:
-    # The gate is source-selective, not blanket: in one binary the free-string caller survives and
-    # the unknown-source caller is dropped — recall amplification kept on controllable input only.
+def test_fmt_wrapper_keeps_controllable_and_demotes_unknown(tmp_path: Path) -> None:
+    # Source-selectivity is preserved, but expressed as RANK rather than removal: both callers are
+    # recovered; the read-side ladder puts the free-string one above the unknown one. That serves
+    # the original motive (variadic loggers must not flood the high band) without deleting a '?'.
     db = _make_db(
         tmp_path,
         [
@@ -2532,10 +2536,16 @@ def test_fmt_wrapper_gate_keeps_controllable_drops_unknown(tmp_path: Path) -> No
     )
     atlas = tmp_path / "atlas.db"
     stats = run_analyzer2(db, atlas, source_run_id="run_fmt_gate")
-    assert stats.wrapper_propagated == 1  # only the free-string caller survives the gate
+    assert stats.wrapper_propagated == 2  # BOTH recovered; the difference is rank, not presence
+    assert stats.fmt_wrapper_unknown_source_demoted == 1
     anchors = set(_by_anchor(atlas))
-    assert "handle_req" in anchors  # external_input -> kept
-    assert "emit_state" not in anchors  # unknown -> dropped
+    assert "handle_req" in anchors  # external_input -> kept, ranks high
+    assert "emit_state" in anchors  # unknown -> kept, ranks low (never removed)
+    # the ladder, not the gate, separates them: free outranks unknown, and neither is sunk
+    free_rank = _controllability_rank(_cand_of(atlas, "handle_req").dim("controllability"))
+    unk_rank = _controllability_rank(_cand_of(atlas, "emit_state").dim("controllability"))
+    assert free_rank > unk_rank  # a controllable source still ranks above an unknown one
+    assert unk_rank > _CONTROLLABILITY_RANK["constant"]  # ...but a '?' never hits the floor
 
 
 def test_cmd_axis_unknown_source_wrapper_is_still_kept(tmp_path: Path) -> None:

@@ -165,10 +165,10 @@ class Analyzer2Stats:
     nvram_wrapper_edges: int = 0  # gap② A2 indirect key edges recovered through thin nvram wrappers
     nvram_defaults_written: int = 0  # naming-bridge phase 1: router_defaults members flattened
     web_form_fields_written: int = 0  # M1 SaTC front-end: editable web form fields flattened
-    # fmt-wrapper candidates dropped by the precision gate (uncontrollable/unknown forwarded value).
-    # A deliberate recall trim — but COUNTED, not silent, so the summary shows the fmt axis was
-    # narrowed (parity with data_gap_skipped; never let a drop imply the candidate set is complete).
-    fmt_wrapper_unknown_source_skipped: int = 0
+    # fmt-wrapper candidates DEMOTED (not dropped) because the forwarded value's controllability is
+    # unknown. They stay in the corpus and stay queryable; the read-side ladder ranks them below a
+    # controllable source. Counted so the summary shows how much of the fmt axis rests on a '?'.
+    fmt_wrapper_unknown_source_demoted: int = 0
 
 
 def _load_known_components(db_path: Path | str) -> set[str]:
@@ -810,7 +810,7 @@ def run_analyzer2(
     instances_written = 0
     wrapper_propagated = 0
     data_gap_skipped = 0
-    fmt_wrapper_unknown_source_skipped = 0
+    fmt_wrapper_unknown_source_demoted = 0
 
     # Scan-lineage facts (binary/function counts + extraction build hash) for the run row. Read
     # from the analysis.db (best-effort; degrades to None on an older schema, never a hard failure).
@@ -1119,22 +1119,25 @@ def run_analyzer2(
                 source_class = (
                     "external_input" if evidence["source_kind"] == "free_string" else ("unknown")
                 )
-                # 缺口① precision gate (format-string axis only): wrapper propagation is
-                # L3's sole recall-amplifying step, so on the fmt axis it must rest on a
-                # controllable source. A fmt candidate whose forwarded value is not a free
-                # (externally-influenced) string is dropped: variadic loggers (vsyslog /
-                # vfprintf) are ubiquitous, so without this the amplification floods the set
-                # with calls into legitimate logging wrappers whose input is unconfirmed
-                # (measured ~90% of fmt wrapper candidates), diluting the real controllable-
-                # input deep chains. Dropping an unknown-source candidate creates NO false-
-                # negative — an uncontrollable source is not a real format-string-injection
-                # path. The command axis is deliberately unchanged: a constant / charset-
-                # constrained argument forwarded to a shell wrapper stays a downweighted lead.
+                # Precision on the format-string axis is a RANKING job, not a corpus job.
+                #
+                # This gate used to DROP a recovered fmt candidate whose forwarded value was not a
+                # free (externally-influenced) string, reasoning that "an uncontrollable source is
+                # not a real format-string path". But source_kind here is only ever free_string or
+                # unknown — there is no proven-uncontrollable reading to drop. So the gate was
+                # discarding candidates whose controllability is UNKNOWN, i.e. 100% '?', breaking
+                # the rule that a '?' is never silently removed: the same function found DIRECTLY
+                # keeps its unknown candidate, so dropping it when it is found through a wrapper is
+                # a pure false negative that also makes the set read as complete when it is not.
+                #
+                # The real motivation — variadic loggers are ubiquitous, so amplifying recall on
+                # them would flood the high band (measured ~90% of fmt wrapper candidates) — is a
+                # ranking concern, and the read-side ladder already serves it: an unknown
+                # controllability ranks below 'free'/'constrained' and far below a proven cross,
+                # while the demotion iron law keeps it OFF the floor (only a proven-safe fact sinks
+                # a candidate). So the candidate stays in the corpus, demoted and still queryable.
                 if wc.sink_class == "fmt_string" and source_class == "unknown":
-                    # Counted, not silent: the fmt axis was intentionally narrowed here, and the
-                    # summary must show it rather than let the candidate set read as complete.
-                    fmt_wrapper_unknown_source_skipped += 1
-                    continue
+                    fmt_wrapper_unknown_source_demoted += 1
                 # Def-use provenance for the wrapper function's own sinks. The real
                 # sink is one hop away, but the forwarding function's provenance still tells the
                 # agent where the forwarded value comes from. A surfaced fact, never scored.
@@ -1211,5 +1214,5 @@ def run_analyzer2(
         nvram_wrapper_edges=len(wrapper_edge_rows),
         nvram_defaults_written=len(nvram_default_rows),
         web_form_fields_written=len(web_form_field_rows),
-        fmt_wrapper_unknown_source_skipped=fmt_wrapper_unknown_source_skipped,
+        fmt_wrapper_unknown_source_demoted=fmt_wrapper_unknown_source_demoted,
     )
