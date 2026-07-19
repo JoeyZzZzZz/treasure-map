@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`scan` no longer silently caches a code-rich binary as "empty".** `ghidra_status='ok_empty'`
+  was trusted as permanent ground truth, but it is derived from `has_substantial_text`, which
+  returns `False` on *any* file read/parse error. So a code-rich binary whose file was momentarily
+  unreadable at analysis time (a temp/cpio extraction cleaned, a migration to another machine, a
+  race) got frozen as "legitimately empty" — and every honesty net (`already_done`, the Step 1b
+  self-heal, the incomplete-binaries warning) then skipped it by trusting that stale label. It read
+  as done+clean with 0 functions, silently, forever — exactly the failure a re-scan months later
+  hits. The self-heal now re-verifies code-richness against the file the *current* scan sees: a
+  done+0-function binary that is code-rich now is re-dirtied and re-analyzed (regardless of its
+  stored label, no DB deletion), while one that is genuinely code-free stays cached as `ok_empty`
+  and is never churned. The current file is the authority; a label can be stale, the bytes cannot.
 - **The format-string wrapper gate now demotes instead of dropping (a `?` is never removed).** A
   recovered fmt-wrapper candidate whose forwarded value was "not a controllable source" was dropped
   from the corpus. But the forwarded `source_kind` here is only ever `free_string` or `unknown` —

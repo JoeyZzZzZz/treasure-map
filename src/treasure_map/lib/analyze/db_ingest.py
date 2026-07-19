@@ -75,28 +75,40 @@ def ingest_elfs(
     if reanalyze == REANALYZE_ALL:
         already_done = set()
 
-    # Step 1b: ★ Red-line self-heal — a row marked done but holding 0 functions despite carrying
-    # real code is a frozen bad state (a partial/empty run wrongly cached, e.g. a >200-byte shell).
-    # Re-dirty it so a re-run recovers it, WITHOUT deleting the database. A legitimately code-free
-    # object is marked ghidra_status='ok_empty' and is left done (never churned).
+    # Step 1b: ★ Red-line self-heal — the "cached" flag (ghidra_ok=1) must not outlive the ARTIFACT
+    # it claims. A row marked done but holding 0 functions has no artifact; whether that is a real
+    # cached result or a silent-stale one is decided by the CURRENT file, never by a stored label.
+    #
+    # The stored ghidra_status='ok_empty' is DELIBERATELY NOT TRUSTED here. It was derived at
+    # analysis time from has_substantial_text, which returns False on ANY read/parse error — so a
+    # code-rich binary whose file was momentarily unreadable then (a temp/cpio extraction cleaned, a
+    # migration to another machine, a race) was frozen as "legitimately empty" and, once frozen,
+    # every honesty net that trusted the label skipped it: it read as done+clean with 0 functions,
+    # forever, silently. That is the exact failure a re-scan months later on another machine hits.
+    #
+    # So re-verify code-richness against the file THIS scan sees: a done+0-function binary whose
+    # file is code-rich NOW is re-dirtied (recovered on the re-run, no DB deletion), regardless of
+    # its stored label; one whose file is genuinely code-free NOW is (re)marked ok_empty and left
+    # cached (never churned). The current file is the authority; a label can be stale, bytes cannot.
     if already_done:
         done_ph = ",".join("?" * len(already_done))
         zero_fn = {
             row["sha256"]
             for row in conn.execute(
                 f"SELECT b.sha256 FROM binaries b WHERE b.sha256 IN ({done_ph}) "  # noqa: S608
-                "AND COALESCE(b.ghidra_status, '') != 'ok_empty' "
                 "AND NOT EXISTS (SELECT 1 FROM functions f WHERE f.binary_id = b.id)",
                 list(already_done),
             ).fetchall()
         }
         rec_by_sha = {r.sha256: r for r in records}
+        # Re-checked against the CURRENT file — a stored ok_empty is re-examined, not believed.
         heal = {s for s in zero_fn if s in rec_by_sha and has_substantial_text(rec_by_sha[s].path)}
         if heal:
-            logger.info("self-heal: %d code binaries had 0 functions -> redo", len(heal))
-        # The rest of the zero-function done rows are genuinely code-free (or predate the status
-        # column): backfill ok_empty so they read as legitimately empty and stop being flagged
-        # incomplete — without re-analyzing them.
+            logger.info(
+                "self-heal: %d cached-but-empty binaries are code-rich -> re-analyze", len(heal)
+            )
+        # The rest are genuinely code-free NOW (or predate the status column): (re)mark ok_empty so
+        # they read as legitimately empty and stop being flagged incomplete — without re-analyzing.
         code_free = zero_fn - heal
         if code_free:
             conn.executemany(

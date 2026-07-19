@@ -490,6 +490,48 @@ def test_self_heal_backfills_ok_empty_for_codefree_object(
     conn.close()
 
 
+def test_self_heal_redirties_code_binary_wrongly_frozen_as_ok_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ★ THE silent-stale bug (real-firmware, reproduced): ghidra_status='ok_empty' was TRUSTED
+    # forever, but it is derived from has_substantial_text, which returns False on any read error —
+    # so a code-rich binary whose file was momentarily unreadable at analysis time (a temp/cpio
+    # extraction cleaned, a migration, a race) got frozen as "legitimately empty". Every honesty net
+    # then skipped it by trusting the stale label: it read as done+clean with 0 functions, silently,
+    # forever. The current file — code-rich NOW — must OVERRIDE the stale label and re-dirty it.
+    conn = open_db(tmp_path / "analysis.db")
+    rec = _make_record("httpd", "deadbeef")
+    ingest_elfs(conn, [rec])
+    conn.execute(
+        "UPDATE binaries SET ghidra_ok=1, ghidra_status='ok_empty' WHERE sha256='deadbeef'"
+    )
+    conn.commit()  # frozen: cached done, 0 functions, mislabeled ok_empty
+    monkeypatch.setattr(_DB_INGEST, lambda _p: True)  # the file IS code-rich this scan
+    _, dirty = ingest_elfs(conn, [rec])
+    assert "deadbeef" in dirty  # re-dirtied despite the stale ok_empty — no longer silent
+
+
+def test_ok_empty_is_reverified_not_trusted_when_file_stays_codefree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The other side of the same coin (acceptance #3): re-verifying ok_empty must NOT churn a
+    # genuinely code-free object. Its file is still code-free this scan -> stays cached, stays
+    # ok_empty, never re-analyzed. (Re-verification is authoritative, but authority cuts both ways.)
+    conn = open_db(tmp_path / "analysis.db")
+    rec = _make_record("data.so", "deadbeef")
+    ingest_elfs(conn, [rec])
+    conn.execute(
+        "UPDATE binaries SET ghidra_ok=1, ghidra_status='ok_empty' WHERE sha256='deadbeef'"
+    )
+    conn.commit()
+    monkeypatch.setattr(_DB_INGEST, lambda _p: False)  # still genuinely code-free
+    _, dirty = ingest_elfs(conn, [rec])
+    assert "deadbeef" not in dirty  # a real empty is never churned
+    row = conn.execute("SELECT ghidra_status FROM binaries WHERE sha256='deadbeef'").fetchone()
+    assert row[0] == "ok_empty"
+    conn.close()
+
+
 def test_ingest_updates_last_seen_at_for_all_records(tmp_path: Path) -> None:
     """last_seen_at is set after first ingest and updated on subsequent ingests."""
     conn = open_db(tmp_path / "analysis.db")
