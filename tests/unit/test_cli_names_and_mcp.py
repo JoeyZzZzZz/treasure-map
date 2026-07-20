@@ -24,6 +24,36 @@ def test_short_names_registered_old_names_hidden() -> None:
     assert "hunt-pattern" not in CliRunner().invoke(main, ["--help"]).output
 
 
+def test_help_is_grouped_into_three_sections() -> None:
+    # ★ The human/agent division is made legible: a person drives the Main group; analysis is
+    # recommended via an agent over MCP; Advanced is manual inspection / single-stage re-runs.
+    out = CliRunner().invoke(main, ["--help"]).output
+    i_main = out.index("Main:")
+    i_analysis = out.index("Analysis (recommended):")
+    i_adv = out.index("Advanced")
+    assert i_main < i_analysis < i_adv  # sections appear in order
+
+    def section_of(cmd: str) -> str:
+        pos = out.index(f"\n  {cmd} ")
+        return "main" if pos < i_analysis else ("analysis" if pos < i_adv else "advanced")
+
+    # Main is terse and person-facing; it must NOT swell with the internal stages.
+    for cmd in ("init", "scan", "diff", "runs"):
+        assert section_of(cmd) == "main"
+    assert section_of("mcp") == "analysis"
+    for cmd in ("analyze", "hunt", "triage", "atlas-view", "fact"):
+        assert section_of(cmd) == "advanced"
+
+
+def test_help_fact_points_at_the_mcp_equivalence_and_stages_are_labelled() -> None:
+    out = CliRunner().invoke(main, ["--help"]).output
+    flat = " ".join(out.split())
+    # fact is the human cross-check of what an agent sees via MCP — say so.
+    assert "Read structured facts (same as an agent sees via MCP" in flat
+    # the advanced single-stage commands are labelled as scan's stages.
+    assert "scan's 1st stage" in flat and "scan's 2nd stage" in flat and "scan's 3rd stage" in flat
+
+
 @pytest.mark.parametrize(
     ("old", "new"),
     [("hunt-pattern", "hunt"), ("hunt-diff", "diff"), ("mcp-serve", "mcp")],

@@ -20,7 +20,10 @@ def _emit(record: dict[str, object]) -> None:
     click.echo(json.dumps(record, indent=2, sort_keys=True))
 
 
-@click.group(name="fact")
+@click.group(
+    name="fact",
+    short_help="Read structured facts (same as an agent sees via MCP — for manual cross-check)",
+)
 def fact() -> None:
     """Read structured facts from an analysis database (the layer MCP also serves)."""
 
@@ -105,7 +108,10 @@ def _resolve_mcp_target(
     return atlas, ws
 
 
-@click.command(name="mcp")
+@click.command(
+    name="mcp",
+    short_help="Let an AI agent use tmap via MCP (recommended for analysis)",
+)
 @click.option(
     "--atlas",
     "atlas_db",

@@ -142,13 +142,12 @@ def test_scan_runs_three_steps_in_order(tmp_path: Path, monkeypatch: pytest.Monk
     monkeypatch.setattr("treasure_map.lib.hunt.run_analyzer2", _fake_hunt)
     monkeypatch.setattr("treasure_map.lib.query.triage", _fake_triage)
 
-    ws = tmp_path / "router_v1"
     result = CliRunner().invoke(
         scan,
         [
             str(_mkfs(tmp_path)),
             "-w",
-            str(ws),
+            "router_v1",  # a NAME (managed under the base) — the only workspace form now
             "--atlas",
             str(tmp_path / "atlas.db"),
         ],
@@ -185,7 +184,7 @@ def test_scan_explicit_run_id_overrides_default(
         [
             str(_mkfs(tmp_path)),
             "-w",
-            str(tmp_path / "router_v1"),
+            "router_v1",
             "--run-id",
             "device_x",
             "--atlas",
@@ -219,7 +218,7 @@ def test_scan_analyze_failure_short_circuits(
     )
 
     result = CliRunner().invoke(
-        scan, [str(_mkfs(tmp_path)), "-w", str(tmp_path / "ws"), "--atlas", str(tmp_path / "a.db")]
+        scan, [str(_mkfs(tmp_path)), "-w", "ws", "--atlas", str(tmp_path / "a.db")]
     )
     assert result.exit_code != 0
     assert downstream == []  # neither hunt nor triage ran
@@ -241,9 +240,7 @@ def test_scan_triage_segment_matches_triage_command(
     monkeypatch.setattr("treasure_map.lib.hunt.run_analyzer2", lambda *a, **k: _hunt_stats(2))
     # triage + renderer are REAL here.
 
-    scan_out = CliRunner().invoke(
-        scan, [str(_mkfs(tmp_path)), "-w", str(tmp_path / "ws_x"), "--atlas", str(atlas)]
-    )
+    scan_out = CliRunner().invoke(scan, [str(_mkfs(tmp_path)), "-w", "ws_x", "--atlas", str(atlas)])
     triage_out = CliRunner().invoke(triage_cmd, ["ws_x", "--atlas", str(atlas)])
     assert scan_out.exit_code == 0, scan_out.output
     assert triage_out.exit_code == 0, triage_out.output
@@ -271,7 +268,7 @@ def test_scan_passes_through_triage_options(
     monkeypatch.setattr("treasure_map.lib.analyze.pipeline.run_analyze", _fake_analyze)
     monkeypatch.setattr("treasure_map.lib.hunt.run_analyzer2", lambda *a, **k: _hunt_stats(3))
 
-    base = [str(_mkfs(tmp_path)), "-w", str(tmp_path / "ws_x"), "--atlas", str(atlas)]
+    base = [str(_mkfs(tmp_path)), "-w", "ws_x", "--atlas", str(atlas)]
     runner = CliRunner()
 
     default = runner.invoke(scan, base)
@@ -308,7 +305,7 @@ def test_scan_empty_candidates_is_ok(tmp_path: Path, monkeypatch: pytest.MonkeyP
         [
             str(_mkfs(tmp_path)),
             "-w",
-            str(tmp_path / "ws_empty"),
+            "ws_empty",
             "--atlas",
             str(tmp_path / "atlas.db"),
         ],

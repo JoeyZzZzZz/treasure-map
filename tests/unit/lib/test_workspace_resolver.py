@@ -20,26 +20,27 @@ def test_bare_name_is_managed_under_base() -> None:
     assert r.path == _BASE / "router_v1"
 
 
-@pytest.mark.parametrize(
-    "spec, expected",
-    [
-        ("./work", Path("./work")),
-        ("a/b", Path("a/b")),
-        ("/abs/x", Path("/abs/x")),
-        ("../up", Path("../up")),
-    ],
-)
-def test_path_specs_used_verbatim(spec: str, expected: Path) -> None:
-    r = resolve_workspace(spec, workspace_dir=_BASE, fs_root=Path("/fw"))
-    assert r.kind == "path"
-    assert r.path == expected
+@pytest.mark.parametrize("spec", ["./work", "a/b", "/abs/x", "../up", "~/scratch/ws"])
+def test_path_specs_are_rejected(spec: str) -> None:
+    # ★ Single semantics: -w is a NAME, never a path. A path-like spec is the exact mix-up that
+    # used to split one run across two directories, so it is rejected loudly, not resolved.
+    with pytest.raises(WorkspaceError):
+        resolve_workspace(spec, workspace_dir=_BASE, fs_root=Path("/fw"))
 
 
-def test_tilde_path_is_expanded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("HOME", str(tmp_path))
-    r = resolve_workspace("~/scratch/ws", workspace_dir=_BASE, fs_root=Path("/fw"))
-    assert r.kind == "path"
-    assert r.path == tmp_path / "scratch" / "ws"
+def test_name_and_dotslash_name_do_not_split_into_two_dirs() -> None:
+    # The regression the convergence fixes: `router` resolves under the base; `./router` no longer
+    # resolves to a different (relative) directory — it is rejected, so a run cannot silently split.
+    named = resolve_workspace("router", workspace_dir=_BASE, fs_root=Path("/fw"))
+    assert named.path == _BASE / "router"
+    with pytest.raises(WorkspaceError):
+        resolve_workspace("./router", workspace_dir=_BASE, fs_root=Path("/fw"))
+
+
+def test_path_rejection_message_suggests_the_bare_name() -> None:
+    # The error must guide the user to the name form, not just refuse.
+    with pytest.raises(WorkspaceError, match="my_ws"):
+        resolve_workspace("/mnt/scratch/my_ws", workspace_dir=_BASE, fs_root=Path("/fw"))
 
 
 def test_auto_name_is_deterministic_for_same_fs_root() -> None:
@@ -60,13 +61,12 @@ def test_auto_name_differs_for_same_basename_different_path() -> None:
 
 @pytest.mark.parametrize("bad", ["a b", "weird*name", "name#1", "bad:name"])
 def test_illegal_name_raises(bad: str) -> None:
-    # A bare value with no path signal but illegal name characters: not a name, not a path.
+    # A bare value with no path signal but illegal name characters: not a valid name.
     with pytest.raises(WorkspaceError):
         resolve_workspace(bad, workspace_dir=_BASE, fs_root=Path("/fw"))
 
 
-def test_dotdot_is_treated_as_path_not_name() -> None:
-    # "." / ".." have a leading dot, so they are path specs (used verbatim), never bare names.
-    r = resolve_workspace("..", workspace_dir=_BASE, fs_root=Path("/fw"))
-    assert r.kind == "path"
-    assert r.path == Path("..")
+def test_dotdot_is_rejected() -> None:
+    # ".." has a leading dot -> a path-like spec -> rejected (no path mode any more).
+    with pytest.raises(WorkspaceError):
+        resolve_workspace("..", workspace_dir=_BASE, fs_root=Path("/fw"))

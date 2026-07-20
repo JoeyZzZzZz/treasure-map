@@ -130,6 +130,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`-w`/`--workspace` is now a workspace NAME only — the literal-path mode is removed.** A path-mode
+  used to exist, and it silently split one logical run across two physical directories: `-w router`
+  (managed under the base) and `-w ./router` (a relative path resolved against the current dir)
+  landed in different places, so a re-scan written one way could not see data written the other, and
+  it left 0-byte orphan databases behind — which misled a whole verification pass. A workspace is now
+  addressed one way: `-w <name>` always maps to `<workspace_dir>/<name>`, so the same name is always
+  the same directory. A path-like value is rejected with a message that points at the name form (it
+  is no longer silently resolved). `atlas.db` is unaffected; `analysis.db` is a rebuildable
+  intermediate, so re-run `scan` once to repopulate the managed workspace.
+- **`tmap --help` is grouped to make the human/agent division legible.** Commands were a flat list;
+  they now fall into three sections: **Main** (`init` / `scan` / `diff` / `runs`) — where a person
+  hands tmap the work only a person decides; **Analysis (recommended)** (`mcp`) — running the
+  analysis itself is recommended via an agent over MCP; and **Advanced** (`analyze` / `hunt` /
+  `triage` / `atlas-view` / `fact`) — for inspecting results yourself or re-running a single stage.
+  The Main group stays terse (what each does, not how); the Advanced group labels `analyze`/`hunt`/
+  `triage` as scan's stages and points out `fact` reads the same facts an agent sees via MCP. Hidden
+  back-compat aliases are unchanged; a future command with no group still shows under "Other".
+
 - **`bare_sink` moved out of `blocking_mechanism` into a new `exposure_shape` column.** `bare_sink`
   is a danger form (a raw command/format sink with no recognized in-function source), not a
   mitigation, so filing it under `blocking_mechanism` risked a consumer reading it as "blocked". It

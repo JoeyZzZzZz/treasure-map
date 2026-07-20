@@ -35,7 +35,7 @@ def _echo_legal_notice(*, as_json: bool = False) -> None:
     click.echo("", err=True)
 
 
-@click.command("diff", short_help="Diff two analysis.db builds; grade reachability.")
+@click.command("diff", short_help="Compare two firmware versions")
 @click.argument("db_a", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.argument("db_b", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option(
@@ -116,7 +116,7 @@ def hunt_diff(
     )
 
 
-@click.command("hunt", short_help="Find call-sequence shape candidates in a build.")
+@click.command("hunt", short_help="Match suspicious call-chains only (scan's 2nd stage)")
 @click.argument("db", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--run-id", required=True, help="Neutral per-run id (the device_spread unit).")
 @click.option(
@@ -587,7 +587,7 @@ def _echo_run_lineage(atlas_path: Path, selected_run: str | None) -> None:
     click.echo(f"atlas: {n} run(s) — `tmap runs` for lineage, --run <id> to scope")
 
 
-@click.command("runs", short_help="List the firmware runs (scans) recorded in the atlas.")
+@click.command("runs", short_help="List scanned firmware runs")
 @click.option(
     "--config",
     "-c",
@@ -636,7 +636,7 @@ def runs(config: Path | None, atlas_path: Path | None, as_json: bool) -> None:
         click.echo(f"  {_run_lineage_line(r)}")
 
 
-@click.command("triage", short_help="Rank to-verify candidates for manual reverse-engineering.")
+@click.command("triage", short_help="Rank & show candidates only (scan's 3rd stage)")
 @click.argument("run_id", required=False, default=None, shell_complete=_complete_run_ids)
 @click.option(
     "--run",
@@ -890,7 +890,7 @@ def triage(
     )
 
 
-@click.command("atlas-view", short_help="Neutral cross-firmware atlas aggregation views.")
+@click.command("atlas-view", short_help="Query the atlas database")
 @click.argument("view", type=click.Choice(["dormant", "density", "twins", "ledger"]))
 @click.option(
     "--config",
@@ -956,14 +956,14 @@ def atlas_view(view: str, config: Path | None, atlas_path: Path | None) -> None:
     click.echo("Note: rows are leads/candidates, not findings; interpretation is out of scope.")
 
 
-@click.command("scan", short_help="One command: analyze -> hunt -> triage, ending in a list.")
+@click.command("scan", short_help="Scan firmware for suspicious sinks")
 @click.argument("fs_root", type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.option(
     "--workspace",
     "-w",
     type=str,
     default=None,
-    help="Workspace as a NAME (managed under your base) or a PATH (verbatim). Omitted: auto name.",
+    help="Workspace NAME, managed under your base. Omitted: auto name. Same name -> same dir.",
 )
 @click.option(
     "--run-id",

@@ -90,7 +90,7 @@ def test_analyze_runs_pipeline_and_prints_result(
 
     fs_root = tmp_path / "fs"
     fs_root.mkdir()
-    result = CliRunner().invoke(analyze, [str(fs_root), "--workspace", str(tmp_path / "ws")])
+    result = CliRunner().invoke(analyze, [str(fs_root), "--workspace", "ws"])
 
     assert result.exit_code == 0, result.output
     assert "Functions ingested:" in result.output

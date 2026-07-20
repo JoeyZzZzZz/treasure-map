@@ -60,7 +60,7 @@ scopes that to just the binary you are validating.
 
 @click.command(
     "analyze",
-    short_help="Analyze an extracted firmware filesystem.",
+    short_help="Decompile & extract facts only (scan's 1st stage)",
     epilog=_ANALYZE_EPILOG,
 )
 @click.argument("fs_root", type=click.Path(exists=True, file_okay=False, path_type=Path))
@@ -70,10 +70,9 @@ scopes that to just the binary you are validating.
     type=str,
     default=None,
     help=(
-        "Workspace as a NAME (managed under your workspace base, e.g. -w router_v1) or a "
-        "PATH (used verbatim if it has a '/', '~', leading '.', or is absolute, e.g. "
-        "-w /mnt/scratch/fw1). Omitted: a deterministic auto name under the base. Re-run "
-        "with the same value to resume."
+        "Workspace NAME, managed under your workspace base (e.g. -w router_v1). Omitted: a "
+        "deterministic auto name derived from the firmware dir. Re-run with the same name to "
+        "resume — the same name always maps to the same directory."
     ),
 )
 @click.option(
@@ -117,10 +116,10 @@ def analyze(
 ) -> None:
     """Analyze an extracted firmware filesystem root.
 
-    Produces an analysis.db in the workspace directory. -w/--workspace takes a NAME
-    (managed under your workspace base) or a PATH (used verbatim); omitted, a deterministic
-    auto name is derived from the firmware dir. Resume-safe: re-running with the same -w
-    skips completed steps.
+    Produces an analysis.db in the workspace directory. -w/--workspace takes a workspace NAME,
+    managed under your workspace base; omitted, a deterministic auto name is derived from the
+    firmware dir. Resume-safe: re-running with the same -w skips completed steps (the same name
+    always maps to the same directory).
     """
     from treasure_map.lib.analyze.pipeline import run_analyze
     from treasure_map.lib.config.config import load_config
@@ -139,9 +138,7 @@ def analyze(
     def _progress(step: str, meta: dict[str, Any]) -> None:
         click.echo(f"  [{step}] {meta}")
 
-    if resolved.kind == "path":
-        click.echo(f"Workspace: {ws_path}  (explicit path)")
-    elif resolved.kind == "auto":
+    if resolved.kind == "auto":
         click.echo(f"Workspace: '{ws_path.name}'  (auto) → {ws_path}")
     else:
         click.echo(f"Workspace: '{workspace}' → {ws_path}")
