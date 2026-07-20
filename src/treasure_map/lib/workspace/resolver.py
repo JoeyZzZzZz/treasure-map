@@ -87,3 +87,16 @@ def resolve_workspace(spec: str | None, *, workspace_dir: Path, fs_root: Path) -
             "'.', '_', '-' and must start with a letter or digit."
         )
     return ResolvedWorkspace(workspace_dir / spec, "name")
+
+
+def list_workspace_names(workspace_dir: Path) -> list[str]:
+    """The existing workspace names (immediate sub-directories) under ``workspace_dir``, sorted.
+
+    Backs shell completion for ``scan -w`` so a RE-scan can pick an existing name without a typo
+    (a typo would silently start a fresh workspace). Completion only SUGGESTS these — a brand-new
+    name is still accepted, since scanning new firmware must always be possible. Returns [] when the
+    base directory does not exist yet (never raises: a completion helper must not error)."""
+    try:
+        return sorted(p.name for p in workspace_dir.iterdir() if p.is_dir())
+    except OSError:
+        return []

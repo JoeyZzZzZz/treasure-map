@@ -92,6 +92,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no rank change. **★ IRON LAW: `reachability` stays `unknown`; a lead is a fact, never a grant, and
   the word "reached" never appears.**
 
+- **`tmap init` installs shell tab-completion (bash + zsh), by default and honestly.** Completion
+  now rides along with the setup a user already runs — no `--no-completion` flag, because a
+  completion script is side-effect-free and a skip toggle would only push a non-decision onto the
+  user. The script is written to the shell's own autoload directory (bash:
+  `~/.local/share/bash-completion/completions/tmap`; zsh: `~/.zsh/completions/_tmap`) — **never** by
+  editing an rc file. It is idempotent (a re-run rewrites only on change). Honest about activation: a
+  new `completion` doctor check reports where it went and, when the shell will not pick it up
+  (bash-completion absent, or the zsh dir not yet on `fpath`), the exact one line to add — it never
+  presents an inert completion as working. bash and zsh only for now; other shells are added on
+  demand.
+- **Shell completion for `scan -w` and `diff --run-id-a/-b`.** `scan -w <tab>` suggests existing
+  workspace names (so a re-scan reuses a workspace instead of a typo silently starting a fresh one)
+  while still accepting a brand-new name; `diff`'s run-id options complete the run names already in
+  the atlas. Both callbacks are read-only and best-effort — an absent atlas or any error yields no
+  suggestions, never a crashed shell. (The `diff` CLI currently takes two analysis.db paths plus
+  run-id labels; a fuller "pick two existing runs" completion awaits a diff-CLI redesign.)
 - **String-keyed edges exposed (detector B: strcmp-ladder dispatch).** A string-keyed edge is a
   deterministic fact — an attacker-influenceable string key gates or dispatches to a set of callees.
   A new Ghidra P-Code detector enumerates each same-variable `strcmp`/`strncmp`/`strcasecmp` ladder

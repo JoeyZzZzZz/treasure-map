@@ -70,3 +70,20 @@ def test_dotdot_is_rejected() -> None:
     # ".." has a leading dot -> a path-like spec -> rejected (no path mode any more).
     with pytest.raises(WorkspaceError):
         resolve_workspace("..", workspace_dir=_BASE, fs_root=Path("/fw"))
+
+
+def test_list_workspace_names_returns_sorted_subdirs(tmp_path: Path) -> None:
+    from treasure_map.lib.workspace.resolver import list_workspace_names
+
+    base = tmp_path / "ws"
+    base.mkdir()
+    for name in ("charlie", "alpha", "bravo"):
+        (base / name).mkdir()
+    (base / "loose_file").write_text("not a workspace")  # a file is not a workspace
+    assert list_workspace_names(base) == ["alpha", "bravo", "charlie"]
+
+
+def test_list_workspace_names_absent_base_is_empty(tmp_path: Path) -> None:
+    from treasure_map.lib.workspace.resolver import list_workspace_names
+
+    assert list_workspace_names(tmp_path / "does_not_exist") == []  # never raises

@@ -243,6 +243,25 @@ def test_run_init_workspace_dir_check_is_green_after_provisioning(fake_home: Pat
     assert ws_check[1] is True, f"workspace_dir check failed: {ws_check[2]}"
 
 
+def test_run_init_installs_completion_and_the_doctor_reports_it(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Completion is a STANDARD init step (no flag): a full run installs the script and the doctor
+    # carries a 'completion' check. bash-completion is forced present so the result is stable.
+    monkeypatch.setenv("SHELL", "/bin/bash")
+    from treasure_map.lib.setup import completion as comp
+
+    monkeypatch.setattr(comp, "_bash_completion_present", lambda: True)
+    result = run_init(force=False, non_interactive=True, prompt=_noop_prompt)
+
+    script = fake_home / ".local" / "share" / "bash-completion" / "completions" / "tmap"
+    assert script.exists(), "completion script was not installed by init"
+    comp_check = next((c for c in result.checks if c[0] == "completion"), None)
+    assert comp_check is not None and comp_check[1] is True  # installed + active -> green
+    # ★ never edits the user's rc file
+    assert not (fake_home / ".bashrc").exists()
+
+
 def test_run_init_provisions_and_greens_custom_workspace_dir(
     fake_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

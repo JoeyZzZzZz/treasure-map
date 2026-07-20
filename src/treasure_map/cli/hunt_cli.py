@@ -21,6 +21,51 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _complete_workspace(ctx: click.Context, param: click.Parameter, incomplete: str) -> list[Any]:
+    """Shell completion for ``scan -w``: existing workspace names under the configured base.
+
+    A convenience for re-scanning an existing workspace without a typo; a brand-new name is still
+    accepted (completion suggests, never restricts). Best-effort and side-effect-free — any failure
+    yields no suggestions rather than an error (a completion helper must never crash the shell)."""
+    from click.shell_completion import CompletionItem
+
+    try:
+        from treasure_map.lib.config.config import load_config
+        from treasure_map.lib.workspace.resolver import list_workspace_names
+
+        names = list_workspace_names(load_config(None).workspace_dir)
+    except Exception:
+        return []
+    return [CompletionItem(n) for n in names if n.startswith(incomplete)]
+
+
+def _complete_run_id(ctx: click.Context, param: click.Parameter, incomplete: str) -> list[Any]:
+    """Shell completion for a run-id argument: the run names already recorded in the atlas.
+
+    Opens the atlas READ-ONLY (no create/migrate side effects) and lists list_runs' run_ids. Absent
+    atlas or any error -> no suggestions, never a crash."""
+    import sqlite3
+
+    from click.shell_completion import CompletionItem
+
+    try:
+        from treasure_map.lib.config.config import load_config
+        from treasure_map.lib.query import list_runs
+
+        atlas = load_config(None).atlas.db_path
+        if not atlas.exists():
+            return []
+        conn = sqlite3.connect(f"file:{atlas}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            ids = [r.run_id for r in list_runs(conn) if r.run_id]
+        finally:
+            conn.close()
+    except Exception:
+        return []
+    return [CompletionItem(i) for i in ids if i.startswith(incomplete)]
+
+
 def _echo_legal_notice(*, as_json: bool = False) -> None:
     """Print the intended-use / legal reminder to stderr (skipped under --json).
 
@@ -44,8 +89,18 @@ def _echo_legal_notice(*, as_json: bool = False) -> None:
     default="version",
     help="Neutral comparison axis recorded as scope_origin (no vendor/version identity).",
 )
-@click.option("--run-id-a", required=True, help="Neutral run id for the baseline (db_a).")
-@click.option("--run-id-b", required=True, help="Neutral run id for the comparison (db_b).")
+@click.option(
+    "--run-id-a",
+    required=True,
+    help="Neutral run id for the baseline (db_a).",
+    shell_complete=_complete_run_id,
+)
+@click.option(
+    "--run-id-b",
+    required=True,
+    help="Neutral run id for the comparison (db_b).",
+    shell_complete=_complete_run_id,
+)
 @click.option(
     "--config",
     "-c",
@@ -964,6 +1019,7 @@ def atlas_view(view: str, config: Path | None, atlas_path: Path | None) -> None:
     type=str,
     default=None,
     help="Workspace NAME, managed under your base. Omitted: auto name. Same name -> same dir.",
+    shell_complete=_complete_workspace,
 )
 @click.option(
     "--run-id",

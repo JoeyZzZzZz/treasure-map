@@ -285,6 +285,34 @@ def _configure_ghidra(
     echo("  Ghidra : left unset (no valid path entered).")
 
 
+def _configure_completion(*, echo: Callable[[str], None]) -> None:
+    """Install shell tab-completion (a standard init step; bash + zsh). Best-effort + honest.
+
+    Writes the completion script to the shell's own autoload directory — never edits an rc file.
+    Any failure is echoed, never swallowed, and the doctor's ``completion`` check reports the state
+    (installed / active / the one line to add). No ``--no-completion`` flag: a completion script has
+    no side effects, so a skip toggle would only push a non-decision onto the user.
+    """
+    from treasure_map.lib.setup.completion import detect_shell, install_completion
+
+    shell = detect_shell()
+    if shell is None:
+        echo("  Completion: shell is not bash/zsh — skipped (nothing to install).")
+        return
+    try:
+        outcome = install_completion(shell, Path.home())
+    except OSError as exc:
+        echo(f"  Completion: could not install for {shell}: {exc}")
+        return
+    if outcome is None:
+        echo(f"  Completion: no installer for {shell} — skipped.")
+        return
+    state = "installed" if outcome.wrote else "already up to date"
+    echo(f"  Completion: {state} for {shell} at {outcome.path}")
+    if not outcome.active and outcome.activation_hint:
+        echo(f"              to activate, {outcome.activation_hint}")
+
+
 def _run_doctor(tm_home: Path, cfg: Config | None) -> tuple[tuple[str, bool, str], ...]:
     """Run preflight checks and return (name, ok, detail) triples."""
     checks: list[tuple[str, bool, str]] = []
@@ -314,6 +342,11 @@ def _run_doctor(tm_home: Path, cfg: Config | None) -> tuple[tuple[str, bool, str
             checks.append((label, ok, "writable" if ok else "not writable"))
         else:
             checks.append((label, False, "not provisioned"))
+
+    # Shell completion: installed AND active? (honest — an inert completion is not presented clean.)
+    from treasure_map.lib.setup.completion import completion_check
+
+    checks.append(completion_check(Path.home()))
 
     return tuple(checks)
 
@@ -359,6 +392,7 @@ def run_init(
             prompt=prompt,
             echo=echo,
         )
+        _configure_completion(echo=echo)
 
     # Source env file (non-override semantics) so doctor can see API keys.
     _source_env_file(env_path)
