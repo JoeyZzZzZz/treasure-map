@@ -484,6 +484,45 @@ def test_provenance_shallow_free_string_stays_free_not_unknown(tmp_path: Path) -
     assert _ctrl(c) == "free"
 
 
+def test_optimistic_free_fallback_is_likely_never_proven(tmp_path: Path) -> None:
+    # ★ HONESTY (proven-devaluation fix): the source_kind=free_string fallback is OPTIMISTIC — the
+    # convergence-transforms are not subtracted, so a washed value can still read 'free'. Its state
+    # must be 'likely' (optimistic, unconfirmed), NEVER 'proven'. The value stays 'free' (ranking
+    # and the controllability=free filter untouched); only the certainty word changes so the note
+    # (which already says OPTIMISTIC) stops being contradicted by a 'proven' label.
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp_free", sink_class="cmd")  # source_class=unknown: isolate controllability
+    ref = _inst(conn, p, sink_anchor="system", source_kind="free_string")  # no provenance depth
+    conn.close()
+    d = _find(triage(open_atlas(tmp_path / "atlas.db")), ref).dim("controllability")
+    assert (d.state, d.value) == ("likely", "free")  # optimistic lead, never a proof
+    assert "OPTIMISTIC" in d.note  # the note says optimistic; the state word now agrees
+
+
+def test_proven_note_never_calls_its_own_reading_optimistic_or_unproven(tmp_path: Path) -> None:
+    # ★ HONESTY invariant (terminology consistency): a state=='proven' dimension's OWN note must
+    # never say 'optimistic' / 'unproven' — those two words are RESERVED for the demoted leads (the
+    # likely 'free', the structural 'param'), so 'proven' can never read as a self-contradiction.
+    # Built with a REAL proven-controllable (SaTC cross) + a proven-constant, so a regression that
+    # re-imports either word into a proven note (e.g. a comparative 'above the optimistic free') is
+    # caught — and a real proof is still present, guarding against over-correction.
+    conn = _atlas(tmp_path)
+    ctrl_ev = _stack_buf_prov("system", [_getter_vararg("fb_comment")])  # fb_comment: seeded cross
+    _inst(conn, _pattern(conn, "fp_ctrl"), sink_anchor="system", flow_evidence=ctrl_ev)
+    _inst(conn, _pattern(conn, "fp_const"), sink_anchor="system", blocking="const_sink_arg")
+    _inst(conn, _pattern(conn, "fp_free"), sink_anchor="system", source_kind="free_string")
+    proven_dims = 0
+    for c in triage(open_atlas(tmp_path / "atlas.db")):
+        for d in c.dimensions:
+            if d.state == "proven":
+                proven_dims += 1
+                note = d.note.lower()
+                assert "optimistic" not in note and "unproven" not in note, (
+                    f"proven {d.name} note self-contradicts: {d.note!r}"
+                )
+    assert proven_dims  # real proofs (controllable + constant) present — not over-corrected
+
+
 def test_provenance_deep_const_beats_source_kind_free_fallback(tmp_path: Path) -> None:
     # Ordering: a provenance-DEEP all-const candidate (ipsec strcpy) reads constant, even though its
     # top-level source_kind is free_string — the provenance verdict is checked before the fallback.
@@ -898,10 +937,11 @@ def test_likely_controllable_outranks_free(tmp_path: Path) -> None:
     assert order.index(likely_ref) < order.index(free_ref)
 
 
-def test_likely_cmd_outranks_proven_free_lower_impact(tmp_path: Path) -> None:
-    # M3 harm-respect (impact is the OUTER axis): a likely-controllable cmd sink outranks a
-    # proven-'free' LOG sink -- a high-impact unconfirmed lead beats a low-impact confirmed one, so
-    # the worst bug never falls off the top screen behind a wholesale 'proven' band.
+def test_likely_cmd_outranks_optimistic_free_lower_impact(tmp_path: Path) -> None:
+    # M3 harm-respect (impact is the OUTER axis): a likely-controllable cmd sink outranks an
+    # optimistic-'free' LOG sink -- a high-impact unconfirmed lead beats a low-impact one, so the
+    # worst bug never falls off the top screen. (Both are unproven leads: likely-controllable and
+    # the optimistic 'free' fallback -- impact, not a 'proven' band, governs.)
     conn = _atlas(tmp_path)
     _register_wrapper(conn, "FUN_000b2e80", "oauth_auth_code")
     _seed_default(conn, "oauth_auth_code")

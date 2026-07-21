@@ -741,9 +741,9 @@ def test_source_kind_drives_controllability(tmp_path: Path) -> None:
 
 
 def test_external_input_builds_param_source_and_floats_above_nonparam(tmp_path: Path) -> None:
-    # ★ M4-1/9: A2 source_class=external_input on a system sink builds source=proven:param, and the
-    # candidate floats ABOVE a same-certainty non-param peer (out of the unknown pile), so it is no
-    # longer buried. The non-param peer carries NO param dimension.
+    # ★ M4-1/9: A2 source_class=external_input on a system sink builds source=structural:param, and
+    # the candidate floats ABOVE a same-certainty non-param peer (out of the unknown pile), so it is
+    # no longer buried. The non-param peer carries NO param dimension.
     conn = _atlas(tmp_path)
     ext = _pattern(conn, "fp_ext", sink_class="cmd", source_class="external_input")
     non = _pattern(conn, "fp_non", sink_class="cmd", source_class="unknown")
@@ -751,7 +751,7 @@ def test_external_input_builds_param_source_and_floats_above_nonparam(tmp_path: 
     _inst(conn, non, fn="plain_unknown")  # non-external, controllability unknown
     ranked = triage(conn)
     param = next(c for c in ranked if c.function == "netool")
-    assert param.dim("source").state == "proven" and param.dim("source").value == "param"
+    assert param.dim("source").state == "structural" and param.dim("source").value == "param"
     assert [c.function for c in ranked] == ["netool", "plain_unknown"]  # param floats above
     plain = next(c for c in ranked if c.function == "plain_unknown")
     assert plain.dim("source").value != "param"  # non-external: no param signal
@@ -760,14 +760,14 @@ def test_external_input_builds_param_source_and_floats_above_nonparam(tmp_path: 
 
 def test_param_source_not_swallowed_by_free_fallback(tmp_path: Path) -> None:
     # ★ M4-3b (the execution-order trap): an external_input+free_string candidate is judged
-    # certainty=free by the fallback chain AND carries source=proven:param — the orthogonal signal
-    # is built OUTSIDE the chain, so free never short-circuits it (both present, not only unknowns).
+    # certainty=free by the fallback chain AND carries source=structural:param — the orthogonal
+    # signal is built OUTSIDE the chain, so free never short-circuits it (both present).
     conn = _atlas(tmp_path)
     p = _pattern(conn, "fp", sink_class="cmd", source_class="external_input")
     _inst(conn, p, fn="free_ext", source_kind="free_string")
     c = triage(conn)[0]
     assert _ctrl(c) == "free"  # certainty chain still judges free
-    assert c.dim("source").value == "param" and c.dim("source").state == "proven"
+    assert c.dim("source").value == "param" and c.dim("source").state == "structural"
     conn.close()
 
 
@@ -787,8 +787,8 @@ def test_param_float_lifts_unconstrained_external_over_name_tiebreak(tmp_path: P
 def test_charset_safe_external_is_not_param_floated(tmp_path: Path) -> None:
     # ★ M4-3c(b) guardrail (param-internal demotion iron law): a charset_safe external_input (a
     # converter constrained the value inline -> metachars blocked -> can't inject) is NOT floated,
-    # even though it still honestly carries source=proven:param. With no float, the name tiebreak
-    # stands, so the external one does NOT jump its non-param peer.
+    # even though it still honestly carries source=structural:param. With no float, the name
+    # tiebreak stands, so the external one does NOT jump its non-param peer.
     conn = _atlas(tmp_path)
     ext = _pattern(conn, "fp_ext", sink_class="cmd", source_class="external_input")
     non = _pattern(conn, "fp_non", sink_class="cmd", source_class="unknown")
@@ -799,6 +799,47 @@ def test_charset_safe_external_is_not_param_floated(tmp_path: Path) -> None:
     assert order == ["a_safe_non", "z_safe_ext"]  # NOT floated: name tiebreak stands
     z = next(c for c in ranked if c.function == "z_safe_ext")
     assert z.dim("source").value == "param"  # still honestly marked, just not floated
+    conn.close()
+
+
+def test_external_input_source_is_structural_never_proven(tmp_path: Path) -> None:
+    # ★ HONESTY (proven-devaluation fix): source_class=external_input is a COARSE A2 pattern label
+    # (it fires on ~every cmd candidate, near-zero discrimination) with controllability UNPROVEN.
+    # Its state must be 'structural' (a lead), NEVER 'proven' — a source is not a controllability
+    # proof. The signal is NOT dropped (value stays 'param', the note keeps UNPROVEN); only the
+    # certainty word is demoted so the label stops overclaiming to a strong consumer.
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp", sink_class="cmd", source_class="external_input")
+    _inst(conn, p, fn="ext", source_kind="free_string")
+    d = triage(conn)[0].dim("source")
+    assert (d.state, d.value) == ("structural", "param")  # a lead, never a proof
+    assert "UNPROVEN" in d.note  # the signal survives; only the state word is demoted
+    conn.close()
+
+
+def test_proven_is_never_spent_on_an_optimistic_or_unproven_reading(tmp_path: Path) -> None:
+    # ★ HONESTY invariant (terminology consistency, the red line of this fix): across a MIXED
+    # corpus, no dimension may carry state=='proven' while its OWN note calls the reading optimistic
+    # or unproven. 'proven' stays reserved for a positive proof (a provably-constant argument here);
+    # the optimistic 'free' and the structural 'param' leads are demoted OUT of it, so a strong
+    # consumer never mistakes a lead for a confirmed anchor. And a real proof is still present, so
+    # this is not an over-correction that demotes the genuine 'proven' too.
+    conn = _atlas(tmp_path)
+    ext = _pattern(conn, "fp_ext", sink_class="cmd", source_class="external_input")
+    const = _pattern(conn, "fp_const", sink_class="cmd", source_class="unknown")
+    _inst(conn, ext, fn="ext_free", source_kind="free_string")  # likely:free + structural:param
+    _inst(conn, const, fn="const_fn", blocking="const_sink_arg")  # proven:constant — a real proof
+    seen_a_real_proof = False
+    for c in triage(conn):
+        for d in c.dimensions:
+            note = d.note.lower()
+            soft = "optimistic" in note or "unproven" in note
+            if soft:
+                assert d.state != "proven", f"{d.name}: unproven/optimistic note but state=proven"
+            if d.state == "proven":
+                seen_a_real_proof = True
+                assert not soft, f"{d.name}: proven must not carry an optimistic/unproven note"
+    assert seen_a_real_proof  # proven:constant survives — no over-correction of a genuine proof
     conn.close()
 
 
@@ -1142,8 +1183,8 @@ def test_cli_triage_json_carries_dimensions_not_score(tmp_path: Path) -> None:
     assert "score" not in rows[0]  # the collapsed score is gone
     names = {d["name"] for d in rows[0]["dimensions"]}
     assert "controllability" in names and "sink_impact" in names
-    for d in rows[0]["dimensions"]:  # every layer is a four-state fact (likely = M2 tier)
-        assert d["state"] in {"proven", "likely", "excluded", "unknown"}
+    for d in rows[0]["dimensions"]:  # every layer is an honest fact (likely / structural = leads)
+        assert d["state"] in {"proven", "likely", "structural", "excluded", "unknown"}
 
 
 def test_cli_triage_prints_intended_use_notice(tmp_path: Path) -> None:

@@ -700,8 +700,9 @@ def test_explain_and_list_surface_source_kind(tmp_path: Path) -> None:
     assert ex["candidate"]["source_kind"] == "free_string"
     (cand,) = tools["list_candidates"]()["candidates"]
     # the compact row folds source_kind into the resolved controllability label (free_string with no
-    # provenance verdict -> proven:free); the RAW source_kind stays on explain, not the list row.
-    assert cand["controllability"] == "proven:free"
+    # provenance verdict -> likely:free, an OPTIMISTIC fallback, NEVER proven); the RAW source_kind
+    # stays on explain, not the list row.
+    assert cand["controllability"] == "likely:free"
     assert "source_kind" not in cand
 
 
@@ -806,10 +807,10 @@ def test_compact_row_carries_a_new_axis_without_a_whitelist() -> None:
     # loop hardcodes NO dimension whitelist, so a future source=param axis is picked up for free.
     dims = [
         Dimension("controllability", "unknown", "unknown", "src"),
-        Dimension("source", "proven", "param", "pattern.source_class=external_input"),
+        Dimension("source", "structural", "param", "pattern.source_class=external_input"),
     ]
     row = mcp_app._candidate_row(_mk_candidate(dims), rank=3)
-    assert row["dimensions"]["source"] == "proven:param"
+    assert row["dimensions"]["source"] == "structural:param"
 
 
 def test_compact_row_baseline_is_unknown_state_not_a_modal_value() -> None:
@@ -903,12 +904,12 @@ def test_mcp_get_strings_accepts_offset_and_returns_paging(tmp_path: Path) -> No
 
 def test_compact_row_carries_param_source_when_controllability_unknown(tmp_path: Path) -> None:
     # ★ step-4 param contract seam (C1/C6, anti-'hidden marker'): a controllability=unknown
-    # external_input candidate STILL surfaces source=proven:param on the compact row — the
+    # external_input candidate STILL surfaces source=structural:param on the compact row — the
     # axis-agnostic carry from step 3 picks the new axis up with no serializer edit.
     tools = _tools(tmp_path)  # _mk_atlas uses source_class=external_input
     (cand,) = tools["list_candidates"]()["candidates"]
     assert cand["controllability"] == "unknown:unknown"
-    assert cand["dimensions"]["source"] == "proven:param"
+    assert cand["dimensions"]["source"] == "structural:param"
 
 
 def test_explain_carries_param_source_with_unproven_note(tmp_path: Path) -> None:
@@ -917,7 +918,7 @@ def test_explain_carries_param_source_with_unproven_note(tmp_path: Path) -> None
     tools = _tools(tmp_path)
     ex = tools["explain_candidate"]("run_m#fn1@cmd")
     src = next(d for d in ex["candidate"]["dimensions"] if d["name"] == "source")
-    assert src["value"] == "param" and src["state"] == "proven"
+    assert src["value"] == "param" and src["state"] == "structural"  # a lead, never proven
     assert "UNPROVEN" in src["note"]
 
 

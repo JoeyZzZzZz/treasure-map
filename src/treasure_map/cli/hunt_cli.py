@@ -448,7 +448,10 @@ def _render_triage(
     )
 
 
-_STATE_GLYPH = {"proven": "✓", "excluded": "✗", "unknown": "?"}
+# Glyph = certainty bucket: ✓ proven (a positive proof) · ~ soft (likely / structural: a lead, NOT
+# a proof) · ✗ excluded (ruled out) · ? unknown (not established). ``likely`` and ``structural`` map
+# to the SAME ~ so a reader never mistakes an optimistic/structural lead for the ✓ of a proof.
+_STATE_GLYPH = {"proven": "✓", "likely": "~", "structural": "~", "excluded": "✗", "unknown": "?"}
 
 
 def _render_explain(ex: CandidateExplanation, *, as_json: bool) -> None:

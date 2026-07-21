@@ -72,16 +72,22 @@ PHASE1_CAVEATS: tuple[str, ...] = (
 class Dimension:
     """One map layer's honest three-state annotation for a candidate — a FACT, never a verdict.
 
-    ``state`` is the glyph-level certainty: ``proven`` (✓ established, ``value`` carries the
-    reading), ``likely`` (~ an optimistic-but-unconfirmed reading, e.g. a router_defaults-member
-    controllability — carries ``value`` but never claims proof), ``excluded`` (✗ established
-    not-applicable / ruled out), ``unknown`` (? not established — ``note`` says what is missing and
-    why). ``value`` is the concrete reading (e.g. ``free`` / ``cmd`` / ``found``); ``source`` names
-    where it came from; ``note`` carries the reason for a ? or an honest caveat. The red line: a ?
-    is NEVER rendered as ✓, and a ~ never as ✓ — an unconfirmed reading must not read as proven."""
+    ``state`` is the glyph-level certainty: ``proven`` (✓ established — RESERVED for a positive
+    proof: a SaTC front↔back cross, a provably-constant argument, a sound rootfs entry edge; NEVER
+    an optimistic fallback or a coarse zero-discrimination pattern label), ``likely`` (~ an
+    optimistic-but-unconfirmed reading, e.g. a router_defaults-member controllability or the
+    optimistic 'free' text-level fallback — carries ``value`` but never claims proof),
+    ``structural`` (~ a structural lead from the coarse pattern layer, e.g. an A2 external_input
+    source — a fact about shape that points somewhere to look, NOT a controllability proof),
+    ``excluded`` (✗ established not-applicable / ruled out), ``unknown`` (? not established —
+    ``note`` says what is missing and why). ``value`` is the concrete reading (``free`` / ``cmd``);
+    ``source`` names where it came from; ``note`` carries the reason for a ? or an honest caveat.
+    The red line: a ? is NEVER rendered as ✓, and neither ~ (``likely`` nor ``structural``) ever as
+    ✓ — an unproven reading must never read as proven (proven is the one word tmap must not spend
+    on a value it has not proven)."""
 
     name: str
-    state: str  # "proven" | "likely" | "excluded" | "unknown"
+    state: str  # "proven" | "likely" | "structural" | "excluded" | "unknown"
     value: str
     source: str
     note: str = ""
@@ -897,9 +903,11 @@ def _dim_controllability(
          is a proven constant. Checked BEFORE the source_kind fallback so a provenance-DEEP
          all-const candidate (e.g. an ipsec strcpy of a literal) reads constant, not free (demotion
          iron law: incomplete provenance never reads constant).
-      4. free         — FALLBACK to the text-level source_kind=free_string. This is the ONLY path
-         that keeps a provenance-SHALLOW legit argv-free candidate (a nanddump/mtdinfo printf whose
-         only signal is source_kind) as 'free' instead of collapsing it to unknown — do NOT drop it.
+      4. free (likely) — FALLBACK to the text-level source_kind=free_string, carried at state=likely
+         (OPTIMISTIC, never proven — no positive evidence backs it, only the absence of a narrowing
+         signal). This is the ONLY path that keeps a provenance-SHALLOW legit argv-free candidate (a
+         nanddump/mtdinfo printf whose only signal is source_kind) as 'free' instead of collapsing
+         it to unknown — do NOT drop it, but do NOT dress the optimism as a proof.
       5. constrained  — a charset-safe / numeric-shape source.
       6. unknown      — nothing established; a ? never sinks.
     (An 'external -> free' step for a provenance external marker is reserved for a future phase; the
@@ -917,7 +925,7 @@ def _dim_controllability(
             f"sink_arg_provenance: {via} reaches the sink argument",
             "PROVEN controllable: a user-settable source (SaTC front-end x back-end cross) reaches "
             "the sink argument — the strongest controllability the map asserts, ranked above the "
-            "optimistic 'free'",
+            "'free' fallback",
         )
     likely_keys = _likely_settable_keys_reaching_sink(
         conn, flow_evidence, sink_anchor, wrapper_names
@@ -959,13 +967,14 @@ def _dim_controllability(
     if source_kind == "free_string":
         return Dimension(
             "controllability",
-            "proven",
+            "likely",
             "free",
             "source_kind=free_string (provenance-shallow fallback)",
-            "OPTIMISTIC fallback: no provenance verdict, so the text-level source_kind carries it, "
-            "keeping a legit argv-free candidate (e.g. a nanddump printf) 'free' instead of "
-            "collapsing to unknown. Convergence-transforms not subtracted, so a value washed by "
-            "inet_ntop / a whitelist / a fixed-width parse may still read as free",
+            "OPTIMISTIC fallback (state=likely, NOT proven): no provenance verdict, so the "
+            "text-level source_kind carries the reading, keeping a legit argv-free candidate (e.g. "
+            "a nanddump printf) 'free' instead of collapsing to unknown. Convergence-transforms "
+            "are not subtracted, so a value washed by inet_ntop / a whitelist / a fixed-width "
+            "parse may still read as free; this is an unproven read, confirm byte-freedom by hand",
         )
     if source_kind == "charset_safe":
         return Dimension(
@@ -1283,9 +1292,12 @@ def _dim_completeness() -> Dimension:
 
 def _dim_source(source_class: str, source_kind: str) -> Dimension:
     """The ORTHOGONAL source axis: is the sink argument fed by A2-confirmed external input (a
-    request/POST param)? ``source_class == external_input`` => ``proven:param`` — a structural
+    request/POST param)? ``source_class == external_input`` => ``structural:param`` — a structural
     command/exec-injection lead whose controllability is UNPROVEN (no key-side web_settable
-    evidence), WEAKER than an nvram 'likely' reading.
+    evidence), WEAKER than an nvram 'likely' reading. NOT ``proven``: the A2 pattern layer is coarse
+    (it fires on nearly every cmd candidate, ~zero discrimination) and a source is not a
+    controllability proof — ``proven`` is reserved for a positive proof, so the state word matches
+    the note's own 'UNPROVEN' instead of contradicting it.
 
     Orthogonal to controllability, and consumes the COARSE ``source_class`` (A2 pattern layer), NOT
     the fine flow_evidence marker: it is built whenever A2 marked external_input, EVEN when the
@@ -1297,13 +1309,14 @@ def _dim_source(source_class: str, source_kind: str) -> Dimension:
     if source_class == "external_input":
         return Dimension(
             "source",
-            "proven",
+            "structural",
             "param",
             "pattern.source_class = external_input (A2)",
             "external input reaches the sink (a POST/request param); NOT proven web-controllable "
-            f"(no key-side web_settable evidence). charset={source_kind}. Controllability "
-            "UNPROVEN — weaker than an nvram 'likely' reading; a structural lead, confirm the "
-            "concrete request field and reachability by hand.",
+            f"(no key-side web_settable evidence). charset={source_kind}. A STRUCTURAL lead "
+            "(state=structural, NOT proven): controllability UNPROVEN — weaker than an nvram "
+            "'likely' reading, and the A2 pattern layer is coarse (near-zero discrimination on cmd "
+            "candidates). Confirm the concrete request field and reachability by hand.",
         )
     return Dimension(
         "source",
@@ -1520,9 +1533,11 @@ _CHARSET_FEASIBILITY_RANK: dict[str, int] = {
 
 
 def _is_param_source(c: TriageCandidate) -> bool:
-    """True when A2 marked this candidate's source external_input (source=proven:param)."""
+    """True when A2 marked this candidate's source external_input (source=structural:param). The
+    param float / charset tiebreak / filter all route through this ONE predicate, so demoting the
+    source state from proven to structural leaves the sort and filter behaviour untouched."""
     d = c.dim("source")
-    return d.state == "proven" and d.value == "param"
+    return d.state == "structural" and d.value == "param"
 
 
 def _param_float(c: TriageCandidate) -> int:
