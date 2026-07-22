@@ -213,3 +213,76 @@ class RunCapabilityRow:
     present: int = 1
     id: int | None = None
     created_at: str | None = None
+
+
+@dataclass(frozen=True)
+class FunctionAlignmentRow:
+    """Mirrors one function_alignment row: ONE BinDiff-matched (A-side, B-side) function pair.
+
+    An ALIGNMENT FACT (BinDiff matched these two addresses), NEVER a change verdict.
+    ``alignment_confidence`` is BinDiff ``confidence`` (trust in the pairing); ``similarity`` is the
+    separate change-magnitude fact (a pair may be similarity=1.0 yet confidence ~0.02). Addresses
+    normalized hex; names are carried, never the anchor."""
+
+    diff_id: str
+    addr_a: str
+    addr_b: str
+    alignment_confidence: float
+    alignment_state: str  # 'aligned' | 'alignment_undetermined'
+    name_a: str | None = None
+    name_b: str | None = None
+    similarity: float | None = None
+    basicblocks: int | None = None
+    edges: int | None = None
+    instructions: int | None = None
+    id: int | None = None
+
+
+@dataclass(frozen=True)
+class FunctionPresenceRow:
+    """Mirrors one function_presence row: a baseline-domain function NOT in any matched
+    pair. States ONLY 'this function is not in any matched pair' — NEVER 'added' or 'removed' (a
+    later stage's judgement). ``presence_state`` is three-state (a decompile gap / inventory gap
+    is existence-undetermined, never an add/delete)."""
+
+    diff_id: str
+    side: str  # 'a' | 'b'
+    addr: str
+    presence_state: str
+    name: str | None = None
+    decompiled: int | None = None
+    id: int | None = None
+
+
+@dataclass(frozen=True)
+class DiffMetaRow:
+    """Mirrors the diff_meta row for one A-vs-B comparison: the runs, their analysis-tool versions,
+    the honest coverage counts (so the existence blind spot is quantifiable, not invisible), and the
+    version_skew flag (analysis-tool versions only — it does NOT detect build-side compiler/inlining
+    skew)."""
+
+    diff_id: str
+    run_a_id: str
+    run_b_id: str
+    tool_version_a: str | None = None
+    tool_version_b: str | None = None
+    ghidra_version_a: str | None = None
+    ghidra_version_b: str | None = None
+    version_skew: int = 0
+    bindiff_source: str | None = None
+    matched_pairs: int | None = None
+    alignment_undetermined: int | None = None
+    functions_total_a: int | None = None
+    functions_total_b: int | None = None
+    matched_in_domain_a: int | None = None
+    matched_in_domain_b: int | None = None
+    unmatched_a: int | None = None
+    unmatched_b: int | None = None
+    out_of_inventory_a: int | None = None
+    out_of_inventory_b: int | None = None
+    inventory_mismatch_a: int | None = None
+    inventory_mismatch_b: int | None = None
+    functions_empty_a: int | None = None
+    functions_empty_b: int | None = None
+    presence_computed_a: int = 0
+    presence_computed_b: int = 0

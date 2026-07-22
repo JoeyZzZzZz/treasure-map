@@ -12,6 +12,9 @@ import sqlite3
 from dataclasses import dataclass
 
 from treasure_map.lib.atlas.models import (
+    DiffMetaRow,
+    FunctionAlignmentRow,
+    FunctionPresenceRow,
     InstanceRow,
     NvramDefaultRow,
     NvramFlowRow,
@@ -153,6 +156,112 @@ def delete_run_capabilities(conn: sqlite3.Connection, run_id: str, *, commit: bo
     if commit:
         conn.commit()
     return cur.rowcount
+
+
+def delete_diff(conn: sqlite3.Connection, diff_id: str, *, commit: bool = True) -> None:
+    """Delete every row of one diff (replace-by-diff refresh) so a re-parse is idempotent — touches
+    ONLY this diff_id across function_alignment / function_presence / diff_meta."""
+    conn.execute("DELETE FROM function_alignment WHERE diff_id = ?", (diff_id,))
+    conn.execute("DELETE FROM function_presence WHERE diff_id = ?", (diff_id,))
+    conn.execute("DELETE FROM diff_meta WHERE diff_id = ?", (diff_id,))
+    if commit:
+        conn.commit()
+
+
+def add_function_alignment(
+    conn: sqlite3.Connection, rows: list[FunctionAlignmentRow], *, commit: bool = True
+) -> int:
+    """Insert BinDiff-matched function-pair rows in one batch; return the count. Each is an
+    alignment FACT, never a change verdict. commit=False lets the caller batch delete+insert."""
+    if not rows:
+        return 0
+    conn.executemany(
+        """INSERT INTO function_alignment
+           (diff_id, addr_a, addr_b, name_a, name_b, alignment_confidence, similarity,
+            alignment_state, basicblocks, edges, instructions)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        [
+            (
+                r.diff_id,
+                r.addr_a,
+                r.addr_b,
+                r.name_a,
+                r.name_b,
+                r.alignment_confidence,
+                r.similarity,
+                r.alignment_state,
+                r.basicblocks,
+                r.edges,
+                r.instructions,
+            )
+            for r in rows
+        ],
+    )
+    if commit:
+        conn.commit()
+    return len(rows)
+
+
+def add_function_presence(
+    conn: sqlite3.Connection, rows: list[FunctionPresenceRow], *, commit: bool = True
+) -> int:
+    """Insert per-side unmatched-function rows in one batch; return the count. Each states ONLY 'not
+    in a matched pair', NEVER 'added'/'removed'. commit=False joins the caller's transaction."""
+    if not rows:
+        return 0
+    conn.executemany(
+        """INSERT INTO function_presence
+           (diff_id, side, addr, name, presence_state, decompiled)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        [(r.diff_id, r.side, r.addr, r.name, r.presence_state, r.decompiled) for r in rows],
+    )
+    if commit:
+        conn.commit()
+    return len(rows)
+
+
+def add_diff_meta(conn: sqlite3.Connection, row: DiffMetaRow, *, commit: bool = True) -> None:
+    """Write the one diff_meta row for a comparison (coverage counts + version_skew). commit=False
+    joins the caller's transaction so the whole diff write is atomic."""
+    conn.execute(
+        """INSERT INTO diff_meta
+           (diff_id, run_a_id, run_b_id, tool_version_a, tool_version_b, ghidra_version_a,
+            ghidra_version_b, version_skew, bindiff_source, matched_pairs, alignment_undetermined,
+            functions_total_a, functions_total_b, matched_in_domain_a, matched_in_domain_b,
+            unmatched_a, unmatched_b, out_of_inventory_a, out_of_inventory_b, inventory_mismatch_a,
+            inventory_mismatch_b, functions_empty_a, functions_empty_b, presence_computed_a,
+            presence_computed_b)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            row.diff_id,
+            row.run_a_id,
+            row.run_b_id,
+            row.tool_version_a,
+            row.tool_version_b,
+            row.ghidra_version_a,
+            row.ghidra_version_b,
+            row.version_skew,
+            row.bindiff_source,
+            row.matched_pairs,
+            row.alignment_undetermined,
+            row.functions_total_a,
+            row.functions_total_b,
+            row.matched_in_domain_a,
+            row.matched_in_domain_b,
+            row.unmatched_a,
+            row.unmatched_b,
+            row.out_of_inventory_a,
+            row.out_of_inventory_b,
+            row.inventory_mismatch_a,
+            row.inventory_mismatch_b,
+            row.functions_empty_a,
+            row.functions_empty_b,
+            row.presence_computed_a,
+            row.presence_computed_b,
+        ),
+    )
+    if commit:
+        conn.commit()
 
 
 def add_run_capabilities(

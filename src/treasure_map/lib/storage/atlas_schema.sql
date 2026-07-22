@@ -336,3 +336,112 @@ CREATE INDEX IF NOT EXISTS idx_instance_reach   ON instance(reachability_status)
 CREATE INDEX IF NOT EXISTS idx_instance_prov    ON instance(provenance_level);
 CREATE INDEX IF NOT EXISTS idx_instance_scope   ON instance(scope_origin);
 CREATE INDEX IF NOT EXISTS idx_instance_run     ON instance(source_run_id);
+
+-- ── layer-0 diff: function_alignment ─────────────────────────────────────────
+-- One BinDiff-matched function pair (A-side <-> B-side), parsed from a .BinDiff
+-- SQLite. It is the substrate a version comparison aligns candidates on.
+--
+-- IRON LAW: a row is an ALIGNMENT FACT (BinDiff matched these two addresses),
+-- NEVER a verdict about what changed. A change verdict is a later stage.
+--
+-- MATCHED PAIRS ONLY: a function present on one side with no match is NOT a row
+-- here (BinDiff's function table stores pairs). The ABSENCE of a row must NEVER
+-- be read as "function removed" -- unmatched functions are listed per-side in
+-- function_presence, and out-of-inventory entries are counted in diff_meta.
+--
+-- alignment_confidence is BinDiff `confidence` (trust in THIS pairing), NOT
+-- `similarity` (content likeness). A pair can be similarity=1.0 yet confidence
+-- ~0.02 (many identical small wrappers) -- that pair is undetermined, not aligned.
+-- similarity is a FIRST-CLASS fact (how much the pair differs), surfaced next to
+-- confidence, never hidden as "reference only" -- it is the change-magnitude axis
+-- a consumer triages on, and it is a raw BinDiff fact, not a change verdict.
+CREATE TABLE IF NOT EXISTS function_alignment (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    diff_id               TEXT NOT NULL,   -- identifies this A-vs-B comparison
+    addr_a                TEXT NOT NULL,   -- A-side entry addr, normalized hex
+    addr_b                TEXT NOT NULL,   -- B-side entry addr, same normalization
+    name_a                TEXT,            -- carried, not an anchor
+    name_b                TEXT,
+    alignment_confidence  REAL NOT NULL,   -- = BinDiff confidence. Trust in the pairing.
+    similarity            REAL,            -- = BinDiff similarity: HOW MUCH the pair differs.
+    alignment_state       TEXT NOT NULL,   -- 'aligned' | 'alignment_undetermined'
+    basicblocks           INTEGER,         -- carried for candidate-level alignment
+    edges                 INTEGER,
+    instructions          INTEGER,
+    UNIQUE(diff_id, addr_a, addr_b)
+);
+CREATE INDEX IF NOT EXISTS idx_falign_diff ON function_alignment(diff_id);
+CREATE INDEX IF NOT EXISTS idx_falign_a    ON function_alignment(diff_id, addr_a);
+CREATE INDEX IF NOT EXISTS idx_falign_b    ON function_alignment(diff_id, addr_b);
+
+-- ── layer-0 diff: function_presence ──────────────────────────────────────────
+-- Per-side functions that are IN this run's function inventory but did NOT end
+-- up in a matched pair. Exists so the ABSENCE of a function from
+-- function_alignment is never the only way a consumer learns of it: an unmatched
+-- function is an explicit, countable, inspectable row.
+--
+-- BASELINE DOMAIN: this run's own functions table, NOT the diff tool's function
+-- enumeration. The two disagree by design -- this exporter skips thunks,
+-- externals and micro-functions, the diff tool keeps them. Subtracting from the
+-- diff tool's larger set would manufacture hundreds of phantom "unmatched" rows.
+-- Entries the diff tool matched but this inventory does not carry are counted as
+-- out_of_inventory in diff_meta, never as unmatched, never as add/delete.
+--
+-- IRON LAW: a row states ONLY "this function is not in any matched pair". It is
+-- NOT a claim of "added" or "removed" -- a refactor may split one function into
+-- two, a compiler change may inline one away. add-vs-delete is a later stage's
+-- judgement; presence is this stage's fact.
+CREATE TABLE IF NOT EXISTS function_presence (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    diff_id        TEXT NOT NULL,
+    side           TEXT NOT NULL,   -- 'a' | 'b'
+    addr           TEXT NOT NULL,   -- normalized hex
+    name           TEXT,
+    presence_state TEXT NOT NULL,   -- 'unmatched_both_decompiled'
+                                    -- | 'unmatched_decompile_missing'  (existence undetermined)
+                                    -- | 'inventory_mismatch'           (existence undetermined)
+    decompiled     INTEGER,         -- 1 / 0 / NULL(unknown): did this side decompile it?
+    UNIQUE(diff_id, side, addr)
+);
+CREATE INDEX IF NOT EXISTS idx_fpres ON function_presence(diff_id, side);
+
+-- ── layer-0 diff: diff_meta ──────────────────────────────────────────────────
+-- One row per A-vs-B comparison: which runs, their analysis-tool versions, the
+-- honest coverage counts that turn the existence blind spot from invisible into
+-- quantifiable, and the version_skew flag.
+--
+-- version_skew compares the ANALYSIS TOOL versions (tool_version / ghidra_version)
+-- of the two runs -- NOT firmware_sha256 (A and B are DIFFERENT firmware by
+-- definition, a patch changes the image) and NOT build_hash (a single-firmware
+-- stale-pass signal). It does NOT detect BUILD-SIDE skew: a compiler/inlining
+-- difference between the two firmware builds shows up as a phantom add/delete and
+-- a spuriously low similarity, and this flag never marks that -- do not read
+-- version_skew=false as "the two are comparable".
+CREATE TABLE IF NOT EXISTS diff_meta (
+    diff_id                 TEXT PRIMARY KEY,
+    run_a_id                TEXT NOT NULL,
+    run_b_id                TEXT NOT NULL,
+    tool_version_a          TEXT,
+    tool_version_b          TEXT,
+    ghidra_version_a        TEXT,
+    ghidra_version_b        TEXT,
+    version_skew            INTEGER NOT NULL DEFAULT 0,   -- 1 = analysis-tool versions differ
+    bindiff_source          TEXT,            -- the input .BinDiff file identity
+    matched_pairs           INTEGER,         -- rows in function_alignment for this diff
+    alignment_undetermined  INTEGER,         -- of those, confidence < threshold
+    functions_total_a       INTEGER,         -- baseline domain size = tmap functions table (A)
+    functions_total_b       INTEGER,
+    matched_in_domain_a     INTEGER,         -- matched pairs whose A addr is in baseline_a
+    matched_in_domain_b     INTEGER,
+    unmatched_a             INTEGER,         -- baseline_a not in any matched pair
+    unmatched_b             INTEGER,
+    out_of_inventory_a      INTEGER,         -- matched A addr NOT in baseline_a (thunk/extern/micro)
+    out_of_inventory_b      INTEGER,
+    inventory_mismatch_a    INTEGER,         -- baseline_a addr the other side's baseline lacks
+    inventory_mismatch_b    INTEGER,
+    functions_empty_a       INTEGER,         -- baseline_a functions that never decompiled
+    functions_empty_b       INTEGER,
+    presence_computed_a     INTEGER NOT NULL DEFAULT 0,  -- 1 = A side's baseline was available
+    presence_computed_b     INTEGER NOT NULL DEFAULT 0,
+    created_at              DATETIME DEFAULT CURRENT_TIMESTAMP
+);

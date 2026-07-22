@@ -684,9 +684,10 @@ def test_open_atlas_migration_is_idempotent(tmp_path: Path) -> None:
 
 
 def test_static_no_unscoped_wipe_in_atlas() -> None:
-    # No table-wide wipe path. DROP is always forbidden. The ONLY permitted DELETEs are the
-    # run-scoped replace-by-run refreshes (DELETE FROM <table> WHERE source_run_id = ?), each
-    # touching one run's rows — not cross-run accumulation. Any other DELETE FROM fails.
+    # No table-wide wipe path. DROP is always forbidden. The ONLY permitted DELETEs are SCOPED
+    # replace refreshes: run-scoped (WHERE source_run_id/run_id = ?) or diff-scoped (WHERE
+    # diff_id = ?), each touching one run's / one diff's rows — not cross-run accumulation. Any
+    # other DELETE FROM fails.
     forbidden_sql = ("DROP TABLE", "DROP VIEW", "DROP INDEX")
     permitted_deletes = (
         "DELETE FROM instance WHERE source_run_id = ?",
@@ -695,6 +696,10 @@ def test_static_no_unscoped_wipe_in_atlas() -> None:
         "DELETE FROM web_form_fields WHERE source_run_id = ?",
         "DELETE FROM string_keyed_edge WHERE source_run_id = ?",
         "DELETE FROM run_capability WHERE run_id = ?",
+        # diff-scoped replace-by-diff refresh (idempotent layer-0 re-parse), touches one diff_id
+        "DELETE FROM function_alignment WHERE diff_id = ?",
+        "DELETE FROM function_presence WHERE diff_id = ?",
+        "DELETE FROM diff_meta WHERE diff_id = ?",
     )
     for py_file in _ATLAS_SRC.glob("*.py"):
         text = py_file.read_text()
