@@ -45,6 +45,7 @@ from treasure_map.lib.query.triage import (
     shown_statuses,
     sink_matches,
     sort_candidates,
+    state_value_label,
     triage,
 )
 from treasure_map.lib.query.views import (
@@ -97,6 +98,7 @@ __all__ = [
     "shown_statuses",
     "sink_matches",
     "sort_candidates",
+    "state_value_label",
     "triage",
     "twins",
 ]

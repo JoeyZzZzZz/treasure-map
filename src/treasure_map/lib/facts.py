@@ -449,6 +449,13 @@ _STRING_FUNC_SCOPE_NOTE = (
     "only gates existence in value mode (unresolvable name -> found:false). To scope strings to a "
     "function, resolve the address in a disassembler's xref view."
 )
+# A SHORT, top-level alert that repeats the note's headline where a consumer skimming the response
+# keys sees it (the full detail stays in ``note``). Prominence, not new information — raised because
+# the reported pain point was "you must read to the bottom note to learn `function` is a no-op".
+_STRING_FUNC_SCOPE_WARNING = (
+    "`function` was passed but does NOT scope these strings — results are binary-wide "
+    "(func_scope_applied=false; see note). It only gates existence in value mode."
+)
 
 
 def _truncated_binaries(conn: sqlite3.Connection, binary_id: int | None = None) -> list[str]:
@@ -592,6 +599,7 @@ def get_strings(
         }
         if func is not None:
             result["func_scope_applied"] = False
+            result["warning"] = _STRING_FUNC_SCOPE_WARNING
         # Silent-drop guard: if a binary in scope was truncated at the export cap, a content search
         # can MISS a hit dropped past the cap — an empty/short result is NOT proof of absence there.
         trunc_bins = _truncated_binaries(conn, bid if scope_bin is not None else None)
@@ -651,6 +659,7 @@ def get_strings(
     }
     if func is not None:
         out["func_scope_applied"] = False
+        out["warning"] = _STRING_FUNC_SCOPE_WARNING
     # Silent-drop guard: a truncated binary's stored list is only a prefix, so a string NOT listed
     # is NOT proven absent — it may have been dropped past the export cap. Never imply completeness.
     if truncated:

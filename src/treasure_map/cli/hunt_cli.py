@@ -474,6 +474,9 @@ def _render_explain(ex: CandidateExplanation, *, as_json: bool) -> None:
                     "caveats": list(ex.caveats),
                     "controllability": ex.controllability,
                     "sink_impact": ex.sink_impact,
+                    # honest state:value siblings — a bare "free" alone loses the likely state
+                    "controllability_labeled": ex.controllability_labeled,
+                    "sink_impact_labeled": ex.sink_impact_labeled,
                     "dimensions": [
                         {
                             "name": d.name,

@@ -817,6 +817,18 @@ def test_external_input_source_is_structural_never_proven(tmp_path: Path) -> Non
     conn.close()
 
 
+def test_external_input_zero_discrimination_note_covers_all_sink_classes(tmp_path: Path) -> None:
+    # ★ 1.2: the 'near-zero discrimination' caveat must NOT read as cmd-only — external_input fires
+    # on nearly every candidate in fmt_string and path_sink too, so a fmt_string external_input's
+    # source note names the other sink classes (else the coarse label is understated as cmd-only).
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp_fmt", sink_class="fmt_string", source_class="external_input")
+    _inst(conn, p, fn="fmt_ext", sink_anchor="fprintf", source_kind="free_string")
+    note = triage(conn)[0].dim("source").note
+    assert "fmt_string" in note and "path_sink" in note  # scope widened beyond cmd
+    conn.close()
+
+
 def test_proven_is_never_spent_on_an_optimistic_or_unproven_reading(tmp_path: Path) -> None:
     # ★ HONESTY invariant (terminology consistency, the red line of this fix): across a MIXED
     # corpus, no dimension may carry state=='proven' while its OWN note calls the reading optimistic

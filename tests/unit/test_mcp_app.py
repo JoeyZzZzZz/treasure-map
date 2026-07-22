@@ -714,6 +714,11 @@ def test_explain_top_level_exposes_source_kind_and_class(tmp_path: Path) -> None
     ex = tools["explain_candidate"]("run_m#fn1@cmd")
     assert "source_kind" in ex  # top-level key, NOT ex["candidate"]["source_kind"]
     assert "source_class" in ex  # coarse class also top-level — both agent-visible
+    # ★ 1.3 (MCP face, via asdict): the honest state:value siblings ride the explain top level too,
+    # so an agent reads the controllability certainty without a bare-value trap. Bare field stays.
+    assert ex["controllability"] == "unknown"  # bare value unchanged
+    assert ex["controllability_labeled"] == "unknown:unknown"  # honest state:value sibling
+    assert ex["sink_impact_labeled"] == f"proven:{ex['sink_impact']}"
 
 
 def test_source_kind_defaults_unknown_and_no_regression(tmp_path: Path) -> None:
@@ -862,6 +867,32 @@ def test_compact_list_envelope_carries_legend(tmp_path: Path) -> None:
     assert "explain_candidate" in out["legend"]
 
 
+def test_list_verbose_default_carries_available_views(tmp_path: Path) -> None:
+    # ★ 4.5.1: verbose defaults True — the full available_views enumeration rides the envelope
+    # (unchanged behaviour), so nothing regresses for a consumer that relied on it.
+    tools = _tools(tmp_path)
+    out = tools["list_candidates"]()
+    assert "available_views" in out and out["available_views"]
+    assert "available_views_note" not in out
+
+
+def test_list_non_verbose_drops_only_navigational_boilerplate(tmp_path: Path) -> None:
+    # ★ 4.5.1 iron laws: verbose=False drops ONLY the available_views enumeration (navigational
+    # boilerplate that repeats every call) — the honest caveats stay in FULL (never traded for
+    # tokens), and a one-line switchable pointer stays so the lens is never read as 'all there is'.
+    tools = _tools(tmp_path)
+    full = tools["list_candidates"](verbose=True)
+    lean = tools["list_candidates"](verbose=False)
+    assert "available_views" not in lean  # the big enumeration is gone
+    assert "available_views_note" in lean and "switchable" in lean["available_views_note"]
+    assert lean["caveats"] == full["caveats"]  # IRON LAW 1: honest caveats untouched
+    assert lean["caveats"]  # non-empty — the phase-1 blind spots always ride
+    assert "switchable" in lean["lens"]  # IRON LAW 2: the one-line switchable pointer stays
+    assert lean["legend"] == full["legend"]  # the unknown≠safe legend is honest, kept
+    # the candidates themselves are identical — verbose only trims boilerplate, never the data
+    assert lean["candidates"] == full["candidates"]
+
+
 def test_compact_row_reachability_seam_real_dimension(tmp_path: Path) -> None:
     # ★ cross-step seam (the contract anchor): reachability became a Dimension in step 2, but the
     # compact serializer did not exist then. Verify with the REAL dimension (not a synthetic one):
@@ -930,6 +961,18 @@ def test_mcp_get_strings_function_scope_flag(tmp_path: Path) -> None:
     r = tools["get_strings"](binary="webd", function="handle_req", run_id="run_m")
     assert r["func_scope_applied"] is False
     assert "does NOT narrow" in r["note"]
+    # ★ 1.4: the honesty is now PROMINENT — a top-level `warning` (not only the bottom note), so a
+    # consumer skimming the keys sees `function` is a no-op without reading to the note.
+    assert "warning" in r and "does NOT scope" in r["warning"]
+
+
+def test_mcp_get_strings_no_warning_when_function_absent(tmp_path: Path) -> None:
+    # ★ 1.4 guardrail: the warning fires ONLY when `function` was actually passed — a plain
+    # by-binary call must not carry it (else it becomes new noise on every call).
+    tools = _tools(tmp_path)
+    r = tools["get_strings"](binary="webd", run_id="run_m")
+    assert "func_scope_applied" not in r
+    assert "warning" not in r
 
 
 # ── the two exploit-barrier buckets on the MCP face (mark_exploited + the read tools) ──

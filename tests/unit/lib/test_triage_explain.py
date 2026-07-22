@@ -226,8 +226,13 @@ def test_explanation_surfaces_source_signals_at_top_level(tmp_path: Path) -> Non
     assert ex is not None
     assert ex.source_kind == "free_string"
     assert ex.source_class == "external_input"
-    assert ex.controllability == "free"  # free_string source -> controllability free
+    # ★ 1.3: the BARE flat value is UNCHANGED (no in-place wire change to "likely:free" that would
+    # break a consumer reading == "free"); the labeled sibling carries the honest state so a bare
+    # "free" read alone never hides the optimistic 'likely'.
+    assert ex.controllability == "free"  # bare value, back-compat — NOT rewritten in place
+    assert ex.controllability_labeled == "likely:free"  # honest state:value sibling
     assert ex.sink_impact == "copy"
+    assert ex.sink_impact_labeled == "proven:copy"
     assert ex.source_kind == ex.candidate.source_kind  # echoes the candidate, no divergence
     assert ex.source_class == ex.candidate.source_class
 

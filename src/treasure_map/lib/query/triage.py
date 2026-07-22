@@ -99,6 +99,14 @@ class Dimension:
     evidence: tuple[dict[str, Any], ...] = ()
 
 
+def state_value_label(d: Dimension) -> str:
+    """One dimension as a compact ``state:value`` label (the honest certainty prefix + reading, e.g.
+    ``likely:free`` / ``structural:param``). The single source of the ``state:value`` format — the
+    MCP compact row and the explain rollup's labeled fields both read it, so a bare value never
+    reaches a consumer without its state."""
+    return f"{d.state}:{d.value}"
+
+
 @dataclass(frozen=True)
 class TriageCandidate:
     """One candidate = a point on the map, with a three-state annotation on every dimension layer.
@@ -1295,7 +1303,8 @@ def _dim_source(source_class: str, source_kind: str) -> Dimension:
     request/POST param)? ``source_class == external_input`` => ``structural:param`` — a structural
     command/exec-injection lead whose controllability is UNPROVEN (no key-side web_settable
     evidence), WEAKER than an nvram 'likely' reading. NOT ``proven``: the A2 pattern layer is coarse
-    (it fires on nearly every cmd candidate, ~zero discrimination) and a source is not a
+    (it fires on nearly EVERY external-input candidate across ALL sink classes — cmd, fmt_string,
+    path_sink — so it is ~zero discrimination, not a cmd-only signal) and a source is not a
     controllability proof — ``proven`` is reserved for a positive proof, so the state word matches
     the note's own 'UNPROVEN' instead of contradicting it.
 
@@ -1315,8 +1324,9 @@ def _dim_source(source_class: str, source_kind: str) -> Dimension:
             "external input reaches the sink (a POST/request param); NOT proven web-controllable "
             f"(no key-side web_settable evidence). charset={source_kind}. A STRUCTURAL lead "
             "(state=structural, NOT proven): controllability UNPROVEN — weaker than an nvram "
-            "'likely' reading, and the A2 pattern layer is coarse (near-zero discrimination on cmd "
-            "candidates). Confirm the concrete request field and reachability by hand.",
+            "'likely' reading, and the A2 pattern layer is coarse (near-zero discrimination — it "
+            "fires on nearly every external-input candidate in ANY sink class: cmd, fmt_string, "
+            "path_sink). Confirm the concrete request field and reachability by hand.",
         )
     return Dimension(
         "source",
@@ -1952,11 +1962,17 @@ class CandidateExplanation:
     verify_steps: tuple[str, ...]
     # Signals promoted to the explain TOP LEVEL so a consumer reads them without descending into
     # ``candidate``: the coarse source class, the fine source_kind, the controllability annotation,
-    # and the sink-impact class. Each echoes the same-named candidate field / dimension value.
+    # and the sink-impact class. ``controllability`` / ``sink_impact`` echo the BARE dimension value
+    # (kept for back-compat with a consumer that reads the flat field); a bare ``free`` read alone
+    # loses the ``likely`` state, so ``*_labeled`` carry the honest ``state:value`` (the full
+    # state+value+note always lives in ``dimensions`` — these are a convenience echo, never a second
+    # source of truth). Read the labeled sibling, or the dimension, for the certainty.
     source_class: str
     source_kind: str
     controllability: str
     sink_impact: str
+    controllability_labeled: str
+    sink_impact_labeled: str
     # Summary-first sink_arg_provenance (Ghidra def-use fact) at the explain TOP LEVEL: one compact
     # entry per command/format sink in this candidate's function (idx / kind / resolved /
     # nearest_dominating_writer). The full writer + fmt + vararg detail is fetched on demand with
@@ -2034,5 +2050,7 @@ def explain_candidate(conn: sqlite3.Connection, evidence_ref: str) -> CandidateE
         source_kind=candidate.source_kind,
         controllability=candidate.dim("controllability").value,
         sink_impact=candidate.dim("sink_impact").value,
+        controllability_labeled=state_value_label(candidate.dim("controllability")),
+        sink_impact_labeled=state_value_label(candidate.dim("sink_impact")),
         sink_arg_provenance_summary=_sink_provenance_summary(conn, _row_get(row, "flow_evidence")),
     )

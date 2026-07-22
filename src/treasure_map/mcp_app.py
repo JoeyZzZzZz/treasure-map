@@ -61,6 +61,7 @@ from treasure_map.lib.query import list_runs as _list_runs
 from treasure_map.lib.query import only_refusal as _only_refusal
 from treasure_map.lib.query import parse_impact_order as _parse_impact_order
 from treasure_map.lib.query import runs_where_function_exists as _runs_where_function_exists
+from treasure_map.lib.query import state_value_label as _state_value_label
 from treasure_map.lib.query import triage as _triage
 from treasure_map.lib.query import twins as _twins
 
@@ -140,8 +141,9 @@ _FETCH_CODE_LEGEND = (
 
 
 def _dim_label(d: Any) -> str:
-    """One dimension compressed to a single ``state:value`` label (no note) for the compact row."""
-    return f"{d.state}:{d.value}"
+    """One dimension compressed to a single ``state:value`` label (no note) for the compact row —
+    the same honest ``state:value`` format the explain rollup's labeled fields use (one source)."""
+    return _state_value_label(d)
 
 
 def _lineage_inline(run: RunRow) -> dict[str, Any]:
@@ -463,7 +465,12 @@ def make_tools(
             result["run_source"] = locus["run_source"]
             result["run_lineage"] = _lineage_inline(run)
             if locus.get("warning"):
-                result["warning"] = locus["warning"]
+                # MERGE, never clobber: a fact-layer warning (e.g. get_strings' func-scope alert)
+                # must not be silently overwritten by the run-locus warning — both are honest.
+                existing = result.get("warning")
+                result["warning"] = (
+                    f"{existing} | {locus['warning']}" if existing else locus["warning"]
+                )
             return result
         finally:
             atlas.close()
@@ -506,6 +513,7 @@ def make_tools(
         impact_order: str | None = None,
         limit: int = 50,
         offset: int = 0,
+        verbose: bool = True,
     ) -> dict[str, Any]:
         """A multi-dimensional map of recall candidates, ordered by a switchable lens.
 
@@ -544,7 +552,12 @@ def make_tools(
         state is ESTABLISHED, as one ``state:value`` label — the per-dimension note is dropped here
         to keep the list directly readable, and fetched on demand via ``explain_candidate``. A
         dimension NOT shown on a row is state=unknown (a coverage gap, NOT proven safe) — see the
-        result's ``legend``. DERIVED facts, NOT a verdict — read the head, then explain per ref."""
+        result's ``legend``. DERIVED facts, NOT a verdict — read the head, then explain per ref.
+
+        ``verbose`` (default True) prints the full ``available_views`` enumeration. Pass
+        ``verbose=False`` to drop ONLY that navigational boilerplate (it repeats each call) and save
+        tokens — the honest ``caveats``, the ``legend``, and the one-line ``lens.switchable``
+        pointer ALWAYS stay, so the map is never read as complete and the lens stays switchable."""
         atlas = open_atlas(atlas_path)
         try:
             # run_id scopes the listing to one firmware; None spans every run in the atlas. There is
@@ -605,12 +618,27 @@ def make_tools(
                 "--filter never reduces the corpus, --only prunes the view but corpus stays whole",
             },
             # The preset lenses the agent can switch to, each with its when-to-use note, so views
-            # are DISCOVERABLE from the result itself (not only from this tool's docstring).
-            "available_views": [
-                {"view": name, "spine": preset["spine"], "when_to_use": preset["desc"]}
-                for name, preset in _VIEWS.items()
-            ],
-            # The honest phase-1 blind spots — surfaced so the map is never read as complete.
+            # are DISCOVERABLE from the result itself. Navigational boilerplate only (it does not
+            # vary with the candidates), so ``verbose=False`` drops it to save tokens — the one-line
+            # ``lens.switchable`` pointer above still says the lens IS switchable (never a silent
+            # 'this is all there is'). The honest caveats below are NEVER dropped.
+            **(
+                {
+                    "available_views": [
+                        {"view": name, "spine": preset["spine"], "when_to_use": preset["desc"]}
+                        for name, preset in _VIEWS.items()
+                    ]
+                }
+                if verbose
+                else {
+                    "available_views_note": (
+                        "omitted (verbose=false) — pass verbose=true to list every preset lens; "
+                        "the lens is switchable now via sort_by / view / filters / only"
+                    )
+                }
+            ),
+            # The honest phase-1 blind spots — surfaced so the map is never read as complete. ALWAYS
+            # present (honesty is never traded for tokens), regardless of ``verbose``.
             "caveats": list(_LENS_CAVEATS),
             # ★ M7: the run this listing was scoped to (None = every run), the canonical name every
             # tool uses. The old ambient current_run_id + per-row is_current_run are GONE — an
@@ -906,13 +934,15 @@ def make_tools(
     ) -> dict[str, Any]:
         """Recorded strings: by binary, or searched by ``value`` (substring).
 
+        ★ ``function`` does NOT scope the results — DO NOT pass it expecting a per-function slice.
+        There is no string->function index and .rodata addresses fall outside code ranges, so the
+        results are binary-wide regardless; passing it only adds a top-level ``warning`` +
+        ``func_scope_applied: false`` (and in value mode it just gates existence: bad name -> none).
+
         Run-aware: pass ``run_id`` (or an ``evidence_ref`` that supplies run + binary). ``value``
         searches string CONTENT and returns each hit with its address + owning binary (one-call
         locate); reference-site (which function uses a string) is not indexed — the result says so
-        honestly. ★ ``function`` does NOT scope the results (no string->function index, and .rodata
-        addresses fall outside code ranges): the response carries ``func_scope_applied: false`` +
-        note whenever ``function`` is passed, and in value mode ``function`` only gates existence
-        (unresolvable name -> found:false). Large results are paged LOSSLESSLY by byte size under
+        honestly. Large results are paged LOSSLESSLY by byte size under
         ``paging``: pass ``offset`` = ``paging.next_offset`` to page the tail (never summarized).
         HONEST BOUND: a binary's string export is capped, so results carry ``truncated`` / ``total``
         (by-binary) or ``search_may_be_incomplete`` (by-value) when a scanned binary was capped — a
