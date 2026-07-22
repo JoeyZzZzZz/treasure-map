@@ -334,6 +334,46 @@ def test_ingest_stores_a2_wrapper_fields(tmp_path: Path) -> None:
     conn.close()
 
 
+def test_ingest_stores_address_taken_column(tmp_path: Path) -> None:
+    """The address_taken transport column round-trips verbatim: a function carrying takes stores the
+    {edges, truncated} object; a function without the field defaults to '{}' (no takes until a
+    re-scan). get_xrefs(direction=address_taken) reads this column."""
+    conn, sha_to_id = _setup_db(tmp_path)
+    output_dir = tmp_path / "ghidra_output"
+    take = {
+        "taken_at": "0x9010",
+        "taken_in_func": "register_handlers",
+        "taken_in_func_addr": "0x8f00",
+        "segment": ".text-literalpool",
+        "nearby_symbol": None,
+    }
+    _write_ghidra_json(
+        output_dir,
+        "test_bin",
+        "a" * 64,
+        {
+            "functions": [
+                {
+                    "name": "handler",
+                    "address": "1000",
+                    "callees": [],
+                    "pseudocode": "void handler(){}",
+                    "address_taken": {"edges": [take], "truncated": False},
+                },
+                {"name": "plain", "address": "2000", "callees": [], "pseudocode": "void p(){}"},
+            ],
+            "imports": [],
+            "exports": [],
+            "strings": [],
+        },
+    )
+    ingest_ghidra_output(conn, output_dir, [_make_record("test_bin", "a" * 64)], sha_to_id)
+    rows = {r[0]: r[1] for r in conn.execute("SELECT name, address_taken FROM functions")}
+    assert json.loads(rows["handler"]) == {"edges": [take], "truncated": False}
+    assert json.loads(rows["plain"]) == {}  # no field -> default '{}', never null
+    conn.close()
+
+
 def test_ingest_stores_callees_truncated_flag(tmp_path: Path) -> None:
     """A wide dispatcher whose callee list hit the cap carries callees_truncated=1 so the call
     graph is never read as complete; a normal function defaults to 0."""

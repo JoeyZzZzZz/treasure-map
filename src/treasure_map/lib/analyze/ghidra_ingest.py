@@ -162,6 +162,10 @@ def _ingest_one_binary(
                 # recovered in this function, carried verbatim to be flattened into the atlas
                 # string_keyed_edge table at hunt time. Old exports -> '{}' (never null).
                 json.dumps(func.get("string_keyed_edges", {}), ensure_ascii=False),
+                # address-taken transport: who references THIS function's entry as a data/pointer
+                # ref (a .data table slot or a .text literal-pool take), carried verbatim and read
+                # by get_xrefs(direction=address_taken). Old exports -> '{}' (never null).
+                json.dumps(func.get("address_taken", {}), ensure_ascii=False),
             )
         )
     if func_rows:
@@ -170,8 +174,8 @@ def _ingest_one_binary(
                (binary_id, name, address, size_bytes, pseudocode,
                 pseudocode_hash, callees, callees_truncated, is_exported,
                 sink_provenance, nvram_ops, nvram_wrapper, wrapper_call_args,
-                string_keyed_edges)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                string_keyed_edges, address_taken)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             func_rows,
         )
         stats.functions_ingested += len(func_rows)

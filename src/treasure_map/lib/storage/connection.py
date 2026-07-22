@@ -59,6 +59,10 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # string-keyed-edge transport (detector B: same-variable strcmp ladder → {key, callees}).
     # Back-fills '{}' on older DBs (no edges until re-scan). Must match schema.sql.
     ("functions", "string_keyed_edges", "TEXT DEFAULT '{}'"),
+    # address-taken transport (who references a function's entry as a data/pointer ref — a static
+    # dispatch-table slot or a literal-pool take). Back-fills '{}' on older DBs (no takes until a
+    # re-scan). Must match schema.sql.
+    ("functions", "address_taken", "TEXT DEFAULT '{}'"),
 )
 
 

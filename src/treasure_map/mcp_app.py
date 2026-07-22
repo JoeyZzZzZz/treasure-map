@@ -911,10 +911,24 @@ def make_tools(
         run_id: str | None = None,
         evidence_ref: str | None = None,
     ) -> dict[str, Any]:
-        """Cross-reference edges: direction='callers' or 'callees' (includes cross-binary edges).
+        """Cross-reference edges: direction='callers' / 'callees' (both include cross-binary edges),
+        or 'address_taken'.
+
+        direction='address_taken' returns where this function's ENTRY address is referenced as a
+        DATA/POINTER value — a .data dispatch-table slot or a .text literal-pool ``ldr =F`` — and
+        which function took it (``taken_in_func``). Use it to locate WHERE a handler is registered
+        into a function-pointer table when direction='callers' comes back empty ('maybe dispatch').
+        It is a FACT (F's address is stored here), NEVER proof F is dispatched/reachable — trace the
+        call yourself.
 
         Run-aware: ``run_id`` + ``function`` or ``evidence_ref``; echoes ``resolved_run``."""
-        d: facts.XrefDirection = "callees" if direction == "callees" else "callers"
+        d: facts.XrefDirection = (
+            "callees"
+            if direction == "callees"
+            else "address_taken"
+            if direction == "address_taken"
+            else "callers"
+        )
         return _fact(
             lambda c, fn, bn: facts.get_xrefs(c, func=fn or "", direction=d, binary=bn),
             run_id=run_id,

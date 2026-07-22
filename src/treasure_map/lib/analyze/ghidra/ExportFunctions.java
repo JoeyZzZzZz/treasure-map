@@ -877,6 +877,83 @@ public class ExportFunctions extends GhidraScript {
         return "0x" + Long.toHexString(a.getOffset());
     }
 
+    // ADDRTAKEN_LIMIT caps one function's address-taken record. When hit, the extra takes are NOT
+    // silently dropped: truncated=true flags the record (same silent-drop red line as callees).
+    private static final int ADDRTAKEN_LIMIT = 100;
+
+    // Address-taken FACTS: who references function F's ENTRY as a DATA/POINTER reference (a .data
+    // dispatch-table slot, or a .text literal-pool `ldr =F` used for runtime/heap registration).
+    //
+    // ★ DIRECTION: getReferencesTo(F.entry) — who took F's address — NOT getReferencesFrom (what F
+    //   reads). ★ FILTER: by REFERENCE TYPE (drop isCall / isFlow — those are callers/branches),
+    //   NEVER by source segment: an ARM literal-pool `ldr =F` is a DATA ref that sits in an
+    //   EXECUTABLE block, so a segment filter would wrongly drop the runtime-registration case.
+    //   ``segment`` is metadata only. ★ IRON LAW: a fact (F's address is taken here, by this
+    //   function), NEVER a dispatch/reachability verdict — how/whether F is then called is the
+    //   consumer's to trace. ``taken_in_func`` = getFunctionContaining(from): the registrar/taker
+    //   (a literal-pool take resolves to it; a bare static-table slot is in no function -> null).
+    private String buildAddressTaken(Function func) {
+        Address entry = func.getEntryPoint();
+        ReferenceManager refMgr = currentProgram.getReferenceManager();
+        FunctionManager  fm      = currentProgram.getFunctionManager();
+        Memory           mem     = currentProgram.getMemory();
+        SymbolTable       symtab  = currentProgram.getSymbolTable();
+        StringBuilder arr = new StringBuilder("[");
+        boolean first = true, truncated = false;
+        int count = 0;
+        ReferenceIterator it = refMgr.getReferencesTo(entry);
+        while (it.hasNext()) {
+            Reference ref = it.next();
+            RefType rt = ref.getReferenceType();
+            if (rt.isCall() || rt.isFlow()) continue;          // callers/branches, not an address-take
+            if (!entry.equals(ref.getToAddress())) continue;   // only a TRUE entry take (defensive)
+            Address from = ref.getFromAddress();
+            if (from == null) continue;
+            // VALIDITY check (NOT a segment filter): the take must sit in a REAL initialized memory
+            // block — a location in the binary that actually holds F's pointer. Ghidra models an
+            // ELF entry-point / dynamic-symbol / relocation marker as a reference FROM address 0x0
+            // (no memory block); those are loader bookkeeping, not an in-binary data/literal-pool
+            // take. This drops from==0x0 noise WITHOUT dropping any real segment (a .text literal
+            // pool / .data / .got slot all have a real block), so the reference-type-not-segment
+            // rule still holds.
+            MemoryBlock fromBlk = mem.getBlock(from);
+            if (fromBlk == null || !fromBlk.isInitialized()) continue;
+            if (count >= ADDRTAKEN_LIMIT) { truncated = true; break; }
+            Function inFunc = fm.getFunctionContaining(from);
+            String takenInName = (inFunc != null) ? inFunc.getName() : null;
+            String takenInAddr = (inFunc != null) ? addrHex(inFunc.getEntryPoint()) : null;
+            String seg = segmentLabel(fromBlk);
+            Symbol nsym = symtab.getPrimarySymbol(from);
+            String nearby = (nsym != null && nsym.getName() != null && !nsym.getName().isEmpty())
+                            ? nsym.getName() : null;
+            if (!first) arr.append(",");
+            first = false;
+            arr.append("{\"taken_at\":\"").append(esc(addrHex(from))).append("\"")
+               .append(",\"taken_in_func\":")
+               .append(takenInName != null ? "\"" + esc(takenInName) + "\"" : "null")
+               .append(",\"taken_in_func_addr\":")
+               .append(takenInAddr != null ? "\"" + esc(takenInAddr) + "\"" : "null")
+               .append(",\"segment\":\"").append(esc(seg)).append("\"")
+               .append(",\"nearby_symbol\":")
+               .append(nearby != null ? "\"" + esc(nearby) + "\"" : "null")
+               .append("}");
+            count++;
+        }
+        arr.append("]");
+        return "{\"edges\":" + arr + ",\"truncated\":" + truncated + "}";
+    }
+
+    // The source-segment LABEL for an address holding F's pointer — METADATA to tell a static table
+    // from a runtime/heap registration, NEVER a filter. An executable block holding a pointer is an
+    // ARM-style literal-pool take (".text-literalpool"); otherwise the block name (.data / .rodata /
+    // .got / .data.rel.ro / …). Never used to include/exclude a reference (see buildAddressTaken).
+    private String segmentLabel(MemoryBlock blk) {
+        if (blk == null) return "unknown";
+        if (blk.isExecute()) return ".text-literalpool";
+        String n = blk.getName();
+        return (n != null && !n.isEmpty()) ? n : "unknown";
+    }
+
     private Address safeAdd(Address a, long delta) {
         try { return a.add(delta); } catch (Exception e) { return null; }
     }
@@ -1638,6 +1715,16 @@ public class ExportFunctions extends GhidraScript {
                 strKeyedEdges = "{\"edges\":[]}";
             }
 
+            // address-taken: who references THIS function's entry as data/pointer (non-call, non-flow)
+            // — a static-table slot or a literal-pool `ldr =F`. Reference-driven (no decompile needed),
+            // additive and isolated; a failure just yields no takes, never breaking the scan.
+            String addressTaken = "{\"edges\":[],\"truncated\":false}";
+            try {
+                addressTaken = buildAddressTaken(func);
+            } catch (Throwable ignore) {
+                addressTaken = "{\"edges\":[],\"truncated\":false}";
+            }
+
             // gap② A2: thin-nvram-wrapper flag + its callers' resolved literal keys. Additive and
             // isolated — a wrapper edge is recovered cross-function at hunt time; a failure here
             // just yields no wrapper data, never breaking the scan (honesty > coverage).
@@ -1668,6 +1755,7 @@ public class ExportFunctions extends GhidraScript {
                      .append(wrapperCallArgs)    // ",\"wrapper_call_args\":[...]"
                      .append(",")
                      .append("\"string_keyed_edges\":").append(strKeyedEdges).append(",")
+                     .append("\"address_taken\":").append(addressTaken).append(",")
                      .append("\"pseudocode\":")  .append("\"").append(esc(pseudocode)).append("\"")
                      .append("}");
             funcCount++;

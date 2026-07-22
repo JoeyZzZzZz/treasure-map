@@ -24,7 +24,28 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Literal
 
-XrefDirection = Literal["callers", "callees"]
+from treasure_map.lib.hunt.refs import _norm_addr
+
+XrefDirection = Literal["callers", "callees", "address_taken"]
+
+# The iron-law note on every address-taken result: it is a FACT (F's entry is referenced as a
+# data/pointer value here), NEVER a dispatch/reachability verdict. Whether/how F is then called
+# through that stored pointer is the consumer's to trace.
+_ADDRTAKEN_NOTE = (
+    "address-taken FACTS: each edge is a place F's ENTRY address is referenced as a data/pointer "
+    "value (a dispatch-table slot or a literal-pool `ldr =F`), and taken_in_func is the function "
+    "that took it. This is NOT proof F is dispatched or reachable — whether and how the stored "
+    "pointer is later called is for you to trace (a fact, never a routing verdict)."
+)
+_ADDRTAKEN_EMPTY_NOTE = (
+    "no address-taken sites recorded: F's entry is not referenced as a data/pointer value in this "
+    "binary's analysis. That is NOT proof F is uncalled — it may be reached by a direct call "
+    "(get_xrefs direction=callers) or a mechanism static analysis did not resolve."
+)
+_ADDRTAKEN_TRUNC_NOTE = (
+    "address-taken list TRUNCATED at the extractor cap: it is a prefix, so a site NOT listed may "
+    "still exist; do not read this as the complete set"
+)
 
 
 def open_analysis_ro(db_path: Path | str) -> sqlite3.Connection:
@@ -306,8 +327,11 @@ def get_xrefs(
     """Cross-reference edges for one function.
 
     direction='callers' returns the functions that reference this one; 'callees' returns the
-    functions it references. Cross-binary edges (an import resolved to another binary's export)
-    are included — that is the value over a single decompiler view.
+    functions it references; 'address_taken' returns where this function's ENTRY is referenced as a
+    DATA/POINTER value (a dispatch-table slot or a literal-pool ``ldr =F``) and which function took
+    it — a fact for locating a function-pointer registration, NEVER a dispatch/reachability verdict.
+    Cross-binary edges (an import resolved to another binary's export) are included for callers/
+    callees — that is the value over a single decompiler view.
 
     The xref table only records cross-binary edges, so for 'callers' a same-binary caller is
     recovered as a fallback by reverse-scanning each function's recorded callee list (xref_type
@@ -318,6 +342,8 @@ def get_xrefs(
     if row is None:
         assert miss is not None
         return miss
+    if direction == "address_taken":
+        return _address_taken_xrefs(conn, row)
     fid = row["id"]
     if direction == "callers":
         match_col, other_func, other_bin = "callee_func_id", "caller_func_id", "caller_binary_id"
@@ -372,6 +398,52 @@ def get_xrefs(
     if notes:
         result["note"] = " | ".join(notes)
     return result
+
+
+def _address_taken_xrefs(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+    """Address-taken edges for one function F: where F's ENTRY is referenced as a data/pointer value
+    (a .data dispatch-table slot or a .text literal-pool ``ldr =F``), and which function took it.
+
+    Reads the per-function ``address_taken`` transport column (Ghidra ``getReferencesTo(F.entry)``
+    filtered to non-call, non-flow refs). ``taken_at`` / ``taken_in_func_addr`` are canonicalized
+    with the SAME ``_norm_addr`` as evidence_ref, so a re-scan yields byte-identical addresses. IRON
+    LAW: a FACT (F's address is taken here, by this function), NEVER a dispatch/reachability verdict
+    — the honest note says so and an empty result is an honest empty, never 'uncalled'."""
+    r = conn.execute("SELECT address_taken FROM functions WHERE id = ?", (row["id"],)).fetchone()
+    raw = r["address_taken"] if r is not None else None
+    parsed: dict[str, Any] = {}
+    if raw:
+        try:
+            obj = json.loads(raw)
+            if isinstance(obj, dict):
+                parsed = obj
+        except (ValueError, TypeError):
+            parsed = {}
+    edges_raw = parsed.get("edges")
+    takes = edges_raw if isinstance(edges_raw, list) else []
+    edges: list[dict[str, Any]] = []
+    for t in takes:
+        if not isinstance(t, dict):
+            continue
+        edges.append(
+            {
+                "taken_at": _norm_addr(t.get("taken_at")),
+                "taken_in_func": t.get("taken_in_func"),
+                "taken_in_func_addr": _norm_addr(t.get("taken_in_func_addr")),
+                "segment": t.get("segment"),
+                "nearby_symbol": t.get("nearby_symbol"),
+            }
+        )
+    notes = [_ADDRTAKEN_NOTE if edges else _ADDRTAKEN_EMPTY_NOTE]
+    if parsed.get("truncated"):
+        notes.append(_ADDRTAKEN_TRUNC_NOTE)
+    return {
+        "found": True,
+        "anchor": _anchor(row["binary_name"], row["name"], row["address"]),
+        "direction": "address_taken",
+        "edges": edges,
+        "note": " | ".join(notes),
+    }
 
 
 def _append_callee_reverse_callers(

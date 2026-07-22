@@ -72,9 +72,25 @@ def _mk_analysis(tmp_path: Path) -> Path:
         (json.dumps(["do_fwd"]),),
     )
     conn.execute(
-        "INSERT INTO functions (id, binary_id, name, address, pseudocode, callees) "
-        "VALUES (2, 1, 'do_fwd', '0x5c34', 'void do_fwd(char* a){ system(a); }', ?)",
-        (json.dumps(["system"]),),
+        "INSERT INTO functions (id, binary_id, name, address, pseudocode, callees, address_taken) "
+        "VALUES (2, 1, 'do_fwd', '0x5c34', 'void do_fwd(char* a){ system(a); }', ?, ?)",
+        (
+            json.dumps(["system"]),
+            json.dumps(
+                {
+                    "edges": [
+                        {
+                            "taken_at": "0x6bc0",
+                            "taken_in_func": "handle_req",
+                            "taken_in_func_addr": "0x6b90",
+                            "segment": ".text-literalpool",
+                            "nearby_symbol": None,
+                        }
+                    ],
+                    "truncated": False,
+                }
+            ),
+        ),
     )
     conn.execute(
         "INSERT INTO non_binary_files (id, kind, name, path) "
@@ -931,6 +947,19 @@ def test_mcp_get_strings_accepts_offset_and_returns_paging(tmp_path: Path) -> No
     r = tools["get_strings"](binary="webd", offset=0, run_id="run_m")
     assert "paging" in r and r["paging"]["offset"] == 0
     assert r["paging"]["next_offset"] is None  # the synthetic webd fits one page
+
+
+def test_mcp_get_xrefs_address_taken_passthrough(tmp_path: Path) -> None:
+    # ★ the address-taken direction reaches the analysis.db fact through the run-aware MCP wrapper
+    # (direction no longer collapsed to callers/callees): it names the registrar and stays a fact.
+    tools = _tools(tmp_path)
+    r = tools["get_xrefs"](function="do_fwd", direction="address_taken", run_id="run_m")
+    assert r["direction"] == "address_taken"
+    e = r["edges"][0]
+    assert e["taken_in_func"] == "handle_req" and e["segment"] == ".text-literalpool"
+    assert e["taken_at"] == "00006bc0"  # canonicalized like evidence_ref
+    assert "NOT proof" in r["note"]  # IRON LAW: a fact, never a dispatch/reachability verdict
+    assert r["resolved_run"] == "run_m"  # run-aware envelope still stamped
 
 
 def test_compact_row_carries_param_source_when_controllability_unknown(tmp_path: Path) -> None:

@@ -52,6 +52,52 @@ def _mkdb(tmp_path: Path) -> Path:
         "INSERT INTO xrefs (caller_binary_id, caller_func_id, callee_binary_id, callee_func_id, "
         "xref_type) VALUES (1, 1, 2, 3, 'import_export')"
     )
+    # address-taken fixtures (vendor-neutral). Mechanism 1 — a .text literal-pool `ldr =F` inside a
+    # registrar (taken_in_func set); raw 0x addresses exercise _norm_addr canonicalization.
+    conn.execute(
+        "INSERT INTO functions (id, binary_id, name, address, pseudocode, callees, is_exported, "
+        "address_taken) VALUES (5, 1, 'dispatch_handler_a', '0x3000', 'void h_a(){}',"
+        " '[]', 0, ?)",
+        (
+            json.dumps(
+                {
+                    "edges": [
+                        {
+                            "taken_at": "0x9010",
+                            "taken_in_func": "register_handlers",
+                            "taken_in_func_addr": "0x8f00",
+                            "segment": ".text-literalpool",
+                            "nearby_symbol": None,
+                        }
+                    ],
+                    "truncated": False,
+                }
+            ),
+        ),
+    )
+    # Mechanism 2 — a bare .data static dispatch-table slot (taken_in_func=null), with a nearby
+    # symbol, and truncated=true to exercise the honest prefix flag.
+    conn.execute(
+        "INSERT INTO functions (id, binary_id, name, address, pseudocode, callees, is_exported, "
+        "address_taken) VALUES (6, 1, 'dispatch_handler_b', '0x3100', 'void h_b(){}',"
+        " '[]', 0, ?)",
+        (
+            json.dumps(
+                {
+                    "edges": [
+                        {
+                            "taken_at": "0xa000",
+                            "taken_in_func": None,
+                            "taken_in_func_addr": None,
+                            "segment": ".data",
+                            "nearby_symbol": "handler_table",
+                        }
+                    ],
+                    "truncated": True,
+                }
+            ),
+        ),
+    )
     conn.execute(
         "INSERT INTO strings (binary_id, value, address, category) "
         "VALUES (1, '/tmp/state', '0x1010', 'path')"
@@ -134,6 +180,46 @@ def test_get_xrefs_callers_and_callees_cross_binary(tmp_path: Path) -> None:
     }
     callers = facts.get_xrefs(conn, func="foo_entry", binary="libfoo.so", direction="callers")
     assert callers["edges"][0]["anchor"]["function"] == "handle_req"
+    conn.close()
+
+
+def test_get_xrefs_address_taken_literalpool_names_the_registrar(tmp_path: Path) -> None:
+    # ★ flagship shape (the messagingagent case): F's address is taken in a .text literal-pool
+    # `ldr =F` inside a registrar, so taken_in_func names WHO registered F — the answer get_xrefs
+    # callers can't give (a runtime/heap registration has no direct caller edge). taken_at is
+    # canonicalized with the SAME _norm_addr as evidence_ref (0x-free, zero-padded 8-hex).
+    conn = _ro(tmp_path)
+    r = facts.get_xrefs(conn, func="dispatch_handler_a", direction="address_taken")
+    assert r["direction"] == "address_taken"
+    e = r["edges"][0]
+    assert e["taken_in_func"] == "register_handlers"
+    assert e["segment"] == ".text-literalpool"  # a literal-pool take is KEPT (not segment-filtered)
+    assert e["taken_at"] == "00009010" and e["taken_in_func_addr"] == "00008f00"  # normalized
+    # ★ IRON LAW: a fact, never a dispatch/reachability verdict — the note draws that line.
+    assert "NOT proof" in r["note"] and "trace" in r["note"]
+    conn.close()
+
+
+def test_get_xrefs_address_taken_static_table_and_truncation(tmp_path: Path) -> None:
+    # ★ the other mechanism: a bare .data static-table slot has NO containing function
+    # (taken_in_func=null) but a nearby symbol; the honest truncation flag surfaces as a note.
+    conn = _ro(tmp_path)
+    r = facts.get_xrefs(conn, func="dispatch_handler_b", direction="address_taken")
+    e = r["edges"][0]
+    assert e["taken_in_func"] is None and e["taken_in_func_addr"] is None  # bare data slot
+    assert e["segment"] == ".data" and e["nearby_symbol"] == "handler_table"
+    assert e["taken_at"] == "0000a000"  # normalized
+    assert "TRUNCATED" in r["note"]  # honest prefix flag, never a silent drop
+    conn.close()
+
+
+def test_get_xrefs_address_taken_empty_is_honest_not_uncalled(tmp_path: Path) -> None:
+    # ★ honest empty: a function whose entry is not referenced as data returns empty edges with a
+    # note that this is NOT proof it is uncalled — never a fabricated or silent 'no takes = safe'.
+    conn = _ro(tmp_path)
+    r = facts.get_xrefs(conn, func="handle_req", direction="address_taken")
+    assert r["edges"] == []
+    assert "NOT proof" in r["note"] and "uncalled" in r["note"]
     conn.close()
 
 

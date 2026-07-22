@@ -71,6 +71,12 @@ CREATE TABLE IF NOT EXISTS functions (
     -- recovered from a same-variable strcmp ladder in this function (detector B). TRANSPORT column,
     -- flattened into the atlas string_keyed_edge table at hunt time. Empty '{}' when none.
     string_keyed_edges TEXT DEFAULT '{}',
+    -- address-taken FACTS: JSON {edges:[{taken_at,taken_in_func,taken_in_func_addr,segment,
+    -- nearby_symbol}],truncated} — who references THIS function's ENTRY as a data/pointer ref (a
+    -- .data dispatch-table slot or a .text literal-pool `ldr =F`). Filtered by reference type
+    -- (non-call, non-flow), NEVER by source segment. A FACT (F's address is taken here, by this
+    -- function), NEVER a dispatch/reachability verdict. Read via get_xrefs(direction=address_taken).
+    address_taken   TEXT DEFAULT '{}',
     FOREIGN KEY(binary_id) REFERENCES binaries(id) ON DELETE CASCADE
 );
 
