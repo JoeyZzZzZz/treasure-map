@@ -397,10 +397,16 @@ CREATE TABLE IF NOT EXISTS function_presence (
     side           TEXT NOT NULL,   -- 'a' | 'b'
     addr           TEXT NOT NULL,   -- normalized hex
     name           TEXT,
-    presence_state TEXT NOT NULL,   -- 'unmatched_both_decompiled'
-                                    -- | 'unmatched_decompile_missing'  (existence undetermined)
-                                    -- | 'inventory_mismatch'           (existence undetermined)
-    decompiled     INTEGER,         -- 1 / 0 / NULL(unknown): did this side decompile it?
+    presence_state TEXT NOT NULL,   -- ANALYSIS COMPLETENESS (not the decompile action):
+                                    -- 'unmatched_analysis_complete'    = no analysis gap (decompiled
+                                    --   OR a design-skipped micro-function) -> existence DETERMINED
+                                    -- | 'unmatched_analysis_incomplete' = a real gap (decompile
+                                    --   failed, or size unknown) -> existence UNDETERMINED, NEVER
+                                    --   read as add/delete
+                                    -- | 'inventory_mismatch'            = the other side's baseline
+                                    --   lacks this address
+    decompiled     INTEGER,         -- 1 / 0 / NULL(unknown): was this side's decompile a success?
+                                    --   NULL when size_bytes is unrecorded (cannot classify)
     UNIQUE(diff_id, side, addr)
 );
 CREATE INDEX IF NOT EXISTS idx_fpres ON function_presence(diff_id, side);
@@ -439,8 +445,14 @@ CREATE TABLE IF NOT EXISTS diff_meta (
     out_of_inventory_b      INTEGER,
     inventory_mismatch_a    INTEGER,         -- baseline_a addr the other side's baseline lacks
     inventory_mismatch_b    INTEGER,
-    functions_empty_a       INTEGER,         -- baseline_a functions that never decompiled
+    functions_empty_a       INTEGER,         -- REAL decompile failures (size >= MIN, no pseudocode)
+                                             --   — same meaning as run.functions_empty; does NOT
+                                             --   include design-skipped micro-functions
     functions_empty_b       INTEGER,
+    micro_skipped_a         INTEGER,         -- micro-functions (size < MIN) the exporter skipped by
+                                             --   design — known-benign, kept SEPARATE from
+                                             --   functions_empty (never merged: same-name-diff-meaning)
+    micro_skipped_b         INTEGER,
     presence_computed_a     INTEGER NOT NULL DEFAULT 0,  -- 1 = A side's baseline was available
     presence_computed_b     INTEGER NOT NULL DEFAULT 0,
     created_at              DATETIME DEFAULT CURRENT_TIMESTAMP

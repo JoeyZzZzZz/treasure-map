@@ -99,6 +99,15 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if nvkf_cols and "via_wrapper" not in nvkf_cols:
         conn.execute("ALTER TABLE nvram_key_flow ADD COLUMN via_wrapper TEXT")
 
+    # diff_meta.micro_skipped_a/b (added this round): design-skipped micro-function counts, kept
+    # SEPARATE from functions_empty (which now means real failures only). An atlas that already
+    # created diff_meta needs these columns; nullable INTEGER, existing rows carry NULL. Idempotent.
+    dm_cols = _column_names(conn, "diff_meta")
+    if dm_cols and "micro_skipped_a" not in dm_cols:
+        conn.execute("ALTER TABLE diff_meta ADD COLUMN micro_skipped_a INTEGER")
+    if dm_cols and "micro_skipped_b" not in dm_cols:
+        conn.execute("ALTER TABLE diff_meta ADD COLUMN micro_skipped_b INTEGER")
+
 
 def open_atlas(db_path: Path) -> sqlite3.Connection:
     """Open (or create) the atlas SQLite database and apply the schema.

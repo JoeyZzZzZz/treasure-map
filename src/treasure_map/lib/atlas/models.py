@@ -282,7 +282,9 @@ class DiffMetaRow:
     out_of_inventory_b: int | None = None
     inventory_mismatch_a: int | None = None
     inventory_mismatch_b: int | None = None
-    functions_empty_a: int | None = None
+    functions_empty_a: int | None = None  # REAL decompile failures only (== run.functions_empty)
     functions_empty_b: int | None = None
+    micro_skipped_a: int | None = None  # design-skipped micro-funcs, kept separate (never merged)
+    micro_skipped_b: int | None = None
     presence_computed_a: int = 0
     presence_computed_b: int = 0

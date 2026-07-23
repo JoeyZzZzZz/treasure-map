@@ -31,6 +31,7 @@ from treasure_map.lib.atlas.writer import (
     delete_diff,
 )
 from treasure_map.lib.errors import ConfigError
+from treasure_map.lib.facts import _DECOMPILE_MIN_SIZE
 from treasure_map.lib.hunt.refs import _norm_addr
 from treasure_map.lib.query.runs import get_run
 
@@ -124,21 +125,53 @@ def parse_bindiff(
     )
 
 
+def _decompile_status(pseudocode: str | None, size_bytes: int | None) -> str:
+    """Classify one baseline function's decompile outcome — the KEY distinction empty pseudocode
+    hides: an empty body is NOT the same as a failed decompile.
+
+      * ``ok``            — has pseudocode.
+      * ``skipped_micro`` — empty AND size < _DECOMPILE_MIN_SIZE: the exporter skips micro-functions
+                            (thunks / alignment stubs) BY DESIGN, so this is not an analysis gap.
+      * ``failed``        — empty AND size >= _DECOMPILE_MIN_SIZE: a genuine decompile failure.
+      * ``unknown``       — size unrecorded (NULL OR 0). ★ BOTH sentinels: functions.size_bytes is
+                            ``INTEGER DEFAULT 0`` so it is never NULL in practice -- 0 is the real
+                            "unrecorded" marker. A 0-size real function must NOT be swallowed into
+                            skipped_micro (0 < MIN); size-unknown cannot be classified -> unknown.
+    ``unknown`` is checked BEFORE the size comparison so 0 never falls through to skipped_micro."""
+    if pseudocode and pseudocode.strip():
+        return "ok"
+    if size_bytes is None or size_bytes == 0:
+        return "unknown"
+    if size_bytes < _DECOMPILE_MIN_SIZE:
+        return "skipped_micro"
+    return "failed"
+
+
 @dataclass(frozen=True)
 class BaselineDomain:
-    """One run's function inventory for the diffed binary: normalized addr -> decompiled? (the tmap
-    functions table, NOT the diff tool's larger enumeration -- see the 737-phantom guard)."""
+    """One run's function inventory for the diffed binary: normalized addr -> (name, decompile
+    status) over the tmap functions table (NOT the diff tool's larger enumeration -- the 737-phantom
+    guard). ``decompile status`` is 4-state (see ``_decompile_status``): a design-skipped
+    micro-function is told apart from a real decompile failure, so a benign skip is never inflated
+    into an analysis gap."""
 
-    # addr -> (name, decompiled) ; decompiled True/False from pseudocode presence
-    functions: dict[str, tuple[str | None, bool]]
+    # addr -> (name, decompile_status) ; status in ok / skipped_micro / failed / unknown
+    functions: dict[str, tuple[str | None, str]]
 
     @property
     def addrs(self) -> frozenset[str]:
         return frozenset(self.functions)
 
     @property
-    def empty_count(self) -> int:
-        return sum(1 for _n, dec in self.functions.values() if not dec)
+    def failed_count(self) -> int:
+        """Real decompile failures (size >= MIN, no pseudocode) — the same meaning as
+        run.functions_empty. Does NOT include design-skipped micro-functions."""
+        return sum(1 for _n, st in self.functions.values() if st == "failed")
+
+    @property
+    def skipped_micro_count(self) -> int:
+        """Micro-functions the exporter skipped by design (size < MIN) — known-benign, NOT a gap."""
+        return sum(1 for _n, st in self.functions.values() if st == "skipped_micro")
 
 
 def load_baseline(analysis_db_path: str, binary: str) -> BaselineDomain:
@@ -146,37 +179,37 @@ def load_baseline(analysis_db_path: str, binary: str) -> BaselineDomain:
 
     ``binary`` matches ``binaries.name`` OR ``binaries.sha256`` (the sha is the stable selector).
     The domain is tmap's own inventory, which by design omits thunks / externals / micro-functions
-    the diff tool keeps -- so presence uses THIS set, not the diff tool's larger one."""
+    the diff tool keeps -- so presence uses THIS set, not the diff tool's larger one. ``size_bytes``
+    is read so an empty body is classified (design-skip vs real failure), never lumped 'missing'."""
     con = sqlite3.connect(f"file:{analysis_db_path}?mode=ro", uri=True)
     try:
         con.row_factory = sqlite3.Row
         rows = con.execute(
-            "SELECT f.address, f.name, f.pseudocode FROM functions f "
+            "SELECT f.address, f.name, f.pseudocode, f.size_bytes FROM functions f "
             "JOIN binaries b ON b.id = f.binary_id WHERE b.name = ? OR b.sha256 = ?",
             (binary, binary),
         ).fetchall()
     finally:
         con.close()
-    funcs: dict[str, tuple[str | None, bool]] = {}
+    funcs: dict[str, tuple[str | None, str]] = {}
     for r in rows:
         addr = norm_hex(r["address"])
         if addr is None:
             continue
-        funcs[addr] = (r["name"], bool((r["pseudocode"] or "").strip()))
+        funcs[addr] = (r["name"], _decompile_status(r["pseudocode"], r["size_bytes"]))
     return BaselineDomain(functions=funcs)
 
 
-def _presence_state(decompiled: bool | None) -> str:
-    """The three-state presence label for an unmatched baseline function. A cleanly-decompiled
-    unmatched function is a genuine unmatched (add/delete/refactor -- a LATER stage judges which); a
-    decompile gap or an unknown status is existence-UNDETERMINED and must NEVER read as add/delete.
-    Mapped from the function's own decompile status (the cross-side literal-address ``inventory``
-    comparison of the original spec does not apply across two different-address-space builds)."""
-    if decompiled is True:
-        return "unmatched_both_decompiled"
-    if decompiled is False:
-        return "unmatched_decompile_missing"
-    return "inventory_mismatch"
+def _presence_state(status: str) -> str:
+    """The presence label for an unmatched baseline function — about ANALYSIS COMPLETENESS, not the
+    decompile action. ``ok`` (decompiled) and ``skipped_micro`` (design-skipped, no gap) are both
+    ``unmatched_analysis_complete`` (existence is DETERMINED, a genuine unmatched a later stage may
+    judge add/delete/refactor). ``failed`` and ``unknown`` are ``unmatched_analysis_incomplete``
+    (a real gap -> existence UNDETERMINED, NEVER add/delete). ``unknown`` -> incomplete is the
+    conservative direction: size unknown means 'no gap' cannot be asserted."""
+    if status in ("ok", "skipped_micro"):
+        return "unmatched_analysis_complete"
+    return "unmatched_analysis_incomplete"
 
 
 @dataclass(frozen=True)
@@ -186,6 +219,15 @@ class SidePresence:
     out_of_inventory: int
     inventory_mismatch: int
     matched_in_domain: int
+
+
+# decompile status -> the presence row's honest ``decompiled`` flag (1 / 0 / NULL-unknown).
+_DECOMPILED_FLAG: dict[str, int | None] = {
+    "ok": 1,
+    "skipped_micro": 0,
+    "failed": 0,
+    "unknown": None,
+}
 
 
 def compute_side_presence(
@@ -198,27 +240,25 @@ def compute_side_presence(
     out_of_inventory = len(matched_addrs - baseline.addrs)
     matched_in_domain = len(matched_addrs & baseline.addrs)
     rows: list[FunctionPresenceRow] = []
-    inv_mismatch = 0
     for addr in sorted(unmatched_addrs):
-        name, decompiled = baseline.functions[addr]
-        state = _presence_state(decompiled)
-        if state == "inventory_mismatch":
-            inv_mismatch += 1
+        name, status = baseline.functions[addr]
         rows.append(
             FunctionPresenceRow(
                 diff_id=diff_id,
                 side=side,
                 addr=addr,
                 name=name,
-                presence_state=state,
-                decompiled=1 if decompiled else 0,
+                presence_state=_presence_state(status),
+                decompiled=_DECOMPILED_FLAG[status],
             )
         )
+    # inventory_mismatch is a cross-side-domain state, not derived per-side here (different builds
+    # have disjoint address spaces), so it stays 0 in this path -- a valid-but-unreached state.
     return SidePresence(
         rows=rows,
         unmatched=len(unmatched_addrs),
         out_of_inventory=out_of_inventory,
-        inventory_mismatch=inv_mismatch,
+        inventory_mismatch=0,
         matched_in_domain=matched_in_domain,
     )
 
@@ -310,8 +350,12 @@ def run_layer0_parse(
         out_of_inventory_b=pres_b.out_of_inventory,
         inventory_mismatch_a=pres_a.inventory_mismatch,
         inventory_mismatch_b=pres_b.inventory_mismatch,
-        functions_empty_a=baseline_a.empty_count,
-        functions_empty_b=baseline_b.empty_count,
+        # functions_empty = REAL failures only (== run.functions_empty); micro_skipped kept SEPARATE
+        # (design-skipped micro-funcs are known-benign, never merged into the failure count).
+        functions_empty_a=baseline_a.failed_count,
+        functions_empty_b=baseline_b.failed_count,
+        micro_skipped_a=baseline_a.skipped_micro_count,
+        micro_skipped_b=baseline_b.skipped_micro_count,
         presence_computed_a=1,
         presence_computed_b=1,
     )
