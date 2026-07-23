@@ -219,6 +219,11 @@ class SidePresence:
     out_of_inventory: int
     inventory_mismatch: int
     matched_in_domain: int
+    # The ACTUAL out-of-inventory address SET (matched addrs not in the baseline domain), not only
+    # its count. Retained so a guard can assert it at the SET level: a count-level check flips green
+    # when two categories happen to have equal cardinality (numbers coincide, elements misplace), so
+    # the domain-swap regression must be caught by set equality, which is cardinality-independent.
+    out_of_inventory_addrs: frozenset[str] = frozenset()
 
 
 # decompile status -> the presence row's honest ``decompiled`` flag (1 / 0 / NULL-unknown).
@@ -235,9 +240,15 @@ def compute_side_presence(
 ) -> SidePresence:
     """Per-side presence: baseline functions with no matched pair become explicit, countable rows;
     matched addrs NOT in the baseline are out_of_inventory (counted, never a presence row, never an
-    add/delete). A presence row states ONLY 'not in a matched pair', never 'added'/'removed'."""
+    add/delete). A presence row states ONLY 'not in a matched pair', never 'added'/'removed'.
+
+    ★ HONEST COVERAGE NOTE: the presence / baseline layer has NO real-firmware CI coverage. Every
+    presence test uses a synthetic analysis.db; the A-side reference numbers (1111 / 737 / 34) rest
+    on two one-off manual verifications with no live assertion, and the B-side (where the 'new
+    function' signal would live) has never been run on real data because no patched run is ingested.
+    The double-machine reproducibility that IS proven covers the .BinDiff EXPORT, not this layer."""
     unmatched_addrs = baseline.addrs - matched_addrs
-    out_of_inventory = len(matched_addrs - baseline.addrs)
+    out_of_inventory_addrs = matched_addrs - baseline.addrs
     matched_in_domain = len(matched_addrs & baseline.addrs)
     rows: list[FunctionPresenceRow] = []
     for addr in sorted(unmatched_addrs):
@@ -257,9 +268,10 @@ def compute_side_presence(
     return SidePresence(
         rows=rows,
         unmatched=len(unmatched_addrs),
-        out_of_inventory=out_of_inventory,
+        out_of_inventory=len(out_of_inventory_addrs),
         inventory_mismatch=0,
         matched_in_domain=matched_in_domain,
+        out_of_inventory_addrs=frozenset(out_of_inventory_addrs),
     )
 
 
@@ -287,6 +299,57 @@ def _resolve_run(atlas: sqlite3.Connection, run_id: str, side: str) -> RunRow:
             "(present but unresolved) -- re-scan it to record its lineage before diffing"
         )
     return run
+
+
+def _binary_sha256(analysis_db_path: str, binary: str) -> str | None:
+    """The content sha256 of the diffed binary in this run's analysis.db (``binary`` = name OR
+    sha256). None when the binary is not found."""
+    con = sqlite3.connect(f"file:{analysis_db_path}?mode=ro", uri=True)
+    try:
+        row = con.execute(
+            "SELECT sha256 FROM binaries WHERE name = ? OR sha256 = ?", (binary, binary)
+        ).fetchone()
+    finally:
+        con.close()
+    return row[0] if row is not None else None
+
+
+def _bindiff_file_hashes(bindiff_path: Path) -> list[str]:
+    """The two per-side content hashes from a ``.BinDiff``'s ``file`` table, ordered by id
+    (id=1 = A/before ↔ address1, id=2 = B/after ↔ address2). The declared ``CHARACTER(40)`` does not
+    truncate under SQLite dynamic typing, so a 64-char sha256 rides intact. [] when there is no
+    ``file`` table (an older / hand-made .BinDiff) -- then the binary identity cannot be checked."""
+    con = sqlite3.connect(f"file:{bindiff_path}?mode=ro", uri=True)
+    try:
+        try:
+            rows = con.execute("SELECT hash FROM file ORDER BY id").fetchall()
+        except sqlite3.OperationalError:
+            return []  # no file table
+    finally:
+        con.close()
+    return [r[0] for r in rows if r[0]]
+
+
+def _validate_bindiff_binaries(
+    bindiff_path: Path, run_a: RunRow, run_b: RunRow, binary_a: str, binary_b: str
+) -> None:
+    """Guard: the ``.BinDiff`` must be the comparison of THESE two binaries. Cross-firmware misuse
+    (firmware X's .BinDiff over firmware Y's runs) would otherwise write a whole set of garbage
+    alignment rows silently. Checks a DETERMINISTIC FACT (the file hashes on each side equal the
+    resolved binaries' sha256s), never a judgement -- function-scope compliant. Skipped only when a
+    .BinDiff has no file table (identity unverifiable, NOT a silent pass of a known mismatch)."""
+    hashes = _bindiff_file_hashes(bindiff_path)
+    if len(hashes) < 2:
+        return  # no file table -> cannot verify (documented boundary)
+    assert run_a.analysis_db_path is not None and run_b.analysis_db_path is not None
+    sha_a = _binary_sha256(run_a.analysis_db_path, binary_a)
+    sha_b = _binary_sha256(run_b.analysis_db_path, binary_b)
+    if hashes[0] != sha_a or hashes[1] != sha_b:
+        raise ConfigError(
+            "this .BinDiff does not correspond to the two runs' binaries: its file-side hashes "
+            f"({hashes[0]}, {hashes[1]}) do not match the resolved binary sha256s ({sha_a}, "
+            f"{sha_b}) -- a cross-firmware .BinDiff would produce garbage alignment; refusing"
+        )
 
 
 @dataclass(frozen=True)
@@ -317,6 +380,7 @@ def run_layer0_parse(
     ``diff_id`` in a single replace-by-diff transaction (idempotent re-parse)."""
     run_a = _resolve_run(atlas, run_a_id, "a")
     run_b = _resolve_run(atlas, run_b_id, "b")
+    _validate_bindiff_binaries(bindiff_path, run_a, run_b, binary_a, binary_b)
     did = diff_id or f"{run_a_id}::{run_b_id}"
 
     parsed = parse_bindiff(bindiff_path, did, threshold)

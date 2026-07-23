@@ -16,9 +16,11 @@ from pathlib import Path
 import pytest
 
 from treasure_map.lib.atlas.connection import open_atlas
-from treasure_map.lib.atlas.models import FunctionAlignmentRow
+from treasure_map.lib.atlas.models import FunctionAlignmentRow, FunctionPresenceRow
 from treasure_map.lib.atlas.writer import add_function_alignment, begin_run
+from treasure_map.lib.diff import layer0
 from treasure_map.lib.diff.layer0 import (
+    BaselineDomain,
     alignment_state,
     compute_side_presence,
     load_baseline,
@@ -52,9 +54,10 @@ _NAMED_UNDETERMINED = [
 ]
 
 
-def _mk_bindiff(path: Path, rows: list[tuple]) -> Path:  # type: ignore[type-arg]
+def _mk_bindiff(path: Path, rows: list[tuple], *, file_hashes=("sha_a", "sha_b")) -> Path:  # type: ignore[type-arg]
     """A tiny synthetic .BinDiff (only the columns layer-0 reads). rows = (a1,n1,a2,n2,sim,conf,
-    bb,edges,instr)."""
+    bb,edges,instr). ``file_hashes`` = the (before, after) side hashes written to the ``file`` table
+    for the binary-identity check; pass None to omit the file table (unverifiable)."""
     con = sqlite3.connect(path)
     con.execute(
         "CREATE TABLE function (id INTEGER PRIMARY KEY, address1 BIGINT, name1 TEXT, "
@@ -66,6 +69,12 @@ def _mk_bindiff(path: Path, rows: list[tuple]) -> Path:  # type: ignore[type-arg
         "basicblocks,edges,instructions) VALUES (?,?,?,?,?,?,?,?,?)",
         rows,
     )
+    if file_hashes is not None:
+        con.execute("CREATE TABLE file (id INT, filename TEXT, hash CHARACTER(40))")
+        con.executemany(
+            "INSERT INTO file (id, filename, hash) VALUES (?, ?, ?)",
+            [(1, "before", file_hashes[0]), (2, "after", file_hashes[1])],
+        )
     con.commit()
     con.close()
     return path
@@ -157,18 +166,116 @@ def test_alignment_row_has_no_change_verdict_field() -> None:
 # ── baseline domain + presence three-state (synthetic, hermetic) ────────────────────────
 
 
-def test_out_of_inventory_never_counts_as_unmatched(tmp_path: Path) -> None:
-    # ★ the phantom guard (real fw: 737 out-of-inventory): a matched pair whose A addr is NOT in
-    # tmap's inventory (a thunk BinDiff keeps but the exporter skips) is out_of_inventory — NEVER an
-    # unmatched presence row.
-    db = _mk_analysis(tmp_path / "a.db", "lib.so", "s", [("0x1000", "real_fn", "int f(){}", 64)])
-    base = load_baseline(str(db), "lib.so")
-    # matched: one addr in inventory (0x1000) + one NOT in inventory (0x9999 = a thunk)
-    pres = compute_side_presence("d", "a", frozenset({"00001000", "00009999"}), base)
-    assert pres.out_of_inventory == 1  # 0x9999 matched but not in inventory
-    assert pres.unmatched == 0  # 0x1000 matched; nothing left unmatched
-    assert pres.matched_in_domain == 1
-    assert pres.rows == []  # no phantom unmatched row
+# ── presence: the ②③④ fixture + SET-level guards (each proven to have teeth in reverse below) ──
+#
+# The domain-swap bug (baseline := BinDiff set instead of tmap's inventory) and the operand-swap bug
+# (unmatched := matched - baseline) are DIFFERENT bugs whose symptoms land in DIFFERENT buckets, so
+# they need different guards. Categories injected (NOT ①, which layer-0 has no input channel for):
+#   ② out-of-domain ∧ matched -> out_of_inventory ; ③ in-domain ∧ unmatched -> a presence row ;
+# ④ in-domain ∧ matched -> matched_in_domain. ★ Fixture rule |②| != |③| (1 vs 2) so a count-level
+# coincidence can never mask a set-level error; ★ ③ non-empty and covering BOTH presence_states.
+
+# ④ two in-domain matched funcs ; ③ two in-domain UNMATCHED funcs (one analysis_complete via a
+# skipped_micro size, one analysis_incomplete via a real-failure size) ; ② one out-of-domain match.
+_CAT4 = frozenset({"00004000", "00004001"})
+_CAT3 = frozenset({"00003000", "00003001"})
+_CAT2 = frozenset({"00009999"})
+
+
+def _presence_fixture(tmp_path: Path):  # type: ignore[no-untyped-def]
+    # baseline (tmap functions inventory) = ③ ∪ ④ ; matched pairs (from the .BinDiff) = ② ∪ ④.
+    funcs = [
+        ("0x4000", "kept0", "int f(){}", 64),  # ④ ok
+        ("0x4001", "kept1", "int f(){}", 64),  # ④ ok
+        ("0x3000", "gone_micro", "", 4),  # ③ skipped_micro -> unmatched_analysis_complete
+        ("0x3001", "gone_failed", "", 128),  # ③ failed -> unmatched_analysis_incomplete
+    ]
+    db = _mk_analysis(tmp_path / "a.db", "lib.so", "s", funcs)
+    baseline = load_baseline(str(db), "lib.so")
+    matched = _CAT2 | _CAT4
+    return baseline, matched
+
+
+def test_presence_guards_g1_g3_g4_g5_on_subset_fixture(tmp_path: Path) -> None:
+    baseline, matched = _presence_fixture(tmp_path)
+    pres = compute_side_presence("d", "a", matched, baseline)
+    # ★ G1 (D1's core, cardinality-independent): baseline domain equals the TEST-SIDE independently
+    # known functions set (③∪④) -- NOT the matched set. A domain swap corrupts baseline.addrs.
+    assert baseline.addrs == _CAT3 | _CAT4
+    # ★ G3 (D1 catcher, SET not count): out_of_inventory is exactly ② (out-of-domain matched)
+    assert pres.out_of_inventory_addrs == _CAT2
+    # ★ G4 (D2 catcher, SET): the unmatched presence rows are exactly ③ (in-domain unmatched)
+    assert {r.addr for r in pres.rows} == _CAT3
+    # ★ G5 (functional, axis D3): ③'s two presence_states are bucketed correctly
+    by_addr = {r.addr: r.presence_state for r in pres.rows}
+    assert by_addr["00003000"] == "unmatched_analysis_complete"  # skipped_micro
+    assert by_addr["00003001"] == "unmatched_analysis_incomplete"  # real failure
+    # structural identity -- a NON-GUARD (tautology for ANY baseline: (B∩M)⊎(B−M)≡B); no
+    # interception, never relied on as a guard.
+    assert pres.matched_in_domain + pres.unmatched == len(baseline.addrs)  # NON-GUARD (always true)
+
+
+# ── reverse-validation: each guard PROVEN to go red under its degradation (per simulation) ──
+# D1 domain-swap -> G1,G3,G4 red ; D2 operand-swap -> G4 red (G1,G3 GREEN, discriminating) ;
+# D3 mapping-broken -> G5 red. (G5's red under D1/D2 would be collateral of ③ rows vanishing, so it
+# is NOT tested there; the structural identity is a NON-GUARD, green under any degradation.)
+
+
+def test_reverse_d1_domain_swap_reds_g1_g3_g4(tmp_path: Path) -> None:
+    baseline, matched = _presence_fixture(tmp_path)
+    # THE BUG: baseline := the BinDiff/matched set (the code can only see matched pairs), not tmap's
+    # inventory. All of matched's addrs become 'in domain'.
+    d1_baseline = BaselineDomain(functions={a: (None, "ok") for a in matched})
+    pres = compute_side_presence("d", "a", matched, d1_baseline)
+    assert d1_baseline.addrs != _CAT3 | _CAT4  # G1 RED (baseline corrupted)
+    assert pres.out_of_inventory_addrs != _CAT2  # G3 RED (matched - matched = empty, not ②)
+    assert {r.addr for r in pres.rows} != _CAT3  # G4 RED (baseline - matched = empty, not ③)
+    # ★ the structural identity stays GREEN even here -> proves it is a NON-GUARD, not a catcher
+    assert pres.matched_in_domain + pres.unmatched == len(d1_baseline.addrs)
+
+
+def _compute_d2(matched, baseline):  # type: ignore[no-untyped-def]
+    # THE BUG (operand swap): unmatched := matched - baseline (should be baseline - matched).
+    unmatched = matched - baseline.addrs
+    return [
+        FunctionPresenceRow(
+            diff_id="d",
+            side="a",
+            addr=a,
+            name=None,
+            presence_state="unmatched_analysis_complete",
+            decompiled=1,
+        )
+        for a in sorted(unmatched)
+    ]
+
+
+def test_reverse_d2_operand_swap_reds_only_g4(tmp_path: Path) -> None:
+    baseline, matched = _presence_fixture(tmp_path)
+    d2_rows = _compute_d2(matched, baseline)
+    assert {r.addr for r in d2_rows} != _CAT3  # G4 RED (unmatched became ②, not ③)
+    # ★ G1 and G3 stay GREEN under D2 -> they DISCRIMINATE the kind (D2 not D1)
+    assert baseline.addrs == _CAT3 | _CAT4  # G1 green
+    assert (matched - baseline.addrs) == _CAT2  # G3 green (out_of_inventory still ②)
+
+
+def test_reverse_d3_mapping_broken_reds_g5(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    # THE BUG (_presence_state): mis-map skipped_micro -> analysis_incomplete (reverse of the
+    # micro-function fix). G5 catches it; G1/G3/G4 (set-membership, not per-row status) stay green.
+    real = layer0._presence_state
+    monkeypatch.setattr(
+        layer0,
+        "_presence_state",
+        lambda st: "unmatched_analysis_incomplete" if st == "skipped_micro" else real(st),
+    )
+    baseline, matched = _presence_fixture(tmp_path)
+    pres = compute_side_presence("d", "a", matched, baseline)
+    by_addr = {r.addr: r.presence_state for r in pres.rows}
+    assert by_addr["00003000"] != "unmatched_analysis_complete"  # G5 RED (skipped_micro mis-mapped)
+    # ★ the set-level guards are UNAFFECTED by a mapping bug -> they stay green (discriminate D3)
+    assert baseline.addrs == _CAT3 | _CAT4  # G1 green
+    assert pres.out_of_inventory_addrs == _CAT2  # G3 green
+    assert {r.addr for r in pres.rows} == _CAT3  # G4 green
 
 
 def test_skipped_micro_is_analysis_complete_not_a_gap(tmp_path: Path) -> None:
@@ -447,3 +554,45 @@ def test_schema_declares_matched_pairs_only() -> None:
     ).read_text()
     assert "MATCHED PAIRS ONLY" in schema
     assert '"function removed"' in schema  # absence of a row != removed
+
+
+# ── binary-identity hash validation (a cross-firmware .BinDiff is refused, not silently run) ──
+
+
+def test_bindiff_binary_hash_mismatch_is_refused(tmp_path: Path) -> None:
+    # ★ a .BinDiff whose file-side hash does not match the resolved binary sha256 (the classic
+    # cross-firmware misuse) -> explicit ConfigError, and NOT one alignment row written.
+    atlas_path = _seed_two_runs(tmp_path)  # analysis dbs carry sha 'sha_a' / 'sha_b'
+    bad = _mk_bindiff(
+        tmp_path / "bad.BinDiff",
+        [(0x1000, "keep", 0x1100, "keep", 0.98, 0.97, 3, 2, 20)],
+        file_hashes=("WRONG_HASH", "sha_b"),  # A-side hash does not match binary_a
+    )
+    con = open_atlas(atlas_path)
+    with pytest.raises(ConfigError, match="does not correspond"):
+        run_layer0_parse(
+            con,
+            bindiff_path=bad,
+            run_a_id="run_a",
+            run_b_id="run_b",
+            binary_a="lib.so",
+            binary_b="lib.so",
+        )
+    assert con.execute("SELECT COUNT(*) FROM function_alignment").fetchone()[0] == 0
+    con.close()
+
+
+def test_bindiff_matching_hashes_proceed(tmp_path: Path) -> None:
+    # ★ matching file-side hashes -> the parse runs normally (the guard is not a blanket block).
+    atlas_path = _seed_two_runs(tmp_path)
+    con = open_atlas(atlas_path)
+    r = run_layer0_parse(
+        con,
+        bindiff_path=_tiny_bindiff(tmp_path),
+        run_a_id="run_a",
+        run_b_id="run_b",
+        binary_a="lib.so",
+        binary_b="lib.so",
+    )
+    assert r.matched_pairs == 1  # _tiny_bindiff writes matching ('sha_a','sha_b') hashes
+    con.close()
