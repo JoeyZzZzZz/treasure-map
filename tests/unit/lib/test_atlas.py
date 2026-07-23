@@ -696,10 +696,12 @@ def test_static_no_unscoped_wipe_in_atlas() -> None:
         "DELETE FROM web_form_fields WHERE source_run_id = ?",
         "DELETE FROM string_keyed_edge WHERE source_run_id = ?",
         "DELETE FROM run_capability WHERE run_id = ?",
-        # diff-scoped replace-by-diff refresh (idempotent layer-0 re-parse), touches one diff_id
+        # diff-scoped replace-by-diff refresh (idempotent layer-0 / layer-2 re-parse), one diff_id
         "DELETE FROM function_alignment WHERE diff_id = ?",
         "DELETE FROM function_presence WHERE diff_id = ?",
         "DELETE FROM diff_meta WHERE diff_id = ?",
+        "DELETE FROM dimension_delta WHERE diff_id = ?",
+        "DELETE FROM dimension_capability_state WHERE diff_id = ?",
     )
     for py_file in _ATLAS_SRC.glob("*.py"):
         text = py_file.read_text()

@@ -457,3 +457,104 @@ CREATE TABLE IF NOT EXISTS diff_meta (
     presence_computed_b     INTEGER NOT NULL DEFAULT 0,
     created_at              DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+
+-- ── layer-2 diff: dimension_delta ────────────────────────────────────────────
+-- One dimension's difference for one subject between two runs. A row is a
+-- PROJECTION of two already-computed layer annotations, NEVER a fresh analysis
+-- and NEVER a quality judgement: this layer says "this annotation differs",
+-- never "the change fixed / broke / regressed anything". There is deliberately
+-- no fixed / incomplete_fix / regression value.
+--
+-- IRON LAW (tri-state): delta_kind is 'layer_unchanged' ONLY when both sides are
+-- present, comparable and equal. Anything unresolved on either side is
+-- 'delta_undetermined' -- NEVER collapsed into 'layer_unchanged'. A wrong
+-- 'unchanged' is the expensive error: a consumer acts on it as "this dimension
+-- was not touched by the change".
+--
+-- undetermined_scope separates two kinds of not-knowing a consumer must handle
+-- differently:
+--   'data'       -- this subject was not resolvable (alignment broke, a region
+--                   was incomplete). Another subject may resolve fine.
+--   'capability' -- this whole dimension is unavailable in this tool/code
+--                   version; it is identical for EVERY subject and no amount of
+--                   data fixes it. NEVER present it as a per-subject data gap.
+-- A consumer keys ONLY on undetermined_scope; undetermined_reason is human/agent
+-- readable and its enum may grow -- never branch bucketing on an unknown reason.
+--
+-- ★ state_a / state_b are OPAQUE evidence carried for the reader, NOT a branch
+-- basis: this layer may compare them ONLY for existence and equality, and must
+-- NEVER read their content to decide anything (no `if state_a == '<value>'`).
+-- Branching on content would make this a second verdict engine; its job is to
+-- project, never to judge. (Free text; enforced by contract + review, not schema.)
+--
+-- "vanished edge" honesty: a completeness guard blocks a diff over a region a
+-- detector SELF-REPORTED as incomplete, but it cannot catch a detector silently
+-- missing an edge inside a region it reported 'complete'. So an edge absent on
+-- one side is "not detected there" -- usually, but NOT necessarily, "removed".
+CREATE TABLE IF NOT EXISTS dimension_delta (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    diff_id              TEXT NOT NULL,
+    dimension            TEXT NOT NULL,   -- registry/declaration-driven, never a semantic verdict
+    subject_kind         TEXT NOT NULL,   -- 'edge' | 'candidate' | 'function'
+    subject_key          TEXT NOT NULL,   -- identity WITHIN the dimension (edges: binary|mech|key|func)
+    state_a              TEXT,            -- A-side annotation, OPAQUE to this layer
+    state_b              TEXT,            -- B-side annotation, OPAQUE to this layer
+    delta_kind           TEXT NOT NULL
+        CHECK (delta_kind IN ('layer_changed','layer_unchanged','delta_undetermined')),
+    undetermined_scope   TEXT
+        CHECK (undetermined_scope IS NULL OR undetermined_scope IN ('data','capability')),
+    undetermined_reason  TEXT,            -- machine-readable label; enum may grow (do not branch on it)
+    capability_ref       TEXT,            -- the dimension, when scope='capability'
+    alignment_confidence REAL,            -- carried when the delta relied on a function alignment
+    UNIQUE(diff_id, dimension, subject_kind, subject_key)
+);
+CREATE INDEX IF NOT EXISTS idx_dimdelta_diff ON dimension_delta(diff_id);
+CREATE INDEX IF NOT EXISTS idx_dimdelta_dim  ON dimension_delta(diff_id, dimension);
+CREATE INDEX IF NOT EXISTS idx_dimdelta_kind ON dimension_delta(diff_id, delta_kind);
+
+-- ── layer-2 diff: dimension_capability_state ─────────────────────────────────
+-- Per-dimension capability state on BOTH sides, recorded explicitly so a
+-- dimension neither side can delta is VISIBLE as a declared gap, never invisible
+-- by absence. TWO ORTHOGONAL facts:
+--   * state_a / state_b = ANALYSIS capability of each RUN: 'present' (a
+--     run_capability row with present=1) | 'declared_absent' (present=0) |
+--     'registration_unknown' (NO row). Absence of a row is NOT 'declared_absent'
+--     -- that conflation is the empty!=absent trap at the capability layer.
+--   * delta_supported = whether THIS layer's CODE version can compute a delta for
+--     the dimension at all. An analysis can exist while no delta is implemented
+--     (delta_supported=0) -- the dimension is then visible here, never silently
+--     absent. These two are independent: (present,present,1)=normal;
+--     (present,present,0)=analysis exists, delta not built; (not-present,*)=no
+--     analysis.
+CREATE TABLE IF NOT EXISTS dimension_capability_state (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    diff_id      TEXT NOT NULL,
+    dimension    TEXT NOT NULL,
+    state_a      TEXT NOT NULL
+        CHECK (state_a IN ('present','declared_absent','registration_unknown')),
+    state_b      TEXT NOT NULL
+        CHECK (state_b IN ('present','declared_absent','registration_unknown')),
+    delta_supported INTEGER NOT NULL CHECK (delta_supported IN (0,1)),
+    UNIQUE(diff_id, dimension)
+);
+
+-- ── layer-2 diff: dimension_delta_full (visibility view) ─────────────────────
+-- The base dimension_delta stays honest: it writes NO per-subject placeholder
+-- rows for a dimension it never examined a subject of (that would fake "checked
+-- every subject, all undetermined"). But a consumer scanning only dimension_delta
+-- would then miss those dimensions -- back to expressing a gap by absence. This
+-- view projects each unsupported/absent dimension into ONE dimension-level
+-- capability-undetermined row and unions it in, so one query sees the whole
+-- dimension universe while the base table tells no per-subject lie.
+CREATE VIEW IF NOT EXISTS dimension_delta_full AS
+  SELECT diff_id, dimension, subject_kind, subject_key, delta_kind,
+         undetermined_scope, undetermined_reason, capability_ref
+    FROM dimension_delta
+  UNION ALL
+  SELECT diff_id, dimension, 'dimension' AS subject_kind, dimension AS subject_key,
+         'delta_undetermined', 'capability',
+         CASE WHEN delta_supported = 0 THEN 'delta_not_implemented'
+              ELSE 'capability_absent' END,
+         dimension
+    FROM dimension_capability_state
+   WHERE delta_supported = 0 OR state_a <> 'present' OR state_b <> 'present';

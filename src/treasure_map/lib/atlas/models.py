@@ -288,3 +288,45 @@ class DiffMetaRow:
     micro_skipped_b: int | None = None
     presence_computed_a: int = 0
     presence_computed_b: int = 0
+
+
+@dataclass(frozen=True)
+class DimensionDeltaRow:
+    """Mirrors one dimension_delta row: one dimension's difference for one subject between two runs.
+
+    A PROJECTION of two already-computed layer annotations, NEVER a fresh analysis or a quality
+    verdict. ``delta_kind`` is tri-state; ``layer_unchanged`` only when both sides are present,
+    comparable and equal. ``state_a``/``state_b`` are OPAQUE (existence/equality only, never a
+    branch basis). ``undetermined_scope`` ('data' | 'capability') is the sole consumer key;
+    ``undetermined_reason`` is a human-readable label whose enum may grow."""
+
+    diff_id: str
+    dimension: str
+    subject_kind: str  # 'edge' | 'candidate' | 'function'
+    subject_key: str
+    delta_kind: str  # 'layer_changed' | 'layer_unchanged' | 'delta_undetermined'
+    state_a: str | None = None
+    state_b: str | None = None
+    undetermined_scope: str | None = None  # 'data' | 'capability'
+    undetermined_reason: str | None = None
+    capability_ref: str | None = None
+    alignment_confidence: float | None = None
+    id: int | None = None
+
+
+@dataclass(frozen=True)
+class DimensionCapabilityStateRow:
+    """Mirrors one dimension_capability_state row: a dimension's capability on both sides, recorded
+    explicitly so a dimension neither side can delta is a VISIBLE declared gap, never absent.
+
+    ``state_a``/``state_b`` = each run's ANALYSIS capability ('present' | 'declared_absent' |
+    'registration_unknown' -- a missing run_capability row is registration_unknown, NEVER
+    declared_absent). ``delta_supported`` = whether THIS code version can compute the delta at all
+    (orthogonal to the analysis capability)."""
+
+    diff_id: str
+    dimension: str
+    state_a: str
+    state_b: str
+    delta_supported: int
+    id: int | None = None

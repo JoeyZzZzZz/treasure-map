@@ -13,6 +13,8 @@ from dataclasses import dataclass
 
 from treasure_map.lib.atlas.models import (
     DiffMetaRow,
+    DimensionCapabilityStateRow,
+    DimensionDeltaRow,
     FunctionAlignmentRow,
     FunctionPresenceRow,
     InstanceRow,
@@ -160,12 +162,75 @@ def delete_run_capabilities(conn: sqlite3.Connection, run_id: str, *, commit: bo
 
 def delete_diff(conn: sqlite3.Connection, diff_id: str, *, commit: bool = True) -> None:
     """Delete every row of one diff (replace-by-diff refresh) so a re-parse is idempotent — touches
-    ONLY this diff_id across function_alignment / function_presence / diff_meta."""
+    ONLY this diff_id across the layer-0 and layer-2 diff tables."""
     conn.execute("DELETE FROM function_alignment WHERE diff_id = ?", (diff_id,))
     conn.execute("DELETE FROM function_presence WHERE diff_id = ?", (diff_id,))
     conn.execute("DELETE FROM diff_meta WHERE diff_id = ?", (diff_id,))
+    conn.execute("DELETE FROM dimension_delta WHERE diff_id = ?", (diff_id,))
+    conn.execute("DELETE FROM dimension_capability_state WHERE diff_id = ?", (diff_id,))
     if commit:
         conn.commit()
+
+
+def delete_dimension_delta(conn: sqlite3.Connection, diff_id: str, *, commit: bool = True) -> None:
+    """Delete a diff's layer-2 rows only (replace-by-diff refresh for a re-run of layer-2 alone,
+    without touching the layer-0 alignment) — touches ONLY this diff_id."""
+    conn.execute("DELETE FROM dimension_delta WHERE diff_id = ?", (diff_id,))
+    conn.execute("DELETE FROM dimension_capability_state WHERE diff_id = ?", (diff_id,))
+    if commit:
+        conn.commit()
+
+
+def add_dimension_deltas(
+    conn: sqlite3.Connection, rows: list[DimensionDeltaRow], *, commit: bool = True
+) -> int:
+    """Insert dimension_delta rows in one batch; return the count. Each is a PROJECTION of two
+    already-computed annotations, NEVER a change/quality verdict. commit=False joins the txn."""
+    if not rows:
+        return 0
+    conn.executemany(
+        """INSERT INTO dimension_delta
+           (diff_id, dimension, subject_kind, subject_key, state_a, state_b, delta_kind,
+            undetermined_scope, undetermined_reason, capability_ref, alignment_confidence)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        [
+            (
+                r.diff_id,
+                r.dimension,
+                r.subject_kind,
+                r.subject_key,
+                r.state_a,
+                r.state_b,
+                r.delta_kind,
+                r.undetermined_scope,
+                r.undetermined_reason,
+                r.capability_ref,
+                r.alignment_confidence,
+            )
+            for r in rows
+        ],
+    )
+    if commit:
+        conn.commit()
+    return len(rows)
+
+
+def add_dimension_capability_states(
+    conn: sqlite3.Connection, rows: list[DimensionCapabilityStateRow], *, commit: bool = True
+) -> int:
+    """Insert dimension_capability_state rows in one batch; return the count. Records each
+    dimension's capability on both sides + whether this code can delta it."""
+    if not rows:
+        return 0
+    conn.executemany(
+        """INSERT INTO dimension_capability_state
+           (diff_id, dimension, state_a, state_b, delta_supported)
+           VALUES (?, ?, ?, ?, ?)""",
+        [(r.diff_id, r.dimension, r.state_a, r.state_b, r.delta_supported) for r in rows],
+    )
+    if commit:
+        conn.commit()
+    return len(rows)
 
 
 def add_function_alignment(
