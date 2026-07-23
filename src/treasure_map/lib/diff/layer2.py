@@ -57,7 +57,30 @@ DECLARED_DELTA_DIMENSIONS: tuple[DimensionSpec, ...] = (
     DimensionSpec("filtering", delta_supported=False, always_present=True),
     DimensionSpec("source_writability", delta_supported=False, always_present=True),
     DimensionSpec("sink_impact", delta_supported=False, always_present=True),
+    # same class as the four above (triage read-time candidate dimensions); declared with
+    # delta_supported=0 so they are VISIBLE, never absent-by-omission. Whether 'completeness' (an
+    # analysis-completeness meta-dimension) ever warrants a delta is a later call -- but 'later' is
+    # not 'gone from the universe'.
+    DimensionSpec("writer", delta_supported=False, always_present=True),
+    DimensionSpec("completeness", delta_supported=False, always_present=True),
 )
+
+
+def _uncovered_triage_dimension(
+    triage_dimensions: frozenset[str], declared: frozenset[str]
+) -> str | None:
+    """The first triage dimension NOT covered by the declared layer-2 set, or None when all are
+    covered. A triage dimension is covered when it appears verbatim OR when a declared sub-dimension
+    prefixes it (``name.``) -- reachability is one triage dimension but two layer-2 sub-dimensions.
+    A triage dimension absent from the layer-2 universe is invisible to a consumer (no capability
+    row, no view row), so this is the mechanical check that a new triage dimension is never left to
+    vanish by absence -- the exact gap-by-absence this layer exists to kill."""
+    for name in sorted(triage_dimensions):
+        if name in declared or any(d.startswith(f"{name}.") for d in declared):
+            continue
+        return name
+    return None
+
 
 # subjects whose function-anchor alignment is low-confidence: the layer-0 state that means "aligned,
 # but do not trust the pairing" (mirrors function_alignment.alignment_state).
@@ -225,15 +248,41 @@ def _aligned_callee_set(
     return frozenset(out), None, min_conf
 
 
+def _version_skew_rows(
+    atlas: sqlite3.Connection, diff_id: str, run_a: str, run_b: str
+) -> list[DimensionDeltaRow]:
+    """★ Iron law 6 (edge form): an edge dimension is written at HUNT time, so it cannot be
+    recomputed at diff time. Under a version skew the two sides' edges may be the product of
+    DIFFERENT detector versions, so 'edge changed' and 'detector changed' are INDISTINGUISHABLE. Per
+    rule, indistinguishable is undetermined: every subject is delta_undetermined(scope=data,
+    reason=version_skew), never changed/unchanged. The completeness guard cannot catch this -- a
+    region self-reported 'complete' by an OLD detector and 'complete' by a NEW one are two different
+    completes with no version stamp."""
+    _, b2a = _load_alignment(atlas, diff_id)
+    _, keys_a, unres_a = _group(_load_edges(atlas, run_a), "a", b2a)
+    _, keys_b, unres_b = _group(_load_edges(atlas, run_b), "b", b2a)
+    subject_keys = set(keys_a.values()) | set(keys_b.values()) | set(unres_a) | set(unres_b)
+    return [_und(diff_id, k, "version_skew") for k in sorted(subject_keys)]
+
+
 def _string_keyed_edge_delta(
-    atlas: sqlite3.Connection, diff_id: str, run_a: str, run_b: str, cap_a: str, cap_b: str
+    atlas: sqlite3.Connection,
+    diff_id: str,
+    run_a: str,
+    run_b: str,
+    cap_a: str,
+    cap_b: str,
+    version_skew: bool,
 ) -> list[DimensionDeltaRow]:
     """Project the string_keyed_edge dimension. Guards (G1 key/anchor, G2 callee alignability, G3
     completeness) run FIRST in order; only a subject that clears ALL guards has its callee sets
     compared. Any guard trip -> delta_undetermined (never changed/unchanged)."""
     dim = "reachability.string_keyed_edge"
     if cap_a != "present" or cap_b != "present":
+        # analysis absent on a side is a deeper gap than a version skew -> capability scope
         return _capability_asymmetry(atlas, diff_id, dim, run_a, run_b, cap_a, cap_b)
+    if version_skew:
+        return _version_skew_rows(atlas, diff_id, run_a, run_b)
 
     a2b, b2a = _load_alignment(atlas, diff_id)
     edges_a = _load_edges(atlas, run_a)
@@ -356,7 +405,13 @@ def _completeness_guard(
     """G3 (three-value): a diff is allowed ONLY when both relevant regions are self-reported
     'complete'. A present side that is incomplete/partial, or a counterpart region with no
     verifiable completeness record, blocks the diff. Honesty boundary: this catches SELF-REPORTED
-    gaps only, not an edge a detector silently missed inside a 'complete' region."""
+    gaps only, not an edge a detector silently missed inside a 'complete' region.
+
+    ★ STATIC-TABLE-SPECIFIC boundary (weaker): a static_string_table edge has anchor=None and no
+    per-function region, so the counterpart side's completeness CANNOT be verified -- only the
+    present side is checked. A static-table edge that one side's table detector silently missed can
+    therefore read as layer_changed. (Small blast radius -- ~546 rows -- and the present side is
+    still completeness-checked, but omitting it would be dishonest.)"""
     anchor = canonical[3]
     # present side(s) must be complete
     if a is not None and a.completeness != {"complete"}:
@@ -364,7 +419,9 @@ def _completeness_guard(
     if b is not None and b.completeness != {"complete"}:
         return _und(diff_id, key_str, "completeness_not_complete", state_b=_state_str(b))
     if anchor is None:
-        return None  # static table: no per-function counterpart region to verify
+        return (
+            None  # static table: no per-function counterpart region to verify (see boundary above)
+        )
     # counterpart region (the side lacking this subject) must be verifiably complete
     if a is None and region_a.get(anchor) is not True:
         return _und(diff_id, key_str, "completeness_not_complete", state_b=_state_str(b))
@@ -468,7 +525,18 @@ def run_layer2_delta(
     Replace-by-diff (idempotent). A dimension neither side can delta is a VISIBLE capability row,
     never silently absent; a delta-supported dimension whose sides both have the analysis runs its
     handler; one side missing the analysis yields capability-scoped undetermined per present edge.
-    """
+
+    ★ Iron law 6 (version skew): edge dimensions cannot be recomputed at diff time, so under a
+    version skew they are degraded to version_skew undetermined (see _version_skew_rows). ``skew``
+    is read from diff_meta (layer-0 computes it from tool_version, NOT firmware hash); a MISSING /
+    unreadable diff_meta row is treated AS a skew (cannot-confirm-same-version != confirmed-same,
+    empty != absent on the version axis). BOUNDARY: version_skew only compares the ANALYSIS-TOOL
+    version -- it does NOT catch a detector-logic change within one tool_version, nor build-side
+    compiler/inlining skew between the two firmware; not all comparability risk."""
+    skew_row = atlas.execute(
+        "SELECT version_skew FROM diff_meta WHERE diff_id = ?", (diff_id,)
+    ).fetchone()
+    version_skew = skew_row is None or skew_row[0] is None or bool(skew_row[0])
     declared = {d.name: d for d in DECLARED_DELTA_DIMENSIONS}
     # discovered analysis sub-dimensions (never hardcoded): whatever run_capability actually holds
     discovered = {
@@ -501,7 +569,9 @@ def run_layer2_delta(
         )
         handler = _DELTA_HANDLERS.get(dim)
         if delta_supported and handler is not None:
-            delta_rows.extend(handler(atlas, diff_id, run_a_id, run_b_id, state_a, state_b))
+            delta_rows.extend(
+                handler(atlas, diff_id, run_a_id, run_b_id, state_a, state_b, version_skew)
+            )
 
     delete_dimension_delta(atlas, diff_id, commit=False)
     add_dimension_capability_states(atlas, cap_rows, commit=False)

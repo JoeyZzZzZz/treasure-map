@@ -28,6 +28,7 @@ from treasure_map.lib.diff.layer2 import (
     declared_delta_dimension_names,
     run_layer2_delta,
 )
+from treasure_map.lib.query.triage import _DIMENSION_NAMES  # authoritative triage dimension set
 
 _SKE = "reachability.string_keyed_edge"
 
@@ -68,7 +69,18 @@ def _cap(con, run, dim, present):  # type: ignore[no-untyped-def]
     add_run_capabilities(con, [RunCapabilityRow(run_id=run, capability=dim, present=present)])
 
 
-def _align(con, diff, pairs):  # type: ignore[no-untyped-def]
+def _diff_meta(con, diff="d", *, skew=0, run_a="ra", run_b="rb"):  # type: ignore[no-untyped-def]
+    # layer-0 always writes a diff_meta row before layer-2 runs; seed it (version_skew drives the
+    # iron-law-6 degradation). ABSENCE of this row -> version_skew treated as 1 (empty!=absent).
+    con.execute(
+        "INSERT OR REPLACE INTO diff_meta (diff_id, run_a_id, run_b_id, version_skew) "
+        "VALUES (?, ?, ?, ?)",
+        (diff, run_a, run_b, skew),
+    )
+    con.commit()
+
+
+def _align(con, diff, pairs, *, skew=0):  # type: ignore[no-untyped-def]
     # pairs = list of (addr_a, addr_b, confidence, state)
     add_function_alignment(
         con,
@@ -79,6 +91,7 @@ def _align(con, diff, pairs):  # type: ignore[no-untyped-def]
             for a, b, c, s in pairs
         ],
     )
+    _diff_meta(con, diff, skew=skew)  # a real diff always has a diff_meta row (version_skew=0 here)
 
 
 def _deltas(con, diff, dim=_SKE):  # type: ignore[no-untyped-def]
@@ -127,7 +140,7 @@ def test_no_hardcoded_analysis_subdim_names_in_source() -> None:
 # ── edge delta main path + G1 (align by address, func anchor) ────────────────────────────
 
 
-def _seed_matched(con, *, b_callee="2100", a_complete="complete", b_complete="complete"):  # type: ignore[no-untyped-def]
+def _seed_matched(con, *, b_callee="2100", a_complete="complete", b_complete="complete", skew=0):  # type: ignore[no-untyped-def]
     _cap(con, "ra", _SKE, 1)
     _cap(con, "rb", _SKE, 1)
     add_string_keyed_edges(
@@ -142,7 +155,9 @@ def _seed_matched(con, *, b_callee="2100", a_complete="complete", b_complete="co
         ],
     )
     # ★ callee A addr 2000 != B addr 2100: alignment is load-bearing, not cosmetic
-    _align(con, "d", [("1000", "1100", 0.98, "aligned"), ("2000", "2100", 0.98, "aligned")])
+    _align(
+        con, "d", [("1000", "1100", 0.98, "aligned"), ("2000", "2100", 0.98, "aligned")], skew=skew
+    )
 
 
 def test_edge_unchanged_when_aligned_callees_equal(tmp_path: Path) -> None:
@@ -471,4 +486,104 @@ def test_reverse_missing_row_mapped_to_declared_absent_would_be_wrong(tmp_path: 
     )
     _cap(con, "r", "x.declared", 0)
     assert layer2._analysis_capability(con, "r", "x.declared") == "declared_absent"  # 0 != missing
+    con.close()
+
+
+# ── Item 1: every triage dimension is VISIBLE (no gap-by-absence) + a mechanical coverage guard ──
+
+
+def test_all_seven_triage_dimensions_are_visible(tmp_path: Path) -> None:
+    # ★ writer / completeness were silently absent (gap-by-absence). Every canonical triage dim
+    # must appear in the capability universe: verbatim, or covered by a sub-dimension prefix.
+    con = _atlas(tmp_path)
+    _cap(con, "ra", _SKE, 1)
+    _cap(con, "rb", _SKE, 1)
+    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    dims = set(_capstate(con, "d"))
+    for name in _DIMENSION_NAMES:
+        covered = name in dims or any(d.startswith(f"{name}.") for d in dims)
+        assert covered, f"triage dimension {name!r} is invisible in the layer-2 universe"
+    cs = _capstate(con, "d")
+    assert cs["writer"] == ("present", "present", 0)  # visible, delta_supported=0
+    assert cs["completeness"] == ("present", "present", 0)
+
+
+def test_writer_completeness_appear_in_view_as_delta_not_implemented(tmp_path: Path) -> None:
+    con = _atlas(tmp_path)
+    _cap(con, "ra", _SKE, 1)
+    _cap(con, "rb", _SKE, 1)
+    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    view = {
+        r[0]: r[1]
+        for r in con.execute(
+            "SELECT dimension, undetermined_reason FROM dimension_delta_full "
+            "WHERE diff_id='d' AND subject_kind='dimension'"
+        )
+    }
+    assert view["writer"] == "delta_not_implemented"
+    assert view["completeness"] == "delta_not_implemented"
+    # ★ base table still has NO per-subject placeholder rows for them (honest base, visible view)
+    n = con.execute(
+        "SELECT COUNT(*) FROM dimension_delta WHERE dimension IN ('writer','completeness')"
+    ).fetchone()[0]
+    assert n == 0
+    con.close()
+
+
+def test_coverage_guard_has_teeth(tmp_path: Path) -> None:
+    # ★ reverse-validation: the real set covers every triage dim; dropping ANY declared entry's
+    # entry's coverage makes _uncovered_triage_dimension return the now-uncovered name (goes red).
+    declared = declared_delta_dimension_names()
+    assert (
+        layer2._uncovered_triage_dimension(_DIMENSION_NAMES, declared) is None
+    )  # forward: covered
+    for name in _DIMENSION_NAMES:
+        reduced = frozenset(d for d in declared if d != name and not d.startswith(f"{name}."))
+        assert layer2._uncovered_triage_dimension(_DIMENSION_NAMES, reduced) is not None, name
+
+
+def test_no_declared_dimension_is_a_phantom_top_level(tmp_path: Path) -> None:
+    # reverse spelling guard: every declared top-level name (before '.') is a real triage dimension.
+    for d in declared_delta_dimension_names():
+        top = d.split(".", 1)[0]
+        assert top in _DIMENSION_NAMES, f"declared {d!r} points at non-existent triage dim {top!r}"
+
+
+# ── Item 2: iron law 6 (version skew) degrades edge deltas; reverse proves the guard acts ──
+
+
+def test_version_skew_degrades_every_edge_subject(tmp_path: Path) -> None:
+    # ★ tool_version differs (diff_meta.version_skew=1): 'edge changed' vs 'detector changed' is
+    # indistinguishable, so EVERY edge subject is delta_undetermined(reason=version_skew) -- and NOT
+    # one layer_changed / layer_unchanged escapes.
+    con = _atlas(tmp_path)
+    _seed_matched(con, skew=1)
+    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    rows = _deltas(con, "d")
+    assert rows and all(r[1] == "delta_undetermined" for r in rows)
+    assert all(r[2] == "data" and r[3] == "version_skew" for r in rows)
+    con.close()
+
+
+def test_version_skew_zero_restores_the_verdict(tmp_path: Path) -> None:
+    # ★ reverse-validation: the SAME fixture with version_skew=0 restores layer_unchanged -- proves
+    # skew guard genuinely gates the verdict, not that everything is always undetermined.
+    con = _atlas(tmp_path)
+    _seed_matched(con, skew=0)  # identical edges/alignment, only the skew flag differs
+    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    (row,) = _deltas(con, "d")
+    assert row[1] == "layer_unchanged"  # not undetermined -> the guard was the only difference
+    con.close()
+
+
+def test_missing_diff_meta_is_treated_as_skew(tmp_path: Path) -> None:
+    # ★ empty != absent on the version axis: a MISSING diff_meta row means "cannot confirm same
+    # version", which is NOT "confirmed same version" -> degrade as skew, never a silent verdict.
+    con = _atlas(tmp_path)
+    _seed_matched(con, skew=0)
+    con.execute("DELETE FROM diff_meta WHERE diff_id='d'")  # remove the row entirely
+    con.commit()
+    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    (row,) = _deltas(con, "d")
+    assert row[1] == "delta_undetermined" and row[3] == "version_skew"
     con.close()
