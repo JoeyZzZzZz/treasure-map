@@ -108,6 +108,15 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if dm_cols and "micro_skipped_b" not in dm_cols:
         conn.execute("ALTER TABLE diff_meta ADD COLUMN micro_skipped_b INTEGER")
 
+    # diff_meta.binary_a/b (added this round): the diff's per-side TARGET binary (short name), so a
+    # per-binary consumer (string_keyed_edge delta) filters to the diffed binary, not the whole
+    # firmware. An atlas that already created diff_meta needs these columns; nullable TEXT, existing
+    # rows carry NULL (the consumer refuses rather than silently skipping the filter). Idempotent.
+    if dm_cols and "binary_a" not in dm_cols:
+        conn.execute("ALTER TABLE diff_meta ADD COLUMN binary_a TEXT")
+    if dm_cols and "binary_b" not in dm_cols:
+        conn.execute("ALTER TABLE diff_meta ADD COLUMN binary_b TEXT")
+
 
 def open_atlas(db_path: Path) -> sqlite3.Connection:
     """Open (or create) the atlas SQLite database and apply the schema.

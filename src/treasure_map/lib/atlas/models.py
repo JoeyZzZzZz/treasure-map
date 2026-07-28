@@ -288,6 +288,12 @@ class DiffMetaRow:
     micro_skipped_b: int | None = None
     presence_computed_a: int = 0
     presence_computed_b: int = 0
+    # the diff's TARGET binary per side (a diff aligns ONE binary), stored as the short name. A
+    # consumer that filters per-binary facts (string_keyed_edge spans the whole firmware) needs this
+    # scope; NULL on a diff written before it was recorded -> the consumer must refuse, not silently
+    # skip filtering (empty != absent on the binary-scope axis).
+    binary_a: str | None = None
+    binary_b: str | None = None
 
 
 @dataclass(frozen=True)

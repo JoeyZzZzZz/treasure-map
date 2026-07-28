@@ -23,12 +23,13 @@ from treasure_map.lib.atlas.writer import (
     add_string_keyed_edges,
 )
 from treasure_map.lib.diff import layer2
+from treasure_map.lib.diff.layer0 import norm_hex
 from treasure_map.lib.diff.layer2 import (
     DECLARED_DELTA_DIMENSIONS,
     declared_delta_dimension_names,
     run_layer2_delta,
 )
-from treasure_map.lib.query.triage import _DIMENSION_NAMES  # authoritative triage dimension set
+from treasure_map.lib.query.triage import _CANONICAL_DIMENSION_NAMES  # the authoritative universe
 
 _SKE = "reachability.string_keyed_edge"
 
@@ -40,22 +41,29 @@ def _edge(
     callee_addr,
     *,
     mechanism="strcmp_gate",
-    callee_name="h",  # type: ignore[no-untyped-def]
+    callee_name=None,  # type: ignore[no-untyped-def]
     callee_kind="direct",
     completeness="complete",
     from_function="FUN_x",
     table_addr=None,
+    raw_from=False,
+    binary="lib.so",
 ):
+    # ★ Bug D fixture world (mirrors real data): from_func_addr is stored in NORMALIZED hex (as the
+    # extractor records it) so the B-side b2a lookup hits; callee_addr is stored RAW (0x-form,
+    # unpadded) so the layer-2 code's norm_hex is load-bearing to reconcile it with the normalized
+    # function_alignment. raw_from=True stores a DIRTY from_func_addr (for the subject-anchor test).
+    # callee_name defaults to None -> the ADDRESS anchor path (Bug B name routing tested apart).
     return StringKeyedEdgeRow(
         source_run_id=run,
-        binary="lib.so",
+        binary=binary,
         from_function=from_function,
         key=key,
         mechanism=mechanism,
         callee_name=callee_name,
         callee_addr=callee_addr,
         callee_kind=callee_kind,
-        from_func_addr=from_addr,
+        from_func_addr=from_addr if raw_from else norm_hex(from_addr),
         table_addr=table_addr,
         completeness_status=completeness,
     )
@@ -69,24 +77,32 @@ def _cap(con, run, dim, present):  # type: ignore[no-untyped-def]
     add_run_capabilities(con, [RunCapabilityRow(run_id=run, capability=dim, present=present)])
 
 
-def _diff_meta(con, diff="d", *, skew=0, run_a="ra", run_b="rb"):  # type: ignore[no-untyped-def]
+def _diff_meta(con, diff="d", *, skew=0, run_a="ra", run_b="rb", binary="lib.so"):  # type: ignore[no-untyped-def]
     # layer-0 always writes a diff_meta row before layer-2 runs; seed it (version_skew drives the
-    # iron-law-6 degradation). ABSENCE of this row -> version_skew treated as 1 (empty!=absent).
+    # iron-law-6 degradation; binary_a/b scope the per-binary edge filter). ABSENCE of the row ->
+    # version_skew treated as 1 (empty!=absent). ★ binary=None seeds a NULL scope (a pre-feature
+    # diff), which the edge handler must REFUSE, never silently un-filter.
     con.execute(
-        "INSERT OR REPLACE INTO diff_meta (diff_id, run_a_id, run_b_id, version_skew) "
-        "VALUES (?, ?, ?, ?)",
-        (diff, run_a, run_b, skew),
+        "INSERT OR REPLACE INTO diff_meta "
+        "(diff_id, run_a_id, run_b_id, version_skew, binary_a, binary_b) VALUES (?, ?, ?, ?, ?, ?)",
+        (diff, run_a, run_b, skew, binary, binary),
     )
     con.commit()
 
 
 def _align(con, diff, pairs, *, skew=0):  # type: ignore[no-untyped-def]
-    # pairs = list of (addr_a, addr_b, confidence, state)
+    # pairs = (addr_a, addr_b, confidence, state). ★ addresses stored NORMALIZED, as real layer-0
+    # writes function_alignment (norm_hex) -- so a raw callee_addr must be normalized by the layer-2
+    # code to match. Callers pass short forms; norm_hex zero-pads them.
     add_function_alignment(
         con,
         [
             FunctionAlignmentRow(
-                diff_id=diff, addr_a=a, addr_b=b, alignment_confidence=c, alignment_state=s
+                diff_id=diff,
+                addr_a=norm_hex(a),
+                addr_b=norm_hex(b),
+                alignment_confidence=c,
+                alignment_state=s,
             )
             for a, b, c, s in pairs
         ],
@@ -313,6 +329,250 @@ def test_g2_partial_callee_unalignable_blocks_the_whole_edge(tmp_path: Path) -> 
     con.close()
 
 
+# ── Bug D (address format) + Bug B (name-availability anchor) ────────────────────────────
+
+
+def test_bug_d_raw_0x_callee_addr_aligns_after_norm(tmp_path: Path) -> None:
+    # ★ Bug D core: callee_addr in raw Ghidra form (0x30664) vs function_alignment in norm_hex
+    # (00030664) -- only norm_hex reconciles them (raw -> 100% miss -> false unalignable before).
+    con = _atlas(tmp_path)
+    _cap(con, "ra", _SKE, 1)
+    _cap(con, "rb", _SKE, 1)
+    add_string_keyed_edges(con, [_edge("ra", "k", "1000", "0x30664")])
+    add_string_keyed_edges(con, [_edge("rb", "k", "1100", "0x30670")])
+    _align(con, "d", [("1000", "1100", 0.98, "aligned"), ("30664", "30670", 0.98, "aligned")])
+    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    (row,) = _deltas(con, "d")
+    assert row[1] == "layer_unchanged"  # 0x30664 aligns to 0x30670 -> same callee
+    con.close()
+
+
+def test_bug_d_both_sides_symmetric_direct_callee_is_unchanged(tmp_path: Path) -> None:
+    # ★ (the most important Bug D anchor): the SAME direct callee, correctly aligned on both
+    # sides, is layer_unchanged. A projects the aligned addr_b (norm_hex); B projects its addr --
+    # if the B-side out.add is NOT normalized, B={raw} != A={norm} -> a FALSE layer_changed. This
+    # catches the B-side normalization specifically (the 0x test above only exercises the A lookup).
+    con = _atlas(tmp_path)
+    _cap(con, "ra", _SKE, 1)
+    _cap(con, "rb", _SKE, 1)
+    add_string_keyed_edges(con, [_edge("ra", "k", "1000", "30664")])
+    add_string_keyed_edges(con, [_edge("rb", "k", "1100", "30670")])
+    _align(con, "d", [("1000", "1100", 0.98, "aligned"), ("30664", "30670", 0.98, "aligned")])
+    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    (row,) = _deltas(con, "d")
+    assert row[1] == "layer_unchanged"
+    con.close()
+
+
+def test_bug_d_subject_anchor_survives_dirty_from_func(tmp_path: Path) -> None:
+    # ★ a from_func_addr in DIRTY form (0x29ed8) on the A side must still pair with B -- the
+    # canonical key normalizes it. Without the A-side norm_hex in _canonical_and_key, A and B become
+    # two orphan subjects (pairing collapses), not one comparable subject.
+    con = _atlas(tmp_path)
+    _cap(con, "ra", _SKE, 1)
+    _cap(con, "rb", _SKE, 1)
+    add_string_keyed_edges(
+        con, [_edge("ra", "k", "0x29ed8", "2000", raw_from=True)]
+    )  # dirty A anchor
+    add_string_keyed_edges(con, [_edge("rb", "k", "29100", "2100")])  # clean B anchor (normalized)
+    _align(con, "d", [("29ed8", "29100", 0.98, "aligned"), ("2000", "2100", 0.98, "aligned")])
+    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    # ★ the assertion is about PAIRING, not the verdict: ONE subject means the dirty A anchor and
+    # the clean B anchor resolved to the SAME canonical key. (Verdict = from_function_unaligned:
+    # G1 aligns the host by the raw from_func_addr, a separate axis the spec's three norm_hex points
+    # deliberately do not touch; from_func is dirty here by construction.)
+    # Without the A-side norm_hex in _canonical_and_key, A and B would be two orphan subjects.
+    rows = _deltas(con, "d")
+    assert len(rows) == 1  # paired, not two orphans
+    con.close()
+
+
+def test_no_second_address_normalizer_in_layer2() -> None:
+    # ★ layer-2 REUSES layer0.norm_hex; it must not define a second address canonicalizer
+    # (double normalization is exactly what norm_hex's docstring warns against).
+    src = Path(layer2.__file__).read_text()
+    assert "def norm_hex" not in src and "def _norm_addr" not in src
+    assert "from treasure_map.lib.diff.layer0 import norm_hex" in src
+
+
+def test_bug_b_thunk_name_is_the_stable_anchor(tmp_path: Path) -> None:
+    # ★ a resolved thunk name (snprintf) is a stable cross-version identity. Same name both
+    # sides -> unchanged, even though the callee addresses differ AND there is NO alignment row for
+    # them (the address path could never have judged this; the name path does).
+    con = _atlas(tmp_path)
+    _cap(con, "ra", _SKE, 1)
+    _cap(con, "rb", _SKE, 1)
+    add_string_keyed_edges(
+        con, [_edge("ra", "k", "1000", "2000", callee_name="snprintf", callee_kind="thunk")]
+    )
+    add_string_keyed_edges(
+        con, [_edge("rb", "k", "1100", "9999", callee_name="snprintf", callee_kind="thunk")]
+    )
+    _align(con, "d", [("1000", "1100", 0.98, "aligned")])  # func aligns; NO callee alignment row
+    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    (row,) = _deltas(con, "d")
+    assert row[1] == "layer_unchanged"  # name:snprintf == name:snprintf; addresses irrelevant
+    con.close()
+
+
+def test_bug_b_thunk_name_change_is_layer_changed(tmp_path: Path) -> None:
+    # ★ a name change (snprintf -> snprintf_chk) IS a real change -- the anchor is strict.
+    con = _atlas(tmp_path)
+    _cap(con, "ra", _SKE, 1)
+    _cap(con, "rb", _SKE, 1)
+    add_string_keyed_edges(
+        con, [_edge("ra", "k", "1000", "2000", callee_name="snprintf", callee_kind="thunk")]
+    )
+    add_string_keyed_edges(
+        con, [_edge("rb", "k", "1100", "2100", callee_name="snprintf_chk", callee_kind="thunk")]
+    )
+    _align(con, "d", [("1000", "1100", 0.98, "aligned")])
+    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    (row,) = _deltas(con, "d")
+    assert row[1] == "layer_changed"
+    con.close()
+
+
+def test_bug_b_no_identity_is_honestly_unalignable(tmp_path: Path) -> None:
+    # ★ an address-derived FUN_% name with NO addr, and a callee with no name and no addr,
+    # both stay callee_unalignable -- honest undetermined, never a fabricated identity.
+    for tag, kw in (
+        ("fun_noaddr", {"callee_name": "FUN_00030664", "callee_addr": None}),
+        ("nothing", {"callee_name": None, "callee_addr": None}),
+    ):
+        con = open_atlas(tmp_path / f"u_{tag}.db")
+        _cap(con, "ra", _SKE, 1)
+        _cap(con, "rb", _SKE, 1)
+        add_string_keyed_edges(con, [_edge("ra", "k", "1000", **kw)])  # type: ignore[arg-type]
+        add_string_keyed_edges(con, [_edge("rb", "k", "1100", "2100")])
+        _align(con, "d", [("1000", "1100", 0.98, "aligned"), ("2000", "2100", 0.98, "aligned")])
+        run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+        (row,) = _deltas(con, "d")
+        assert (row[1], row[3]) == ("delta_undetermined", "callee_unalignable"), tag
+        con.close()
+
+
+def test_bug_b_fun_name_never_used_as_a_name_anchor(tmp_path: Path) -> None:
+    # ★ (the most important false-signal defense): a FUN_% name is address-derived and DIFFERS
+    # across versions. If anchored by NAME, two aligned functions (FUN_00002000 vs FUN_00002100 --
+    # the SAME function) would falsely read layer_changed, polluting the one real signal. They must
+    # ADDRESS-anchor via alignment -> layer_unchanged. Reddens if _is_addr_derived_name misses FUN_.
+    con = _atlas(tmp_path)
+    _cap(con, "ra", _SKE, 1)
+    _cap(con, "rb", _SKE, 1)
+    add_string_keyed_edges(con, [_edge("ra", "k", "1000", "2000", callee_name="FUN_00002000")])
+    add_string_keyed_edges(con, [_edge("rb", "k", "1100", "2100", callee_name="FUN_00002100")])
+    _align(con, "d", [("1000", "1100", 0.98, "aligned"), ("2000", "2100", 0.98, "aligned")])
+    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    (row,) = _deltas(con, "d")
+    assert row[1] == "layer_unchanged"  # FUN names differ but addresses align -> same function
+    con.close()
+
+
+def test_bug_b_anchor_space_mismatch_is_undetermined_not_changed(tmp_path: Path) -> None:
+    # ★ one side anchors by a real NAME, the other by ADDRESS (Ghidra named the callee on one
+    # version, left it FUN_ on the other) -> not comparable -> delta_undetermined
+    # (reason=anchor_space_mismatch), NEVER layer_changed. ★ the name:/addr: prefixes also
+    # mean a real name that is literally a hex string can't masquerade as an address element.
+    con = _atlas(tmp_path)
+    _cap(con, "ra", _SKE, 1)
+    _cap(con, "rb", _SKE, 1)
+    add_string_keyed_edges(con, [_edge("ra", "k", "1000", "2000", callee_name="do_reboot")])  # name
+    add_string_keyed_edges(
+        con, [_edge("rb", "k", "1100", "2100", callee_name="FUN_00002100")]
+    )  # addr
+    _align(con, "d", [("1000", "1100", 0.98, "aligned"), ("2000", "2100", 0.98, "aligned")])
+    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    (row,) = _deltas(con, "d")
+    assert (row[1], row[3]) == ("delta_undetermined", "anchor_space_mismatch")  # not layer_changed
+    con.close()
+
+
+# ── Bug A (per-binary edge scope) ────────────────────────────────────────────────────────
+
+
+def test_bug_a_edge_filter_scopes_to_the_diffed_binary(tmp_path: Path) -> None:
+    # ★ a run's string_keyed_edge spans MANY binaries, but a diff aligns ONE. The delta must
+    # contain ONLY the diffed binary's subjects. Edges of OTHER binaries (no alignment rows here)
+    # would otherwise flood the delta as unaligned. diff_meta.binary_a/b = 'lib.so' (via _align).
+    con = _atlas(tmp_path)
+    _cap(con, "ra", _SKE, 1)
+    _cap(con, "rb", _SKE, 1)
+    add_string_keyed_edges(con, [_edge("ra", "k", "1000", "2000")])  # lib.so (target)
+    add_string_keyed_edges(con, [_edge("rb", "k", "1100", "2100")])
+    # a DIFFERENT binary in the same run -- must be filtered out of a lib.so diff
+    add_string_keyed_edges(con, [_edge("ra", "x", "9000", "9100", binary="httpd")])
+    add_string_keyed_edges(con, [_edge("rb", "x", "9200", "9300", binary="httpd")])
+    _align(con, "d", [("1000", "1100", 0.98, "aligned"), ("2000", "2100", 0.98, "aligned")])
+    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    rows = _deltas(con, "d")
+    assert len(rows) == 1  # ONLY the lib.so subject; httpd's edges are out of this diff's scope
+    assert rows[0][1] == "layer_unchanged"
+    con.close()
+
+
+def test_bug_a_edge_filter_is_load_bearing(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    # ★ reverse: if _load_edges ignored the binary scope (the pre-fix bug), the OTHER binary's
+    # edges flood in -> more than one subject, undetermined explosion. Proves the filter has teeth.
+    real = layer2._load_edges
+
+    def unfiltered(atlas, run_id, binary):  # type: ignore[no-untyped-def]
+        return real(atlas, run_id, None)  # drop the binary scope -> whole-firmware edges
+
+    monkeypatch.setattr(layer2, "_load_edges", unfiltered)
+    con = _atlas(tmp_path)
+    _cap(con, "ra", _SKE, 1)
+    _cap(con, "rb", _SKE, 1)
+    add_string_keyed_edges(con, [_edge("ra", "k", "1000", "2000")])
+    add_string_keyed_edges(con, [_edge("rb", "k", "1100", "2100")])
+    add_string_keyed_edges(con, [_edge("ra", "x", "9000", "9100", binary="httpd")])
+    add_string_keyed_edges(con, [_edge("rb", "x", "9200", "9300", binary="httpd")])
+    _align(con, "d", [("1000", "1100", 0.98, "aligned"), ("2000", "2100", 0.98, "aligned")])
+    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    assert len(_deltas(con, "d")) > 1  # httpd subjects flooded in -> the filter WAS load-bearing
+    con.close()
+
+
+def test_bug_a_null_binary_scope_is_refused_not_flooded(tmp_path: Path) -> None:
+    # ★ a diff_meta row with binary_a/b IS NULL (a pre-feature diff) must NOT silently
+    # un-filter and flood the whole firmware -- the edge dimension is REFUSED (one
+    # honest binary_scope_unrecorded marker, re-run needed), never a per-subject verdict.
+    con = _atlas(tmp_path)
+    _cap(con, "ra", _SKE, 1)
+    _cap(con, "rb", _SKE, 1)
+    add_string_keyed_edges(con, [_edge("ra", "k", "1000", "2000")])
+    add_string_keyed_edges(con, [_edge("ra", "x", "9000", "9100", binary="httpd")])
+    add_string_keyed_edges(con, [_edge("rb", "k", "1100", "2100")])
+    _align(con, "d", [("1000", "1100", 0.98, "aligned"), ("2000", "2100", 0.98, "aligned")])
+    con.execute("UPDATE diff_meta SET binary_a=NULL, binary_b=NULL WHERE diff_id='d'")
+    con.commit()
+    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    rows = _deltas(con, "d")
+    assert len(rows) == 1  # ONE refusal marker, not the whole-firmware flood
+    assert rows[0][1] == "delta_undetermined" and rows[0][3] == "binary_scope_unrecorded"
+    con.close()
+
+
+def test_bug_a_diff_meta_binary_columns_migrated_on_old_atlas(tmp_path: Path) -> None:
+    # ★ an atlas whose diff_meta predates binary_a/b must gain the columns via _migrate, not
+    # only via a fresh CREATE TABLE. Simulate the old schema (drop the columns), reopen -> _migrate
+    # must add them back. Without the ALTER in _migrate, every per-binary diff read on a pre-feature
+    # atlas would fail (this is the atlas half of the "schema migration needs BOTH places" rule).
+    from treasure_map.lib.atlas.connection import _column_names
+
+    db = tmp_path / "old.db"
+    con = open_atlas(db)
+    con.execute("ALTER TABLE diff_meta DROP COLUMN binary_a")  # simulate a pre-feature atlas
+    con.execute("ALTER TABLE diff_meta DROP COLUMN binary_b")
+    con.commit()
+    assert "binary_a" not in _column_names(con, "diff_meta")  # confirm the 'old' state first
+    con.close()
+    con2 = open_atlas(db)  # reopen -> _migrate runs
+    cols = _column_names(con2, "diff_meta")
+    assert "binary_a" in cols and "binary_b" in cols  # _migrate restored them
+    con2.close()
+
+
 # ── G3 completeness (three-value) ────────────────────────────────────────────────────────
 
 
@@ -449,7 +709,8 @@ def test_reverse_callee_alignment_is_load_bearing(tmp_path: Path, monkeypatch) -
     # (A callee 2000 vs B callee 2100) FLIPS to layer_changed. Proves the alignment step is real and
     # that the unchanged test has teeth.
     def broken(callees, a2b, side):  # type: ignore[no-untyped-def]
-        return frozenset(str(c.get("addr")) for c in callees if c.get("addr")), None, None
+        # compare RAW callee addrs, skipping function_alignment AND normalization (the pre-fix bug)
+        return frozenset(str(c.get("addr")) for c in callees if c.get("addr")), None, None, {"addr"}
 
     monkeypatch.setattr(layer2, "_aligned_callee_set", broken)
     con = _atlas(tmp_path)
@@ -492,20 +753,39 @@ def test_reverse_missing_row_mapped_to_declared_absent_would_be_wrong(tmp_path: 
 # ── Item 1: every triage dimension is VISIBLE (no gap-by-absence) + a mechanical coverage guard ──
 
 
-def test_all_seven_triage_dimensions_are_visible(tmp_path: Path) -> None:
-    # ★ writer / completeness were silently absent (gap-by-absence). Every canonical triage dim
-    # must appear in the capability universe: verbatim, or covered by a sub-dimension prefix.
+def test_all_eight_triage_dimensions_are_visible(tmp_path: Path) -> None:
+    # ★ writer / completeness / source were silently absent (gap-by-absence). Every CANONICAL triage
+    # dim (all 8) must appear in the capability universe: verbatim, or covered by a sub-dimension
+    # prefix. Anchored on _CANONICAL_DIMENSION_NAMES (8), not the 7-name --filter set that omits
+    # `source` -- anchoring on the filter set is exactly what let `source` vanish here.
     con = _atlas(tmp_path)
     _cap(con, "ra", _SKE, 1)
     _cap(con, "rb", _SKE, 1)
     run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
     dims = set(_capstate(con, "d"))
-    for name in _DIMENSION_NAMES:
+    for name in _CANONICAL_DIMENSION_NAMES:
         covered = name in dims or any(d.startswith(f"{name}.") for d in dims)
         assert covered, f"triage dimension {name!r} is invisible in the layer-2 universe"
     cs = _capstate(con, "d")
     assert cs["writer"] == ("present", "present", 0)  # visible, delta_supported=0
     assert cs["completeness"] == ("present", "present", 0)
+    # ★ source specifically (the dim this bug hid): visible as a delta_supported=0 capability row.
+    assert cs["source"] == ("present", "present", 0)
+
+
+def test_source_dimension_visibility_is_load_bearing(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    # ★ reverse/teeth: with `source` REMOVED from the declared universe (the pre-fix state), it
+    # vanishes from the capability rows -> proving the DimensionSpec("source", ...) declaration is
+    # what makes it visible, not something else. If source still appeared, the forward assertion
+    # above would not be reading the declaration.
+    without_source = tuple(d for d in layer2.DECLARED_DELTA_DIMENSIONS if d.name != "source")
+    monkeypatch.setattr(layer2, "DECLARED_DELTA_DIMENSIONS", without_source)
+    con = _atlas(tmp_path)
+    _cap(con, "ra", _SKE, 1)
+    _cap(con, "rb", _SKE, 1)
+    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    assert "source" not in set(_capstate(con, "d"))
+    con.close()
 
 
 def test_writer_completeness_appear_in_view_as_delta_not_implemented(tmp_path: Path) -> None:
@@ -531,22 +811,39 @@ def test_writer_completeness_appear_in_view_as_delta_not_implemented(tmp_path: P
 
 
 def test_coverage_guard_has_teeth(tmp_path: Path) -> None:
-    # ★ reverse-validation: the real set covers every triage dim; dropping ANY declared entry's
-    # entry's coverage makes _uncovered_triage_dimension return the now-uncovered name (goes red).
+    # ★ reverse-validation: the real set covers every CANONICAL triage dim (all 8, incl. source);
+    # dropping ANY declared entry's coverage makes _uncovered_triage_dimension return the
+    # now-uncovered name (goes red). Anchored on _CANONICAL_DIMENSION_NAMES so `source` is checked.
     declared = declared_delta_dimension_names()
     assert (
-        layer2._uncovered_triage_dimension(_DIMENSION_NAMES, declared) is None
+        layer2._uncovered_triage_dimension(_CANONICAL_DIMENSION_NAMES, declared) is None
     )  # forward: covered
-    for name in _DIMENSION_NAMES:
+    for name in _CANONICAL_DIMENSION_NAMES:
         reduced = frozenset(d for d in declared if d != name and not d.startswith(f"{name}."))
-        assert layer2._uncovered_triage_dimension(_DIMENSION_NAMES, reduced) is not None, name
+        assert (
+            layer2._uncovered_triage_dimension(_CANONICAL_DIMENSION_NAMES, reduced) is not None
+        ), name
+
+
+def test_uncovered_guard_prefix_requires_the_dot(tmp_path: Path) -> None:
+    # ★ prefix-trap nail: coverage is `d.startswith(f"{name}.")` WITH the dot. Without it,
+    # `source` would be falsely covered by `source_writability` (a prefix, no dot) -> guard returns
+    # None -> `source` reads as covered while absent. Anchor: source uncovered, only
+    # source_writability declared -> the guard MUST report 'source'. If the dot were dropped this
+    # goes green (wrongly), so this is the load-bearing test for that judgement.
+    assert (
+        layer2._uncovered_triage_dimension(frozenset({"source"}), frozenset({"source_writability"}))
+        == "source"
+    )
 
 
 def test_no_declared_dimension_is_a_phantom_top_level(tmp_path: Path) -> None:
     # reverse spelling guard: every declared top-level name (before '.') is a real triage dimension.
     for d in declared_delta_dimension_names():
         top = d.split(".", 1)[0]
-        assert top in _DIMENSION_NAMES, f"declared {d!r} points at non-existent triage dim {top!r}"
+        assert top in _CANONICAL_DIMENSION_NAMES, (
+            f"declared {d!r} points at non-existent triage dim {top!r}"
+        )
 
 
 # ── Item 2: iron law 6 (version skew) degrades edge deltas; reverse proves the guard acts ──

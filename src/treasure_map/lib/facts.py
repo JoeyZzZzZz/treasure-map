@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from treasure_map.lib.hunt.refs import _norm_addr
+from treasure_map.version import UNKNOWN_VERSION
 
 XrefDirection = Literal["callers", "callees", "address_taken"]
 
@@ -123,16 +124,24 @@ def analysis_run_counts(conn: sqlite3.Connection) -> dict[str, Any]:
     Written into the atlas ``run`` row so list_runs / ``tmap runs`` can show a scan's size and
     detect a STALE scan. ``build_hash`` is the DISTINCT ``pass_version`` over the current scan's
     binaries (the extraction-pass content hash): one value = a uniform build; ``mixed:<n>`` = the
-    scan spans more than one pass version; None when unknown. ``functions_empty`` reuses the
-    partial-decompile red-line count. Every field degrades to None/0 on an older analysis.db that
-    lacks a column (the lineage is best-effort, never a hard failure of the scan)."""
+    scan spans more than one pass version; None when unknown. ``ghidra_version`` is the decompiler
+    version behind the scan (see ``_run_ghidra_version``) and is ALWAYS a string, never None.
+    ``functions_empty`` reuses the partial-decompile red-line count. Every other field degrades to
+    None/0 on an older analysis.db that lacks a column (the lineage is best-effort, never a hard
+    failure of the scan)."""
     try:
         binaries = conn.execute("SELECT COUNT(*) FROM current_binaries").fetchone()[0]
         functions = conn.execute(
             "SELECT COUNT(*) FROM functions f JOIN current_binaries b ON b.id = f.binary_id"
         ).fetchone()[0]
     except sqlite3.OperationalError:
-        return {"binaries": None, "functions": None, "functions_empty": None, "build_hash": None}
+        return {
+            "binaries": None,
+            "functions": None,
+            "functions_empty": None,
+            "build_hash": None,
+            "ghidra_version": UNKNOWN_VERSION,
+        }
     functions_empty = sum(b["functions_empty"] for b in list_partially_incomplete_binaries(conn))
     build_hash: str | None
     try:
@@ -156,7 +165,31 @@ def analysis_run_counts(conn: sqlite3.Connection) -> dict[str, Any]:
         "functions": functions,
         "functions_empty": functions_empty,
         "build_hash": build_hash,
+        "ghidra_version": _run_ghidra_version(conn),
     }
+
+
+def _run_ghidra_version(conn: sqlite3.Connection) -> str:
+    """The ONE Ghidra version behind this scan's usable output, else the explicit ``unknown``.
+
+    Population = the current scan's binaries whose Ghidra output was usable (``ghidra_ok = 1``);
+    rows that produced nothing carry no version and cannot make the run's version un-confirmable.
+
+    Returns a single version ONLY when every row in that population declares the SAME one. A NULL
+    among them (produced before this was recorded), more than one distinct value (a scan spanning
+    two installations), an empty population, or a missing column all collapse to ``unknown`` --
+    which reads downstream as "cannot confirm this run's decompiler version", NOT as "same as the
+    other side". The per-binary column keeps the detail a collapsed rollup drops."""
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT ghidra_version FROM current_binaries WHERE ghidra_ok = 1"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return UNKNOWN_VERSION
+    versions = [r[0] for r in rows]
+    if len(versions) == 1 and versions[0]:
+        return str(versions[0])
+    return UNKNOWN_VERSION
 
 
 def _anchor(binary: str | None, name: str | None, address: str | None) -> dict[str, Any]:

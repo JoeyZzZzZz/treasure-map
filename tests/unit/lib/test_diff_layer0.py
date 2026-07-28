@@ -31,6 +31,7 @@ from treasure_map.lib.diff.layer0 import (
 from treasure_map.lib.errors import ConfigError
 from treasure_map.lib.query.diff_align import align_by_a, align_by_b
 from treasure_map.lib.storage.connection import open_db
+from treasure_map.version import UNKNOWN_VERSION
 
 FIXTURE = (
     Path(__file__).resolve().parents[2]
@@ -333,9 +334,17 @@ def test_both_size_sentinels_are_unknown_not_skipped_micro(tmp_path: Path) -> No
 # ── orchestrator + query face (synthetic atlas + analysis.db) ────────────────────────────
 
 
-def _seed_two_runs(tmp_path: Path, *, tool_a: str = "0.0.1", tool_b: str = "0.0.1") -> Path:
+def _seed_two_runs(
+    tmp_path: Path,
+    *,
+    tool_a: str = "0.0.1",
+    tool_b: str = "0.0.1",
+    ghidra_a: str = "11.4.3",
+    ghidra_b: str = "11.4.3",
+) -> Path:
     """Two runs (A/B) each resolving to a synthetic analysis.db, both carrying a 'lib.so' with the
-    tiny .BinDiff's addresses. Returns the atlas path."""
+    tiny .BinDiff's addresses. Returns the atlas path. The Ghidra versions are parameterized so the
+    version-skew criterion (tmap tool_version AND Ghidra version) can be exercised independently."""
     dba = _mk_analysis(
         tmp_path / "a.db",
         "lib.so",
@@ -350,8 +359,8 @@ def _seed_two_runs(tmp_path: Path, *, tool_a: str = "0.0.1", tool_b: str = "0.0.
     )
     atlas_path = tmp_path / "atlas.db"
     con = open_atlas(atlas_path)
-    begin_run(con, "run_a", analysis_db_path=str(dba), tool_version=tool_a, ghidra_version="11.4.3")
-    begin_run(con, "run_b", analysis_db_path=str(dbb), tool_version=tool_b, ghidra_version="11.4.3")
+    begin_run(con, "run_a", analysis_db_path=str(dba), tool_version=tool_a, ghidra_version=ghidra_a)
+    begin_run(con, "run_b", analysis_db_path=str(dbb), tool_version=tool_b, ghidra_version=ghidra_b)
     con.close()
     return atlas_path
 
@@ -595,4 +604,117 @@ def test_bindiff_matching_hashes_proceed(tmp_path: Path) -> None:
         binary_b="lib.so",
     )
     assert r.matched_pairs == 1  # _tiny_bindiff writes matching ('sha_a','sha_b') hashes
+    con.close()
+
+
+# ── iron law 6: version_skew must carry a REAL tool+Ghidra version difference (not a constant) ──
+#
+# The consumer side (layer2) is already correct; these anchor
+# the PRODUCER.  (tool_version drives skew, forward+reverse) are covered by
+# test_version_skew_uses_tool_version_not_firmware_hash above and, on the consumer side, by
+# test_diff_layer2.test_version_skew_degrades_every_edge_subject / _zero_restores. The tests here
+# cover the Ghidra criterion , the both-unknown conservative direction , anchor
+# independence (reverse), and the end-to-end visibility sanity .
+
+
+def _parse_two_runs(tmp_path: Path, **seed_kw: str):  # type: ignore[no-untyped-def]
+    """Seed two runs with the given tool/ghidra versions, run layer-0, return the Layer0Result."""
+    con = open_atlas(_seed_two_runs(tmp_path, **seed_kw))
+    try:
+        return run_layer0_parse(
+            con,
+            bindiff_path=_tiny_bindiff(tmp_path),
+            run_a_id="run_a",
+            run_b_id="run_b",
+            binary_a="lib.so",
+            binary_b="lib.so",
+        )
+    finally:
+        con.close()
+
+
+def test_confirmed_same_version_contract() -> None:
+    # ★ tight anchor +  unconfirmable: 'confirmed same' is True ONLY for two equal REAL
+    # versions. A missing value (None) OR the explicit UNKNOWN_VERSION on EITHER side is
+    # unconfirmable -> False (cannot-confirm-same != confirmed-same, the conservative direction).
+    # ★ both-unknown is the case CC's review added: two failed detections most need skew, so it MUST
+    # be False. Deleting layer0's `if a == UNKNOWN_VERSION or b == UNKNOWN_VERSION: return False`
+    # line flips this one case to True -> this assertion goes red (its teeth). Anchors on the
+    # UNKNOWN_VERSION constant (single source), never the literal "unknown".
+    assert layer0._confirmed_same_version("11.0", "11.0") is True
+    assert layer0._confirmed_same_version("11.0", "11.1") is False
+    assert layer0._confirmed_same_version(UNKNOWN_VERSION, UNKNOWN_VERSION) is False  # both unknown
+    assert layer0._confirmed_same_version("11.0", UNKNOWN_VERSION) is False  # one unknown
+    assert layer0._confirmed_same_version(UNKNOWN_VERSION, "11.0") is False
+    assert layer0._confirmed_same_version("11.0", None) is False  # one NULL (legacy/pre-column run)
+    assert layer0._confirmed_same_version(None, None) is False
+
+
+def test_version_skew_ghidra_criterion_is_live(tmp_path: Path) -> None:
+    # ★ /  (regret guard): tool_version EQUAL, Ghidra versions differ -> skew=1. This is
+    # the criterion the constant-None used to short-circuit; it proves the Ghidra leg is live and
+    # cannot silently degrade to comparing only tool_version.
+    r = _parse_two_runs(tmp_path, ghidra_a="11.0", ghidra_b="11.1")
+    assert r.meta.version_skew == 1
+
+
+def test_version_skew_ghidra_criterion_is_load_bearing(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    # ★ reverse/independence: force _confirmed_same_version to always-confirm; the SAME
+    # ghidra-differing fixture must then drop to skew=0 -> proves the Ghidra criterion (not
+    # something else) produced the skew=1 above. If it stayed 1, the forward anchor is not reading
+    # the criterion and must be rewritten.
+    monkeypatch.setattr(layer0, "_confirmed_same_version", lambda a, b: True)
+    r = _parse_two_runs(tmp_path, ghidra_a="11.0", ghidra_b="11.1")
+    assert r.meta.version_skew == 0
+
+
+def test_version_skew_both_unknown_is_conservative(tmp_path: Path) -> None:
+    # ★ end-to-end: both sides recorded UNKNOWN_VERSION (two failed detections), tool_version
+    # equal -> cannot confirm the same decompiler -> skew=1. The trap CC's audit named: a truthy
+    # "unknown" == "unknown" must NOT read as confirmed-same. Deleting layer0's UNKNOWN_VERSION
+    # guard line reddens this (both-unknown would fall through to a == b -> skew=0).
+    r = _parse_two_runs(tmp_path, ghidra_a=UNKNOWN_VERSION, ghidra_b=UNKNOWN_VERSION)
+    assert r.meta.version_skew == 1
+
+
+def test_version_skew_forward_is_load_bearing(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    # ★ anchor independence: break _version_skew (force False); a tool_version-differing diff
+    # must then report version_skew=0 -> proves the forward skew assertions genuinely read
+    # _version_skew's output, not a constant.
+    monkeypatch.setattr(layer0, "_version_skew", lambda a, b: False)
+    r = _parse_two_runs(tmp_path, tool_a="0.0.1", tool_b="0.0.2")
+    assert r.meta.version_skew == 0
+
+
+def test_diff_meta_records_ghidra_version_not_null(tmp_path: Path) -> None:
+    # (INTEGRATION SANITY, not a mechanical anchor): a normal run stamps the recorded Ghidra
+    # version onto diff_meta, visible (never NULL) so a consumer tells "unknown" (detection failed)
+    # from NULL (field never implemented). ★ The "never NULL" invariant's TEETH live in the
+    # per-layer anchors -- facts._run_ghidra_version and detect_ghidra_version --
+    # because a single-point mutate does NOT redden THIS end-to-end assertion (the two sentinels
+    # mask each other), so it is sanity only, deliberately not relied on as a guard.
+    r = _parse_two_runs(tmp_path, ghidra_a="11.4.3", ghidra_b="11.4.3")
+    assert r.meta.ghidra_version_a == "11.4.3"
+    assert r.meta.ghidra_version_b == "11.4.3"
+
+
+# ── Bug A: diff_meta records the diff's target binary short name ──
+
+
+def test_diff_meta_binary_normalized_to_short_name(tmp_path: Path) -> None:
+    # ★ Bug A: run_layer0_parse given a SHA256-form binary must STORE the short NAME in
+    # diff_meta.binary_a/b -- layer-2 filters on string_keyed_edge.binary (short name), so a stored
+    # sha would zero-match and silently drop every edge (over-filter). _seed_two_runs
+    # gives lib.so the sha 'sha_a'/'sha_b'; passing those (the sha form) must still record 'lib.so'.
+    con = open_atlas(_seed_two_runs(tmp_path))
+    r = run_layer0_parse(
+        con,
+        bindiff_path=_tiny_bindiff(tmp_path),
+        run_a_id="run_a",
+        run_b_id="run_b",
+        binary_a="sha_a",  # SHA256 form, not the short name
+        binary_b="sha_b",
+    )
+    assert r.meta.binary_a == "lib.so"  # normalized to the short name, NOT the sha
+    assert r.meta.binary_b == "lib.so"
     con.close()

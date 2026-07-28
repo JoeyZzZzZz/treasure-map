@@ -531,3 +531,48 @@ def test_runner_pass_version_matches_its_script_dir(tmp_path: Path) -> None:
     (d / "ExportFunctions.java").write_text("class ExportFunctions {}\n")
     runner = GhidraRunner(GhidraConfig(), script_dir=d, headless=tmp_path / "hl")
     assert runner.pass_version() == compute_pass_version(d)
+
+
+# ── iron law 6: Ghidra-version detection ────────────────
+
+
+def test_detect_ghidra_version_reads_application_properties(tmp_path: Path) -> None:
+    # ★ the version behind analyzeHeadless is read from <home>/Ghidra/application.properties
+    # (home = the headless path's parent.parent -- analyzeHeadless lives in <home>/support/). A
+    # well-formed properties file yields application.version, ignoring the other keys.
+    from treasure_map.lib.analyze.ghidra_runner import detect_ghidra_version
+
+    home = tmp_path / "ghidra_11.4.3_PUBLIC"
+    (home / "support").mkdir(parents=True)
+    (home / "Ghidra").mkdir()
+    (home / "Ghidra" / "application.properties").write_text(
+        "application.name=Ghidra\napplication.version=11.4.3\napplication.release.name=PUBLIC\n"
+    )
+    assert detect_ghidra_version(home / "support" / "analyzeHeadless") == "11.4.3"
+
+
+def test_detect_ghidra_version_unreadable_is_unknown_not_none(tmp_path: Path) -> None:
+    # ★ TEETH: a missing/unreadable application.properties returns the EXPLICIT
+    # UNKNOWN_VERSION string, never None -- a None would let a downstream version compare
+    # short-circuit into a silent "same version". Mutating the failure return to None reddens this
+    # (None == UNKNOWN_VERSION is False). Anchors on the constant (single source), not the literal.
+    from treasure_map.lib.analyze.ghidra_runner import detect_ghidra_version
+    from treasure_map.version import UNKNOWN_VERSION
+
+    # no Ghidra/ tree at all -> read_text raises OSError -> the explicit sentinel
+    assert detect_ghidra_version(tmp_path / "nowhere" / "support" / "analyzeHeadless") == (
+        UNKNOWN_VERSION
+    )
+
+
+def test_detect_ghidra_version_missing_key_is_unknown(tmp_path: Path) -> None:
+    # ★ a properties file that exists but has NO application.version key -> the sentinel,
+    # never a guess or a crash (an installation whose properties format drifted stays honest).
+    from treasure_map.lib.analyze.ghidra_runner import detect_ghidra_version
+    from treasure_map.version import UNKNOWN_VERSION
+
+    home = tmp_path / "ghidra"
+    (home / "support").mkdir(parents=True)
+    (home / "Ghidra").mkdir()
+    (home / "Ghidra" / "application.properties").write_text("application.name=Ghidra\n")
+    assert detect_ghidra_version(home / "support" / "analyzeHeadless") == UNKNOWN_VERSION

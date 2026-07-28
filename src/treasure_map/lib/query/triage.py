@@ -1665,9 +1665,33 @@ def sort_candidates(
     return sorted(candidates, key=lambda c: _sort_key(c, spine=sp, overrides=impact_overrides))
 
 
+# The --filter LENS set: the dimensions a user can filter/sort candidates by. This is NOT the
+# authoritative dimension universe -- `source` is deliberately absent (it is an orthogonal
+# param/source axis, not a filterable lens). Anything that must COVER every dimension (a consumer,
+# the layer-2 universe guard) must anchor on _CANONICAL_DIMENSION_NAMES below, never on this set.
 _DIMENSION_NAMES = frozenset(
     {
         "controllability",
+        "source_writability",
+        "reachability",
+        "filtering",
+        "sink_impact",
+        "writer",
+        "completeness",
+    }
+)
+
+# The authoritative dimension universe: every dimension _build_dimensions() actually emits. Written
+# out by hand ON PURPOSE -- it must NOT be derived as `{d.name for d in _build_dimensions(...)}`,
+# because a derived anchor is self-referential: deleting a `_dim_*` would drop the name from BOTH
+# the code and the anchor, so a coverage guard would stay green while a dimension silently vanished
+# (zero interception). A consumer/guard that must not let a dimension disappear by absence anchors
+# on THIS list; test_triage_explain asserts it equals {d.name for d in ex.dimensions}, so a drift
+# between this hand-list and the real assembly is caught mechanically.
+_CANONICAL_DIMENSION_NAMES = frozenset(
+    {
+        "controllability",
+        "source",
         "source_writability",
         "reachability",
         "filtering",

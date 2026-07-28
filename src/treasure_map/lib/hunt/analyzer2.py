@@ -832,6 +832,10 @@ def run_analyzer2(
             firmware_path=firmware_path,
             build_hash=lineage["build_hash"],
             tool_version=__version__,
+            # The decompiler version the SCAN recorded (always a string, 'unknown' when the scan
+            # could not confirm one) -- never re-detected here, which would record whatever Ghidra
+            # is installed at hunt time instead of the one that produced this analysis.db.
+            ghidra_version=lineage["ghidra_version"],
         )
         # One transaction: drop this run's old rows + write the fresh result, or roll back to
         # the prior result on any error (never leave a half-written run). Only this run_id's

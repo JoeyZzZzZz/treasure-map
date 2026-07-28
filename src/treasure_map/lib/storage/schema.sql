@@ -25,6 +25,10 @@ CREATE TABLE IF NOT EXISTS binaries (
     pass_version TEXT,                     -- content hash of the ExportFunctions pass that produced
                                            --   this row's output; a mismatch re-dirties it so a pass
                                            --   edit re-extracts automatically (no manual JSON delete)
+    ghidra_version TEXT,                   -- Ghidra version that produced this row's output ('unknown'
+                                           --   when undetectable, NULL when produced before this was
+                                           --   recorded); rolled up per run so a cross-version diff
+                                           --   can tell a decompiler change from a firmware change
     strings_total     INTEGER,             -- true count of matching defined strings (>= stored); NULL
                                            --   on binaries exported before honest truncation existed
     strings_truncated INTEGER DEFAULT 0,   -- 1 = the stored strings list is a prefix (cap/cancel hit),

@@ -43,6 +43,10 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # re-dirties every binary once (a correct one-time re-extraction) until the current hash is
     # stored. Must match schema.sql.
     ("binaries", "pass_version", "TEXT"),
+    # Ghidra version that produced this row's output. Back-fills NULL on older DBs, which rolls up
+    # to the explicit 'unknown' run-level sentinel (cannot confirm which decompiler ran) rather than
+    # being read as "same version as the other side". Must match schema.sql.
+    ("binaries", "ghidra_version", "TEXT"),
     # honest string-truncation transport: true match count + a prefix flag, so get_strings surfaces
     # a capped/searched binary's dropped strings instead of reading them as "absent". Back-fill
     # NULL/0 on older DBs (a genuinely complete list is the pre-cap default). Must match schema.sql.

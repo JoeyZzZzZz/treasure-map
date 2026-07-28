@@ -28,6 +28,7 @@ from treasure_map.lib.atlas.writer import (
     add_dimension_deltas,
     delete_dimension_delta,
 )
+from treasure_map.lib.diff.layer0 import norm_hex  # the ONE address canonicalizer (no second one)
 
 # ── the layer-2 DELTA-capability declaration (a property of THIS code version, NOT of a run) ──
 # What this layer version can (or explicitly cannot yet) delta. This is legitimately code-declared:
@@ -54,6 +55,11 @@ DECLARED_DELTA_DIMENSIONS: tuple[DimensionSpec, ...] = (
     # candidate-level dimensions: analysis exists (triage computes them read-time) but the delta is
     # gated on candidate-level alignment (a later layer) -> visible here as delta_supported=0
     DimensionSpec("controllability", delta_supported=False, always_present=True),
+    # `source` (the orthogonal param/source axis) is the SAME class as the candidate dims here. It
+    # was silently absent from the layer-2 universe -- the exact gap-by-absence this layer kills --
+    # because the coverage guard's anchor was the 7-name --filter set, which omits it. Declared
+    # delta_supported=0 so it is VISIBLE (a capability row), never absent-by-omission.
+    DimensionSpec("source", delta_supported=False, always_present=True),
     DimensionSpec("filtering", delta_supported=False, always_present=True),
     DimensionSpec("source_writability", delta_supported=False, always_present=True),
     DimensionSpec("sink_impact", delta_supported=False, always_present=True),
@@ -108,12 +114,26 @@ _EDGE_COLS = (
 )
 
 
-def _load_edges(atlas: sqlite3.Connection, run_id: str) -> list[dict[str, Any]]:
+def _load_edges(atlas: sqlite3.Connection, run_id: str, binary: str | None) -> list[dict[str, Any]]:
+    """Edges for one run SCOPED to one binary. ★ Bug A: string_keyed_edge spans the whole firmware,
+    but a diff aligns ONE binary -- without the ``binary`` filter every other binary's edges join
+    against this diff's (single-binary) function_alignment and flood the delta as unaligned.
+
+    ``binary=None`` (an unrecorded scope) loads UNFILTERED. This is reached ONLY on already-degraded
+    paths (a missing-diff_meta version_skew, or a capability asymmetry with no scope), where every
+    subject is undetermined regardless; the NORMAL compare path never passes None -- it refuses a
+    NULL scope up front rather than silently un-filtering (that is the Bug A regression)."""
     atlas.row_factory = sqlite3.Row
-    rows = atlas.execute(
-        f"SELECT {_EDGE_COLS} FROM string_keyed_edge WHERE source_run_id = ?",  # noqa: S608 -- literal cols
-        (run_id,),
-    ).fetchall()
+    if binary is None:
+        rows = atlas.execute(
+            f"SELECT {_EDGE_COLS} FROM string_keyed_edge WHERE source_run_id = ?",  # noqa: S608 -- literal cols
+            (run_id,),
+        ).fetchall()
+    else:
+        rows = atlas.execute(
+            f"SELECT {_EDGE_COLS} FROM string_keyed_edge WHERE source_run_id = ? AND binary = ?",  # noqa: S608 -- literal cols
+            (run_id, binary),
+        ).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -160,7 +180,7 @@ def _canonical_and_key(
         return (binary, mech, key, None), f"{binary}|{mech}|{key}"
     faddr = edge["from_func_addr"]
     if side == "a":
-        anchor = faddr  # already A-space
+        anchor = norm_hex(faddr)  # ★ Bug D pt3: canonical-key ingredient -> normalized, never raw
         return (binary, mech, key, anchor), f"{binary}|{mech}|{key}|{anchor}"
     # side b: map the func anchor back to A-space via alignment; unaligned -> a b: sentinel anchor
     aligned = b2a.get(faddr) if faddr is not None else None
@@ -223,33 +243,70 @@ def _und(
     )
 
 
+def _is_addr_derived_name(name: str | None) -> bool:
+    """A Ghidra auto-generated, address-derived callee name (``FUN_xxxx`` / ``thunk_xxxx``). Such a
+    name is UNSTABLE across versions (it encodes an address that moves), so it must NEVER anchor a
+    cross-version comparison -- that would flip a stable callee to a false layer_changed. A callee
+    with such a name falls back to its ADDRESS anchor (aligned via function_alignment) instead."""
+    return name is not None and (name.startswith("FUN_") or name.startswith("thunk_"))
+
+
 def _aligned_callee_set(
     callees: list[dict[str, Any]], a2b: dict[str, tuple[str, float, str]], side: str
-) -> tuple[frozenset[str] | None, str | None, float | None]:
-    """The callee set projected into a common (B) space, or (None, reason, conf) when any callee is
-    unalignable / low-confidence. A callees are mapped forward via a2b; B callees use their own addr
-    (a brand-new B callee is a real difference, not an alignment failure)."""
+) -> tuple[frozenset[str] | None, str | None, float | None, set[str]]:
+    """Project a subject's callees into a common comparison space, else (None, reason, conf, spaces)
+    when any callee is unalignable / low-confidence.
+
+    Per callee the anchor is chosen by NAME AVAILABILITY (not by callee_kind):
+      - a real (non-address-derived) callee_name -> ``name:<name>`` -- a stable cross-version
+        identity (``snprintf`` stays ``snprintf``; a change to ``snprintf_chk`` is a real change);
+      - else (name missing or an address-derived FUN_/thunk_ name) the ADDRESS anchor: an A callee
+        maps forward via function_alignment (``addr:<addr_b>``), a B callee uses its own addr. ★ Bug
+        D: every address is canonicalized with norm_hex BEFORE it is looked up or emitted, so a raw
+        ``0x30664`` and an aligned ``00030664`` are one identity (two before -> 100% miss);
+      - else (no address either) -> callee_unalignable (honest undetermined, no fabricated id).
+
+    ``spaces`` reports which anchor spaces this side used ({'name'}/{'addr'}/both) so the caller
+    can detect an anchor-space MISMATCH (one side name-anchored, the other addr-anchored -- the same
+    callee may be a real name on one version and a FUN_ on the other: not comparable, never a proven
+    change). The ``name:``/``addr:`` prefixes keep the two element classes from colliding."""
     out: set[str] = set()
+    spaces: set[str] = set()
     min_conf: float | None = None
     for c in callees:
-        addr = c.get("addr")
-        if not addr:
-            return None, "callee_unalignable", None
+        name = c.get("name")
+        if name and not _is_addr_derived_name(name):
+            out.add(f"name:{name}")
+            spaces.add("name")
+            continue
+        na = norm_hex(
+            c.get("addr")
+        )  # address-derived/absent name -> the address anchor, normalized
+        if na is None:
+            return None, "callee_unalignable", None, spaces
         if side == "a":
-            aligned = a2b.get(addr)
+            aligned = a2b.get(na)
             if aligned is None:
-                return None, "callee_unalignable", None
+                return None, "callee_unalignable", None, spaces
             if aligned[2] == _LOW_CONF_STATE:
-                return None, "callee_alignment_low_confidence", aligned[1]
-            out.add(aligned[0])
+                return None, "callee_alignment_low_confidence", aligned[1], spaces
+            out.add(f"addr:{aligned[0]}")
             min_conf = aligned[1] if min_conf is None else min(min_conf, aligned[1])
         else:
-            out.add(addr)  # B callee already in B space; a real address is all comparison needs
-    return frozenset(out), None, min_conf
+            out.add(
+                f"addr:{na}"
+            )  # B callee already in B space; normalized so formats can't diverge
+        spaces.add("addr")
+    return frozenset(out), None, min_conf, spaces
 
 
 def _version_skew_rows(
-    atlas: sqlite3.Connection, diff_id: str, run_a: str, run_b: str
+    atlas: sqlite3.Connection,
+    diff_id: str,
+    run_a: str,
+    run_b: str,
+    binary_a: str | None,
+    binary_b: str | None,
 ) -> list[DimensionDeltaRow]:
     """★ Iron law 6 (edge form): an edge dimension is written at HUNT time, so it cannot be
     recomputed at diff time. Under a version skew the two sides' edges may be the product of
@@ -259,8 +316,8 @@ def _version_skew_rows(
     region self-reported 'complete' by an OLD detector and 'complete' by a NEW one are two different
     completes with no version stamp."""
     _, b2a = _load_alignment(atlas, diff_id)
-    _, keys_a, unres_a = _group(_load_edges(atlas, run_a), "a", b2a)
-    _, keys_b, unres_b = _group(_load_edges(atlas, run_b), "b", b2a)
+    _, keys_a, unres_a = _group(_load_edges(atlas, run_a, binary_a), "a", b2a)
+    _, keys_b, unres_b = _group(_load_edges(atlas, run_b, binary_b), "b", b2a)
     subject_keys = set(keys_a.values()) | set(keys_b.values()) | set(unres_a) | set(unres_b)
     return [_und(diff_id, k, "version_skew") for k in sorted(subject_keys)]
 
@@ -273,6 +330,8 @@ def _string_keyed_edge_delta(
     cap_a: str,
     cap_b: str,
     version_skew: bool,
+    binary_a: str | None,
+    binary_b: str | None,
 ) -> list[DimensionDeltaRow]:
     """Project the string_keyed_edge dimension. Guards (G1 key/anchor, G2 callee alignability, G3
     completeness) run FIRST in order; only a subject that clears ALL guards has its callee sets
@@ -280,13 +339,21 @@ def _string_keyed_edge_delta(
     dim = "reachability.string_keyed_edge"
     if cap_a != "present" or cap_b != "present":
         # analysis absent on a side is a deeper gap than a version skew -> capability scope
-        return _capability_asymmetry(atlas, diff_id, dim, run_a, run_b, cap_a, cap_b)
+        return _capability_asymmetry(
+            atlas, diff_id, dim, run_a, run_b, cap_a, cap_b, binary_a, binary_b
+        )
     if version_skew:
-        return _version_skew_rows(atlas, diff_id, run_a, run_b)
+        return _version_skew_rows(atlas, diff_id, run_a, run_b, binary_a, binary_b)
+    # ★ Bug A: past skew/capability we WILL compare, so the binary scope must be known.
+    # string_keyed_edge spans the whole firmware; a diff aligns ONE binary (diff_meta.binary_a/b). A
+    # NULL scope (a diff written before it was recorded) is an honest refusal -- NEVER a licence to
+    # skip the filter and flood in every other binary's edges (empty != absent on the scope axis).
+    if binary_a is None or binary_b is None:
+        return [_und(diff_id, f"{dim}:binary_scope_unrecorded", "binary_scope_unrecorded")]
 
     a2b, b2a = _load_alignment(atlas, diff_id)
-    edges_a = _load_edges(atlas, run_a)
-    edges_b = _load_edges(atlas, run_b)
+    edges_a = _load_edges(atlas, run_a, binary_a)
+    edges_b = _load_edges(atlas, run_b, binary_b)
     subj_a, keys_a, unres_a = _group(edges_a, "a", b2a)
     subj_b, keys_b, unres_b = _group(edges_b, "b", b2a)
     # per-function region completeness in A-space (a region is complete iff every edge row there is
@@ -319,11 +386,11 @@ def _string_keyed_edge_delta(
             rows.append(g3)
             continue
         # G2 callee alignability, then compare
-        set_a, reason_a, conf_a = (
-            _aligned_callee_set(a.callees, a2b, "a") if a else (frozenset(), None, None)
+        set_a, reason_a, conf_a, spaces_a = (
+            _aligned_callee_set(a.callees, a2b, "a") if a else (frozenset(), None, None, set())
         )
-        set_b, reason_b, conf_b = (
-            _aligned_callee_set(b.callees, a2b, "b") if b else (frozenset(), None, None)
+        set_b, reason_b, conf_b, spaces_b = (
+            _aligned_callee_set(b.callees, a2b, "b") if b else (frozenset(), None, None, set())
         )
         if set_a is None or set_b is None:
             rows.append(
@@ -334,6 +401,12 @@ def _string_keyed_edge_delta(
                     conf=conf_a or conf_b,
                 )
             )
+            continue
+        # both sides alignable but anchored in DIFFERENT identity spaces (one name, one addr): the
+        # same callee may be a real name on one version and a FUN_ on the other -- not comparable,
+        # and NEVER a proven change (that would pollute the one real signal this layer produces).
+        if a and b and spaces_a != spaces_b:
+            rows.append(_und(diff_id, key_str, "anchor_space_mismatch"))
             continue
         state_a = _state_str(a)
         state_b = _state_str(b)
@@ -459,19 +532,21 @@ def _capability_asymmetry(
     run_b: str,
     cap_a: str,
     cap_b: str,
+    binary_a: str | None,
+    binary_b: str | None,
 ) -> list[DimensionDeltaRow]:
     """One side lacks the analysis: every PRESENT-side subject is capability-scoped undetermined,
     identically (constant per subject -- a whole-dimension gap, never a per-subject data gap)."""
     _, b2a = _load_alignment(atlas, diff_id)
     if cap_a == "present":
-        present_run, side = run_a, "a"
+        present_run, side, present_binary = run_a, "a", binary_a
         reason = (
             "capability_absent_b"
             if cap_b == "declared_absent"
             else "capability_registration_unknown"
         )
     elif cap_b == "present":
-        present_run, side = run_b, "b"
+        present_run, side, present_binary = run_b, "b", binary_b
         reason = (
             "capability_absent_a"
             if cap_a == "declared_absent"
@@ -479,7 +554,7 @@ def _capability_asymmetry(
         )
     else:
         return []  # neither side has the analysis: no subjects; the capability_state row carries it
-    _, keys, _ = _group(_load_edges(atlas, present_run), side, b2a)
+    _, keys, _ = _group(_load_edges(atlas, present_run, present_binary), side, b2a)
     return [
         DimensionDeltaRow(
             diff_id=diff_id,
@@ -533,10 +608,14 @@ def run_layer2_delta(
     empty != absent on the version axis). BOUNDARY: version_skew only compares the ANALYSIS-TOOL
     version -- it does NOT catch a detector-logic change within one tool_version, nor build-side
     compiler/inlining skew between the two firmware; not all comparability risk."""
-    skew_row = atlas.execute(
-        "SELECT version_skew FROM diff_meta WHERE diff_id = ?", (diff_id,)
+    meta_row = atlas.execute(
+        "SELECT version_skew, binary_a, binary_b FROM diff_meta WHERE diff_id = ?", (diff_id,)
     ).fetchone()
-    version_skew = skew_row is None or skew_row[0] is None or bool(skew_row[0])
+    version_skew = meta_row is None or meta_row[0] is None or bool(meta_row[0])
+    # the diff's per-side target binary (short name). A per-binary handler MUST scope to it; NULL (a
+    # pre-feature diff) is an honest refusal, never a licence to skip the filter (see the handler).
+    binary_a = meta_row[1] if meta_row is not None else None
+    binary_b = meta_row[2] if meta_row is not None else None
     declared = {d.name: d for d in DECLARED_DELTA_DIMENSIONS}
     # discovered analysis sub-dimensions (never hardcoded): whatever run_capability actually holds
     discovered = {
@@ -570,7 +649,17 @@ def run_layer2_delta(
         handler = _DELTA_HANDLERS.get(dim)
         if delta_supported and handler is not None:
             delta_rows.extend(
-                handler(atlas, diff_id, run_a_id, run_b_id, state_a, state_b, version_skew)
+                handler(
+                    atlas,
+                    diff_id,
+                    run_a_id,
+                    run_b_id,
+                    state_a,
+                    state_b,
+                    version_skew,
+                    binary_a,
+                    binary_b,
+                )
             )
 
     delete_dimension_delta(atlas, diff_id, commit=False)

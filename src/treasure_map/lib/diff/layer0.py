@@ -34,6 +34,7 @@ from treasure_map.lib.errors import ConfigError
 from treasure_map.lib.facts import _DECOMPILE_MIN_SIZE
 from treasure_map.lib.hunt.refs import _norm_addr
 from treasure_map.lib.query.runs import get_run
+from treasure_map.version import UNKNOWN_VERSION
 
 # The confidence boundary between an aligned pair and an undetermined one. Owner-set: on the
 # reference fixture it cuts 1815/1848 high-confidence (~98%), matching BinDiff's own overall
@@ -276,15 +277,33 @@ def compute_side_presence(
 
 
 def _version_skew(a: RunRow, b: RunRow) -> bool:
-    """True when the two runs' ANALYSIS-TOOL versions differ. Compares tool_version (+ the
-    ghidra_version when BOTH sides recorded it). NEVER firmware_sha256 (A and B are different
-    firmware) or build_hash (a single-firmware stale signal). Does NOT detect build-side
-    compiler/inlining skew (see the schema note)."""
+    """True when the two runs' ANALYSIS-TOOL versions are not CONFIRMED equal.
+
+    Compares tool_version and ghidra_version. NEVER firmware_sha256 (A and B are different firmware)
+    or build_hash (a single-firmware stale signal). Does NOT detect build-side compiler/inlining
+    skew, nor detector-logic drift inside one tool_version (see the schema note).
+
+    ★ The ghidra criterion is deliberately NOT short-circuited on a missing value: a side recorded
+    as ``unknown`` (or NULL, from a run predating collection) means we cannot confirm the two runs
+    used the same decompiler, and cannot-confirm-same is not confirmed-same -- so it counts as skew.
+    Reading a half-recorded pair as "no skew" would silently bias toward comparability exactly where
+    the evidence is missing. Cost, accepted: diffs of runs scanned before the decompiler version was
+    recorded degrade to undetermined until they are re-scanned."""
     if a.tool_version != b.tool_version:
         return True
-    if a.ghidra_version and b.ghidra_version and a.ghidra_version != b.ghidra_version:
+    if not _confirmed_same_version(a.ghidra_version, b.ghidra_version):
         return True
     return False
+
+
+def _confirmed_same_version(a: str | None, b: str | None) -> bool:
+    """True ONLY when both sides carry a real version string and they are equal. A missing value or
+    the explicit ``unknown`` sentinel on EITHER side is not a match -- it is unconfirmable."""
+    if not a or not b:
+        return False
+    if a == UNKNOWN_VERSION or b == UNKNOWN_VERSION:
+        return False
+    return a == b
 
 
 def _resolve_run(atlas: sqlite3.Connection, run_id: str, side: str) -> RunRow:
@@ -308,6 +327,24 @@ def _binary_sha256(analysis_db_path: str, binary: str) -> str | None:
     try:
         row = con.execute(
             "SELECT sha256 FROM binaries WHERE name = ? OR sha256 = ?", (binary, binary)
+        ).fetchone()
+    finally:
+        con.close()
+    return row[0] if row is not None else None
+
+
+def _binary_name(analysis_db_path: str, binary: str) -> str | None:
+    """The SHORT NAME of the diffed binary in this run's analysis.db (``binary`` = name OR sha256).
+
+    diff_meta stores the short name so the layer-2 per-binary filter (``string_keyed_edge.binary``
+    holds short names) matches. Normalizing a caller-supplied sha256 HERE, at write time, is the
+    fix for the over-filter trap: a read-side ``WHERE binary = <sha256>`` would zero-match and
+    silently drop every edge of the binary. None when the binary is not found -- the diff cannot
+    record a scope it cannot resolve, and the consumer then refuses rather than guessing."""
+    con = sqlite3.connect(f"file:{analysis_db_path}?mode=ro", uri=True)
+    try:
+        row = con.execute(
+            "SELECT name FROM binaries WHERE name = ? OR sha256 = ?", (binary, binary)
         ).fetchone()
     finally:
         con.close()
@@ -396,6 +433,10 @@ def run_layer0_parse(
         diff_id=did,
         run_a_id=run_a_id,
         run_b_id=run_b_id,
+        # the diff's target binary per side, normalized to the short name AT WRITE TIME so the
+        # layer-2 per-binary filter matches (a caller-supplied sha256 would zero-match there).
+        binary_a=_binary_name(run_a.analysis_db_path, binary_a),
+        binary_b=_binary_name(run_b.analysis_db_path, binary_b),
         tool_version_a=run_a.tool_version,
         tool_version_b=run_b.tool_version,
         ghidra_version_a=run_a.ghidra_version,

@@ -455,6 +455,10 @@ CREATE TABLE IF NOT EXISTS diff_meta (
     micro_skipped_b         INTEGER,
     presence_computed_a     INTEGER NOT NULL DEFAULT 0,  -- 1 = A side's baseline was available
     presence_computed_b     INTEGER NOT NULL DEFAULT 0,
+    binary_a                TEXT,            -- the diff's TARGET binary per side (a diff aligns ONE
+    binary_b                TEXT,            --   binary), stored as short name; NULL on a pre-feature
+                                             --   diff -> a per-binary consumer must refuse, not skip
+                                             --   filtering (empty != absent on the binary-scope axis)
     created_at              DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 

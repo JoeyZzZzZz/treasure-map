@@ -20,22 +20,12 @@ from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import InstanceRow
 from treasure_map.lib.atlas.writer import add_instance, upsert_pattern
 from treasure_map.lib.query import explain_candidate
+from treasure_map.lib.query.triage import _CANONICAL_DIMENSION_NAMES
 
 _FID = [0]
 
 _WEAPON_WORDS = ("payload", "exploit", "send", "poc", "rce")  # checked as whole words
 _SELF_VERDICT = ("high-confidence vulnerability", "confirmed exploit", "confirmed vulnerability")
-
-_DIMENSION_NAMES = {
-    "controllability",
-    "source",
-    "source_writability",
-    "reachability",
-    "filtering",
-    "sink_impact",
-    "writer",
-    "completeness",
-}
 
 
 def _has_weapon_word(text: str) -> str | None:
@@ -100,7 +90,9 @@ def test_explanation_carries_all_dimension_layers(tmp_path: Path) -> None:
         conn.close()
     assert ex is not None
     names = {d.name for d in ex.dimensions}
-    assert names == _DIMENSION_NAMES  # all eight layers present (source = orthogonal param axis)
+    # ★ CI anchor (independent, hand-written): the canonical universe equals the ACTUAL
+    # assembly. A dropped/added _dim_* drifts this -> red. Single source of truth (no second list).
+    assert names == _CANONICAL_DIMENSION_NAMES  # all eight layers (source = orthogonal param axis)
     for d in ex.dimensions:  # each layer is an honest fact (likely = optimistic, structural = lead)
         assert d.state in {"proven", "likely", "structural", "excluded", "unknown"}
         assert d.value and d.source
@@ -203,7 +195,7 @@ def test_cli_explain_json_is_structured_without_payload(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     data = json.loads(result.output)
     assert data["evidence_ref"] == "run_x#fn7"
-    assert {d["name"] for d in data["dimensions"]} == _DIMENSION_NAMES
+    assert {d["name"] for d in data["dimensions"]} == _CANONICAL_DIMENSION_NAMES
     assert "score" not in data and "score_breakdown" not in data  # the collapsed score is gone
     assert "verify" in data and "claims_does_not" in data and "caveats" in data
     assert _has_weapon_word(json.dumps(data)) is None

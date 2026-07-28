@@ -28,6 +28,7 @@ from typing import Any
 from treasure_map.lib.analyze.elf_inventory import ElfRecord, has_substantial_text
 from treasure_map.lib.config.config import GhidraConfig
 from treasure_map.lib.errors import GhidraNotFoundError
+from treasure_map.version import UNKNOWN_VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +104,29 @@ def compute_pass_version(script_dir: Path) -> str:
         h.update(b"\0")
         h.update(body)
     return h.hexdigest()[:16]
+
+
+def detect_ghidra_version(headless: Path) -> str:
+    """The Ghidra version behind an ``analyzeHeadless`` path, or ``UNKNOWN_VERSION``.
+
+    Reads ``application.version`` out of ``<ghidra_home>/Ghidra/application.properties``, the
+    installation's own version declaration (``analyzeHeadless`` lives at
+    ``<ghidra_home>/support/analyzeHeadless``, so the home is its parent's parent).
+
+    Honesty red-line: a failure to detect returns the EXPLICIT ``UNKNOWN_VERSION`` string, never
+    None and never a guess. A recorded "unknown" is read downstream as "cannot confirm this run's
+    decompiler version", which is conservative; a None would let a version comparison short-circuit
+    into a silent "same version"."""
+    props = headless.parent.parent / "Ghidra" / "application.properties"
+    try:
+        text = props.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return UNKNOWN_VERSION
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key.strip() == "application.version":
+            return value.strip() or UNKNOWN_VERSION
+    return UNKNOWN_VERSION
 
 
 @dataclass
@@ -374,6 +398,12 @@ class GhidraRunner:
     def pass_version(self) -> str:
         """Content hash of the extraction pass this runner will execute (its script dir's .java)."""
         return compute_pass_version(self._script_dir)
+
+    def ghidra_version(self) -> str:
+        """Version of the Ghidra installation this runner will invoke (``UNKNOWN_VERSION`` when it
+        cannot be read). Stamped onto every binary this run analyzes, so a later cross-version diff
+        can tell "the decompiler changed" apart from "the firmware changed"."""
+        return detect_ghidra_version(self.get_headless())
 
     def run_ghidra(
         self,

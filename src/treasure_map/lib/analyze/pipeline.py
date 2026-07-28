@@ -94,6 +94,11 @@ async def run_analyze(
     # ExportFunctions re-extracts every binary automatically (no manual JSON/db deletion).
     pass_version = runner.pass_version()
 
+    # Version of the Ghidra that will actually produce this run's output ('unknown' when it cannot
+    # be read). Stamped per analyzed binary next to pass_version, so the recorded version is the one
+    # that DID the work — not whatever happens to be installed later when the run is hunted.
+    ghidra_version = runner.ghidra_version()
+
     records = scan_filesystem(fs_root, progress_callback=progress_callback)
 
     conn = open_db(workspace.db_path)
@@ -137,9 +142,9 @@ async def run_analyze(
                 # run leaves pass_version untouched (still stale/NULL) so it stays dirty next time.
                 if res.success:
                     conn.execute(
-                        "UPDATE binaries SET ghidra_ok=?, ghidra_status=?, pass_version=? "
-                        "WHERE sha256=?",
-                        (1, res.analysis_status, pass_version, rec.sha256),
+                        "UPDATE binaries SET ghidra_ok=?, ghidra_status=?, pass_version=?, "
+                        "ghidra_version=? WHERE sha256=?",
+                        (1, res.analysis_status, pass_version, ghidra_version, rec.sha256),
                     )
                 else:
                     conn.execute(

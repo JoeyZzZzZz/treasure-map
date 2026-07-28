@@ -715,3 +715,51 @@ def test_referencing_string_empty_text_is_rejected(tmp_path: Path) -> None:
     finally:
         conn.close()
     assert r["found"] is False
+
+
+# ── iron law 6: the per-run Ghidra-version rollup ──────
+
+
+def test_run_ghidra_version_rollup_is_the_never_null_sentinel(tmp_path: Path) -> None:
+    # ★ (LOAD-BEARING sentinel): _run_ghidra_version is the point that guarantees a run's
+    # recorded Ghidra version is ALWAYS a string, never None -- it is the sufficient sentinel behind
+    # "diff_meta.ghidra_version is never NULL". Population = binaries with usable output
+    # (ghidra_ok=1). A single consistent version rolls up to itself; a NULL among them, more than
+    # one distinct value, or an empty population all collapse to the explicit UNKNOWN_VERSION.
+    # ★ Teeth: mutating the final `return UNKNOWN_VERSION` to `return None` reddens the NULL / multi
+    # / empty cases below (they would become None, not the sentinel).
+    from treasure_map.version import UNKNOWN_VERSION
+
+    def rollup(name: str, rows: list[tuple[int, str | None]]) -> str:
+        db = tmp_path / f"{name}.db"
+        conn = open_db(db)
+        for i, (ok, ver) in enumerate(rows, start=1):
+            conn.execute(
+                "INSERT INTO binaries (id, name, path, sha256, ghidra_ok, ghidra_version, "
+                "last_seen_at) VALUES (?, ?, ?, ?, ?, ?, '2026-01-01')",
+                (i, f"b{i}", f"p{i}", f"{i:0>64}", ok, ver),
+            )
+        conn.commit()
+        conn.close()
+        ro = facts.open_analysis_ro(db)
+        try:
+            return facts._run_ghidra_version(ro)
+        finally:
+            ro.close()
+
+    # one consistent version across the usable population -> that version
+    assert rollup("one", [(1, "11.4.3"), (1, "11.4.3")]) == "11.4.3"
+    # a NULL among the usable rows (a binary produced before the column existed) -> unknown
+    assert rollup("null", [(1, "11.4.3"), (1, None)]) == UNKNOWN_VERSION
+    # more than one distinct version (a scan spanning two Ghidra installs) -> unknown
+    assert rollup("multi", [(1, "11.4.3"), (1, "11.5")]) == UNKNOWN_VERSION
+    # empty usable population (nothing with ghidra_ok=1) -> unknown, never None
+    assert rollup("empty", [(0, "11.4.3")]) == UNKNOWN_VERSION
+    # ★ the invariant every branch upholds: a str, never None (the teeth for "diff_meta never NULL")
+    for nm, rows in [
+        ("s1", [(1, "x")]),
+        ("s2", [(1, None)]),
+        ("s3", [(1, "a"), (1, "b")]),
+        ("s4", [(0, "x")]),
+    ]:
+        assert isinstance(rollup(nm, rows), str)
