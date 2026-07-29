@@ -126,7 +126,15 @@ def _ingest_one_binary(
     """Replace this binary's rows in functions/imports/exports/strings."""
 
     # DELETE existing rows for this binary_id (idempotent re-ingest)
-    for table in ("functions", "imports", "exports", "strings", "nvram_defaults", "string_tables"):
+    for table in (
+        "functions",
+        "imports",
+        "exports",
+        "strings",
+        "nvram_defaults",
+        "string_tables",
+        "detector_scan_status",
+    ):
         conn.execute(f"DELETE FROM {table} WHERE binary_id = ?", (binary_id,))
 
     # functions
@@ -302,3 +310,23 @@ def _ingest_one_binary(
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 st_rows,
             )
+        # ★ honest 0-row status: write ONE detector_scan_status row EVERY ingest (NOT gated by
+        # st_rows). At zero tables an empty result would otherwise read as "confirmed none"; this
+        # row records scanned=1 + scope + cap_hit so a consumer tells genuine-none from
+        # unsupported-form or capped. found_count is the number of TABLES (not entries).
+        found_tables = sum(1 for t in string_tables.get("tables", []) if isinstance(t, dict))
+        conn.execute(
+            "INSERT INTO detector_scan_status "
+            "(binary_id, detector, scanned, supported_scope, unsupported_note, cap_hit, "
+            "found_count) VALUES (?, 'string_tables', 1, ?, ?, ?, ?)",
+            (binary_id, c_scope, c_reason, 1 if comp.get("cap_hit") else 0, found_tables),
+        )
+    else:
+        # No detector object in the payload (an export predating detector A). Do NOT claim a scan
+        # that did not happen: record scanned=0 so the consumer sees "no status recorded", never a
+        # confident negative.
+        conn.execute(
+            "INSERT INTO detector_scan_status (binary_id, detector, scanned) "
+            "VALUES (?, 'string_tables', 0)",
+            (binary_id,),
+        )

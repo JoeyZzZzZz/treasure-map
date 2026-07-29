@@ -262,6 +262,25 @@ CREATE INDEX IF NOT EXISTS idx_ske_run    ON string_keyed_edge(source_run_id);
 CREATE INDEX IF NOT EXISTS idx_ske_callee ON string_keyed_edge(callee_name);
 CREATE INDEX IF NOT EXISTS idx_ske_from   ON string_keyed_edge(from_function);
 
+-- detector_scan_status: the hunt-flattened per-(run, binary, detector) honesty status of a
+-- table-form detector, crossing the analysis.db -> atlas boundary alongside string_keyed_edge so
+-- the consumer query (which reads ATLAS, not analysis.db) can attach it to an EMPTY result. Without
+-- this an empty static-table result reads as a confident "none" and conflates genuine-none from
+-- unsupported-form / capped. Replace-by-run at hunt time (one row per run,binary,detector).
+CREATE TABLE IF NOT EXISTS detector_scan_status (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_run_id    TEXT,
+    binary           TEXT,             -- short name, matching string_keyed_edge.binary
+    detector         TEXT,             -- 'string_tables'
+    scanned          INTEGER NOT NULL DEFAULT 0,
+    supported_scope  TEXT,
+    unsupported_note TEXT,
+    cap_hit          INTEGER NOT NULL DEFAULT 0,
+    found_count      INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_detstat_run    ON detector_scan_status(source_run_id);
+CREATE INDEX IF NOT EXISTS idx_detstat_binary ON detector_scan_status(binary);
+
 -- run_capability: a per-run capability registry — the deterministic fact that a given tmap version's
 -- scan/hunt produced a given analysis sub-dimension. present=1 is registered UNCONDITIONALLY when the
 -- detector code runs (absence-of-findings ≠ absence-of-capability), so a cross-version diff iterates

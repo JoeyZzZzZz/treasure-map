@@ -12,6 +12,7 @@ import sqlite3
 from dataclasses import dataclass
 
 from treasure_map.lib.atlas.models import (
+    DetectorScanStatusRow,
     DiffMetaRow,
     DimensionCapabilityStateRow,
     DimensionDeltaRow,
@@ -143,6 +144,53 @@ def add_string_keyed_edges(
                 r.completeness_status,
                 r.completeness_reason,
                 r.completeness_scope,
+            )
+            for r in rows
+        ],
+    )
+    if commit:
+        conn.commit()
+    return len(rows)
+
+
+def delete_run_detector_status(
+    conn: sqlite3.Connection, source_run_id: str, *, commit: bool = True
+) -> int:
+    """Delete all detector_scan_status rows of one run (replace-by-run); return rows deleted.
+
+    Touches ONLY this run_id's rows. commit=False joins the caller's txn so the status flatten is
+    atomic with the run's edge write."""
+    cur = conn.execute("DELETE FROM detector_scan_status WHERE source_run_id = ?", (source_run_id,))
+    if commit:
+        conn.commit()
+    return cur.rowcount
+
+
+def add_detector_status(
+    conn: sqlite3.Connection, rows: list[DetectorScanStatusRow], *, commit: bool = True
+) -> int:
+    """Insert flattened detector_scan_status rows (one per run,binary,detector); return the count.
+
+    The per-binary honesty status of a table-form detector, crossing to atlas so an empty query
+    result carries it. Written EVEN AT zero edges (a scanned-but-found-nothing binary must be
+    visible). commit=False lets the caller batch delete+insert into one txn."""
+    if not rows:
+        return 0
+    conn.executemany(
+        """INSERT INTO detector_scan_status
+           (source_run_id, binary, detector, scanned, supported_scope, unsupported_note,
+            cap_hit, found_count)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        [
+            (
+                r.source_run_id,
+                r.binary,
+                r.detector,
+                r.scanned,
+                r.supported_scope,
+                r.unsupported_note,
+                r.cap_hit,
+                r.found_count,
             )
             for r in rows
         ],

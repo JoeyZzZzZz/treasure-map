@@ -2718,3 +2718,102 @@ def test_a2_sources_are_boundary_clean() -> None:
         # surfaces.
         if path.name not in exploit_exempt and path.name != _ATLAS_SCHEMA.name:
             assert not stray_exploit.search(text), f"stray 'exploit' framing in {path.name}"
+
+
+# ── honest 0-row status for the static string-table detector (L4 flatten + L5 query attach) ──
+
+
+def test_flatten_detector_status_reads_analysis_db(tmp_path: Path) -> None:
+    # L4: _flatten_detector_status reads analysis.db detector_scan_status -> per-run atlas rows
+    # (binary name joined in), so the status can cross to atlas alongside the edges.
+    from treasure_map.lib.hunt.analyzer2 import _flatten_detector_status
+
+    db = tmp_path / "a.db"
+    conn = open_db(db)
+    conn.execute("INSERT INTO binaries (id, name, sha256) VALUES (1, 'httpd', ?)", ("a" * 64,))
+    conn.execute(
+        "INSERT INTO detector_scan_status (binary_id, detector, scanned, supported_scope, "
+        "unsupported_note, cap_hit, found_count) "
+        "VALUES (1, 'string_tables', 1, 'absolute_2field_only', 'reason', 1, 0)"
+    )
+    conn.commit()
+    conn.close()
+    (r,) = _flatten_detector_status(db, "run1")
+    assert (r.source_run_id, r.binary, r.detector, r.scanned, r.cap_hit, r.found_count) == (
+        "run1",
+        "httpd",
+        "string_tables",
+        1,
+        1,
+        0,
+    )
+
+
+def test_flatten_detector_status_missing_table_is_empty(tmp_path: Path) -> None:
+    # a pre-feature analysis.db (no detector_scan_status table) -> [] (query reports 'no status').
+    from treasure_map.lib.hunt.analyzer2 import _flatten_detector_status
+
+    db = tmp_path / "old.db"
+    raw = sqlite3.connect(db)
+    raw.execute("CREATE TABLE binaries (id INTEGER PRIMARY KEY, name TEXT)")
+    raw.commit()
+    raw.close()
+    assert _flatten_detector_status(db, "run1") == []
+
+
+def _seed_status(atlas: sqlite3.Connection, *, cap_hit: int = 0) -> None:
+    from treasure_map.lib.atlas.models import DetectorScanStatusRow
+    from treasure_map.lib.atlas.writer import add_detector_status
+
+    add_detector_status(
+        atlas,
+        [
+            DetectorScanStatusRow(
+                source_run_id="run1",
+                binary="httpd",
+                detector="string_tables",
+                scanned=1,
+                supported_scope="absolute_2field_only",
+                unsupported_note="reason",
+                cap_hit=cap_hit,
+                found_count=0,
+            )
+        ],
+    )
+
+
+def test_empty_edges_result_carries_static_table_status(tmp_path: Path) -> None:
+    # ★ L5: an EMPTY string_keyed_edge result carries the static-table status so it is NOT read as a
+    # confident 'none' -- scanned=1, cap_hit=0, scope travel WITH the (empty) result.
+    from treasure_map.lib.query.string_edges import get_string_keyed_edges
+
+    atlas = open_atlas(tmp_path / "atlas.db")
+    _seed_status(atlas)
+    res = get_string_keyed_edges(atlas, binary="httpd")
+    assert res["edges"] == []
+    st = res["static_string_table_status"]
+    assert st["mechanism_scope"] == "static_string_table"  # ★ scoped: NOT strcmp_gate / detector B
+    (s,) = st["statuses"]
+    assert (s["scanned"], s["cap_hit"], s["supported_scope"]) == (1, False, "absolute_2field_only")
+    atlas.close()
+
+
+def test_static_table_status_cap_hit_surfaces_to_consumer(tmp_path: Path) -> None:
+    # ★ situation 3 end-to-end at the query: a capped scan surfaces cap_hit=True on the empty res.
+    from treasure_map.lib.query.string_edges import get_string_keyed_edges
+
+    atlas = open_atlas(tmp_path / "atlas.db")
+    _seed_status(atlas, cap_hit=1)
+    (s,) = get_string_keyed_edges(atlas, binary="httpd")["static_string_table_status"]["statuses"]
+    assert s["cap_hit"] is True
+    atlas.close()
+
+
+def test_static_table_status_no_row_is_unknown_not_none(tmp_path: Path) -> None:
+    # no status row for this binary -> empty statuses + an UNKNOWN note (never a confident 'none').
+    from treasure_map.lib.query.string_edges import get_string_keyed_edges
+
+    atlas = open_atlas(tmp_path / "atlas.db")
+    st = get_string_keyed_edges(atlas, binary="nobody")["static_string_table_status"]
+    assert st["statuses"] == [] and "UNKNOWN" in st["note"]
+    atlas.close()

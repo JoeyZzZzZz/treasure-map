@@ -202,6 +202,25 @@ class StringKeyedEdgeRow:
 
 
 @dataclass(frozen=True)
+class DetectorScanStatusRow:
+    """Mirrors one atlas detector_scan_status row: the hunt-flattened honesty status of a table-form
+    detector for one (run, binary). ``scanned`` = the detector ran; ``supported_scope`` = the
+    form(s) it checks; ``cap_hit`` = a probe/entry cap truncated the walk; ``found_count`` = tables
+    found. It lets an EMPTY string_keyed_edge result carry its own honesty (genuine-none vs
+    unsupported-form vs capped) instead of reading as a confident false negative."""
+
+    source_run_id: str | None
+    binary: str | None
+    detector: str
+    scanned: int = 0
+    supported_scope: str | None = None
+    unsupported_note: str | None = None
+    cap_hit: int = 0
+    found_count: int = 0
+    id: int | None = None
+
+
+@dataclass(frozen=True)
 class RunCapabilityRow:
     """Mirrors one run_capability row: the deterministic fact that a run produced a given analysis
     sub-dimension (e.g. 'reachability.string_keyed_edge'). present=1 is registered UNCONDITIONALLY

@@ -760,12 +760,14 @@ public class ExportFunctions extends GhidraScript {
         StringBuilder tables = new StringBuilder("[");
         boolean firstT = true;
         long probes = 0;
+        boolean capHit = false;   // a probe/entry cap truncated the walk (situation 3: a supported
+                                  //   table beyond the cap is dropped and must NOT read as clean 0)
         for (MemoryBlock blk : mem.getBlocks()) {
             if (!blk.isInitialized() || blk.isExecute()) continue;   // data only, never code
             Address end = blk.getEnd();
             Address a = blk.getStart();
             while (a != null && end.subtract(a) >= stride - 1) {
-                if (probes++ > STRTBL_MAX_PROBES) { a = null; break; }
+                if (probes++ > STRTBL_MAX_PROBES) { capHit = true; a = null; break; }
                 String[] rec = tableRecord(a, ps, mem, fm);
                 if (rec == null) { a = safeAdd(a, ps); continue; }
                 // A record resolved: greedily extend the run at this stride until one fails.
@@ -778,6 +780,13 @@ public class ExportFunctions extends GhidraScript {
                     if (r2 == null) break;
                     entries.add(r2);
                     b = safeAdd(b, stride);
+                }
+                // Entry-cap truncation: the run stopped at STRTBL_MAX_ENTRIES while the next slot
+                // would still have resolved -> a real table was cut short (situation 3), not a
+                // natural end. One extra probe distinguishes "cut" from "exactly this many".
+                if (entries.size() >= STRTBL_MAX_ENTRIES && b != null
+                        && end.subtract(b) >= stride - 1 && tableRecord(b, ps, mem, fm) != null) {
+                    capHit = true;
                 }
                 if (entries.size() >= STRTBL_MIN_RUN) {
                     if (!firstT) tables.append(",");
@@ -805,7 +814,7 @@ public class ExportFunctions extends GhidraScript {
         // a cross-version table delta in an unhandled form reads as undetermined, not a real change.
         return "{\"tables\":" + tables + ",\"completeness\":{\"status\":\"incomplete\",\"reason\":"
              + "\"got_relative_and_three_field_and_mips_not_detected\",\"scope\":"
-             + "\"absolute_2field_only\"}}";
+             + "\"absolute_2field_only\",\"cap_hit\":" + capHit + "}}";
     }
 
     // One {string_ptr, func_ptr} record at address a -> {key, func_name, func_addr, func_kind}, or

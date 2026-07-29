@@ -31,6 +31,7 @@ from typing import Any
 from treasure_map.lib import facts
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import (
+    DetectorScanStatusRow,
     InstanceRow,
     NvramDefaultRow,
     NvramFlowRow,
@@ -39,6 +40,7 @@ from treasure_map.lib.atlas.models import (
     WebFormFieldRow,
 )
 from treasure_map.lib.atlas.writer import (
+    add_detector_status,
     add_instance,
     add_nvram_default_rows,
     add_nvram_flow_rows,
@@ -47,6 +49,7 @@ from treasure_map.lib.atlas.writer import (
     add_web_form_field_rows,
     begin_run,
     delete_run_capabilities,
+    delete_run_detector_status,
     delete_run_instances,
     delete_run_nvram_defaults,
     delete_run_nvram_flow,
@@ -501,6 +504,42 @@ def _flatten_string_tables(db_path: Path | str, source_run_id: str) -> list[Stri
     return out
 
 
+def _flatten_detector_status(
+    db_path: Path | str, source_run_id: str
+) -> list[DetectorScanStatusRow]:
+    """Flatten analysis.db detector_scan_status into per-(run, binary, detector) atlas rows.
+
+    Crosses the analysis.db -> atlas boundary alongside the edge facts, so the consumer query (which
+    reads ATLAS) can attach a detector's honesty status to an EMPTY string_keyed_edge result. A
+    missing table (older analysis.db, not re-scanned) yields no rows -- the query then reports 'no
+    status recorded', never a confident negative."""
+    uri = f"file:{Path(db_path)}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        rows = conn.execute(
+            "SELECT d.detector, d.scanned, d.supported_scope, d.unsupported_note, d.cap_hit, "
+            "d.found_count, b.name AS binary "
+            "FROM detector_scan_status d LEFT JOIN binaries b ON b.id = d.binary_id"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []  # pre-feature analysis.db -> no status (query reports 'no status recorded')
+    finally:
+        conn.close()
+    return [
+        DetectorScanStatusRow(
+            source_run_id=source_run_id,
+            binary=r[6],
+            detector=r[0] if isinstance(r[0], str) else "string_tables",
+            scanned=int(r[1]) if r[1] is not None else 0,
+            supported_scope=r[2] if isinstance(r[2], str) else None,
+            unsupported_note=r[3] if isinstance(r[3], str) else None,
+            cap_hit=int(r[4]) if r[4] is not None else 0,
+            found_count=int(r[5]) if r[5] is not None else 0,
+        )
+        for r in rows
+    ]
+
+
 def _one_hop_edge_leads(
     all_funcs: list[FuncRow],
     edge_rows: list[StringKeyedEdgeRow],
@@ -795,6 +834,9 @@ def run_analyzer2(
     # detector A: static {string -> funcptr} dispatch tables land in the SAME atlas edge table
     # (mechanism='static_string_table'), so both detectors share one query + MCP surface + cap key.
     string_keyed_edge_rows += _flatten_string_tables(db_path, source_run_id)
+    # detector A honesty status (per binary): flattened into atlas alongside the edges so an EMPTY
+    # result carries "scanned / scope / cap_hit" instead of reading as a confident "none".
+    detector_status_rows = _flatten_detector_status(db_path, source_run_id)
     # ONE-HOP string-key leads: which candidates sit one direct call below an edge callee. Computed
     # here because the call graph lives in the analysis DB (the atlas holds no callgraph), and rides
     # to the reachability layer on flow_evidence — the same compute-at-hunt/read-at-triage path as
@@ -859,6 +901,10 @@ def run_analyzer2(
             # same txn (replace-by-run). The capability is registered even with zero edges.
             delete_run_string_keyed_edges(atlas, source_run_id, commit=False)
             add_string_keyed_edges(atlas, string_keyed_edge_rows, commit=False)
+            # detector A honesty status: refresh in the SAME txn (replace-by-run). Written even at
+            # zero tables so an empty edge result can attach it — the whole reason this exists.
+            delete_run_detector_status(atlas, source_run_id, commit=False)
+            add_detector_status(atlas, detector_status_rows, commit=False)
             delete_run_capabilities(atlas, source_run_id, commit=False)
             add_run_capabilities(atlas, capability_rows, commit=False)
             for match in result.matches:

@@ -261,6 +261,86 @@ def test_ingest_parses_string_tables(tmp_path: Path) -> None:
     ).fetchone()
     assert st[0] == "incomplete"
     assert st[1] == "absolute_2field_only"
+
+
+def _ingest_string_tables(tmp_path: Path, st: object):  # type: ignore[no-untyped-def]
+    """Ingest a payload whose string_tables value is ``st`` (a dict, or omit by passing None) and
+    return the detector_scan_status rows for the binary."""
+    conn, sha_to_id = _setup_db(tmp_path)
+    output_dir = tmp_path / "ghidra_output"
+    data: dict[str, object] = {"functions": [], "imports": [], "exports": [], "strings": []}
+    if st is not None:
+        data["string_tables"] = st
+    _write_ghidra_json(output_dir, "test_bin", "a" * 64, data)
+    ingest_ghidra_output(conn, output_dir, [_make_record("test_bin", "a" * 64)], sha_to_id)
+    return conn.execute(
+        "SELECT detector, scanned, supported_scope, unsupported_note, cap_hit, found_count "
+        "FROM detector_scan_status"
+    ).fetchall()
+
+
+_COMP = {
+    "status": "incomplete",
+    "reason": "got_relative_and_three_field_and_mips_not_detected",
+    "scope": "absolute_2field_only",
+    "cap_hit": False,
+}
+
+
+def test_detector_status_written_even_at_zero_tables(tmp_path: Path) -> None:
+    # ★ the whole point: at ZERO tables a detector_scan_status row is STILL written (scanned=1), so
+    # an empty result is not read as a confident "none". The `if st_rows:` guard must not gate it.
+    (row,) = _ingest_string_tables(tmp_path, {"tables": [], "completeness": _COMP})
+    assert tuple(row) == ("string_tables", 1, "absolute_2field_only", _COMP["reason"], 0, 0)
+
+
+def test_detector_status_cap_hit_propagates(tmp_path: Path) -> None:
+    # ★ situation 3: a cap-truncated scan (cap_hit=true from the extractor) is recorded as cap_hit=1
+    # -- a truncated walk never reads as a clean 0.
+    (row,) = _ingest_string_tables(
+        tmp_path, {"tables": [], "completeness": {**_COMP, "cap_hit": True}}
+    )
+    assert row[4] == 1  # cap_hit
+
+
+def test_detector_status_found_count_is_tables_not_entries(tmp_path: Path) -> None:
+    # found_count counts TABLES (1 here), not entries (2) -- a distinct honest count.
+    table = {
+        "table_addr": "0x1000",
+        "stride": 8,
+        "count": 2,
+        "entries": [{"key": "a"}, {"key": "b"}],
+    }
+    (row,) = _ingest_string_tables(tmp_path, {"tables": [table], "completeness": _COMP})
+    assert row[1] == 1 and row[5] == 1  # scanned=1, found_count=1 (one table)
+
+
+def test_detector_status_absent_payload_is_scanned_zero(tmp_path: Path) -> None:
+    # ★ old export with no detector object: record scanned=0 -- never claim a scan that did not run.
+    (row,) = _ingest_string_tables(tmp_path, None)
+    assert row[0] == "string_tables" and row[1] == 0  # scanned=0
+
+
+def test_detector_status_idempotent_reingest_one_row(tmp_path: Path) -> None:
+    # wipe-and-rebuild: re-ingesting the same binary leaves exactly one status row (DELETE loop).
+    conn, sha_to_id = _setup_db(tmp_path)
+    output_dir = tmp_path / "ghidra_output"
+    _write_ghidra_json(
+        output_dir,
+        "test_bin",
+        "a" * 64,
+        {
+            "functions": [],
+            "imports": [],
+            "exports": [],
+            "strings": [],
+            "string_tables": {"tables": [], "completeness": _COMP},
+        },
+    )
+    rec = [_make_record("test_bin", "a" * 64)]
+    ingest_ghidra_output(conn, output_dir, rec, sha_to_id)
+    ingest_ghidra_output(conn, output_dir, rec, sha_to_id)  # re-ingest
+    assert conn.execute("SELECT COUNT(*) FROM detector_scan_status").fetchone()[0] == 1
     conn.close()
 
 

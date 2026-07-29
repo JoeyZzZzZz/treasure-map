@@ -177,6 +177,25 @@ CREATE TABLE IF NOT EXISTS string_tables (
     FOREIGN KEY(binary_id) REFERENCES binaries(id) ON DELETE CASCADE
 );
 
+-- detector_scan_status: ONE row per (binary, detector) written on EVERY analyze — even at 0 tables.
+-- This is the honesty fix for the static string-table detector: at zero rows string_tables carries
+-- nothing, so an empty result reads as "confirmed none" and conflates (a) genuinely none of the
+-- SUPPORTED form, (b) a table present in an unsupported form, (c) a scan truncated by a cap. This
+-- row lets a consumer tell those apart: scanned=1 + supported_scope + cap_hit make an empty result
+-- carry its own honesty instead of a silent false negative.
+CREATE TABLE IF NOT EXISTS detector_scan_status (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    binary_id        INTEGER NOT NULL,
+    detector         TEXT    NOT NULL,   -- 'string_tables' (room for future table-form detectors)
+    scanned          INTEGER NOT NULL DEFAULT 0,  -- 1 = the detector ran on this binary
+    supported_scope  TEXT,              -- form(s) checked, e.g. 'absolute_2field_only'
+    unsupported_note TEXT,              -- forms NOT checked (the detector's fixed reason string)
+    cap_hit          INTEGER NOT NULL DEFAULT 0,  -- 1 = a probe/entry cap truncated the scan
+    found_count      INTEGER NOT NULL DEFAULT 0,  -- number of tables found
+    FOREIGN KEY(binary_id) REFERENCES binaries(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_detscan_binary ON detector_scan_status(binary_id);
+
 -- 非二进制文件主表 (Round C framework; WIPE-AND-REBUILD each analyze run)
 -- sha256 = cross-firmware identity key for the knowledge base. Indexed,
 -- intentionally NOT unique (a file + its copy at another path are two findings).
