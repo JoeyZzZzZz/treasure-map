@@ -25,7 +25,7 @@ dependencies = [
     # The AI-facing MCP server is the substrate's primary consumer entry point, not an add-on:
     # `tmap mcp` must connect out of the box on any install, so its SDK is a core dependency
     # (imported at module top level like every other core dep, never behind an extra).
-    "mcp>=1.0",
+    "mcp>=1.0,<2",  # 2.0 removed mcp.server.fastmcp (used by mcp_app); pin until we migrate the API
 ]
 
 [project.optional-dependencies]
