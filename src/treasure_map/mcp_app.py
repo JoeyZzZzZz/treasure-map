@@ -477,24 +477,27 @@ def make_tools(
 
     def _incomplete_for_run(
         atlas: sqlite3.Connection, run_id: str | None
-    ) -> tuple[list[str], list[dict[str, Any]]]:
-        """The analysis-completeness red-lines for a SINGLE resolved run (they are a per-scan fact).
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        """The analysis-completeness red-lines for a SINGLE resolved run (they are a per-scan fact):
+        incomplete binaries, partially-incomplete binaries, and folded high-fan-out xref symbols
+        (whose constrained L0 edges are visible here, never silently dropped).
 
         Computed only when list_candidates is scoped to one resolvable run; empty across an all-runs
         listing (the red-line is per firmware, not a single value over a shared atlas)."""
         if run_id is None:
-            return [], []
+            return [], [], []
         run = _get_run(atlas, run_id)
         if run is None:
-            return [], []
+            return [], [], []
         db = _resolve_db(atlas, run)
         if isinstance(db, dict):
-            return [], []
+            return [], [], []
         conn = facts.open_analysis_ro(db)
         try:
             return (
                 facts.list_incomplete_binaries(conn),
                 facts.list_partially_incomplete_binaries(conn),
+                facts.list_folded_xref_symbols(conn),
             )
         finally:
             conn.close()
@@ -565,7 +568,7 @@ def make_tools(
             # silently isolate to the wrong scan) is gone; each row carries its own ``run``.
             ranked = _triage(atlas, run_id=run_id)
             runs_in_atlas = [r.run_id for r in _list_runs(atlas)]
-            incomplete, partially_incomplete = _incomplete_for_run(atlas, run_id)
+            incomplete, partially_incomplete, folded_xref = _incomplete_for_run(atlas, run_id)
         finally:
             atlas.close()
         ranked = _filter_candidates(ranked, sink=sink, status=status, include_gated=include_gated)
@@ -655,6 +658,10 @@ def make_tools(
             # run (empty across an all-runs listing — the red-line is per firmware, not one value).
             "incomplete_binaries": incomplete,
             "partially_incomplete_binaries": partially_incomplete,
+            # ★ Red-line (scaling): high-fan-out L0 symbols whose constrained edges were NOT
+            # materialized -- visible with per-symbol counts so a suppressed edge is a known
+            # decision, never a silent drop. Empty unless scoped to one resolvable run.
+            "folded_xref_symbols": folded_xref,
             # ``corpus`` is the INVARIANT candidate total — a --filter float never changes it. Under
             # an --only sweep, ``total`` is the (smaller) pruned view; ``corpus`` still shows the
             # whole set so "no match" is never read as "absent".

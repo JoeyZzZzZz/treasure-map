@@ -6,7 +6,10 @@ functions / imports / exports / strings tables.
 Designed to align with Round 2 partial invalidation:
 - Only ingests JSON files for the `dirty_records` set
 - Per-binary DELETE-then-INSERT (destructive, idempotent within a run)
-- Skips gracefully when JSON file missing (binary failed Ghidra) or malformed
+- Skips gracefully when JSON file missing (binary failed Ghidra) or malformed. Such a binary is
+  NOT lost by this skip: the pipeline already recorded it as ``ghidra_status='failed'`` with a
+  ``ghidra_status_reason``, and it surfaces via ``facts.list_incomplete_binaries`` (MCP
+  ``incomplete_binaries``). This skip is a tolerant fallback, not the only signal.
 """
 
 from __future__ import annotations

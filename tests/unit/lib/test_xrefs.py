@@ -4,14 +4,19 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
+from treasure_map.lib import facts
+from treasure_map.lib.analyze import xrefs as xrefs_mod
 from treasure_map.lib.analyze.xrefs import (
+    DEFAULT_FOLD_EDGE_THRESHOLD,
     build_xrefs,
     categorize_string,
     is_useful_ipc_string,
 )
+from treasure_map.lib.config.config import Config
 from treasure_map.lib.storage.connection import open_db
 
 # ── String classification ─────────────────────────────────────────────────────
@@ -347,4 +352,114 @@ def test_build_xrefs_empty_db(tmp_path: Path) -> None:
     stats = build_xrefs(conn)
     assert stats.total_xrefs == 0
     assert stats.strings_classified == 0
+    conn.close()
+
+
+# ── large-firmware scaling: batch flush + L0 high-fan-out fold ────────────────
+
+
+def _fanout_db(tmp_path: Path, *, exporters: int, callers: int, symbol: str = "gensym"):  # type: ignore[no-untyped-def]
+    """An 'app' binary with `callers` functions all calling `symbol`, plus `exporters` library
+    binaries each exporting `symbol` (with a concrete function body). Edge contribution for the
+    symbol = callers × exporters; none are intra-binary (callers live in 'app', not an exporter)."""
+    conn = open_db(tmp_path / "analysis.db")
+    conn.execute(
+        "INSERT INTO binaries (id, name, sha256, dt_needed) VALUES (1, 'app', ?, '[]')", ("1" * 64,)
+    )
+    conn.executemany(
+        "INSERT INTO functions (id, binary_id, name, callees) VALUES (?, 1, ?, ?)",
+        [(1000 + i, f"caller_{i}", json.dumps([symbol])) for i in range(callers)],
+    )
+    for b in range(exporters):
+        bid = 100 + b
+        conn.execute(
+            "INSERT INTO binaries (id, name, sha256, dt_needed) VALUES (?, ?, ?, '[]')",
+            (bid, f"lib{b}.so", f"{b:064d}"),
+        )
+        conn.execute(
+            "INSERT INTO functions (id, binary_id, name, callees) VALUES (?, ?, ?, '[]')",
+            (5000 + b, bid, symbol),
+        )
+        conn.execute(
+            "INSERT INTO exports (binary_id, func_name, address) VALUES (?, ?, ?)",
+            (bid, symbol, f"{b:08x}"),
+        )
+    conn.commit()
+    return conn
+
+
+def _l0_edges(conn: sqlite3.Connection) -> int:
+    return conn.execute("SELECT COUNT(*) FROM xrefs WHERE xref_type='callees_exports'").fetchone()[
+        0
+    ]
+
+
+def test_batch_flush_loses_no_edges_and_no_dups(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    # ★ batch flush changes WHEN edges are written, never WHAT: with a tiny batch the whole set is
+    # still present exactly once. Reddens if _flush forgets to clear pending (dups) or clears with
+    # no insert (losses). 8 exporters × 5 callers = 40 edges; batch of 3 forces many mid-flushes.
+    monkeypatch.setattr(xrefs_mod, "XREF_FLUSH_BATCH", 3)
+    conn = _fanout_db(tmp_path, exporters=8, callers=5)
+    stats = build_xrefs(conn, fold_edge_threshold=10_000)  # high -> no fold, pure batch test
+    assert stats.layer0_callees_exports == 40
+    assert _l0_edges(conn) == 40  # every edge present exactly once (no loss, no duplicate row)
+    conn.close()
+
+
+def test_high_fanout_symbol_is_folded_into_ledger(tmp_path: Path) -> None:
+    # ★ a generic symbol above the edge-contribution threshold AND the exporter floor is FOLDED: its
+    # edges are NOT in xrefs, and it is recorded in xref_folded_symbols (never silently dropped).
+    conn = _fanout_db(tmp_path, exporters=16, callers=5)  # contribution 80, exporters 16 >= floor
+    stats = build_xrefs(conn, fold_edge_threshold=50)
+    assert stats.layer0_callees_exports == 0  # no per-edge rows materialized for the folded symbol
+    assert _l0_edges(conn) == 0
+    assert stats.layer0_folded_symbols == 1 and stats.layer0_folded_edges == 80  # 5 × 16
+    (row,) = conn.execute(
+        "SELECT symbol, exporters, callers, folded_edges FROM xref_folded_symbols"
+    ).fetchall()
+    assert tuple(row) == ("gensym", 16, 5, 80)
+    # ★ visible via the same facts reader the MCP surfaces (not a silent drop)
+    got = facts.list_folded_xref_symbols(conn)
+    assert got == [{"symbol": "gensym", "exporters": 16, "callers": 5, "folded_edges": 80}]
+    conn.close()
+
+
+def test_exporter_floor_protects_low_ambiguity_symbol(tmp_path: Path) -> None:
+    # ★ the floor: a symbol with FEW exporters is never folded no matter how high its edge count --
+    # each edge points at a near-unique target (high value). 8 exporters (< floor 16), threshold 10
+    # (so contribution 40 > 10) -> still NOT folded; the 40 edges are materialized.
+    conn = _fanout_db(tmp_path, exporters=8, callers=5)
+    stats = build_xrefs(conn, fold_edge_threshold=10)
+    assert stats.layer0_folded_symbols == 0  # floor blocked the fold
+    assert stats.layer0_callees_exports == 40 and _l0_edges(conn) == 40
+    assert facts.list_folded_xref_symbols(conn) == []
+    conn.close()
+
+
+def test_below_threshold_symbol_is_not_folded(tmp_path: Path) -> None:
+    # a genuinely low-contribution symbol (16 exporters but 1 caller -> 16 edges) stays under a
+    # threshold and is fully materialized -- folding only touches the real bombs.
+    conn = _fanout_db(tmp_path, exporters=16, callers=1)
+    stats = build_xrefs(conn, fold_edge_threshold=25_000)
+    assert stats.layer0_folded_symbols == 0
+    assert stats.layer0_callees_exports == 16
+    conn.close()
+
+
+def test_config_fold_threshold_stays_in_sync_with_xrefs_default() -> None:
+    # ★ single source of truth without an import inversion: the config default and the xrefs module
+    # default MUST match (pipeline passes the config value into build_xrefs). Drift -> red.
+    assert Config().xref_fold_edge_threshold == DEFAULT_FOLD_EDGE_THRESHOLD
+
+
+def test_l0_emits_periodic_progress_log(tmp_path: Path, monkeypatch, caplog) -> None:  # type: ignore[no-untyped-def]
+    # ★ Fix ③: a long L0 pass logs periodic progress so it is visibly RUNNING, not hung (the owner
+    # should not need py-spy to tell). Threshold shrunk so a small fixture crosses it.
+    import logging
+
+    monkeypatch.setattr(xrefs_mod, "_L0_PROGRESS_EVERY", 2)
+    conn = _fanout_db(tmp_path, exporters=2, callers=5)  # 5 caller funcs -> crosses 2 twice
+    with caplog.at_level(logging.INFO, logger="treasure_map.lib.analyze.xrefs"):
+        build_xrefs(conn, fold_edge_threshold=10_000)  # high -> no fold, pure progress test
+    assert any("xrefs L0:" in r.getMessage() for r in caplog.records)
     conn.close()

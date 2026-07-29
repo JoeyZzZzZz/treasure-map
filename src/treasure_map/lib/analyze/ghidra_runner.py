@@ -144,6 +144,31 @@ class GhidraResult:
     # OR code present but 0 functions decompiled. ``success`` is True for ok / ok_empty only.
     analysis_status: str = "failed"
     function_count: int = 0  # functions in the output JSON (0 for ok_empty / failed)
+    # WHY a failed run failed, so a consumer distinguishes a recoverable timeout (re-scan may finish
+    # it) from a structural failure. None on success. One of: 'timeout' / 'import_failed' /
+    # 'no_output' / 'incomplete'. Recorded onto binaries.ghidra_status_reason for the incomplete
+    # surfacing -- degrade must be visible AND explicable, not just a flat 'failed'.
+    reason: str | None = None
+
+
+# ★ A binary that cannot finish within this even on an isolated retry is a genuine hang, not a
+# needs-more-time case — the dynamic timeout never runs a single binary unbounded.
+_TIMEOUT_CEILING_SECONDS = 1800  # 30 min
+
+
+def _dynamic_timeout(binary: Path, base: int) -> int:
+    """A per-binary analysis timeout scaled by file size, replacing the flat one-size-fits-all.
+
+    A small binary uses ``base``; a large one (whose analysis+export budget genuinely needs more)
+    gets proportionally more time, capped at the ceiling. This is why a 28M library no longer times
+    out under a budget sized for a 200K one — and why a truly hung binary still cannot run forever.
+    """
+    try:
+        size_mb = binary.stat().st_size / 1024 / 1024
+    except OSError:
+        return base
+    scaled = base if size_mb < 10 else int(base * (size_mb / 10))
+    return min(_TIMEOUT_CEILING_SECONDS, max(base, scaled))
 
 
 def find_headless(config: GhidraConfig) -> Path:
@@ -412,17 +437,20 @@ class GhidraRunner:
         timeout: int,
         arch: str,
         sha8: str = "",
+        retry: bool = True,
     ) -> GhidraResult:
         """Run analyzeHeadless on a single binary with at most one retry.
 
-        A failed first attempt is retried exactly once at 2× the original timeout:
         - 'Import failed'  -> patch the problematic ELF sections (Ghidra 11.1.2
           StringIndexOutOfBoundsException on GNU notes / ARM attributes) and re-run the patched
-          copy.
+          copy. This deterministic recovery ALWAYS runs (it is cheap and not CPU-bound).
         - any other failure (chiefly a per-file timeout on a large binary) -> re-run the ORIGINAL
-          binary with the doubled budget, no patch.
-        A retry that still fails returns success=False — a real failure is reported honestly, never
-        frozen as a fake 'ok'.
+          binary with a doubled budget (capped at the ceiling), ONLY when ``retry`` is True.
+
+        ★ ``retry`` gates the TIMEOUT retry so ``run_all`` can defer it: phase 1 runs every binary
+        once IN PARALLEL (retry=False), phase 2 re-runs the failures SERIALLY (retry=True) so a big
+        binary retries with the CPU to itself instead of competing in the pool. A still-failing
+        retry returns success=False with an explicit ``reason`` — never a fabricated 'ok'.
         """
         headless = self.get_headless()
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -431,16 +459,7 @@ class GhidraRunner:
 
         r1 = self._run_once(binary, output_dir, arch, sha8, timeout, headless)
         if r1.success:
-            return GhidraResult(
-                binary=binary,
-                output_file=r1.output_file,
-                success=True,
-                elapsed=r1.elapsed,
-                analysis_status=r1.analysis_status,
-                function_count=r1.function_count,
-                log_path=r1.log_path,
-                stderr_tail=r1.stderr_tail,
-            )
+            return r1
 
         import_failed = False
         if r1.log_path is not None and r1.log_path.exists():
@@ -449,56 +468,40 @@ class GhidraRunner:
             except OSError:
                 pass
 
-        # r1 failed. One retry either way — but the recovery differs by cause:
-        #   • import failure -> patch the problematic ELF sections (GNU notes / ARM attributes) and
-        #     re-run the PATCHED copy at 2× timeout.
-        #   • any other failure -> chiefly a per-file timeout: a large binary whose analysis+export
-        #     budget exceeded the timeout leaves NO json and is not an import problem, so re-run
-        #     the ORIGINAL binary at 2× timeout (no patch). This is why a one-shot timeout is not a
-        #     death sentence for big binaries (e.g. a ~2700-function libc whose analysis+export
-        #     needs >360s but finishes comfortably inside 720s).
-        # Honesty red-line: a still-failing retry (incl. one that times out again) returns
-        # success=False — never a fabricated 'ok'.
+        retry_timeout = min(_TIMEOUT_CEILING_SECONDS, timeout * 2)
         did_retry = False
         total_elapsed = r1.elapsed
+        last = r1
         if import_failed:
+            # deterministic recovery, always attempted (patch the ELF, re-run the patched copy)
             patch_result = _patch_elf_for_ghidra(binary)
             if patch_result is not None:
                 patched_file, tmpdir = patch_result
                 try:
-                    r2 = self._run_once(patched_file, output_dir, arch, sha8, timeout * 2, headless)
+                    r2 = self._run_once(
+                        patched_file, output_dir, arch, sha8, retry_timeout, headless
+                    )
                     did_retry = True
                     total_elapsed += r2.elapsed
+                    last = r2
                     if r2.success:
-                        return GhidraResult(
-                            binary=binary,
-                            output_file=r2.output_file,
-                            success=True,
-                            elapsed=total_elapsed,
-                            retried=True,
-                            analysis_status=r2.analysis_status,
-                            function_count=r2.function_count,
-                            log_path=r2.log_path,
-                            stderr_tail=r2.stderr_tail,
-                        )
+                        r2.binary = binary
+                        r2.elapsed = total_elapsed
+                        r2.retried = True
+                        return r2
                 finally:
                     shutil.rmtree(tmpdir, ignore_errors=True)
-        else:
-            r2 = self._run_once(binary, output_dir, arch, sha8, timeout * 2, headless)
+        elif retry:
+            # the CPU-contending timeout retry — deferred to run_all's serial phase 2 (retry=False
+            # in phase 1) so a big binary does not retry while competing for cores in the pool.
+            r2 = self._run_once(binary, output_dir, arch, sha8, retry_timeout, headless)
             did_retry = True
             total_elapsed += r2.elapsed
+            last = r2
             if r2.success:
-                return GhidraResult(
-                    binary=binary,
-                    output_file=r2.output_file,
-                    success=True,
-                    elapsed=total_elapsed,
-                    retried=True,
-                    analysis_status=r2.analysis_status,
-                    function_count=r2.function_count,
-                    log_path=r2.log_path,
-                    stderr_tail=r2.stderr_tail,
-                )
+                r2.elapsed = total_elapsed
+                r2.retried = True
+                return r2
 
         return GhidraResult(
             binary=binary,
@@ -508,6 +511,7 @@ class GhidraRunner:
             retried=did_retry,
             log_path=r1.log_path,
             stderr_tail=r1.stderr_tail,
+            reason="import_failed" if import_failed else last.reason,
         )
 
     def _run_once(
@@ -537,9 +541,10 @@ class GhidraRunner:
             "JAVA_TOOL_OPTIONS": f"-Xmx{heap_mb}m -Xms{xms_mb}m -Duser.home={ghidra_home_dir}",
         }
 
+        rc = 0
         stderr_raw = ""
         try:
-            _, stderr_raw = _run_subprocess(cmd, env, timeout + 60)
+            rc, stderr_raw = _run_subprocess(cmd, env, timeout + 60)
         finally:
             shutil.rmtree(proj_dir, ignore_errors=True)
             shutil.rmtree(ghidra_home_dir, ignore_errors=True)
@@ -550,6 +555,15 @@ class GhidraRunner:
 
         analysis_status, function_count = _classify_analysis(expected_out, binary)
         success = analysis_status in ("ok", "ok_empty")
+        # reason for a failure, by cause (import_failed is decided by run_ghidra from the log)
+        reason: str | None = None
+        if not success:
+            if rc == -1:
+                reason = "timeout"  # subprocess killed at the wall-clock budget
+            elif not expected_out.exists():
+                reason = "no_output"  # ran but produced no JSON
+            else:
+                reason = "incomplete"  # JSON present but unusable (malformed / 0 functions on code)
         return GhidraResult(
             binary=binary,
             output_file=expected_out if success else None,
@@ -559,6 +573,7 @@ class GhidraRunner:
             function_count=function_count,
             log_path=log_path if log_path.exists() else None,
             stderr_tail=stderr_raw if stderr_raw else None,
+            reason=reason,
         )
 
     def run_all(
@@ -567,32 +582,42 @@ class GhidraRunner:
         output_dir: Path,
         progress_callback: ProgressCallback | None = None,
     ) -> list[GhidraResult]:
-        """Parallel Ghidra dispatch; pool size = config.max_parallel_jvms.
+        """Two-phase Ghidra dispatch.
 
-        Discovers analyzeHeadless once before spawning threads so
-        GhidraNotFoundError is raised immediately rather than N times.
+        ★ Phase 1: run every binary ONCE in parallel (pool = config.max_parallel_jvms), each at a
+        size-scaled timeout, with the timeout retry DEFERRED (retry=False).
+        ★ Phase 2: re-run phase-1 failures SERIALLY at a doubled budget — a big binary that timed
+        because the pool was CPU-saturated now retries with the whole machine to itself. This is the
+        real fix (a per-call 'longer timeout' flag would not help: the retry would still compete in
+        the pool). A phase-2 failure stays a failure with its ``reason`` (surfaced downstream).
+
+        Discovers analyzeHeadless once before spawning threads so GhidraNotFoundError is raised
+        immediately rather than N times.
         """
         self.get_headless()  # fail-fast: raise GhidraNotFoundError before any thread work
         output_dir.mkdir(parents=True, exist_ok=True)
-        results: list[GhidraResult] = []
+        base = self._config.headless_timeout_seconds
         n = len(records)
+        by_idx: dict[int, GhidraResult] = {}
 
         pool = ThreadPoolExecutor(max_workers=self._config.max_parallel_jvms)
         try:
-            future_to_rec = {
+            future_to_idx = {
                 pool.submit(
                     self.run_ghidra,
                     rec.path,
                     output_dir,
-                    self._config.headless_timeout_seconds,
+                    _dynamic_timeout(rec.path, base),
                     rec.arch,
                     rec.sha256[:8],
-                ): rec
-                for rec in records
+                    False,  # phase 1: defer the timeout retry to the serial phase 2
+                ): i
+                for i, rec in enumerate(records)
             }
             try:
-                for i, fut in enumerate(as_completed(future_to_rec), 1):
-                    rec = future_to_rec[fut]
+                for done, fut in enumerate(as_completed(future_to_idx), 1):
+                    i = future_to_idx[fut]
+                    rec = records[i]
                     try:
                         result = fut.result()
                     except Exception as exc:
@@ -600,23 +625,21 @@ class GhidraRunner:
                         result = GhidraResult(
                             binary=rec.path, output_file=None, success=False, elapsed=0.0
                         )
-                    results.append(result)
+                    by_idx[i] = result
                     if progress_callback is not None:
                         progress_callback(
                             "ghidra",
-                            {"done": i, "total": n, "name": rec.name, "ok": result.success},
+                            {"done": done, "total": n, "name": rec.name, "ok": result.success},
                         )
-                    status = (
-                        "ok" if result.success else ("retried_fail" if result.retried else "fail")
-                    )
-                    logger.info("[%d/%d] %s %s (%.0fs)", i, n, rec.name, status, result.elapsed)
+                    status = "ok" if result.success else "fail"
+                    logger.info("[%d/%d] %s %s (%.0fs)", done, n, rec.name, status, result.elapsed)
             except KeyboardInterrupt:
                 logger.warning(
                     "interrupted — terminating %d live Ghidra process group(s)",
                     len(_active_pgids),
                 )
                 terminate_all()
-                for f in future_to_rec:
+                for f in future_to_idx:
                     f.cancel()
                 raise
         finally:
@@ -626,4 +649,45 @@ class GhidraRunner:
             terminate_all()
             pool.shutdown(wait=True, cancel_futures=True)
 
-        return results
+        # Phase 2: serial isolated retry of the failures, at a doubled (ceiling-capped) budget.
+        failed = [i for i in range(n) if not by_idx[i].success]
+        if failed:
+            logger.info(
+                "ghidra: retrying %d failed binary/ies serially (isolated CPU)", len(failed)
+            )
+            try:
+                for k, i in enumerate(failed, 1):
+                    rec = records[i]
+                    retry_timeout = min(
+                        _TIMEOUT_CEILING_SECONDS, _dynamic_timeout(rec.path, base) * 2
+                    )
+                    try:
+                        r = self.run_ghidra(
+                            rec.path, output_dir, retry_timeout, rec.arch, rec.sha256[:8], False
+                        )
+                    except Exception as exc:
+                        logger.error("Ghidra retry crashed for %s: %s", rec.name, exc)
+                        continue
+                    r.retried = True
+                    by_idx[i] = r
+                    if progress_callback is not None:
+                        progress_callback(
+                            "ghidra_retry",
+                            {"done": k, "total": len(failed), "name": rec.name, "ok": r.success},
+                        )
+                    logger.info(
+                        "retry [%d/%d] %s %s (%.0fs)",
+                        k,
+                        len(failed),
+                        rec.name,
+                        "ok" if r.success else "fail",
+                        r.elapsed,
+                    )
+            except KeyboardInterrupt:
+                logger.warning(
+                    "interrupted during serial retry — terminating live process group(s)"
+                )
+                terminate_all()
+                raise
+
+        return [by_idx[i] for i in range(n)]

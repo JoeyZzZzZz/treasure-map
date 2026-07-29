@@ -69,6 +69,11 @@ class Config(BaseModel):
     )
     atlas: AtlasConfig = Field(default_factory=AtlasConfig)
     log_level: str = "INFO"
+    # L0 xref fold threshold (edge contribution = callers × exporters). A high-fan-out symbol
+    # above this is folded into the xref_folded_symbols ledger instead of exploding the xrefs table.
+    # Keep in sync with xrefs.DEFAULT_FOLD_EDGE_THRESHOLD (a unit test asserts equality). Tune down
+    # from the ledger produced on real large firmware if bombs slip under it.
+    xref_fold_edge_threshold: int = 25_000
 
     @field_validator("workspace_dir", mode="before")
     @classmethod

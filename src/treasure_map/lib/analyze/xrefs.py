@@ -39,6 +39,27 @@ logger = logging.getLogger(__name__)
 # Signature: (caller_bid, caller_fid, callee_bid, callee_fid, xref_type, confidence) -> inserted
 _AddFn = Callable[[int, "int | None", int, "int | None", str, float], bool]
 
+# ★ Large-firmware scaling. Edges are flushed to the DB every XREF_FLUSH_BATCH rows so the in-memory
+# ``pending`` list stays bounded regardless of total edge count (a 679-binary firmware produces
+# tens of millions of L0 edges; accumulating them all is what OOMs). The dedup ``seen`` set is not
+# bounded by this — it is bounded by FOLDING (below), which keeps the high-fan-out generic symbols
+# out of ``seen`` entirely.
+XREF_FLUSH_BATCH = 50_000
+
+# ★ L0 fold criterion (data-driven, tunable). A generic export name (malloc/memcpy/…) is exported by
+# MANY binaries and called by MANY functions -> caller_refs × exporters low-value edges. The primary
+# criterion is that EDGE CONTRIBUTION (callers × exporters); an exporter FLOOR guarantees a
+# low-ambiguity symbol (few exporters, so each edge points at a near-unique target) is NEVER folded,
+# no matter how widely it is called -- those are high-value edges. Conservative defaults: tune from
+# the xref_folded_symbols ledger produced on the real firmware (fold too little -> re-lower;
+# fold something specific -> raise). The threshold is overridable via config.
+DEFAULT_FOLD_EDGE_THRESHOLD = 25_000
+FOLD_MIN_EXPORTERS = 16
+
+# Emit an L0 progress line every this-many caller functions (a large firmware has ~218k), so the
+# multi-minute cross-binary pass is visibly running rather than looking hung.
+_L0_PROGRESS_EVERY = 20_000
+
 
 # ── String classification rules (ordered, first-match-wins) ──────────────────
 # Ported from history/scripts/06_build_xrefs.py STRING_RULES.
@@ -94,6 +115,9 @@ class XrefStats:
     layer2_dt_needed: int = 0
     layer3_string_ipc: int = 0
     strings_classified: int = 0
+    # high-fan-out L0 symbols folded + edges suppressed (detail in xref_folded_symbols)
+    layer0_folded_symbols: int = 0
+    layer0_folded_edges: int = 0
 
     @property
     def layer1_total(self) -> int:
@@ -198,8 +222,16 @@ def _build_caller_index(cur: sqlite3.Cursor, binary_id: int) -> dict[str, list[i
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 
-def build_xrefs(conn: sqlite3.Connection) -> XrefStats:
-    """Wipe and rebuild xrefs table from current DB state.
+_INSERT_XREF = """INSERT INTO xrefs
+       (caller_binary_id, caller_func_id, callee_binary_id,
+        callee_func_id, xref_type, confidence)
+       VALUES (?, ?, ?, ?, ?, ?)"""
+
+
+def build_xrefs(
+    conn: sqlite3.Connection, *, fold_edge_threshold: int = DEFAULT_FOLD_EDGE_THRESHOLD
+) -> XrefStats:
+    """Wipe and rebuild xrefs (+ the xref_folded_symbols ledger) from current DB state.
 
     Also classifies all strings whose category is currently NULL.
 
@@ -207,17 +239,29 @@ def build_xrefs(conn: sqlite3.Connection) -> XrefStats:
 
     Dedup strategy: in-memory set keyed by
     (caller_bid, caller_fid, callee_bid, callee_fid, xref_type).
-    All inserts are batched via executemany at the end — O(1) dedup,
-    no per-row SELECT overhead.
+
+    ★ Large-firmware scaling (memory is bounded, not the edge count):
+      - inserts are FLUSHED every XREF_FLUSH_BATCH rows, so ``pending`` never grows unbounded
+        (accumulating tens of millions of edges is what OOMed a 679-binary firmware);
+      - L0 folds high-fan-out generic symbols (see _layer0), keeping ``seen`` bounded too and
+        recording the constrained edges in xref_folded_symbols instead of silently dropping them.
+      The flush is safe with the shared cursor: every layer materializes its outer query with
+      .fetchall() first, so a mid-loop executemany cannot invalidate a live cursor iteration.
     """
     stats = XrefStats()
     cur = conn.cursor()
 
     cur.execute("DELETE FROM xrefs")
+    cur.execute("DELETE FROM xref_folded_symbols")
     conn.commit()
 
     seen: set[tuple[int, int | None, int, int | None, str]] = set()
     pending: list[tuple[int, int | None, int, int | None, str, float]] = []
+
+    def _flush() -> None:
+        if pending:
+            cur.executemany(_INSERT_XREF, pending)
+            pending.clear()
 
     def _try_add(
         caller_binary_id: int,
@@ -241,29 +285,36 @@ def build_xrefs(conn: sqlite3.Connection) -> XrefStats:
                 confidence,
             )
         )
+        if len(pending) >= XREF_FLUSH_BATCH:
+            _flush()  # bound memory: move the batch to the DB and free the Python list
         return True
 
     soname_map = _build_soname_map(cur)
 
-    _layer0_callees_exports(cur, _try_add, stats)
+    folded_ledger: list[tuple[str, int, int, int]] = []
+    _layer0_callees_exports(
+        cur, _try_add, stats, fold_edge_threshold=fold_edge_threshold, folded_out=folded_ledger
+    )
     _layer1_import_export(cur, _try_add, soname_map, stats)
     _layer2_dt_needed(cur, _try_add, soname_map, stats)
     _classify_strings(cur, conn, stats)
     _layer3_string_ipc(cur, _try_add, stats)
 
-    if pending:
+    _flush()  # the tail below the last batch boundary
+    if folded_ledger:
         cur.executemany(
-            """INSERT INTO xrefs
-               (caller_binary_id, caller_func_id, callee_binary_id,
-                callee_func_id, xref_type, confidence)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            pending,
+            "INSERT INTO xref_folded_symbols (symbol, exporters, callers, folded_edges) "
+            "VALUES (?, ?, ?, ?)",
+            folded_ledger,
         )
     conn.commit()
 
     logger.info(
-        "xrefs: L0=%d L1=%d (func=%d lib=%d) L2=%d L3=%d, %d strings classified, total %d xrefs",
+        "xrefs: L0=%d (folded %d syms / %d edges) L1=%d (func=%d lib=%d) L2=%d L3=%d, "
+        "%d strings classified, total %d xrefs",
         stats.layer0_callees_exports,
+        stats.layer0_folded_symbols,
+        stats.layer0_folded_edges,
         stats.layer1_total,
         stats.layer1_import_export_func,
         stats.layer1_import_export_lib,
@@ -282,6 +333,9 @@ def _layer0_callees_exports(
     cur: sqlite3.Cursor,
     add_fn: _AddFn,
     stats: XrefStats,
+    *,
+    fold_edge_threshold: int = DEFAULT_FOLD_EDGE_THRESHOLD,
+    folded_out: list[tuple[str, int, int, int]] | None = None,
 ) -> None:
     """Layer 0: function.callees × exports exact match.
 
@@ -297,6 +351,14 @@ def _layer0_callees_exports(
     a concrete function record are included. PLT thunks (exports with no
     matching function body) are excluded. Including them would bloat the xrefs
     table ~10x with NULL-callee rows that convey no actionable information.
+
+    ★ FOLD (large-firmware scaling): a generic export name exported by MANY binaries and called by
+    MANY functions produces caller × exporter low-value edges (which of 300 mallocs? — noise). A
+    symbol is FOLDED when its edge contribution (callers × exporters) exceeds the threshold AND it
+    clears the exporter floor (FOLD_MIN_EXPORTERS) — the floor guarantees a low-ambiguity
+    symbol (few exporters, near-unique target/edge) is never folded. Folded edges are NOT written
+    to xrefs, but they are NEVER silently dropped: each folded symbol's (exporters, callers,
+    folded_edges) counts go to ``folded_out`` -> the xref_folded_symbols ledger.
     """
     export_index: dict[str, list[tuple[int, int]]] = defaultdict(list)
     rows = cur.execute(
@@ -313,16 +375,49 @@ def _layer0_callees_exports(
         """SELECT id, binary_id, callees FROM functions
            WHERE callees IS NOT NULL AND callees != '[]'"""
     ).fetchall()
+
+    # Pass 1: parse callees once, count caller references per exported name (the edge-contribution
+    # numerator). ``parsed`` reuses the parse so pass 2 does not re-json.loads 218k rows.
+    parsed: list[tuple[int, int, list[str]]] = []
+    caller_refs: dict[str, int] = defaultdict(int)
     for caller_func_id, caller_binary_id, callees_json in func_rows:
         try:
             callees = json.loads(callees_json)
         except json.JSONDecodeError:
             continue
-        for callee_name in callees:
-            targets = export_index.get(callee_name)
-            if not targets:
+        names = [n for n in callees if n in export_index]
+        if not names:
+            continue
+        parsed.append((caller_func_id, caller_binary_id, names))
+        for n in names:
+            caller_refs[n] += 1
+
+    # Decide the folded set by EDGE CONTRIBUTION, gated by the exporter floor.
+    folded_bins: dict[str, set[int]] = {}
+    for name, callers in caller_refs.items():
+        exporters = len(export_index[name])
+        if exporters >= FOLD_MIN_EXPORTERS and callers * exporters > fold_edge_threshold:
+            folded_bins[name] = {b for b, _ in export_index[name]}
+
+    # Pass 2: build edges for non-folded names; COUNT (never build) the constrained edges of folded
+    # names into the ledger.
+    fold_edges: dict[str, int] = defaultdict(int)
+    total = len(parsed)
+    for done, (caller_func_id, caller_binary_id, names) in enumerate(parsed, 1):
+        # ★ periodic progress so a long L0 pass (218k functions on a large firmware) is visibly
+        # RUNNING, not hung -- the owner should not need py-spy to tell the difference.
+        if done % _L0_PROGRESS_EVERY == 0:
+            logger.info(
+                "xrefs L0: %d/%d funcs, %d edges so far", done, total, stats.layer0_callees_exports
+            )
+        for callee_name in names:
+            if callee_name in folded_bins:
+                exps = folded_bins[callee_name]
+                fold_edges[callee_name] += len(export_index[callee_name]) - (
+                    1 if caller_binary_id in exps else 0
+                )
                 continue
-            for callee_binary_id, callee_func_id in targets:
+            for callee_binary_id, callee_func_id in export_index[callee_name]:
                 if callee_binary_id == caller_binary_id:
                     continue
                 if add_fn(
@@ -334,6 +429,13 @@ def _layer0_callees_exports(
                     1.0,
                 ):
                     stats.layer0_callees_exports += 1
+
+    for name in sorted(folded_bins):
+        edges = fold_edges[name]
+        stats.layer0_folded_symbols += 1
+        stats.layer0_folded_edges += edges
+        if folded_out is not None:
+            folded_out.append((name, len(export_index[name]), caller_refs[name], edges))
 
 
 def _layer1_import_export(

@@ -142,14 +142,18 @@ async def run_analyze(
                 # run leaves pass_version untouched (still stale/NULL) so it stays dirty next time.
                 if res.success:
                     conn.execute(
-                        "UPDATE binaries SET ghidra_ok=?, ghidra_status=?, pass_version=?, "
-                        "ghidra_version=? WHERE sha256=?",
+                        "UPDATE binaries SET ghidra_ok=?, ghidra_status=?, "
+                        "ghidra_status_reason=NULL, pass_version=?, ghidra_version=? "
+                        "WHERE sha256=?",
                         (1, res.analysis_status, pass_version, ghidra_version, rec.sha256),
                     )
                 else:
+                    # record WHY it failed (timeout/import_failed/no_output/incomplete) so the
+                    # incomplete surfacing can tell a recoverable timeout from a structural failure.
                     conn.execute(
-                        "UPDATE binaries SET ghidra_ok=?, ghidra_status=? WHERE sha256=?",
-                        (0, res.analysis_status, rec.sha256),
+                        "UPDATE binaries SET ghidra_ok=?, ghidra_status=?, ghidra_status_reason=? "
+                        "WHERE sha256=?",
+                        (0, res.analysis_status, res.reason, rec.sha256),
                     )
                 if res.success:
                     ghidra_ok += 1
@@ -168,7 +172,7 @@ async def run_analyze(
         )
 
         # Round B: build cross-binary xrefs + classify strings (wipe-and-rebuild)
-        xref_stats = build_xrefs(conn)
+        xref_stats = build_xrefs(conn, fold_edge_threshold=config.xref_fold_edge_threshold)
 
         # ★ Red-line visibility: current-scan binaries that hold 0 functions and are NOT a
         # legitimately code-free object (ghidra_status != ok_empty). Truthful DB-derived set — it

@@ -514,8 +514,8 @@ def test_list_incomplete_binaries_flags_failed_not_codefree(tmp_path: Path) -> N
     db = tmp_path / "incomplete.db"
     conn = open_db(db)
     conn.execute(
-        "INSERT INTO binaries (id, name, path, sha256, ghidra_status, last_seen_at) "
-        "VALUES (1, 'rc', 'sbin/rc', 'x', 'failed', '2026-01-01')"
+        "INSERT INTO binaries (id, name, path, sha256, ghidra_status, ghidra_status_reason, "
+        "last_seen_at) VALUES (1, 'rc', 'sbin/rc', 'x', 'failed', 'timeout', '2026-01-01')"
     )
     conn.execute(
         "INSERT INTO binaries (id, name, path, sha256, ghidra_status, last_seen_at) "
@@ -529,7 +529,8 @@ def test_list_incomplete_binaries_flags_failed_not_codefree(tmp_path: Path) -> N
     conn.commit()
     conn.close()
     ro = facts.open_analysis_ro(db)
-    assert facts.list_incomplete_binaries(ro) == ["rc"]
+    # ★ surfaced as {binary, reason} so a consumer sees WHY (timeout may finish on a re-scan)
+    assert facts.list_incomplete_binaries(ro) == [{"binary": "rc", "reason": "timeout"}]
     ro.close()
 
 

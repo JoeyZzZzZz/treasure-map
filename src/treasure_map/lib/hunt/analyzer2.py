@@ -754,6 +754,9 @@ def run_analyzer2(
     """
     result = scan(db_path)
     all_funcs = load_functions(db_path)
+    # ★ phase-scale progress: on a large firmware (~218k functions) the hunt is a multi-second pass;
+    # log its magnitude so it is visibly running, not hung (does NOT change the hunt algorithm).
+    logger.info("hunt: analyzing %d functions", len(all_funcs))
     funcs: dict[int, FuncRow] = {f.func_id: f for f in all_funcs}
     callers_of = _load_caller_ids(db_path)
     entry_index = _load_entry_index(db_path)

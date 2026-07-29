@@ -347,7 +347,8 @@ def test_run_ghidra_timeout_retry_then_success(tmp_path: Path) -> None:
 
 
 def test_run_all_calls_progress_callback(tmp_path: Path) -> None:
-    """progress_callback is invoked once per record with correct keys."""
+    """progress_callback fires per record in phase 1 ('ghidra') and per FAILED record in the serial
+    phase 2 ('ghidra_retry'), each with the done/total/name/ok keys."""
     records = [
         ElfRecord(
             path=tmp_path / name,
@@ -371,9 +372,11 @@ def test_run_all_calls_progress_callback(tmp_path: Path) -> None:
             records, tmp_path / "out", progress_callback=lambda s, m: progress.append((s, m))
         )
 
-    assert len(progress) == 2
-    assert all(step == "ghidra" for step, _ in progress)
-    assert {m["name"] for _, m in progress} == {"a", "b"}
+    p1 = [m for s, m in progress if s == "ghidra"]
+    p2 = [m for s, m in progress if s == "ghidra_retry"]
+    assert {m["name"] for m in p1} == {"a", "b"}  # phase 1: one per record
+    assert {m["name"] for m in p2} == {"a", "b"}  # both failed -> both retried serially in phase 2
+    assert all(set(m) == {"done", "total", "name", "ok"} for _, m in progress)
 
 
 def test_run_all_returns_one_result_per_record(tmp_path: Path) -> None:
@@ -576,3 +579,140 @@ def test_detect_ghidra_version_missing_key_is_unknown(tmp_path: Path) -> None:
     (home / "Ghidra").mkdir()
     (home / "Ghidra" / "application.properties").write_text("application.name=Ghidra\n")
     assert detect_ghidra_version(home / "support" / "analyzeHeadless") == UNKNOWN_VERSION
+
+
+# ── large-firmware scaling (Fix ②): reason, dynamic timeout, two-phase serial retry ──
+
+
+def _sized_file(path: Path, mb: int) -> Path:
+    with open(path, "wb") as f:
+        f.truncate(mb * 1024 * 1024)  # sparse: reports size without writing the bytes
+    return path
+
+
+def test_dynamic_timeout_scales_with_size_and_caps(tmp_path: Path) -> None:
+    # ★ a size-scaled timeout: small -> base; big -> proportionally more; huge -> ceiling (never
+    # unbounded). Replaces the flat one-size-fits-all that timed a 28M library out under a small.
+    from treasure_map.lib.analyze.ghidra_runner import _TIMEOUT_CEILING_SECONDS, _dynamic_timeout
+
+    assert _dynamic_timeout(_sized_file(tmp_path / "sm", 1), 300) == 300  # < 10MB -> base
+    assert _dynamic_timeout(_sized_file(tmp_path / "big", 28), 300) == int(300 * 2.8)  # scaled
+    assert _dynamic_timeout(_sized_file(tmp_path / "huge", 500), 300) == _TIMEOUT_CEILING_SECONDS
+
+
+def test_run_ghidra_reason_timeout(tmp_path: Path) -> None:
+    # ★ a timeout failure carries reason='timeout' so a consumer knows a re-scan may finish it.
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    binary = tmp_path / "b"
+    _write_small_elf(binary)
+
+    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+        return -1, "timeout"
+
+    runner = _make_runner(tmp_path)
+    with patch(f"{MODULE}._run_subprocess", fake_sub):
+        r = runner.run_ghidra(
+            binary, output_dir, timeout=60, arch="x86:LE:64:default", sha8="deadbeef", retry=False
+        )
+    assert r.success is False and r.reason == "timeout"
+
+
+def test_run_ghidra_reason_no_output(tmp_path: Path) -> None:
+    # ★ a non-zero exit with no JSON is 'no_output', DISTINCT from a timeout -- a structural fail.
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    binary = tmp_path / "b"
+    _write_small_elf(binary)
+
+    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+        return 1, "err"
+
+    runner = _make_runner(tmp_path)
+    with patch(f"{MODULE}._run_subprocess", fake_sub):
+        r = runner.run_ghidra(
+            binary, output_dir, timeout=60, arch="x86:LE:64:default", sha8="deadbeef", retry=False
+        )
+    assert r.success is False and r.reason == "no_output"
+
+
+def test_run_ghidra_retry_false_skips_the_timeout_retry(tmp_path: Path) -> None:
+    # ★ retry=False runs ONE attempt (no in-pool timeout retry) -- what run_all uses in phase 1 so
+    # the CPU-contending retry is deferred to the serial phase 2. retry=True runs the retry.
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    binary = tmp_path / "b"
+    _write_small_elf(binary)
+    calls = {"n": 0}
+
+    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+        calls["n"] += 1
+        return -1, "timeout"
+
+    runner = _make_runner(tmp_path)
+    with patch(f"{MODULE}._run_subprocess", fake_sub):
+        r = runner.run_ghidra(
+            binary, output_dir, timeout=60, arch="x86:LE:64:default", sha8="deadbeef", retry=False
+        )
+    assert calls["n"] == 1 and r.retried is False  # exactly one attempt, no retry
+    calls["n"] = 0
+    with patch(f"{MODULE}._run_subprocess", fake_sub):
+        runner.run_ghidra(
+            binary, output_dir, timeout=60, arch="x86:LE:64:default", sha8="deadbeef", retry=True
+        )
+    assert calls["n"] == 2  # retry=True -> the one timeout retry ran
+
+
+def _big_rec(tmp_path: Path) -> ElfRecord:
+    rec = ElfRecord(
+        path=tmp_path / "big",
+        name="big",
+        arch="x86:LE:64:default",
+        elf_type="executable",
+        sha256="deadbeef",
+    )
+    _write_small_elf(rec.path)
+    return rec
+
+
+def test_run_all_two_phase_serial_retry_recovers(tmp_path: Path) -> None:
+    # ★ phase 1 runs each binary ONCE in parallel; a failure is retried SERIALLY in phase 2 (a
+    # 'ghidra_retry' event fires). This distinguishes the two-phase design from an in-pool retry,
+    # which would recover inside phase 1 with NO ghidra_retry event and no isolated CPU.
+    rec = _big_rec(tmp_path)
+    calls = {"n": 0}
+
+    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return -1, "timeout"  # phase 1: fail
+        out = Path(env["OUTPUT_DIR"]) / f"big_{env['SHA8']}_ghidra.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(_good_json())
+        return 0, ""  # phase 2: succeed
+
+    events: list[tuple[str, dict[str, Any]]] = []
+    runner = _make_runner(tmp_path)
+    with patch(f"{MODULE}._run_subprocess", fake_sub):
+        results = runner.run_all(
+            [rec], tmp_path / "out", progress_callback=lambda s, m: events.append((s, m))
+        )
+    assert calls["n"] == 2  # ONE phase-1 attempt + ONE phase-2 retry (not an in-pool 3rd attempt)
+    assert results[0].success is True and results[0].retried is True
+    assert any(s == "ghidra_retry" and m["name"] == "big" for s, m in events)  # phase 2 ran
+
+
+def test_run_all_phase2_failure_stays_failed_with_reason(tmp_path: Path) -> None:
+    # ★ a binary that fails BOTH phases stays failed, honestly, with its reason (never a fake ok).
+    rec = _big_rec(tmp_path)
+    calls = {"n": 0}
+
+    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+        calls["n"] += 1
+        return -1, "timeout"
+
+    runner = _make_runner(tmp_path)
+    with patch(f"{MODULE}._run_subprocess", fake_sub):
+        results = runner.run_all([rec], tmp_path / "out")
+    assert calls["n"] == 2  # phase 1 + phase 2, then it stays failed
+    assert results[0].success is False and results[0].reason == "timeout"

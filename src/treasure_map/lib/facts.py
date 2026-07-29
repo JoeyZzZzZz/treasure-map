@@ -56,23 +56,44 @@ def open_analysis_ro(db_path: Path | str) -> sqlite3.Connection:
     return conn
 
 
-def list_incomplete_binaries(conn: sqlite3.Connection) -> list[str]:
+def list_incomplete_binaries(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     """Current-scan binaries that produced 0 functions and are NOT legitimately code-free.
 
-    ★ Red-line (degrade must be visible): a binary Ghidra failed on holds 0 functions, so it looks
-    'clean' to every reader. This surfaces those names so a consumer knows the analysis is
-    INCOMPLETE for them — not that there is nothing to find. Empty on an older analysis.db that
-    predates the ``ghidra_status`` column (the read degrades quietly rather than error)."""
+    ★ Red-line (degrade must be visible AND explicable): a binary Ghidra failed on holds 0
+    functions, so it looks 'clean' to every reader. This surfaces each as ``{binary, reason}`` so a
+    consumer knows the analysis is INCOMPLETE for it — and WHY (``timeout`` may finish on a re-scan;
+    ``import_failed`` / ``incomplete`` is structural). ``reason`` is None on a failure recorded
+    before it was captured. Empty on an older analysis.db predating the columns (degrades)."""
     try:
         rows = conn.execute(
-            "SELECT b.name FROM current_binaries b "
+            "SELECT b.name, b.ghidra_status_reason AS reason FROM current_binaries b "
             "WHERE COALESCE(b.ghidra_status, '') != 'ok_empty' "
             "AND NOT EXISTS (SELECT 1 FROM functions f WHERE f.binary_id = b.id) "
             "ORDER BY b.name"
         ).fetchall()
     except sqlite3.OperationalError:
         return []
-    return [r["name"] for r in rows]
+    return [{"binary": r["name"], "reason": r["reason"]} for r in rows]
+
+
+def list_folded_xref_symbols(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """High-fan-out L0 export symbols whose per-edge expansion was CONSTRAINED (folded).
+
+    ★ Red-line (constrained edges must be visible): a generic symbol exported by many binaries and
+    called by many functions produces a low-value edge explosion; those edges are NOT written to
+    xrefs, but they are NOT silently dropped either. This surfaces each folded symbol with
+    ``{symbol, exporters, callers, folded_edges}`` so a consumer knows "N edges were suppressed for
+    symbol X" and can ask for them if a specific case needs them — absence of an L0 edge to a folded
+    symbol is a scaling decision, not proof there is no call. Empty on an older analysis.db that
+    predates the ``xref_folded_symbols`` table (the read degrades quietly rather than error)."""
+    try:
+        rows = conn.execute(
+            "SELECT symbol, exporters, callers, folded_edges FROM xref_folded_symbols "
+            "ORDER BY folded_edges DESC, symbol"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return [dict(r) for r in rows]
 
 
 # A function large enough that Ghidra should have produced pseudocode. Sub-threshold bodies (thunks,

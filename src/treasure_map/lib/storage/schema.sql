@@ -22,6 +22,10 @@ CREATE TABLE IF NOT EXISTS binaries (
     size_bytes   INTEGER DEFAULT 0,        -- ELF 文件大小 (bytes)
     ghidra_ok    INTEGER NOT NULL DEFAULT 0, -- Round 2 partial-invalidation flag (1 = usable output)
     ghidra_status TEXT,                    -- tri-state analysis outcome: ok / ok_empty / failed / NULL
+    ghidra_status_reason TEXT,             -- WHY a failed run failed: timeout / import_failed /
+                                           --   no_output / incomplete; NULL on success. Lets the
+                                           --   incomplete surfacing distinguish a recoverable
+                                           --   timeout from a structural failure
     pass_version TEXT,                     -- content hash of the ExportFunctions pass that produced
                                            --   this row's output; a mismatch re-dirties it so a pass
                                            --   edit re-extracts automatically (no manual JSON delete)
@@ -111,6 +115,18 @@ CREATE TABLE IF NOT EXISTS xrefs (
     callee_func_id      INTEGER,        -- NULL = 库级别引用
     xref_type           TEXT,           -- import_export / dt_needed / string_ipc
     confidence          REAL    DEFAULT 1.0
+);
+
+-- xref_folded_symbols: an EXPLICIT ledger of the high-fan-out L0 export names whose per-edge
+-- expansion was constrained (a generic symbol exported by many binaries × called by many functions
+-- would produce a low-value edge explosion). These edges are NOT written to xrefs — but they are
+-- NEVER silently dropped: this table records what was folded and how much, so a consumer can see
+-- "N edges were suppressed for symbol X" and ask for them if needed. Wipe-and-rebuilt with xrefs.
+CREATE TABLE IF NOT EXISTS xref_folded_symbols (
+    symbol         TEXT PRIMARY KEY,   -- the folded export name (a generic high-fan-out symbol)
+    exporters      INTEGER NOT NULL,   -- # binaries exporting it (with a concrete function body)
+    callers        INTEGER NOT NULL,   -- # caller-function references to it across the firmware
+    folded_edges   INTEGER NOT NULL    -- # L0 edges NOT materialized (the constrained edges, visible)
 );
 
 -- 字符串
