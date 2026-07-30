@@ -520,6 +520,8 @@ CREATE TABLE IF NOT EXISTS dimension_delta (
     dimension            TEXT NOT NULL,   -- registry/declaration-driven, never a semantic verdict
     subject_kind         TEXT NOT NULL,   -- 'edge' | 'candidate' | 'function'
     subject_key          TEXT NOT NULL,   -- identity WITHIN the dimension (edges: binary|mech|key|func)
+    binary               TEXT,            -- the diff's target binary (short name), parsed from
+                                          -- subject_key; NULL for the marker / scope-unrecorded row
     state_a              TEXT,            -- A-side annotation, OPAQUE to this layer
     state_b              TEXT,            -- B-side annotation, OPAQUE to this layer
     delta_kind           TEXT NOT NULL
@@ -534,6 +536,7 @@ CREATE TABLE IF NOT EXISTS dimension_delta (
 CREATE INDEX IF NOT EXISTS idx_dimdelta_diff ON dimension_delta(diff_id);
 CREATE INDEX IF NOT EXISTS idx_dimdelta_dim  ON dimension_delta(diff_id, dimension);
 CREATE INDEX IF NOT EXISTS idx_dimdelta_kind ON dimension_delta(diff_id, delta_kind);
+CREATE INDEX IF NOT EXISTS idx_dimdelta_bin  ON dimension_delta(diff_id, binary);
 
 -- ── layer-2 diff: dimension_capability_state ─────────────────────────────────
 -- Per-dimension capability state on BOTH sides, recorded explicitly so a

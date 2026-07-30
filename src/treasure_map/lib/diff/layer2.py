@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from treasure_map.lib.atlas.models import DimensionCapabilityStateRow, DimensionDeltaRow
@@ -661,6 +661,15 @@ def run_layer2_delta(
                     binary_b,
                 )
             )
+
+    # Stamp each row's target binary from its subject_key prefix ({binary}|{mech}|{key}|{anchor}),
+    # so a per-binary consumer filters on a real column, not a brittle LIKE. The dimension-level
+    # marker (e.g. "{dim}:binary_scope_unrecorded") carries no "|" -> binary stays NULL, which is
+    # the honest value for a diff whose binary scope was never recorded.
+    delta_rows = [
+        replace(r, binary=(r.subject_key.split("|", 1)[0] if "|" in r.subject_key else None))
+        for r in delta_rows
+    ]
 
     delete_dimension_delta(atlas, diff_id, commit=False)
     add_dimension_capability_states(atlas, cap_rows, commit=False)

@@ -42,8 +42,11 @@ def _complete_workspace(ctx: click.Context, param: click.Parameter, incomplete: 
 def _complete_run_id(ctx: click.Context, param: click.Parameter, incomplete: str) -> list[Any]:
     """Shell completion for a run-id argument: the run names already recorded in the atlas.
 
-    Opens the atlas READ-ONLY (no create/migrate side effects) and lists list_runs' run_ids. Absent
-    atlas or any error -> no suggestions, never a crash."""
+    Honors a ``--atlas`` value already parsed into the context (so completion targets the same atlas
+    the command will use), else the configured atlas. Opens the atlas READ-ONLY (no create/migrate
+    side effects) and lists list_runs' run_ids. Absent atlas or any error -> no suggestions, never a
+    crash. This is the ONE run-id completer (the former ``_complete_run_ids`` duplicate was merged
+    in, keeping this read-only open over its migrating one so a tab-press never mutates it)."""
     import sqlite3
 
     from click.shell_completion import CompletionItem
@@ -52,7 +55,8 @@ def _complete_run_id(ctx: click.Context, param: click.Parameter, incomplete: str
         from treasure_map.lib.config.config import load_config
         from treasure_map.lib.query import list_runs
 
-        atlas = load_config(None).atlas.db_path
+        override = ctx.params.get("atlas_path") if ctx is not None else None
+        atlas = Path(override) if override else load_config(None).atlas.db_path
         if not atlas.exists():
             return []
         conn = sqlite3.connect(f"file:{atlas}?mode=ro", uri=True)
@@ -80,26 +84,22 @@ def _echo_legal_notice(*, as_json: bool = False) -> None:
     click.echo("", err=True)
 
 
-@click.command("diff", short_help="Compare two firmware versions")
-@click.argument("db_a", type=click.Path(exists=True, dir_okay=False, path_type=Path))
-@click.argument("db_b", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.command("diff", short_help="Compare two firmware runs for one binary (map-model diff)")
+@click.argument("run_a_id", shell_complete=_complete_run_id)
+@click.argument("run_b_id", shell_complete=_complete_run_id)
 @click.option(
-    "--axis",
-    type=click.Choice(["version", "mod", "sibling"]),
-    default="version",
-    help="Neutral comparison axis recorded as scope_origin (no vendor/version identity).",
+    "--binary",
+    "binary_name",
+    required=True,
+    help="Short name of the ONE binary to diff (e.g. one .so). A whole-firmware diff is orders of "
+    "magnitude more expensive, so exactly one binary is diffed per command (no --all-binaries).",
 )
 @click.option(
-    "--run-id-a",
-    required=True,
-    help="Neutral run id for the baseline (db_a).",
-    shell_complete=_complete_run_id,
-)
-@click.option(
-    "--run-id-b",
-    required=True,
-    help="Neutral run id for the comparison (db_b).",
-    shell_complete=_complete_run_id,
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Run even when the two runs used different tmap/Ghidra versions -- every delta will then "
+    "be version_skew undetermined (the result stays honestly degraded).",
 )
 @click.option(
     "--config",
@@ -116,58 +116,52 @@ def _echo_legal_notice(*, as_json: bool = False) -> None:
     help="Atlas DB path (defaults to the configured atlas.db_path).",
 )
 def hunt_diff(
-    db_a: Path,
-    db_b: Path,
-    axis: str,
-    run_id_a: str,
-    run_id_b: str,
+    run_a_id: str,
+    run_b_id: str,
+    binary_name: str,
+    force: bool,
     config: Path | None,
     atlas_path: Path | None,
 ) -> None:
-    """Diff two analysis databases, grade reachability, and write neutral atlas instances.
+    """Diff two runs of ONE binary through the map-model pipeline, in a single command.
 
-    Function alignment is fully deterministic (exact symbol, then pseudocode hash); the
-    stripped/renamed residue neither pass resolves surfaces honestly as added/removed. Writes
-    graded leads at provenance L0/L1 only; public_finding is expected to be EMPTY in M2.
+    RUN_A_ID / RUN_B_ID are run ids (a run id is scan's --run-id, default = the -w workspace name),
+    NOT paths; tab-completion lists this atlas's runs. Drives the external aligner end-to-end
+    (BinExport -> BinDiff, you never touch an intermediate file), then writes alignment facts and
+    tri-state dimension deltas to the atlas. A delta is a PROJECTION of existing annotations, never
+    a change/defect verdict -- read it with the get_diff_* MCP tools and judge it yourself.
     """
+    from treasure_map.lib.atlas.connection import open_atlas
     from treasure_map.lib.config.config import load_config
+    from treasure_map.lib.diff.driver import run_version_diff
     from treasure_map.lib.errors import TreasureMapError
-    from treasure_map.lib.hunt import run_diff_analyzer
 
     cfg = load_config(config)
     resolved_atlas = atlas_path if atlas_path is not None else cfg.atlas.db_path
-
+    atlas = open_atlas(Path(resolved_atlas))
     try:
-        stats = run_diff_analyzer(
-            db_a,
-            db_b,
-            axis,  # type: ignore[arg-type]  # Click constrains to the Axis literals
-            resolved_atlas,
-            run_id_a=run_id_a,
-            run_id_b=run_id_b,
-        )
+        summary = run_version_diff(atlas, run_a_id, run_b_id, binary_name, config=cfg, force=force)
     except TreasureMapError as exc:
         raise click.ClickException(f"{type(exc).__name__}: {exc}") from exc
+    finally:
+        atlas.close()
 
+    for w in summary.warnings:
+        click.echo(f"warning: {w}", err=True)
     click.echo(f"Atlas: {resolved_atlas}")
-    click.echo(f"  Change leads      : {stats.leads}")
+    click.echo(f"  diff_id       : {summary.diff_id}")
+    click.echo(f"  binary        : {summary.binary}")
+    click.echo(f"  matched_pairs : {summary.matched_pairs}")
+    click.echo(f"  version_skew  : {summary.version_skew}")
     click.echo(
-        "  Of which          : "
-        f"changed={stats.changed} (graded), "
-        f"unverifiable={stats.changed_unverifiable} (one side had no body), "
-        f"skipped_no_body={stats.skipped_no_body} (neither side had a body)"
+        "  delta         : "
+        f"layer_changed={summary.delta_layer_changed}, "
+        f"layer_unchanged={summary.delta_layer_unchanged}, "
+        f"delta_undetermined={summary.delta_undetermined}"
     )
-    click.echo(f"  Instances written : {stats.instances_written}")
     click.echo(
-        "  By reachability   : "
-        f"confirmed={stats.by_status.get('confirmed', 0)}, "
-        f"blocked={stats.by_status.get('blocked', 0)}, "
-        f"unknown={stats.by_status.get('unknown', 0)}"
-    )
-    click.echo(f"  public_finding    : {stats.public_findings}")
-    click.echo(
-        "Note: public_finding is expected to be empty in M2 — A1 writes L0/L1 only "
-        "(no external anchor), so a confirmed result at L2 or above cannot arise here."
+        "Read the deltas: get_diff_deltas / get_diff_meta / get_function_alignment / "
+        "get_diff_capabilities"
     )
 
 
@@ -600,28 +594,6 @@ def _run_lineage_line(r: RunRow) -> str:
     return "   ".join(parts)
 
 
-def _complete_run_ids(ctx: click.Context, param: click.Parameter, incomplete: str) -> list[str]:
-    """Shell-completion for a run id (M8b): the atlas's run ids starting with ``incomplete``.
-
-    Best-effort — reads the --atlas value if already parsed, else the configured atlas. Any failure
-    yields no completions (never an error), and there is no short-prefix auto-match (a partial that
-    is ambiguous would silently pick wrong — tab completion lets the user SEE and choose)."""
-    try:
-        from treasure_map.lib.atlas.connection import open_atlas
-        from treasure_map.lib.config.config import load_config
-        from treasure_map.lib.query import list_runs as run_list_runs
-
-        atlas_path = ctx.params.get("atlas_path") or load_config(None).atlas.db_path
-        conn = open_atlas(Path(atlas_path))
-        try:
-            ids = [r.run_id for r in run_list_runs(conn)]
-        finally:
-            conn.close()
-    except Exception:
-        return []
-    return [rid for rid in ids if rid.startswith(incomplete)]
-
-
 def _echo_run_lineage(atlas_path: Path, selected_run: str | None) -> None:
     """Print the run's scan lineage at the top of a CLI view (M8c) — the stale-scan guard.
 
@@ -698,13 +670,13 @@ def runs(config: Path | None, atlas_path: Path | None, as_json: bool) -> None:
 
 
 @click.command("triage", short_help="Rank & show candidates only (scan's 3rd stage)")
-@click.argument("run_id", required=False, default=None, shell_complete=_complete_run_ids)
+@click.argument("run_id", required=False, default=None, shell_complete=_complete_run_id)
 @click.option(
     "--run",
     "run_opt",
     default=None,
     help="Restrict to one run id (overrides RUN_ID).",
-    shell_complete=_complete_run_ids,
+    shell_complete=_complete_run_id,
 )
 @click.option(
     "--top", "top_n", type=int, default=None, help="Show at most N candidates (default 20)."

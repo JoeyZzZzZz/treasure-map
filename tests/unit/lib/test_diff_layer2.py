@@ -194,6 +194,45 @@ def test_edge_changed_when_callee_set_differs(tmp_path: Path) -> None:
     con.close()
 
 
+def test_dimension_delta_carries_binary_parsed_from_subject_key(tmp_path: Path) -> None:
+    # ★ The binary column is filled at write time from the subject_key prefix
+    # ({binary}|{mech}|{key}|{anchor}), so a per-binary consumer filters on a real column instead of
+    # a brittle subject_key LIKE. Break the derivation (or drop the column write) and this reds.
+    con = _atlas(tmp_path)
+    _seed_matched(con)
+    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    rows = con.execute(
+        "SELECT subject_key, binary FROM dimension_delta WHERE diff_id='d' AND subject_kind='edge'"
+    ).fetchall()
+    assert rows  # at least one edge subject
+    for subject_key, binary in rows:
+        assert binary == "lib.so"  # the diffed binary, not NULL, not the whole subject_key
+        assert subject_key.split("|")[0] == binary  # parsed from the prefix, in lock-step
+    con.close()
+
+
+def test_binary_scope_unrecorded_marker_has_null_binary(tmp_path: Path) -> None:
+    # ★ The dimension-level marker ("{dim}:binary_scope_unrecorded", no "|") must carry a NULL
+    # binary -- the honest value for a diff whose binary scope was never recorded, never a garbage
+    # split of the marker string.
+    con = _atlas(tmp_path)
+    _cap(con, "ra", _SKE, 1)
+    _cap(con, "rb", _SKE, 1)
+    add_string_keyed_edges(con, [_edge("ra", "k", "1000", "2000")])
+    add_string_keyed_edges(con, [_edge("rb", "k", "1100", "2100")])
+    _align(con, "d", [("1000", "1100", 0.98, "aligned")])
+    _diff_meta(con, "d", binary=None)  # NULL scope -> the refusal marker
+    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    rows = con.execute(
+        "SELECT subject_key, binary FROM dimension_delta WHERE diff_id='d'"
+    ).fetchall()
+    assert rows
+    for subject_key, binary in rows:
+        assert "binary_scope_unrecorded" in subject_key
+        assert binary is None
+    con.close()
+
+
 def test_g1_aligns_by_address_not_by_name(tmp_path: Path) -> None:
     # ★ from_function NAME differs (FUN_x vs FUN_y, address-derived) but from_func_addr aligns ->
     # unchanged. The name is never used for cross-version comparison.

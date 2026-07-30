@@ -10,7 +10,7 @@ from pathlib import Path
 
 from click.testing import CliRunner
 
-from treasure_map.cli.hunt_cli import _complete_run_ids, runs, triage
+from treasure_map.cli.hunt_cli import _complete_run_id, runs, triage
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import InstanceRow
 from treasure_map.lib.atlas.writer import add_instance, begin_run, finish_run, upsert_pattern
@@ -94,6 +94,6 @@ def test_run_id_completion_matches_prefix(tmp_path: Path) -> None:
     class _Ctx:
         params = {"atlas_path": atlas}
 
-    out = _complete_run_ids(_Ctx(), None, "rt_")  # type: ignore[arg-type]
-    assert out == ["rt_scanned"]
-    assert _complete_run_ids(_Ctx(), None, "zzz") == []  # type: ignore[arg-type]
+    out = _complete_run_id(_Ctx(), None, "rt_")  # type: ignore[arg-type]
+    assert [c.value for c in out] == ["rt_scanned"]
+    assert _complete_run_id(_Ctx(), None, "zzz") == []  # type: ignore[arg-type]

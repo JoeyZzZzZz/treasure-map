@@ -336,6 +336,7 @@ class DimensionDeltaRow:
     undetermined_reason: str | None = None
     capability_ref: str | None = None
     alignment_confidence: float | None = None
+    binary: str | None = None  # diff's target binary (short name), parsed from subject_key
     id: int | None = None
 
 

@@ -132,11 +132,12 @@ def grade_candidate(
     *,
     source_class: str | None = None,
 ) -> ReachabilityVerdict:
-    """Grade one candidate as confirmed / blocked / unknown.
+    """Grade one candidate as confirmed / unknown (``blocked`` is reserved, never emitted here).
 
-    source_class is accepted for interface symmetry with the detection layer; the grade
-    is decided from the pseudocode, callees, and sink alone. See the module docstring for
-    the deliberate intra-procedural limits.
+    v1 returns only "confirmed" or "unknown"; a would-be "blocked" grades "unknown" (see the
+    module docstring — deciding non-reachability soundly is left to the deep engine, so "blocked"
+    stays a valid but unused ReachabilityStatus). source_class is accepted for interface symmetry
+    with the detection layer; the grade is decided from the pseudocode, callees, and sink alone.
     """
     if not callees:
         return ReachabilityVerdict("unknown", None, _BASIS_NO_CALLEES, degraded=True)

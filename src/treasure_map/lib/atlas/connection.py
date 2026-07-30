@@ -117,6 +117,14 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if dm_cols and "binary_b" not in dm_cols:
         conn.execute("ALTER TABLE diff_meta ADD COLUMN binary_b TEXT")
 
+    # dimension_delta.binary (added this round): the diff's target binary (short name), parsed from
+    # subject_key at write time, so a per-binary consumer filters on a real column instead of a
+    # brittle LIKE on the subject_key prefix. An atlas that already created dimension_delta needs
+    # the column; nullable TEXT, existing rows carry NULL until re-diffed. Idempotent.
+    dd_cols = _column_names(conn, "dimension_delta")
+    if dd_cols and "binary" not in dd_cols:
+        conn.execute("ALTER TABLE dimension_delta ADD COLUMN binary TEXT")
+
 
 def open_atlas(db_path: Path) -> sqlite3.Connection:
     """Open (or create) the atlas SQLite database and apply the schema.

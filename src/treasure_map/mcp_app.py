@@ -64,6 +64,11 @@ from treasure_map.lib.query import runs_where_function_exists as _runs_where_fun
 from treasure_map.lib.query import state_value_label as _state_value_label
 from treasure_map.lib.query import triage as _triage
 from treasure_map.lib.query import twins as _twins
+from treasure_map.lib.query.diff_align import align_by_a as _align_by_a
+from treasure_map.lib.query.diff_align import align_by_b as _align_by_b
+from treasure_map.lib.query.diff_align import get_diff_capabilities as _get_diff_capabilities
+from treasure_map.lib.query.diff_align import get_diff_deltas as _get_diff_deltas
+from treasure_map.lib.query.diff_align import get_diff_meta as _get_diff_meta
 
 # A standing reminder attached to every candidate-listing / aggregation result: the ordering and
 # recurrence signals are derived from neutral stored facts, carry their evidence, and are NOT a
@@ -872,6 +877,90 @@ def make_tools(
             conn.close()
         return result
 
+    def get_diff_deltas(
+        diff_id: str,
+        binary: str | None = None,
+        dimension: str | None = None,
+        delta_kind: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+        verbose: bool = False,
+    ) -> dict[str, Any]:
+        """The tri-state dimension DELTAS a version diff produced, for one ``diff_id`` (default
+        ``{run_a}::{run_b}``). Filter by ``binary`` (the diffed binary's short name), ``dimension``,
+        ``delta_kind``; page with ``limit``/``offset``.
+
+        ★ A delta is a PROJECTION of two already-computed annotations, NOT a change/quality verdict.
+        ``layer_changed`` = the patch changed this aligned function's edge set -- NOT proof the
+        change matters, you judge that. ``delta_undetermined`` is NOT 'unchanged' -- always read
+        its ``undetermined_reason`` (an enum that may grow; do not branch on it). ``state_a`` /
+        ``state_b`` are OPAQUE strings you interpret. An EMPTY result is NOT 'no changes' -- call
+        get_diff_capabilities to see which dimensions this diff can even delta. ``verbose=false``
+        keeps the payload to rows + paging; ``verbose=true`` adds the note + legend."""
+        conn = open_atlas(atlas_path)
+        try:
+            return _get_diff_deltas(
+                conn,
+                diff_id,
+                binary=binary,
+                dimension=dimension,
+                delta_kind=delta_kind,
+                limit=limit,
+                offset=offset,
+                verbose=verbose,
+            )
+        finally:
+            conn.close()
+
+    def get_diff_meta(diff_id: str) -> dict[str, Any]:
+        """The meta facts of one version diff (``diff_id`` default ``{run_a}::{run_b}``): binary
+        scope, tool/decompiler versions, and the alignment + presence counts.
+
+        ★ ``version_skew=1`` means every delta in this diff is version_skew undetermined -- do not
+        read it as 'no change'; it compares only the analysis-tool version, not the firmware. A NULL
+        ``ghidra_version`` = that side recorded none. ``unmatched_b`` = B-side functions with no
+        A-side match (the presence layer, the WEAKEST signal -- to find changes look at
+        ``layer_changed`` via get_diff_deltas, not this)."""
+        conn = open_atlas(atlas_path)
+        try:
+            return _get_diff_meta(conn, diff_id)
+        finally:
+            conn.close()
+
+    def get_function_alignment(diff_id: str, addr: str, side: str = "a") -> dict[str, Any]:
+        """The BinDiff-aligned counterpart of one function address in a diff. ``side="a"`` resolves
+        an A-side (before) address to its B-side match; ``side="b"`` the reverse. The core "I found
+        something at address X -- did the other version patch it?" lookup.
+
+        ★ Returns an ALIGNMENT FACT, never a verdict: ``alignment_confidence`` = trust in the
+        pairing, ``similarity`` = how much the pair differs (a pair can be similarity=1.0 yet
+        confidence ~0.02). ``alignment_undetermined`` means the alignment ITSELF is uncertain --
+        neither 'not matched' nor 'changed'. No match here is NOT proof the function was added or
+        removed (see function_presence)."""
+        conn = open_atlas(atlas_path)
+        try:
+            if side == "b":
+                return _align_by_b(conn, diff_id, addr)
+            return _align_by_a(conn, diff_id, addr)
+        finally:
+            conn.close()
+
+    def get_diff_capabilities(diff_id: str) -> dict[str, Any]:
+        """Per-dimension capability state for a diff (``diff_id`` default ``{run_a}::{run_b}``):
+        which dimensions each side could analyse and whether this diff can produce a delta for them.
+
+        ★ ``delta_supported=0`` for a dimension is an EXPLICIT non-judgement -- the dimension is
+        VISIBLE but this diff produces no per-subject delta for it, never a silent omission. Read
+        this alongside an empty get_diff_deltas: empty there + delta_supported=0 here = 'this diff
+        does not delta that dimension', which is NOT the same as 'nothing changed'. ``state_a`` /
+        ``state_b`` are each side's analysis capability (present / declared_absent /
+        registration_unknown)."""
+        conn = open_atlas(atlas_path)
+        try:
+            return _get_diff_capabilities(conn, diff_id)
+        finally:
+            conn.close()
+
     def get_pseudocode(
         function: str | None = None,
         binary: str | None = None,
@@ -1208,6 +1297,10 @@ def make_tools(
         "get_sink_provenance": get_sink_provenance,
         "get_nvram_key_flow": get_nvram_key_flow,
         "get_string_keyed_edges": get_string_keyed_edges,
+        "get_diff_deltas": get_diff_deltas,
+        "get_diff_meta": get_diff_meta,
+        "get_function_alignment": get_function_alignment,
+        "get_diff_capabilities": get_diff_capabilities,
         "cross_firmware_patterns": cross_firmware_patterns,
         "pattern_density": pattern_density,
         "pattern_twins": pattern_twins,

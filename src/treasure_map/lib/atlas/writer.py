@@ -238,15 +238,16 @@ def add_dimension_deltas(
         return 0
     conn.executemany(
         """INSERT INTO dimension_delta
-           (diff_id, dimension, subject_kind, subject_key, state_a, state_b, delta_kind,
+           (diff_id, dimension, subject_kind, subject_key, binary, state_a, state_b, delta_kind,
             undetermined_scope, undetermined_reason, capability_ref, alignment_confidence)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         [
             (
                 r.diff_id,
                 r.dimension,
                 r.subject_kind,
                 r.subject_key,
+                r.binary,
                 r.state_a,
                 r.state_b,
                 r.delta_kind,

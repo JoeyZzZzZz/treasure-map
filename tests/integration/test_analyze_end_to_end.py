@@ -41,6 +41,9 @@ def _mock_runner() -> MagicMock:
     # Fix A: the pipeline binds runner.pass_version() as a SQL param; a bare MagicMock is
     # unbindable. A stable string keeps it constant across runners (no spurious re-dirty).
     runner.pass_version.return_value = "testpass"
+    # Same reason: the pipeline now also binds runner.ghidra_version() (the decompiler version the
+    # scan records); a bare MagicMock is unbindable, so give it a stable string.
+    runner.ghidra_version.return_value = "11.4.3"
     return runner
 
 
