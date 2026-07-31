@@ -1109,6 +1109,16 @@ def scan(
         raise click.ClickException(str(exc)) from exc
     ws_path = resolved.path
 
+    # ★ Store an ABSOLUTE firmware root so a later `tmap diff` can locate the binaries from ANY cwd
+    # (binaries.path and firmware_path both derive from this one fs_root). The window is tight and
+    # bounded on BOTH sides: resolve AFTER resolve_workspace (auto-naming without -w uses the raw
+    # fs_root.name — resolving '.' first would rename the workspace and silently re-scan from
+    # scratch) but BEFORE run_analyze (the traversal that writes binaries.path runs there, well
+    # before firmware_path is recorded — resolving only near firmware_path would leave binaries.path
+    # relative, exactly the half that blocks diff). One resolve here keeps both paths consistent
+    # (mirrors analyzer2's resolve of analysis_db_path).
+    fs_root = fs_root.resolve()
+
     effective_run_id = run_id if run_id is not None else ws_path.name
     resolved_atlas = atlas_path if atlas_path is not None else cfg.atlas.db_path
 

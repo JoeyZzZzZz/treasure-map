@@ -58,6 +58,7 @@ where = ["src"]
 # this because they run from the source tree. Extend these globs for any new asset.
 [tool.setuptools.package-data]
 "treasure_map.lib.analyze.ghidra" = ["*.java"]
+"treasure_map.lib.diff.ghidra" = ["*.java"]
 "treasure_map.lib.storage" = ["*.sql"]
 
 [tool.pytest.ini_options]

@@ -20,6 +20,7 @@ _PYPROJECT = Path(__file__).resolve().parents[2] / "pyproject.toml"
 # (package, resource) pairs for every non-.py asset the runtime loads from disk.
 _ASSETS = [
     ("treasure_map.lib.analyze.ghidra", "ExportFunctions.java"),
+    ("treasure_map.lib.diff.ghidra", "ExportBinExport.java"),
     ("treasure_map.lib.storage", "atlas_schema.sql"),
     ("treasure_map.lib.storage", "schema.sql"),
 ]
@@ -38,4 +39,5 @@ def test_pyproject_declares_package_data() -> None:
     data = tomllib.loads(_PYPROJECT.read_text())
     package_data = data["tool"]["setuptools"]["package-data"]
     assert "*.java" in package_data["treasure_map.lib.analyze.ghidra"]
+    assert "*.java" in package_data["treasure_map.lib.diff.ghidra"]
     assert "*.sql" in package_data["treasure_map.lib.storage"]

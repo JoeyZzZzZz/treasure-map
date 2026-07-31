@@ -160,6 +160,45 @@ def test_scan_runs_three_steps_in_order(tmp_path: Path, monkeypatch: pytest.Monk
     assert seen["firmware_path"] is not None  # scan wires the firmware root into the run lineage
 
 
+def test_scan_stores_absolute_firmware_path_from_relative_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ★ Fix C: firmware_path (and binaries.path — same fs_root) must be recorded ABSOLUTE so a later
+    # `tmap diff` locates the binaries from ANY cwd. Invoke scan with a RELATIVE fs_root (cwd set to
+    # its parent); both the firmware_path handed to hunt AND the fs_root handed to analyze (which
+    # writes binaries.path) must be absolute. Reverting the `fs_root = fs_root.resolve()` line reds
+    # this.
+    _base_patches(monkeypatch)
+    _mkfs(tmp_path)  # creates tmp_path/fs
+    monkeypatch.chdir(tmp_path)
+    seen: dict[str, Any] = {}
+
+    async def _fake_analyze(fs_root: Any, *_: Any, **__: Any) -> SimpleNamespace:
+        seen["analyze_fs_root"] = fs_root
+        return _fake_analyze_result(tmp_path / "analysis.db")
+
+    def _fake_hunt(
+        db: Any, atlas: Any, *, source_run_id: str, firmware_path: str | None = None
+    ) -> Any:
+        seen["firmware_path"] = firmware_path
+        return _hunt_stats()
+
+    monkeypatch.setattr("treasure_map.lib.analyze.pipeline.run_analyze", _fake_analyze)
+    monkeypatch.setattr("treasure_map.lib.hunt.run_analyzer2", _fake_hunt)
+    monkeypatch.setattr("treasure_map.lib.query.triage", lambda conn, *, run_id=None: [])
+
+    result = CliRunner().invoke(
+        scan,
+        ["fs", "-w", "router_v1", "--atlas", str(tmp_path / "atlas.db")],  # RELATIVE fs_root
+    )
+
+    assert result.exit_code == 0, result.output
+    assert Path(
+        seen["firmware_path"]
+    ).is_absolute()  # recorded absolute -> diff locates from any cwd
+    assert Path(seen["analyze_fs_root"]).is_absolute()  # traversal (binaries.path) also absolute
+
+
 def test_scan_explicit_run_id_overrides_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

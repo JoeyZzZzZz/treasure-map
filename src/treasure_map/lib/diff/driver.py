@@ -48,6 +48,13 @@ if TYPE_CHECKING:
     from treasure_map.lib.atlas.models import RunRow
     from treasure_map.lib.config.config import Config
 
+# tmap's OWN headless BinExport script. Kept OUT of lib/analyze/ghidra on purpose:
+# compute_pass_version hashes EVERY *.java in that dir, so a file added there would change the
+# extraction pass_version and re-extract every binary of every firmware on the next scan. This dir
+# is not on that hash path.
+_SCRIPT_DIR = Path(__file__).parent / "ghidra"
+_BINEXPORT_SCRIPT = "ExportBinExport.java"
+
 
 class DiffToolchainError(TreasureMapError):
     """The external diff toolchain (Ghidra + BinExport plugin + BinDiff CLI) is not available, or a
@@ -161,6 +168,13 @@ def _check_toolchain(config: Config) -> None:
         missing.append("Ghidra analyzeHeadless (set ghidra.local.home or $GHIDRA_HOME)")
     if headless is not None and not _binexport_present(headless):
         missing.append("the BinExport Ghidra extension (install the prebuilt BinExport for 11.4.3)")
+    # tmap's OWN export script is a runtime .java asset — a wheel that dropped the package-data glob
+    # would ship without it, so verify it here (a packaging problem, not a missing 3rd-party tool).
+    if not (_SCRIPT_DIR / _BINEXPORT_SCRIPT).is_file():
+        missing.append(
+            f"tmap's own {_BINEXPORT_SCRIPT} (expected at {_SCRIPT_DIR}) — a packaging problem, "
+            "not a missing third-party tool: reinstall tmap"
+        )
     if _find_bindiff() is None:
         missing.append("the 'bindiff' CLI on PATH (install BinDiff 8)")
     if missing:
@@ -276,15 +290,45 @@ def _so_not_found_msg(run_id: str, binary_name: str, run: RunRow) -> str:
 # ── external toolchain orchestration (REAL-MACHINE; not exercised in CI) ──────────────
 
 
-def _run_binexport(so_path: Path, config: Config, out_dir: Path, side: str, timeout_s: int) -> Path:
-    """Export one ``.so`` to a ``.BinExport`` via Ghidra headless + the BinExport plugin.
+def _tail(raw: bytes | None, n: int) -> str:
+    return raw.decode("utf-8", "replace")[-n:] if raw else ""
 
-    REAL-MACHINE PATH — requires Ghidra 11.4.3 + the BinExport extension; not runnable in CI. The
-    command line is the one adjustment point if the plugin's headless entry changes."""
+
+def _diag(
+    cmd: list[str], proc: subprocess.CompletedProcess[bytes], log_path: Path | None = None
+) -> str:
+    """A readable failure report for a Ghidra/BinDiff subprocess.
+
+    ★ Ghidra's and BinDiff's REAL diagnostics go to stdout and the ``-log`` file; stderr carries
+    only the JVM banner. Reporting stderr alone (the original trap) makes a failure unreadable —
+    this investigation's cost was almost entirely 'only the stderr banner was shown'. So this always
+    includes the full argv, the stdout tail, the stderr tail, and the -log tail when there."""
+    parts = [f"argv: {' '.join(cmd)}"]
+    out = _tail(proc.stdout, 1600)
+    err = _tail(proc.stderr, 800)
+    if out:
+        parts.append(f"stdout(tail):\n{out}")
+    if err:
+        parts.append(f"stderr(tail):\n{err}")
+    if log_path is not None and log_path.is_file():
+        log = log_path.read_text(errors="replace")[-1600:]
+        if log:
+            parts.append(f"log(tail):\n{log}")
+    return "\n".join(parts)
+
+
+def _run_binexport(so_path: Path, config: Config, out_dir: Path, side: str, timeout_s: int) -> Path:
+    """Export one ``.so`` to a ``.BinExport`` via Ghidra headless + tmap's own export script.
+
+    REAL-MACHINE PATH — requires Ghidra 11.4.3 + the BinExport extension (for its classes); not
+    runnable in CI. Uses tmap's own non-interactive ``ExportBinExport.java`` (NOT the extension's
+    interactive ``BinExport.java``, which ignores the output-path argument and lets analyzeHeadless
+    exit 0 with no file). The argv here is the one adjustment point if the export entry changes."""
     from treasure_map.lib.analyze.ghidra_runner import find_headless
 
     headless = find_headless(config.ghidra)
     export_path = out_dir / f"{side}.BinExport"
+    log_path = out_dir / f"{side}.ghidra.log"
     with tempfile.TemporaryDirectory(prefix="tm_binexport_proj_") as proj:
         cmd = [
             str(headless),
@@ -293,9 +337,13 @@ def _run_binexport(so_path: Path, config: Config, out_dir: Path, side: str, time
             "-import",
             str(so_path),
             "-postScript",
-            "BinExport.java",
+            _BINEXPORT_SCRIPT,
             str(export_path),
+            "-scriptPath",
+            str(_SCRIPT_DIR),
             "-deleteProject",
+            "-log",
+            str(log_path),
             "-analysisTimeoutPerFile",
             str(timeout_s),
         ]
@@ -308,10 +356,16 @@ def _run_binexport(so_path: Path, config: Config, out_dir: Path, side: str, time
             raise DiffToolchainError(
                 f"BinExport timed out for side {side} ({so_path.name})"
             ) from exc
-    if proc.returncode != 0 or not export_path.exists():
-        tail = proc.stderr.decode("utf-8", "replace")[-800:]
+    if proc.returncode != 0:
         raise DiffToolchainError(
-            f"BinExport failed for side {side} ({so_path.name}, rc={proc.returncode}): {tail}"
+            f"BinExport subprocess failed (side {side}, {so_path.name}, rc={proc.returncode})\n"
+            + _diag(cmd, proc, log_path)
+        )
+    if not export_path.exists():
+        raise DiffToolchainError(
+            f"BinExport produced no file for side {side} ({so_path.name}) although the process "
+            "exited 0 — the postScript did not run to completion (analyzeHeadless returns 0 even "
+            f"when a postScript aborts). Expected: {export_path}\n" + _diag(cmd, proc, log_path)
         )
     return export_path
 
@@ -340,11 +394,12 @@ def _run_bindiff(export_a: Path, export_b: Path, out_dir: Path, timeout_s: int) 
     except subprocess.TimeoutExpired as exc:
         raise DiffToolchainError("BinDiff timed out") from exc
     if proc.returncode != 0:
-        tail = proc.stderr.decode("utf-8", "replace")[-800:]
-        raise DiffToolchainError(f"BinDiff failed (rc={proc.returncode}): {tail}")
+        raise DiffToolchainError(f"BinDiff failed (rc={proc.returncode})\n" + _diag(cmd, proc))
     produced = sorted(out_dir.glob("*.BinDiff"))
     if not produced:
-        raise DiffToolchainError("BinDiff produced no .BinDiff output")
+        raise DiffToolchainError(
+            "BinDiff exited 0 but produced no .BinDiff output\n" + _diag(cmd, proc)
+        )
     return produced[0]
 
 

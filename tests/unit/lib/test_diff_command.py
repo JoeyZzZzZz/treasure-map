@@ -186,6 +186,28 @@ def test_check5_toolchain_missing_hard_blocks(
     con.close()
 
 
+def test_check5_own_export_script_missing_is_a_packaging_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ★ tmap's own ExportBinExport.java is a runtime .java asset; a wheel that dropped the
+    # package-data glob would ship without it. Point _SCRIPT_DIR at an empty dir (all third-party
+    # tools present) -> preflight hard-blocks with a "packaging problem: reinstall tmap" message,
+    # not a deep crash inside BinExport.
+    so = tmp_path / "lib.so"
+    so.write_bytes(b"\x7fELF")
+    atlas_path = _seed(tmp_path, so_a=str(so), so_b=str(so))
+    monkeypatch.setattr(
+        "treasure_map.lib.analyze.ghidra_runner.find_headless", lambda c: Path("/x")
+    )
+    monkeypatch.setattr(driver, "_binexport_present", lambda h: True)
+    monkeypatch.setattr(driver, "_find_bindiff", lambda: Path("/usr/bin/bindiff"))
+    monkeypatch.setattr(driver, "_SCRIPT_DIR", tmp_path / "no_scripts_here")  # script absent
+    con = open_atlas(atlas_path)
+    with pytest.raises(DiffToolchainError, match="packaging problem"):
+        preflight(con, "run_a", "run_b", "lib.so", config=_cfg(), force=False)
+    con.close()
+
+
 def test_check5_all_present_preflight_succeeds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

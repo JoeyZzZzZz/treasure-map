@@ -130,11 +130,22 @@ def open_atlas(db_path: Path) -> sqlite3.Connection:
     """Open (or create) the atlas SQLite database and apply the schema.
 
     The schema uses IF NOT EXISTS throughout, so re-applying it to an existing database is
-    safe and preserves all rows. An older atlas is then brought forward in place by _migrate
+    safe and preserves all rows. An older atlas is first brought forward in place by _migrate
     (adds instance.origin / binary_path / binary_content_hash / is_thin_cmd_wrapper /
-    wrapped_sink / flow_evidence, renames pattern.recurrence_breadth -> device_spread, drops
-    legacy pattern.device_category) — never by a table rebuild, so instance rows and all derived
-    counts are kept.
+    wrapped_sink / flow_evidence / dimension_delta.binary, renames pattern.recurrence_breadth ->
+    device_spread, drops legacy pattern.device_category) — never by a table rebuild, so instance
+    rows and all derived counts are kept.
+
+    ★ ORDER IS LOAD-BEARING: _migrate MUST run BEFORE executescript. The schema now carries an
+    index/constraint that references a MIGRATED-IN column (idx_dimdelta_bin on
+    dimension_delta(diff_id, binary)); on an OLD atlas whose dimension_delta predates that column,
+    running executescript first hits `CREATE INDEX ... (binary)` — IF NOT EXISTS guards only the
+    index NAME, not the referenced column — and raises "no such column: binary", so executescript
+    aborts and _migrate never runs: the atlas cannot be opened at all. Migrating first adds the
+    column, so the later CREATE INDEX finds it. On a fresh DB every _migrate step is a no-op
+    (_column_names returns empty for a table that does not exist yet), so this order is safe both
+    ways. Do NOT reorder these two lines — any future schema object that references a migrated
+    column would silently re-break every existing atlas.
 
     WARNING: Moving atlas.db requires sqlite3 .backup() or wal_checkpoint(TRUNCATE)
     before any file-copy — never a bare cp while WAL side-files exist.
@@ -143,7 +154,7 @@ def open_atlas(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     schema = _SCHEMA_PATH.read_text()
+    _migrate(conn)  # ★ BEFORE executescript — see the load-bearing-order note above
     conn.executescript(schema)
-    _migrate(conn)
     conn.commit()
     return conn

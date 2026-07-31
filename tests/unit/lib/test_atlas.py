@@ -722,3 +722,75 @@ def test_static_no_judgment_tokens_in_atlas() -> None:
         text = py_file.read_text().upper()
         for token in judgment_tokens:
             assert token not in text, f"Judgment token {token!r} found in {py_file.name}"
+
+
+# ---------------------------------------------------------------------------
+# Regression: an OLD-shape atlas (missing a migrated-in column) must reopen.
+# Every atlas test above builds a FRESH db, which is exactly why a bug that only
+# fires when an EXISTING atlas is re-opened slipped through. These simulate the
+# old shape by dropping a migrated-in column, then reopening.
+# ---------------------------------------------------------------------------
+
+
+def _table_cols(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def test_open_atlas_reopens_old_dimension_delta_missing_binary(tmp_path: Path) -> None:
+    # ★ Regression for the migrate-order bug. The schema's idx_dimdelta_bin references
+    # dimension_delta.binary, a MIGRATED-IN column. If executescript runs before _migrate, an OLD
+    # atlas whose dimension_delta predates that column hits `CREATE INDEX ... (binary)` — IF NOT
+    # EXISTS guards only the index NAME, not the column — and raises "no such column: binary", so
+    # the atlas cannot be opened at all. Simulate the old shape (drop the column + its index) and
+    # reopen. ★ Reverting the _migrate/executescript order in open_atlas makes this test red.
+    db = tmp_path / "atlas.db"
+    conn = open_atlas(db)
+    conn.execute(
+        "INSERT INTO dimension_delta (diff_id, dimension, subject_kind, subject_key, delta_kind) "
+        "VALUES ('r::r', 'dim', 'edge', 'k', 'layer_changed')"
+    )
+    conn.commit()
+    conn.execute("DROP INDEX IF EXISTS idx_dimdelta_bin")
+    conn.execute("ALTER TABLE dimension_delta DROP COLUMN binary")
+    conn.commit()
+    assert "binary" not in _table_cols(conn, "dimension_delta")  # old shape now
+    conn.close()
+
+    conn2 = open_atlas(db)  # must NOT raise
+    try:
+        assert "binary" in _table_cols(conn2, "dimension_delta")  # re-added by _migrate
+        index_names = {r[1] for r in conn2.execute("PRAGMA index_list(dimension_delta)")}
+        assert "idx_dimdelta_bin" in index_names  # index recreated by executescript
+        assert conn2.execute("SELECT COUNT(*) FROM dimension_delta").fetchone()[0] == 1  # row kept
+    finally:
+        conn2.close()
+
+
+@pytest.mark.parametrize(
+    ("table", "col"),
+    [
+        ("instance", "binary_path"),
+        ("instance", "flow_evidence"),
+        ("instance", "exposure_shape"),
+        ("diff_meta", "binary_a"),
+        ("nvram_key_flow", "via_wrapper"),
+    ],
+)
+def test_open_atlas_reopens_old_shape_missing_migrated_column(
+    tmp_path: Path, table: str, col: str
+) -> None:
+    # The same trap fires for ANY schema object that references a migrated column; more broadly, an
+    # old atlas missing any migrated column must reopen and get it back. Drop the column, reopen,
+    # assert it is re-added — coverage for the whole "old library opens" class, not one column.
+    db = tmp_path / "atlas.db"
+    conn = open_atlas(db)
+    conn.execute(f"ALTER TABLE {table} DROP COLUMN {col}")  # noqa: S608 -- literal params
+    conn.commit()
+    assert col not in _table_cols(conn, table)  # old shape now
+    conn.close()
+
+    conn2 = open_atlas(db)  # must NOT raise
+    try:
+        assert col in _table_cols(conn2, table)  # re-added by _migrate
+    finally:
+        conn2.close()
