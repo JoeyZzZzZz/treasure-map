@@ -582,3 +582,48 @@ def test_ingest_writes_size_bytes(tmp_path: Path) -> None:
     row = conn.execute("SELECT size_bytes FROM binaries WHERE sha256='deadbeef'").fetchone()
     assert row["size_bytes"] == 4096
     conn.close()
+
+
+def _rec_at(name: str, sha: str, path: Path) -> ElfRecord:
+    return ElfRecord(
+        path=path,
+        name=name,
+        arch="ARM:LE:32:v7",
+        elf_type="shared_library",
+        sha256=sha,
+        dt_needed=[],
+        protections={"nx": True, "pie": False, "canary": False, "relro": "none", "fortify": False},
+        size=4096,
+    )
+
+
+def test_cached_rescan_refreshes_binaries_path(tmp_path: Path) -> None:
+    # ★ A cached re-scan (same sha256) must pick up the CURRENT scan's path. Step 2's INSERT OR
+    # IGNORE leaves the existing row untouched, so the path is refreshed only by Step 3's UPDATE.
+    # Without that, a relative path an earlier scan wrote stays frozen and a cross-directory
+    # `tmap diff` cannot locate the .so. ★ Reverting the `path = ?` addition to Step 3 reds this.
+    conn = open_db(tmp_path / "analysis.db")
+    rel = Path("../fw/lib.so")  # the old, frozen-relative state (from a scan in a different cwd)
+    absolute = (tmp_path / "fw" / "lib.so").resolve()
+
+    ingest_elfs(conn, [_rec_at("lib.so", "abc123", rel)])  # earlier scan: relative path
+    conn.execute("UPDATE binaries SET ghidra_ok = 1 WHERE sha256 = 'abc123'")  # mark it cached/done
+    conn.commit()
+    before = conn.execute(
+        "SELECT path, last_seen_at FROM binaries WHERE sha256 = 'abc123'"
+    ).fetchone()
+    assert before["path"] == str(rel) and not Path(before["path"]).is_absolute()  # frozen-relative
+
+    # cached re-scan (same sha256 -> already_done, not re-run) carrying the CURRENT absolute path
+    _, dirty = ingest_elfs(conn, [_rec_at("lib.so", "abc123", absolute)])
+    assert "abc123" not in dirty  # genuinely cached, Ghidra not re-run
+
+    after = conn.execute(
+        "SELECT path, last_seen_at, ghidra_ok FROM binaries WHERE sha256 = 'abc123'"
+    ).fetchone()
+    assert Path(after["path"]).is_absolute()  # ★ the fix: cached row picked up the absolute path
+    assert after["path"] == str(absolute)  # exactly the current scan's path
+    assert after["ghidra_ok"] == 1  # non-regression: the cached row is not churned
+    assert after["last_seen_at"] >= before["last_seen_at"]  # non-regression: last_seen_at refreshed
+    assert conn.execute("SELECT COUNT(*) FROM binaries").fetchone()[0] == 1  # no duplicate row
+    conn.close()

@@ -23,9 +23,10 @@ def ingest_elfs(
 ) -> tuple[dict[str, int], set[str]]:
     """Ingest ELF records into the binaries table.
 
-    Uses INSERT OR IGNORE so the same sha256 is never duplicated.  Updates
-    last_seen_at for every sha256 in the current scan so the current_binaries
-    view reflects this run.
+    Uses INSERT OR IGNORE so the same sha256 is never duplicated.  Refreshes last_seen_at AND
+    path for every sha256 in the current scan (both are per-scan OBSERVED values, not
+    content-identity) so the current_binaries view reflects this run and a cached (unchanged)
+    binary still records the path THIS scan saw it at.
 
     ``reanalyze`` forces re-analysis ignoring the cache. ``REANALYZE_ALL`` re-runs every binary. A
     name or path SCOPES the run to only the matching binary/binaries and ignores all other
@@ -146,11 +147,18 @@ def ingest_elfs(
             ),
         )
 
-    # Step 3: touch last_seen_at for ALL records so current_binaries view is correct
-    if shas:
+    # Step 3: refresh last_seen_at AND path for ALL records — both are per-scan OBSERVED values
+    # (when the file was last seen / where it currently lives on THIS machine), NOT content-
+    # identity. Step 2's INSERT OR IGNORE leaves a cached (unchanged-sha256) row untouched, so
+    # without this the path would stay frozen at whatever an earlier scan wrote — e.g. a relative
+    # path from a different cwd — which then breaks locating the .so for a cross-directory
+    # `tmap diff`. path is a LOCATION property (same content can live at a new place), correctly
+    # keyed by sha256; it is not a content property like arch/sha that must never move with the
+    # scan. records dedupe by sha256, so no row is updated twice with conflicting paths.
+    if records:
         conn.executemany(
-            "UPDATE binaries SET last_seen_at = ? WHERE sha256 = ?",
-            [(scan_timestamp, sha) for sha in shas],
+            "UPDATE binaries SET last_seen_at = ?, path = ? WHERE sha256 = ?",
+            [(scan_timestamp, str(r.path), r.sha256) for r in records],
         )
 
     conn.commit()
