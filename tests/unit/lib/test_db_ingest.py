@@ -606,20 +606,20 @@ def test_cached_rescan_refreshes_binaries_path(tmp_path: Path) -> None:
     rel = Path("../fw/lib.so")  # the old, frozen-relative state (from a scan in a different cwd)
     absolute = (tmp_path / "fw" / "lib.so").resolve()
 
-    ingest_elfs(conn, [_rec_at("lib.so", "abc123", rel)])  # earlier scan: relative path
-    conn.execute("UPDATE binaries SET ghidra_ok = 1 WHERE sha256 = 'abc123'")  # mark it cached/done
+    ingest_elfs(conn, [_rec_at("lib.so", "facefeed", rel)])  # earlier scan: relative path
+    conn.execute("UPDATE binaries SET ghidra_ok = 1 WHERE sha256 = 'facefeed'")  # cached/done
     conn.commit()
     before = conn.execute(
-        "SELECT path, last_seen_at FROM binaries WHERE sha256 = 'abc123'"
+        "SELECT path, last_seen_at FROM binaries WHERE sha256 = 'facefeed'"
     ).fetchone()
     assert before["path"] == str(rel) and not Path(before["path"]).is_absolute()  # frozen-relative
 
     # cached re-scan (same sha256 -> already_done, not re-run) carrying the CURRENT absolute path
-    _, dirty = ingest_elfs(conn, [_rec_at("lib.so", "abc123", absolute)])
-    assert "abc123" not in dirty  # genuinely cached, Ghidra not re-run
+    _, dirty = ingest_elfs(conn, [_rec_at("lib.so", "facefeed", absolute)])
+    assert "facefeed" not in dirty  # genuinely cached, Ghidra not re-run
 
     after = conn.execute(
-        "SELECT path, last_seen_at, ghidra_ok FROM binaries WHERE sha256 = 'abc123'"
+        "SELECT path, last_seen_at, ghidra_ok FROM binaries WHERE sha256 = 'facefeed'"
     ).fetchone()
     assert Path(after["path"]).is_absolute()  # ★ the fix: cached row picked up the absolute path
     assert after["path"] == str(absolute)  # exactly the current scan's path
