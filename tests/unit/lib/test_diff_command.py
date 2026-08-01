@@ -301,6 +301,7 @@ def test_read_helpers_require_explicit_atlas_no_default_fallback() -> None:
         diff_align.get_diff_deltas,
         diff_align.get_diff_meta,
         diff_align.get_diff_capabilities,
+        diff_align.list_diffs,
         diff_align.align_by_a,
         diff_align.align_by_b,
     ):
@@ -321,6 +322,7 @@ def test_diff_read_helpers_have_no_write_sql() -> None:
         diff_align.get_diff_deltas,
         diff_align.get_diff_meta,
         diff_align.get_diff_capabilities,
+        diff_align.list_diffs,
         diff_align.align_by_a,
         diff_align.align_by_b,
     ):
@@ -382,3 +384,172 @@ def test_grade_candidate_never_returns_blocked() -> None:
     src = inspect.getsource(grader.grade_candidate)
     assert 'ReachabilityVerdict("blocked"' not in src
     assert "blocked" in inspect.getdoc(grader.grade_candidate).lower()  # documented as reserved
+
+
+# ── default full diff: change filter, failure-continue, confirm gate ───────────────────
+
+
+def _mk_multi_analysis(path: Path, name_to_sha: dict[str, str]) -> Path:
+    con = open_db(path)
+    for i, (name, sha) in enumerate(name_to_sha.items(), start=1):
+        con.execute(
+            "INSERT INTO binaries (id, name, path, sha256) VALUES (?, ?, ?, ?)",
+            (i, name, name, sha),
+        )
+    con.commit()
+    con.close()
+    return path
+
+
+def _seed_multi(tmp_path: Path, a: dict[str, str], b: dict[str, str]) -> Path:
+    _mk_multi_analysis(tmp_path / "a.db", a)
+    _mk_multi_analysis(tmp_path / "b.db", b)
+    atlas_path = tmp_path / "atlas.db"
+    con = open_atlas(atlas_path)
+    begin_run(
+        con,
+        "run_a",
+        analysis_db_path=str(tmp_path / "a.db"),
+        tool_version="0.0.1",
+        ghidra_version="11.4.3",
+    )
+    begin_run(
+        con,
+        "run_b",
+        analysis_db_path=str(tmp_path / "b.db"),
+        tool_version="0.0.1",
+        ghidra_version="11.4.3",
+    )
+    con.close()
+    return atlas_path
+
+
+def test_plan_full_diff_selects_only_changed_present_both_sides(tmp_path: Path) -> None:
+    # liba changed (sha differs), libb unchanged (same sha), libc only in A, libd only in B.
+    atlas_path = _seed_multi(
+        tmp_path,
+        {"liba": "s1", "libb": "same", "libc": "s3"},
+        {"liba": "s1b", "libb": "same", "libd": "s4"},
+    )
+    con = open_atlas(atlas_path)
+    plan = driver.plan_full_diff(con, "run_a", "run_b")
+    con.close()
+    assert plan.changed == ("liba",)  # only the content that differs, present both sides
+    assert plan.unchanged == ("libb",)  # skipped (diffing identical content is waste)
+    assert plan.only_in_a == ("libc",)
+    assert plan.only_in_b == ("libd",)
+
+
+def test_run_full_diff_continues_past_a_single_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ★ One binary's failure must not lose the rest — record it and keep going.
+    atlas_path = _seed_multi(
+        tmp_path,
+        {"liba": "1", "libb": "2", "libc": "3"},
+        {"liba": "1x", "libb": "2x", "libc": "3x"},
+    )
+    monkeypatch.setattr(driver, "_check_toolchain", lambda config: None)
+
+    def _fake_single(atlas, ra, rb, binary, *, config, force):  # type: ignore[no-untyped-def]
+        if binary == "libb":
+            raise DiffToolchainError("BinExport blew up for libb")
+        return driver.DiffSummary(
+            diff_id=f"run_a::run_b::{binary}",
+            binary=binary,
+            matched_pairs=1,
+            version_skew=False,
+            delta_layer_changed=1,
+            delta_layer_unchanged=0,
+            delta_undetermined=0,
+            warnings=(),
+        )
+
+    monkeypatch.setattr(driver, "run_version_diff", _fake_single)
+    con = open_atlas(atlas_path)
+    fsum = driver.run_full_diff(con, "run_a", "run_b", config=_cfg(), force=False)
+    con.close()
+    assert not fsum.cancelled
+    assert {o.binary for o in fsum.outcomes} == {"liba", "libb", "libc"}  # all attempted
+    failed = [o for o in fsum.outcomes if o.error is not None]
+    assert len(failed) == 1 and failed[0].binary == "libb"  # the one failure recorded
+    assert sum(1 for o in fsum.outcomes if o.error is None) == 2  # the others still succeeded
+
+
+def test_run_full_diff_confirm_gate_cancels_without_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    atlas_path = _seed_multi(tmp_path, {"liba": "1"}, {"liba": "2"})
+    monkeypatch.setattr(driver, "_check_toolchain", lambda config: None)
+    ran: list[str] = []
+    monkeypatch.setattr(
+        driver,
+        "run_version_diff",
+        lambda *a, **k: ran.append("x"),  # type: ignore[arg-type]
+    )
+    con = open_atlas(atlas_path)
+    fsum = driver.run_full_diff(con, "run_a", "run_b", config=_cfg(), confirm=lambda n: False)
+    con.close()
+    assert fsum.cancelled and fsum.outcomes == () and ran == []  # declined -> nothing ran
+
+
+def test_run_full_diff_no_changed_binaries_is_a_clean_noop(tmp_path: Path) -> None:
+    atlas_path = _seed_multi(tmp_path, {"liba": "same"}, {"liba": "same"})  # nothing changed
+    con = open_atlas(atlas_path)
+    fsum = driver.run_full_diff(con, "run_a", "run_b", config=_cfg())
+    con.close()
+    assert not fsum.cancelled and fsum.plan.changed == () and fsum.outcomes == ()
+
+
+# ── list_diffs (browse the diffs) ──────────────────────────────────────────────────────
+
+
+def _seed_two_diffs(atlas_path: Path) -> None:
+    con = open_atlas(atlas_path)
+    for binary, changed in (("liba", 2), ("libb", 5)):
+        did = f"run_a::run_b::{binary}"
+        con.execute(
+            "INSERT OR REPLACE INTO diff_meta (diff_id, run_a_id, run_b_id, version_skew, "
+            "binary_a, binary_b, matched_pairs) VALUES (?, 'run_a', 'run_b', 0, ?, ?, 100)",
+            (did, binary, binary),
+        )
+        add_dimension_deltas(
+            con,
+            [
+                DimensionDeltaRow(
+                    diff_id=did,
+                    dimension="reachability.string_keyed_edge",
+                    subject_kind="edge",
+                    subject_key=f"{binary}|m|k{n}|a",
+                    delta_kind="layer_changed",
+                    binary=binary,
+                )
+                for n in range(changed)
+            ],
+        )
+    con.close()
+
+
+def test_list_diffs_returns_every_binary_with_counts(tmp_path: Path) -> None:
+    atlas_path = tmp_path / "atlas.db"
+    open_atlas(atlas_path).close()
+    _seed_two_diffs(atlas_path)
+    con = open_atlas(atlas_path)
+    res = diff_align.list_diffs(con)
+    con.close()
+    assert res["count"] == 2
+    by_bin = {d["binary"]: d for d in res["diffs"]}
+    assert (
+        by_bin["liba"]["layer_changed"] == 2 and by_bin["liba"]["diff_id"] == "run_a::run_b::liba"
+    )
+    assert by_bin["libb"]["layer_changed"] == 5 and by_bin["libb"]["matched_pairs"] == 100
+
+
+def test_list_diffs_filters_by_run_pair(tmp_path: Path) -> None:
+    atlas_path = tmp_path / "atlas.db"
+    open_atlas(atlas_path).close()
+    _seed_two_diffs(atlas_path)
+    con = open_atlas(atlas_path)
+    assert diff_align.list_diffs(con, "run_a", "run_b")["count"] == 2
+    assert diff_align.list_diffs(con, "run_a", "other")["count"] == 0  # no such pair -> empty
+    con.close()

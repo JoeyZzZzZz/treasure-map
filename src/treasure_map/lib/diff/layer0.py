@@ -351,6 +351,19 @@ def _binary_name(analysis_db_path: str, binary: str) -> str | None:
     return row[0] if row is not None else None
 
 
+def make_diff_id(run_a_id: str, run_b_id: str, binary: str) -> str:
+    """The identity of ONE binary's diff between two runs: ``{run_a}::{run_b}::{binary}``.
+
+    Including the binary makes the id UNIQUE per (run_a, run_b, binary), so diffing a second binary
+    no longer overwrites the first: delete_diff / every ``WHERE diff_id = ?`` then naturally scopes
+    to a single binary, with no read-side filter to add or forget. ``binary`` MUST be the normalized
+    short name (== diff_meta.binary_a), never the raw ``--binary`` input (which may be a sha256), so
+    the same binary always maps to one id. diff_id is an OPAQUE key — nothing splits or parses it —
+    so appending a segment is safe for every consumer."""
+    assert "::" not in binary, f"binary short name must not contain '::': {binary!r}"
+    return f"{run_a_id}::{run_b_id}::{binary}"
+
+
 def _bindiff_file_hashes(bindiff_path: Path) -> list[str]:
     """The two per-side content hashes from a ``.BinDiff``'s ``file`` table, ordered by id
     (id=1 = A/before ↔ address1, id=2 = B/after ↔ address2). The declared ``CHARACTER(40)`` does not
@@ -418,11 +431,19 @@ def run_layer0_parse(
     run_a = _resolve_run(atlas, run_a_id, "a")
     run_b = _resolve_run(atlas, run_b_id, "b")
     _validate_bindiff_binaries(bindiff_path, run_a, run_b, binary_a, binary_b)
-    did = diff_id or f"{run_a_id}::{run_b_id}"
-
-    parsed = parse_bindiff(bindiff_path, did, threshold)
     assert run_a.analysis_db_path is not None  # _resolve_run guarantees it
     assert run_b.analysis_db_path is not None
+    # Normalize the target binary to its short name (== what diff_meta.binary_a stores), used for
+    # BOTH the diff_id's binary segment and the diff_meta columns so the two are consistent by
+    # construction. A version diff compares ONE binary, so the two sides must resolve to the same
+    # short name (a rename across versions is not this model's job) — assert it, fail-fast.
+    norm_a = _binary_name(run_a.analysis_db_path, binary_a)
+    norm_b = _binary_name(run_b.analysis_db_path, binary_b)
+    assert norm_a is not None and norm_b is not None  # binary must exist in the run (preflight)
+    assert norm_a == norm_b, f"a version diff compares one binary: got {norm_a!r} vs {norm_b!r}"
+    did = diff_id or make_diff_id(run_a_id, run_b_id, norm_a)
+
+    parsed = parse_bindiff(bindiff_path, did, threshold)
     baseline_a = load_baseline(run_a.analysis_db_path, binary_a)
     baseline_b = load_baseline(run_b.analysis_db_path, binary_b)
     pres_a = compute_side_presence(did, "a", parsed.matched_addrs_a, baseline_a)
@@ -434,9 +455,10 @@ def run_layer0_parse(
         run_a_id=run_a_id,
         run_b_id=run_b_id,
         # the diff's target binary per side, normalized to the short name AT WRITE TIME so the
-        # layer-2 per-binary filter matches (a caller-supplied sha256 would zero-match there).
-        binary_a=_binary_name(run_a.analysis_db_path, binary_a),
-        binary_b=_binary_name(run_b.analysis_db_path, binary_b),
+        # layer-2 per-binary filter matches (a caller-supplied sha256 would zero-match there). Same
+        # value that forms the diff_id's binary segment above (consistent by construction).
+        binary_a=norm_a,
+        binary_b=norm_b,
         tool_version_a=run_a.tool_version,
         tool_version_b=run_b.tool_version,
         ghidra_version_a=run_a.ghidra_version,

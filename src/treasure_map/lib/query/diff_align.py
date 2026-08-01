@@ -253,3 +253,59 @@ def get_diff_capabilities(atlas: sqlite3.Connection, diff_id: str) -> dict[str, 
         "capabilities": [dict(zip(cols, r, strict=True)) for r in rows],
         "note": _CAP_NOTE,
     }
+
+
+_LIST_DIFFS_NOTE = (
+    "Each row is ONE binary's diff between two runs (diff_id = {run_a}::{run_b}::{binary}). The "
+    "counts are tri-state PROJECTIONS, not verdicts: layer_changed = the binary's changed aligned "
+    "functions, NOT proof the change matters; delta_undetermined is NOT 'unchanged'. An EMPTY list "
+    "means no diff has been run for that filter yet — not 'nothing changed'. Pick a binary, then "
+    "read it with get_diff_deltas / get_diff_meta."
+)
+
+_LIST_DIFFS_COLS = (
+    "diff_id",
+    "binary",
+    "run_a_id",
+    "run_b_id",
+    "matched_pairs",
+    "version_skew",
+    "layer_changed",
+    "layer_unchanged",
+    "delta_undetermined",
+)
+
+
+def list_diffs(
+    atlas: sqlite3.Connection,
+    run_a_id: str | None = None,
+    run_b_id: str | None = None,
+) -> dict[str, Any]:
+    """Every binary diffed between two runs, with each one's change profile — the browse view after
+    a full diff. Optionally filter to a run-pair. Read-only; counts are tri-state projections, never
+    a verdict or a ranking (a diff is a map, not a score)."""
+    where: list[str] = []
+    params: list[Any] = []
+    if run_a_id is not None:
+        where.append("dm.run_a_id = ?")
+        params.append(run_a_id)
+    if run_b_id is not None:
+        where.append("dm.run_b_id = ?")
+        params.append(run_b_id)
+    clause = ("WHERE " + " AND ".join(where)) if where else ""
+    rows = atlas.execute(
+        "SELECT dm.diff_id, dm.binary_a, dm.run_a_id, dm.run_b_id, dm.matched_pairs, "  # noqa: S608
+        "dm.version_skew, "
+        "SUM(CASE WHEN dd.delta_kind='layer_changed' THEN 1 ELSE 0 END), "
+        "SUM(CASE WHEN dd.delta_kind='layer_unchanged' THEN 1 ELSE 0 END), "
+        "SUM(CASE WHEN dd.delta_kind='delta_undetermined' THEN 1 ELSE 0 END) "
+        "FROM diff_meta dm LEFT JOIN dimension_delta dd ON dd.diff_id = dm.diff_id "
+        f"{clause} GROUP BY dm.diff_id ORDER BY dm.run_a_id, dm.run_b_id, dm.binary_a",
+        params,
+    ).fetchall()
+    return {
+        "diffs": [dict(zip(_LIST_DIFFS_COLS, r, strict=True)) for r in rows],
+        "count": len(rows),
+        "filters": {"run_a_id": run_a_id, "run_b_id": run_b_id},
+        "note": _LIST_DIFFS_NOTE,
+    }

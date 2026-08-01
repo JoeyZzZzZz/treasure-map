@@ -24,10 +24,12 @@ from treasure_map.lib.diff.layer0 import (
     alignment_state,
     compute_side_presence,
     load_baseline,
+    make_diff_id,
     norm_hex,
     parse_bindiff,
     run_layer0_parse,
 )
+from treasure_map.lib.diff.layer2 import _load_alignment, run_layer2_delta
 from treasure_map.lib.errors import ConfigError
 from treasure_map.lib.query.diff_align import align_by_a, align_by_b
 from treasure_map.lib.storage.connection import open_db
@@ -717,4 +719,159 @@ def test_diff_meta_binary_normalized_to_short_name(tmp_path: Path) -> None:
     )
     assert r.meta.binary_a == "lib.so"  # normalized to the short name, NOT the sha
     assert r.meta.binary_b == "lib.so"
+    con.close()
+
+
+# ── Route A: diff_id includes the binary, so a second binary's diff never overwrites the first ──
+
+
+def _mk_analysis_multi(path: Path, bins: list) -> Path:  # type: ignore[type-arg]
+    """A synthetic analysis.db with SEVERAL binaries. bins = [(name, sha, [(addr,nm,pc,size)])]."""
+    con = open_db(path)
+    for bid, (binary, sha, funcs) in enumerate(bins, start=1):
+        con.execute(
+            "INSERT INTO binaries (id, name, path, sha256) VALUES (?, ?, ?, ?)",
+            (bid, binary, binary, sha),
+        )
+        for addr, name, pc, size in funcs:
+            con.execute(
+                "INSERT INTO functions (binary_id, name, address, pseudocode, size_bytes) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (bid, name, addr, pc, size),
+            )
+    con.commit()
+    con.close()
+    return path
+
+
+def test_make_diff_id_includes_binary_and_rejects_delimiter() -> None:
+    assert make_diff_id("ra", "rb", "libx.so") == "ra::rb::libx.so"
+    assert make_diff_id("ra", "rb", "liba") != make_diff_id("ra", "rb", "libb")  # per-binary unique
+    with pytest.raises(AssertionError):
+        make_diff_id("ra", "rb", "bad::name")  # '::' in the binary segment is refused
+
+
+def _seed_two_binaries(tmp_path: Path):  # type: ignore[no-untyped-def]
+    # Both binaries carry a function at the SAME address 0x1000 (a shared entry addr is the norm),
+    # so a diff_id that did NOT include the binary would let one binary's alignment clobber the
+    # other's. run_a/run_b give each binary a distinct sha per side.
+    # each A-side binary also has an UNMATCHED function at 0x2000 (only in A), so function_presence
+    # gets a row too — otherwise, with everything matched, that table is legitimately empty.
+    _mk_analysis_multi(
+        tmp_path / "a.db",
+        [
+            (
+                "liba",
+                "a_liba",
+                [("0x1000", "keep", "int k(){}", 64), ("0x2000", "gone", "int g(){}", 48)],
+            ),
+            (
+                "libb",
+                "b_liba",
+                [("0x1000", "keep", "int k(){}", 64), ("0x2000", "gone", "int g(){}", 48)],
+            ),
+        ],
+    )
+    _mk_analysis_multi(
+        tmp_path / "b.db",
+        [
+            ("liba", "a_libb", [("0x1100", "keep", "int k(){}", 64)]),
+            ("libb", "b_libb", [("0x1100", "keep", "int k(){}", 64)]),
+        ],
+    )
+    atlas_path = tmp_path / "atlas.db"
+    con = open_atlas(atlas_path)
+    begin_run(con, "run_a", analysis_db_path=str(tmp_path / "a.db"), tool_version="0.0.1")
+    begin_run(con, "run_b", analysis_db_path=str(tmp_path / "b.db"), tool_version="0.0.1")
+    con.close()
+    # one .BinDiff per binary; file hashes match that binary's per-side sha so the guard passes
+    bd_a = _mk_bindiff(
+        tmp_path / "liba.BinDiff",
+        [(0x1000, "func_liba", 0x1100, "func_liba", 0.98, 0.97, 3, 2, 20)],
+        file_hashes=("a_liba", "a_libb"),
+    )
+    bd_b = _mk_bindiff(
+        tmp_path / "libb.BinDiff",
+        [(0x1000, "func_libb", 0x1100, "func_libb", 0.98, 0.97, 3, 2, 20)],
+        file_hashes=("b_liba", "b_libb"),
+    )
+    return atlas_path, bd_a, bd_b
+
+
+def _diff(con, bd, binary):  # type: ignore[no-untyped-def]
+    return run_layer0_parse(
+        con, bindiff_path=bd, run_a_id="run_a", run_b_id="run_b", binary_a=binary, binary_b=binary
+    )
+
+
+def _full_diff(con, bd, binary):  # type: ignore[no-untyped-def]
+    r = _diff(con, bd, binary)
+    run_layer2_delta(con, diff_id=r.diff_id, run_a_id="run_a", run_b_id="run_b")
+    return r
+
+
+def test_two_binaries_diff_do_not_overwrite_each_other(tmp_path: Path) -> None:
+    # ★ The overwrite bug: delete_diff wipes every table by diff_id, so diffing a second binary
+    # under a binary-free diff_id deleted the first binary's rows. With the binary in the diff_id,
+    # both survive. Diff liba, then libb (layer0 + layer2 each); assert liba's rows are STILL there
+    # in all diff tables.
+    atlas_path, bd_a, bd_b = _seed_two_binaries(tmp_path)
+    con = open_atlas(atlas_path)
+    ra = _full_diff(con, bd_a, "liba")
+    _full_diff(con, bd_b, "libb")  # this must NOT delete liba's diff
+
+    assert ra.diff_id == "run_a::run_b::liba"  # unique per binary
+    for table in (
+        "diff_meta",
+        "function_alignment",
+        "function_presence",
+        "dimension_capability_state",
+    ):
+        n_a = con.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE diff_id = ?", ("run_a::run_b::liba",)
+        ).fetchone()[0]
+        n_b = con.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE diff_id = ?", ("run_a::run_b::libb",)
+        ).fetchone()[0]
+        assert n_a > 0, f"{table}: liba's diff was overwritten by libb"
+        assert n_b > 0, f"{table}: libb's diff is missing"
+    con.close()
+
+
+def test_two_binaries_diff_overwrite_when_binary_dropped_from_id(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    # Reverse-verify the fix's teeth: drop the binary from the diff_id (the pre-fix behavior) and
+    # the second diff DOES clobber the first — proving the binary segment is what isolates them.
+    monkeypatch.setattr(
+        "treasure_map.lib.diff.layer0.make_diff_id", lambda a, b, _binary: f"{a}::{b}"
+    )
+    atlas_path, bd_a, bd_b = _seed_two_binaries(tmp_path)
+    con = open_atlas(atlas_path)
+    _diff(con, bd_a, "liba")
+    _diff(con, bd_b, "libb")  # same diff_id 'run_a::run_b' -> delete_diff wipes liba
+    # liba's alignment (name func_liba) is gone; only libb's remains under the shared id
+    names = {
+        r[0]
+        for r in con.execute("SELECT name_a FROM function_alignment WHERE diff_id = 'run_a::run_b'")
+    }
+    assert names == {"func_libb"}  # liba clobbered
+    con.close()
+
+
+def test_read_side_scopes_to_one_binary_despite_shared_addr(tmp_path: Path) -> None:
+    # ★ Route A's core claim: read points need ZERO changes because a unique diff_id already scopes
+    # each WHERE diff_id=? to one binary. Both binaries align addr 0x1000; reading liba's diff_id
+    # must return liba's pairing, never libb's, even though the addr collides.
+    atlas_path, bd_a, bd_b = _seed_two_binaries(tmp_path)
+    con = open_atlas(atlas_path)
+    _diff(con, bd_a, "liba")
+    _diff(con, bd_b, "libb")
+
+    a2b_a, _ = _load_alignment(con, "run_a::run_b::liba")
+    a2b_b, _ = _load_alignment(con, "run_a::run_b::libb")
+    # both have a mapping for 0x1000, but each to its OWN diff's data (no cross-pollution)
+    fwd = align_by_a(con, "run_a::run_b::liba", "0x1000")
+    assert fwd["found"] and fwd["pairs"][0]["name_a"] == "func_liba"  # liba's row, not libb's
+    assert "00001000" in a2b_a and "00001000" in a2b_b  # each diff has its own 0x1000 mapping
     con.close()

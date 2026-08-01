@@ -84,15 +84,61 @@ def _echo_legal_notice(*, as_json: bool = False) -> None:
     click.echo("", err=True)
 
 
-@click.command("diff", short_help="Compare two firmware runs for one binary (map-model diff)")
+def _echo_single_diff(summary: Any, resolved_atlas: Path) -> None:
+    """Print one binary's diff result (the --binary or single-binary path)."""
+    for w in summary.warnings:
+        click.echo(f"warning: {w}", err=True)
+    click.echo(f"Atlas: {resolved_atlas}")
+    click.echo(f"  diff_id       : {summary.diff_id}")
+    click.echo(f"  binary        : {summary.binary}")
+    click.echo(f"  matched_pairs : {summary.matched_pairs}")
+    click.echo(f"  version_skew  : {summary.version_skew}")
+    click.echo(
+        "  delta         : "
+        f"layer_changed={summary.delta_layer_changed}, "
+        f"layer_unchanged={summary.delta_layer_unchanged}, "
+        f"delta_undetermined={summary.delta_undetermined}"
+    )
+    click.echo(
+        "Read the deltas: get_diff_deltas / get_diff_meta / get_function_alignment / "
+        "get_diff_capabilities"
+    )
+
+
+def _echo_full_diff(fsum: Any, resolved_atlas: Path) -> None:
+    """Print a full diff's roll-up: what was diffed vs skipped, and per-binary success/failure."""
+    plan = fsum.plan
+    click.echo(f"Atlas: {resolved_atlas}")
+    if fsum.cancelled:
+        click.echo(f"Cancelled — {len(plan.changed)} changed binaries not diffed.")
+        return
+    if not plan.changed:
+        click.echo("No changed binaries between the two runs (nothing to diff).")
+    ok = [o for o in fsum.outcomes if o.error is None]
+    failed = [o for o in fsum.outcomes if o.error is not None]
+    click.echo(
+        f"  binaries      : {len(plan.changed)} changed (diffed), {len(plan.unchanged)} unchanged "
+        f"(skipped), only-in-A {len(plan.only_in_a)}, only-in-B {len(plan.only_in_b)}"
+    )
+    click.echo(f"  diffed        : {len(ok)} ok, {len(failed)} failed")
+    for o in failed:
+        click.echo(f"    - {o.binary}: {o.error}")
+    if plan.changed:
+        click.echo("Read the deltas: list_diffs, then get_diff_deltas / get_diff_meta")
+
+
+@click.command(
+    "diff", short_help="Compare two firmware runs (all changed binaries, or one with --binary)"
+)
 @click.argument("run_a_id", shell_complete=_complete_run_id)
 @click.argument("run_b_id", shell_complete=_complete_run_id)
 @click.option(
     "--binary",
     "binary_name",
-    required=True,
-    help="Short name of the ONE binary to diff (e.g. one .so). A whole-firmware diff is orders of "
-    "magnitude more expensive, so exactly one binary is diffed per command (no --all-binaries).",
+    default=None,
+    help="Diff only this ONE binary (short name). Omitted (the default) diffs EVERY binary whose "
+    "content changed between the two runs — the cross-binary view is tmap diff's unique value; a "
+    "single binary you can already do in Ghidra.",
 )
 @click.option(
     "--force",
@@ -118,51 +164,80 @@ def _echo_legal_notice(*, as_json: bool = False) -> None:
 def hunt_diff(
     run_a_id: str,
     run_b_id: str,
-    binary_name: str,
+    binary_name: str | None,
     force: bool,
     config: Path | None,
     atlas_path: Path | None,
 ) -> None:
-    """Diff two runs of ONE binary through the map-model pipeline, in a single command.
+    """Diff two runs through the map-model pipeline, in a single command.
 
     RUN_A_ID / RUN_B_ID are run ids (a run id is scan's --run-id, default = the -w workspace name),
-    NOT paths; tab-completion lists this atlas's runs. Drives the external aligner end-to-end
-    (BinExport -> BinDiff, you never touch an intermediate file), then writes alignment facts and
-    tri-state dimension deltas to the atlas. A delta is a PROJECTION of existing annotations, never
-    a change/defect verdict -- read it with the get_diff_* MCP tools and judge it yourself.
+    NOT paths; tab-completion lists this atlas's runs. By default diffs every binary that changed
+    between the two runs (serially, with progress); ``--binary NAME`` focuses one. Drives the
+    external aligner end-to-end (BinExport -> BinDiff, you never touch an intermediate file), then
+    writes alignment facts and tri-state dimension deltas to the atlas. A delta is a PROJECTION of
+    existing annotations, never a change/defect verdict -- read it with the get_diff_* MCP tools
+    (list_diffs to browse, then get_diff_deltas) and judge it yourself.
     """
     from treasure_map.lib.atlas.connection import open_atlas
     from treasure_map.lib.config.config import load_config
-    from treasure_map.lib.diff.driver import run_version_diff
+    from treasure_map.lib.diff.driver import (
+        _FULL_DIFF_CONFIRM_THRESHOLD,
+        run_full_diff,
+        run_version_diff,
+    )
     from treasure_map.lib.errors import TreasureMapError
 
     cfg = load_config(config)
     resolved_atlas = atlas_path if atlas_path is not None else cfg.atlas.db_path
+
+    def _confirm(n: int) -> bool:
+        if n <= _FULL_DIFF_CONFIRM_THRESHOLD:
+            return True
+        mins = max(1, round(n * 20 / 60))
+        return click.confirm(
+            f"Will diff {n} changed binaries (~{mins} min, serial); --binary <name> does just one. "
+            "Continue?",
+            default=False,
+        )
+
+    def _on_outcome(i: int, total: int, outcome: Any) -> None:
+        if outcome.error is not None:
+            click.echo(f"  [{i}/{total}] {outcome.binary}: FAILED — {outcome.error}")
+        else:
+            s = outcome.summary
+            click.echo(
+                f"  [{i}/{total}] {outcome.binary}: {s.delta_layer_changed} changed / "
+                f"{s.delta_layer_unchanged} unchanged / {s.delta_undetermined} undetermined"
+            )
+
     atlas = open_atlas(Path(resolved_atlas))
     try:
-        summary = run_version_diff(atlas, run_a_id, run_b_id, binary_name, config=cfg, force=force)
+        if binary_name is not None:
+            single = run_version_diff(
+                atlas, run_a_id, run_b_id, binary_name, config=cfg, force=force
+            )
+            full = None
+        else:
+            single = None
+            full = run_full_diff(
+                atlas,
+                run_a_id,
+                run_b_id,
+                config=cfg,
+                force=force,
+                confirm=_confirm,
+                on_outcome=_on_outcome,
+            )
     except TreasureMapError as exc:
         raise click.ClickException(f"{type(exc).__name__}: {exc}") from exc
     finally:
         atlas.close()
 
-    for w in summary.warnings:
-        click.echo(f"warning: {w}", err=True)
-    click.echo(f"Atlas: {resolved_atlas}")
-    click.echo(f"  diff_id       : {summary.diff_id}")
-    click.echo(f"  binary        : {summary.binary}")
-    click.echo(f"  matched_pairs : {summary.matched_pairs}")
-    click.echo(f"  version_skew  : {summary.version_skew}")
-    click.echo(
-        "  delta         : "
-        f"layer_changed={summary.delta_layer_changed}, "
-        f"layer_unchanged={summary.delta_layer_unchanged}, "
-        f"delta_undetermined={summary.delta_undetermined}"
-    )
-    click.echo(
-        "Read the deltas: get_diff_deltas / get_diff_meta / get_function_alignment / "
-        "get_diff_capabilities"
-    )
+    if single is not None:
+        _echo_single_diff(single, resolved_atlas)
+    else:
+        _echo_full_diff(full, resolved_atlas)
 
 
 @click.command("hunt", short_help="Match suspicious call-chains only (scan's 2nd stage)")

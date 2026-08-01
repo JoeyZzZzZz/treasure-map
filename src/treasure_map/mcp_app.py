@@ -69,6 +69,7 @@ from treasure_map.lib.query.diff_align import align_by_b as _align_by_b
 from treasure_map.lib.query.diff_align import get_diff_capabilities as _get_diff_capabilities
 from treasure_map.lib.query.diff_align import get_diff_deltas as _get_diff_deltas
 from treasure_map.lib.query.diff_align import get_diff_meta as _get_diff_meta
+from treasure_map.lib.query.diff_align import list_diffs as _list_diffs
 
 # A standing reminder attached to every candidate-listing / aggregation result: the ordering and
 # recurrence signals are derived from neutral stored facts, carry their evidence, and are NOT a
@@ -886,8 +887,9 @@ def make_tools(
         offset: int = 0,
         verbose: bool = False,
     ) -> dict[str, Any]:
-        """The tri-state dimension DELTAS a version diff produced, for one ``diff_id`` (default
-        ``{run_a}::{run_b}``). Filter by ``binary`` (the diffed binary's short name), ``dimension``,
+        """The tri-state dimension DELTAS a version diff produced, for one ``diff_id`` (a diff_id is
+        ``{run_a}::{run_b}::{binary}`` — it already identifies ONE binary; use list_diffs to find
+        the ids). Filter by ``binary`` (redundant with the id, kept as a check), ``dimension``,
         ``delta_kind``; page with ``limit``/``offset``.
 
         ★ A delta is a PROJECTION of two already-computed annotations, NOT a change/quality verdict.
@@ -913,8 +915,8 @@ def make_tools(
             conn.close()
 
     def get_diff_meta(diff_id: str) -> dict[str, Any]:
-        """The meta facts of one version diff (``diff_id`` default ``{run_a}::{run_b}``): binary
-        scope, tool/decompiler versions, and the alignment + presence counts.
+        """The meta facts of one version diff (``diff_id`` = ``{run_a}::{run_b}::{binary}``, one per
+        binary — see list_diffs): binary scope, tool/decompiler versions, alignment + presence.
 
         ★ ``version_skew=1`` means every delta in this diff is version_skew undetermined -- do not
         read it as 'no change'; it compares only the analysis-tool version, not the firmware. A NULL
@@ -946,8 +948,8 @@ def make_tools(
             conn.close()
 
     def get_diff_capabilities(diff_id: str) -> dict[str, Any]:
-        """Per-dimension capability state for a diff (``diff_id`` default ``{run_a}::{run_b}``):
-        which dimensions each side could analyse and whether this diff can produce a delta for them.
+        """Per-dimension capability state for a diff (``diff_id`` = ``{run_a}::{run_b}::{binary}``,
+        one per binary): which dimensions each side could analyse and whether it can delta them.
 
         ★ ``delta_supported=0`` for a dimension is an EXPLICIT non-judgement -- the dimension is
         VISIBLE but this diff produces no per-subject delta for it, never a silent omission. Read
@@ -958,6 +960,21 @@ def make_tools(
         conn = open_atlas(atlas_path)
         try:
             return _get_diff_capabilities(conn, diff_id)
+        finally:
+            conn.close()
+
+    def list_diffs(run_a_id: str | None = None, run_b_id: str | None = None) -> dict[str, Any]:
+        """Browse the version diffs in the atlas: one row per binary diffed between two runs, with
+        its change profile (matched_pairs, layer_changed / unchanged / undetermined, version_skew).
+        Optionally filter to a run-pair. The entry point after a full diff — see which binaries were
+        compared and how much each moved, then open one with get_diff_deltas / get_diff_meta.
+
+        ★ Counts are tri-state PROJECTIONS, never verdicts or a ranking: ``layer_changed`` is not
+        proof the change matters, and an EMPTY list means no diff has been run for that filter --
+        not 'nothing changed'."""
+        conn = open_atlas(atlas_path)
+        try:
+            return _list_diffs(conn, run_a_id, run_b_id)
         finally:
             conn.close()
 
@@ -1301,6 +1318,7 @@ def make_tools(
         "get_diff_meta": get_diff_meta,
         "get_function_alignment": get_function_alignment,
         "get_diff_capabilities": get_diff_capabilities,
+        "list_diffs": list_diffs,
         "cross_firmware_patterns": cross_firmware_patterns,
         "pattern_density": pattern_density,
         "pattern_twins": pattern_twins,

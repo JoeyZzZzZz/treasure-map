@@ -30,6 +30,7 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -39,6 +40,7 @@ from treasure_map.lib.diff.layer0 import (
     _confirmed_same_version,
     _resolve_run,
     _version_skew,
+    make_diff_id,
     run_layer0_parse,
 )
 from treasure_map.lib.diff.layer2 import run_layer2_delta
@@ -89,6 +91,39 @@ class DiffSummary:
     delta_layer_unchanged: int
     delta_undetermined: int
     warnings: tuple[str, ...]
+
+
+# Above this many changed binaries, a full diff asks for confirmation (serial diffs are ~20s each,
+# so a large sweep can run for many minutes — never start that silently).
+_FULL_DIFF_CONFIRM_THRESHOLD = 20
+
+
+@dataclass(frozen=True)
+class FullDiffPlan:
+    """Which binaries a full diff will (and won't) diff, decided from the two runs' inventories."""
+
+    changed: tuple[str, ...]  # present in BOTH runs, sha256 differs -> diffed
+    unchanged: tuple[str, ...]  # present in both, same sha256 -> skipped (diffing them is waste)
+    only_in_a: tuple[str, ...]  # present only in run A -> cannot function-diff (no counterpart)
+    only_in_b: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class BinaryDiffOutcome:
+    """One binary's result within a full diff. ``summary`` is None exactly when it failed."""
+
+    binary: str
+    summary: DiffSummary | None
+    error: str | None
+
+
+@dataclass(frozen=True)
+class FullDiffSummary:
+    """What a full diff reports: the plan, each binary's outcome, and whether the user cancelled."""
+
+    plan: FullDiffPlan
+    outcomes: tuple[BinaryDiffOutcome, ...]
+    cancelled: bool
 
 
 # ── binary .so location (finding-1 fail-fast) ────────────────────────────────────────
@@ -422,7 +457,10 @@ def run_version_diff(
     caller diffs one ``--binary`` at a time. ``binary_a == binary_b == binary_name``. The alignment
     is produced by the external differ (never self-built), then layer0/layer2 only project it."""
     pf = preflight(atlas, run_a_id, run_b_id, binary_name, config=config, force=force)
-    did = diff_id or f"{run_a_id}::{run_b_id}"
+    # pf.binary_a is the normalized short name (preflight resolved it, asserted non-None). Include
+    # it in the diff_id so this binary's diff does not overwrite another binary's under the same
+    # run-pair (make_diff_id / delete_diff then scope to this one binary).
+    did = diff_id or make_diff_id(run_a_id, run_b_id, pf.binary_a)
     timeout_s = config.ghidra.headless_timeout_seconds
 
     with tempfile.TemporaryDirectory(prefix="tm_diff_") as td:
@@ -462,3 +500,87 @@ def _delta_counts(atlas: sqlite3.Connection, diff_id: str) -> dict[str, int]:
         (diff_id,),
     ).fetchall()
     return {r[0]: r[1] for r in rows}
+
+
+# ── full (default) diff: every CHANGED binary between two runs ────────────────────────
+
+
+def _read_binaries(analysis_db_path: str) -> dict[str, str]:
+    """``{binary short name -> sha256}`` for one run's analysis.db. Rows are already sha-deduped at
+    scan; if a basename still repeats (two files, same name, different content) the last row wins —
+    a rare collision, acceptable for deciding which binaries changed."""
+    con = sqlite3.connect(f"file:{analysis_db_path}?mode=ro", uri=True)
+    try:
+        rows = con.execute(
+            "SELECT name, sha256 FROM binaries WHERE name IS NOT NULL AND sha256 IS NOT NULL"
+        ).fetchall()
+    finally:
+        con.close()
+    return {r[0]: r[1] for r in rows}
+
+
+def plan_full_diff(atlas: sqlite3.Connection, run_a_id: str, run_b_id: str) -> FullDiffPlan:
+    """Decide which binaries a full diff should diff: those present in BOTH runs whose content
+    (sha256) differs. Unchanged binaries are skipped (diffing identical content is pure waste); a
+    binary present on only one side has no counterpart to align, so it is listed, never diffed."""
+    run_a = _resolve_run(atlas, run_a_id, "a")
+    run_b = _resolve_run(atlas, run_b_id, "b")
+    assert run_a.analysis_db_path is not None and run_b.analysis_db_path is not None
+    a = _read_binaries(run_a.analysis_db_path)
+    b = _read_binaries(run_b.analysis_db_path)
+    both = a.keys() & b.keys()
+    return FullDiffPlan(
+        changed=tuple(sorted(n for n in both if a[n] != b[n])),
+        unchanged=tuple(sorted(n for n in both if a[n] == b[n])),
+        only_in_a=tuple(sorted(a.keys() - b.keys())),
+        only_in_b=tuple(sorted(b.keys() - a.keys())),
+    )
+
+
+def run_full_diff(
+    atlas: sqlite3.Connection,
+    run_a_id: str,
+    run_b_id: str,
+    *,
+    config: Config,
+    force: bool = False,
+    confirm: Callable[[int], bool] = lambda _n: True,
+    on_outcome: Callable[[int, int, BinaryDiffOutcome], None] = lambda _i, _n, _o: None,
+) -> FullDiffSummary:
+    """Diff every CHANGED binary between two runs, SERIALLY.
+
+    Serial by design — correctness first; parallelism is a separate performance concern, and this
+    loop is the single clean insertion point for it. The run-pair-global preconditions (version
+    skew, toolchain) are checked ONCE up front so a global problem fails fast instead of N identical
+    per-binary failures; a PER-binary failure (e.g. one .so cannot be located) is recorded and the
+    sweep CONTINUES — a full diff's value is coverage, and one bad binary must not lose the rest.
+    ``confirm(n)`` gates a large sweep; ``on_outcome`` reports each binary as it finishes."""
+    plan = plan_full_diff(atlas, run_a_id, run_b_id)
+    if not plan.changed:
+        return FullDiffSummary(plan, (), cancelled=False)
+    # run-pair-global preflight, once (same for every binary):
+    run_a = _resolve_run(atlas, run_a_id, "a")
+    run_b = _resolve_run(atlas, run_b_id, "b")
+    if _version_skew(run_a, run_b) and not force:
+        raise ConfigError(
+            "the two runs were produced by different tmap/Ghidra versions (or a version was not "
+            "recorded), so every delta would be version_skew undetermined. Re-scan both with the "
+            "same toolchain, or pass --force to diff anyway (the result stays honestly degraded)."
+        )
+    _check_toolchain(config)
+    if not confirm(len(plan.changed)):
+        return FullDiffSummary(plan, (), cancelled=True)
+
+    outcomes: list[BinaryDiffOutcome] = []
+    total = len(plan.changed)
+    for i, binary in enumerate(plan.changed, 1):
+        try:
+            summary = run_version_diff(
+                atlas, run_a_id, run_b_id, binary, config=config, force=force
+            )
+            outcome = BinaryDiffOutcome(binary, summary, None)
+        except TreasureMapError as exc:
+            outcome = BinaryDiffOutcome(binary, None, f"{type(exc).__name__}: {exc}")
+        outcomes.append(outcome)
+        on_outcome(i, total, outcome)
+    return FullDiffSummary(plan, tuple(outcomes), cancelled=False)
