@@ -392,19 +392,27 @@ def test_run_full_diff_recovers_failed_binary(
     atlas_path = _seed_pair(tmp_path, {"liba": "s1"}, {"liba": "s1b"})
     con = open_atlas(atlas_path)
     _seed_committed_status(con, "liba", diff_ok=0, attempts=1, sha_a="s1", sha_b="s1b")
+    # real preflight (the .so files exist via _seed_pair) with the toolchain check stubbed; compute
+    # is the parallel middle (stubbed to succeed); persist writes the ok=1 row (stubbed, no real
+    # .BinDiff). The orchestration (retry -> compute -> persist -> recovered) is real.
     monkeypatch.setattr(driver, "_check_toolchain", lambda config: None)
+    monkeypatch.setattr(
+        driver,
+        "compute_diff",
+        lambda so_a, so_b, td, config: driver.DiffArtifacts(so_a, so_b, td / "x.BinDiff"),
+    )
 
-    def _fake_success(atlas, ra, rb, binary, *, config, force):  # type: ignore[no-untyped-def]
-        did = make_diff_id(ra, rb, binary)
+    def _fake_persist(atlas, **kw):  # type: ignore[no-untyped-def]
+        did = kw["diff_id"]
         driver.delete_diff(atlas, did, commit=False)
         add_diff_meta(
             atlas,
             DiffMetaRow(
                 diff_id=did,
-                run_a_id=ra,
-                run_b_id=rb,
-                binary_a=binary,
-                binary_b=binary,
+                run_a_id=kw["run_a_id"],
+                run_b_id=kw["run_b_id"],
+                binary_a=kw["binary_short"],
+                binary_b=kw["binary_short"],
                 diff_ok=1,
                 diff_status="ok",
                 diff_attempts=2,
@@ -415,16 +423,16 @@ def test_run_full_diff_recovers_failed_binary(
         )
         return driver.DiffSummary(
             diff_id=did,
-            binary=binary,
+            binary=kw["binary_name"],
             matched_pairs=1,
-            version_skew=False,
+            version_skew=kw["version_skew"],
             delta_layer_changed=0,
             delta_layer_unchanged=0,
             delta_undetermined=0,
-            warnings=(),
+            warnings=kw["warnings"],
         )
 
-    monkeypatch.setattr(driver, "run_version_diff", _fake_success)
+    monkeypatch.setattr(driver, "_persist_success", _fake_persist)
     fsum = driver.run_full_diff(con, "run_a", "run_b", config=_cfg())
     row = con.execute(
         "SELECT diff_ok, diff_status FROM diff_meta WHERE diff_id=?",

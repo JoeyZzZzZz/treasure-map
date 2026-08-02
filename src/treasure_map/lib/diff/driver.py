@@ -25,12 +25,14 @@ only those two functions.
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import sqlite3
 import subprocess
 import tempfile
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -49,6 +51,9 @@ from treasure_map.lib.diff.layer0 import (
 )
 from treasure_map.lib.diff.layer2 import run_layer2_delta
 from treasure_map.lib.errors import ConfigError, GhidraNotFoundError, TreasureMapError
+from treasure_map.lib.machine import clamp_parallelism_to_memory
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from treasure_map.lib.atlas.models import RunRow
@@ -60,6 +65,14 @@ if TYPE_CHECKING:
 # is not on that hash path.
 _SCRIPT_DIR = Path(__file__).parent / "ghidra"
 _BINEXPORT_SCRIPT = "ExportBinExport.java"
+
+# BinExport JVM heap for a diff. Deliberately a conservative fixed ceiling, NOT the per-binary
+# adaptive_heap_mb ladder scan uses: RSS (~950MB measured) is not the -Xmx a peak analysis needs,
+# and the export path here (ExportBinExport.java) differs from scan's (ExportFunctions.java), so its
+# peak-heap demand is unmeasured. Downsizing to the ladder (max(size_a,size_b)) is a pending
+# optimization — it awaits a measured peak-heap / OOM point on the largest diffed binary; until then
+# 4096 stays (slower under parallelism, but never an OOM mid-sweep).
+_DIFF_BINEXPORT_HEAP_MB = 4096
 
 
 class DiffToolchainError(TreasureMapError):
@@ -516,7 +529,7 @@ def _run_binexport(so_path: Path, config: Config, out_dir: Path, side: str, time
             "-analysisTimeoutPerFile",
             str(timeout_s),
         ]
-        env = {**os.environ, "JAVA_TOOL_OPTIONS": "-Xmx4096m"}
+        env = {**os.environ, "JAVA_TOOL_OPTIONS": f"-Xmx{_DIFF_BINEXPORT_HEAP_MB}m"}
         try:
             proc = subprocess.run(  # noqa: S603 -- fixed argv, no shell
                 cmd, env=env, capture_output=True, timeout=timeout_s + 120
@@ -572,7 +585,88 @@ def _run_bindiff(export_a: Path, export_b: Path, out_dir: Path, timeout_s: int) 
     return produced[0]
 
 
-# ── the whole pipeline ───────────────────────────────────────────────────────────────
+# ── the whole pipeline: preflight (atlas) -> compute (zero-atlas) -> persist (atlas) ───
+#
+# The three phases are split so a full diff can run the CPU-heavy middle phase in parallel while the
+# atlas-touching ends stay serial on the main thread. The atlas connection is check_same_thread=True
+# (a worker touching it raises), and its writes must be serialized anyway (rollback-journal SQLite),
+# so ONLY compute runs off the main thread — and compute takes Paths, never the atlas or a run id.
+
+
+@dataclass(frozen=True)
+class DiffArtifacts:
+    """The external-toolchain output of one binary's compute phase — files on disk, no atlas state.
+    Carried from a (possibly parallel) compute worker to the serial persist phase."""
+
+    binexport_a: Path
+    binexport_b: Path
+    bindiff_path: Path
+
+
+def compute_diff(so_a: Path, so_b: Path, td: Path, config: Config) -> DiffArtifacts:
+    """The CPU-heavy middle phase for ONE binary: BinExport x2 + BinDiff, into ``td``. ZERO atlas.
+
+    ★ Takes only Paths + config — NO atlas connection and NO run id — so it is safe to run in a
+    worker thread (the atlas is check_same_thread and must be written serially; this function never
+    touches it). Raises DiffToolchainError on any toolchain step failure; the caller records that
+    against the atlas in the serial phase. The caller owns ``td`` (creates and removes it)."""
+    timeout_s = config.ghidra.headless_timeout_seconds
+    export_a = _run_binexport(so_a, config, td, "a", timeout_s)
+    export_b = _run_binexport(so_b, config, td, "b", timeout_s)
+    bindiff_path = _run_bindiff(export_a, export_b, td, timeout_s)
+    return DiffArtifacts(binexport_a=export_a, binexport_b=export_b, bindiff_path=bindiff_path)
+
+
+def _persist_success(
+    atlas: sqlite3.Connection,
+    *,
+    diff_id: str,
+    run_a_id: str,
+    run_b_id: str,
+    binary_name: str,
+    binary_short: str,
+    bindiff_path: Path,
+    version_skew: bool,
+    warnings: tuple[str, ...],
+) -> DiffSummary:
+    """The serial persist phase for a SUCCESSFUL compute: parse the .BinDiff into the atlas (layer0)
+    and project the deltas (layer2), as ONE atomic write. A layer-2 failure is recorded as an atomic
+    blind-spot row (rollback -> no dirty ok=1 residue) and re-raised — the exact retry-status logic,
+    unchanged, just moved out of the fused pipeline so it runs on the main thread after compute."""
+    try:
+        l0 = run_layer0_parse(
+            atlas,
+            bindiff_path=bindiff_path,
+            run_a_id=run_a_id,
+            run_b_id=run_b_id,
+            binary_a=binary_name,
+            binary_b=binary_name,
+            diff_id=diff_id,
+            commit=False,
+        )
+        run_layer2_delta(atlas, diff_id=diff_id, run_a_id=run_a_id, run_b_id=run_b_id, commit=True)
+    except TreasureMapError as exc:
+        _record_diff_failure(
+            atlas,
+            diff_id=diff_id,
+            run_a_id=run_a_id,
+            run_b_id=run_b_id,
+            binary_short=binary_short,
+            exc=exc,
+        )
+        raise
+
+    counts = _delta_counts(atlas, diff_id)
+    return DiffSummary(
+        diff_id=diff_id,
+        binary=binary_name,
+        matched_pairs=l0.matched_pairs,
+        version_skew=version_skew,
+        delta_layer_changed=counts.get("layer_changed", 0),
+        delta_layer_unchanged=counts.get("layer_unchanged", 0),
+        delta_undetermined=counts.get("delta_undetermined", 0),
+        warnings=warnings,
+    )
 
 
 def run_version_diff(
@@ -589,57 +683,45 @@ def run_version_diff(
 
     Single binary by design — a whole-firmware loop is orders of magnitude more expensive, so the
     caller diffs one ``--binary`` at a time. ``binary_a == binary_b == binary_name``. The alignment
-    is produced by the external differ (never self-built), then layer0/layer2 only project it."""
+    is produced by the external differ (never self-built), then layer0/layer2 only project it.
+
+    Structured as the three phases (preflight -> compute -> persist); the ``td`` is owned here (not
+    a ``with`` block) so the same compute/persist split powers the parallel full diff. Any toolchain
+    or parse failure is recorded as an honest, atomic blind-spot row (diff_ok=0 + why + attempts)
+    then re-raised so the caller still sees the error."""
     pf = preflight(atlas, run_a_id, run_b_id, binary_name, config=config, force=force)
     # pf.binary_a is the normalized short name (preflight resolved it, asserted non-None). Include
     # it in the diff_id so this binary's diff does not overwrite another binary's under the same
     # run-pair (make_diff_id / delete_diff then scope to this one binary).
     did = diff_id or make_diff_id(run_a_id, run_b_id, pf.binary_a)
-    timeout_s = config.ghidra.headless_timeout_seconds
 
-    # Any toolchain/parse step can fail; record the failure as an honest, atomic blind-spot row
-    # (diff_ok=0 + why + attempts) so it persists and the next full diff can retry it, then re-raise
-    # so the caller (single-binary CLI or the full-diff loop) still sees the error. A layer-2 fail
-    # after layer-0's uncommitted INSERT is made consistent by _record_diff_failure's rollback.
+    td = Path(tempfile.mkdtemp(prefix="tm_diff_"))
     try:
-        with tempfile.TemporaryDirectory(prefix="tm_diff_") as td:
-            tdp = Path(td)
-            export_a = _run_binexport(pf.so_a, config, tdp, "a", timeout_s)
-            export_b = _run_binexport(pf.so_b, config, tdp, "b", timeout_s)
-            bindiff_path = _run_bindiff(export_a, export_b, tdp, timeout_s)
-            l0 = run_layer0_parse(
+        try:
+            artifacts = compute_diff(pf.so_a, pf.so_b, td, config)
+        except TreasureMapError as exc:
+            _record_diff_failure(
                 atlas,
-                bindiff_path=bindiff_path,
+                diff_id=did,
                 run_a_id=run_a_id,
                 run_b_id=run_b_id,
-                binary_a=binary_name,
-                binary_b=binary_name,
-                diff_id=did,
-                commit=False,
+                binary_short=pf.binary_a,
+                exc=exc,
             )
-            run_layer2_delta(atlas, diff_id=did, run_a_id=run_a_id, run_b_id=run_b_id, commit=True)
-    except TreasureMapError as exc:
-        _record_diff_failure(
+            raise
+        return _persist_success(
             atlas,
             diff_id=did,
             run_a_id=run_a_id,
             run_b_id=run_b_id,
+            binary_name=binary_name,
             binary_short=pf.binary_a,
-            exc=exc,
+            bindiff_path=artifacts.bindiff_path,
+            version_skew=pf.version_skew,
+            warnings=pf.warnings,
         )
-        raise
-
-    counts = _delta_counts(atlas, did)
-    return DiffSummary(
-        diff_id=did,
-        binary=binary_name,
-        matched_pairs=l0.matched_pairs,
-        version_skew=pf.version_skew,
-        delta_layer_changed=counts.get("layer_changed", 0),
-        delta_layer_unchanged=counts.get("layer_unchanged", 0),
-        delta_undetermined=counts.get("delta_undetermined", 0),
-        warnings=pf.warnings,
-    )
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
 
 
 def _delta_counts(atlas: sqlite3.Connection, diff_id: str) -> dict[str, int]:
@@ -767,6 +849,122 @@ def _read_recorded_status(atlas: sqlite3.Connection, diff_id: str) -> tuple[int 
     return row[0], row[1]
 
 
+@dataclass(frozen=True)
+class _ResolvedDiff:
+    """One binary resolved by the serial pre-phase, carrying only what compute (Paths) + persist
+    (short name, skew, diff_id) need — deliberately NO atlas handle, so it crosses into a worker."""
+
+    binary: str  # the name the plan iterated (a short name) -> layer0 binary_a/binary_b
+    binary_short: str  # normalized short name (pf.binary_a) -> diff_meta + diff_id
+    so_a: Path
+    so_b: Path
+    version_skew: bool
+    warnings: tuple[str, ...]
+    diff_id: str
+    size_bytes: int  # max(so_a, so_b) on-disk size -> disk-headroom estimate
+    prior_failed: bool  # entered this run as a retry (diff_ok=0) -> a success is a recovery
+
+
+def _persist_outcome(
+    atlas: sqlite3.Connection,
+    rd: _ResolvedDiff,
+    run_a_id: str,
+    run_b_id: str,
+    *,
+    artifacts: DiffArtifacts | None,
+    compute_exc: BaseException | None,
+) -> BinaryDiffOutcome:
+    """The serial persist step for ONE binary's compute result -> its outcome. Main thread only.
+
+    Success -> layer0/layer2 write (an atomic transaction) + a recovered flag if it entered failed.
+    Compute failure OR a persist (layer-2) failure -> the retry-status atomic blind-spot write
+    (rollback -> delete -> insert -> commit), so every binary is its own independent transaction
+    even under parallel compute — one binary's failure never corrupts another's row."""
+    if compute_exc is not None:
+        _record_diff_failure(
+            atlas,
+            diff_id=rd.diff_id,
+            run_a_id=run_a_id,
+            run_b_id=run_b_id,
+            binary_short=rd.binary_short,
+            exc=compute_exc,
+        )
+        attempts, reason = _read_recorded_status(atlas, rd.diff_id)
+        return BinaryDiffOutcome(
+            rd.binary,
+            None,
+            f"{type(compute_exc).__name__}: {compute_exc}",
+            attempts=attempts,
+            reason=reason,
+            was_failed_before=rd.prior_failed,
+        )
+    assert artifacts is not None  # compute_exc is None -> artifacts present (mutually exclusive)
+    try:
+        summary = _persist_success(
+            atlas,
+            diff_id=rd.diff_id,
+            run_a_id=run_a_id,
+            run_b_id=run_b_id,
+            binary_name=rd.binary,
+            binary_short=rd.binary_short,
+            bindiff_path=artifacts.bindiff_path,
+            version_skew=rd.version_skew,
+            warnings=rd.warnings,
+        )
+    except TreasureMapError as exc:
+        # _persist_success already recorded the failed row atomically; belt-and-braces rollback so
+        # no stray uncommitted state rides the next binary's commit.
+        atlas.rollback()
+        attempts, reason = _read_recorded_status(atlas, rd.diff_id)
+        return BinaryDiffOutcome(
+            rd.binary,
+            None,
+            f"{type(exc).__name__}: {exc}",
+            attempts=attempts,
+            reason=reason,
+            was_failed_before=rd.prior_failed,
+        )
+    attempts, _ = _read_recorded_status(atlas, summary.diff_id)
+    return BinaryDiffOutcome(
+        rd.binary,
+        summary,
+        None,
+        attempts=attempts,
+        was_failed_before=rd.prior_failed,
+        recovered=rd.prior_failed,  # entered failed, now succeeded -> self-healed
+    )
+
+
+def _effective_diff_workers(configured: int, resolved: list[_ResolvedDiff]) -> int:
+    """Clamp the configured pool size DOWN to what current memory AND disk allow for this run.
+
+    Memory: the config value is a stable MemTotal derivation; if free RAM is low right now, running
+    that many BinExport JVMs would OOM (see clamp_parallelism_to_memory). Disk: N concurrent
+    computes each write ~2x the binary (two .BinExport + a .BinDiff) into a temp dir; if free disk
+    cannot hold ``workers`` of the largest such set, reduce (the interleaved persist keeps only
+    ~workers sets on disk at once). Both clamps only lower the count, log it, never go below 1."""
+    workers, note = clamp_parallelism_to_memory(max(1, configured))
+    if note:
+        logger.warning("diff: %s", note)
+    try:
+        free = shutil.disk_usage(tempfile.gettempdir()).free
+        biggest = max((rd.size_bytes for rd in resolved), default=0)
+        if biggest > 0:
+            per_slot = biggest * 2  # 2 exports + a .BinDiff, conservatively <= 2x the binary
+            disk_cap = max(1, int(free * 0.8) // per_slot)
+            if disk_cap < workers:
+                logger.warning(
+                    "diff: low disk: parallelism %d->%d this run (~%dMB free)",
+                    workers,
+                    disk_cap,
+                    free // (1024 * 1024),
+                )
+                workers = disk_cap
+    except OSError:
+        pass
+    return max(1, workers)
+
+
 def run_full_diff(
     atlas: sqlite3.Connection,
     run_a_id: str,
@@ -779,16 +977,23 @@ def run_full_diff(
     confirm: Callable[[int], bool] = lambda _n: True,
     on_outcome: Callable[[int, int, BinaryDiffOutcome], None] = lambda _i, _n, _o: None,
 ) -> FullDiffSummary:
-    """Diff every CHANGED binary between two runs that NEEDS diffing, SERIALLY.
+    """Diff every CHANGED binary that NEEDS diffing: parallel compute, serial write.
 
     Incremental + self-healing: already-ok binaries whose content is unchanged are skipped, and
     previously-failed ones are retried (up to ``retry_limit`` at the same content; ``force_retry``
-    also re-attempts suspected hard boundaries) -- see plan_full_diff. Serial by design (parallelism
-    is a separate concern; this loop is its one clean insertion point). The run-pair-global
-    preconditions (version skew, toolchain) are checked ONCE up front so a global problem fails fast
-    instead of N identical per-binary failures; a PER-binary failure is recorded as an atomic
-    blind-spot row and the sweep CONTINUES — a full diff's value is coverage, and one bad binary
-    must not lose the rest. ``confirm(n)`` gates a large sweep; ``on_outcome`` reports each one."""
+    also re-attempts suspected hard boundaries) -- see plan_full_diff.
+
+    THREE PHASES: (1) a serial pre-phase resolves each binary (preflight reads the atlas + each
+    analysis.db, so it cannot run off the main thread); (2) the CPU-heavy compute (BinExport x2 +
+    BinDiff, zero atlas) runs in a thread pool sized to ``max_parallel_jvms``, clamped down for THIS
+    run by current memory/disk; (3) as each compute completes, the main thread persists it SERIALLY
+    (layer0/layer2 or the atomic failure write) — SQLite is written by one thread only, so no WAL /
+    multi-connection complexity, and each binary stays its own independent atomic transaction.
+
+    The run-pair-global preconditions (version skew, toolchain) are checked ONCE up front so a
+    global problem fails fast; a PER-binary failure is recorded as an atomic blind-spot row and the
+    sweep CONTINUES. ``confirm(n)`` gates a large sweep; ``on_outcome`` reports each binary as it
+    finishes (in completion order, not submission order)."""
     plan = plan_full_diff(atlas, run_a_id, run_b_id, retry_limit=retry_limit)
     to_run = plan.binaries_to_run(force_retry=force_retry)
     if not to_run:
@@ -808,37 +1013,83 @@ def run_full_diff(
         return FullDiffSummary(plan, (), cancelled=True, retry_limit=retry_limit)
 
     was_failed_before = set(plan.retry) | set(plan.hard_failed)
-    outcomes: list[BinaryDiffOutcome] = []
     total = len(to_run)
-    for i, binary in enumerate(to_run, 1):
-        did = make_diff_id(run_a_id, run_b_id, binary)
-        prior_failed = binary in was_failed_before
+    outcomes: list[BinaryDiffOutcome] = []
+    done = 0
+
+    # ── Phase 1 (serial, main thread): resolve each binary. preflight reads the atlas + the db,
+    #    so it MUST stay on the main thread; a binary whose preflight fails (e.g. its .so cannot be
+    #    located) never enters the pool — it is surfaced as a failure outcome right here. ──
+    resolved: list[_ResolvedDiff] = []
+    for binary in to_run:
         try:
-            summary = run_version_diff(
-                atlas, run_a_id, run_b_id, binary, config=config, force=force
-            )
-            attempts, _ = _read_recorded_status(atlas, summary.diff_id)
-            outcome = BinaryDiffOutcome(
-                binary,
-                summary,
-                None,
-                attempts=attempts,
-                was_failed_before=prior_failed,
-                recovered=prior_failed,  # entered failed, now succeeded -> self-healed
-            )
+            pf = preflight(atlas, run_a_id, run_b_id, binary, config=config, force=force)
         except TreasureMapError as exc:
-            # run_version_diff already recorded the failed row atomically; roll back any stray
-            # uncommitted state as a belt-and-braces guard so it never rides the next commit.
-            atlas.rollback()
-            attempts, reason = _read_recorded_status(atlas, did)
-            outcome = BinaryDiffOutcome(
+            done += 1
+            oc = BinaryDiffOutcome(
                 binary,
                 None,
                 f"{type(exc).__name__}: {exc}",
-                attempts=attempts,
-                reason=reason,
-                was_failed_before=prior_failed,
+                was_failed_before=binary in was_failed_before,
             )
-        outcomes.append(outcome)
-        on_outcome(i, total, outcome)
+            outcomes.append(oc)
+            on_outcome(done, total, oc)
+            continue
+        try:
+            size_bytes = max(pf.so_a.stat().st_size, pf.so_b.stat().st_size)
+        except OSError:
+            size_bytes = 0
+        resolved.append(
+            _ResolvedDiff(
+                binary=binary,
+                binary_short=pf.binary_a,
+                so_a=pf.so_a,
+                so_b=pf.so_b,
+                version_skew=pf.version_skew,
+                warnings=pf.warnings,
+                diff_id=make_diff_id(run_a_id, run_b_id, pf.binary_a),
+                size_bytes=size_bytes,
+                prior_failed=binary in was_failed_before,
+            )
+        )
+
+    # ── Phase 2 (parallel compute) + Phase 3 (serial persist as each completes) ──
+    if resolved:
+        workers = _effective_diff_workers(config.ghidra.max_parallel_jvms, resolved)
+        tds = {rd.diff_id: Path(tempfile.mkdtemp(prefix="tm_diff_")) for rd in resolved}
+        by_id = {rd.diff_id: rd for rd in resolved}
+        pool = ThreadPoolExecutor(max_workers=workers)
+        try:
+            fut_to_id = {
+                pool.submit(compute_diff, rd.so_a, rd.so_b, tds[rd.diff_id], config): rd.diff_id
+                for rd in resolved
+            }
+            for fut in as_completed(fut_to_id):
+                rd = by_id[fut_to_id[fut]]
+                try:
+                    artifacts: DiffArtifacts | None = fut.result()
+                    compute_exc: BaseException | None = None
+                except Exception as exc:  # toolchain error OR unexpected worker crash
+                    artifacts, compute_exc = None, exc
+                try:
+                    oc = _persist_outcome(
+                        atlas,
+                        rd,
+                        run_a_id,
+                        run_b_id,
+                        artifacts=artifacts,
+                        compute_exc=compute_exc,
+                    )
+                finally:
+                    # consume-and-clean: the orchestrator owns each temp dir (compute produced into
+                    # it, persist read from it) so nothing leaks and disk stays bounded to ~workers.
+                    shutil.rmtree(tds[rd.diff_id], ignore_errors=True)
+                outcomes.append(oc)
+                done += 1
+                on_outcome(done, total, oc)
+        finally:
+            pool.shutdown(wait=True)
+            for td in tds.values():
+                shutil.rmtree(td, ignore_errors=True)
+
     return FullDiffSummary(plan, tuple(outcomes), cancelled=False, retry_limit=retry_limit)

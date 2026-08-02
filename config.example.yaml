@@ -5,7 +5,8 @@
 ghidra:
   mode: local    # local | docker (M4) | remote (M4)
   headless_timeout_seconds: 300
-  max_parallel_jvms: 4
+  max_parallel_jvms: 4   # `tmap init` overwrites this with a value derived from the machine
+                         #   (physical cores + memory); `tmap init --force` re-detects it
 
   local:
     home: ~      # null = auto-discover via GHIDRA_HOME env or PATH; or set explicit path

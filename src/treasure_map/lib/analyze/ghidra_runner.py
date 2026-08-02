@@ -28,6 +28,7 @@ from typing import Any
 from treasure_map.lib.analyze.elf_inventory import ElfRecord, has_substantial_text
 from treasure_map.lib.config.config import GhidraConfig
 from treasure_map.lib.errors import GhidraNotFoundError
+from treasure_map.lib.machine import clamp_parallelism_to_memory
 from treasure_map.version import UNKNOWN_VERSION
 
 logger = logging.getLogger(__name__)
@@ -154,6 +155,21 @@ class GhidraResult:
 # ★ A binary that cannot finish within this even on an isolated retry is a genuine hang, not a
 # needs-more-time case — the dynamic timeout never runs a single binary unbounded.
 _TIMEOUT_CEILING_SECONDS = 1800  # 30 min
+
+
+def adaptive_heap_mb(size_bytes: int) -> tuple[int, int]:
+    """(xmx_mb, xms_mb) for a Ghidra headless JVM, scaled by the binary's size — the per-binary heap
+    ladder, NOT a machine-wide single value.
+
+    A per-binary ladder is why a 500KB library runs in 512MB while a 60MB one gets 2048MB: a single
+    machine-wide heap would either starve the big binary or waste memory on the small one (and cut
+    how many can run in parallel). Shared so ``diff``'s BinExport can adopt the same model in place
+    of a hardcoded ceiling. xms is 1/8 of xmx (min 64MB), matching the JVM's usual init/max ratio.
+    """
+    size_mb = size_bytes / 1024 / 1024
+    xmx = 512 if size_mb < 1 else 768 if size_mb < 10 else 1536 if size_mb < 50 else 2048
+    xms = max(64, xmx // 8)
+    return xmx, xms
 
 
 def _dynamic_timeout(binary: Path, base: int) -> int:
@@ -531,9 +547,7 @@ class GhidraRunner:
             headless, binary, arch, proj_dir, output_dir, self._script_dir, sha8, timeout
         )
 
-        size_mb = binary.stat().st_size / 1024 / 1024
-        heap_mb = 512 if size_mb < 1 else 768 if size_mb < 10 else 1536 if size_mb < 50 else 2048
-        xms_mb = max(64, heap_mb // 8)
+        heap_mb, xms_mb = adaptive_heap_mb(binary.stat().st_size)
         env: dict[str, str] = {
             **dict(os.environ),
             "OUTPUT_DIR": str(output_dir),
@@ -600,7 +614,13 @@ class GhidraRunner:
         n = len(records)
         by_idx: dict[int, GhidraResult] = {}
 
-        pool = ThreadPoolExecutor(max_workers=self._config.max_parallel_jvms)
+        # Runtime memory guard: the configured pool size is a stable MemTotal derivation, but if
+        # the machine is actually short on free memory right now, running that many JVMs would OOM/
+        # swap. Clamp DOWN to what MemAvailable allows for THIS run only (config is untouched).
+        workers, clamp_note = clamp_parallelism_to_memory(self._config.max_parallel_jvms)
+        if clamp_note:
+            logger.warning("ghidra: %s", clamp_note)
+        pool = ThreadPoolExecutor(max_workers=workers)
         try:
             future_to_idx = {
                 pool.submit(

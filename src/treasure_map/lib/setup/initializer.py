@@ -19,11 +19,13 @@ from treasure_map.lib.config.config import Config, _source_env_file
 logger = logging.getLogger(__name__)
 
 # Default config matching config.example.yaml; stores env var names, never values.
+# max_parallel_jvms is deliberately ABSENT here: _configure_parallelism probes the machine at init
+# and writes the derived value (a hardcoded default would mask a wrong-sized pool). If it were ever
+# missing from config.yaml, config.py's GhidraConfig default (4) is the safety fallback.
 _DEFAULT_CONFIG_YAML: dict[str, Any] = {
     "ghidra": {
         "mode": "local",
         "headless_timeout_seconds": 300,
-        "max_parallel_jvms": 4,
         "local": {"home": None},
     },
     "workspace_dir": "~/.treasure-map/workspaces",
@@ -285,6 +287,59 @@ def _configure_ghidra(
     echo("  Ghidra : left unset (no valid path entered).")
 
 
+def _configured_max_parallel(config_path: Path) -> int | None:
+    """Return ghidra.max_parallel_jvms from an existing config.yaml, or None if unset/unreadable."""
+    if not config_path.exists():
+        return None
+    try:
+        data: dict[str, Any] = yaml.safe_load(config_path.read_text()) or {}
+    except Exception:
+        return None
+    value = (data.get("ghidra") or {}).get("max_parallel_jvms")
+    return int(value) if isinstance(value, int) else None
+
+
+def _set_max_parallel(config_path: Path, value: int) -> None:
+    """Write ghidra.max_parallel_jvms into config.yaml, preserving the rest of the file."""
+    data: dict[str, Any] = yaml.safe_load(config_path.read_text()) or {}
+    data.setdefault("ghidra", {})["max_parallel_jvms"] = value
+    config_path.write_text(yaml.safe_dump(data, default_flow_style=False))
+
+
+def _configure_parallelism(
+    config_path: Path,
+    *,
+    force: bool,
+    echo: Callable[[str], None],
+) -> None:
+    """Probe the machine (physical cores + memory) and write the derived ``max_parallel_jvms``.
+
+    First init (or ``--force``, which regenerated the config without the value) detects and writes;
+    a re-run keeps an already-written value untouched (the operator may have hand-tuned it —
+    re-probe only on ``--force``). CPU knee = physical cores, memory budget = MemTotal × a
+    conservative fraction; the smaller wins (see lib/machine.py). The probe method is logged so an
+    imprecise detection (WSL2/container falling back off /proc/cpuinfo) is visible, never trusted.
+    """
+    from treasure_map.lib.machine import (
+        derive_parallelism,
+        mem_total_mb,
+        physical_cores,
+    )
+
+    current = _configured_max_parallel(config_path)
+    if current is not None and not force:
+        echo(f"  Parallelism: max_parallel_jvms={current} (kept; --force to re-detect).")
+        return
+    probe = physical_cores()
+    mem = mem_total_mb()
+    derived = derive_parallelism(probe.count, mem)
+    _set_max_parallel(config_path, derived)
+    echo(
+        f"  Parallelism: detected {probe.count} physical cores ({probe.method}) / {mem}MB "
+        f"-> max_parallel_jvms={derived}."
+    )
+
+
 def _configure_completion(*, echo: Callable[[str], None]) -> None:
     """Install shell tab-completion (a standard init step; bash + zsh). Best-effort + honest.
 
@@ -392,6 +447,7 @@ def run_init(
             prompt=prompt,
             echo=echo,
         )
+        _configure_parallelism(config_path, force=force, echo=echo)
         _configure_completion(echo=echo)
 
     # Source env file (non-override semantics) so doctor can see API keys.

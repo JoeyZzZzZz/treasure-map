@@ -77,6 +77,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`tmap init` sizes the JVM pool to the machine, and `diff` full runs now run in parallel.**
+  `max_parallel_jvms` was a hardcoded 4 and diff's BinExport heap a hardcoded `-Xmx4096m`, neither
+  looking at the machine; a full diff ran every changed binary serially. Now `tmap init` probes the
+  box — physical cores (the measured CPU knee, since Ghidra analysis is CPU-bound and hyperthreads
+  contend) and MemTotal (a conservative fraction, not the volatile MemAvailable) — and writes the
+  smaller of the two as `max_parallel_jvms` (`tmap init --force` re-detects; the probe method is
+  logged so a WSL2/container fallback is visible). A full `diff` is split into three phases —
+  preflight (serial, reads the atlas), compute (BinExport + BinDiff, parallel across a thread pool,
+  zero atlas), and persist (serial on the main thread) — so the CPU-heavy middle runs concurrently
+  while every atlas write stays single-threaded (no WAL, and each binary keeps its own independent
+  atomic transaction from the retry-status work). Before a pool starts, parallelism is clamped down
+  for that run if free memory or disk is tight (the config value is untouched). scan's per-binary
+  adaptive heap ladder is now a shared `adaptive_heap_mb` helper it keeps using; diff's BinExport
+  heap holds the conservative fixed 4096 until a peak-heap measurement on the largest diffed binary
+  confirms the ladder is safe there (never an OOM mid-sweep).
+
 - **`diff` full runs are now incremental, self-healing, and honest about failures.** A full diff
   used to fail permanently on any per-binary toolchain error: the failure was printed once and never
   persisted, so a flaky, one-off failure stayed in the blind spot forever, a genuinely hard boundary

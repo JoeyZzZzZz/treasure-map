@@ -440,32 +440,63 @@ def test_plan_full_diff_selects_only_changed_present_both_sides(tmp_path: Path) 
     assert plan.only_in_b == ("libd",)
 
 
+def _fake_preflight(tmp_path: Path):  # type: ignore[no-untyped-def]
+    """A preflight stub for the parallel orchestration: dummy .so files + short-name = the binary,
+    so the serial pre-phase resolves without a real toolchain / located binary."""
+    from treasure_map.lib.atlas.models import RunRow
+
+    def _pf(atlas, run_a_id, run_b_id, binary_name, *, config, force):  # type: ignore[no-untyped-def]
+        so_a = tmp_path / f"{binary_name}_a.so"
+        so_b = tmp_path / f"{binary_name}_b.so"
+        so_a.write_bytes(b"\x7fELF")
+        so_b.write_bytes(b"\x7fELF")
+        return driver.PreflightResult(
+            run_a=RunRow(run_id=run_a_id),
+            run_b=RunRow(run_id=run_b_id),
+            binary_a=binary_name,
+            binary_b=binary_name,
+            so_a=so_a,
+            so_b=so_b,
+            version_skew=False,
+            warnings=(),
+        )
+
+    return _pf
+
+
 def test_run_full_diff_continues_past_a_single_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # ★ One binary's failure must not lose the rest — record it and keep going.
+    # ★ One binary's failure must not lose the rest — record it and keep going. Drives the parallel
+    # orchestration: preflight (serial) + compute (the parallel middle) are stubbed; persist is real
+    # for the failure (atomic blind-spot write) and stubbed for the successes.
     atlas_path = _seed_multi(
         tmp_path,
         {"liba": "1", "libb": "2", "libc": "3"},
         {"liba": "1x", "libb": "2x", "libc": "3x"},
     )
     monkeypatch.setattr(driver, "_check_toolchain", lambda config: None)
+    monkeypatch.setattr(driver, "preflight", _fake_preflight(tmp_path))
 
-    def _fake_single(atlas, ra, rb, binary, *, config, force):  # type: ignore[no-untyped-def]
-        if binary == "libb":
-            raise DiffToolchainError("BinExport blew up for libb")
+    def _fake_compute(so_a, so_b, td, config):  # type: ignore[no-untyped-def]
+        if "libb" in so_a.name:
+            raise DiffToolchainError("BinExport subprocess failed (rc=1) for libb")
+        return driver.DiffArtifacts(so_a, so_b, td / "x.BinDiff")
+
+    def _fake_persist(atlas, **kw):  # type: ignore[no-untyped-def]
         return driver.DiffSummary(
-            diff_id=f"run_a::run_b::{binary}",
-            binary=binary,
+            diff_id=kw["diff_id"],
+            binary=kw["binary_name"],
             matched_pairs=1,
-            version_skew=False,
+            version_skew=kw["version_skew"],
             delta_layer_changed=1,
             delta_layer_unchanged=0,
             delta_undetermined=0,
-            warnings=(),
+            warnings=kw["warnings"],
         )
 
-    monkeypatch.setattr(driver, "run_version_diff", _fake_single)
+    monkeypatch.setattr(driver, "compute_diff", _fake_compute)
+    monkeypatch.setattr(driver, "_persist_success", _fake_persist)
     con = open_atlas(atlas_path)
     fsum = driver.run_full_diff(con, "run_a", "run_b", config=_cfg(), force=False)
     con.close()
