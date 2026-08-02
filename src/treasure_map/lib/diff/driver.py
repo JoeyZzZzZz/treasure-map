@@ -35,9 +35,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from treasure_map.lib.atlas.models import DiffMetaRow
+from treasure_map.lib.atlas.writer import add_diff_meta, delete_diff
 from treasure_map.lib.diff.layer0 import (
     _binary_name,
+    _binary_sha256,
     _confirmed_same_version,
+    _next_attempts,
     _resolve_run,
     _version_skew,
     make_diff_id,
@@ -97,33 +101,163 @@ class DiffSummary:
 # so a large sweep can run for many minutes — never start that silently).
 _FULL_DIFF_CONFIRM_THRESHOLD = 20
 
+# How many times a full diff attempts a failing binary AT THE SAME CONTENT before treating it as a
+# suspected hard boundary (a deterministic toolchain failure, e.g. BinDiff cannot rebuild the flow
+# graph) and skipping it on later runs unless --force-retry. A transient failure (a Ghidra crash
+# while printing stats) usually clears within one or two retries; a hard boundary never does, so
+# retrying it every full diff is pure waste. Reset to zero when the binary's content changes (see
+# _next_attempts): a recompiled binary may diff fine, so the past verdict is void.
+_DIFF_RETRY_LIMIT = 3
+
+
+def _classify_failure_reason(exc: BaseException) -> str:
+    """Bucket a toolchain failure so a consumer can tell a likely-transient failure from a hard
+    boundary. Matches the DETERMINISTIC message text the toolchain steps raise (``_run_binexport`` /
+    ``_run_bindiff``); anything unrecognized is 'other'. Order matters -- timeout is checked before
+    the generic step failure so a timed-out export is not miscounted as a crash."""
+    msg = str(exc).lower()
+    if "timed out" in msg or "timeout" in msg:
+        return "timeout"
+    if "produced no file" in msg or "produced no .bindiff" in msg:
+        return "binexport_no_file"
+    if "basic block" in msg or "flowgraph" in msg or "flow graph" in msg:
+        return "bindiff_flowgraph"
+    if "binexport" in msg:
+        return "binexport_ghidra_crash"
+    return "other"
+
+
+def _record_diff_failure(
+    atlas: sqlite3.Connection,
+    *,
+    diff_id: str,
+    run_a_id: str,
+    run_b_id: str,
+    binary_short: str,
+    exc: BaseException,
+) -> tuple[int, str]:
+    """Persist ONE binary's diff FAILURE as a self-contained atomic transaction; return
+    (attempts, reason).
+
+    diff's write model differs from scan's (add_diff_meta is a pure INSERT keyed on a PRIMARY KEY
+    diff_id, and one diff spans an uncommitted layer-0 INSERT + a layer-2 commit), so "also write a
+    failed row" cannot be a bare INSERT: a layer-2 failure would leave layer-0's uncommitted row to
+    conflict, and a retry would hit the prior failed row's PK. The safe order is:
+
+        rollback  -> discard any uncommitted layer-0 residue (no ok=1 row leaks through)
+        next_attempts (read the prior row BEFORE deleting it)
+        delete_diff(commit=False)  -> clear a prior committed failed row (else the INSERT conflicts)
+        add_diff_meta(failed row, commit=False)  -> now the INSERT cannot conflict
+        commit  -> the failed row lands as its own atomic transaction
+
+    So every binary's diff is atomic: a failure never leaves a half-written or ok=1 row, and a
+    second failure of the same binary is a clean replace, never a crash (the retry path must not
+    crash on its own PK). The failed row carries NO coverage counts (there is no usable output),
+    only the honest status + why + attempt count + the content it ran on."""
+    atlas.rollback()  # ① drop layer-0's uncommitted diff_meta/alignment residue, if any
+    sha_a, sha_b = _current_shas(atlas, run_a_id, run_b_id, binary_short)
+    attempts = _next_attempts(atlas, diff_id, sha_a, sha_b)  # read prior BEFORE delete
+    reason = _classify_failure_reason(exc)
+    delete_diff(atlas, diff_id, commit=False)  # ② clear any prior failed row -> no PK conflict
+    add_diff_meta(
+        atlas,
+        DiffMetaRow(
+            diff_id=diff_id,
+            run_a_id=run_a_id,
+            run_b_id=run_b_id,
+            binary_a=binary_short,
+            binary_b=binary_short,
+            diff_ok=0,
+            diff_status="failed",
+            diff_status_reason=reason,
+            diff_attempts=attempts,
+            sha256_a=sha_a,
+            sha256_b=sha_b,
+        ),
+        commit=False,  # ③ INSERT now cannot conflict (prior row deleted, residue rolled back)
+    )
+    atlas.commit()  # ④ the failed row is its own atomic transaction
+    return attempts, reason
+
+
+def _current_shas(
+    atlas: sqlite3.Connection, run_a_id: str, run_b_id: str, binary: str
+) -> tuple[str | None, str | None]:
+    """Best-effort (sha256_a, sha256_b) for one binary across two runs, for the failure path.
+
+    Runs inside an except handler, so it must never raise: an unresolvable run or unreadable
+    analysis.db yields (None, None) rather than masking the original failure. A None sha means the
+    attempts counter cannot confirm same-content and resets to 1 (see _next_attempts) -- honest,
+    since we cannot prove it is the same content that failed before."""
+    try:
+        run_a = _resolve_run(atlas, run_a_id, "a")
+        run_b = _resolve_run(atlas, run_b_id, "b")
+        sha_a = _binary_sha256(run_a.analysis_db_path, binary) if run_a.analysis_db_path else None
+        sha_b = _binary_sha256(run_b.analysis_db_path, binary) if run_b.analysis_db_path else None
+    except (ConfigError, sqlite3.Error):
+        return None, None
+    return sha_a, sha_b
+
 
 @dataclass(frozen=True)
 class FullDiffPlan:
-    """Which binaries a full diff will (and won't) diff, decided from the two runs' inventories."""
+    """Which binaries a full diff will (and won't) diff, decided from the two runs' inventories AND
+    the per-binary diff status already recorded in the atlas.
 
-    changed: tuple[str, ...]  # present in BOTH runs, sha256 differs -> diffed
+    ``changed`` is the whole set present in both runs whose sha256 differs; it is PARTITIONED into
+    four disjoint sub-sets by recorded status, so a full diff is incremental (skip already-ok) and
+    self-healing (retry failed) instead of redoing everything:
+      * ``to_diff``     -- never diffed, or content changed since the last diff (attempts reset).
+      * ``retry``       -- failed before, under the retry cap -> diffed again (transient self-heal).
+      * ``already_ok``  -- diff_ok=1 and both sides' sha256 unchanged -> skipped (redoing = waste).
+      * ``hard_failed`` -- failed at the retry cap, same content -> skipped unless --force-retry
+                           (a suspected hard boundary; still VISIBLE, never a silent drop)."""
+
+    changed: tuple[str, ...]  # present in BOTH runs, sha256 differs (to_diff+retry+already_ok+hard)
     unchanged: tuple[str, ...]  # present in both, same sha256 -> skipped (diffing them is waste)
     only_in_a: tuple[str, ...]  # present only in run A -> cannot function-diff (no counterpart)
     only_in_b: tuple[str, ...]
+    to_diff: tuple[str, ...] = ()  # never diffed, or content changed -> diff (attempts start fresh)
+    retry: tuple[str, ...] = ()  # failed, attempts < cap -> retry (transient self-heal)
+    already_ok: tuple[str, ...] = ()  # diff_ok=1, sha unchanged -> skip (incremental)
+    hard_failed: tuple[str, ...] = ()  # failed at cap, sha unchanged -> skip unless --force-retry
+
+    def binaries_to_run(self, *, force_retry: bool = False) -> tuple[str, ...]:
+        """The binaries this full diff will actually diff: the never-done/changed set plus the
+        under-cap retries, and -- only when ``force_retry`` -- the suspected hard boundaries too."""
+        picked = list(self.to_diff) + list(self.retry)
+        if force_retry:
+            picked += list(self.hard_failed)
+        return tuple(sorted(set(picked)))
 
 
 @dataclass(frozen=True)
 class BinaryDiffOutcome:
-    """One binary's result within a full diff. ``summary`` is None exactly when it failed."""
+    """One binary's result within a full diff. ``summary`` is None exactly when it failed.
+
+    ``attempts`` / ``reason`` are read back from the recorded diff_meta row (None when nothing was
+    recorded, e.g. a preflight failure before the diff_id existed). ``was_failed_before`` marks a
+    binary that entered this run as a retry (diff_ok=0), so a now-successful one is ``recovered`` --
+    the visible evidence a transient failure self-healed."""
 
     binary: str
     summary: DiffSummary | None
     error: str | None
+    attempts: int | None = None
+    reason: str | None = None
+    was_failed_before: bool = False
+    recovered: bool = False
 
 
 @dataclass(frozen=True)
 class FullDiffSummary:
-    """What a full diff reports: the plan, each binary's outcome, and whether the user cancelled."""
+    """What a full diff reports: the plan, each binary's outcome, whether the user cancelled, and
+    the retry cap in force (so a reader can label a failed binary 'will retry' vs 'hard')."""
 
     plan: FullDiffPlan
     outcomes: tuple[BinaryDiffOutcome, ...]
     cancelled: bool
+    retry_limit: int = _DIFF_RETRY_LIMIT
 
 
 # ── binary .so location (finding-1 fail-fast) ────────────────────────────────────────
@@ -463,22 +597,37 @@ def run_version_diff(
     did = diff_id or make_diff_id(run_a_id, run_b_id, pf.binary_a)
     timeout_s = config.ghidra.headless_timeout_seconds
 
-    with tempfile.TemporaryDirectory(prefix="tm_diff_") as td:
-        tdp = Path(td)
-        export_a = _run_binexport(pf.so_a, config, tdp, "a", timeout_s)
-        export_b = _run_binexport(pf.so_b, config, tdp, "b", timeout_s)
-        bindiff_path = _run_bindiff(export_a, export_b, tdp, timeout_s)
-        l0 = run_layer0_parse(
+    # Any toolchain/parse step can fail; record the failure as an honest, atomic blind-spot row
+    # (diff_ok=0 + why + attempts) so it persists and the next full diff can retry it, then re-raise
+    # so the caller (single-binary CLI or the full-diff loop) still sees the error. A layer-2 fail
+    # after layer-0's uncommitted INSERT is made consistent by _record_diff_failure's rollback.
+    try:
+        with tempfile.TemporaryDirectory(prefix="tm_diff_") as td:
+            tdp = Path(td)
+            export_a = _run_binexport(pf.so_a, config, tdp, "a", timeout_s)
+            export_b = _run_binexport(pf.so_b, config, tdp, "b", timeout_s)
+            bindiff_path = _run_bindiff(export_a, export_b, tdp, timeout_s)
+            l0 = run_layer0_parse(
+                atlas,
+                bindiff_path=bindiff_path,
+                run_a_id=run_a_id,
+                run_b_id=run_b_id,
+                binary_a=binary_name,
+                binary_b=binary_name,
+                diff_id=did,
+                commit=False,
+            )
+            run_layer2_delta(atlas, diff_id=did, run_a_id=run_a_id, run_b_id=run_b_id, commit=True)
+    except TreasureMapError as exc:
+        _record_diff_failure(
             atlas,
-            bindiff_path=bindiff_path,
+            diff_id=did,
             run_a_id=run_a_id,
             run_b_id=run_b_id,
-            binary_a=binary_name,
-            binary_b=binary_name,
-            diff_id=did,
-            commit=False,
+            binary_short=pf.binary_a,
+            exc=exc,
         )
-        run_layer2_delta(atlas, diff_id=did, run_a_id=run_a_id, run_b_id=run_b_id, commit=True)
+        raise
 
     counts = _delta_counts(atlas, did)
     return DiffSummary(
@@ -519,22 +668,103 @@ def _read_binaries(analysis_db_path: str) -> dict[str, str]:
     return {r[0]: r[1] for r in rows}
 
 
-def plan_full_diff(atlas: sqlite3.Connection, run_a_id: str, run_b_id: str) -> FullDiffPlan:
+@dataclass(frozen=True)
+class _DiffStatusRecord:
+    """One binary's recorded diff status for a run-pair, read from diff_meta for classification."""
+
+    diff_ok: int
+    diff_attempts: int
+    sha256_a: str | None
+    sha256_b: str | None
+
+
+def _read_diff_status_map(
+    atlas: sqlite3.Connection, run_a_id: str, run_b_id: str
+) -> dict[str, _DiffStatusRecord]:
+    """``{binary short name -> _DiffStatusRecord}`` for every recorded diff of this run-pair.
+
+    Keyed on ``binary_a`` (the normalized short name plan_full_diff also uses). A pre-feature row
+    with a NULL binary_a cannot be mapped to a binary, so it is skipped -> that binary reads as
+    'never diffed' and is re-diffed, which backfills the new columns (honest, not a silent skip)."""
+    rows = atlas.execute(
+        "SELECT binary_a, diff_ok, diff_attempts, sha256_a, sha256_b FROM diff_meta "
+        "WHERE run_a_id = ? AND run_b_id = ? AND binary_a IS NOT NULL",
+        (run_a_id, run_b_id),
+    ).fetchall()
+    return {
+        r[0]: _DiffStatusRecord(
+            diff_ok=r[1] or 0, diff_attempts=r[2] or 0, sha256_a=r[3], sha256_b=r[4]
+        )
+        for r in rows
+    }
+
+
+def plan_full_diff(
+    atlas: sqlite3.Connection,
+    run_a_id: str,
+    run_b_id: str,
+    *,
+    retry_limit: int = _DIFF_RETRY_LIMIT,
+) -> FullDiffPlan:
     """Decide which binaries a full diff should diff: those present in BOTH runs whose content
-    (sha256) differs. Unchanged binaries are skipped (diffing identical content is pure waste); a
-    binary present on only one side has no counterpart to align, so it is listed, never diffed."""
+    (sha256) differs, PARTITIONED by their recorded diff status so the sweep is incremental +
+    self-healing. Unchanged binaries are skipped (diffing identical content is pure waste); a binary
+    present on only one side has no counterpart to align, so it is listed, never diffed.
+
+    Classification of each changed binary (see FullDiffPlan for the buckets):
+      * no recorded diff, or recorded content (sha256) differs from now -> ``to_diff``
+        (the content-changed case also VOIDS a past hard-boundary verdict: attempts reset).
+      * diff_ok=1 and both sha256 unchanged -> ``already_ok`` (skip).
+      * diff_ok=0, same content, attempts < ``retry_limit`` -> ``retry``.
+      * diff_ok=0, same content, attempts >= ``retry_limit`` -> ``hard_failed`` (skip w/o force)."""
     run_a = _resolve_run(atlas, run_a_id, "a")
     run_b = _resolve_run(atlas, run_b_id, "b")
     assert run_a.analysis_db_path is not None and run_b.analysis_db_path is not None
     a = _read_binaries(run_a.analysis_db_path)
     b = _read_binaries(run_b.analysis_db_path)
     both = a.keys() & b.keys()
+    changed = sorted(n for n in both if a[n] != b[n])
+    unchanged = sorted(n for n in both if a[n] == b[n])
+    status = _read_diff_status_map(atlas, run_a_id, run_b_id)
+
+    to_diff: list[str] = []
+    retry: list[str] = []
+    already_ok: list[str] = []
+    hard_failed: list[str] = []
+    for n in changed:
+        rec = status.get(n)
+        if rec is None:
+            to_diff.append(n)  # never diffed
+        elif rec.diff_ok == 1 and rec.sha256_a == a[n] and rec.sha256_b == b[n]:
+            already_ok.append(n)  # succeeded, content unchanged -> skip
+        elif rec.sha256_a != a[n] or rec.sha256_b != b[n]:
+            to_diff.append(n)  # content changed (or unrecorded sha) -> re-diff, attempts reset
+        elif rec.diff_attempts < retry_limit:
+            retry.append(n)  # failed, same content, under cap -> retry
+        else:
+            hard_failed.append(n)  # failed at cap, same content -> skip unless --force-retry
+
     return FullDiffPlan(
-        changed=tuple(sorted(n for n in both if a[n] != b[n])),
-        unchanged=tuple(sorted(n for n in both if a[n] == b[n])),
+        changed=tuple(changed),
+        unchanged=tuple(unchanged),
         only_in_a=tuple(sorted(a.keys() - b.keys())),
         only_in_b=tuple(sorted(b.keys() - a.keys())),
+        to_diff=tuple(to_diff),
+        retry=tuple(retry),
+        already_ok=tuple(already_ok),
+        hard_failed=tuple(hard_failed),
     )
+
+
+def _read_recorded_status(atlas: sqlite3.Connection, diff_id: str) -> tuple[int | None, str | None]:
+    """(diff_attempts, diff_status_reason) for one recorded diff, or (None, None) if none. Read back
+    after a binary runs so the outcome carries the attempt count + failure bucket for reporting."""
+    row = atlas.execute(
+        "SELECT diff_attempts, diff_status_reason FROM diff_meta WHERE diff_id = ?", (diff_id,)
+    ).fetchone()
+    if row is None:
+        return None, None
+    return row[0], row[1]
 
 
 def run_full_diff(
@@ -544,20 +774,26 @@ def run_full_diff(
     *,
     config: Config,
     force: bool = False,
+    force_retry: bool = False,
+    retry_limit: int = _DIFF_RETRY_LIMIT,
     confirm: Callable[[int], bool] = lambda _n: True,
     on_outcome: Callable[[int, int, BinaryDiffOutcome], None] = lambda _i, _n, _o: None,
 ) -> FullDiffSummary:
-    """Diff every CHANGED binary between two runs, SERIALLY.
+    """Diff every CHANGED binary between two runs that NEEDS diffing, SERIALLY.
 
-    Serial by design — correctness first; parallelism is a separate performance concern, and this
-    loop is the single clean insertion point for it. The run-pair-global preconditions (version
-    skew, toolchain) are checked ONCE up front so a global problem fails fast instead of N identical
-    per-binary failures; a PER-binary failure (e.g. one .so cannot be located) is recorded and the
-    sweep CONTINUES — a full diff's value is coverage, and one bad binary must not lose the rest.
-    ``confirm(n)`` gates a large sweep; ``on_outcome`` reports each binary as it finishes."""
-    plan = plan_full_diff(atlas, run_a_id, run_b_id)
-    if not plan.changed:
-        return FullDiffSummary(plan, (), cancelled=False)
+    Incremental + self-healing: already-ok binaries whose content is unchanged are skipped, and
+    previously-failed ones are retried (up to ``retry_limit`` at the same content; ``force_retry``
+    also re-attempts suspected hard boundaries) -- see plan_full_diff. Serial by design (parallelism
+    is a separate concern; this loop is its one clean insertion point). The run-pair-global
+    preconditions (version skew, toolchain) are checked ONCE up front so a global problem fails fast
+    instead of N identical per-binary failures; a PER-binary failure is recorded as an atomic
+    blind-spot row and the sweep CONTINUES — a full diff's value is coverage, and one bad binary
+    must not lose the rest. ``confirm(n)`` gates a large sweep; ``on_outcome`` reports each one."""
+    plan = plan_full_diff(atlas, run_a_id, run_b_id, retry_limit=retry_limit)
+    to_run = plan.binaries_to_run(force_retry=force_retry)
+    if not to_run:
+        # nothing NEEDS diffing: no changed binaries, or all already-ok / suspected-hard (skipped).
+        return FullDiffSummary(plan, (), cancelled=False, retry_limit=retry_limit)
     # run-pair-global preflight, once (same for every binary):
     run_a = _resolve_run(atlas, run_a_id, "a")
     run_b = _resolve_run(atlas, run_b_id, "b")
@@ -568,19 +804,41 @@ def run_full_diff(
             "same toolchain, or pass --force to diff anyway (the result stays honestly degraded)."
         )
     _check_toolchain(config)
-    if not confirm(len(plan.changed)):
-        return FullDiffSummary(plan, (), cancelled=True)
+    if not confirm(len(to_run)):
+        return FullDiffSummary(plan, (), cancelled=True, retry_limit=retry_limit)
 
+    was_failed_before = set(plan.retry) | set(plan.hard_failed)
     outcomes: list[BinaryDiffOutcome] = []
-    total = len(plan.changed)
-    for i, binary in enumerate(plan.changed, 1):
+    total = len(to_run)
+    for i, binary in enumerate(to_run, 1):
+        did = make_diff_id(run_a_id, run_b_id, binary)
+        prior_failed = binary in was_failed_before
         try:
             summary = run_version_diff(
                 atlas, run_a_id, run_b_id, binary, config=config, force=force
             )
-            outcome = BinaryDiffOutcome(binary, summary, None)
+            attempts, _ = _read_recorded_status(atlas, summary.diff_id)
+            outcome = BinaryDiffOutcome(
+                binary,
+                summary,
+                None,
+                attempts=attempts,
+                was_failed_before=prior_failed,
+                recovered=prior_failed,  # entered failed, now succeeded -> self-healed
+            )
         except TreasureMapError as exc:
-            outcome = BinaryDiffOutcome(binary, None, f"{type(exc).__name__}: {exc}")
+            # run_version_diff already recorded the failed row atomically; roll back any stray
+            # uncommitted state as a belt-and-braces guard so it never rides the next commit.
+            atlas.rollback()
+            attempts, reason = _read_recorded_status(atlas, did)
+            outcome = BinaryDiffOutcome(
+                binary,
+                None,
+                f"{type(exc).__name__}: {exc}",
+                attempts=attempts,
+                reason=reason,
+                was_failed_before=prior_failed,
+            )
         outcomes.append(outcome)
         on_outcome(i, total, outcome)
-    return FullDiffSummary(plan, tuple(outcomes), cancelled=False)
+    return FullDiffSummary(plan, tuple(outcomes), cancelled=False, retry_limit=retry_limit)

@@ -69,6 +69,7 @@ from treasure_map.lib.query.diff_align import align_by_b as _align_by_b
 from treasure_map.lib.query.diff_align import get_diff_capabilities as _get_diff_capabilities
 from treasure_map.lib.query.diff_align import get_diff_deltas as _get_diff_deltas
 from treasure_map.lib.query.diff_align import get_diff_meta as _get_diff_meta
+from treasure_map.lib.query.diff_align import list_diff_blindspots as _list_diff_blindspots
 from treasure_map.lib.query.diff_align import list_diffs as _list_diffs
 
 # A standing reminder attached to every candidate-listing / aggregation result: the ordering and
@@ -922,7 +923,9 @@ def make_tools(
         read it as 'no change'; it compares only the analysis-tool version, not the firmware. A NULL
         ``ghidra_version`` = that side recorded none. ``unmatched_b`` = B-side functions with no
         A-side match (the presence layer, the WEAKEST signal -- to find changes look at
-        ``layer_changed`` via get_diff_deltas, not this)."""
+        ``layer_changed`` via get_diff_deltas, not this). ★ ``diff_ok=0`` means this binary did NOT
+        diff (``diff_status='failed'``, ``diff_status_reason`` = why, ``diff_attempts`` = tries): an
+        empty get_diff_deltas for it is a BLIND SPOT, never 'no change' (list_diff_blindspots)."""
         conn = open_atlas(atlas_path)
         try:
             return _get_diff_meta(conn, diff_id)
@@ -965,16 +968,40 @@ def make_tools(
 
     def list_diffs(run_a_id: str | None = None, run_b_id: str | None = None) -> dict[str, Any]:
         """Browse the version diffs in the atlas: one row per binary diffed between two runs, with
-        its change profile (matched_pairs, layer_changed / unchanged / undetermined, version_skew).
-        Optionally filter to a run-pair. The entry point after a full diff — see which binaries were
-        compared and how much each moved, then open one with get_diff_deltas / get_diff_meta.
+        its change profile (matched_pairs, layer_changed / unchanged / undetermined, version_skew)
+        AND its diff status (diff_ok / diff_status / diff_status_reason / diff_attempts). Optionally
+        filter to a run-pair. The entry point after a full diff — see which binaries were compared,
+        how much each moved, and which FAILED to diff, then open one with get_diff_deltas /
+        get_diff_meta.
 
         ★ Counts are tri-state PROJECTIONS, never verdicts or a ranking: ``layer_changed`` is not
         proof the change matters, and an EMPTY list means no diff has been run for that filter --
-        not 'nothing changed'."""
+        not 'nothing changed'. ★ A ``diff_ok=0`` row is a BLIND SPOT (the binary did not diff --
+        diff_status_reason says why): its zero counts are 'unknown', NOT 'no change'. Use
+        list_diff_blindspots to focus just the un-diffed binaries."""
         conn = open_atlas(atlas_path)
         try:
             return _list_diffs(conn, run_a_id, run_b_id)
+        finally:
+            conn.close()
+
+    def list_diff_blindspots(
+        run_a_id: str | None = None, run_b_id: str | None = None
+    ) -> dict[str, Any]:
+        """The binaries a full diff could NOT analyse between two runs (``diff_ok=0``) — the
+        explicit blind-spot listing that keeps an un-diffed binary from masquerading as 'no change'.
+        Optionally filter to a run-pair.
+
+        ★ UNKNOWN is not SAFE: a binary missing from the deltas may simply have FAILED to diff. Each
+        row gives ``diff_status_reason`` (why it failed — e.g. binexport_ghidra_crash likely
+        transient, bindiff_flowgraph likely a hard boundary), ``diff_attempts`` (how many tries),
+        and ``suspected_hard`` (1 = hit the retry cap, so later full diffs skip it unless
+        force_retry; a HINT from repeated identical-content failures, never proof the binary is
+        undiffable — its content changing resets the count). Read this alongside get_diff_deltas so
+        a consumer of the change map always sees the coverage gaps too."""
+        conn = open_atlas(atlas_path)
+        try:
+            return _list_diff_blindspots(conn, run_a_id, run_b_id)
         finally:
             conn.close()
 
@@ -1319,6 +1346,7 @@ def make_tools(
         "get_function_alignment": get_function_alignment,
         "get_diff_capabilities": get_diff_capabilities,
         "list_diffs": list_diffs,
+        "list_diff_blindspots": list_diff_blindspots,
         "cross_firmware_patterns": cross_firmware_patterns,
         "pattern_density": pattern_density,
         "pattern_twins": pattern_twins,

@@ -351,6 +351,35 @@ def _binary_name(analysis_db_path: str, binary: str) -> str | None:
     return row[0] if row is not None else None
 
 
+def _next_attempts(
+    atlas: sqlite3.Connection, diff_id: str, cur_sha_a: str | None, cur_sha_b: str | None
+) -> int:
+    """The attempts count to record for THIS diff of ``diff_id``, sha-aware so it doubles as the
+    attempts-reset gate.
+
+    Reads the prior diff_meta row (if any) BEFORE it is deleted/replaced. The counter only CONTINUES
+    when both sides' current sha256 POSITIVELY equal the prior row's -- i.e. the exact same content
+    is being diffed again (a genuine retry). If the content changed (a recompiled binary) OR either
+    side's sha is unknown, it RESETS to 1: a past 'hard boundary' verdict is void once the bytes
+    differ, and an unknowable identity must never be counted as a repeat failure (that would falsely
+    escalate toward the retry cap). Success and failure paths share this so both agree on the count.
+    """
+    row = atlas.execute(
+        "SELECT diff_attempts, sha256_a, sha256_b FROM diff_meta WHERE diff_id = ?", (diff_id,)
+    ).fetchone()
+    if row is None:
+        return 1
+    prev_attempts = row[0] or 0
+    prev_a, prev_b = row[1], row[2]
+    same_content = (
+        cur_sha_a is not None
+        and cur_sha_b is not None
+        and prev_a == cur_sha_a
+        and prev_b == cur_sha_b
+    )
+    return prev_attempts + 1 if same_content else 1
+
+
 def make_diff_id(run_a_id: str, run_b_id: str, binary: str) -> str:
     """The identity of ONE binary's diff between two runs: ``{run_a}::{run_b}::{binary}``.
 
@@ -449,6 +478,13 @@ def run_layer0_parse(
     pres_a = compute_side_presence(did, "a", parsed.matched_addrs_a, baseline_a)
     pres_b = compute_side_presence(did, "b", parsed.matched_addrs_b, baseline_b)
 
+    # sha256 of the diffed content on each side, recorded so the next full diff can skip an
+    # unchanged binary (incremental) and reset the attempts counter when the content changed. Read
+    # BEFORE delete_diff replaces the row -- _next_attempts needs the prior row.
+    sha_a = _binary_sha256(run_a.analysis_db_path, binary_a)
+    sha_b = _binary_sha256(run_b.analysis_db_path, binary_b)
+    attempts = _next_attempts(atlas, did, sha_a, sha_b)
+
     undetermined = sum(1 for r in parsed.rows if r.alignment_state == "alignment_undetermined")
     meta = DiffMetaRow(
         diff_id=did,
@@ -485,6 +521,16 @@ def run_layer0_parse(
         micro_skipped_b=baseline_b.skipped_micro_count,
         presence_computed_a=1,
         presence_computed_b=1,
+        # A successful parse: diff_ok=1 / status='ok'. This row is written with commit=False in the
+        # real pipeline, so it only reaches disk when layer-2 also commits -- a layer-2 failure
+        # rolls the whole transaction back, leaving NO ok=1 residue (the driver's failure path then
+        # writes the honest failed row). attempts continues/reset by content identity (sha).
+        diff_ok=1,
+        diff_status="ok",
+        diff_status_reason=None,
+        diff_attempts=attempts,
+        sha256_a=sha_a,
+        sha256_b=sha_b,
     )
 
     delete_diff(atlas, did, commit=False)

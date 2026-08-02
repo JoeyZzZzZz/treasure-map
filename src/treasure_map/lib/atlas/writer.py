@@ -344,9 +344,10 @@ def add_diff_meta(conn: sqlite3.Connection, row: DiffMetaRow, *, commit: bool = 
             functions_total_a, functions_total_b, matched_in_domain_a, matched_in_domain_b,
             unmatched_a, unmatched_b, out_of_inventory_a, out_of_inventory_b, inventory_mismatch_a,
             inventory_mismatch_b, functions_empty_a, functions_empty_b, micro_skipped_a,
-            micro_skipped_b, presence_computed_a, presence_computed_b, binary_a, binary_b)
+            micro_skipped_b, presence_computed_a, presence_computed_b, binary_a, binary_b,
+            diff_ok, diff_status, diff_status_reason, diff_attempts, sha256_a, sha256_b)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                   ?, ?, ?)""",
+                   ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             row.diff_id,
             row.run_a_id,
@@ -377,6 +378,12 @@ def add_diff_meta(conn: sqlite3.Connection, row: DiffMetaRow, *, commit: bool = 
             row.presence_computed_b,
             row.binary_a,
             row.binary_b,
+            row.diff_ok,
+            row.diff_status,
+            row.diff_status_reason,
+            row.diff_attempts,
+            row.sha256_a,
+            row.sha256_b,
         ),
     )
     if commit:

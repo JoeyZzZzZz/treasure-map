@@ -117,6 +117,25 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if dm_cols and "binary_b" not in dm_cols:
         conn.execute("ALTER TABLE diff_meta ADD COLUMN binary_b TEXT")
 
+    # diff_meta per-binary status (added this round): the scan-side ghidra_ok/status/reason model
+    # ported to diff, so a FAILED binary persists a queryable blind-spot row and the next full diff
+    # can skip already-ok binaries (incremental) and retry failed ones (self-healing). diff_ok /
+    # diff_attempts are NOT NULL DEFAULT (a pre-feature row takes ok=0 / attempts=0, i.e. "failed /
+    # never counted" -> re-diffed next run, which backfills the columns); the rest are nullable.
+    # Idempotent — each ADD runs only while its column is missing.
+    if dm_cols and "diff_ok" not in dm_cols:
+        conn.execute("ALTER TABLE diff_meta ADD COLUMN diff_ok INTEGER NOT NULL DEFAULT 0")
+    if dm_cols and "diff_status" not in dm_cols:
+        conn.execute("ALTER TABLE diff_meta ADD COLUMN diff_status TEXT")
+    if dm_cols and "diff_status_reason" not in dm_cols:
+        conn.execute("ALTER TABLE diff_meta ADD COLUMN diff_status_reason TEXT")
+    if dm_cols and "diff_attempts" not in dm_cols:
+        conn.execute("ALTER TABLE diff_meta ADD COLUMN diff_attempts INTEGER NOT NULL DEFAULT 0")
+    if dm_cols and "sha256_a" not in dm_cols:
+        conn.execute("ALTER TABLE diff_meta ADD COLUMN sha256_a TEXT")
+    if dm_cols and "sha256_b" not in dm_cols:
+        conn.execute("ALTER TABLE diff_meta ADD COLUMN sha256_b TEXT")
+
     # dimension_delta.binary (added this round): the diff's target binary (short name), parsed from
     # subject_key at write time, so a per-binary consumer filters on a real column instead of a
     # brittle LIKE on the subject_key prefix. An atlas that already created dimension_delta needs

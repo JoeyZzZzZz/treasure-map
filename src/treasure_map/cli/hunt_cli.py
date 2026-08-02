@@ -106,25 +106,59 @@ def _echo_single_diff(summary: Any, resolved_atlas: Path) -> None:
 
 
 def _echo_full_diff(fsum: Any, resolved_atlas: Path) -> None:
-    """Print a full diff's roll-up: what was diffed vs skipped, and per-binary success/failure."""
+    """Print a full diff's roll-up: what was diffed vs skipped (incremental), which failures
+    self-healed, and which persist as blind spots — so a coverage gap is never invisible."""
     plan = fsum.plan
+    limit = fsum.retry_limit
     click.echo(f"Atlas: {resolved_atlas}")
     if fsum.cancelled:
-        click.echo(f"Cancelled — {len(plan.changed)} changed binaries not diffed.")
+        click.echo(
+            f"Cancelled — {len(plan.binaries_to_run(force_retry=True))} binaries needing a diff "
+            "not run."
+        )
         return
     if not plan.changed:
         click.echo("No changed binaries between the two runs (nothing to diff).")
+        return
     ok = [o for o in fsum.outcomes if o.error is None]
     failed = [o for o in fsum.outcomes if o.error is not None]
+    recovered = [o.binary for o in ok if o.recovered]
+    # a failure that has hit the retry cap is a suspected hard boundary; below the cap it retries.
+    still_hard = [o for o in failed if (o.attempts or 0) >= limit]
+    will_retry = [o for o in failed if (o.attempts or 0) < limit]
     click.echo(
-        f"  binaries      : {len(plan.changed)} changed (diffed), {len(plan.unchanged)} unchanged "
+        f"  binaries      : {len(plan.changed)} changed, {len(plan.unchanged)} unchanged "
         f"(skipped), only-in-A {len(plan.only_in_a)}, only-in-B {len(plan.only_in_b)}"
     )
-    click.echo(f"  diffed        : {len(ok)} ok, {len(failed)} failed")
-    for o in failed:
-        click.echo(f"    - {o.binary}: {o.error}")
-    if plan.changed:
-        click.echo("Read the deltas: list_diffs, then get_diff_deltas / get_diff_meta")
+    click.echo(
+        f"  diffed        : {len(ok)} ok ({len(plan.to_diff)} new, {len(plan.already_ok)} "
+        f"skipped-already-ok), {len(failed)} failed this run"
+    )
+    if recovered:
+        click.echo(
+            f"  recovered     : {len(recovered)} retried and now ok — {', '.join(recovered)}"
+        )
+    if still_hard:
+        click.echo(
+            f"  still failing : {len(still_hard)} at the retry cap (suspected hard boundary; "
+            "--force-retry to re-attempt)"
+        )
+        for o in still_hard:
+            click.echo(f"    - {o.binary}: {o.reason or o.error} (attempts={o.attempts})")
+    if will_retry:
+        click.echo(f"  will retry    : {len(will_retry)} failed this run (next full diff retries)")
+        for o in will_retry:
+            click.echo(f"    - {o.binary}: {o.reason or o.error} (attempts={o.attempts})")
+    if plan.hard_failed:
+        # suspected-hard binaries SKIPPED this run (not re-attempted without --force-retry)
+        click.echo(
+            f"  blind spots   : {len(plan.hard_failed)} suspected-hard skipped this run — "
+            f"{', '.join(plan.hard_failed)} (list_diff_blindspots / --force-retry)"
+        )
+    click.echo(
+        "Read the deltas: list_diffs, then get_diff_deltas / get_diff_meta; "
+        "list_diff_blindspots for un-diffed binaries."
+    )
 
 
 @click.command(
@@ -148,6 +182,13 @@ def _echo_full_diff(fsum: Any, resolved_atlas: Path) -> None:
     "be version_skew undetermined (the result stays honestly degraded).",
 )
 @click.option(
+    "--force-retry",
+    is_flag=True,
+    default=False,
+    help="In a full diff, also re-attempt binaries that hit the retry cap (suspected hard "
+    "boundaries), which are skipped by default. Use after fixing a toolchain issue.",
+)
+@click.option(
     "--config",
     "-c",
     type=click.Path(exists=True, path_type=Path),
@@ -166,6 +207,7 @@ def hunt_diff(
     run_b_id: str,
     binary_name: str | None,
     force: bool,
+    force_retry: bool,
     config: Path | None,
     atlas_path: Path | None,
 ) -> None:
@@ -226,6 +268,7 @@ def hunt_diff(
                 run_b_id,
                 config=cfg,
                 force=force,
+                force_retry=force_retry,
                 confirm=_confirm,
                 on_outcome=_on_outcome,
             )

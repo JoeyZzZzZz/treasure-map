@@ -313,6 +313,18 @@ class DiffMetaRow:
     # skip filtering (empty != absent on the binary-scope axis).
     binary_a: str | None = None
     binary_b: str | None = None
+    # per-binary diff status (the scan-side ghidra_ok/status/reason model ported to diff). diff_ok
+    # is the RERUN GATE: 1 = usable output (all steps ok), never re-diffed while sha unchanged; 0 =
+    # failed, re-diffed next full run. diff_status is tri-state (ok / failed / NULL pre-feature);
+    # diff_status_reason buckets the failure; diff_attempts counts attempts at the SAME content (a
+    # retry cap reads it, reset when either sha256 changes); sha256_a/b are the content the diff ran
+    # on -- the incremental-skip and attempts-reset gate. A failed row carries NO coverage counts.
+    diff_ok: int = 0
+    diff_status: str | None = None
+    diff_status_reason: str | None = None
+    diff_attempts: int = 0
+    sha256_a: str | None = None
+    sha256_b: str | None = None
 
 
 @dataclass(frozen=True)

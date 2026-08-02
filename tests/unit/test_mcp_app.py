@@ -43,6 +43,7 @@ _EXPECTED_TOOLS = {
     "get_function_alignment",
     "get_diff_capabilities",
     "list_diffs",
+    "list_diff_blindspots",
     "cross_firmware_patterns",
     "pattern_density",
     "pattern_twins",

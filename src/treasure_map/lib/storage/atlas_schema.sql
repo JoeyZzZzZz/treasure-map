@@ -478,6 +478,25 @@ CREATE TABLE IF NOT EXISTS diff_meta (
     binary_b                TEXT,            --   binary), stored as short name; NULL on a pre-feature
                                              --   diff -> a per-binary consumer must refuse, not skip
                                              --   filtering (empty != absent on the binary-scope axis)
+    -- per-binary diff status (mirrors the scan-side ghidra_ok/status/reason model): a FAILED binary
+    -- writes its own row (diff_ok=0 + status + reason) so a blind spot is persisted and queryable,
+    -- never invisible. diff_ok is the RERUN GATE: an ok=1 binary whose content is unchanged is
+    -- skipped next full diff (incremental); an ok=0 binary is retried (self-healing for a flaky
+    -- toolchain failure). A failed row carries NO coverage counts (there is no usable output).
+    diff_ok                 INTEGER NOT NULL DEFAULT 0,  -- 1 = usable output (BinExport x2 + BinDiff
+                                             --   + layer0/2 all succeeded); 0 = this diff failed
+    diff_status             TEXT,            -- tri-state outcome: ok / failed / NULL (pre-feature)
+    diff_status_reason      TEXT,            -- WHY a failed diff failed: binexport_ghidra_crash /
+                                             --   bindiff_flowgraph / binexport_no_file / timeout /
+                                             --   other; NULL on success. Lets a consumer tell a
+                                             --   likely-transient failure from a hard boundary
+    diff_attempts           INTEGER NOT NULL DEFAULT 0,  -- cumulative attempts at the SAME content;
+                                             --   reset to 1 when either side's sha256 changes (a
+                                             --   recompiled binary may now diff, so a past 'hard'
+                                             --   verdict is void); a retry cap uses this
+    sha256_a                TEXT,            -- A-side binary sha256 at diff time; the incremental
+    sha256_b                TEXT,            --   skip + attempts-reset gate (current sha != this ->
+                                             --   content changed -> re-diff, attempts reset)
     created_at              DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
+from treasure_map.lib.diff.driver import _DIFF_RETRY_LIMIT
 from treasure_map.lib.diff.layer0 import norm_hex
 
 _ALIGN_NOTE = (
@@ -102,13 +103,23 @@ _META_NOTE = (
     "version_skew=1 -> every delta in this diff is version_skew undetermined; do not read it as "
     "'no change'. It compares only the analysis-tool version, not the firmware. A NULL "
     "ghidra_version means that side did not record one. unmatched_b = B-side functions with no "
-    "A-side match (presence layer, the WEAKEST signal -- look at layer_changed, not this)."
+    "A-side match (presence layer, the WEAKEST signal -- look at layer_changed, not this). "
+    "diff_ok=0 means this binary did NOT diff (diff_status='failed', diff_status_reason = why): an "
+    "empty get_diff_deltas for it is a BLIND SPOT, not 'no change'. diff_ok=1 = usable output."
 )
 
 _CAP_NOTE = (
     "delta_supported=0 for a dimension means it is VISIBLE but this diff produces no per-subject "
     "delta for it -- an EXPLICIT non-judgement, never a silent omission. state_a/state_b are each "
     "side's analysis capability (present / declared_absent / registration_unknown)."
+)
+
+_EMPTY_DELTAS_NOTE = (
+    "EMPTY is NOT 'no changes'. Two very different cases produce it: (a) the binary diffed fine "
+    "but no dimension changed, or (b) the binary did NOT diff at all (a blind spot). Check "
+    "get_diff_meta -> diff_ok/diff_status: diff_ok=0 means it failed (see diff_status_reason). "
+    "list_diff_blindspots enumerates the run-pair's un-diffed binaries. Also see "
+    "get_diff_capabilities for dimensions this diff cannot delta."
 )
 
 _DELTA_COLS = (
@@ -147,6 +158,10 @@ _META_COLS = (
     "presence_computed_a",
     "presence_computed_b",
     "bindiff_source",
+    "diff_ok",
+    "diff_status",
+    "diff_status_reason",
+    "diff_attempts",
 )
 
 
@@ -212,6 +227,12 @@ def get_diff_deltas(
             "undetermined_scope": "data | capability (the sole consumer key)",
             "empty_result": "not 'no changes' -- see get_diff_capabilities",
         }
+    elif total == 0:
+        # An empty result is the trap this tool must not spring: it reads as 'no change' but the
+        # binary may not have diffed at all (diff_ok=0). Surface the honesty note EVEN in the terse
+        # (non-verbose) mode, precisely because that is where a consumer is most likely to misread
+        # an empty result -- point them at the diff_status and the blind-spot listing.
+        result["note"] = _EMPTY_DELTAS_NOTE
     return result
 
 
@@ -259,8 +280,10 @@ _LIST_DIFFS_NOTE = (
     "Each row is ONE binary's diff between two runs (diff_id = {run_a}::{run_b}::{binary}). The "
     "counts are tri-state PROJECTIONS, not verdicts: layer_changed = the binary's changed aligned "
     "functions, NOT proof the change matters; delta_undetermined is NOT 'unchanged'. An EMPTY list "
-    "means no diff has been run for that filter yet — not 'nothing changed'. Pick a binary, then "
-    "read it with get_diff_deltas / get_diff_meta."
+    "means no diff has been run for that filter yet — not 'nothing changed'. diff_ok=0 rows are "
+    "BLIND SPOTS (diff_status='failed', diff_status_reason = why, diff_attempts = tries): the "
+    "binary did not diff, so its zero counts are 'unknown', never 'no change' — "
+    "list_diff_blindspots focuses just those. Pick a binary, then read get_diff_deltas / meta."
 )
 
 _LIST_DIFFS_COLS = (
@@ -270,6 +293,10 @@ _LIST_DIFFS_COLS = (
     "run_b_id",
     "matched_pairs",
     "version_skew",
+    "diff_ok",
+    "diff_status",
+    "diff_status_reason",
+    "diff_attempts",
     "layer_changed",
     "layer_unchanged",
     "delta_undetermined",
@@ -281,9 +308,10 @@ def list_diffs(
     run_a_id: str | None = None,
     run_b_id: str | None = None,
 ) -> dict[str, Any]:
-    """Every binary diffed between two runs, with each one's change profile — the browse view after
-    a full diff. Optionally filter to a run-pair. Read-only; counts are tri-state projections, never
-    a verdict or a ranking (a diff is a map, not a score)."""
+    """Every binary diffed between two runs, with each one's change profile AND its diff status —
+    the browse view after a full diff. Optionally filter to a run-pair. Read-only; counts tri-state
+    projections, never a verdict or a ranking (a diff is a map, not a score). diff_ok/diff_status
+    ride each row so a failed (un-diffed) binary is visible, never mistaken for 'no change'."""
     where: list[str] = []
     params: list[Any] = []
     if run_a_id is not None:
@@ -295,7 +323,7 @@ def list_diffs(
     clause = ("WHERE " + " AND ".join(where)) if where else ""
     rows = atlas.execute(
         "SELECT dm.diff_id, dm.binary_a, dm.run_a_id, dm.run_b_id, dm.matched_pairs, "  # noqa: S608
-        "dm.version_skew, "
+        "dm.version_skew, dm.diff_ok, dm.diff_status, dm.diff_status_reason, dm.diff_attempts, "
         "SUM(CASE WHEN dd.delta_kind='layer_changed' THEN 1 ELSE 0 END), "
         "SUM(CASE WHEN dd.delta_kind='layer_unchanged' THEN 1 ELSE 0 END), "
         "SUM(CASE WHEN dd.delta_kind='delta_undetermined' THEN 1 ELSE 0 END) "
@@ -308,4 +336,61 @@ def list_diffs(
         "count": len(rows),
         "filters": {"run_a_id": run_a_id, "run_b_id": run_b_id},
         "note": _LIST_DIFFS_NOTE,
+    }
+
+
+_BLINDSPOT_NOTE = (
+    "The binaries a full diff could NOT analyse between two runs (diff_ok=0) — the blind spots a "
+    "consumer of the deltas must see so an un-diffed binary is never read as 'no change' (UNKNOWN "
+    "is not SAFE). Each row: why it failed (diff_status_reason), how many times it was attempted "
+    "(diff_attempts), and whether it has hit the retry cap (suspected_hard=1 -> a likely-"
+    "deterministic toolchain boundary, skipped on later full diffs unless force_retry; 0 -> a "
+    "likely-transient failure that the next full diff retries). suspected_hard is a HINT from "
+    "repeated identical-content failures, never proof the binary is undiffable — its content "
+    "changing resets the count."
+)
+
+_BLINDSPOT_COLS = ("diff_id", "binary", "diff_status_reason", "diff_attempts", "suspected_hard")
+
+
+def list_diff_blindspots(
+    atlas: sqlite3.Connection,
+    run_a_id: str | None = None,
+    run_b_id: str | None = None,
+    *,
+    retry_limit: int = _DIFF_RETRY_LIMIT,
+) -> dict[str, Any]:
+    """The un-diffed (diff_ok=0) binaries of a run-pair: the explicit blind-spot listing so a
+    'no delta' can never masquerade as 'no change'. ``suspected_hard`` = diff_attempts >= the retry
+    cap (a likely hard boundary). Optionally filter to a run-pair. Read-only, facts only."""
+    where = ["diff_ok = 0"]
+    params: list[Any] = []
+    if run_a_id is not None:
+        where.append("run_a_id = ?")
+        params.append(run_a_id)
+    if run_b_id is not None:
+        where.append("run_b_id = ?")
+        params.append(run_b_id)
+    clause = " AND ".join(where)
+    rows = atlas.execute(
+        "SELECT diff_id, binary_a, diff_status_reason, diff_attempts "  # noqa: S608 -- clause literal
+        f"FROM diff_meta WHERE {clause} ORDER BY run_a_id, run_b_id, binary_a",
+        params,
+    ).fetchall()
+    blindspots = [
+        {
+            "diff_id": r[0],
+            "binary": r[1],
+            "diff_status_reason": r[2],
+            "diff_attempts": r[3],
+            "suspected_hard": 1 if (r[3] or 0) >= retry_limit else 0,
+        }
+        for r in rows
+    ]
+    return {
+        "blindspots": blindspots,
+        "count": len(blindspots),
+        "filters": {"run_a_id": run_a_id, "run_b_id": run_b_id},
+        "retry_limit": retry_limit,
+        "note": _BLINDSPOT_NOTE,
     }

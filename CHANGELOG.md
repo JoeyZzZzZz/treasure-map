@@ -77,6 +77,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`diff` full runs are now incremental, self-healing, and honest about failures.** A full diff
+  used to fail permanently on any per-binary toolchain error: the failure was printed once and never
+  persisted, so a flaky, one-off failure stayed in the blind spot forever, a genuinely hard boundary
+  (BinDiff cannot rebuild a binary's flow graph) could not be told apart from a transient one, and
+  re-running redid every already-succeeded binary from scratch. The scan pipeline already solved this
+  trio for Ghidra (a tri-state `ghidra_status` + an `ok` gate + auto re-run of the not-ok), so the
+  same model is ported to diff: each binary now records a `diff_ok` / `diff_status` /
+  `diff_status_reason` / `diff_attempts` row in `diff_meta` (a **failed** binary writes its own row —
+  a persisted, queryable blind spot, never a silent drop), plus the `sha256` it ran on. The next full
+  diff then **skips** already-ok binaries whose content is unchanged (incremental), **retries** failed
+  ones (a transient crash self-heals within a couple of attempts), and after a retry cap marks a
+  same-content repeat failure a *suspected hard boundary* it stops re-attempting — unless
+  `--force-retry`, or the binary's content changes (a recompile voids the past verdict and resets the
+  count). The failure write is a single **atomic** transaction (rollback → delete → insert → commit)
+  so a second failure of the same binary never crashes on its own primary key and a layer-2 failure
+  leaves no half-written or falsely-ok row behind. Read side: `list_diffs` carries each binary's
+  status, a new `list_diff_blindspots` MCP tool enumerates the un-diffed binaries with their reason
+  and attempt count, and an empty `get_diff_deltas` now points at the diff status — so an un-diffed
+  binary can never masquerade as "no change" (UNKNOWN is not SAFE).
+
 - **Reachability leads: string-key edges now reach one hop down, structurally.** A candidate that
   IS an edge callee already carried its key as a prose note. A candidate one direct call BELOW an
   edge callee — where the flagship command sink actually sits — carried nothing. Both now surface as
