@@ -266,3 +266,111 @@ def test_full_diff_one_failure_does_not_corrupt_others(
     con.close()
     assert (boom[0], boom[1], boom[2]) == (0, "failed", "binexport_ghidra_crash")
     assert ok_rows == 0  # no cross-contamination onto the other binary
+
+
+# ── Ctrl-C: cancel the queued sweep, keep completed, mark cancelled ─────────────────────
+
+
+class _FakeFuture:
+    def __init__(self, fn, args) -> None:  # type: ignore[no-untyped-def]
+        self.fn, self.args, self.ran, self.cancelled = fn, args, False, False
+
+    def result(self):  # type: ignore[no-untyped-def]
+        self.ran = True
+        return self.fn(*self.args)
+
+
+class _FakePool:
+    """A ThreadPoolExecutor stand-in that runs submit() lazily (on result()) so the test controls
+    exactly which futures 'complete' before the interrupt, and records the shutdown kwargs."""
+
+    def __init__(self, max_workers: int) -> None:
+        self.subs: list[_FakeFuture] = []
+        self.shutdown_kwargs: dict[str, object] | None = None
+
+    def submit(self, fn, *args):  # type: ignore[no-untyped-def]
+        f = _FakeFuture(fn, args)
+        self.subs.append(f)
+        return f
+
+    def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
+        self.shutdown_kwargs = {"wait": wait, "cancel_futures": cancel_futures}
+        if cancel_futures:  # mirror the real pool: drop the not-yet-run (queued) futures
+            for f in self.subs:
+                if not f.ran:
+                    f.cancelled = True
+
+
+def test_ctrl_c_cancels_queue_keeps_completed_marks_cancelled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ★ Ctrl-C mid-sweep must STOP scheduling (cancel the queued computes via shutdown
+    # cancel_futures=True), keep the already-completed binaries, and return cancelled=True — it must
+    # NOT drain the whole queue. Reverse: dropping cancel_futures=True leaves the queue to run.
+    atlas_path = _seed(tmp_path, {"a": "1", "b": "2", "c": "3"}, {"a": "1x", "b": "2x", "c": "3x"})
+    monkeypatch.setattr(driver, "_check_toolchain", lambda config: None)
+    monkeypatch.setattr(driver, "preflight", _fake_preflight(tmp_path))
+    monkeypatch.setattr(
+        driver, "compute_diff", lambda so_a, so_b, td, config: driver.DiffArtifacts(so_a, so_b, td)
+    )
+    monkeypatch.setattr(driver, "_persist_success", _ok_persist)
+    pools: list[_FakePool] = []
+
+    def _mk_pool(max_workers):  # type: ignore[no-untyped-def]
+        p = _FakePool(max_workers)
+        pools.append(p)
+        return p
+
+    def _one_then_interrupt(fut_map):  # type: ignore[no-untyped-def]
+        # yield exactly ONE future (the loop runs + persists it), then simulate Ctrl-C.
+        yield next(iter(fut_map))
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(driver, "ThreadPoolExecutor", _mk_pool)
+    monkeypatch.setattr(driver, "as_completed", _one_then_interrupt)
+
+    con = open_atlas(atlas_path)
+    fsum = driver.run_full_diff(con, "run_a", "run_b", config=_cfg())
+    con.close()
+    assert fsum.cancelled is True  # graceful cancel, not a crash
+    assert len(fsum.outcomes) == 1  # the one completed binary is kept
+    pool = pools[0]
+    assert pool.shutdown_kwargs == {"wait": True, "cancel_futures": True}  # ★ the fix
+    ran = [f for f in pool.subs if f.ran]
+    cancelled = [f for f in pool.subs if f.cancelled]
+    assert len(ran) == 1 and len(cancelled) == 2  # 1 completed, 2 queued -> cancelled (not drained)
+
+
+# ── diff-side memory budget is decoupled from the shared scan/init constant ─────────────
+
+
+def test_effective_diff_workers_uses_diff_per_jvm(monkeypatch: pytest.MonkeyPatch) -> None:
+    # ★ diff passes its OWN heavier per-JVM budget to the clamp, never the shared PER_JVM_MB.
+    captured: dict[str, object] = {}
+
+    def _fake_clamp(configured, *, per_jvm_mb=None, **kw):  # type: ignore[no-untyped-def]
+        captured["per_jvm_mb"] = per_jvm_mb
+        return configured, None
+
+    monkeypatch.setattr(driver, "clamp_parallelism_to_memory", _fake_clamp)
+    rd = driver._ResolvedDiff(
+        binary="x",
+        binary_short="x",
+        so_a=Path("/x"),
+        so_b=Path("/x"),
+        version_skew=False,
+        warnings=(),
+        diff_id="d",
+        size_bytes=1000,
+        prior_failed=False,
+    )
+    driver._effective_diff_workers(4, [rd])
+    assert captured["per_jvm_mb"] == driver._DIFF_PER_JVM_MB == 1600
+
+
+def test_shared_per_jvm_stays_1024_so_scan_is_not_shrunk() -> None:
+    # ★ reverse of raising the shared constant: machine.PER_JVM_MB stays 1024, so scan/init pools
+    # are NOT dragged down by diff's heavier BinExport budget (that would slow large scans).
+    import treasure_map.lib.machine as machine
+
+    assert machine.PER_JVM_MB == 1024

@@ -112,11 +112,12 @@ def _echo_full_diff(fsum: Any, resolved_atlas: Path) -> None:
     limit = fsum.retry_limit
     click.echo(f"Atlas: {resolved_atlas}")
     if fsum.cancelled:
+        # Ctrl-C: the completed binaries are persisted; the rest are simply un-diffed and will be
+        # picked up on the next full run (incremental). Show the roll-up of what DID complete below.
         click.echo(
-            f"Cancelled — {len(plan.binaries_to_run(force_retry=True))} binaries needing a diff "
-            "not run."
+            f"Interrupted — completed {len(fsum.outcomes)} binaries; the rest will be diffed on "
+            "the next run."
         )
-        return
     if not plan.changed:
         click.echo("No changed binaries between the two runs (nothing to diff).")
         return
@@ -215,7 +216,7 @@ def hunt_diff(
 
     RUN_A_ID / RUN_B_ID are run ids (a run id is scan's --run-id, default = the -w workspace name),
     NOT paths; tab-completion lists this atlas's runs. By default diffs every binary that changed
-    between the two runs (serially, with progress); ``--binary NAME`` focuses one. Drives the
+    between the two runs (in parallel, with progress); ``--binary NAME`` focuses one. Drives the
     external aligner end-to-end (BinExport -> BinDiff, you never touch an intermediate file), then
     writes alignment facts and tri-state dimension deltas to the atlas. A delta is a PROJECTION of
     existing annotations, never a change/defect verdict -- read it with the get_diff_* MCP tools
@@ -223,25 +224,17 @@ def hunt_diff(
     """
     from treasure_map.lib.atlas.connection import open_atlas
     from treasure_map.lib.config.config import load_config
-    from treasure_map.lib.diff.driver import (
-        _FULL_DIFF_CONFIRM_THRESHOLD,
-        run_full_diff,
-        run_version_diff,
-    )
+    from treasure_map.lib.diff.driver import run_full_diff, run_version_diff
     from treasure_map.lib.errors import TreasureMapError
 
     cfg = load_config(config)
     resolved_atlas = atlas_path if atlas_path is not None else cfg.atlas.db_path
 
-    def _confirm(n: int) -> bool:
-        if n <= _FULL_DIFF_CONFIRM_THRESHOLD:
-            return True
-        mins = max(1, round(n * 20 / 60))
-        return click.confirm(
-            f"Will diff {n} changed binaries (~{mins} min, serial); --binary <name> does just one. "
-            "Continue?",
-            default=False,
-        )
+    def _on_start(n: int) -> None:
+        # The full sweep is the normal usage, so it runs unconfirmed. Announce the size + the escape
+        # hatch (one binary) once, then stream per-binary progress. Ctrl-C stops it cleanly.
+        click.echo(f"Diffing {n} changed binaries.")
+        click.echo("Use --binary <name> to diff just one.")
 
     def _on_outcome(i: int, total: int, outcome: Any) -> None:
         if outcome.error is not None:
@@ -269,7 +262,7 @@ def hunt_diff(
                 config=cfg,
                 force=force,
                 force_retry=force_retry,
-                confirm=_confirm,
+                on_start=_on_start,
                 on_outcome=_on_outcome,
             )
     except TreasureMapError as exc:

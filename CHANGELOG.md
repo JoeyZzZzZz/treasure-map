@@ -88,10 +88,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   zero atlas), and persist (serial on the main thread) — so the CPU-heavy middle runs concurrently
   while every atlas write stays single-threaded (no WAL, and each binary keeps its own independent
   atomic transaction from the retry-status work). Before a pool starts, parallelism is clamped down
-  for that run if free memory or disk is tight (the config value is untouched). scan's per-binary
-  adaptive heap ladder is now a shared `adaptive_heap_mb` helper it keeps using; diff's BinExport
-  heap holds the conservative fixed 4096 until a peak-heap measurement on the largest diffed binary
-  confirms the ladder is safe there (never an OOM mid-sweep).
+  for that run if free memory or disk is tight — diff uses its own heavier per-JVM budget for that
+  clamp (BinExport's peak is above scan's) without shrinking scan's pool. scan's per-binary adaptive
+  heap ladder is now a shared `adaptive_heap_mb` helper it keeps using; diff's BinExport heap holds
+  the conservative fixed 4096 until a peak-heap measurement on the largest diffed binary confirms the
+  ladder is safe there (never an OOM mid-sweep). A full diff runs without a confirmation prompt (it
+  is the normal usage — it announces the count, then streams progress); Ctrl-C stops scheduling
+  further binaries and exits cleanly, keeping every binary already diffed (the rest are picked up on
+  the next run) — the in-flight exports still finish, since a pool thread cannot kill them.
 
 - **`diff` full runs are now incremental, self-healing, and honest about failures.** A full diff
   used to fail permanently on any per-binary toolchain error: the failure was printed once and never

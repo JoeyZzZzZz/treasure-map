@@ -35,7 +35,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from treasure_map.lib.atlas.models import DiffMetaRow
 from treasure_map.lib.atlas.writer import add_diff_meta, delete_diff
@@ -74,6 +74,16 @@ _BINEXPORT_SCRIPT = "ExportBinExport.java"
 # 4096 stays (slower under parallelism, but never an OOM mid-sweep).
 _DIFF_BINEXPORT_HEAP_MB = 4096
 
+# The memory a single diff BinExport JVM is budgeted at for the RUNTIME parallelism clamp — DIFF's
+# own value, deliberately NOT machine.PER_JVM_MB (the shared init/scan 1024). BinExport's measured
+# peak RSS on the two largest binaries here is ~1320MB (scan's ExportFunctions runs lighter at
+# ~950MB, so it keeps 1024), and this is 1.2x that as a thin margin. It is a CLAMP UNIT, not a
+# steady-state cap: clamp_parallelism_to_memory divides current MemAvailable by it, so on an idle
+# machine diff still runs at the configured knee, and only when free memory is genuinely tight does
+# it back off to ~this-many-MB per JVM. Raising the shared constant instead would drop scan's pool
+# too (479-library scans would slow), so diff passes its own value explicitly.
+_DIFF_PER_JVM_MB = 1600
+
 
 class DiffToolchainError(TreasureMapError):
     """The external diff toolchain (Ghidra + BinExport plugin + BinDiff CLI) is not available, or a
@@ -109,10 +119,6 @@ class DiffSummary:
     delta_undetermined: int
     warnings: tuple[str, ...]
 
-
-# Above this many changed binaries, a full diff asks for confirmation (serial diffs are ~20s each,
-# so a large sweep can run for many minutes — never start that silently).
-_FULL_DIFF_CONFIRM_THRESHOLD = 20
 
 # How many times a full diff attempts a failing binary AT THE SAME CONTENT before treating it as a
 # suspected hard boundary (a deterministic toolchain failure, e.g. BinDiff cannot rebuild the flow
@@ -939,11 +945,14 @@ def _effective_diff_workers(configured: int, resolved: list[_ResolvedDiff]) -> i
     """Clamp the configured pool size DOWN to what current memory AND disk allow for this run.
 
     Memory: the config value is a stable MemTotal derivation; if free RAM is low right now, running
-    that many BinExport JVMs would OOM (see clamp_parallelism_to_memory). Disk: N concurrent
-    computes each write ~2x the binary (two .BinExport + a .BinDiff) into a temp dir; if free disk
-    cannot hold ``workers`` of the largest such set, reduce (the interleaved persist keeps only
-    ~workers sets on disk at once). Both clamps only lower the count, log it, never go below 1."""
-    workers, note = clamp_parallelism_to_memory(max(1, configured))
+    that many BinExport JVMs would OOM (see clamp_parallelism_to_memory). ``_DIFF_PER_JVM_MB`` is
+    passed EXPLICITLY here — BinExport's measured peak is heavier than scan's, so diff budgets its
+    own per-JVM memory without touching the shared machine.PER_JVM_MB (which would shrink scan's
+    pool too). Disk: N concurrent computes each write ~2x the binary (two .BinExport + a .BinDiff)
+    into a temp dir; if free disk cannot hold ``workers`` of the largest such set, reduce (the
+    interleaved persist keeps only ~workers sets on disk at once). Both clamps only lower it,
+    never below 1."""
+    workers, note = clamp_parallelism_to_memory(max(1, configured), per_jvm_mb=_DIFF_PER_JVM_MB)
     if note:
         logger.warning("diff: %s", note)
     try:
@@ -974,7 +983,7 @@ def run_full_diff(
     force: bool = False,
     force_retry: bool = False,
     retry_limit: int = _DIFF_RETRY_LIMIT,
-    confirm: Callable[[int], bool] = lambda _n: True,
+    on_start: Callable[[int], None] = lambda _n: None,
     on_outcome: Callable[[int, int, BinaryDiffOutcome], None] = lambda _i, _n, _o: None,
 ) -> FullDiffSummary:
     """Diff every CHANGED binary that NEEDS diffing: parallel compute, serial write.
@@ -992,8 +1001,11 @@ def run_full_diff(
 
     The run-pair-global preconditions (version skew, toolchain) are checked ONCE up front so a
     global problem fails fast; a PER-binary failure is recorded as an atomic blind-spot row and the
-    sweep CONTINUES. ``confirm(n)`` gates a large sweep; ``on_outcome`` reports each binary as it
-    finishes (in completion order, not submission order)."""
+    sweep CONTINUES. The full sweep runs unconfirmed (it is the normal usage) — ``on_start(n)`` is
+    notified with the count before work begins; ``on_outcome`` reports each binary as it finishes
+    (in completion order). Ctrl-C stops SCHEDULING further binaries and returns ``cancelled=True``
+    with the completed ones intact; see the interrupt handler for the honest 'in-flight JVM'
+    bound."""
     plan = plan_full_diff(atlas, run_a_id, run_b_id, retry_limit=retry_limit)
     to_run = plan.binaries_to_run(force_retry=force_retry)
     if not to_run:
@@ -1009,13 +1021,14 @@ def run_full_diff(
             "same toolchain, or pass --force to diff anyway (the result stays honestly degraded)."
         )
     _check_toolchain(config)
-    if not confirm(len(to_run)):
-        return FullDiffSummary(plan, (), cancelled=True, retry_limit=retry_limit)
+    # notify the caller of the sweep size (no confirmation gate — a full diff is normal use)
+    on_start(len(to_run))
 
     was_failed_before = set(plan.retry) | set(plan.hard_failed)
     total = len(to_run)
     outcomes: list[BinaryDiffOutcome] = []
     done = 0
+    cancelled = False
 
     # ── Phase 1 (serial, main thread): resolve each binary. preflight reads the atlas + the db,
     #    so it MUST stay on the main thread; a binary whose preflight fails (e.g. its .so cannot be
@@ -1059,6 +1072,7 @@ def run_full_diff(
         tds = {rd.diff_id: Path(tempfile.mkdtemp(prefix="tm_diff_")) for rd in resolved}
         by_id = {rd.diff_id: rd for rd in resolved}
         pool = ThreadPoolExecutor(max_workers=workers)
+        fut_to_id: dict[Any, str] = {}  # pre-bound so an interrupt mid-submit finds it defined
         try:
             fut_to_id = {
                 pool.submit(compute_diff, rd.so_a, rd.so_b, tds[rd.diff_id], config): rd.diff_id
@@ -1087,9 +1101,23 @@ def run_full_diff(
                 outcomes.append(oc)
                 done += 1
                 on_outcome(done, total, oc)
+        except KeyboardInterrupt:
+            # Ctrl-C: stop SCHEDULING more binaries. Discard the current in-flight (uncommitted)
+            # persist — every COMPLETED binary already committed its own transaction, so a rollback
+            # drops at most the one mid-write. The finally then cancels the QUEUED computes; the
+            # already-running BinExport subprocesses (<= workers) cannot be killed from a pool
+            # thread, so they finish (bounded by the per-file timeout) before the process exits — a
+            # clean cancel of the SCHEDULE, not an instant kill.
+            cancelled = True
+            atlas.rollback()
+            logger.warning(
+                "diff: interrupted after %d/%d binaries; the rest run next time", done, total
+            )
         finally:
-            pool.shutdown(wait=True)
+            # cancel_futures=True drops the QUEUED computes (the real 'stop the sweep'); wait=True
+            # lets the in-flight ones finish so rmtree never races a compute still writing its dir.
+            pool.shutdown(wait=True, cancel_futures=True)
             for td in tds.values():
                 shutil.rmtree(td, ignore_errors=True)
 
-    return FullDiffSummary(plan, tuple(outcomes), cancelled=False, retry_limit=retry_limit)
+    return FullDiffSummary(plan, tuple(outcomes), cancelled=cancelled, retry_limit=retry_limit)

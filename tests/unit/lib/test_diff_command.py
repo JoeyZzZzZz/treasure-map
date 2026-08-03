@@ -507,21 +507,38 @@ def test_run_full_diff_continues_past_a_single_failure(
     assert sum(1 for o in fsum.outcomes if o.error is None) == 2  # the others still succeeded
 
 
-def test_run_full_diff_confirm_gate_cancels_without_running(
+def test_run_full_diff_runs_unconfirmed_and_notifies_start(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    atlas_path = _seed_multi(tmp_path, {"liba": "1"}, {"liba": "2"})
+    # ★ the full sweep runs without a confirmation gate (it is the normal usage); on_start is
+    # notified with the count before work begins so the CLI can announce it.
+    atlas_path = _seed_multi(tmp_path, {"liba": "1", "libb": "2"}, {"liba": "1x", "libb": "2x"})
     monkeypatch.setattr(driver, "_check_toolchain", lambda config: None)
-    ran: list[str] = []
+    monkeypatch.setattr(driver, "preflight", _fake_preflight(tmp_path))
+    monkeypatch.setattr(
+        driver, "compute_diff", lambda so_a, so_b, td, config: driver.DiffArtifacts(so_a, so_b, td)
+    )
     monkeypatch.setattr(
         driver,
-        "run_version_diff",
-        lambda *a, **k: ran.append("x"),  # type: ignore[arg-type]
+        "_persist_success",
+        lambda atlas, **kw: driver.DiffSummary(
+            diff_id=kw["diff_id"],
+            binary=kw["binary_name"],
+            matched_pairs=1,
+            version_skew=kw["version_skew"],
+            delta_layer_changed=0,
+            delta_layer_unchanged=0,
+            delta_undetermined=0,
+            warnings=kw["warnings"],
+        ),
     )
+    started: list[int] = []
     con = open_atlas(atlas_path)
-    fsum = driver.run_full_diff(con, "run_a", "run_b", config=_cfg(), confirm=lambda n: False)
+    fsum = driver.run_full_diff(con, "run_a", "run_b", config=_cfg(), on_start=started.append)
     con.close()
-    assert fsum.cancelled and fsum.outcomes == () and ran == []  # declined -> nothing ran
+    assert started == [2]  # notified once with the sweep size, no confirmation asked
+    assert not fsum.cancelled
+    assert {o.binary for o in fsum.outcomes} == {"liba", "libb"}  # all ran, unconfirmed
 
 
 def test_run_full_diff_no_changed_binaries_is_a_clean_noop(tmp_path: Path) -> None:
