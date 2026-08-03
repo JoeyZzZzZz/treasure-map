@@ -603,3 +603,37 @@ CREATE VIEW IF NOT EXISTS dimension_delta_full AS
          dimension
     FROM dimension_capability_state
    WHERE delta_supported = 0 OR state_a <> 'present' OR state_b <> 'present';
+
+-- ── overlay: a mutable annotation layer over the read-only candidate map ──────
+-- Holds an AGENT's OWN annotations on scan/hunt candidates — never a tool-emitted
+-- fact, and NEVER written back onto instance/pattern (which stay untouched). A
+-- consumer reads the base map, decides something about a candidate, and records
+-- that decision here, keyed by the candidate's evidence_ref. Two views share one
+-- base map: with the overlay off (the default) the base map reads byte-for-byte
+-- as if this table were empty; with it on, these annotations are shown ALONGSIDE
+-- the base facts, always distinguishable from them.
+--
+-- The row is MUTABLE (one annotation per anchor, last write wins) — this is why
+-- it lives outside the append-only instance/pattern store. basis_state snapshots
+-- the facts the annotation rested on at write time (the function's pseudocode
+-- hash + the per-sibling dimension set); a later read re-derives that basis and
+-- reports what moved, so an annotation made against now-stale facts is flagged
+-- for re-review. The layer reports those facts ONLY — whether a changed basis
+-- undoes the annotation is the consumer's judgement, never asserted here.
+CREATE TABLE IF NOT EXISTS overlay (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    anchor_kind   TEXT NOT NULL DEFAULT 'evidence_ref'
+        CHECK (anchor_kind IN ('evidence_ref','diff_subject')),  -- diff_subject reserved (unused)
+    anchor_ref    TEXT NOT NULL,            -- evidence_ref (run_id#sha8:addr@suffix) for the MVP kind
+    verdict       TEXT NOT NULL
+        CHECK (verdict IN ('to-review','in-progress','suspicious','excluded','safe')),
+    rationale     TEXT NOT NULL,            -- why + next step + confidence; blank is rejected at write
+    attributed_to TEXT
+        CHECK (attributed_to IS NULL OR attributed_to IN ('agent','agent-via-mcp')),  -- coarse; never faked
+    basis_state   TEXT,                     -- JSON snapshot: pseudocode_hash + per-sibling dimension set
+    created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    -- one annotation per anchor: a re-annotation UPDATES in place (last write wins)
+    UNIQUE (anchor_kind, anchor_ref)
+);
+CREATE INDEX IF NOT EXISTS idx_overlay_verdict ON overlay(verdict);

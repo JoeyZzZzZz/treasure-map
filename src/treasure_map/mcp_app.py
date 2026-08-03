@@ -39,7 +39,11 @@ from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import PublicCvePatternRow, RunRow
 from treasure_map.lib.atlas.writer import add_private_exploit as _add_private_exploit
 from treasure_map.lib.atlas.writer import add_public_cve_patterns as _add_public_cve_patterns
+from treasure_map.lib.errors import ConfigError
 from treasure_map.lib.notice import LEGAL_NOTICE
+from treasure_map.lib.overlay import clear_overlay as _clear_overlay
+from treasure_map.lib.overlay import list_overlays as _list_overlays
+from treasure_map.lib.overlay import upsert_overlay as _upsert_overlay
 from treasure_map.lib.query import DEFAULT_LENS_LABEL as _LENS_LABEL
 from treasure_map.lib.query import PHASE1_CAVEATS as _LENS_CAVEATS
 from treasure_map.lib.query import VIEWS as _VIEWS
@@ -1213,8 +1217,8 @@ def make_tools(
         }
 
     def mark_exploited(evidence_ref: str, pattern: str, exploit_note: str) -> dict[str, Any]:
-        """Record ONE hole you PROVED reachable into the private exploited-hole ledger — the ONE
-        write tool here (every other tool is read-only).
+        """Record ONE hole you PROVED reachable into the private exploited-hole ledger — the
+        proof-bar write tool (the fact tools are read-only; annotate writes the overlay).
 
         The admission bar is EXPLOITED: ``exploit_note`` must carry the proof (how it triggers, the
         effect obtained, the guard bypassed). The tool rejects a blank/whitespace proof or pattern,
@@ -1330,6 +1334,94 @@ def make_tools(
             atlas.close()
         return {**counts, "note": _DERIVED_SIGNAL_NOTE}
 
+    def annotate(evidence_ref: str, verdict: str, rationale: str) -> dict[str, Any]:
+        """Record YOUR OWN judgement about one candidate onto the overlay — the annotation layer
+        over the read-only map. This is YOUR decision, not a tool fact; the base map
+        (list_candidates) is unchanged whether the overlay is empty or full, and reads identically
+        with the overlay off.
+
+        ``verdict`` is one of: ``to-review`` / ``in-progress`` (neutral; a note or a half-done
+        review — put the next step in the rationale so you can resume), ``suspicious`` (dig deeper),
+        ``excluded`` (noise / not relevant), ``safe`` (you judged it safe — a HIGH bar you own: a
+        wrongly-'safe' candidate is a missed hole). ``rationale`` is required (why + next step +
+        confidence). One annotation per candidate: re-annotating OVERWRITES (last write wins; the
+        echo names whom you overwrote). The write snapshots the candidate's basis (its pseudocode +
+        dimensions) so list_overlays can flag it for re-review if the base map moved. A blind write
+        is honest: an unresolved ``evidence_ref`` is still recorded, with a warning."""
+        if not (evidence_ref and evidence_ref.strip()):
+            return {"written": False, "error": "evidence_ref must be non-blank."}
+        if not (rationale and rationale.strip()):
+            return {
+                "written": False,
+                "error": "rationale must be non-blank — record why + the next step + confidence.",
+            }
+        atlas = open_atlas(atlas_path)
+        try:
+            ref = _resolve_ref(atlas, evidence_ref)
+            try:
+                res = _upsert_overlay(
+                    atlas,
+                    evidence_ref=evidence_ref,
+                    verdict=verdict,
+                    rationale=rationale,
+                    attributed_to="agent-via-mcp",
+                )
+            except ConfigError as exc:
+                return {"written": False, "error": str(exc)}
+        finally:
+            atlas.close()
+        result: dict[str, Any] = {
+            "written": True,
+            "action": res.action,  # 'inserted' | 'updated'
+            "id": res.id,
+            "evidence_ref": evidence_ref.strip(),
+            "verdict": verdict,
+            "atlas": str(atlas_path),
+            "note": "recorded on the overlay (an AGENT annotation, never a tool fact). The base "
+            "is unchanged. list_overlays resumes these + flags any whose basis has since moved.",
+        }
+        if res.action == "updated":
+            result["overwrote"] = {
+                "attributed_to": res.prior_attributed_to,
+                "updated_at": res.prior_updated_at,
+            }
+        if ref is None or not res.basis_resolved:
+            result["warning"] = (
+                f"evidence_ref '{evidence_ref}' does not resolve to a candidate in this atlas — "
+                "BLIND WRITE (annotating before the scan exists?). Recorded anyway; basis cannot "
+                "be snapshotted, so staleness cannot be checked until the ref resolves."
+            )
+        return result
+
+    def list_overlays(verdict: str | None = None) -> dict[str, Any]:
+        """Your overlay annotations, optionally filtered to one ``verdict`` — the resume view: "what
+        did I mark ``in-progress`` / ``suspicious`` / ``excluded``". Each row carries its live
+        ``basis_state``: ``unchanged`` (the pseudocode + dimensions it rested on have not moved),
+        ``changed`` (they have — RE-REVIEW; the delta names what moved), ``unverifiable`` (no
+        pseudocode hash to compare — an honest can't-say, never a clean bill), or
+        ``anchor_unresolved`` (the ref no longer resolves). Stale rows are surfaced, never dropped.
+
+        ★ These are AGENT decisions on the overlay, not tool facts. ``bias`` is the opt-in
+        overlay-on view's float(+1)/sink(-1); the base map's own ordering is untouched."""
+        atlas = open_atlas(atlas_path)
+        try:
+            return _list_overlays(atlas, verdict=verdict)
+        finally:
+            atlas.close()
+
+    def clear_overlay() -> dict[str, Any]:
+        """Delete EVERY overlay annotation (the base map is untouched — it reads byte-identical
+        afterward). The overlay is scratch space you own; this wipes it. Returns rows removed."""
+        atlas = open_atlas(atlas_path)
+        try:
+            removed = _clear_overlay(atlas)
+        finally:
+            atlas.close()
+        return {
+            "cleared": removed,
+            "note": "overlay annotations removed; the read-only base map is unchanged.",
+        }
+
     def legal_notice() -> dict[str, Any]:
         """The tool's intended-use / legal notice."""
         return {"notice": LEGAL_NOTICE}
@@ -1360,6 +1452,9 @@ def make_tools(
         "get_script_callsites": get_script_callsites,
         "get_components_cves": get_components_cves,
         "get_disassembly": get_disassembly,
+        "annotate": annotate,
+        "list_overlays": list_overlays,
+        "clear_overlay": clear_overlay,
         "mark_exploited": mark_exploited,
         "list_moat": list_moat,
         "list_cve_patterns": list_cve_patterns,

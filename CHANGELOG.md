@@ -77,6 +77,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **An overlay annotation layer — an agent can record its own judgements over the read-only
+  candidate map without ever touching it.** Three new MCP tools (`annotate`, `list_overlays`,
+  `clear_overlay`) write to a separate, mutable `overlay` table; the base map (`list_candidates` and
+  the instance/pattern tables behind it) reads byte-identical whether the overlay is empty or full,
+  so the annotations are always distinguishable from tool facts and clearing them restores nothing.
+  Each annotation carries a verdict (`to-review` / `in-progress` / `suspicious` / `excluded` /
+  `safe`) plus a required rationale, coarse attribution (never a fabricated identity — a schema CHECK
+  enforces it), and last-write-wins semantics (re-annotating overwrites in place and echoes whom it
+  overwrote). The load-bearing honesty piece is **basis staleness**: each write snapshots the facts
+  the annotation rested on — the function's pseudocode hash plus the per-sibling dimension SET (an
+  `evidence_ref` maps to several instances, keyed by the content-stable pattern_id, so a change to
+  *any* sibling is caught and a same-content re-scan produces zero delta). A later `list_overlays`
+  re-derives that basis and reports what moved (`unchanged` / `changed` / `unverifiable` when there
+  is no pseudocode hash to compare / `anchor_unresolved` when the candidate is gone), flagging a
+  stale annotation for re-review rather than silently trusting it — the tool reports those facts
+  only; whether a changed basis undoes the annotation is the consumer's call. Anchors scan/hunt
+  candidates (`evidence_ref`) for now; a version-diff anchor kind is reserved in the schema.
+
 - **`tmap init` sizes the JVM pool to the machine, and `diff` full runs now run in parallel.**
   `max_parallel_jvms` was a hardcoded 4 and diff's BinExport heap a hardcoded `-Xmx4096m`, neither
   looking at the machine; a full diff ran every changed binary serially. Now `tmap init` probes the

@@ -57,6 +57,9 @@ _EXPECTED_TOOLS = {
     "get_script_callsites",
     "get_components_cves",
     "get_disassembly",
+    "annotate",
+    "list_overlays",
+    "clear_overlay",
     "mark_exploited",
     "list_moat",
     "list_cve_patterns",
@@ -1008,6 +1011,53 @@ def test_mcp_get_strings_no_warning_when_function_absent(tmp_path: Path) -> None
     r = tools["get_strings"](binary="webd", run_id="run_m")
     assert "func_scope_applied" not in r
     assert "warning" not in r
+
+
+# ── the overlay annotation layer on the MCP face (annotate / list_overlays / clear_overlay) ──
+
+
+def test_annotate_writes_lists_and_clears_without_touching_base(tmp_path: Path) -> None:
+    tools = _tools(tmp_path)
+    base_before = tools["list_candidates"]()  # the read-only base map, overlay empty
+    r = tools["annotate"](
+        evidence_ref="run_m#fn1@cmd", verdict="suspicious", rationale="arg0 looks attacker-fed"
+    )
+    assert r["written"] is True and r["action"] == "inserted"
+    # ★ the base map reads identically whether the overlay is empty or full
+    assert tools["list_candidates"]() == base_before
+    lst = tools["list_overlays"]()
+    assert lst["count"] == 1
+    assert lst["overlays"][0]["verdict"] == "suspicious"
+    assert lst["overlays"][0]["basis_state"] == "unchanged"  # nothing has moved yet
+    # verdict filter
+    assert tools["list_overlays"](verdict="excluded")["count"] == 0
+    # clear leaves the base map untouched
+    assert tools["clear_overlay"]()["cleared"] == 1
+    assert tools["list_overlays"]()["count"] == 0
+    assert tools["list_candidates"]() == base_before
+
+
+def test_annotate_rejects_blank_rationale_and_bad_verdict(tmp_path: Path) -> None:
+    tools = _tools(tmp_path)
+    assert tools["annotate"]("run_m#fn1@cmd", "suspicious", "   ")["written"] is False
+    assert tools["annotate"]("", "suspicious", "x")["written"] is False
+    r = tools["annotate"]("run_m#fn1@cmd", "not-a-verdict", "x")
+    assert r["written"] is False and "verdict must be one of" in r["error"]
+
+
+def test_annotate_blind_write_warns_but_records(tmp_path: Path) -> None:
+    tools = _tools(tmp_path)
+    r = tools["annotate"]("run_m#nope@x", "to-review", "annotating before the scan")
+    assert r["written"] is True and "warning" in r  # blind write is honest, not silent
+    assert tools["list_overlays"]()["count"] == 1
+
+
+def test_annotate_overwrites_in_place_with_echo(tmp_path: Path) -> None:
+    tools = _tools(tmp_path)
+    tools["annotate"]("run_m#fn1@cmd", "suspicious", "first pass")
+    r = tools["annotate"]("run_m#fn1@cmd", "excluded", "on reflection, benign")
+    assert r["action"] == "updated" and r["overwrote"]["attributed_to"] == "agent-via-mcp"
+    assert tools["list_overlays"]()["count"] == 1  # one row, last write wins
 
 
 # ── the two exploit-barrier buckets on the MCP face (mark_exploited + the read tools) ──
