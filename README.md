@@ -1,16 +1,27 @@
 # Treasure Map
 
-Treasure Map is a static analysis tool for IoT firmware research.
+Treasure Map turns extracted IoT firmware into an honest, re-derivable fact substrate your AI
+reasons over — the model does the vulnerability reasoning; the tool guarantees the model's inputs
+are complete, deterministic, and not something it produced on its own.
 
-Given an extracted firmware filesystem, it decompiles every binary,
-traces data flow from external input sources to sensitive sinks, and
-produces structured analyses optimized for AI-assisted reasoning.
+Point it at an extracted firmware filesystem. It decompiles every binary, traces data flow from
+external-input sources to dangerous sinks, and hands your AI co-pilot (Claude Code, Cursor,
+ChatGPT) a ranked, evidence-anchored candidate list — every lead traceable to a binary, function,
+and address.
 
-Designed for security researchers who reverse IoT firmware and want
-their AI co-pilot (Claude Code, Cursor, ChatGPT) to do the heavy
-lifting on vulnerability understanding.
+**What makes it a substrate, not another scanner:**
 
-CLI: `tmap`. AGPL-3.0.
+- **Tri-state honesty.** Every fact is YES, NO, or an explicit UNKNOWN — it never dresses "can't
+  tell" as a confident answer. Recall before precision: a dangerous sink is listed even when no
+  in-function source is found (the controlled value may arrive through a caller), and known
+  low-yield forms sink to the bottom but are never dropped.
+- **Leads, not verdicts.** It supplies facts, chains, reachability evidence, and trigger conditions
+  — never a payload, PoC, or "this is exploitable." You, or your AI, judge and verify.
+- **Judgments that accumulate.** Your AI's own verdicts settle in an annotation layer over the
+  read-only facts, so a multi-session audit converges instead of starting fresh each time — and a
+  judgment is flagged for re-review the moment the facts under it move.
+
+CLI: `tmap`. AI-facing MCP server bundled. AGPL-3.0.
 
 ## What you'll need
 
@@ -127,8 +138,10 @@ tmap scan ./_firmware.extracted -w router_v1
 
 `tmap scan` runs the whole pipeline — **analyze → hunt → triage** — and ends by printing a
 **ranked, ready-to-act candidate list**: the functions worth reverse-engineering first, each with
-an `evidence_ref` (`{run_id}#fn{func_id}@{sink}`) anchor and — printed under the row as `in: …` —
-the **full path of the binary to open** in your decompiler, so a candidate in a firmware of
+an `evidence_ref` anchor (`{run_id}#{sha8}:{addr}@{sink}` — content-derived from the binary's
+sha256 prefix and the function's entry address, so it stays stable across re-scans) and — printed
+under the row as `in: …` — the **full path of the binary to open** in your decompiler, so a
+candidate in a firmware of
 hundreds of binaries is directly actionable. It is slow in the **analyze** stage (one Ghidra JVM per
 binary) and shows **per-stage progress** so you can see it working; the last stage is the same
 readable triage table as `tmap triage`.
@@ -222,8 +235,9 @@ analysis from your latest scan — no flags. To serve a specific run instead, pa
 running — started by hand it just waits on stdin. Register it once with your client (next section)
 and the client spawns it on demand.
 
-It offers read-only tools over the same fact layer the CLI's `tmap fact …` commands use (so a fact
-fetched either way is identical):
+It offers tools over the same fact layer the CLI's `tmap fact …` commands use — read-only fact
+lookups (a fact fetched either way is identical), plus a small write surface for the AI's own
+annotations (below) that live in a separate layer and never mutate the facts:
 
 - **`list_candidates`** — the ranked leads for the firmware the server is bound to (it isolates to
   the current run, so a shared atlas doesn't mix in another image); filter by `sink` / `sink_class`
@@ -234,9 +248,17 @@ fetched either way is identical):
   chase a lead across the whole firmware.
 - **`cross_firmware_patterns` / `pattern_density`** (plus `pattern_twins` / `dormant_candidates`) —
   cross-firmware recurrence signals to judge which lead is worth your time first.
+- **`annotate` / `list_overlays` / `clear_overlay`** — the annotation layer. Your AI records its own
+  verdict on a candidate — `to-review` / `in-progress` / `suspicious` / `excluded` / `safe`, with a
+  free-text rationale — and lists them back as a resumable watchlist filtered by verdict. Each entry
+  carries a freshness check: if the facts it rested on have since moved (the function's pseudocode
+  or a reachability/flow dimension changed), it is flagged for re-review rather than silently
+  trusted; if its anchor no longer resolves, that is surfaced too. This is what lets a multi-session
+  audit converge instead of restarting from zero — the judgments sit in a layer over the read-only
+  fact map, and clearing them restores the map untouched.
 - **`legal_notice`** — the intended-use notice.
 
-Two contracts hold on every tool: **every result carries an evidence anchor** (binary + function +
+Two contracts hold on every fact tool: **every result carries an evidence anchor** (binary + function +
 address, or script + line) — a lookup that resolves nothing returns a "not found" record, never a
 guess — and the output is **facts, chains, reachability evidence, and trigger conditions only;
 never a payload, trigger bytes, or PoC**. The ordering signals (`score`, `entry_reach`,
