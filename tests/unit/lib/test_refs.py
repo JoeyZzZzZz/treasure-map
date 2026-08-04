@@ -27,7 +27,8 @@ Reverse mutation (break-the-code proof — run once, expect RED, then restore):
     Expected: **2 failed**, both genuine assertion reds (not *error* / not a syntax blow-up) —
     ``test_rescan_id_drift_yields_identical_ref`` (the two refs now differ by their ``-266156`` /
     ``-354333`` tails) and ``test_id_fallback_reachable_only_without_address_or_name`` (the same
-    injected id displaces the degenerate ``id<func_id>`` tail: ``-266156`` replaces ``id266156``).
+    injected id displaces the degenerate ``id<func_id>`` tail — ``-266156`` replaces the
+    ``id``-prefixed form).
     Restore the line to re-green.
 """
 
