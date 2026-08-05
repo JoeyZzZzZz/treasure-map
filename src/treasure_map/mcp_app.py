@@ -47,6 +47,7 @@ from treasure_map.lib.overlay import upsert_overlay as _upsert_overlay
 from treasure_map.lib.query import DEFAULT_LENS_LABEL as _LENS_LABEL
 from treasure_map.lib.query import PHASE1_CAVEATS as _LENS_CAVEATS
 from treasure_map.lib.query import VIEWS as _VIEWS
+from treasure_map.lib.query import apply_overlay_view as _apply_overlay_view
 from treasure_map.lib.query import apply_view as _apply_view
 from treasure_map.lib.query import canonical_view as _canonical_view
 from treasure_map.lib.query import density as _density
@@ -177,7 +178,39 @@ def _short_binary(binary_path: str | None) -> str | None:
     return binary_path.rsplit("/", 1)[-1] or binary_path
 
 
-def _candidate_row(c: Any, rank: int) -> dict[str, Any]:
+def _overlay_marker(o: dict[str, Any]) -> dict[str, Any]:
+    """One annotation as the row's OWN top-level entry — never merged into a tool-derived field.
+
+    The overlay is the agent's own layer; the dimensions are what tmap itself established. Keeping
+    the annotation in its own key is what makes the two structurally distinguishable on every row:
+    a candidate the base map read as provably constant and the agent floated as suspicious shows
+    BOTH readings side by side, so neither silently overwrites the other.
+
+    A basis that has MOVED (or cannot be verified) is flagged right here for re-review, naming what
+    moved — the annotation is never quietly re-served as if it still rested on the same facts.
+    """
+    marker = {
+        "verdict": o["verdict"],
+        "attributed_to": o["attributed_to"],  # coarse authorship; never fabricated as a human
+        "basis_state": o["basis_state"],
+    }
+    if o["basis_state"] != "unchanged":
+        delta = o.get("basis_delta") or {}
+        moved = sorted(
+            {d for m in delta.get("dimensions", {}).get("moves", []) for d in m["moved"]}
+        )
+        marker["re_review"] = (
+            f"was {o['verdict']} — the basis moved ({o['basis_state']}); re-review before trusting"
+        )
+        marker["basis_moved"] = {
+            "pseudocode": delta.get("pseudocode"),
+            "dimensions": moved,
+            "detail": "full delta via list_overlays",
+        }
+    return marker
+
+
+def _candidate_row(c: Any, rank: int, overlay: dict[str, Any] | None = None) -> dict[str, Any]:
     """One candidate as a COMPACT triage row (the compact-row carry contract C1-C3).
 
     Spine facts (always present) + every non-spine dimension whose state is ESTABLISHED
@@ -190,13 +223,17 @@ def _candidate_row(c: Any, rank: int) -> dict[str, Any]:
 
     ``run`` names the candidate's firmware run (source_run_id) explicitly — a shared atlas mixes
     firmware, so a row must carry its own run rather than lean on an ambient 'current run' (the
-    ambient marker was the run-binding hazard; there is no is_current_run flag any more)."""
+    ambient marker was the run-binding hazard; there is no is_current_run flag any more).
+
+    ``overlay`` (only with the overlay-on view) is the agent's own annotation for this candidate.
+    It lands in its own top-level ``overlay`` key — see ``_overlay_marker`` — never inside
+    ``dimensions``; with the overlay off the key is absent and the row is a pure base-map row."""
     carried = {
         d.name: _dim_label(d)
         for d in c.dimensions
         if d.name not in _SPINE_DIMENSIONS and d.state != "unknown"
     }
-    return {
+    row: dict[str, Any] = {
         # the anchor — pass to explain_candidate / get_sink_provenance / get_pseudocode(ref)
         "evidence_ref": c.evidence_ref,
         # position under the current lens (0-based, absolute; re-ranked on a lens switch)
@@ -214,6 +251,13 @@ def _candidate_row(c: Any, rank: int) -> dict[str, Any]:
         # NOT here is state=unknown — a coverage gap, NOT proven safe (see the envelope legend).
         "dimensions": carried,
     }
+    if overlay is not None:
+        # ★ The agent's judgement rides in its OWN key. NEVER inside ``dimensions`` — that carry
+        # loop is axis-agnostic, so a verdict placed there would be auto-adopted as if it were a
+        # tmap-established dimension — and never merged into ``controllability``. Two layers, two
+        # keys, so a row always answers "did the tool establish this, or did the agent decide it?".
+        row["overlay"] = _overlay_marker(overlay)
+    return row
 
 
 def _run_summary(candidates: list[Any]) -> list[dict[str, Any]]:
@@ -528,6 +572,7 @@ def make_tools(
         limit: int = 50,
         offset: int = 0,
         verbose: bool = True,
+        overlay: bool = False,
     ) -> dict[str, Any]:
         """A multi-dimensional map of recall candidates, ordered by a switchable lens.
 
@@ -571,7 +616,16 @@ def make_tools(
         ``verbose`` (default True) prints the full ``available_views`` enumeration. Pass
         ``verbose=False`` to drop ONLY that navigational boilerplate (it repeats each call) and save
         tokens — the honest ``caveats``, the ``legend``, and the one-line ``lens.switchable``
-        pointer ALWAYS stay, so the map is never read as complete and the lens stays switchable."""
+        pointer ALWAYS stay, so the map is never read as complete and the lens stays switchable.
+
+        ``overlay`` (default False) turns on YOUR OWN annotation layer as the OUTERMOST ordering
+        band: what you marked ``suspicious`` floats, ``excluded``/``safe`` sinks, and a dismissal
+        whose basis has since moved floats back for re-review. Each annotated row then carries an
+        ``overlay`` key (verdict + attribution + basis freshness) alongside — never merged into —
+        the tool-derived fields, so your judgement and tmap's facts stay distinguishable. It
+        RE-RANKS, never reduces: a sunk candidate stays in the corpus and is still filterable. Being
+        outermost, a candidate you marked suspicious outranks an unannotated ``filters`` match —
+        that is the point of the view; with ``overlay=False`` the base-map order is unchanged."""
         atlas = open_atlas(atlas_path)
         try:
             # run_id scopes the listing to one firmware; None spans every run in the atlas. There is
@@ -580,6 +634,9 @@ def make_tools(
             ranked = _triage(atlas, run_id=run_id)
             runs_in_atlas = [r.run_id for r in _list_runs(atlas)]
             incomplete, partially_incomplete, folded_xref = _incomplete_for_run(atlas, run_id)
+            # Read the annotations while the atlas is still open (each row's basis freshness is
+            # re-derived against the live base map). Overlay OFF -> nothing is read at all.
+            overlays = _list_overlays(atlas)["overlays"] if overlay else []
         finally:
             atlas.close()
         ranked = _filter_candidates(ranked, sink=sink, status=status, include_gated=include_gated)
@@ -605,6 +662,13 @@ def make_tools(
             only_filters=only_filters,
             impact_overrides=overrides or None,
         )
+        # ★ The overlay band is the OUTERMOST ordering pass, deliberately applied AFTER _apply_view:
+        # that call re-sorts the whole list from scratch, so any re-rank done before it would be
+        # silently discarded. Stable, so each band keeps the lens order inside it. With the overlay
+        # off, by_ref is empty, this is skipped, and the order is the base map's, unchanged.
+        by_ref = {o["anchor_ref"]: o for o in overlays}
+        if overlay:
+            ranked = _apply_overlay_view(ranked, by_ref)
         total = len(ranked)
         filter_match = _filter_match_count(ranked, dim_filters) if dim_filters else None
         lim = max(0, min(limit, _MAX_LIMIT))
@@ -686,7 +750,11 @@ def make_tools(
             # ★ compact rows (M1): spine facts + established dimensions, no per-dimension note. The
             # full per-candidate note is on demand via explain_candidate(evidence_ref) (M2);
             # ``rank`` is the absolute position under the active lens.
-            "candidates": [_candidate_row(c, off + i) for i, c in enumerate(page)],
+            # With the overlay on, each annotated row also carries its own ``overlay`` key (the
+            # agent's verdict + basis freshness), kept separate from every tool-derived field.
+            "candidates": [
+                _candidate_row(c, off + i, by_ref.get(c.evidence_ref)) for i, c in enumerate(page)
+            ],
         }
 
     def cross_firmware_patterns(limit: int = 50, offset: int = 0) -> dict[str, Any]:

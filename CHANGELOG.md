@@ -95,6 +95,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only; whether a changed basis undoes the annotation is the consumer's call. Anchors scan/hunt
   candidates (`evidence_ref`) for now; a version-diff anchor kind is reserved in the schema.
 
+- **`list_candidates(overlay=true)` — an opt-in view that ranks the map by your own annotations.**
+  Default off; with it on, the annotations become the OUTERMOST ordering band, applied after the
+  lens has fully sorted the list: `suspicious` floats, `excluded`/`safe` sink, and a dismissal whose
+  basis has since moved floats back up for re-review instead of staying quietly sunk (an
+  `unverifiable` basis counts as moved — a judgement resting on facts nobody can check is not a
+  reason to keep a candidate out of sight). It **re-ranks, never reduces**: a sunk candidate stays
+  in the corpus, still filterable and still queryable. Because the band reads only the annotation
+  and never a base-map fact, an agent's `suspicious` can float a candidate the base map itself sank
+  as provably constant — and the row then shows BOTH readings, the agent's verdict in its own
+  top-level `overlay` key (verdict + attribution + basis freshness, naming what moved when stale)
+  alongside the untouched tool-derived fields, so a float can never be misread as tmap having found
+  the candidate dangerous. The band is stable, so the lens order survives inside it. The base sort
+  engine is unchanged and knows nothing about any of this: with `overlay=false` the listing is the
+  base map's, order and rows alike, and the annotation key is simply absent.
+
 - **`tmap init` sizes the JVM pool to the machine, and `diff` full runs now run in parallel.**
   `max_parallel_jvms` was a hardcoded 4 and diff's BinExport heap a hardcoded `-Xmx4096m`, neither
   looking at the machine; a full diff ran every changed binary serially. Now `tmap init` probes the

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from treasure_map.lib.query.exploit_ledger import list_cve_patterns, list_moat
 from treasure_map.lib.query.nvram import get_nvram_key_flow
+from treasure_map.lib.query.overlay_view import apply_overlay_view, overlay_band
 from treasure_map.lib.query.runs import (
     get_run,
     list_runs,
@@ -72,6 +73,7 @@ __all__ = [
     "LedgerRow",
     "TriageCandidate",
     "TwinRow",
+    "apply_overlay_view",
     "apply_view",
     "canonical_view",
     "density",
@@ -91,6 +93,7 @@ __all__ = [
     "list_moat",
     "list_runs",
     "only_refusal",
+    "overlay_band",
     "parse_impact_order",
     "reachability_match_count",
     "reducible",
