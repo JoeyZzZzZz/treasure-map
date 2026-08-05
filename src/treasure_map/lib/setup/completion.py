@@ -10,10 +10,15 @@ default" and "honest about it" do not conflict: the script goes to a user-level 
 and — when it will not — the ONE line the user must add themselves.
 
 Two hard rules (mirrors the rest of init):
-  * NEVER edit the user's shell rc file. Write to the shell's own autoload directory; if that is
-    not enough, PRINT the one line for the user to add — never add it for them.
+  * NEVER touch the user's shell rc file without their explicit consent. Installing writes only to
+    the shell's own autoload directory. When that is not enough to make completion load, init ASKS
+    (a Y/N, interactive runs only) and appends a marked, idempotent block ONLY on a yes; a decline
+    or a non-interactive run just PRINTS the one line for the user to add. What the rule protects
+    is an rc changed behind the user's back — an explicit yes IS the user's decision, so consent
+    satisfies it; silence never does.
   * NEVER silently claim success. If the script cannot be generated/written, or the shell will not
-    pick it up, that is surfaced (init echo + a doctor check), not swallowed.
+    pick it up, that is surfaced (init echo + a doctor check), not swallowed. An rc that cannot be
+    appended to reports the failure and falls back to printing the line — never a false "added".
 
 bash and zsh only — the vast majority of users. fish and others are added on demand, not pre-built.
 """
@@ -28,6 +33,13 @@ import click
 from click.shell_completion import get_completion_class
 
 SUPPORTED_SHELLS = ("bash", "zsh")
+
+# The fences around anything init appends to an rc. They exist so the block is RECOGNISABLE (the
+# idempotence check is "is the start marker already there?") and REMOVABLE (a user can delete from
+# one marker to the other and be exactly where they started). Never change them casually: an older
+# marker left in an rc would stop matching and the block would be appended a second time.
+_MARK_START = "# >>> tmap completion >>>"
+_MARK_END = "# <<< tmap completion <<<"
 
 # Click derives the runtime trigger var from the entry-point name (tmap -> _TMAP_COMPLETE); the
 # generated script and the running CLI must agree on it, so it is named once here.
@@ -121,23 +133,68 @@ def _zshrc_puts_dir_on_fpath(home: Path, comp_dir: Path) -> bool:
     return False
 
 
+def _bashrc_sources_completion(home: Path, path: Path) -> bool:
+    """Best-effort: does the user's bash startup already source our completion script?
+
+    The same conservative READ as the zsh check (never a shell spawn): true only when a source line
+    (``source X`` or ``. X``) names our exact script path. Sourcing the script directly is a
+    complete activation on its own — it registers the completion without the bash-completion
+    framework — so this is a second, independent way for bash to be genuinely active."""
+    needle = str(path)
+    for rc in (home / ".bashrc", home / ".bash_profile"):
+        try:
+            text = rc.read_text()
+        except OSError:
+            continue
+        for raw in text.splitlines():
+            line = raw.strip()
+            if needle in line and (line.startswith(("source ", ". ")) or " source " in line):
+                return True
+    return False
+
+
+def rc_path(shell: str, home: Path) -> Path | None:
+    """The startup file whose one line makes an installed completion script actually load.
+
+    This is the ONLY file init ever appends to, and only with the user's explicit yes."""
+    if shell == "bash":
+        return home / ".bashrc"
+    if shell == "zsh":
+        return home / ".zshrc"
+    return None
+
+
+def _activation_line(shell: str, path: Path) -> str | None:
+    """The bare shell line that activates the completion — no prose, no prefix.
+
+    ONE source of truth: the human-facing hint below wraps this line in an instruction, and
+    ``activate_completion`` appends exactly this line to the rc. Keeping them split matters — the
+    hint is a sentence ("add to ~/.zshrc: …"), and appending a sentence to a shell rc would be a
+    syntax error, not an activation.
+
+    The zsh line is self-sufficient: it re-runs ``compinit`` itself, so it works appended at the END
+    of an rc and need not be threaded in before a user's existing compinit."""
+    if shell == "bash":
+        return f"source {path}"
+    if shell == "zsh":
+        return f"fpath=({path.parent} $fpath) && autoload -Uz compinit && compinit"
+    return None
+
+
 def _activation(shell: str, home: Path, path: Path) -> tuple[bool, str | None]:
     """(will an interactive shell load ``path``?, the one line to add if not).
 
     Conservative by design: when it cannot be confirmed, returns not-active WITH the exact step,
     never a hopeful 'active'. A wrong 'you're set up' is worse than a redundant reminder."""
+    line = _activation_line(shell, path)
     if shell == "bash":
-        if _bash_completion_present():
+        if _bash_completion_present() or _bashrc_sources_completion(home, path):
             return True, None
-        return False, f"add to ~/.bashrc:  source {path}"
+        return False, f"add to ~/.bashrc:  {line}"
     if shell == "zsh":
-        comp_dir = path.parent
-        if _zshrc_puts_dir_on_fpath(home, comp_dir):
+        if _zshrc_puts_dir_on_fpath(home, path.parent):
             return True, None
-        return False, (
-            f"add to ~/.zshrc (before 'compinit'):  "
-            f"fpath=({comp_dir} $fpath) && autoload -Uz compinit && compinit"
-        )
+        return False, f"add to ~/.zshrc (before 'compinit'):  {line}"
     return False, None
 
 
@@ -160,6 +217,57 @@ def install_completion(shell: str, home: Path) -> CompletionInstall | None:
     return CompletionInstall(
         shell=shell, path=path, wrote=wrote, active=active, activation_hint=hint
     )
+
+
+@dataclass(frozen=True)
+class CompletionActivation:
+    """The outcome of appending the activation line to a shell rc (only ever after a user yes)."""
+
+    shell: str
+    rc: Path
+    added: bool  # True = the block was appended this run
+    already: bool  # True = the marked block was already present, so nothing was written
+    error: str | None  # a filesystem failure, reported verbatim; None means it really worked
+
+    @property
+    def ok(self) -> bool:
+        """Is the rc now carrying the activation line? False means the caller must NOT claim it."""
+        return self.error is None
+
+
+def activate_completion(shell: str, home: Path, path: Path) -> CompletionActivation | None:
+    """APPEND a marked activation block to the user's shell rc. Call ONLY on explicit consent.
+
+    Three properties this must hold, in order of how much damage getting them wrong would do:
+
+    * **Append, never rewrite.** The rc is the user's file, often long and hand-tuned; this opens
+      it in append mode and adds a fenced block at the end. It never reads-modifies-writes the
+      whole file, so there is no path on which an unrelated line is lost.
+    * **Idempotent.** If the start marker is already in the rc, nothing is written at all. Running
+      ``tmap init`` a dozen times leaves exactly one block.
+    * **Honest on failure.** An unreadable/unwritable rc returns the OSError text with
+      ``ok`` False; it never reports a success the filesystem did not give, and the caller falls
+      back to printing the line for the user to add by hand.
+
+    Returns None for a shell with no rc/activation line (nothing to do, not a failure)."""
+    rc = rc_path(shell, home)
+    line = _activation_line(shell, path)
+    if rc is None or line is None:
+        return None
+    try:
+        existing = rc.read_text() if rc.exists() else ""
+    except OSError as exc:
+        return CompletionActivation(shell, rc, added=False, already=False, error=str(exc))
+    if _MARK_START in existing:
+        return CompletionActivation(shell, rc, added=False, already=True, error=None)
+    # A leading newline so the block never fuses onto an rc whose last line lacks one.
+    block = f"\n{_MARK_START}\n{line}\n{_MARK_END}\n"
+    try:
+        with rc.open("a", encoding="utf-8") as fh:
+            fh.write(block)
+    except OSError as exc:
+        return CompletionActivation(shell, rc, added=False, already=False, error=str(exc))
+    return CompletionActivation(shell, rc, added=True, already=False, error=None)
 
 
 def completion_check(home: Path, shell: str | None = None) -> tuple[str, bool, str]:

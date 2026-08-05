@@ -340,10 +340,19 @@ def _configure_parallelism(
     )
 
 
-def _configure_completion(*, echo: Callable[[str], None]) -> None:
+def _configure_completion(
+    *,
+    non_interactive: bool,
+    prompt: Callable[[str], str],
+    echo: Callable[[str], None],
+) -> None:
     """Install shell tab-completion (a standard init step; bash + zsh). Best-effort + honest.
 
-    Writes the completion script to the shell's own autoload directory — never edits an rc file.
+    The script goes to the shell's own autoload directory. When that alone will not make the shell
+    load it, an INTERACTIVE init then asks (Y/N, Enter = yes) and appends a marked, idempotent block
+    to the rc only on a yes; a decline — and every non-interactive run — writes no rc and just
+    prints the one line to add. init never changes an rc the user did not agree to.
+
     Any failure is echoed, never swallowed, and the doctor's ``completion`` check reports the state
     (installed / active / the one line to add). No ``--no-completion`` flag: a completion script has
     no side effects, so a skip toggle would only push a non-decision onto the user.
@@ -365,7 +374,62 @@ def _configure_completion(*, echo: Callable[[str], None]) -> None:
     state = "installed" if outcome.wrote else "already up to date"
     echo(f"  Completion: {state} for {shell} at {outcome.path}")
     if not outcome.active and outcome.activation_hint:
-        echo(f"              to activate, {outcome.activation_hint}")
+        _offer_activation(
+            shell,
+            outcome.path,
+            outcome.activation_hint,
+            non_interactive=non_interactive,
+            prompt=prompt,
+            echo=echo,
+        )
+
+
+def _offer_activation(
+    shell: str,
+    script_path: Path,
+    hint: str,
+    *,
+    non_interactive: bool,
+    prompt: Callable[[str], str],
+    echo: Callable[[str], None],
+) -> None:
+    """Ask whether to add the activation line to the rc, and add it only on a yes.
+
+    Non-interactive runs never ask and never write — an unattended init changing a shell rc is
+    precisely the no-consent edit the rule forbids, and there is nobody there to agree. Ambiguous
+    input is treated as no: only Enter / y / yes writes, so an unrecognised answer errs toward
+    leaving the user's file alone.
+    """
+    from treasure_map.lib.setup.completion import activate_completion, rc_path
+
+    rc = rc_path(shell, Path.home())
+    if non_interactive or rc is None:
+        echo(f"              to activate, {hint}")
+        return
+    answer = (
+        prompt(
+            f"Add tmap's completion line to ~/{rc.name} now? "
+            "tab-completion won't work until you do [Y/n]"
+        )
+        .strip()
+        .lower()
+    )
+    if answer not in ("", "y", "yes"):
+        echo(f"              to activate, {hint}")
+        return
+    result = activate_completion(shell, Path.home(), script_path)
+    if result is None or not result.ok:
+        detail = f": {result.error}" if result is not None and result.error else ""
+        echo(f"              could not write ~/{rc.name}{detail}")
+        echo(f"              to activate, {hint}")
+        return
+    if result.already:
+        echo(f"              ~/{rc.name} already has the tmap block — nothing to add.")
+        return
+    echo(
+        f"              added to ~/{rc.name} — restart your shell or run "
+        f"`source ~/{rc.name}` to activate now."
+    )
 
 
 def _run_doctor(tm_home: Path, cfg: Config | None) -> tuple[tuple[str, bool, str], ...]:
@@ -448,7 +512,9 @@ def run_init(
             echo=echo,
         )
         _configure_parallelism(config_path, force=force, echo=echo)
-        _configure_completion(echo=echo)
+        # Before the doctor below: a yes here appends the activation line, so the preflight then
+        # reads an rc that is genuinely set up and reports ✅ rather than a stale ❌.
+        _configure_completion(non_interactive=non_interactive, prompt=prompt, echo=echo)
 
     # Source env file (non-override semantics) so doctor can see API keys.
     _source_env_file(env_path)

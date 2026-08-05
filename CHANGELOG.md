@@ -7,7 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`tmap init` can now activate shell completion for you — with your explicit yes.** Installing the
+  completion script into the shell's autoload directory is often not enough for the shell to load
+  it, and init's only recourse was to print the one line and leave it to you. An interactive init
+  now asks (`[Y/n]`, Enter = yes) and, on a yes, APPENDS a fenced block
+  (`# >>> tmap completion >>>` … `# <<< tmap completion <<<`) to `~/.zshrc` / `~/.bashrc`. It is
+  append-only (never a read-modify-write of your rc), idempotent (the marker is the check, so
+  re-running init leaves exactly one block), and removable (cut between the markers to be back where
+  you started). A **non-interactive init never asks and never writes** — an unattended run editing a
+  shell rc is the no-consent edit the rule exists to prevent, and there is nobody there to agree —
+  and an unrecognised answer is treated as no. An rc that cannot be written reports the failure and
+  falls back to printing the line; it never claims an edit the filesystem refused. Once the line is
+  in place the preflight's `completion` check reports ✅ instead of a stale ❌ (bash gained the same
+  rc-reading activation check zsh already had, so sourcing the script directly counts as active).
+  This deliberately relaxes the previous "never edit the user's rc" rule to "never edit it without
+  consent" — what that rule protects is an rc changed behind your back, which an explicit yes is not.
+
 ### Fixed
+
+- **Dropped a docker image default that pointed at a tag which does not exist.** The `docker` Ghidra
+  mode (not implemented yet) carried `image: "…-ghidra:11.2"` as its default — a stale tag naming a
+  version the project no longer uses. Left as-is it would have failed at pull time with a confusing
+  registry error instead of an honest "you have not configured an image", so the default is now
+  empty and will be filled in when the docker mode is actually built.
 
 - **`scan` no longer silently caches a code-rich binary as "empty".** `ghidra_status='ok_empty'`
   was trusted as permanent ground truth, but it is derived from `has_substantial_text`, which

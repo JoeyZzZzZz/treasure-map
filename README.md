@@ -1,413 +1,204 @@
 # Treasure Map
 
+[English](README.md) | [中文](README.zh.md)
+
 Treasure Map turns extracted IoT firmware into an honest, re-derivable fact substrate your AI
 reasons over — the model does the vulnerability reasoning; the tool guarantees the model's inputs
 are complete, deterministic, and not something it produced on its own.
 
-Point it at an extracted firmware filesystem. It decompiles every binary, traces data flow from
-external-input sources to dangerous sinks, and hands your AI co-pilot (Claude Code, Cursor,
-ChatGPT) a ranked, evidence-anchored candidate list — every lead traceable to a binary, function,
-and address.
+Point it at an extracted firmware filesystem. It decompiles every binary, locates dangerous sink
+callsites, records where each sink argument's value comes from within its function, and grades how
+reachable each one is — then hands your AI co-pilot (Claude Code, Cursor, Codex, and others) a
+ranked, evidence-anchored candidate list, every lead traceable to a binary, function, and address.
+Facts are the tool's job; reasoning is the model's. Treasure Map does its half completely so your
+AI can do its half best.
 
 **What makes it a substrate, not another scanner:**
 
 - **Tri-state honesty.** Every fact is YES, NO, or an explicit UNKNOWN — it never dresses "can't
-  tell" as a confident answer. Recall before precision: a dangerous sink is listed even when no
-  in-function source is found (the controlled value may arrive through a caller), and known
-  low-yield forms sink to the bottom but are never dropped.
-- **Leads, not verdicts.** It supplies facts, chains, reachability evidence, and trigger conditions
-  — never a payload, PoC, or "this is exploitable." You, or your AI, judge and verify.
+  tell" as a confident answer. A dangerous sink is listed even when no input source is found inside
+  the function (the controlled value may arrive through a caller), and known low-yield forms sink to
+  the bottom of the list but are never dropped.
+- **Leads, not verdicts.** It supplies facts, chains, and reachability evidence — never a payload,
+  PoC, or "this is exploitable." You, or your AI, judge and verify.
 - **Judgments that accumulate.** Your AI's own verdicts settle in an annotation layer over the
-  read-only facts, so a multi-session audit converges instead of starting fresh each time — and a
-  judgment is flagged for re-review the moment the facts under it move.
+  read-only facts, so a multi-session audit picks up where it left off instead of starting fresh —
+  and a judgment is flagged for re-review the moment the facts under it change.
 
-CLI: `tmap`. AI-facing MCP server bundled. AGPL-3.0.
+CLI: `tmap`, with a bundled AI-facing MCP server. **Runs on macOS and Linux** (on Windows, use WSL).
 
-## What you'll need
+---
 
-| Dependency | Version | Why |
+## Requirements
+
+| You provide | Version | Why |
 |---|---|---|
-| Ghidra | 11.x | decompiles every binary (headless) |
-| JDK | 21 | required by Ghidra 11.x (older JDKs make Ghidra fail to launch) |
-| API key(s) | — | only for the LLM fallback in `diff` (stripped/renamed residue); `tmap analyze`, `hunt`, and `diff --max-assist 0` run with no key |
+| **Ghidra** | 11.4.3 | decompiles every binary (headless) |
+| **JDK** | 21 | required by Ghidra 11.4.3 — JDK 11/17 make it fail to launch |
 
-You install Ghidra and JDK yourself; the Setup below installs Treasure Map and the right Python
-for you. (A zero-setup Docker image with everything bundled is planned; until then, follow Setup.)
+You install Ghidra and JDK yourself; the install below sets up Treasure Map and the right Python
+for you. **No API keys are required.** (A zero-setup Docker image bundling everything is planned.)
 
-Treasure Map's **input is an already-extracted firmware filesystem**. Unpacking the firmware image
-is outside its scope — use whatever extraction tool you prefer; Treasure Map takes the resulting
-directory.
+**Input = an already-extracted firmware filesystem.** Unpacking the firmware image is outside
+Treasure Map's scope — use whatever extraction tool you prefer, and point Treasure Map at the
+resulting directory.
 
-## Setup
+---
 
-Do these **in order**. Each step starts with a quick check — if you already have it, skip ahead.
+## Install
 
-### Step 1 — Install uv
-
-[uv](https://docs.astral.sh/uv/) is a single binary that installs Treasure Map and manages the
-correct Python for it (no system Python or apt/PPA needed).
+**1. Install [uv](https://docs.astral.sh/uv/)** (a single binary that also manages the right Python):
 
 ```bash
-# Linux / macOS:
-curl -LsSf https://astral.sh/uv/install.sh | sh
-source "$HOME/.local/bin/env"        # or just open a new shell so `uv` is on PATH
-# Windows (PowerShell):  irm https://astral.sh/uv/install.ps1 | iex
-# Already have it? `uv --version` → skip to Step 2.
+curl -LsSf https://astral.sh/uv/install.sh | sh   # macOS / Linux
 ```
 
-### Step 2 — JDK 21
+**2. Install JDK 21** — check with `java -version` (must report 21):
 
-Check: `java -version` — it must report **21**. If so, skip to Step 3. (Ghidra 11.x needs exactly
-21; JDK 11/17 make it fail at launch. With several JDKs installed, select 21 via
-`sudo update-alternatives --config java`.)
-
-Install:
 ```bash
-# Debian/Ubuntu 24.04+:
-sudo apt install -y openjdk-21-jdk
-# macOS:  brew install openjdk@21
-# Older Ubuntu / other distros: Eclipse Temurin (https://adoptium.net) or SDKMAN (sdk install java 21-tem)
+# Debian/Ubuntu:  sudo apt install -y openjdk-21-jdk
+# macOS:          brew install openjdk@21
+# Other:          Eclipse Temurin (https://adoptium.net)
 ```
 
-### Step 3 — Ghidra 11.x
+**3. Install Ghidra 11.4.3** — download and unzip it (no installer, no admin rights):
 
-Check: if Ghidra 11.x is **already installed**, find its **install root** — the directory that
-directly contains `support/analyzeHeadless` — and go straight to "Make it discoverable" below
-(don't reinstall).
-
-Install (no installer — just download + unzip):
 ```bash
-# Download the "ghidra_<ver>_PUBLIC_<date>.zip" asset (NOT "Source code") from:
-#   https://github.com/NationalSecurityAgency/ghidra/releases
-unzip ghidra_11.*_PUBLIC_*.zip -d ~/ghidra      # -> ~/ghidra/ghidra_11.x_PUBLIC/  (= the install root)
+curl -L -o ghidra.zip \
+  https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.4.3_build/ghidra_11.4.3_PUBLIC_20251203.zip
+unzip ghidra.zip -d ~/ghidra && rm ghidra.zip
+export GHIDRA_HOME=~/ghidra/ghidra_11.4.3_PUBLIC   # the folder that contains support/analyzeHeadless
 ```
-No admin rights needed.
 
-**Make it discoverable.** Point `GHIDRA_HOME` at the install root (the folder containing
-`support/`) so the next steps find Ghidra automatically:
-```bash
-export GHIDRA_HOME=~/ghidra/ghidra_11.x_PUBLIC      # use your actual install root
-```
-Run Steps 4–5 in **this same shell**. `tmap init` (Step 5) detects `GHIDRA_HOME` and **writes the
-path into `config.yaml`**, so it persists afterward — you don't need to keep `GHIDRA_HOME` set in
-future shells, and you don't paste any path by hand.
-
-### Step 4 — Install Treasure Map
-
-One command. uv fetches a managed CPython 3.11, builds Treasure Map in an isolated environment,
-and puts the `tmap` command on your PATH — nothing to activate.
+**4. Install Treasure Map:**
 
 ```bash
 uv tool install --python 3.11 "git+https://github.com/JoeyZzZzZz/treasure-map.git"
-tmap --help
 ```
 
-The AI-facing [MCP server](#ai-facing-access-mcp-server) is a core dependency, bundled on every
-install — `tmap mcp` connects out of the box, no extra flag. (Not using uv? `pip install
-"git+https://github.com/JoeyZzZzZz/treasure-map.git"` pulls the same core set.)
-
-(The `git+…` URL is fetched with **git**, so make sure git is installed — `sudo apt install -y
-git`. Later: `uv tool upgrade treasure-map` / `uv tool uninstall treasure-map`.)
-
-### Step 5 — Configure: `tmap init`
+**5. Configure once:**
 
 ```bash
 tmap init
 ```
-This writes `~/.treasure-map/config.yaml` plus your API keys and runs a doctor preflight. If you
-set `GHIDRA_HOME` in Step 3 (or Ghidra is on your `PATH`), init **detects it and saves the path to
-`config.yaml` automatically — no prompt**. Otherwise it asks once for the install root and
-remembers it. Fix anything it marks `❌` (see [Troubleshooting](#troubleshooting)), then re-run
-`tmap init`. When it shows no `❌`, you're ready.
 
-> **Prefer pipx?** If you already have a Python ≥ 3.11 and use pipx, you can substitute Step 1+4
-> with `pipx install --python python3.11 "git+https://github.com/JoeyZzZzZz/treasure-map.git"`
-> (install a 3.11 first if needed — e.g. deadsnakes PPA, or `pyenv install 3.11`). uv is
-> recommended because it brings its own Python and needs no PPA.
+`init` writes `~/.treasure-map/config.yaml`, detects Ghidra from `GHIDRA_HOME` (or asks once), and
+runs a preflight check. Fix anything it marks `❌`, then re-run. When there's no `❌`, you're ready.
 
-## Using it
+---
 
-**Point Treasure Map at your extracted firmware filesystem root** first. (How you unpacked the
-firmware is up to you — outside Treasure Map's scope.) Say you extracted to `./_firmware.extracted/`.
+## Use it
 
-### The main path — one command
+Point Treasure Map at your extracted firmware root and run one command:
 
 ```bash
-tmap scan ./_firmware.extracted -w router_v1
+tmap scan ./firmware.extracted -w router_v1
 ```
 
-`tmap scan` runs the whole pipeline — **analyze → hunt → triage** — and ends by printing a
-**ranked, ready-to-act candidate list**: the functions worth reverse-engineering first, each with
-an `evidence_ref` anchor (`{run_id}#{sha8}:{addr}@{sink}` — content-derived from the binary's
-sha256 prefix and the function's entry address, so it stays stable across re-scans) and — printed
-under the row as `in: …` — the **full path of the binary to open** in your decompiler, so a
-candidate in a firmware of
-hundreds of binaries is directly actionable. It is slow in the **analyze** stage (one Ghidra JVM per
-binary) and shows **per-stage progress** so you can see it working; the last stage is the same
-readable triage table as `tmap triage`.
+It decompiles every binary and builds the fact map — the slow part (one Ghidra pass per binary),
+with progress shown; resume-safe, so re-running with the same `-w` continues from the last
+checkpoint. Scan a new firmware whenever you like; each is kept under its own workspace.
 
-The ranking is a **review order** — `scan` scales up *finding candidates*; confirming a candidate
-into a real issue is the manual reverse-engineering work, and stays yours. Gated (filtered/dormant)
-candidates fold by default (`--include-gated` to show); `--top N`, `--status`, `--json` tune the
-output. `--run-id` defaults to the workspace name (keep it **one run-id per device + firmware
-version**).
+That's the only command you run by hand. Everything after — reading the ranked leads, chasing them
+across the firmware, recording judgments — is done by your AI agent through the MCP server ↓
 
-### Or run the steps individually
+---
 
-Use these when you need to **re-run a single stage** — analyze is slow, hunt/triage are fast, and
-the two stores decouple on purpose (`analysis.db` is wipe-and-rebuild; the atlas is append-only).
+## Connect your AI agent
 
-```bash
-tmap analyze ./_firmware.extracted -w router_v1                                  # -> analysis.db
-tmap hunt router_v1/analysis.db --run-id router_v1                               # -> atlas
-tmap triage router_v1                # ranked globally by score; lower # = look first (top reachable on top)
-tmap triage router_v1 --explain 1    # explain rank #1 (also accepts --explain <evidence_ref>)
-```
+Treasure Map ships an MCP (Model Context Protocol) server. Register it **once** — no paths, no
+per-firmware setup. The server binds your whole `atlas` (the knowledge base of everything you've
+scanned); the **agent picks which firmware to work on**, and a new `tmap scan` is available with no
+reconfiguration.
 
-`tmap triage` lists candidates in one global score-descending order — the `#` is a **stable rank**
-(1 = highest, look first) that names the same candidate regardless of `--top`/`--status`/`--sink`, so
-you can pass it straight to `--explain`. Each row prints, under it, `in: <binary path>` — the binary
-to open in your decompiler. That location is stored in the atlas, so candidates stay locatable **even
-after the per-firmware `analysis.db` is wiped/rebuilt**.
-
-The list **caps at 20 by default** (it tells you when more exist). To see past the cap: `--all` shows
-every candidate, and **`--sink <x>` shows every candidate for one sink, uncapped and across all
-statuses** — by callee (`--sink system`, `popen`, `execl`, `strcpy`, `syslog`) or class (`--sink
-cmd|copy|fmt_string|format`). Use `--sink system` when a recalled sink you care about is scored low
-and would otherwise sit below the default cap.
-
-**Recall before precision.** A dangerous sink callsite — command execution (`system`/`popen`/`exec*`),
-a buffer copy (`strcpy`/`memcpy`/…), or a format-string-injection sink (`syslog`/`printf`/`fprintf`/
-`err`/`warn`/…, flagged when the **format-string argument is non-literal** — a fixed format string is
-exempt; an uncontrolled format is RCE-class, ranked alongside command injection) —
-is listed as a candidate even when no input source is recognized inside the function — the
-controlled value may arrive through a caller, and a candidate that is never listed is the most
-hidden false negative. Known low-yield forms are then **ranked low, never dropped**: a bare sink
-with no in-function source, an exec sink that bypasses the shell, a value the function numerically
-validates, a constant passed in by the sole caller, and code recognized as a third-party library
-(by symbol) all sink to the bottom of their tier so the real source→sink shapes float up — but
-every one stays a listed candidate you can still pull up with `--sink`/`--all`. `--explain <#|evidence_ref>` opens a single candidate: an itemized
-breakdown of **why its score is what it is** (each point maps to a real signal), the call structure,
-the **honest bounds** (reachability is single-function/L1, no caller traced, no cross-function flow;
-`external_input` is a class label, not a trace), and a **manual-verify checklist** with anchors. It
-explains evidence so you (or an AI) can judge and verify — it does **not** declare the candidate a
-real issue and prints **no triggering input**.
-
-**`-w/--workspace` takes a name *or* a path:**
-- a **bare name** (`-w router_v1`) is managed for you under your workspace base —
-  `~/.treasure-map/workspaces/router_v1` (the base is set in `tmap init`);
-- a value with a **slash, `~`, `.`, or an absolute path** (`-w /mnt/scratch/fw1`, `-w ./work`)
-  is used **as a literal path** — use this to put a workspace on a large/scratch/external disk;
-- **omitted**, it defaults to an auto name under the base (derived from the firmware dir), shown
-  in the output.
-
-Analysis is **resume-safe**: re-run with the **same** `-w` to continue from the last checkpoint.
-Useful flags: `--skip-non-binary`, `--skip-ingester <KIND>`, `-c <config.yaml>`.
-
-**Go further (optional)**, once you have one or more `analysis.db`:
-```bash
-tmap diff <old.db> <new.db> ...        # diff two builds, grade reachability
-tmap atlas-view ...                     # neutral cross-firmware aggregation
-```
-
-### AI-facing access (MCP server)
-
-Treasure Map exposes its analysis facts to an AI client through a [Model Context
-Protocol](https://modelcontextprotocol.io) server, so an assistant can chase a lead across an
-entire firmware — pull a candidate, read its pseudocode, follow callees/xrefs to the next hop,
-check the strings, the cross-artifact script call sites, and the SBOM/CVE matches — and form its
-own judgement on a reproducible, cross-artifact substrate. It is **not** an arbitrary disassembly
-proxy: the value is the full, deterministically re-derivable structure plus the derived,
-evidence-backed review-ordering signals.
-
-The server is a core dependency — installed with Treasure Map on every install, so `tmap mcp`
-works out of the box with no extra flag.
-
-```bash
-tmap mcp        # serve the most recent scan (no paths needed)
-```
-
-`scan` / `hunt` / `analyze` record a **last-run pointer**, so a bare `tmap mcp` serves the
-analysis from your latest scan — no flags. To serve a specific run instead, pass absolute paths:
-`tmap mcp --analysis-db /abs/router_v1/analysis.db --atlas /abs/router_v1/atlas.db`.
-
-`tmap mcp` is a **stdio server meant to be launched by an MCP client**, not a daemon you keep
-running — started by hand it just waits on stdin. Register it once with your client (next section)
-and the client spawns it on demand.
-
-It offers tools over the same fact layer the CLI's `tmap fact …` commands use — read-only fact
-lookups (a fact fetched either way is identical), plus a small write surface for the AI's own
-annotations (below) that live in a separate layer and never mutate the facts:
-
-- **`list_candidates`** — the ranked leads for the firmware the server is bound to (it isolates to
-  the current run, so a shared atlas doesn't mix in another image); filter by `sink` / `sink_class`
-  / `status`, and page with `limit` + `offset`.
-- **`explain_candidate`** — one candidate's score breakdown, honest bounds, and where to verify.
-- **`get_pseudocode` / `get_callees` / `get_xrefs` / `get_strings` / `get_imports_exports` /
-  `get_script_callsites` / `get_components_cves` / `get_disassembly`** — the structured facts to
-  chase a lead across the whole firmware.
-- **`cross_firmware_patterns` / `pattern_density`** (plus `pattern_twins` / `dormant_candidates`) —
-  cross-firmware recurrence signals to judge which lead is worth your time first.
-- **`annotate` / `list_overlays` / `clear_overlay`** — the annotation layer. Your AI records its own
-  verdict on a candidate — `to-review` / `in-progress` / `suspicious` / `excluded` / `safe`, with a
-  free-text rationale — and lists them back as a resumable watchlist filtered by verdict. Each entry
-  carries a freshness check: if the facts it rested on have since moved (the function's pseudocode
-  or a reachability/flow dimension changed), it is flagged for re-review rather than silently
-  trusted; if its anchor no longer resolves, that is surfaced too. This is what lets a multi-session
-  audit converge instead of restarting from zero — the judgments sit in a layer over the read-only
-  fact map, and clearing them restores the map untouched.
-- **`legal_notice`** — the intended-use notice.
-
-Two contracts hold on every fact tool: **every result carries an evidence anchor** (binary + function +
-address, or script + line) — a lookup that resolves nothing returns a "not found" record, never a
-guess — and the output is **facts, chains, reachability evidence, and trigger conditions only;
-never a payload, trigger bytes, or PoC**. The ordering signals (`score`, `entry_reach`,
-`device_spread`, `blocking_mechanism`) are labelled derived and evidence-backed — a lead to verify,
-never a verdict.
-
-### Using it from an AI agent
-
-**Register it with Claude Code once.** Use **absolute paths** (a client spawns the server in an
-environment where `~` may not expand) and the `user` scope so it's available from any directory:
-
-```bash
-claude mcp add -s user treasure-map -- tmap mcp \
-  --analysis-db /abs/path/to/analysis.db --atlas /abs/path/to/atlas.db
-claude mcp list      # treasure-map ✓ Connected
-```
-
-Registered once, Claude Code **spawns the server automatically** every session — no manual `tmap
-mcp`. You can even drop the two paths (`-- tmap mcp`) to follow the last-run pointer instead.
-**Switching firmware:** with the no-paths form a fresh `tmap scan` is picked up automatically;
-otherwise re-`add` with the new `--analysis-db`. Cursor and other MCP clients work the same way —
-point their "command" at `tmap mcp …`.
-
-**A prompt to start the agent off** (the server also carries a workflow hint, but a nudge helps):
-
-> Audit this firmware with the treasure-map MCP. Start with `list_candidates` (filter by
-> `sink_class` / `status`) and read down the ranked list from the top. Pick one, take its
-> `evidence_ref` (or its function name / address) and call `get_pseudocode`, then follow the
-> callers with `get_xrefs` (direction `callers`) to trace upstream. Candidates are **leads, not
-> conclusions** — recall is wide so expect false positives; read the pseudocode and judge for
-> yourself. Use `cross_firmware_patterns` to see whether a lead recurs across firmware images.
-
-**A typical loop:**
-
-1. `list_candidates` → scan the top of the ranked list, pick a lead.
-2. take its `evidence_ref` (or function name + address) → `get_pseudocode`.
-3. `get_callees` to step into the sink, `get_xrefs` (direction `callers`) to trace upstream.
-4. read the code and decide — the tools draw no conclusion for you.
-
-Two honest edges that match how the tools behave: an **empty caller set is not "unreachable"** —
-the function may be reached through an indirect / dispatch-table call static analysis can't resolve
-(the result says so). And **which function references a given string is not indexed** — `get_strings`
-locates the string and its address; resolve the reference site in your disassembler's xref view.
-
-## Pointing Treasure Map at Ghidra
-
-Used in Step 5 and at analyze time. Treasure Map locates Ghidra's `analyzeHeadless` by checking,
-**in order**:
-
-1. `ghidra.local.home` in `~/.treasure-map/config.yaml` → expects `<home>/support/analyzeHeadless`
-2. the `GHIDRA_HOME` environment variable → expects `$GHIDRA_HOME/support/analyzeHeadless`
-3. `analyzeHeadless` on your `PATH`
-
-It does **not** scan your disk — if none of the three points at Ghidra, it reports
-*not detected* even when Ghidra is installed.
-
-**Recommended (option 1 — shell-independent, survives new terminals):** `tmap init` writes this
-for you from the path you give it; or edit `config.yaml`:
-
-```yaml
-ghidra:
-  local:
-    home: /path/to/ghidra_11.x_PUBLIC
-```
-
-**Alternatives:** export `GHIDRA_HOME` (in the shell that runs `tmap`), or add
-`<ghidra-root>/support` to your `PATH`.
-
-Two things that trip people up:
-- **Point at the install *root*** — the directory that directly contains `support/`. The test is
-  simply: `<your path>/support/analyzeHeadless` must exist.
-- **Windows/WSL:** the detector looks for `analyzeHeadless` (Linux/macOS). On native Windows the
-  launcher is `analyzeHeadless.bat`; in WSL, install the **Linux** build of Ghidra and use a
-  Linux path, not a Windows `/mnt/c/...` one.
-
-`GHIDRA_HOME` is configuration, not a secret, so it is **not** stored in `.env` — use `config.yaml`
-(option 1) for a persistent setup.
-
-## Troubleshooting
-
-**Install:**
-- `tmap: command not found` after install — the tool's bin directory isn't on PATH yet. For uv:
-  `uv tool update-shell`, then open a new shell. For pipx: `pipx ensurepath`. Confirm
-  `~/.local/bin` is on your `PATH`. (If the shell suggests `apt install emboss`, ignore it — an
-  unrelated package shipping a different `tmap`.)
-
-**`tmap init` doctor** prints `name: ✅/❌ detail`. Common ❌ and fixes:
-
-| Doctor line | Fix |
+| Agent | Register once |
 |---|---|
-| `ghidra: ... not found` / *not detected* | Set `ghidra.local.home` in `config.yaml` (above) to your Ghidra install root. Verify `<root>/support/analyzeHeadless` exists. |
-| `java: not on PATH` | Do Step 2; ensure `java -version` reports **21** (`update-alternatives --config java` if you have several). |
-| `key:DEEPSEEK_API_KEY` / `key:ANTHROPIC_API_KEY: not set` | Provide the keys for your configured LLM tiers (defaults use DeepSeek + Anthropic). Re-run `tmap init` and paste them, or add them to `~/.treasure-map/.env`. Not required for plain `tmap analyze`. |
-| `atlas_dir` / `workspace_dir: not writable` | Ensure `~/.treasure-map/` (and any custom paths in `config.yaml`) are writable. |
+| **Claude Code** | `claude mcp add -s user treasure-map -- tmap mcp` |
+| **Codex (OpenAI)** | `codex mcp add treasure-map -- tmap mcp` |
+| **Cursor / Windsurf / Gemini CLI / other JSON clients** | add the block below to the client's MCP config file |
 
-Re-run `tmap init` after any fix to re-check.
+```json
+{
+  "mcpServers": {
+    "treasure-map": {
+      "command": "tmap",
+      "args": ["mcp"]
+    }
+  }
+}
+```
 
-## Intended Use & Legal
+Config file: Cursor `~/.cursor/mcp.json`, Windsurf `~/.codeium/windsurf/mcp_config.json`, Gemini CLI
+`~/.gemini/settings.json`; VS Code — `code --add-mcp '{"name":"treasure-map","command":"tmap","args":["mcp"]}'`.
 
-**Purpose.** Treasure Map supports defensive security auditing and
-vulnerability research on firmware. It produces candidate findings and
-analysis leads; by design it does **not** generate proof-of-concept
-exploits, payloads, shellcode, or other directly weaponizable output.
+Then, in your agent:
 
-**Lawful use is yours to ensure.** Only analyze firmware you lawfully
-possess — e.g. a device you own, or firmware made genuinely public by its
-vendor and obtained **without** bypassing any login, paywall, or access
-control. Even lawfully obtained firmware may be subject to license,
-terms-of-service, or contractual restrictions on reverse engineering; you
-are responsible for reviewing them.
+> Audit this firmware using treasure-map. Work down its ranked candidate list from the top — open
+> a lead's pseudocode, trace it upstream, and judge it yourself. They're leads to verify, not
+> confirmed bugs.
 
-**Findings are candidates, not verdicts.** Output requires independent
-human verification and is not a confirmed vulnerability.
-
-**No warranty; your responsibility.** The tool is provided "as is," without
-warranty of any kind. You are solely responsible for how you use it and for
-ensuring your activity is lawful in your jurisdiction. If you are unsure
-whether a given analysis is permitted, consult qualified legal counsel
-before proceeding.
+---
 
 ## Status
 
-This project is in early development. APIs and behaviors will change. Current coverage: command-
-execution, buffer-copy, and format-string-injection sinks, with an AI-facing MCP server over the
-shared fact layer.
+Early development — APIs and behaviors may change.
+
+- **Stable:** the `scan` pipeline (analyze → hunt → triage), the AI-facing MCP fact layer, and the
+  annotation layer. Sink coverage: command-execution, buffer-copy, and format-string-injection
+  sinks (with in-function argument provenance), plus path sinks (detection and ranking).
+- **Experimental:** `diff` (cross-build patch comparison) — under active development; does not
+  affect `scan`.
+
+---
+
+## Intended Use & Legal
+
+**Purpose.** Treasure Map supports defensive security auditing and vulnerability research on
+firmware. It produces candidate findings and analysis leads; by design it does **not** generate
+proof-of-concept exploits, payloads, shellcode, or other directly weaponizable output.
+
+**Lawful use is yours to ensure.** Only analyze firmware you lawfully possess — a device you own, or
+firmware made genuinely public by its vendor and obtained **without** bypassing any login, paywall,
+or access control. Even lawfully obtained firmware may carry license, terms-of-service, or
+contractual restrictions on reverse engineering; you are responsible for reviewing them.
+
+**Findings are candidates, not verdicts.** Output requires independent human verification and is not
+a confirmed vulnerability.
+
+**No warranty.** The tool is provided "as is." You are solely responsible for how you use it and for
+ensuring your activity is lawful in your jurisdiction. If unsure, consult qualified legal counsel
+before proceeding.
+
+---
+
+## Troubleshooting
+
+- **`tmap: command not found`** — the tool's bin dir isn't on PATH. Run `uv tool update-shell`,
+  then open a new shell.
+- **`Ghidra : not found` / `not auto-detected`** — set `ghidra.local.home` in
+  `~/.treasure-map/config.yaml` to your Ghidra install root; verify
+  `<root>/support/analyzeHeadless` exists. (WSL: install the **Linux** build and use a Linux path,
+  not `/mnt/c/...`.)
+- **`java: not on PATH`** — ensure `java -version` reports **21** (`update-alternatives --config
+  java` if you have several).
+
+Re-run `tmap init` after any fix to re-check.
+
+---
 
 ## Uninstalling
 
-Remove the tool itself — this leaves your data and config untouched:
 ```bash
-uv tool uninstall treasure-map        # or, if you used pipx:  pipx uninstall treasure-map
+uv tool uninstall treasure-map
 ```
 
-Uninstalling **deliberately keeps `~/.treasure-map/`** — your `config.yaml`, API keys (`.env`),
-and especially **`atlas.db`**, the cross-firmware knowledge base that accumulates across runs and
-is never rebuilt. Reinstalling and running `tmap init` again simply reuses all of it (init is
-idempotent — it detects existing config and doesn't overwrite it; pass `--force` only if you want
-to regenerate `config.yaml`).
+This **keeps `~/.treasure-map/`** — your config and especially **`atlas.db`**, the cross-firmware
+knowledge base that accumulates across runs and is never rebuilt. Reinstalling reuses all of it. To
+wipe everything including `atlas.db`: `rm -rf ~/.treasure-map` (not recoverable — not recommended).
 
-If you truly want to wipe everything — keys, config, workspaces, **and the accumulated
-`atlas.db`**:
-```bash
-rm -rf ~/.treasure-map        # deletes your API keys AND atlas.db — not recoverable
-```
-**Not recommended.** `atlas.db` is the analysis data you've built up over time; deleting it throws
-that away for good. Across upgrades and reinstalls, prefer leaving `~/.treasure-map/` in place.
+---
 
 ## License
 
-This project is licensed under [AGPL-3.0](LICENSE). See [LICENSE-FAQ.md](LICENSE-FAQ.md) for details.
-
-For commercial licensing inquiries, please open an issue or contact the maintainer.
+[AGPL-3.0](LICENSE) — see [LICENSE-FAQ.md](LICENSE-FAQ.md). For commercial licensing, open an issue
+or contact the maintainer.

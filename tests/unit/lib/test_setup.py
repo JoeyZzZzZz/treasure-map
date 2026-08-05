@@ -493,3 +493,68 @@ def test_init_workspace_base_non_interactive_no_prompt(fake_home: Path) -> None:
     run_init(non_interactive=True, prompt=_record)
     assert not any("Workspace base" in m for m in msgs)  # never prompts
     assert _workspace_dir(fake_home) == "~/.treasure-map/workspaces"
+
+
+# ── completion activation: init only touches an rc with explicit consent ───────────────
+
+
+def _rc_state(home: Path) -> dict[str, str | None]:
+    """Byte snapshot of every rc init could conceivably touch (None = absent)."""
+    names = (".bashrc", ".zshrc", ".bash_profile", ".zprofile")
+    return {n: (home / n).read_text() if (home / n).exists() else None for n in names}
+
+
+def test_non_interactive_init_never_touches_the_rc(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ★ An unattended init changing a shell rc is exactly the no-consent edit the rule forbids —
+    # and there is nobody there to agree. It must print the line and write nothing.
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+    monkeypatch.setattr("treasure_map.lib.setup.completion._bash_completion_present", lambda: False)
+    (fake_home / ".zshrc").write_text("# mine\n")
+    before = _rc_state(fake_home)
+
+    lines: list[str] = []
+    run_init(force=False, non_interactive=True, prompt=_noop_prompt, echo=lines.append)
+
+    assert _rc_state(fake_home) == before  # byte-identical
+    assert any("to activate" in line for line in lines)  # ... and the hint was still printed
+
+
+def test_interactive_yes_appends_the_block_and_flips_the_doctor(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Enter (the [Y/n] default) is a yes: the block lands, and the preflight that runs afterwards
+    # reports the completion check green rather than a stale red.
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+    result = run_init(force=False, non_interactive=False, prompt=lambda _msg: "")
+
+    body = (fake_home / ".zshrc").read_text()
+    assert "# >>> tmap completion >>>" in body and "fpath=(" in body
+    completion = [c for c in result.checks if c[0] == "completion"]
+    assert completion and completion[0][1] is True
+
+
+def test_interactive_no_leaves_the_rc_alone(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Declining keeps the current behaviour exactly: no rc write, the hint printed, doctor red.
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+    lines: list[str] = []
+    result = run_init(
+        force=False, non_interactive=False, prompt=lambda _msg: "n", echo=lines.append
+    )
+
+    assert not (fake_home / ".zshrc").exists()
+    assert any("to activate" in line for line in lines)
+    completion = [c for c in result.checks if c[0] == "completion"]
+    assert completion and completion[0][1] is False
+
+
+def test_unrecognised_answer_is_treated_as_no(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Ambiguity errs toward leaving the user's file alone — only Enter / y / yes writes.
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+    run_init(force=False, non_interactive=False, prompt=lambda _msg: "maybe")
+    assert not (fake_home / ".zshrc").exists()

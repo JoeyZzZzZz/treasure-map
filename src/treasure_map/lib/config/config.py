@@ -46,7 +46,10 @@ class GhidraLocalConfig(BaseModel):
 
 
 class GhidraDockerConfig(BaseModel):
-    image: str = "ghcr.io/joeyz/treasure-map-ghidra:11.2"
+    # No default image: the docker mode is not implemented yet, and the previous default named a
+    # tag that does not exist. A wrong default is worse than none — it would fail at pull time with
+    # a confusing "manifest unknown" instead of an honest "you have not configured an image".
+    image: str = ""
 
 
 class GhidraRemoteConfig(BaseModel):
