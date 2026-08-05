@@ -200,5 +200,4 @@ wipe everything including `atlas.db`: `rm -rf ~/.treasure-map` (not recoverable 
 
 ## License
 
-[AGPL-3.0](LICENSE) — see [LICENSE-FAQ.md](LICENSE-FAQ.md). For commercial licensing, open an issue
-or contact the maintainer.
+[AGPL-3.0](LICENSE). For commercial licensing, open an issue or contact the maintainer.
