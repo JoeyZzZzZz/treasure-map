@@ -194,6 +194,16 @@ class UpsertResult:
     prior_updated_at: str | None = None
 
 
+def _run_id_from_ref(anchor_ref: str) -> str | None:
+    """The firmware run an anchor belongs to: everything before the first ``#``, else None.
+
+    Derived, never invented — an anchor with no run segment (or an empty one) stays NULL rather
+    than being guessed at. This MUST agree with the backfill in the atlas migration, so a row
+    written today and a row migrated from before the column existed carry the same value."""
+    head = anchor_ref.split("#", 1)[0] if "#" in anchor_ref else ""
+    return head or None
+
+
 def upsert_overlay(
     atlas: sqlite3.Connection,
     *,
@@ -236,9 +246,16 @@ def upsert_overlay(
         )
     else:
         cur = atlas.execute(
-            "INSERT INTO overlay (anchor_kind, anchor_ref, verdict, rationale, attributed_to, "
-            "basis_state) VALUES ('evidence_ref', ?, ?, ?, ?, ?)",
-            (evidence_ref, verdict, rationale.strip(), attributed_to, basis.to_json()),
+            "INSERT INTO overlay (anchor_kind, anchor_ref, run_id, verdict, rationale, "
+            "attributed_to, basis_state) VALUES ('evidence_ref', ?, ?, ?, ?, ?, ?)",
+            (
+                evidence_ref,
+                _run_id_from_ref(evidence_ref),
+                verdict,
+                rationale.strip(),
+                attributed_to,
+                basis.to_json(),
+            ),
         )
         new_id = cur.lastrowid
         assert new_id is not None
@@ -274,20 +291,31 @@ _LIST_NOTE = (
 )
 
 
-def list_overlays(atlas: sqlite3.Connection, *, verdict: str | None = None) -> dict[str, Any]:
-    """Every annotation, optionally filtered to one verdict (the resume view: 'what did I mark
-    in-progress / suspicious / excluded'). Each row carries its live basis_state so a stale
-    annotation is visibly flagged, never silently trusted."""
+def list_overlays(
+    atlas: sqlite3.Connection, *, verdict: str | None = None, run_id: str | None = None
+) -> dict[str, Any]:
+    """Every annotation, optionally narrowed to one verdict and/or one firmware run (the resume
+    view: 'what did I mark in-progress / suspicious / excluded, on THIS firmware'). Each row
+    carries its live basis_state so a stale annotation is visibly flagged, never silently trusted.
+
+    The two filters AND together. ``run_id`` is an exact match on the stored column — the run is a
+    real field here, not a prefix of the anchor string, so nothing depends on how the anchor
+    happens to be punctuated."""
     params: list[str] = []
-    clause = ""
+    conds: list[str] = []
     if verdict is not None:
         if verdict not in _VERDICTS:
             raise ConfigError(f"verdict must be one of {list(_VERDICTS)}; got {verdict!r}")
-        clause = "WHERE verdict = ?"
+        conds.append("verdict = ?")
         params.append(verdict)
+    if run_id is not None:
+        conds.append("run_id = ?")
+        params.append(run_id)
+    clause = ("WHERE " + " AND ".join(conds)) if conds else ""
     rows = atlas.execute(
-        "SELECT id, anchor_kind, anchor_ref, verdict, rationale, attributed_to, basis_state, "
-        f"created_at, updated_at FROM overlay {clause} ORDER BY verdict, updated_at DESC",  # noqa: S608
+        "SELECT id, anchor_kind, anchor_ref, run_id, verdict, rationale, attributed_to, "
+        f"basis_state, created_at, updated_at FROM overlay {clause} "  # noqa: S608
+        "ORDER BY verdict, updated_at DESC",
         params,
     ).fetchall()
     overlays = []
@@ -299,6 +327,7 @@ def list_overlays(atlas: sqlite3.Connection, *, verdict: str | None = None) -> d
                 "id": r["id"],
                 "anchor_kind": r["anchor_kind"],
                 "anchor_ref": r["anchor_ref"],
+                "run_id": r["run_id"],  # which firmware this annotation is about
                 "verdict": r["verdict"],
                 "attributed_to": r["attributed_to"],
                 "rationale": r["rationale"],
@@ -314,6 +343,6 @@ def list_overlays(atlas: sqlite3.Connection, *, verdict: str | None = None) -> d
         "overlays": overlays,
         "count": len(overlays),
         "counts_by_verdict": counts,
-        "filter": {"verdict": verdict},
+        "filter": {"verdict": verdict, "run_id": run_id},
         "note": _LIST_NOTE,
     }

@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Annotations now record which firmware they are about, and `list_overlays` can filter to one.**
+  The atlas accumulates every scan, so a multi-firmware audit read its annotations back as one
+  mixed pile — the run was in there, buried inside the `evidence_ref` string, but nothing could
+  query it. `overlay` gains a `run_id` column, derived from the anchor (the segment before `#`) and
+  written alongside every new annotation, plus `list_overlays(run_id=...)` — an exact equality match
+  on a real column, so nothing hinges on how an anchor happens to be punctuated. Each row also
+  surfaces its own `run_id`, so even an unfiltered listing stays attributable, and the two filters
+  AND together. Existing annotations are backfilled in place by the atlas migration; an anchor
+  carrying no run segment is left NULL rather than guessed at, and the write path applies the same
+  rule so a migrated row and a fresh one agree. Purely additive: `UNIQUE(anchor_kind, anchor_ref)`
+  is untouched (`run_id` is derived, adding no identity of its own), and no table is rebuilt.
+
 - **`tmap init` can now activate shell completion for you — with your explicit yes.** Installing the
   completion script into the shell's autoload directory is often not enough for the shell to load
   it, and init's only recourse was to print the one line and leave it to you. An interactive init

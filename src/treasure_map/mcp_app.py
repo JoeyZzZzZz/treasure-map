@@ -1461,7 +1461,7 @@ def make_tools(
             )
         return result
 
-    def list_overlays(verdict: str | None = None) -> dict[str, Any]:
+    def list_overlays(verdict: str | None = None, run_id: str | None = None) -> dict[str, Any]:
         """Your overlay annotations, optionally filtered to one ``verdict`` — the resume view: "what
         did I mark ``in-progress`` / ``suspicious`` / ``excluded``". Each row carries its live
         ``basis_state``: ``unchanged`` (the pseudocode + dimensions it rested on have not moved),
@@ -1469,11 +1469,15 @@ def make_tools(
         pseudocode hash to compare — an honest can't-say, never a clean bill), or
         ``anchor_unresolved`` (the ref no longer resolves). Stale rows are surfaced, never dropped.
 
+        ``run_id`` narrows to ONE firmware — the atlas accumulates across every scan, so without it
+        a multi-firmware audit reads back one mixed pile. Each row also carries its own ``run_id``.
+        Both filters AND together.
+
         ★ These are AGENT decisions on the overlay, not tool facts. ``bias`` is the opt-in
         overlay-on view's float(+1)/sink(-1); the base map's own ordering is untouched."""
         atlas = open_atlas(atlas_path)
         try:
-            return _list_overlays(atlas, verdict=verdict)
+            return _list_overlays(atlas, verdict=verdict, run_id=run_id)
         finally:
             atlas.close()
 

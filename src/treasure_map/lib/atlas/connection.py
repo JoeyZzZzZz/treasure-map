@@ -144,6 +144,24 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if dd_cols and "binary" not in dd_cols:
         conn.execute("ALTER TABLE dimension_delta ADD COLUMN binary TEXT")
 
+    # overlay.run_id (added this round): which firmware an annotation belongs to. The value was
+    # always there, buried in the anchor_ref string; storing it as a column turns "show me this
+    # firmware's annotations" into an exact equality match instead of a prefix probe. Nullable, and
+    # a pure ADD — the UNIQUE(anchor_kind, anchor_ref) rule is untouched, since run_id is derived
+    # from anchor_ref and adds no identity of its own. Idempotent: the ADD runs only while the
+    # column is missing, and the backfill only touches rows that have no value yet.
+    ov_cols = _column_names(conn, "overlay")
+    if ov_cols and "run_id" not in ov_cols:
+        conn.execute("ALTER TABLE overlay ADD COLUMN run_id TEXT")
+    if ov_cols:
+        # Backfill from the anchor: everything before the first '#'. `> 1` (not `> 0`) so a ref
+        # that STARTS with '#' is left NULL rather than backfilled to an empty string — the same
+        # rule the write path applies, so a backfilled row and a freshly written one agree.
+        conn.execute(
+            "UPDATE overlay SET run_id = substr(anchor_ref, 1, instr(anchor_ref, '#') - 1) "
+            "WHERE run_id IS NULL AND instr(anchor_ref, '#') > 1"
+        )
+
 
 def open_atlas(db_path: Path) -> sqlite3.Connection:
     """Open (or create) the atlas SQLite database and apply the schema.

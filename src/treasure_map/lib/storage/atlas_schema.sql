@@ -625,6 +625,11 @@ CREATE TABLE IF NOT EXISTS overlay (
     anchor_kind   TEXT NOT NULL DEFAULT 'evidence_ref'
         CHECK (anchor_kind IN ('evidence_ref','diff_subject')),  -- diff_subject reserved (unused)
     anchor_ref    TEXT NOT NULL,            -- evidence_ref (run_id#sha8:addr@suffix) for the MVP kind
+    -- Which firmware this annotation belongs to. DERIVED from anchor_ref (the segment before '#'),
+    -- stored explicitly so filtering to one firmware is an exact equality match instead of a
+    -- string prefix probe. Nullable: an anchor kind that carries no run segment leaves it NULL
+    -- rather than guessing. It does NOT change the uniqueness rule below.
+    run_id        TEXT,
     verdict       TEXT NOT NULL
         CHECK (verdict IN ('to-review','in-progress','suspicious','excluded','safe')),
     rationale     TEXT NOT NULL,            -- why + next step + confidence; blank is rejected at write

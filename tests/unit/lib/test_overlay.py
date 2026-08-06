@@ -290,3 +290,114 @@ def test_list_overlays_verdict_filter_and_bias(tmp_path: Path) -> None:
     excl = overlay.list_overlays(con, verdict="excluded")["overlays"][0]
     assert excl["bias"] == -1  # excluded sinks
     con.close()
+
+
+# ── run_id: which firmware an annotation belongs to ────────────────────────────────────
+#
+# Reverse mutations — each applied once and observed RED (assertion failures, not errors), then
+# restored. Re-run any to re-verify these guards bite:
+#
+# 1. no run filter. In `overlay.list_overlays` never append the `run_id = ?` condition. -> 2 failed,
+#    incl. `test_run_id_filter_isolates_one_firmware`: the other firmware's annotation leaks in.
+# 2. write path forgets the run. In `upsert_overlay` pass None instead of
+#    `_run_id_from_ref(evidence_ref)`. -> 3 failed, incl. `test_new_annotation_records_its_run`:
+#    the fresh row's run_id is NULL, so its own firmware's view no longer returns it.
+# 3. no backfill. In `atlas.connection._migrate` skip the overlay backfill UPDATE. -> 1 failed:
+#    `test_pre_existing_rows_are_backfilled` — a row written before the column existed stays NULL
+#    and silently drops out of its own firmware's view.
+# 4. OR instead of AND. In `list_overlays` join the conditions with " OR ". -> 1 failed:
+#    `test_filters_and_together` — the other firmware's row comes back too.
+
+
+_REF_A = "run_a#deadbeef:0x100"
+_REF_B = "run_b#cafebabe:0x200"
+
+
+def _seed_two_runs(tmp_path: Path) -> sqlite3.Connection:
+    """One atlas holding candidates from TWO firmwares — the shared-atlas case run_id exists for.
+
+    The refs carry their own run segment, because that is where run_id is derived FROM — the
+    anchor, not the instance's source_run_id. Keeping them equal here would hide which one the
+    column actually follows."""
+    con = open_atlas(tmp_path / "atlas.db")
+    for run, ref in ((_REF_A.split("#")[0], _REF_A), (_REF_B.split("#")[0], _REF_B)):
+        pid = upsert_pattern(
+            con, source_class="param", sink_class="system", call_sequence_shape=f"c-{run}"
+        )
+        add_instance(
+            con,
+            InstanceRow(
+                pattern_id=pid,
+                source_run_id=run,
+                evidence_ref=ref,
+                pseudocode_hash=f"hash-{run}",
+                reachability_status="unknown",
+            ),
+        )
+    return con
+
+
+def test_run_id_filter_isolates_one_firmware(tmp_path: Path) -> None:
+    # ★ The point of the column: a shared atlas accumulates every scan, so "my annotations" has to
+    # mean "this firmware's annotations" or a multi-firmware audit reads back one mixed pile.
+    con = _seed_two_runs(tmp_path)
+    overlay.upsert_overlay(con, evidence_ref=_REF_A, verdict="suspicious", rationale="dig here")
+    overlay.upsert_overlay(con, evidence_ref=_REF_B, verdict="excluded", rationale="benign")
+    assert overlay.list_overlays(con)["count"] == 2  # unfiltered: both firmwares
+
+    only_a = overlay.list_overlays(con, run_id="run_a")
+    assert [o["anchor_ref"] for o in only_a["overlays"]] == [_REF_A]
+    assert only_a["filter"]["run_id"] == "run_a"
+    only_b = overlay.list_overlays(con, run_id="run_b")
+    assert [o["anchor_ref"] for o in only_b["overlays"]] == [_REF_B]
+    assert overlay.list_overlays(con, run_id="run_nope")["count"] == 0  # honest empty, not a guess
+
+
+def test_new_annotation_records_its_run(tmp_path: Path) -> None:
+    # A row written today must carry the run, or it is invisible to its own firmware's view.
+    con = _seed_two_runs(tmp_path)
+    overlay.upsert_overlay(con, evidence_ref=_REF_A, verdict="in-progress", rationale="reading it")
+    stored = con.execute("SELECT run_id FROM overlay WHERE anchor_ref = ?", (_REF_A,)).fetchone()
+    assert stored["run_id"] == "run_a"
+    assert overlay.list_overlays(con, run_id="run_a")["count"] == 1
+    # ... and the row surfaces its own run, so a mixed listing stays attributable
+    assert overlay.list_overlays(con)["overlays"][0]["run_id"] == "run_a"
+
+
+def test_pre_existing_rows_are_backfilled(tmp_path: Path) -> None:
+    # ★ An annotation written before the column existed must not fall out of its firmware's view.
+    # Simulated by clearing the value and re-opening, which is exactly what an old atlas looks like.
+    db = tmp_path / "atlas.db"
+    con = _seed_two_runs(tmp_path)
+    overlay.upsert_overlay(con, evidence_ref=_REF_A, verdict="safe", rationale="checked")
+    con.execute("UPDATE overlay SET run_id = NULL")  # the pre-column shape
+    con.commit()
+    con.close()
+
+    con = open_atlas(db)  # re-open runs the migration
+    try:
+        stored = con.execute(
+            "SELECT run_id FROM overlay WHERE anchor_ref = ?", (_REF_A,)
+        ).fetchone()
+        assert stored["run_id"] == "run_a"  # backfilled from the anchor
+        assert overlay.list_overlays(con, run_id="run_a")["count"] == 1
+    finally:
+        con.close()
+
+
+def test_filters_and_together(tmp_path: Path) -> None:
+    con = _seed_two_runs(tmp_path)
+    overlay.upsert_overlay(con, evidence_ref=_REF_A, verdict="suspicious", rationale="dig")
+    overlay.upsert_overlay(con, evidence_ref=_REF_B, verdict="excluded", rationale="benign")
+    both = overlay.list_overlays(con, run_id="run_a", verdict="suspicious")
+    assert [o["anchor_ref"] for o in both["overlays"]] == [_REF_A]
+    # the same verdict on the OTHER firmware is not this firmware's
+    assert overlay.list_overlays(con, run_id="run_b", verdict="suspicious")["count"] == 0
+
+
+def test_anchor_without_a_run_segment_stays_null(tmp_path: Path) -> None:
+    # Derived, never invented: an anchor carrying no run segment is left NULL rather than guessed
+    # at — and the write path and the migration backfill agree on that rule.
+    assert overlay._run_id_from_ref("run_a#deadbeef:0x1@cmd") == "run_a"
+    assert overlay._run_id_from_ref("#leading-hash") is None  # empty prefix is not a run
+    assert overlay._run_id_from_ref("no-hash-at-all") is None
