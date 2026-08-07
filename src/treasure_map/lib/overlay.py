@@ -33,13 +33,18 @@ from typing import Any
 
 from treasure_map.lib.errors import ConfigError
 
-# The agent verdicts an annotation may carry. Neutral / in-progress states sit at bias 0; the two
-# opt-in view biases (+1 float, -1 sink) are exposed as a FACT for a view layer to consume — the
-# base map's own ordering is never touched by this module.
-_VERDICTS = ("to-review", "in-progress", "suspicious", "excluded", "safe")
+# The agent verdicts an annotation may carry. This layer stores a CONCLUSION, not a task: an
+# annotation says what was decided about a candidate, and ``inconclusive`` is itself a conclusion —
+# it was looked at, and nothing decisive could be established within what this tool can see (the
+# rationale carries the next step). A verdict that sits at bias 0 leaves the base-map position
+# alone; the two opt-in view biases (+1 float, -1 sink) are exposed as a FACT for a view layer to
+# consume — the base map's own ordering is never touched by this module.
+#
+# The vocabulary can change freely now that no database constraint pins it, so anything reading a
+# verdict must tolerate one it does not know: an older database can still hold a retired word.
+_VERDICTS = ("inconclusive", "suspicious", "excluded", "safe")
 _VERDICT_BIAS = {
-    "to-review": 0,
-    "in-progress": 0,
+    "inconclusive": 0,
     "suspicious": 1,
     "excluded": -1,
     "safe": -1,
@@ -265,10 +270,36 @@ def upsert_overlay(
     return result
 
 
-def clear_overlay(atlas: sqlite3.Connection, *, commit: bool = True) -> int:
-    """Delete every annotation (the base map is untouched, so it is byte-identical afterward). A
-    runtime action — the overlay is scratch space a consumer may wipe; return the rows removed."""
-    cur = atlas.execute("DELETE FROM overlay")
+def clear_overlay(
+    atlas: sqlite3.Connection,
+    *,
+    run_id: str | None = None,
+    evidence_ref: str | None = None,
+    commit: bool = True,
+) -> int:
+    """Delete annotations and return how many rows went. The base map is untouched either way, so
+    it reads byte-identical afterward — this is scratch space a consumer owns and may clear.
+
+    With no scope this wipes every annotation, which is the original behaviour. Pass ONE scope to
+    clear less: ``run_id`` drops one firmware's annotations, ``evidence_ref`` drops the single
+    annotation on one candidate. Keeping a layer that stores conclusions tidy means retiring
+    individual entries, not starting over, so the narrow forms are the ones to reach for.
+
+    The two scopes are mutually exclusive: accepting both would have to invent a meaning for their
+    combination, and guessing wrong here deletes the consumer's own work."""
+    if run_id is not None and evidence_ref is not None:
+        raise ConfigError(
+            "clear_overlay takes at most one scope: run_id OR evidence_ref, never both"
+        )
+    if evidence_ref is not None:
+        cur = atlas.execute(
+            "DELETE FROM overlay WHERE anchor_kind = 'evidence_ref' AND anchor_ref = ?",
+            (evidence_ref,),
+        )
+    elif run_id is not None:
+        cur = atlas.execute("DELETE FROM overlay WHERE run_id = ?", (run_id,))
+    else:
+        cur = atlas.execute("DELETE FROM overlay")
     if commit:
         atlas.commit()
     return cur.rowcount
@@ -295,7 +326,7 @@ def list_overlays(
     atlas: sqlite3.Connection, *, verdict: str | None = None, run_id: str | None = None
 ) -> dict[str, Any]:
     """Every annotation, optionally narrowed to one verdict and/or one firmware run (the resume
-    view: 'what did I mark in-progress / suspicious / excluded, on THIS firmware'). Each row
+    view: 'what did I mark inconclusive / suspicious / excluded, on THIS firmware'). Each row
     carries its live basis_state so a stale annotation is visibly flagged, never silently trusted.
 
     The two filters AND together. ``run_id`` is an exact match on the stored column — the run is a
@@ -331,7 +362,10 @@ def list_overlays(
                 "verdict": r["verdict"],
                 "attributed_to": r["attributed_to"],
                 "rationale": r["rationale"],
-                "bias": _VERDICT_BIAS[r["verdict"]],
+                # A verdict this build does not know — a word retired since the row was written —
+                # falls back to neutral rather than raising. Reading an old annotation must never
+                # fail just because the vocabulary moved on.
+                "bias": _VERDICT_BIAS.get(r["verdict"], 0),
                 "basis_state": delta["state"],
                 "basis_note": _STALE_NOTE.get(delta["state"], ""),
                 "basis_delta": delta,

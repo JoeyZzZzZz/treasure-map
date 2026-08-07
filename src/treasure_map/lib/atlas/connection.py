@@ -235,8 +235,18 @@ def _migrate(conn: sqlite3.Connection) -> None:
     ov_sql = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='overlay'"
     ).fetchone()
-    if ov_sql and re.search(r"CHECK\s*\(\s*verdict\b", ov_sql[0], re.I):
-        _rebuild_overlay_without_verdict_check(conn)
+    # ov_sql is None on a database that has no overlay table yet — a brand-new one, since _migrate
+    # runs before the schema script creates anything. Both steps below are guarded by it.
+    if ov_sql:
+        if re.search(r"CHECK\s*\(\s*verdict\b", ov_sql[0], re.I):
+            _rebuild_overlay_without_verdict_check(conn)
+
+        # overlay.verdict rename (this round): 'to-review' -> 'inconclusive'. The old name described
+        # a task still to be done, but this layer records what was CONCLUDED — and "nothing decisive
+        # could be established" is itself a conclusion. Data-only, so no rebuild and no shape test:
+        # the statement is self-idempotent, matching nothing once it has run. It follows the rebuild
+        # so it updates the final table rather than one about to be replaced.
+        conn.execute("UPDATE overlay SET verdict = 'inconclusive' WHERE verdict = 'to-review'")
 
 
 def open_atlas(db_path: Path) -> sqlite3.Connection:

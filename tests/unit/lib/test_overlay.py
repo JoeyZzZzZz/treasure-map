@@ -94,7 +94,7 @@ def test_upsert_rejects_bad_verdict_and_blank_rationale(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="verdict must be one of"):
         overlay.upsert_overlay(con, evidence_ref=_REF, verdict="nope", rationale="x")
     with pytest.raises(ConfigError, match="rationale must be non-blank"):
-        overlay.upsert_overlay(con, evidence_ref=_REF, verdict="to-review", rationale="   ")
+        overlay.upsert_overlay(con, evidence_ref=_REF, verdict="inconclusive", rationale="   ")
     con.close()
 
 
@@ -118,7 +118,7 @@ def test_attribution_is_never_fabricated(tmp_path: Path) -> None:
 def test_blind_write_on_unresolved_ref_is_recorded_with_basis_unresolved(tmp_path: Path) -> None:
     con = _seed(tmp_path)
     res = overlay.upsert_overlay(
-        con, evidence_ref="ghost#0:0x0", verdict="to-review", rationale="note before scan"
+        con, evidence_ref="ghost#0:0x0", verdict="inconclusive", rationale="note before scan"
     )
     assert res.action == "inserted"
     assert res.basis_resolved is False  # honest: nothing to snapshot
@@ -165,7 +165,7 @@ def test_basis_changed_when_a_dimension_moves(tmp_path: Path) -> None:
 
 def test_basis_changed_when_pseudocode_hash_moves(tmp_path: Path) -> None:
     con = _seed(tmp_path)
-    overlay.upsert_overlay(con, evidence_ref=_REF, verdict="in-progress", rationale="reading")
+    overlay.upsert_overlay(con, evidence_ref=_REF, verdict="inconclusive", rationale="reading")
     con.execute("UPDATE instance SET pseudocode_hash='hash-B' WHERE evidence_ref=?", (_REF,))
     con.commit()
     row = overlay.list_overlays(con)["overlays"][0]
@@ -356,7 +356,7 @@ def test_run_id_filter_isolates_one_firmware(tmp_path: Path) -> None:
 def test_new_annotation_records_its_run(tmp_path: Path) -> None:
     # A row written today must carry the run, or it is invisible to its own firmware's view.
     con = _seed_two_runs(tmp_path)
-    overlay.upsert_overlay(con, evidence_ref=_REF_A, verdict="in-progress", rationale="reading it")
+    overlay.upsert_overlay(con, evidence_ref=_REF_A, verdict="inconclusive", rationale="reading it")
     stored = con.execute("SELECT run_id FROM overlay WHERE anchor_ref = ?", (_REF_A,)).fetchone()
     assert stored["run_id"] == "run_a"
     assert overlay.list_overlays(con, run_id="run_a")["count"] == 1
@@ -401,3 +401,114 @@ def test_anchor_without_a_run_segment_stays_null(tmp_path: Path) -> None:
     assert overlay._run_id_from_ref("run_a#deadbeef:0x1@cmd") == "run_a"
     assert overlay._run_id_from_ref("#leading-hash") is None  # empty prefix is not a run
     assert overlay._run_id_from_ref("no-hash-at-all") is None
+
+
+# ── the verdict vocabulary moved: retire one word, rename another, and stay readable ───
+#
+# Reverse mutations — each applied once and observed RED, then restored:
+#
+# 1. drop the tolerance: in `overlay.list_overlays` index `_VERDICT_BIAS[...]` again.
+#    -> `test_list_overlays_tolerates_a_retired_verdict` fails with KeyError.
+# 2. un-retire: put "in-progress" back in `_VERDICTS`.
+#    -> `test_upsert_rejects_a_retired_verdict` fails — the write is accepted again.
+# 3. skip the rename: remove the UPDATE from `atlas.connection._migrate`.
+#    -> `test_migrate_renames_to_review_to_inconclusive` fails — the old word survives.
+# 4. ignore the scope: in `clear_overlay` always run the unscoped DELETE.
+#    -> `test_clear_overlay_scoped` fails — the untargeted rows are gone too.
+
+
+def test_upsert_rejects_a_retired_verdict(tmp_path: Path) -> None:
+    # A word removed from the vocabulary stops being writable — the write path is where validity
+    # lives now that no database constraint pins it.
+    con = _seed(tmp_path)
+    with pytest.raises(ConfigError, match="verdict must be one of"):
+        overlay.upsert_overlay(con, evidence_ref=_REF, verdict="in-progress", rationale="x")
+    con.close()
+
+
+def test_upsert_accepts_inconclusive(tmp_path: Path) -> None:
+    con = _seed(tmp_path)
+    res = overlay.upsert_overlay(
+        con, evidence_ref=_REF, verdict="inconclusive", rationale="looked; nothing decisive"
+    )
+    assert res.action == "inserted"
+    row = overlay.list_overlays(con)["overlays"][0]
+    assert row["verdict"] == "inconclusive"
+    assert row["bias"] == 0  # neutral: leaves the candidate where the base map put it
+    con.close()
+
+
+def test_list_overlays_tolerates_a_retired_verdict(tmp_path: Path) -> None:
+    # ★ Old databases still hold words this build has retired. Reading one must not fail — a
+    # vocabulary change cannot be allowed to make existing annotations unreadable.
+    con = _seed(tmp_path)
+    con.execute(
+        "INSERT INTO overlay (anchor_ref, run_id, verdict, rationale) "
+        "VALUES (?, 'run1', 'in-progress', 'written before the word was retired')",
+        (_REF,),
+    )
+    con.commit()
+    res = overlay.list_overlays(con)  # must not raise
+    assert res["count"] == 1
+    row = res["overlays"][0]
+    assert row["verdict"] == "in-progress"  # surfaced as stored, never rewritten
+    assert row["bias"] == 0  # unknown word -> neutral, so no view moves it on a guess
+    con.close()
+
+
+def test_migrate_renames_to_review_to_inconclusive(tmp_path: Path) -> None:
+    # ★ The rename reaches rows written under the old name, and only those.
+    db = tmp_path / "atlas.db"
+    con = _seed(tmp_path)
+    con.execute(
+        "INSERT INTO overlay (anchor_ref, run_id, verdict, rationale) "
+        "VALUES ('r#a:0x1@cmd', 'r', 'to-review', 'old name')"
+    )
+    con.execute(
+        "INSERT INTO overlay (anchor_ref, run_id, verdict, rationale) "
+        "VALUES ('r#a:0x2@cmd', 'r', 'suspicious', 'untouched')"
+    )
+    con.commit()
+    con.close()
+
+    con = open_atlas(db)  # the migration runs on open
+    verdicts = dict(con.execute("SELECT anchor_ref, verdict FROM overlay"))
+    assert verdicts["r#a:0x1@cmd"] == "inconclusive"
+    assert verdicts["r#a:0x2@cmd"] == "suspicious"  # every other verdict left alone
+    con.close()
+
+    con = open_atlas(db)  # idempotent: nothing left to rename
+    assert dict(con.execute("SELECT anchor_ref, verdict FROM overlay")) == verdicts
+    con.close()
+
+
+def test_clear_overlay_scoped(tmp_path: Path) -> None:
+    # ★ Clearing one entry — or one firmware's — instead of starting over. Anything outside the
+    # scope must survive; a scope that silently widened would delete work the consumer still wants.
+    def _seed_rows(con: sqlite3.Connection) -> None:
+        for ref in ("rC#s:0x1@cmd", "rC#s:0x2@cmd", "rD#s:0x1@cmd", "rE#s:0x1@cmd"):
+            con.execute(
+                "INSERT INTO overlay (anchor_ref, run_id, verdict, rationale) VALUES (?,?,?,?)",
+                (ref, ref.split("#")[0], "suspicious", "seed"),
+            )
+        con.commit()
+
+    def _refs(con: sqlite3.Connection) -> list[str]:
+        return [r[0] for r in con.execute("SELECT anchor_ref FROM overlay ORDER BY anchor_ref")]
+
+    con = _seed(tmp_path)
+    _seed_rows(con)
+    assert overlay.clear_overlay(con, evidence_ref="rC#s:0x1@cmd") == 1
+    assert _refs(con) == ["rC#s:0x2@cmd", "rD#s:0x1@cmd", "rE#s:0x1@cmd"]
+
+    assert overlay.clear_overlay(con, run_id="rC") == 1  # only what is left of that run
+    assert _refs(con) == ["rD#s:0x1@cmd", "rE#s:0x1@cmd"]
+
+    assert overlay.clear_overlay(con) == 2  # no scope: everything
+    assert _refs(con) == []
+
+    _seed_rows(con)
+    with pytest.raises(ConfigError, match="at most one scope"):
+        overlay.clear_overlay(con, run_id="rC", evidence_ref="rC#s:0x1@cmd")
+    assert len(_refs(con)) == 4  # the refusal deleted nothing
+    con.close()

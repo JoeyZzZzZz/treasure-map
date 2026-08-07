@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The verdict vocabulary is now four words, and reading an old one never fails.** `to-review` is
+  renamed **`inconclusive`**: the old name described a task still to be done, but this layer records
+  what was CONCLUDED about a candidate — and "it was looked at and nothing decisive could be
+  established from what this tool can see" is itself a conclusion, with the next step going in the
+  rationale. `in-progress` is retired: it sat at the same neutral bias, meant the same thing in
+  practice, and had no real use. Existing `to-review` rows are renamed in place on the next open
+  (idempotent; no table rebuild — nothing pins the vocabulary in the database any more), and every
+  other verdict is left alone. Retired words are **not** rewritten or deleted — the overlay holds
+  the consumer's own annotations, and the tool does not edit them. Instead, reading tolerates them:
+  a verdict this build does not recognise falls back to neutral bias and keeps the candidate's
+  base-map position, rather than raising or guessing at what it meant.
+- **`clear_overlay` can clear one entry or one firmware instead of everything.** It took no
+  arguments and wiped the table, which made "retire this one annotation I no longer stand behind"
+  impossible without starting over. It now accepts `run_id` **or** `evidence_ref` (never both — a
+  combination would have to invent a meaning, and guessing wrong deletes the consumer's work); with
+  no argument it still wipes everything, as before. Exposed on the MCP tool too, which echoes back
+  the scope it acted on and how many rows went.
+
 - **The verdict vocabulary is no longer pinned in the database.** `overlay.verdict` carried a
   schema-level `CHECK` listing every allowed word, so changing the vocabulary — renaming a verdict,
   retiring one, adding one — meant rebuilding the table and carrying real annotations across. That

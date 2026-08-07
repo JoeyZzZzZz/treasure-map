@@ -306,8 +306,11 @@ def test_band_mapping() -> None:
     assert overlay_band(ann("suspicious")) == FLOAT
     assert overlay_band(ann("excluded")) == SINK
     assert overlay_band(ann("safe")) == SINK
-    assert overlay_band(ann("to-review")) == NEUTRAL  # work in flight, not a judgement
+    assert overlay_band(ann("inconclusive")) == NEUTRAL  # looked at, nothing decisive: stay put
+    # ★ A verdict this build no longer knows (retired since the row was written) must also land
+    # NEUTRAL rather than raising — the vocabulary moves, stored annotations do not.
     assert overlay_band(ann("in-progress")) == NEUTRAL
+    assert overlay_band(ann("some-future-word")) == NEUTRAL
     # A dismissal whose basis moved — or that cannot be verified at all — comes back up. An
     # unverifiable basis is an honest can't-say, and a can't-say must never bury a candidate.
     assert overlay_band(ann("excluded", "changed")) == FLOAT
@@ -322,7 +325,7 @@ def test_every_verdict_maps_to_a_band() -> None:
     # Mechanical completeness: a verdict added to the storage layer without a band decision here
     # would silently ride as NEUTRAL, so pin that every known verdict is accounted for.
     bands = {v: overlay_band({"verdict": v, "basis_state": "unchanged"}) for v in overlay._VERDICTS}
-    assert set(bands) == {"to-review", "in-progress", "suspicious", "excluded", "safe"}
+    assert set(bands) == {"inconclusive", "suspicious", "excluded", "safe"}
     assert set(bands.values()) == {FLOAT, NEUTRAL, SINK}
 
 

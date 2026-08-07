@@ -1408,8 +1408,9 @@ def make_tools(
         (list_candidates) is unchanged whether the overlay is empty or full, and reads identically
         with the overlay off.
 
-        ``verdict`` is one of: ``to-review`` / ``in-progress`` (neutral; a note or a half-done
-        review — put the next step in the rationale so you can resume), ``suspicious`` (dig deeper),
+        ``verdict`` is one of: ``inconclusive`` (you looked and nothing decisive could be
+        established from what this tool can see — put the next step in the rationale so you can
+        resume; it leaves the candidate where it was), ``suspicious`` (dig deeper),
         ``excluded`` (noise / not relevant), ``safe`` (you judged it safe — a HIGH bar you own: a
         wrongly-'safe' candidate is a missed hole). ``rationale`` is required (why + next step +
         confidence). One annotation per candidate: re-annotating OVERWRITES (last write wins; the
@@ -1463,7 +1464,7 @@ def make_tools(
 
     def list_overlays(verdict: str | None = None, run_id: str | None = None) -> dict[str, Any]:
         """Your overlay annotations, optionally filtered to one ``verdict`` — the resume view: "what
-        did I mark ``in-progress`` / ``suspicious`` / ``excluded``". Each row carries its live
+        did I mark ``inconclusive`` / ``suspicious`` / ``excluded``". Each row carries its live
         ``basis_state``: ``unchanged`` (the pseudocode + dimensions it rested on have not moved),
         ``changed`` (they have — RE-REVIEW; the delta names what moved), ``unverifiable`` (no
         pseudocode hash to compare — an honest can't-say, never a clean bill), or
@@ -1481,17 +1482,31 @@ def make_tools(
         finally:
             atlas.close()
 
-    def clear_overlay() -> dict[str, Any]:
-        """Delete EVERY overlay annotation (the base map is untouched — it reads byte-identical
-        afterward). The overlay is scratch space you own; this wipes it. Returns rows removed."""
+    def clear_overlay(run_id: str | None = None, evidence_ref: str | None = None) -> dict[str, Any]:
+        """Delete overlay annotations and report how many went. The base map is untouched either
+        way — it reads byte-identical afterward. This is scratch space you own.
+
+        With NO argument this wipes every annotation, across every firmware. Pass ONE scope to
+        clear less: ``run_id`` drops just that firmware's annotations, ``evidence_ref`` drops the
+        single annotation on one candidate — the one to reach for when retiring an entry you no
+        longer stand behind, rather than starting over. The two scopes cannot be combined."""
         atlas = open_atlas(atlas_path)
         try:
-            removed = _clear_overlay(atlas)
+            removed = _clear_overlay(atlas, run_id=run_id, evidence_ref=evidence_ref)
+        except ConfigError as exc:
+            return {"cleared": 0, "error": str(exc)}
         finally:
             atlas.close()
+        if evidence_ref is not None:
+            scope = f"the annotation on {evidence_ref}"
+        elif run_id is not None:
+            scope = f"annotations for run {run_id}"
+        else:
+            scope = "EVERY annotation, across every firmware"
         return {
             "cleared": removed,
-            "note": "overlay annotations removed; the read-only base map is unchanged.",
+            "scope": {"run_id": run_id, "evidence_ref": evidence_ref},
+            "note": f"removed {scope}; the read-only base map is unchanged.",
         }
 
     def legal_notice() -> dict[str, Any]:

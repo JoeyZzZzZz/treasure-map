@@ -42,8 +42,10 @@ def overlay_band(annotation: dict[str, Any] | None) -> int:
 
     ``suspicious`` floats. ``excluded`` / ``safe`` sink, but ONLY while their basis still reads
     ``unchanged`` — once it has moved (or cannot be verified) the candidate floats back up for
-    re-review, so a stale dismissal can never bury a candidate for good. ``to-review`` /
-    ``in-progress`` are work-in-flight, not a judgement, so they keep the base-map position.
+    re-review, so a stale dismissal can never bury a candidate for good. ``inconclusive`` says the
+    candidate was looked at and nothing decisive was established, which is no reason to move it
+    either way, so it keeps its base-map position — as does any verdict this build does not
+    recognise, since a word retired since the annotation was written must not be guessed at.
     """
     if annotation is None:
         return NEUTRAL

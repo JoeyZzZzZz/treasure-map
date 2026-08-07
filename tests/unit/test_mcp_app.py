@@ -1047,7 +1047,7 @@ def test_annotate_rejects_blank_rationale_and_bad_verdict(tmp_path: Path) -> Non
 
 def test_annotate_blind_write_warns_but_records(tmp_path: Path) -> None:
     tools = _tools(tmp_path)
-    r = tools["annotate"]("run_m#nope@x", "to-review", "annotating before the scan")
+    r = tools["annotate"]("run_m#nope@x", "inconclusive", "annotating before the scan")
     assert r["written"] is True and "warning" in r  # blind write is honest, not silent
     assert tools["list_overlays"]()["count"] == 1
 
