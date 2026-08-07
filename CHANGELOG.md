@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The verdict vocabulary is no longer pinned in the database.** `overlay.verdict` carried a
+  schema-level `CHECK` listing every allowed word, so changing the vocabulary — renaming a verdict,
+  retiring one, adding one — meant rebuilding the table and carrying real annotations across. That
+  cost is now paid once: the CHECK is gone, and validity is enforced where the writes happen (both
+  write paths reject an unknown verdict) plus a test that pins every known verdict to a band, so a
+  new one cannot slip through unhandled. Existing databases are migrated in place, atomically —
+  explicitly transactional and statement-by-statement, because SQLite commits a bare `CREATE`
+  immediately and `executescript` commits whatever is already open, either of which would strand a
+  half-built table that nothing is allowed to clean up. A crash mid-rebuild rolls back to exactly
+  where it started, and the retry succeeds. Every other constraint (the anchor-kind and attribution
+  CHECKs, the uniqueness rule, both NOT NULLs), every column and every row survive unchanged.
+- **The atlas wipe guard now names one exemption instead of forbidding all table drops.** It still
+  refuses every `DROP VIEW` / `DROP INDEX` and every `DROP TABLE` of an evidence table — those hold
+  cross-run findings only a full re-scan could reproduce. `overlay` is exempt: it holds the
+  consumer's own annotations, which the design has always let them clear in one call. The check
+  extracts the table name rather than matching text, so a near-miss like `overlay_backup` is still
+  refused.
+
 ### Added
 
 - **Annotations now record which firmware they are about, and `list_overlays` can filter to one.**

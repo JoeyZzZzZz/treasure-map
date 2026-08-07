@@ -9,14 +9,76 @@ copying the main file without them yields "database disk image is malformed" on 
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from pathlib import Path
 
 _SCHEMA_PATH = Path(__file__).parent.parent / "storage" / "atlas_schema.sql"
 
+# The overlay table minus the verdict CHECK. Every other column, default, constraint and the
+# uniqueness rule are reproduced verbatim from the schema — the rebuild below copies column by
+# column, so anything dropped here would be silently lost rather than reported.
+_OVERLAY_REBUILT_DDL = """
+CREATE TABLE overlay_new (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    anchor_kind   TEXT NOT NULL DEFAULT 'evidence_ref'
+        CHECK (anchor_kind IN ('evidence_ref','diff_subject')),
+    anchor_ref    TEXT NOT NULL,
+    run_id        TEXT,
+    verdict       TEXT NOT NULL,
+    rationale     TEXT NOT NULL,
+    attributed_to TEXT
+        CHECK (attributed_to IS NULL OR attributed_to IN ('agent','agent-via-mcp')),
+    basis_state   TEXT,
+    created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (anchor_kind, anchor_ref)
+)
+"""
+
+# Named one place, used by both halves of the copy, so the two lists cannot drift apart.
+_OVERLAY_COLUMNS = (
+    "id,anchor_kind,anchor_ref,run_id,verdict,rationale,attributed_to,"
+    "basis_state,created_at,updated_at"
+)
+
 
 def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
     return {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _rebuild_overlay_without_verdict_check(conn: sqlite3.Connection) -> None:
+    """Rebuild ``overlay`` with the verdict CHECK dropped, carrying every row across.
+
+    ★ This MUST be atomic, and getting there needs two non-obvious things. The connection uses
+    SQLite's default isolation, which opens a transaction before DML but NOT before DDL — so a
+    bare ``CREATE`` commits itself immediately. And ``executescript`` commits whatever is open
+    before it runs, so wrapping it in a transaction does not help either. Either way a crash
+    before the rename leaves ``overlay_new`` behind, and the next open cannot clean it up: the
+    wipe guard only permits dropping ``overlay``, never a temp table. That is a permanent
+    deadlock — every subsequent open would retry the rebuild and hit "table already exists".
+
+    Hence: an explicit ``BEGIN IMMEDIATE``, every statement through ``execute`` (never
+    ``executescript``), and the transaction closed HERE — the caller runs the schema script right
+    after, which would otherwise commit a half-finished rebuild by implication.
+    """
+    conn.commit()  # settle anything pending so BEGIN starts from a clean slate
+    conn.execute("BEGIN IMMEDIATE")  # explicit, so the CREATE below is inside the transaction too
+    try:
+        conn.execute(_OVERLAY_REBUILT_DDL)
+        conn.execute(  # explicit column lists on both sides — never SELECT *
+            f"INSERT INTO overlay_new ({_OVERLAY_COLUMNS}) "  # noqa: S608 -- fixed literal tuple
+            f"SELECT {_OVERLAY_COLUMNS} FROM overlay"
+        )
+        conn.execute("DROP TABLE overlay")
+        conn.execute("ALTER TABLE overlay_new RENAME TO overlay")
+        # The drop took the old index with it; the schema script's CREATE INDEX runs later, but
+        # relying on that would make this rebuild depend on statement order elsewhere.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_overlay_verdict ON overlay(verdict)")
+        conn.commit()
+    except Exception:
+        conn.rollback()  # the CREATE rolls back with everything else: no temp table left behind
+        raise
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
@@ -161,6 +223,20 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "UPDATE overlay SET run_id = substr(anchor_ref, 1, instr(anchor_ref, '#') - 1) "
             "WHERE run_id IS NULL AND instr(anchor_ref, '#') > 1"
         )
+
+    # overlay.verdict CHECK removal (this round): the vocabulary is still moving, and pinning it in
+    # the schema made every wording change cost a rebuild that has to carry real annotations across.
+    # ★ Runs AFTER the run_id migration above, because the rebuild copies column by column — on an
+    # atlas that predates run_id, rebuilding first would try to read a column that is not there yet.
+    # Unlike every other migration here, what changes is a table-level constraint rather than a
+    # column, so PRAGMA table_info cannot see it — the test is the stored CREATE statement itself.
+    # The pattern points at the VERDICT check specifically: overlay carries three CHECKs, so a loose
+    # "does the SQL mention CHECK and verdict" would stay true forever and rebuild on every open.
+    ov_sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='overlay'"
+    ).fetchone()
+    if ov_sql and re.search(r"CHECK\s*\(\s*verdict\b", ov_sql[0], re.I):
+        _rebuild_overlay_without_verdict_check(conn)
 
 
 def open_atlas(db_path: Path) -> sqlite3.Connection:

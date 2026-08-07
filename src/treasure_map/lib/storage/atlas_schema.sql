@@ -630,8 +630,11 @@ CREATE TABLE IF NOT EXISTS overlay (
     -- string prefix probe. Nullable: an anchor kind that carries no run segment leaves it NULL
     -- rather than guessing. It does NOT change the uniqueness rule below.
     run_id        TEXT,
-    verdict       TEXT NOT NULL
-        CHECK (verdict IN ('to-review','in-progress','suspicious','excluded','safe')),
+    -- No CHECK here on purpose. The vocabulary is still evolving, and pinning it in the schema
+    -- means every wording change costs a table rebuild that has to carry real annotations across.
+    -- Validity is enforced where the writes are: both write paths reject an unknown verdict, and
+    -- a test pins that every known verdict has a band, so a new one cannot slip in unhandled.
+    verdict       TEXT NOT NULL,
     rationale     TEXT NOT NULL,            -- why + next step + confidence; blank is rejected at write
     attributed_to TEXT
         CHECK (attributed_to IS NULL OR attributed_to IN ('agent','agent-via-mcp')),  -- coarse; never faked
