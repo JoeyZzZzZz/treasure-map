@@ -297,13 +297,13 @@ CREATE TABLE IF NOT EXISTS run_capability (
 CREATE INDEX IF NOT EXISTS idx_runcap_run ON run_capability(run_id);
 CREATE INDEX IF NOT EXISTS idx_runcap_cap ON run_capability(capability);
 
--- exploit-barrier buckets — the two are PHYSICALLY SEPARATE tables on purpose (not one table + a
--- source column). They differ in sensitivity, who can produce them, and whether they count toward
--- barrier depth; the split makes those three un-mixable at the storage layer (a public row can never
--- be mis-exported as private, and public volume can never inflate depth — depth counts private only).
+-- exploit record tables — the two are PHYSICALLY SEPARATE tables on purpose (not one table + a
+-- source column). They differ in sensitivity, who can produce them, and whether they are counted;
+-- the split makes those three un-mixable at the storage layer (a public row can never be
+-- mis-exported as private, and public volume can never inflate the private count).
 
--- public_cve_pattern (FRONT-STAGE): public-CVE exploit forms. An agent may fill it. NOT counted
--- in barrier depth (it is breadth/material, not a barrier). Not sensitive.
+-- public_cve_pattern (PUBLIC): public-CVE exploit forms. An agent may fill it. NOT counted in
+-- distinct_exploits (it is reference material, not a verified exploit). Not sensitive.
 -- pattern/source/sink are FREE TEXT — no structured match key is presumed (the fingerprint key is
 -- unproven; no fuzzy match is built here, only exact human-readable lookup).
 -- origin marks these rows as EXTERNALLY IMPORTED material, not tmap deterministic extraction — a
@@ -322,24 +322,24 @@ CREATE TABLE IF NOT EXISTS public_cve_pattern (
     created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
--- private_exploit (BACK-STAGE, the real barrier): a hole its owner PROVED reachable. Admission bar =
+-- private_exploit (PRIVATE): a candidate its owner PROVED exploitable. Admission bar =
 -- EXPLOITED: exploit_note is NOT NULL (schema) AND the write tool rejects blank/whitespace — a
 -- structural lead that was never exploited does NOT belong here (it stays in the pending-to-exploit
--- queue). Barrier DEPTH counts THIS table only, by COUNT(DISTINCT evidence_ref) (a hole, not a
--- corroboration row). evidence_ref is the STABLE candidate handle (survives a re-scan), never the
--- AUTOINCREMENT instance_id (which drifts). Private evidence of a real hole in a shipping product —
+-- queue). distinct_exploits counts THIS table only, by COUNT(DISTINCT evidence_ref) (one per
+-- candidate, not per corroboration row). evidence_ref is the STABLE candidate handle (survives a re-scan), never the
+-- AUTOINCREMENT instance_id (which drifts). Private evidence about a shipping product —
 -- redact='vendor_sensitive' by default; REDACT ON EXPORT, and the read path withholds exploit_note
 -- unless a caller explicitly reveals it. Append-only, NOT unique: one evidence_ref may gather several
 -- rows (corroboration / escalation), a later write never overwrites an earlier one.
 CREATE TABLE IF NOT EXISTS private_exploit (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    evidence_ref  TEXT NOT NULL,      -- the candidate this hole anchors to (stable handle, not id)
+    evidence_ref  TEXT NOT NULL,      -- the candidate this record anchors to (stable handle, not id)
     pattern       TEXT NOT NULL,      -- exploit form (free text)
     exploit_note  TEXT NOT NULL,      -- proof: how it triggers, effect obtained, guard bypassed (bar)
     patch_form    TEXT,               -- empty; the diff line backfills the correct patch form later.
-                                      --   patch_form is a property of the HOLE (evidence_ref), not
+                                      --   patch_form is a property of the CANDIDATE (evidence_ref), not
                                       --   of a corroboration row: read it as the latest non-empty
-                                      --   value per evidence_ref (same hole-vs-row rule as depth).
+                                      --   value per evidence_ref (same candidate-vs-row rule as the count).
     cve_id        TEXT,               -- empty; backfilled on disclosure (credibility compounding)
     redact        TEXT DEFAULT 'vendor_sensitive',  -- export-sensitivity marker (marker only here)
     attributed_to TEXT,               -- auto-attribution; nullable; NULL = "attribution unrecorded",

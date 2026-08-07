@@ -61,8 +61,8 @@ from treasure_map.lib.query import get_sink_provenance as _get_sink_provenance
 from treasure_map.lib.query import get_string_keyed_edges as _get_string_keyed_edges
 from treasure_map.lib.query import ledger as _ledger
 from treasure_map.lib.query import list_cve_patterns as _list_cve_patterns
-from treasure_map.lib.query import list_moat as _list_moat
 from treasure_map.lib.query import list_runs as _list_runs
+from treasure_map.lib.query import list_verified_exploits as _list_verified_exploits
 from treasure_map.lib.query import only_refusal as _only_refusal
 from treasure_map.lib.query import parse_impact_order as _parse_impact_order
 from treasure_map.lib.query import runs_where_function_exists as _runs_where_function_exists
@@ -1285,7 +1285,7 @@ def make_tools(
         }
 
     def mark_exploited(evidence_ref: str, pattern: str, exploit_note: str) -> dict[str, Any]:
-        """Record ONE hole you PROVED reachable into the private exploited-hole ledger — the
+        """Record ONE candidate you PROVED exploitable into the private exploit records — the
         proof-bar write tool (the fact tools are read-only; annotate writes the overlay).
 
         The admission bar is EXPLOITED: ``exploit_note`` must carry the proof (how it triggers, the
@@ -1338,7 +1338,7 @@ def make_tools(
             "id": new_id,
             "evidence_ref": evidence_ref.strip(),
             "atlas": str(atlas_path),
-            "note": "recorded into the private exploited-hole ledger. The tool checked the proof "
+            "note": "recorded into the private exploit records. The tool checked the proof "
             "field is non-blank, NOT that the exploit is real — that is your judgement.",
         }
         if resolved_label is not None:
@@ -1347,8 +1347,8 @@ def make_tools(
             result["warning"] = warning
         return result
 
-    def list_moat(reveal: bool = False) -> dict[str, Any]:
-        """The private exploited-hole ledger: ``holes`` (barrier depth = distinct candidates) +
+    def list_verified_exploits(reveal: bool = False) -> dict[str, Any]:
+        """The private exploit records: ``distinct_exploits`` (distinct candidates) +
         ``records`` (rows). Each entry carries its pattern + a has_exploit_evidence flag; the full
         ``exploit_note`` (the closest thing to an exploit method) is WITHHELD unless reveal=True.
 
@@ -1357,17 +1357,17 @@ def make_tools(
         leave the system' holds for the DEFAULT path only — on reveal it rides your own care."""
         atlas = open_atlas(atlas_path)
         try:
-            result = _list_moat(atlas, reveal=reveal)
+            result = _list_verified_exploits(atlas, reveal=reveal)
         finally:
             atlas.close()
         result["note"] = _DERIVED_SIGNAL_NOTE
         return result
 
     def list_cve_patterns(cve_id: str | None = None, sink: str | None = None) -> dict[str, Any]:
-        """The public-CVE exploit-form list (front-stage material, NOT counted in barrier depth).
+        """The public-CVE exploit-form list (public material, NOT counted in ``distinct_exploits``).
 
         Filter by exact ``cve_id`` and/or a ``sink`` substring — deterministic lookup, no fuzzy
-        match. Public data — separate table from the private exploited-hole ledger."""
+        match. Public data — a separate table from the private exploit records."""
         atlas = open_atlas(atlas_path)
         try:
             result = _list_cve_patterns(atlas, cve_id=cve_id, sink=sink)
@@ -1377,7 +1377,7 @@ def make_tools(
         return result
 
     def import_cve_patterns(patterns: list[dict[str, Any]]) -> dict[str, Any]:
-        """Idempotent import of public-CVE exploit forms into the public (front-stage) table.
+        """Idempotent import of public-CVE exploit forms into the public table.
 
         Each item is a dict with ``pattern`` (required) + optional ``cve_id`` / ``source`` /
         ``sink`` / ``ref`` / ``notes``. A row whose (cve_id, pattern, source, sink) already exists
@@ -1528,7 +1528,7 @@ def make_tools(
         "list_overlays": list_overlays,
         "clear_overlay": clear_overlay,
         "mark_exploited": mark_exploited,
-        "list_moat": list_moat,
+        "list_verified_exploits": list_verified_exploits,
         "list_cve_patterns": list_cve_patterns,
         "import_cve_patterns": import_cve_patterns,
         "legal_notice": legal_notice,

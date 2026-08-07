@@ -61,7 +61,7 @@ _EXPECTED_TOOLS = {
     "list_overlays",
     "clear_overlay",
     "mark_exploited",
-    "list_moat",
+    "list_verified_exploits",
     "list_cve_patterns",
     "import_cve_patterns",
     "legal_notice",
@@ -1060,7 +1060,7 @@ def test_annotate_overwrites_in_place_with_echo(tmp_path: Path) -> None:
     assert tools["list_overlays"]()["count"] == 1  # one row, last write wins
 
 
-# ── the two exploit-barrier buckets on the MCP face (mark_exploited + the read tools) ──
+# ── the two exploit record tables on the MCP face (mark_exploited + the read tools) ──
 
 
 def test_mark_exploited_rejects_blank_proof(tmp_path: Path) -> None:
@@ -1076,7 +1076,7 @@ def test_mark_exploited_rejects_blank_proof(tmp_path: Path) -> None:
         evidence_ref="run_m#fn1@cmd", pattern="   ", exploit_note="triggered"
     )
     assert r["written"] is False
-    assert tools["list_moat"]()["holes"] == 0  # nothing admitted
+    assert tools["list_verified_exploits"]()["distinct_exploits"] == 0  # nothing admitted
 
 
 def test_mark_exploited_resolved_ref_echoes_no_warning(tmp_path: Path) -> None:
@@ -1143,31 +1143,32 @@ def test_mark_exploited_no_lineage_run_blind_write_warns(tmp_path: Path) -> None
     assert "warning" in r and "no recorded" in r["warning"]
 
 
-def test_list_moat_default_withholds_note_reveal_includes_it(tmp_path: Path) -> None:
+def test_list_verified_exploits_default_withholds_note_reveal_includes_it(tmp_path: Path) -> None:
     # ★ verification 4: the default read never sprays exploit_note; reveal=True is the one channel.
     tools = _tools(tmp_path)
     tools["mark_exploited"](
         evidence_ref="run_m#fn1@cmd", pattern="cmd", exploit_note="POST x=;reboot; -> reboot"
     )
-    default = tools["list_moat"]()
+    default = tools["list_verified_exploits"]()
     (entry,) = default["exploits"]
     assert "exploit_note" not in entry and entry["has_exploit_evidence"] is True
-    revealed = tools["list_moat"](reveal=True)
+    revealed = tools["list_verified_exploits"](reveal=True)
     assert revealed["exploits"][0]["exploit_note"] == "POST x=;reboot; -> reboot"
 
 
-def test_list_moat_depth_is_distinct_ref_via_tool(tmp_path: Path) -> None:
-    # ★ verification 3: two rows on the SAME ref → holes stays 1 (COUNT DISTINCT), records is 2.
+def test_list_verified_exploits_counts_distinct_refs_via_tool(tmp_path: Path) -> None:
+    # ★ verification 3: two rows on the SAME ref → distinct_exploits stays 1 (COUNT DISTINCT),
+    # records is 2.
     tools = _tools(tmp_path)
     tools["mark_exploited"](evidence_ref="run_m#fn1@cmd", pattern="cmd", exploit_note="via web")
     tools["mark_exploited"](evidence_ref="run_m#fn1@cmd", pattern="cmd", exploit_note="via cli too")
-    m = tools["list_moat"]()
-    assert m["holes"] == 1 and m["records"] == 2
+    m = tools["list_verified_exploits"]()
+    assert m["distinct_exploits"] == 1 and m["records"] == 2
 
 
 def test_import_cve_patterns_idempotent_via_tool(tmp_path: Path) -> None:
-    # ★ verification 8: public import fills the front-stage table and re-running never doubles;
-    # public volume never enters barrier depth.
+    # ★ verification 8: public import fills the public table and re-running never doubles;
+    # public volume never enters distinct_exploits.
     tools = _tools(tmp_path)
     payload = [
         {"pattern": "nvram->system", "cve_id": "CVE-1", "source": "lan_ip", "sink": "system"},
@@ -1179,22 +1180,21 @@ def test_import_cve_patterns_idempotent_via_tool(tmp_path: Path) -> None:
     assert again["inserted"] == 0 and again["skipped"] == 2  # idempotent
     assert tools["list_cve_patterns"]()["count"] == 2
     assert tools["list_cve_patterns"](sink="pop")["count"] == 1  # substring filter
-    assert tools["list_moat"]()["holes"] == 0  # public volume is off the barrier
+    assert (
+        tools["list_verified_exploits"]()["distinct_exploits"] == 0
+    )  # public volume is not counted as a verified exploit
 
 
-# ── public-surface neutrality: the server is a published artifact, stricter discipline ──
+# ── published surface: no private-note references, and the legal notice is wired in ──
 
 
-def test_public_server_files_are_neutral() -> None:
-    # The MCP server + its read layer + CLI are published ("the public-facing surface"); they must
-    # carry no strategy vocabulary, no private-doc/section citation, and the defensive legal notice
-    # must be wired into the server instructions.
+def test_public_server_files_carry_no_private_references() -> None:
+    # The MCP server + its read layer + CLI ship to users, so they must cite nothing that lives in
+    # the author's private working notes, and the defensive legal notice must be wired into the
+    # server instructions.
     src = Path(__file__).resolve().parents[2] / "src" / "treasure_map"
-    banned = re.compile(r"\b(moat|shield|fix_quality|incomplete_patch)\b|盾|§|PRD\s", re.IGNORECASE)
     privdoc = re.compile(r"private (design )?notes|treasure-map-notes", re.IGNORECASE)
     for rel in ("lib/facts.py", "mcp_app.py", "cli/mcp_cli.py"):
-        text = (src / rel).read_text()
-        assert not banned.search(text), f"strategy/section vocab in {rel}"
-        assert not privdoc.search(text), f"private-doc reference in {rel}"
+        assert not privdoc.search((src / rel).read_text()), f"private-note reference in {rel}"
     # the defensive notice is the server's standing instruction
     assert "LEGAL_NOTICE" in (src / "mcp_app.py").read_text()

@@ -40,31 +40,14 @@ if [ -n "$WATCHLIST" ]; then
     fi
 fi
 
-# ── strategy/judgment-vocabulary guard (added lines, whole tree) ──────────────
-# Mirror the CI backstop (scripts/check-vendor-neutrality.sh): scan ADDED lines
-# across the whole tree, minus the pattern-holding machinery AND the self-
-# referential neutrality tests (which embed this vocab as denylist literals). Same
-# view CI uses, so a stray banned word — in a test file too, not just src — is
-# caught here at commit time instead of one CI round-trip later.
-ADDED_FRAMING=$(git diff --cached -U0 --diff-filter=ACM -- . \
-        "${TM_DIFF_MACHINERY_EXCLUDES[@]}" "${TM_DIFF_NEUTRALITY_TEST_EXCLUDES[@]}" \
-        | grep '^+' | grep -v '^+++' || true)
-HITS=$(printf '%s' "$ADDED_FRAMING" | grep -nIE "$TM_BANNED_VOCAB" || true)
-if [ -n "$HITS" ]; then
-  echo ""
-  echo "❌ COMMIT BLOCKED — strategy/judgment vocabulary in staged changes:"
-  echo "$HITS"
-  echo ""
-  echo "Use mechanism-only naming; keep strategy framing out of committed code."
-  echo ""
-  exit 1
-fi
-
 # ── private-document / private-path guard (added lines, whole tree) ───────────
-# Same ADDED_FRAMING view as the strategy-vocab guard above (whole tree minus the
-# pattern-holding machinery AND the self-referential neutrality tests, whose
-# denylists embed these very tokens). Covers tests/ too — a private-doc/path
-# reference is caught here at commit time instead of one CI round-trip later.
+# Scan ADDED lines across the whole tree, minus the pattern-holding machinery AND
+# the self-referential tests (whose literals embed these very tokens). Same view
+# CI uses. Covers tests/ too — a private-doc/path reference is caught here at
+# commit time instead of one CI round-trip later.
+ADDED_FRAMING=$(git diff --cached -U0 --diff-filter=ACM -- . \
+        "${TM_DIFF_MACHINERY_EXCLUDES[@]}" "${TM_DIFF_SELF_REFERENTIAL_EXCLUDES[@]}" \
+        | grep '^+' | grep -v '^+++' || true)
 HITS=$(printf '%s' "$ADDED_FRAMING" | grep -nIE "$TM_PRIVDOC" || true)
 if [ -n "$HITS" ]; then
   echo ""

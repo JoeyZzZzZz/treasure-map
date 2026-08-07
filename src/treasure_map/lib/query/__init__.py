@@ -8,7 +8,7 @@ nothing here scores, ranks, or judges.
 
 from __future__ import annotations
 
-from treasure_map.lib.query.exploit_ledger import list_cve_patterns, list_moat
+from treasure_map.lib.query.exploit_ledger import list_cve_patterns, list_verified_exploits
 from treasure_map.lib.query.nvram import get_nvram_key_flow
 from treasure_map.lib.query.overlay_view import apply_overlay_view, overlay_band
 from treasure_map.lib.query.runs import (
@@ -90,7 +90,7 @@ __all__ = [
     "impact_tier",
     "ledger",
     "list_cve_patterns",
-    "list_moat",
+    "list_verified_exploits",
     "list_runs",
     "only_refusal",
     "overlay_band",

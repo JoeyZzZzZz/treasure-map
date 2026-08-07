@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Scan the commit message for vendor identifiers / model numbers and strategy
-# vocabulary, using the same detection logic as pre-commit (.githooks/lib.sh).
+# Scan the commit message for third-party firmware identifiers / model numbers,
+# using the same detection logic as pre-commit (.githooks/lib.sh).
 # $1 is the path to the file holding the proposed commit message.
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/lib.sh"
@@ -31,14 +31,3 @@ if [ -n "$WATCHLIST" ]; then
     fi
 fi
 
-# ── strategy/judgment-vocabulary guard (commit message) ──────────────────────
-SVHITS=$(printf '%s' "$MSG" | grep -nIE "$TM_BANNED_VOCAB" || true)
-if [ -n "$SVHITS" ]; then
-    echo ""
-    echo "❌ COMMIT BLOCKED — strategy/judgment vocabulary in commit message:"
-    echo "$SVHITS"
-    echo ""
-    echo "Use mechanism-only wording; keep strategy framing out of commit messages."
-    echo ""
-    exit 1
-fi

@@ -1339,7 +1339,7 @@ def test_stored_judgement_keeps_its_anchor_across_a_rescan(tmp_path: Path) -> No
     # Record one against a candidate, re-scan, and it must still resolve to that same live candidate
     # (spec acceptance 3). Under the old func_id ref this silently went dangling on every re-scan.
     from treasure_map.lib.atlas.writer import add_private_exploit
-    from treasure_map.lib.query.exploit_ledger import list_moat
+    from treasure_map.lib.query.exploit_ledger import list_verified_exploits
 
     fw = _rc_dispatch_fw()
     db = _make_db(tmp_path, fw)
@@ -1356,14 +1356,16 @@ def test_stored_judgement_keeps_its_anchor_across_a_rescan(tmp_path: Path) -> No
 
     conn = open_atlas(atlas_p)
     try:
-        moat = list_moat(conn)
+        verified = list_verified_exploits(conn)
         # the record still anchors a LIVE candidate — it did not go dangling
         still_anchored = conn.execute(
             "SELECT COUNT(*) FROM instance WHERE evidence_ref = ?", (ref,)
         ).fetchone()[0]
     finally:
         conn.close()
-    assert moat["holes"] == 1, "the stored judgement lost its anchor after a re-scan"
+    assert verified["distinct_exploits"] == 1, (
+        "the stored judgement lost its anchor after a re-scan"
+    )
     assert still_anchored == 1
     assert _ref_of(atlas_p, "FUN_000b32a0") == ref  # the candidate still carries the same ref
 
@@ -2693,9 +2695,9 @@ def test_path_sink_is_additive_no_regression(tmp_path: Path) -> None:
 
 def test_a2_sources_are_boundary_clean() -> None:
     # The neutral A2 + aggregation layer carries no offensive/judgement framing and no section /
-    # private-doc refs. The private exploited-hole ledger (exploit_ledger.py + its private_exploit /
+    # private-doc refs. The private exploit records (exploit_ledger.py + its private_exploit /
     # exploit_note storage in the schema) is the ONE sanctioned non-neutral store the
-    # exploit-barrier ledger feature adds: the domain term "exploit" is permitted THERE only. Every
+    # exploit-record feature adds: the domain term "exploit" is permitted THERE only. Every
     # harder framing word stays banned across the whole layer — including the ledger and the schema
     # — so the carve-out is
     # exactly one word, exactly two surfaces.
@@ -2713,7 +2715,7 @@ def test_a2_sources_are_boundary_clean() -> None:
         text = path.read_text()
         assert not hard.search(text), f"offensive framing in {path.name}"
         assert not section_ref.search(text), f"section/private-doc ref in {path.name}"
-        # the schema stores the exploit ledger (its whole barrier DDL block is "exploit" prose), so
+        # the schema stores the exploit ledger (that whole DDL block is "exploit" prose), so
         # the exploit-word check applies to the neutral files only, never the two sanctioned
         # surfaces.
         if path.name not in exploit_exempt and path.name != _ATLAS_SCHEMA.name:

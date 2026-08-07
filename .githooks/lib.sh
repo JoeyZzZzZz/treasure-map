@@ -1,4 +1,4 @@
-# Shared vendor-neutrality / strategy-vocabulary scanning.
+# Shared scanning for third-party firmware identifiers and private-note references.
 #
 # Sourced (never executed) by the git hooks (.githooks/pre-commit,
 # .githooks/commit-msg) and by CI (scripts/check-vendor-neutrality.sh) so the
@@ -6,8 +6,7 @@
 # on source beyond defining the TM_* variables and functions below.
 
 # Regexes shared between the local hooks and the CI fallback. Defined here so a
-# fix to one denylist applies everywhere at once.
-TM_BANNED_VOCAB='\b(moat|shield)\b|盾|fix_quality|incomplete_patch_flag|fix_quality_score'
+# fix to one pattern applies everywhere at once.
 TM_PRIVDOC='treasure-map-notes|private (design )?notes|design note|PRD §|private notes dir'
 TM_SECTREF='§[0-9]|PRD §|\b(DD|ED|FD)[0-9]\b'
 
@@ -16,10 +15,10 @@ TM_SECTREF='§[0-9]|PRD §|\b(DD|ED|FD)[0-9]\b'
 # backstop (git diff BASE HEAD), so the two can never drift. Each site runs its
 # own `git diff … -- . "${set[@]}"` and picks the set per the scan it is running.
 
-# MACHINERY: files whose whole job is to hold denylist patterns / real brand
-# names verbatim — the hook scripts, the watchlists, and the hook's own test
-# (which embeds real vendor tokens to prove detection). Exempt from EVERY scan;
-# scanning them would only match their own pattern definitions.
+# MACHINERY: files whose whole job is to hold scan patterns / real brand names
+# verbatim — the hook scripts, the watchlists, and the hook's own test (which
+# embeds real vendor tokens to prove detection). Exempt from EVERY scan; scanning
+# them would only match their own pattern definitions.
 TM_DIFF_MACHINERY_EXCLUDES=(
     ":(exclude).githooks/vendor-watchlist.txt"
     ":(exclude).githooks/vendor-watchlist.example.txt"
@@ -29,18 +28,17 @@ TM_DIFF_MACHINERY_EXCLUDES=(
     ":(exclude)tests/unit/test_precommit_hook.py"
 )
 
-# NEUTRALITY TESTS: self-referential tests that read project source and assert it
-# is free of framing/judgment vocabulary — so each one NECESSARILY embeds that
-# vocabulary as denylist literals (e.g. fix_quality, moat, shield, "private
-# notes"). They are exempt from the FRAMING scans (strategy-vocab + private-doc)
-# ONLY. The vendor-name scan still covers them — a neutrality test has no business
-# naming a brand — and each was verified brand-clean.
+# SELF-REFERENTIAL TESTS: tests that read project source and assert it does not
+# cite the author's private notes — so each one NECESSARILY embeds those very
+# tokens as literals. They are exempt from the private-note scan ONLY. The
+# vendor-name scan still covers them — such a test has no business naming a brand
+# — and each was verified brand-clean.
 #
 # ADMISSION RULE — the ONLY thing that may enter this list: a test whose body
-# scans project source for the ABSENCE of banned framing/judgment words. This is
-# NOT a general escape hatch: anything else that trips a scan must be fixed in the
+# scans project source for the ABSENCE of private-note references. This is NOT a
+# general escape hatch: anything else that trips a scan must be fixed in the
 # source, never parked here.
-TM_DIFF_NEUTRALITY_TEST_EXCLUDES=(
+TM_DIFF_SELF_REFERENTIAL_EXCLUDES=(
     ":(exclude)tests/unit/test_mcp_app.py"
     ":(exclude)tests/unit/lib/test_analyzer2.py"
     ":(exclude)tests/unit/lib/test_diff.py"

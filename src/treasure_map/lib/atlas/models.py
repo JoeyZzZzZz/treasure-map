@@ -140,12 +140,12 @@ class NvramDefaultRow:
 
 @dataclass(frozen=True)
 class PublicCvePatternRow:
-    """Mirrors one public_cve_pattern row: a public-CVE exploit form (front-stage material).
+    """Mirrors one public_cve_pattern row: a public-CVE exploit form (public material).
 
-    Agent-fillable, not sensitive, and NOT counted in barrier depth. ``pattern``/``source``/``sink``
-    are free text — no structured match key is presumed. Physically separate from the private
-    exploited-hole ledger. ``origin`` marks the row as externally imported (not tmap deterministic
-    extraction) — always 'external_import'."""
+    Agent-fillable, not sensitive, and NOT counted in ``distinct_exploits``.
+    ``pattern``/``source``/``sink`` are free text — no structured match key is presumed. Physically
+    separate from the private verified-exploit records. ``origin`` marks the row as externally
+    imported (not tmap deterministic extraction) — always 'external_import'."""
 
     pattern: str
     cve_id: str | None = None

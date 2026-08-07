@@ -494,7 +494,7 @@ def add_private_exploit(
     attributed_to: str | None = None,
     commit: bool = True,
 ) -> int:
-    """Append one exploited-hole record (admission bar = EXPLOITED); return the row id.
+    """Append one verified-exploit record (admission bar = EXPLOITED); return the row id.
 
     Storage-side guard for the bar: ``evidence_ref`` / ``pattern`` / ``exploit_note`` must be
     non-blank after stripping (SQLite's NOT NULL only blocks NULL, letting ''/'   ' through — the
@@ -536,7 +536,7 @@ def add_public_cve_patterns(
     """Idempotent import of public-CVE exploit forms; return {inserted, skipped}.
 
     A row whose ``(cve_id, pattern, source, sink)`` already exists is SKIPPED, so re-running the
-    same import never silently doubles the rows (which would not inflate barrier depth — that counts
+    same import never silently doubles the rows (which would not inflate the distinct count — that
     private only — but would pollute the public listing). ``pattern`` must be non-blank."""
     inserted = skipped = 0
     for r in rows:

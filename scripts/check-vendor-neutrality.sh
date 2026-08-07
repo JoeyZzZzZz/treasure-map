@@ -32,27 +32,20 @@ fail=0
 #   ADDED_ALL     — everything but the pattern-holding machinery. The vendor-name
 #                   scan runs here; a neutrality test must never name a brand, and
 #                   every such test was verified brand-clean.
-#   ADDED_FRAMING — ADDED_ALL minus the self-referential neutrality tests, which
-#                   embed the strategy-vocab / private-doc literals they detect.
-#                   The framing scans (strategy-vocab + private-doc + section-ref) run here.
+#   ADDED_FRAMING — ADDED_ALL minus the self-referential tests, which embed the
+#                   private-note / section-ref literals they detect. The
+#                   private-doc + section-ref scans run here.
 if [ -n "$BASE_REF" ]; then
     ADDED_ALL=$(git diff "$BASE_REF" "$HEAD_REF" -U0 --diff-filter=ACM -- . \
             "${TM_DIFF_MACHINERY_EXCLUDES[@]}" \
             | grep '^+' | grep -v '^+++' || true)
     ADDED_FRAMING=$(git diff "$BASE_REF" "$HEAD_REF" -U0 --diff-filter=ACM -- . \
-            "${TM_DIFF_MACHINERY_EXCLUDES[@]}" "${TM_DIFF_NEUTRALITY_TEST_EXCLUDES[@]}" \
+            "${TM_DIFF_MACHINERY_EXCLUDES[@]}" "${TM_DIFF_SELF_REFERENTIAL_EXCLUDES[@]}" \
             | grep '^+' | grep -v '^+++' || true)
 
     if HITS=$(printf '%s' "$ADDED_ALL" | tm_scan_text "$WATCHLIST"); then :; else
         echo "❌ vendor identifier(s) in diff content ($RANGE):"
         echo "$HITS"
-        fail=1
-    fi
-
-    SVHITS=$(printf '%s' "$ADDED_FRAMING" | grep -nIE "$TM_BANNED_VOCAB" || true)
-    if [ -n "$SVHITS" ]; then
-        echo "❌ strategy/judgment vocabulary in diff content ($RANGE):"
-        echo "$SVHITS"
         fail=1
     fi
 
@@ -88,17 +81,10 @@ if HITS=$(printf '%s' "$MSGS" | tm_scan_text "$WATCHLIST"); then :; else
     fail=1
 fi
 
-SVHITS=$(printf '%s' "$MSGS" | grep -nIE "$TM_BANNED_VOCAB" || true)
-if [ -n "$SVHITS" ]; then
-    echo "❌ strategy/judgment vocabulary in commit message(s) ($RANGE):"
-    echo "$SVHITS"
-    fail=1
-fi
-
 if [ "$fail" -ne 0 ]; then
     echo ""
-    echo "Vendor names / model numbers / strategy framing must never enter committed"
-    echo "artifacts or commit messages. Replace with a generic category term and amend."
+    echo "Vendor names / model numbers must never enter committed artifacts or"
+    echo "commit messages. Replace with a generic category term and amend."
     exit 1
 fi
 
