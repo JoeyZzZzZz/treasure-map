@@ -7,6 +7,7 @@ import logging
 import click
 
 from treasure_map.cli.analyze_cli import analyze
+from treasure_map.cli.exploit_cli import exploit
 from treasure_map.cli.hunt_cli import atlas_view, hunt_diff, hunt_pattern, runs, scan, triage
 from treasure_map.cli.init_cli import init
 from treasure_map.cli.mcp_cli import fact, mcp_serve
@@ -31,7 +32,7 @@ class _AliasGroup(click.Group):
     # (section title, ordered command names). A person drives the Main group; an agent over MCP is
     # the recommended way to do the analysis itself; Advanced is manual inspection / single-stage.
     _GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
-        ("Main", ("init", "scan", "diff", "runs")),
+        ("Main", ("init", "scan", "diff", "runs", "exploit")),
         ("Analysis (recommended)", ("mcp",)),
         (
             "Advanced (inspect results yourself / re-run a single step)",
@@ -88,6 +89,7 @@ main.add_command(runs)
 main.add_command(atlas_view)
 main.add_command(fact)
 main.add_command(mcp_serve)
+main.add_command(exploit)
 
 if __name__ == "__main__":
     main()

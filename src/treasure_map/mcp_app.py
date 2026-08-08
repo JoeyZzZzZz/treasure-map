@@ -37,7 +37,6 @@ from mcp.server.fastmcp import FastMCP
 from treasure_map.lib import facts
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import PublicCvePatternRow, RunRow
-from treasure_map.lib.atlas.writer import add_private_exploit as _add_private_exploit
 from treasure_map.lib.atlas.writer import add_public_cve_patterns as _add_public_cve_patterns
 from treasure_map.lib.errors import ConfigError
 from treasure_map.lib.notice import LEGAL_NOTICE
@@ -1284,69 +1283,6 @@ def make_tools(
             "runs": [asdict(r) for r in runs],
         }
 
-    def mark_exploited(evidence_ref: str, pattern: str, exploit_note: str) -> dict[str, Any]:
-        """Record ONE candidate you PROVED exploitable into the private exploit records — the
-        proof-bar write tool (the fact tools are read-only; annotate writes the overlay).
-
-        The admission bar is EXPLOITED: ``exploit_note`` must carry the proof (how it triggers, the
-        effect obtained, the guard bypassed). The tool rejects a blank/whitespace proof or pattern,
-        but it does NOT verify the exploit is real — that judgement is YOURS, never asserted here.
-        ``evidence_ref`` anchors the candidate (a stable handle that survives a re-scan). The ref is
-        resolved for the echo and INHERITS the no-lineage honesty: if it does not resolve, or points
-        at a run with no recorded analysis.db, the row is STILL written (recording before a scan is
-        allowed) but the result carries an explicit ``warning`` — a blind write is never silent."""
-        if not (evidence_ref and evidence_ref.strip()):
-            return {"written": False, "error": "evidence_ref must be non-blank."}
-        if not (pattern and pattern.strip()):
-            return {"written": False, "error": "pattern must be non-blank."}
-        if not (exploit_note and exploit_note.strip()):
-            return {
-                "written": False,
-                "error": "exploit_note must be non-blank — the bar is a PROVEN hole; record how it "
-                "triggers / the effect / the guard bypassed. (No proof, no write.)",
-            }
-        atlas = open_atlas(atlas_path)
-        try:
-            ref = _resolve_ref(atlas, evidence_ref)
-            resolved_label: str | None = None
-            warning: str | None = None
-            if ref is None:
-                warning = (
-                    f"evidence_ref '{evidence_ref}' is not in this atlas — BLIND WRITE "
-                    "(recording before the scan exists?). The row is written anyway."
-                )
-            else:
-                ref_run, ref_bin, ref_fn = ref
-                resolved_label = f"{ref_fn or '?'}@{ref_bin or '?'} (run {ref_run})"
-                run = _get_run(atlas, ref_run) if ref_run is not None else None
-                if run is None or not run.analysis_db_path:
-                    warning = (
-                        f"evidence_ref '{evidence_ref}' points at run '{ref_run}' with no recorded "
-                        "analysis.db (a pre-existing / un-scanned run) — BLIND WRITE. Row written."
-                    )
-            new_id = _add_private_exploit(
-                atlas,
-                evidence_ref=evidence_ref,
-                pattern=pattern,
-                exploit_note=exploit_note,
-                attributed_to=None,  # no clean operator identity here — NULL, never fabricated
-            )
-        finally:
-            atlas.close()
-        result: dict[str, Any] = {
-            "written": True,
-            "id": new_id,
-            "evidence_ref": evidence_ref.strip(),
-            "atlas": str(atlas_path),
-            "note": "recorded into the private exploit records. The tool checked the proof "
-            "field is non-blank, NOT that the exploit is real — that is your judgement.",
-        }
-        if resolved_label is not None:
-            result["resolved"] = resolved_label
-        if warning is not None:
-            result["warning"] = warning
-        return result
-
     def list_verified_exploits(reveal: bool = False) -> dict[str, Any]:
         """The private exploit records: ``distinct_exploits`` (distinct candidates) +
         ``records`` (rows). Each entry carries its pattern + a has_exploit_evidence flag; the full
@@ -1596,7 +1532,6 @@ def make_tools(
         "annotate": annotate,
         "list_overlays": list_overlays,
         "clear_overlay": clear_overlay,
-        "mark_exploited": mark_exploited,
         "list_verified_exploits": list_verified_exploits,
         "list_cve_patterns": list_cve_patterns,
         "import_cve_patterns": import_cve_patterns,

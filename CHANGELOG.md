@@ -7,7 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **`mark_exploited` is gone from the MCP surface — the exploit ledger is now written by people
+  only.** An entry in that ledger says someone proved a hole on a real device. An assistant cannot
+  reach a device, so it cannot testify to that, and a claim relayed through one is still a claim
+  nobody verified. Rather than gate the tool, the write path is removed: there is no agent-facing
+  way to add to the ledger at all. Reading is untouched — `list_verified_exploits` behaves exactly
+  as before, including withholding the proof text unless explicitly revealed.
+
 ### Added
+
+- **`tmap exploit add` / `tmap exploit rm` — the ledger's human write path.** `add` takes the
+  candidate, the shape, the proof, and `--operator`: a named person, required, recorded with the
+  entry (in the existing attribution column — no schema change). The admission bar is unchanged;
+  nothing here checks the proof is real, and it says so. A reference matching no candidate is
+  still written, with a warning naming both possibilities (a scan that does not exist yet, or a
+  typo) rather than deciding which. `rm` retracts ONE entry by id — the ledger is append-only
+  because corroboration accumulates, and this is the single sanctioned exception: scoped to one id,
+  never keyed on the reference (which several rows can share), and it prints the entry before
+  removing it. One consequence to know about: the finer "this run has no recorded analysis.db"
+  warning the old tool produced is not reproduced on the human path.
 
 - **A new top verdict, `exploitable`, for a candidate that is done being investigated.** Where
   `suspicious` means "worth digging into", `exploitable` means the digging finished and only

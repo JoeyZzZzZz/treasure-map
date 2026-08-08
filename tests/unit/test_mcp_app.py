@@ -60,7 +60,6 @@ _EXPECTED_TOOLS = {
     "annotate",
     "list_overlays",
     "clear_overlay",
-    "mark_exploited",
     "list_verified_exploits",
     "list_cve_patterns",
     "import_cve_patterns",
@@ -1060,94 +1059,39 @@ def test_annotate_overwrites_in_place_with_echo(tmp_path: Path) -> None:
     assert tools["list_overlays"]()["count"] == 1  # one row, last write wins
 
 
-# ── the two exploit record tables on the MCP face (mark_exploited + the read tools) ──
+# ── the two exploit record tables on the MCP face (READ tools only — writing is CLI-only) ──
 
 
-def test_mark_exploited_rejects_blank_proof(tmp_path: Path) -> None:
-    # ★ verification 2: the admission bar is EXPLOITED. A blank / whitespace proof (or pattern) is
-    # rejected at the tool layer — written:False, nothing lands in the ledger.
+def test_agent_cannot_write_the_exploit_ledger(tmp_path: Path) -> None:
+    # ★ The trust boundary: an entry here claims something was proved on a real device, and an
+    # assistant cannot reach one. So there is no agent-facing write path at all — not a gated one,
+    # not one that relays a person's summary. Reading stays available.
     tools = _tools(tmp_path)
-    for bad in ("", "   ", "\t"):
-        r = tools["mark_exploited"](
-            evidence_ref="run_m#fn1@cmd", pattern="cmd inj", exploit_note=bad
-        )
-        assert r["written"] is False and "error" in r
-    r = tools["mark_exploited"](
-        evidence_ref="run_m#fn1@cmd", pattern="   ", exploit_note="triggered"
-    )
-    assert r["written"] is False
-    assert tools["list_verified_exploits"]()["distinct_exploits"] == 0  # nothing admitted
+    assert "mark_exploited" not in tools
+    # The ledger's only remaining tool is the read one. `import_cve_patterns` fills the PUBLIC
+    # CVE-form table — reference material anyone may add, and a different table entirely.
+    assert {n for n in tools if "exploit" in n} == {"list_verified_exploits"}
 
 
-def test_mark_exploited_resolved_ref_echoes_no_warning(tmp_path: Path) -> None:
-    # ★ verification 5 (state 1/3): a ref that anchors a real candidate in a scanned run → written,
-    # a `resolved` label, and NO warning (the write is not blind).
-    tools = _tools(tmp_path)
-    r = tools["mark_exploited"](
-        evidence_ref="run_m#fn1@cmd", pattern="cmd inj", exploit_note="POST /x.cgi -> system()"
-    )
-    assert r["written"] is True and "id" in r
-    assert "handle_req" in r["resolved"] and "run_m" in r["resolved"]
-    assert "warning" not in r
+def _seed_ledger(tmp_path: Path, **kw: str) -> None:
+    """Put one row in the ledger the way a person would — through the writer, not a tool."""
+    from treasure_map.lib.atlas.writer import add_private_exploit
 
-
-def test_mark_exploited_ref_not_in_atlas_blind_write_warns(tmp_path: Path) -> None:
-    # ★ verification 5 (state 2/3): a ref that anchors NOTHING in the atlas → STILL written
-    # (recording before the scan is allowed), but the result carries a BLIND WRITE warning.
-    tools = _tools(tmp_path)
-    r = tools["mark_exploited"](
-        evidence_ref="ghost#nope", pattern="cmd inj", exploit_note="proved by hand"
-    )
-    assert r["written"] is True
-    assert "warning" in r and "BLIND WRITE" in r["warning"]
-    assert "resolved" not in r  # nothing to resolve to
-
-
-def test_mark_exploited_no_lineage_run_blind_write_warns(tmp_path: Path) -> None:
-    # ★ verification 5 (state 3/3): the ref DOES anchor a candidate, but its run has no recorded
-    # analysis.db (a pre-existing / un-scanned run) → written, with a warning that inherits the
-    # no-lineage honesty (a run we cannot re-open must not read as a clean write).
-    atlas = _mk_atlas(tmp_path)
-    conn = open_atlas(atlas)
-    pid = upsert_pattern(
-        conn,
-        source_class="external_input",
-        sink_class="cmd",
-        call_sequence_shape="source->cmd",
-        structural_fingerprint="fp_ghost",
-        fingerprint_algo_version="callseq-v1",
-    )
-    add_instance(
-        conn,
-        InstanceRow(
-            pattern_id=pid,
-            pseudocode_hash="hg",
-            source_anchor="ghost_fn",
-            sink_anchor="do_x",
-            source_run_id="ghost_run",  # an instance whose run row is never begin_run'd
-            reachability_status="unknown",
-            blocking_mechanism=None,
-            provenance_level="L0",
-            evidence_ref="ghost_run#fn@cmd",
-            scope_origin="intra",
-            origin="custom",
-            binary_path="usr/sbin/ghostd",
-        ),
-    )
-    conn.close()
-    tools = mcp_app.make_tools(atlas)
-    r = tools["mark_exploited"](
-        evidence_ref="ghost_run#fn@cmd", pattern="cmd inj", exploit_note="proved"
-    )
-    assert r["written"] is True
-    assert "warning" in r and "no recorded" in r["warning"]
+    conn = open_atlas(tmp_path / "atlas.db")
+    try:
+        add_private_exploit(conn, **kw)  # type: ignore[arg-type]
+    finally:
+        conn.close()
 
 
 def test_list_verified_exploits_default_withholds_note_reveal_includes_it(tmp_path: Path) -> None:
     # ★ verification 4: the default read never sprays exploit_note; reveal=True is the one channel.
     tools = _tools(tmp_path)
-    tools["mark_exploited"](
-        evidence_ref="run_m#fn1@cmd", pattern="cmd", exploit_note="POST x=;reboot; -> reboot"
+    _seed_ledger(
+        tmp_path,
+        evidence_ref="run_m#fn1@cmd",
+        pattern="cmd",
+        exploit_note="POST x=;reboot; -> reboot",
     )
     default = tools["list_verified_exploits"]()
     (entry,) = default["exploits"]
@@ -1160,8 +1104,8 @@ def test_list_verified_exploits_counts_distinct_refs_via_tool(tmp_path: Path) ->
     # ★ verification 3: two rows on the SAME ref → distinct_exploits stays 1 (COUNT DISTINCT),
     # records is 2.
     tools = _tools(tmp_path)
-    tools["mark_exploited"](evidence_ref="run_m#fn1@cmd", pattern="cmd", exploit_note="via web")
-    tools["mark_exploited"](evidence_ref="run_m#fn1@cmd", pattern="cmd", exploit_note="via cli too")
+    _seed_ledger(tmp_path, evidence_ref="run_m#fn1@cmd", pattern="cmd", exploit_note="via web")
+    _seed_ledger(tmp_path, evidence_ref="run_m#fn1@cmd", pattern="cmd", exploit_note="via cli too")
     m = tools["list_verified_exploits"]()
     assert m["distinct_exploits"] == 1 and m["records"] == 2
 

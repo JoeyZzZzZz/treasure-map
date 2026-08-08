@@ -730,6 +730,11 @@ def test_static_no_unscoped_wipe_in_atlas() -> None:
         "DELETE FROM diff_meta WHERE diff_id = ?",
         "DELETE FROM dimension_delta WHERE diff_id = ?",
         "DELETE FROM dimension_capability_state WHERE diff_id = ?",
+        # A named operator retracting ONE ledger entry. This is not a replace-refresh like the rest
+        # of this list, and the widening is deliberate: the ledger is append-only, and a mistaken
+        # entry needs a way out. It stays inside what the guard actually protects — it is scoped to
+        # a single id, so it can never become the cross-run wipe this check exists to stop.
+        "DELETE FROM private_exploit WHERE id = ?",
     )
     for py_file in _ATLAS_SRC.glob("*.py"):
         text = py_file.read_text()

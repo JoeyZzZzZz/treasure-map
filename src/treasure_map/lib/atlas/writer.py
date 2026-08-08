@@ -530,6 +530,22 @@ def add_private_exploit(
     return int(cur.lastrowid)  # type: ignore[arg-type]
 
 
+def delete_private_exploit(conn: sqlite3.Connection, *, id: int, commit: bool = True) -> int:  # noqa: A002
+    """Remove ONE ledger row by its stable row id — a named operator retracting an entry.
+
+    This table is append-only by design, because corroboration accumulates and nothing here should
+    quietly disappear. Retracting a mistaken entry is the one sanctioned exception, and it is
+    scoped to a single id: never a table-wide wipe, and never keyed on evidence_ref (one ref can
+    carry several rows, so that would take out corroboration nobody asked to remove).
+
+    Returns the number of rows removed — 0 when no such id, which the caller should report rather
+    than treat as success."""
+    cur = conn.execute("DELETE FROM private_exploit WHERE id = ?", (id,))
+    if commit:
+        conn.commit()
+    return int(cur.rowcount)
+
+
 def add_public_cve_patterns(
     conn: sqlite3.Connection, rows: list[PublicCvePatternRow], *, commit: bool = True
 ) -> dict[str, int]:

@@ -21,6 +21,7 @@ from treasure_map.lib.atlas.writer import (
     add_private_exploit,
     add_public_cve_patterns,
     begin_run,
+    delete_private_exploit,
     finish_run,
     upsert_pattern,
 )
@@ -36,6 +37,7 @@ __all__ = [
     "add_private_exploit",
     "add_public_cve_patterns",
     "begin_run",
+    "delete_private_exploit",
     "finish_run",
     "open_atlas",
     "upsert_pattern",
