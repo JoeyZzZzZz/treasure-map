@@ -1068,6 +1068,7 @@ def test_rebuilt_overlay_keeps_every_other_constraint(tmp_path: Path) -> None:
             "rationale",
             "attributed_to",
             "basis_state",
+            "verdict_basis",
             "created_at",
             "updated_at",
         }

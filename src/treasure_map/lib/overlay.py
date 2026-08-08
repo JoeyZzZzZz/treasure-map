@@ -27,6 +27,7 @@ Two things keep the layer honest:
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from dataclasses import dataclass
 from typing import Any
@@ -42,12 +43,18 @@ from treasure_map.lib.errors import ConfigError
 #
 # The vocabulary can change freely now that no database constraint pins it, so anything reading a
 # verdict must tolerate one it does not know: an older database can still hold a retired word.
-_VERDICTS = ("inconclusive", "suspicious", "excluded", "safe")
+#
+# ``exploitable`` is a tier above ``suspicious``: the digging is finished and only real-machine
+# confirmation is left. Its display bias is +1 like any float verdict — what puts it ABOVE
+# suspicious is its own ordering band in the view layer, deliberately kept separate from this
+# number, which nothing sorts by.
+_VERDICTS = ("inconclusive", "suspicious", "excluded", "safe", "exploitable")
 _VERDICT_BIAS = {
     "inconclusive": 0,
     "suspicious": 1,
     "excluded": -1,
     "safe": -1,
+    "exploitable": 1,
 }
 # Coarse attribution only. NULL means "not recorded"; a fabricated identity is never written (the
 # schema CHECK enforces this set). A real identity matters only at a later promotion boundary.
@@ -105,6 +112,95 @@ class Basis:
             pseudocode_known=bool(d.get("pseudocode_known")),
             siblings=frozenset(tuple(s) for s in d.get("siblings", [])),
         )
+
+
+# A "does this look like it names code" probe for an exploit chain. Deliberately shallow: the
+# snake_case arm matches ANY word containing an underscore, and technical prose is full of those, so
+# a chain with no real anchor usually still passes. It is not a filter and must not be read as one —
+# it shapes what gets written and nudges toward citing code, and it only stops prose carrying no
+# symbol-shaped token at all. Tightening it is not currently possible either: real chains cite bare
+# snake_case function names with no 0x/FUN_ prefix, and nothing mechanical separates those from an
+# ordinary underscored word. If this verdict is ever made mandatory, this probe is NOT the check to
+# lean on — a real one would demand flow structure (anchors joined by ->), which real chains have.
+_CHAIN_ANCHOR = re.compile(
+    r"0x[0-9a-fA-F]+"  # an address
+    r"|FUN_[0-9a-fA-F]+|sub_[0-9a-fA-F]+"  # a decompiler's address-derived symbol
+    r"|\b[0-9a-fA-F]{6,}\b"  # a bare hex address
+    r"|\b[A-Za-z_][A-Za-z0-9]*_[A-Za-z0-9_]+\b",  # a snake_case symbol
+    re.I,
+)
+
+_SAFE_FIELDS = ("block_source", "block_point", "block_why")
+
+
+def _validate_verdict_basis(verdict: str, vb: dict[str, Any] | None) -> str | None:
+    """Check the justification a verdict must carry, and return it as JSON to store (or None).
+
+    Two verdicts make a claim strong enough to owe an explanation, and they owe different ones:
+
+    * ``safe`` REQUIRES all three parts. Saying a candidate is safe is the one judgement that takes
+      it off the table, and a wrong one only comes back when the CODE changes — never because the
+      judgement itself was wrong. So it has to name what is blocked, where, and why that holds.
+    * ``exploitable`` validates what it is GIVEN but does not yet require it. The shape is still
+      being learned from real cases; making it mandatory before it has settled would push people
+      into writing filler to satisfy a form.
+
+    ★ Honest limit: these are non-blank checks. Filler passes every one of them. They are a speed
+    bump and a way to make the resulting record re-usable — never evidence that the claim is true.
+    """
+    if verdict == "safe":
+        if not vb:
+            raise ConfigError(
+                "safe requires verdict_basis with block_source / block_point / block_why — "
+                "naming what stops the input, where, and why it cannot be bypassed"
+            )
+        for k in _SAFE_FIELDS:
+            v = vb.get(k)
+            if not (isinstance(v, str) and v.strip()):
+                raise ConfigError(
+                    f"safe.{k} must be non-blank (the load-bearing one is block_why: say why the "
+                    "block covers every path in and cannot be worked around)"
+                )
+        return json.dumps({"kind": "safe", **{k: str(vb[k]).strip() for k in _SAFE_FIELDS}})
+
+    if verdict == "exploitable":
+        if vb is None:
+            return None  # soft this round: recorded without a basis, by design
+        chain = vb.get("chain")
+        if not (isinstance(chain, str) and chain.strip()):
+            raise ConfigError("exploitable.chain must be non-blank")
+        if not _CHAIN_ANCHOR.search(chain):
+            raise ConfigError(
+                "exploitable.chain should cite code — an address, a FUN_ symbol, or a function "
+                "name. This is a shallow prompt, not a check that the chain is right"
+            )
+        gaps = vb.get("verification_gaps")
+        if not (
+            isinstance(gaps, list)
+            and len(gaps) >= 2
+            and all(isinstance(g, str) and g.strip() for g in gaps)
+        ):
+            raise ConfigError(
+                "exploitable.verification_gaps needs at least 2 non-blank items — what still has "
+                "to be confirmed on real hardware"
+            )
+        sp = vb.get("shared_prereq")
+        if sp is not None and not (isinstance(sp, str) and sp.strip()):
+            raise ConfigError("shared_prereq, when given, must be non-blank")
+        return json.dumps(
+            {
+                "kind": "exploitable",
+                "chain": chain.strip(),
+                "verification_gaps": [g.strip() for g in gaps],
+                "shared_prereq": sp.strip() if isinstance(sp, str) else None,
+            }
+        )
+
+    # Every other verdict carries no basis. Accepting one silently would store a justification
+    # under a verdict nothing reads it for, so say so instead of dropping it.
+    if vb is not None:
+        raise ConfigError(f"verdict_basis applies to safe / exploitable only, not {verdict!r}")
+    return None
 
 
 def capture_basis(atlas: sqlite3.Connection, evidence_ref: str) -> Basis:
@@ -216,14 +312,21 @@ def upsert_overlay(
     verdict: str,
     rationale: str,
     attributed_to: str | None = "agent-via-mcp",
+    verdict_basis: dict[str, Any] | None = None,
     commit: bool = True,
 ) -> UpsertResult:
     """Write (or overwrite) the annotation for one ``evidence_ref`` — last write wins, one row per
     anchor. Rejects an unknown verdict, a blank rationale, or a fabricated attribution. Snapshots
     the candidate's basis at write time (a blind write on an unresolved ref is allowed — recording
-    before a scan exists — reports ``basis_resolved=False``). Touches ONLY the overlay table."""
+    before a scan exists — reports ``basis_resolved=False``). Touches ONLY the overlay table.
+
+    ``verdict_basis`` carries the structured justification the strong verdicts owe — required for
+    ``safe``, validated-if-given for ``exploitable``, refused for the rest. See
+    ``_validate_verdict_basis`` for what each shape must contain and for the honest limits of the
+    checking."""
     if verdict not in _VERDICTS:
         raise ConfigError(f"verdict must be one of {list(_VERDICTS)}; got {verdict!r}")
+    basis_json = _validate_verdict_basis(verdict, verdict_basis)
     if not (rationale and rationale.strip()):
         raise ConfigError("rationale must be non-blank (why + next step + confidence)")
     if attributed_to is not None and attributed_to not in _ATTRIBUTION:
@@ -239,8 +342,15 @@ def upsert_overlay(
     if prior is not None:
         atlas.execute(
             "UPDATE overlay SET verdict = ?, rationale = ?, attributed_to = ?, basis_state = ?, "
-            "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (verdict, rationale.strip(), attributed_to, basis.to_json(), prior["id"]),
+            "verdict_basis = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (
+                verdict,
+                rationale.strip(),
+                attributed_to,
+                basis.to_json(),
+                basis_json,
+                prior["id"],
+            ),
         )
         result = UpsertResult(
             action="updated",
@@ -252,7 +362,8 @@ def upsert_overlay(
     else:
         cur = atlas.execute(
             "INSERT INTO overlay (anchor_kind, anchor_ref, run_id, verdict, rationale, "
-            "attributed_to, basis_state) VALUES ('evidence_ref', ?, ?, ?, ?, ?, ?)",
+            "attributed_to, basis_state, verdict_basis) "
+            "VALUES ('evidence_ref', ?, ?, ?, ?, ?, ?, ?)",
             (
                 evidence_ref,
                 _run_id_from_ref(evidence_ref),
@@ -260,6 +371,7 @@ def upsert_overlay(
                 rationale.strip(),
                 attributed_to,
                 basis.to_json(),
+                basis_json,
             ),
         )
         new_id = cur.lastrowid
@@ -345,7 +457,7 @@ def list_overlays(
     clause = ("WHERE " + " AND ".join(conds)) if conds else ""
     rows = atlas.execute(
         "SELECT id, anchor_kind, anchor_ref, run_id, verdict, rationale, attributed_to, "
-        f"basis_state, created_at, updated_at FROM overlay {clause} "  # noqa: S608
+        f"basis_state, verdict_basis, created_at, updated_at FROM overlay {clause} "  # noqa: S608
         "ORDER BY verdict, updated_at DESC",
         params,
     ).fetchall()
@@ -368,6 +480,9 @@ def list_overlays(
                 "bias": _VERDICT_BIAS.get(r["verdict"], 0),
                 "basis_state": delta["state"],
                 "basis_note": _STALE_NOTE.get(delta["state"], ""),
+                # The structured justification a safe / exploitable annotation was written with,
+                # parsed back for the reader; None for verdicts that carry none.
+                "verdict_basis": json.loads(r["verdict_basis"]) if r["verdict_basis"] else None,
                 "basis_delta": delta,
                 "updated_at": r["updated_at"],
             }

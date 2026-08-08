@@ -53,7 +53,13 @@ from treasure_map.lib import overlay
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import InstanceRow
 from treasure_map.lib.atlas.writer import add_instance, begin_run, finish_run, upsert_pattern
-from treasure_map.lib.query.overlay_view import FLOAT, NEUTRAL, SINK, overlay_band
+from treasure_map.lib.query.overlay_view import (
+    FLOAT,
+    NEUTRAL,
+    SINK,
+    SUPER_FLOAT,
+    overlay_band,
+)
 
 _RUN = "run_v"
 
@@ -325,8 +331,10 @@ def test_every_verdict_maps_to_a_band() -> None:
     # Mechanical completeness: a verdict added to the storage layer without a band decision here
     # would silently ride as NEUTRAL, so pin that every known verdict is accounted for.
     bands = {v: overlay_band({"verdict": v, "basis_state": "unchanged"}) for v in overlay._VERDICTS}
-    assert set(bands) == {"inconclusive", "suspicious", "excluded", "safe"}
-    assert set(bands.values()) == {FLOAT, NEUTRAL, SINK}
+    assert set(bands) == {"inconclusive", "suspicious", "excluded", "safe", "exploitable"}
+    # SUPER_FLOAT must appear: if exploitable were missing its branch it would fall to NEUTRAL,
+    # silently ranking with the "nothing decided" pile instead of above every suspicious.
+    assert set(bands.values()) == {SUPER_FLOAT, FLOAT, NEUTRAL, SINK}
 
 
 def test_apply_is_pure_and_never_reduces(tmp_path: Path) -> None:
@@ -347,3 +355,25 @@ def test_apply_is_pure_and_never_reduces(tmp_path: Path) -> None:
     assert ranked == before  # input untouched
     assert len(out) == len(before)
     assert {c.evidence_ref for c in out} == {c.evidence_ref for c in before}
+
+
+def test_exploitable_outranks_every_suspicious(tmp_path: Path) -> None:
+    # ★ exploitable is a tier above suspicious — the digging is done, only hardware confirmation is
+    # left — so it must sort above suspicious even when the base map ranked the suspicious one
+    # higher. That ordering comes from its own band; the display bias is not what any sort reads.
+    # Mutation: delete the exploitable branch in overlay_band -> it falls to NEUTRAL -> red.
+    assert overlay_band({"verdict": "exploitable", "basis_state": "unchanged"}) == SUPER_FLOAT
+    # ... and it is never demoted when its basis moves: staleness is surfaced on the row, not acted
+    # on by sinking the candidate that was judged closest to proven.
+    assert overlay_band({"verdict": "exploitable", "basis_state": "changed"}) == SUPER_FLOAT
+
+    atlas_path = _seed(tmp_path)
+    tools = mcp_app.make_tools(atlas_path)
+    base = _order(tools)
+    assert base.index(CMD_FREE) < base.index(LOG_FREE)  # precondition: base map puts CMD first
+
+    _annotate(atlas_path, CMD_FREE, "suspicious")
+    _annotate(atlas_path, LOG_FREE, "exploitable")
+    on = _order(tools, overlay=True)
+    assert on[0] == LOG_FREE  # the exploitable one, despite ranking lower in the base map
+    assert on.index(LOG_FREE) < on.index(CMD_FREE)

@@ -30,8 +30,10 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:  # import only for typing — the storage layer must not depend on this view
     from treasure_map.lib.query.triage import TriageCandidate
 
-# Band ordering: small sorts earlier.
-FLOAT, NEUTRAL, SINK = 0, 1, 2
+# Band ordering: small sorts earlier. SUPER_FLOAT sits below FLOAT so `exploitable` lands above
+# every `suspicious` — the ordering comes from THIS value, not from the display bias, which no
+# sort reads.
+SUPER_FLOAT, FLOAT, NEUTRAL, SINK = -1, 0, 1, 2
 
 # The verdicts that sink a candidate — and that re-surface once their basis moves.
 _SUNK_VERDICTS = ("excluded", "safe")
@@ -39,6 +41,10 @@ _SUNK_VERDICTS = ("excluded", "safe")
 
 def overlay_band(annotation: dict[str, Any] | None) -> int:
     """Which band one annotation biases its candidate into (``None`` = unannotated -> NEUTRAL).
+
+    ``exploitable`` goes to the very top — a tier above ``suspicious``, meaning the work is done
+    and only real-machine confirmation is left. It never auto-demotes: if its basis later moves,
+    that is SURFACED on the row by ``list_overlays``, not acted on by sinking it out of sight.
 
     ``suspicious`` floats. ``excluded`` / ``safe`` sink, but ONLY while their basis still reads
     ``unchanged`` — once it has moved (or cannot be verified) the candidate floats back up for
@@ -50,6 +56,8 @@ def overlay_band(annotation: dict[str, Any] | None) -> int:
     if annotation is None:
         return NEUTRAL
     verdict, basis_state = annotation["verdict"], annotation["basis_state"]
+    if verdict == "exploitable":
+        return SUPER_FLOAT
     if verdict in _SUNK_VERDICTS and basis_state != "unchanged":
         return FLOAT  # a dismissal whose basis moved: re-surface for re-review, never leave it sunk
     if verdict == "suspicious":

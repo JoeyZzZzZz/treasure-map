@@ -104,7 +104,7 @@ def test_attribution_is_never_fabricated(tmp_path: Path) -> None:
     con = _seed(tmp_path)
     with pytest.raises(ConfigError, match="never fabricated"):
         overlay.upsert_overlay(
-            con, evidence_ref=_REF, verdict="safe", rationale="ok", attributed_to="alice"
+            con, evidence_ref=_REF, verdict="suspicious", rationale="ok", attributed_to="alice"
         )
     with pytest.raises(sqlite3.IntegrityError):
         con.execute(
@@ -369,7 +369,7 @@ def test_pre_existing_rows_are_backfilled(tmp_path: Path) -> None:
     # Simulated by clearing the value and re-opening, which is exactly what an old atlas looks like.
     db = tmp_path / "atlas.db"
     con = _seed_two_runs(tmp_path)
-    overlay.upsert_overlay(con, evidence_ref=_REF_A, verdict="safe", rationale="checked")
+    overlay.upsert_overlay(con, evidence_ref=_REF_A, verdict="suspicious", rationale="checked")
     con.execute("UPDATE overlay SET run_id = NULL")  # the pre-column shape
     con.commit()
     con.close()
@@ -511,4 +511,171 @@ def test_clear_overlay_scoped(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="at most one scope"):
         overlay.clear_overlay(con, run_id="rC", evidence_ref="rC#s:0x1@cmd")
     assert len(_refs(con)) == 4  # the refusal deleted nothing
+    con.close()
+
+
+# ── the two verdicts that owe an explanation: safe (required) and exploitable (soft) ───
+#
+# Reverse mutations — each applied once and observed RED, then restored:
+#
+# 1. drop the safe gate: return None instead of raising when a safe row has no basis.
+#    -> `test_safe_requires_all_three_parts` fails — an unexplained 'safe' is accepted.
+# 2. harden exploitable: raise when its basis is None.
+#    -> `test_exploitable_basis_is_validated_but_not_required` fails on the no-basis case.
+# 3. drop the chain probe: skip the _CHAIN_ANCHOR search.
+#    -> the same test fails — a chain naming no code is accepted.
+# 4. accept cross-kind: delete the trailing `if vb is not None: raise`.
+#    -> `test_verdict_basis_is_refused_for_the_other_verdicts` fails.
+# 5. move the column migration BEFORE the rebuild in `_migrate` (or drop its guard).
+#    -> `test_verdict_basis_column_survives_an_old_atlas` fails — the rebuild's fixed ten-column
+#    copy drops the new column on any atlas old enough to be rebuilt.
+
+_SAFE_OK = {
+    "block_source": "the topic string from the mqtt subscribe",
+    "block_point": "check_topic_prefix, before the buffer is built",
+    "block_why": "every caller of build_cmd goes through it, and it rejects anything with a shell "
+    "metacharacter before the copy",
+}
+_EXPLOIT_OK = {
+    "chain": "mqtt topic -> handler_parse_cmd -> build_cmd (0x4a12) -> system",
+    "verification_gaps": [
+        "needs a device on the same mesh segment",
+        "unclear whether the daemon runs as root",
+    ],
+}
+
+
+def _basis_of(con: sqlite3.Connection, ref: str) -> dict | None:
+    raw = con.execute("SELECT verdict_basis FROM overlay WHERE anchor_ref = ?", (ref,)).fetchone()
+    import json as _json
+
+    return _json.loads(raw[0]) if raw and raw[0] else None
+
+
+def test_safe_requires_all_three_parts(tmp_path: Path) -> None:
+    # ★ 'safe' is the judgement that takes a candidate off the table, and a wrong one only comes
+    # back if the CODE changes — never because the judgement was wrong. So it has to say what is
+    # blocked, where, and why that holds everywhere.
+    con = _seed(tmp_path)
+    with pytest.raises(ConfigError, match="safe requires verdict_basis"):
+        overlay.upsert_overlay(con, evidence_ref=_REF, verdict="safe", rationale="looks fine")
+    for missing in _SAFE_OK:
+        partial = {k: v for k, v in _SAFE_OK.items() if k != missing}
+        with pytest.raises(ConfigError, match=f"safe.{missing}"):
+            overlay.upsert_overlay(
+                con, evidence_ref=_REF, verdict="safe", rationale="x", verdict_basis=partial
+            )
+    with pytest.raises(ConfigError, match="block_why"):  # present but blank is not present
+        overlay.upsert_overlay(
+            con,
+            evidence_ref=_REF,
+            verdict="safe",
+            rationale="x",
+            verdict_basis={**_SAFE_OK, "block_why": "   "},
+        )
+    assert overlay.list_overlays(con)["count"] == 0  # nothing was written by any refusal
+
+    overlay.upsert_overlay(
+        con, evidence_ref=_REF, verdict="safe", rationale="blocked", verdict_basis=_SAFE_OK
+    )
+    stored = _basis_of(con, _REF)
+    assert stored is not None and stored["kind"] == "safe"
+    assert stored["block_point"] == _SAFE_OK["block_point"]
+    assert overlay.list_overlays(con)["overlays"][0]["verdict_basis"]["kind"] == "safe"
+    con.close()
+
+
+def test_exploitable_basis_is_validated_but_not_required(tmp_path: Path) -> None:
+    # ★ Soft on purpose: the shape is still being learned from real cases, and requiring it before
+    # it settles just produces filler. What IS given gets checked.
+    con = _seed(tmp_path)
+    overlay.upsert_overlay(
+        con, evidence_ref=_REF, verdict="exploitable", rationale="chain looks complete"
+    )
+    assert _basis_of(con, _REF) is None  # accepted with nothing attached
+
+    with pytest.raises(ConfigError, match="cite code"):  # a chain naming nothing in the binary
+        overlay.upsert_overlay(
+            con,
+            evidence_ref=_REF,
+            verdict="exploitable",
+            rationale="x",
+            verdict_basis={**_EXPLOIT_OK, "chain": "the input reaches a shell somewhere"},
+        )
+    with pytest.raises(ConfigError, match="verification_gaps"):  # one gap is not a list of gaps
+        overlay.upsert_overlay(
+            con,
+            evidence_ref=_REF,
+            verdict="exploitable",
+            rationale="x",
+            verdict_basis={**_EXPLOIT_OK, "verification_gaps": ["only one"]},
+        )
+
+    overlay.upsert_overlay(
+        con,
+        evidence_ref=_REF,
+        verdict="exploitable",
+        rationale="ready for hardware",
+        verdict_basis={**_EXPLOIT_OK, "shared_prereq": "same mesh segment"},
+    )
+    stored = _basis_of(con, _REF)
+    assert stored is not None and stored["kind"] == "exploitable"
+    assert len(stored["verification_gaps"]) == 2
+    assert stored["shared_prereq"] == "same mesh segment"
+    con.close()
+
+
+def test_verdict_basis_is_refused_for_the_other_verdicts(tmp_path: Path) -> None:
+    # Storing a justification under a verdict nothing reads it for would quietly lose it — say so.
+    con = _seed(tmp_path)
+    for verdict in ("inconclusive", "suspicious", "excluded"):
+        with pytest.raises(ConfigError, match="applies to safe / exploitable only"):
+            overlay.upsert_overlay(
+                con,
+                evidence_ref=_REF,
+                verdict=verdict,
+                rationale="x",
+                verdict_basis=_EXPLOIT_OK,
+            )
+    con.close()
+
+
+def test_verdict_basis_column_survives_an_old_atlas(tmp_path: Path) -> None:
+    # ★ The column is added AFTER the verdict-CHECK rebuild, which copies a fixed ten-column list.
+    # Added before it, the rebuild would drop it again on exactly the databases that need migrating.
+    db = tmp_path / "atlas.db"
+    con = open_atlas(db)
+    con.execute("DROP TABLE overlay")  # replace with the pre-change shape: CHECK, and no new column
+    con.execute("""CREATE TABLE overlay (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        anchor_kind TEXT NOT NULL DEFAULT 'evidence_ref'
+            CHECK (anchor_kind IN ('evidence_ref','diff_subject')),
+        anchor_ref TEXT NOT NULL,
+        run_id TEXT,
+        verdict TEXT NOT NULL
+            CHECK (verdict IN ('to-review','in-progress','suspicious','excluded','safe')),
+        rationale TEXT NOT NULL,
+        attributed_to TEXT
+            CHECK (attributed_to IS NULL OR attributed_to IN ('agent','agent-via-mcp')),
+        basis_state TEXT,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE (anchor_kind, anchor_ref))""")
+    con.execute(
+        "INSERT INTO overlay (anchor_ref, run_id, verdict, rationale) "
+        "VALUES ('old#a:0x1@cmd', 'old', 'suspicious', 'written before the column existed')"
+    )
+    con.commit()
+    con.close()
+
+    con = open_atlas(db)  # rebuild (CHECK removal) THEN the column add
+    cols = {r[1] for r in con.execute("PRAGMA table_info(overlay)")}
+    assert "verdict_basis" in cols, "the rebuild's fixed column list dropped the new column"
+    row = con.execute("SELECT * FROM overlay").fetchone()
+    assert row["verdict_basis"] is None  # nullable: an existing row simply has none
+    assert row["rationale"] == "written before the column existed"  # and is otherwise intact
+    con.close()
+
+    con = open_atlas(db)  # idempotent: adding it twice would raise "duplicate column name"
+    assert "verdict_basis" in {r[1] for r in con.execute("PRAGMA table_info(overlay)")}
     con.close()

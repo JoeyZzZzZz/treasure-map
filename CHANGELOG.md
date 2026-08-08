@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A new top verdict, `exploitable`, for a candidate that is done being investigated.** Where
+  `suspicious` means "worth digging into", `exploitable` means the digging finished and only
+  real-machine confirmation is left. It sorts ABOVE every suspicious candidate in the overlay-on
+  view, via its own ordering band rather than a bigger display bias (nothing sorts by the bias), and
+  it is never auto-demoted: if its basis later moves, that is surfaced on the row instead of sinking
+  the candidate judged closest to proven. Passing `chain` (the path, citing code) and
+  `verification_gaps` (two or more things still to confirm on hardware) is strongly recommended and
+  validated when given, but not yet required — the shape is still being learned from real cases, and
+  requiring it early would only produce filler.
+- **`safe` now has to say why.** It was documented as a high bar but enforced exactly like
+  `excluded`. It now requires all three of `block_source` / `block_point` / `block_why` — what input
+  was traced, where it is stopped, and why that stop covers every path in and cannot be worked
+  around — and the write is refused without them. This is the judgement that takes a candidate off
+  the table, and a wrong one only comes back if the CODE changes, never because the judgement was
+  wrong; the tool answers a successful `safe` by saying so. **Honest limit:** these are non-blank
+  checks. Filler passes them. They are a speed bump and a way to leave a reviewable record — never
+  evidence that the claim is true.
+- Both justifications live in one new nullable `overlay.verdict_basis` column, keyed by `kind`.
+  Distinct from `basis_state`, which snapshots the FACTS an annotation rested on: that one is about
+  staleness, this one about reasoning, and neither is written from the other. `list_overlays`
+  returns it parsed, so `list_overlays(verdict="safe")` reads as an audit of standing safe claims.
+
 ### Changed
 
 - **The verdict vocabulary is now four words, and reading an old one never fails.** `to-review` is

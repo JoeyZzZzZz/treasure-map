@@ -639,6 +639,12 @@ CREATE TABLE IF NOT EXISTS overlay (
     attributed_to TEXT
         CHECK (attributed_to IS NULL OR attributed_to IN ('agent','agent-via-mcp')),  -- coarse; never faked
     basis_state   TEXT,                     -- JSON snapshot: pseudocode_hash + per-sibling dimension set
+    -- Structured justification for the two verdicts that require one, JSON keyed by `kind`:
+    -- safe {block_source, block_point, block_why} / exploitable {chain, verification_gaps,
+    -- shared_prereq}. NULL for every verdict that carries none. NOT the same thing as basis_state
+    -- above: that snapshots the FACTS an annotation rested on (for staleness); this records WHY the
+    -- consumer reached the conclusion. Two columns, two jobs, neither written from the other.
+    verdict_basis TEXT,
     created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     -- one annotation per anchor: a re-annotation UPDATES in place (last write wins)

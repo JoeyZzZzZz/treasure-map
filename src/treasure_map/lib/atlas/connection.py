@@ -248,6 +248,22 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # so it updates the final table rather than one about to be replaced.
         conn.execute("UPDATE overlay SET verdict = 'inconclusive' WHERE verdict = 'to-review'")
 
+        # overlay.verdict_basis (this round): the structured justification a `safe` or `exploitable`
+        # annotation must carry. Additive and nullable — existing rows keep NULL.
+        # ★ ORDER IS LOAD-BEARING: this MUST stay AFTER the rebuild above. That rebuild copies a
+        # FIXED ten-column list, so a column added before it would be silently dropped on any atlas
+        # old enough to be rebuilt. Adding it here means an old atlas is rebuilt to ten columns and
+        # then gains the eleventh, while a current one skips the rebuild and just gains it.
+        if "verdict_basis" not in _column_names(conn, "overlay"):
+            conn.execute("ALTER TABLE overlay ADD COLUMN verdict_basis TEXT")
+
+        # overlay.verdict_basis (this round): the structured justification a `safe` or `exploitable`
+        # annotation must carry. Additive and nullable — existing rows keep NULL.
+        # ★ ORDER IS LOAD-BEARING: this MUST stay AFTER the rebuild above. That rebuild copies a
+        # FIXED ten-column list, so a column added before it would be silently dropped on any atlas
+        # old enough to be rebuilt. Adding it here means an old atlas is rebuilt to ten columns and
+        # then gains the eleventh, while a current one skips the rebuild and just gains it.
+
 
 def open_atlas(db_path: Path) -> sqlite3.Connection:
     """Open (or create) the atlas SQLite database and apply the schema.

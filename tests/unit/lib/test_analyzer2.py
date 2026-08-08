@@ -2707,9 +2707,12 @@ def test_a2_sources_are_boundary_clean() -> None:
         re.IGNORECASE,
     )
     section_ref = re.compile(r"§|PRD\s")
-    # "exploit*" framing is still banned in every NEUTRAL file; the two sanctioned storage
-    # identifiers (the exploit_ledger import path, the exploit_note column) are the only exceptions.
-    stray_exploit = re.compile(r"\bexploit(?!_ledger\b|_note\b)\w*", re.IGNORECASE)
+    # "exploit*" framing is still banned in every NEUTRAL file. The exceptions are STORED
+    # IDENTIFIERS, not framing: the exploit_ledger import path, the exploit_note column, and the
+    # `exploitable` verdict — a value a consumer writes into the overlay, which the ordering layer
+    # has to compare against by name. Each is a literal the code cannot avoid spelling; anything
+    # that is merely describing work in those terms stays banned.
+    stray_exploit = re.compile(r"\bexploit(?!_ledger\b|_note\b|able\b)\w*", re.IGNORECASE)
     exploit_exempt = {"exploit_ledger.py"}  # the private ledger read module (non-neutral by design)
     for path in [_HUNT_A2, *_QUERY_PKG.glob("*.py"), _ATLAS_SCHEMA]:
         text = path.read_text()

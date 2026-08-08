@@ -1402,21 +1402,48 @@ def make_tools(
             atlas.close()
         return {**counts, "note": _DERIVED_SIGNAL_NOTE}
 
-    def annotate(evidence_ref: str, verdict: str, rationale: str) -> dict[str, Any]:
+    def annotate(
+        evidence_ref: str,
+        verdict: str,
+        rationale: str,
+        block_source: str | None = None,
+        block_point: str | None = None,
+        block_why: str | None = None,
+        chain: str | None = None,
+        verification_gaps: list[str] | None = None,
+        shared_prereq: str | None = None,
+    ) -> dict[str, Any]:
         """Record YOUR OWN judgement about one candidate onto the overlay — the annotation layer
         over the read-only map. This is YOUR decision, not a tool fact; the base map
         (list_candidates) is unchanged whether the overlay is empty or full, and reads identically
         with the overlay off.
 
-        ``verdict`` is one of: ``inconclusive`` (you looked and nothing decisive could be
-        established from what this tool can see — put the next step in the rationale so you can
-        resume; it leaves the candidate where it was), ``suspicious`` (dig deeper),
-        ``excluded`` (noise / not relevant), ``safe`` (you judged it safe — a HIGH bar you own: a
-        wrongly-'safe' candidate is a missed hole). ``rationale`` is required (why + next step +
-        confidence). One annotation per candidate: re-annotating OVERWRITES (last write wins; the
-        echo names whom you overwrote). The write snapshots the candidate's basis (its pseudocode +
-        dimensions) so list_overlays can flag it for re-review if the base map moved. A blind write
-        is honest: an unresolved ``evidence_ref`` is still recorded, with a warning."""
+        ``verdict`` is one of:
+
+        * ``inconclusive`` — you looked and nothing decisive could be established from what this
+          tool can see. Put the next step in the rationale; the candidate stays where it was.
+        * ``suspicious`` — worth digging into further. Floats up.
+        * ``excluded`` — noise, or not relevant. Sinks.
+        * ``safe`` — you judged it cannot be reached or exploited. Sinks, and REQUIRES all three of
+          ``block_source`` (what input you traced), ``block_point`` (where it is stopped — name the
+          function/check), ``block_why`` (why that stop covers EVERY path in and cannot be worked
+          around). The third is the load-bearing one. This is the judgement that takes a candidate
+          off the table, and a wrong one only comes back if the CODE changes — never because the
+          judgement was wrong — so it is recorded as a claim someone can review.
+        * ``exploitable`` — a tier above suspicious: the digging is done and only real-machine
+          confirmation is left. Floats ABOVE every suspicious candidate. Strongly recommended (not
+          yet required) to pass ``chain`` — the path, citing code, e.g.
+          "mqtt topic -> handler_parse_cmd -> build_cmd (0x4a12) -> system" — plus
+          ``verification_gaps``, two or more things still to confirm on hardware, e.g.
+          ["needs a device on the same mesh segment", "unclear whether the daemon runs as root"].
+          Optional ``shared_prereq`` names a precondition shared with other candidates. With those
+          filled the record survives as a re-usable description of the shape, not just a label.
+
+        ``rationale`` is required (why + next step + confidence). One annotation per candidate:
+        re-annotating OVERWRITES (last write wins; the echo names whom you overwrote). The write
+        snapshots the candidate's basis (its pseudocode + dimensions) so list_overlays can flag it
+        for re-review if the base map moved. A blind write is honest: an unresolved
+        ``evidence_ref`` is still recorded, with a warning."""
         if not (evidence_ref and evidence_ref.strip()):
             return {"written": False, "error": "evidence_ref must be non-blank."}
         if not (rationale and rationale.strip()):
@@ -1424,6 +1451,20 @@ def make_tools(
                 "written": False,
                 "error": "rationale must be non-blank — record why + the next step + confidence.",
             }
+        # Assemble the per-verdict justification from the named arguments. Only the fields that
+        # belong to the verdict being written are collected; anything supplied that does not belong
+        # is passed through so the layer below can refuse it by name rather than dropping it.
+        supplied = {
+            "block_source": block_source,
+            "block_point": block_point,
+            "block_why": block_why,
+            "chain": chain,
+            "verification_gaps": verification_gaps,
+            "shared_prereq": shared_prereq,
+        }
+        given = {k: v for k, v in supplied.items() if v is not None}
+        verdict_basis: dict[str, Any] | None = given or None
+
         atlas = open_atlas(atlas_path)
         try:
             ref = _resolve_ref(atlas, evidence_ref)
@@ -1434,6 +1475,7 @@ def make_tools(
                     verdict=verdict,
                     rationale=rationale,
                     attributed_to="agent-via-mcp",
+                    verdict_basis=verdict_basis,
                 )
             except ConfigError as exc:
                 return {"written": False, "error": str(exc)}
@@ -1449,6 +1491,18 @@ def make_tools(
             "note": "recorded on the overlay (an AGENT annotation, never a tool fact). The base "
             "is unchanged. list_overlays resumes these + flags any whose basis has since moved.",
         }
+        if verdict == "safe":
+            result["note"] = (
+                "recorded as a reviewable defensive claim. You are asserting the thing this tool "
+                "deliberately will not assert for you: that nothing gets through. A wrong 'safe' "
+                "is a real hole gone quiet — it only re-surfaces when the CODE changes, never "
+                "because the judgement itself was wrong."
+            )
+        elif verdict == "exploitable" and verdict_basis is None:
+            result["note"] = (
+                "recorded. Consider adding chain + verification_gaps: with them this survives as a "
+                "re-usable description of the shape, rather than a label only you can interpret."
+            )
         if res.action == "updated":
             result["overwrote"] = {
                 "attributed_to": res.prior_attributed_to,
