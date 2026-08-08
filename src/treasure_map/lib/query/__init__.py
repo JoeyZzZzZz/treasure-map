@@ -8,7 +8,11 @@ nothing here scores, ranks, or judges.
 
 from __future__ import annotations
 
-from treasure_map.lib.query.exploit_ledger import list_cve_patterns, list_verified_exploits
+from treasure_map.lib.query.exploit_ledger import (
+    list_cve_patterns,
+    list_verified_exploits,
+    refs_in_ledger,
+)
 from treasure_map.lib.query.nvram import get_nvram_key_flow
 from treasure_map.lib.query.overlay_view import apply_overlay_view, overlay_band
 from treasure_map.lib.query.runs import (
@@ -96,6 +100,7 @@ __all__ = [
     "overlay_band",
     "parse_impact_order",
     "reachability_match_count",
+    "refs_in_ledger",
     "reducible",
     "runs_where_function_exists",
     "shown_statuses",

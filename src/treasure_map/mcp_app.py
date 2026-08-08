@@ -64,6 +64,7 @@ from treasure_map.lib.query import list_runs as _list_runs
 from treasure_map.lib.query import list_verified_exploits as _list_verified_exploits
 from treasure_map.lib.query import only_refusal as _only_refusal
 from treasure_map.lib.query import parse_impact_order as _parse_impact_order
+from treasure_map.lib.query import refs_in_ledger as _refs_in_ledger
 from treasure_map.lib.query import runs_where_function_exists as _runs_where_function_exists
 from treasure_map.lib.query import state_value_label as _state_value_label
 from treasure_map.lib.query import triage as _triage
@@ -92,8 +93,8 @@ _MAX_LIMIT = 200
 # notice stays reachable via the legal_notice tool (B4).
 _AGENT_INSTRUCTIONS = (
     "Treasure Map exposes a firmware analysis knowledge base as read-only fact tools. Work the "
-    "loop: RECALL -> FETCH FACTS -> JUDGE. (1) list_candidates is a multi-dimensional map: each "
-    "lead carries an honest three-state annotation on every layer (controllability / "
+    "loop: RECALL -> FETCH FACTS -> JUDGE -> RECORD. (1) list_candidates is a multi-dimensional "
+    "map: each lead carries an honest three-state annotation on every layer (controllability / "
     "source_writability / reachability / filtering / sink_impact / writer / completeness), ordered "
     "by a SWITCHABLE lens (sort_by / view / filters / impact_order) whose default sinks only "
     "provably-safe candidates and NEVER buries a '?'. It is NOT a verdict — recall is deliberately "
@@ -120,7 +121,16 @@ _AGENT_INSTRUCTIONS = (
     "cross-firmware signals: cross_firmware_patterns (a pattern recurring across many firmware "
     "images) and get_components_cves (known-CVE components). Prefer narrow filters (run_id / sink "
     "/ status) and paging over pulling everything; fetch detail per evidence_ref. The tools draw "
-    "no conclusion and emit no payload/PoC — that judgement is yours."
+    "no conclusion and emit no payload/PoC — that judgement is yours. (4) RECORD a conclusion "
+    "worth keeping past this session, so the next one inherits it instead of starting over: "
+    "annotate(evidence_ref, verdict, rationale) writes YOUR judgement onto an overlay — "
+    "suspicious/exploitable float a real lead the base map had sunk, excluded/safe sink noise you "
+    "have cleared (safe must say what blocks it, where, and why). list_candidates(overlay=true) "
+    "then re-ranks by your own conclusions; it is off by default and the base map is unchanged "
+    "with it off. list_overlays(run_id=...) reviews what you concluded last time and flags any "
+    "whose underlying facts have since moved. A row already marked in_exploit_ledger was confirmed "
+    "by a person — you cannot write that (people do, from the command line), and it is usually not "
+    "worth re-verifying."
 )
 
 
@@ -137,7 +147,11 @@ _SPINE_DIMENSIONS = frozenset({"controllability"})
 _COMPACT_ROW_LEGEND = (
     "compact rows = spine facts + every dimension with an ESTABLISHED state (state:value, no "
     "note). A dimension NOT shown on a row is state=unknown: a coverage gap, NOT proven safe. "
-    "Fetch explain_candidate(evidence_ref) for that candidate's full per-dimension note."
+    "Fetch explain_candidate(evidence_ref) for that candidate's full per-dimension note. "
+    "A row carrying in_exploit_ledger:true was written into the exploit ledger by a PERSON at the "
+    "command line, against a proven-exploit bar — the highest-trust marker here, and usually not "
+    "worth re-verifying. It means the logic was proven and recorded; it is NOT a claim that anyone "
+    "reproduced it on real hardware."
 )
 
 
@@ -209,7 +223,9 @@ def _overlay_marker(o: dict[str, Any]) -> dict[str, Any]:
     return marker
 
 
-def _candidate_row(c: Any, rank: int, overlay: dict[str, Any] | None = None) -> dict[str, Any]:
+def _candidate_row(
+    c: Any, rank: int, overlay: dict[str, Any] | None = None, *, in_ledger: bool = False
+) -> dict[str, Any]:
     """One candidate as a COMPACT triage row (the compact-row carry contract C1-C3).
 
     Spine facts (always present) + every non-spine dimension whose state is ESTABLISHED
@@ -256,6 +272,13 @@ def _candidate_row(c: Any, rank: int, overlay: dict[str, Any] | None = None) -> 
         # tmap-established dimension — and never merged into ``controllability``. Two layers, two
         # keys, so a row always answers "did the tool establish this, or did the agent decide it?".
         row["overlay"] = _overlay_marker(overlay)
+    if in_ledger:
+        # A THIRD provenance layer, in its own key like ``overlay`` — and for the same reason. It is
+        # neither a dimension this tool established nor the agent's own judgement: a PERSON put this
+        # candidate in the exploit ledger from the command line, which is the highest-trust marker
+        # here and usually means re-verifying it is wasted effort. It says the logic was proven and
+        # recorded, NOT that anyone reproduced it on hardware.
+        row["in_exploit_ledger"] = True
     return row
 
 
@@ -605,6 +628,10 @@ def make_tools(
         ``caveats`` states the honest phase-1 blind spots (optimistic 'free', near-always-'?'
         filtering).
 
+        A row may also carry ``in_exploit_ledger`` — a person recorded that candidate in the
+        exploit ledger from the command line. It is a tool-side fact, not an opt-in view, so it
+        shows whether or not ``overlay`` is on, and it is the highest-trust marker on the row.
+
         Rows are COMPACT: spine facts (evidence_ref / rank / sink_class / sink / controllability /
         nvram_source_key / binary / function / structural_fingerprint) plus each dimension whose
         state is ESTABLISHED, as one ``state:value`` label — the per-dimension note is dropped here
@@ -636,6 +663,9 @@ def make_tools(
             # Read the annotations while the atlas is still open (each row's basis freshness is
             # re-derived against the live base map). Overlay OFF -> nothing is read at all.
             overlays = _list_overlays(atlas)["overlays"] if overlay else []
+            # Read unconditionally, unlike the overlays above: whether a person put a candidate in
+            # the ledger is a fact about the world, not an opt-in view, so it shows either way.
+            ledger_refs = _refs_in_ledger(atlas)
         finally:
             atlas.close()
         ranked = _filter_candidates(ranked, sink=sink, status=status, include_gated=include_gated)
@@ -752,7 +782,13 @@ def make_tools(
             # With the overlay on, each annotated row also carries its own ``overlay`` key (the
             # agent's verdict + basis freshness), kept separate from every tool-derived field.
             "candidates": [
-                _candidate_row(c, off + i, by_ref.get(c.evidence_ref)) for i, c in enumerate(page)
+                _candidate_row(
+                    c,
+                    off + i,
+                    by_ref.get(c.evidence_ref),
+                    in_ledger=c.evidence_ref in ledger_refs,
+                )
+                for i, c in enumerate(page)
             ],
         }
 
@@ -1374,6 +1410,9 @@ def make_tools(
           ["needs a device on the same mesh segment", "unclear whether the daemon runs as root"].
           Optional ``shared_prereq`` names a precondition shared with other candidates. With those
           filled the record survives as a re-usable description of the shape, not just a label.
+
+        Call this when you have reached a conclusion about a candidate worth keeping past THIS
+        session — not on every read, and not for mid-investigation scratch notes.
 
         ``rationale`` is required (why + next step + confidence). One annotation per candidate:
         re-annotating OVERWRITES (last write wins; the echo names whom you overwrote). The write

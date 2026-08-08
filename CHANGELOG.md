@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A candidate a person already confirmed now says so on its row.** `list_candidates` marks any
+  candidate whose reference appears in the exploit ledger with `in_exploit_ledger: true` — the
+  highest-trust marker on a row, and usually a reason not to spend effort re-analysing it. It is a
+  read-only derivation from data that already existed, matched on the exact reference (no fuzzy or
+  cross-firmware matching), and it shows whether or not the opt-in overlay view is on, because
+  whether a person recorded something is a fact rather than a view preference. It sits in its own
+  top-level key, keeping three provenance layers separate on one row: what the tool established,
+  what the agent decided, and what a person confirmed. What it does NOT claim is stated with it:
+  the logic was proven and recorded, not reproduced on hardware.
+- **The annotation layer is now discoverable.** It had existed for several rounds while the
+  server's own instructions never mentioned it, so almost nothing was ever annotated and the
+  vocabulary, gates and ordering built on top of it went unused. The agent loop is now
+  RECALL → FETCH FACTS → JUDGE → **RECORD**, named in the header as well as the body so a client
+  that truncates still shows it, with a phase that says what `annotate` is for and how
+  `list_candidates(overlay=true)` and `list_overlays` build on it. `annotate` itself now says WHEN
+  to call it — on reaching a conclusion worth keeping past the session, not on every read. The
+  ledger marker is explained in the row legend, which rides on every listing. Nothing is pushed
+  from a fact tool's results; each tool describes itself.
+
 ### Removed
 
 - **`mark_exploited` is gone from the MCP surface — the exploit ledger is now written by people
