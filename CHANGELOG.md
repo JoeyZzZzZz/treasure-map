@@ -7,7 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A filter naming a dimension that does not exist is now refused instead of matching everything.**
+  An unrecognised name fell through to a catch-all that returns true, so every candidate landed in
+  the matched band and the count came back equal to the whole corpus — reading as "they all matched"
+  rather than "there is no such dimension", the worst of the three possible answers. Both
+  `--filter` and `--only` now refuse an unknown name and list the real ones, on the MCP tool and the
+  CLI alike. The valid set is anchored on what the matcher actually honours, including the two sink
+  spellings, so live filters like `sink_class=` are not broken by the check. This catches a bad NAME
+  only; a real dimension given a value it has no rule for still matches everything.
+- **`list_diff_blindspots` no longer reports a run-pair row as a per-binary blind spot.** A blind
+  spot means one binary was not diffed, and its row id reads `run_a::run_b::binary`. A row whose id
+  is just `run_a::run_b` describes the pair itself; listing it invented a gap on a binary that had
+  in fact diffed cleanly under its own row. Excluded by comparing against the id rebuilt from the
+  row's own run columns rather than by counting separators, since a binary name may contain them.
+
 ### Added
+
+- **`get_nvram_key_flow` takes an optional `run_id`.** The graph still spans every scanned firmware
+  by default — often the point, and each row already names its run — but auditing one image no
+  longer means reading another device's rows out of the answer. The scope applies to all three
+  reads behind the result (exact hits, template matches, unresolved count); narrowing only some
+  would return an answer that looks scoped and is not. Note it also scopes the completeness caveat,
+  which then means "may be incomplete within THIS run".
+- **A static check pins that overlay writes live in one place.** Dropping the database's verdict
+  CHECK rested on every write going through one validating function — true, but asserted only in a
+  comment. Now checked: a coarse token plus an explicit per-file budget, copying the wipe guard
+  rather than a narrow pattern, since a precise pattern is easy to slip past by accident (a
+  different column order, `INSERT OR REPLACE`, a schema-qualified name) and then silently permits
+  what it was written to forbid. Its limits are documented where it lives: it cannot see a
+  statement split across string literals, a quoted identifier, or a write added inside the write
+  path's own module.
+
+### Removed
+
+- **`get_components_cves` is gone from the MCP surface.** The tables it read have never had a
+  writer, so it always returned empty — an honest answer, but a permanent one, and it cost a slot
+  in every agent's tool list. Component identification and CVE matching are deliberately not built;
+  the tool is withdrawn rather than left returning nothing. The tables stay: the scanner reads
+  `components` to help exclude third-party code, and degrades cleanly while it is empty. The
+  separate CVE-form reference tables and their tools are untouched.
 
 - **A candidate a person already confirmed now says so on its row.** `list_candidates` marks any
   candidate whose reference appears in the exploit ledger with `in_exploit_ledger: true` — the

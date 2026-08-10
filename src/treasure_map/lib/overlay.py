@@ -426,7 +426,7 @@ _STALE_NOTE = {
 
 _LIST_NOTE = (
     "An AGENT annotation layer over the read-only candidate map — consumer decisions, NOT tool "
-    "tool facts, and the base map is unchanged whether this is empty or full. Each row carries a "
+    "facts, and the base map is unchanged whether this is empty or full. Each row carries a "
     "basis_state: 'unchanged' means the pseudocode + dimensions the annotation rested on have not "
     "moved; 'changed' means they have (re-review); 'unverifiable' is an honest can't-say, never a "
     "clean bill; 'anchor_unresolved' means the ref no longer resolves. Stale rows are surfaced, "

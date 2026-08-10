@@ -350,8 +350,6 @@ _BLINDSPOT_NOTE = (
     "changing resets the count."
 )
 
-_BLINDSPOT_COLS = ("diff_id", "binary", "diff_status_reason", "diff_attempts", "suspected_hard")
-
 
 def list_diff_blindspots(
     atlas: sqlite3.Connection,
@@ -362,8 +360,14 @@ def list_diff_blindspots(
 ) -> dict[str, Any]:
     """The un-diffed (diff_ok=0) binaries of a run-pair: the explicit blind-spot listing so a
     'no delta' can never masquerade as 'no change'. ``suspected_hard`` = diff_attempts >= the retry
-    cap (a likely hard boundary). Optionally filter to a run-pair. Read-only, facts only."""
-    where = ["diff_ok = 0"]
+    cap (a likely hard boundary). Optionally filter to a run-pair. Read-only, facts only.
+
+    A blind spot is per-binary, and a per-binary row's id reads ``run_a::run_b::binary``. A row
+    whose id is just ``run_a::run_b`` describes the run-pair itself, not any one binary, so listing
+    it would invent a blind spot on a binary nobody failed to diff. Compared against the id built
+    from this row's own run columns rather than by counting separators, since a binary name may
+    contain them."""
+    where = ["diff_ok = 0", "diff_id <> run_a_id || '::' || run_b_id"]
     params: list[Any] = []
     if run_a_id is not None:
         where.append("run_a_id = ?")

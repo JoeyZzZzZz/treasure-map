@@ -494,3 +494,36 @@ def test_get_diff_deltas_empty_points_at_status_even_non_verbose(tmp_path: Path)
     note = res["note"].lower()
     assert "not 'no changes'" in note or "not 'no change'" in note
     assert "diff_ok" in note and "list_diff_blindspots" in note
+
+
+def test_run_pair_level_row_is_not_reported_as_a_binary_blindspot(tmp_path: Path) -> None:
+    """★ A blind spot means "this binary was not diffed". A row whose id is just run_a::run_b
+    describes the RUN PAIR, not any one binary — listing it invents a gap on a binary nobody
+    failed to diff, and the binary it names may in fact have diffed cleanly under its own row.
+
+    Compared against the id rebuilt from this row's own run columns rather than by counting
+    separators: a binary name is free to contain them.
+    """
+    atlas_path = _seed_pair(
+        tmp_path, {"openssl": "o1", "libxml2": "x1"}, {"openssl": "o2", "libxml2": "x2"}
+    )
+    con = open_atlas(atlas_path)
+    # openssl diffed fine, under its own per-binary row
+    _seed_committed_status(con, "openssl", diff_ok=1, attempts=1, sha_a="o1", sha_b="o2")
+    # libxml2 genuinely failed — a real blind spot
+    _seed_committed_status(
+        con, "libxml2", diff_ok=0, attempts=1, sha_a="x1", sha_b="x2", reason="failed"
+    )
+    # ... and a run-pair-level row that also carries a binary name, which is the shape that used to
+    # surface as a phantom blind spot on a binary that was never actually skipped.
+    con.execute(
+        "INSERT INTO diff_meta (diff_id, run_a_id, run_b_id, binary_a, binary_b, diff_ok) "
+        "VALUES ('run_a::run_b', 'run_a', 'run_b', 'openssl', 'openssl', 0)"
+    )
+    con.commit()
+
+    bs = diff_align.list_diff_blindspots(con, "run_a", "run_b")
+    names = [b["binary"] for b in bs["blindspots"]]
+    assert names == ["libxml2"], f"expected only the real blind spot, got {names}"
+    assert all(b["diff_id"] != "run_a::run_b" for b in bs["blindspots"])
+    con.close()

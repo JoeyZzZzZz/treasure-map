@@ -917,6 +917,7 @@ def triage(
         explain_candidate,
         filter_match_count,
         only_refusal,
+        unknown_dimension_refusal,
     )
     from treasure_map.lib.query import apply_view as run_apply_view
     from treasure_map.lib.query import parse_impact_order as run_parse_impact_order
@@ -933,6 +934,11 @@ def triage(
 
     dim_filters = _parse_dim_filters(dim_filter_specs)
     only_filters = _parse_dim_filters(only_specs)
+    # An unrecognised dimension name matches everything, so it would come back looking like a
+    # filter that matched the whole corpus. Refuse it here and name the ones that exist.
+    bad_dim = unknown_dimension_refusal(dim_filters) or unknown_dimension_refusal(only_filters)
+    if bad_dim is not None:
+        raise click.ClickException(bad_dim)
     overrides = run_parse_impact_order(impact_order) if impact_order else None
     # A deprecated alias (reachable-only) resolves to its canonical name everywhere the lens is
     # named, so the header nudges the reader onto the current spelling instead of echoing the old.

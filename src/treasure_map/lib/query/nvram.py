@@ -353,8 +353,17 @@ def _web_settable(conn: sqlite3.Connection, key: str) -> dict[str, Any]:
     }
 
 
-def get_nvram_key_flow(conn: sqlite3.Connection, key: str) -> dict[str, Any]:
+def get_nvram_key_flow(
+    conn: sqlite3.Connection, key: str, *, run_id: str | None = None
+) -> dict[str, Any]:
     """Assemble the cross-binary read/write graph for one concrete nvram key.
+
+    ``run_id`` narrows every part of the answer to one firmware. Left out (the default), the graph
+    spans every firmware in the atlas — deliberate, since a key's behaviour across devices is often
+    the point, and each row names its own run so the result stays readable either way. Note what
+    scoping does to ``completeness``: the unresolved-key count it rests on becomes "unresolved
+    within THIS run", so the caveat reads as "this run's graph may be incomplete" rather than the
+    atlas-wide one.
 
     Returns exact writers/readers (constant key match) and a separate flagged template_matches list
     (parametric templates the key satisfies). ``found`` is False only when nothing — exact or
@@ -365,19 +374,28 @@ def get_nvram_key_flow(conn: sqlite3.Connection, key: str) -> dict[str, Any]:
     because wrapper-indirect access is not resolved. Absence is NEVER "the key is unused". A fact,
     never a verdict.
     """
+    # One scope clause, applied to ALL THREE reads below. Narrowing only some of them would mix
+    # this run's exact hits with another firmware's templates and unresolved count — a scoped answer
+    # that is quietly not scoped.
+    scope_sql = " AND source_run_id = ?" if run_id is not None else ""
+    scope_args: tuple[str, ...] = (run_id,) if run_id is not None else ()
+
     exact_rows = conn.execute(
         "SELECT source_run_id, key, key_kind, binary, func, op, value_source, api, via_wrapper "
-        "FROM nvram_key_flow WHERE key_kind = 'constant' AND key = ? "
-        "ORDER BY binary, func",
-        (key,),
+        "FROM nvram_key_flow WHERE key_kind = 'constant' AND key = ?"
+        + scope_sql
+        + " ORDER BY binary, func",
+        (key, *scope_args),
     ).fetchall()
     writers = [_entry(r) for r in exact_rows if r["op"] == "write"]
     readers = [_entry(r) for r in exact_rows if r["op"] == "read"]
 
     param_rows = conn.execute(
         "SELECT source_run_id, key, key_kind, binary, func, op, value_source, api, via_wrapper "
-        "FROM nvram_key_flow WHERE key_kind = 'parametric' AND key IS NOT NULL "
-        "ORDER BY binary, func"
+        "FROM nvram_key_flow WHERE key_kind = 'parametric' AND key IS NOT NULL"
+        + scope_sql
+        + " ORDER BY binary, func",
+        scope_args,
     ).fetchall()
     template_matches = [
         {**_entry(r), "template": r["key"], "match": "template"}
@@ -387,7 +405,8 @@ def get_nvram_key_flow(conn: sqlite3.Connection, key: str) -> dict[str, Any]:
 
     unresolved_count = int(
         conn.execute(
-            "SELECT COUNT(*) FROM nvram_key_flow WHERE key_kind = 'unresolved'"
+            "SELECT COUNT(*) FROM nvram_key_flow WHERE key_kind = 'unresolved'" + scope_sql,
+            scope_args,
         ).fetchone()[0]
     )
 

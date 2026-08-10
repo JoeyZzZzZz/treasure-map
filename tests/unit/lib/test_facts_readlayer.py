@@ -347,14 +347,6 @@ def test_get_script_callsites_is_entry_evidence(tmp_path: Path) -> None:
     conn.close()
 
 
-def test_get_components_cves(tmp_path: Path) -> None:
-    conn = _ro(tmp_path)
-    r = facts.get_components_cves(conn, binary="webd")
-    assert r["components"][0]["product"] == "genlib"
-    assert r["cve_matches"][0]["cve_id"] == "synthetic-cve"
-    conn.close()
-
-
 def test_get_pseudocode_address_forms_all_resolve(tmp_path: Path) -> None:
     # The real schema stores 00038de8; a consumer may type the address any of these ways.
     conn = _ro(tmp_path)

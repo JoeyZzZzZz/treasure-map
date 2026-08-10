@@ -52,6 +52,7 @@ from treasure_map.lib.query.triage import (
     sort_candidates,
     state_value_label,
     triage,
+    unknown_dimension_refusal,
 )
 from treasure_map.lib.query.views import (
     FINE_FP_ALGO_VERSION,
@@ -109,4 +110,5 @@ __all__ = [
     "state_value_label",
     "triage",
     "twins",
+    "unknown_dimension_refusal",
 ]

@@ -632,8 +632,11 @@ CREATE TABLE IF NOT EXISTS overlay (
     run_id        TEXT,
     -- No CHECK here on purpose. The vocabulary is still evolving, and pinning it in the schema
     -- means every wording change costs a table rebuild that has to carry real annotations across.
-    -- Validity is enforced where the writes are: both write paths reject an unknown verdict, and
-    -- a test pins that every known verdict has a band, so a new one cannot slip in unhandled.
+    -- Validity is enforced where the writes are: the sole write path is overlay.py::upsert_overlay,
+    -- which validates at its head. A static gate pins that overlay writes spelled contiguously in
+    -- source text, outside lib/overlay.py, are zero apart from the whitelisted migrations — text
+    -- matching, so it cannot claim more than that. A second test pins that every known verdict has
+    -- an ordering band, so a new one cannot slip in unhandled.
     verdict       TEXT NOT NULL,
     rationale     TEXT NOT NULL,            -- why + next step + confidence; blank is rejected at write
     attributed_to TEXT

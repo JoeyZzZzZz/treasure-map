@@ -1793,6 +1793,33 @@ def reducible(dim: str, candidates: list[TriageCandidate]) -> bool:
     return bool(candidates) and all(_is_resolved(c, dim) for c in candidates)
 
 
+# The dimension names a filter may name. Extends the canonical set with the two sink spellings
+# ``_matches`` also honours — anchoring on _CANONICAL alone would reject ``sink_class``, which is a
+# live, selective filter. (Referencing _CANONICAL here is fine: what must never be derived is the
+# canonical set itself, from _build_dimensions(); this only reads it.)
+_FILTERABLE_DIMENSION_NAMES = frozenset(_CANONICAL_DIMENSION_NAMES | {"sink_class", "sink"})
+
+
+def unknown_dimension_refusal(filters: list[tuple[str, str]]) -> str | None:
+    """The refusal message when a filter names a dimension that does not exist, else None.
+
+    Without this, an unknown name is not an error and not an empty result — ``_matches`` returns
+    True for anything it does not recognise, so every candidate lands in the matched band and the
+    count comes back equal to the whole corpus. That reads like "they all match" rather than "there
+    is no such dimension", which is the worst of the three possible answers.
+
+    This catches a bad NAME only. A real dimension given a value it has no rule for (``source`` with
+    anything other than nvram/param, say) still matches everything — a separate gap, not closed
+    here."""
+    for dim, _ in filters:
+        if dim not in _FILTERABLE_DIMENSION_NAMES:
+            return (
+                f"filter dimension {dim!r} does not exist; valid dimensions are: "
+                f"{', '.join(sorted(_FILTERABLE_DIMENSION_NAMES))}"
+            )
+    return None
+
+
 def only_refusal(
     only_filters: list[tuple[str, str]], candidates: list[TriageCandidate]
 ) -> str | None:

@@ -512,3 +512,45 @@ def test_template_has_anchor() -> None:
     assert not template_has_anchor("%d")
     assert not template_has_anchor("<built:strcpy>")
     assert not template_has_anchor("a%s")  # 1 fixed char < threshold
+
+
+def test_run_id_scopes_every_part_of_the_graph(tmp_path: Path) -> None:
+    # ★ Scoping has to reach all three reads. Narrowing only the exact hits would answer with this
+    # run's writers beside another firmware's templates and unresolved count — an answer that looks
+    # scoped and is not, which is worse than not offering the option.
+    conn = open_atlas(tmp_path / "atlas.db")
+    rows = [
+        # (run, key, kind) — the same key in two firmwares, plus a template and an unresolved op
+        ("fw_a", "http_passwd", "constant"),
+        ("fw_b", "http_passwd", "constant"),
+        ("fw_a", "http_%s", "parametric"),
+        ("fw_b", "http_%s", "parametric"),
+        ("fw_a", None, "unresolved"),
+        ("fw_b", None, "unresolved"),
+    ]
+    add_nvram_flow_rows(
+        conn,
+        [
+            NvramFlowRow(
+                source_run_id=run,
+                key=key,
+                key_kind=kind,
+                binary=f"{run}d",
+                func="f",
+                op="read",
+                api="nvram_get",
+            )
+            for run, key, kind in rows
+        ],
+    )
+
+    everywhere = get_nvram_key_flow(conn, "http_passwd")
+    assert {e["source_run_id"] for e in everywhere["readers"]} == {"fw_a", "fw_b"}
+    assert len(everywhere["template_matches"]) == 2
+    assert everywhere["unresolved_count"] == 2
+
+    scoped = get_nvram_key_flow(conn, "http_passwd", run_id="fw_a")
+    assert {e["source_run_id"] for e in scoped["readers"]} == {"fw_a"}
+    assert [t["source_run_id"] for t in scoped["template_matches"]] == ["fw_a"]
+    assert scoped["unresolved_count"] == 1  # the caveat is now about THIS run, not the atlas
+    conn.close()

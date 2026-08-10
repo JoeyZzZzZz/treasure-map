@@ -69,6 +69,7 @@ from treasure_map.lib.query import runs_where_function_exists as _runs_where_fun
 from treasure_map.lib.query import state_value_label as _state_value_label
 from treasure_map.lib.query import triage as _triage
 from treasure_map.lib.query import twins as _twins
+from treasure_map.lib.query import unknown_dimension_refusal as _unknown_dim_refusal
 from treasure_map.lib.query.diff_align import align_by_a as _align_by_a
 from treasure_map.lib.query.diff_align import align_by_b as _align_by_b
 from treasure_map.lib.query.diff_align import get_diff_capabilities as _get_diff_capabilities
@@ -116,10 +117,9 @@ _AGENT_INSTRUCTIONS = (
     "binary = short name OR full path), get_callees / get_xrefs to walk the call chain (an empty "
     "caller set may mean an indirect/dispatch-table call, not 'unreachable'), get_strings, "
     "get_functions_referencing_string (which functions mention a string, by pseudocode text "
-    "match — not a resolved symbol xref), get_imports_exports, get_script_callsites, "
-    "get_components_cves. (3) Judge value with the "
-    "cross-firmware signals: cross_firmware_patterns (a pattern recurring across many firmware "
-    "images) and get_components_cves (known-CVE components). Prefer narrow filters (run_id / sink "
+    "match — not a resolved symbol xref), get_imports_exports, get_script_callsites. "
+    "(3) Judge value with the cross-firmware signal cross_firmware_patterns (a pattern "
+    "recurring across many firmware images). Prefer narrow filters (run_id / sink "
     "/ status) and paging over pulling everything; fetch detail per evidence_ref. The tools draw "
     "no conclusion and emit no payload/PoC — that judgement is yours. (4) RECORD a conclusion "
     "worth keeping past this session, so the next one inherits it instead of starting over: "
@@ -678,6 +678,12 @@ def make_tools(
         # hide candidates). The composite key and demotion iron law ride under any spine.
         dim_filters = _parse_dim_filters(filters)
         only_filters = _parse_dim_filters(only)
+        # Refuse a dimension name that does not exist BEFORE anything reads it. Unrecognised names
+        # match every candidate, so letting one through returns the whole corpus labelled as
+        # matched — indistinguishable from a filter that genuinely matched everything.
+        refusal = _unknown_dim_refusal(dim_filters) or _unknown_dim_refusal(only_filters)
+        if refusal is not None:
+            return {"note": _DERIVED_SIGNAL_NOTE, "error": refusal, "corpus": len(ranked)}
         refusal = _only_refusal(only_filters, ranked)
         if refusal is not None:
             return {"note": _DERIVED_SIGNAL_NOTE, "error": refusal, "corpus": len(ranked)}
@@ -927,7 +933,7 @@ def make_tools(
             result["run_lineage"] = _lineage_inline(run)
         return result
 
-    def get_nvram_key_flow(key: str) -> dict[str, Any]:
+    def get_nvram_key_flow(key: str, run_id: str | None = None) -> dict[str, Any]:
         """Cross-binary nvram key graph: who WRITES and who READS one nvram key (gap② phase 2).
 
         Turns "trace this config value across processes" from two manual reverse-lookups into one
@@ -941,10 +947,16 @@ def make_tools(
         (``unresolved_note`` says how many): a key that came from a caller could touch ANY key, so
         the writers/readers here may be incomplete — never read an empty result as "unused". Each
         entry carries ``source_run_id`` so a cross-firmware atlas stays legible. A surfaced FACT,
-        never a verdict."""
+        never a verdict.
+
+        ``run_id`` narrows the whole graph to one firmware. Omitted (the default), it spans every
+        firmware you have scanned — often what you want, since a key's behaviour across devices is
+        the interesting part, and every row names its own run. Pass it when you are auditing ONE
+        image and do not want another device's rows in the answer. Scoping also scopes the
+        completeness caveat: it then means "may be incomplete within THIS run"."""
         conn = open_atlas(atlas_path)
         try:
-            result = _get_nvram_key_flow(conn, key)
+            result = _get_nvram_key_flow(conn, key, run_id=run_id)
         finally:
             conn.close()
         result["note"] = _DERIVED_SIGNAL_NOTE
@@ -1266,21 +1278,6 @@ def make_tools(
             binary=binary,
         )
 
-    def get_components_cves(
-        binary: str | None = None,
-        run_id: str | None = None,
-        evidence_ref: str | None = None,
-    ) -> dict[str, Any]:
-        """SBOM components recognized in a binary + their CVE-table matches (a query result).
-
-        Run-aware: ``run_id`` + ``binary`` or ``evidence_ref``; echoes ``resolved_run``."""
-        return _fact(
-            lambda c, fn, bn: facts.get_components_cves(c, binary=bn or ""),
-            run_id=run_id,
-            evidence_ref=evidence_ref,
-            binary=binary,
-        )
-
     def get_disassembly(
         function: str | None = None,
         binary: str | None = None,
@@ -1566,7 +1563,6 @@ def make_tools(
         "get_functions_referencing_string": get_functions_referencing_string,
         "get_imports_exports": get_imports_exports,
         "get_script_callsites": get_script_callsites,
-        "get_components_cves": get_components_cves,
         "get_disassembly": get_disassembly,
         "annotate": annotate,
         "list_overlays": list_overlays,

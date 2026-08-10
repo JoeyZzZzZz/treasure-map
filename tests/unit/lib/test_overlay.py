@@ -679,3 +679,78 @@ def test_verdict_basis_column_survives_an_old_atlas(tmp_path: Path) -> None:
     con = open_atlas(db)  # idempotent: adding it twice would raise "duplicate column name"
     assert "verdict_basis" in {r[1] for r in con.execute("PRAGMA table_info(overlay)")}
     con.close()
+
+
+# ── the overlay write path, pinned statically ─────────────────────────────────────────
+
+
+_OVERLAY_WRITE_TOKEN = re.compile(
+    r"(?:INSERT\s+(?:OR\s+\w+\s+)?INTO|UPDATE|REPLACE\s+INTO)\s+(?:\w+\.)?overlay\b",
+    re.IGNORECASE,
+)
+
+# Files allowed to write the overlay, and how many writes each may contain. Keyed by path relative
+# to the package, NOT by bare filename: two different modules here are both called connection.py,
+# and only one of them is allowed any writes. overlay.py is the write path's home and is exempt
+# outright; the migration module gets an exact count, so adding a write there is a deliberate act
+# that has to be declared here too.
+_OVERLAY_WRITE_HOME = "lib/overlay.py"
+_OVERLAY_WRITE_BUDGET = {
+    "lib/atlas/connection.py": 2,  # the run_id backfill and the verdict rename
+}
+
+
+def test_static_overlay_writes_live_in_one_place() -> None:
+    """The safety argument for dropping the database's verdict CHECK is that every write goes
+    through one validating function. That was a claim in a comment; this makes it checkable.
+
+    Deliberately a coarse token plus an explicit budget, copying the wipe guard rather than a
+    narrow pattern: a precise regex is easy to slip past by accident (a different column order, an
+    `INSERT OR REPLACE`, a schema-qualified name) and then it silently permits what it was written
+    to forbid. A coarse token over-matches instead, which is the safe direction — a new write shows
+    up loudly.
+
+    ★ What it does NOT catch, stated so nobody reads more into it:
+      * a statement split across string literals (`"INSERT INTO " "overlay (...)"`) — which can
+        happen by ACCIDENT the first time someone rewraps a long line, not just adversarially;
+      * a quoted identifier (`INSERT INTO "overlay"`);
+      * a write added INSIDE overlay.py that bypasses upsert_overlay, since the exemption is by
+        file rather than by function.
+    It catches the common, accidental case: a contiguous overlay write appearing somewhere new.
+    """
+    src = Path(__file__).resolve().parents[3] / "src" / "treasure_map"
+    for py in sorted(src.rglob("*.py")):
+        rel = py.relative_to(src).as_posix()
+        if rel == _OVERLAY_WRITE_HOME:
+            continue
+        found = len(_OVERLAY_WRITE_TOKEN.findall(py.read_text()))
+        allowed = _OVERLAY_WRITE_BUDGET.get(rel, 0)
+        assert found == allowed, (
+            f"{rel} has {found} overlay write(s), expected {allowed} — a new write path must "
+            f"go through overlay.py::upsert_overlay (which validates), or be added to the budget "
+            f"here with a reason"
+        )
+
+
+def test_the_write_gate_catches_the_ways_around_it() -> None:
+    # ★ The point of a coarse token: the shapes a narrow pattern misses. Each of these is a real
+    # overlay write, and each must be seen — the column-order and OR-REPLACE ones especially, since
+    # a pattern anchored on "UPDATE overlay SET verdict" or a plain "INSERT INTO" lets them through.
+    for sql in (
+        'conn.execute("INSERT INTO overlay (anchor_ref, verdict) VALUES (?, ?)")',
+        'conn.execute("INSERT OR REPLACE INTO overlay (anchor_ref) VALUES (?)")',
+        'conn.execute("INSERT INTO main.overlay (anchor_ref) VALUES (?)")',
+        'conn.execute("UPDATE overlay SET rationale = ?, verdict = ? WHERE id = ?")',
+        'conn.execute("REPLACE INTO overlay (anchor_ref) VALUES (?)")',
+        'conn.execute("update  overlay  set verdict = ?")',
+    ):
+        assert _OVERLAY_WRITE_TOKEN.search(sql), f"a write got past the gate: {sql}"
+    # ... and it does not fire on things that are not overlay writes
+    for sql in (
+        'conn.execute("CREATE TABLE overlay_new (id INTEGER)")',
+        'conn.execute("INSERT INTO overlay_new (id) VALUES (1)")',  # the rebuild's temp table
+        'conn.execute("SELECT * FROM overlay")',
+        'conn.execute("DELETE FROM overlay WHERE run_id = ?")',  # covered by the wipe guard instead
+        "# the overlay is updated by upsert_overlay",  # prose
+    ):
+        assert not _OVERLAY_WRITE_TOKEN.search(sql), f"false positive: {sql}"

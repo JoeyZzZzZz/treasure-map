@@ -257,13 +257,6 @@ def _migrate(conn: sqlite3.Connection) -> None:
         if "verdict_basis" not in _column_names(conn, "overlay"):
             conn.execute("ALTER TABLE overlay ADD COLUMN verdict_basis TEXT")
 
-        # overlay.verdict_basis (this round): the structured justification a `safe` or `exploitable`
-        # annotation must carry. Additive and nullable — existing rows keep NULL.
-        # ★ ORDER IS LOAD-BEARING: this MUST stay AFTER the rebuild above. That rebuild copies a
-        # FIXED ten-column list, so a column added before it would be silently dropped on any atlas
-        # old enough to be rebuilt. Adding it here means an old atlas is rebuilt to ten columns and
-        # then gains the eleventh, while a current one skips the rebuild and just gains it.
-
 
 def open_atlas(db_path: Path) -> sqlite3.Connection:
     """Open (or create) the atlas SQLite database and apply the schema.
@@ -272,8 +265,10 @@ def open_atlas(db_path: Path) -> sqlite3.Connection:
     safe and preserves all rows. An older atlas is first brought forward in place by _migrate
     (adds instance.origin / binary_path / binary_content_hash / is_thin_cmd_wrapper /
     wrapped_sink / flow_evidence / dimension_delta.binary, renames pattern.recurrence_breadth ->
-    device_spread, drops legacy pattern.device_category) — never by a table rebuild, so instance
-    rows and all derived counts are kept.
+    device_spread, drops legacy pattern.device_category). The instance table is only ever moved
+    forward in place — never rebuilt — so its rows and every derived count are kept. Overlay is the
+    one exception: it IS rebuilt, once, to shed a legacy verdict CHECK (see
+    _rebuild_overlay_without_verdict_check), carrying every row across inside one transaction.
 
     ★ ORDER IS LOAD-BEARING: _migrate MUST run BEFORE executescript. The schema now carries an
     index/constraint that references a MIGRATED-IN column (idx_dimdelta_bin on

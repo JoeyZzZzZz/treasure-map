@@ -55,7 +55,6 @@ _EXPECTED_TOOLS = {
     "get_functions_referencing_string",
     "get_imports_exports",
     "get_script_callsites",
-    "get_components_cves",
     "get_disassembly",
     "annotate",
     "list_overlays",
@@ -1142,3 +1141,19 @@ def test_public_server_files_carry_no_private_references() -> None:
         assert not privdoc.search((src / rel).read_text()), f"private-note reference in {rel}"
     # the defensive notice is the server's standing instruction
     assert "LEGAL_NOTICE" in (src / "mcp_app.py").read_text()
+
+
+def test_list_candidates_refuses_a_filter_dimension_that_does_not_exist(tmp_path: Path) -> None:
+    # ★ End-to-end, because the wiring is the part that can go missing. An unrecognised dimension
+    # matches every candidate, so without this the call returns the whole corpus labelled as
+    # matched — which reads as "everything matched your filter", not "no such dimension".
+    tools = _tools(tmp_path)
+    res = tools["list_candidates"](filters="binary=ip")
+    assert "error" in res, f"expected a refusal, got a listing of {res.get('total')} candidates"
+    assert "binary" in res["error"] and "does not exist" in res["error"]
+    assert "sink_class" in res["error"]  # names the dimensions that do exist
+
+    # the same check guards --only, and a real dimension still works
+    assert "error" in tools["list_candidates"](only="binary=ip")
+    ok = tools["list_candidates"](filters="sink_class=cmd")
+    assert "error" not in ok and ok["total"] >= 1

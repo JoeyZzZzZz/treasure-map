@@ -24,6 +24,7 @@ from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import InstanceRow
 from treasure_map.lib.atlas.writer import add_instance, upsert_pattern
 from treasure_map.lib.query import sort_candidates, triage
+from treasure_map.lib.query.triage import Dimension, TriageCandidate
 
 _FID = [0]
 
@@ -1439,3 +1440,97 @@ def test_cli_view_reachable_only_alias_resolves_to_reachable_first(tmp_path: Pat
     assert alias.exit_code == 0, alias.output
     assert alias.output == first.output  # alias is transparent — same float lens, same rows
     assert "(5 candidates:" in first.output  # corpus stays whole under either spelling
+
+
+# ── a filter naming a dimension that does not exist ───────────────────────────────────
+
+
+def test_unknown_filter_dimension_is_refused_not_silently_matched() -> None:
+    # ★ The old behaviour was the worst of the three possible answers. An unrecognised name does
+    # not error and does not match nothing — `_matches` returns True for anything it does not know,
+    # so every candidate lands in the matched band and the count comes back equal to the corpus.
+    # That reads as "they all match" rather than "there is no such dimension".
+    from treasure_map.lib.query.triage import unknown_dimension_refusal
+
+    refusal = unknown_dimension_refusal([("binary", "ip")])
+    assert refusal is not None
+    assert "binary" in refusal and "does not exist" in refusal
+    assert "controllability" in refusal and "sink_class" in refusal  # names the real ones
+
+
+def test_the_sink_aliases_are_not_rejected() -> None:
+    # ★ The check anchors on what `_matches` actually honours, which includes two sink spellings
+    # beyond the canonical set. Anchoring on the canonical set alone would reject `sink_class`,
+    # a live and genuinely selective filter — a guard that breaks working queries.
+    from treasure_map.lib.query.triage import unknown_dimension_refusal
+
+    for dim in ("sink_class", "sink", "sink_impact", "source", "controllability", "reachability"):
+        assert unknown_dimension_refusal([(dim, "whatever")]) is None, f"{dim} should be accepted"
+
+
+def test_every_accepted_dimension_can_actually_reject_something() -> None:
+    """★ The set is only meaningful if each name in it is FALSIFIABLE — if some value exists that
+    a candidate can fail to match. That, not "is it accepted", is what separates a real dimension
+    from an unknown one: an unknown name reaches the catch-all `return True` and matches
+    everything, and so does `source` given a value it has no rule for. Testing acceptance would
+    make those two indistinguishable.
+
+    Honest limit: this needs a hand-maintained table of probe values. If a dimension gains values
+    none of these exercise, it will look non-falsifiable and this guard quietly stops covering it.
+    """
+    from treasure_map.lib.query.triage import _FILTERABLE_DIMENSION_NAMES, _matches
+
+    probes = (
+        "nvram",
+        "param",
+        "cmd",
+        "copy",
+        "log",
+        "free",
+        "constant",
+        "yes",
+        "no",
+        "unknown",
+        "direct",
+        "entry:web",
+        "proven",
+        "complete",
+    )
+    candidates = [
+        TriageCandidate(
+            review_status="to-verify",
+            reachability_status="unknown",
+            function="f",
+            sink_anchor="system",
+            source_class="external_input",
+            sink_class=sc,
+            blocking_mechanism=None,
+            origin="custom",
+            source_run_id="run",
+            evidence_ref=f"run#a:0x{i}@cmd",
+            binary_path="usr/sbin/d",
+            dimensions=tuple(
+                Dimension(name, "unknown", "unknown", "", "")
+                for name in (
+                    "controllability",
+                    "source",
+                    "source_writability",
+                    "reachability",
+                    "filtering",
+                    "sink_impact",
+                    "writer",
+                    "completeness",
+                )
+            ),
+        )
+        for i, sc in enumerate(("cmd", "copy", "log"))
+    ]
+    for dim in sorted(_FILTERABLE_DIMENSION_NAMES):
+        assert any(not _matches(c, dim, v) for v in probes for c in candidates), (
+            f"{dim} matched every probe value on every candidate — it cannot filter anything"
+        )
+
+    for unknown in ("binary", "foo", "path"):
+        assert all(_matches(c, unknown, v) for v in probes for c in candidates), (
+            f"{unknown} is supposed to be unknown-and-match-all; if that changed, add it to the set"
+        )

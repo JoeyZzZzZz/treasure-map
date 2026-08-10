@@ -925,44 +925,6 @@ def get_script_callsites(conn: sqlite3.Connection, *, binary: str) -> dict[str, 
     return {"found": True, "binary": binary, "callsites": sites}
 
 
-def get_components_cves(conn: sqlite3.Connection, *, binary: str) -> dict[str, Any]:
-    """SBOM components recognized in a binary + their CVE-table matches (a query result, not a
-    judgement that the binary is affected — version-range/config caveats are the consumer's)."""
-    bid = _binary_id(conn, binary)
-    if bid is None:
-        return {"found": False, "query": {"binary": binary}}
-    components = [
-        {
-            "id": r["id"],
-            "product": r["product"],
-            "version": r["version"],
-            "cpe": r["cpe"],
-            "source": r["source"],
-        }
-        for r in conn.execute(
-            "SELECT id, product, version, cpe, source FROM components WHERE binary_id = ? "
-            "ORDER BY product, version",
-            (bid,),
-        )
-    ]
-    cves = [
-        {
-            "cve_id": r["cve_id"],
-            "cvss_score": r["cvss_score"],
-            "severity": r["severity"],
-            "component_id": r["component_id"],
-            "published": r["published"],
-            "url": r["url"],
-        }
-        for r in conn.execute(
-            "SELECT cve_id, cvss_score, severity, component_id, published, url "
-            "FROM cve_matches WHERE binary_id = ? ORDER BY cvss_score DESC",
-            (bid,),
-        )
-    ]
-    return {"found": True, "binary": binary, "components": components, "cve_matches": cves}
-
-
 def get_disassembly(
     conn: sqlite3.Connection, *, func: str, binary: str | None = None
 ) -> dict[str, Any]:
