@@ -8,45 +8,30 @@ proving the thin wrapper drives the pipeline and prints the result block.
 
 from __future__ import annotations
 
+from dataclasses import fields as _dataclass_fields
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from click.testing import CliRunner
 
 from treasure_map.cli.analyze_cli import analyze
+from treasure_map.lib.analyze.pipeline import AnalyzeResult
 from treasure_map.lib.config.config import Config
 
+# Fields that are not plain counters, so they carry a real stand-in value.
+_NON_COUNTER = {"db_path", "elapsed", "incomplete_binaries"}
 
-def _fake_result(db_path: Path) -> SimpleNamespace:
-    """A stand-in AnalyzeResult exposing every attribute the CLI prints."""
-    fields = {
-        "db_path": db_path,
-        "binary_count": 0,
-        "dirty_count": 0,
-        "ghidra_ok": 0,
-        "ghidra_failed": 0,
-        "ghidra_skipped": 0,
-        "functions_ingested": 0,
-        "imports_ingested": 0,
-        "exports_ingested": 0,
-        "strings_ingested": 0,
-        "layer0_xrefs": 0,
-        "layer1_xrefs": 0,
-        "layer2_xrefs": 0,
-        "layer3_xrefs": 0,
-        "strings_classified": 0,
-        "total_xrefs": 0,
-        "non_binary_files_ingested": 0,
-        "script_calls_ingested": 0,
-        "config_entries_ingested": 0,
-        "credentials_ingested": 0,
-        "web_endpoints_ingested": 0,
-        "elapsed": 0.1,
-        "incomplete_binaries": [],
-    }
-    return SimpleNamespace(**fields)
+
+def _fake_result(db_path: Path) -> AnalyzeResult:
+    """A stand-in AnalyzeResult, built FROM the real dataclass rather than hand-listed.
+
+    The previous version was a SimpleNamespace with every printed attribute typed out by hand, so
+    the moment the CLI printed one more field the stub silently lacked it — surfacing as an
+    AttributeError buried inside a CliRunner result, and only in CI. Deriving the counters from
+    ``AnalyzeResult`` itself means a new counter can never make this stub stale."""
+    counters = {f.name: 0 for f in _dataclass_fields(AnalyzeResult) if f.name not in _NON_COUNTER}
+    return AnalyzeResult(db_path=db_path, elapsed=0.1, incomplete_binaries=[], **counters)
 
 
 class _DummyWorkspace:
@@ -66,7 +51,7 @@ class _DummyWorkspace:
 def _patch_pipeline(monkeypatch: pytest.MonkeyPatch, db_path: Path) -> None:
     """Stub load_config / Workspace / run_analyze so analyze runs without Ghidra."""
 
-    async def _fake_run_analyze(*_: Any, **__: Any) -> SimpleNamespace:
+    async def _fake_run_analyze(*_: Any, **__: Any) -> AnalyzeResult:
         return _fake_result(db_path)
 
     monkeypatch.setattr(
