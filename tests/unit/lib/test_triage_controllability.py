@@ -1118,3 +1118,176 @@ def test_static_string_table_edge_also_stays_unknown() -> None:
     assert d.state == "unknown"
     assert d.value == "unknown"
     assert "nvram_dump" in d.note
+
+
+# ── the completeness gate: a sink that left no def-use record here cannot be called constant ──
+#
+# The shape all of these are about: the candidate's real sink sits behind a thin forwarding
+# wrapper, so the caller's provenance describes the caller's OWN other sinks and never the wrapped
+# one. Both constant exits would otherwise read "constant" off evidence that never saw the sink
+# being judged — an error in the one direction the map forbids, since a wrong 'safe' sinks a real
+# lead out of the first screen and nobody looks again.
+
+
+def _const_record(sink: str, value: str = "/bin/echo hello") -> dict[str, object]:
+    """One def-use record whose sink argument is a plain readable string constant."""
+    return {
+        "sink": sink,
+        "sink_idx": 0,
+        "provenance": {"kind": "constant", "value": value, "value_kind": "literal_string"},
+    }
+
+
+def _dim_of(conn: sqlite3.Connection, ref: str) -> tuple[str, str]:
+    (cand,) = [c for c in triage(conn) if c.evidence_ref == ref]
+    dim = cand.dim("controllability")
+    return dim.state, dim.value
+
+
+def test_escaped_sink_is_not_called_constant_off_its_siblings(tmp_path: Path) -> None:
+    # G1 — the gate itself, on the provenance exit. The anchor is `system`; every record present
+    # belongs to some OTHER sink the caller logs through. "All records are constant" is true and
+    # meaningless: the value handed to `system` was never looked at.
+    #
+    # MUTATION (verified RED, 1 failed): in triage._dim_controllability drop the gate from the
+    # provenance exit — `if prov_verdict == "const":` in place of
+    # `if const_trustworthy and prov_verdict == "const":` -> this candidate reads
+    # ('proven', 'constant') again.
+    conn = open_atlas(tmp_path / "atlas.db")
+    try:
+        pid = _pattern(conn, "fp_g1")
+        ref = _inst(
+            conn,
+            pid,
+            sink_anchor="system",
+            flow_evidence={
+                "sink_arg_provenance": [_const_record("syslog", "cfg %s"), _const_record("syslog")]
+            },
+        )
+        assert _dim_of(conn, ref) != ("proven", "constant")
+    finally:
+        conn.close()
+
+
+def test_escaped_sink_with_a_constant_marker_is_not_called_constant(tmp_path: Path) -> None:
+    # G5 — the SAME gate on the OTHER exit, end to end. This is the one a gate written only at the
+    # provenance classifier misses entirely: `const_sink_arg` is computed from the caller's body,
+    # which for an escaped sink holds a constant shell (a format string) around the conversion the
+    # attacker fills. The marker is true about the caller and says nothing about the wrapped sink.
+    #
+    # MUTATION (verified RED, 1 failed): in triage._dim_controllability gate only the provenance
+    # exit — restore `if blocking_mechanism in PROVABLY_CONSTANT_MARKERS:` without the
+    # `const_trustworthy and` prefix -> this candidate reads ('proven', 'constant') again.
+    conn = open_atlas(tmp_path / "atlas.db")
+    try:
+        pid = _pattern(conn, "fp_g5")
+        ref = _inst(
+            conn,
+            pid,
+            sink_anchor="system",
+            blocking="const_sink_arg",
+            flow_evidence={"sink_arg_provenance": [_const_record("syslog")]},
+        )
+        assert _dim_of(conn, ref) != ("proven", "constant")
+    finally:
+        conn.close()
+
+
+def test_gate_never_suppresses_a_controllable_reading(tmp_path: Path) -> None:
+    # G2 — the gate is one-directional. With the anchor missed, the liberal fallback may still show
+    # a controllable source among the sibling records; that reading must survive untouched.
+    # Promoting on partial evidence costs a review, demoting on it hides a real lead.
+    #
+    # MUTATION (verified RED, 1 failed): in triage._dim_controllability move the gate above the
+    # controllable steps — insert `if _anchor_missed(flow_evidence, sink_anchor): return
+    # _dim_unknown_controllability()` right after `prov_verdict = ...` (or simply return the
+    # source_kind fallback there) -> this candidate stops reading ('proven', 'controllable').
+    conn = open_atlas(tmp_path / "atlas.db")
+    try:
+        _seed_cross(conn)
+        pid = _pattern(conn, "fp_g2")
+        prov = _stack_buf_prov("syslog", [_getter_vararg("fb_comment")])
+        ref = _inst(conn, pid, sink_anchor="system", flow_evidence=prov)
+        assert _dim_of(conn, ref) == ("proven", "controllable")
+    finally:
+        conn.close()
+
+
+def test_constant_still_asserted_when_the_anchored_sink_is_present(tmp_path: Path) -> None:
+    # G3 — the gate must not become a blanket ban. With a record FOR the anchored sink, the
+    # constant reading is exactly as sound as it was, and the thousands of legitimately-constant
+    # candidates keep sinking out of the first screen.
+    #
+    # MUTATION (verified RED, 1 failed): in triage._dim_controllability hard-suppress the exits —
+    # `const_trustworthy = False` in place of `not _anchor_missed(...)` -> this candidate stops
+    # reading ('proven', 'constant').
+    conn = open_atlas(tmp_path / "atlas.db")
+    try:
+        pid = _pattern(conn, "fp_g3")
+        ref = _inst(
+            conn,
+            pid,
+            sink_anchor="system",
+            flow_evidence={"sink_arg_provenance": [_const_record("system")]},
+        )
+        assert _dim_of(conn, ref) == ("proven", "constant")
+    finally:
+        conn.close()
+
+
+def test_variadic_iron_law_is_untouched_by_the_gate(tmp_path: Path) -> None:
+    # G4 — the two completeness rules are at different levels and must both keep working. Here the
+    # anchor IS present (the gate passes), and the RECORD-level rule still refuses to call a
+    # variadic exec constant on the strength of arg0 alone.
+    #
+    # MUTATION (verified RED, 1 failed): in triage._record_class drop the variadic downgrade —
+    # delete `if cls == "const" and rec.get("sink") in _MULTI_ARG_COMMAND_SINKS: return "unknown"`
+    # -> this candidate reads ('proven', 'constant').
+    conn = open_atlas(tmp_path / "atlas.db")
+    try:
+        pid = _pattern(conn, "fp_g4")
+        ref = _inst(
+            conn,
+            pid,
+            sink_anchor="execl",
+            flow_evidence={"sink_arg_provenance": [_const_record("execl", "/bin/sh")]},
+        )
+        assert _dim_of(conn, ref) != ("proven", "constant")
+    finally:
+        conn.close()
+
+
+def test_a_sink_class_def_use_does_not_cover_is_never_read_as_an_escape() -> None:
+    # G6 — the DEFENSIVE guard, and the only one with no real-atlas instance behind it. Def-use
+    # records exist for command and format sinks only, so "no record for fopen" means def-use does
+    # not cover path sinks — never that a sink escaped.
+    #
+    # ★ The fixture carries a NON-EMPTY provenance on purpose. With an empty one the non-empty
+    # guard would return False first and this test would pass without the def-use-sink guard ever
+    # running — a guard that proves nothing. The assertion below pins that the records really are
+    # non-empty, so the pass can only come from the guard under test.
+    #
+    # MUTATION (verified RED, 1 failed): in triage._anchor_missed delete
+    # `if sink_anchor not in _DEF_USE_SINKS: return False` -> this path candidate is read as an
+    # escape.
+    from treasure_map.lib.query.triage import _anchor_missed, _sink_provenance_records
+
+    evidence = json.dumps({"sink_arg_provenance": [_const_record("system")]})
+    assert _sink_provenance_records(evidence), "fixture must be non-empty or G6 proves nothing"
+    assert _anchor_missed(evidence, "fopen") is False
+
+
+def test_absent_provenance_is_not_read_as_an_escape() -> None:
+    # G7 — the LOAD-BEARING non-empty guard, anchored on a shape a real atlas is full of: a
+    # command/format sink whose candidate carries no def-use records at all. That is "nothing was
+    # captured here", which the classifier already answers with None — reading it as an escape
+    # would widen the gate by roughly two orders of magnitude and start demoting candidates whose
+    # constant reading is perfectly sound.
+    #
+    # MUTATION (verified RED, 1 failed): in triage._anchor_missed delete
+    # `if not records: return False` -> these candidates are read as escapes.
+    from treasure_map.lib.query.triage import _anchor_missed
+
+    assert _anchor_missed(json.dumps({"sink_arg_provenance": []}), "vfprintf") is False
+    assert _anchor_missed(json.dumps({"source_kind": "unknown"}), "system") is False
+    assert _anchor_missed(None, "system") is False

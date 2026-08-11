@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A sink that left no trace of itself can no longer be called constant.** `constant` is the only
+  "safe" reading the map asserts, and the only one that sinks a candidate out of the first screen —
+  so a wrong one is the single worst error available: nobody looks again. Two exits reached it, and
+  both trusted evidence that had never seen the sink being judged. The value origin is recorded per
+  function and per direct call, so when the real sink sits behind a thin forwarding wrapper the
+  caller's records describe the caller's OTHER sinks. "Every record is a constant" then came out
+  true for a sink not among them; and the `const_sink_arg` marker, computed from the same caller
+  body, found the constant shell around the conversion an attacker fills and read it as a constant
+  command. Both exits now require at least one record for the sink actually being judged, and fall
+  back to the ordinary source reading without it.
+  The rule that this enforces was written in a docstring the whole time and never in code — which
+  is why the guard ships with the mutation that breaks it. The two controllable readings are
+  deliberately NOT gated: promoting on partial evidence costs a review, demoting on it hides a real
+  lead. Nor is it a claim of completeness — it establishes that the sink was seen at all, not that
+  its record is whole. Candidates whose sink IS in their records are entirely unaffected: on a real
+  atlas, exactly the escaped ones move and every other reading is unchanged.
+
 - **A filter naming a dimension that does not exist is now refused instead of matching everything.**
   An unrecognised name fell through to a catch-all that returns true, so every candidate landed in
   the matched band and the count came back equal to the whole corpus — reading as "they all matched"

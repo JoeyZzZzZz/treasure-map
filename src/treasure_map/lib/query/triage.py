@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from treasure_map.lib.pattern.classes import CMD, FMT_STRING
 from treasure_map.lib.query.nvram import _web_settable
 from treasure_map.lib.query.sink_impact import (
     CONSTRAINED_MARKERS,
@@ -501,9 +502,16 @@ def _verdict_from_provenance(
     conn: sqlite3.Connection, flow_evidence: str | None, sink_anchor: str | None
 ) -> str | None:
     """The single controllability verdict from the anchored sink's def-use provenance:
-    'controllable' (a web-settable / external source reaches the sink arg), 'const' (EVERY record is
-    a proven constant — the demotion iron law: complete + all-constant), or None (undetermined ->
-    the caller falls back to the top-level source_kind)."""
+    'controllable' (a web-settable / external source reaches the sink arg), 'const' (EVERY record
+    PRESENT is a proven constant), or None (undetermined -> the caller falls back to the top-level
+    source_kind).
+
+    ★ A pure classifier over the records it is handed — 'const' here means "all-constant over what
+    is present", and says NOTHING about whether the right sink is among them. The other half of the
+    demotion iron law, that the anchored sink must be present at all, is enforced by the CALLER
+    (_anchor_missed in _dim_controllability) because it gates two constant exits, not just this
+    one. Reading a 'const' from here as a completeness claim is exactly the mistake that gate
+    exists to stop."""
     recs = _scoped_records(flow_evidence, sink_anchor)
     if not recs:
         return None
@@ -513,6 +521,58 @@ def _verdict_from_provenance(
     if all(c == "const" for c in classes):
         return "const"
     return None
+
+
+# The sinks the extractor builds a def-use record for. ExportFunctions computes one
+# sink_arg_provenance record per COMMAND / FORMAT-STRING sink call and nothing else, so this set is
+# a mirror of that lexicon. A copy sink (strcpy/memcpy/…) or a path sink (fopen/…) never gets a
+# record, which means "no record for this sink" says NOTHING about them — it only says def-use does
+# not cover that sink class.
+_DEF_USE_SINKS: frozenset[str] = CMD | FMT_STRING
+
+
+def _anchor_missed(flow_evidence: str | None, sink_anchor: str | None) -> bool:
+    """True ONLY when the def-use provenance SHOULD carry the anchored sink but does NOT.
+
+    This is the COMPLETENESS half of the demotion iron law, which until now lived only in prose.
+    The shape it catches: a candidate whose real sink sits behind a thin forwarding wrapper. The
+    provenance is per-function and per-DIRECT-callee, so the caller's records hold the caller's own
+    OTHER sinks and not the wrapped one — the value actually handed to the real sink was never
+    looked at. Any "this argument is a constant" reading built on those records, or on a marker
+    computed from that same caller body, rests on never having seen the sink at all.
+
+    Three guards, with deliberately different roles:
+
+    (a) DEFENSIVE, and structurally redundant today. The anchor must be a sink def-use covers at
+        all. Under the current evidence writer a copy/path candidate always ends up with EMPTY
+        provenance, so (b) already stops every one of them and this guard fires on nothing (a real
+        atlas measures its marginal contribution at exactly 0). It is kept because the redundancy
+        is not guaranteed: if the writer ever gives a copy/path candidate a NON-empty provenance
+        carrying some unrelated def-use sink's record, (b) would pass and only this guard would
+        stop a wrong escape reading. It guards a structural possibility, not a present instance.
+    (b) LOAD-BEARING. The provenance must be non-empty. Empty means no def-use was captured here
+        at all — which is the ordinary state for a copy or path candidate, and which
+        _verdict_from_provenance already answers with None. Reading empty as "the sink escaped"
+        would sweep in thousands of candidates whose constant reading is perfectly sound (on a real
+        atlas, dropping this guard alone widens the set ~90-fold).
+    (c) LOAD-BEARING — the escape signal itself. Records exist, yet none of them is the anchored
+        sink.
+
+    ★ Necessary, not sufficient. It proves "I have at least one record for the sink I am judging",
+    NOT "the provenance is complete". A record that exists but was internally truncated is a deeper
+    gap this does not address.
+
+    ★ Boundary: a firmware-specific sink added to the extractor's lexicon at scan time is not in
+    (a)'s set, so an escape on such a sink is not caught here — that leaves the pre-existing
+    behaviour untouched rather than making it worse."""
+    if not sink_anchor:
+        return False
+    if sink_anchor not in _DEF_USE_SINKS:  # (a) defensive
+        return False
+    records = _sink_provenance_records(flow_evidence)
+    if not records:  # (b) load-bearing
+        return False
+    return not any(r.get("sink") == sink_anchor for r in records)  # (c) load-bearing
 
 
 def _web_settable_keys_reaching_sink(
@@ -911,10 +971,14 @@ def _dim_controllability(
          proven-controllable and above the optimistic 'free'. Placed before the constant steps: a
          dynamic nvram key reaching the arg cannot co-occur with a proven-constant reading — and if
          the data ever conflicts, promoting is the safe direction.
-      3. constant     — a provably-constant marker, OR the provenance is COMPLETE and every source
-         is a proven constant. Checked BEFORE the source_kind fallback so a provenance-DEEP
-         all-const candidate (e.g. an ipsec strcpy of a literal) reads constant, not free (demotion
-         iron law: incomplete provenance never reads constant).
+      3. constant     — a provably-constant marker, OR every source in the provenance is a proven
+         constant. Checked BEFORE the source_kind fallback so a provenance-DEEP all-const candidate
+         (e.g. an ipsec strcpy of a literal) reads constant, not free. ★ BOTH of these exits are
+         gated on _anchor_missed: the anchored sink must have left a def-use record here, or the
+         reading falls through to the fallback. That is the demotion iron law's completeness half,
+         and it is now code rather than a claim in this docstring — a sink hidden behind a thin
+         wrapper leaves the caller's records describing OTHER sinks, and both exits would otherwise
+         read "constant" off evidence that never saw the sink being judged.
       4. free (likely) — FALLBACK to the text-level source_kind=free_string, carried at state=likely
          (OPTIMISTIC, never proven — no positive evidence backs it, only the absence of a narrowing
          signal). This is the ONLY path that keeps a provenance-SHALLOW legit argv-free candidate (a
@@ -956,7 +1020,21 @@ def _dim_controllability(
             "getter value may be shape-constrained — confirm web-settability and an untransformed "
             "value",
         )
-    if blocking_mechanism in PROVABLY_CONSTANT_MARKERS:
+    # ★ THE COMPLETENESS GATE. Both constant exits below are suppressed when the anchored sink left
+    # no def-use record here, because neither of them can be trusted in that state:
+    #   * the marker exit is computed from the CALLER's own body, which for an escaped sink never
+    #     contains the real call — it can prove a constant is present in the caller (a format
+    #     string, say) but not that the value handed to the wrapped sink is one. A constant shell
+    #     around an attacker-filled conversion reads exactly like a constant here.
+    #   * the provenance exit reads "every record is constant" over records that are the caller's
+    #     OTHER sinks, so it comes out true vacuously.
+    # Suppressing them drops the candidate to the source_kind fallback — the safe direction. Both
+    # controllable steps above stay OPEN under the same condition: promoting on partial evidence
+    # costs a review, demoting on it hides a real one. If a future constant marker can prove the
+    # WRAPPED argument constant on its own, it belongs on an explicit allow-list with that proof
+    # written out; none does today.
+    const_trustworthy = not _anchor_missed(flow_evidence, sink_anchor)
+    if const_trustworthy and blocking_mechanism in PROVABLY_CONSTANT_MARKERS:
         return Dimension(
             "controllability",
             "proven",
@@ -964,17 +1042,23 @@ def _dim_controllability(
             f"blocking_mechanism={blocking_mechanism}",
             "provably-constant sink argument (compile-time constant, not attacker-controllable) — "
             "the only 'safe' controllability tmap asserts this phase; this is what sinks a "
-            "candidate out of the first screen",
+            "candidate out of the first screen. Asserted only with a def-use record for the "
+            "anchored sink in hand: with none, this exit is suppressed and the reading falls back",
         )
-    if prov_verdict == "const":
+    if const_trustworthy and prov_verdict == "const":
         return Dimension(
             "controllability",
             "proven",
             "constant",
-            "sink_arg_provenance: every source resolves to a proven constant (provenance complete)",
+            "sink_arg_provenance: every source resolves to a proven constant, and the anchored "
+            "sink is among the records read",
             "provably-constant via def-use (all sources constant literals, none unresolved) — "
-            "demotes out of the first screen; incomplete provenance / a variadic exec seen only at "
-            "arg0 would read unknown, NEVER constant (the demotion iron law)",
+            "demotes out of the first screen. TWO separate completeness rules hold it up, at two "
+            "different levels: per RECORD, a variadic exec seen only at arg0 reads unknown, never "
+            "constant; per CANDIDATE, the anchored sink must have left at least one record here at "
+            "all, so a sink that escaped behind a thin wrapper can never be called constant on the "
+            "strength of the caller's other sinks. Neither proves the provenance COMPLETE — a "
+            "record that exists but was internally truncated is a deeper gap",
         )
     if source_kind == "free_string":
         return Dimension(
