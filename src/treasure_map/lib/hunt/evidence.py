@@ -366,14 +366,25 @@ class EntryIndex:
         self,
         script_calls: list[tuple[str | None, str | None, int | None, str | None]],
         web_endpoints: list[tuple[str | None, str | None, str | None, str | None, str | None]],
+        exec_sites: dict[str, list[dict[str, Any]]] | None = None,
     ) -> None:
         self._script_calls = script_calls
         self._web_endpoints = web_endpoints
+        # A DIFFERENT source from the two above: not a rootfs file, but another BINARY's launch
+        # callsite, computed during the hunt (the call provenance lives in the analysis DB, not in
+        # a table this index can read). Optional on purpose — an index built without it degrades to
+        # exactly the previous behaviour instead of failing, so an older caller keeps working.
+        self._exec_sites = exec_sites or {}
 
     def sites_for(self, binary_name: str | None, binary_path: str | None) -> list[dict[str, Any]]:
         """Every entry site referencing the binary (all sites). Each script site carries the script
         path, line, and coarse argument pattern (literal / var_expansion / piped) so the parameter
         source is visible. [] means none found — the caller reports ``unknown``, NOT "unreachable".
+
+        Three kinds of reference, kept distinct so the reader knows which one they are looking at:
+        a rootfs script that invokes the binary, a web asset that names it, and another binary that
+        launches it (an ``exec_edge`` site). All three are textual/structural references, and none
+        of them is proof that input arrives — the caller must not collapse them into a verdict.
         """
         names = {n for n in (binary_name, Path(binary_path).name if binary_path else None) if n}
         if not names:
@@ -407,12 +418,20 @@ class EntryIndex:
                         "arg_source": source,
                     }
                 )
+        for name in names:
+            sites.extend(self._exec_sites.get(name, ()))
         return sites
 
 
-def load_entry_index(conn: sqlite3.Connection) -> EntryIndex:
+def load_entry_index(
+    conn: sqlite3.Connection, exec_sites: dict[str, list[dict[str, Any]]] | None = None
+) -> EntryIndex:
     """Load the L0.5 entry-evidence tables once (read-only). Missing tables yield an empty index
-    (an older analysis.db without L0.5 simply produces ``entry_reach=unknown`` everywhere)."""
+    (an older analysis.db without L0.5 simply produces ``entry_reach=unknown`` everywhere).
+
+    ``exec_sites`` comes from a different source than the two tables here — it is computed during
+    the hunt from the call provenance, keyed by the binary being launched. Omitting it degrades to
+    the rootfs-only index rather than failing, so the two sources stay independent."""
     try:
         sc = conn.execute(
             "SELECT f.path, c.command, c.line_number, c.args_pattern "
@@ -432,4 +451,5 @@ def load_entry_index(conn: sqlite3.Connection) -> EntryIndex:
     return EntryIndex(
         [(r[0], r[1], r[2], r[3]) for r in sc],
         [(r[0], r[1], r[2], r[3], r[4]) for r in we],
+        exec_sites=exec_sites,
     )

@@ -262,6 +262,68 @@ CREATE INDEX IF NOT EXISTS idx_ske_run    ON string_keyed_edge(source_run_id);
 CREATE INDEX IF NOT EXISTS idx_ske_callee ON string_keyed_edge(callee_name);
 CREATE INDEX IF NOT EXISTS idx_ske_from   ON string_keyed_edge(from_function);
 
+-- exec_edge: a cross-binary "A launches B" fact — binary A's code calls a command/exec sink whose
+-- argument names B. Recovered from the per-function sink argument provenance the extractor already
+-- computed, then resolved against the rootfs link inventory (fs_symlinks), so /bin/sh -> busybox
+-- lands as a real edge instead of an unmatched token.
+--
+-- ★ IRON LAW: this is an ENUMERATED EDGE (a fact), NEVER a reachability verdict. "A execs B" does
+-- not say the exec callsite runs, nor that an attacker reaches it. The reachability layer may use
+-- an edge as an entry SITE, and its status stays found/unknown — an edge NEVER produces 'blocked'.
+--
+-- target_resolution is a six-state, mutually exclusive, total classification of the argument token:
+--   resolved_direct     the token names a binary in this run's inventory
+--   resolved_symlink    the token is a rootfs link whose target is such a binary
+--   resolved_script     the token is a .sh that the non-binary inventory holds
+--   self_exec           /proc/self/exe (the launcher re-executes itself)
+--   unresolved          the token could not be read out of the provenance at all
+--   unmatched           read fine, matched nothing
+-- ★ unmatched is NOT "absent". It carries four plain facts so a reader can tell the cases apart
+-- WITHOUT tmap judging them: token_form (absolute/bare/relative), symlink_ambiguous (several
+-- link targets are binaries — undecided, not guessed), symlink_corrupt (the extraction damaged
+-- the link), symlink_target_unresolved (the link exists and points at resolved_via, but that
+-- target is not a known binary — it may be a script, another link, or an extraction gap).
+-- The last one is DEFAULT-DENY: any link hit that does not land on an inventory member reports it,
+-- so a damage shape nobody has seen yet degrades visibly instead of silently resolving.
+--
+-- The two sink families never overlap. SHELL (system/popen/doSystem) -> target_layer='shell_command':
+-- the target is the command's first word; the image is always /bin/sh and is deliberately NOT
+-- listed as a separate edge. EXEC (execl*/execv*) -> target_layer='exec_image': the target is the
+-- image path in arg0. ★ For the EXEC family argv is structurally invisible (a variadic list or a
+-- caller-built array): arg0 is recorded and argv is NEVER reconstructed.
+-- Replace-by-run at hunt time, alongside the other flattened edge facts.
+CREATE TABLE IF NOT EXISTS exec_edge (
+    id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_run_id            TEXT,
+    launcher_binary          TEXT,     -- A: the binary whose code holds the call
+    launcher_function        TEXT,
+    launcher_addr            TEXT,
+    exec_api                 TEXT,     -- system / popen / doSystem / execl / execv / ...
+    sink_addr                TEXT,     -- the callsite address (part of the dedup identity)
+    target_layer             TEXT,     -- shell_command | exec_image
+    shell_wrapped            INTEGER,  -- the command runs through an explicit shell -c
+    piped                    INTEGER,  -- the shell command contains a pipeline
+    inner_command_visible    INTEGER,  -- can tmap read the command the shell will run?
+    argv_visibility          TEXT,     -- known | known_with_placeholder | structurally_invisible
+    argv_template            TEXT,     -- the visible command text (shell family only)
+    argv_provenance          TEXT,     -- provenance kind of the sink argument (constant/stack_buf/...)
+    target_token             TEXT,     -- B as written at the callsite
+    target_resolution        TEXT NOT NULL,
+    token_form               TEXT,     -- absolute | relative | bare
+    symlink_ambiguous        INTEGER,
+    symlink_corrupt          INTEGER,
+    symlink_target_unresolved INTEGER,
+    target_binary            TEXT,     -- B resolved to an inventory member, else NULL
+    resolved_via             TEXT,     -- the link target name that was hit (resolved or not)
+    occurrences              INTEGER NOT NULL DEFAULT 1,
+    created_at               DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_execedge_run      ON exec_edge(source_run_id);
+CREATE INDEX IF NOT EXISTS idx_execedge_target   ON exec_edge(target_binary);
+CREATE INDEX IF NOT EXISTS idx_execedge_launcher ON exec_edge(launcher_binary);
+CREATE INDEX IF NOT EXISTS idx_execedge_res      ON exec_edge(target_resolution);
+
 -- detector_scan_status: the hunt-flattened per-(run, binary, detector) honesty status of a
 -- table-form detector, crossing the analysis.db -> atlas boundary alongside string_keyed_edge so
 -- the consumer query (which reads ATLAS, not analysis.db) can attach it to an EMPTY result. Without

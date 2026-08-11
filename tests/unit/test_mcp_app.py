@@ -38,6 +38,7 @@ _EXPECTED_TOOLS = {
     "get_sink_provenance",
     "get_nvram_key_flow",
     "get_string_keyed_edges",
+    "launched_by",
     "get_diff_deltas",
     "get_diff_meta",
     "get_function_alignment",

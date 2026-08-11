@@ -722,6 +722,7 @@ def test_static_no_unscoped_wipe_in_atlas() -> None:
         "DELETE FROM nvram_defaults WHERE source_run_id = ?",
         "DELETE FROM web_form_fields WHERE source_run_id = ?",
         "DELETE FROM string_keyed_edge WHERE source_run_id = ?",
+        "DELETE FROM exec_edge WHERE source_run_id = ?",
         "DELETE FROM detector_scan_status WHERE source_run_id = ?",
         "DELETE FROM run_capability WHERE run_id = ?",
         # diff-scoped replace-by-diff refresh (idempotent layer-0 / layer-2 re-parse), one diff_id

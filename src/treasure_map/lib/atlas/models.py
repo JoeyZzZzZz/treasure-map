@@ -202,6 +202,43 @@ class StringKeyedEdgeRow:
 
 
 @dataclass(frozen=True)
+class ExecEdgeRow:
+    """Mirrors one exec_edge row: ONE cross-binary "A launches B" fact.
+
+    Binary ``launcher_binary`` calls ``exec_api`` with an argument naming ``target_token``, which
+    resolved (or did not) to ``target_binary``. ★ An ENUMERATED EDGE, never a reachability verdict:
+    it does not claim the callsite runs or that input reaches it. ``target_resolution`` is total and
+    mutually exclusive over six states; ``unmatched`` carries the three symlink facts plus
+    ``token_form`` so a reader tells damage from ambiguity from a genuine miss without tmap
+    judging. ``occurrences`` counts identical callsite/token repeats folded into one row."""
+
+    source_run_id: str | None
+    launcher_binary: str | None
+    launcher_function: str | None
+    exec_api: str | None
+    target_token: str | None
+    target_resolution: str
+    launcher_addr: str | None = None
+    sink_addr: str | None = None
+    target_layer: str | None = None
+    shell_wrapped: int = 0
+    piped: int = 0
+    inner_command_visible: int = 0
+    argv_visibility: str | None = None
+    argv_template: str | None = None
+    argv_provenance: str | None = None
+    token_form: str | None = None
+    symlink_ambiguous: int = 0
+    symlink_corrupt: int = 0
+    symlink_target_unresolved: int = 0
+    target_binary: str | None = None
+    resolved_via: str | None = None
+    occurrences: int = 1
+    id: int | None = None
+    created_at: str | None = None
+
+
+@dataclass(frozen=True)
 class DetectorScanStatusRow:
     """Mirrors one atlas detector_scan_status row: the hunt-flattened honesty status of a table-form
     detector for one (run, binary). ``scanned`` = the detector ran; ``supported_scope`` = the

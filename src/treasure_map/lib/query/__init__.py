@@ -8,6 +8,7 @@ nothing here scores, ranks, or judges.
 
 from __future__ import annotations
 
+from treasure_map.lib.query.exec_edges import launched_by
 from treasure_map.lib.query.exploit_ledger import (
     list_cve_patterns,
     list_verified_exploits,
@@ -93,6 +94,7 @@ __all__ = [
     "get_run",
     "get_sink_provenance",
     "impact_tier",
+    "launched_by",
     "ledger",
     "list_cve_patterns",
     "list_verified_exploits",

@@ -58,6 +58,7 @@ from treasure_map.lib.query import get_nvram_key_flow as _get_nvram_key_flow
 from treasure_map.lib.query import get_run as _get_run
 from treasure_map.lib.query import get_sink_provenance as _get_sink_provenance
 from treasure_map.lib.query import get_string_keyed_edges as _get_string_keyed_edges
+from treasure_map.lib.query import launched_by as _launched_by
 from treasure_map.lib.query import ledger as _ledger
 from treasure_map.lib.query import list_cve_patterns as _list_cve_patterns
 from treasure_map.lib.query import list_runs as _list_runs
@@ -998,6 +999,36 @@ def make_tools(
             conn.close()
         return result
 
+    def launched_by(
+        target: str,
+        run_id: str | None = None,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        """Which binaries' CODE launches ``target`` — the cross-binary "A execs B" edge. Answers
+        "who starts this daemon?" and "is this binary only ever run by that one caller?" from a
+        table, instead of grepping every command string by hand.
+
+        ``target`` is a binary NAME as the inventory holds it (``busybox``, ``httpd``). Pass
+        ``run_id`` to stay inside one firmware; without it the answer spans every run in the atlas
+        and each edge names its own. Each edge carries the launcher (binary + function + address),
+        the API, whether a shell wraps it, the command template when one is visible, and — when
+        the target was reached through a rootfs symlink — which link target resolved it.
+
+        Read ``target_layer``: ``exec_image`` means the target IS the image being run;
+        ``shell_command`` means it is the first word of a command string, whose actual image is
+        /bin/sh (deliberately not listed as its own edge). The two never overlap.
+
+        ★ These are ENUMERATED FACTS, NOT a reachability verdict: an edge does not say the
+        callsite runs, nor that an attacker's input reaches it — you confirm the caller. An EMPTY
+        result is NOT proof that nothing launches the binary: read ``exec_argv_status``, which
+        names what this pass cannot see (most sharply, a caller whose command sink sits behind a
+        thin forwarding wrapper — that callsite is invisible here)."""
+        conn = open_atlas(atlas_path)
+        try:
+            return _launched_by(conn, target, run_id=run_id, limit=limit)
+        finally:
+            conn.close()
+
     def get_diff_deltas(
         diff_id: str,
         binary: str | None = None,
@@ -1546,6 +1577,7 @@ def make_tools(
         "get_sink_provenance": get_sink_provenance,
         "get_nvram_key_flow": get_nvram_key_flow,
         "get_string_keyed_edges": get_string_keyed_edges,
+        "launched_by": launched_by,
         "get_diff_deltas": get_diff_deltas,
         "get_diff_meta": get_diff_meta,
         "get_function_alignment": get_function_alignment,

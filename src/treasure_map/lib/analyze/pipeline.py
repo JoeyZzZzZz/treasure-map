@@ -25,6 +25,7 @@ from treasure_map.lib.analyze.elf_inventory import ElfRecord, scan_filesystem
 from treasure_map.lib.analyze.ghidra_ingest import IngestStats, ingest_ghidra_output
 from treasure_map.lib.analyze.ghidra_runner import GhidraRunner
 from treasure_map.lib.analyze.non_binary.orchestrator import NonBinaryStats, run_all_ingesters
+from treasure_map.lib.analyze.symlinks import SymlinkCollector, write_symlinks
 from treasure_map.lib.analyze.xrefs import XrefStats, build_xrefs
 from treasure_map.lib.config.config import Config
 from treasure_map.lib.storage.connection import open_db
@@ -63,6 +64,10 @@ class AnalyzeResult:
     # legitimately code-free (ghidra_status != ok_empty) — analysis is incomplete for them, NOT
     # clean. The CLI warns and names them so they are never mistaken for "nothing to find".
     incomplete_binaries: list[str] = field(default_factory=list)
+    # Symbolic links inventoried under the firmware root this run (the fs_symlinks table the
+    # cross-binary exec edge resolves its targets through). 0 is a real answer for a rootfs with
+    # no links; it is never a "did not run" signal — the walk always runs.
+    symlinks_recorded: int = 0
 
 
 async def run_analyze(
@@ -99,7 +104,13 @@ async def run_analyze(
     # that DID the work — not whatever happens to be installed later when the run is hunted.
     ghidra_version = runner.ghidra_version()
 
-    records = scan_filesystem(fs_root, progress_callback=progress_callback)
+    # The ELF walk already tests every entry for being a symlink; hand it a collector so those
+    # links become an inventory instead of being dropped. This walk always runs (the non-binary
+    # walk is skippable), so the inventory does not depend on an optional stage.
+    symlink_collector = SymlinkCollector(fs_root)
+    records = scan_filesystem(
+        fs_root, progress_callback=progress_callback, symlink_collector=symlink_collector
+    )
 
     conn = open_db(workspace.db_path)
     dirty_records: list[ElfRecord] = []
@@ -107,9 +118,14 @@ async def run_analyze(
     ghidra_failed = 0
     incomplete_binaries: list[str] = []
     ingest_stats = IngestStats()
+    symlinks_recorded = 0
     xref_stats = XrefStats()
     nb_stats = NonBinaryStats()
     try:
+        # Wipe-and-rebuild the link inventory (the cross-binary exec edge resolves its targets
+        # through it). Independent of Ghidra, so it lands even on a fully-cached re-analyze.
+        symlinks_recorded = write_symlinks(conn, symlink_collector.records)
+
         sha_to_id, dirty_shas = ingest_elfs(
             conn, records, reanalyze=reanalyze, pass_version=pass_version
         )
@@ -223,4 +239,5 @@ async def run_analyze(
         web_endpoints_ingested=nb_stats.sub_rows.get("web_asset", 0),
         elapsed=time.monotonic() - t0,
         incomplete_binaries=incomplete_binaries,
+        symlinks_recorded=symlinks_recorded,
     )

@@ -32,6 +32,7 @@ from treasure_map.lib import facts
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import (
     DetectorScanStatusRow,
+    ExecEdgeRow,
     InstanceRow,
     NvramDefaultRow,
     NvramFlowRow,
@@ -41,6 +42,7 @@ from treasure_map.lib.atlas.models import (
 )
 from treasure_map.lib.atlas.writer import (
     add_detector_status,
+    add_exec_edges,
     add_instance,
     add_nvram_default_rows,
     add_nvram_flow_rows,
@@ -50,6 +52,7 @@ from treasure_map.lib.atlas.writer import (
     begin_run,
     delete_run_capabilities,
     delete_run_detector_status,
+    delete_run_exec_edges,
     delete_run_instances,
     delete_run_nvram_defaults,
     delete_run_nvram_flow,
@@ -71,6 +74,13 @@ from treasure_map.lib.hunt.evidence import (
     build_fmtstr_evidence,
     build_size_evidence,
     load_entry_index,
+)
+from treasure_map.lib.hunt.exec_edges import (
+    UNSUPPORTED_NOTE,
+    ExecEdgeInventory,
+    build_exec_edges,
+    build_symlink_index,
+    exec_entry_sites,
 )
 from treasure_map.lib.hunt.facts import is_thin_cmd_wrapper
 from treasure_map.lib.hunt.refs import build_evidence_ref
@@ -117,13 +127,18 @@ def _load_caller_ids(db_path: Path | str) -> dict[int, list[int]]:
     return callers
 
 
-def _load_entry_index(db_path: Path | str) -> EntryIndex:
-    """Load the rootfs entry-evidence index (L0.5 script_calls / web_endpoints) once, read-only."""
+def _load_entry_index(
+    db_path: Path | str, exec_sites: dict[str, list[dict[str, Any]]] | None = None
+) -> EntryIndex:
+    """Load the rootfs entry-evidence index (L0.5 script_calls / web_endpoints) once, read-only.
+
+    ``exec_sites`` adds the cross-binary launch sites computed earlier in this hunt — a different
+    source from the two rootfs tables, so it arrives as an argument instead of a query."""
     uri = f"file:{Path(db_path)}?mode=ro"
     conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row
     try:
-        return load_entry_index(conn)
+        return load_entry_index(conn, exec_sites=exec_sites)
     finally:
         conn.close()
 
@@ -504,6 +519,90 @@ def _flatten_string_tables(db_path: Path | str, source_run_id: str) -> list[Stri
     return out
 
 
+def _load_exec_inventory(db_path: Path | str) -> ExecEdgeInventory:
+    """Everything a launch token is matched against: the link inventory, the binary names, and the
+    script names.
+
+    Each table is read independently and an absent one degrades to empty rather than failing: an
+    analysis.db predating the link inventory still produces edges, they simply resolve fewer
+    tokens (reported unmatched, never invented). The binary set is the run's own inventory — the
+    same set a reader can open — so "resolved" always means "you can go and read this"."""
+    uri = f"file:{Path(db_path)}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        try:
+            link_rows = conn.execute(
+                "SELECT link_path, link_name, target_name, corrupt_reason FROM fs_symlinks"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            link_rows = []  # pre-inventory analysis.db -> no link resolution, never a hard failure
+        try:
+            bins = {r[0] for r in conn.execute("SELECT name FROM binaries") if r[0]}
+        except sqlite3.OperationalError:
+            bins = set()
+        try:
+            scripts = {
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM non_binary_files WHERE kind = 'shell_script'"
+                )
+                if r[0]
+            }
+        except sqlite3.OperationalError:
+            scripts = set()
+    finally:
+        conn.close()
+    return ExecEdgeInventory(
+        symlinks=build_symlink_index([(r[0], r[1], r[2], r[3]) for r in link_rows]),
+        bin_names=frozenset(bins),
+        script_names=frozenset(scripts),
+    )
+
+
+def _flatten_exec_edges(
+    db_path: Path | str,
+    all_funcs: list[FuncRow],
+    sink_prov_by_func: dict[int, list[dict[str, Any]]],
+    source_run_id: str,
+) -> list[ExecEdgeRow]:
+    """Flatten this run's cross-binary launch edges out of the sink argument provenance.
+
+    Reads only what the extractor already recorded — it does not re-enumerate callsites, which is
+    the boundary that keeps this a projection of existing facts rather than a second detector. An
+    analysis.db with no provenance yields no edges, and the scan status says so."""
+    return build_exec_edges(
+        all_funcs, sink_prov_by_func, _load_exec_inventory(db_path), source_run_id
+    )
+
+
+def _exec_scan_status(
+    edge_rows: list[ExecEdgeRow], all_funcs: list[FuncRow], source_run_id: str
+) -> list[DetectorScanStatusRow]:
+    """One honesty row per binary for the launch-edge pass, written EVEN AT zero edges.
+
+    Without it an empty result reads as a confident "this binary launches nothing", which would be
+    wrong in every one of the ways ``unsupported_note`` lists — most sharply for a binary whose
+    command sinks all sit behind a thin wrapper, where the pass genuinely cannot see the callsite.
+    A binary with no functions at all still gets a row: it was in scope, and the scan ran."""
+    found: dict[str | None, int] = {}
+    for row in edge_rows:
+        found[row.launcher_binary] = found.get(row.launcher_binary, 0) + 1
+    binaries = {f.binary_name for f in all_funcs} | set(found)
+    return [
+        DetectorScanStatusRow(
+            source_run_id=source_run_id,
+            binary=binary,
+            detector="exec_argv",
+            scanned=1,
+            supported_scope="system/popen/doSystem command strings + execl*/execv* arg0",
+            unsupported_note=UNSUPPORTED_NOTE,
+            cap_hit=0,
+            found_count=found.get(binary, 0),
+        )
+        for binary in sorted(binaries, key=lambda b: (b is None, b or ""))
+    ]
+
+
 def _flatten_detector_status(
     db_path: Path | str, source_run_id: str
 ) -> list[DetectorScanStatusRow]:
@@ -798,7 +897,6 @@ def run_analyzer2(
     logger.info("hunt: analyzing %d functions", len(all_funcs))
     funcs: dict[int, FuncRow] = {f.func_id: f for f in all_funcs}
     callers_of = _load_caller_ids(db_path)
-    entry_index = _load_entry_index(db_path)
     # Factor ① (recall): functions whose only command sink is reached one hop through a thin
     # wrapper — invisible to the shape scan (no command sink among their own callees).
     wrapper_candidates = find_wrapper_propagated_candidates(
@@ -806,7 +904,15 @@ def run_analyzer2(
     )
     # Ghidra def-use provenance per function (merged into cmd/fmt flow_evidence below). Function-
     # level fact; keyed by func_id. Empty when the analysis.db predates the provenance column.
+    # Loaded BEFORE the entry index because the cross-binary launch edges are read out of it and
+    # feed that index as a third entry source.
     sink_prov_by_func = _load_sink_provenance(db_path)
+    # Cross-binary launch edges ("A's code execs B"), flattened into the atlas exec_edge table and
+    # ALSO offered to the entry index: a binary nothing in the rootfs mentions may still be started
+    # by another binary, which used to read as a plain coverage gap. ★ Only edges whose target
+    # resolved to a real binary become entry sites, and a site never produces a 'blocked' status.
+    exec_edge_rows = _flatten_exec_edges(db_path, all_funcs, sink_prov_by_func, source_run_id)
+    entry_index = _load_entry_index(db_path, exec_sites=exec_entry_sites(exec_edge_rows))
     # gap② phase 2: per-function nvram read/write ops, flattened into the atlas nvram_key_flow
     # table below so an agent can trace a key's writers/readers across binaries. Empty when the
     # analysis.db predates the nvram_ops column.
@@ -837,6 +943,9 @@ def run_analyzer2(
     # detector A honesty status (per binary): flattened into atlas alongside the edges so an EMPTY
     # result carries "scanned / scope / cap_hit" instead of reading as a confident "none".
     detector_status_rows = _flatten_detector_status(db_path, source_run_id)
+    # Launch-edge honesty status (per binary), written even at zero edges — an empty result must
+    # not read as "this binary launches nothing" when the pass has known structural gaps.
+    detector_status_rows += _exec_scan_status(exec_edge_rows, all_funcs, source_run_id)
     # ONE-HOP string-key leads: which candidates sit one direct call below an edge callee. Computed
     # here because the call graph lives in the analysis DB (the atlas holds no callgraph), and rides
     # to the reachability layer on flow_evidence — the same compute-at-hunt/read-at-triage path as
@@ -848,7 +957,10 @@ def run_analyzer2(
     capability_rows = [
         RunCapabilityRow(
             run_id=source_run_id, capability="reachability.string_keyed_edge", present=1
-        )
+        ),
+        # Registered UNCONDITIONALLY, exactly like the one above: this tmap version ran the
+        # launch-edge pass, so the capability is present even on a firmware with zero edges.
+        RunCapabilityRow(run_id=source_run_id, capability="reachability.exec_argv_edge", present=1),
     ]
 
     by_status = {"confirmed": 0, "blocked": 0, "unknown": 0}
@@ -901,6 +1013,9 @@ def run_analyzer2(
             # same txn (replace-by-run). The capability is registered even with zero edges.
             delete_run_string_keyed_edges(atlas, source_run_id, commit=False)
             add_string_keyed_edges(atlas, string_keyed_edge_rows, commit=False)
+            # Cross-binary launch edges: same replace-by-run refresh, same transaction.
+            delete_run_exec_edges(atlas, source_run_id, commit=False)
+            add_exec_edges(atlas, exec_edge_rows, commit=False)
             # detector A honesty status: refresh in the SAME txn (replace-by-run). Written even at
             # zero tables so an empty edge result can attach it — the whole reason this exists.
             delete_run_detector_status(atlas, source_run_id, commit=False)

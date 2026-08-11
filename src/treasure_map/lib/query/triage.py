@@ -180,31 +180,35 @@ def _entry_reach_sites(flow_evidence: str | None) -> list[dict[str, Any]]:
     return [s for s in sites if isinstance(s, dict)]
 
 
+# The entry kinds a site may carry, in the FIXED order they are joined into a label. Order is
+# load-bearing: it keeps ``entry:web+script`` spelled exactly as it always was, so a stored value,
+# a filter string, and a cross-version comparison all keep matching.
+_ENTRY_KIND_LABELS: tuple[tuple[str, str], ...] = (
+    ("web_endpoint", "web"),
+    ("script_call", "script"),
+    ("exec_edge", "exec"),
+)
+
+
 def _entry_reach_status(flow_evidence: str | None) -> str:
-    """Classify the rootfs entry evidence into an HONEST, multi-valued MECHANISTIC label, reading
-    each ``entry_reach.sites`` entry's ``kind`` (the fact the evidence layer recorded) — NOT
-    collapsing every site to a single misleading "found":
+    """Classify the entry evidence into an HONEST, multi-valued MECHANISTIC label, reading each
+    ``entry_reach.sites`` entry's ``kind`` (the fact the evidence layer recorded) — NOT collapsing
+    every site to a single misleading "found":
 
       ``entry:web``         a web-asset endpoint references this binary (boundary match)
       ``entry:script``      a boot/rootfs script invokes this binary (exact tail match)
-      ``entry:web+script``  both kinds of reference exist — reported TOGETHER, neither one
-                            preferred over the other (collapsing to one recreates "found")
+      ``entry:exec``        another binary's code launches this binary (a resolved launch edge)
+      ``entry:web+script``  several kinds of reference exist — reported TOGETHER in a fixed order,
+                            none preferred over the others (collapsing to one recreates "found")
       ``unknown``           no site found: a coverage gap, NEVER "unreachable"
 
-    This is a MECHANISTIC label ("the binary name appears on this kind of rootfs edge"), NOT a
+    This is a MECHANISTIC label ("the binary name appears on this kind of edge"), NOT a
     reachability verdict — it does not decide whether an attacker's input actually arrives here.
     The caveats live in ``_dim_reachability``'s note. It answers the entry level only; entry->sink
     flow is a separate, unmodeled question. Conservative: no parseable site reports ``unknown``."""
     kinds = {s.get("kind") for s in _entry_reach_sites(flow_evidence)}
-    web = "web_endpoint" in kinds
-    script = "script_call" in kinds
-    if web and script:
-        return "entry:web+script"
-    if web:
-        return "entry:web"
-    if script:
-        return "entry:script"
-    return "unknown"
+    present = [label for kind, label in _ENTRY_KIND_LABELS if kind in kinds]
+    return f"entry:{'+'.join(present)}" if present else "unknown"
 
 
 def _entry_web_triggers(flow_evidence: str | None, *, limit: int = 3) -> tuple[str, ...]:
@@ -1070,8 +1074,9 @@ def _dim_source_writability(
 # state/value — they stay in the note. The standard-flow caveat is the always-true honest note (a
 # textual reference is not a dispatch proof); the completeness caveat names the unmodeled bridge.
 _REACH_CAVEAT_STANDARD_FLOW = (
-    "a rootfs entry references this binary — a textual reference, NOT proof the input arrives from "
-    "that entry; confirm the endpoint/script actually dispatches here"
+    "an entry edge references this binary — a rootfs reference or another binary's launch "
+    "callsite, NOT proof the input arrives from it; confirm the endpoint/script/caller actually "
+    "dispatches here"
 )
 _REACH_CAVEAT_COMPLETENESS = (
     "service-dispatch / IPC bridges (notify_rc / rc_service: httpd->rc) are NOT modeled, so a "
@@ -1163,11 +1168,13 @@ def _dim_reachability(
     string_keyed_edges: tuple[dict[str, Any], ...] = (),
     flow_evidence: str | None = None,
 ) -> Dimension:
-    """Which kind of rootfs entry references this binary? A MECHANISTIC label — entry:web /
-    entry:script / entry:web+script / unknown — NEVER a reachability verdict (it does not decide
-    whether the input arrives) and never a claim about an authentication boundary. ``state`` is
-    proven for any SOUND entry reference (the boundary-matched web edge and the exact-tail script
-    edge are both sound); unknown for a coverage gap. A ? is NEVER 'unreachable' and never sinks.
+    """Which kind of entry edge references this binary? A MECHANISTIC label — entry:web /
+    entry:script / entry:exec / their ``+`` combinations / unknown — NEVER a reachability verdict
+    (it does not decide whether the input arrives) and never a claim about an authentication
+    boundary. ``state`` is proven for any SOUND entry reference (the boundary-matched web edge, the
+    exact-tail script edge, and a launch edge whose target resolved to this very binary are all
+    sound REFERENCES — soundness of the reference, never of the dataflow behind it); unknown for a
+    coverage gap. A ? is NEVER 'unreachable' and never sinks.
     The two caveats (standard-flow + completeness) always ride in ``note`` and never collapse into
     state/value (contract C7). This answers the ENTRY level only — entry->sink flow within a
     function is a separate, unmodeled question.
@@ -1191,7 +1198,7 @@ def _dim_reachability(
             "reachability",
             "proven",
             entry_reach,
-            "flow_evidence.entry_reach.sites (rootfs script / web-asset reference)",
+            "flow_evidence.entry_reach.sites (rootfs script / web-asset / launch-edge reference)",
             note + edge_note,
             leads,
         )
@@ -1200,9 +1207,11 @@ def _dim_reachability(
         "unknown",
         "unknown",
         "flow_evidence.entry_reach.sites",
-        "no rootfs script/web entry found — reported unknown (a coverage gap), NOT unreachable: "
-        "the binary may be invoked indirectly, via another binary's exec, or over an unmodeled "
-        "service-dispatch/IPC bridge (notify_rc); a ? never sinks" + edge_note,
+        "no script/web/launch entry found — reported unknown (a coverage gap), NOT unreachable: "
+        "cross-binary launch edges are enumerated but INCOMPLETE (a caller behind a thin command "
+        "wrapper is invisible to that pass, and a token that could not be read resolves to "
+        "nothing), and a service-dispatch/IPC bridge (notify_rc) is not modeled at all; a ? never "
+        "sinks" + edge_note,
         leads,
     )
 

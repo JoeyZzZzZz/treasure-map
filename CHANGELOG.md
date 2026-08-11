@@ -25,6 +25,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`launched_by` — which binaries' code launches a given binary.** The call graph inside one
+  binary was covered; the edge between two was not, so a daemon nothing in the rootfs mentions read
+  as a plain coverage gap even when another binary starts it on every boot. The hunt now reads the
+  command and exec callsites out of the sink argument provenance it already stores, resolves the
+  named program against a new inventory of the rootfs symlinks, and records one `A launches B`
+  edge per callsite. `/bin/sh -> busybox` therefore lands as a real edge instead of a dead token.
+  Each edge names the launcher (binary, function, address), the API, whether a shell wraps it, and
+  the command template when one is visible.
+  These are ENUMERATED FACTS, never a reachability verdict: an edge does not say the callsite runs
+  or that input reaches it. A token that resolved to nothing is still on the table, carrying why —
+  the shape it was written in, and separately whether a symlink was ambiguous, damaged by the
+  extraction tool, or pointing at something that never became a binary. An empty answer ships with
+  the pass's own scan status naming what it cannot see; most sharply, a caller whose command sink
+  sits behind a thin forwarding wrapper is INVISIBLE to this pass, because the caller's provenance
+  does not contain the wrapped sink. Reading empty as "nothing launches this" would be wrong there.
+- **Reachability can now read `entry:exec`.** A resolved launch edge counts as an entry reference
+  alongside the rootfs script and web-asset ones, and combines with them (`entry:web+script+exec`)
+  in a fixed order that leaves the existing spellings untouched. Only an edge whose target resolved
+  to a real binary qualifies; a script target and every unresolved state do not. As before, an
+  entry reading is a MECHANISTIC label and never a verdict — and this path can only ever report
+  found or unknown, never "blocked".
+- **`tmap analyze` records the firmware's symbolic links** and reports the count. The walk already
+  tested each entry for being a link on its way to skipping it; that test now runs BEFORE the
+  is-a-regular-file test, because following a link answers False for exactly the two damaged
+  classes that matter — a dangling link and one an extraction tool flattened onto `/dev/null`. Each
+  link records its final target and, when it has none, which kind of damage: placeholder, dangling,
+  escaping the firmware root, or a chain too long to follow. tmap does not repair a damaged link
+  and does not guess which applet a flattened one meant; it records the damage and leaves the call
+  to the reader.
+
 - **`get_nvram_key_flow` takes an optional `run_id`.** The graph still spans every scanned firmware
   by default — often the point, and each row already names its run — but auditing one image no
   longer means reading another device's rows out of the answer. The scope applies to all three

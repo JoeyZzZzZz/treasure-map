@@ -16,6 +16,7 @@ from treasure_map.lib.atlas.models import (
     DiffMetaRow,
     DimensionCapabilityStateRow,
     DimensionDeltaRow,
+    ExecEdgeRow,
     FunctionAlignmentRow,
     FunctionPresenceRow,
     InstanceRow,
@@ -144,6 +145,71 @@ def add_string_keyed_edges(
                 r.completeness_status,
                 r.completeness_reason,
                 r.completeness_scope,
+            )
+            for r in rows
+        ],
+    )
+    if commit:
+        conn.commit()
+    return len(rows)
+
+
+def delete_run_exec_edges(
+    conn: sqlite3.Connection, source_run_id: str, *, commit: bool = True
+) -> int:
+    """Delete all exec_edge rows of one run (replace-by-run refresh). Returns rows deleted.
+
+    Touches ONLY this run_id's rows — other firmware's launch edges are untouched. commit=False
+    joins the caller's transaction so a run's flatten is atomic with its instance write."""
+    cur = conn.execute("DELETE FROM exec_edge WHERE source_run_id = ?", (source_run_id,))
+    if commit:
+        conn.commit()
+    return cur.rowcount
+
+
+def add_exec_edges(
+    conn: sqlite3.Connection, rows: list[ExecEdgeRow], *, commit: bool = True
+) -> int:
+    """Insert flattened cross-binary launch edges in one batch; return the count.
+
+    Neutral enumerated-edge facts ("A's code calls exec with an argument naming B"), NEVER a
+    reachability verdict. No validation beyond the schema: every honesty flag the hunt computed is
+    stored verbatim, including the ones that say the target could NOT be resolved — a row that
+    resolved nothing is exactly the row a reader must still see."""
+    if not rows:
+        return 0
+    conn.executemany(
+        """INSERT INTO exec_edge
+           (source_run_id, launcher_binary, launcher_function, launcher_addr, exec_api, sink_addr,
+            target_layer, shell_wrapped, piped, inner_command_visible, argv_visibility,
+            argv_template, argv_provenance, target_token, target_resolution, token_form,
+            symlink_ambiguous, symlink_corrupt, symlink_target_unresolved, target_binary,
+            resolved_via, occurrences)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        [
+            (
+                r.source_run_id,
+                r.launcher_binary,
+                r.launcher_function,
+                r.launcher_addr,
+                r.exec_api,
+                r.sink_addr,
+                r.target_layer,
+                r.shell_wrapped,
+                r.piped,
+                r.inner_command_visible,
+                r.argv_visibility,
+                r.argv_template,
+                r.argv_provenance,
+                r.target_token,
+                r.target_resolution,
+                r.token_form,
+                r.symlink_ambiguous,
+                r.symlink_corrupt,
+                r.symlink_target_unresolved,
+                r.target_binary,
+                r.resolved_via,
+                r.occurrences,
             )
             for r in rows
         ],

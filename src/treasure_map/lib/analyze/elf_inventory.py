@@ -11,6 +11,8 @@ from pathlib import Path
 
 from elftools.elf.elffile import ELFFile
 
+from treasure_map.lib.analyze.symlinks import SymlinkCollector
+
 logger = logging.getLogger(__name__)
 
 
@@ -199,18 +201,28 @@ def sha256_file(path: Path) -> str:
 def scan_filesystem(
     fs_root: Path,
     progress_callback: object | None = None,
+    symlink_collector: SymlinkCollector | None = None,
 ) -> list[ElfRecord]:
     """Walk *fs_root* and return one ElfRecord per unique ELF binary.
 
     Symlinks are skipped (Ghidra resolves them to the real file name, which
     causes output to be written under the wrong path).  Content-identical
     files (same sha256) are deduplicated — only the first occurrence is kept.
+
+    ``symlink_collector`` turns the links this walk already skips into an inventory instead of
+    dropping them. ★ Its test runs BEFORE ``is_file()``: is_file() follows the link, so a dangling
+    or /dev/null-placeholder link answers False there and would be discarded as "not a regular
+    file" before anything recognized it as a link — losing exactly the damaged links that matter.
+    The collector is keyed by path, so several walks may share one without double-counting.
     """
     results: list[ElfRecord] = []
     seen_sha: set[str] = set()
 
     for fpath in sorted(fs_root.rglob("*")):
-        if not fpath.is_file() or fpath.is_symlink():
+        is_link = (
+            symlink_collector.offer(fpath) if symlink_collector is not None else fpath.is_symlink()
+        )
+        if is_link or not fpath.is_file():
             continue
         try:
             with fpath.open("rb") as f:

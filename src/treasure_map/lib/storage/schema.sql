@@ -196,6 +196,30 @@ CREATE TABLE IF NOT EXISTS detector_scan_status (
 );
 CREATE INDEX IF NOT EXISTS idx_detscan_binary ON detector_scan_status(binary_id);
 
+-- fs_symlinks: every symbolic link under the firmware root (WIPE-AND-REBUILD each analyze run).
+-- A rootfs routes much of its command surface through links (/bin/sh -> busybox), so a
+-- cross-binary "A execs B" edge cannot tell "B is really busybox" from "B was never extracted"
+-- without this table. ★ Records the link and its FINAL target only — it never repairs what the
+-- extraction tool destroyed and never guesses which applet a flattened link meant. corrupt_reason
+-- separates the damage classes a reader must not conflate: devnull_placeholder (target is exactly
+-- /dev/null — an unpacker placeholder OR a genuinely special node; telling those apart needs an
+-- applet roster, a semantic call this layer refuses), escapes_root (target normalizes outside the
+-- root — checked before existence so the HOST filesystem can never answer for the firmware),
+-- dangling (inside the root, nothing there), chain_unresolved (link chain too long or cyclic).
+-- resolved=1 ONLY with corrupt_reason NULL. Both lookup directions are indexed: link_path for an
+-- absolute token (/bin/sh, unique) and link_name for a bare token (sh, may hit several links).
+CREATE TABLE IF NOT EXISTS fs_symlinks (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    link_path     TEXT,               -- relative to firmware fs_root
+    link_name     TEXT,               -- basename of the link itself
+    target_raw    TEXT,               -- readlink value, verbatim
+    target_name   TEXT,               -- basename of the FINAL target after following the chain
+    resolved      INTEGER NOT NULL DEFAULT 0,
+    corrupt_reason TEXT               -- devnull_placeholder/escapes_root/dangling/chain_unresolved/NULL
+);
+CREATE INDEX IF NOT EXISTS idx_fs_symlinks_path ON fs_symlinks(link_path);
+CREATE INDEX IF NOT EXISTS idx_fs_symlinks_name ON fs_symlinks(link_name);
+
 -- 非二进制文件主表 (Round C framework; WIPE-AND-REBUILD each analyze run)
 -- sha256 = cross-firmware identity key for the knowledge base. Indexed,
 -- intentionally NOT unique (a file + its copy at another path are two findings).
