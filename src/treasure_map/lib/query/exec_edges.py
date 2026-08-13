@@ -75,14 +75,25 @@ def _row_to_edge(r: sqlite3.Row) -> dict[str, Any]:
 
 
 def _exec_scan_status(
-    conn: sqlite3.Connection, run_id: str | None, binary: str | None
+    conn: sqlite3.Connection, run_id: str | None, binary: str | None, *, per_binary: bool
 ) -> dict[str, Any]:
     """The launch-edge pass's honesty status for the queried scope, so an EMPTY result carries
     whether the silence can be trusted.
 
     ★ Scoped to the ``exec_argv`` pass only. An empty edge list is a confident 'nothing launches
     this' ONLY when a status row says scanned=1 AND the shapes in ``unsupported_note`` do not
-    apply to the code you care about. No status row => not scanned or not re-hunted => UNKNOWN."""
+    apply to the code you care about. No status row => not scanned or not re-hunted => UNKNOWN.
+
+    Two shapes, because the per-binary rows are only ever READ in one situation. ``scanned_total``
+    and ``found_total`` always ride along: they are what an "is this pass covering anything?"
+    check needs, and they cost nothing. The row-by-row list rides only when ``per_binary`` is set —
+    which the caller does exactly when the answer came back EMPTY, the one moment a reader goes
+    looking for a specific launcher to decide whether the silence is trustworthy. With an answer in
+    hand nobody reads those rows, and there are enough of them (a real atlas spanning several
+    firmware produces roughly two thousand) to bury the answer they annotate.
+
+    The rows are never SUMMARISED away, only withheld when unread: the totals are an addition, not
+    a replacement, and asking a question that comes back empty always returns the full list."""
     where = ["detector = 'exec_argv'"]
     params: list[Any] = []
     for col, val in (("source_run_id", run_id), ("binary", binary)):
@@ -104,14 +115,27 @@ def _exec_scan_status(
     # actually varies per binary.
     scopes = {r["supported_scope"] for r in rows if r["supported_scope"]}
     notes = {r["unsupported_note"] for r in rows if r["unsupported_note"]}
-    return {
+    status: dict[str, Any] = {
         "pass_scope": "exec_argv",
         # Shared across every row. A set with more than one member would mean rows from runs of
         # DIFFERENT tmap versions are being read together, so they are joined rather than one being
         # picked — a silently-dropped scope would understate what the pass cannot see.
         "supported_scope": " | ".join(sorted(scopes)) or None,
         "unsupported_note": " | ".join(sorted(notes)) or None,
-        "statuses": [
+        # The floor: enough to see the pass ran and produced something, without the row list.
+        "scanned_total": len(rows),
+        "found_total": sum(r["found_count"] or 0 for r in rows),
+        "note": (
+            "Honesty status for the exec_argv pass ONLY. An EMPTY launched_by result is a "
+            "confident 'nothing in this firmware launches it' ONLY when a status has scanned=1 "
+            "and none of the unsupported_note shapes covers the caller you care about. No "
+            "statuses => not scanned or not re-hunted => UNKNOWN, never 'nothing launches it'. "
+            "The per-binary rows ride along whenever the answer is empty — the moment you need "
+            "them to check whether the launcher you suspect was in the scanned set at all."
+        ),
+    }
+    if per_binary:
+        status["statuses"] = [
             {
                 "binary": r["binary"],
                 "scanned": r["scanned"],
@@ -121,14 +145,8 @@ def _exec_scan_status(
                 "found_count": r["found_count"],
             }
             for r in rows
-        ],
-        "note": (
-            "Honesty status for the exec_argv pass ONLY. An EMPTY launched_by result is a "
-            "confident 'nothing in this firmware launches it' ONLY when a status has scanned=1 "
-            "and none of the unsupported_note shapes covers the caller you care about. No "
-            "statuses => not scanned or not re-hunted => UNKNOWN, never 'nothing launches it'."
-        ),
-    }
+        ]
+    return status
 
 
 def launched_by(
@@ -140,12 +158,24 @@ def launched_by(
 ) -> dict[str, Any]:
     """Which binaries' code launches ``target``, and how.
 
-    ``target`` accepts either spelling the table can hold: a binary's SHORT NAME as the inventory
-    lists it (``busybox``, ``httpd``), or a launched SCRIPT's path under the firmware root
-    (``usr/sbin/getmac``). A script is stored by path — a basename would be ambiguous when two
-    directories hold different scripts of the same name — so a short name is matched against the
-    stored path's basename too. Asking for ``getmac`` therefore finds the script edge, and when
-    several scripts share that basename you get all of them rather than a guess.
+    ``target`` takes any spelling a reader plausibly has in hand:
+
+      * a binary's SHORT NAME as the inventory lists it (``busybox``, ``httpd``);
+      * a launched SCRIPT's stored path (``usr/sbin/getmac``);
+      * an edge's ``target_token`` copied VERBATIM out of a result — which is how the code wrote it,
+        so it usually carries a leading slash (``/usr/sbin/pluginmanager``).
+
+    That third spelling is the one a reader reaches for first, and it used to answer zero. Targets
+    are stored the way the inventory holds them — a script by its root-relative path, a binary by
+    its short name — and neither carries the leading slash the source text does. So a leading-slash
+    query is compared against the stored value with the slash removed, and against its basename;
+    both are EXACT comparisons, never a prefix or suffix match. Matching a full path by its basename
+    mirrors how the token was resolved in the first place: a binary is identified by name, not by
+    the path the callsite happened to spell.
+
+    ★ One case still answers zero on purpose: a token a SYMLINK renamed. ``/bin/sh`` resolves to
+    ``busybox``, and no spelling of ``sh`` is ``busybox`` — ask for ``target_binary`` instead. The
+    edge itself carries both, so the result you copied from names the answer.
 
     Only edges whose token RESOLVED to the target are returned — a token that matched nothing is in
     the table but belongs to no target, so it can never be silently attributed here. Pass
@@ -156,11 +186,22 @@ def launched_by(
     attacker reaches it. An EMPTY result is NOT proof that nothing launches the binary — read the
     accompanying scan status, which names the shapes this pass cannot see (a caller behind a thin
     command wrapper being the sharpest one)."""
-    # ★ Exact basename comparison, never a LIKE: a suffix match would answer `getmac` with an
-    # unrelated `foogetmac`. Registered per call — the connection is the caller's.
+    # ★ Every comparison is exact equality — never a LIKE, which would answer `getmac` with an
+    # unrelated `foogetmac`. Registered per call: the connection is the caller's.
     conn.create_function("tm_basename", 1, lambda p: posixpath.basename(p) if p else p)
-    where = ["(target_binary = ? OR tm_basename(target_binary) = ?)"]
-    params: list[Any] = [target, target]
+    # For a query with no slash in it all three spellings collapse to the same string, so a
+    # short-name lookup runs exactly the comparison it always did.
+    query_unrooted = target.lstrip("/")
+    query_basename = posixpath.basename(target)
+    where = [
+        "("
+        "target_binary = ?"  # the stored value, verbatim
+        " OR target_binary = ?"  # a leading-slash query against a root-relative stored path
+        " OR target_binary = ?"  # a leading-slash query against a stored short name
+        " OR tm_basename(target_binary) = ?"  # a short-name query against a stored path
+        ")"
+    ]
+    params: list[Any] = [target, query_unrooted, query_basename, target]
     if run_id is not None:
         where.append("source_run_id = ?")
         params.append(run_id)
@@ -179,7 +220,8 @@ def launched_by(
             "count": 0,
             "truncated": False,
             "note": "exec_edge table absent (older atlas or not re-hunted yet)",
-            "exec_argv_status": _exec_scan_status(conn, run_id, None),
+            # No table at all is the emptiest answer there is: give the rows.
+            "exec_argv_status": _exec_scan_status(conn, run_id, None, per_binary=True),
         }
     edges = [_row_to_edge(r) for r in rows]
     return {
@@ -189,8 +231,8 @@ def launched_by(
         "truncated": len(edges) >= limit,
         "launcher_binaries": sorted({str(e["launcher"]["binary"]) for e in edges if e["launcher"]}),
         # ★ The pass's honesty travels WITH the result so an EMPTY one is never read as a
-        # confident 'nothing launches this'.
-        "exec_argv_status": _exec_scan_status(conn, run_id, None),
+        # confident 'nothing launches this' — and the per-binary rows come with it precisely then.
+        "exec_argv_status": _exec_scan_status(conn, run_id, None, per_binary=not edges),
         "note": (
             "Enumerated cross-binary launch edges (A's code calls a command/exec sink whose "
             "argument names B). A FACT, NOT a reachability verdict: an edge does not say the "

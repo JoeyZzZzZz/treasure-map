@@ -574,6 +574,173 @@ def test_script_edge_answers_to_both_its_short_name_and_its_path(tmp_path: Path)
         conn.close()
 
 
+# ── looking an edge up by the spelling a reader actually has ──────────────────────────
+
+
+def _edge_row(**kw: Any) -> Any:
+    from treasure_map.lib.atlas.models import ExecEdgeRow
+
+    base: dict[str, Any] = {
+        "source_run_id": "run1",
+        "launcher_binary": "web_daemon",
+        "launcher_function": "starter",
+        "exec_api": "system",
+        "target_resolution": "resolved_direct",
+    }
+    return ExecEdgeRow(**{**base, **kw})
+
+
+def _seeded_atlas(tmp_path: Path) -> Any:
+    """One edge of each storage shape, plus two decoys a sloppy match would grab."""
+    from treasure_map.lib.atlas.writer import add_exec_edges
+
+    conn = open_atlas(tmp_path / "atlas.db")
+    add_exec_edges(
+        conn,
+        [
+            # a script: stored by its root-relative path, the token as the code wrote it
+            _edge_row(
+                target_token="/usr/sbin/webs_update.sh",
+                target_binary="usr/sbin/webs_update.sh",
+                target_resolution="resolved_script",
+            ),
+            # a binary: stored by short name, the token again as the code wrote it
+            _edge_row(target_token="/usr/sbin/pluginmanager", target_binary="pluginmanager"),
+            # a symlink-renamed target: no spelling of the token is the stored name
+            _edge_row(
+                target_token="/bin/sh",
+                target_binary="busybox",
+                target_resolution="resolved_symlink",
+            ),
+            # decoys: only a prefix/suffix match would return these
+            _edge_row(target_token="foopluginmanager", target_binary="foopluginmanager"),
+            _edge_row(target_token="manager", target_binary="manager"),
+        ],
+    )
+    return conn
+
+
+def test_a_token_copied_verbatim_out_of_an_edge_finds_that_edge(tmp_path: Path) -> None:
+    # ★ P1. The spelling a reader has in hand is the edge's own target_token — the code's own text,
+    # so it carries a leading slash. Targets are stored the way the inventory holds them, which
+    # never does. Both stored shapes must answer that query, or the reader gets a zero and reads it
+    # as "nothing launches this" — the misreading this whole surface exists to prevent.
+    #
+    # MUTATIONS (each verified RED, 1 failed): in query/exec_edges.launched_by delete
+    #  (a) the second comparison and its `query_unrooted` param -> the script query returns 0;
+    #  (b) the third comparison and its `query_basename` param -> the binary query returns 0.
+    conn = _seeded_atlas(tmp_path)
+    try:
+        assert launched_by(conn, "/usr/sbin/webs_update.sh")["count"] == 1  # stored relative
+        assert launched_by(conn, "/usr/sbin/pluginmanager")["count"] == 1  # stored short
+        # the stored spellings keep working, unchanged
+        assert launched_by(conn, "usr/sbin/webs_update.sh")["count"] == 1
+        assert launched_by(conn, "pluginmanager")["count"] == 1
+        # a short name still reaches a script stored by path
+        assert launched_by(conn, "webs_update.sh")["count"] == 1
+    finally:
+        conn.close()
+
+
+def test_a_symlink_renamed_target_answers_zero_and_says_where_to_look(tmp_path: Path) -> None:
+    # ★ The one case that stays at zero on purpose: no spelling of `/bin/sh` is `busybox`. Guessing
+    # would mean resolving links at read time, which is the write side's job and was already done —
+    # the edge carries both names. The docstring points at target_binary rather than leaving the
+    # reader with an unexplained empty.
+    conn = _seeded_atlas(tmp_path)
+    try:
+        assert launched_by(conn, "/bin/sh")["count"] == 0
+        assert launched_by(conn, "busybox")["count"] == 1  # the exit named in the docstring
+    finally:
+        conn.close()
+    assert "target_binary" in launched_by.__doc__
+    assert "symlink" in launched_by.__doc__.lower()
+
+
+def test_lookup_never_matches_on_a_prefix_or_suffix(tmp_path: Path) -> None:
+    # Every comparison is exact equality. The decoys differ from the query by a prefix and by a
+    # path segment, and both must stay out — a widened match would attribute another binary's
+    # launcher to this one.
+    #
+    # MUTATION (verified RED, 1 failed): in query/exec_edges.launched_by widen the first comparison
+    # to `target_binary LIKE '%' || ?` -> the foopluginmanager decoy is returned too.
+    conn = _seeded_atlas(tmp_path)
+    try:
+        assert launched_by(conn, "pluginmanager")["count"] == 1
+        assert launched_by(conn, "/usr/sbin/pluginmanager")["count"] == 1
+        assert launched_by(conn, "manager")["count"] == 1  # the decoy answers only to itself
+    finally:
+        conn.close()
+
+
+def test_a_short_name_query_is_one_comparison_repeated(tmp_path: Path) -> None:
+    # A query with no slash collapses all three spellings to the same string, so the added
+    # comparisons cannot change what a short-name lookup returns — the property that makes this
+    # safe to widen. Asserted on the queries themselves rather than on a remembered count.
+    import posixpath
+
+    for name in ("busybox", "sh", "pluginmanager", "manager"):
+        assert name == name.lstrip("/") == posixpath.basename(name)
+    conn = _seeded_atlas(tmp_path)
+    try:
+        got = {e["target_binary"] for e in launched_by(conn, "busybox")["edges"]}
+        assert got == {"busybox"}
+    finally:
+        conn.close()
+
+
+# ── the scan status carries its detail where it is actually read ──────────────────────
+
+
+def test_status_detail_rides_only_with_an_empty_answer(tmp_path: Path) -> None:
+    # ★ The per-binary rows are read in exactly one situation: the answer came back empty and the
+    # reader wants to know whether the launcher they suspect was even scanned. With an answer in
+    # hand nobody reads them, and a real atlas has enough of them to bury the answer. The totals
+    # ride along either way, so "did this pass cover anything" is always answerable.
+    #
+    # ★ The rows are WITHHELD when unread, never summarised away: an empty answer still returns
+    # every one of them. Replacing them with the totals would leave a reader unable to tell
+    # "scanned and found nothing" from "never scanned".
+    #
+    # MUTATION (verified RED, 1 failed): in query/exec_edges.launched_by pass
+    # `per_binary=True` unconditionally -> the non-empty answer carries the detail again.
+    from treasure_map.lib.atlas.models import DetectorScanStatusRow
+    from treasure_map.lib.atlas.writer import add_detector_status
+
+    conn = _seeded_atlas(tmp_path)
+    try:
+        add_detector_status(
+            conn,
+            [
+                DetectorScanStatusRow("run1", "web_daemon", "exec_argv", 1, "scope", "note", 0, 5),
+                DetectorScanStatusRow("run1", "quiet_lib", "exec_argv", 1, "scope", "note", 0, 0),
+            ],
+        )
+        answered = launched_by(conn, "pluginmanager")
+        empty = launched_by(conn, "nothing_launches_this")
+
+        assert answered["count"] == 1
+        assert "statuses" not in answered["exec_argv_status"]
+        assert answered["exec_argv_status"]["scanned_total"] == 2
+        assert answered["exec_argv_status"]["found_total"] == 5
+        # the shared note stays in both shapes — it is what makes an empty answer readable
+        assert answered["exec_argv_status"]["unsupported_note"] == "note"
+
+        assert empty["count"] == 0
+        assert [s["binary"] for s in empty["exec_argv_status"]["statuses"]] == [
+            "web_daemon",
+            "quiet_lib",
+        ]
+        assert empty["exec_argv_status"]["scanned_total"] == 2
+        # a scanned-but-found-nothing binary is still listed: that is the evidence that an empty
+        # answer about it is trustworthy, and dropping it would erase the distinction
+        assert {"binary": "quiet_lib", "scanned": 1, "cap_hit": False, "found_count": 0} in empty[
+            "exec_argv_status"
+        ]["statuses"]
+    finally:
+        conn.close()
+
+
 # ── recovering a program name from a built command template ───────────────────────────
 
 

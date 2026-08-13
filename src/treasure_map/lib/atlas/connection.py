@@ -155,6 +155,16 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # hand-filled, unconsumed field. Idempotent — runs only while the column exists.
         conn.execute("ALTER TABLE pattern DROP COLUMN device_category")
 
+    ee_cols = _column_names(conn, "exec_edge")
+    if "resolved_via" in ee_cols:
+        # Hard-removed: it restated target_binary on every row, and where a symlink resolved the
+        # target the link's own name is the basename of the token — derivable, so it was stored
+        # twice. Dropping it from the schema stops new writes but cannot touch a table that already
+        # exists, so an atlas built before that change keeps the column, holding values written
+        # under the OLD meaning for as long as its runs are not re-hunted. Idempotent; none of
+        # exec_edge's indexes references the column, so no index has to be dropped first.
+        conn.execute("ALTER TABLE exec_edge DROP COLUMN resolved_via")
+
     # gap② A2 (added this round): the thin nvram wrapper a wrapper-indirect key edge was resolved
     # through. Nullable TEXT — existing rows carry NULL (a DIRECT edge) until re-hunted. Idempotent.
     nvkf_cols = _column_names(conn, "nvram_key_flow")

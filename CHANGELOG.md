@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Looking an edge up by the token it shows you now works.** `launched_by` matched a target the
+  way the inventory stores it — a script by its root-relative path, a binary by its short name —
+  but the spelling a reader has in hand is the edge's own `target_token`, which is the code's text
+  and so carries a leading slash. Copying it straight back in returned zero, which reads as
+  "nothing launches this": the misreading this whole surface exists to prevent. A leading-slash
+  query is now also compared against the stored value with the slash removed, and against its
+  basename. Every comparison stays exact equality — never a prefix or suffix match — and a query
+  with no slash in it collapses to the same string three times, so short-name lookups are
+  unchanged. One case still answers zero on purpose: a token a SYMLINK renamed (`/bin/sh` resolves
+  to `busybox`, and no spelling of `sh` is `busybox`); the docstring now points at `target_binary`,
+  which the edge already carries, instead of leaving an unexplained empty.
+- **`launched_by` carries its per-binary status where it is actually read.** The rows were attached
+  to every answer — across several firmware, around two thousand of them — burying the answer they
+  annotate. They ride now only when the result came back EMPTY, which is the one moment a reader
+  goes looking for whether the launcher they suspect was scanned at all. Two totals ride along
+  always, so "did this pass cover anything" stays answerable without the list. The rows are
+  withheld when unread, never summarised away: an empty answer still returns every one of them,
+  including the scanned-but-found-nothing binaries that are precisely the evidence an empty answer
+  is trustworthy.
+- **An atlas built before `resolved_via` was removed now sheds the column on open.** Dropping it
+  from the schema stopped new writes, but `CREATE TABLE IF NOT EXISTS` cannot alter a table that
+  already exists, so an older atlas kept it — holding values written under the old meaning for as
+  long as its runs went un-hunted. The migration that removes it has to run on the ATLAS
+  connection, since that is where the table is created; hanging it on the analysis database would
+  find no such table and skip in silence.
+
 - **A launched script is recognised by being a script, not by its name ending in `.sh`.** The
   resolver demanded both inventory membership AND the suffix, which reads backwards on a real
   rootfs: a script invoked as a program is typically the one WITHOUT a suffix (an `init.d` entry,

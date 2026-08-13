@@ -803,6 +803,39 @@ def test_open_atlas_reopens_old_dimension_delta_missing_binary(tmp_path: Path) -
         conn2.close()
 
 
+def test_open_atlas_drops_a_stale_exec_edge_resolved_via(tmp_path: Path) -> None:
+    # ★ resolved_via restated target_binary and was removed from the schema — but CREATE TABLE IF
+    # NOT EXISTS cannot alter a table that already exists, so an atlas built before that change
+    # keeps the column, holding values written under the OLD meaning for as long as its runs are
+    # not re-hunted. The migration has to drop it, and it has to run on the ATLAS connection: this
+    # table is created by the atlas schema, so a migration hung on the analysis database would find
+    # no such table and skip in silence, leaving the column forever.
+    #
+    # MUTATION (verified RED, 1 failed): in atlas/connection.py comment out the
+    # `conn.execute("ALTER TABLE exec_edge DROP COLUMN resolved_via")` line -> the column survives
+    # the reopen.
+    db = tmp_path / "atlas.db"
+    conn = open_atlas(db)
+    assert "resolved_via" not in _table_cols(conn, "exec_edge")  # a fresh atlas is already clean
+    conn.execute("ALTER TABLE exec_edge ADD COLUMN resolved_via TEXT")
+    conn.execute(
+        "INSERT INTO exec_edge (source_run_id, target_resolution, target_binary, resolved_via) "
+        "VALUES ('run1', 'resolved_symlink', 'busybox', 'busybox')"
+    )
+    conn.commit()
+    assert "resolved_via" in _table_cols(conn, "exec_edge")  # old shape now
+    conn.close()
+
+    conn2 = open_atlas(db)  # must NOT raise
+    try:
+        assert "resolved_via" not in _table_cols(conn2, "exec_edge")
+        # the ROW survives — this drops a redundant column, it does not discard edges
+        assert conn2.execute("SELECT COUNT(*) FROM exec_edge").fetchone()[0] == 1
+        assert conn2.execute("SELECT target_binary FROM exec_edge").fetchone()[0] == "busybox"
+    finally:
+        conn2.close()
+
+
 @pytest.mark.parametrize(
     ("table", "col"),
     [
