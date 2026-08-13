@@ -281,8 +281,9 @@ CREATE INDEX IF NOT EXISTS idx_ske_from   ON string_keyed_edge(from_function);
 -- ★ unmatched is NOT "absent". It carries four plain facts so a reader can tell the cases apart
 -- WITHOUT tmap judging them: token_form (absolute/bare/relative), symlink_ambiguous (several
 -- link targets are binaries — undecided, not guessed), symlink_corrupt (the extraction damaged
--- the link), symlink_target_unresolved (the link exists and points at resolved_via, but that
--- target is not a known binary — it may be a script, another link, or an extraction gap).
+-- the link), symlink_target_unresolved (the link exists but its target is not a known binary — it
+-- may be a script, another link, or an extraction gap; the link's own name is basename of the
+-- token, so it is not stored a second time).
 -- The last one is DEFAULT-DENY: any link hit that does not land on an inventory member reports it,
 -- so a damage shape nobody has seen yet degrades visibly instead of silently resolving.
 --
@@ -313,8 +314,7 @@ CREATE TABLE IF NOT EXISTS exec_edge (
     symlink_ambiguous        INTEGER,
     symlink_corrupt          INTEGER,
     symlink_target_unresolved INTEGER,
-    target_binary            TEXT,     -- B resolved to an inventory member, else NULL
-    resolved_via             TEXT,     -- the link target name that was hit (resolved or not)
+    target_binary            TEXT,     -- B resolved: a binary short name, or a script's path
     occurrences              INTEGER NOT NULL DEFAULT 1,
     created_at               DATETIME DEFAULT CURRENT_TIMESTAMP
 );

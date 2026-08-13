@@ -65,13 +65,14 @@ def _prov(sink: str, provenance: dict[str, Any], addr: str = "0x11020") -> dict[
 def _inventory(
     links: list[tuple[str, str, str | None, str | None]] | None = None,
     binaries: set[str] | None = None,
-    scripts: set[str] | None = None,
+    scripts: dict[str, tuple[str, ...]] | None = None,
 ) -> ExecEdgeInventory:
-    """``links`` rows are (link_path, link_name, target_name, corrupt_reason)."""
+    """``links`` rows are (link_path, link_name, target_name, corrupt_reason); ``scripts`` maps a
+    script basename to the path(s) the inventory holds for it."""
     return ExecEdgeInventory(
         symlinks=build_symlink_index(list(links or [])),
         bin_names=frozenset(binaries or {"web_daemon", "busybox"}),
-        script_names=frozenset(scripts or set()),
+        scripts=dict(scripts or {}),
     )
 
 
@@ -113,7 +114,6 @@ def test_exec_of_interpreter_link_resolves_to_the_multicall_binary() -> None:
     (edge,) = _edges([_prov("execl", _const("/bin/sh"))], inv)
     assert edge.target_resolution == "resolved_symlink"
     assert edge.target_binary == "busybox"
-    assert edge.resolved_via == "busybox"
     assert edge.target_layer == "exec_image"
     assert (edge.shell_wrapped, edge.inner_command_visible) == (1, 0)
     assert edge.argv_visibility == "structurally_invisible"
@@ -280,7 +280,6 @@ def _classify(spec: dict[str, Any]) -> str:
             target_unresolved=spec.get("target_unresolved", False),
         ),
         in_non_binary=spec.get("in_non_binary", False),
-        is_sh_script=spec.get("sh", False),
     )
 
 
@@ -406,7 +405,7 @@ def test_link_whose_target_is_not_a_known_binary_is_default_denied() -> None:
     #      `return SymlinkMatch(via_symlink=True, matched_targets=tuple(sorted(hits)))`
     #      -> resolution becomes resolved_symlink, a target_binary is claimed.
     #  (b) lose the fact — change the same line to `return SymlinkMatch()` -> all three flags read
-    #      0 and resolved_via is None, so "the link IS there" is gone.
+    #      0, so "the link IS there" is gone entirely.
     inv = _inventory(
         links=[("bin/tool_x", "tool_x", "helper_tool", None)],
         binaries={"web_daemon", "busybox"},
@@ -415,12 +414,11 @@ def test_link_whose_target_is_not_a_known_binary_is_default_denied() -> None:
     assert edge.target_resolution == "unmatched"
     assert edge.symlink_target_unresolved == 1
     assert (edge.symlink_ambiguous, edge.symlink_corrupt) == (0, 0)
-    assert edge.resolved_via == "helper_tool"
     assert edge.target_binary is None
 
 
 def test_script_target_resolves_but_never_grants_an_entry_site() -> None:
-    inv = _inventory(binaries={"web_daemon"}, scripts={"restart.sh"})
+    inv = _inventory(binaries={"web_daemon"}, scripts={"restart.sh": ("etc/init.d/restart.sh",)})
     (edge,) = _edges([_prov("system", _const("/etc/init.d/restart.sh reload"))], inv)
     assert edge.target_resolution == "resolved_script"
     assert exec_entry_sites([edge]) == {}
@@ -492,6 +490,213 @@ def test_parse_of_empty_command_yields_an_empty_first_word() -> None:
     assert (parsed.first_word, parsed.piped, parsed.shell_wrapped) == ("", False, False)
 
 
+# ── launched scripts: recognition, addressability, and the multi-candidate boundary ───
+
+
+def test_a_script_without_a_dot_sh_suffix_still_resolves() -> None:
+    # ★ C1. A script invoked as a program is usually the one with NO suffix — an init.d entry, an
+    # sbin helper. Demanding `.sh` on top of inventory membership pushed those into `unmatched`,
+    # which reads as "I do not recognize this token" about a file the inventory holds by name.
+    #
+    # MUTATION (verified RED, 1 failed): in exec_edges.classify_target_resolution restore the
+    # suffix gate — `if in_non_binary and token.endswith(".sh"):` — and this token falls to
+    # 'unmatched'.
+    inv = _inventory(binaries={"web_daemon"}, scripts={"getmac": ("usr/sbin/getmac",)})
+    (edge,) = _edges([_prov("system", _const("getmac eth0"))], inv)
+    assert edge.target_resolution == "resolved_script"
+
+
+def test_single_path_script_records_the_path_so_the_edge_is_answerable() -> None:
+    # ★ A2. A resolved script edge used to leave target_binary NULL, so the read tool — which looks
+    # up by that column — could never answer for a script. The path is what gets recorded, not the
+    # token: a third of these tokens are bare, and storing whichever spelling the callsite happened
+    # to use would fill one column with two kinds of key.
+    #
+    # MUTATION (verified RED, 1 failed): in exec_edges._build_row delete the
+    # `elif resolution == RESOLVED_SCRIPT and len(script_paths) == 1:` branch -> target_binary is
+    # None again and the edge is unanswerable.
+    inv = _inventory(binaries={"web_daemon"}, scripts={"getmac": ("usr/sbin/getmac",)})
+    (edge,) = _edges([_prov("system", _const("/usr/sbin/getmac eth0"))], inv)
+    assert (edge.target_resolution, edge.target_binary) == ("resolved_script", "usr/sbin/getmac")
+
+
+def test_a_name_held_by_several_scripts_is_left_unpicked() -> None:
+    # ★ The multi-candidate boundary. Two directories hold genuinely different scripts under one
+    # name. The edge still says "a script resolved" — that much is known — but names none of them:
+    # picking one would be a guess, and the candidates stay recoverable by looking the basename up
+    # in the script inventory.
+    #
+    # MUTATION (verified RED, 1 failed): in exec_edges._build_row drop the single-path condition —
+    # `elif resolution == RESOLVED_SCRIPT and script_paths:` with `target_binary = script_paths[0]`
+    # -> one of the two candidates is silently chosen.
+    inv = _inventory(
+        binaries={"web_daemon"},
+        scripts={"led_ctl": ("etc/init.d/led_ctl", "usr/sbin/led_ctl")},
+    )
+    (edge,) = _edges([_prov("system", _const("led_ctl on"))], inv)
+    assert edge.target_resolution == "resolved_script"
+    assert edge.target_binary is None
+
+
+def test_script_edge_answers_to_both_its_short_name_and_its_path(tmp_path: Path) -> None:
+    # ★ A2-r. Storing scripts by path makes the lookup key heterogeneous: binaries answer to a
+    # short name, scripts to a path. A reader asking `launched_by("getmac")` would get 0 rows and
+    # read it as "nothing launches it" — the exact misreading this whole surface exists to prevent.
+    # A short name is therefore matched against the stored path's basename as well.
+    #
+    # MUTATION (verified RED, 1 failed): in query/exec_edges.launched_by drop the alternative —
+    # `where = ["target_binary = ?"]` with a single param -> the short-name query returns 0.
+    from treasure_map.lib.atlas.models import ExecEdgeRow
+    from treasure_map.lib.atlas.writer import add_exec_edges
+
+    conn = open_atlas(tmp_path / "atlas.db")
+    try:
+        add_exec_edges(
+            conn,
+            [
+                ExecEdgeRow(
+                    source_run_id="run1",
+                    launcher_binary="web_daemon",
+                    launcher_function="starter",
+                    exec_api="system",
+                    target_token="getmac",
+                    target_resolution="resolved_script",
+                    target_binary="usr/sbin/getmac",
+                )
+            ],
+        )
+        assert launched_by(conn, "getmac", run_id="run1")["count"] == 1
+        assert launched_by(conn, "usr/sbin/getmac", run_id="run1")["count"] == 1
+        # exact basename comparison, never a suffix match
+        assert launched_by(conn, "mac", run_id="run1")["count"] == 0
+        assert launched_by(conn, "foogetmac", run_id="run1")["count"] == 0
+    finally:
+        conn.close()
+
+
+# ── recovering a program name from a built command template ───────────────────────────
+
+
+def test_constant_argument_is_substituted_back_into_the_template() -> None:
+    # ★ B1. `snprintf(buf, "%s '%s'", "/usr/sbin/tool -j", user)` builds a command whose first word
+    # is a conversion, so the template alone resolves to nothing — while the program name sits
+    # right there as a constant argument. Substituting the constants recovers it.
+    #
+    # The runtime argument is deliberately NOT substituted: its conversion stays, the visibility
+    # still reports a placeholder, and no target is claimed for a value nobody has seen.
+    #
+    # MUTATION (verified RED, 1 failed): in exec_edges._arg_values stop substituting —
+    # `out.append(fmt)` in place of `out.append(_substitute_constant_args(fmt, ...))` -> the first
+    # word is '%s' and the target goes unresolved.
+    inv = _inventory(binaries={"web_daemon", "tool"})
+    prov = {
+        "kind": "stack_buf",
+        "stack_key": "sp-0x40",
+        "writers": [
+            {
+                "writer": "snprintf@0x1",
+                "dominates_sink": True,
+                "fmt": "%s '%s'",
+                "varargs": [
+                    {"pos": 3, "spec": "%s", "source": _const("/usr/sbin/tool -j")},
+                    {"pos": 4, "spec": "%s", "source": {"kind": "param", "name": "user"}},
+                ],
+            }
+        ],
+    }
+    (edge,) = _edges([_prov("system", prov)], inv)
+    assert edge.target_token == "/usr/sbin/tool"
+    assert edge.target_binary == "tool"
+    assert edge.argv_visibility == "known_with_placeholder"
+    assert edge.argv_template == "/usr/sbin/tool -j '%s'"
+
+
+def test_a_runtime_first_word_is_never_fabricated() -> None:
+    # The mirror of the above: when the first conversion's argument is NOT a constant, nothing is
+    # substituted there and the target stays honestly unresolved. Substituting it would invent a
+    # program name out of a value nobody has seen.
+    #
+    # ★ The load-bearing case is the SECOND one below. A parameter source carries no value at all,
+    # so even a broken filter could not substitute it. A constant the extractor confirms but could
+    # NOT read out as text does carry a value — the string "0x8f20" — and pasting that in would
+    # name a program that does not exist. That is the fabrication the readable-constant test stops.
+    #
+    # MUTATION (verified RED, 1 failed): in exec_edges._substitute_constant_args delete
+    # `if not isinstance(source, dict) or source.get("value_kind") != "literal_string": continue`
+    # -> the unreadable constant is pasted in as if it were a name and the template becomes
+    # "0x8f20 -j".
+    inv = _inventory(binaries={"web_daemon", "tool"})
+
+    def _writer(source: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "kind": "stack_buf",
+            "writers": [
+                {
+                    "writer": "snprintf@0x1",
+                    "dominates_sink": True,
+                    "fmt": "%s -j",
+                    "varargs": [{"pos": 3, "spec": "%s", "source": source}],
+                }
+            ],
+        }
+
+    (from_param,) = _edges([_prov("system", _writer({"kind": "param", "name": "p"}))], inv)
+    assert from_param.target_resolution == "unresolved"
+
+    unreadable = {"kind": "constant", "value": "0x8f20", "value_kind": "ambiguous_0x"}
+    (from_unreadable,) = _edges([_prov("system", _writer(unreadable))], inv)
+    assert from_unreadable.target_resolution == "unresolved"
+    assert from_unreadable.argv_template == "%s -j"
+
+
+def test_substitution_maps_conversions_to_arguments_by_the_shared_scanner() -> None:
+    # A local count of '%' characters gets the mapping wrong the moment a format uses %% or a
+    # *-supplied width — and putting a constant at the wrong offset names the WRONG program, which
+    # is worse than naming none. The mapping comes from the scanner the read layer already uses.
+    #
+    # MUTATION (verified RED, 1 failed): in exec_edges._substitute_constant_args drop the star
+    # guard — remove `or conv.stars` from the skip condition -> the *-width case substitutes at the
+    # wrong offset and the recovered token changes.
+    from treasure_map.lib.hunt.exec_edges import _substitute_constant_args
+
+    args = [
+        {"source": _const("AAA")},
+        {"source": _const("BBB")},
+        {"source": _const("CCC")},
+    ]
+    # %% consumes nothing, so the first conversion still takes argument 0
+    assert _substitute_constant_args("100%% %s", args) == "100%% AAA"
+    # a *-width consumes an argument of its own before the conversion
+    assert _substitute_constant_args("%*s", args) == "%*s"
+    assert _substitute_constant_args("%s %s", args) == "AAA BBB"
+    # a %d is a number, never a program name
+    assert _substitute_constant_args("%d %s", args) == "%d BBB"
+
+
+def test_shared_scanner_and_the_read_layer_agree_on_arity() -> None:
+    # The scanner is shared precisely so these cannot drift; an off-by-one does not fail loudly, it
+    # silently attributes the wrong argument to a conversion.
+    from treasure_map.lib.fmt_spec import arity, conversions
+    from treasure_map.lib.query.triage import _fmt_arity
+
+    for fmt, expected in [
+        ("", 0),
+        ("no conversions", 0),
+        ("%s", 1),
+        ("%%", 0),
+        ("100%% done: %s", 1),
+        ("%*s", 2),
+        ("%-10.*s %s", 3),
+        ("%ld %s", 2),
+        ("trailing %", 0),
+    ]:
+        assert arity(fmt) == expected, fmt
+        assert _fmt_arity(fmt) == expected, fmt
+    # every conversion's arg_index is below the arity it reports
+    for conv in conversions("%-10.*s %s %d"):
+        assert conv.arg_index < arity("%-10.*s %s %d")
+
+
 # ── end-to-end: the hunt writes the table, the status, and the capability ─────────────
 
 
@@ -548,6 +753,58 @@ def test_hunt_writes_the_edge_and_the_consumer_reads_it_back(tmp_path: Path) -> 
     assert result["launcher_binaries"] == ["web_daemon"]
 
 
+def test_hunt_wires_the_script_inventory_end_to_end(tmp_path: Path) -> None:
+    # ★ END-TO-END WIRING for the script path. Every other script test builds the inventory by
+    # hand, so all of them stay green even if the hunt never loads a path out of analysis.db — the
+    # classic shape where the library is tested and the wiring is not. This one goes through the
+    # real loader: a shell_script row with a path, a caller that launches it by bare name, and a
+    # read tool that answers for it.
+    #
+    # MUTATION (verified RED, 1 failed): in analyzer2._load_exec_inventory drop the paths —
+    # `scripts={k: () for k in scripts}` in place of the sorted-tuple mapping -> the edge resolves
+    # but carries no target_binary, so launched_by answers 0.
+    db = tmp_path / "analysis.db"
+    conn = open_db(db)
+    conn.execute(
+        "INSERT INTO binaries (id, name, path, sha256) VALUES (1, 'web_daemon', "
+        "'/usr/sbin/web_daemon', ?)",
+        ("d" * 64,),
+    )
+    conn.execute(
+        "INSERT INTO functions (binary_id, name, address, pseudocode, callees, sink_provenance) "
+        "VALUES (1, 'starter', '00011000', ?, ?, ?)",
+        (
+            'void starter(void){ system("getmac eth0"); }',
+            json.dumps(["system"]),
+            json.dumps([_prov("system", _const("getmac eth0"))]),
+        ),
+    )
+    # a launched script with NO .sh suffix — the shape the suffix gate used to hide
+    conn.execute(
+        "INSERT INTO non_binary_files (kind, name, path, sha256) "
+        "VALUES ('shell_script', 'getmac', 'usr/sbin/getmac', ?)",
+        ("e" * 64,),
+    )
+    conn.commit()
+    conn.close()
+
+    atlas_path = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas_path, source_run_id="run1")
+
+    conn2 = open_atlas(atlas_path)
+    try:
+        rows = conn2.execute(
+            "SELECT target_resolution, target_binary FROM exec_edge WHERE source_run_id='run1'"
+        ).fetchall()
+        by_short = launched_by(conn2, "getmac", run_id="run1")
+        by_path = launched_by(conn2, "usr/sbin/getmac", run_id="run1")
+    finally:
+        conn2.close()
+    assert [tuple(r) for r in rows] == [("resolved_script", "usr/sbin/getmac")]
+    assert by_short["count"] == 1, "a reader asking by short name must not get a silent 0"
+    assert by_path["count"] == 1
+
+
 def test_hunt_registers_the_capability_unconditionally(tmp_path: Path) -> None:
     # No edges in this firmware, yet the capability is registered: the pass RAN. Absence of edges
     # is not absence of the capability, and a cross-version comparison relies on the difference.
@@ -590,12 +847,20 @@ def test_zero_edge_result_carries_a_visible_scan_status(tmp_path: Path) -> None:
     finally:
         conn.close()
     assert result["count"] == 0
-    statuses = result["exec_argv_status"]["statuses"]
-    assert statuses, "an empty result with no status reads as a confident 'nothing launches it'"
-    assert all(s["scanned"] == 1 for s in statuses)
-    note = statuses[0]["unsupported_note"]
+    status = result["exec_argv_status"]
+    assert status["statuses"], "an empty result with no status reads as a confident 'none'"
+    assert all(s["scanned"] == 1 for s in status["statuses"])
+    # ★ The note and the scope describe the PASS, so they are carried ONCE at the top rather than
+    # copied onto every binary — on a real atlas that copy made the status several times the size
+    # of the answer it annotates, and pushed a count:0 result over the response limit.
+    note = status["unsupported_note"]
     assert "thin command wrapper" in note
     assert "posix_spawn" in note
+    assert status["supported_scope"]
+    assert not any("unsupported_note" in s for s in status["statuses"]), (
+        "the shared note must not be duplicated per binary"
+    )
+    assert set(status["statuses"][0]) == {"binary", "scanned", "cap_hit", "found_count"}
 
 
 def test_scan_status_covers_a_binary_that_produced_no_edges(tmp_path: Path) -> None:

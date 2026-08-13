@@ -16,6 +16,7 @@ The two families are disjoint, so a row is one or the other and never counted tw
 
 from __future__ import annotations
 
+import posixpath
 import sqlite3
 from typing import Any
 
@@ -23,7 +24,7 @@ _COLS = (
     "source_run_id, launcher_binary, launcher_function, launcher_addr, exec_api, sink_addr, "
     "target_layer, shell_wrapped, piped, inner_command_visible, argv_visibility, argv_template, "
     "argv_provenance, target_token, target_resolution, token_form, symlink_ambiguous, "
-    "symlink_corrupt, symlink_target_unresolved, target_binary, resolved_via, occurrences"
+    "symlink_corrupt, symlink_target_unresolved, target_binary, occurrences"
 )
 
 _LAYER_NOTES = {
@@ -63,7 +64,6 @@ def _row_to_edge(r: sqlite3.Row) -> dict[str, Any]:
             "argv_provenance": r["argv_provenance"],
         },
         "symlink": {
-            "resolved_via": r["resolved_via"],
             "ambiguous": bool(r["symlink_ambiguous"]),
             "corrupt": bool(r["symlink_corrupt"]),
             "target_unresolved": bool(r["symlink_target_unresolved"]),
@@ -97,15 +97,26 @@ def _exec_scan_status(
         rows = conn.execute(sql, params).fetchall()
     except sqlite3.OperationalError:
         rows = []  # pre-feature atlas / not re-hunted -> no status recorded (also UNKNOWN)
+    # Every row of a run carries the SAME scope and note — they describe the PASS, not the binary.
+    # Repeating them per binary made the status dwarf the answer it was attached to (on a real
+    # atlas, ~1500 rows each carrying the same ~700 characters), to the point that a count:0 result
+    # could not be returned inline. Hoisted to one shared copy; the per-binary rows keep only what
+    # actually varies per binary.
+    scopes = {r["supported_scope"] for r in rows if r["supported_scope"]}
+    notes = {r["unsupported_note"] for r in rows if r["unsupported_note"]}
     return {
         "pass_scope": "exec_argv",
+        # Shared across every row. A set with more than one member would mean rows from runs of
+        # DIFFERENT tmap versions are being read together, so they are joined rather than one being
+        # picked — a silently-dropped scope would understate what the pass cannot see.
+        "supported_scope": " | ".join(sorted(scopes)) or None,
+        "unsupported_note": " | ".join(sorted(notes)) or None,
         "statuses": [
             {
-                "run_id": r["source_run_id"],
                 "binary": r["binary"],
                 "scanned": r["scanned"],
-                "supported_scope": r["supported_scope"],
-                "unsupported_note": r["unsupported_note"],
+                # KEPT even though a real atlas has never seen it set: this is the honest-degrade
+                # channel, and a channel that has not fired is not a channel to delete.
                 "cap_hit": bool(r["cap_hit"]),
                 "found_count": r["found_count"],
             }
@@ -129,18 +140,27 @@ def launched_by(
 ) -> dict[str, Any]:
     """Which binaries' code launches ``target``, and how.
 
-    ``target`` is a binary NAME as the inventory holds it (``busybox``, ``httpd``). Only edges
-    whose token RESOLVED to that binary are returned — a token that matched nothing is in the
-    table but belongs to no target, so it can never be silently attributed here. Pass ``run_id``
-    to stay inside one firmware; without it the answer spans every run in the atlas and each edge
-    says which run it came from.
+    ``target`` accepts either spelling the table can hold: a binary's SHORT NAME as the inventory
+    lists it (``busybox``, ``httpd``), or a launched SCRIPT's path under the firmware root
+    (``usr/sbin/getmac``). A script is stored by path — a basename would be ambiguous when two
+    directories hold different scripts of the same name — so a short name is matched against the
+    stored path's basename too. Asking for ``getmac`` therefore finds the script edge, and when
+    several scripts share that basename you get all of them rather than a guess.
+
+    Only edges whose token RESOLVED to the target are returned — a token that matched nothing is in
+    the table but belongs to no target, so it can never be silently attributed here. Pass
+    ``run_id`` to stay inside one firmware; without it the answer spans every run in the atlas and
+    each edge says which run it came from.
 
     ★ A FACT, NOT a reachability verdict. An edge does not say the callsite runs or that an
     attacker reaches it. An EMPTY result is NOT proof that nothing launches the binary — read the
     accompanying scan status, which names the shapes this pass cannot see (a caller behind a thin
     command wrapper being the sharpest one)."""
-    where = ["target_binary = ?"]
-    params: list[Any] = [target]
+    # ★ Exact basename comparison, never a LIKE: a suffix match would answer `getmac` with an
+    # unrelated `foogetmac`. Registered per call — the connection is the caller's.
+    conn.create_function("tm_basename", 1, lambda p: posixpath.basename(p) if p else p)
+    where = ["(target_binary = ? OR tm_basename(target_binary) = ?)"]
+    params: list[Any] = [target, target]
     if run_id is not None:
         where.append("source_run_id = ?")
         params.append(run_id)
@@ -176,7 +196,15 @@ def launched_by(
             "argument names B). A FACT, NOT a reachability verdict: an edge does not say the "
             "callsite runs, nor that input reaches it — confirm the caller yourself. Read each "
             "edge's target_layer: exec_image means B is the image, shell_command means B is the "
-            "command's first word (the /bin/sh image is not listed separately). Empty is NOT "
-            "proof of nothing — check exec_argv_status."
+            "command's first word (the /bin/sh image is not listed separately). A target_binary "
+            "holding a path is a launched SCRIPT; a short name is a binary. When a symlink "
+            "resolved the target, the link's own name is basename(target_token) — derivable, so "
+            "it is not stored a second time. A resolution with target_binary NULL means several "
+            "candidates shared the name and none was picked: look the basename up in the script "
+            "or symlink inventory to see them. Attribution to a callsite is an OVER-APPROXIMATION: "
+            "a stack buffer reused by several exec points carries all of its writers at each of "
+            "them, so sink_addr means 'some exec point in this function' — 'this function can run "
+            "B' holds, 'this callsite runs B' does not. Empty is NOT proof of nothing — check "
+            "exec_argv_status."
         ),
     }

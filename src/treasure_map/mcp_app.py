@@ -1008,11 +1008,13 @@ def make_tools(
         "who starts this daemon?" and "is this binary only ever run by that one caller?" from a
         table, instead of grepping every command string by hand.
 
-        ``target`` is a binary NAME as the inventory holds it (``busybox``, ``httpd``). Pass
-        ``run_id`` to stay inside one firmware; without it the answer spans every run in the atlas
-        and each edge names its own. Each edge carries the launcher (binary + function + address),
-        the API, whether a shell wraps it, the command template when one is visible, and — when
-        the target was reached through a rootfs symlink — which link target resolved it.
+        ``target`` takes either a binary's SHORT NAME as the inventory lists it (``busybox``,
+        ``httpd``) or a launched SCRIPT's path under the firmware root (``usr/sbin/getmac``).
+        Scripts are stored by path, and a short name is matched against that path's basename too,
+        so ``getmac`` finds the script edge either way. Pass ``run_id`` to stay inside one
+        firmware; without it the answer spans every run in the atlas and each edge names its own.
+        Each edge carries the launcher (binary + function + address), the API, whether a shell
+        wraps it, and the command template when one is visible.
 
         Read ``target_layer``: ``exec_image`` means the target IS the image being run;
         ``shell_command`` means it is the first word of a command string, whose actual image is

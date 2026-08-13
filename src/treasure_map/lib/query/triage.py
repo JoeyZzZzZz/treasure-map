@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from treasure_map.lib.fmt_spec import arity as fmt_arity
 from treasure_map.lib.pattern.classes import CMD, FMT_STRING
 from treasure_map.lib.query.nvram import _web_settable
 from treasure_map.lib.query.sink_impact import (
@@ -707,40 +708,13 @@ def _sink_provenance_summary(
 
 
 def _fmt_arity(fmt: str) -> int:
-    """Number of arguments a printf-style format string consumes: one per conversion specifier
-    (``%%`` excluded), plus one for each ``*`` width/precision taken from an argument. Mirrors the
-    ExportFunctions specifier scan so the read-side trim never drops a genuinely-consumed arg."""
-    n = 0
-    i = 0
-    length = len(fmt)
-    while i < length:
-        if fmt[i] != "%":
-            i += 1
-            continue
-        j = i + 1
-        if j < length and fmt[j] == "%":  # literal %%
-            i = j + 1
-            continue
-        stars = 0
-        while j < length and fmt[j] in "-+ 0#":  # flags
-            j += 1
-        while j < length and (fmt[j].isdigit() or fmt[j] == "*"):  # width
-            if fmt[j] == "*":
-                stars += 1
-            j += 1
-        if j < length and fmt[j] == ".":  # precision
-            j += 1
-            while j < length and (fmt[j].isdigit() or fmt[j] == "*"):
-                if fmt[j] == "*":
-                    stars += 1
-                j += 1
-        while j < length and fmt[j] in "hljztL":  # length modifiers
-            j += 1
-        if j >= length:
-            break
-        n += 1 + stars  # the conversion char + any *-supplied width/precision
-        i = j + 1
-    return n
+    """Number of arguments a printf-style format string consumes.
+
+    Delegates to the shared scanner, which the extractor-mirroring rules live in — the same one the
+    launch-edge layer uses to map a conversion to its argument. A second copy here would be a
+    second thing to keep in step, and an off-by-one in either does not fail loudly; it silently
+    attributes the wrong argument to a conversion."""
+    return fmt_arity(fmt)
 
 
 def _trim_writer_varargs(writer: dict[str, Any]) -> dict[str, Any]:

@@ -232,7 +232,6 @@ class ExecEdgeRow:
     symlink_corrupt: int = 0
     symlink_target_unresolved: int = 0
     target_binary: str | None = None
-    resolved_via: str | None = None
     occurrences: int = 1
     id: int | None = None
     created_at: str | None = None

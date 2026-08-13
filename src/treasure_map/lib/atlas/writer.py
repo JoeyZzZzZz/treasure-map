@@ -184,8 +184,8 @@ def add_exec_edges(
             target_layer, shell_wrapped, piped, inner_command_visible, argv_visibility,
             argv_template, argv_provenance, target_token, target_resolution, token_form,
             symlink_ambiguous, symlink_corrupt, symlink_target_unresolved, target_binary,
-            resolved_via, occurrences)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            occurrences)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         [
             (
                 r.source_run_id,
@@ -208,7 +208,6 @@ def add_exec_edges(
                 r.symlink_corrupt,
                 r.symlink_target_unresolved,
                 r.target_binary,
-                r.resolved_via,
                 r.occurrences,
             )
             for r in rows

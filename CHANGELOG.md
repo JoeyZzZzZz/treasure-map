@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A launched script is recognised by being a script, not by its name ending in `.sh`.** The
+  resolver demanded both inventory membership AND the suffix, which reads backwards on a real
+  rootfs: a script invoked as a program is typically the one WITHOUT a suffix (an `init.d` entry,
+  an `sbin` helper), while `.sh` tends to mark the library scripts other scripts source. Known
+  scripts were therefore reported `unmatched` — "I do not recognise this" about a file the
+  inventory holds by name. Membership is now the whole test; the query behind the inventory selects
+  shell scripts only, so nothing else can arrive there, and no second-guessing heuristic is layered
+  on the file classification.
+- **A launched script can now be looked up.** Script edges recorded no target at all, so the read
+  tool — which looks up by that column — could never answer for one. A resolved script now records
+  its PATH (not the token: a third of these tokens are bare, and storing whichever spelling the
+  callsite used would fill one column with two kinds of key). Because that makes the lookup key
+  heterogeneous — binaries by short name, scripts by path — a short name is now also matched
+  against the stored path's basename, so asking for `getmac` finds the script edge instead of
+  returning a silent zero that reads as "nothing launches it". The comparison is on the exact
+  basename, never a suffix match. When several scripts share a basename the edge still says a
+  script resolved but names none of them: picking one would be a guess, and the candidates stay
+  recoverable from the inventory.
+- **A command built as `"%s ..."` no longer hides the program it runs.** Commands are routinely
+  assembled as `snprintf(buf, "%s '%s'", "/usr/sbin/tool -j", user)`. Only the template was read,
+  so the first word was a conversion, the program name — sitting right there as a constant argument
+  — was invisible, and the edge resolved to nothing. Constant arguments are now substituted back
+  into the template. Runtime arguments are NOT: their conversion stays, the visibility still
+  reports a placeholder, and no target is claimed for a value nobody has seen. Neither is a
+  constant whose text the extractor could not read, which would paste in an address as if it were
+  a name. The conversion-to-argument mapping comes from the format scanner the read layer already
+  uses — now shared rather than written a second time, because an off-by-one there does not fail
+  loudly, it silently attributes the wrong argument to a conversion.
+- **`launched_by` no longer buries its answer under a repeated disclaimer.** The pass's scope note
+  describes the PASS, not the binary, but a copy rode on every per-binary status row — on a real
+  atlas around 1500 identical copies, several times the size of the answer they annotated, enough
+  to push even a zero-result response over the size limit. It is carried once at the top now; the
+  per-binary rows keep only what varies. `cap_hit` stays even though no scan has ever set it: an
+  honest-degrade channel that has not fired is not a channel to delete.
+- **Dropped `resolved_via`, which restated `target_binary`.** The two were filled from the same
+  value and were equal on every row. Where a symlink resolved the target, the link's own name is
+  the basename of the token — derivable, and the honest note now says so instead of storing it a
+  second time.
+
 - **A sink that left no trace of itself can no longer be called constant.** `constant` is the only
   "safe" reading the map asserts, and the only one that sinks a candidate out of the first screen —
   so a wrong one is the single worst error available: nobody looks again. Two exits reached it, and

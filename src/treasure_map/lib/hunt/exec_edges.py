@@ -28,6 +28,25 @@ EXEC (``execl`` / ``execlp`` / ``execle`` / ``execv`` / ``execvp`` / ``execve``)
     with ``inner_command_visible=0``: tmap can see that a shell was launched and must NOT pretend
     to know the command it was handed.
 
+★ CALLSITE ATTRIBUTION IS AN OVER-APPROXIMATION, on purpose. A stack buffer reused by several
+exec points has EVERY one of its writers read at EVERY one of those points — dropping a writer
+would drop a real launch, so the widening is the safe direction. The consequence is that
+``sink_addr`` means "some exec point in this function", not "the point that runs this token": in a
+function that reuses one buffer, each callsite carries the whole buffer's command set (a real
+firmware has one function with 102 callsites all carrying the same token set; about a quarter of
+all callsites expand to several targets, and most resolved edges come from such callsites).
+"Function A can run X" is TRUE; "this callsite runs X" is not guaranteed. Fragments of a command
+assembled piecewise (``strcpy(buf, " > /tmp/out")``) are read as tokens of their own and land
+unmatched with a bare token form; no heuristic tries to tell a whole command from a fragment,
+because that is a semantic judgement and it would drop real launches whose program name is written
+as a relative path. Read ``argv_template`` and judge.
+
+★ MULTI-CANDIDATE TOKENS. A bare token can name several things: two directories holding different
+scripts of the same name, or a name several symlinks claim. The resolution state still says what
+KIND of thing was found, but ``target_binary`` is left empty rather than picking one. The
+candidates are not lost — looking the token's basename up in the script inventory (shell scripts)
+or the link inventory recovers them — so this is a choice with an exit, not an omission.
+
 ★ SCOPE BOUNDARY — the provenance this reads is per-function and per-DIRECT-callee. When the real
 sink sits behind a thin forwarding wrapper (``caller f -> W -> system``), f's provenance does not
 contain that ``system`` at all — it belongs to W. This module then sees only W's own
@@ -47,6 +66,7 @@ from typing import Any
 
 from treasure_map.lib.atlas.models import ExecEdgeRow
 from treasure_map.lib.diff.loader import FuncRow
+from treasure_map.lib.fmt_spec import conversions
 
 # The command-string family: the argument is a shell command line, not an image path.
 SHELL_SINKS = frozenset({"system", "popen", "doSystem"})
@@ -93,7 +113,15 @@ UNSUPPORTED_NOTE = (
     "target_unresolved rather than guessed; and a call sitting behind a thin command wrapper is "
     "INVISIBLE here — the caller's provenance does not contain the wrapped sink, so only the "
     "wrapper's own forwarded argument is seen (as unresolved). Closing that needs the shared "
-    "wrapper-traversal capability; until then this table under-counts such callers."
+    "wrapper-traversal capability; until then this table under-counts such callers. "
+    "Attribution to a CALLSITE is an over-approximation: a stack buffer reused by several exec "
+    "points has all of its writers read at each of them (dropping one would drop a real launch), "
+    "so sink_addr means 'some exec point in this function', not 'the point that runs this token' "
+    "— 'this function can run X' is true, 'this callsite runs X' is not guaranteed, and recovering "
+    "a program name from a command template widens which edges this covers without changing the "
+    "proportion. A token naming several candidates (two scripts sharing a basename, a link with "
+    "several targets) keeps its resolution state but no target_binary — look the basename up in "
+    "the script or link inventory to see the candidates."
 )
 
 
@@ -219,7 +247,6 @@ def classify_target_resolution(
     in_binaries: bool,
     match: SymlinkMatch,
     in_non_binary: bool,
-    is_sh_script: bool,
 ) -> str:
     """Total, mutually exclusive classification of one target token into the six states.
 
@@ -235,7 +262,15 @@ def classify_target_resolution(
         return RESOLVED_DIRECT
     if match.via_symlink:
         return RESOLVED_SYMLINK
-    if is_sh_script and in_non_binary:
+    if in_non_binary:
+        # ★ Membership of the script inventory is the WHOLE test. It used to also demand a `.sh`
+        # suffix, which reads backwards on a real rootfs: a script invoked as a program is exactly
+        # the one without a suffix (an init.d entry, an sbin helper), while `.sh` tends to mark the
+        # library scripts other scripts source. That extra gate pushed known scripts into
+        # `unmatched` — reporting "I do not recognize this" about a file the inventory holds. The
+        # inventory is populated from the extractor's own file classification and the query behind
+        # it selects shell scripts only, so no other kind of file can arrive here; tmap adds no
+        # second-guessing heuristic of its own on top of that classification.
         return RESOLVED_SCRIPT
     return UNMATCHED
 
@@ -293,7 +328,7 @@ def _arg_values(prov: Any, depth: int = 0) -> list[str | None]:
                 continue
             fmt = writer.get("fmt")
             if isinstance(fmt, str):
-                out.append(fmt)
+                out.append(_substitute_constant_args(fmt, writer.get("varargs")))
             elif isinstance(writer.get("src_source"), dict):
                 out.extend(_arg_values(writer["src_source"], depth + 1))
         return out or [None]
@@ -303,6 +338,47 @@ def _arg_values(prov: Any, depth: int = 0) -> list[str | None]:
             out.extend(_arg_values(source, depth + 1))
         return out or [None]
     return [None]
+
+
+def _substitute_constant_args(fmt: str, varargs: Any) -> str:
+    """Fill a writer's format string with the arguments that are compile-time constants.
+
+    A command is very often built as ``snprintf(buf, "%s '%s'", "/usr/sbin/tool -j", user)``. Read
+    as a template, the first word is ``%s`` — the program name is invisible and the edge resolves
+    to nothing, even though the name is sitting right there as a constant argument. Substituting
+    the constants back recovers it.
+
+    ★ Only CONSTANT arguments are substituted. A runtime one stays as its conversion, so the
+    template still shows what is unknown and ``argv_visibility`` still reports a placeholder — the
+    first word becomes readable without the rest being claimed. Substituting a runtime argument
+    would fabricate a target; substituting at the wrong offset would name the wrong one, which is
+    why the conversion-to-argument mapping comes from the shared scanner rather than a local count
+    of ``%`` characters.
+
+    Conversions are replaced back-to-front so the earlier ones keep their recorded offsets."""
+    args = varargs if isinstance(varargs, list) else []
+    if not args:
+        return fmt
+    out = fmt
+    for conv in reversed(conversions(fmt)):
+        if conv.char != "s" or conv.stars:  # a %d is a number, not a name; a * shifts the mapping
+            continue
+        if conv.arg_index >= len(args):
+            continue  # fewer arguments than the format consumes — nothing to put here
+        entry = args[conv.arg_index]
+        if not isinstance(entry, dict):
+            continue
+        source = entry.get("source")
+        # Only a constant the extractor could READ OUT as text carries this mark. That covers both
+        # refusals at once: a runtime value has no mark (leave the conversion, honestly unknown),
+        # and a constant whose text could not be read has a different one (a confirmed constant
+        # whose bytes are unknown is not a name).
+        if not isinstance(source, dict) or source.get("value_kind") != "literal_string":
+            continue
+        value = source.get("value")
+        if isinstance(value, str):
+            out = out[: conv.start] + value + out[conv.end :]
+    return out
 
 
 def _dedup(values: list[str | None]) -> list[str | None]:
@@ -455,11 +531,16 @@ def _exec_facts(value: str | None) -> _EdgeFacts:
 
 @dataclass(frozen=True)
 class ExecEdgeInventory:
-    """Everything the token resolution is matched against, gathered once per run."""
+    """Everything the token resolution is matched against, gathered once per run.
+
+    ``scripts`` maps a script's basename to its path(s) under the firmware root. Paths, not the
+    token, because the token may be bare: a third of resolved script edges name their target with
+    no directory at all, so recording the token would fill the target column with two different
+    kinds of key. The path is already known at match time — it is what the inventory holds."""
 
     symlinks: SymlinkIndex
     bin_names: frozenset[str]
-    script_names: frozenset[str]
+    scripts: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 def build_exec_edges(
@@ -520,20 +601,25 @@ def _build_row(
         if readable
         else (SymlinkMatch())
     )
+    script_paths = inventory.scripts.get(base, ())
     resolution = classify_target_resolution(
         token,
         facts.token_kind,
         in_binaries=readable and base in inventory.bin_names,
         match=match,
-        in_non_binary=base in inventory.script_names,
-        is_sh_script=base.endswith(".sh"),
+        in_non_binary=bool(script_paths),
     )
     target_binary: str | None = None
     if resolution == RESOLVED_DIRECT:
         target_binary = base
     elif resolution == RESOLVED_SYMLINK:
         target_binary = match.matched_targets[0] if match.matched_targets else None
-    resolved_via = ", ".join(match.matched_targets) if match.matched_targets else None
+    elif resolution == RESOLVED_SCRIPT and len(script_paths) == 1:
+        # One path for this name -> that path IS the target, and the edge becomes answerable.
+        # SEVERAL paths (genuinely different scripts sharing a basename) -> left NULL: picking one
+        # would be a guess, and the candidates are recoverable by looking the basename up in the
+        # script inventory.
+        target_binary = script_paths[0]
     # The three symlink facts describe an UNMATCHED token. On a resolved token they would be noise
     # about a road not taken (a link named like the target that the direct match already beat).
     unmatched = resolution == UNMATCHED
@@ -558,7 +644,6 @@ def _build_row(
         symlink_corrupt=int(unmatched and match.corrupt),
         symlink_target_unresolved=int(unmatched and match.target_unresolved),
         target_binary=target_binary,
-        resolved_via=resolved_via if resolution in (RESOLVED_SYMLINK, UNMATCHED) else None,
     )
 
 

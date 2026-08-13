@@ -526,7 +526,9 @@ def _load_exec_inventory(db_path: Path | str) -> ExecEdgeInventory:
     Each table is read independently and an absent one degrades to empty rather than failing: an
     analysis.db predating the link inventory still produces edges, they simply resolve fewer
     tokens (reported unmatched, never invented). The binary set is the run's own inventory — the
-    same set a reader can open — so "resolved" always means "you can go and read this"."""
+    same set a reader can open — so "resolved" always means "you can go and read this", and the
+    script map carries paths for the same reason: a resolved script edge names a file the reader
+    can open, not a bare word."""
     uri = f"file:{Path(db_path)}?mode=ro"
     conn = sqlite3.connect(uri, uri=True)
     try:
@@ -541,21 +543,24 @@ def _load_exec_inventory(db_path: Path | str) -> ExecEdgeInventory:
         except sqlite3.OperationalError:
             bins = set()
         try:
-            scripts = {
-                r[0]
-                for r in conn.execute(
-                    "SELECT name FROM non_binary_files WHERE kind = 'shell_script'"
-                )
-                if r[0]
-            }
+            # name -> path(s). The query selects shell scripts ONLY, which is what makes it safe
+            # for the resolver to trust inventory membership on its own: a web asset or a config
+            # file cannot reach it. Several paths under one basename are kept, not collapsed —
+            # they are genuinely different scripts, and choosing between them is not tmap's call.
+            scripts: dict[str, list[str]] = {}
+            for name, path in conn.execute(
+                "SELECT name, path FROM non_binary_files WHERE kind = 'shell_script'"
+            ):
+                if name and path and path not in scripts.setdefault(name, []):
+                    scripts[name].append(path)
         except sqlite3.OperationalError:
-            scripts = set()
+            scripts = {}
     finally:
         conn.close()
     return ExecEdgeInventory(
         symlinks=build_symlink_index([(r[0], r[1], r[2], r[3]) for r in link_rows]),
         bin_names=frozenset(bins),
-        script_names=frozenset(scripts),
+        scripts={k: tuple(sorted(v)) for k, v in scripts.items()},
     )
 
 
