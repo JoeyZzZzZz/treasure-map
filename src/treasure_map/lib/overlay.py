@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Overlay: a mutable annotation layer laid over the read-only candidate map.
 
 An overlay row holds an AGENT's OWN annotation about one scan/hunt candidate — never a tool-emitted

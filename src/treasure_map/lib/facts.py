@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Thin, read-only fact accessors over an analysis database — the layer CLI and MCP share.
 
 These functions expose the structured, deterministically re-derivable facts the analysis pass

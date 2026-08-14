@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Legal / intended-use notice shown in the tool's main outputs.
 
 A neutral reminder that the tool is for defensive auditing and research, that its output

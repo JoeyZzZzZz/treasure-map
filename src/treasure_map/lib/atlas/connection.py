@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Atlas database connection — open or create atlas.db.
 
 WARNING: Moving atlas.db requires sqlite3 .backup() or WAL wal_checkpoint(TRUNCATE)

@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Intra-procedural taint helpers — a single-function read, nothing more.
 
 These helpers see one function's pseudocode at a time. They can often tell whether the

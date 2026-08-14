@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Unit tests for lib/hunt/facts — the thin-command-wrapper structural fact.
 
 Pure functions over synthetic, vendor-neutral pseudocode, plus an atlas round-trip proving the

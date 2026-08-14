@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """One-command version diff — preflight, drive the external aligner, project the map.
 
 ``run_version_diff`` is the whole ``tmap diff`` pipeline behind a single call, mirroring how

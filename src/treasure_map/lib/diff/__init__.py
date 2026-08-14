@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Version-diff pipeline — map-model projection over an EXTERNAL alignment.
 
 The alignment between two firmware versions is produced by an external, deterministic

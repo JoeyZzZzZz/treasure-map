@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Unit tests for lib/hunt/wrapper_propagation — factor ① one-hop thin-wrapper propagation.
 
 Synthetic, vendor-neutral FuncRows. The finder recovers the D-2 blind spot (a function whose

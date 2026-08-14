@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Treasure Map MCP server — exposes the trustworthy fact substrate to an AI client.
 
 This is the AI-facing surface of the analysis knowledge base. It is NOT an arbitrary

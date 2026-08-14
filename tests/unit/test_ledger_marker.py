@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """The `in_exploit_ledger` row marker, and whether an agent can discover the annotation layer.
 
 Two things are tested here, and they are the same problem seen from both ends. The marker says a

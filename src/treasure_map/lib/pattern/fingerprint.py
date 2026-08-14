@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Coarse structural fingerprint for a call-sequence match.
 
 This is the COARSE, high-recall layer: a stable hash over the match's structural shape

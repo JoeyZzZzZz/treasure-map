@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """CLI wrappers for the analyzers (A1 diff-driven, A2 pattern-driven) and atlas views.
 
 Thin Click wrappers only — all logic lives in lib/hunt/ and lib/query/. A small set of

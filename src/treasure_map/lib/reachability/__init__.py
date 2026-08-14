@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Reachability grading primitive (intra-procedural v1).
 
 Grades a candidate (a function's pseudocode + callees + the sink it reaches) as

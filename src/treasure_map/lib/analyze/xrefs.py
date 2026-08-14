@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Cross-binary reference builder (4-layer algorithm) + string classifier.
 
 Layer 0: callees × exports  (primary, function-level, confidence=1.0)

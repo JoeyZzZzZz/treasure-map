@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Read-side nvram key-flow query over the atlas nvram_key_flow table (gap② phase 2).
 
 The table holds per-op nvram read/write facts flattened at hunt time; this reader assembles the

@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """The per-binary diff STATUS model: failure persistence (honest blind spots), the ATOMIC failure
 write (no PK crash on retry, no dirty ok=1 residue on a layer-2 failure), incremental skip of
 already-ok binaries, self-healing retry of failed ones, a retry cap with a sha256-driven reset, and

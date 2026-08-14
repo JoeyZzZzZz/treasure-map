@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Unit tests for the SINGLE controllability verdict (M3) + its band order (M4).
 
 The verdict is computed from sink_arg_provenance (not the collapsed top-level source_kind), crosses

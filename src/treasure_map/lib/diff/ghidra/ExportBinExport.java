@@ -1,5 +1,5 @@
-// Copyright (C) 2025-2026 JoeyZzZzZz
-// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 JoeyZzZzZz
+// SPDX-License-Identifier: Apache-2.0
 //
 // Headless BinExport: write the current program's BinExport2 protobuf to the path passed as the
 // FIRST -postScript argument. Export half of the version-diff pipeline.

@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Neutral read-side aggregation views over the atlas.
 
 density / twins / dormant — mechanism aggregations only. Every row is a lead/candidate;

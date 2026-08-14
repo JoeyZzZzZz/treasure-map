@@ -38,7 +38,7 @@ Open an issue describing your use case and the feature you'd like to see.
 
 ## Development setup
 
-End users install with `pipx` (see the README); contributors work from a clone in an
+End users install with `uv tool` (see the README); contributors work from a clone in an
 editable virtual environment instead:
 
 ```bash

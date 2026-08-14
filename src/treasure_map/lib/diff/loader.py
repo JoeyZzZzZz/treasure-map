@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Read-only loader for the function rows the diff primitive compares.
 
 Both analysis databases are opened strictly read-only (file:...?mode=ro): the diff

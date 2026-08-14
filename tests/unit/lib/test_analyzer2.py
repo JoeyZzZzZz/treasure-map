@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Unit tests for Analyzer-2 (A2) — the pattern-driven atlas writer.
 
 Synthetic, vendor-neutral analysis.db (incl. one OSS binary) + temp atlas; hermetic (no

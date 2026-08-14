@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Analyzer-2 — the pattern-driven analyzer (R-pattern -> R2 -> atlas).
 
 Composes two hermetic primitives and persists the result: R-pattern locates call-sequence

@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Shell tab-completion install — a standard step of ``tmap init`` (bash + zsh).
 
 Completion rides along with init so a user who is setting tmap up anyway gets it with no extra

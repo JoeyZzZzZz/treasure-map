@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Copy-sink size-source classification — the danger axis of a buffer copy.
 
 A buffer copy (memcpy/memmove/strncpy/strcpy) is dangerous when its WRITE LENGTH is

@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Frozen result models for the call-sequence pattern primitive.
 
 No behavior. A match is a CANDIDATE SHAPE / lead — never a claimed bug. Field names

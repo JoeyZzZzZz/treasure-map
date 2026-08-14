@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Triage read view — a multi-dimensional, honestly-annotated map of atlas candidate instances.
 
 Pure read path over the atlas. Each candidate is a point on the map carrying a three-state

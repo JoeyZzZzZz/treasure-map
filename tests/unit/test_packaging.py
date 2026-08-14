@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Regression guard: the wheel must ship the non-.py runtime assets.
 
 A built wheel only carries files declared under [tool.setuptools.package-data]; without

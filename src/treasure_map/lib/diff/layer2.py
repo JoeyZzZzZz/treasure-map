@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Layer-2 dimension delta: PROJECT two already-computed layer annotations into a per-dimension,
 per-subject difference. It ONLY projects; it never re-analyzes and never judges quality.
 

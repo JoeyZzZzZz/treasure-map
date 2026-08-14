@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """WebAsset ingester: detect + ingest HTML/JS/CGI/PHP/etc. web asset files.
 
 Detection: file extension in {html, htm, js, mjs, cgi, php, asp, aspx, jsp, jspx}.

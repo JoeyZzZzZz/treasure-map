@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Read-side view over the string_keyed_edge table (detector B / detector A facts).
 
 A string-keyed edge is a DETERMINISTIC FACT: an attacker-influenceable string key gates or

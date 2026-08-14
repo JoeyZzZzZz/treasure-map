@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Public entry: scan one analysis.db for call-sequence shape candidates.
 
 Pure-static and hermetic — no LLM, no network, no router, no tier consumed. The input

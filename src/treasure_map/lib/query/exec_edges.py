@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Read-side view over the exec_edge table: who launches a given binary.
 
 An exec edge is a DETERMINISTIC FACT: binary A's code calls a command or exec sink with an

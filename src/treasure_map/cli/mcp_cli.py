@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """CLI wrappers over the shared fact layer + the MCP server launcher.
 
 These commands delegate to ``treasure_map.lib.facts`` — the SAME read layer the MCP server uses

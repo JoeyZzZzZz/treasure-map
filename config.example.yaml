@@ -3,20 +3,24 @@
 # API keys to fill in.
 
 ghidra:
-  mode: local    # local | docker (M4) | remote (M4)
+  mode: local    # 'local' is the only implemented mode
   headless_timeout_seconds: 300
   max_parallel_jvms: 4   # `tmap init` overwrites this with a value derived from the machine
                          #   (physical cores + memory); `tmap init --force` re-detects it
 
   local:
     home: ~      # null = auto-discover via GHIDRA_HOME env or PATH; or set explicit path
-    # home: /path/to/ghidra_11.2
+    # home: /path/to/ghidra_11.4.3_PUBLIC   # Ghidra 11.4.3 is the pinned, tested toolchain
 
-  docker:        # only used when mode: docker (M4)
-    image: ghcr.io/joeyz/treasure-map-ghidra:11.2
-
-  remote:        # only used when mode: remote (M4)
-    endpoint: http://localhost:8080
+  # NOT IMPLEMENTED — there is no container image and no remote service; setting either mode does
+  # not work today. The config schema still accepts these keys, so the shape is shown for when one
+  # of them is built, commented out so it cannot be mistaken for a working option.
+  #
+  # docker:
+  #   image: <no image is published>
+  #
+  # remote:
+  #   endpoint: http://localhost:8080
 
 workspace_dir: ~/.treasure-map/workspaces
 

@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Regression guard for the autouse home-isolation fixture (tests/conftest.py).
 
 Proves a test can never resolve a default home path to the user's REAL ~/.treasure-map/ — the

@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Sink-impact tier config + controllability markers — data-driven and extensible.
 
 The {sink_class -> impact tier} map is DATA, not code branches. Adding a new sink type (a path

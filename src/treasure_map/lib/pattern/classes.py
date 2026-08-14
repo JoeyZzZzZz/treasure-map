@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Semantic call classes — generic taint source/sink knowledge.
 
 These frozensets describe WHAT COUNTS AS a source/formatter/command-sink/copy in

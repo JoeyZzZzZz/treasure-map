@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The project is licensed under Apache-2.0.** `LICENSE` is the authoritative Apache text, a
+  `NOTICE` file carries the attribution Apache asks for, every per-file SPDX header states
+  `Apache-2.0`, and the package classifier agrees. The per-file headers stay: Apache does not
+  require them, but they are what a licence scanner reads. Both READMEs drop the offer of separate
+  commercial terms, which Apache leaves nothing to offer. A test holds this as an invariant rather
+  than a one-off sweep: a second licence marker anywhere in the tree fails it, since that is the
+  state leaving a reader unable to tell which terms apply. Copyright is the project's single year,
+  2026. Nothing was ever released under other terms, so there is no migration for anyone to make.
+  The runtime legal notice is unchanged in substance: it states how the tool may be used, which is
+  a different thing from the licence.
+
+- **The diff fixture no longer comes from real firmware.** The layer-0 parse was verified against a
+  BinDiff of a firmware library. It is replaced by real BinDiff output over a synthetic subject:
+  two variants of a C file written for this repository, built stripped so the tool meets the same
+  nameless, repetitive code it meets in production — including several byte-identical functions it
+  pairs at similarity 1.0 while reporting low confidence, which is the case proving alignment must
+  follow confidence and not similarity. The fixture is regenerable from committed sources
+  (`tests/fixtures/layer0/make_fixture.sh`) and its provenance is written down beside it.
+  One thing is lost with the old fixture and worth stating: it was production-scale, ~1800 matched
+  pairs against 48 here, so these tests no longer evidence anything about scale.
+
+- **The example config stops advertising what does not exist.** Its Ghidra path example named a
+  version the README does not pin, and it offered `docker` and `remote` modes for which there is no
+  image and no service. The version now matches the pinned toolchain, and the two unbuilt modes are
+  commented out and labelled, so neither reads as a working option.
+
+- **Removed `.env.example`.** It asked for LLM API keys that nothing in the tool reads — analysis is
+  hermetic and `tmap init` provisions no keys — so its only effect was telling a first-time user to
+  go and find credentials they do not need.
+
+- **One version string.** `pyproject` said 0.1.0 while `version.py` said 0.0.1; the second is
+  stamped onto every run this tool records. Both now read 0.1.0.
+
+- **`CONTRIBUTING` said end users install with pipx**, while the README uses `uv tool`. It now
+  matches the README.
+
 - **The public-facing wording no longer casts tmap as the one judging.** `tmap --help` opened with
   "IoT firmware exploit-path discovery", and two commands summarised themselves as matching
   "suspicious" call-chains and sinks. tmap supplies facts a model cannot generate for itself; the
@@ -1161,7 +1197,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   router cache. `build_router` gained a `tiers=` parameter so summarization needs only
   the S-tier key.
 - Initial project structure
-- AGPL-3.0 license
+- Apache-2.0 license
 - M2 Step 2 (R0): `tmap init` onboarding command (`cli/init_cli.py`, `lib/setup/`).
   Provisions `~/.treasure-map/` tree (config.yaml, .env chmod 0600, workspaces/).
   Runs preflight doctor: Ghidra, Java, binwalk, API keys, dir writability.

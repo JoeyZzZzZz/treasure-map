@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Red-line CI gates — the two invariants enforced by scripts/check_recall_integrity.py.
 
 Gate A (never wrongly downweight): a const_sink_arg note must never sit on a free_string candidate.

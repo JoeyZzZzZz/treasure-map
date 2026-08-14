@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Read-only query face over the layer-0 (alignment) and layer-2 (dimension-delta) diff tables.
 
 The 80%-case alignment workflow: "I found something at A-side address X -- did B patch it?" So a

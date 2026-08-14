@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Neutral structural function-facts for the pattern analyzer.
 
 A fact here is a STRUCTURAL observation about a function — a property of its body and the

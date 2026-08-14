@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Layer-0 parse: a ``.BinDiff`` SQLite -> the atlas function-alignment substrate.
 
 This layer ONLY aligns; it never judges semantics. Every ``function_alignment`` row is the

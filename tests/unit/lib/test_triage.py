@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Unit tests for lib/query/triage — the read-only dimension MAP of atlas candidates.
 
 Builds a synthetic atlas directly (no analyzer), then asserts the default-lens ordering (spine

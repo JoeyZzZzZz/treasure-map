@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Unit tests for lib/facts — the shared read-only fact layer (CLI + MCP).
 
 Hermetic: a synthetic, vendor-neutral analysis.db. Proves each reader returns anchored facts,

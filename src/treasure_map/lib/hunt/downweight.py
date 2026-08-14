@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Recognize already-low-yield candidate forms and the third-party-library origin.
 
 These are FP-suppression signals, not verdicts: each names a neutral structural form known

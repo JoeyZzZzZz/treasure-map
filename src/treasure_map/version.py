@@ -1,7 +1,7 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 
-__version__ = "0.0.1"
+__version__ = "0.1.0"
 
 # The explicit "we could not confirm which version produced this" sentinel for any recorded
 # analysis-tool version. It is a VALUE, never None: a missing/undetectable version must stay

@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Unit tests for copy-sink size-source classification (the buffer-copy danger axis).
 
 Hermetic: synthetic, vendor-neutral pseudocode strings. Proves the prove-bounded-to-demote

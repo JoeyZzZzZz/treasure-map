@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """The "last run" pointer — what `tmap mcp` reads to start without explicit paths.
 
 A user's analysis.db usually lives OUTSIDE the managed workspace base (a scratch disk, a custom

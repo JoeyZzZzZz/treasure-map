@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Run-lineage reads over the atlas: resolve a run_id to its analysis.db, and enumerate runs.
 
 ``get_run`` is the RESOLVER a run-aware fact tool routes on (run_id -> analysis.db path).

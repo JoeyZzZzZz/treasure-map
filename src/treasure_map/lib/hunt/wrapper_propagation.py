@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Factor ① — one-hop thin-wrapper propagation (the L3 recall step).
 
 A function whose real sink hides inside a thin forwarding wrapper has no sink of that kind among

@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Cross-binary launch edges: token reading, six-state resolution, and the honesty flags.
 
 Fixtures are synthetic and vendor-neutral. The link shapes they exercise are the ones real

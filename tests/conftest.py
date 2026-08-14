@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Autouse guard: no test may touch the real ~/.treasure-map/.
 
 Production code defaults several paths to the user's home directory. Some resolve ``Path.home()``

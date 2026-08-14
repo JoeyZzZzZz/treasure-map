@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Resolve a workspace spec (a name, or nothing) to a concrete directory.
 
 Pure resolution logic — no I/O, no Workspace construction. The CLI calls resolve_workspace

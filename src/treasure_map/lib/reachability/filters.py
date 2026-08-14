@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Validator / filter recognition — GENERIC name patterns only.
 
 This is a name-based heuristic, not semantic analysis: a callee whose name looks like a

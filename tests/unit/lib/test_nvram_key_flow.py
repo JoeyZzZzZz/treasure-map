@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Unit tests for the nvram key-flow query (gap② phase 2): the three-tier honesty contract over
 the atlas nvram_key_flow table — exact (constant), template (parametric, flagged), and unresolved
 (never connected to a concrete key, but exposed via completeness)."""

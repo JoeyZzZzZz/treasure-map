@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Machine capability probe — physical cores + memory, and the parallelism they imply.
 
 Zero third-party dependencies (Linux ``/proc`` + ``lscpu`` + ``os.cpu_count`` only). Used by

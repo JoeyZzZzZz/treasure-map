@@ -217,4 +217,4 @@ uv tool uninstall treasure-map
 
 ## 许可证
 
-[AGPL-3.0](LICENSE)。商业授权请开一个 issue 或联系维护者。
+[Apache-2.0](LICENSE)。

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Recall-integrity gates — machine enforcement of two design red lines.
 
 These invariants used to be docstring-only contracts, so their breaches surfaced only in a live

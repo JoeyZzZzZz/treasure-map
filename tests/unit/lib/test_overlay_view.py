@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """The opt-in overlay-on ordering view: an agent's annotations as the outermost ordering band.
 
 Two things have to hold at once, and each needs its own teeth:

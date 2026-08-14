@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Filesystem symlink inventory — one honest record per symbolic link under the firmware root.
 
 A firmware rootfs routes a large share of its commands through symlinks: ``/bin/sh -> busybox``,

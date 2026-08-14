@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Machine capability probe + the parallelism it derives, and init writing the derived value.
 
 Hermetic: /proc files are synthesized in tmp and passed by path; os.cpu_count / lscpu are

@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Unit tests for sink_arg_provenance surfacing (design: the Ghidra def-use fact of where a
 command/format sink's argument comes from, merged into flow_evidence and read back by the triage
 explain summary + the get_sink_provenance detail tool).

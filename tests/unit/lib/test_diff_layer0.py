@@ -1,11 +1,17 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Unit tests for layer-0 parse (.BinDiff -> atlas function_alignment / function_presence).
 
-Fingerprint tests read the COMMITTED real fixture (tests/fixtures/layer0/*.BinDiff) so verification
-is on real BinDiff runtime data, never a synthetic stub. Domain / orchestrator tests use a tiny
-crafted .BinDiff + a synthetic analysis.db to exercise the presence + write logic hermetically (the
-243MB real analysis.db is not in the repo).
+Fingerprint tests read the COMMITTED fixture (tests/fixtures/layer0/*.BinDiff), which is REAL
+BinDiff runtime output — what the tool actually emits, not a hand-built SQLite table that agrees
+with our own reading of it. Its SUBJECT is synthetic: two variants of a C file written for this
+repository, built stripped so BinDiff meets the same nameless, structurally-repetitive code it
+meets in the firmware this tool reads. Nothing in it derives from any firmware or third-party
+binary. tests/fixtures/layer0/make_fixture.sh regenerates it from those sources; the counts below
+are fingerprints OF THE COMMITTED FILE, so regenerating on a different toolchain moves them.
+
+Domain / orchestrator tests use a tiny crafted .BinDiff + a synthetic analysis.db to exercise the
+presence + write logic hermetically.
 """
 
 from __future__ import annotations
@@ -39,21 +45,23 @@ FIXTURE = (
     Path(__file__).resolve().parents[2]
     / "fixtures"
     / "layer0"
-    / "libshared_before_vs_libshared_after.BinDiff"
+    / "shapes_before_vs_shapes_after.BinDiff"
 )
 
-# The 8 low-confidence pairs the spec names (address1, address2 in BIGINT decimal): each must parse
-# to alignment_undetermined. They are the SAME batch under two totally different toolchains, so this
-# is a structural fact of libshared (identical small wrappers), not toolchain noise.
+# Low-confidence pairs (address1, address2 in BIGINT decimal), each of which must parse to
+# alignment_undetermined. They are the stripped, byte-identical wrappers: BinDiff pairs them at
+# similarity 1.0 and then says it cannot tell WHICH wrapper went with which. Repetitive nameless
+# code is the ordinary shape of a stripped firmware binary, which is why the fixture is built to
+# contain it.
 _NAMED_UNDETERMINED = [
-    (234452, 431136),
-    (384720, 394188),
-    (378832, 388300),
-    (209576, 214624),
-    (235264, 313944),
-    (233248, 205944),
-    (367384, 376852),
-    (327648, 336772),
+    (1053017, 1053017),
+    (1053029, 1053029),
+    (1053041, 1053041),
+    (1053053, 1053053),
+    (1053065, 1053065),
+    (1053077, 1053077),
+    (1053089, 1053089),
+    (1053101, 1053101),
 ]
 
 
@@ -108,14 +116,14 @@ def _mk_analysis(path: Path, binary: str, sha: str, funcs: list[tuple]) -> Path:
 
 def test_parse_real_fixture_matched_pair_count() -> None:
     p = parse_bindiff(FIXTURE, "d")
-    assert len(p.rows) == 1848  # matched-pair count
+    assert len(p.rows) == 48  # matched-pair count
 
 
 def test_parse_real_fixture_confidence_split_at_0_9() -> None:
     p = parse_bindiff(FIXTURE, "d")
     aligned = sum(1 for r in p.rows if r.alignment_state == "aligned")
     undet = sum(1 for r in p.rows if r.alignment_state == "alignment_undetermined")
-    assert (aligned, undet) == (1815, 33)  # 0.9 threshold split
+    assert (aligned, undet) == (28, 20)  # 0.9 threshold split
 
 
 def test_parse_real_fixture_named_low_conf_pairs_are_undetermined() -> None:
@@ -127,11 +135,14 @@ def test_parse_real_fixture_named_low_conf_pairs_are_undetermined() -> None:
 
 
 def test_confidence_not_similarity_is_the_alignment_axis() -> None:
-    # ★ the iron proof: (384720,394188) has similarity=1.0 (identical content) yet confidence ~0.02
-    # (BinDiff can't trust the pairing among identical wrappers). Using similarity as the alignment
-    # axis would call it a perfect align; confidence correctly calls it undetermined.
+    # ★ the iron proof, and the whole reason the fixture is built the way it is: this pair has
+    # similarity 1.0 — byte-identical content — while BinDiff reports a confidence below the
+    # threshold, because among several identical stripped wrappers it cannot say which one on the
+    # left is which on the right. Aligning on similarity would call that a perfect match; aligning
+    # on confidence correctly calls it undetermined. Similarity answers "how alike", confidence
+    # answers "is this the same function", and only the second one may drive alignment.
     p = parse_bindiff(FIXTURE, "d")
-    row = next(r for r in p.rows if (r.addr_a, r.addr_b) == (norm_hex(384720), norm_hex(394188)))
+    row = next(r for r in p.rows if (r.addr_a, r.addr_b) == (norm_hex(1053017), norm_hex(1053017)))
     assert row.similarity == 1.0
     assert row.alignment_confidence < 0.9
     assert row.alignment_state == "alignment_undetermined"
@@ -145,10 +156,10 @@ def test_similarity_is_carried_first_class_not_dropped() -> None:
 
 
 def test_bigint_decimal_address_normalized_to_tmap_hex() -> None:
-    # ★ address contract: BinDiff address1 is BIGINT decimal; 234452 -> 0x393d4 -> "000393d4".
-    assert norm_hex(234452) == "000393d4"
+    # ★ address contract: BinDiff address1 is BIGINT decimal; 1053017 -> 0x101159 -> "00101159".
+    assert norm_hex(1053017) == "00101159"
     p = parse_bindiff(FIXTURE, "d")
-    assert any(r.addr_a == "000393d4" for r in p.rows)
+    assert any(r.addr_a == "00101159" for r in p.rows)
 
 
 # ── parse honesty: nothing dropped, no semantic verdict ─────────────────────────────────

@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """Cross-binary launch edges: "binary A's code calls exec with an argument naming B".
 
 The call graph inside one binary is well covered; the edge BETWEEN binaries is not. A router's web

@@ -1,5 +1,5 @@
-# Copyright (C) 2025-2026 JoeyZzZzZz
-# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
 """The opt-in overlay-on ordering pass: an agent's own annotations as an OUTERMOST band bias.
 
 Default OFF. With the overlay on, the annotations an agent recorded over the read-only map become
