@@ -45,6 +45,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`CONTRIBUTING` said end users install with pipx**, while the README uses `uv tool`. It now
   matches the README.
 
+- **The package description no longer casts tmap as the one judging** — and the check that pins
+  the rest of the public wording now covers it. `exploit-path discovery` survived the sweep that
+  fixed the CLI, in the one line an index and an installer put in front of everyone who never opens
+  the README. The scanned surface now includes the description and the keywords: free text we
+  choose, the most widely read of it, and the easiest to forget. Classifiers stay out — that
+  vocabulary is PyPI's, not ours.
+
 - **The public-facing wording no longer casts tmap as the one judging.** `tmap --help` opened with
   "IoT firmware exploit-path discovery", and two commands summarised themselves as matching
   "suspicious" call-chains and sinks. tmap supplies facts a model cannot generate for itself; the

@@ -1,7 +1,7 @@
 [project]
 name = "treasure-map"
 version = "0.1.0"
-description = "IoT firmware patch diff and exploit-path discovery"
+description = "Reconnaissance tooling for AI-driven IoT firmware vulnerability research"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {file = "LICENSE"}

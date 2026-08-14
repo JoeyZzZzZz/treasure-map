@@ -16,16 +16,26 @@ from __future__ import annotations
 
 import ast
 import re
+import tomllib
 from pathlib import Path
 
-_SRC = Path(__file__).resolve().parents[2] / "src" / "treasure_map"
+_REPO = Path(__file__).resolve().parents[2]
+_SRC = _REPO / "src" / "treasure_map"
 _CLI = _SRC / "cli"
 _NOTICE = _SRC / "lib" / "notice.py"
+_PYPROJECT = _REPO / "pyproject.toml"
 
 # ── SCOPE. Read this before widening it. ──────────────────────────────────────────────
 #
 # This gate scans the `help=` / `short_help=` strings and the click command/group docstrings under
-# cli/, plus lib/notice.py. That is the text a user reads without asking for it.
+# cli/, plus lib/notice.py and the package metadata in pyproject.toml. That is the text a user
+# reads without asking for it.
+#
+# The package description belongs here even though it is not "help text": it is the single line an
+# index and an installer show, so it reaches more people than any string in the CLI, and it is the
+# easiest one to forget when the framing is fixed everywhere else. It was, in fact, the one that
+# survived the first pass. Keywords ride along for the same reason — free text we choose. The
+# classifiers do not: their vocabulary is PyPI's, not ours.
 #
 # It deliberately does NOT scan mcp_app.py. The `suspicious` / `exploitable` words there are the
 # OVERLAY VERDICT VOCABULARY — the set a human or agent writes into an annotation
@@ -97,6 +107,36 @@ def _public_strings(path: Path) -> list[tuple[int, str, str]]:
     return out
 
 
+def _package_metadata_strings() -> list[tuple[str, str]]:
+    """(field, text) for the free-text public metadata: what an index and an installer show."""
+    project = tomllib.loads(_PYPROJECT.read_text()).get("project", {})
+    out: list[tuple[str, str]] = []
+    description = project.get("description")
+    if isinstance(description, str):
+        out.append(("description", description))
+    for keyword in project.get("keywords", []):
+        if isinstance(keyword, str):
+            out.append(("keyword", keyword))
+    return out
+
+
+def test_package_metadata_never_makes_tmap_the_judge() -> None:
+    # ★ The description is the most widely read sentence the project has — one line on an index
+    # page, in front of everyone who never opens the README. It kept "exploit-path discovery" after
+    # the CLI had been fixed, which is exactly why it is scanned now rather than trusted.
+    #
+    # MUTATION (verified RED, 1 failed): put the old description back in pyproject.toml —
+    # `description = "IoT firmware patch diff and exploit-path discovery"` — and this names it.
+    fields = _package_metadata_strings()
+    # a scan that read nothing would pass the assertion below without checking anything
+    assert any(f == "description" for f, _ in fields), "no description found — did the read break?"
+    offences = [f"{field}: {word!r} in {text!r}" for field, text in fields for word in _flag(text)]
+    assert not offences, (
+        "package metadata must not cast tmap as the one judging — it is the line an index shows:"
+        "\n  " + "\n  ".join(offences)
+    )
+
+
 def test_cli_help_text_never_makes_tmap_the_judge() -> None:
     # ★ MUTATION (verified RED, 1 failed): put the old wording back in cli/main.py —
     # `"""Treasure Map — IoT firmware exploit-path discovery."""` — and this fails naming
@@ -165,3 +205,5 @@ def test_the_scope_note_stays_with_the_gate() -> None:
     note = "\n".join(ln for ln in lines[:end] if ln.startswith("#"))
     assert "mcp_app.py" in note
     assert "OVERLAY VERDICT VOCABULARY" in note
+    # and why the package metadata IS in scope, since that is the boundary most recently moved
+    assert "pyproject.toml" in note
