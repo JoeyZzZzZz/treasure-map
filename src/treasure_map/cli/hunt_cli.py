@@ -276,7 +276,9 @@ def hunt_diff(
         _echo_full_diff(full, resolved_atlas)
 
 
-@click.command("hunt", short_help="Match suspicious call-chains only (scan's 2nd stage)")
+@click.command(
+    "hunt", short_help="Match call-chains against known sink patterns (scan's 2nd stage)"
+)
 @click.argument("db", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--run-id", required=True, help="Neutral per-run id (the device_spread unit).")
 @click.option(
@@ -1106,7 +1108,7 @@ def atlas_view(view: str, config: Path | None, atlas_path: Path | None) -> None:
     click.echo("Note: rows are leads/candidates, not findings; interpretation is out of scope.")
 
 
-@click.command("scan", short_help="Scan firmware for suspicious sinks")
+@click.command("scan", short_help="Scan firmware and record sink call-sites")
 @click.argument("fs_root", type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.option(
     "--workspace",

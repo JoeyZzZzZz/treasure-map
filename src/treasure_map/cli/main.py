@@ -69,7 +69,7 @@ class _AliasGroup(click.Group):
 @click.group(cls=_AliasGroup, context_settings={"max_content_width": 100})
 @click.option("--debug", is_flag=True, default=False, help="Enable debug logging.")
 def main(debug: bool) -> None:
-    """Treasure Map — IoT firmware exploit-path discovery."""
+    """Treasure Map is a reconnaissance tool for AI-driven firmware vulnerability research."""
     level = logging.DEBUG if debug else logging.INFO
     logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s")
     # Third-party request logs (one "HTTP/1.1 200 OK" per call) are noise at INFO; keep them

@@ -165,6 +165,15 @@ def launched_by(
       * an edge's ``target_token`` copied VERBATIM out of a result — which is how the code wrote it,
         so it usually carries a leading slash (``/usr/sbin/pluginmanager``).
 
+    ★ A launched SCRIPT is stored under the path the extraction produced, whose first segment can
+    differ from the runtime path the code names — an overlay physical path such as
+    ``rom/etc/init.d/wifi.sh`` against a token ``/etc/init.d/wifi.sh``. No spelling of the one is
+    the other, so a logical-path token answers zero: ASK FOR THE SHORT NAME (``wifi.sh``), which
+    reaches the stored path by its basename. The prefix is not stripped automatically because it
+    differs per firmware and per extraction, so there is nothing exact to strip — a pattern loose
+    enough to cover them all would be guessing, and this layer does not guess. Naming the exit is
+    the honest fix; widening the match is not.
+
     That third spelling is the one a reader reaches for first, and it used to answer zero. Targets
     are stored the way the inventory holds them — a script by its root-relative path, a binary by
     its short name — and neither carries the leading slash the source text does. So a leading-slash

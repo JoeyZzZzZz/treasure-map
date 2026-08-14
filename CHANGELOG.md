@@ -7,7 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The public-facing wording no longer casts tmap as the one judging.** `tmap --help` opened with
+  "IoT firmware exploit-path discovery", and two commands summarised themselves as matching
+  "suspicious" call-chains and sinks. tmap supplies facts a model cannot generate for itself; the
+  model and the person do the reasoning, and a word that quietly promotes the tool from witness to
+  judge invites a reader to stop verifying. The front door now describes what the tool is, and the
+  two summaries describe what they mechanically do — match call-chains against known sink patterns,
+  and record sink call-sites. A check pins this: the `help` text under `cli/` and the legal notice
+  are scanned against a hand-written list of judgement words, with negated disclaimers ("NOT a
+  verdict") exempt, because punishing those would push the text toward saying less about its own
+  limits. Its scope is written into it — notably why the overlay verdict vocabulary an annotator
+  writes (`suspicious`, `exploitable`) is a different thing and out of scope.
+
 ### Fixed
+
+- **`launched_by` explains the one remaining lookup that answers zero.** A launched script is
+  stored under the path the extraction produced, whose first segment can differ from the runtime
+  path the code names — an overlay physical path against a logical-path token. No spelling of one
+  is the other, so pasting the token in returns nothing. The prefix is not stripped automatically:
+  it differs per firmware and per extraction, so there is nothing exact to strip, and a pattern
+  loose enough to cover them all would be guessing. The docstring names the way out instead — ask
+  for the short name — so the zero is explained rather than silent.
 
 - **Looking an edge up by the token it shows you now works.** `launched_by` matched a target the
   way the inventory stores it — a script by its root-relative path, a binary by its short name —

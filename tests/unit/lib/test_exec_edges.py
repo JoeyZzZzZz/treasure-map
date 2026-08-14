@@ -657,6 +657,22 @@ def test_a_symlink_renamed_target_answers_zero_and_says_where_to_look(tmp_path: 
     assert "symlink" in launched_by.__doc__.lower()
 
 
+def test_the_overlay_path_mismatch_is_documented_with_its_way_out() -> None:
+    # ★ A launched script is stored under the path the extraction produced, whose first segment can
+    # differ from the runtime path the code names (an overlay `rom/` prefix). No spelling of one is
+    # the other, so a logical-path token answers zero — measured on a real firmware, a handful of
+    # edges. The prefix is not stripped automatically: it differs per firmware and per extraction,
+    # so there is nothing exact to strip and a loose pattern would be guessing. What makes that
+    # acceptable is that the way out is WRITTEN DOWN, so the zero is never left unexplained.
+    #
+    # MUTATION (verified RED, 1 failed): delete the overlay paragraph from launched_by's docstring
+    # -> the zero has no documented exit again.
+    doc = launched_by.__doc__ or ""
+    assert "overlay" in doc.lower()
+    assert "SHORT NAME" in doc
+    assert "does not guess" in doc
+
+
 def test_lookup_never_matches_on_a_prefix_or_suffix(tmp_path: Path) -> None:
     # Every comparison is exact equality. The decoys differ from the query by a prefix and by a
     # path segment, and both must stay out — a widened match would attribute another binary's
