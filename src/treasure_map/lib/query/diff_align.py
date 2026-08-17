@@ -33,6 +33,123 @@ _ALIGN_NOTE = (
 )
 
 
+# ── has the ground under a diff moved since it was computed? ──────────────────────────
+#
+# A diff is a statement about two specific builds. Re-scan one of them with different content and
+# the alignment underneath still reads as current: the addresses it matched belong to a binary that
+# no longer exists. Nothing corrects for that on its own, so the check happens where the result is
+# CONSUMED — the one point every reader passes through.
+#
+# ★ THE TEST IS THE GENERATION, NEVER THE CLOCK. "This run was re-scanned after the diff" says
+# nothing: re-scanning identical content is the common case and leaves every alignment valid. Only
+# a changed content hash means the diff describes something that is gone. Judging by timestamps
+# would flag the entire table on any re-scan, which is the same failure — old data treated as
+# current — pointed the other way.
+#
+# ★ COMPARED BY EXISTENCE, NOT BY PICKING A ROW. The diff records a binary's SHORT NAME, and one
+# name really can cover several files in a scan (a real firmware has four such names in one run,
+# each with two distinct hashes — including one that was itself diffed). Reading "the" hash for a
+# name would be a coin flip, and half the time it would call an unchanged diff stale. So: the
+# stored hash matching ANY hash under that name means the file that was diffed is still there,
+# unchanged. Only when it matches none of them has the ground moved.
+
+STALE_UNKNOWN = "source_unavailable"  # cannot tell — never reported as stale, never as fresh
+STALE_NO_STAMP = "generation_unstamped"  # the diff predates the hash being recorded
+STALE_CHANGED = "source_content_changed"
+STALE_GONE = "source_binary_absent"
+
+
+def _current_generation(atlas: sqlite3.Connection, run_id: str) -> dict[str, set[str]] | None:
+    """Every content hash the run's CURRENT scan holds, keyed by binary short name.
+
+    ★ Read from the run's own analysis.db, resolved through the ``analysis_db_path`` the run row
+    records for exactly this purpose. The atlas's own per-candidate hash is the wrong source: it
+    exists only for binaries that produced a candidate, so on a real firmware it covers about a
+    third of the binaries that were diffed — and treating "no hash here" as "changed" would brand
+    most of an unchanged table stale.
+
+    None means the source could not be read at all (no path recorded, file gone, unreadable). That
+    is a can't-tell, and it is kept distinct from an answer: a diff is never called stale because
+    its source was unreachable."""
+    row = atlas.execute("SELECT analysis_db_path FROM run WHERE run_id = ?", (run_id,)).fetchone()
+    if row is None or not row[0]:
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{row[0]}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        out: dict[str, set[str]] = {}
+        for name, sha in conn.execute("SELECT name, sha256 FROM current_binaries"):
+            if name and sha:
+                out.setdefault(name, set()).add(sha)
+        return out
+    except sqlite3.Error:
+        return None  # a pre-view analysis.db: cannot tell, so say so
+    finally:
+        conn.close()
+
+
+def _freshness(
+    generation: dict[str, set[str]] | None, binary: str | None, stored_sha: str | None
+) -> tuple[bool | None, str | None]:
+    """Is this diff still about the build it was computed from? (stale, reason).
+
+    ``stale`` is None when the question cannot be answered — reported as such rather than resolved
+    in either direction, because "we could not check" and "we checked and it is fine" are
+    different things to hand a reader."""
+    if generation is None:
+        return None, STALE_UNKNOWN
+    if not stored_sha:
+        return None, STALE_NO_STAMP  # written before the stamp existed; nothing to compare
+    present = generation.get(binary or "")
+    if present is None:
+        return True, STALE_GONE  # the scan no longer holds a binary by that name at all
+    if stored_sha in present:
+        return False, None  # the diffed file is still there, byte for byte
+    return True, STALE_CHANGED
+
+
+def _combine(a: bool | None, b: bool | None) -> bool | None:
+    """One answer from the two sides of a diff.
+
+    Either side having moved makes the whole diff a statement about a build that is gone. A side
+    that could not be checked does NOT make it stale — it makes it unverified, which is a third
+    answer and is reported as one rather than rounded toward either."""
+    if a or b:
+        return True
+    return None if (a is None or b is None) else False
+
+
+class _GenerationCache:
+    """One lookup per run, reused across the rows of a listing."""
+
+    def __init__(self, atlas: sqlite3.Connection) -> None:
+        self._atlas = atlas
+        self._by_run: dict[str, dict[str, set[str]] | None] = {}
+
+    def for_run(self, run_id: str | None) -> dict[str, set[str]] | None:
+        if not run_id:
+            return None
+        if run_id not in self._by_run:
+            self._by_run[run_id] = _current_generation(self._atlas, run_id)
+        return self._by_run[run_id]
+
+
+def _is_whole_run_row(diff_id: str, run_a_id: str, run_b_id: str) -> bool:
+    """Is this the abandoned run-pair row, rather than a diff of one binary?
+
+    A diff aligns ONE binary, and its id carries that binary as a third segment. A row whose id is
+    just the two run ids is left over from before that was true, and it describes nothing a reader
+    can act on.
+
+    ★ Identified by the SHAPE OF THE ID, never by ``diff_ok``. A failed per-binary diff also has
+    diff_ok=0, and that one is a blind spot a reader must keep seeing — filtering on the flag would
+    take it out along with the leftover, hiding a binary that could not be diffed behind the same
+    silence as one that was never meant to be listed."""
+    return diff_id == f"{run_a_id}::{run_b_id}"
+
+
 def _row_to_pair(r: sqlite3.Row) -> dict[str, Any]:
     return {
         "addr_a": r["addr_a"],
@@ -183,6 +300,10 @@ def get_diff_deltas(
     a prefix collides. verbose=false (default) returns only the delta rows + paging (context is a
     budget); verbose=true adds the honesty note + legend. The honesty invariants live in the tool
     docstring and always apply -- an empty result is NOT proof of 'no changes'."""
+    meta = atlas.execute(
+        "SELECT run_a_id, run_b_id, binary_a, sha256_a, sha256_b FROM diff_meta WHERE diff_id = ?",
+        (diff_id,),
+    ).fetchone()
     where = ["diff_id = ?"]
     params: list[Any] = [diff_id]
     if binary is not None:
@@ -208,10 +329,28 @@ def get_diff_deltas(
     ).fetchall()
     deltas = [dict(zip(_DELTA_COLS, r, strict=True)) for r in rows]
     hi = lo + len(deltas)
+    cache = _GenerationCache(atlas)
+    stale_a, reason_a = (
+        _freshness(cache.for_run(meta["run_a_id"]), meta["binary_a"], meta["sha256_a"])
+        if meta is not None
+        else (None, STALE_UNKNOWN)
+    )
+    stale_b, reason_b = (
+        _freshness(cache.for_run(meta["run_b_id"]), meta["binary_a"], meta["sha256_b"])
+        if meta is not None
+        else (None, STALE_UNKNOWN)
+    )
     result: dict[str, Any] = {
         "diff_id": diff_id,
         "filters": {"binary": binary, "dimension": dimension, "delta_kind": delta_kind},
         "deltas": deltas,
+        # ★ Whether these deltas still describe builds that exist. Attached to EVERY response, not
+        # only the verbose one: a reader who trimmed the notes to save room is exactly the reader
+        # who would otherwise act on a diff of a build that is gone. It is ORTHOGONAL to
+        # diff_status — a diff can have computed perfectly and still be about a file that has since
+        # been replaced — so it is reported separately and never folded into that field.
+        "source_stale": _combine(stale_a, stale_b),
+        "source_stale_reason": reason_a or reason_b,
         "page": {
             "count": total,
             "returned": len(deltas),
@@ -283,7 +422,15 @@ _LIST_DIFFS_NOTE = (
     "means no diff has been run for that filter yet — not 'nothing changed'. diff_ok=0 rows are "
     "BLIND SPOTS (diff_status='failed', diff_status_reason = why, diff_attempts = tries): the "
     "binary did not diff, so its zero counts are 'unknown', never 'no change' — "
-    "list_diff_blindspots focuses just those. Pick a binary, then read get_diff_deltas / meta."
+    "list_diff_blindspots focuses just those. Pick a binary, then read get_diff_deltas / meta. "
+    "★ source_stale says whether the diff still describes builds that exist: true = a side's "
+    "binary content changed (or that binary is gone from the scan), so the alignment underneath "
+    "points at a file that no longer exists — re-run the diff before reading its deltas as "
+    "current. false = the diffed files are still there byte for byte, which is the normal result "
+    "of re-scanning unchanged sources. null = could not be checked (source analysis.db "
+    "unreachable, or the diff predates the content stamp) — read source_stale_reason; it is NOT a "
+    "clean bill. Judged on CONTENT, never on which happened later: re-scanning identical sources "
+    "leaves every diff valid."
 )
 
 _LIST_DIFFS_COLS = (
@@ -326,14 +473,29 @@ def list_diffs(
         "dm.version_skew, dm.diff_ok, dm.diff_status, dm.diff_status_reason, dm.diff_attempts, "
         "SUM(CASE WHEN dd.delta_kind='layer_changed' THEN 1 ELSE 0 END), "
         "SUM(CASE WHEN dd.delta_kind='layer_unchanged' THEN 1 ELSE 0 END), "
-        "SUM(CASE WHEN dd.delta_kind='delta_undetermined' THEN 1 ELSE 0 END) "
+        "SUM(CASE WHEN dd.delta_kind='delta_undetermined' THEN 1 ELSE 0 END), "
+        "dm.sha256_a, dm.sha256_b "
         "FROM diff_meta dm LEFT JOIN dimension_delta dd ON dd.diff_id = dm.diff_id "
         f"{clause} GROUP BY dm.diff_id ORDER BY dm.run_a_id, dm.run_b_id, dm.binary_a",
         params,
     ).fetchall()
+    cache = _GenerationCache(atlas)
+    diffs: list[dict[str, Any]] = []
+    for r in rows:
+        row = dict(zip(_LIST_DIFFS_COLS, r[: len(_LIST_DIFFS_COLS)], strict=True))
+        if _is_whole_run_row(row["diff_id"], row["run_a_id"], row["run_b_id"]):
+            continue  # a leftover run-pair row: it describes no binary, so it answers nothing
+        stale_a, reason_a = _freshness(cache.for_run(row["run_a_id"]), row["binary"], r[13])
+        stale_b, reason_b = _freshness(cache.for_run(row["run_b_id"]), row["binary"], r[14])
+        # ★ Either side moving makes the diff a statement about a build that is gone. An
+        # unanswerable side does not make it stale — it makes it unverified, which is said out loud
+        # rather than rounded to either answer.
+        row["source_stale"] = _combine(stale_a, stale_b)
+        row["source_stale_reason"] = reason_a or reason_b
+        diffs.append(row)
     return {
-        "diffs": [dict(zip(_LIST_DIFFS_COLS, r, strict=True)) for r in rows],
-        "count": len(rows),
+        "diffs": diffs,
+        "count": len(diffs),
         "filters": {"run_a_id": run_a_id, "run_b_id": run_b_id},
         "note": _LIST_DIFFS_NOTE,
     }

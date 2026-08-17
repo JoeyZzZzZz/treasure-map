@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A diff now says whether the builds it describes still exist.** A diff is a statement about two
+  specific binaries; re-scan one with different content and the alignment underneath still reads as
+  current, while the addresses it matched belong to a file that is gone. `list_diffs` and
+  `get_diff_deltas` now carry `source_stale`, checked where the result is consumed — the one point
+  every reader passes through.
+  The test is the CONTENT, never the clock. Re-scanning identical sources is the ordinary case and
+  leaves every diff valid; judging by which happened later would brand a whole table stale on any
+  re-scan, which is the same failure — old data read as current — pointed the other way.
+  Two details it would be easy to get wrong, and both are load-bearing. The current hashes come
+  from the run's own analysis database, resolved through the path the run row records: the atlas's
+  per-candidate hash exists only for binaries that produced a candidate, so on a real firmware it
+  covers about a third of what was diffed, and reading "no hash" as "changed" would brand most of
+  an unchanged table. And a stored hash is compared for MEMBERSHIP among the hashes under that
+  name, because one short name really can cover several files in a scan — a measured run has four
+  such names, one of them a binary that was itself diffed — so reading "the" hash for a name would
+  be a coin flip that calls unchanged diffs stale half the time.
+  Three answers, not two: stale, not stale, and could-not-check (the source database is
+  unreachable, or the diff predates the content stamp). The third is reported as itself rather than
+  rounded — a real atlas holds one such row. Staleness is also kept apart from `diff_status`: a
+  diff can have computed perfectly and still be about a file that has since been replaced.
+
+- **An integrity gate for candidates whose run was never registered.** An instance naming a
+  `source_run_id` with no row in `run` is a scan that left its results behind without its lineage —
+  no build hash, no scan status, no path back to the analysis it came from — yet it still counts
+  toward device spread and still lists as a candidate. The `run` table is the single authority on
+  which runs exist. The gate is read-only and does not clean anything: re-hunting a run under its
+  own name does that in one pass. It exists for the two ways the problem returns afterwards — a
+  re-hunt under a DIFFERENT name, leaving the old label's rows with nothing to remove them, and a
+  future "delete this run" that forgets its instances.
+
+### Fixed
+
+- **A leftover run-pair row is no longer listed as a binary's diff.** A diff aligns one binary and
+  its id names it as a third segment; a row whose id is just the two run ids predates that and
+  describes nothing a reader can act on. It is identified by the SHAPE OF ITS ID, never by
+  `diff_ok` — a failed per-binary diff carries that same flag and is a blind spot a reader must
+  keep seeing, so filtering on it would hide a binary that could not be diffed behind the same
+  silence.
+
+### Changed
+
 - **Every candidate now says whether anyone has been through it.** The annotation layer recorded
   conclusions but could only be read by asking for it, so the question a reader most needs
   answered — which of these have I already done? — had no answer on the map. Each row carries a

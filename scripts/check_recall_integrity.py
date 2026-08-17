@@ -18,6 +18,11 @@ Gate B — degrade must be visible (no silent failure):
     functions table. A partial/empty run must be recorded ``failed`` (retried) or, when genuinely
     code-free, ``ok_empty`` — never a functionless "ok" frozen as clean.
 
+Gate C — old data must not pass as current (one authority on which runs exist):
+    NO instance may name a source_run_id that has no row in ``run``. Such rows are a scan whose
+    results outlived its lineage: no build hash, no scan status, no path back to the analysis they
+    came from — yet they still count toward device spread and still list as candidates.
+
 Usage:
     check_recall_integrity.py --atlas ATLAS.db --analysis ANALYSIS.db   # check real databases
     check_recall_integrity.py --self-test                              # CI: synthetic clean+dirty
@@ -49,6 +54,18 @@ _GATE_B_SQL = (
 )
 
 
+# Gate C: every candidate's run must be a registered run. An instance whose source_run_id has no
+# row in `run` is a scan that left its results behind without its lineage — no build hash, no scan
+# status, no path back to the analysis it came from. Those rows still feed device_spread (each
+# unregistered label counts as another device) and still list as candidates, so they are read as
+# findings from a firmware nobody can identify. The `run` table is the single authority on which
+# runs exist; anything claiming a run it does not name is a leftover.
+_GATE_C_SQL = (
+    "SELECT COUNT(*) FROM instance WHERE source_run_id IS NOT NULL "
+    "AND source_run_id NOT IN (SELECT run_id FROM run)"
+)
+
+
 def _count(db_path: Path, sql: str) -> int:
     """Run a COUNT(*) invariant query against a database opened read-only."""
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
@@ -68,6 +85,21 @@ def gate_b_violations(analysis_db: Path) -> int:
     return _count(analysis_db, _GATE_B_SQL)
 
 
+def gate_c_violations(atlas_db: Path) -> int:
+    """Count instances whose source_run_id names no registered run (must be 0).
+
+    ★ This does not CLEAN anything, and it is not how the current leftovers get removed — a
+    re-hunt of the run under its own name does that, writing the run row and replacing the
+    instances in one pass. This exists for the two ways the problem comes back after that: a
+    re-hunt under a DIFFERENT name (the rows under the old label have nothing to remove them), and
+    a future "delete this run" that forgets to take its instances with it.
+
+    Deliberately read-only, and deliberately not a write-side foreign key: the path that produced
+    these rows — instances written before their run row — is already closed by the writer, which
+    registers the run first. A constraint there would be risk spent on a route nothing takes."""
+    return _count(atlas_db, _GATE_C_SQL)
+
+
 def _check_real(atlas_db: Path | None, analysis_db: Path | None) -> int:
     fail = 0
     if atlas_db is not None:
@@ -77,6 +109,12 @@ def _check_real(atlas_db: Path | None, analysis_db: Path | None) -> int:
             fail = 1
         else:
             print("✓ Gate A: no const_sink_arg / free_string contradiction")
+        n = gate_c_violations(atlas_db)
+        if n:
+            print(f"❌ Gate C: {n} instance(s) whose source_run_id names no registered run")
+            fail = 1
+        else:
+            print("✓ Gate C: every instance names a registered run")
     if analysis_db is not None:
         n = gate_b_violations(analysis_db)
         if n:
@@ -92,7 +130,7 @@ def _build_self_test_dbs(root: Path, *, violating: bool) -> tuple[Path, Path]:
     violation — using the REAL schema so the check runs against production table shapes."""
     from treasure_map.lib.atlas.connection import open_atlas
     from treasure_map.lib.atlas.models import InstanceRow
-    from treasure_map.lib.atlas.writer import add_instance, upsert_pattern
+    from treasure_map.lib.atlas.writer import add_instance, begin_run, upsert_pattern
     from treasure_map.lib.storage.connection import open_db
 
     analysis = root / f"analysis_{'bad' if violating else 'ok'}.db"
@@ -114,6 +152,12 @@ def _build_self_test_dbs(root: Path, *, violating: bool) -> tuple[Path, Path]:
 
     atlas = root / f"atlas_{'bad' if violating else 'ok'}.db"
     aconn = open_atlas(atlas)
+    if not violating:
+        # Register the run the instances below name. The clean fixture has to do this or it fails
+        # Gate C itself — which is the gate doing its job: a scan that writes candidates without
+        # registering its run is exactly the leftover state being guarded against. The violating
+        # fixture skips it, and that omission IS its Gate C violation.
+        begin_run(aconn, "run_selftest", analysis_db_path=str(analysis))
     pid = upsert_pattern(
         aconn,
         source_class="external_input",
@@ -130,7 +174,7 @@ def _build_self_test_dbs(root: Path, *, violating: bool) -> tuple[Path, Path]:
             pseudocode_hash="h_ok",
             source_anchor="fn_ok",
             sink_anchor="system",
-            source_run_id="run",
+            source_run_id="run_selftest",
             reachability_status="unknown",
             blocking_mechanism="const_sink_arg",
             provenance_level="L0",
@@ -150,7 +194,7 @@ def _build_self_test_dbs(root: Path, *, violating: bool) -> tuple[Path, Path]:
                 pseudocode_hash="h_bad",
                 source_anchor="fn_bad",
                 sink_anchor="system",
-                source_run_id="run",
+                source_run_id="run_selftest",
                 reachability_status="unknown",
                 blocking_mechanism="const_sink_arg",
                 provenance_level="L0",
@@ -178,8 +222,10 @@ def _self_test() -> int:
         checks = {
             "clean Gate A == 0": gate_a_violations(clean_atlas) == 0,
             "clean Gate B == 0": gate_b_violations(clean_analysis) == 0,
+            "clean Gate C == 0": gate_c_violations(clean_atlas) == 0,
             "violating Gate A > 0": gate_a_violations(bad_atlas) > 0,
             "violating Gate B > 0": gate_b_violations(bad_analysis) > 0,
+            "violating Gate C > 0": gate_c_violations(bad_atlas) > 0,
         }
     ok = True
     for name, passed in checks.items():
