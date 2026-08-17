@@ -49,6 +49,7 @@ from treasure_map.lib.query import VIEWS as _VIEWS
 from treasure_map.lib.query import apply_overlay_view as _apply_overlay_view
 from treasure_map.lib.query import apply_view as _apply_view
 from treasure_map.lib.query import canonical_view as _canonical_view
+from treasure_map.lib.query import coverage_report as _coverage_report
 from treasure_map.lib.query import density as _density
 from treasure_map.lib.query import dormant as _dormant
 from treasure_map.lib.query import explain_candidate as _explain_candidate
@@ -63,6 +64,7 @@ from treasure_map.lib.query import ledger as _ledger
 from treasure_map.lib.query import list_cve_patterns as _list_cve_patterns
 from treasure_map.lib.query import list_runs as _list_runs
 from treasure_map.lib.query import list_verified_exploits as _list_verified_exploits
+from treasure_map.lib.query import load_coverage_index as _load_coverage_index
 from treasure_map.lib.query import only_refusal as _only_refusal
 from treasure_map.lib.query import parse_impact_order as _parse_impact_order
 from treasure_map.lib.query import refs_in_ledger as _refs_in_ledger
@@ -225,7 +227,12 @@ def _overlay_marker(o: dict[str, Any]) -> dict[str, Any]:
 
 
 def _candidate_row(
-    c: Any, rank: int, overlay: dict[str, Any] | None = None, *, in_ledger: bool = False
+    c: Any,
+    rank: int,
+    overlay: dict[str, Any] | None = None,
+    *,
+    in_ledger: bool = False,
+    coverage: str = "none",
 ) -> dict[str, Any]:
     """One candidate as a COMPACT triage row (the compact-row carry contract C1-C3).
 
@@ -243,7 +250,12 @@ def _candidate_row(
 
     ``overlay`` (only with the overlay-on view) is the agent's own annotation for this candidate.
     It lands in its own top-level ``overlay`` key — see ``_overlay_marker`` — never inside
-    ``dimensions``; with the overlay off the key is absent and the row is a pure base-map row."""
+    ``dimensions``; with the overlay off the key is absent and the row is a pure base-map row.
+
+    ``coverage`` says whether this candidate has been looked at, and it is present either way —
+    a tool-side fact about the annotation layer's state, like the ledger marker beside it, and
+    like it NEVER a dimension. It carries no annotation content: ``none`` means nothing has been
+    recorded here, which is the state a reader needs to see without asking for the overlay."""
     carried = {
         d.name: _dim_label(d)
         for d in c.dimensions
@@ -266,6 +278,10 @@ def _candidate_row(
         # Non-spine dimensions with an established state, each "state:value" (no note). A dimension
         # NOT here is state=unknown — a coverage gap, NOT proven safe (see the envelope legend).
         "dimensions": carried,
+        # Has anyone been through this one? A fact about the annotation layer, never a dimension
+        # and never the annotation's content — unconditional, so "nobody has looked at this" is
+        # visible without turning a view on.
+        "coverage": coverage,
     }
     if overlay is not None:
         # ★ The agent's judgement rides in its OWN key. NEVER inside ``dimensions`` — that carry
@@ -553,6 +569,73 @@ def make_tools(
         finally:
             atlas.close()
 
+    def _coverage_block(
+        scope: list[Any],
+        whole_run: list[Any],
+        index: Any,
+        incomplete: list[Any],
+        partially_incomplete: list[Any],
+        folded_xref: list[Any],
+    ) -> dict[str, Any]:
+        """Coverage for the listed scope, with everything needed to read it honestly attached.
+
+        ★ The completion signal NEVER travels alone. It sits in the same object as the run's
+        blind-spot ledger and as the shape of the verdicts reached, because each of them can turn
+        "this scope is covered" into something false: binaries that never produced candidates are
+        not covered by having read the candidates, and a scope cleared entirely by the cheapest
+        dismissal is covered only in the bookkeeping sense.
+
+        ``outside_this_scope`` is the same count over every candidate NOT in this listing's scope —
+        the answer to "I finished cmd, am I done?", which is no. It spans the resolved run, or
+        every run in the atlas when the listing was not scoped to one."""
+        report = _coverage_report(scope, index)
+        in_scope = {getattr(c, "evidence_ref", None) for c in scope}
+        rest = [c for c in whole_run if getattr(c, "evidence_ref", None) not in in_scope]
+        rest_report = _coverage_report(rest, index)
+        return {
+            "total": report.total,
+            "looked_at": report.seen,
+            "not_looked_at": report.unseen,
+            "page_size": report.page_size,
+            "pages_total": report.pages_total,
+            "pages_remaining": report.pages_remaining,
+            # Exhaustive over this scope: every candidate is in exactly one of these.
+            "states": report.states,
+            # ★ What the conclusions COST to assert. `safe` carries a structured evidence basis;
+            # `excluded` needs only a sentence. A scope cleared entirely by the second is a visible
+            # shape here — which is the only thing that makes it visible at all.
+            "verdict_shape": report.verdict_shape,
+            # ★ Named at CANDIDATE level, not "the ones on page 4": the point is that the ones
+            # nobody has been through can be opened directly from here.
+            "next_page": report.next_page,
+            # Annotations whose candidate is no longer in this set — a conclusion with nothing left
+            # to attach to. Reported, never counted as a conclusion and never dropped.
+            "dangling_annotations": report.dangling,
+            "outside_this_scope": {
+                "not_looked_at": rest_report.unseen,
+                "pages_remaining": rest_report.pages_remaining,
+            },
+            # ★ Inseparable from the numbers above: candidates were never generated for these, so
+            # reading every candidate does not reach them.
+            "blind_spots": {
+                "incomplete_binaries": incomplete,
+                "partially_incomplete_binaries": partially_incomplete,
+                "folded_xref_symbols": folded_xref,
+            },
+            "complete": report.unseen == 0,
+            "note": (
+                "Progress is per PAGE, and the remainder is stated every time — working through a "
+                "page is not working through the class. A candidate counts as looked at when an "
+                "annotation exists for it, per candidate, unaffected by the lens or by annotating "
+                "anything else. 'complete' means nothing in THIS scope is unread; it is not a "
+                "statement about the firmware — read blind_spots beside it, and note that a sink "
+                "that never became a candidate is not in this set at all. When you cannot settle "
+                "one, record 'inconclusive' with the next step: it is a real conclusion and it "
+                "stays in view. 'excluded' means you have a reason it cannot be reached — it is "
+                "not the way to clear a page."
+            ),
+        }
+
     def _incomplete_for_run(
         atlas: sqlite3.Connection, run_id: str | None
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
@@ -659,6 +742,9 @@ def make_tools(
             # NO ambient 'current run' fallback — the old current_run_id binding (which could
             # silently isolate to the wrong scan) is gone; each row carries its own ``run``.
             ranked = _triage(atlas, run_id=run_id)
+            # Kept before any filtering: the cross-scope remainder is measured against the WHOLE
+            # run, so finishing one class is never read as finishing the firmware.
+            whole_run = list(ranked)
             runs_in_atlas = [r.run_id for r in _list_runs(atlas)]
             incomplete, partially_incomplete, folded_xref = _incomplete_for_run(atlas, run_id)
             # Read the annotations while the atlas is still open (each row's basis freshness is
@@ -667,6 +753,12 @@ def make_tools(
             # Read unconditionally, unlike the overlays above: whether a person put a candidate in
             # the ledger is a fact about the world, not an opt-in view, so it shows either way.
             ledger_refs = _refs_in_ledger(atlas)
+            # Same footing, same reason: whether a candidate has been LOOKED AT is a fact about the
+            # annotation layer's state, not a view to opt into. Only the ref, its verdict and its
+            # live basis freshness are read here — the annotation's content (who, on what basis,
+            # how it re-ranks) still arrives only with overlay=true. Sized by how many annotations
+            # exist, never by how many candidates.
+            coverage_index = _load_coverage_index(atlas)
         finally:
             atlas.close()
         ranked = _filter_candidates(ranked, sink=sink, status=status, include_gated=include_gated)
@@ -776,6 +868,13 @@ def make_tools(
             # ``corpus`` is the INVARIANT candidate total — a --filter float never changes it. Under
             # an --only sweep, ``total`` is the (smaller) pruned view; ``corpus`` still shows the
             # whole set so "no match" is never read as "absent".
+            # ★ How far through this scope a reader is, measured in PAGES. A class of thousands
+            # cannot be finished in one sitting, and demanding it be would only reward clearing the
+            # board. Every number is recomputed here from the annotations — no page number and no
+            # "done" flag is stored anywhere, so the answer cannot drift from what was recorded.
+            "coverage": _coverage_block(
+                ranked, whole_run, coverage_index, incomplete, partially_incomplete, folded_xref
+            ),
             "corpus": corpus,
             "total": total,
             "returned": len(page),
@@ -794,6 +893,7 @@ def make_tools(
                     off + i,
                     by_ref.get(c.evidence_ref),
                     in_ledger=c.evidence_ref in ledger_refs,
+                    coverage=coverage_index.state_for(c.evidence_ref),
                 )
                 for i, c in enumerate(page)
             ],
@@ -882,12 +982,16 @@ def make_tools(
 
         Returns a not-found record when no instance carries ``evidence_ref`` (no fabrication).
         Echoes the canonical ``resolved_run`` + inline ``run_lineage`` (M6/M7): a ref anchors ONE
-        firmware run, so the explanation names the scan it came from (never an ambient run)."""
+        firmware run, so the explanation names the scan it came from (never an ambient run).
+
+        Carries ``coverage``: whether a conclusion has been recorded for this candidate. When none
+        has, it says where to put one and why that is worth doing for the reader's own sake."""
         conn = open_atlas(atlas_path)
         try:
             ex = _explain_candidate(conn, evidence_ref)
             ref = _resolve_ref(conn, evidence_ref)
             run = _get_run(conn, ref[0]) if ref is not None and ref[0] is not None else None
+            coverage_state = _load_coverage_index(conn).state_for(evidence_ref)
         finally:
             conn.close()
         if ex is None:
@@ -896,6 +1000,22 @@ def make_tools(
         data["found"] = True
         data["note"] = _DERIVED_SIGNAL_NOTE
         data["atlas"] = str(atlas_path)
+        data["coverage"] = coverage_state
+        if coverage_state == "none":
+            # ★ Stated as a fact about this candidate, the same way an unknown dimension is, and
+            # argued from the reader's OWN interest rather than from tidiness. A conclusion kept
+            # outside the overlay is a conclusion nothing can re-check: when the source is
+            # re-scanned and the code underneath moves, it quietly becomes a stale belief that
+            # something was fine. Recorded here, the same change surfaces it for another look.
+            data["coverage_hint"] = (
+                "No conclusion recorded for this candidate. Record one with annotate(evidence_ref, "
+                "verdict, rationale) — it is one call, and it is what makes your conclusion "
+                "survive a re-scan: when the code underneath moves, an annotation is flagged for "
+                "re-review, while a conclusion held anywhere else silently goes stale. If you "
+                "looked and could not settle it, 'inconclusive' with the next step IS the "
+                "conclusion — it stays in view. 'excluded' means you have a reason it cannot be "
+                "reached, not that you are done looking."
+            )
         if run is not None:
             data["resolved_run"] = run.run_id
             data["run_lineage"] = _lineage_inline(run)

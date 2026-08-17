@@ -1022,8 +1022,26 @@ def test_annotate_writes_lists_and_clears_without_touching_base(tmp_path: Path) 
         evidence_ref="run_m#fn1@cmd", verdict="suspicious", rationale="arg0 looks attacker-fed"
     )
     assert r["written"] is True and r["action"] == "inserted"
-    # ★ the base map reads identically whether the overlay is empty or full
-    assert tools["list_candidates"]() == base_before
+    # ★ Annotating must not disturb the base map: same order, same tool-derived fields, whether
+    # the overlay is empty or full. What DOES change is the coverage fact — whether anyone has
+    # been through a candidate is unconditional, on the same footing as the ledger marker, so it
+    # appears with the overlay view off. The narrowing is the point: the ranking is protected,
+    # the presence fact is not hidden. See test_coverage.py for the difference pinned exactly.
+    after = tools["list_candidates"]()
+
+    def _without_coverage(result: dict) -> dict:
+        return {
+            **{k: v for k, v in result.items() if k != "coverage"},
+            "candidates": [
+                {k: v for k, v in row.items() if k != "coverage"} for row in result["candidates"]
+            ],
+        }
+
+    assert _without_coverage(after) == _without_coverage(base_before)
+    annotated_row = next(
+        row for row in after["candidates"] if row["evidence_ref"] == "run_m#fn1@cmd"
+    )
+    assert annotated_row["coverage"] == "concluded"
     lst = tools["list_overlays"]()
     assert lst["count"] == 1
     assert lst["overlays"][0]["verdict"] == "suspicious"

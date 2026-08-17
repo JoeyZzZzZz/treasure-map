@@ -8,6 +8,12 @@ nothing here scores, ranks, or judges.
 
 from __future__ import annotations
 
+from treasure_map.lib.query.coverage import (
+    DEFAULT_PAGE_SIZE,
+    CoverageIndex,
+    coverage_report,
+    load_coverage_index,
+)
 from treasure_map.lib.query.exec_edges import launched_by
 from treasure_map.lib.query.exploit_ledger import (
     list_cve_patterns,
@@ -93,6 +99,10 @@ __all__ = [
     "get_nvram_key_flow",
     "get_run",
     "get_sink_provenance",
+    "DEFAULT_PAGE_SIZE",
+    "CoverageIndex",
+    "coverage_report",
+    "load_coverage_index",
     "impact_tier",
     "launched_by",
     "ledger",

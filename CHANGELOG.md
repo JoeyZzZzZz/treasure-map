@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Every candidate now says whether anyone has been through it.** The annotation layer recorded
+  conclusions but could only be read by asking for it, so the question a reader most needs
+  answered — which of these have I already done? — had no answer on the map. Each row carries a
+  `coverage` state, present whether or not the annotation view is on, because whether a candidate
+  has been looked at is a fact about the world rather than a view to opt into. What stays behind
+  the view switch is the annotation's CONTENT. It is derived from what was already stored: no new
+  column, no new verdict, and in particular no "working on it" state — the overlay records
+  conclusions, and progress is answered by presence instead.
+  Four states beyond "nobody has looked": a conclusion was reached; `inconclusive`, which is a real
+  conclusion (looked, could not settle) and deliberately NOT counted as settled; a verdict written
+  in a word that has since been retired, which cannot be read as either; and a conclusion whose
+  facts have moved since. A conclusion whose candidate has disappeared entirely is reported
+  separately — judged by re-deriving the anchor now, not by the snapshot taken when it was
+  written, which by definition said the anchor was fine.
+
+- **Progress is reported in pages, with the remainder stated every time.** A class on a large
+  firmware runs to thousands of candidates; "N of N" is unreachable and, worse, rewards clearing
+  the board. A listing now carries how many candidates it holds, how many are unread, how many
+  pages that is, and — named individually, not as a page number — the ones to work through next.
+  The paging order is pinned to the default impact table and ignores filters and lens choices: an
+  `--impact-order` override replaces that table, so letting it reach the paging would move
+  candidates onto pages already passed, and "everything gets reached eventually" would quietly
+  stop being true. Page counts are recomputed from the annotations on every read; no page number
+  is stored anywhere.
+  A completion signal never travels alone. It sits with the run's blind-spot ledger, since
+  binaries that failed to analyse produced no candidates for anyone to read, and with the shape of
+  the verdicts reached, since `safe` demands a structured evidence basis while `excluded` needs
+  only a sentence — a scope cleared entirely by the second is covered only in the bookkeeping
+  sense, and this is the only place that shows. Finishing one class also reports what is left
+  everywhere else, so it is not read as finishing the firmware.
+  `explain_candidate` says where to record a conclusion when none exists, argued from the reader's
+  own interest: a conclusion kept anywhere else goes stale silently when the code moves, while one
+  recorded here is flagged for another look.
+  ★ What this cannot do: it cannot make anyone read carefully. It can make shallow work land as an
+  open state rather than a clean-looking dismissal, and make a batch of cheap dismissals visible.
+  And it is exhaustive over the CANDIDATE SET, not the firmware — a sink that never became a
+  candidate is not in the set being paged through, which is a recall question and not this one.
+
 ### Changed
 
 - **The project is licensed under Apache-2.0.** `LICENSE` is the authoritative Apache text, a
