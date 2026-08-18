@@ -269,7 +269,8 @@ def _match_functions(conn: sqlite3.Connection, func: str, binary: str | None) ->
         params.extend(addrs)
     sql = (
         "SELECT f.id, f.binary_id, f.name, f.address, f.size_bytes, f.pseudocode, f.callees, "
-        "f.callees_truncated, f.is_exported, b.name AS binary_name, b.path AS binary_path "
+        "f.callees_truncated, f.is_exported, f.unresolved_external_calls, "
+        "b.name AS binary_name, b.path AS binary_path "
         "FROM functions f JOIN binaries b ON b.id = f.binary_id "
         f"WHERE ({' OR '.join(where)})"  # noqa: S608 -- placeholders only; values stay bound params
     )
@@ -306,6 +307,20 @@ _CALLEES_TRUNC_NOTE = (
     "callees TRUNCATED: this function's callee list hit the extractor cap (a wide dispatcher), so "
     "it is a prefix — a callee NOT listed may still exist; do not read this as the complete set"
 )
+_UNRESOLVED_EXT_NOTE = (
+    "UNCLASSIFIED EXTERNAL CALLS: this function calls a lazy-binding stub the pure-ELF resolver "
+    "could not name — a possible unrecognized libc sink (system/exec/…) the decompiler dropped and "
+    "the resolver could not recover. A completeness lead, not a verdict; read the pseudocode at "
+    "each address before trusting an empty sink list for this function"
+)
+
+
+def _col(row: Any, name: str) -> Any:
+    """A column value that tolerates an older analysis.db missing it (returns None)."""
+    try:
+        return row[name]
+    except (IndexError, KeyError):
+        return None
 
 
 def get_pseudocode(
@@ -332,6 +347,13 @@ def get_pseudocode(
         "callees_truncated": truncated,
         "pseudocode": row["pseudocode"],
     }
+    # Stub calls the ELF resolver could not name: a possible unrecognized libc sink this function
+    # makes that is left visible rather than read as an ordinary internal call. Surfaced only when
+    # present, so it is never noise on the ordinary case.
+    unresolved = _parse_callees(_col(row, "unresolved_external_calls"))
+    if unresolved:
+        result["unresolved_external_calls"] = unresolved
+        result["unresolved_external_calls_note"] = _UNRESOLVED_EXT_NOTE
     if truncated:
         result["note"] = _CALLEES_TRUNC_NOTE
     return result

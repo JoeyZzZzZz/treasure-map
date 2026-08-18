@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A command-execution sink the decompiler dropped is recovered from the ELF.** When a program
+  calls `system`, the compiler routes it through a lazy-binding stub; if the decompiler does not
+  stitch that stub back to the import — which it routinely does not, depending on how it was
+  configured and how the binary was linked — the caller is left calling `FUN_004125b0`, and a real
+  sink drops out of every downstream reading. That is a false negative on a sink that objectively
+  exists. A pure-ELF pass now resolves each stub to its import name from the relocations and GOT
+  the binary already carries, INDEPENDENT of the decompiler, and rewrites the callee at ingest —
+  so the rest of the pipeline sees `system` and the caller becomes a candidate, with no downstream
+  change. On one real firmware this returns 75 caller functions to the candidate set, across its
+  web-facing cgi binaries, including the case this started from.
+  Two paths, both deterministic: the PLT's `JUMP_SLOT` relocations, and the classic global-GOT
+  position formula. The formula's domain guards are load-bearing, not defensive: on a new-ABI
+  binary it produces a negative symbol index for a `.got.plt` slot, and reading that out would
+  write a WRONG name — a fabricated `system` is worse than an unresolved one, so an out-of-boundary
+  slot yields nothing. When the two paths disagree on a slot (a corrupt or adversarial binary),
+  the slot is dropped, not guessed: recovering a false negative must never manufacture a false
+  positive.
+  ★ Scope: this recovers the stub-mediated call — a direct call to a stub, which the decompiler
+  names after the stub's address so the address is recoverable. It does not recover an inline
+  `%call16` GOT call written straight into the caller, which the decompiler renders as a nameless
+  indirect call carrying no address to work back from; finding those needs a disassembler this
+  layer deliberately does not depend on. Such a call, left unresolved, is surfaced instead —
+  `get_pseudocode` reports a function's unclassified external calls as a completeness lead, so a
+  possible unrecognized sink stays visible rather than being read as an ordinary internal call.
+
+### Fixed
+
 - **A diff now says whether the builds it describes still exist.** A diff is a statement about two
   specific binaries; re-scan one with different content and the alignment underneath still reads as
   current, while the addresses it matched belong to a file that is gone. `list_diffs` and

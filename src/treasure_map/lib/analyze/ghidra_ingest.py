@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from treasure_map.lib.analyze.elf_inventory import ElfRecord
+from treasure_map.lib.analyze.stub_resolve import StubResolution, relabel_callees, resolve_stubs
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +99,11 @@ def ingest_ghidra_output(
             continue
 
         binary_id = sha_to_id[rec.sha256]
-        _ingest_one_binary(conn, binary_id, data, stats)
+        # Resolve this binary's lazy-binding stubs to their import names from ELF structure, so a
+        # caller left calling FUN_<stub-addr> is seen calling `system` — recovering a real sink the
+        # decompiler dropped. Ghidra-independent; None for a non-MIPS or unreadable ELF (no change).
+        resolution = resolve_stubs(rec.path)
+        _ingest_one_binary(conn, binary_id, data, stats, resolution)
         stats.binaries_processed += 1
 
     conn.commit()
@@ -122,6 +127,7 @@ def _ingest_one_binary(
     binary_id: int,
     data: dict[str, Any],
     stats: IngestStats,
+    resolution: StubResolution | None = None,
 ) -> None:
     """Replace this binary's rows in functions/imports/exports/strings."""
 
@@ -142,6 +148,19 @@ def _ingest_one_binary(
     for func in data.get("functions", []):
         pseudocode = func.get("pseudocode") or ""
         ph = hashlib.md5(pseudocode.encode("utf-8")).hexdigest() if pseudocode else None
+        # ★ Relabel stub calls to their import names, HERE at the callee source — so the name the
+        # rest of the pipeline reads is `system`, not FUN_<addr>, and no downstream layer needs a
+        # second address-to-name step. A call in a stub region the resolver could not name is
+        # carried through unchanged AND recorded as an unclassified external call (the hole stays
+        # visible). No resolution (non-MIPS / unreadable) leaves callees exactly as exported.
+        raw_callees = func.get("callees", [])
+        if resolution is not None and isinstance(raw_callees, list):
+            relabelled = relabel_callees([str(c) for c in raw_callees], resolution)
+            callees_json = json.dumps(relabelled.callees, ensure_ascii=False)
+            unresolved_json = json.dumps(relabelled.unresolved_stub_addrs, ensure_ascii=False)
+        else:
+            callees_json = json.dumps(raw_callees, ensure_ascii=False)
+            unresolved_json = "[]"
         func_rows.append(
             (
                 binary_id,
@@ -150,7 +169,7 @@ def _ingest_one_binary(
                 func.get("size", 0),
                 pseudocode,
                 ph,
-                json.dumps(func.get("callees", []), ensure_ascii=False),
+                callees_json,
                 # honest callee-graph truncation flag: 1 = the callee list is a prefix (cap hit), so
                 # consumers never read a clipped dispatcher's callees/callers as the complete graph.
                 1 if func.get("callees_truncated") else 0,
@@ -177,6 +196,7 @@ def _ingest_one_binary(
                 # ref (a .data table slot or a .text literal-pool take), carried verbatim and read
                 # by get_xrefs(direction=address_taken). Old exports -> '{}' (never null).
                 json.dumps(func.get("address_taken", {}), ensure_ascii=False),
+                unresolved_json,
             )
         )
     if func_rows:
@@ -185,8 +205,8 @@ def _ingest_one_binary(
                (binary_id, name, address, size_bytes, pseudocode,
                 pseudocode_hash, callees, callees_truncated, is_exported,
                 sink_provenance, nvram_ops, nvram_wrapper, wrapper_call_args,
-                string_keyed_edges, address_taken)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                string_keyed_edges, address_taken, unresolved_external_calls)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             func_rows,
         )
         stats.functions_ingested += len(func_rows)

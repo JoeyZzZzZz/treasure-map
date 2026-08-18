@@ -71,6 +71,10 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # dispatch-table slot or a literal-pool take). Back-fills '{}' on older DBs (no takes until a
     # re-scan). Must match schema.sql.
     ("functions", "address_taken", "TEXT DEFAULT '{}'"),
+    # unclassified external calls (stub calls the ELF resolver could not name) — an unrecognized
+    # libc sink left visible. Back-fills '[]' on older DBs (no leads until a re-scan). Must match
+    # schema.sql.
+    ("functions", "unresolved_external_calls", "TEXT DEFAULT '[]'"),
 )
 
 

@@ -85,6 +85,12 @@ CREATE TABLE IF NOT EXISTS functions (
     -- (non-call, non-flow), NEVER by source segment. A FACT (F's address is taken here, by this
     -- function), NEVER a dispatch/reachability verdict. Read via get_xrefs(direction=address_taken).
     address_taken   TEXT DEFAULT '{}',
+    -- unclassified external calls: the stub calls (FUN_<addr> into .plt/.MIPS.stubs) this function
+    -- makes that the pure-ELF stub resolver could NOT name — a possible unrecognized libc sink left
+    -- visible instead of silently read as an ordinary internal call. JSON array of stub addresses;
+    -- '[]' when every external call resolved (or the binary is not MIPS). A completeness lead, not
+    -- a verdict.
+    unresolved_external_calls TEXT DEFAULT '[]',
     FOREIGN KEY(binary_id) REFERENCES binaries(id) ON DELETE CASCADE
 );
 
