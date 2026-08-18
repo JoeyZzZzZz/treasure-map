@@ -25,6 +25,7 @@ summary / vuln_hint / has_user_input) is ever produced.
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from collections.abc import Callable
@@ -92,6 +93,43 @@ _DERIVED_SIGNAL_NOTE = (
 
 # Hard cap on a single list_candidates page so an over-large limit cannot blow up the context.
 _MAX_LIMIT = 200
+
+# A ceiling on the whole list_candidates response, in bytes. The candidates array is ~86% of the
+# body and grows linearly with the page, so a wide-row query (path_sink rows run ~440 bytes) at a
+# large limit produced a ~95KB response that overflowed to a file. This bounds the response by
+# TRIMMING THE PAGE — not by dropping honesty: every trimmed row is still reachable by paging on
+# (next_offset), the totals stay exact, and the trim is announced (candidates_truncated). Chosen
+# well under the observed overflow point; one constant to raise if the transport allows more.
+_RESPONSE_BYTE_BUDGET = 48_000
+
+
+def _fit_candidates(
+    envelope: dict[str, Any], rows: list[dict[str, Any]], budget: int
+) -> tuple[list[dict[str, Any]], bool]:
+    """The prefix of ``rows`` whose serialization keeps the whole response within ``budget`` bytes.
+
+    Byte-aware on purpose: a fixed row count cannot bound the response when row width varies by
+    sink class and path length. The envelope's own size (legend, caveats, coverage, the folded
+    red-line) is measured first, then rows are added while they fit. At least one row is always
+    returned — a single oversized row is trimmed-to-one and flagged, never silently dropped, and
+    never turned into an empty page that reads as 'nothing here'.
+
+    Returns ``(kept_rows, truncated_by_bytes)``. ``truncated_by_bytes`` is True only when the byte
+    ceiling cut the page shorter than the rows handed in — a row-count limit reaching its end is a
+    different thing, tracked by the caller's paging fields."""
+    running = len(json.dumps({**envelope, "candidates": []}))
+    kept: list[dict[str, Any]] = []
+    for row in rows:
+        # json.dumps' default item separator is ", " (2 chars), added only BETWEEN elements — so
+        # the first row carries no separator and each later one carries two, matching the real
+        # serialized size exactly rather than approximating it.
+        cost = len(json.dumps(row)) + (2 if kept else 0)
+        if kept and running + cost > budget:
+            return kept, True
+        kept.append(row)
+        running += cost
+    return kept, False
+
 
 # The server's standing instruction to an AI client: the working loop, not legalese. The legal
 # notice stays reachable via the legal_notice tool (B4).
@@ -617,10 +655,20 @@ def make_tools(
             },
             # ★ Inseparable from the numbers above: candidates were never generated for these, so
             # reading every candidate does not reach them.
+            #
+            # ``folded_xref_symbols`` is NOT repeated in full here. Its authoritative copy is the
+            # top-level ``folded_xref_symbols`` field, which is a per-scan red-line present on EVERY
+            # response — so the full symbol list and its per-symbol suppressed-edge counts are
+            # always reachable there. This carries the count and a pointer, not a second copy: the
+            # authority lives in the container that cannot be absent, never in this one, which some
+            # response shapes may not produce.
             "blind_spots": {
                 "incomplete_binaries": incomplete,
                 "partially_incomplete_binaries": partially_incomplete,
-                "folded_xref_symbols": folded_xref,
+                "folded_xref_symbols": {
+                    "count": len(folded_xref),
+                    "see": "folded_xref_symbols (top-level) — the full list + per-symbol counts",
+                },
             },
             "complete": report.unseen == 0,
             "note": (
@@ -708,7 +756,10 @@ def make_tools(
 
         Legacy filters still apply: ``sink`` (callee OR class), ``sink_class`` (exact), ``status``
         (to-verify / reachable / gated / all), ``fingerprint`` (pivot from cross_firmware_patterns).
-        Paged (``limit`` capped 200 + ``offset``). The result's ``lens`` names the active view and
+        Paged (``limit`` capped 200 + ``offset``). The page is ALSO bounded by response size:
+        a wide-row page is trimmed to fit the transport, and ``candidates_truncated`` says so
+        — read ``total`` for the true count and page on with ``next_offset``, which resumes
+        exactly where the byte trim stopped. The result's ``lens`` names the active view and
         ``caveats`` states the honest phase-1 blind spots (optimistic 'free', near-always-'?'
         filtering).
 
@@ -802,8 +853,17 @@ def make_tools(
         lim = max(0, min(limit, _MAX_LIMIT))
         off = max(0, offset)
         page = ranked[off : off + lim]
-        end = off + len(page)
-        return {
+        candidate_rows = [
+            _candidate_row(
+                c,
+                off + i,
+                by_ref.get(c.evidence_ref),
+                in_ledger=c.evidence_ref in ledger_refs,
+                coverage=coverage_index.state_for(c.evidence_ref),
+            )
+            for i, c in enumerate(page)
+        ]
+        envelope: dict[str, Any] = {
             "note": _DERIVED_SIGNAL_NOTE,
             # ★ C8-6: rows are compact (spine + established dimensions only); an omitted dimension
             # is state=unknown, NOT proven safe. Said once on the envelope, not per row.
@@ -877,27 +937,25 @@ def make_tools(
             ),
             "corpus": corpus,
             "total": total,
-            "returned": len(page),
             "offset": off,
             "limit": lim,
-            "truncated": end < total,
-            "next_offset": end if end < total else None,
-            # ★ compact rows (M1): spine facts + established dimensions, no per-dimension note. The
-            # full per-candidate note is on demand via explain_candidate(evidence_ref) (M2);
-            # ``rank`` is the absolute position under the active lens.
-            # With the overlay on, each annotated row also carries its own ``overlay`` key (the
-            # agent's verdict + basis freshness), kept separate from every tool-derived field.
-            "candidates": [
-                _candidate_row(
-                    c,
-                    off + i,
-                    by_ref.get(c.evidence_ref),
-                    in_ledger=c.evidence_ref in ledger_refs,
-                    coverage=coverage_index.state_for(c.evidence_ref),
-                )
-                for i, c in enumerate(page)
-            ],
         }
+        # ★ Fit the candidate array to the response byte budget — a wide-row page at a large limit
+        # would otherwise overflow the transport. Paging fields are set from what ACTUALLY fit, not
+        # from the row limit, so next_offset resumes exactly where the bytes stopped and no row is
+        # skipped. candidates_truncated distinguishes a byte cut from a row-limit end; ``truncated``
+        # / ``next_offset`` mean "there is more, page on" for either reason.
+        kept, truncated_by_bytes = _fit_candidates(envelope, candidate_rows, _RESPONSE_BYTE_BUDGET)
+        returned_end = off + len(kept)
+        more = returned_end < total
+        envelope["candidates"] = kept
+        envelope["returned"] = len(kept)
+        envelope["truncated"] = more
+        envelope["next_offset"] = returned_end if more else None
+        # Announced, never silent: the page was cut by SIZE, so a reader knows the shortfall is the
+        # budget and not the corpus, and pages on with next_offset. total/corpus stay exact.
+        envelope["candidates_truncated"] = truncated_by_bytes
+        return envelope
 
     def cross_firmware_patterns(limit: int = 50, offset: int = 0) -> dict[str, Any]:
         """Per-pattern recurrence ledger — the highest-value cross-firmware signal.

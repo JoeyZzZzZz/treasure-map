@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A large `list_candidates` response no longer overflows the transport.** A wide-row page at a
+  large limit — path_sink rows run ~440 bytes each — serialized to ~95KB and spilled to a file.
+  The candidate array is now trimmed to a response byte budget: byte-aware, because row width
+  varies by sink class and path length so a fixed row count cannot bound the response. The trim is
+  a visible decision, not a silent drop — `candidates_truncated` says the page was cut, `total` and
+  `corpus` stay exact, and `next_offset` resumes at the first row the byte trim could not carry, so
+  every candidate is reachable by paging on. A single row larger than the whole budget is
+  trimmed-to-one and flagged, never turned into an empty page. On a real firmware a path_sink query
+  at limit 200 drops from ~102KB to ~48KB.
+- **The folded-xref red-line is serialized once, not twice.** The full list of high-fan-out symbols
+  whose constrained edges were suppressed appeared in full at the top level AND inside the coverage
+  block. The authoritative copy stays at the top level — the per-scan red-line present on every
+  response — and the coverage site now carries a count and a pointer to it, not a second copy. The
+  authority deliberately lives in the container that cannot be absent: deduping into a block some
+  response shapes may not produce would be a new silent drop. Every folded symbol and its
+  suppressed-edge counts stay readable once.
+
 ### Added
 
 - **A command-execution sink the decompiler dropped is recovered from the ELF.** When a program
