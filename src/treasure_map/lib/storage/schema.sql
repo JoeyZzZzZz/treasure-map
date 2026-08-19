@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS binaries (
                                            --   no_output / incomplete; NULL on success. Lets the
                                            --   incomplete surfacing distinguish a recoverable
                                            --   timeout from a structural failure
-    pass_version TEXT,                     -- content hash of the ExportFunctions pass that produced
+    pass_version TEXT,                     -- content hash of the per-binary extraction PIPELINE
                                            --   this row's output; a mismatch re-dirties it so a pass
                                            --   edit re-extracts automatically (no manual JSON delete)
     ghidra_version TEXT,                   -- Ghidra version that produced this row's output ('unknown'

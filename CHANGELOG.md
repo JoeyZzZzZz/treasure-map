@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The pass fingerprint now covers the whole per-binary extraction pipeline, not just the Java.**
+  `pass_version` is the cache key that decides whether a same-content binary is re-extracted; it
+  hashed only the `.java` scripts. When a Python relabel step (the stub resolver) started rewriting
+  the stored callees, the fingerprint did not move, so a re-scan skipped every binary and the
+  recovered sink was never stored — a false-negative fix that shipped as a false negative. The
+  fingerprint now spans the declared Python pipeline (`ghidra_ingest` + `stub_resolve`) alongside
+  the `.java`.
+  The set is declared explicitly and locked by a mechanical gate, not a transitive import closure:
+  `ghidra_ingest` imports `elf_inventory` for a TYPE and reaches `symlinks` two hops on, and those
+  run on every scan (wipe-and-rebuild), so an import-based rule would make an unrelated edit trigger
+  a full, hours-long re-extraction. The gate parses the ingest write-path and requires every
+  analyze module it CALLS into the functions cache to be declared — a type-only import does not
+  qualify, and a future extraction step added and left undeclared fails the gate rather than
+  shipping blind. The hash is deterministic (sorted files, no `sys.modules`).
+  ★ Consequence, stated so it is not misread as a bug: this changes `build_hash` too (it is the
+  `pass_version`), so after this lands every already-scanned firmware shows a stale-scan signal
+  until it is re-scanned once — which is correct, because those scans never ran the relabel and
+  genuinely need re-extracting; the signal converges to the new value afterward.
+  ★ Boundary, named because it is the same shape of blind spot one level out: the hash covers the
+  extraction CODE, not the versions of the libraries it calls. A `pyelftools` or Ghidra upgrade can
+  change the extracted result while the fingerprint stays put, so a library/tool upgrade still needs
+  a manual `--reanalyze`; folding tool versions into the dirty check is a larger, separate decision.
+
 - **A large `list_candidates` response no longer overflows the transport.** A wide-row page at a
   large limit — path_sink rows run ~440 bytes each — serialized to ~95KB and spilled to a file.
   The candidate array is now trimmed to a response byte budget: byte-aware, because row width

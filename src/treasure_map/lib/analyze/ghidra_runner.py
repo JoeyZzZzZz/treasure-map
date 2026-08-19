@@ -83,20 +83,55 @@ _SCRIPT_DIR = Path(__file__).parent / "ghidra"
 _GHIDRA_RELEASES_URL = "https://github.com/NationalSecurityAgency/ghidra/releases"
 
 
-def compute_pass_version(script_dir: Path) -> str:
-    """Content hash of the Ghidra extraction pass — every .java in the script dir (ExportFunctions
-    plus any sibling).
+# The Python extraction steps whose output is written into the per-binary ``functions`` cache
+# during the dirty-record loop — the same cache the .java pass feeds. They belong in the pass
+# fingerprint for the SAME reason the .java does: editing them changes what a re-scan would store,
+# so a same-content re-scan must re-extract rather than skip. Declared EXPLICITLY, not derived from
+# an import closure: ``ghidra_ingest`` imports ``elf_inventory`` for the ``ElfRecord`` TYPE and (two
+# hops on) reaches ``symlinks``, which runs on every scan (wipe-and-rebuild) — pulling those in via
+# import transitivity would make an edit to an unrelated wipe-and-rebuild step trigger a full,
+# hours-long Ghidra re-extraction. The criterion is "its output is written into the functions cache
+# inside the dirty loop", and ``test_pass_version.py`` locks this set against that criterion
+# mechanically, so a future extraction step cannot be added and silently left out.
+_PIPELINE_PY_MODULES: tuple[str, ...] = ("ghidra_ingest.py", "stub_resolve.py")
 
-    This is a cache-key dimension: the per-binary Ghidra output depends on the pass logic as much as
-    on the binary bytes, so editing the pass must invalidate the cache and re-extract automatically
-    (no manual JSON/db deletion). A missing/unreadable script dir yields a stable sentinel so a scan
-    still runs (and treats everything as needing a first extraction) rather than crashing."""
-    h = hashlib.sha256()
+
+def pass_version_source_files(script_dir: Path) -> list[Path]:
+    """Every file whose content the pass fingerprint depends on: the .java scripts plus the declared
+    Python extraction modules (which live in the analyze dir, ``script_dir``'s parent).
+
+    Sorted deterministically — .java by path, then the declared Python modules by name — so the
+    same content always hashes the same, independent of import order or ``sys.modules`` state."""
+    analyze_dir = script_dir.parent
     try:
-        scripts = sorted(script_dir.glob("*.java"))
+        java = sorted(script_dir.glob("*.java"))
     except OSError:
-        scripts = []
-    for p in scripts:
+        java = []
+    py = [analyze_dir / name for name in sorted(_PIPELINE_PY_MODULES)]
+    return java + py
+
+
+def compute_pass_version(script_dir: Path) -> str:
+    """Content hash of the per-binary extraction PIPELINE — the .java Ghidra pass AND the declared
+    Python load/relabel steps (``ghidra_ingest`` + ``stub_resolve``) that write the functions cache.
+
+    This is a cache-key dimension: the per-binary output depends on the pipeline logic as much as on
+    the binary bytes, so editing ANY step that changes what gets stored — the Java extraction OR the
+    Python relabel — must invalidate the cache and re-extract automatically (no manual JSON/db
+    deletion). It was ONCE only the .java; a Python relabel step (stub_resolve) then changed the
+    stored callees while the fingerprint ignored it, so a same-content re-scan skipped every binary
+    and the new extraction never ran — a false-negative fix deployed as a false negative. Hence the
+    fingerprint now spans the whole pipeline. A missing/unreadable file is skipped so a scan still
+    runs (treating everything as needing a first extraction) rather than crashing.
+
+    ★ It hashes the extraction CODE, not the version of libraries the code calls: pyelftools (which
+    stub_resolve parses ELF with) and Ghidra are NOT in this hash, so upgrading one can change the
+    extracted result while the fingerprint stays put — a same-content re-scan would then skip it.
+    That is the same shape of blind spot, from a dependency rather than our own code; a
+    library/tool upgrade still needs a manual --reanalyze. Folding tool versions into the dirty
+    check is a larger, separate decision (each dependency bump would force a full re-extraction)."""
+    h = hashlib.sha256()
+    for p in pass_version_source_files(script_dir):
         try:
             body = p.read_bytes()
         except OSError:
