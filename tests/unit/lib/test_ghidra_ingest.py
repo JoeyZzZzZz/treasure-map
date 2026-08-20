@@ -273,9 +273,10 @@ def _ingest_string_tables(tmp_path: Path, st: object):  # type: ignore[no-untype
         data["string_tables"] = st
     _write_ghidra_json(output_dir, "test_bin", "a" * 64, data)
     ingest_ghidra_output(conn, output_dir, [_make_record("test_bin", "a" * 64)], sha_to_id)
+    # scoped to THIS detector: the status table now also carries the data_blocks export's own row
     return conn.execute(
         "SELECT detector, scanned, supported_scope, unsupported_note, cap_hit, found_count "
-        "FROM detector_scan_status"
+        "FROM detector_scan_status WHERE detector = 'string_tables'"
     ).fetchall()
 
 
@@ -340,7 +341,12 @@ def test_detector_status_idempotent_reingest_one_row(tmp_path: Path) -> None:
     rec = [_make_record("test_bin", "a" * 64)]
     ingest_ghidra_output(conn, output_dir, rec, sha_to_id)
     ingest_ghidra_output(conn, output_dir, rec, sha_to_id)  # re-ingest
-    assert conn.execute("SELECT COUNT(*) FROM detector_scan_status").fetchone()[0] == 1
+    # exactly one row PER detector (every detector's status is wiped and rebuilt, none accumulates)
+    per_detector = conn.execute(
+        "SELECT detector, COUNT(*) FROM detector_scan_status GROUP BY detector"
+    ).fetchall()
+    assert {r[0] for r in per_detector} == {"string_tables", "data_blocks"}
+    assert all(r[1] == 1 for r in per_detector)
     conn.close()
 
 

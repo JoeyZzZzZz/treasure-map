@@ -817,6 +817,90 @@ public class ExportFunctions extends GhidraScript {
              + "\"absolute_2field_only\",\"cap_hit\":" + capHit + "}}";
     }
 
+    // ============ raw data-segment bytes (.rodata/.data): a slicing substrate, not a reading ============
+    // Export each non-executable memory block's raw bytes so a query can slice the bytes at ANY
+    // data-segment address the agent meets in pseudocode (a bare `DAT_000174e4`) WITHOUT re-running
+    // Ghidra. BYTES ONLY: this pass attaches no reading of them — whether a byte run is a key, a
+    // charset table or padding is the consumer's call, never this pass's.
+    //
+    // Two honesty red lines travel per block:
+    //   truncated=true    a cap cut the export short, so the stored bytes cover LESS than `size`.
+    //                     NEVER read it as "the block ends here" — that turns a cap into a false
+    //                     "nothing more is there".
+    //   initialized=false a .bss block: the ELF reserves the extent but stores no bytes, so the
+    //                     value exists only at runtime. Exported WITH its extent and NO bytes —
+    //                     declared missing, never silently zero-filled (a zero would be a reading).
+    // Caps, CALIBRATED against four real firmware images (456 / 455 / 479 / 417 binaries): the
+    // largest single binary would store 0.79 MiB and the 99th percentile 0.26 MiB, so a per-binary
+    // total of 8 MiB carries ~10x headroom over anything measured and never bit on that corpus.
+    // Whole-image cost is 1.7-7.4 MiB of exported bytes, i.e. +0.2% to +3% of the analysis.db those
+    // images already produce. Should a future image exceed a cap, truncated/cap_hit is what keeps
+    // the shortfall visible instead of silent.
+    private static final long DATABLK_MAX_BYTES_PER_BLOCK = 4_194_304L;   // 4 MiB, per block
+    private static final long DATABLK_MAX_TOTAL_BYTES = 8_388_608L;       // 8 MiB, per binary
+
+    private String buildDataBlocks() {
+        Memory mem = currentProgram.getMemory();
+        StringBuilder blocks = new StringBuilder("[");
+        boolean first = true;
+        boolean capHit = false;
+        long total = 0;
+        for (MemoryBlock blk : mem.getBlocks()) {
+            // Loaded memory only. Ghidra also creates blocks for the sections an ELF never maps
+            // (.comment / .shstrtab / .ARM.attributes / _elfSectionHeaders) and parks them in the
+            // OTHER space, where every one of them starts at offset 0. Exported, they would all
+            // claim the address range 0..size and shadow a genuine low address (a .so is linked at
+            // 0), so a lookup could answer out of .shstrtab — a WRONG block, which is worse than
+            // no block. Measured on a real firmware binary: 4 such blocks, all at 0x0.
+            if (!blk.getStart().getAddressSpace().isLoadedMemorySpace()) continue;
+            long size = blk.getSize();
+            String head = "{\"name\":\"" + esc(blk.getName()) + "\",\"start\":\"0x"
+                        + Long.toHexString(blk.getStart().getOffset()) + "\",\"size\":" + size;
+            if (!first) blocks.append(",");
+            first = false;
+            if (blk.isExecute()) {
+                // Bytes are NOT collected from an executable block — data only, never code (the
+                // buildStringTables test). Its EXTENT is still recorded, with no bytes, because on
+                // an ELF stripped of section headers Ghidra builds one block per PT_LOAD and the
+                // read-only data rides inside the executable RX segment (measured on real firmware:
+                // 454/456, 455/455 and 417/417 binaries of three images are section-header-free, so
+                // this is the common case, not the exotic one). Without this row a .rodata address
+                // there answers "in no data block at all", which reads as "nothing is there"; with
+                // it the answer names the block and says the export scope, not the binary, is why
+                // the bytes are missing.
+                blocks.append(head).append(",\"executable\":true,\"initialized\":")
+                      .append(blk.isInitialized()).append(",\"truncated\":false}");
+                continue;
+            }
+            if (!blk.isInitialized()) {
+                // .bss: extent without content. Still exported, so an address landing here resolves
+                // to "uninitialized" rather than to "not in any data block" — two different answers.
+                blocks.append(head).append(",\"initialized\":false,\"truncated\":false}");
+                continue;
+            }
+            long room = DATABLK_MAX_TOTAL_BYTES - total;
+            if (room < 0) room = 0;
+            long want = Math.min(Math.min(size, DATABLK_MAX_BYTES_PER_BLOCK), room);
+            byte[] buf = new byte[(int) want];
+            int got;
+            try {
+                got = mem.getBytes(blk.getStart(), buf, 0, (int) want);
+            } catch (Exception e) {
+                got = 0;   // unreadable block: 0 bytes stored, and truncated below says so
+            }
+            if (got < 0) got = 0;
+            if (got < want) buf = Arrays.copyOf(buf, got);
+            total += got;
+            boolean truncated = got < size;   // stored bytes cover less than the block's extent
+            if (truncated) capHit = true;
+            blocks.append(head).append(",\"initialized\":true,\"truncated\":").append(truncated)
+                  .append(",\"bytes\":\"").append(Base64.getEncoder().encodeToString(buf))
+                  .append("\"}");
+        }
+        blocks.append("]");
+        return "{\"blocks\":" + blocks + ",\"cap_hit\":" + capHit + "}";
+    }
+
     // One {string_ptr, func_ptr} record at address a -> {key, func_name, func_addr, func_kind}, or
     // null when either pointer does not resolve. The key ptr is read + resolved FIRST (the cheap,
     // usually-failing test) so the common non-record probe costs one read, not a function lookup.
@@ -1918,6 +2002,17 @@ public class ExportFunctions extends GhidraScript {
             stringTables = "{\"tables\":[]}";
         }
 
+        // 4d. A1: raw bytes of every data segment (.rodata/.data + the .bss extents). A pure
+        // data-segment fact no function body carries, stored so a query can slice bytes at any
+        // data address without re-running Ghidra. Additive + isolated: any failure yields an empty
+        // block list with cap_hit=false, never breaking the scan.
+        String dataBlocks = "{\"blocks\":[],\"cap_hit\":false}";
+        try {
+            dataBlocks = buildDataBlocks();
+        } catch (Throwable ignore) {
+            dataBlocks = "{\"blocks\":[],\"cap_hit\":false}";
+        }
+
         // 5. Write JSON output file — atomically.
         // Write to a .tmp sibling first, then ATOMIC_MOVE into place so an
         // interrupted JVM (killpg on timeout / OOM) can never leave a partial
@@ -1945,7 +2040,11 @@ public class ExportFunctions extends GhidraScript {
             pw.print("\"nvram_defaults\":"    + nvramDefaults + ",");
             // Detector A: static {string -> funcptr} dispatch tables (incomplete by construction —
             // MVP absolute-2-field only; an empty list is "none of THAT form", never "no dispatch").
-            pw.print("\"string_tables\":"     + stringTables);
+            pw.print("\"string_tables\":"     + stringTables + ",");
+            // A1: raw data-segment bytes. RAW BYTES ONLY — no reading of them travels with them.
+            // An absent key (an export predating A1) is "not exported" (unknown), never "no data";
+            // a block's truncated=true means the bytes cover LESS than size, never "ends here".
+            pw.print("\"data_blocks\":"      + dataBlocks);
             pw.print("}");
         }
         try {

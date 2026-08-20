@@ -14,6 +14,7 @@ Designed to align with Round 2 partial invalidation:
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
@@ -139,6 +140,7 @@ def _ingest_one_binary(
         "strings",
         "nvram_defaults",
         "string_tables",
+        "data_blocks",
         "detector_scan_status",
     ):
         conn.execute(f"DELETE FROM {table} WHERE binary_id = ?", (binary_id,))
@@ -348,5 +350,72 @@ def _ingest_one_binary(
         conn.execute(
             "INSERT INTO detector_scan_status (binary_id, detector, scanned) "
             "VALUES (?, 'string_tables', 0)",
+            (binary_id,),
+        )
+
+    # A1: raw data-segment bytes. One row per exported memory block. RAW BYTES ONLY — nothing here
+    # reads them. An initialized block carries its (possibly cap-truncated) bytes; a .bss block
+    # carries bytes=NULL with initialized=0, so a later lookup answers "uninitialized, runtime-only"
+    # instead of a fabricated zero. An absent/empty block list contributes NO rows — the query then
+    # reports "not exported" (unknown), never "no data".
+    data_blocks = data.get("data_blocks")
+    if isinstance(data_blocks, dict):
+        blk_rows: list[tuple[Any, ...]] = []
+        for b in data_blocks.get("blocks", []):
+            if not isinstance(b, dict):
+                continue
+            initialized = 1 if b.get("initialized") else 0
+            executable = 1 if b.get("executable") else 0
+            truncated = 1 if b.get("truncated") else 0
+            raw: bytes | None = None
+            if initialized and not executable:
+                try:
+                    raw = base64.b64decode(b.get("bytes") or "", validate=True)
+                except ValueError:
+                    # Undecodable transport for a block the exporter said IS initialized. Store zero
+                    # bytes and FORCE truncated=1 so the gap reads as "we hold less than size",
+                    # never as an authoritative short block.
+                    raw, truncated = b"", 1
+            blk_rows.append(
+                (
+                    binary_id,
+                    b.get("name"),
+                    b.get("start"),
+                    b.get("size"),
+                    raw,
+                    initialized,
+                    executable,
+                    truncated,
+                )
+            )
+        if blk_rows:
+            conn.executemany(
+                "INSERT INTO data_blocks "
+                "(binary_id, block_name, start_addr, size, bytes, initialized, executable, "
+                "truncated) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                blk_rows,
+            )
+        # ★ honest 0-row status, same shape as the string_tables one: written EVERY ingest, NOT
+        # gated on row count. At zero blocks an empty data_blocks table would otherwise read as
+        # "this binary has no data segments"; this row records that the export DID run and whether
+        # a cap cut it. found_count is the number of BLOCKS exported.
+        conn.execute(
+            "INSERT INTO detector_scan_status "
+            "(binary_id, detector, scanned, supported_scope, unsupported_note, cap_hit, "
+            "found_count) VALUES (?, 'data_blocks', 1, ?, ?, ?, ?)",
+            (
+                binary_id,
+                "initialized_non_executable_blocks",
+                "uninitialized_bss_blocks_carry_no_bytes",
+                1 if data_blocks.get("cap_hit") else 0,
+                len([b for b in data_blocks.get("blocks", []) if isinstance(b, dict)]),
+            ),
+        )
+    else:
+        # No data_blocks object in the payload (an export predating A1). Do NOT claim an export that
+        # did not happen: scanned=0, so a consumer sees "no status recorded", never a clean zero.
+        conn.execute(
+            "INSERT INTO detector_scan_status (binary_id, detector, scanned) "
+            "VALUES (?, 'data_blocks', 0)",
             (binary_id,),
         )

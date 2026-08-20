@@ -158,7 +158,10 @@ _AGENT_INSTRUCTIONS = (
     "binary = short name OR full path), get_callees / get_xrefs to walk the call chain (an empty "
     "caller set may mean an indirect/dispatch-table call, not 'unreachable'), get_strings, "
     "get_functions_referencing_string (which functions mention a string, by pseudocode text "
-    "match — not a resolved symbol xref), get_imports_exports, get_script_callsites. "
+    "match — not a resolved symbol xref), get_imports_exports, get_script_callsites, "
+    "get_data_bytes (the RAW bytes a data segment stores at an address — the content the "
+    "decompiler drops when it renders a bare DAT_00xxxxxx; bytes only, the reading is "
+    "yours). "
     "(3) Judge value with the cross-firmware signal cross_firmware_patterns (a pattern "
     "recurring across many firmware images). Prefer narrow filters (run_id / sink "
     "/ status) and paging over pulling everything; fetch detail per evidence_ref. The tools draw "
@@ -1454,6 +1457,39 @@ def make_tools(
             binary=binary,
         )
 
+    def get_data_bytes(
+        address: str,
+        length: int = 64,
+        binary: str | None = None,
+        run_id: str | None = None,
+        evidence_ref: str | None = None,
+    ) -> dict[str, Any]:
+        """RAW bytes stored at a data-segment ``address`` (what a bare ``DAT_000174e4`` hides).
+
+        The decompiler renders a data-segment constant as a name and DROPS its content, so the
+        value is simply absent from the pseudocode. This reads it back from the segment bytes
+        recorded at scan time (no Ghidra re-run). ``address`` is hex, in any form Ghidra shows
+        (``0x174e4`` / ``000174e4``); ``length`` is bytes to return.
+
+        ★ BYTES ONLY — no interpretation travels with them. ``ascii`` is a mechanical rendering
+        (non-printable -> '.'), NOT a claim that the run is text/a key/a charset; that reading is
+        yours to make. Misses are distinct on purpose and none of them means "the bytes are zero":
+        ``uninitialized_bss`` (a reserved .bss extent whose value exists only at runtime),
+        ``address_not_in_any_data_block`` (outside every exported block), and
+        ``data_blocks_not_exported`` (this binary was not scanned since the export existed —
+        UNKNOWN, not "no data"). ``truncated`` names which limit stopped the read and never means
+        the data ends there.
+
+        Run-aware: ``run_id`` + ``binary`` or ``evidence_ref``; echoes ``resolved_run``."""
+        return _fact(
+            lambda c, fn, bn: facts.get_data_bytes(
+                c, binary=bn or "", address=address, length=length
+            ),
+            run_id=run_id,
+            evidence_ref=evidence_ref,
+            binary=binary,
+        )
+
     def get_functions_referencing_string(
         text: str,
         binary: str | None = None,
@@ -1774,6 +1810,7 @@ def make_tools(
         "get_strings": get_strings,
         "get_functions_referencing_string": get_functions_referencing_string,
         "get_imports_exports": get_imports_exports,
+        "get_data_bytes": get_data_bytes,
         "get_script_callsites": get_script_callsites,
         "get_disassembly": get_disassembly,
         "annotate": annotate,

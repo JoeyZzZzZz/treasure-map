@@ -31,6 +31,39 @@ from __future__ import annotations
 
 _BIN_ANCHOR_LEN = 8  # sha256 prefix; 479 real binaries -> 479 distinct prefixes (no collision)
 
+# Per-axis labels for a wrapper-propagated candidate: (call_sequence_shape prefix, evidence_ref
+# suffix), keyed by the candidate's sink_class. "cmd" keeps its historical strings byte-for-byte.
+#
+# It lives HERE, with the ref builder, because the second half IS the ref vocabulary: the suffix
+# that distinguishes a wrapper-recovered instance from the direct one is what a reader must be able
+# to map BACK to the direct (base) suffix. Keeping the table in one leaf module means the forward
+# use (A2 minting refs) and the reverse use (a read tool pointing a wrapper ref at its base) can
+# never drift apart into two hand-written copies.
+_WRAPPER_AXIS: dict[str, tuple[str, str]] = {
+    "cmd": ("wrapper-cmd", "cmd_via_wrapper"),
+    "fmt_string": ("wrapper-fmt", "fmt_via_wrapper"),
+}
+
+# Reverse of the suffix half: a wrapper-recovered ref suffix -> the suffix its DIRECT counterpart
+# carries (the sink_class, which is exactly what a direct instance uses). DERIVED, never re-typed.
+_WRAPPER_SUFFIX_TO_BASE: dict[str, str] = {
+    suffix: sink_class for sink_class, (_shape, suffix) in _WRAPPER_AXIS.items()
+}
+
+
+def base_evidence_ref(evidence_ref: str) -> str | None:
+    """The DIRECT-candidate ref a wrapper-recovered ``evidence_ref`` corresponds to, else None.
+
+    A purely mechanical suffix swap (``…@cmd_via_wrapper`` -> ``…@cmd``): same run, same binary
+    anchor, same function anchor, only the sink-axis suffix changes. It says NOTHING about whether
+    that base ref exists — proving existence is the caller's job, and inventing a ref that resolves
+    to nothing would be exactly the fabricated-anchor failure the ref contract forbids."""
+    for suffix, base_suffix in _WRAPPER_SUFFIX_TO_BASE.items():
+        tail = f"@{suffix}"
+        if evidence_ref.endswith(tail):
+            return f"{evidence_ref[: -len(tail)]}@{base_suffix}"
+    return None
+
 
 def _norm_addr(address: str | None) -> str | None:
     """Canonicalize an entry address to lowercase, 0x-free, zero-padded hex ("000b32a0").

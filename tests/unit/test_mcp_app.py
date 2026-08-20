@@ -55,6 +55,7 @@ _EXPECTED_TOOLS = {
     "get_strings",
     "get_functions_referencing_string",
     "get_imports_exports",
+    "get_data_bytes",
     "get_script_callsites",
     "get_disassembly",
     "annotate",

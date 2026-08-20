@@ -83,7 +83,7 @@ from treasure_map.lib.hunt.exec_edges import (
     exec_entry_sites,
 )
 from treasure_map.lib.hunt.facts import is_thin_cmd_wrapper
-from treasure_map.lib.hunt.refs import build_evidence_ref
+from treasure_map.lib.hunt.refs import _WRAPPER_AXIS, build_evidence_ref
 from treasure_map.lib.hunt.wrapper_propagation import (
     find_wrapper_propagated_candidates,
 )
@@ -202,14 +202,6 @@ def _load_known_components(db_path: Path | str) -> set[str]:
     finally:
         conn.close()
     return {r[0] for r in rows}
-
-
-# Per-axis labels for a wrapper-propagated candidate: (call_sequence_shape prefix, evidence_ref
-# suffix). Keyed by the candidate's sink_class. "cmd" keeps its historical strings byte-for-byte.
-_WRAPPER_AXIS: dict[str, tuple[str, str]] = {
-    "cmd": ("wrapper-cmd", "cmd_via_wrapper"),
-    "fmt_string": ("wrapper-fmt", "fmt_via_wrapper"),
-}
 
 
 def _wrapper_fingerprint(sink_class: str, source_class: str, wrapped_sink: str) -> str:

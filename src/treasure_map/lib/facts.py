@@ -921,6 +921,220 @@ def get_imports_exports(conn: sqlite3.Connection, *, binary: str) -> dict[str, A
     return {"found": True, "binary": binary, "imports": imports, "exports": exports}
 
 
+# get_data_bytes standing contract, on EVERY result. The tool hands over bytes; it never reads
+# them. Saying so inline keeps the boundary at the point of use, where an agent could otherwise
+# mistake an ascii rendering for a claim that the run IS text.
+_DATA_BYTES_CONTRACT = (
+    "RAW BYTES ONLY. This returns what the data segment stores at an address and attaches NO "
+    "reading of it: `ascii` is a mechanical byte-by-byte rendering (non-printable -> '.'), NOT a "
+    "claim that the run is text, a key, a charset, or anything else. Deciding what the bytes mean "
+    "is yours."
+)
+# A cap on ONE request, so a single call cannot serialize a whole 4 MiB segment into a response.
+# Independent of the exporter's per-block cap: this one bounds the ANSWER, that one the STORE.
+_DATA_BYTES_MAX_LENGTH = 4096
+
+
+def _hex_addr_int(address: str | None) -> int | None:
+    """Parse a Ghidra address to int, reading a bare form as HEX.
+
+    NOT ``_addr_int``: that one falls back to decimal for a 0x-less string, which silently misreads
+    the bare form an agent copies straight out of pseudocode (``DAT_00174000`` -> "00174000" would
+    become decimal 174000, an address in a different block). Hex-first matches ``_norm_addr``, the
+    canonicalization every evidence anchor already uses."""
+    if not address:
+        return None
+    a = address.strip().lower().removeprefix("0x")
+    try:
+        return int(a, 16)
+    except ValueError:
+        return None
+
+
+def _ascii_render(raw: bytes) -> str:
+    """Mechanical rendering: a printable ASCII byte as itself, anything else as '.'. No judgement
+    about whether the run IS text — that reading belongs to the consumer."""
+    return "".join(chr(b) if 0x20 <= b <= 0x7E else "." for b in raw)
+
+
+def get_data_bytes(
+    conn: sqlite3.Connection, *, binary: str, address: str, length: int
+) -> dict[str, Any]:
+    """The raw bytes one binary's data segments store at ``address`` (a slicing substrate).
+
+    The decompiler renders a data-segment constant as a bare ``DAT_000174e4`` and drops its
+    CONTENT, so the value at that address is simply not in the pseudocode. This reads it back out of
+    the stored segment bytes — no Ghidra re-run — and hands over the bytes and nothing else.
+
+    HONEST BOUNDARIES, each a distinct answer a consumer must not conflate:
+    - ``data_blocks_not_exported``: this binary has no exported blocks (an analysis.db predating the
+      export, or a binary not re-scanned). UNKNOWN — never "this binary has no data".
+    - ``address_not_in_any_data_block``: the address falls outside every exported block. It is NOT
+      "the bytes are zero" and NOT "nothing is there" — it may be an unexported space.
+    - ``address_in_executable_block``: a block DOES cover the address, but it is executable, and
+      this export carries data bytes only. Kept distinct from the previous case because it is the
+      COMMON one on section-header-stripped firmware, where .rodata rides inside the executable
+      PT_LOAD — "the scope excluded it" must never read as "no block covers it".
+    - ``uninitialized_bss``: the address lands in a .bss extent, which stores no bytes at all; the
+      value exists only at runtime. Distinct from the previous case ON PURPOSE: "reserved but empty"
+      and "not in any segment" are different facts.
+    - ``truncated``: the returned bytes stop short of what was asked, because the block ends
+      (``clamped_to_block_end``), the exporter's cap stored less than the block's extent
+      (``cap_truncated``), or the request exceeded this tool's per-call cap
+      (``request_length_capped``). NEVER read a truncated answer as "the data ends here".
+    """
+    if length <= 0:
+        return {
+            "found": False,
+            "query": {"binary": binary, "address": address, "length": length},
+            "note": "invalid_length",
+            "detail": "length must be >= 1",
+            "contract": _DATA_BYTES_CONTRACT,
+        }
+    query = {"binary": binary, "address": address, "length": length}
+    row = conn.execute(
+        "SELECT id FROM binaries WHERE name = ? OR path = ? LIMIT 1", (binary, binary)
+    ).fetchone()
+    if row is None:
+        return {
+            "found": False,
+            "query": query,
+            "note": "no_such_binary",
+            "contract": _DATA_BYTES_CONTRACT,
+        }
+    bid = int(row["id"])
+    try:
+        blocks = conn.execute(
+            "SELECT block_name, start_addr, size, bytes, initialized, executable, truncated "
+            "FROM data_blocks WHERE binary_id = ? ORDER BY id",
+            (bid,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        blocks = []  # analysis.db predating the table -> the same "not exported" (unknown) answer
+    if not blocks:
+        return {
+            "found": False,
+            "query": query,
+            "note": "data_blocks_not_exported",
+            "detail": (
+                "no data-segment blocks are stored for this binary (older analysis.db, or not "
+                "re-scanned since the export existed) — UNKNOWN, not 'no data'"
+            ),
+            "contract": _DATA_BYTES_CONTRACT,
+        }
+    addr = _hex_addr_int(address)
+    if addr is None:
+        return {
+            "found": False,
+            "query": query,
+            "note": "unparsable_address",
+            "detail": "address must be hex (0x-prefixed or bare, as Ghidra renders it)",
+            "contract": _DATA_BYTES_CONTRACT,
+        }
+
+    hit = None
+    for b in blocks:
+        start = _hex_addr_int(b["start_addr"])
+        size = int(b["size"] or 0)
+        if start is not None and start <= addr < start + size:
+            hit = (b, start, size)
+            break
+    if hit is None:
+        return {
+            "found": False,
+            "query": query,
+            "note": "address_not_in_any_data_block",
+            "detail": (
+                "the address is outside every exported data block — it may be code, or space the "
+                "export did not cover; this is NOT 'the bytes are zero'"
+            ),
+            "contract": _DATA_BYTES_CONTRACT,
+        }
+    blk, start, size = hit
+    block_anchor = {
+        "block_name": blk["block_name"],
+        "start": blk["start_addr"],
+        "block_size": size,
+    }
+    if blk["executable"]:
+        return {
+            "found": False,
+            "query": query,
+            **block_anchor,
+            "note": "address_in_executable_block",
+            "detail": (
+                "the address lands in an EXECUTABLE block, whose bytes this export deliberately "
+                "does not carry (data only, never code). On an ELF stripped of section headers "
+                "there is one block per PT_LOAD and the read-only data sits inside the executable "
+                "one, so a .rodata constant lands here — the bytes exist in the binary, the export "
+                "scope is what excludes them. Read them from the binary itself, or widen the "
+                "export scope"
+            ),
+            "contract": _DATA_BYTES_CONTRACT,
+        }
+    if not blk["initialized"]:
+        return {
+            "found": False,
+            "query": query,
+            **block_anchor,
+            "note": "uninitialized_bss",
+            "detail": "value is runtime-only",
+            "contract": _DATA_BYTES_CONTRACT,
+        }
+
+    stored: bytes = bytes(blk["bytes"] or b"")
+    offset = addr - start
+    # Three independent bounds on where the answer can end; the tightest one wins and NAMES itself,
+    # so a short answer always says which limit produced it rather than looking like the data's end.
+    capped_length = min(length, _DATA_BYTES_MAX_LENGTH)
+    end_by_request = offset + capped_length
+    end_by_block = size
+    end_by_stored = len(stored)
+    end_raw = min(end_by_request, end_by_block, end_by_stored)
+    end = max(offset, end_raw)  # a store shorter than the offset yields 0 bytes, never a negative
+    raw = stored[offset:end]
+    result: dict[str, Any] = {
+        "found": True,
+        "query": query,
+        **block_anchor,
+        "read_at": f"0x{addr:x}",
+        "offset_in_block": offset,
+        "bytes": raw.hex(),
+        "length_returned": len(raw),
+        "ascii": _ascii_render(raw),
+        "contract": _DATA_BYTES_CONTRACT,
+    }
+    if end < offset + length:
+        if end_by_stored < end_by_block and end_raw == end_by_stored:
+            note, detail = (
+                "cap_truncated",
+                "the exporter's cap stored fewer bytes than this block's extent; the missing tail "
+                "exists in the binary but was not exported — NOT the end of the data",
+            )
+        elif end_raw == end_by_block:
+            note, detail = (
+                "clamped_to_block_end",
+                "the request ran past the end of this block; bytes beyond it belong to another "
+                "block (or none) and were not read here",
+            )
+        else:
+            note, detail = (
+                "request_length_capped",
+                f"this tool returns at most {_DATA_BYTES_MAX_LENGTH} bytes per call; ask again at "
+                "a later address for the tail",
+            )
+        result["truncated"] = True
+        result["note"] = note
+        result["detail"] = detail
+    else:
+        result["truncated"] = False
+    if blk["truncated"]:
+        # The block itself is a prefix. Said even on a fully-served read: the bytes returned are
+        # right, but "nothing more after this block's stored tail" would be wrong.
+        result["block_bytes_incomplete"] = True
+    return result
+
+
 def get_script_callsites(conn: sqlite3.Connection, *, binary: str) -> dict[str, Any]:
     """Cross-artifact call sites: rootfs scripts that invoke this binary (entry-reach evidence).
 

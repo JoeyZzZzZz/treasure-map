@@ -183,6 +183,31 @@ CREATE TABLE IF NOT EXISTS string_tables (
     FOREIGN KEY(binary_id) REFERENCES binaries(id) ON DELETE CASCADE
 );
 
+-- A1: raw initialized data-segment bytes (.rodata/.data), one row per memory block. Stored at
+-- ingest so a query slices the bytes at ANY data-segment address the agent meets in pseudocode
+-- WITHOUT re-running Ghidra. RAW BYTES ONLY — no interpretation is stored or implied.
+-- truncated=1 = a cap hit (the stored bytes cover LESS than size); NEVER read it as "the block ends
+-- here". initialized=0 (.bss) = bytes NULL: the extent is reserved but the value is runtime-only, so
+-- it is declared missing, never zero-filled. NO rows for a binary = the data blocks were not
+-- exported (unknown), NEVER "no data". WIPE-AND-REBUILD per binary each analyze run.
+CREATE TABLE IF NOT EXISTS data_blocks (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    binary_id   INTEGER,
+    block_name  TEXT,       -- segment name as the loader named it (.rodata / .data / .bss / …)
+    start_addr  TEXT,       -- block base address (0x…)
+    size        INTEGER,    -- the block's full extent in bytes (may exceed len(bytes) — see truncated)
+    bytes       BLOB,       -- raw stored bytes; NULL when initialized=0 (.bss has none)
+    initialized INTEGER,    -- 1 = the ELF stores bytes here; 0 = .bss (runtime-only value)
+    executable  INTEGER DEFAULT 0,  -- 1 = an EXECUTABLE block: extent recorded, bytes deliberately
+                                    --   NOT exported (data only, never code). On a section-header-
+                                    --   stripped ELF the read-only data rides inside the executable
+                                    --   PT_LOAD, so this row is what makes "the scope excluded it"
+                                    --   distinguishable from "no block covers this address".
+    truncated   INTEGER DEFAULT 0,  -- 1 = a cap cut the export: bytes cover < size
+    FOREIGN KEY(binary_id) REFERENCES binaries(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_data_blocks_binary ON data_blocks(binary_id);
+
 -- detector_scan_status: ONE row per (binary, detector) written on EVERY analyze — even at 0 tables.
 -- This is the honesty fix for the static string-table detector: at zero rows string_tables carries
 -- nothing, so an empty result reads as "confirmed none" and conflates (a) genuinely none of the
