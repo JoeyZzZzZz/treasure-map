@@ -158,7 +158,10 @@ _AGENT_INSTRUCTIONS = (
     "binary = short name OR full path), get_callees / get_xrefs to walk the call chain (an empty "
     "caller set may mean an indirect/dispatch-table call, not 'unreachable'), get_strings, "
     "get_functions_referencing_string (which functions mention a string, by pseudocode text "
-    "match — not a resolved symbol xref), get_imports_exports, get_script_callsites, "
+    "match — wide and noisy, hits comments too), get_string_reference_anchors (the PARSED "
+    "sibling: where a string is referenced by a RESOLVED Ghidra data reference — no comment "
+    "noise, but only defined strings and resolved refs), get_imports_exports, "
+    "get_script_callsites, "
     "get_data_bytes (the RAW bytes a data segment stores at an address — the content the "
     "decompiler drops when it renders a bare DAT_00xxxxxx; bytes only, the reading is "
     "yours). "
@@ -1480,6 +1483,13 @@ def make_tools(
         UNKNOWN, not "no data"). ``truncated`` names which limit stopped the read and never means
         the data ends there.
 
+        ★ ``bytes_from_executable_segment: true`` + ``warning``: the bytes came out of an RX block.
+        Executable blocks ARE covered, because on a section-header-stripped ELF (the common case in
+        firmware) Ghidra makes one block per PT_LOAD and .rodata rides inside the executable one —
+        without that reach a .rodata address would be unanswerable there. The cost is that .rodata
+        and .text are then indistinguishable: treat such a run as possibly INSTRUCTIONS until the
+        address is confirmed to be a data constant.
+
         Run-aware: ``run_id`` + ``binary`` or ``evidence_ref``; echoes ``resolved_run``."""
         return _fact(
             lambda c, fn, bn: facts.get_data_bytes(
@@ -1505,6 +1515,44 @@ def make_tools(
         symbol reference — the text may sit in a comment or unrelated literal; confirm each hit."""
         return _fact(
             lambda c, fn, bn: facts.get_functions_referencing_string(c, text=text, binary=bn),
+            run_id=run_id,
+            evidence_ref=evidence_ref,
+            binary=binary,
+        )
+
+    def get_string_reference_anchors(
+        text: str,
+        binary: str | None = None,
+        limit: int = 50,
+        run_id: str | None = None,
+        evidence_ref: str | None = None,
+    ) -> dict[str, Any]:
+        """Where a string is REFERENCED, by RESOLVED Ghidra data references (parsed, not text).
+
+        The parsed sibling of get_functions_referencing_string. That one searches decompiled TEXT
+        for a substring, so it also matches comments, longer strings containing this one, and
+        unrelated literals — wide and noisy. This one reports references Ghidra actually resolved to
+        the string's address, so that noise cannot appear. The trade is coverage: only DEFINED
+        strings, only references the analysis recovered, and ``text`` matches the string value
+        EXACTLY (locate the exact literal with get_strings(value=…) first). Use both.
+
+        Each anchor is {ref_at, ref_in_func, ref_in_func_addr, segment} — the referencing
+        instruction, the function containing it (null for a bare table slot in no function), and the
+        segment as METADATA ONLY (an ARM literal-pool ``ldr =S`` is a data reference living in an
+        executable block, so segment never filters). A FACT (the string is referenced here), NEVER a
+        dispatch/reachability verdict.
+
+        HONEST BOUNDS: ``no_resolved_dataref`` = the export ran and resolved nothing here — the
+        same "empty is not a proof" shape as an empty caller set, NOT "this string is unreferenced"
+        (indirect/computed references escape resolution). ``string_refs_not_exported`` = no export
+        for this scope at all (older scan / not re-scanned) — UNKNOWN, not "no references".
+
+        Run-aware: ``run_id`` + optional ``binary`` (or an ``evidence_ref``); echoes
+        ``resolved_run``."""
+        return _fact(
+            lambda c, fn, bn: facts.get_string_reference_anchors(
+                c, text=text, binary=bn, limit=limit
+            ),
             run_id=run_id,
             evidence_ref=evidence_ref,
             binary=binary,
@@ -1809,6 +1857,7 @@ def make_tools(
         "get_xrefs": get_xrefs,
         "get_strings": get_strings,
         "get_functions_referencing_string": get_functions_referencing_string,
+        "get_string_reference_anchors": get_string_reference_anchors,
         "get_imports_exports": get_imports_exports,
         "get_data_bytes": get_data_bytes,
         "get_script_callsites": get_script_callsites,

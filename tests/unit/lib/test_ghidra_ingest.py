@@ -345,7 +345,7 @@ def test_detector_status_idempotent_reingest_one_row(tmp_path: Path) -> None:
     per_detector = conn.execute(
         "SELECT detector, COUNT(*) FROM detector_scan_status GROUP BY detector"
     ).fetchall()
-    assert {r[0] for r in per_detector} == {"string_tables", "data_blocks"}
+    assert {r[0] for r in per_detector} == {"string_tables", "string_refs", "data_blocks"}
     assert all(r[1] == 1 for r in per_detector)
     conn.close()
 

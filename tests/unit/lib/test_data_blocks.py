@@ -38,6 +38,9 @@ _OTHER_SHA = "b" * 64
 _RODATA = b"ABCDEFGHIJKLMNOP"  # 16 bytes at 0x10000
 _DATA_STORED = b"01234567"  # 8 bytes stored of a 32-byte block at 0x20000
 _RODATA2 = bytes((i % 251) for i in range(8192))  # 8192 bytes at 0x40000
+# an RX PT_LOAD at 0x50000: on a stripped ELF .rodata and .text share one block, so these bytes are
+# deliberately half instruction-looking and half text -- the reader must not be told which is which.
+_EXEC_SEG = bytes(range(0x20)) + b"exec-segment-literal"
 
 
 def _payload(*, cap_hit: bool = True) -> dict[str, Any]:
@@ -73,13 +76,14 @@ def _payload(*, cap_hit: bool = True) -> dict[str, Any]:
                     "truncated": False,
                 },
                 {
-                    # a section-header-stripped ELF's RX PT_LOAD: extent recorded, bytes withheld
+                    # a section-header-stripped ELF's RX PT_LOAD: .rodata and .text share it
                     "name": "segment_2",
                     "start": "0x50000",
-                    "size": 256,
+                    "size": len(_EXEC_SEG),
                     "executable": True,
                     "initialized": True,
                     "truncated": False,
+                    "bytes": base64.b64encode(_EXEC_SEG).decode(),
                 },
                 {
                     "name": ".rodata2",
@@ -164,10 +168,10 @@ def test_ingest_writes_one_row_per_block(tmp_path: Path) -> None:
     assert bss["initialized"] == 0
     assert bss["bytes"] is None
     assert bss["size"] == 64  # the extent is still recorded, so an address can land in it
-    # an executable block is an EXTENT-ONLY record: bytes deliberately withheld (data, never code).
-    # A third state -- not .bss, and not a data block that happens to hold nothing.
+    # an executable block carries its bytes AND its flag: the flag is what the read side turns into
+    # the "may be instructions" warning, so losing it in transport loses the warning.
     ex = by_name["segment_2"]
-    assert ex["executable"] == 1 and ex["bytes"] is None and ex["size"] == 256
+    assert ex["executable"] == 1 and bytes(ex["bytes"]) == _EXEC_SEG
 
 
 def test_ingest_writes_a_scan_status_row_even_though_it_is_not_a_detector(tmp_path: Path) -> None:
@@ -271,52 +275,73 @@ def test_no_rows_is_not_no_data(tmp_path: Path) -> None:
     assert "bytes" not in res
 
 
-def test_executable_block_is_not_read_as_absent(tmp_path: Path) -> None:
-    """An address inside an EXECUTABLE block must say the export SCOPE withheld the bytes -- never
-    that no block covers the address.
+def test_executable_segment_bytes_are_served_with_their_warning(tmp_path: Path) -> None:
+    """RX blocks ARE readable -- and the answer can never arrive without saying the run may be code.
 
-    This is the COMMON case, not an exotic one: on an ELF stripped of section headers Ghidra builds
+    Executable blocks are in scope on purpose: on an ELF stripped of section headers Ghidra builds
     one block per PT_LOAD and the read-only data sits inside the executable RX segment. Verified on
     this machine against Ghidra 12.1.2 -- a stripped firmware binary yields ``segment_2``
     (init=true, exec=true, holding its .rodata) plus ``segment_3`` (init=true, exec=false), whereas
-    a binary that kept its section headers yields a separate non-executable ``.rodata`` block.
+    a binary that kept its section headers yields a separate non-executable ``.rodata`` block; and
+    454/456, 455/455, 417/417 binaries of three real images are section-header-free. Excluding RX
+    would therefore leave a .rodata address unanswerable on the vast majority of real binaries.
 
-    MUTATION (must go RED): drop the ``blk["executable"]`` branch in ``facts.get_data_bytes`` (or,
-    upstream, restore a ``continue`` for executable blocks in ``buildDataBlocks`` so no extent is
-    exported). A .rodata address on a stripped binary then answers
-    ``address_not_in_any_data_block``, which reads as "nothing is there" -- a false negative on the
-    majority of real binaries."""
+    The price is that .rodata and .text are indistinguishable there, so the caveat is mandatory.
+
+    MUTATION (must go RED): drop the ``blk["executable"]`` branch in ``facts.get_data_bytes``, or
+    stop carrying ``executable`` through ``ghidra_ingest``. The bytes then arrive looking exactly
+    like data-segment bytes and an agent can read a run of ARM instructions as a charset table."""
     db = _ingest(tmp_path, _payload())
     conn = _ro(db)
     try:
-        res = facts.get_data_bytes(conn, binary="test_bin", address="0x50010", length=16)
+        res = facts.get_data_bytes(conn, binary="test_bin", address="0x50020", length=20)
     finally:
         conn.close()
-    assert res["found"] is False
-    assert res["note"] == "address_in_executable_block"
-    assert res["block_name"] == "segment_2"  # named, so the reader knows WHICH block withheld it
-    assert "bytes" not in res
+    assert res["found"] is True
+    assert bytes.fromhex(res["bytes"]) == b"exec-segment-literal"
+    assert res["block_name"] == "segment_2"
+    # ★ the caveat, on its OWN keys -- not in `note`, which the truncation reason owns
+    assert res["bytes_from_executable_segment"] is True
+    assert "may be read-only DATA or may be INSTRUCTION" in res["warning"]
+
+
+def test_executable_warning_survives_a_truncated_read(tmp_path: Path) -> None:
+    """The RX caveat and a truncation reason must COEXIST. Sharing one `note` slot would let a
+    short read out of an RX block silently lose the "may be instructions" warning -- the exact
+    signal-collapse this codebase treats as a red line.
+
+    MUTATION (must go RED): move the caveat into ``note`` (``result["note"] =
+    "bytes_from_executable_segment"``) instead of its own key; the truncation reason then overwrites
+    it, or it overwrites the truncation reason."""
+    db = _ingest(tmp_path, _payload())
+    conn = _ro(db)
+    try:
+        # start near the end of the RX block so the read is clamped AND lands in RX
+        res = facts.get_data_bytes(conn, binary="test_bin", address="0x50028", length=64)
+    finally:
+        conn.close()
+    assert res["found"] is True
+    assert res["truncated"] is True and res["note"] == "clamped_to_block_end"
+    assert res["bytes_from_executable_segment"] is True and res["warning"]
 
 
 def test_bss_note_distinct_from_not_in_block(tmp_path: Path) -> None:
-    """The four not-found reasons are four DIFFERENT strings; collapsing any two of them would let
-    a caller answer a question the substrate never answered."""
+    """The three not-found reasons are three DIFFERENT strings; collapsing any two of them would
+    let a caller answer a question the substrate never answered."""
     db = _ingest(tmp_path, _payload())
     conn = _ro(db)
     try:
         bss = facts.get_data_bytes(conn, binary="test_bin", address="0x30010", length=8)
         gone = facts.get_data_bytes(conn, binary="test_bin", address="0x99999", length=8)
         never = facts.get_data_bytes(conn, binary="bare_bin", address="0x10000", length=8)
-        code = facts.get_data_bytes(conn, binary="test_bin", address="0x50010", length=8)
     finally:
         conn.close()
-    notes = {bss["note"], gone["note"], never["note"], code["note"]}
-    assert len(notes) == 4
+    notes = {bss["note"], gone["note"], never["note"]}
+    assert len(notes) == 3
     assert notes == {
         "uninitialized_bss",
         "address_not_in_any_data_block",
         "data_blocks_not_exported",
-        "address_in_executable_block",
     }
 
 
@@ -336,6 +361,9 @@ def test_plain_read_returns_the_bytes_and_no_reading_of_them(tmp_path: Path) -> 
     assert res["offset_in_block"] == 4 and res["block_name"] == ".rodata"
     # the red line: bytes only. No verdict key of any kind rides along.
     assert "RAW BYTES ONLY" in res["contract"]
+    # a data-block read carries NO executable caveat -- a flag that is always on says nothing
+    assert "bytes_from_executable_segment" not in res
+    assert "warning" not in res
     assert not {"is_text", "safe", "verdict", "looks_like"} & set(res)
 
 

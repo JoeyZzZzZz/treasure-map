@@ -54,6 +54,7 @@ _EXPECTED_TOOLS = {
     "get_xrefs",
     "get_strings",
     "get_functions_referencing_string",
+    "get_string_reference_anchors",
     "get_imports_exports",
     "get_data_bytes",
     "get_script_callsites",

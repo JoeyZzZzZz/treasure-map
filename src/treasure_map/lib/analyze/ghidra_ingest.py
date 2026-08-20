@@ -140,6 +140,7 @@ def _ingest_one_binary(
         "strings",
         "nvram_defaults",
         "string_tables",
+        "string_refs",
         "data_blocks",
         "detector_scan_status",
     ):
@@ -353,11 +354,75 @@ def _ingest_one_binary(
             (binary_id,),
         )
 
-    # A1: raw data-segment bytes. One row per exported memory block. RAW BYTES ONLY — nothing here
-    # reads them. An initialized block carries its (possibly cap-truncated) bytes; a .bss block
-    # carries bytes=NULL with initialized=0, so a later lookup answers "uninitialized, runtime-only"
-    # instead of a fabricated zero. An absent/empty block list contributes NO rows — the query then
-    # reports "not exported" (unknown), never "no data".
+    # Resolved string-reference anchors: one row per (string, referencing instruction). A RESOLVED
+    # Ghidra data/pointer reference — unlike the pseudocode TEXT search it cannot hit a comment or
+    # an unrelated literal, and unlike a reachability edge it says nothing about what the
+    # referencing code then does. A string with no resolved reference contributes NO rows, and an
+    # absent payload key contributes none either; the query tells those apart from the scan-status
+    # row written below.
+    string_refs = data.get("string_refs")
+    if isinstance(string_refs, dict):
+        sref_rows: list[tuple[Any, ...]] = []
+        strings_with_refs = 0
+        for entry in string_refs.get("strings", []):
+            if not isinstance(entry, dict):
+                continue
+            refs = [r for r in entry.get("refs", []) if isinstance(r, dict)]
+            if not refs:
+                continue
+            strings_with_refs += 1
+            truncated = 1 if entry.get("truncated") else 0
+            for r in refs:
+                sref_rows.append(
+                    (
+                        binary_id,
+                        entry.get("string_addr"),
+                        entry.get("value"),
+                        r.get("ref_at"),
+                        r.get("ref_in_func"),
+                        r.get("ref_in_func_addr"),
+                        r.get("segment"),
+                        truncated,
+                    )
+                )
+        if sref_rows:
+            conn.executemany(
+                "INSERT INTO string_refs "
+                "(binary_id, string_addr, string_value, ref_at, ref_in_func, ref_in_func_addr, "
+                "segment, truncated) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                sref_rows,
+            )
+        # ★ honest 0-row status, written EVERY ingest and NOT gated on row count: at zero rows an
+        # empty string_refs would otherwise read as "this binary references no strings". found_count
+        # is the number of STRINGS that had at least one resolved reference (not the row count).
+        conn.execute(
+            "INSERT INTO detector_scan_status "
+            "(binary_id, detector, scanned, supported_scope, unsupported_note, cap_hit, "
+            "found_count) VALUES (?, 'string_refs', 1, ?, ?, ?, ?)",
+            (
+                binary_id,
+                "defined_strings_with_resolved_data_refs",
+                "indirect_or_computed_references_are_not_resolved",
+                1 if string_refs.get("cap_hit") else 0,
+                strings_with_refs,
+            ),
+        )
+    else:
+        # No string_refs object in the payload (an export predating it). Record scanned=0 so a
+        # consumer sees "no status recorded", never a confident "no references".
+        conn.execute(
+            "INSERT INTO detector_scan_status (binary_id, detector, scanned) "
+            "VALUES (?, 'string_refs', 0)",
+            (binary_id,),
+        )
+
+    # A1: raw segment bytes. One row per exported memory block. RAW BYTES ONLY — nothing here reads
+    # them. An initialized block carries its (possibly cap-truncated) bytes; a .bss block carries
+    # bytes=NULL with initialized=0, so a later lookup answers "uninitialized, runtime-only" instead
+    # of a fabricated zero. `executable` marks a block whose bytes came out of an RX segment, where
+    # .rodata and .text are indistinguishable without section headers — the read side turns it into
+    # a standing warning, so it must survive the round trip. An absent/empty block list contributes
+    # NO rows — the query then reports "not exported" (unknown), never "no data".
     data_blocks = data.get("data_blocks")
     if isinstance(data_blocks, dict):
         blk_rows: list[tuple[Any, ...]] = []
@@ -368,7 +433,7 @@ def _ingest_one_binary(
             executable = 1 if b.get("executable") else 0
             truncated = 1 if b.get("truncated") else 0
             raw: bytes | None = None
-            if initialized and not executable:
+            if initialized:
                 try:
                     raw = base64.b64decode(b.get("bytes") or "", validate=True)
                 except ValueError:

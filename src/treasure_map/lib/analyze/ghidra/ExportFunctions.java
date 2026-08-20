@@ -817,11 +817,20 @@ public class ExportFunctions extends GhidraScript {
              + "\"absolute_2field_only\",\"cap_hit\":" + capHit + "}}";
     }
 
-    // ============ raw data-segment bytes (.rodata/.data): a slicing substrate, not a reading ============
-    // Export each non-executable memory block's raw bytes so a query can slice the bytes at ANY
-    // data-segment address the agent meets in pseudocode (a bare `DAT_000174e4`) WITHOUT re-running
-    // Ghidra. BYTES ONLY: this pass attaches no reading of them — whether a byte run is a key, a
-    // charset table or padding is the consumer's call, never this pass's.
+    // ============ raw segment bytes: a slicing substrate, not a reading ============
+    // Export each LOADED memory block's raw bytes so a query can slice the bytes at ANY address the
+    // agent meets in pseudocode (a bare `DAT_000174e4`) WITHOUT re-running Ghidra. BYTES ONLY: this
+    // pass attaches no reading of them — whether a byte run is a key, a charset table or padding is
+    // the consumer's call, never this pass's.
+    //
+    // ★ SCOPE INCLUDES EXECUTABLE BLOCKS, and that is deliberate. On an ELF stripped of section
+    // headers Ghidra builds one block per PT_LOAD and the read-only data rides INSIDE the executable
+    // RX segment — measured on real firmware, 454/456, 455/455 and 417/417 binaries of three images
+    // are section-header-free, so collecting non-executable blocks only would have failed to answer
+    // a .rodata address on the overwhelming majority of real binaries. The price of that reach is an
+    // honesty duty the consumer must not lose: without section headers NOTHING here can tell .rodata
+    // from .text inside an RX block, so `executable` travels with every record and the read side
+    // turns it into a standing warning that the returned run may be DATA or may be INSTRUCTIONS.
     //
     // Two honesty red lines travel per block:
     //   truncated=true    a cap cut the export short, so the stored bytes cover LESS than `size`.
@@ -830,14 +839,16 @@ public class ExportFunctions extends GhidraScript {
     //   initialized=false a .bss block: the ELF reserves the extent but stores no bytes, so the
     //                     value exists only at runtime. Exported WITH its extent and NO bytes —
     //                     declared missing, never silently zero-filled (a zero would be a reading).
-    // Caps, CALIBRATED against four real firmware images (456 / 455 / 479 / 417 binaries): the
-    // largest single binary would store 0.79 MiB and the 99th percentile 0.26 MiB, so a per-binary
-    // total of 8 MiB carries ~10x headroom over anything measured and never bit on that corpus.
-    // Whole-image cost is 1.7-7.4 MiB of exported bytes, i.e. +0.2% to +3% of the analysis.db those
-    // images already produce. Should a future image exceed a cap, truncated/cap_hit is what keeps
+    // Caps, CALIBRATED against real firmware images (456 / 417 / 479 binaries) with the EXECUTABLE
+    // segments included: per binary the median is 0.02 MiB, p99 is 1.4 MiB and the worst single
+    // binary measured is 14.1 MiB — which is why the caps sit at 16 MiB per block and 32 MiB per
+    // binary rather than the 4/8 MiB that sufficed while only data blocks were collected. Whole-
+    // image cost is 36-64 MiB of exported bytes (+8% to +22% of the analysis.db those images
+    // already produce) — the deliberate price of answering a .rodata address on a section-header-
+    // stripped binary at all. Should a future image exceed a cap, truncated/cap_hit is what keeps
     // the shortfall visible instead of silent.
-    private static final long DATABLK_MAX_BYTES_PER_BLOCK = 4_194_304L;   // 4 MiB, per block
-    private static final long DATABLK_MAX_TOTAL_BYTES = 8_388_608L;       // 8 MiB, per binary
+    private static final long DATABLK_MAX_BYTES_PER_BLOCK = 16_777_216L;  // 16 MiB, per block
+    private static final long DATABLK_MAX_TOTAL_BYTES = 33_554_432L;      // 32 MiB, per binary
 
     private String buildDataBlocks() {
         Memory mem = currentProgram.getMemory();
@@ -858,24 +869,11 @@ public class ExportFunctions extends GhidraScript {
                         + Long.toHexString(blk.getStart().getOffset()) + "\",\"size\":" + size;
             if (!first) blocks.append(",");
             first = false;
-            if (blk.isExecute()) {
-                // Bytes are NOT collected from an executable block — data only, never code (the
-                // buildStringTables test). Its EXTENT is still recorded, with no bytes, because on
-                // an ELF stripped of section headers Ghidra builds one block per PT_LOAD and the
-                // read-only data rides inside the executable RX segment (measured on real firmware:
-                // 454/456, 455/455 and 417/417 binaries of three images are section-header-free, so
-                // this is the common case, not the exotic one). Without this row a .rodata address
-                // there answers "in no data block at all", which reads as "nothing is there"; with
-                // it the answer names the block and says the export scope, not the binary, is why
-                // the bytes are missing.
-                blocks.append(head).append(",\"executable\":true,\"initialized\":")
-                      .append(blk.isInitialized()).append(",\"truncated\":false}");
-                continue;
-            }
             if (!blk.isInitialized()) {
                 // .bss: extent without content. Still exported, so an address landing here resolves
                 // to "uninitialized" rather than to "not in any data block" — two different answers.
-                blocks.append(head).append(",\"initialized\":false,\"truncated\":false}");
+                blocks.append(head).append(",\"initialized\":false,\"executable\":")
+                      .append(blk.isExecute()).append(",\"truncated\":false}");
                 continue;
             }
             long room = DATABLK_MAX_TOTAL_BYTES - total;
@@ -893,7 +891,9 @@ public class ExportFunctions extends GhidraScript {
             total += got;
             boolean truncated = got < size;   // stored bytes cover less than the block's extent
             if (truncated) capHit = true;
-            blocks.append(head).append(",\"initialized\":true,\"truncated\":").append(truncated)
+            blocks.append(head).append(",\"initialized\":true,\"executable\":")
+                  .append(blk.isExecute())
+                  .append(",\"truncated\":").append(truncated)
                   .append(",\"bytes\":\"").append(Base64.getEncoder().encodeToString(buf))
                   .append("\"}");
         }
@@ -1045,6 +1045,93 @@ public class ExportFunctions extends GhidraScript {
         if (blk.isExecute()) return ".text-literalpool";
         String n = blk.getName();
         return (n != null && !n.isEmpty()) ? n : "unknown";
+    }
+
+    // STRINGREF_PER_STRING_LIMIT caps ONE string's reference list; STRINGREF_TOTAL_LIMIT bounds the
+    // whole binary's export. Neither drops silently: the per-string cap sets truncated on THAT
+    // string's record, the total cap sets cap_hit on the whole result.
+    //
+    // CALIBRATED on real firmware: references run at ~0.96 per defined string (2252 refs over 2356
+    // strings on a measured binary), 83% of strings carry exactly one, and the busiest single string
+    // carried 13 — so the per-string cap of 100 has ~8x headroom. The richest real binary in the
+    // corpus holds 14,317 defined strings, projecting to ~13.7k references, and STR_LIMIT bounds any
+    // binary at 20,000 strings (~19k projected references) — so the total cap of 200,000 has ~10x
+    // headroom and did not bite anywhere measured. Cost measured on the same binary: +0.39 MiB of
+    // payload and NO measurable analyze time (29.93s before, 29.78s after, on an already-analyzed
+    // program), because getReferencesTo early-outs on the unreferenced majority.
+    private static final int STRINGREF_PER_STRING_LIMIT = 100;
+    private static final int STRINGREF_TOTAL_LIMIT = 200_000;
+
+    // Out-params of stringRefsRecord. A GhidraScript instance runs single-threaded over one
+    // program, so instance fields are a safe way to hand back the counters beside the JSON.
+    private int     srefEmitted;     // references written by the last stringRefsRecord call
+    private boolean srefTruncated;   // a cap cut that call's list short
+
+    // Resolved string-reference FACTS: which instructions reference the string living at
+    // stringAddr, as a DATA/POINTER reference.
+    //
+    // ★ The SAME machinery and the same discipline as buildAddressTaken — only the target changes,
+    //   from a function ENTRY to a string's data address. DIRECTION: getReferencesTo(stringAddr) —
+    //   who points AT the string. FILTER: by REFERENCE TYPE (drop isCall / isFlow — those are
+    //   control flow, not a data reference), NEVER by source segment: an ARM literal-pool `ldr =S`
+    //   is a DATA ref that sits in an EXECUTABLE block, so a segment filter would drop the ordinary
+    //   case — and on real ARM firmware it is not merely the ordinary case but the ONLY one:
+    //   measured on a real binary, 2252 of 2252 references were ".text-literalpool", so a segment
+    //   filter would have deleted the entire feature there. ``segment`` is metadata only. ★ IRON LAW: a fact (S is referenced HERE), NEVER a
+    //   dispatch/reachability verdict — what the referencing code then does with S is the
+    //   consumer's to trace.
+    //
+    // Distinct from the pseudocode TEXT search (get_functions_referencing_string), which matches a
+    // substring and happily hits a comment or an unrelated literal: this is a reference Ghidra
+    // actually RESOLVED. It is also NARROWER — it sees only defined strings and only the references
+    // the analysis recovered — so an empty result is "none resolved", never "none exist".
+    private String stringRefsRecord(Address stringAddr, String value, int budget) {
+        srefEmitted = 0;
+        srefTruncated = false;
+        if (budget <= 0) return null;
+        ReferenceManager refMgr = currentProgram.getReferenceManager();
+        FunctionManager  fm     = currentProgram.getFunctionManager();
+        Memory           mem    = currentProgram.getMemory();
+        ReferenceIterator it = refMgr.getReferencesTo(stringAddr);
+        if (!it.hasNext()) return null;   // early out: the overwhelmingly common unreferenced string
+        int cap = Math.min(STRINGREF_PER_STRING_LIMIT, budget);
+        StringBuilder arr = new StringBuilder("[");
+        boolean first = true;
+        int count = 0;
+        while (it.hasNext()) {
+            Reference ref = it.next();
+            RefType rt = ref.getReferenceType();
+            if (rt.isCall() || rt.isFlow()) continue;              // control flow, not a data ref
+            if (!stringAddr.equals(ref.getToAddress())) continue;  // a TRUE ref to it (defensive)
+            Address from = ref.getFromAddress();
+            if (from == null) continue;
+            // VALIDITY check (NOT a segment filter), identical to buildAddressTaken's: the
+            // reference must sit in a REAL initialized block. Ghidra models entry-point / dynamic-
+            // symbol / relocation markers as references FROM address 0x0, which has no block; that
+            // is loader bookkeeping, not an in-binary reference. Every real source — a .text
+            // literal pool, .data, .got — has a block, so no segment is lost.
+            MemoryBlock fromBlk = mem.getBlock(from);
+            if (fromBlk == null || !fromBlk.isInitialized()) continue;
+            if (count >= cap) { srefTruncated = true; break; }
+            Function inFunc = fm.getFunctionContaining(from);
+            String inName = (inFunc != null) ? inFunc.getName() : null;
+            String inAddr = (inFunc != null) ? addrHex(inFunc.getEntryPoint()) : null;
+            if (!first) arr.append(",");
+            first = false;
+            arr.append("{\"ref_at\":\"").append(esc(addrHex(from))).append("\"")
+               .append(",\"ref_in_func\":")
+               .append(inName != null ? "\"" + esc(inName) + "\"" : "null")
+               .append(",\"ref_in_func_addr\":")
+               .append(inAddr != null ? "\"" + esc(inAddr) + "\"" : "null")
+               .append(",\"segment\":\"").append(esc(segmentLabel(fromBlk))).append("\"")
+               .append("}");
+            count++;
+        }
+        arr.append("]");
+        if (count == 0) return null;   // every reference to it was control flow / loader noise
+        srefEmitted = count;
+        return "{\"string_addr\":\"" + esc(addrHex(stringAddr)) + "\",\"value\":\"" + esc(value)
+             + "\",\"refs\":" + arr + ",\"truncated\":" + srefTruncated + "}";
     }
 
     private Address safeAdd(Address a, long delta) {
@@ -1928,6 +2015,15 @@ public class ExportFunctions extends GhidraScript {
         boolean strCancelled = false;
         final int STR_LIMIT = 20000;
 
+        // Resolved string-reference anchors, gathered in THIS SAME pass. A second full
+        // getDefinedData traversal would be pure waste on an already-slow analyze, and the refs are
+        // only wanted for strings this pass actually stores — so string_refs is a subset of strings
+        // by construction, and a STR_LIMIT truncation truncates both (folded into cap_hit below).
+        StringBuilder stringRefsJson = new StringBuilder("[");
+        boolean firstSRef = true;
+        int     sRefTotal = 0;
+        boolean sRefCapHit = false;
+
         DataIterator dataIter = currentProgram.getListing().getDefinedData(true);
         while (dataIter.hasNext()) {
             if (monitor.isCancelled()) { strCancelled = true; break; }
@@ -1974,13 +2070,40 @@ public class ExportFunctions extends GhidraScript {
                        .append("\"address\":\"").append(esc(data.getAddress().toString())).append("\"")
                        .append("}");
             strCount++;
+
+            // Who REFERENCES this string (a resolved data ref), gathered in the same pass. Isolated:
+            // any failure on one string costs that string's refs, never the whole strings export.
+            if (!sRefCapHit) {
+                String srec = null;
+                try {
+                    srec = stringRefsRecord(data.getAddress(), val, STRINGREF_TOTAL_LIMIT - sRefTotal);
+                } catch (Throwable ignore) {
+                    srec = null;
+                }
+                if (srec != null) {
+                    if (!firstSRef) stringRefsJson.append(",");
+                    firstSRef = false;
+                    stringRefsJson.append(srec);
+                    sRefTotal += srefEmitted;
+                    if (sRefTotal >= STRINGREF_TOTAL_LIMIT) sRefCapHit = true;
+                }
+            }
         }
         stringsJson.append("]");
+        stringRefsJson.append("]");
         // Truncated if the cap dropped matches OR a cancel cut the count short (then strTotal is a
         // lower bound and completeness is unknown — flag it rather than imply a clean count).
         boolean strTruncated = strTotal > strCount || strCancelled;
         println("[ExportFunctions] strings: " + strCount + " stored / " + strTotal + " total"
                 + (strTruncated ? " (TRUNCATED)" : ""));
+
+        // A truncated STRING list truncates the reference list with it (refs are gathered only for
+        // strings that were stored), so the string cap is folded into cap_hit instead of being left
+        // implicit — an empty/short string_refs never reads as "these are all the references".
+        String stringRefs = "{\"strings\":" + stringRefsJson + ",\"cap_hit\":"
+                          + (sRefCapHit || strTruncated) + "}";
+        println("[ExportFunctions] string_refs: " + sRefTotal + " refs"
+                + ((sRefCapHit || strTruncated) ? " (CAP HIT)" : ""));
 
         // 4b. Naming-bridge phase 1: parse the router_defaults data-segment table (the web-settable
         // nvram default keys). A pure data-segment fact the decompiler cannot surface. Additive +
@@ -2044,7 +2167,11 @@ public class ExportFunctions extends GhidraScript {
             // A1: raw data-segment bytes. RAW BYTES ONLY — no reading of them travels with them.
             // An absent key (an export predating A1) is "not exported" (unknown), never "no data";
             // a block's truncated=true means the bytes cover LESS than size, never "ends here".
-            pw.print("\"data_blocks\":"      + dataBlocks);
+            pw.print("\"data_blocks\":"      + dataBlocks + ",");
+            // Resolved string-reference anchors: WHERE each stored string is referenced by a
+            // data/pointer reference. A resolved fact, never a reachability verdict; an absent key
+            // (an export predating it) is "not exported" (unknown), never "no references".
+            pw.print("\"string_refs\":"      + stringRefs);
             pw.print("}");
         }
         try {

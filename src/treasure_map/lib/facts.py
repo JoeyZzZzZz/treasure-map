@@ -899,6 +899,152 @@ def get_functions_referencing_string(
     }
 
 
+# The standing bound on a RESOLVED reference set. An empty one is "Ghidra resolved none", which is
+# the same shape of honesty as an empty caller set: the mechanism that reaches the string may simply
+# not be statically resolvable.
+_STRING_REF_UNRESOLVED_NOTE = (
+    "Ghidra resolved no data reference to this string here. That is NOT proof it is unreferenced: "
+    "an indirect or computed reference (a pointer built at runtime, a table walked by index, a "
+    "reference the analysis never recovered) escapes resolution, and only DEFINED strings are "
+    "covered at all. Cross-check with get_functions_referencing_string, whose pseudocode text "
+    "match is wider (and noisier)."
+)
+_STRING_REF_NOTE_RESOLVED = (
+    "RESOLVED Ghidra data references (NOT a pseudocode text match): each anchor is an instruction "
+    "that references this string's address. It is a FACT (the string is referenced here), never a "
+    "dispatch or reachability verdict — what the referencing code does with the string is yours to "
+    "trace. `segment` is metadata (an ARM literal-pool reference legitimately sits in an "
+    "executable block); it is never used to include or exclude an anchor."
+)
+
+
+def _string_refs_exported(conn: sqlite3.Connection, bid: int | None) -> bool:
+    """Whether the string-reference export RAN for this scope — the difference between "no resolved
+    reference" and "nobody ever looked". Reads the per-binary scan-status row the ingest writes on
+    every run, and falls back to the presence of any row (a database written before that status
+    existed still proves the export ran)."""
+    where, params = "detector = 'string_refs' AND scanned = 1", []
+    if bid is not None:
+        where += " AND binary_id = ?"
+        params = [bid]
+    try:
+        row = conn.execute(
+            f"SELECT 1 FROM detector_scan_status WHERE {where} LIMIT 1",  # noqa: S608 -- literal
+            params,
+        ).fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    if row is not None:
+        return True
+    sql = "SELECT 1 FROM string_refs"
+    if bid is not None:
+        sql += " WHERE binary_id = ?"
+    try:
+        return conn.execute(sql + " LIMIT 1", params).fetchone() is not None
+    except sqlite3.OperationalError:
+        return False
+
+
+def get_string_reference_anchors(
+    conn: sqlite3.Connection, *, text: str, binary: str | None = None, limit: int = 50
+) -> dict[str, Any]:
+    """Where a string is REFERENCED, by resolved Ghidra data references (the parsed sibling of
+    ``get_functions_referencing_string``).
+
+    ★ The difference from ``get_functions_referencing_string``: that one searches the decompiled
+    TEXT for a substring, so it happily matches a comment, a longer string that contains this one,
+    or an unrelated literal — every hit is a lead to confirm. This one reports references Ghidra
+    actually RESOLVED to the string's address, so none of that noise can appear. The trade is
+    coverage, not accuracy: it sees only DEFINED strings and only the references the analysis
+    recovered, and matching is EXACT on the string value (find the exact literal with
+    ``get_strings(value=…)`` first). Use both — wide-and-noisy against narrow-and-resolved.
+
+    Each anchor is ``{ref_at, ref_in_func, ref_in_func_addr, segment}``: the referencing
+    instruction, the function containing it (NULL when it lies in no function — a bare table slot),
+    and the source segment as METADATA. ``segment`` never filters anything: an ARM literal-pool
+    ``ldr =S`` is a data reference sitting in an executable block, so filtering by segment would
+    drop the ordinary case.
+
+    HONEST BOUNDARIES: ``no_resolved_dataref`` means the export ran and resolved nothing here — the
+    same "empty set is not a proof" shape as an empty caller list, NOT "this string is
+    unreferenced". ``string_refs_not_exported`` means this scope has no export at all (an older
+    analysis.db, or a binary not re-scanned) — UNKNOWN, not "no references"."""
+    if not text:
+        return {"found": False, "reason": "empty search text", "query": {"text": text}}
+    lim = max(1, limit)
+    bid = None
+    if binary is not None:
+        row = conn.execute(
+            "SELECT id FROM binaries WHERE name = ? OR path = ? LIMIT 1", (binary, binary)
+        ).fetchone()
+        if row is None:
+            return {
+                "found": False,
+                "query": {"text": text, "binary": binary},
+                "note": "no_such_binary",
+            }
+        bid = int(row["id"])
+    query = {"text": text, "binary": binary, "match_kind": "exact_string_value"}
+    sql = (
+        "SELECT r.string_addr, r.string_value, r.ref_at, r.ref_in_func, r.ref_in_func_addr, "
+        "r.segment, r.truncated, b.name AS binary_name "
+        "FROM string_refs r JOIN binaries b ON b.id = r.binary_id WHERE r.string_value = ?"
+    )
+    params: list[Any] = [text]
+    if bid is not None:
+        sql += " AND r.binary_id = ?"
+        params.append(bid)
+    sql += " ORDER BY b.name, r.string_addr, r.ref_at LIMIT ?"
+    params.append(lim + 1)  # one extra row detects truncation without a second COUNT
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    except sqlite3.OperationalError:
+        rows = []  # analysis.db predating the table -> the same "not exported" (unknown) answer
+    if not rows:
+        if not _string_refs_exported(conn, bid):
+            return {
+                "found": False,
+                "query": query,
+                "note": "string_refs_not_exported",
+                "detail": (
+                    "no string-reference export exists for this scope (older analysis.db, or not "
+                    "re-scanned since it existed) — UNKNOWN, never 'no references'"
+                ),
+            }
+        return {
+            "found": False,
+            "query": query,
+            "note": "no_resolved_dataref",
+            "detail": _STRING_REF_UNRESOLVED_NOTE,
+        }
+    over_limit = len(rows) > lim
+    anchors = [
+        {
+            "binary": r["binary_name"],
+            "string_addr": _norm_addr(r["string_addr"]),
+            "ref_at": _norm_addr(r["ref_at"]),
+            "ref_in_func": r["ref_in_func"],
+            "ref_in_func_addr": _norm_addr(r["ref_in_func_addr"]),
+            "segment": r["segment"],
+        }
+        for r in rows[:lim]
+    ]
+    # Two independent shortfalls, kept apart: the EXPORT capped this string's reference list, and/or
+    # this RESPONSE capped the rows. Either way the set is a prefix, never "all of them".
+    export_truncated = any(r["truncated"] for r in rows[:lim])
+    return {
+        "found": True,
+        "query": query,
+        "anchors": anchors,
+        "returned": len(anchors),
+        "limit": lim,
+        "truncated": bool(export_truncated or over_limit),
+        "export_truncated": bool(export_truncated),
+        "response_truncated": over_limit,
+        "note": _STRING_REF_NOTE_RESOLVED,
+    }
+
+
 def get_imports_exports(conn: sqlite3.Connection, *, binary: str) -> dict[str, Any]:
     """The import and export symbol tables of one binary (the cross-binary edge endpoints)."""
     bid = _binary_id(conn, binary)
@@ -928,7 +1074,8 @@ _DATA_BYTES_CONTRACT = (
     "RAW BYTES ONLY. This returns what the data segment stores at an address and attaches NO "
     "reading of it: `ascii` is a mechanical byte-by-byte rendering (non-printable -> '.'), NOT a "
     "claim that the run is text, a key, a charset, or anything else. Deciding what the bytes mean "
-    "is yours."
+    "is yours. Bytes out of an executable (RX) block additionally carry "
+    "`bytes_from_executable_segment` + a `warning`: they may be instructions rather than data."
 )
 # A cap on ONE request, so a single call cannot serialize a whole 4 MiB segment into a response.
 # Independent of the exporter's per-block cap: this one bounds the ANSWER, that one the STORE.
@@ -971,10 +1118,10 @@ def get_data_bytes(
       export, or a binary not re-scanned). UNKNOWN — never "this binary has no data".
     - ``address_not_in_any_data_block``: the address falls outside every exported block. It is NOT
       "the bytes are zero" and NOT "nothing is there" — it may be an unexported space.
-    - ``address_in_executable_block``: a block DOES cover the address, but it is executable, and
-      this export carries data bytes only. Kept distinct from the previous case because it is the
-      COMMON one on section-header-stripped firmware, where .rodata rides inside the executable
-      PT_LOAD — "the scope excluded it" must never read as "no block covers it".
+    - ``bytes_from_executable_segment`` (a returned-bytes caveat, not a miss): the bytes came out of
+      an RX block. On a section-header-stripped ELF .rodata and .text share one PT_LOAD block, so
+      the run may be data OR instructions and nothing here can tell which. It rides on its own key
+      plus ``warning`` — never in ``note`` — so a truncation reason can never displace it.
     - ``uninitialized_bss``: the address lands in a .bss extent, which stores no bytes at all; the
       value exists only at runtime. Distinct from the previous case ON PURPOSE: "reserved but empty"
       and "not in any segment" are different facts.
@@ -1056,22 +1203,6 @@ def get_data_bytes(
         "start": blk["start_addr"],
         "block_size": size,
     }
-    if blk["executable"]:
-        return {
-            "found": False,
-            "query": query,
-            **block_anchor,
-            "note": "address_in_executable_block",
-            "detail": (
-                "the address lands in an EXECUTABLE block, whose bytes this export deliberately "
-                "does not carry (data only, never code). On an ELF stripped of section headers "
-                "there is one block per PT_LOAD and the read-only data sits inside the executable "
-                "one, so a .rodata constant lands here — the bytes exist in the binary, the export "
-                "scope is what excludes them. Read them from the binary itself, or widen the "
-                "export scope"
-            ),
-            "contract": _DATA_BYTES_CONTRACT,
-        }
     if not blk["initialized"]:
         return {
             "found": False,
@@ -1128,6 +1259,22 @@ def get_data_bytes(
         result["detail"] = detail
     else:
         result["truncated"] = False
+    if blk["executable"]:
+        # ★ The RX honesty duty, on TWO DEDICATED KEYS of its own — deliberately NOT sharing the
+        # `note` slot, which carries the truncation reason. A shared slot means a truncated read out
+        # of an RX block would silently drop this warning, and reading instruction bytes as data is
+        # a worse error than not knowing why a read stopped short. Both keys are unconditional
+        # whenever the block is executable.
+        result["bytes_from_executable_segment"] = True
+        result["warning"] = (
+            "these bytes come from an EXECUTABLE (RX) block. If the binary has no section headers "
+            "there is one block per PT_LOAD, so .rodata and .text share this block and NOTHING "
+            "here can tell them apart: the run returned may be read-only DATA or may be "
+            "INSTRUCTION bytes. Do not read it as data without confirming the address is a data "
+            "constant "
+            "(e.g. the pseudocode references it as DAT_/a string, or a disassembler shows no "
+            "instruction there)."
+        )
     if blk["truncated"]:
         # The block itself is a prefix. Said even on a fully-served read: the bytes returned are
         # right, but "nothing more after this block's stored tail" would be wrong.

@@ -145,6 +145,29 @@ CREATE TABLE IF NOT EXISTS strings (
     FOREIGN KEY(binary_id) REFERENCES binaries(id) ON DELETE CASCADE
 );
 
+-- Resolved string-reference anchors: string S at data-segment address X is referenced (a
+-- data/pointer reference, NOT a call/flow) at instruction ref_at inside ref_in_func. Distinct from
+-- get_functions_referencing_string (a pseudocode TEXT match): this is a RESOLVED Ghidra reference,
+-- not a substring lead. Filtered by REFERENCE TYPE (drop call/flow), NEVER by segment — an ARM
+-- literal-pool `ldr =S` is a data ref that sits in an executable block. A FACT (S is referenced
+-- here), never a dispatch/reachability verdict. truncated=1 = a per-string cap hit (the refs cover
+-- fewer than all of them). NO rows for a binary = string_refs was not exported (unknown), NEVER
+-- "no references". WIPE-AND-REBUILD per binary each analyze run.
+CREATE TABLE IF NOT EXISTS string_refs (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    binary_id        INTEGER,
+    string_addr      TEXT,     -- the string's data-segment address '0x…' (groups a string's refs)
+    string_value     TEXT,     -- the string literal (join key for consumers)
+    ref_at           TEXT,     -- instruction address that references the string '0x…'
+    ref_in_func      TEXT,     -- function containing ref_at (NULL if in no function)
+    ref_in_func_addr TEXT,     -- that function's entry '0x…' (NULL if none)
+    segment          TEXT,     -- source-segment LABEL of ref_at (metadata only, never a filter)
+    truncated        INTEGER DEFAULT 0,  -- 1 = a per-string cap truncated this string's ref list
+    FOREIGN KEY(binary_id) REFERENCES binaries(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_string_refs_binary ON string_refs(binary_id);
+CREATE INDEX IF NOT EXISTS idx_string_refs_value  ON string_refs(binary_id, string_value);
+
 -- naming-bridge phase 1: the router_defaults data-segment table — one row per web-settable nvram
 -- default key (parsed from libshared's 20-byte struct array). A resolved member has key=name; a
 -- member whose name ptr was unreadable is recorded with key=NULL (not silently skipped), so a
