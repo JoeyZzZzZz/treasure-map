@@ -26,7 +26,6 @@ from pathlib import Path
 from typing import Any
 
 from treasure_map.lib.fmt_spec import arity as fmt_arity
-from treasure_map.lib.hunt.refs import base_evidence_ref
 from treasure_map.lib.pattern.classes import CMD, FMT_STRING
 from treasure_map.lib.query.nvram import _web_settable
 from treasure_map.lib.query.sink_impact import (
@@ -779,28 +778,6 @@ def get_sink_provenance(
         (evidence_ref,),
     ).fetchone()
     if row is None:
-        # A wrapper-recovered ref (…@cmd_via_wrapper) names the FORWARDING function, one hop before
-        # the real sink; the sink_arg record lives on the direct candidate's ref (…@cmd). When the
-        # queried wrapper ref holds nothing but that base ref does exist, say WHERE the provenance
-        # is instead of a bare "no such ref" — the miss is a wrong door, not an absent fact.
-        # ★ Mechanical suffix map + an existence check ONLY: nothing of the base ref's provenance is
-        # merged or carried over here, and a base ref that does not exist is never pointed at.
-        base_ref = base_evidence_ref(evidence_ref)
-        if (
-            base_ref is not None
-            and conn.execute(
-                "SELECT 1 FROM instance WHERE evidence_ref = ? LIMIT 1", (base_ref,)
-            ).fetchone()
-        ):
-            return {
-                "evidence_ref": evidence_ref,
-                "found": False,
-                "note": "queried_wrapper_ref",
-                "see_base_ref": base_ref,
-                "detail": (
-                    "provenance lives on the base ref; the wrapper hop carries no sink_arg record"
-                ),
-            }
         return {"evidence_ref": evidence_ref, "found": False, "note": "no_such_evidence_ref"}
     records = _sink_provenance_records(row[0])
     if not records:
