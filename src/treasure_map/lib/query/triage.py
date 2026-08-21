@@ -21,7 +21,7 @@ import json
 import logging
 import sqlite3
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -532,6 +532,47 @@ def _verdict_from_provenance(
 _DEF_USE_SINKS: frozenset[str] = CMD | FMT_STRING
 
 
+def _flow_is_via_wrapper(flow_evidence: str | None) -> bool:
+    """True when this candidate's sink sits one hop away, inside a thin forwarding wrapper.
+
+    Reads the single marker the evidence writer sets for that shape
+    (``flow_path.sink_via_wrapper``), never the evidence_ref's suffix. Anything absent or
+    unparseable is False, which is the conservative direction HERE: a False keeps an ordinary
+    copy/path candidate's empty provenance trusted instead of sweeping it in."""
+    if not flow_evidence:
+        return False
+    try:
+        data = json.loads(flow_evidence)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    flow_path = data.get("flow_path")
+    return isinstance(flow_path, dict) and flow_path.get("sink_via_wrapper") is True
+
+
+def _flow_wrapped_sink(flow_evidence: str | None) -> str | None:
+    """The real sink name behind a thin wrapper (``flow_path.wrapper.wrapped_sink``), or None when
+    the shape does not record one. None is NOT read as "not a command sink" — see
+    ``_wrapper_empty_evidence``, which keeps it a third, explicitly unknown class."""
+    if not flow_evidence:
+        return None
+    try:
+        data = json.loads(flow_evidence)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    flow_path = data.get("flow_path")
+    if not isinstance(flow_path, dict):
+        return None
+    wrapper = flow_path.get("wrapper")
+    if not isinstance(wrapper, dict):
+        return None
+    sink = wrapper.get("wrapped_sink")
+    return sink if isinstance(sink, str) and sink else None
+
+
 def _anchor_missed(flow_evidence: str | None, sink_anchor: str | None) -> bool:
     """True ONLY when the def-use provenance SHOULD carry the anchored sink but does NOT.
 
@@ -571,8 +612,21 @@ def _anchor_missed(flow_evidence: str | None, sink_anchor: str | None) -> bool:
     if sink_anchor not in _DEF_USE_SINKS:  # (a) defensive
         return False
     records = _sink_provenance_records(flow_evidence)
-    if not records:  # (b) load-bearing
-        return False
+    if not records:  # (b) load-bearing — SPLIT by whether the sink was forwarded through a wrapper
+        # A via_wrapper candidate's sink lives in a DIFFERENT function at a DIFFERENT address, so
+        # its own empty provenance means the forwarded value was never traced. Reading it constant
+        # rests on never having seen the sink at all — and for a COMMAND wrapper the mis-reading is
+        # concrete, not theoretical: the shape is `system(vsnprintf(buf, fmt, varargs))`, tmap's
+        # const marker looks at the caller's fmt TEMPLATE (constant, as a template should be) and
+        # concludes "constant command", while the injection surface is the VARARG spliced into it,
+        # which nothing here examined. So the const reading is withdrawn.
+        #
+        # A copy/path candidate's empty provenance is the ORDINARY no-def-use state and stays
+        # trusted: def-use only ever covers command/format sinks, so "no record" says nothing about
+        # them, and treating it as an escape is what widens the set ~90-fold. The two cases are
+        # cleanly separable — on a real atlas every empty-provenance wrapper candidate carries the
+        # sink_via_wrapper marker and no non-wrapper one does, so this split misfires on neither.
+        return _flow_is_via_wrapper(flow_evidence)
     return not any(r.get("sink") == sink_anchor for r in records)  # (c) load-bearing
 
 
@@ -922,14 +976,15 @@ def _sanitizer_records(flow_evidence: str | None) -> list[dict[str, Any]]:
 # ── the seven map layers: each an honest three-state Dimension, never a verdict ──
 
 
-def _dim_controllability(
+def _controllability_reading(
     conn: sqlite3.Connection,
     *,
     flow_evidence: str | None,
     sink_anchor: str | None,
     source_kind: str,
     blocking_mechanism: str | None,
-    wrapper_names: frozenset[str] = frozenset(),
+    wrapper_names: frozenset[str],
+    via_wrapper_empty: bool,
 ) -> Dimension:
     """Attacker byte-freedom over the sink argument, from the SINGLE verdict: controllable / free /
     constrained / constant / unknown. A ``controllable`` reading carries a certainty in ``state``:
@@ -952,13 +1007,19 @@ def _dim_controllability(
          reading falls through to the fallback. That is the demotion iron law's completeness half,
          and it is now code rather than a claim in this docstring — a sink hidden behind a thin
          wrapper leaves the caller's records describing OTHER sinks, and both exits would otherwise
-         read "constant" off evidence that never saw the sink being judged.
+         read "constant" off evidence that never saw the sink being judged. That gate now also
+         covers the case where the wrapper candidate's provenance is EMPTY rather than merely
+         about other sinks — empty is the state the forwarded sink actually produces, so treating
+         it as "nothing escaped" was reading a constant off never having looked.
       4. free (likely) — FALLBACK to the text-level source_kind=free_string, carried at state=likely
          (OPTIMISTIC, never proven — no positive evidence backs it, only the absence of a narrowing
          signal). This is the ONLY path that keeps a provenance-SHALLOW legit argv-free candidate (a
          nanddump/mtdinfo printf whose only signal is source_kind) as 'free' instead of collapsing
          it to unknown — do NOT drop it, but do NOT dress the optimism as a proof.
-      5. constrained  — a charset-safe / numeric-shape source.
+      5. constrained  — a charset-safe / numeric-shape source. Held to the SAME completeness rule
+         as step 3 via ``via_wrapper_empty``: both markers describe the value handed to a wrapper's
+         FIRST argument, which for the `system(vsnprintf(buf, fmt, ...))` shape is the format
+         template rather than the vararg the danger rides on.
       6. unknown      — nothing established; a ? never sinks.
     (An 'external -> free' step for a provenance external marker is reserved for a future phase; the
     extractor emits no such marker today, so argv-free rides step 4.) The provenance verdict is
@@ -1046,7 +1107,15 @@ def _dim_controllability(
             "are not subtracted, so a value washed by inet_ntop / a whitelist / a fixed-width "
             "parse may still read as free; this is an unproven read, confirm byte-freedom by hand",
         )
-    if source_kind == "charset_safe":
+    # The two proven:constrained exits are held to the SAME completeness rule as the constant ones
+    # when the sink was forwarded and never traced. Both are computed from the value this function
+    # hands to the wrapper — its FIRST argument — which for the `system(vsnprintf(buf, fmt, ...))`
+    # shape is the format template, not the vararg the danger rides on. A charset-safe template
+    # says nothing about what got spliced into it, so asserting `proven` off it repeats the exact
+    # mis-attribution the constant gate above exists to stop. Structural, not observed: this fires
+    # on 0 candidates in the atlas measured, and is written anyway so a future one cannot slip a
+    # `proven` back in through the side door.
+    if not via_wrapper_empty and source_kind == "charset_safe":
         return Dimension(
             "controllability",
             "proven",
@@ -1054,7 +1123,7 @@ def _dim_controllability(
             "source_kind=charset_safe",
             "sink argument built inline by a charset-safe converter (MAC / IP / base64 shape)",
         )
-    if blocking_mechanism in CONSTRAINED_MARKERS:
+    if not via_wrapper_empty and blocking_mechanism in CONSTRAINED_MARKERS:
         return Dimension(
             "controllability",
             "proven",
@@ -1070,6 +1139,100 @@ def _dim_controllability(
         "controllable direction not established — NOT proven safe, NOT proven controllable; a ? "
         "never sinks",
     )
+
+
+# The drill-down text a suppressed wrapper candidate carries. Two variants, split on the ONE
+# distinction that changes what a reviewer should do first: is the real sink a COMMAND sink?
+_WRAPPER_EMPTY_CMD_DETAIL = (
+    "forwarded through a thin wrapper to a COMMAND sink (system/popen/exec*) and never traced. The "
+    "const marker reads the fmt TEMPLATE handed to the wrapper; where the wrapper splices varargs "
+    "into that template, the injectable value is the VARARG, which nothing examined. Trace the "
+    "vararg source — a command sink is where this matters most."
+)
+_WRAPPER_EMPTY_NONCMD_DETAIL = (
+    "forwarded through a thin wrapper to a format/log sink and never traced. The fmt is a constant "
+    "at the large majority of sampled sites, so most of these are benign, but the vararg was never "
+    "verified — reading them const was unproven rather than wrong. Chase after the command ones."
+)
+_WRAPPER_EMPTY_UNKNOWN_DETAIL = (
+    "forwarded through a thin wrapper and never traced, and the wrapper's real sink was not "
+    "recorded either — so whether it reaches a command sink is UNKNOWN, not 'no'. Grouped with "
+    "the command ones for that reason: a missing sink name must not read as a harmless one."
+)
+
+
+def _wrapper_empty_evidence(flow_evidence: str | None) -> dict[str, Any]:
+    """The drill-down row for a candidate whose const reading was withdrawn because its sink was
+    forwarded into a wrapper and never traced.
+
+    EVIDENCE ONLY — it never changes state/value/note. Its job is to let a consumer separate the
+    handful reaching a COMMAND sink (~5% of them, where a mis-read constant matters most) from the
+    long tail of format/log wrappers whose format string is almost always a literal.
+
+    Three classes, not two: an unrecorded wrapped_sink is its own
+    ``unknown`` rather than being folded into ``non_cmd``, because folding it there would assert
+    "not a command sink" from a fact nobody checked."""
+    wrapped = _flow_wrapped_sink(flow_evidence)
+    if wrapped is None:
+        sink_class, detail = "unknown", _WRAPPER_EMPTY_UNKNOWN_DETAIL
+    elif wrapped in CMD:
+        sink_class, detail = "cmd", _WRAPPER_EMPTY_CMD_DETAIL
+    else:
+        sink_class, detail = "non_cmd", _WRAPPER_EMPTY_NONCMD_DETAIL
+    return {
+        "via": "wrapper_empty_provenance",
+        "wrapped_sink": wrapped,
+        "wrapped_sink_class": sink_class,
+        # A FACT, not an ordering: True only when the wrapper's real sink was recorded AND is not a
+        # command sink. False covers both "it IS a command sink" and "nobody recorded which sink it
+        # is" — so selecting False is the one filter that cannot miss a command sink. (A rank/
+        # urgency field is deliberately absent: this layer states what is known, the lens orders.)
+        "command_sink_ruled_out": sink_class == "non_cmd",
+        "detail": detail,
+    }
+
+
+def _dim_controllability(
+    conn: sqlite3.Connection,
+    *,
+    flow_evidence: str | None,
+    sink_anchor: str | None,
+    source_kind: str,
+    blocking_mechanism: str | None,
+    wrapper_names: frozenset[str] = frozenset(),
+) -> Dimension:
+    """The controllability reading, plus the drill-down row a never-traced wrapper sink earns.
+
+    Two steps kept apart on purpose. ``_controllability_reading`` decides state/value/source/note
+    exactly as before. Then, and ONLY for a candidate whose sink was forwarded into a thin wrapper
+    while its own provenance stayed empty, this attaches one ``evidence`` row naming the wrapper's
+    real sink and how urgent it is.
+
+    ★ Why the attachment lives HERE and not inside the reading: a suppressed wrapper candidate
+    lands on the SAME shared fallback branches every ordinary free/unknown candidate lands on
+    (source_kind=free_string -> likely:free, else unknown). Writing the evidence into those
+    branches would stamp the wrapper marker onto every free and unknown candidate in the atlas —
+    thousands of them, none forwarded through anything. One tail, gated on the wrapper condition,
+    reaches both landing spots and nothing else.
+
+    ★ ``replace`` touches ``evidence`` and nothing else: the fallback's own note (the "OPTIMISTIC,
+    confirm byte-freedom by hand" honesty) stays verbatim. Two independent honest signals, two
+    slots — neither overwrites the other."""
+    via_wrapper_empty = not _sink_provenance_records(flow_evidence) and _flow_is_via_wrapper(
+        flow_evidence
+    )
+    dim = _controllability_reading(
+        conn,
+        flow_evidence=flow_evidence,
+        sink_anchor=sink_anchor,
+        source_kind=source_kind,
+        blocking_mechanism=blocking_mechanism,
+        wrapper_names=wrapper_names,
+        via_wrapper_empty=via_wrapper_empty,
+    )
+    if not via_wrapper_empty:
+        return dim
+    return replace(dim, evidence=(_wrapper_empty_evidence(flow_evidence),))
 
 
 def _dim_source_writability(

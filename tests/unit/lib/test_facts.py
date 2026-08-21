@@ -306,14 +306,48 @@ def test_migration_adds_columns_to_legacy_atlas(tmp_path: Path) -> None:
 
 
 def test_no_recall_or_score_path_reads_the_fact() -> None:
-    # ★ This round records the fact but consumes it NOWHERE. Guard against an accidental early
-    # consumer: the recall (analyzer2), downweight, and read-side score modules must not
-    # reference the fact field by name. (analyzer2 WRITES it; it must not branch on it.)
+    # ★ The fact must never drive recall or a reading. The blanket ban stands for the recall and
+    # downweight paths, and for the wrapper PREDICATE everywhere.
     for rel in ("lib/hunt/downweight.py", "lib/query/triage.py", "lib/query/views.py"):
         text = (_SRC / rel).read_text()
         assert "is_thin_cmd_wrapper" not in text, f"{rel} unexpectedly references the fact"
+    for rel in ("lib/hunt/downweight.py", "lib/query/views.py"):
+        text = (_SRC / rel).read_text()
         assert "wrapped_sink" not in text, f"{rel} unexpectedly references the fact"
     # analyzer2 writes the fact but must not READ it back to alter recall/score: the only
     # occurrences are the import, the call, and the two InstanceRow kwargs — never a comparison.
     a2 = (_SRC / "lib/hunt/analyzer2.py").read_text()
     assert "if thin_wrapper" not in a2 and "if is_thin_cmd_wrapper" not in a2
+
+
+def test_triage_reads_the_wrapped_sink_name_only_for_drill_down() -> None:
+    """triage.py is now ALLOWED to read ``wrapped_sink`` — and only to label a drill-down row.
+
+    The blanket "nobody may name this field" ban above was the right guard while nothing consumed
+    the fact. It stopped being expressible that way once a candidate whose sink was forwarded into
+    a wrapper had to stop being asserted constant: the suppression itself keys on the SHAPE
+    (``flow_path.sink_via_wrapper``), but naming the wrapper's real sink is what lets a consumer
+    tell the ~5% forwarded into a COMMAND sink from the long format/log tail.
+
+    So the ban narrows to what it was really protecting: the sink NAME must not reach a
+    state/value decision. Enforced mechanically rather than by comment — ``_flow_wrapped_sink`` is
+    callable from exactly one function, the evidence-row builder, which by the Dimension contract
+    never changes state or value. Any new caller fails here and has to justify itself.
+
+    MUTATION (must go RED): call ``_flow_wrapped_sink`` from ``_controllability_reading`` (e.g.
+    branch the reading on whether the wrapped sink is a command sink) -> a second caller appears."""
+    import ast
+
+    tree = ast.parse((_SRC / "lib/query/triage.py").read_text())
+    callers = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        for inner in ast.walk(node):
+            if (
+                isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Name)
+                and inner.func.id == "_flow_wrapped_sink"
+            ):
+                callers.add(node.name)
+    assert callers == {"_wrapper_empty_evidence"}, callers

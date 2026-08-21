@@ -1284,10 +1284,264 @@ def test_absent_provenance_is_not_read_as_an_escape() -> None:
     # would widen the gate by roughly two orders of magnitude and start demoting candidates whose
     # constant reading is perfectly sound.
     #
-    # MUTATION (verified RED, 1 failed): in triage._anchor_missed delete
-    # `if not records: return False` -> these candidates are read as escapes.
+    # ★ This guard is now SPLIT by wrapper shape (see the via_wrapper block at the end of this
+    # file): empty provenance stays trusted only when the sink was NOT forwarded into a thin
+    # wrapper. Every fixture below is non-wrapper, which is exactly the half this test pins.
+    #
+    # MUTATION (verified RED, 1 failed): in triage._anchor_missed replace the wrapper split with
+    # `if not records: return True` -> these candidates are read as escapes.
     from treasure_map.lib.query.triage import _anchor_missed
 
     assert _anchor_missed(json.dumps({"sink_arg_provenance": []}), "vfprintf") is False
     assert _anchor_missed(json.dumps({"source_kind": "unknown"}), "system") is False
     assert _anchor_missed(None, "system") is False
+    # a malformed / marker-less flow is conservative: not read as a wrapper, so not read as escaped
+    assert _anchor_missed("not json at all", "system") is False
+    assert _anchor_missed(json.dumps({"flow_path": {}}), "system") is False
+    # ★ the load-bearing negative: a REAL non-wrapper candidate's flow_path is fully POPULATED
+    # (sink_arg + one_hop, what evidence._flow_path always emits) and simply lacks the wrapper
+    # marker. Testing only empty/absent flow_paths would let "any flow_path at all" pass for a
+    # wrapper test and sweep the whole non-wrapper population in.
+    populated = {"flow_path": {"sink_arg": "acStack_80", "one_hop": ["uVar1", "pcVar2"]}}
+    assert _anchor_missed(json.dumps(populated), "system") is False
+    # and the marker itself must be the True BOOLEAN, not merely present/truthy-ish
+    for marker in (False, None, 0, "yes"):
+        flow = {"flow_path": {"sink_arg": "a", "one_hop": [], "sink_via_wrapper": marker}}
+        assert _anchor_missed(json.dumps(flow), "system") is False, marker
+
+
+# ── via_wrapper + EMPTY provenance: the const reading is withdrawn (guard (b) split) ──
+#
+# Shape: the candidate's real sink lives one hop away, inside a thin wrapper at a DIFFERENT
+# address, and this function's own provenance is empty — the forwarded value was never traced. The
+# const marker that used to carry these reads the CALLER's first argument, which for the
+# `system(vsnprintf(buf, fmt, varargs))` wrapper shape is the format TEMPLATE (constant, as a
+# template should be) while the injection surface is the VARARG spliced into it. Calling that
+# "constant" is a reading built on never having seen the sink.
+#
+# Measured on a real atlas: every empty-provenance wrapper candidate carries the sink_via_wrapper
+# marker and no non-wrapper one does, so the split below separates them with no misfire either way.
+
+
+def _wrapper_flow(wrapped_sink: str | None, **extra: object) -> dict[str, object]:
+    """A via_wrapper candidate's flow_evidence with NO sink_arg_provenance — the exact shape the
+    evidence writer produces when the sink is forwarded one hop."""
+    wrapper: dict[str, object] = {"name": "thin_fwd"}
+    if wrapped_sink is not None:
+        wrapper["wrapped_sink"] = wrapped_sink
+    return {
+        "source_kind": "unknown",
+        "flow_path": {"sink_via_wrapper": True, "wrapper": wrapper},
+        **extra,
+    }
+
+
+def _controllability_dim(conn: sqlite3.Connection, ref: str):  # type: ignore[no-untyped-def]
+    (cand,) = [c for c in triage(conn) if c.evidence_ref == ref]
+    return cand.dim("controllability")
+
+
+def test_wrapper_empty_cmd_suppressed(tmp_path: Path) -> None:
+    """A command-sink wrapper with empty provenance must stop reading proven:constant, and must
+    say so in a drill-down row that does not rule out a command sink.
+
+    Asserts state != 'proven' rather than a specific landing spot: where it falls depends on the
+    candidate's own source_kind (free_string -> likely:free, otherwise unknown), and pinning one
+    would be brittle for no gain.
+
+    MUTATION (must go RED): in triage._anchor_missed restore the unconditional
+    `if not records: return False` in place of the wrapper split -> the const marker carries this
+    candidate back to ('proven', 'constant')."""
+    conn = open_atlas(tmp_path / "atlas.db")
+    try:
+        pid = _pattern(conn, "fp_wrap_cmd")
+        ref = _inst(
+            conn,
+            pid,
+            sink_anchor="system",
+            flow_evidence=_wrapper_flow("system"),
+            blocking="const_sink_arg",  # the marker that used to force proven:constant
+        )
+        dim = _controllability_dim(conn, ref)
+    finally:
+        conn.close()
+    assert (dim.state, dim.value) != ("proven", "constant")
+    assert dim.state != "proven"
+    (ev,) = dim.evidence
+    assert ev["via"] == "wrapper_empty_provenance"
+    assert ev["wrapped_sink"] == "system"
+    assert ev["wrapped_sink_class"] == "cmd"
+    assert ev["command_sink_ruled_out"] is False
+
+
+def test_wrapper_empty_noncmd_suppressed_low(tmp_path: Path) -> None:
+    # A format/log wrapper is suppressed by the same rule, but its command sink IS ruled out: the
+    # format string is a literal at the overwhelming majority of sampled sites, so these are mostly
+    # benign — they were
+    # simply never verified, which is a different statement from "they are unsafe".
+    conn = open_atlas(tmp_path / "atlas.db")
+    try:
+        pid = _pattern(conn, "fp_wrap_fmt")
+        ref = _inst(
+            conn,
+            pid,
+            sink_anchor="vfprintf",
+            flow_evidence=_wrapper_flow("vfprintf"),
+            blocking="const_sink_arg",
+        )
+        dim = _controllability_dim(conn, ref)
+    finally:
+        conn.close()
+    assert dim.state != "proven"
+    (ev,) = dim.evidence
+    assert ev["wrapped_sink_class"] == "non_cmd"
+    assert ev["command_sink_ruled_out"] is True
+
+
+def test_wrapper_empty_exec_family_suppressed(tmp_path: Path) -> None:
+    # The command class is the pattern-layer CMD set, so the exec family counts as a command sink
+    # exactly like system/popen. Reading it off a hand-written shell-only list would silently drop
+    # every exec* wrapper into the ruled-out set.
+    conn = open_atlas(tmp_path / "atlas.db")
+    try:
+        pid = _pattern(conn, "fp_wrap_exec")
+        ref = _inst(
+            conn,
+            pid,
+            sink_anchor="execve",
+            flow_evidence=_wrapper_flow("execve"),
+            blocking="const_sink_arg",
+        )
+        dim = _controllability_dim(conn, ref)
+    finally:
+        conn.close()
+    assert dim.state != "proven"
+    assert dim.evidence[0]["wrapped_sink_class"] == "cmd"
+    assert dim.evidence[0]["command_sink_ruled_out"] is False
+
+
+def test_wrapper_empty_unrecorded_sink_is_not_called_non_cmd(tmp_path: Path) -> None:
+    # A wrapper whose real sink was never recorded is its own UNKNOWN class, not folded into
+    # non_cmd: folding it there would assert "not a command sink" from a fact nobody checked, and
+    # rule it out along with them. 0 instances in the atlas measured; written because the
+    # structural possibility, not its current population, is what the rule is for.
+    conn = open_atlas(tmp_path / "atlas.db")
+    try:
+        pid = _pattern(conn, "fp_wrap_unk")
+        ref = _inst(
+            conn,
+            pid,
+            sink_anchor="system",
+            flow_evidence=_wrapper_flow(None),
+            blocking="const_sink_arg",
+        )
+        dim = _controllability_dim(conn, ref)
+    finally:
+        conn.close()
+    assert dim.state != "proven"
+    assert dim.evidence[0]["wrapped_sink_class"] == "unknown"
+    # ★ "not ruled out" — selecting False is the filter that cannot miss a command sink
+    assert dim.evidence[0]["command_sink_ruled_out"] is False
+
+
+def test_non_wrapper_empty_still_const(tmp_path: Path) -> None:
+    """The split must not touch a copy/path candidate's empty provenance — that is the ORDINARY
+    no-def-use state (def-use covers command/format sinks only), and reading it as an escape widens
+    the gate by roughly two orders of magnitude.
+
+    MUTATION (must go RED): make the guard unconditional the other way —
+    `if not records: return True` in triage._anchor_missed -> this candidate stops reading
+    ('proven', 'constant') and thousands of sound constants come back with it."""
+    conn = open_atlas(tmp_path / "atlas.db")
+    try:
+        pid = _pattern(conn, "fp_nonwrap_empty")
+        ref = _inst(
+            conn,
+            pid,
+            sink_anchor="strcpy",
+            flow_evidence={"source_kind": "unknown"},  # no provenance, no wrapper marker
+            blocking="const_sink_arg",
+        )
+        dim = _controllability_dim(conn, ref)
+    finally:
+        conn.close()
+    assert (dim.state, dim.value) == ("proven", "constant")
+    assert dim.evidence == ()  # and it earns no wrapper drill-down row
+
+
+def test_non_wrapper_free_has_no_wrapper_evidence(tmp_path: Path) -> None:
+    """An ordinary free candidate lands on the SAME shared fallback branch a suppressed wrapper
+    candidate lands on, and must NOT pick up the wrapper marker on the way.
+
+    MUTATION (must go RED): attach the evidence inside the shared fallback branches instead of at
+    the gated tail (drop the `if not via_wrapper_empty: return dim` guard in
+    triage._dim_controllability) -> every free and unknown candidate in the atlas, thousands of
+    them, gets stamped as a never-traced wrapper."""
+    conn = open_atlas(tmp_path / "atlas.db")
+    try:
+        pid = _pattern(conn, "fp_plain_free")
+        ref = _inst(conn, pid, sink_anchor="system", source_kind="free_string")
+        dim = _controllability_dim(conn, ref)
+    finally:
+        conn.close()
+    assert (dim.state, dim.value) == ("likely", "free")
+    assert dim.evidence == ()
+
+
+def test_both_const_exits_gated(tmp_path: Path) -> None:
+    """state != 'proven', not merely != 'proven:constant'.
+
+    const_trustworthy gates the two CONSTANT exits only. Downstream sit two proven:CONSTRAINED
+    exits (source_kind=charset_safe / a CONSTRAINED_MARKER blocking_mechanism) computed from the
+    same caller-side value — the wrapper's first argument, i.e. the format template, not the vararg
+    the danger rides on. Without gating them too, a suppressed wrapper candidate carrying such a
+    marker walks back out through the side door as 'proven'. 0 such instances in the atlas measured;
+    the exit is closed anyway.
+
+    MUTATION (must go RED): drop `not via_wrapper_empty and` from the two constrained exits in
+    triage._controllability_reading -> this candidate reads ('proven', 'constrained')."""
+    conn = open_atlas(tmp_path / "atlas.db")
+    try:
+        pid = _pattern(conn, "fp_wrap_constrained")
+        ref = _inst(
+            conn,
+            pid,
+            sink_anchor="system",
+            flow_evidence=_wrapper_flow("system", source_kind="charset_safe"),
+        )
+        dim = _controllability_dim(conn, ref)
+    finally:
+        conn.close()
+    assert dim.state != "proven"
+
+
+def test_cmd_evidence_names_vararg_surface(tmp_path: Path) -> None:
+    """The mis-attribution correction has to reach a consumer, and it must not evict the note that
+    was already there. The vararg explanation rides in evidence[0]['detail']; Dimension.note keeps
+    the fallback's own "OPTIMISTIC, confirm byte-freedom by hand" text verbatim. Two independent
+    honest signals, two slots — neither overwrites the other.
+
+    MUTATION (must go RED): write the detail into Dimension.note instead of the evidence row (a
+    `replace(dim, note=...)`) -> the fallback's optimism warning is silently overwritten."""
+    conn = open_atlas(tmp_path / "atlas.db")
+    try:
+        pid = _pattern(conn, "fp_wrap_detail")
+        ref = _inst(
+            conn,
+            pid,
+            sink_anchor="system",
+            flow_evidence=_wrapper_flow("system", source_kind="free_string"),
+            blocking="const_sink_arg",
+        )
+        dim = _controllability_dim(conn, ref)
+        plain = _controllability_dim(
+            conn, _inst(conn, pid, sink_anchor="system", source_kind="free_string")
+        )
+    finally:
+        conn.close()
+    assert "VARARG" in dim.evidence[0]["detail"]
+    assert "COMMAND sink" in dim.evidence[0]["detail"]
+    # the fallback note is untouched: byte-identical to the one a plain free candidate gets
+    assert (dim.state, dim.value) == ("likely", "free")
+    assert dim.note == plain.note
+    assert "OPTIMISTIC" in dim.note

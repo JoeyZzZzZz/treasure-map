@@ -2322,6 +2322,23 @@ def test_json_free_string_via_wrapper_floats_high(tmp_path: Path) -> None:
 def test_safe_fanout_to_wrapper_is_suppressed_below_real_concat(tmp_path: Path) -> None:
     # ★ the real free-string-via-wrapper outranks the safe fanout (constant / charset
     # argument forwarded to the wrapper), which the existing FP-suppression downweights.
+    #
+    # ★ The RANK order is what this test is for, and it is unchanged. What changed is the two safe
+    # fanouts' controllability VALUE: a candidate whose sink was forwarded into a wrapper while its
+    # own provenance stayed empty no longer reads proven:constant / proven:constrained, because
+    # neither marker examined the value the wrapper actually ran. See the via_wrapper block in
+    # test_triage_controllability.
+    #
+    # ★ ACCEPTED COST, recorded rather than glossed: for THESE two fixtures the old reading was
+    # sound. `reboot_now` forwards a single constant argument to `do_cmd(p){system(p);}`, so the
+    # constant really was the whole command; `arp_set` forwards a charset-constrained buffer. The
+    # mis-attribution the suppression exists for needs a forwarding call that passes MORE than the
+    # one argument the marker looked at — the vararg case. Measured on a real atlas, of the 170
+    # candidates that stopped being asserted safe, 117 (69%) are multi-argument forwards where the
+    # vararg was genuinely never examined and 53 (31%) are single-argument forwards like these two,
+    # lifted as collateral. Narrowing the rule by argument count is the follow-up that would recover
+    # them; until something actually traces into the wrapper, the map says "not verified" rather
+    # than "safe".
     db = _make_db(
         tmp_path,
         [
@@ -2343,13 +2360,20 @@ def test_safe_fanout_to_wrapper_is_suppressed_below_real_concat(tmp_path: Path) 
     rows = _by_anchor(atlas)
     assert rows["reboot_now"]["blocking_mechanism"] == "const_sink_arg"
     assert rows["arp_set"]["blocking_mechanism"] == "charset_constrained"
-    # the real free concat (controllability=free) outranks both safe fanouts: const_sink_arg is
-    # provably-constant -> sunk; arp_set's charset_safe source -> constrained (below free).
+    # the real free concat still outranks both safe fanouts — the ordering this test pins.
     assert _ctrl_of(atlas, "set_route") == "free"
-    assert _ctrl_of(atlas, "reboot_now") == "constant" and _is_safe(atlas, "reboot_now")
-    assert _ctrl_of(atlas, "arp_set") == "constrained"
     assert _rank_of(atlas, "set_route") < _rank_of(atlas, "reboot_now")
     assert _rank_of(atlas, "set_route") < _rank_of(atlas, "arp_set")
+    # neither fanout is asserted SAFE any more: the markers were read off the forwarded argument,
+    # not off what the wrapper ran, so the map declines to sink them out of the first screen.
+    assert not _is_safe(atlas, "reboot_now")
+    assert not _is_safe(atlas, "arp_set")
+    for fn in ("reboot_now", "arp_set"):
+        dim = _cand_of(atlas, fn).dim("controllability")
+        assert dim.state != "proven", (fn, dim.state, dim.value)
+        # and each says WHY it was lifted, naming the wrapper's real sink
+        assert dim.evidence[0]["via"] == "wrapper_empty_provenance"
+        assert dim.evidence[0]["wrapped_sink"] == "system"
 
 
 def test_wrapper_itself_kept_as_distinct_bare_sink_candidate(tmp_path: Path) -> None:
