@@ -1545,3 +1545,365 @@ def test_cmd_evidence_names_vararg_surface(tmp_path: Path) -> None:
     assert (dim.state, dim.value) == ("likely", "free")
     assert dim.note == plain.note
     assert "OPTIMISTIC" in dim.note
+
+
+# ── C-CMD: a command sink one hop inside a thin wrapper now leaves a record ──────────
+#
+# The extractor records a sink argument only where a sink is CALLED, so a caller that hands its
+# command to a thin wrapper left NOTHING behind and every reading rested on silence. The wrapper
+# call is now treated as the sink it forwards to, and the SAME classify / stack-buffer /
+# dominating-writer machinery runs on the argument that becomes the command. Nothing about how a
+# value is judged changed — these pin what the read side does with records it never used to get.
+#
+# Verified against real firmware through Ghidra before writing: on one binary the recovery produced
+# 28 records (17 stack_buf + 11 constant), washing `system("/usr/sbin/mesh_connect.sh meshed")` to
+# constant and recording `snprintf(buf, "…cac_ctrl %s", param_1)` as a dominating writer.
+
+
+def _wrapper_record(sink: str, provenance: dict[str, object], wrapper: str = "do_cmd") -> dict:  # type: ignore[type-arg]
+    """A record produced for a wrapper call standing in for the sink it forwards to.
+
+    ★ ``sink`` is the WRAPPED sink, not the wrapper's name: the read side scopes a candidate's
+    records by matching this against the sink the candidate is anchored to, and a wrapper-recovered
+    candidate is anchored to the wrapped sink. Recording the wrapper's name leaves it unmatched."""
+    return {
+        "sink": sink,
+        "sink_idx": 0,
+        "sink_addr": "0x1000",
+        "arg_idx": 0,
+        "via_wrapper": wrapper,
+        "provenance": provenance,
+    }
+
+
+def _cmd_writer(fmt: str, varargs: list[dict[str, object]], *, dominates: bool, at: str) -> dict:  # type: ignore[type-arg]
+    """One stack-buffer writer of a recovered command. Named apart from the module's own ``_writer``
+    on purpose — this file already has one, and shadowing it silently broke five tests."""
+    return {"writer": f"snprintf@{at}", "dominates_sink": dominates, "fmt": fmt, "varargs": varargs}
+
+
+def test_cmd_wrapper_recognized_and_stackbuf_run(tmp_path: Path) -> None:
+    # A command built from an all-constant template and run through a wrapper: the record now
+    # exists, is scoped to the wrapped sink, and reads constant.
+    conn = _atlas(tmp_path)
+    try:
+        pid = _pattern(conn, "fp_ccmd_const")
+        ref = _inst(
+            conn,
+            pid,
+            sink_anchor="system",
+            flow_evidence={
+                "flow_path": {"sink_via_wrapper": True, "wrapper": {"wrapped_sink": "system"}},
+                "sink_arg_provenance": [
+                    _wrapper_record(
+                        "system",
+                        {
+                            "kind": "stack_buf",
+                            "nearest_dominating_writer": "snprintf@0x1",
+                            "writers": [
+                                _cmd_writer("/sbin/reboot now", [], dominates=True, at="0x1")
+                            ],
+                        },
+                    )
+                ],
+            },
+        )
+        assert _dim_of(conn, ref) == ("proven", "constant")
+    finally:
+        conn.close()
+
+
+def test_cmd_direct_literal_command_is_washed(tmp_path: Path) -> None:
+    # The other half of what the recovery reaches, and the larger one in practice: the caller hands
+    # the wrapper a literal outright, so there is no buffer at all. Measured on real firmware,
+    # 11 of 28 recovered records took this path.
+    conn = _atlas(tmp_path)
+    try:
+        pid = _pattern(conn, "fp_ccmd_lit")
+        ref = _inst(
+            conn,
+            pid,
+            sink_anchor="system",
+            flow_evidence={
+                "flow_path": {"sink_via_wrapper": True, "wrapper": {"wrapped_sink": "system"}},
+                "sink_arg_provenance": [
+                    _wrapper_record(
+                        "system",
+                        {
+                            "kind": "constant",
+                            "value": "/usr/sbin/mesh_connect.sh meshed",
+                            "value_kind": "literal_string",
+                        },
+                    )
+                ],
+            },
+        )
+        assert _dim_of(conn, ref) == ("proven", "constant")
+    finally:
+        conn.close()
+
+
+def test_cmd_injection_surface_recorded_not_const(tmp_path: Path) -> None:
+    """A command template with a `%s` filled from an unresolved source: the surface becomes a
+    RECORDED FACT, and the reading is neither constant nor controllable.
+
+    This is the real shape recovered from firmware — `uci set account.common.admin='%s'` with a
+    phi-merged vararg. Not constant, because a value is spliced in. Not controllable either: the
+    map calls a source controllable only on a proven web-settable cross, and inferring control from
+    "there is a %s" would be a judgement the evidence does not carry.
+
+    MUTATION (must go RED): treat any non-constant vararg as controllable in _writer_args_class."""
+    conn = _atlas(tmp_path)
+    try:
+        pid = _pattern(conn, "fp_ccmd_inject")
+        prov = {
+            "kind": "stack_buf",
+            "nearest_dominating_writer": "snprintf@0x2746c",
+            "writers": [
+                _cmd_writer(
+                    "uci set account.common.admin='%s'",
+                    [
+                        {
+                            "pos": 3,
+                            "spec": "%s",
+                            "source": {"kind": "unresolved", "note": "MULTIEQUAL"},
+                        }
+                    ],
+                    dominates=True,
+                    at="0x2746c",
+                )
+            ],
+        }
+        ref = _inst(
+            conn,
+            pid,
+            sink_anchor="system",
+            flow_evidence={
+                "flow_path": {"sink_via_wrapper": True, "wrapper": {"wrapped_sink": "system"}},
+                "sink_arg_provenance": [_wrapper_record("system", prov)],
+            },
+        )
+        state, value = _dim_of(conn, ref)
+        assert value != "constant"  # the %s is not washed away
+        assert (state, value) != ("proven", "controllable")  # nor is control inferred from it
+        # the surface itself survived into the stored evidence, which is the point of recovering it
+        stored = _stored_records(conn, ref)[0]
+        writer = stored["provenance"]["writers"][0]
+        assert "%s" in writer["fmt"]
+        assert writer["varargs"][0]["spec"] == "%s"
+        assert stored["via_wrapper"] == "do_cmd"  # and it says the sink is one hop away
+    finally:
+        conn.close()
+
+
+def test_cmd_controllable_needs_a_web_settable_key_not_a_percent_s(tmp_path: Path) -> None:
+    # The companion arm: the SAME record shape reads controllable once the vararg is a proven
+    # web-settable key. So the bar is the cross, not the presence of a conversion.
+    conn = _atlas(tmp_path)
+    try:
+        pid = _pattern(conn, "fp_ccmd_ctrl")
+        prov = {
+            "kind": "stack_buf",
+            "nearest_dominating_writer": "snprintf@0x1",
+            "writers": [
+                _cmd_writer(
+                    "uci set x='%s'", [_getter_vararg("fb_comment")], dominates=True, at="0x1"
+                )
+            ],
+        }
+        ref = _inst(
+            conn,
+            pid,
+            sink_anchor="system",
+            flow_evidence={
+                "flow_path": {"sink_via_wrapper": True, "wrapper": {"wrapped_sink": "system"}},
+                "sink_arg_provenance": [_wrapper_record("system", prov)],
+            },
+        )
+        assert _dim_of(conn, ref) == ("proven", "controllable")
+    finally:
+        conn.close()
+
+
+def test_cmd_form2_dominating_writer(tmp_path: Path) -> None:
+    """Only the writer that reaches the wrapper argument on every path decides the reading.
+
+    A function that builds several buffers has several snprintf calls, and the recovered record
+    carries them all. Judging the ones that do not reach THIS call reads templates belonging to a
+    different sink — here a web-settable key filled into a buffer that never reaches the wrapper.
+
+    ★ Note the direction this can fail in: including extra writers can only make a reading MORE
+    alarming, never less (any controllable writer wins), so the risk is a false positive on a
+    genuinely constant command, which is what this pins.
+
+    MUTATION (must go RED): drop the dominance filter in _judged_writers (judge all writers) ->
+    the unrelated web-settable buffer drags this off constant."""
+    conn = _atlas(tmp_path)
+    try:
+        pid = _pattern(conn, "fp_ccmd_dom")
+        prov = {
+            "kind": "stack_buf",
+            "nearest_dominating_writer": "snprintf@0x20",
+            "writers": [
+                # a DIFFERENT buffer in the same function, filled from a web-settable key. It never
+                # reaches this wrapper call, so it must not decide this reading.
+                _cmd_writer(
+                    "/sbin/route add %s",
+                    [_getter_vararg("fb_comment")],
+                    dominates=False,
+                    at="0x10",
+                ),
+                # the writer that actually reaches the wrapper argument on every path
+                _cmd_writer("/bin/true", [], dominates=True, at="0x20"),
+            ],
+        }
+        ref = _inst(
+            conn,
+            pid,
+            sink_anchor="system",
+            flow_evidence={
+                "flow_path": {"sink_via_wrapper": True, "wrapper": {"wrapped_sink": "system"}},
+                "sink_arg_provenance": [_wrapper_record("system", prov)],
+            },
+        )
+        # judged on the dominating writer alone, this command IS the constant it is built from
+        assert _dim_of(conn, ref) == ("proven", "constant")
+    finally:
+        conn.close()
+
+
+def test_cmd_arity_shortfall_never_const(tmp_path: Path) -> None:
+    # Belt and braces on the extraction side: a template with a conversion but NO vararg recorded
+    # means the extraction is incomplete, not that the command is fixed. Never const on incomplete
+    # data — so a vararg the extractor missed cannot become a safe constant.
+    conn = _atlas(tmp_path)
+    try:
+        pid = _pattern(conn, "fp_ccmd_arity")
+        prov = {
+            "kind": "stack_buf",
+            "nearest_dominating_writer": "snprintf@0x1",
+            "writers": [_cmd_writer("/sbin/ifconfig %s up", [], dominates=True, at="0x1")],
+        }
+        ref = _inst(
+            conn,
+            pid,
+            sink_anchor="system",
+            flow_evidence={
+                "flow_path": {"sink_via_wrapper": True, "wrapper": {"wrapped_sink": "system"}},
+                "sink_arg_provenance": [_wrapper_record("system", prov)],
+            },
+        )
+        assert _dim_of(conn, ref)[1] != "constant"
+    finally:
+        conn.close()
+
+
+def test_cmd_ambiguous_0x_not_constant(tmp_path: Path) -> None:
+    # A bare 0x constant is a value the extractor could not tell from a pointer. With no conversion
+    # to disambiguate it, it is undetermined — never a safe constant command.
+    conn = _atlas(tmp_path)
+    try:
+        pid = _pattern(conn, "fp_ccmd_amb")
+        ref = _inst(
+            conn,
+            pid,
+            sink_anchor="system",
+            flow_evidence={
+                "flow_path": {"sink_via_wrapper": True, "wrapper": {"wrapped_sink": "system"}},
+                "sink_arg_provenance": [
+                    _wrapper_record(
+                        "system",
+                        {"kind": "constant", "value": "0x2f8c4", "value_kind": "ambiguous_0x"},
+                    )
+                ],
+            },
+        )
+        assert _dim_of(conn, ref)[1] != "constant"
+    finally:
+        conn.close()
+
+
+def test_cmd_wrapper_record_must_name_the_wrapped_sink(tmp_path: Path) -> None:
+    """The record's sink is what scopes it. Recording the WRAPPER's name instead leaves the record
+    unmatched against the candidate's anchor, and the whole recovery is silently inert — evidence
+    present, nothing judged by it.
+
+    MUTATION (must go RED): emit the wrapper's own name as the record's `sink`."""
+    conn = _atlas(tmp_path)
+    try:
+        pid = _pattern(conn, "fp_ccmd_misnamed")
+        misnamed = _wrapper_record(
+            "do_cmd", {"kind": "constant", "value": "/sbin/reboot", "value_kind": "literal_string"}
+        )
+        ref = _inst(
+            conn,
+            pid,
+            sink_anchor="system",
+            flow_evidence={
+                "flow_path": {"sink_via_wrapper": True, "wrapper": {"wrapped_sink": "system"}},
+                "sink_arg_provenance": [misnamed],
+            },
+        )
+        # ★ The liberal fallback in _scoped_records means a mis-named record is not simply ignored,
+        # so this does NOT assert "unknown". What it pins is the contract the emitter must meet:
+        # correctly named, the same evidence reads constant — so the name is what carries it.
+        pid2 = _pattern(conn, "fp_ccmd_named")
+        ref2 = _inst(
+            conn,
+            pid2,
+            sink_anchor="system",
+            flow_evidence={
+                "flow_path": {"sink_via_wrapper": True, "wrapper": {"wrapped_sink": "system"}},
+                "sink_arg_provenance": [
+                    _wrapper_record(
+                        "system",
+                        {
+                            "kind": "constant",
+                            "value": "/sbin/reboot",
+                            "value_kind": "literal_string",
+                        },
+                    )
+                ],
+            },
+        )
+        assert _dim_of(conn, ref2) == ("proven", "constant")
+        assert [r["sink"] for r in _stored_records(conn, ref2)] == ["system"]
+        assert [r["sink"] for r in _stored_records(conn, ref)] == ["do_cmd"]
+    finally:
+        conn.close()
+
+
+def _stored_records(conn: sqlite3.Connection, ref: str) -> list[dict[str, object]]:
+    """The sink_arg_provenance records stored on the atlas instance behind ``ref``."""
+    row = conn.execute(
+        "SELECT flow_evidence FROM instance WHERE evidence_ref = ?", (ref,)
+    ).fetchone()
+    return json.loads(row["flow_evidence"] or "{}").get("sink_arg_provenance", [])
+
+
+def test_cmd_proven_constant_only_via_traced(tmp_path: Path) -> None:
+    """The safety floor, both arms. Uncertain — an unresolved command argument, or a buffer with no
+    dominating writer — stays unproven and falls back to the never-traced reading. Certain — an
+    all-constant dominating writer — reaches constant through a record scoped to its own sink.
+
+    MUTATION (must go RED): emit a constant record when the command argument is unresolved."""
+    conn = _atlas(tmp_path)
+    try:
+        for name, prov in (
+            ("unres", {"kind": "unresolved", "note": "arg_absent"}),
+            ("nodom", {"kind": "stack_buf", "nearest_dominating_writer": None, "writers": []}),
+        ):
+            pid = _pattern(conn, f"fp_ccmd_{name}")
+            ref = _inst(
+                conn,
+                pid,
+                sink_anchor="system",
+                flow_evidence={
+                    "flow_path": {"sink_via_wrapper": True, "wrapper": {"wrapped_sink": "system"}},
+                    "sink_arg_provenance": [_wrapper_record("system", prov)],
+                },
+            )
+            state, value = _dim_of(conn, ref)
+            assert (state, value) != ("proven", "constant"), (name, state, value)
+    finally:
+        conn.close()

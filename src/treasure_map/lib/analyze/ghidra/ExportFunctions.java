@@ -230,6 +230,230 @@ public class ExportFunctions extends GhidraScript {
 
     // Build the per-function sink_provenance JSON array (one record per command/format sink call,
     // ordered by call-site address = sink_idx).
+    // ============ thin COMMAND wrapper registry (C-CMD: the sink one hop away) ============
+    // A candidate whose command sink sits inside a thin forwarding wrapper leaves NOTHING behind in
+    // its own def-use pass: the pass records a sink argument only where a sink is CALLED, and here
+    // the caller calls the wrapper, not system/popen. So the value it actually runs was never
+    // examined, and every reading built on that silence is a reading of nothing.
+    //
+    // The fix is to treat the wrapper CALL as the sink it forwards to, and run the existing
+    // provenance machinery on the argument that becomes the command. Nothing about how a value is
+    // judged changes — the same classify / stack-buffer / dominating-writer analysis runs, on an
+    // argument it previously never saw.
+    //
+    // ★ BINARY-SCOPED, and that is load-bearing rather than incidental. The registry is a field of
+    // this script instance, and headless analysis runs one program per JVM, so it is rebuilt from
+    // scratch for every binary and can only ever hold wrappers whose BODY was read in THIS program.
+    // The same helper name genuinely carries different bodies in different binaries here — one
+    // `shell_cmd` running system(), another forking — so a name-keyed global (what TMAP_EXTRA_SINKS
+    // does, deliberately not reused) would judge one binary's caller against another's body.
+    private static final Set<String> FORWARD_CMD_SINKS =
+        new HashSet<>(Arrays.asList("system", "popen", "doSystem"));
+    private static final int WRAPPER_MAX_STATEMENTS = 20;   // mirrors lib/hunt/facts.py
+    // Caller-supplied placeholders the decompiler emits for a parameter it could not tie to the
+    // signature. Recognised as parameters (mirroring the Python side) but NOT indexable, so a
+    // wrapper whose command rides one of these is never registered — see the index rule below.
+    private static final Pattern CALLER_SUPPLIED_RE =
+        Pattern.compile("param_\\d+|in_stack_[0-9a-fx]+|unaff_\\w+"
+                      + "|in_(?:a[0-3]|v[01]|t\\d|s[0-8]|k[01]|at|gp|sp|fp|ra)");
+    // Builders whose FIRST argument is a destination being written — a value built here is not a
+    // verbatim forward of a parameter.
+    // Type / keyword words that are never a parameter NAME (mirrors taint._TYPE_WORDS), so a slot
+    // spelling only a type is recorded as unnamed rather than as a parameter called "char".
+    private static final Set<String> WRAPPER_TYPE_WORDS = new HashSet<>(Arrays.asList(
+        "bool", "break", "byte", "case", "char", "code", "const", "continue", "do", "double",
+        "dword", "else", "enum", "float", "for", "goto", "if", "int", "long", "qword", "return",
+        "short", "signed", "size_t", "sizeof", "ssize_t", "static", "struct", "switch", "uint",
+        "undefined", "union", "unsigned", "void", "while", "word"));
+    private static final Set<String> WRAPPER_BUILDERS = new HashSet<>(Arrays.asList(
+        "snprintf", "sprintf", "vsnprintf", "vsprintf", "strcpy", "strncpy", "strcat", "strncat",
+        "memcpy", "memmove", "stpcpy", "__sprintf_chk", "__snprintf_chk"));
+
+    // wrapper function name -> the sink it forwards to ("system" / "popen" / "doSystem")
+    private Map<String, String> cmdWrapperSink = new HashMap<>();
+    // wrapper function name -> WHICH of its parameters becomes the command (position in signature)
+    private Map<String, Integer> cmdWrapperKeyArg = new HashMap<>();
+
+    // Non-empty statement count, the same coarse body-size proxy the Python side uses.
+    private int statementCount(String pseudocode) {
+        int n = 0;
+        for (String s : pseudocode.split("[;\\n{}]")) {
+            if (s.trim().length() > 0) n++;
+        }
+        return n;
+    }
+
+    // The identifier feeding a call's FIRST argument, or null. Mirrors taint.locate_sink_arg.
+    private String firstArgIdent(String pseudocode, String calleeName) {
+        Matcher m = Pattern.compile("\\b" + Pattern.quote(calleeName) + "\\s*\\(\\s*([^,)]+)")
+                           .matcher(pseudocode);
+        if (!m.find()) return null;
+        Matcher id = Pattern.compile("[A-Za-z_][A-Za-z0-9_]*").matcher(m.group(1));
+        return id.find() ? id.group(0) : null;
+    }
+
+    // The signature's parameter SLOTS in declaration order; a slot with no name is kept as null.
+    //
+    // ★ Unnamed slots are KEPT rather than dropped, because position is the whole point: dropping
+    // one renumbers every parameter after it, so `f(int, char *cmd)` would report cmd at position 0
+    // and the caller's argument 0 would be read while argument 1 is what reaches the sink. A
+    // wrong-but-plausible position is worse than no position — it judges a real value that is
+    // simply the wrong one.
+    private List<String> signatureSlots(String pseudocode) {
+        List<String> slots = new ArrayList<>();
+        int brace = pseudocode.indexOf('{');
+        String head = (brace != -1) ? pseudocode.substring(0, brace) : pseudocode;
+        int lp = head.indexOf('(');
+        if (lp == -1) return slots;
+        int depth = 0, rp = -1;
+        for (int i = lp; i < head.length(); i++) {
+            char c = head.charAt(i);
+            if (c == '(') depth++;
+            else if (c == ')') { depth--; if (depth == 0) { rp = i; break; } }
+        }
+        if (rp == -1) return slots;
+        String inner = head.substring(lp + 1, rp);
+        if (inner.trim().equals("void")) return slots;   // `(void)` is no parameters at all
+        Pattern idRe = Pattern.compile("[A-Za-z_][A-Za-z0-9_]*");
+        for (String part : inner.split(",")) {
+            String last = null;
+            Matcher m = idRe.matcher(part);
+            while (m.find()) last = m.group(0);
+            if (last == null || last.equals("void") || WRAPPER_TYPE_WORDS.contains(last)) slots.add(null);
+            else slots.add(last);
+        }
+        return slots;
+    }
+
+    // True when `arg` is neither reassigned nor built locally — i.e. the value handed to the sink is
+    // the parameter itself. Mirrors facts._arg_is_forwarded_verbatim.
+    private boolean forwardedVerbatim(String pseudocode, String arg) {
+        String q = Pattern.quote(arg);
+        if (Pattern.compile("\\b" + q + "\\s*=\\s*(?!=)").matcher(pseudocode).find()) return false;
+        StringBuilder alt = new StringBuilder();
+        List<String> builders = new ArrayList<>(WRAPPER_BUILDERS);
+        Collections.sort(builders);
+        for (String b : builders) {
+            if (alt.length() > 0) alt.append("|");
+            alt.append(Pattern.quote(b));
+        }
+        return !Pattern.compile("\\b(?:" + alt + ")\\s*\\(\\s*" + q + "\\b")
+                       .matcher(pseudocode).find();
+    }
+
+    // Recognise a thin command-forwarding wrapper and say WHICH parameter becomes the command.
+    // Returns {wrapped_sink, param_index} or null. Mirrors facts.is_thin_cmd_wrapper, plus the
+    // index the Python side never needed.
+    //
+    // ★ The index is NOT assumed to be 0. The recognition test only requires the sink's first
+    // argument to be SOME parameter of the wrapper, so `W(int flag, char *cmd){system(cmd);}` is a
+    // genuine wrapper whose command is parameter 1. Reading the caller's argument 0 there would
+    // judge the flag — and when a flag is a constant while the real command is a variable, that
+    // reads as a safe constant. The command position is recovered, and a wrapper whose position
+    // cannot be established is NOT registered rather than being read at a guessed 0.
+    private String[] thinCmdWrapper(String pseudocode, Set<String> callees) {
+        if (pseudocode == null || pseudocode.isEmpty()) return null;
+        Set<String> shell = new TreeSet<>();
+        for (String c : callees) {
+            String n = (c == null) ? "" : c.trim();
+            if (FORWARD_CMD_SINKS.contains(n)) shell.add(n);
+        }
+        if (shell.isEmpty()) return null;
+        String wrapped = shell.contains("system") ? "system" : shell.iterator().next();
+        if (statementCount(pseudocode) > WRAPPER_MAX_STATEMENTS) return null;
+        String arg = firstArgIdent(pseudocode, wrapped);
+        if (arg == null) return null;
+        List<String> slots = signatureSlots(pseudocode);
+        int idx = slots.indexOf(arg);
+        if (idx < 0) {
+            // The command is a parameter the decompiler could not tie to a signature slot (a
+            // caller-supplied placeholder). It IS a forward, but its position is unknown, and an
+            // unknown position is not a position: registering it would mean reading some other
+            // argument of every caller. Declined.
+            return null;
+        }
+        if (!forwardedVerbatim(pseudocode, arg)) return null;
+        return new String[]{ wrapped, Integer.toString(idx) };
+    }
+
+    // The callee NAMES of one function, resolved the same way the main callee scan resolves them
+    // (through PLT thunks and GOT slots), so a stripped binary's `system` call is still seen.
+    private Set<String> calleeNamesOf(Function func, FunctionManager fm, SymbolTable symtab,
+                                      Listing listing, ReferenceManager refMgr) {
+        Set<String> out = new HashSet<>();
+        InstructionIterator ii = listing.getInstructions(func.getBody(), true);
+        while (ii.hasNext()) {
+            Instruction instr = ii.next();
+            for (Reference ref : refMgr.getReferencesFrom(instr.getAddress())) {
+                RefType rt = ref.getReferenceType();
+                if (!rt.isCall()) continue;
+                String[] nk = resolveCallee(ref.getToAddress(), rt, fm, symtab, listing);
+                if (nk != null && nk[0] != null && !nk[0].isEmpty()) out.add(nk[0]);
+            }
+        }
+        return out;
+    }
+
+    // Build the per-program registry BEFORE any provenance is produced.
+    //
+    // ★ Why a separate pass at all: the main loop visits functions in address order, so a caller can
+    // be reached before the wrapper it calls. Consulting a registry that is still being filled would
+    // make the result depend on which of the two happens to sit at the lower address — the same
+    // input analysed twice would disagree with itself.
+    //
+    // ★ Why it is cheap: only a function that CALLS a shell sink can be a command wrapper, and that
+    // is a vanishingly small slice — measured across three firmware images, 0.22%-0.38% of all
+    // functions, at most 134 in any single binary. The instruction scan runs for every function
+    // (cheap), and the decompiler — the expensive part — runs only for that slice.
+    private void buildCmdWrapperRegistry(DecompInterface decomp, FunctionManager fm) {
+        cmdWrapperSink = new HashMap<>();
+        cmdWrapperKeyArg = new HashMap<>();
+        SymbolTable symtab = currentProgram.getSymbolTable();
+        Listing listing = currentProgram.getListing();
+        ReferenceManager refMgr = currentProgram.getReferenceManager();
+        int registered = 0, examined = 0;
+        for (Function func : fm.getFunctions(true)) {
+            if (monitor.isCancelled()) break;
+            if (func.isThunk() || func.isExternal()) continue;
+            if (func.getBody().getNumAddresses() < 10) continue;
+            String name = func.getName();
+            if (name == null || name.isEmpty()) continue;
+            if (FORWARD_CMD_SINKS.contains(name)) continue;   // the sink itself is not a wrapper
+            Set<String> callees;
+            try {
+                callees = calleeNamesOf(func, fm, symtab, listing, refMgr);
+            } catch (Exception e) {
+                continue;
+            }
+            boolean callsShell = false;
+            for (String c : callees) if (FORWARD_CMD_SINKS.contains(c)) { callsShell = true; break; }
+            if (!callsShell) continue;   // the cheap gate: no decompile for the other 99.7%
+            examined++;
+            String pseudocode = null;
+            try {
+                DecompileResults dr = decomp.decompileFunction(func, 20, monitor);
+                if (dr != null && dr.decompileCompleted() && dr.getDecompiledFunction() != null) {
+                    pseudocode = dr.getDecompiledFunction().getC();
+                }
+            } catch (Exception e) {
+                pseudocode = null;
+            }
+            if (pseudocode == null) continue;
+            String[] hit;
+            try {
+                hit = thinCmdWrapper(pseudocode, callees);
+            } catch (Exception e) {
+                hit = null;   // any doubt: not a wrapper (the Python side's rule, kept here)
+            }
+            if (hit == null) continue;
+            cmdWrapperSink.put(name, hit[0]);
+            cmdWrapperKeyArg.put(name, Integer.parseInt(hit[1]));
+            registered++;
+        }
+        println("[ExportFunctions] cmd wrappers: " + registered + " registered / "
+                + examined + " shell-sink callers examined");
+    }
+
     private String buildSinkProvenance(HighFunction hf) {
         List<PcodeOpAST> ops = new ArrayList<>();
         Iterator<PcodeOpAST> it = hf.getPcodeOps();
@@ -240,7 +464,11 @@ public class ExportFunctions extends GhidraScript {
             int oc = op.getOpcode();
             if (oc != PcodeOp.CALL && oc != PcodeOp.CALLIND) continue;
             String cn = calleeNameOf(op);
-            if (cn != null && sinkKeyArg.containsKey(cn)) sinks.add(op);
+            // A registered thin command wrapper stands in for the sink it forwards to: the value
+            // this function hands it IS the command that runs, and without this the pass records
+            // nothing at all for such a call.
+            if (cn != null && (sinkKeyArg.containsKey(cn) || cmdWrapperKeyArg.containsKey(cn)))
+                sinks.add(op);
         }
         if (sinks.isEmpty()) return "[]";
         sinks.sort(new Comparator<PcodeOpAST>() {
@@ -256,7 +484,16 @@ public class ExportFunctions extends GhidraScript {
         boolean first = true;
         for (PcodeOpAST sink : sinks) {
             String cn = calleeNameOf(sink);
-            int keyArg = sinkKeyArg.get(cn);
+            // A real sink wins over a same-named wrapper: if a function were somehow named
+            // "system", the lexicon's reading of it is the authoritative one.
+            boolean viaWrapper = !sinkKeyArg.containsKey(cn);
+            int keyArg = viaWrapper ? cmdWrapperKeyArg.get(cn) : sinkKeyArg.get(cn);
+            // ★ The RECORDED sink is the one that actually runs the command, not the wrapper's own
+            // name — the reading layer scopes a candidate's records by matching this against the
+            // sink it is anchored to, and a candidate reached through a wrapper is anchored to the
+            // wrapped sink. Recording the wrapper's name here would leave the record unmatched and
+            // the whole recovery silently inert.
+            String recordedSink = viaWrapper ? cmdWrapperSink.get(cn) : cn;
             Varnode arg = (keyArg + 1 < sink.getNumInputs()) ? sink.getInput(keyArg + 1) : null;
             String prov = (arg == null)
                     ? "{\"kind\":\"unresolved\",\"note\":\"arg_absent\"}"
@@ -264,10 +501,17 @@ public class ExportFunctions extends GhidraScript {
             if (!first) arr.append(",");
             first = false;
             arr.append("{\"sink_idx\":").append(sinkIdx)
-               .append(",\"sink\":\"").append(esc(cn)).append("\"")
+               .append(",\"sink\":\"").append(esc(recordedSink)).append("\"")
                .append(",\"sink_addr\":\"").append(esc(addr0x(sink))).append("\"")
-               .append(",\"arg_idx\":").append(keyArg)
-               .append(",\"provenance\":").append(prov)
+               .append(",\"arg_idx\":").append(keyArg);
+            if (viaWrapper) {
+                // Said explicitly, because the record's sink name is NOT what is written at this
+                // address: a reader looking for a `system` call here would find the wrapper call
+                // instead and have no way to tell why. The value judged is the argument handed to
+                // the wrapper, one hop before the sink runs it.
+                arr.append(",\"via_wrapper\":\"").append(esc(cn)).append("\"");
+            }
+            arr.append(",\"provenance\":").append(prov)
                .append("}");
             sinkIdx++;
         }
@@ -1756,6 +2000,12 @@ public class ExportFunctions extends GhidraScript {
             String n = esym.getName();
             if (n != null && !n.isEmpty()) knownNames.add(n);
         }
+
+        // Thin command wrappers, recognised BEFORE any provenance is produced: the main loop below
+        // walks functions in address order, so a caller can be reached before the wrapper it calls,
+        // and a registry filled as we go would make the answer depend on which of the two sits at
+        // the lower address.
+        buildCmdWrapperRegistry(decomp, fm);
 
         for (Function func : fm.getFunctions(true)) {
             if (monitor.isCancelled()) break;
