@@ -64,15 +64,22 @@ def _statement_count(pseudocode: str) -> int:
     return sum(1 for s in _STMT_SPLIT_RE.split(pseudocode) if s.strip())
 
 
-def _signature_params(pseudocode: str) -> set[str]:
-    """Parameter identifiers from the function signature — the first top-level (...) before the
-    opening brace. Each parameter's NAME is its last identifier (`char* param_1` -> param_1;
-    `const char *cmd` -> cmd). Type-only words (an unnamed `(void)` / `(char*)`) are dropped."""
+def signature_slots(pseudocode: str) -> list[str | None]:
+    """One entry per parameter SLOT of the signature, in declaration order.
+
+    A slot holds the parameter's name — its last identifier (`char* param_1` -> param_1;
+    `const char *cmd` -> cmd) — or None when the slot declares a type with no name.
+
+    ★ Unnamed slots are KEPT as None rather than dropped, because position is the whole point of
+    this list and dropping them silently shifts every parameter after one: in
+    `f(int, char *param_2)` a name-only list reports param_2 at position 0, so a caller's argument
+    0 gets read when argument 1 is what reaches the sink. Wrong-position is worse than no position
+    — it judges a real value that is simply the wrong one."""
     brace = pseudocode.find("{")
     head = pseudocode[:brace] if brace != -1 else pseudocode
     lp = head.find("(")
     if lp == -1:
-        return set()
+        return []
     depth = 0
     rp = -1
     for i in range(lp, len(head)):
@@ -84,17 +91,55 @@ def _signature_params(pseudocode: str) -> set[str]:
                 rp = i
                 break
     if rp == -1:
-        return set()
-    params: set[str] = set()
+        return []
+    slots: list[str | None] = []
     for part in head[lp + 1 : rp].split(","):
         idents = _IDENT_RE.findall(part)
-        if not idents:
+        name = idents[-1] if idents else None
+        if name == "void" and len(slots) == 0 and head[lp + 1 : rp].strip() == "void":
+            return []  # `(void)` is "no parameters", not one unnamed slot
+        if name is None or name in _TYPE_WORDS or name == "void":
+            slots.append(None)  # a typed-but-unnamed slot: position preserved, name unknown
             continue
-        name = idents[-1]
-        if name == "void" or name in _TYPE_WORDS:
-            continue
-        params.add(name)
-    return params
+        slots.append(name)
+    return slots
+
+
+def signature_params_ordered(pseudocode: str) -> list[str]:
+    """The signature's NAMED parameters, in declaration order (the named view of
+    ``signature_slots``). Positions are NOT preserved here — anything indexing by position must
+    use ``signature_slots``."""
+    return [s for s in signature_slots(pseudocode) if s is not None]
+
+
+def _signature_params(pseudocode: str) -> set[str]:
+    """The signature's parameter NAMES (order-free view of ``signature_slots``)."""
+    return {s for s in signature_slots(pseudocode) if s is not None}
+
+
+def fmt_wrapper_format_index(pseudocode: str, wrapped_sink: str) -> int | None:
+    """The POSITION of a thin fmt wrapper's format parameter in its own signature, or None.
+
+    Pairs with ``is_thin_fmt_wrapper``, which answers "is this a fmt wrapper, and which sink" but
+    not "which of its parameters is the format". A caller needs the position: it forwards arguments
+    positionally, so this index is what turns "the wrapper's format comes from its parameter
+    ``param_2``" into "read the caller's argument 1".
+
+    None whenever the position cannot be established — the sink's format argument is not one of
+    the signature's named parameters (a decompiler placeholder like ``in_r3``, or a value built
+    inside the wrapper). The caller then declines to read any argument rather than guessing one,
+    because a guessed position reads a DIFFERENT value than the one that reaches the sink.
+
+    Indexed over ``signature_slots``, so an unnamed slot occupies its position instead of shifting
+    the parameters after it."""
+    ident = locate_format_arg(pseudocode, wrapped_sink)
+    if ident is None:
+        return None
+    slots = signature_slots(pseudocode)
+    try:
+        return slots.index(ident)
+    except ValueError:
+        return None
 
 
 def _arg_is_forwarded_verbatim(pseudocode: str, arg: str) -> bool:

@@ -2846,3 +2846,276 @@ def test_static_table_status_no_row_is_unknown_not_none(tmp_path: Path) -> None:
     st = get_string_keyed_edges(atlas, binary="nobody")["static_string_table_status"]
     assert st["statuses"] == [] and "UNKNOWN" in st["note"]
     atlas.close()
+
+
+# ── C-FMT: reading the wrapper's FORMAT argument, at the position its signature puts it ──
+#
+# A candidate recovered through a thin fmt wrapper had its dangerous value read at argument 0 —
+# right for the command axis, where the whole first argument IS the command, and wrong for the
+# format axis, where argument 0 is a stream / level / program name and the format sits later. When
+# that wrong argument happened to be a literal, the candidate read as constant while its actual
+# format was a variable: a false negative, on the one argument that carries the injection.
+#
+# Measured on real firmware before writing these: 11 candidates in one image alone have a literal
+# argument 0 and a NON-literal real format — exactly the shape below.
+#
+# The fixtures drive the whole live path (run_analyzer2 -> flow evidence -> triage), not a helper
+# in isolation, so a mutation that restores the argument-0 reading has to fail here.
+
+
+def _fmt_wrapper_arg1_fn(name: str = "log_at") -> dict[str, object]:
+    """A thin fmt wrapper whose FORMAT is its second parameter — the vfprintf(stream, fmt, …)
+    shape. Argument 0 is the stream: constant at nearly every call site, and irrelevant."""
+    return {
+        "name": name,
+        "pseudocode": (
+            f"void {name}(int param_1,char *param_2,undefined4 param_3)"
+            f"{{ FILE *s; s=_stderr; vfprintf(s,param_2,param_3); }}"
+        ),
+        "hash": f"h_{name}",
+        "callees": ["vfprintf"],
+    }
+
+
+def _caller_fmt_at_arg1(name: str, fmt_expr: str, *, callees: list[str] | None = None):  # type: ignore[no-untyped-def]
+    """A caller passing a CONSTANT argument 0 and ``fmt_expr`` at the format position (arg 1)."""
+    return {
+        "name": name,
+        "pseudocode": (
+            f'void {name}(char *param_1){{ char *pcVar2; pcVar2 = getenv("X"); '
+            f"log_at(2,{fmt_expr},param_1); }}"
+        ),
+        "hash": f"h_{name}",
+        "callees": callees if callees is not None else ["getenv", "log_at"],
+    }
+
+
+def _fmt_atlas(tmp_path: Path, funcs: list[dict[str, object]], *, run: str = "run_cfmt") -> Path:
+    db = _make_db(tmp_path, [{"name": "netd", "funcs": funcs}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id=run)
+    return atlas
+
+
+def _fmt_records(atlas: Path, fn: str) -> list[dict[str, object]]:
+    """The sink_arg_provenance records stored for ``fn``'s wrapper-recovered instance."""
+    row = _by_anchor(atlas)[fn]
+    return json.loads(row["flow_evidence"] or "{}").get("sink_arg_provenance", [])
+
+
+def test_fmt_position_aware_not_arg0(tmp_path: Path) -> None:
+    """The format is read at the wrapper's format POSITION, not at argument 0.
+
+    Argument 0 here is the constant `2`; the real format is the variable `pcVar2`. Reading argument
+    0 judges a value that never reaches the sink, and judges it SAFE.
+
+    MUTATION (must go RED): in analyzer2's wrapper loop restore the argument-0 reading —
+    `sink_arg = locate_sink_arg(f_pseudocode, wc.wrapper_name)` and drop the recovered record, or
+    force `fmt_index = None`. The candidate then reads its constant stream argument and this
+    assertion sees a constant."""
+    atlas = _fmt_atlas(
+        tmp_path, [_fmt_wrapper_arg1_fn(), _caller_fmt_at_arg1("report_err", "pcVar2")]
+    )
+    dim = _cand_of(atlas, "report_err").dim("controllability")
+    assert (dim.state, dim.value) != ("proven", "constant")
+    assert dim.state != "proven"
+    assert not _is_safe(atlas, "report_err")
+
+
+def test_fmt_const_literal_constant(tmp_path: Path) -> None:
+    # A literal at the format position is constant by inspection: recovered as an ordinary
+    # provenance record and judged by the existing classifier, no new verdict logic.
+    atlas = _fmt_atlas(
+        tmp_path, [_fmt_wrapper_arg1_fn(), _caller_fmt_at_arg1("report_ok", '"boot done\\n"')]
+    )
+    dim = _cand_of(atlas, "report_ok").dim("controllability")
+    assert (dim.state, dim.value) == ("proven", "constant")
+    # …and it is a REAL record anchored to the candidate's sink, not an empty-provenance shortcut
+    (rec,) = [r for r in _fmt_records(atlas, "report_ok") if r.get("sink") == "vfprintf"]
+    assert rec["provenance"]["kind"] == "constant"
+    assert rec["provenance"]["value"] == "boot done\n"
+    assert rec["provenance"]["value_kind"] == "literal_string"
+
+
+def test_fmt_rodata_unresolvable_stays_unknown(tmp_path: Path) -> None:
+    """A data pointer at the format position is NOT a readable literal — no record, no constant.
+
+    Checked against real firmware rather than assumed: the decompiler INLINES a string it
+    recognised (which is why a literal format shows up as text at all), so a `DAT_` name is what it
+    emits precisely when it did not recognise one. 0 of 36 such arguments across two images
+    resolved to a recorded string, so treating them as constants would assert safety about bytes
+    nobody read."""
+    atlas = _fmt_atlas(
+        tmp_path, [_fmt_wrapper_arg1_fn(), _caller_fmt_at_arg1("report_dat", "&DAT_000198b4")]
+    )
+    assert _cand_of(atlas, "report_dat").dim("controllability").state != "proven"
+    assert [r for r in _fmt_records(atlas, "report_dat") if r.get("sink") == "vfprintf"] == []
+
+
+def test_fmt_variable_not_constant(tmp_path: Path) -> None:
+    """A variable format stays unproven even when every branch in sight assigns a constant.
+
+    Washing a phi-of-constants to `const` needs EVERY reaching definition; enumerating the branches
+    that are easy to see is how a constant gets asserted about a value another branch controls. The
+    landing spot follows the candidate's own source_kind, so this pins "not proven", not a spot.
+
+    MUTATION (must go RED): make the recovery follow single-branch assignments (treat
+    `pcVar2 = "..."` seen anywhere in the body as the format's value) -> this reads constant."""
+    caller = {
+        "name": "report_phi",
+        "pseudocode": (
+            'void report_phi(int c){ char *pcVar2; if (c) { pcVar2 = "a: %s"; } '
+            'else { pcVar2 = "b: %s"; } log_at(2,pcVar2,c); }'
+        ),
+        "hash": "h_report_phi",
+        "callees": ["log_at"],
+    }
+    atlas = _fmt_atlas(tmp_path, [_fmt_wrapper_arg1_fn(), caller])
+    dim = _cand_of(atlas, "report_phi").dim("controllability")
+    assert (dim.state, dim.value) != ("proven", "constant")
+    assert dim.state != "proven"
+
+
+def test_fmt_vararg_not_modeled_as_injection(tmp_path: Path) -> None:
+    """★ AXIS INVERSION, pinned structurally. On the fmt axis the varargs are harmless data being
+    formatted into a log or a stream; only the FORMAT carries injection. A record shaped like a
+    stack_buf writer — a format template plus its varargs — hands the read side a `%s` vararg it
+    judges as an injection surface, which is the command axis's rule applied to the wrong axis.
+
+    The protection is that no such record is ever built here, so this asserts the SHAPE of what
+    C-FMT emits, not a downstream check.
+
+    MUTATION (must go RED): have the recovery emit `{"kind": "stack_buf", "writers": [...]}` with
+    the format's varargs for a fmt candidate -> a vararg appears in the emitted record."""
+    atlas = _fmt_atlas(
+        tmp_path,
+        [_fmt_wrapper_arg1_fn(), _caller_fmt_at_arg1("report_va", '"user %s did %s"')],
+    )
+    recovered = [
+        r
+        for r in _fmt_records(atlas, "report_va")
+        if r.get("recovered_by") == "fmt_wrapper_callsite"
+    ]
+    assert recovered, "the literal format should have been recovered"
+    for rec in recovered:
+        assert rec["provenance"]["kind"] == "constant"
+        assert rec["provenance"].get("writers") is None
+        assert rec["provenance"].get("varargs") is None
+        assert "stack_buf" not in json.dumps(rec)
+    # and the reading stays constant — the %s in the template never makes it controllable
+    assert _cand_of(atlas, "report_va").dim("controllability").value == "constant"
+
+
+def test_fmt_binary_scope(tmp_path: Path) -> None:
+    """The wrapper is resolved inside the CALLER's binary. A same-named helper really does carry a
+    different body in a different binary here, and reading the wrong one reads the format position
+    off the wrong signature — so the argument judged is not the argument that reaches the sink.
+
+    MUTATION (must go RED): key the wrapper registry by name alone instead of (binary_id, name) ->
+    binary B's caller is judged against binary A's wrapper, and its variable format at index 1 is
+    read at index 0 where a constant sits."""
+    db = _make_db(
+        tmp_path,
+        [
+            # binary A: format at index 1 (stream first)
+            {
+                "name": "neta",
+                "funcs": [_fmt_wrapper_arg1_fn(), _caller_fmt_at_arg1("a_rep", '"ok"')],
+            },
+            # binary B: SAME wrapper name, format at index 0, and its caller passes a VARIABLE
+            # there while a constant sits at index 1 — the exact swap a name-only lookup gets wrong
+            {
+                "name": "netb",
+                "funcs": [
+                    {
+                        "name": "log_at",
+                        "pseudocode": (
+                            "void log_at(char *param_1,int param_2)"
+                            "{ FILE *s; s=_stderr; vfprintf(s,param_1,param_2); }"
+                        ),
+                        "hash": "h_log_at_b",
+                        "callees": ["vfprintf"],
+                    },
+                    {
+                        "name": "b_rep",
+                        "pseudocode": (
+                            'void b_rep(void){ char *pcVar2; pcVar2 = getenv("X"); '
+                            'log_at(pcVar2,"tail"); }'
+                        ),
+                        "hash": "h_b_rep",
+                        "callees": ["getenv", "log_at"],
+                    },
+                ],
+            },
+        ],
+    )
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_scope")
+    # binary B's caller: its real format is the variable at index 0 -> never proven
+    assert _cand_of(atlas, "b_rep").dim("controllability").state != "proven"
+    # binary A's caller is unaffected: its literal format at index 1 still reads constant
+    assert _cand_of(atlas, "a_rep").dim("controllability").value == "constant"
+
+
+def test_fmt_name_not_in_callees_unknown(tmp_path: Path) -> None:
+    # The wrapper name must be among the caller's callees for the hop to exist at all. Without it
+    # there is no candidate to judge — the text is never chased on name alone.
+    caller = _caller_fmt_at_arg1("no_edge", '"safe %s"', callees=["getenv"])
+    atlas = _fmt_atlas(tmp_path, [_fmt_wrapper_arg1_fn(), caller])
+    conn = open_atlas(atlas)
+    try:
+        from treasure_map.lib.query import triage as run_triage
+
+        names = {c.function for c in run_triage(conn)}
+    finally:
+        conn.close()
+    assert "no_edge" not in names
+
+
+def test_fmt_proven_constant_only_via_traced(tmp_path: Path) -> None:
+    """Both arms of the safety floor, in one place.
+
+    UNCERTAIN arm — a variable format, an unresolvable data pointer, and a format position that
+    could not be established all leave the provenance empty and fall back to the never-traced
+    reading. CERTAIN arm — a literal format reaches constant, and does so THROUGH a record anchored
+    to the candidate's own sink, never through an empty-provenance shortcut.
+
+    MUTATION (must go RED): emit a constant record when the format argument is not a literal (e.g.
+    fall back to `{"kind": "constant", "value": arg}` for a variable) -> the uncertain arm reads
+    proven."""
+    unknown_sig = {
+        # A wrapper whose format is a CALLER-SUPPLIED placeholder the decompiler could not tie to
+        # a signature slot: it is a real forwarding wrapper, but its format position is unknown.
+        "name": "log_ph",
+        "pseudocode": (
+            "void log_ph(int param_1){ FILE *s; s=_stderr; vfprintf(s,unaff_r4,param_1); }"
+        ),
+        "hash": "h_log_ph",
+        "callees": ["vfprintf"],
+    }
+    ph_caller = {
+        # ★ a LITERAL sits at argument 0 here, so guessing position 0 when the real position is
+        # unknown manufactures a constant out of a value that is not the format at all.
+        "name": "via_ph",
+        "pseudocode": 'void via_ph(int c){ log_ph("boot tag",c); }',
+        "hash": "h_via_ph",
+        "callees": ["log_ph"],
+    }
+    atlas = _fmt_atlas(
+        tmp_path,
+        [
+            _fmt_wrapper_arg1_fn(),
+            _caller_fmt_at_arg1("arm_var", "pcVar2"),
+            _caller_fmt_at_arg1("arm_dat", "&DAT_00011111"),
+            _caller_fmt_at_arg1("arm_lit", '"ready\\n"'),
+            unknown_sig,
+            ph_caller,
+        ],
+    )
+    for fn in ("arm_var", "arm_dat", "via_ph"):
+        dim = _cand_of(atlas, fn).dim("controllability")
+        assert dim.state != "proven", (fn, dim.state, dim.value)
+    assert _fmt_records(atlas, "via_ph") == []  # nothing was read at a guessed position
+    # the certain arm reaches constant, and only via a record scoped to its sink
+    assert _cand_of(atlas, "arm_lit").dim("controllability").value == "constant"
+    assert any(r.get("sink") == "vfprintf" for r in _fmt_records(atlas, "arm_lit"))

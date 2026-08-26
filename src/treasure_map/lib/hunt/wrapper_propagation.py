@@ -39,7 +39,11 @@ import json
 from dataclasses import dataclass
 
 from treasure_map.lib.diff.loader import FuncRow
-from treasure_map.lib.hunt.facts import is_thin_cmd_wrapper, is_thin_fmt_wrapper
+from treasure_map.lib.hunt.facts import (
+    fmt_wrapper_format_index,
+    is_thin_cmd_wrapper,
+    is_thin_fmt_wrapper,
+)
 from treasure_map.lib.pattern.classes import CMD, FMT_STRING
 from treasure_map.lib.pattern.oss import is_oss_binary
 
@@ -57,6 +61,14 @@ class WrapperCandidate:
     wrapper_name: str
     wrapped_sink: str
     sink_class: str
+    # FORMAT-AXIS ONLY: the position of the wrapper's format parameter in its own signature, so the
+    # caller's format argument can be read at the right INDEX rather than at argument 0 (which on
+    # this axis is a stream / level / program name, not the format). None on the command axis, and
+    # None on the format axis whenever the position could not be established — the reader then
+    # declines to read any argument instead of guessing one. Computed where the wrapper's body is
+    # in hand and the registry key already pins the binary, so it cannot be resolved against a
+    # same-named function from a different binary.
+    format_param_index: int | None = None
 
 
 def _parse_callees(raw: str | None) -> list[str]:
@@ -73,7 +85,7 @@ def _axis_candidate(
     f: FuncRow,
     callee_names: set[str],
     direct_sinks: frozenset[str],
-    wrappers: dict[tuple[int, str], str],
+    wrappers: dict[tuple[int, str], tuple[str, int | None]],
     sink_class: str,
 ) -> WrapperCandidate | None:
     """Recover ``f`` on one sink axis, or None. ``f`` is skipped when it has a direct sink of this
@@ -88,9 +100,13 @@ def _axis_candidate(
     )
     if not called:
         return None
-    wrapper_name, wrapped_sink = called[0]  # deterministic: first wrapper by name
+    wrapper_name, (wrapped_sink, fmt_index) = called[0]  # deterministic: first wrapper by name
     return WrapperCandidate(
-        func=f, wrapper_name=wrapper_name, wrapped_sink=wrapped_sink, sink_class=sink_class
+        func=f,
+        wrapper_name=wrapper_name,
+        wrapped_sink=wrapped_sink,
+        sink_class=sink_class,
+        format_param_index=fmt_index,
     )
 
 
@@ -105,8 +121,8 @@ def find_wrapper_propagated_candidates(
     ``known_components`` is the OSS-binary set (same exclusion the shape scan uses) so propagated
     candidates surface in custom binaries only."""
     # 1) Per-binary thin-wrapper registries, one per axis: (binary_id, wrapper name) -> sink.
-    cmd_wrappers: dict[tuple[int, str], str] = {}
-    fmt_wrappers: dict[tuple[int, str], str] = {}
+    cmd_wrappers: dict[tuple[int, str], tuple[str, int | None]] = {}
+    fmt_wrappers: dict[tuple[int, str], tuple[str, int | None]] = {}
     for f in funcs:
         if not f.name or not f.pseudocode:
             continue
@@ -115,10 +131,18 @@ def find_wrapper_propagated_candidates(
         callees = _parse_callees(f.callees)
         is_cmd, cmd_sink = is_thin_cmd_wrapper(f.pseudocode, callees)
         if is_cmd and cmd_sink is not None:
-            cmd_wrappers[(f.binary_id, f.name)] = cmd_sink
+            cmd_wrappers[(f.binary_id, f.name)] = (cmd_sink, None)
         is_fmt, fmt_sink = is_thin_fmt_wrapper(f.pseudocode, callees)
         if is_fmt and fmt_sink is not None:
-            fmt_wrappers[(f.binary_id, f.name)] = fmt_sink
+            # The format position is recorded HERE, with the wrapper's own body in hand. Doing it
+            # later, from the candidate, would mean finding the wrapper by name again — and a name
+            # is not unique across binaries (the same helper name really does carry different
+            # bodies in different binaries here), so the position could be read off the wrong
+            # function. The registry key is (binary_id, name), so this cannot happen.
+            fmt_wrappers[(f.binary_id, f.name)] = (
+                fmt_sink,
+                fmt_wrapper_format_index(f.pseudocode, fmt_sink),
+            )
 
     # 2) Callers of a same-binary wrapper that have no direct sink of that axis of their own.
     out: list[WrapperCandidate] = []

@@ -83,6 +83,7 @@ from treasure_map.lib.hunt.exec_edges import (
     exec_entry_sites,
 )
 from treasure_map.lib.hunt.facts import is_thin_cmd_wrapper
+from treasure_map.lib.hunt.fmt_provenance import constant_format_record, format_argument
 from treasure_map.lib.hunt.refs import _WRAPPER_AXIS, build_evidence_ref
 from treasure_map.lib.hunt.wrapper_propagation import (
     find_wrapper_propagated_candidates,
@@ -99,7 +100,7 @@ from treasure_map.lib.pattern.classes import (
 )
 from treasure_map.lib.query.nvram import template_has_anchor
 from treasure_map.lib.reachability import grade_candidate
-from treasure_map.lib.reachability.taint import locate_sink_arg
+from treasure_map.lib.reachability.taint import _IDENT_RE, locate_sink_arg
 from treasure_map.version import __version__
 
 logger = logging.getLogger(__name__)
@@ -202,6 +203,32 @@ def _load_known_components(db_path: Path | str) -> set[str]:
     finally:
         conn.close()
     return {r[0] for r in rows}
+
+
+# The sink_class string the format axis carries (the key _WRAPPER_AXIS uses for it).
+FMT_STRING_CLASS = "fmt_string"
+
+
+def _wrapper_sink_arg(pseudocode: str, wrapper_name: str, fmt_index: int | None) -> str | None:
+    """The identifier feeding the wrapper's dangerous argument — at the FORMAT position when one is
+    known, otherwise the first argument.
+
+    ``fmt_index`` is set only for a format-axis candidate whose wrapper signature pinned its format
+    position; the command axis, and a format wrapper whose position could not be established, keep
+    the historical first-argument reading unchanged.
+
+    A literal at the format position yields None, not an identifier: there is no VARIABLE feeding
+    the sink, and manufacturing one out of the literal's first word would send the taint reader
+    chasing a name that does not exist. The constant is carried by the provenance record instead."""
+    if fmt_index is None:
+        return locate_sink_arg(pseudocode, wrapper_name)
+    arg = format_argument(pseudocode, wrapper_name, fmt_index)
+    if arg is None:
+        return locate_sink_arg(pseudocode, wrapper_name)
+    ident = _IDENT_RE.search(arg)
+    if ident is None or arg.lstrip().startswith('"'):
+        return None
+    return ident.group(0)
 
 
 def _wrapper_fingerprint(sink_class: str, source_class: str, wrapped_sink: str) -> str:
@@ -1268,7 +1295,17 @@ def run_analyzer2(
                 f_pseudocode = f.pseudocode or ""
                 f_callees = _parse_callees(f.callees)
                 shape_prefix, ref_suffix = _WRAPPER_AXIS[wc.sink_class]
-                sink_arg = locate_sink_arg(f_pseudocode, wc.wrapper_name)
+                # ★ POSITION-AWARE on the format axis. The command axis's dangerous value is the
+                # wrapper's FIRST argument, so locate_sink_arg is right there. On the format axis it
+                # is wrong, and wrong in the direction that hides bugs: argument 0 is the stream,
+                # level or program name, while the format — the only argument that carries
+                # format-string injection — sits at whatever position the wrapper's signature puts
+                # it. Reading argument 0 therefore judged the wrong value, and when that wrong value
+                # happened to be a literal the candidate was read as constant while its actual
+                # format was a variable. Measured on real firmware: `W(2, pcVar2, uVar1)` — argument
+                # 0 is the constant `2`, the format is the variable `pcVar2` at index 1.
+                fmt_index = wc.format_param_index if wc.sink_class == FMT_STRING_CLASS else None
+                sink_arg = _wrapper_sink_arg(f_pseudocode, wc.wrapper_name, fmt_index)
                 blocking = wrapper_propagation_form_note(f_pseudocode, wc.wrapper_name, sink_arg)
                 evidence = build_flow_evidence(
                     pseudocode=f_pseudocode,
@@ -1306,7 +1343,27 @@ def run_analyzer2(
                 # Def-use provenance for the wrapper function's own sinks. The real
                 # sink is one hop away, but the forwarding function's provenance still tells the
                 # agent where the forwarded value comes from. A surfaced fact, never scored.
-                evidence["sink_arg_provenance"] = sink_prov_by_func.get(f.func_id, [])
+                # Def-use provenance for the wrapper function's own sinks, PLUS — on the format
+                # axis — the format argument recovered from this call site. The extractor's def-use
+                # pass stops at the function boundary, so a forwarded sink leaves nothing behind and
+                # the candidate can only be read as "never traced". Reading the format literal out
+                # of the call site one hop up recovers the common case as an ordinary constant
+                # record, which the existing classifier judges with no new verdict logic. Every
+                # uncertain shape yields no record and keeps the untraced reading (see
+                # fmt_provenance). ★ The record carries the format ONLY — never its varargs, which
+                # on this axis are harmless data and which a stack_buf-shaped record would get
+                # judged as an injection surface.
+                recovered = (
+                    constant_format_record(
+                        pseudocode=f_pseudocode,
+                        wrapper_name=wc.wrapper_name,
+                        wrapped_sink=wc.wrapped_sink,
+                        index=fmt_index,
+                    )
+                    if wc.sink_class == FMT_STRING_CLASS
+                    else []
+                )
+                evidence["sink_arg_provenance"] = sink_prov_by_func.get(f.func_id, []) + recovered
                 pattern_id = upsert_pattern(
                     atlas,
                     source_class=source_class,
