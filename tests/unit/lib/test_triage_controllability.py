@@ -1907,3 +1907,50 @@ def test_cmd_proven_constant_only_via_traced(tmp_path: Path) -> None:
             assert (state, value) != ("proven", "constant"), (name, state, value)
     finally:
         conn.close()
+
+
+def test_fmt_variable_survives_marker_still_unknown(tmp_path: Path) -> None:
+    """★ THE BACKSTOP, pinned on its own. A wrapper candidate with EMPTY provenance stays unproven
+    even when a `const_sink_arg` note is sitting on it.
+
+    Why this is worth its own test: the format axis no longer emits that note, so in today's code
+    this combination does not arise on that path. Safety must not rest on the note being absent —
+    it rests on the completeness guard, which refuses to trust ANY constant reading for a candidate
+    whose forwarded sink left no record. Those are two independent defences and this one is the
+    lower of the two. Without it, anything that ever re-attaches a note to an untraced candidate —
+    a new axis, a new marker, a revived code path — silently reopens the false negative.
+
+    Verified end-to-end while investigating: with the note alive and the provenance empty, the
+    candidate still read unknown.
+
+    MUTATION (must go RED): make _anchor_missed's guard (b) return False for a via_wrapper
+    candidate with empty provenance (the pre-fix behaviour) -> the surviving note carries this to
+    proven:constant."""
+    conn = _atlas(tmp_path)
+    try:
+        pid = _pattern(conn, "fp_backstop", sink_class="fmt_string")
+        ref = _inst(
+            conn,
+            pid,
+            sink_anchor="vfprintf",
+            # a note is present AND the sink was forwarded AND nothing was traced
+            blocking="const_sink_arg",
+            flow_evidence={
+                "source_kind": "unknown",
+                "flow_path": {
+                    "sink_via_wrapper": True,
+                    "wrapper": {"name": "log_at", "wrapped_sink": "vfprintf"},
+                },
+                "sink_arg_provenance": [],
+            },
+        )
+        state, value = _dim_of(conn, ref)
+        assert (state, value) != ("proven", "constant")
+        assert state != "proven"
+        # and the reading says WHY it was not trusted, rather than silently landing somewhere
+        (cand,) = [c for c in triage(conn) if c.evidence_ref == ref]
+        dim = cand.dim("controllability")
+        assert "blocking_mechanism" not in dim.source
+        assert dim.evidence and dim.evidence[0]["via"] == "wrapper_empty_provenance"
+    finally:
+        conn.close()

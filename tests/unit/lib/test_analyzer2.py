@@ -3119,3 +3119,68 @@ def test_fmt_proven_constant_only_via_traced(tmp_path: Path) -> None:
     # the certain arm reaches constant, and only via a record scoped to its sink
     assert _cand_of(atlas, "arm_lit").dim("controllability").value == "constant"
     assert any(r.get("sink") == "vfprintf" for r in _fmt_records(atlas, "arm_lit"))
+
+
+def _tag_first_caller(name: str, fmt_expr: str) -> dict[str, object]:
+    """A caller whose argument 0 is a constant TAG and whose real format sits at argument 1.
+
+    The shape that made the mis-attribution visible on real firmware:
+    `log_at("auth_enhance", "user=%s password=%s", p)`. Argument 0 being a literal is what the
+    command-axis form note keys on."""
+    return {
+        "name": name,
+        "pseudocode": (
+            f'void {name}(char *param_1){{ char *pcVar2; pcVar2 = getenv("X"); '
+            f'log_at("auth_enhance",{fmt_expr},param_1); }}'
+        ),
+        "hash": f"h_{name}",
+        "callees": ["getenv", "log_at"],
+    }
+
+
+def test_fmt_tagfirst_const_traced_not_arg0marker(tmp_path: Path) -> None:
+    """A constant format must be credited to the FORMAT, not to a constant tag beside it.
+
+    The form note is a command-axis reading: all three notes it can produce describe the wrapper's
+    FIRST argument, which on the command axis IS the command. On the format axis argument 0 is a
+    tag / stream / level, so a literal there produced `const_sink_arg` and the candidate reached
+    "constant" through that note — the right verdict credited to the wrong argument, while the
+    format actually recovered from the call site sat unused.
+
+    Measured on real firmware before the fix: 41 and 64 format candidates in two images took the
+    note's path. After it, 0 do, and not one verdict changed — the fault was attribution only.
+
+    MUTATION (must go RED): restore the unconditional call in analyzer2's wrapper loop
+    (`blocking = wrapper_propagation_form_note(...)` for both axes) -> the reading is credited to
+    `blocking_mechanism=const_sink_arg` again."""
+    atlas = _fmt_atlas(
+        tmp_path,
+        [_fmt_wrapper_arg1_fn(), _tag_first_caller("auth_log", '"user=%s password=%s"')],
+    )
+    dim = _cand_of(atlas, "auth_log").dim("controllability")
+    # a. the verdict itself
+    assert (dim.state, dim.value) == ("proven", "constant")
+    # b. …reached through the recovered record, not through the argument-0 note
+    assert "sink_arg_provenance" in dim.source
+    assert "blocking_mechanism" not in dim.source
+    # c. …and the record carries the REAL format from argument 1
+    (rec,) = [
+        r
+        for r in _fmt_records(atlas, "auth_log")
+        if r.get("recovered_by") == "fmt_wrapper_callsite"
+    ]
+    assert rec["provenance"]["value"] == "user=%s password=%s"
+    assert rec["arg_idx"] == 1
+    # d. the format axis stores no note at all
+    assert _by_anchor(atlas)["auth_log"]["blocking_mechanism"] is None
+
+
+def test_cmd_axis_keeps_its_form_note(tmp_path: Path) -> None:
+    """The command axis must KEEP the note: there, argument 0 really is the command, so a literal
+    forwarded to the wrapper is a constant command and the note names the right argument.
+
+    MUTATION (must go RED): suppress the note on both axes instead of the format axis alone."""
+    atlas = _fmt_atlas(
+        tmp_path, [_thin_cmd_wrapper_fn(), _const_via_wrapper_fn()], run="run_cmd_note"
+    )
+    assert _by_anchor(atlas)["reboot_now"]["blocking_mechanism"] == "const_sink_arg"

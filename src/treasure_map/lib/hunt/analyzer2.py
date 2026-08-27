@@ -1306,7 +1306,26 @@ def run_analyzer2(
                 # 0 is the constant `2`, the format is the variable `pcVar2` at index 1.
                 fmt_index = wc.format_param_index if wc.sink_class == FMT_STRING_CLASS else None
                 sink_arg = _wrapper_sink_arg(f_pseudocode, wc.wrapper_name, fmt_index)
-                blocking = wrapper_propagation_form_note(f_pseudocode, wc.wrapper_name, sink_arg)
+                # ★ The form note is a COMMAND-axis reading, and only the command axis may carry it.
+                # All three notes it produces describe the wrapper's FIRST argument: a literal there
+                # is a constant command, a numeric- or charset-constrained one cannot carry shell
+                # syntax. On the format axis argument 0 is a stream, a level or a tag — so the note
+                # answers a question about the wrong argument, and a constant tag beside a constant
+                # format still credited the reading to the tag. Measured on real firmware, 41 and 64
+                # format candidates in two images reached "constant" through that note rather than
+                # through the format actually recovered from the call site: the verdict happened to
+                # agree, the reason did not, and a reason that names the wrong argument is what a
+                # reviewer would have to un-learn.
+                #
+                # So the format axis produces NO note at all, and its reading rests entirely on the
+                # recovered format record (a literal format) or on the honest untraced fallback (a
+                # variable one). Nothing is lost: none of the three notes says anything about
+                # whether a FORMAT is controllable, which is the only danger on this axis.
+                blocking = (
+                    None
+                    if wc.sink_class == FMT_STRING_CLASS
+                    else wrapper_propagation_form_note(f_pseudocode, wc.wrapper_name, sink_arg)
+                )
                 evidence = build_flow_evidence(
                     pseudocode=f_pseudocode,
                     callees=f_callees,
