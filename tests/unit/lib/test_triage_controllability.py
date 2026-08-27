@@ -14,6 +14,8 @@ import json
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import (
     InstanceRow,
@@ -29,6 +31,7 @@ from treasure_map.lib.atlas.writer import (
     upsert_pattern,
 )
 from treasure_map.lib.query import sort_candidates, triage
+from treasure_map.lib.query.triage import _scoped_records
 
 _FID = [0]
 
@@ -1952,5 +1955,206 @@ def test_fmt_variable_survives_marker_still_unknown(tmp_path: Path) -> None:
         dim = cand.dim("controllability")
         assert "blocking_mechanism" not in dim.source
         assert dim.evidence and dim.evidence[0]["via"] == "wrapper_empty_provenance"
+    finally:
+        conn.close()
+
+
+# ── a marker must not vouch for the sinks it never looked at ─────────────────────────
+#
+# The blocking markers are FUNCTION-level: the writer sets const_sink_arg when SOME call in the
+# body passes a literal. A function with several sinks — `system("reboot")` beside a
+# `system(<unresolved>)` — therefore carries the marker for the whole candidate, and the marker
+# exits took it at face value: one constant call vouched for every other call in the same function,
+# overriding a per-sink record that had come back unknown.
+#
+# Measured on a real atlas: 25 candidates read proven:constant that way, every one of them a
+# multi-sink function whose def-use had actually returned None. Closing it moved exactly those 25
+# to unknown and touched nothing else — free, controllable and constrained counts unchanged.
+
+
+def _unknown_record(sink: str) -> dict[str, object]:
+    """A record for the same sink whose value the def-use pass could NOT resolve."""
+    return {
+        "sink": sink,
+        "sink_idx": 1,
+        "provenance": {
+            "kind": "stack_buf",
+            "nearest_dominating_writer": "snprintf@0x2",
+            "writers": [
+                {
+                    "writer": "snprintf@0x2",
+                    "dominates_sink": True,
+                    "fmt": "%s",
+                    "varargs": [
+                        {"pos": 3, "spec": "%s", "source": {"kind": "unresolved", "note": "phi"}}
+                    ],
+                }
+            ],
+        },
+    }
+
+
+def test_direct_multisink_const_marker_yields_to_unknown(tmp_path: Path) -> None:
+    """The main shape, and a DIRECT sink — not a wrapper one. Of the 25 candidates this fixes on a
+    real atlas, all 25 are direct.
+
+    `system("which envrams")` beside a `system(<buffer>)` whose contents did not resolve: the
+    literal call earns the marker, and the marker used to speak for the unresolved one too.
+
+    MUTATION (must go RED): drop `and not has_unsafe_record` from the constant marker exit ->
+    the literal call vouches for the unresolved one again."""
+    conn = _atlas(tmp_path)
+    try:
+        pid = _pattern(conn, "fp_multisink_direct")
+        ref = _inst(
+            conn,
+            pid,
+            sink_anchor="popen",
+            blocking="const_sink_arg",  # earned by the literal call, applied to the whole function
+            flow_evidence={
+                "source_kind": "unknown",
+                "sink_arg_provenance": [
+                    _const_record("popen", "which envrams"),
+                    _unknown_record("popen"),
+                ],
+            },
+        )
+        state, value = _dim_of(conn, ref)
+        assert (state, value) != ("proven", "constant")
+        assert state != "proven"
+    finally:
+        conn.close()
+
+
+def test_multisink_const_marker_yields_to_unknown_record(tmp_path: Path) -> None:
+    # The same shape reached through a wrapper. Same rule, no special case for the axis.
+    conn = _atlas(tmp_path)
+    try:
+        pid = _pattern(conn, "fp_multisink_wrapper")
+        ref = _inst(
+            conn,
+            pid,
+            sink_anchor="system",
+            blocking="const_sink_arg",
+            flow_evidence={
+                "source_kind": "unknown",
+                "flow_path": {
+                    "sink_via_wrapper": True,
+                    "wrapper": {"name": "do_cmd", "wrapped_sink": "system"},
+                },
+                "sink_arg_provenance": [
+                    _const_record("system", "/sbin/reboot"),
+                    _unknown_record("system"),
+                ],
+            },
+        )
+        assert _dim_of(conn, ref)[0] != "proven"
+    finally:
+        conn.close()
+
+
+def test_singlesink_constant_still_constant(tmp_path: Path) -> None:
+    """No collateral: when every record IS constant the reading stays proven:constant.
+
+    ★ HONEST LIMIT, measured rather than assumed: this does NOT distinguish the gate's two possible
+    spellings. Writing it as "any record at all vetoes" (dropping the `prov_verdict is None` half)
+    changes ZERO verdicts across a real atlas of 12803 candidates — because an all-constant record
+    set is caught by the provenance exit just below, which returns the same reading. What that
+    spelling would change is ATTRIBUTION: 217 candidates move from being credited to the marker to
+    being credited to the provenance. The precise spelling is kept because a gate should mean what
+    its name says and attribution should stay put, not because a wrong verdict is at stake.
+
+    The over-correction that IS dangerous is dropping the OTHER half — see
+    test_copy_const_size_unaffected_by_prefix, where the measurement is 3480 candidates."""
+    conn = _atlas(tmp_path)
+    try:
+        pid = _pattern(conn, "fp_singlesink_const")
+        ref = _inst(
+            conn,
+            pid,
+            sink_anchor="system",
+            blocking="const_sink_arg",
+            flow_evidence={"sink_arg_provenance": [_const_record("system", "/sbin/reboot")]},
+        )
+        assert _dim_of(conn, ref) == ("proven", "constant")
+    finally:
+        conn.close()
+
+
+def test_empty_provenance_const_size_still_constant(tmp_path: Path) -> None:
+    # Empty records leave the gate False, so a candidate the def-use pass does not cover reads
+    # exactly as it did. The fix narrows nothing that was already sound.
+    conn = _atlas(tmp_path)
+    try:
+        pid = _pattern(conn, "fp_empty_constsize")
+        ref = _inst(conn, pid, sink_anchor="strcpy", blocking="const_size")
+        assert _dim_of(conn, ref) == ("proven", "constant")
+    finally:
+        conn.close()
+
+
+def test_copy_const_size_unaffected_by_prefix(tmp_path: Path) -> None:
+    """Locks in the STRUCTURAL reason copy candidates are safe from this gate: def-use covers
+    command and format sinks only, so a copy sink never produces a record and the gate can never
+    become True for one.
+
+    Written as a regression rather than left implicit: if a future pass starts emitting records for
+    copy sinks, the gate would quietly start firing on thousands of them, and this is where that
+    shows up as a decision to make rather than a silent shift.
+
+    MUTATION (must go RED): drop the `bool(_scoped_records(...))` half of the gate (leaving
+    `has_unsafe_record = prov_verdict is None`) -> it fires on every candidate the def-use pass does
+    not cover. Measured on a real atlas: 3480 candidates demoted from proven:constant to unknown,
+    which is the false-positive flood this half exists to prevent."""
+    conn = _atlas(tmp_path)
+    try:
+        pid = _pattern(conn, "fp_copy_constsize", sink_class="copy")
+        ref = _inst(
+            conn,
+            pid,
+            sink_anchor="memcpy",
+            blocking="const_size",
+            flow_evidence={"source_kind": "unknown"},
+        )
+        row = conn.execute(
+            "SELECT flow_evidence FROM instance WHERE evidence_ref = ?", (ref,)
+        ).fetchone()
+        assert _scoped_records(row["flow_evidence"], "memcpy") == []
+        assert _dim_of(conn, ref) == ("proven", "constant")
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("marker", ["numeric_sanitized", "charset_constrained"])
+def test_constrained_marker_yields_to_unknown(tmp_path: Path, marker: str) -> None:
+    """The parallel door. One writer sets const_sink_arg AND the numeric / charset notes from the
+    same body, so closing only the constant exit would let the same candidate leave as
+    proven:constrained instead — a different word for the same unearned "proven".
+
+    ★ Zero live instances on the atlas measured (the one candidate carrying a constrained marker
+    beside an unknown record has source_kind=free_string and returns at the earlier free exit).
+    Closed anyway: the door is one source_kind away from being reachable, and a structural
+    possibility is what a gate is for.
+
+    MUTATION (must go RED): drop `and not has_unsafe_record` from the constrained marker exit."""
+    conn = _atlas(tmp_path)
+    try:
+        pid = _pattern(conn, f"fp_constrained_{marker}")
+        ref = _inst(
+            conn,
+            pid,
+            sink_anchor="system",
+            blocking=marker,
+            flow_evidence={
+                "source_kind": "unknown",
+                "sink_arg_provenance": [
+                    _const_record("system", "/bin/true"),
+                    _unknown_record("system"),
+                ],
+            },
+        )
+        state, value = _dim_of(conn, ref)
+        assert (state, value) != ("proven", "constrained")
+        assert state != "proven"
     finally:
         conn.close()

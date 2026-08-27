@@ -1026,6 +1026,20 @@ def _controllability_reading(
     computed by _verdict_from_provenance — the SAME classifier the explain rollup uses, so a
     candidate carries one controllability reading, never two that disagree."""
     prov_verdict = _verdict_from_provenance(conn, flow_evidence, sink_anchor)
+    # ★ "The provenance holds a record that was NOT shown to be constant."
+    #
+    # A marker is a FUNCTION-level reading: the writer sets const_sink_arg when SOME call in the
+    # body passes a literal. A function with several sinks — `system("reboot")` beside a
+    # `system(<unresolved>)` — therefore carries the marker for the whole candidate, and the marker
+    # exits below trusted it without ever looking at what the per-sink def-use actually found. One
+    # constant call vouched for every other call in the same function.
+    #
+    # `prov_verdict is None` is exactly the state to refuse: a controllable verdict already
+    # returned above, and an all-constant one returns "const", so None with records present means
+    # at least one record came back unknown. Empty records leave this False, which keeps every
+    # candidate the def-use pass does not cover (copy and path sinks get no record at all) reading
+    # exactly as before — the fix narrows nothing that was sound.
+    has_unsafe_record = bool(_scoped_records(flow_evidence, sink_anchor)) and prov_verdict is None
     if prov_verdict == "controllable":
         keys = _web_settable_keys_reaching_sink(conn, flow_evidence, sink_anchor)
         via = f"web-settable key '{keys[0]}'" if keys else "a user-settable source"
@@ -1065,11 +1079,21 @@ def _controllability_reading(
     #     OTHER sinks, so it comes out true vacuously.
     # Suppressing them drops the candidate to the source_kind fallback — the safe direction. Both
     # controllable steps above stay OPEN under the same condition: promoting on partial evidence
-    # costs a review, demoting on it hides a real one. If a future constant marker can prove the
-    # WRAPPED argument constant on its own, it belongs on an explicit allow-list with that proof
-    # written out; none does today.
+    # costs a review, demoting on it hides a real one.
+    #
+    # ★ TWO independent conditions gate the marker exit, and they catch different failures. This one
+    # asks whether the anchored sink left a record AT ALL; has_unsafe_record asks whether the
+    # records that exist all came back constant. A multi-sink function passes the first and fails
+    # the second, which is why the first alone let a literal in one call vouch for the rest.
+    #
+    # If a future constant marker can prove the WRAPPED argument constant on its own, it belongs on
+    # an explicit allow-list with that proof written out; none does today.
     const_trustworthy = not _anchor_missed(flow_evidence, sink_anchor)
-    if const_trustworthy and blocking_mechanism in PROVABLY_CONSTANT_MARKERS:
+    if (
+        const_trustworthy
+        and blocking_mechanism in PROVABLY_CONSTANT_MARKERS
+        and not has_unsafe_record
+    ):
         return Dimension(
             "controllability",
             "proven",
@@ -1123,7 +1147,14 @@ def _controllability_reading(
             "source_kind=charset_safe",
             "sink argument built inline by a charset-safe converter (MAC / IP / base64 shape)",
         )
-    if not via_wrapper_empty and blocking_mechanism in CONSTRAINED_MARKERS:
+    # The SAME refusal, on the parallel door. One writer sets const_sink_arg and the numeric /
+    # charset notes from the same body, so closing only the constant exit would let a candidate with
+    # an unknown record walk out as proven:constrained instead — a different word for the same
+    # unearned "proven".
+    if (
+        not via_wrapper_empty
+        and blocking_mechanism in CONSTRAINED_MARKERS
+    ):
         return Dimension(
             "controllability",
             "proven",
