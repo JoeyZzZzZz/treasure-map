@@ -1154,6 +1154,7 @@ def _controllability_reading(
     if (
         not via_wrapper_empty
         and blocking_mechanism in CONSTRAINED_MARKERS
+        and not has_unsafe_record
     ):
         return Dimension(
             "controllability",
