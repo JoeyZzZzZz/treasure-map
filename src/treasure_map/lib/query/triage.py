@@ -836,20 +836,30 @@ def get_sink_provenance(
     records = _sink_provenance_records(row[0])
     if not records:
         return {"evidence_ref": evidence_ref, "found": False, "note": "no_sink_provenance"}
+    # The origin fragments, alongside the records rather than inside them: a record says what the
+    # def-use pass saw at the sink, an origin says where that value came from. Read-time and
+    # derived — this call stores nothing and the controllability verdict never sees it.
+    origin = source_origin(conn, row[0], wrapper_names=_nvram_wrapper_names(conn))
     if sink_idx is None:
-        return {
+        out: dict[str, Any] = {
             "evidence_ref": evidence_ref,
             "found": True,
             "records": [_present_record(r, dominating_only=dominating_only) for r in records],
         }
+        if origin is not None:
+            out["source_origin"] = origin
+        return out
     for rec in records:
         if rec.get("sink_idx") == sink_idx:
-            return {
+            one: dict[str, Any] = {
                 "evidence_ref": evidence_ref,
                 "found": True,
                 "sink_idx": sink_idx,
                 "record": _present_record(rec, dominating_only=dominating_only),
             }
+            if origin is not None:
+                one["source_origin"] = origin
+            return one
     return {
         "evidence_ref": evidence_ref,
         "found": False,
@@ -933,6 +943,189 @@ def _nvram_source_key(
                     if key is not None:
                         return key
     return None
+
+
+# ── source_origin: the origin fragments the lower layers found and nobody handed on ──
+#
+# A candidate's headline says where its sink argument came from, and for four candidates in five it
+# says "unknown". Underneath, though, the analysis has often already recovered something: which
+# dispatch key routes to this function, which nvram accessor produced the value, which call it came
+# back from. Those fragments sit in the stored evidence and no reader ever turned them into an
+# answer — the same "a lower layer computed it, this one didn't read it" gap the nvram wrapper set
+# was fixed for.
+#
+# This turns them into ONE honest fact per candidate: not "the value is controllable", but "here is
+# where it comes from, go pull this thread". The distinction is the whole point of the layer.
+#
+# ★ READ-TIME, and that is load-bearing rather than a convenience. Nothing here writes
+# flow_evidence. The three keys the controllability verdict reads — sink_arg_provenance,
+# flow_path, source_kind — are not merely left alone, they are unreachable from this code: it
+# only ever reads. So "the origin axis cannot move a verdict" is true by construction, not by a
+# check someone has to keep passing.
+#
+# ★ NOT A VERDICT. An origin that resolves to a name nobody has classified stays `resolved: false`.
+# Naming the call a value came back from is a lead; deciding whether that value is attacker-shaped
+# is the reader's job, and the map does not pre-empt it.
+
+_SOURCE_ORIGIN_COMPLETENESS = (
+    "these are the origins RESOLVED for this candidate, not an exhaustive list of where its value "
+    "can come from. Resolution is one hop and intra-procedural: a key built in a caller, a "
+    "dispatch form the extractor does not recognise, or an indirect call all leave no fragment "
+    "here. An origin missing from this list was NOT ruled out — it was not recovered."
+)
+
+
+def _dispatch_origins(flow_evidence: str | None) -> list[dict[str, Any]]:
+    """Origins from the string-keyed dispatch leads: which key routes to this function.
+
+    Field names are the lead's own, read off real data rather than guessed — a lead carries
+    ``key`` / ``mechanism`` / ``through`` / ``via`` / ``hops`` and nothing else. Passing them
+    through under their own names keeps this a projection of the fact instead of a re-spelling of
+    it, and means a lead gaining a field does not silently drop it here."""
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for lead in _flow_list(flow_evidence, "reachability_leads"):
+        if not isinstance(lead, dict):
+            continue
+        origin = {
+            "axis": "dispatch",
+            "endpoint": lead.get("key"),
+            "mechanism": lead.get("mechanism"),
+            "through": lead.get("through"),
+            "lead_via": lead.get("via"),
+            "hops": lead.get("hops"),
+        }
+        marker = tuple(sorted((k, str(v)) for k, v in origin.items()))
+        if marker in seen:
+            continue
+        seen.add(marker)
+        out.append(origin)
+    return out
+
+
+def _provenance_origins(
+    flow_evidence: str | None, wrapper_names: frozenset[str]
+) -> list[dict[str, Any]]:
+    """Origins from the def-use records: the calls a sink argument's value came back from.
+
+    Walks the SAME places ``_nvram_source_key`` walks — each record's own provenance and the
+    varargs of its stack-buffer writers — because that is where an nvram value actually enters
+    (``snprintf("...%s", nvram_get(key))``). Reusing that traversal, and ``_nvram_key_from_source``
+    for the key itself, is deliberate: a second implementation of "is this an nvram read" would
+    drift from the one the controllability layer consults, and then the two would disagree about
+    the same candidate."""
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+
+    def add(origin: dict[str, Any]) -> None:
+        marker = tuple(sorted((k, str(v)) for k, v in origin.items()))
+        if marker not in seen:
+            seen.add(marker)
+            out.append(origin)
+
+    for rec in _sink_provenance_records(flow_evidence):
+        prov = rec.get("provenance")
+        prov = prov if isinstance(prov, dict) else {}
+        sources: list[Any] = [prov]
+        for writer in prov.get("writers") or []:
+            if not isinstance(writer, dict):
+                continue
+            for vararg in writer.get("varargs") or []:
+                if isinstance(vararg, dict):
+                    sources.append(vararg.get("source"))
+        for source in sources:
+            if not isinstance(source, dict) or source.get("kind") != "call_return":
+                continue
+            callee = source.get("callee")
+            if callee in NVRAM_GETTERS or callee in wrapper_names:
+                key = _nvram_key_from_source(source, wrapper_names)
+                origin = {
+                    "axis": "nvram",
+                    "key": key,
+                    "accessor": callee,
+                    "via_wrapper": callee if callee in wrapper_names else None,
+                }
+                if key is None:
+                    # The accessor is recognised but its key argument was not a resolved constant
+                    # — a key built or forwarded from somewhere this hop cannot see. Said out loud
+                    # rather than dropped: "an nvram value, key unknown" is a usable lead, and a
+                    # silent drop would read as "no nvram involved".
+                    origin["note"] = (
+                        "an nvram accessor feeds this sink, but its key argument was not a "
+                        "resolved constant here — the key is built or passed in from elsewhere"
+                    )
+                add(origin)
+            else:
+                # A call this layer has no classification for. Recorded as an origin because it IS
+                # one, and flagged unresolved because saying more would be inventing it.
+                add({"axis": "call_return", "callee": callee, "resolved": False})
+    return out
+
+
+def _origin_cross_references(conn: sqlite3.Connection, origins: list[dict[str, Any]]) -> None:
+    """Annotate origins whose name also appears in the web-form / nvram-default inventories.
+
+    ★ The field names state a MEMBERSHIP FACT — "this name appears in that table" — and nothing
+    more. They are deliberately not called `web_settable` or `controllable`: the proven
+    front-to-back cross is a separate judgement that the controllability layer already makes on its
+    own terms, and a name collision is exactly the kind of thing that looks like proof and is not.
+    An origin annotated here is a thread worth pulling, not a settled question."""
+    names = {o.get("key") for o in origins if o.get("axis") == "nvram" and o.get("key")}
+    names |= {
+        o.get("endpoint") for o in origins if o.get("axis") == "dispatch" and o.get("endpoint")
+    }
+    if not names:
+        return
+    in_defaults: set[str] = set()
+    in_web: set[str] = set()
+    placeholders = ",".join("?" for _ in names)
+    ordered = sorted(str(n) for n in names)
+    for table, column, sink in (
+        ("nvram_defaults", "key", in_defaults),
+        ("web_form_fields", "field_keyword", in_web),
+    ):
+        try:
+            rows = conn.execute(
+                f"SELECT DISTINCT {column} FROM {table} WHERE {column} IN ({placeholders})",  # noqa: S608 -- identifiers are literals
+                ordered,
+            ).fetchall()
+        except sqlite3.OperationalError:
+            continue  # an older atlas without the table: no annotation, never a claim either way
+        sink.update(r[0] for r in rows if r[0])
+    for origin in origins:
+        name = origin.get("key") if origin.get("axis") == "nvram" else origin.get("endpoint")
+        if not name:
+            continue
+        if name in in_defaults:
+            origin["name_in_nvram_defaults"] = True
+        if name in in_web:
+            origin["name_in_web_form_fields"] = True
+
+
+def source_origin(
+    conn: sqlite3.Connection,
+    flow_evidence: str | None,
+    *,
+    wrapper_names: frozenset[str] = frozenset(),
+) -> dict[str, Any] | None:
+    """Where this candidate's sink value comes from, as far as the analysis actually resolved it.
+
+    Returns None when nothing was resolved — mirroring ``reachability_leads``, which is absent
+    rather than empty when there are none, so a candidate with no fragments reads exactly as it did
+    and an empty list never masquerades as "we looked and there is no origin".
+
+    Read-only and derived: nothing here is stored, and the controllability verdict cannot see it.
+    """
+    origins = _dispatch_origins(flow_evidence) + _provenance_origins(flow_evidence, wrapper_names)
+    if not origins:
+        return None
+    _origin_cross_references(conn, origins)
+    return {
+        "origins": origins,
+        "resolved_count": len(origins),
+        "completeness": "resolved_only",
+        "note": _SOURCE_ORIGIN_COMPLETENESS,
+    }
 
 
 def _flow_path_obj(flow_evidence: str | None) -> dict[str, Any]:
@@ -2292,6 +2485,12 @@ class CandidateExplanation:
     # ``get_sink_provenance`` so a many-sink candidate never overruns the token budget. A surfaced
     # fact only; nothing here feeds recall or a grade.
     sink_arg_provenance_summary: tuple[dict[str, Any], ...]
+    # Where the sink value came FROM, as far as the analysis resolved it — the dispatch key that
+    # routes here, the nvram accessor that produced it, the call it came back from. Derived at read
+    # time from fragments the lower layers already recovered and nobody handed on; None when none
+    # were resolved (absent, never an empty list that would read as "there is no origin"). A lead
+    # to pull, never a controllability claim: see ``source_origin``.
+    source_origin: dict[str, Any] | None
 
 
 def _verify_steps(candidate: TriageCandidate) -> tuple[str, ...]:
@@ -2366,4 +2565,9 @@ def explain_candidate(conn: sqlite3.Connection, evidence_ref: str) -> CandidateE
         controllability_labeled=state_value_label(candidate.dim("controllability")),
         sink_impact_labeled=state_value_label(candidate.dim("sink_impact")),
         sink_arg_provenance_summary=_sink_provenance_summary(conn, _row_get(row, "flow_evidence")),
+        source_origin=source_origin(
+            conn,
+            _row_get(row, "flow_evidence"),
+            wrapper_names=_nvram_wrapper_names(conn),
+        ),
     )
