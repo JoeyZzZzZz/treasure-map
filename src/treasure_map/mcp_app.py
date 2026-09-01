@@ -86,9 +86,21 @@ from treasure_map.lib.query.diff_align import list_diffs as _list_diffs
 # recurrence signals are derived from neutral stored facts, carry their evidence, and are NOT a
 # security verdict.
 _DERIVED_SIGNAL_NOTE = (
-    "the dimension layers / entry_reach / device_spread / lens ordering are DERIVED, "
-    "evidence-backed facts — NOT a verdict. A candidate is a lead to verify, never a confirmed "
-    "issue; a '?' layer is a coverage gap, never 'safe'."
+    "the dimension layers / entry_reach / device_spread / lens ordering / blocking_mechanism are "
+    "DERIVED, evidence-backed facts — NOT a verdict. A candidate is a lead to verify, never a "
+    "confirmed issue; a '?' layer is a coverage gap, never 'safe'."
+)
+
+# The bare form note only reaches a reader through explain, which expands the whole candidate. It
+# is NOT in a list row, so this caveat is attached there and not to the standing note — putting it
+# on every list response would spend the response budget explaining a field that response does not
+# contain. (Adding it to the standing note overflowed that budget by 49 bytes, which is how the
+# placement got settled.)
+_BARE_FORM_NOTE_CAVEAT = (
+    "blocking_mechanism is a raw form note and its NAME can read like an all-clear: no_shell_exec "
+    "says the command runs without a shell, NOT that it cannot be injected — the argv and the "
+    "program path are untouched by it. Read the dimension it feeds, or evidence_surface, never the "
+    "bare string."
 )
 
 # Hard cap on a single list_candidates page so an over-large limit cannot blow up the context.
@@ -1063,6 +1075,9 @@ def make_tools(
         data = asdict(ex)
         data["found"] = True
         data["note"] = _DERIVED_SIGNAL_NOTE
+        # This payload expands the candidate, so the raw form note reaches the reader as a bare
+        # string. Frame it here, where it actually appears.
+        data["blocking_mechanism_note"] = _BARE_FORM_NOTE_CAVEAT
         data["atlas"] = str(atlas_path)
         data["coverage"] = coverage_state
         if coverage_state == "none":

@@ -1128,6 +1128,196 @@ def source_origin(
     }
 
 
+# ── evidence_surface: the length / format / exec-shape facts nobody reads ────────────
+#
+# Three analyses already run for every candidate and write their result into the stored evidence:
+# a copy candidate gets a length picture, a format candidate gets the format's argument position,
+# and a command candidate gets a neutral note about the shape of its exec. Part of that is consumed
+# by the controllability verdict. The rest is produced and read by nobody — a copy candidate's whole
+# length picture, a format candidate's position, and one of the command notes.
+#
+# The cost of that is concrete: every copy candidate's headline reads "unknown" with no length
+# information beside it, so an agent facing thousands of them has nothing to sort on. The facts to
+# sort on were computed and thrown away.
+#
+# ★ READ-TIME. Nothing here writes. The verdict reads the stored evidence string and the stored
+# marker column; this produces a display object from them and hands it to no one but the reader. So
+# it cannot move a verdict — not because a check says so, but because there is no path.
+#
+# ★ THE WORDING IS THE SAFETY PROPERTY, and it is stated here rather than cited from anywhere,
+# because committed code has to be self-sufficient. Two of these facts are shaped like reassurance
+# and are not:
+#
+#   * seeing a clamp shape is NOT a limit. The producer marks every clamp it records
+#     `coverage: unjudged` precisely because it did not decide whether the shape actually restricts
+#     the write, and that marking is carried through here untouched. Nothing downstream reads a
+#     clamp, so this surface is the FIRST and ONLY place in the chain where "a limit was checked"
+#     could be asserted — one reassuring sentence here would become the chain's only such claim,
+#     resting on nothing.
+#   * `no_shell_exec` is NOT "no command injection". It says this function's command capability is
+#     all exec-family, without a shell. Shell metacharacters stop meaning anything; the argv and the
+#     path an attacker may reach do not. The name reads like an all-clear, which makes it the
+#     strongest bait in the codebase for exactly the misreading above.
+#
+# So every entry states PRESENCE, never SUFFICIENCY: what shape was seen, plus what was not decided.
+# The reassuring vocabulary is kept OUT of the output entirely — not even inside a negation — so
+# that a crude search for it over this layer's output is a meaningful check rather than one that
+# trips over its own disclaimers.
+
+# The sink_class values a candidate's pattern carries. Not the CMD / FMT_STRING sets imported
+# above — those hold sink NAMES (system, vfprintf); these are the class strings stored on the
+# pattern row, and confusing the two silently matches nothing.
+_CLASS_COPY = "copy"
+_CLASS_FMT = "fmt_string"
+_CLASS_CMD = "cmd"
+_CLASS_PATH = "path_sink"
+
+_SURFACE_NOT_BOUNDED = (
+    "tmap has NOT decided whether this shape actually limits the write. A clamp recorded here "
+    "carries the producer's own coverage=unjudged: it was seen, not verified. Read it as a place "
+    "to look, never as a length that needs no checking."
+)
+_SURFACE_NOT_TRACED = (
+    "the length trace stopped before the sink, and stopping is not a clearing — the boundary value "
+    "says where the analysis ran out, not that nothing reaches here"
+)
+_SURFACE_EXEC_NOT_ASSERTED = (
+    "this does NOT rule out command injection. It says the command capability of this function is "
+    "exec-family without a shell, so shell metacharacters lose their meaning in the argument. What "
+    "an attacker may still reach — the argv entries, the program path — is untouched by that, and "
+    "tmap has judged neither."
+)
+
+# What each recorded length kind actually says, in words that state the shape and stop there.
+_SIZE_KIND_READING: dict[str, str] = {
+    "const": "the length is a compile-time constant",
+    "sizeof": "the length comes from a sizeof of the destination",
+    "variable": "the length comes from a variable — trace that variable's controllability",
+    "source_len": "the length comes from measuring the source (a strlen-shaped read of the input)",
+    "clamp": (
+        "the length passes through an upper-limit SHAPE. Whether that shape actually restricts the "
+        "write is NOT decided here"
+    ),
+    "pointer_guard": (
+        "the length relates to a pointer-range comparison SHAPE — a form observed, not a proof "
+        "that it restricts anything"
+    ),
+    "untraced": "the length was not traced at all — this is the absence of a fact, not a small one",
+}
+
+
+def _copy_surface(evidence: dict[str, Any]) -> dict[str, Any] | None:
+    """The length picture for a copy candidate, or None when the producer recorded none.
+
+
+    None rather than a shape full of nulls: a candidate whose length analysis produced nothing has
+    no picture, and an object saying `size_kind: null` invites reading a missing analysis as a
+    finished one. Measured on a real atlas, 678 of 6780 copy candidates are in that state."""
+    if "size_kind" not in evidence:
+        return None
+    kind = evidence.get("size_kind")
+    boundary = evidence.get("trace_boundary")
+    out: dict[str, Any] = {
+        "axis": "copy_length",
+        "size_kind": kind,
+        "size_flow": evidence.get("size_flow"),
+        # Verbatim, including each entry's own coverage marking. Re-summarising these is how the
+        # producer's "seen, not verified" would quietly become "checked".
+        "clamp_seen": evidence.get("clamp_seen") or [],
+        "trace_boundary": boundary,
+        "reading": _SIZE_KIND_READING.get(
+            str(kind), "the length kind recorded here is not one this reader knows how to describe"
+        ),
+    }
+    if out["clamp_seen"] or kind in ("clamp", "pointer_guard"):
+        out["not_asserted"] = _SURFACE_NOT_BOUNDED
+    if boundary and boundary != "reached_sink":
+        out["trace_incomplete"] = _SURFACE_NOT_TRACED
+    return out
+
+
+def _fmt_surface(evidence: dict[str, Any]) -> dict[str, Any] | None:
+    """Which argument of a format sink carries the format string.
+
+    A position of None means the analysis did not establish one — NOT that the format sits at
+    argument 0, and NOT that there is no format. It is reported as its own state for that reason;
+    on a real atlas 466 of 2068 format candidates are in it."""
+    if "fmt_arg_pos" not in evidence and "fmt_arg_literal" not in evidence:
+        return None
+    pos = evidence.get("fmt_arg_pos")
+    literal = evidence.get("fmt_arg_literal")
+    out: dict[str, Any] = {
+        "axis": "format_position",
+        "fmt_arg_pos": pos,
+        "fmt_arg_literal": literal,
+    }
+    if pos is None:
+        out["reading"] = (
+            "the format-string position was NOT established for this candidate — unknown, not "
+            "argument 0"
+        )
+    else:
+        out["reading"] = f"the format string is argument {pos} of the sink call"
+    if literal is None:
+        out["literal_state"] = (
+            "whether that argument is a literal was not established — read this as unknown, never "
+            "as 'not a literal'"
+        )
+    return out
+
+
+def _exec_shape_surface(blocking_mechanism: str | None) -> dict[str, Any] | None:
+    """The one command-side form note that no verdict consumes, given a frame to be read in.
+
+    Every other note this producer emits is read by the controllability layer and shows up there
+    with a state and a reading attached. This one is emitted, stored, and consumed by nothing — so
+    the only way it reaches anybody is as a bare string on the candidate, where a name that reads
+    like an all-clear arrives with nothing qualifying it. Giving it a frame is the point."""
+    if blocking_mechanism != "no_shell_exec":
+        return None
+    return {
+        "axis": "exec_shape",
+        "exec_shape": "no_shell_exec",
+        "reading": (
+            "every command sink this function can reach is exec-family and runs without a shell, "
+            "so shell metacharacters in the argument do not reach an interpreter"
+        ),
+        "coverage": "unjudged",
+        "not_asserted": _SURFACE_EXEC_NOT_ASSERTED,
+    }
+
+
+def evidence_surface(
+    flow_evidence: str | None,
+    sink_class: str | None,
+    blocking_mechanism: str | None = None,
+) -> dict[str, Any] | None:
+    """The already-computed length / format / exec-shape facts for one candidate, or None.
+
+    Dispatched on the candidate's sink class, because the three analyses are disjoint: a copy
+    candidate has a length picture and no format position, a command candidate has neither. None
+    when this candidate's class has no such analysis, or when the analysis recorded nothing —
+    absent rather than empty, so "no picture" can never read as "the picture is clear".
+
+    Derived and read-only. It states what shape was found and what was not decided; it decides
+    nothing, and it is not an input to any reading of controllability."""
+    evidence: dict[str, Any] = {}
+    if flow_evidence:
+        try:
+            parsed = json.loads(flow_evidence)
+        except (ValueError, TypeError):
+            parsed = None
+        if isinstance(parsed, dict):
+            evidence = parsed
+    if sink_class == _CLASS_COPY:
+        return _copy_surface(evidence)
+    if sink_class == _CLASS_FMT:
+        return _fmt_surface(evidence)
+    if sink_class in (_CLASS_CMD, _CLASS_PATH):
+        return _exec_shape_surface(blocking_mechanism)
+    return None
+
+
 def _flow_path_obj(flow_evidence: str | None) -> dict[str, Any]:
     """The stored flow_evidence.flow_path dict (sink_arg / one_hop / wrapper markers); {} when
     absent or unparsable."""
@@ -2491,6 +2681,12 @@ class CandidateExplanation:
     # were resolved (absent, never an empty list that would read as "there is no origin"). A lead
     # to pull, never a controllability claim: see ``source_origin``.
     source_origin: dict[str, Any] | None
+    # The length / format / exec-shape facts already computed for this candidate's class and
+    # consumed by nothing — a copy candidate's length picture, a format candidate's argument
+    # position, the one command form note no verdict reads. Derived at read time; None when the
+    # class has no such analysis or the analysis recorded nothing. States what shape was found and
+    # what was NOT decided — never that anything is bounded or safe. See ``evidence_surface``.
+    evidence_surface: dict[str, Any] | None
 
 
 def _verify_steps(candidate: TriageCandidate) -> tuple[str, ...]:
@@ -2569,5 +2765,10 @@ def explain_candidate(conn: sqlite3.Connection, evidence_ref: str) -> CandidateE
             conn,
             _row_get(row, "flow_evidence"),
             wrapper_names=_nvram_wrapper_names(conn),
+        ),
+        evidence_surface=evidence_surface(
+            _row_get(row, "flow_evidence"),
+            _row_get(row, "sink_class"),
+            _row_get(row, "blocking_mechanism"),
         ),
     )

@@ -441,15 +441,25 @@ def test_evidence_signals_do_not_feed_score_or_grade() -> None:
     #   - source_kind: the fine-grained controllability class — the controllability layer.
     #   - sanitizer_seen: a sanitizer-shaped call on the path — the filtering layer (near-always
     #     '?'; it can never prove coverage, so it neither ranks nor sinks a candidate).
-    # The purely interpretive fields below are surfaced by NO ranking-layer file at all.
-    never_surfaced = ("trace_boundary", "size_kind")
+    # No ranking-layer file may import the producer at all.
     for rel in ("lib/query/triage.py", "lib/hunt/downweight.py", "lib/reachability/grader.py"):
         text = (_SRC / rel).read_text()
         assert "hunt.evidence" not in text and "import evidence" not in text, (
             f"{rel} unexpectedly imports the evidence module"
         )
+    # The purely interpretive length fields must not reach anything that grades or downweights.
+    #
+    # ★ The read-side triage is no longer in that list. It now SURFACES those fields — read-only,
+    # in a display object handed to no verdict — because they were computed for every copy
+    # candidate and read by nobody, leaving an agent with thousands of headline-unknown candidates
+    # and nothing to sort on. The ban narrows to what it was protecting: the fields must not reach
+    # a GRADE. In triage that is enforced below by name, not by hoping the word stays absent.
+    never_surfaced = ("trace_boundary", "size_kind")
+    for rel in ("lib/hunt/downweight.py", "lib/reachability/grader.py"):
+        text = (_SRC / rel).read_text()
         for field in never_surfaced:
             assert field not in text, f"{rel} unexpectedly references evidence field {field!r}"
+    _assert_length_fields_stay_out_of_triage_verdicts()
     # The grader and the downweight must consume NONE of the evidence signals — not the layers the
     # triage surfaces (entry_reach / source_kind / sanitizer_seen) nor the raw flow_evidence. Only
     # the presentation-layer triage may surface a fact, and it drives no grade (there is no score).
@@ -457,3 +467,35 @@ def test_evidence_signals_do_not_feed_score_or_grade() -> None:
         text = (_SRC / rel).read_text()
         for field in ("entry_reach", "source_kind", "sanitizer_seen", "flow_evidence"):
             assert field not in text, f"{rel} unexpectedly references {field!r}"
+
+
+def _assert_length_fields_stay_out_of_triage_verdicts() -> None:
+    """In triage, the interpretive length fields may be named ONLY by the surface builders.
+
+    The blanket "this word must not appear" ban was expressible while nothing consumed these
+    fields. Once the read side surfaces them it stops being expressible, and dropping it entirely
+    would give up the thing it protected. So it narrows to the property that matters — no function
+    that produces a Dimension may read them — and is enforced by looking at which functions
+    actually mention them rather than at whether the file does.
+
+    MUTATION (must go RED): read size_kind or trace_boundary inside any Dimension-producing
+    function in triage.
+    """
+    import ast
+
+    tree = ast.parse((_SRC / "lib/query/triage.py").read_text())
+    allowed = {"_copy_surface", "evidence_surface"}
+    offenders: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef) or node.name in allowed:
+            continue
+        named = {
+            inner.value
+            for inner in ast.walk(node)
+            if isinstance(inner, ast.Constant)
+            and isinstance(inner.value, str)
+            and inner.value in ("trace_boundary", "size_kind")
+        }
+        if named:
+            offenders[node.name] = named
+    assert not offenders, f"length fields named outside the surface builders: {offenders}"
