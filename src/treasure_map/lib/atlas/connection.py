@@ -267,6 +267,14 @@ def _migrate(conn: sqlite3.Connection) -> None:
         if "verdict_basis" not in _column_names(conn, "overlay"):
             conn.execute("ALTER TABLE overlay ADD COLUMN verdict_basis TEXT")
 
+    # run.hunt_commit (added this round): which tmap commit produced this run's instances, so a
+    # re-hunt can be skipped when the code that would run is the same code that already ran.
+    # Nullable on purpose — a run hunted before this column existed carries NULL, which compares
+    # equal to no commit and therefore re-hunts. Idempotent; runs only while the column is missing.
+    run_cols = _column_names(conn, "run")
+    if run_cols and "hunt_commit" not in run_cols:
+        conn.execute("ALTER TABLE run ADD COLUMN hunt_commit TEXT")
+
 
 def open_atlas(db_path: Path) -> sqlite3.Connection:
     """Open (or create) the atlas SQLite database and apply the schema.

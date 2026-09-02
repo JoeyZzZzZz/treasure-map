@@ -13,8 +13,10 @@ complete. Read-only; no verdict.
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import dataclass
 
 from treasure_map.lib.atlas.models import RunRow
+from treasure_map.version import UNKNOWN_VERSION
 
 _RUN_COLUMNS = (
     "run_id",
@@ -22,6 +24,7 @@ _RUN_COLUMNS = (
     "firmware_path",
     "firmware_sha256",
     "build_hash",
+    "hunt_commit",
     "tool_version",
     "ghidra_version",
     "machine",
@@ -41,6 +44,7 @@ def _row_to_runrow(row: sqlite3.Row) -> RunRow:
         firmware_path=row["firmware_path"],
         firmware_sha256=row["firmware_sha256"],
         build_hash=row["build_hash"],
+        hunt_commit=row["hunt_commit"],
         tool_version=row["tool_version"],
         ghidra_version=row["ghidra_version"],
         machine=row["machine"],
@@ -122,3 +126,90 @@ def list_runs(conn: sqlite3.Connection) -> list[RunRow]:
         if r[0] not in known
     ]
     return resolved + unresolved
+
+
+@dataclass(frozen=True)
+class Staleness:
+    """Whether a run's stored result was PROVABLY produced by different code than is running now.
+
+    ★ The bar is a positive mismatch — two real values that differ — never a failure to confirm a
+    match. That is the opposite bar from the hunt-skip decision, and deliberately so: skipping work
+    on an unconfirmed match risks serving a stale answer as fresh, while refusing to answer on an
+    unconfirmed match makes every pre-stamp run unreadable and every editable install permanently
+    mute. So a missing stamp, an unreadable hash, and an install with no recorded commit all read
+    as "cannot tell", which this layer reports as a caveat and never as a refusal.
+
+    ``axis`` names WHICH input changed: 'extraction' (the facts in the analysis.db would be
+    re-derived differently) or 'hunt' (the same facts would be graded differently). ``remedy`` is
+    the concrete command, which depends on whether the run recorded a firmware root to re-read.
+    """
+
+    stale: bool
+    axis: str | None
+    detail: str
+    remedy: str
+
+
+def _remedy_for(run: RunRow) -> str:
+    if run.firmware_path:
+        return f"`tmap rescan {run.run_id}` re-reads {run.firmware_path} and refreshes this run."
+    return (
+        f"this run recorded no firmware root, so it cannot be re-read automatically — "
+        f"`tmap scan <firmware-root> --run-id {run.run_id}` once you have the extracted firmware."
+    )
+
+
+def run_staleness(run: RunRow, *, build_hash: str | None, commit: str) -> Staleness:
+    """Compare a run's stored lineage against the code running now.
+
+    ``build_hash`` is the extraction pipeline's current content hash and ``commit`` the running
+    install's commit; either may be unknown, which yields a not-stale result with a stated reason.
+    """
+    stored_build = run.build_hash
+    if (
+        stored_build
+        and build_hash
+        # 'mixed:N' is a count, not a hash: the run's binaries were extracted by more than one
+        # pipeline version. It cannot be compared, so it is reported as unconfirmable rather than
+        # decided either way.
+        and not stored_build.startswith("mixed:")
+        and stored_build != build_hash
+    ):
+        return Staleness(
+            True,
+            "extraction",
+            f"extracted by pipeline {stored_build}, running {build_hash} — the facts stored for "
+            "this run would be re-derived differently by the code answering you now.",
+            _remedy_for(run),
+        )
+    if (
+        run.hunt_commit
+        and run.hunt_commit != UNKNOWN_VERSION
+        and commit != UNKNOWN_VERSION
+        and run.hunt_commit != commit
+    ):
+        return Staleness(
+            True,
+            "hunt",
+            f"hunted by tmap {run.hunt_commit[:12]}, running {commit[:12]} — the candidates stored "
+            "for this run were graded by different code than is answering you now.",
+            _remedy_for(run),
+        )
+    # Not provably stale. Say which comparisons could not be made, so "not stale" is never read as
+    # "confirmed current" when in fact nothing was comparable.
+    unknowns = []
+    if not stored_build or not build_hash or (stored_build or "").startswith("mixed:"):
+        unknowns.append("extraction hash")
+    if not run.hunt_commit or run.hunt_commit == UNKNOWN_VERSION or commit == UNKNOWN_VERSION:
+        unknowns.append("hunt commit")
+    if unknowns:
+        return Staleness(
+            False,
+            None,
+            f"could not compare {' or '.join(unknowns)} for this run — not shown to be stale, "
+            "which is not the same as shown to be current.",
+            _remedy_for(run),
+        )
+    return Staleness(
+        False, None, "extraction hash and hunt commit both match the running tmap.", ""
+    )

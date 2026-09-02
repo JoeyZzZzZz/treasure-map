@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Any
 
 import click
 
+from treasure_map.version import UNKNOWN_VERSION, installed_commit
+
 if TYPE_CHECKING:
     from treasure_map.lib.atlas.models import RunRow
     from treasure_map.lib.query import CandidateExplanation, TriageCandidate
@@ -289,6 +291,14 @@ def hunt_diff(
     help="Path to config.yaml (overrides ~/.treasure-map/config.yaml).",
 )
 @click.option(
+    "--rehunt",
+    is_flag=True,
+    default=False,
+    help="Hunt again even when this run's stored candidates were already produced by this tmap "
+    "commit from this extraction. The skip exists because that pair reproduces the same result; "
+    "use this to re-run it anyway (e.g. to check that it still does).",
+)
+@click.option(
     "--atlas",
     "atlas_path",
     type=click.Path(path_type=Path),
@@ -298,6 +308,7 @@ def hunt_diff(
 def hunt_pattern(
     db: Path,
     run_id: str,
+    rehunt: bool,
     config: Path | None,
     atlas_path: Path | None,
 ) -> None:
@@ -312,11 +323,17 @@ def hunt_pattern(
 
     cfg = load_config(config)
     resolved_atlas = atlas_path if atlas_path is not None else cfg.atlas.db_path
-    stats = run_analyzer2(db, resolved_atlas, source_run_id=run_id)
+    stats = run_analyzer2(db, resolved_atlas, source_run_id=run_id, rehunt=rehunt)
     # Record this as the last run so `tmap mcp` can serve it without explicit paths.
     write_last_run(db, resolved_atlas, run_id)
 
     click.echo(f"Atlas: {resolved_atlas}")
+    if stats.skipped:
+        # Reported before the counts, which are all zero on a skip and would otherwise read as a
+        # hunt that ran and found nothing.
+        click.echo(f"  Hunt SKIPPED      : {stats.hunt_currency}")
+        click.echo("                      stored candidates kept; --rehunt runs it anyway")
+        return
     click.echo(f"  Functions scanned : {stats.scanned}")
     click.echo(f"  Shape candidates  : {stats.matches}")
     click.echo(f"  Instances written : {stats.instances_written}")
@@ -1173,6 +1190,14 @@ def atlas_view(view: str, config: Path | None, atlas_path: Path | None) -> None:
     "invalidated (the full-update path).",
 )
 @click.option(
+    "--rehunt",
+    is_flag=True,
+    default=False,
+    help="Hunt again even when this run's stored candidates were already produced by this tmap "
+    "commit from this extraction. The skip exists because that pair reproduces the same result; "
+    "use this to re-run it anyway (e.g. to check that it still does).",
+)
+@click.option(
     "--config",
     "-c",
     type=click.Path(exists=True, path_type=Path),
@@ -1199,6 +1224,7 @@ def scan(
     skip_non_binary: bool,
     skip_ingesters: tuple[str, ...],
     reanalyze: str | None,
+    rehunt: bool,
     config: Path | None,
     atlas_path: Path | None,
 ) -> None:
@@ -1287,15 +1313,22 @@ def scan(
             resolved_atlas,
             source_run_id=effective_run_id,
             firmware_path=str(fs_root),
+            rehunt=rehunt,
         )
     except TreasureMapError as exc:
         raise click.ClickException(f"{type(exc).__name__}: {exc}") from exc
-    click.echo(
-        f"      → {h.instances_written} candidates written "
-        f"(confirmed={h.by_status.get('confirmed', 0)}, "
-        f"blocked={h.by_status.get('blocked', 0)}, "
-        f"unknown={h.by_status.get('unknown', 0)})"
-    )
+    if h.skipped:
+        # Said out loud, because the counts below would otherwise print as zeros and read as a
+        # hunt that found nothing. The stored candidates are untouched and still queryable.
+        click.echo(f"      → hunt SKIPPED — {h.hunt_currency}; stored candidates kept as they are")
+        click.echo("        (--rehunt runs it anyway)")
+    else:
+        click.echo(
+            f"      → {h.instances_written} candidates written "
+            f"(confirmed={h.by_status.get('confirmed', 0)}, "
+            f"blocked={h.by_status.get('blocked', 0)}, "
+            f"unknown={h.by_status.get('unknown', 0)})"
+        )
     if h.data_gap_skipped:
         # Honesty flag: matches whose body Ghidra could not decompile were dropped — candidate
         # set is incomplete for this run (a real sink can hide in an un-decompilable function).
@@ -1342,3 +1375,171 @@ def scan(
         include_gated=include_gated,
         as_json=as_json,
     )
+
+
+def _rescan_reason(run: RunRow, *, commit: str) -> str | None:
+    """Why this run is out of date with the running tmap, or None when it is current.
+
+    Mirrors the hunt-side currency rule and lands on "out of date" wherever sameness cannot be
+    CONFIRMED, so an unstamped or unknown-commit run is offered for rescan rather than passed
+    over — the cost of an unnecessary rescan is time, the cost of a missed one is a stale answer
+    that reads exactly like a fresh one.
+    """
+    if commit == UNKNOWN_VERSION:
+        return "the running install records no commit, so currency cannot be confirmed"
+    if run.scan_status != "complete":
+        return f"previous run did not finish (scan_status={run.scan_status})"
+    if not run.hunt_commit:
+        return "hunted before the commit stamp existed"
+    if run.hunt_commit == UNKNOWN_VERSION:
+        return "hunted by an install that recorded no commit"
+    if run.hunt_commit != commit:
+        return f"hunted by {run.hunt_commit[:12]}, running {commit[:12]}"
+    return None
+
+
+@click.command("rescan", short_help="Re-run scans that predate the running tmap")
+@click.argument("run_ids", nargs=-1, shell_complete=_complete_run_id)
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Rescan the selected runs even when they are already current (re-runs the hunt too).",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="List what would be rescanned and why, without running anything.",
+)
+@click.option(
+    "--config",
+    "-c",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Path to config.yaml (overrides ~/.treasure-map/config.yaml).",
+)
+@click.option(
+    "--atlas",
+    "atlas_path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Atlas DB path (defaults to the configured atlas.db_path).",
+)
+@click.pass_context
+def rescan(
+    ctx: click.Context,
+    run_ids: tuple[str, ...],
+    force: bool,
+    dry_run: bool,
+    config: Path | None,
+    atlas_path: Path | None,
+) -> None:
+    """Bring runs scanned by an older tmap up to date with the one installed now.
+
+    With no arguments, selects every run whose stored result was NOT produced by this tmap commit.
+    Name run ids to scope it. Each selected run is re-driven through the full `tmap scan` path on
+    the firmware root it recorded, so it picks up whatever the extraction and the hunt learned to
+    do since. Runs already produced by this commit are left alone (--force re-runs them anyway).
+
+    A run whose firmware root was never recorded, or is no longer on disk, CANNOT be rescanned —
+    those are listed by name with the reason. They are never dropped from the report: a run that
+    silently vanishes from a refresh list reads as one that did not need refreshing.
+    """
+    from treasure_map.lib.atlas.connection import open_atlas
+    from treasure_map.lib.config.config import load_config
+    from treasure_map.lib.query import list_runs as run_list_runs
+
+    cfg = load_config(config)
+    resolved_atlas = atlas_path if atlas_path is not None else cfg.atlas.db_path
+    conn = open_atlas(resolved_atlas)
+    try:
+        all_runs = run_list_runs(conn)
+    finally:
+        conn.close()
+
+    if run_ids:
+        known = {r.run_id for r in all_runs}
+        missing = [rid for rid in run_ids if rid not in known]
+        if missing:
+            raise click.ClickException(
+                f"no such run in {resolved_atlas}: {', '.join(missing)} — `tmap runs` lists them"
+            )
+        selected = [r for r in all_runs if r.run_id in set(run_ids)]
+    else:
+        selected = list(all_runs)
+
+    commit = installed_commit()
+    click.echo(f"atlas: {resolved_atlas}")
+    unstamped = (
+        "  (this install records no commit, so no run can be shown current)"
+        if commit == UNKNOWN_VERSION
+        else ""
+    )
+    click.echo(f"running tmap commit: {commit}{unstamped}")
+
+    todo: list[tuple[RunRow, str]] = []
+    current: list[RunRow] = []
+    for r in selected:
+        reason = _rescan_reason(r, commit=commit)
+        if reason is None and not force:
+            current.append(r)
+        else:
+            todo.append((r, reason or "--force"))
+
+    # Split by whether the firmware is actually there to be re-read. Both halves are REPORTED;
+    # only the first can be acted on.
+    runnable: list[tuple[RunRow, str]] = []
+    unrunnable: list[tuple[RunRow, str]] = []
+    for r, reason in todo:
+        if not r.firmware_path:
+            unrunnable.append((r, "no firmware root recorded for this run"))
+        elif not Path(r.firmware_path).is_dir():
+            unrunnable.append((r, f"firmware root is gone: {r.firmware_path}"))
+        else:
+            runnable.append((r, reason))
+
+    if current:
+        click.echo(f"\nup to date ({len(current)}): {', '.join(r.run_id for r in current)}")
+    if unrunnable:
+        click.echo(f"\nCANNOT rescan ({len(unrunnable)}) — out of date but not re-readable:")
+        for r, why in unrunnable:
+            click.echo(f"  {r.run_id}: {why}")
+    if not runnable:
+        click.echo("\nnothing to rescan.")
+        return
+
+    click.echo(f"\nto rescan ({len(runnable)}):")
+    for r, why in runnable:
+        click.echo(f"  {r.run_id}: {why}")
+    if dry_run:
+        click.echo("\n--dry-run: nothing was run.")
+        return
+
+    failed: list[tuple[str, str]] = []
+    for i, (r, _why) in enumerate(runnable, start=1):
+        click.echo(f"\n=== [{i}/{len(runnable)}] rescanning {r.run_id} ===")
+        try:
+            ctx.invoke(
+                scan,
+                fs_root=Path(str(r.firmware_path)),
+                run_id=r.run_id,
+                atlas_path=resolved_atlas,
+                config=config,
+                rehunt=force,
+                # This command refreshes; it does not read. The candidate list is a separate act —
+                # `tmap triage <run>` — so a multi-run rescan does not bury its own summary.
+                top_n=0,
+            )
+        except click.ClickException as exc:
+            # One firmware failing must not abandon the rest: the others are still refreshable,
+            # and a half-done rescan that stops silently is worse than one that says what broke.
+            click.echo(f"  FAILED: {exc.format_message()}", err=True)
+            failed.append((r.run_id, exc.format_message()))
+
+    click.echo(f"\nrescanned {len(runnable) - len(failed)}/{len(runnable)}")
+    if failed:
+        click.echo(f"failed ({len(failed)}):")
+        for rid, msg in failed:
+            click.echo(f"  {rid}: {msg}")
+    click.echo("`tmap triage <run-id>` for the refreshed candidate list.")

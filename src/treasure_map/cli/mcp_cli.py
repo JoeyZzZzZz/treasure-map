@@ -10,14 +10,62 @@ construction (the CLI and MCP are two thin wrappers over one query, never two im
 from __future__ import annotations
 
 import json
+import sqlite3
 
 import click
 
 from treasure_map.lib import facts
+from treasure_map.lib.analyze.ghidra_runner import current_pass_version
 
 
 def _emit(record: dict[str, object]) -> None:
     click.echo(json.dumps(record, indent=2, sort_keys=True))
+
+
+def _stale_extract(conn: sqlite3.Connection) -> str | None:
+    """A note when this analysis.db was extracted by a different pipeline than is installed now.
+
+    ANNOTATION, never a refusal. This command reads an analysis.db the caller named directly, and
+    a person reading facts out of an older extraction on purpose is a normal thing to do — a
+    cross-check against a previous pipeline is precisely why the file is still on disk. So the
+    mismatch is stated and the fact is still printed. (The MCP path refuses instead: an agent
+    routes by run_id, has no reason to have chosen an old extraction, and cannot tell one from the
+    other in the answer.)
+
+    Returns None when the comparison cannot be made — an analysis.db too old to record a pipeline
+    version, or one whose binaries carry more than one. Absence of a note is "nothing to say", not
+    "confirmed current".
+    """
+    try:
+        versions = [
+            r[0]
+            for r in conn.execute(
+                "SELECT DISTINCT pass_version FROM current_binaries WHERE pass_version IS NOT NULL"
+            ).fetchall()
+        ]
+    except sqlite3.OperationalError:
+        # An analysis.db predating the column. Nothing to compare against.
+        return None
+    if len(versions) != 1:
+        return None
+    current = current_pass_version()
+    if versions[0] == current:
+        return None
+    return (
+        f"stale_extract: this analysis.db was extracted by pipeline {versions[0]}, the installed "
+        f"tmap runs {current}. The fact below is what THAT extraction recorded; re-scanning the "
+        "firmware may produce a different one."
+    )
+
+
+def _emit_fact(conn: sqlite3.Connection, record: dict[str, object]) -> None:
+    """Print one fact, carrying an extraction-staleness note when there is one to carry."""
+    note = _stale_extract(conn)
+    if note is not None:
+        # A separate key, never folded into the record's own note field: two independent honest
+        # statements each need their own slot, or one silently overwrites the other.
+        record = {**record, "stale_extract_warning": note}
+    _emit(record)
 
 
 @click.group(
@@ -36,7 +84,7 @@ def pseudocode(function: str, binary: str | None, analysis_db: str) -> None:
     """Print the decompiler pseudocode for FUNCTION (name or address)."""
     conn = facts.open_analysis_ro(analysis_db)
     try:
-        _emit(facts.get_pseudocode(conn, func=function, binary=binary))
+        _emit_fact(conn, facts.get_pseudocode(conn, func=function, binary=binary))
     finally:
         conn.close()
 
@@ -49,7 +97,7 @@ def callees(function: str, binary: str | None, analysis_db: str) -> None:
     """Print the direct callees of FUNCTION (intra-binary edges flagged resolved)."""
     conn = facts.open_analysis_ro(analysis_db)
     try:
-        _emit(facts.get_callees(conn, func=function, binary=binary))
+        _emit_fact(conn, facts.get_callees(conn, func=function, binary=binary))
     finally:
         conn.close()
 
@@ -69,7 +117,7 @@ def xrefs(function: str, direction: str, binary: str | None, analysis_db: str) -
     d: facts.XrefDirection = "callees" if direction == "callees" else "callers"
     conn = facts.open_analysis_ro(analysis_db)
     try:
-        _emit(facts.get_xrefs(conn, func=function, direction=d, binary=binary))
+        _emit_fact(conn, facts.get_xrefs(conn, func=function, direction=d, binary=binary))
     finally:
         conn.close()
 
@@ -81,7 +129,7 @@ def script_callsites(binary: str, analysis_db: str) -> None:
     """Print the rootfs scripts that invoke BINARY (entry-reach evidence)."""
     conn = facts.open_analysis_ro(analysis_db)
     try:
-        _emit(facts.get_script_callsites(conn, binary=binary))
+        _emit_fact(conn, facts.get_script_callsites(conn, binary=binary))
     finally:
         conn.close()
 

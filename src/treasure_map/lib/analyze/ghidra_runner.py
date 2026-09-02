@@ -22,6 +22,7 @@ import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -140,6 +141,18 @@ def compute_pass_version(script_dir: Path) -> str:
         h.update(b"\0")
         h.update(body)
     return h.hexdigest()[:16]
+
+
+@lru_cache(maxsize=1)
+def current_pass_version() -> str:
+    """The extraction fingerprint of the pipeline THIS install would run, for staleness reads.
+
+    The same value ``GhidraRunner.pass_version()`` stamps onto a binary it extracts, computed
+    without constructing a runner — a reader comparing a stored run against the current code needs
+    the number, not a Ghidra installation. Cached: the source files cannot change under a running
+    process in any way this value should follow mid-session.
+    """
+    return compute_pass_version(_SCRIPT_DIR)
 
 
 def detect_ghidra_version(headless: Path) -> str:

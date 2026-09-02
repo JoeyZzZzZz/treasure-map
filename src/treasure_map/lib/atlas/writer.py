@@ -676,6 +676,11 @@ def begin_run(
                tool_version     = excluded.tool_version,
                ghidra_version   = excluded.ghidra_version,
                machine          = excluded.machine,
+               -- The stamp says "this commit produced the instances in the table". The caller is
+               -- about to DELETE those instances and write new ones, so the old stamp stops being
+               -- true right here — clearing it means a crash mid-write leaves no claim of currency
+               -- behind, rather than one describing rows that no longer exist.
+               hunt_commit      = NULL,
                scan_status      = 'in_progress',
                scanned_at       = CURRENT_TIMESTAMP,
                updated_at       = CURRENT_TIMESTAMP""",
@@ -702,29 +707,36 @@ def finish_run(
     binaries: int | None = None,
     functions: int | None = None,
     functions_empty: int | None = None,
+    hunt_commit: str | None = None,
     commit: bool = True,
 ) -> None:
     """Mark a run's scan FINISHED: set scan_status (default 'complete') + the analysis counts.
 
     Called AFTER the run's instances are committed. If the row is missing (a code path that skipped
-    begin_run) it is inserted, so a finished run is never invisible in list_runs."""
+    begin_run) it is inserted, so a finished run is never invisible in list_runs.
+
+    ``hunt_commit`` records WHICH tmap produced the instances just committed. Passing None leaves
+    any existing stamp untouched rather than clearing it — a caller that does not know the commit
+    has no grounds to erase one that a previous hunt established. The stamp is what lets a later
+    run decide the stored result is reproducible and skip re-hunting it."""
     if scan_status not in ("in_progress", "complete", "partial", "failed"):
         raise ConfigError(
             f"scan_status must be in_progress/complete/partial/failed; got {scan_status!r}"
         )
     cur = conn.execute(
         """UPDATE run SET scan_status = ?, binaries = ?, functions = ?, functions_empty = ?,
+               hunt_commit = COALESCE(?, hunt_commit),
                updated_at = CURRENT_TIMESTAMP
            WHERE run_id = ?""",
-        (scan_status, binaries, functions, functions_empty, run_id),
+        (scan_status, binaries, functions, functions_empty, hunt_commit, run_id),
     )
     if cur.rowcount == 0:
         conn.execute(
             """INSERT INTO run
-                   (run_id, scan_status, binaries, functions, functions_empty,
+                   (run_id, scan_status, binaries, functions, functions_empty, hunt_commit,
                     scanned_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)""",
-            (run_id, scan_status, binaries, functions, functions_empty),
+               VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)""",
+            (run_id, scan_status, binaries, functions, functions_empty, hunt_commit),
         )
     if commit:
         conn.commit()

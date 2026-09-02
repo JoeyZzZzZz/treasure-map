@@ -81,6 +81,10 @@ class RunRow:
     firmware_path: str | None = None
     firmware_sha256: str | None = None
     build_hash: str | None = None
+    # The tmap commit that produced this run's INSTANCES, when the install that hunted it recorded
+    # one. None on a run hunted before the stamp existed, and 'unknown' when the hunting install
+    # had no commit to record — neither is a commit, so neither ever reads as "up to date".
+    hunt_commit: str | None = None
     tool_version: str | None = None
     ghidra_version: str | None = None
     machine: str | None = None

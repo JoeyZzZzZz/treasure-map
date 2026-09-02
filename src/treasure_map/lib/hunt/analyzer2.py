@@ -24,6 +24,7 @@ import hashlib
 import json
 import logging
 import sqlite3
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -101,7 +102,7 @@ from treasure_map.lib.pattern.classes import (
 from treasure_map.lib.query.nvram import template_has_anchor
 from treasure_map.lib.reachability import grade_candidate
 from treasure_map.lib.reachability.taint import _IDENT_RE, locate_sink_arg
-from treasure_map.version import __version__
+from treasure_map.version import UNKNOWN_VERSION, __version__, installed_commit
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +189,82 @@ class Analyzer2Stats:
     # unknown. They stay in the corpus and stay queryable; the read-side ladder ranks them below a
     # controllable source. Counted so the summary shows how much of the fmt axis rests on a '?'.
     fmt_wrapper_unknown_source_demoted: int = 0
+    # Whether this call SKIPPED the hunt because an equally-current result was already stored.
+    # A skip writes nothing, so every count above stays 0 — ``skipped`` is what separates "the
+    # hunt ran and found nothing" from "the hunt did not run", which the counts alone cannot say.
+    skipped: bool = False
+    # Why the hunt ran or was skipped, in words, ALWAYS set. Reported by the caller so the decision
+    # is visible rather than inferred from a silent absence of output.
+    hunt_currency: str = "hunt ran"
+
+
+@dataclass(frozen=True)
+class HuntCurrency:
+    """Whether a stored hunt result was produced by THIS code from THIS extraction.
+
+    ``current`` True means re-running the hunt would reproduce what is already stored, so the
+    work can be skipped. It rests on ONE measured property — that the hunt is deterministic over
+    its content columns given the same analysis.db and the same code — which is why both inputs
+    must match, and why every way of failing to CONFIRM a match (a missing row, an unrecorded
+    commit, an unfinished previous hunt) lands on False. ``reason`` states what was established, in
+    words either way, so the decision is reported rather than inferred from silence.
+    """
+
+    current: bool
+    reason: str
+
+
+def hunt_currency(
+    run_row: Mapping[str, object] | None,
+    *,
+    build_hash: str | None,
+    commit: str,
+) -> HuntCurrency:
+    """Decide whether a stored hunt result is reproducible by the current code + extraction.
+
+    ★ Every branch that cannot CONFIRM sameness returns not-current. Skipping is the destructive
+    direction here: a wrongly-skipped hunt leaves stale candidates that read exactly like fresh
+    ones, while a wrongly-repeated hunt costs only time. So an unknown commit (an install with no
+    recorded commit), a NULL stamp (a run hunted before the stamp existed), a missing lineage hash
+    and an unfinished previous hunt all re-hunt.
+    """
+    if run_row is None:
+        return HuntCurrency(False, "no stored hunt for this run")
+    status = run_row.get("scan_status")
+    if status != "complete":
+        # An 'in_progress' row is the honest half-written signal begin_run leaves behind; its
+        # instances are whatever the crash happened to commit, so they are not a result to keep.
+        return HuntCurrency(False, f"previous hunt did not finish (scan_status={status!r})")
+    if commit == UNKNOWN_VERSION:
+        return HuntCurrency(
+            False, "the running install records no commit, so sameness cannot be confirmed"
+        )
+    stored_commit = run_row.get("hunt_commit")
+    if stored_commit != commit:
+        shown = stored_commit if stored_commit else "none recorded"
+        return HuntCurrency(False, f"hunted by a different tmap ({shown} != {commit})")
+    if build_hash is None:
+        return HuntCurrency(False, "this analysis.db records no extraction hash")
+    if run_row.get("build_hash") != build_hash:
+        return HuntCurrency(False, "the extraction changed since this run was hunted")
+    return HuntCurrency(True, f"already hunted by this tmap ({commit[:12]}) from this extraction")
+
+
+def _stored_run_row(atlas_path: Path | str, run_id: str) -> dict[str, object] | None:
+    """The atlas ``run`` row for run_id, or None when the atlas has no such run (or no column)."""
+    conn = open_atlas(Path(atlas_path))
+    try:
+        try:
+            row = conn.execute(
+                "SELECT scan_status, hunt_commit, build_hash FROM run WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        except sqlite3.OperationalError:
+            # An atlas whose run table predates hunt_commit. Reading this as "no row" makes the
+            # currency check answer not-current, i.e. re-hunt — the conservative direction.
+            return None
+        return dict(row) if row is not None else None
+    finally:
+        conn.close()
 
 
 def _load_known_components(db_path: Path | str) -> set[str]:
@@ -899,6 +976,7 @@ def run_analyzer2(
     *,
     source_run_id: str,
     firmware_path: str | None = None,
+    rehunt: bool = False,
 ) -> Analyzer2Stats:
     """Scan one analysis.db for shape candidates, grade them, and write atlas instances.
 
@@ -913,7 +991,42 @@ def run_analyzer2(
     instance write, ``finish_run`` marks it 'complete' AFTER: a crash between leaves 'in_progress'
     (the honest "did not finish" signal), never a run silently missing behind half-written rows.
     ``firmware_path`` is the scanned firmware root when the caller knows it (else NULL).
+
+    SKIPS the whole hunt when the stored result was already produced by this tmap commit from this
+    extraction (see ``hunt_currency``); ``rehunt=True`` forces the work regardless. The skip rests
+    on the hunt being deterministic over its content columns for a fixed (analysis.db, code) pair.
     """
+    # Scan-lineage facts (binary/function counts + extraction build hash) for the run row. Read
+    # from the analysis.db (best-effort; degrades to None on an older schema, never a hard failure).
+    # ★ Read FIRST because the skip gate below compares its build_hash against the stored one —
+    # deciding not to work has to come before the work, and this read is a handful of counts.
+    lineage_conn = facts.open_analysis_ro(db_path)
+    try:
+        lineage = facts.analysis_run_counts(lineage_conn)
+    finally:
+        lineage_conn.close()
+
+    commit = installed_commit()
+    currency = hunt_currency(
+        _stored_run_row(atlas_path, source_run_id),
+        build_hash=lineage["build_hash"],
+        commit=commit,
+    )
+    if currency.current and not rehunt:
+        # Nothing is written, and NOTHING IS DELETED: the stored instances stay exactly as they
+        # are. Returning zero counts alongside skipped=True is why the flag exists — a caller that
+        # read the counts alone would see this as a hunt that found nothing.
+        logger.info("hunt: skipped — %s", currency.reason)
+        return Analyzer2Stats(
+            scanned=0,
+            matches=0,
+            instances_written=0,
+            by_status={"confirmed": 0, "blocked": 0, "unknown": 0},
+            oss_excluded=0,
+            skipped=True,
+            hunt_currency=currency.reason,
+        )
+
     result = scan(db_path)
     all_funcs = load_functions(db_path)
     # ★ phase-scale progress: on a large firmware (~218k functions) the hunt is a multi-second pass;
@@ -992,14 +1105,6 @@ def run_analyzer2(
     wrapper_propagated = 0
     data_gap_skipped = 0
     fmt_wrapper_unknown_source_demoted = 0
-
-    # Scan-lineage facts (binary/function counts + extraction build hash) for the run row. Read
-    # from the analysis.db (best-effort; degrades to None on an older schema, never a hard failure).
-    lineage_conn = facts.open_analysis_ro(db_path)
-    try:
-        lineage = facts.analysis_run_counts(lineage_conn)
-    finally:
-        lineage_conn.close()
 
     atlas = open_atlas(Path(atlas_path))
     try:
@@ -1439,6 +1544,9 @@ def run_analyzer2(
             binaries=lineage["binaries"],
             functions=lineage["functions"],
             functions_empty=lineage["functions_empty"],
+            # Stamped only HERE, after the instance transaction committed: the stamp claims "this
+            # commit produced these instances", so it must never outrun the instances themselves.
+            hunt_commit=commit,
         )
     finally:
         atlas.close()
@@ -1456,4 +1564,5 @@ def run_analyzer2(
         nvram_defaults_written=len(nvram_default_rows),
         web_form_fields_written=len(web_form_field_rows),
         fmt_wrapper_unknown_source_demoted=fmt_wrapper_unknown_source_demoted,
+        hunt_currency=f"hunt ran — {currency.reason}",
     )

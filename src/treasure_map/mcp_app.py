@@ -36,6 +36,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from treasure_map.lib import facts
+from treasure_map.lib.analyze.ghidra_runner import current_pass_version as _current_pass_version
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import PublicCvePatternRow, RunRow
 from treasure_map.lib.atlas.writer import add_public_cve_patterns as _add_public_cve_patterns
@@ -70,6 +71,7 @@ from treasure_map.lib.query import load_coverage_index as _load_coverage_index
 from treasure_map.lib.query import only_refusal as _only_refusal
 from treasure_map.lib.query import parse_impact_order as _parse_impact_order
 from treasure_map.lib.query import refs_in_ledger as _refs_in_ledger
+from treasure_map.lib.query import run_staleness as _run_staleness
 from treasure_map.lib.query import runs_where_function_exists as _runs_where_function_exists
 from treasure_map.lib.query import state_value_label as _state_value_label
 from treasure_map.lib.query import triage as _triage
@@ -82,6 +84,7 @@ from treasure_map.lib.query.diff_align import get_diff_deltas as _get_diff_delta
 from treasure_map.lib.query.diff_align import get_diff_meta as _get_diff_meta
 from treasure_map.lib.query.diff_align import list_diff_blindspots as _list_diff_blindspots
 from treasure_map.lib.query.diff_align import list_diffs as _list_diffs
+from treasure_map.version import installed_commit as _installed_commit
 
 # A standing reminder attached to every candidate-listing / aggregation result: the ordering and
 # recurrence signals are derived from neutral stored facts, carry their evidence, and are NOT a
@@ -555,6 +558,20 @@ def make_tools(
                 f"run '{run.run_id}' has no recorded analysis.db (a pre-existing scan with no "
                 "lineage row) — re-scan it to enable fact tools on this run.",
             )
+        # Staleness REFUSAL. Only a proven mismatch gets here (see run_staleness): the stored run
+        # was demonstrably produced by different code than is answering now, so every fact this
+        # run would return is an artifact of a pipeline that no longer exists, served with the
+        # same confidence as a current one. Refusing is the point — an agent that cannot tell the
+        # two apart will not ask, and a caveat buried in a large result does not get read.
+        stale = _run_staleness(run, build_hash=_current_pass_version(), commit=_installed_commit())
+        if stale.stale:
+            err = _error(
+                atlas,
+                f"run '{run.run_id}' is a STALE scan ({stale.axis}): {stale.detail}",
+            )
+            err["stale_scan"] = {"axis": stale.axis, "detail": stale.detail}
+            err["remedy"] = stale.remedy
+            return err
         authoritative = Path(run.analysis_db_path)
         if authoritative.exists():
             return authoritative

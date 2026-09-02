@@ -25,6 +25,7 @@ from treasure_map.lib.query.overlay_view import apply_overlay_view, overlay_band
 from treasure_map.lib.query.runs import (
     get_run,
     list_runs,
+    run_staleness,
     runs_where_function_exists,
 )
 from treasure_map.lib.query.sink_impact import (
@@ -111,6 +112,7 @@ __all__ = [
     "list_cve_patterns",
     "list_verified_exploits",
     "list_runs",
+    "run_staleness",
     "only_refusal",
     "overlay_band",
     "parse_impact_order",

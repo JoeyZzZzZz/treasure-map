@@ -57,6 +57,10 @@ def _hunt_stats(written: int = 0) -> SimpleNamespace:
         nvram_defaults_written=0,
         web_form_fields_written=0,
         fmt_wrapper_unknown_source_demoted=0,
+        # A stub of a hunt that RAN: the CLI branches on this to decide whether to print candidate
+        # counts or the skip line, so leaving it off would silently exercise neither branch.
+        skipped=False,
+        hunt_currency="hunt ran",
     )
 
 
@@ -126,7 +130,14 @@ def test_scan_runs_three_steps_in_order(tmp_path: Path, monkeypatch: pytest.Monk
         return _fake_analyze_result(tmp_path / "analysis.db")
 
     def _fake_hunt(
-        db: Any, atlas: Any, *, source_run_id: str, firmware_path: str | None = None
+        db: Any,
+        atlas: Any,
+        *,
+        source_run_id: str,
+        firmware_path: str | None = None,
+        # Mirrors the real run_analyzer2 signature. A stub that silently swallowed **kwargs
+        # would keep passing after the real function's contract changed underneath it.
+        rehunt: bool = False,
     ) -> Any:
         calls.append("hunt")
         seen["run_id"] = source_run_id
@@ -178,7 +189,14 @@ def test_scan_stores_absolute_firmware_path_from_relative_cwd(
         return _fake_analyze_result(tmp_path / "analysis.db")
 
     def _fake_hunt(
-        db: Any, atlas: Any, *, source_run_id: str, firmware_path: str | None = None
+        db: Any,
+        atlas: Any,
+        *,
+        source_run_id: str,
+        firmware_path: str | None = None,
+        # Mirrors the real run_analyzer2 signature. A stub that silently swallowed **kwargs
+        # would keep passing after the real function's contract changed underneath it.
+        rehunt: bool = False,
     ) -> Any:
         seen["firmware_path"] = firmware_path
         return _hunt_stats()
@@ -209,7 +227,14 @@ def test_scan_explicit_run_id_overrides_default(
         return _fake_analyze_result(tmp_path / "analysis.db")
 
     def _fake_hunt(
-        db: Any, atlas: Any, *, source_run_id: str, firmware_path: str | None = None
+        db: Any,
+        atlas: Any,
+        *,
+        source_run_id: str,
+        firmware_path: str | None = None,
+        # Mirrors the real run_analyzer2 signature. A stub that silently swallowed **kwargs
+        # would keep passing after the real function's contract changed underneath it.
+        rehunt: bool = False,
     ) -> Any:
         seen["run_id"] = source_run_id
         return _hunt_stats()
@@ -351,3 +376,43 @@ def test_scan_empty_candidates_is_ok(tmp_path: Path, monkeypatch: pytest.MonkeyP
     )
     assert result.exit_code == 0, result.output
     assert "0 candidates" in result.output  # honest empty segment, no crash
+
+
+def test_scan_says_out_loud_when_the_hunt_was_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ A skipped hunt writes nothing, so every count it reports is zero.
+
+    Printing those zeros through the normal line would read "0 candidates written (confirmed=0,
+    blocked=0, unknown=0)" — indistinguishable from a hunt that ran and found nothing on this
+    firmware. The stored candidates are in fact untouched and still there, which is the opposite
+    conclusion. So the skip gets its own line, and it names the way to override it.
+
+    MUTATION: delete the ``if h.skipped`` branch in scan and print the counts unconditionally ->
+    RED.
+    """
+    _base_patches(monkeypatch)
+
+    async def _fake_analyze(*_: Any, **__: Any) -> SimpleNamespace:
+        return _fake_analyze_result(tmp_path / "analysis.db")
+
+    stats = _hunt_stats()
+    stats.skipped = True
+    stats.hunt_currency = "already hunted by this tmap (abc123abc123) from this extraction"
+
+    def _fake_hunt(*_: Any, **__: Any) -> Any:
+        return stats
+
+    monkeypatch.setattr("treasure_map.lib.analyze.pipeline.run_analyze", _fake_analyze)
+    monkeypatch.setattr("treasure_map.lib.hunt.run_analyzer2", _fake_hunt)
+    monkeypatch.setattr("treasure_map.lib.query.triage", lambda *_a, **_k: [])
+
+    result = CliRunner().invoke(
+        scan, [str(_mkfs(tmp_path)), "-w", "router_v1", "--atlas", str(tmp_path / "atlas.db")]
+    )
+    assert result.exit_code == 0, result.output
+    assert "hunt SKIPPED" in result.output
+    assert "already hunted by this tmap" in result.output
+    assert "stored candidates kept as they are" in result.output
+    assert "--rehunt" in result.output
+    assert "candidates written" not in result.output
