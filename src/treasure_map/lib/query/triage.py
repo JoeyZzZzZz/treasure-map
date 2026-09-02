@@ -2566,6 +2566,27 @@ def reachability_match_count(candidates: list[TriageCandidate], values: list[str
     return filter_match_count(candidates, [("reachability", v) for v in values])
 
 
+def effective_float_filters(
+    view: str | None, dim_filters: list[tuple[str, str]] | None
+) -> list[tuple[str, str]]:
+    """The float filters a lens actually applies: a preset view's own filter, then the explicit
+    ones. Order is preserved because it is the order they are applied in.
+
+    ★ One derivation, two readers. The view floats these; the listing counts how many candidates
+    they match, so a lens that promises to float something can say when nothing matched. Deriving
+    that twice is how the two drift the day a preset gains a second float-affecting property — and
+    the drift would be silent, because both halves would still look right on their own.
+
+    Scope note, so the next reader does not over-trust the name: this is the single source of the
+    FILTER derivation only. A preset's spine is still looked up where the sorting happens."""
+    out: list[tuple[str, str]] = []
+    resolved = canonical_view(view)
+    if resolved and resolved in VIEWS and VIEWS[resolved]["filter"]:
+        out.append(VIEWS[resolved]["filter"])
+    out.extend(dim_filters or [])
+    return out
+
+
 def apply_view(
     candidates: list[TriageCandidate],
     *,
@@ -2587,17 +2608,13 @@ def apply_view(
       before calling (this function does not re-check; a caller that skips validation may prune an
       optimistic dimension and silently hide candidates)."""
     spine = "impact"
-    float_filters: list[tuple[str, str]] = []
     view = canonical_view(view)  # resolve a deprecated alias (reachable-only -> reachable-first)
     if view and view in VIEWS:
-        preset = VIEWS[view]
-        spine = preset["spine"]
-        if preset["filter"]:
-            float_filters.append(preset["filter"])
+        spine = VIEWS[view]["spine"]
     if sort_by:
         spine = sort_by
-    if dim_filters:
-        float_filters.extend(dim_filters)
+    # The same derivation the listing counts matches against — see effective_float_filters.
+    float_filters = effective_float_filters(view, dim_filters)
     out = list(candidates)
     for d, val in only_filters or []:  # explicit prune (eligibility validated by the caller)
         out = filter_by_dimension(out, d, val)

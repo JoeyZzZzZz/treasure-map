@@ -53,6 +53,7 @@ from treasure_map.lib.query import canonical_view as _canonical_view
 from treasure_map.lib.query import coverage_report as _coverage_report
 from treasure_map.lib.query import density as _density
 from treasure_map.lib.query import dormant as _dormant
+from treasure_map.lib.query import effective_float_filters as _effective_float_filters
 from treasure_map.lib.query import explain_candidate as _explain_candidate
 from treasure_map.lib.query import filter_candidates as _filter_candidates
 from treasure_map.lib.query import filter_match_count as _filter_match_count
@@ -379,6 +380,35 @@ def _parse_dim_filters(spec: str | None) -> list[tuple[str, str]]:
         if sep and d.strip() and v.strip():
             out.append((d.strip(), v.strip()))
     return out
+
+
+def _float_empty_note(float_filters: list[tuple[str, str]], total: int, corpus: int) -> str:
+    """The message for a lens that floats something and matched none of it.
+
+    ★ Every effective filter is named, and more than one is called out as a conjunction. The match
+    count is an AND over all of them, so pointing at just one would report "this dimension matched
+    nothing" when the truth is "nothing matched all of them together" — a wrong reason, handed to
+    someone who came here because the ordering surprised them.
+
+    ★ The denominator is the count the match was taken over — the view AFTER any prune — not the
+    whole corpus. Quoting the corpus beside a numerator computed on the pruned view is a fraction
+    with two different bases, and this is a sentence a person reads and trusts.
+
+    ★ Says what it is: a coverage fact about this run. Zero matches means nothing here carried that
+    combination — a statement about what the analysis attributed, not about what the firmware
+    contains, and not a conclusion about anything. The reassuring vocabulary is kept out of the
+    text entirely, disclaimers included, so that searching this layer's output for it stays a
+    meaningful check instead of one that trips over its own caveats."""
+    named = ", ".join(f"{d}={v}" for d, v in float_filters)
+    what = f"ALL of: {named}" if len(float_filters) > 1 else named
+    scope = f"0 of {total} in this view" + (f" (whole corpus {corpus})" if total != corpus else "")
+    return (
+        f"this lens floats candidates matching {what}, but {scope} matched on this run — nothing "
+        "floats, so the order you are seeing is the default lens's. That is a COVERAGE fact about "
+        "this run: no candidate here carried that combination. It says nothing about whether the "
+        "firmware contains sources of that kind — only that the analysis attributed none — and it "
+        "is not a conclusion about anything."
+    )
 
 
 def _effective_spine(sort_by: str | None, view: str | None) -> str:
@@ -867,7 +897,16 @@ def make_tools(
         if overlay:
             ranked = _apply_overlay_view(ranked, by_ref)
         total = len(ranked)
-        filter_match = _filter_match_count(ranked, dim_filters) if dim_filters else None
+        # ★ Count against the filters the lens ACTUALLY floats — a preset view's own filter
+        # included, not just the ones typed on the command line. Counting only the explicit ones
+        # meant a view whose whole promise is "these float to the top" reported nothing at all when
+        # nothing matched: the caller saw the default order back, with no way to tell a lens that
+        # found nothing from a lens that had nothing to do.
+        float_filters = _effective_float_filters(view, dim_filters)
+        # None and 0 are different answers and stay different: None is "no lens filter was applied",
+        # 0 is "one was, and it matched nothing". Collapsing them loses exactly the distinction this
+        # is for.
+        filter_match = _filter_match_count(ranked, float_filters) if float_filters else None
         lim = max(0, min(limit, _MAX_LIMIT))
         off = max(0, offset)
         page = ranked[off : off + lim]
@@ -896,6 +935,13 @@ def make_tools(
                 # --filter circle-and-weights (floats matches, corpus whole); --only sweeps (prunes,
                 # ground-truth dims only). filter_match = how many the --filter matched.
                 "filter_match": filter_match,
+                # Only when a lens promised to float something and matched none of it. With matches
+                # the ordering speaks for itself; with no filter at all there is nothing to explain.
+                **(
+                    {"float_empty": _float_empty_note(float_filters, total, corpus)}
+                    if float_filters and filter_match == 0
+                    else {}
+                ),
                 "only": [f"{d}={v}" for d, v in only_filters],
                 "impact_order": impact_order or "default (cmd=fmt_string>copy>log)",
                 "switchable": "sort_by / view / filters (float) / only (sweep) — re-ranks; "
