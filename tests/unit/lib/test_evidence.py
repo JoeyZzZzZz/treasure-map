@@ -469,6 +469,18 @@ def test_evidence_signals_do_not_feed_score_or_grade() -> None:
             assert field not in text, f"{rel} unexpectedly references {field!r}"
 
 
+# The interpretive evidence fields: computed per candidate, surfaced read-only, and read by no
+# verdict. Named once so the guard covers all of them, not just the two that came first.
+_INTERPRETIVE_FIELDS = (
+    "trace_boundary",
+    "size_kind",
+    "size_flow",
+    "clamp_seen",
+    "fmt_arg_pos",
+    "fmt_arg_literal",
+)
+
+
 def _assert_length_fields_stay_out_of_triage_verdicts() -> None:
     """In triage, the interpretive length fields may be named ONLY by the surface builders.
 
@@ -478,13 +490,19 @@ def _assert_length_fields_stay_out_of_triage_verdicts() -> None:
     that produces a Dimension may read them — and is enforced by looking at which functions
     actually mention them rather than at whether the file does.
 
-    MUTATION (must go RED): read size_kind or trace_boundary inside any Dimension-producing
-    function in triage.
+    ★ All six interpretive fields, not the two the length picture happens to use. clamp_seen is the
+    one with the worst consequence and the strongest pull: wiring it into a verdict gate turns every
+    clamp-shaped candidate into a proven-constant one, sinking each to the bottom of the list as
+    "shown safe" on the strength of a shape nobody judged. Leaving the field with the largest
+    downside outside the mechanical check is the gap this closes.
+
+    MUTATION (must go RED): read any of the six inside a Dimension-producing function in triage —
+    clamp_seen in particular.
     """
     import ast
 
     tree = ast.parse((_SRC / "lib/query/triage.py").read_text())
-    allowed = {"_copy_surface", "evidence_surface"}
+    allowed = {"_copy_surface", "_fmt_surface", "evidence_surface"}
     offenders: dict[str, set[str]] = {}
     for node in ast.walk(tree):
         if not isinstance(node, ast.FunctionDef) or node.name in allowed:
@@ -494,8 +512,53 @@ def _assert_length_fields_stay_out_of_triage_verdicts() -> None:
             for inner in ast.walk(node)
             if isinstance(inner, ast.Constant)
             and isinstance(inner.value, str)
-            and inner.value in ("trace_boundary", "size_kind")
+            and inner.value in _INTERPRETIVE_FIELDS
         }
         if named:
             offenders[node.name] = named
     assert not offenders, f"length fields named outside the surface builders: {offenders}"
+
+
+def test_no_present_tense_population_counts_in_the_source() -> None:
+    """A comment that justifies itself with "N of M candidates are in this state" is a claim whose
+    truth is a snapshot: it goes stale on another machine and false on a re-scan, and when the real
+    count is zero it has been asserting a population that cannot exist.
+
+    ★ Deliberately NOT a blanket ban on numbers. A measurement that a design DEPENDS on stays —
+    where a constant came from, what a guard would cost if removed, what a one-off observation
+    showed — because those read as history and stay true when the number moves. What goes is the
+    present-tense census whose claim collapses if the count changes.
+
+    ★ HONEST COVERAGE, stated rather than implied: this catches the "N of M" phrasing only. The
+    "of N candidates" and "N/M" variants slip past it, and no single pattern separates the two
+    kinds cleanly — a reviewer still has to read. It is a first net, not a proof.
+
+    MUTATION (must go RED): put an "N of M candidates" claim back into a scanned file."""
+    import re
+
+    scanned = (
+        "lib/query/triage.py",
+        "lib/hunt/evidence.py",
+        "lib/reachability/copy_size.py",
+    )
+    census = re.compile(r"\b\d+ of \d+\b")
+    offenders: list[str] = []
+    for rel in scanned:
+        for i, line in enumerate((_SRC / rel).read_text().splitlines(), 1):
+            if census.search(line):
+                offenders.append(f"{rel}:{i}: {line.strip()}")
+    assert not offenders, "present-tense population counts: " + "; ".join(offenders)
+
+
+def test_the_design_rationale_measurements_are_left_alone() -> None:
+    """The other half of the rule, pinned so a later tidy-up does not take the honest numbers too.
+
+    Each of these is a measurement a decision RESTS on: the threshold's origin, what dropping a
+    guard would cost, and a guard that admits it fires on nothing today. Deleting them would not
+    make the code more honest — it would leave a magic constant with no provenance and a guard that
+    reads as if it were written for a case somebody saw."""
+    triage = (_SRC / "lib/query/triage.py").read_text()
+    assert "~90-fold" in triage  # why the non-empty guard has to be there
+    assert "written anyway so a future one cannot slip" in triage  # a guard that admits it is idle
+    layer0 = (_SRC / "lib/diff/layer0.py").read_text()
+    assert "1815/1848" in layer0  # where ALIGN_THRESHOLD came from

@@ -12,10 +12,10 @@ stored evidence and never writes any, so the three keys the controllability verd
 sink_arg_provenance, flow_path, source_kind — are unreachable from it. The first test below is the
 one that matters: the same candidate reads the same verdict with or without origin fragments.
 
-Verified against a real atlas of 12799 candidates while building this: the Dimension tuples digest
-identically with the layer present and absent, and a deliberately broken build — one where a
-verdict exit consults the origin — moves 1685 candidates, so the guard is anchored independently of
-this code rather than certifying itself.
+Verified against a real atlas while building this: the Dimension tuples digest identically with the
+layer present and absent, and a deliberately broken build — one where a verdict exit consults the
+origin — moves a large share of candidates, so the guard is anchored independently of this code
+rather than certifying itself.
 """
 
 from __future__ import annotations

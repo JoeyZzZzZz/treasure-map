@@ -1212,7 +1212,7 @@ def _copy_surface(evidence: dict[str, Any]) -> dict[str, Any] | None:
 
     None rather than a shape full of nulls: a candidate whose length analysis produced nothing has
     no picture, and an object saying `size_kind: null` invites reading a missing analysis as a
-    finished one. Measured on a real atlas, 678 of 6780 copy candidates are in that state."""
+    finished one."""
     if "size_kind" not in evidence:
         return None
     kind = evidence.get("size_kind")
@@ -1239,9 +1239,17 @@ def _copy_surface(evidence: dict[str, Any]) -> dict[str, Any] | None:
 def _fmt_surface(evidence: dict[str, Any]) -> dict[str, Any] | None:
     """Which argument of a format sink carries the format string.
 
-    A position of None means the analysis did not establish one — NOT that the format sits at
-    argument 0, and NOT that there is no format. It is reported as its own state for that reason;
-    on a real atlas 466 of 2068 format candidates are in it."""
+    Returns None when neither key was written at all. That is the state a candidate recovered
+    through a thin wrapper is in, and it is worth naming precisely: those go through the general
+    evidence builder, which does not RUN format analysis, so the keys are ABSENT rather than
+    unresolved. The analysis did not fail on them — it never ran.
+
+    A position of None is reported as its own state — not argument 0, and not "there is no format".
+    That state is currently unreachable: the format-sink set and the position map carry the same
+    keys, so a candidate's position is always an int. The branch is kept as a guard against those
+    two sets drifting apart, which nothing else would catch, and NOT because any candidate is in
+    it. Its sibling for the literal flag was removed instead: that value comes from a function
+    typed to return a bool, so no candidate could ever be in it and nothing was guarding."""
     if "fmt_arg_pos" not in evidence and "fmt_arg_literal" not in evidence:
         return None
     pos = evidence.get("fmt_arg_pos")
@@ -1258,11 +1266,6 @@ def _fmt_surface(evidence: dict[str, Any]) -> dict[str, Any] | None:
         )
     else:
         out["reading"] = f"the format string is argument {pos} of the sink call"
-    if literal is None:
-        out["literal_state"] = (
-            "whether that argument is a literal was not established — read this as unknown, never "
-            "as 'not a literal'"
-        )
     return out
 
 

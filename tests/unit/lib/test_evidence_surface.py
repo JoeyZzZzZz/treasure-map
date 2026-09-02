@@ -18,11 +18,11 @@ property here rather than a nicety:
   * `no_shell_exec` is not "no command injection" — it says the command runs without a shell, so
     shell metacharacters stop mattering while the argv and the program path do not.
 
-Measured against a real atlas of 12799 candidates while building this: the Dimension digest is
-identical with the layer present and absent, and both deliberately-broken builds move it — wiring a
-clamp into a verdict gate turns 6 constrained readings into 373, and adding no_shell_exec to the
-constant markers calls 31 more candidates constant. So the invariance check is anchored
-independently of this code rather than certifying itself.
+Checked against a real atlas while building this: the Dimension digest is identical with the
+layer present and absent, and both deliberately-broken builds move it — wiring a clamp into a
+verdict gate turns constrained readings into a large multiple of themselves, and adding
+no_shell_exec to the constant markers calls more candidates constant. So the invariance check is
+anchored independently of this code rather than certifying itself.
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ import pytest
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import InstanceRow
 from treasure_map.lib.atlas.writer import add_instance, upsert_pattern
+from treasure_map.lib.pattern.classes import FMT_STRING, FMT_STRING_ARG
 from treasure_map.lib.query.sink_impact import CONSTRAINED_MARKERS, PROVABLY_CONSTANT_MARKERS
 from treasure_map.lib.query.triage import _dim_controllability, evidence_surface
 
@@ -101,8 +102,7 @@ def test_surfaced_facts_never_change_the_verdict(
     construction; the test exists so that stops being a claim about today's code.
 
     MUTATION (must go RED, verified by deliberately breaking the build): have any verdict exit
-    consult the surface. On a real atlas, reading clamp_seen there moved 367 candidates into
-    constrained."""
+    consult the surface — reading clamp_seen there moves candidates into constrained."""
     conn = open_atlas(tmp_path / "atlas.db")
     try:
         plain = _dim_controllability(
@@ -164,8 +164,8 @@ def test_orphan_form_notes_stay_out_of_every_marker_set() -> None:
 
     A lock on the present state rather than a discovery: they are outside the marker sets today, so
     this is green now and its job is to fail the day someone wires one in. What it would cost was
-    measured — adding no_shell_exec to the constant markers calls 31 more candidates constant on a
-    real atlas, which is the misreading this whole layer exists to prevent.
+    measured — adding no_shell_exec to the constant markers makes the map call more candidates
+    constant, which is the misreading this whole layer exists to prevent.
 
     MUTATION (must go RED): add any of the three to either marker set."""
     read = PROVABLY_CONSTANT_MARKERS | CONSTRAINED_MARKERS
@@ -218,8 +218,7 @@ def test_copy_without_a_length_picture_is_absent_not_empty() -> None:
     """A copy candidate whose length analysis recorded nothing gets None.
 
     Not a shape full of nulls: `size_kind: null` invites reading a missing analysis as a finished
-    one. Measured on a real atlas, 678 of 6780 copy candidates are in this state — so it is the
-    common case, not a corner."""
+    one, and candidates really are in this state — it is a normal case, not a corner."""
     assert _surface({"source_kind": "unknown"}, "copy") is None
     assert _surface(None, "copy") is None
 
@@ -230,19 +229,39 @@ def test_copy_without_a_length_picture_is_absent_not_empty() -> None:
 def test_format_position_is_reported_and_an_unknown_one_says_unknown() -> None:
     """An unestablished format position is its own state — NOT argument 0, NOT 'no format'.
 
-    On a real atlas 466 of 2068 format candidates have no established position, so collapsing that
-    into 0 would misdescribe nearly a quarter of them.
+    ★ Note which state the real candidates are in: those recovered through a thin wrapper have the
+    keys ABSENT, because the wrapper path runs the general evidence builder, which does not run
+    format analysis at all. They return None from the surface, and never reach the position branch.
+    That branch guards a different thing — the format-sink set drifting apart from the position map
+    — and is pinned by the subset assertion below rather than by any candidate being in it.
 
     MUTATION (must go RED): default a missing fmt_arg_pos to 0."""
-    known = _surface({"fmt_arg_pos": 1, "fmt_arg_literal": None}, "fmt_string")
-    unknown = _surface({"fmt_arg_pos": None, "fmt_arg_literal": None}, "fmt_string")
+    known = _surface({"fmt_arg_pos": 1, "fmt_arg_literal": False}, "fmt_string")
+    unknown = _surface({"fmt_arg_pos": None, "fmt_arg_literal": False}, "fmt_string")
     assert known is not None and unknown is not None
     assert known["fmt_arg_pos"] == 1 and "argument 1" in known["reading"]
     assert unknown["fmt_arg_pos"] is None
     assert "NOT established" in unknown["reading"]
-    # and "was it a literal" being unrecorded is reported as unknown, never as "not a literal"
-    assert "never" in unknown["literal_state"]
+    # ★ the real population: a wrapper-recovered candidate has NEITHER key, so it gets no surface
+    # at all rather than one describing an unresolved position
     assert _surface({"source_kind": "unknown"}, "fmt_string") is None
+
+
+def test_every_format_sink_has_a_position_mapping() -> None:
+    """The invariant the position branch is kept for, made mechanical.
+
+    That branch fires only if a format sink exists with no entry in the position map, and NOTHING
+    else enforces that the two stay in step — which is what makes keeping a currently-unreachable
+    branch reasonable, and what makes leaving the invariant unchecked unreasonable.
+
+    ★ Subset, not equality. What the branch needs is that every format sink HAS a position; a
+    position registered ahead of its sink is harmless, and demanding equality would fail an
+    innocent edit with a message pointing at the wrong thing.
+
+    MUTATION (must go RED): add a sink to the format set without a position for it."""
+    assert set(FMT_STRING) <= set(FMT_STRING_ARG), (
+        "a format sink has no position mapping — the format-position branch would start firing"
+    )
 
 
 # ── cmd / path: the exec shape ───────────────────────────────────────────────────────
@@ -287,8 +306,8 @@ def test_explain_carries_the_surface_for_every_class(tmp_path: Path) -> None:
     """The hook is reached for every candidate class — the point of hanging it here.
 
     An earlier design hung it on the deep-provenance reader, which returns early for a candidate
-    with no def-use records. Copy candidates never have any: measured on a real atlas, 0 of 6780.
-    That hook would have been unreachable for the whole class it was built for."""
+    with no def-use records. Copy candidates never have any, so that hook would have been
+    unreachable for the whole class it was built for."""
     from treasure_map.lib.query import explain_candidate
 
     conn = open_atlas(tmp_path / "atlas.db")
@@ -296,7 +315,7 @@ def test_explain_carries_the_surface_for_every_class(tmp_path: Path) -> None:
         for i, (cls, evidence, marker) in enumerate(
             [
                 ("copy", _CLAMP_EVIDENCE, None),
-                ("fmt_string", {"fmt_arg_pos": 0, "fmt_arg_literal": None}, None),
+                ("fmt_string", {"fmt_arg_pos": 0, "fmt_arg_literal": False}, None),
                 ("cmd", {"source_kind": "unknown"}, "no_shell_exec"),
                 ("path_sink", {"source_kind": "unknown"}, "no_shell_exec"),
             ]
