@@ -34,10 +34,17 @@ BUILD = "8beedde56942dbb1"
 
 
 def _row(**over: object) -> dict[str, object]:
+    """A stored run row in the shape ``_stored_run_row`` returns — INCLUDING the live row count.
+
+    Mirrors the real reader deliberately rather than accepting whatever keys a test happens to
+    pass: when the currency rule grows an input, every case here has to be re-stated in terms of
+    it, which is how a test notices that the decision now rests on something it never set."""
     base: dict[str, object] = {
         "scan_status": "complete",
         "hunt_commit": COMMIT,
         "build_hash": BUILD,
+        "hunt_instances": 3,
+        "live_instances": 3,
     }
     base.update(over)
     return base
@@ -258,6 +265,41 @@ def test_remedy_names_a_runnable_command_only_when_the_firmware_is_recorded() ->
     )
     assert "tmap rescan r1" not in lost.remedy
     assert "no firmware root" in lost.remedy
+
+
+def test_a_run_with_no_firmware_is_told_its_facts_are_still_readable() -> None:
+    """★ "You cannot refresh this" is not the same as "there is nothing you can do".
+
+    A refused run whose firmware root is gone still has its analysis.db on disk, and the CLI reads
+    that file directly — annotating the extraction mismatch instead of declining, because a person
+    naming the file has chosen it on purpose. Naming that route turns a dead end into a next step;
+    getting the firmware back can take a while, and the facts are readable in the meantime.
+
+    MUTATION: drop the analysis-db branch from ``_remedy_for`` -> RED.
+    """
+    reachable = run_staleness(
+        _run(hunt_commit=OTHER, firmware_path=None, analysis_db_path="/ws/r1/analysis.db"),
+        build_hash=BUILD,
+        commit=COMMIT,
+    )
+    assert "tmap fact <subcommand> --analysis-db /ws/r1/analysis.db" in reachable.remedy
+    assert "tmap scan <firmware-root> --run-id r1" in reachable.remedy
+
+
+def test_the_analysis_db_route_is_not_offered_when_there_is_no_path_to_offer() -> None:
+    """★ The command needs an argument. A run with neither a firmware root nor a recorded
+    analysis.db would otherwise be handed ``--analysis-db None`` — a remedy that cannot be typed,
+    which is worse than the honest "re-scan when you have the firmware".
+
+    MUTATION: emit the analysis-db line unconditionally -> RED.
+    """
+    nothing = run_staleness(
+        _run(hunt_commit=OTHER, firmware_path=None, analysis_db_path=None),
+        build_hash=BUILD,
+        commit=COMMIT,
+    )
+    assert "--analysis-db" not in nothing.remedy
+    assert "tmap scan <firmware-root> --run-id r1" in nothing.remedy
 
 
 # --------------------------------------------------------------------------- the commit reader
@@ -482,3 +524,284 @@ def test_an_unknown_install_commit_never_skips_a_real_hunt(
     db, atlas = _seeded(tmp_path), tmp_path / "atlas.db"
     a2.run_analyzer2(db, atlas, source_run_id="r")
     assert a2.run_analyzer2(db, atlas, source_run_id="r").skipped is False
+
+
+# ------------------------------------------------------- the stamp must describe rows that exist
+
+
+def _seeded_no_candidates(tmp_path: Path) -> Path:
+    """An analysis.db that yields ZERO candidates — a legitimate, complete result.
+
+    Load-bearing for the over-correction guard below: the difference between "the rows this hunt
+    wrote are gone" and "this hunt wrote no rows" cannot be read off the table, only off the
+    recorded count."""
+    db = tmp_path / "empty.db"
+    conn = open_db(db)
+    conn.execute(
+        "INSERT INTO binaries (id, name, path, sha256, last_seen_at, pass_version) "
+        "VALUES (1, 'quiet', 'usr/sbin/quiet', ?, '2026-01-01 00:00:00', 'pv_x')",
+        ("b" * 64,),
+    )
+    conn.execute(
+        "INSERT INTO functions (id, binary_id, name, address, pseudocode, pseudocode_hash, callees)"
+        " VALUES (1, 1, 'quiet', '0x2000', 'void quiet(void){ return; }', 'h_quiet', ?)",
+        (json.dumps([]),),
+    )
+    conn.commit()
+    conn.close()
+    return db
+
+
+def _run_column(atlas: Path, run_id: str, column: str) -> object:
+    conn = open_atlas(atlas)
+    try:
+        row = conn.execute(
+            f"SELECT {column} FROM run WHERE run_id = ?",  # noqa: S608 -- fixed literal names
+            (run_id,),
+        ).fetchone()
+        return None if row is None else row[0]
+    finally:
+        conn.close()
+
+
+def test_the_stamp_records_how_many_rows_the_hunt_wrote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The count is written beside the commit, by the same call, after the same transaction."""
+    from treasure_map.lib.hunt import analyzer2 as a2
+
+    monkeypatch.setattr(a2, "installed_commit", lambda: COMMIT)
+    db, atlas = _seeded(tmp_path), tmp_path / "atlas.db"
+    stats = a2.run_analyzer2(db, atlas, source_run_id="r")
+    assert stats.instances_written == 1
+    assert _run_column(atlas, "r", "hunt_instances") == 1
+
+
+def test_rows_deleted_out_from_under_the_stamp_defeat_the_skip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ THE HOLE THIS CLOSES — a stamp vouching for rows that are not there any more.
+
+    Delete a run's instances by any route that is not this module (a manual DELETE, a half-restored
+    atlas copy, another caller of delete_run_instances) and the stamp keeps saying "this commit
+    produced this run's candidates". Before the count was compared, the next hunt read that stamp,
+    skipped, and reported "already hunted by this tmap" over an empty table. The skip must fail
+    here, and the rows must come back.
+
+    MUTATION: remove the ``stored_rows != live_rows`` branch from ``hunt_currency`` -> RED
+    (skipped is True and the table stays empty). Measured RED at 1 failed.
+
+    ★ Why the 861ef07 mutation set missed it: its end-to-end assertion was "a skip leaves the rows
+    unchanged", which holds just as well when both sides are zero. No mutation deleted data, so
+    nothing ever produced the state in which the stamp is wrong.
+    """
+    from treasure_map.lib.hunt import analyzer2 as a2
+
+    monkeypatch.setattr(a2, "installed_commit", lambda: COMMIT)
+    db, atlas = _seeded(tmp_path), tmp_path / "atlas.db"
+    a2.run_analyzer2(db, atlas, source_run_id="r")
+    assert len(_instances(atlas)) == 1
+
+    conn = open_atlas(atlas)
+    conn.execute("DELETE FROM instance WHERE source_run_id = 'r'")
+    conn.commit()
+    conn.close()
+
+    again = a2.run_analyzer2(db, atlas, source_run_id="r")
+    assert again.skipped is False
+    assert "stored candidate rows changed" in (again.hunt_currency or "")
+    assert len(_instances(atlas)) == 1, "the re-hunt must restore what was deleted"
+
+
+def test_extra_rows_under_the_stamp_also_defeat_the_skip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The comparison is a COUNT, so it catches a table that grew as well as one that shrank.
+
+    This is the case an existence probe cannot see at all: the rows are still there, there are
+    simply not the rows this hunt wrote. Pinned separately because a fix that only asked "is the
+    table empty" would pass the deletion test above and fail here.
+
+    MUTATION: replace the count comparison with ``if live_rows == 0`` -> RED.
+    """
+    from treasure_map.lib.hunt import analyzer2 as a2
+
+    monkeypatch.setattr(a2, "installed_commit", lambda: COMMIT)
+    db, atlas = _seeded(tmp_path), tmp_path / "atlas.db"
+    a2.run_analyzer2(db, atlas, source_run_id="r")
+
+    conn = open_atlas(atlas)
+    conn.execute(
+        "INSERT INTO instance (pattern_id, pseudocode_hash, sink_anchor, source_run_id, "
+        "evidence_ref) SELECT pattern_id, 'h_extra', 'FUN_extra', 'r', 'r#extra' FROM instance "
+        "WHERE source_run_id = 'r' LIMIT 1"
+    )
+    conn.commit()
+    conn.close()
+
+    again = a2.run_analyzer2(db, atlas, source_run_id="r")
+    assert again.skipped is False
+    assert "stored candidate rows changed" in (again.hunt_currency or "")
+
+
+def test_a_run_stamped_before_the_count_existed_re_hunts_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A NULL count cannot be compared, so it re-hunts — the same direction every other unknown
+    takes. Every run in an existing atlas is in this state exactly once after this ships.
+
+    MUTATION: treat a NULL ``hunt_instances`` as matching -> RED.
+    """
+    from treasure_map.lib.hunt import analyzer2 as a2
+
+    monkeypatch.setattr(a2, "installed_commit", lambda: COMMIT)
+    db, atlas = _seeded(tmp_path), tmp_path / "atlas.db"
+    a2.run_analyzer2(db, atlas, source_run_id="r")
+
+    conn = open_atlas(atlas)
+    conn.execute("UPDATE run SET hunt_instances = NULL WHERE run_id = 'r'")
+    conn.commit()
+    conn.close()
+
+    again = a2.run_analyzer2(db, atlas, source_run_id="r")
+    assert again.skipped is False
+    assert "before the instance count was recorded" in (again.hunt_currency or "")
+    assert _run_column(atlas, "r", "hunt_instances") == 1  # refilled by the re-hunt
+
+
+def test_a_run_that_legitimately_found_nothing_still_skips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ THE OVER-CORRECTION GUARD — the only test that tells the right fix from the naive one.
+
+    Zero candidates is a real, complete result: this analysis.db has no sink shape in it. An
+    implementation that checked whether the run HAS rows (``SELECT 1 … LIMIT 1``) would find none,
+    conclude the stamp was orphaned, and re-hunt this run on every single scan forever — trading
+    one silent wrong answer for a permanent one. Comparing counts makes zero a value like any
+    other.
+
+    MUTATION: change the check to an existence probe -> RED (skipped is False). Measured RED at
+    1 failed.
+    """
+    from treasure_map.lib.hunt import analyzer2 as a2
+
+    monkeypatch.setattr(a2, "installed_commit", lambda: COMMIT)
+    db, atlas = _seeded_no_candidates(tmp_path), tmp_path / "atlas.db"
+    first = a2.run_analyzer2(db, atlas, source_run_id="quiet")
+    assert first.instances_written == 0, "this fixture must produce no candidates, or it proves it"
+    assert _run_column(atlas, "quiet", "hunt_instances") == 0  # zero is STORED, not left NULL
+
+    second = a2.run_analyzer2(db, atlas, source_run_id="quiet")
+    assert second.skipped is True
+
+
+def test_begin_run_clears_the_count_with_the_stamp(tmp_path: Path) -> None:
+    """The count describes the rows begin_run is about to delete, so it expires at the same moment
+    the stamp does. Leaving it behind would let a crashed hunt's row count vouch for a table that
+    was emptied and never refilled.
+
+    MUTATION: drop ``hunt_instances = NULL`` from begin_run's upsert -> RED.
+    """
+    atlas = tmp_path / "atlas.db"
+    conn = open_atlas(atlas)
+    begin_run(conn, "r", analysis_db_path="/ws/a.db")
+    finish_run(conn, "r", hunt_commit=COMMIT, hunt_instances=7)
+    assert conn.execute("SELECT hunt_instances FROM run WHERE run_id='r'").fetchone()[0] == 7
+    begin_run(conn, "r", analysis_db_path="/ws/a.db")
+    assert conn.execute("SELECT hunt_instances FROM run WHERE run_id='r'").fetchone()[0] is None
+    conn.close()
+
+
+def test_finish_run_without_a_count_leaves_an_existing_one_alone(tmp_path: Path) -> None:
+    """COALESCE, same as the commit stamp: not knowing is not grounds to erase what is known."""
+    atlas = tmp_path / "atlas.db"
+    conn = open_atlas(atlas)
+    begin_run(conn, "r", analysis_db_path="/ws/a.db")
+    finish_run(conn, "r", hunt_commit=COMMIT, hunt_instances=4)
+    finish_run(conn, "r", scan_status="partial")
+    assert conn.execute("SELECT hunt_instances FROM run WHERE run_id='r'").fetchone()[0] == 4
+    conn.close()
+
+
+def test_an_atlas_predating_the_count_column_gains_it_and_keeps_its_rows(tmp_path: Path) -> None:
+    """The additive migration, on a run table built without the column.
+
+    MUTATION: drop the hunt_instances ALTER from _migrate -> RED (OperationalError on the SELECT).
+    """
+    atlas = tmp_path / "old.db"
+    raw = sqlite3.connect(atlas)
+    raw.executescript(
+        "CREATE TABLE run (run_id TEXT PRIMARY KEY, scan_status TEXT NOT NULL DEFAULT "
+        "'in_progress', scanned_at DATETIME, updated_at DATETIME);"
+        "INSERT INTO run (run_id, scan_status) VALUES ('legacy', 'complete');"
+    )
+    raw.commit()
+    raw.close()
+
+    conn = open_atlas(atlas)
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(run)").fetchall()}
+        assert "hunt_instances" in cols
+        row = conn.execute(
+            "SELECT scan_status, hunt_instances FROM run WHERE run_id=?", ("legacy",)
+        ).fetchone()
+        # the row survived the migration; the count is honestly NULL, not 0
+        assert tuple(row) == ("complete", None)
+    finally:
+        conn.close()
+    open_atlas(atlas).close()  # idempotent
+
+
+# --------------------------------------------------------- a skip still records where things are
+
+
+def test_a_skipped_hunt_records_the_new_locations_and_nothing_else(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ The skip returns before begin_run, so the lineage would otherwise freeze at the last hunt.
+
+    Move the firmware, re-scan, and the run keeps pointing at a directory that is no longer there;
+    everything that later re-reads the run (a rescan, the remedy line a refusal prints) is then
+    aimed at the wrong place. The relocation is written, and ONLY the relocation: the stamp, the
+    status, the counts and the extraction hash describe the hunt that actually ran, which this
+    call did not.
+
+    MUTATION: remove the ``refresh_run_lineage`` call from the skip branch -> RED (firmware_path
+    stays at the old root). Call ``begin_run`` there instead -> RED (the stamp is cleared and the
+    status is knocked back to in_progress). Measured RED at 1 failed each.
+    """
+    import shutil
+
+    from treasure_map.lib.hunt import analyzer2 as a2
+
+    monkeypatch.setattr(a2, "installed_commit", lambda: COMMIT)
+    db, atlas = _seeded(tmp_path), tmp_path / "atlas.db"
+    a2.run_analyzer2(db, atlas, source_run_id="r", firmware_path="/fw/OLD")
+    before = {
+        col: _run_column(atlas, "r", col)
+        for col in ("scan_status", "hunt_commit", "hunt_instances", "build_hash", "scanned_at")
+    }
+
+    moved = tmp_path / "moved" / "analysis.db"
+    moved.parent.mkdir()
+    shutil.copy(db, moved)
+    stats = a2.run_analyzer2(moved, atlas, source_run_id="r", firmware_path="/fw/NEW")
+
+    assert stats.skipped is True
+    assert _run_column(atlas, "r", "firmware_path") == "/fw/NEW"
+    assert _run_column(atlas, "r", "analysis_db_path") == str(moved.resolve())
+    for col, was in before.items():
+        assert _run_column(atlas, "r", col) == was, f"a skip must not rewrite {col}"
+
+
+def test_relocation_never_invents_a_run(tmp_path: Path) -> None:
+    """UPDATE only. A run with no row has no lineage to relocate, and inserting one here would
+    manufacture a scan that never happened."""
+    from treasure_map.lib.atlas.writer import refresh_run_lineage
+
+    conn = open_atlas(tmp_path / "atlas.db")
+    try:
+        assert refresh_run_lineage(conn, "ghost", analysis_db_path="/x", firmware_path="/y") == 0
+        assert conn.execute("SELECT COUNT(*) FROM run").fetchone()[0] == 0
+    finally:
+        conn.close()

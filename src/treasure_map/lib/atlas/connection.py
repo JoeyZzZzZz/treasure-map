@@ -275,6 +275,16 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if run_cols and "hunt_commit" not in run_cols:
         conn.execute("ALTER TABLE run ADD COLUMN hunt_commit TEXT")
 
+    # run.hunt_instances (added this round): how many instance rows that hunt actually committed.
+    # The commit stamp alone says WHO produced the result, not that the result is still in the
+    # table — delete the rows by any route and the stamp keeps vouching for them. Storing the count
+    # makes "what was written" a comparable value, so the skip gate can check the rows are still
+    # there. Nullable: a run hunted before this column existed has no count to compare and re-hunts
+    # once. Idempotent; runs only while the column is missing.
+    run_cols = _column_names(conn, "run")
+    if run_cols and "hunt_instances" not in run_cols:
+        conn.execute("ALTER TABLE run ADD COLUMN hunt_instances INTEGER")
+
 
 def open_atlas(db_path: Path) -> sqlite3.Connection:
     """Open (or create) the atlas SQLite database and apply the schema.

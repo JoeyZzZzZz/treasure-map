@@ -25,6 +25,7 @@ _RUN_COLUMNS = (
     "firmware_sha256",
     "build_hash",
     "hunt_commit",
+    "hunt_instances",
     "tool_version",
     "ghidra_version",
     "machine",
@@ -45,6 +46,7 @@ def _row_to_runrow(row: sqlite3.Row) -> RunRow:
         firmware_sha256=row["firmware_sha256"],
         build_hash=row["build_hash"],
         hunt_commit=row["hunt_commit"],
+        hunt_instances=row["hunt_instances"],
         tool_version=row["tool_version"],
         ghidra_version=row["ghidra_version"],
         machine=row["machine"],
@@ -151,8 +153,26 @@ class Staleness:
 
 
 def _remedy_for(run: RunRow) -> str:
+    """The concrete next command for a run that cannot be answered from as it stands.
+
+    Never a bare "this is stale": a reader who is told what is wrong and not what to do about it
+    has been given a dead end."""
     if run.firmware_path:
         return f"`tmap rescan {run.run_id}` re-reads {run.firmware_path} and refreshes this run."
+    # No firmware root to re-read. Re-scanning is the fix, but it needs the firmware back, which
+    # may take a while — and meanwhile what this run already extracted is still on disk and still
+    # readable. Naming that route matters because the alternative reads as "nothing you can do":
+    # the analysis.db is a different tool surface (the CLI annotates the extraction mismatch and
+    # prints the fact, where the run-routed path declines), not a way around the same check.
+    # Offered only when there IS a recorded analysis.db — otherwise the command has no argument.
+    if run.analysis_db_path:
+        return (
+            f"this run recorded no firmware root, so it cannot be re-read automatically. What it "
+            f"already extracted is still readable directly: "
+            f"`tmap fact <subcommand> --analysis-db {run.analysis_db_path}` prints the facts with "
+            f"an extraction-mismatch note attached. To refresh the run itself, "
+            f"`tmap scan <firmware-root> --run-id {run.run_id}` once you have the firmware."
+        )
     return (
         f"this run recorded no firmware root, so it cannot be re-read automatically — "
         f"`tmap scan <firmware-root> --run-id {run.run_id}` once you have the extracted firmware."

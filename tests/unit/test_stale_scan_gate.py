@@ -174,19 +174,15 @@ def test_cli_fact_annotates_an_old_extraction_and_still_prints_the_fact(tmp_path
     assert payload["pseudocode"]
 
 
-@pytest.mark.parametrize("value", [None, "SAME"])
-def test_cli_fact_says_nothing_when_there_is_nothing_to_say(tmp_path: Path, value: str) -> None:
-    """No note for a matching extraction, and no note when the version was never recorded.
-
-    The second half matters: an analysis.db with no pass_version cannot be compared, and inventing
-    a warning for it would train the reader to ignore the warning that means something.
+def test_cli_fact_says_nothing_when_the_extraction_matches(tmp_path: Path) -> None:
+    """No note when the comparison was made and came out equal — the only silent case.
 
     ★ The visible-row assertion is here because this test can pass for the WRONG reason. An
     analysis.db whose current_binaries view is empty also produces no note — silence proves nothing
     unless there was a row to compare. It cost a debugging round to notice, so it is asserted.
     """
     analysis = _mk_analysis(tmp_path)
-    _set_pass_version(analysis, current_pass_version() if value == "SAME" else None)
+    _set_pass_version(analysis, current_pass_version())
     conn = sqlite3.connect(analysis)
     assert conn.execute("SELECT COUNT(*) FROM current_binaries").fetchone()[0] == 1
     conn.close()
@@ -195,6 +191,35 @@ def test_cli_fact_says_nothing_when_there_is_nothing_to_say(tmp_path: Path, valu
     )
     assert out.exit_code == 0, out.output
     assert "stale_extract_warning" not in json.loads(out.output)
+
+
+def test_cli_fact_says_so_when_the_extraction_pass_was_never_recorded(tmp_path: Path) -> None:
+    """★ An unrecorded pipeline version is UNKNOWN, and unknown gets said out loud.
+
+    The check used to filter these rows out of its own query, so an analysis.db predating the
+    versioning produced the same silence as one that matched. Silence here reads as "extracted by
+    the pipeline you are running" — which is exactly the collapse of "cannot tell" into "same"
+    that this note exists to prevent. The fact is still printed; only the silence is gone.
+
+    MUTATION: put ``WHERE pass_version IS NOT NULL`` back on the query -> RED (no warning key).
+    Measured RED at 1 failed.
+
+    ★ The visible-row assertion is load-bearing for the same reason as above: with an empty
+    current_binaries view there is no NULL to find and the branch never runs.
+    """
+    analysis = _mk_analysis(tmp_path)
+    _set_pass_version(analysis, None)
+    conn = sqlite3.connect(analysis)
+    assert conn.execute("SELECT COUNT(*) FROM current_binaries").fetchone()[0] == 1
+    conn.close()
+    out = CliRunner().invoke(
+        fact_group, ["pseudocode", "handle_req", "--analysis-db", str(analysis)]
+    )
+    assert out.exit_code == 0, out.output
+    payload = json.loads(out.output)
+    assert "extraction pass unknown" in payload["stale_extract_warning"]
+    assert payload["found"] is True  # annotated, never refused
+    assert payload["pseudocode"]
 
 
 def test_cli_fact_tolerates_an_analysis_db_without_the_column(tmp_path: Path) -> None:

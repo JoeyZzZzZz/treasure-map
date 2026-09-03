@@ -60,6 +60,7 @@ from treasure_map.lib.atlas.writer import (
     delete_run_string_keyed_edges,
     delete_run_web_form_fields,
     finish_run,
+    refresh_run_lineage,
     upsert_pattern,
 )
 from treasure_map.lib.diff.loader import FuncRow, load_functions
@@ -227,6 +228,18 @@ def hunt_currency(
     ones, while a wrongly-repeated hunt costs only time. So an unknown commit (an install with no
     recorded commit), a NULL stamp (a run hunted before the stamp existed), a missing lineage hash
     and an unfinished previous hunt all re-hunt.
+
+    ★ The stamp is a claim ABOUT ROWS, so the rows are checked too. ``hunt_commit`` says which code
+    produced this run's instances; it says nothing about whether those instances are still in the
+    table. Anything that removes them without going through this module — a manual DELETE, a
+    partially restored atlas copy, another caller of delete_run_instances — leaves the stamp
+    vouching for rows that are gone, and the skip would then report "already hunted" over an empty
+    result. Comparing the stored COUNT against the live one closes that: the count is a value that
+    fails to match when the rows change, where mere existence is not (see the caveat below).
+
+    ★ The check compares COUNTS, never existence. A run whose analysis.db legitimately yields no
+    candidates writes zero rows, and a `SELECT 1 ... LIMIT 1` probe would find nothing there and
+    re-hunt it forever. Zero is a real result, and storing it makes zero comparable.
     """
     if run_row is None:
         return HuntCurrency(False, "no stored hunt for this run")
@@ -247,22 +260,47 @@ def hunt_currency(
         return HuntCurrency(False, "this analysis.db records no extraction hash")
     if run_row.get("build_hash") != build_hash:
         return HuntCurrency(False, "the extraction changed since this run was hunted")
+    # Last, because it is the only check that had to count rows. Both halves land on re-hunt: a run
+    # stamped before the count was recorded cannot be confirmed, and a count that no longer matches
+    # is a stamp describing rows that are not there.
+    stored_rows = run_row.get("hunt_instances")
+    if stored_rows is None:
+        return HuntCurrency(False, "hunted before the instance count was recorded")
+    live_rows = run_row.get("live_instances")
+    if stored_rows != live_rows:
+        return HuntCurrency(
+            False,
+            f"stored candidate rows changed since the hunt ({live_rows} now, {stored_rows} then)",
+        )
     return HuntCurrency(True, f"already hunted by this tmap ({commit[:12]}) from this extraction")
 
 
 def _stored_run_row(atlas_path: Path | str, run_id: str) -> dict[str, object] | None:
-    """The atlas ``run`` row for run_id, or None when the atlas has no such run (or no column)."""
+    """The atlas ``run`` row for run_id plus its LIVE instance count, or None when there is no row.
+
+    The live count rides along under ``live_instances`` rather than being fetched by the caller so
+    that it is read on the SAME connection at the SAME moment as the stamp it will be compared
+    against — two separate opens would leave a window in which the rows could change between the
+    claim and the check. Indexed by idx_instance_run, so it is a lookup, not a table scan."""
     conn = open_atlas(Path(atlas_path))
     try:
         try:
             row = conn.execute(
-                "SELECT scan_status, hunt_commit, build_hash FROM run WHERE run_id = ?", (run_id,)
+                "SELECT scan_status, hunt_commit, hunt_instances, build_hash "
+                "FROM run WHERE run_id = ?",
+                (run_id,),
             ).fetchone()
         except sqlite3.OperationalError:
-            # An atlas whose run table predates hunt_commit. Reading this as "no row" makes the
+            # An atlas whose run table predates these columns. Reading this as "no row" makes the
             # currency check answer not-current, i.e. re-hunt — the conservative direction.
             return None
-        return dict(row) if row is not None else None
+        if row is None:
+            return None
+        stored = dict(row)
+        stored["live_instances"] = conn.execute(
+            "SELECT COUNT(*) FROM instance WHERE source_run_id = ?", (run_id,)
+        ).fetchone()[0]
+        return stored
     finally:
         conn.close()
 
@@ -1013,10 +1051,26 @@ def run_analyzer2(
         commit=commit,
     )
     if currency.current and not rehunt:
-        # Nothing is written, and NOTHING IS DELETED: the stored instances stay exactly as they
+        # NOTHING IS DELETED and no result is written: the stored instances stay exactly as they
         # are. Returning zero counts alongside skipped=True is why the flag exists — a caller that
         # read the counts alone would see this as a hunt that found nothing.
+        #
+        # The one thing that IS written is where the inputs live now. begin_run never runs on this
+        # path, so without this the row keeps the analysis.db and firmware root of the hunt that
+        # actually ran; move the firmware, re-scan, and every later re-read still points at the old
+        # location. Narrow by construction (see refresh_run_lineage): the stamp, the status, the
+        # counts and the extraction hash all describe that earlier hunt and stay untouched.
         logger.info("hunt: skipped — %s", currency.reason)
+        relocate = open_atlas(Path(atlas_path))
+        try:
+            refresh_run_lineage(
+                relocate,
+                source_run_id,
+                analysis_db_path=str(Path(db_path).resolve()),
+                firmware_path=firmware_path,
+            )
+        finally:
+            relocate.close()
         return Analyzer2Stats(
             scanned=0,
             matches=0,
@@ -1547,6 +1601,10 @@ def run_analyzer2(
             # Stamped only HERE, after the instance transaction committed: the stamp claims "this
             # commit produced these instances", so it must never outrun the instances themselves.
             hunt_commit=commit,
+            # The other half of that claim, written in the same call: how many rows it produced.
+            # A later skip re-reads it and refuses to trust the stamp unless the table still holds
+            # exactly this many rows for the run.
+            hunt_instances=instances_written,
         )
     finally:
         atlas.close()

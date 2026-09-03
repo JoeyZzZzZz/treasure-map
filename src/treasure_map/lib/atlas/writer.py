@@ -679,8 +679,11 @@ def begin_run(
                -- The stamp says "this commit produced the instances in the table". The caller is
                -- about to DELETE those instances and write new ones, so the old stamp stops being
                -- true right here — clearing it means a crash mid-write leaves no claim of currency
-               -- behind, rather than one describing rows that no longer exist.
+               -- behind, rather than one describing rows that no longer exist. The row COUNT is
+               -- half of the same claim and stops being true at the same instant, so it goes with
+               -- it: a stale count left behind would describe rows about to be deleted.
                hunt_commit      = NULL,
+               hunt_instances   = NULL,
                scan_status      = 'in_progress',
                scanned_at       = CURRENT_TIMESTAMP,
                updated_at       = CURRENT_TIMESTAMP""",
@@ -699,6 +702,40 @@ def begin_run(
         conn.commit()
 
 
+def refresh_run_lineage(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    analysis_db_path: str | None = None,
+    firmware_path: str | None = None,
+    commit: bool = True,
+) -> int:
+    """Update ONLY where a run's inputs now live; return the number of rows touched.
+
+    For the path that decides not to re-hunt: the stored result still stands, but the caller just
+    told us where the analysis.db and the firmware root are NOW, and those may have moved since the
+    hunt that produced the result. Recording the new locations keeps every path that re-reads the
+    run (a rescan, a remedy line) pointed at files that exist.
+
+    Deliberately narrow. ``scan_status`` / ``hunt_commit`` / ``hunt_instances`` / ``build_hash`` /
+    the counts / ``scanned_at`` all describe THE HUNT THAT RAN, and a skipped hunt produced none of
+    them — writing them here would date a result to a run that never happened. A None argument
+    leaves the stored value alone rather than erasing it. Never inserts: a run with no row has no
+    lineage to relocate.
+    """
+    cur = conn.execute(
+        """UPDATE run
+              SET analysis_db_path = COALESCE(?, analysis_db_path),
+                  firmware_path    = COALESCE(?, firmware_path),
+                  updated_at       = CURRENT_TIMESTAMP
+            WHERE run_id = ?""",
+        (analysis_db_path, firmware_path, run_id),
+    )
+    if commit:
+        conn.commit()
+    return int(cur.rowcount)
+
+
 def finish_run(
     conn: sqlite3.Connection,
     run_id: str,
@@ -708,6 +745,7 @@ def finish_run(
     functions: int | None = None,
     functions_empty: int | None = None,
     hunt_commit: str | None = None,
+    hunt_instances: int | None = None,
     commit: bool = True,
 ) -> None:
     """Mark a run's scan FINISHED: set scan_status (default 'complete') + the analysis counts.
@@ -715,10 +753,12 @@ def finish_run(
     Called AFTER the run's instances are committed. If the row is missing (a code path that skipped
     begin_run) it is inserted, so a finished run is never invisible in list_runs.
 
-    ``hunt_commit`` records WHICH tmap produced the instances just committed. Passing None leaves
-    any existing stamp untouched rather than clearing it — a caller that does not know the commit
-    has no grounds to erase one that a previous hunt established. The stamp is what lets a later
-    run decide the stored result is reproducible and skip re-hunting it."""
+    ``hunt_commit`` records WHICH tmap produced the instances just committed, and
+    ``hunt_instances`` HOW MANY were committed. Passing None for either leaves the existing value
+    untouched rather than clearing it — a caller that does not know has no grounds to erase what a
+    previous hunt established. Together they are what lets a later run decide the stored result is
+    reproducible and skip re-hunting it: the commit says the same code would produce it, the count
+    says the rows it produced are still in the table."""
     if scan_status not in ("in_progress", "complete", "partial", "failed"):
         raise ConfigError(
             f"scan_status must be in_progress/complete/partial/failed; got {scan_status!r}"
@@ -726,17 +766,34 @@ def finish_run(
     cur = conn.execute(
         """UPDATE run SET scan_status = ?, binaries = ?, functions = ?, functions_empty = ?,
                hunt_commit = COALESCE(?, hunt_commit),
+               hunt_instances = COALESCE(?, hunt_instances),
                updated_at = CURRENT_TIMESTAMP
            WHERE run_id = ?""",
-        (scan_status, binaries, functions, functions_empty, hunt_commit, run_id),
+        (
+            scan_status,
+            binaries,
+            functions,
+            functions_empty,
+            hunt_commit,
+            hunt_instances,
+            run_id,
+        ),
     )
     if cur.rowcount == 0:
         conn.execute(
             """INSERT INTO run
                    (run_id, scan_status, binaries, functions, functions_empty, hunt_commit,
-                    scanned_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)""",
-            (run_id, scan_status, binaries, functions, functions_empty, hunt_commit),
+                    hunt_instances, scanned_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)""",
+            (
+                run_id,
+                scan_status,
+                binaries,
+                functions,
+                functions_empty,
+                hunt_commit,
+                hunt_instances,
+            ),
         )
     if commit:
         conn.commit()

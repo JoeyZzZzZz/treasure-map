@@ -80,10 +80,15 @@ CREATE TABLE IF NOT EXISTS run (
     firmware_sha256   TEXT,             -- run-identity content hash (manifest/firmware); NULL if unknown
     build_hash        TEXT,             -- extraction-pipeline content hash (pass_version) — STALE-scan signal
     hunt_commit       TEXT,             -- tmap commit that produced this run's INSTANCES — STALE-hunt
-                                        -- signal, and the only basis for skipping a re-hunt.
+                                        -- signal, and, together with build_hash and
+                                        -- hunt_instances, the basis for skipping a re-hunt.
                                         -- 'unknown' when the running install records no commit;
                                         -- NULL on a run hunted before this column existed. Neither
                                         -- ever compares equal to a real commit, so both re-hunt.
+    hunt_instances    INTEGER,          -- instance rows this run's hunt committed; NULL on a run
+                                        -- hunted before this column existed. The skip gate
+                                        -- requires it to equal the live count — a stamp cannot
+                                        -- vouch for rows that are no longer there.
     tool_version      TEXT,             -- treasure_map __version__ that produced this run
     ghidra_version    TEXT,             -- decompiler version, when known; else NULL
     machine           TEXT,             -- host that ran the scan, when known; else NULL

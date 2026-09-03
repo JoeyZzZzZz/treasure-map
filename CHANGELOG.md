@@ -9,6 +9,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A scan proven to be out of date is now refused on every tool, including the candidate map.**
+  The refusal lived on one code path — the one the fact tools route through — so it was reachable
+  from `get_pseudocode` and not from `list_candidates` or `explain_candidate`, which read the atlas
+  directly. A run demonstrably graded by code that no longer exists therefore handed back
+  candidates with no marking at all, through the entry the tool instructions name first. The gate
+  is now a single function called from every entry: the run-scoped readers refuse with
+  `stale_scan` + `remedy`, a diff refuses when either side is stale and says which side, and the
+  cross-run readers — which serve many firmware at once and so cannot refuse — drop those runs'
+  rows and name them under `stale_runs_refused`.
+  The bar for refusing is unchanged and deliberately narrow: only a PROVEN mismatch. A run whose
+  extraction hash or commit cannot be compared is still served, with its reason stated — widening
+  the coverage without widening the bar is the whole point, since a gate that fired on "cannot
+  tell" would make an existing atlas unreadable the day it landed.
+  ★ `list_candidates` without a `run_id` reports `candidates_excluded` per refused run and a
+  `corpus_note`, both counted under the same filters as `corpus`, so the arithmetic holds. Two
+  aggregations (`pattern_twins`, `cross_firmware_patterns`) count ACROSS runs and carry no run
+  column: their refused runs are named with a null count and a note saying the numbers still
+  include them, rather than a zero that would claim the run contributed nothing.
+
+- **A skipped re-hunt no longer trusts a stamp whose rows are gone.** The commit stamp said which
+  code produced a run's candidates; nothing checked that those candidates were still in the table.
+  Remove them by any route that is not the hunt itself — a manual DELETE, a partially restored
+  atlas copy, another caller of the delete helper — and the next scan read the stamp, skipped, and
+  reported "already hunted by this tmap" over an empty result. The run row now also records HOW
+  MANY rows the hunt committed (`hunt_instances`), and the skip requires that count to equal what
+  the table holds now.
+  The check compares counts, never existence: a run whose analysis.db legitimately yields no
+  candidates writes zero rows, and an "does it have any rows" probe would re-hunt it forever.
+  Zero is a real result, and storing it makes zero comparable.
+  ★ Consequence, stated so it is not misread as a bug: every run scanned before this lands has no
+  recorded count, which cannot be confirmed and therefore re-hunts once. After that first pass the
+  count is stored and the skip resumes. Same shape as the commit stamp's own first landing.
+
+- **A skipped hunt now records where the firmware and the analysis.db moved to.** The skip returns
+  before the run row is rewritten, so the recorded locations stayed at whatever they were when the
+  hunt last actually ran. Move the firmware, re-scan, and the run kept pointing at a directory that
+  is no longer there — which then broke the rescan classification and the remedy lines that read
+  it. The relocation is written and nothing else: the stamp, the status, the counts and the
+  extraction hash describe the hunt that ran, which a skip did not.
+
+- **A completeness check that could not run no longer looks like a clean scan.**
+  `incomplete_binaries` / `partially_incomplete_binaries` / `folded_xref_symbols` exist so an
+  absent candidate is not read as a clean binary. When the run had no recorded analysis.db, or the
+  file was gone, the answer was the same three empty lists — the strongest possible statement of
+  cleanliness, produced by not looking. `list_candidates` now carries an `analysis_completeness`
+  block whose `unavailable` says why the check did not run, and whose note says in words that the
+  empty lists above are unavailable, not clean.
+
+- **`tmap fact` now says so when the analysis.db records no extraction pipeline at all.** The
+  staleness note filtered unversioned rows out of its own query, so a database predating the
+  versioning produced exactly the same silence as one that matched the installed pipeline. The
+  fact is still printed — this path annotates, it does not refuse — but unknown is now stated
+  instead of read as "same".
+
+- **A run with no firmware root is told what it can still do.** Its remedy said only "re-scan once
+  you have the firmware". What that run already extracted is on disk and readable directly, so the
+  remedy now names `tmap fact --analysis-db <path>` alongside the re-scan — offered only when
+  there is a recorded path to name, since the command needs an argument.
+
+### Changed
+
+- **`tmap runs` and `tmap rescan` now group runs by WHICH input moved, and say what each costs.**
+  Both commands answered "out of date" without saying whether that meant a full re-decompile or a
+  seconds-long re-grade — a difference of orders of magnitude that the reader could previously
+  discover only by starting the work. Runs are now split into `needs re-extraction` (the
+  decompiler runs over every binary again; the binary count is shown) and `needs re-hunt` (stored
+  facts are re-graded, no decompiler), with the up-to-date ones listed separately. One classifier
+  answers both commands, so what `tmap runs` calls out of date and what `tmap rescan` offers to
+  redo cannot drift apart. Runs whose firmware root is missing are still reported by name, in
+  their own section, exactly as before.
+  `tmap runs` also shows the hunt stamp and the row count on the human line (`hunt <commit>` /
+  `hunt none`, `rows N` / `rows ?`), and `--json` gains `hunt_commit`, `hunt_instances` and the
+  `staleness` classification. Without them, a run offered for refresh was unexplained: the build
+  hash matched and nothing else was visible.
+
 - **The pass fingerprint now covers the whole per-binary extraction pipeline, not just the Java.**
   `pass_version` is the cache key that decides whether a same-content binary is re-extracted; it
   hashed only the `.java` scripts. When a Python relabel step (the stub resolver) started rewriting

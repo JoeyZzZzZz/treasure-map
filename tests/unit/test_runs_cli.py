@@ -11,6 +11,7 @@ from pathlib import Path
 from click.testing import CliRunner
 
 from treasure_map.cli.hunt_cli import _complete_run_id, runs, triage
+from treasure_map.lib.analyze.ghidra_runner import current_pass_version
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import InstanceRow
 from treasure_map.lib.atlas.writer import add_instance, begin_run, finish_run, upsert_pattern
@@ -97,3 +98,74 @@ def test_run_id_completion_matches_prefix(tmp_path: Path) -> None:
     out = _complete_run_id(_Ctx(), None, "rt_")  # type: ignore[arg-type]
     assert [c.value for c in out] == ["rt_scanned"]
     assert _complete_run_id(_Ctx(), None, "zzz") == []  # type: ignore[arg-type]
+
+
+def test_runs_shows_the_hunt_stamp_and_the_row_count(tmp_path: Path) -> None:
+    """★ The stamp decides whether a re-scan would do any work, so it belongs on the line a person
+    reads — not only in --json.
+
+    Without it, `tmap rescan` offering to redo a run is unexplained: the human view showed the
+    build hash matching and nothing else, so the run looked current. Both parts distinguish "not
+    recorded" from a value: ``hunt none`` and ``rows ?`` are honestly unknown, which is not the
+    same as a run that graded zero candidates.
+
+    MUTATION: drop the hunt/rows parts from ``_run_lineage_line`` -> RED.
+    """
+    atlas = tmp_path / "atlas.db"
+    conn = open_atlas(atlas)
+    begin_run(conn, "stamped", analysis_db_path="/ws/a.db", build_hash="pv_a")
+    finish_run(conn, "stamped", binaries=3, functions=9, hunt_commit="f" * 40, hunt_instances=1683)
+    begin_run(conn, "unstamped", analysis_db_path="/ws/b.db", build_hash="pv_a")
+    finish_run(conn, "unstamped", binaries=1, functions=2)
+    conn.close()
+
+    out = CliRunner().invoke(runs, ["--atlas", str(atlas)])
+    assert out.exit_code == 0, out.output
+    assert "hunt ffffffffffff" in out.output
+    assert "rows 1683" in out.output
+    assert "hunt none" in out.output
+    assert "rows ?" in out.output
+
+
+def test_runs_groups_by_which_input_moved(tmp_path: Path) -> None:
+    """★ The same three tiers `tmap rescan` uses, from the same classifier — so the command that
+    lists runs and the command that refreshes them cannot disagree about which are current.
+
+    MUTATION: classify with ``run_staleness`` instead -> RED (it treats an unconfirmable run as
+    current, so the un-stamped run would be reported up to date and never offered for refresh).
+    """
+    atlas = tmp_path / "atlas.db"
+    conn = open_atlas(atlas)
+    begin_run(conn, "old_extract", analysis_db_path="/ws/a.db", build_hash="facefeedfacefeed")
+    finish_run(conn, "old_extract", binaries=484, functions=9)
+    begin_run(conn, "old_hunt", analysis_db_path="/ws/b.db", build_hash=current_pass_version())
+    finish_run(conn, "old_hunt", binaries=2, functions=3)
+    conn.close()
+
+    out = CliRunner().invoke(runs, ["--atlas", str(atlas)])
+    assert out.exit_code == 0, out.output
+    assert "needs re-extraction (1)" in out.output
+    assert "old_extract" in out.output
+    assert "needs re-hunt (1)" in out.output
+    assert "old_hunt" in out.output
+    assert "tmap rescan" in out.output
+
+
+def test_runs_json_carries_the_stamp_and_the_classification(tmp_path: Path) -> None:
+    """A script gets the same answer without re-deriving it (and so cannot derive a different one).
+
+    MUTATION: drop the ``staleness`` key from the JSON view -> RED.
+    """
+    atlas = tmp_path / "atlas.db"
+    conn = open_atlas(atlas)
+    begin_run(conn, "r", analysis_db_path="/ws/a.db", build_hash="facefeedfacefeed")
+    finish_run(conn, "r", hunt_commit="f" * 40, hunt_instances=12)
+    conn.close()
+
+    out = CliRunner().invoke(runs, ["--atlas", str(atlas), "--json"])
+    assert out.exit_code == 0, out.output
+    row = json.loads(out.output)[0]
+    assert row["hunt_commit"] == "f" * 40
+    assert row["hunt_instances"] == 12
+    assert row["staleness"]["axis"] == "extraction"
+    assert "facefeedface" in row["staleness"]["reason"]

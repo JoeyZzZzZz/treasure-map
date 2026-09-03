@@ -32,20 +32,31 @@ def _stale_extract(conn: sqlite3.Connection) -> str | None:
     routes by run_id, has no reason to have chosen an old extraction, and cannot tell one from the
     other in the answer.)
 
-    Returns None when the comparison cannot be made — an analysis.db too old to record a pipeline
-    version, or one whose binaries carry more than one. Absence of a note is "nothing to say", not
-    "confirmed current".
+    Returns None when the comparison cannot be made and there is nothing useful to say about why —
+    an analysis.db with no binaries at all, or one whose binaries carry more than one recorded
+    version. Absence of a note is "nothing to say", not "confirmed current".
     """
     try:
         versions = [
             r[0]
-            for r in conn.execute(
-                "SELECT DISTINCT pass_version FROM current_binaries WHERE pass_version IS NOT NULL"
-            ).fetchall()
+            for r in conn.execute("SELECT DISTINCT pass_version FROM current_binaries").fetchall()
         ]
     except sqlite3.OperationalError:
         # An analysis.db predating the column. Nothing to compare against.
         return None
+    if not versions:
+        return None
+    if None in versions:
+        # Binaries extracted before the pipeline recorded a version at all. Filtering these out of
+        # the query — which is what this used to do — turned "I cannot tell" into silence, and
+        # silence here reads as "extracted by the pipeline you are running". It was not; it is
+        # unknown, and unknown is the thing this note exists to say out loud.
+        return (
+            "stale_extract: extraction pass unknown (pre-versioning scan) — this analysis.db does "
+            "not record which pipeline extracted it, so it cannot be compared against the "
+            f"installed tmap ({current_pass_version()}). The fact below is what that extraction "
+            "recorded; re-scanning the firmware may produce a different one."
+        )
     if len(versions) != 1:
         return None
     current = current_pass_version()

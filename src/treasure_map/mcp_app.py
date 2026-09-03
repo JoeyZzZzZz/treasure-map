@@ -169,7 +169,11 @@ _AGENT_INSTRUCTIONS = (
     "holds many firmware, so pass run_id (from list_runs) OR an evidence_ref (a candidate row's "
     "anchor, which self-resolves the run + binary + function); there is NO ambient default. Every "
     "result echoes resolved_run + run_lineage (build/scanned_at/scan_status) so you see which "
-    "scan answered and whether it is stale — check list_runs before trusting an old scan. Read "
+    "scan answered and whether it is stale — check list_runs before trusting an old scan. A run "
+    "PROVEN to have been hunted by different code than is answering is refused on EVERY tool, "
+    "candidates included (stale_scan + remedy; on a cross-run reader its rows are dropped and it "
+    "is named under stale_runs_refused); an unprovable mismatch is served with its reason stated, "
+    "never refused. Read "
     "facts: get_pseudocode (func = a name OR an address in any form; "
     "binary = short name OR full path), get_callees / get_xrefs to walk the call chain (an empty "
     "caller set may mean an indirect/dispatch-table call, not 'unreachable'), get_strings, "
@@ -540,6 +544,106 @@ def make_tools(
             "warning": warning,
         }
 
+    def _stale_refusal(atlas: sqlite3.Connection, run: RunRow) -> dict[str, Any] | None:
+        """The refusal for a PROVABLY stale run, or None when it is servable.
+
+        Only a proven mismatch gets here (see run_staleness): the stored run was demonstrably
+        produced by different code than is answering now, so every fact it would return is an
+        artifact of a pipeline that no longer exists, served with the same confidence as a current
+        one. Refusing is the point — a caller that cannot tell the two apart will not ask, and a
+        caveat buried in a large result does not get read.
+
+        ★ This is a COVERAGE surface, not a rule. The bar for refusing (proven, never merely
+        unconfirmable) is decided once, in run_staleness; what belongs here is every entry point a
+        caller can arrive through. A gate reachable from one tool and not another is not a weaker
+        gate, it is an open door beside a locked one, and the caller has no way to know which they
+        walked through.
+        """
+        stale = _run_staleness(run, build_hash=_current_pass_version(), commit=_installed_commit())
+        if not stale.stale:
+            return None
+        err = _error(atlas, f"run '{run.run_id}' is a STALE scan ({stale.axis}): {stale.detail}")
+        err["stale_scan"] = {"axis": stale.axis, "detail": stale.detail}
+        err["remedy"] = stale.remedy
+        return err
+
+    def _refuse_stale_run(atlas: sqlite3.Connection, run_id: str | None) -> dict[str, Any] | None:
+        """The refusal for a tool call SCOPED to one run, or None (unscoped, unknown, or servable).
+
+        An unknown run_id is left alone: "no such run in this atlas" is a different answer, and
+        each tool already gives it in its own shape. The refusal carries the run + lineage so the
+        caller can see WHICH scan was declined without a second call."""
+        if run_id is None:
+            return None
+        run = _get_run(atlas, run_id)
+        if run is None:
+            return None
+        err = _stale_refusal(atlas, run)
+        if err is not None:
+            err["resolved_run"] = run.run_id
+            err["run_lineage"] = _lineage_inline(run)
+        return err
+
+    def _refused_entries(
+        index: dict[str, dict[str, Any]], counts: dict[str, int] | None
+    ) -> list[dict[str, Any]]:
+        """``stale_runs_refused`` rows: which runs were refused and how many of their rows went.
+
+        ``counts`` None means the reader could not take those rows out — an aggregate computed
+        ACROSS runs has no per-run row to remove — so ``candidates_excluded`` is null rather than
+        zero. Null and 0 are different answers here: 0 says the run contributed nothing, null says
+        its contribution is still in the numbers below and could not be separated out."""
+        return [
+            {**entry, "candidates_excluded": (None if counts is None else counts.get(rid, 0))}
+            for rid, entry in sorted(index.items())
+        ]
+
+    def _refuse_stale_diff(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] | None:
+        """The refusal for a diff whose A or B side is a PROVABLY stale run, else None.
+
+        A diff is a claim about two scans, so it is only as current as the older of them: reading a
+        delta between one run graded by this code and one graded by code that no longer exists
+        gives a difference whose cause cannot be told apart from the difference in the graders. The
+        refusal names WHICH side, because they need separate re-scans. An unknown diff_id passes
+        through — 'no such diff' is each tool's own answer."""
+        row = atlas.execute(
+            "SELECT run_a_id, run_b_id FROM diff_meta WHERE diff_id = ?", (diff_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        for side, run_id in (("a", row["run_a_id"]), ("b", row["run_b_id"])):
+            run = _get_run(atlas, run_id) if run_id else None
+            if run is None:
+                continue
+            err = _stale_refusal(atlas, run)
+            if err is not None:
+                err["stale_scan"]["diff_side"] = side
+                err["diff_id"] = diff_id
+                err["run_lineage"] = _lineage_inline(run)
+                return err
+        return None
+
+    def _stale_run_index(atlas: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+        """Every PROVABLY stale run in this atlas, keyed by run_id, each with its refusal detail.
+
+        For the cross-run readers, which serve many firmware at once and so cannot answer with a
+        single refusal: they drop the stale runs' rows and report them under ``stale_runs_refused``
+        instead. Naming them is the whole point — rows that silently disappear from an aggregate
+        read as rows that were never there."""
+        build = _current_pass_version()
+        commit = _installed_commit()
+        index: dict[str, dict[str, Any]] = {}
+        for r in _list_runs(atlas):
+            stale = _run_staleness(r, build_hash=build, commit=commit)
+            if stale.stale:
+                index[r.run_id] = {
+                    "run_id": r.run_id,
+                    "axis": stale.axis,
+                    "detail": stale.detail,
+                    "remedy": stale.remedy,
+                }
+        return index
+
     def _resolve_db(atlas: sqlite3.Connection, run: RunRow) -> Path | dict[str, Any]:
         """The run's analysis.db Path, or a hard error (G4) — never a silent empty.
 
@@ -558,20 +662,9 @@ def make_tools(
                 f"run '{run.run_id}' has no recorded analysis.db (a pre-existing scan with no "
                 "lineage row) — re-scan it to enable fact tools on this run.",
             )
-        # Staleness REFUSAL. Only a proven mismatch gets here (see run_staleness): the stored run
-        # was demonstrably produced by different code than is answering now, so every fact this
-        # run would return is an artifact of a pipeline that no longer exists, served with the
-        # same confidence as a current one. Refusing is the point — an agent that cannot tell the
-        # two apart will not ask, and a caveat buried in a large result does not get read.
-        stale = _run_staleness(run, build_hash=_current_pass_version(), commit=_installed_commit())
-        if stale.stale:
-            err = _error(
-                atlas,
-                f"run '{run.run_id}' is a STALE scan ({stale.axis}): {stale.detail}",
-            )
-            err["stale_scan"] = {"axis": stale.axis, "detail": stale.detail}
-            err["remedy"] = stale.remedy
-            return err
+        refusal = _stale_refusal(atlas, run)
+        if refusal is not None:
+            return refusal
         authoritative = Path(run.analysis_db_path)
         if authoritative.exists():
             return authoritative
@@ -751,27 +844,43 @@ def make_tools(
 
     def _incomplete_for_run(
         atlas: sqlite3.Connection, run_id: str | None
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    ) -> tuple[
+        list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any] | None
+    ]:
         """The analysis-completeness red-lines for a SINGLE resolved run (they are a per-scan fact):
         incomplete binaries, partially-incomplete binaries, and folded high-fan-out xref symbols
         (whose constrained L0 edges are visible here, never silently dropped).
 
         Computed only when list_candidates is scoped to one resolvable run; empty across an all-runs
-        listing (the red-line is per firmware, not a single value over a shared atlas)."""
+        listing (the red-line is per firmware, not a single value over a shared atlas).
+
+        ★ The FOURTH return value is what keeps the other three honest. These red-lines exist so an
+        absent candidate is not read as a clean binary — which means an empty list has to mean
+        "looked, found none". Every way of failing to look (no run, no recorded analysis.db, the
+        file gone, a refusal) used to land on the same three empty lists as a clean scan, so the
+        one reading that most needed saying was the one that could not be said. ``unavailable``
+        carries WHY the check did not run, and is None only when it did.
+        """
         if run_id is None:
-            return [], [], []
+            # Unscoped: not a failure, and not a clean bill either — the red-line is a property of
+            # one scan, and there is no single one here.
+            return [], [], [], None
         run = _get_run(atlas, run_id)
         if run is None:
-            return [], [], []
+            return [], [], [], {"reason": "unknown_run", "run_id": run_id}
         db = _resolve_db(atlas, run)
         if isinstance(db, dict):
-            return [], [], []
+            # The resolver's own error, passed through whole: it already says whether the run has
+            # no recorded analysis.db, the file has moved, or the scan is refused as stale, and
+            # each needs a different fix.
+            return [], [], [], db
         conn = facts.open_analysis_ro(db)
         try:
             return (
                 facts.list_incomplete_binaries(conn),
                 facts.list_partially_incomplete_binaries(conn),
                 facts.list_folded_xref_symbols(conn),
+                None,
             )
         finally:
             conn.close()
@@ -854,15 +963,43 @@ def make_tools(
         that is the point of the view; with ``overlay=False`` the base-map order is unchanged."""
         atlas = open_atlas(atlas_path)
         try:
+            # ★ The stale gate stands HERE, before any candidate is read — this is the entry an
+            # agent is told to start from, so a scan proven to have been graded by other code has
+            # to be refused here or the refusal does not exist. Scoped to one run it is a refusal;
+            # unscoped it cannot be (the map spans firmware), so those runs are dropped from the
+            # corpus and NAMED below instead.
+            scoped_refusal = _refuse_stale_run(atlas, run_id)
+            if scoped_refusal is not None:
+                return scoped_refusal
             # run_id scopes the listing to one firmware; None spans every run in the atlas. There is
             # NO ambient 'current run' fallback — the old current_run_id binding (which could
             # silently isolate to the wrong scan) is gone; each row carries its own ``run``.
             ranked = _triage(atlas, run_id=run_id)
+            stale_index = _stale_run_index(atlas) if run_id is None else {}
+            refused_rows: dict[str, list[Any]] = {}
+            if stale_index:
+                # BEFORE whole_run and before corpus: every later count is derived from this list,
+                # so a row removed after the fact would still be counted in the totals a reader
+                # uses to judge how much is left. The removed rows are KEPT here, not just counted,
+                # because how many of them there "are" depends on this call's own filters — and
+                # saying corpus excludes N of them is only true if N was measured the same way.
+                servable = []
+                for c in ranked:
+                    if c.source_run_id in stale_index:
+                        refused_rows.setdefault(c.source_run_id, []).append(c)
+                    else:
+                        servable.append(c)
+                ranked = servable
             # Kept before any filtering: the cross-scope remainder is measured against the WHOLE
             # run, so finishing one class is never read as finishing the firmware.
             whole_run = list(ranked)
             runs_in_atlas = [r.run_id for r in _list_runs(atlas)]
-            incomplete, partially_incomplete, folded_xref = _incomplete_for_run(atlas, run_id)
+            (
+                incomplete,
+                partially_incomplete,
+                folded_xref,
+                completeness_unavailable,
+            ) = _incomplete_for_run(atlas, run_id)
             # Read the annotations while the atlas is still open (each row's basis freshness is
             # re-derived against the live base map). Overlay OFF -> nothing is read at all.
             overlays = _list_overlays(atlas)["overlays"] if overlay else []
@@ -877,11 +1014,25 @@ def make_tools(
             coverage_index = _load_coverage_index(atlas)
         finally:
             atlas.close()
-        ranked = _filter_candidates(ranked, sink=sink, status=status, include_gated=include_gated)
-        if sink_class is not None:
-            ranked = [c for c in ranked if c.sink_class == sink_class]
-        if fingerprint is not None:
-            ranked = [c for c in ranked if c.structural_fingerprint == fingerprint]
+
+        def _narrow(rows: list[Any]) -> list[Any]:
+            rows = _filter_candidates(rows, sink=sink, status=status, include_gated=include_gated)
+            if sink_class is not None:
+                rows = [c for c in rows if c.sink_class == sink_class]
+            if fingerprint is not None:
+                rows = [c for c in rows if c.structural_fingerprint == fingerprint]
+            return rows
+
+        ranked = _narrow(ranked)
+        # The refused rows are narrowed by the SAME filters before being counted, so ``corpus`` and
+        # ``candidates_excluded`` are measured on one basis and the note's arithmetic holds. Count
+        # them raw and a caller who filtered to one sink class would be told the corpus excludes
+        # rows that would not have been in it either way.
+        refused_counts = {rid: len(_narrow(rows)) for rid, rows in refused_rows.items()}
+        stale_runs_refused = [
+            {**entry, "candidates_excluded": refused_counts.get(rid, 0)}
+            for rid, entry in sorted(stale_index.items())
+        ]
         # Apply the map lens: --filter dimensions circle-and-weight FLOAT (corpus never reduced); an
         # --only sweep prunes, refused on an optimistic/null-bearing dimension (which would silently
         # hide candidates). The composite key and demotion iron law ride under any spine.
@@ -1006,6 +1157,40 @@ def make_tools(
             # materialized -- visible with per-symbol counts so a suppressed edge is a known
             # decision, never a silent drop. Empty unless scoped to one resolvable run.
             "folded_xref_symbols": folded_xref,
+            # ★ Whether the three lists above were COMPUTED. They are the reason an absent
+            # candidate is not read as a clean binary, so an empty list has to be able to mean only
+            # one thing. ``unavailable`` is null when the check ran; otherwise it carries why it
+            # did not, and the note says in words that the empty lists are silence, not a result.
+            "analysis_completeness": {
+                "unavailable": completeness_unavailable,
+                "note": (
+                    "incomplete_binaries / partially_incomplete_binaries / folded_xref_symbols "
+                    "COULD NOT BE COMPUTED for this listing — the empty lists above are "
+                    "UNAVAILABLE, not clean. See unavailable.error for what to do."
+                    if completeness_unavailable is not None
+                    else (
+                        "computed for this run."
+                        if run_id is not None
+                        else "not computed: these are per-scan facts and this listing spans every "
+                        "run — pass run_id to get them."
+                    )
+                ),
+            },
+            # ★ Runs whose stored result was PROVEN to have been graded by different code than is
+            # answering. Their candidates are not in this listing; they are counted here instead,
+            # by name, so the reader can tell a firmware that produced nothing from one that was
+            # not served. Always present — an empty list is the statement that none were refused.
+            "stale_runs_refused": stale_runs_refused,
+            # Stated only when it applies, because it changes how ``corpus`` reads: the refused
+            # rows are outside the denominator rather than inside it at zero, so a float count of
+            # "0 of N" is measured against rows that could actually have been served.
+            "corpus_note": (
+                f"corpus excludes {sum(refused_counts.values())} candidates from "
+                f"{len(stale_runs_refused)} refused run(s), counted under the same filters as "
+                "corpus — see stale_runs_refused"
+                if stale_runs_refused
+                else None
+            ),
             # ``corpus`` is the INVARIANT candidate total — a --filter float never changes it. Under
             # an --only sweep, ``total`` is the (smaller) pruned view; ``corpus`` still shows the
             # whole set so "no match" is never read as "absent".
@@ -1048,16 +1233,27 @@ def make_tools(
         conn = open_atlas(atlas_path)
         try:
             rows = _ledger(conn)
+            stale_index = _stale_run_index(conn)
         finally:
             conn.close()
         page, meta = _page(rows, limit, offset)
-        return {
+        result = {
             "note": _DERIVED_SIGNAL_NOTE,
             # The analysis-completeness red-line is a per-SCAN fact; it is surfaced per run via
             # list_candidates(run_id=…), not on this cross-run aggregation (no single analysis.db).
             **meta,
+            # Same reason as pattern_twins: device_spread IS a count of runs, so removing one is
+            # re-deriving the ledger, not filtering it. Named, with a null count.
+            "stale_runs_refused": _refused_entries(stale_index, None),
             "patterns": [asdict(r) for r in page],
         }
+        if stale_index:
+            result["stale_runs_note"] = (
+                "device_spread still COUNTS the refused runs listed in stale_runs_refused: it is "
+                "a distinct-run count over each pattern's instances and cannot be filtered without "
+                "re-deriving the ledger. Read it as an upper bound on servable scans."
+            )
+        return result
 
     def pattern_density(limit: int = 100, offset: int = 0) -> dict[str, Any]:
         """Candidate-instance density per (run, sink_class, fingerprint).
@@ -1068,13 +1264,24 @@ def make_tools(
         conn = open_atlas(atlas_path)
         try:
             rows = _density(conn)
+            stale_index = _stale_run_index(conn)
         finally:
             conn.close()
+        counts: dict[str, int] = {}
+        if stale_index:
+            kept = []
+            for r in rows:
+                if r.source_run_id in stale_index:
+                    counts[r.source_run_id] = counts.get(r.source_run_id, 0) + r.instance_count
+                else:
+                    kept.append(r)
+            rows = kept
         page, meta = _page(rows, limit, offset)
         return {
             "note": _DERIVED_SIGNAL_NOTE,
             # Per-scan completeness rides list_candidates(run_id=…); this aggregation is cross-run.
             **meta,
+            "stale_runs_refused": _refused_entries(stale_index, counts),
             "density": [asdict(r) for r in page],
         }
 
@@ -1087,14 +1294,28 @@ def make_tools(
         conn = open_atlas(atlas_path)
         try:
             rows = _twins(conn)
+            stale_index = _stale_run_index(conn)
         finally:
             conn.close()
         page, meta = _page(rows, limit, offset)
-        return {
+        result = {
             "note": _DERIVED_SIGNAL_NOTE,
             **meta,
+            # Named but NOT removed: a twin row is a count over every run at once and carries no
+            # run of its own, so a refused run's instances cannot be taken back out of it without
+            # re-deriving the aggregation. Saying which runs are in there beats a silently mixed
+            # count — and null (not 0) is what says their contribution is still included.
+            "stale_runs_refused": _refused_entries(stale_index, None),
             "twins": [asdict(r) for r in page],
         }
+        if stale_index:
+            result["stale_runs_note"] = (
+                "blocked_count / non_blocked_count still INCLUDE the refused runs listed in "
+                "stale_runs_refused: these counts aggregate across every run and carry no run "
+                "column to filter on. Scope per run with list_candidates(run_id=…) to read only "
+                "servable scans."
+            )
+        return result
 
     def dormant_candidates(limit: int = 100, offset: int = 0) -> dict[str, Any]:
         """Candidates whose in-function path carries an identified guard (blocked, L0/L1).
@@ -1105,12 +1326,25 @@ def make_tools(
         conn = open_atlas(atlas_path)
         try:
             rows = _dormant(conn)
+            stale_index = _stale_run_index(conn)
         finally:
             conn.close()
+        # Dropped BEFORE paging, so the page counts describe rows that could actually be served.
+        counts: dict[str, int] = {}
+        if stale_index:
+            kept = []
+            for r in rows:
+                rid = r["source_run_id"]
+                if rid in stale_index:
+                    counts[rid] = counts.get(rid, 0) + 1
+                else:
+                    kept.append(r)
+            rows = kept
         page, meta = _page(rows, limit, offset)
         return {
             "note": _DERIVED_SIGNAL_NOTE,
             **meta,
+            "stale_runs_refused": _refused_entries(stale_index, counts),
             "dormant": [dict(r) for r in page],
         }
 
@@ -1127,9 +1361,20 @@ def make_tools(
         has, it says where to put one and why that is worth doing for the reader's own sake."""
         conn = open_atlas(atlas_path)
         try:
-            ex = _explain_candidate(conn, evidence_ref)
             ref = _resolve_ref(conn, evidence_ref)
             run = _get_run(conn, ref[0]) if ref is not None and ref[0] is not None else None
+            # ★ Same gate as list_candidates, on the tool the map's rows point AT. A ref resolves
+            # its own run, so the refusal needs no argument from the caller — and without it the
+            # refusal is one hop from useless: every candidate row carries a ref, and following one
+            # is the documented next step.
+            if run is not None:
+                refusal = _stale_refusal(conn, run)
+                if refusal is not None:
+                    refusal["resolved_run"] = run.run_id
+                    refusal["run_lineage"] = _lineage_inline(run)
+                    refusal["evidence_ref"] = evidence_ref
+                    return refusal
+            ex = _explain_candidate(conn, evidence_ref)
             coverage_state = _load_coverage_index(conn).state_for(evidence_ref)
         finally:
             conn.close()
@@ -1180,11 +1425,18 @@ def make_tools(
         stated (``resolved: false``/``indirect_unresolved``), never dropped."""
         conn = open_atlas(atlas_path)
         try:
+            ref = _resolve_ref(conn, evidence_ref)
+            run = _get_run(conn, ref[0]) if ref is not None and ref[0] is not None else None
+            if run is not None:
+                refusal = _stale_refusal(conn, run)
+                if refusal is not None:
+                    refusal["resolved_run"] = run.run_id
+                    refusal["run_lineage"] = _lineage_inline(run)
+                    refusal["evidence_ref"] = evidence_ref
+                    return refusal
             result: dict[str, Any] = _get_sink_provenance(
                 conn, evidence_ref, sink_idx, dominating_only=dominating_only
             )
-            ref = _resolve_ref(conn, evidence_ref)
-            run = _get_run(conn, ref[0]) if ref is not None and ref[0] is not None else None
         finally:
             conn.close()
         result["note"] = _DERIVED_SIGNAL_NOTE
@@ -1219,6 +1471,9 @@ def make_tools(
         completeness caveat: it then means "may be incomplete within THIS run"."""
         conn = open_atlas(atlas_path)
         try:
+            refusal = _refuse_stale_run(conn, run_id)
+            if refusal is not None:
+                return refusal
             result = _get_nvram_key_flow(conn, key, run_id=run_id)
         finally:
             conn.close()
@@ -1249,6 +1504,9 @@ def make_tools(
         string-key-dispatched)."""
         conn = open_atlas(atlas_path)
         try:
+            refusal = _refuse_stale_run(conn, run_id)
+            if refusal is not None:
+                return refusal
             result = _get_string_keyed_edges(
                 conn,
                 run_id=run_id,
@@ -1289,6 +1547,9 @@ def make_tools(
         thin forwarding wrapper — that callsite is invisible here)."""
         conn = open_atlas(atlas_path)
         try:
+            refusal = _refuse_stale_run(conn, run_id)
+            if refusal is not None:
+                return refusal
             return _launched_by(conn, target, run_id=run_id, limit=limit)
         finally:
             conn.close()
@@ -1316,6 +1577,9 @@ def make_tools(
         keeps the payload to rows + paging; ``verbose=true`` adds the note + legend."""
         conn = open_atlas(atlas_path)
         try:
+            refusal = _refuse_stale_diff(conn, diff_id)
+            if refusal is not None:
+                return refusal
             return _get_diff_deltas(
                 conn,
                 diff_id,
@@ -1342,6 +1606,9 @@ def make_tools(
         empty get_diff_deltas for it is a BLIND SPOT, never 'no change' (list_diff_blindspots)."""
         conn = open_atlas(atlas_path)
         try:
+            refusal = _refuse_stale_diff(conn, diff_id)
+            if refusal is not None:
+                return refusal
             return _get_diff_meta(conn, diff_id)
         finally:
             conn.close()
@@ -1358,6 +1625,9 @@ def make_tools(
         removed (see function_presence)."""
         conn = open_atlas(atlas_path)
         try:
+            refusal = _refuse_stale_diff(conn, diff_id)
+            if refusal is not None:
+                return refusal
             if side == "b":
                 return _align_by_b(conn, diff_id, addr)
             return _align_by_a(conn, diff_id, addr)
@@ -1376,6 +1646,9 @@ def make_tools(
         registration_unknown)."""
         conn = open_atlas(atlas_path)
         try:
+            refusal = _refuse_stale_diff(conn, diff_id)
+            if refusal is not None:
+                return refusal
             return _get_diff_capabilities(conn, diff_id)
         finally:
             conn.close()
@@ -1877,6 +2150,9 @@ def make_tools(
         overlay-on view's float(+1)/sink(-1); the base map's own ordering is untouched."""
         atlas = open_atlas(atlas_path)
         try:
+            refusal = _refuse_stale_run(atlas, run_id)
+            if refusal is not None:
+                return refusal
             return _list_overlays(atlas, verdict=verdict, run_id=run_id)
         finally:
             atlas.close()

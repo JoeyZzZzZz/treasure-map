@@ -85,6 +85,10 @@ class RunRow:
     # one. None on a run hunted before the stamp existed, and 'unknown' when the hunting install
     # had no commit to record — neither is a commit, so neither ever reads as "up to date".
     hunt_commit: str | None = None
+    # How many instance rows that hunt committed. None on a run hunted before the count was
+    # recorded — which is not zero: zero is a run that legitimately produced no candidates, and the
+    # two must not collapse, or a real empty result would be indistinguishable from an unknown one.
+    hunt_instances: int | None = None
     tool_version: str | None = None
     ghidra_version: str | None = None
     machine: str | None = None
