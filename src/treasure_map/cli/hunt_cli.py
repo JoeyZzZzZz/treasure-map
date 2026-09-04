@@ -720,19 +720,52 @@ def _reachability_inline(status: str) -> str:
     return "not shown reachable within the function (a lead to verify)"
 
 
-def _run_lineage_line(r: RunRow) -> str:
-    """One human line of a run's lineage: id + status + scan date + build + hunt stamp + counts.
+def _run_lineage_line(
+    r: RunRow, *, id_width: int = 0, status_width: int = 0, bins_width: int = 0
+) -> str:
+    """One human line: id + status + scan date + counts.
 
-    The hunt stamp (which tmap graded this run's candidates, and how many rows it wrote) is shown
-    beside the build hash because the two together are what decides whether a re-scan would redo
-    any work — a reader who can see only the build hash cannot tell why a run is being offered for
-    refresh. Both parts distinguish "not recorded" from a value: ``hunt none`` is a run graded
-    before the stamp existed and ``rows ?`` a run graded before the count did, neither of which is
-    the same as a run that legitimately produced zero candidates.
+    Provenance — the build hash, the hunt stamp, the row count — is in ``--json``. It is what a
+    machine compares; a person reading a list of runs is answering a different question (what is
+    here, and is it current), and six lines of hashes answer it worse than the grouping does.
+
+    The three width arguments pad the ragged columns so a list of runs reads down as well as
+    across; a single non-``complete`` status is enough to knock every column after it out of line.
+    All default to 0, which is the unpadded single-line form.
 
     A run with no lineage row (a pre-existing scan) is shown but flagged — never hidden."""
     if not r.resolved:
-        return f"{r.run_id}   [no lineage row — pre-existing scan; re-scan to record it]"
+        return (
+            f"{r.run_id:<{id_width}}   [no lineage row — pre-existing scan; re-scan to record it]"
+        )
+    parts = [f"{r.run_id:<{id_width}}", f"{r.scan_status or 'unknown':<{status_width}}"]
+    if r.scanned_at:
+        parts.append(f"scanned {str(r.scanned_at).split(' ')[0]}")
+    if r.binaries is not None or r.functions is not None:
+        parts.append(f"{r.binaries or 0:>{bins_width}} bins / {r.functions or 0} fns")
+    return "   ".join(parts)
+
+
+def _line_widths(run_rows: list[RunRow]) -> tuple[int, int, int]:
+    """The id, status and binary-count column widths for a listing, measured over EVERY run it
+    will show — so the tiers line up with each other, not only within themselves."""
+    ids = max((len(r.run_id) for r in run_rows), default=0)
+    status = max((len(r.scan_status or "unknown") for r in run_rows if r.resolved), default=0)
+    bins = max((len(str(r.binaries or 0)) for r in run_rows if r.resolved), default=0)
+    return ids, status, bins
+
+
+def _run_provenance_line(r: RunRow) -> str:
+    """The lineage line WITH provenance: build hash + hunt stamp + row count.
+
+    ★ Kept for the one-run banner at the top of a candidate view, which is a different surface
+    answering a different question: it exists so a STALE scan cannot be read in silence, and that
+    view has no ``--json`` to fall back on. The listing line drops these because the listing has
+    somewhere else to put them; here there is nowhere else. Both parts distinguish "not recorded"
+    from a value: ``hunt none`` is a run graded before the stamp existed and ``rows ?`` one graded
+    before the count did, neither of which is a run that legitimately produced zero candidates."""
+    if not r.resolved:
+        return _run_lineage_line(r)
     parts = [r.run_id, r.scan_status or "unknown"]
     if r.scanned_at:
         parts.append(f"scanned {str(r.scanned_at).split(' ')[0]}")
@@ -766,7 +799,7 @@ def _echo_run_lineage(atlas_path: Path, selected_run: str | None) -> None:
             if selected_run is not None:
                 r = run_get_run(conn, selected_run)
                 if r is not None:
-                    click.echo(f"run: {_run_lineage_line(r)}")
+                    click.echo(f"run: {_run_provenance_line(r)}")
                     return
             n = len(run_list_runs(conn))
         finally:
@@ -843,21 +876,41 @@ def runs(config: Path | None, atlas_path: Path | None, as_json: bool) -> None:
         click.echo("no runs in this atlas yet — run `tmap scan <firmware>` first.")
         return
     click.echo(f"{len(run_rows)} run(s) in {resolved_atlas}:")
+    id_w, status_w, bins_w = _line_widths(run_rows)
     # Grouped by WHICH input has moved on, not merely by whether something has. The two groups cost
     # different amounts of time to bring forward, so a reader deciding what to do next needs them
     # apart; the same classifier answers `tmap rescan`, so the two commands cannot disagree.
     for axis, tier in (("extraction", extraction), ("hunt", hunt_stale)):
         if not tier:
             continue
-        click.echo(f"\n{_TIER_LABEL[axis]} ({len(tier)}) — {_TIER_COST[axis]}:")
-        for r, why in tier:
-            click.echo(f"  {_run_lineage_line(r)}")
-            click.echo(f"      {why}")
+        click.echo(f"\n{_TIER_LABEL[axis]} ({len(tier)}):")
+        for r, _why in tier:
+            click.echo(
+                f"  {_run_lineage_line(r, id_width=id_w, status_width=status_w, bins_width=bins_w)}"
+            )
+        # The reason once per tier, not once per run. Six runs out of date for the same reason is
+        # one fact about the install, and repeating it beside every line hid the list it annotates.
+        # Several reasons -> several lines, each naming the runs it is about, so grouping never
+        # merges two different situations into whichever sentence happened to come first.
+        for reason, ids in _reasons_grouped(tier, axis).items():
+            named = "" if len(ids) == len(tier) else f": {', '.join(ids)}"
+            click.echo(f"  → {reason}{named}")
     if current:
-        click.echo(f"\nup to date ({len(current)}) — a re-scan would reproduce these:")
+        click.echo(f"\nup to date ({len(current)}):")
         for r in current:
-            click.echo(f"  {_run_lineage_line(r)}")
-    click.echo("\n`tmap rescan` refreshes the runs above that recorded a firmware root.")
+            click.echo(
+                f"  {_run_lineage_line(r, id_width=id_w, status_width=status_w, bins_width=bins_w)}"
+            )
+    stale_runs = [r for r, _why in (*extraction, *hunt_stale)]
+    if any(not r.firmware_path or not Path(r.firmware_path).is_dir() for r in stale_runs):
+        # Some of what is listed above cannot be refreshed at all — saying "rescan them" without
+        # that would send the reader at a command that fails on a subset, with no hint which.
+        click.echo(
+            "\n`tmap rescan` refreshes the runs that still have a firmware root; the others are "
+            "readable via `tmap fact --analysis-db <path>`."
+        )
+    else:
+        click.echo("\n`tmap rescan` refreshes them.")
 
 
 @click.command("triage", short_help="Rank & show candidates only (scan's 3rd stage)")
@@ -1515,6 +1568,58 @@ _TIER_COST = {
     "extraction": "slower: the decompiler runs over every binary again",
     "hunt": "fast: stored facts are re-graded, the decompiler does not run",
 }
+
+
+# The machine reason -> one sentence a person can act on, with the cost of acting folded in.
+# Prefix-matched because several reasons carry interpolated values (hashes, counts) that say
+# nothing to a reader; what they need is which input moved and how long the fix takes.
+_REASON_HUMAN: tuple[tuple[str, str], ...] = (
+    ("hunted by ", "hunted by an older tmap; re-hunt is fast (no decompile)"),
+    (
+        "hunted before the commit stamp existed",
+        "hunted before tmap recorded what it ran; re-hunt is fast",
+    ),
+    (
+        "hunted before the instance count was recorded",
+        "hunted before tmap recorded what it ran; re-hunt is fast",
+    ),
+    (
+        "stored candidate rows changed since the hunt",
+        "stored candidates were modified after the hunt; re-hunt is fast",
+    ),
+    (
+        "the running install records no commit",
+        "this install records no commit, so currency cannot be confirmed; re-hunt is fast",
+    ),
+)
+
+
+def _reason_human(axis: str, reason: str, *, binaries: int | None = None) -> str:
+    """One actionable sentence for a tier's reason, or the machine reason verbatim.
+
+    ★ An unmapped reason passes through UNCHANGED. Rewriting only the reasons that were thought of
+    is how a new one becomes invisible: the reader would see a familiar sentence describing a
+    situation nobody had considered. Verbatim is worse prose and a true statement.
+    """
+    if axis == "extraction" and reason.startswith("extracted by "):
+        scale = f" (decompiles {binaries} binaries)" if binaries else ""
+        return f"extracted by an older tmap; re-extraction is slow{scale}"
+    for prefix, human in _REASON_HUMAN:
+        if reason.startswith(prefix):
+            return human
+    return reason
+
+
+def _reasons_grouped(tier: list[tuple[RunRow, str]], axis: str) -> dict[str, list[str]]:
+    """``{human reason -> the run ids it covers}`` for one tier, in first-appearance order.
+
+    The extraction sentence names how many binaries would be decompiled, which is a property of
+    the whole tier rather than of one run, so it is summed here."""
+    total_bins = sum(r.binaries or 0 for r, _why in tier)
+    out: dict[str, list[str]] = {}
+    for r, why in tier:
+        out.setdefault(_reason_human(axis, why, binaries=total_bins or None), []).append(r.run_id)
+    return out
 
 
 def _staleness_tiers(

@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`tmap runs`' human listing drops the provenance columns.** The build hash, the hunt stamp and
+  the row count are what a machine compares; they are in `--json`, and on six lines they crowded
+  out the list they were annotating. A person reading a list of runs is answering a different
+  question — what is here, and is it current — so each line is now the run, its status, its scan
+  date and its counts, in aligned columns. The reason a tier is out of date is said ONCE per tier
+  rather than beside every run, in a sentence with the cost of fixing it folded in
+  (`→ hunted by an older tmap; re-hunt is fast (no decompile)`); when a tier holds several reasons
+  each gets its own line naming the runs it covers, so grouping never merges two situations into
+  whichever sentence came first. A reason the mapping does not recognise passes through verbatim.
+  ★ The one-run banner at the top of a candidate view KEEPS the build hash. It exists so a stale
+  scan cannot be read in silence and it has no `--json` to fall back on — the listing dropped
+  provenance because the listing has somewhere else to put it; there, there is nowhere else.
+  ★ The closing line names the limit when there is one: if any listed run's firmware root is gone,
+  it says so and points at `tmap fact --analysis-db` for those, rather than sending the reader at
+  a command that fails on a subset without saying which.
+  Unchanged: the tier classification, `tmap rescan`'s output, and `--json`.
+
 ### Fixed
 
 - **A binary is identified by its row, not by its name.** One firmware ships the same

@@ -8,8 +8,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
+from treasure_map.cli import hunt_cli
 from treasure_map.cli.hunt_cli import _complete_run_id, runs, triage
 from treasure_map.lib.analyze.ghidra_runner import current_pass_version
 from treasure_map.lib.atlas.connection import open_atlas
@@ -46,7 +48,7 @@ def test_runs_lists_lineage_and_flags_unresolved(tmp_path: Path) -> None:
     r = CliRunner().invoke(runs, ["--atlas", str(atlas)])
     assert r.exit_code == 0, r.output
     assert "rt_scanned" in r.output
-    assert "complete" in r.output and "build pv_a" in r.output  # lineage shown
+    assert "complete" in r.output  # status shown
     assert "12 bins / 3400 fns" in r.output
     # the pre-existing (instance-only) run is VISIBLE but flagged, never hidden
     assert "old_preexisting" in r.output
@@ -100,17 +102,28 @@ def test_run_id_completion_matches_prefix(tmp_path: Path) -> None:
     assert _complete_run_id(_Ctx(), None, "zzz") == []  # type: ignore[arg-type]
 
 
-def test_runs_shows_the_hunt_stamp_and_the_row_count(tmp_path: Path) -> None:
-    """★ The stamp decides whether a re-scan would do any work, so it belongs on the line a person
-    reads — not only in --json.
+def _run_lines(output: str) -> list[str]:
+    """The per-run lines of a listing: indented, and not one of the tier's ``→`` reason lines."""
+    return [
+        ln
+        for ln in output.splitlines()
+        if ln.startswith("  ") and not ln.strip().startswith("→") and ln.strip()
+    ]
 
-    Without it, `tmap rescan` offering to redo a run is unexplained: the human view showed the
-    build hash matching and nothing else, so the run looked current. Both parts distinguish "not
-    recorded" from a value: ``hunt none`` and ``rows ?`` are honestly unknown, which is not the
-    same as a run that graded zero candidates.
 
-    MUTATION: drop the hunt/rows parts from ``_run_lineage_line`` -> RED.
+def test_the_human_listing_carries_no_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ The listing answers what is here and whether it is current. The build hash, the hunt
+    stamp and the row count answer neither: they are what a machine compares, they are in
+    ``--json``, and on six lines they crowded out the list they were annotating.
+
+    MUTATION: put the ``build`` / ``hunt`` / ``rows`` parts back into ``_run_lineage_line`` -> RED.
+    Measured RED at 1 failed.
     """
+    # A commit the stamps can differ FROM. Without it the editable install records none and every
+    # run lands on the same "cannot be confirmed" reason, before the reason under test is reached.
+    monkeypatch.setattr(hunt_cli, "installed_commit", lambda: "c" * 40)
     atlas = tmp_path / "atlas.db"
     conn = open_atlas(atlas)
     begin_run(conn, "stamped", analysis_db_path="/ws/a.db", build_hash="pv_a")
@@ -121,10 +134,96 @@ def test_runs_shows_the_hunt_stamp_and_the_row_count(tmp_path: Path) -> None:
 
     out = CliRunner().invoke(runs, ["--atlas", str(atlas)])
     assert out.exit_code == 0, out.output
-    assert "hunt ffffffffffff" in out.output
-    assert "rows 1683" in out.output
-    assert "hunt none" in out.output
-    assert "rows ?" in out.output
+    # Checked on the RUN LINES, not the whole output: the tier label and the reason both
+    # legitimately contain "re-hunt", so asserting over everything is a check nothing can satisfy.
+    run_lines = _run_lines(out.output)
+    assert run_lines, out.output
+    for line in run_lines:
+        for token in ("build ", "hunt ", "rows "):
+            assert token not in line, (token, line)
+    # what it DOES carry: the run, its state, and one line saying what to do about it
+    assert "stamped" in out.output and "3 bins / 9 fns" in out.output
+    assert "needs re-extraction (2):" in out.output  # build_hash 'pv_a' is not this pipeline
+    assert "`tmap rescan`" in out.output
+
+
+def test_the_one_run_banner_keeps_its_provenance(tmp_path: Path) -> None:
+    """★ The counterweight. The banner at the top of a candidate view exists so a STALE scan
+    cannot be read in silence, and that view has no ``--json`` to fall back on — so the build hash
+    stays there even though the listing dropped it. Two surfaces, two questions.
+
+    MUTATION: point ``_echo_run_lineage`` at ``_run_lineage_line`` -> RED.
+    """
+    atlas = _atlas_with_runs(tmp_path)
+    out = CliRunner().invoke(triage, ["--run", "rt_scanned", "--atlas", str(atlas)])
+    assert out.exit_code == 0, out.output
+    assert "run: rt_scanned" in out.output and "build pv_a" in out.output
+
+
+def test_the_reason_is_said_once_per_tier_not_once_per_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Six runs out of date for the same reason is ONE fact about the install. Repeated beside
+    every line it buried the list; with a single reason the run ids are redundant too.
+
+    MUTATION: make ``_reason_human`` return "" -> RED.
+    """
+    monkeypatch.setattr(hunt_cli, "installed_commit", lambda: "c" * 40)
+    atlas = tmp_path / "atlas.db"
+    conn = open_atlas(atlas)
+    for rid in ("a_run", "b_run"):
+        begin_run(conn, rid, analysis_db_path=f"/ws/{rid}.db", build_hash=current_pass_version())
+        finish_run(conn, rid, binaries=2, functions=3, hunt_commit="f" * 40, hunt_instances=1)
+    conn.close()
+
+    out = CliRunner().invoke(runs, ["--atlas", str(atlas)])
+    assert out.exit_code == 0, out.output
+    arrows = [ln for ln in out.output.splitlines() if ln.strip().startswith("→")]
+    assert len(arrows) == 1, out.output
+    assert arrows[0].strip() == "→ hunted by an older tmap; re-hunt is fast (no decompile)"
+
+
+def test_two_reasons_in_one_tier_are_listed_apart_with_their_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Grouping must not merge two situations into whichever sentence came first — each reason
+    names the runs it is about.
+
+    MUTATION: emit only the first reason, or drop the run ids when there are several groups -> RED.
+    """
+    monkeypatch.setattr(hunt_cli, "installed_commit", lambda: "c" * 40)
+    atlas = tmp_path / "atlas.db"
+    conn = open_atlas(atlas)
+    begin_run(conn, "graded_old", analysis_db_path="/ws/a.db", build_hash=current_pass_version())
+    finish_run(conn, "graded_old", binaries=2, functions=3, hunt_commit="f" * 40, hunt_instances=1)
+    begin_run(conn, "crashed", analysis_db_path="/ws/b.db", build_hash=current_pass_version())
+    finish_run(conn, "crashed", scan_status="failed", binaries=1, functions=1)
+    conn.close()
+
+    out = CliRunner().invoke(runs, ["--atlas", str(atlas)])
+    assert out.exit_code == 0, out.output
+    arrows = [ln.strip() for ln in out.output.splitlines() if ln.strip().startswith("→")]
+    assert len(arrows) == 2, out.output
+    assert any(a.endswith(": graded_old") and "older tmap" in a for a in arrows)
+    assert any(a.endswith(": crashed") and "did not finish" in a for a in arrows)
+
+
+def test_an_unmapped_reason_passes_through_verbatim() -> None:
+    """★ Rewriting only the reasons that were thought of is how a new one becomes invisible: the
+    reader would see a familiar sentence describing a situation nobody had considered.
+
+    MUTATION: return a catch-all sentence instead of the reason -> RED.
+    """
+    from treasure_map.cli.hunt_cli import _reason_human
+
+    novel = "the moon was in the wrong phase"
+    assert _reason_human("hunt", novel) == novel
+    assert _reason_human("extraction", novel) == novel
+    # and the mapped ones ARE rewritten, so the passthrough is not simply doing nothing
+    assert "re-hunt is fast" in _reason_human("hunt", "hunted by abc123def456, running 789")
+    assert "decompiles 484 binaries" in _reason_human(
+        "extraction", "extracted by abc, running def", binaries=484
+    )
 
 
 def test_runs_groups_by_which_input_moved(tmp_path: Path) -> None:
