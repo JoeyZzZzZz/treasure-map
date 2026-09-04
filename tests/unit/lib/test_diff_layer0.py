@@ -926,3 +926,33 @@ def test_read_side_scopes_to_one_binary_despite_shared_addr(tmp_path: Path) -> N
     assert fwd["found"] and fwd["pairs"][0]["name_a"] == "func_liba"  # liba's row, not libb's
     assert "00001000" in a2b_a and "00001000" in a2b_b  # each diff has its own 0x1000 mapping
     con.close()
+
+
+def test_a_diff_records_which_file_it_aligned(tmp_path: Path) -> None:
+    """diff_meta stores the short name for the per-binary filter; the path says which of the files
+    under that name was actually diffed.
+
+    ★ Driven through ``run_layer0_parse``, not through the writer: the writer only proves the
+    column exists, while the claim is that the DIFF fills it in. A test that inserts the row itself
+    passes just as well when layer 0 stops passing the paths.
+
+    MUTATION: drop ``binary_path_a/_b`` from the layer-0 write -> RED. Measured RED at 1 failed.
+    """
+    atlas = open_atlas(_seed_two_runs(tmp_path))
+    try:
+        res = run_layer0_parse(
+            atlas,
+            bindiff_path=_tiny_bindiff(tmp_path),
+            run_a_id="run_a",
+            run_b_id="run_b",
+            **_bins(atlas, "run_a", "run_b", "lib.so"),
+        )
+        row = atlas.execute(
+            "SELECT binary_a, binary_path_a, binary_path_b FROM diff_meta WHERE diff_id = ?",
+            (res.diff_id,),
+        ).fetchone()
+    finally:
+        atlas.close()
+    assert row["binary_a"] == "lib.so"  # the short name still scopes the per-binary filter
+    assert row["binary_path_a"] == "lib.so"  # the fixture records path == name
+    assert row["binary_path_b"] == "lib.so"

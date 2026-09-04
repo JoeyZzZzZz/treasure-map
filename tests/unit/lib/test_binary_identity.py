@@ -721,40 +721,6 @@ def test_hunt_records_the_binary_path_beside_every_short_name(tmp_path: Path) ->
         atlas.close()
 
 
-def test_a_diff_records_which_file_it_aligned(tmp_path: Path) -> None:
-    """diff_meta stores the short name for the per-binary filter; the path says which of the files
-    under that name was actually diffed.
-
-    ★ Driven through ``run_layer0_parse``, not through the writer: the writer only proves the
-    column exists, while the claim is that the DIFF fills it in. A test that inserts the row itself
-    passes just as well when layer 0 stops passing the paths.
-
-    MUTATION: drop ``binary_path_a/_b`` from the layer-0 write -> RED. Measured RED at 1 failed.
-    """
-    from tests.unit.lib.test_diff_layer0 import _bins, _seed_two_runs, _tiny_bindiff
-    from treasure_map.lib.atlas.connection import open_atlas
-    from treasure_map.lib.diff.layer0 import run_layer0_parse
-
-    atlas = open_atlas(_seed_two_runs(tmp_path))
-    try:
-        res = run_layer0_parse(
-            atlas,
-            bindiff_path=_tiny_bindiff(tmp_path),
-            run_a_id="run_a",
-            run_b_id="run_b",
-            **_bins(atlas, "run_a", "run_b", "lib.so"),
-        )
-        row = atlas.execute(
-            "SELECT binary_a, binary_path_a, binary_path_b FROM diff_meta WHERE diff_id = ?",
-            (res.diff_id,),
-        ).fetchone()
-    finally:
-        atlas.close()
-    assert row["binary_a"] == "lib.so"  # the short name still scopes the per-binary filter
-    assert row["binary_path_a"] == "lib.so"  # the fixture records path == name
-    assert row["binary_path_b"] == "lib.so"
-
-
 def test_a_key_lead_is_scoped_by_path_and_says_which_basis_it_matched(tmp_path: Path) -> None:
     """★ Two binaries share a short name and each holds a ``handle`` the other's key does not
     reach. Scoped by name, one binary's key lead annotated the other's candidate.
