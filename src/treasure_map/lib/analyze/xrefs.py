@@ -118,6 +118,11 @@ class XrefStats:
     # high-fan-out L0 symbols folded + edges suppressed (detail in xref_folded_symbols)
     layer0_folded_symbols: int = 0
     layer0_folded_edges: int = 0
+    # dependency edges NOT written because the soname named more than one binary in this firmware
+    # (detail in xref_unresolved_sonames). Counted per layer: the two are different strengths of
+    # edge: a function-level import lost to ambiguity matters more than a library-level one.
+    dt_needed_ambiguous: int = 0
+    import_export_ambiguous: int = 0
 
     @property
     def layer1_total(self) -> int:
@@ -164,35 +169,64 @@ def is_useful_ipc_string(s: str) -> bool:
 # ── Soname resolution helpers ─────────────────────────────────────────────────
 
 
-def _build_soname_map(cur: sqlite3.Cursor) -> dict[str, int]:
-    """Build a {soname → binary_id} index with versioned-soname fallback.
+@dataclass(frozen=True)
+class SonameHit:
+    """Which binaries a soname could name, and by which of the three name forms it matched.
+
+    ``bids`` is a TUPLE because a soname is a name, and one firmware can ship two files under it.
+    ``match_kind`` records whether the hit was on the recorded name or on a stripped-version
+    fallback — a fallback is a weaker claim, and a reader of the unresolved ledger needs to know
+    which kind of match produced the ambiguity."""
+
+    bids: tuple[int, ...]
+    match_kind: str
+
+
+def _build_soname_map(cur: sqlite3.Cursor) -> dict[str, dict[str, tuple[int, ...]]]:
+    """Build a {name form → {soname → every binary_id under it}} index, with versioned fallbacks.
 
     Handles: libssl.so.1.1 → libssl.so → libssl
-    """
-    soname_map: dict[str, int] = {}
+
+    ★ Every id ACCUMULATES; nothing overwrites and nothing is first-wins. The exact-name map used
+    to assign (last binary with that name won) and the two fallback maps used ``setdefault`` (first
+    won), so a firmware carrying two ``libstdc++.so.6`` produced a dependency edge to whichever one
+    the row order happened to surface — a confident edge to an arbitrary file, indistinguishable
+    from a correct one. The three forms are kept in SEPARATE maps because they are different
+    strengths of claim, and a fallback hit must not be reported as an exact one."""
+    exact: dict[str, list[int]] = {}
+    versioned: dict[str, list[int]] = {}
+    unversioned: dict[str, list[int]] = {}
     for bid, name in cur.execute("SELECT id, name FROM binaries"):
-        soname_map[name] = bid
+        exact.setdefault(name, []).append(bid)
         base = re.sub(r"\.so(\.\d+)+$", ".so", name)
         if base != name:
-            soname_map.setdefault(base, bid)
+            versioned.setdefault(base, []).append(bid)
         no_ext = re.sub(r"\.so$", "", base)
         if no_ext != base:
-            soname_map.setdefault(no_ext, bid)
-    return soname_map
+            unversioned.setdefault(no_ext, []).append(bid)
+    return {
+        "exact": {k: tuple(sorted(v)) for k, v in exact.items()},
+        "versioned_fallback": {k: tuple(sorted(v)) for k, v in versioned.items()},
+        "unversioned_fallback": {k: tuple(sorted(v)) for k, v in unversioned.items()},
+    }
 
 
-def _resolve_soname(soname: str, soname_map: dict[str, int]) -> int | None:
-    """Resolve a soname (possibly versioned) to a binary_id."""
-    bid = soname_map.get(soname)
-    if bid is not None:
-        return bid
-    for variant in (
-        re.sub(r"\.so(\.\d+)+$", ".so", soname),
-        re.sub(r"\.so.*$", "", soname),
-    ):
-        bid = soname_map.get(variant)
-        if bid is not None:
-            return bid
+def _resolve_soname(
+    soname: str, soname_map: dict[str, dict[str, tuple[int, ...]]]
+) -> SonameHit | None:
+    """Every binary a soname could name, or None when it names nothing in this firmware.
+
+    Tiers most-specific first, stopping at the FIRST tier that matches anything — an exact name is
+    never diluted by what a stripped-version form would also have matched."""
+    variants = (
+        ("exact", soname),
+        ("versioned_fallback", re.sub(r"\.so(\.\d+)+$", ".so", soname)),
+        ("unversioned_fallback", re.sub(r"\.so.*$", "", soname)),
+    )
+    for kind, key in variants:
+        bids = soname_map[kind].get(key)
+        if bids:
+            return SonameHit(bids=bids, match_kind=kind)
     return None
 
 
@@ -253,6 +287,7 @@ def build_xrefs(
 
     cur.execute("DELETE FROM xrefs")
     cur.execute("DELETE FROM xref_folded_symbols")
+    cur.execute("DELETE FROM xref_unresolved_sonames")
     conn.commit()
 
     seen: set[tuple[int, int | None, int, int | None, str]] = set()
@@ -295,8 +330,9 @@ def build_xrefs(
     _layer0_callees_exports(
         cur, _try_add, stats, fold_edge_threshold=fold_edge_threshold, folded_out=folded_ledger
     )
-    _layer1_import_export(cur, _try_add, soname_map, stats)
-    _layer2_dt_needed(cur, _try_add, soname_map, stats)
+    unresolved_ledger: list[tuple[int, str, str, str | None, str, str]] = []
+    _layer1_import_export(cur, _try_add, soname_map, stats, unresolved_out=unresolved_ledger)
+    _layer2_dt_needed(cur, _try_add, soname_map, stats, unresolved_out=unresolved_ledger)
     _classify_strings(cur, conn, stats)
     _layer3_string_ipc(cur, _try_add, stats)
 
@@ -306,6 +342,13 @@ def build_xrefs(
             "INSERT INTO xref_folded_symbols (symbol, exporters, callers, folded_edges) "
             "VALUES (?, ?, ?, ?)",
             folded_ledger,
+        )
+    if unresolved_ledger:
+        cur.executemany(
+            "INSERT INTO xref_unresolved_sonames "
+            "(binary_id, soname, edge_layer, import_func_name, match_kind, candidate_binary_ids) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            unresolved_ledger,
         )
     conn.commit()
 
@@ -441,8 +484,9 @@ def _layer0_callees_exports(
 def _layer1_import_export(
     cur: sqlite3.Cursor,
     add_fn: _AddFn,
-    soname_map: dict[str, int],
+    soname_map: dict[str, dict[str, tuple[int, ...]]],
     stats: XrefStats,
+    unresolved_out: list[tuple[int, str, str, str | None, str, str]] | None = None,
 ) -> None:
     """Layer 1: Ghidra imports × exports (fallback).
 
@@ -469,9 +513,34 @@ def _layer1_import_export(
         caller_index = _build_caller_index(cur, caller_bid)
 
         for func_name, soname in import_list:
-            dep_id = _resolve_soname(soname, soname_map)
-            if dep_id is None or dep_id == caller_bid:
+            hit = _resolve_soname(soname, soname_map)
+            if hit is None:
+                continue  # names nothing in this firmware -- the pre-existing semantics
+            # Self-reference is dropped per candidate, then the ambiguity is judged on what is
+            # left: a soname that names this binary AND one other is a real choice of one, not a
+            # choice of two.
+            others = tuple(b for b in hit.bids if b != caller_bid)
+            if not others:
                 continue
+            if len(others) > 1:
+                # More than one binary answers to this soname, so this import names no single
+                # callee. The edge is NOT written -- and it is recorded, with every candidate, so
+                # the missing edge is a visible decision rather than a gap. A function-level edge
+                # is the stronger kind, which is why the symbol is recorded with it.
+                stats.import_export_ambiguous += 1
+                if unresolved_out is not None:
+                    unresolved_out.append(
+                        (
+                            caller_bid,
+                            soname,
+                            "import_export",
+                            func_name,
+                            hit.match_kind,
+                            json.dumps(list(others)),
+                        )
+                    )
+                continue
+            dep_id = others[0]
 
             key = (dep_id, func_name)
             if key not in callee_func_cache:
@@ -495,10 +564,17 @@ def _layer1_import_export(
 def _layer2_dt_needed(
     cur: sqlite3.Cursor,
     add_fn: _AddFn,
-    soname_map: dict[str, int],
+    soname_map: dict[str, dict[str, tuple[int, ...]]],
     stats: XrefStats,
+    unresolved_out: list[tuple[int, str, str, str | None, str, str]] | None = None,
 ) -> None:
-    """Layer 2: ELF DT_NEEDED → library-level dependency edges."""
+    """Layer 2: ELF DT_NEEDED → library-level dependency edges.
+
+    A soname naming MORE THAN ONE binary in this firmware writes no edge and lands in
+    ``xref_unresolved_sonames`` with its candidates. That is a deliberate loss of edges that were
+    previously written: they pointed at whichever binary the index happened to hold, which is not
+    the same thing as pointing at the right one. Almost-certainly-right is not right, and the
+    candidates are handed over so the question can be settled rather than assumed."""
     rows = cur.execute("SELECT id, dt_needed FROM binaries WHERE dt_needed != '[]'").fetchall()
     for bid, dt_json in rows:
         try:
@@ -506,10 +582,20 @@ def _layer2_dt_needed(
         except (json.JSONDecodeError, TypeError):
             continue
         for soname in dt_needed:
-            dep_id = _resolve_soname(soname, soname_map)
-            if dep_id is None or dep_id == bid:
+            hit = _resolve_soname(soname, soname_map)
+            if hit is None:
+                continue  # not in this firmware's inventory -- the pre-existing semantics
+            others = tuple(b for b in hit.bids if b != bid)  # self-reference, per candidate
+            if not others:
                 continue
-            if add_fn(bid, None, dep_id, None, "dt_needed", 0.9):
+            if len(others) > 1:
+                stats.dt_needed_ambiguous += 1
+                if unresolved_out is not None:
+                    unresolved_out.append(
+                        (bid, soname, "dt_needed", None, hit.match_kind, json.dumps(list(others)))
+                    )
+                continue
+            if add_fn(bid, None, others[0], None, "dt_needed", 0.9):
                 stats.layer2_dt_needed += 1
 
 

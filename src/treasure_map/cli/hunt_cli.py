@@ -135,6 +135,14 @@ def _echo_full_diff(fsum: Any, resolved_atlas: Path) -> None:
         f"  binaries      : {len(plan.changed)} changed, {len(plan.unchanged)} unchanged "
         f"(skipped), only-in-A {len(plan.only_in_a)}, only-in-B {len(plan.only_in_b)}"
     )
+    if plan.ambiguous_by_name:
+        # Neither changed nor unchanged: the name carries more than one binary on a side, so
+        # "did it change" was never answered for it. Said out loud, with the way to answer it.
+        click.echo(
+            f"  ambiguous     : {len(plan.ambiguous_by_name)} binaries share a short name with "
+            "another (not compared — diff them by sha256 or path): "
+            f"{', '.join(plan.ambiguous_by_name)}"
+        )
     click.echo(
         f"  diffed        : {len(ok)} ok ({len(plan.to_diff)} new, {len(plan.already_ok)} "
         f"skipped-already-ok), {len(failed)} failed this run"
@@ -175,7 +183,9 @@ def _echo_full_diff(fsum: Any, resolved_atlas: Path) -> None:
     "--binary",
     "binary_name",
     default=None,
-    help="Diff only this ONE binary (short name). Omitted (the default) diffs EVERY binary whose "
+    help="Diff only this ONE binary. Accepts a sha256 (a >=8-hex prefix works), a full path, or a "
+    "short name; a short name that several binaries share is refused with the candidates listed, "
+    "since there is no single binary to diff. Omitted (the default) diffs EVERY binary whose "
     "content changed between the two runs — the cross-binary view is tmap diff's unique value; a "
     "single binary you can already do in Ghidra.",
 )

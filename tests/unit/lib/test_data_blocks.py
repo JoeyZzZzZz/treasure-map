@@ -104,11 +104,19 @@ def _ingest(tmp_path: Path, payload: dict[str, Any] | None) -> Path:
     db = tmp_path / "analysis.db"
     conn = open_db(db)
     conn.execute(
-        "INSERT INTO binaries (name, path, sha256) VALUES (?, ?, ?)",
+        # last_seen_at is LOAD-BEARING: current_binaries selects rows whose last_seen_at equals
+        # the maximum, and NULL never equals NULL, so omitting it yields an EMPTY view and every
+        # binary selector misses. Real scans always write it.
+        "INSERT INTO binaries (name, path, sha256, last_seen_at) "
+        "VALUES (?, ?, ?, '2026-01-01T00:00:00')",
         ("test_bin", "usr/sbin/test_bin", _SHA),
     )
     conn.execute(
-        "INSERT INTO binaries (name, path, sha256) VALUES (?, ?, ?)",
+        # last_seen_at is LOAD-BEARING: current_binaries selects rows whose last_seen_at equals
+        # the maximum, and NULL never equals NULL, so omitting it yields an EMPTY view and every
+        # binary selector misses. Real scans always write it.
+        "INSERT INTO binaries (name, path, sha256, last_seen_at) "
+        "VALUES (?, ?, ?, '2026-01-01T00:00:00')",
         ("bare_bin", "usr/sbin/bare_bin", _OTHER_SHA),
     )
     conn.commit()
@@ -417,7 +425,8 @@ def test_binary_resolves_by_short_name_or_path(tmp_path: Path) -> None:
     finally:
         conn.close()
     assert by_name["bytes"] == by_path["bytes"]
-    assert missing["found"] is False and missing["note"] == "no_such_binary"
+    # The selector resolver's own shape: a reason, and the query it could not satisfy.
+    assert missing["found"] is False and missing["reason"] == "not_found"
 
 
 def test_undecodable_transport_is_flagged_not_stored_as_empty(tmp_path: Path) -> None:

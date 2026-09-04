@@ -135,6 +135,29 @@ CREATE TABLE IF NOT EXISTS xref_folded_symbols (
     folded_edges   INTEGER NOT NULL    -- # L0 edges NOT materialized (the constrained edges, visible)
 );
 
+-- xref_unresolved_sonames: an EXPLICIT ledger of the library-dependency edges whose soname names
+-- MORE THAN ONE binary in this firmware. One firmware can ship two files called libstdc++.so.6
+-- under different roots, with different content; a soname naming both identifies neither, so the
+-- edge is NOT written to xrefs — and NEVER silently dropped: the candidates are recorded here so a
+-- consumer sees "this dependency could be either of these" instead of an edge that quietly picked
+-- one, or no edge at all. Same shape and same purpose as xref_folded_symbols.
+-- Wipe-and-rebuilt by build_xrefs together with xrefs / xref_folded_symbols (see xrefs.py) — a
+-- whole-table rebuild, so it does NOT enter the ghidra_ingest per-binary DELETE tuple and needs no
+-- FK CASCADE.
+CREATE TABLE IF NOT EXISTS xref_unresolved_sonames (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    binary_id            INTEGER NOT NULL,  -- the DEPENDING binary (the edge's source)
+    soname               TEXT NOT NULL,     -- the dependency name as recorded (may be versioned)
+    edge_layer           TEXT NOT NULL,     -- 'dt_needed' | 'import_export'
+    import_func_name     TEXT,              -- the imported symbol (import_export only; NULL for
+                                            --   a library-level dt_needed edge)
+    match_kind           TEXT NOT NULL,     -- which name matched: 'exact' | 'versioned_fallback' |
+                                            --   'unversioned_fallback' — a fallback match is a
+                                            --   weaker claim than an exact one, so it is recorded
+    candidate_binary_ids TEXT NOT NULL,     -- JSON [int,…]: every binary the soname could mean
+    reason               TEXT NOT NULL DEFAULT 'ambiguous_soname'
+);
+
 -- 字符串
 CREATE TABLE IF NOT EXISTS strings (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,

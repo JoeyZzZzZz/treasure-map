@@ -39,9 +39,8 @@ from typing import TYPE_CHECKING, Any
 
 from treasure_map.lib.atlas.models import DiffMetaRow
 from treasure_map.lib.atlas.writer import add_diff_meta, delete_diff
+from treasure_map.lib.binary_id import BinaryRow, resolve_binary_in_db
 from treasure_map.lib.diff.layer0 import (
-    _binary_name,
-    _binary_sha256,
     _confirmed_same_version,
     _next_attempts,
     _resolve_run,
@@ -100,6 +99,11 @@ class PreflightResult:
     run_b: RunRow
     binary_a: str  # short name, as recorded in each analysis.db
     binary_b: str
+    # The RESOLVED rows. Everything downstream takes these instead of re-resolving the selector:
+    # one diff used to look the same short name up eight times, and each lookup was free to pick a
+    # different row when the name repeated.
+    bin_a: BinaryRow
+    bin_b: BinaryRow
     so_a: Path  # the located, existing .so file for side A
     so_b: Path
     version_skew: bool
@@ -129,11 +133,27 @@ class DiffSummary:
 _DIFF_RETRY_LIMIT = 3
 
 
+# The marker recorded when a diff was refused because the selector named more than one binary.
+# Distinct from every other failure reason: it is fixed by naming a path or a sha256, not by
+# re-scanning or re-running the toolchain.
+AMBIGUOUS_SELECTOR_REASON = "ambiguous_binary_selector"
+
+
+class AmbiguousBinarySelectorError(ConfigError):
+    """The selector matches more than one binary in a run, so there is nothing to diff.
+
+    Its own type, not a message to match on: it is the one diff failure that is fixed by naming a
+    path or a sha256 rather than by re-scanning or retrying the toolchain, and the retry accounting
+    must be able to tell it apart without parsing prose."""
+
+
 def _classify_failure_reason(exc: BaseException) -> str:
     """Bucket a toolchain failure so a consumer can tell a likely-transient failure from a hard
     boundary. Matches the DETERMINISTIC message text the toolchain steps raise (``_run_binexport`` /
     ``_run_bindiff``); anything unrecognized is 'other'. Order matters -- timeout is checked before
     the generic step failure so a timed-out export is not miscounted as a crash."""
+    if isinstance(exc, AmbiguousBinarySelectorError):
+        return AMBIGUOUS_SELECTOR_REASON
     msg = str(exc).lower()
     if "timed out" in msg or "timeout" in msg:
         return "timeout"
@@ -211,11 +231,19 @@ def _current_shas(
     try:
         run_a = _resolve_run(atlas, run_a_id, "a")
         run_b = _resolve_run(atlas, run_b_id, "b")
-        sha_a = _binary_sha256(run_a.analysis_db_path, binary) if run_a.analysis_db_path else None
-        sha_b = _binary_sha256(run_b.analysis_db_path, binary) if run_b.analysis_db_path else None
     except (ConfigError, sqlite3.Error):
         return None, None
-    return sha_a, sha_b
+    # An unresolvable selector — including an AMBIGUOUS one — yields None for that side rather
+    # than raising: this runs inside an except handler, and an exception here would replace the
+    # failure being reported with a different one.
+    return _side_sha(run_a, binary), _side_sha(run_b, binary)
+
+
+def _side_sha(run: RunRow, binary: str) -> str | None:
+    if not run.analysis_db_path:
+        return None
+    row, _miss = resolve_binary_in_db(run.analysis_db_path, binary)
+    return row.sha256 if row is not None else None
 
 
 @dataclass(frozen=True)
@@ -230,12 +258,19 @@ class FullDiffPlan:
       * ``retry``       -- failed before, under the retry cap -> diffed again (transient self-heal).
       * ``already_ok``  -- diff_ok=1 and both sides' sha256 unchanged -> skipped (redoing = waste).
       * ``hard_failed`` -- failed at the retry cap, same content -> skipped unless --force-retry
-                           (a suspected hard boundary; still VISIBLE, never a silent drop)."""
+                           (a suspected hard boundary; still VISIBLE, never a silent drop).
+
+    ``changed`` + ``unchanged`` + ``ambiguous_by_name`` partitions the names present in BOTH runs.
+    The third is where a short name turned out not to identify one file."""
 
     changed: tuple[str, ...]  # present in BOTH runs, sha256 differs (to_diff+retry+already_ok+hard)
     unchanged: tuple[str, ...]  # present in both, same sha256 -> skipped (diffing them is waste)
     only_in_a: tuple[str, ...]  # present only in run A -> cannot function-diff (no counterpart)
     only_in_b: tuple[str, ...]
+    # ★ Present in both, but the NAME carries more than one binary on a side, so "did it change"
+    # has no answer by name. Neither changed nor unchanged: a fourth outcome, listed rather than
+    # folded into either, because folding it would state a comparison that was never made.
+    ambiguous_by_name: tuple[str, ...] = ()
     to_diff: tuple[str, ...] = ()  # never diffed, or content changed -> diff (attempts start fresh)
     retry: tuple[str, ...] = ()  # failed, attempts < cap -> retry (transient self-heal)
     already_ok: tuple[str, ...] = ()  # diff_ok=1, sha unchanged -> skip (incremental)
@@ -282,27 +317,21 @@ class FullDiffSummary:
 # ── binary .so location (finding-1 fail-fast) ────────────────────────────────────────
 
 
-def _locate_binary_so(run: RunRow, binary_name: str) -> Path | None:
-    """The on-disk ``.so`` file for ``binary_name`` in this run, or None if it cannot be located.
+def _locate_binary_so(run: RunRow, bin_row: BinaryRow) -> Path | None:
+    """The on-disk ``.so`` for an ALREADY-RESOLVED binary in this run, or None if not locatable.
 
     BinExport needs the REAL binary file (a Ghidra plugin exports from it), not the analysis.db.
-    ``binaries.path`` is recorded relative and its shape varies across runs (the scan-side
-    absolute-path fix is a separate ticket), so this tries several roots and returns the first that
-    EXISTS: an absolute recorded path, the path joined under the run's firmware root, that root plus
-    the bare file name, and finally the recorded path relative to the CWD. None here is an honest
-    'cannot locate' that preflight turns into a hard block -- never a guessed path fed to export."""
-    if not run.analysis_db_path:
+    Takes the resolved row rather than a selector: the entry resolved it once, and re-resolving
+    here is how the same short name came to be looked up eight times in one diff, each lookup free
+    to land on a different row. ``binaries.path`` is recorded relative and its shape varies across
+    runs (the scan-side absolute-path fix is a separate ticket), so this tries several roots and
+    returns the first that EXISTS: an absolute recorded path, the path joined under the run's
+    firmware root, that root plus the bare file name, and finally the recorded path relative to the
+    CWD. None here is an honest 'cannot locate' that preflight turns into a hard block -- never a
+    guessed path fed to export."""
+    if not bin_row.path:
         return None
-    con = sqlite3.connect(f"file:{run.analysis_db_path}?mode=ro", uri=True)
-    try:
-        row = con.execute(
-            "SELECT path FROM binaries WHERE name = ? OR sha256 = ?", (binary_name, binary_name)
-        ).fetchone()
-    finally:
-        con.close()
-    if row is None or not row[0]:
-        return None
-    raw = Path(row[0])
+    raw = Path(bin_row.path)
     candidates: list[Path] = []
     if raw.is_absolute():
         candidates.append(raw)
@@ -417,28 +446,57 @@ def preflight(
     # confirm-same is only used to phrase the note precisely; the gate itself is _version_skew.
     _ = _confirmed_same_version(run_a.ghidra_version, run_b.ghidra_version)
 
-    so_a = _locate_binary_so(run_a, binary_name)  # check 4
+    # ★ Check 4, in two halves. The selector is resolved to a ROW here, ONCE per side, and the row
+    # is what every later stage receives. An ambiguous short name is refused right here with its
+    # candidates: pushing it further meant it surfaced later as ".BinDiff does not correspond to
+    # the two runs' binaries" (a cross-firmware message for a same-firmware problem) or as an
+    # assertion that disappears under -O, letting a None name flow into the diff_id.
+    bin_a, miss_a = resolve_binary_in_db(run_a.analysis_db_path, binary_name)  # type: ignore[arg-type]
+    if bin_a is None:
+        raise _selector_error(run_a_id, binary_name, miss_a, run_a)
+    bin_b, miss_b = resolve_binary_in_db(run_b.analysis_db_path, binary_name)  # type: ignore[arg-type]
+    if bin_b is None:
+        raise _selector_error(run_b_id, binary_name, miss_b, run_b)
+
+    so_a = _locate_binary_so(run_a, bin_a)
     if so_a is None:
-        raise ConfigError(_so_not_found_msg(run_a_id, binary_name, run_a))
-    so_b = _locate_binary_so(run_b, binary_name)
+        raise ConfigError(_so_not_found_msg(run_a_id, binary_name, bin_a))
+    so_b = _locate_binary_so(run_b, bin_b)
     if so_b is None:
-        raise ConfigError(_so_not_found_msg(run_b_id, binary_name, run_b))
+        raise ConfigError(_so_not_found_msg(run_b_id, binary_name, bin_b))
 
     _check_toolchain(config)  # check 5
 
-    bin_a = _binary_name(run_a.analysis_db_path, binary_name)  # type: ignore[arg-type]
-    bin_b = _binary_name(run_b.analysis_db_path, binary_name)  # type: ignore[arg-type]
-    assert bin_a is not None and bin_b is not None  # check 4 already resolved the row
     return PreflightResult(
         run_a=run_a,
         run_b=run_b,
-        binary_a=bin_a,
-        binary_b=bin_b,
+        binary_a=bin_a.name,
+        binary_b=bin_b.name,
+        bin_a=bin_a,
+        bin_b=bin_b,
         so_a=so_a,
         so_b=so_b,
         version_skew=skew,
         warnings=tuple(warnings),
     )
+
+
+def _selector_error(
+    run_id: str, selector: str, miss: dict[str, Any] | None, run: RunRow
+) -> ConfigError:
+    """Turn a selector miss into the hard block, naming every candidate when there is a choice."""
+    reason = (miss or {}).get("reason")
+    if reason == "ambiguous":
+        listed = "\n".join(
+            f"  {c.get('binary_path') or '(no path recorded)'}   sha256={c.get('sha256')}"
+            for c in (miss or {}).get("candidates", [])
+        )
+        return AmbiguousBinarySelectorError(
+            f"run '{run_id}': binary selector '{selector}' names MORE THAN ONE binary in this "
+            f"firmware, so there is no single binary to diff:\n{listed}\n"
+            "Re-run with one of the paths above, or with a sha256 (a >=8-hex prefix works)."
+        )
+    return ConfigError(_so_not_found_msg(run_id, selector, None) if run else "")
 
 
 def _check_db_on_disk(run: RunRow, run_id: str) -> None:
@@ -453,21 +511,14 @@ def _check_db_on_disk(run: RunRow, run_id: str) -> None:
         )
 
 
-def _so_not_found_msg(run_id: str, binary_name: str, run: RunRow) -> str:
-    recorded = "unknown"
-    if run.analysis_db_path and Path(run.analysis_db_path).exists():
-        con = sqlite3.connect(f"file:{run.analysis_db_path}?mode=ro", uri=True)
-        try:
-            row = con.execute(
-                "SELECT path FROM binaries WHERE name = ? OR sha256 = ?", (binary_name, binary_name)
-            ).fetchone()
-        finally:
-            con.close()
-        recorded = (
-            (row[0] if row and row[0] else "not in this run's binaries")
-            if row
-            else ("not in this run's binaries")
-        )
+def _so_not_found_msg(run_id: str, binary_name: str, bin_row: BinaryRow | None) -> str:
+    """Why the .so could not be located. The recorded path comes off the row the entry already
+    resolved; this function does not query, so it cannot resolve the selector a second time and
+    report a different binary than the one that failed."""
+    if bin_row is None:
+        recorded = "not in this run's binaries"
+    else:
+        recorded = bin_row.path or "no path recorded for this binary"
     return (
         f"run '{run_id}': the .so file for binary '{binary_name}' cannot be located on this "
         f"machine (recorded path: {recorded}). BinExport needs the real binary file. Confirm the "
@@ -629,7 +680,8 @@ def _persist_success(
     diff_id: str,
     run_a_id: str,
     run_b_id: str,
-    binary_name: str,
+    bin_a: BinaryRow,
+    bin_b: BinaryRow,
     binary_short: str,
     bindiff_path: Path,
     version_skew: bool,
@@ -645,8 +697,8 @@ def _persist_success(
             bindiff_path=bindiff_path,
             run_a_id=run_a_id,
             run_b_id=run_b_id,
-            binary_a=binary_name,
-            binary_b=binary_name,
+            bin_a=bin_a,
+            bin_b=bin_b,
             diff_id=diff_id,
             commit=False,
         )
@@ -665,7 +717,7 @@ def _persist_success(
     counts = _delta_counts(atlas, diff_id)
     return DiffSummary(
         diff_id=diff_id,
-        binary=binary_name,
+        binary=binary_short,
         matched_pairs=l0.matched_pairs,
         version_skew=version_skew,
         delta_layer_changed=counts.get("layer_changed", 0),
@@ -720,7 +772,8 @@ def run_version_diff(
             diff_id=did,
             run_a_id=run_a_id,
             run_b_id=run_b_id,
-            binary_name=binary_name,
+            bin_a=pf.bin_a,
+            bin_b=pf.bin_b,
             binary_short=pf.binary_a,
             bindiff_path=artifacts.bindiff_path,
             version_skew=pf.version_skew,
@@ -742,10 +795,17 @@ def _delta_counts(atlas: sqlite3.Connection, diff_id: str) -> dict[str, int]:
 # ── full (default) diff: every CHANGED binary between two runs ────────────────────────
 
 
-def _read_binaries(analysis_db_path: str) -> dict[str, str]:
-    """``{binary short name -> sha256}`` for one run's analysis.db. Rows are already sha-deduped at
-    scan; if a basename still repeats (two files, same name, different content) the last row wins —
-    a rare collision, acceptable for deciding which binaries changed."""
+def _read_binaries(analysis_db_path: str) -> dict[str, tuple[str, ...]]:
+    """``{binary short name -> every sha256 carrying that name}``, sorted, for one run.
+
+    A tuple, not a value. A short name is a LABEL: one firmware ships two ``libstdc++.so.6`` under
+    different roots with different content. Collapsing them to one sha meant "did this binary
+    change" was answered about whichever row the database returned last — and the answer flipped
+    with nothing observable changing. Keeping every sha lets the caller SEE that the name does not
+    identify one file, and say so, instead of comparing two arbitrary picks.
+
+    Final shape is per relative firmware path; that is blocked on the recorded paths being
+    comparable across runs (see _locate_binary_so), which has its own ticket."""
     con = sqlite3.connect(f"file:{analysis_db_path}?mode=ro", uri=True)
     try:
         rows = con.execute(
@@ -753,7 +813,10 @@ def _read_binaries(analysis_db_path: str) -> dict[str, str]:
         ).fetchall()
     finally:
         con.close()
-    return {r[0]: r[1] for r in rows}
+    by_name: dict[str, list[str]] = {}
+    for name, sha in rows:
+        by_name.setdefault(name, []).append(sha)
+    return {name: tuple(sorted(shas)) for name, shas in by_name.items()}
 
 
 @dataclass(frozen=True)
@@ -811,8 +874,13 @@ def plan_full_diff(
     a = _read_binaries(run_a.analysis_db_path)
     b = _read_binaries(run_b.analysis_db_path)
     both = a.keys() & b.keys()
-    changed = sorted(n for n in both if a[n] != b[n])
-    unchanged = sorted(n for n in both if a[n] == b[n])
+    # ★ A name carrying more than one binary on either side identifies nothing, so it is neither
+    # changed nor unchanged — it is UNDECIDABLE by name, and it says so. Comparing the first sha of
+    # each side would produce a confident answer about an arbitrary pairing.
+    ambiguous = sorted(n for n in both if len(a[n]) > 1 or len(b[n]) > 1)
+    decidable = both - set(ambiguous)
+    changed = sorted(n for n in decidable if a[n][0] != b[n][0])
+    unchanged = sorted(n for n in decidable if a[n][0] == b[n][0])
     status = _read_diff_status_map(atlas, run_a_id, run_b_id)
 
     to_diff: list[str] = []
@@ -823,9 +891,11 @@ def plan_full_diff(
         rec = status.get(n)
         if rec is None:
             to_diff.append(n)  # never diffed
-        elif rec.diff_ok == 1 and rec.sha256_a == a[n] and rec.sha256_b == b[n]:
+        # ``changed`` only holds names that resolved to ONE binary per side, so [0] is that
+        # binary's sha — the comparison is against the same file that was diffed, not a pick.
+        elif rec.diff_ok == 1 and rec.sha256_a == a[n][0] and rec.sha256_b == b[n][0]:
             already_ok.append(n)  # succeeded, content unchanged -> skip
-        elif rec.sha256_a != a[n] or rec.sha256_b != b[n]:
+        elif rec.sha256_a != a[n][0] or rec.sha256_b != b[n][0]:
             to_diff.append(n)  # content changed (or unrecorded sha) -> re-diff, attempts reset
         elif rec.diff_attempts < retry_limit:
             retry.append(n)  # failed, same content, under cap -> retry
@@ -837,6 +907,7 @@ def plan_full_diff(
         unchanged=tuple(unchanged),
         only_in_a=tuple(sorted(a.keys() - b.keys())),
         only_in_b=tuple(sorted(b.keys() - a.keys())),
+        ambiguous_by_name=tuple(ambiguous),
         to_diff=tuple(to_diff),
         retry=tuple(retry),
         already_ok=tuple(already_ok),
@@ -860,8 +931,12 @@ class _ResolvedDiff:
     """One binary resolved by the serial pre-phase, carrying only what compute (Paths) + persist
     (short name, skew, diff_id) need — deliberately NO atlas handle, so it crosses into a worker."""
 
-    binary: str  # the name the plan iterated (a short name) -> layer0 binary_a/binary_b
+    binary: str  # the selector the plan iterated (a short name) -> reporting only
     binary_short: str  # normalized short name (pf.binary_a) -> diff_meta + diff_id
+    # The rows preflight resolved. Carried rather than re-derived from ``binary`` downstream: the
+    # persist step must write about the same binary the compute step exported.
+    bin_a: BinaryRow
+    bin_b: BinaryRow
     so_a: Path
     so_b: Path
     version_skew: bool
@@ -911,7 +986,8 @@ def _persist_outcome(
             diff_id=rd.diff_id,
             run_a_id=run_a_id,
             run_b_id=run_b_id,
-            binary_name=rd.binary,
+            bin_a=rd.bin_a,
+            bin_b=rd.bin_b,
             binary_short=rd.binary_short,
             bindiff_path=artifacts.bindiff_path,
             version_skew=rd.version_skew,
@@ -1038,6 +1114,18 @@ def run_full_diff(
         try:
             pf = preflight(atlas, run_a_id, run_b_id, binary, config=config, force=force)
         except TreasureMapError as exc:
+            if isinstance(exc, AmbiguousBinarySelectorError):
+                # Persist it as this binary's blind spot, the same shape a toolchain failure gets.
+                # A refusal that lives only in the console scrolls away; recorded, it shows up in
+                # list_diff_blindspots with a reason that names the fix.
+                _record_diff_failure(
+                    atlas,
+                    diff_id=make_diff_id(run_a_id, run_b_id, binary),
+                    run_a_id=run_a_id,
+                    run_b_id=run_b_id,
+                    binary_short=binary,
+                    exc=exc,
+                )
             done += 1
             oc = BinaryDiffOutcome(
                 binary,
@@ -1056,6 +1144,8 @@ def run_full_diff(
             _ResolvedDiff(
                 binary=binary,
                 binary_short=pf.binary_a,
+                bin_a=pf.bin_a,
+                bin_b=pf.bin_b,
                 so_a=pf.so_a,
                 so_b=pf.so_b,
                 version_skew=pf.version_skew,

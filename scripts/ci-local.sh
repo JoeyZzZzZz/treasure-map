@@ -12,6 +12,9 @@ ruff format --check src/ tests/
 echo "==> mypy strict"
 mypy src/
 
+echo "==> binary-selector gate"
+bash scripts/check-binary-selector-resolution.sh
+
 echo "==> pytest unit"
 pytest tests/unit/ -q
 

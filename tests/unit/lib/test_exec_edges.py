@@ -19,6 +19,7 @@ from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.diff.loader import FuncRow
 from treasure_map.lib.hunt import run_analyzer2
 from treasure_map.lib.hunt.exec_edges import (
+    CLASSIFIER_RESOLUTIONS,
     EXEC_SINKS,
     SHELL_SINKS,
     TARGET_RESOLUTIONS,
@@ -64,14 +65,25 @@ def _prov(sink: str, provenance: dict[str, Any], addr: str = "0x11020") -> dict[
 
 def _inventory(
     links: list[tuple[str, str, str | None, str | None]] | None = None,
-    binaries: set[str] | None = None,
+    binaries: set[str] | dict[str, tuple[str, ...]] | None = None,
     scripts: dict[str, tuple[str, ...]] | None = None,
 ) -> ExecEdgeInventory:
     """``links`` rows are (link_path, link_name, target_name, corrupt_reason); ``scripts`` maps a
-    script basename to the path(s) the inventory holds for it."""
+    script basename to the path(s) the inventory holds for it.
+
+    ``binaries`` may be a set of short names — expanded to one synthetic path each, the usual case
+    — or a name -> paths mapping when a test needs a name that SEVERAL binaries answer to. The
+    inventory holds paths because a short name is a label: two files can share one."""
+    if binaries is None:
+        binaries = {"web_daemon", "busybox"}
+    bin_names = (
+        binaries
+        if isinstance(binaries, dict)
+        else {name: (f"usr/sbin/{name}",) for name in binaries}
+    )
     return ExecEdgeInventory(
         symlinks=build_symlink_index(list(links or [])),
-        bin_names=frozenset(binaries or {"web_daemon", "busybox"}),
+        bin_names=bin_names,
         scripts=dict(scripts or {}),
     )
 
@@ -113,7 +125,7 @@ def test_exec_of_interpreter_link_resolves_to_the_multicall_binary() -> None:
     inv = _inventory(links=[("bin/sh", "sh", "busybox", None)])
     (edge,) = _edges([_prov("execl", _const("/bin/sh"))], inv)
     assert edge.target_resolution == "resolved_symlink"
-    assert edge.target_binary == "busybox"
+    assert edge.target_binary == "usr/sbin/busybox"
     assert edge.target_layer == "exec_image"
     assert (edge.shell_wrapped, edge.inner_command_visible) == (1, 0)
     assert edge.argv_visibility == "structurally_invisible"
@@ -144,9 +156,10 @@ def test_target_layer_splits_the_two_families() -> None:
     (shell_edge,) = _edges([_prov("system", _const("helper -x"))], inv)
     (exec_edge,) = _edges([_prov("execv", _const("/bin/helper"))], inv)
     assert shell_edge.target_layer == "shell_command"
-    assert (shell_edge.target_token, shell_edge.target_binary) == ("helper", "helper")
+    # target_binary now holds the PATH: the short name is what could be ambiguous.
+    assert (shell_edge.target_token, shell_edge.target_binary) == ("helper", "usr/sbin/helper")
     assert exec_edge.target_layer == "exec_image"
-    assert exec_edge.target_binary == "helper"
+    assert exec_edge.target_binary == "usr/sbin/helper"
 
 
 def test_shell_wrapped_pipeline_is_read_through_to_its_first_stage() -> None:
@@ -225,7 +238,7 @@ def test_phi_merge_yields_one_edge_per_origin() -> None:
         ],
         inv,
     )
-    assert sorted(e.target_binary for e in edges) == ["helper", "other_tool"]
+    assert sorted(e.target_binary for e in edges) == ["usr/sbin/helper", "usr/sbin/other_tool"]
 
 
 def test_every_stack_writer_contributes_an_edge() -> None:
@@ -246,7 +259,7 @@ def test_every_stack_writer_contributes_an_edge() -> None:
         ],
     }
     edges = _edges([_prov("system", prov)], inv)
-    assert sorted(e.target_binary for e in edges) == ["helper", "other_tool"]
+    assert sorted(e.target_binary for e in edges) == ["usr/sbin/helper", "usr/sbin/other_tool"]
 
 
 # ── the six states: total and mutually exclusive ──────────────────────────────────────
@@ -287,12 +300,17 @@ def test_classification_is_total_and_lands_in_exactly_one_of_six_states() -> Non
     # Every input gets exactly one state, and the image over the inputs is the whole six-state set
     # — no input falls through, and no seventh state exists.
     #
+    # ★ Six, not eight: the classifier judges the NAME. Whether that name identifies ONE FILE is a
+    # question about the inventory, not the token, and is decided at the row builder — see
+    # test_a_name_two_binaries_answer_to_resolves_no_target.
+    #
     # MUTATION (verified RED, 1 failed): in exec_edges.classify_target_resolution delete the final
     # `return UNMATCHED` and let the function fall off the end -> the unmatched inputs come back
     # None, so the image is no longer a subset of the six states.
     produced = {_classify(spec) for spec in _CLASSIFY_INPUTS}
-    assert produced <= TARGET_RESOLUTIONS
-    assert produced == TARGET_RESOLUTIONS  # the fixtures cover every state
+    assert produced <= CLASSIFIER_RESOLUTIONS
+    assert produced == CLASSIFIER_RESOLUTIONS  # the fixtures cover every state
+    assert CLASSIFIER_RESOLUTIONS < TARGET_RESOLUTIONS  # the column holds strictly more
     for spec in _CLASSIFY_INPUTS:
         assert _classify(spec) in TARGET_RESOLUTIONS
 
@@ -466,9 +484,10 @@ def test_entry_sites_are_keyed_by_the_launched_binary() -> None:
     inv = _inventory(links=[("bin/sh", "sh", "busybox", None)])
     edges = _edges([_prov("execl", _const("/bin/sh"))], inv)
     sites = exec_entry_sites(edges)
-    assert list(sites) == ["busybox"]
-    assert sites["busybox"][0]["kind"] == "exec_edge"
-    assert sites["busybox"][0]["launcher_binary"] == "web_daemon"
+    # keyed by PATH — a short-name key would offer the site to every binary of that name
+    assert list(sites) == ["usr/sbin/busybox"]
+    assert sites["usr/sbin/busybox"][0]["kind"] == "exec_edge"
+    assert sites["usr/sbin/busybox"][0]["launcher_binary"] == "web_daemon"
 
 
 def test_unresolved_edges_never_become_entry_sites() -> None:
@@ -789,7 +808,7 @@ def test_constant_argument_is_substituted_back_into_the_template() -> None:
     }
     (edge,) = _edges([_prov("system", prov)], inv)
     assert edge.target_token == "/usr/sbin/tool"
-    assert edge.target_binary == "tool"
+    assert edge.target_binary == "usr/sbin/tool"
     assert edge.argv_visibility == "known_with_placeholder"
     assert edge.argv_template == "/usr/sbin/tool -j '%s'"
 
@@ -889,7 +908,11 @@ def _analysis_db(tmp_path: Path, *, with_links: bool = True) -> Path:
     conn = open_db(db_path)
     for bid, name in ((1, "web_daemon"), (2, "busybox")):
         conn.execute(
-            "INSERT INTO binaries (id, name, path, sha256) VALUES (?, ?, ?, ?)",
+            # last_seen_at is LOAD-BEARING: the exec inventory reads current_binaries, which
+            # selects on MAX(last_seen_at); NULL never equals NULL, so omitting it empties the
+            # inventory and every token reads as unmatched.
+            "INSERT INTO binaries (id, name, path, sha256, last_seen_at) "
+            "VALUES (?, ?, ?, ?, '2026-01-01T00:00:00')",
             (bid, name, f"/usr/sbin/{name}", str(bid) * 64),
         )
     conn.execute(
@@ -1097,7 +1120,11 @@ def test_exec_edge_grants_an_entry_site_that_can_only_be_found_or_unknown(tmp_pa
     conn = open_db(db)
     for bid, name in ((1, "web_daemon"), (2, "helper")):
         conn.execute(
-            "INSERT INTO binaries (id, name, path, sha256) VALUES (?, ?, ?, ?)",
+            # last_seen_at is LOAD-BEARING: the exec inventory reads current_binaries, which
+            # selects on MAX(last_seen_at); NULL never equals NULL, so omitting it empties the
+            # inventory and every token reads as unmatched.
+            "INSERT INTO binaries (id, name, path, sha256, last_seen_at) "
+            "VALUES (?, ?, ?, ?, '2026-01-01T00:00:00')",
             (bid, name, f"/usr/sbin/{name}", str(bid) * 64),
         )
     # binary 1 launches binary 2 ...
@@ -1191,3 +1218,58 @@ def test_missing_link_table_degrades_without_failing(tmp_path: Path) -> None:
     finally:
         conn.close()
     assert [r[0] for r in rows] == ["unmatched"]
+
+
+# ── a short name two binaries answer to resolves no target ────────────────────────────
+
+
+def test_a_name_two_binaries_answer_to_resolves_no_target() -> None:
+    """★ The name resolved; the FILE did not.
+
+    ``target_binary`` is what a reader follows to open the launched program. Storing the bare short
+    name meant an edge pointing at a name two files answer to — follow it and you land on whichever
+    one you happen to look up. When the inventory holds several paths under the name, no target is
+    recorded and the state says which half succeeded, so the edge is still there as a launch FACT
+    while the target is honestly undecided.
+
+    MUTATION: keep ``target_binary = base`` (the short name) -> RED, both because the target is no
+    longer None and because the state stays ``resolved_direct``.
+    """
+    inv = _inventory(
+        binaries={"helper": ("usr/sbin/helper", "opt/bin/helper"), "solo": ("bin/solo",)}
+    )
+    edges = _edges([_prov("system", _const("helper -d"))], inventory=inv)
+    assert len(edges) == 1
+    assert edges[0].target_resolution == "ambiguous_direct"
+    assert edges[0].target_binary is None
+    assert edges[0].target_token == "helper"  # the launch itself is still recorded
+
+    # the counterpart: one path under the name -> the path IS the target
+    solo = _edges([_prov("system", _const("solo -x"))], inventory=inv)
+    assert (solo[0].target_resolution, solo[0].target_binary) == ("resolved_direct", "bin/solo")
+
+
+def test_a_symlink_landing_on_an_ambiguous_name_resolves_no_target() -> None:
+    """One hop on, same rule: the link's target NAME is held by several files.
+
+    MUTATION: take ``match.matched_targets[0]`` as the target again -> RED.
+    """
+    inv = _inventory(
+        links=[("bin/sh", "sh", "busybox", None)],
+        binaries={"busybox": ("bin/busybox", "usr/bin/busybox")},
+    )
+    edges = _edges([_prov("execl", _const("/bin/sh"))], inventory=inv)
+    assert edges[0].target_resolution == "ambiguous_symlink_target"
+    assert edges[0].target_binary is None
+
+
+def test_an_ambiguous_target_grants_no_entry_site() -> None:
+    """An entry site says "this binary is launched here". With the file undecided, offering the
+    site to every namesake would be entry evidence for a program nobody launches.
+
+    MUTATION: add the two ambiguous states to ``enters_entry_reach`` -> RED.
+    """
+    for state in ("ambiguous_direct", "ambiguous_symlink_target"):
+        assert enters_entry_reach(state) is False
+    inv = _inventory(binaries={"helper": ("usr/sbin/helper", "opt/bin/helper")})
+    assert exec_entry_sites(_edges([_prov("system", _const("helper -d"))], inventory=inv)) == {}

@@ -175,7 +175,11 @@ _AGENT_INSTRUCTIONS = (
     "is named under stale_runs_refused); an unprovable mismatch is served with its reason stated, "
     "never refused. Read "
     "facts: get_pseudocode (func = a name OR an address in any form; "
-    "binary = short name OR full path), get_callees / get_xrefs to walk the call chain (an empty "
+    "binary = sha256 (or >=8-hex prefix) OR full path OR short name. A short name shared by "
+    "several binaries returns reason='ambiguous' listing each candidate's binary_path and "
+    "sha256 — re-issue with one of them; ambiguous is not an error, it is what the firmware "
+    "actually contains. When func is given, the function's own binary is used), "
+    "get_callees / get_xrefs to walk the call chain (an empty "
     "caller set may mean an indirect/dispatch-table call, not 'unreachable'), get_strings, "
     "get_functions_referencing_string (which functions mention a string, by pseudocode text "
     "match — wide and noisy, hits comments too), get_string_reference_anchors (the PARSED "
@@ -845,11 +849,17 @@ def make_tools(
     def _incomplete_for_run(
         atlas: sqlite3.Connection, run_id: str | None
     ) -> tuple[
-        list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any] | None
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        int,
+        dict[str, Any] | None,
     ]:
         """The analysis-completeness red-lines for a SINGLE resolved run (they are a per-scan fact):
-        incomplete binaries, partially-incomplete binaries, and folded high-fan-out xref symbols
-        (whose constrained L0 edges are visible here, never silently dropped).
+        incomplete binaries, partially-incomplete binaries, folded high-fan-out xref symbols
+        (whose constrained L0 edges are visible here, never silently dropped), and the COUNT of
+        dependency edges whose soname named more than one binary (the same shape: an edge that was
+        not written, surfaced as a number with a pointer to the detail, never a silent absence).
 
         Computed only when list_candidates is scoped to one resolvable run; empty across an all-runs
         listing (the red-line is per firmware, not a single value over a shared atlas).
@@ -864,22 +874,23 @@ def make_tools(
         if run_id is None:
             # Unscoped: not a failure, and not a clean bill either — the red-line is a property of
             # one scan, and there is no single one here.
-            return [], [], [], None
+            return [], [], [], 0, None
         run = _get_run(atlas, run_id)
         if run is None:
-            return [], [], [], {"reason": "unknown_run", "run_id": run_id}
+            return [], [], [], 0, {"reason": "unknown_run", "run_id": run_id}
         db = _resolve_db(atlas, run)
         if isinstance(db, dict):
             # The resolver's own error, passed through whole: it already says whether the run has
             # no recorded analysis.db, the file has moved, or the scan is refused as stale, and
             # each needs a different fix.
-            return [], [], [], db
+            return [], [], [], 0, db
         conn = facts.open_analysis_ro(db)
         try:
             return (
                 facts.list_incomplete_binaries(conn),
                 facts.list_partially_incomplete_binaries(conn),
                 facts.list_folded_xref_symbols(conn),
+                facts.count_unresolved_soname_edges(conn),
                 None,
             )
         finally:
@@ -998,6 +1009,7 @@ def make_tools(
                 incomplete,
                 partially_incomplete,
                 folded_xref,
+                unresolved_sonames,
                 completeness_unavailable,
             ) = _incomplete_for_run(atlas, run_id)
             # Read the annotations while the atlas is still open (each row's basis freshness is
@@ -1157,6 +1169,13 @@ def make_tools(
             # materialized -- visible with per-symbol counts so a suppressed edge is a known
             # decision, never a silent drop. Empty unless scoped to one resolvable run.
             "folded_xref_symbols": folded_xref,
+            # ★ Red-line (same family): library-dependency edges NOT written because their soname
+            # names more than one binary in this firmware. A count plus where the detail lives —
+            # the candidates are per depending binary, so they belong on that binary's own read.
+            "unresolved_soname_edges": {
+                "count": unresolved_sonames,
+                "see": "get_imports_exports(binary).dt_needed_unresolved",
+            },
             # ★ Whether the three lists above were COMPUTED. They are the reason an absent
             # candidate is not read as a clean binary, so an empty list has to be able to mean only
             # one thing. ``unavailable`` is null when the check ran; otherwise it carries why it
@@ -1703,7 +1722,14 @@ def make_tools(
         Run-aware: pass ``run_id`` (see list_runs) + ``function``, OR just ``evidence_ref`` (a
         candidate row's ref self-resolves run + binary + function). Every result echoes
         ``resolved_run`` + ``run_lineage`` so you always see which scan answered (and if it is
-        stale). A miss says whether the function lives in a DIFFERENT run or in none."""
+        stale). A miss says whether the function lives in a DIFFERENT run or in none.
+
+        ``binary`` is a SELECTOR: a sha256 (a >=8-hex prefix works), a full path, or a
+        short name. A short name is a label and can name several binaries in one firmware;
+        when it does, the result is ``reason='ambiguous'`` listing each candidate's
+        ``binary_path`` and ``sha256`` — re-issue with one of them. That is an answer about
+        the firmware, not an error.
+        When ``func`` resolves, ITS binary is used and ``binary`` does not re-select."""
         return _fact(
             lambda c, fn, bn: facts.get_pseudocode(c, func=fn or "", binary=bn),
             run_id=run_id,
@@ -1721,7 +1747,14 @@ def make_tools(
     ) -> dict[str, Any]:
         """Direct callee names of one function (intra-binary edges flagged resolved to follow).
 
-        Run-aware: ``run_id`` + ``function`` or ``evidence_ref``; echoes ``resolved_run``."""
+        Run-aware: ``run_id`` + ``function`` or ``evidence_ref``; echoes ``resolved_run``.
+
+        ``binary`` is a SELECTOR: a sha256 (a >=8-hex prefix works), a full path, or a
+        short name. A short name is a label and can name several binaries in one firmware;
+        when it does, the result is ``reason='ambiguous'`` listing each candidate's
+        ``binary_path`` and ``sha256`` — re-issue with one of them. That is an answer about
+        the firmware, not an error.
+        When ``func`` resolves, ITS binary is used and ``binary`` does not re-select."""
         return _fact(
             lambda c, fn, bn: facts.get_callees(c, func=fn or "", binary=bn),
             run_id=run_id,
@@ -1748,7 +1781,14 @@ def make_tools(
         It is a FACT (F's address is stored here), NEVER proof F is dispatched/reachable — trace the
         call yourself.
 
-        Run-aware: ``run_id`` + ``function`` or ``evidence_ref``; echoes ``resolved_run``."""
+        Run-aware: ``run_id`` + ``function`` or ``evidence_ref``; echoes ``resolved_run``.
+
+        ``binary`` is a SELECTOR: a sha256 (a >=8-hex prefix works), a full path, or a
+        short name. A short name is a label and can name several binaries in one firmware;
+        when it does, the result is ``reason='ambiguous'`` listing each candidate's
+        ``binary_path`` and ``sha256`` — re-issue with one of them. That is an answer about
+        the firmware, not an error.
+        When ``func`` resolves, ITS binary is used and ``binary`` does not re-select."""
         d: facts.XrefDirection = (
             "callees"
             if direction == "callees"
@@ -1787,7 +1827,14 @@ def make_tools(
         ``paging``: pass ``offset`` = ``paging.next_offset`` to page the tail (never summarized).
         HONEST BOUND: a binary's string export is capped, so results carry ``truncated`` / ``total``
         (by-binary) or ``search_may_be_incomplete`` (by-value) when a scanned binary was capped — a
-        string NOT found there is NOT proven absent."""
+        string NOT found there is NOT proven absent.
+
+        ``binary`` is a SELECTOR: a sha256 (a >=8-hex prefix works), a full path, or a
+        short name. A short name is a label and can name several binaries in one firmware;
+        when it does, the result is ``reason='ambiguous'`` listing each candidate's
+        ``binary_path`` and ``sha256`` — re-issue with one of them. That is an answer about
+        the firmware, not an error.
+        When ``func`` resolves, ITS binary is used and ``binary`` does not re-select."""
         return _fact(
             lambda c, fn, bn: facts.get_strings(c, binary=bn, func=fn, value=value, offset=offset),
             run_id=run_id,
@@ -1803,7 +1850,13 @@ def make_tools(
     ) -> dict[str, Any]:
         """Import and export symbol tables of one binary (cross-binary edge endpoints).
 
-        Run-aware: ``run_id`` + ``binary`` or ``evidence_ref``; echoes ``resolved_run``."""
+        Run-aware: ``run_id`` + ``binary`` or ``evidence_ref``; echoes ``resolved_run``.
+
+        ``binary`` is a SELECTOR: a sha256 (a >=8-hex prefix works), a full path, or a
+        short name. A short name is a label and can name several binaries in one firmware;
+        when it does, the result is ``reason='ambiguous'`` listing each candidate's
+        ``binary_path`` and ``sha256`` — re-issue with one of them. That is an answer about
+        the firmware, not an error."""
         return _fact(
             lambda c, fn, bn: facts.get_imports_exports(c, binary=bn or ""),
             run_id=run_id,
@@ -1841,7 +1894,13 @@ def make_tools(
         and .text are then indistinguishable: treat such a run as possibly INSTRUCTIONS until the
         address is confirmed to be a data constant.
 
-        Run-aware: ``run_id`` + ``binary`` or ``evidence_ref``; echoes ``resolved_run``."""
+        Run-aware: ``run_id`` + ``binary`` or ``evidence_ref``; echoes ``resolved_run``.
+
+        ``binary`` is a SELECTOR: a sha256 (a >=8-hex prefix works), a full path, or a
+        short name. A short name is a label and can name several binaries in one firmware;
+        when it does, the result is ``reason='ambiguous'`` listing each candidate's
+        ``binary_path`` and ``sha256`` — re-issue with one of them. That is an answer about
+        the firmware, not an error."""
         return _fact(
             lambda c, fn, bn: facts.get_data_bytes(
                 c, binary=bn or "", address=address, length=length
@@ -1863,7 +1922,13 @@ def make_tools(
         but functions.pseudocode is stored in full, so this answers "which functions mention this
         text". ``binary`` (short name or full path) narrows the scan; omitted, it scans every
         binary. Capped (``truncated`` when more exist). HONEST BOUND: a TEXT match, not a resolved
-        symbol reference — the text may sit in a comment or unrelated literal; confirm each hit."""
+        symbol reference — the text may sit in a comment or unrelated literal; confirm each hit.
+
+        ``binary`` is a SELECTOR: a sha256 (a >=8-hex prefix works), a full path, or a
+        short name. A short name is a label and can name several binaries in one firmware;
+        when it does, the result is ``reason='ambiguous'`` listing each candidate's
+        ``binary_path`` and ``sha256`` — re-issue with one of them. That is an answer about
+        the firmware, not an error."""
         return _fact(
             lambda c, fn, bn: facts.get_functions_referencing_string(c, text=text, binary=bn),
             run_id=run_id,
@@ -1899,7 +1964,13 @@ def make_tools(
         for this scope at all (older scan / not re-scanned) — UNKNOWN, not "no references".
 
         Run-aware: ``run_id`` + optional ``binary`` (or an ``evidence_ref``); echoes
-        ``resolved_run``."""
+        ``resolved_run``.
+
+        ``binary`` is a SELECTOR: a sha256 (a >=8-hex prefix works), a full path, or a
+        short name. A short name is a label and can name several binaries in one firmware;
+        when it does, the result is ``reason='ambiguous'`` listing each candidate's
+        ``binary_path`` and ``sha256`` — re-issue with one of them. That is an answer about
+        the firmware, not an error."""
         return _fact(
             lambda c, fn, bn: facts.get_string_reference_anchors(
                 c, text=text, binary=bn, limit=limit
@@ -1932,7 +2003,14 @@ def make_tools(
     ) -> dict[str, Any]:
         """On-demand disassembly — same-source aligned, or an honest 'unavailable' (never wrong).
 
-        Run-aware: ``run_id`` + ``function`` or ``evidence_ref``; echoes ``resolved_run``."""
+        Run-aware: ``run_id`` + ``function`` or ``evidence_ref``; echoes ``resolved_run``.
+
+        ``binary`` is a SELECTOR: a sha256 (a >=8-hex prefix works), a full path, or a
+        short name. A short name is a label and can name several binaries in one firmware;
+        when it does, the result is ``reason='ambiguous'`` listing each candidate's
+        ``binary_path`` and ``sha256`` — re-issue with one of them. That is an answer about
+        the firmware, not an error.
+        When ``func`` resolves, ITS binary is used and ``binary`` does not re-select."""
         return _fact(
             lambda c, fn, bn: facts.get_disassembly(c, func=fn or "", binary=bn),
             run_id=run_id,

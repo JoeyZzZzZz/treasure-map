@@ -20,6 +20,7 @@ import pytest
 from treasure_map.lib.analyze.ghidra_runner import adaptive_heap_mb
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.writer import begin_run
+from treasure_map.lib.binary_id import BinaryRow
 from treasure_map.lib.diff import driver
 from treasure_map.lib.diff.driver import DiffToolchainError, compute_diff
 from treasure_map.lib.storage.connection import open_db
@@ -38,7 +39,8 @@ def _seed(tmp_path: Path, a: dict[str, str], b: dict[str, str]) -> Path:
         con = open_db(path)
         for i, (name, sha) in enumerate(mapping.items(), start=1):
             con.execute(
-                "INSERT INTO binaries (id, name, path, sha256) VALUES (?, ?, ?, ?)",
+                "INSERT INTO binaries (id, name, path, sha256, last_seen_at) "
+                "VALUES (?, ?, ?, ?, '2026-01-01T00:00:00')",
                 (i, name, name, sha),
             )
         con.commit()
@@ -53,17 +55,24 @@ def _seed(tmp_path: Path, a: dict[str, str], b: dict[str, str]) -> Path:
 
 def _fake_preflight(tmp_path: Path):  # type: ignore[no-untyped-def]
     from treasure_map.lib.atlas.models import RunRow
+    from treasure_map.lib.binary_id import BinaryRow
 
     def _pf(atlas, run_a_id, run_b_id, binary_name, *, config, force):  # type: ignore[no-untyped-def]
         so_a = tmp_path / f"{binary_name}_a.so"
         so_b = tmp_path / f"{binary_name}_b.so"
         so_a.write_bytes(b"\x7fELF")
         so_b.write_bytes(b"\x7fELF")
+        # The stub mirrors what the real preflight now returns: the RESOLVED rows travel with
+        # the result, so nothing downstream re-resolves the selector. A stub that omitted them
+        # would let a signature change through unnoticed.
+        row = BinaryRow(id=1, name=binary_name, path=f"/usr/lib/{binary_name}", sha256="a" * 64)
         return driver.PreflightResult(
             run_a=RunRow(run_id=run_a_id),
             run_b=RunRow(run_id=run_b_id),
             binary_a=binary_name,
             binary_b=binary_name,
+            bin_a=row,
+            bin_b=row,
             so_a=so_a,
             so_b=so_b,
             version_skew=False,
@@ -76,7 +85,7 @@ def _fake_preflight(tmp_path: Path):  # type: ignore[no-untyped-def]
 def _ok_persist(atlas, **kw):  # type: ignore[no-untyped-def]
     return driver.DiffSummary(
         diff_id=kw["diff_id"],
-        binary=kw["binary_name"],
+        binary=kw["bin_a"].name,
         matched_pairs=1,
         version_skew=kw["version_skew"],
         delta_layer_changed=1,
@@ -353,9 +362,12 @@ def test_effective_diff_workers_uses_diff_per_jvm(monkeypatch: pytest.MonkeyPatc
         return configured, None
 
     monkeypatch.setattr(driver, "clamp_parallelism_to_memory", _fake_clamp)
+    row = BinaryRow(id=1, name="x", path="/usr/lib/x", sha256="a" * 64)
     rd = driver._ResolvedDiff(
         binary="x",
         binary_short="x",
+        bin_a=row,
+        bin_b=row,
         so_a=Path("/x"),
         so_b=Path("/x"),
         version_skew=False,

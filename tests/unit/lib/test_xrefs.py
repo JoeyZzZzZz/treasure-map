@@ -463,3 +463,164 @@ def test_l0_emits_periodic_progress_log(tmp_path: Path, monkeypatch, caplog) -> 
         build_xrefs(conn, fold_edge_threshold=10_000)  # high -> no fold, pure progress test
     assert any("xrefs L0:" in r.getMessage() for r in caplog.records)
     conn.close()
+
+
+# ── an ambiguous soname writes no edge, and says so ───────────────────────────
+
+
+def _ambiguous_soname_db(tmp_path: Path, *, copies: int = 2, versioned: bool = False):  # type: ignore[no-untyped-def]
+    """One depending binary plus ``copies`` libraries sharing a soname under different paths.
+
+    The real shape this models: a firmware carrying the same library under two roots, with
+    different content. ``versioned`` makes the dependency name carry a version the library rows do
+    not, so the hit lands on the stripped-version fallback instead of the exact name."""
+    conn = open_db(tmp_path / "analysis.db")
+    dep = "libshared.so.6.0" if versioned else "libshared.so.6"
+    conn.execute(
+        "INSERT INTO binaries (id, name, path, sha256, last_seen_at, dt_needed) "
+        "VALUES (1, 'appd', 'usr/sbin/appd', ?, '2026-01-01T00:00:00', ?)",
+        ("a" * 64, json.dumps([dep])),
+    )
+    for i in range(copies):
+        conn.execute(
+            "INSERT INTO binaries (id, name, path, sha256, last_seen_at, dt_needed) "
+            "VALUES (?, 'libshared.so.6', ?, ?, '2026-01-01T00:00:00', '[]')",
+            (2 + i, f"root{i}/lib/libshared.so.6", chr(ord("b") + i) * 64),
+        )
+    conn.commit()
+    return conn
+
+
+def _ledger(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    conn.row_factory = sqlite3.Row
+    return conn.execute(
+        "SELECT * FROM xref_unresolved_sonames ORDER BY soname, edge_layer"
+    ).fetchall()
+
+
+def test_a_soname_naming_two_binaries_writes_no_edge_and_is_recorded(tmp_path: Path) -> None:
+    """★ The dependency names a LABEL that two files answer to, so it identifies neither.
+
+    The index used to assign per name (last binary with that name won), so the edge was written to
+    whichever row the scan happened to reach last — a confident edge to an arbitrary file,
+    indistinguishable in the table from a correct one. Now no edge is written and every candidate
+    is recorded, so the missing edge is a visible decision.
+
+    MUTATION: restore ``soname_map[name] = bid`` in _build_soname_map -> RED (an edge reappears and
+    the ledger empties). Change the multi-candidate branch back to ``continue`` -> RED (the edge
+    stays gone but nothing records it, which is the silent drop). Measured RED at 1 failed each.
+    """
+    conn = _ambiguous_soname_db(tmp_path)
+    stats = build_xrefs(conn)
+    assert stats.layer2_dt_needed == 0
+    assert stats.dt_needed_ambiguous == 1
+    assert (
+        conn.execute("SELECT COUNT(*) FROM xrefs WHERE xref_type = 'dt_needed'").fetchone()[0] == 0
+    )
+    rows = _ledger(conn)
+    assert len(rows) == 1
+    assert rows[0]["soname"] == "libshared.so.6"
+    assert rows[0]["edge_layer"] == "dt_needed"
+    assert rows[0]["import_func_name"] is None
+    assert rows[0]["match_kind"] == "exact"
+    assert set(json.loads(rows[0]["candidate_binary_ids"])) == {2, 3}
+    assert rows[0]["reason"] == "ambiguous_soname"
+    conn.close()
+
+
+def test_three_copies_are_all_named(tmp_path: Path) -> None:
+    """A fix that only ever compared two candidates would pass the pair case."""
+    conn = _ambiguous_soname_db(tmp_path, copies=3)
+    build_xrefs(conn)
+    rows = _ledger(conn)
+    assert set(json.loads(rows[0]["candidate_binary_ids"])) == {2, 3, 4}
+    conn.close()
+
+
+def test_a_fallback_match_is_recorded_as_a_fallback(tmp_path: Path) -> None:
+    """The dependency carries a version the libraries do not, so it matched the stripped form. That
+    is a weaker claim than an exact name and the ledger says which it was.
+
+    MUTATION: report every hit as 'exact' -> RED.
+    """
+    conn = _ambiguous_soname_db(tmp_path, versioned=True)
+    build_xrefs(conn)
+    rows = _ledger(conn)
+    assert len(rows) == 1
+    assert rows[0]["soname"] == "libshared.so.6.0"
+    assert rows[0]["match_kind"] == "versioned_fallback"
+    conn.close()
+
+
+def test_an_unambiguous_soname_still_writes_its_edge(tmp_path: Path) -> None:
+    """The regression that keeps the fix from being a blanket suppression."""
+    conn = _ambiguous_soname_db(tmp_path, copies=1)
+    stats = build_xrefs(conn)
+    assert stats.layer2_dt_needed == 1
+    assert stats.dt_needed_ambiguous == 0
+    assert _ledger(conn) == []
+    conn.close()
+
+
+def test_an_ambiguous_import_names_the_symbol_it_lost(tmp_path: Path) -> None:
+    """Layer 1 is the FUNCTION-level edge, so an import lost to ambiguity costs more than a
+    library-level one — the ledger records which symbol it was.
+
+    ★ Population note: the imports table is empty on every stripped firmware scanned so far, so
+    this branch has no live instances. It is implemented and pinned for type and contract
+    consistency with layer 2, not on the strength of an observed defect.
+
+    MUTATION: change the layer-1 multi-candidate branch back to ``continue`` -> RED.
+    """
+    conn = _ambiguous_soname_db(tmp_path)
+    conn.execute(
+        "INSERT INTO imports (binary_id, func_name, lib_soname) VALUES (1, 'shared_entry', ?)",
+        ("libshared.so.6",),
+    )
+    conn.commit()
+    stats = build_xrefs(conn)
+    assert stats.import_export_ambiguous == 1
+    assert stats.layer1_total == 0
+    assert (
+        conn.execute("SELECT COUNT(*) FROM xrefs WHERE xref_type = 'import_export'").fetchone()[0]
+        == 0
+    )
+    rows = [r for r in _ledger(conn) if r["edge_layer"] == "import_export"]
+    assert len(rows) == 1
+    assert rows[0]["import_func_name"] == "shared_entry"
+    conn.close()
+
+
+def test_the_unresolved_ledger_is_wiped_with_the_xrefs(tmp_path: Path) -> None:
+    """It is rebuilt whole with the table it explains, so a stale row cannot outlive its scan."""
+    conn = _ambiguous_soname_db(tmp_path)
+    build_xrefs(conn)
+    assert len(_ledger(conn)) == 1
+    build_xrefs(conn)
+    assert len(_ledger(conn)) == 1  # rebuilt, not accumulated
+    conn.close()
+
+
+def test_get_imports_exports_surfaces_the_unresolved_dependencies(tmp_path: Path) -> None:
+    """The candidates reach the reader with the path and sha that tell them apart.
+
+    MUTATION: drop ``dt_needed_unresolved`` from the response -> RED.
+    """
+    conn = _ambiguous_soname_db(tmp_path)
+    build_xrefs(conn)
+    conn.row_factory = sqlite3.Row
+    res = facts.get_imports_exports(conn, binary="usr/sbin/appd")
+    unresolved = res["dt_needed_unresolved"]
+    assert len(unresolved) == 1
+    assert unresolved[0]["soname"] == "libshared.so.6"
+    assert {c["binary_path"] for c in unresolved[0]["candidates"]} == {
+        "root0/lib/libshared.so.6",
+        "root1/lib/libshared.so.6",
+    }
+    assert all(c["sha256"] for c in unresolved[0]["candidates"])
+    # the counterpart read: a binary with nothing unresolved says so with an empty list, not by
+    # omitting the key
+    clean = facts.get_imports_exports(conn, binary="root0/lib/libshared.so.6")
+    assert clean["dt_needed_unresolved"] == []
+    assert facts.count_unresolved_soname_edges(conn) == 1
+    conn.close()

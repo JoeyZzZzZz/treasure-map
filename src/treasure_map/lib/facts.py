@@ -24,6 +24,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Literal
 
+from treasure_map.lib.binary_id import resolve_binary
 from treasure_map.lib.hunt.refs import _norm_addr
 from treasure_map.version import UNKNOWN_VERSION
 
@@ -94,6 +95,67 @@ def list_folded_xref_symbols(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     except sqlite3.OperationalError:
         return []
     return [dict(r) for r in rows]
+
+
+def list_unresolved_soname_edges(
+    conn: sqlite3.Connection, *, binary_id: int | None = None
+) -> list[dict[str, Any]]:
+    """Library-dependency edges NOT written because the soname named more than one binary.
+
+    ★ Red-line (an ambiguous dependency must be visible): one firmware can ship two files under the
+    same soname, so a dependency naming it identifies neither. The edge is not written to xrefs —
+    and it is not silently dropped either: each row here carries the depending binary, the soname,
+    which name form matched, and EVERY candidate with its path and sha256, so the question can be
+    settled instead of assumed. Absence of a dependency edge to an ambiguous soname is a recorded
+    decision, not evidence there is no dependency.
+
+    ``binary_id`` scopes to one depending binary. Empty on an older analysis.db that predates the
+    table (the read degrades quietly rather than error)."""
+    sql = (
+        "SELECT u.binary_id, u.soname, u.edge_layer, u.import_func_name, u.match_kind, "
+        "u.candidate_binary_ids FROM xref_unresolved_sonames u"
+    )
+    params: list[Any] = []
+    if binary_id is not None:
+        sql += " WHERE u.binary_id = ?"
+        params.append(binary_id)
+    sql += " ORDER BY u.soname, u.edge_layer, u.import_func_name, u.id"
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        try:
+            ids = [int(i) for i in json.loads(r["candidate_binary_ids"])]
+        except (ValueError, TypeError):
+            ids = []
+        candidates = []
+        for cid in ids:
+            name, path = _binary_name_path_by_id(conn, cid)
+            sha = conn.execute("SELECT sha256 FROM binaries WHERE id = ?", (cid,)).fetchone()
+            candidates.append(
+                {"binary": name, "binary_path": path, "sha256": sha["sha256"] if sha else None}
+            )
+        out.append(
+            {
+                "soname": r["soname"],
+                "edge_layer": r["edge_layer"],
+                "import_func_name": r["import_func_name"],
+                "match_kind": r["match_kind"],
+                "candidates": candidates,
+            }
+        )
+    return out
+
+
+def count_unresolved_soname_edges(conn: sqlite3.Connection) -> int:
+    """How many dependency edges this scan could not attribute to one binary. 0 on an older db."""
+    try:
+        row = conn.execute("SELECT COUNT(*) AS n FROM xref_unresolved_sonames").fetchone()
+    except sqlite3.OperationalError:
+        return 0
+    return int(row["n"]) if row else 0
 
 
 # A function large enough that Ghidra should have produced pseudocode. Sub-threshold bodies (thunks,
@@ -213,8 +275,13 @@ def _run_ghidra_version(conn: sqlite3.Connection) -> str:
     return UNKNOWN_VERSION
 
 
-def _anchor(binary: str | None, name: str | None, address: str | None) -> dict[str, Any]:
-    return {"binary": binary, "function": name, "address": address}
+def _anchor(
+    binary: str | None, binary_path: str | None, name: str | None, address: str | None
+) -> dict[str, Any]:
+    """One cross-tool anchor. ``binary`` is the short NAME, which repeats across a firmware, so the
+    path travels with it — without one, an anchor naming ``libstdc++.so.6`` does not say which of
+    them, and a reader cannot re-issue a query that lands on the same binary twice."""
+    return {"binary": binary, "binary_path": binary_path, "function": name, "address": address}
 
 
 def _parse_callees(raw: str | None) -> list[str]:
@@ -296,7 +363,9 @@ def _resolve_one(
             "found": False,
             "reason": "ambiguous",
             "query": {"function": func, "binary": binary},
-            "candidates": [_anchor(r["binary_name"], r["name"], r["address"]) for r in rows],
+            "candidates": [
+                _anchor(r["binary_name"], r["binary_path"], r["name"], r["address"]) for r in rows
+            ],
         }
     return rows[0], None
 
@@ -339,7 +408,7 @@ def get_pseudocode(
     truncated = bool(row["callees_truncated"])
     result: dict[str, Any] = {
         "found": True,
-        "anchor": _anchor(row["binary_name"], row["name"], row["address"]),
+        "anchor": _anchor(row["binary_name"], row["binary_path"], row["name"], row["address"]),
         "binary_path": row["binary_path"],
         "size_bytes": row["size_bytes"],
         "is_exported": bool(row["is_exported"]),
@@ -372,19 +441,21 @@ def get_callees(
         assert miss is not None
         return miss
     binary_name = row["binary_name"]
+    # ★ Scoped by binary ID, not by short name. Scoping by name pooled the functions of every
+    # binary sharing that name, so a callee that only exists in the OTHER one came back
+    # resolved_in_binary=true — a claim that the call stays inside this file when it does not.
     same_binary = {
         r["name"]
         for r in conn.execute(
-            "SELECT f.name FROM functions f JOIN binaries b ON b.id = f.binary_id "
-            "WHERE b.name = ? AND f.name IS NOT NULL",
-            (binary_name,),
+            "SELECT name FROM functions WHERE binary_id = ? AND name IS NOT NULL",
+            (row["binary_id"],),
         )
     }
     callees = _parse_callees(row["callees"])
     truncated = bool(row["callees_truncated"])
     result: dict[str, Any] = {
         "found": True,
-        "anchor": _anchor(binary_name, row["name"], row["address"]),
+        "anchor": _anchor(binary_name, row["binary_path"], row["name"], row["address"]),
         "callees": [{"name": c, "resolved_in_binary": c in same_binary} for c in callees],
         "callees_truncated": truncated,
     }
@@ -431,23 +502,49 @@ def get_xrefs(
         (fid,),
     ).fetchall()
     edges: list[dict[str, Any]] = []
+    # ★ The dedup key for the reverse-caller pass below, accumulated HERE rather than derived from
+    # the edge dicts later: those dicts are handed back to the caller verbatim, so an internal
+    # binary-id field added to them would leak straight into the response.
+    #
+    # The key is (name, BINARY ID, ADDRESS) — what actually identifies a caller. Neither of the
+    # first two alone will do: a short name is shared by different binaries, so keying on it made
+    # every same-named caller in the second binary collide with the first; and a name is not unique
+    # WITHIN a binary either (a library can carry several functions called ``widen`` at different
+    # addresses), so dropping the address collapses them to one. Both mistakes produce the same
+    # symptom — a caller set that comes back short and reads like a function with few callers.
+    seen_ids: set[tuple[str | None, int | None, str | None]] = set()
     for r in rows:
         of = conn.execute(
-            "SELECT f.name, f.address, b.name AS bn FROM functions f "
+            "SELECT f.name, f.address, f.binary_id, b.name AS bn, b.path AS bp FROM functions f "
             "JOIN binaries b ON b.id = f.binary_id WHERE f.id = ?",
             (r["ofid"],),
         ).fetchone()
-        bn = of["bn"] if of else _binary_name(conn, r["obid"])
+        if of is not None:
+            bn, bp = of["bn"], of["bp"]
+        else:
+            # A library-level edge: no function row, only the other side's binary id. Resolve the
+            # label AND the path from that id — the id is the identity, and dropping the path here
+            # would leave exactly the anchors that name a repeated short name unqualified.
+            bn, bp = _binary_name_path_by_id(conn, r["obid"])
         edges.append(
             {
-                "anchor": _anchor(bn, of["name"] if of else None, of["address"] if of else None),
+                "anchor": _anchor(
+                    bn, bp, of["name"] if of else None, of["address"] if of else None
+                ),
                 "xref_type": r["xref_type"],
                 "library_level": of is None,  # NULL func id = a binary/library-level reference
             }
         )
+        seen_ids.add(
+            (
+                of["name"] if of else None,
+                of["binary_id"] if of else r["obid"],
+                of["address"] if of else None,
+            )
+        )
     notes: list[str] = []
     if direction == "callers":
-        _append_callee_reverse_callers(conn, row, edges)
+        _append_callee_reverse_callers(conn, row, edges, seen_ids)
         if not edges:
             notes.append(
                 "no direct callers found; may be reached via an indirect/dispatch-table/"
@@ -467,7 +564,7 @@ def get_xrefs(
             )
     result: dict[str, Any] = {
         "found": True,
-        "anchor": _anchor(row["binary_name"], row["name"], row["address"]),
+        "anchor": _anchor(row["binary_name"], row["binary_path"], row["name"], row["address"]),
         "direction": direction,
         "edges": edges,
     }
@@ -515,7 +612,7 @@ def _address_taken_xrefs(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str
         notes.append(_ADDRTAKEN_TRUNC_NOTE)
     return {
         "found": True,
-        "anchor": _anchor(row["binary_name"], row["name"], row["address"]),
+        "anchor": _anchor(row["binary_name"], row["binary_path"], row["name"], row["address"]),
         "direction": "address_taken",
         "edges": edges,
         "note": " | ".join(notes),
@@ -523,48 +620,59 @@ def _address_taken_xrefs(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str
 
 
 def _append_callee_reverse_callers(
-    conn: sqlite3.Connection, row: sqlite3.Row, edges: list[dict[str, Any]]
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    edges: list[dict[str, Any]],
+    seen_ids: set[tuple[str | None, int | None, str | None]],
 ) -> None:
     """Append same-binary direct callers recovered by reverse-scanning callee lists.
 
     The xref table carries no intra-binary function->function edge, but ``functions.callees`` does
     (each function's own out-edges). A function whose callee list contains the target by an exact
     name match is a direct caller. ``LIKE`` is only a prefilter; the membership test is on parsed
-    JSON elements so a name that is a substring of another callee does not false-match."""
+    JSON elements so a name that is a substring of another callee does not false-match.
+
+    ★ Dedup is on (function name, BINARY ID, ADDRESS), which is why ``seen_ids`` is passed in
+    rather than rebuilt from ``edges``. Neither of the first two alone identifies a caller: a short
+    name is shared across binaries (one firmware can ship two ``libstdc++.so.6``), and a name is
+    not unique inside one binary either. Keying on the name alone dropped every same-named caller
+    after the first — a caller set that comes back short is the one thing this function must never
+    produce quietly."""
     target = row["name"]
     if not target:
         return
-    seen = {(e["anchor"]["function"], e["anchor"]["binary"]) for e in edges}
     for fr in conn.execute(
-        "SELECT f.name, f.address, f.callees, b.name AS bn FROM functions f "
-        "JOIN binaries b ON b.id = f.binary_id WHERE f.binary_id = ? AND f.callees LIKE ?",
+        "SELECT f.name, f.address, f.callees, f.binary_id, b.name AS bn, b.path AS bp "
+        "FROM functions f JOIN binaries b ON b.id = f.binary_id "
+        "WHERE f.binary_id = ? AND f.callees LIKE ?",
         (row["binary_id"], f"%{target}%"),
     ):
         if target not in _parse_callees(fr["callees"]):
             continue
-        key = (fr["name"], fr["bn"])
-        if key in seen:
+        key = (fr["name"], fr["binary_id"], fr["address"])
+        if key in seen_ids:
             continue
-        seen.add(key)
+        seen_ids.add(key)
         edges.append(
             {
-                "anchor": _anchor(fr["bn"], fr["name"], fr["address"]),
+                "anchor": _anchor(fr["bn"], fr["bp"], fr["name"], fr["address"]),
                 "xref_type": "intra_callees",  # reverse-resolved from the caller's callee list
                 "library_level": False,
             }
         )
 
 
-def _binary_name(conn: sqlite3.Connection, binary_id: int | None) -> str | None:
+def _binary_name_path_by_id(
+    conn: sqlite3.Connection, binary_id: int | None
+) -> tuple[str | None, str | None]:
+    """``(name, path)`` for a binary looked up BY ID — the identity, never a selector.
+
+    Keyed on the id on purpose: this is the honest direction. Its deleted sibling took a short name
+    and returned one row of however many shared it."""
     if binary_id is None:
-        return None
-    r = conn.execute("SELECT name FROM binaries WHERE id = ?", (binary_id,)).fetchone()
-    return r["name"] if r else None
-
-
-def _binary_id(conn: sqlite3.Connection, binary: str) -> int | None:
-    r = conn.execute("SELECT id FROM binaries WHERE name = ?", (binary,)).fetchone()
-    return int(r["id"]) if r else None
+        return None, None
+    r = conn.execute("SELECT name, path FROM binaries WHERE id = ?", (binary_id,)).fetchone()
+    return (r["name"], r["path"]) if r else (None, None)
 
 
 def _addr_int(address: str | None) -> int | None:
@@ -696,28 +804,35 @@ def get_strings(
         # ★ M6: value mode now honours ``func`` (previously it was silently dropped — a search
         # could not be scoped to a function). Resolve func first; a non-resolving func is SURFACED
         # (not-found / ambiguous), never ignored. func narrows the search to its address range.
-        fbin: str | None = None
         lo = hi = None
+        bid: int | None = None
+        scope_path: str | None = None
         if func is not None:
             frow, miss = _resolve_one(conn, func, binary)
             if frow is None:
                 assert miss is not None
                 return miss
-            fbin = frow["binary_name"]
+            # ★ Once the function resolved, ITS binary is the scope — the id, not a re-resolution
+            # of whatever selector the caller typed. Re-resolving a short name here would drag a
+            # uniquely-resolved function back into an ambiguity it had already passed through, and
+            # could scope the search to a different binary than the one the function lives in.
+            bid = frow["binary_id"]
+            scope_path = frow["binary_path"]
             lo = _addr_int(frow["address"])
             if lo is not None and frow["size_bytes"]:
                 hi = lo + int(frow["size_bytes"])
+        elif binary is not None:
+            brow, miss = resolve_binary(conn, binary)
+            if brow is None:
+                assert miss is not None
+                return {**miss, "query": {**miss["query"], "value": value}}
+            bid, scope_path = brow.id, brow.path
         sql = (
             "SELECT s.value, s.address, s.category, b.name AS bn FROM strings s "
             "JOIN binaries b ON b.id = s.binary_id WHERE s.value LIKE ?"
         )
         params: list[Any] = [f"%{value}%"]
-        scope_bin = binary if binary is not None else fbin
-        bid: int | None = None
-        if scope_bin is not None:
-            bid = _binary_id(conn, scope_bin)
-            if bid is None:
-                return {"found": False, "query": {"binary": scope_bin, "value": value}}
+        if bid is not None:
             sql += " AND s.binary_id = ?"
             params.append(bid)
         sql += " ORDER BY b.name, s.address"
@@ -738,7 +853,14 @@ def get_strings(
         page, paging = _byte_page(hits, offset, max_chars)
         result: dict[str, Any] = {
             "found": True,
-            "query": {"value": value, "binary": binary, "func": func},
+            # ``binary_path`` echoes the binary actually searched — which, when ``func`` was given,
+            # is the function's own binary regardless of what ``binary`` said.
+            "query": {
+                "value": value,
+                "binary": binary,
+                "binary_path": scope_path,
+                "func": func,
+            },
             "strings": page,
             "paging": paging,
             # ★ 3.1 declared≠actual: `func` is echoed but does NOT scope strings (see the note). The
@@ -750,7 +872,7 @@ def get_strings(
             result["warning"] = _STRING_FUNC_SCOPE_WARNING
         # Silent-drop guard: if a binary in scope was truncated at the export cap, a content search
         # can MISS a hit dropped past the cap — an empty/short result is NOT proof of absence there.
-        trunc_bins = _truncated_binaries(conn, bid if scope_bin is not None else None)
+        trunc_bins = _truncated_binaries(conn, bid)
         if trunc_bins:
             result["search_may_be_incomplete"] = True
             result["truncated_binaries"] = trunc_bins
@@ -763,9 +885,11 @@ def get_strings(
         return result
     if binary is None:
         return {"found": False, "query": {"binary": binary, "value": value}}
-    bid = _binary_id(conn, binary)
-    if bid is None:
-        return {"found": False, "query": {"binary": binary}}
+    brow, miss = resolve_binary(conn, binary)
+    if brow is None:
+        assert miss is not None
+        return miss
+    bid = brow.id
     rows = conn.execute(
         "SELECT value, address, category FROM strings WHERE binary_id = ? ORDER BY address",
         (bid,),
@@ -881,8 +1005,7 @@ def get_functions_referencing_string(
     truncated = len(rows) > lim
     functions = [
         {
-            **_anchor(r["binary_name"], r["name"], r["address"]),
-            "binary_path": r["binary_path"],
+            **_anchor(r["binary_name"], r["binary_path"], r["name"], r["address"]),
             "match_line": _first_match_line(r["pseudocode"], text),
         }
         for r in rows[:lim]
@@ -974,16 +1097,11 @@ def get_string_reference_anchors(
     lim = max(1, limit)
     bid = None
     if binary is not None:
-        row = conn.execute(
-            "SELECT id FROM binaries WHERE name = ? OR path = ? LIMIT 1", (binary, binary)
-        ).fetchone()
-        if row is None:
-            return {
-                "found": False,
-                "query": {"text": text, "binary": binary},
-                "note": "no_such_binary",
-            }
-        bid = int(row["id"])
+        brow, miss = resolve_binary(conn, binary)
+        if brow is None:
+            assert miss is not None
+            return {**miss, "query": {**miss["query"], "text": text}}
+        bid = brow.id
     query = {"text": text, "binary": binary, "match_kind": "exact_string_value"}
     sql = (
         "SELECT r.string_addr, r.string_value, r.ref_at, r.ref_in_func, r.ref_in_func_addr, "
@@ -1047,9 +1165,11 @@ def get_string_reference_anchors(
 
 def get_imports_exports(conn: sqlite3.Connection, *, binary: str) -> dict[str, Any]:
     """The import and export symbol tables of one binary (the cross-binary edge endpoints)."""
-    bid = _binary_id(conn, binary)
-    if bid is None:
-        return {"found": False, "query": {"binary": binary}}
+    brow, miss = resolve_binary(conn, binary)
+    if brow is None:
+        assert miss is not None
+        return miss
+    bid = brow.id
     imports = [
         {"func_name": r["func_name"], "lib_soname": r["lib_soname"]}
         for r in conn.execute(
@@ -1064,7 +1184,17 @@ def get_imports_exports(conn: sqlite3.Connection, *, binary: str) -> dict[str, A
             (bid,),
         )
     ]
-    return {"found": True, "binary": binary, "imports": imports, "exports": exports}
+    return {
+        "found": True,
+        "binary": brow.name,
+        "binary_path": brow.path,
+        "imports": imports,
+        "exports": exports,
+        # ★ Dependency edges this scan REFUSED to attribute, because their soname names more than
+        # one binary in this firmware. Always present: an empty list is the statement that every
+        # dependency resolved to one file, which is a different thing from not having looked.
+        "dt_needed_unresolved": list_unresolved_soname_edges(conn, binary_id=bid),
+    }
 
 
 # get_data_bytes standing contract, on EVERY result. The tool hands over bytes; it never reads
@@ -1139,17 +1269,11 @@ def get_data_bytes(
             "contract": _DATA_BYTES_CONTRACT,
         }
     query = {"binary": binary, "address": address, "length": length}
-    row = conn.execute(
-        "SELECT id FROM binaries WHERE name = ? OR path = ? LIMIT 1", (binary, binary)
-    ).fetchone()
-    if row is None:
-        return {
-            "found": False,
-            "query": query,
-            "note": "no_such_binary",
-            "contract": _DATA_BYTES_CONTRACT,
-        }
-    bid = int(row["id"])
+    brow, miss = resolve_binary(conn, binary)
+    if brow is None:
+        assert miss is not None
+        return {**miss, "query": {**query, **miss["query"]}, "contract": _DATA_BYTES_CONTRACT}
+    bid = brow.id
     try:
         blocks = conn.execute(
             "SELECT block_name, start_addr, size, bytes, initialized, executable, truncated "
@@ -1331,5 +1455,5 @@ def get_disassembly(
             "address alignment, which this server context does not retain; refusing to emit "
             "possibly-misaligned addresses (open the anchor in an aligned tool instead)"
         ),
-        "anchor": _anchor(row["binary_name"], row["name"], row["address"]),
+        "anchor": _anchor(row["binary_name"], row["binary_path"], row["name"], row["address"]),
     }

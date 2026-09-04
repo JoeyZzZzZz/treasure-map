@@ -109,10 +109,13 @@ def _ingest(tmp_path: Path, payload: dict[str, Any] | None) -> Path:
     db = tmp_path / "analysis.db"
     conn = open_db(db)
     conn.execute(
-        "INSERT INTO binaries (name, path, sha256) VALUES (?,?,?)", ("webd", "usr/sbin/webd", _SHA)
+        "INSERT INTO binaries (name, path, sha256, last_seen_at) "
+        "VALUES (?,?,?,'2026-01-01T00:00:00')",
+        ("webd", "usr/sbin/webd", _SHA),
     )
     conn.execute(
-        "INSERT INTO binaries (name, path, sha256) VALUES (?,?,?)",
+        "INSERT INTO binaries (name, path, sha256, last_seen_at) "
+        "VALUES (?,?,?,'2026-01-01T00:00:00')",
         ("bare_bin", "usr/sbin/bare_bin", _OTHER_SHA),
     )
     conn.commit()

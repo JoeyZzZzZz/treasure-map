@@ -484,6 +484,7 @@ def _flatten_nvram_ops(
                     key=key,
                     key_kind=key_kind,
                     binary=f.binary_name,
+                    binary_path=f.binary_path,
                     func=f.name,
                     op=opkind,
                     value_source=value_source,
@@ -577,6 +578,7 @@ def _flatten_string_keyed_edges(
             common: dict[str, Any] = {
                 "source_run_id": source_run_id,
                 "binary": f.binary_name,
+                "binary_path": f.binary_path,
                 "from_function": f.name,
                 "from_func_addr": func_addr if isinstance(func_addr, str) else None,
                 "key": key,
@@ -622,7 +624,8 @@ def _flatten_string_tables(db_path: Path | str, source_run_id: str) -> list[Stri
     try:
         rows = conn.execute(
             "SELECT s.table_addr, s.key, s.func_name, s.func_addr, s.func_kind, "
-            "s.completeness_status, s.completeness_reason, s.completeness_scope, b.name AS binary "
+            "s.completeness_status, s.completeness_reason, s.completeness_scope, "
+            "b.name AS binary, b.path AS binary_path "
             "FROM string_tables s LEFT JOIN binaries b ON b.id = s.binary_id"
         ).fetchall()
     except sqlite3.OperationalError:
@@ -636,6 +639,7 @@ def _flatten_string_tables(db_path: Path | str, source_run_id: str) -> list[Stri
             StringKeyedEdgeRow(
                 source_run_id=source_run_id,
                 binary=r[8],
+                binary_path=r[9],
                 from_function=None,  # a static table has no source function (it lives in .rodata)
                 from_func_addr=None,
                 key=r[1] if isinstance(r[1], str) else None,
@@ -673,9 +677,17 @@ def _load_exec_inventory(db_path: Path | str) -> ExecEdgeInventory:
         except sqlite3.OperationalError:
             link_rows = []  # pre-inventory analysis.db -> no link resolution, never a hard failure
         try:
-            bins = {r[0] for r in conn.execute("SELECT name FROM binaries") if r[0]}
+            # name -> path(s), the same shape as the script inventory below and for the same
+            # reason: a short name is a label, and one firmware can hold two files under it.
+            # Reading current_binaries (not binaries) keeps the inventory to THIS scan.
+            bins: dict[str, list[str]] = {}
+            for name, path in conn.execute("SELECT name, path FROM current_binaries"):
+                if name and path and path not in bins.setdefault(name, []):
+                    bins[name].append(path)
+                elif name:
+                    bins.setdefault(name, [])
         except sqlite3.OperationalError:
-            bins = set()
+            bins = {}
         try:
             # name -> path(s). The query selects shell scripts ONLY, which is what makes it safe
             # for the resolver to trust inventory membership on its own: a web asset or a config
@@ -693,7 +705,7 @@ def _load_exec_inventory(db_path: Path | str) -> ExecEdgeInventory:
         conn.close()
     return ExecEdgeInventory(
         symlinks=build_symlink_index([(r[0], r[1], r[2], r[3]) for r in link_rows]),
-        bin_names=frozenset(bins),
+        bin_names={k: tuple(sorted(v)) for k, v in bins.items()},
         scripts={k: tuple(sorted(v)) for k, v in scripts.items()},
     )
 
@@ -727,10 +739,15 @@ def _exec_scan_status(
     for row in edge_rows:
         found[row.launcher_binary] = found.get(row.launcher_binary, 0) + 1
     binaries = {f.binary_name for f in all_funcs} | set(found)
+    # name -> path, so the status row says WHICH file it is about. A name held by two binaries maps
+    # to whichever of them the function list mentions; the count above is already per name, so the
+    # path here is a pointer, not a second scope. (Per-path status is a write-side follow-up.)
+    paths: dict[str | None, str | None] = {f.binary_name: f.binary_path for f in all_funcs}
     return [
         DetectorScanStatusRow(
             source_run_id=source_run_id,
             binary=binary,
+            binary_path=paths.get(binary),
             detector="exec_argv",
             scanned=1,
             supported_scope="system/popen/doSystem command strings + execl*/execv* arg0",
@@ -756,7 +773,7 @@ def _flatten_detector_status(
     try:
         rows = conn.execute(
             "SELECT d.detector, d.scanned, d.supported_scope, d.unsupported_note, d.cap_hit, "
-            "d.found_count, b.name AS binary "
+            "d.found_count, b.name AS binary, b.path AS binary_path "
             "FROM detector_scan_status d LEFT JOIN binaries b ON b.id = d.binary_id"
         ).fetchall()
     except sqlite3.OperationalError:
@@ -767,6 +784,7 @@ def _flatten_detector_status(
         DetectorScanStatusRow(
             source_run_id=source_run_id,
             binary=r[6],
+            binary_path=r[7],
             detector=r[0] if isinstance(r[0], str) else "string_tables",
             scanned=int(r[1]) if r[1] is not None else 0,
             supported_scope=r[2] if isinstance(r[2], str) else None,
@@ -938,6 +956,7 @@ def _flatten_wrapper_edges(
                     key=key,
                     key_kind=key_kind,
                     binary=f.binary_name,
+                    binary_path=f.binary_path,
                     func=f.name,
                     op=op,
                     value_source=None,  # written value lives inside the wrapper, unresolved here
@@ -959,7 +978,8 @@ def _load_nvram_defaults(db_path: Path | str, source_run_id: str) -> list[NvramD
     conn = sqlite3.connect(uri, uri=True)
     try:
         rows = conn.execute(
-            "SELECT d.key, d.default_value, d.flags, d.member_index, b.name AS binary "
+            "SELECT d.key, d.default_value, d.flags, d.member_index, b.name AS binary, "
+            "b.path AS binary_path "
             "FROM nvram_defaults d LEFT JOIN binaries b ON b.id = d.binary_id"
         ).fetchall()
     except sqlite3.OperationalError:
@@ -974,6 +994,7 @@ def _load_nvram_defaults(db_path: Path | str, source_run_id: str) -> list[NvramD
             flags=r[2] if isinstance(r[2], int) else None,
             member_index=r[3] if isinstance(r[3], int) else None,
             binary=r[4],
+            binary_path=r[5],
         )
         for r in rows
     ]

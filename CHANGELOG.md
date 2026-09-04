@@ -9,6 +9,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A binary is identified by its row, not by its name.** One firmware ships the same
+  `libstdc++.so.6` under two roots — different content, different function tables, different data.
+  Every read that selected a binary by short name and took the first row back was answering about
+  whichever one the database returned: silently, and not necessarily the same one for two queries
+  over the same firmware. Selector resolution now lives in one module, accepts a sha256 (an
+  ≥8-hex prefix works), a full path or a short name, and answers a name that several binaries share
+  with `reason: "ambiguous"` and every candidate's `binary_path` + `sha256` — a fact about the
+  firmware, returned in a form the caller can act on, never a pick. A CI gate keeps the by-name
+  lookup from reappearing elsewhere.
+  Concretely fixed by this: `get_callees`' `resolved_in_binary` claimed a call stayed inside the
+  file when the callee only existed in the namesake (the function set was pooled by name); the
+  reverse-caller pass de-duplicated on the name, so every same-named caller after the first
+  vanished and a caller set came back short; a version diff resolved the same selector eight times
+  and could get a different row each time, with the ambiguity surfacing much later as "this
+  .BinDiff does not correspond to the two runs' binaries" or as an assertion that disappears under
+  `-O`; `load_baseline` merged every namesake's functions into one presence domain, which — where
+  their addresses overlap — was wrong about the entries it did contain, not merely short; and a
+  full diff's "did this binary change" compared one arbitrary sha per side.
+  ★ Every anchor now carries `binary_path` beside the short name, so a result says which file it
+  came from. When `func` resolves, ITS binary is used and `binary` does not re-select — a function
+  that identified itself is not dragged back into an ambiguity.
+  ★ `tmap diff` refuses a shared short name with the candidates listed, and records that refusal
+  as that binary's blind spot (`ambiguous_binary_selector`) — a distinct reason, because it is
+  fixed by naming a path or a sha, not by retrying. A full diff reports such names as
+  `ambiguous` alongside changed/unchanged rather than comparing them; the three partition the
+  names present in both runs.
+
+- **A library dependency whose soname names two binaries no longer picks one.** The soname index
+  assigned per name (last row won) and its version-stripped fallbacks kept the first, so a
+  `DT_NEEDED` edge pointed at whichever file the scan happened to reach — a confident edge to an
+  arbitrary target, indistinguishable in the table from a correct one. Such an edge is now not
+  written, and is recorded in `xref_unresolved_sonames` with every candidate and which name form
+  matched; `get_imports_exports` surfaces it as `dt_needed_unresolved`, and the `list_candidates`
+  red-line block carries the count. Same shape as the folded-xref ledger: not written, never
+  silently dropped.
+  ★ Stated cost: the edges this removes were probably right (their callers sit where the obvious
+  candidate lives). Probably is not a proof — the candidates are handed over instead of assumed,
+  and reading one costs a step that guessing did not.
+
+- **Per-binary rows record which file they are about.** `exec_edge`, `string_keyed_edge`,
+  `detector_scan_status`, `nvram_key_flow`, `nvram_defaults` and `diff_meta` scoped a row to a
+  binary by short name, so a per-binary filter on that name matched every file answering to it.
+  Each now stores the path beside the name (nullable; a pre-existing row keeps working and says
+  so). The string-key reachability lead is scoped by path when the row has one, and every returned
+  edge reports which basis it matched on rather than presenting the two as equivalent.
+  `exec_edge.target_binary` now holds the resolved PATH; when the launched name belongs to several
+  binaries the target is left unset and the resolution says `ambiguous_direct` /
+  `ambiguous_symlink_target` — the name resolved, the file did not, and such an edge grants no
+  entry site.
+
 - **A scan proven to be out of date is now refused on every tool, including the candidate map.**
   The refusal lived on one code path — the one the fact tools route through — so it was reachable
   from `get_pseudocode` and not from `list_candidates` or `explain_candidate`, which read the atlas

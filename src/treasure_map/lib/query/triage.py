@@ -2049,14 +2049,20 @@ def _candidate(
         web_keys = _web_settable_keys_reaching_sink(conn, fe, sink_anchor)
         nvram_key = web_keys[0] if web_keys else None
     # ★ Reachability lead (iron-law-safe): is this candidate's function the callee of a string-keyed
-    # edge (a strcmp ladder / static table gates it behind an attacker-influenceable key)? Scoped to
-    # this candidate's binary (basename of binary_path == the edge's short binary name) so a
-    # same-named function in another binary does not bleed in. This ANNOTATES the reachability note
-    # with the key lead; it NEVER flips reachability to proven — the agent judges reachability.
+    # edge (a strcmp ladder / static table gates it behind an attacker-influenceable key)? This
+    # ANNOTATES the reachability note with the key lead; it NEVER flips reachability to proven —
+    # the agent judges reachability.
+    #
+    # ★ Scoped by the candidate's binary PATH when the edge row records one (a short name is a
+    # label two files in one firmware can share). An edge row written before that column existed
+    # carries NULL and is still matched by basename; each returned edge reports which basis it
+    # matched on, so a name-scoped lead is never read as a path-scoped one.
     function = row["source_anchor"]
     binary_path = row["binary_path"]
     binary_name = Path(binary_path).name if binary_path else None
-    string_keyed_edges = tuple(edges_reaching_callee(conn, binary_name, function))
+    string_keyed_edges = tuple(
+        edges_reaching_callee(conn, binary_name, function, binary_path=binary_path)
+    )
     return TriageCandidate(
         review_status=REVIEW_STATUS_BY_REACHABILITY.get(reach, reach),
         reachability_status=reach,

@@ -41,6 +41,8 @@ jobs:
           pip install -e ".[dev]"
       - name: Red-line gates (never wrongly downweight; degrade must be visible)
         run: python scripts/check_recall_integrity.py --self-test
+      - name: Binary-selector gate (one resolver; an ambiguous name is refused, never picked)
+        run: bash scripts/check-binary-selector-resolution.sh
 
   lint:
     name: Lint

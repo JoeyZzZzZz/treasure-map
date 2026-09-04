@@ -20,11 +20,15 @@ def _mkdb(tmp_path: Path) -> Path:
     db = tmp_path / "analysis.db"
     conn = open_db(db)
     conn.execute(
-        "INSERT INTO binaries (id, name, path, sha256) VALUES (1, 'webd', 'usr/sbin/webd', ?)",
+        # last_seen_at is LOAD-BEARING for current_binaries (NULL = NULL is never true, so an
+        # omitted value empties the view and every binary selector misses).
+        "INSERT INTO binaries (id, name, path, sha256, last_seen_at) "
+        "VALUES (1, 'webd', 'usr/sbin/webd', ?, '2026-01-01T00:00:00')",
         ("a" * 64,),
     )
     conn.execute(
-        "INSERT INTO binaries (id, name, path, sha256) VALUES (2, 'libfoo.so', 'lib/libfoo.so', ?)",
+        "INSERT INTO binaries (id, name, path, sha256, last_seen_at) "
+        "VALUES (2, 'libfoo.so', 'lib/libfoo.so', ?, '2026-01-01T00:00:00')",
         ("b" * 64,),
     )
     conn.execute(
@@ -142,7 +146,14 @@ def test_get_pseudocode_by_name_carries_anchor(tmp_path: Path) -> None:
     conn = _ro(tmp_path)
     r = facts.get_pseudocode(conn, func="handle_req")
     assert r["found"] is True
-    assert r["anchor"] == {"binary": "webd", "function": "handle_req", "address": "0x1000"}
+    # ★ The anchor carries the PATH beside the short name. A name repeats across a firmware, so
+    # an anchor naming only the name does not say which binary it came from.
+    assert r["anchor"] == {
+        "binary": "webd",
+        "binary_path": "usr/sbin/webd",
+        "function": "handle_req",
+        "address": "0x1000",
+    }
     assert "do_cmd" in r["pseudocode"]
     assert r["callees"] == ["helper", "do_cmd"]
     conn.close()
@@ -175,6 +186,7 @@ def test_get_xrefs_callers_and_callees_cross_binary(tmp_path: Path) -> None:
     callees = facts.get_xrefs(conn, func="handle_req", direction="callees")
     assert callees["edges"][0]["anchor"] == {
         "binary": "libfoo.so",
+        "binary_path": "lib/libfoo.so",  # the path says WHICH libfoo.so, the name alone cannot
         "function": "foo_entry",
         "address": "0x500",
     }
@@ -237,13 +249,15 @@ def _trunc_db(tmp_path: Path) -> Path:
     db = tmp_path / "trunc.db"
     conn = open_db(db)
     conn.execute(
-        "INSERT INTO binaries (id, name, path, sha256, strings_total, strings_truncated) "
-        "VALUES (1, 'rc', 'sbin/rc', ?, 5000, 1)",
+        "INSERT INTO binaries (id, name, path, sha256, strings_total, strings_truncated, "
+        "last_seen_at) "
+        "VALUES (1, 'rc', 'sbin/rc', ?, 5000, 1, '2026-01-01T00:00:00')",
         ("a" * 64,),
     )
     conn.execute(
-        "INSERT INTO binaries (id, name, path, sha256, strings_total, strings_truncated) "
-        "VALUES (2, 'httpd', 'usr/sbin/httpd', ?, 2, 0)",
+        "INSERT INTO binaries (id, name, path, sha256, strings_total, strings_truncated, "
+        "last_seen_at) "
+        "VALUES (2, 'httpd', 'usr/sbin/httpd', ?, 2, 0, '2026-01-01T00:00:00')",
         ("b" * 64,),
     )
     conn.execute("INSERT INTO strings (binary_id, value, address) VALUES (1, 'sw_mode', '0x10')")
@@ -293,7 +307,8 @@ def _callee_trunc_db(tmp_path: Path) -> Path:
     db = tmp_path / "ct.db"
     conn = open_db(db)
     conn.execute(
-        "INSERT INTO binaries (id, name, path, sha256) VALUES (1, 'rc', 'sbin/rc', ?)",
+        "INSERT INTO binaries (id, name, path, sha256, last_seen_at) "
+        "VALUES (1, 'rc', 'sbin/rc', ?, '2026-01-01T00:00:00')",
         ("a" * 64,),
     )
     conn.execute(
@@ -405,7 +420,8 @@ def _strings_db(tmp_path: Path) -> Path:
     db = tmp_path / "s.db"
     conn = open_db(db)
     conn.execute(
-        "INSERT INTO binaries (id, name, path, sha256) VALUES (1, 'rc', 'sbin/rc', ?)",
+        "INSERT INTO binaries (id, name, path, sha256, last_seen_at) "
+        "VALUES (1, 'rc', 'sbin/rc', ?, '2026-01-01T00:00:00')",
         ("a" * 64,),
     )
     conn.execute(
@@ -579,11 +595,13 @@ def _mk_refdb(tmp_path: Path) -> Path:
     db = tmp_path / "refs.db"
     conn = open_db(db)
     conn.execute(
-        "INSERT INTO binaries (id, name, path, sha256) VALUES (1, 'webd', 'sbin/webd', ?)",
+        "INSERT INTO binaries (id, name, path, sha256, last_seen_at) "
+        "VALUES (1, 'webd', 'sbin/webd', ?, '2026-01-01T00:00:00')",
         ("a" * 64,),
     )
     conn.execute(
-        "INSERT INTO binaries (id, name, path, sha256) VALUES (2, 'apid', 'sbin/apid', ?)",
+        "INSERT INTO binaries (id, name, path, sha256, last_seen_at) "
+        "VALUES (2, 'apid', 'sbin/apid', ?, '2026-01-01T00:00:00')",
         ("b" * 64,),
     )
     conn.execute(
@@ -654,7 +672,8 @@ def test_referencing_string_underscore_is_literal_not_wildcard(tmp_path: Path) -
     db = tmp_path / "esc.db"
     conn = open_db(db)
     conn.execute(
-        "INSERT INTO binaries (id, name, path, sha256) VALUES (1, 'webd', 'sbin/webd', ?)",
+        "INSERT INTO binaries (id, name, path, sha256, last_seen_at) "
+        "VALUES (1, 'webd', 'sbin/webd', ?, '2026-01-01T00:00:00')",
         ("a" * 64,),
     )
     conn.execute(
@@ -679,7 +698,8 @@ def test_referencing_string_limit_and_truncation(tmp_path: Path) -> None:
     db = tmp_path / "many.db"
     conn = open_db(db)
     conn.execute(
-        "INSERT INTO binaries (id, name, path, sha256) VALUES (1, 'webd', 'sbin/webd', ?)",
+        "INSERT INTO binaries (id, name, path, sha256, last_seen_at) "
+        "VALUES (1, 'webd', 'sbin/webd', ?, '2026-01-01T00:00:00')",
         ("a" * 64,),
     )
     for i in range(60):  # 60 functions all mentioning the marker -> default cap of 50 truncates

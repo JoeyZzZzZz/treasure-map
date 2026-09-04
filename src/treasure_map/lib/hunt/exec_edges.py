@@ -61,6 +61,7 @@ through W, with the target read from the wrapped sink's own argument.
 from __future__ import annotations
 
 import posixpath
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -95,11 +96,24 @@ RESOLVED_SCRIPT = "resolved_script"
 SELF_EXEC = "self_exec"
 UNRESOLVED = "unresolved"
 UNMATCHED = "unmatched"
+# The token names a binary the inventory holds under SEVERAL paths — the same short name on two
+# different files. The name resolves; the FILE does not, so no target is recorded and the state
+# says which half succeeded. Kept apart from ``unmatched`` (which means nothing matched at all)
+# because the fix is different: here the candidates exist and can be listed.
+AMBIGUOUS_DIRECT = "ambiguous_direct"
+AMBIGUOUS_SYMLINK_TARGET = "ambiguous_symlink_target"
 
-# The six states, for the totality check the tests assert against.
-TARGET_RESOLUTIONS = frozenset(
+# What ``classify_target_resolution`` itself can return: a total, mutually exclusive classification
+# of the TOKEN. It answers "does this name something the inventory holds", which is as far as a
+# name can be judged.
+CLASSIFIER_RESOLUTIONS = frozenset(
     {RESOLVED_DIRECT, RESOLVED_SYMLINK, RESOLVED_SCRIPT, SELF_EXEC, UNRESOLVED, UNMATCHED}
 )
+
+# Every value the stored column can hold. The two ambiguous states are decided one step later, at
+# the row builder, because they are not a property of the token: they depend on how many FILES the
+# inventory holds under the name it matched, which the classifier is not given.
+TARGET_RESOLUTIONS = CLASSIFIER_RESOLUTIONS | {AMBIGUOUS_DIRECT, AMBIGUOUS_SYMLINK_TARGET}
 
 LAYER_SHELL = "shell_command"
 LAYER_EXEC = "exec_image"
@@ -195,7 +209,9 @@ class SymlinkMatch:
     matched_targets: tuple[str, ...] = ()
 
 
-def resolve_symlink(token: str, index: SymlinkIndex, bin_names: frozenset[str]) -> SymlinkMatch:
+def resolve_symlink(
+    token: str, index: SymlinkIndex, bin_names: Mapping[str, tuple[str, ...]]
+) -> SymlinkMatch:
     """Resolve ``token`` through the rootfs link inventory.
 
     An absolute token matches by full path, which is unique. A bare token matches by name, which
@@ -248,7 +264,10 @@ def classify_target_resolution(
     match: SymlinkMatch,
     in_non_binary: bool,
 ) -> str:
-    """Total, mutually exclusive classification of one target token into the six states.
+    """Total, mutually exclusive classification of one target token into the six CLASSIFIER states.
+
+    Judges the NAME only. Whether that name identifies one file is decided by the row builder,
+    which can see how many paths the inventory holds under it (see AMBIGUOUS_DIRECT).
 
     Every input lands in exactly one state — there is no fall-through and no None. ``unmatched`` is
     the honest catch-all: ambiguity, damage, an unverifiable link target, a genuinely missing
@@ -539,7 +558,11 @@ class ExecEdgeInventory:
     kinds of key. The path is already known at match time — it is what the inventory holds."""
 
     symlinks: SymlinkIndex
-    bin_names: frozenset[str]
+    # short name -> every recorded PATH under it. A mapping, not a set: a short name is a label
+    # and one firmware can hold two files under it, so "the token names a binary" and "the token
+    # names ONE binary" are different questions. Membership tests (``token in bin_names``) read
+    # the keys and are unaffected.
+    bin_names: Mapping[str, tuple[str, ...]]
     scripts: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
 
@@ -611,9 +634,22 @@ def _build_row(
     )
     target_binary: str | None = None
     if resolution == RESOLVED_DIRECT:
-        target_binary = base
+        # ★ The PATH is what identifies the launched file, and only when the name carries exactly
+        # one. Recording the bare short name meant an edge to a name two files answer to — the
+        # reader following it lands on whichever one they look up. Several paths -> no target and
+        # a state that says so, the same way an ambiguous script basename is already handled.
+        paths = tuple(inventory.bin_names.get(base, ()))
+        if len(paths) == 1:
+            target_binary = paths[0]
+        else:
+            resolution = AMBIGUOUS_DIRECT
     elif resolution == RESOLVED_SYMLINK:
-        target_binary = match.matched_targets[0] if match.matched_targets else None
+        linked = match.matched_targets[0] if match.matched_targets else None
+        paths = tuple(inventory.bin_names.get(linked, ())) if linked else ()
+        if len(paths) == 1:
+            target_binary = paths[0]
+        else:
+            resolution = AMBIGUOUS_SYMLINK_TARGET
     elif resolution == RESOLVED_SCRIPT and len(script_paths) == 1:
         # One path for this name -> that path IS the target, and the edge becomes answerable.
         # SEVERAL paths (genuinely different scripts sharing a basename) -> left NULL: picking one
@@ -626,6 +662,7 @@ def _build_row(
     return ExecEdgeRow(
         source_run_id=source_run_id,
         launcher_binary=func.binary_name,
+        launcher_binary_path=func.binary_path,
         launcher_function=func.name,
         launcher_addr=func.address,
         exec_api=api,
@@ -648,11 +685,15 @@ def _build_row(
 
 
 def exec_entry_sites(rows: list[ExecEdgeRow]) -> dict[str, list[dict[str, Any]]]:
-    """Group the entry-eligible edges by the binary they launch.
+    """Group the entry-eligible edges by the binary they launch, keyed by its PATH.
 
     ★ Only edges whose target resolved to a real binary are offered, and the site records the
     launcher, not a verdict. The reachability layer turns an offered site into ``found``; with no
-    site it reports ``unknown``. Neither path can produce 'blocked' — an edge is a lead."""
+    site it reports ``unknown``. Neither path can produce 'blocked' — an edge is a lead.
+
+    ★ Keyed by ``target_binary``, which now holds the resolved PATH. A short-name key would offer
+    the same site to every binary sharing that name — one launch callsite read as entry evidence
+    for a file nobody launches."""
     sites: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         if not enters_entry_reach(row.target_resolution) or not row.target_binary:

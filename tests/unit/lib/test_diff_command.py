@@ -38,7 +38,8 @@ def _mk_analysis(path: Path, binary: str, so_path: str | None) -> Path:
     => the bare name, i.e. an unlocatable relative path)."""
     con = open_db(path)
     con.execute(
-        "INSERT INTO binaries (id, name, path, sha256) VALUES (1, ?, ?, ?)",
+        "INSERT INTO binaries (id, name, path, sha256, last_seen_at) "
+        "VALUES (1, ?, ?, ?, '2026-01-01T00:00:00')",
         (binary, so_path if so_path is not None else binary, binary + "_sha"),
     )
     con.commit()
@@ -393,7 +394,8 @@ def _mk_multi_analysis(path: Path, name_to_sha: dict[str, str]) -> Path:
     con = open_db(path)
     for i, (name, sha) in enumerate(name_to_sha.items(), start=1):
         con.execute(
-            "INSERT INTO binaries (id, name, path, sha256) VALUES (?, ?, ?, ?)",
+            "INSERT INTO binaries (id, name, path, sha256, last_seen_at) "
+            "VALUES (?, ?, ?, ?, '2026-01-01T00:00:00')",
             (i, name, name, sha),
         )
     con.commit()
@@ -444,17 +446,24 @@ def _fake_preflight(tmp_path: Path):  # type: ignore[no-untyped-def]
     """A preflight stub for the parallel orchestration: dummy .so files + short-name = the binary,
     so the serial pre-phase resolves without a real toolchain / located binary."""
     from treasure_map.lib.atlas.models import RunRow
+    from treasure_map.lib.binary_id import BinaryRow
 
     def _pf(atlas, run_a_id, run_b_id, binary_name, *, config, force):  # type: ignore[no-untyped-def]
         so_a = tmp_path / f"{binary_name}_a.so"
         so_b = tmp_path / f"{binary_name}_b.so"
         so_a.write_bytes(b"\x7fELF")
         so_b.write_bytes(b"\x7fELF")
+        # The stub mirrors what the real preflight now returns: the RESOLVED rows travel with
+        # the result, so nothing downstream re-resolves the selector. A stub that omitted them
+        # would let a signature change through unnoticed.
+        row = BinaryRow(id=1, name=binary_name, path=f"/usr/lib/{binary_name}", sha256="a" * 64)
         return driver.PreflightResult(
             run_a=RunRow(run_id=run_a_id),
             run_b=RunRow(run_id=run_b_id),
             binary_a=binary_name,
             binary_b=binary_name,
+            bin_a=row,
+            bin_b=row,
             so_a=so_a,
             so_b=so_b,
             version_skew=False,
@@ -486,7 +495,7 @@ def test_run_full_diff_continues_past_a_single_failure(
     def _fake_persist(atlas, **kw):  # type: ignore[no-untyped-def]
         return driver.DiffSummary(
             diff_id=kw["diff_id"],
-            binary=kw["binary_name"],
+            binary=kw["bin_a"].name,
             matched_pairs=1,
             version_skew=kw["version_skew"],
             delta_layer_changed=1,
@@ -523,7 +532,7 @@ def test_run_full_diff_runs_unconfirmed_and_notifies_start(
         "_persist_success",
         lambda atlas, **kw: driver.DiffSummary(
             diff_id=kw["diff_id"],
-            binary=kw["binary_name"],
+            binary=kw["bin_a"].name,
             matched_pairs=1,
             version_skew=kw["version_skew"],
             delta_layer_changed=0,

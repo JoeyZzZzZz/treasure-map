@@ -19,6 +19,7 @@ from click.testing import CliRunner
 from treasure_map import mcp_app
 from treasure_map.cli.mcp_cli import fact as fact_group
 from treasure_map.lib import facts
+from treasure_map.lib.analyze.ghidra_runner import current_pass_version
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import InstanceRow, NvramFlowRow
 from treasure_map.lib.atlas.writer import (
@@ -73,8 +74,12 @@ def _mk_analysis(tmp_path: Path) -> Path:
     db = tmp_path / "analysis.db"
     conn = open_db(db)
     conn.execute(
-        "INSERT INTO binaries (id, name, path, sha256) VALUES (1, 'webd', 'usr/sbin/webd', ?)",
-        ("a" * 64,),
+        # pass_version is recorded because a real scan records it: without one, the CLI fact path
+        # honestly annotates "extraction pass unknown", which is a REAL difference from the MCP
+        # path and would make a lib/MCP/CLI parity comparison fail for the right reason.
+        "INSERT INTO binaries (id, name, path, sha256, last_seen_at, pass_version) "
+        "VALUES (1, 'webd', 'usr/sbin/webd', ?, '2026-01-01T00:00:00', ?)",
+        ("a" * 64, current_pass_version()),
     )
     conn.execute(
         "INSERT INTO functions (id, binary_id, name, address, size_bytes, pseudocode, callees) "
@@ -547,7 +552,8 @@ def test_no_lineage_run_never_revived_by_ws_root_fallback(tmp_path: Path) -> Non
     (ws_root / "miwifi").mkdir(parents=True)
     old = open_db(ws_root / "miwifi" / "analysis.db")
     old.execute(
-        "INSERT INTO binaries (id, name, path, sha256) VALUES (1, 'mtd', 'sbin/mtd', ?)",
+        "INSERT INTO binaries (id, name, path, sha256, last_seen_at) "
+        "VALUES (1, 'mtd', 'sbin/mtd', ?, '2026-01-01T00:00:00')",
         ("z" * 64,),
     )
     old.commit()
@@ -583,7 +589,8 @@ def test_ws_root_fallback_still_recovers_a_moved_lineage_run(tmp_path: Path) -> 
     (ws_root / "rt").mkdir(parents=True)
     db = open_db(ws_root / "rt" / "analysis.db")
     db.execute(
-        "INSERT INTO binaries (id, name, path, sha256) VALUES (1, 'webd', 'sbin/webd', ?)",
+        "INSERT INTO binaries (id, name, path, sha256, last_seen_at) "
+        "VALUES (1, 'webd', 'sbin/webd', ?, '2026-01-01T00:00:00')",
         ("a" * 64,),
     )
     db.execute(

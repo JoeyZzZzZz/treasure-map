@@ -77,7 +77,8 @@ def _seed_pair(
         so = tmp_path / f"a_{name}"
         so.write_bytes(b"\x7fELF")
         ca.execute(
-            "INSERT INTO binaries (id, name, path, sha256) VALUES (?, ?, ?, ?)",
+            "INSERT INTO binaries (id, name, path, sha256, last_seen_at) "
+            "VALUES (?, ?, ?, ?, '2026-01-01T00:00:00')",
             (i, name, str(so), sha),
         )
         if with_funcs:
@@ -91,7 +92,8 @@ def _seed_pair(
         so = tmp_path / f"b_{name}"
         so.write_bytes(b"\x7fELF")
         cb.execute(
-            "INSERT INTO binaries (id, name, path, sha256) VALUES (?, ?, ?, ?)",
+            "INSERT INTO binaries (id, name, path, sha256, last_seen_at) "
+            "VALUES (?, ?, ?, ?, '2026-01-01T00:00:00')",
             (i, name, str(so), sha),
         )
         if with_funcs:
@@ -423,7 +425,7 @@ def test_run_full_diff_recovers_failed_binary(
         )
         return driver.DiffSummary(
             diff_id=did,
-            binary=kw["binary_name"],
+            binary=kw["bin_a"].name,
             matched_pairs=1,
             version_skew=kw["version_skew"],
             delta_layer_changed=0,

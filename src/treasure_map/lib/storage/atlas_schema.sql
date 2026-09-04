@@ -180,6 +180,8 @@ CREATE TABLE IF NOT EXISTS nvram_key_flow (
     key_kind      TEXT NOT NULL DEFAULT 'unresolved'
         CHECK (key_kind IN ('constant','parametric','unresolved')),
     binary        TEXT,
+    binary_path   TEXT,   -- that binary's recorded path; the short name is a label and repeats
+                          --   across a firmware. NULL on a pre-column row
     func          TEXT,
     op            TEXT NOT NULL DEFAULT 'read' CHECK (op IN ('read','write')),
     value_source  TEXT,   -- write-side value provenance JSON (controllability signal); NULL for reads
@@ -207,6 +209,7 @@ CREATE TABLE IF NOT EXISTS nvram_defaults (
     flags         INTEGER,
     member_index  INTEGER,
     binary        TEXT,
+    binary_path   TEXT,   -- that binary's recorded path; NULL on a pre-column row
     created_at    DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -248,6 +251,9 @@ CREATE TABLE IF NOT EXISTS string_keyed_edge (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     source_run_id       TEXT,
     binary              TEXT,
+    binary_path         TEXT,   -- the binary's recorded path. The short name above is a
+                                --   LABEL and repeats across a firmware, so it is the path
+                                --   that identifies WHICH file. NULL on a pre-column row
     from_function       TEXT,   -- the dispatcher/table function (strcmp ladder) or NULL (static table)
     from_func_addr      TEXT,
     key                 TEXT,   -- the gating string (strcmp constant) or table entry name
@@ -281,13 +287,20 @@ CREATE INDEX IF NOT EXISTS idx_ske_from   ON string_keyed_edge(from_function);
 -- not say the exec callsite runs, nor that an attacker reaches it. The reachability layer may use
 -- an edge as an entry SITE, and its status stays found/unknown — an edge NEVER produces 'blocked'.
 --
--- target_resolution is a six-state, mutually exclusive, total classification of the argument token:
---   resolved_direct     the token names a binary in this run's inventory
---   resolved_symlink    the token is a rootfs link whose target is such a binary
---   resolved_script     the token is a .sh that the non-binary inventory holds
+-- target_resolution is an eight-state, mutually exclusive, total classification of the token:
+--   resolved_direct     the token names ONE binary in this run's inventory
+--   resolved_symlink    the token is a rootfs link whose target is ONE such binary
+--   resolved_script     the token is a script that the non-binary inventory holds
 --   self_exec           /proc/self/exe (the launcher re-executes itself)
 --   unresolved          the token could not be read out of the provenance at all
 --   unmatched           read fine, matched nothing
+--   ambiguous_direct          the name matches SEVERAL binaries (two files, one short name), so
+--                             the name resolved and the FILE did not — target_binary stays NULL
+--   ambiguous_symlink_target  same, one hop on: the link's target name matches several binaries
+-- ★ The two ambiguous states are kept apart from unmatched on purpose: unmatched means nothing
+-- matched, while these mean too much did. The fix differs (the candidates exist and are listable),
+-- and folding them together would report a firmware fact as a recognition failure.
+-- target_binary holds the resolved PATH, not the short name: the name is what was ambiguous.
 -- ★ unmatched is NOT "absent". It carries four plain facts so a reader can tell the cases apart
 -- WITHOUT tmap judging them: token_form (absolute/bare/relative), symlink_ambiguous (several
 -- link targets are binaries — undecided, not guessed), symlink_corrupt (the extraction damaged
@@ -306,7 +319,11 @@ CREATE INDEX IF NOT EXISTS idx_ske_from   ON string_keyed_edge(from_function);
 CREATE TABLE IF NOT EXISTS exec_edge (
     id                       INTEGER PRIMARY KEY AUTOINCREMENT,
     source_run_id            TEXT,
-    launcher_binary          TEXT,     -- A: the binary whose code holds the call
+    launcher_binary          TEXT,     -- A: the binary whose code holds the call (SHORT NAME,
+                                       --   which repeats across a firmware — see the path below)
+    launcher_binary_path     TEXT,     -- A's recorded path: the short name is a label, so it is
+                                       --   the path that says WHICH file holds the callsite.
+                                       --   NULL on a row written before this column existed
     launcher_function        TEXT,
     launcher_addr            TEXT,
     exec_api                 TEXT,     -- system / popen / doSystem / execl / execv / ...
@@ -343,6 +360,8 @@ CREATE TABLE IF NOT EXISTS detector_scan_status (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     source_run_id    TEXT,
     binary           TEXT,             -- short name, matching string_keyed_edge.binary
+    binary_path      TEXT,             -- that binary's recorded path — the name alone does not say
+                                       --   which file. NULL on a pre-column row
     detector         TEXT,             -- 'string_tables'
     scanned          INTEGER NOT NULL DEFAULT 0,
     supported_scope  TEXT,
@@ -550,6 +569,9 @@ CREATE TABLE IF NOT EXISTS diff_meta (
     binary_b                TEXT,            --   binary), stored as short name; NULL on a pre-feature
                                              --   diff -> a per-binary consumer must refuse, not skip
                                              --   filtering (empty != absent on the binary-scope axis)
+    binary_path_a           TEXT,            -- the resolved PATH per side. The short name above is a
+    binary_path_b           TEXT,            --   label and can name several files; these say which
+                                             --   one was diffed. NULL until the diff is re-run
     -- per-binary diff status (mirrors the scan-side ghidra_ok/status/reason model): a FAILED binary
     -- writes its own row (diff_ok=0 + status + reason) so a blind spot is persisted and queryable,
     -- never invisible. diff_ok is the RERUN GATE: an ok=1 binary whose content is unchanged is

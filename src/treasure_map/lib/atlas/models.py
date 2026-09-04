@@ -125,6 +125,10 @@ class NvramFlowRow:
     via_wrapper: str | None = (
         None  # A2: thin nvram wrapper an indirect edge resolved through; None=direct
     )
+    # The binary's recorded path. The short name beside it is a LABEL that repeats across a
+    # firmware, so it is the path that says which file this row is about. None on a row read
+    # back from before the column existed.
+    binary_path: str | None = None
     id: int | None = None
     created_at: str | None = None
 
@@ -142,6 +146,10 @@ class NvramDefaultRow:
     flags: int | None = None
     member_index: int | None = None
     binary: str | None = None
+    # The binary's recorded path. The short name beside it is a LABEL that repeats across a
+    # firmware, so it is the path that says which file this row is about. None on a row read
+    # back from before the column existed.
+    binary_path: str | None = None
     id: int | None = None
     created_at: str | None = None
 
@@ -205,6 +213,10 @@ class StringKeyedEdgeRow:
     completeness_status: str = "complete"
     completeness_reason: str | None = None
     completeness_scope: str | None = None
+    # The binary's recorded path. The short name beside it is a LABEL that repeats across a
+    # firmware, so it is the path that says which file this row is about. None on a row read
+    # back from before the column existed.
+    binary_path: str | None = None
     id: int | None = None
     created_at: str | None = None
 
@@ -241,6 +253,9 @@ class ExecEdgeRow:
     symlink_target_unresolved: int = 0
     target_binary: str | None = None
     occurrences: int = 1
+    # The LAUNCHER's recorded path. ``launcher_binary`` is a short name and repeats across a
+    # firmware, so it is the path that says which file holds the callsite. None on a pre-column row.
+    launcher_binary_path: str | None = None
     id: int | None = None
     created_at: str | None = None
 
@@ -261,6 +276,10 @@ class DetectorScanStatusRow:
     unsupported_note: str | None = None
     cap_hit: int = 0
     found_count: int = 0
+    # The binary's recorded path. The short name beside it is a LABEL that repeats across a
+    # firmware, so it is the path that says which file this row is about. None on a row read
+    # back from before the column existed.
+    binary_path: str | None = None
     id: int | None = None
 
 
@@ -341,6 +360,10 @@ class DiffMetaRow:
     matched_in_domain_b: int | None = None
     unmatched_a: int | None = None
     unmatched_b: int | None = None
+    # The resolved PATH per side. ``binary_a``/``binary_b`` hold the short name, which can name
+    # several files; these say which one was actually diffed. None until the diff is re-run.
+    binary_path_a: str | None = None
+    binary_path_b: str | None = None
     out_of_inventory_a: int | None = None
     out_of_inventory_b: int | None = None
     inventory_mismatch_a: int | None = None

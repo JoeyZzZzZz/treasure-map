@@ -98,7 +98,12 @@ def _mk_analysis(path: Path, binary: str, sha: str, funcs: list[tuple]) -> Path:
     since the decompile-status classifier turns on it (design-skip vs real failure vs unknown)."""
     con = open_db(path)
     con.execute(
-        "INSERT INTO binaries (id, name, path, sha256) VALUES (1, ?, ?, ?)", (binary, binary, sha)
+        # ★ last_seen_at is LOAD-BEARING, not decoration: current_binaries selects rows whose
+        # last_seen_at equals the maximum, and NULL = NULL is never true, so a fixture that omits
+        # it yields an EMPTY view and every binary resolution misses. Real scans always write it.
+        "INSERT INTO binaries (id, name, path, sha256, last_seen_at) "
+        "VALUES (1, ?, ?, ?, '2026-01-01T00:00:00')",
+        (binary, binary, sha),
     )
     for addr, name, pc, size in funcs:
         con.execute(
@@ -196,6 +201,46 @@ _CAT3 = frozenset({"00003000", "00003001"})
 _CAT2 = frozenset({"00009999"})
 
 
+def _bins(atlas, run_a_id: str, run_b_id: str, sel_a: str, sel_b: str | None = None):  # type: ignore[no-untyped-def]
+    """``{"bin_a": …, "bin_b": …}`` — the two resolved rows run_layer0_parse now takes.
+
+    Resolves per side through each run's own analysis.db, which is what ``preflight`` does before
+    calling it. Passing the selector straight through was how one short name got resolved eight
+    separate times inside a single diff."""
+    from treasure_map.lib.binary_id import resolve_binary_in_db
+    from treasure_map.lib.query.runs import get_run
+
+    out = {}
+    fallback = None
+    for key, rid, sel in (("bin_a", run_a_id, sel_a), ("bin_b", run_b_id, sel_b or sel_a)):
+        run = get_run(atlas, rid)
+        assert run is not None
+        if not run.analysis_db_path:
+            # A deliberately UNRESOLVED run: production never gets here (preflight blocks on it),
+            # and the test's point is that run_layer0_parse refuses on its own. Hand it the other
+            # side's row so the call is well-formed and the refusal comes from where it should.
+            assert fallback is not None
+            out[key] = fallback
+            continue
+        row, miss = resolve_binary_in_db(run.analysis_db_path, sel)
+        assert row is not None, miss
+        out[key] = fallback = row
+    return out
+
+
+def _row(db: Path, selector: str):  # type: ignore[no-untyped-def]
+    """Resolve a selector to the BinaryRow the production entry (preflight) would pass down.
+
+    The layer-0 functions take an identity, not a selector, so a test that wants to exercise them
+    resolves first — exactly as the real caller does. A test that keeps passing a short name is
+    testing a signature that no longer exists."""
+    from treasure_map.lib.binary_id import resolve_binary_in_db
+
+    row, miss = resolve_binary_in_db(str(db), selector)
+    assert row is not None, miss
+    return row
+
+
 def _presence_fixture(tmp_path: Path):  # type: ignore[no-untyped-def]
     # baseline (tmap functions inventory) = ③ ∪ ④ ; matched pairs (from the .BinDiff) = ② ∪ ④.
     funcs = [
@@ -205,7 +250,7 @@ def _presence_fixture(tmp_path: Path):  # type: ignore[no-untyped-def]
         ("0x3001", "gone_failed", "", 128),  # ③ failed -> unmatched_analysis_incomplete
     ]
     db = _mk_analysis(tmp_path / "a.db", "lib.so", "s", funcs)
-    baseline = load_baseline(str(db), "lib.so")
+    baseline = load_baseline(str(db), _row(db, "lib.so"))
     matched = _CAT2 | _CAT4
     return baseline, matched
 
@@ -299,7 +344,7 @@ def test_skipped_micro_is_analysis_complete_not_a_gap(tmp_path: Path) -> None:
     # an analysis blind spot that does not exist). This test FAILS under the pre-fix behavior
     # (empty -> incomplete regardless of size), so it has teeth.
     db = _mk_analysis(tmp_path / "a.db", "lib.so", "s", [("0x2000", "micro_stub", "", 4)])
-    base = load_baseline(str(db), "lib.so")
+    base = load_baseline(str(db), _row(db, "lib.so"))
     assert base.skipped_micro_count == 1 and base.failed_count == 0
     pres = compute_side_presence("d", "a", frozenset(), base)
     assert pres.rows[0].presence_state == "unmatched_analysis_complete"
@@ -309,7 +354,7 @@ def test_real_decompile_failure_is_analysis_incomplete(tmp_path: Path) -> None:
     # ★ a genuine failure (empty pseudocode at/above the min size) is a real gap -> existence
     # UNDETERMINED -> unmatched_analysis_incomplete (never add/delete).
     db = _mk_analysis(tmp_path / "a.db", "lib.so", "s", [("0x3000", "big_failed", "", 128)])
-    base = load_baseline(str(db), "lib.so")
+    base = load_baseline(str(db), _row(db, "lib.so"))
     assert base.failed_count == 1 and base.skipped_micro_count == 0
     pres = compute_side_presence("d", "a", frozenset(), base)
     assert pres.rows[0].presence_state == "unmatched_analysis_incomplete"
@@ -317,7 +362,7 @@ def test_real_decompile_failure_is_analysis_incomplete(tmp_path: Path) -> None:
 
 def test_ok_function_is_analysis_complete(tmp_path: Path) -> None:
     db = _mk_analysis(tmp_path / "a.db", "lib.so", "s", [("0x1000", "fn", "int f(){}", 64)])
-    base = load_baseline(str(db), "lib.so")
+    base = load_baseline(str(db), _row(db, "lib.so"))
     pres = compute_side_presence("d", "a", frozenset(), base)
     assert pres.rows[0].presence_state == "unmatched_analysis_complete"
 
@@ -333,7 +378,7 @@ def test_both_size_sentinels_are_unknown_not_skipped_micro(tmp_path: Path) -> No
         "s",
         [("0x1000", "size_null", "", None), ("0x2000", "size_zero", "", 0)],
     )
-    base = load_baseline(str(db), "lib.so")
+    base = load_baseline(str(db), _row(db, "lib.so"))
     assert (
         base.skipped_micro_count == 0 and base.failed_count == 0
     )  # neither is a determinate class
@@ -395,8 +440,7 @@ def test_orchestrator_writes_all_three_tables_and_is_idempotent(tmp_path: Path) 
         bindiff_path=bd,
         run_a_id="run_a",
         run_b_id="run_b",
-        binary_a="lib.so",
-        binary_b="lib.so",
+        **_bins(con, "run_a", "run_b", "lib.so"),
     )
     assert r1.matched_pairs == 1
     q = "SELECT COUNT(*) FROM function_alignment WHERE diff_id=?"
@@ -407,8 +451,7 @@ def test_orchestrator_writes_all_three_tables_and_is_idempotent(tmp_path: Path) 
         bindiff_path=bd,
         run_a_id="run_a",
         run_b_id="run_b",
-        binary_a="lib.so",
-        binary_b="lib.so",
+        **_bins(con, "run_a", "run_b", "lib.so"),
     )
     n2 = con.execute(q, (r1.diff_id,)).fetchone()[0]
     assert n1 == n2 == 1
@@ -444,8 +487,7 @@ def test_diff_meta_functions_empty_is_failures_only_micro_skipped_separate(tmp_p
         bindiff_path=_tiny_bindiff(tmp_path),
         run_a_id="run_a",
         run_b_id="run_b",
-        binary_a="lib.so",
-        binary_b="lib.so",
+        **_bins(con, "run_a", "run_b", "lib.so"),
     )
     row = con.execute(
         "SELECT functions_empty_a, micro_skipped_a FROM diff_meta WHERE diff_id=?", (r.diff_id,)
@@ -465,8 +507,7 @@ def test_presence_rows_expose_unmatched_both_sides(tmp_path: Path) -> None:
         bindiff_path=_tiny_bindiff(tmp_path),
         run_a_id="run_a",
         run_b_id="run_b",
-        binary_a="lib.so",
-        binary_b="lib.so",
+        **_bins(con, "run_a", "run_b", "lib.so"),
     )
     pres = {
         (row[0], row[1]): row[2]
@@ -497,8 +538,7 @@ def test_unresolved_run_errors_not_silent_empty(tmp_path: Path) -> None:
             bindiff_path=_tiny_bindiff(tmp_path),
             run_a_id="run_a",
             run_b_id="run_b",
-            binary_a="lib.so",
-            binary_b="lib.so",
+            **_bins(con, "run_a", "run_b", "lib.so"),
         )
     con.close()
 
@@ -512,8 +552,7 @@ def test_version_skew_uses_tool_version_not_firmware_hash(tmp_path: Path) -> Non
         bindiff_path=_tiny_bindiff(tmp_path),
         run_a_id="run_a",
         run_b_id="run_b",
-        binary_a="lib.so",
-        binary_b="lib.so",
+        **_bins(con, "run_a", "run_b", "lib.so"),
     )
     assert r.meta.version_skew == 0  # same tool_version despite different firmware sha
     con.close()
@@ -524,8 +563,7 @@ def test_version_skew_uses_tool_version_not_firmware_hash(tmp_path: Path) -> Non
         bindiff_path=_tiny_bindiff(tmp_path / "skew"),
         run_a_id="run_a",
         run_b_id="run_b",
-        binary_a="lib.so",
-        binary_b="lib.so",
+        **_bins(con2, "run_a", "run_b", "lib.so"),
     )
     assert r2.meta.version_skew == 1  # differing tool_version -> exposed, non-blocking
     con2.close()
@@ -597,8 +635,7 @@ def test_bindiff_binary_hash_mismatch_is_refused(tmp_path: Path) -> None:
             bindiff_path=bad,
             run_a_id="run_a",
             run_b_id="run_b",
-            binary_a="lib.so",
-            binary_b="lib.so",
+            **_bins(con, "run_a", "run_b", "lib.so"),
         )
     assert con.execute("SELECT COUNT(*) FROM function_alignment").fetchone()[0] == 0
     con.close()
@@ -613,8 +650,7 @@ def test_bindiff_matching_hashes_proceed(tmp_path: Path) -> None:
         bindiff_path=_tiny_bindiff(tmp_path),
         run_a_id="run_a",
         run_b_id="run_b",
-        binary_a="lib.so",
-        binary_b="lib.so",
+        **_bins(con, "run_a", "run_b", "lib.so"),
     )
     assert r.matched_pairs == 1  # _tiny_bindiff writes matching ('sha_a','sha_b') hashes
     con.close()
@@ -639,8 +675,7 @@ def _parse_two_runs(tmp_path: Path, **seed_kw: str):  # type: ignore[no-untyped-
             bindiff_path=_tiny_bindiff(tmp_path),
             run_a_id="run_a",
             run_b_id="run_b",
-            binary_a="lib.so",
-            binary_b="lib.so",
+            **_bins(con, "run_a", "run_b", "lib.so"),
         )
     finally:
         con.close()
@@ -725,8 +760,8 @@ def test_diff_meta_binary_normalized_to_short_name(tmp_path: Path) -> None:
         bindiff_path=_tiny_bindiff(tmp_path),
         run_a_id="run_a",
         run_b_id="run_b",
-        binary_a="sha_a",  # SHA256 form, not the short name
-        binary_b="sha_b",
+        # SHA256 form, not the short name — the resolver takes either, per side
+        **_bins(con, "run_a", "run_b", "sha_a", "sha_b"),
     )
     assert r.meta.binary_a == "lib.so"  # normalized to the short name, NOT the sha
     assert r.meta.binary_b == "lib.so"
@@ -741,7 +776,8 @@ def _mk_analysis_multi(path: Path, bins: list) -> Path:  # type: ignore[type-arg
     con = open_db(path)
     for bid, (binary, sha, funcs) in enumerate(bins, start=1):
         con.execute(
-            "INSERT INTO binaries (id, name, path, sha256) VALUES (?, ?, ?, ?)",
+            "INSERT INTO binaries (id, name, path, sha256, last_seen_at) "
+            "VALUES (?, ?, ?, ?, '2026-01-01T00:00:00')",  # last_seen_at: see _mk_analysis
             (bid, binary, binary, sha),
         )
         for addr, name, pc, size in funcs:
@@ -811,7 +847,11 @@ def _seed_two_binaries(tmp_path: Path):  # type: ignore[no-untyped-def]
 
 def _diff(con, bd, binary):  # type: ignore[no-untyped-def]
     return run_layer0_parse(
-        con, bindiff_path=bd, run_a_id="run_a", run_b_id="run_b", binary_a=binary, binary_b=binary
+        con,
+        bindiff_path=bd,
+        run_a_id="run_a",
+        run_b_id="run_b",
+        **_bins(con, "run_a", "run_b", binary),
     )
 
 

@@ -21,7 +21,7 @@ import sqlite3
 from typing import Any
 
 _COLS = (
-    "source_run_id, binary, from_function, from_func_addr, key, mechanism, "
+    "source_run_id, binary, binary_path, from_function, from_func_addr, key, mechanism, "
     "callee_name, callee_addr, callee_kind, ladder_size, table_addr, "
     "completeness_status, completeness_reason, completeness_scope"
 )
@@ -31,6 +31,11 @@ def _row_to_edge(r: sqlite3.Row) -> dict[str, Any]:
     """One string_keyed_edge row -> a flat edge dict (callee anchor + fine-grained completeness)."""
     return {
         "binary": r["binary"],
+        "binary_path": r["binary_path"],
+        # WHICH identity this row was matched on. A short name can belong to several binaries, so
+        # a row scoped by name alone is a weaker claim than one scoped by path — said per row,
+        # because a pre-column row and a current one can sit side by side in one answer.
+        "scope_basis": "binary_path" if r["binary_path"] else "short_name (pre-migration row)",
         "from_function": r["from_function"],
         "from_func_addr": r["from_func_addr"],
         "key": r["key"],
@@ -48,20 +53,35 @@ def _row_to_edge(r: sqlite3.Row) -> dict[str, Any]:
 
 
 def edges_reaching_callee(
-    conn: sqlite3.Connection, binary: str | None, func_name: str | None
+    conn: sqlite3.Connection,
+    binary: str | None,
+    func_name: str | None,
+    *,
+    binary_path: str | None = None,
 ) -> list[dict[str, Any]]:
     """Every string-keyed edge whose CALLEE is ``func_name`` in ``binary`` — the reachability
     layer's lookup ("is this candidate's function gated behind a string key?").
 
-    Matched by callee_name (+ binary when both are known, so a same-named function in another binary
-    does not bleed in). A FACT lookup only — the caller must keep reachability=unknown; this returns
-    the key lead(s), never a reachability verdict. Empty list when the function is no edge's callee
-    (which is NOT proof of unreachability — most functions simply are not string-key-dispatched)."""
+    Matched by callee_name plus the binary, so a same-named function elsewhere does not bleed in.
+    ★ The binary scope prefers ``binary_path``: a short name is a label two files in one firmware
+    can share, and scoping by it attached one binary's key lead to the other's candidate. Rows
+    written before the path column exists carry NULL there and are still matched by name — each
+    returned row says which basis it matched on rather than presenting the two as equivalent.
+
+    A FACT lookup only — the caller must keep reachability=unknown; this returns the key lead(s),
+    never a reachability verdict. Empty list when the function is no edge's callee (which is NOT
+    proof of unreachability — most functions simply are not string-key-dispatched)."""
     if not func_name:
         return []
-    if binary:
+    if binary_path and binary:
+        sql = (
+            f"SELECT {_COLS} FROM string_keyed_edge WHERE callee_name = ? "
+            "AND (binary_path = ? OR (binary_path IS NULL AND binary = ?))"
+        )
+        params: tuple[str, ...] = (func_name, binary_path, binary)
+    elif binary:
         sql = f"SELECT {_COLS} FROM string_keyed_edge WHERE callee_name = ? AND binary = ?"
-        params: tuple[str, ...] = (func_name, binary)
+        params = (func_name, binary)
     else:
         sql = f"SELECT {_COLS} FROM string_keyed_edge WHERE callee_name = ?"
         params = (func_name,)

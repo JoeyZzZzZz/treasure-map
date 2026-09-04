@@ -285,6 +285,26 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if run_cols and "hunt_instances" not in run_cols:
         conn.execute("ALTER TABLE run ADD COLUMN hunt_instances INTEGER")
 
+    # binary_path columns (added this round). Every one of these tables scoped a row to a binary by
+    # its SHORT NAME, which is a label: one firmware ships two files under the same name, so a
+    # per-binary filter on the name matched both. The path is added beside the name rather than
+    # replacing it — the name is still what a caller types and what the read side matches on, and
+    # the existing rows keep working. NULL on a row written before the column existed, which reads
+    # as "this row was scoped by name only" and is why the readers say so rather than pretend.
+    # Idempotent; each runs only while its column is missing.
+    for table, column in (
+        ("exec_edge", "launcher_binary_path"),
+        ("string_keyed_edge", "binary_path"),
+        ("detector_scan_status", "binary_path"),
+        ("nvram_key_flow", "binary_path"),
+        ("nvram_defaults", "binary_path"),
+        ("diff_meta", "binary_path_a"),
+        ("diff_meta", "binary_path_b"),
+    ):
+        cols = _column_names(conn, table)
+        if cols and column not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")  # noqa: S608
+
 
 def open_atlas(db_path: Path) -> sqlite3.Connection:
     """Open (or create) the atlas SQLite database and apply the schema.

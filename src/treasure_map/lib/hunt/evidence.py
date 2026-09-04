@@ -418,8 +418,14 @@ class EntryIndex:
                         "arg_source": source,
                     }
                 )
-        for name in names:
-            sites.extend(self._exec_sites.get(name, ()))
+        # ★ Exec sites are keyed by the launched binary's PATH, because that is what identifies
+        # the file — two binaries in one firmware can share a short name, and a site attached to
+        # the name would be offered to both. The short names stay in the lookup set so a key that
+        # is a script path's basename, or a name-keyed site from another producer, still matches;
+        # the path is tried first and is what a same-name pair is separated by.
+        for key in (binary_path, *sorted(names)):
+            if key:
+                sites.extend(self._exec_sites.get(key, ()))
         return sites
 
 

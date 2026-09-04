@@ -79,14 +79,16 @@ def add_nvram_flow_rows(
         return 0
     conn.executemany(
         """INSERT INTO nvram_key_flow
-           (source_run_id, key, key_kind, binary, func, op, value_source, api, via_wrapper)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           (source_run_id, key, key_kind, binary, binary_path, func, op, value_source, api,
+            via_wrapper)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         [
             (
                 r.source_run_id,
                 r.key,
                 r.key_kind,
                 r.binary,
+                r.binary_path,
                 r.func,
                 r.op,
                 r.value_source,
@@ -127,8 +129,8 @@ def add_string_keyed_edges(
         """INSERT INTO string_keyed_edge
            (source_run_id, binary, from_function, from_func_addr, key, mechanism,
             callee_name, callee_addr, callee_kind, ladder_size, table_addr,
-            completeness_status, completeness_reason, completeness_scope)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            completeness_status, completeness_reason, completeness_scope, binary_path)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         [
             (
                 r.source_run_id,
@@ -145,6 +147,7 @@ def add_string_keyed_edges(
                 r.completeness_status,
                 r.completeness_reason,
                 r.completeness_scope,
+                r.binary_path,
             )
             for r in rows
         ],
@@ -184,8 +187,8 @@ def add_exec_edges(
             target_layer, shell_wrapped, piped, inner_command_visible, argv_visibility,
             argv_template, argv_provenance, target_token, target_resolution, token_form,
             symlink_ambiguous, symlink_corrupt, symlink_target_unresolved, target_binary,
-            occurrences)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            occurrences, launcher_binary_path)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         [
             (
                 r.source_run_id,
@@ -209,6 +212,7 @@ def add_exec_edges(
                 r.symlink_target_unresolved,
                 r.target_binary,
                 r.occurrences,
+                r.launcher_binary_path,
             )
             for r in rows
         ],
@@ -244,8 +248,8 @@ def add_detector_status(
     conn.executemany(
         """INSERT INTO detector_scan_status
            (source_run_id, binary, detector, scanned, supported_scope, unsupported_note,
-            cap_hit, found_count)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            cap_hit, found_count, binary_path)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         [
             (
                 r.source_run_id,
@@ -256,6 +260,7 @@ def add_detector_status(
                 r.unsupported_note,
                 r.cap_hit,
                 r.found_count,
+                r.binary_path,
             )
             for r in rows
         ],
@@ -410,9 +415,10 @@ def add_diff_meta(conn: sqlite3.Connection, row: DiffMetaRow, *, commit: bool = 
             unmatched_a, unmatched_b, out_of_inventory_a, out_of_inventory_b, inventory_mismatch_a,
             inventory_mismatch_b, functions_empty_a, functions_empty_b, micro_skipped_a,
             micro_skipped_b, presence_computed_a, presence_computed_b, binary_a, binary_b,
-            diff_ok, diff_status, diff_status_reason, diff_attempts, sha256_a, sha256_b)
+            diff_ok, diff_status, diff_status_reason, diff_attempts, sha256_a, sha256_b,
+            binary_path_a, binary_path_b)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                   ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             row.diff_id,
             row.run_a_id,
@@ -449,6 +455,8 @@ def add_diff_meta(conn: sqlite3.Connection, row: DiffMetaRow, *, commit: bool = 
             row.diff_attempts,
             row.sha256_a,
             row.sha256_b,
+            row.binary_path_a,
+            row.binary_path_b,
         ),
     )
     if commit:
@@ -496,8 +504,8 @@ def add_nvram_default_rows(
         return 0
     conn.executemany(
         """INSERT INTO nvram_defaults
-           (source_run_id, key, default_value, flags, member_index, binary)
-           VALUES (?, ?, ?, ?, ?, ?)""",
+           (source_run_id, key, default_value, flags, member_index, binary, binary_path)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
         [
             (
                 r.source_run_id,
@@ -506,6 +514,7 @@ def add_nvram_default_rows(
                 r.flags,
                 r.member_index,
                 r.binary,
+                r.binary_path,
             )
             for r in rows
         ],
