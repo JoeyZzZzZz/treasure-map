@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Every binary now reaches the shape scan and the wrapper propagation.** The recall pass skipped
+  whole binaries before looking at any of their code: anything the `components` table listed,
+  anything whose name matched a 22-entry list of generic project names, and anything called `lib*`.
+  A perfect command-injection shape inside one of those produced nothing at all, and the only trace
+  was a counter on the `tmap scan` summary — nothing in the MCP surface, and no way for a reader of
+  the result to tell "looked and found nothing" from "never looked".
+  It was also a weaker test than it looked. The `components` table has no writer, so in practice
+  the exclusion was the name heuristic alone: it cannot tell a vendor's own shared library from
+  libc, and `lib*` matched every shared object in the firmware, custom ones included. Which project
+  a binary came from is a label for the read side to weigh against everything else known about a
+  candidate — `origin`, which recognises third-party code at function-symbol granularity, is
+  untouched and still carried on every instance. It is not grounds for the recall pass to never
+  look.
+  `oss.py` is deleted. `custom_functions` is renamed `functions_with_callees`, and a new
+  `callee_parse_failed` counts functions whose stored callee list would not parse — previously
+  dropped silently, now reported as the data gap it is. The two partition what the scan admitted
+  (`functions_with_callees + callee_parse_failed == functions_scanned`), checked on every scan and
+  re-derived from a real database by a new Gate D, so "was this looked at" is answerable from the
+  numbers rather than from the code.
+  ★ Expect materially more candidates, and a `pattern_breadth` upper bound that loosens with them —
+  the recurrence ledgers now count instances from widely-shipped stock binaries until origin is
+  component-confirmed. That caveat is stated where the counts are read.
+  ★ Two wrapper-propagation tests that pinned per-binary isolation had been passing vacuously:
+  their fixtures used a binary named `libb`, which the heuristic short-circuited before the
+  isolation they were testing was ever exercised. They now test it.
+
 ### Changed
 
 - **`tmap runs`' human listing drops the provenance columns.** The build hash, the hunt stamp and

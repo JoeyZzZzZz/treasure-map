@@ -29,7 +29,8 @@ from treasure_map.lib.pattern.classes import (
     path_arg_ident,
 )
 from treasure_map.lib.pattern.fingerprint import FINGERPRINT_ALGO_VERSION
-from treasure_map.lib.pattern.oss import GENERIC_OSS_NAMES, is_oss_binary
+from treasure_map.lib.pattern.models import PatternStats
+from treasure_map.lib.pattern.scanner import shape_scan_invariant_holds
 from treasure_map.lib.storage.connection import open_db
 
 _PATTERN_PKG = Path(__file__).resolve().parents[3] / "src" / "treasure_map" / "lib" / "pattern"
@@ -347,15 +348,25 @@ def test_path_sink_set_disjoint_from_other_classes() -> None:
     assert not (PATH_SINK & (CMD | COPY | FORMAT | FMT_STRING | SOURCE))
 
 
-# ── OSS exclusion (the iteration-1 lesson) ──────────────────────────────────────────
+# ── every binary is scanned ─────────────────────────────────────────────────────────
 
 
-def test_oss_binary_in_components_is_excluded(tmp_path: Path) -> None:
+def test_component_table_binary_is_scanned(tmp_path: Path) -> None:
+    """★ Being recorded in the components table is a LABEL, not a reason not to look.
+
+    The scan used to skip such a binary outright, so a perfect shape inside it produced nothing
+    at all — a recall decision taken by name at scan time, whose only trace was a CLI counter.
+    Which project a binary came from belongs on the read side, where it can be weighed against
+    everything else known about the candidate; it cannot be a reason never to look.
+
+    MUTATION: skip `busybox` in the scanner loop -> RED here (empty match set) AND `scan()` raises,
+    because the two counts no longer partition what was admitted. Measured RED at 1 failed.
+    """
     db = _make_db(
         tmp_path,
         [
             {
-                "name": "busybox",  # public OSS, also recorded in components
+                "name": "busybox",  # widely-shipped stock binary, also recorded in components
                 "oss": True,
                 "funcs": [
                     {
@@ -369,12 +380,22 @@ def test_oss_binary_in_components_is_excluded(tmp_path: Path) -> None:
     )
     res = scan(db)
 
-    assert res.matches == ()  # the perfect shape is suppressed because it is OSS
-    assert res.stats.oss_binaries_excluded == 1
-    assert res.stats.custom_functions == 0
+    assert {m.func_ref.binary_name for m in res.matches} == {"busybox"}
+    assert res.stats.functions_with_callees == 1
+    assert res.stats.callee_parse_failed == 0
+    assert shape_scan_invariant_holds(res.stats)
 
 
-def test_custom_kept_alongside_oss(tmp_path: Path) -> None:
+def test_every_binary_scanned_alongside(tmp_path: Path) -> None:
+    """A stock binary, a shared library and a custom one all reach the detectors.
+
+    ``lib*`` was the other half of the old heuristic, and it is the half that cost the most: a
+    wrapper in a shared library forwards a caller's argument to a sink exactly as one anywhere
+    else does.
+
+    MUTATION: skip names starting with `lib` in the scanner loop -> RED (the set loses
+    libfoo.so.1) AND `scan()` raises. Measured RED at 1 failed.
+    """
     db = _make_db(
         tmp_path,
         [
@@ -384,13 +405,23 @@ def test_custom_kept_alongside_oss(tmp_path: Path) -> None:
                 "funcs": [
                     {
                         "name": "applet",
-                        "pseudocode": 'system("/bin/sh -c %s");',
+                        "pseudocode": 'snprintf(c,64,"/bin/sh -c %s",a); system(c);',
                         "callees": ["recv", "snprintf", "system"],
                     }
                 ],
             },
             {
-                "name": "webd",  # custom → kept
+                "name": "libfoo.so.1",
+                "funcs": [
+                    {
+                        "name": "forward",
+                        "pseudocode": 'snprintf(c,64,"/usr/sbin/svc %s",a); system(c);',
+                        "callees": ["recv", "snprintf", "system"],
+                    }
+                ],
+            },
+            {
+                "name": "webd",
                 "funcs": [
                     {
                         "name": "handle",
@@ -403,10 +434,10 @@ def test_custom_kept_alongside_oss(tmp_path: Path) -> None:
     )
     res = scan(db)
 
-    assert res.stats.oss_binaries_excluded == 1
-    assert res.stats.custom_functions == 1
-    assert len(res.matches) == 1
-    assert res.matches[0].func_ref.binary_name == "webd"
+    assert {m.func_ref.binary_name for m in res.matches} == {"webd", "busybox", "libfoo.so.1"}
+    assert res.stats.functions_with_callees == 3
+    assert res.stats.callee_parse_failed == 0
+    assert shape_scan_invariant_holds(res.stats)
 
 
 def test_empty_callees_are_skipped(tmp_path: Path) -> None:
@@ -459,20 +490,6 @@ def test_scan_rejects_missing_db(tmp_path: Path) -> None:
         scan(tmp_path / "nope.db")  # read-only mode does not create the file
 
 
-# ── OSS heuristics (fallback when not in components) ────────────────────────────────
-
-
-def test_oss_name_and_lib_heuristics() -> None:
-    empty: set[str] = set()
-    assert is_oss_binary("dropbear", known_components=empty)  # generic OSS name
-    assert is_oss_binary("openssl-1.1.1", known_components=empty)  # version-stripped name
-    assert is_oss_binary("libcrypto.so.1.1", known_components=empty)  # lib* + soname
-    assert not is_oss_binary("webd", known_components=empty)  # custom → kept
-    assert not is_oss_binary("appsvcd", known_components=empty)
-    # Data-driven membership wins regardless of name.
-    assert is_oss_binary("appsvcd", known_components={"appsvcd"})
-
-
 # ── fingerprint stability ───────────────────────────────────────────────────────────
 
 
@@ -521,10 +538,79 @@ def test_pattern_package_is_boundary_clean() -> None:
         assert not section_ref.search(text), f"section/private-doc ref in {path.name}"
 
 
-def test_call_class_and_oss_sets_are_generic_identifiers() -> None:
+def test_call_class_sets_are_generic_identifiers() -> None:
     ident = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
     for name in SOURCE | FORMAT | CMD | COPY | FMT_STRING | PATH_SINK:
         assert ident.match(name), f"non-identifier call-class entry: {name!r}"
-    oss_ident = re.compile(r"^[a-z0-9_]+$")
-    for name in GENERIC_OSS_NAMES:
-        assert oss_ident.match(name), f"unexpected OSS-list entry: {name!r}"
+
+
+# ── a function whose callees will not parse is a counted gap, never a silent drop ────
+
+
+def test_scan_counts_callee_parse_failures(tmp_path: Path) -> None:
+    """★ The pre-filter already excludes a literal ``'[]'``, so an empty parse result means the
+    stored value was MALFORMED. That is a data gap about those functions, not a decision about
+    them — and the two look identical from the outside unless the gap is counted.
+
+    The scan does not raise here: bad data is expected and is reported. Raising is reserved for
+    the invariant being broken, which can only be a skip in the code.
+
+    MUTATION: make the parse-failure branch a bare ``continue`` again (no counter) -> RED on the
+    counts AND `scan()` raises, because the partition no longer adds up. Measured RED at 1 failed.
+    """
+    db_path = tmp_path / "malformed.db"
+    conn = open_db(db_path)
+    conn.execute("INSERT INTO binaries (id, name, sha256) VALUES (1, 'webd', ?)", ("a" * 64,))
+    rows = [
+        (
+            1,
+            "handle",
+            'snprintf(c,64,"/usr/sbin/svc %s",a); system(c);',
+            json.dumps(["recv", "snprintf", "system"]),
+        ),
+        # both pass the `callees != '[]'` pre-filter and both fail to parse into a list
+        (2, "broken_shape", "void broken_shape(void){}", '{"not":"a list"}'),
+        (3, "broken_json", "void broken_json(void){}", "not-json-at-all"),
+    ]
+    for fid, name, pc, callees in rows:
+        conn.execute(
+            "INSERT INTO functions (id, binary_id, name, address, pseudocode, callees) "
+            "VALUES (?, 1, ?, ?, ?, ?)",
+            (fid, name, f"0x{fid:04x}", pc, callees),
+        )
+    conn.commit()
+    conn.close()
+
+    res = scan(db_path)
+
+    assert res.stats.functions_scanned == 3
+    assert res.stats.functions_with_callees == 1
+    assert res.stats.callee_parse_failed == 2
+    assert shape_scan_invariant_holds(res.stats)
+    # the readable function still produced its candidate — a gap elsewhere is not a scan failure
+    assert {m.func_ref.func_name for m in res.matches} == {"handle"}
+
+
+def test_shape_scan_invariant_pure() -> None:
+    """The predicate itself, away from any database: what was admitted is exactly what was either
+    scanned or counted as a gap.
+
+    Shared with Gate D on purpose — a gate that re-implements the rule it enforces can drift from
+    the code and then agrees with it about nothing in particular.
+
+    MUTATION: make ``shape_scan_invariant_holds`` return True -> RED here, and the recall-integrity
+    self-test's violating side turns green. Measured RED at 1 failed.
+    """
+
+    def _stats(scanned: int, with_callees: int, parse_failed: int) -> PatternStats:
+        return PatternStats(
+            functions_scanned=scanned,
+            functions_with_callees=with_callees,
+            callee_parse_failed=parse_failed,
+            pattern_a=0,
+            pattern_b=0,
+        )
+
+    assert shape_scan_invariant_holds(_stats(3, 1, 2)) is True
+    assert shape_scan_invariant_holds(_stats(3, 1, 0)) is False  # one went missing
+    assert shape_scan_invariant_holds(_stats(3, 2, 2)) is False  # one counted twice

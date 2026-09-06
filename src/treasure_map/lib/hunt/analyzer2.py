@@ -3,7 +3,7 @@
 """Analyzer-2 — the pattern-driven analyzer (R-pattern -> R2 -> atlas).
 
 Composes two hermetic primitives and persists the result: R-pattern locates call-sequence
-shape candidates in one analysis.db (OSS excluded at scan time); R2 grades each candidate's
+shape candidates in one analysis.db; R2 grades each candidate's
 reachability; A2 upserts the RICH "callseq-v1" pattern and writes a graded instance into the
 atlas. This is the first time R-pattern's output reaches the persistent store — the pattern
 table was designed for exactly this.
@@ -179,9 +179,12 @@ class Analyzer2Stats:
     matches: int  # call-sequence shape matches found
     instances_written: int  # graded instances persisted into the atlas
     by_status: dict[str, int]  # reachability_status -> count, over written instances
-    oss_excluded: int  # distinct OSS/third-party binaries R-pattern excluded
     wrapper_propagated: int = 0  # cmd/fmt candidates recovered via one-hop thin-wrapper propagation
     data_gap_skipped: int = 0  # shape matches dropped with no decompilable body (Ghidra gap)
+    # functions the shape scan could not read a callee list for (malformed stored JSON). A data
+    # gap about those functions, not a decision about them — reported so an incomplete candidate
+    # set is never read as a complete one.
+    callee_parse_failed: int = 0
     nvram_flows_written: int = 0  # gap② per-op nvram read/write rows flattened into the atlas
     nvram_wrapper_edges: int = 0  # gap② A2 indirect key edges recovered through thin nvram wrappers
     nvram_defaults_written: int = 0  # naming-bridge phase 1: router_defaults members flattened
@@ -303,21 +306,6 @@ def _stored_run_row(atlas_path: Path | str, run_id: str) -> dict[str, object] | 
         return stored
     finally:
         conn.close()
-
-
-def _load_known_components(db_path: Path | str) -> set[str]:
-    """The OSS-binary name set (components-table membership) the shape scan also excludes."""
-    uri = f"file:{Path(db_path)}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True)
-    try:
-        rows = conn.execute(
-            "SELECT DISTINCT b.name FROM components c JOIN binaries b ON b.id = c.binary_id"
-        ).fetchall()
-    except sqlite3.OperationalError:
-        return set()
-    finally:
-        conn.close()
-    return {r[0] for r in rows}
 
 
 # The sink_class string the format axis carries (the key _WRAPPER_AXIS uses for it).
@@ -1097,7 +1085,6 @@ def run_analyzer2(
             matches=0,
             instances_written=0,
             by_status={"confirmed": 0, "blocked": 0, "unknown": 0},
-            oss_excluded=0,
             skipped=True,
             hunt_currency=currency.reason,
         )
@@ -1111,9 +1098,7 @@ def run_analyzer2(
     callers_of = _load_caller_ids(db_path)
     # Factor ① (recall): functions whose only command sink is reached one hop through a thin
     # wrapper — invisible to the shape scan (no command sink among their own callees).
-    wrapper_candidates = find_wrapper_propagated_candidates(
-        all_funcs, _load_known_components(db_path)
-    )
+    wrapper_candidates = find_wrapper_propagated_candidates(all_funcs)
     # Ghidra def-use provenance per function (merged into cmd/fmt flow_evidence below). Function-
     # level fact; keyed by func_id. Empty when the analysis.db predates the provenance column.
     # Loaded BEFORE the entry index because the cross-binary launch edges are read out of it and
@@ -1269,8 +1254,8 @@ def run_analyzer2(
 
                 # FP-suppression labels written into existing neutral fields (read-side ordering
                 # downweights them; nothing is removed or graded blocked). origin recognizes
-                # statically-linked third-party library code (function-symbol granularity, beyond
-                # the binary-level OSS exclusion); a form note marks a known low-yield shape. Only
+                # statically-linked third-party library code, at function-symbol granularity; a
+                # form note marks a known low-yield shape. Only
                 # attach a form note when the grader left blocking_mechanism open.
                 origin = library_origin(match.func_ref.func_name) or "unknown"
                 # detect_form_signal reads the cmd danger axis (arg0). Copy sinks are graded on the
@@ -1635,8 +1620,8 @@ def run_analyzer2(
         matches=len(result.matches),
         instances_written=instances_written,
         by_status=by_status,
-        oss_excluded=result.stats.oss_binaries_excluded,
         wrapper_propagated=wrapper_propagated,
+        callee_parse_failed=result.stats.callee_parse_failed,
         data_gap_skipped=data_gap_skipped,
         nvram_flows_written=len(nvram_flow_rows),
         nvram_wrapper_edges=len(wrapper_edge_rows),

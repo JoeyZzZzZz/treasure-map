@@ -45,7 +45,6 @@ from treasure_map.lib.hunt.facts import (
     is_thin_fmt_wrapper,
 )
 from treasure_map.lib.pattern.classes import CMD, FMT_STRING
-from treasure_map.lib.pattern.oss import is_oss_binary
 
 
 @dataclass(frozen=True)
@@ -110,23 +109,20 @@ def _axis_candidate(
     )
 
 
-def find_wrapper_propagated_candidates(
-    funcs: list[FuncRow], known_components: set[str]
-) -> list[WrapperCandidate]:
-    """Return the non-OSS functions whose only sink of a given axis is reached one hop through a
-    thin wrapper in the same binary — on BOTH the command and the format-string axis. Deterministic
-    (input order is binary, func id; per function the cmd candidate precedes the fmt one). A
-    function can yield up to one candidate per axis (distinct sink classes reached).
+def find_wrapper_propagated_candidates(funcs: list[FuncRow]) -> list[WrapperCandidate]:
+    """Return the functions, in every binary, whose only sink of a given axis is reached one hop
+    through a thin wrapper in the same binary — on BOTH the command and the format-string axis.
+    Deterministic (input order is binary, func id; per function the cmd candidate precedes the fmt
+    one). A function can yield up to one candidate per axis (distinct sink classes reached).
 
-    ``known_components`` is the OSS-binary set (same exclusion the shape scan uses) so propagated
-    candidates surface in custom binaries only."""
+    No binary is skipped by name. A wrapper in a shared library forwards a caller's argument to a
+    sink exactly as one in any other binary does, and which project a binary came from is a label
+    for the read side to weigh, not grounds for the recall pass to never look."""
     # 1) Per-binary thin-wrapper registries, one per axis: (binary_id, wrapper name) -> sink.
     cmd_wrappers: dict[tuple[int, str], tuple[str, int | None]] = {}
     fmt_wrappers: dict[tuple[int, str], tuple[str, int | None]] = {}
     for f in funcs:
         if not f.name or not f.pseudocode:
-            continue
-        if is_oss_binary(f.binary_name, known_components=known_components):
             continue
         callees = _parse_callees(f.callees)
         is_cmd, cmd_sink = is_thin_cmd_wrapper(f.pseudocode, callees)
@@ -148,8 +144,6 @@ def find_wrapper_propagated_candidates(
     out: list[WrapperCandidate] = []
     for f in funcs:
         if not f.pseudocode:
-            continue
-        if is_oss_binary(f.binary_name, known_components=known_components):
             continue
         callee_names = {c.strip() for c in _parse_callees(f.callees) if c.strip()}
         cmd = _axis_candidate(f, callee_names, CMD, cmd_wrappers, "cmd")

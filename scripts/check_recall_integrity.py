@@ -23,6 +23,14 @@ Gate C — old data must not pass as current (one authority on which runs exist)
     results outlived its lineage: no build hash, no scan status, no path back to the analysis they
     came from — yet they still count toward device spread and still list as candidates.
 
+Gate D — the shape scan skips no function with callees (one authority on what was looked at):
+    ``functions_with_callees + callee_parse_failed == functions_scanned``
+    (``scanner.shape_scan_invariant_holds``). Every function the SQL pre-filter admitted either
+    reached the detectors or is counted as a data gap. The pass used to skip whole binaries by
+    name, and the only trace was a CLI counter — a recall decision taken at scan time, invisible
+    to every reader of the result. The equation makes "was it looked at" answerable from the
+    numbers instead of from the code.
+
 Usage:
     check_recall_integrity.py --atlas ATLAS.db --analysis ANALYSIS.db   # check real databases
     check_recall_integrity.py --self-test                              # CI: synthetic clean+dirty
@@ -38,6 +46,10 @@ import sqlite3
 import sys
 import tempfile
 from pathlib import Path
+
+from treasure_map.lib.errors import ConfigError
+from treasure_map.lib.pattern import scanner
+from treasure_map.lib.pattern.models import PatternStats
 
 # Gate A: const_sink_arg must never coexist with a free_string sink argument.
 _GATE_A_SQL = (
@@ -100,6 +112,19 @@ def gate_c_violations(atlas_db: Path) -> int:
     return _count(atlas_db, _GATE_C_SQL)
 
 
+def gate_d_violations(analysis_db: Path) -> int:
+    """Count functions the shape scan admitted but neither scanned nor counted (must be 0).
+
+    Re-derives the invariant by RUNNING the scan, so this measures what the code actually did
+    rather than re-implementing the rule. ``scan`` raises when the invariant fails, which is the
+    same finding — reported as one violation rather than by reading the exception's prose."""
+    try:
+        stats = scanner.scan(analysis_db).stats
+    except ConfigError:
+        return 1
+    return stats.functions_scanned - stats.functions_with_callees - stats.callee_parse_failed
+
+
 def _check_real(atlas_db: Path | None, analysis_db: Path | None) -> int:
     fail = 0
     if atlas_db is not None:
@@ -122,6 +147,12 @@ def _check_real(atlas_db: Path | None, analysis_db: Path | None) -> int:
             fail = 1
         else:
             print("✓ Gate B: every ghidra_status='ok' binary has functions")
+        n = gate_d_violations(analysis_db)
+        if n:
+            print(f"❌ Gate D: {n} function(s) with callees skipped by the shape scan")
+            fail = 1
+        else:
+            print("✓ Gate D: every function with callees was scanned or counted as a parse failure")
     return fail
 
 
@@ -226,6 +257,27 @@ def _self_test() -> int:
             "violating Gate A > 0": gate_a_violations(bad_atlas) > 0,
             "violating Gate B > 0": gate_b_violations(bad_analysis) > 0,
             "violating Gate C > 0": gate_c_violations(bad_atlas) > 0,
+            # Gate D is a pure arithmetic property of the stats, so it is exercised as one: a
+            # partition that adds up, and one that does not. Stubbing the scan body to fake a
+            # skip would test the stub. The real scan is what `--analysis` checks.
+            "clean Gate D holds": scanner.shape_scan_invariant_holds(
+                PatternStats(
+                    functions_scanned=3,
+                    functions_with_callees=1,
+                    callee_parse_failed=2,
+                    pattern_a=0,
+                    pattern_b=0,
+                )
+            ),
+            "violating Gate D fails": not scanner.shape_scan_invariant_holds(
+                PatternStats(
+                    functions_scanned=3,
+                    functions_with_callees=1,
+                    callee_parse_failed=0,
+                    pattern_a=0,
+                    pattern_b=0,
+                )
+            ),
         }
     ok = True
     for name, passed in checks.items():

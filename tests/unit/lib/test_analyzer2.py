@@ -241,23 +241,37 @@ def _count(atlas_path: Path, view: str) -> int:
         conn.close()
 
 
-# ── writer: rich patterns + instances, OSS excluded, L0/L1, empty public_finding ────
+# ── writer: rich patterns + instances, every binary scanned, L0/L1, empty public_finding ──
 
 
-def test_writer_populates_atlas_oss_excluded(tmp_path: Path) -> None:
+def test_writer_scans_component_table_binary(tmp_path: Path) -> None:
+    """End to end: a binary recorded in the components table produces a written instance.
+
+    MUTATION: skip `busybox` in the scanner loop -> RED (one match, one instance, one name).
+    """
     db = _make_db(
         tmp_path,
         [
-            {"name": "webd", "funcs": [_cmd_injection_fn("handle")]},
-            {"name": "busybox", "oss": True, "funcs": [_cmd_injection_fn("applet")]},
+            {"name": "webd", "path": "usr/sbin/webd", "funcs": [_cmd_injection_fn("handle")]},
+            {
+                "name": "busybox",
+                "path": "bin/busybox",
+                "oss": True,
+                "funcs": [_cmd_injection_fn("applet")],
+            },
         ],
     )
     atlas = tmp_path / "atlas.db"
     stats = run_analyzer2(db, atlas, source_run_id="run_dcs")
 
-    assert stats.oss_excluded == 1
-    assert stats.matches == 1  # only the custom binary's match
-    assert stats.instances_written == 1
+    assert stats.matches == 2
+    assert stats.instances_written == 2
+    conn = open_atlas(atlas)
+    try:
+        paths = {r[0] for r in conn.execute("SELECT binary_path FROM instance")}
+    finally:
+        conn.close()
+    assert {Path(p).name for p in paths} == {"webd", "busybox"}
     assert _count(atlas, "public_finding") == 0
 
     conn = open_atlas(atlas)

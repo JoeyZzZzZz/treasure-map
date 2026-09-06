@@ -18,17 +18,11 @@ import logging
 import sqlite3
 from pathlib import Path
 
+from treasure_map.lib.errors import ConfigError
 from treasure_map.lib.pattern.models import FuncRef, PatternMatch, PatternStats, ScanResult
-from treasure_map.lib.pattern.oss import is_oss_binary
 from treasure_map.lib.pattern.shapes import DETECTORS
 
 logger = logging.getLogger(__name__)
-
-_KNOWN_COMPONENTS_SQL = """
-SELECT DISTINCT b.name
-  FROM components c
-  JOIN binaries b ON b.id = c.binary_id
-"""
 
 _FUNCTIONS_SQL = """
 SELECT f.id, b.name AS binary_name, f.name, f.pseudocode, f.callees
@@ -53,25 +47,35 @@ def _parse_callees(raw: str | None) -> list[str]:
     return [str(x) for x in data]
 
 
+def shape_scan_invariant_holds(stats: PatternStats) -> bool:
+    """Every function the pre-filter admitted either reached the detectors or is a counted gap.
+
+    One predicate, two callers: ``scan`` checks it on every run, and Gate D re-derives it from a
+    real analysis.db. Sharing it is the point — a gate that re-implements the rule it enforces can
+    drift from the code, and then agrees with it about nothing in particular."""
+    return stats.functions_with_callees + stats.callee_parse_failed == stats.functions_scanned
+
+
 def scan(db_path: Path | str) -> ScanResult:
     """Scan an analysis.db (read-only) for call-sequence shape candidates.
 
-    OSS/third-party binaries are excluded (components-table membership first, then a
-    generic-name fallback) so the scan surfaces shapes in custom binaries only.
+    Every binary is scanned; no binary is skipped by name or by components-table membership
+    (origin is a label carried on the instance, never a scan-time filter). A function whose stored
+    callees cannot be parsed is counted in ``callee_parse_failed`` and surfaced as a data gap,
+    never silently dropped.
     """
     uri = f"file:{Path(db_path)}?mode=ro"
     conn = sqlite3.connect(uri, uri=True)
     try:
         conn.row_factory = sqlite3.Row
-        known_components = {row["name"] for row in conn.execute(_KNOWN_COMPONENTS_SQL)}
         rows = conn.execute(_FUNCTIONS_SQL).fetchall()
     finally:
         conn.close()
 
     matches: list[PatternMatch] = []
-    excluded_binaries: set[str] = set()
     functions_scanned = 0
-    custom_functions = 0
+    functions_with_callees = 0
+    callee_parse_failed = 0
     hits = {
         "cmd_injection_shape": 0,
         "overflow_shape": 0,
@@ -83,14 +87,15 @@ def scan(db_path: Path | str) -> ScanResult:
     for row in rows:
         functions_scanned += 1
         binary_name = row["binary_name"]
-        if is_oss_binary(binary_name, known_components=known_components):
-            excluded_binaries.add(binary_name)
-            continue
-
         callees = _parse_callees(row["callees"])
         if not callees:
+            # The SQL pre-filter already excluded a literal '[]', so an empty list here means the
+            # stored value did not PARSE — malformed JSON, or JSON that is not a list. That is a
+            # data gap about this function, not a decision about it: counted and reported, so an
+            # incomplete candidate set never reads as a complete one.
+            callee_parse_failed += 1
             continue
-        custom_functions += 1
+        functions_with_callees += 1
 
         func_ref = FuncRef(binary_name=binary_name, func_name=row["name"], func_id=row["id"])
         pseudocode = row["pseudocode"] or ""
@@ -103,12 +108,24 @@ def scan(db_path: Path | str) -> ScanResult:
 
     stats = PatternStats(
         functions_scanned=functions_scanned,
-        oss_binaries_excluded=len(excluded_binaries),
-        custom_functions=custom_functions,
+        functions_with_callees=functions_with_callees,
+        callee_parse_failed=callee_parse_failed,
         pattern_a=hits["cmd_injection_shape"],
         pattern_b=hits["overflow_shape"],
         bare_cmd=hits["bare_cmd_shape"],
         fmt_string=hits["fmt_string_shape"],
         path_sink=hits["path_sink_shape"],
     )
+    # ★ Checked here, at runtime, on every scan. The two counts partition what the pre-filter
+    # admitted, so a mismatch means a function left the loop through neither branch — a skip
+    # taken on a property of the function rather than of its data. That is the exact shape of
+    # what this pass used to do by binary name, and it is a programming error, so it raises rather
+    # than degrading: a scan that quietly skipped part of the firmware is worse than no scan.
+    # Malformed data does NOT come here; it is counted in callee_parse_failed and reported.
+    if not shape_scan_invariant_holds(stats):
+        raise ConfigError(
+            f"shape scan invariant violated: scanned={stats.functions_scanned} "
+            f"with_callees={stats.functions_with_callees} "
+            f"parse_failed={stats.callee_parse_failed}"
+        )
     return ScanResult(matches=tuple(matches), stats=stats)

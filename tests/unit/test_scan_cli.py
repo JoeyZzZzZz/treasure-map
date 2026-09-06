@@ -52,6 +52,10 @@ def _hunt_stats(written: int = 0) -> SimpleNamespace:
         instances_written=written,
         by_status={"confirmed": 0, "blocked": 0, "unknown": written},
         data_gap_skipped=0,
+        # Mirrors the real stats field-for-field ON PURPOSE (no getattr fallback, no **kwargs): a
+        # field added to Analyzer2Stats and not surfaced here shows up as a failure rather than as
+        # a summary line nobody notices is missing.
+        callee_parse_failed=0,
         nvram_flows_written=0,
         nvram_wrapper_edges=0,
         nvram_defaults_written=0,

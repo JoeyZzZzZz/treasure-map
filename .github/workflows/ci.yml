@@ -43,6 +43,8 @@ jobs:
         run: python scripts/check_recall_integrity.py --self-test
       - name: Binary-selector gate (one resolver; an ambiguous name is refused, never picked)
         run: bash scripts/check-binary-selector-resolution.sh
+      - name: OSS-exclusion gate (the shape scan skips no binary by name)
+        run: bash scripts/check-oss-exclusion-retired.sh
 
   lint:
     name: Lint

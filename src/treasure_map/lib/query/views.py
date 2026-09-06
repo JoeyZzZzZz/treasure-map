@@ -46,6 +46,9 @@ class LedgerRow:
     pattern_breadth = distinct fine fingerprints (pseudocode_hash) over instances with origin
                       in (custom, unknown); a provisional upper bound under
                       fine_fp_algo_version (included origins = custom, unknown).
+
+    ★ the bound loosened materially when scan-time exclusion was retired: instances from
+    widely-shipped stock binaries count here until origin is component-confirmed.
     """
 
     pattern_id: int

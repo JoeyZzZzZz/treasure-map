@@ -56,7 +56,7 @@ def test_caller_of_thin_wrapper_becomes_candidate() -> None:
         'void set_route(void){ char cmd[128]; snprintf(cmd,128,"route %s",x); do_cmd(cmd); }',
         ["snprintf", "do_cmd"],
     )
-    cands = find_wrapper_propagated_candidates([_WRAPPER, caller], set())
+    cands = find_wrapper_propagated_candidates([_WRAPPER, caller])
     assert _names(cands) == {"set_route"}
     (c,) = cands
     assert c.wrapper_name == "do_cmd"
@@ -71,12 +71,12 @@ def test_function_with_direct_cmd_sink_is_not_propagated() -> None:
         'void has_system(char* p){ char c[64]; snprintf(c,64,"%s",p); system(c); do_cmd(c); }',
         ["snprintf", "system", "do_cmd"],
     )
-    assert find_wrapper_propagated_candidates([_WRAPPER, direct], set()) == []
+    assert find_wrapper_propagated_candidates([_WRAPPER, direct]) == []
 
 
 def test_wrapper_itself_is_not_a_propagated_candidate() -> None:
     # do_cmd calls system directly -> excluded by the direct-cmd-sink rule (its own bare_sink).
-    assert find_wrapper_propagated_candidates([_WRAPPER], set()) == []
+    assert find_wrapper_propagated_candidates([_WRAPPER]) == []
 
 
 def test_cross_binary_wrapper_is_not_propagated() -> None:
@@ -95,7 +95,7 @@ def test_cross_binary_wrapper_is_not_propagated() -> None:
         'void caller(void){ char c[64]; snprintf(c,64,"%s",x); do_cmd(c); }',
         ["snprintf", "do_cmd"],
     )
-    assert find_wrapper_propagated_candidates([wrapper_libb, caller_a], set()) == []
+    assert find_wrapper_propagated_candidates([wrapper_libb, caller_a]) == []
 
 
 def test_multi_hop_wrapper_is_not_propagated() -> None:
@@ -107,12 +107,21 @@ def test_multi_hop_wrapper_is_not_propagated() -> None:
         'void outer(void){ char c[64]; snprintf(c,64,"%s",x); middle(c); }',
         ["snprintf", "middle"],
     )
-    cands = find_wrapper_propagated_candidates([_WRAPPER, middle, f], set())
+    cands = find_wrapper_propagated_candidates([_WRAPPER, middle, f])
     # 'middle' itself is a one-hop caller of do_cmd (recovered); 'outer' is two hops (not).
     assert _names(cands) == {"middle"}
 
 
-def test_oss_binary_is_excluded() -> None:
+def test_component_binary_wrapper_propagated() -> None:
+    """★ A wrapper in a widely-shipped stock binary forwards its caller's argument to a sink
+    exactly as one anywhere else does.
+
+    This pass used to skip such a binary by name, so the caller was never recovered — a recall
+    decision taken on the label rather than on the code. Which project the binary came from is for
+    the read side to weigh; it is not grounds for the recall pass to never look.
+
+    MUTATION: put a name-based ``continue`` back in the registration pass -> RED.
+    """
     wrapper = _fn(1, "do_cmd", "void do_cmd(char* p){ system(p); }", ["system"], binary="busybox")
     caller = _fn(
         2,
@@ -121,7 +130,30 @@ def test_oss_binary_is_excluded() -> None:
         ["snprintf", "do_cmd"],
         binary="busybox",
     )
-    assert find_wrapper_propagated_candidates([wrapper, caller], {"busybox"}) == []
+    (c,) = find_wrapper_propagated_candidates([wrapper, caller])
+    assert c.func.name == "applet"
+    assert c.func.binary_name == "busybox"
+
+
+def test_lib_binary_wrapper_propagated() -> None:
+    """The other half of the retired heuristic, and the costlier one: ``lib*`` matched every
+    shared object in the firmware, custom ones included.
+
+    MUTATION: put the name-based ``continue`` back -> RED.
+    """
+    wrapper = _fn(
+        1, "do_cmd", "void do_cmd(char* p){ system(p); }", ["system"], binary="libshared.so"
+    )
+    caller = _fn(
+        2,
+        "forward",
+        'void forward(void){ char c[64]; snprintf(c,64,"%s",x); do_cmd(c); }',
+        ["snprintf", "do_cmd"],
+        binary="libshared.so",
+    )
+    (c,) = find_wrapper_propagated_candidates([wrapper, caller])
+    assert c.func.name == "forward"
+    assert c.func.binary_name == "libshared.so"
 
 
 def test_no_wrapper_means_no_candidates() -> None:
@@ -131,7 +163,7 @@ def test_no_wrapper_means_no_candidates() -> None:
         'void a(void){ char c[64]; snprintf(c,64,"%s",x); notify(c); }',
         ["snprintf", "notify"],
     )
-    assert find_wrapper_propagated_candidates([a], set()) == []
+    assert find_wrapper_propagated_candidates([a]) == []
 
 
 def test_deterministic_wrapper_pick_when_several() -> None:
@@ -143,7 +175,7 @@ def test_deterministic_wrapper_pick_when_several() -> None:
         'void multi(void){ char c[64]; snprintf(c,64,"%s",x); do_cmd(c); run_sh(c); }',
         ["snprintf", "do_cmd", "run_sh"],
     )
-    (c,) = find_wrapper_propagated_candidates([_WRAPPER, w2, caller], set())
+    (c,) = find_wrapper_propagated_candidates([_WRAPPER, w2, caller])
     assert c.wrapper_name == "do_cmd"  # 'do_cmd' < 'run_sh'
 
 
@@ -159,7 +191,7 @@ def test_caller_of_thin_fmt_wrapper_becomes_fmt_candidate() -> None:
         'void handle_req(void){ char m[128]; snprintf(m,128,"got %s",x); log_msg(m); }',
         ["snprintf", "log_msg"],
     )
-    (c,) = find_wrapper_propagated_candidates([_FMT_WRAPPER, caller], set())
+    (c,) = find_wrapper_propagated_candidates([_FMT_WRAPPER, caller])
     assert c.func.name == "handle_req"
     assert c.wrapper_name == "log_msg"
     assert c.wrapped_sink == "printf"
@@ -174,7 +206,7 @@ def test_function_with_direct_fmt_sink_is_not_propagated() -> None:
         "void has_fmt(char* p){ fprintf(stderr, p, 0); log_msg(p); }",
         ["fprintf", "log_msg"],
     )
-    assert find_wrapper_propagated_candidates([_FMT_WRAPPER, direct], set()) == []
+    assert find_wrapper_propagated_candidates([_FMT_WRAPPER, direct]) == []
 
 
 def test_cross_binary_fmt_wrapper_is_not_propagated() -> None:
@@ -192,7 +224,7 @@ def test_cross_binary_fmt_wrapper_is_not_propagated() -> None:
         'void caller(void){ char m[64]; snprintf(m,64,"%s",x); log_msg(m); }',
         ["snprintf", "log_msg"],
     )
-    assert find_wrapper_propagated_candidates([wrapper_libb, caller_a], set()) == []
+    assert find_wrapper_propagated_candidates([wrapper_libb, caller_a]) == []
 
 
 def test_cmd_and_fmt_axes_both_recovered_for_one_function() -> None:
@@ -204,7 +236,7 @@ def test_cmd_and_fmt_axes_both_recovered_for_one_function() -> None:
         'void dispatch(void){ char m[64]; snprintf(m,64,"%s",x); do_cmd(m); log_msg(m); }',
         ["snprintf", "do_cmd", "log_msg"],
     )
-    cands = find_wrapper_propagated_candidates([_WRAPPER, _FMT_WRAPPER, caller], set())
+    cands = find_wrapper_propagated_candidates([_WRAPPER, _FMT_WRAPPER, caller])
     assert {c.sink_class for c in cands} == {"cmd", "fmt_string"}
     assert {c.func.name for c in cands} == {"dispatch"}
     by_axis = {c.sink_class: c for c in cands}

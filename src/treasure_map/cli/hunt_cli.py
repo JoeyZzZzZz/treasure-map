@@ -349,7 +349,6 @@ def hunt_pattern(
     click.echo(f"  Functions scanned : {stats.scanned}")
     click.echo(f"  Shape candidates  : {stats.matches}")
     click.echo(f"  Instances written : {stats.instances_written}")
-    click.echo(f"  OSS binaries excluded : {stats.oss_excluded}")
     click.echo(
         "  By reachability   : "
         f"confirmed={stats.by_status.get('confirmed', 0)}, "
@@ -361,6 +360,13 @@ def hunt_pattern(
         click.echo(
             f"  Data-gap skipped  : {stats.data_gap_skipped} "
             "(shape matches with no decompilable body — candidate set is INCOMPLETE)"
+        )
+    if stats.callee_parse_failed:
+        # The other data gap, one stage earlier: the function was admitted for scanning and its
+        # stored callee list would not parse, so no detector ever saw it.
+        click.echo(
+            f"  Callee-parse failed : {stats.callee_parse_failed} function(s) whose stored callees "
+            "could not be parsed — NOT scanned, candidate set incomplete"
         )
     if stats.fmt_wrapper_unknown_source_demoted:
         # Not a recall flag: these candidates are IN the set, just ranked below a controllable
@@ -1449,6 +1455,12 @@ def scan(
         click.echo(
             f"      → {h.data_gap_skipped} shape matches skipped (data gap: no decompilable "
             "body) — candidate set INCOMPLETE"
+        )
+    if h.callee_parse_failed:
+        # The same honesty, one stage earlier: admitted for scanning, callee list unparseable.
+        click.echo(
+            f"      → {h.callee_parse_failed} functions whose stored callees could not be parsed "
+            "— NOT scanned, candidate set INCOMPLETE"
         )
     if h.fmt_wrapper_unknown_source_demoted:
         # Not a recall flag: kept in the set, only ranked lower (a '?' is never removed).

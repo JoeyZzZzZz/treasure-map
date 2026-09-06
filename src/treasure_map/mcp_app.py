@@ -1248,7 +1248,10 @@ def make_tools(
         For each pattern: ``device_spread`` (how many distinct firmware runs it appears in) and
         ``pattern_breadth`` (distinct fine fingerprints). A candidate whose pattern recurs across
         many firmware images is worth reviewing sooner. Paged (``offset`` + ``truncated`` +
-        ``next_offset``) so the tail past ``limit`` is reachable. DERIVED, NOT a verdict."""
+        ``next_offset``) so the tail past ``limit`` is reachable. DERIVED, NOT a verdict.
+
+        ★ the bound loosened materially when scan-time exclusion was retired: instances from
+        widely-shipped stock binaries count here until origin is component-confirmed."""
         conn = open_atlas(atlas_path)
         try:
             rows = _ledger(conn)

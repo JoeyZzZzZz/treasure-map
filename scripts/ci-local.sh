@@ -15,6 +15,9 @@ mypy src/
 echo "==> binary-selector gate"
 bash scripts/check-binary-selector-resolution.sh
 
+echo "==> oss-exclusion gate"
+bash scripts/check-oss-exclusion-retired.sh
+
 echo "==> pytest unit"
 pytest tests/unit/ -q
 

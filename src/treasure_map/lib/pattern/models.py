@@ -56,8 +56,15 @@ class PatternMatch:
 @dataclass(frozen=True)
 class PatternStats:
     functions_scanned: int  # function rows considered (after the SQL pre-filter)
-    oss_binaries_excluded: int  # distinct OSS/third-party binaries skipped
-    custom_functions: int  # functions in kept (non-OSS) binaries — the detector inputs
+    # ★ The two below PARTITION functions_scanned:
+    #     functions_with_callees + callee_parse_failed == functions_scanned
+    # That equation is the whole point. It says every function the pre-filter admitted either
+    # reached the detectors or is counted as a data gap — nothing is dropped on the way, by name
+    # or otherwise. It is checked at runtime (see scanner.shape_scan_invariant_holds) and by Gate D.
+    # functions whose callee list parsed non-empty — the detector inputs
+    functions_with_callees: int
+    # functions whose stored callees could not be parsed — a data gap, surfaced, never dropped
+    callee_parse_failed: int
     pattern_a: int  # cmd_injection_shape matches
     pattern_b: int  # overflow_shape matches
     bare_cmd: int = 0  # bare_cmd_shape matches (cmd sink, no constructed shell command)
