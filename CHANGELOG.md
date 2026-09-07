@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A run that never finished is no longer reported as a fast re-hunt.** `tmap runs` and
+  `tmap rescan` sorted every out-of-date run into "needs re-extraction" or "needs re-hunt", and a
+  run that stopped mid-scan — or that has no lineage row at all, a pre-existing scan this tmap
+  never recorded — landed in the second one: "fast: stored facts are re-graded, the decompiler does
+  not run". That is a promise about how long the fix takes, and it was wrong in the expensive
+  direction. Those runs have an incomplete analysis.db or none, so bringing one forward is a whole
+  scan with the decompiler in it. The reader was told seconds and got Ghidra.
+  A third tier, `needs a full re-scan`, now holds them, ordered first because it is the most work.
+  Its cost line says the time is not measured and assumes the slow case: analyze is per-binary and
+  idempotent, so a run that stopped after every binary was already extracted can come back
+  quickly — but a run that stopped is not known to be that one, and quoting the faster figure
+  would be a promise about work nobody has looked at.
+  ★ The check runs FIRST, ahead of the extraction and unknown-commit comparisons. A run that never
+  finished has nothing to compare, and on an install that records no commit — an editable
+  checkout, where this is most often read — the unknown-commit branch matches every run there is;
+  behind it the new tier would be empty exactly where it is needed.
+  ★ `--json` carries the new axis. A tier missing there reports `staleness: null`, which a script
+  reads as "confirmed current" — the one thing these runs are not.
+  ★ The closing line of `tmap runs` counts the new tier when deciding whether `tmap rescan` can
+  refresh what was listed. Without that it said "rescan refreshes them" about runs with no
+  firmware root at all.
+
+
 - **Every binary now reaches the shape scan and the wrapper propagation.** The recall pass skipped
   whole binaries before looking at any of their code: anything the `components` table listed,
   anything whose name matched a 22-entry list of generic project names, and anything called `lib*`.

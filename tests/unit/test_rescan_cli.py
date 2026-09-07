@@ -75,7 +75,7 @@ def test_anything_not_shown_current_is_offered_for_rescan(run: RunRow, commit: s
     result = _reason(run, commit=commit)
     assert result, "an out-of-date run must come with the reason it is out of date"
     axis, why = result
-    assert axis in ("extraction", "hunt") and why
+    assert axis in ("incomplete", "extraction", "hunt") and why
 
 
 def _atlas_with(tmp_path: Path, rows: list[dict[str, object]]) -> Path:
@@ -370,3 +370,40 @@ def test_force_rescans_a_run_that_is_confirmed_current(
     out = CliRunner().invoke(rescan, ["--atlas", str(db), "--force"])
     assert out.exit_code == 0, out.output
     assert calls == [True]
+
+
+def test_rescan_lists_an_unfinished_run_in_its_own_tier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ The tier has to reach the rescan report too, and it needs its own fixture to be seen:
+    the runs that motivated it have no firmware root, so they are split off into CANNOT rescan
+    before any tier is printed. A run with a root and an unfinished scan is what exercises it.
+
+    MUTATION: leave the tier out of the axis map, or out of the render loop -> RED. The two fail
+    differently and both quietly: without the axis the run is counted by "to rescan (N)" and
+    matches no tier below it, so the header says N over a list of N-1.
+    """
+    monkeypatch.setattr(hunt_cli, "installed_commit", lambda: COMMIT)
+    fw = tmp_path / "fw"
+    fw.mkdir()
+    db = _atlas_with(
+        tmp_path,
+        [
+            {
+                "run_id": "stopped",
+                "scan_status": "in_progress",
+                "firmware_path": str(fw),
+                "binaries": 7,
+                "build_hash": current_pass_version(),
+            }
+        ],
+    )
+    out = CliRunner().invoke(rescan, ["--atlas", str(db), "--dry-run"])
+    assert out.exit_code == 0, out.output
+    assert "to rescan (1):" in out.output
+    assert "needs a full re-scan (1)" in out.output
+    assert "the decompiler runs" in out.output
+    assert "stopped:" in out.output and "[7 binaries]" in out.output
+    # the count and the listing agree — a run with no axis would be counted and never printed
+    listed = [ln for ln in out.output.splitlines() if ln.strip().startswith("stopped:")]
+    assert len(listed) == 1, out.output

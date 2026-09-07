@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 import click
 
+from treasure_map.lib.errors import ConfigError
 from treasure_map.version import UNKNOWN_VERSION, installed_commit
 
 if TYPE_CHECKING:
@@ -857,14 +858,20 @@ def runs(config: Path | None, atlas_path: Path | None, as_json: bool) -> None:
         conn.close()
     commit = installed_commit()
     current_build = current_pass_version()
-    extraction, hunt_stale, current = _staleness_tiers(
+    tiers, current = _staleness_tiers(
         run_rows, current_build=current_build, commit=commit, live=live
     )
     if as_json:
         # The same classification the human view groups on, per run, so a script does not have to
         # re-derive it (and cannot derive a different one).
-        axis_reason = {r.run_id: ("extraction", why) for r, why in extraction}
-        axis_reason.update({r.run_id: ("hunt", why) for r, why in hunt_stale})
+        #
+        # ★ Built from EVERY tier, by iterating them. Naming two of three here left the third
+        # reporting `staleness: null` — which reads as "confirmed current", the one thing those
+        # runs are not. A script cannot tell that apart from a run that really is up to date, and
+        # the omission looks like nothing at all in the output.
+        axis_reason: dict[str, tuple[str, str]] = {}
+        for axis in _TIER_ORDER:
+            axis_reason.update({r.run_id: (axis, why) for r, why in tiers[axis]})
         rows = []
         for r in run_rows:
             found = axis_reason.get(r.run_id)
@@ -886,7 +893,8 @@ def runs(config: Path | None, atlas_path: Path | None, as_json: bool) -> None:
     # Grouped by WHICH input has moved on, not merely by whether something has. The two groups cost
     # different amounts of time to bring forward, so a reader deciding what to do next needs them
     # apart; the same classifier answers `tmap rescan`, so the two commands cannot disagree.
-    for axis, tier in (("extraction", extraction), ("hunt", hunt_stale)):
+    for axis in _TIER_ORDER:
+        tier = tiers[axis]
         if not tier:
             continue
         click.echo(f"\n{_TIER_LABEL[axis]} ({len(tier)}):")
@@ -907,7 +915,11 @@ def runs(config: Path | None, atlas_path: Path | None, as_json: bool) -> None:
             click.echo(
                 f"  {_run_lineage_line(r, id_width=id_w, status_width=status_w, bins_width=bins_w)}"
             )
-    stale_runs = [r for r, _why in (*extraction, *hunt_stale)]
+    # ★ EVERY tier, not the two that happen to be named. The closing line claims what `tmap
+    # rescan` can do about what was just listed, so a tier left out of this check is a tier whose
+    # runs are quietly assumed refreshable — and the tier most likely to hold un-refreshable runs
+    # is the one for runs that never finished.
+    stale_runs = [r for axis in _TIER_ORDER for r, _why in tiers[axis]]
     if any(not r.firmware_path or not Path(r.firmware_path).is_dir() for r in stale_runs):
         # Some of what is listed above cannot be refreshed at all — saying "rescan them" without
         # that would send the reader at a command that fails on a subset, with no hint which.
@@ -1508,12 +1520,13 @@ def _rescan_reason(
 ) -> tuple[str, str] | None:
     """WHICH input is out of date and why, or None when both are confirmed current.
 
-    Returns ``(axis, reason)``. The axis names what has to be redone, because the two cost wildly
+    Returns ``(axis, reason)``. The axis names what has to be redone, because they cost wildly
     different amounts of time and a caller deciding whether to start now deserves to know which it
-    is: 'extraction' means the analysis.db itself would be rebuilt differently (a full decompile),
-    'hunt' means the same stored facts would only be graded again (no decompiler at all).
-    Extraction is reported first when both differ — redoing the extraction redoes the hunt anyway,
-    so listing the run twice would overstate the work.
+    is: 'incomplete' means the run never finished (or never recorded a lineage at all), so there is
+    a whole scan to run; 'extraction' means the analysis.db itself would be rebuilt differently (a
+    full decompile); 'hunt' means the same stored facts would only be graded again (no decompiler
+    at all). The more work an axis implies, the earlier it is reported — redoing the extraction
+    redoes the hunt anyway, so listing a run twice would overstate what is left.
 
     Mirrors the hunt-side currency rule and lands on "out of date" wherever sameness cannot be
     CONFIRMED, so an unstamped or unknown-commit run is offered for rescan rather than passed
@@ -1523,12 +1536,40 @@ def _rescan_reason(
     current. Offering an unknown run for refresh and refusing to answer from it are opposite
     decisions and cannot share a predicate.
     """
-    # Extraction is tested FIRST because it is the only axis that can be PROVEN here, and the axis
-    # is a claim about how long the work takes. Both values present and different is that proof; a
-    # run with no stored hash, or an install that cannot compute one, falls through to the hunt
-    # axis rather than being claimed for the expensive one on no evidence. Re-extracting re-hunts
-    # as a matter of course, so a run whose extraction AND stamp both moved belongs here only —
-    # listing it as a fast re-hunt would promise a few seconds of work and then run a decompiler.
+    # ★ FIRST, ahead of every comparison. A run that never finished, or that has no lineage row at
+    # all, has nothing to compare: asking whether its extraction is current or whether its commit
+    # can be confirmed presumes a scan that completed. It did not, and the fix is a whole scan —
+    # the decompiler included. Reported as a fast re-hunt (which is where this used to land, via
+    # the scan_status branch below the commit check) it promises seconds and then runs Ghidra.
+    #
+    # The ORDER is load-bearing, not stylistic. On an install that records no commit — an editable
+    # checkout, the environment this is most often read in — the unknown-commit branch below
+    # matches every run there is. Behind it, this branch would never be reached and the tier would
+    # be empty exactly where it is needed.
+    #
+    # ``resolved`` appears twice below and only ONE of them decides anything today. In the
+    # condition it is implied: every unresolved run also carries scan_status='unknown', so the
+    # status half already places it in this tier — it is written out because unresolved-or-
+    # unfinished is what the tier MEANS, not because it currently adds a run. In the sentence it
+    # is load-bearing: reporting "previous run did not finish" about a pre-existing scan states
+    # something that did not happen. It never failed; it was never recorded.
+    #
+    # (``incomplete`` here names the RUN's state, and scan_status carries its own 'partial' value
+    # plus there is an unrelated edge-completeness vocabulary elsewhere. Different namespaces, no
+    # functional overlap — noted so a reader does not go looking for one.)
+    if not run.resolved or run.scan_status != "complete":
+        why = (
+            "no lineage row — a pre-existing scan this tmap never recorded"
+            if not run.resolved
+            else f"previous run did not finish (scan_status={run.scan_status})"
+        )
+        return ("incomplete", why)
+    # Extraction is next because it is the only remaining axis that can be PROVEN here, and the
+    # axis is a claim about how long the work takes. Both values present and different is that
+    # proof; a run with no stored hash, or an install that cannot compute one, falls through to the
+    # hunt axis rather than being claimed for the expensive one on no evidence. Re-extracting
+    # re-hunts as a matter of course, so a run whose extraction AND stamp both moved belongs here
+    # only — listing it as a fast re-hunt would promise a few seconds and then run a decompiler.
     if run.build_hash and current_build and run.build_hash != current_build:
         return (
             "extraction",
@@ -1536,8 +1577,6 @@ def _rescan_reason(
         )
     if commit == UNKNOWN_VERSION:
         return ("hunt", "the running install records no commit, so currency cannot be confirmed")
-    if run.scan_status != "complete":
-        return ("hunt", f"previous run did not finish (scan_status={run.scan_status})")
     if not run.hunt_commit:
         return ("hunt", "hunted before the commit stamp existed")
     if run.hunt_commit == UNKNOWN_VERSION:
@@ -1573,10 +1612,17 @@ def _live_instance_counts(conn: sqlite3.Connection) -> dict[str, int]:
 # that they differ by orders of magnitude, and a reader deciding whether to start now cannot see
 # that from "out of date".
 _TIER_LABEL = {
+    "incomplete": "needs a full re-scan",
     "extraction": "needs re-extraction",
     "hunt": "needs re-hunt",
 }
 _TIER_COST = {
+    # ★ Not measured, and deliberately the pessimistic reading. Analyze is per-binary and
+    # idempotent, so a run that stopped after every binary was already extracted can come back
+    # quickly — but a run that stopped is not known to be that one, and quoting the faster figure
+    # would be a promise about work nobody has looked at. Over-stating costs the reader a pause;
+    # under-stating costs them a Ghidra run they were told would not happen.
+    "incomplete": "a full scan, the decompiler runs (time not measured; assume the slow case)",
     "extraction": "slower: the decompiler runs over every binary again",
     "hunt": "fast: stored facts are re-graded, the decompiler does not run",
 }
@@ -1613,9 +1659,16 @@ def _reason_human(axis: str, reason: str, *, binaries: int | None = None) -> str
     is how a new one becomes invisible: the reader would see a familiar sentence describing a
     situation nobody had considered. Verbatim is worse prose and a true statement.
     """
+    scale = f" (decompiles {binaries} binaries)" if binaries else ""
     if axis == "extraction" and reason.startswith("extracted by "):
-        scale = f" (decompiles {binaries} binaries)" if binaries else ""
         return f"extracted by an older tmap; re-extraction is slow{scale}"
+    if axis == "incomplete":
+        # Sized like the extraction tier, and for the same reason: a full scan decompiles, so how
+        # much there is to decompile is the part of "slow" a reader can act on. The machine reason
+        # rides verbatim after the colon rather than being replaced — this tier holds two different
+        # situations (a scan that stopped, and one that was never recorded at all) and a single
+        # sentence covering both would be wrong about one of them.
+        return f"needs a full scan{scale}: {reason}"
     for prefix, human in _REASON_HUMAN:
         if reason.startswith(prefix):
             return human
@@ -1634,15 +1687,25 @@ def _reasons_grouped(tier: list[tuple[RunRow, str]], axis: str) -> dict[str, lis
     return out
 
 
+# The tiers in the order a reader should meet them: most work first, so the thing that will take
+# longest is not the last thing found. Every consumer iterates this, so adding a tier is one edit
+# rather than a hunt for the places that enumerate them by hand.
+_TIER_ORDER: tuple[str, ...] = ("incomplete", "extraction", "hunt")
+
+
 def _staleness_tiers(
     run_rows: list[RunRow], *, current_build: str | None, commit: str, live: dict[str, int]
-) -> tuple[list[tuple[RunRow, str]], list[tuple[RunRow, str]], list[RunRow]]:
-    """Split runs into (extraction-stale, hunt-stale, current), each carrying its reason.
+) -> tuple[dict[str, list[tuple[RunRow, str]]], list[RunRow]]:
+    """Split runs into ``{axis -> [(run, reason)]}`` plus the confirmed-current ones.
+
+    A mapping keyed by axis rather than one list per tier: the tiers grew from two to three, and
+    every caller that unpacked a fixed-width tuple had to be found and changed by hand — the kind
+    of edit that is easy to do in four places out of five. Every axis in ``_TIER_ORDER`` is present
+    as a key, empty or not, so a consumer never has to guess whether a missing key means empty.
 
     One classifier for both commands, so what `tmap runs` calls out of date and what `tmap rescan`
     offers to redo can never drift apart."""
-    extraction: list[tuple[RunRow, str]] = []
-    hunt: list[tuple[RunRow, str]] = []
+    tiers: dict[str, list[tuple[RunRow, str]]] = {axis: [] for axis in _TIER_ORDER}
     current: list[RunRow] = []
     for r in run_rows:
         res = _rescan_reason(
@@ -1650,16 +1713,21 @@ def _staleness_tiers(
         )
         if res is None:
             current.append(r)
-        elif res[0] == "extraction":
-            extraction.append((r, res[1]))
         else:
-            hunt.append((r, res[1]))
-    return extraction, hunt, current
+            # An axis the order does not know would silently vanish from every render, so it is
+            # refused here rather than dropped: a new axis must be declared, not just returned.
+            axis = res[0]
+            if axis not in tiers:
+                raise ConfigError(f"unknown staleness axis {axis!r} (not in {_TIER_ORDER})")
+            tiers[axis].append((r, res[1]))
+    return tiers, current
 
 
 def _tier_line(r: RunRow, why: str, axis: str) -> str:
     """One tier entry: the run, why it is in that tier, and how big the work is when known."""
-    scale = f" [{r.binaries} binaries]" if axis == "extraction" and r.binaries is not None else ""
+    # Both decompiling tiers carry the size of the work; the hunt tier does not decompile.
+    sized = axis in ("extraction", "incomplete")
+    scale = f" [{r.binaries} binaries]" if sized and r.binaries is not None else ""
     return f"{r.run_id}: {why}{scale}"
 
 
@@ -1748,17 +1816,19 @@ def rescan(
     )
     click.echo(f"running tmap commit: {commit}{unstamped}")
 
-    extraction, hunt_stale, current = _staleness_tiers(
+    tiers, current = _staleness_tiers(
         selected, current_build=current_build, commit=commit, live=live
     )
+    # ★ Both maps filled from EVERY tier. Missing a tier here fails in two different ways, and
+    # neither is loud: leaving it out of ``todo`` drops its runs from the report altogether, while
+    # leaving it out of ``axis_of`` keeps them in the count and out of every tier listing below —
+    # "to rescan (N)" over a list of N-1.
     axis_of: dict[str, str] = {}
     todo: list[tuple[RunRow, str]] = []
-    for r, why in extraction:
-        axis_of[r.run_id] = "extraction"
-        todo.append((r, why))
-    for r, why in hunt_stale:
-        axis_of[r.run_id] = "hunt"
-        todo.append((r, why))
+    for axis in _TIER_ORDER:
+        for r, why in tiers[axis]:
+            axis_of[r.run_id] = axis
+            todo.append((r, why))
     if force:
         # --force redoes the runs nothing else would offer. They go in the hunt tier because that
         # is the work: their extraction is already current, so the scan re-grades and does not
@@ -1793,7 +1863,7 @@ def rescan(
     click.echo(f"\nto rescan ({len(runnable)}):")
     # Split by WHICH input moved, because the two cost different amounts of time: naming the axis
     # and its cost is the difference between knowing this will take a while and discovering it.
-    for axis in ("extraction", "hunt"):
+    for axis in _TIER_ORDER:
         tier = [(r, why) for r, why in runnable if axis_of.get(r.run_id) == axis]
         if not tier:
             continue

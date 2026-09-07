@@ -17,6 +17,7 @@ from treasure_map.lib.analyze.ghidra_runner import current_pass_version
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import InstanceRow
 from treasure_map.lib.atlas.writer import add_instance, begin_run, finish_run, upsert_pattern
+from treasure_map.version import UNKNOWN_VERSION
 
 
 def _atlas_with_runs(tmp_path: Path) -> Path:
@@ -194,10 +195,13 @@ def test_two_reasons_in_one_tier_are_listed_apart_with_their_runs(
     monkeypatch.setattr(hunt_cli, "installed_commit", lambda: "c" * 40)
     atlas = tmp_path / "atlas.db"
     conn = open_atlas(atlas)
+    # Both land in the SAME tier (hunt) for DIFFERENT reasons — which is the property under test.
+    # An earlier version used a `failed` run for the second reason; that run now has a tier of its
+    # own, so it stopped exercising the grouping it was written for.
     begin_run(conn, "graded_old", analysis_db_path="/ws/a.db", build_hash=current_pass_version())
     finish_run(conn, "graded_old", binaries=2, functions=3, hunt_commit="f" * 40, hunt_instances=1)
-    begin_run(conn, "crashed", analysis_db_path="/ws/b.db", build_hash=current_pass_version())
-    finish_run(conn, "crashed", scan_status="failed", binaries=1, functions=1)
+    begin_run(conn, "uncounted", analysis_db_path="/ws/b.db", build_hash=current_pass_version())
+    finish_run(conn, "uncounted", binaries=1, functions=1, hunt_commit="c" * 40)
     conn.close()
 
     out = CliRunner().invoke(runs, ["--atlas", str(atlas)])
@@ -205,7 +209,7 @@ def test_two_reasons_in_one_tier_are_listed_apart_with_their_runs(
     arrows = [ln.strip() for ln in out.output.splitlines() if ln.strip().startswith("→")]
     assert len(arrows) == 2, out.output
     assert any(a.endswith(": graded_old") and "older tmap" in a for a in arrows)
-    assert any(a.endswith(": crashed") and "did not finish" in a for a in arrows)
+    assert any(a.endswith(": uncounted") and "recorded what it ran" in a for a in arrows)
 
 
 def test_an_unmapped_reason_passes_through_verbatim() -> None:
@@ -268,3 +272,157 @@ def test_runs_json_carries_the_stamp_and_the_classification(tmp_path: Path) -> N
     assert row["hunt_instances"] == 12
     assert row["staleness"]["axis"] == "extraction"
     assert "facefeedface" in row["staleness"]["reason"]
+
+
+# ── the fourth tier: a run that never finished needs a whole scan, not a fast re-hunt ──
+
+
+def _unfinished_atlas(tmp_path: Path, *, firmware: str | None = None) -> Path:
+    """One run that stopped mid-scan and one that is up to date."""
+    atlas = tmp_path / "atlas.db"
+    conn = open_atlas(atlas)
+    begin_run(
+        conn,
+        "stopped",
+        analysis_db_path="/ws/a.db",
+        firmware_path=firmware,
+        build_hash=current_pass_version(),
+    )
+    finish_run(conn, "stopped", scan_status="failed", binaries=7, functions=9)
+    begin_run(conn, "fine", analysis_db_path="/ws/b.db", build_hash=current_pass_version())
+    finish_run(conn, "fine", binaries=1, functions=1, hunt_commit="c" * 40, hunt_instances=0)
+    conn.close()
+    return atlas
+
+
+def test_an_unfinished_run_is_its_own_tier_not_a_fast_re_hunt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ A run that never finished was reported as "needs re-hunt / fast, no decompile".
+
+    That is a promise about how long the fix takes, and it was wrong in the expensive direction:
+    the run's analysis.db is incomplete or absent, so bringing it forward is a full scan with the
+    decompiler in it. The reader was told seconds and got Ghidra.
+
+    MUTATION: return ``("hunt", …)`` from the scan_status branch again -> RED.
+    """
+    monkeypatch.setattr(hunt_cli, "installed_commit", lambda: "c" * 40)
+    out = CliRunner().invoke(runs, ["--atlas", str(_unfinished_atlas(tmp_path))])
+    assert out.exit_code == 0, out.output
+    assert "needs a full re-scan (1):" in out.output
+    assert "needs re-hunt" not in out.output
+    assert "up to date (1):" in out.output
+    # the cost is stated where the tier is named, and it is the honest (pessimistic) one
+    arrows = [ln.strip() for ln in out.output.splitlines() if ln.strip().startswith("→")]
+    assert any("needs a full scan" in a and "did not finish" in a for a in arrows), arrows
+    assert any("7 binaries" in a for a in arrows), arrows  # sized like the other decompiling tier
+
+
+def test_a_run_with_no_lineage_row_is_in_the_same_tier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pre-existing scan this tmap never recorded is the same situation one step earlier: there
+    is nothing to compare, and the fix is a whole scan.
+
+    ★ What the ``not run.resolved`` half actually decides is the SENTENCE, not the tier. Such a run
+    also carries ``scan_status='unknown'``, so the status half already puts it here — but the
+    reason it would then give is "previous run did not finish", which is not what happened. It did
+    not fail; it was never recorded. Asserted on the tier's ``→`` line, because the run's own line
+    says "no lineage row" either way and an assertion over the whole output passes without the
+    branch under test doing anything (it did, until this was tightened).
+
+    MUTATION: drop the ``not run.resolved`` half -> RED (the tier reason becomes "did not finish").
+    """
+    monkeypatch.setattr(hunt_cli, "installed_commit", lambda: "c" * 40)
+    atlas = tmp_path / "atlas.db"
+    conn = open_atlas(atlas)
+    pid = upsert_pattern(
+        conn, source_class="external_input", sink_class="cmd", call_sequence_shape="s->cmd"
+    )
+    add_instance(
+        conn,
+        InstanceRow(
+            pattern_id=pid,
+            pseudocode_hash="h1",
+            sink_anchor="FUN_1",
+            source_run_id="no_lineage",
+            evidence_ref="no_lineage#fn1",
+        ),
+    )
+    conn.close()
+
+    out = CliRunner().invoke(runs, ["--atlas", str(atlas)])
+    assert out.exit_code == 0, out.output
+    assert "needs a full re-scan (1):" in out.output
+    (arrow,) = [ln.strip() for ln in out.output.splitlines() if ln.strip().startswith("→")]
+    assert "never recorded" in arrow, arrow
+    assert "did not finish" not in arrow, arrow
+
+
+def test_the_unfinished_tier_is_decided_before_the_unknown_commit_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ THE ORDER, and the only fixture that can see it.
+
+    An editable install records no commit, and the unknown-commit branch matches EVERY run. Put
+    the unfinished check behind it and this tier is empty exactly where it is most needed — in the
+    environment the command is most often read in. Nothing else in the suite catches that: a
+    fixture with a real commit never reaches the branch that would steal the run.
+
+    ★ The build_hash matches the running pipeline on purpose too. With a stale one the extraction
+    branch answers first, and the test would pass with the unfinished check anywhere after it.
+
+    MUTATION: move the unfinished check below the unknown-commit branch -> RED.
+    """
+    monkeypatch.setattr(hunt_cli, "installed_commit", lambda: UNKNOWN_VERSION)
+    out = CliRunner().invoke(runs, ["--atlas", str(_unfinished_atlas(tmp_path))])
+    assert out.exit_code == 0, out.output
+    assert "needs a full re-scan (1):" in out.output
+    assert "stopped" in out.output
+    # the other run has no confirmable commit, so it lands in the hunt tier — which is what makes
+    # this a real ordering test: the unknown-commit branch IS live here and did not take 'stopped'
+    assert "needs re-hunt (1):" in out.output
+
+
+def test_the_unfinished_tier_reaches_the_json_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ A tier missing from the JSON view reports ``staleness: null`` — which a script reads as
+    "confirmed current", the one thing these runs are not. The omission looks like nothing at all
+    in the output, which is what makes it worth pinning.
+
+    MUTATION: build ``axis_reason`` from the extraction and hunt tiers only -> RED.
+    """
+    monkeypatch.setattr(hunt_cli, "installed_commit", lambda: "c" * 40)
+    out = CliRunner().invoke(runs, ["--atlas", str(_unfinished_atlas(tmp_path)), "--json"])
+    assert out.exit_code == 0, out.output
+    by_id = {r["run_id"]: r for r in json.loads(out.output)}
+    assert by_id["stopped"]["staleness"]["axis"] == "incomplete"
+    assert "did not finish" in by_id["stopped"]["staleness"]["reason"]
+    assert by_id["fine"]["staleness"] is None  # the counterweight: current really is null
+
+
+def test_the_closing_line_counts_the_unfinished_tier_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ The closing line claims what `tmap rescan` can do about what was just listed. Check only
+    some tiers for a firmware root and the runs in the others are quietly assumed refreshable —
+    and the tier most likely to hold un-refreshable runs is the one for runs that never finished.
+
+    MUTATION: build ``stale_runs`` from the extraction and hunt tiers only -> RED (the output
+    promises `tmap rescan` refreshes them, when the only stale run has no firmware root at all).
+    """
+    monkeypatch.setattr(hunt_cli, "installed_commit", lambda: "c" * 40)
+    out = CliRunner().invoke(runs, ["--atlas", str(_unfinished_atlas(tmp_path, firmware=None))])
+    assert out.exit_code == 0, out.output
+    assert "readable via `tmap fact --analysis-db" in out.output
+    assert "`tmap rescan` refreshes them." not in out.output
+
+    # and the counterweight: with the root present, the plain sentence is the true one
+    fw = tmp_path / "fw"
+    fw.mkdir()
+    out2 = CliRunner().invoke(
+        runs, ["--atlas", str(_unfinished_atlas(tmp_path / "b", firmware=str(fw)))]
+    )
+    assert out2.exit_code == 0, out2.output
+    assert "`tmap rescan` refreshes them." in out2.output
