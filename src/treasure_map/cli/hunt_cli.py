@@ -9,6 +9,7 @@ top-level commands; not a file-per-analyzer.
 from __future__ import annotations
 
 import logging
+import sqlite3
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -18,8 +19,6 @@ from treasure_map.lib.errors import ConfigError
 from treasure_map.version import UNKNOWN_VERSION, installed_commit
 
 if TYPE_CHECKING:
-    import sqlite3
-
     from treasure_map.lib.atlas.models import RunRow
     from treasure_map.lib.query import CandidateExplanation, TriageCandidate
 
@@ -1635,30 +1634,44 @@ _TIER_COST = {
     # under-stating costs them a Ghidra run they were told would not happen.
     "incomplete": "a full scan, the decompiler runs (time not measured; assume the slow case)",
     "extraction": "slower: the decompiler runs over every binary again",
-    "hunt": "fast: stored facts are re-graded, the decompiler does not run",
+    # ★ Says what IS redone, not only what is skipped. build_hash covers the per-binary extraction
+    # and nothing else, so the ELF inventory, the symlink table, the xrefs and the non-binary
+    # ingesters are rebuilt every time — a re-hunt is cheap because no decompiler starts, not
+    # because nothing happens. The retry clause is the other half a reader can act on: the scan's
+    # dirty check picks up binaries whose last extraction FAILED (a timeout is not retried at the
+    # same budget), so a re-hunt can legitimately run Ghidra on a few of them.
+    "hunt": (
+        "no decompile on cache hit; the inventory, xrefs and non-binary facts are rebuilt and the "
+        "run is hunted again — binaries whose last extraction failed are retried"
+    ),
 }
 
 
 # The machine reason -> one sentence a person can act on, with the cost of acting folded in.
 # Prefix-matched because several reasons carry interpolated values (hashes, counts) that say
 # nothing to a reader; what they need is which input moved and how long the fix takes.
+#
+# "no decompile" rather than "fast": the tier cost above carries what a re-hunt actually redoes,
+# and a one-word promise of speed over a rebuild nobody has timed is the kind of claim this file
+# exists to avoid making.
 _REASON_HUMAN: tuple[tuple[str, str], ...] = (
-    ("hunted by ", "hunted by an older tmap; re-hunt is fast (no decompile)"),
+    ("hunted by ", "hunted by an older tmap; re-hunt needs no decompile"),
     (
         "hunted before the commit stamp existed",
-        "hunted before tmap recorded what it ran; re-hunt is fast",
+        "hunted before tmap recorded what it ran; re-hunt needs no decompile",
     ),
     (
         "hunted before the instance count was recorded",
-        "hunted before tmap recorded what it ran; re-hunt is fast",
+        "hunted before tmap recorded what it ran; re-hunt needs no decompile",
     ),
     (
         "stored candidate rows changed since the hunt",
-        "stored candidates were modified after the hunt; re-hunt is fast",
+        "stored candidates were modified after the hunt; re-hunt needs no decompile",
     ),
     (
         "the running install records no commit",
-        "this install records no commit, so currency cannot be confirmed; re-hunt is fast",
+        "this install records no commit, so currency cannot be confirmed; "
+        "re-hunt needs no decompile",
     ),
 )
 
@@ -1774,61 +1787,52 @@ def _recorded_workspace_name(run: RunRow, *, workspace_dir: Path) -> str | None:
     return ws.name
 
 
-def _rehunt_in_place(run: RunRow, db: Path, *, atlas_path: Path, rehunt: bool) -> None:
-    """Re-grade one run's RECORDED analysis.db — the hunt tier's work, with no decompiler in it.
+def _no_stored_facts(db: Path | None) -> str | None:
+    """Why ``db`` cannot supply a run's stored extraction, or None when it can.
 
-    The classifier already proved this run's extraction current (``build_hash`` matches the running
-    pass), so the stored facts are the facts this tmap would extract; only the grading moved. Going
-    through the full scan path here would re-walk the firmware and hand the decompiler a whole
-    rootfs to confirm what is already known — the tier reports "fast: the decompiler does not run",
-    and the execution has to be the thing that makes that sentence true.
+    The hunt tier's whole claim is that the extraction on disk is current, so the scan it triggers
+    will find nothing dirty and never start Ghidra. That claim rests on there BEING an extraction.
+    A recorded path that is missing, empty, or schema-less is not a cheap re-scan — ``scan`` creates
+    the database it cannot open and then decompiles the entire firmware into it. Which is the right
+    repair; it is the silence that is wrong, so the caller announces it first.
 
-    ★ ``firmware_path`` is handed back in. ``begin_run`` writes the column from whatever the caller
-    supplies, so re-hunting without it — which is exactly what `tmap hunt` does — NULLs the run's
-    firmware root. A run with no recorded root is the one thing rescan reports as CANNOT rescan, so
-    refreshing a run that way would spend its ability to ever be refreshed again.
+    ``build_hash`` cannot see any of this: it is stamped per binary inside the database, so a run
+    whose database has since been truncated still compares as current against the running pass.
 
-    ★ A database error is turned into a ClickException, which is the ONLY kind the rescan loop
-    collects. Reading the stored facts directly is what exposes this: the scan path rebuilds the
-    schema before it hunts, so a recorded file that exists but holds no extraction (a 0-byte or
-    half-written database) raised nothing there and raises ``sqlite3.OperationalError`` here. Left
-    bare it escapes the loop, and one unreadable database abandons every run queued behind it.
+    Read-only ON PURPOSE. ``open_db`` would CREATE the schema in a 0-byte file (measured), which
+    both destroys the evidence of what was wrong and makes states 2 and 3 indistinguishable.
+
+    Raises ``sqlite3.DatabaseError`` when the file is not a database at all — the one state that
+    must NOT be rebuilt over, since those bytes may be the only copy of an extraction. The caller
+    turns that into a failure for this run alone.
     """
-    import sqlite3
-
-    from treasure_map.lib.errors import TreasureMapError
-    from treasure_map.lib.hunt import run_analyzer2
-    from treasure_map.lib.last_run import write_last_run
-
-    click.echo(f"  re-hunting {db} in place (extraction is current — no decompile)")
+    if db is None:
+        return "this run recorded no analysis.db"
+    if not db.exists():
+        return f"recorded analysis.db is gone: {db}"
+    if db.stat().st_size == 0:
+        return f"recorded analysis.db is empty (0 bytes): {db}"
     try:
-        h = run_analyzer2(
-            db,
-            atlas_path,
-            source_run_id=run.run_id,
-            firmware_path=run.firmware_path,
-            rehunt=rehunt,
-        )
-    except TreasureMapError as exc:
-        raise click.ClickException(f"{type(exc).__name__}: {exc}") from exc
-    except sqlite3.DatabaseError as exc:
-        raise click.ClickException(
-            f"recorded analysis.db is unreadable ({exc}): {db} — its extraction has to be rebuilt "
-            f"before this run can be re-graded: `tmap scan {run.firmware_path} "
-            f"--run-id {run.run_id}`"
-        ) from exc
-    if h.skipped:
-        click.echo(f"      → hunt SKIPPED — {h.hunt_currency}; stored candidates kept as they are")
-    else:
-        click.echo(
-            f"      → {h.instances_written} candidates written "
-            f"(confirmed={h.by_status.get('confirmed', 0)}, "
-            f"blocked={h.by_status.get('blocked', 0)}, "
-            f"unknown={h.by_status.get('unknown', 0)})"
-        )
-    # Same pointer the scan path writes, so a refresh leaves `tmap mcp` (no args) pointing at a run
-    # that was just refreshed rather than at whatever was scanned last.
-    write_last_run(db, atlas_path, run.run_id)
+        # ★ The connect is INSIDE the try. sqlite3 opens lazily, so the two failures arrive at
+        # different moments: a directory where the file should be raises at CONNECT ("disk I/O
+        # error"), while bytes that are not a database get all the way to the first query ("file is
+        # not a database"). Connecting outside meant the whole class raised past this decision and
+        # was never classified — it reached the right outcome by escaping rather than by deciding.
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            row = conn.execute("SELECT COUNT(*) FROM binaries").fetchone()
+        finally:
+            conn.close()
+    except sqlite3.OperationalError as exc:
+        # "no such table" is a readable database holding no extraction — rebuildable. Anything else
+        # (unopenable, locked, no permission) rides out to the caller as the un-rebuildable state:
+        # scan would replace a file nobody has established is replaceable.
+        if "no such table" not in str(exc):
+            raise
+        return f"recorded analysis.db holds no binaries table: {db}"
+    if not row or row[0] == 0:
+        return f"recorded analysis.db holds no extracted binaries: {db}"
+    return None
 
 
 @click.command("rescan", short_help="Re-run scans that predate the running tmap")
@@ -1871,11 +1875,19 @@ def rescan(
     """Bring runs scanned by an older tmap up to date with the one installed now.
 
     With no arguments, selects every run whose stored result was NOT produced by this tmap commit.
-    Name run ids to scope it. Each selected run is refreshed IN PLACE, on the analysis.db the atlas
-    records for it: a run whose extraction is already current is only re-graded (no decompiler), and
-    one whose extraction moved is re-scanned into the workspace that run already occupies. Either
-    way the run keeps its recorded analysis.db — a refresh never starts a second workspace for a run
-    that has one. Runs already produced by this commit are left alone (--force re-runs them anyway).
+    Name run ids to scope it. Each selected run is re-scanned IN PLACE, into the workspace the atlas
+    records for it, so a refresh never starts a second workspace for a run that has one. A run whose
+    extraction is already current costs no decompiler time — the scan finds every binary cached —
+    but it does rebuild the parts no fingerprint covers: the ELF inventory, the symlinks, the
+    cross-binary xrefs and the non-binary facts. Runs already produced by this commit are left alone
+    (--force re-runs them anyway).
+
+    WHAT --force CAN AND CANNOT REFRESH. It re-runs the scan, so a changed config or a firmware
+    directory whose contents moved is picked up. It does NOT re-extract: the scan it drives carries
+    no --reanalyze, and the extraction fingerprint hashes tmap's own pipeline code, not the version
+    of the libraries that code calls. After upgrading pyelftools (which the stub-resolve step parses
+    ELF with) or Ghidra, the stored extraction is stale in a way nothing here can see — that one
+    needs `tmap scan <firmware-root> --run-id <run> --reanalyze`.
 
     A run whose firmware root was never recorded, or is no longer on disk, CANNOT be rescanned —
     those are listed by name with the reason. They are never dropped from the report: a run that
@@ -1981,26 +1993,22 @@ def rescan(
     for i, (r, _why) in enumerate(runnable, start=1):
         click.echo(f"\n=== [{i}/{len(runnable)}] rescanning {r.run_id} ===")
         try:
-            # The classifier already worked out WHICH input moved; this is where that answer is
-            # spent. Running the full scan for every tier alike would hand the decompiler a whole
-            # rootfs for a run whose extraction the classifier just proved current — and the tier
-            # above it promised the opposite in writing.
+            # EVERY tier goes through scan. ``build_hash`` proves one thing — that the per-binary
+            # extraction can be re-used — and the scan's own dirty check is what spends that proof
+            # (0 dirty, so Ghidra never starts). It proves nothing about the ELF inventory, the
+            # symlink table, the cross-binary xrefs or the non-binary ingesters, none of which are
+            # in any stamp: scan rebuilds all four unconditionally, and a path that skipped straight
+            # to the grading would have kept whatever stale version of them was on disk while
+            # claiming the run was refreshed.
             recorded_db = Path(r.analysis_db_path) if r.analysis_db_path else None
-            on_hunt_axis = axis_of.get(r.run_id) == "hunt"
-            if on_hunt_axis and recorded_db is not None and recorded_db.is_file():
-                _rehunt_in_place(r, recorded_db, atlas_path=resolved_atlas, rehunt=force)
-                continue
-            if on_hunt_axis:
-                # Said out loud. The tier line above already promised "fast: the decompiler does
-                # not run", and there are no stored facts to re-grade without a database holding
-                # them — so the promise stops being true here, and reporting it is the difference
-                # between a surprise and a decision.
-                no_facts = (
-                    f"recorded analysis.db is gone: {recorded_db}"
-                    if recorded_db is not None
-                    else "this run recorded no analysis.db"
-                )
-                click.echo(f"  {no_facts} — falling back to a full scan (the decompiler runs)")
+            if axis_of.get(r.run_id) == "hunt":
+                # The hunt tier is the one that promised "the decompiler does not run", and that
+                # promise is only kept while there IS an extraction to find current. Checked before
+                # scan rather than after, because scan's repair for a missing database is to build
+                # one — correctly, and over the whole firmware.
+                no_facts = _no_stored_facts(recorded_db)
+                if no_facts:
+                    click.echo(f"  {no_facts} — rebuilding it: the decompiler runs")
             ctx.invoke(
                 scan,
                 fs_root=Path(str(r.firmware_path)),
@@ -2021,6 +2029,19 @@ def rescan(
             # and a half-done rescan that stops silently is worse than one that says what broke.
             click.echo(f"  FAILED: {exc.format_message()}", err=True)
             failed.append((r.run_id, exc.format_message()))
+        except sqlite3.DatabaseError as exc:
+            # ★ The same law, for the exception nothing else catches. A recorded file whose bytes
+            # are not a database raises this — from the check above, or from deeper inside scan on a
+            # corrupt page it only reaches later. It is not a TreasureMapError, so scan does not
+            # convert it, and the handler above does not see it: unhandled, ONE bad file ends the
+            # whole refresh and every run queued behind it is silently never attempted.
+            #
+            # Not rebuilt over, either. A missing or empty database has nothing to lose, but these
+            # bytes may be the only copy of an extraction that took hours, and `scan` would replace
+            # them. Naming the run and moving on leaves the decision with the person who can tell.
+            msg = f"recorded analysis.db is not a readable database ({exc}) — left untouched"
+            click.echo(f"  FAILED: {msg}", err=True)
+            failed.append((r.run_id, msg))
 
     click.echo(f"\nrescanned {len(runnable) - len(failed)}/{len(runnable)}")
     if failed:

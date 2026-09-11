@@ -671,7 +671,16 @@ def begin_run(
     Written BEFORE the run's instances, so a crash mid-scan leaves 'in_progress' (the honest "did
     not finish" signal) rather than a silently-missing run behind half-written candidates. A re-scan
     resets the row to in_progress with the fresh lineage (its old instances are being replaced).
-    ``analysis_db_path`` is the run_id -> analysis.db resolver a run-aware fact tool routes on."""
+    ``analysis_db_path`` is the run_id -> analysis.db resolver a run-aware fact tool routes on.
+
+    ★ ``firmware_path`` is COALESCEd, not overwritten: a caller passing None is one that does not
+    KNOW the firmware root, never one reporting that the run no longer has one. `tmap hunt` is
+    exactly that caller — it re-hunts an analysis.db and is never told which firmware produced it —
+    so a plain ``excluded`` assignment NULLed the column on every hunt of an already-scanned run
+    (measured). That column is the sole condition on which `tmap rescan` reports a run as
+    un-refreshable, so erasing it spends the run's ability to ever be refreshed again. The other
+    columns stay unconditional: each describes THIS extraction, and None there is a fresh scan
+    genuinely having nothing to record."""
     conn.execute(
         """INSERT INTO run
                (run_id, analysis_db_path, firmware_path, firmware_sha256, build_hash,
@@ -679,7 +688,9 @@ def begin_run(
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
            ON CONFLICT(run_id) DO UPDATE SET
                analysis_db_path = excluded.analysis_db_path,
-               firmware_path    = excluded.firmware_path,
+               -- Unprefixed ``firmware_path`` on the right is the EXISTING row's value: a caller
+               -- with nothing to say about the firmware root leaves the recorded one standing.
+               firmware_path    = COALESCE(excluded.firmware_path, firmware_path),
                firmware_sha256  = excluded.firmware_sha256,
                build_hash       = excluded.build_hash,
                tool_version     = excluded.tool_version,

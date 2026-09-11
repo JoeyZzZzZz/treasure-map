@@ -143,6 +143,35 @@ def test_begin_run_clears_the_stamp_so_a_crash_leaves_no_claim(tmp_path: Path) -
     assert conn.execute("SELECT hunt_commit FROM run WHERE run_id='r1'").fetchone()[0] is None
 
 
+def test_begin_run_without_a_firmware_root_leaves_the_recorded_one_alone(tmp_path: Path) -> None:
+    """★ M-A4. A caller passing no firmware root does not KNOW one; it is not reporting that the run
+    has none.
+
+    `tmap hunt` is exactly that caller: it re-hunts an analysis.db and is never told which firmware
+    produced it, so it reaches begin_run with firmware_path=None. Assigned straight from
+    ``excluded``, that NULLed the column on every hunt of an already-scanned run — and an absent
+    firmware root is the SOLE condition on which `tmap rescan` reports a run as un-refreshable. A
+    refresh would have spent the run's ability to ever be refreshed again.
+
+    The neighbouring columns stay unconditional on purpose: each describes THIS extraction, where
+    None is a scan that genuinely has nothing to record. Only the firmware root is a fact about the
+    run that outlives any single hunt, so only it is COALESCEd.
+
+    MUTATION: write ``firmware_path = excluded.firmware_path`` again -> RED. Measured: 1 failed.
+    """
+    conn = _atlas(tmp_path)
+    begin_run(conn, "r1", analysis_db_path="/x/a.db", firmware_path="/fw/root", build_hash=BUILD)
+    begin_run(conn, "r1", analysis_db_path="/x/a.db", build_hash=BUILD)  # a hunt, no root known
+    assert (
+        conn.execute("SELECT firmware_path FROM run WHERE run_id='r1'").fetchone()[0] == "/fw/root"
+    )
+    # ...and a caller that DOES know a new location still moves it (COALESCE must not freeze it).
+    begin_run(conn, "r1", analysis_db_path="/x/a.db", firmware_path="/fw/moved", build_hash=BUILD)
+    assert (
+        conn.execute("SELECT firmware_path FROM run WHERE run_id='r1'").fetchone()[0] == "/fw/moved"
+    )
+
+
 def test_finish_run_without_a_commit_leaves_an_existing_stamp_alone(tmp_path: Path) -> None:
     """A caller that does not know the commit has no grounds to erase one already established.
 

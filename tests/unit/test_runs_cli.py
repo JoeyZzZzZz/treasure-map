@@ -181,7 +181,7 @@ def test_the_reason_is_said_once_per_tier_not_once_per_run(
     assert out.exit_code == 0, out.output
     arrows = [ln for ln in out.output.splitlines() if ln.strip().startswith("→")]
     assert len(arrows) == 1, out.output
-    assert arrows[0].strip() == "→ hunted by an older tmap; re-hunt is fast (no decompile)"
+    assert arrows[0].strip() == "→ hunted by an older tmap; re-hunt needs no decompile"
 
 
 def test_two_reasons_in_one_tier_are_listed_apart_with_their_runs(
@@ -224,7 +224,7 @@ def test_an_unmapped_reason_passes_through_verbatim() -> None:
     assert _reason_human("hunt", novel) == novel
     assert _reason_human("extraction", novel) == novel
     # and the mapped ones ARE rewritten, so the passthrough is not simply doing nothing
-    assert "re-hunt is fast" in _reason_human("hunt", "hunted by abc123def456, running 789")
+    assert "needs no decompile" in _reason_human("hunt", "hunted by abc123def456, running 789")
     assert "decompiles 484 binaries" in _reason_human(
         "extraction", "extracted by abc, running def", binaries=484
     )

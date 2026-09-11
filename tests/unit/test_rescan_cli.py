@@ -11,6 +11,7 @@ like a list on which everything was fine.
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 import click
@@ -235,7 +236,10 @@ def test_the_two_tiers_are_reported_separately_with_what_they_cost(tmp_path: Pat
     assert "decompiler runs over every binary again" in out.output
     assert "old_extract:" in out.output and "[484 binaries]" in out.output
     assert "needs re-hunt (1)" in out.output
-    assert "the decompiler does not run" in out.output
+    # The hunt tier states BOTH halves: no decompiler on a cache hit, and the rebuild that happens
+    # anyway. "no decompile" alone was the half that made a rebuilt inventory read as nothing.
+    assert "no decompile on cache hit" in out.output
+    assert "rebuilt" in out.output and "hunted again" in out.output
     assert "old_hunt:" in out.output
 
 
@@ -381,12 +385,12 @@ def test_force_rescans_a_run_that_is_confirmed_current(
     rescanned with or without --force, and the assertion would pass without the flag doing
     anything.
 
-    A forced run lands on the HUNT axis (its extraction is current), so what carries ``rehunt`` is
-    the in-place re-grade, not ``scan`` — and ``scan`` must not be reached at all, or --force would
-    quietly mean "decompile everything again".
+    A forced run lands on the HUNT axis (its extraction is current) and goes through ``scan`` like
+    every other tier, into the workspace it is recorded in. ``rehunt`` has to travel that far: the
+    scan reaches the hunt, finds the stamp current, and skips unless told otherwise.
 
     MUTATION: drop the ``if force`` block that moves current runs into todo -> RED
-    ("nothing to rescan"). Pass ``rehunt=False`` to the re-grade -> RED.
+    ("nothing to rescan"). Pass ``rehunt=False`` to the scan -> RED.
     """
     fw = tmp_path / "fw"
     fw.mkdir()
@@ -411,8 +415,7 @@ def test_force_rescans_a_run_that_is_confirmed_current(
         CliRunner().invoke(rescan, ["--atlas", str(db), "--dry-run"]).output.count("up to date (1)")
         == 1
     ), "the fixture must be confirmed current, or --force is not what moved it"
-    scanned: list[str | None] = []
-    regraded: list[tuple[Path, bool]] = []
+    scanned: list[tuple[str | None, str | None, bool]] = []
 
     def _fake_scan(
         fs_root: Path,
@@ -423,17 +426,12 @@ def test_force_rescans_a_run_that_is_confirmed_current(
         rehunt: bool,
         top_n: int | None,
     ) -> None:
-        scanned.append(run_id)
-
-    def _fake_regrade(run: RunRow, db_path: Path, *, atlas_path: Path, rehunt: bool) -> None:
-        regraded.append((db_path, rehunt))
+        scanned.append((run_id, workspace, rehunt))
 
     monkeypatch.setattr(hunt_cli, "scan", _fake_scan)
-    monkeypatch.setattr(hunt_cli, "_rehunt_in_place", _fake_regrade)
     out = CliRunner().invoke(rescan, ["--atlas", str(db), "--force"])
     assert out.exit_code == 0, out.output
-    assert regraded == [(ws_dir / "fresh_ws" / "analysis.db", True)]
-    assert scanned == [], "--force on a current run must not reach the decompiling path"
+    assert scanned == [("fresh", "fresh_ws", True)]
 
 
 def test_rescan_lists_an_unfinished_run_in_its_own_tier(
@@ -531,31 +529,66 @@ def _instance_refs(atlas: Path, run_id: str) -> list[str]:
         conn.close()
 
 
-def test_a_custom_named_run_is_refreshed_in_place_and_nothing_decompiles(
+def _stale_xref_sentinel(db: Path) -> None:
+    """A row in the xrefs table that only a rebuild can remove.
+
+    ``build_xrefs`` opens with DELETE FROM xrefs / xref_folded_symbols / xref_unresolved_sonames and
+    re-derives all three, so this row surviving a refresh means the rebuild did not happen. It is
+    the observable for the half of a re-hunt that no fingerprint covers.
+    """
+    conn = open_db(db)
+    try:
+        conn.execute(
+            "INSERT INTO xrefs (id, caller_binary_id, callee_binary_id, xref_type, confidence) "
+            "VALUES (4242, 1, 1, 'stale_sentinel', 1.0)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _has_sentinel(db: Path) -> bool:
+    conn = open_db(db)
+    try:
+        return bool(
+            conn.execute("SELECT 1 FROM xrefs WHERE xref_type = 'stale_sentinel'").fetchone()
+        )
+    finally:
+        conn.close()
+
+
+def test_a_custom_named_run_is_rescanned_in_place_rebuilding_without_the_decompiler(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """★ THE REGRESSION, end to end on a real atlas and a real analysis.db (INV-1..INV-4).
+    """★ THE REGRESSION, end to end on a real atlas, a real analysis.db and the REAL analyze stage.
 
     The shape that was bitten: a run scanned under a CUSTOM workspace name, whose extraction is
     current. Rescan handed ``scan`` only the firmware root, so it derived the auto name
     ``analyze_<root>_<hash8>`` — a different directory from the one this run is recorded in. That
     database is empty, so every binary reads as dirty, the decompiler runs over the whole firmware,
-    and the run is re-pointed at the new directory with the original left behind as an orphan. The
-    tier above it said, in writing, "fast: the decompiler does not run".
+    and the run is re-pointed at the new directory with the original left behind as an orphan.
 
-    Four things are pinned here, and they fail independently:
-      - the analyze pipeline is never entered (the promise the tier makes);
-      - ``analysis_db_path`` still names the same file afterwards (no re-point);
-      - ``workspace_dir`` gained no directory (no orphan twin);
-      - the candidates written came from THIS database (the recorded one was the one read).
-    ``firmware_path`` rides along: re-hunting without it NULLs the column, and a run with no
-    recorded root is precisely what rescan reports as un-refreshable next time.
+    What replaced it is NOT a path that skips the scan. ``build_hash`` proves the per-binary
+    extraction can be re-used and nothing more: the ELF inventory, the symlinks, the cross-binary
+    xrefs and the non-binary facts are in no fingerprint at all, so a refresh that jumped straight
+    to the grading would keep whatever stale version of them was on disk. The scan runs, and its own
+    dirty check is what keeps the decompiler out of it.
 
-    MUTATION (the original bug, restored): drop ``workspace=`` and the hunt-axis branch so every
-    tier goes through ``scan`` again -> RED. Measured: 1 failed, on the analyze pipeline being
-    entered. MUTATION: pass ``firmware_path=None`` to the re-grade -> RED (the column is NULLed).
+    Five things are pinned, and they fail independently:
+      - the analyze stage IS entered (the rebuild actually happens);
+      - Ghidra's ``run_all`` is NOT (0 dirty — what makes a re-hunt cheap);
+      - a stale xrefs row is gone afterwards (the rebuild reached the parts no stamp covers);
+      - ``analysis_db_path`` still names the same file, and ``workspace_dir`` gained no directory;
+      - ``firmware_path`` survives — a run with no recorded root is what rescan reports as
+        un-refreshable next time.
+
+    MUTATION (the original bug, restored): drop ``workspace=`` so the auto name is derived -> RED.
+    MUTATION: re-grade in place instead of scanning -> RED (the sentinel survives).
+    MUTATION: make the fixture dirty (clear pass_version on the seeded binary) -> Ghidra runs,
+    so this goes RED.
     """
     from treasure_map.lib.analyze import pipeline
+    from treasure_map.lib.analyze.ghidra_runner import GhidraRunner
 
     fw = tmp_path / "cpio-root"
     fw.mkdir()
@@ -563,6 +596,8 @@ def test_a_custom_named_run_is_refreshed_in_place_and_nothing_decompiles(
     monkeypatch.setenv("TM_WORKSPACE_DIR", str(ws_dir))
     (ws_dir / "my_device").mkdir(parents=True)
     db_file = _seeded_analysis_db(ws_dir / "my_device" / "analysis.db").resolve()
+    _stale_xref_sentinel(db_file)
+    assert _has_sentinel(db_file), "the fixture must start with the stale row it claims to remove"
     monkeypatch.setattr(hunt_cli, "installed_commit", lambda: COMMIT)
     atlas = _atlas_with(
         tmp_path,
@@ -587,25 +622,36 @@ def test_a_custom_named_run_is_refreshed_in_place_and_nothing_decompiles(
     auto = resolve_workspace(None, workspace_dir=ws_dir, fs_root=fw).path.name
     assert auto != "my_device", "the fixture must let a derived name differ from the recorded one"
 
-    def _no_decompile(*_a: object, **_k: object) -> None:
-        raise AssertionError("the analyze pipeline was entered for a run on the hunt axis")
+    # Ghidra is not installed in a test environment, and run_analyze fails fast on that before it
+    # does any work. Only the DISCOVERY is faked; the pipeline itself is the real one, so what the
+    # assertions below observe is the real rebuild.
+    monkeypatch.setattr(GhidraRunner, "get_headless", lambda self: Path("/nonexistent/headless"))
+    monkeypatch.setattr(GhidraRunner, "ghidra_version", lambda self: "unknown")
+    decompiled: list[object] = []
+    monkeypatch.setattr(
+        GhidraRunner,
+        "run_all",
+        lambda self, *a, **k: decompiled.append(a) or [],  # type: ignore[func-returns-value]
+    )
+    analyzed: list[object] = []
+    real_run_analyze = pipeline.run_analyze
 
-    # scan imports run_analyze at CALL time, so patching the module attribute catches the decompile
-    # wherever the scan path is reached from.
-    monkeypatch.setattr(pipeline, "run_analyze", _no_decompile)
+    async def _spy_run_analyze(*a: object, **k: object) -> object:
+        analyzed.append(a)
+        return await real_run_analyze(*a, **k)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(pipeline, "run_analyze", _spy_run_analyze)
 
     before = sorted(p.name for p in ws_dir.iterdir())
     out = CliRunner().invoke(rescan, ["--atlas", str(atlas)])
     assert out.exit_code == 0, out.output
+    assert analyzed, "the analyze stage must run — the rebuild is not optional"
+    assert decompiled == [], "a current extraction means 0 dirty, so Ghidra must never start"
+    assert not _has_sentinel(db_file), "the stale xrefs row must be rebuilt away"
     row = _run_row(atlas, "device_run")
     assert row["analysis_db_path"] == str(db_file), "the run must not be re-pointed"
     assert row["firmware_path"] == str(fw), "a refresh must not cost the run its firmware root"
     assert sorted(p.name for p in ws_dir.iterdir()) == before == ["my_device"]
-    refs = _instance_refs(atlas, "device_run")
-    assert refs, "the re-grade must actually write this run's candidates"
-    # The binary sha8 and the function address of the SEEDED database — an anchor no other
-    # database could produce, so this says which file was read, not merely that some file was.
-    assert all(r.startswith("device_run#aaaaaaaa:00001000@") for r in refs), refs
 
 
 def test_an_auto_named_run_is_re_scanned_into_the_very_same_auto_workspace(
@@ -703,33 +749,85 @@ def test_a_workspace_outside_the_configured_base_is_refused_not_guessed() -> Non
     assert "not under" in str(exc.value) and "/elsewhere/my_device" in str(exc.value)
 
 
-def test_a_hunt_tier_run_whose_database_is_gone_says_so_before_decompiling(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def _unusable(kind: str, ws_dir: Path) -> tuple[str, str]:
+    """One of the four REBUILDABLE unusable states, as (recorded path, workspace name).
+
+    All four mean the same thing to a refresh — there is no extraction on disk to find current — and
+    all four are repaired the same way, by letting ``scan`` rebuild the database where the run
+    already lives. They are enumerated rather than collapsed because ``build_hash`` cannot see any
+    of them: it is stamped per binary INSIDE the database, so a run whose database has since been
+    truncated still compares as current against the running pass and still lands on the hunt tier.
+    """
+    ws = ws_dir / f"ws_{kind}"
+    ws.mkdir(parents=True)
+    db = ws / "analysis.db"
+    if kind == "missing":
+        pass  # the workspace exists, the database does not
+    elif kind == "zero_byte":
+        db.touch()
+    elif kind == "no_table":
+        # A real SQLite database with no tmap schema in it at all.
+        conn = sqlite3.connect(db)
+        conn.execute("CREATE TABLE unrelated (x INTEGER)")
+        conn.commit()
+        conn.close()
+    elif kind == "no_binaries":
+        # The full schema, and not one binary extracted into it.
+        open_db(db).close()
+    else:  # pragma: no cover - guards a typo in the parametrize list
+        raise AssertionError(f"unknown fixture kind {kind!r}")
+    return str(db), ws.name
+
+
+@pytest.mark.parametrize(
+    ("kind", "says"),
+    [
+        ("missing", "recorded analysis.db is gone"),
+        ("zero_byte", "recorded analysis.db is empty (0 bytes)"),
+        ("no_table", "recorded analysis.db holds no binaries table"),
+        ("no_binaries", "recorded analysis.db holds no extracted binaries"),
+    ],
+)
+def test_a_hunt_tier_run_with_no_stored_facts_is_announced_before_it_decompiles(
+    kind: str, says: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The tier promised "the decompiler does not run"; with no database to re-grade, it will.
+    """★ M-A3. The tier said "no decompile on cache hit"; with no extraction on disk, there is no
+    cache to hit and ``scan`` will decompile the whole firmware.
 
-    There are no stored facts to grade without the file that holds them, so the run falls back to a
-    full scan — into its RECORDED workspace, which is where the rebuilt database belongs. What must
-    not happen is the fallback being silent: a reader who was told "fast" and then waits through a
-    Ghidra run has been misled by the report, not merely delayed.
+    Rebuilding is the right repair — an empty or missing database SHOULD be rebuilt, and into the
+    workspace the run already occupies. It is the silence that is wrong: a reader who was told a
+    re-hunt needs no decompiler, and then waits through a full Ghidra run, was misled by the report
+    rather than merely delayed.
 
-    MUTATION: drop the echoed fallback line -> RED. MUTATION: keep routing a db-less hunt-tier run
-    into the in-place re-grade -> RED (it has no database to open).
+    Four states, because only the first one used to be detected. A 0-byte file, a database with no
+    tmap schema, and a full schema holding zero binaries all reach ``scan`` looking exactly like a
+    healthy re-hunt, and each of them decompiles everything.
+
+    ★ Each state is pinned to the SENTENCE IT PRODUCES, not merely to the warning appearing. A
+    0-byte file, asked for a row count, answers "no such table" exactly like a schema-less one — so
+    a test that only checked "something was warned about" stayed green with the size check deleted
+    (measured: 80 passed). The states differ to the person diagnosing them, so the report has to
+    tell them apart, and the assertion has to require that.
+
+    MUTATION: drop the echoed warning -> RED on all four. MUTATION: drop the 0-byte branch -> RED
+    on that case (it reports itself as schema-less instead). MUTATION: use ``open_db`` for the check
+    -> RED (it CREATES the schema in a 0-byte file, so that state reports itself as merely
+    empty-of-binaries and the evidence of what was wrong is destroyed by the check).
     """
     fw = tmp_path / "fw"
     fw.mkdir()
     ws_dir = tmp_path / "workspaces"
     monkeypatch.setenv("TM_WORKSPACE_DIR", str(ws_dir))
-    (ws_dir / "vanished").mkdir(parents=True)  # the workspace is there, the database is not
     monkeypatch.setattr(hunt_cli, "installed_commit", lambda: COMMIT)
+    recorded, ws_name = _unusable(kind, ws_dir)
     atlas = _atlas_with(
         tmp_path,
         [
             {
-                "run_id": "gone_db",
+                "run_id": "no_facts",
                 "scan_status": "complete",
                 "firmware_path": str(fw),
-                "analysis_db_path": str(ws_dir / "vanished" / "analysis.db"),
+                "analysis_db_path": recorded,
                 "build_hash": current_pass_version(),
                 "hunt_commit": OTHER,
                 "hunt_instances": 0,
@@ -752,42 +850,107 @@ def test_a_hunt_tier_run_whose_database_is_gone_says_so_before_decompiling(
     monkeypatch.setattr(hunt_cli, "scan", _fake_scan)
     out = CliRunner().invoke(rescan, ["--atlas", str(atlas)])
     assert out.exit_code == 0, out.output
-    assert "recorded analysis.db is gone" in out.output
-    assert "the decompiler runs" in out.output
-    assert seen == ["vanished"], "the rebuild belongs in the workspace the run already occupies"
+    assert says in out.output, out.output
+    assert "the decompiler runs" in out.output, out.output
+    assert seen == [ws_name], "the rebuild belongs in the workspace the run already occupies"
 
 
-def test_an_unreadable_recorded_database_fails_one_run_not_the_whole_refresh(
+def test_a_run_that_recorded_no_database_is_announced_too(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """★ Reading the stored facts directly is what exposes this, so it is guarded where it is new.
+    """The same honesty with nothing recorded at all — and no workspace to name, so ``scan`` is left
+    to derive one. The only case where deriving is right: there is no recorded workspace to re-use.
 
-    The scan path rebuilds the schema before it hunts, so a recorded file that exists but holds no
-    extraction — 0-byte, half-written, interrupted — went unnoticed there. Re-grading opens it as
-    it is, and sqlite raises a ``DatabaseError``, which is not the exception type this loop
-    collects: left bare, one unreadable database takes every run queued behind it down with it.
+    MUTATION: return a name instead of None from ``_recorded_workspace_name`` -> RED.
+    """
+    fw = tmp_path / "fw"
+    fw.mkdir()
+    monkeypatch.setenv("TM_WORKSPACE_DIR", str(tmp_path / "workspaces"))
+    monkeypatch.setattr(hunt_cli, "installed_commit", lambda: COMMIT)
+    atlas = _atlas_with(
+        tmp_path,
+        [
+            {
+                "run_id": "no_db",
+                "scan_status": "complete",
+                "firmware_path": str(fw),
+                "build_hash": current_pass_version(),
+                "hunt_commit": OTHER,
+                "hunt_instances": 0,
+            }
+        ],
+    )
+    seen: list[str | None] = []
 
-    Two runs, the broken one FIRST, because the whole claim is about what happens after it.
+    def _fake_scan(
+        fs_root: Path,
+        workspace: str | None,
+        run_id: str | None,
+        atlas_path: Path | None,
+        config: Path | None,
+        rehunt: bool,
+        top_n: int | None,
+    ) -> None:
+        seen.append(workspace)
 
-    MUTATION: drop the ``sqlite3.DatabaseError`` handler -> RED (the second run is never attempted
-    and the command exits non-zero). Measured: 1 failed.
+    monkeypatch.setattr(hunt_cli, "scan", _fake_scan)
+    out = CliRunner().invoke(rescan, ["--atlas", str(atlas)])
+    assert out.exit_code == 0, out.output
+    assert "this run recorded no analysis.db" in out.output
+    assert "the decompiler runs" in out.output
+    assert seen == [None]
+
+
+@pytest.mark.parametrize("kind", ["garbage_bytes", "directory"])
+def test_a_file_that_is_not_a_database_fails_one_run_and_is_left_untouched(
+    kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ M-A5. The fifth state, and the only one that must NOT be rebuilt over.
+
+    Bytes that are not a database may still be the only copy of an extraction that took hours —
+    a half-written file, a wrong path, a damaged disk. ``scan`` would replace them. So this run is
+    named as FAILED and its file is not touched, leaving the decision with the person who can tell
+    what those bytes are.
+
+    And it must not take the refresh down with it. ``sqlite3.DatabaseError`` is not a
+    ``TreasureMapError``, so ``scan`` never converts it, and the loop's handler only catches
+    ``ClickException``: unhandled, ONE bad file ends the whole run and every firmware queued behind
+    it is silently never attempted. The bad run is FIRST here, because the whole claim is about what
+    happens after it.
+
+    ★ TWO shapes, because they raise DIFFERENT exception classes and only one of them reaches the
+    "no such table" guard. Garbage bytes raise ``sqlite3.DatabaseError`` ("file is not a database"),
+    which is NOT an ``OperationalError`` and so never enters that branch at all — with only that
+    case here, deleting the guard changed nothing and the suite stayed green (measured: 80 passed).
+    A directory in the database's place raises ``OperationalError`` ("disk I/O error"), which does
+    enter it and must be re-raised rather than reported as rebuildable.
+
+    MUTATION: accept every OperationalError as rebuildable (drop the "no such table" guard) -> RED
+    on the directory case. MUTATION: drop the loop's ``except sqlite3.DatabaseError`` -> RED on
+    both (the good run is never reached and the command exits non-zero).
     """
     fw = tmp_path / "fw"
     fw.mkdir()
     ws_dir = tmp_path / "workspaces"
     monkeypatch.setenv("TM_WORKSPACE_DIR", str(ws_dir))
     monkeypatch.setattr(hunt_cli, "installed_commit", lambda: COMMIT)
-    broken = _workspace(ws_dir, "broken_ws")  # exists, holds no schema at all
+    (ws_dir / "junk_ws").mkdir(parents=True)
+    junk = ws_dir / "junk_ws" / "analysis.db"
+    payload = b"\x00\xffthis is not a database at all" * 40
+    if kind == "garbage_bytes":
+        junk.write_bytes(payload)
+    else:
+        junk.mkdir()  # a directory where the database should be
     (ws_dir / "good_ws").mkdir(parents=True)
     good = _seeded_analysis_db(ws_dir / "good_ws" / "analysis.db")
     atlas = _atlas_with(
         tmp_path,
         [
             {
-                "run_id": "a_broken",
+                "run_id": "a_junk",
                 "scan_status": "complete",
                 "firmware_path": str(fw),
-                "analysis_db_path": str(broken),
+                "analysis_db_path": str(junk),
                 "build_hash": current_pass_version(),
                 "hunt_commit": OTHER,
                 "hunt_instances": 0,
@@ -803,9 +966,26 @@ def test_an_unreadable_recorded_database_fails_one_run_not_the_whole_refresh(
             },
         ],
     )
+    seen: list[str | None] = []
+
+    def _fake_scan(
+        fs_root: Path,
+        workspace: str | None,
+        run_id: str | None,
+        atlas_path: Path | None,
+        config: Path | None,
+        rehunt: bool,
+        top_n: int | None,
+    ) -> None:
+        seen.append(run_id)
+
+    monkeypatch.setattr(hunt_cli, "scan", _fake_scan)
     out = CliRunner().invoke(rescan, ["--atlas", str(atlas)])
     assert out.exit_code == 0, out.output
     assert "rescanned 1/2" in out.output
-    assert "a_broken: recorded analysis.db is unreadable" in out.output
-    # the run behind the broken one was still refreshed, from its own recorded database
-    assert _instance_refs(atlas, "b_good"), out.output
+    assert "a_junk: recorded analysis.db is not a readable database" in out.output
+    assert seen == ["b_good"], "the unreadable path must not be scanned over"
+    if kind == "garbage_bytes":
+        assert junk.read_bytes() == payload, "those bytes may be the only copy of an extraction"
+    else:
+        assert junk.is_dir() and not any(junk.iterdir()), "nothing may be written into it"
