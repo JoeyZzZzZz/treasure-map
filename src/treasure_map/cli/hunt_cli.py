@@ -1742,6 +1742,95 @@ def _tier_line(r: RunRow, why: str, axis: str) -> str:
     return f"{r.run_id}: {why}{scale}"
 
 
+def _recorded_workspace_name(run: RunRow, *, workspace_dir: Path) -> str | None:
+    """The workspace NAME a re-scan of ``run`` must re-use, or None when the run recorded none.
+
+    A run's identity is its run_id, and the atlas records WHERE that run's analysis.db lives. A
+    re-scan has to land in that same workspace. Handing ``scan`` only the firmware root instead
+    lets it derive an AUTO name from that root, which is not the name a run scanned as
+    ``-w my_device`` was stored under: the re-scan then opens an empty database, finds every binary
+    dirty, decompiles the whole firmware again — and re-points the run at the new directory,
+    orphaning the one that held the original extraction.
+
+    ★ It is the PARENT directory's name, never ``Path(analysis_db_path).name``. That one is the
+    file name "analysis.db", identical for every run, and ``resolve_workspace`` accepts it as a
+    perfectly valid NAME — so every run would resolve into one shared workspace/analysis.db
+    directory that holds no extraction at all. Silent, and worse than the bug it replaces.
+
+    Refuses a workspace that does not sit directly under ``workspace_dir``: ``-w`` takes a NAME and
+    re-resolves it against the configured base, so a name lifted from somewhere else would quietly
+    designate a DIFFERENT directory (an unrelated run's, when the names collide). Naming the run as
+    failed costs one line; scanning it into another run's workspace merges two firmware.
+    """
+    if not run.analysis_db_path:
+        return None
+    ws = Path(run.analysis_db_path).parent
+    if ws.parent.resolve() != workspace_dir.resolve():
+        raise click.ClickException(
+            f"recorded workspace {ws} is not under the configured workspace_dir {workspace_dir}, "
+            f"and -w resolves a NAME against that base — re-scanning would write somewhere else. "
+            f"Point workspace_dir at {ws.parent} to refresh this run in place."
+        )
+    return ws.name
+
+
+def _rehunt_in_place(run: RunRow, db: Path, *, atlas_path: Path, rehunt: bool) -> None:
+    """Re-grade one run's RECORDED analysis.db — the hunt tier's work, with no decompiler in it.
+
+    The classifier already proved this run's extraction current (``build_hash`` matches the running
+    pass), so the stored facts are the facts this tmap would extract; only the grading moved. Going
+    through the full scan path here would re-walk the firmware and hand the decompiler a whole
+    rootfs to confirm what is already known — the tier reports "fast: the decompiler does not run",
+    and the execution has to be the thing that makes that sentence true.
+
+    ★ ``firmware_path`` is handed back in. ``begin_run`` writes the column from whatever the caller
+    supplies, so re-hunting without it — which is exactly what `tmap hunt` does — NULLs the run's
+    firmware root. A run with no recorded root is the one thing rescan reports as CANNOT rescan, so
+    refreshing a run that way would spend its ability to ever be refreshed again.
+
+    ★ A database error is turned into a ClickException, which is the ONLY kind the rescan loop
+    collects. Reading the stored facts directly is what exposes this: the scan path rebuilds the
+    schema before it hunts, so a recorded file that exists but holds no extraction (a 0-byte or
+    half-written database) raised nothing there and raises ``sqlite3.OperationalError`` here. Left
+    bare it escapes the loop, and one unreadable database abandons every run queued behind it.
+    """
+    import sqlite3
+
+    from treasure_map.lib.errors import TreasureMapError
+    from treasure_map.lib.hunt import run_analyzer2
+    from treasure_map.lib.last_run import write_last_run
+
+    click.echo(f"  re-hunting {db} in place (extraction is current — no decompile)")
+    try:
+        h = run_analyzer2(
+            db,
+            atlas_path,
+            source_run_id=run.run_id,
+            firmware_path=run.firmware_path,
+            rehunt=rehunt,
+        )
+    except TreasureMapError as exc:
+        raise click.ClickException(f"{type(exc).__name__}: {exc}") from exc
+    except sqlite3.DatabaseError as exc:
+        raise click.ClickException(
+            f"recorded analysis.db is unreadable ({exc}): {db} — its extraction has to be rebuilt "
+            f"before this run can be re-graded: `tmap scan {run.firmware_path} "
+            f"--run-id {run.run_id}`"
+        ) from exc
+    if h.skipped:
+        click.echo(f"      → hunt SKIPPED — {h.hunt_currency}; stored candidates kept as they are")
+    else:
+        click.echo(
+            f"      → {h.instances_written} candidates written "
+            f"(confirmed={h.by_status.get('confirmed', 0)}, "
+            f"blocked={h.by_status.get('blocked', 0)}, "
+            f"unknown={h.by_status.get('unknown', 0)})"
+        )
+    # Same pointer the scan path writes, so a refresh leaves `tmap mcp` (no args) pointing at a run
+    # that was just refreshed rather than at whatever was scanned last.
+    write_last_run(db, atlas_path, run.run_id)
+
+
 @click.command("rescan", short_help="Re-run scans that predate the running tmap")
 @click.argument("run_ids", nargs=-1, shell_complete=_complete_run_id)
 @click.option(
@@ -1782,9 +1871,11 @@ def rescan(
     """Bring runs scanned by an older tmap up to date with the one installed now.
 
     With no arguments, selects every run whose stored result was NOT produced by this tmap commit.
-    Name run ids to scope it. Each selected run is re-driven through the full `tmap scan` path on
-    the firmware root it recorded, so it picks up whatever the extraction and the hunt learned to
-    do since. Runs already produced by this commit are left alone (--force re-runs them anyway).
+    Name run ids to scope it. Each selected run is refreshed IN PLACE, on the analysis.db the atlas
+    records for it: a run whose extraction is already current is only re-graded (no decompiler), and
+    one whose extraction moved is re-scanned into the workspace that run already occupies. Either
+    way the run keeps its recorded analysis.db — a refresh never starts a second workspace for a run
+    that has one. Runs already produced by this commit are left alone (--force re-runs them anyway).
 
     A run whose firmware root was never recorded, or is no longer on disk, CANNOT be rescanned —
     those are listed by name with the reason. They are never dropped from the report: a run that
@@ -1842,8 +1933,9 @@ def rescan(
             todo.append((r, why))
     if force:
         # --force redoes the runs nothing else would offer. They go in the hunt tier because that
-        # is the work: their extraction is already current, so the scan re-grades and does not
-        # decompile — the report says what is about to happen, not merely that something is.
+        # is the work: their extraction is already current, so the run is re-graded in place and
+        # the decompiler never starts — the report says what is about to happen, not merely that
+        # something is.
         for r in current:
             axis_of[r.run_id] = "hunt"
             todo.append((r, "--force"))
@@ -1889,9 +1981,33 @@ def rescan(
     for i, (r, _why) in enumerate(runnable, start=1):
         click.echo(f"\n=== [{i}/{len(runnable)}] rescanning {r.run_id} ===")
         try:
+            # The classifier already worked out WHICH input moved; this is where that answer is
+            # spent. Running the full scan for every tier alike would hand the decompiler a whole
+            # rootfs for a run whose extraction the classifier just proved current — and the tier
+            # above it promised the opposite in writing.
+            recorded_db = Path(r.analysis_db_path) if r.analysis_db_path else None
+            on_hunt_axis = axis_of.get(r.run_id) == "hunt"
+            if on_hunt_axis and recorded_db is not None and recorded_db.is_file():
+                _rehunt_in_place(r, recorded_db, atlas_path=resolved_atlas, rehunt=force)
+                continue
+            if on_hunt_axis:
+                # Said out loud. The tier line above already promised "fast: the decompiler does
+                # not run", and there are no stored facts to re-grade without a database holding
+                # them — so the promise stops being true here, and reporting it is the difference
+                # between a surprise and a decision.
+                no_facts = (
+                    f"recorded analysis.db is gone: {recorded_db}"
+                    if recorded_db is not None
+                    else "this run recorded no analysis.db"
+                )
+                click.echo(f"  {no_facts} — falling back to a full scan (the decompiler runs)")
             ctx.invoke(
                 scan,
                 fs_root=Path(str(r.firmware_path)),
+                # ★ The workspace the run is RECORDED in, never one derived from the firmware root:
+                # see _recorded_workspace_name. None only when the run recorded no analysis.db at
+                # all, which is the one case with nothing to re-use.
+                workspace=_recorded_workspace_name(r, workspace_dir=cfg.workspace_dir),
                 run_id=r.run_id,
                 atlas_path=resolved_atlas,
                 config=config,
