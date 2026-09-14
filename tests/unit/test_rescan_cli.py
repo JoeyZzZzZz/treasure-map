@@ -19,7 +19,12 @@ import pytest
 from click.testing import CliRunner
 
 from treasure_map.cli import hunt_cli
-from treasure_map.cli.hunt_cli import _recorded_workspace_name, _rescan_reason, rescan
+from treasure_map.cli.hunt_cli import (
+    _recorded_workspace_name,
+    _rescan_reason,
+    rescan,
+    scan,
+)
 from treasure_map.lib.analyze.ghidra_runner import current_pass_version
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import RunRow
@@ -989,3 +994,115 @@ def test_a_file_that_is_not_a_database_fails_one_run_and_is_left_untouched(
         assert junk.read_bytes() == payload, "those bytes may be the only copy of an extraction"
     else:
         assert junk.is_dir() and not any(junk.iterdir()), "nothing may be written into it"
+
+
+# ------------------------------------------------------------------------------------------
+# The stage labels. rescan drives scan with top_n=0 — "refresh, do not read" — and the triage
+# stage is what that suppresses. Both halves of that live here: the stage the run does NOT do,
+# and the denominator that must stop counting it.
+# ------------------------------------------------------------------------------------------
+
+
+def _cache_hit_scan(monkeypatch: pytest.MonkeyPatch, ws_dir: Path, name: str) -> Path:
+    """A workspace whose extraction is already current, with Ghidra discovery faked.
+
+    ★ Both halves are load-bearing for the assertions that follow. Without the fake discovery,
+    ``run_analyze`` fails fast at ``get_headless`` BEFORE any disk work — scan raises, rescan marks
+    the run FAILED, and the stage labels are never printed at all: the test and every mutation of it
+    would pass on output that does not exist. Without a 0-dirty database, ``run_all`` is reached and
+    a test environment has no Ghidra behind the faked path.
+    """
+    from treasure_map.lib.analyze.ghidra_runner import GhidraRunner
+
+    monkeypatch.setenv("TM_WORKSPACE_DIR", str(ws_dir))
+    (ws_dir / name).mkdir(parents=True)
+    db = _seeded_analysis_db(ws_dir / name / "analysis.db").resolve()
+    monkeypatch.setattr(GhidraRunner, "get_headless", lambda self: Path("/nonexistent/headless"))
+    monkeypatch.setattr(GhidraRunner, "ghidra_version", lambda self: "unknown")
+    monkeypatch.setattr(GhidraRunner, "run_all", lambda self, *a, **k: [])
+    return db
+
+
+def test_a_rescan_reports_two_stages_and_renders_no_triage_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ rescan refreshes; it does not read. So it runs TWO stages, and says two.
+
+    scan is invoked with ``top_n=0``, which used to cap the triage table at zero rows while the
+    renderer printed its header, lens and caveats regardless — "showing top 0 of N" under a line
+    counting thousands of candidates, from a command whose lens rule promises never to reduce what
+    reaches the first screen. Nothing was lost (the N proves the corpus and the ordering are intact)
+    and nothing was shown either; the stage was pure cost, a full ranking computed to display none
+    of it.
+
+    Suppressing the stage without moving the denominator would swap one contradiction for another:
+    "[1/3] … [2/3] …" and then no third stage reads as a step that crashed. So the label counts the
+    stages this invocation actually performs.
+
+    ★ EVERY assertion anchors text that carries its STAGE WORD, never a bare "[k/N]". rescan's own
+    loop header is "=== [i/N] rescanning <run> ===", so a bare "[1/2]" would be satisfied by the
+    header of a two-run refresh and contradicted by a three-run one — a guard whose teeth depend on
+    how many runs the fixture happens to hold. The fixture also pins EXACTLY ONE refreshable run,
+    which degenerates that header to "[1/1]" and keeps the two numbering schemes apart.
+
+    MUTATION: make ``show_triage`` unconditionally True (restoring the defect) -> RED. Measured: the
+    "[2/2] hunting" assertion fails (it becomes "[2/3] hunting"), and "[3/3] triage",
+    "[1/3] analyzing" and "showing top 0" all appear.
+    """
+    fw = tmp_path / "cpio-root"
+    fw.mkdir()
+    ws_dir = tmp_path / "workspaces"
+    db_file = _cache_hit_scan(monkeypatch, ws_dir, "my_device")
+    monkeypatch.setattr(hunt_cli, "installed_commit", lambda: COMMIT)
+    atlas = _atlas_with(
+        tmp_path,
+        [
+            {
+                "run_id": "device_run",
+                "scan_status": "complete",
+                "firmware_path": str(fw),
+                "analysis_db_path": str(db_file),
+                "build_hash": current_pass_version(),
+                "hunt_commit": OTHER,
+                "hunt_instances": 0,
+            }
+        ],
+    )
+    out = CliRunner().invoke(rescan, ["--atlas", str(atlas)])
+    assert out.exit_code == 0, out.output
+    # The stages this invocation performs, counted as two.
+    assert "[1/2] analyzing" in out.output, out.output
+    assert "[2/2] hunting" in out.output, out.output
+    # ...and no third stage, under either numbering.
+    assert "[1/3] analyzing" not in out.output, out.output
+    assert "[3/3] triage" not in out.output, out.output
+    assert "showing top 0" not in out.output, out.output
+    # The refresh still reports, and still points at the command that DOES read.
+    assert "rescanned" in out.output
+    assert "`tmap triage" in out.output
+
+
+def test_a_direct_scan_still_reports_three_stages_and_keeps_its_triage_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The suppression belongs to the caller that asked for a refresh, not to scan.
+
+    Someone running `tmap scan` wants the candidates when it finishes — that trailing list is the
+    point of the one-shot path. Pinned separately because the change lives inside scan, where it
+    would be equally easy to remove the stage for everyone.
+
+    MUTATION: set ``show_triage = False`` unconditionally -> RED (no triage stage, and the analyze
+    label counts to 2).
+    """
+    fw = tmp_path / "cpio-root"
+    fw.mkdir()
+    ws_dir = tmp_path / "workspaces"
+    _cache_hit_scan(monkeypatch, ws_dir, "my_device")
+    out = CliRunner().invoke(
+        scan, [str(fw), "-w", "my_device", "--atlas", str(tmp_path / "atlas.db")]
+    )
+    assert out.exit_code == 0, out.output
+    assert "[1/3] analyzing" in out.output, out.output
+    assert "[2/3] hunting" in out.output, out.output
+    assert "[3/3] triage" in out.output, out.output
+    assert "[1/2] analyzing" not in out.output, out.output

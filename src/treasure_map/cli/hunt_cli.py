@@ -1415,8 +1415,22 @@ def scan(
         "(replace-by-run); keep one run-id per device+firmware version"
     )
 
-    # [1/3] analyze — reuse the analyze command's resolve_workspace + Workspace + asyncio.run path.
-    click.echo("\n[1/3] analyzing firmware (Ghidra) …")
+    # rescan invokes scan with top_n=0 to refresh WITHOUT reading — the candidate list is a separate
+    # act (`tmap triage <run>`), so a multi-run refresh is neither buried under six triage tables
+    # nor contradicted by a "showing top 0 of N" summary (the renderer's header, lens and caveats
+    # print regardless of the cap, so a 0 cap left an empty table under a line counting thousands).
+    #
+    # This 0 is a MAGIC-VALUE OVERLOAD, not an internal-only value: --top carries no IntRange, so a
+    # user can type `tmap scan --top 0` and land here too, and they get no triage stage rather than
+    # an empty one. Acceptable — that input only ever rendered an empty list.
+    #
+    # ★ Computed ONCE. The stage denominator and the skip are two statements of one fact, and
+    # deriving them separately is how a label comes to say "of 3" over a run that does 2.
+    show_triage = top_n != 0
+    total_stages = 3 if show_triage else 2
+
+    # Stage 1 — analyze: reuse the analyze command's resolve_workspace + Workspace + asyncio.run.
+    click.echo(f"\n[1/{total_stages}] analyzing firmware (Ghidra) …")
     from treasure_map.lib.analyze.pipeline import run_analyze
 
     try:
@@ -1447,8 +1461,10 @@ def scan(
     _report_timeout_skips(result.timeout_skipped)
     _warn_incomplete(result.incomplete_binaries)
 
-    # [2/3] hunt call-sequence shapes -> atlas.
-    click.echo(f"\n[2/3] hunting call-sequence shapes → atlas (run-id={effective_run_id}) …")
+    # Stage 2 — hunt call-sequence shapes -> atlas.
+    click.echo(
+        f"\n[2/{total_stages}] hunting call-sequence shapes → atlas (run-id={effective_run_id}) …"
+    )
     try:
         h = run_analyzer2(
             result.db_path,
@@ -1505,24 +1521,29 @@ def scan(
 
     write_last_run(result.db_path, resolved_atlas, effective_run_id)
 
-    # [3/3] triage — the readable, ranked candidate list (same renderer as `tmap triage`).
-    click.echo("\n[3/3] triage — ranked candidates for manual review:\n")
-    conn = open_atlas(resolved_atlas)
-    try:
-        candidates = run_triage(conn, run_id=effective_run_id)
-    finally:
-        conn.close()
-    _render_triage(
-        candidates,
-        run_label=effective_run_id,
-        lens_label=DEFAULT_LENS_LABEL,
-        caveats=PHASE1_CAVEATS,
-        top_n=_effective_top(top_n, show_all=show_all, sink=sink),
-        status=status,
-        sink=sink,
-        include_gated=include_gated,
-        as_json=as_json,
-    )
+    if show_triage:
+        # [3/3] triage — the readable, ranked candidate list (same renderer as `tmap triage`).
+        # The denominator is literal 3 because this is the only way in: reaching here IS what makes
+        # the total 3. The whole stage is inside the condition, the ranking included — capping the
+        # render at 0 rows still sorted every candidate in the run first, which is a full sort
+        # computed so that none of it could be shown.
+        click.echo("\n[3/3] triage — ranked candidates for manual review:\n")
+        conn = open_atlas(resolved_atlas)
+        try:
+            candidates = run_triage(conn, run_id=effective_run_id)
+        finally:
+            conn.close()
+        _render_triage(
+            candidates,
+            run_label=effective_run_id,
+            lens_label=DEFAULT_LENS_LABEL,
+            caveats=PHASE1_CAVEATS,
+            top_n=_effective_top(top_n, show_all=show_all, sink=sink),
+            status=status,
+            sink=sink,
+            include_gated=include_gated,
+            as_json=as_json,
+        )
 
 
 def _rescan_reason(
