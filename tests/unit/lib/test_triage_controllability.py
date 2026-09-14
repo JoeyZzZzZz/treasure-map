@@ -30,8 +30,10 @@ from treasure_map.lib.atlas.writer import (
     add_web_form_field_rows,
     upsert_pattern,
 )
+from treasure_map.lib.hunt import exec_edges
+from treasure_map.lib.pattern import classes
 from treasure_map.lib.query import sort_candidates, triage
-from treasure_map.lib.query.triage import _scoped_records
+from treasure_map.lib.query.triage import _MULTI_ARG_COMMAND_SINKS, _scoped_records
 
 _FID = [0]
 
@@ -1238,26 +1240,65 @@ def test_constant_still_asserted_when_the_anchored_sink_is_present(tmp_path: Pat
         conn.close()
 
 
-def test_variadic_iron_law_is_untouched_by_the_gate(tmp_path: Path) -> None:
+@pytest.mark.parametrize("sink", sorted(exec_edges.EXEC_SINKS))
+def test_variadic_iron_law_is_untouched_by_the_gate(sink: str, tmp_path: Path) -> None:
     # G4 — the two completeness rules are at different levels and must both keep working. Here the
     # anchor IS present (the gate passes), and the RECORD-level rule still refuses to call a
     # variadic exec constant on the strength of arg0 alone.
+    #
+    # ★ Parametrized over EVERY exec sink, not just one. Pinned to `execl` alone, this passed while
+    # `execve` was missing from _MULTI_ARG_COMMAND_SINKS — the whole false negative sat outside the
+    # one case the test happened to name. The family is the property; a single member is an example.
     #
     # MUTATION (verified RED, 1 failed): in triage._record_class drop the variadic downgrade —
     # delete `if cls == "const" and rec.get("sink") in _MULTI_ARG_COMMAND_SINKS: return "unknown"`
     # -> this candidate reads ('proven', 'constant').
     conn = open_atlas(tmp_path / "atlas.db")
     try:
-        pid = _pattern(conn, "fp_g4")
+        pid = _pattern(conn, f"fp_g4_{sink}")
         ref = _inst(
             conn,
             pid,
-            sink_anchor="execl",
-            flow_evidence={"sink_arg_provenance": [_const_record("execl", "/bin/sh")]},
+            sink_anchor=sink,
+            flow_evidence={"sink_arg_provenance": [_const_record(sink, "/bin/sh")]},
         )
         assert _dim_of(conn, ref) != ("proven", "constant")
     finally:
         conn.close()
+
+
+def test_the_multi_arg_set_is_exactly_the_exec_family() -> None:
+    """★ The set is a hand-kept literal, so something independent has to say what belongs in it.
+
+    ``exec_edges.EXEC_SINKS`` is that something: maintained on the hunt side, for its own reasons,
+    and never imported by triage.py — so the two can disagree, which is the only way this can fail.
+    Deriving the literal FROM EXEC_SINKS would make every assertion below compare a value with
+    itself and the guard would be incapable of going red.
+
+    Three separate claims, because they fail for different reasons:
+      A. every exec sink is covered — the `execve` false negative this file exists for;
+      B. nothing outside CMD is listed — `execvpe` sat here for a set it is not a member of, so its
+         presence could never reach a candidate and only made the gap look handled;
+      C. the two sets are EQUAL — the membership lock. A and B both pass for `doSystem` (it IS in
+         CMD), so C is the only assertion that catches it being folded in here. doSystem is the same
+         kind of false negative reached through a different exit and is fixed separately; if it is
+         ever meant to join this set, this line and the G4 anchor move together, deliberately.
+
+    MUTATION: drop `execve` from the literal -> RED (A and C). Add `execvpe` back -> RED (B and C).
+    Add `doSystem` -> RED (C only). Measured: 2, 2 and 1 failed respectively.
+    """
+    assert exec_edges.EXEC_SINKS <= _MULTI_ARG_COMMAND_SINKS, (
+        f"exec sinks missing from the multi-arg set: "
+        f"{sorted(exec_edges.EXEC_SINKS - _MULTI_ARG_COMMAND_SINKS)}"
+    )
+    assert _MULTI_ARG_COMMAND_SINKS <= classes.CMD, (
+        f"listed here but not a command sink at all, so never consulted: "
+        f"{sorted(_MULTI_ARG_COMMAND_SINKS - classes.CMD)}"
+    )
+    assert _MULTI_ARG_COMMAND_SINKS == exec_edges.EXEC_SINKS, (
+        f"drift: missing={sorted(exec_edges.EXEC_SINKS - _MULTI_ARG_COMMAND_SINKS)}, "
+        f"extra={sorted(_MULTI_ARG_COMMAND_SINKS - exec_edges.EXEC_SINKS)}"
+    )
 
 
 def test_a_sink_class_def_use_does_not_cover_is_never_read_as_an_escape() -> None:

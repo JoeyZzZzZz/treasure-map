@@ -425,8 +425,27 @@ def _writer_args_class(conn: sqlite3.Connection, fmt: Any, varargs: Any) -> str:
 # on a partial (arg0-only) view (the demotion iron law: a variadic exec seen only at arg0 ->
 # unknown, never constant — the agent's blood-earned counter-example). system/popen take the whole
 # command in one arg, so they are NOT here — a single constant record legitimately proves them.
+# ``execve`` belongs here: the command it runs is in argv, not arg0. Reading arg0 alone and calling
+# the command constant is a false negative — real firmware has execve("/bin/sh", __argv, envp) with
+# a constant arg0 and an argv nobody proved anything about.
+#
+# ``execvpe`` removed. It is NOT in ``classes.CMD``, and this set is only consulted once a candidate
+# is already a CMD member judged const (see _record_class below) — so its membership here could
+# never reach a real candidate. It was false coverage: it made "execvpe is handled" look true while
+# the actual gap is upstream, in CMD not recognizing it as a sink at all. Removing it deletes the
+# illusion, NOT the gap — execvpe is a real glibc function and a future firmware may well call it.
+# That recall gap is registered for the CMD/registry decision rather than left to vanish with this
+# edit (an unrecorded deletion of coverage is itself a silent drop).
+#
+# ``doSystem`` is the same KIND of false negative but not the same mechanism: it is printf-style
+# variadic and leaves through the marker exit (blocking_mechanism=const_sink_arg), not this def-use
+# one. It is fixed separately and must not be folded in here.
+#
+# A literal set on purpose. Deriving it from CMD or from hunt's EXEC_SINKS would make the test that
+# guards it compare a value against itself, and lib/query must not import lib/hunt (the read layer
+# does not depend on the write layer).
 _MULTI_ARG_COMMAND_SINKS: frozenset[str] = frozenset(
-    {"execl", "execlp", "execle", "execv", "execvp", "execvpe"}
+    {"execl", "execle", "execlp", "execv", "execve", "execvp"}
 )
 
 
