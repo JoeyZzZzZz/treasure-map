@@ -71,7 +71,11 @@ CREATE TABLE IF NOT EXISTS functions (
     callees_truncated INTEGER DEFAULT 0,    -- 1 = callee list hit the extractor cap (a wide dispatcher):
                                             --   the list is a prefix, so get_callees / reverse-caller
                                             --   synthesis must not read it as the complete call graph
-    is_exported     INTEGER DEFAULT 0,      -- 1 = 导出符号
+    -- 1 = this function's name is a DEFINED function symbol in the binary's dynamic symbol table,
+    -- read from the DYNAMIC segment at ingest (see analyze/elf_exports.py). An UPPER BOUND on the
+    -- exports: hidden / local-binding symbols are not excluded. 0 also covers "could not be
+    -- determined" (unreadable ELF, no dynamic segment) — it is never a proof of non-export.
+    is_exported     INTEGER DEFAULT 0,
     -- sink_arg_provenance: Ghidra def-use fact per command/format sink in this function (JSON array,
     -- one record per sink; see ExportFunctions.buildSinkProvenance / the provenance design). TRANSPORT column:
     -- analysis.db is wipe-and-rebuild, so this rides with the function here and is merged into the

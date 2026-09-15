@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from treasure_map.lib.analyze.elf_exports import dynamic_function_exports
 from treasure_map.lib.analyze.elf_inventory import ElfRecord
 from treasure_map.lib.analyze.stub_resolve import StubResolution, relabel_callees, resolve_stubs
 
@@ -104,7 +105,13 @@ def ingest_ghidra_output(
         # caller left calling FUN_<stub-addr> is seen calling `system` — recovering a real sink the
         # decompiler dropped. Ghidra-independent; None for a non-MIPS or unreadable ELF (no change).
         resolution = resolve_stubs(rec.path)
-        _ingest_one_binary(conn, binary_id, data, stats, resolution)
+        # Which functions this binary EXPORTS, read from its dynamic symbol table. It is read from
+        # the ELF here rather than taken from the decompiler because the decompiler's flag answers
+        # a symbol-namespace question, not an ELF-export one — it measured as a constant 0 across
+        # every function of every real firmware scanned. None means "could not be determined",
+        # which stays distinct from "exports nothing".
+        exports = dynamic_function_exports(rec.path)
+        _ingest_one_binary(conn, binary_id, data, stats, resolution, exports)
         stats.binaries_processed += 1
 
     conn.commit()
@@ -123,12 +130,26 @@ def ingest_ghidra_output(
     return stats
 
 
+def _exported_flag(func_name: Any, exports: frozenset[str] | None) -> int:
+    """1 only when this function's name is a defined dynamic function export of its binary.
+
+    ``exports`` is None when the ELF's export set could not be read at all, which yields 0 — "not
+    shown to be exported", never a proof of non-export (see analyze/elf_exports.py). The join is by
+    NAME, because an ARM Thumb symbol's address carries the Thumb bit in bit 0 and would not match
+    the even entry address the decompiler reports for the same function.
+    """
+    if exports is None or not isinstance(func_name, str):
+        return 0
+    return 1 if func_name in exports else 0
+
+
 def _ingest_one_binary(
     conn: sqlite3.Connection,
     binary_id: int,
     data: dict[str, Any],
     stats: IngestStats,
     resolution: StubResolution | None = None,
+    exports: frozenset[str] | None = None,
 ) -> None:
     """Replace this binary's rows in functions/imports/exports/strings."""
 
@@ -176,7 +197,7 @@ def _ingest_one_binary(
                 # honest callee-graph truncation flag: 1 = the callee list is a prefix (cap hit), so
                 # consumers never read a clipped dispatcher's callees/callers as the complete graph.
                 1 if func.get("callees_truncated") else 0,
-                int(func.get("is_exported", 0)),
+                _exported_flag(func.get("name"), exports),
                 # sink_arg_provenance transport: the Ghidra-computed def-use fact for this
                 # function's command/format sinks, carried verbatim to be merged into the atlas
                 # instance's flow_evidence at hunt time. Missing/old exports -> '[]' (never null).

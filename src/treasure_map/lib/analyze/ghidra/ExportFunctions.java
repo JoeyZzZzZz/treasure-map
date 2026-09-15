@@ -2016,7 +2016,10 @@ public class ExportFunctions extends GhidraScript {
             String funcName  = func.getName();
             String funcAddr  = func.getEntryPoint().toString();
             long   funcSize  = func.getBody().getNumAddresses();
-            int    isExported = func.isGlobal() ? 1 : 0;
+            // NOTE: this export deliberately carries no is_exported flag. Whether a function is an
+            // ELF export is read from the binary's dynamic symbol table at ingest time (see
+            // analyze/elf_exports.py). isGlobal() answers a SYMBOL NAMESPACE question instead,
+            // which is not the same fact and measured as a constant 0 on every firmware scanned.
 
             // Skip micro-functions (< 10 bytes): trampolines, alignment stubs, etc.
             // Not worth decompiling; they carry no logic and slow down the batch.
@@ -2176,7 +2179,6 @@ public class ExportFunctions extends GhidraScript {
                      .append("\"name\":")        .append("\"").append(esc(funcName))  .append("\",")
                      .append("\"address\":")     .append("\"").append(esc(funcAddr))  .append("\",")
                      .append("\"size\":")        .append(funcSize).append(",")
-                     .append("\"is_exported\":") .append(isExported).append(",")
                      .append("\"callees\":")     .append(calleesArr).append(",")
                      .append("\"callees_truncated\":").append(calleesTruncated).append(",")
                      .append("\"sink_provenance\":").append(sinkProv).append(",")

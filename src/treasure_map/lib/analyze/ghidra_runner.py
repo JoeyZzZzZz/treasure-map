@@ -94,7 +94,7 @@ _GHIDRA_RELEASES_URL = "https://github.com/NationalSecurityAgency/ghidra/release
 # hours-long Ghidra re-extraction. The criterion is "its output is written into the functions cache
 # inside the dirty loop", and ``test_pass_version.py`` locks this set against that criterion
 # mechanically, so a future extraction step cannot be added and silently left out.
-_PIPELINE_PY_MODULES: tuple[str, ...] = ("ghidra_ingest.py", "stub_resolve.py")
+_PIPELINE_PY_MODULES: tuple[str, ...] = ("elf_exports.py", "ghidra_ingest.py", "stub_resolve.py")
 
 
 def pass_version_source_files(script_dir: Path) -> list[Path]:
@@ -114,7 +114,8 @@ def pass_version_source_files(script_dir: Path) -> list[Path]:
 
 def compute_pass_version(script_dir: Path) -> str:
     """Content hash of the per-binary extraction PIPELINE — the .java Ghidra pass AND the declared
-    Python load/relabel steps (``ghidra_ingest`` + ``stub_resolve``) that write the functions cache.
+    Python load/relabel steps (``ghidra_ingest`` + ``stub_resolve`` + ``elf_exports``) that write
+    the functions cache.
 
     This is a cache-key dimension: the per-binary output depends on the pipeline logic as much as on
     the binary bytes, so editing ANY step that changes what gets stored — the Java extraction OR the
