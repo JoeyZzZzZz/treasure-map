@@ -307,6 +307,26 @@ def all_format_calls_literal(pseudocode: str, sink_name: str) -> bool:
     return all(a is not None and bool(_FMT_LITERAL_RE.match(a)) for a in fmt_args)
 
 
+def format_call_is_risky(pseudocode: str, sink_name: str, occurrence: int) -> bool:
+    """True when the ``occurrence``-th call to ``sink_name`` passes a NON-literal format argument.
+
+    The per-CALL form of ``all_format_calls_literal``. That one answers about the whole function
+    (exempt only when EVERY call is literal), which is the right question for "does this function
+    hold a candidate" and the wrong one for "is THIS call the risky one" — a function logging a
+    fixed format ten times and a constructed one once is not ten candidates, and it is not one
+    candidate that could be any of the eleven calls either.
+
+    Same prove-safe-to-exempt direction as the function-level test: a call whose format position
+    cannot be read counts as RISKY, never as exempt. An occurrence that is not there is not a call
+    and so is not a candidate.
+    """
+    args = _iter_format_args(pseudocode, sink_name)
+    if occurrence < 0 or occurrence >= len(args):
+        return False
+    arg = args[occurrence]
+    return arg is None or not bool(_FMT_LITERAL_RE.match(arg))
+
+
 def format_string_ident(pseudocode: str, sink_name: str) -> str | None:
     """Leading identifier of the FIRST non-literal format argument of ``sink_name`` (the danger
     axis), or None when every call's format argument is a literal / unreadable."""

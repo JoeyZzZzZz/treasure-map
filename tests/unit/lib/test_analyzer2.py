@@ -2697,8 +2697,10 @@ def test_fmt_wrapper_unknown_source_is_demoted_and_counted_not_dropped(tmp_path:
 
 
 def test_fmt_wrapper_itself_kept_as_distinct_candidate(tmp_path: Path) -> None:
-    # No double counting: the wrapper is its own direct fmt candidate (@fmt_string); the caller is
-    # the wrapper-recovered candidate (@fmt_via_wrapper). Two distinct, uniquely-referenced rows.
+    # No double counting: the wrapper is its own direct fmt candidate (@fmt_string#0 — the format
+    # axis is read per CALLSITE, so its ref carries the callsite ordinal); the caller is the
+    # wrapper-recovered candidate (@fmt_via_wrapper, a function-level axis, so no ordinal). Two
+    # distinct, uniquely-referenced rows.
     db = _make_db(
         tmp_path,
         [{"name": "netd", "funcs": [_thin_fmt_wrapper_fn(), _free_via_fmt_wrapper_fn()]}],
@@ -2706,7 +2708,7 @@ def test_fmt_wrapper_itself_kept_as_distinct_candidate(tmp_path: Path) -> None:
     atlas = tmp_path / "atlas.db"
     run_analyzer2(db, atlas, source_run_id="run_fmt2")
     rows = _by_anchor(atlas, "fmt_string")
-    assert rows["log_msg"]["evidence_ref"].endswith("@fmt_string")
+    assert rows["log_msg"]["evidence_ref"].endswith("@fmt_string#0")
     assert rows["handle_req"]["evidence_ref"].endswith("@fmt_via_wrapper")
     refs = [r["evidence_ref"] for r in _instances(atlas)]
     assert len(set(refs)) == len(refs)  # unique
@@ -2865,6 +2867,37 @@ def test_path_sink_writer_is_honestly_not_traced(tmp_path: Path) -> None:
     run_analyzer2(db, atlas, source_run_id="r")
     writer = _cand_of(atlas, "p_free").dim("writer")
     assert writer.value == "not_traced" and writer.state == "unknown"
+
+
+def test_each_path_callsite_reaches_the_atlas_with_its_own_callee(tmp_path: Path) -> None:
+    """★ THE WIRING, not the detector. Each path candidate must reach the atlas anchored at the
+    callee of ITS OWN callsite.
+
+    A detector-level test cannot see this. The detector can be perfectly per-callsite while the
+    writer re-derives the sink from the callee LIST, which hands every row of the function one
+    alphabetically-chosen name. The refs would still look right — the ordinal comes from the
+    callsite index, not from the callee — so ``sink_anchor`` is the only field that shows it, and
+    that is what this asserts.
+
+    The fixture makes the two rules DIVERGE: unlink is called first, fopen sorts first. Re-deriving
+    gives both rows "fopen"; reading the detector's evidence gives unlink then fopen.
+
+    MUTATION (measured: 1 failed of 111, this test alone): drop "path_sink" from the
+    evidence-anchored tuple in analyzer2, so sink_name falls back to _sink_name_for(callees, ...)
+    -> both rows read "fopen". Nothing else in the file noticed — which is why this guard is here
+    and not left to the detector-level tests."""
+    fn = {
+        "name": "fs_op",
+        "pseudocode": 'void fs_op(char *a, char *b){ unlink(a); fopen(b, "r"); }',
+        "hash": "h_fs_op",
+        "callees": ["unlink", "fopen"],
+    }
+    db = _make_db(tmp_path, [{"name": "svcd", "funcs": [fn]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="r")
+    rows = _instances_of(atlas, "path_sink")
+    assert [r["sink_anchor"] for r in rows] == ["unlink", "fopen"]
+    assert len({r["evidence_ref"] for r in rows}) == 2  # distinct refs, one per callsite
 
 
 def test_path_sink_impact_is_high_and_filterable(tmp_path: Path) -> None:

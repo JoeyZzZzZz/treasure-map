@@ -326,10 +326,25 @@ def test_path_sink_with_source_labels_external_input(tmp_path: Path) -> None:
     assert m.call_sequence_shape == "source->path_sink"
 
 
-def test_path_sink_anchor_is_deterministic(tmp_path: Path) -> None:
-    # Several path sinks in one function -> anchor to the alphabetically-first (stable evidence).
-    (m,) = _path_match(tmp_path, "fs_op", 'unlink(a); fopen(b, "w");', ["unlink", "fopen"])
-    assert m.evidence == "fopen"  # sorted(cc.path_sink)[0]
+def test_each_path_sink_callsite_gets_its_own_candidate(tmp_path: Path) -> None:
+    """Several path calls in one function are several candidates, each anchored at ITS OWN callee.
+
+    This replaces a guard that pinned the opposite — one candidate per function, anchored at the
+    alphabetically-first callee. Anchoring by sort order meant the row a reader got was not the
+    call they were looking at, and the function's remaining path calls had no row anywhere.
+
+    The fixture makes the two rules DIVERGE rather than agree: source order here is unlink then
+    fopen, while the retired sort order would have put fopen first. A fixture where they coincide
+    would pass under either rule.
+
+    MUTATION (measured: 5 failed): make pattern_path emit one function-level match again (force its
+    callsite list empty) -> this test plus the site-coverage, ordinal-order, which-shapes-are-
+    per-call and fingerprint-sibling guards all go red together."""
+    matches = _path_match(tmp_path, "fs_op", 'unlink(a); fopen(b, "w");', ["unlink", "fopen"])
+    assert [(m.sink_callsite_index, m.evidence, m.sink_callsite_occurrence) for m in matches] == [
+        (0, "unlink", 0),
+        (1, "fopen", 0),
+    ]
 
 
 def test_path_helpers_literal_ident_and_position() -> None:
@@ -761,14 +776,21 @@ def test_per_callsite_siblings_share_one_fingerprint_and_one_scanned_function(
     assert shape_scan_invariant_holds(res.stats)
 
 
-def test_function_level_shapes_still_yield_at_most_one(tmp_path: Path) -> None:
-    """The list contract did not turn the other four shapes into per-callsite ones.
+def test_the_command_shapes_are_the_ones_that_stay_function_level(tmp_path: Path) -> None:
+    """Which shapes are per-callsite and which are per-function, pinned as one statement.
 
-    They are about the function, and two system() calls in one function are one candidate exactly as
-    before. Stated as a test because "detectors return lists now" is the kind of change that quietly
-    generalizes to shapes it was never meant to touch.
+    The write-length shapes (copy, format), the format argument (fmt_string) and the path argument
+    (path_sink) all belong to a CALL, and each emits one candidate per callsite. The command shapes
+    are the ones still about the FUNCTION: their evidence is a constructed shell literal that the
+    function builds, not a property of one call, so two system() calls here remain one candidate.
 
-    MUTATION (must go RED): make any of the four emit per call."""
+    This test said the opposite until path_sink and fmt_string moved: it pinned all four non-copy
+    shapes as function-level. That is why it is phrased as "which side is each shape on" rather than
+    "the others are function-level" — the sentence has to keep meaning something when a shape moves.
+
+    MUTATION (measured: 5 failed, this among them): revert pattern_path to one match per function
+    -> path_sink reads 1 here instead of 2. Making a command shape emit per call is the same
+    assertion read from its other side."""
     tmp_path.mkdir(parents=True, exist_ok=True)
     db = _make_db(
         tmp_path,
@@ -792,7 +814,9 @@ def test_function_level_shapes_still_yield_at_most_one(tmp_path: Path) -> None:
     per_class = {}
     for m in res.matches:
         per_class[m.sink_class] = per_class.get(m.sink_class, 0) + 1
-    assert per_class == {"cmd": 1, "fmt_string": 1, "path_sink": 1}
+    # Two system() calls -> ONE cmd candidate (the function-level shape). Two non-literal printf
+    # calls -> two fmt_string candidates; two fopen calls -> two path_sink candidates.
+    assert per_class == {"cmd": 1, "fmt_string": 2, "path_sink": 2}
 
 
 # ── a buffer formatter writing into a destination is a candidate per CALLSITE ─────────
@@ -920,3 +944,140 @@ def test_a_formatter_building_a_shell_command_is_still_a_command_candidate(
     )
     by_class = {m.sink_class for m in scan(db).matches}
     assert by_class == {"cmd", "format"}
+
+
+# ── a path sink is a candidate per CALLSITE ──────────────────────────────────────────
+#
+# The axis a path sink is read on is its PATH ARGUMENT, which belongs to the call. One row per
+# function was anchored at whichever callee sorted first, so a constant path could stand in for a
+# controllable one in the same function — and take the demotion a hard-coded path earns with it.
+
+_VISIBLE_PATH_CALL = re.compile(rf"\b(?:{'|'.join(sorted(PATH_SINK))})\s*\(")
+
+
+def test_path_candidate_count_equals_the_visible_callsites(tmp_path: Path) -> None:
+    """Site coverage: as many candidates as there are path calls to see, no more, no fewer.
+
+    Counted with this test's own matcher over the same text, so the check is not the enumerator
+    agreeing with itself. The vocabulary comes from the shared PATH_SINK set — a test carrying its
+    own copy of the callee names would go stale the day one is added.
+
+    MUTATION (measured: 5 failed, this among them): emit once per function instead of per call.
+    The "repeat" body below holds three calls to two names, so emitting per callee NAME fails it
+    too — which a body with one call per name could not tell apart."""
+    bodies = {
+        "one": 'fopen(p, "r");',
+        "mixed": 'fopen(p, "r"); unlink(q); mkdir(d); rename(a, b);',
+        "repeat": 'fopen(a, "r"); unlink(b); fopen(c, "w");',
+    }
+    for label, body in bodies.items():
+        matches = _path_match(tmp_path / label, "fs", body, sorted(PATH_SINK))
+        assert len(matches) == len(_VISIBLE_PATH_CALL.findall(body)), label
+
+
+def test_path_callsite_ordinals_run_in_source_order_across_callee_names(tmp_path: Path) -> None:
+    """The two ordinals are different numbers and each says what it says.
+
+    ``sink_callsite_index`` orders every path call in the function across callee names, so it names
+    a callsite the same way on every re-scan. ``sink_callsite_occurrence`` counts within ONE callee,
+    which is the number a per-call argument reader indexes with — hand it the index instead and the
+    third call below (index 2, but only the SECOND fopen) reads a call that is not there.
+
+    MUTATION (measured: 5 failed, this among them): force pattern_path back to a function-level
+    match -> no ordinals at all. Ordering the sites by callee name, or setting occurrence = index,
+    breaks the same assertion on its other axis."""
+    matches = _path_match(
+        tmp_path / "ord", "fs", 'fopen(a, "r"); unlink(b); fopen(c, "w");', ["fopen", "unlink"]
+    )
+    assert [(m.sink_callsite_index, m.evidence, m.sink_callsite_occurrence) for m in matches] == [
+        (0, "fopen", 0),
+        (1, "unlink", 0),
+        (2, "fopen", 1),
+    ]
+
+
+def test_path_callee_never_spelled_out_still_yields_one_candidate(tmp_path: Path) -> None:
+    """The recall floor: a callee the body never writes as a call is still a candidate.
+
+    Enumerating callsites yields nothing here, and a detector that emitted per callsite and stopped
+    would have traded the split for a silent recall loss. Such a candidate carries NO callsite
+    ordinal — calling it "callsite 0" would claim a call nobody located.
+
+    MUTATION (measured: 1 failed, this test alone): ``return []`` when the enumerator finds no
+    site -> the candidate disappears and nothing else in the file notices, which is the point."""
+    matches = _path_match(tmp_path / "ptr", "fs", "code *p; p = fopen; (*p)(x);", ["fopen"])
+    assert len(matches) == 1
+    assert matches[0].sink_callsite_index is None
+    assert matches[0].sink_callsite_occurrence is None
+    assert matches[0].evidence == "fopen"
+
+
+# ── a format-string sink is a candidate per RISKY CALLSITE ───────────────────────────
+
+
+def test_only_the_non_literal_format_callsite_is_a_candidate(tmp_path: Path) -> None:
+    """★ The precision gain, and the FP gate surviving it.
+
+    The literal-format exemption now applies PER CALL. A function that logs a fixed format three
+    times and a constructed one once yields exactly ONE candidate, anchored at the risky call —
+    where before it yielded one candidate anchored at the sink NAME, which told a reader only that
+    somewhere among the four calls one was risky.
+
+    Asserted on the ANCHOR, not on the count: a detector that kept the function-level behaviour also
+    returns one candidate here, and only the ordinal tells the two apart.
+
+    MUTATION (measured: 2 failed): use all_format_calls_literal (the whole-function test) per site
+    instead of format_call_is_risky -> every call of a mixed function becomes a candidate, failing
+    this guard and the older mixed-calls one."""
+    matches = _fmt_match(
+        tmp_path, "log_it", 'printf("a"); printf("b"); printf("c"); printf(user);', ["printf"]
+    )
+    assert len(matches) == 1
+    assert (matches[0].sink_callsite_index, matches[0].sink_callsite_occurrence) == (3, 3)
+
+
+def test_every_format_callsite_literal_is_still_exempt(tmp_path: Path) -> None:
+    """The FP gate: a function whose every format call is a literal yields NOTHING.
+
+    This is the suppression the whole recall rides on — the common syslog/printf must not flood the
+    candidate set — and it must not be weakened by moving the test per call.
+
+    MUTATION (measured: 6 failed): treat a literal format as risky in format_call_is_risky -> this
+    guard, the new per-call one, and four older exemption / mixed-call guards all go red. A
+    suppression that stopped suppressing fails broadly, which is the shape to expect."""
+    assert _fmt_match(tmp_path, "log_it", 'printf("a"); printf("b");', ["printf"]) == []
+
+
+def test_format_string_risky_sink_never_spelled_out_still_yields_one_candidate(
+    tmp_path: Path,
+) -> None:
+    """The recall floor on the format axis, and the reason it is not an exemption.
+
+    ``pcVar1 = syslog;`` and an indirect call: the callee list names the sink, the text holds no
+    ``syslog(``. No callsite can be located, so no per-site candidate can be emitted — but nothing
+    was proven safe either, so the function-level candidate stands, with no ordinal.
+
+    MUTATION (measured: 1 failed, this test alone): ``return []`` when no risky site is located,
+    instead of falling back -> the candidate vanishes with nothing else going red."""
+    matches = _fmt_match(tmp_path, "log_it", "code *p; p = syslog; (*p)(3, x);", ["syslog"])
+    assert len(matches) == 1
+    assert matches[0].sink_callsite_index is None
+    assert matches[0].evidence == "syslog"
+
+
+def test_path_and_format_siblings_share_one_fingerprint(tmp_path: Path) -> None:
+    """More candidates, same SHAPE — so the recurrence ledgers read the same after the split.
+
+    The fingerprint basis excludes the callsite anchor, so per-callsite siblings fold into one
+    pattern row. This is what keeps breadth / device-spread accounting from being re-baselined by a
+    change that only splits rows apart, and it is the same property the copy split relies on.
+
+    MUTATION (measured: 2 failed): add the callsite ordinal to the fingerprint basis -> this guard
+    and the copy-sibling one both go red, i.e. the split would have re-baselined the ledgers."""
+    body = 'fopen(a,"r"); fopen(b,"w"); fopen(c,"a");'
+    paths = _path_match(tmp_path / "p", "fs", body, ["fopen"])
+    assert len(paths) == 3
+    assert len({m.structural_fingerprint for m in paths}) == 1
+    fmts = _fmt_match(tmp_path / "f", "lg", "printf(x); printf(y);", ["printf"])
+    assert len(fmts) == 2
+    assert len({m.structural_fingerprint for m in fmts}) == 1

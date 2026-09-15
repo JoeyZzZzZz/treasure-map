@@ -1229,10 +1229,12 @@ def run_analyzer2(
                     continue
 
                 callees = _parse_callees(row.callees)
-                # Two sink classes have their concrete sink chosen by the DETECTOR and carried in
-                # evidence; anchor to that rather than re-deriving one from the callee list.
-                #   fmt_string — the risky (non-literal) sink, so a literal-exempt sibling (a
-                #                printf("lit") alongside a syslog(buf)) is never anchored.
+                # Every per-CALLSITE shape has its concrete sink chosen by the DETECTOR and carried
+                # in evidence; anchor to THAT rather than re-deriving one from the callee list. Only
+                # the function-level command shapes fall through to the resolver below — for them
+                # the callee list is all there is.
+                #   fmt_string — the risky (non-literal) sink AT THIS CALLSITE, so a literal-exempt
+                #                sibling (a printf("lit") beside a syslog(buf)) is never anchored.
                 #   copy       — the callee AT THIS CANDIDATE'S CALLSITE. Re-deriving would pick
                 #                one name for the whole function and hand a strcpy candidate the
                 #                memcpy that happens to sort first.
@@ -1240,8 +1242,11 @@ def run_analyzer2(
                 #                the length ARGUMENT POSITION differs by callee (snprintf's cap is
                 #                argument 1, strncat's append amount is argument 2), so a candidate
                 #                handed the wrong callee's name reads the wrong argument entirely.
+                #   path_sink  — same again, and for the same reason the position matters: fopen's
+                #                path is argument 0 while openat's is argument 1. Re-deriving would
+                #                give every callsite in the function one alphabetically-chosen name.
                 sink_name: str | None
-                if match.sink_class in ("fmt_string", "copy", "format"):
+                if match.sink_class in ("fmt_string", "copy", "format", "path_sink"):
                     sink_name = match.evidence
                 else:
                     sink_name = _sink_name_for(callees, match.sink_class)

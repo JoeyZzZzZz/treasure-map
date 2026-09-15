@@ -27,6 +27,7 @@ from treasure_map.lib.pattern.classes import (
     PATH_SINK,
     SOURCE,
     all_format_calls_literal,
+    format_call_is_risky,
     sink_callsites,
 )
 from treasure_map.lib.pattern.fingerprint import (
@@ -280,59 +281,107 @@ def pattern_format(func_ref: FuncRef, callees: list[str], pseudocode: str) -> li
 
 
 def pattern_fmtstr(func_ref: FuncRef, callees: list[str], pseudocode: str) -> list[PatternMatch]:
-    """Format-string-injection shape: a logger/printf-family sink with a NON-LITERAL format arg.
+    """Format-string-injection shape: ONE candidate per printf-family CALLSITE whose format
+    argument is NOT a literal.
 
     The literal-format exemption is the FP-suppression that GATES this recall (the overwhelmingly
-    common syslog/printf passes a fixed format string and must not flood the candidate set): a sink
-    is a candidate only when not all of its calls pass a literal format argument — i.e. at least one
-    call's format-string position is a variable / constructed value (a format-string-injection
-    suspect). Source presence is a SCORING signal, not a gate (same as pattern_b): a non-literal
-    format with no recognized in-function source is still listed, just lower. The risky sink is
-    chosen deterministically (sorted) so the evidence anchor is stable.
+    common syslog/printf passes a fixed format string and must not flood the candidate set). It is
+    applied PER CALL, not per function. A function that logs a fixed format ten times and a
+    constructed one once used to yield a single candidate anchored at the sink NAME, which said
+    only "somewhere in here this sink is called riskily" and left a reader to find which of the
+    eleven calls it meant. The risky call now carries its own row and the ten exempt ones carry
+    none.
 
-    Function-level: at most one match, as before."""
+    Source presence is a SCORING signal, not a gate (same as pattern_b): a non-literal format with
+    no recognized in-function source is still listed, just lower.
+
+    A sink that is risky at FUNCTION level but whose calls the body never spells out (``pcVar1 =
+    syslog;`` and an indirect call) yields ONE candidate with no callsite anchor — the same recall
+    floor pattern_b keeps; emitting nothing there would pay for the split with a silent recall
+    loss. A call whose format position cannot be read counts as risky, never as exempt:
+    prove-safe-to-exempt, never prove-dangerous-to-keep."""
     cc = classify(callees)
     if not cc.fmt_string:
         return []
+    shape = "source->fmt_string" if cc.source else "fmt_string"
+    sites = [
+        site
+        for site in sink_callsites(pseudocode, cc.fmt_string)
+        if format_call_is_risky(pseudocode, site.sink_name, site.occurrence)
+    ]
+    if sites:
+        return [
+            _match(
+                func_ref,
+                "fmt_string_shape",
+                _source_class(cc),
+                "fmt_string",
+                shape,
+                site.sink_name,
+                sink_callsite_index=site.index,
+                sink_callsite_occurrence=site.occurrence,
+            )
+            for site in sites
+        ]
+    # No RISKY callsite located. Either every located call is exempt (a fixed format -> no
+    # candidate, the FP gate doing its job), or the sink is risky but its calls are not in the
+    # text — which is the recall floor, not an exemption, so it still yields one function-level
+    # candidate. all_format_calls_literal tells the two apart: it is False when the calls could
+    # not be located at all.
     risky = sorted(s for s in cc.fmt_string if not all_format_calls_literal(pseudocode, s))
     if not risky:
-        return []  # every format-string sink uses a fixed format -> exempt (no candidate)
-    has_src = bool(cc.source)
-    return [
-        _match(
-            func_ref,
-            "fmt_string_shape",
-            _source_class(cc),
-            "fmt_string",
-            "source->fmt_string" if has_src else "fmt_string",
-            risky[0],
-        )
-    ]
+        return []
+    return [_match(func_ref, "fmt_string_shape", _source_class(cc), "fmt_string", shape, risky[0])]
 
 
 def pattern_path(func_ref: FuncRef, callees: list[str], pseudocode: str) -> list[PatternMatch]:
-    """Path/file-sink shape: a path/file sink (fopen/open/unlink/rename/...). Recall net for the
-    whole path-sink class (a controllable path enables traversal / arbitrary file read-write).
+    """Path/file-sink shape: ONE candidate per path-sink CALLSITE (fopen/open/unlink/rename/...).
+
+    Recall net for the whole path-sink class — a controllable path enables traversal / arbitrary
+    file read-write.
+
+    Per callsite, not per function, for the reason pattern_b is: the axis a path sink is read on —
+    its PATH argument — belongs to the CALL. A function that opens a fixed "/etc/…" at one call and
+    a caller-supplied name at the next produced ONE row, anchored at whichever callee name sorted
+    first. So the constant path could stand in for the controllable one, and the demotion a
+    hard-coded path earns would then sink the function's other, unexamined call with it.
 
     Source is a scoring signal, not a gate (same as pattern_b): the path may arrive from a caller,
-    so a bare path sink with no recognized in-function source is still listed. The concrete sink is
-    chosen deterministically (sorted) so the evidence anchor is stable. Controllability of the path
-    argument (constant / free / unknown) is decided downstream on the per-sink PATH argument.
+    so a bare path sink with no recognized in-function source is still listed. Controllability of
+    the path argument (constant / free / unknown) is decided downstream, on the per-sink PATH
+    argument of THIS call.
 
-    Function-level: at most one match, as before."""
+    A function whose body spells out no call to any of its path callees still yields exactly ONE
+    candidate with no callsite anchor — the function-level match it has always produced. Emitting
+    nothing there would pay for the split with a silent recall loss."""
     cc = classify(callees)
     if not cc.path_sink:
         return []
-    has_src = bool(cc.source)
+    shape = "source->path_sink" if cc.source else "path_sink"
+    sites = sink_callsites(pseudocode, cc.path_sink)
+    if not sites:
+        return [
+            _match(
+                func_ref,
+                "path_sink_shape",
+                _source_class(cc),
+                "path_sink",
+                shape,
+                sorted(cc.path_sink)[0],
+            )
+        ]
     return [
         _match(
             func_ref,
             "path_sink_shape",
             _source_class(cc),
             "path_sink",
-            "source->path_sink" if has_src else "path_sink",
-            sorted(cc.path_sink)[0],
+            shape,
+            site.sink_name,
+            sink_callsite_index=site.index,
+            sink_callsite_occurrence=site.occurrence,
         )
+        for site in sites
     ]
 
 
@@ -342,11 +391,12 @@ Detector = Callable[[FuncRef, list[str], str], "list[PatternMatch]"]
 # mutually exclusive on the same function (bare_cmd defers when pattern_a's shell-ish literal is
 # present).
 #
-# HOW MANY candidates a (function, sink class) yields is now the shape's own answer, not a rule of
-# the registry: the function-level shapes yield 0 or 1, while pattern_b and pattern_format yield
-# one per callsite (the write length belongs to the call, not to the function). The old "at most
-# one" held only while every shape was about a function, and reading it as a guarantee is what let
-# a function's second copy call go unrepresented.
+# HOW MANY candidates a (function, sink class) yields is the shape's own answer, not a rule of the
+# registry: pattern_a and bare_cmd are about the FUNCTION and yield 0 or 1, while pattern_b,
+# pattern_format, pattern_fmtstr and pattern_path yield one per CALLSITE — the axis each of them is
+# read on (a write length, a format argument, a path argument) belongs to the CALL. The old "at
+# most one" held only while every shape was about a function, and reading it as a guarantee is what
+# let a function's second copy call go unrepresented.
 DETECTORS: tuple[Detector, ...] = (
     pattern_a,
     bare_cmd,
