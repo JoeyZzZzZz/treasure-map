@@ -588,3 +588,35 @@ def test_downweight_module_is_boundary_clean() -> None:
     text = _DOWNWEIGHT.read_text()
     assert not banned.search(text)
     assert not re.search(r"§|PRD\s", text)
+
+
+# ── a constant command form written as a stub-rendered call ─────────────────────────
+
+
+def test_a_constant_command_named_after_its_stub_is_recognised() -> None:
+    """The const-command downweight locates its call through the shared authority.
+
+    ``system("/sbin/reboot")`` is the highest-frequency command false positive, and on a stripped
+    binary that same call is often rendered ``FUN_<stub-addr>("/sbin/reboot")``. Without a resolved
+    stub table the note does not fire and the candidate keeps its normal rank — the fail-safe
+    direction, a missed downweight rather than a wrong one. With the table it is recognised.
+
+    Asserted through detect_form_signal, the real caller, rather than the private helper: a note
+    that fires in the helper but never reaches the write path would be no downweight at all.
+
+    MUTATION (measured: 1 failed each, this test alone): drop the stub_names forward in
+    detect_form_signal, or in _sink_arg_is_literal -> the second assertion reads None. Both hops
+    were measured separately, which is what says the chain is connected end to end rather than
+    merely present at one end."""
+    pseudo = 'void f(void){ FUN_004125b0("/sbin/reboot"); }'
+    kwargs: dict[str, object] = {
+        "sink_name": "system",
+        "pseudocode": pseudo,
+        "callees": ["system"],
+        "sink_arg": None,
+    }
+    assert detect_form_signal(**kwargs) is None  # type: ignore[arg-type]
+    assert (
+        detect_form_signal(**kwargs, stub_names={0x4125B0: "system"})  # type: ignore[arg-type]
+        == CONST_SINK_ARG
+    )

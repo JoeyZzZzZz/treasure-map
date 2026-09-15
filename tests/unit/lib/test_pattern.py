@@ -26,8 +26,10 @@ from treasure_map.lib.pattern.classes import (
     SOURCE,
     all_format_calls_literal,
     all_path_calls_literal,
+    call_offsets,
     format_string_ident,
     path_arg_ident,
+    sink_callsites,
 )
 from treasure_map.lib.pattern.fingerprint import FINGERPRINT_ALGO_VERSION
 from treasure_map.lib.pattern.models import PatternStats
@@ -1201,3 +1203,129 @@ def test_command_callee_never_spelled_out_still_yields_one_candidate(tmp_path: P
     assert matches[0].sink_callsite_index is None
     assert matches[0].sink_callsite_occurrence is None
     assert matches[0].evidence == "system"
+
+
+# ── the call-location authority, and calls the decompiler named after a stub ─────────
+#
+# On a stripped binary the decompiler routinely renders a libc call as FUN_<stub-addr>(...), so the
+# text holds no `system(` at all. A resolved stub table turns those back into calls to the import,
+# and the authority merges them into the SAME source order as the textual ones — so "the Nth call"
+# means one thing no matter how each call happened to be rendered.
+
+_STUB_BODY = "memcpy(a, b, 4); FUN_004125b0(c); memcpy(d, e, n);"
+
+
+def test_call_offsets_without_a_stub_table_is_unchanged() -> None:
+    """★ The additive property every existing caller depends on.
+
+    Threading a resolution through must not move the answer for callers that have none. With no
+    mapping the stub call below is not a call to anything this function knows about.
+
+    MUTATION (measured: 5 failed): count FUN_<addr> calls even when no table was given -> this
+    guard plus the enumerator's and all three delegate guards go red, because every reader that
+    passes no table starts seeing calls that were never there for it."""
+    offsets = call_offsets(_STUB_BODY, "memcpy")
+    assert len(offsets) == 2
+    assert all(_STUB_BODY[o] == "(" for o in offsets)
+    assert call_offsets(_STUB_BODY, "system") == ()
+
+
+def test_a_stub_rendered_call_joins_in_source_order() -> None:
+    """With the table, the stub call IS a call to the import — and lands where it is written.
+
+    Ordering is the whole point: the stub call sits between the two memcpys, so a merge that
+    appended instead of sorting would put it last and every ordinal after it would shift.
+
+    MUTATION (measured: 1 failed, this test alone): concatenate without sorting -> the merged
+    offsets stop ascending and the stub call is reported last instead of second."""
+    offsets = call_offsets(_STUB_BODY, "system", {0x4125B0: "system"})
+    assert len(offsets) == 1
+    assert offsets[0] == _STUB_BODY.index("FUN_004125b0(") + len("FUN_004125b0")
+    merged = call_offsets(_STUB_BODY, "memcpy", {0x4125B0: "memcpy"})
+    assert len(merged) == 3
+    assert list(merged) == sorted(merged)  # the stub call is second, not appended last
+
+
+def test_a_stub_address_mapping_to_another_import_is_not_this_callee() -> None:
+    """Never fabricate a callsite: a stub that resolves elsewhere is not a call to this name.
+
+    A wrong `system` is a manufactured candidate — the one outcome worse than an unresolved sink —
+    so the address must match THIS name, not merely be present in the table.
+
+    MUTATION (measured: 2 failed): treat any address present in the table as a match -> this guard
+    and the enumerator's both go red, because the stub counts as a system call while the table
+    says it is memcpy."""
+    assert call_offsets(_STUB_BODY, "system", {0x4125B0: "memcpy"}) == ()
+    assert call_offsets(_STUB_BODY, "system", {0x999999: "system"}) == ()  # address not in the text
+
+
+def test_sink_callsites_enumerates_stub_rendered_calls_too() -> None:
+    """The emitter sees them, with both ordinals right across callee names.
+
+    The stub call is the SECOND of three calls but the FIRST (and only) call to system, so index
+    and occurrence must disagree here — a fixture where they coincide could not tell a correct
+    enumerator from one that returns the index for both.
+
+    MUTATION (measured: 1 failed, this test alone): drop the stub_names forward in sink_callsites
+    -> only the two memcpys are enumerated and the recovered sink has no callsite at all."""
+    sites = sink_callsites(_STUB_BODY, {"memcpy", "system"}, {0x4125B0: "system"})
+    assert [(s.index, s.sink_name, s.occurrence) for s in sites] == [
+        (0, "memcpy", 0),
+        (1, "system", 0),
+        (2, "memcpy", 1),
+    ]
+    # ...and with no table the recovered call is simply not there (the pre-change answer).
+    assert [s.sink_name for s in sink_callsites(_STUB_BODY, {"memcpy", "system"})] == [
+        "memcpy",
+        "memcpy",
+    ]
+
+
+def test_a_stub_rendered_path_call_can_only_turn_constant_off() -> None:
+    """★ The prove-safe direction, where an unseen call is the dangerous kind of invisible.
+
+    ``all_path_calls_literal`` marks a path compile-time-constant only when EVERY call passes a
+    literal. A call the reader cannot see is a call it cannot check — so a stub-rendered call
+    carrying a variable path would leave the answer at "constant" and sink a controllable path out
+    of sight. With the table that call is seen, and seeing it can only ever turn constant OFF.
+
+    The fixture makes the two answers DIVERGE rather than agree: literal-only without the table,
+    variable-carrying with it.
+
+    MUTATION (measured: 1 failed, this test alone): drop the stub_names forward in
+    all_path_calls_literal -> the second assertion reads True, i.e. a variable path is reported as
+    a fixed one and the candidate is sunk as provably safe."""
+    body = 'fopen("/etc/svc.conf", "r"); FUN_004125b0(p, "w");'
+    assert all_path_calls_literal(body, "fopen") is True  # only the textual call is visible
+    assert all_path_calls_literal(body, "fopen", {0x4125B0: "fopen"}) is False
+
+
+def test_a_stub_rendered_format_call_is_judged_with_the_others() -> None:
+    """The same for the format-literal exemption, which is the gate the whole recall rides on.
+
+    A function whose only NON-literal format call was rendered as a stub reads "every call is
+    literal" and is exempted — the exemption firing on a call nobody looked at.
+
+    MUTATION (measured: 1 failed, this test alone): drop the stub_names forward in
+    all_format_calls_literal -> the exemption survives a non-literal call, which is the gate
+    firing on a call nobody looked at."""
+    body = 'printf("ready\\n"); FUN_00412560(user);'
+    assert all_format_calls_literal(body, "printf") is True
+    assert all_format_calls_literal(body, "printf", {0x412560: "printf"}) is False
+
+
+def test_the_danger_axis_identifiers_come_from_the_stub_call_too() -> None:
+    """The two ``*_ident`` readers name the value whose controllability matters.
+
+    Without the table they find nothing here (every visible call is literal) and the candidate
+    would carry no identifier to trace; with it they name the variable the stub call passes.
+
+    MUTATION (measured: 1 failed each, this test alone): drop the stub_names forward in
+    format_string_ident, or in path_arg_ident -> that reader returns None while a variable really
+    is reaching the sink. Both were measured separately; each fails only this guard."""
+    fmt_body = 'printf("ready\\n"); FUN_00412560(user);'
+    assert format_string_ident(fmt_body, "printf") is None
+    assert format_string_ident(fmt_body, "printf", {0x412560: "printf"}) == "user"
+    path_body = 'fopen("/etc/svc.conf", "r"); FUN_004125b0(chosen, "w");'
+    assert path_arg_ident(path_body, "fopen") is None
+    assert path_arg_ident(path_body, "fopen", {0x4125B0: "fopen"}) == "chosen"

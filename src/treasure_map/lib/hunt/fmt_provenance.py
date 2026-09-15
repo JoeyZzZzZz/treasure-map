@@ -33,8 +33,10 @@ provenance is reversible (someone looks again); a wrongly-emitted constant is no
 
 from __future__ import annotations
 
-import re
+from collections.abc import Mapping
 from typing import Any
+
+from treasure_map.lib.pattern.classes import call_offsets
 
 # The literal escapes a decompiler emits inside a C string, mapped back to the byte they stand for.
 # Only these; an unknown escape keeps its backslash rather than being silently dropped.
@@ -49,22 +51,30 @@ _C_ESCAPES = {
 }
 
 
-def call_arguments(pseudocode: str, callee: str) -> list[str] | None:
+def call_arguments(
+    pseudocode: str, callee: str, stub_names: Mapping[int, str] | None = None
+) -> list[str] | None:
     """The argument expressions of the FIRST call to ``callee``, split at top level.
 
     Depth- and string-aware, unlike a plain ``split(",")``: a nested call
     (``log(2, "%s", f(a, b))``) and a comma inside a string literal both keep their argument
     together, so argument N is really argument N. Returns None when the call is not found.
+
+    The call is located through ``call_offsets``, the one authority the callsite enumerator counts
+    with, so a call the decompiler rendered as ``FUN_<addr>(…)`` is found too when ``stub_names``
+    resolves that address to this callee. Without the table such a call is simply not there, and
+    the record built from these arguments is absent rather than wrong — which is why this reader
+    belongs with the others even though it produces a record and not a candidate.
     """
-    match = re.search(rf"\b{re.escape(callee)}\s*\(", pseudocode)
-    if match is None:
+    offsets = call_offsets(pseudocode, callee, stub_names)
+    if not offsets:
         return None
     args: list[str] = []
     current: list[str] = []
     depth = 1
     in_string = False
     escaped = False
-    for ch in pseudocode[match.end() :]:
+    for ch in pseudocode[offsets[0] + 1 :]:
         if in_string:
             current.append(ch)
             if escaped:

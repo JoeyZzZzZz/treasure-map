@@ -59,6 +59,22 @@ def test_only_a_lone_literal_counts_as_constant() -> None:
         assert rec(expr) == [], expr
 
 
+def test_a_call_named_after_its_stub_is_found_with_the_resolved_table() -> None:
+    """A call the decompiler named after the stub it goes through carries ordinary arguments.
+
+    This reader locates the call through the single call-location authority, so a resolved stub
+    table makes ``FUN_<addr>(…)`` readable as a call to the import. Without the table there is no
+    call here at all and the record is ABSENT — which is the honest outcome, never a wrong one.
+
+    MUTATION (measured: 1 failed, this test alone): drop the stub_names forward in call_arguments
+    -> the second assertion returns None and the record silently stops being produced."""
+    pc = 'void f(void){ FUN_004125b0(2, "done: %s", x); }'
+    assert call_arguments(pc, "log_at") is None
+    assert call_arguments(pc, "log_at", {0x4125B0: "log_at"}) == ["2", '"done: %s"', "x"]
+    # a table that resolves the address to something else is not this callee
+    assert call_arguments(pc, "log_at", {0x4125B0: "syslog"}) is None
+
+
 def test_no_index_declines_rather_than_guessing() -> None:
     # An unestablished format position reads NO argument. Guessing one (say 0) judges a stream or
     # level — a different value than the one reaching the sink, and usually a constant-looking one.

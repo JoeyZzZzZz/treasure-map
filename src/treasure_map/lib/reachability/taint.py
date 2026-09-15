@@ -18,6 +18,7 @@ passed to it.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from typing import Literal
 
 from treasure_map.lib.pattern.classes import (
@@ -28,6 +29,7 @@ from treasure_map.lib.pattern.classes import (
     SOURCE,
     SOURCE_STRONG,
     SOURCE_WEAK,
+    call_offsets,
     format_string_ident,
 )
 
@@ -157,26 +159,40 @@ def abi_unrecovered(pseudocode: str) -> bool:
     return _ABI_UNRECOVERED_RE.search(pseudocode) is not None
 
 
-def locate_sink_arg(pseudocode: str, sink_name: str) -> str | None:
+def locate_sink_arg(
+    pseudocode: str, sink_name: str, stub_names: Mapping[int, str] | None = None
+) -> str | None:
     """Return the identifier feeding the sink's first argument (the command string).
 
     Targets the first argument, which is the command/destination for system/popen-style
     sinks. Returns None when the sink call or a usable argument identifier is not found.
+
+    The call is located through ``call_offsets``, the one authority the callsite enumerator counts
+    with, so a call the decompiler rendered as ``FUN_<addr>(…)`` is found too when ``stub_names``
+    resolves that address to this sink. Without the table such a call is invisible here and the
+    candidate carries no identifier at all — an absence, never a wrong answer.
     """
-    match = re.search(rf"\b{re.escape(sink_name)}\s*\(\s*([^,)]+)", pseudocode)
-    if not match:
+    offsets = call_offsets(pseudocode, sink_name, stub_names)
+    if not offsets:
         return None
-    ident = _IDENT_RE.search(match.group(1))
+    open_paren = offsets[0]
+    end = open_paren + 1
+    while end < len(pseudocode) and pseudocode[end] not in ",)":
+        end += 1
+    ident = _IDENT_RE.search(pseudocode[open_paren + 1 : end])
     return ident.group(0) if ident else None
 
 
-def locate_format_arg(pseudocode: str, sink_name: str) -> str | None:
+def locate_format_arg(
+    pseudocode: str, sink_name: str, stub_names: Mapping[int, str] | None = None
+) -> str | None:
     """Return the identifier feeding a format-string sink's FORMAT argument (the danger axis).
 
     The format position is per-sink (fprintf -> arg1, printf -> arg0, …); a literal format
     argument is safe and yields None. Returns the first non-literal format argument's identifier,
-    or None when every call passes a literal / the call is unreadable."""
-    return format_string_ident(pseudocode, sink_name)
+    or None when every call passes a literal / the call is unreadable. ``stub_names`` carries
+    through to the same authority the rest of the readers use."""
+    return format_string_ident(pseudocode, sink_name, stub_names)
 
 
 def _arg_ident(args: str, pos: int) -> str | None:

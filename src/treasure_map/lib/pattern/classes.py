@@ -10,7 +10,7 @@ generic, public C/libc and common-embedded API names; no vendor-proprietary symb
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
 # External-input getters, split by strength of external controllability (neutral,
@@ -270,17 +270,24 @@ def _split_top_args(arglist: str) -> list[str]:
     return parts
 
 
-def _iter_format_args(pseudocode: str, sink_name: str) -> list[str | None]:
+def _iter_format_args(
+    pseudocode: str, sink_name: str, stub_names: Mapping[int, str] | None = None
+) -> list[str | None]:
     """The format-argument text of EVERY call to ``sink_name`` (None when its position is absent).
 
     Iterates each call (balanced parentheses) so a function that calls a sink both with a literal
-    and with a variable format is judged on all calls, never just the first."""
+    and with a variable format is judged on all calls, never just the first.
+
+    The call positions come from ``call_offsets`` — the same authority the callsite enumerator
+    counts with — so entry N here is the call candidate N is anchored at, and a call the decompiler
+    rendered as ``FUN_<addr>(…)`` is included exactly when ``stub_names`` resolves that address to
+    this sink. A second regex of its own would agree with the enumerator only until one of the two
+    was adjusted."""
     pos = FMT_STRING_ARG.get(sink_name)
     if pos is None:
         return []
     out: list[str | None] = []
-    for m in re.finditer(rf"\b{re.escape(sink_name)}\s*\(", pseudocode):
-        i = m.end() - 1  # at the '('
+    for i in call_offsets(pseudocode, sink_name, stub_names):
         depth = 0
         for j in range(i, len(pseudocode)):
             ch = pseudocode[j]
@@ -295,19 +302,26 @@ def _iter_format_args(pseudocode: str, sink_name: str) -> list[str | None]:
     return out
 
 
-def all_format_calls_literal(pseudocode: str, sink_name: str) -> bool:
+def all_format_calls_literal(
+    pseudocode: str, sink_name: str, stub_names: Mapping[int, str] | None = None
+) -> bool:
     """True only when EVERY call to ``sink_name`` passes a string-literal format argument.
 
     This is the exemption test (prove-safe-to-exempt): a sink is exempt only when all of its calls
     have a fixed format string. If any call's format argument is non-literal — or its position is
     unreadable — the function is NOT exempt (kept for recall; never miss a controllable format)."""
-    fmt_args = _iter_format_args(pseudocode, sink_name)
+    fmt_args = _iter_format_args(pseudocode, sink_name, stub_names)
     if not fmt_args:
         return False  # the call could not be located -> do not exempt
     return all(a is not None and bool(_FMT_LITERAL_RE.match(a)) for a in fmt_args)
 
 
-def format_call_is_risky(pseudocode: str, sink_name: str, occurrence: int) -> bool:
+def format_call_is_risky(
+    pseudocode: str,
+    sink_name: str,
+    occurrence: int,
+    stub_names: Mapping[int, str] | None = None,
+) -> bool:
     """True when the ``occurrence``-th call to ``sink_name`` passes a NON-literal format argument.
 
     The per-CALL form of ``all_format_calls_literal``. That one answers about the whole function
@@ -320,17 +334,19 @@ def format_call_is_risky(pseudocode: str, sink_name: str, occurrence: int) -> bo
     cannot be read counts as RISKY, never as exempt. An occurrence that is not there is not a call
     and so is not a candidate.
     """
-    args = _iter_format_args(pseudocode, sink_name)
+    args = _iter_format_args(pseudocode, sink_name, stub_names)
     if occurrence < 0 or occurrence >= len(args):
         return False
     arg = args[occurrence]
     return arg is None or not bool(_FMT_LITERAL_RE.match(arg))
 
 
-def format_string_ident(pseudocode: str, sink_name: str) -> str | None:
+def format_string_ident(
+    pseudocode: str, sink_name: str, stub_names: Mapping[int, str] | None = None
+) -> str | None:
     """Leading identifier of the FIRST non-literal format argument of ``sink_name`` (the danger
     axis), or None when every call's format argument is a literal / unreadable."""
-    for arg in _iter_format_args(pseudocode, sink_name):
+    for arg in _iter_format_args(pseudocode, sink_name, stub_names):
         if arg is None or _FMT_LITERAL_RE.match(arg):
             continue
         ident = _IDENT_RE.search(arg)
@@ -339,17 +355,20 @@ def format_string_ident(pseudocode: str, sink_name: str) -> str | None:
     return None
 
 
-def _iter_path_args(pseudocode: str, sink_name: str) -> list[str | None]:
+def _iter_path_args(
+    pseudocode: str, sink_name: str, stub_names: Mapping[int, str] | None = None
+) -> list[str | None]:
     """The PATH-argument text of EVERY call to ``sink_name`` (None when its position is absent).
 
     Mirrors _iter_format_args but keyed on PATH_SINK_ARG (the per-sink path position), so a sink
-    called several times (a constant path here, a variable path there) is judged on all calls."""
+    called several times (a constant path here, a variable path there) is judged on all calls —
+    and, like it, takes its call positions from ``call_offsets`` so the enumerator and this reader
+    cannot drift apart, stub-rendered calls included."""
     pos = PATH_SINK_ARG.get(sink_name)
     if pos is None:
         return []
     out: list[str | None] = []
-    for m in re.finditer(rf"\b{re.escape(sink_name)}\s*\(", pseudocode):
-        i = m.end() - 1  # at the '('
+    for i in call_offsets(pseudocode, sink_name, stub_names):
         depth = 0
         for j in range(i, len(pseudocode)):
             ch = pseudocode[j]
@@ -364,24 +383,33 @@ def _iter_path_args(pseudocode: str, sink_name: str) -> list[str | None]:
     return out
 
 
-def all_path_calls_literal(pseudocode: str, sink_name: str) -> bool:
+def all_path_calls_literal(
+    pseudocode: str, sink_name: str, stub_names: Mapping[int, str] | None = None
+) -> bool:
     """True only when EVERY call to ``sink_name`` passes a string-literal PATH argument.
 
     The prove-safe-to-mark-constant test (mirror of all_format_calls_literal): a path sink is a
     compile-time-constant path only when all of its calls have a literal path. If any call's path
     is a variable — or its position is unreadable — it is NOT constant (kept for recall; a
-    controllable path is never washed into 'constant')."""
-    path_args = _iter_path_args(pseudocode, sink_name)
+    controllable path is never washed into 'constant').
+
+    ★ ``stub_names`` matters here in the prove-safe direction: a stub-rendered call this reader
+    cannot see is a call it cannot check, and marking a path constant while an unseen call passes a
+    variable would be exactly the false safety the whole-function form of this test exists to
+    avoid. With the table the unseen call is seen, and it can only ever turn 'constant' off."""
+    path_args = _iter_path_args(pseudocode, sink_name, stub_names)
     if not path_args:
         return False  # the call could not be located -> do not mark constant
     return all(a is not None and bool(_FMT_LITERAL_RE.match(a)) for a in path_args)
 
 
-def path_arg_ident(pseudocode: str, sink_name: str) -> str | None:
+def path_arg_ident(
+    pseudocode: str, sink_name: str, stub_names: Mapping[int, str] | None = None
+) -> str | None:
     """Leading identifier of the FIRST non-literal PATH argument of ``sink_name`` (the value whose
     controllability matters), or None when every call's path is a literal / unreadable — the source
     kind of that identifier is then classified by the flow-evidence layer."""
-    for arg in _iter_path_args(pseudocode, sink_name):
+    for arg in _iter_path_args(pseudocode, sink_name, stub_names):
         if arg is None or _FMT_LITERAL_RE.match(arg):
             continue
         ident = _IDENT_RE.search(arg)
@@ -392,17 +420,42 @@ def path_arg_ident(pseudocode: str, sink_name: str) -> str | None:
 
 # ── Call locations: one authority on "where are the calls to NAME" ──────────────────────────────
 
+# A call the decompiler named after the stub it goes through (``FUN_004125b0(...)``) rather than
+# after the import behind it. The address is recoverable from the name, which is what lets a
+# resolved stub table turn such a call back into a call to ``system`` / ``memcpy`` / ….
+_STUB_CALL_RE = re.compile(r"\bFUN_([0-9a-fA-F]+)\s*\(")
 
-def call_offsets(pseudocode: str, name: str) -> tuple[int, ...]:
-    """Offsets of the opening parenthesis of every textual call to ``name``, in source order.
+
+def call_offsets(
+    pseudocode: str, name: str, stub_names: Mapping[int, str] | None = None
+) -> tuple[int, ...]:
+    """Offsets of the opening parenthesis of every call to ``name``, in source order.
 
     THE single authority on where a function's calls to one callee are, shared by the callsite
     enumerator below and by the per-call argument readers in the reachability layer. Sharing it is
     the point: a candidate anchored at "the 2nd memcpy call" and the call whose arguments actually
     get read have to be the SAME call. Two counts derived from two copies of this regex agree only
     by coincidence, and stop agreeing the first time either one is adjusted.
+
+    ``stub_names`` maps a lazy-binding stub's ENTRY ADDRESS to the import it calls (see
+    analyze/stub_resolve). When it is given, a call the decompiler rendered as ``FUN_004125b0(...)``
+    counts as a call to ``name`` whenever that address maps to ``name`` — merged into the same
+    source order as the textual calls, so the Nth call is the Nth call however it was rendered. A
+    plain mapping rather than the resolver's own dataclass keeps this layer free of the analyze
+    layer; the caller passes ``resolution.names``.
+
+    Without ``stub_names`` the answer is byte-for-byte what it has always been, which is what makes
+    the recovery additive: every caller that has no resolution to hand behaves exactly as before.
     """
-    return tuple(m.end() - 1 for m in re.finditer(rf"\b{re.escape(name)}\s*\(", pseudocode))
+    direct = [m.end() - 1 for m in re.finditer(rf"\b{re.escape(name)}\s*\(", pseudocode)]
+    if not stub_names:
+        return tuple(direct)
+    stubs = [
+        m.end() - 1
+        for m in _STUB_CALL_RE.finditer(pseudocode)
+        if stub_names.get(int(m.group(1), 16)) == name
+    ]
+    return tuple(sorted(direct + stubs))
 
 
 @dataclass(frozen=True)
@@ -426,7 +479,11 @@ class SinkCallsite:
     occurrence: int
 
 
-def sink_callsites(pseudocode: str, sink_names: Iterable[str]) -> tuple[SinkCallsite, ...]:
+def sink_callsites(
+    pseudocode: str,
+    sink_names: Iterable[str],
+    stub_names: Mapping[int, str] | None = None,
+) -> tuple[SinkCallsite, ...]:
     """Every textual call to one of ``sink_names``, in source order.
 
     A name with no textual call contributes nothing. The callee list can name a callee the
@@ -442,7 +499,7 @@ def sink_callsites(pseudocode: str, sink_names: Iterable[str]) -> tuple[SinkCall
     sites = [
         (offset, name, occurrence)
         for name in sorted({n for n in sink_names if n})
-        for occurrence, offset in enumerate(call_offsets(pseudocode, name))
+        for occurrence, offset in enumerate(call_offsets(pseudocode, name, stub_names))
     ]
     sites.sort()
     return tuple(

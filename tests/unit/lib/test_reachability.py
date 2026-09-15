@@ -507,3 +507,48 @@ def test_abi_unrecovered_helper_precision() -> None:
     assert abi_unrecovered("/* WARNING: Unknown calling convention */ void f(){}")
     assert not abi_unrecovered("char acStack_120[256]; char auStack_88[64]; int local_10;")
     assert not abi_unrecovered("struct in_addr a; recv(fd, buf, 64);")
+
+
+def test_locate_sink_arg_reads_a_call_named_after_its_stub() -> None:
+    """The sink-argument reader finds the call through the single call-location authority.
+
+    On a stripped binary the decompiler routinely renders a libc call as ``FUN_<stub-addr>(…)``, so
+    the text holds no ``system(`` and this reader finds nothing — the candidate then carries no
+    identifier to trace at all. With a resolved stub table the call is there and its argument is
+    read like any other.
+
+    MUTATION (measured: 1 failed, this test alone): drop the stub_names forward in locate_sink_arg
+    -> the second assertion returns None while a real value is reaching the sink."""
+    from treasure_map.lib.reachability.taint import locate_sink_arg
+
+    stubbed = "void f(char *cmd){ FUN_004125b0(cmd); }"
+    assert locate_sink_arg(stubbed, "system") is None
+    assert locate_sink_arg(stubbed, "system", {0x4125B0: "system"}) == "cmd"
+    # an address the table resolves elsewhere is not a call to this sink
+    assert locate_sink_arg(stubbed, "system", {0x4125B0: "memcpy"}) is None
+
+
+def test_locate_sink_arg_keeps_its_first_argument_semantics() -> None:
+    """The rewrite onto the shared authority must not move what "the first argument" means.
+
+    It reads argument 0 and stops at the first comma; a call with no argument at all yields
+    nothing, and leading whitespace is not part of the identifier.
+
+    MUTATION (measured: 1 failed, this test alone): scan past the first comma -> the last case
+    below reads argument 1's identifier instead of answering with nothing.
+
+    ★ The first version of this guard was TOOTHLESS and the mutation ran green: its only
+    multi-argument case was ``execl(path, arg0, arg1)``, where a reader that ran on to the closing
+    paren still reports the first identifier it finds — "path" either way. A fixture whose two
+    candidate behaviours give the same answer proves nothing. Keep a case where argument 0 carries
+    no identifier at all, or this goes back to testing nothing."""
+    from treasure_map.lib.reachability.taint import locate_sink_arg
+
+    assert locate_sink_arg("void f(void){ system(); }", "system") is None
+    assert locate_sink_arg("void f(void){ system(  cmd ); }", "system") == "cmd"
+    assert locate_sink_arg("void f(void){ execl(path, arg0, arg1); }", "execl") == "path"
+    # ★ The case that makes "stops at the first comma" testable at all. The line above cannot:
+    # a reader that ran on to the closing paren would slice "path, arg0, arg1" and still report
+    # the FIRST identifier in it, which is "path" either way. Here argument 0 carries no
+    # identifier, so running on answers with argument 1's value instead of nothing.
+    assert locate_sink_arg("void f(void){ execl(0, cmd); }", "execl") is None
