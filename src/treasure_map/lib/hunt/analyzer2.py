@@ -1229,10 +1229,14 @@ def run_analyzer2(
                     continue
 
                 callees = _parse_callees(row.callees)
-                # Every per-CALLSITE shape has its concrete sink chosen by the DETECTOR and carried
-                # in evidence; anchor to THAT rather than re-deriving one from the callee list. Only
-                # the function-level command shapes fall through to the resolver below — for them
-                # the callee list is all there is.
+                # Every shape now chooses its concrete sink in the DETECTOR and carries it in
+                # evidence; anchor to THAT rather than re-deriving one from the callee list. The
+                # resolver below is the fallback for a sink class whose detector carries no anchor
+                # — none does today, so it is reached only if one is added without one.
+                #   cmd        — the command sink AT THIS CALLSITE. Re-deriving had to pick one
+                #                name per function, and an execv sorting ahead of a coexisting
+                #                system would anchor the row at the non-shell sink and let the
+                #                shell one be downweighted as if it were not there.
                 #   fmt_string — the risky (non-literal) sink AT THIS CALLSITE, so a literal-exempt
                 #                sibling (a printf("lit") beside a syslog(buf)) is never anchored.
                 #   copy       — the callee AT THIS CANDIDATE'S CALLSITE. Re-deriving would pick
@@ -1246,7 +1250,7 @@ def run_analyzer2(
                 #                path is argument 0 while openat's is argument 1. Re-deriving would
                 #                give every callsite in the function one alphabetically-chosen name.
                 sink_name: str | None
-                if match.sink_class in ("fmt_string", "copy", "format", "path_sink"):
+                if match.sink_class in ("cmd", "fmt_string", "copy", "format", "path_sink"):
                     sink_name = match.evidence
                 else:
                     sink_name = _sink_name_for(callees, match.sink_class)

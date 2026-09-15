@@ -1462,7 +1462,9 @@ def test_evidence_ref_distinguishes_same_named_binaries(tmp_path: Path) -> None:
         refs = [r["evidence_ref"] for r in conn.execute("SELECT evidence_ref FROM instance")]
     finally:
         conn.close()
-    refs = [r for r in refs if r.endswith("@cmd")]  # this is about the cmd axis of each binary
+    # The cmd axis of each binary. The ordinal is part of the ref now (the command axis is read per
+    # callsite), and each of these two functions holds exactly one command call.
+    refs = [r for r in refs if r.endswith("@cmd#0")]
     assert len(refs) == 2
     assert len(set(refs)) == 2, f"same-named binaries collided at the same address: {refs}"
 
@@ -1715,7 +1717,7 @@ def test_explain_anchors_the_right_sink_hit(tmp_path: Path) -> None:
     conn = open_atlas(atlas)
     try:
         cmd_ref = next(
-            r["evidence_ref"] for r in _instances(atlas) if r["evidence_ref"].endswith("@cmd")
+            r["evidence_ref"] for r in _instances(atlas) if r["evidence_ref"].endswith("@cmd#0")
         )
         ex = explain_candidate(conn, cmd_ref)
     finally:
@@ -2570,8 +2572,9 @@ def test_safe_fanout_to_wrapper_is_suppressed_below_real_concat(tmp_path: Path) 
 
 
 def test_wrapper_itself_kept_as_distinct_bare_sink_candidate(tmp_path: Path) -> None:
-    # No double counting: the wrapper is its own bare_sink candidate (@cmd); the caller is the
-    # wrapper-recovered candidate (@cmd_via_wrapper). Two distinct instances.
+    # No double counting: the wrapper is its own bare_sink candidate (@cmd#0 — the command axis is
+    # read per CALLSITE, so its ref carries the ordinal); the caller is the wrapper-recovered
+    # candidate (@cmd_via_wrapper, a function-level axis, so no ordinal). Two distinct instances.
     db = _make_db(
         tmp_path,
         [{"name": "netd", "funcs": [_thin_cmd_wrapper_fn(), _free_via_wrapper_fn()]}],
@@ -2581,7 +2584,7 @@ def test_wrapper_itself_kept_as_distinct_bare_sink_candidate(tmp_path: Path) -> 
     rows = _by_anchor(atlas)
     assert rows["do_cmd"]["exposure_shape"] == "bare_sink"
     assert rows["do_cmd"]["blocking_mechanism"] is None
-    assert rows["do_cmd"]["evidence_ref"].endswith("@cmd")
+    assert rows["do_cmd"]["evidence_ref"].endswith("@cmd#0")
     assert rows["set_route"]["evidence_ref"].endswith("@cmd_via_wrapper")
     refs = [r["evidence_ref"] for r in _instances(atlas)]
     assert len(set(refs)) == len(refs)  # unique
@@ -2898,6 +2901,37 @@ def test_each_path_callsite_reaches_the_atlas_with_its_own_callee(tmp_path: Path
     rows = _instances_of(atlas, "path_sink")
     assert [r["sink_anchor"] for r in rows] == ["unlink", "fopen"]
     assert len({r["evidence_ref"] for r in rows}) == 2  # distinct refs, one per callsite
+
+
+def test_each_command_callsite_reaches_the_atlas_with_its_own_callee(tmp_path: Path) -> None:
+    """★ THE WIRING on the command axis, and the hazard it retires.
+
+    While one row stood for the whole function the writer had to pick a command sink from the
+    callee LIST, and it preferred a shell sink on purpose: an exec-family name sorting first would
+    otherwise anchor the row at the non-shell call and let the shell one be downweighted as though
+    it were not there. Now each command callsite has its own row, so each must be anchored at ITS
+    OWN callee — and if the writer falls back to the list resolver, BOTH rows here read "system"
+    while the refs still carry their ordinals and look perfectly correct.
+
+    The fixture makes the two rules disagree: execv is called first, system is the shell-preferred
+    name. Re-deriving gives ["system", "system"]; reading the detector's evidence gives
+    ["execv", "system"].
+
+    MUTATION (measured: 1 failed of 112, this test alone): drop "cmd" from the evidence-anchored
+    tuple in analyzer2 -> both rows read "system". Nothing else in the file noticed, which is why
+    this guard is here rather than left to the detector-level tests."""
+    fn = {
+        "name": "run_both",
+        "pseudocode": "void run_both(char *a, char *b){ execv(a, 0); system(b); }",
+        "hash": "h_run_both",
+        "callees": ["execv", "system"],
+    }
+    db = _make_db(tmp_path, [{"name": "svcd", "funcs": [fn]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="r")
+    rows = _instances_of(atlas, "cmd")
+    assert [r["sink_anchor"] for r in rows] == ["execv", "system"]
+    assert len({r["evidence_ref"] for r in rows}) == 2
 
 
 def test_path_sink_impact_is_high_and_filterable(tmp_path: Path) -> None:

@@ -2,15 +2,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """Call-sequence shape detection.
 
-classify() buckets a function's callees into semantic classes; the detectors then test
-for two coarse shapes. A detector returns a LIST of PatternMatch (candidate shapes / leads) —
-empty when the shape is absent, and never a claimed bug. The DETECTORS registry is an explicit
-tuple of plain callables (no inheritance), so adding a shape is one entry plus one function.
+classify() buckets a function's callees into semantic classes; the detectors then test for the
+coarse shapes. A detector returns a LIST of PatternMatch (candidate shapes / leads) — empty when
+the shape is absent, and never a claimed bug. The DETECTORS registry is an explicit tuple of plain
+callables (no inheritance), so adding a shape is one entry plus one function. One detector may emit
+more than one KIND: the command axis labels a candidate by whether a shell template was built,
+which is a property of the candidate and not a reason for two enumerators.
 
-A list rather than an optional single match because the unit a candidate describes is not the
-same for every shape: most are about a FUNCTION, while the copy shape is about one CALL — a
-function that copies a fixed 4 bytes at one call and a caller-supplied length at the next holds
-two different facts, and one row per function can only carry one of them.
+A list rather than an optional single match because the unit a candidate describes is a CALL, not
+a function — a function that copies a fixed 4 bytes at one call and a caller-supplied length at
+the next holds two different facts, and one row per function could only ever carry one of them.
+Beneath that every shape keeps the same floor: a callee the body never spells out as a call still
+yields exactly one candidate, carrying no callsite ordinal, because dropping it would pay for the
+split with a silent recall loss.
 """
 
 from __future__ import annotations
@@ -130,55 +134,66 @@ def _source_class(cc: CallClasses) -> str:
     return "external_input" if cc.source else "unknown"
 
 
-def pattern_a(func_ref: FuncRef, callees: list[str], pseudocode: str) -> list[PatternMatch]:
-    """Command-injection shape: a shell-ish %s command string is built and run.
+def pattern_cmd(func_ref: FuncRef, callees: list[str], pseudocode: str) -> list[PatternMatch]:
+    """Command-sink shape: ONE candidate per command-sink CALLSITE (system/popen/exec*).
 
-    Requires format + command sink + a shell-ish %s literal (a constructed shell command).
-    Source is no longer a gate — when absent, source_class is 'unknown' and the shape drops the
-    'source->' prefix; the value may still arrive from a caller (e.g. an argv/optarg path).
+    ★ ONE enumerator, two KINDS. The injection shape and the bare-sink shape were two detectors
+    that had to be kept mutually exclusive by hand, but they are not two shapes — they are one
+    atom, a command sink being called, carrying a template signal or not. Both end at the same
+    ``system()``. So the enumeration happens once, over the callsites, and the template signal only
+    decides which kind each candidate is labelled with.
 
-    Function-level: at most one match, as before."""
-    cc = classify(callees)
-    if not (cc.fmt and cc.cmd):
-        return []
-    literal = _shellish_format_literal(pseudocode)
-    if literal is None:
-        return []
-    has_src = bool(cc.source)
-    return [
-        _match(
-            func_ref,
-            "cmd_injection_shape",
-            _source_class(cc),
-            "cmd",
-            "source->format->cmd" if has_src else "format->cmd",
-            literal,
-        )
-    ]
+    ★ The KIND and the SHAPE STRING are reused exactly, never unified. A candidate with a shell-ish
+    template is ``cmd_injection_shape`` / ``format->cmd`` and one without is ``bare_cmd_shape`` /
+    ``cmd``, the same strings as before. That is load-bearing: the structural fingerprint is keyed
+    on (pattern kind, sink class, source class, call-sequence shape), so inventing a unified kind —
+    or changing either string — would move every command fingerprint at once and break the
+    recurrence ledgers that count how widely a shape recurs. Splitting rows apart does NOT do that:
+    the callsite anchor is deliberately outside the fingerprint basis (see ``_match``), so the
+    siblings of one function share one fingerprint and fold into the pattern row they always had.
 
+    Per callsite, because a command sink being called is the unit. Two ``system()`` calls in one
+    function that builds a shell template used to produce ONE row — the second call had no row
+    anywhere, which is the same disappearance the copy split exists to undo.
 
-def bare_cmd(func_ref: FuncRef, callees: list[str], pseudocode: str) -> list[PatternMatch]:
-    """Bare command-sink fallback: a command sink with NO constructed shell command.
+    It also retires an anchoring hazard rather than working around it: with one row per function
+    the concrete sink had to be chosen from the callee list, and an ``execv`` sorting ahead of a
+    coexisting ``system`` could mask the shell sink. Every command callsite now has its own row, so
+    there is nothing left to mask.
 
-    Fires only when pattern_a does not (no shell-ish %s literal). This is the recall net for
-    command-exec sinks (system/popen/exec*) that pattern_a's shape gate would otherwise drop —
-    listed at a low score (the analyzer marks it / downweights it), never silently omitted.
+    The template test stays FUNCTION-level (a shell-ish %s literal is built somewhere in this
+    function), so all of a function's command callsites carry the same kind. Which call the literal
+    actually feeds is a value question this text-level pass does not answer, and labelling only one
+    callsite would claim it did.
 
-    Function-level: at most one match, as before."""
+    A function whose body spells out no call to any of its command callees yields exactly ONE
+    candidate with no callsite anchor — the same recall floor the copy split keeps."""
     cc = classify(callees)
     if not cc.cmd:
         return []
-    if cc.fmt and _shellish_format_literal(pseudocode) is not None:
-        return []  # pattern_a owns the constructed-shell-command case
+    # A constructed shell command needs a formatter to build it AND a shell-ish literal to build.
+    literal = _shellish_format_literal(pseudocode) if cc.fmt else None
+    has_src = bool(cc.source)
+    kind: PatternKind = "cmd_injection_shape" if literal is not None else "bare_cmd_shape"
+    if literal is not None:
+        shape = "source->format->cmd" if has_src else "format->cmd"
+    else:
+        shape = "source->cmd" if has_src else "cmd"
+    sites = sink_callsites(pseudocode, cc.cmd)
+    if not sites:
+        return [_match(func_ref, kind, _source_class(cc), "cmd", shape, sorted(cc.cmd)[0])]
     return [
         _match(
             func_ref,
-            "bare_cmd_shape",
+            kind,
             _source_class(cc),
             "cmd",
-            "source->cmd" if cc.source else "cmd",
-            sorted(cc.cmd)[0],
+            shape,
+            site.sink_name,
+            sink_callsite_index=site.index,
+            sink_callsite_occurrence=site.occurrence,
         )
+        for site in sites
     ]
 
 
@@ -244,7 +259,7 @@ def pattern_format(func_ref: FuncRef, callees: list[str], pseudocode: str) -> li
     be said about it is recorded separately.
 
     ★ This does NOT take the family away from the command-injection shape. A sprintf that builds a
-    shell string still feeds pattern_a through ``cc.fmt``; the same call can be both a cmd
+    shell string still feeds pattern_cmd through ``cc.fmt``; the same call can be both a cmd
     candidate and a write-length candidate, under different refs.
 
     A function whose body spells out no call (the callee list names one, the text does not) yields
@@ -387,19 +402,19 @@ def pattern_path(func_ref: FuncRef, callees: list[str], pseudocode: str) -> list
 
 Detector = Callable[[FuncRef, list[str], str], "list[PatternMatch]"]
 
-# Explicit registry — one entry per shape, plain callables only. pattern_a and bare_cmd are
-# mutually exclusive on the same function (bare_cmd defers when pattern_a's shell-ish literal is
-# present).
+# Explicit registry — one entry per shape, plain callables only. The command axis is ONE entry
+# emitting two kinds (a template signal picks which), rather than two detectors that had to be
+# kept mutually exclusive by hand.
 #
 # HOW MANY candidates a (function, sink class) yields is the shape's own answer, not a rule of the
-# registry: pattern_a and bare_cmd are about the FUNCTION and yield 0 or 1, while pattern_b,
-# pattern_format, pattern_fmtstr and pattern_path yield one per CALLSITE — the axis each of them is
-# read on (a write length, a format argument, a path argument) belongs to the CALL. The old "at
-# most one" held only while every shape was about a function, and reading it as a guarantee is what
-# let a function's second copy call go unrepresented.
+# registry. Every shape here yields one per CALLSITE, because the axis each is read on — a write
+# length, a format argument, a path argument, the command string — belongs to the CALL and not to
+# the function. Each keeps the same recall floor: exactly ONE function-level candidate, carrying no
+# ordinal, when the body spells out no call to its callees. The old "at most one" held only while
+# every shape was about a function, and reading it as a guarantee is what let a function's second
+# copy call go unrepresented.
 DETECTORS: tuple[Detector, ...] = (
-    pattern_a,
-    bare_cmd,
+    pattern_cmd,
     pattern_b,
     pattern_format,
     pattern_fmtstr,

@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for the call-sequence pattern primitive (R-pattern).
 
-Hermetic: synthetic, vendor-neutral analysis databases, no network, no LLM. Proves the
-two shape detectors (positive + negative), the OSS-exclusion lesson, the coarse
-fingerprint, read-only safety, and a boundary check that the package stays vendor- and
+Hermetic: synthetic, vendor-neutral analysis databases, no network, no LLM. Proves each shape
+detector (positive + negative), that every sink axis emits one candidate per CALLSITE with a
+function-level recall floor beneath it, the OSS-exclusion lesson, the coarse fingerprint,
+read-only safety, and a boundary check that the package stays vendor- and
 judgment-vocabulary-free.
 """
 
@@ -63,10 +64,10 @@ def _make_db(tmp_path: Path, binaries: list[dict[str, object]]) -> Path:
     return db_path
 
 
-# ── Pattern A — command-injection shape ─────────────────────────────────────────────
+# ── The command axis — two kinds, one detector ──────────────────────────────────────
 
 
-def test_pattern_a_positive(tmp_path: Path) -> None:
+def test_cmd_injection_shape_positive(tmp_path: Path) -> None:
     db = _make_db(
         tmp_path,
         [
@@ -95,12 +96,17 @@ def test_pattern_a_positive(tmp_path: Path) -> None:
     assert m.call_sequence_shape == "source->format->cmd"
     assert m.fingerprint_algo_version == FINGERPRINT_ALGO_VERSION
     assert m.structural_fingerprint  # non-empty stable hash
-    assert m.evidence == "/usr/bin/tool %s"  # the matched shell-ish format literal
+    # Evidence is the command sink AT THIS CALLSITE, as it is for every other per-callsite shape.
+    # The shell-ish literal is what made this an injection rather than a bare sink, and it says so
+    # through pattern_kind / call_sequence_shape above — which are the fields that get persisted.
+    # The literal text itself never was: nothing outside this detector ever read it.
+    assert m.evidence == "system"
+    assert m.sink_callsite_index == 0 and m.sink_callsite_occurrence == 0
     assert m.func_ref.binary_name == "webd"
     assert m.func_ref.func_name == "handle_req"
 
 
-def test_pattern_a_non_shellish_literal_falls_back_to_bare_cmd(tmp_path: Path) -> None:
+def test_a_non_shellish_literal_falls_back_to_the_bare_cmd_kind(tmp_path: Path) -> None:
     db = _make_db(
         tmp_path,
         [
@@ -776,21 +782,23 @@ def test_per_callsite_siblings_share_one_fingerprint_and_one_scanned_function(
     assert shape_scan_invariant_holds(res.stats)
 
 
-def test_the_command_shapes_are_the_ones_that_stay_function_level(tmp_path: Path) -> None:
-    """Which shapes are per-callsite and which are per-function, pinned as one statement.
+def test_every_sink_axis_now_emits_one_candidate_per_callsite(tmp_path: Path) -> None:
+    """Every sink axis is read on a property of the CALL, so every one of them emits per callsite.
 
-    The write-length shapes (copy, format), the format argument (fmt_string) and the path argument
-    (path_sink) all belong to a CALL, and each emits one candidate per callsite. The command shapes
-    are the ones still about the FUNCTION: their evidence is a constructed shell literal that the
-    function builds, not a property of one call, so two system() calls here remain one candidate.
+    This assertion has now inverted twice, which is the reason it is written as a census of all
+    three axes rather than as "the others are function-level". It first pinned four shapes as
+    function-level; then path_sink and fmt_string moved; now the command axis has moved too. A
+    sentence that names which side each axis is on keeps meaning something across those moves,
+    while "the others" silently becomes false.
 
-    This test said the opposite until path_sink and fmt_string moved: it pinned all four non-copy
-    shapes as function-level. That is why it is phrased as "which side is each shape on" rather than
-    "the others are function-level" — the sentence has to keep meaning something when a shape moves.
+    Two system() calls, two non-literal printf calls and two fopen calls: six candidates, two per
+    axis. Before the splits this fixture produced three — one per axis — and the second call of
+    each pair had no row anywhere.
 
-    MUTATION (measured: 5 failed, this among them): revert pattern_path to one match per function
-    -> path_sink reads 1 here instead of 2. Making a command shape emit per call is the same
-    assertion read from its other side."""
+    MUTATION (measured): revert pattern_path to one match per function -> 5 failed, path_sink
+    reads 1 here instead of 2. Revert pattern_cmd instead -> 5 failed, cmd reads 1 instead of 2.
+    Each axis fails this same assertion from its own side, which is what makes it a census rather
+    than a statement about one shape."""
     tmp_path.mkdir(parents=True, exist_ok=True)
     db = _make_db(
         tmp_path,
@@ -814,9 +822,7 @@ def test_the_command_shapes_are_the_ones_that_stay_function_level(tmp_path: Path
     per_class = {}
     for m in res.matches:
         per_class[m.sink_class] = per_class.get(m.sink_class, 0) + 1
-    # Two system() calls -> ONE cmd candidate (the function-level shape). Two non-literal printf
-    # calls -> two fmt_string candidates; two fopen calls -> two path_sink candidates.
-    assert per_class == {"cmd": 1, "fmt_string": 2, "path_sink": 2}
+    assert per_class == {"cmd": 2, "fmt_string": 2, "path_sink": 2}
 
 
 # ── a buffer formatter writing into a destination is a candidate per CALLSITE ─────────
@@ -924,8 +930,8 @@ def test_a_formatter_building_a_shell_command_is_still_a_command_candidate(
     callee set. Emitting it as a write candidate must not take it out of that shape: the two are
     different questions about one call, and they land at different refs.
 
-    MUTATION (must go RED): route FORMAT away from the cmd shape (drop cc.fmt from pattern_a's
-    gate, or stop classifying FORMAT into cc.fmt)."""
+    MUTATION (must go RED): route FORMAT away from the cmd shape (drop cc.fmt from pattern_cmd's
+    template gate, or stop classifying FORMAT into cc.fmt)."""
     tmp_path.mkdir(parents=True, exist_ok=True)
     db = _make_db(
         tmp_path,
@@ -1081,3 +1087,117 @@ def test_path_and_format_siblings_share_one_fingerprint(tmp_path: Path) -> None:
     fmts = _fmt_match(tmp_path / "f", "lg", "printf(x); printf(y);", ["printf"])
     assert len(fmts) == 2
     assert len({m.structural_fingerprint for m in fmts}) == 1
+
+
+# ── a command sink is a candidate per CALLSITE ───────────────────────────────────────
+#
+# The injection shape and the bare-sink shape were two detectors kept mutually exclusive by hand,
+# but they describe ONE atom: a command sink being called, in a function that did or did not build
+# a shell template. One enumerator now walks the callsites, and the template signal only picks
+# which KIND each candidate carries. The kinds and the shape strings are untouched on purpose —
+# the structural fingerprint is keyed on them.
+
+_VISIBLE_CMD_CALL = re.compile(rf"\b(?:{'|'.join(sorted(CMD))})\s*\(")
+
+
+def _cmd_match(tmp_path: Path, name: str, pseudocode: str, callees: list[str]) -> list:  # type: ignore[type-arg]
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    db = _make_db(
+        tmp_path,
+        [{"name": "svcd", "funcs": [{"name": name, "pseudocode": pseudocode, "callees": callees}]}],
+    )
+    return [m for m in scan(db).matches if m.sink_class == "cmd"]
+
+
+def test_each_command_callsite_gets_its_own_candidate(tmp_path: Path) -> None:
+    """★ The collapse this undoes: two constructed commands, two system() calls, one row.
+
+    A function that builds a shell string, runs it, builds a second and runs that one produced a
+    SINGLE candidate. The second system() had no row anywhere, and the row that did exist was
+    anchored at the function, so nothing said which of the two calls it described.
+
+    Both siblings keep cmd_injection_shape and share one fingerprint: the split adds rows, never
+    shapes, so the recurrence ledgers read the same afterwards as before.
+
+    MUTATION (measured: 5 failed): emit once per function again (force the callsite list empty) ->
+    this guard, the bare-sink one, the exec-masking one, the per-axis census and the injection
+    positive case all go red together."""
+    body = (
+        'sprintf(a, "/bin/sh -c %s", x); system(a); sprintf(b, "/usr/sbin/tool %s", y); system(b);'
+    )
+    matches = _cmd_match(tmp_path, "run_two", body, ["sprintf", "system"])
+    assert [(m.sink_callsite_index, m.evidence, m.sink_callsite_occurrence) for m in matches] == [
+        (0, "system", 0),
+        (1, "system", 1),
+    ]
+    assert {m.pattern_kind for m in matches} == {"cmd_injection_shape"}
+    assert len({m.structural_fingerprint for m in matches}) == 1
+
+
+def test_a_bare_command_sink_is_a_candidate_per_call(tmp_path: Path) -> None:
+    """The same for the no-template case, counted against this test's own matcher.
+
+    MUTATION (measured: 5 failed, this among them): emit once per function again. Emitting per
+    callee NAME instead of per call fails it too — the body below calls one name three times."""
+    body = "system(a); system(b); system(c);"
+    matches = _cmd_match(tmp_path, "run_all", body, ["system"])
+    assert len(matches) == len(_VISIBLE_CMD_CALL.findall(body)) == 3
+    assert {m.pattern_kind for m in matches} == {"bare_cmd_shape"}
+    assert [m.sink_callsite_occurrence for m in matches] == [0, 1, 2]
+    assert len({m.structural_fingerprint for m in matches}) == 1
+
+
+def test_the_command_kinds_and_shape_strings_are_unchanged(tmp_path: Path) -> None:
+    """★ THE NO-CHURN CONSTRAINT, as an assertion on the exact strings.
+
+    The structural fingerprint is keyed on (pattern kind, sink class, source class, call-sequence
+    shape). Merging the two command kinds into one — or renaming either shape string — would move
+    every command fingerprint at once, and the ledgers counting how widely a shape recurs would
+    quietly start from zero. Splitting rows apart does not do that; renaming does, which is why
+    the merge happened in the enumerator and stopped there.
+
+    MUTATION (measured): emit one unified kind for both branches -> 5 failed: this guard, the
+    injection positive case, the source-widening guard and the fingerprint-distinctness guard.
+    Renaming the injection shape strings instead -> 2 failed: this guard and the positive case.
+    Both halves of the churn are caught, and by older guards as well as this one."""
+    tpl = 'sprintf(c, "/bin/sh -c %s", b); '
+    cases = {
+        ("cmd_injection_shape", "source->format->cmd"): (
+            f"recv(s, b, 9); {tpl}system(c);",
+            ["recv", "sprintf", "system"],
+        ),
+        ("cmd_injection_shape", "format->cmd"): (f"{tpl}system(c);", ["sprintf", "system"]),
+        ("bare_cmd_shape", "source->cmd"): ("recv(s, b, 9); system(b);", ["recv", "system"]),
+        ("bare_cmd_shape", "cmd"): ("system(b);", ["system"]),
+    }
+    for (kind, shape), (body, callees) in cases.items():
+        (m,) = _cmd_match(tmp_path / kind / shape.replace(">", "_"), "f", body, callees)
+        assert (m.pattern_kind, m.call_sequence_shape) == (kind, shape)
+
+
+def test_a_shell_sink_is_no_longer_masked_by_a_coexisting_exec_sink(tmp_path: Path) -> None:
+    """★ An anchoring hazard retired rather than worked around.
+
+    With one row per function the concrete sink had to be picked from the callee list, and the
+    writer preferred a shell sink precisely because an exec-family name sorting first would anchor
+    the row at the non-shell call — letting the shell one be downweighted as though it were not
+    there. Every command callsite now has its own row, so there is nothing left to mask, and the
+    preference is no longer load-bearing.
+
+    MUTATION (measured: 5 failed, this among them): emit once per function -> one of these two
+    calls loses its row, and which one survives is decided by the anchor rule rather than by the
+    code."""
+    matches = _cmd_match(tmp_path, "both", "execv(p, argv); system(cmd);", ["execv", "system"])
+    assert [(m.sink_callsite_index, m.evidence) for m in matches] == [(0, "execv"), (1, "system")]
+
+
+def test_command_callee_never_spelled_out_still_yields_one_candidate(tmp_path: Path) -> None:
+    """The recall floor on the command axis, same as every other per-callsite shape keeps.
+
+    MUTATION (measured: 1 failed, this test alone): ``return []`` when the enumerator finds no
+    site -> the candidate disappears with nothing else going red."""
+    matches = _cmd_match(tmp_path, "ptr", "code *p; p = system; (*p)(c);", ["system"])
+    assert len(matches) == 1
+    assert matches[0].sink_callsite_index is None
+    assert matches[0].sink_callsite_occurrence is None
+    assert matches[0].evidence == "system"

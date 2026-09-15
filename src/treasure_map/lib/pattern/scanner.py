@@ -100,9 +100,10 @@ def scan(db_path: Path | str) -> ScanResult:
 
         func_ref = FuncRef(binary_name=binary_name, func_name=row["name"], func_id=row["id"])
         pseudocode = row["pseudocode"] or ""
-        # A detector returns a LIST: empty when its shape is absent, one entry for a
-        # function-level shape, and one per CALLSITE for a shape whose facts belong to the call
-        # (copy). The three function counters above stay OUTSIDE this loop and are incremented
+        # A detector returns a LIST: empty when its shape is absent, one entry per CALLSITE, and —
+        # when the body spells out no call to a callee the shape names — exactly one entry
+        # carrying no callsite anchor (the recall floor). The three function counters above stay
+        # OUTSIDE this loop and are incremented
         # once per function — a function that yields six candidates is still one function scanned,
         # so the partition Gate D checks is unaffected by how many candidates come out of it.
         for detector in DETECTORS:
