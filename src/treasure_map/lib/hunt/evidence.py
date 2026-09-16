@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -298,6 +299,7 @@ def build_size_evidence(
     entry_sites: list[dict[str, Any]] | None = None,
     callsite_index: int | None = None,
     occurrence: int = 0,
+    stub_names: Mapping[int, str] | None = None,
 ) -> dict[str, Any]:
     """Assemble the size-flow evidence for one copy-sink candidate (JSON-serializable).
 
@@ -318,7 +320,7 @@ def build_size_evidence(
     guess which call each belongs to. ``callsite_index=None`` means the call could not be located
     in the text at all: the record then says ``anchor: "function"`` and leaves the ordinals null,
     rather than printing a 0 that would read as "the first call" for a call nobody found."""
-    cs = classify_copy_size(pseudocode, sink_name, occurrence=occurrence)
+    cs = classify_copy_size(pseudocode, sink_name, occurrence=occurrence, stub_names=stub_names)
     deps = _derives_map(pseudocode)
     if cs.size_var is not None:
         real = _real_vars(pseudocode, deps)
@@ -354,12 +356,14 @@ FMT_LITERAL_CONSTANT = "literal_constant"  # a literal with no % — nothing exp
 FMT_UNRESOLVED = "unresolved"  # a variable format, or a callee with no format string at all
 
 
-def _format_string_resolution(pseudocode: str, sink_name: str, occurrence: int) -> str:
+def _format_string_resolution(
+    pseudocode: str, sink_name: str, occurrence: int, stub_names: Mapping[int, str] | None = None
+) -> str:
     """Which of the three states this call's format string is in. Never a judgement about risk."""
     pos = FORMAT_ARG.get(sink_name)
     if pos is None:
         return FMT_UNRESOLVED  # strcat / strncat carry no format string to read
-    offsets = call_offsets(pseudocode, sink_name)
+    offsets = call_offsets(pseudocode, sink_name, stub_names)
     if occurrence < 0 or occurrence >= len(offsets):
         return FMT_UNRESOLVED
     i = offsets[occurrence]
@@ -388,6 +392,7 @@ def build_format_size_evidence(
     entry_sites: list[dict[str, Any]] | None = None,
     callsite_index: int | None = None,
     occurrence: int = 0,
+    stub_names: Mapping[int, str] | None = None,
 ) -> dict[str, Any]:
     """The write-length evidence for one buffer-formatter candidate (JSON-serializable).
 
@@ -401,7 +406,7 @@ def build_format_size_evidence(
     EVIDENCE, never a verdict. Nothing here says the destination is too small; the call does not
     carry the destination's size, and inventing one is the failure this whole axis is written
     around."""
-    fs = classify_format_size(pseudocode, sink_name, occurrence=occurrence)
+    fs = classify_format_size(pseudocode, sink_name, occurrence=occurrence, stub_names=stub_names)
     deps = _derives_map(pseudocode)
     if fs.size_var is not None:
         real = _real_vars(pseudocode, deps)
@@ -417,7 +422,7 @@ def build_format_size_evidence(
             "occurrence": occurrence if anchored else None,
             "anchor": "callsite" if anchored else "function",
         },
-        "format_string": _format_string_resolution(pseudocode, sink_name, occurrence)
+        "format_string": _format_string_resolution(pseudocode, sink_name, occurrence, stub_names)
         if anchored
         else FMT_UNRESOLVED,
         "size_flow": {"size_arg": fs.size_text, "size_var": fs.size_var, "one_hop": one_hop},
@@ -439,6 +444,8 @@ def build_fmtstr_evidence(
     callees: list[str],
     sink_name: str,
     entry_sites: list[dict[str, Any]] | None,
+    stub_names: Mapping[int, str] | None = None,
+    occurrence: int | None = None,
 ) -> dict[str, Any]:
     """Assemble the flow evidence for one format-string-injection candidate (JSON-serializable).
 
@@ -448,12 +455,12 @@ def build_fmtstr_evidence(
     string, and whether every call passes a literal format (it must NOT, or this would not be a
     candidate — recorded for transparency). EVIDENCE, never a verdict — it does not
     decide the format is truly controllable."""
-    fmt_arg = format_string_ident(pseudocode, sink_name)
+    fmt_arg = format_string_ident(pseudocode, sink_name, stub_names, occurrence)
     ev = build_flow_evidence(
         pseudocode=pseudocode, callees=callees, sink_arg=fmt_arg, entry_sites=entry_sites
     )
     ev["fmt_arg_pos"] = FMT_STRING_ARG.get(sink_name)
-    ev["fmt_arg_literal"] = all_format_calls_literal(pseudocode, sink_name)
+    ev["fmt_arg_literal"] = all_format_calls_literal(pseudocode, sink_name, stub_names)
     return ev
 
 

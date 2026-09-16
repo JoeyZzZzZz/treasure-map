@@ -9,8 +9,12 @@ import json
 import sqlite3
 from pathlib import Path
 
+import pytest
+
+from treasure_map.lib.analyze import ghidra_ingest as ingest_mod
 from treasure_map.lib.analyze.elf_inventory import ElfRecord
 from treasure_map.lib.analyze.ghidra_ingest import ingest_ghidra_output
+from treasure_map.lib.analyze.stub_resolve import StubResolution
 from treasure_map.lib.storage.connection import open_db
 
 
@@ -761,3 +765,80 @@ def test_ingest_missing_nvram_ops_defaults_empty(tmp_path: Path) -> None:
     ingest_ghidra_output(conn, output_dir, [_make_record("test_bin", "a" * 64)], sha_to_id)
     assert conn.execute("SELECT nvram_ops FROM functions").fetchone()["nvram_ops"] == "[]"
     conn.close()
+
+
+# ── the resolved stub table, carried per binary ─────────────────────────────────────
+
+
+def _ingest_with_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, resolution: StubResolution | None
+) -> object:
+    """Ingest one binary with ``resolve_stubs`` forced to a given answer; return stub_names."""
+    conn, sha_to_id = _setup_db(tmp_path)
+    output_dir = tmp_path / "ghidra_output"
+    _write_ghidra_json(
+        output_dir,
+        "test_bin",
+        "a" * 64,
+        {
+            "functions": [
+                {
+                    "name": "handler",
+                    "address": "1000",
+                    "size": 64,
+                    "callees": ["FUN_004125b0"],
+                    "pseudocode": "void handler(char *c){ FUN_004125b0(c); }",
+                }
+            ],
+            "imports": [],
+            "exports": [],
+            "strings": [],
+        },
+    )
+    monkeypatch.setattr(ingest_mod, "resolve_stubs", lambda _path: resolution)
+    ingest_ghidra_output(conn, output_dir, [_make_record("test_bin", "a" * 64)], sha_to_id)
+    stored = conn.execute(
+        "SELECT stub_names FROM binaries WHERE sha256 = ?", ("a" * 64,)
+    ).fetchone()
+    conn.close()
+    return stored[0]
+
+
+def test_a_resolved_stub_table_is_stored_for_the_binary(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """The stub table rides with the binary so a hunt-time reader can use it.
+
+    The callee LIST is already relabelled at ingest, but the pseudocode TEXT still spells the call
+    as FUN_<stub-addr>(. The text readers run at hunt time, against a database the ELF may no
+    longer sit next to, so the resolved table has to be stored rather than re-derived.
+
+    Addresses are stored as lowercase hex, matching the FUN_<hex> spelling they came from.
+
+    MUTATION (measured: 2 failed — this test and the three-state one): stop writing the column in
+    _ingest_one_binary -> every binary reads None, so a stored table and an unread one look the
+    same."""
+    stored = _ingest_with_resolution(
+        tmp_path,
+        monkeypatch,
+        StubResolution(
+            names={0x4125B0: "system", 0x412450: "popen"}, regions=((0x412400, 0x413000),)
+        ),
+    )
+    assert json.loads(str(stored)) == {"4125b0": "system", "412450": "popen"}
+
+
+def test_read_but_empty_is_not_the_same_as_not_determined(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """★ Three-state honesty, at the column.
+
+    A binary whose ELF WAS read but resolved no stub stores '{}' — "looked, found none". A binary
+    with no resolution at all (not MIPS, or unreadable) stores NULL — "not determined". Collapsing
+    them would let "we never looked" be read as "this binary has no stubs", which is exactly the
+    false negative the resolver exists to undo.
+
+    MUTATION (measured: 1 failed, this test alone): write '{}' when resolution is None -> the two
+    states stop being distinguishable and the second assertion fails."""
+    empty = _ingest_with_resolution(
+        tmp_path / "empty", monkeypatch, StubResolution(names={}, regions=((0x401000, 0x401200),))
+    )
+    assert empty == "{}"  # read it; nothing resolved
+    absent = _ingest_with_resolution(tmp_path / "absent", monkeypatch, None)
+    assert absent is None  # never determined

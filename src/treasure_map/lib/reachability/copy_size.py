@@ -32,6 +32,7 @@ candidate over silently dropping a possibly-real one.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from treasure_map.lib.pattern.classes import FORMAT, call_offsets
@@ -169,7 +170,9 @@ def _split_top(arglist: str) -> list[str]:
     return parts
 
 
-def _call_args(pseudocode: str, name: str, occurrence: int) -> list[str] | None:
+def _call_args(
+    pseudocode: str, name: str, occurrence: int, stub_names: Mapping[int, str] | None = None
+) -> list[str] | None:
     """Top-level arguments of the ``occurrence``-th call to ``name`` (0-based), or None.
 
     The call positions come from ``classes.call_offsets`` — the same authority the detector counts
@@ -178,8 +181,12 @@ def _call_args(pseudocode: str, name: str, occurrence: int) -> list[str] | None:
     was adjusted, and then a candidate would silently carry another call's length.
 
     None when the call is not there — an occurrence past the end, or a callee the body never spells
-    out. The caller reports that as ``untraced``, never as an absence of length."""
-    offsets = call_offsets(pseudocode, name)
+    out. The caller reports that as ``untraced``, never as an absence of length.
+
+    ``stub_names`` reaches the authority so a call the decompiler rendered as ``FUN_<addr>(…)`` is
+    one of the calls counted here — otherwise the occurrence a candidate was anchored at would not
+    exist for this reader and its length would read ``untraced``."""
+    offsets = call_offsets(pseudocode, name, stub_names)
     if occurrence < 0 or occurrence >= len(offsets):
         return None
     i = offsets[occurrence]  # at the '('
@@ -233,7 +240,13 @@ def _pointer_guards(pseudocode: str, var: str) -> tuple[str, ...]:
     return tuple(label for pat, label in shapes if re.search(pat, pseudocode))
 
 
-def classify_format_size(pseudocode: str, sink_name: str, *, occurrence: int = 0) -> CopySize:
+def classify_format_size(
+    pseudocode: str,
+    sink_name: str,
+    *,
+    occurrence: int = 0,
+    stub_names: Mapping[int, str] | None = None,
+) -> CopySize:
     """Classify the write-length of the ``occurrence``-th ``sink_name`` FORMATTER call.
 
     The buffer formatters (snprintf/sprintf/vsnprintf/vsprintf/strcat/strncat) write into a
@@ -263,7 +276,7 @@ def classify_format_size(pseudocode: str, sink_name: str, *, occurrence: int = 0
     ``untraced``."""
     if sink_name not in FORMAT:
         return CopySize(SIZE_UNTRACED, None, None)
-    args = _call_args(pseudocode, sink_name, occurrence)
+    args = _call_args(pseudocode, sink_name, occurrence, stub_names)
     if args is None:
         return CopySize(SIZE_UNTRACED, None, None)
 
@@ -292,7 +305,13 @@ def classify_format_size(pseudocode: str, sink_name: str, *, occurrence: int = 0
     return CopySize(var_kind, size, var)
 
 
-def classify_copy_size(pseudocode: str, sink_name: str, *, occurrence: int = 0) -> CopySize:
+def classify_copy_size(
+    pseudocode: str,
+    sink_name: str,
+    *,
+    occurrence: int = 0,
+    stub_names: Mapping[int, str] | None = None,
+) -> CopySize:
     """Classify the size source of the ``occurrence``-th ``sink_name`` copy call in ``pseudocode``.
 
     ``occurrence`` is 0-based and defaults to the first call — the historical reading, kept as the
@@ -308,7 +327,7 @@ def classify_copy_size(pseudocode: str, sink_name: str, *, occurrence: int = 0) 
 
     Returns a CopySize. An unreadable call, an occurrence that is not there, or a non-copy
     ``sink_name`` yields ``untraced``."""
-    args = _call_args(pseudocode, sink_name, occurrence)
+    args = _call_args(pseudocode, sink_name, occurrence, stub_names)
     if args is None:
         return CopySize(SIZE_UNTRACED, None, None)
 

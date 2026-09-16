@@ -930,3 +930,58 @@ def test_skipping_the_re_run_does_not_remove_it_from_the_incomplete_surfacing(
     listed = list_incomplete_binaries(conn)
     assert [(e["binary"], e["reason"]) for e in listed] == [("big_daemon", "timeout")]
     conn.close()
+
+
+def test_migration_adds_stub_names_to_old_db(tmp_path: Path) -> None:
+    """A database built before the stub table existed must gain the column on open.
+
+    Adding a column to schema.sql alone is not enough: CREATE TABLE IF NOT EXISTS never alters an
+    existing table, so every pre-existing analysis.db would be missing it and the first ingest
+    would fail with "no column named stub_names". Existing rows must survive, and re-opening must
+    not raise.
+
+    MUTATION (measured: 1 failed, this test alone): drop the ("binaries", "stub_names", "TEXT")
+    entry from _ADDED_COLUMNS in storage/connection.py -> the column is absent here while a fresh
+    database still has it."""
+    db_path = tmp_path / "legacy.db"
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "CREATE TABLE binaries (id INTEGER PRIMARY KEY, name TEXT, sha256 TEXT UNIQUE, "
+        "ghidra_ok INTEGER NOT NULL DEFAULT 0)"
+    )
+    raw.execute("INSERT INTO binaries (id, name, sha256) VALUES (1, 'webd', 'aa')")
+    raw.commit()
+    raw.close()
+
+    conn = open_db(db_path)  # triggers the additive migration
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(binaries)")}
+    assert "stub_names" in cols
+    row = conn.execute("SELECT name, stub_names FROM binaries WHERE id = 1").fetchone()
+    assert row["name"] == "webd"  # the pre-existing row survived
+    # ★ NULL, not '{}': an old row was never looked at, which is a different answer from
+    # "looked and found no stubs". Back-filling '{}' would state a fact nobody established.
+    assert row["stub_names"] is None
+    conn.close()
+
+    conn = open_db(db_path)  # idempotent: re-running the migration must not raise
+    assert "stub_names" in {row[1] for row in conn.execute("PRAGMA table_info(binaries)")}
+    conn.close()
+
+
+def test_schema_sql_alone_declares_the_stub_column(tmp_path: Path) -> None:
+    """The other half of the two-place rule, asserted where it can actually fail.
+
+    ★ Going through open_db could NOT test this: it applies schema.sql and then runs the additive
+    migration, which would put a column missing from schema.sql straight back. The assertion would
+    hold no matter which of the two places carried it, i.e. it would test nothing. Building the
+    database from schema.sql ALONE is what makes "the canonical schema declares it" falsifiable.
+
+    MUTATION (measured: 1 failed of 46, this test alone): remove stub_names from schema.sql ->
+    red here while the old-database migration test above stays GREEN, which is the measurement
+    that proves the migration really does mask the omission and that this test earns its place."""
+    db_path = tmp_path / "schema_only.db"
+    raw = sqlite3.connect(db_path)
+    raw.executescript(_SCHEMA_PATH.read_text())
+    cols = {row[1] for row in raw.execute("PRAGMA table_info(binaries)")}
+    raw.close()
+    assert "stub_names" in cols

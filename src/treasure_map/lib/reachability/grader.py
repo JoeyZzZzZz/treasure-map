@@ -23,6 +23,8 @@ confirmed defect or a publishable result.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from treasure_map.lib.pattern.classes import COPY, FMT_STRING, FORMAT
 from treasure_map.lib.reachability.copy_size import (
     SIZE_APPEND_CONST,
@@ -164,7 +166,8 @@ def grade_candidate(
     sink_name: str,
     *,
     source_class: str | None = None,
-    copy_occurrence: int = 0,
+    copy_occurrence: int | None = None,
+    stub_names: Mapping[int, str] | None = None,
 ) -> ReachabilityVerdict:
     """Grade one candidate as confirmed / unknown (``blocked`` is reserved, never emitted here).
 
@@ -173,10 +176,17 @@ def grade_candidate(
     stays a valid but unused ReachabilityStatus). source_class is accepted for interface symmetry
     with the detection layer; the grade is decided from the pseudocode, callees, and sink alone.
 
-    ``copy_occurrence`` selects WHICH call to ``sink_name`` the copy branch reads (0-based, default
-    the first — the historical reading). It is meaningful only there: a copy candidate is about one
-    call, so grading its length has to be about that call too. Every other sink is graded on the
-    function as before and ignores it.
+    ``copy_occurrence`` selects WHICH call to ``sink_name`` this candidate is about (0-based).
+    ``None`` means the caller holds no callsite, and each branch then keeps its own historical
+    default: the length readers fall back to the first call, and the format-string reader falls back
+    to the first NON-LITERAL call across the function. Those two defaults differ, which is why this
+    is threaded as None rather than as 0 — passing 0 would silently turn "no callsite in hand" into
+    "callsite zero" and make a function whose first printf is literal grade as unreadable.
+
+    ``stub_names`` is the binary's resolved lazy-binding stub table (see analyze/stub_resolve). It
+    is threaded to every reader below so that a sink call the decompiler named after its stub is
+    graded like any other; with none, such a call is invisible and the verdict degrades honestly to
+    "the sink call or its argument could not be located".
     """
     if not callees:
         return ReachabilityVerdict("unknown", None, _BASIS_NO_CALLEES, degraded=True)
@@ -188,7 +198,9 @@ def grade_candidate(
         # function. classify_copy_size reads the length source; a provably-bounded length
         # (const/sizeof/clamp/pointer_guard) carries a downweight form note, a suspect or
         # unbounded length carries none (kept at its normal rank — never silently demoted).
-        cs = classify_copy_size(pseudocode, sink_name, occurrence=copy_occurrence)
+        cs = classify_copy_size(
+            pseudocode, sink_name, occurrence=copy_occurrence or 0, stub_names=stub_names
+        )
         basis = _COPY_BASIS.get(cs.kind, _BASIS_ORIGIN_UNKNOWN)
         return ReachabilityVerdict("unknown", copy_size_form_note(cs.kind), basis)
 
@@ -202,7 +214,9 @@ def grade_candidate(
         # verdict about the wrong value entirely. Whatever a formatter's write length turns out to
         # be, the verdict here is 'unknown': the facts are about the call, and none of them
         # establishes that a write is or is not reachable.
-        fs = classify_format_size(pseudocode, sink_name, occurrence=copy_occurrence)
+        fs = classify_format_size(
+            pseudocode, sink_name, occurrence=copy_occurrence or 0, stub_names=stub_names
+        )
         basis = _FORMAT_BASIS.get(fs.kind, _BASIS_ORIGIN_UNKNOWN)
         # copy_size_form_note holds none of the five formatter kinds, so this is structurally None
         # — a formatter is never demoted on its length. Called rather than hardcoded so the two
@@ -213,9 +227,9 @@ def grade_candidate(
     # a literal format yields no identifier (safe). Every other sink is graded on arg0 (command
     # string) exactly as before — the cmd path is byte-for-byte unchanged.
     if sink_name in FMT_STRING:
-        sink_arg = locate_format_arg(pseudocode, sink_name)
+        sink_arg = locate_format_arg(pseudocode, sink_name, stub_names, copy_occurrence)
     else:
-        sink_arg = locate_sink_arg(pseudocode, sink_name)
+        sink_arg = locate_sink_arg(pseudocode, sink_name, stub_names, copy_occurrence or 0)
     if sink_arg is None:
         return ReachabilityVerdict("unknown", None, _BASIS_NO_SINK, degraded=True)
 

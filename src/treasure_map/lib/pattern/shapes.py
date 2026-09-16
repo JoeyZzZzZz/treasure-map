@@ -20,7 +20,7 @@ split with a silent recall loss.
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 
 from treasure_map.lib.pattern.classes import (
@@ -134,7 +134,12 @@ def _source_class(cc: CallClasses) -> str:
     return "external_input" if cc.source else "unknown"
 
 
-def pattern_cmd(func_ref: FuncRef, callees: list[str], pseudocode: str) -> list[PatternMatch]:
+def pattern_cmd(
+    func_ref: FuncRef,
+    callees: list[str],
+    pseudocode: str,
+    stub_names: Mapping[int, str] | None = None,
+) -> list[PatternMatch]:
     """Command-sink shape: ONE candidate per command-sink CALLSITE (system/popen/exec*).
 
     ★ ONE enumerator, two KINDS. The injection shape and the bare-sink shape were two detectors
@@ -179,7 +184,7 @@ def pattern_cmd(func_ref: FuncRef, callees: list[str], pseudocode: str) -> list[
         shape = "source->format->cmd" if has_src else "format->cmd"
     else:
         shape = "source->cmd" if has_src else "cmd"
-    sites = sink_callsites(pseudocode, cc.cmd)
+    sites = sink_callsites(pseudocode, cc.cmd, stub_names)
     if not sites:
         return [_match(func_ref, kind, _source_class(cc), "cmd", shape, sorted(cc.cmd)[0])]
     return [
@@ -197,7 +202,12 @@ def pattern_cmd(func_ref: FuncRef, callees: list[str], pseudocode: str) -> list[
     ]
 
 
-def pattern_b(func_ref: FuncRef, callees: list[str], pseudocode: str) -> list[PatternMatch]:
+def pattern_b(
+    func_ref: FuncRef,
+    callees: list[str],
+    pseudocode: str,
+    stub_names: Mapping[int, str] | None = None,
+) -> list[PatternMatch]:
     """Copy/overflow shape: ONE candidate per copy CALLSITE. Source is a scoring signal, not a gate.
 
     Per callsite, not per function, because the axis a copy is read on — the write length — belongs
@@ -219,7 +229,7 @@ def pattern_b(func_ref: FuncRef, callees: list[str], pseudocode: str) -> list[Pa
     if not cc.copy:
         return []
     shape = "source->copy" if cc.source else "copy"
-    sites = sink_callsites(pseudocode, cc.copy)
+    sites = sink_callsites(pseudocode, cc.copy, stub_names)
     if not sites:
         return [
             _match(func_ref, "overflow_shape", _source_class(cc), "copy", shape, sorted(cc.copy)[0])
@@ -239,7 +249,12 @@ def pattern_b(func_ref: FuncRef, callees: list[str], pseudocode: str) -> list[Pa
     ]
 
 
-def pattern_format(func_ref: FuncRef, callees: list[str], pseudocode: str) -> list[PatternMatch]:
+def pattern_format(
+    func_ref: FuncRef,
+    callees: list[str],
+    pseudocode: str,
+    stub_names: Mapping[int, str] | None = None,
+) -> list[PatternMatch]:
     """Buffer-formatter write shape: ONE candidate per formatter CALLSITE.
 
     snprintf / sprintf / vsnprintf / vsprintf / strcat / strncat all build a string INTO a
@@ -268,7 +283,7 @@ def pattern_format(func_ref: FuncRef, callees: list[str], pseudocode: str) -> li
     if not cc.fmt:
         return []
     shape = "source->format" if cc.source else "format"
-    sites = sink_callsites(pseudocode, cc.fmt)
+    sites = sink_callsites(pseudocode, cc.fmt, stub_names)
     if not sites:
         return [
             _match(
@@ -295,7 +310,12 @@ def pattern_format(func_ref: FuncRef, callees: list[str], pseudocode: str) -> li
     ]
 
 
-def pattern_fmtstr(func_ref: FuncRef, callees: list[str], pseudocode: str) -> list[PatternMatch]:
+def pattern_fmtstr(
+    func_ref: FuncRef,
+    callees: list[str],
+    pseudocode: str,
+    stub_names: Mapping[int, str] | None = None,
+) -> list[PatternMatch]:
     """Format-string-injection shape: ONE candidate per printf-family CALLSITE whose format
     argument is NOT a literal.
 
@@ -321,8 +341,8 @@ def pattern_fmtstr(func_ref: FuncRef, callees: list[str], pseudocode: str) -> li
     shape = "source->fmt_string" if cc.source else "fmt_string"
     sites = [
         site
-        for site in sink_callsites(pseudocode, cc.fmt_string)
-        if format_call_is_risky(pseudocode, site.sink_name, site.occurrence)
+        for site in sink_callsites(pseudocode, cc.fmt_string, stub_names)
+        if format_call_is_risky(pseudocode, site.sink_name, site.occurrence, stub_names)
     ]
     if sites:
         return [
@@ -343,13 +363,20 @@ def pattern_fmtstr(func_ref: FuncRef, callees: list[str], pseudocode: str) -> li
     # text — which is the recall floor, not an exemption, so it still yields one function-level
     # candidate. all_format_calls_literal tells the two apart: it is False when the calls could
     # not be located at all.
-    risky = sorted(s for s in cc.fmt_string if not all_format_calls_literal(pseudocode, s))
+    risky = sorted(
+        s for s in cc.fmt_string if not all_format_calls_literal(pseudocode, s, stub_names)
+    )
     if not risky:
         return []
     return [_match(func_ref, "fmt_string_shape", _source_class(cc), "fmt_string", shape, risky[0])]
 
 
-def pattern_path(func_ref: FuncRef, callees: list[str], pseudocode: str) -> list[PatternMatch]:
+def pattern_path(
+    func_ref: FuncRef,
+    callees: list[str],
+    pseudocode: str,
+    stub_names: Mapping[int, str] | None = None,
+) -> list[PatternMatch]:
     """Path/file-sink shape: ONE candidate per path-sink CALLSITE (fopen/open/unlink/rename/...).
 
     Recall net for the whole path-sink class — a controllable path enables traversal / arbitrary
@@ -373,7 +400,7 @@ def pattern_path(func_ref: FuncRef, callees: list[str], pseudocode: str) -> list
     if not cc.path_sink:
         return []
     shape = "source->path_sink" if cc.source else "path_sink"
-    sites = sink_callsites(pseudocode, cc.path_sink)
+    sites = sink_callsites(pseudocode, cc.path_sink, stub_names)
     if not sites:
         return [
             _match(
@@ -400,7 +427,7 @@ def pattern_path(func_ref: FuncRef, callees: list[str], pseudocode: str) -> list
     ]
 
 
-Detector = Callable[[FuncRef, list[str], str], "list[PatternMatch]"]
+Detector = Callable[[FuncRef, list[str], str, "Mapping[int, str] | None"], "list[PatternMatch]"]
 
 # Explicit registry — one entry per shape, plain callables only. The command axis is ONE entry
 # emitting two kinds (a template signal picks which), rather than two detectors that had to be

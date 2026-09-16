@@ -100,6 +100,7 @@ from treasure_map.lib.pattern.classes import (
     all_path_calls_literal,
     path_arg_ident,
 )
+from treasure_map.lib.pattern.scanner import load_stub_names
 from treasure_map.lib.query.nvram import template_has_anchor
 from treasure_map.lib.reachability import grade_candidate
 from treasure_map.lib.reachability.taint import _IDENT_RE, locate_sink_arg
@@ -1091,6 +1092,11 @@ def run_analyzer2(
 
     result = scan(db_path)
     all_funcs = load_functions(db_path)
+    # Each binary's resolved stub table (see analyze/stub_resolve), loaded once: the readers below
+    # run on decompiled TEXT, where a lazy-binding call is spelled after the stub it goes through
+    # rather than after the import. Without it those calls are invisible here even though the
+    # callee LIST already names them, and a candidate anchored at one grades as "could not locate".
+    stub_by_binary = load_stub_names(db_path)
     # ★ phase-scale progress: on a large firmware (~218k functions) the hunt is a multi-second pass;
     # log its magnitude so it is visibly running, not hung (does NOT change the hunt algorithm).
     logger.info("hunt: analyzing %d functions", len(all_funcs))
@@ -1229,6 +1235,7 @@ def run_analyzer2(
                     continue
 
                 callees = _parse_callees(row.callees)
+                stub_names = stub_by_binary.get(row.binary_id)
                 # Every shape now chooses its concrete sink in the DETECTOR and carries it in
                 # evidence; anchor to THAT rather than re-deriving one from the callee list. The
                 # resolver below is the fallback for a sink class whose detector carries no anchor
@@ -1266,14 +1273,22 @@ def run_analyzer2(
                 if sink_name is None:
                     sink_arg = None
                 elif match.sink_class == "path_sink":
-                    sink_arg = path_arg_ident(row.pseudocode, sink_name)
+                    sink_arg = path_arg_ident(
+                        row.pseudocode, sink_name, stub_names, match.sink_callsite_occurrence
+                    )
                 else:
-                    sink_arg = locate_sink_arg(row.pseudocode, sink_name)
+                    sink_arg = locate_sink_arg(
+                        row.pseudocode, sink_name, stub_names, copy_occurrence
+                    )
                 if sink_name is None:
                     status, blocking = "unknown", None
                 else:
                     verdict = grade_candidate(
-                        row.pseudocode, callees, sink_name, copy_occurrence=copy_occurrence
+                        row.pseudocode,
+                        callees,
+                        sink_name,
+                        copy_occurrence=match.sink_callsite_occurrence,
+                        stub_names=stub_names,
                     )
                     status, blocking = verdict.status, verdict.blocking_mechanism
 
@@ -1309,6 +1324,8 @@ def run_analyzer2(
                         sink_arg=sink_arg,
                         func_name=match.func_ref.func_name,
                         callers_pseudocode=callers_pc,
+                        stub_names=stub_names,
+                        occurrence=copy_occurrence,
                     )
                 # Path/file sinks: a string-literal PATH argument is a compile-time constant
                 # (proven-safe). _sink_arg_is_literal (the cmd axis) is shell-gated and reads arg0,
@@ -1318,7 +1335,7 @@ def run_analyzer2(
                     blocking is None
                     and match.sink_class == "path_sink"
                     and sink_name is not None
-                    and all_path_calls_literal(row.pseudocode, sink_name)
+                    and all_path_calls_literal(row.pseudocode, sink_name, stub_names)
                 ):
                     blocking = CONST_SINK_ARG
                 # Recall fallback: a bare sink with no recognized in-function source (and no
@@ -1380,6 +1397,7 @@ def run_analyzer2(
                         entry_sites=sites,
                         callsite_index=match.sink_callsite_index,
                         occurrence=copy_occurrence,
+                        stub_names=stub_names,
                     )
                     _attach_edge_leads(
                         size_ev, edge_leads, row.binary_name, match.func_ref.func_name
@@ -1397,6 +1415,7 @@ def run_analyzer2(
                         entry_sites=sites,
                         callsite_index=match.sink_callsite_index,
                         occurrence=copy_occurrence,
+                        stub_names=stub_names,
                     )
                     _attach_edge_leads(
                         fmt_size_ev, edge_leads, row.binary_name, match.func_ref.func_name
@@ -1411,6 +1430,8 @@ def run_analyzer2(
                         callees=callees,
                         sink_name=sink_name,
                         entry_sites=sites,
+                        stub_names=stub_names,
+                        occurrence=match.sink_callsite_occurrence,
                     )
                     # Same def-use provenance merge as the cmd axis (format-string sinks are in the
                     # provenance lexicon too; key arg = the format position).

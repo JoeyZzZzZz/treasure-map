@@ -82,6 +82,12 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # libc sink left visible. Back-fills '[]' on older DBs (no leads until a re-scan). Must match
     # schema.sql.
     ("functions", "unresolved_external_calls", "TEXT DEFAULT '[]'"),
+    # Resolved lazy-binding stub table per binary ({hex stub address -> import name}), so a
+    # reader can see a call the decompiler named after its stub. Back-fills NULL on older DBs,
+    # which reads as 'not determined' and NOT as 'this binary has no stubs' — the two are
+    # different answers and only a re-scan turns the first into the second. Must match
+    # schema.sql.
+    ("binaries", "stub_names", "TEXT"),
 )
 
 

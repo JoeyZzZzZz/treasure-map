@@ -48,6 +48,13 @@ CREATE TABLE IF NOT EXISTS binaries (
                                            --   on binaries exported before honest truncation existed
     strings_truncated INTEGER DEFAULT 0,   -- 1 = the stored strings list is a prefix (cap/cancel hit),
                                            --   so get_strings must not read a missing string as absent
+    -- Lazy-binding stub table: {stub entry address (lowercase hex) -> the import it calls},
+    -- resolved from this binary's ELF structure at ingest (see analyze/stub_resolve). It lets a
+    -- reader recognise a call the decompiler rendered as FUN_<stub-addr>( as a call to that
+    -- import. THREE states, and the first two must not be collapsed: NULL = not determined
+    -- (not MIPS, unreadable, or ingested before this column existed); '{}' = the ELF was read
+    -- and no stub resolved; a JSON object = the stubs that did. NULL never reads as 'no stubs'.
+    stub_names   TEXT,
     last_seen_at DATETIME,                 -- timestamp of most recent ingest scan
     analyzed_at  DATETIME DEFAULT CURRENT_TIMESTAMP
 );

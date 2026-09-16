@@ -3906,3 +3906,122 @@ def test_a_formatter_length_picture_reaches_the_reader(tmp_path: Path) -> None:
             "literal_constant",
             "unresolved",
         )
+
+
+# ── the resolved stub table, from the stored column to the written rows ─────────────
+
+
+def _store_stub_table(db: Path, table: dict[str, str]) -> None:
+    """Put a resolved stub table on every binary of this analysis.db — what ingest stores."""
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE binaries SET stub_names = ?", (json.dumps(table),))
+    conn.commit()
+    conn.close()
+
+
+def test_a_stub_rendered_sink_call_is_recovered_end_to_end(tmp_path: Path) -> None:
+    """★ THE POINT OF THE STUB TABLE, every hop of it, which no unit test covers.
+
+    On a stripped binary the decompiler names a libc call after the stub it goes through, so the
+    body spells ``FUN_004125b0(...)`` and never ``system(``. The callee LIST already says
+    ``system`` — it is relabelled at ingest — so the shape scan knows the sink is there and falls
+    back to ONE function-level candidate: the recall floor, anchored at no call, carrying no
+    argument to trace.
+
+    With the table stored on the binary both calls are located. Measured on this fixture: one row
+    at ``@cmd`` becomes two at ``@cmd#0`` and ``@cmd#1``, and the recorded sink argument goes from
+    null to the real variables. The column, the loader, the scanner, the detector, the ref builder,
+    the grader and the evidence builder are all exercised at once.
+
+    MUTATION (measured): stop loading the column in the scanner, or in the hunt -> 3 failed (this
+    guard and the two below; the recovery disappears wholesale). Stop forwarding the table from the
+    command detector, or stop telling locate_sink_arg which call -> 2 failed (this and the
+    interleaved guard). Each hop was measured separately, which is what says the chain is connected
+    all the way rather than merely present at one end."""
+    fn = {
+        "name": "handle",
+        "pseudocode": (
+            "void handle(char *cmd, char *other){ FUN_004125b0(cmd); FUN_004125b0(other); }"
+        ),
+        "hash": "h_handle",
+        "callees": ["system"],
+    }
+    db = _make_db(tmp_path, [{"name": "webd", "funcs": [fn]}])
+
+    blind = tmp_path / "blind.db"
+    run_analyzer2(db, blind, source_run_id="r_blind")
+    rows = _instances_of(blind, "cmd")
+    assert [r["evidence_ref"].rsplit("@", 1)[1] for r in rows] == ["cmd"]
+    assert json.loads(rows[0]["flow_evidence"])["flow_path"]["sink_arg"] is None
+
+    _store_stub_table(db, {"4125b0": "system"})
+    seeing = tmp_path / "seeing.db"
+    run_analyzer2(db, seeing, source_run_id="r_seeing")
+    rows = _instances_of(seeing, "cmd")
+    assert [r["evidence_ref"].rsplit("@", 1)[1] for r in rows] == ["cmd#0", "cmd#1"]
+    assert [r["sink_anchor"] for r in rows] == ["system", "system"]
+    args = [json.loads(r["flow_evidence"])["flow_path"]["sink_arg"] for r in rows]
+    assert args == ["cmd", "other"]  # each row carries ITS OWN call's argument
+
+
+def test_interleaved_textual_and_stub_calls_keep_the_reader_aligned(tmp_path: Path) -> None:
+    """★ The emitter's Nth candidate and the reader's Nth call have to be ONE call.
+
+    A body mixing a call written out in full with one named after its stub is exactly where two
+    enumerators would drift apart: the detector would count three calls and an argument reader
+    counting only textual ones would find two, so candidate #2 would be graded on candidate #1's
+    value. Both come from the single call-location authority, so they cannot.
+
+    The oracle is the fixture itself — every call passes a distinct variable, so ordinal-to-
+    argument is readable by eye and owes nothing to the enumerator under test.
+
+    MUTATION (measured: 2 failed — this guard and the end-to-end one): drop the occurrence forward
+    in analyzer2's locate_sink_arg call -> all three rows report ``first``, i.e. two candidates are
+    graded on a value their own call never passes."""
+    fn = {
+        "name": "mix",
+        "pseudocode": (
+            "void mix(char *first, char *second, char *third)"
+            "{ system(first); FUN_004125b0(second); system(third); }"
+        ),
+        "hash": "h_mix",
+        "callees": ["system"],
+    }
+    db = _make_db(tmp_path, [{"name": "svcd", "funcs": [fn]}])
+    _store_stub_table(db, {"4125b0": "system"})
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="r_mix")
+    rows = _instances_of(atlas, "cmd")
+    assert [r["evidence_ref"].rsplit("@", 1)[1] for r in rows] == ["cmd#0", "cmd#1", "cmd#2"]
+    args = [json.loads(r["flow_evidence"])["flow_path"]["sink_arg"] for r in rows]
+    assert args == ["first", "second", "third"]
+
+
+def test_a_recovered_copy_is_graded_on_its_own_length(tmp_path: Path) -> None:
+    """★ No false safety travels along the recovery (the §4.4 direction).
+
+    The textual call copies a literal 4 bytes and earns a bounded-length note; the stub-rendered
+    call copies a caller-supplied ``n`` and must NOT inherit it. Anchored per callsite but graded
+    on call 0, the recovered row would come back marked bounded — a candidate demoted out of the
+    first screen on a length belonging to a different call.
+
+    MUTATION (measured: 1 failed, this guard alone): drop the stub table from build_size_evidence
+    -> the recovered call is not a call this reader can see, so its length reads ``untraced``
+    instead of ``variable``. Nothing else noticed, which is why this guard is separate from the
+    command-axis ones."""
+    fn = {
+        "name": "cp",
+        "pseudocode": (
+            "void cp(char *d, char *s, int n){ memcpy(d, s, 4); FUN_00412450(d, s, n); }"
+        ),
+        "hash": "h_cp",
+        "callees": ["memcpy"],
+    }
+    db = _make_db(tmp_path, [{"name": "svcd", "funcs": [fn]}])
+    _store_stub_table(db, {"412450": "memcpy"})
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="r_cp")
+    rows = _instances_of(atlas, "copy")
+    assert [r["evidence_ref"].rsplit("@", 1)[1] for r in rows] == ["copy#0", "copy#1"]
+    assert [json.loads(r["flow_evidence"])["size_kind"] for r in rows] == ["const", "variable"]
+    assert [r["blocking_mechanism"] for r in rows] == ["const_size", None]

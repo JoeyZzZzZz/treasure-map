@@ -280,6 +280,22 @@ def _ingest_one_binary(
         (int(strings_total), strings_truncated, binary_id),
     )
 
+    # This binary's resolved lazy-binding stubs, carried so a later reader can recognise a call the
+    # decompiler rendered as FUN_<stub-addr>( as a call to the import behind it. The callee LIST is
+    # already relabelled above; this is what the pseudocode TEXT readers need, and they run at hunt
+    # time against a database the ELF may no longer sit next to.
+    #
+    # ★ Three states, and the first two must not collapse: no resolution at all (not MIPS, or an
+    # unreadable ELF) writes NULL — "not determined" — while a resolution that named nothing writes
+    # '{}' — "read it, nothing resolved". Writing '{}' for both would let "we never looked" be read
+    # as "this binary has no stubs", which is the same false negative the resolver exists to undo.
+    stub_names_json = (
+        json.dumps({f"{addr:x}": name for addr, name in sorted(resolution.names.items())})
+        if resolution is not None
+        else None
+    )
+    conn.execute("UPDATE binaries SET stub_names = ? WHERE id = ?", (stub_names_json, binary_id))
+
     # naming-bridge phase 1: the router_defaults web-settable-key table. Only a binary where the
     # symbol was LOCATED contributes rows (a resolved member -> key=name; a member whose name ptr
     # was unreadable -> key=NULL, so a located-but-incomplete table stays honest). A binary without

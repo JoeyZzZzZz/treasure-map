@@ -146,14 +146,18 @@ def _sink_arg_is_literal(
     sink_name: str,
     sink_arg: str | None,
     stub_names: Mapping[int, str] | None = None,
+    occurrence: int = 0,
 ) -> bool:
     """True when THIS candidate's sink argument is a fixed .rodata constant with no free value
     reaching it — `system("/sbin/reboot")`, the highest-frequency command false positive.
 
     ★ Red-line (never wrongly downweight): parameter-specific, tied to the anchored candidate's
-    OWN sink_arg — NOT a whole-function search. Both guards are required:
-      1. a shell-running sink is called with a DIRECT string literal (`system("...")`), so a
-         constant command form exists at some callsite; and
+    OWN callsite and sink_arg — NOT a whole-function search. Both guards are required:
+      1. THIS candidate's call passes a DIRECT string literal (`system("...")`). It was once "some
+         callsite in the function does", which was safe only while a command candidate described a
+         whole function. Once each command callsite gets its own row, that form hands the row for
+         `system(var)` the literal belonging to a `system("/sbin/reboot")` next to it, and guard 2
+         only catches it when the variable is free-tainted — a plain global would slip through; and
       2. no free value (an in-function source output or a caller-supplied parameter) reaches this
          candidate's sink argument (`free_taint_reaches`).
     A whole-function regex satisfied only (1): a function with both `system("const")` and
@@ -165,10 +169,10 @@ def _sink_arg_is_literal(
     command."""
     if sink_name not in _SHELL_RUN_SINKS:
         return False
-    if not any(
-        _call_opens_with_a_string_literal(pseudocode, offset)
-        for offset in call_offsets(pseudocode, sink_name, stub_names)
-    ):
+    offsets = call_offsets(pseudocode, sink_name, stub_names)
+    if occurrence < 0 or occurrence >= len(offsets):
+        return False
+    if not _call_opens_with_a_string_literal(pseudocode, offsets[occurrence]):
         return False
     # Parameter-specific guard: a free value reaching this candidate's sink argument means the
     # literal above is a different callsite — do not downweight this (tainted) candidate.
@@ -384,6 +388,7 @@ def detect_form_signal(
     func_name: str | None = None,
     callers_pseudocode: list[str] | None = None,
     stub_names: Mapping[int, str] | None = None,
+    occurrence: int = 0,
 ) -> str | None:
     """Return one neutral form note to downweight this candidate, or None.
 
@@ -393,7 +398,9 @@ def detect_form_signal(
     a candidate at its normal score."""
     if _caller_only_constants(func_name, callees, callers_pseudocode or []):
         return CALLER_CONSTANT
-    if sink_name is not None and _sink_arg_is_literal(pseudocode, sink_name, sink_arg, stub_names):
+    if sink_name is not None and _sink_arg_is_literal(
+        pseudocode, sink_name, sink_arg, stub_names, occurrence
+    ):
         return CONST_SINK_ARG
     if sink_arg is not None and _value_is_constrained(pseudocode, sink_arg, _NUMERIC_VALIDATORS):
         return NUMERIC_SANITIZED

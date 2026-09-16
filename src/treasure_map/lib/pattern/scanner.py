@@ -25,7 +25,7 @@ from treasure_map.lib.pattern.shapes import DETECTORS
 logger = logging.getLogger(__name__)
 
 _FUNCTIONS_SQL = """
-SELECT f.id, b.name AS binary_name, f.name, f.pseudocode, f.callees
+SELECT f.id, f.binary_id, b.name AS binary_name, f.name, f.pseudocode, f.callees
   FROM functions f
   JOIN binaries b ON b.id = f.binary_id
  WHERE f.pseudocode IS NOT NULL
@@ -45,6 +45,47 @@ def _parse_callees(raw: str | None) -> list[str]:
     if not isinstance(data, list):
         return []
     return [str(x) for x in data]
+
+
+def load_stub_names(db_path: Path | str) -> dict[int, dict[int, str]]:
+    """binary_id -> {stub entry address -> the import it calls}, from the stored per-binary table.
+
+    The table was resolved from the ELF at ingest (see analyze/stub_resolve) and stored because the
+    readers run here, against a database the binary may no longer sit next to. Addresses come back
+    as ints, the form ``call_offsets`` matches a ``FUN_<hex>(`` call against.
+
+    A binary contributes no entry when its table is NULL ("not determined") or ``{}`` ("read it,
+    nothing resolved"). The column keeps those apart — they are different facts about the scan —
+    but for a reader they are the same instruction: apply no mapping. An older database with no
+    such column yields no entries at all, so the scan runs exactly as it did before.
+    """
+    uri = f"file:{Path(db_path)}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        rows = conn.execute("SELECT id, stub_names FROM binaries").fetchall()
+    except sqlite3.OperationalError:
+        return {}  # a database built before the table was stored
+    finally:
+        conn.close()
+    out: dict[int, dict[int, str]] = {}
+    for binary_id, raw in rows:
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        table: dict[int, str] = {}
+        for addr, name in data.items():
+            try:
+                table[int(str(addr), 16)] = str(name)
+            except ValueError:
+                continue  # an unreadable key is skipped, never guessed at
+        if table:
+            out[int(binary_id)] = table
+    return out
 
 
 def shape_scan_invariant_holds(stats: PatternStats) -> bool:
@@ -71,6 +112,11 @@ def scan(db_path: Path | str) -> ScanResult:
         rows = conn.execute(_FUNCTIONS_SQL).fetchall()
     finally:
         conn.close()
+
+    # Each binary's resolved stub table, so a sink call the decompiler named after its stub is
+    # seen by the detectors. Loaded once per scan rather than per function: it is a property of the
+    # binary, and re-reading it 88,000 times would be the same answer at 88,000 times the cost.
+    stub_by_binary = load_stub_names(db_path)
 
     matches: list[PatternMatch] = []
     functions_scanned = 0
@@ -100,14 +146,17 @@ def scan(db_path: Path | str) -> ScanResult:
 
         func_ref = FuncRef(binary_name=binary_name, func_name=row["name"], func_id=row["id"])
         pseudocode = row["pseudocode"] or ""
+        # This binary's resolved stub table, so a call the decompiler named after its stub is one
+        # of the calls the detectors see. None for a binary with none — the pre-change behaviour.
+        stub_names = stub_by_binary.get(row["binary_id"])
         # A detector returns a LIST: empty when its shape is absent, one entry per CALLSITE, and —
-        # when the body spells out no call to a callee the shape names — exactly one entry
-        # carrying no callsite anchor (the recall floor). The three function counters above stay
-        # OUTSIDE this loop and are incremented
-        # once per function — a function that yields six candidates is still one function scanned,
-        # so the partition Gate D checks is unaffected by how many candidates come out of it.
+        # when the body spells out no call to a callee the shape names — exactly one entry carrying
+        # no callsite anchor (the recall floor). The three function counters above stay OUTSIDE this
+        # loop and are incremented once per function — a function that yields six candidates is
+        # still one function scanned, so the partition Gate D checks is unaffected by how many
+        # candidates come out of it.
         for detector in DETECTORS:
-            for match in detector(func_ref, callees, pseudocode):
+            for match in detector(func_ref, callees, pseudocode, stub_names):
                 matches.append(match)
                 hits[match.pattern_kind] += 1
 

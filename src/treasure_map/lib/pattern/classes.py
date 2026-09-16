@@ -342,11 +342,28 @@ def format_call_is_risky(
 
 
 def format_string_ident(
-    pseudocode: str, sink_name: str, stub_names: Mapping[int, str] | None = None
+    pseudocode: str,
+    sink_name: str,
+    stub_names: Mapping[int, str] | None = None,
+    occurrence: int | None = None,
 ) -> str | None:
-    """Leading identifier of the FIRST non-literal format argument of ``sink_name`` (the danger
-    axis), or None when every call's format argument is a literal / unreadable."""
-    for arg in _iter_format_args(pseudocode, sink_name, stub_names):
+    """Leading identifier of a non-literal format argument of ``sink_name`` (the danger axis).
+
+    ``occurrence`` selects WHICH call to read. A per-callsite candidate must pass its own ordinal:
+    it is anchored at the Nth call, so reporting the first call's argument would hand it a value
+    the call it names never sees — and a downweight taken on that value would be decided by a
+    different callsite entirely. A literal at that call yields None, which is the honest answer
+    (this call's format is fixed) rather than a hunt for some other call's variable.
+
+    ``occurrence=None`` keeps the function-level reading — the FIRST non-literal argument across
+    all calls — for callers that hold no callsite, and is byte-for-byte what this always did.
+    """
+    args = _iter_format_args(pseudocode, sink_name, stub_names)
+    if occurrence is not None:
+        if occurrence < 0 or occurrence >= len(args):
+            return None
+        args = [args[occurrence]]
+    for arg in args:
         if arg is None or _FMT_LITERAL_RE.match(arg):
             continue
         ident = _IDENT_RE.search(arg)
@@ -404,12 +421,28 @@ def all_path_calls_literal(
 
 
 def path_arg_ident(
-    pseudocode: str, sink_name: str, stub_names: Mapping[int, str] | None = None
+    pseudocode: str,
+    sink_name: str,
+    stub_names: Mapping[int, str] | None = None,
+    occurrence: int | None = None,
 ) -> str | None:
-    """Leading identifier of the FIRST non-literal PATH argument of ``sink_name`` (the value whose
-    controllability matters), or None when every call's path is a literal / unreadable — the source
-    kind of that identifier is then classified by the flow-evidence layer."""
-    for arg in _iter_path_args(pseudocode, sink_name, stub_names):
+    """Leading identifier of a non-literal PATH argument of ``sink_name`` (the value whose
+    controllability matters); the flow-evidence layer classifies that identifier's source kind.
+
+    ``occurrence`` selects WHICH call to read, for the same reason it does on the format axis: a
+    candidate anchored at the Nth call must be judged on the Nth call's path. A function that opens
+    a fixed "/etc/…" at one call and a caller-supplied name at the next would otherwise hand BOTH
+    rows the variable — including the row whose own path is a constant.
+
+    ``occurrence=None`` keeps the function-level reading (first non-literal across all calls) for
+    callers that hold no callsite.
+    """
+    args = _iter_path_args(pseudocode, sink_name, stub_names)
+    if occurrence is not None:
+        if occurrence < 0 or occurrence >= len(args):
+            return None
+        args = [args[occurrence]]
+    for arg in args:
         if arg is None or _FMT_LITERAL_RE.match(arg):
             continue
         ident = _IDENT_RE.search(arg)

@@ -552,3 +552,22 @@ def test_locate_sink_arg_keeps_its_first_argument_semantics() -> None:
     # the FIRST identifier in it, which is "path" either way. Here argument 0 carries no
     # identifier, so running on answers with argument 1's value instead of nothing.
     assert locate_sink_arg("void f(void){ execl(0, cmd); }", "execl") is None
+
+
+def test_grading_without_a_callsite_keeps_each_readers_own_default() -> None:
+    """★ Threading the callsite ordinal stayed ADDITIVE for a caller that holds none.
+
+    The readers disagree about what "no callsite" means, and the difference is load-bearing: the
+    write-length readers default to the FIRST call, while the format-string reader defaults to the
+    first NON-LITERAL call across the function. Passing 0 for "none" collapses the two — a function
+    whose first printf carries a literal would then grade as "the sink call or its argument could
+    not be located", a degraded verdict for a candidate whose dangerous call is written right
+    there, two statements down.
+
+    MUTATION (measured: 1 failed, this test alone): hand the format-string reader
+    ``copy_occurrence or 0`` the way the length readers take it -> the basis flips to the
+    could-not-locate one, i.e. a visible dangerous call is reported as unlocatable."""
+    pseudo = 'void f(char *param_1){ printf("starting\\n"); printf(param_1); }'
+    verdict = grade_candidate(pseudo, ["printf"], "printf")
+    assert "could not be located" not in verdict.basis
+    assert "parameter" in verdict.basis  # it read the SECOND call, where the danger is

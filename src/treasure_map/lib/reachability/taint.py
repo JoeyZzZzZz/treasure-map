@@ -160,7 +160,10 @@ def abi_unrecovered(pseudocode: str) -> bool:
 
 
 def locate_sink_arg(
-    pseudocode: str, sink_name: str, stub_names: Mapping[int, str] | None = None
+    pseudocode: str,
+    sink_name: str,
+    stub_names: Mapping[int, str] | None = None,
+    occurrence: int = 0,
 ) -> str | None:
     """Return the identifier feeding the sink's first argument (the command string).
 
@@ -171,11 +174,16 @@ def locate_sink_arg(
     with, so a call the decompiler rendered as ``FUN_<addr>(…)`` is found too when ``stub_names``
     resolves that address to this sink. Without the table such a call is invisible here and the
     candidate carries no identifier at all — an absence, never a wrong answer.
+
+    ``occurrence`` selects WHICH call (0-based, default the first — the historical reading). A
+    per-callsite candidate has to pass its own ordinal: anchored at the Nth call but reading the
+    first call's argument, it would carry a value its own call never passes, and the parameter-
+    specific downweights that read this value would then be decided by a different callsite.
     """
     offsets = call_offsets(pseudocode, sink_name, stub_names)
-    if not offsets:
+    if occurrence < 0 or occurrence >= len(offsets):
         return None
-    open_paren = offsets[0]
+    open_paren = offsets[occurrence]
     end = open_paren + 1
     while end < len(pseudocode) and pseudocode[end] not in ",)":
         end += 1
@@ -184,7 +192,10 @@ def locate_sink_arg(
 
 
 def locate_format_arg(
-    pseudocode: str, sink_name: str, stub_names: Mapping[int, str] | None = None
+    pseudocode: str,
+    sink_name: str,
+    stub_names: Mapping[int, str] | None = None,
+    occurrence: int | None = None,
 ) -> str | None:
     """Return the identifier feeding a format-string sink's FORMAT argument (the danger axis).
 
@@ -192,7 +203,7 @@ def locate_format_arg(
     argument is safe and yields None. Returns the first non-literal format argument's identifier,
     or None when every call passes a literal / the call is unreadable. ``stub_names`` carries
     through to the same authority the rest of the readers use."""
-    return format_string_ident(pseudocode, sink_name, stub_names)
+    return format_string_ident(pseudocode, sink_name, stub_names, occurrence)
 
 
 def _arg_ident(args: str, pos: int) -> str | None:
