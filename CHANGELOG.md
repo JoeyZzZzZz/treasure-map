@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Large-file and same-shape aliases of the path and copy sinks are now recalled.** A controllable
+  path through `fopen64` / `freopen64` / `openat64` / `creat` / `truncate64`, or a copy through
+  `mempcpy` / `wmemcpy`, previously matched no sink set at all, so such a call produced no candidate
+  anywhere — the least visible way to miss one. Each shares the danger axis of a name already
+  covered and is graded exactly as that base is: the `*64` openers read the path at their base's
+  argument position, `openat64`'s path is the argument after the dirfd (not the dirfd), and
+  `mempcpy` / `wmemcpy` read their write length from the third argument. `wmemcpy`'s length counts
+  wide characters, but only the length's source (constant / variable / untraced) is classified,
+  never its byte magnitude, so the element width does not change the reading.
+
+### Changed
+
+- **A callsite ordinal inside an `evidence_ref` (`…@path_sink#N`, `…@copy#N`) can move by one when
+  the same function also calls a newly-recalled alias.** The ordinal counts every call to the sink
+  class in source order, so a function that spells a newly-covered call (say a `mempcpy`) before an
+  existing one (a `memcpy`) now numbers the new call first and shifts the existing call's ordinal up
+  by one. A judgement stored against the old ordinal keeps resolving, but to the adjacent call, so
+  re-anchor any such judgement before re-hunting. A reference that stops resolving is visible; one
+  that resolves to a neighbour is not, which is why the shift is called out here.
+
 ### Fixed
 
 - **A run that never finished is no longer reported as a fast re-hunt.** `tmap runs` and

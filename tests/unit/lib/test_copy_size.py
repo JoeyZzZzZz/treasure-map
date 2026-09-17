@@ -10,7 +10,10 @@ source-length copy, an unrelated clamp) must never be demoted.
 
 from __future__ import annotations
 
+from treasure_map.lib.pattern.classes import COPY
 from treasure_map.lib.reachability.copy_size import (
+    _SIZED_COPY,
+    _UNSIZED_COPY,
     SIZE_APPEND_CONST,
     SIZE_APPEND_VARIABLE,
     SIZE_CAP_CONST,
@@ -275,3 +278,45 @@ def test_an_unreadable_formatter_call_is_untraced_not_unbounded() -> None:
         SIZE_UNTRACED
     )
     assert classify_format_size("memcpy(d, s, 4);", "memcpy").kind == SIZE_UNTRACED
+
+
+# ── the copy aliases added to the sink vocabulary read their length like their base ─────
+
+
+def test_mempcpy_is_classified_on_size() -> None:
+    # mempcpy(dst, src, n) has memcpy's (dst, src, n) shape; the length is arg2 either way.
+    assert classify_copy_size("mempcpy(dst, src, n);", "mempcpy").kind == SIZE_VARIABLE
+    assert classify_copy_size("mempcpy(dst, src, 8);", "mempcpy").kind == SIZE_CONST
+
+
+def test_wmemcpy_is_classified_on_size() -> None:
+    # wmemcpy(dst, src, n): n counts wide characters, but only the length's SOURCE is classified,
+    # not its byte magnitude, so a variable count is variable and a literal count is const.
+    assert classify_copy_size("wmemcpy(dst, src, n);", "wmemcpy").kind == SIZE_VARIABLE
+    assert classify_copy_size("wmemcpy(dst, src, 8);", "wmemcpy").kind == SIZE_CONST
+
+
+def test_every_copy_sink_has_a_length_reading_and_the_two_tables_agree() -> None:
+    """The COPY vocabulary and the length tables cannot drift: a length-taking copy that is NOT in
+    _SIZED_COPY reads SIZE_UNTRACED for every call (``if sink_name not in _SIZED_COPY: return
+    untraced``), so it would emit candidates whose length silently never traces. Encoded as a set
+    identity rather than a spot check, so any copy name added to one table without the other turns
+    this red instead of shipping an always-untraced sink.
+
+    MUTATION (must go RED): remove ``mempcpy`` (or ``wmemcpy``) from _SIZED_COPY — the identity
+    breaks here and the two classification tests above flip to SIZE_UNTRACED."""
+    assert "mempcpy" in _SIZED_COPY
+    assert "wmemcpy" in _SIZED_COPY
+    assert COPY == (_SIZED_COPY | _UNSIZED_COPY)
+    assert not (_SIZED_COPY & _UNSIZED_COPY)
+
+
+def test_a_copy_name_outside_the_sized_table_reads_untraced() -> None:
+    """The failure this guards: a copy sink whose length position was never registered reports its
+    length as untraced, not as some default value. ``wmemset`` is a name deliberately NOT collected
+    (it fills a constant, it is not a taint-moving copy) — used here only as a stand-in for 'a copy
+    callee absent from _SIZED_COPY', to pin the untraced behavior.
+
+    MUTATION (must go RED): make the size reader fall through to reading args[2] for any callee."""
+    assert "wmemset" not in _SIZED_COPY
+    assert classify_copy_size("wmemset(dst, 0, n);", "wmemset").kind == SIZE_UNTRACED

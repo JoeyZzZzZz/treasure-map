@@ -23,6 +23,7 @@ from treasure_map.lib.pattern.classes import (
     FMT_STRING,
     FORMAT,
     PATH_SINK,
+    PATH_SINK_ARG,
     SOURCE,
     all_format_calls_literal,
     all_path_calls_literal,
@@ -1329,3 +1330,141 @@ def test_the_danger_axis_identifiers_come_from_the_stub_call_too() -> None:
     path_body = 'fopen("/etc/svc.conf", "r"); FUN_004125b0(chosen, "w");'
     assert path_arg_ident(path_body, "fopen") is None
     assert path_arg_ident(path_body, "fopen", {0x4125B0: "fopen"}) == "chosen"
+
+
+# ── sink-alias completion: same-signature aliases of covered sinks are recalled ─────────
+#
+# The vocabulary change these tests cover adds large-file (*64) and same-shape aliases to the path
+# and copy sink sets. The delta is kept as a test-local constant so a base/alias position table can
+# be checked against it, and so the old vocabulary can be reconstructed for the ref-identity self
+# tests below (the audit recomputes callsites under the old set on the same body).
+_ADDED_PATH_ALIASES = frozenset({"fopen64", "freopen64", "openat64", "creat", "truncate64"})
+_ADDED_COPY_ALIASES = frozenset({"mempcpy", "wmemcpy"})
+# Aliases that copy their path position from an already-covered base; the *64 pair are their base's
+# large-file variant, openat64 shares openat's dirfd-first signature. creat / truncate64 are NOT
+# here: they are new base members with a directly-specified position, checked separately.
+_PATH_ALIAS_BASE = {"fopen64": "fopen", "freopen64": "freopen", "openat64": "openat"}
+
+
+def test_new_path_aliases_are_each_recalled_with_a_variable_path(tmp_path: Path) -> None:
+    """Every added path alias, called with a variable path, is one path-sink candidate anchored at
+    that callee — the recall floor the whole class rests on (previously these names matched no sink
+    set, so a controllable path through them produced zero candidates).
+
+    openat64 is called with its path at arg1 (a dirfd first), the rest at arg0."""
+    calls = {
+        "fopen64": 'fopen64(p, "r");',
+        "freopen64": 'freopen64(p, "r", fh);',
+        "openat64": "openat64(AT_FDCWD, p, 0);",
+        "creat": "creat(p, 0644);",
+        "truncate64": "truncate64(p, 0);",
+    }
+    for name, body in calls.items():
+        (m,) = _path_match(tmp_path / name, "fn", body, [name])
+        assert m.sink_class == "path_sink"
+        assert m.evidence == name, name
+
+
+def test_new_copy_aliases_are_each_recalled_with_a_variable_length(tmp_path: Path) -> None:
+    """mempcpy / wmemcpy called with a variable length are each one copy candidate anchored at that
+    callee. Before the vocabulary change neither name was a copy sink, so an overflowing length
+    through them had no row anywhere."""
+    for name in ("mempcpy", "wmemcpy"):
+        matches = _copy_matches(tmp_path / name, f"{name}(dst, src, n);", [name])
+        assert [m.evidence for m in matches] == [name], name
+
+
+def test_path_alias_positions_track_their_base_and_new_members_are_arg0() -> None:
+    """The value check the arg-position gate rests on: an alias must read the SAME argument its base
+    reads, or a caller-controlled path would be judged at the wrong position. The *64 / openat64
+    aliases copy their base's position; the two new base members (creat, truncate64) specify arg0
+    directly and are asserted against that literal, not against a base.
+
+    MUTATION (must go RED): set openat64 to 0 (its path is arg1, after the dirfd), or point any
+    based alias at a different index from its base."""
+    for alias, base in _PATH_ALIAS_BASE.items():
+        assert PATH_SINK_ARG[alias] == PATH_SINK_ARG[base], (alias, base)
+    assert PATH_SINK_ARG["creat"] == 0
+    assert PATH_SINK_ARG["truncate64"] == 0
+    # every path sink, aliases included, has a registered position and none is orphaned.
+    assert set(PATH_SINK_ARG) == PATH_SINK
+
+
+def test_path_alias_arg_is_read_at_its_own_position_not_a_neighbour() -> None:
+    """M1 (read the wrong argument) is the failure that turns a live sink into a false-safe one: a
+    ``fopen64(path, "r")`` read at arg1 sees the "r" literal and would be washed to a constant path.
+    The path arg (arg0 for fopen64, arg1 for openat64 after the dirfd) must be the one read.
+
+    MUTATION (must go RED): read arg0 for openat64 (the dirfd), or drop fopen64 from PATH_SINK_ARG
+    so it takes no position -> path_arg_ident returns None on a variable path."""
+    # fopen64: the mode literal at arg1 must NOT wash a variable path at arg0 into 'constant'.
+    assert path_arg_ident('fopen64(chosen, "r");', "fopen64") == "chosen"
+    assert path_arg_ident('fopen64("/etc/x", "r");', "fopen64") is None
+    assert all_path_calls_literal('fopen64(chosen, "r");', "fopen64") is False
+    assert all_path_calls_literal('fopen64("/etc/x", "r");', "fopen64") is True
+    # openat64: the path is arg1; arg0 is the dirfd and must not be read as the path.
+    assert path_arg_ident("openat64(AT_FDCWD, chosen, 0);", "openat64") == "chosen"
+    assert all_path_calls_literal("openat64(AT_FDCWD, chosen, 0);", "openat64") is False
+    assert all_path_calls_literal('openat64(AT_FDCWD, "/etc/x", 0);', "openat64") is True
+    # creat / truncate64: path at arg0.
+    assert path_arg_ident("creat(chosen, 0644);", "creat") == "chosen"
+    assert path_arg_ident("truncate64(chosen, 0);", "truncate64") == "chosen"
+
+
+def test_alias_names_do_not_cross_match_by_substring() -> None:
+    """A copy name is a substring of another (``memcpy`` inside ``wmemcpy``), so the call locator
+    must match on a word boundary or memcpy's callsite count would absorb wmemcpy's calls and the
+    Nth-call anchor would point at the wrong line.
+
+    MUTATION (must go RED): drop the \\b word boundary in call_offsets' regex -> memcpy is found
+    inside wmemcpy and mempcpy."""
+    assert call_offsets("wmemcpy(d, s, n);", "memcpy") == ()
+    assert call_offsets("mempcpy(d, s, n);", "memcpy") == ()
+    assert len(call_offsets("wmemcpy(d, s, n);", "wmemcpy")) == 1
+    assert len(call_offsets("mempcpy(d, s, n);", "mempcpy")) == 1
+    # and the base is still found when spelled on its own.
+    assert len(call_offsets("memcpy(d, s, n); wmemcpy(e, t, m);", "memcpy")) == 1
+
+
+def _ordinal_map(text: str, names: frozenset[str]) -> dict[int, tuple[str, int]]:
+    """index -> (sink_name, occurrence) for one body under one sink vocabulary — the identity the
+    ref-identity audit compares between the old and new vocabularies."""
+    return {s.index: (s.sink_name, s.occurrence) for s in sink_callsites(text, names)}
+
+
+def test_adding_a_copy_alias_can_repoint_a_prior_ordinal() -> None:
+    """Same-name-different-sequence: an added alias spelled BEFORE an existing sink takes its
+    ordinal and pushes the existing call's ordinal up one, so the ref ``@copy#0`` now names a
+    different
+    call. This is the silent re-point the ref-identity gate measures against the durable judgement
+    store (a re-point that lands on a stored anchor must be re-anchored before a re-hunt).
+
+    Synthetic, not copied from a real ref. Reconstructs the old vocabulary as COPY minus the batch's
+    additions and recomputes on the same body, which is what the real audit does.
+
+    MUTATION (must go RED): order sink_callsites by callee name instead of source position -> the
+    alias no longer takes index 0 by being spelled first and the re-point is not reproduced."""
+    text = "mempcpy(d1, s1, n1); memcpy(d2, s2, n2);"
+    old = _ordinal_map(text, COPY - _ADDED_COPY_ALIASES)
+    new = _ordinal_map(text, COPY)
+    assert old == {0: ("memcpy", 0)}
+    assert new == {0: ("mempcpy", 0), 1: ("memcpy", 0)}
+    assert old[0] != new[0]  # ordinal 0 re-points: memcpy -> mempcpy
+
+
+def test_a_newly_locatable_alias_flips_a_function_off_its_bare_ref() -> None:
+    """ref-disappearance mechanism: a function whose only copy is an indirect pointer
+    (``p = memcpy;`` then a call through ``p``, no textual ``memcpy(``) produced ONE function-level
+    candidate with the bare ``@copy`` ref under the old vocabulary. If a newly added alias is
+    spelled as a call, the new
+    vocabulary locates a callsite and the function switches to the per-callsite ``@copy#0``, so the
+    bare ``@copy`` string is gone. The hard gate counts how often this happens on real firmware,
+    because each such function's bare ref is one a stored judgement could have been keyed by.
+
+    MUTATION (must go RED): make sink_callsites invent a site for a callee spelled only as a value
+    (no call parens) -> the old vocabulary no longer yields the empty/fallback state."""
+    text = "code *p; p = memcpy; (*p)(d, s, n); mempcpy(d2, s2, n2);"
+    old = sink_callsites(text, COPY - _ADDED_COPY_ALIASES)
+    new = sink_callsites(text, COPY)
+    assert old == ()  # no locatable call -> function-level fallback -> bare @copy
+    assert [(s.index, s.sink_name, s.occurrence) for s in new] == [(0, "mempcpy", 0)]

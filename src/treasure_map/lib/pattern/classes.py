@@ -106,13 +106,18 @@ CMD: frozenset[str] = frozenset(
 )
 
 # Copies: move bytes into a destination buffer (length-taking or not). memmove has the same
-# (dst, src, n) danger shape as memcpy and is graded on the same write-length axis.
+# (dst, src, n) danger shape as memcpy and is graded on the same write-length axis. mempcpy and
+# wmemcpy share that (dst, src, n) shape too — mempcpy returns dst+n, wmemcpy counts wide
+# characters — and are graded on the same axis. Every length-taking name here MUST also appear in
+# copy_size._SIZED_COPY, or its write length silently reads as untraced.
 COPY: frozenset[str] = frozenset(
     {
         "strcpy",
         "strncpy",
         "memcpy",
         "memmove",
+        "mempcpy",
+        "wmemcpy",
     }
 )
 
@@ -186,12 +191,18 @@ FORMAT_ARG: dict[str, int] = {
 # axis is the PATH argument, whose position is per-sink (see PATH_SINK_ARG) — NOT always arg0.
 PATH_SINK: frozenset[str] = frozenset(
     {
-        # open for read/write (a controllable path -> traversal / arbitrary read-write)
+        # open for read/write (a controllable path -> traversal / arbitrary read-write). The *64
+        # names are the large-file (_FILE_OFFSET_BITS=64) variants with the same signatures.
         "fopen",
+        "fopen64",
         "freopen",
+        "freopen64",
         "open",
         "open64",
         "openat",
+        "openat64",
+        # create for writing (a controllable path -> arbitrary file creation)
+        "creat",
         # delete
         "unlink",
         "unlinkat",
@@ -203,20 +214,26 @@ PATH_SINK: frozenset[str] = frozenset(
         "mkdir",
         "rmdir",
         "opendir",
+        # truncate (a controllable path -> arbitrary file truncation)
+        "truncate64",
     }
 )
 
 # The PATH argument index for each path/file sink (0-based). MUST be per-sink: fopen's path is
-# arg0, but openat/unlinkat take a dirfd first so their path is arg1, and renameat's source path is
-# arg1 (arg0 is olddirfd). Reading arg0 blindly would judge the dirfd, not the path — missing the
-# real sink and mis-classifying a constant one. rename/renameat expose two path args; the source
-# path (0 / 1) is taken this phase — the destination path is a later refinement.
+# arg0, but openat/openat64/unlinkat take a dirfd first so their path is arg1, and renameat's
+# source path is arg1 (arg0 is olddirfd). Reading arg0 blindly would judge the dirfd, not the path
+# — missing the real sink and mis-classifying a constant one. rename/renameat expose two path
+# args; the source path (0 / 1) is taken this phase — the destination path is a later refinement.
 PATH_SINK_ARG: dict[str, int] = {
     "fopen": 0,
+    "fopen64": 0,
     "freopen": 0,
+    "freopen64": 0,
     "open": 0,
     "open64": 0,
     "openat": 1,
+    "openat64": 1,
+    "creat": 0,
     "unlink": 0,
     "unlinkat": 1,
     "remove": 0,
@@ -225,6 +242,7 @@ PATH_SINK_ARG: dict[str, int] = {
     "mkdir": 0,
     "rmdir": 0,
     "opendir": 0,
+    "truncate64": 0,
 }
 
 # A whole argument that is a plain string literal (optionally an L"..." wide literal). A format

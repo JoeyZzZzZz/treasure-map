@@ -81,8 +81,11 @@ _FORM_NOTE: dict[str, str] = {
     SIZE_POINTER_GUARD: POINTER_GUARD_SIZE,
 }
 
-# Copies whose write length is an explicit third argument.
-_SIZED_COPY: frozenset[str] = frozenset({"memcpy", "memmove", "strncpy"})
+# Copies whose write length is an explicit third argument. mempcpy and wmemcpy also take
+# (dst, src, n); wmemcpy's n counts wide characters, but only the length's SOURCE (const /
+# variable / untraced) is classified here, never its byte magnitude, so the element width does not
+# change the reading. Every length-taking name in classes.COPY must appear here.
+_SIZED_COPY: frozenset[str] = frozenset({"memcpy", "memmove", "strncpy", "mempcpy", "wmemcpy"})
 # Copies with an IMPLICIT length = the source string length (no length argument).
 _UNSIZED_COPY: frozenset[str] = frozenset({"strcpy"})
 
