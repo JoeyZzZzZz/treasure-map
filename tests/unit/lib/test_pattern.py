@@ -26,6 +26,8 @@ from treasure_map.lib.pattern.classes import (
     PATH_SINK,
     PATH_SINK_ARG,
     SOURCE,
+    SOURCE_STRONG,
+    SOURCE_WEAK,
     all_format_calls_literal,
     all_path_calls_literal,
     call_offsets,
@@ -35,7 +37,7 @@ from treasure_map.lib.pattern.classes import (
 )
 from treasure_map.lib.pattern.fingerprint import FINGERPRINT_ALGO_VERSION
 from treasure_map.lib.pattern.models import FuncRef, PatternStats
-from treasure_map.lib.pattern.scanner import shape_scan_invariant_holds
+from treasure_map.lib.pattern.scanner import DETECTORS, shape_scan_invariant_holds
 from treasure_map.lib.storage.connection import open_db
 
 _PATTERN_PKG = Path(__file__).resolve().parents[3] / "src" / "treasure_map" / "lib" / "pattern"
@@ -1497,3 +1499,132 @@ def test_a_newly_locatable_alias_flips_a_function_off_its_bare_ref() -> None:
     new = sink_callsites(text, COPY)
     assert old == ()  # no locatable call -> function-level fallback -> bare @copy
     assert [(s.index, s.sink_name, s.occurrence) for s in new] == [(0, "mempcpy", 0)]
+
+
+# ── libc ABI aliases of the recognized sources ─────────────────────────────────────────
+#
+# The delta is a test-local constant so the old vocabulary can be reconstructed: adding a source
+# name re-labels a candidate, it never creates one, and both halves need checking.
+_ADDED_SOURCE_ALIASES = frozenset(
+    {"__isoc99_sscanf", "__isoc99_fscanf", "__isoc99_scanf", "fgets_unlocked", "__getdelim"}
+)
+# Same-family names deliberately NOT listed: no call to any of them exists in the corpus this set
+# was closed over, and listing a source nobody calls claims a reading that was never observed.
+_UNLISTED_SOURCE_CANDIDATES = frozenset(
+    {
+        "__isoc99_vsscanf",
+        "vsscanf",
+        "__isoc99_vfscanf",
+        "vfscanf",
+        "__isoc99_vscanf",
+        "vscanf",
+        "fread_unlocked",
+    }
+)
+# One body per alias: the alias reads input, a copy sink then gives the function a candidate to
+# carry the source label. Without the alias recognized the same body is source_class=unknown.
+_SOURCE_ALIAS_BODY = {
+    "__isoc99_sscanf": '__isoc99_sscanf(inp, "%s", buf);',
+    "__isoc99_fscanf": '__isoc99_fscanf(fh, "%s", buf);',
+    "__isoc99_scanf": '__isoc99_scanf("%s", buf);',
+    "fgets_unlocked": "fgets_unlocked(buf, 64, fh);",
+    "__getdelim": "__getdelim(&line, &cap, 10, fh);",
+}
+
+
+def test_each_libc_source_alias_is_recognized_as_a_source(tmp_path: Path) -> None:
+    """Each added alias, on its own, labels its function's candidate external_input.
+
+    Per alias rather than once for the set: a single shared assertion passes while four of the five
+    names do nothing, which is exactly the shape of a vocabulary entry that was never wired.
+
+    MUTATION (must go RED, one per alias): drop that alias from SOURCE_WEAK -> its body reads
+    source_class=unknown again while the other four stay green."""
+    for alias, read in _SOURCE_ALIAS_BODY.items():
+        db = _make_db(
+            tmp_path / alias,
+            [
+                {
+                    "name": "svcd",
+                    "funcs": [
+                        {
+                            "name": "handler",
+                            "pseudocode": f"{read} memcpy(dst, buf, n);",
+                            "callees": [alias, "memcpy"],
+                        }
+                    ],
+                }
+            ],
+        )
+        (m,) = [x for x in scan(db).matches if x.sink_class == "copy"]
+        assert m.source_class == "external_input", alias
+        assert m.call_sequence_shape == "source->copy", alias
+
+
+def _all_matches(fr: FuncRef, callees: list[str], body: str) -> list:  # type: ignore[type-arg]
+    """Every detector's matches for one function, in detector order."""
+    return [m for det in DETECTORS for m in det(fr, callees, body, None)]
+
+
+def test_a_source_alias_relabels_a_candidate_and_never_creates_one() -> None:
+    """Recognising a source is NOT a recall change. No detector gates emission on the source class
+    -- every one of them gates on its own sink -- so adding a source name must leave the candidate
+    set, its callsite ordinals and its sink evidence identical, and move only the two shape fields
+    (source_class, call_sequence_shape) plus the fingerprint they feed. A source that added or
+    dropped a row would change what is on the board, not just how it is labelled.
+
+    MUTATION (must go RED): gate any detector on cc.source (e.g. ``if not cc.source: return []``)
+    -> the candidate sets stop matching; or fold the source into the callsite anchor -> the ordinal
+    comparison breaks."""
+    fr = FuncRef(binary_name="b", func_name="handler", func_id=1)
+    callees = ["__isoc99_sscanf", "memcpy", "system", "fopen"]
+    body = '__isoc99_sscanf(inp, "%s", buf); memcpy(dst, buf, n); system(cmd); fopen(path, "r");'
+    saved = shapes.SOURCE
+    try:
+        shapes.SOURCE = saved - _ADDED_SOURCE_ALIASES
+        old = _all_matches(fr, callees, body)
+        shapes.SOURCE = saved
+        new = _all_matches(fr, callees, body)
+    finally:
+        shapes.SOURCE = saved
+
+    def anchors(ms: list) -> list:  # type: ignore[type-arg]
+        return [
+            (
+                m.sink_class,
+                m.pattern_kind,
+                m.evidence,
+                m.sink_callsite_index,
+                m.sink_callsite_occurrence,
+            )
+            for m in ms
+        ]
+
+    assert len(new) == len(old) > 0
+    assert anchors(new) == anchors(old)  # no candidate added, dropped, or re-anchored
+    assert {m.source_class for m in old} == {"unknown"}
+    assert {m.source_class for m in new} == {"external_input"}
+    for o, n in zip(old, new, strict=True):
+        assert n.call_sequence_shape == f"source->{o.call_sequence_shape}"
+        assert n.structural_fingerprint != o.structural_fingerprint  # the two fields feed it
+
+
+def test_source_alias_vocabulary_stays_weak_and_unspeculative() -> None:
+    """The added names are WEAK sources (their bases are), and the same-family names that no call
+    in the corpus reaches stay out. Encoded as set relations so a later edit that promotes one to
+    STRONG, or quietly adds an unobserved name, fails here instead of shipping.
+
+    MUTATION (must go RED): move any alias into SOURCE_STRONG, or add one of the unlisted names."""
+    assert _ADDED_SOURCE_ALIASES <= SOURCE_WEAK
+    assert not (_ADDED_SOURCE_ALIASES & SOURCE_STRONG)
+    assert _ADDED_SOURCE_ALIASES <= SOURCE  # the union R-pattern reads
+    assert not (_UNLISTED_SOURCE_CANDIDATES & SOURCE)
+    # every alias sits beside a base that is itself a recognized weak source
+    for alias, base in {
+        "__isoc99_sscanf": "sscanf",
+        "__isoc99_fscanf": "fscanf",
+        "__isoc99_scanf": "scanf",
+        "fgets_unlocked": "fgets",
+        "__getdelim": "getdelim",
+    }.items():
+        assert base in SOURCE_WEAK, (alias, base)

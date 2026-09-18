@@ -38,16 +38,28 @@ SOURCE_STRONG: frozenset[str] = frozenset(
 # function.
 SOURCE_WEAK: frozenset[str] = frozenset(
     {
+        # Some entries are libc ABI aliases listed beside the base they mirror (fgets_unlocked,
+        # the __isoc99_* scanf family, __getdelim); listing them fixes symbol-recognition recall
+        # at the pattern layer. The extractor's Java side (ExportFunctions TOKENIZERS / WRITERS)
+        # matches by exact name and does not recognize them — a pre-existing description seam
+        # between the two layers that listing them here neither creates nor widens: the Java
+        # provenance never reads source_class, so these record as call_return either way. Do NOT
+        # hand-sync the Java lists from here; that is a scan-side change with its own re-extract.
         "read",
         "fread",
         "fgets",
+        "fgets_unlocked",
         "gets",
         "scanf",
+        "__isoc99_scanf",
         "sscanf",
+        "__isoc99_sscanf",
         "fscanf",
+        "__isoc99_fscanf",
         # Stream/line/scatter reads (file + socket response bodies).
         "getline",
         "getdelim",
+        "__getdelim",
         "pread",
         "readv",
         "getenv",
