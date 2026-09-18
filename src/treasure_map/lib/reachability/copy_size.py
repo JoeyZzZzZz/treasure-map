@@ -88,6 +88,10 @@ _FORM_NOTE: dict[str, str] = {
 _SIZED_COPY: frozenset[str] = frozenset({"memcpy", "memmove", "strncpy", "mempcpy", "wmemcpy"})
 # Copies with an IMPLICIT length = the source string length (no length argument).
 _UNSIZED_COPY: frozenset[str] = frozenset({"strcpy"})
+# Copies whose length is an ELEMENT count, not a byte count. sizeof() yields bytes, so sizeof(dst)
+# as one of these lengths is a unit mismatch (it copies element-width times too many bytes), not a
+# proof the write fits — the opposite of the bound a byte copy's sizeof is.
+_WIDE_ELEMENT_COPY: frozenset[str] = frozenset({"wmemcpy"})
 
 # Which argument of a buffer formatter carries a length, and what that length MEANS. Lives here
 # rather than in the call-class vocabulary for the same reason _SIZED_COPY does: the position is
@@ -352,6 +356,10 @@ def classify_copy_size(
     if _NUM_LITERAL_RE.match(size):
         return CopySize(SIZE_CONST, size, None)
     if "sizeof" in size:
+        if sink_name in _WIDE_ELEMENT_COPY:
+            # A wide-character copy takes an element count; sizeof(dst) is bytes, so it is the
+            # classic unit error, not a size-of bound. Keep it live rather than demote it.
+            return CopySize(SIZE_VARIABLE, size, None)
         return CopySize(SIZE_SIZEOF, size, None)
     if _STRLEN_RE.search(size):
         return CopySize(SIZE_SOURCE_LEN, size, _lead_ident(size))

@@ -296,6 +296,24 @@ def test_wmemcpy_is_classified_on_size() -> None:
     assert classify_copy_size("wmemcpy(dst, src, 8);", "wmemcpy").kind == SIZE_CONST
 
 
+def test_wmemcpy_sizeof_length_is_not_a_sizeof_bound() -> None:
+    """A wide-character copy takes an ELEMENT count; sizeof() yields BYTES, so ``sizeof(dst)`` as a
+    wmemcpy length is the classic unit error (it copies element-width times too many bytes), not a
+    proof the write fits. It must NOT earn the demoting ``sizeof_bound`` note a byte copy's sizeof
+    does -- washing that overrun into 'bounded' is exactly the false safety to avoid. A byte copy
+    (memcpy) keeps its sizeof bound; a literal element count stays const (a fixed count is bounded
+    whatever the unit).
+
+    MUTATION (must go RED): drop the wide-copy special case so wmemcpy's sizeof returns SIZE_SIZEOF
+    (sizeof_bound) like memcpy's."""
+    w = classify_copy_size("wmemcpy(dst, src, sizeof(dst));", "wmemcpy")
+    assert w.kind == SIZE_VARIABLE
+    assert copy_size_form_note(w.kind) is None  # kept live, never demoted
+    # a byte copy's sizeof is a genuine bound and is unchanged:
+    assert classify_copy_size("memcpy(dst, src, sizeof(dst));", "memcpy").kind == SIZE_SIZEOF
+    assert copy_size_form_note(SIZE_SIZEOF) == "sizeof_bound"
+
+
 def test_every_copy_sink_has_a_length_reading_and_the_two_tables_agree() -> None:
     """The COPY vocabulary and the length tables cannot drift: a length-taking copy that is NOT in
     _SIZED_COPY reads SIZE_UNTRACED for every call (``if sink_name not in _SIZED_COPY: return

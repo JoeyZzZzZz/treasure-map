@@ -110,6 +110,11 @@ CMD: frozenset[str] = frozenset(
 # wmemcpy share that (dst, src, n) shape too — mempcpy returns dst+n, wmemcpy counts wide
 # characters — and are graded on the same axis. Every length-taking name here MUST also appear in
 # copy_size._SIZED_COPY, or its write length silently reads as untraced.
+#
+# These are copy SINKS here, but are NOT in the extractor's buffer-writer set (analyze/ghidra
+# WRITERS) that the dominating-writer provenance reads to judge a stack buffer's fill: recognising a
+# new writer is a scan-side change (re-extract), so a buffer filled only by mempcpy/wmemcpy is, to
+# that reader, filled by nothing it knows — a separate, larger change.
 COPY: frozenset[str] = frozenset(
     {
         "strcpy",

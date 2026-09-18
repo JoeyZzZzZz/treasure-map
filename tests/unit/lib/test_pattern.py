@@ -16,6 +16,7 @@ import re
 import sqlite3
 from pathlib import Path
 
+import treasure_map.lib.pattern.shapes as shapes
 from treasure_map.lib.pattern import scan
 from treasure_map.lib.pattern.classes import (
     CMD,
@@ -33,7 +34,7 @@ from treasure_map.lib.pattern.classes import (
     sink_callsites,
 )
 from treasure_map.lib.pattern.fingerprint import FINGERPRINT_ALGO_VERSION
-from treasure_map.lib.pattern.models import PatternStats
+from treasure_map.lib.pattern.models import FuncRef, PatternStats
 from treasure_map.lib.pattern.scanner import shape_scan_invariant_holds
 from treasure_map.lib.storage.connection import open_db
 
@@ -1337,7 +1338,7 @@ def test_the_danger_axis_identifiers_come_from_the_stub_call_too() -> None:
 # The vocabulary change these tests cover adds large-file (*64) and same-shape aliases to the path
 # and copy sink sets. The delta is kept as a test-local constant so a base/alias position table can
 # be checked against it, and so the old vocabulary can be reconstructed for the ref-identity self
-# tests below (the audit recomputes callsites under the old set on the same body).
+# tests below (the old vocabulary is recomputed on the same body).
 _ADDED_PATH_ALIASES = frozenset({"fopen64", "freopen64", "openat64", "creat", "truncate64"})
 _ADDED_COPY_ALIASES = frozenset({"mempcpy", "wmemcpy"})
 # Aliases that copy their path position from an already-covered base; the *64 pair are their base's
@@ -1391,7 +1392,7 @@ def test_path_alias_positions_track_their_base_and_new_members_are_arg0() -> Non
 
 
 def test_path_alias_arg_is_read_at_its_own_position_not_a_neighbour() -> None:
-    """M1 (read the wrong argument) is the failure that turns a live sink into a false-safe one: a
+    """Reading the wrong argument is the failure that turns a live sink into a false-safe one: a
     ``fopen64(path, "r")`` read at arg1 sees the "r" literal and would be washed to a constant path.
     The path arg (arg0 for fopen64, arg1 for openat64 after the dirfd) must be the one read.
 
@@ -1428,28 +1429,56 @@ def test_alias_names_do_not_cross_match_by_substring() -> None:
 
 def _ordinal_map(text: str, names: frozenset[str]) -> dict[int, tuple[str, int]]:
     """index -> (sink_name, occurrence) for one body under one sink vocabulary — the identity the
-    ref-identity audit compares between the old and new vocabularies."""
+    ref-identity comparison uses between the old and new vocabularies."""
     return {s.index: (s.sink_name, s.occurrence) for s in sink_callsites(text, names)}
 
 
-def test_adding_a_copy_alias_can_repoint_a_prior_ordinal() -> None:
-    """Same-name-different-sequence: an added alias spelled BEFORE an existing sink takes its
-    ordinal and pushes the existing call's ordinal up one, so the ref ``@copy#0`` now names a
-    different
-    call. This is the silent re-point the ref-identity gate measures against the durable judgement
-    store (a re-point that lands on a stored anchor must be re-anchored before a re-hunt).
+def test_adding_a_copy_alias_repoints_a_same_name_ordinal() -> None:
+    """Same-name, DIFFERENT call: an added alias spelled before two calls to an existing sink pushes
+    both of that sink's ordinals up by one, so ``@copy#1`` keeps its callee name (``memcpy``) yet
+    names a different call than before. A comparison that looked only at the sink name would pass
+    this unchanged -- the name at #1 is ``memcpy`` on both sides -- so the ref identity has to be
+    (name, occurrence), never the name alone. #0 additionally re-points by name (memcpy -> mempcpy);
+    both forms live in one fixture.
 
-    Synthetic, not copied from a real ref. Reconstructs the old vocabulary as COPY minus the batch's
-    additions and recomputes on the same body, which is what the real audit does.
+    Synthetic, not copied from a real ref: the old vocabulary is COPY minus this batch's additions,
+    recomputed on the same body.
 
-    MUTATION (must go RED): order sink_callsites by callee name instead of source position -> the
-    alias no longer takes index 0 by being spelled first and the re-point is not reproduced."""
-    text = "mempcpy(d1, s1, n1); memcpy(d2, s2, n2);"
+    MUTATION (must go RED): order sink_callsites by callee name instead of source position, or drop
+    the occurrence from the identity so #1's memcpy-before and memcpy-after compare equal."""
+    text = "mempcpy(w, x, y); memcpy(a, b, c); memcpy(d, e, f);"
     old = _ordinal_map(text, COPY - _ADDED_COPY_ALIASES)
     new = _ordinal_map(text, COPY)
-    assert old == {0: ("memcpy", 0)}
-    assert new == {0: ("mempcpy", 0), 1: ("memcpy", 0)}
-    assert old[0] != new[0]  # ordinal 0 re-points: memcpy -> mempcpy
+    assert old == {0: ("memcpy", 0), 1: ("memcpy", 1)}
+    assert new == {0: ("mempcpy", 0), 1: ("memcpy", 0), 2: ("memcpy", 1)}
+    assert new[0][0] != old[0][0]  # #0 re-points by NAME: memcpy -> mempcpy
+    assert new[1][0] == old[1][0] == "memcpy"  # #1 keeps the callee name...
+    assert new[1][1] != old[1][1]  # ...but names a different call (occurrence 1 -> 0)
+
+
+def test_function_level_fallback_ref_repoints_when_the_first_name_changes() -> None:
+    """The third re-point form: a function whose path callees are all indirect (no textual call to
+    locate) yields ONE function-level candidate carrying the BARE ``@path_sink`` ref, whose evidence
+    is the alphabetically-first path callee. An added alias that sorts first becomes that evidence,
+    so the bare ref -- which has no ``#N`` -- names a different sink while its string is unchanged.
+    The identity comparison must cover bare refs too, not only the ``#N`` ones.
+
+    MUTATION (must go RED): anchor the fallback at a fixed name instead of sorted(cc)[0], or exclude
+    the no-ordinal refs from the identity comparison."""
+    fr = FuncRef(binary_name="b", func_name="f", func_id=1)
+    callees = ["open", "fopen64"]
+    body = "code *p; p = fopen64; (*p)(name, mode);"  # no textual open( / fopen64( to locate
+    saved = shapes.PATH_SINK
+    try:
+        shapes.PATH_SINK = saved - _ADDED_PATH_ALIASES
+        (old,) = shapes.pattern_path(fr, callees, body)
+        shapes.PATH_SINK = saved
+        (new,) = shapes.pattern_path(fr, callees, body)
+    finally:
+        shapes.PATH_SINK = saved
+    assert old.sink_callsite_index is None and new.sink_callsite_index is None  # bare refs
+    assert old.evidence == "open"  # sorted({open})[0]
+    assert new.evidence == "fopen64"  # sorted({open, fopen64})[0] -> the bare ref re-points
 
 
 def test_a_newly_locatable_alias_flips_a_function_off_its_bare_ref() -> None:
