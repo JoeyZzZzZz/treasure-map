@@ -21,10 +21,11 @@ import pytest
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import InstanceRow
 from treasure_map.lib.atlas.writer import add_instance, upsert_pattern
-from treasure_map.lib.query import explain_candidate, get_sink_provenance
+from treasure_map.lib.query import explain_candidate, get_sink_provenance, triage
 from treasure_map.lib.query.triage import (
     _fmt_arity,
     _is_proven_safe,
+    _matches,
     _sink_provenance_summary,
     _writer_args_class,
 )
@@ -611,3 +612,73 @@ def test_get_sink_provenance_detail_surfaces_value_kind(tmp_path: Path) -> None:
         conn.close()
     va = detail["record"]["provenance"]["writers"][0]["varargs"][0]
     assert va["source"]["value_kind"] == "ambiguous_0x"  # not stripped — the limitation is visible
+
+
+# ── a candidate's nvram key / origin come from its OWN sink, end to end ─────────────────
+#
+# The anchored sink (system) resolved nothing; the sibling printf resolved an nvram key. Read
+# unscoped, the candidate was named for wan_proto and floated into the nvram-source lens on a key
+# that reaches another call in the same function.
+_BORROWABLE = [
+    {
+        "sink_idx": 0,
+        "sink": "system",
+        "sink_addr": "0x100",
+        "arg_idx": 0,
+        "provenance": {"kind": "unresolved"},
+    },
+    {
+        "sink_idx": 1,
+        "sink": "printf",
+        "sink_addr": "0x200",
+        "arg_idx": 0,
+        "provenance": {"kind": "call_return", "callee": "nvram_get", "const_args": ["wan_proto"]},
+    },
+]
+
+
+def test_get_sink_provenance_scopes_the_origin_to_the_candidates_own_sink(tmp_path: Path) -> None:
+    """G6. The origin travels beside the records, so it is a candidate-level fact and answers for
+    the candidate's anchored sink -- including when a sink_idx selects another record, because the
+    records are addressable by idx on their own and the origin is not one of them.
+
+    The records payload itself is untouched: narrowing it would hide a sink the caller asked for.
+
+    MUTATION (must go RED): select flow_evidence alone again and call source_origin without the
+    anchor."""
+    conn = open_atlas(_seed(tmp_path, provenance=_BORROWABLE))
+    full = get_sink_provenance(conn, "run_x#fn7@cmd")
+    assert {r["sink"] for r in full["records"]} == {"system", "printf"}  # payload intact
+    assert "source_origin" not in full  # the anchored sink resolved no origin
+    one = get_sink_provenance(conn, "run_x#fn7@cmd", sink_idx=1)
+    assert "source_origin" not in one
+    conn.close()
+
+
+def test_triage_candidate_does_not_borrow_a_sibling_sinks_nvram_key(tmp_path: Path) -> None:
+    """G7, the wiring gate. The scoped readers take the anchor as a required argument, which stops
+    a caller forgetting it -- but not a caller passing one that is silently None, and the explain
+    path reads the column through a helper that returns None for a column it did not select. Only
+    an end-to-end assertion catches that, so this one runs the real triage() over a real instance.
+
+    MUTATION (must go RED): pass None as the anchor at the _nvram_source_key call site -> the
+    candidate is named for wan_proto again and floats into the nvram-source lens."""
+    conn = open_atlas(_seed(tmp_path, provenance=_BORROWABLE))
+    (candidate,) = triage(conn)
+    assert candidate.nvram_source_key is None
+    assert candidate.dim("source_writability").state == "excluded"
+    assert _matches(candidate, "source", "nvram") is False
+    conn.close()
+
+
+def test_explain_candidate_does_not_borrow_a_sibling_sinks_origin(tmp_path: Path) -> None:
+    """G8, the other half of the wiring gate -- the explain path reaches source_origin through its
+    own call site, so G7 passing says nothing about this one.
+
+    MUTATION (must go RED): pass None as the anchor at the explain_candidate call site -> the
+    sibling's nvram origin reappears as this candidate's."""
+    conn = open_atlas(_seed(tmp_path, provenance=_BORROWABLE))
+    ex = explain_candidate(conn, "run_x#fn7@cmd")
+    assert ex is not None
+    assert ex.source_origin is None
+    conn.close()

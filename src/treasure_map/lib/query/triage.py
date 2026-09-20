@@ -148,9 +148,11 @@ class TriageCandidate:
     # The pattern's structural fingerprint (the same key cross_firmware_patterns / pattern_density
     # group by), surfaced so a consumer can pivot from a recurring pattern to its instances.
     structural_fingerprint: str | None = None
-    # The nvram key feeding the sink argument, when the def-use provenance resolved the source to an
-    # nvram getter: its web-settability drives the controllability annotation. None when the
-    # source is not a resolved nvram getter. A surfaced fact, never a verdict.
+    # The nvram key feeding THIS candidate's anchored sink argument, when the def-use provenance
+    # resolved that sink's source to an nvram getter; None when it did not. It feeds the
+    # nvram-source lens and the source_writability layer — it does NOT drive the controllability
+    # annotation, which looks up the web-settable keys itself and keeps its own scope. A surfaced
+    # fact, never a verdict.
     nvram_source_key: str | None = None
     # The honest three-state map layers. Every dimension is a first-class, queryable /
     # sortable / filterable annotation here — NOT buried in flow_evidence JSON to dig out.
@@ -880,7 +882,8 @@ def get_sink_provenance(
     fact, never a verdict. Unknown ref / idx is reported honestly, never as an empty-but-successful
     result."""
     row = conn.execute(
-        "SELECT flow_evidence FROM instance WHERE evidence_ref = ? ORDER BY instance_id LIMIT 1",
+        "SELECT flow_evidence, sink_anchor FROM instance WHERE evidence_ref = ? "
+        "ORDER BY instance_id LIMIT 1",
         (evidence_ref,),
     ).fetchone()
     if row is None:
@@ -891,7 +894,9 @@ def get_sink_provenance(
     # The origin fragments, alongside the records rather than inside them: a record says what the
     # def-use pass saw at the sink, an origin says where that value came from. Read-time and
     # derived — this call stores nothing and the controllability verdict never sees it.
-    origin = source_origin(conn, row[0], wrapper_names=_nvram_wrapper_names(conn))
+    origin = source_origin(
+        conn, row[0], sink_anchor=row[1], wrapper_names=_nvram_wrapper_names(conn)
+    )
     if sink_idx is None:
         out: dict[str, Any] = {
             "evidence_ref": evidence_ref,
@@ -969,18 +974,26 @@ def _nvram_key_from_source(source: Any, wrapper_names: frozenset[str] = frozense
 
 
 def _nvram_source_key(
-    flow_evidence: str | None, wrapper_names: frozenset[str] = frozenset()
+    flow_evidence: str | None, wrapper_names: frozenset[str], sink_anchor: str | None
 ) -> str | None:
-    """Scan the stored sink_arg_provenance for a resolved nvram-accessor source and return its key.
+    """The nvram key feeding THIS candidate's anchored sink argument, or None.
 
-    Looks at each sink's top-level provenance AND the varargs of its stack-buffer writers (where an
-    nvram value most often enters, via ``snprintf("...%s...", nvram_get(key))`` or a wrapper of it).
-    Returns the first resolved key; None when no sink's value came from a recognised nvram getter or
-    thin wrapper (``wrapper_names``). A surfaced FIELD (which key is involved) — deliberately broad
-    (not dominance-scoped): naming a key here only makes the candidate visible in the nvram-source
-    view and its source_writability layer; the controllability VERDICT is judged separately and is
-    dominance-scoped, so a broad field can never over-assert control."""
-    for rec in _sink_provenance_records(flow_evidence):
+    Looks at the anchored sink's own provenance AND the varargs of its stack-buffer writers (where
+    an nvram value most often enters, via ``snprintf("...%s...", nvram_get(key))`` or a wrapper of
+    it). Returns the first key resolved there; None when that sink's value came from no recognised
+    nvram getter or thin wrapper (``wrapper_names``).
+
+    Scoped to the anchored sink through ``_writer_scoped_records``. The records are stored per
+    FUNCTION, so reading them unscoped answered with whichever sink in the function resolved a key
+    first: a candidate could be named for a key reaching a SIBLING call rather than its own. This
+    field is what the nvram-source lens floats on and what source_writability reads, so a borrowed
+    key floated a candidate into a view it does not belong in. No key for the anchored sink now
+    reads as None — not attributed, rather than attributed to a neighbour.
+
+    Still not a verdict, and still not dominance-scoped WITHIN the sink: the controllability verdict
+    is judged separately (``_verdict_from_provenance``), keeps its own scope and its own liberal
+    fallback, so this field can over-assert control in neither direction."""
+    for rec in _writer_scoped_records(flow_evidence, sink_anchor):
         prov = rec.get("provenance")
         prov = prov if isinstance(prov, dict) else {}
         key = _nvram_key_from_source(prov, wrapper_names)
@@ -1056,16 +1069,23 @@ def _dispatch_origins(flow_evidence: str | None) -> list[dict[str, Any]]:
 
 
 def _provenance_origins(
-    flow_evidence: str | None, wrapper_names: frozenset[str]
+    flow_evidence: str | None, wrapper_names: frozenset[str], sink_anchor: str | None
 ) -> list[dict[str, Any]]:
-    """Origins from the def-use records: the calls a sink argument's value came back from.
+    """Origins from the def-use records of THIS candidate's anchored sink: the calls its argument's
+    value came back from.
 
-    Walks the SAME places ``_nvram_source_key`` walks — each record's own provenance and the
-    varargs of its stack-buffer writers — because that is where an nvram value actually enters
+    Walks the SAME places ``_nvram_source_key`` walks — the record's own provenance and the varargs
+    of its stack-buffer writers — because that is where an nvram value actually enters
     (``snprintf("...%s", nvram_get(key))``). Reusing that traversal, and ``_nvram_key_from_source``
     for the key itself, is deliberate: a second implementation of "is this an nvram read" would
     drift from the one the controllability layer consults, and then the two would disagree about
-    the same candidate."""
+    the same candidate.
+
+    Scoped to the anchored sink for the reason ``_nvram_source_key`` is: the records are per
+    FUNCTION, so unscoped this reported a sibling sink's origin as this candidate's. An origin says
+    where THIS value came from, and a neighbour's answer is not a weaker version of that — it is a
+    different question. With no record for the anchored sink the list is empty, and the caller
+    reports no origin rather than one belonging to another call."""
     out: list[dict[str, Any]] = []
     seen: set[tuple[Any, ...]] = set()
 
@@ -1075,7 +1095,7 @@ def _provenance_origins(
             seen.add(marker)
             out.append(origin)
 
-    for rec in _sink_provenance_records(flow_evidence):
+    for rec in _writer_scoped_records(flow_evidence, sink_anchor):
         prov = rec.get("provenance")
         prov = prov if isinstance(prov, dict) else {}
         sources: list[Any] = [prov]
@@ -1158,6 +1178,7 @@ def source_origin(
     conn: sqlite3.Connection,
     flow_evidence: str | None,
     *,
+    sink_anchor: str | None,
     wrapper_names: frozenset[str] = frozenset(),
 ) -> dict[str, Any] | None:
     """Where this candidate's sink value comes from, as far as the analysis actually resolved it.
@@ -1167,8 +1188,14 @@ def source_origin(
     and an empty list never masquerades as "we looked and there is no origin".
 
     Read-only and derived: nothing here is stored, and the controllability verdict cannot see it.
+
+    ``sink_anchor`` scopes the PROVENANCE half to this candidate's own sink. The dispatch half is
+    deliberately not scoped: a string-keyed lead says which key routes to the FUNCTION, so it is
+    the same fact for every candidate in it and has no sink to be scoped by.
     """
-    origins = _dispatch_origins(flow_evidence) + _provenance_origins(flow_evidence, wrapper_names)
+    origins = _dispatch_origins(flow_evidence) + _provenance_origins(
+        flow_evidence, wrapper_names, sink_anchor
+    )
     if not origins:
         return None
     _origin_cross_references(conn, origins)
@@ -2163,7 +2190,7 @@ def _candidate(
     # web-settable key the verdict found reaching the sink. Wrapper-aware (M1) so a key read through
     # a shared accessor (the common case) still shows in source_writability and the nvram-source
     # view, coherent with the controllability reading.
-    nvram_key = _nvram_source_key(fe, wrapper_names)
+    nvram_key = _nvram_source_key(fe, wrapper_names, sink_anchor)
     if nvram_key is None:
         web_keys = _web_settable_keys_reaching_sink(conn, fe, sink_anchor)
         nvram_key = web_keys[0] if web_keys else None
@@ -2909,6 +2936,7 @@ def explain_candidate(conn: sqlite3.Connection, evidence_ref: str) -> CandidateE
         source_origin=source_origin(
             conn,
             _row_get(row, "flow_evidence"),
+            sink_anchor=_row_get(row, "sink_anchor"),
             wrapper_names=_nvram_wrapper_names(conn),
         ),
         evidence_surface=evidence_surface(

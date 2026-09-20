@@ -55,9 +55,13 @@ def _atlas(tmp_path: Path) -> sqlite3.Connection:
 
 
 def _origin(conn: sqlite3.Connection, evidence: dict[str, Any] | None) -> dict[str, Any] | None:
+    # sink_anchor=None on purpose: these fixtures carry a single sink, so there is no sibling to
+    # borrow from and the no-anchor branch reads the same records a matching anchor would. The
+    # per-sink scoping itself is guarded in test_triage.py, against fixtures that DO have siblings.
     return source_origin(
         conn,
         json.dumps(evidence) if evidence is not None else None,
+        sink_anchor=None,
         wrapper_names=_nvram_wrapper_names(conn),
     )
 

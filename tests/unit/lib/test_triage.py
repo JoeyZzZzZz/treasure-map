@@ -1624,3 +1624,97 @@ def test_writer_via_wrapper_is_decided_before_any_scoping() -> None:
     fe = _prov_evidence(("printf", {"kind": "constant"}), wrapper=True)
     assert _dim_writer(fe, "system").value == "via_wrapper"
     assert _dim_writer(fe, None).value == "via_wrapper"
+
+
+# ── the provenance consumers answer for the candidate's OWN sink ────────────────────────
+
+_NVRAM_SRC = {"kind": "call_return", "callee": "nvram_get", "const_args": ["wan_proto"]}
+_SIBLING_SRC = {"kind": "call_return", "callee": "nvram_get", "const_args": ["sibling_key"]}
+
+
+def test_nvram_source_key_reads_only_its_own_sinks_provenance() -> None:
+    """G1. sink_arg_provenance is stored per FUNCTION, so a function that formats and then executes
+    carries a record for each. Reading them unscoped named the command candidate for a key that
+    reaches the sprintf beside it, and that key is what floats a candidate into the nvram-source
+    lens -- so a borrowed key put it in a view it does not belong in.
+
+    MUTATION (must go RED): iterate _sink_provenance_records instead of _writer_scoped_records."""
+    from treasure_map.lib.query.triage import _nvram_source_key
+
+    fe = _prov_evidence(("sprintf", _NVRAM_SRC), ("system", {"kind": "unresolved"}))
+    assert _nvram_source_key(fe, frozenset(), "system") is None
+    assert _nvram_source_key(fe, frozenset(), "sprintf") == "wan_proto"
+
+
+def test_source_origin_reads_only_its_own_sinks_provenance(tmp_path: Path) -> None:
+    """G2. An origin says where THIS candidate's value came from. A sibling sink's origin is not a
+    weaker answer to that question, it is an answer to a different one.
+
+    MUTATION (must go RED): drop sink_anchor from the _provenance_origins call in source_origin."""
+    from treasure_map.lib.query.triage import source_origin
+
+    conn = _atlas(tmp_path)
+    fe = _prov_evidence(("system", _NVRAM_SRC), ("printf", _SIBLING_SRC))
+    out = source_origin(conn, fe, sink_anchor="system", wrapper_names=frozenset())
+    assert out is not None
+    keys = {o.get("key") for o in out["origins"]}
+    assert "wan_proto" in keys
+    assert "sibling_key" not in keys
+
+
+def test_provenance_consumers_never_fabricate_for_an_unrecorded_sink(tmp_path: Path) -> None:
+    """G3. With no record for the anchored sink the honest answer is nothing: no key, no origin.
+    Not attributed beats attributed to a neighbour -- the borrowed answer reads as a finding about
+    this candidate, and a reader has no way to see that it came from another call.
+
+    MUTATION (must go RED): give the writer scoper a liberal fallback (return every record when the
+    anchor matches none), the polarity controllability uses and this side must not."""
+    from treasure_map.lib.query.triage import _nvram_source_key, source_origin
+
+    conn = _atlas(tmp_path)
+    fe = _prov_evidence(("printf", _NVRAM_SRC))
+    assert _nvram_source_key(fe, frozenset(), "execve") is None
+    assert source_origin(conn, fe, sink_anchor="execve", wrapper_names=frozenset()) is None
+
+
+def test_dispatch_origins_are_deliberately_not_sink_scoped(tmp_path: Path) -> None:
+    """G4, the reverse gate. A string-keyed dispatch lead says which key routes to the FUNCTION, so
+    it is the same fact for every candidate in it and has no sink to be scoped by. Scoping it too
+    would drop a real lead from every candidate whose own sink has no def-use record.
+
+    MUTATION (must go RED): scope or drop the dispatch half of source_origin, so it stops
+    surviving an anchor that matches no def-use record."""
+    from treasure_map.lib.query.triage import source_origin
+
+    conn = _atlas(tmp_path)
+    fe = json.dumps(
+        {
+            "reachability_leads": [
+                {"key": "route_key", "mechanism": "strcmp", "through": "h", "via": "v", "hops": 1}
+            ],
+            "sink_arg_provenance": [{"sink": "printf", "provenance": _SIBLING_SRC}],
+        }
+    )
+    out = source_origin(conn, fe, sink_anchor="system", wrapper_names=frozenset())
+    assert out is not None  # the dispatch lead survives...
+    axes = {o["axis"] for o in out["origins"]}
+    assert axes == {"dispatch"}  # ...while the sibling's provenance origin does not
+    assert {o.get("endpoint") for o in out["origins"]} == {"route_key"}
+
+
+def test_provenance_consumers_without_an_anchor_keep_the_unscoped_reading(tmp_path: Path) -> None:
+    """G5, mirroring the writer layer's own no-anchor guard. No candidate in the scanned firmware
+    reaches this branch (every stored candidate carries a sink_anchor), so it cannot be checked
+    against data at all -- which is exactly why it needs a test. Nothing to scope BY means keeping
+    the reading this has always had, not being forced to empty by a scope that cannot apply.
+
+    MUTATION (must go RED): return None or [] for a missing anchor instead of the unscoped
+    records."""
+    from treasure_map.lib.query.triage import _nvram_source_key, source_origin
+
+    conn = _atlas(tmp_path)
+    fe = _prov_evidence(("printf", _NVRAM_SRC))
+    assert _nvram_source_key(fe, frozenset(), None) == "wan_proto"
+    out = source_origin(conn, fe, sink_anchor=None, wrapper_names=frozenset())
+    assert out is not None
+    assert "wan_proto" in {o.get("key") for o in out["origins"]}

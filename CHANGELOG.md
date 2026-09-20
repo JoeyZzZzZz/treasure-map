@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A candidate's nvram key and origin fragments now come from its own sink, not a neighbour's.**
+  `sink_arg_provenance` is stored per FUNCTION, so a function that reads a config value and then
+  runs a command carries a record for each call. Two consumers walked those records unscoped and
+  took the first that resolved: `nvram_source_key` — the field the nvram-source lens floats on and
+  `source_writability` reads — and the origin fragments behind `explain_candidate`'s
+  `source_origin` and `get_sink_provenance`. A candidate could therefore be named for a key that
+  reaches a neighbouring call, and be floated into a view on the strength of it. Both now read only
+  the anchored sink's records, through the same strict scope the writer layer uses; with none, the
+  key is None and the origin list empty — not attributed, rather than attributed to a neighbour.
+  Measured across the scanned firmware: 38 candidates lose a borrowed key and 67 lose borrowed
+  origins, every one of those to zero, and none gains either.
+  ★ The revocations rest on presence, not absence. Every affected candidate HAS a def-use record
+  for its own anchored sink, so the new reading is "that sink resolved no nvram key", never
+  "nothing was looked at".
+  ★ The dispatch half of `source_origin` is deliberately NOT scoped: a string-keyed lead says which
+  key routes to the FUNCTION, so it is the same fact for every candidate in it and has no sink to
+  be scoped by.
+  ★ The nvram-source lens holds fewer candidates as a result (284 to 246 here) — those 38 were
+  floating on a neighbour's key. Nothing else moves: controllability, every sort atom and the whole
+  default ordering are unchanged candidate for candidate, because the verdict keeps its own scope
+  and its own liberal fallback, and this field never fed it.
+
+### Fixed
+
 - **The writer layer no longer answers with a sibling sink's writer.** `sink_arg_provenance` is
   recorded per FUNCTION, so a function that both prints and executes carries a record for each; the
   writer dimension read them unscoped and reported the first one that resolved anything. A
