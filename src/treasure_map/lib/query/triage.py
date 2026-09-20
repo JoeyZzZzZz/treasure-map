@@ -518,6 +518,39 @@ def _scoped_records(flow_evidence: str | None, sink_anchor: str | None) -> list[
     return recs
 
 
+def _writer_scoped_records(
+    flow_evidence: str | None, sink_anchor: str | None
+) -> list[dict[str, Any]]:
+    """The sink_arg_provenance records for the candidate's anchored sink — STRICTLY, no fallback.
+
+    The sibling of ``_scoped_records``, and deliberately not it: the two want OPPOSITE fallbacks,
+    because a failed anchor match pushes them in opposite directions.
+
+    ``_scoped_records`` feeds controllability, where the safe failure is keeping a candidate alive:
+    falling back to every record may promote a constant sibling, but it can never hide a
+    controllable one behind a failed match.
+
+    A located writer has the other polarity. It is a surfaced fact that reads as reassurance — "the
+    sink argument resolves to a constant writer" — so taking it from a SIBLING sink's record states
+    something about this sink that was never established, in the direction that reassures. Measured
+    on real firmware before this scope existed: a command-execution candidate reported the constant
+    writer of a printf sitting in the same function. With no record for the anchored sink the
+    honest answer is none, and the caller reports not_traced — a '?', which never sinks a candidate.
+
+    Scoped by sink NAME, the anchor a candidate actually carries; two calls to the same sink in one
+    function still share these records. That is the granularity controllability is scoped at too,
+    and narrowing either to a callsite needs an anchor this layer does not have.
+
+    A candidate with no sink anchor has nothing to scope BY, so it keeps the unscoped reading it
+    has always had rather than being forced to not_traced by a scope that cannot be applied. No
+    candidate in the scanned corpus is in that state, so the branch is covered by a unit test
+    rather than by data."""
+    recs = _sink_provenance_records(flow_evidence)
+    if not sink_anchor:
+        return recs
+    return [r for r in recs if r.get("sink") == sink_anchor]
+
+
 def _verdict_from_provenance(
     conn: sqlite3.Connection, flow_evidence: str | None, sink_anchor: str | None
 ) -> str | None:
@@ -1973,9 +2006,15 @@ def _dim_sink_impact(sink_class: str, overrides: dict[str, int] | None = None) -
     )
 
 
-def _dim_writer(flow_evidence: str | None) -> Dimension:
+def _dim_writer(flow_evidence: str | None, sink_anchor: str | None) -> Dimension:
     """Who writes the sink argument's value? located / via_wrapper / not_traced, from the def-use
-    provenance. A ? (not_traced) never sinks."""
+    provenance of THIS candidate's own sink. A ? (not_traced) never sinks.
+
+    Scoped through ``_writer_scoped_records``: the stored provenance is per FUNCTION, so reading it
+    unscoped answered with whichever sink in the function happened to resolve first — including a
+    sink of another class entirely. ``located`` is a reassuring fact, so that borrowing was wrong in
+    the direction that reassures. Not ``_scoped_records``: its liberal fallback is right for
+    controllability and wrong here (see that pair's docstrings)."""
     if _flow_path_obj(flow_evidence).get("sink_via_wrapper"):
         return Dimension(
             "writer",
@@ -1984,7 +2023,7 @@ def _dim_writer(flow_evidence: str | None) -> Dimension:
             "flow_evidence.flow_path.wrapper",
             "the value is forwarded one hop through a thin wrapper to the real sink",
         )
-    for rec in _sink_provenance_records(flow_evidence):
+    for rec in _writer_scoped_records(flow_evidence, sink_anchor):
         prov = rec.get("provenance")
         prov = prov if isinstance(prov, dict) else {}
         if prov.get("kind") == "constant":
@@ -2101,7 +2140,7 @@ def _build_dimensions(
         _dim_reachability(entry_reach, web_triggers, string_keyed_edges, flow_evidence),
         _dim_filtering(flow_evidence),
         _dim_sink_impact(sink_class),
-        _dim_writer(flow_evidence),
+        _dim_writer(flow_evidence, sink_anchor),
         _dim_completeness(),
     )
 

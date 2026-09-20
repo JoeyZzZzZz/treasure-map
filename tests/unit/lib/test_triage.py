@@ -1534,3 +1534,93 @@ def test_every_accepted_dimension_can_actually_reject_something() -> None:
         assert all(_matches(c, unknown, v) for v in probes for c in candidates), (
             f"{unknown} is supposed to be unknown-and-match-all; if that changed, add it to the set"
         )
+
+
+# ── the writer dimension answers for the candidate's OWN sink ───────────────────────────
+
+
+def _prov_evidence(*records: tuple[str, dict[str, object]], wrapper: bool = False) -> str:
+    """flow_evidence carrying one sink_arg_provenance record per (sink name, provenance) pair."""
+    payload: dict[str, object] = {
+        "sink_arg_provenance": [{"sink": s, "provenance": p} for s, p in records]
+    }
+    if wrapper:
+        payload["flow_path"] = {"sink_via_wrapper": True}
+    return json.dumps(payload)
+
+
+def test_writer_reads_only_its_own_sinks_provenance() -> None:
+    """The stored provenance is per FUNCTION, so a function that both prints and executes carries a
+    record for each. Reading them unscoped answered the command candidate with the printf's
+    constant writer -- "the sink argument resolves to a constant writer", about a sink that
+    resolved nothing, in the direction that reassures. Each candidate must answer from its own
+    anchored sink's record.
+
+    MUTATION (must go RED): iterate _sink_provenance_records instead of _writer_scoped_records in
+    _dim_writer -> the system candidate reports located again, borrowed from printf."""
+    from treasure_map.lib.query.triage import _dim_writer
+
+    fe = _prov_evidence(
+        ("printf", {"kind": "constant"}),
+        ("system", {"kind": "unresolved"}),
+    )
+    assert _dim_writer(fe, "system").value == "not_traced"
+    assert _dim_writer(fe, "printf").value == "located"
+
+
+def test_writer_scope_covers_the_dominating_writer_exit_too() -> None:
+    """Both located exits are scoped, not just the constant one: a sibling's nearest dominating
+    writer is as much a claim about a sink that was never traced.
+
+    MUTATION (must go RED): scope only the ``kind == constant`` branch and leave the dominating
+    writer branch reading every record."""
+    from treasure_map.lib.query.triage import _dim_writer
+
+    fe = _prov_evidence(
+        ("sprintf", {"nearest_dominating_writer": "local_38"}),
+        ("system", {"kind": "unresolved"}),
+    )
+    assert _dim_writer(fe, "system").value == "not_traced"
+    assert _dim_writer(fe, "sprintf").value == "located"
+
+
+def test_writer_never_fabricates_when_the_anchored_sink_has_no_record() -> None:
+    """Scoping may only TIGHTEN. With no record for the anchored sink the honest answer is
+    not_traced -- a '?', which never sinks a candidate -- and never a writer borrowed to fill the
+    gap. This is the direction that matters: located reads as reassurance, so inventing one is the
+    failure that hides work, while a '?' only asks for a look.
+
+    MUTATION (must go RED): fall back to every record when the anchor matches none (the liberal
+    fallback _scoped_records uses for controllability, which is wrong at this polarity)."""
+    from treasure_map.lib.query.triage import _dim_writer
+
+    fe = _prov_evidence(("fprintf", {"kind": "constant"}))
+    assert _dim_writer(fe, "execve").value == "not_traced"
+
+
+def test_writer_without_a_sink_anchor_keeps_the_unscoped_reading() -> None:
+    """The no-anchor branch, which no candidate in the scanned firmware reaches (every stored
+    candidate carries a sink_anchor) and which therefore cannot be checked against data at all.
+    A candidate with no anchor has nothing to scope BY, so it keeps the reading it has always had
+    rather than being forced to not_traced by a scope that cannot be applied.
+
+    Covered here BECAUSE the data cannot cover it: an unreachable-on-this-corpus branch with no
+    test is a branch whose behaviour nobody has ever checked.
+
+    MUTATION (must go RED): return [] for a missing anchor instead of the unscoped records."""
+    from treasure_map.lib.query.triage import _dim_writer
+
+    fe = _prov_evidence(("printf", {"kind": "constant"}))
+    assert _dim_writer(fe, None).value == "located"
+
+
+def test_writer_via_wrapper_is_decided_before_any_scoping() -> None:
+    """The wrapper early-return is unchanged and anchor-independent: the value is forwarded one hop,
+    so which record the anchor would have selected does not arise.
+
+    MUTATION (must go RED): disable the wrapper early-return so the record scan decides first."""
+    from treasure_map.lib.query.triage import _dim_writer
+
+    fe = _prov_evidence(("printf", {"kind": "constant"}), wrapper=True)
+    assert _dim_writer(fe, "system").value == "via_wrapper"
+    assert _dim_writer(fe, None).value == "via_wrapper"

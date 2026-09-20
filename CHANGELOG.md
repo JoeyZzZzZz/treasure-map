@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The writer layer no longer answers with a sibling sink's writer.** `sink_arg_provenance` is
+  recorded per FUNCTION, so a function that both prints and executes carries a record for each; the
+  writer dimension read them unscoped and reported the first one that resolved anything. A
+  command-execution candidate in such a function was told "the sink argument resolves to a constant
+  writer" on the strength of a `printf` sitting beside it — a statement about a sink that resolved
+  nothing, made in the direction that reassures. Each candidate now answers from its own anchored
+  sink's records; with none, it reports `not_traced`, a `?` that never sinks anything.
+  Measured across the scanned firmware: 583 candidates change, every one of them `located` →
+  `not_traced` and none the other way (fmt_string 431, cmd 152, no other sink class);
+  `via_wrapper` is untouched.
+  ★ The scope is by sink NAME — the anchor a candidate actually carries — so two calls to the same
+  sink in one function still share these records. That is the granularity controllability is scoped
+  at too; narrowing either to a callsite needs an anchor this layer does not have yet.
+  ★ Deliberately NOT the liberal fallback the controllability scope uses. There, falling back to
+  every record can only keep a candidate alive; here it would hand back a sibling's constant
+  writer, which is the failure being fixed.
+  ★ Review ORDER moves with it: a located writer is a tertiary only-up promote, so a candidate that
+  loses it settles back among its peers — in one firmware, 2834 of 18111 candidates change
+  position, 116 of them downward and the rest rising to meet them. Nothing crosses the
+  proven-safe line: the set of candidates that sink is unchanged, because only a constant
+  controllability sinks one and this touches neither.
+
 ### Added
 
 - **The C library's ABI aliases of the recognized input sources are recognized too.** A function
