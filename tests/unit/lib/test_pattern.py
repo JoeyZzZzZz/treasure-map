@@ -1504,23 +1504,60 @@ def test_a_newly_locatable_alias_flips_a_function_off_its_bare_ref() -> None:
 # ── libc ABI aliases of the recognized sources ─────────────────────────────────────────
 #
 # The delta is a test-local constant so the old vocabulary can be reconstructed: adding a source
-# name re-labels a candidate, it never creates one, and both halves need checking.
-_ADDED_SOURCE_ALIASES = frozenset(
-    {"__isoc99_sscanf", "__isoc99_fscanf", "__isoc99_scanf", "fgets_unlocked", "__getdelim"}
-)
-# Same-family names deliberately NOT listed: no call to any of them exists in the corpus this set
-# was closed over, and listing a source nobody calls claims a reading that was never observed.
-_UNLISTED_SOURCE_CANDIDATES = frozenset(
+# name re-labels a candidate, it never creates one, and both halves need checking. An alias goes in
+# the SAME strength set as the base it mirrors -- a network alias placed in the weak set would
+# understate exactly the controllability the split exists to record.
+_ADDED_WEAK_ALIASES = frozenset(
     {
-        "__isoc99_vsscanf",
-        "vsscanf",
-        "__isoc99_vfscanf",
-        "vfscanf",
-        "__isoc99_vscanf",
-        "vscanf",
+        "__isoc99_sscanf",
+        "__isoc99_fscanf",
+        "__isoc99_scanf",
+        "fgets_unlocked",
+        "__getdelim",
+        "__libc_read",
+        "__read_nocancel",
         "fread_unlocked",
+        "pread64",
+        "__libc_pread",
+        "__libc_pread64",
+        "__pread64",
     }
 )
+_ADDED_STRONG_ALIASES = frozenset({"__libc_recv", "__recv", "__libc_recvfrom", "__libc_recvmsg"})
+_ADDED_SOURCE_ALIASES = _ADDED_WEAK_ALIASES | _ADDED_STRONG_ALIASES
+_SOURCE_ALIAS_BASE = {
+    "__isoc99_sscanf": "sscanf",
+    "__isoc99_fscanf": "fscanf",
+    "__isoc99_scanf": "scanf",
+    "fgets_unlocked": "fgets",
+    "__getdelim": "getdelim",
+    "__libc_read": "read",
+    "__read_nocancel": "read",
+    "fread_unlocked": "fread",
+    "pread64": "pread",
+    "__libc_pread": "pread",
+    "__libc_pread64": "pread",
+    "__pread64": "pread",
+    "__libc_recv": "recv",
+    "__recv": "recv",
+    "__libc_recvfrom": "recvfrom",
+    "__libc_recvmsg": "recvmsg",
+}
+# Names the de-affixing rule reaches but that are deliberately NOT listed, each with the reason it
+# is actually out -- never "nothing calls it", which is a claim about a corpus rather than about
+# the symbol, and which was wrong for most of this list.
+#
+#   * the v-forms take a va_list where their base takes varargs. Different signature, so they are
+#     not the same call under another name; whether to read them as sources is a separate question
+#     from this alias rule, not something this rule answers.
+#   * read64 is not a C library name at all: the C library has no such entry point (read needs no
+#     large-file variant), and here a single application binary exports it and nothing imports it.
+#     Stripping "64" to reach "read" is a false positive of the mechanical rule.
+_UNLISTED_VA_LIST_FORMS = frozenset(
+    {"vscanf", "vsscanf", "vfscanf", "__isoc99_vscanf", "__isoc99_vsscanf", "__isoc99_vfscanf"}
+)
+_UNLISTED_NOT_A_LIBC_NAME = frozenset({"read64"})
+_UNLISTED_SOURCE_CANDIDATES = _UNLISTED_VA_LIST_FORMS | _UNLISTED_NOT_A_LIBC_NAME
 # One body per alias: the alias reads input, a copy sink then gives the function a candidate to
 # carry the source label. Without the alias recognized the same body is source_class=unknown.
 _SOURCE_ALIAS_BODY = {
@@ -1529,6 +1566,17 @@ _SOURCE_ALIAS_BODY = {
     "__isoc99_scanf": '__isoc99_scanf("%s", buf);',
     "fgets_unlocked": "fgets_unlocked(buf, 64, fh);",
     "__getdelim": "__getdelim(&line, &cap, 10, fh);",
+    "__libc_read": "__libc_read(fd, buf, 64);",
+    "__read_nocancel": "__read_nocancel(fd, buf, 64);",
+    "fread_unlocked": "fread_unlocked(buf, 1, 64, fh);",
+    "pread64": "pread64(fd, buf, 64, off);",
+    "__libc_pread": "__libc_pread(fd, buf, 64, off);",
+    "__libc_pread64": "__libc_pread64(fd, buf, 64, off);",
+    "__pread64": "__pread64(fd, buf, 64, off);",
+    "__libc_recv": "__libc_recv(sock, buf, 64, 0);",
+    "__recv": "__recv(sock, buf, 64, 0);",
+    "__libc_recvfrom": "__libc_recvfrom(sock, buf, 64, 0, sa, &sl);",
+    "__libc_recvmsg": "__libc_recvmsg(sock, msg, 0);",
 }
 
 
@@ -1609,22 +1657,36 @@ def test_a_source_alias_relabels_a_candidate_and_never_creates_one() -> None:
         assert n.structural_fingerprint != o.structural_fingerprint  # the two fields feed it
 
 
-def test_source_alias_vocabulary_stays_weak_and_unspeculative() -> None:
-    """The added names are WEAK sources (their bases are), and the same-family names that no call
-    in the corpus reaches stay out. Encoded as set relations so a later edit that promotes one to
-    STRONG, or quietly adds an unobserved name, fails here instead of shipping.
+def test_every_source_alias_inherits_the_strength_of_its_base() -> None:
+    """An alias must land in the SAME strength set as the base it mirrors. The split gates
+    reachability grading, so filing a network alias under weak would understate the very
+    controllability the split records, and filing a file read under strong would overstate it.
+    Asserted as "same set as the base" rather than as a hand-written list, so a new alias cannot be
+    added to the wrong side and still pass.
 
-    MUTATION (must go RED): move any alias into SOURCE_STRONG, or add one of the unlisted names."""
-    assert _ADDED_SOURCE_ALIASES <= SOURCE_WEAK
-    assert not (_ADDED_SOURCE_ALIASES & SOURCE_STRONG)
+    MUTATION (must go RED): move any __libc_recv* name into SOURCE_WEAK (or any read/pread alias
+    into SOURCE_STRONG)."""
+    assert _ADDED_WEAK_ALIASES <= SOURCE_WEAK
+    assert _ADDED_STRONG_ALIASES <= SOURCE_STRONG
+    assert not (_ADDED_WEAK_ALIASES & SOURCE_STRONG)
+    assert not (_ADDED_STRONG_ALIASES & SOURCE_WEAK)
     assert _ADDED_SOURCE_ALIASES <= SOURCE  # the union R-pattern reads
+    assert set(_SOURCE_ALIAS_BASE) == _ADDED_SOURCE_ALIASES  # no alias without a declared base
+    for alias, base in _SOURCE_ALIAS_BASE.items():
+        for strength in (SOURCE_STRONG, SOURCE_WEAK):
+            assert (alias in strength) == (base in strength), (alias, base)
+
+
+def test_names_the_alias_rule_reaches_but_does_not_list_stay_out() -> None:
+    """The exclusions are held to a reason that is about the SYMBOL, not about a corpus. A v-form
+    takes a va_list where its base takes varargs, so it is not the same call under another name;
+    read64 is not a C library entry point at all. Both readings stay true however many calls a
+    future corpus contains -- the earlier version of this guard pinned "nothing calls these", which
+    was false for most of the list and would have blocked adding one that belonged.
+
+    MUTATION (must go RED): list any of these names in SOURCE."""
     assert not (_UNLISTED_SOURCE_CANDIDATES & SOURCE)
-    # every alias sits beside a base that is itself a recognized weak source
-    for alias, base in {
-        "__isoc99_sscanf": "sscanf",
-        "__isoc99_fscanf": "fscanf",
-        "__isoc99_scanf": "scanf",
-        "fgets_unlocked": "fgets",
-        "__getdelim": "getdelim",
-    }.items():
-        assert base in SOURCE_WEAK, (alias, base)
+    # the v-forms' bases ARE recognized sources -- it is the signature, not the base, that keeps
+    # them out, so the guard must not be readable as "its base is unknown".
+    assert {"scanf", "sscanf", "fscanf"} <= SOURCE
+    assert not (_UNLISTED_SOURCE_CANDIDATES & set(_SOURCE_ALIAS_BASE))

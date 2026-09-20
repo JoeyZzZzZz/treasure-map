@@ -16,14 +16,32 @@ from dataclasses import dataclass
 # External-input getters, split by strength of external controllability (neutral,
 # mechanism-based). Strength gates reachability grading only; R-pattern's shape detection
 # uses the SOURCE union below and is unaffected by the split.
+#
+# Both sets list libc ABI aliases beside the base they mirror (the __libc_* and *_nocancel forms,
+# the large-file *64 forms, *_unlocked, and the __isoc99_* scanf family): the C library exports
+# these names for the same call, so matching only the base leaves a function that reads its input
+# through one of them with no recognized source at all. Two boundaries, both real, neither closed
+# here:
+#   * The extractor's Java side (ExportFunctions TOKENIZERS / WRITERS) matches by exact name and
+#     does not recognize them. Its provenance never reads source_class, so these record as
+#     call_return either way; do NOT hand-sync the Java lists from here, that is a scan-side
+#     change with its own re-extract.
+#   * reachability/taint keys its buffer- and return-seeding tables on the BASE names only, so an
+#     alias is recognized as a source without seeding taint onto the buffer it fills. That
+#     under-taints, the direction that biases to "unknown" rather than to a claim, but it does
+#     make an alias weaker evidence than the name it mirrors.
 
 # Strong: network / request input — externally controllable by a remote party.
 SOURCE_STRONG: frozenset[str] = frozenset(
     {
         "recv",
+        "__libc_recv",
+        "__recv",
         "recvfrom",
+        "__libc_recvfrom",
         # Generic datagram / scatter-gather socket receives (IPC + network).
         "recvmsg",
+        "__libc_recvmsg",
         "recvmmsg",
         # Generic web/CGI parameter getters (public webserver API style).
         "websGetVar",
@@ -38,15 +56,11 @@ SOURCE_STRONG: frozenset[str] = frozenset(
 # function.
 SOURCE_WEAK: frozenset[str] = frozenset(
     {
-        # Some entries are libc ABI aliases listed beside the base they mirror (fgets_unlocked,
-        # the __isoc99_* scanf family, __getdelim); listing them fixes symbol-recognition recall
-        # at the pattern layer. The extractor's Java side (ExportFunctions TOKENIZERS / WRITERS)
-        # matches by exact name and does not recognize them — a pre-existing description seam
-        # between the two layers that listing them here neither creates nor widens: the Java
-        # provenance never reads source_class, so these record as call_return either way. Do NOT
-        # hand-sync the Java lists from here; that is a scan-side change with its own re-extract.
         "read",
+        "__libc_read",
+        "__read_nocancel",
         "fread",
+        "fread_unlocked",
         "fgets",
         "fgets_unlocked",
         "gets",
@@ -61,6 +75,10 @@ SOURCE_WEAK: frozenset[str] = frozenset(
         "getdelim",
         "__getdelim",
         "pread",
+        "pread64",
+        "__libc_pread",
+        "__libc_pread64",
+        "__pread64",
         "readv",
         "getenv",
         # Command-line / option parsing (the option argument is locally-influenced input).

@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The C library's ABI aliases of the recognized input sources are recognized too.** A function
+  that reads its input through `__isoc99_sscanf` / `__isoc99_fscanf` / `__isoc99_scanf`,
+  `fgets_unlocked`, `fread_unlocked`, `__getdelim`, `__libc_read` / `__read_nocancel`, `pread64` /
+  `__libc_pread` / `__libc_pread64` / `__pread64`, or the receive aliases `__libc_recv` / `__recv`
+  / `__libc_recvfrom` / `__libc_recvmsg` was recorded as having no recognized source at all: these
+  are the names the C library exports for calls already listed, and matching only the base name
+  missed them. Each alias is filed in the same strength set as the base it mirrors, so the receive
+  aliases are strong (network) sources and the file/stream ones weak.
+  ★ An alias is weaker evidence than the name it mirrors: the taint seeder keys its buffer- and
+  return-value tables on the base names, so an alias marks the function as having a source without
+  seeding taint onto the buffer it fills. That under-taints, which biases a reading to "unknown"
+  rather than to a claim.
+
+### Changed
+
+- **Candidates in those functions are re-labelled, and their structural fingerprint moves with the
+  label.** `source_class` goes `unknown` -> `external_input` and `call_sequence_shape` gains its
+  `source->` prefix; the fingerprint is a hash of both, so such a candidate now folds into a
+  different pattern row than before. `exposure_shape` clears on the same candidates: `bare_sink`
+  records "a sink with no recognized in-function source", which stops being true once the source is
+  recognized. Review ORDER moves with the labels, so a stored ranking expectation may need
+  re-baselining.
+  Nothing else moves. No candidate is added, dropped or re-anchored; every callsite ordinal and
+  `evidence_ref` is unchanged; and reachability status, blocking mechanism and taint sets are
+  what they were — measured, not assumed, because the strength split is read by the taint layer.
+
+### Added
+
 - **Large-file and same-shape aliases of the path and copy sinks are now recalled.** A controllable
   path through `fopen64` / `freopen64` / `openat64` / `creat` / `truncate64`, or a copy through
   `mempcpy` / `wmemcpy`, previously matched no sink set at all, so such a call produced no candidate
