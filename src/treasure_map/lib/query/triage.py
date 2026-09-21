@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from treasure_map.lib.fmt_spec import arity as fmt_arity
+from treasure_map.lib.fmt_spec import conversions as fmt_conversions
 from treasure_map.lib.pattern.classes import CMD, FMT_STRING
 from treasure_map.lib.query.nvram import _web_settable
 from treasure_map.lib.query.sink_impact import (
@@ -440,8 +441,11 @@ def _writer_args_class(conn: sqlite3.Connection, fmt: Any, varargs: Any) -> str:
 # edit (an unrecorded deletion of coverage is itself a silent drop).
 #
 # ``doSystem`` is the same KIND of false negative but not the same mechanism: it is printf-style
-# variadic and leaves through the marker exit (blocking_mechanism=const_sink_arg), not this def-use
-# one. It is fixed separately and must not be folded in here.
+# variadic, so its arg0 is a FORMAT and a constant template does not make the command constant. It
+# leaves through BOTH exits — the marker one (blocking_mechanism=const_sink_arg) AND this def-use
+# one — so it is downgraded at their shared upstream in ``_record_class``, against its own set
+# (``_FORMAT_COMMAND_SINKS``), and must not be folded in here: this set asks about ARITY, that one
+# about a template's CONTENT, and a name belongs to at most one of those questions.
 #
 # A literal set on purpose. Deriving it from CMD or from hunt's EXEC_SINKS would make the test that
 # guards it compare a value against itself, and lib/query must not import lib/hunt (the read layer
@@ -449,6 +453,50 @@ def _writer_args_class(conn: sqlite3.Connection, fmt: Any, varargs: Any) -> str:
 _MULTI_ARG_COMMAND_SINKS: frozenset[str] = frozenset(
     {"execl", "execle", "execlp", "execv", "execve", "execvp"}
 )
+
+# printf-style VARIADIC command sinks: arg0 is a FORMAT template, so a constant template does NOT
+# make the command constant — the varargs it splices do. A literal set on purpose, like
+# _MULTI_ARG_COMMAND_SINKS, and for the same reason.
+#
+# ``system`` / ``popen`` are deliberately NOT here, and their danger is not missed: a runtime-built
+# ``system(buf)`` (buf from ``snprintf("cmd %s", user)``) has a stack_buf arg0 and is judged on the
+# def-use writer path (``_writer_args_class`` over ``_judged_writers``), while a
+# ``system("echo %s")`` with a LITERAL percent is a genuine constant — the shell runs it verbatim,
+# nothing consumes that conversion — and MUST stay sunk. Only a variadic sink, where arg0 IS the
+# format and the varargs bypass the writer path, needs this downgrade.
+_FORMAT_COMMAND_SINKS: frozenset[str] = frozenset({"doSystem"})
+
+# Conversions that make a COMMAND template non-constant in an attacker-shaped way: %s (arbitrary
+# string, shell metacharacters included — the injection primitive), %x / %p (attacker-influenced
+# and non-constant, and anomalous inside a command), %n (a write primitive). Case-folded, so %X
+# counts. %c is OUT: one byte can flip a metacharacter but cannot splice a command name or
+# arbitrary text, so it is not a standalone primitive. %d / %u / %f emit no metacharacter.
+#
+# ★ DISTINCT from ``_STRING_PTR_CONVERSIONS`` and from the ambiguous-0x reading beside it, which
+# ask a DIFFERENT question — which conversion consumes a POINTER, and whether a bare 0x is a known
+# integer. There %x is BENIGN (a known integer literal); here it is injectable (a hex splice in a
+# command is not a constant command). Do not unify the two sets: each would be wrong for the
+# other's question, in opposite directions.
+_INJECTABLE_CONVERSIONS: frozenset[str] = frozenset({"s", "p", "x", "n"})
+
+
+def _fmt_has_injectable_conv(prov: dict[str, Any]) -> bool:
+    """True when this record's constant format template splices an injectable conversion.
+
+    Reads the template out of the constant record's own value and scans it with the SHARED format
+    scanner — ``fmt_spec.conversions`` returns exactly the ARGUMENT-CONSUMING conversions (``%%``
+    consumes nothing and is skipped), so a hit is positive evidence that an unexamined operand
+    reaches the command, not a guess about the text. A second parser here would drift from the one
+    every other reader uses.
+
+    False for anything that is not a literal-string constant: a template this cannot read is not a
+    template this may judge."""
+    if prov.get("kind") != "constant":
+        return False
+    value = prov.get("value")
+    if not isinstance(value, str):
+        return False
+    return any(c.char.lower() in _INJECTABLE_CONVERSIONS for c in fmt_conversions(value))
 
 
 def _judged_writers(prov: dict[str, Any]) -> list[dict[str, Any]]:
@@ -481,8 +529,14 @@ def _record_class(conn: sqlite3.Connection, rec: dict[str, Any]) -> str:
     DOMINATING writers only (see _judged_writers — a non-dominating branch writer may inject into a
     different sink, so it does not decide this one): controllable if any judged writer is
     controllable, 'const' only if EVERY judged writer is const, else 'unknown'. With no writer at
-    all -> 'unknown'. Unresolved / indirect_unresolved -> 'unknown'. A multi-arg exec sink is NEVER
-    'const' on partial provenance (the iron law) — a would-be 'const' is downgraded to 'unknown'."""
+    all -> 'unknown'. Unresolved / indirect_unresolved -> 'unknown'.
+
+    Two iron laws downgrade a would-be 'const' here, both because arg0 alone does not settle a
+    VARIADIC command. A multi-arg exec sink is never 'const' on partial provenance. A printf-style
+    variadic command sink is not 'const' either when its constant TEMPLATE splices an injectable
+    conversion: that conversion consumes a vararg, and the vararg is the surface nothing here has
+    looked at. The second law needs the content check the first does not — a variadic command whose
+    template splices nothing injectable really is a constant command."""
     prov = rec.get("provenance")
     prov = prov if isinstance(prov, dict) else {}
     kind = prov.get("kind")
@@ -502,6 +556,16 @@ def _record_class(conn: sqlite3.Connection, rec: dict[str, Any]) -> str:
         cls = "unknown"
     # Iron law: a variadic exec proven constant only at arg0 is NOT a constant command.
     if cls == "const" and rec.get("sink") in _MULTI_ARG_COMMAND_SINKS:
+        return "unknown"
+    # Iron law, the printf-style sibling: a variadic FORMAT command sink proven constant only at its
+    # arg0 TEMPLATE is not a constant command when that template splices an injectable conversion.
+    # Unlike the exec law this one reads the CONTENT — a template with nothing injectable in it IS a
+    # constant command and stays 'const'.
+    if (
+        cls == "const"
+        and rec.get("sink") in _FORMAT_COMMAND_SINKS
+        and _fmt_has_injectable_conv(prov)
+    ):
         return "unknown"
     return cls
 

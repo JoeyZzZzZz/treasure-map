@@ -79,6 +79,7 @@ def _inst(
     binary_path: str | None = None,
     entry_reach: str | None = None,
     source_kind: str | None = None,
+    sink_provenance: list[dict[str, object]] | None = None,
 ) -> None:
     _FID[0] += 1
     provenance = "L1" if status in {"confirmed", "blocked"} else "L0"
@@ -92,6 +93,8 @@ def _inst(
         evidence["entry_reach"] = {"status": "found" if sites else "unknown", "sites": sites}
     if source_kind is not None:
         evidence["source_kind"] = source_kind
+    if sink_provenance is not None:
+        evidence["sink_arg_provenance"] = sink_provenance
     flow_evidence = json.dumps(evidence) if evidence else None
     add_instance(
         conn,
@@ -1718,3 +1721,168 @@ def test_provenance_consumers_without_an_anchor_keep_the_unscoped_reading(tmp_pa
     out = source_origin(conn, fe, sink_anchor=None, wrapper_names=frozenset())
     assert out is not None
     assert "wan_proto" in {o.get("key") for o in out["origins"]}
+
+
+# ── a variadic FORMAT command sink is not constant just because its template is ──────────
+
+_DOSYS = "doSystem"
+
+
+def _rclass(tmp_path: Path, sink: str, value: object, kind: str = "constant") -> str:
+    """One record's controllability class, through the real _record_class."""
+    from treasure_map.lib.query.triage import _record_class
+
+    return _record_class(
+        _atlas(tmp_path), {"sink": sink, "provenance": {"kind": kind, "value": value}}
+    )
+
+
+def test_variadic_format_command_with_an_injectable_conversion_is_not_constant(
+    tmp_path: Path,
+) -> None:
+    """G1. doSystem is printf-style variadic: arg0 is a TEMPLATE, and proving the template constant
+    says nothing about the vararg it splices. ``doSystem("reboot %s", user)`` was reported
+    controllability=constant -- this phase's only proven-safe fact, which sinks a candidate under
+    every lens and every filter -- on evidence that never looked at the injected operand.
+
+    The template's own conversion is the evidence: %s consumes a vararg, so an unexamined operand
+    demonstrably reaches the command. That is enough to refuse the certification; it is not a claim
+    that the candidate is exploitable.
+
+    MUTATION (must go RED): drop the _FORMAT_COMMAND_SINKS branch from _record_class."""
+    assert _rclass(tmp_path, _DOSYS, "reboot %s") == "unknown"
+
+
+def test_variadic_format_command_with_no_conversion_stays_constant(tmp_path: Path) -> None:
+    """G2. The downgrade reads the template's CONTENT, unlike the exec law beside it. A variadic
+    command that splices nothing really does run verbatim, and demoting it would be the mirror
+    error -- a wrong demotion hides a real constant behind a '?'.
+
+    MUTATION (must go RED): make _fmt_has_injectable_conv return True unconditionally."""
+    assert _rclass(tmp_path, _DOSYS, "reboot now") == "const"
+
+
+def test_a_numeric_conversion_does_not_make_a_command_injectable(tmp_path: Path) -> None:
+    """G3. %d/%u/%f emit digits: no shell metacharacter, no command name, nothing to splice.
+
+    MUTATION (must go RED): add "d" to _INJECTABLE_CONVERSIONS."""
+    assert _rclass(tmp_path, _DOSYS, "sleep %d") == "const"
+
+
+def test_a_literal_percent_is_not_a_conversion(tmp_path: Path) -> None:
+    """G4. ``%%`` consumes no argument, so it splices nothing. Asserted through the shared format
+    scanner rather than a local rule -- a second parser here would drift from the one every other
+    reader uses, and then two layers would disagree about the same template.
+
+    MUTATION (must go RED): scan for a bare "%" followed by a letter instead of using fmt_spec."""
+    assert _rclass(tmp_path, _DOSYS, "done 100%%") == "const"
+    assert _rclass(tmp_path, _DOSYS, "done 100%% then %s") == "unknown"
+    # the case a naive "% followed by a letter" scan gets wrong: the %% is a literal percent and
+    # the s after it is ordinary text, so nothing is consumed and the command IS constant.
+    assert _rclass(tmp_path, _DOSYS, "100%%s") == "const"
+
+
+def test_a_non_variadic_shell_sink_keeps_its_literal_percent(tmp_path: Path) -> None:
+    """G5. ``system("echo %s done")`` really is a constant command: the shell runs that text
+    verbatim, nothing consumes the conversion. Only a VARIADIC sink -- where arg0 is the format and
+    the varargs bypass the writer path -- earns the downgrade, which is why the set is a literal
+    and not every shell sink. On the scanned firmware the only constant system templates carrying a
+    percent are literal ones inside embedded awk, so folding system in would demote real constants.
+
+    MUTATION (must go RED): add "system" to _FORMAT_COMMAND_SINKS."""
+    assert _rclass(tmp_path, "system", "echo %s done") == "const"
+    assert _rclass(tmp_path, "popen", "x %s") == "const"
+
+
+def test_format_command_sink_set_is_hand_maintained(tmp_path: Path) -> None:
+    """G6. The set is a literal, not a slice of CMD -- a derived set would make this guard compare a
+    value against itself, and the question it answers (is arg0 a format template?) is not the
+    question CMD answers (is this a command sink?).
+
+    MUTATION (must go RED): derive it from CMD, or add system/popen."""
+    from treasure_map.lib.pattern.classes import CMD
+    from treasure_map.lib.query.triage import _FORMAT_COMMAND_SINKS
+
+    assert _FORMAT_COMMAND_SINKS == frozenset({_DOSYS})
+    assert _DOSYS in CMD  # it IS a command sink...
+    assert _FORMAT_COMMAND_SINKS < CMD  # ...but the set is a strict, hand-picked subset
+    assert not ({"system", "popen"} & _FORMAT_COMMAND_SINKS)
+
+
+def test_injectable_conversion_set_is_the_written_down_one(tmp_path: Path) -> None:
+    """G11. The membership lock, mirroring the one on the multi-arg exec set: the set is a decision
+    about which conversions are attacker-shaped, so it is pinned against a list written here by
+    hand. Widening it silently would demote real constants; narrowing it silently would restore the
+    certification this exists to refuse.
+
+    ★ Deliberately NOT the same set as _STRING_PTR_CONVERSIONS, which asks which conversion
+    consumes a POINTER. %x is injectable here and benign there (a known integer literal), so a
+    later tidy-up must not unify them.
+
+    MUTATION (must go RED): add or remove any conversion."""
+    from treasure_map.lib.query.triage import (
+        _INJECTABLE_CONVERSIONS,
+        _STRING_PTR_CONVERSIONS,
+    )
+
+    assert _INJECTABLE_CONVERSIONS == frozenset({"s", "p", "x", "n"})
+    assert _INJECTABLE_CONVERSIONS != _STRING_PTR_CONVERSIONS
+
+
+def test_injectable_conversions_are_matched_case_folded(tmp_path: Path) -> None:
+    """G8/G9/G10. %X is %x, and the pointer and write primitives count too: %p is attacker-shaped
+    and non-constant inside a command, %n writes.
+
+    MUTATION (must go RED): drop the .lower(), or drop "p" / "n" from the set."""
+    assert _rclass(tmp_path, _DOSYS, "cmd %X") == "unknown"
+    assert _rclass(tmp_path, _DOSYS, "cmd %p") == "unknown"
+    assert _rclass(tmp_path, _DOSYS, "cmd %n") == "unknown"
+
+
+def test_an_unreadable_template_is_a_registered_gap_not_a_judgement(tmp_path: Path) -> None:
+    """The boundary, pinned because it is a GAP rather than a decision, and it leans the unsafe way.
+
+    This downgrade reads the template text. A record that carries no readable template is therefore
+    not downgraded — and since such a record still classifies 'const', it keeps the certification
+    this change exists to refuse. It is registered rather than closed: no record in the scanned
+    firmware has that shape, and widening the downgrade to "cannot read it, so refuse to certify"
+    is a separate decision with its own population to measure.
+
+    A format built at runtime is already 'unknown' by another road (a stack_buf with no judged
+    writer), so the gap is narrower than it first looks."""
+    assert _rclass(tmp_path, _DOSYS, None) == "const"  # <- the registered gap, stated honestly
+    assert _rclass(tmp_path, _DOSYS, "cmd %s", kind="stack_buf") == "unknown"
+
+
+def test_a_variadic_format_command_is_no_longer_certified_safe_end_to_end(
+    tmp_path: Path,
+) -> None:
+    """G7. The wiring gate: the marker exit, the def-use constant exit and the parallel
+    'constrained' exit all read the same has_unsafe_record, so downgrading the record at their
+    shared upstream closes every one of them. The fixture carries the real shape -- a stored
+    const_sink_arg marker -- so a fix that only reached one door would still show here.
+
+    What matters downstream is not the word but the sinking: proven-safe is the first sort key
+    under every lens and pushes a candidate to the bottom band of every filtered view, so a wrong
+    certification is not merely a mislabel, it is unreachable by any query.
+
+    MUTATION (must go RED): restore _record_class to its pre-change form."""
+    from treasure_map.lib.query.triage import _float_by_dimension, _is_proven_safe
+
+    conn = _atlas(tmp_path)
+    pid = _pattern(conn, "fp_dosys")
+    _inst(
+        conn,
+        pid,
+        fn="handler",
+        sink_anchor=_DOSYS,
+        blocking="const_sink_arg",
+        sink_provenance=[
+            {"sink": _DOSYS, "provenance": {"kind": "constant", "value": "reboot %s"}}
+        ],
+    )
+    (c,) = triage(conn)
+    assert c.dim("controllability").value != "constant"
+    assert _is_proven_safe(c) is False
+    # and therefore not pushed to the bottom band of a filtered view either
+    assert _float_by_dimension([c], [("source", "param")]) == [c]

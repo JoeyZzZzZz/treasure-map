@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A variadic command is no longer certified constant just because its format template is.**
+  `doSystem` is printf-style: its first argument is a TEMPLATE, so proving that argument constant
+  says nothing about the vararg the template splices. A `doSystem("reboot %s", value)` was reported
+  `controllability=constant` — this phase's only proven-safe fact, and the one thing that sinks a
+  candidate out of every lens and out of the top band of every filtered view — on evidence that
+  never looked at the injected operand. Such a record now reads as unknown, which closes all three
+  doors that consult it: the marker exit, the def-use constant exit, and the parallel "constrained"
+  exit. Measured across the scanned firmware: 141 candidates stop being certified safe, and none
+  moves the other way.
+  ★ Unlike the sibling rule for multi-argument exec sinks, this one reads the template's CONTENT: a
+  variadic command that splices nothing injectable — plain text, or only `%d` / `%u` / `%c` — really
+  does run verbatim and stays constant. The conversions that count are `%s` (arbitrary string, shell
+  metacharacters included), `%p` / `%x` and `%n`; `%%` consumes nothing and is not one of them.
+  ★ `system` and `popen` are deliberately untouched. They are not variadic, so a literal percent in
+  their argument is text the shell runs verbatim — on the firmware here the only such templates sit
+  inside embedded awk, and demoting them would hide real constants.
+  ★ This refuses a certification; it does not assert a finding. The candidate goes back to `?`,
+  which is where a value nobody has examined belongs.
+
 - **A candidate's nvram key and origin fragments now come from its own sink, not a neighbour's.**
   `sink_arg_provenance` is stored per FUNCTION, so a function that reads a config value and then
   runs a command carries a record for each call. Two consumers walked those records unscoped and
