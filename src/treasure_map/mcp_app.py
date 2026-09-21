@@ -1446,7 +1446,11 @@ def make_tools(
         writer's varargs trimmed to what its format string actually consumes; pass
         ``dominating_only`` to return only the dominating writers. A surfaced Ghidra def-use FACT of
         where a sink argument's value comes from — never a verdict, and an unreachable origin is
-        stated (``resolved: false``/``indirect_unresolved``), never dropped."""
+        stated (``resolved: false``/``indirect_unresolved``), never dropped.
+
+        The result also includes a ``source_origin`` companion (where the sink value comes from),
+        scoped to THIS candidate's anchored sink — the same for any ``sink_idx``, since ``records``
+        already carry the per-sink detail."""
         conn = open_atlas(atlas_path)
         try:
             ref = _resolve_ref(conn, evidence_ref)

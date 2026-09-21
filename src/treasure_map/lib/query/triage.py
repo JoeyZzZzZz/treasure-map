@@ -944,7 +944,12 @@ def get_sink_provenance(
     that idx. Writers are presented dominating-first with fmt-arity vararg trimming; pass
     ``dominating_only`` to return only the sound dominating writers. Read-only; a surfaced def-use
     fact, never a verdict. Unknown ref / idx is reported honestly, never as an empty-but-successful
-    result."""
+    result.
+
+    The response also carries a ``source_origin`` companion — the origin fragments behind the sink
+    value. It is scoped to the candidate's OWN anchored sink and is therefore identical for every
+    ``sink_idx``: the per-sink def-use detail lives in ``records``, while the candidate-level origin
+    sits beside them, and never belongs to a sibling sink."""
     row = conn.execute(
         "SELECT flow_evidence, sink_anchor FROM instance WHERE evidence_ref = ? "
         "ORDER BY instance_id LIMIT 1",

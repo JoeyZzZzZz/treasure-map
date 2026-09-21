@@ -50,8 +50,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default ordering are unchanged candidate for candidate, because the verdict keeps its own scope
   and its own liberal fallback, and this field never fed it.
 
-### Fixed
-
 - **The writer layer no longer answers with a sibling sink's writer.** `sink_arg_provenance` is
   recorded per FUNCTION, so a function that both prints and executes carries a record for each; the
   writer dimension read them unscoped and reported the first one that resolved anything. A
