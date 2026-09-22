@@ -80,6 +80,36 @@ def callsite_suffix(sink_class: str, callsite_index: int | None) -> str:
     return sink_class if callsite_index is None else f"{sink_class}#{callsite_index}"
 
 
+def callsite_offset_suffix(
+    sink_class: str, offset_norm: str | None, callsite_index: int | None = None
+) -> str:
+    """The ref suffix for a per-callsite candidate anchored by its ADDRESS offset: ``<class>@<off>``
+    (e.g. ``cmd@0x001218``), replacing the ``<class>#<index>`` text-ordinal form (callsite_suffix).
+
+    Why the offset and not the ordinal: both name the same call, but the offset from the function
+    entry survives a decompiler UPGRADE where the Nth-call ordinal does not (callsite_suffix spells
+    out that scope).
+
+      * ``offset_norm`` given         -> ``<class>@<offset>``  (the call's in-body address is known)
+      * else ``callsite_index`` given -> ``<class>#<index>``   (the LEGACY ordinal form)
+      * else                          -> ``<class>``           (function-level, no callsite located)
+
+    THE CALLER'S CONTRACT decides the middle case, and it is what keeps the rekey safe. When the
+    extraction carried the bridge (post-churn: the normal case), the caller passes
+    ``callsite_index=None``, so a call the bridge could not place — register-indirect, unrendered,
+    out of body — degrades to the bare class, and NO ``#index`` ref is ever emitted. The ``#index``
+    form appears ONLY when the caller has no bridge at all (a pre-churn / un-migrated analysis.db),
+    where it reproduces the historical ref byte-for-byte so per-callsite candidates stay distinct.
+    Since the churn forces a re-scan, the atlas the rekey migrates NEVER holds a ``#index`` ref, so
+    an old numbered anchor left un-remapped resolves to nothing (visible staleness) rather than
+    silently matching a re-hunted ``#index`` a retired phantom shifted onto a different call."""
+    if offset_norm is not None:
+        return f"{sink_class}@{offset_norm}"
+    if callsite_index is not None:
+        return f"{sink_class}#{callsite_index}"
+    return sink_class
+
+
 def _norm_addr(address: str | None) -> str | None:
     """Canonicalize an entry address to lowercase, 0x-free, zero-padded hex ("000b32a0").
 
@@ -98,6 +128,43 @@ def _norm_addr(address: str | None) -> str | None:
         return a
 
 
+def _addr_to_int(address: str | int | None) -> int | None:
+    """Parse an address (``"0xb32a0"`` / ``"000b32a0"`` / int) to int, or None when unparseable.
+
+    Shared by _norm_offset; kept separate from _norm_addr, which renders a STRING and deliberately
+    passes a non-hex form through verbatim, a policy the arithmetic here must not inherit."""
+    if address is None:
+        return None
+    if isinstance(address, int):
+        return address
+    a = address.strip().lower().removeprefix("0x")
+    if not a:
+        return None
+    try:
+        return int(a, 16)
+    except ValueError:
+        return None
+
+
+def _norm_offset(sink_addr: str | int | None, func_entry: str | int | None) -> str | None:
+    """The canonical, signed offset of a callsite from its function entry:
+    ``sink_addr - func_entry`` rendered ``[-]0x<zero-padded hex>`` (``0x001218`` / ``-0x000040``).
+
+    Address-relative on purpose: the offset survives a decompiler upgrade that moves the text
+    ordinal (see callsite_offset_suffix). SIGNED because an out-of-line block the compiler placed
+    below the entry is a real, in-body call at a negative offset — dropping the sign would alias it
+    onto a different call. Zero-padded to a fixed minimum width so one offset has exactly one
+    spelling ("0x1218" and "0x001218" must never be two anchors), mirroring _norm_addr; an offset
+    wider than the pad still renders deterministically. None when either address is unparseable —
+    the caller then falls back to the bare/ordinal suffix, never a guessed anchor."""
+    sa = _addr_to_int(sink_addr)
+    fe = _addr_to_int(func_entry)
+    if sa is None or fe is None:
+        return None
+    delta = sa - fe
+    return f"{'-' if delta < 0 else ''}0x{abs(delta):06x}"
+
+
 def build_evidence_ref(
     run_id: str,
     *,
@@ -112,8 +179,9 @@ def build_evidence_ref(
 
     ``suffix`` is the sink-class hit (``cmd`` / ``copy`` / ``cmd_via_wrapper`` …), which keeps the
     ref unique when one function matches several sinks, and for a per-callsite shape carries the
-    callsite ordinal too (``copy#1``) so siblings within one function stay distinct — build it with
-    ``callsite_suffix`` rather than by hand. Each anchor degrades honestly, worst-anchor
+    call's address offset too (``copy@0x000480``) so siblings within one function stay distinct —
+    build it with ``callsite_offset_suffix`` rather than by hand. Each anchor degrades honestly,
+    worst-anchor
     last: binary = sha256 prefix -> name -> "nobin"; function = address -> name -> "id<func_id>".
     The ``id<func_id>`` tail is the only unstable form and is unreachable on real firmware (every
     one of 88,178 functions carried an address); it exists so a degenerate row still gets a unique

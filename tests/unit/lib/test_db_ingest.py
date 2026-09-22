@@ -985,3 +985,102 @@ def test_schema_sql_alone_declares_the_stub_column(tmp_path: Path) -> None:
     cols = {row[1] for row in raw.execute("PRAGMA table_info(binaries)")}
     raw.close()
     assert "stub_names" in cols
+
+
+# ── D4: bridge transport columns (call_tokens + body_ranges), two-place rule ─────────────────────
+
+
+def test_migration_adds_call_tokens_and_body_ranges_to_old_db(tmp_path: Path) -> None:
+    """A database built before the D4 bridge columns must gain both on open (back-filling '[]'), so
+    ghidra_ingest can write them without "no column named call_tokens/body_ranges"; rows survive."""
+    db_path = tmp_path / "legacy_bridge.db"
+    _legacy_functions_db(db_path)
+    conn = open_db(db_path)  # triggers the additive migration
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(functions)")}
+        assert "call_tokens" in cols
+        assert "body_ranges" in cols
+        row = conn.execute(
+            "SELECT name, call_tokens, body_ranges FROM functions WHERE id = 1"
+        ).fetchone()
+        assert row["name"] == "main"
+        assert row["call_tokens"] == "[]"
+        assert row["body_ranges"] == "[]"
+        # idempotent: a second open must not duplicate either column
+        conn.close()
+        conn2 = open_db(db_path)
+        cols2 = [r[1] for r in conn2.execute("PRAGMA table_info(functions)")]
+        assert cols2.count("call_tokens") == 1
+        assert cols2.count("body_ranges") == 1
+        conn2.close()
+    finally:
+        pass
+
+
+def test_schema_sql_alone_declares_the_bridge_columns(tmp_path: Path) -> None:
+    """The other half of the two-place rule, asserted where it can fail. Building from schema.sql
+    ALONE (never running the migration that would mask a schema.sql omission) is what makes
+    "the canonical schema declares call_tokens/body_ranges" falsifiable.
+
+    MUTATION (must go RED here while the old-db migration test stays GREEN): remove either column
+    from schema.sql's functions table."""
+    db_path = tmp_path / "schema_only_bridge.db"
+    raw = sqlite3.connect(db_path)
+    raw.executescript(_SCHEMA_PATH.read_text())
+    cols = {row[1] for row in raw.execute("PRAGMA table_info(functions)")}
+    raw.close()
+    assert "call_tokens" in cols
+    assert "body_ranges" in cols
+
+
+def test_ingest_writes_bridge_transport_verbatim(tmp_path: Path) -> None:
+    """call_tokens + body_ranges from the ghidra JSON land in functions verbatim — the hunt layer
+    reads the ref address-offset and the out-of-body test from them.
+
+    MUTATION (must go RED): drop call_tokens or body_ranges from the INSERT column list / value
+    tuple in _ingest_one_binary."""
+    import json
+
+    from treasure_map.lib.analyze.ghidra_ingest import IngestStats, _ingest_one_binary
+
+    conn = open_db(tmp_path / "bridge_rt.db")
+    conn.execute("INSERT INTO binaries (id, name, sha256) VALUES (1, 'x', 'h')")
+    tokens = [
+        {
+            "call_token": "system",
+            "token_addr": "0x409bc8",
+            "op_addr": "0x409bc8",
+            "opcode": 7,
+            "text_off": 45,
+            "line": 5,
+        }
+    ]
+    ranges = [["0x409748", "0x409c00"]]
+    data = {
+        "functions": [
+            {"name": "f", "address": "00409748", "call_tokens": tokens, "body_ranges": ranges}
+        ]
+    }
+    _ingest_one_binary(conn, 1, data, IngestStats(), None)
+    conn.commit()
+    row = conn.execute("SELECT call_tokens, body_ranges FROM functions").fetchone()
+    conn.close()
+    assert json.loads(row["call_tokens"]) == tokens
+    assert json.loads(row["body_ranges"]) == ranges
+
+
+def test_ingest_bridge_transport_defaults_empty_on_old_export(tmp_path: Path) -> None:
+    """An export from before the bridge (no call_tokens/body_ranges keys) stores '[]', never null —
+    the same never-null contract as sink_provenance."""
+    from treasure_map.lib.analyze.ghidra_ingest import IngestStats, _ingest_one_binary
+
+    conn = open_db(tmp_path / "bridge_old.db")
+    conn.execute("INSERT INTO binaries (id, name, sha256) VALUES (1, 'x', 'h')")
+    _ingest_one_binary(
+        conn, 1, {"functions": [{"name": "f", "address": "1000"}]}, IngestStats(), None
+    )
+    conn.commit()
+    row = conn.execute("SELECT call_tokens, body_ranges FROM functions").fetchone()
+    conn.close()
+    assert row["call_tokens"] == "[]"
+    assert row["body_ranges"] == "[]"

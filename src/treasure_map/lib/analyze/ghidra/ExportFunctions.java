@@ -1921,6 +1921,78 @@ public class ExportFunctions extends GhidraScript {
         return s != null ? s.getName() : null;
     }
 
+    /** D4 bridge: every function-name token in the decompiler's C markup, with BOTH candidate
+     *  addresses -- the token's own min address and the address of the PcodeOp the token carries --
+     *  plus the token's character offset in the printed C text. Raw triples only: no name
+     *  normalisation and no occurrence numbering happen here (both need the ELF stub table, which
+     *  this pass cannot read). */
+    private String buildCallTokens(Function func, DecompileResults dr) {
+        ClangTokenGroup markup = dr.getCCodeMarkup();
+        if (markup == null) return "[]";
+        PrettyPrinter pp = new PrettyPrinter(func, markup, null);
+        List<ClangLine> lines = pp.getLines();
+        StringBuilder arr = new StringBuilder("[");
+        boolean first = true;
+        int off = 0;
+        for (ClangLine line : lines) {
+            String indent = line.getIndentString();
+            int col = off + (indent == null ? 0 : indent.length());
+            for (ClangToken tok : line.getAllTokens()) {
+                String txt = tok.getText();
+                if (txt == null) txt = "";
+                if (tok instanceof ClangFuncNameToken) {
+                    PcodeOp op = ((ClangFuncNameToken) tok).getPcodeOp();
+                    String tokAddr = "";
+                    Address ta = tok.getMinAddress();
+                    if (ta != null) tokAddr = "0x" + Long.toHexString(ta.getOffset());
+                    String opAddr = "";
+                    int opcode = -1;
+                    if (op != null) {
+                        opcode = op.getOpcode();
+                        if (op.getSeqnum() != null && op.getSeqnum().getTarget() != null)
+                            opAddr = "0x" + Long.toHexString(op.getSeqnum().getTarget().getOffset());
+                    }
+                    if (!first) arr.append(",");
+                    first = false;
+                    arr.append("{\"call_token\":\"").append(esc(txt)).append("\"")
+                       .append(",\"token_addr\":\"").append(esc(tokAddr)).append("\"")
+                       .append(",\"op_addr\":\"").append(esc(opAddr)).append("\"")
+                       .append(",\"opcode\":").append(opcode)
+                       .append(",\"text_off\":").append(col)
+                       .append(",\"line\":").append(line.getLineNumber())
+                       .append("}");
+                }
+                col += txt.length();
+            }
+            off = col + 1;   // the printer joins lines with one newline
+        }
+        arr.append("]");
+        return arr.toString();
+    }
+
+    /** D4 bridge: the function body's REAL address ranges (AddressRangeIterator), not the
+     *  getNumAddresses() count the export already carries. A non-contiguous body yields several
+     *  ranges, which is the whole point: "is this sink address inside its function" cannot be
+     *  answered from entry+size. */
+    private String buildBodyRanges(Function func) {
+        StringBuilder arr = new StringBuilder("[");
+        boolean first = true;
+        AddressSetView body = func.getBody();
+        if (body != null) {
+            AddressRangeIterator it = body.getAddressRanges();
+            while (it.hasNext()) {
+                AddressRange r = it.next();
+                if (!first) arr.append(",");
+                first = false;
+                arr.append("[\"0x").append(Long.toHexString(r.getMinAddress().getOffset()))
+                   .append("\",\"0x").append(Long.toHexString(r.getMaxAddress().getOffset()))
+                   .append("\"]");
+            }
+        }
+        arr.append("]");
+        return arr.toString();
+    }
+
     private String addr0x(PcodeOp op) {
         return "0x" + Long.toHexString(op.getSeqnum().getTarget().getOffset());
     }
@@ -2025,6 +2097,7 @@ public class ExportFunctions extends GhidraScript {
             // Not worth decompiling; they carry no logic and slow down the batch.
             String pseudocode = "";
             HighFunction hf = null;   // Varnode/def-use + block graph from the SAME decompile (design B)
+            DecompileResults drKeep = null;   // D4 bridge: kept so the C markup can be walked below
             if (funcSize < 10) {
                 // Leave pseudocode empty — populate_db.py handles null pseudocode fine.
             } else try {
@@ -2035,6 +2108,7 @@ public class ExportFunctions extends GhidraScript {
                         pseudocode = df.getC();
                     }
                     hf = dr.getHighFunction();   // reused, not a second decompile
+                    drKeep = dr;                 // D4 bridge: same decompile, no second pass
                 }
             } catch (Exception e) {
                 pseudocode = "/* decompile_error: " + e.getMessage() + " */";
@@ -2173,6 +2247,14 @@ public class ExportFunctions extends GhidraScript {
                 wrapperCallArgs = ",\"wrapper_call_args\":[]";
             }
 
+            // D4 bridge payloads: per-call name tokens + real body ranges (see build* below).
+            String callTokens = "[]";
+            try { if (drKeep != null) callTokens = buildCallTokens(func, drKeep); }
+            catch (Throwable ignore) { callTokens = "[]"; }
+            String bodyRanges = "[]";
+            try { bodyRanges = buildBodyRanges(func); }
+            catch (Throwable ignore) { bodyRanges = "[]"; }
+
             if (!firstFunc) funcsJson.append(",");
             firstFunc = false;
             funcsJson.append("{")
@@ -2188,6 +2270,8 @@ public class ExportFunctions extends GhidraScript {
                      .append(",")
                      .append("\"string_keyed_edges\":").append(strKeyedEdges).append(",")
                      .append("\"address_taken\":").append(addressTaken).append(",")
+                     .append("\"call_tokens\":").append(callTokens).append(",")
+                     .append("\"body_ranges\":").append(bodyRanges).append(",")
                      .append("\"pseudocode\":")  .append("\"").append(esc(pseudocode)).append("\"")
                      .append("}");
             funcCount++;

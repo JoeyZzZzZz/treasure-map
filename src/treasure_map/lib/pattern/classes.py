@@ -504,6 +504,41 @@ def path_arg_ident(
     return None
 
 
+def _literal_spans(text: str) -> tuple[tuple[int, int], ...]:
+    """(open_quote_index, close_quote_index) for every C string/char literal, escapes honoured.
+
+    A ``name(`` whose paren falls inside one of these spans is text inside a printed message, not a
+    call — the decompiler emits ``syslog(1,"... snprintf() failed")`` verbatim. Used by
+    ``call_offsets`` to keep such a match from becoming a phantom callsite."""
+    spans: list[tuple[int, int]] = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == '"' or ch == "'":
+            j = i + 1
+            while j < n:
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] == ch or text[j] == "\n":
+                    break
+                j += 1
+            spans.append((i, j))
+            i = j + 1
+        else:
+            i += 1
+    return tuple(spans)
+
+
+def _is_phantom_offset(paren_off: int, decl_end: int, spans: tuple[tuple[int, int], ...]) -> bool:
+    """A regex ``name(`` hit that is NOT a call: on the function's own declaration line (paren
+    before the body's opening brace ``decl_end``; ``decl_end == -1`` means no brace was found, so
+    this rule is off), or with its paren inside a string/char literal span. See ``call_offsets``."""
+    if decl_end != -1 and paren_off < decl_end:
+        return True
+    return any(lo < paren_off <= hi for lo, hi in spans)
+
+
 # ── Call locations: one authority on "where are the calls to NAME" ──────────────────────────────
 
 # A call the decompiler named after the stub it goes through (``FUN_004125b0(...)``) rather than
@@ -513,7 +548,11 @@ _STUB_CALL_RE = re.compile(r"\bFUN_([0-9a-fA-F]+)\s*\(")
 
 
 def call_offsets(
-    pseudocode: str, name: str, stub_names: Mapping[int, str] | None = None
+    pseudocode: str,
+    name: str,
+    stub_names: Mapping[int, str] | None = None,
+    *,
+    strip_phantoms: bool = True,
 ) -> tuple[int, ...]:
     """Offsets of the opening parenthesis of every call to ``name``, in source order.
 
@@ -532,15 +571,34 @@ def call_offsets(
 
     Without ``stub_names`` the answer is byte-for-byte what it has always been, which is what makes
     the recovery additive: every caller that has no resolution to hand behaves exactly as before.
+
+    ``strip_phantoms`` (default True, so every caller is fixed at once) drops two kinds of regex hit
+    that are NOT a call and used to invent a phantom callsite that shifted every real occurrence
+    after it: a hit on the function's own DECLARATION (before the body's opening brace — a
+    stub-named wrapper ``void FUN_x(...)`` whose entry address resolves to a sink used to be
+    counted as a call to it), and a hit INSIDE a string/char literal (``syslog(1,"snprintf()")``).
+    Pass ``strip_phantoms=False`` to reproduce the pre-fix output byte-for-byte; the D4 rekey diffs
+    the two to name the phantom callsites it retires (see hunt/rekey_d4), and nothing else needs it.
     """
-    direct = [m.end() - 1 for m in re.finditer(rf"\b{re.escape(name)}\s*\(", pseudocode)]
+    spans = _literal_spans(pseudocode) if strip_phantoms else ()
+    decl_end = pseudocode.find("{") if strip_phantoms else -1
+
+    direct: list[int] = []
+    for m in re.finditer(rf"\b{re.escape(name)}\s*\(", pseudocode):
+        off = m.end() - 1
+        if strip_phantoms and _is_phantom_offset(off, decl_end, spans):
+            continue
+        direct.append(off)
     if not stub_names:
         return tuple(direct)
-    stubs = [
-        m.end() - 1
-        for m in _STUB_CALL_RE.finditer(pseudocode)
-        if stub_names.get(int(m.group(1), 16)) == name
-    ]
+    stubs: list[int] = []
+    for m in _STUB_CALL_RE.finditer(pseudocode):
+        if stub_names.get(int(m.group(1), 16)) != name:
+            continue
+        off = m.end() - 1
+        if strip_phantoms and _is_phantom_offset(off, decl_end, spans):
+            continue
+        stubs.append(off)
     return tuple(sorted(direct + stubs))
 
 
@@ -563,12 +621,18 @@ class SinkCallsite:
     index: int
     sink_name: str
     occurrence: int
+    # Character offset of this call's opening paren in the decompiled text. The D4 rekey joins an
+    # old function-scoped ref to its re-hunted candidate by (func, text_offset), NOT by occurrence,
+    # which moves when a phantom callsite is retired (see hunt/rekey_d4 / build_evidence_ref).
+    offset: int = -1
 
 
 def sink_callsites(
     pseudocode: str,
     sink_names: Iterable[str],
     stub_names: Mapping[int, str] | None = None,
+    *,
+    strip_phantoms: bool = True,
 ) -> tuple[SinkCallsite, ...]:
     """Every textual call to one of ``sink_names``, in source order.
 
@@ -585,10 +649,12 @@ def sink_callsites(
     sites = [
         (offset, name, occurrence)
         for name in sorted({n for n in sink_names if n})
-        for occurrence, offset in enumerate(call_offsets(pseudocode, name, stub_names))
+        for occurrence, offset in enumerate(
+            call_offsets(pseudocode, name, stub_names, strip_phantoms=strip_phantoms)
+        )
     ]
     sites.sort()
     return tuple(
-        SinkCallsite(index=index, sink_name=name, occurrence=occurrence)
-        for index, (_offset, name, occurrence) in enumerate(sites)
+        SinkCallsite(index=index, sink_name=name, occurrence=occurrence, offset=offset)
+        for index, (offset, name, occurrence) in enumerate(sites)
     )

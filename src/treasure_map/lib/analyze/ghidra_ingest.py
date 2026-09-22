@@ -221,6 +221,10 @@ def _ingest_one_binary(
                 # by get_xrefs(direction=address_taken). Old exports -> '{}' (never null).
                 json.dumps(func.get("address_taken", {}), ensure_ascii=False),
                 unresolved_json,
+                # D4 bridge transport: per-call ClangFuncNameToken triples and the function's real
+                # body address ranges, carried verbatim for hunt-time ref-offset + out-of-body.
+                json.dumps(func.get("call_tokens", []), ensure_ascii=False),
+                json.dumps(func.get("body_ranges", []), ensure_ascii=False),
             )
         )
     if func_rows:
@@ -229,8 +233,9 @@ def _ingest_one_binary(
                (binary_id, name, address, size_bytes, pseudocode,
                 pseudocode_hash, callees, callees_truncated, is_exported,
                 sink_provenance, nvram_ops, nvram_wrapper, wrapper_call_args,
-                string_keyed_edges, address_taken, unresolved_external_calls)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                string_keyed_edges, address_taken, unresolved_external_calls,
+                call_tokens, body_ranges)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             func_rows,
         )
         stats.functions_ingested += len(func_rows)

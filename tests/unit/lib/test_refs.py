@@ -80,3 +80,60 @@ def test_id_fallback_reachable_only_without_address_or_name() -> None:
         func_id=_ID_SCAN_A,
     )
     assert f"id{_ID_SCAN_A}" in ref
+
+
+# ── D4: address-offset ref form ─────────────────────────────────────────────────────────────────
+
+from treasure_map.lib.hunt.refs import (  # noqa: E402
+    _norm_offset,
+    callsite_offset_suffix,
+)
+
+
+def test_norm_offset_is_signed_and_zero_padded() -> None:
+    """One offset, one spelling: signed, 0x, fixed-width zero pad. A negative in-body offset (an
+    out-of-line block below the entry) keeps its sign so it never aliases onto a positive call.
+
+    MUTATION (must go RED): drop the sign (``abs`` both sides), or drop the zero pad (``:x``)."""
+    assert _norm_offset("0x409bc8", "0x409748") == "0x000480"
+    assert _norm_offset("0x400", "0x440") == "-0x000040"
+    assert _norm_offset("0x1000", "0x1000") == "0x000000"
+    # the "0x1218" vs "0x001218" aliasing the pad exists to prevent
+    assert _norm_offset("0x1218", "0x0") == _norm_offset("0x001218", "0x0") == "0x001218"
+    # an offset wider than the pad still renders deterministically
+    assert _norm_offset("0x1abcdef", "0x0") == "0x1abcdef"
+    # unparseable either side -> None (caller falls back, never guesses)
+    assert _norm_offset(None, "0x1") is None
+    assert _norm_offset("zzz", "0x1") is None
+
+
+def test_callsite_offset_suffix_three_forms_by_caller_contract() -> None:
+    """Address offset when known; else the legacy ``#index`` ONLY if the caller passes one; else
+    bare. The caller passes an index only for a pre-bridge DB, so a bridge-present hunt emits no
+    ``#index`` at all — the invariant the rekey rests on. With the bridge present, an unaddressable
+    call (index withheld) degrades to bare, not to a shifted ordinal a retired phantom could move.
+
+    MUTATION (must go RED): return the bare class even when a callsite_index is given (which would
+    collapse per-callsite candidates on a pre-bridge DB)."""
+    assert callsite_offset_suffix("cmd", "0x001218") == "cmd@0x001218"
+    assert callsite_offset_suffix("cmd", "0x001218", 3) == "cmd@0x001218"  # offset wins over index
+    assert callsite_offset_suffix("copy", None, 2) == "copy#2"  # legacy: no bridge, index passed
+    assert callsite_offset_suffix("copy", None) == "copy"  # bridge present, index withheld -> bare
+    assert callsite_offset_suffix("copy", None, None) == "copy"
+
+
+def test_offset_ref_splits_on_the_first_at_sign() -> None:
+    """The full ref carries two ``@`` (``...@cmd@0x000480``); readers must split on the FIRST so the
+    head stays ``<run>#<sha8>:<addr>`` and the suffix is ``<class>@<offset>``.
+
+    This pins the wire contract the rekey executor relies on for parsing the new-form ref."""
+    ref = build_evidence_ref(
+        "runx",
+        suffix=callsite_offset_suffix("cmd", _norm_offset("0x409bc8", "0x409748")),
+        binary_sha256="a886defeaabbccdd",
+        address="0x409748",
+    )
+    assert ref == "runx#a886defe:00409748@cmd@0x000480"
+    head, suffix = ref.split("@", 1)
+    assert head == "runx#a886defe:00409748"
+    assert suffix.split("@") == ["cmd", "0x000480"]

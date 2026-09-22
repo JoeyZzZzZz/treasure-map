@@ -88,6 +88,16 @@ CREATE TABLE IF NOT EXISTS functions (
     -- analysis.db is wipe-and-rebuild, so this rides with the function here and is merged into the
     -- atlas instance's flow_evidence at hunt time (the persistent home). Empty '[]' when none.
     sink_provenance TEXT    DEFAULT '[]',
+    -- D4 bridge transport (wipe-and-rebuild with the function, consumed at hunt time):
+    -- call_tokens: JSON [{call_token,token_addr,op_addr,opcode,text_off,line}] — every function-name
+    -- token in the decompiler's C markup, giving each textual call BOTH its own address and the
+    -- character offset where it prints. The per-callsite ref's ADDRESS offset is read here (the
+    -- 85.5% of candidates with no sink_provenance record have no other address source). '[]' if none.
+    call_tokens     TEXT    DEFAULT '[]',
+    -- body_ranges: JSON [["0x<lo>","0x<hi>"], ...] — the function body's REAL address ranges
+    -- (AddressRangeIterator), not the size_bytes count. A non-contiguous body has several; a sink
+    -- address outside all of them is out-of-body -> not_traced. '[]' if none.
+    body_ranges     TEXT    DEFAULT '[]',
     -- gap② phase 1: per-function nvram read/write ops (which key this function reads/writes + the
     -- written value's source). Feeds the phase-2 cross-binary key graph. Empty '[]' when none.
     nvram_ops       TEXT    DEFAULT '[]',

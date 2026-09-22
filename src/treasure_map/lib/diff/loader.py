@@ -30,12 +30,18 @@ class FuncRow:
     pseudocode: str | None
     pseudocode_hash: str | None
     callees: str | None
+    # D4 bridge transport (analysis.db functions; None on a pre-bridge / un-migrated DB). The hunt
+    # layer reads the per-callsite ref's ADDRESS offset from call_tokens and the out-of-body test
+    # from body_ranges; the diff layer ignores both. Defaulted so synthetic FuncRows stay valid.
+    call_tokens: str | None = None
+    body_ranges: str | None = None
 
 
 _SELECT = """
 SELECT f.id, f.binary_id, b.name AS binary_name, b.path AS binary_path,
        b.sha256 AS binary_sha256, f.name, f.address,
-       f.pseudocode, f.pseudocode_hash, f.callees
+       f.pseudocode, f.pseudocode_hash, f.callees,
+       __BRIDGE_COLS__
   FROM functions f
   JOIN binaries b ON b.id = f.binary_id
  ORDER BY b.name, f.id
@@ -52,7 +58,13 @@ def load_functions(db_path: Path | str) -> list[FuncRow]:
     conn = sqlite3.connect(uri, uri=True)
     try:
         conn.row_factory = sqlite3.Row
-        rows = conn.execute(_SELECT).fetchall()
+        # The bridge columns may be absent on a DB built before D4 / not yet migrated (this opens
+        # read-only, so it never migrates). Select them only when present, else NULL, so a stale
+        # analysis.db still loads instead of raising "no such column".
+        fcols = {r[1] for r in conn.execute("PRAGMA table_info(functions)")}
+        ct = "f.call_tokens" if "call_tokens" in fcols else "NULL AS call_tokens"
+        br = "f.body_ranges" if "body_ranges" in fcols else "NULL AS body_ranges"
+        rows = conn.execute(_SELECT.replace("__BRIDGE_COLS__", f"{ct}, {br}")).fetchall()
     finally:
         conn.close()
     return [
@@ -67,6 +79,8 @@ def load_functions(db_path: Path | str) -> list[FuncRow]:
             pseudocode=r["pseudocode"],
             pseudocode_hash=r["pseudocode_hash"],
             callees=r["callees"],
+            call_tokens=r["call_tokens"],
+            body_ranges=r["body_ranges"],
         )
         for r in rows
     ]

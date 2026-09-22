@@ -64,6 +64,7 @@ from treasure_map.lib.atlas.writer import (
     upsert_pattern,
 )
 from treasure_map.lib.diff.loader import FuncRow, load_functions
+from treasure_map.lib.hunt.bridge import callsite_address_offset
 from treasure_map.lib.hunt.downweight import (
     CONST_SINK_ARG,
     detect_form_signal,
@@ -86,7 +87,11 @@ from treasure_map.lib.hunt.exec_edges import (
 )
 from treasure_map.lib.hunt.facts import is_thin_cmd_wrapper
 from treasure_map.lib.hunt.fmt_provenance import constant_format_record, format_argument
-from treasure_map.lib.hunt.refs import _WRAPPER_AXIS, build_evidence_ref, callsite_suffix
+from treasure_map.lib.hunt.refs import (
+    _WRAPPER_AXIS,
+    build_evidence_ref,
+    callsite_offset_suffix,
+)
 from treasure_map.lib.hunt.wrapper_propagation import (
     find_wrapper_propagated_candidates,
 )
@@ -1495,10 +1500,27 @@ def run_analyzer2(
                         # them; each is a distinct instance, and the suffix is what keeps their
                         # refs apart (it is the single anchor used by --explain, manual jump-back,
                         # and any durable per-ref judgement store — which is why it must not drift
-                        # across a re-scan; see build_evidence_ref / callsite_suffix).
+                        # across a re-scan; see build_evidence_ref / callsite_offset_suffix).
                         evidence_ref=build_evidence_ref(
                             source_run_id,
-                            suffix=callsite_suffix(match.sink_class, match.sink_callsite_index),
+                            suffix=callsite_offset_suffix(
+                                match.sink_class,
+                                callsite_address_offset(
+                                    row.pseudocode,
+                                    sink_name,
+                                    match.sink_callsite_occurrence,
+                                    row.call_tokens,
+                                    row.body_ranges,
+                                    row.address,
+                                    stub_names,
+                                ),
+                                # legacy ordinal only when this DB predates the bridge; with the
+                                # bridge present, an unaddressable call degrades to the bare class
+                                # and no #index ref is ever emitted (keeps the rekey unambiguous).
+                                None
+                                if row.call_tokens not in (None, "[]")
+                                else match.sink_callsite_index,
+                            ),
                             binary_sha256=row.binary_sha256,
                             binary_name=row.binary_name,
                             address=row.address,

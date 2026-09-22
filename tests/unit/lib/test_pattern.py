@@ -1690,3 +1690,79 @@ def test_names_the_alias_rule_reaches_but_does_not_list_stay_out() -> None:
     # them out, so the guard must not be readable as "its base is unknown".
     assert {"scanf", "sscanf", "fscanf"} <= SOURCE
     assert not (_UNLISTED_SOURCE_CANDIDATES & set(_SOURCE_ALIAS_BASE))
+
+
+# ── D4: enumerator phantom-callsite stripping (declaration line + string literal) ────────────────
+
+
+def test_call_offsets_skips_the_functions_own_declaration_line() -> None:
+    """A stub-named wrapper's own declaration is not a call to the sink it forwards to.
+
+    ``void FUN_00409000(char *param_1)`` is the declaration of a wrapper whose entry address
+    resolves (via the stub table) to ``system``; the raw regex counted that declaration as a first
+    ``system`` call, inventing a phantom callsite before the body and shifting the real call to
+    occurrence 1. The declaration sits before the body's opening brace, so it is dropped.
+
+    MUTATION (must go RED): drop the ``decl_end`` test in ``_is_phantom_offset``, or default
+    ``strip_phantoms`` to False."""
+    pc = "\nvoid FUN_00409000(char *param_1)\n\n{\n  system(param_1);\n  return;\n}\n"
+    stub = {0x409000: "system"}
+    real_paren = pc.index("system(") + len("system")
+    assert call_offsets(pc, "system", stub) == (real_paren,)
+    # without stripping, the declaration's FUN_00409000( counts too -> the phantom
+    assert call_offsets(pc, "system", stub, strip_phantoms=False) == (
+        pc.index("FUN_00409000(") + len("FUN_00409000"),
+        real_paren,
+    )
+    sites = sink_callsites(pc, {"system"}, stub)
+    assert [(s.index, s.sink_name, s.occurrence, s.offset) for s in sites] == [
+        (0, "system", 0, real_paren)
+    ]
+
+
+def test_call_offsets_skips_a_match_inside_a_string_literal() -> None:
+    """``sink(`` printed inside a message string is text, not a call.
+
+    ``syslog(3,"fopen() failed")`` contains the characters ``fopen(`` inside the format literal; the
+    raw regex counted it as an ``fopen`` call and shifted the real one after it.
+
+    MUTATION (must go RED): drop the literal-span test from ``_is_phantom_offset``."""
+    pc = (
+        '\nint f(void)\n\n{\n  FILE *p = fopen("/tmp/x","r");\n'
+        '  syslog(3,"fopen() failed");\n  return 0;\n}\n'
+    )
+    real_paren = pc.index('fopen("/tmp') + len("fopen")
+    assert call_offsets(pc, "fopen") == (real_paren,)
+    assert len(call_offsets(pc, "fopen", strip_phantoms=False)) == 2
+
+
+def test_call_offsets_strip_phantoms_false_reproduces_pre_fix_output() -> None:
+    """The unstripped path is byte-for-byte the old behaviour, so the D4 rekey can diff for the
+    phantom callsites it retires (PHANTOM = offsets(strip=off) - offsets(strip=on)).
+
+    MUTATION (must go RED): ignore the ``strip_phantoms`` flag (always strip)."""
+    pc = "\nvoid FUN_00409000(char *p)\n\n{\n  system(p);\n}\n"
+    stub = {0x409000: "system"}
+    off = call_offsets(pc, "system", stub, strip_phantoms=False)
+    assert off == (
+        pc.index("FUN_00409000(") + len("FUN_00409000"),
+        pc.index("system(") + len("system"),
+    )
+    assert set(off) - set(call_offsets(pc, "system", stub)) == {
+        pc.index("FUN_00409000(") + len("FUN_00409000")
+    }
+
+
+def test_call_offsets_stripping_never_swallows_a_real_call() -> None:
+    """Stripping must not over-reach: a real call on the SAME line right after a string literal is
+    kept, and strip on/off agree. The literal ``"x"`` and the ``memcpy`` that follows it share a
+    line, so a scanner that ran the literal span to the newline would hide the first ``memcpy``.
+
+    MUTATION (must go RED): make the literal scanner break only on newline (swallow past the closing
+    quote), or make the declaration rule use the LAST brace instead of the first."""
+    pc = (
+        '\nint g(int a)\n\n{\n  printf("x"); memcpy(d, s, 4);\n  memcpy(e, t, a);\n  return 0;\n}\n'
+    )
+    assert call_offsets(pc, "memcpy") == call_offsets(pc, "memcpy", strip_phantoms=False)
+    assert len(call_offsets(pc, "memcpy")) == 2
+    assert len(call_offsets(pc, "printf")) == 1
