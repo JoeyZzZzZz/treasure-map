@@ -51,8 +51,9 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # to the explicit 'unknown' run-level sentinel (cannot confirm which decompiler ran) rather than
     # being read as "same version as the other side". Must match schema.sql.
     ("binaries", "ghidra_version", "TEXT"),
-    # WHY a failed Ghidra run failed (timeout/import_failed/no_output/incomplete). Back-fills NULL
-    # on older DBs (a pre-feature failure carries no reason -> failed with an unknown cause).
+    # WHY a failed Ghidra run failed (timeout/import_failed/no_output/incomplete/stale_output).
+    # Back-fills NULL on older DBs (a pre-feature failure carries no reason -> failed with an
+    # unknown cause).
     # Must match schema.sql.
     ("binaries", "ghidra_status_reason", "TEXT"),
     # What the LAST failed Ghidra attempt ran under: its wall-clock budget and the extraction

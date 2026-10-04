@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import sqlite3
 from pathlib import Path
 
 from click.testing import CliRunner
@@ -1185,3 +1186,53 @@ def test_list_candidates_refuses_a_filter_dimension_that_does_not_exist(tmp_path
     assert "error" in tools["list_candidates"](only="binary=ip")
     ok = tools["list_candidates"](filters="sink_class=cmd")
     assert "error" not in ok and ok["total"] >= 1
+
+
+# ── anchor / extraction facts are surfaced on the row and on every evidence_ref fact ───────────
+
+
+def _mark_degraded_and_old(tmp_path: Path) -> None:
+    conn = sqlite3.connect(tmp_path / "atlas.db")
+    row = conn.execute("SELECT flow_evidence FROM instance WHERE evidence_ref = 'run_m#fn1@cmd'")
+    ev = json.loads(row.fetchone()[0])
+    ev.update(
+        callsite_located=False,
+        anchor_degraded="out_of_body",
+        extraction_current=False,
+        extraction_pass="deadbeefdeadbeef",
+        attempted_pass="facefeedfacefeed",
+    )
+    conn.execute(
+        "UPDATE instance SET flow_evidence = ? WHERE evidence_ref = 'run_m#fn1@cmd'",
+        (json.dumps(ev),),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_degraded_and_earlier_extraction_facts_reach_every_reader(tmp_path: Path) -> None:
+    """A degraded function-level anchor and an earlier extraction are stated, with their notes, on
+    the candidate row, in explain_candidate, and on an evidence_ref fact tool's result — under
+    their own key, never over the fact's existing ``anchor`` (its function locator).
+
+    MUTATION (must go RED): drop the anchor stamp in the shared fact envelope, or the row key."""
+    tools = _tools(tmp_path)
+    _mark_degraded_and_old(tmp_path)
+    (cand,) = tools["list_candidates"]()["candidates"]
+    pc = tools["get_pseudocode"](evidence_ref="run_m#fn1@cmd")
+    ex = tools["explain_candidate"](evidence_ref="run_m#fn1@cmd")
+    for anchor in (cand["anchor_facts"], pc["anchor_facts"], ex["candidate"]["anchor_facts"]):
+        assert anchor["callsite_located"] is False
+        assert anchor["anchor_degraded"] == "out_of_body"
+        assert "FUNCTION-level degraded anchor" in anchor["anchor_note"]
+        assert anchor["extraction_current"] is False
+        assert anchor["attempted_pass"] == "facefeedfacefeed"
+        assert "did not succeed" in anchor["extraction_note"]
+    assert pc["anchor"]["function"] == "handle_req"  # the locator is untouched
+
+
+def test_a_clean_candidate_carries_no_anchor_key(tmp_path: Path) -> None:
+    tools = _tools(tmp_path)
+    (cand,) = tools["list_candidates"]()["candidates"]
+    assert "anchor_facts" not in cand
+    assert "anchor_facts" not in tools["get_pseudocode"](evidence_ref="run_m#fn1@cmd")

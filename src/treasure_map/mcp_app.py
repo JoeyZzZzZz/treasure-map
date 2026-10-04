@@ -84,6 +84,7 @@ from treasure_map.lib.query.diff_align import get_diff_deltas as _get_diff_delta
 from treasure_map.lib.query.diff_align import get_diff_meta as _get_diff_meta
 from treasure_map.lib.query.diff_align import list_diff_blindspots as _list_diff_blindspots
 from treasure_map.lib.query.diff_align import list_diffs as _list_diffs
+from treasure_map.lib.query.triage import anchor_facts
 from treasure_map.version import installed_commit as _installed_commit
 
 # A standing reminder attached to every candidate-listing / aggregation result: the ordering and
@@ -351,6 +352,9 @@ def _candidate_row(
         # visible without turning a view on.
         "coverage": coverage,
     }
+    if c.anchor_facts:
+        # a degraded function-level ref and/or an earlier extraction, said on the row itself
+        row["anchor_facts"] = c.anchor_facts
     if overlay is not None:
         # ★ The agent's judgement rides in its OWN key. NEVER inside ``dimensions`` — that carry
         # loop is axis-agnostic, so a verdict placed there would be auto-adopted as if it were a
@@ -494,6 +498,18 @@ def make_tools(
         if row is None:
             return None
         return (row["source_run_id"], _short_binary(row["binary_path"]), row["source_anchor"])
+
+    def _ref_anchor_facts(atlas: sqlite3.Connection, evidence_ref: str) -> dict[str, Any]:
+        """The anchor/extraction facts of a ref, across EVERY instance row it names (a degraded
+        bare ref is shared by siblings, and any one of them being degraded is the fact to show)."""
+        merged: dict[str, Any] = {}
+        for (fe,) in atlas.execute(
+            "SELECT flow_evidence FROM instance WHERE evidence_ref = ? ORDER BY instance_id",
+            (evidence_ref,),
+        ):
+            for key, value in anchor_facts(fe).items():
+                merged.setdefault(key, value)
+        return merged
 
     def _resolve_locus(
         atlas: sqlite3.Connection,
@@ -758,6 +774,11 @@ def make_tools(
             result["resolved_run"] = run.run_id
             result["run_source"] = locus["run_source"]
             result["run_lineage"] = _lineage_inline(run)
+            if evidence_ref is not None:
+                ref_facts = _ref_anchor_facts(atlas, evidence_ref)
+                if ref_facts:
+                    # own key: "anchor" is already the fact's function locator
+                    result["anchor_facts"] = ref_facts
             if locus.get("warning"):
                 # MERGE, never clobber: a fact-layer warning (e.g. get_strings' func-scope alert)
                 # must not be silently overwritten by the run-locus warning — both are honest.

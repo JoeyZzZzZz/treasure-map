@@ -50,7 +50,7 @@ def _insert_func(
     exactly what ghidra_ingest does, which is what makes func_id climb on every re-ingest."""
     nvram_wrapper = func.get("nvram_wrapper")
     cols = "binary_id, name, address, pseudocode, pseudocode_hash, callees, nvram_ops, "
-    cols += "nvram_wrapper, wrapper_call_args, string_keyed_edges"
+    cols += "nvram_wrapper, wrapper_call_args, string_keyed_edges, call_tokens, body_ranges"
     vals: tuple[object, ...] = (
         bid,
         func["name"],
@@ -62,6 +62,9 @@ def _insert_func(
         json.dumps(nvram_wrapper) if nvram_wrapper else None,
         json.dumps(func.get("wrapper_call_args", [])),
         json.dumps(func.get("string_keyed_edges", {})),
+        # bridge transport: absent -> "[]", exactly what the ingest stores for a token-less export
+        json.dumps(func.get("call_tokens", [])),
+        json.dumps(func.get("body_ranges", [])),
     )
     if fid is not None:
         cols = "id, " + cols
@@ -110,7 +113,7 @@ def _make_db(
         )
     for bid, spec in enumerate(binaries, start=1):
         conn.execute(
-            "INSERT INTO binaries (id, name, path, sha256) VALUES (?, ?, ?, ?)",
+            "INSERT INTO binaries (id, name, path, sha256, ghidra_ok) VALUES (?, ?, ?, ?, 1)",
             (bid, spec["name"], spec.get("path"), _sha(str(spec["name"]))),
         )
         if spec.get("oss"):
@@ -1447,7 +1450,7 @@ def test_evidence_ref_distinguishes_same_named_binaries(tmp_path: Path) -> None:
     conn = open_db(db)
     for bid, spec in enumerate(fw, start=1):
         conn.execute(
-            "INSERT INTO binaries (id, name, path, sha256) VALUES (?, ?, ?, ?)",
+            "INSERT INTO binaries (id, name, path, sha256, ghidra_ok) VALUES (?, ?, ?, ?, 1)",
             (bid, spec["name"], spec["path"], _sha(str(spec["path"]))),
         )
         for func in spec["funcs"]:  # type: ignore[union-attr]
@@ -3024,7 +3027,9 @@ def test_flatten_detector_status_reads_analysis_db(tmp_path: Path) -> None:
 
     db = tmp_path / "a.db"
     conn = open_db(db)
-    conn.execute("INSERT INTO binaries (id, name, sha256) VALUES (1, 'httpd', ?)", ("a" * 64,))
+    conn.execute(
+        "INSERT INTO binaries (id, name, sha256, ghidra_ok) VALUES (1, 'httpd', ?, 1)", ("a" * 64,)
+    )
     conn.execute(
         "INSERT INTO detector_scan_status (binary_id, detector, scanned, supported_scope, "
         "unsupported_note, cap_hit, found_count) "
@@ -4025,3 +4030,186 @@ def test_a_recovered_copy_is_graded_on_its_own_length(tmp_path: Path) -> None:
     assert [r["evidence_ref"].rsplit("@", 1)[1] for r in rows] == ["copy#0", "copy#1"]
     assert [json.loads(r["flow_evidence"])["size_kind"] for r in rows] == ["const", "variable"]
     assert [r["blocking_mechanism"] for r in rows] == ["const_size", None]
+
+
+# ── offset-ref wiring with real bridge data (call_tokens + body_ranges) ─────────────────────────
+
+
+def _bridged(name: str, entry: int, pseudocode: str, callees: list[str], *, body: tuple[int, int],
+             addr_of: dict[str, list[int]]) -> dict[str, object]:  # fmt: skip
+    """A fixture function carrying the bridge facts the extractor emits: one opcode-7 token per
+    textual call (``text_off`` at the name's start, as printed) whose address comes from
+    ``addr_of[name][nth]``, and the body's address range."""
+    tokens: list[dict[str, object]] = []
+    for callee, addrs in addr_of.items():
+        start = -1
+        for addr in addrs:
+            start = pseudocode.index(callee + "(", start + 1)
+            tokens.append(
+                {"call_token": callee, "text_off": start, "op_addr": hex(addr), "opcode": 7}
+            )
+    return {
+        "name": name,
+        "address": f"{entry:08x}",
+        "hash": f"h_{name}",
+        "pseudocode": pseudocode,
+        "callees": callees,
+        "call_tokens": tokens,
+        "body_ranges": [[hex(body[0]), hex(body[1])]],
+    }
+
+
+def _rows_for(atlas: Path, anchor: str) -> list[tuple[str, dict[str, object]]]:
+    conn = open_atlas(atlas)
+    try:
+        rows = conn.execute(
+            "SELECT evidence_ref, flow_evidence FROM instance WHERE source_anchor = ? "
+            "ORDER BY instance_id",
+            (anchor,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [(str(r[0]), json.loads(r[1]) if r[1] else {}) for r in rows]
+
+
+def test_interleaved_sinks_get_their_own_address_offset_refs(tmp_path: Path) -> None:
+    """Two copy sinks interleaved (index != occurrence for the second memcpy): each candidate's ref
+    is ``@copy@<its own offset>``, read from the bridge token of ITS call.
+
+    MUTATION (must go RED): pass the callsite INDEX where the occurrence belongs (the second
+    memcpy, index 2, has no occurrence 2 and falls back); or emit ``#index`` regardless of the
+    bridge; or skip the offset (always None) so every candidate degrades to the bare class."""
+    pc = (
+        "void Copier(char *a,char *b,int n) {\n"
+        "  memcpy(a,b,4);\n  strcpy(a,b);\n  memcpy(a,b,n);\n}\n"
+    )
+    fn = _bridged(
+        "Copier", 0x401000, pc, ["memcpy", "strcpy"],
+        body=(0x401000, 0x401100), addr_of={"memcpy": [0x401010, 0x401030], "strcpy": [0x401020]},
+    )  # fmt: skip
+    db = _make_db(tmp_path, [{"name": "httpd", "funcs": [fn]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_b")
+    refs = sorted(ref.split("@", 1)[1] for ref, _ in _rows_for(atlas, "Copier"))
+    assert refs == ["copy@0x000010", "copy@0x000020", "copy@0x000030"]
+    assert all("callsite_located" not in ev for _, ev in _rows_for(atlas, "Copier"))
+
+
+def test_a_token_less_row_in_a_bridged_db_degrades_to_bare_never_index(tmp_path: Path) -> None:
+    """In a post-bridge database a function whose export carried no tokens is a DATA GAP: its
+    per-callsite candidate degrades to the bare class with ``callsite_located: false`` /
+    ``anchor_degraded: no_bridge_data`` — never the legacy ``#index``, which is only for a database
+    that predates the bridge altogether.
+
+    MUTATION (must go RED): decide the #index fallback per row again
+    (``row.call_tokens not in (None, "[]")``), or flag the reason by truthiness so "[]" reads as
+    no_bridge_token."""
+    bridged = _bridged(
+        "Copier", 0x401000, "void Copier(char *a,char *b) {\n  memcpy(a,b,4);\n}\n", ["memcpy"],
+        body=(0x401000, 0x401100), addr_of={"memcpy": [0x401010]},
+    )  # fmt: skip
+    gap = {
+        "name": "Runner",
+        "address": "00402000",
+        "hash": "h_Runner",
+        "pseudocode": "void Runner(char *p) {\n  system(p);\n}\n",
+        "callees": ["system"],
+    }  # no call_tokens -> "[]"
+    db = _make_db(tmp_path, [{"name": "httpd", "funcs": [bridged, gap]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_b")
+    rows = _rows_for(atlas, "Runner")
+    assert [ref.split("@", 1)[1] for ref, _ in rows] == ["cmd"]
+    assert rows[0][1]["callsite_located"] is False
+    assert rows[0][1]["anchor_degraded"] == "no_bridge_data"
+
+
+def test_out_of_body_siblings_share_a_bare_ref_and_both_say_so(tmp_path: Path) -> None:
+    """Two calls whose addresses fall outside the function body (inlined into a neighbour) both
+    degrade to the bare class and so share one ref; each row says ``callsite_located: false`` with
+    ``anchor_degraded: out_of_body``, so no reader takes the shared ref for one call.
+
+    MUTATION (must go RED): drop the ``callsite_located`` / ``anchor_degraded`` keys."""
+    pc = "void Inl(char *a,char *b,int n) {\n  memcpy(a,b,4);\n  memcpy(a,b,n);\n}\n"
+    fn = _bridged(
+        "Inl", 0x401000, pc, ["memcpy"],
+        body=(0x401000, 0x401100), addr_of={"memcpy": [0x409000, 0x409010]},
+    )  # fmt: skip
+    db = _make_db(tmp_path, [{"name": "httpd", "funcs": [fn]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_b")
+    rows = _rows_for(atlas, "Inl")
+    assert [ref.split("@", 1)[1] for ref, _ in rows] == ["copy", "copy"]
+    assert [ev.get("callsite_located") for _, ev in rows] == [False, False]
+    assert [ev.get("anchor_degraded") for _, ev in rows] == ["out_of_body", "out_of_body"]
+
+
+def test_a_binary_whose_extraction_failed_marks_its_candidates_not_current(tmp_path: Path) -> None:
+    """A binary whose Ghidra run failed this scan still has its last good extraction's rows, and
+    they are hunted; every candidate says so (``extraction_current: false``, the pass that produced
+    the rows, and the pass this scan attempted). A binary from this scan's pass carries no such key.
+
+    MUTATION (must go RED): drop the extraction notes from the candidate's evidence."""
+    pc = "void Copier(char *a,char *b) {\n  memcpy(a,b,4);\n}\n"
+    good = _bridged(
+        "Copier", 0x401000, pc, ["memcpy"], body=(0x401000, 0x401100),
+        addr_of={"memcpy": [0x401010]},
+    )  # fmt: skip
+    old = dict(good, name="OldCopier", address="00405000", hash="h_old")
+    db = _make_db(tmp_path, [{"name": "httpd", "funcs": [good]}, {"name": "stale", "funcs": [old]}])
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE binaries SET pass_version = 'facefeedfacefeed' WHERE id = 1")
+    conn.execute(
+        "UPDATE binaries SET ghidra_ok = 0, pass_version = 'deadbeefdeadbeef', "
+        "timeout_pass_version = 'facefeedfacefeed' WHERE id = 2"
+    )
+    conn.commit()
+    conn.close()
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_b")
+    (_, cur_ev), = _rows_for(atlas, "Copier")  # fmt: skip
+    (_, old_ev), = _rows_for(atlas, "OldCopier")  # fmt: skip
+    assert "extraction_current" not in cur_ev
+    assert old_ev["extraction_current"] is False
+    assert old_ev["extraction_pass"] == "deadbeefdeadbeef"
+    assert old_ev["attempted_pass"] == "facefeedfacefeed"
+
+
+def test_a_binary_left_on_an_older_pass_is_marked_not_current(tmp_path: Path) -> None:
+    """The scan's pass is the one most binaries' last attempt carries; a binary whose rows still
+    come from another pass is marked ``extraction_current: false`` even with ghidra_ok = 1 (no
+    attempted_pass: it was not a failed attempt). The scan pass is read from the scan side, so a
+    binary on the majority pass carries no key whatever pass the hunting process would compute.
+
+    MUTATION (must go RED): mark only failed binaries (drop the pass comparison)."""
+    pc = "void Copier(char *a,char *b) {\n  memcpy(a,b,4);\n}\n"
+
+    def fn(name: str, entry: int) -> dict[str, object]:
+        return _bridged(
+            name, entry, pc.replace("Copier", name), ["memcpy"], body=(entry, entry + 0x100),
+            addr_of={"memcpy": [entry + 0x10]},
+        )  # fmt: skip
+
+    db = _make_db(
+        tmp_path,
+        [
+            {"name": "a", "funcs": [fn("Fa", 0x401000)]},
+            {"name": "b", "funcs": [fn("Fb", 0x402000)]},
+            {"name": "c", "funcs": [fn("Fc", 0x403000)]},
+        ],
+    )
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "UPDATE binaries SET last_seen_at = '2026-10-01', pass_version = 'facefeedfacefeed'"
+    )
+    conn.execute("UPDATE binaries SET pass_version = 'deadbeefdeadbeef' WHERE id = 3")
+    conn.commit()
+    conn.close()
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_b")
+    (_, ev_a), = _rows_for(atlas, "Fa")  # fmt: skip
+    (_, ev_c), = _rows_for(atlas, "Fc")  # fmt: skip
+    assert "extraction_current" not in ev_a
+    assert ev_c["extraction_current"] is False
+    assert ev_c["extraction_pass"] == "deadbeefdeadbeef"
+    assert "attempted_pass" not in ev_c

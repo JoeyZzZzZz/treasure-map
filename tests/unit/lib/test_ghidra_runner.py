@@ -36,10 +36,13 @@ def _write_small_elf(path: Path) -> None:
     path.write_bytes(b"\x7fELF" + b"\x00" * 100)
 
 
-def _good_json() -> str:
-    """Return a >200-byte valid Ghidra output JSON."""
+def _good_json(env: dict[str, str] | None = None) -> str:
+    """Return a >200-byte valid Ghidra output JSON. Given the run's ``env``, it carries the
+    ``pass_version`` / ``sha8`` markers the real extractor echoes back from PASS_VERSION / SHA8."""
+    markers = {} if env is None else {"pass_version": env["PASS_VERSION"], "sha8": env["SHA8"]}
     return json.dumps(
-        {
+        markers
+        | {
             "binary": "httpd",
             "functions": [
                 {
@@ -192,7 +195,7 @@ def test_run_ghidra_success(tmp_path: Path) -> None:
     def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
         out = output_dir / f"httpd_{sha8}_ghidra.json"
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(_good_json())
+        out.write_text(_good_json(env))
         return 0, ""
 
     runner = _make_runner(tmp_path)
@@ -261,7 +264,7 @@ def test_run_ghidra_retries_on_import_failed(tmp_path: Path) -> None:
             (output_dir / f"httpd_{sha8}.log").write_text("ERROR: Import failed for httpd")
             return 1, "Import failed"
         # Second call: produce valid output
-        (output_dir / f"httpd_{sha8}_ghidra.json").write_text(_good_json())
+        (output_dir / f"httpd_{sha8}_ghidra.json").write_text(_good_json(env))
         return 0, ""
 
     def fake_patch(src: Path) -> tuple[Path, Path]:
@@ -328,7 +331,7 @@ def test_run_ghidra_timeout_retry_then_success(tmp_path: Path) -> None:
         call_count += 1
         if call_count == 1:
             return -1, "timeout"  # first budget exhausted, no JSON written
-        (output_dir / f"httpd_{sha8}_ghidra.json").write_text(_good_json())
+        (output_dir / f"httpd_{sha8}_ghidra.json").write_text(_good_json(env))
         return 0, ""
 
     runner = _make_runner(tmp_path)
@@ -688,7 +691,7 @@ def test_run_all_two_phase_serial_retry_recovers(tmp_path: Path) -> None:
             return -1, "timeout"  # phase 1: fail
         out = Path(env["OUTPUT_DIR"]) / f"big_{env['SHA8']}_ghidra.json"
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(_good_json())
+        out.write_text(_good_json(env))
         return 0, ""  # phase 2: succeed
 
     events: list[tuple[str, dict[str, Any]]] = []
@@ -793,3 +796,103 @@ def test_a_result_that_never_ran_records_no_budget(tmp_path: Path) -> None:
 
     placeholder = GhidraResult(binary=tmp_path / "b", output_file=None, success=False, elapsed=0.0)
     assert placeholder.timeout_budget is None
+
+
+# ── stale-output guards: a run must never be credited with a file it did not write ─────────────
+
+
+def _foreign_json(pass_version: str, sha8: str) -> str:
+    """A well-formed output that describes ANOTHER extraction (a different pass or binary)."""
+    data = json.loads(_good_json())
+    data["pass_version"] = pass_version
+    data["sha8"] = sha8
+    return json.dumps(data)
+
+
+def _run_once_with(tmp_path: Path, fake_sub, sha8: str = "deadbeef"):  # type: ignore[no-untyped-def]
+    output_dir = tmp_path / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    binary = tmp_path / "httpd"
+    _write_small_elf(binary)
+    runner = _make_runner(tmp_path)
+    with patch(f"{MODULE}._run_subprocess", fake_sub):
+        result = runner.run_ghidra(
+            binary, output_dir, timeout=60, arch="x86:LE:64:default", sha8=sha8, retry=False
+        )
+    return result, output_dir / f"httpd_{sha8}_ghidra.json"
+
+
+def test_a_timeout_is_a_failure_even_when_a_valid_output_is_on_disk(tmp_path: Path) -> None:
+    """Killed at the budget = failed, whatever file is present. Here the file even carries THIS
+    run's correct markers (the strongest case: a JSON that looks perfect), and still does not count.
+
+    MUTATION (must go RED): drop the ``rc == -1`` branch in ``_run_once``."""
+
+    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+        out = Path(env["OUTPUT_DIR"]) / f"httpd_{env['SHA8']}_ghidra.json"
+        out.write_text(_good_json(env))
+        return -1, "timeout"
+
+    result, _ = _run_once_with(tmp_path, fake_sub)
+    assert result.success is False
+    assert result.reason == "timeout"
+    assert result.output_file is None
+
+
+def test_an_output_left_by_an_earlier_run_is_cleared_before_the_run(tmp_path: Path) -> None:
+    """A previous scan's JSON at the target path is removed before Ghidra starts, so a run that
+    writes nothing reports no_output — it can never be credited with the old file's functions.
+
+    MUTATION (must go RED): drop the pre-run unlink in ``_run_once`` (the old file is then read and
+    the reason becomes stale_output instead of no_output)."""
+    sha8 = "deadbeef"
+    preset = tmp_path / "output" / f"httpd_{sha8}_ghidra.json"
+    preset.parent.mkdir(parents=True)
+    preset.write_text(_foreign_json("feedfacefeedface", sha8))  # an older pass, functions > 0
+
+    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+        return 0, ""  # exits cleanly, writes nothing
+
+    result, out = _run_once_with(tmp_path, fake_sub, sha8)
+    assert result.success is False
+    assert result.reason == "no_output"
+    assert not out.exists()
+
+
+def test_an_output_with_foreign_markers_is_stale_not_success(tmp_path: Path) -> None:
+    """A JSON that appears at the path but was written by another pass (copied in, a mixed-in old
+    workspace) is stale_output. Two variants: wrong pass, and right pass but wrong binary.
+
+    MUTATION (must go RED): make ``_markers_mismatch`` return False (or skip it in
+    ``_classify_analysis``) -> the foreign file is counted as this run's success."""
+    for wrong_pass, wrong_sha8 in ((True, False), (False, True)):
+
+        def fake_sub(
+            cmd: list[str],
+            env: dict[str, str],
+            timeout: int,
+            wp: bool = wrong_pass,
+            ws: bool = wrong_sha8,
+        ) -> tuple[int, str]:
+            out = Path(env["OUTPUT_DIR"]) / f"httpd_{env['SHA8']}_ghidra.json"
+            out.write_text(
+                _foreign_json(
+                    "feedfacefeedface" if wp else env["PASS_VERSION"],
+                    "cafebabe" if ws else env["SHA8"],
+                )
+            )
+            return 0, ""
+
+        sub = tmp_path / ("p" if wrong_pass else "s")
+        result, _ = _run_once_with(sub, fake_sub)
+        assert result.success is False, (wrong_pass, wrong_sha8)
+        assert result.reason == "stale_output", (wrong_pass, wrong_sha8)
+
+
+def test_classify_rejects_a_missing_marker_when_one_is_expected(tmp_path: Path) -> None:
+    """A JSON with no markers (an extractor from before they existed) never satisfies an expected
+    pass/sha8: absence is a mismatch, not a pass."""
+    out = tmp_path / "b_ghidra.json"
+    out.write_text(_good_json())  # no markers
+    assert _classify_analysis(out, tmp_path / "b", "feedfacefeedface", "deadbeef") == ("failed", 0)
+    assert _classify_analysis(out, tmp_path / "b") == ("ok", 1)  # no expectation -> no check

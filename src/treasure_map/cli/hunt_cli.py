@@ -512,6 +512,7 @@ def _render_triage(
                         "sink_class": c.sink_class,
                         "sink_anchor": c.sink_anchor,
                         "nvram_source_key": c.nvram_source_key,
+                        "anchor_facts": c.anchor_facts,
                         "dimensions": [
                             {
                                 "name": d.name,
@@ -578,6 +579,9 @@ def _render_triage(
         if c.dim("source").value == "param":
             loc += "   source=param"
         click.echo(loc)
+        for key in ("anchor_note", "extraction_note"):
+            if key in c.anchor_facts:
+                click.echo(f"        ! {c.anchor_facts[key]}")
     if "gated" not in visible_statuses and counts["gated"]:
         click.echo(f"\n  (gated: {counts['gated']} hidden; --include-gated to show)")
     click.echo("\ncaveats (this map is honest but low-resolution — do not read it as complete):")
@@ -635,6 +639,7 @@ def _render_explain(ex: CandidateExplanation, *, as_json: bool) -> None:
                         "sink_class": c.sink_class,
                         "sink_anchor": c.sink_anchor,
                         "nvram_source_key": c.nvram_source_key,
+                        "anchor_facts": c.anchor_facts,
                         "call_sequence_shape": ex.call_sequence_shape,
                         "blocking_mechanism": c.blocking_mechanism,
                         "exposure_shape": c.exposure_shape,
@@ -672,6 +677,16 @@ def _render_explain(ex: CandidateExplanation, *, as_json: bool) -> None:
     click.echo(f"  shape        = {ex.call_sequence_shape or '?'}")
     click.echo(f"  function     = {c.function or '?'}")
     click.echo(f"  binary       = {c.binary_path or '?'}   (open this in the decompiler)")
+    if c.anchor_facts.get("callsite_located") is False:
+        click.echo(
+            f"  anchor       = degraded ({c.anchor_facts.get('anchor_degraded')}): "
+            f"{c.anchor_facts['anchor_note']}"
+        )
+    if c.anchor_facts.get("extraction_current") is False:
+        click.echo(
+            f"  extraction   = {c.anchor_facts.get('extraction_pass')}: "
+            f"{c.anchor_facts['extraction_note']}"
+        )
 
     click.echo("\nin-function dataflow & filter:")
     click.echo(f"  {_reachability_inline(c.reachability_status)}")

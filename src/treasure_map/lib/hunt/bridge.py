@@ -77,6 +77,69 @@ def op_addr_at(call_tokens_json: str | None, pseudocode: str, paren_off: int) ->
     return None
 
 
+# Why a callsite could not be pinned to an in-body address. One vocabulary, shared by the hunt
+# (which records it on the candidate as ``anchor_degraded``) and the rekey (its not_traced reasons),
+# so the same failure reads the same everywhere.
+NO_BRIDGE_DATA = "no_bridge_data"  # the function carries no bridge tokens at all
+NO_BRIDGE_TOKEN = "no_bridge_token"  # tokens exist, none ends at this call's paren
+OUT_OF_BODY = "out_of_body"  # the call address is outside the function's body ranges
+ENUMERATOR_OUT_OF_RANGE = "enumerator_out_of_range"  # the occurrence is past the text's calls
+OFFSET_UNPARSEABLE = "offset_unparseable"  # an address that does not parse as hex
+NO_FUNC_ENTRY = "no_func_entry"  # the function row has no entry address to measure from
+NO_SINK_NAME = "no_sink_name"  # the candidate names no concrete sink to enumerate
+ANCHOR_DEGRADED_REASONS: frozenset[str] = frozenset(
+    {
+        NO_BRIDGE_DATA,
+        NO_BRIDGE_TOKEN,
+        OUT_OF_BODY,
+        ENUMERATOR_OUT_OF_RANGE,
+        OFFSET_UNPARSEABLE,
+        NO_FUNC_ENTRY,
+        NO_SINK_NAME,
+    }
+)
+
+
+def bridge_tokens_present(call_tokens_json: str | None) -> bool:
+    """Did the extractor record ANY bridge token for this function?
+
+    False for NULL, an empty string, unparseable JSON, or an empty list. The empty list matters:
+    ``"[]"`` is a non-empty string (truthy), and it is exactly what the ingest stores for an export
+    that carried no tokens, so a plain truthiness test would misreport "no bridge data" as "the
+    bridge ran and found nothing at this call"."""
+    if not call_tokens_json:
+        return False
+    try:
+        tokens = json.loads(call_tokens_json)
+    except (ValueError, TypeError):
+        return False
+    return isinstance(tokens, list) and len(tokens) > 0
+
+
+def address_offset_at(
+    call_tokens_json: str | None,
+    body_ranges_json: str | None,
+    pseudocode: str,
+    paren_off: int,
+    func_entry: str,
+) -> tuple[str | None, str | None]:
+    """``(offset, None)`` for the call whose opening paren is ``paren_off``, or ``(None, reason)``.
+
+    The one place a text position becomes an address offset: the hunt reaches it through the
+    occurrence it enumerated, the rekey through the text offset it recovered from an old ref."""
+    if not bridge_tokens_present(call_tokens_json):
+        return None, NO_BRIDGE_DATA
+    addr = op_addr_at(call_tokens_json, pseudocode, paren_off)
+    if addr is None:
+        return None, NO_BRIDGE_TOKEN
+    if not addr_in_body(addr, body_ranges_json):
+        return None, OUT_OF_BODY
+    offset = _norm_offset(addr, func_entry)
+    if offset is None:
+        return None, OFFSET_UNPARSEABLE
+    return offset, None
+
+
 def callsite_address_offset(
     pseudocode: str | None,
     sink_name: str | None,
@@ -85,21 +148,28 @@ def callsite_address_offset(
     body_ranges_json: str | None,
     func_entry: str | None,
     stub_names: dict[int, str] | None,
-) -> str | None:
-    """The normalized ADDRESS offset of the ``occurrence``-th call to ``sink_name``, from the bridge
-    tokens, or None when it cannot be pinned to an in-body address.
+) -> tuple[str | None, str | None]:
+    """``(offset, None)`` — the normalized ADDRESS offset of the ``occurrence``-th call to
+    ``sink_name`` — or ``(None, reason)`` when it cannot be pinned to an in-body address.
 
-    None makes the candidate not_traced. Steps: locate the callsite's text position with the SAME
-    enumerator the detector used (so the Nth call is the same call), find the bridge token whose
-    name ends at that call's paren, take its call-instruction address, and require it to fall inside
-    the body — otherwise not_traced, never a guessed anchor."""
-    if not call_tokens_json or occurrence is None or not func_entry or not sink_name:
-        return None
+    ``reason`` is one of ``ANCHOR_DEGRADED_REASONS``; the candidate is then not_traced and the hunt
+    records the reason on it. ``(None, None)`` only when ``occurrence`` is None: a function-level
+    candidate has no callsite to locate, so nothing degraded. Steps: locate the callsite's text
+    position with the SAME enumerator the detector used (so the Nth call is the same call), find the
+    bridge token whose name ends at that call's paren, take its call-instruction address, and
+    require it to fall inside the body — never a guessed anchor."""
+    if occurrence is None:
+        return None, None
+    if not sink_name:
+        return None, NO_SINK_NAME
+    if not func_entry:
+        return None, NO_FUNC_ENTRY
+    if not bridge_tokens_present(call_tokens_json):
+        return None, NO_BRIDGE_DATA
     pc = pseudocode or ""
     offsets = call_offsets(pc, sink_name, stub_names)
     if occurrence >= len(offsets):
-        return None
-    addr = op_addr_at(call_tokens_json, pc, offsets[occurrence])
-    if addr is None or not addr_in_body(addr, body_ranges_json):
-        return None
-    return _norm_offset(addr, func_entry)
+        return None, ENUMERATOR_OUT_OF_RANGE
+    return address_offset_at(
+        call_tokens_json, body_ranges_json, pc, offsets[occurrence], func_entry
+    )

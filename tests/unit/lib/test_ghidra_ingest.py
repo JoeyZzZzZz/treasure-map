@@ -842,3 +842,61 @@ def test_read_but_empty_is_not_the_same_as_not_determined(tmp_path: Path, monkey
     assert empty == "{}"  # read it; nothing resolved
     absent = _ingest_with_resolution(tmp_path / "absent", monkeypatch, None)
     assert absent is None  # never determined
+
+
+# ── EC3: a JSON written by another extraction pass / for another binary is not ingested ─────────
+
+
+def _marked(sha256: str, pass_version: str) -> dict:  # type: ignore[type-arg]
+    return {
+        "pass_version": pass_version,
+        "sha8": sha256[:8],
+        "binary": "test_bin",
+        "functions": [{"name": "main", "address": "0x1000", "pseudocode": "int main(){}"}],
+        "imports": [],
+        "exports": [],
+        "strings": [],
+    }
+
+
+def test_ingest_skips_a_json_from_another_pass_and_counts_it(tmp_path: Path) -> None:
+    """A JSON whose pass_version (or sha8) marker differs from this scan's is another run's output:
+    not ingested, counted as stale, and the binary's existing rows are left as they were.
+
+    MUTATION (must go RED): drop the EC3 marker check in ingest_ghidra_output."""
+    conn, sha_to_id = _setup_db(tmp_path)
+    out = tmp_path / "ghidra_output"
+    rec = _make_record("test_bin", "a" * 64)
+    for marker_pass, marker_sha8 in (("feedfacefeedface", "a" * 8), ("facefeedfacefeed", "b" * 8)):
+        data = _marked("a" * 64, marker_pass)
+        data["sha8"] = marker_sha8
+        _write_ghidra_json(out, "test_bin", "a" * 64, data)
+        stats = ingest_ghidra_output(conn, out, [rec], sha_to_id, pass_version="facefeedfacefeed")
+        assert stats.binaries_stale_json == 1, (marker_pass, marker_sha8)
+        assert stats.binaries_processed == 0
+        assert conn.execute("SELECT COUNT(*) FROM functions").fetchone()[0] == 0
+
+
+def test_ingest_accepts_a_json_whose_markers_match(tmp_path: Path) -> None:
+    conn, sha_to_id = _setup_db(tmp_path)
+    out = tmp_path / "ghidra_output"
+    _write_ghidra_json(out, "test_bin", "a" * 64, _marked("a" * 64, "facefeedfacefeed"))
+    stats = ingest_ghidra_output(
+        conn, out, [_make_record("test_bin", "a" * 64)], sha_to_id, pass_version="facefeedfacefeed"
+    )
+    assert stats.binaries_stale_json == 0
+    assert stats.binaries_processed == 1
+    assert conn.execute("SELECT COUNT(*) FROM functions").fetchone()[0] == 1
+
+
+def test_ingest_treats_a_missing_marker_as_stale(tmp_path: Path) -> None:
+    """An export with no markers (an extractor from before they existed) is not this pass's."""
+    conn, sha_to_id = _setup_db(tmp_path)
+    out = tmp_path / "ghidra_output"
+    data = _marked("a" * 64, "facefeedfacefeed")
+    del data["pass_version"]
+    _write_ghidra_json(out, "test_bin", "a" * 64, data)
+    stats = ingest_ghidra_output(
+        conn, out, [_make_record("test_bin", "a" * 64)], sha_to_id, pass_version="facefeedfacefeed"
+    )
+    assert stats.binaries_stale_json == 1

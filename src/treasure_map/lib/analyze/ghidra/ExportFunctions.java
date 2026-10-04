@@ -1925,21 +1925,28 @@ public class ExportFunctions extends GhidraScript {
      *  addresses -- the token's own min address and the address of the PcodeOp the token carries --
      *  plus the token's character offset in the printed C text. Raw triples only: no name
      *  normalisation and no occurrence numbering happen here (both need the ELF stub table, which
-     *  this pass cannot read). */
+     *  this pass cannot read).
+     *
+     *  Offsets and token text describe the PRINTED text -- exactly what getC() returns, which is
+     *  PrettyPrinter.print() under an IllegalCharCppTransformer -- and are counted in Unicode CODE
+     *  POINTS, the unit the Python reader indexes that text by. Counting Java chars (16-bit code units)
+     *  or the raw token text instead drifts by one per supplementary character and by the renaming
+     *  the transformer applies (it prints one supplementary character as two underscores). */
     private String buildCallTokens(Function func, DecompileResults dr) {
         ClangTokenGroup markup = dr.getCCodeMarkup();
         if (markup == null) return "[]";
-        PrettyPrinter pp = new PrettyPrinter(func, markup, null);
+        NameTransformer transformer = new IllegalCharCppTransformer();
+        PrettyPrinter pp = new PrettyPrinter(func, markup, transformer);
         List<ClangLine> lines = pp.getLines();
+        int newlineLen = codePoints(System.lineSeparator());
         StringBuilder arr = new StringBuilder("[");
         boolean first = true;
         int off = 0;
         for (ClangLine line : lines) {
             String indent = line.getIndentString();
-            int col = off + (indent == null ? 0 : indent.length());
+            int col = off + (indent == null ? 0 : codePoints(indent));
             for (ClangToken tok : line.getAllTokens()) {
-                String txt = tok.getText();
-                if (txt == null) txt = "";
+                String txt = printedText(tok, transformer);
                 if (tok instanceof ClangFuncNameToken) {
                     PcodeOp op = ((ClangFuncNameToken) tok).getPcodeOp();
                     String tokAddr = "";
@@ -1962,12 +1969,29 @@ public class ExportFunctions extends GhidraScript {
                        .append(",\"line\":").append(line.getLineNumber())
                        .append("}");
                 }
-                col += txt.length();
+                col += codePoints(txt);
             }
-            off = col + 1;   // the printer joins lines with one newline
+            off = col + newlineLen;   // the printer ends every line with the line separator
         }
         arr.append("]");
         return arr.toString();
+    }
+
+    /** The text PrettyPrinter.print() emits for one token: name-bearing tokens (function, variable,
+     *  type, field, label) pass through the name transformer unless they are constant-coloured;
+     *  everything else prints verbatim (a null text prints as "null", as StringBuilder.append does
+     *  there). Mirrors PrettyPrinter.getText so the bridge counts the same characters getC() has. */
+    private static String printedText(ClangToken tok, NameTransformer transformer) {
+        boolean named = tok instanceof ClangFuncNameToken || tok instanceof ClangVariableToken
+                || tok instanceof ClangTypeToken || tok instanceof ClangFieldToken
+                || tok instanceof ClangLabelToken;
+        if (named && tok.getSyntaxType() == ClangToken.CONST_COLOR) named = false;
+        String text = tok.getText();
+        return named ? transformer.simplify(text) : String.valueOf(text);
+    }
+
+    private static int codePoints(String s) {
+        return s.codePointCount(0, s.length());
     }
 
     /** D4 bridge: the function body's REAL address ranges (AddressRangeIterator), not the
@@ -2025,6 +2049,12 @@ public class ExportFunctions extends GhidraScript {
                 sha8 = "00000000";
             }
         }
+
+        // The extraction pass the driver expects (its content hash), echoed into the output so the
+        // file proves which pass wrote it; the driver and the ingest reject a mismatch. Absent ->
+        // empty string, never null: an empty marker is a mismatch, judged on the Python side.
+        String passVersion = System.getenv("PASS_VERSION");
+        if (passVersion == null) passVersion = "";
 
         String binaryName = currentProgram.getName();
         println("[ExportFunctions] start: binary=" + binaryName + " sha8=" + sha8);
@@ -2485,6 +2515,10 @@ public class ExportFunctions extends GhidraScript {
                 new OutputStreamWriter(new FileOutputStream(tmpPath), "UTF-8"))) {
             pw.print("{");
             pw.print("\"binary\":\"" + esc(binaryName) + "\",");
+            // Self-description: which pass and which binary (the RESOLVED sha8, also when it was
+            // computed from the file because SHA8 was not set) this output belongs to.
+            pw.print("\"pass_version\":\"" + esc(passVersion) + "\",");
+            pw.print("\"sha8\":\"" + esc(sha8) + "\",");
             pw.print("\"functions\":"  + funcsJson   + ",");
             pw.print("\"imports\":"    + importsJson  + ",");
             pw.print("\"exports\":"    + exportsJson  + ",");

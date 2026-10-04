@@ -94,12 +94,15 @@ def callsite_offset_suffix(
       * else ``callsite_index`` given -> ``<class>#<index>``   (the LEGACY ordinal form)
       * else                          -> ``<class>``           (function-level, no callsite located)
 
-    THE CALLER'S CONTRACT decides the middle case, and it is what keeps the rekey safe. When the
-    extraction carried the bridge (post-churn: the normal case), the caller passes
-    ``callsite_index=None``, so a call the bridge could not place — register-indirect, unrendered,
-    out of body — degrades to the bare class, and NO ``#index`` ref is ever emitted. The ``#index``
-    form appears ONLY when the caller has no bridge at all (a pre-churn / un-migrated analysis.db),
-    where it reproduces the historical ref byte-for-byte so per-callsite candidates stay distinct.
+    THE CALLER'S CONTRACT decides the middle case, and it is what keeps the rekey safe. It is
+    decided per DATABASE, never per row. When the database was extracted with the bridge
+    (post-churn: the normal case), the caller passes ``callsite_index=None`` for every candidate,
+    so a call the bridge could not place — register-indirect, unrendered, out of body, or a row
+    whose export carried no tokens (a data gap) — degrades to the bare class, and NO ``#index`` ref
+    is ever emitted. The ``#index`` form appears ONLY when the whole database predates the bridge
+    (a pre-churn / un-migrated analysis.db), where it reproduces the historical ref byte-for-byte so
+    per-callsite candidates stay distinct. A per-row decision broke this once: a stale token-less
+    row in a bridged database emitted a shifted ordinal that read as an old ref.
     Since the churn forces a re-scan, the atlas the rekey migrates NEVER holds a ``#index`` ref, so
     an old numbered anchor left un-remapped resolves to nothing (visible staleness) rather than
     silently matching a re-hunted ``#index`` a retired phantom shifted onto a different call."""

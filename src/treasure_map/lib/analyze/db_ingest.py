@@ -15,8 +15,8 @@ logger = logging.getLogger(__name__)
 REANALYZE_ALL = "__all__"
 
 # The one failure cause this module declines to re-run. Named rather than inlined because the
-# narrowness IS the rule: every other cause (import_failed / no_output / incomplete) keeps being
-# retried on every scan, unchanged.
+# narrowness IS the rule: every other cause (import_failed / no_output / incomplete /
+# stale_output) keeps being retried on every scan, unchanged.
 _TIMEOUT_REASON = "timeout"
 
 

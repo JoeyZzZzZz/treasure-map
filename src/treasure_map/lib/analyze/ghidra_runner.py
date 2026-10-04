@@ -196,8 +196,9 @@ class GhidraResult:
     function_count: int = 0  # functions in the output JSON (0 for ok_empty / failed)
     # WHY a failed run failed, so a consumer distinguishes a recoverable timeout (re-scan may finish
     # it) from a structural failure. None on success. One of: 'timeout' / 'import_failed' /
-    # 'no_output' / 'incomplete'. Recorded onto binaries.ghidra_status_reason for the incomplete
-    # surfacing -- degrade must be visible AND explicable, not just a flat 'failed'.
+    # 'no_output' / 'incomplete' / 'stale_output' (a JSON another pass or binary wrote). Recorded
+    # onto binaries.ghidra_status_reason for the incomplete surfacing -- degrade must be visible AND
+    # explicable, not just a flat 'failed'.
     reason: str | None = None
     # The wall-clock budget (seconds) the attempt behind THIS result actually ran under — recorded,
     # not re-derived, because "re-scan may finish it" is only true if the next scan hands it MORE
@@ -399,30 +400,70 @@ def _patch_elf_for_ghidra(src: Path) -> tuple[Path, Path] | None:
         return None
 
 
-def _probe_function_count(output_file: Path) -> int | None:
-    """Number of functions in a Ghidra output JSON, or None when it is missing/unparseable.
+def _probe_function_count(output_file: Path) -> tuple[int | None, str | None, str | None]:
+    """(function count, ``pass_version`` marker, ``sha8`` marker) of a Ghidra output JSON.
 
-    None signals a hard failure (no usable output); 0 is a valid parsed-but-empty result the caller
-    judges against the ELF's code presence. The output files are modest, so a full parse is fine."""
+    The count is None when the file is missing/unparseable — a hard failure (no usable output); 0
+    is a valid parsed-but-empty result the caller judges against the ELF's code presence. The two
+    markers are what the extractor wrote about itself (which extraction pass, which binary), None
+    when absent; they are what lets a caller tell THIS run's output from a file an earlier run left
+    at the same path. The output files are modest, so a full parse is fine."""
     try:
         with output_file.open("r", encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, ValueError):
-        return None
-    funcs = data.get("functions") if isinstance(data, dict) else None
-    return len(funcs) if isinstance(funcs, list) else None
+        return None, None, None
+    if not isinstance(data, dict):
+        return None, None, None
+    funcs = data.get("functions")
+    marker_pass = data.get("pass_version")
+    marker_sha8 = data.get("sha8")
+    return (
+        len(funcs) if isinstance(funcs, list) else None,
+        marker_pass if isinstance(marker_pass, str) else None,
+        marker_sha8 if isinstance(marker_sha8, str) else None,
+    )
 
 
-def _classify_analysis(output_file: Path, binary: Path) -> tuple[str, int]:
+def _markers_mismatch(
+    marker_pass: str | None,
+    marker_sha8: str | None,
+    expected_pass: str | None,
+    expected_sha8: str | None,
+) -> bool:
+    """True when an output's self-description disagrees with what this run expects. An expected
+    value of None means "do not check that marker"; a missing/empty marker never matches."""
+    if expected_pass is not None and (not marker_pass or marker_pass != expected_pass):
+        return True
+    return expected_sha8 is not None and (not marker_sha8 or marker_sha8 != expected_sha8)
+
+
+def _classify_analysis(
+    output_file: Path,
+    binary: Path,
+    expected_pass: str | None = None,
+    expected_sha8: str | None = None,
+) -> tuple[str, int]:
     """Classify a finished run into (analysis_status, function_count).
 
     ★ Red-line: success requires a NON-EMPTY functions array, not merely a >200-byte file — a
     truncated/partial run can leave a well-formed-but-empty shell (``{"functions": []}``), and
     counting that as success froze the binary as analyzed so it never re-ran. A code-free object
     (no substantial .text) with 0 functions is ``ok_empty`` (legitimate; do not re-churn); a binary
-    with code but 0 functions is ``failed`` (not clean)."""
-    count = _probe_function_count(output_file) if output_file.exists() else None
+    with code but 0 functions is ``failed`` (not clean).
+
+    ★ Freshness: the output directory outlives a scan, so the file at ``output_file`` may be one an
+    EARLIER run wrote — a run that timed out never replaces it. When ``expected_pass`` /
+    ``expected_sha8`` are given, the file's own markers must equal them (a missing or empty marker
+    is a mismatch), else ``failed``: counting another run's functions as this run's success is how a
+    stale extraction got stamped current and was never re-extracted. Callers that run Ghidra pass
+    both; the checks are skipped only when neither is given."""
+    if not output_file.exists():
+        return "failed", 0
+    count, marker_pass, marker_sha8 = _probe_function_count(output_file)
     if count is None:
+        return "failed", 0
+    if _markers_mismatch(marker_pass, marker_sha8, expected_pass, expected_sha8):
         return "failed", 0
     if count > 0:
         return "ok", count
@@ -643,12 +684,22 @@ class GhidraRunner:
         cmd = _build_cmd(
             headless, binary, arch, proj_dir, output_dir, self._script_dir, sha8, timeout
         )
+        expected_out = output_dir / f"{binary.name}_{sha8}_ghidra.json"
+        # A file left at the target path by an earlier run must never be read as this run's output:
+        # clear it (and its in-flight .tmp) before starting, so the only file present afterwards is
+        # one THIS run wrote. The markers checked below catch every other way a foreign file
+        # appears.
+        for leftover in (expected_out, expected_out.with_name(expected_out.name + ".tmp")):
+            leftover.unlink(missing_ok=True)
+        expected_pass = self.pass_version()
 
         heap_mb, xms_mb = adaptive_heap_mb(binary.stat().st_size)
         env: dict[str, str] = {
             **dict(os.environ),
             "OUTPUT_DIR": str(output_dir),
             "SHA8": sha8,
+            # echoed back into the JSON by the extractor, so the output proves which pass wrote it
+            "PASS_VERSION": expected_pass,
             "JAVA_TOOL_OPTIONS": f"-Xmx{heap_mb}m -Xms{xms_mb}m -Duser.home={ghidra_home_dir}",
         }
 
@@ -661,20 +712,31 @@ class GhidraRunner:
             shutil.rmtree(ghidra_home_dir, ignore_errors=True)
 
         elapsed = time.monotonic() - t0
-        expected_out = output_dir / f"{binary.name}_{sha8}_ghidra.json"
         log_path = output_dir / f"{binary.name}_{sha8}.log"
 
-        analysis_status, function_count = _classify_analysis(expected_out, binary)
-        success = analysis_status in ("ok", "ok_empty")
-        # reason for a failure, by cause (import_failed is decided by run_ghidra from the log)
         reason: str | None = None
-        if not success:
-            if rc == -1:
-                reason = "timeout"  # subprocess killed at the wall-clock budget
-            elif not expected_out.exists():
-                reason = "no_output"  # ran but produced no JSON
-            else:
-                reason = "incomplete"  # JSON present but unusable (malformed / 0 functions on code)
+        if rc == -1:
+            # Killed at the wall-clock budget: a failure no matter what file is on disk. The
+            # extractor never reached its atomic move, so any JSON present is not this run's.
+            analysis_status, function_count = "failed", 0
+            reason = "timeout"
+        else:
+            analysis_status, function_count = _classify_analysis(
+                expected_out, binary, expected_pass, sha8
+            )
+            if analysis_status not in ("ok", "ok_empty"):
+                # failure reason by cause (import_failed is decided by run_ghidra from the log)
+                if not expected_out.exists():
+                    reason = "no_output"  # ran but produced no JSON
+                else:
+                    count, marker_pass, marker_sha8 = _probe_function_count(expected_out)
+                    if count is not None and _markers_mismatch(
+                        marker_pass, marker_sha8, expected_pass, sha8
+                    ):
+                        reason = "stale_output"  # a JSON is there, but another pass/binary wrote it
+                    else:
+                        reason = "incomplete"  # malformed / 0 functions on a binary with code
+        success = analysis_status in ("ok", "ok_empty")
         return GhidraResult(
             binary=binary,
             output_file=expected_out if success else None,

@@ -7,7 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Per-callsite `evidence_ref` suffixes now name the call by its address, not its ordinal.** The
+  suffix `<class>#<index>` (the Nth enumerated call) becomes `<class>@<offset>`, where the offset is
+  the call instruction's address minus the function entry (signed, zero-padded hex). The offset
+  survives a decompiler upgrade that moves the ordinal. A durable anchor (an overlay annotation, a
+  ruler truth entry) is migrated onto the new form by the ref rekey; an anchor that cannot be proven
+  to name the same call is left in place and visibly resolves to nothing — never re-pointed to a
+  different candidate.
+- **A callsite that cannot be pinned to an address degrades to a function-level anchor and says
+  so.** Register-indirect, unrendered or out-of-body calls take the bare `<class>` suffix, which
+  same-function siblings may share; each such row carries `callsite_located: false` and an
+  `anchor_degraded` reason, readers surface both under `anchor_facts`, and an overlay judgement on
+  such a ref is refused. A candidate whose binary failed this scan's extraction (its rows come from
+  an earlier extraction) carries `extraction_current: false`, also surfaced under `anchor_facts`.
+
 ### Fixed
+
+- **A Ghidra run that timed out could be credited with an earlier run's output.** The runner judged
+  success by counting the functions in whatever JSON sat at the target path, and that directory
+  outlives a scan; a killed run never replaced the old file, so it was stamped current and never
+  re-extracted. Each export now records the extraction pass and binary it was written for, and both
+  the runner and the ingest reject a mismatch (`stale_output`); a killed run is always a failure,
+  the old file is cleared before each run, and only binaries whose run succeeded are ingested.
 
 - **A variadic command is no longer certified constant just because its format template is.**
   `doSystem` is printf-style: its first argument is a TEMPLATE, so proving that argument constant

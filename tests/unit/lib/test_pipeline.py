@@ -320,3 +320,30 @@ async def test_force_retry_reaches_the_dirty_check(tmp_path: Path) -> None:
 
     assert ingest.call_args.kwargs["force_retry"] is True
     assert ingest.call_args.kwargs["timeout_base"] == _cfg().ghidra.headless_timeout_seconds
+
+
+# ── stale-output wiring: only this run's successes are ingested, against this run's pass ───────
+
+
+async def test_only_this_runs_successes_are_ingested_against_its_pass(tmp_path: Path) -> None:
+    """The ingest receives ONLY the binaries whose Ghidra run succeeded in this scan, plus the
+    scan's pass_version to check every JSON against. A failed binary's leftover JSON never reaches
+    the ingest, so its rows stay those of its last good extraction.
+
+    MUTATION (must go RED): pass ``dirty_records`` instead of the successes, or drop the
+    ``pass_version=`` argument from the ingest_ghidra_output call."""
+    ok = _rec("httpd", "deadbeef")
+    bad = _rec("dropbear", "cafebabe")
+    runner = _mock_runner([_ok_ghidra(ok), _fail_ghidra(bad)])
+    ingest = MagicMock(return_value=MagicMock(binaries_processed=1))
+    with patch(f"{MODULE}.GhidraRunner", return_value=runner):
+        with patch(f"{MODULE}.scan_filesystem", return_value=[ok, bad]):
+            with patch(f"{MODULE}.ingest_elfs", _mock_ingest({"deadbeef", "cafebabe"})):
+                with patch(f"{MODULE}.ingest_ghidra_output", ingest):
+                    with Workspace(tmp_path / "ws") as ws:
+                        # dirty order follows scan order; make it deterministic
+                        await run_analyze(tmp_path / "fs", ws, _cfg())
+    args, kwargs = ingest.call_args
+    passed = args[2] if len(args) > 2 else kwargs["dirty_records"]
+    assert [r.sha256 for r in passed] == ["deadbeef"]
+    assert kwargs.get("pass_version") == "testpass"

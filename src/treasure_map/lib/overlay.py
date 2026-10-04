@@ -295,6 +295,28 @@ class UpsertResult:
     prior_updated_at: str | None = None
 
 
+def _refuse_degraded_anchor(atlas: sqlite3.Connection, evidence_ref: str) -> None:
+    """Refuse a judgement on a ref whose candidate could not be pinned to its callsite.
+
+    The hunt marks such a candidate ``callsite_located: false``: its ref is the bare, FUNCTION-level
+    anchor, and same-function siblings may share it, so a judgement written there would silently
+    apply to every one of them while a single-row reader shows only the first. Refused on that
+    marker alone — never on "the ref names several rows", which legitimate multi-pattern rows do."""
+    for (fe,) in atlas.execute(
+        "SELECT flow_evidence FROM instance WHERE evidence_ref = ?", (evidence_ref,)
+    ):
+        try:
+            data = json.loads(fe) if fe else None
+        except (ValueError, TypeError):
+            continue
+        if isinstance(data, dict) and data.get("callsite_located") is False:
+            raise ConfigError(
+                f"evidence_ref {evidence_ref!r} is a function-level degraded anchor "
+                f"(callsite_located=false, anchor_degraded={data.get('anchor_degraded')!r}): "
+                "several callsites may share it, so it cannot carry a per-callsite judgement"
+            )
+
+
 def _run_id_from_ref(anchor_ref: str) -> str | None:
     """The firmware run an anchor belongs to: everything before the first ``#``, else None.
 
@@ -333,6 +355,7 @@ def upsert_overlay(
         raise ConfigError(
             f"attributed_to must be NULL or one of {list(_ATTRIBUTION)} (never fabricated)"
         )
+    _refuse_degraded_anchor(atlas, evidence_ref)
     basis = capture_basis(atlas, evidence_ref)
     prior = atlas.execute(
         "SELECT id, attributed_to, updated_at FROM overlay "
@@ -425,7 +448,8 @@ def repoint_overlay_anchor(
     1; the anchor is unique). run_id is re-derived from the new ref, the same rule upsert uses, so a
     re-pointed row and a freshly written row agree. Lives here because overlay writes have one home;
     the rekey calls it inside its own transaction (``commit=False``) so the whole migration is
-    atomic."""
+    atomic. Refuses a degraded target (see ``_refuse_degraded_anchor``) like any other write."""
+    _refuse_degraded_anchor(atlas, new_ref)
     cur = atlas.execute(
         "UPDATE overlay SET anchor_ref = ?, run_id = ? "
         "WHERE anchor_kind = 'evidence_ref' AND anchor_ref = ?",

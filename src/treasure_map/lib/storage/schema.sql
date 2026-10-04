@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS binaries (
     ghidra_ok    INTEGER NOT NULL DEFAULT 0, -- Round 2 partial-invalidation flag (1 = usable output)
     ghidra_status TEXT,                    -- tri-state analysis outcome: ok / ok_empty / failed / NULL
     ghidra_status_reason TEXT,             -- WHY a failed run failed: timeout / import_failed /
-                                           --   no_output / incomplete; NULL on success. Lets the
+                                           --   no_output / incomplete / stale_output; NULL on
+                                           --   success. Lets the
                                            --   incomplete surfacing distinguish a recoverable
                                            --   timeout from a structural failure
     pass_version TEXT,                     -- content hash of the per-binary extraction PIPELINE

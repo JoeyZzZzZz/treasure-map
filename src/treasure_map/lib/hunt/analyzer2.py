@@ -24,6 +24,7 @@ import hashlib
 import json
 import logging
 import sqlite3
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -112,6 +113,96 @@ from treasure_map.lib.reachability.taint import _IDENT_RE, locate_sink_arg
 from treasure_map.version import UNKNOWN_VERSION, __version__, installed_commit
 
 logger = logging.getLogger(__name__)
+
+
+def _db_has_bridge(db_path: Path | str) -> bool:
+    """Was this analysis.db extracted WITH the call-token bridge (a post-bridge database)?
+
+    Decided once per database, never per row: true when ``functions`` has a ``call_tokens`` column
+    and at least one row carries a token. In a post-bridge database a row without tokens is a DATA
+    GAP (an export the bridge never reached), not a pre-bridge row, so it must degrade to the bare
+    class rather than fall back to the legacy ``#index`` — the per-row test that used to decide this
+    let such a row emit a shifted ordinal that the ref rekey then trusted."""
+    conn = sqlite3.connect(f"file:{Path(db_path)}?mode=ro", uri=True)
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(functions)")}
+        if "call_tokens" not in cols:
+            return False
+        row = conn.execute(
+            "SELECT 1 FROM functions WHERE call_tokens IS NOT NULL "
+            "AND call_tokens NOT IN ('', '[]') LIMIT 1"
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def _load_extraction_notes(db_path: Path | str) -> dict[int, dict[str, Any]]:
+    """binary_id -> evidence keys saying a binary's candidates come from an EARLIER extraction.
+
+    A binary whose Ghidra run failed in this scan keeps the function rows of its last good
+    extraction (ghidra_ok = 0, pass_version left at the old value), and those rows are still hunted.
+    Its candidates carry ``extraction_current: false`` with the pass that produced them
+    (``extraction_pass``) and, for a failed run, the pass this scan attempted (``attempted_pass``).
+    Binaries extracted by this scan's pass get no keys.
+
+    "This scan's pass" is read from the scan side, never from the hunting process. Each binary's
+    LAST ATTEMPT ran under ``pass_version`` (succeeded) or ``timeout_pass_version`` (failed); the
+    scan's pass is the value most current binaries' last attempts carry (a strict majority; a tie
+    names none). ``run.build_hash`` cannot serve: it is the distinct pass_version over the binaries,
+    so a single failed binary turns it into ``mixed:2``. When no scan pass can be named, only the
+    failed binaries are marked."""
+    conn = sqlite3.connect(f"file:{Path(db_path)}?mode=ro", uri=True)
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(binaries)")}
+        if not {"ghidra_ok", "pass_version", "timeout_pass_version", "last_seen_at"} <= cols:
+            return {}
+        rows = conn.execute(
+            "SELECT id, ghidra_ok, pass_version, timeout_pass_version, last_seen_at FROM binaries"
+        ).fetchall()
+    finally:
+        conn.close()
+    seen = [r[4] for r in rows if r[4] is not None]
+    latest = max(seen) if seen else None
+    # the current scan's binaries (same rule as the current_binaries view; all, if none is dated)
+    current = [r for r in rows if latest is None or r[4] == latest]
+    votes = Counter(
+        attempt for _bid, ok, pv, tpv, _seen in current if (attempt := pv if ok == 1 else tpv)
+    )
+    ranked = votes.most_common(2)
+    scan_pass = (
+        ranked[0][0] if ranked and (len(ranked) == 1 or ranked[0][1] > ranked[1][1]) else None
+    )
+    if scan_pass is None and votes:
+        logger.warning(
+            "hunt: binaries' last extraction attempts tie on the pass (%s); only failed binaries "
+            "are marked as not from this extraction",
+            dict(votes),
+        )
+    notes: dict[int, dict[str, Any]] = {}
+    for bid, ok, pv, tpv, _seen in rows:
+        failed = ok != 1
+        stale_pass = scan_pass is not None and pv != scan_pass
+        if not (failed or stale_pass):
+            continue
+        note: dict[str, Any] = {"extraction_current": False, "extraction_pass": pv}
+        if failed:
+            note["attempted_pass"] = tpv
+        notes[bid] = note
+    return notes
+
+
+def _with_evidence_keys(flow_evidence: str | None, keys: dict[str, Any]) -> str | None:
+    """``flow_evidence`` with ``keys`` merged in (no-op when there are none). The evidence built in
+    this module is always a JSON object; anything else is a construction bug, raised loudly rather
+    than dropping the keys that mark a candidate as degraded."""
+    if not keys:
+        return flow_evidence
+    data = json.loads(flow_evidence) if flow_evidence else {}
+    if not isinstance(data, dict):
+        raise ValueError("flow_evidence is not a JSON object; cannot attach anchor/extraction keys")
+    data.update(keys)
+    return json.dumps(data, sort_keys=True)
 
 
 def _load_caller_ids(db_path: Path | str) -> dict[int, list[int]]:
@@ -1102,6 +1193,10 @@ def run_analyzer2(
     # rather than after the import. Without it those calls are invisible here even though the
     # callee LIST already names them, and a candidate anchored at one grades as "could not locate".
     stub_by_binary = load_stub_names(db_path)
+    # Whether this database carries the call-token bridge (decided per DATABASE, see _db_has_bridge)
+    # and which binaries' rows come from an earlier extraction than this scan's.
+    db_has_bridge = _db_has_bridge(db_path)
+    extraction_notes = _load_extraction_notes(db_path)
     # ★ phase-scale progress: on a large firmware (~218k functions) the hunt is a multi-second pass;
     # log its magnitude so it is visibly running, not hung (does NOT change the hunt algorithm).
     logger.info("hunt: analyzing %d functions", len(all_funcs))
@@ -1472,6 +1567,28 @@ def run_analyzer2(
                     flow_evidence = json.dumps(path_ev, sort_keys=True)
 
                 provenance = "L1" if status in {"confirmed", "blocked"} else "L0"
+                callsite_offset, anchor_degraded = callsite_address_offset(
+                    row.pseudocode,
+                    sink_name,
+                    match.sink_callsite_occurrence,
+                    row.call_tokens,
+                    row.body_ranges,
+                    row.address,
+                    stub_names,
+                )
+                evidence_keys: dict[str, Any] = {}
+                if (
+                    db_has_bridge
+                    and callsite_offset is None
+                    and match.sink_callsite_occurrence is not None
+                ):
+                    # A located-in-text callsite that could not be pinned to an address degrades to
+                    # the bare class: a FUNCTION-level anchor that siblings may share. Said on the
+                    # candidate so no reader, and no judgement store, takes it for one call.
+                    evidence_keys["callsite_located"] = False
+                    evidence_keys["anchor_degraded"] = anchor_degraded
+                evidence_keys.update(extraction_notes.get(row.binary_id, {}))
+                flow_evidence = _with_evidence_keys(flow_evidence, evidence_keys)
                 pattern_id = upsert_pattern(
                     atlas,
                     source_class=match.source_class,
@@ -1505,21 +1622,12 @@ def run_analyzer2(
                             source_run_id,
                             suffix=callsite_offset_suffix(
                                 match.sink_class,
-                                callsite_address_offset(
-                                    row.pseudocode,
-                                    sink_name,
-                                    match.sink_callsite_occurrence,
-                                    row.call_tokens,
-                                    row.body_ranges,
-                                    row.address,
-                                    stub_names,
-                                ),
-                                # legacy ordinal only when this DB predates the bridge; with the
-                                # bridge present, an unaddressable call degrades to the bare class
-                                # and no #index ref is ever emitted (keeps the rekey unambiguous).
-                                None
-                                if row.call_tokens not in (None, "[]")
-                                else match.sink_callsite_index,
+                                callsite_offset,
+                                # legacy ordinal only when the whole DATABASE predates the bridge;
+                                # in a post-bridge database an unaddressable call degrades to the
+                                # bare class and no #index ref is ever emitted (keeps the rekey
+                                # unambiguous).
+                                None if db_has_bridge else match.sink_callsite_index,
                             ),
                             binary_sha256=row.binary_sha256,
                             binary_name=row.binary_name,
@@ -1686,7 +1794,9 @@ def run_analyzer2(
                         binary_content_hash=f.binary_sha256,
                         scope_origin="intra",
                         origin="unknown",  # see the candidate path above: never guessed here
-                        flow_evidence=json.dumps(evidence, sort_keys=True),
+                        flow_evidence=json.dumps(
+                            evidence | extraction_notes.get(f.binary_id, {}), sort_keys=True
+                        ),
                     ),
                     commit=False,
                 )

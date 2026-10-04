@@ -41,6 +41,9 @@ class IngestStats:
     binaries_processed: int = 0
     binaries_missing_json: int = 0
     binaries_malformed_json: int = 0
+    # a JSON whose pass_version / sha8 markers do not match this scan: written by another
+    # extraction pass or for another binary, so it is not ingested (same handling as EC1/EC2)
+    binaries_stale_json: int = 0
 
 
 def ingest_ghidra_output(
@@ -48,6 +51,7 @@ def ingest_ghidra_output(
     ghidra_output_dir: Path,
     dirty_records: list[ElfRecord],
     sha_to_id: dict[str, int],
+    pass_version: str | None = None,
 ) -> IngestStats:
     """For each dirty binary, locate its <name>_<sha8>_ghidra.json,
     parse, and write to functions/imports/exports/strings tables.
@@ -62,6 +66,11 @@ def ingest_ghidra_output(
         ghidra_output_dir: workspace ghidra_output directory
         dirty_records: binaries that need re-ingest (from ingest_elfs return)
         sha_to_id: sha256 → binaries.id mapping (from ingest_elfs return)
+        pass_version: the extraction pass this scan ran. When given, every JSON must carry the
+            same ``pass_version`` marker and its own binary's ``sha8`` (a missing marker is a
+            mismatch); a JSON that does not is another run's output and is skipped (EC3) rather
+            than written over this binary's rows. The scan pipeline always passes it; None skips
+            the check (a caller with no pass to compare against).
 
     Returns:
         IngestStats summarizing what was written
@@ -100,6 +109,21 @@ def ingest_ghidra_output(
             stats.binaries_malformed_json += 1
             continue
 
+        # EC3: JSON written by another extraction pass or for another binary
+        if pass_version is not None and (
+            data.get("pass_version") != pass_version or data.get("sha8") != sha8
+        ):
+            logger.warning(
+                "ghidra_ingest: stale JSON for %s (sha8=%s): markers pass=%r sha8=%r, expected %r",
+                rec.name,
+                sha8,
+                data.get("pass_version"),
+                data.get("sha8"),
+                pass_version,
+            )
+            stats.binaries_stale_json += 1
+            continue
+
         binary_id = sha_to_id[rec.sha256]
         # Resolve this binary's lazy-binding stubs to their import names from ELF structure, so a
         # caller left calling FUN_<stub-addr> is seen calling `system` — recovering a real sink the
@@ -117,11 +141,12 @@ def ingest_ghidra_output(
     conn.commit()
 
     logger.info(
-        "ghidra_ingest: %d binaries processed (%d missing, %d malformed), "
+        "ghidra_ingest: %d binaries processed (%d missing, %d malformed, %d stale), "
         "%d functions, %d imports, %d exports, %d strings",
         stats.binaries_processed,
         stats.binaries_missing_json,
         stats.binaries_malformed_json,
+        stats.binaries_stale_json,
         stats.functions_ingested,
         stats.imports_ingested,
         stats.exports_ingested,

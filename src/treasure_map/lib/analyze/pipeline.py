@@ -170,6 +170,10 @@ async def run_analyze(
             len(records) - len(dirty_records),
         )
 
+        # Only binaries whose Ghidra run SUCCEEDED in this scan are ingested: a failed one keeps the
+        # rows of its last good extraction (flagged at hunt time as not from this pass) instead of
+        # ingesting whatever JSON an earlier run left behind.
+        ingest_records: list[ElfRecord] = []
         if dirty_records:
             ghidra_output_dir = workspace.path / "ghidra_output"
             ghidra_output_dir.mkdir(parents=True, exist_ok=True)
@@ -196,8 +200,9 @@ async def run_analyze(
                         (1, res.analysis_status, pass_version, ghidra_version, rec.sha256),
                     )
                 else:
-                    # record WHY it failed (timeout/import_failed/no_output/incomplete) so the
-                    # incomplete surfacing can tell a recoverable timeout from a structural failure.
+                    # record WHY it failed (timeout/import_failed/no_output/incomplete/
+                    # stale_output) so the incomplete surfacing can tell a recoverable timeout
+                    # from a structural failure.
                     # ...and record what this attempt RAN UNDER: the budget it was given and
                     # the extraction fingerprint behind it. pass_version stays untouched above
                     # because it describes a row's OUTPUT and there is none; these two describe the
@@ -217,6 +222,7 @@ async def run_analyze(
                     )
                 if res.success:
                     ghidra_ok += 1
+                    ingest_records.append(rec)
                 else:
                     ghidra_failed += 1
             conn.commit()
@@ -227,8 +233,9 @@ async def run_analyze(
         ingest_stats = ingest_ghidra_output(
             conn,
             workspace.path / "ghidra_output",
-            dirty_records,
+            ingest_records,
             sha_to_id,
+            pass_version=pass_version,
         )
 
         # Round B: build cross-binary xrefs + classify strings (wipe-and-rebuild)

@@ -158,6 +158,9 @@ class TriageCandidate:
     # The honest three-state map layers. Every dimension is a first-class, queryable /
     # sortable / filterable annotation here — NOT buried in flow_evidence JSON to dig out.
     dimensions: tuple[Dimension, ...] = field(default_factory=tuple)
+    # Facts about the ANCHOR and the EXTRACTION behind this row (see ``anchor_facts``): a degraded
+    # function-level ref, and/or rows read from an earlier extraction. Empty when neither applies.
+    anchor_facts: dict[str, Any] = field(default_factory=dict)
 
     def dim(self, name: str) -> Dimension:
         """The named dimension layer; a ``unknown`` placeholder if it was not computed (defensive —
@@ -249,6 +252,52 @@ def _source_kind_from_evidence(flow_evidence: str | None) -> str:
         return "unknown"
     kind = data.get("source_kind") if isinstance(data, dict) else None
     return kind if isinstance(kind, str) and kind else "unknown"
+
+
+_DEGRADED_ANCHOR_NOTE = (
+    "this ref is a FUNCTION-level degraded anchor: the call could not be pinned to an address, so "
+    "several callsites of this function may share it; it cannot carry a per-callsite judgement"
+)
+_FAILED_EXTRACTION_NOTE = (
+    "this candidate comes from an earlier extraction: this scan's extraction of its binary did "
+    "not succeed, so the facts are those of the extraction pass named in extraction_pass"
+)
+_OLDER_PASS_NOTE = (
+    "this candidate comes from an earlier extraction pass than this scan's (extraction_pass); "
+    "its binary was not re-extracted under the current pass"
+)
+
+
+def anchor_facts(flow_evidence: str | None) -> dict[str, Any]:
+    """The stored facts about a candidate's ANCHOR and EXTRACTION, verbatim, each with its note.
+
+    Two facts, both recorded by the hunt and both easy to miss inside flow_evidence: the ref is a
+    function-level degraded anchor (``callsite_located: false`` + ``anchor_degraded``), and/or the
+    candidate was read from an earlier extraction (``extraction_current: false`` +
+    ``extraction_pass`` [+ ``attempted_pass``]). Empty when neither applies, so a reader can surface
+    the dict whenever it is non-empty. A pure read; never computes either fact."""
+    if not flow_evidence:
+        return {}
+    try:
+        data = json.loads(flow_evidence)
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, Any] = {}
+    if data.get("callsite_located") is False:
+        out["callsite_located"] = False
+        out["anchor_degraded"] = data.get("anchor_degraded")
+        out["anchor_note"] = _DEGRADED_ANCHOR_NOTE
+    if data.get("extraction_current") is False:
+        out["extraction_current"] = False
+        out["extraction_pass"] = data.get("extraction_pass")
+        if "attempted_pass" in data:
+            out["attempted_pass"] = data.get("attempted_pass")
+            out["extraction_note"] = _FAILED_EXTRACTION_NOTE
+        else:
+            out["extraction_note"] = _OLDER_PASS_NOTE
+    return out
 
 
 def _sink_provenance_records(flow_evidence: str | None) -> list[dict[str, Any]]:
@@ -2295,6 +2344,7 @@ def _candidate(
         exposure_shape=_row_get(row, "exposure_shape"),
         structural_fingerprint=_row_get(row, "structural_fingerprint"),
         nvram_source_key=nvram_key,
+        anchor_facts=anchor_facts(fe),
         dimensions=_build_dimensions(
             conn,
             flow_evidence=fe,
