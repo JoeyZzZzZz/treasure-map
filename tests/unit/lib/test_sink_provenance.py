@@ -21,6 +21,11 @@ import pytest
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import InstanceRow
 from treasure_map.lib.atlas.writer import add_instance, upsert_pattern
+from treasure_map.lib.hunt.refs import (
+    _norm_offset,
+    build_evidence_ref,
+    callsite_offset_suffix,
+)
 from treasure_map.lib.query import explain_candidate, get_sink_provenance, triage
 from treasure_map.lib.query.triage import (
     _fmt_arity,
@@ -682,3 +687,125 @@ def test_explain_candidate_does_not_borrow_a_sibling_sinks_origin(tmp_path: Path
     assert ex is not None
     assert ex.source_origin is None
     conn.close()
+
+
+# ── B2: is_candidate_callsite — the detail marks the record each dimension reads from ────────
+
+
+def _addr_ref(func_entry: int, sink_addr: int, sink_class: str = "cmd") -> str:
+    """A per-callsite ADDRESSED ref forged by the real ref machinery, pointing at ``sink_addr``."""
+    return build_evidence_ref(
+        "run_x",
+        suffix=callsite_offset_suffix(sink_class, _norm_offset(sink_addr, func_entry)),
+        binary_sha256="deadbeef",
+        address=hex(func_entry),
+    )
+
+
+def test_summary_candidate_callsite_flag_present_only_with_an_address(tmp_path: Path) -> None:
+    """B2 #11. _sink_provenance_summary adds ``is_candidate_callsite`` ONLY when given a callsite
+    address, on exactly the record that is the candidate's own (anchored sink name AND matching
+    address). Function-level (no address) omits the key entirely.
+
+    MUTATION (must go RED): make the flag compare address only (drop the sink-name check) -> the
+    popen record sharing the candidate's address would read True."""
+    conn = open_atlas(tmp_path / "atlas.db")
+    prov = [
+        {"sink": "system", "sink_idx": 0, "sink_addr": "0x100", "provenance": {"kind": "constant"}},
+        {"sink": "system", "sink_idx": 1, "sink_addr": "0x200", "provenance": {"kind": "constant"}},
+        {"sink": "popen", "sink_idx": 2, "sink_addr": "0x200", "provenance": {"kind": "constant"}},
+    ]
+    fe = json.dumps({"sink_arg_provenance": prov})
+    try:
+        plain = _sink_provenance_summary(conn, fe)
+        assert all("is_candidate_callsite" not in s for s in plain)
+
+        marked = _sink_provenance_summary(conn, fe, sink_anchor="system", callsite_addr=0x200)
+        assert all("is_candidate_callsite" in s for s in marked)
+        # true on system@0x200 only — NOT the popen record that shares the address
+        assert [s["is_candidate_callsite"] for s in marked] == [False, True, False]
+
+        no_own = _sink_provenance_summary(conn, fe, sink_anchor="system", callsite_addr=0x999)
+        assert all("is_candidate_callsite" in s for s in no_own)
+        assert not any(s["is_candidate_callsite"] for s in no_own)
+    finally:
+        conn.close()
+
+
+def test_get_sink_provenance_marks_candidate_callsite_end_to_end(tmp_path: Path) -> None:
+    """B2 wiring. get_sink_provenance reads the address out of its evidence_ref and flags the one
+    record that is the candidate's own callsite; a function-level ref adds no flag at all.
+
+    MUTATION (must go RED): drop `callsite_addr=callsite_addr` from get_sink_provenance's _marked /
+    source_origin wiring -> the addressed ref stops flagging (or flags nothing)."""
+    prov = [
+        {
+            "sink": "system",
+            "sink_idx": 0,
+            "sink_addr": "0x401000",
+            "provenance": {"kind": "constant"},
+        },
+        {
+            "sink": "system",
+            "sink_idx": 1,
+            "sink_addr": "0x402000",
+            "provenance": {"kind": "constant"},
+        },
+    ]
+    ref = _addr_ref(0x400000, 0x401000)  # addressed to sink_idx 0
+    atlas = _seed(tmp_path, ref=ref, provenance=prov)
+    conn = open_atlas(atlas)
+    try:
+        out = get_sink_provenance(conn, ref)
+        flags = {r["sink_idx"]: r["is_candidate_callsite"] for r in out["records"]}
+        assert flags == {0: True, 1: False}
+        one = get_sink_provenance(conn, ref, 1)
+        assert one["record"]["is_candidate_callsite"] is False
+    finally:
+        conn.close()
+
+
+def test_get_sink_provenance_adds_no_flag_for_a_function_level_ref(tmp_path: Path) -> None:
+    """B2 #11 / baseline. A function-level ref leaves the records byte-identical — no new key."""
+    prov = [
+        {"sink": "system", "sink_idx": 0, "sink_addr": "0x100", "provenance": {"kind": "constant"}},
+    ]
+    atlas = _seed(tmp_path, ref="run_x#fn7@cmd", provenance=prov)
+    conn = open_atlas(atlas)
+    try:
+        out = get_sink_provenance(conn, "run_x#fn7@cmd")
+        assert all("is_candidate_callsite" not in r for r in out["records"])
+    finally:
+        conn.close()
+
+
+def test_explain_candidate_summary_marks_candidate_callsite_end_to_end(tmp_path: Path) -> None:
+    """B2 wiring. explain_candidate threads the ref address into the sink_arg_provenance_summary, so
+    the entry each dimension is read from is flagged; a function-level ref leaves it unflagged.
+
+    MUTATION (must go RED): drop `callsite_addr=callsite_addr` from explain_candidate's
+    _sink_provenance_summary call -> the addressed ref's summary stops flagging."""
+    prov = [
+        {
+            "sink": "system",
+            "sink_idx": 0,
+            "sink_addr": "0x401000",
+            "provenance": {"kind": "constant"},
+        },
+        {
+            "sink": "system",
+            "sink_idx": 1,
+            "sink_addr": "0x402000",
+            "provenance": {"kind": "constant"},
+        },
+    ]
+    ref = _addr_ref(0x400000, 0x402000)  # addressed to sink_idx 1
+    atlas = _seed(tmp_path, ref=ref, provenance=prov)
+    conn = open_atlas(atlas)
+    try:
+        ex = explain_candidate(conn, ref)
+        assert ex is not None
+        flags = {s["sink_idx"]: s["is_candidate_callsite"] for s in ex.sink_arg_provenance_summary}
+        assert flags == {0: False, 1: True}
+    finally:
+        conn.close()

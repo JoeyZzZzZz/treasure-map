@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -315,6 +316,50 @@ def _sink_provenance_records(flow_evidence: str | None) -> list[dict[str, Any]]:
     if not isinstance(prov, list):
         return []
     return [r for r in prov if isinstance(r, dict)]
+
+
+# The per-callsite evidence_ref suffix ``…:<func_entry>@<class>@<offset>`` (see lib/hunt/refs.py:
+# build_evidence_ref + callsite_offset_suffix + _norm_offset). The function anchor is canonical hex
+# and the offset is a signed hex delta from it; this is a SECOND reader of that shape, kept in step
+# by a round-trip test rather than by importing lib/hunt (the :499-501 convention). The two ``@``
+# matter: the first joins the sink CLASS, the second the address offset — split greedily on the
+# last so a function-level ``…@<class>`` (no offset) never matches.
+_CALLSITE_REF_RE = re.compile(r":([0-9a-f]+)@[a-z_]+@(-?)0x([0-9a-f]+)$")
+
+
+def _callsite_addr(evidence_ref: str | None) -> int | None:
+    """The absolute sink address a per-callsite ref names, or None when the ref carries no address.
+
+    Reconstructs ``func_entry + offset`` from the addressed suffix. None (no address to scope by,
+    so the caller keeps the function-level reading) for every other shape: a function-level
+    ``…@<class>``, a wrapper ``…@<class>_via_wrapper``, a legacy ordinal ``…@<class>#<n>``, a
+    non-hex function anchor, the empty string, or None."""
+    m = _CALLSITE_REF_RE.search(evidence_ref or "")
+    if m is None:
+        return None
+    off = int(m.group(3), 16)
+    return int(m.group(1), 16) + (-off if m.group(2) else off)
+
+
+def _record_addr(rec: dict[str, Any]) -> int | None:
+    """One record's absolute sink address as an int, from its ``sink_addr`` ``"0x…"`` string.
+
+    None when the field is missing, not a string, or does not parse — never guessed."""
+    addr = rec.get("sink_addr")
+    if not isinstance(addr, str):
+        return None
+    try:
+        return int(addr, 16)
+    except ValueError:
+        return None
+
+
+def _own_callsite_records(
+    recs: list[dict[str, Any]], sink_anchor: str | None, callsite_addr: int
+) -> list[dict[str, Any]]:
+    """THE single definition of a candidate's "own" records: its anchored sink name AND its own
+    callsite address. Shared by every record-scoping function so the predicate cannot drift."""
+    return [r for r in recs if r.get("sink") == sink_anchor and _record_addr(r) == callsite_addr]
 
 
 # call_return callees that FORWARD a source-argument value unchanged (strcpy/memcpy-family REPLACE
@@ -619,13 +664,27 @@ def _record_class(conn: sqlite3.Connection, rec: dict[str, Any]) -> str:
     return cls
 
 
-def _scoped_records(flow_evidence: str | None, sink_anchor: str | None) -> list[dict[str, Any]]:
+def _scoped_records(
+    flow_evidence: str | None, sink_anchor: str | None, *, callsite_addr: int | None = None
+) -> list[dict[str, Any]]:
     """The sink_arg_provenance records for the candidate's ANCHORED sink (rec.sink == sink_anchor).
+
+    With a callsite address AND a record for it (``own``), scopes to that one callsite: a function
+    with two calls to the same sink no longer reads one off the other. With an address but NO such
+    record, falls through to the name-scoped reading below, which has two sub-cases the constant
+    exits lean on: if provenance is NON-empty the name scope returns the sibling records and
+    ``_anchor_missed``'s guard (c) (addressed) finds no ``own`` and closes both constant exits; if
+    provenance is ENTIRELY empty the name scope is empty too and guard (b) governs, exactly as at
+    baseline. ``callsite_addr`` None reproduces the baseline byte-for-byte.
 
     Falls back to ALL records when the anchor matches none — a LIBERAL fallback: it may promote a
     constant sibling, but it never HIDES a controllable key by a failed anchor match (the demotion
     iron law is asymmetric — a wrong promote is safe, a wrong demote hides a bug)."""
     recs = _sink_provenance_records(flow_evidence)
+    if callsite_addr is not None:
+        own = _own_callsite_records(recs, sink_anchor, callsite_addr)
+        if own:
+            return own
     if sink_anchor:
         scoped = [r for r in recs if r.get("sink") == sink_anchor]
         if scoped:
@@ -634,7 +693,7 @@ def _scoped_records(flow_evidence: str | None, sink_anchor: str | None) -> list[
 
 
 def _writer_scoped_records(
-    flow_evidence: str | None, sink_anchor: str | None
+    flow_evidence: str | None, sink_anchor: str | None, *, callsite_addr: int | None = None
 ) -> list[dict[str, Any]]:
     """The sink_arg_provenance records for the candidate's anchored sink — STRICTLY, no fallback.
 
@@ -652,22 +711,31 @@ def _writer_scoped_records(
     writer of a printf sitting in the same function. With no record for the anchored sink the
     honest answer is none, and the caller reports not_traced — a '?', which never sinks a candidate.
 
-    Scoped by sink NAME, the anchor a candidate actually carries; two calls to the same sink in one
-    function still share these records. That is the granularity controllability is scoped at too,
-    and narrowing either to a callsite needs an anchor this layer does not have.
+    Scoped to the candidate's OWN callsite when its ref carries an address (``own`` — the anchored
+    sink name AND the same address): two calls to the same sink in one function no longer share
+    these records, so a ``located`` writer is never read off a sibling call. Without an address (a
+    function-level or degraded ref) it scopes by sink NAME, as it always did. No fallback either
+    way — an addressed candidate with no record of its own gets an empty set, and the caller reports
+    not_traced.
 
-    A candidate with no sink anchor has nothing to scope BY, so it keeps the unscoped reading it
-    has always had rather than being forced to not_traced by a scope that cannot be applied. No
-    candidate in the scanned corpus is in that state, so the branch is covered by a unit test
-    rather than by data."""
+    A candidate with no sink anchor has nothing to scope BY (no name and no address apply), so it
+    keeps the unscoped reading it has always had rather than being forced to not_traced by a scope
+    that cannot be applied. No candidate in the scanned corpus is in that state, so the branch is
+    covered by a unit test rather than by data."""
     recs = _sink_provenance_records(flow_evidence)
     if not sink_anchor:
         return recs
-    return [r for r in recs if r.get("sink") == sink_anchor]
+    if callsite_addr is None:
+        return [r for r in recs if r.get("sink") == sink_anchor]
+    return _own_callsite_records(recs, sink_anchor, callsite_addr)
 
 
 def _verdict_from_provenance(
-    conn: sqlite3.Connection, flow_evidence: str | None, sink_anchor: str | None
+    conn: sqlite3.Connection,
+    flow_evidence: str | None,
+    sink_anchor: str | None,
+    *,
+    callsite_addr: int | None = None,
 ) -> str | None:
     """The single controllability verdict from the anchored sink's def-use provenance:
     'controllable' (a web-settable / external source reaches the sink arg), 'const' (EVERY record
@@ -680,7 +748,7 @@ def _verdict_from_provenance(
     (_anchor_missed in _dim_controllability) because it gates two constant exits, not just this
     one. Reading a 'const' from here as a completeness claim is exactly the mistake that gate
     exists to stop."""
-    recs = _scoped_records(flow_evidence, sink_anchor)
+    recs = _scoped_records(flow_evidence, sink_anchor, callsite_addr=callsite_addr)
     if not recs:
         return None
     classes = [_record_class(conn, r) for r in recs]
@@ -740,7 +808,9 @@ def _flow_wrapped_sink(flow_evidence: str | None) -> str | None:
     return sink if isinstance(sink, str) and sink else None
 
 
-def _anchor_missed(flow_evidence: str | None, sink_anchor: str | None) -> bool:
+def _anchor_missed(
+    flow_evidence: str | None, sink_anchor: str | None, *, callsite_addr: int | None = None
+) -> bool:
     """True ONLY when the def-use provenance SHOULD carry the anchored sink but does NOT.
 
     This is the COMPLETENESS half of the demotion iron law, which until now lived only in prose.
@@ -764,8 +834,10 @@ def _anchor_missed(flow_evidence: str | None, sink_anchor: str | None) -> bool:
         _verdict_from_provenance already answers with None. Reading empty as "the sink escaped"
         would sweep in thousands of candidates whose constant reading is perfectly sound (on a real
         atlas, dropping this guard alone widens the set ~90-fold).
-    (c) LOAD-BEARING — the escape signal itself. Records exist, yet none of them is the anchored
-        sink.
+    (c) LOAD-BEARING — the escape signal itself. Records exist, yet none is the anchored sink. With
+        a callsite address this narrows to "none is THIS callsite's own record" (``own`` empty while
+        other records are present), so a sibling call's constant can no longer back-fill a sink that
+        left no record of its own here; without an address it stays the baseline by-sink-name test.
 
     ★ Necessary, not sufficient. It proves "I have at least one record for the sink I am judging",
     NOT "the provenance is complete". A record that exists but was internally truncated is a deeper
@@ -794,11 +866,17 @@ def _anchor_missed(flow_evidence: str | None, sink_anchor: str | None) -> bool:
         # cleanly separable — on a real atlas every empty-provenance wrapper candidate carries the
         # sink_via_wrapper marker and no non-wrapper one does, so this split misfires on neither.
         return _flow_is_via_wrapper(flow_evidence)
-    return not any(r.get("sink") == sink_anchor for r in records)  # (c) load-bearing
+    if callsite_addr is None:  # (c) load-bearing — by sink NAME
+        return not any(r.get("sink") == sink_anchor for r in records)
+    return not _own_callsite_records(records, sink_anchor, callsite_addr)  # (c) by CALLSITE
 
 
 def _web_settable_keys_reaching_sink(
-    conn: sqlite3.Connection, flow_evidence: str | None, sink_anchor: str | None
+    conn: sqlite3.Connection,
+    flow_evidence: str | None,
+    sink_anchor: str | None,
+    *,
+    callsite_addr: int | None = None,
 ) -> list[str]:
     """The web-settable keys that reach the anchored sink argument (order-preserving, deduped) —
     surfaced so the controllability note names the key and the source_writability layer can show it.
@@ -811,7 +889,7 @@ def _web_settable_keys_reaching_sink(
             seen.add(k)
             out.append(k)
 
-    for rec in _scoped_records(flow_evidence, sink_anchor):
+    for rec in _scoped_records(flow_evidence, sink_anchor, callsite_addr=callsite_addr):
         prov = rec.get("provenance")
         prov = prov if isinstance(prov, dict) else {}
         add(_source_web_settable_key(conn, prov))
@@ -829,6 +907,8 @@ def _likely_settable_keys_reaching_sink(
     flow_evidence: str | None,
     sink_anchor: str | None,
     wrapper_names: frozenset[str],
+    *,
+    callsite_addr: int | None = None,
 ) -> list[str]:
     """nvram keys reaching the anchored sink argument that are web_settable=='likely' (M2: an
     in_router_defaults member — the middle tier below a proven SaTC 'yes').
@@ -855,7 +935,7 @@ def _likely_settable_keys_reaching_sink(
             seen.add(k)
             out.append(k)
 
-    for rec in _scoped_records(flow_evidence, sink_anchor):
+    for rec in _scoped_records(flow_evidence, sink_anchor, callsite_addr=callsite_addr):
         prov = rec.get("provenance")
         prov = prov if isinstance(prov, dict) else {}
         consider(prov)
@@ -876,12 +956,21 @@ _ARGS_CLASS_TO_STATE: dict[str, str] = {
 
 
 def _sink_provenance_summary(
-    conn: sqlite3.Connection, flow_evidence: str | None
+    conn: sqlite3.Connection,
+    flow_evidence: str | None,
+    *,
+    sink_anchor: str | None = None,
+    callsite_addr: int | None = None,
 ) -> tuple[dict[str, Any], ...]:
     """Per-sink summary of sink_arg_provenance (summary-first: the FULL writer/vararg detail is
     fetched on demand via ``get_sink_provenance``, so a multi-sink candidate never blows the token
     budget). One compact dict per sink: idx / name / addr / kind / resolved / writer_count? /
-    nearest_dominating_writer?. A surfaced fact only — never a verdict, never a score input."""
+    nearest_dominating_writer?. A surfaced fact only — never a verdict, never a score input.
+
+    When ``callsite_addr`` is given (the candidate's ref carried an address), each entry gains
+    ``is_candidate_callsite``: True on the one record that is this candidate's own sink (anchored
+    sink name AND matching address) — the record its per-dimension readings are taken from. The key
+    is omitted entirely for a function-level candidate (``callsite_addr`` None)."""
     out: list[dict[str, Any]] = []
     for rec in _sink_provenance_records(flow_evidence):
         prov = rec.get("provenance")
@@ -924,6 +1013,10 @@ def _sink_provenance_summary(
                             _writer_args_class(conn, w.get("fmt"), w.get("varargs"))
                         ]
                         break
+        if callsite_addr is not None:
+            summary["is_candidate_callsite"] = (
+                rec.get("sink") == sink_anchor and _record_addr(rec) == callsite_addr
+            )
         out.append(summary)
     return tuple(out)
 
@@ -1009,17 +1102,37 @@ def get_sink_provenance(
     records = _sink_provenance_records(row[0])
     if not records:
         return {"evidence_ref": evidence_ref, "found": False, "note": "no_sink_provenance"}
+    sink_anchor = row[1]
+    callsite_addr = _callsite_addr(evidence_ref)
+
+    def _marked(rec: dict[str, Any]) -> dict[str, Any]:
+        # Present the record, then — only for an addressed candidate — flag the ONE record that is
+        # this candidate's own callsite. _present_record returns the input unchanged when the
+        # provenance is not a dict, so copy before adding the key rather than mutate the stored rec.
+        shown = _present_record(rec, dominating_only=dominating_only)
+        if callsite_addr is None:
+            return shown
+        shown = dict(shown)
+        shown["is_candidate_callsite"] = (
+            rec.get("sink") == sink_anchor and _record_addr(rec) == callsite_addr
+        )
+        return shown
+
     # The origin fragments, alongside the records rather than inside them: a record says what the
     # def-use pass saw at the sink, an origin says where that value came from. Read-time and
     # derived — this call stores nothing and the controllability verdict never sees it.
     origin = source_origin(
-        conn, row[0], sink_anchor=row[1], wrapper_names=_nvram_wrapper_names(conn)
+        conn,
+        row[0],
+        sink_anchor=sink_anchor,
+        wrapper_names=_nvram_wrapper_names(conn),
+        callsite_addr=callsite_addr,
     )
     if sink_idx is None:
         out: dict[str, Any] = {
             "evidence_ref": evidence_ref,
             "found": True,
-            "records": [_present_record(r, dominating_only=dominating_only) for r in records],
+            "records": [_marked(r) for r in records],
         }
         if origin is not None:
             out["source_origin"] = origin
@@ -1030,7 +1143,7 @@ def get_sink_provenance(
                 "evidence_ref": evidence_ref,
                 "found": True,
                 "sink_idx": sink_idx,
-                "record": _present_record(rec, dominating_only=dominating_only),
+                "record": _marked(rec),
             }
             if origin is not None:
                 one["source_origin"] = origin
@@ -1092,7 +1205,11 @@ def _nvram_key_from_source(source: Any, wrapper_names: frozenset[str] = frozense
 
 
 def _nvram_source_key(
-    flow_evidence: str | None, wrapper_names: frozenset[str], sink_anchor: str | None
+    flow_evidence: str | None,
+    wrapper_names: frozenset[str],
+    sink_anchor: str | None,
+    *,
+    callsite_addr: int | None = None,
 ) -> str | None:
     """The nvram key feeding THIS candidate's anchored sink argument, or None.
 
@@ -1111,7 +1228,7 @@ def _nvram_source_key(
     Still not a verdict, and still not dominance-scoped WITHIN the sink: the controllability verdict
     is judged separately (``_verdict_from_provenance``), keeps its own scope and its own liberal
     fallback, so this field can over-assert control in neither direction."""
-    for rec in _writer_scoped_records(flow_evidence, sink_anchor):
+    for rec in _writer_scoped_records(flow_evidence, sink_anchor, callsite_addr=callsite_addr):
         prov = rec.get("provenance")
         prov = prov if isinstance(prov, dict) else {}
         key = _nvram_key_from_source(prov, wrapper_names)
@@ -1187,7 +1304,11 @@ def _dispatch_origins(flow_evidence: str | None) -> list[dict[str, Any]]:
 
 
 def _provenance_origins(
-    flow_evidence: str | None, wrapper_names: frozenset[str], sink_anchor: str | None
+    flow_evidence: str | None,
+    wrapper_names: frozenset[str],
+    sink_anchor: str | None,
+    *,
+    callsite_addr: int | None = None,
 ) -> list[dict[str, Any]]:
     """Origins from the def-use records of THIS candidate's anchored sink: the calls its argument's
     value came back from.
@@ -1213,7 +1334,7 @@ def _provenance_origins(
             seen.add(marker)
             out.append(origin)
 
-    for rec in _writer_scoped_records(flow_evidence, sink_anchor):
+    for rec in _writer_scoped_records(flow_evidence, sink_anchor, callsite_addr=callsite_addr):
         prov = rec.get("provenance")
         prov = prov if isinstance(prov, dict) else {}
         sources: list[Any] = [prov]
@@ -1298,6 +1419,7 @@ def source_origin(
     *,
     sink_anchor: str | None,
     wrapper_names: frozenset[str] = frozenset(),
+    callsite_addr: int | None = None,
 ) -> dict[str, Any] | None:
     """Where this candidate's sink value comes from, as far as the analysis actually resolved it.
 
@@ -1312,7 +1434,7 @@ def source_origin(
     the same fact for every candidate in it and has no sink to be scoped by.
     """
     origins = _dispatch_origins(flow_evidence) + _provenance_origins(
-        flow_evidence, wrapper_names, sink_anchor
+        flow_evidence, wrapper_names, sink_anchor, callsite_addr=callsite_addr
     )
     if not origins:
         return None
@@ -1629,6 +1751,7 @@ def _controllability_reading(
     blocking_mechanism: str | None,
     wrapper_names: frozenset[str],
     via_wrapper_empty: bool,
+    callsite_addr: int | None = None,
 ) -> Dimension:
     """Attacker byte-freedom over the sink argument, from the SINGLE verdict: controllable / free /
     constrained / constant / unknown. A ``controllable`` reading carries a certainty in ``state``:
@@ -1669,23 +1792,34 @@ def _controllability_reading(
     extractor emits no such marker today, so argv-free rides step 4.) The provenance verdict is
     computed by _verdict_from_provenance — the SAME classifier the explain rollup uses, so a
     candidate carries one controllability reading, never two that disagree."""
-    prov_verdict = _verdict_from_provenance(conn, flow_evidence, sink_anchor)
+    prov_verdict = _verdict_from_provenance(
+        conn, flow_evidence, sink_anchor, callsite_addr=callsite_addr
+    )
     # ★ "The provenance holds a record that was NOT shown to be constant."
     #
-    # A marker is a FUNCTION-level reading: the writer sets const_sink_arg when SOME call in the
-    # body passes a literal. A function with several sinks — `system("reboot")` beside a
-    # `system(<unresolved>)` — therefore carries the marker for the whole candidate, and the marker
-    # exits below trusted it without ever looking at what the per-sink def-use actually found. One
-    # constant call vouched for every other call in the same function.
+    # The constant markers below are not all per-callsite. const_sink_arg IS parameter-specific
+    # (downweight._sink_arg_is_literal reads THIS candidate's own call by its occurrence);
+    # caller_constant is still a FUNCTION-level reading — the sole caller only ever passes
+    # constants — so it is carried by every sink in the body alike. A function with several sinks —
+    # `system("reboot")` beside a `system(<unresolved>)` — can therefore still let one constant
+    # vouch for another call through the function-level marker, and even a per-callsite
+    # const_sink_arg says nothing about whether the ANCHORED sink left a def-use record at all (a
+    # sink forwarded through a wrapper leaves only the caller's OWN records). The marker exits below
+    # cannot be trusted on a marker alone, which is why the completeness gate runs.
     #
     # `prov_verdict is None` is exactly the state to refuse: a controllable verdict already
     # returned above, and an all-constant one returns "const", so None with records present means
     # at least one record came back unknown. Empty records leave this False, which keeps every
     # candidate the def-use pass does not cover (copy and path sinks get no record at all) reading
     # exactly as before — the fix narrows nothing that was sound.
-    has_unsafe_record = bool(_scoped_records(flow_evidence, sink_anchor)) and prov_verdict is None
+    has_unsafe_record = (
+        bool(_scoped_records(flow_evidence, sink_anchor, callsite_addr=callsite_addr))
+        and prov_verdict is None
+    )
     if prov_verdict == "controllable":
-        keys = _web_settable_keys_reaching_sink(conn, flow_evidence, sink_anchor)
+        keys = _web_settable_keys_reaching_sink(
+            conn, flow_evidence, sink_anchor, callsite_addr=callsite_addr
+        )
         via = f"web-settable key '{keys[0]}'" if keys else "a user-settable source"
         return Dimension(
             "controllability",
@@ -1697,7 +1831,7 @@ def _controllability_reading(
             "'free' fallback",
         )
     likely_keys = _likely_settable_keys_reaching_sink(
-        conn, flow_evidence, sink_anchor, wrapper_names
+        conn, flow_evidence, sink_anchor, wrapper_names, callsite_addr=callsite_addr
     )
     if likely_keys:
         return Dimension(
@@ -1732,7 +1866,7 @@ def _controllability_reading(
     #
     # If a future constant marker can prove the WRAPPED argument constant on its own, it belongs on
     # an explicit allow-list with that proof written out; none does today.
-    const_trustworthy = not _anchor_missed(flow_evidence, sink_anchor)
+    const_trustworthy = not _anchor_missed(flow_evidence, sink_anchor, callsite_addr=callsite_addr)
     if (
         const_trustworthy
         and blocking_mechanism in PROVABLY_CONSTANT_MARKERS
@@ -1758,10 +1892,12 @@ def _controllability_reading(
             "provably-constant via def-use (all sources constant literals, none unresolved) — "
             "demotes out of the first screen. TWO separate completeness rules hold it up, at two "
             "different levels: per RECORD, a variadic exec seen only at arg0 reads unknown, never "
-            "constant; per CANDIDATE, the anchored sink must have left at least one record here at "
-            "all, so a sink that escaped behind a thin wrapper can never be called constant on the "
-            "strength of the caller's other sinks. Neither proves the provenance COMPLETE — a "
-            "record that exists but was internally truncated is a deeper gap",
+            "constant; per CANDIDATE, the anchored sink must have left a record of its OWN here — "
+            "this callsite's when the ref carries an address, any call to the sink in the function "
+            "otherwise — so neither a sink escaped behind a wrapper nor one callsite leaning on a "
+            "constant sibling is called constant on records that are not its own. Neither proves "
+            "the provenance COMPLETE — a record that exists but was internally truncated is a "
+            "deeper gap",
         )
     if source_kind == "free_string":
         return Dimension(
@@ -1876,6 +2012,7 @@ def _dim_controllability(
     source_kind: str,
     blocking_mechanism: str | None,
     wrapper_names: frozenset[str] = frozenset(),
+    callsite_addr: int | None = None,
 ) -> Dimension:
     """The controllability reading, plus the drill-down row a never-traced wrapper sink earns.
 
@@ -1905,6 +2042,7 @@ def _dim_controllability(
         blocking_mechanism=blocking_mechanism,
         wrapper_names=wrapper_names,
         via_wrapper_empty=via_wrapper_empty,
+        callsite_addr=callsite_addr,
     )
     if not via_wrapper_empty:
         return dim
@@ -2151,15 +2289,20 @@ def _dim_sink_impact(sink_class: str, overrides: dict[str, int] | None = None) -
     )
 
 
-def _dim_writer(flow_evidence: str | None, sink_anchor: str | None) -> Dimension:
+def _dim_writer(
+    flow_evidence: str | None, sink_anchor: str | None, *, callsite_addr: int | None = None
+) -> Dimension:
     """Who writes the sink argument's value? located / via_wrapper / not_traced, from the def-use
     provenance of THIS candidate's own sink. A ? (not_traced) never sinks.
 
     Scoped through ``_writer_scoped_records``: the stored provenance is per FUNCTION, so reading it
     unscoped answered with whichever sink in the function happened to resolve first — including a
     sink of another class entirely. ``located`` is a reassuring fact, so that borrowing was wrong in
-    the direction that reassures. Not ``_scoped_records``: its liberal fallback is right for
-    controllability and wrong here (see that pair's docstrings)."""
+    the direction that reassures. When the candidate's ref carries an address this narrows further,
+    to the writers of THIS callsite only (``callsite_addr``), so one call to a sink is never read as
+    ``located`` off a constant sibling call to the same sink; a function-level ref keeps the
+    by-name scope. Not ``_scoped_records``: its liberal fallback is right for controllability and
+    wrong here (see that pair's docstrings)."""
     if _flow_path_obj(flow_evidence).get("sink_via_wrapper"):
         return Dimension(
             "writer",
@@ -2168,7 +2311,7 @@ def _dim_writer(flow_evidence: str | None, sink_anchor: str | None) -> Dimension
             "flow_evidence.flow_path.wrapper",
             "the value is forwarded one hop through a thin wrapper to the real sink",
         )
-    for rec in _writer_scoped_records(flow_evidence, sink_anchor):
+    for rec in _writer_scoped_records(flow_evidence, sink_anchor, callsite_addr=callsite_addr):
         prov = rec.get("provenance")
         prov = prov if isinstance(prov, dict) else {}
         if prov.get("kind") == "constant":
@@ -2264,6 +2407,7 @@ def _build_dimensions(
     sink_anchor: str | None,
     wrapper_names: frozenset[str] = frozenset(),
     string_keyed_edges: tuple[dict[str, Any], ...] = (),
+    callsite_addr: int | None = None,
 ) -> tuple[Dimension, ...]:
     """The honest map layers for one candidate. web_settable is the SaTC front↔back cross, looked
     up once when the source resolved to an nvram key (shared by source_writability); the
@@ -2279,13 +2423,14 @@ def _build_dimensions(
             source_kind=source_kind,
             blocking_mechanism=blocking_mechanism,
             wrapper_names=wrapper_names,
+            callsite_addr=callsite_addr,
         ),
         _dim_source(source_class, source_kind),
         _dim_source_writability(nvram_key, web_settable),
         _dim_reachability(entry_reach, web_triggers, string_keyed_edges, flow_evidence),
         _dim_filtering(flow_evidence),
         _dim_sink_impact(sink_class),
-        _dim_writer(flow_evidence, sink_anchor),
+        _dim_writer(flow_evidence, sink_anchor, callsite_addr=callsite_addr),
         _dim_completeness(),
     )
 
@@ -2303,14 +2448,20 @@ def _candidate(
     sink_class = row["sink_class"]
     blocking = row["blocking_mechanism"]
     sink_anchor = row["sink_anchor"]
+    # The sink address this candidate's ref names (None for a function-level / degraded ref), so
+    # every provenance read below is scoped to THIS callsite rather than every call to the same sink
+    # in the function.
+    callsite_addr = _callsite_addr(row["evidence_ref"])
     # The resolved nvram key for the source_writability layer: a recognized nvram accessor — a
     # direct getter (NVRAM_GETTERS) OR an A2 thin wrapper (wrapper_names) — first, else the first
     # web-settable key the verdict found reaching the sink. Wrapper-aware (M1) so a key read through
     # a shared accessor (the common case) still shows in source_writability and the nvram-source
     # view, coherent with the controllability reading.
-    nvram_key = _nvram_source_key(fe, wrapper_names, sink_anchor)
+    nvram_key = _nvram_source_key(fe, wrapper_names, sink_anchor, callsite_addr=callsite_addr)
     if nvram_key is None:
-        web_keys = _web_settable_keys_reaching_sink(conn, fe, sink_anchor)
+        web_keys = _web_settable_keys_reaching_sink(
+            conn, fe, sink_anchor, callsite_addr=callsite_addr
+        )
         nvram_key = web_keys[0] if web_keys else None
     # ★ Reachability lead (iron-law-safe): is this candidate's function the callee of a string-keyed
     # edge (a strcmp ladder / static table gates it behind an attacker-influenceable key)? This
@@ -2358,6 +2509,7 @@ def _candidate(
             sink_anchor=sink_anchor,
             wrapper_names=wrapper_names,
             string_keyed_edges=string_keyed_edges,
+            callsite_addr=callsite_addr,
         ),
     )
 
@@ -3025,6 +3177,7 @@ def explain_candidate(conn: sqlite3.Connection, evidence_ref: str) -> CandidateE
     row = rows[0]
 
     candidate = _candidate(conn, row, _nvram_wrapper_names(conn))
+    callsite_addr = _callsite_addr(evidence_ref)
     claims_does = (
         "present each dimension layer as an observed FACT about this candidate (controllability, "
         "source-writability, reachability, filtering, sink impact, writer, completeness) with its "
@@ -3051,12 +3204,18 @@ def explain_candidate(conn: sqlite3.Connection, evidence_ref: str) -> CandidateE
         sink_impact=candidate.dim("sink_impact").value,
         controllability_labeled=state_value_label(candidate.dim("controllability")),
         sink_impact_labeled=state_value_label(candidate.dim("sink_impact")),
-        sink_arg_provenance_summary=_sink_provenance_summary(conn, _row_get(row, "flow_evidence")),
+        sink_arg_provenance_summary=_sink_provenance_summary(
+            conn,
+            _row_get(row, "flow_evidence"),
+            sink_anchor=_row_get(row, "sink_anchor"),
+            callsite_addr=callsite_addr,
+        ),
         source_origin=source_origin(
             conn,
             _row_get(row, "flow_evidence"),
             sink_anchor=_row_get(row, "sink_anchor"),
             wrapper_names=_nvram_wrapper_names(conn),
+            callsite_addr=callsite_addr,
         ),
         evidence_surface=evidence_surface(
             _row_get(row, "flow_evidence"),

@@ -23,8 +23,18 @@ from treasure_map.cli.hunt_cli import triage as triage_cmd
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import InstanceRow
 from treasure_map.lib.atlas.writer import add_instance, upsert_pattern
+from treasure_map.lib.hunt.refs import (
+    _norm_offset,
+    build_evidence_ref,
+    callsite_offset_suffix,
+)
 from treasure_map.lib.query import sort_candidates, triage
-from treasure_map.lib.query.triage import Dimension, TriageCandidate
+from treasure_map.lib.query.triage import (
+    Dimension,
+    TriageCandidate,
+    _callsite_addr,
+    _record_addr,
+)
 
 _FID = [0]
 
@@ -1886,3 +1896,80 @@ def test_a_variadic_format_command_is_no_longer_certified_safe_end_to_end(
     assert _is_proven_safe(c) is False
     # and therefore not pushed to the bottom band of a filtered view either
     assert _float_by_dimension([c], [("source", "param")]) == [c]
+
+
+# ── B2: per-callsite provenance — the ref-address readers (_callsite_addr / _record_addr) ────
+
+
+def _round_trip_ref(sink_class: str, func_entry: int, sink_addr: int) -> str:
+    """Forge a per-callsite ref through the REAL ref machinery (refs.py) — the byte-for-byte shape
+    the second reader in triage.py must round-trip without importing lib/hunt."""
+    return build_evidence_ref(
+        "run_1",
+        suffix=callsite_offset_suffix(sink_class, _norm_offset(sink_addr, func_entry)),
+        binary_sha256="deadbeef",
+        address=hex(func_entry),
+    )
+
+
+def test_callsite_addr_round_trips_every_class_and_offset_shape() -> None:
+    """A ref forged by build_evidence_ref + callsite_offset_suffix + _norm_offset must read back to
+    the exact sink address it started from: the second reader in triage.py stays in step with the
+    single forge, so a change to either is caught here rather than silently mis-scoping. Covers a
+    positive and a negative offset, an offset wider than six hex digits, a 64-bit entry, and all
+    five sink classes.
+
+    MUTATION (must go RED): drop the sign handling in _callsite_addr (always add the offset) -> the
+    negative-offset case reconstructs the wrong address."""
+    cases = [
+        ("cmd", 0x00401000, 0x00401218),  # positive offset
+        ("copy", 0x00401000, 0x00400FC0),  # negative offset (out-of-line block below entry)
+        ("format", 0x00010000, 0x01234567),  # offset wider than six hex digits
+        ("fmt_string", 0x7F0000001000, 0x7F0000001240),  # 64-bit entry
+        ("path_sink", 0x00008000, 0x00008120),  # fifth class
+    ]
+    for sink_class, func_entry, sink_addr in cases:
+        ref = _round_trip_ref(sink_class, func_entry, sink_addr)
+        assert _callsite_addr(ref) == sink_addr, (sink_class, ref)
+
+
+def test_callsite_addr_is_none_for_every_non_addressed_shape() -> None:
+    """Only the addressed ``…:<entry>@<class>@<offset>`` suffix carries an address; every other ref
+    shape reads None so the candidate keeps its function-level scope, never a spurious address.
+
+    MUTATION (must go RED): make the second ``@<offset>`` group optional in _CALLSITE_REF_RE -> the
+    function-level ``…@cmd`` case stops reading None."""
+    entry = 0x00401000
+    func_level = build_evidence_ref(
+        "run_1", suffix="cmd", binary_sha256="deadbeef", address=hex(entry)
+    )
+    via_wrapper = build_evidence_ref(
+        "run_1", suffix="cmd_via_wrapper", binary_sha256="deadbeef", address=hex(entry)
+    )
+    legacy = build_evidence_ref(
+        "run_1",
+        suffix=callsite_offset_suffix("cmd", None, 0),
+        binary_sha256="deadbeef",
+        address=hex(entry),
+    )
+    non_hex_fn = build_evidence_ref(
+        "run_1", suffix="cmd", binary_sha256="deadbeef", func_name="handle_set"
+    )
+    assert _callsite_addr(func_level) is None  # …@cmd
+    assert _callsite_addr(via_wrapper) is None  # …@cmd_via_wrapper
+    assert _callsite_addr(legacy) is None  # …@cmd#0 (legacy ordinal)
+    assert _callsite_addr("run#deadbeef") is None  # degenerate: no :<entry>@<class>@<offset> tail
+    assert _callsite_addr(non_hex_fn) is None  # function anchor is a name, not hex
+    assert _callsite_addr("") is None
+    assert _callsite_addr(None) is None
+
+
+def test_record_addr_parses_or_honestly_returns_none() -> None:
+    """_record_addr reads one record's sink_addr ``"0x…"`` string to an int, and returns None —
+    never a guess — when the field is missing, not a string, or unparseable."""
+    assert _record_addr({"sink_addr": "0x401218"}) == 0x401218
+    assert _record_addr({"sink_addr": "0X401218"}) == 0x401218  # case-insensitive 0x prefix
+    assert _record_addr({}) is None  # missing
+    assert _record_addr({"sink_addr": 0x401218}) is None  # not a string (an int)
+    assert _record_addr({"sink_addr": "deadzz"}) is None  # unparseable
+    assert _record_addr({"sink_addr": ""}) is None  # empty

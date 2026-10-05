@@ -31,9 +31,22 @@ from treasure_map.lib.atlas.writer import (
     upsert_pattern,
 )
 from treasure_map.lib.hunt import exec_edges
+from treasure_map.lib.hunt.refs import (
+    _norm_offset,
+    build_evidence_ref,
+    callsite_offset_suffix,
+)
 from treasure_map.lib.pattern import classes
 from treasure_map.lib.query import sort_candidates, triage
-from treasure_map.lib.query.triage import _MULTI_ARG_COMMAND_SINKS, _scoped_records
+from treasure_map.lib.query.triage import (
+    _MULTI_ARG_COMMAND_SINKS,
+    _anchor_missed,
+    _dim_controllability,
+    _dim_writer,
+    _scoped_records,
+    _verdict_from_provenance,
+    _web_settable_keys_reaching_sink,
+)
 
 _FID = [0]
 
@@ -2199,3 +2212,307 @@ def test_constrained_marker_yields_to_unknown(tmp_path: Path, marker: str) -> No
         assert state != "proven"
     finally:
         conn.close()
+
+
+# ── B2: per-callsite provenance scoping — one call to a sink is not read off a sibling ───────
+
+
+def _const_at(sink: str, addr: int, value: str = "/sbin/reboot") -> dict[str, object]:
+    """A constant record at a specific sink address (writer=located, record class=const)."""
+    return {
+        "sink": sink,
+        "sink_idx": 0,
+        "sink_addr": hex(addr),
+        "provenance": {"kind": "constant", "value": value, "value_kind": "literal_string"},
+    }
+
+
+def _untraced_at(sink: str, addr: int) -> dict[str, object]:
+    """A stack_buf record whose dominating writer never resolved and which carries NO
+    nearest_dominating_writer: on its own it reads writer=not_traced and record class=unknown."""
+    return {
+        "sink": sink,
+        "sink_idx": 1,
+        "sink_addr": hex(addr),
+        "provenance": {
+            "kind": "stack_buf",
+            "writers": [
+                {
+                    "writer": "snprintf@0xb",
+                    "dominates_sink": True,
+                    "fmt": "%s",
+                    "varargs": [
+                        {"pos": 3, "spec": "%s", "source": {"kind": "unresolved", "note": "phi"}}
+                    ],
+                }
+            ],
+        },
+    }
+
+
+def _controllable_at(sink: str, addr: int, key: str) -> dict[str, object]:
+    """A stack_buf record whose dominating writer splices a web-settable nvram key: controllable."""
+    return {
+        "sink": sink,
+        "sink_idx": 2,
+        "sink_addr": hex(addr),
+        "provenance": {
+            "kind": "stack_buf",
+            "nearest_dominating_writer": "snprintf@0x1",
+            "writers": [
+                {
+                    "writer": "snprintf@0x1",
+                    "dominates_sink": True,
+                    "fmt": "%s",
+                    "varargs": [_getter_vararg(key)],
+                }
+            ],
+        },
+    }
+
+
+def _fe(*records: dict[str, object], source_kind: str = "unknown") -> str:
+    return json.dumps({"source_kind": source_kind, "sink_arg_provenance": list(records)})
+
+
+def _addr_inst(
+    conn: sqlite3.Connection,
+    pattern_id: int,
+    sink_anchor: str,
+    ev: dict[str, object],
+    *,
+    func_entry: int,
+    sink_addr: int,
+) -> str:
+    """Seed one instance whose evidence_ref is a per-callsite ADDRESSED ref (forged by the real ref
+    machinery) pointing at ``sink_addr`` — so _candidate reads it back and scopes to it."""
+    ref = build_evidence_ref(
+        "run_1",
+        suffix=callsite_offset_suffix("cmd", _norm_offset(sink_addr, func_entry)),
+        binary_sha256="deadbeef",
+        address=hex(func_entry),
+    )
+    _FID[0] += 1
+    add_instance(
+        conn,
+        InstanceRow(
+            pattern_id=pattern_id,
+            pseudocode_hash=f"h{_FID[0]}",
+            source_anchor=f"fn{_FID[0]}",
+            sink_anchor=sink_anchor,
+            source_run_id="run_1",
+            reachability_status="unknown",
+            blocking_mechanism=None,
+            provenance_level="L0",
+            evidence_ref=ref,
+            scope_origin="intra",
+            origin="unknown",
+            flow_evidence=json.dumps(ev),
+        ),
+    )
+    return ref
+
+
+def test_writer_located_is_not_borrowed_from_a_sibling_callsite(tmp_path: Path) -> None:
+    """B2 #3. A function with a constant `system("reboot")` beside an untraced `system(var)`: the
+    untraced call's writer is `not_traced` on its OWN address, but reads `located` off the constant
+    sibling when the candidate has no address — the pre-fix borrowing this closes.
+
+    MUTATION (must go RED): drop `callsite_addr=callsite_addr` from _dim_writer's
+    _writer_scoped_records call -> the addressed untraced call borrows the constant (located)."""
+    fe = _fe(_const_at("system", 0x1000), _untraced_at("system", 0x2000))
+    assert _dim_writer(fe, "system", callsite_addr=0x2000).value == "not_traced"
+    assert _dim_writer(fe, "system").value == "located"  # unaddressed: borrows the sibling
+    assert _dim_writer(fe, "system", callsite_addr=0x1000).value == "located"  # A's own record
+
+
+def test_anchor_missed_is_per_callsite(tmp_path: Path) -> None:
+    """B2 #4. Only the constant sibling left a record; the candidate's own call did not. By NAME a
+    record for `system` exists (not missed); by CALLSITE this candidate has none of its own
+    (missed), so the constant exit is suppressed and the reading falls back.
+
+    MUTATION (must go RED): drop `callsite_addr=callsite_addr` from _anchor_missed's guard (c) ->
+    the addressed candidate is no longer 'missed' and reads constant off the sibling."""
+    conn = _atlas(tmp_path)
+    try:
+        fe = _fe(_const_at("system", 0x1000))  # candidate B lives at 0x2000: no record of its own
+        assert _anchor_missed(fe, "system") is False
+        assert _anchor_missed(fe, "system", callsite_addr=0x2000) is True
+        dim = _dim_controllability(
+            conn,
+            flow_evidence=fe,
+            sink_anchor="system",
+            source_kind="unknown",
+            blocking_mechanism="const_sink_arg",
+            callsite_addr=0x2000,
+        )
+        assert dim.value != "constant"
+    finally:
+        conn.close()
+
+
+def test_constant_verdict_is_per_callsite(tmp_path: Path) -> None:
+    """B2 #5. With a constant record and an unknown record for the same sink present, the constant
+    call reads `constant` only when scoped to its OWN address; unscoped, the sibling unknown dilutes
+    the verdict. The unknown call is never constant either way.
+
+    MUTATION (must go RED): drop `callsite_addr=callsite_addr` from _verdict_from_provenance's
+    _scoped_records call -> the addressed constant call is diluted to None too."""
+    conn = _atlas(tmp_path)
+    try:
+        fe = _fe(_const_at("system", 0x1000), _untraced_at("system", 0x2000))
+        assert _verdict_from_provenance(conn, fe, "system", callsite_addr=0x1000) == "const"
+        assert _verdict_from_provenance(conn, fe, "system") is None  # diluted by the sibling
+        assert _verdict_from_provenance(conn, fe, "system", callsite_addr=0x2000) is None
+        a_dim = _dim_controllability(
+            conn,
+            flow_evidence=fe,
+            sink_anchor="system",
+            source_kind="unknown",
+            blocking_mechanism=None,
+            callsite_addr=0x1000,
+        )
+        assert (a_dim.state, a_dim.value) == ("proven", "constant")
+        b_dim = _dim_controllability(
+            conn,
+            flow_evidence=fe,
+            sink_anchor="system",
+            source_kind="unknown",
+            blocking_mechanism=None,
+            callsite_addr=0x2000,
+        )
+        assert b_dim.value != "constant"
+    finally:
+        conn.close()
+
+
+def test_web_settable_key_is_not_leaked_across_callsites(tmp_path: Path) -> None:
+    """B2 #6. A constant call beside a call that splices a web-settable key: scoped to the constant
+    call's address no key reaches it (constant); scoped to the key's call it is controllable. The
+    key must not float the constant call, nor the constant silence the key's call."""
+    conn = _atlas(tmp_path)  # _atlas seeds the SaTC cross (fb_comment crosses web_settable=yes)
+    try:
+        fe = _fe(_const_at("system", 0x1000), _controllable_at("system", 0x2000, "fb_comment"))
+        assert _web_settable_keys_reaching_sink(conn, fe, "system", callsite_addr=0x1000) == []
+        a_dim = _dim_controllability(
+            conn,
+            flow_evidence=fe,
+            sink_anchor="system",
+            source_kind="unknown",
+            blocking_mechanism=None,
+            callsite_addr=0x1000,
+        )
+        assert (a_dim.state, a_dim.value) == ("proven", "constant")
+        assert _web_settable_keys_reaching_sink(conn, fe, "system", callsite_addr=0x2000) == [
+            "fb_comment"
+        ]
+        b_dim = _dim_controllability(
+            conn,
+            flow_evidence=fe,
+            sink_anchor="system",
+            source_kind="unknown",
+            blocking_mechanism=None,
+            callsite_addr=0x2000,
+        )
+        assert (b_dim.state, b_dim.value) == ("proven", "controllable")
+    finally:
+        conn.close()
+
+
+def test_scoped_records_fallback_is_unchanged_when_own_is_empty(tmp_path: Path) -> None:
+    """B2 #7. With an address but no record of the candidate's own (only another sink's record
+    present), _scoped_records returns exactly what it returns unaddressed — the liberal fallback is
+    untouched, so nothing a failed address match can hide a controllable key behind."""
+    other = {
+        "sink": "printf",
+        "sink_idx": 0,
+        "sink_addr": "0x9000",
+        "provenance": {"kind": "constant", "value": "x"},
+    }
+    fe = _fe(other)
+    without = _scoped_records(fe, "system")
+    addressed = _scoped_records(fe, "system", callsite_addr=0x2000)
+    assert addressed == without
+    assert [r["sink"] for r in addressed] == ["printf"]
+
+
+def test_empty_provenance_is_governed_by_guard_b_regardless_of_address(tmp_path: Path) -> None:
+    """B2 #8. With NO provenance at all and not a wrapper candidate, guard (b) governs before the
+    callsite guard (c), so _anchor_missed is False with or without an address, and a const_sink_arg
+    marker still reads constant — the ordinary copy/path no-def-use state is unchanged."""
+    conn = _atlas(tmp_path)
+    try:
+        fe = json.dumps({"source_kind": "unknown"})
+        assert _anchor_missed(fe, "system") is False
+        assert _anchor_missed(fe, "system", callsite_addr=0x2000) is False
+        for addr in (None, 0x2000):
+            dim = _dim_controllability(
+                conn,
+                flow_evidence=fe,
+                sink_anchor="system",
+                source_kind="unknown",
+                blocking_mechanism="const_sink_arg",
+                callsite_addr=addr,
+            )
+            assert (dim.state, dim.value) == ("proven", "constant")
+    finally:
+        conn.close()
+
+
+def test_iron_laws_survive_per_callsite_scoping(tmp_path: Path) -> None:
+    """B2 #9. The two per-record iron laws fire the same under callsite scoping: an execl arg0
+    constant is the program path (never a constant command), and a doSystem constant %s TEMPLATE
+    splices an unexamined vararg (never a constant command)."""
+    conn = _atlas(tmp_path)
+    try:
+        fe_execl = _fe(_const_at("execl", 0x1000, "/bin/ls"))
+        assert _verdict_from_provenance(conn, fe_execl, "execl", callsite_addr=0x1000) is None
+        fe_dosys = _fe(_const_at("doSystem", 0x2000, "reboot %s"))
+        assert _verdict_from_provenance(conn, fe_dosys, "doSystem", callsite_addr=0x2000) is None
+        for fe, sink, addr in [(fe_execl, "execl", 0x1000), (fe_dosys, "doSystem", 0x2000)]:
+            dim = _dim_controllability(
+                conn,
+                flow_evidence=fe,
+                sink_anchor=sink,
+                source_kind="unknown",
+                blocking_mechanism=None,
+                callsite_addr=addr,
+            )
+            assert dim.value != "constant"
+    finally:
+        conn.close()
+
+
+def test_candidate_threads_callsite_addr_end_to_end(tmp_path: Path) -> None:
+    """B2 wiring. _candidate must read the address out of the row's evidence_ref and scope every
+    dimension by it. Two instances share one provenance (a constant call + an untraced call) but
+    carry refs addressed to different calls; a third carries a function-level ref.
+
+    MUTATION (must go RED): drop `callsite_addr=callsite_addr` from _candidate's _build_dimensions
+    call -> the addressed candidates read identically to the function-level one."""
+    conn = _atlas(tmp_path)
+    try:
+        p = _pattern(conn, "fp_b2_e2e", sink_class="cmd")
+        ev = {
+            "source_kind": "unknown",
+            "sink_arg_provenance": [
+                _const_at("system", 0x401000),
+                _untraced_at("system", 0x402000),
+            ],
+        }
+        ref_a = _addr_inst(conn, p, "system", ev, func_entry=0x400000, sink_addr=0x401000)
+        ref_b = _addr_inst(conn, p, "system", ev, func_entry=0x400000, sink_addr=0x402000)
+        ref_fn = _inst(conn, p, sink_anchor="system", flow_evidence=ev)
+    finally:
+        conn.close()
+    cands = triage(open_atlas(tmp_path / "atlas.db"))
+    ca, cb, cfn = (_find(cands, r) for r in (ref_a, ref_b, ref_fn))
+    assert ca is not None and cb is not None and cfn is not None
+    # addressed to the constant call: constant + located
+    assert ca.dim("controllability").value == "constant"
+    assert ca.dim("writer").value == "located"
+    # addressed to the untraced call: neither borrowed
+    assert cb.dim("controllability").value != "constant"
+    assert cb.dim("writer").value == "not_traced"
+    # function-level ref keeps the pre-fix borrowing (writer located off the constant sibling)
+    assert cfn.dim("writer").value == "located"

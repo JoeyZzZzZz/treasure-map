@@ -1396,7 +1396,10 @@ def make_tools(
     def explain_candidate(evidence_ref: str) -> dict[str, Any]:
         """Single-candidate fact view: every dimension layer's honest three-state annotation
         (controllability / source_writability / reachability / filtering / sink_impact / writer /
-        completeness), the lens caveats, the claim bounds, and where to verify — no score.
+        completeness), the lens caveats, the claim bounds, and where to verify — no score. When the
+        ref carries a callsite address, the ``sink_arg_provenance_summary`` entry each dimension is
+        read from is flagged ``is_candidate_callsite: true``; the flag is absent entirely for a
+        function-level anchor.
 
         Returns a not-found record when no instance carries ``evidence_ref`` (no fabrication).
         Echoes the canonical ``resolved_run`` + inline ``run_lineage`` (M6/M7): a ref anchors ONE
@@ -1471,7 +1474,10 @@ def make_tools(
 
         The result also includes a ``source_origin`` companion (where the sink value comes from),
         scoped to THIS candidate's anchored sink — the same for any ``sink_idx``, since ``records``
-        already carry the per-sink detail."""
+        already carry the per-sink detail. When the ref carries a callsite address, the one record
+        that is this candidate's own callsite — the record its dimension readings come from — is
+        flagged ``is_candidate_callsite: true``; the flag is absent entirely for a function-level
+        anchor (every other record stays exactly as before)."""
         conn = open_atlas(atlas_path)
         try:
             ref = _resolve_ref(conn, evidence_ref)

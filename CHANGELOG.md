@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`get_sink_provenance` and `explain_candidate` mark which record a candidate reads from.** When
+  the candidate's `evidence_ref` carries a callsite address, each returned sink record and each
+  `sink_arg_provenance_summary` entry gains `is_candidate_callsite` — true on the one record that is
+  this candidate's own call, the record its per-dimension readings are taken from. The key is
+  omitted entirely for a function-level anchor, so the existing output is unchanged.
 - **Per-callsite `evidence_ref` suffixes now name the call by its address, not its ordinal.** The
   suffix `<class>#<index>` (the Nth enumerated call) becomes `<class>@<offset>`, where the offset is
   the call instruction's address minus the function entry (signed, zero-padded hex). The offset
@@ -25,6 +30,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A candidate's writer is no longer read off a sibling call to the same sink.** `sink_arg_provenance`
+  is stored per function, so an untraced `system(var)` beside a constant `system("reboot")` reported
+  the constant call's `located` writer as its own — a reassuring fact it had not earned. When the
+  `evidence_ref` carries a callsite address the writer is scoped to that one call (`not_traced` when
+  its own value was never resolved); a function-level ref keeps the by-sink-name reading.
+- **The constant controllability verdict and its completeness gate are scoped per callsite.** An
+  all-constant def-use verdict, a `const_sink_arg` marker, and the completeness check that gates the
+  two constant exits were scoped by sink NAME, so one constant call could certify a sibling call to
+  the same sink as `constant` — this phase's only proven-safe fact. With a callsite address they read
+  only the candidate's own record; the liberal controllability fallback is unchanged, so a failed
+  address match never demotes a controllable candidate.
 - **A Ghidra run that timed out could be credited with an earlier run's output.** The runner judged
   success by counting the functions in whatever JSON sat at the target path, and that directory
   outlives a scan; a killed run never replaced the old file, so it was stamped current and never

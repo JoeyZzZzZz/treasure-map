@@ -37,6 +37,7 @@ from treasure_map.lib.atlas.writer import (
 )
 from treasure_map.lib.query.triage import (
     _dim_controllability,
+    _nvram_source_key,
     _nvram_wrapper_names,
     source_origin,
 )
@@ -465,3 +466,52 @@ def test_surfaced_by_both_consumers(tmp_path: Path) -> None:
     assert prov["source_origin"]["origins"]
     assert ex is not None and ex.source_origin is not None
     assert {o["axis"] for o in ex.source_origin["origins"]} == {"dispatch", "nvram"}
+
+
+# ── B2: both the origin list and the nvram key scope to the candidate's own callsite ─────────
+
+
+def test_source_origin_and_nvram_key_scope_to_their_own_callsite(tmp_path: Path) -> None:
+    """B2 #10. Two calls to the same sink in one function, each reading a DIFFERENT nvram key:
+    scoped to a call's own address, source_origin and _nvram_source_key report only that call's key.
+    Unscoped, both keys surface and _nvram_source_key returns whichever resolves first.
+
+    MUTATION (must go RED): drop `callsite_addr=callsite_addr` from _provenance_origins' and
+    _nvram_source_key's _writer_scoped_records calls -> the addressed reads pick up both keys."""
+    conn = _atlas(tmp_path)
+    try:
+        a = {
+            "sink": "system",
+            "sink_idx": 0,
+            "sink_addr": "0x100",
+            "provenance": _nvram_source("nvram_get", "wan_proto"),
+        }
+        b = {
+            "sink": "system",
+            "sink_idx": 1,
+            "sink_addr": "0x200",
+            "provenance": _nvram_source("nvram_get", "lan_ipaddr"),
+        }
+        fe = json.dumps({"sink_arg_provenance": [a, b]})
+        wn = _nvram_wrapper_names(conn)
+
+        assert _nvram_source_key(fe, wn, "system", callsite_addr=0x200) == "lan_ipaddr"
+        origin_b = source_origin(
+            conn, fe, sink_anchor="system", wrapper_names=wn, callsite_addr=0x200
+        )
+        assert origin_b is not None
+        assert [o.get("key") for o in origin_b["origins"]] == ["lan_ipaddr"]
+
+        assert _nvram_source_key(fe, wn, "system", callsite_addr=0x100) == "wan_proto"
+        origin_a = source_origin(
+            conn, fe, sink_anchor="system", wrapper_names=wn, callsite_addr=0x100
+        )
+        assert origin_a is not None
+        assert [o.get("key") for o in origin_a["origins"]] == ["wan_proto"]
+
+        origin_all = source_origin(conn, fe, sink_anchor="system", wrapper_names=wn)
+        assert origin_all is not None
+        assert sorted(o.get("key") for o in origin_all["origins"]) == ["lan_ipaddr", "wan_proto"]
+        assert _nvram_source_key(fe, wn, "system") == "wan_proto"  # first-found, a sibling's
+    finally:
+        conn.close()
