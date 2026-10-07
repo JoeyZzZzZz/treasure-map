@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Every callee-name list the extractor recognises now lives in one registry file.** Command and
+  format-string sinks with their key argument, buffer writers, printf-family writer format
+  positions, tokenizers, nvram accessors and shell-forwarding sinks moved out of the Ghidra script
+  into `extractor_names.tsv` beside it. The extractor builds its lists from that file at run time
+  and the read side parses the same file, deriving its command / format-string sink classes and
+  format positions from it and checking its copy / format / getter lists against it. The file is
+  part of the extraction fingerprint, so this change re-extracts every binary once. A malformed
+  registry stops a scan before any extraction starts.
+- **The extractor recognises more buffer writers and two more nvram accessors.** New writers:
+  `strlcpy`, `strlcat`, `mempcpy`, `wmemcpy`, `stpncpy` and the fortified `_chk` copy, append and
+  printf forms. `strlcpy` / `strlcat` are read only as writers of a buffer's fill and never become a
+  copy candidate. `nvram_bufget` / `nvram_bufset` are recorded as nvram reads / writes with the key
+  taken from their second argument (the first is an index).
+- **A call's constant arguments are also recorded by position** (`const_args_by_pos`, additive), and
+  an nvram key is read at the accessor's own key position. Composite prefix+name keys are produced
+  only when both halves are constant; a bare `0x…` constant is never read as a key.
+- **Fortified (`_chk`) copy and format calls carry an object-size fact.** Their size record gains
+  `objsize`, with `unbounded: true` only when the compiler passed `(size_t)-1` — the call then checks
+  nothing. A concrete object size is reported but never turned into a bound, and the fact does not
+  enter the size kind, the grade or the review order.
 - **`get_sink_provenance` and `explain_candidate` mark which record a candidate reads from.** When
   the candidate's `evidence_ref` carries a callsite address, each returned sink record and each
   `sink_arg_provenance_summary` entry gains `is_candidate_callsite` — true on the one record that is
@@ -30,6 +50,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A sink called through an unresolved lazy-binding stub now gets its def-use provenance.** In a
+  stripped binary the decompiler renders such a call as `FUN_<stub-addr>(…)`; the extractor did not
+  recognise it as `system` / `printf` / a writer / an nvram accessor, so the call carried no
+  provenance. The scan now hands the extractor the binary's resolved stub table, the extractor
+  names those calls after the import they reach (internally only — the exported callee list is
+  unchanged), and both thin-command-wrapper recognisers find a wrapped sink call spelled that way.
+  The extractor echoes a content hash of the table it loaded; the runner and the ingest refuse an
+  output whose hash is not this binary's table, so a run that read another binary's table cannot be
+  ingested.
+- **An nvram value read through a getter missing from the read side's short getter list is now a
+  key source.** Every value-returning accessor the extractor knows counts (predicate reads such as
+  "is empty" / "contains word" do not), in one set shared by the nvram-source key and the origin
+  list, so the two no longer disagree about whether a call is an nvram read.
 - **A candidate's writer is no longer read off a sibling call to the same sink.** `sink_arg_provenance`
   is stored per function, so an untraced `system(var)` beside a constant `system("reboot")` reported
   the constant call's `located` writer as its own — a reassuring fact it had not earned. When the

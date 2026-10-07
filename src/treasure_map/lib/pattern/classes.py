@@ -13,6 +13,8 @@ import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
+from treasure_map.lib.pattern.extractor_names import REGISTRY
+
 # External-input getters, split by strength of external controllability (neutral,
 # mechanism-based). Strength gates reachability grading only; R-pattern's shape detection
 # uses the SOURCE union below and is unaffected by the split.
@@ -22,10 +24,9 @@ from dataclasses import dataclass
 # these names for the same call, so matching only the base leaves a function that reads its input
 # through one of them with no recognized source at all. Two boundaries, both real, neither closed
 # here:
-#   * The extractor's Java side (ExportFunctions TOKENIZERS / WRITERS) matches by exact name and
-#     does not recognize them. Its provenance never reads source_class, so these record as
-#     call_return either way; do NOT hand-sync the Java lists from here, that is a scan-side
-#     change with its own re-extract.
+#   * The extractor's name lists (extractor_names.tsv: tokenizers / writers) match by exact name
+#     and do not carry these aliases. Its provenance never reads source_class, so these record as
+#     call_return either way; adding an alias THERE is a scan-side change with its own re-extract.
 #   * reachability/taint keys its buffer- and return-seeding tables on the BASE names only, so an
 #     alias is recognized as a source without seeding taint onto the buffer it fills. That
 #     under-taints, the direction that biases to "unknown" rather than to a claim, but it does
@@ -107,7 +108,15 @@ SOURCE_WEAK: frozenset[str] = frozenset(
 # strength). Keep this equal to the historical SOURCE so R-pattern stays unchanged.
 SOURCE: frozenset[str] = SOURCE_STRONG | SOURCE_WEAK
 
-# String formatters: build a buffer from a format and arguments.
+# String formatters: build a buffer from a format and arguments, or append to one. The _chk forms
+# are the fortified (-D_FORTIFY_SOURCE) entry points a compiler substitutes for the plain calls;
+# they write the same destination and carry an extra object-size argument (copy_size._OBJSIZE_ARG).
+#
+# This set and COPY together partition the extractor's buffer writers (extractor_names.tsv roles
+# writer + writer_fmt): every writer is a copy or a formatter here, except strlcpy / strlcat, which
+# truncate to the destination size they are given and are read only as writers, never as a
+# candidate. The partition itself (copy vs. format/append) is not in the registry, so it is kept
+# here and checked against it rather than derived from it.
 FORMAT: frozenset[str] = frozenset(
     {
         "snprintf",
@@ -116,24 +125,18 @@ FORMAT: frozenset[str] = frozenset(
         "vsprintf",
         "strcat",
         "strncat",
+        "__sprintf_chk",
+        "__snprintf_chk",
+        "__vsprintf_chk",
+        "__vsnprintf_chk",
+        "__strcat_chk",
+        "__strncat_chk",
     }
 )
 
-# Command sinks: hand a string to a shell / new process image.
-CMD: frozenset[str] = frozenset(
-    {
-        "system",
-        "popen",
-        "execl",
-        "execlp",
-        "execle",
-        "execv",
-        "execvp",
-        "execve",
-        # Generic "run a shell command" wrapper, common across embedded code.
-        "doSystem",
-    }
-)
+# Command sinks: hand a string to a shell / new process image. Derived from the extractor registry
+# (role sink_cmd) so the read side and the def-use pass name exactly the same sinks.
+CMD: frozenset[str] = frozenset(REGISTRY.sink_cmd)
 
 # Copies: move bytes into a destination buffer (length-taking or not). memmove has the same
 # (dst, src, n) danger shape as memcpy and is graded on the same write-length axis. mempcpy and
@@ -141,10 +144,9 @@ CMD: frozenset[str] = frozenset(
 # characters — and are graded on the same axis. Every length-taking name here MUST also appear in
 # copy_size._SIZED_COPY, or its write length silently reads as untraced.
 #
-# These are copy SINKS here, but are NOT in the extractor's buffer-writer set (analyze/ghidra
-# WRITERS) that the dominating-writer provenance reads to judge a stack buffer's fill: recognising a
-# new writer is a scan-side change (re-extract), so a buffer filled only by mempcpy/wmemcpy is, to
-# that reader, filled by nothing it knows — a separate, larger change.
+# Every copy here is also a buffer writer in the extractor registry (extractor_names.tsv), so the
+# dominating-writer provenance that judges a stack buffer's fill knows the same copies; the _chk
+# forms are the fortified entry points, with the length (where there is one) in the same position.
 COPY: frozenset[str] = frozenset(
     {
         "strcpy",
@@ -153,6 +155,15 @@ COPY: frozenset[str] = frozenset(
         "memmove",
         "mempcpy",
         "wmemcpy",
+        "stpcpy",
+        "stpncpy",
+        "__memcpy_chk",
+        "__memmove_chk",
+        "__mempcpy_chk",
+        "__strcpy_chk",
+        "__strncpy_chk",
+        "__stpcpy_chk",
+        "__stpncpy_chk",
     }
 )
 
@@ -161,65 +172,24 @@ COPY: frozenset[str] = frozenset(
 # a non-literal format argument is a format-string-injection suspect (%n write, %s/%x read). These
 # do not build a buffer (so they are NOT in FORMAT, the buffer-formatter set) and are not commands.
 # snprintf/sprintf are deliberately excluded — they are buffer formatters handled as copy/overflow.
-FMT_STRING: frozenset[str] = frozenset(
-    {
-        "printf",
-        "vprintf",
-        "fprintf",
-        "vfprintf",
-        "dprintf",
-        "vdprintf",
-        "syslog",
-        "vsyslog",
-        "err",
-        "errx",
-        "verr",
-        "verrx",
-        "warn",
-        "warnx",
-        "vwarn",
-        "vwarnx",
-        "asprintf",
-        "vasprintf",
-    }
-)
+# Derived from the extractor registry (role sink_fmt), the list the def-use pass traces.
+FMT_STRING: frozenset[str] = frozenset(REGISTRY.sink_fmt)
 
 # The format-string argument index for each format-string sink (0-based). MUST be per-sink and
 # correct: fprintf's format is arg1 (arg0 is the FILE*), syslog's is arg1 (arg0 is the log level),
 # printf's is arg0. Blindly reading arg0 would treat a FILE*/level as the format — missing the
 # real sink and mis-judging the safe ones. asprintf/vasprintf write to arg0 (char**) so the format
-# is arg1.
-FMT_STRING_ARG: dict[str, int] = {
-    "printf": 0,
-    "vprintf": 0,
-    "warn": 0,
-    "warnx": 0,
-    "vwarn": 0,
-    "vwarnx": 0,
-    "fprintf": 1,
-    "vfprintf": 1,
-    "dprintf": 1,
-    "vdprintf": 1,
-    "syslog": 1,
-    "vsyslog": 1,
-    "err": 1,
-    "errx": 1,
-    "verr": 1,
-    "verrx": 1,
-    "asprintf": 1,
-    "vasprintf": 1,
-}
+# is arg1. The positions are the registry's sink_fmt key_idx — the argument the def-use pass reads.
+FMT_STRING_ARG: dict[str, int] = dict(REGISTRY.sink_fmt)
 
 # Which argument of a BUFFER formatter is its format string. Distinct from FMT_STRING_ARG above,
 # which is about the printf-family interpreters; these write into a destination instead, and their
 # format sits after it. strcat / strncat are absent because they have no format string at all —
-# absence here means "this callee has none", never "we did not look".
-FORMAT_ARG: dict[str, int] = {
-    "sprintf": 1,  # sprintf(dst, FMT, ...)
-    "vsprintf": 1,  # vsprintf(dst, FMT, ap)
-    "snprintf": 2,  # snprintf(dst, cap, FMT, ...)
-    "vsnprintf": 2,  # vsnprintf(dst, cap, FMT, ap)
-}
+# absence here means "this callee has none", never "we did not look". Derived from the extractor
+# registry (role writer_fmt, fmt_idx): sprintf(dst, FMT, ...) -> 1, snprintf(dst, cap, FMT, ...)
+# -> 2, __sprintf_chk(dst, flag, objsize, FMT, ...) -> 3, __snprintf_chk(dst, cap, flag, objsize,
+# FMT, ...) -> 4.
+FORMAT_ARG: dict[str, int] = dict(REGISTRY.writer_fmt)
 
 # Path / file sinks: a controllable PATH argument enables directory traversal / arbitrary file
 # read / write / delete. Mechanism-only, generic libc/POSIX names (no vendor symbol). The danger

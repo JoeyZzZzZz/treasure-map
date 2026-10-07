@@ -1,0 +1,122 @@
+# Extractor name registry: the single source of every callee-name list the Ghidra extraction
+# pass (ExportFunctions.java) recognises, read by that pass at run time and by the Python read
+# side (lib/pattern/extractor_names.py). Part of the extraction fingerprint (pass_version): any
+# edit here re-extracts every binary on the next scan.
+#
+# Tab-separated. Lines starting with '#' and blank lines are ignored. The first other line is the
+# header and must match exactly. A row has at most as many cells as the header; trailing empty
+# cells may be omitted. Index columns are 0-based argument positions; an empty cell means "not
+# applicable to this role" (read as -1).
+#
+# role       meaning                                                     required columns
+# sink_cmd   command sink; key_idx = the command argument                 key_idx
+# sink_fmt   format-string sink; key_idx = the format argument            key_idx
+# writer     fills a destination buffer (a stack_buf writer)              -
+# writer_fmt printf-family buffer writer; fmt_idx = its format argument  fmt_idx
+# nvram      nvram accessor; op = read/write/commit/getall                op (+ key_idx for read/write)
+# tokenizer  splits a string into tokens                                  -
+# forward_cmd shell-running sink whose first argument IS the command     -
+#
+# nvram columns: key_idx = the key argument (-1 for whole-store ops); name_idx = the name half of a
+# composite prefix+name key (-1 otherwise); val_idx = the written value (-1 for reads and key-only
+# writes); returns_value = true when a read returns the stored VALUE (a value source), false when
+# it returns a predicate about it; empty for write/commit/getall.
+name	role	op	key_idx	name_idx	val_idx	fmt_idx	returns_value	notes
+system	sink_cmd		0
+popen	sink_cmd		0
+execl	sink_cmd		0					program path; argv follows
+execlp	sink_cmd		0					program path; argv follows
+execle	sink_cmd		0					program path; argv follows
+execv	sink_cmd		0					program path; argv vector at arg1
+execvp	sink_cmd		0					program path; argv vector at arg1
+execve	sink_cmd		0					program path; argv vector at arg1
+doSystem	sink_cmd		0					printf-style command template
+printf	sink_fmt		0
+vprintf	sink_fmt		0
+warn	sink_fmt		0
+warnx	sink_fmt		0
+vwarn	sink_fmt		0
+vwarnx	sink_fmt		0
+fprintf	sink_fmt		1					arg0 is the stream
+vfprintf	sink_fmt		1					arg0 is the stream
+dprintf	sink_fmt		1					arg0 is the descriptor
+vdprintf	sink_fmt		1					arg0 is the descriptor
+syslog	sink_fmt		1					arg0 is the priority
+vsyslog	sink_fmt		1					arg0 is the priority
+err	sink_fmt		1					arg0 is the exit status
+errx	sink_fmt		1					arg0 is the exit status
+verr	sink_fmt		1					arg0 is the exit status
+verrx	sink_fmt		1					arg0 is the exit status
+asprintf	sink_fmt		1					arg0 is the char** result
+vasprintf	sink_fmt		1					arg0 is the char** result
+sprintf	writer_fmt					1		sprintf(dst, fmt, ...)
+vsprintf	writer_fmt					1		vsprintf(dst, fmt, ap)
+snprintf	writer_fmt					2		snprintf(dst, cap, fmt, ...)
+vsnprintf	writer_fmt					2		vsnprintf(dst, cap, fmt, ap)
+__sprintf_chk	writer_fmt					3		(dst, flag, objsize, fmt, ...)
+__snprintf_chk	writer_fmt					4		(dst, cap, flag, objsize, fmt, ...)
+__vsprintf_chk	writer_fmt					3		(dst, flag, objsize, fmt, ap)
+__vsnprintf_chk	writer_fmt					4		(dst, cap, flag, objsize, fmt, ap)
+strcpy	writer
+strncpy	writer
+strcat	writer
+strncat	writer
+memcpy	writer
+memmove	writer
+stpcpy	writer
+stpncpy	writer
+mempcpy	writer
+wmemcpy	writer
+strlcpy	writer							writer only: never a copy candidate
+strlcat	writer							writer only: never a copy candidate
+__memcpy_chk	writer							(dst, src, n, objsize)
+__memmove_chk	writer							(dst, src, n, objsize)
+__mempcpy_chk	writer							(dst, src, n, objsize)
+__strcpy_chk	writer							(dst, src, objsize)
+__strncpy_chk	writer							(dst, src, n, objsize)
+__stpcpy_chk	writer							(dst, src, objsize)
+__stpncpy_chk	writer							(dst, src, n, objsize)
+__strcat_chk	writer							(dst, src, objsize)
+__strncat_chk	writer							(dst, src, n, objsize)
+strtok	tokenizer
+strtok_r	tokenizer
+strsep	tokenizer
+sscanf	tokenizer
+system	forward_cmd
+popen	forward_cmd
+doSystem	forward_cmd
+nvram_get	nvram	read	0	-1	-1		true
+nvram_get_int	nvram	read	0	-1	-1		true
+nvram_default_get	nvram	read	0	-1	-1		true
+nvram_contains_word	nvram	read	0	-1	-1		false	predicate
+nvram_get_hex	nvram	read	0	-1	-1		true
+nvram_get_r	nvram	read	0	-1	-1		true
+nvram_split_get	nvram	read	0	-1	-1		true
+wlcsm_nvram_get	nvram	read	0	-1	-1		true
+jffs_nvram_get	nvram	read	0	-1	-1		true
+nvram_is_empty	nvram	read	0	-1	-1		false	predicate
+nvram_valid_get_int	nvram	read	0	-1	-1		true
+nvram_get_bitflag	nvram	read	0	-1	-1		false	predicate
+nvram_get_double	nvram	read	0	-1	-1		true
+nvram_get_file	nvram	read	0	-1	-1		true
+internal_nvram_get_int	nvram	read	0	-1	-1		true
+nvram_bufget	nvram	read	1	-1	-1		true	(index, key)
+nvram_set	nvram	write	0	-1	1
+nvram_set_int	nvram	write	0	-1	1
+nvram_set_hex	nvram	write	0	-1	1
+nvram_restore_var	nvram	write	0	-1	1
+wlcsm_nvram_set	nvram	write	0	-1	1
+jffs_nvram_set	nvram	write	0	-1	1
+nvram_bufset	nvram	write	1	-1	2			(index, key, value)
+nvram_unset	nvram	write	0	-1	-1			key-only write
+jffs_nvram_unset	nvram	write	0	-1	-1			key-only write
+nvram_pf_get	nvram	read	0	1	-1		true	composite key prefix+name
+nvram_pf_get_int	nvram	read	0	1	-1		true	composite key prefix+name
+nvram_pf_match	nvram	read	0	1	-1		false	predicate; composite key
+nvram_pf_set	nvram	write	0	1	2			composite key prefix+name
+nvram_pf_set_int	nvram	write	0	1	2			composite key prefix+name
+nvram_commit	nvram	commit	-1	-1	-1
+nvram_commit_x	nvram	commit	-1	-1	-1
+wlcsm_nvram_commit	nvram	commit	-1	-1	-1
+nvram_getall	nvram	getall	-1	-1	-1
+jffs_nvram_getall	nvram	getall	-1	-1	-1

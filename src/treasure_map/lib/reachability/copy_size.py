@@ -84,10 +84,27 @@ _FORM_NOTE: dict[str, str] = {
 # Copies whose write length is an explicit third argument. mempcpy and wmemcpy also take
 # (dst, src, n); wmemcpy's n counts wide characters, but only the length's SOURCE (const /
 # variable / untraced) is classified here, never its byte magnitude, so the element width does not
-# change the reading. Every length-taking name in classes.COPY must appear here.
-_SIZED_COPY: frozenset[str] = frozenset({"memcpy", "memmove", "strncpy", "mempcpy", "wmemcpy"})
-# Copies with an IMPLICIT length = the source string length (no length argument).
-_UNSIZED_COPY: frozenset[str] = frozenset({"strcpy"})
+# change the reading. Every length-taking name in classes.COPY must appear here. The fortified
+# _chk forms keep the length in the same third position; their extra last argument is the
+# destination's object size (see _OBJSIZE_ARG), never the length.
+_SIZED_COPY: frozenset[str] = frozenset(
+    {
+        "memcpy",
+        "memmove",
+        "strncpy",
+        "mempcpy",
+        "wmemcpy",
+        "stpncpy",
+        "__memcpy_chk",
+        "__memmove_chk",
+        "__mempcpy_chk",
+        "__strncpy_chk",
+        "__stpncpy_chk",
+    }
+)
+# Copies with an IMPLICIT length = the source string length (no length argument): the source is
+# the second argument, as for strcpy.
+_UNSIZED_COPY: frozenset[str] = frozenset({"strcpy", "stpcpy", "__strcpy_chk", "__stpcpy_chk"})
 # Copies whose length is an ELEMENT count, not a byte count. sizeof() yields bytes, so sizeof(dst)
 # as one of these lengths is a unit mismatch (it copies element-width times too many bytes), not a
 # proof the write fits — the opposite of the bound a byte copy's sizeof is.
@@ -105,10 +122,36 @@ _WIDE_ELEMENT_COPY: frozenset[str] = frozenset({"wmemcpy"})
 _CAP_ARG: dict[str, int] = {
     "snprintf": 1,  # snprintf(dst, CAP, fmt, ...)
     "vsnprintf": 1,  # vsnprintf(dst, CAP, fmt, ap)
+    "__snprintf_chk": 1,  # __snprintf_chk(dst, CAP, flag, objsize, fmt, ...)
+    "__vsnprintf_chk": 1,  # __vsnprintf_chk(dst, CAP, flag, objsize, fmt, ap)
 }
 _APPEND_ARG: dict[str, int] = {
     "strncat": 2,  # strncat(dst, src, HOW MUCH TO APPEND)
+    "__strncat_chk": 2,  # __strncat_chk(dst, src, HOW MUCH TO APPEND, objsize)
 }
+
+# The DESTINATION OBJECT SIZE argument of a fortified (_chk) call: the size the compiler knew for
+# the destination, which the C library checks the write against. When the compiler could not tell,
+# it passes (size_t)-1 — printed as 0xffffffff on the 32-bit targets here — and the check is then
+# no check at all. That one value is the only fact read from this argument (see objsize_fact); a
+# concrete number is not turned into a bound, because nothing here proves it is the real capacity.
+_OBJSIZE_ARG: dict[str, int] = {
+    "__sprintf_chk": 2,  # (dst, flag, OBJSIZE, fmt, ...)
+    "__vsprintf_chk": 2,  # (dst, flag, OBJSIZE, fmt, ap)
+    "__snprintf_chk": 3,  # (dst, cap, flag, OBJSIZE, fmt, ...)
+    "__vsnprintf_chk": 3,  # (dst, cap, flag, OBJSIZE, fmt, ap)
+    "__memcpy_chk": 3,  # (dst, src, n, OBJSIZE)
+    "__memmove_chk": 3,  # (dst, src, n, OBJSIZE)
+    "__mempcpy_chk": 3,  # (dst, src, n, OBJSIZE)
+    "__strncpy_chk": 3,  # (dst, src, n, OBJSIZE)
+    "__stpncpy_chk": 3,  # (dst, src, n, OBJSIZE)
+    "__strncat_chk": 3,  # (dst, src, n, OBJSIZE)
+    "__strcpy_chk": 2,  # (dst, src, OBJSIZE)
+    "__stpcpy_chk": 2,  # (dst, src, OBJSIZE)
+    "__strcat_chk": 2,  # (dst, src, OBJSIZE)
+}
+# (size_t)-1 as the decompiler prints it on a 32-bit target: "the compiler did not know".
+_OBJSIZE_UNKNOWN_RE = re.compile(r"^\s*0xffffffff[uUlL]*\s*$")
 
 # String-length callees: a length taken from one is the source's own length (source_len).
 _STRLEN_RE = re.compile(r"\b(?:strlen|strnlen|wcslen)\s*\(")
@@ -245,6 +288,33 @@ def _pointer_guards(pseudocode: str, var: str) -> tuple[str, ...]:
         (rf"\w+\s*\+\s*{v}\s*[<>]=?\s*\w+", "base + v < bound"),
     )
     return tuple(label for pat, label in shapes if re.search(pat, pseudocode))
+
+
+def objsize_fact(
+    pseudocode: str,
+    sink_name: str,
+    *,
+    occurrence: int = 0,
+    stub_names: Mapping[int, str] | None = None,
+) -> dict[str, object] | None:
+    """The destination-object-size fact of a fortified (_chk) call, or None for any other callee.
+
+    ``{"objsize_arg": <the argument text, or None when the call could not be read>,
+    "unbounded": True | None}``. ``unbounded`` is True only when the argument is (size_t)-1
+    (``0xffffffff``): the compiler did not know the destination's size, so the library check this
+    call exists for checks nothing. Any other value — a concrete number, an expression, an
+    unreadable call — is None, NOT False: a number here is what the compiler believed, which this
+    layer does not prove is the destination's real capacity, so it is never turned into a bound.
+
+    A surfaced fact only. It is never read into the size kind, the grade, or the review order."""
+    pos = _OBJSIZE_ARG.get(sink_name)
+    if pos is None:
+        return None
+    args = _call_args(pseudocode, sink_name, occurrence, stub_names)
+    if args is None or pos >= len(args):
+        return {"objsize_arg": None, "unbounded": None}
+    text = args[pos].strip()
+    return {"objsize_arg": text, "unbounded": True if _OBJSIZE_UNKNOWN_RE.match(text) else None}
 
 
 def classify_format_size(

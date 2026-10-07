@@ -57,7 +57,7 @@ where = ["src"]
 # (a pipx/pip install would then fail at analyze/schema time). Editable installs hide
 # this because they run from the source tree. Extend these globs for any new asset.
 [tool.setuptools.package-data]
-"treasure_map.lib.analyze.ghidra" = ["*.java"]
+"treasure_map.lib.analyze.ghidra" = ["*.java", "*.tsv"]
 "treasure_map.lib.diff.ghidra" = ["*.java"]
 "treasure_map.lib.storage" = ["*.sql"]
 

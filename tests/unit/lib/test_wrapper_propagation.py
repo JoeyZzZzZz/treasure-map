@@ -242,3 +242,29 @@ def test_cmd_and_fmt_axes_both_recovered_for_one_function() -> None:
     by_axis = {c.sink_class: c for c in cands}
     assert by_axis["cmd"].wrapped_sink == "system"
     assert by_axis["fmt_string"].wrapped_sink == "printf"
+
+
+# ── a stripped binary: the wrapped sink call is spelled after its lazy-binding stub ───────────
+
+
+def test_a_wrapper_whose_sink_call_is_stub_rendered_is_found_with_the_stub_table() -> None:
+    """In a stripped binary the wrapper body reads `FUN_00412000(param_1)` while its (ingest-
+    relabelled) callee list already says `system`. With the binary's stub table the call is found
+    and the wrapper's callers are recovered; without it the wrapper is not recognised — the gap
+    this table closes. The table is per binary: another binary's table does not apply.
+
+    MUTATION (verified RED): stop passing `stub_names` to is_thin_cmd_wrapper in
+    find_wrapper_propagated_candidates -> no candidate with the table either."""
+    wrapper = _fn(1, "do_cmd", "void do_cmd(char* param_1){ FUN_00412000(param_1); }", ["system"])
+    caller = _fn(
+        2,
+        "set_route",
+        'void set_route(void){ char cmd[128]; snprintf(cmd,128,"route %s",x); do_cmd(cmd); }',
+        ["snprintf", "do_cmd"],
+    )
+    assert find_wrapper_propagated_candidates([wrapper, caller]) == []
+    cands = find_wrapper_propagated_candidates([wrapper, caller], {1: {0x412000: "system"}})
+    assert _names(cands) == {"set_route"}
+    assert cands[0].wrapped_sink == "system"
+    # a table for another binary says nothing about this one
+    assert find_wrapper_propagated_candidates([wrapper, caller], {2: {0x412000: "system"}}) == []

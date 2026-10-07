@@ -36,6 +36,7 @@ controllable input) — this finder stays purely structural and returns the cand
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from treasure_map.lib.diff.loader import FuncRow
@@ -109,7 +110,10 @@ def _axis_candidate(
     )
 
 
-def find_wrapper_propagated_candidates(funcs: list[FuncRow]) -> list[WrapperCandidate]:
+def find_wrapper_propagated_candidates(
+    funcs: list[FuncRow],
+    stub_by_binary: Mapping[int, Mapping[int, str]] | None = None,
+) -> list[WrapperCandidate]:
     """Return the functions, in every binary, whose only sink of a given axis is reached one hop
     through a thin wrapper in the same binary — on BOTH the command and the format-string axis.
     Deterministic (input order is binary, func id; per function the cmd candidate precedes the fmt
@@ -117,7 +121,11 @@ def find_wrapper_propagated_candidates(funcs: list[FuncRow]) -> list[WrapperCand
 
     No binary is skipped by name. A wrapper in a shared library forwards a caller's argument to a
     sink exactly as one in any other binary does, and which project a binary came from is a label
-    for the read side to weigh, not grounds for the recall pass to never look."""
+    for the read side to weigh, not grounds for the recall pass to never look.
+
+    ``stub_by_binary`` (binary_id -> that binary's resolved stub table) lets the command-wrapper
+    test find a sink call rendered as ``FUN_<stub-addr>(…)`` in a stripped binary; without it such
+    a wrapper is not recognised, which is what happened before the table was threaded here."""
     # 1) Per-binary thin-wrapper registries, one per axis: (binary_id, wrapper name) -> sink.
     cmd_wrappers: dict[tuple[int, str], tuple[str, int | None]] = {}
     fmt_wrappers: dict[tuple[int, str], tuple[str, int | None]] = {}
@@ -125,7 +133,8 @@ def find_wrapper_propagated_candidates(funcs: list[FuncRow]) -> list[WrapperCand
         if not f.name or not f.pseudocode:
             continue
         callees = _parse_callees(f.callees)
-        is_cmd, cmd_sink = is_thin_cmd_wrapper(f.pseudocode, callees)
+        stub_names = stub_by_binary.get(f.binary_id) if stub_by_binary else None
+        is_cmd, cmd_sink = is_thin_cmd_wrapper(f.pseudocode, callees, stub_names=stub_names)
         if is_cmd and cmd_sink is not None:
             cmd_wrappers[(f.binary_id, f.name)] = (cmd_sink, None)
         is_fmt, fmt_sink = is_thin_fmt_wrapper(f.pseudocode, callees)

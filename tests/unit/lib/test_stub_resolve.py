@@ -21,11 +21,15 @@ import pytest
 
 from treasure_map.lib.analyze.stub_resolve import (
     _GOT_ENTRY,
+    STUB_MARKER_NONE,
     StubResolution,
     _merge_slot_names,
+    _stub_addr_of,
     global_got_slot_symbol_index,
     relabel_callees,
     resolve_stubs,
+    serialize_stub_table,
+    stub_table_marker,
 )
 
 # The stub resolver's headline case is proven against a REAL extracted MIPS firmware, which is not
@@ -248,3 +252,57 @@ class _Stats:
         self.imports_ingested = 0
         self.exports_ingested = 0
         self.strings_ingested = 0
+
+
+# ── the stub table handed to the extractor, and the marker it must echo ───────────────────────
+
+
+def test_the_stub_table_is_sorted_lowercase_hex_one_entry_per_line() -> None:
+    table = serialize_stub_table({0x4125B0: "system", 0x400010: "memcpy"})
+    assert table == "400010\tmemcpy\n4125b0\tsystem\n"
+    # the address reads back the way a FUN_ callee's does
+    assert all(_stub_addr_of(f"FUN_{line.split(chr(9))[0]}") for line in table.splitlines())
+
+
+def test_a_name_that_would_break_the_line_format_is_left_out_of_table_and_marker() -> None:
+    names = {0x10: "system", 0x20: "bad\tname", 0x30: "also\nbad"}
+    assert serialize_stub_table(names) == "10\tsystem\n"
+    assert stub_table_marker(names) == stub_table_marker({0x10: "system"})
+
+
+def test_the_marker_is_a_content_hash_never_a_count() -> None:
+    """Two different tables of the same size must give different markers — a count would let a JVM
+    that read ANOTHER binary's table pass.
+
+    MUTATION (verified RED): return str(len(names)) from stub_table_marker."""
+    import hashlib
+
+    a = {0x10: "system", 0x20: "popen"}
+    b = {0x10: "system", 0x20: "memcpy"}
+    assert stub_table_marker(a) != stub_table_marker(b)
+    assert stub_table_marker(a) == hashlib.sha256(serialize_stub_table(a).encode()).hexdigest()
+    # no table at all and an empty table are different answers
+    assert stub_table_marker(None) == STUB_MARKER_NONE == "none"
+    assert stub_table_marker({}) != STUB_MARKER_NONE
+
+
+def test_the_extractor_hashes_the_same_normalisation() -> None:
+    """The extractor re-normalises the table it LOADED (sorted by address, lowercase hex, tab, name,
+    newline) and hashes that; the driver's marker is only comparable if both use one form.
+    Source-level: the Java side cannot run in the unit suite."""
+    import re
+    from pathlib import Path
+
+    import treasure_map.lib.analyze.stub_resolve as sr
+
+    java = (Path(sr.__file__).parent / "ghidra" / "ExportFunctions.java").read_text()
+    body = java[java.index("private void loadStubNames(") :]
+    body = body[: body.index("private String stubLookup(")]
+    assert "Collections.sort(addrs);" in body
+    assert re.search(
+        r'norm\.append\(Long\.toHexString\(a\)\)\.append\("\\t"\)\.append\(stubNames\.get\(a\)\)'
+        r'\.append\("\\n"\)',
+        body,
+    )
+    assert 'MessageDigest.getInstance("SHA256")' in body
+    assert 'stubMarker = "none"' in body

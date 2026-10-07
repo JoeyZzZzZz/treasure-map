@@ -135,3 +135,75 @@ def test_only_shell_sink_callers_are_decompiled_twice() -> None:
     gate = body.index("if (!callsShell) continue;")
     decompile = body.index("decomp.decompileFunction")
     assert gate < decompile, "the shell-sink gate must precede the decompile"
+
+
+# ── lazy-binding stubs: recognised internally, never written into the exported callees ────────
+
+
+def _method(src: str, signature: str) -> str:
+    """The text of one method, from its signature to the next private/public method."""
+    start = src.index(signature)
+    rest = src[start + len(signature) :]
+    nxt = re.search(r"\n    (?:private|public|protected)\b", rest)
+    return src[start : start + len(signature) + (nxt.start() if nxt else len(rest))]
+
+
+def test_callee_naming_goes_through_the_stub_table() -> None:
+    """Every lexicon lookup names a call's callee through calleeNameOf; it must resolve a
+    FUN_<stub-addr> callee to the import the stub reaches, or a stripped binary's system() call is
+    no sink at all.
+
+    MUTATION (verified RED): make calleeNameOf return calleeNameOfRaw(call) directly."""
+    src = _source()
+    assert re.search(
+        r"private String calleeNameOf\(PcodeOp call\)\s*\{\s*"
+        r"return stubLookup\(calleeNameOfRaw\(call\)\);",
+        src,
+    )
+    lookup = _method(src, "private String stubLookup(String name)")
+    assert 'name.startsWith("FUN_")' in lookup
+    assert "Long.parseLong(name.substring(4), 16)" in lookup
+
+
+def test_the_wrapper_registry_sees_stub_rendered_shell_sinks_at_both_layers() -> None:
+    """Membership gate: callee names pass through stubLookup before the shell-sink test. Inner
+    location: the wrapped call is found either by name or as FUN_<stub-addr>( for a stub the table
+    resolves to it.
+
+    MUTATION (verified RED): drop the stubLookup in the gate loop."""
+    src = _source()
+    gate = _method(src, "private void buildCmdWrapperRegistry(")
+    assert re.search(
+        r"for \(String c : calleeNamesOf\(func, fm, symtab, listing, refMgr\)\) "
+        r"callees\.add\(stubLookup\(c\)\);",
+        gate,
+    )
+    locate = _method(src, "private String firstArgIdent(")
+    assert "STUB_CALL.matcher(pseudocode)" in locate
+    assert "stubNames.get(Long.parseLong(st.group(1), 16))" in locate
+
+
+def test_the_exported_callees_are_not_rewritten_by_the_stub_table() -> None:
+    """The callees list each function exports is built from resolveCallee, untouched by the table:
+    the ingest relabels it on its own, and a non-stub binary's export stays byte-for-byte."""
+    src = _source()
+    run = src[src.index("public void run()") :]
+    callee_block = run[run.index("PIC intra-.so calls go through PLT stubs") :]
+    callee_block = callee_block[: callee_block.index("resolveCallee(") + 200]
+    assert "stubLookup" not in callee_block
+
+
+def test_call_return_records_constants_by_position() -> None:
+    """A getter whose key is not its first argument needs the position: const_args alone has lost
+    it. The by-position object is additive — const_args / arg_count stay."""
+    body = _method(_source(), "private String callReturn(PcodeOp callDef, String cn)")
+    assert '\\"const_args_by_pos\\":{' in body
+    assert "append(i - 1)" in body
+    assert '\\"const_args\\":[' in body
+    assert '\\"arg_count\\":' in body
+
+
+def test_the_export_header_carries_the_stub_marker() -> None:
+    src = _source()
+    assert re.search(r'pw\.print\("\\"stub_marker\\":\\"" \+ esc\(stubMarker\)', src)
+    assert 'loadStubNames(System.getenv("TMAP_STUB_NAMES"));' in src

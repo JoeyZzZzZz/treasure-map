@@ -14,7 +14,7 @@ import pytest
 from treasure_map.lib.analyze import ghidra_ingest as ingest_mod
 from treasure_map.lib.analyze.elf_inventory import ElfRecord
 from treasure_map.lib.analyze.ghidra_ingest import ingest_ghidra_output
-from treasure_map.lib.analyze.stub_resolve import StubResolution
+from treasure_map.lib.analyze.stub_resolve import StubResolution, stub_table_marker
 from treasure_map.lib.storage.connection import open_db
 
 
@@ -847,10 +847,13 @@ def test_read_but_empty_is_not_the_same_as_not_determined(tmp_path: Path, monkey
 # ── EC3: a JSON written by another extraction pass / for another binary is not ingested ─────────
 
 
-def _marked(sha256: str, pass_version: str) -> dict:  # type: ignore[type-arg]
+def _marked(sha256: str, pass_version: str, stub_marker: str = "none") -> dict:  # type: ignore[type-arg]
+    # stub_marker "none": these records are not MIPS ELFs, so no stub table resolves and the real
+    # extractor, handed none, reports "none".
     return {
         "pass_version": pass_version,
         "sha8": sha256[:8],
+        "stub_marker": stub_marker,
         "binary": "test_bin",
         "functions": [{"name": "main", "address": "0x1000", "pseudocode": "int main(){}"}],
         "imports": [],
@@ -900,3 +903,45 @@ def test_ingest_treats_a_missing_marker_as_stale(tmp_path: Path) -> None:
         conn, out, [_make_record("test_bin", "a" * 64)], sha_to_id, pass_version="facefeedfacefeed"
     )
     assert stats.binaries_stale_json == 1
+
+
+# ── EC3 also checks the stub table the extractor read ─────────────────────────────────────────
+
+
+def test_ingest_checks_the_stub_marker_against_this_binarys_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The extractor echoes the hash of the stub table it loaded. When this binary's table resolves,
+    only that hash is this binary's extraction: "none" (no table read), another table's hash, or
+    no marker at all is another run's output and is skipped as stale.
+
+    MUTATION (verified RED): drop the stub_marker comparison from EC3 -> the mismatching exports
+    are ingested."""
+    resolution = StubResolution(names={0x4125B0: "system"}, regions=())
+    monkeypatch.setattr(ingest_mod, "resolve_stubs", lambda path: resolution)
+    rec = _make_record("test_bin", "a" * 64)
+    good = stub_table_marker(resolution.names)
+    for marker in ("none", stub_table_marker({0x4125B0: "popen"}), None):
+        case = tmp_path / f"bad_{marker}"
+        case.mkdir()
+        conn, sha_to_id = _setup_db(case)
+        out = case / "ghidra_output"
+        data = _marked("a" * 64, "facefeedfacefeed", stub_marker=good)
+        if marker is None:
+            del data["stub_marker"]
+        else:
+            data["stub_marker"] = marker
+        _write_ghidra_json(out, "test_bin", "a" * 64, data)
+        stats = ingest_ghidra_output(conn, out, [rec], sha_to_id, pass_version="facefeedfacefeed")
+        assert stats.binaries_stale_json == 1, marker
+        assert conn.execute("SELECT COUNT(*) FROM functions").fetchone()[0] == 0
+
+    (tmp_path / "good").mkdir()
+    conn, sha_to_id = _setup_db(tmp_path / "good")
+    out = tmp_path / "good" / "ghidra_output"
+    _write_ghidra_json(
+        out, "test_bin", "a" * 64, _marked("a" * 64, "facefeedfacefeed", stub_marker=good)
+    )
+    stats = ingest_ghidra_output(conn, out, [rec], sha_to_id, pass_version="facefeedfacefeed")
+    assert stats.binaries_stale_json == 0
+    assert stats.binaries_processed == 1

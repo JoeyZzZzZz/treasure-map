@@ -52,6 +52,7 @@ from treasure_map.lib.reachability.copy_size import (
     SIZE_UNTRACED,
     classify_copy_size,
     classify_format_size,
+    objsize_fact,
 )
 from treasure_map.lib.reachability.filters import _is_validator_name
 from treasure_map.lib.reachability.taint import (
@@ -292,6 +293,22 @@ def _size_trace_boundary(
     return "two_hop_untraced"
 
 
+def _attach_objsize(
+    out: dict[str, Any],
+    pseudocode: str,
+    sink_name: str,
+    occurrence: int,
+    stub_names: Mapping[int, str] | None,
+) -> None:
+    """Add the fortified call's destination-object-size fact (``objsize``) to a size record.
+
+    Only a _chk sink carries the key; every other record is left exactly as it was. The fact is
+    surfaced, not judged: ``size_kind`` and everything ranked from it are untouched by it."""
+    fact = objsize_fact(pseudocode, sink_name, occurrence=occurrence, stub_names=stub_names)
+    if fact is not None:
+        out["objsize"] = fact
+
+
 def build_size_evidence(
     *,
     pseudocode: str,
@@ -328,7 +345,7 @@ def build_size_evidence(
     else:
         one_hop = []
     anchored = callsite_index is not None
-    return {
+    out: dict[str, Any] = {
         "size_kind": cs.kind,
         "copy_callsite": {
             "sink": sink_name,
@@ -344,6 +361,8 @@ def build_size_evidence(
         },
         "trace_boundary": _size_trace_boundary(pseudocode, cs.kind, cs.size_var, deps),
     }
+    _attach_objsize(out, pseudocode, sink_name, occurrence, stub_names)
+    return out
 
 
 # How much could be said about the FORMAT STRING of a buffer-formatter call. A separate axis from
@@ -414,7 +433,7 @@ def build_format_size_evidence(
     else:
         one_hop = []
     anchored = callsite_index is not None
-    return {
+    out: dict[str, Any] = {
         "size_kind": fs.kind,
         "copy_callsite": {
             "sink": sink_name,
@@ -436,6 +455,8 @@ def build_format_size_evidence(
         },
         "trace_boundary": _size_trace_boundary(pseudocode, fs.kind, fs.size_var, deps),
     }
+    _attach_objsize(out, pseudocode, sink_name, occurrence, stub_names)
+    return out
 
 
 def build_fmtstr_evidence(

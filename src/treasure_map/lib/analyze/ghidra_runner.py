@@ -27,9 +27,15 @@ from pathlib import Path
 from typing import Any
 
 from treasure_map.lib.analyze.elf_inventory import ElfRecord, has_substantial_text
+from treasure_map.lib.analyze.stub_resolve import (
+    resolve_stubs,
+    serialize_stub_table,
+    stub_table_marker,
+)
 from treasure_map.lib.config.config import GhidraConfig
 from treasure_map.lib.errors import GhidraNotFoundError
 from treasure_map.lib.machine import clamp_parallelism_to_memory
+from treasure_map.lib.pattern.extractor_names import validate_registry
 from treasure_map.version import UNKNOWN_VERSION
 
 logger = logging.getLogger(__name__)
@@ -98,18 +104,25 @@ _PIPELINE_PY_MODULES: tuple[str, ...] = ("elf_exports.py", "ghidra_ingest.py", "
 
 
 def pass_version_source_files(script_dir: Path) -> list[Path]:
-    """Every file whose content the pass fingerprint depends on: the .java scripts plus the declared
-    Python extraction modules (which live in the analyze dir, ``script_dir``'s parent).
+    """Every file whose content the pass fingerprint depends on: the .java scripts, the name
+    registry they read at run time (the .tsv beside them), and the declared Python extraction
+    modules (which live in the analyze dir, ``script_dir``'s parent).
 
-    Sorted deterministically — .java by path, then the declared Python modules by name — so the
-    same content always hashes the same, independent of import order or ``sys.modules`` state."""
+    Sorted deterministically — .java by path, then .tsv by path, then the declared Python modules
+    by name — so the same content always hashes the same, independent of import order or
+    ``sys.modules`` state. A per-binary stub table is NOT here: it is written to the output
+    directory, never beside the scripts, so it cannot enter this glob."""
     analyze_dir = script_dir.parent
     try:
         java = sorted(script_dir.glob("*.java"))
     except OSError:
         java = []
+    try:
+        tsv = sorted(script_dir.glob("*.tsv"))
+    except OSError:
+        tsv = []
     py = [analyze_dir / name for name in sorted(_PIPELINE_PY_MODULES)]
-    return java + py
+    return java + tsv + py
 
 
 def compute_pass_version(script_dir: Path) -> str:
@@ -400,28 +413,34 @@ def _patch_elf_for_ghidra(src: Path) -> tuple[Path, Path] | None:
         return None
 
 
-def _probe_function_count(output_file: Path) -> tuple[int | None, str | None, str | None]:
-    """(function count, ``pass_version`` marker, ``sha8`` marker) of a Ghidra output JSON.
+def _probe_function_count(
+    output_file: Path,
+) -> tuple[int | None, str | None, str | None, str | None]:
+    """(function count, ``pass_version`` marker, ``sha8`` marker, ``stub_marker``) of a Ghidra
+    output JSON.
 
     The count is None when the file is missing/unparseable — a hard failure (no usable output); 0
     is a valid parsed-but-empty result the caller judges against the ELF's code presence. The two
     markers are what the extractor wrote about itself (which extraction pass, which binary), None
     when absent; they are what lets a caller tell THIS run's output from a file an earlier run left
-    at the same path. The output files are modest, so a full parse is fine."""
+    at the same path. The stub marker says which stub table the extractor actually read (see
+    ``stub_resolve.stub_table_marker``). The output files are modest, so a full parse is fine."""
     try:
         with output_file.open("r", encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, ValueError):
-        return None, None, None
+        return None, None, None, None
     if not isinstance(data, dict):
-        return None, None, None
+        return None, None, None, None
     funcs = data.get("functions")
     marker_pass = data.get("pass_version")
     marker_sha8 = data.get("sha8")
+    marker_stub = data.get("stub_marker")
     return (
         len(funcs) if isinstance(funcs, list) else None,
         marker_pass if isinstance(marker_pass, str) else None,
         marker_sha8 if isinstance(marker_sha8, str) else None,
+        marker_stub if isinstance(marker_stub, str) else None,
     )
 
 
@@ -430,12 +449,20 @@ def _markers_mismatch(
     marker_sha8: str | None,
     expected_pass: str | None,
     expected_sha8: str | None,
+    marker_stub: str | None = None,
+    expected_stub: str | None = None,
 ) -> bool:
     """True when an output's self-description disagrees with what this run expects. An expected
-    value of None means "do not check that marker"; a missing/empty marker never matches."""
+    value of None means "do not check that marker"; a missing/empty marker never matches.
+
+    The stub marker is a content hash of the stub table the extractor loaded, so a JVM that read
+    another binary's table (or none, when one was meant) is caught here even though its pass and
+    binary markers are right."""
     if expected_pass is not None and (not marker_pass or marker_pass != expected_pass):
         return True
-    return expected_sha8 is not None and (not marker_sha8 or marker_sha8 != expected_sha8)
+    if expected_sha8 is not None and (not marker_sha8 or marker_sha8 != expected_sha8):
+        return True
+    return expected_stub is not None and (not marker_stub or marker_stub != expected_stub)
 
 
 def _classify_analysis(
@@ -443,6 +470,7 @@ def _classify_analysis(
     binary: Path,
     expected_pass: str | None = None,
     expected_sha8: str | None = None,
+    expected_stub: str | None = None,
 ) -> tuple[str, int]:
     """Classify a finished run into (analysis_status, function_count).
 
@@ -460,10 +488,12 @@ def _classify_analysis(
     both; the checks are skipped only when neither is given."""
     if not output_file.exists():
         return "failed", 0
-    count, marker_pass, marker_sha8 = _probe_function_count(output_file)
+    count, marker_pass, marker_sha8, marker_stub = _probe_function_count(output_file)
     if count is None:
         return "failed", 0
-    if _markers_mismatch(marker_pass, marker_sha8, expected_pass, expected_sha8):
+    if _markers_mismatch(
+        marker_pass, marker_sha8, expected_pass, expected_sha8, marker_stub, expected_stub
+    ):
         return "failed", 0
     if count > 0:
         return "ok", count
@@ -685,13 +715,27 @@ class GhidraRunner:
             headless, binary, arch, proj_dir, output_dir, self._script_dir, sha8, timeout
         )
         expected_out = output_dir / f"{binary.name}_{sha8}_ghidra.json"
+        stub_table = output_dir / f"{binary.name}_{sha8}.stubs.tsv"
         # A file left at the target path by an earlier run must never be read as this run's output:
-        # clear it (and its in-flight .tmp) before starting, so the only file present afterwards is
-        # one THIS run wrote. The markers checked below catch every other way a foreign file
-        # appears.
-        for leftover in (expected_out, expected_out.with_name(expected_out.name + ".tmp")):
+        # clear it (and its in-flight .tmp, and an earlier run's stub table) before starting, so the
+        # only files present afterwards are ones THIS run wrote. The markers checked below catch
+        # every other way a foreign file appears.
+        for leftover in (
+            expected_out,
+            expected_out.with_name(expected_out.name + ".tmp"),
+            stub_table,
+        ):
             leftover.unlink(missing_ok=True)
         expected_pass = self.pass_version()
+        # This binary's lazy-binding stubs, resolved from ELF structure and handed to the extractor
+        # so a call it renders as FUN_<stub-addr> is recognised as the import it reaches. None (not
+        # a readable MIPS ELF with dynamic symbols) hands nothing in, and the extractor must then
+        # report "none" — an empty table and no table are different answers.
+        resolution = resolve_stubs(binary)
+        expected_stub = stub_table_marker(None if resolution is None else resolution.names)
+        if resolution is not None:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            stub_table.write_text(serialize_stub_table(resolution.names), encoding="utf-8")
 
         heap_mb, xms_mb = adaptive_heap_mb(binary.stat().st_size)
         env: dict[str, str] = {
@@ -702,6 +746,10 @@ class GhidraRunner:
             "PASS_VERSION": expected_pass,
             "JAVA_TOOL_OPTIONS": f"-Xmx{heap_mb}m -Xms{xms_mb}m -Duser.home={ghidra_home_dir}",
         }
+        # Never inherit a table from the parent environment: this binary's table, or none.
+        env.pop("TMAP_STUB_NAMES", None)
+        if resolution is not None:
+            env["TMAP_STUB_NAMES"] = str(stub_table)
 
         rc = 0
         stderr_raw = ""
@@ -722,16 +770,18 @@ class GhidraRunner:
             reason = "timeout"
         else:
             analysis_status, function_count = _classify_analysis(
-                expected_out, binary, expected_pass, sha8
+                expected_out, binary, expected_pass, sha8, expected_stub
             )
             if analysis_status not in ("ok", "ok_empty"):
                 # failure reason by cause (import_failed is decided by run_ghidra from the log)
                 if not expected_out.exists():
                     reason = "no_output"  # ran but produced no JSON
                 else:
-                    count, marker_pass, marker_sha8 = _probe_function_count(expected_out)
+                    count, marker_pass, marker_sha8, marker_stub = _probe_function_count(
+                        expected_out
+                    )
                     if count is not None and _markers_mismatch(
-                        marker_pass, marker_sha8, expected_pass, sha8
+                        marker_pass, marker_sha8, expected_pass, sha8, marker_stub, expected_stub
                     ):
                         reason = "stale_output"  # a JSON is there, but another pass/binary wrote it
                     else:
@@ -769,6 +819,9 @@ class GhidraRunner:
         immediately rather than N times.
         """
         self.get_headless()  # fail-fast: raise GhidraNotFoundError before any thread work
+        # Same for the name registry every extractor JVM reads: a malformed file stops the scan
+        # here, once and loudly, instead of failing every binary one JVM at a time.
+        validate_registry(self._script_dir / "extractor_names.tsv")
         output_dir.mkdir(parents=True, exist_ok=True)
         base = self._config.headless_timeout_seconds
         n = len(records)

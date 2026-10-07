@@ -9,6 +9,9 @@
 // Environment variables:
 //   OUTPUT_DIR  output directory (default /tmp/ghidra_output)
 //   SHA8        first 8 chars of sha256, used to uniquify the output filename
+//   PASS_VERSION    extraction pass fingerprint, echoed into the output
+//   TMAP_STUB_NAMES optional "<hex addr>\t<name>" table of resolved lazy-binding stubs
+// Name lists come from extractor_names.tsv next to this script (see loadRegistry).
 //
 // No external dependencies - JSON is built manually (no Gson).
 // Tested on Ghidra 11.1.2
@@ -41,44 +44,29 @@ public class ExportFunctions extends GhidraScript {
         "if", "for", "while", "switch", "return", "sizeof", "do", "else", "goto",
         "case", "default", "break", "continue", "typedef", "struct", "union", "enum"));
 
-    // ---- sink_arg_provenance sink lexicon (mirrors lib/pattern/classes.py CMD + FMT_STRING) ----
-    // The "key argument" whose value origin we trace back: command sinks forward arg0 (the command
-    // / path); format-string sinks carry the format string at a per-sink position (FMT_STRING_ARG).
-    // Buffer formatters (snprintf/sprintf) are WRITERS, not provenance sinks. Value = 0-based key
-    // arg index. Extra sinks (firmware-specific wrappers) can be appended via TMAP_EXTRA_SINKS.
-    private static final Map<String, Integer> SINK_KEYARG = new HashMap<>();
-    static {
-        for (String s : new String[]{
-                "system", "popen", "execl", "execlp", "execle", "execv", "execvp", "execve", "doSystem"})
-            SINK_KEYARG.put(s, 0);
-        SINK_KEYARG.put("printf", 0);  SINK_KEYARG.put("vprintf", 0);
-        SINK_KEYARG.put("warn", 0);    SINK_KEYARG.put("warnx", 0);
-        SINK_KEYARG.put("vwarn", 0);   SINK_KEYARG.put("vwarnx", 0);
-        SINK_KEYARG.put("fprintf", 1); SINK_KEYARG.put("vfprintf", 1);
-        SINK_KEYARG.put("dprintf", 1); SINK_KEYARG.put("vdprintf", 1);
-        SINK_KEYARG.put("syslog", 1);  SINK_KEYARG.put("vsyslog", 1);
-        SINK_KEYARG.put("err", 1);     SINK_KEYARG.put("errx", 1);
-        SINK_KEYARG.put("verr", 1);    SINK_KEYARG.put("verrx", 1);
-        SINK_KEYARG.put("asprintf", 1); SINK_KEYARG.put("vasprintf", 1);
-    }
-    // Functions that fill a destination buffer — candidate writers of a stack_buf sink argument.
-    private static final Set<String> WRITERS = new HashSet<>(Arrays.asList(
-        "snprintf", "sprintf", "vsnprintf", "vsprintf", "strcpy", "strncpy", "strcat", "strncat",
-        "memcpy", "memmove", "stpcpy", "__sprintf_chk", "__snprintf_chk"));
-    // Format-string argument index for the printf-family writers (0-based over the callee's args):
-    // sprintf(dst, fmt, ...) → 1; snprintf(dst, n, fmt, ...) → 2; __sprintf_chk(dst, flag, n, fmt) → 3.
-    private static final Map<String, Integer> WRITER_FMTARG = new HashMap<>();
-    static {
-        WRITER_FMTARG.put("sprintf", 1);   WRITER_FMTARG.put("vsprintf", 1);
-        WRITER_FMTARG.put("snprintf", 2);  WRITER_FMTARG.put("vsnprintf", 2);
-        WRITER_FMTARG.put("__sprintf_chk", 3); WRITER_FMTARG.put("__snprintf_chk", 4);
-    }
-    private static final Set<String> TOKENIZERS = new HashSet<>(Arrays.asList(
-        "strtok", "strtok_r", "strsep", "sscanf"));
+    // ---- callee-name lexicon: loaded per program from the extractor registry ----
+    // Every name list below is built by loadRegistry() from extractor_names.tsv, the file that sits
+    // next to this script. The same file is read by the Python side (lib/pattern/extractor_names.py),
+    // so the names this pass recognises and the names the read side reasons about cannot drift apart
+    // the way two hand-kept copies do. The file is part of the extraction fingerprint: editing it
+    // re-extracts every binary. A missing or malformed file aborts the binary (loadRegistry throws)
+    // rather than extracting with an empty lexicon, which would look like "no sinks here".
+    //
+    //   SINK_KEYARG    provenance sinks (command + format-string) -> 0-based key argument. Buffer
+    //                  formatters (snprintf/sprintf) are WRITERS, not provenance sinks. Extra sinks
+    //                  (firmware-specific wrappers) can be appended via TMAP_EXTRA_SINKS.
+    //   WRITERS        functions that fill a destination buffer — candidate writers of a stack_buf
+    //                  sink argument (registry roles writer + writer_fmt).
+    //   WRITER_FMTARG  format-string argument of the printf-family writers (0-based over the
+    //                  callee's args): sprintf(dst, fmt, ...) -> 1; snprintf(dst, n, fmt, ...) -> 2.
+    //   TOKENIZERS     string splitters whose output is a token of their input.
+    private final Map<String, Integer> SINK_KEYARG = new HashMap<>();
+    private final Set<String> WRITERS = new HashSet<>();
+    private final Map<String, Integer> WRITER_FMTARG = new HashMap<>();
+    private final Set<String> TOKENIZERS = new HashSet<>();
     private static final int PROV_MAX_DEPTH = 2;   // vararg / nested-source recursion cap (the provenance design)
 
-    // ---- gap② nvram op lexicon (measured on real firmware: 6 APIs = 98% of calls, + pf family +
-    // long tail; missing one = a missed key = a false negative, so the tail is included). Per API:
+    // ---- gap② nvram op lexicon (registry role nvram). Per API:
     //   op    read / write / commit / getall
     //   keyIdx  0-based arg holding the key (-1 = whole-store op, no key: commit/getall)
     //   nameIdx pf family only — the composite key is prefix(keyIdx)+name(nameIdx); -1 otherwise
@@ -89,29 +77,214 @@ public class ExportFunctions extends GhidraScript {
             this.op = op; this.keyIdx = keyIdx; this.nameIdx = nameIdx; this.valIdx = valIdx;
         }
     }
-    private static final Map<String, NvSpec> NVRAM = new HashMap<>();
-    static {
-        for (String r : new String[]{"nvram_get", "nvram_get_int", "nvram_default_get",
-                "nvram_contains_word", "nvram_get_hex", "nvram_get_r", "nvram_split_get",
-                "wlcsm_nvram_get", "jffs_nvram_get", "nvram_is_empty", "nvram_valid_get_int",
-                "nvram_get_bitflag", "nvram_get_double", "nvram_get_file", "internal_nvram_get_int"})
-            NVRAM.put(r, new NvSpec("read", 0, -1, -1));
-        for (String w : new String[]{"nvram_set", "nvram_set_int", "nvram_set_hex",
-                "nvram_restore_var", "wlcsm_nvram_set", "jffs_nvram_set"})
-            NVRAM.put(w, new NvSpec("write", 0, -1, 1));                 // key=arg0, value=arg1
-        for (String w : new String[]{"nvram_unset", "jffs_nvram_unset"})
-            NVRAM.put(w, new NvSpec("write", 0, -1, -1));                // key-only write (no value)
-        for (String r : new String[]{"nvram_pf_get", "nvram_pf_get_int", "nvram_pf_match"})
-            NVRAM.put(r, new NvSpec("read", 0, 1, -1));                  // composite key prefix+name
-        for (String w : new String[]{"nvram_pf_set", "nvram_pf_set_int"})
-            NVRAM.put(w, new NvSpec("write", 0, 1, 2));                  // prefix+name, value=arg2
-        for (String c : new String[]{"nvram_commit", "nvram_commit_x", "wlcsm_nvram_commit"})
-            NVRAM.put(c, new NvSpec("commit", -1, -1, -1));
-        for (String g : new String[]{"nvram_getall", "jffs_nvram_getall"})
-            NVRAM.put(g, new NvSpec("getall", -1, -1, -1));
+    private final Map<String, NvSpec> NVRAM = new HashMap<>();
+
+    // The registry file's header and roles. Parsed by the same rules as the Python reader
+    // (lib/pattern/extractor_names.py parse_registry): a file one accepts, the other accepts.
+    private static final String REGISTRY_FILE = "extractor_names.tsv";
+    private static final String[] REGISTRY_HEADER = {
+        "name", "role", "op", "key_idx", "name_idx", "val_idx", "fmt_idx", "returns_value", "notes"};
+    private static final Set<String> REGISTRY_ROLES = new HashSet<>(Arrays.asList(
+        "sink_cmd", "sink_fmt", "writer", "writer_fmt", "nvram", "tokenizer", "forward_cmd"));
+    private static final Set<String> NVRAM_OPS = new HashSet<>(Arrays.asList(
+        "read", "write", "commit", "getall"));
+    private static final Pattern REGISTRY_NAME = Pattern.compile("[A-Za-z_][A-Za-z0-9_]*");
+
+    private int registryInt(String cell, String column, int lineno) {
+        if (cell.isEmpty()) return -1;
+        try {
+            return Integer.parseInt(cell);
+        } catch (NumberFormatException e) {
+            throw new IllegalStateException("extractor registry line " + lineno + ": " + column
+                + " must be an integer, got '" + cell + "'");
+        }
     }
 
-    // Per-run sink map = static lexicon + optional TMAP_EXTRA_SINKS (comma-separated, key arg 0).
+    private Boolean registryBool(String cell, int lineno) {
+        if (cell.isEmpty()) return null;
+        if (cell.equals("true")) return Boolean.TRUE;
+        if (cell.equals("false")) return Boolean.FALSE;
+        throw new IllegalStateException("extractor registry line " + lineno
+            + ": returns_value must be true/false/empty, got '" + cell + "'");
+    }
+
+    // Build every name list from the registry next to this script. Throws on any deviation from
+    // the format — the binary then fails loudly instead of being extracted with a partial lexicon.
+    private void loadRegistry() throws IOException {
+        generic.jar.ResourceFile dir = getSourceFile().getParentFile();
+        generic.jar.ResourceFile reg = new generic.jar.ResourceFile(dir, REGISTRY_FILE);
+        if (!reg.exists()) {
+            throw new IllegalStateException("extractor registry not found: " + reg.getAbsolutePath());
+        }
+        SINK_KEYARG.clear(); WRITERS.clear(); WRITER_FMTARG.clear(); TOKENIZERS.clear();
+        NVRAM.clear(); FORWARD_CMD_SINKS.clear(); WRAPPER_BUILDERS.clear();
+        Set<String> seen = new HashSet<>();
+        Map<String, Integer> roleRows = new HashMap<>();
+        boolean headerSeen = false;
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(
+                reg.getInputStream(), "UTF-8"))) {
+            String raw;
+            int lineno = 0;
+            while ((raw = br.readLine()) != null) {
+                lineno++;
+                String stripped = raw.trim();
+                if (stripped.isEmpty() || stripped.startsWith("#")) continue;
+                String[] cells = raw.split("\t", -1);
+                if (!headerSeen) {
+                    if (!Arrays.equals(cells, REGISTRY_HEADER)) {
+                        throw new IllegalStateException("extractor registry line " + lineno
+                            + ": header must be " + Arrays.toString(REGISTRY_HEADER));
+                    }
+                    headerSeen = true;
+                    continue;
+                }
+                if (cells.length > REGISTRY_HEADER.length) {
+                    throw new IllegalStateException("extractor registry line " + lineno + ": "
+                        + cells.length + " cells, at most " + REGISTRY_HEADER.length);
+                }
+                String[] c = Arrays.copyOf(cells, REGISTRY_HEADER.length);
+                for (int i = 0; i < c.length; i++) if (c[i] == null) c[i] = "";
+                String name = c[0], role = c[1], op = c[2];
+                if (!REGISTRY_NAME.matcher(name).matches()) {
+                    throw new IllegalStateException("extractor registry line " + lineno
+                        + ": name '" + name + "' is not an identifier");
+                }
+                if (!REGISTRY_ROLES.contains(role)) {
+                    throw new IllegalStateException("extractor registry line " + lineno
+                        + ": unknown role '" + role + "'");
+                }
+                if (!seen.add(name + "\t" + role)) {
+                    throw new IllegalStateException("extractor registry line " + lineno
+                        + ": duplicate " + role + " row for '" + name + "'");
+                }
+                int keyIdx = registryInt(c[3], "key_idx", lineno);
+                int nameIdx = registryInt(c[4], "name_idx", lineno);
+                int valIdx = registryInt(c[5], "val_idx", lineno);
+                int fmtIdx = registryInt(c[6], "fmt_idx", lineno);
+                Boolean returnsValue = registryBool(c[7], lineno);
+                if (!role.equals("nvram") && (!op.isEmpty() || returnsValue != null)) {
+                    throw new IllegalStateException("extractor registry line " + lineno
+                        + ": op/returns_value apply to nvram rows only");
+                }
+                switch (role) {
+                    case "sink_cmd":
+                    case "sink_fmt":
+                        if (keyIdx < 0) throw new IllegalStateException("extractor registry line "
+                            + lineno + ": " + role + " needs key_idx");
+                        SINK_KEYARG.put(name, keyIdx);
+                        break;
+                    case "writer":
+                        WRITERS.add(name);
+                        break;
+                    case "writer_fmt":
+                        if (fmtIdx < 0) throw new IllegalStateException("extractor registry line "
+                            + lineno + ": writer_fmt needs fmt_idx");
+                        WRITERS.add(name);
+                        WRITER_FMTARG.put(name, fmtIdx);
+                        break;
+                    case "tokenizer":
+                        TOKENIZERS.add(name);
+                        break;
+                    case "forward_cmd":
+                        FORWARD_CMD_SINKS.add(name);
+                        break;
+                    default:   // nvram
+                        if (!NVRAM_OPS.contains(op)) throw new IllegalStateException(
+                            "extractor registry line " + lineno + ": bad nvram op '" + op + "'");
+                        if ((op.equals("read") || op.equals("write")) && keyIdx < 0)
+                            throw new IllegalStateException("extractor registry line " + lineno
+                                + ": nvram " + op + " needs key_idx");
+                        if (op.equals("read") && returnsValue == null)
+                            throw new IllegalStateException("extractor registry line " + lineno
+                                + ": nvram read needs returns_value");
+                        if (!op.equals("read") && returnsValue != null)
+                            throw new IllegalStateException("extractor registry line " + lineno
+                                + ": returns_value applies to nvram reads only");
+                        NVRAM.put(name, new NvSpec(op, keyIdx, nameIdx, valIdx));
+                        break;
+                }
+                roleRows.merge(role, 1, Integer::sum);
+            }
+        }
+        if (!headerSeen) throw new IllegalStateException("extractor registry has no header line");
+        for (String role : REGISTRY_ROLES) {
+            if (!roleRows.containsKey(role)) {
+                throw new IllegalStateException("extractor registry has no rows for role " + role);
+            }
+        }
+        // A value built by any writer is not a verbatim forward of a parameter.
+        WRAPPER_BUILDERS.addAll(WRITERS);
+        println("[ExportFunctions] registry: " + SINK_KEYARG.size() + " sinks, " + WRITERS.size()
+                + " writers, " + NVRAM.size() + " nvram accessors");
+    }
+
+    // ---- lazy-binding stub names (per binary, optional) ----
+    // A stripped MIPS binary calls an import through a PLT stub Ghidra cannot resolve, so the call
+    // decompiles as FUN_<stub-addr>(...) and every lexicon lookup above misses it. The driver
+    // resolves each stub's import name from ELF structure and hands the table in through
+    // TMAP_STUB_NAMES (a "<hex addr>\t<name>" file). It is consulted INTERNALLY only — to name a
+    // call's callee for sink / writer / nvram / wrapper recognition — and never rewrites the
+    // exported callees list, which the ingest relabels on its own.
+    private final Map<Long, String> stubNames = new HashMap<>();
+    // Content hash of the table actually loaded (normalised: sorted by address, "<hex>\t<name>\n"),
+    // echoed into the output so the driver can prove THIS binary's table was the one read. "none"
+    // when no table was handed in — an explicit "not injected", never confused with a read failure,
+    // which throws.
+    private String stubMarker = "none";
+
+    private void loadStubNames(String path) throws IOException {
+        stubNames.clear();
+        stubMarker = "none";
+        if (path == null || path.isEmpty()) return;
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(
+                new FileInputStream(path), "UTF-8"))) {
+            String raw;
+            int lineno = 0;
+            while ((raw = br.readLine()) != null) {
+                lineno++;
+                if (raw.isEmpty()) continue;
+                String[] cells = raw.split("\t", -1);
+                if (cells.length != 2 || cells[1].isEmpty()) {
+                    throw new IllegalStateException("stub table line " + lineno + " malformed");
+                }
+                long addr;
+                try {
+                    addr = Long.parseLong(cells[0], 16);
+                } catch (NumberFormatException e) {
+                    throw new IllegalStateException("stub table line " + lineno + " bad address");
+                }
+                stubNames.put(addr, cells[1]);
+            }
+        }
+        List<Long> addrs = new ArrayList<>(stubNames.keySet());
+        Collections.sort(addrs);
+        StringBuilder norm = new StringBuilder();
+        for (Long a : addrs) norm.append(Long.toHexString(a)).append("\t").append(stubNames.get(a)).append("\n");
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA256");
+            byte[] h = md.digest(norm.toString().getBytes("UTF-8"));
+            StringBuilder hex = new StringBuilder(64);
+            for (byte b : h) hex.append(String.format("%02x", b & 0xff));
+            stubMarker = hex.toString();
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA256 unavailable", e);
+        }
+        println("[ExportFunctions] stub table: " + stubNames.size() + " entries");
+    }
+
+    // A FUN_<hex> name whose address is a resolved stub -> the import it calls; any other name as is.
+    // The address is read as int(hex, 16), the same reading the Python side gives a FUN_ callee.
+    private String stubLookup(String name) {
+        if (name == null || stubNames.isEmpty() || !name.startsWith("FUN_")) return name;
+        try {
+            String hit = stubNames.get(Long.parseLong(name.substring(4), 16));
+            return hit != null ? hit : name;
+        } catch (NumberFormatException e) {
+            return name;
+        }
+    }
+
+    // Per-run sink map = registry lexicon + optional TMAP_EXTRA_SINKS (comma-separated, key arg 0).
     private Map<String, Integer> sinkKeyArg = SINK_KEYARG;
 
     // Escape a string for JSON: handles control chars, quotes, backslashes
@@ -247,8 +420,8 @@ public class ExportFunctions extends GhidraScript {
     // The same helper name genuinely carries different bodies in different binaries here — one
     // `shell_cmd` running system(), another forking — so a name-keyed global (what TMAP_EXTRA_SINKS
     // does, deliberately not reused) would judge one binary's caller against another's body.
-    private static final Set<String> FORWARD_CMD_SINKS =
-        new HashSet<>(Arrays.asList("system", "popen", "doSystem"));
+    // Registry role forward_cmd: shell-running sinks whose first argument IS the command.
+    private final Set<String> FORWARD_CMD_SINKS = new HashSet<>();
     private static final int WRAPPER_MAX_STATEMENTS = 20;   // mirrors lib/hunt/facts.py
     // Caller-supplied placeholders the decompiler emits for a parameter it could not tie to the
     // signature. Recognised as parameters (mirroring the Python side) but NOT indexable, so a
@@ -256,8 +429,6 @@ public class ExportFunctions extends GhidraScript {
     private static final Pattern CALLER_SUPPLIED_RE =
         Pattern.compile("param_\\d+|in_stack_[0-9a-fx]+|unaff_\\w+"
                       + "|in_(?:a[0-3]|v[01]|t\\d|s[0-8]|k[01]|at|gp|sp|fp|ra)");
-    // Builders whose FIRST argument is a destination being written — a value built here is not a
-    // verbatim forward of a parameter.
     // Type / keyword words that are never a parameter NAME (mirrors taint._TYPE_WORDS), so a slot
     // spelling only a type is recorded as unnamed rather than as a parameter called "char".
     private static final Set<String> WRAPPER_TYPE_WORDS = new HashSet<>(Arrays.asList(
@@ -265,9 +436,9 @@ public class ExportFunctions extends GhidraScript {
         "dword", "else", "enum", "float", "for", "goto", "if", "int", "long", "qword", "return",
         "short", "signed", "size_t", "sizeof", "ssize_t", "static", "struct", "switch", "uint",
         "undefined", "union", "unsigned", "void", "while", "word"));
-    private static final Set<String> WRAPPER_BUILDERS = new HashSet<>(Arrays.asList(
-        "snprintf", "sprintf", "vsnprintf", "vsprintf", "strcpy", "strncpy", "strcat", "strncat",
-        "memcpy", "memmove", "stpcpy", "__sprintf_chk", "__snprintf_chk"));
+    // Builders whose FIRST argument is a destination being written — a value built here is not a
+    // verbatim forward of a parameter. Derived from WRITERS when the registry loads.
+    private final Set<String> WRAPPER_BUILDERS = new HashSet<>();
 
     // wrapper function name -> the sink it forwards to ("system" / "popen" / "doSystem")
     private Map<String, String> cmdWrapperSink = new HashMap<>();
@@ -283,14 +454,42 @@ public class ExportFunctions extends GhidraScript {
         return n;
     }
 
-    // The identifier feeding a call's FIRST argument, or null. Mirrors taint.locate_sink_arg.
+    // The identifier feeding a call's FIRST argument, or null. Mirrors taint.locate_sink_arg: the
+    // first call in text order, whether it is spelled `name(` or, in a stripped binary, as
+    // `FUN_<stub-addr>(` for a stub the table resolves to `name` (classes.call_offsets'
+    // stub_names reading).
     private String firstArgIdent(String pseudocode, String calleeName) {
-        Matcher m = Pattern.compile("\\b" + Pattern.quote(calleeName) + "\\s*\\(\\s*([^,)]+)")
-                           .matcher(pseudocode);
-        if (!m.find()) return null;
+        int open = -1;
+        Matcher d = Pattern.compile("\\b" + Pattern.quote(calleeName) + "\\s*\\(").matcher(pseudocode);
+        if (d.find()) open = d.end() - 1;
+        if (!stubNames.isEmpty()) {
+            // A FUN_ hit before the body opens is the function's own declaration, not a call.
+            int declEnd = pseudocode.indexOf('{');
+            Matcher st = STUB_CALL.matcher(pseudocode);
+            while (st.find()) {
+                if (open != -1 && st.start() >= open) break;
+                if (st.end() - 1 < declEnd) continue;
+                String hit;
+                try {
+                    hit = stubNames.get(Long.parseLong(st.group(1), 16));
+                } catch (NumberFormatException e) {
+                    hit = null;
+                }
+                if (calleeName.equals(hit)) {
+                    open = st.end() - 1;
+                    break;
+                }
+            }
+        }
+        if (open == -1) return null;
+        Matcher m = Pattern.compile("\\(\\s*([^,)]+)").matcher(pseudocode);
+        if (!m.find(open) || m.start() != open) return null;
         Matcher id = Pattern.compile("[A-Za-z_][A-Za-z0-9_]*").matcher(m.group(1));
         return id.find() ? id.group(0) : null;
     }
+
+    // A call the decompiler rendered after an unresolved stub's address (classes._STUB_CALL_RE).
+    private static final Pattern STUB_CALL = Pattern.compile("\\bFUN_([0-9a-fA-F]+)\\s*\\(");
 
     // The signature's parameter SLOTS in declaration order; a slot with no name is kept as null.
     //
@@ -419,9 +618,11 @@ public class ExportFunctions extends GhidraScript {
             String name = func.getName();
             if (name == null || name.isEmpty()) continue;
             if (FORWARD_CMD_SINKS.contains(name)) continue;   // the sink itself is not a wrapper
-            Set<String> callees;
+            Set<String> callees = new HashSet<>();
             try {
-                callees = calleeNamesOf(func, fm, symtab, listing, refMgr);
+                // A shell sink reached through an unresolved stub is still a shell sink: the gate
+                // and the wrapper test both see the import name, never the stub's FUN_ name.
+                for (String c : calleeNamesOf(func, fm, symtab, listing, refMgr)) callees.add(stubLookup(c));
             } catch (Exception e) {
                 continue;
             }
@@ -1532,7 +1733,19 @@ public class ExportFunctions extends GhidraScript {
             sb.append("\"").append(esc(val)).append("\"");
             n++;
         }
-        sb.append("],\"arg_count\":").append(argCount);
+        sb.append("],\"const_args_by_pos\":{");
+        // The same constants keyed by their 0-based argument position, so a reader can take the
+        // key of an accessor whose key is not its first argument (nvram_bufget(index, key)) —
+        // const_args alone has lost the positions of the non-constant arguments between them.
+        boolean firstPos = true;
+        for (int i = 1; i < callDef.getNumInputs(); i++) {
+            String val = resolveConst(callDef.getInput(i), 0);
+            if (val == null) continue;
+            if (!firstPos) sb.append(",");
+            sb.append("\"").append(i - 1).append("\":\"").append(esc(val)).append("\"");
+            firstPos = false;
+        }
+        sb.append("},\"arg_count\":").append(argCount);
         // Honesty (never silently drop): const_args lists ONLY the args that resolved to a constant.
         // When some args were non-constant they are absent from const_args, so flag it here — a
         // consumer must never read const_args as the full argument list. e.g. getter(key, param_2)
@@ -1897,8 +2110,14 @@ public class ExportFunctions extends GhidraScript {
         }
     }
 
-    // Resolve a CALL op's target to a callee name (follows thunks); null if not statically known.
+    // Resolve a CALL op's target to a callee name, naming a call through a resolved lazy-binding
+    // stub after the import it reaches (see stubLookup); null if not statically known.
     private String calleeNameOf(PcodeOp call) {
+        return stubLookup(calleeNameOfRaw(call));
+    }
+
+    // Resolve a CALL op's target to a callee name (follows thunks); null if not statically known.
+    private String calleeNameOfRaw(PcodeOp call) {
         Varnode t = call.getInput(0);
         if (t == null) return null;
         Address to = null;
@@ -2058,6 +2277,11 @@ public class ExportFunctions extends GhidraScript {
 
         String binaryName = currentProgram.getName();
         println("[ExportFunctions] start: binary=" + binaryName + " sha8=" + sha8);
+
+        // Every name list, then this binary's stub table, BEFORE any lexicon is consulted. Either
+        // failing throws: the binary is reported failed rather than extracted half-blind.
+        loadRegistry();
+        loadStubNames(System.getenv("TMAP_STUB_NAMES"));
 
         // Init decompiler
         DecompInterface decomp = new DecompInterface();
@@ -2519,6 +2743,9 @@ public class ExportFunctions extends GhidraScript {
             // computed from the file because SHA8 was not set) this output belongs to.
             pw.print("\"pass_version\":\"" + esc(passVersion) + "\",");
             pw.print("\"sha8\":\"" + esc(sha8) + "\",");
+            // Which stub table this run actually read (content hash, or "none" when none was handed
+            // in). The driver and the ingest compare it with the table they meant for this binary.
+            pw.print("\"stub_marker\":\"" + esc(stubMarker) + "\",");
             pw.print("\"functions\":"  + funcsJson   + ",");
             pw.print("\"imports\":"    + importsJson  + ",");
             pw.print("\"exports\":"    + exportsJson  + ",");

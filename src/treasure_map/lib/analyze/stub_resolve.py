@@ -38,7 +38,9 @@ call, when it is left unresolved, is surfaced as an unclassified external call r
 
 from __future__ import annotations
 
+import hashlib
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -250,3 +252,36 @@ def relabel_callees(callees: list[str], resolution: StubResolution) -> RelabelRe
         else:
             out.append(callee)  # an ordinary internal function the map simply did not resolve
     return RelabelResult(callees=out, unresolved_stub_addrs=unresolved)
+
+
+# The marker the extractor echoes when it was handed no stub table at all: "not injected", a value
+# no content hash can take, so it is never confused with a table (or with a table that failed to
+# load — the extractor throws on that instead of writing any output).
+STUB_MARKER_NONE = "none"
+
+
+def _stub_table_entries(names: Mapping[int, str]) -> list[tuple[int, str]]:
+    """The entries a stub table carries, normalised: sorted by address, and only names that cannot
+    break the one-entry-per-line, tab-separated form."""
+    return sorted(
+        (addr, name)
+        for addr, name in names.items()
+        if addr >= 0 and name and "\t" not in name and "\n" not in name and "\r" not in name
+    )
+
+
+def serialize_stub_table(names: Mapping[int, str]) -> str:
+    """The stub table handed to the extractor (TMAP_STUB_NAMES): one ``<hex addr>\\t<name>`` line
+    per resolved stub, sorted by address. The address is written the way ``_stub_addr_of`` reads a
+    ``FUN_`` callee back (lowercase hex, int(hex, 16)), so both sides name a stub by one number."""
+    return "".join(f"{addr:x}\t{name}\n" for addr, name in _stub_table_entries(names))
+
+
+def stub_table_marker(names: Mapping[int, str] | None) -> str:
+    """The marker the extractor must echo for this table: the sha256 of its normalised content
+    (the extractor re-normalises the table it actually loaded and hashes that), or
+    ``STUB_MARKER_NONE`` when no table is handed in. A count is never a marker — two different
+    tables of the same size would pass."""
+    if names is None:
+        return STUB_MARKER_NONE
+    return hashlib.sha256(serialize_stub_table(names).encode("utf-8")).hexdigest()

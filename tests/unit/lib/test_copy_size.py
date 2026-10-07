@@ -338,3 +338,69 @@ def test_a_copy_name_outside_the_sized_table_reads_untraced() -> None:
     MUTATION (must go RED): make the size reader fall through to reading args[2] for any callee."""
     assert "wmemset" not in _SIZED_COPY
     assert classify_copy_size("wmemset(dst, 0, n);", "wmemset").kind == SIZE_UNTRACED
+
+
+# ── fortified (_chk) calls: the length where it always was, plus the object-size fact ────────
+
+
+def test_a_fortified_copy_reads_its_length_not_its_object_size() -> None:
+    """__memcpy_chk(dst, src, n, objsize): the length is still argument 2; the extra last argument
+    is the destination's object size and must never be read as the write length."""
+    pc = "void f(char *d,char *s,int n){ __memcpy_chk(d,s,n,0xffffffff); }"
+    cs = classify_copy_size(pc, "__memcpy_chk")
+    assert cs.kind == SIZE_VARIABLE
+    assert cs.size_var == "n"
+    unsized = classify_copy_size(
+        "void f(char *d,char *s){ __strcpy_chk(d,s,0x40); }", "__strcpy_chk"
+    )
+    assert unsized.kind == SIZE_SOURCE_LEN
+    assert unsized.size_text == "s"
+    assert classify_copy_size("void f(char *d,char *s){ stpcpy(d,s); }", "stpcpy").kind == (
+        SIZE_SOURCE_LEN
+    )
+
+
+def test_fortified_formatters_keep_their_cap_and_append_positions() -> None:
+    """__snprintf_chk / __vsnprintf_chk carry a cap at argument 1 like snprintf; __strncat_chk an
+    append amount at argument 2 like strncat; __sprintf_chk / __strcat_chk have neither. Leaving
+    __vsnprintf_chk out would report "no length parameter" for a call that has one."""
+    snp = 'void f(char *d,int n,char *x){ __snprintf_chk(d,n,1,0xffffffff,"%s",x); }'
+    assert classify_format_size(snp, "__snprintf_chk").kind == SIZE_CAP_VARIABLE
+    vsnp = "void f(char *d,char *x,va_list ap){ __vsnprintf_chk(d,0x40,1,0x40,x,ap); }"
+    assert classify_format_size(vsnp, "__vsnprintf_chk").kind == SIZE_CAP_CONST
+    cat = "void f(char *d,char *s,int k){ __strncat_chk(d,s,k,0xffffffff); }"
+    assert classify_format_size(cat, "__strncat_chk").kind == SIZE_APPEND_VARIABLE
+    spr = 'void f(char *d,char *x){ __sprintf_chk(d,1,0xffffffff,"%s",x); }'
+    assert classify_format_size(spr, "__sprintf_chk").kind == SIZE_NO_BOUND
+
+
+def test_objsize_fact_names_only_the_compiler_did_not_know_case() -> None:
+    """(size_t)-1 means no size check at all: unbounded True. A concrete number is NOT a bound
+    this layer proves, so it is None — never False. Any other callee carries no fact.
+
+    The flag argument sits right before the object size and is a different value here, so a
+    reader off by one position reads the flag and fails.
+
+    MUTATION (verified RED): set _OBJSIZE_ARG["__snprintf_chk"] to 2 (the flag)."""
+    from treasure_map.lib.reachability.copy_size import objsize_fact
+
+    unknown = 'void f(char *d,char *x){ __snprintf_chk(d,0x40,1,0xffffffff,"%s",x); }'
+    assert objsize_fact(unknown, "__snprintf_chk") == {
+        "objsize_arg": "0xffffffff",
+        "unbounded": True,
+    }
+    known = 'void f(char *d,char *x){ __snprintf_chk(d,0x40,1,0x40,"%s",x); }'
+    assert objsize_fact(known, "__snprintf_chk") == {"objsize_arg": "0x40", "unbounded": None}
+    copy = "void f(char *d,char *s){ __strcpy_chk(d,s,0xffffffff); }"
+    assert objsize_fact(copy, "__strcpy_chk") == {"objsize_arg": "0xffffffff", "unbounded": True}
+    assert objsize_fact("void f(){ memcpy(a,b,4); }", "memcpy") is None
+    assert objsize_fact("void f(){ }", "__memcpy_chk") == {"objsize_arg": None, "unbounded": None}
+
+
+def test_objsize_fact_reads_a_stub_rendered_call() -> None:
+    from treasure_map.lib.reachability.copy_size import objsize_fact
+
+    pc = "void f(char *d,char *s,int n){ FUN_00412000(d,s,n,0xffffffff); }"
+    assert objsize_fact(pc, "__memcpy_chk")["objsize_arg"] is None  # type: ignore[index]
+    fact = objsize_fact(pc, "__memcpy_chk", stub_names={0x412000: "__memcpy_chk"})
+    assert fact == {"objsize_arg": "0xffffffff", "unbounded": True}

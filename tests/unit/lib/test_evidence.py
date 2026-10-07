@@ -562,3 +562,36 @@ def test_the_design_rationale_measurements_are_left_alone() -> None:
     assert "written anyway so a future one cannot slip" in triage  # a guard that admits it is idle
     layer0 = (_SRC / "lib/diff/layer0.py").read_text()
     assert "1815/1848" in layer0  # where ALIGN_THRESHOLD came from
+
+
+# ── the fortified-call object-size fact rides on the size record, and only there ──────────────
+
+
+def test_only_a_fortified_call_carries_the_objsize_fact_and_it_never_moves_the_size_kind() -> None:
+    """A _chk copy/formatter record carries ``objsize``; any other record is exactly as before. The
+    fact is surfaced, not judged: the same call with a known object size and with (size_t)-1 gets
+    the same size_kind.
+
+    MUTATION (verified RED): drop the _attach_objsize call from build_size_evidence."""
+    from treasure_map.lib.hunt.evidence import build_format_size_evidence, build_size_evidence
+
+    chk = "void f(char *d,char *s,int n){ __memcpy_chk(d,s,n,0xffffffff); }"
+    known = "void f(char *d,char *s,int n){ __memcpy_chk(d,s,n,0x40); }"
+    ev = build_size_evidence(pseudocode=chk, sink_name="__memcpy_chk", callsite_index=0)
+    assert ev["objsize"] == {"objsize_arg": "0xffffffff", "unbounded": True}
+    ev_known = build_size_evidence(pseudocode=known, sink_name="__memcpy_chk", callsite_index=0)
+    assert ev_known["objsize"]["unbounded"] is None
+    assert ev["size_kind"] == ev_known["size_kind"]
+    plain = build_size_evidence(
+        pseudocode="void f(char *d,char *s,int n){ memcpy(d,s,n); }",
+        sink_name="memcpy",
+        callsite_index=0,
+    )
+    assert "objsize" not in plain
+    fmt = build_format_size_evidence(
+        pseudocode='void f(char *d,char *x){ __sprintf_chk(d,1,0xffffffff,"%s",x); }',
+        sink_name="__sprintf_chk",
+        callsite_index=0,
+    )
+    assert fmt["objsize"]["unbounded"] is True
+    assert fmt["format_string"] == "literal_with_args"

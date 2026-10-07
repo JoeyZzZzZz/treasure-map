@@ -1204,7 +1204,7 @@ def run_analyzer2(
     callers_of = _load_caller_ids(db_path)
     # Factor ① (recall): functions whose only command sink is reached one hop through a thin
     # wrapper — invisible to the shape scan (no command sink among their own callees).
-    wrapper_candidates = find_wrapper_propagated_candidates(all_funcs)
+    wrapper_candidates = find_wrapper_propagated_candidates(all_funcs, stub_by_binary)
     # Ghidra def-use provenance per function (merged into cmd/fmt flow_evidence below). Function-
     # level fact; keyed by func_id. Empty when the analysis.db predates the provenance column.
     # Loaded BEFORE the entry index because the cross-binary launch edges are read out of it and
@@ -1457,7 +1457,9 @@ def run_analyzer2(
                 # sink. Recorded for a later analysis layer to consume; it is NOT read here, by the
                 # form-note downweight, or by the read-side score — recording it changes neither
                 # this candidate's recall nor its review-ordering rank.
-                thin_wrapper, wrapped_sink = is_thin_cmd_wrapper(row.pseudocode, callees)
+                thin_wrapper, wrapped_sink = is_thin_cmd_wrapper(
+                    row.pseudocode, callees, stub_names=stub_names
+                )
 
                 # Structured flow EVIDENCE for command-sink candidates (the partition L3 is about):
                 # source classification, one-hop value flow, sanitizer presence (coverage=unjudged),

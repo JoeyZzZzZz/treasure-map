@@ -25,7 +25,12 @@ from typing import Any
 
 from treasure_map.lib.analyze.elf_exports import dynamic_function_exports
 from treasure_map.lib.analyze.elf_inventory import ElfRecord
-from treasure_map.lib.analyze.stub_resolve import StubResolution, relabel_callees, resolve_stubs
+from treasure_map.lib.analyze.stub_resolve import (
+    StubResolution,
+    relabel_callees,
+    resolve_stubs,
+    stub_table_marker,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,8 +74,10 @@ def ingest_ghidra_output(
         pass_version: the extraction pass this scan ran. When given, every JSON must carry the
             same ``pass_version`` marker and its own binary's ``sha8`` (a missing marker is a
             mismatch); a JSON that does not is another run's output and is skipped (EC3) rather
-            than written over this binary's rows. The scan pipeline always passes it; None skips
-            the check (a caller with no pass to compare against).
+            than written over this binary's rows. The same holds for ``stub_marker``: it must be
+            the hash of THIS binary's resolved stub table, or "none" when none resolves. The scan
+            pipeline always passes it; None skips the checks (a caller with no pass to compare
+            against).
 
     Returns:
         IngestStats summarizing what was written
@@ -109,26 +116,36 @@ def ingest_ghidra_output(
             stats.binaries_malformed_json += 1
             continue
 
-        # EC3: JSON written by another extraction pass or for another binary
+        # Resolve this binary's lazy-binding stubs to their import names from ELF structure, so a
+        # caller left calling FUN_<stub-addr> is seen calling `system` — recovering a real sink the
+        # decompiler dropped. Ghidra-independent; None for a non-MIPS or unreadable ELF (no change).
+        # Resolved before EC3 because the extractor was handed this same table and echoes its hash.
+        resolution = resolve_stubs(rec.path)
+        expected_stub = stub_table_marker(None if resolution is None else resolution.names)
+
+        # EC3: JSON written by another extraction pass or for another binary — or by a run that read
+        # a different stub table than this binary's (the stub marker is a content hash of the table
+        # the extractor actually loaded, so a cross-wired table cannot pass on a matching count).
         if pass_version is not None and (
-            data.get("pass_version") != pass_version or data.get("sha8") != sha8
+            data.get("pass_version") != pass_version
+            or data.get("sha8") != sha8
+            or data.get("stub_marker") != expected_stub
         ):
             logger.warning(
-                "ghidra_ingest: stale JSON for %s (sha8=%s): markers pass=%r sha8=%r, expected %r",
+                "ghidra_ingest: stale JSON for %s (sha8=%s): markers pass=%r sha8=%r stub=%r, "
+                "expected pass=%r stub=%r",
                 rec.name,
                 sha8,
                 data.get("pass_version"),
                 data.get("sha8"),
+                data.get("stub_marker"),
                 pass_version,
+                expected_stub,
             )
             stats.binaries_stale_json += 1
             continue
 
         binary_id = sha_to_id[rec.sha256]
-        # Resolve this binary's lazy-binding stubs to their import names from ELF structure, so a
-        # caller left calling FUN_<stub-addr> is seen calling `system` — recovering a real sink the
-        # decompiler dropped. Ghidra-independent; None for a non-MIPS or unreadable ELF (no change).
-        resolution = resolve_stubs(rec.path)
         # Which functions this binary EXPORTS, read from its dynamic symbol table. It is read from
         # the ELF here rather than taken from the decompiler because the decompiler's flag answers
         # a symbol-namespace question, not an ELF-export one — it measured as a constant 0 across

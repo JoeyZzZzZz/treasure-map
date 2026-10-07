@@ -29,6 +29,7 @@ from typing import Any
 from treasure_map.lib.fmt_spec import arity as fmt_arity
 from treasure_map.lib.fmt_spec import conversions as fmt_conversions
 from treasure_map.lib.pattern.classes import CMD, FMT_STRING
+from treasure_map.lib.pattern.extractor_names import REGISTRY as _EXTRACTOR_NAMES
 from treasure_map.lib.query.nvram import _web_settable
 from treasure_map.lib.query.sink_impact import (
     CONSTRAINED_MARKERS,
@@ -1182,25 +1183,62 @@ def _nvram_wrapper_names(conn: sqlite3.Connection) -> frozenset[str]:
     return frozenset(r[0] for r in rows if r[0])
 
 
-def _nvram_key_from_source(source: Any, wrapper_names: frozenset[str] = frozenset()) -> str | None:
-    """The nvram key if ``source`` is a call_return reading nvram — via a direct getter OR a thin
-    wrapper (``wrapper_names``, from A2) — else None.
+# Every call whose RETURN is an nvram value: the extractor registry's value-returning reads (its
+# predicate reads — "is this key empty", "does it contain this word" — return a yes/no about the
+# value, not the value, and are left out), plus the read-side getter names the extractor's list
+# does not carry. One set, consulted by both readers below, so "is this an nvram read" has one
+# answer for the key and for the origin.
+_NVRAM_VALUE_READERS: frozenset[str] = _EXTRACTOR_NAMES.nvram_value_getters | NVRAM_GETTERS
 
-    The key is the accessor's first constant string argument (``const_args[0]``) — the exact shape
-    the def-use extractor records for ``nvram_get("wan_proto")`` AND for a thin wrapper forwarding a
-    caller-supplied constant key (a real thin forwarder passes that key straight to one nvram
-    accessor, so the wrapper's const_args[0] IS the key — A2's is_thin test is what earns that
-    equivalence; a non-thin function that computes its own key is never in ``wrapper_names``). An
-    accessor with no resolved const key yields None (honest: the key was not recovered), never a
-    fabricated key."""
+
+def _is_nvram_value_read(callee: Any, wrapper_names: frozenset[str]) -> bool:
+    """True when a call_return from ``callee`` carries an nvram VALUE: a value-returning nvram read,
+    or a thin nvram wrapper recognised for this database (``wrapper_names``, from A2)."""
+    return isinstance(callee, str) and (callee in _NVRAM_VALUE_READERS or callee in wrapper_names)
+
+
+def _key_const(value: Any) -> str | None:
+    """A constant argument usable as an nvram key, or None. A bare 0x… is an integer or a pointer
+    the extractor could not read a string from — an index argument, never a key name."""
+    if not isinstance(value, str) or not value or _is_hex_literal(value):
+        return None
+    return value
+
+
+def _nvram_key_from_source(source: Any, wrapper_names: frozenset[str] = frozenset()) -> str | None:
+    """The nvram key if ``source`` is a call_return reading an nvram value — via an accessor the
+    extractor registry knows, a read-side getter name, or a thin wrapper (``wrapper_names``, from
+    A2) — else None.
+
+    For a registry accessor the key is read at the accessor's own key position from
+    ``const_args_by_pos`` (``nvram_bufget(index, key)`` keeps its key in argument 1, so the first
+    constant would be the index). A composite prefix+name accessor (the pf family) yields a key
+    only when BOTH halves are constant, and the two are joined the way the extractor joins them; a
+    non-constant key argument is None — not recovered, never guessed.
+
+    A record with no positions (an extraction that predates them), a thin wrapper, or a read-side
+    getter name takes the first constant argument (``const_args[0]``) — what the extractor recorded
+    for ``nvram_get("wan_proto")``, and what a thin forwarder passes straight through (A2's thin
+    test is what earns that equivalence). A composite accessor without positions is None: its
+    first constant may be the prefix alone. Either way a 0x… constant is never a key."""
     if not isinstance(source, dict) or source.get("kind") != "call_return":
         return None
     callee = source.get("callee")
-    if callee not in NVRAM_GETTERS and callee not in wrapper_names:
+    if not _is_nvram_value_read(callee, wrapper_names):
+        return None
+    spec = _EXTRACTOR_NAMES.nvram.get(callee) if isinstance(callee, str) else None
+    by_pos = source.get("const_args_by_pos")
+    if spec is not None and isinstance(by_pos, dict):
+        key = _key_const(by_pos.get(str(spec.key_idx)))
+        if key is None or spec.name_idx < 0:
+            return key
+        name = _key_const(by_pos.get(str(spec.name_idx)))
+        return None if name is None else key + name
+    if spec is not None and spec.name_idx >= 0:
         return None
     const_args = source.get("const_args")
-    if isinstance(const_args, list) and const_args and isinstance(const_args[0], str):
-        return const_args[0] or None
+    if isinstance(const_args, list) and const_args:
+        return _key_const(const_args[0])
     return None
 
 
@@ -1348,7 +1386,7 @@ def _provenance_origins(
             if not isinstance(source, dict) or source.get("kind") != "call_return":
                 continue
             callee = source.get("callee")
-            if callee in NVRAM_GETTERS or callee in wrapper_names:
+            if _is_nvram_value_read(callee, wrapper_names):
                 key = _nvram_key_from_source(source, wrapper_names)
                 origin = {
                     "axis": "nvram",

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 from pathlib import Path
@@ -19,8 +20,10 @@ from treasure_map.lib.analyze.ghidra_runner import (
     compute_pass_version,
     find_headless,
 )
+from treasure_map.lib.analyze.stub_resolve import StubResolution, stub_table_marker
 from treasure_map.lib.config.config import GhidraConfig, GhidraLocalConfig
 from treasure_map.lib.errors import GhidraNotFoundError
+from treasure_map.lib.pattern.extractor_names import RegistryError
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -36,10 +39,29 @@ def _write_small_elf(path: Path) -> None:
     path.write_bytes(b"\x7fELF" + b"\x00" * 100)
 
 
+def _echoed_stub_marker(env: dict[str, str]) -> str:
+    """The ``stub_marker`` the real extractor writes: the sha256 of the stub table it loaded
+    (re-normalised; for a table the driver serialised that is the file's own content), or "none"
+    when TMAP_STUB_NAMES was not set."""
+    path = env.get("TMAP_STUB_NAMES")
+    if not path:
+        return "none"
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
 def _good_json(env: dict[str, str] | None = None) -> str:
     """Return a >200-byte valid Ghidra output JSON. Given the run's ``env``, it carries the
-    ``pass_version`` / ``sha8`` markers the real extractor echoes back from PASS_VERSION / SHA8."""
-    markers = {} if env is None else {"pass_version": env["PASS_VERSION"], "sha8": env["SHA8"]}
+    ``pass_version`` / ``sha8`` / ``stub_marker`` markers the real extractor echoes back from
+    PASS_VERSION / SHA8 / TMAP_STUB_NAMES."""
+    markers = (
+        {}
+        if env is None
+        else {
+            "pass_version": env["PASS_VERSION"],
+            "sha8": env["SHA8"],
+            "stub_marker": _echoed_stub_marker(env),
+        }
+    )
     return json.dumps(
         markers
         | {
@@ -896,3 +918,126 @@ def test_classify_rejects_a_missing_marker_when_one_is_expected(tmp_path: Path) 
     out.write_text(_good_json())  # no markers
     assert _classify_analysis(out, tmp_path / "b", "feedfacefeedface", "deadbeef") == ("failed", 0)
     assert _classify_analysis(out, tmp_path / "b") == ("ok", 1)  # no expectation -> no check
+
+
+# ── the stub table handed to the extractor, and the marker that proves it was read ────────────
+
+
+def _resolution(names: dict[int, str]) -> StubResolution:
+    return StubResolution(names=names, regions=())
+
+
+def _run_with(
+    tmp_path: Path,
+    resolution: StubResolution | None,
+    echo: Any = _echoed_stub_marker,
+) -> tuple[Any, dict[str, str], Path]:
+    """Run one binary through run_ghidra with a fake extractor that echoes ``echo(env)`` as its stub
+    marker (the real one by default). Returns (result, env it was handed, output dir)."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    binary = tmp_path / "httpd"
+    _write_small_elf(binary)
+    sha8 = "deadbeef"
+    output_dir = tmp_path / "out"
+    seen: dict[str, str] = {}
+
+    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+        seen.update(env)
+        data = json.loads(_good_json(env))
+        data["stub_marker"] = echo(env)
+        out = output_dir / f"httpd_{sha8}_ghidra.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(data))
+        return 0, ""
+
+    runner = _make_runner(tmp_path)
+    with (
+        patch(f"{MODULE}._run_subprocess", fake_sub),
+        patch(f"{MODULE}.resolve_stubs", return_value=resolution),
+    ):
+        result = runner.run_ghidra(
+            binary, output_dir, timeout=60, arch="MIPS:BE:32:default", sha8=sha8
+        )
+    return result, seen, output_dir
+
+
+def test_a_resolved_stub_table_is_written_for_the_binary_and_handed_in(tmp_path: Path) -> None:
+    """The binary's own table, serialised next to its output, path passed in TMAP_STUB_NAMES.
+
+    MUTATION (verified RED): drop the `env["TMAP_STUB_NAMES"] = ...` line -> the extractor echoes
+    "none", the expected marker is the table's hash, the run is refused."""
+    result, env, out = _run_with(tmp_path, _resolution({0x4125B0: "system", 0x400010: "memcpy"}))
+    table = out / "httpd_deadbeef.stubs.tsv"
+    assert result.success is True
+    assert env["TMAP_STUB_NAMES"] == str(table)
+    assert table.read_text() == "400010\tmemcpy\n4125b0\tsystem\n"
+
+
+def test_no_resolution_hands_no_table_even_if_the_environment_carries_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A binary with no resolvable stubs gets no table — and must not inherit one from the parent
+    process, which would be another binary's."""
+    monkeypatch.setenv("TMAP_STUB_NAMES", str(tmp_path / "someone_elses.stubs.tsv"))
+    result, env, out = _run_with(tmp_path, None)
+    assert result.success is True
+    assert "TMAP_STUB_NAMES" not in env
+    assert not (out / "httpd_deadbeef.stubs.tsv").exists()
+
+
+def test_an_output_that_read_the_wrong_stub_table_is_refused(tmp_path: Path) -> None:
+    """A JVM that loaded another binary's table (or none, when one was meant) echoes a different
+    hash; its output is not this binary's extraction, however right its pass and sha8 markers are.
+
+    MUTATION (verified RED): drop the stub check from _markers_mismatch -> both runs succeed."""
+    other = stub_table_marker({0x4125B0: "popen"})
+    result, _, _ = _run_with(tmp_path / "a", _resolution({0x4125B0: "system"}), lambda env: other)
+    assert result.success is False
+    assert result.reason == "stale_output"
+    result, _, _ = _run_with(tmp_path / "b", _resolution({0x4125B0: "system"}), lambda env: "none")
+    assert result.success is False
+    assert result.reason == "stale_output"
+
+
+def test_a_table_where_none_was_meant_is_refused(tmp_path: Path) -> None:
+    result, _, _ = _run_with(tmp_path, None, lambda env: stub_table_marker({0x4125B0: "system"}))
+    assert result.success is False
+    assert result.reason == "stale_output"
+
+
+def test_an_earlier_runs_stub_table_is_cleared_before_the_run(tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    out.mkdir()
+    stale = out / "httpd_deadbeef.stubs.tsv"
+    stale.write_text("4125b0\tsystem\n")
+    result, env, _ = _run_with(tmp_path, None)
+    assert result.success is True
+    assert not stale.exists()
+
+
+def test_run_all_refuses_a_malformed_registry_before_any_jvm(tmp_path: Path) -> None:
+    """A registry the extractor would reject stops the scan once, up front, instead of failing
+    every binary one JVM at a time.
+
+    MUTATION (verified RED): drop the validate_registry call from run_all -> subprocesses start."""
+    script_dir = tmp_path / "ghidra"
+    script_dir.mkdir()
+    (script_dir / "extractor_names.tsv").write_text("not\ta\theader\n")
+    rec = ElfRecord(
+        path=tmp_path / "a",
+        name="a",
+        arch="x86:LE:64:default",
+        elf_type="executable",
+        sha256="a" * 64,
+    )
+    _write_small_elf(rec.path)
+    calls: list[list[str]] = []
+
+    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+        calls.append(cmd)
+        return 1, ""
+
+    runner = GhidraRunner(GhidraConfig(), headless=tmp_path / "hl", script_dir=script_dir)
+    with patch(f"{MODULE}._run_subprocess", fake_sub), pytest.raises(RegistryError):
+        runner.run_all([rec], tmp_path / "out")
+    assert calls == []

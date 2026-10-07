@@ -233,3 +233,35 @@ def test_the_docstring_describes_the_whole_pipeline_not_just_java() -> None:
     assert "stub_resolve" in doc
     assert "pipeline" in doc.lower()
     assert "pyelftools" in doc  # the library-version blind spot is named, not hidden
+
+
+# ── the name registry the extractor reads at run time ─────────────────────────────────────────
+
+
+def test_the_name_registry_is_in_the_fingerprint(tmp_path: Path) -> None:
+    """The extractor builds every name list from the .tsv beside it, so editing that file changes
+    what gets extracted exactly as editing the .java does — it must move pass_version.
+
+    MUTATION (verified RED): drop the `*.tsv` glob from pass_version_source_files -> the two
+    registries hash the same and the TSV is absent from the file list."""
+    d1 = _fake_analyze(tmp_path / "a", java="class X{}", ingest="# i", stub="# s", extra={})
+    (d1 / "extractor_names.tsv").write_text("name\trole\nsystem\tsink_cmd\n")
+    before = compute_pass_version(d1)
+    assert d1 / "extractor_names.tsv" in pass_version_source_files(d1)
+    (d1 / "extractor_names.tsv").write_text("name\trole\nsystem\tsink_cmd\npopen\tsink_cmd\n")
+    assert compute_pass_version(d1) != before
+
+
+def test_the_shipped_registry_is_hashed() -> None:
+    names = {p.name for p in pass_version_source_files(_ANALYZE / "ghidra")}
+    assert "extractor_names.tsv" in names
+
+
+def test_a_stub_table_in_the_output_directory_is_not_hashed(tmp_path: Path) -> None:
+    """A per-binary stub table is written to the OUTPUT directory, never beside the scripts, so it
+    cannot enter the fingerprint and make every binary dirty on every scan."""
+    d1 = _fake_analyze(tmp_path / "a", java="class X{}", ingest="# i", stub="# s", extra={})
+    out = tmp_path / "ghidra_output"
+    out.mkdir()
+    (out / "httpd_deadbeef.stubs.tsv").write_text("412000\tsystem\n")
+    assert all(p.parent != out for p in pass_version_source_files(d1))

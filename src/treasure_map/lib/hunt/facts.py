@@ -24,8 +24,10 @@ miss, and it prefers to stay silent rather than mislabel.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 
-from treasure_map.lib.pattern.classes import COPY, FMT_STRING, FORMAT
+from treasure_map.lib.pattern.classes import FMT_STRING
+from treasure_map.lib.pattern.extractor_names import REGISTRY
 from treasure_map.lib.reachability.taint import (
     _CALLER_SUPPLIED_RE,
     _IDENT_RE,
@@ -39,12 +41,15 @@ from treasure_map.lib.reachability.taint import (
 # excluded on purpose: their first argument is the program path, not the command string, so a
 # parameter in the first slot says nothing about command forwarding (and exec-without-a-shell
 # is inert for shell metacharacters anyway — handled by the no_shell_exec downweight elsewhere).
-_FORWARD_CMD_SINKS: frozenset[str] = frozenset({"system", "popen", "doSystem"})
+# The extractor registry's forward_cmd role — the same set its wrapper registry gates on.
+_FORWARD_CMD_SINKS: frozenset[str] = REGISTRY.forward_cmd
 
 # Buffer-building calls. If the forwarded argument is the destination of one of these, the
 # value was constructed locally (format / concat / copy), so the function is NOT a verbatim
-# forwarder — it builds a command, which is a different (and more interesting) shape.
-_BUILDERS: frozenset[str] = FORMAT | COPY
+# forwarder — it builds a command, which is a different (and more interesting) shape. Every buffer
+# writer the extractor knows (registry roles writer + writer_fmt), the same set the extractor's own
+# wrapper test treats as a builder, so the two recognisers judge one body alike.
+_BUILDERS: frozenset[str] = REGISTRY.writers
 
 # N — a thin wrapper does ~one thing. We bound the function by its non-empty statement count
 # (statements split on ; and block braces). FIXED here (and asserted in the tests). 20 (not the
@@ -161,6 +166,7 @@ def is_thin_cmd_wrapper(
     callees: list[str],
     *,
     max_statements: int = _WRAPPER_MAX_STATEMENTS,
+    stub_names: Mapping[int, str] | None = None,
 ) -> tuple[bool, str | None]:
     """Recognize a thin command-forwarding wrapper. Returns (is_wrapper, wrapped_sink).
 
@@ -169,6 +175,11 @@ def is_thin_cmd_wrapper(
       2. that sink's first argument is one of the function's own parameters (or a decompiler
          caller-supplied placeholder param_N / in_<reg>), forwarded verbatim — not built locally;
       3. the body is thin (<= max_statements non-empty statements).
+
+    ``stub_names`` (a binary's resolved lazy-binding stubs, address -> import) lets step 2 find a
+    sink call the decompiler rendered as ``FUN_<stub-addr>(…)``. The callee list is already
+    relabelled at ingest, so step 1 sees ``system`` either way; without the table the call itself
+    is invisible in the text and the function is (wrongly, but safely) not a wrapper.
 
     Structural fact only: it does NOT assert the forwarded value is attacker-controlled. Returns
     (False, None) under any doubt. See the module docstring."""
@@ -181,7 +192,7 @@ def is_thin_cmd_wrapper(
     if _statement_count(pseudocode) > max_statements:
         return False, None
 
-    arg = locate_sink_arg(pseudocode, wrapped)
+    arg = locate_sink_arg(pseudocode, wrapped, stub_names)
     if arg is None:
         return False, None
 

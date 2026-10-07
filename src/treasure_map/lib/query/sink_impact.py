@@ -76,11 +76,13 @@ def parse_impact_order(spec: str) -> dict[str, int]:
 
 
 # --- nvram controllability combo -------------------------------------------------------------
-# Callees whose return value is an nvram key's stored value. When a sink argument's def-use
-# provenance is a call_return from one of these, the KEY is the getter's first constant string
-# argument (``const_args[0]``); its web-settability (router_defaults) drives the controllability
-# annotation (fact transport). Extend this set as new getters appear; it is a mechanism
-# list, not a verdict.
+# Callees whose return value is an nvram key's stored value, named on the read side. The nvram
+# accessors the extractor itself knows live in its name registry (extractor_names.tsv, role nvram),
+# which also says where each one's key argument is; this set adds getter names that registry does
+# not carry, so they are still read as value sources (triage._NVRAM_VALUE_READERS is the union).
+# For one of these the KEY is the first constant string argument (``const_args[0]``); its
+# web-settability (router_defaults) drives the controllability annotation (fact transport). Extend
+# this set as new getters appear; it is a mechanism list, not a verdict.
 NVRAM_GETTERS: frozenset[str] = frozenset(
     {
         "nvram_get",

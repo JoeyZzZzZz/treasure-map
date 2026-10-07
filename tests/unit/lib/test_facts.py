@@ -351,3 +351,18 @@ def test_triage_reads_the_wrapped_sink_name_only_for_drill_down() -> None:
             ):
                 callers.add(node.name)
     assert callers == {"_wrapper_empty_evidence"}, callers
+
+
+def test_thin_cmd_wrapper_finds_a_stub_rendered_sink_call_with_the_stub_table() -> None:
+    """The callee list names `system`, but the body spells the call after its stub. Only the stub
+    table connects the two; without it the call is invisible and the answer is a safe no."""
+    from treasure_map.lib.hunt.facts import is_thin_cmd_wrapper
+
+    pc = "void do_cmd(char *param_1){ FUN_00412000(param_1); }"
+    assert is_thin_cmd_wrapper(pc, ["system"]) == (False, None)
+    assert is_thin_cmd_wrapper(pc, ["system"], stub_names={0x412000: "system"}) == (
+        True,
+        "system",
+    )
+    # a stub that resolves to something else is not the sink
+    assert is_thin_cmd_wrapper(pc, ["system"], stub_names={0x412000: "memcpy"}) == (False, None)
