@@ -216,6 +216,31 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if dd_cols and "binary" not in dd_cols:
         conn.execute("ALTER TABLE dimension_delta ADD COLUMN binary TEXT")
 
+    # C7 candidate-level columns (added this round): subject_kind='candidate' overlay rows carry
+    # the honest four-state `presence`, the key granularity / match basis, the tier-1 counterpart
+    # classification, the co-claim fold counts, and BOTH sides' generation stamps for a read-time
+    # staleness guard. All nullable TEXT/INTEGER, no index references them, so adding them before
+    # executescript is safe (unlike dimension_delta.binary above, which an index does reference).
+    # Existing edge rows and any pre-C7 atlas carry NULL. Idempotent; each runs only while missing.
+    if dd_cols:
+        for _c7col, _c7type in (
+            ("presence", "TEXT"),
+            ("key_granularity", "TEXT"),
+            ("match_basis", "TEXT"),
+            ("counterpart_call", "TEXT"),
+            ("coclaimed_by", "TEXT"),
+            ("a_n", "INTEGER"),
+            ("b_n", "INTEGER"),
+            ("hunt_commit_a", "TEXT"),
+            ("hunt_commit_b", "TEXT"),
+            ("build_hash_a", "TEXT"),
+            ("build_hash_b", "TEXT"),
+            ("hunt_instances_a", "INTEGER"),
+            ("hunt_instances_b", "INTEGER"),
+        ):
+            if _c7col not in dd_cols:
+                conn.execute(f"ALTER TABLE dimension_delta ADD COLUMN {_c7col} {_c7type}")  # noqa: S608
+
     # overlay.run_id (added this round): which firmware an annotation belongs to. The value was
     # always there, buried in the anchor_ref string; storing it as a column turns "show me this
     # firmware's annotations" into an exact equality match instead of a prefix probe. Nullable, and

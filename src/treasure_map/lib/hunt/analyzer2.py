@@ -65,7 +65,7 @@ from treasure_map.lib.atlas.writer import (
     upsert_pattern,
 )
 from treasure_map.lib.diff.loader import FuncRow, load_functions
-from treasure_map.lib.hunt.bridge import callsite_address_offset
+from treasure_map.lib.hunt.bridge import callsite_addr_out_of_body, callsite_address_offset
 from treasure_map.lib.hunt.downweight import (
     CONST_SINK_ARG,
     detect_form_signal,
@@ -1589,6 +1589,19 @@ def run_analyzer2(
                     # candidate so no reader, and no judgement store, takes it for one call.
                     evidence_keys["callsite_located"] = False
                     evidence_keys["anchor_degraded"] = anchor_degraded
+                    # C7 callsite-address recovery: recover the call address out_of_body drops,
+                    # so the cross-side overlay can fold co-claimed callsites and align by address.
+                    # The ref STAYS the bare class (D4 overlay anchoring is unchanged); the address
+                    # lives only in flow_evidence. None (register-indirect) writes nothing.
+                    callsite_addr = callsite_addr_out_of_body(
+                        row.pseudocode,
+                        sink_name,
+                        match.sink_callsite_occurrence,
+                        row.call_tokens,
+                        stub_names,
+                    )
+                    if callsite_addr is not None:
+                        evidence_keys["callsite_addr"] = callsite_addr
                 evidence_keys.update(extraction_notes.get(row.binary_id, {}))
                 flow_evidence = _with_evidence_keys(flow_evidence, evidence_keys)
                 pattern_id = upsert_pattern(

@@ -173,3 +173,29 @@ def callsite_address_offset(
     return address_offset_at(
         call_tokens_json, body_ranges_json, pc, offsets[occurrence], func_entry
     )
+
+
+def callsite_addr_out_of_body(
+    pseudocode: str | None,
+    sink_name: str | None,
+    occurrence: int | None,
+    call_tokens_json: str | None,
+    stub_names: dict[int, str] | None,
+) -> str | None:
+    """The ABSOLUTE call-instruction address of the ``occurrence``-th call to ``sink_name``, EVEN
+    when it falls outside the function's body ranges.
+
+    ``address_offset_at`` DROPS that address on the ``out_of_body`` degrade (returns only a reason),
+    but C7's co-claim fold / cross-side address alignment need it back. Recovered WITHOUT changing
+    any existing signature (``rekey_d4`` shares ``address_offset_at`` / ``op_addr_at`` and must keep
+    seeing them unchanged). It reuses the SAME enumeration (``call_offsets`` + ``op_addr_at``) as
+    ``callsite_address_offset``, so the address is the very same callsite the detector enumerated.
+    None when no bridge token pins the call (register-indirect, no tokens, occurrence out of range)
+    — the caller then records no address and the candidate stays function-level, never a guess."""
+    if occurrence is None or not sink_name or not bridge_tokens_present(call_tokens_json):
+        return None
+    pc = pseudocode or ""
+    offsets = call_offsets(pc, sink_name, stub_names)
+    if occurrence >= len(offsets):
+        return None
+    return op_addr_at(call_tokens_json, pc, offsets[occurrence])

@@ -304,7 +304,9 @@ def get_diff_deltas(
         "SELECT run_a_id, run_b_id, binary_a, sha256_a, sha256_b FROM diff_meta WHERE diff_id = ?",
         (diff_id,),
     ).fetchone()
-    where = ["diff_id = ?"]
+    # C7 writes subject_kind='candidate' rows into the same table; they are the dedicated
+    # get_diff_sink_overlay tool's domain and must never leak into this edge/dimension view.
+    where = ["diff_id = ?", "subject_kind != 'candidate'"]
     params: list[Any] = [diff_id]
     if binary is not None:
         where.append("binary = ?")

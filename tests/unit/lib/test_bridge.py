@@ -18,6 +18,7 @@ from treasure_map.lib.hunt.bridge import (
     OFFSET_UNPARSEABLE,
     OUT_OF_BODY,
     bridge_tokens_present,
+    callsite_addr_out_of_body,
     callsite_address_offset,
     op_addr_at,
 )
@@ -103,3 +104,25 @@ def test_each_failure_has_its_own_reason() -> None:
     assert run(call_tokens_json=other) == (None, NO_BRIDGE_TOKEN)
     assert run(body_ranges_json=json.dumps([["0x5000", "0x5fff"]])) == (None, OUT_OF_BODY)
     assert run(func_entry="zz") == (None, OFFSET_UNPARSEABLE)
+
+
+def test_callsite_addr_out_of_body_recovers_dropped_address() -> None:
+    """C7 (co-claim fold): out_of_body drops the computed call address (returns only a reason);
+    callsite_addr_out_of_body recovers it via the SAME enumeration. None when no token pins it.
+
+    MUTATION (must go RED): gate it on addr_in_body — then the out_of_body case returns None."""
+    pc = "void f(void) {\n  system(p);\n}\n"
+    at = pc.index("system")
+    tok = json.dumps([_tok("system", at, "0x1010")])
+    out_of_body = json.dumps([["0x5000", "0x5fff"]])  # 0x1010 is NOT in this body
+    # offset path drops it (reason only); the recovery returns the address anyway
+    assert callsite_address_offset(pc, "system", 0, tok, out_of_body, "0x1000", None) == (
+        None,
+        OUT_OF_BODY,
+    )
+    assert callsite_addr_out_of_body(pc, "system", 0, tok, None) == "0x1010"
+    # function-level / no sink / no token pin -> None (never a guess)
+    assert callsite_addr_out_of_body(pc, "system", None, tok, None) is None
+    assert callsite_addr_out_of_body(pc, None, 0, tok, None) is None
+    assert callsite_addr_out_of_body(pc, "system", 0, "[]", None) is None
+    assert callsite_addr_out_of_body(pc, "system", 1, tok, None) is None  # occurrence out of range

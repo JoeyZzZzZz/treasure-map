@@ -4129,7 +4129,9 @@ def test_out_of_body_siblings_share_a_bare_ref_and_both_say_so(tmp_path: Path) -
     degrade to the bare class and so share one ref; each row says ``callsite_located: false`` with
     ``anchor_degraded: out_of_body``, so no reader takes the shared ref for one call.
 
-    MUTATION (must go RED): drop the ``callsite_located`` / ``anchor_degraded`` keys."""
+    MUTATION (must go RED): drop the ``callsite_located`` / ``anchor_degraded`` / ``callsite_addr``
+    keys. The bare ref STAYS shared; the recovered physical ``callsite_addr`` is what the C7 overlay
+    uses to tell the two apart without re-anchoring the ref (overlay judgements hold)."""
     pc = "void Inl(char *a,char *b,int n) {\n  memcpy(a,b,4);\n  memcpy(a,b,n);\n}\n"
     fn = _bridged(
         "Inl", 0x401000, pc, ["memcpy"],
@@ -4142,6 +4144,10 @@ def test_out_of_body_siblings_share_a_bare_ref_and_both_say_so(tmp_path: Path) -
     assert [ref.split("@", 1)[1] for ref, _ in rows] == ["copy", "copy"]
     assert [ev.get("callsite_located") for _, ev in rows] == [False, False]
     assert [ev.get("anchor_degraded") for _, ev in rows] == ["out_of_body", "out_of_body"]
+    # the out_of_body physical address the degrade would drop is recovered into flow_evidence, and
+    # it distinguishes the two shared-ref siblings (what the cross-side overlay folds / aligns on).
+    cas = [ev.get("callsite_addr") for _, ev in rows]
+    assert all(cas) and cas[0] != cas[1]
 
 
 def test_a_binary_whose_extraction_failed_marks_its_candidates_not_current(tmp_path: Path) -> None:

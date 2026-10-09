@@ -42,6 +42,7 @@ _EXPECTED_TOOLS = {
     "get_string_keyed_edges",
     "launched_by",
     "get_diff_deltas",
+    "get_diff_sink_overlay",
     "get_diff_meta",
     "get_function_alignment",
     "get_diff_capabilities",

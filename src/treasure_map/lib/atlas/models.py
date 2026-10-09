@@ -418,6 +418,40 @@ class DimensionDeltaRow:
     capability_ref: str | None = None
     alignment_confidence: float | None = None
     binary: str | None = None  # diff's target binary (short name), parsed from subject_key
+    # ── C7 candidate-level fields (subject_kind='candidate'); all None for edge rows ──
+    # ``presence`` is the authoritative four-state ('added'|'removed'|'persisted'|
+    # 'presence_undetermined'); ``delta_kind`` is its CHECK-safe projection. ``counterpart_call``
+    # under the atlas+BinDiff backend is only 'present_different_callee'|'counterpart_not_candidate'
+    # (the BinExport five-way split is a future backend, never guessed here). ``coclaimed_by`` is a
+    # JSON list. The six generation stamps gate read-time staleness.
+    presence: str | None = None
+    key_granularity: str | None = (
+        None  # 'callsite'|'degraded_out_of_body'|'function_fallback'|'wrapper'
+    )
+    match_basis: str | None = None  # 'instruction'|'function_level'|'ordinal_singleton'
+    counterpart_call: str | None = None
+    coclaimed_by: str | None = None  # JSON list of co-claiming function entries (co-claim fold)
+    a_n: int | None = None
+    b_n: int | None = None
+    hunt_commit_a: str | None = None
+    hunt_commit_b: str | None = None
+    build_hash_a: str | None = None
+    build_hash_b: str | None = None
+    hunt_instances_a: int | None = None
+    hunt_instances_b: int | None = None
+    id: int | None = None
+
+
+@dataclass(frozen=True)
+class InstructionMatchRow:
+    """Mirrors one instruction_match row: ONE BinDiff-matched instruction address pair (A<->B) at a
+    candidate sink callsite. BinDiff pairs by position only -- NO callee is carried here (the table
+    has none); C7 verifies the callee from both sides' candidate records. 1:1 per A address."""
+
+    diff_id: str
+    func_addr_a: str
+    addr_a: str
+    addr_b: str
     id: int | None = None
 
 

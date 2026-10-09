@@ -84,6 +84,7 @@ from treasure_map.lib.query.diff_align import get_diff_deltas as _get_diff_delta
 from treasure_map.lib.query.diff_align import get_diff_meta as _get_diff_meta
 from treasure_map.lib.query.diff_align import list_diff_blindspots as _list_diff_blindspots
 from treasure_map.lib.query.diff_align import list_diffs as _list_diffs
+from treasure_map.lib.query.sink_overlay import compute_sink_overlay as _compute_sink_overlay
 from treasure_map.lib.query.triage import anchor_facts
 from treasure_map.version import installed_commit as _installed_commit
 
@@ -1648,6 +1649,60 @@ def make_tools(
         finally:
             conn.close()
 
+    def get_diff_sink_overlay(
+        diff_id: str,
+        binary: str | None = None,
+        sink_class: str | None = None,
+        presence: str | None = None,
+        min_alignment_confidence: float | None = None,
+    ) -> dict[str, Any]:
+        """Candidate-level SINK OVERLAY (C7 / Layer 0.5): line up the A/B sink candidates of ONE
+        diff (``diff_id`` = ``{run_a}::{run_b}::{binary}``; use list_diffs for ids) and report an
+        honest four-state ``presence`` per candidate — ``added`` / ``removed`` / ``persisted`` /
+        ``presence_undetermined``. EVIDENCE ONLY, never a fix-status verdict.
+
+        ★ ``removed`` is as suspect as a dormant hole: it is emitted ONLY when a whole function is
+        unmatched on the other side with analysis complete. A candidate that merely 'looks gone'
+        inside an aligned function pair is ``presence_undetermined`` — tmap's own decompile can
+        miss-render a real call, so the safe direction is taken. ``presence_undetermined`` is NOT
+        'unchanged': read ``presence_reason`` (callsite_not_exported / crossside_match_degraded
+        / counterpart_not_candidate / present_different_callee / alignment_low_confidence / ... — an
+        enum that may grow; do not branch on it). Under the current atlas+BinDiff backend a matched
+        callsite whose B side has no candidate is ``counterpart_not_candidate`` (the B callee is
+        unreadable here), never a guessed removed. Filter by ``binary`` / ``sink_class`` /
+        ``presence`` / ``min_alignment_confidence``. Each row carries the A/B evidence_ref (the
+        unmatched side is null) for traceback."""
+        conn = open_atlas(atlas_path)
+        try:
+            refusal = _refuse_stale_diff(conn, diff_id)
+            if refusal is not None:
+                return refusal
+            rows = _compute_sink_overlay(
+                conn,
+                diff_id,
+                binary=binary,
+                sink_class=sink_class,
+                presence=presence,
+                min_alignment_confidence=min_alignment_confidence,
+            )
+            return {
+                "diff_id": diff_id,
+                "filters": {
+                    "binary": binary,
+                    "sink_class": sink_class,
+                    "presence": presence,
+                    "min_alignment_confidence": min_alignment_confidence,
+                },
+                "count": len(rows),
+                "rows": [asdict(r) for r in rows],
+                "note": (
+                    "four-state candidate overlay; presence_undetermined is NOT unchanged (read "
+                    "presence_reason); removed/added are function-level; atlas+BinDiff backend."
+                ),
+            }
+        finally:
+            conn.close()
+
     def get_diff_meta(diff_id: str) -> dict[str, Any]:
         """The meta facts of one version diff (``diff_id`` = ``{run_a}::{run_b}::{binary}``, one per
         binary — see list_diffs): binary scope, tool/decompiler versions, alignment + presence.
@@ -2311,6 +2366,7 @@ def make_tools(
         "get_string_keyed_edges": get_string_keyed_edges,
         "launched_by": launched_by,
         "get_diff_deltas": get_diff_deltas,
+        "get_diff_sink_overlay": get_diff_sink_overlay,
         "get_diff_meta": get_diff_meta,
         "get_function_alignment": get_function_alignment,
         "get_diff_capabilities": get_diff_capabilities,

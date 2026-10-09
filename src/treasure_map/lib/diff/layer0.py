@@ -14,6 +14,7 @@ different measurement basis). The parse itself has ZERO dependency on the tool t
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,12 +23,14 @@ from treasure_map.lib.atlas.models import (
     DiffMetaRow,
     FunctionAlignmentRow,
     FunctionPresenceRow,
+    InstructionMatchRow,
     RunRow,
 )
 from treasure_map.lib.atlas.writer import (
     add_diff_meta,
     add_function_alignment,
     add_function_presence,
+    add_instruction_matches,
     delete_diff,
 )
 from treasure_map.lib.binary_id import BinaryRow
@@ -35,6 +38,7 @@ from treasure_map.lib.errors import ConfigError
 from treasure_map.lib.facts import _DECOMPILE_MIN_SIZE
 from treasure_map.lib.hunt.refs import _norm_addr
 from treasure_map.lib.query.runs import get_run
+from treasure_map.lib.query.triage import _callsite_addr
 from treasure_map.version import UNKNOWN_VERSION
 
 # The confidence boundary between an aligned pair and an undetermined one. Owner-set: on the
@@ -125,6 +129,97 @@ def parse_bindiff(
     return AlignmentParse(
         rows=rows, matched_addrs_a=frozenset(a_addrs), matched_addrs_b=frozenset(b_addrs)
     )
+
+
+def _candidate_callsite_addrs(atlas: sqlite3.Connection, run_id: str, sha: str) -> set[str]:
+    """Every sink-candidate CALLSITE address for one run's binary, normalized hex. tier-1 reads it
+    from the ref's addressed suffix; a degraded candidate reads the hunt-side callsite_addr the
+    extractor recovered into flow_evidence (absent before that backfill). Function-level fallbacks
+    and wrappers carry no address and contribute none."""
+    out: set[str] = set()
+    for ref, fe in atlas.execute(
+        "SELECT evidence_ref, flow_evidence FROM instance "
+        "WHERE source_run_id = ? AND binary_content_hash = ?",
+        (run_id, sha),
+    ):
+        if not ref:
+            continue
+        ci = _callsite_addr(ref)
+        if ci is not None:
+            h = norm_hex(ci)
+            if h is not None:
+                out.add(h)
+            continue
+        if fe:
+            try:
+                data = json.loads(fe)
+            except (ValueError, TypeError):
+                data = None
+            ca = data.get("callsite_addr") if isinstance(data, dict) else None
+            if isinstance(ca, str) and ca:
+                h = norm_hex(ca)
+                if h is not None:
+                    out.add(h)
+    return out
+
+
+def parse_instruction_matches(
+    bindiff_path: Path, diff_id: str, candidate_addrs_a: set[str]
+) -> list[InstructionMatchRow]:
+    """The BinDiff instruction matches (address1<->address2) on a run-A candidate callsite.
+
+    BinDiff's instruction table is positional only; it is scoped by basicblock -> function, so the
+    containing A function entry is joined in. Only addresses in ``candidate_addrs_a`` are kept (the
+    fill is small). Matching is 1:1 on the A address. [] when the .BinDiff has no instruction
+    table (an older / hand-made one)."""
+    if not candidate_addrs_a:
+        return []
+    con = sqlite3.connect(f"file:{bindiff_path}?mode=ro", uri=True)
+    try:
+        try:
+            raw = con.execute(
+                "SELECT i.address1, i.address2, f.address1 FROM instruction i "
+                "JOIN basicblock bb ON i.basicblockid = bb.id "
+                "JOIN function f ON bb.functionid = f.id"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+    finally:
+        con.close()
+    out: list[InstructionMatchRow] = []
+    seen: set[str] = set()
+    for a1, a2, fa in raw:
+        addr_a = norm_hex(a1)
+        if addr_a is None or addr_a not in candidate_addrs_a or addr_a in seen:
+            continue
+        addr_b, func_a = norm_hex(a2), norm_hex(fa)
+        if addr_b is None or func_a is None:
+            continue
+        seen.add(addr_a)
+        out.append(
+            InstructionMatchRow(diff_id=diff_id, func_addr_a=func_a, addr_a=addr_a, addr_b=addr_b)
+        )
+    return out
+
+
+def persist_instruction_matches(
+    atlas: sqlite3.Connection,
+    *,
+    bindiff_path: Path,
+    diff_id: str,
+    run_a_id: str,
+    sha_a: str | None,
+    commit: bool = False,
+) -> int:
+    """Parse + store the candidate-callsite instruction matches for one diff (C7's cross-side
+    bridge). Runs in the persist phase while the .BinDiff is still on disk, AFTER run_layer0_parse
+    (whose delete_diff already cleared any prior instruction_match for this diff_id). Joins the
+    caller's transaction (commit=False). A no-op when the binary has no sha or no candidates."""
+    if not sha_a:
+        return 0
+    addrs = _candidate_callsite_addrs(atlas, run_a_id, sha_a)
+    rows = parse_instruction_matches(bindiff_path, diff_id, addrs)
+    return add_instruction_matches(atlas, rows, commit=commit)
 
 
 def _decompile_status(pseudocode: str | None, size_bytes: int | None) -> str:

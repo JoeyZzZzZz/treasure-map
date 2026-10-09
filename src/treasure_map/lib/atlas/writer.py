@@ -20,6 +20,7 @@ from treasure_map.lib.atlas.models import (
     FunctionAlignmentRow,
     FunctionPresenceRow,
     InstanceRow,
+    InstructionMatchRow,
     NvramDefaultRow,
     NvramFlowRow,
     PublicCvePatternRow,
@@ -283,6 +284,7 @@ def delete_diff(conn: sqlite3.Connection, diff_id: str, *, commit: bool = True) 
     ONLY this diff_id across the layer-0 and layer-2 diff tables."""
     conn.execute("DELETE FROM function_alignment WHERE diff_id = ?", (diff_id,))
     conn.execute("DELETE FROM function_presence WHERE diff_id = ?", (diff_id,))
+    conn.execute("DELETE FROM instruction_match WHERE diff_id = ?", (diff_id,))
     conn.execute("DELETE FROM diff_meta WHERE diff_id = ?", (diff_id,))
     conn.execute("DELETE FROM dimension_delta WHERE diff_id = ?", (diff_id,))
     conn.execute("DELETE FROM dimension_capability_state WHERE diff_id = ?", (diff_id,))
@@ -290,11 +292,25 @@ def delete_diff(conn: sqlite3.Connection, diff_id: str, *, commit: bool = True) 
         conn.commit()
 
 
-def delete_dimension_delta(conn: sqlite3.Connection, diff_id: str, *, commit: bool = True) -> None:
-    """Delete a diff's layer-2 rows only (replace-by-diff refresh for a re-run of layer-2 alone,
-    without touching the layer-0 alignment) — touches ONLY this diff_id."""
-    conn.execute("DELETE FROM dimension_delta WHERE diff_id = ?", (diff_id,))
-    conn.execute("DELETE FROM dimension_capability_state WHERE diff_id = ?", (diff_id,))
+def delete_dimension_delta(
+    conn: sqlite3.Connection, diff_id: str, *, subject_kind: str | None = None, commit: bool = True
+) -> None:
+    """Delete a diff's layer-2/C7 rows (replace-by-diff refresh for a re-run without touching the
+    layer-0 alignment) — touches ONLY this diff_id.
+
+    ``subject_kind`` scopes the delete so the two producers never clobber each other's rows:
+    layer-2 passes ``'edge'`` (and still owns dimension_capability_state), C7 passes ``'candidate'``
+    (and must NOT delete capability state, which is layer-2's). ``None`` wipes every subject_kind
+    for a full layer-2+C7 refresh."""
+    sql = "DELETE FROM dimension_delta WHERE diff_id = ?"
+    params: list[str] = [diff_id]
+    if subject_kind is not None:
+        sql += " AND subject_kind = ?"
+        params.append(subject_kind)
+    conn.execute(sql, params)
+    # dimension_capability_state is layer-2's (edge) domain; a candidate-scoped refresh leaves it.
+    if subject_kind in (None, "edge"):
+        conn.execute("DELETE FROM dimension_capability_state WHERE diff_id = ?", (diff_id,))
     if commit:
         conn.commit()
 
@@ -309,8 +325,11 @@ def add_dimension_deltas(
     conn.executemany(
         """INSERT INTO dimension_delta
            (diff_id, dimension, subject_kind, subject_key, binary, state_a, state_b, delta_kind,
-            undetermined_scope, undetermined_reason, capability_ref, alignment_confidence)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            undetermined_scope, undetermined_reason, capability_ref, alignment_confidence,
+            presence, key_granularity, match_basis, counterpart_call, coclaimed_by, a_n, b_n,
+            hunt_commit_a, hunt_commit_b, build_hash_a, build_hash_b, hunt_instances_a,
+            hunt_instances_b)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         [
             (
                 r.diff_id,
@@ -325,9 +344,40 @@ def add_dimension_deltas(
                 r.undetermined_reason,
                 r.capability_ref,
                 r.alignment_confidence,
+                r.presence,
+                r.key_granularity,
+                r.match_basis,
+                r.counterpart_call,
+                r.coclaimed_by,
+                r.a_n,
+                r.b_n,
+                r.hunt_commit_a,
+                r.hunt_commit_b,
+                r.build_hash_a,
+                r.build_hash_b,
+                r.hunt_instances_a,
+                r.hunt_instances_b,
             )
             for r in rows
         ],
+    )
+    if commit:
+        conn.commit()
+    return len(rows)
+
+
+def add_instruction_matches(
+    conn: sqlite3.Connection, rows: list[InstructionMatchRow], *, commit: bool = True
+) -> int:
+    """Insert instruction_match rows (A<->B candidate-callsite address pairs) in one batch; return
+    the count. Positional BinDiff matches only — NO callee is stored (the C7 docstring in the schema
+    explains why). commit=False joins the caller's txn (layer-0 persist)."""
+    if not rows:
+        return 0
+    conn.executemany(
+        "INSERT OR IGNORE INTO instruction_match (diff_id, func_addr_a, addr_a, addr_b) "
+        "VALUES (?, ?, ?, ?)",
+        [(r.diff_id, r.func_addr_a, r.addr_a, r.addr_b) for r in rows],
     )
     if commit:
         conn.commit()

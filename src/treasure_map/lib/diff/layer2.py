@@ -671,7 +671,9 @@ def run_layer2_delta(
         for r in delta_rows
     ]
 
-    delete_dimension_delta(atlas, diff_id, commit=False)
+    # Scope the refresh to this producer's own rows: layer-2 owns 'edge' (and capability state);
+    # C7's 'candidate' rows live in the same table and must survive a layer-2 re-run.
+    delete_dimension_delta(atlas, diff_id, subject_kind="edge", commit=False)
     add_dimension_capability_states(atlas, cap_rows, commit=False)
     add_dimension_deltas(atlas, delta_rows, commit=False)
     if commit:
