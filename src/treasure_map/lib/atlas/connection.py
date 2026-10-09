@@ -216,12 +216,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if dd_cols and "binary" not in dd_cols:
         conn.execute("ALTER TABLE dimension_delta ADD COLUMN binary TEXT")
 
-    # C7 candidate-level columns (added this round): subject_kind='candidate' overlay rows carry
+    # Sink-overlay candidate-level columns: subject_kind='candidate' overlay rows carry
     # the honest four-state `presence`, the key granularity / match basis, the tier-1 counterpart
     # classification, the co-claim fold counts, and BOTH sides' generation stamps for a read-time
     # staleness guard. All nullable TEXT/INTEGER, no index references them, so adding them before
     # executescript is safe (unlike dimension_delta.binary above, which an index does reference).
-    # Existing edge rows and any pre-C7 atlas carry NULL. Idempotent; each runs only while missing.
+    # Existing edge rows and any older atlas carry NULL. Idempotent; each runs only while missing.
     if dd_cols:
         for _c7col, _c7type in (
             ("presence", "TEXT"),

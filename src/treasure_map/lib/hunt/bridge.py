@@ -186,10 +186,11 @@ def callsite_addr_out_of_body(
     when it falls outside the function's body ranges.
 
     ``address_offset_at`` DROPS that address on the ``out_of_body`` degrade (returns only a reason),
-    but C7's co-claim fold / cross-side address alignment need it back. Recovered WITHOUT changing
-    any existing signature (``rekey_d4`` shares ``address_offset_at`` / ``op_addr_at`` and must keep
-    seeing them unchanged). It reuses the SAME enumeration (``call_offsets`` + ``op_addr_at``) as
-    ``callsite_address_offset``, so the address is the very same callsite the detector enumerated.
+    but the sink overlay's co-claim fold / cross-side address alignment need it back. Recovered
+    WITHOUT changing any existing signature (``rekey_d4`` shares ``address_offset_at`` /
+    ``op_addr_at`` and must keep seeing them unchanged). It reuses the SAME enumeration
+    (``call_offsets`` + ``op_addr_at``) as ``callsite_address_offset``, so the address is the very
+    same callsite the detector enumerated.
     None when no bridge token pins the call (register-indirect, no tokens, occurrence out of range)
     — the caller then records no address and the candidate stays function-level, never a guess."""
     if occurrence is None or not sink_name or not bridge_tokens_present(call_tokens_json):

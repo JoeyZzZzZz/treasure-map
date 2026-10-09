@@ -4130,8 +4130,8 @@ def test_out_of_body_siblings_share_a_bare_ref_and_both_say_so(tmp_path: Path) -
     ``anchor_degraded: out_of_body``, so no reader takes the shared ref for one call.
 
     MUTATION (must go RED): drop the ``callsite_located`` / ``anchor_degraded`` / ``callsite_addr``
-    keys. The bare ref STAYS shared; the recovered physical ``callsite_addr`` is what the C7 overlay
-    uses to tell the two apart without re-anchoring the ref (overlay judgements hold)."""
+    keys. The bare ref STAYS shared; the recovered physical ``callsite_addr`` is what the sink
+    overlay uses to tell the two apart without re-anchoring the ref (overlay judgements hold)."""
     pc = "void Inl(char *a,char *b,int n) {\n  memcpy(a,b,4);\n  memcpy(a,b,n);\n}\n"
     fn = _bridged(
         "Inl", 0x401000, pc, ["memcpy"],

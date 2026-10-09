@@ -88,6 +88,9 @@ from treasure_map.lib.query.sink_overlay import compute_sink_overlay as _compute
 from treasure_map.lib.query.sink_overlay import (
     compute_sink_overlay_runs as _compute_sink_overlay_runs,
 )
+from treasure_map.lib.query.sink_overlay import filter_by_reason as _overlay_filter_by_reason
+from treasure_map.lib.query.sink_overlay import page_overlay as _page_overlay
+from treasure_map.lib.query.sink_overlay import summarize_overlay as _summarize_overlay
 from treasure_map.lib.query.triage import anchor_facts
 from treasure_map.version import installed_commit as _installed_commit
 
@@ -1660,17 +1663,35 @@ def make_tools(
         min_alignment_confidence: float | None = None,
         run_a: str | None = None,
         run_b: str | None = None,
+        detail: str = "summary",
+        limit: int = 200,
+        offset: int = 0,
+        reason: str | None = None,
     ) -> dict[str, Any]:
         """Candidate-level SINK OVERLAY (Layer 0.5): line up the A/B sink candidates and report an
         honest four-state ``presence`` per candidate — ``added`` / ``removed`` / ``persisted`` /
         ``presence_undetermined``. EVIDENCE ONLY, never a fix-status verdict.
 
-        Two modes — pass EXACTLY one:
+        Scope — pass EXACTLY one:
           * ``diff_id`` (``{run_a}::{run_b}::{binary}``; use list_diffs for ids): one binary's diff.
           * ``run_a`` + ``run_b``: every diff between the two runs, PLUS every candidate no diff
             covers — a binary with no diff row (``binary_not_diffed``) or one hidden behind a
             same-named, different-content binary that was diffed (``shadowed_by_name_collision``).
-            Those rows carry ``diff_id: null``. Both runs are checked for staleness.
+            Those rows carry ``diff_id: null``. Both runs are checked for staleness. This mode
+            recomputes every diff of the pair, so it takes on the order of ten-plus seconds.
+
+        Response size — ``detail``:
+          * ``"summary"`` (default): NO rows. ``summary`` counts the filtered rows — ``total_rows``,
+            ``by_presence``, ``by_presence_reason`` (keys ``"<presence>|<reason or ->"``),
+            ``by_key_granularity``, ``by_sink_class``, and in run-pair mode ``by_binary``. Start
+            here, then narrow with the filters.
+          * ``"rows"``: one page of rows — ``limit`` (1-2000, default 200) rows from ``offset``
+            (default 0), plus ``total_rows`` and ``next_offset`` (null on the last page). Rows are
+            in a fixed neutral order (diff, binary, granularity, sink class, refs — never by
+            presence or importance), so walking ``offset = next_offset`` until null returns every
+            row exactly once.
+        Row filters (both modes): ``binary`` / ``sink_class`` / ``presence`` /
+        ``min_alignment_confidence``, and ``reason`` (exact ``presence_reason`` match).
 
         ★ ``removed`` / ``added`` are emitted ONLY when a whole function is unmatched on the other
         side with analysis complete. A candidate that merely looks gone or new inside an aligned
@@ -1682,18 +1703,18 @@ def make_tools(
         at the callsite level requires the matched call on the other side to call the SAME sink.
         Each row carries the A/B evidence_ref (the unmatched side is null) for traceback.
 
-        ``coverage`` checks that every candidate of both sides is represented by some row (named as
-        ``a_ref``/``b_ref``, folded into ``coclaimed_by``/``coclaimed_by_b``, or counted in a
-        degraded row's ``a_n``/``b_n``): ``a_total``/``a_represented``, ``b_total``/
-        ``b_represented``, ``excluded_legacy`` (old anchors with no function address, not lined
-        up). ``coverage_violation: true`` means some candidates are missing from the rows —
-        ``unrepresented_refs`` samples them; do not read the rows as complete. Coverage always
-        describes the whole diff / run pair; ``binary`` / ``sink_class`` / ``presence`` /
-        ``min_alignment_confidence`` filter the rows only."""
+        ``coverage`` (both modes) checks that every candidate of both sides is represented by some
+        row (named as ``a_ref``/``b_ref``, folded into ``coclaimed_by``/``coclaimed_by_b``, or
+        counted in a degraded row's ``a_n``/``b_n``): ``a_total``/``a_represented``,
+        ``b_total``/``b_represented``, ``excluded_legacy`` (old anchors with no function address,
+        not lined up). ``coverage_violation: true`` means some candidates are missing from the rows
+        — ``unrepresented_refs`` samples them; do not read the rows as complete. Coverage ALWAYS
+        describes the whole diff / run pair; the filters and paging narrow the rows only."""
         filters = {
             "binary": binary,
             "sink_class": sink_class,
             "presence": presence,
+            "reason": reason,
             "min_alignment_confidence": min_alignment_confidence,
         }
         by_runs = run_a is not None or run_b is not None
@@ -1704,6 +1725,13 @@ def make_tools(
                 "run_a": run_a,
                 "run_b": run_b,
             }
+        if detail not in ("summary", "rows"):
+            return {"error": f"detail must be 'summary' or 'rows', got {detail!r}"}
+        if detail == "rows":
+            if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 2000:
+                return {"error": f"limit must be an integer in 1..2000, got {limit!r}"}
+            if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+                return {"error": f"offset must be an integer >= 0, got {offset!r}"}
         conn = open_atlas(atlas_path)
         try:
             if by_runs:
@@ -1736,17 +1764,37 @@ def make_tools(
                     min_alignment_confidence=min_alignment_confidence,
                 )
                 scope = {"diff_id": diff_id}
-            return {
+            rows = _overlay_filter_by_reason(result.rows, reason)
+            out: dict[str, Any] = {
                 **scope,
                 "filters": filters,
-                "count": len(result.rows),
+                "detail": detail,
                 "coverage": asdict(result.coverage),
-                "rows": [asdict(r) for r in result.rows],
-                "note": (
-                    "four-state candidate overlay; presence_undetermined is NOT unchanged (read "
-                    "presence_reason); removed/added are function-level; atlas+BinDiff backend."
-                ),
             }
+            if detail == "summary":
+                out["summary"] = _summarize_overlay(rows, by_binary=by_runs)
+                out["note"] = (
+                    "counts only; pass detail='rows' with limit/offset to page through the rows "
+                    "(follow next_offset until null). presence_undetermined is NOT unchanged (read "
+                    "presence_reason); removed/added are function-level; coverage is over the "
+                    "whole scope, unaffected by filters."
+                )
+                return out
+            page = _page_overlay(rows, limit=limit, offset=offset)
+            out.update(
+                {
+                    "total_rows": page["total_rows"],
+                    "offset": page["offset"],
+                    "limit": page["limit"],
+                    "next_offset": page["next_offset"],
+                    "rows": [asdict(r) for r in page["rows"]],
+                    "note": (
+                        "one page in a fixed neutral order; presence_undetermined is NOT "
+                        "unchanged (read presence_reason); removed/added are function-level."
+                    ),
+                }
+            )
+            return out
         finally:
             conn.close()
 

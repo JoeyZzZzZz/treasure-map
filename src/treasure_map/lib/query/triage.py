@@ -2124,10 +2124,11 @@ def _dim_source_writability(
     )
 
 
-# The two mandatory reachability caveats (contract C7 note). Kept as constants so the dimension
-# note, the explain view, and the seam tests read one source of truth. Neither ever collapses into
-# state/value — they stay in the note. The standard-flow caveat is the always-true honest note (a
-# textual reference is not a dispatch proof); the completeness caveat names the unmodeled bridge.
+# The two mandatory reachability caveats (the reachability-caveat contract). Kept as constants so
+# the dimension note, the explain view, and the seam tests read one source of truth. Neither ever
+# collapses into state/value — they stay in the note. The standard-flow caveat is the always-true
+# honest note (a textual reference is not a dispatch proof); the completeness caveat names the
+# unmodeled bridge.
 _REACH_CAVEAT_STANDARD_FLOW = (
     "an entry edge references this binary — a rootfs reference or another binary's launch "
     "callsite, NOT proof the input arrives from it; confirm the endpoint/script/caller actually "
@@ -2231,8 +2232,8 @@ def _dim_reachability(
     sound REFERENCES — soundness of the reference, never of the dataflow behind it); unknown for a
     coverage gap. A ? is NEVER 'unreachable' and never sinks.
     The two caveats (standard-flow + completeness) always ride in ``note`` and never collapse into
-    state/value (contract C7). This answers the ENTRY level only — entry->sink flow within a
-    function is a separate, unmodeled question.
+    state/value (the reachability-caveat contract). This answers the ENTRY level only — entry->sink
+    flow within a function is a separate, unmodeled question.
 
     ★ IRON LAW: a string-keyed edge — whether it dispatches straight here (0 hops) or lands one call
     above (1 hop) — is APPENDED to the note as a key lead and mirrored into ``evidence`` as a

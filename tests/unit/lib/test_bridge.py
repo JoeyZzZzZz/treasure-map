@@ -107,8 +107,9 @@ def test_each_failure_has_its_own_reason() -> None:
 
 
 def test_callsite_addr_out_of_body_recovers_dropped_address() -> None:
-    """C7 (co-claim fold): out_of_body drops the computed call address (returns only a reason);
-    callsite_addr_out_of_body recovers it via the SAME enumeration. None when no token pins it.
+    """The overlay's co-claim fold: out_of_body drops the computed call address (returns only a
+    reason); callsite_addr_out_of_body recovers it via the SAME enumeration. None when no token pins
+    it.
 
     MUTATION (must go RED): gate it on addr_in_body — then the out_of_body case returns None."""
     pc = "void f(void) {\n  system(p);\n}\n"

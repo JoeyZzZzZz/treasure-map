@@ -28,6 +28,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Every result carries `coverage`: per-side totals and the number of candidates the rows
     represent. A shortfall is reported as `coverage_violation` with a sample of the missing refs,
     never dropped silently. Old anchors with no function address are counted as `excluded_legacy`.
+- **`get_diff_sink_overlay` returns a summary by default.** The default answer is counts only:
+  per presence, per presence and reason, per key granularity, per sink class, and per binary in
+  run-pair mode. The rows come with `detail="rows"`, one page at a time (`limit`, default 200, up to
+  2000; `offset`; follow `next_offset` until null). Pages use a fixed order by location and
+  anchors, so walking them returns every row once. A new `reason` filter matches `presence_reason`
+  exactly. `coverage` always describes the whole diff or run pair, whatever the filters.
 - **New atlas storage, migrated automatically when an older atlas is opened.** `dimension_delta`
   gains nullable candidate columns: presence, key granularity, match basis, counterpart call,
   co-claimers, folded counts and both sides' generation stamps. A new `instruction_match` table keeps

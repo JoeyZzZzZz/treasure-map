@@ -532,12 +532,12 @@ CREATE TABLE IF NOT EXISTS function_presence (
 );
 CREATE INDEX IF NOT EXISTS idx_fpres ON function_presence(diff_id, side);
 
--- ── layer-0 diff: instruction_match (C7 cross-side callsite bridge) ───────────
+-- ── layer-0 diff: instruction_match (sink-overlay cross-side callsite bridge) ─
 -- BinDiff's instruction table is PURELY positional: it pairs matched instruction addresses
 -- (address1 <-> address2) and carries NO mnemonic / operand / callee. So this table stores only
--- the address pair, scoped by the containing A-side function, and ONLY for addresses that are a
--- candidate sink callsite in run A (the fill is small -- hundreds, not every instruction). C7 reads
--- addr_a -> addr_b, then verifies the callee from BOTH sides' atlas CANDIDATE records; where B has
+-- the address pair, scoped by the containing A-side function, and ONLY for pairs where the A or
+-- the B address (either side) is a candidate sink callsite (the fill is small -- candidate-sized,
+-- not every instruction). The sink overlay reads addr_a <-> addr_b, then verifies the callee from BOTH sides' atlas CANDIDATE records; where B has
 -- no candidate at addr_b the callee is unreadable under the atlas+BinDiff backend and the result is
 -- an honest presence_undetermined (never a guessed removed/persisted). The callee backend is a
 -- SEAM: a future BinExport2-proto reader (backend B) or a tmap-call_tokens materialiser (backend
@@ -678,7 +678,7 @@ CREATE TABLE IF NOT EXISTS dimension_delta (
     undetermined_reason  TEXT,            -- machine-readable label; enum may grow (do not branch on it)
     capability_ref       TEXT,            -- the dimension, when scope='capability'
     alignment_confidence REAL,            -- carried when the delta relied on a function alignment
-    -- ── C7 candidate-level columns (subject_kind='candidate') ───────────────────────────────
+    -- ── sink-overlay candidate-level columns (subject_kind='candidate') ───────────────────────────────
     -- All NULL for layer-2 edge rows. The four-state `presence` is the authoritative candidate
     -- result; `delta_kind` above is only its CHECK-compatible projection (added/removed ->
     -- layer_changed, persisted -> layer_unchanged, presence_undetermined -> delta_undetermined),

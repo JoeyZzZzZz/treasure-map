@@ -63,6 +63,10 @@ their callee list truncated at extraction; a candidate in such a function may re
 ★ GENERATION: ``instruction_match`` is built at diff time from the A/B candidate callsites as they
 were then. A re-hunt that changes a run's candidate set or callsite addresses (a new candidate
 shape, a re-split callsite) must be followed by re-running the affected diffs.
+
+COST: the run-pair computation is not incremental — it recomputes every diff of the pair, which
+takes on the order of ten-plus seconds for a large pair. A large result is read through
+``summarize_overlay`` (counts) and ``page_overlay`` (a stable, ordered page), never in one piece.
 """
 
 from __future__ import annotations
@@ -986,6 +990,70 @@ def _filter(
             if r.alignment_confidence is not None and r.alignment_confidence >= min_conf
         ]
     return out
+
+
+# ── reading a large result: reason filter, counts, stable pages ──────────────────────────
+
+
+def filter_by_reason(rows: list[SinkOverlayRow], reason: str | None) -> list[SinkOverlayRow]:
+    """Rows whose ``presence_reason`` equals ``reason``; all rows when ``reason`` is None."""
+    if reason is None:
+        return rows
+    return [r for r in rows if r.presence_reason == reason]
+
+
+def _row_order_key(r: SinkOverlayRow) -> tuple[str, str, str, str, str, str]:
+    """A neutral, total-enough order for paging: by location and anchors only — never by presence
+    or any notion of importance (the overlay is a map, not a ranking). Ties keep the compute order,
+    which is itself deterministic, so the order is stable across calls."""
+    return (
+        r.diff_id or "",
+        r.binary or "",
+        r.key_granularity,
+        r.sink_class,
+        r.a_ref or "",
+        r.b_ref or "",
+    )
+
+
+def summarize_overlay(rows: list[SinkOverlayRow], *, by_binary: bool) -> dict[str, Any]:
+    """Counts over ``rows`` (already filtered): total, and per presence, presence|reason, key
+    granularity and sink class; per binary too when ``by_binary`` (run-pair mode, where a row's
+    binary varies; a row with none counts under ``(none)``). Counts only — nothing is truncated."""
+
+    def count(keys: list[str]) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for k in keys:
+            out[k] = out.get(k, 0) + 1
+        return dict(sorted(out.items()))
+
+    summary: dict[str, Any] = {
+        "total_rows": len(rows),
+        "by_presence": count([r.presence for r in rows]),
+        "by_presence_reason": count([f"{r.presence}|{r.presence_reason or '-'}" for r in rows]),
+        "by_key_granularity": count([r.key_granularity for r in rows]),
+        "by_sink_class": count([r.sink_class for r in rows]),
+    }
+    if by_binary:
+        summary["by_binary"] = count([r.binary or "(none)" for r in rows])
+    return summary
+
+
+def page_overlay(rows: list[SinkOverlayRow], *, limit: int, offset: int) -> dict[str, Any]:
+    """One page of ``rows`` in the neutral order (``_row_order_key``): the page's rows, the total,
+    and ``next_offset`` (None on the last page). Walking every page with the same arguments yields
+    each row exactly once."""
+    if limit < 1 or offset < 0:
+        raise ValueError(f"page_overlay needs limit >= 1 and offset >= 0, got {limit}, {offset}")
+    ordered = sorted(rows, key=_row_order_key)
+    end = offset + limit
+    return {
+        "rows": ordered[offset:end],
+        "total_rows": len(ordered),
+        "offset": offset,
+        "limit": limit,
+        "next_offset": end if end < len(ordered) else None,
+    }
 
 
 # ── persistence (durable candidate-level baseline) ──────────────────────────────────────

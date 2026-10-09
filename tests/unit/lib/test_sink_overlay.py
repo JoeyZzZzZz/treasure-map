@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -771,11 +772,13 @@ def test_mcp_modes_and_coverage(atlas: sqlite3.Connection, tmp_path: Path) -> No
     _servable(atlas)
     tool = mcp_app.make_tools(tmp_path / "atlas.db")["get_diff_sink_overlay"]
     one = tool(DIFF_ID)
-    assert one["diff_id"] == DIFF_ID and one["count"] == len(one["rows"]) > 0
+    assert one["diff_id"] == DIFF_ID and one["summary"]["total_rows"] > 0
+    assert "by_binary" not in one["summary"]  # one diff = one binary
     cov = one["coverage"]
     assert cov["coverage_violation"] is False and cov["b_represented"] == cov["b_total"] > 0
     pair = tool(run_a="runA", run_b="runB")
     assert (pair["run_a"], pair["run_b"]) == ("runA", "runB") and "coverage" in pair
+    assert pair["summary"]["by_binary"] == {"libx": pair["summary"]["total_rows"]}
     for bad in ({}, {"diff_id": DIFF_ID, "run_a": "runA", "run_b": "runB"}, {"run_a": "runA"}):
         assert "error" in tool(**bad), bad
 
@@ -790,3 +793,150 @@ def test_mcp_run_pair_refuses_a_stale_side(atlas: sqlite3.Connection, tmp_path: 
         run_a="runA", run_b="runB"
     )
     assert out["stale_scan"]["axis"] == "extraction" and out["resolved_run"] == "runB"
+
+
+# ── reading a large result: summary by default, stable pages ───────────────────────────
+
+
+def _tool(atlas: sqlite3.Connection, tmp_path: Path):  # type: ignore[no-untyped-def]
+    from treasure_map import mcp_app
+
+    _servable(atlas)
+    return mcp_app.make_tools(tmp_path / "atlas.db")["get_diff_sink_overlay"]
+
+
+def _key(r: dict) -> tuple:  # type: ignore[type-arg]
+    return (
+        r["diff_id"] or "",
+        r["binary"] or "",
+        r["key_granularity"],
+        r["sink_class"],
+        r["a_ref"] or "",
+        r["b_ref"] or "",
+    )
+
+
+def _walk(tool, limit: int, **kw: object) -> list[dict]:  # type: ignore[no-untyped-def, type-arg]
+    rows: list[dict] = []  # type: ignore[type-arg]
+    offset: int | None = 0
+    while offset is not None:
+        page = tool(DIFF_ID, detail="rows", limit=limit, offset=offset, **kw)
+        assert len(page["rows"]) <= limit
+        rows.extend(page["rows"])
+        offset = page["next_offset"]
+    return rows
+
+
+def test_default_detail_returns_no_rows(atlas: sqlite3.Connection, tmp_path: Path) -> None:
+    """The default answer is counts, never the row dump.
+
+    MUTATION (verified RED): default ``detail="rows"`` in the MCP signature -> ``rows`` is back."""
+    out = _tool(atlas, tmp_path)(DIFF_ID)
+    assert "rows" not in out and out["detail"] == "summary"
+    s = out["summary"]
+    assert s["total_rows"] == len(_rows(atlas)) > 0
+    assert sum(s["by_presence"].values()) == s["total_rows"]
+    assert sum(s["by_presence_reason"].values()) == s["total_rows"]
+    assert s["by_presence_reason"]["persisted|-"] == s["by_presence"]["persisted"]
+
+
+def test_paging_covers_every_row_once(atlas: sqlite3.Connection, tmp_path: Path) -> None:
+    """Walking ``next_offset`` to the end yields every row exactly once — here over 2.5 pages.
+
+    MUTATION (verified RED): ``next_offset = end - 1`` in ``page_overlay`` (an off-by-one) ->
+    duplicated rows."""
+    total = len(_rows(atlas))
+    while total % 5:  # pad to a multiple of 5 so the row count is exactly 2.5 pages
+        _inst(
+            atlas, "runB", SHA_B, _ref("runB", "0000d000", "cmd", f"0x{0x100 + total:06x}"), "cmd"
+        )
+        atlas.commit()
+        total += 1
+    limit = total * 2 // 5
+    tool = _tool(atlas, tmp_path)
+    got = _walk(tool, limit)
+    assert len(got) == total == len(_rows(atlas))
+    dumped = [json.dumps(r, sort_keys=True) for r in got]
+    assert len(set(dumped)) == total  # no duplicate
+    every = sorted(json.dumps(asdict(r), sort_keys=True) for r in _rows(atlas))
+    assert sorted(dumped) == every  # nothing missing
+
+
+def test_page_overlay_pure_walk_two_and_a_half_pages() -> None:
+    rows = [
+        so.SinkOverlayRow(
+            diff_id="d",
+            binary="b",
+            sink_class="cmd",
+            a_ref=f"r#{i:03d}",
+            b_ref=None,
+            key_granularity="callsite",
+            presence="presence_undetermined",
+            presence_reason="instruction_unmatched",
+            match_basis="instruction",
+            counterpart_call=None,
+            alignment_confidence=None,
+        )
+        for i in range(25)
+    ]
+    seen: list[str] = []
+    offset: int | None = 0
+    while offset is not None:
+        page = so.page_overlay(rows, limit=10, offset=offset)
+        assert page["total_rows"] == 25
+        seen.extend(r.a_ref or "" for r in page["rows"])
+        offset = page["next_offset"]
+    assert seen == [f"r#{i:03d}" for i in range(25)]
+    with pytest.raises(ValueError):
+        so.page_overlay(rows, limit=0, offset=0)
+
+
+def test_paging_order_is_deterministic(atlas: sqlite3.Connection, tmp_path: Path) -> None:
+    """The same page twice is byte-identical, and the order is the documented neutral key — not the
+    compute order (which here differs: the B-side rows are computed after the A side).
+
+    MUTATION (verified RED): drop the sort in ``page_overlay`` (``ordered = list(rows)``) -> the
+    page follows compute order instead of the key."""
+    computed = [asdict(r) for r in _rows(atlas)]
+    assert [_key(r) for r in computed] != sorted(_key(r) for r in computed)  # fixture is unsorted
+    tool = _tool(atlas, tmp_path)
+    p1 = tool(DIFF_ID, detail="rows", limit=7, offset=7)
+    p2 = tool(DIFF_ID, detail="rows", limit=7, offset=7)
+    assert json.dumps(p1, sort_keys=True) == json.dumps(p2, sort_keys=True)
+    walked = _walk(tool, 7)
+    assert [_key(r) for r in walked] == sorted(_key(r) for r in computed)
+
+
+def test_filters_narrow_summary_not_coverage(atlas: sqlite3.Connection, tmp_path: Path) -> None:
+    tool = _tool(atlas, tmp_path)
+    full = tool(DIFF_ID)
+    narrow = tool(DIFF_ID, presence="persisted")
+    assert 0 < narrow["summary"]["total_rows"] < full["summary"]["total_rows"]
+    assert narrow["summary"]["by_presence"] == {"persisted": narrow["summary"]["total_rows"]}
+    assert narrow["coverage"] == full["coverage"]
+
+
+def test_reason_filter(atlas: sqlite3.Connection, tmp_path: Path) -> None:
+    """MUTATION (verified RED): ignore ``reason`` (``filter_by_reason`` returns every row) -> other
+    reasons leak into the page."""
+    tool = _tool(atlas, tmp_path)
+    page = tool(DIFF_ID, detail="rows", limit=2000, reason="present_different_callee")
+    assert page["total_rows"] == len(page["rows"]) > 0
+    assert {r["presence_reason"] for r in page["rows"]} == {"present_different_callee"}
+    summ = tool(DIFF_ID, reason="present_different_callee")["summary"]
+    assert list(summ["by_presence_reason"]) == ["presence_undetermined|present_different_callee"]
+
+
+def test_detail_and_limit_validation(atlas: sqlite3.Connection, tmp_path: Path) -> None:
+    """Bad paging arguments are an answer (an ``error``), never an exception."""
+    tool = _tool(atlas, tmp_path)
+    for bad in (
+        {"detail": "everything"},
+        {"detail": "rows", "limit": 0},
+        {"detail": "rows", "limit": 2001},
+        {"detail": "rows", "offset": -1},
+    ):
+        out = tool(DIFF_ID, **bad)
+        assert "error" in out and "rows" not in out, bad
+    assert "error" not in tool(DIFF_ID, detail="rows", limit=2000)
+    assert "error" not in tool(DIFF_ID, detail="rows", limit=1, offset=10_000)

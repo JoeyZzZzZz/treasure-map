@@ -268,8 +268,9 @@ def test_reachability_multi_value_not_collapsed_to_single_kind(tmp_path: Path) -
 
 
 def test_reachability_only_ever_proven_or_unknown_four_state(tmp_path: Path) -> None:
-    # ★ contract C4/C7: the reachability axis uses only proven (any sound entry) or unknown (a
-    # coverage gap) — never a fifth state, and never 'likely' (that tier is controllability's).
+    # ★ reachability-state contract: the reachability axis uses only proven (any sound entry) or
+    # unknown (a coverage gap) — never a fifth state, and never 'likely' (that tier is
+    # controllability's).
     conn = _atlas(tmp_path)
     p = _pattern(conn, "fp", sink_class="cmd", source_class="external_input")
     for i, val in enumerate(("entry:web", "entry:script", "entry:web+script", "unknown")):
@@ -294,9 +295,9 @@ def test_reachability_web_note_carries_endpoint_and_method(tmp_path: Path) -> No
 
 
 def test_reachability_entry_note_has_two_caveats_and_no_pre_auth(tmp_path: Path) -> None:
-    # ★ seam (contract C7 note, mechanistic-label invariant): an entry:web note carries BOTH the
-    # standard-flow caveat (textual reference != dispatch proof) and the completeness caveat
-    # (service-dispatch/notify_rc unmodeled), and NEVER a pre-auth/attack-surface claim.
+    # ★ seam (reachability-caveat contract, mechanistic-label invariant): an entry:web note carries
+    # BOTH the standard-flow caveat (textual reference != dispatch proof) and the completeness
+    # caveat (service-dispatch/notify_rc unmodeled), and NEVER a pre-auth/attack-surface claim.
     conn = _atlas(tmp_path)
     p = _pattern(conn, "fp", sink_class="cmd", source_class="external_input")
     _inst(conn, p, fn="web_fn", entry_reach="entry:web")

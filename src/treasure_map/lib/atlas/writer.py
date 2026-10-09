@@ -295,13 +295,13 @@ def delete_diff(conn: sqlite3.Connection, diff_id: str, *, commit: bool = True) 
 def delete_dimension_delta(
     conn: sqlite3.Connection, diff_id: str, *, subject_kind: str | None = None, commit: bool = True
 ) -> None:
-    """Delete a diff's layer-2/C7 rows (replace-by-diff refresh for a re-run without touching the
-    layer-0 alignment) — touches ONLY this diff_id.
+    """Delete a diff's layer-2/sink-overlay rows (replace-by-diff refresh for a re-run without
+    touching the layer-0 alignment) — touches ONLY this diff_id.
 
     ``subject_kind`` scopes the delete so the two producers never clobber each other's rows:
-    layer-2 passes ``'edge'`` (and still owns dimension_capability_state), C7 passes ``'candidate'``
-    (and must NOT delete capability state, which is layer-2's). ``None`` wipes every subject_kind
-    for a full layer-2+C7 refresh."""
+    layer-2 passes ``'edge'`` (and still owns dimension_capability_state), the sink overlay passes
+    ``'candidate'`` (and must NOT delete capability state, which is layer-2's). ``None`` wipes every
+    subject_kind for a full layer-2 + sink-overlay refresh."""
     sql = "DELETE FROM dimension_delta WHERE diff_id = ?"
     params: list[str] = [diff_id]
     if subject_kind is not None:
@@ -370,8 +370,8 @@ def add_instruction_matches(
     conn: sqlite3.Connection, rows: list[InstructionMatchRow], *, commit: bool = True
 ) -> int:
     """Insert instruction_match rows (A<->B candidate-callsite address pairs) in one batch; return
-    the count. Positional BinDiff matches only — NO callee is stored (the C7 docstring in the schema
-    explains why). commit=False joins the caller's txn (layer-0 persist)."""
+    the count. Positional BinDiff matches only — NO callee is stored (the instruction_match comment
+    in the schema explains why). commit=False joins the caller's txn (layer-0 persist)."""
     if not rows:
         return 0
     conn.executemany(
