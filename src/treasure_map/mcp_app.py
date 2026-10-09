@@ -85,6 +85,9 @@ from treasure_map.lib.query.diff_align import get_diff_meta as _get_diff_meta
 from treasure_map.lib.query.diff_align import list_diff_blindspots as _list_diff_blindspots
 from treasure_map.lib.query.diff_align import list_diffs as _list_diffs
 from treasure_map.lib.query.sink_overlay import compute_sink_overlay as _compute_sink_overlay
+from treasure_map.lib.query.sink_overlay import (
+    compute_sink_overlay_runs as _compute_sink_overlay_runs,
+)
 from treasure_map.lib.query.triage import anchor_facts
 from treasure_map.version import installed_commit as _installed_commit
 
@@ -1650,51 +1653,95 @@ def make_tools(
             conn.close()
 
     def get_diff_sink_overlay(
-        diff_id: str,
+        diff_id: str | None = None,
         binary: str | None = None,
         sink_class: str | None = None,
         presence: str | None = None,
         min_alignment_confidence: float | None = None,
+        run_a: str | None = None,
+        run_b: str | None = None,
     ) -> dict[str, Any]:
-        """Candidate-level SINK OVERLAY (C7 / Layer 0.5): line up the A/B sink candidates of ONE
-        diff (``diff_id`` = ``{run_a}::{run_b}::{binary}``; use list_diffs for ids) and report an
+        """Candidate-level SINK OVERLAY (Layer 0.5): line up the A/B sink candidates and report an
         honest four-state ``presence`` per candidate — ``added`` / ``removed`` / ``persisted`` /
         ``presence_undetermined``. EVIDENCE ONLY, never a fix-status verdict.
 
-        ★ ``removed`` is as suspect as a dormant hole: it is emitted ONLY when a whole function is
-        unmatched on the other side with analysis complete. A candidate that merely 'looks gone'
-        inside an aligned function pair is ``presence_undetermined`` — tmap's own decompile can
-        miss-render a real call, so the safe direction is taken. ``presence_undetermined`` is NOT
-        'unchanged': read ``presence_reason`` (callsite_not_exported / crossside_match_degraded
-        / counterpart_not_candidate / present_different_callee / alignment_low_confidence / ... — an
-        enum that may grow; do not branch on it). Under the current atlas+BinDiff backend a matched
-        callsite whose B side has no candidate is ``counterpart_not_candidate`` (the B callee is
-        unreadable here), never a guessed removed. Filter by ``binary`` / ``sink_class`` /
-        ``presence`` / ``min_alignment_confidence``. Each row carries the A/B evidence_ref (the
-        unmatched side is null) for traceback."""
+        Two modes — pass EXACTLY one:
+          * ``diff_id`` (``{run_a}::{run_b}::{binary}``; use list_diffs for ids): one binary's diff.
+          * ``run_a`` + ``run_b``: every diff between the two runs, PLUS every candidate no diff
+            covers — a binary with no diff row (``binary_not_diffed``) or one hidden behind a
+            same-named, different-content binary that was diffed (``shadowed_by_name_collision``).
+            Those rows carry ``diff_id: null``. Both runs are checked for staleness.
+
+        ★ ``removed`` / ``added`` are emitted ONLY when a whole function is unmatched on the other
+        side with analysis complete. A candidate that merely looks gone or new inside an aligned
+        function pair is ``presence_undetermined`` — tmap's own decompile can miss-render a real
+        call, so the safe direction is taken. ``presence_undetermined`` is NOT 'unchanged': read
+        ``presence_reason`` (instruction_unmatched / crossside_match_degraded /
+        counterpart_not_candidate / a_counterpart_not_candidate / present_different_callee /
+        alignment_low_confidence / ... — an enum that may grow; do not branch on it). ``persisted``
+        at the callsite level requires the matched call on the other side to call the SAME sink.
+        Each row carries the A/B evidence_ref (the unmatched side is null) for traceback.
+
+        ``coverage`` checks that every candidate of both sides is represented by some row (named as
+        ``a_ref``/``b_ref``, folded into ``coclaimed_by``/``coclaimed_by_b``, or counted in a
+        degraded row's ``a_n``/``b_n``): ``a_total``/``a_represented``, ``b_total``/
+        ``b_represented``, ``excluded_legacy`` (old anchors with no function address, not lined
+        up). ``coverage_violation: true`` means some candidates are missing from the rows —
+        ``unrepresented_refs`` samples them; do not read the rows as complete. Coverage always
+        describes the whole diff / run pair; ``binary`` / ``sink_class`` / ``presence`` /
+        ``min_alignment_confidence`` filter the rows only."""
+        filters = {
+            "binary": binary,
+            "sink_class": sink_class,
+            "presence": presence,
+            "min_alignment_confidence": min_alignment_confidence,
+        }
+        by_runs = run_a is not None or run_b is not None
+        if (diff_id is not None) == by_runs or (by_runs and (run_a is None or run_b is None)):
+            return {
+                "error": "pass exactly one of: diff_id, or both run_a and run_b",
+                "diff_id": diff_id,
+                "run_a": run_a,
+                "run_b": run_b,
+            }
         conn = open_atlas(atlas_path)
         try:
-            refusal = _refuse_stale_diff(conn, diff_id)
-            if refusal is not None:
-                return refusal
-            rows = _compute_sink_overlay(
-                conn,
-                diff_id,
-                binary=binary,
-                sink_class=sink_class,
-                presence=presence,
-                min_alignment_confidence=min_alignment_confidence,
-            )
+            if by_runs:
+                assert run_a is not None and run_b is not None
+                for rid in (run_a, run_b):
+                    refusal = _refuse_stale_run(conn, rid)
+                    if refusal is not None:
+                        return refusal
+                result = _compute_sink_overlay_runs(
+                    conn,
+                    run_a,
+                    run_b,
+                    binary=binary,
+                    sink_class=sink_class,
+                    presence=presence,
+                    min_alignment_confidence=min_alignment_confidence,
+                )
+                scope: dict[str, Any] = {"run_a": run_a, "run_b": run_b}
+            else:
+                assert diff_id is not None
+                refusal = _refuse_stale_diff(conn, diff_id)
+                if refusal is not None:
+                    return refusal
+                result = _compute_sink_overlay(
+                    conn,
+                    diff_id,
+                    binary=binary,
+                    sink_class=sink_class,
+                    presence=presence,
+                    min_alignment_confidence=min_alignment_confidence,
+                )
+                scope = {"diff_id": diff_id}
             return {
-                "diff_id": diff_id,
-                "filters": {
-                    "binary": binary,
-                    "sink_class": sink_class,
-                    "presence": presence,
-                    "min_alignment_confidence": min_alignment_confidence,
-                },
-                "count": len(rows),
-                "rows": [asdict(r) for r in rows],
+                **scope,
+                "filters": filters,
+                "count": len(result.rows),
+                "coverage": asdict(result.coverage),
+                "rows": [asdict(r) for r in result.rows],
                 "note": (
                     "four-state candidate overlay; presence_undetermined is NOT unchanged (read "
                     "presence_reason); removed/added are function-level; atlas+BinDiff backend."

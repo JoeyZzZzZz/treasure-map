@@ -19,13 +19,13 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from treasure_map.lib.callsite_ref import callsite_abs_addr
 from treasure_map.lib.fmt_spec import arity as fmt_arity
 from treasure_map.lib.fmt_spec import conversions as fmt_conversions
 from treasure_map.lib.pattern.classes import CMD, FMT_STRING
@@ -319,27 +319,9 @@ def _sink_provenance_records(flow_evidence: str | None) -> list[dict[str, Any]]:
     return [r for r in prov if isinstance(r, dict)]
 
 
-# The per-callsite evidence_ref suffix ``…:<func_entry>@<class>@<offset>`` (see lib/hunt/refs.py:
-# build_evidence_ref + callsite_offset_suffix + _norm_offset). The function anchor is canonical hex
-# and the offset is a signed hex delta from it; this is a SECOND reader of that shape, kept in step
-# by a round-trip test rather than by importing lib/hunt (the :499-501 convention). The two ``@``
-# matter: the first joins the sink CLASS, the second the address offset — split greedily on the
-# last so a function-level ``…@<class>`` (no offset) never matches.
-_CALLSITE_REF_RE = re.compile(r":([0-9a-f]+)@[a-z_]+@(-?)0x([0-9a-f]+)$")
-
-
-def _callsite_addr(evidence_ref: str | None) -> int | None:
-    """The absolute sink address a per-callsite ref names, or None when the ref carries no address.
-
-    Reconstructs ``func_entry + offset`` from the addressed suffix. None (no address to scope by,
-    so the caller keeps the function-level reading) for every other shape: a function-level
-    ``…@<class>``, a wrapper ``…@<class>_via_wrapper``, a legacy ordinal ``…@<class>#<n>``, a
-    non-hex function anchor, the empty string, or None."""
-    m = _CALLSITE_REF_RE.search(evidence_ref or "")
-    if m is None:
-        return None
-    off = int(m.group(3), 16)
-    return int(m.group(1), 16) + (-off if m.group(2) else off)
+# The absolute callsite address of a per-callsite ref is read by lib/callsite_ref.callsite_abs_addr,
+# shared with the diff layer (a reader of the lib/hunt/refs.py shape that imports nothing from
+# lib/hunt, kept in step by a round-trip test).
 
 
 def _record_addr(rec: dict[str, Any]) -> int | None:
@@ -1104,7 +1086,7 @@ def get_sink_provenance(
     if not records:
         return {"evidence_ref": evidence_ref, "found": False, "note": "no_sink_provenance"}
     sink_anchor = row[1]
-    callsite_addr = _callsite_addr(evidence_ref)
+    callsite_addr = callsite_abs_addr(evidence_ref)
 
     def _marked(rec: dict[str, Any]) -> dict[str, Any]:
         # Present the record, then — only for an addressed candidate — flag the ONE record that is
@@ -2489,7 +2471,7 @@ def _candidate(
     # The sink address this candidate's ref names (None for a function-level / degraded ref), so
     # every provenance read below is scoped to THIS callsite rather than every call to the same sink
     # in the function.
-    callsite_addr = _callsite_addr(row["evidence_ref"])
+    callsite_addr = callsite_abs_addr(row["evidence_ref"])
     # The resolved nvram key for the source_writability layer: a recognized nvram accessor — a
     # direct getter (NVRAM_GETTERS) OR an A2 thin wrapper (wrapper_names) — first, else the first
     # web-settable key the verdict found reaching the sink. Wrapper-aware (M1) so a key read through
@@ -3215,7 +3197,7 @@ def explain_candidate(conn: sqlite3.Connection, evidence_ref: str) -> CandidateE
     row = rows[0]
 
     candidate = _candidate(conn, row, _nvram_wrapper_names(conn))
-    callsite_addr = _callsite_addr(evidence_ref)
+    callsite_addr = callsite_abs_addr(evidence_ref)
     claims_does = (
         "present each dimension layer as an observed FACT about this candidate (controllability, "
         "source-writability, reachability, filtering, sink impact, writer, completeness) with its "

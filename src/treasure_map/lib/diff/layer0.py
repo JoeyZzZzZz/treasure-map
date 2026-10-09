@@ -34,11 +34,11 @@ from treasure_map.lib.atlas.writer import (
     delete_diff,
 )
 from treasure_map.lib.binary_id import BinaryRow
+from treasure_map.lib.callsite_ref import callsite_abs_addr
 from treasure_map.lib.errors import ConfigError
 from treasure_map.lib.facts import _DECOMPILE_MIN_SIZE
 from treasure_map.lib.hunt.refs import _norm_addr
 from treasure_map.lib.query.runs import get_run
-from treasure_map.lib.query.triage import _callsite_addr
 from treasure_map.version import UNKNOWN_VERSION
 
 # The confidence boundary between an aligned pair and an undetermined one. Owner-set: on the
@@ -144,7 +144,7 @@ def _candidate_callsite_addrs(atlas: sqlite3.Connection, run_id: str, sha: str) 
     ):
         if not ref:
             continue
-        ci = _callsite_addr(ref)
+        ci = callsite_abs_addr(ref)
         if ci is not None:
             h = norm_hex(ci)
             if h is not None:
@@ -164,15 +164,20 @@ def _candidate_callsite_addrs(atlas: sqlite3.Connection, run_id: str, sha: str) 
 
 
 def parse_instruction_matches(
-    bindiff_path: Path, diff_id: str, candidate_addrs_a: set[str]
+    bindiff_path: Path,
+    diff_id: str,
+    candidate_addrs_a: set[str],
+    candidate_addrs_b: set[str],
 ) -> list[InstructionMatchRow]:
-    """The BinDiff instruction matches (address1<->address2) on a run-A candidate callsite.
+    """The BinDiff instruction matches (address1<->address2) on a candidate callsite of EITHER side.
 
     BinDiff's instruction table is positional only; it is scoped by basicblock -> function, so the
-    containing A function entry is joined in. Only addresses in ``candidate_addrs_a`` are kept (the
-    fill is small). Matching is 1:1 on the A address. [] when the .BinDiff has no instruction
-    table (an older / hand-made one)."""
-    if not candidate_addrs_a:
+    containing A function entry is joined in. A pair is kept when its A address is a run-A candidate
+    callsite OR its B address is a run-B candidate callsite (the fill stays candidate-sized). The
+    B-side half lets a reader tell "B's candidate matched an A instruction that is not a candidate"
+    apart from "B's candidate matched nothing". Matching is 1:1 on each side's address. [] when the
+    .BinDiff has no instruction table (an older / hand-made one)."""
+    if not candidate_addrs_a and not candidate_addrs_b:
         return []
     con = sqlite3.connect(f"file:{bindiff_path}?mode=ro", uri=True)
     try:
@@ -189,11 +194,10 @@ def parse_instruction_matches(
     out: list[InstructionMatchRow] = []
     seen: set[str] = set()
     for a1, a2, fa in raw:
-        addr_a = norm_hex(a1)
-        if addr_a is None or addr_a not in candidate_addrs_a or addr_a in seen:
+        addr_a, addr_b, func_a = norm_hex(a1), norm_hex(a2), norm_hex(fa)
+        if addr_a is None or addr_b is None or func_a is None or addr_a in seen:
             continue
-        addr_b, func_a = norm_hex(a2), norm_hex(fa)
-        if addr_b is None or func_a is None:
+        if addr_a not in candidate_addrs_a and addr_b not in candidate_addrs_b:
             continue
         seen.add(addr_a)
         out.append(
@@ -209,16 +213,22 @@ def persist_instruction_matches(
     diff_id: str,
     run_a_id: str,
     sha_a: str | None,
+    run_b_id: str,
+    sha_b: str | None,
     commit: bool = False,
 ) -> int:
-    """Parse + store the candidate-callsite instruction matches for one diff (C7's cross-side
-    bridge). Runs in the persist phase while the .BinDiff is still on disk, AFTER run_layer0_parse
-    (whose delete_diff already cleared any prior instruction_match for this diff_id). Joins the
-    caller's transaction (commit=False). A no-op when the binary has no sha or no candidates."""
-    if not sha_a:
-        return 0
-    addrs = _candidate_callsite_addrs(atlas, run_a_id, sha_a)
-    rows = parse_instruction_matches(bindiff_path, diff_id, addrs)
+    """Parse + store the candidate-callsite instruction matches for one diff (the overlay's
+    cross-side bridge). Runs in the persist phase while the .BinDiff is still on disk, AFTER
+    run_layer0_parse (whose delete_diff already cleared any prior instruction_match for this
+    diff_id). Joins the caller's transaction (commit=False). A side with no sha contributes no
+    candidate addresses; a no-op when neither side has any.
+
+    ★ The kept pairs are chosen by the A/B candidate callsites AS OF THIS DIFF. A later re-hunt that
+    changes a run's candidate set or addresses (a new candidate shape, a re-split callsite) leaves
+    these rows describing the old set, so such a re-hunt must be followed by re-running the diff."""
+    addrs_a = _candidate_callsite_addrs(atlas, run_a_id, sha_a) if sha_a else set()
+    addrs_b = _candidate_callsite_addrs(atlas, run_b_id, sha_b) if sha_b else set()
+    rows = parse_instruction_matches(bindiff_path, diff_id, addrs_a, addrs_b)
     return add_instruction_matches(atlas, rows, commit=commit)
 
 

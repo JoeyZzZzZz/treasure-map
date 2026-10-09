@@ -703,15 +703,18 @@ def _persist_success(
             diff_id=diff_id,
             commit=False,
         )
-        # C7 cross-side bridge: store this diff's candidate-callsite instruction matches while the
-        # .BinDiff is still on disk (the caller rmtrees the temp dir only after this returns), AFTER
-        # run_layer0_parse's delete_diff cleared any prior rows; one txn with layer-2's commit.
+        # Sink-overlay cross-side bridge: store this diff's candidate-callsite instruction matches
+        # (either side's candidates) while the .BinDiff is still on disk (the caller rmtrees the
+        # temp dir only after this returns), AFTER run_layer0_parse's delete_diff cleared any prior
+        # rows; one txn with layer-2's commit.
         persist_instruction_matches(
             atlas,
             bindiff_path=bindiff_path,
             diff_id=diff_id,
             run_a_id=run_a_id,
             sha_a=bin_a.sha256,
+            run_b_id=run_b_id,
+            sha_b=bin_b.sha256,
             commit=False,
         )
         run_layer2_delta(atlas, diff_id=diff_id, run_a_id=run_a_id, run_b_id=run_b_id, commit=True)

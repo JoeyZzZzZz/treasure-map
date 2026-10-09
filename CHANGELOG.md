@@ -7,7 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Candidate-level sink overlay across a version diff (MCP `get_diff_sink_overlay`).** On top of
+  the function alignment, each sink candidate of the two runs is lined up with its counterpart and
+  given one of four `presence` states: `added`, `removed`, `persisted` or `presence_undetermined`.
+  It is evidence, not a fix-status verdict.
+  - Two modes: `diff_id` for one binary's diff, or `run_a` + `run_b` for every diff between two
+    runs. The run-pair mode also lists the candidates no diff covers: a binary with no diff
+    (`binary_not_diffed`), or one hidden behind a same-named binary with different content that was
+    diffed instead (`shadowed_by_name_collision`).
+  - **`presence_undetermined` is not "unchanged".** It always carries a machine-readable
+    `presence_reason`, such as an unmatched instruction, a low-confidence function alignment, a
+    different callee at the matched call, a matched instruction that is not a candidate on the other
+    side, a failed or version-skewed diff, or runs from different extraction generations.
+    `removed` / `added` are given only when a whole function has no counterpart and the other
+    side's analysis is complete. A candidate that only looks gone or new inside an aligned function
+    stays undetermined. `persisted` at a callsite requires the matched call to reach the same sink
+    by name.
+  - Every result carries `coverage`: per-side totals and the number of candidates the rows
+    represent. A shortfall is reported as `coverage_violation` with a sample of the missing refs,
+    never dropped silently. Old anchors with no function address are counted as `excluded_legacy`.
+- **New atlas storage, migrated automatically when an older atlas is opened.** `dimension_delta`
+  gains nullable candidate columns: presence, key granularity, match basis, counterpart call,
+  co-claimers, folded counts and both sides' generation stamps. A new `instruction_match` table keeps
+  BinDiff's instruction pairs at either side's candidate callsites.
+  - Until the runs are re-hunted and the diffs re-run, there is no instruction data and every
+    callsite-level candidate reads `presence_undetermined` (`crossside_match_degraded`).
+- **Known gap:** the diff readers (`get_diff_deltas`, `get_diff_meta`, `get_function_alignment`,
+  `get_diff_sink_overlay`) are MCP-only; there is no CLI for them yet.
+
 ### Changed
+
+- **`get_diff_deltas` no longer returns candidate rows.** It returns the edge-level deltas only;
+  candidate presence is read through `get_diff_sink_overlay`.
 
 - **Every callee-name list the extractor recognises now lives in one registry file.** Command and
   format-string sinks with their key argument, buffer writers, printf-family writer format
