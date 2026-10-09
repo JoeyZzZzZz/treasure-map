@@ -1,8 +1,8 @@
 """Candidate-level sink overlay (lib/query/sink_overlay).
 
 Zero real data: every ref / run / binary name here is synthetic placeholder hex. Exercises the
-atlas+BinDiff backend's honest four-state engine across every presence path, both judging
-directions, the co-claim fold on both sides, the coverage invariant and the run-pair mode.
+atlas+BinDiff backend's honest engine (persisted | presence_undetermined) across every path, both
+judging directions, the co-claim fold on both sides, the coverage invariant and the run-pair mode.
 """
 
 from __future__ import annotations
@@ -137,7 +137,7 @@ def atlas(tmp_path: Path) -> sqlite3.Connection:
     _falign(conn, "00003000", "00004000", 0.50, "alignment_undetermined")
     _inst(conn, "runA", SHA_A, _ref("runA", "00003000", "cmd", "0x000008"), "cmd")
 
-    # F3 A-side unmatched, analysis complete -> removed
+    # F3 A-side unmatched, analysis complete -> undetermined (function_unmatched), never 'removed'
     _fpres(conn, "a", "00005000", "unmatched_analysis_complete")
     _inst(conn, "runA", SHA_A, _ref("runA", "00005000", "cmd", "0x000004"), "cmd")
 
@@ -166,7 +166,7 @@ def atlas(tmp_path: Path) -> sqlite3.Connection:
         _inst(conn, "runA", SHA_A, _ref("runA", "0000b000", "format"), "format", DEG)
     _inst(conn, "runB", SHA_B, _ref("runB", "0000c000", "format"), "format", DEG)  # only 1 on B
 
-    # F8 B-side unmatched complete -> added
+    # F8 B-side unmatched complete -> undetermined (function_unmatched), never 'added'
     _fpres(conn, "b", "0000d000", "unmatched_analysis_complete")
     _inst(conn, "runB", SHA_B, _ref("runB", "0000d000", "cmd", "0x000004"), "cmd")
 
@@ -239,9 +239,12 @@ def test_alignment_low_confidence(atlas: sqlite3.Connection) -> None:
     assert r.presence_reason == "alignment_low_confidence"
 
 
-def test_function_removed(atlas: sqlite3.Connection) -> None:
+def test_function_unmatched_a_side(atlas: sqlite3.Connection) -> None:
+    """A whole A function with no B counterpart is not evidence of a deletion: undetermined."""
     r = _by(_rows(atlas), a_off=":00005000@")
-    assert r is not None and r.presence == "removed" and r.match_basis == "function_level"
+    assert r is not None and r.presence == "presence_undetermined"
+    assert r.presence_reason == "function_unmatched" and r.match_basis == "function_level"
+    assert r.a_ref is not None and r.b_ref is None
 
 
 def test_function_unmatched_incomplete_undetermined(atlas: sqlite3.Connection) -> None:
@@ -276,15 +279,18 @@ def test_tier2_count_match_and_mismatch(atlas: sqlite3.Connection) -> None:
     )
 
 
-def test_function_added(atlas: sqlite3.Connection) -> None:
+def test_function_unmatched_b_side(atlas: sqlite3.Connection) -> None:
+    """A whole B function with no A counterpart is not evidence of an addition: undetermined."""
     r = _by(_rows(atlas), b_off=":0000d000@")
-    assert r is not None and r.presence == "added" and r.a_ref is None and r.b_ref is not None
+    assert r is not None and r.presence == "presence_undetermined"
+    assert r.presence_reason == "function_unmatched" and r.match_basis == "function_level"
+    assert r.a_ref is None and r.b_ref is not None
 
 
 def test_never_collapses_to_unchanged(atlas: sqlite3.Connection) -> None:
-    # Honesty: no row is 'unchanged'; every non-persisted/added/removed is undetermined.
+    # Honesty: no row is 'unchanged'; every non-persisted row is undetermined.
     for r in _rows(atlas):
-        assert r.presence in ("added", "removed", "persisted", "presence_undetermined")
+        assert r.presence in ("persisted", "presence_undetermined")
         if r.presence == "presence_undetermined":
             assert r.presence_reason is not None  # always a machine-readable reason
 
@@ -320,7 +326,7 @@ def test_b_only_callsite_in_aligned_function_is_emitted(atlas: sqlite3.Connectio
 
 def test_b_only_in_aligned_function_reason_table(atlas: sqlite3.Connection) -> None:
     """The B-side reasons mirror the A side: low-confidence pair, no instruction data at all,
-    function-level key A lacks — each undetermined, never added."""
+    function-level key A lacks — each undetermined."""
     low = _ref("runB", "00004000", "cmd", "0x000020")  # F2's B function: low confidence
     fn = _ref("runB", "00008000", "unlink_sink")  # F5's B function: tier-3 key A lacks
     _inst(atlas, "runB", SHA_B, low, "cmd")
@@ -940,3 +946,121 @@ def test_detail_and_limit_validation(atlas: sqlite3.Connection, tmp_path: Path) 
         assert "error" in out and "rows" not in out, bad
     assert "error" not in tool(DIFF_ID, detail="rows", limit=2000)
     assert "error" not in tool(DIFF_ID, detail="rows", limit=1, offset=10_000)
+
+
+# ── no removed / added; logic-versioned baselines ────────────────────────────────────
+
+# The run-pair summary of the fixture, keyed by SINK_OVERLAY_LOGIC_VERSION. When a logic change
+# moves this summary, ADD a new version key with the new value and bump the constant — never edit
+# an existing key's value (it records what that logic version computed).
+_GOLDEN: dict[str, dict[str, object]] = {
+    "2": {
+        "total_rows": 13,
+        "by_presence": {"persisted": 4, "presence_undetermined": 9},
+        "by_presence_reason": {
+            "persisted|-": 4,
+            "presence_undetermined|alignment_low_confidence": 1,
+            "presence_undetermined|counterpart_not_candidate": 1,
+            "presence_undetermined|crossside_count_mismatch": 1,
+            "presence_undetermined|function_unmatched": 2,
+            "presence_undetermined|instruction_unmatched": 1,
+            "presence_undetermined|no_counterpart_undetermined": 2,
+            "presence_undetermined|present_different_callee": 1,
+        },
+        "by_key_granularity": {
+            "callsite": 8,
+            "degraded_out_of_body": 2,
+            "function_fallback": 2,
+            "wrapper": 1,
+        },
+        "by_sink_class": {"cmd": 9, "copy": 2, "format": 1, "path_sink": 1},
+        "by_binary": {"libx": 13},
+    },
+}
+
+
+def test_golden_summary_matches_logic_version(atlas: sqlite3.Connection) -> None:
+    rows = so.compute_sink_overlay_runs(atlas, "runA", "runB").rows
+    summary = so.summarize_overlay(rows, by_binary=True)
+    assert summary == _GOLDEN[so.SINK_OVERLAY_LOGIC_VERSION]
+
+
+def test_degraded_key_in_unmatched_function_is_function_unmatched(
+    atlas: sqlite3.Connection,
+) -> None:
+    """The degraded key row has its own entry into the unmatched-function verdict.
+
+    MUTATION (verified RED): in ``_key_row`` replace the ``_function_unmatched`` call with the old
+    ``("removed", None)`` -> this key reads removed."""
+    _fpres(atlas, "a", "00015000", "unmatched_analysis_complete")
+    _inst(atlas, "runA", SHA_A, _ref("runA", "00015000", "copy"), "copy", _deg(None))
+    res = so.compute_sink_overlay(atlas, DIFF_ID)
+    r = _by(res.rows, a_off=":00015000@copy")
+    assert r is not None and r.key_granularity == "degraded_out_of_body"
+    assert r.presence == "presence_undetermined" and r.presence_reason == "function_unmatched"
+    _assert_full_coverage(res)
+
+
+def test_inlined_helper_is_not_removed(atlas: sqlite3.Connection) -> None:
+    """An inlined helper: A's helper holds a cmd call and has no B counterpart, while its caller
+    is aligned and B's caller now holds a call to the same sink. The helper's candidate is
+    undetermined — the unmatched function is not evidence that the call went away.
+
+    MUTATION (verified RED): make ``_function_unmatched`` return ``("removed", None)`` for an
+    analysis-complete function -> the helper's candidate reads removed."""
+    _fpres(atlas, "a", "00030000", "unmatched_analysis_complete")  # the helper
+    helper = _ref("runA", "00030000", "cmd", "0x000010")
+    _inst(atlas, "runA", SHA_A, helper, "cmd", sink="system")
+    _falign(atlas, "00031000", "00041000", 0.95, "aligned")  # the caller pair
+    _inst(atlas, "runB", SHA_B, _ref("runB", "00041000", "cmd", "0x000010"), "cmd", sink="system")
+    r = _by(_rows(atlas), a_off=helper)
+    assert r is not None and r.presence == "presence_undetermined"
+    assert r.presence_reason == "function_unmatched" and r.b_ref is None
+
+
+def test_no_row_is_ever_added_or_removed(atlas: sqlite3.Connection) -> None:
+    _fold_scenario(atlas)
+    _inst(atlas, "runA", "c" * 64, "runA#cafecafe:00001000@cmd@0x000010", "cmd", path="/x/liby")
+    single = so.compute_sink_overlay(atlas, DIFF_ID).rows
+    pair = so.compute_sink_overlay_runs(atlas, "runA", "runB").rows
+    assert single and pair
+    assert {r.presence for r in single + pair} <= {"persisted", "presence_undetermined"}
+
+
+@pytest.mark.parametrize("bad", ["removed", "added"])
+def test_presence_filter_rejects_states_never_emitted(atlas: sqlite3.Connection, bad: str) -> None:
+    """A filter the layer can never satisfy is an error, not an empty answer that reads as "none".
+
+    MUTATION (verified RED): make ``_check_presence_filter`` a no-op -> empty lists, no error."""
+    with pytest.raises(ValueError, match="function_unmatched"):
+        so.compute_sink_overlay(atlas, DIFF_ID, presence=bad)
+    with pytest.raises(ValueError, match="function_unmatched"):
+        so.compute_sink_overlay_runs(atlas, "runA", "runB", presence=bad)
+
+
+def test_persist_stamps_logic_version(atlas: sqlite3.Connection) -> None:
+    """MUTATION (verified RED): drop ``overlay_version=`` from ``persist_sink_overlay`` -> NULL."""
+    n = so.persist_sink_overlay(atlas, DIFF_ID)
+    versions = atlas.execute(
+        "SELECT overlay_version FROM dimension_delta WHERE subject_kind = 'candidate'"
+    ).fetchall()
+    assert len(versions) == n > 0
+    assert {v[0] for v in versions} == {so.SINK_OVERLAY_LOGIC_VERSION}
+
+
+@pytest.mark.parametrize("stored", ["1", None])
+def test_baseline_from_other_logic_is_stale(atlas: sqlite3.Connection, stored: str | None) -> None:
+    """A baseline written by other overlay logic (or before the stamp existed: NULL) is stale.
+
+    MUTATION (verified RED): drop the overlay_version comparison in
+    ``read_sink_overlay_baseline`` -> rows are served."""
+    so.persist_sink_overlay(atlas, DIFF_ID)
+    assert so.read_sink_overlay_baseline(atlas, DIFF_ID)["stale_baseline"] is False
+    atlas.execute(
+        "UPDATE dimension_delta SET overlay_version = ? WHERE id = "
+        "(SELECT MIN(id) FROM dimension_delta WHERE subject_kind = 'candidate')",
+        (stored,),
+    )
+    out = so.read_sink_overlay_baseline(atlas, DIFF_ID)
+    assert out["stale_baseline"] is True and out["rows"] is None
+    assert out["mismatched_fields"] == ["overlay_version"]

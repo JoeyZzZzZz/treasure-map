@@ -679,11 +679,11 @@ CREATE TABLE IF NOT EXISTS dimension_delta (
     capability_ref       TEXT,            -- the dimension, when scope='capability'
     alignment_confidence REAL,            -- carried when the delta relied on a function alignment
     -- ── sink-overlay candidate-level columns (subject_kind='candidate') ───────────────────────────────
-    -- All NULL for layer-2 edge rows. The four-state `presence` is the authoritative candidate
-    -- result; `delta_kind` above is only its CHECK-compatible projection (added/removed ->
-    -- layer_changed, persisted -> layer_unchanged, presence_undetermined -> delta_undetermined),
-    -- so existing delta_kind consumers keep working while the honest four-state lives here.
-    presence             TEXT,            -- 'added' | 'removed' | 'persisted' | 'presence_undetermined'
+    -- All NULL for layer-2 edge rows. `presence` (two states plus undetermined) is the
+    -- authoritative candidate result; `delta_kind` above is only its CHECK-compatible projection
+    -- (persisted -> layer_unchanged, presence_undetermined -> delta_undetermined), so existing
+    -- delta_kind consumers keep working while the honest result lives here.
+    presence             TEXT,            -- 'persisted' | 'presence_undetermined'
     key_granularity      TEXT,            -- 'callsite' | 'degraded_out_of_body' | 'function_fallback' | 'wrapper'
     match_basis          TEXT,            -- 'instruction' | 'function_level' | 'ordinal_singleton'
     counterpart_call     TEXT,            -- tier-1 only: 'present_same_callee' | 'present_different_callee'
@@ -698,6 +698,7 @@ CREATE TABLE IF NOT EXISTS dimension_delta (
     build_hash_b         TEXT,
     hunt_instances_a     INTEGER,
     hunt_instances_b     INTEGER,
+    overlay_version      TEXT,            -- overlay logic version that computed the row; NULL for edge rows
     UNIQUE(diff_id, dimension, subject_kind, subject_key)
 );
 CREATE INDEX IF NOT EXISTS idx_dimdelta_diff ON dimension_delta(diff_id);

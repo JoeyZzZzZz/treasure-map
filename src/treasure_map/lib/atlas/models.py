@@ -419,11 +419,11 @@ class DimensionDeltaRow:
     alignment_confidence: float | None = None
     binary: str | None = None  # diff's target binary (short name), parsed from subject_key
     # ── sink-overlay candidate-level fields (subject_kind='candidate'); None for edge rows ──
-    # ``presence`` is the authoritative four-state ('added'|'removed'|'persisted'|
+    # ``presence`` is the authoritative two states plus undetermined ('persisted'|
     # 'presence_undetermined'); ``delta_kind`` is its CHECK-safe projection. ``counterpart_call``
     # under the atlas+BinDiff backend is only 'present_different_callee'|'counterpart_not_candidate'
     # (the BinExport five-way split is a future backend, never guessed here). ``coclaimed_by`` is a
-    # JSON list. The six generation stamps gate read-time staleness.
+    # JSON list. The six generation stamps and ``overlay_version`` gate read-time staleness.
     presence: str | None = None
     key_granularity: str | None = (
         None  # 'callsite'|'degraded_out_of_body'|'function_fallback'|'wrapper'
@@ -439,6 +439,7 @@ class DimensionDeltaRow:
     build_hash_b: str | None = None
     hunt_instances_a: int | None = None
     hunt_instances_b: int | None = None
+    overlay_version: str | None = None  # overlay logic version that computed the row
     id: int | None = None
 
 

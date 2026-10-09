@@ -529,3 +529,55 @@ def test_run_pair_level_row_is_not_reported_as_a_binary_blindspot(tmp_path: Path
     assert names == ["libxml2"], f"expected only the real blind spot, got {names}"
     assert all(b["diff_id"] != "run_a::run_b" for b in bs["blindspots"])
     con.close()
+
+
+def _delta(con: sqlite3.Connection, diff_id: str, kind: str, delta_kind: str, key: str) -> None:
+    from treasure_map.lib.atlas.models import DimensionDeltaRow
+    from treasure_map.lib.atlas.writer import add_dimension_deltas
+
+    add_dimension_deltas(
+        con,
+        [
+            DimensionDeltaRow(
+                diff_id=diff_id,
+                dimension="presence" if kind == "candidate" else "reachability",
+                subject_kind=kind,
+                subject_key=key,
+                delta_kind=delta_kind,
+            )
+        ],
+    )
+
+
+def test_list_diffs_counts_edge_deltas_only(tmp_path: Path) -> None:
+    """Candidate overlay rows share dimension_delta but are not edge deltas: list_diffs counts
+    edges only, and a diff holding ONLY candidate rows is still listed (with zero counts).
+
+    MUTATION (verified RED): drop the ``subject_kind != 'candidate'`` scope -> the candidate rows
+    are counted. MUTATION (verified RED): move the scope from ON into WHERE -> the candidate-only
+    diff disappears."""
+    atlas_path = _seed_pair(tmp_path, {"both": "a1", "cand": "c1"}, {"both": "a2", "cand": "c2"})
+    con = open_atlas(atlas_path)
+    both = _seed_committed_status(con, "both", diff_ok=1, attempts=1, sha_a="a1", sha_b="a2")
+    cand = _seed_committed_status(con, "cand", diff_ok=1, attempts=1, sha_a="c1", sha_b="c2")
+    _delta(con, both, "edge", "layer_changed", "e1")
+    _delta(con, both, "edge", "layer_unchanged", "e2")
+    _delta(con, both, "candidate", "delta_undetermined", "c1")
+    _delta(con, both, "candidate", "layer_unchanged", "c2")
+    _delta(con, cand, "candidate", "delta_undetermined", "c3")
+    by_bin = {d["binary"]: d for d in diff_align.list_diffs(con, "run_a", "run_b")["diffs"]}
+    counts = ("layer_changed", "layer_unchanged", "delta_undetermined")
+    assert tuple(by_bin["both"][k] for k in counts) == (1, 1, 0)
+    assert tuple(by_bin["cand"][k] for k in counts) == (0, 0, 0)
+    con.close()
+
+
+def test_delta_counts_ignore_candidate_rows(tmp_path: Path) -> None:
+    """MUTATION (verified RED): drop the candidate scope in ``driver._delta_counts``."""
+    atlas_path = _seed_pair(tmp_path, {"both": "a1"}, {"both": "a2"})
+    con = open_atlas(atlas_path)
+    did = _seed_committed_status(con, "both", diff_ok=1, attempts=1, sha_a="a1", sha_b="a2")
+    _delta(con, did, "edge", "layer_changed", "e1")
+    _delta(con, did, "candidate", "delta_undetermined", "c1")
+    assert driver._delta_counts(con, did) == {"layer_changed": 1}
+    con.close()

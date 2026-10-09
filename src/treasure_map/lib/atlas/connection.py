@@ -217,10 +217,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE dimension_delta ADD COLUMN binary TEXT")
 
     # Sink-overlay candidate-level columns: subject_kind='candidate' overlay rows carry
-    # the honest four-state `presence`, the key granularity / match basis, the tier-1 counterpart
-    # classification, the co-claim fold counts, and BOTH sides' generation stamps for a read-time
-    # staleness guard. All nullable TEXT/INTEGER, no index references them, so adding them before
-    # executescript is safe (unlike dimension_delta.binary above, which an index does reference).
+    # the honest `presence` (two states plus undetermined), the key granularity / match basis, the
+    # tier-1 counterpart classification, the co-claim fold counts, BOTH sides' generation stamps and
+    # the overlay logic version for a read-time staleness guard. All nullable TEXT/INTEGER, no index
+    # references them, so adding them before executescript is safe (unlike dimension_delta.binary
+    # above, which an index does reference).
     # Existing edge rows and any older atlas carry NULL. Idempotent; each runs only while missing.
     if dd_cols:
         for _c7col, _c7type in (
@@ -237,6 +238,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
             ("build_hash_b", "TEXT"),
             ("hunt_instances_a", "INTEGER"),
             ("hunt_instances_b", "INTEGER"),
+            ("overlay_version", "TEXT"),
         ):
             if _c7col not in dd_cols:
                 conn.execute(f"ALTER TABLE dimension_delta ADD COLUMN {_c7col} {_c7type}")  # noqa: S608

@@ -11,8 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Candidate-level sink overlay across a version diff (MCP `get_diff_sink_overlay`).** On top of
   the function alignment, each sink candidate of the two runs is lined up with its counterpart and
-  given one of four `presence` states: `added`, `removed`, `persisted` or `presence_undetermined`.
-  It is evidence, not a fix-status verdict.
+  given a `presence`: `persisted`, or `presence_undetermined` when that cannot be established
+  (two states plus undetermined). It is evidence, not a fix-status verdict; no row ever says a call
+  was added or removed.
   - Two modes: `diff_id` for one binary's diff, or `run_a` + `run_b` for every diff between two
     runs. The run-pair mode also lists the candidates no diff covers: a binary with no diff
     (`binary_not_diffed`), or one hidden behind a same-named binary with different content that was
@@ -21,9 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `presence_reason`, such as an unmatched instruction, a low-confidence function alignment, a
     different callee at the matched call, a matched instruction that is not a candidate on the other
     side, a failed or version-skewed diff, or runs from different extraction generations.
-    `removed` / `added` are given only when a whole function has no counterpart and the other
-    side's analysis is complete. A candidate that only looks gone or new inside an aligned function
-    stays undetermined. `persisted` at a callsite requires the matched call to reach the same sink
+    A whole function with no counterpart on the other side is `presence_undetermined` with reason
+    `function_unmatched`: the function may have been inlined, moved to another binary, or fallen
+    into an analysis hole, so it is not evidence of a deletion or an addition. A candidate that only
+    looks gone or new inside an aligned function stays undetermined too. `persisted` at a callsite requires the matched call to reach the same sink
     by name.
   - Every result carries `coverage`: per-side totals and the number of candidates the rows
     represent. A shortfall is reported as `coverage_violation` with a sample of the missing refs,
@@ -36,8 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exactly. `coverage` always describes the whole diff or run pair, whatever the filters.
 - **New atlas storage, migrated automatically when an older atlas is opened.** `dimension_delta`
   gains nullable candidate columns: presence, key granularity, match basis, counterpart call,
-  co-claimers, folded counts and both sides' generation stamps. A new `instruction_match` table keeps
-  BinDiff's instruction pairs at either side's candidate callsites.
+  co-claimers, folded counts, both sides' generation stamps and the overlay logic version. A new
+  `instruction_match` table keeps BinDiff's instruction pairs at either side's candidate callsites.
+  - A stored overlay baseline carries the logic version that computed it; once the overlay logic
+    changes, every older baseline reads as stale.
   - Until the runs are re-hunted and the diffs re-run, there is no instruction data and every
     callsite-level candidate reads `presence_undetermined` (`crossside_match_degraded`).
 - **Known gap:** the diff readers (`get_diff_deltas`, `get_diff_meta`, `get_function_alignment`,

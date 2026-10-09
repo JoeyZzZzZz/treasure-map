@@ -1669,8 +1669,11 @@ def make_tools(
         reason: str | None = None,
     ) -> dict[str, Any]:
         """Candidate-level SINK OVERLAY (Layer 0.5): line up the A/B sink candidates and report an
-        honest four-state ``presence`` per candidate — ``added`` / ``removed`` / ``persisted`` /
-        ``presence_undetermined``. EVIDENCE ONLY, never a fix-status verdict.
+        honest ``presence`` per candidate — two states plus undetermined: ``persisted`` /
+        ``presence_undetermined``. EVIDENCE ONLY, never a fix-status verdict. A whole function with
+        no counterpart is ``presence_undetermined`` / ``function_unmatched`` — NOT evidence of a
+        deletion or an addition (the function may have been inlined, moved to another binary, or
+        fallen into an analysis hole).
 
         Scope — pass EXACTLY one:
           * ``diff_id`` (``{run_a}::{run_b}::{binary}``; use list_diffs for ids): one binary's diff.
@@ -1693,13 +1696,16 @@ def make_tools(
         Row filters (both modes): ``binary`` / ``sink_class`` / ``presence`` /
         ``min_alignment_confidence``, and ``reason`` (exact ``presence_reason`` match).
 
-        ★ ``removed`` / ``added`` are emitted ONLY when a whole function is unmatched on the other
-        side with analysis complete. A candidate that merely looks gone or new inside an aligned
-        function pair is ``presence_undetermined`` — tmap's own decompile can miss-render a real
-        call, so the safe direction is taken. ``presence_undetermined`` is NOT 'unchanged': read
-        ``presence_reason`` (instruction_unmatched / crossside_match_degraded /
-        counterpart_not_candidate / a_counterpart_not_candidate / present_different_callee /
-        alignment_low_confidence / ... — an enum that may grow; do not branch on it). ``persisted``
+        ★ No row ever says a call is gone or new. A whole function with no counterpart is
+        ``function_unmatched``, not a deletion or an addition; a candidate that merely looks gone
+        or new inside an aligned function pair is ``presence_undetermined`` too — tmap's own
+        decompile can miss-render a real call, so the safe direction is taken. ``presence`` accepts
+        only ``persisted`` / ``presence_undetermined`` (anything else is an error; filter whole
+        unmatched functions with ``reason="function_unmatched"``). ``presence_undetermined`` is NOT
+        'unchanged': read ``presence_reason`` (function_unmatched / instruction_unmatched /
+        crossside_match_degraded / counterpart_not_candidate / a_counterpart_not_candidate /
+        present_different_callee / alignment_low_confidence / ... — an enum that may grow; do not
+        branch on it). ``persisted``
         at the callsite level requires the matched call on the other side to call the SAME sink.
         Each row carries the A/B evidence_ref (the unmatched side is null) for traceback.
 
@@ -1724,6 +1730,15 @@ def make_tools(
                 "diff_id": diff_id,
                 "run_a": run_a,
                 "run_b": run_b,
+            }
+        if presence is not None and presence not in ("persisted", "presence_undetermined"):
+            return {
+                "error": (
+                    f"presence must be 'persisted' or 'presence_undetermined', got {presence!r}: "
+                    "this backend never emits added/removed — a whole function with no "
+                    "counterpart is presence_undetermined; filter it with "
+                    "reason='function_unmatched'"
+                )
             }
         if detail not in ("summary", "rows"):
             return {"error": f"detail must be 'summary' or 'rows', got {detail!r}"}
@@ -1776,8 +1791,9 @@ def make_tools(
                 out["note"] = (
                     "counts only; pass detail='rows' with limit/offset to page through the rows "
                     "(follow next_offset until null). presence_undetermined is NOT unchanged (read "
-                    "presence_reason); removed/added are function-level; coverage is over the "
-                    "whole scope, unaffected by filters."
+                    "presence_reason); a whole function with no counterpart is "
+                    "function_unmatched, not evidence of a deletion or an addition; coverage is "
+                    "over the whole scope, unaffected by filters."
                 )
                 return out
             page = _page_overlay(rows, limit=limit, offset=offset)
@@ -1790,7 +1806,8 @@ def make_tools(
                     "rows": [asdict(r) for r in page["rows"]],
                     "note": (
                         "one page in a fixed neutral order; presence_undetermined is NOT "
-                        "unchanged (read presence_reason); removed/added are function-level."
+                        "unchanged (read presence_reason); a whole function with no counterpart "
+                        "is function_unmatched, not evidence of a deletion or an addition."
                     ),
                 }
             )

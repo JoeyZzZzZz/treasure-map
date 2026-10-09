@@ -799,9 +799,11 @@ def run_version_diff(
 
 
 def _delta_counts(atlas: sqlite3.Connection, diff_id: str) -> dict[str, int]:
-    """The tri-state delta distribution for one diff, read back from what layer2 wrote."""
+    """The tri-state delta distribution for one diff, read back from what layer2 wrote (edge
+    deltas only; the candidate overlay's rows share the table and are not layer2's)."""
     rows = atlas.execute(
-        "SELECT delta_kind, COUNT(*) FROM dimension_delta WHERE diff_id = ? GROUP BY delta_kind",
+        "SELECT delta_kind, COUNT(*) FROM dimension_delta "
+        "WHERE diff_id = ? AND subject_kind != 'candidate' GROUP BY delta_kind",
         (diff_id,),
     ).fetchall()
     return {r[0]: r[1] for r in rows}

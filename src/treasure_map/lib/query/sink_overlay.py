@@ -1,8 +1,8 @@
 """Candidate-level sink overlay (Layer 0.5).
 
 On top of BinDiff's function-level alignment, line up the A/B sink candidates of one diff (or of
-every diff between two runs), or mark them honestly as not lined-up. EVIDENCE ONLY: four states
-(added / removed / persisted / presence_undetermined), never a fix-status verdict, never a
+every diff between two runs), or mark them honestly as not lined-up. EVIDENCE ONLY: two states
+plus undetermined (persisted | presence_undetermined), never a fix-status verdict, never a
 path/taint engine.
 
 Callee backend = atlas + BinDiff (the only data available without re-reading a .BinExport proto or
@@ -10,24 +10,27 @@ a run's analysis.db). BinDiff's instruction table pairs addresses POSITIONALLY a
 callee, so the callee is verified from BOTH sides' atlas candidate records
 (``instance.sink_anchor``, the called sink's name). Where the other side has no candidate at the
 matched address the callee is simply unreadable here, and the result is an honest
-``presence_undetermined`` — NEVER a guessed removed / added.
+``presence_undetermined`` — never a guess that the call is gone or new.
 
 ★ BACKEND SEAM (registered, not built): a future backend could supply the other side's callee and
 upgrade the ``counterpart_not_candidate`` / ``a_counterpart_not_candidate`` buckets into a richer
-counterpart split (a persisting same-callee call that the other side no longer flags -> removed; an
-address that is not a call -> its own reason; ...). Two candidates:
+counterpart split (a persisting same-callee call that the other side no longer flags; an address
+that is not a call; ...). Two candidates:
   * backend B  — read the .BinExport2 protobuf's disassembly for the matched instruction's callee;
   * backend A+ — materialise tmap's own analysis.db call_tokens as the callee source for BOTH sides.
 Either only reclassifies those buckets; neither reworks the model below. A+ is likely more complete
 than B on MIPS (the fact layer sees calls BinExport drops). This module stays on the atlas+BinDiff
 backend and leaves those buckets undetermined.
 
-HONESTY LINE (backend-independent): anything BinExport/BinDiff could not export or match is
-``presence_undetermined`` with a machine-readable reason — NEVER collapsed to unchanged / persisted
-/ removed. ``removed``/``added`` are emitted ONLY at the function level (a whole function unmatched
-on the other side with ``unmatched_analysis_complete``); a candidate that merely "looks gone" or
-"looks new" inside an aligned function pair stays ``presence_undetermined`` (tmap can miss-render a
-real call, and that extraction blindspot cannot be ruled out under this backend — safe direction).
+HONESTY LINE (backend-independent): this layer emits only ``persisted`` and
+``presence_undetermined``. Anything BinExport/BinDiff could not export or match is
+``presence_undetermined`` with a machine-readable reason — NEVER collapsed to unchanged /
+persisted. A whole function with no counterpart is ``presence_undetermined`` /
+``function_unmatched``: the function may have been deleted, inlined into a caller, moved to another
+binary, or fallen into an analysis hole, and this layer cannot tell which. A candidate that merely
+"looks gone" or "looks new" inside an aligned function pair stays ``presence_undetermined`` too
+(tmap can miss-render a real call, and that extraction blindspot cannot be ruled out under this
+backend — safe direction).
 
 COMPLETENESS: every candidate of both sides is represented — named as a row's ``a_ref``/``b_ref``,
 folded into a row's ``coclaimed_by`` / ``coclaimed_by_b``, or counted in a degraded key row's
@@ -43,7 +46,8 @@ carry no function address and cannot be lined up; they are counted as ``excluded
   layer's own guard for callers that bypass that refusal, and apply to every row of the diff.
   run-pair only: ``binary_not_diffed``, ``shadowed_by_name_collision`` (a same-named binary with a
   different content hash was diffed instead).
-  function level: ``counterpart_not_analyzed``, ``no_counterpart_undetermined``,
+  function level: ``function_unmatched`` (no counterpart function; this side's analysis is
+  complete), ``counterpart_not_analyzed``, ``no_counterpart_undetermined``,
   ``alignment_low_confidence``.
   callsite level: ``crossside_match_degraded`` (this diff has no instruction-match data at all),
   ``instruction_unmatched`` (instruction data exists but this callsite was not matched — an export
@@ -88,19 +92,21 @@ _G_DEGRADED = "degraded_out_of_body"
 _G_FUNCTION_FALLBACK = "function_fallback"
 _G_WRAPPER = "wrapper"
 
-# presence four-state
-_P_ADDED = "added"
-_P_REMOVED = "removed"
+# presence: persisted | presence_undetermined (this layer never claims a call is gone or new)
 _P_PERSISTED = "persisted"
 _P_UNDET = "presence_undetermined"
+_PRESENCE_VALUES = (_P_PERSISTED, _P_UNDET)
 
 # presence -> delta_kind projection (CHECK-safe), so existing delta_kind consumers keep working
 _DELTA_KIND = {
-    _P_ADDED: "layer_changed",
-    _P_REMOVED: "layer_changed",
     _P_PERSISTED: "layer_unchanged",
     _P_UNDET: "delta_undetermined",
 }
+
+# The logic version stamped on every persisted baseline row. Bump it whenever the way a row is
+# computed changes (a verdict, a reason, a key, a fold): a baseline written by other logic is then
+# read as stale instead of being compared as if it were current.
+SINK_OVERLAY_LOGIC_VERSION = "2"
 
 _UNREPRESENTED_SAMPLE = 20  # refs listed when the coverage invariant breaks (diagnosis, not a dump)
 
@@ -117,7 +123,7 @@ class SinkOverlayRow:
     a_ref: str | None
     b_ref: str | None
     key_granularity: str
-    presence: str  # added | removed | persisted | presence_undetermined
+    presence: str  # persisted | presence_undetermined
     presence_reason: str | None  # machine-readable; only when presence_undetermined
     match_basis: str | None  # instruction | function_level
     counterpart_call: str | None  # present_different_callee | counterpart_not_candidate (tier-1)
@@ -484,7 +490,6 @@ class _Dir:
     presence: dict[str, str]  # this side's unmatched-function presence states
     imatch: dict[str, str]  # this side's callsite addr -> other side's matched addr
     imatch_present: bool
-    gone: str  # presence for a whole function unmatched with analysis complete
     no_cand_reason: str  # matched instruction on the other side is not a candidate
 
 
@@ -493,13 +498,17 @@ _Verdict = tuple[str, str | None, str | None, str | None, _Cand | None]
 
 
 def _function_unmatched(fe: str, d: _Dir) -> tuple[str, str | None]:
-    """(presence, reason) for a candidate whose function has no counterpart on the other side.
+    """(presence, reason) for a candidate whose function has no counterpart on the other side —
+    ALWAYS undetermined.
 
-    removed/added ONLY when the other side's analysis is complete. An unmatched function whose
-    analysis is incomplete, or an inventory mismatch, is undetermined, never removed/added."""
+    ``unmatched_analysis_complete`` says only that THIS side's function exists and was decompiled.
+    On the other side the function may have been deleted, inlined into a caller, moved to another
+    binary, or fallen into an analysis hole; this layer cannot tell which, so it is never read as a
+    removal or an addition: ``function_unmatched``. With no presence record at all the counterpart
+    was never analysed; an incomplete analysis or an inventory mismatch is undetermined as well."""
     pstate = d.presence.get(fe)
     if pstate == "unmatched_analysis_complete":
-        return d.gone, None
+        return _P_UNDET, "function_unmatched"
     if pstate is None:
         return _P_UNDET, "counterpart_not_analyzed"
     return _P_UNDET, "no_counterpart_undetermined"
@@ -541,7 +550,7 @@ def _tier1_verdict(cand: _Cand, d: _Dir) -> _Verdict:
         # object of a callsite-tier match.
         return _P_UNDET, "crossgranularity_unresolved", "instruction", None, None
     # matched, but the other side has no candidate there: its callee is unreadable under the
-    # atlas+BinDiff backend -> honest undetermined, never a guessed removed/added.
+    # atlas+BinDiff backend -> honest undetermined, never a guess that the call is gone or new.
     return _P_UNDET, d.no_cand_reason, "instruction", "counterpart_not_candidate", None
 
 
@@ -549,7 +558,7 @@ def _funclevel_verdict(cand: _Cand, other_fe: str, d: _Dir) -> _Verdict:
     """A function_fallback / wrapper candidate in an aligned, high-confidence function pair: the
     other side carries the same (function, key_class) at the same function-level granularity ->
     persisted. Otherwise undetermined — a candidate that merely looks gone/new inside an aligned
-    function is NEVER removed/added (the safe direction)."""
+    function is never read as gone or new (the safe direction)."""
     peers = d.other.fn_key.get((other_fe, _key_class(cand)), [])
     if peers:
         return _P_PERSISTED, None, "function_level", None, peers[0]
@@ -844,7 +853,6 @@ def _compute(atlas: sqlite3.Connection, diff_id: str) -> _Computed | None:
         presence=ctx.presence_a,
         imatch=ctx.imatch,
         imatch_present=ctx.imatch_present,
-        gone=_P_REMOVED,
         no_cand_reason="counterpart_not_candidate",
     )
     db = _Dir(
@@ -855,7 +863,6 @@ def _compute(atlas: sqlite3.Connection, diff_id: str) -> _Computed | None:
         presence=ctx.presence_b,
         imatch=ctx.imatch_b,
         imatch_present=ctx.imatch_present,
-        gone=_P_ADDED,
         no_cand_reason="a_counterpart_not_candidate",
     )
     b_row_of: dict[int, int] = {}
@@ -898,6 +905,17 @@ def _coverage(a: _Loaded, b: _Loaded, out: _Out) -> SinkOverlayCoverage:
     )
 
 
+def _check_presence_filter(presence: str | None) -> None:
+    """Reject a presence filter this layer can never satisfy, instead of answering an empty list
+    that would read as "none found"."""
+    if presence is not None and presence not in _PRESENCE_VALUES:
+        raise ValueError(
+            f"presence must be None, 'persisted' or 'presence_undetermined', got {presence!r}: "
+            "this backend never emits added/removed; a whole function with no counterpart is "
+            "presence_undetermined with reason='function_unmatched'"
+        )
+
+
 def compute_sink_overlay(
     atlas: sqlite3.Connection,
     diff_id: str,
@@ -910,6 +928,7 @@ def compute_sink_overlay(
     """Live-compute the candidate-level sink overlay for one diff. Reads function_alignment +
     function_presence + instruction_match + both runs' candidate tables; writes nothing. The
     filters narrow the rows only; ``coverage`` always describes the whole diff."""
+    _check_presence_filter(presence)
     comp = _compute(atlas, diff_id)
     if comp is None:
         empty = _Loaded([], 0)
@@ -934,6 +953,7 @@ def compute_sink_overlay_runs(
     ``shadowed_by_name_collision`` when a same-named binary with a different content hash WAS
     diffed (the name-keyed diff picked the other one), else ``binary_not_diffed``. Those rows have
     no diff_id and are never persisted. ``coverage`` is over both runs' whole candidate sets."""
+    _check_presence_filter(presence)
     diffs = atlas.execute(
         "SELECT diff_id, sha256_a, sha256_b, binary_a, binary_b FROM diff_meta "
         "WHERE run_a_id = ? AND run_b_id = ? ORDER BY diff_id",
@@ -1138,6 +1158,7 @@ def persist_sink_overlay(atlas: sqlite3.Connection, diff_id: str, *, commit: boo
                 build_hash_b=bh_b,
                 hunt_instances_a=hi_a,
                 hunt_instances_b=hi_b,
+                overlay_version=SINK_OVERLAY_LOGIC_VERSION,
             )
         )
     keys = [d.subject_key for d in dd_rows]
@@ -1156,7 +1177,9 @@ def read_sink_overlay_baseline(atlas: sqlite3.Connection, diff_id: str) -> dict[
     Every stored row's generation stamps (hunt_commit / build_hash / hunt_instances, both sides)
     are compared with the runs' CURRENT values. Any difference means a run was re-hunted or
     re-scanned after the baseline was written, so its rows describe candidates that may no longer
-    exist: the answer is ``stale_baseline: true`` with the differing fields, and no rows."""
+    exist. Its ``overlay_version`` is compared with SINK_OVERLAY_LOGIC_VERSION: rows written by
+    other overlay logic would not match a live computation. Either way the answer is
+    ``stale_baseline: true`` with the differing fields, and no rows."""
     ctx = _load_diff_ctx(atlas, diff_id)
     if ctx is None:
         return {"diff_id": diff_id, "error": "no such diff"}
@@ -1164,7 +1187,7 @@ def read_sink_overlay_baseline(atlas: sqlite3.Connection, diff_id: str) -> dict[
         "SELECT subject_key, presence, undetermined_reason, key_granularity, match_basis, "
         "counterpart_call, coclaimed_by, a_n, b_n, alignment_confidence, binary, "
         "hunt_commit_a, hunt_commit_b, build_hash_a, build_hash_b, "
-        "hunt_instances_a, hunt_instances_b "
+        "hunt_instances_a, hunt_instances_b, overlay_version "
         "FROM dimension_delta WHERE diff_id = ? AND subject_kind = 'candidate' ORDER BY id",
         (diff_id,),
     ).fetchall()
@@ -1182,6 +1205,8 @@ def read_sink_overlay_baseline(atlas: sqlite3.Connection, diff_id: str) -> dict[
                 stored_val = row[offset + 2 * i]
                 if cur is None or stored_val != cur[i]:
                     mismatched.add(f"{name}_{side}")
+        if row[17] != SINK_OVERLAY_LOGIC_VERSION:  # NULL (a pre-stamp baseline) is stale too
+            mismatched.add("overlay_version")
     if mismatched:
         return {
             "diff_id": diff_id,

@@ -478,7 +478,10 @@ def list_diffs(
         "SUM(CASE WHEN dd.delta_kind='layer_unchanged' THEN 1 ELSE 0 END), "
         "SUM(CASE WHEN dd.delta_kind='delta_undetermined' THEN 1 ELSE 0 END), "
         "dm.sha256_a, dm.sha256_b "
+        # Edge deltas only: the candidate overlay's rows share the table. The scope sits in the ON
+        # clause, not WHERE, so a diff with no edge rows still lists (with zero counts).
         "FROM diff_meta dm LEFT JOIN dimension_delta dd ON dd.diff_id = dm.diff_id "
+        "AND dd.subject_kind != 'candidate' "
         f"{clause} GROUP BY dm.diff_id ORDER BY dm.run_a_id, dm.run_b_id, dm.binary_a",
         params,
     ).fetchall()

@@ -171,6 +171,20 @@ def _tools(tmp_path: Path):
     return mcp_app.make_tools(_mk_atlas(tmp_path))
 
 
+def test_sink_overlay_presence_filter_never_added_or_removed(tmp_path: Path) -> None:
+    """The overlay never emits added/removed, so asking for them is an error that points at the
+    real reason (``function_unmatched``) — never an empty answer that reads as "none found".
+
+    MUTATION (verified RED): drop the presence check in ``get_diff_sink_overlay`` -> the library
+    raises instead of answering."""
+    tool = _tools(tmp_path)["get_diff_sink_overlay"]
+    for bad in ("removed", "added"):
+        out = tool("run_m::run_m::libx", presence=bad)
+        assert "function_unmatched" in out["error"], bad
+    ok = tool("run_m::run_m::libx", presence="persisted")
+    assert "error" not in ok and ok["summary"]["total_rows"] == 0
+
+
 # ── discoverability ──────────────────────────────────────────────────────────────────
 
 

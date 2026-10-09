@@ -845,6 +845,7 @@ def test_open_atlas_drops_a_stale_exec_edge_resolved_via(tmp_path: Path) -> None
         ("instance", "exposure_shape"),
         ("diff_meta", "binary_a"),
         ("nvram_key_flow", "via_wrapper"),
+        ("dimension_delta", "overlay_version"),
     ],
 )
 def test_open_atlas_reopens_old_shape_missing_migrated_column(
@@ -1112,5 +1113,35 @@ def test_rebuilt_overlay_keeps_every_other_constraint(tmp_path: Path) -> None:
             "created_at",
             "updated_at",
         }
+    finally:
+        conn.close()
+
+
+def test_fresh_atlas_takes_an_edge_delta_row(tmp_path: Path) -> None:
+    """A brand-new atlas (no migration ran: the table comes from the schema file alone) accepts
+    the full dimension_delta insert, so the schema file carries every column the writer names.
+
+    MUTATION (verified RED): drop ``overlay_version`` from the CREATE in atlas_schema.sql -> the
+    insert fails on the missing column."""
+    from treasure_map.lib.atlas.models import DimensionDeltaRow
+    from treasure_map.lib.atlas.writer import add_dimension_deltas
+
+    conn = open_atlas(tmp_path / "fresh.db")
+    try:
+        n = add_dimension_deltas(
+            conn,
+            [
+                DimensionDeltaRow(
+                    diff_id="ra::rb::libx",
+                    dimension="reachability",
+                    subject_kind="edge",
+                    subject_key="edge|k",
+                    delta_kind="layer_unchanged",
+                )
+            ],
+        )
+        assert n == 1
+        row = conn.execute("SELECT subject_kind, overlay_version FROM dimension_delta").fetchone()
+        assert tuple(row) == ("edge", None)
     finally:
         conn.close()

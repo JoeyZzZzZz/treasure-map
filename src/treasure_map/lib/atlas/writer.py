@@ -328,8 +328,8 @@ def add_dimension_deltas(
             undetermined_scope, undetermined_reason, capability_ref, alignment_confidence,
             presence, key_granularity, match_basis, counterpart_call, coclaimed_by, a_n, b_n,
             hunt_commit_a, hunt_commit_b, build_hash_a, build_hash_b, hunt_instances_a,
-            hunt_instances_b)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            hunt_instances_b, overlay_version)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         [
             (
                 r.diff_id,
@@ -357,6 +357,7 @@ def add_dimension_deltas(
                 r.build_hash_b,
                 r.hunt_instances_a,
                 r.hunt_instances_b,
+                r.overlay_version,
             )
             for r in rows
         ],
