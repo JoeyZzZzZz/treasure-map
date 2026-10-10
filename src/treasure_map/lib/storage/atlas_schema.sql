@@ -684,7 +684,7 @@ CREATE TABLE IF NOT EXISTS dimension_delta (
     -- (persisted -> layer_unchanged, presence_undetermined -> delta_undetermined), so existing
     -- delta_kind consumers keep working while the honest result lives here.
     presence             TEXT,            -- 'persisted' | 'presence_undetermined'
-    key_granularity      TEXT,            -- 'callsite' | 'degraded_out_of_body' | 'function_fallback' | 'wrapper'
+    key_granularity      TEXT,            -- 'callsite' | 'wrapper_callsite' | 'degraded_out_of_body' | 'function_fallback' | 'wrapper'
     match_basis          TEXT,            -- 'instruction' | 'function_level' | 'ordinal_singleton'
     counterpart_call     TEXT,            -- tier-1 only: 'present_same_callee' | 'present_different_callee'
                                           --   | 'not_a_call' | 'absent' | 'unknown' (NULL when persisted / n/a)

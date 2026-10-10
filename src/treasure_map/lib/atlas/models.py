@@ -425,9 +425,8 @@ class DimensionDeltaRow:
     # (the BinExport five-way split is a future backend, never guessed here). ``coclaimed_by`` is a
     # JSON list. The six generation stamps and ``overlay_version`` gate read-time staleness.
     presence: str | None = None
-    key_granularity: str | None = (
-        None  # 'callsite'|'degraded_out_of_body'|'function_fallback'|'wrapper'
-    )
+    # 'callsite'|'wrapper_callsite'|'degraded_out_of_body'|'function_fallback'|'wrapper'
+    key_granularity: str | None = None
     match_basis: str | None = None  # 'instruction'|'function_level'|'ordinal_singleton'
     counterpart_call: str | None = None
     coclaimed_by: str | None = None  # JSON list of co-claiming function entries (co-claim fold)

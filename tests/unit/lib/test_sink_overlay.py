@@ -261,7 +261,9 @@ def test_tier3_persisted_and_undetermined(atlas: sqlite3.Connection) -> None:
     assert ps is not None and ps.presence == "presence_undetermined"
 
 
-def test_wrapper_persisted(atlas: sqlite3.Connection) -> None:
+def test_wrapper_fallback_persisted(atlas: sqlite3.Connection) -> None:
+    """The function-level wrapper fallback (bare axis ref, no call located) keeps its own tier and
+    matches the same (function, axis) key on the other side."""
     r = _by(_rows(atlas), a_off="cmd_via_wrapper")
     assert r is not None and r.presence == "persisted" and r.key_granularity == "wrapper"
 
@@ -976,6 +978,30 @@ _GOLDEN: dict[str, dict[str, object]] = {
         "by_sink_class": {"cmd": 9, "copy": 2, "format": 1, "path_sink": 1},
         "by_binary": {"libx": 13},
     },
+    # logic 3 adds the wrapper_callsite tier; this fixture holds no call to a wrapper, so its
+    # summary is unchanged (the wrapper tier is pinned by the wrapper tests below)
+    "3": {
+        "total_rows": 13,
+        "by_presence": {"persisted": 4, "presence_undetermined": 9},
+        "by_presence_reason": {
+            "persisted|-": 4,
+            "presence_undetermined|alignment_low_confidence": 1,
+            "presence_undetermined|counterpart_not_candidate": 1,
+            "presence_undetermined|crossside_count_mismatch": 1,
+            "presence_undetermined|function_unmatched": 2,
+            "presence_undetermined|instruction_unmatched": 1,
+            "presence_undetermined|no_counterpart_undetermined": 2,
+            "presence_undetermined|present_different_callee": 1,
+        },
+        "by_key_granularity": {
+            "callsite": 8,
+            "degraded_out_of_body": 2,
+            "function_fallback": 2,
+            "wrapper": 1,
+        },
+        "by_sink_class": {"cmd": 9, "copy": 2, "format": 1, "path_sink": 1},
+        "by_binary": {"libx": 13},
+    },
 }
 
 
@@ -1064,3 +1090,180 @@ def test_baseline_from_other_logic_is_stale(atlas: sqlite3.Connection, stored: s
     out = so.read_sink_overlay_baseline(atlas, DIFF_ID)
     assert out["stale_baseline"] is True and out["rows"] is None
     assert out["mismatched_fields"] == ["overlay_version"]
+
+
+# ── wrapper candidates lined up per call ──────────────────────────────────────────────────────
+
+
+def _wflow(name: str | None, addr: str | None, deg: str | None = None, located: bool = True) -> str:
+    """flow_evidence of a wrapper candidate: the wrapper hop, optionally a degraded call."""
+    wrapper: dict[str, object] = {"wrapped_sink": "system"}
+    if name is not None:
+        wrapper["name"] = name
+    if addr is not None:
+        wrapper["addr"] = addr
+    flow: dict[str, object] = {"flow_path": {"sink_via_wrapper": True, "wrapper": wrapper}}
+    if not located:
+        flow["callsite_located"] = False
+        flow["anchor_degraded"] = "out_of_body"
+        if deg is not None:
+            flow["callsite_addr"] = deg
+    return json.dumps(flow)
+
+
+W_A, W_B = "00050000", "00060000"  # a thin wrapper's entry on each side
+
+
+def _wrapper_pair(
+    conn: sqlite3.Connection,
+    *,
+    a: tuple[str | None, str | None] = ("do_cmd", W_A),
+    b: tuple[str | None, str | None] = ("do_cmd", W_B),
+    b_sink: str = "system",
+    align_w: bool = True,
+) -> tuple[str, str]:
+    """One call to a wrapper in F1 on each side, matched instruction-to-instruction at +0x90."""
+    if align_w:
+        _falign(conn, W_A, W_B, 0.95, "aligned")
+    a_ref = _ref("runA", "00001000", "cmd_via_wrapper", "0x000090")
+    b_ref = _ref("runB", "00002000", "cmd_via_wrapper", "0x000090")
+    _inst(conn, "runA", SHA_A, a_ref, "cmd", _wflow(*a), sink="system")
+    _inst(conn, "runB", SHA_B, b_ref, "cmd", _wflow(*b), sink=b_sink)
+    _imatch(conn, "00001090", "00002090", "00001000")
+    return a_ref, b_ref
+
+
+def test_wrapper_call_with_aligned_wrapper_persists(atlas: sqlite3.Connection) -> None:
+    """MUTATION (verified RED): leave wrapper_callsite out of ``t1_at`` in ``_index`` -> the B call
+    is not found at the matched address."""
+    a_ref, b_ref = _wrapper_pair(atlas)
+    res = so.compute_sink_overlay(atlas, DIFF_ID)
+    r = _by(res.rows, a_off=a_ref)
+    assert r is not None and r.key_granularity == "wrapper_callsite"
+    assert r.presence == "persisted" and r.b_ref == b_ref and r.match_basis == "instruction"
+    _assert_full_coverage(res)
+
+
+def test_wrapper_identity_is_its_aligned_address_not_its_name(atlas: sqlite3.Connection) -> None:
+    """Two stripped wrappers named after their own (different) addresses are the same function when
+    the alignment pairs them; the names would have said otherwise.
+
+    MUTATION (verified RED): compare ``callee_name`` before the address in ``_same_callee`` -> the
+    differing ``FUN_`` names read as a different callee."""
+    a_ref, _ = _wrapper_pair(atlas, a=(f"FUN_{W_A}", W_A), b=(f"FUN_{W_B}", W_B))
+    r = _by(_rows(atlas), a_off=a_ref)
+    assert r is not None and r.presence == "persisted"
+
+
+def test_wrapper_without_alignment_is_unreadable(atlas: sqlite3.Connection) -> None:
+    a_ref, _ = _wrapper_pair(atlas, align_w=False)
+    r = _by(_rows(atlas), a_off=a_ref)
+    assert r is not None and r.presence_reason == "callee_unreadable"
+
+
+def test_wrapper_aligned_elsewhere_is_a_different_callee(atlas: sqlite3.Connection) -> None:
+    """A's wrapper aligns to some OTHER B function than the one B's call reaches.
+
+    MUTATION (verified RED): treat any aligned wrapper address as the same callee (return True
+    whenever an alignment exists) -> persisted."""
+    a_ref, _ = _wrapper_pair(atlas, b=("do_cmd", "00080000"))
+    r = _by(_rows(atlas), a_off=a_ref)
+    assert r is not None and r.presence_reason == "present_different_callee"
+    assert r.counterpart_call == "present_different_callee"
+
+
+def test_same_wrapper_forwarding_to_another_sink_is_a_different_callee(
+    atlas: sqlite3.Connection,
+) -> None:
+    """MUTATION (verified RED): drop the wrapped-sink comparison for wrappers in
+    ``_same_callee`` -> the same aligned W reads persisted."""
+    a_ref, _ = _wrapper_pair(atlas, b_sink="popen")
+    r = _by(_rows(atlas), a_off=a_ref)
+    assert r is not None and r.presence_reason == "present_different_callee"
+
+
+def test_wrapper_against_direct_sink_is_a_different_callee(atlas: sqlite3.Connection) -> None:
+    """A wrapper call matched to a direct call of the same sink (the wrapper was inlined, or
+    introduced) is a different callee, in either orientation.
+
+    MUTATION (verified RED): drop the type check in ``_same_callee`` -> the direct-vs-wrapper
+    orientation compares sink names only and reads persisted."""
+    _falign(atlas, W_A, W_B, 0.95, "aligned")
+    inl_a = _ref("runA", "00001000", "cmd_via_wrapper", "0x0000a0")
+    _inst(atlas, "runA", SHA_A, inl_a, "cmd", _wflow("do_cmd", W_A), sink="system")
+    _inst(atlas, "runB", SHA_B, _ref("runB", "00002000", "cmd", "0x0000a0"), "cmd", sink="system")
+    _imatch(atlas, "000010a0", "000020a0", "00001000")
+    intro_a = _ref("runA", "00001000", "cmd", "0x0000b0")
+    _inst(atlas, "runA", SHA_A, intro_a, "cmd", sink="system")
+    wb = _ref("runB", "00002000", "cmd_via_wrapper", "0x0000b0")
+    _inst(atlas, "runB", SHA_B, wb, "cmd", _wflow("do_cmd", W_B), sink="system")
+    _imatch(atlas, "000010b0", "000020b0", "00001000")
+    rows = _rows(atlas)
+    for ref in (inl_a, intro_a):
+        r = _by(rows, a_off=ref)
+        assert r is not None and r.presence_reason == "present_different_callee", ref
+
+
+def test_wrapper_with_no_recorded_callee_is_unreadable(atlas: sqlite3.Connection) -> None:
+    a_ref, _ = _wrapper_pair(atlas, a=(None, None))
+    r = _by(_rows(atlas), a_off=a_ref)
+    assert r is not None and r.presence_reason == "callee_unreadable"
+
+
+def test_wrapper_names_decide_only_when_no_address_is_recorded(atlas: sqlite3.Connection) -> None:
+    """An older hunt recorded the wrapper's name only: same name, same sink -> persisted."""
+    a_ref, _ = _wrapper_pair(atlas, a=("do_cmd", None), b=("do_cmd", None), align_w=False)
+    r = _by(_rows(atlas), a_off=a_ref)
+    assert r is not None and r.presence == "persisted"
+
+
+def test_wrapper_and_direct_degraded_keys_stay_apart(atlas: sqlite3.Connection) -> None:
+    """A degraded wrapper call and a degraded direct call of the same sink class in one function
+    are different keys (the wrapper's key class is its axis).
+
+    MUTATION (verified RED): key ``_degraded_keys`` by sink_class again -> one key of count 2."""
+    _inst(atlas, "runA", SHA_A, _ref("runA", "0000b000", "cmd"), "cmd", DEG)
+    _inst(
+        atlas,
+        "runA",
+        SHA_A,
+        _ref("runA", "0000b000", "cmd_via_wrapper"),
+        "cmd",
+        _wflow("do_cmd", W_A, located=False),
+    )
+    res = so.compute_sink_overlay(atlas, DIFF_ID)
+    keys = sorted(
+        (r.a_ref or "", r.a_n)
+        for r in res.rows
+        if r.key_granularity == "degraded_out_of_body" and r.sink_class == "cmd"
+    )
+    assert keys == [
+        (_ref("runA", "0000b000", "cmd"), 1),
+        (_ref("runA", "0000b000", "cmd_via_wrapper"), 1),
+    ]
+    _assert_full_coverage(res)
+
+
+def test_degraded_wrapper_call_folds_into_the_wrapper_callsite(atlas: sqlite3.Connection) -> None:
+    """A degraded wrapper candidate whose recovered call address is a wrapper_callsite on the same
+    side folds into that row, and every candidate stays represented."""
+    a_ref, _ = _wrapper_pair(atlas)
+    _falign(atlas, "00016000", "00026000", 0.95, "aligned")
+    deg = _ref("runA", "00016000", "cmd_via_wrapper")
+    _inst(atlas, "runA", SHA_A, deg, "cmd", _wflow("do_cmd", W_A, deg="0x1090", located=False))
+    res = so.compute_sink_overlay(atlas, DIFF_ID)
+    r = _by(res.rows, a_off=a_ref)
+    assert r is not None and r.coclaimed_by == ["00016000"]
+    assert not [x for x in res.rows if x.a_ref == deg]
+    _assert_full_coverage(res)
+
+
+def test_layer0_collects_wrapper_call_addresses(tmp_path: Path) -> None:
+    """MUTATION (verified RED): drop the ``wrapper_call_abs_addr`` fallback in
+    ``_candidate_callsite_addrs`` -> the wrapper call's instruction pair is not kept."""
+    from treasure_map.lib.diff.layer0 import _candidate_callsite_addrs
+
+    atlas = open_atlas(tmp_path / "atlas.db")
+    _inst(atlas, "runA", SHA_A, _ref("runA", "00001000", "cmd_via_wrapper", "0x000090"), "cmd")
+    _inst(atlas, "runA", SHA_A, _ref("runA", "00001000", "cmd", "0x000010"), "cmd")
+    assert _candidate_callsite_addrs(atlas, "runA", SHA_A) == {"00001090", "00001010"}

@@ -49,6 +49,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Wrapper-forwarded candidates are split per call.** A function that reaches a sink through a
+  thin wrapper used to yield one candidate per axis, for the first wrapper by name, read from its
+  first call. It now yields one candidate per call to each wrapper, and its ref names that call:
+  `…@cmd_via_wrapper@<offset>`, the offset of the call to the wrapper. Calls are counted in text
+  order, not address order. Only a function-level fallback, kept when no call to the wrapper can be
+  found in the text (a call through a function pointer), keeps the bare ref; a call that is found
+  but cannot be pinned to an in-body address keeps it too, marked `callsite_located: false`.
+  - Annotations and judgements stored on an old wrapper ref no longer resolve and need to be
+    re-pointed.
+  - The evidence of each candidate (the forwarded argument, the constant-command note, the
+    recovered literal format) is read from that candidate's own call.
+  - Readers that count instances, such as `pattern_density` and `cross_firmware_patterns`, now count
+    wrapper patterns per call: roughly 3.35 times the previous count on the firmware measured.
+  - The sink overlay gains a `wrapper_callsite` key granularity. A matched pair of calls is the same
+    only when both are the same type (direct sink or wrapper) and call the same callee and sink; a
+    wrapper is identified by its entry address through the diff's function alignment, not by name.
+
 - **`get_diff_deltas` no longer returns candidate rows.** It returns the edge-level deltas only;
   candidate presence is read through `get_diff_sink_overlay`.
 

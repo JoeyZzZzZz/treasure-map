@@ -167,7 +167,7 @@ def test_no_wrapper_means_no_candidates() -> None:
 
 
 def test_deterministic_wrapper_pick_when_several() -> None:
-    # Caller invokes two wrappers; the candidate names one deterministically (first by name).
+    # Caller invokes two wrappers once each: one candidate per call, ordered by wrapper name.
     w2 = _fn(2, "run_sh", 'void run_sh(char* param_1){ popen(param_1,"r"); }', ["popen"])
     caller = _fn(
         3,
@@ -175,8 +175,8 @@ def test_deterministic_wrapper_pick_when_several() -> None:
         'void multi(void){ char c[64]; snprintf(c,64,"%s",x); do_cmd(c); run_sh(c); }',
         ["snprintf", "do_cmd", "run_sh"],
     )
-    (c,) = find_wrapper_propagated_candidates([_WRAPPER, w2, caller])
-    assert c.wrapper_name == "do_cmd"  # 'do_cmd' < 'run_sh'
+    cands = find_wrapper_propagated_candidates([_WRAPPER, w2, caller])
+    assert [(c.wrapper_name, c.occurrence) for c in cands] == [("do_cmd", 0), ("run_sh", 0)]
 
 
 # ── the format-string axis (缺口①): symmetric one-hop propagation through a thin fmt wrapper ──
@@ -268,3 +268,70 @@ def test_a_wrapper_whose_sink_call_is_stub_rendered_is_found_with_the_stub_table
     assert cands[0].wrapped_sink == "system"
     # a table for another binary says nothing about this one
     assert find_wrapper_propagated_candidates([wrapper, caller], {2: {0x412000: "system"}}) == []
+
+
+# ── one candidate per CALL to a wrapper ─────────────────────────────────────────────────────────
+
+
+def test_one_candidate_per_call_in_text_order() -> None:
+    """Each call to a wrapper forwards its own argument, so each is its own candidate: two calls to
+    do_cmd and one to run_sh give three, ordered by wrapper name then occurrence, each naming its
+    wrapper's own entry.
+
+    MUTATION (verified RED): emit only occurrence 0 per wrapper in ``_axis_candidates`` -> two."""
+    w2 = _fn(7, "run_sh", 'void run_sh(char* param_1){ popen(param_1,"r"); }', ["popen"])
+    caller = _fn(
+        9,
+        "multi",
+        "void multi(void){ run_sh(a); do_cmd(b); do_cmd(c); }",
+        ["do_cmd", "run_sh"],
+    )
+    cands = find_wrapper_propagated_candidates([_WRAPPER, w2, caller])
+    assert [(c.wrapper_name, c.occurrence, c.wrapper_addr) for c in cands] == [
+        ("do_cmd", 0, _WRAPPER.address),
+        ("do_cmd", 1, _WRAPPER.address),
+        ("run_sh", 0, w2.address),
+    ]
+
+
+def test_direct_sink_on_the_axis_skips_every_wrapper_call() -> None:
+    caller = _fn(
+        9,
+        "both",
+        "void both(void){ system(a); do_cmd(b); do_cmd(c); }",
+        ["system", "do_cmd"],
+    )
+    assert find_wrapper_propagated_candidates([_WRAPPER, caller]) == []
+
+
+def test_unlocatable_wrapper_call_keeps_one_function_level_candidate() -> None:
+    """The callee list names the wrapper but the text calls it through a pointer: one candidate,
+    occurrence None — never dropped, never guessed onto a call.
+
+    MUTATION (verified RED): drop the fallback in ``_axis_candidates`` -> no candidate."""
+    caller = _fn(
+        9,
+        "indirect",
+        "void indirect(void){ code *ptr; ptr = do_cmd; (*ptr)(a); }",
+        ["do_cmd"],
+    )
+    (c,) = find_wrapper_propagated_candidates([_WRAPPER, caller])
+    assert (c.wrapper_name, c.occurrence, c.wrapper_addr) == ("do_cmd", None, _WRAPPER.address)
+
+
+def test_calls_are_counted_with_the_stub_table_the_readers_use() -> None:
+    """A call rendered after its stub (``FUN_<addr>(…)``) counts as a call to the wrapper when the
+    binary's stub table resolves it, in text order with the plain calls — the same enumeration the
+    per-call argument readers use, so candidate k and the call whose argument is read agree.
+
+    MUTATION (verified RED): count calls without ``stub_names`` in ``_axis_candidates`` -> one
+    candidate, and occurrence 1 then reads a call that does not exist."""
+    from treasure_map.lib.hunt.analyzer2 import _wrapper_sink_arg
+
+    pc = "void f(void){ FUN_00012340(first); do_cmd(second); }"
+    caller = _fn(9, "f", pc, ["do_cmd"])
+    stubs = {0x12340: "do_cmd"}
+    cands = find_wrapper_propagated_candidates([_WRAPPER, caller], {1: stubs})
+    assert [c.occurrence for c in cands] == [0, 1]
+    read = [_wrapper_sink_arg(pc, "do_cmd", None, stubs, c.occurrence) for c in cands]
+    assert read == ["first", "second"]

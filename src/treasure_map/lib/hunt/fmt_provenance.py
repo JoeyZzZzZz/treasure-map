@@ -52,9 +52,13 @@ _C_ESCAPES = {
 
 
 def call_arguments(
-    pseudocode: str, callee: str, stub_names: Mapping[int, str] | None = None
+    pseudocode: str,
+    callee: str,
+    stub_names: Mapping[int, str] | None = None,
+    occurrence: int = 0,
 ) -> list[str] | None:
-    """The argument expressions of the FIRST call to ``callee``, split at top level.
+    """The argument expressions of the ``occurrence``-th call to ``callee`` (0-based, default the
+    first), split at top level. None when that call does not exist.
 
     Depth- and string-aware, unlike a plain ``split(",")``: a nested call
     (``log(2, "%s", f(a, b))``) and a comma inside a string literal both keep their argument
@@ -67,14 +71,14 @@ def call_arguments(
     belongs with the others even though it produces a record and not a candidate.
     """
     offsets = call_offsets(pseudocode, callee, stub_names)
-    if not offsets:
+    if occurrence < 0 or occurrence >= len(offsets):
         return None
     args: list[str] = []
     current: list[str] = []
     depth = 1
     in_string = False
     escaped = False
-    for ch in pseudocode[offsets[0] + 1 :]:
+    for ch in pseudocode[offsets[occurrence] + 1 :]:
         if in_string:
             current.append(ch)
             if escaped:
@@ -131,24 +135,39 @@ def _string_literal(expr: str) -> str | None:
     return "".join(out)
 
 
-def format_argument(pseudocode: str, wrapper_name: str, index: int) -> str | None:
-    """The caller's argument at the wrapper's format POSITION, verbatim, or None.
+def format_argument(
+    pseudocode: str,
+    wrapper_name: str,
+    index: int,
+    *,
+    stub_names: Mapping[int, str] | None = None,
+    occurrence: int = 0,
+) -> str | None:
+    """The caller's argument at the wrapper's format POSITION, verbatim, or None — read from the
+    ``occurrence``-th call to the wrapper (default the first).
 
     None when the call cannot be read or has fewer arguments than the wrapper's signature declares
     — a mismatch means the two views disagree and nothing here should pick one."""
     if index < 0:
         return None
-    args = call_arguments(pseudocode, wrapper_name)
+    args = call_arguments(pseudocode, wrapper_name, stub_names, occurrence)
     if args is None or index >= len(args):
         return None
     return args[index]
 
 
 def constant_format_record(
-    *, pseudocode: str, wrapper_name: str, wrapped_sink: str, index: int | None
+    *,
+    pseudocode: str,
+    wrapper_name: str,
+    wrapped_sink: str,
+    index: int | None,
+    stub_names: Mapping[int, str] | None = None,
+    occurrence: int = 0,
 ) -> list[dict[str, Any]]:
     """A one-record ``sink_arg_provenance`` list when the caller's format argument is a literal
-    spelled out at the call site; otherwise an EMPTY list.
+    spelled out at the call site; otherwise an EMPTY list. The call read is the ``occurrence``-th
+    call to the wrapper (default the first), located with ``stub_names`` like every other reader.
 
     The record's shape is the one the read side already understands — ``sink`` matching the
     candidate's anchored sink so the verdict is scoped to it, and a ``constant`` provenance whose
@@ -176,7 +195,9 @@ def constant_format_record(
     """
     if index is None:
         return []
-    arg = format_argument(pseudocode, wrapper_name, index)
+    arg = format_argument(
+        pseudocode, wrapper_name, index, stub_names=stub_names, occurrence=occurrence
+    )
     if arg is None:
         return []
     value = _string_literal(arg)

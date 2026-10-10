@@ -90,6 +90,7 @@ from treasure_map.lib.hunt.facts import is_thin_cmd_wrapper
 from treasure_map.lib.hunt.fmt_provenance import constant_format_record, format_argument
 from treasure_map.lib.hunt.refs import (
     _WRAPPER_AXIS,
+    _norm_addr,
     build_evidence_ref,
     callsite_offset_suffix,
 )
@@ -409,9 +410,19 @@ def _stored_run_row(atlas_path: Path | str, run_id: str) -> dict[str, object] | 
 FMT_STRING_CLASS = "fmt_string"
 
 
-def _wrapper_sink_arg(pseudocode: str, wrapper_name: str, fmt_index: int | None) -> str | None:
+def _wrapper_sink_arg(
+    pseudocode: str,
+    wrapper_name: str,
+    fmt_index: int | None,
+    stub_names: Mapping[int, str] | None = None,
+    occurrence: int | None = None,
+) -> str | None:
     """The identifier feeding the wrapper's dangerous argument — at the FORMAT position when one is
     known, otherwise the first argument.
+
+    ``occurrence`` (0-based, text order, located with ``stub_names``) reads the candidate's OWN call
+    to the wrapper. None is the function-level fallback and keeps the historical reading of the
+    first call, byte for byte.
 
     ``fmt_index`` is set only for a format-axis candidate whose wrapper signature pinned its format
     position; the command axis, and a format wrapper whose position could not be established, keep
@@ -420,11 +431,20 @@ def _wrapper_sink_arg(pseudocode: str, wrapper_name: str, fmt_index: int | None)
     A literal at the format position yields None, not an identifier: there is no VARIABLE feeding
     the sink, and manufacturing one out of the literal's first word would send the taint reader
     chasing a name that does not exist. The constant is carried by the provenance record instead."""
-    if fmt_index is None:
-        return locate_sink_arg(pseudocode, wrapper_name)
-    arg = format_argument(pseudocode, wrapper_name, fmt_index)
-    if arg is None:
-        return locate_sink_arg(pseudocode, wrapper_name)
+    if occurrence is None:
+        if fmt_index is None:
+            return locate_sink_arg(pseudocode, wrapper_name)
+        arg = format_argument(pseudocode, wrapper_name, fmt_index)
+        if arg is None:
+            return locate_sink_arg(pseudocode, wrapper_name)
+    else:
+        if fmt_index is None:
+            return locate_sink_arg(pseudocode, wrapper_name, stub_names, occurrence)
+        arg = format_argument(
+            pseudocode, wrapper_name, fmt_index, stub_names=stub_names, occurrence=occurrence
+        )
+        if arg is None:
+            return locate_sink_arg(pseudocode, wrapper_name, stub_names, occurrence)
     ident = _IDENT_RE.search(arg)
     if ident is None or arg.lstrip().startswith('"'):
         return None
@@ -1692,7 +1712,12 @@ def run_analyzer2(
                 # format was a variable. Measured on real firmware: `W(2, pcVar2, uVar1)` — argument
                 # 0 is the constant `2`, the format is the variable `pcVar2` at index 1.
                 fmt_index = wc.format_param_index if wc.sink_class == FMT_STRING_CLASS else None
-                sink_arg = _wrapper_sink_arg(f_pseudocode, wc.wrapper_name, fmt_index)
+                # The SAME stub table the finder counted this candidate's calls with, so the call
+                # every per-call reader below looks at is the call the candidate is anchored to.
+                wc_stub_names = stub_by_binary.get(f.binary_id)
+                sink_arg = _wrapper_sink_arg(
+                    f_pseudocode, wc.wrapper_name, fmt_index, wc_stub_names, wc.occurrence
+                )
                 # ★ The form note is a COMMAND-axis reading, and only the command axis may carry it.
                 # All three notes it produces describe the wrapper's FIRST argument: a literal there
                 # is a constant command, a numeric- or charset-constrained one cannot carry shell
@@ -1711,14 +1736,22 @@ def run_analyzer2(
                 blocking = (
                     None
                     if wc.sink_class == FMT_STRING_CLASS
-                    else wrapper_propagation_form_note(f_pseudocode, wc.wrapper_name, sink_arg)
+                    else wrapper_propagation_form_note(
+                        f_pseudocode, wc.wrapper_name, sink_arg, wc_stub_names, wc.occurrence
+                    )
                 )
                 evidence = build_flow_evidence(
                     pseudocode=f_pseudocode,
                     callees=f_callees,
                     sink_arg=sink_arg,
                     entry_sites=entry_index.sites_for(f.binary_name, f.binary_path),
-                    wrapper={"name": wc.wrapper_name, "wrapped_sink": wc.wrapped_sink},
+                    wrapper={
+                        "name": wc.wrapper_name,
+                        "wrapped_sink": wc.wrapped_sink,
+                        # the wrapper's own entry, so a reader can tell two wrappers apart by
+                        # identity — a stripped binary names many of them FUN_<addr>
+                        "addr": _norm_addr(wc.wrapper_addr),
+                    },
                 )
                 # ★ Red-line write-side reconciliation (Gate A): a wrapper-forwarded free_string
                 # must never carry a const_sink_arg note (drop it; keep its normal rank).
@@ -1759,17 +1792,54 @@ def run_analyzer2(
                 # fmt_provenance). ★ The record carries the format ONLY — never its varargs, which
                 # on this axis are harmless data and which a stack_buf-shaped record would get
                 # judged as an injection surface.
-                recovered = (
-                    constant_format_record(
+                if wc.sink_class != FMT_STRING_CLASS:
+                    recovered = []
+                elif wc.occurrence is None:
+                    recovered = constant_format_record(
                         pseudocode=f_pseudocode,
                         wrapper_name=wc.wrapper_name,
                         wrapped_sink=wc.wrapped_sink,
                         index=fmt_index,
                     )
-                    if wc.sink_class == FMT_STRING_CLASS
-                    else []
-                )
+                else:
+                    # this candidate's own call: a sibling call's literal format is not this one's
+                    recovered = constant_format_record(
+                        pseudocode=f_pseudocode,
+                        wrapper_name=wc.wrapper_name,
+                        wrapped_sink=wc.wrapped_sink,
+                        index=fmt_index,
+                        stub_names=wc_stub_names,
+                        occurrence=wc.occurrence,
+                    )
                 evidence["sink_arg_provenance"] = sink_prov_by_func.get(f.func_id, []) + recovered
+                # The candidate's call to the wrapper, pinned to its address offset exactly as a
+                # direct sink call is (same enumerator, same stub table, same bridge).
+                wrapper_offset, wrapper_degraded = callsite_address_offset(
+                    f_pseudocode,
+                    wc.wrapper_name,
+                    wc.occurrence,
+                    f.call_tokens,
+                    f.body_ranges,
+                    f.address,
+                    wc_stub_names,
+                )
+                wrapper_keys: dict[str, Any] = {}
+                if db_has_bridge and wrapper_offset is None and wc.occurrence is not None:
+                    # A located-in-text call that could not be pinned to an address degrades to the
+                    # bare class, exactly as a direct sink call does: a FUNCTION-level anchor that
+                    # sibling calls may share, said on the candidate so no reader takes it for one
+                    # call. The address out_of_body drops is recovered for the cross-side overlay.
+                    wrapper_keys["callsite_located"] = False
+                    wrapper_keys["anchor_degraded"] = wrapper_degraded
+                    wrapper_call_addr = callsite_addr_out_of_body(
+                        f_pseudocode,
+                        wc.wrapper_name,
+                        wc.occurrence,
+                        f.call_tokens,
+                        wc_stub_names,
+                    )
+                    if wrapper_call_addr is not None:
+                        wrapper_keys["callsite_addr"] = wrapper_call_addr
                 pattern_id = upsert_pattern(
                     atlas,
                     source_class=source_class,
@@ -1795,10 +1865,17 @@ def run_analyzer2(
                         # Distinct suffix so a function that is ALSO a direct candidate (it is not,
                         # by construction) never collides; this is the wrapper-recovered instance.
                         # The axis suffix also keeps a cmd- and a fmt-via-wrapper recovery of the
-                        # same function from colliding. Same re-scan-stable anchor as above.
+                        # same function from colliding. One candidate per CALL to the wrapper, so
+                        # the suffix carries that call's address offset (``<axis>@<offset>``), the
+                        # legacy ordinal only when the whole database predates the bridge, and the
+                        # bare axis for the function-level fallback or an unaddressable call.
                         evidence_ref=build_evidence_ref(
                             source_run_id,
-                            suffix=ref_suffix,
+                            suffix=callsite_offset_suffix(
+                                ref_suffix,
+                                wrapper_offset,
+                                None if db_has_bridge else wc.occurrence,
+                            ),
                             binary_sha256=f.binary_sha256,
                             binary_name=f.binary_name,
                             address=f.address,
@@ -1810,7 +1887,8 @@ def run_analyzer2(
                         scope_origin="intra",
                         origin="unknown",  # see the candidate path above: never guessed here
                         flow_evidence=json.dumps(
-                            evidence | extraction_notes.get(f.binary_id, {}), sort_keys=True
+                            evidence | wrapper_keys | extraction_notes.get(f.binary_id, {}),
+                            sort_keys=True,
                         ),
                     ),
                     commit=False,

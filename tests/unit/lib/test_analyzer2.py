@@ -2481,7 +2481,7 @@ def test_free_string_via_wrapper_becomes_high_band_candidate(tmp_path: Path) -> 
     assert ev["flow_path"]["sink_via_wrapper"] is True
     assert ev["flow_path"]["wrapper"]["name"] == "do_cmd"
     assert ev["trace_boundary"] == "reached_sink_via_one_hop_wrapper"
-    assert row["evidence_ref"].endswith("@cmd_via_wrapper")
+    assert row["evidence_ref"].endswith("@cmd_via_wrapper#0")
 
 
 def _json_free_via_wrapper_fn(name: str = "set_wifi") -> dict[str, object]:
@@ -2588,7 +2588,7 @@ def test_wrapper_itself_kept_as_distinct_bare_sink_candidate(tmp_path: Path) -> 
     assert rows["do_cmd"]["exposure_shape"] == "bare_sink"
     assert rows["do_cmd"]["blocking_mechanism"] is None
     assert rows["do_cmd"]["evidence_ref"].endswith("@cmd#0")
-    assert rows["set_route"]["evidence_ref"].endswith("@cmd_via_wrapper")
+    assert rows["set_route"]["evidence_ref"].endswith("@cmd_via_wrapper#0")
     refs = [r["evidence_ref"] for r in _instances(atlas)]
     assert len(set(refs)) == len(refs)  # unique
 
@@ -2656,7 +2656,7 @@ def test_free_string_via_fmt_wrapper_becomes_fmt_candidate(tmp_path: Path) -> No
     assert ev["flow_path"]["wrapper"]["name"] == "log_msg"
     assert ev["flow_path"]["wrapper"]["wrapped_sink"] == "printf"
     assert ev["trace_boundary"] == "reached_sink_via_one_hop_wrapper"
-    assert row["evidence_ref"].endswith("@fmt_via_wrapper")
+    assert row["evidence_ref"].endswith("@fmt_via_wrapper#0")
 
     # The candidate is on the fmt_string axis (its pattern), never mislabeled as cmd.
     conn = open_atlas(atlas)
@@ -2715,7 +2715,7 @@ def test_fmt_wrapper_itself_kept_as_distinct_candidate(tmp_path: Path) -> None:
     run_analyzer2(db, atlas, source_run_id="run_fmt2")
     rows = _by_anchor(atlas, "fmt_string")
     assert rows["log_msg"]["evidence_ref"].endswith("@fmt_string#0")
-    assert rows["handle_req"]["evidence_ref"].endswith("@fmt_via_wrapper")
+    assert rows["handle_req"]["evidence_ref"].endswith("@fmt_via_wrapper#0")
     refs = [r["evidence_ref"] for r in _instances(atlas)]
     assert len(set(refs)) == len(refs)  # unique
 
@@ -2791,7 +2791,7 @@ def test_cmd_axis_unknown_source_wrapper_is_still_kept(tmp_path: Path) -> None:
     stats = run_analyzer2(db, atlas, source_run_id="run_cmd_unknown")
     assert stats.wrapper_propagated == 1  # the const-forwarding cmd caller is still recovered
     row = _by_anchor(atlas)["reboot_now"]
-    assert row["evidence_ref"].endswith("@cmd_via_wrapper")
+    assert row["evidence_ref"].endswith("@cmd_via_wrapper#0")
     assert row["blocking_mechanism"] == "const_sink_arg"  # downweighted, not dropped
 
 
@@ -4219,3 +4219,150 @@ def test_a_binary_left_on_an_older_pass_is_marked_not_current(tmp_path: Path) ->
     assert ev_c["extraction_current"] is False
     assert ev_c["extraction_pass"] == "deadbeefdeadbeef"
     assert "attempted_pass" not in ev_c
+
+
+# ── wrapper candidates: one per CALL to the wrapper ──────────────────────────────────────────────
+
+
+def _wrapper_rows(atlas: Path, anchor: str) -> list[tuple[str, dict[str, object], sqlite3.Row]]:
+    """``anchor``'s wrapper-recovered instances (ref, flow, row), in emission order."""
+    conn = open_atlas(atlas)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM instance WHERE source_anchor = ? AND evidence_ref LIKE '%_via_wrapper%' "
+            "ORDER BY instance_id",
+            (anchor,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [(str(r["evidence_ref"]), json.loads(r["flow_evidence"] or "{}"), r) for r in rows]
+
+
+def _addressed(fn: dict[str, object], address: str) -> dict[str, object]:
+    return {**fn, "address": address}
+
+
+def test_wrapper_candidate_per_call_with_its_own_offset_ref(tmp_path: Path) -> None:
+    """Two calls to do_cmd and one to run_sh give three candidates, ordered by wrapper name then
+    occurrence (text order), each anchored at ITS call's address offset and naming its wrapper's
+    entry in the flow.
+
+    MUTATION (verified RED): build the wrapper ref from the bare axis again (drop the offset) ->
+    the three refs collapse into one."""
+    run_sh = {
+        "name": "run_sh",
+        "address": "00420000",
+        "pseudocode": 'void run_sh(char* param_1){ popen(param_1,"r"); }',
+        "hash": "h_run_sh",
+        "callees": ["popen"],
+    }
+    pc = "void Multi(char *a,char *b,char *c) {\n  do_cmd(a);\n  run_sh(b);\n  do_cmd(c);\n}\n"
+    fn = _bridged(
+        "Multi", 0x401000, pc, ["do_cmd", "run_sh"], body=(0x401000, 0x401100),
+        addr_of={"do_cmd": [0x401010, 0x401030], "run_sh": [0x401020]},
+    )  # fmt: skip
+    funcs = [_addressed(_thin_cmd_wrapper_fn(), "00410000"), run_sh, fn]
+    db = _make_db(tmp_path, [{"name": "netd", "funcs": funcs}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_w")
+    rows = _wrapper_rows(atlas, "Multi")
+    assert [ref.split("@", 1)[1] for ref, _, _ in rows] == [
+        "cmd_via_wrapper@0x000010",
+        "cmd_via_wrapper@0x000030",
+        "cmd_via_wrapper@0x000020",
+    ]
+    assert [ev["flow_path"]["wrapper"] for _, ev, _ in rows] == [  # type: ignore[index]
+        {"name": "do_cmd", "wrapped_sink": "system", "addr": "00410000"},
+        {"name": "do_cmd", "wrapped_sink": "system", "addr": "00410000"},
+        {"name": "run_sh", "wrapped_sink": "popen", "addr": "00420000"},
+    ]
+    assert [ev["flow_path"]["sink_arg"] for _, ev, _ in rows] == ["a", "c", "b"]  # type: ignore[index]
+    assert all("callsite_located" not in ev for _, ev, _ in rows)
+
+
+def test_wrapper_call_out_of_body_degrades_like_a_direct_call(tmp_path: Path) -> None:
+    """A wrapper call whose address falls outside the body degrades exactly as a direct sink call
+    does: bare axis ref, ``callsite_located: false``, ``anchor_degraded: out_of_body``, and the
+    recovered call address.
+
+    MUTATION (verified RED): drop the degrade keys from the wrapper path -> no marker."""
+    pc = "void Inl(char *a) {\n  do_cmd(a);\n}\n"
+    fn = _bridged(
+        "Inl", 0x401000, pc, ["do_cmd"], body=(0x401000, 0x401100),
+        addr_of={"do_cmd": [0x409000]},
+    )  # fmt: skip
+    funcs = [_addressed(_thin_cmd_wrapper_fn(), "00410000"), fn]
+    db = _make_db(tmp_path, [{"name": "netd", "funcs": funcs}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_w")
+    ((ref, ev, _),) = _wrapper_rows(atlas, "Inl")
+    assert ref.endswith("@cmd_via_wrapper")
+    assert ev["callsite_located"] is False and ev["anchor_degraded"] == "out_of_body"
+    assert ev["callsite_addr"] == "0x409000"
+
+
+def test_wrapper_evidence_is_read_per_call(tmp_path: Path) -> None:
+    """The constant-command note, the forwarded argument and (on the format axis) the recovered
+    literal format each come from the candidate's OWN call — a literal passed by a sibling call says
+    nothing about this one.
+
+    MUTATION (verified RED): pass ``occurrence=None`` to ``wrapper_propagation_form_note`` -> the
+    whole-function literal test marks the variable call constant too. MUTATION (verified RED):
+    drop ``occurrence`` from the per-call ``constant_format_record`` -> the variable-format call
+    gets the first call's recovered literal."""
+    cmd_pc = 'void Two(char *p) {\n  do_cmd("/sbin/reboot");\n  do_cmd(p);\n}\n'
+    cmd_fn = _bridged(
+        "Two", 0x401000, cmd_pc, ["do_cmd"], body=(0x401000, 0x401100),
+        addr_of={"do_cmd": [0x401010, 0x401020]},
+    )  # fmt: skip
+    fmt_pc = 'void Fm(char *param_1) {\n  log_at(2,"boot %s",param_1);\n  log_at(2,param_1,7);\n}\n'
+    fmt_fn = _bridged(
+        "Fm", 0x402000, fmt_pc, ["log_at"], body=(0x402000, 0x402100),
+        addr_of={"log_at": [0x402010, 0x402020]},
+    )  # fmt: skip
+    funcs = [
+        _addressed(_thin_cmd_wrapper_fn(), "00410000"),
+        _addressed(_fmt_wrapper_arg1_fn(), "00430000"),
+        cmd_fn,
+        fmt_fn,
+    ]
+    db = _make_db(tmp_path, [{"name": "netd", "funcs": funcs}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_w")
+    cmd_rows = _wrapper_rows(atlas, "Two")
+    assert [r["blocking_mechanism"] for _, _, r in cmd_rows] == ["const_sink_arg", None]
+    # each call's own first argument (the literal's first word is the axis's existing reading)
+    assert [ev["flow_path"]["sink_arg"] for _, ev, _ in cmd_rows] == ["sbin", "p"]  # type: ignore[index]
+    fmt_rows = _wrapper_rows(atlas, "Fm")
+    recovered = [
+        [r for r in ev["sink_arg_provenance"] if r.get("recovered_by") == "fmt_wrapper_callsite"]  # type: ignore[union-attr, attr-defined]
+        for _, ev, _ in fmt_rows
+    ]
+    assert [len(r) for r in recovered] == [1, 0]
+    assert recovered[0][0]["provenance"]["value"] == "boot %s"
+    assert [ev["flow_path"]["sink_arg"] for _, ev, _ in fmt_rows] == [None, "param_1"]  # type: ignore[index]
+
+
+def test_wrapper_called_through_a_pointer_keeps_the_function_level_candidate(
+    tmp_path: Path,
+) -> None:
+    """No call to the wrapper can be found in the text: one candidate on the bare axis ref, with
+    the same reading as before the per-call split — only the wrapper's entry is added to the
+    flow."""
+    pc = "void Ind(char *a) {\n  code *ptr;\n  ptr = do_cmd;\n  (*ptr)(a);\n}\n"
+    fn = _bridged(
+        "Ind", 0x401000, pc, ["do_cmd"], body=(0x401000, 0x401100), addr_of={},
+    )  # fmt: skip
+    fn["call_tokens"] = [{"call_token": "x", "text_off": 0, "op_addr": "0x401010", "opcode": 7}]
+    funcs = [_addressed(_thin_cmd_wrapper_fn(), "00410000"), fn]
+    db = _make_db(tmp_path, [{"name": "netd", "funcs": funcs}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_w")
+    ((ref, ev, _),) = _wrapper_rows(atlas, "Ind")
+    assert ref.endswith("@cmd_via_wrapper")
+    assert "callsite_located" not in ev
+    assert ev["flow_path"]["wrapper"] == {  # type: ignore[index]
+        "name": "do_cmd",
+        "wrapped_sink": "system",
+        "addr": "00410000",
+    }

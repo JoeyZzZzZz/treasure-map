@@ -31,6 +31,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 
+from treasure_map.lib.hunt.fmt_provenance import _string_literal, call_arguments
 from treasure_map.lib.pattern.classes import CMD, COPY, FORMAT, SOURCE, call_offsets
 from treasure_map.lib.reachability.taint import _IDENT_RE, flows_into, free_taint_reaches
 
@@ -415,7 +416,11 @@ def detect_form_signal(
 
 
 def wrapper_propagation_form_note(
-    pseudocode: str, wrapper_name: str, sink_arg: str | None
+    pseudocode: str,
+    wrapper_name: str,
+    sink_arg: str | None,
+    stub_names: Mapping[int, str] | None = None,
+    occurrence: int | None = None,
 ) -> str | None:
     """Form note for a wrapper-propagated command candidate (factor ①).
 
@@ -425,11 +430,21 @@ def wrapper_propagation_form_note(
     just hands the wrapper a constant or a charset-constrained value — is downweighted and does not
     crowd the high band: a literal forwarded to the wrapper is a constant command; a numeric- or
     inline-charset-constrained argument cannot carry shell syntax. Returns None (no downweight) when
-    the forwarded value is a free / constructed string — the real lead this recall step recovers."""
+    the forwarded value is a free / constructed string — the real lead this recall step recovers.
+
+    ``occurrence`` names the candidate's own call to the wrapper (0-based, text order, located with
+    ``stub_names``). With it, "constant" means THAT call's first argument is exactly one string
+    literal — a literal passed by a sibling call says nothing about this one. Without it (the
+    function-level fallback) the historical whole-function test applies."""
+    if occurrence is not None:
+        args = call_arguments(pseudocode, wrapper_name, stub_names, occurrence)
+        literal_first = args is not None and bool(args) and _string_literal(args[0]) is not None
+    else:
+        literal_first = bool(re.search(rf'\b{re.escape(wrapper_name)}\s*\(\s*"', pseudocode))
     # ★ Red-line: same parameter-specific guard as a direct sink. A literal forwarded to the
     # wrapper is a constant command ONLY when no free value also reaches this candidate's forwarded
     # argument — otherwise the literal is a different callsite and downweighting hides the lead.
-    if re.search(rf'\b{re.escape(wrapper_name)}\s*\(\s*"', pseudocode) and not (
+    if literal_first and not (
         sink_arg is not None and free_taint_reaches(pseudocode, sink_arg, safe_vars=set())
     ):
         return CONST_SINK_ARG

@@ -35,7 +35,9 @@ _BIN_ANCHOR_LEN = 8  # sha256 prefix; 479 real binaries -> 479 distinct prefixes
 # suffix), keyed by the candidate's sink_class. "cmd" keeps its historical strings byte-for-byte.
 # The single source of truth for the wrapper axis; A2 reads it when minting refs. It lives HERE,
 # with the ref builder, because the second half IS ref vocabulary and this module is the leaf every
-# ref-building caller can import.
+# ref-building caller can import. A wrapper candidate is emitted per CALL to its wrapper, so its ref
+# carries that call's offset like any per-callsite ref (``…@cmd_via_wrapper@<offset>``); the offset
+# names the call to the WRAPPER, not to the sink inside it.
 #
 # ★ There is deliberately NO reverse (suffix -> "base ref") map. A wrapper ref and the thin wrapper
 # it forwards into are DIFFERENT candidates at DIFFERENT addresses, related through the

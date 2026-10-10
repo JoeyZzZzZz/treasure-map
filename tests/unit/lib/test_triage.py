@@ -23,7 +23,12 @@ from treasure_map.cli.hunt_cli import triage as triage_cmd
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import InstanceRow
 from treasure_map.lib.atlas.writer import add_instance, upsert_pattern
-from treasure_map.lib.callsite_ref import callsite_abs_addr
+from treasure_map.lib.callsite_ref import (
+    callsite_abs_addr,
+    is_wrapper_class,
+    ref_suffix_parts,
+    wrapper_call_abs_addr,
+)
 from treasure_map.lib.hunt.refs import (
     _norm_offset,
     build_evidence_ref,
@@ -1938,8 +1943,8 @@ def test_callsite_addr_is_none_for_every_non_addressed_shape() -> None:
     """Only the addressed ``…:<entry>@<class>@<offset>`` suffix carries an address; every other ref
     shape reads None so the candidate keeps its function-level scope, never a spurious address.
 
-    MUTATION (must go RED): make the second ``@<offset>`` group optional in _CALLSITE_REF_RE -> the
-    function-level ``…@cmd`` case stops reading None."""
+    MUTATION (must go RED): drop the wrapper-class check in ``callsite_abs_addr`` -> an addressed
+    wrapper ref (see the wrapper test below) reads the wrapper call as a sink address."""
     entry = 0x00401000
     func_level = build_evidence_ref(
         "run_1", suffix="cmd", binary_sha256="deadbeef", address=hex(entry)
@@ -1963,6 +1968,120 @@ def test_callsite_addr_is_none_for_every_non_addressed_shape() -> None:
     assert callsite_abs_addr(non_hex_fn) is None  # function anchor is a name, not hex
     assert callsite_abs_addr("") is None
     assert callsite_abs_addr(None) is None
+
+
+def test_ref_suffix_parts_reads_every_suffix_shape() -> None:
+    """The one suffix parser reads the bare class, the addressed form (either sign) and the legacy
+    ordinal, for direct and wrapper classes alike, through the real ref forge."""
+
+    def ref(suffix: str) -> str:
+        return build_evidence_ref(
+            "run_1", suffix=suffix, binary_sha256="deadbeef", address="0x1000"
+        )
+
+    assert ref_suffix_parts(ref("cmd")) == ("cmd", None, None)
+    assert ref_suffix_parts(ref(callsite_offset_suffix("cmd", "0x000040"))) == ("cmd", 0x40, None)
+    assert ref_suffix_parts(ref(callsite_offset_suffix("copy", "-0x000040"))) == (
+        "copy",
+        -0x40,
+        None,
+    )
+    assert ref_suffix_parts(ref(callsite_offset_suffix("cmd", None, 3))) == ("cmd", None, 3)
+    wrapped = ref(callsite_offset_suffix("fmt_via_wrapper", _norm_offset(0x1218, 0x1000)))
+    assert ref_suffix_parts(wrapped) == ("fmt_via_wrapper", 0x218, None)
+    assert ref_suffix_parts(ref("cmd_via_wrapper")) == ("cmd_via_wrapper", None, None)
+    assert ref_suffix_parts("run#fn12") is None and ref_suffix_parts(None) is None
+    assert is_wrapper_class("cmd_via_wrapper") and not is_wrapper_class("cmd")
+
+
+def test_wrapper_ref_names_the_wrapper_call_never_a_sink_call() -> None:
+    """An addressed wrapper ref names the candidate's call to its WRAPPER: ``wrapper_call_abs_addr``
+    reads it, ``callsite_abs_addr`` (a SINK address, which scopes sink records) reads None — and
+    the reverse for a direct sink ref.
+
+    MUTATION (verified RED): drop the wrapper-class check in ``callsite_abs_addr``."""
+    entry = 0x00401000
+    for axis in ("cmd_via_wrapper", "fmt_via_wrapper"):
+        for call in (0x00401218, 0x00400FC0):  # a positive and a negative offset
+            wref = build_evidence_ref(
+                "run_1",
+                suffix=callsite_offset_suffix(axis, _norm_offset(call, entry)),
+                binary_sha256="deadbeef",
+                address=hex(entry),
+            )
+            assert wrapper_call_abs_addr(wref) == call
+            assert callsite_abs_addr(wref) is None
+    direct = build_evidence_ref(
+        "run_1",
+        suffix=callsite_offset_suffix("cmd", _norm_offset(0x00401218, entry)),
+        binary_sha256="deadbeef",
+        address=hex(entry),
+    )
+    assert callsite_abs_addr(direct) == 0x00401218
+    assert wrapper_call_abs_addr(direct) is None
+    bare = build_evidence_ref(
+        "run_1", suffix="cmd_via_wrapper", binary_sha256="deadbeef", address=hex(entry)
+    )
+    assert wrapper_call_abs_addr(bare) is None
+
+
+def test_addressed_wrapper_fmt_candidate_keeps_its_recovered_constant(tmp_path: Path) -> None:
+    """A per-call wrapper fmt candidate's ref carries the offset of its call to the WRAPPER. That is
+    no sink address, so the candidate's provenance reads stay unscoped and the literal format
+    recovered at its call site (a record with no sink address) still reads constant.
+
+    MUTATION (verified RED): make ``callsite_abs_addr`` return the wrapper call's address -> the
+    recovered record is scoped out and the reading is no longer constant."""
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp_wfmt", sink_class="fmt_string", source_class="unknown")
+    entry = 0x00401000
+    ref = build_evidence_ref(
+        "run_1",
+        suffix=callsite_offset_suffix("fmt_via_wrapper", _norm_offset(0x00401040, entry)),
+        binary_sha256="deadbeef",
+        address=hex(entry),
+    )
+    flow = {
+        "source_kind": "unknown",
+        "flow_path": {
+            "sink_arg": None,
+            "one_hop": [],
+            "sink_via_wrapper": True,
+            "wrapper": {"name": "log_at", "wrapped_sink": "vfprintf", "addr": "00402000"},
+        },
+        "trace_boundary": "reached_sink_via_one_hop_wrapper",
+        "sink_arg_provenance": [
+            {
+                "sink": "vfprintf",
+                "arg_idx": 1,
+                "provenance": {
+                    "kind": "constant",
+                    "value": "boot %s",
+                    "value_kind": "literal_string",
+                },
+                "recovered_by": "fmt_wrapper_callsite",
+            }
+        ],
+    }
+    add_instance(
+        conn,
+        InstanceRow(
+            pattern_id=p,
+            pseudocode_hash="h_wfmt",
+            source_anchor="report",
+            sink_anchor="vfprintf",
+            source_run_id="run_1",
+            reachability_status="unknown",
+            provenance_level="L0",
+            evidence_ref=ref,
+            flow_evidence=json.dumps(flow),
+        ),
+    )
+    assert callsite_abs_addr(ref) is None  # the candidate's scope: function level
+    (cand,) = triage(conn)
+    dim = cand.dim("controllability")
+    assert (dim.state, dim.value) == ("proven", "constant")
+    conn.close()
 
 
 def test_record_addr_parses_or_honestly_returns_none() -> None:

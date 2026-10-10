@@ -34,7 +34,7 @@ from treasure_map.lib.atlas.writer import (
     delete_diff,
 )
 from treasure_map.lib.binary_id import BinaryRow
-from treasure_map.lib.callsite_ref import callsite_abs_addr
+from treasure_map.lib.callsite_ref import callsite_abs_addr, wrapper_call_abs_addr
 from treasure_map.lib.errors import ConfigError
 from treasure_map.lib.facts import _DECOMPILE_MIN_SIZE
 from treasure_map.lib.hunt.refs import _norm_addr
@@ -133,9 +133,10 @@ def parse_bindiff(
 
 def _candidate_callsite_addrs(atlas: sqlite3.Connection, run_id: str, sha: str) -> set[str]:
     """Every sink-candidate CALLSITE address for one run's binary, normalized hex. tier-1 reads it
-    from the ref's addressed suffix; a degraded candidate reads the hunt-side callsite_addr the
+    from the ref's addressed suffix — for a wrapper candidate that is its call to the WRAPPER, the
+    address the overlay lines it up by; a degraded candidate reads the hunt-side callsite_addr the
     extractor recovered into flow_evidence (absent before that backfill). Function-level fallbacks
-    and wrappers carry no address and contribute none."""
+    carry no address and contribute none."""
     out: set[str] = set()
     for ref, fe in atlas.execute(
         "SELECT evidence_ref, flow_evidence FROM instance "
@@ -145,6 +146,8 @@ def _candidate_callsite_addrs(atlas: sqlite3.Connection, run_id: str, sha: str) 
         if not ref:
             continue
         ci = callsite_abs_addr(ref)
+        if ci is None:
+            ci = wrapper_call_abs_addr(ref)
         if ci is not None:
             h = norm_hex(ci)
             if h is not None:

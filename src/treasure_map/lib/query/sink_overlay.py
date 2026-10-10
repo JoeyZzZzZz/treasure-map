@@ -32,6 +32,23 @@ binary, or fallen into an analysis hole, and this layer cannot tell which. A can
 (tmap can miss-render a real call, and that extraction blindspot cannot be ruled out under this
 backend — safe direction).
 
+KEY GRANULARITY (``key_granularity``): ``callsite`` (a direct sink call, lined up by its address),
+``wrapper_callsite`` (a call to a thin wrapper ``W`` that forwards to the sink one hop away, lined
+up by the address of the call to ``W``), ``degraded_out_of_body`` (a call located in the text but
+not pinned to an in-body address; compared per (function, key class) by count),
+``function_fallback`` and ``wrapper`` (function-level, compared per (function, key class)). The key
+class of a wrapper candidate is its axis (``cmd_via_wrapper``, …), so a wrapper is never lined up
+against a direct sink of the same sink class.
+
+CALLEE (the two callsite tiers): a pair is the same call only when both are the same TYPE (direct
+sink vs wrapper) and call the same thing. For a direct sink that is the sink's name. For a wrapper
+the callee is ``W`` and the sink it forwards to: a different ``W``, or the same ``W`` now forwarding
+to a different sink, is a different callee. ``W`` is compared by its ENTRY ADDRESS through this
+diff's function alignment, not by name — a stripped binary names many wrappers ``FUN_<addr>``, and
+two of those names agreeing (or disagreeing) says nothing about whether they are the same function.
+A ``W`` with no high-confidence alignment cannot be compared: ``callee_unreadable``. Only a row
+whose flow records no wrapper address on either side falls back to comparing names.
+
 COMPLETENESS: every candidate of both sides is represented — named as a row's ``a_ref``/``b_ref``,
 folded into a row's ``coclaimed_by`` / ``coclaimed_by_b``, or counted in a degraded key row's
 ``a_n``/``b_n``. ``SinkOverlayResult.coverage`` checks that invariant on every call and reports a
@@ -80,7 +97,12 @@ import sqlite3
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-from treasure_map.lib.callsite_ref import callsite_abs_addr
+from treasure_map.lib.callsite_ref import (
+    callsite_abs_addr,
+    is_wrapper_class,
+    ref_suffix_parts,
+    wrapper_call_abs_addr,
+)
 from treasure_map.lib.errors import TreasureMapError
 from treasure_map.version import UNKNOWN_VERSION
 
@@ -91,6 +113,8 @@ _G_CALLSITE = "callsite"
 _G_DEGRADED = "degraded_out_of_body"
 _G_FUNCTION_FALLBACK = "function_fallback"
 _G_WRAPPER = "wrapper"
+_G_WRAPPER_CALLSITE = "wrapper_callsite"
+_CALLSITE_TIERS = (_G_CALLSITE, _G_WRAPPER_CALLSITE)
 
 # presence: persisted | presence_undetermined (this layer never claims a call is gone or new)
 _P_PERSISTED = "persisted"
@@ -106,7 +130,7 @@ _DELTA_KIND = {
 # The logic version stamped on every persisted baseline row. Bump it whenever the way a row is
 # computed changes (a verdict, a reason, a key, a fold): a baseline written by other logic is then
 # read as stale instead of being compared as if it were current.
-SINK_OVERLAY_LOGIC_VERSION = "2"
+SINK_OVERLAY_LOGIC_VERSION = "3"
 
 _UNREPRESENTED_SAMPLE = 20  # refs listed when the coverage invariant breaks (diagnosis, not a dump)
 
@@ -122,7 +146,7 @@ class SinkOverlayRow:
     sink_class: str
     a_ref: str | None
     b_ref: str | None
-    key_granularity: str
+    key_granularity: str  # callsite|wrapper_callsite|degraded_out_of_body|function_fallback|wrapper
     presence: str  # persisted | presence_undetermined
     presence_reason: str | None  # machine-readable; only when presence_undetermined
     match_basis: str | None  # instruction | function_level
@@ -173,7 +197,12 @@ class _Cand:
     binary_name: str | None  # basename of binary_path
     func_entry: str  # normalized hex string of the containing function entry
     tier: str  # key_granularity
-    callsite_addr: str | None  # normalized hex of the sink callsite; None at function level
+    # normalized hex of the candidate's call (the sink call, or for a wrapper the call to W); None
+    # at function level
+    callsite_addr: str | None
+    wrapper_axis: str | None = None  # the wrapper class (``cmd_via_wrapper``, …); None if direct
+    callee_name: str | None = None  # direct: the sink's name; wrapper: W's name (flow evidence)
+    callee_addr: str | None = None  # wrapper only: W's entry, normalized hex (flow evidence)
 
 
 # ── ref parsing ──────────────────────────────────────────────────────────────────────
@@ -205,28 +234,44 @@ def _func_entry_hex(ref: str) -> str | None:
 def _classify(ref: str, flow: dict[str, Any]) -> tuple[str, str | None]:
     """(key_granularity, callsite_addr_hex|None) for a candidate, from ref shape + flow markers.
 
-    - wrapper: ref ends ``_via_wrapper`` -> no address.
+    Wrapper class (``<axis>_via_wrapper``):
+    - wrapper_callsite: the ref carries an offset -> the address of the call to the wrapper.
+    - degraded_out_of_body: flow.callsite_located is False (as for a direct sink, below).
+    - wrapper: everything else (the function-level fallback).
+    Direct sink class:
     - callsite: ref has an addressed suffix ``@<class>@<offset>`` -> callsite_addr from the ref.
     - degraded_out_of_body: flow.callsite_located is False -> address iff the backfill wrote
       flow.callsite_addr (pre-backfill it is None and the row stays function-level).
     - function_fallback: everything else at function level (no marker, no address).
     """
-    if ref.endswith("_via_wrapper"):
+    parts = ref_suffix_parts(ref)
+    if parts is not None and is_wrapper_class(parts[0]):
+        waddr = wrapper_call_abs_addr(ref)
+        if waddr is not None:
+            return _G_WRAPPER_CALLSITE, _norm_addr(waddr)
+        if flow.get("callsite_located") is False:
+            return _degraded(flow)
         return _G_WRAPPER, None
     addr = callsite_abs_addr(ref)
     if addr is not None:
         return _G_CALLSITE, _norm_addr(addr)
     if flow.get("callsite_located") is False:
-        ca = flow.get("callsite_addr")  # hunt-side callsite_addr backfill; None pre-backfill
-        if isinstance(ca, str) and ca:
-            try:
-                return _G_DEGRADED, _norm_addr(int(ca, 16))
-            except ValueError:
-                return _G_DEGRADED, None
-        if isinstance(ca, int):
-            return _G_DEGRADED, _norm_addr(ca)
-        return _G_DEGRADED, None
+        return _degraded(flow)
     return _G_FUNCTION_FALLBACK, None
+
+
+def _degraded(flow: dict[str, Any]) -> tuple[str, str | None]:
+    """A located-in-text call not pinned to an in-body address: degraded, with the address the
+    hunt recovered into flow.callsite_addr when it could."""
+    ca = flow.get("callsite_addr")  # hunt-side callsite_addr backfill; None pre-backfill
+    if isinstance(ca, str) and ca:
+        try:
+            return _G_DEGRADED, _norm_addr(int(ca, 16))
+        except ValueError:
+            return _G_DEGRADED, None
+    if isinstance(ca, int):
+        return _G_DEGRADED, _norm_addr(ca)
+    return _G_DEGRADED, None
 
 
 def _parse_flow(flow_evidence: str | None) -> dict[str, Any]:
@@ -265,7 +310,13 @@ def _parse_rows(rows: list[Any], name_filter: str | None = None) -> _Loaded:
         if func_entry is None:
             legacy += 1  # no address to line up by -> excluded, and counted (never silently)
             continue
-        tier, callsite_addr = _classify(ref, _parse_flow(fe))
+        flow = _parse_flow(fe)
+        tier, callsite_addr = _classify(ref, flow)
+        parts = ref_suffix_parts(ref)
+        wrapper_axis = parts[0] if parts is not None and is_wrapper_class(parts[0]) else None
+        callee_name, callee_addr = (
+            _wrapper_callee(flow) if wrapper_axis is not None else (sink or None, None)
+        )
         out.append(
             _Cand(
                 iid=iid,
@@ -277,9 +328,30 @@ def _parse_rows(rows: list[Any], name_filter: str | None = None) -> _Loaded:
                 func_entry=func_entry,
                 tier=tier,
                 callsite_addr=callsite_addr,
+                wrapper_axis=wrapper_axis,
+                callee_name=callee_name,
+                callee_addr=callee_addr,
             )
         )
     return _Loaded(out, legacy)
+
+
+def _wrapper_callee(flow: dict[str, Any]) -> tuple[str | None, str | None]:
+    """(W's name, W's normalized entry) from a wrapper candidate's ``flow_path.wrapper``; each is
+    None when the flow does not record it (an older hunt has the name only)."""
+    path = flow.get("flow_path")
+    wrapper = path.get("wrapper") if isinstance(path, dict) else None
+    if not isinstance(wrapper, dict):
+        return None, None
+    name = wrapper.get("name")
+    raw = wrapper.get("addr")
+    addr: str | None = None
+    if isinstance(raw, str) and raw:
+        try:
+            addr = _norm_addr(int(raw, 16))
+        except ValueError:
+            addr = None
+    return (name if isinstance(name, str) and name else None), addr
 
 
 def _load_candidates(atlas: sqlite3.Connection, run_id: str, sha: str) -> _Loaded:
@@ -423,12 +495,10 @@ def _generation_mismatch(atlas: sqlite3.Connection, ctx: _DiffCtx) -> bool:
 
 
 def _key_class(cand: _Cand) -> str:
-    """The function-level matching key dimension: for a wrapper candidate the AXIS (the ref suffix,
-    e.g. ``cmd_via_wrapper``), so a wrapper never matches a direct sink of the same sink_class; for
-    everything else the sink_class."""
-    if cand.tier == _G_WRAPPER:
-        return cand.ref.rsplit("@", 1)[-1]
-    return cand.sink_class
+    """The matching key dimension: for a wrapper candidate (any tier) the AXIS, e.g.
+    ``cmd_via_wrapper``, so a wrapper never shares a key with a direct sink of the same sink_class;
+    for everything else the sink_class."""
+    return cand.wrapper_axis or cand.sink_class
 
 
 @dataclass
@@ -436,10 +506,10 @@ class _Side:
     """One side's candidates, indexed for the cross-side lookups, plus its co-claim fold."""
 
     cands: list[_Cand]
-    t1_at: dict[str, list[_Cand]]  # callsite addr -> callsite-tier candidates
+    t1_at: dict[str, list[_Cand]]  # callsite addr -> callsite / wrapper_callsite candidates
     deg_at: dict[str, list[_Cand]]  # callsite addr -> degraded candidates with a recovered addr
     fn_key: dict[tuple[str, str], list[_Cand]]  # (func, key_class) -> function_fallback / wrapper
-    class_at_func: set[tuple[str, str]]  # (func, sink_class) of every non-wrapper candidate
+    class_at_func: set[tuple[str, str]]  # (func, sink_class) of every direct-sink candidate
     folded: dict[str, list[_Cand]]  # callsite addr -> degraded candidates folded into it
     folded_ids: set[int]
     unresolved_ids: set[int]  # degraded candidates at a multi-claimed, unowned callsite
@@ -451,13 +521,13 @@ def _index(cands: list[_Cand]) -> _Side:
     fn_key: dict[tuple[str, str], list[_Cand]] = {}
     class_at_func: set[tuple[str, str]] = set()
     for c in cands:
-        if c.tier == _G_CALLSITE and c.callsite_addr is not None:
+        if c.tier in _CALLSITE_TIERS and c.callsite_addr is not None:
             t1_at.setdefault(c.callsite_addr, []).append(c)
         elif c.tier == _G_DEGRADED and c.callsite_addr is not None:
             deg_at.setdefault(c.callsite_addr, []).append(c)
         if c.tier in (_G_FUNCTION_FALLBACK, _G_WRAPPER):
             fn_key.setdefault((c.func_entry, _key_class(c)), []).append(c)
-        if c.tier != _G_WRAPPER:
+        if c.wrapper_axis is None:
             class_at_func.add((c.func_entry, c.sink_class))
     # co-claim fold (callsite_addr-gated): a degraded candidate whose recovered address is also a
     # callsite-tier candidate's address on the SAME side is folded into that candidate's row, never
@@ -514,12 +584,51 @@ def _function_unmatched(fe: str, d: _Dir) -> tuple[str, str | None]:
     return _P_UNDET, "no_counterpart_undetermined"
 
 
+def _callee_readable(cand: _Cand) -> bool:
+    """Can this candidate's own callee be compared at all?"""
+    if cand.wrapper_axis is None:
+        return cand.sink is not None
+    return cand.sink is not None and (cand.callee_addr is not None or cand.callee_name is not None)
+
+
+def _same_callee(cand: _Cand, o: _Cand, d: _Dir) -> bool | None:
+    """Is ``o`` (the other side, at the matched address) the same callee as ``cand``? None when it
+    cannot be told.
+
+    Different types (a wrapper call against a direct sink call — e.g. the wrapper was inlined) are
+    different callees. Two direct sinks compare by sink name. Two wrapper calls are different when
+    they forward to different sinks; otherwise ``W`` is compared by entry address through this
+    diff's function alignment (only a high-confidence pair counts — anything else is unknown), and
+    by name only when neither flow records an address. A missing sink name is unknown."""
+    if (cand.wrapper_axis is None) != (o.wrapper_axis is None):
+        return False
+    if cand.sink is None or o.sink is None:
+        return None
+    if cand.wrapper_axis is None:
+        return cand.sink == o.sink
+    if cand.sink != o.sink:
+        return False
+    if cand.callee_addr is not None and o.callee_addr is not None:
+        aligned = d.align.get(cand.callee_addr)
+        if aligned is None or aligned[2] != "aligned":
+            return None
+        return aligned[0] == o.callee_addr
+    if cand.callee_name is not None and o.callee_name is not None:
+        return cand.callee_name == o.callee_name
+    return None
+
+
 def _tier1_verdict(cand: _Cand, d: _Dir) -> _Verdict:
-    """A callsite-tier candidate in an aligned, high-confidence function pair.
+    """A callsite / wrapper_callsite candidate in an aligned, high-confidence function pair.
 
     persisted only when the instruction matched AND the other side has a callsite-tier candidate at
-    the matched address calling the SAME sink (by name; a same-name pair of different sink classes
-    is still the same call). A same-class pair with a different callee is NOT persisted."""
+    the matched address with the SAME callee (``_same_callee``: same type, same sink by name — a
+    same-name pair of different sink classes is still the same call — and for a wrapper the same
+    ``W``, judged by its aligned entry address). A wrapper's callee is ``W`` together with the sink
+    it forwards to, so "different" covers both a call to another ``W`` and the same ``W`` now
+    forwarding to another sink. The address, not the name, decides ``W``: in a stripped binary
+    ``FUN_<addr>`` names would otherwise state a false fact either way. If the comparison is
+    unknown for any candidate there, or this one's own callee is unreadable: callee_unreadable."""
     ca = cand.callsite_addr
     if ca is None:  # a callsite tier with no address should not happen; stay honest
         return _P_UNDET, "crossside_match_degraded", "instruction", None, None
@@ -532,9 +641,10 @@ def _tier1_verdict(cand: _Cand, d: _Dir) -> _Verdict:
         return _P_UNDET, reason, "instruction", None, None
     t1 = d.other.t1_at.get(other_addr, [])
     if t1:
-        if cand.sink is None or any(o.sink is None for o in t1):
+        verdicts = [(o, _same_callee(cand, o, d)) for o in t1]
+        if not _callee_readable(cand) or any(v is None for _o, v in verdicts):
             return _P_UNDET, "callee_unreadable", "instruction", None, t1[0]
-        same = [o for o in t1 if o.sink == cand.sink]
+        same = [o for o, v in verdicts if v]
         if same:
             same.sort(key=lambda o: o.sink_class != cand.sink_class)  # same class first
             return _P_PERSISTED, None, "instruction", None, same[0]
@@ -575,7 +685,7 @@ def _verdict(cand: _Cand, d: _Dir) -> tuple[_Verdict, float | None]:
     other_fe, conf, state = d.align[fe]
     if state != "aligned":
         return (_P_UNDET, "alignment_low_confidence", None, None, None), conf
-    if cand.tier == _G_CALLSITE:
+    if cand.tier in _CALLSITE_TIERS:
         return _tier1_verdict(cand, d), conf
     return _funclevel_verdict(cand, other_fe, d), conf
 
@@ -662,7 +772,7 @@ def _degraded_keys(side: _Side) -> dict[tuple[str, str], list[_Cand]]:
     keys: dict[tuple[str, str], list[_Cand]] = {}
     for c in side.cands:
         if c.tier == _G_DEGRADED and c.iid not in side.folded_ids:
-            keys.setdefault((c.func_entry, c.sink_class), []).append(c)
+            keys.setdefault((c.func_entry, _key_class(c)), []).append(c)
     return keys
 
 
@@ -754,7 +864,7 @@ def _emit_flat(
     keys: dict[tuple[str | None, str | None, str, str], list[_Cand]] = {}
     for c in cands:
         if c.tier == _G_DEGRADED:
-            keys.setdefault((c.sha, c.binary_name, c.func_entry, c.sink_class), []).append(c)
+            keys.setdefault((c.sha, c.binary_name, c.func_entry, _key_class(c)), []).append(c)
             continue
         out.emit(
             SinkOverlayRow(
