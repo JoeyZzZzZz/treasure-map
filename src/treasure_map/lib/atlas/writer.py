@@ -328,8 +328,9 @@ def add_dimension_deltas(
             undetermined_scope, undetermined_reason, capability_ref, alignment_confidence,
             presence, key_granularity, match_basis, counterpart_call, coclaimed_by, a_n, b_n,
             hunt_commit_a, hunt_commit_b, build_hash_a, build_hash_b, hunt_instances_a,
-            hunt_instances_b, overlay_version)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            hunt_instances_b, overlay_version, counterpart_callee)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                   ?)""",
         [
             (
                 r.diff_id,
@@ -358,6 +359,7 @@ def add_dimension_deltas(
                 r.hunt_instances_a,
                 r.hunt_instances_b,
                 r.overlay_version,
+                r.counterpart_callee,
             )
             for r in rows
         ],
@@ -371,14 +373,15 @@ def add_instruction_matches(
     conn: sqlite3.Connection, rows: list[InstructionMatchRow], *, commit: bool = True
 ) -> int:
     """Insert instruction_match rows (A<->B candidate-callsite address pairs) in one batch; return
-    the count. Positional BinDiff matches only — NO callee is stored (the instruction_match comment
-    in the schema explains why). commit=False joins the caller's txn (layer-0 persist)."""
+    the count. The pair is BinDiff's positional match; the per-side call-site facts are written
+    afterwards by ``set_instruction_match_facts`` (see the instruction_match comment in the schema).
+    commit=False joins the caller's txn (layer-0 persist)."""
     if not rows:
         return 0
     conn.executemany(
-        "INSERT OR IGNORE INTO instruction_match (diff_id, func_addr_a, addr_a, addr_b) "
-        "VALUES (?, ?, ?, ?)",
-        [(r.diff_id, r.func_addr_a, r.addr_a, r.addr_b) for r in rows],
+        "INSERT OR IGNORE INTO instruction_match "
+        "(diff_id, func_addr_a, addr_a, addr_b, facts_a, facts_b) VALUES (?, ?, ?, ?, ?, ?)",
+        [(r.diff_id, r.func_addr_a, r.addr_a, r.addr_b, r.facts_a, r.facts_b) for r in rows],
     )
     if commit:
         conn.commit()
@@ -467,9 +470,10 @@ def add_diff_meta(conn: sqlite3.Connection, row: DiffMetaRow, *, commit: bool = 
             inventory_mismatch_b, functions_empty_a, functions_empty_b, micro_skipped_a,
             micro_skipped_b, presence_computed_a, presence_computed_b, binary_a, binary_b,
             diff_ok, diff_status, diff_status_reason, diff_attempts, sha256_a, sha256_b,
-            binary_path_a, binary_path_b)
+            binary_path_a, binary_path_b, callsite_facts_a, callsite_facts_b,
+            callsite_facts_hash_a, callsite_facts_hash_b, stub_state_a, stub_state_b)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             row.diff_id,
             row.run_a_id,
@@ -508,7 +512,55 @@ def add_diff_meta(conn: sqlite3.Connection, row: DiffMetaRow, *, commit: bool = 
             row.sha256_b,
             row.binary_path_a,
             row.binary_path_b,
+            row.callsite_facts_a,
+            row.callsite_facts_b,
+            row.callsite_facts_hash_a,
+            row.callsite_facts_hash_b,
+            row.stub_state_a,
+            row.stub_state_b,
         ),
+    )
+    if commit:
+        conn.commit()
+
+
+def set_instruction_match_facts(
+    conn: sqlite3.Connection,
+    diff_id: str,
+    facts: list[tuple[str, str | None, str | None]],
+    *,
+    commit: bool = True,
+) -> int:
+    """Write the per-side call-site facts onto this diff's instruction_match rows, keyed by
+    ``(addr_a, facts_a_json, facts_b_json)``; return the count. Scoped to ``diff_id``."""
+    if not facts:
+        return 0
+    conn.executemany(
+        "UPDATE instruction_match SET facts_a = ?, facts_b = ? WHERE diff_id = ? AND addr_a = ?",
+        [(fa, fb, diff_id, addr_a) for addr_a, fa, fb in facts],
+    )
+    if commit:
+        conn.commit()
+    return len(facts)
+
+
+def set_callsite_facts_state(
+    conn: sqlite3.Connection,
+    diff_id: str,
+    *,
+    side: str,
+    state: str,
+    build_hash: str | None,
+    stub_state: str | None,
+    commit: bool = True,
+) -> None:
+    """Record one side's call-site facts state on the diff's diff_meta row (``side`` 'a'/'b')."""
+    if side not in ("a", "b"):
+        raise ValueError(f"side must be 'a' or 'b', got {side!r}")
+    conn.execute(
+        f"UPDATE diff_meta SET callsite_facts_{side} = ?, callsite_facts_hash_{side} = ?, "  # noqa: S608
+        f"stub_state_{side} = ? WHERE diff_id = ?",
+        (state, build_hash, stub_state, diff_id),
     )
     if commit:
         conn.commit()

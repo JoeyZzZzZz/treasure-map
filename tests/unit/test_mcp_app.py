@@ -171,6 +171,16 @@ def _tools(tmp_path: Path):
     return mcp_app.make_tools(_mk_atlas(tmp_path))
 
 
+def test_sink_overlay_side_filter_is_validated(tmp_path: Path) -> None:
+    """MUTATION (verified RED): drop the side check in ``get_diff_sink_overlay`` -> the library
+    raises instead of answering."""
+    tool = _tools(tmp_path)["get_diff_sink_overlay"]
+    out = tool("run_m::run_m::libx", side="neither")
+    assert "side" in out["error"]
+    ok = tool("run_m::run_m::libx", side="a_only", detail="rows")
+    assert "error" not in ok and ok["filters"]["side"] == "a_only" and ok["rows"] == []
+
+
 def test_sink_overlay_presence_filter_never_added_or_removed(tmp_path: Path) -> None:
     """The overlay never emits added/removed, so asking for them is an error that points at the
     real reason (``function_unmatched``) — never an empty answer that reads as "none found".

@@ -25,8 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     A whole function with no counterpart on the other side is `presence_undetermined` with reason
     `function_unmatched`: the function may have been inlined, moved to another binary, or fallen
     into an analysis hole, so it is not evidence of a deletion or an addition. A candidate that only
-    looks gone or new inside an aligned function stays undetermined too. `persisted` at a callsite requires the matched call to reach the same sink
-    by name.
+    looks gone or new inside an aligned function stays undetermined too. `persisted` at a callsite
+    requires the matched call to reach the same sink by name.
   - Every result carries `coverage`: per-side totals and the number of candidates the rows
     represent. A shortfall is reported as `coverage_violation` with a sample of the missing refs,
     never dropped silently. Old anchors with no function address are counted as `excluded_legacy`.
@@ -44,6 +44,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     changes, every older baseline reads as stale.
   - Until the runs are re-hunted and the diffs re-run, there is no instruction data and every
     callsite-level candidate reads `presence_undetermined` (`crossside_match_degraded`).
+- **The sink overlay reads what a matched non-candidate instruction calls.** When BinDiff matches a
+  candidate's call to an instruction on the other side that is not a candidate, the diff now records
+  what that instruction calls: the callee identities from that run's own call tokens (an import
+  through a resolved stub, a function of the binary, a name only, …) and the call targets in its
+  BinExport file. They are stored per side next to the instruction pair (`instruction_match.facts_a`
+  / `facts_b`), with each side's read state, extraction hash and stub-table state on `diff_meta`.
+  - Such a row now reads one of `counterpart_call_facts_absent`, `counterpart_facts_stale`,
+    `counterpart_no_call_fact`, `counterpart_call_ambiguous`, `counterpart_callee_unresolved`,
+    `counterpart_same_callee` or `counterpart_different_callee` instead of
+    `counterpart_not_candidate` / `a_counterpart_not_candidate`. All stay `presence_undetermined`;
+    no other row changes. No call recorded at an instruction is not taken to mean it is not a call.
+  - A different-callee row (including the existing `present_different_callee`) carries
+    `counterpart_callee`, with `same_callee_candidate_elsewhere`: whether the paired function still
+    holds a candidate with the same callee. A different callee at the matched instruction is not
+    the same as a replaced callee.
+  - The summary adds `by_presence_reason_side`, and rows can be filtered by `side` (`a_only`,
+    `b_only`, `both`).
+  - Two wrapper calls whose wrappers are pinned by address on one side only are no longer compared
+    by name: `callee_unreadable`.
+  - Baselines are stamped with overlay logic version 4. The diffs must be re-run for the call-site
+    facts to be recorded; until then those rows read `counterpart_call_facts_absent`.
 - **Known gap:** the diff readers (`get_diff_deltas`, `get_diff_meta`, `get_function_alignment`,
   `get_diff_sink_overlay`) are MCP-only; there is no CLI for them yet.
 

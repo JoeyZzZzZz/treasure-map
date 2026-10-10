@@ -207,6 +207,26 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE diff_meta ADD COLUMN sha256_a TEXT")
     if dm_cols and "sha256_b" not in dm_cols:
         conn.execute("ALTER TABLE diff_meta ADD COLUMN sha256_b TEXT")
+    # diff_meta call-site facts state (per side): read / bridge_absent / not_read, the build hash it
+    # was read from, and the stub-table state. Nullable TEXT, no index references them; existing
+    # rows carry NULL (facts never recorded) until the diff is re-run. Idempotent.
+    for _dmcol in (
+        "callsite_facts_a",
+        "callsite_facts_b",
+        "callsite_facts_hash_a",
+        "callsite_facts_hash_b",
+        "stub_state_a",
+        "stub_state_b",
+    ):
+        if dm_cols and _dmcol not in dm_cols:
+            conn.execute(f"ALTER TABLE diff_meta ADD COLUMN {_dmcol} TEXT")  # noqa: S608
+
+    # instruction_match.facts_a/b: the call-site facts at each side's matched address (JSON).
+    # Nullable TEXT, no index references them; existing rows carry NULL. Idempotent.
+    im_cols = _column_names(conn, "instruction_match")
+    for _imcol in ("facts_a", "facts_b"):
+        if im_cols and _imcol not in im_cols:
+            conn.execute(f"ALTER TABLE instruction_match ADD COLUMN {_imcol} TEXT")  # noqa: S608
 
     # dimension_delta.binary (added this round): the diff's target binary (short name), parsed from
     # subject_key at write time, so a per-binary consumer filters on a real column instead of a
@@ -239,6 +259,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
             ("hunt_instances_a", "INTEGER"),
             ("hunt_instances_b", "INTEGER"),
             ("overlay_version", "TEXT"),
+            ("counterpart_callee", "TEXT"),
         ):
             if _c7col not in dd_cols:
                 conn.execute(f"ALTER TABLE dimension_delta ADD COLUMN {_c7col} {_c7type}")  # noqa: S608

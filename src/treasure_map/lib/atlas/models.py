@@ -394,6 +394,15 @@ class DiffMetaRow:
     diff_attempts: int = 0
     sha256_a: str | None = None
     sha256_b: str | None = None
+    # call-site facts beside instruction_match, per side: read | bridge_absent | not_read (None on a
+    # diff written before they were recorded), the analysis.db build hash they were read from, and
+    # the stub-table state (not_applicable | not_determined | read).
+    callsite_facts_a: str | None = None
+    callsite_facts_b: str | None = None
+    callsite_facts_hash_a: str | None = None
+    callsite_facts_hash_b: str | None = None
+    stub_state_a: str | None = None
+    stub_state_b: str | None = None
 
 
 @dataclass(frozen=True)
@@ -420,10 +429,11 @@ class DimensionDeltaRow:
     binary: str | None = None  # diff's target binary (short name), parsed from subject_key
     # ── sink-overlay candidate-level fields (subject_kind='candidate'); None for edge rows ──
     # ``presence`` is the authoritative two states plus undetermined ('persisted'|
-    # 'presence_undetermined'); ``delta_kind`` is its CHECK-safe projection. ``counterpart_call``
-    # under the atlas+BinDiff backend is only 'present_different_callee'|'counterpart_not_candidate'
-    # (the BinExport five-way split is a future backend, never guessed here). ``coclaimed_by`` is a
-    # JSON list. The six generation stamps and ``overlay_version`` gate read-time staleness.
+    # 'presence_undetermined'); ``delta_kind`` is its CHECK-safe projection. ``counterpart_call`` is
+    # 'present_same_callee'|'present_different_callee'|'unknown' (or 'counterpart_not_candidate'
+    # from the candidates-only backend); 'not_a_call'/'absent' are never emitted. ``coclaimed_by``
+    # and ``counterpart_callee`` are JSON. The six generation stamps and ``overlay_version`` gate
+    # read-time staleness.
     presence: str | None = None
     # 'callsite'|'wrapper_callsite'|'degraded_out_of_body'|'function_fallback'|'wrapper'
     key_granularity: str | None = None
@@ -439,20 +449,23 @@ class DimensionDeltaRow:
     hunt_instances_a: int | None = None
     hunt_instances_b: int | None = None
     overlay_version: str | None = None  # overlay logic version that computed the row
+    counterpart_callee: str | None = None  # JSON: the matched other-side callee (same/different)
     id: int | None = None
 
 
 @dataclass(frozen=True)
 class InstructionMatchRow:
     """Mirrors one instruction_match row: ONE BinDiff-matched instruction address pair (A<->B) at a
-    candidate sink callsite. BinDiff pairs by position only -- NO callee is carried here (the table
-    has none); the sink overlay verifies the callee from both sides' candidate records. 1:1 per
-    A address."""
+    candidate sink callsite. BinDiff pairs by position only; what each side's instruction calls is
+    the per-side call-site facts JSON (``facts_a`` / ``facts_b``), written after the pair is chosen
+    (None until then, or when that side's facts were not read). 1:1 per A address."""
 
     diff_id: str
     func_addr_a: str
     addr_a: str
     addr_b: str
+    facts_a: str | None = None
+    facts_b: str | None = None
     id: int | None = None
 
 

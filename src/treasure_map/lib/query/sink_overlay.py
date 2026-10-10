@@ -5,22 +5,24 @@ every diff between two runs), or mark them honestly as not lined-up. EVIDENCE ON
 plus undetermined (persisted | presence_undetermined), never a fix-status verdict, never a
 path/taint engine.
 
-Callee backend = atlas + BinDiff (the only data available without re-reading a .BinExport proto or
-a run's analysis.db). BinDiff's instruction table pairs addresses POSITIONALLY and carries no
-callee, so the callee is verified from BOTH sides' atlas candidate records
-(``instance.sink_anchor``, the called sink's name). Where the other side has no candidate at the
-matched address the callee is simply unreadable here, and the result is an honest
-``presence_undetermined`` — never a guess that the call is gone or new.
+Callee source. BinDiff's instruction table pairs addresses POSITIONALLY and carries no callee. The
+callee is verified from BOTH sides' atlas candidate records first (``instance.sink_anchor``, the
+called sink's name; a wrapper's ``W``). Where the other side has NO candidate at the matched
+address, the call-site facts written beside the pair are read instead: the callee identities the
+other run's own call tokens record at that instruction, and the call targets its BinExport recorded
+(see lib/diff/callsite_facts). They refine that one case only — no other row changes, and every row
+they decide stays ``presence_undetermined``: what the matched instruction calls is a fact about
+it, never a claim that the candidate's call persisted, went away or is new. They need an
+instruction pair, so a candidate BinDiff matched to nothing is untouched.
 
-★ BACKEND SEAM (registered, not built): a future backend could supply the other side's callee and
-upgrade the ``counterpart_not_candidate`` / ``a_counterpart_not_candidate`` buckets into a richer
-counterpart split (a persisting same-callee call that the other side no longer flags; an address
-that is not a call; ...). Two candidates:
-  * backend B  — read the .BinExport2 protobuf's disassembly for the matched instruction's callee;
-  * backend A+ — materialise tmap's own analysis.db call_tokens as the callee source for BOTH sides.
-Either only reclassifies those buckets; neither reworks the model below. A+ is likely more complete
-than B on MIPS (the fact layer sees calls BinExport drops). This module stays on the atlas+BinDiff
-backend and leaves those buckets undetermined.
+What the facts do NOT do: infer that an instruction is not a call because no call is recorded at
+it (a register-indirect call records none, and a function the bridge did not cover records nothing
+at all). That needs the disassembly itself and is left to a backend that reads it.
+
+★ ``present_different_callee`` / ``counterpart_different_callee`` mean "the instruction BinDiff
+matched to this call calls something else" — NOT "the callee was replaced": the call may still be
+there, matched elsewhere. ``counterpart_callee.same_callee_candidate_elsewhere`` says whether the
+paired function holds another candidate with the same callee.
 
 HONESTY LINE (backend-independent): this layer emits only ``persisted`` and
 ``presence_undetermined``. Anything BinExport/BinDiff could not export or match is
@@ -69,9 +71,16 @@ carry no function address and cannot be lined up; they are counted as ``excluded
   callsite level: ``crossside_match_degraded`` (this diff has no instruction-match data at all),
   ``instruction_unmatched`` (instruction data exists but this callsite was not matched — an export
   gap or a changed basic block; this backend cannot tell which), ``present_different_callee``,
-  ``counterpart_not_candidate`` / ``a_counterpart_not_candidate`` (matched to a non-candidate
-  instruction on the B / A side), ``crossgranularity_unresolved`` (the other side has the same call
-  only at a different key granularity), ``callee_unreadable`` (a sink name is missing).
+  ``crossgranularity_unresolved`` (the other side has the same call only at a different key
+  granularity), ``callee_unreadable`` (a sink name is missing, or a wrapper cannot be compared).
+  matched to a non-candidate instruction (read from the call-site facts, either direction):
+  ``counterpart_call_facts_absent`` (no readable facts for that side), ``counterpart_facts_stale``
+  (read from an older extraction than that run's current one), ``counterpart_no_call_fact`` (no
+  call recorded at that instruction), ``counterpart_call_ambiguous`` (more than one callee there),
+  ``counterpart_callee_unresolved`` (a callee that cannot be compared — e.g. an unresolved stub),
+  ``counterpart_same_callee``, ``counterpart_different_callee``. The candidates-only reading
+  (``callee_backend="atlas_candidates"``) leaves that case as ``counterpart_not_candidate`` /
+  ``a_counterpart_not_candidate`` instead; the default reading no longer emits those two.
   degraded keys: ``crossside_count_mismatch``, ``coclaim_unresolved`` (one physical callsite claimed
   by two or more functions' degraded candidates with no callsite-tier candidate there to own it).
   ``callsite_not_exported`` is reserved for a backend that can prove an export gap and is NOT
@@ -93,6 +102,7 @@ takes on the order of ten-plus seconds for a large pair. A large result is read 
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -130,7 +140,19 @@ _DELTA_KIND = {
 # The logic version stamped on every persisted baseline row. Bump it whenever the way a row is
 # computed changes (a verdict, a reason, a key, a fold): a baseline written by other logic is then
 # read as stale instead of being compared as if it were current.
-SINK_OVERLAY_LOGIC_VERSION = "3"
+SINK_OVERLAY_LOGIC_VERSION = "4"
+
+# Where the callee of a matched other-side instruction that is NOT a candidate comes from.
+# ``callsite_facts`` (the default) reads the call-site facts stored beside instruction_match;
+# ``atlas_candidates`` reads candidates only and leaves that case as ``counterpart_not_candidate`` /
+# ``a_counterpart_not_candidate`` — kept to check that the facts only refine that one case.
+_BACKEND_FACTS = "callsite_facts"
+_BACKEND_CANDIDATES = "atlas_candidates"
+_CALLEE_BACKENDS = (_BACKEND_FACTS, _BACKEND_CANDIDATES)
+
+# The direction a row speaks for: which side's candidate it names.
+_SIDES = ("a_only", "b_only", "both")
+_FUN_NAME_RE = re.compile(r"FUN_[0-9a-fA-F]+")
 
 _UNREPRESENTED_SAMPLE = 20  # refs listed when the coverage invariant breaks (diagnosis, not a dump)
 
@@ -150,12 +172,18 @@ class SinkOverlayRow:
     presence: str  # persisted | presence_undetermined
     presence_reason: str | None  # machine-readable; only when presence_undetermined
     match_basis: str | None  # instruction | function_level
-    counterpart_call: str | None  # present_different_callee | counterpart_not_candidate (tier-1)
+    # tier-1 only: present_same_callee | present_different_callee | unknown (or, from the
+    # candidates-only backend, counterpart_not_candidate)
+    counterpart_call: str | None
     alignment_confidence: float | None
     coclaimed_by: list[str] | None = None  # A-side degraded co-claimers' function entries
     coclaimed_by_b: list[str] | None = None  # B-side degraded co-claimers' function entries
     a_n: int | None = None
     b_n: int | None = None
+    # On a same/different-callee row: what the matched other-side instruction calls —
+    # ``{"matched_addr", "callees": [...], "same_callee_candidate_elsewhere": bool|None}`` (the last
+    # key only on a different-callee row). None otherwise.
+    counterpart_callee: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -409,17 +437,29 @@ class _DiffCtx:
     imatch: dict[str, str]
     imatch_b: dict[str, str]
     imatch_present: bool
+    # call-site facts at each side's matched addresses (address -> parsed JSON, None when that
+    # side's column is NULL), each side's facts state, the build hash read from, its stub state
+    facts_a: dict[str, dict[str, Any] | None] = field(default_factory=dict)
+    facts_b: dict[str, dict[str, Any] | None] = field(default_factory=dict)
+    facts_state_a: str | None = None
+    facts_state_b: str | None = None
+    facts_hash_a: str | None = None
+    facts_hash_b: str | None = None
+    stub_state_a: str | None = None
+    stub_state_b: str | None = None
 
 
 def _load_diff_ctx(atlas: sqlite3.Connection, diff_id: str) -> _DiffCtx | None:
     meta = atlas.execute(
-        "SELECT run_a_id, run_b_id, binary_a, binary_b, sha256_a, sha256_b, diff_ok, version_skew "
-        "FROM diff_meta WHERE diff_id = ?",
+        "SELECT run_a_id, run_b_id, binary_a, binary_b, sha256_a, sha256_b, diff_ok, version_skew, "
+        "callsite_facts_a, callsite_facts_b, callsite_facts_hash_a, callsite_facts_hash_b, "
+        "stub_state_a, stub_state_b FROM diff_meta WHERE diff_id = ?",
         (diff_id,),
     ).fetchone()
     if meta is None:
         return None
-    run_a, run_b, binary_a, binary_b, sha_a, sha_b, diff_ok, version_skew = meta
+    run_a, run_b, binary_a, binary_b, sha_a, sha_b, diff_ok, version_skew = meta[:8]
+    fs_a, fs_b, fh_a, fh_b, ss_a, ss_b = meta[8:]
     align_a: dict[str, tuple[str, float, str]] = {}
     align_b: dict[str, tuple[str, float, str]] = {}
     for addr_a, addr_b, conf, state in atlas.execute(
@@ -438,11 +478,16 @@ def _load_diff_ctx(atlas: sqlite3.Connection, diff_id: str) -> _DiffCtx | None:
         (presence_a if side == "a" else presence_b)[addr] = pstate
     imatch: dict[str, str] = {}
     imatch_b: dict[str, str] = {}
-    for addr_a, addr_b in atlas.execute(
-        "SELECT addr_a, addr_b FROM instruction_match WHERE diff_id = ?", (diff_id,)
+    facts_a: dict[str, dict[str, Any] | None] = {}
+    facts_b: dict[str, dict[str, Any] | None] = {}
+    for addr_a, addr_b, fa, fb in atlas.execute(
+        "SELECT addr_a, addr_b, facts_a, facts_b FROM instruction_match WHERE diff_id = ?",
+        (diff_id,),
     ):
         imatch[addr_a] = addr_b
         imatch_b[addr_b] = addr_a
+        facts_a[addr_a] = _parse_facts(fa)
+        facts_b[addr_b] = _parse_facts(fb)
     return _DiffCtx(
         diff_id=diff_id,
         binary=binary_a,
@@ -460,7 +505,28 @@ def _load_diff_ctx(atlas: sqlite3.Connection, diff_id: str) -> _DiffCtx | None:
         imatch=imatch,
         imatch_b=imatch_b,
         imatch_present=bool(imatch),
+        facts_a=facts_a,
+        facts_b=facts_b,
+        facts_state_a=fs_a,
+        facts_state_b=fs_b,
+        facts_hash_a=fh_a,
+        facts_hash_b=fh_b,
+        stub_state_a=ss_a,
+        stub_state_b=ss_b,
     )
+
+
+def _parse_facts(raw: str | None) -> dict[str, Any] | None:
+    """One side's call-site facts JSON at a matched address, or None when absent / unreadable."""
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("callees"), list):
+        return None
+    return data
 
 
 def _gen_stamps(
@@ -513,6 +579,7 @@ class _Side:
     folded: dict[str, list[_Cand]]  # callsite addr -> degraded candidates folded into it
     folded_ids: set[int]
     unresolved_ids: set[int]  # degraded candidates at a multi-claimed, unowned callsite
+    by_func: dict[str, list[_Cand]] = field(default_factory=dict)  # func entry -> candidates
 
 
 def _index(cands: list[_Cand]) -> _Side:
@@ -546,7 +613,12 @@ def _index(cands: list[_Cand]) -> _Side:
     unresolved_ids = {
         d.iid for degs in claims.values() if len({d.func_entry for d in degs}) >= 2 for d in degs
     }
-    return _Side(cands, t1_at, deg_at, fn_key, class_at_func, folded, folded_ids, unresolved_ids)
+    by_func: dict[str, list[_Cand]] = {}
+    for c in cands:
+        by_func.setdefault(c.func_entry, []).append(c)
+    return _Side(
+        cands, t1_at, deg_at, fn_key, class_at_func, folded, folded_ids, unresolved_ids, by_func
+    )
 
 
 @dataclass
@@ -560,11 +632,21 @@ class _Dir:
     presence: dict[str, str]  # this side's unmatched-function presence states
     imatch: dict[str, str]  # this side's callsite addr -> other side's matched addr
     imatch_present: bool
-    no_cand_reason: str  # matched instruction on the other side is not a candidate
+    no_cand_reason: (
+        str  # matched instruction on the other side is not a candidate (candidates-only)
+    )
+    backend: str = _BACKEND_FACTS
+    # the OTHER side's call-site facts at its matched addresses, their state, whether they are from
+    # an older extraction than that run's current one, and its stub-table state
+    other_facts: dict[str, dict[str, Any] | None] = field(default_factory=dict)
+    other_facts_state: str | None = None
+    other_facts_stale: bool = False
+    other_stub_state: str | None = None
 
 
-# (presence, reason, match_basis, counterpart_call, other-side candidate or None)
-_Verdict = tuple[str, str | None, str | None, str | None, _Cand | None]
+# (presence, reason, match_basis, counterpart_call, other-side candidate or None,
+#  counterpart_callee or None)
+_Verdict = tuple[str, str | None, str | None, str | None, _Cand | None, dict[str, Any] | None]
 
 
 def _function_unmatched(fe: str, d: _Dir) -> tuple[str, str | None]:
@@ -613,6 +695,8 @@ def _same_callee(cand: _Cand, o: _Cand, d: _Dir) -> bool | None:
         if aligned is None or aligned[2] != "aligned":
             return None
         return aligned[0] == o.callee_addr
+    if cand.callee_addr is not None or o.callee_addr is not None:
+        return None  # one side's W is pinned by address, the other's is not: not comparable
     if cand.callee_name is not None and o.callee_name is not None:
         return cand.callee_name == o.callee_name
     return None
@@ -631,37 +715,214 @@ def _tier1_verdict(cand: _Cand, d: _Dir) -> _Verdict:
     unknown for any candidate there, or this one's own callee is unreadable: callee_unreadable."""
     ca = cand.callsite_addr
     if ca is None:  # a callsite tier with no address should not happen; stay honest
-        return _P_UNDET, "crossside_match_degraded", "instruction", None, None
+        return _P_UNDET, "crossside_match_degraded", "instruction", None, None, None
     other_addr = d.imatch.get(ca)
     if other_addr is None:
         # No instruction data at all -> the degraded period before layer-0 instruction persistence
         # was re-run. Data present but not this callsite -> an export gap OR a changed basic block
         # BinDiff did not pair; this backend cannot tell which, so it names neither.
         reason = "instruction_unmatched" if d.imatch_present else "crossside_match_degraded"
-        return _P_UNDET, reason, "instruction", None, None
+        return _P_UNDET, reason, "instruction", None, None, None
     t1 = d.other.t1_at.get(other_addr, [])
     if t1:
         verdicts = [(o, _same_callee(cand, o, d)) for o in t1]
         if not _callee_readable(cand) or any(v is None for _o, v in verdicts):
-            return _P_UNDET, "callee_unreadable", "instruction", None, t1[0]
+            return _P_UNDET, "callee_unreadable", "instruction", None, t1[0], None
         same = [o for o, v in verdicts if v]
         if same:
             same.sort(key=lambda o: o.sink_class != cand.sink_class)  # same class first
-            return _P_PERSISTED, None, "instruction", None, same[0]
+            return _P_PERSISTED, None, "instruction", None, same[0], None
+        callee = {
+            "matched_addr": other_addr,
+            "callees": [_candidate_callee(o) for o in t1],
+            "same_callee_candidate_elsewhere": _same_callee_elsewhere(cand, d),
+        }
         return (
             _P_UNDET,
             "present_different_callee",
             "instruction",
             "present_different_callee",
             t1[0],
+            callee,
         )
     if d.other.deg_at.get(other_addr):
         # only a degraded (function-level) candidate claims that address: never the persisted
         # object of a callsite-tier match.
-        return _P_UNDET, "crossgranularity_unresolved", "instruction", None, None
-    # matched, but the other side has no candidate there: its callee is unreadable under the
-    # atlas+BinDiff backend -> honest undetermined, never a guess that the call is gone or new.
-    return _P_UNDET, d.no_cand_reason, "instruction", "counterpart_not_candidate", None
+        return _P_UNDET, "crossgranularity_unresolved", "instruction", None, None, None
+    if d.backend == _BACKEND_CANDIDATES:
+        # candidates only: the other side's callee there is unreadable -> honest undetermined
+        return (
+            _P_UNDET,
+            d.no_cand_reason,
+            "instruction",
+            "counterpart_not_candidate",
+            None,
+            None,
+        )
+    return _facts_verdict(cand, d, other_addr)
+
+
+# ── the matched instruction is not a candidate: read the call-site facts ─────────────────
+
+
+@dataclass(frozen=True)
+class _Ident:
+    """One callee identity recorded at the other side's matched instruction, with the address it
+    is compared by (``effective_addr``) and where that address came from (``addr_source``)."""
+
+    name: str
+    addr: str | None
+    kind: str
+    effective_addr: str | None
+    addr_source: str | None
+
+    def as_json(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "addr": self.addr,
+            "kind": self.kind,
+            "addr_source": self.addr_source,
+        }
+
+
+def _merge_addr(x: str | None, targets: list[str] | None) -> tuple[str | None, str | None]:
+    """(effective_addr, addr_source) from the identity's own address ``x`` and the instruction's
+    BinExport targets. A disagreement is NOT settled in favour of either: no address."""
+    distinct = sorted(set(targets or []))
+    if not distinct:
+        return (x, "x") if x is not None else (None, None)
+    if len(distinct) > 1:
+        return None, "binexport_ambiguous"
+    (target,) = distinct
+    if x is None:
+        return target, "binexport"
+    if x == target:
+        return target, "both"
+    return None, "conflict"
+
+
+def _idents(facts: dict[str, Any]) -> list[_Ident]:
+    raw_targets = facts.get("targets")
+    targets = [str(v) for v in raw_targets] if isinstance(raw_targets, list) else None
+    seen: dict[tuple[str, str | None, str], _Ident] = {}
+    for c in facts.get("callees") or []:
+        if not isinstance(c, dict) or not isinstance(c.get("name"), str):
+            continue
+        name, kind = c["name"], str(c.get("kind") or "")
+        addr = c.get("addr") if isinstance(c.get("addr"), str) else None
+        eff, src = _merge_addr(addr, targets)
+        seen.setdefault((name, addr, kind), _Ident(name, addr, kind, eff, src))
+    return [seen[k] for k in sorted(seen, key=lambda k: (k[0], k[1] or "", k[2]))]
+
+
+def _fact_same_callee(cand: _Cand, ident: _Ident, d: _Dir) -> bool | None:
+    """Does the other side's instruction call ``cand``'s callee? Only its DIRECT callee is read.
+
+    A direct sink compares by name, exactly (``strcpy`` is not ``__strcpy_chk``) — but a call
+    through a stub the other side could not resolve is printed ``FUN_<stub>`` and would read as a
+    different callee while it may well be the same import, so it is unknown: an unresolved stub, or
+    any ``FUN_<hex>`` name where that side's stub table was never determined. A wrapper compares
+    ``W`` by entry address through this diff's function alignment, never by name; with no address
+    on either side, or no high-confidence alignment for ``W``, it is unknown."""
+    if cand.wrapper_axis is None:
+        if cand.sink is None or ident.kind == "stub_unresolved":
+            return None
+        if _FUN_NAME_RE.fullmatch(ident.name) and d.other_stub_state == "not_determined":
+            return None
+        return ident.name == cand.sink
+    if cand.sink is None or cand.callee_addr is None or ident.effective_addr is None:
+        return None
+    aligned = d.align.get(cand.callee_addr)
+    if aligned is None or aligned[2] != "aligned":
+        return None
+    return aligned[0] == ident.effective_addr
+
+
+def _facts_verdict(cand: _Cand, d: _Dir, other_addr: str) -> _Verdict:
+    """The matched other-side instruction carries no candidate: judge it by the call-site facts.
+
+    Seven outcomes, all ``presence_undetermined`` — what the instruction calls is a fact about it,
+    never a claim that the candidate's call persisted, went away or is new. In order: no readable
+    facts for that side (``counterpart_call_facts_absent``); facts from an older extraction than
+    that run's current one (``counterpart_facts_stale``); no CALL recorded at that address
+    (``counterpart_no_call_fact`` — NOT "it is not a call": a register-indirect call records none);
+    two or more different callees there (``counterpart_call_ambiguous``); a callee that cannot be
+    compared (``counterpart_callee_unresolved``); the same callee (``counterpart_same_callee``);
+    a different one (``counterpart_different_callee``)."""
+    facts = d.other_facts.get(other_addr)
+    if d.other_facts_state != "read" or facts is None:
+        return _P_UNDET, "counterpart_call_facts_absent", "instruction", "unknown", None, None
+    if d.other_facts_stale:
+        return _P_UNDET, "counterpart_facts_stale", "instruction", "unknown", None, None
+    idents = _idents(facts)
+    if not idents:
+        return _P_UNDET, "counterpart_no_call_fact", "instruction", "unknown", None, None
+    if len(idents) > 1:
+        return _P_UNDET, "counterpart_call_ambiguous", "instruction", "unknown", None, None
+    same = _fact_same_callee(cand, idents[0], d)
+    if same is None:
+        return _P_UNDET, "counterpart_callee_unresolved", "instruction", "unknown", None, None
+    callee: dict[str, Any] = {"matched_addr": other_addr, "callees": [idents[0].as_json()]}
+    if same:
+        return (
+            _P_UNDET,
+            "counterpart_same_callee",
+            "instruction",
+            "present_same_callee",
+            None,
+            callee,
+        )
+    callee["same_callee_candidate_elsewhere"] = _same_callee_elsewhere(cand, d)
+    return (
+        _P_UNDET,
+        "counterpart_different_callee",
+        "instruction",
+        "present_different_callee",
+        None,
+        callee,
+    )
+
+
+def _candidate_callee(o: _Cand) -> dict[str, Any]:
+    """A matched other-side CANDIDATE as a callee entry (its sink, or its wrapper ``W``)."""
+    if o.wrapper_axis is None:
+        return {"name": o.sink, "addr": None, "kind": "candidate", "addr_source": None}
+    return {"name": o.callee_name, "addr": o.callee_addr, "kind": "candidate", "addr_source": None}
+
+
+def _same_callee_elsewhere(cand: _Cand, d: _Dir) -> bool | None:
+    """Does ANOTHER candidate in the other side's paired function have ``cand``'s callee?
+
+    A different callee at the instruction BinDiff matched is not the same thing as "the callee was
+    replaced": the call may well still be there, matched elsewhere. True = such a candidate exists;
+    False = the paired function holds no candidate with this callee; None = it cannot be told (the
+    function is not paired, or a candidate there could match but its callee is unreadable). Reads
+    the candidate records only."""
+    paired = d.align.get(cand.func_entry)
+    if paired is None or paired[2] != "aligned" or cand.sink is None:
+        return None
+    peers = d.other.by_func.get(paired[0], [])
+    unknown = False
+    if cand.wrapper_axis is None:
+        for o in peers:
+            if o.wrapper_axis is not None:
+                continue
+            if o.sink is None:
+                unknown = True
+            elif o.sink == cand.sink:
+                return True
+        return None if unknown else False
+    w = d.align.get(cand.callee_addr) if cand.callee_addr is not None else None
+    if w is None or w[2] != "aligned":
+        return None
+    for o in peers:
+        if o.wrapper_axis is None or o.sink != cand.sink:
+            continue
+        if o.callee_addr is None:
+            unknown = True
+        elif o.callee_addr == w[0]:
+            return True
+    return None if unknown else False
 
 
 def _funclevel_verdict(cand: _Cand, other_fe: str, d: _Dir) -> _Verdict:
@@ -671,20 +932,20 @@ def _funclevel_verdict(cand: _Cand, other_fe: str, d: _Dir) -> _Verdict:
     function is never read as gone or new (the safe direction)."""
     peers = d.other.fn_key.get((other_fe, _key_class(cand)), [])
     if peers:
-        return _P_PERSISTED, None, "function_level", None, peers[0]
+        return _P_PERSISTED, None, "function_level", None, peers[0], None
     if cand.tier == _G_FUNCTION_FALLBACK and (other_fe, cand.sink_class) in d.other.class_at_func:
-        return _P_UNDET, "crossgranularity_unresolved", "function_level", None, None
-    return _P_UNDET, "no_counterpart_undetermined", "function_level", None, None
+        return _P_UNDET, "crossgranularity_unresolved", "function_level", None, None, None
+    return _P_UNDET, "no_counterpart_undetermined", "function_level", None, None, None
 
 
 def _verdict(cand: _Cand, d: _Dir) -> tuple[_Verdict, float | None]:
     fe = cand.func_entry
     if fe not in d.align:
         p, reason = _function_unmatched(fe, d)
-        return (p, reason, "function_level", None, None), None
+        return (p, reason, "function_level", None, None, None), None
     other_fe, conf, state = d.align[fe]
     if state != "aligned":
-        return (_P_UNDET, "alignment_low_confidence", None, None, None), conf
+        return (_P_UNDET, "alignment_low_confidence", None, None, None, None), conf
     if cand.tier in _CALLSITE_TIERS:
         return _tier1_verdict(cand, d), conf
     return _funclevel_verdict(cand, other_fe, d), conf
@@ -725,7 +986,7 @@ def _judge_pass(
     for c in d.this.cands:
         if c.tier == _G_DEGRADED or c.iid in covered_this:
             continue
-        (p, reason, mb, cc, other), conf = _verdict(c, d)
+        (p, reason, mb, cc, other, callee), conf = _verdict(c, d)
         # a fold joins the first row of its callsite only (one listing, never double-counted)
         fold = [
             f for f in d.this.folded.get(c.callsite_addr or "", []) if f.iid not in covered_this
@@ -746,6 +1007,7 @@ def _judge_pass(
             alignment_confidence=conf,
             coclaimed_by=(_coclaimers(fold) or None) if d.side == "a" else None,
             coclaimed_by_b=(_coclaimers(fold) or None) if d.side == "b" else None,
+            counterpart_callee=callee,
         )
         mine = [c, *fold]
         theirs = [other] if other else []
@@ -916,7 +1178,22 @@ class _Computed:
     b: _Loaded
 
 
-def _compute(atlas: sqlite3.Connection, diff_id: str) -> _Computed | None:
+def _facts_stale(atlas: sqlite3.Connection, run_id: str, read_from: str | None) -> bool:
+    """Were a side's call-site facts read from another extraction than its run's current one?
+    Compared with the run row's ``build_hash``; a missing value on either end cannot be shown
+    current, so it counts as stale (the outcome is undetermined either way)."""
+    stamps = _gen_stamps(atlas, run_id)
+    current = stamps[1] if stamps is not None else None
+    return read_from is None or current is None or read_from != current
+
+
+def _compute(
+    atlas: sqlite3.Connection, diff_id: str, *, callee_backend: str = _BACKEND_FACTS
+) -> _Computed | None:
+    if callee_backend not in _CALLEE_BACKENDS:
+        raise ValueError(
+            f"callee_backend must be one of {_CALLEE_BACKENDS}, got {callee_backend!r}"
+        )
     ctx = _load_diff_ctx(atlas, diff_id)
     if ctx is None:
         return None
@@ -964,6 +1241,11 @@ def _compute(atlas: sqlite3.Connection, diff_id: str) -> _Computed | None:
         imatch=ctx.imatch,
         imatch_present=ctx.imatch_present,
         no_cand_reason="counterpart_not_candidate",
+        backend=callee_backend,
+        other_facts=ctx.facts_b,
+        other_facts_state=ctx.facts_state_b,
+        other_facts_stale=_facts_stale(atlas, ctx.run_b, ctx.facts_hash_b),
+        other_stub_state=ctx.stub_state_b,
     )
     db = _Dir(
         side="b",
@@ -974,6 +1256,11 @@ def _compute(atlas: sqlite3.Connection, diff_id: str) -> _Computed | None:
         imatch=ctx.imatch_b,
         imatch_present=ctx.imatch_present,
         no_cand_reason="a_counterpart_not_candidate",
+        backend=callee_backend,
+        other_facts=ctx.facts_a,
+        other_facts_state=ctx.facts_state_a,
+        other_facts_stale=_facts_stale(atlas, ctx.run_a, ctx.facts_hash_a),
+        other_stub_state=ctx.stub_state_a,
     )
     b_row_of: dict[int, int] = {}
     _judge_pass(out, da, diff_id, ctx.binary, b_row_of)
@@ -1034,12 +1321,14 @@ def compute_sink_overlay(
     sink_class: str | None = None,
     presence: str | None = None,
     min_alignment_confidence: float | None = None,
+    callee_backend: str = _BACKEND_FACTS,
 ) -> SinkOverlayResult:
     """Live-compute the candidate-level sink overlay for one diff. Reads function_alignment +
-    function_presence + instruction_match + both runs' candidate tables; writes nothing. The
-    filters narrow the rows only; ``coverage`` always describes the whole diff."""
+    function_presence + instruction_match (with its call-site facts) + both runs' candidate tables;
+    writes nothing. The filters narrow the rows only; ``coverage`` always describes the whole diff.
+    ``callee_backend`` is for checking the facts against the candidates-only reading."""
     _check_presence_filter(presence)
-    comp = _compute(atlas, diff_id)
+    comp = _compute(atlas, diff_id, callee_backend=callee_backend)
     if comp is None:
         empty = _Loaded([], 0)
         return SinkOverlayResult([], _coverage(empty, empty, _Out()))
@@ -1056,6 +1345,7 @@ def compute_sink_overlay_runs(
     sink_class: str | None = None,
     presence: str | None = None,
     min_alignment_confidence: float | None = None,
+    callee_backend: str = _BACKEND_FACTS,
 ) -> SinkOverlayResult:
     """The overlay over EVERY diff between two runs, plus every candidate no diff covers.
 
@@ -1071,7 +1361,7 @@ def compute_sink_overlay_runs(
     ).fetchall()
     out = _Out()
     for diff_id, *_rest in diffs:
-        comp = _compute(atlas, diff_id)
+        comp = _compute(atlas, diff_id, callee_backend=callee_backend)
         if comp is None:
             continue
         out.rows.extend(comp.out.rows)
@@ -1146,10 +1436,46 @@ def _row_order_key(r: SinkOverlayRow) -> tuple[str, str, str, str, str, str]:
     )
 
 
+def _row_side(r: SinkOverlayRow) -> str:
+    """Which side's candidate a row speaks for: ``a_only`` / ``b_only`` (one ref), ``both``, or
+    ``neither`` (no ref — not produced by construction; counted, never dropped, if it appears)."""
+    if r.a_ref and r.b_ref:
+        return "both"
+    if r.a_ref:
+        return "a_only"
+    if r.b_ref:
+        return "b_only"
+    return "neither"
+
+
+def check_side_filter(side: str | None) -> None:
+    """Reject a side filter other than ``a_only`` / ``b_only`` / ``both``."""
+    if side is not None and side not in _SIDES:
+        raise ValueError(f"side must be one of {_SIDES} or None, got {side!r}")
+
+
+def filter_by_side(rows: list[SinkOverlayRow], side: str | None) -> list[SinkOverlayRow]:
+    """Rows whose direction (``_row_side``) equals ``side``; all rows when ``side`` is None."""
+    check_side_filter(side)
+    if side is None:
+        return rows
+    return [r for r in rows if _row_side(r) == side]
+
+
+def _reason_side_key(r: SinkOverlayRow) -> str:
+    key = f"{r.presence}|{r.presence_reason or '-'}|{_row_side(r)}"
+    if r.presence_reason == "counterpart_different_callee":
+        elsewhere = (r.counterpart_callee or {}).get("same_callee_candidate_elsewhere")
+        key += f"|same_callee_candidate_elsewhere={json.dumps(elsewhere)}"
+    return key
+
+
 def summarize_overlay(rows: list[SinkOverlayRow], *, by_binary: bool) -> dict[str, Any]:
     """Counts over ``rows`` (already filtered): total, and per presence, presence|reason, key
     granularity and sink class; per binary too when ``by_binary`` (run-pair mode, where a row's
-    binary varies; a row with none counts under ``(none)``). Counts only — nothing is truncated."""
+    binary varies; a row with none counts under ``(none)``). ``by_presence_reason_side`` adds the
+    row's direction (``presence|reason|side``), and splits ``counterpart_different_callee`` by
+    ``same_callee_candidate_elsewhere``. Counts only — nothing is truncated."""
 
     def count(keys: list[str]) -> dict[str, int]:
         out: dict[str, int] = {}
@@ -1161,6 +1487,7 @@ def summarize_overlay(rows: list[SinkOverlayRow], *, by_binary: bool) -> dict[st
         "total_rows": len(rows),
         "by_presence": count([r.presence for r in rows]),
         "by_presence_reason": count([f"{r.presence}|{r.presence_reason or '-'}" for r in rows]),
+        "by_presence_reason_side": count([_reason_side_key(r) for r in rows]),
         "by_key_granularity": count([r.key_granularity for r in rows]),
         "by_sink_class": count([r.sink_class for r in rows]),
     }
@@ -1269,6 +1596,11 @@ def persist_sink_overlay(atlas: sqlite3.Connection, diff_id: str, *, commit: boo
                 hunt_instances_a=hi_a,
                 hunt_instances_b=hi_b,
                 overlay_version=SINK_OVERLAY_LOGIC_VERSION,
+                counterpart_callee=(
+                    json.dumps(r.counterpart_callee, sort_keys=True)
+                    if r.counterpart_callee is not None
+                    else None
+                ),
             )
         )
     keys = [d.subject_key for d in dd_rows]

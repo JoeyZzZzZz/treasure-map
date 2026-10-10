@@ -537,12 +537,12 @@ CREATE INDEX IF NOT EXISTS idx_fpres ON function_presence(diff_id, side);
 -- (address1 <-> address2) and carries NO mnemonic / operand / callee. So this table stores only
 -- the address pair, scoped by the containing A-side function, and ONLY for pairs where the A or
 -- the B address (either side) is a candidate sink callsite (the fill is small -- candidate-sized,
--- not every instruction). The sink overlay reads addr_a <-> addr_b, then verifies the callee from BOTH sides' atlas CANDIDATE records; where B has
--- no candidate at addr_b the callee is unreadable under the atlas+BinDiff backend and the result is
--- an honest presence_undetermined (never a guessed removed/persisted). The callee backend is a
--- SEAM: a future BinExport2-proto reader (backend B) or a tmap-call_tokens materialiser (backend
--- A+) could supply the B-side callee and upgrade that bucket -- without reworking this table. The
--- .BinDiff is deleted right after parse, so a diff re-run MUST clear this table for its diff_id
+-- not every instruction). The pair itself is still BinDiff's POSITIONAL match. What each side's
+-- instruction calls is stored beside it, per side (facts_a / facts_b): the callee identities derived
+-- from that run's own call_tokens, and the call targets the side's BinExport recorded. The sink
+-- overlay compares the callee against the other side's candidate first; where that side has no
+-- candidate at the matched address it reads these facts instead, and never infers "not a call" from
+-- their absence (a register-indirect call leaves no token). The .BinDiff is deleted right after parse, so a diff re-run MUST clear this table for its diff_id
 -- (delete_diff does), or stale matches would drive a wrong presence (the generation-staleness trap).
 -- BinDiff instruction matching is strictly 1:1 on each side's address, hence UNIQUE(diff_id, addr_a).
 CREATE TABLE IF NOT EXISTS instruction_match (
@@ -551,6 +551,14 @@ CREATE TABLE IF NOT EXISTS instruction_match (
     func_addr_a TEXT NOT NULL,   -- containing A-side function entry (normalized hex), for scoping
     addr_a      TEXT NOT NULL,   -- A-side instruction (candidate callsite) address, normalized hex
     addr_b      TEXT NOT NULL,   -- B-side matched instruction address, normalized hex
+    facts_a     TEXT,            -- call-site facts at addr_a: JSON
+                                 --   {"callees":[{"name","addr","kind"},...],"targets":[...]|null}
+                                 --   callees: identities of the CALL tokens (opcode 7) this run's
+                                 --   call_tokens record at this address; [] = none at this address.
+                                 --   targets: the BinExport call targets (normalized); null = not
+                                 --   decoded for this diff. NULL (the whole column) = not written
+                                 --   for this side (see diff_meta.callsite_facts_a).
+    facts_b     TEXT,            -- the same at addr_b
     UNIQUE(diff_id, addr_a)
 );
 CREATE INDEX IF NOT EXISTS idx_imatch_diff ON instruction_match(diff_id);
@@ -625,6 +633,14 @@ CREATE TABLE IF NOT EXISTS diff_meta (
     sha256_a                TEXT,            -- A-side binary sha256 at diff time; the incremental
     sha256_b                TEXT,            --   skip + attempts-reset gate (current sha != this ->
                                              --   content changed -> re-diff, attempts reset)
+    -- call-site facts written beside instruction_match, per side: whether they were read, the
+    -- extraction generation they were read from, and the state of the side's stub table.
+    callsite_facts_a        TEXT,            -- read | bridge_absent | not_read; NULL on a diff
+    callsite_facts_b        TEXT,            --   written before the facts were recorded
+    callsite_facts_hash_a   TEXT,            -- the side's analysis.db build hash when read (the
+    callsite_facts_hash_b   TEXT,            --   reader compares it with run.build_hash)
+    stub_state_a            TEXT,            -- not_applicable (not MIPS) | not_determined (MIPS,
+    stub_state_b            TEXT,            --   no table recorded) | read (MIPS, table recorded)
     created_at              DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -687,7 +703,9 @@ CREATE TABLE IF NOT EXISTS dimension_delta (
     key_granularity      TEXT,            -- 'callsite' | 'wrapper_callsite' | 'degraded_out_of_body' | 'function_fallback' | 'wrapper'
     match_basis          TEXT,            -- 'instruction' | 'function_level' | 'ordinal_singleton'
     counterpart_call     TEXT,            -- tier-1 only: 'present_same_callee' | 'present_different_callee'
-                                          --   | 'not_a_call' | 'absent' | 'unknown' (NULL when persisted / n/a)
+                                          --   | 'unknown' | 'counterpart_not_candidate' (NULL when
+                                          --   persisted / n/a). 'not_a_call' / 'absent' are left to a
+                                          --   backend that reads the disassembly; none is emitted.
     coclaimed_by         TEXT,            -- JSON list of co-claiming function entries (co-claim fold); NULL otherwise
     a_n                  INTEGER,         -- A-side folded count (tier-2 function-level); NULL otherwise
     b_n                  INTEGER,         -- B-side folded count (tier-2 function-level); NULL otherwise
@@ -699,6 +717,8 @@ CREATE TABLE IF NOT EXISTS dimension_delta (
     hunt_instances_a     INTEGER,
     hunt_instances_b     INTEGER,
     overlay_version      TEXT,            -- overlay logic version that computed the row; NULL for edge rows
+    counterpart_callee   TEXT,            -- JSON: what the matched other-side instruction calls, on a
+                                          --   same/different-callee row; NULL otherwise
     UNIQUE(diff_id, dimension, subject_kind, subject_key)
 );
 CREATE INDEX IF NOT EXISTS idx_dimdelta_diff ON dimension_delta(diff_id);

@@ -213,9 +213,15 @@ def test_tier1_present_different_callee(atlas: sqlite3.Connection) -> None:
 
 
 def test_tier1_counterpart_not_candidate(atlas: sqlite3.Connection) -> None:
-    r = _by(_rows(atlas), a_off="@0x000030")
+    """Matched to an other-side instruction with no candidate: the candidates-only reading says
+    counterpart_not_candidate; the default reading looks for call-site facts and, with none
+    recorded for the diff, says they are absent."""
+    r = _by(_rows(atlas, callee_backend="atlas_candidates"), a_off="@0x000030")
     assert r is not None and r.presence == "presence_undetermined"
     assert r.presence_reason == "counterpart_not_candidate" and r.b_ref is None
+    d = _by(_rows(atlas), a_off="@0x000030")
+    assert d is not None and d.presence_reason == "counterpart_call_facts_absent"
+    assert d.counterpart_call == "unknown" and d.b_ref is None
 
 
 def test_tier1_instruction_unmatched(atlas: sqlite3.Connection) -> None:
@@ -757,12 +763,14 @@ def test_instruction_match_keeps_b_candidate_pairs(tmp_path: Path) -> None:
         "SELECT addr_a, addr_b FROM instruction_match WHERE diff_id = ? ORDER BY addr_a", (DIFF_ID,)
     ).fetchall()
     assert [tuple(p) for p in pairs] == [("00001010", "00002010"), ("00001060", "00002060")]
-    res = so.compute_sink_overlay(atlas, DIFF_ID)
+    res = so.compute_sink_overlay(atlas, DIFF_ID, callee_backend="atlas_candidates")
     r = _by(res.rows, b_off=b_only)
     assert r is not None and r.a_ref is None and r.presence == "presence_undetermined"
     assert r.presence_reason == "a_counterpart_not_candidate"
     assert r.counterpart_call == "counterpart_not_candidate"
     _assert_full_coverage(res)
+    d = _by(so.compute_sink_overlay(atlas, DIFF_ID).rows, b_off=b_only)
+    assert d is not None and d.presence_reason == "counterpart_call_facts_absent"
 
 
 # ── MCP surface ─────────────────────────────────────────────────────────────────────
@@ -1002,13 +1010,69 @@ _GOLDEN: dict[str, dict[str, object]] = {
         "by_sink_class": {"cmd": 9, "copy": 2, "format": 1, "path_sink": 1},
         "by_binary": {"libx": 13},
     },
+    # logic 4: the call-site facts; recorded on the base fixture + _golden_v4 (wrapper calls and
+    # facts), so it also pins the wrapper_callsite tier and the side split
+    "4": {
+        "total_rows": 19,
+        "by_presence": {"persisted": 5, "presence_undetermined": 14},
+        "by_presence_reason": {
+            "persisted|-": 5,
+            "presence_undetermined|alignment_low_confidence": 1,
+            "presence_undetermined|callee_unreadable": 1,
+            "presence_undetermined|counterpart_different_callee": 1,
+            "presence_undetermined|counterpart_no_call_fact": 1,
+            "presence_undetermined|counterpart_same_callee": 2,
+            "presence_undetermined|crossside_count_mismatch": 1,
+            "presence_undetermined|function_unmatched": 2,
+            "presence_undetermined|instruction_unmatched": 1,
+            "presence_undetermined|no_counterpart_undetermined": 2,
+            "presence_undetermined|present_different_callee": 2,
+        },
+        "by_presence_reason_side": {
+            "persisted|-|both": 5,
+            "presence_undetermined|alignment_low_confidence|a_only": 1,
+            "presence_undetermined|callee_unreadable|both": 1,
+            "presence_undetermined|counterpart_different_callee|a_only"
+            "|same_callee_candidate_elsewhere=false": 1,
+            "presence_undetermined|counterpart_no_call_fact|b_only": 1,
+            "presence_undetermined|counterpart_same_callee|a_only": 2,
+            "presence_undetermined|crossside_count_mismatch|both": 1,
+            "presence_undetermined|function_unmatched|a_only": 1,
+            "presence_undetermined|function_unmatched|b_only": 1,
+            "presence_undetermined|instruction_unmatched|a_only": 1,
+            "presence_undetermined|no_counterpart_undetermined|a_only": 2,
+            "presence_undetermined|present_different_callee|both": 2,
+        },
+        "by_key_granularity": {
+            "callsite": 10,
+            "degraded_out_of_body": 2,
+            "function_fallback": 2,
+            "wrapper": 1,
+            "wrapper_callsite": 4,
+        },
+        "by_sink_class": {"cmd": 15, "copy": 2, "format": 1, "path_sink": 1},
+        "by_binary": {"libx": 19},
+    },
 }
 
 
 def test_golden_summary_matches_logic_version(atlas: sqlite3.Connection) -> None:
+    """From logic "4" on, the golden fixture adds wrapper calls (same W, another W, an unaligned W)
+    and call-site facts (``_golden_v4``) to the base fixture "2"/"3" were recorded on."""
+    _golden_v4(atlas)
     rows = so.compute_sink_overlay_runs(atlas, "runA", "runB").rows
     summary = so.summarize_overlay(rows, by_binary=True)
     assert summary == _GOLDEN[so.SINK_OVERLAY_LOGIC_VERSION]
+    assert "wrapper_callsite" in summary["by_key_granularity"]
+
+
+def test_candidates_only_reading_reproduces_logic_3(atlas: sqlite3.Connection) -> None:
+    """The candidates-only reading of the base fixture is still exactly what logic "3" recorded."""
+    rows = so.compute_sink_overlay_runs(
+        atlas, "runA", "runB", callee_backend="atlas_candidates"
+    ).rows
+    summary = so.summarize_overlay(rows, by_binary=True)
+    assert {k: summary[k] for k in _GOLDEN["3"]} == _GOLDEN["3"]
 
 
 def test_degraded_key_in_unmatched_function_is_function_unmatched(
@@ -1074,7 +1138,7 @@ def test_persist_stamps_logic_version(atlas: sqlite3.Connection) -> None:
     assert {v[0] for v in versions} == {so.SINK_OVERLAY_LOGIC_VERSION}
 
 
-@pytest.mark.parametrize("stored", ["1", None])
+@pytest.mark.parametrize("stored", ["1", "3", None])
 def test_baseline_from_other_logic_is_stale(atlas: sqlite3.Connection, stored: str | None) -> None:
     """A baseline written by other overlay logic (or before the stamp existed: NULL) is stale.
 
@@ -1267,3 +1331,391 @@ def test_layer0_collects_wrapper_call_addresses(tmp_path: Path) -> None:
     _inst(atlas, "runA", SHA_A, _ref("runA", "00001000", "cmd_via_wrapper", "0x000090"), "cmd")
     _inst(atlas, "runA", SHA_A, _ref("runA", "00001000", "cmd", "0x000010"), "cmd")
     assert _candidate_callsite_addrs(atlas, "runA", SHA_A) == {"00001090", "00001010"}
+
+
+# ── matched to a non-candidate instruction: the call-site facts ─────────────────────────────
+
+
+def _fj(*callees: tuple[str, str | None, str], targets: list[str] | None = None) -> str:
+    """A call-site facts JSON: ``(name, addr, kind)`` identities + the BinExport targets."""
+    return json.dumps(
+        {"callees": [{"name": n, "addr": a, "kind": k} for n, a, k in callees], "targets": targets}
+    )
+
+
+def _facts_meta(
+    conn: sqlite3.Connection,
+    *,
+    state: str | None = "read",
+    hash_: str = "feedface",
+    stub: str = "not_applicable",
+) -> None:
+    """Both sides' call-site facts state on the diff (the fixture runs' build_hash is feedface)."""
+    conn.execute(
+        "UPDATE diff_meta SET callsite_facts_a = ?, callsite_facts_b = ?, "
+        "callsite_facts_hash_a = ?, callsite_facts_hash_b = ?, stub_state_a = ?, stub_state_b = ? "
+        "WHERE diff_id = ?",
+        (state, state, hash_, hash_, stub, stub, DIFF_ID),
+    )
+
+
+def _aplus(
+    conn: sqlite3.Connection,
+    direction: str,
+    facts: str | None,
+    *,
+    sink: str = "system",
+    flow: str | None = None,
+    sink_class: str = "cmd",
+    offset: str = "0x000070",
+) -> str:
+    """One candidate on side ``direction`` in F1, matched to an instruction on the OTHER side that
+    holds no candidate, whose call-site facts are ``facts``. Returns the candidate's ref."""
+    off = int(offset, 16)
+    addr_a, addr_b = f"{0x1000 + off:08x}", f"{0x2000 + off:08x}"
+    suffix = "cmd_via_wrapper" if flow else sink_class
+    if direction == "a":
+        ref = _ref("runA", "00001000", suffix, offset)
+        _inst(conn, "runA", SHA_A, ref, sink_class, flow, sink=sink)
+        fa, fb = None, facts
+    else:
+        ref = _ref("runB", "00002000", suffix, offset)
+        _inst(conn, "runB", SHA_B, ref, sink_class, flow, sink=sink)
+        fa, fb = facts, None
+    conn.execute(
+        "INSERT INTO instruction_match (diff_id, func_addr_a, addr_a, addr_b, facts_a, facts_b) "
+        "VALUES (?, '00001000', ?, ?, ?, ?)",
+        (DIFF_ID, addr_a, addr_b, fa, fb),
+    )
+    return ref
+
+
+def _row_of(conn: sqlite3.Connection, ref: str, **kw: object) -> so.SinkOverlayRow:
+    rows = [r for r in _rows(conn, **kw) if ref in (r.a_ref, r.b_ref)]
+    assert len(rows) == 1, rows
+    return rows[0]
+
+
+_DIRECT_CASES = [
+    # (callees, state, hash, stub_state, reason, counterpart_call)
+    ([("system", None, "name_only")], "not_read", "feedface", "not_applicable",
+     "counterpart_call_facts_absent", "unknown"),
+    ([("system", None, "name_only")], "bridge_absent", "feedface", "not_applicable",
+     "counterpart_call_facts_absent", "unknown"),
+    ([("system", None, "name_only")], "read", "facade", "not_applicable",
+     "counterpart_facts_stale", "unknown"),
+    ([], "read", "feedface", "not_applicable", "counterpart_no_call_fact", "unknown"),
+    ([("system", None, "name_only"), ("popen", None, "name_only")], "read", "feedface",
+     "not_applicable", "counterpart_call_ambiguous", "unknown"),
+    ([("FUN_00000400", "00000400", "stub_unresolved")], "read", "feedface", "read",
+     "counterpart_callee_unresolved", "unknown"),
+    ([("FUN_00000400", "00000400", "fun_name_parsed")], "read", "feedface", "not_determined",
+     "counterpart_callee_unresolved", "unknown"),
+    ([("FUN_00000400", "00000400", "fun_name_parsed")], "read", "feedface", "read",
+     "counterpart_different_callee", "present_different_callee"),
+    ([("system", "00000400", "stub_resolved")], "read", "feedface", "read",
+     "counterpart_same_callee", "present_same_callee"),
+    ([("__system_chk", None, "name_only")], "read", "feedface", "not_applicable",
+     "counterpart_different_callee", "present_different_callee"),
+]  # fmt: skip
+
+
+@pytest.mark.parametrize("direction", ["a", "b"])
+@pytest.mark.parametrize(("callees", "state", "hash_", "stub", "reason", "call"), _DIRECT_CASES)
+def test_facts_reading_for_a_direct_sink(
+    atlas: sqlite3.Connection,
+    direction: str,
+    callees: list[tuple[str, str | None, str]],
+    state: str,
+    hash_: str,
+    stub: str,
+    reason: str,
+    call: str,
+) -> None:
+    """The seven outcomes, both directions, for a direct sink compared by exact name — an
+    unresolved stub, or a ``FUN_<hex>`` name where the stub table was never determined, is unknown
+    rather than "different".
+
+    MUTATION (verified RED): drop the stub_unresolved / not_determined guards in
+    ``_fact_same_callee`` -> those two cases read counterpart_different_callee."""
+    _facts_meta(atlas, state=state, hash_=hash_, stub=stub)
+    ref = _aplus(atlas, direction, _fj(*callees))
+    r = _row_of(atlas, ref)
+    assert (r.presence, r.presence_reason, r.counterpart_call) == (
+        "presence_undetermined",
+        reason,
+        call,
+    )
+    assert r.match_basis == "instruction"
+    assert (r.b_ref if direction == "a" else r.a_ref) is None  # the other side names no candidate
+    if reason in ("counterpart_same_callee", "counterpart_different_callee"):
+        assert r.counterpart_callee is not None
+        assert r.counterpart_callee["callees"][0]["name"] == callees[0][0]
+        assert ("same_callee_candidate_elsewhere" in r.counterpart_callee) == (
+            reason == "counterpart_different_callee"
+        )
+    else:
+        assert r.counterpart_callee is None
+
+
+def test_facts_column_missing_for_a_pair_is_absent(atlas: sqlite3.Connection) -> None:
+    _facts_meta(atlas)
+    ref = _aplus(atlas, "a", None)
+    assert _row_of(atlas, ref).presence_reason == "counterpart_call_facts_absent"
+
+
+def test_fortified_variant_is_a_different_callee(atlas: sqlite3.Connection) -> None:
+    _facts_meta(atlas)
+    ref = _aplus(
+        atlas, "a", _fj(("__strcpy_chk", None, "name_only")), sink="strcpy", sink_class="copy"
+    )
+    assert _row_of(atlas, ref).presence_reason == "counterpart_different_callee"
+
+
+@pytest.mark.parametrize(
+    ("facts", "align_w", "cand_addr", "reason"),
+    [
+        (_fj(("do_cmd", W_B, "table_entry")), True, W_A, "counterpart_same_callee"),
+        (_fj(("other", "00080000", "table_entry")), True, W_A, "counterpart_different_callee"),
+        (_fj(("do_cmd", W_B, "table_entry")), False, W_A, "counterpart_callee_unresolved"),
+        # the BinExport target disagrees with the derived address: no address, unknown
+        (_fj(("do_cmd", W_B, "table_entry"), targets=["00090000"]), True, W_A,
+         "counterpart_callee_unresolved"),
+        # no derived address, but one BinExport target: compared by the target
+        (_fj(("do_cmd", None, "name_ambiguous"), targets=[W_B]), True, W_A,
+         "counterpart_same_callee"),
+        # the candidate's own W has no address: never compared by name
+        (_fj(("do_cmd", W_B, "table_entry")), True, None, "counterpart_callee_unresolved"),
+    ],
+)  # fmt: skip
+def test_facts_reading_for_a_wrapper_call(
+    atlas: sqlite3.Connection,
+    facts: str,
+    align_w: bool,
+    cand_addr: str | None,
+    reason: str,
+) -> None:
+    """A wrapper call compares ``W`` by entry address through the function alignment: the address
+    the facts derived, or the one BinExport target when nothing was derived — and a disagreement
+    between the two is unknown, never settled for either.
+
+    MUTATION (verified RED): settle an X/Z conflict in favour of the BinExport target in
+    ``_merge_addr`` -> the conflicting case reads counterpart_different_callee."""
+    _facts_meta(atlas)
+    if align_w:
+        _falign(atlas, W_A, W_B, 0.95, "aligned")
+    ref = _aplus(atlas, "a", facts, flow=_wflow("do_cmd", cand_addr))
+    r = _row_of(atlas, ref)
+    assert r.key_granularity == "wrapper_callsite"
+    assert r.presence == "presence_undetermined" and r.presence_reason == reason
+
+
+def test_merge_addr_table() -> None:
+    assert so._merge_addr("00001000", None) == ("00001000", "x")
+    assert so._merge_addr("00001000", []) == ("00001000", "x")
+    assert so._merge_addr(None, None) == (None, None)
+    assert so._merge_addr(None, ["00002000"]) == ("00002000", "binexport")
+    assert so._merge_addr("00002000", ["00002000"]) == ("00002000", "both")
+    assert so._merge_addr("00001000", ["00002000"]) == (None, "conflict")
+    assert so._merge_addr("00001000", ["00002000", "00003000"]) == (None, "binexport_ambiguous")
+
+
+def test_a_direct_sink_is_compared_by_name_whatever_binexport_says(
+    atlas: sqlite3.Connection,
+) -> None:
+    _facts_meta(atlas)
+    ref = _aplus(atlas, "a", _fj(("system", "00000400", "table_entry"), targets=["00099999"]))
+    assert _row_of(atlas, ref).presence_reason == "counterpart_same_callee"
+
+
+def test_stale_facts_never_touch_a_persisted_row(atlas: sqlite3.Connection) -> None:
+    """Facts read from an older extraction are stale for the rows they would decide; a row decided
+    by candidates is unaffected.
+
+    MUTATION (verified RED): ignore the stamp in ``_facts_stale`` (always fresh) -> the stale row
+    reads counterpart_same_callee."""
+    _facts_meta(atlas, hash_="facade")
+    ref = _aplus(atlas, "a", _fj(("system", None, "name_only")))
+    assert _row_of(atlas, ref).presence_reason == "counterpart_facts_stale"
+    persisted = _by(_rows(atlas), a_off="@0x000010")
+    assert persisted is not None and persisted.presence == "persisted"
+    _facts_meta(atlas)
+    assert _row_of(atlas, ref).presence_reason == "counterpart_same_callee"
+
+
+def test_mixed_wrapper_addresses_are_unreadable(atlas: sqlite3.Connection) -> None:
+    """One side's W is pinned by address and the other's is not: the names cannot decide it.
+
+    MUTATION (verified RED): drop the mixed-address branch in ``_same_callee`` -> the equal names
+    read persisted."""
+    a_ref, _ = _wrapper_pair(atlas, a=("do_cmd", W_A), b=("do_cmd", None))
+    r = _by(_rows(atlas), a_off=a_ref)
+    assert r is not None and r.presence_reason == "callee_unreadable"
+
+
+def test_different_callee_says_whether_the_callee_is_still_elsewhere(
+    atlas: sqlite3.Connection,
+) -> None:
+    """``same_callee_candidate_elsewhere``: True when the paired function still holds a candidate
+    with this callee, False when it holds none, None when a candidate there is unreadable; the
+    summary splits the different-callee rows by it.
+
+    MUTATION (verified RED): always answer False in ``_same_callee_elsewhere``."""
+    _facts_meta(atlas)
+    # F1's B function holds a cmd candidate (sink "cmd") but no "system" one
+    still = _aplus(atlas, "a", _fj(("popen", None, "name_only")), sink="cmd", offset="0x000070")
+    gone = _aplus(atlas, "a", _fj(("popen", None, "name_only")), sink="system", offset="0x000074")
+    rows = _rows(atlas)
+    by = {r.a_ref: r for r in rows}
+    assert by[still].counterpart_callee["same_callee_candidate_elsewhere"] is True  # type: ignore[index]
+    assert by[gone].counterpart_callee["same_callee_candidate_elsewhere"] is False  # type: ignore[index]
+    # the original different-callee row carries it too
+    orig = _by(rows, a_off="@0x000020")
+    assert orig is not None and orig.presence_reason == "present_different_callee"
+    assert orig.counterpart_callee is not None
+    assert (
+        orig.counterpart_callee["same_callee_candidate_elsewhere"] is True
+    )  # B still has cmd@0x10
+    s = so.summarize_overlay(rows, by_binary=False)["by_presence_reason_side"]
+    assert (
+        s[
+            "presence_undetermined|counterpart_different_callee|a_only|same_callee_candidate_elsewhere=true"
+        ]
+        == 1
+    )
+    assert (
+        s[
+            "presence_undetermined|counterpart_different_callee|a_only|same_callee_candidate_elsewhere=false"
+        ]
+        == 1
+    )
+    atlas.execute("UPDATE instance SET sink_anchor = NULL WHERE evidence_ref LIKE 'runB%@format@%'")
+    unknown = {r.a_ref: r for r in _rows(atlas)}[gone]
+    assert unknown.counterpart_callee["same_callee_candidate_elsewhere"] is None  # type: ignore[index]
+
+
+def test_elsewhere_is_unknown_when_the_function_is_not_paired(atlas: sqlite3.Connection) -> None:
+    cand = so._Cand(
+        iid=1, ref="r", sink_class="cmd", sink="system", sha=None, binary_name=None,
+        func_entry="00009999", tier="callsite", callsite_addr="00009990",
+    )  # fmt: skip
+    side = so._index([])
+    d = so._Dir(
+        side="a", this=side, other=side, align={}, presence={}, imatch={}, imatch_present=True,
+        no_cand_reason="counterpart_not_candidate",
+    )  # fmt: skip
+    assert so._same_callee_elsewhere(cand, d) is None
+
+
+def test_row_side_and_side_filter(atlas: sqlite3.Connection) -> None:
+    """MUTATION (verified RED): read ``both`` as ``a_only`` in ``_row_side``."""
+    base = dict(
+        diff_id=None, binary=None, sink_class="cmd", key_granularity="callsite",
+        presence="presence_undetermined", presence_reason="x", match_basis=None,
+        counterpart_call=None, alignment_confidence=None,
+    )  # fmt: skip
+    rows = [
+        so.SinkOverlayRow(a_ref="a", b_ref=None, **base),  # type: ignore[arg-type]
+        so.SinkOverlayRow(a_ref=None, b_ref="b", **base),  # type: ignore[arg-type]
+        so.SinkOverlayRow(a_ref="a", b_ref="b", **base),  # type: ignore[arg-type]
+        so.SinkOverlayRow(a_ref=None, b_ref=None, **base),  # type: ignore[arg-type]
+    ]
+    assert [so._row_side(r) for r in rows] == ["a_only", "b_only", "both", "neither"]
+    for side in ("a_only", "b_only", "both"):
+        assert len(so.filter_by_side(rows, side)) == 1
+    with pytest.raises(ValueError):
+        so.filter_by_side(rows, "neither")
+    full = _rows(atlas)
+    s = so.summarize_overlay(full, by_binary=False)["by_presence_reason_side"]
+    for side in ("a_only", "b_only", "both"):
+        assert sum(n for k, n in s.items() if k.split("|")[2] == side) == len(
+            so.filter_by_side(full, side)
+        )
+
+
+def test_no_row_claims_not_a_call_and_facts_never_persist(atlas: sqlite3.Connection) -> None:
+    _golden_v4(atlas)
+    rows = so.compute_sink_overlay_runs(atlas, "runA", "runB").rows
+    assert not [r for r in rows if r.counterpart_call in ("not_a_call", "absent")]
+    assert not [
+        r
+        for r in rows
+        if (r.presence_reason or "").startswith("counterpart_")
+        and r.presence != "presence_undetermined"
+    ]
+    assert any((r.presence_reason or "").startswith("counterpart_") for r in rows)
+
+
+def test_facts_only_refine_the_not_candidate_rows(atlas: sqlite3.Connection) -> None:
+    """The two readings agree on every row except, at most, the reason / call / callee of the rows
+    the candidates-only reading leaves as counterpart_not_candidate / a_counterpart_not_candidate.
+
+    MUTATION (verified RED): make the facts reading also change a persisted row (judge every
+    tier-1 row through the facts) -> rows outside that bucket differ."""
+    _golden_v4(atlas)
+    facts = so.compute_sink_overlay_runs(atlas, "runA", "runB")
+    cands = so.compute_sink_overlay_runs(atlas, "runA", "runB", callee_backend="atlas_candidates")
+    assert facts.coverage == cands.coverage
+
+    def key(r: so.SinkOverlayRow) -> tuple:  # type: ignore[type-arg]
+        return (r.diff_id, r.a_ref, r.b_ref, r.key_granularity, r.sink_class, r.binary)
+
+    fmap, cmap = {key(r): r for r in facts.rows}, {key(r): r for r in cands.rows}
+    assert fmap.keys() == cmap.keys() and len(fmap) == len(facts.rows)
+    refined = 0
+    for k, c in cmap.items():
+        f = fmap[k]
+        same = ("presence", "match_basis", "alignment_confidence", "coclaimed_by",
+                "coclaimed_by_b", "a_n", "b_n")  # fmt: skip
+        assert all(getattr(f, n) == getattr(c, n) for n in same), k
+        if c.presence_reason in ("counterpart_not_candidate", "a_counterpart_not_candidate"):
+            refined += 1
+            continue
+        assert (f.presence_reason, f.counterpart_call, f.counterpart_callee) == (
+            c.presence_reason,
+            c.counterpart_call,
+            c.counterpart_callee,
+        ), k
+    assert refined > 0
+
+
+def test_persist_writes_the_counterpart_callee(atlas: sqlite3.Connection) -> None:
+    _facts_meta(atlas)
+    _aplus(atlas, "a", _fj(("popen", None, "name_only")))
+    so.persist_sink_overlay(atlas, DIFF_ID)
+    raw = [
+        r[0]
+        for r in atlas.execute(
+            "SELECT counterpart_callee FROM dimension_delta WHERE subject_kind = 'candidate' "
+            "AND undetermined_reason = 'counterpart_different_callee'"
+        )
+    ]
+    assert raw and all(v is not None for v in raw), raw
+    stored = [json.loads(v) for v in raw]
+    assert stored and stored[0]["callees"][0]["name"] == "popen"
+    versions = {r[0] for r in atlas.execute("SELECT overlay_version FROM dimension_delta")}
+    assert versions == {"4"}
+
+
+def _golden_v4(conn: sqlite3.Connection) -> None:
+    """The base fixture plus wrapper calls and call-site facts: a same W, another W, an unaligned
+    W, a wrapper and a direct sink judged by facts (same / different), and a B-side candidate whose
+    matched A instruction records no call."""
+    _facts_meta(conn)
+    conn.execute(
+        "UPDATE instruction_match SET facts_b = ? WHERE diff_id = ? AND addr_a = '00001030'",
+        (_fj(("cmd", None, "name_only")), DIFF_ID),
+    )
+    _falign(conn, W_A, W_B, 0.95, "aligned")
+    for off, wa, wb in (("0x000090", W_A, W_B), ("0x0000a0", W_A, "00080000"),
+                        ("0x0000b0", "00070000", W_B)):  # fmt: skip
+        _inst(conn, "runA", SHA_A, _ref("runA", "00001000", "cmd_via_wrapper", off), "cmd",
+              _wflow("do_cmd", wa), sink="system")  # fmt: skip
+        _inst(conn, "runB", SHA_B, _ref("runB", "00002000", "cmd_via_wrapper", off), "cmd",
+              _wflow("do_cmd", wb), sink="system")  # fmt: skip
+        o = int(off, 16)
+        _imatch(conn, f"{0x1000 + o:08x}", f"{0x2000 + o:08x}", "00001000")
+    _aplus(conn, "a", _fj(("do_cmd", W_B, "table_entry")), flow=_wflow("do_cmd", W_A),
+           offset="0x0000c0")  # fmt: skip
+    _aplus(conn, "a", _fj(("popen", None, "name_only")), offset="0x0000d0")
+    _aplus(conn, "b", _fj(), sink="cmd", offset="0x0000e0")

@@ -572,6 +572,26 @@ def call_offsets(
     return tuple(sorted(direct + stubs))
 
 
+# The same stub naming as ``_STUB_CALL_RE``, but for a bare name (a call token) rather than a call
+# in running text: the WHOLE name must be ``FUN_<hex>``, so ``thunk_FUN_…`` is not a stub call.
+_STUB_NAME_RE = re.compile(r"FUN_([0-9a-fA-F]+)")
+
+
+def stub_resolved_name(token: str, stub_names: Mapping[int, str] | None) -> str | None:
+    """The import a call token named after its stub (``FUN_<addr>``) resolves to, or None.
+
+    The token-level twin of the stub mapping ``call_offsets`` applies to a ``FUN_<hex>(`` call in
+    the text, with the same table, so a token and the call ``call_offsets`` counts resolve to the
+    same name. None when the token is not exactly ``FUN_<hex>`` or its address is not in the table.
+    """
+    if not stub_names:
+        return None
+    m = _STUB_NAME_RE.fullmatch(token)
+    if m is None:
+        return None
+    return stub_names.get(int(m.group(1), 16))
+
+
 @dataclass(frozen=True)
 class SinkCallsite:
     """One textual call to a sink callee inside a function's pseudocode.

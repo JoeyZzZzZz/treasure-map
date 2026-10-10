@@ -89,6 +89,7 @@ from treasure_map.lib.query.sink_overlay import (
     compute_sink_overlay_runs as _compute_sink_overlay_runs,
 )
 from treasure_map.lib.query.sink_overlay import filter_by_reason as _overlay_filter_by_reason
+from treasure_map.lib.query.sink_overlay import filter_by_side as _overlay_filter_by_side
 from treasure_map.lib.query.sink_overlay import page_overlay as _page_overlay
 from treasure_map.lib.query.sink_overlay import summarize_overlay as _summarize_overlay
 from treasure_map.lib.query.triage import anchor_facts
@@ -1667,6 +1668,7 @@ def make_tools(
         limit: int = 200,
         offset: int = 0,
         reason: str | None = None,
+        side: str | None = None,
     ) -> dict[str, Any]:
         """Candidate-level SINK OVERLAY (Layer 0.5): line up the A/B sink candidates and report an
         honest ``presence`` per candidate — two states plus undetermined: ``persisted`` /
@@ -1686,6 +1688,8 @@ def make_tools(
         Response size — ``detail``:
           * ``"summary"`` (default): NO rows. ``summary`` counts the filtered rows — ``total_rows``,
             ``by_presence``, ``by_presence_reason`` (keys ``"<presence>|<reason or ->"``),
+            ``by_presence_reason_side`` (keys ``"<presence>|<reason or ->|<side>"``, with
+            ``counterpart_different_callee`` further split by ``same_callee_candidate_elsewhere``),
             ``by_key_granularity``, ``by_sink_class``, and in run-pair mode ``by_binary``. Start
             here, then narrow with the filters.
           * ``"rows"``: one page of rows — ``limit`` (1-2000, default 200) rows from ``offset``
@@ -1694,7 +1698,9 @@ def make_tools(
             presence or importance), so walking ``offset = next_offset`` until null returns every
             row exactly once.
         Row filters (both modes): ``binary`` / ``sink_class`` / ``presence`` /
-        ``min_alignment_confidence``, and ``reason`` (exact ``presence_reason`` match).
+        ``min_alignment_confidence``, ``reason`` (exact ``presence_reason`` match), and ``side`` —
+        the row's direction: ``a_only`` (it names an A candidate and no B one), ``b_only`` (a B
+        candidate and no A one), ``both`` (one of each); anything else is an error.
 
         ★ No row ever says a call is gone or new. A whole function with no counterpart is
         ``function_unmatched``, not a deletion or an addition; a candidate that merely looks gone
@@ -1703,10 +1709,20 @@ def make_tools(
         only ``persisted`` / ``presence_undetermined`` (anything else is an error; filter whole
         unmatched functions with ``reason="function_unmatched"``). ``presence_undetermined`` is NOT
         'unchanged': read ``presence_reason`` (function_unmatched / instruction_unmatched /
-        crossside_match_degraded / counterpart_not_candidate / a_counterpart_not_candidate /
-        present_different_callee / alignment_low_confidence / ... — an enum that may grow; do not
-        branch on it). ``persisted``
-        at the callsite level requires the matched call on the other side to call the SAME sink.
+        crossside_match_degraded / present_different_callee / alignment_low_confidence / ... — an
+        enum that may grow; do not branch on it). ``persisted`` at the callsite level requires the
+        matched call on the other side to call the SAME sink.
+
+        When BinDiff matched a candidate's call to an other-side instruction that is NOT a
+        candidate, what that instruction calls is read from the call-site facts recorded with the
+        diff: ``counterpart_call_facts_absent`` / ``counterpart_facts_stale`` /
+        ``counterpart_no_call_fact`` (no call recorded there — NOT proof it is not a call) /
+        ``counterpart_call_ambiguous`` / ``counterpart_callee_unresolved`` /
+        ``counterpart_same_callee`` / ``counterpart_different_callee``, all undetermined.
+        ``present_different_callee`` / ``counterpart_different_callee`` mean the MATCHED instruction
+        calls something else, not that the callee was replaced: ``counterpart_callee`` names it, and
+        its ``same_callee_candidate_elsewhere`` says whether the paired function holds another
+        candidate with the same callee.
         Each row carries the A/B evidence_ref (the unmatched side is null) for traceback.
 
         ``coverage`` (both modes) checks that every candidate of both sides is represented by some
@@ -1721,6 +1737,7 @@ def make_tools(
             "sink_class": sink_class,
             "presence": presence,
             "reason": reason,
+            "side": side,
             "min_alignment_confidence": min_alignment_confidence,
         }
         by_runs = run_a is not None or run_b is not None
@@ -1740,6 +1757,8 @@ def make_tools(
                     "reason='function_unmatched'"
                 )
             }
+        if side is not None and side not in ("a_only", "b_only", "both"):
+            return {"error": f"side must be 'a_only', 'b_only' or 'both', got {side!r}"}
         if detail not in ("summary", "rows"):
             return {"error": f"detail must be 'summary' or 'rows', got {detail!r}"}
         if detail == "rows":
@@ -1779,7 +1798,7 @@ def make_tools(
                     min_alignment_confidence=min_alignment_confidence,
                 )
                 scope = {"diff_id": diff_id}
-            rows = _overlay_filter_by_reason(result.rows, reason)
+            rows = _overlay_filter_by_side(_overlay_filter_by_reason(result.rows, reason), side)
             out: dict[str, Any] = {
                 **scope,
                 "filters": filters,

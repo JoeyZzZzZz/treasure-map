@@ -40,6 +40,8 @@ from typing import TYPE_CHECKING, Any
 from treasure_map.lib.atlas.models import DiffMetaRow
 from treasure_map.lib.atlas.writer import add_diff_meta, delete_diff
 from treasure_map.lib.binary_id import BinaryRow, resolve_binary_in_db
+from treasure_map.lib.diff.binexport2 import BinExportDecodeError, decode_call_targets
+from treasure_map.lib.diff.callsite_facts import derive_and_store_callsite_facts
 from treasure_map.lib.diff.layer0 import (
     _confirmed_same_version,
     _next_attempts,
@@ -659,6 +661,20 @@ class DiffArtifacts:
     binexport_a: Path
     binexport_b: Path
     bindiff_path: Path
+    # Each side's BinExport call targets (instruction address -> targets, normalized), decoded in
+    # the compute phase while the files are at hand. None when that side could not be decoded — an
+    # additive fact, so a decode failure never fails the diff; it is reported in decode_warnings.
+    targets_a: dict[str, list[str]] | None = None
+    targets_b: dict[str, list[str]] | None = None
+    decode_warnings: tuple[str, ...] = ()
+
+
+def _decode_targets(path: Path, side: str) -> tuple[dict[str, list[str]] | None, str | None]:
+    """One side's BinExport call targets, or (None, the warning) when the file cannot be decoded."""
+    try:
+        return decode_call_targets(path), None
+    except BinExportDecodeError as exc:
+        return None, f"call targets not decoded for side {side} ({path.name}): {exc}"
 
 
 def compute_diff(so_a: Path, so_b: Path, td: Path, config: Config) -> DiffArtifacts:
@@ -672,7 +688,16 @@ def compute_diff(so_a: Path, so_b: Path, td: Path, config: Config) -> DiffArtifa
     export_a = _run_binexport(so_a, config, td, "a", timeout_s)
     export_b = _run_binexport(so_b, config, td, "b", timeout_s)
     bindiff_path = _run_bindiff(export_a, export_b, td, timeout_s)
-    return DiffArtifacts(binexport_a=export_a, binexport_b=export_b, bindiff_path=bindiff_path)
+    targets_a, warn_a = _decode_targets(export_a, "a")
+    targets_b, warn_b = _decode_targets(export_b, "b")
+    return DiffArtifacts(
+        binexport_a=export_a,
+        binexport_b=export_b,
+        bindiff_path=bindiff_path,
+        targets_a=targets_a,
+        targets_b=targets_b,
+        decode_warnings=tuple(w for w in (warn_a, warn_b) if w is not None),
+    )
 
 
 def _persist_success(
@@ -685,13 +710,18 @@ def _persist_success(
     bin_b: BinaryRow,
     binary_short: str,
     bindiff_path: Path,
+    targets_a: dict[str, list[str]] | None,
+    targets_b: dict[str, list[str]] | None,
     version_skew: bool,
     warnings: tuple[str, ...],
 ) -> DiffSummary:
     """The serial persist phase for a SUCCESSFUL compute: parse the .BinDiff into the atlas (layer0)
-    and project the deltas (layer2), as ONE atomic write. A layer-2 failure is recorded as an atomic
-    blind-spot row (rollback -> no dirty ok=1 residue) and re-raised — the exact retry-status logic,
-    unchanged, just moved out of the fused pipeline so it runs on the main thread after compute."""
+    and project the deltas (layer2), as ONE atomic write. The call-site facts for the chosen
+    instruction pairs are written in the same transaction (``targets_a``/``targets_b``: the
+    BinExport call targets decoded in the compute phase, None when not decoded). A layer-2 failure
+    is recorded as an atomic blind-spot row (rollback -> no dirty ok=1 residue) and re-raised — the
+    exact retry-status logic, unchanged, just moved out of the fused pipeline so it runs on the main
+    thread after compute."""
     try:
         l0 = run_layer0_parse(
             atlas,
@@ -715,6 +745,19 @@ def _persist_success(
             sha_a=bin_a.sha256,
             run_b_id=run_b_id,
             sha_b=bin_b.sha256,
+            commit=False,
+        )
+        # What each side's matched instruction calls, for the pairs just chosen: derived from each
+        # run's analysis.db (read-only) and merged with the decoded BinExport targets.
+        derive_and_store_callsite_facts(
+            atlas,
+            diff_id=diff_id,
+            analysis_db_a=_resolve_run(atlas, run_a_id, "a").analysis_db_path,
+            analysis_db_b=_resolve_run(atlas, run_b_id, "b").analysis_db_path,
+            bin_a=bin_a,
+            bin_b=bin_b,
+            targets_a=targets_a,
+            targets_b=targets_b,
             commit=False,
         )
         run_layer2_delta(atlas, diff_id=diff_id, run_a_id=run_a_id, run_b_id=run_b_id, commit=True)
@@ -791,8 +834,10 @@ def run_version_diff(
             bin_b=pf.bin_b,
             binary_short=pf.binary_a,
             bindiff_path=artifacts.bindiff_path,
+            targets_a=artifacts.targets_a,
+            targets_b=artifacts.targets_b,
             version_skew=pf.version_skew,
-            warnings=pf.warnings,
+            warnings=pf.warnings + artifacts.decode_warnings,
         )
     finally:
         shutil.rmtree(td, ignore_errors=True)
@@ -1007,8 +1052,10 @@ def _persist_outcome(
             bin_b=rd.bin_b,
             binary_short=rd.binary_short,
             bindiff_path=artifacts.bindiff_path,
+            targets_a=artifacts.targets_a,
+            targets_b=artifacts.targets_b,
             version_skew=rd.version_skew,
-            warnings=rd.warnings,
+            warnings=rd.warnings + artifacts.decode_warnings,
         )
     except TreasureMapError as exc:
         # _persist_success already recorded the failed row atomically; belt-and-braces rollback so

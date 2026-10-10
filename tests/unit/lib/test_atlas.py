@@ -846,6 +846,15 @@ def test_open_atlas_drops_a_stale_exec_edge_resolved_via(tmp_path: Path) -> None
         ("diff_meta", "binary_a"),
         ("nvram_key_flow", "via_wrapper"),
         ("dimension_delta", "overlay_version"),
+        ("dimension_delta", "counterpart_callee"),
+        ("instruction_match", "facts_a"),
+        ("instruction_match", "facts_b"),
+        ("diff_meta", "callsite_facts_a"),
+        ("diff_meta", "callsite_facts_b"),
+        ("diff_meta", "callsite_facts_hash_a"),
+        ("diff_meta", "callsite_facts_hash_b"),
+        ("diff_meta", "stub_state_a"),
+        ("diff_meta", "stub_state_b"),
     ],
 )
 def test_open_atlas_reopens_old_shape_missing_migrated_column(
@@ -1144,4 +1153,29 @@ def test_fresh_atlas_takes_an_edge_delta_row(tmp_path: Path) -> None:
         row = conn.execute("SELECT subject_kind, overlay_version FROM dimension_delta").fetchone()
         assert tuple(row) == ("edge", None)
     finally:
+        conn.close()
+
+
+def test_fresh_atlas_has_the_callsite_fact_columns_and_reopens_unchanged(tmp_path: Path) -> None:
+    """MUTATION (verified RED): leave facts_a out of the instruction_match CREATE."""
+    db = tmp_path / "fresh.db"
+    conn = open_atlas(db)
+    shape = {
+        table: _table_cols(conn, table)
+        for table in ("instruction_match", "diff_meta", "dimension_delta")
+    }
+    conn.close()
+    assert {"facts_a", "facts_b"} <= shape["instruction_match"]
+    assert {
+        "callsite_facts_a",
+        "callsite_facts_b",
+        "callsite_facts_hash_a",
+        "callsite_facts_hash_b",
+        "stub_state_a",
+        "stub_state_b",
+    } <= shape["diff_meta"]
+    assert "counterpart_callee" in shape["dimension_delta"]
+    for _ in range(2):  # opening again changes nothing
+        conn = open_atlas(db)
+        assert {t: _table_cols(conn, t) for t in shape} == shape
         conn.close()
