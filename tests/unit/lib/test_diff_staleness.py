@@ -20,6 +20,7 @@ from typing import Any
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import DiffMetaRow, DimensionDeltaRow
 from treasure_map.lib.atlas.writer import add_diff_meta, add_dimension_deltas, begin_run
+from treasure_map.lib.diff import currency
 from treasure_map.lib.query.diff_align import (
     STALE_CHANGED,
     STALE_GONE,
@@ -71,6 +72,9 @@ def _atlas(
         begin_run(conn, "run_a", analysis_db_path=str(analysis))
         begin_run(conn, "run_b", analysis_db_path=str(analysis))
     did = diff_id or f"run_a::run_b::{binary}"
+    # the input stamps a diff of this content records against the runs as they are now
+    st_a = currency.side_stamp(conn, "run_a", str(analysis), stored_sha, binary)
+    st_b = currency.side_stamp(conn, "run_b", str(analysis), stored_sha, binary)
     add_diff_meta(
         conn,
         DiffMetaRow(
@@ -84,6 +88,17 @@ def _atlas(
             diff_ok=1,
             diff_status="ok",
             matched_pairs=10,
+            ghidra_version_a=st_a.ghidra_version,
+            ghidra_version_b=st_b.ghidra_version,
+            extraction_pass_a=st_a.extraction_pass,
+            extraction_pass_b=st_b.extraction_pass,
+            hunt_inputs_hash_a=st_a.hunt_inputs_hash,
+            hunt_inputs_hash_b=st_b.hunt_inputs_hash,
+            scanned_at_a=st_a.scanned_at,
+            scanned_at_b=st_b.scanned_at,
+            hunt_instances_a=st_a.hunt_instances,
+            hunt_instances_b=st_b.hunt_instances,
+            diff_code_version=currency.DIFF_CODE_VERSION,
         ),
     )
     if with_deltas:
@@ -310,7 +325,8 @@ def test_a_failed_per_binary_diff_stays_a_visible_blind_spot(tmp_path: Path) -> 
 
 def test_the_generation_of_each_run_is_read_once(tmp_path: Path) -> None:
     # A listing spans many diffs over few runs; resolving each run's analysis.db per row would
-    # reopen the same database for every binary.
+    # reopen the same database for every binary. Each run's database is read by two lookups (the
+    # content generation, and the binaries' extraction stamps), each once per run.
     atlas_path = tmp_path / "atlas.db"
     shas = [f"{i}{'d' * 63}" for i in range(5)]
     analysis = _analysis(tmp_path / "analysis.db", [(f"lib{i}.so", shas[i]) for i in range(5)])
@@ -319,6 +335,7 @@ def test_the_generation_of_each_run_is_read_once(tmp_path: Path) -> None:
         begin_run(conn, "run_a", analysis_db_path=str(analysis))
         begin_run(conn, "run_b", analysis_db_path=str(analysis))
         for i in range(5):
+            st = currency.side_stamp(conn, "run_a", str(analysis), shas[i], f"lib{i}.so")
             add_diff_meta(
                 conn,
                 DiffMetaRow(
@@ -330,6 +347,17 @@ def test_the_generation_of_each_run_is_read_once(tmp_path: Path) -> None:
                     sha256_a=shas[i],
                     sha256_b=shas[i],
                     diff_ok=1,
+                    ghidra_version_a=st.ghidra_version,
+                    ghidra_version_b=st.ghidra_version,
+                    extraction_pass_a=st.extraction_pass,
+                    extraction_pass_b=st.extraction_pass,
+                    hunt_inputs_hash_a=st.hunt_inputs_hash,
+                    hunt_inputs_hash_b=st.hunt_inputs_hash,
+                    scanned_at_a=st.scanned_at,
+                    scanned_at_b=st.scanned_at,
+                    hunt_instances_a=st.hunt_instances,
+                    hunt_instances_b=st.hunt_instances,
+                    diff_code_version=currency.DIFF_CODE_VERSION,
                 ),
             )
         opened: list[str] = []
@@ -346,7 +374,7 @@ def test_the_generation_of_each_run_is_read_once(tmp_path: Path) -> None:
             sqlite3.connect = real_connect  # type: ignore[assignment]
         assert served["count"] == 5
         assert all(d["source_stale"] is False for d in served["diffs"])
-        # two runs, two opens — not one per row
-        assert len(opened) == 2, opened
+        # two runs x two lookups — not one per row (that would be 5 x 2 x 2)
+        assert len(opened) == 4, opened
     finally:
         conn.close()

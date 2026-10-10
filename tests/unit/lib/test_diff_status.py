@@ -24,7 +24,7 @@ from treasure_map.lib.atlas.writer import (
     add_diff_meta,
     begin_run,
 )
-from treasure_map.lib.diff import driver
+from treasure_map.lib.diff import currency, driver
 from treasure_map.lib.diff.driver import _DIFF_RETRY_LIMIT, DiffToolchainError
 from treasure_map.lib.diff.layer0 import make_diff_id
 from treasure_map.lib.query import diff_align
@@ -77,8 +77,8 @@ def _seed_pair(
         so = tmp_path / f"a_{name}"
         so.write_bytes(b"\x7fELF")
         ca.execute(
-            "INSERT INTO binaries (id, name, path, sha256, last_seen_at) "
-            "VALUES (?, ?, ?, ?, '2026-01-01T00:00:00')",
+            "INSERT INTO binaries (id, name, path, sha256, pass_version, ghidra_version, "
+            "last_seen_at) VALUES (?, ?, ?, ?, 'pv1', '11.4.3', '2026-01-01T00:00:00')",
             (i, name, str(so), sha),
         )
         if with_funcs:
@@ -92,8 +92,8 @@ def _seed_pair(
         so = tmp_path / f"b_{name}"
         so.write_bytes(b"\x7fELF")
         cb.execute(
-            "INSERT INTO binaries (id, name, path, sha256, last_seen_at) "
-            "VALUES (?, ?, ?, ?, '2026-01-01T00:00:00')",
+            "INSERT INTO binaries (id, name, path, sha256, pass_version, ghidra_version, "
+            "last_seen_at) VALUES (?, ?, ?, ?, 'pv1', '11.4.3', '2026-01-01T00:00:00')",
             (i, name, str(so), sha),
         )
         if with_funcs:
@@ -125,8 +125,15 @@ def _seed_committed_status(
     sha_b: str | None,
     reason: str | None = None,
 ) -> str:
-    """Commit one diff_meta row as if a prior full diff had produced it (the plan's input state)."""
+    """Commit one diff_meta row as if a prior full diff had produced it (the plan's input state):
+    with the input stamps that diff would have recorded against the runs as they are now."""
     did = make_diff_id("run_a", "run_b", binary)
+    db = {
+        r: con.execute("SELECT analysis_db_path FROM run WHERE run_id = ?", (r,)).fetchone()[0]
+        for r in ("run_a", "run_b")
+    }
+    st_a = currency.side_stamp(con, "run_a", db["run_a"], sha_a, binary)
+    st_b = currency.side_stamp(con, "run_b", db["run_b"], sha_b, binary)
     add_diff_meta(
         con,
         DiffMetaRow(
@@ -141,6 +148,13 @@ def _seed_committed_status(
             diff_attempts=attempts,
             sha256_a=sha_a,
             sha256_b=sha_b,
+            ghidra_version_a=st_a.ghidra_version,
+            ghidra_version_b=st_b.ghidra_version,
+            extraction_pass_a=st_a.extraction_pass,
+            extraction_pass_b=st_b.extraction_pass,
+            hunt_inputs_hash_a=st_a.hunt_inputs_hash,
+            hunt_inputs_hash_b=st_b.hunt_inputs_hash,
+            diff_code_version=currency.DIFF_CODE_VERSION,
         ),
         commit=True,
     )

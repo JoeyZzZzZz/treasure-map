@@ -38,8 +38,8 @@ def _mk_analysis(path: Path, binary: str, so_path: str | None) -> Path:
     => the bare name, i.e. an unlocatable relative path)."""
     con = open_db(path)
     con.execute(
-        "INSERT INTO binaries (id, name, path, sha256, last_seen_at) "
-        "VALUES (1, ?, ?, ?, '2026-01-01T00:00:00')",
+        "INSERT INTO binaries (id, name, path, sha256, pass_version, ghidra_version, last_seen_at) "
+        "VALUES (1, ?, ?, ?, 'pv1', '11.4.3', '2026-01-01T00:00:00')",
         (binary, so_path if so_path is not None else binary, binary + "_sha"),
     )
     con.commit()

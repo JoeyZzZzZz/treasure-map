@@ -37,11 +37,26 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from treasure_map.lib.analyze.ghidra_runner import current_pass_version as _current_pass_version
 from treasure_map.lib.atlas.models import DiffMetaRow
 from treasure_map.lib.atlas.writer import add_diff_meta, delete_diff
 from treasure_map.lib.binary_id import BinaryRow, resolve_binary_in_db
 from treasure_map.lib.diff.binexport2 import BinExportDecodeError, decode_call_targets
-from treasure_map.lib.diff.callsite_facts import derive_and_store_callsite_facts
+from treasure_map.lib.diff.callsite_facts import (
+    _build_hash_with_rows,
+    derive_and_store_callsite_facts,
+)
+from treasure_map.lib.diff.currency import (
+    COMPARED_COLUMNS,
+    DIFF_CODE_VERSION,
+    DiffStamps,
+    SideStamp,
+    extraction_stamp,
+    hunt_inputs_digest,
+    read_extraction,
+    side_stamp,
+    stamps_equal,
+)
 from treasure_map.lib.diff.layer0 import (
     _confirmed_same_version,
     _next_attempts,
@@ -54,6 +69,9 @@ from treasure_map.lib.diff.layer0 import (
 from treasure_map.lib.diff.layer2 import run_layer2_delta
 from treasure_map.lib.errors import ConfigError, GhidraNotFoundError, TreasureMapError
 from treasure_map.lib.machine import clamp_parallelism_to_memory
+from treasure_map.lib.query.runs import run_staleness
+from treasure_map.lib.query.sink_overlay import persist_sink_overlay
+from treasure_map.version import installed_commit as _installed_commit
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +143,10 @@ class DiffSummary:
     delta_layer_unchanged: int
     delta_undetermined: int
     warnings: tuple[str, ...]
+    # The diff's stored candidate baseline across this re-diff: None = it had none to keep;
+    # 'restored' = stored again for the new rows; 'not_restored' = refused (see warnings), so the
+    # diff now has none.
+    baseline: str | None = None
 
 
 # How many times a full diff attempts a failing binary AT THE SAME CONTENT before treating it as a
@@ -150,6 +172,17 @@ class AmbiguousBinarySelectorError(ConfigError):
     must be able to tell it apart without parsing prose."""
 
 
+# The marker recorded when a side's binary has no recorded extraction (binaries.pass_version is
+# NULL: no extraction of it ever succeeded), so a diff of it could not say which extraction its
+# functions came from. Fixed by re-scanning that run, not by retrying the toolchain.
+EXTRACTION_UNSTAMPED_REASON = "extraction_unstamped"
+
+
+class ExtractionUnstampedError(ConfigError):
+    """A side's binary has no recorded extraction pass. Its own type for the same reason as
+    AmbiguousBinarySelectorError: a full diff records it as that binary's blind spot and goes on."""
+
+
 def _classify_failure_reason(exc: BaseException) -> str:
     """Bucket a toolchain failure so a consumer can tell a likely-transient failure from a hard
     boundary. Matches the DETERMINISTIC message text the toolchain steps raise (``_run_binexport`` /
@@ -157,6 +190,8 @@ def _classify_failure_reason(exc: BaseException) -> str:
     the generic step failure so a timed-out export is not miscounted as a crash."""
     if isinstance(exc, AmbiguousBinarySelectorError):
         return AMBIGUOUS_SELECTOR_REASON
+    if isinstance(exc, ExtractionUnstampedError):
+        return EXTRACTION_UNSTAMPED_REASON
     msg = str(exc).lower()
     if "timed out" in msg or "timeout" in msg:
         return "timeout"
@@ -195,10 +230,19 @@ def _record_diff_failure(
     So every binary's diff is atomic: a failure never leaves a half-written or ok=1 row, and a
     second failure of the same binary is a clean replace, never a crash (the retry path must not
     crash on its own PK). The failed row carries NO coverage counts (there is no usable output),
-    only the honest status + why + attempt count + the content it ran on."""
+    only the honest status + why + attempt count + the content it ran on, and the input stamps
+    (lib/diff/currency) the attempt was made against, so the next attempt at the same inputs
+    continues the count instead of restarting it.
+
+    ★ The replaced row may be a GOOD diff (a re-diff of unchanged content that was triggered by its
+    stamps, or a single-binary re-run). If it had a stored candidate baseline, that baseline goes
+    with it; the failed row then says so (``baseline_dropped=1``) rather than leaving the loss
+    silent, and keeps saying so through further failures at the same content."""
     atlas.rollback()  # ① drop layer-0's uncommitted diff_meta/alignment residue, if any
     sha_a, sha_b = _current_shas(atlas, run_a_id, run_b_id, binary_short)
-    attempts = _next_attempts(atlas, diff_id, sha_a, sha_b)  # read prior BEFORE delete
+    stamps = _failure_stamps(atlas, run_a_id, run_b_id, binary_short, sha_a, sha_b)
+    attempts = _next_attempts(atlas, diff_id, sha_a, sha_b, stamps)  # read prior BEFORE delete
+    dropped = _baseline_dropped_by_replacing(atlas, diff_id, sha_a, sha_b)  # ditto
     reason = _classify_failure_reason(exc)
     delete_diff(atlas, diff_id, commit=False)  # ② clear any prior failed row -> no PK conflict
     add_diff_meta(
@@ -215,11 +259,88 @@ def _record_diff_failure(
             diff_attempts=attempts,
             sha256_a=sha_a,
             sha256_b=sha_b,
+            ghidra_version_a=stamps.a.ghidra_version,
+            ghidra_version_b=stamps.b.ghidra_version,
+            extraction_pass_a=stamps.a.extraction_pass,
+            extraction_pass_b=stamps.b.extraction_pass,
+            hunt_inputs_hash_a=stamps.a.hunt_inputs_hash,
+            hunt_inputs_hash_b=stamps.b.hunt_inputs_hash,
+            scanned_at_a=stamps.a.scanned_at,
+            scanned_at_b=stamps.b.scanned_at,
+            hunt_instances_a=stamps.a.hunt_instances,
+            hunt_instances_b=stamps.b.hunt_instances,
+            diff_code_version=stamps.diff_code_version,
+            baseline_dropped=dropped,
         ),
         commit=False,  # ③ INSERT now cannot conflict (prior row deleted, residue rolled back)
     )
     atlas.commit()  # ④ the failed row is its own atomic transaction
     return attempts, reason
+
+
+def _has_candidate_baseline(atlas: sqlite3.Connection, diff_id: str) -> bool:
+    """Whether this diff has a stored candidate baseline (the sink overlay's persisted rows)."""
+    return (
+        atlas.execute(
+            "SELECT 1 FROM dimension_delta WHERE diff_id = ? AND subject_kind = 'candidate' "
+            "LIMIT 1",
+            (diff_id,),
+        ).fetchone()
+        is not None
+    )
+
+
+def _baseline_dropped_by_replacing(
+    atlas: sqlite3.Connection, diff_id: str, sha_a: str | None, sha_b: str | None
+) -> int:
+    """1 when replacing this diff's current row with a failed one loses a candidate baseline that
+    was still about this content: the row is a good diff with a stored baseline, or a failed row
+    already marked as having lost one. Only at the SAME content (both sha256 known and equal): a
+    baseline of content that has since changed described something that is gone anyway."""
+    row = atlas.execute(
+        "SELECT diff_ok, sha256_a, sha256_b, baseline_dropped FROM diff_meta WHERE diff_id = ?",
+        (diff_id,),
+    ).fetchone()
+    if row is None or sha_a is None or sha_b is None or (row[1], row[2]) != (sha_a, sha_b):
+        return 0
+    if row[3]:
+        return 1
+    return 1 if row[0] == 1 and _has_candidate_baseline(atlas, diff_id) else 0
+
+
+def _failure_stamps(
+    atlas: sqlite3.Connection,
+    run_a_id: str,
+    run_b_id: str,
+    binary: str,
+    sha_a: str | None,
+    sha_b: str | None,
+) -> DiffStamps:
+    """The input stamps of a failed attempt, best-effort. Runs inside an except handler, so it never
+    raises: a side whose stamps cannot be read gets None for them (which a later attempt that CAN
+    read them sees as different, so the count restarts rather than escalating on a guess)."""
+
+    def one(run_id: str, side: str, sha: str | None) -> SideStamp:
+        try:
+            db = _resolve_run(atlas, run_id, side).analysis_db_path
+            return side_stamp(atlas, run_id, db, sha, binary)
+        except (ConfigError, sqlite3.Error, OSError, ValueError):
+            return SideStamp(None, None, None, None, None)
+
+    return DiffStamps(one(run_a_id, "a", sha_a), one(run_b_id, "b", sha_b), DIFF_CODE_VERSION)
+
+
+def _current_stamps(
+    atlas: sqlite3.Connection, run_a_id: str, run_b_id: str, bin_a: BinaryRow, bin_b: BinaryRow
+) -> DiffStamps:
+    """The input stamps of a diff about to be written (called inside its write transaction)."""
+    db_a = _resolve_run(atlas, run_a_id, "a").analysis_db_path
+    db_b = _resolve_run(atlas, run_b_id, "b").analysis_db_path
+    return DiffStamps(
+        side_stamp(atlas, run_a_id, db_a, bin_a.sha256, bin_a.name),
+        side_stamp(atlas, run_b_id, db_b, bin_b.sha256, bin_b.name),
+        DIFF_CODE_VERSION,
+    )
 
 
 def _current_shas(
@@ -257,11 +378,15 @@ class FullDiffPlan:
     ``changed`` is the whole set present in both runs whose sha256 differs; it is PARTITIONED into
     four disjoint sub-sets by recorded status, so a full diff is incremental (skip already-ok) and
     self-healing (retry failed) instead of redoing everything:
-      * ``to_diff``     -- never diffed, or content changed since the last diff (attempts reset).
+      * ``to_diff``     -- never diffed, or content changed since the last diff, or what the diff
+                           was computed from changed (the extraction, the hunt output it reads, the
+                           diff code: lib/diff/currency) -- attempts reset.
       * ``retry``       -- failed before, under the retry cap -> diffed again (transient self-heal).
-      * ``already_ok``  -- diff_ok=1 and both sides' sha256 unchanged -> skipped (redoing = waste).
-      * ``hard_failed`` -- failed at the retry cap, same content -> skipped unless --force-retry
-                           (a suspected hard boundary; still VISIBLE, never a silent drop).
+      * ``already_ok``  -- diff_ok=1, both sides' sha256 and every input stamp unchanged -> skipped
+                           (redoing = waste).
+      * ``hard_failed`` -- failed at the retry cap, same content and inputs -> skipped unless
+                           --force-retry (a suspected hard boundary; still VISIBLE, never a silent
+                           drop).
 
     ``changed`` + ``unchanged`` + ``ambiguous_by_name`` partitions the names present in BOTH runs.
     The third is where a short name turned out not to identify one file."""
@@ -274,10 +399,10 @@ class FullDiffPlan:
     # has no answer by name. Neither changed nor unchanged: a fourth outcome, listed rather than
     # folded into either, because folding it would state a comparison that was never made.
     ambiguous_by_name: tuple[str, ...] = ()
-    to_diff: tuple[str, ...] = ()  # never diffed, or content changed -> diff (attempts start fresh)
+    to_diff: tuple[str, ...] = ()  # never diffed / content or inputs changed -> diff (fresh count)
     retry: tuple[str, ...] = ()  # failed, attempts < cap -> retry (transient self-heal)
-    already_ok: tuple[str, ...] = ()  # diff_ok=1, sha unchanged -> skip (incremental)
-    hard_failed: tuple[str, ...] = ()  # failed at cap, sha unchanged -> skip unless --force-retry
+    already_ok: tuple[str, ...] = ()  # diff_ok=1, sha + inputs unchanged -> skip (incremental)
+    hard_failed: tuple[str, ...] = ()  # failed at cap, unchanged -> skip unless --force-retry
 
     def binaries_to_run(self, *, force_retry: bool = False) -> tuple[str, ...]:
         """The binaries this full diff will actually diff: the never-done/changed set plus the
@@ -315,6 +440,8 @@ class FullDiffSummary:
     outcomes: tuple[BinaryDiffOutcome, ...]
     cancelled: bool
     retry_limit: int = _DIFF_RETRY_LIMIT
+    # run-pair notes that did not stop the sweep (check_run_pair_currency's warnings)
+    warnings: tuple[str, ...] = ()
 
 
 # ── binary .so location (finding-1 fail-fast) ────────────────────────────────────────
@@ -426,7 +553,9 @@ def preflight(
     3. version consistency (``_confirmed_same_version`` via ``_version_skew``) — WARN + require
        ``--force`` (the sole soft check: the skew mark keeps the result honest, so an informed "I
        know the versions differ but want to look" stays allowed).
-    4. the target binary's ``.so`` is locatable + exists — hard block (finding 1).
+    4. the target binary's ``.so`` is locatable + exists — hard block (finding 1). Before that,
+       each side's binary must have a recorded extraction pass (``ExtractionUnstampedError``): a
+       binary no extraction ever succeeded on has nothing a diff could be tied to.
     5. the toolchain is available — hard block (finding 4).
     """
     run_a = _resolve_run(atlas, run_a_id, "a")  # check 1
@@ -460,6 +589,13 @@ def preflight(
     bin_b, miss_b = resolve_binary_in_db(run_b.analysis_db_path, binary_name)  # type: ignore[arg-type]
     if bin_b is None:
         raise _selector_error(run_b_id, binary_name, miss_b, run_b)
+    for run_id, run, row in ((run_a_id, run_a, bin_a), (run_b_id, run_b, bin_b)):
+        if row.sha256 and extraction_stamp(run.analysis_db_path, row.sha256)[0] is None:
+            raise ExtractionUnstampedError(
+                f"run '{run_id}': binary '{row.name}' ({row.path or 'no path recorded'}) has no "
+                "recorded extraction (no extraction of it has succeeded), so a diff of it could "
+                "not be tied to the code that produced its functions. Re-scan the run."
+            )
 
     so_a = _locate_binary_so(run_a, bin_a)
     if so_a is None:
@@ -721,8 +857,22 @@ def _persist_success(
     BinExport call targets decoded in the compute phase, None when not decoded). A layer-2 failure
     is recorded as an atomic blind-spot row (rollback -> no dirty ok=1 residue) and re-raised — the
     exact retry-status logic, unchanged, just moved out of the fused pipeline so it runs on the main
-    thread after compute."""
+    thread after compute.
+
+    ★ The transaction is opened with BEGIN IMMEDIATE, before anything is read: the input stamps
+    (lib/diff/currency) and the hunt output the diff consumes are then read under the write lock,
+    so a hunt cannot commit between the two and leave a digest describing other rows than the ones
+    the instruction pairs and deltas were built from.
+
+    The re-diff replaces the diff's rows, a stored candidate baseline included. When the diff had
+    one (or its row says a failed attempt dropped one), it is stored again for the new rows once
+    they are committed. A refusal to store it (lib/query/sink_overlay's own gates) does not fail
+    the diff: it is reported in the warnings."""
     try:
+        if not atlas.in_transaction:
+            atlas.execute("BEGIN IMMEDIATE")
+        keep_baseline = _has_candidate_baseline(atlas, diff_id) or _marked_dropped(atlas, diff_id)
+        stamps = _current_stamps(atlas, run_a_id, run_b_id, bin_a, bin_b)
         l0 = run_layer0_parse(
             atlas,
             bindiff_path=bindiff_path,
@@ -732,6 +882,7 @@ def _persist_success(
             bin_b=bin_b,
             diff_id=diff_id,
             commit=False,
+            stamps=stamps,
         )
         # Sink-overlay cross-side bridge: store this diff's candidate-callsite instruction matches
         # (either side's candidates) while the .BinDiff is still on disk (the caller rmtrees the
@@ -772,6 +923,19 @@ def _persist_success(
         )
         raise
 
+    baseline: str | None = None
+    if keep_baseline:
+        try:
+            persist_sink_overlay(atlas, diff_id, commit=True)
+            baseline = "restored"
+        except TreasureMapError as exc:
+            atlas.rollback()
+            baseline = "not_restored"
+            warnings = (
+                *warnings,
+                f"this diff had a stored candidate baseline, and it was not stored again for the "
+                f"new rows: {exc}",
+            )
     counts = _delta_counts(atlas, diff_id)
     return DiffSummary(
         diff_id=diff_id,
@@ -782,6 +946,7 @@ def _persist_success(
         delta_layer_unchanged=counts.get("layer_unchanged", 0),
         delta_undetermined=counts.get("delta_undetermined", 0),
         warnings=warnings,
+        baseline=baseline,
     )
 
 
@@ -804,7 +969,11 @@ def run_version_diff(
     Structured as the three phases (preflight -> compute -> persist); the ``td`` is owned here (not
     a ``with`` block) so the same compute/persist split powers the parallel full diff. Any toolchain
     or parse failure is recorded as an honest, atomic blind-spot row (diff_ok=0 + why + attempts)
-    then re-raised so the caller still sees the error."""
+    then re-raised so the caller still sees the error. The run pair is checked for currency first
+    (``check_run_pair_currency``), exactly as a full diff checks it."""
+    currency_warnings = check_run_pair_currency(
+        _resolve_run(atlas, run_a_id, "a"), _resolve_run(atlas, run_b_id, "b")
+    )
     pf = preflight(atlas, run_a_id, run_b_id, binary_name, config=config, force=force)
     # pf.binary_a is the normalized short name (preflight resolved it, asserted non-None). Include
     # it in the diff_id so this binary's diff does not overwrite another binary's under the same
@@ -837,10 +1006,18 @@ def run_version_diff(
             targets_a=artifacts.targets_a,
             targets_b=artifacts.targets_b,
             version_skew=pf.version_skew,
-            warnings=pf.warnings + artifacts.decode_warnings,
+            warnings=currency_warnings + pf.warnings + artifacts.decode_warnings,
         )
     finally:
         shutil.rmtree(td, ignore_errors=True)
+
+
+def _marked_dropped(atlas: sqlite3.Connection, diff_id: str) -> bool:
+    """Whether the diff's current row records that a failed attempt dropped its baseline."""
+    row = atlas.execute(
+        "SELECT baseline_dropped FROM diff_meta WHERE diff_id = ?", (diff_id,)
+    ).fetchone()
+    return bool(row is not None and row[0])
 
 
 def _delta_counts(atlas: sqlite3.Connection, diff_id: str) -> dict[str, int]:
@@ -889,6 +1066,8 @@ class _DiffStatusRecord:
     diff_attempts: int
     sha256_a: str | None
     sha256_b: str | None
+    # the compared input stamps (lib/diff/currency.COMPARED_COLUMNS) the diff was recorded with
+    stamps: dict[str, object]
 
 
 def _read_diff_status_map(
@@ -900,16 +1079,52 @@ def _read_diff_status_map(
     with a NULL binary_a cannot be mapped to a binary, so it is skipped -> that binary reads as
     'never diffed' and is re-diffed, which backfills the new columns (honest, not a silent skip)."""
     rows = atlas.execute(
-        "SELECT binary_a, diff_ok, diff_attempts, sha256_a, sha256_b FROM diff_meta "
+        "SELECT binary_a, diff_ok, diff_attempts, sha256_a, sha256_b, "  # noqa: S608 -- literal
+        f"{', '.join(COMPARED_COLUMNS)} FROM diff_meta "
         "WHERE run_a_id = ? AND run_b_id = ? AND binary_a IS NOT NULL",
         (run_a_id, run_b_id),
     ).fetchall()
     return {
         r[0]: _DiffStatusRecord(
-            diff_ok=r[1] or 0, diff_attempts=r[2] or 0, sha256_a=r[3], sha256_b=r[4]
+            diff_ok=r[1] or 0,
+            diff_attempts=r[2] or 0,
+            sha256_a=r[3],
+            sha256_b=r[4],
+            stamps=dict(zip(COMPARED_COLUMNS, r[5:], strict=True)),
         )
         for r in rows
     }
+
+
+def _inputs_unchanged(
+    atlas: sqlite3.Connection,
+    rec: _DiffStatusRecord,
+    run_a_id: str,
+    run_b_id: str,
+    binary: str,
+    ext_a: dict[str, tuple[str | None, str | None]],
+    ext_b: dict[str, tuple[str | None, str | None]],
+) -> bool:
+    """Whether every input stamp recorded with this binary's diff equals the current one (plain
+    equality, lib/diff/currency). The extraction and code-version stamps are compared first; the
+    hunt-input digests, the one part that costs a query, only when those already agree."""
+    pv_a, gv_a = ext_a.get(rec.sha256_a or "", (None, None))
+    pv_b, gv_b = ext_b.get(rec.sha256_b or "", (None, None))
+    cheap = {
+        "extraction_pass_a": pv_a,
+        "extraction_pass_b": pv_b,
+        "ghidra_version_a": gv_a,
+        "ghidra_version_b": gv_b,
+        "diff_code_version": DIFF_CODE_VERSION,
+    }
+    if any(rec.stamps.get(c) != v for c, v in cheap.items()):
+        return False
+    current = {
+        **cheap,
+        "hunt_inputs_hash_a": hunt_inputs_digest(atlas, run_a_id, rec.sha256_a, binary),
+        "hunt_inputs_hash_b": hunt_inputs_digest(atlas, run_b_id, rec.sha256_b, binary),
+    }
+    return stamps_equal(rec.stamps, current)
 
 
 def plan_full_diff(
@@ -918,6 +1133,7 @@ def plan_full_diff(
     run_b_id: str,
     *,
     retry_limit: int = _DIFF_RETRY_LIMIT,
+    assume_current: bool = False,
 ) -> FullDiffPlan:
     """Decide which binaries a full diff should diff: those present in BOTH runs whose content
     (sha256) differs, PARTITIONED by their recorded diff status so the sweep is incremental +
@@ -925,11 +1141,16 @@ def plan_full_diff(
     present on only one side has no counterpart to align, so it is listed, never diffed.
 
     Classification of each changed binary (see FullDiffPlan for the buckets):
-      * no recorded diff, or recorded content (sha256) differs from now -> ``to_diff``
-        (the content-changed case also VOIDS a past hard-boundary verdict: attempts reset).
-      * diff_ok=1 and both sha256 unchanged -> ``already_ok`` (skip).
-      * diff_ok=0, same content, attempts < ``retry_limit`` -> ``retry``.
-      * diff_ok=0, same content, attempts >= ``retry_limit`` -> ``hard_failed`` (skip w/o force)."""
+      * no recorded diff, or recorded content (sha256) differs from now, or a recorded input stamp
+        differs from now (lib/diff/currency) -> ``to_diff`` (this also VOIDS a past hard-boundary
+        verdict: attempts reset). A diff recorded before the stamps existed has them NULL, which
+        differs from any current stamp, so it is re-diffed once.
+      * diff_ok=1, sha256 and stamps unchanged -> ``already_ok`` (skip).
+      * diff_ok=0, unchanged, attempts < ``retry_limit`` -> ``retry``.
+      * diff_ok=0, unchanged, attempts >= ``retry_limit`` -> ``hard_failed`` (skip w/o force).
+
+    ``assume_current`` skips the stamp comparison (content is still compared): a diff whose inputs
+    moved is then kept as it is. The read tools still report it as stale."""
     run_a = _resolve_run(atlas, run_a_id, "a")
     run_b = _resolve_run(atlas, run_b_id, "b")
     assert run_a.analysis_db_path is not None and run_b.analysis_db_path is not None
@@ -944,6 +1165,8 @@ def plan_full_diff(
     changed = sorted(n for n in decidable if a[n][0] != b[n][0])
     unchanged = sorted(n for n in decidable if a[n][0] == b[n][0])
     status = _read_diff_status_map(atlas, run_a_id, run_b_id)
+    ext_a = read_extraction(run_a.analysis_db_path) or {}
+    ext_b = read_extraction(run_b.analysis_db_path) or {}
 
     to_diff: list[str] = []
     retry: list[str] = []
@@ -953,16 +1176,21 @@ def plan_full_diff(
         rec = status.get(n)
         if rec is None:
             to_diff.append(n)  # never diffed
+            continue
         # ``changed`` only holds names that resolved to ONE binary per side, so [0] is that
         # binary's sha — the comparison is against the same file that was diffed, not a pick.
-        elif rec.diff_ok == 1 and rec.sha256_a == a[n][0] and rec.sha256_b == b[n][0]:
-            already_ok.append(n)  # succeeded, content unchanged -> skip
-        elif rec.sha256_a != a[n][0] or rec.sha256_b != b[n][0]:
+        if rec.sha256_a != a[n][0] or rec.sha256_b != b[n][0]:
             to_diff.append(n)  # content changed (or unrecorded sha) -> re-diff, attempts reset
+        elif not (
+            assume_current or _inputs_unchanged(atlas, rec, run_a_id, run_b_id, n, ext_a, ext_b)
+        ):
+            to_diff.append(n)  # what it was computed from changed -> re-diff, attempts reset
+        elif rec.diff_ok == 1:
+            already_ok.append(n)  # succeeded, nothing changed -> skip
         elif rec.diff_attempts < retry_limit:
-            retry.append(n)  # failed, same content, under cap -> retry
+            retry.append(n)  # failed, unchanged, under cap -> retry
         else:
-            hard_failed.append(n)  # failed at cap, same content -> skip unless --force-retry
+            hard_failed.append(n)  # failed at cap, unchanged -> skip unless --force-retry
 
     return FullDiffPlan(
         changed=tuple(changed),
@@ -1123,6 +1351,7 @@ def run_full_diff(
     force: bool = False,
     force_retry: bool = False,
     retry_limit: int = _DIFF_RETRY_LIMIT,
+    assume_current: bool = False,
     on_start: Callable[[int], None] = lambda _n: None,
     on_outcome: Callable[[int, int, BinaryDiffOutcome], None] = lambda _i, _n, _o: None,
 ) -> FullDiffSummary:
@@ -1139,14 +1368,18 @@ def run_full_diff(
     (layer0/layer2 or the atomic failure write) — SQLite is written by one thread only, so no WAL /
     multi-connection complexity, and each binary stays its own independent atomic transaction.
 
-    The run-pair-global preconditions (version skew, toolchain) are checked ONCE up front so a
-    global problem fails fast; a PER-binary failure is recorded as an atomic blind-spot row and the
-    sweep CONTINUES. The full sweep runs unconfirmed (it is the normal usage) — ``on_start(n)`` is
-    notified with the count before work begins; ``on_outcome`` reports each binary as it finishes
-    (in completion order). Ctrl-C stops SCHEDULING further binaries and returns ``cancelled=True``
-    with the completed ones intact; see the interrupt handler for the honest 'in-flight JVM'
-    bound."""
-    plan = plan_full_diff(atlas, run_a_id, run_b_id, retry_limit=retry_limit)
+    The run-pair-global preconditions (version skew, the runs' currency — check_run_pair_currency —
+    and the toolchain) are checked ONCE up front so a global problem fails fast; a PER-binary
+    failure is recorded as an atomic blind-spot row and the sweep CONTINUES. ``assume_current``
+    keeps diffs whose recorded input stamps differ from now (see plan_full_diff); it does not
+    relax the currency refusals. The full sweep runs unconfirmed (it is the normal usage) —
+    ``on_start(n)`` is notified with the count before work begins; ``on_outcome`` reports each
+    binary as it finishes (in completion order). Ctrl-C stops SCHEDULING further binaries and
+    returns ``cancelled=True`` with the completed ones intact; see the interrupt handler for the
+    honest 'in-flight JVM' bound."""
+    plan = plan_full_diff(
+        atlas, run_a_id, run_b_id, retry_limit=retry_limit, assume_current=assume_current
+    )
     to_run = plan.binaries_to_run(force_retry=force_retry)
     if not to_run:
         # nothing NEEDS diffing: no changed binaries, or all already-ok / suspected-hard (skipped).
@@ -1160,6 +1393,7 @@ def run_full_diff(
             "recorded), so every delta would be version_skew undetermined. Re-scan both with the "
             "same toolchain, or pass --force to diff anyway (the result stays honestly degraded)."
         )
+    warnings = check_run_pair_currency(run_a, run_b)
     _check_toolchain(config)
     # notify the caller of the sweep size (no confirmation gate — a full diff is normal use)
     on_start(len(to_run))
@@ -1178,7 +1412,7 @@ def run_full_diff(
         try:
             pf = preflight(atlas, run_a_id, run_b_id, binary, config=config, force=force)
         except TreasureMapError as exc:
-            if isinstance(exc, AmbiguousBinarySelectorError):
+            if isinstance(exc, (AmbiguousBinarySelectorError, ExtractionUnstampedError)):
                 # Persist it as this binary's blind spot, the same shape a toolchain failure gets.
                 # A refusal that lives only in the console scrolls away; recorded, it shows up in
                 # list_diff_blindspots with a reason that names the fix.
@@ -1190,11 +1424,18 @@ def run_full_diff(
                     binary_short=binary,
                     exc=exc,
                 )
+                attempts, reason = _read_recorded_status(
+                    atlas, make_diff_id(run_a_id, run_b_id, binary)
+                )
+            else:
+                attempts, reason = None, None
             done += 1
             oc = BinaryDiffOutcome(
                 binary,
                 None,
                 f"{type(exc).__name__}: {exc}",
+                attempts=attempts,
+                reason=reason,
                 was_failed_before=binary in was_failed_before,
             )
             outcomes.append(oc)
@@ -1274,4 +1515,68 @@ def run_full_diff(
             for td in tds.values():
                 shutil.rmtree(td, ignore_errors=True)
 
-    return FullDiffSummary(plan, tuple(outcomes), cancelled=cancelled, retry_limit=retry_limit)
+    return FullDiffSummary(
+        plan, tuple(outcomes), cancelled=cancelled, retry_limit=retry_limit, warnings=warnings
+    )
+
+
+def _concrete_hash(value: str | None) -> bool:
+    """A single extraction hash, as opposed to none or a ``mixed:N`` count of several."""
+    return bool(value) and not str(value).startswith("mixed:")
+
+
+def _analysis_build_hash(analysis_db_path: str | None) -> str | None:
+    """The extraction hash the run's analysis.db holds now (the run row's own derivation), or None
+    when it cannot be read."""
+    if not analysis_db_path or not Path(analysis_db_path).exists():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{analysis_db_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        return _build_hash_with_rows(conn, analysis_db_path)
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+
+def check_run_pair_currency(run_a: RunRow, run_b: RunRow) -> tuple[str, ...]:
+    """Refuse to diff a run pair when either run is PROVABLY out of date; return warnings otherwise.
+
+    Two refusals (ConfigError), both a positive mismatch between two real values:
+      1. ``run_staleness`` against the running tmap says the run is stale -- the judgement the read
+         tools refuse a stale run's answers on, so nothing is diffed from a run they would refuse.
+      2. the run's analysis.db now holds a different extraction hash than the run row recorded:
+         the extraction was redone after the run was hunted, so its candidates belong to another
+         extraction. Compared only when both are one concrete hash.
+    Whatever only cannot be confirmed -- a ``mixed:N`` or missing hash, an unknown hunt commit, a
+    running install that records no commit (an editable one) -- is a warning, never a refusal:
+    those are routine, and refusing them would leave such an install unable to diff at all."""
+    build = _current_pass_version()
+    commit = _installed_commit()
+    warnings: list[str] = []
+    for side, run in (("A", run_a), ("B", run_b)):
+        st = run_staleness(run, build_hash=build, commit=commit)
+        if st.stale:
+            raise ConfigError(
+                f"run {side} '{run.run_id}' is out of date ({st.axis}): {st.detail} {st.remedy}"
+            )
+        if st.remedy:  # run_staleness names a remedy exactly when it could not confirm the run
+            warnings.append(f"run {side} '{run.run_id}': {st.detail}")
+        db_hash = _analysis_build_hash(run.analysis_db_path)
+        if _concrete_hash(db_hash) and _concrete_hash(run.build_hash):
+            if db_hash != run.build_hash:
+                raise ConfigError(
+                    f"run {side} '{run.run_id}' was hunted from extraction {run.build_hash}, but "
+                    f"its analysis.db now holds extraction {db_hash}: the candidates the diff "
+                    f"would read belong to the earlier extraction. Re-hunt run '{run.run_id}' "
+                    "first."
+                )
+        else:
+            warnings.append(
+                f"run {side} '{run.run_id}': its extraction hash ({run.build_hash}) and that of "
+                f"its analysis.db ({db_hash}) cannot be compared"
+            )
+    return tuple(warnings)

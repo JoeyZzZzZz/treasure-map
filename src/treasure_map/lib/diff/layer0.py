@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from treasure_map.lib.atlas.models import (
@@ -35,6 +35,7 @@ from treasure_map.lib.atlas.writer import (
 )
 from treasure_map.lib.binary_id import BinaryRow
 from treasure_map.lib.callsite_ref import callsite_abs_addr, wrapper_call_abs_addr
+from treasure_map.lib.diff.currency import COMPARED_COLUMNS, UNSTAMPED, DiffStamps, stamps_equal
 from treasure_map.lib.errors import ConfigError
 from treasure_map.lib.facts import _DECOMPILE_MIN_SIZE
 from treasure_map.lib.hunt.refs import _norm_addr
@@ -433,20 +434,29 @@ def _resolve_run(atlas: sqlite3.Connection, run_id: str, side: str) -> RunRow:
 
 
 def _next_attempts(
-    atlas: sqlite3.Connection, diff_id: str, cur_sha_a: str | None, cur_sha_b: str | None
+    atlas: sqlite3.Connection,
+    diff_id: str,
+    cur_sha_a: str | None,
+    cur_sha_b: str | None,
+    cur_stamps: DiffStamps,
 ) -> int:
-    """The attempts count to record for THIS diff of ``diff_id``, sha-aware so it doubles as the
-    attempts-reset gate.
+    """The attempts count to record for THIS diff of ``diff_id``, aware of everything the diff was
+    computed from, so it doubles as the attempts-reset gate.
 
     Reads the prior diff_meta row (if any) BEFORE it is deleted/replaced. The counter only CONTINUES
-    when both sides' current sha256 POSITIVELY equal the prior row's -- i.e. the exact same content
-    is being diffed again (a genuine retry). If the content changed (a recompiled binary) OR either
-    side's sha is unknown, it RESETS to 1: a past 'hard boundary' verdict is void once the bytes
-    differ, and an unknowable identity must never be counted as a repeat failure (that would falsely
-    escalate toward the retry cap). Success and failure paths share this so both agree on the count.
+    when the same diff is being attempted again: both sides' current sha256 POSITIVELY equal the
+    prior row's, AND every compared stamp (extraction pass, decompiler version, hunt-input digest,
+    diff code version — see lib/diff/currency) equals the prior row's. Anything else RESETS it to 1:
+    a past 'hard boundary' verdict is void once the bytes, the extraction, the hunt output or the
+    diff code differ, and an unknowable sha must never be counted as a repeat failure (that would
+    falsely escalate toward the retry cap). A prior row written before the stamps were recorded has
+    them NULL, which differs from any current stamp, so its count resets once. Success and failure
+    paths share this so both agree on the count.
     """
     row = atlas.execute(
-        "SELECT diff_attempts, sha256_a, sha256_b FROM diff_meta WHERE diff_id = ?", (diff_id,)
+        "SELECT diff_attempts, sha256_a, sha256_b, "  # noqa: S608 -- literal column list
+        f"{', '.join(COMPARED_COLUMNS)} FROM diff_meta WHERE diff_id = ?",
+        (diff_id,),
     ).fetchone()
     if row is None:
         return 1
@@ -458,7 +468,18 @@ def _next_attempts(
         and prev_a == cur_sha_a
         and prev_b == cur_sha_b
     )
-    return prev_attempts + 1 if same_content else 1
+    prev_stamps = dict(zip(COMPARED_COLUMNS, row[3:], strict=True))
+    same_inputs = stamps_equal(prev_stamps, cur_stamps.compared())
+    return prev_attempts + 1 if (same_content and same_inputs) else 1
+
+
+def _unstamped(run_a: RunRow, run_b: RunRow) -> DiffStamps:
+    """The stamps of a diff written without them: only the runs' decompiler versions."""
+    return replace(
+        UNSTAMPED,
+        a=replace(UNSTAMPED.a, ghidra_version=run_a.ghidra_version),
+        b=replace(UNSTAMPED.b, ghidra_version=run_b.ghidra_version),
+    )
 
 
 def make_diff_id(run_a_id: str, run_b_id: str, binary: str) -> str:
@@ -531,13 +552,19 @@ def run_layer0_parse(
     diff_id: str | None = None,
     threshold: float = ALIGN_THRESHOLD,
     commit: bool = True,
+    stamps: DiffStamps | None = None,
 ) -> Layer0Result:
     """Parse a ``.BinDiff`` into the atlas (function_alignment + function_presence + diff_meta).
 
     Resolves each run's analysis.db via ``run.analysis_db_path`` (errors on an unresolved run, never
     guesses a workspace path), parses the alignment facts, computes per-side presence against each
     run's own function inventory (the baseline domain), and writes all three tables under one
-    ``diff_id`` in a single replace-by-diff transaction (idempotent re-parse)."""
+    ``diff_id`` in a single replace-by-diff transaction (idempotent re-parse).
+
+    ``stamps`` is what else the diff is computed from (lib/diff/currency), taken by the caller
+    inside the same write transaction; they are written to diff_meta, and ghidra_version_a/b then
+    hold each diffed binary's own decompiler version. Without them the row is written unstamped
+    (NULL stamps, the runs' decompiler versions), which every reader reports as unverified."""
     run_a = _resolve_run(atlas, run_a_id, "a")
     run_b = _resolve_run(atlas, run_b_id, "b")
     _validate_bindiff_binaries(bindiff_path, bin_a, bin_b)
@@ -566,7 +593,10 @@ def run_layer0_parse(
     # unchanged binary (incremental) and reset the attempts counter when the content changed. Read
     # BEFORE delete_diff replaces the row -- _next_attempts needs the prior row.
     sha_a, sha_b = bin_a.sha256, bin_b.sha256
-    attempts = _next_attempts(atlas, did, sha_a, sha_b)
+    # What is written is what the attempts gate compares, so an unstamped write (the runs'
+    # decompiler versions, every other stamp NULL) compares against the same shape next time.
+    st = stamps if stamps is not None else _unstamped(run_a, run_b)
+    attempts = _next_attempts(atlas, did, sha_a, sha_b, st)
 
     undetermined = sum(1 for r in parsed.rows if r.alignment_state == "alignment_undetermined")
     meta = DiffMetaRow(
@@ -584,8 +614,8 @@ def run_layer0_parse(
         binary_path_b=bin_b.path,
         tool_version_a=run_a.tool_version,
         tool_version_b=run_b.tool_version,
-        ghidra_version_a=run_a.ghidra_version,
-        ghidra_version_b=run_b.ghidra_version,
+        ghidra_version_a=st.a.ghidra_version,
+        ghidra_version_b=st.b.ghidra_version,
         version_skew=1 if _version_skew(run_a, run_b) else 0,
         bindiff_source=bindiff_path.name,
         matched_pairs=len(parsed.rows),
@@ -618,6 +648,15 @@ def run_layer0_parse(
         diff_attempts=attempts,
         sha256_a=sha_a,
         sha256_b=sha_b,
+        extraction_pass_a=st.a.extraction_pass,
+        extraction_pass_b=st.b.extraction_pass,
+        hunt_inputs_hash_a=st.a.hunt_inputs_hash,
+        hunt_inputs_hash_b=st.b.hunt_inputs_hash,
+        scanned_at_a=st.a.scanned_at,
+        scanned_at_b=st.b.scanned_at,
+        hunt_instances_a=st.a.hunt_instances,
+        hunt_instances_b=st.b.hunt_instances,
+        diff_code_version=st.diff_code_version,
     )
 
     delete_diff(atlas, did, commit=False)

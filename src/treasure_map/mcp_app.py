@@ -79,11 +79,14 @@ from treasure_map.lib.query import twins as _twins
 from treasure_map.lib.query import unknown_dimension_refusal as _unknown_dim_refusal
 from treasure_map.lib.query.diff_align import align_by_a as _align_by_a
 from treasure_map.lib.query.diff_align import align_by_b as _align_by_b
+from treasure_map.lib.query.diff_align import diff_source_staleness as _diff_source_staleness
+from treasure_map.lib.query.diff_align import diffs_source_staleness as _diffs_source_staleness
 from treasure_map.lib.query.diff_align import get_diff_capabilities as _get_diff_capabilities
 from treasure_map.lib.query.diff_align import get_diff_deltas as _get_diff_deltas
 from treasure_map.lib.query.diff_align import get_diff_meta as _get_diff_meta
 from treasure_map.lib.query.diff_align import list_diff_blindspots as _list_diff_blindspots
 from treasure_map.lib.query.diff_align import list_diffs as _list_diffs
+from treasure_map.lib.query.diff_align import staleness_summary as _staleness_summary
 from treasure_map.lib.query.sink_overlay import compute_sink_overlay as _compute_sink_overlay
 from treasure_map.lib.query.sink_overlay import (
     compute_sink_overlay_runs as _compute_sink_overlay_runs,
@@ -1637,7 +1640,11 @@ def make_tools(
         its ``undetermined_reason`` (an enum that may grow; do not branch on it). ``state_a`` /
         ``state_b`` are OPAQUE strings you interpret. An EMPTY result is NOT 'no changes' -- call
         get_diff_capabilities to see which dimensions this diff can even delta. ``verbose=false``
-        keeps the payload to rows + paging; ``verbose=true`` adds the note + legend."""
+        keeps the payload to rows + paging; ``verbose=true`` adds the note + legend.
+        ★ ``source_stale`` (with ``source_stale_reason``): true = the diff no longer describes what
+        it was computed from (binary content, extraction, the hunt output it read, or the diff code
+        changed — re-run the diff); null = could not be checked; false = checked and current. The
+        reasons are listed in list_diffs."""
         conn = open_atlas(atlas_path)
         try:
             refusal = _refuse_stale_diff(conn, diff_id)
@@ -1731,7 +1738,13 @@ def make_tools(
         ``b_total``/``b_represented``, ``excluded_legacy`` (old anchors with no function address,
         not lined up). ``coverage_violation: true`` means some candidates are missing from the rows
         — ``unrepresented_refs`` samples them; do not read the rows as complete. Coverage ALWAYS
-        describes the whole diff / run pair; the filters and paging narrow the rows only."""
+        describes the whole diff / run pair; the filters and paging narrow the rows only.
+
+        ★ Whether the diff still describes what it was computed from (see list_diffs for the
+        reasons): with ``diff_id``, ``source_stale`` / ``source_stale_reason`` at the top level;
+        with ``run_a``+``run_b``, each row carries its own diff's ``source_stale`` /
+        ``source_stale_reason`` (null on a row no diff covers) and ``diff_staleness`` counts the
+        diffs the rows come from (stale / unverified / current, by reason)."""
         filters = {
             "binary": binary,
             "sink_class": sink_class,
@@ -1805,6 +1818,17 @@ def make_tools(
                 "detail": detail,
                 "coverage": asdict(result.coverage),
             }
+            # Whether each diff the rows come from still describes its inputs: one answer for a
+            # single diff, per row (by its own diff) plus counts for a run pair.
+            stale_by_diff: dict[str, dict[str, Any]] = {}
+            if by_runs:
+                stale_by_diff = _diffs_source_staleness(
+                    conn, (r.diff_id for r in result.rows if r.diff_id)
+                )
+                out["diff_staleness"] = _staleness_summary(stale_by_diff)
+            else:
+                assert diff_id is not None
+                out.update(_diff_source_staleness(conn, diff_id))
             if detail == "summary":
                 out["summary"] = _summarize_overlay(rows, by_binary=by_runs)
                 out["note"] = (
@@ -1822,7 +1846,12 @@ def make_tools(
                     "offset": page["offset"],
                     "limit": page["limit"],
                     "next_offset": page["next_offset"],
-                    "rows": [asdict(r) for r in page["rows"]],
+                    "rows": [
+                        {**asdict(r), **_row_staleness(stale_by_diff, r.diff_id)}
+                        if by_runs
+                        else asdict(r)
+                        for r in page["rows"]
+                    ],
                     "note": (
                         "one page in a fixed neutral order; presence_undetermined is NOT "
                         "unchanged (read presence_reason); a whole function with no counterpart "
@@ -1834,6 +1863,14 @@ def make_tools(
         finally:
             conn.close()
 
+    def _row_staleness(
+        by_diff: dict[str, dict[str, Any]], row_diff_id: str | None
+    ) -> dict[str, Any]:
+        """A run-pair overlay row's own diff's staleness; null for a row no diff covers."""
+        if row_diff_id is None:
+            return {"source_stale": None, "source_stale_reason": None}
+        return by_diff.get(row_diff_id, {"source_stale": None, "source_stale_reason": None})
+
     def get_diff_meta(diff_id: str) -> dict[str, Any]:
         """The meta facts of one version diff (``diff_id`` = ``{run_a}::{run_b}::{binary}``, one per
         binary — see list_diffs): binary scope, tool/decompiler versions, alignment + presence.
@@ -1844,7 +1881,9 @@ def make_tools(
         A-side match (the presence layer, the WEAKEST signal -- to find changes look at
         ``layer_changed`` via get_diff_deltas, not this). ★ ``diff_ok=0`` means this binary did NOT
         diff (``diff_status='failed'``, ``diff_status_reason`` = why, ``diff_attempts`` = tries): an
-        empty get_diff_deltas for it is a BLIND SPOT, never 'no change' (list_diff_blindspots)."""
+        empty get_diff_deltas for it is a BLIND SPOT, never 'no change' (list_diff_blindspots).
+        ``source_stale`` / ``source_stale_reason``: whether the diff still describes what it was
+        computed from (true / null = unverified / false; reasons in list_diffs)."""
         conn = open_atlas(atlas_path)
         try:
             refusal = _refuse_stale_diff(conn, diff_id)
@@ -1863,7 +1902,9 @@ def make_tools(
         pairing, ``similarity`` = how much the pair differs (a pair can be similarity=1.0 yet
         confidence ~0.02). ``alignment_undetermined`` means the alignment ITSELF is uncertain --
         neither 'not matched' nor 'changed'. No match here is NOT proof the function was added or
-        removed (see function_presence)."""
+        removed (see function_presence). ``source_stale`` / ``source_stale_reason``: whether the
+        diff still describes what it was computed from (true / null = unverified / false; reasons
+        in list_diffs)."""
         conn = open_atlas(atlas_path)
         try:
             refusal = _refuse_stale_diff(conn, diff_id)
@@ -1884,7 +1925,9 @@ def make_tools(
         this alongside an empty get_diff_deltas: empty there + delta_supported=0 here = 'this diff
         does not delta that dimension', which is NOT the same as 'nothing changed'. ``state_a`` /
         ``state_b`` are each side's analysis capability (present / declared_absent /
-        registration_unknown)."""
+        registration_unknown). ``source_stale`` / ``source_stale_reason``: whether the diff still
+        describes what it was computed from (true / null = unverified / false; reasons in
+        list_diffs)."""
         conn = open_atlas(atlas_path)
         try:
             refusal = _refuse_stale_diff(conn, diff_id)
@@ -1906,7 +1949,17 @@ def make_tools(
         proof the change matters, and an EMPTY list means no diff has been run for that filter --
         not 'nothing changed'. ★ A ``diff_ok=0`` row is a BLIND SPOT (the binary did not diff --
         diff_status_reason says why): its zero counts are 'unknown', NOT 'no change'. Use
-        list_diff_blindspots to focus just the un-diffed binaries."""
+        list_diff_blindspots to focus just the un-diffed binaries.
+
+        ★ Each row's ``source_stale`` says whether the diff still describes what it was computed
+        from. true, with ``source_stale_reason``: ``source_binary_absent`` /
+        ``source_content_changed`` (a side's binary is gone or its bytes changed),
+        ``diff_logic_changed`` (computed by different diff code), ``extraction_changed`` /
+        ``ghidra_changed`` (the binary was re-extracted), ``hunt_inputs_changed`` (the hunt output
+        the diff read changed) — re-run the diff. null: ``generation_unstamped`` (written before
+        the stamps were recorded) / ``source_unavailable`` (the source could not be read) — NOT a
+        clean bill. false: checked and current. The first applicable reason in that order is the
+        one reported."""
         conn = open_atlas(atlas_path)
         try:
             return _list_diffs(conn, run_a_id, run_b_id)
@@ -1926,7 +1979,10 @@ def make_tools(
         and ``suspected_hard`` (1 = hit the retry cap, so later full diffs skip it unless
         force_retry; a HINT from repeated identical-content failures, never proof the binary is
         undiffable — its content changing resets the count). Read this alongside get_diff_deltas so
-        a consumer of the change map always sees the coverage gaps too."""
+        a consumer of the change map always sees the coverage gaps too. ``extraction_unstamped`` =
+        the binary has no recorded extraction (re-scan the run). ``baseline_dropped=1`` = this
+        failure replaced a good diff, and the candidate baseline stored with it. Each row also
+        carries ``source_stale`` / ``source_stale_reason`` (as in list_diffs)."""
         conn = open_atlas(atlas_path)
         try:
             return _list_diff_blindspots(conn, run_a_id, run_b_id)

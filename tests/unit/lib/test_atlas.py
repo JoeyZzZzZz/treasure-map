@@ -855,6 +855,16 @@ def test_open_atlas_drops_a_stale_exec_edge_resolved_via(tmp_path: Path) -> None
         ("diff_meta", "callsite_facts_hash_b"),
         ("diff_meta", "stub_state_a"),
         ("diff_meta", "stub_state_b"),
+        ("diff_meta", "extraction_pass_a"),
+        ("diff_meta", "extraction_pass_b"),
+        ("diff_meta", "hunt_inputs_hash_a"),
+        ("diff_meta", "hunt_inputs_hash_b"),
+        ("diff_meta", "scanned_at_a"),
+        ("diff_meta", "scanned_at_b"),
+        ("diff_meta", "hunt_instances_a"),
+        ("diff_meta", "hunt_instances_b"),
+        ("diff_meta", "diff_code_version"),
+        ("diff_meta", "baseline_dropped"),
     ],
 )
 def test_open_atlas_reopens_old_shape_missing_migrated_column(

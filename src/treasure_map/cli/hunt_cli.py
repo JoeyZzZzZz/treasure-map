@@ -103,6 +103,8 @@ def _echo_single_diff(summary: Any, resolved_atlas: Path) -> None:
         f"layer_unchanged={summary.delta_layer_unchanged}, "
         f"delta_undetermined={summary.delta_undetermined}"
     )
+    if summary.baseline is not None:
+        click.echo(f"  baseline      : {summary.baseline.replace('_', ' ')}")
     click.echo(
         "Read the deltas: get_diff_deltas / get_diff_meta / get_function_alignment / "
         "get_diff_capabilities"
@@ -114,6 +116,8 @@ def _echo_full_diff(fsum: Any, resolved_atlas: Path) -> None:
     self-healed, and which persist as blind spots — so a coverage gap is never invisible."""
     plan = fsum.plan
     limit = fsum.retry_limit
+    for w in fsum.warnings:
+        click.echo(f"warning: {w}", err=True)
     click.echo(f"Atlas: {resolved_atlas}")
     if fsum.cancelled:
         # Ctrl-C: the completed binaries are persisted; the rest are simply un-diffed and will be
@@ -150,6 +154,14 @@ def _echo_full_diff(fsum: Any, resolved_atlas: Path) -> None:
     if recovered:
         click.echo(
             f"  recovered     : {len(recovered)} retried and now ok — {', '.join(recovered)}"
+        )
+    restored = [o.binary for o in ok if o.summary.baseline == "restored"]
+    lost = [o.binary for o in ok if o.summary.baseline == "not_restored"]
+    if restored or lost:
+        # A re-diff replaces the stored candidate baseline with the rest of the diff's rows.
+        click.echo(
+            f"  baselines     : {len(restored)} stored again, {len(lost)} not"
+            + (f" (now without one — see the diff's warnings): {', '.join(lost)}" if lost else "")
         )
     if still_hard:
         click.echo(
@@ -204,6 +216,15 @@ def _echo_full_diff(fsum: Any, resolved_atlas: Path) -> None:
     "boundaries), which are skipped by default. Use after fixing a toolchain issue.",
 )
 @click.option(
+    "--assume-current",
+    is_flag=True,
+    default=False,
+    help="In a full diff, keep a recorded diff whose binary content is unchanged even when what "
+    "it was computed from has changed since (the binary's extraction, the hunt output it read, "
+    "the diff code). The read tools still report such a diff as source_stale. Does not override "
+    "the refusal to diff a run that is out of date.",
+)
+@click.option(
     "--config",
     "-c",
     type=click.Path(exists=True, path_type=Path),
@@ -223,6 +244,7 @@ def hunt_diff(
     binary_name: str | None,
     force: bool,
     force_retry: bool,
+    assume_current: bool,
     config: Path | None,
     atlas_path: Path | None,
 ) -> None:
@@ -276,6 +298,7 @@ def hunt_diff(
                 config=cfg,
                 force=force,
                 force_retry=force_retry,
+                assume_current=assume_current,
                 on_start=_on_start,
                 on_outcome=_on_outcome,
             )

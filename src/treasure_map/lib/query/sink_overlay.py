@@ -1621,7 +1621,11 @@ def read_sink_overlay_baseline(atlas: sqlite3.Connection, diff_id: str) -> dict[
     re-scanned after the baseline was written, so its rows describe candidates that may no longer
     exist. Its ``overlay_version`` is compared with SINK_OVERLAY_LOGIC_VERSION: rows written by
     other overlay logic would not match a live computation. Either way the answer is
-    ``stale_baseline: true`` with the differing fields, and no rows."""
+    ``stale_baseline: true`` with the differing fields, and no rows.
+
+    A diff with no stored baseline answers ``baseline_absent: true`` (``stale_baseline`` null, rows
+    null): there is nothing to be fresh or stale, which is not the same as a current, empty
+    baseline."""
     ctx = _load_diff_ctx(atlas, diff_id)
     if ctx is None:
         return {"diff_id": diff_id, "error": "no such diff"}
@@ -1634,7 +1638,13 @@ def read_sink_overlay_baseline(atlas: sqlite3.Connection, diff_id: str) -> dict[
         (diff_id,),
     ).fetchall()
     if not stored:
-        return {"diff_id": diff_id, "stale_baseline": False, "baseline_rows": 0, "rows": []}
+        return {
+            "diff_id": diff_id,
+            "baseline_absent": True,
+            "stale_baseline": None,
+            "baseline_rows": 0,
+            "rows": None,
+        }
     current: dict[str, tuple[str | None, str | None, int | None] | None] = {
         "a": _gen_stamps(atlas, ctx.run_a),
         "b": _gen_stamps(atlas, ctx.run_b),
@@ -1652,6 +1662,7 @@ def read_sink_overlay_baseline(atlas: sqlite3.Connection, diff_id: str) -> dict[
     if mismatched:
         return {
             "diff_id": diff_id,
+            "baseline_absent": False,
             "stale_baseline": True,
             "mismatched_fields": sorted(mismatched),
             "baseline_rows": len(stored),
@@ -1672,6 +1683,7 @@ def read_sink_overlay_baseline(atlas: sqlite3.Connection, diff_id: str) -> dict[
     )
     return {
         "diff_id": diff_id,
+        "baseline_absent": False,
         "stale_baseline": False,
         "baseline_rows": len(stored),
         "rows": [dict(zip(cols, row[: len(cols)], strict=True)) for row in stored],

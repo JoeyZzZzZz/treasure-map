@@ -403,6 +403,21 @@ class DiffMetaRow:
     callsite_facts_hash_b: str | None = None
     stub_state_a: str | None = None
     stub_state_b: str | None = None
+    # What else the diff was computed from (see lib/diff/currency): per side, the diffed binary's
+    # extraction pass, a digest of the hunt output the diff read, and the run's scanned_at /
+    # hunt_instances at diff time; plus the diff code version. None on a diff written before they
+    # were recorded. ``baseline_dropped`` = 1 when a failed re-diff replaced a good diff that had a
+    # stored candidate baseline.
+    extraction_pass_a: str | None = None
+    extraction_pass_b: str | None = None
+    hunt_inputs_hash_a: str | None = None
+    hunt_inputs_hash_b: str | None = None
+    scanned_at_a: str | None = None
+    scanned_at_b: str | None = None
+    hunt_instances_a: int | None = None
+    hunt_instances_b: int | None = None
+    diff_code_version: str | None = None
+    baseline_dropped: int = 0
 
 
 @dataclass(frozen=True)

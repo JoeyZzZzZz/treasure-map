@@ -641,6 +641,21 @@ CREATE TABLE IF NOT EXISTS diff_meta (
     callsite_facts_hash_b   TEXT,            --   reader compares it with run.build_hash)
     stub_state_a            TEXT,            -- not_applicable (not MIPS) | not_determined (MIPS,
     stub_state_b            TEXT,            --   no table recorded) | read (MIPS, table recorded)
+    -- What else the diff was computed from, per side, so a later full diff can tell whether a
+    -- recorded diff still matches its inputs (see lib/diff/currency). ghidra_version_a/b above
+    -- hold the diffed BINARY's own decompiler version on a diff written with these stamps.
+    extraction_pass_a       TEXT,            -- the diffed binary's binaries.pass_version
+    extraction_pass_b       TEXT,
+    hunt_inputs_hash_a      TEXT,            -- digest of the hunt output the diff read for the
+    hunt_inputs_hash_b      TEXT,            --   side (candidate call sites, edges, capabilities)
+    scanned_at_a            TEXT,            -- run.scanned_at / run.hunt_instances when diffed: a
+    scanned_at_b            TEXT,            --   cheap check that the hunt has not run since
+    hunt_instances_a        INTEGER,
+    hunt_instances_b        INTEGER,
+    diff_code_version       TEXT,            -- the diff code's version; NULL = written before
+                                             --   these stamps were recorded (unverified)
+    baseline_dropped        INTEGER NOT NULL DEFAULT 0,  -- 1 = a failed re-diff replaced a good
+                                             --   diff that had a stored candidate baseline
     created_at              DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 

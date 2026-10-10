@@ -471,9 +471,13 @@ def add_diff_meta(conn: sqlite3.Connection, row: DiffMetaRow, *, commit: bool = 
             micro_skipped_b, presence_computed_a, presence_computed_b, binary_a, binary_b,
             diff_ok, diff_status, diff_status_reason, diff_attempts, sha256_a, sha256_b,
             binary_path_a, binary_path_b, callsite_facts_a, callsite_facts_b,
-            callsite_facts_hash_a, callsite_facts_hash_b, stub_state_a, stub_state_b)
+            callsite_facts_hash_a, callsite_facts_hash_b, stub_state_a, stub_state_b,
+            extraction_pass_a, extraction_pass_b, hunt_inputs_hash_a, hunt_inputs_hash_b,
+            scanned_at_a, scanned_at_b, hunt_instances_a, hunt_instances_b, diff_code_version,
+            baseline_dropped)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                   ?)""",
         (
             row.diff_id,
             row.run_a_id,
@@ -518,6 +522,16 @@ def add_diff_meta(conn: sqlite3.Connection, row: DiffMetaRow, *, commit: bool = 
             row.callsite_facts_hash_b,
             row.stub_state_a,
             row.stub_state_b,
+            row.extraction_pass_a,
+            row.extraction_pass_b,
+            row.hunt_inputs_hash_a,
+            row.hunt_inputs_hash_b,
+            row.scanned_at_a,
+            row.scanned_at_b,
+            row.hunt_instances_a,
+            row.hunt_instances_b,
+            row.diff_code_version,
+            row.baseline_dropped,
         ),
     )
     if commit:

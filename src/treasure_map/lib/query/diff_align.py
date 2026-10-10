@@ -19,8 +19,15 @@ annotations, an ``layer_changed`` is not 'this matters', and an empty result is 
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterable
 from typing import Any
 
+from treasure_map.lib.diff.currency import (
+    DIFF_CODE_VERSION,
+    hunt_inputs_digest,
+    read_extraction,
+    run_hunt_marks,
+)
 from treasure_map.lib.diff.driver import _DIFF_RETRY_LIMIT
 from treasure_map.lib.diff.layer0 import norm_hex
 
@@ -57,6 +64,48 @@ STALE_UNKNOWN = "source_unavailable"  # cannot tell — never reported as stale,
 STALE_NO_STAMP = "generation_unstamped"  # the diff predates the hash being recorded
 STALE_CHANGED = "source_content_changed"
 STALE_GONE = "source_binary_absent"
+# ★ The bytes are not all a diff is computed from. It also reads, per side, the binary's extraction
+# and the hunt's output for it, and it is produced by the diff code — each recorded with the diff
+# as a stamp (lib/diff/currency) and compared here with what it is now, by plain equality.
+STALE_DIFF_LOGIC = "diff_logic_changed"  # computed by different diff code than is running
+STALE_EXTRACTION = "extraction_changed"  # the binary's extraction pass differs
+STALE_GHIDRA = "ghidra_changed"  # the binary's recorded decompiler version differs
+STALE_HUNT_INPUTS = "hunt_inputs_changed"  # the hunt output the diff read differs
+
+# Both sides are judged and the highest-ranked reason found is the one reported (first = highest).
+_REASON_RANK = (
+    STALE_GONE,
+    STALE_CHANGED,
+    STALE_DIFF_LOGIC,
+    STALE_EXTRACTION,
+    STALE_GHIDRA,
+    STALE_HUNT_INPUTS,
+    STALE_NO_STAMP,
+    STALE_UNKNOWN,
+)
+# The reasons that make a diff stale (source_stale true); the other two leave it unverified (null).
+_STALE_REASONS = frozenset(_REASON_RANK[:6])
+
+# The diff_meta columns the staleness check reads.
+_STAMP_COLS = (
+    "run_a_id",
+    "run_b_id",
+    "binary_a",
+    "binary_b",
+    "sha256_a",
+    "sha256_b",
+    "extraction_pass_a",
+    "extraction_pass_b",
+    "ghidra_version_a",
+    "ghidra_version_b",
+    "hunt_inputs_hash_a",
+    "hunt_inputs_hash_b",
+    "scanned_at_a",
+    "scanned_at_b",
+    "hunt_instances_a",
+    "hunt_instances_b",
+    "diff_code_version",
+)
 
 
 def _current_generation(atlas: sqlite3.Connection, run_id: str) -> dict[str, set[str]] | None:
@@ -110,23 +159,15 @@ def _freshness(
     return True, STALE_CHANGED
 
 
-def _combine(a: bool | None, b: bool | None) -> bool | None:
-    """One answer from the two sides of a diff.
-
-    Either side having moved makes the whole diff a statement about a build that is gone. A side
-    that could not be checked does NOT make it stale — it makes it unverified, which is a third
-    answer and is reported as one rather than rounded toward either."""
-    if a or b:
-        return True
-    return None if (a is None or b is None) else False
-
-
 class _GenerationCache:
     """One lookup per run, reused across the rows of a listing."""
 
     def __init__(self, atlas: sqlite3.Connection) -> None:
         self._atlas = atlas
         self._by_run: dict[str, dict[str, set[str]] | None] = {}
+        self._extraction: dict[str, dict[str, tuple[str | None, str | None]] | None] = {}
+        self._marks: dict[str, tuple[str | None, int | None, int] | None] = {}
+        self._digests: dict[tuple[str, str | None, str | None], str] = {}
 
     def for_run(self, run_id: str | None) -> dict[str, set[str]] | None:
         if not run_id:
@@ -134,6 +175,125 @@ class _GenerationCache:
         if run_id not in self._by_run:
             self._by_run[run_id] = _current_generation(self._atlas, run_id)
         return self._by_run[run_id]
+
+    def extraction(self, run_id: str) -> dict[str, tuple[str | None, str | None]] | None:
+        """``{sha256 -> (pass_version, ghidra_version)}`` of the run's analysis.db, or None."""
+        if run_id not in self._extraction:
+            row = self._atlas.execute(
+                "SELECT analysis_db_path FROM run WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            self._extraction[run_id] = read_extraction(row[0] if row is not None else None)
+        return self._extraction[run_id]
+
+    def hunt_marks(self, run_id: str) -> tuple[str | None, int | None, int] | None:
+        """``(scanned_at, hunt_instances, live instance rows)`` of a run; None when it is gone."""
+        if run_id not in self._marks:
+            marks = run_hunt_marks(self._atlas, run_id)
+            live = self._atlas.execute(
+                "SELECT COUNT(*) FROM instance WHERE source_run_id = ?", (run_id,)
+            ).fetchone()[0]
+            self._marks[run_id] = None if marks is None else (marks[0], marks[1], live)
+        return self._marks[run_id]
+
+    def hunt_digest(self, run_id: str, sha: str | None, binary: str | None) -> str:
+        key = (run_id, sha, binary)
+        if key not in self._digests:
+            self._digests[key] = hunt_inputs_digest(self._atlas, run_id, sha, binary)
+        return self._digests[key]
+
+
+def _side_reasons(cache: _GenerationCache, meta: Any, side: str) -> set[str]:
+    """Every staleness reason one side of a diff shows, except the hunt-input one (which costs a
+    query and is only looked for when nothing ranked above it was found — see diff_staleness)."""
+    run_id = meta[f"run_{side}_id"]
+    sha = meta[f"sha256_{side}"]
+    reasons: set[str] = set()
+    _, sha_reason = _freshness(cache.for_run(run_id), meta["binary_a"], sha)
+    if sha_reason is not None:
+        reasons.add(sha_reason)
+    if meta["diff_code_version"] is None:
+        # Written before the input stamps were recorded: nothing to compare them with.
+        reasons.add(STALE_NO_STAMP)
+        return reasons
+    ext = cache.extraction(run_id) if run_id else None
+    if ext is None:
+        reasons.add(STALE_UNKNOWN)
+    elif sha in ext:  # a sha no longer present is already reported above as absent/changed
+        pv, gv = ext[sha]
+        if pv != meta[f"extraction_pass_{side}"]:
+            reasons.add(STALE_EXTRACTION)
+        if gv != meta[f"ghidra_version_{side}"]:
+            reasons.add(STALE_GHIDRA)
+    return reasons
+
+
+def _hunt_inputs_changed(cache: _GenerationCache, meta: Any, side: str) -> bool | None:
+    """Whether the hunt output this side of the diff read has changed; None when the run is gone.
+
+    ★ Fast path: the tables the digest covers are only ever written inside a hunt, and a hunt
+    rewrites run.scanned_at before touching them and run.hunt_instances after. When both still equal
+    what the diff recorded — and the run still holds exactly that many candidate rows, so none were
+    added or removed outside a hunt — no hunt has run since, and the digest is not recomputed.
+    Anything differing (or unrecorded) means it is recomputed and compared, so a hunt that
+    reproduced the same output leaves the diff current. BOUNDARY: a row edited in place outside a
+    hunt keeps the fast path; the full diff's own re-diff decision never takes it (it always
+    recomputes the digest)."""
+    run_id = meta[f"run_{side}_id"]
+    marks = cache.hunt_marks(run_id) if run_id else None
+    if marks is None:
+        return None
+    scanned_at, instances, live = marks
+    stored_at, stored_n = meta[f"scanned_at_{side}"], meta[f"hunt_instances_{side}"]
+    unchanged = (scanned_at, instances, live) == (stored_at, stored_n, stored_n)
+    if stored_at is not None and stored_n is not None and unchanged:
+        return False
+    digest = cache.hunt_digest(run_id, meta[f"sha256_{side}"], meta[f"binary_{side}"])
+    return bool(digest != meta[f"hunt_inputs_hash_{side}"])
+
+
+def diff_staleness(cache: _GenerationCache, meta: Any) -> tuple[bool | None, str | None]:
+    """(source_stale, source_stale_reason) for one diff_meta row carrying ``_STAMP_COLS``.
+
+    Each side is judged on every axis — its bytes, its extraction, the hunt output the diff read —
+    plus the diff code version, and the highest-ranked reason found on either side is reported
+    (``_REASON_RANK``). ``source_stale`` is true for a reason that means the diff no longer
+    describes its inputs, null for one that means it could not be checked (no stamp, or the source
+    unreadable), and false only when every axis was checked and matched."""
+    reasons = _side_reasons(cache, meta, "a") | _side_reasons(cache, meta, "b")
+    if meta["diff_code_version"] is not None and meta["diff_code_version"] != DIFF_CODE_VERSION:
+        reasons.add(STALE_DIFF_LOGIC)
+    rank = {r: i for i, r in enumerate(_REASON_RANK)}
+    higher = [r for r in reasons if rank[r] < rank[STALE_HUNT_INPUTS]]
+    if meta["diff_code_version"] is not None and not higher:
+        for side in ("a", "b"):
+            if _hunt_inputs_changed(cache, meta, side):
+                reasons.add(STALE_HUNT_INPUTS)
+                break
+    if not reasons:
+        return False, None
+    best = min(reasons, key=rank.__getitem__)
+    return (True if best in _STALE_REASONS else None), best
+
+
+def _meta_stamps(atlas: sqlite3.Connection, diff_id: str) -> Any:
+    """The diff_meta row's ``_STAMP_COLS`` as a mapping, or None when there is no such diff."""
+    row = atlas.execute(
+        f"SELECT {', '.join(_STAMP_COLS)} FROM diff_meta WHERE diff_id = ?",  # noqa: S608
+        (diff_id,),
+    ).fetchone()
+    return dict(zip(_STAMP_COLS, row, strict=True)) if row is not None else None
+
+
+def diff_source_staleness(
+    atlas: sqlite3.Connection, diff_id: str, cache: _GenerationCache | None = None
+) -> dict[str, Any]:
+    """``{"source_stale", "source_stale_reason"}`` for one diff, for every diff read surface. A
+    diff_id with no diff_meta row cannot be checked: null with ``source_unavailable``."""
+    meta = _meta_stamps(atlas, diff_id)
+    if meta is None:
+        return {"source_stale": None, "source_stale_reason": STALE_UNKNOWN}
+    stale, reason = diff_staleness(cache or _GenerationCache(atlas), meta)
+    return {"source_stale": stale, "source_stale_reason": reason}
 
 
 def _is_whole_run_row(diff_id: str, run_a_id: str, run_b_id: str) -> bool:
@@ -148,6 +308,32 @@ def _is_whole_run_row(diff_id: str, run_a_id: str, run_b_id: str) -> bool:
     take it out along with the leftover, hiding a binary that could not be diffed behind the same
     silence as one that was never meant to be listed."""
     return diff_id == f"{run_a_id}::{run_b_id}"
+
+
+def diffs_source_staleness(
+    atlas: sqlite3.Connection, diff_ids: Iterable[str]
+) -> dict[str, dict[str, Any]]:
+    """``diff_source_staleness`` for several diffs, sharing one lookup per run."""
+    cache = _GenerationCache(atlas)
+    return {d: diff_source_staleness(atlas, d, cache) for d in sorted(set(diff_ids))}
+
+
+def staleness_summary(by_diff: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Counts over ``diffs_source_staleness``: how many diffs are stale (true), unverified (null)
+    and current (false), and how many carry each reason."""
+    by_reason: dict[str, int] = {}
+    for v in by_diff.values():
+        reason = v["source_stale_reason"]
+        if reason is not None:
+            by_reason[reason] = by_reason.get(reason, 0) + 1
+    flags = [v["source_stale"] for v in by_diff.values()]
+    return {
+        "diffs": len(flags),
+        "stale": sum(1 for f in flags if f is True),
+        "unverified": sum(1 for f in flags if f is None),
+        "current": sum(1 for f in flags if f is False),
+        "by_reason": dict(sorted(by_reason.items())),
+    }
 
 
 def _row_to_pair(r: sqlite3.Row) -> dict[str, Any]:
@@ -179,6 +365,7 @@ def _align_by_side(atlas: sqlite3.Connection, diff_id: str, addr: str, side: str
             "found": False,
             "diff_id": diff_id,
             "query": {"side": side, "addr": norm},
+            **diff_source_staleness(atlas, diff_id),
             "note": (
                 "no matched pair for this address in this diff. That is NOT proof the function was "
                 "added/removed -- an unmatched function is listed in function_presence, and a diff "
@@ -190,6 +377,7 @@ def _align_by_side(atlas: sqlite3.Connection, diff_id: str, addr: str, side: str
         "diff_id": diff_id,
         "query": {"side": side, "addr": norm},
         "pairs": [_row_to_pair(r) for r in rows],
+        **diff_source_staleness(atlas, diff_id),
         "note": _ALIGN_NOTE,
     }
 
@@ -222,7 +410,9 @@ _META_NOTE = (
     "ghidra_version means that side did not record one. unmatched_b = B-side functions with no "
     "A-side match (presence layer, the WEAKEST signal -- look at layer_changed, not this). "
     "diff_ok=0 means this binary did NOT diff (diff_status='failed', diff_status_reason = why): an "
-    "empty get_diff_deltas for it is a BLIND SPOT, not 'no change'. diff_ok=1 = usable output."
+    "empty get_diff_deltas for it is a BLIND SPOT, not 'no change'. diff_ok=1 = usable output. "
+    "baseline_dropped=1 = a failed re-diff replaced a good diff and its stored candidate baseline. "
+    "ghidra_version is the diffed binary's own (the run's on a diff written before the stamps)."
 )
 
 _CAP_NOTE = (
@@ -279,6 +469,7 @@ _META_COLS = (
     "diff_status",
     "diff_status_reason",
     "diff_attempts",
+    "baseline_dropped",
 )
 
 
@@ -300,10 +491,6 @@ def get_diff_deltas(
     a prefix collides. verbose=false (default) returns only the delta rows + paging (context is a
     budget); verbose=true adds the honesty note + legend. The honesty invariants live in the tool
     docstring and always apply -- an empty result is NOT proof of 'no changes'."""
-    meta = atlas.execute(
-        "SELECT run_a_id, run_b_id, binary_a, sha256_a, sha256_b FROM diff_meta WHERE diff_id = ?",
-        (diff_id,),
-    ).fetchone()
     # The sink overlay writes subject_kind='candidate' rows into the same table; they are the
     # dedicated get_diff_sink_overlay tool's domain and must never leak into this edge/dimension
     # view.
@@ -332,28 +519,16 @@ def get_diff_deltas(
     ).fetchall()
     deltas = [dict(zip(_DELTA_COLS, r, strict=True)) for r in rows]
     hi = lo + len(deltas)
-    cache = _GenerationCache(atlas)
-    stale_a, reason_a = (
-        _freshness(cache.for_run(meta["run_a_id"]), meta["binary_a"], meta["sha256_a"])
-        if meta is not None
-        else (None, STALE_UNKNOWN)
-    )
-    stale_b, reason_b = (
-        _freshness(cache.for_run(meta["run_b_id"]), meta["binary_a"], meta["sha256_b"])
-        if meta is not None
-        else (None, STALE_UNKNOWN)
-    )
     result: dict[str, Any] = {
         "diff_id": diff_id,
         "filters": {"binary": binary, "dimension": dimension, "delta_kind": delta_kind},
         "deltas": deltas,
-        # ★ Whether these deltas still describe builds that exist. Attached to EVERY response, not
-        # only the verbose one: a reader who trimmed the notes to save room is exactly the reader
-        # who would otherwise act on a diff of a build that is gone. It is ORTHOGONAL to
-        # diff_status — a diff can have computed perfectly and still be about a file that has since
-        # been replaced — so it is reported separately and never folded into that field.
-        "source_stale": _combine(stale_a, stale_b),
-        "source_stale_reason": reason_a or reason_b,
+        # ★ Whether these deltas still describe their inputs. Attached to EVERY response, not only
+        # the verbose one: a reader who trimmed the notes to save room is exactly the reader who
+        # would otherwise act on a diff of a build that is gone. It is ORTHOGONAL to diff_status —
+        # a diff can have computed perfectly and still be about a file that has since been
+        # replaced — so it is reported separately and never folded into that field.
+        **diff_source_staleness(atlas, diff_id),
         "page": {
             "count": total,
             "returned": len(deltas),
@@ -397,6 +572,7 @@ def get_diff_meta(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any]:
         "found": True,
         "diff_id": diff_id,
         "meta": dict(zip(_META_COLS, row, strict=True)),
+        **diff_source_staleness(atlas, diff_id),
         "note": _META_NOTE,
     }
 
@@ -414,6 +590,7 @@ def get_diff_capabilities(atlas: sqlite3.Connection, diff_id: str) -> dict[str, 
     return {
         "diff_id": diff_id,
         "capabilities": [dict(zip(cols, r, strict=True)) for r in rows],
+        **diff_source_staleness(atlas, diff_id),
         "note": _CAP_NOTE,
     }
 
@@ -426,14 +603,16 @@ _LIST_DIFFS_NOTE = (
     "BLIND SPOTS (diff_status='failed', diff_status_reason = why, diff_attempts = tries): the "
     "binary did not diff, so its zero counts are 'unknown', never 'no change' — "
     "list_diff_blindspots focuses just those. Pick a binary, then read get_diff_deltas / meta. "
-    "★ source_stale says whether the diff still describes builds that exist: true = a side's "
-    "binary content changed (or that binary is gone from the scan), so the alignment underneath "
-    "points at a file that no longer exists — re-run the diff before reading its deltas as "
-    "current. false = the diffed files are still there byte for byte, which is the normal result "
-    "of re-scanning unchanged sources. null = could not be checked (source analysis.db "
-    "unreachable, or the diff predates the content stamp) — read source_stale_reason; it is NOT a "
-    "clean bill. Judged on CONTENT, never on which happened later: re-scanning identical sources "
-    "leaves every diff valid."
+    "★ source_stale says whether the diff still describes what it was computed from: true = a "
+    "side's binary content changed or is gone (source_content_changed / source_binary_absent), "
+    "the diff code changed (diff_logic_changed), the binary was re-extracted "
+    "(extraction_changed / ghidra_changed), or the hunt output the diff read changed "
+    "(hunt_inputs_changed) — re-run the diff before reading its deltas as current. false = every "
+    "input was checked and still matches, the normal result of re-scanning or re-hunting without "
+    "a change. null = could not be checked (source analysis.db unreachable, or the diff predates "
+    "the stamps: generation_unstamped) — read source_stale_reason; it is NOT a clean bill. When "
+    "several apply, the first in the order above is reported. Judged on CONTENT, never on which "
+    "happened later."
 )
 
 _LIST_DIFFS_COLS = (
@@ -477,7 +656,8 @@ def list_diffs(
         "SUM(CASE WHEN dd.delta_kind='layer_changed' THEN 1 ELSE 0 END), "
         "SUM(CASE WHEN dd.delta_kind='layer_unchanged' THEN 1 ELSE 0 END), "
         "SUM(CASE WHEN dd.delta_kind='delta_undetermined' THEN 1 ELSE 0 END), "
-        "dm.sha256_a, dm.sha256_b "
+        + ", ".join(f"dm.{c}" for c in _STAMP_COLS)
+        + " "
         # Edge deltas only: the candidate overlay's rows share the table. The scope sits in the ON
         # clause, not WHERE, so a diff with no edge rows still lists (with zero counts).
         "FROM diff_meta dm LEFT JOIN dimension_delta dd ON dd.diff_id = dm.diff_id "
@@ -491,13 +671,11 @@ def list_diffs(
         row = dict(zip(_LIST_DIFFS_COLS, r[: len(_LIST_DIFFS_COLS)], strict=True))
         if _is_whole_run_row(row["diff_id"], row["run_a_id"], row["run_b_id"]):
             continue  # a leftover run-pair row: it describes no binary, so it answers nothing
-        stale_a, reason_a = _freshness(cache.for_run(row["run_a_id"]), row["binary"], r[13])
-        stale_b, reason_b = _freshness(cache.for_run(row["run_b_id"]), row["binary"], r[14])
-        # ★ Either side moving makes the diff a statement about a build that is gone. An
+        meta = dict(zip(_STAMP_COLS, r[len(_LIST_DIFFS_COLS) :], strict=True))
+        # ★ Either side moving makes the diff a statement about inputs that are gone. An
         # unanswerable side does not make it stale — it makes it unverified, which is said out loud
         # rather than rounded to either answer.
-        row["source_stale"] = _combine(stale_a, stale_b)
-        row["source_stale_reason"] = reason_a or reason_b
+        row["source_stale"], row["source_stale_reason"] = diff_staleness(cache, meta)
         diffs.append(row)
     return {
         "diffs": diffs,
@@ -514,8 +692,11 @@ _BLINDSPOT_NOTE = (
     "(diff_attempts), and whether it has hit the retry cap (suspected_hard=1 -> a likely-"
     "deterministic toolchain boundary, skipped on later full diffs unless force_retry; 0 -> a "
     "likely-transient failure that the next full diff retries). suspected_hard is a HINT from "
-    "repeated identical-content failures, never proof the binary is undiffable — its content "
-    "changing resets the count."
+    "repeated identical-content failures, never proof the binary is undiffable — its content, or "
+    "what the diff reads (extraction, hunt output, diff code), changing resets the count. "
+    "diff_status_reason='extraction_unstamped' = the binary has no recorded extraction (re-scan "
+    "the run). baseline_dropped=1 = this failure replaced a good diff and its stored candidate "
+    "baseline. source_stale / source_stale_reason as in list_diffs."
 )
 
 
@@ -545,20 +726,28 @@ def list_diff_blindspots(
         params.append(run_b_id)
     clause = " AND ".join(where)
     rows = atlas.execute(
-        "SELECT diff_id, binary_a, diff_status_reason, diff_attempts "  # noqa: S608 -- clause literal
-        f"FROM diff_meta WHERE {clause} ORDER BY run_a_id, run_b_id, binary_a",
+        "SELECT diff_id, binary_a, diff_status_reason, diff_attempts, baseline_dropped, "  # noqa: S608
+        + ", ".join(_STAMP_COLS)
+        + f" FROM diff_meta WHERE {clause} ORDER BY run_a_id, run_b_id, binary_a",
         params,
     ).fetchall()
-    blindspots = [
-        {
-            "diff_id": r[0],
-            "binary": r[1],
-            "diff_status_reason": r[2],
-            "diff_attempts": r[3],
-            "suspected_hard": 1 if (r[3] or 0) >= retry_limit else 0,
-        }
-        for r in rows
-    ]
+    cache = _GenerationCache(atlas)
+    blindspots = []
+    for r in rows:
+        stale, reason = diff_staleness(cache, dict(zip(_STAMP_COLS, r[5:], strict=True)))
+        blindspots.append(
+            {
+                "diff_id": r[0],
+                "binary": r[1],
+                "diff_status_reason": r[2],
+                "diff_attempts": r[3],
+                "suspected_hard": 1 if (r[3] or 0) >= retry_limit else 0,
+                # 1 = this failure replaced a good diff and its stored candidate baseline with it
+                "baseline_dropped": r[4] or 0,
+                "source_stale": stale,
+                "source_stale_reason": reason,
+            }
+        )
     return {
         "blindspots": blindspots,
         "count": len(blindspots),

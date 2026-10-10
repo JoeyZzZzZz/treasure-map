@@ -375,7 +375,7 @@ def _diff_fixture(tmp_path: Path) -> sqlite3.Connection:
             atlas, run, analysis_db_path=str(tmp_path / f"{side}.db"), tool_version="0.0.1",
             ghidra_version="11.4.3",
         )  # fmt: skip
-    atlas.execute("UPDATE run SET build_hash = 'pv1'")
+    atlas.execute("UPDATE run SET build_hash = 'pv1', hunt_commit = 'facefeed'")
     atlas.execute(
         "INSERT INTO pattern (source_class, sink_class, call_sequence_shape, "
         "structural_fingerprint, fingerprint_algo_version) VALUES "
@@ -402,6 +402,10 @@ def _run_diff(atlas: sqlite3.Connection, tmp_path: Path, monkeypatch, exports: b
             )
 
     monkeypatch.setattr(driver, "_check_toolchain", lambda config: None)
+    # the fixture runs were extracted by pipeline pv1 and hunted by commit facefeed; make those the
+    # running ones, so both runs are confirmed current
+    monkeypatch.setattr(driver, "_current_pass_version", lambda: "pv1")
+    monkeypatch.setattr(driver, "_installed_commit", lambda: "facefeed")
     monkeypatch.setattr(
         driver, "_run_binexport", lambda so, cfg, out, side, t: tmp_path / f"{side}.BinExport"
     )

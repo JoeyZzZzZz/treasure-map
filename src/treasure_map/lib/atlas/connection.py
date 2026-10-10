@@ -220,6 +220,23 @@ def _migrate(conn: sqlite3.Connection) -> None:
     ):
         if dm_cols and _dmcol not in dm_cols:
             conn.execute(f"ALTER TABLE diff_meta ADD COLUMN {_dmcol} TEXT")  # noqa: S608
+    # diff_meta input stamps (per side + the diff code version) and the dropped-baseline marker.
+    # No index references them; existing rows carry NULL (unverified) / 0 until re-diffed.
+    # Idempotent.
+    for _dmcol, _dmtype in (
+        ("extraction_pass_a", "TEXT"),
+        ("extraction_pass_b", "TEXT"),
+        ("hunt_inputs_hash_a", "TEXT"),
+        ("hunt_inputs_hash_b", "TEXT"),
+        ("scanned_at_a", "TEXT"),
+        ("scanned_at_b", "TEXT"),
+        ("hunt_instances_a", "INTEGER"),
+        ("hunt_instances_b", "INTEGER"),
+        ("diff_code_version", "TEXT"),
+        ("baseline_dropped", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if dm_cols and _dmcol not in dm_cols:
+            conn.execute(f"ALTER TABLE diff_meta ADD COLUMN {_dmcol} {_dmtype}")  # noqa: S608
 
     # instruction_match.facts_a/b: the call-site facts at each side's matched address (JSON).
     # Nullable TEXT, no index references them; existing rows carry NULL. Idempotent.
