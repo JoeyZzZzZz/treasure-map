@@ -234,15 +234,15 @@ def _record_diff_failure(
     (lib/diff/currency) the attempt was made against, so the next attempt at the same inputs
     continues the count instead of restarting it.
 
-    ★ The replaced row may be a GOOD diff (a re-diff of unchanged content that was triggered by its
-    stamps, or a single-binary re-run). If it had a stored candidate baseline, that baseline goes
-    with it; the failed row then says so (``baseline_dropped=1``) rather than leaving the loss
-    silent, and keeps saying so through further failures at the same content."""
+    ★ The replaced row may be a GOOD diff (a re-diff triggered by its stamps or by changed content,
+    or a single-binary re-run). If it had a stored candidate baseline, that baseline goes with it;
+    the failed row then says so (``baseline_dropped=1``) rather than leaving the loss silent, and
+    keeps saying so through further failures until a successful re-diff stores it again."""
     atlas.rollback()  # ① drop layer-0's uncommitted diff_meta/alignment residue, if any
     sha_a, sha_b = _current_shas(atlas, run_a_id, run_b_id, binary_short)
     stamps = _failure_stamps(atlas, run_a_id, run_b_id, binary_short, sha_a, sha_b)
     attempts = _next_attempts(atlas, diff_id, sha_a, sha_b, stamps)  # read prior BEFORE delete
-    dropped = _baseline_dropped_by_replacing(atlas, diff_id, sha_a, sha_b)  # ditto
+    dropped = _baseline_dropped_by_replacing(atlas, diff_id)  # ditto
     reason = _classify_failure_reason(exc)
     delete_diff(atlas, diff_id, commit=False)  # ② clear any prior failed row -> no PK conflict
     add_diff_meta(
@@ -290,22 +290,17 @@ def _has_candidate_baseline(atlas: sqlite3.Connection, diff_id: str) -> bool:
     )
 
 
-def _baseline_dropped_by_replacing(
-    atlas: sqlite3.Connection, diff_id: str, sha_a: str | None, sha_b: str | None
-) -> int:
-    """1 when replacing this diff's current row with a failed one loses a candidate baseline that
-    was still about this content: the row is a good diff with a stored baseline, or a failed row
-    already marked as having lost one. Only at the SAME content (both sha256 known and equal): a
-    baseline of content that has since changed described something that is gone anyway."""
+def _baseline_dropped_by_replacing(atlas: sqlite3.Connection, diff_id: str) -> int:
+    """1 when replacing this diff's current row with a failed one loses a candidate baseline: the
+    row has a stored baseline, or is already marked as having lost one. Whatever the content: a
+    successful re-diff stores the baseline again whether or not the content changed, so a failure
+    in between must not decide whether it comes back."""
     row = atlas.execute(
-        "SELECT diff_ok, sha256_a, sha256_b, baseline_dropped FROM diff_meta WHERE diff_id = ?",
-        (diff_id,),
+        "SELECT baseline_dropped FROM diff_meta WHERE diff_id = ?", (diff_id,)
     ).fetchone()
-    if row is None or sha_a is None or sha_b is None or (row[1], row[2]) != (sha_a, sha_b):
+    if row is None:
         return 0
-    if row[3]:
-        return 1
-    return 1 if row[0] == 1 and _has_candidate_baseline(atlas, diff_id) else 0
+    return 1 if row[0] or _has_candidate_baseline(atlas, diff_id) else 0
 
 
 def _failure_stamps(
@@ -867,7 +862,8 @@ def _persist_success(
     The re-diff replaces the diff's rows, a stored candidate baseline included. When the diff had
     one (or its row says a failed attempt dropped one), it is stored again for the new rows once
     they are committed. A refusal to store it (lib/query/sink_overlay's own gates) does not fail
-    the diff: it is reported in the warnings."""
+    the diff: it is reported in the warnings, and the new row is marked ``baseline_dropped=1`` so
+    the loss stays visible and the next re-diff (or a direct store) puts it back."""
     try:
         if not atlas.in_transaction:
             atlas.execute("BEGIN IMMEDIATE")
@@ -930,6 +926,10 @@ def _persist_success(
             baseline = "restored"
         except TreasureMapError as exc:
             atlas.rollback()
+            # The new rows are committed without the baseline: say so on the row, so the loss is
+            # not read as "never had one" and the next re-diff stores it again.
+            atlas.execute("UPDATE diff_meta SET baseline_dropped = 1 WHERE diff_id = ?", (diff_id,))
+            atlas.commit()
             baseline = "not_restored"
             warnings = (
                 *warnings,
@@ -1368,23 +1368,19 @@ def run_full_diff(
     (layer0/layer2 or the atomic failure write) — SQLite is written by one thread only, so no WAL /
     multi-connection complexity, and each binary stays its own independent atomic transaction.
 
-    The run-pair-global preconditions (version skew, the runs' currency — check_run_pair_currency —
-    and the toolchain) are checked ONCE up front so a global problem fails fast; a PER-binary
-    failure is recorded as an atomic blind-spot row and the sweep CONTINUES. ``assume_current``
-    keeps diffs whose recorded input stamps differ from now (see plan_full_diff); it does not
-    relax the currency refusals. The full sweep runs unconfirmed (it is the normal usage) —
-    ``on_start(n)`` is notified with the count before work begins; ``on_outcome`` reports each
-    binary as it finishes (in completion order). Ctrl-C stops SCHEDULING further binaries and
-    returns ``cancelled=True`` with the completed ones intact; see the interrupt handler for the
-    honest 'in-flight JVM' bound."""
-    plan = plan_full_diff(
-        atlas, run_a_id, run_b_id, retry_limit=retry_limit, assume_current=assume_current
-    )
-    to_run = plan.binaries_to_run(force_retry=force_retry)
-    if not to_run:
-        # nothing NEEDS diffing: no changed binaries, or all already-ok / suspected-hard (skipped).
-        return FullDiffSummary(plan, (), cancelled=False, retry_limit=retry_limit)
-    # run-pair-global preflight, once (same for every binary):
+    The run-pair-global preconditions are checked ONCE up front so a global problem fails fast:
+    version skew and the runs' currency (check_run_pair_currency) before the plan, so a pair whose
+    binaries are all already diffed is refused just the same; the toolchain before any work. A
+    PER-binary failure is recorded as an atomic blind-spot row and the sweep CONTINUES.
+    ``assume_current`` keeps diffs whose recorded input stamps differ from now (see
+    plan_full_diff); it does not relax the currency refusals. The full sweep runs unconfirmed (it
+    is the normal usage) — ``on_start(n)`` is notified with the count before work begins;
+    ``on_outcome`` reports each binary as it finishes (in completion order). Ctrl-C stops
+    SCHEDULING further binaries and returns ``cancelled=True`` with the completed ones intact; see
+    the interrupt handler for the honest 'in-flight JVM' bound."""
+    # run-pair-global preflight, once (same for every binary), before the plan: a pair the diff
+    # would refuse is refused even when every binary is already diffed, so "nothing to diff" never
+    # reads as an answer the read side would not give.
     run_a = _resolve_run(atlas, run_a_id, "a")
     run_b = _resolve_run(atlas, run_b_id, "b")
     if _version_skew(run_a, run_b) and not force:
@@ -1394,6 +1390,15 @@ def run_full_diff(
             "same toolchain, or pass --force to diff anyway (the result stays honestly degraded)."
         )
     warnings = check_run_pair_currency(run_a, run_b)
+    plan = plan_full_diff(
+        atlas, run_a_id, run_b_id, retry_limit=retry_limit, assume_current=assume_current
+    )
+    to_run = plan.binaries_to_run(force_retry=force_retry)
+    if not to_run:
+        # nothing NEEDS diffing: no changed binaries, or all already-ok / suspected-hard (skipped).
+        return FullDiffSummary(
+            plan, (), cancelled=False, retry_limit=retry_limit, warnings=warnings
+        )
     _check_toolchain(config)
     # notify the caller of the sweep size (no confirmation gate — a full diff is normal use)
     on_start(len(to_run))

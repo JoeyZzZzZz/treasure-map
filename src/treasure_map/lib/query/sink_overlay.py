@@ -1541,7 +1541,8 @@ def persist_sink_overlay(atlas: sqlite3.Connection, diff_id: str, *, commit: boo
 
     Writes the diff layer: run it only after the runs are re-hunted and the diff re-run. The read
     API (get_diff_sink_overlay) computes live and does NOT need this. Re-run it after every re-run
-    of this diff: the diff re-run deletes these rows with the rest of the diff."""
+    of this diff: the diff re-run deletes these rows with the rest of the diff. Storing it clears
+    the diff's ``baseline_dropped`` mark."""
     from treasure_map.lib.atlas.models import DimensionDeltaRow
     from treasure_map.lib.atlas.writer import add_dimension_deltas, delete_dimension_delta
 
@@ -1608,6 +1609,8 @@ def persist_sink_overlay(atlas: sqlite3.Connection, diff_id: str, *, commit: boo
         raise SinkOverlayBaselineError(f"overlay for {diff_id!r} has duplicate subject keys")
     delete_dimension_delta(atlas, diff_id, subject_kind="candidate", commit=False)
     add_dimension_deltas(atlas, dd_rows, commit=False)
+    # A diff marked as having lost its baseline has one again.
+    atlas.execute("UPDATE diff_meta SET baseline_dropped = 0 WHERE diff_id = ?", (diff_id,))
     if commit:
         atlas.commit()
     return len(dd_rows)

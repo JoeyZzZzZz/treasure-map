@@ -65,10 +65,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     by name: `callee_unreadable`.
   - Baselines are stamped with overlay logic version 4. The diffs must be re-run for the call-site
     facts to be recorded; until then those rows read `counterpart_call_facts_absent`.
+- **A stored diff is re-run when anything it was computed from changes, and every diff reader says
+  whether it is still current.** Each diff now records, per side, the diffed binary's extraction
+  pass and Ghidra version, a digest of the hunt output it read (candidate callsites, string-keyed
+  edges, run capabilities, the run's tool and Ghidra versions) and the run's `scanned_at` /
+  `hunt_instances`, plus the version of the diff code. The new `diff_meta` columns are added
+  automatically when an older atlas is opened.
+  - A full `tmap diff` re-diffs a binary whose recorded inputs differ from the current ones, as it
+    does for changed content. A failed binary's attempt count continues only while its content and
+    every recorded input are unchanged.
+  - New `tmap diff --assume-current` (full diff only): keep the existing diffs whose recorded
+    inputs differ, instead of re-diffing them. It does not lift the refusals below.
+  - `list_diffs`, `list_diff_blindspots`, `get_diff_meta`, `get_diff_deltas`,
+    `get_diff_capabilities`, `get_function_alignment` and `get_diff_sink_overlay` carry
+    `source_stale` / `source_stale_reason`, with four new reasons: `diff_logic_changed`,
+    `extraction_changed`, `ghidra_changed` and `hunt_inputs_changed`. When several apply, the first
+    of `source_binary_absent`, `source_content_changed`, `diff_logic_changed`, `extraction_changed`,
+    `ghidra_changed`, `hunt_inputs_changed`, `generation_unstamped`, `source_unavailable` is
+    reported. A diff stored before this change reads `generation_unstamped` (`source_stale: null`,
+    not checked). In run-pair mode `get_diff_sink_overlay` marks each row by its own diff and adds
+    `diff_staleness` counts.
+  - `tmap diff` (full and `--binary`) refuses a run pair when either run is proven to have been
+    hunted by other code than is installed, or its analysis.db now holds another extraction than the
+    one it was hunted from. What cannot be confirmed either way is a warning. The check runs even
+    when nothing is left to diff.
+  - A binary with no recorded extraction pass is recorded as a blind spot with reason
+    `extraction_unstamped`.
+  - A re-diff stores the diff's candidate baseline again. When the re-diff fails, or the baseline
+    cannot be stored again, the diff's row says `baseline_dropped: 1` (in `list_diffs`,
+    `get_diff_meta` and `list_diff_blindspots`) until a later re-diff or a direct store puts it
+    back.
+  - **After upgrading:** re-hunt every run first, because until then both `tmap diff` and the MCP
+    readers refuse runs hunted by the earlier build. Then run one full diff per run pair: every diff
+    stored before this change is re-run once.
 - **Known gap:** the diff readers (`get_diff_deltas`, `get_diff_meta`, `get_function_alignment`,
   `get_diff_sink_overlay`) are MCP-only; there is no CLI for them yet.
 
 ### Changed
+
+- **Reading the stored overlay baseline of a diff that has none says so.**
+  `read_sink_overlay_baseline` now returns `baseline_absent: true`, `stale_baseline: null` and
+  `rows: null` for such a diff, instead of `stale_baseline: false` with an empty row list, which
+  read like a current, empty baseline. Its other answers gain `baseline_absent: false`.
 
 - **Wrapper-forwarded candidates are split per call.** A function that reaches a sink through a
   thin wrapper used to yield one candidate per axis, for the first wrapper by name, read from its

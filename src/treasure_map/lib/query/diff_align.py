@@ -208,7 +208,7 @@ def _side_reasons(cache: _GenerationCache, meta: Any, side: str) -> set[str]:
     run_id = meta[f"run_{side}_id"]
     sha = meta[f"sha256_{side}"]
     reasons: set[str] = set()
-    _, sha_reason = _freshness(cache.for_run(run_id), meta["binary_a"], sha)
+    _, sha_reason = _freshness(cache.for_run(run_id), meta[f"binary_{side}"], sha)
     if sha_reason is not None:
         reasons.add(sha_reason)
     if meta["diff_code_version"] is None:
@@ -235,9 +235,14 @@ def _hunt_inputs_changed(cache: _GenerationCache, meta: Any, side: str) -> bool 
     what the diff recorded — and the run still holds exactly that many candidate rows, so none were
     added or removed outside a hunt — no hunt has run since, and the digest is not recomputed.
     Anything differing (or unrecorded) means it is recomputed and compared, so a hunt that
-    reproduced the same output leaves the diff current. BOUNDARY: a row edited in place outside a
-    hunt keeps the fast path; the full diff's own re-diff decision never takes it (it always
-    recomputes the digest)."""
+    reproduced the same output leaves the diff current.
+
+    BOUNDARY: the guard holds only for writes made by a hunt. Rows of the tables the digest covers
+    (the candidate instances, string_keyed_edge, run_capability, the run row's tool and Ghidra
+    versions) added, removed or edited outside a hunt keep the fast path, and the diff reads as
+    current. The one exception is a change to the run's total number of instance rows, which the
+    live count sees. The full diff's own re-diff decision never takes the fast path: it always
+    recomputes the digest."""
     run_id = meta[f"run_{side}_id"]
     marks = cache.hunt_marks(run_id) if run_id else None
     if marks is None:
@@ -411,7 +416,8 @@ _META_NOTE = (
     "A-side match (presence layer, the WEAKEST signal -- look at layer_changed, not this). "
     "diff_ok=0 means this binary did NOT diff (diff_status='failed', diff_status_reason = why): an "
     "empty get_diff_deltas for it is a BLIND SPOT, not 'no change'. diff_ok=1 = usable output. "
-    "baseline_dropped=1 = a failed re-diff replaced a good diff and its stored candidate baseline. "
+    "baseline_dropped=1 = the diff had a stored candidate baseline that a re-diff dropped (it "
+    "failed, or the baseline could not be stored again). "
     "ghidra_version is the diffed binary's own (the run's on a diff written before the stamps)."
 )
 
@@ -602,7 +608,9 @@ _LIST_DIFFS_NOTE = (
     "means no diff has been run for that filter yet — not 'nothing changed'. diff_ok=0 rows are "
     "BLIND SPOTS (diff_status='failed', diff_status_reason = why, diff_attempts = tries): the "
     "binary did not diff, so its zero counts are 'unknown', never 'no change' — "
-    "list_diff_blindspots focuses just those. Pick a binary, then read get_diff_deltas / meta. "
+    "list_diff_blindspots focuses just those. baseline_dropped=1 = the diff had a stored candidate "
+    "baseline that a re-diff dropped (it failed, or the baseline could not be stored again). Pick "
+    "a binary, then read get_diff_deltas / meta. "
     "★ source_stale says whether the diff still describes what it was computed from: true = a "
     "side's binary content changed or is gone (source_content_changed / source_binary_absent), "
     "the diff code changed (diff_logic_changed), the binary was re-extracted "
@@ -629,6 +637,7 @@ _LIST_DIFFS_COLS = (
     "layer_changed",
     "layer_unchanged",
     "delta_undetermined",
+    "baseline_dropped",
 )
 
 
@@ -656,8 +665,7 @@ def list_diffs(
         "SUM(CASE WHEN dd.delta_kind='layer_changed' THEN 1 ELSE 0 END), "
         "SUM(CASE WHEN dd.delta_kind='layer_unchanged' THEN 1 ELSE 0 END), "
         "SUM(CASE WHEN dd.delta_kind='delta_undetermined' THEN 1 ELSE 0 END), "
-        + ", ".join(f"dm.{c}" for c in _STAMP_COLS)
-        + " "
+        "dm.baseline_dropped, " + ", ".join(f"dm.{c}" for c in _STAMP_COLS) + " "
         # Edge deltas only: the candidate overlay's rows share the table. The scope sits in the ON
         # clause, not WHERE, so a diff with no edge rows still lists (with zero counts).
         "FROM diff_meta dm LEFT JOIN dimension_delta dd ON dd.diff_id = dm.diff_id "
@@ -695,8 +703,9 @@ _BLINDSPOT_NOTE = (
     "repeated identical-content failures, never proof the binary is undiffable — its content, or "
     "what the diff reads (extraction, hunt output, diff code), changing resets the count. "
     "diff_status_reason='extraction_unstamped' = the binary has no recorded extraction (re-scan "
-    "the run). baseline_dropped=1 = this failure replaced a good diff and its stored candidate "
-    "baseline. source_stale / source_stale_reason as in list_diffs."
+    "the run). baseline_dropped=1 = the diff had a stored candidate baseline, dropped by this "
+    "failure or an earlier re-diff and not stored again. source_stale / source_stale_reason as in "
+    "list_diffs."
 )
 
 

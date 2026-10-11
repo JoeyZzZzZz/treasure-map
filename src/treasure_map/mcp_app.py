@@ -1941,9 +1941,10 @@ def make_tools(
         """Browse the version diffs in the atlas: one row per binary diffed between two runs, with
         its change profile (matched_pairs, layer_changed / unchanged / undetermined, version_skew)
         AND its diff status (diff_ok / diff_status / diff_status_reason / diff_attempts). Optionally
-        filter to a run-pair. The entry point after a full diff — see which binaries were compared,
-        how much each moved, and which FAILED to diff, then open one with get_diff_deltas /
-        get_diff_meta.
+        filter to a run-pair. ``baseline_dropped=1`` = the diff had a stored candidate baseline that
+        a re-diff dropped (it failed, or the baseline could not be stored again). The entry point
+        after a full diff — see which binaries were compared, how much each moved, and which FAILED
+        to diff, then open one with get_diff_deltas / get_diff_meta.
 
         ★ Counts are tri-state PROJECTIONS, never verdicts or a ranking: ``layer_changed`` is not
         proof the change matters, and an EMPTY list means no diff has been run for that filter --
@@ -1980,8 +1981,9 @@ def make_tools(
         force_retry; a HINT from repeated identical-content failures, never proof the binary is
         undiffable — its content changing resets the count). Read this alongside get_diff_deltas so
         a consumer of the change map always sees the coverage gaps too. ``extraction_unstamped`` =
-        the binary has no recorded extraction (re-scan the run). ``baseline_dropped=1`` = this
-        failure replaced a good diff, and the candidate baseline stored with it. Each row also
+        the binary has no recorded extraction (re-scan the run). ``baseline_dropped=1`` = the
+        diff had a stored candidate baseline, dropped by this failure or an earlier re-diff and not
+        stored again. Each row also
         carries ``source_stale`` / ``source_stale_reason`` (as in list_diffs)."""
         conn = open_atlas(atlas_path)
         try:

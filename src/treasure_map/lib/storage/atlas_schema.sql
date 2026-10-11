@@ -654,8 +654,9 @@ CREATE TABLE IF NOT EXISTS diff_meta (
     hunt_instances_b        INTEGER,
     diff_code_version       TEXT,            -- the diff code's version; NULL = written before
                                              --   these stamps were recorded (unverified)
-    baseline_dropped        INTEGER NOT NULL DEFAULT 0,  -- 1 = a failed re-diff replaced a good
-                                             --   diff that had a stored candidate baseline
+    baseline_dropped        INTEGER NOT NULL DEFAULT 0,  -- 1 = the diff had a stored candidate
+                                             --   baseline that a re-diff dropped (it failed, or
+                                             --   the baseline could not be stored again)
     created_at              DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 

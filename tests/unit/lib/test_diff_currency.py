@@ -721,6 +721,44 @@ def _unreadable(w: _World) -> None:
     (w.tmp / "a.db").rename(w.tmp / "a.db.moved")
 
 
+class _TwoNameCache:
+    """Each run holds its side's binary under its own name; every other axis matches."""
+
+    def for_run(self, run_id: str | None) -> dict[str, set[str]] | None:
+        return {"run_a": {"liba": {_sha("a")}}, "run_b": {"libb": {_sha("b")}}}.get(run_id or "")
+
+    def extraction(self, run_id: str) -> dict[str, tuple[str | None, str | None]]:
+        return {_sha("a" if run_id == "run_a" else "b"): (_PV, "11.4.3")}
+
+    def hunt_marks(self, run_id: str) -> tuple[str | None, int | None, int]:
+        return ("t0", 1, 1)
+
+
+def test_each_side_is_looked_up_by_its_own_binary_name() -> None:
+    """MUTATION (verified RED): look side b up by ``binary_a`` -> its binary reads as gone."""
+    meta = {
+        "run_a_id": "run_a",
+        "run_b_id": "run_b",
+        "binary_a": "liba",
+        "binary_b": "libb",
+        "sha256_a": _sha("a"),
+        "sha256_b": _sha("b"),
+        "diff_code_version": currency.DIFF_CODE_VERSION,
+        **{
+            f"{c}_{s}": v
+            for s in "ab"
+            for c, v in (
+                ("extraction_pass", _PV),
+                ("ghidra_version", "11.4.3"),
+                ("scanned_at", "t0"),
+                ("hunt_instances", 1),
+                ("hunt_inputs_hash", "x"),
+            )
+        },
+    }
+    assert diff_align.diff_staleness(_TwoNameCache(), meta) == (False, None)  # type: ignore[arg-type]
+
+
 @pytest.mark.parametrize(
     ("changes", "expect"),
     [
@@ -908,6 +946,47 @@ def test_a_confirmed_current_pair_diffs_without_warnings(
     assert [o.error for o in fs.outcomes] == [None] and fs.warnings == ()
 
 
+def _rehunted_by_other_code(w: _World, monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub(monkeypatch, w, commit="deadbeef")
+
+
+def _skewed(w: _World, monkeypatch: pytest.MonkeyPatch) -> None:
+    w.atlas.execute("UPDATE run SET ghidra_version = '12.0' WHERE run_id = 'run_b'")
+    w.atlas.commit()
+
+
+@pytest.mark.parametrize(
+    ("make_refused", "why"),
+    [(_rehunted_by_other_code, "out of date"), (_skewed, "different tmap/Ghidra versions")],
+)
+def test_a_pair_with_nothing_left_to_diff_is_refused_all_the_same(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_refused: Any, why: str
+) -> None:
+    """Every binary already diffed: the pair is still refused, as the read side refuses it, rather
+    than answered with "nothing to diff".
+
+    MUTATION (verified RED): check the pair after the plan's early return -> the full diff returns
+    an empty sweep."""
+    w = _two(tmp_path, hunt_commit=_COMMIT)
+    _stub(monkeypatch, w)
+    _full(w)
+    assert _plan(w).already_ok == ("liba",)
+    make_refused(w, monkeypatch)
+    with pytest.raises(ConfigError, match=why):
+        _full(w)
+
+
+def test_a_pair_with_nothing_left_to_diff_still_reports_its_warnings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    w = _two(tmp_path, hunt_commit=_COMMIT)
+    _stub(monkeypatch, w)
+    _full(w)
+    _stub(monkeypatch, w, commit=UNKNOWN_VERSION)
+    fs = _full(w)
+    assert fs.outcomes == () and fs.warnings
+
+
 # ── T9: a stored candidate baseline survives a re-diff, or its loss is visible ────────────────────
 
 
@@ -944,10 +1023,17 @@ def test_a_rediff_stores_the_baseline_again(
     assert so.read_sink_overlay_baseline(w.atlas, _did())["stale_baseline"] is False
 
 
-def test_a_refused_baseline_does_not_fail_the_diff(
+def test_a_refused_baseline_does_not_fail_the_diff_and_is_marked_until_stored_again(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The good row the re-diff committed says its baseline is gone (an ok row, so it shows in
+    list_diffs, not among the blind spots); once the store is possible again, the next re-diff
+    stores it and clears the mark.
+
+    MUTATION (verified RED): drop the mark after the refused store -> the row reads as a diff
+    that never had a baseline, and the next re-diff does not store one."""
     w = _baselined(tmp_path, monkeypatch)
+    n = _baseline_rows(w)
     w.atlas.execute("UPDATE run SET hunt_commit = 'unknown' WHERE run_id = 'run_b'")
     _extraction(w)
     (oc,) = _full(w).outcomes
@@ -955,6 +1041,34 @@ def test_a_refused_baseline_does_not_fail_the_diff(
     assert oc.summary.baseline == "not_restored"
     assert any("candidate baseline" in m for m in oc.summary.warnings)
     assert _row(w)["diff_ok"] == 1 and _baseline_rows(w) == 0
+    assert _row(w)["baseline_dropped"] == 1
+    (listed,) = diff_align.list_diffs(w.atlas)["diffs"]
+    assert listed["baseline_dropped"] == 1
+    assert diff_align.list_diff_blindspots(w.atlas)["blindspots"] == []
+    w.atlas.execute("UPDATE run SET hunt_commit = ? WHERE run_id = 'run_b'", (_COMMIT,))
+    w.atlas.commit()
+    _ghidra(w)
+    (oc,) = _full(w).outcomes
+    assert oc.summary is not None and oc.summary.baseline == "restored"
+    assert _row(w)["baseline_dropped"] == 0 and _baseline_rows(w) == n
+    (listed,) = diff_align.list_diffs(w.atlas)["diffs"]
+    assert listed["baseline_dropped"] == 0
+
+
+def test_storing_the_baseline_directly_clears_the_mark(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MUTATION (verified RED): leave the mark alone in ``persist_sink_overlay`` -> a diff with a
+    stored baseline still says it lost it."""
+    w = _baselined(tmp_path, monkeypatch)
+    w.atlas.execute("UPDATE run SET hunt_commit = 'unknown' WHERE run_id = 'run_b'")
+    _extraction(w)
+    _full(w)
+    assert _row(w)["baseline_dropped"] == 1
+    w.atlas.execute("UPDATE run SET hunt_commit = ? WHERE run_id = 'run_b'", (_COMMIT,))
+    w.atlas.commit()
+    assert so.persist_sink_overlay(w.atlas, _did()) > 0
+    assert _row(w)["baseline_dropped"] == 0
 
 
 def test_reading_an_absent_baseline_says_absent(
@@ -991,17 +1105,25 @@ def test_a_failed_rediff_marks_the_dropped_baseline_until_a_success_restores_it(
     assert _row(w)["baseline_dropped"] == 0 and _baseline_rows(w) > 0
 
 
-def test_a_failure_after_a_content_change_marks_nothing(
+def test_a_failure_after_a_content_change_still_marks_the_dropped_baseline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The baseline described content that has since changed: nothing current was lost."""
+    """A successful re-diff of changed content stores the baseline again, so a failure in between
+    must not decide whether it comes back: it is marked, and the next success stores it.
+
+    MUTATION (verified RED): mark only at the same content -> the failure after the content change
+    marks nothing and the baseline never comes back."""
     w = _baselined(tmp_path, monkeypatch)
     _set_binary(w, "b", "liba", "sha256", _sha("e"))
     so_b = next(p for p, s in w.so_sha.items() if s == _sha("b"))
     w.so_sha[so_b] = _sha("e")
     w.fail.add("liba")
     _full(w)
-    assert _row(w)["baseline_dropped"] == 0
+    assert _row(w)["baseline_dropped"] == 1 and _baseline_rows(w) == 0
+    w.fail.clear()
+    (oc,) = _full(w).outcomes
+    assert oc.summary is not None and oc.summary.baseline == "restored"
+    assert _row(w)["baseline_dropped"] == 0 and _baseline_rows(w) > 0
 
 
 # ── the CLI passes --assume-current through ──────────────────────────────────────────────────────
