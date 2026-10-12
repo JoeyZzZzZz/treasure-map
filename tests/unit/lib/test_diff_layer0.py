@@ -325,7 +325,9 @@ def test_reverse_d3_mapping_broken_reds_g5(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(
         layer0,
         "_presence_state",
-        lambda st: "unmatched_analysis_incomplete" if st == "skipped_micro" else real(st),
+        lambda st, gap=None: (
+            "unmatched_analysis_incomplete" if st == "skipped_micro" else real(st, gap)
+        ),
     )
     baseline, matched = _presence_fixture(tmp_path)
     pres = compute_side_presence("d", "a", matched, baseline)

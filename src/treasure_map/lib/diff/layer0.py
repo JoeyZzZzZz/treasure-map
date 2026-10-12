@@ -36,6 +36,7 @@ from treasure_map.lib.atlas.writer import (
 from treasure_map.lib.binary_id import BinaryRow
 from treasure_map.lib.callsite_ref import callsite_abs_addr, wrapper_call_abs_addr
 from treasure_map.lib.diff.currency import COMPARED_COLUMNS, UNSTAMPED, DiffStamps, stamps_equal
+from treasure_map.lib.diff.export_report import ExportReport
 from treasure_map.lib.errors import ConfigError
 from treasure_map.lib.facts import _DECOMPILE_MIN_SIZE
 from treasure_map.lib.hunt.refs import _norm_addr
@@ -84,14 +85,25 @@ class AlignmentParse:
 
 
 def parse_bindiff(
-    bindiff_path: Path, diff_id: str, threshold: float = ALIGN_THRESHOLD
+    bindiff_path: Path,
+    diff_id: str,
+    threshold: float = ALIGN_THRESHOLD,
+    gaps_a: dict[str, str] | None = None,
+    gaps_b: dict[str, str] | None = None,
 ) -> AlignmentParse:
     """Parse a ``.BinDiff`` SQLite's ``function`` table into alignment-fact rows.
 
     Reads ONLY the ``function`` table (per-row confidence/similarity, never the metadata aggregate).
     ``alignment_confidence`` = BinDiff ``confidence`` (trust in the pairing); ``similarity`` is
     carried separately (change-magnitude). Addresses (BIGINT decimal) are normalized to tmap hex. A
-    low-confidence pair is kept as ``alignment_undetermined``, never dropped."""
+    low-confidence pair is kept as ``alignment_undetermined``, never dropped.
+
+    ``gaps_a`` / ``gaps_b``: the functions each side's export could not represent faithfully
+    (lib/diff/export_report, entry -> gap kind). A pair with either side among them is recorded with
+    the gap and is ``alignment_undetermined`` whatever BinDiff's confidence: BinDiff matched what
+    the export held, and the export did not hold that function as it is."""
+    gaps_a = gaps_a or {}
+    gaps_b = gaps_b or {}
     con = sqlite3.connect(f"file:{bindiff_path}?mode=ro", uri=True)
     try:
         con.row_factory = sqlite3.Row
@@ -110,6 +122,10 @@ def parse_bindiff(
         if addr_a is None or addr_b is None:
             continue  # a pair with an unparseable address is not a usable alignment fact
         conf = float(r["confidence"])
+        gap_a, gap_b = gaps_a.get(addr_a), gaps_b.get(addr_b)
+        state = alignment_state(conf, threshold)
+        if gap_a is not None or gap_b is not None:
+            state = "alignment_undetermined"
         rows.append(
             FunctionAlignmentRow(
                 diff_id=diff_id,
@@ -119,10 +135,12 @@ def parse_bindiff(
                 name_b=r["name2"],
                 alignment_confidence=conf,
                 similarity=float(r["similarity"]) if r["similarity"] is not None else None,
-                alignment_state=alignment_state(conf, threshold),
+                alignment_state=state,
                 basicblocks=r["basicblocks"],
                 edges=r["edges"],
                 instructions=r["instructions"],
+                export_gap_a=gap_a,
+                export_gap_b=gap_b,
             )
         )
         a_addrs.add(addr_a)
@@ -314,13 +332,19 @@ def load_baseline(analysis_db_path: str, bin_row: BinaryRow) -> BaselineDomain:
     return BaselineDomain(functions=funcs)
 
 
-def _presence_state(status: str) -> str:
+def _presence_state(status: str, export_gap: str | None = None) -> str:
     """The presence label for an unmatched baseline function — about ANALYSIS COMPLETENESS, not the
     decompile action. ``ok`` (decompiled) and ``skipped_micro`` (design-skipped, no gap) are both
     ``unmatched_analysis_complete`` (existence is DETERMINED, a genuine unmatched a later stage may
     judge add/delete/refactor). ``failed`` and ``unknown`` are ``unmatched_analysis_incomplete``
     (a real gap -> existence UNDETERMINED, NEVER add/delete). ``unknown`` -> incomplete is the
-    conservative direction: size unknown means 'no gap' cannot be asserted."""
+    conservative direction: size unknown means 'no gap' cannot be asserted.
+
+    A function its export could not represent faithfully (``export_gap``, lib/diff/export_report)
+    is ``unmatched_analysis_incomplete`` whatever its decompile status: it may be unmatched only
+    because BinDiff never saw it as it is."""
+    if export_gap is not None:
+        return "unmatched_analysis_incomplete"
     if status in ("ok", "skipped_micro"):
         return "unmatched_analysis_complete"
     return "unmatched_analysis_incomplete"
@@ -350,7 +374,11 @@ _DECOMPILED_FLAG: dict[str, int | None] = {
 
 
 def compute_side_presence(
-    diff_id: str, side: str, matched_addrs: frozenset[str], baseline: BaselineDomain
+    diff_id: str,
+    side: str,
+    matched_addrs: frozenset[str],
+    baseline: BaselineDomain,
+    gaps: dict[str, str] | None = None,
 ) -> SidePresence:
     """Per-side presence: baseline functions with no matched pair become explicit, countable rows;
     matched addrs NOT in the baseline are out_of_inventory (counted, never a presence row, never an
@@ -365,16 +393,19 @@ def compute_side_presence(
     out_of_inventory_addrs = matched_addrs - baseline.addrs
     matched_in_domain = len(matched_addrs & baseline.addrs)
     rows: list[FunctionPresenceRow] = []
+    gaps = gaps or {}
     for addr in sorted(unmatched_addrs):
         name, status = baseline.functions[addr]
+        gap = gaps.get(addr)
         rows.append(
             FunctionPresenceRow(
                 diff_id=diff_id,
                 side=side,
                 addr=addr,
                 name=name,
-                presence_state=_presence_state(status),
+                presence_state=_presence_state(status, gap),
                 decompiled=_DECOMPILED_FLAG[status],
+                export_gap=gap,
             )
         )
     # inventory_mismatch is a cross-side-domain state, not derived per-side here (different builds
@@ -553,6 +584,9 @@ def run_layer0_parse(
     threshold: float = ALIGN_THRESHOLD,
     commit: bool = True,
     stamps: DiffStamps | None = None,
+    report_a: ExportReport | None = None,
+    report_b: ExportReport | None = None,
+    bindiff_vertex0_fallbacks: int | None = None,
 ) -> Layer0Result:
     """Parse a ``.BinDiff`` into the atlas (function_alignment + function_presence + diff_meta).
 
@@ -564,7 +598,11 @@ def run_layer0_parse(
     ``stamps`` is what else the diff is computed from (lib/diff/currency), taken by the caller
     inside the same write transaction; they are written to diff_meta, and ghidra_version_a/b then
     hold each diffed binary's own decompiler version. Without them the row is written unstamped
-    (NULL stamps, the runs' decompiler versions), which every reader reports as unverified."""
+    (NULL stamps, the runs' decompiler versions), which every reader reports as unverified.
+
+    ``report_a`` / ``report_b``: each side's export report (lib/diff/export_report). The functions
+    it lists are marked on their alignment / presence rows and never read as determined; its counts
+    and ``bindiff_vertex0_fallbacks`` are written to diff_meta. None leaves them unrecorded."""
     run_a = _resolve_run(atlas, run_a_id, "a")
     run_b = _resolve_run(atlas, run_b_id, "b")
     _validate_bindiff_binaries(bindiff_path, bin_a, bin_b)
@@ -583,11 +621,13 @@ def run_layer0_parse(
         )
     did = diff_id or make_diff_id(run_a_id, run_b_id, norm_a)
 
-    parsed = parse_bindiff(bindiff_path, did, threshold)
+    gaps_a = report_a.gaps() if report_a is not None else {}
+    gaps_b = report_b.gaps() if report_b is not None else {}
+    parsed = parse_bindiff(bindiff_path, did, threshold, gaps_a, gaps_b)
     baseline_a = load_baseline(run_a.analysis_db_path, bin_a)
     baseline_b = load_baseline(run_b.analysis_db_path, bin_b)
-    pres_a = compute_side_presence(did, "a", parsed.matched_addrs_a, baseline_a)
-    pres_b = compute_side_presence(did, "b", parsed.matched_addrs_b, baseline_b)
+    pres_a = compute_side_presence(did, "a", parsed.matched_addrs_a, baseline_a, gaps_a)
+    pres_b = compute_side_presence(did, "b", parsed.matched_addrs_b, baseline_b, gaps_b)
 
     # sha256 of the diffed content on each side, recorded so the next full diff can skip an
     # unchanged binary (incremental) and reset the attempts counter when the content changed. Read
@@ -657,6 +697,15 @@ def run_layer0_parse(
         hunt_instances_a=st.a.hunt_instances,
         hunt_instances_b=st.b.hunt_instances,
         diff_code_version=st.diff_code_version,
+        export_builder_a=report_a.builder if report_a else None,
+        export_builder_b=report_b.builder if report_b else None,
+        export_entry_addresses_added_a=report_a.entry_addresses_added if report_a else None,
+        export_entry_addresses_added_b=report_b.entry_addresses_added if report_b else None,
+        export_flow_graphs_dropped_a=report_a.flow_graphs_dropped if report_a else None,
+        export_flow_graphs_dropped_b=report_b.flow_graphs_dropped if report_b else None,
+        export_degenerate_functions_a=len(report_a.degenerate_functions) if report_a else None,
+        export_degenerate_functions_b=len(report_b.degenerate_functions) if report_b else None,
+        bindiff_vertex0_fallbacks=bindiff_vertex0_fallbacks,
     )
 
     delete_diff(atlas, did, commit=False)

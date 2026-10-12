@@ -319,6 +319,10 @@ class FunctionAlignmentRow:
     basicblocks: int | None = None
     edges: int | None = None
     instructions: int | None = None
+    # Why a side's function is not represented faithfully in its export (lib/diff/export_report),
+    # or None. A marked pair is always 'alignment_undetermined'.
+    export_gap_a: str | None = None
+    export_gap_b: str | None = None
     id: int | None = None
 
 
@@ -335,6 +339,9 @@ class FunctionPresenceRow:
     presence_state: str
     name: str | None = None
     decompiled: int | None = None
+    # Why this function is not represented faithfully in its export, or None; a marked function is
+    # always 'unmatched_analysis_incomplete'.
+    export_gap: str | None = None
     id: int | None = None
 
 
@@ -418,6 +425,18 @@ class DiffMetaRow:
     hunt_instances_b: int | None = None
     diff_code_version: str | None = None
     baseline_dropped: int = 0
+    # What each side's export could not represent (lib/diff/export_report) and how many flow-graph
+    # edges BinDiff resolved to the graph's first vertex; None = not recorded (a diff written
+    # before, or a stubbed compute).
+    export_builder_a: str | None = None
+    export_builder_b: str | None = None
+    export_entry_addresses_added_a: int | None = None
+    export_entry_addresses_added_b: int | None = None
+    export_flow_graphs_dropped_a: int | None = None
+    export_flow_graphs_dropped_b: int | None = None
+    export_degenerate_functions_a: int | None = None
+    export_degenerate_functions_b: int | None = None
+    bindiff_vertex0_fallbacks: int | None = None
 
 
 @dataclass(frozen=True)

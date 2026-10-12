@@ -243,7 +243,10 @@ def _stub(
     def bindiff(ea: Path, eb: Path, out: Path, timeout: int) -> Path:
         so_a, so_b = (out / "a.so").read_text(), (out / "b.so").read_text()
         if Path(so_a).name.split("-")[1] in w.fail:
-            raise DiffToolchainError("BinDiff failed (rc=1) Could not find basic block 0000beef")
+            raise DiffToolchainError(
+                "BinDiff failed (rc=1) Could not find basic block 0000beef",
+                kind=driver.FAIL_BINDIFF_FLOWGRAPH,
+            )
         return _bindiff(out / "x.BinDiff", w.so_sha[so_a], w.so_sha[so_b])
 
     monkeypatch.setattr(driver, "_run_binexport", binexport)

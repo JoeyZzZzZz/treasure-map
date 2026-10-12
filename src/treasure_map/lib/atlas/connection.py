@@ -237,6 +237,30 @@ def _migrate(conn: sqlite3.Connection) -> None:
     ):
         if dm_cols and _dmcol not in dm_cols:
             conn.execute(f"ALTER TABLE diff_meta ADD COLUMN {_dmcol} {_dmtype}")  # noqa: S608
+    # What each side's export could not represent (lib/diff/export_report): the builder used, the
+    # repair counts, and BinDiff's first-vertex fallbacks; plus the per-function gap markers on the
+    # presence / alignment rows. No index references them; existing rows carry NULL (not
+    # recorded) until re-diffed. Idempotent.
+    for _dmcol, _dmtype in (
+        ("export_builder_a", "TEXT"),
+        ("export_builder_b", "TEXT"),
+        ("export_entry_addresses_added_a", "INTEGER"),
+        ("export_entry_addresses_added_b", "INTEGER"),
+        ("export_flow_graphs_dropped_a", "INTEGER"),
+        ("export_flow_graphs_dropped_b", "INTEGER"),
+        ("export_degenerate_functions_a", "INTEGER"),
+        ("export_degenerate_functions_b", "INTEGER"),
+        ("bindiff_vertex0_fallbacks", "INTEGER"),
+    ):
+        if dm_cols and _dmcol not in dm_cols:
+            conn.execute(f"ALTER TABLE diff_meta ADD COLUMN {_dmcol} {_dmtype}")  # noqa: S608
+    fa_cols = _column_names(conn, "function_alignment")
+    for _facol in ("export_gap_a", "export_gap_b"):
+        if fa_cols and _facol not in fa_cols:
+            conn.execute(f"ALTER TABLE function_alignment ADD COLUMN {_facol} TEXT")  # noqa: S608
+    fp_cols = _column_names(conn, "function_presence")
+    if fp_cols and "export_gap" not in fp_cols:
+        conn.execute("ALTER TABLE function_presence ADD COLUMN export_gap TEXT")
 
     # instruction_match.facts_a/b: the call-site facts at each side's matched address (JSON).
     # Nullable TEXT, no index references them; existing rows carry NULL. Idempotent.

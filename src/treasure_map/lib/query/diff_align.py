@@ -353,6 +353,10 @@ def _row_to_pair(r: sqlite3.Row) -> dict[str, Any]:
         "basicblocks": r["basicblocks"],
         "edges": r["edges"],
         "instructions": r["instructions"],
+        # why a side's function is not held as it is by its export, or null (the pair is then
+        # alignment_undetermined whatever its confidence)
+        "export_gap_a": r["export_gap_a"],
+        "export_gap_b": r["export_gap_b"],
     }
 
 
@@ -361,15 +365,21 @@ def _align_by_side(atlas: sqlite3.Connection, diff_id: str, addr: str, side: str
     norm = norm_hex(addr)
     rows = atlas.execute(
         f"SELECT addr_a, addr_b, name_a, name_b, alignment_confidence, similarity, "  # noqa: S608
-        f"alignment_state, basicblocks, edges, instructions "
+        f"alignment_state, basicblocks, edges, instructions, export_gap_a, export_gap_b "
         f"FROM function_alignment WHERE diff_id = ? AND {col} = ?",  # noqa: S608 -- col is a literal
         (diff_id, norm),
     ).fetchall()
     if not rows:
+        gap = atlas.execute(
+            "SELECT export_gap FROM function_presence WHERE diff_id = ? AND side = ? AND addr = ?",
+            (diff_id, side, norm),
+        ).fetchone()
         return {
             "found": False,
             "diff_id": diff_id,
             "query": {"side": side, "addr": norm},
+            # non-null when the function is unmatched because its export did not hold it as it is
+            "export_gap": gap[0] if gap is not None else None,
             **diff_source_staleness(atlas, diff_id),
             "note": (
                 "no matched pair for this address in this diff. That is NOT proof the function was "
@@ -476,6 +486,15 @@ _META_COLS = (
     "diff_status_reason",
     "diff_attempts",
     "baseline_dropped",
+    "export_builder_a",
+    "export_builder_b",
+    "export_entry_addresses_added_a",
+    "export_entry_addresses_added_b",
+    "export_flow_graphs_dropped_a",
+    "export_flow_graphs_dropped_b",
+    "export_degenerate_functions_a",
+    "export_degenerate_functions_b",
+    "bindiff_vertex0_fallbacks",
 )
 
 
@@ -705,7 +724,13 @@ _BLINDSPOT_NOTE = (
     "diff_status_reason='extraction_unstamped' = the binary has no recorded extraction (re-scan "
     "the run). baseline_dropped=1 = the diff had a stored candidate baseline, dropped by this "
     "failure or an earlier re-diff and not stored again. source_stale / source_stale_reason as in "
-    "list_diffs."
+    "list_diffs. 'partial' lists the diffs that DID succeed but whose export could not hold some "
+    "functions as they are (a flow graph dropped for having no entry block, or a block entered "
+    "through a delay slot): those functions and every subject resting on them read undetermined "
+    "with reason degenerate_block_source; marked_rows counts the presence / alignment rows marked. "
+    "diff_status_reason='bindiff_flowgraph' = BinDiff rejected a flow graph of an export (the "
+    "export is repaired before BinDiff runs, so this is not expected); 'bindiff_failed' = any "
+    "other BinDiff failure."
 )
 
 
@@ -760,7 +785,73 @@ def list_diff_blindspots(
     return {
         "blindspots": blindspots,
         "count": len(blindspots),
+        "partial": _partial_blindspots(atlas, cache, run_a_id, run_b_id),
         "filters": {"run_a_id": run_a_id, "run_b_id": run_b_id},
         "retry_limit": retry_limit,
         "note": _BLINDSPOT_NOTE,
     }
+
+
+_PARTIAL_COLS = (
+    "export_builder_a",
+    "export_builder_b",
+    "export_flow_graphs_dropped_a",
+    "export_flow_graphs_dropped_b",
+    "export_degenerate_functions_a",
+    "export_degenerate_functions_b",
+    "export_entry_addresses_added_a",
+    "export_entry_addresses_added_b",
+    "bindiff_vertex0_fallbacks",
+)
+
+
+def _partial_blindspots(
+    atlas: sqlite3.Connection,
+    cache: _GenerationCache,
+    run_a_id: str | None,
+    run_b_id: str | None,
+) -> list[dict[str, Any]]:
+    """The diffs that succeeded (diff_ok=1) but whose export could not hold some functions as they
+    are (lib/diff/export_report): those functions, and every subject resting on them, read
+    undetermined (degenerate_block_source). Each row carries the export counts and how many
+    presence / alignment rows of the diff are marked."""
+    where = [
+        "diff_ok = 1",
+        "(COALESCE(export_flow_graphs_dropped_a, 0) + COALESCE(export_flow_graphs_dropped_b, 0) "
+        "+ COALESCE(export_degenerate_functions_a, 0) "
+        "+ COALESCE(export_degenerate_functions_b, 0)) > 0",
+    ]
+    params: list[Any] = []
+    if run_a_id is not None:
+        where.append("run_a_id = ?")
+        params.append(run_a_id)
+    if run_b_id is not None:
+        where.append("run_b_id = ?")
+        params.append(run_b_id)
+    rows = atlas.execute(
+        "SELECT diff_id, binary_a, "  # noqa: S608 -- literal column lists
+        + ", ".join(_PARTIAL_COLS + _STAMP_COLS)
+        + f" FROM diff_meta WHERE {' AND '.join(where)} ORDER BY run_a_id, run_b_id, binary_a",
+        params,
+    ).fetchall()
+    out: list[dict[str, Any]] = []
+    n = len(_PARTIAL_COLS)
+    for r in rows:
+        marked = atlas.execute(
+            "SELECT (SELECT COUNT(*) FROM function_presence WHERE diff_id = ? "
+            "AND export_gap IS NOT NULL) + (SELECT COUNT(*) FROM function_alignment "
+            "WHERE diff_id = ? AND (export_gap_a IS NOT NULL OR export_gap_b IS NOT NULL))",
+            (r[0], r[0]),
+        ).fetchone()[0]
+        stale, reason = diff_staleness(cache, dict(zip(_STAMP_COLS, r[2 + n :], strict=True)))
+        out.append(
+            {
+                "diff_id": r[0],
+                "binary": r[1],
+                **dict(zip(_PARTIAL_COLS, r[2 : 2 + n], strict=True)),
+                "marked_rows": marked,
+                "source_stale": stale,
+                "source_stale_reason": reason,
+            }
+        )
+    return out

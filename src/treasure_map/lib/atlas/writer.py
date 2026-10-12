@@ -416,8 +416,8 @@ def add_function_alignment(
     conn.executemany(
         """INSERT INTO function_alignment
            (diff_id, addr_a, addr_b, name_a, name_b, alignment_confidence, similarity,
-            alignment_state, basicblocks, edges, instructions)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            alignment_state, basicblocks, edges, instructions, export_gap_a, export_gap_b)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         [
             (
                 r.diff_id,
@@ -431,6 +431,8 @@ def add_function_alignment(
                 r.basicblocks,
                 r.edges,
                 r.instructions,
+                r.export_gap_a,
+                r.export_gap_b,
             )
             for r in rows
         ],
@@ -449,9 +451,12 @@ def add_function_presence(
         return 0
     conn.executemany(
         """INSERT INTO function_presence
-           (diff_id, side, addr, name, presence_state, decompiled)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        [(r.diff_id, r.side, r.addr, r.name, r.presence_state, r.decompiled) for r in rows],
+           (diff_id, side, addr, name, presence_state, decompiled, export_gap)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        [
+            (r.diff_id, r.side, r.addr, r.name, r.presence_state, r.decompiled, r.export_gap)
+            for r in rows
+        ],
     )
     if commit:
         conn.commit()
@@ -474,10 +479,13 @@ def add_diff_meta(conn: sqlite3.Connection, row: DiffMetaRow, *, commit: bool = 
             callsite_facts_hash_a, callsite_facts_hash_b, stub_state_a, stub_state_b,
             extraction_pass_a, extraction_pass_b, hunt_inputs_hash_a, hunt_inputs_hash_b,
             scanned_at_a, scanned_at_b, hunt_instances_a, hunt_instances_b, diff_code_version,
-            baseline_dropped)
+            baseline_dropped, export_builder_a, export_builder_b, export_entry_addresses_added_a,
+            export_entry_addresses_added_b, export_flow_graphs_dropped_a,
+            export_flow_graphs_dropped_b, export_degenerate_functions_a,
+            export_degenerate_functions_b, bindiff_vertex0_fallbacks)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                   ?)""",
+                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             row.diff_id,
             row.run_a_id,
@@ -532,6 +540,15 @@ def add_diff_meta(conn: sqlite3.Connection, row: DiffMetaRow, *, commit: bool = 
             row.hunt_instances_b,
             row.diff_code_version,
             row.baseline_dropped,
+            row.export_builder_a,
+            row.export_builder_b,
+            row.export_entry_addresses_added_a,
+            row.export_entry_addresses_added_b,
+            row.export_flow_graphs_dropped_a,
+            row.export_flow_graphs_dropped_b,
+            row.export_degenerate_functions_a,
+            row.export_degenerate_functions_b,
+            row.bindiff_vertex0_fallbacks,
         ),
     )
     if commit:

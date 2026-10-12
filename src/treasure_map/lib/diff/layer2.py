@@ -28,6 +28,7 @@ from treasure_map.lib.atlas.writer import (
     add_dimension_deltas,
     delete_dimension_delta,
 )
+from treasure_map.lib.diff.export_report import DEGENERATE_BLOCK_SOURCE, load_export_gaps
 from treasure_map.lib.diff.layer0 import norm_hex  # the ONE address canonicalizer (no second one)
 
 # ── the layer-2 DELTA-capability declaration (a property of THIS code version, NOT of a run) ──
@@ -153,6 +154,26 @@ def _load_alignment(
         a2b[r[0]] = (r[1], r[2], r[3])
         b2a[r[1]] = (r[0], r[2], r[3])
     return a2b, b2a
+
+
+def _export_gap_guard(
+    a: _SubjectSide | None,
+    b: _SubjectSide | None,
+    gaps_a: set[str],
+    gaps_b: set[str],
+    key_str: str,
+    diff_id: str,
+) -> DimensionDeltaRow | None:
+    """An edge whose function, or one of whose callees, is among a side's export gaps is
+    undetermined (``degenerate_block_source``): its alignment, and so its comparison, rests on a
+    flow graph the export did not hold as it is."""
+    for side, gaps in ((a, gaps_a), (b, gaps_b)):
+        if side is None or not gaps:
+            continue
+        addrs = [side.from_func_addr] + [c.get("addr") for c in side.callees]
+        if any(norm_hex(x) in gaps for x in addrs if x is not None):
+            return _und(diff_id, key_str, DEGENERATE_BLOCK_SOURCE)
+    return None
 
 
 @dataclass
@@ -352,6 +373,7 @@ def _string_keyed_edge_delta(
         return [_und(diff_id, f"{dim}:binary_scope_unrecorded", "binary_scope_unrecorded")]
 
     a2b, b2a = _load_alignment(atlas, diff_id)
+    gaps_a, gaps_b = load_export_gaps(atlas, diff_id)
     edges_a = _load_edges(atlas, run_a, binary_a)
     edges_b = _load_edges(atlas, run_b, binary_b)
     subj_a, keys_a, unres_a = _group(edges_a, "a", b2a)
@@ -373,6 +395,12 @@ def _string_keyed_edge_delta(
         b = subj_b.get(canonical)
         mech = canonical[1]
 
+        # Export gaps first: an edge resting on a function the export did not hold as it is cannot
+        # be compared, and the reason should say so rather than name a downstream symptom.
+        gap = _export_gap_guard(a, b, gaps_a, gaps_b, key_str, diff_id)
+        if gap is not None:
+            rows.append(gap)
+            continue
         # G1 anchor alignment (gate only; static has anchor None and a version-stable key identity)
         if mech == "strcmp_gate":
             g1 = _anchor_guard(canonical, a, b, a2b, b2a, key_str, diff_id)

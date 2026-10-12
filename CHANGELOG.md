@@ -169,6 +169,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Version diffs of MIPS binaries whose export BinDiff rejected now complete.** Two kinds of flow
+  graph in the BinExport extension's output made BinDiff refuse the whole binary
+  (`bindiff_flowgraph`): a flow graph whose entry instruction was exported without its address
+  (BinDiff then places the flow graph at address 0), and a flow graph with no entry block. Every
+  export is now checked before BinDiff runs. The first kind is given the address the reader would
+  derive anyway, so no address changes. The second is removed, and its function is listed as a
+  blind spot. An export with neither is written exactly as before: existing diffs are not affected
+  and the diff code version is unchanged.
+- **Exports the BinExport extension failed to build are rebuilt.** The extension's builder fails on
+  a basic block that a function's body yields but the program-wide block iteration does not return
+  (on MIPS that iteration stops at a block entered through a delay slot). Such diffs were recorded
+  as `timeout`. On exactly that failure the export is now rebuilt by
+  `FallbackBinExport2Builder.java`, a modified copy of the extension's builder (Apache-2.0; the
+  changes are listed in its header and in NOTICE) that registers the missing blocks. The functions
+  that hold a block entered through a delay slot are listed as blind spots.
+  - A listed function is never read as determined: it is `unmatched_analysis_incomplete` or
+    `alignment_undetermined` (with `export_gap` on its row), and every edge delta and sink overlay
+    row resting on it is undetermined with reason `degenerate_block_source`.
+  - `list_diff_blindspots` gains `partial`: the diffs that succeeded with listed functions, with
+    the per-side export counts. `get_diff_meta` reports which builder each side used, the repair
+    counts, and `bindiff_vertex0_fallbacks` (flow-graph edges BinDiff could not resolve to a block
+    of their graph and fell back on the graph's first vertex for). The new columns are added
+    automatically when an older atlas is opened.
+  - The export script is not part of the extraction fingerprint, so nothing is re-extracted. The
+    binaries that failed this way are retried by the next full diff while under the retry cap.
+- **A failed diff's reason is set by the step that failed.** It used to be read back out of the
+  error message, which also carries the command line and the binary's path. An export that wrote
+  nothing was recorded as `timeout` because the command line carries `-analysisTimeoutPerFile`
+  (and so was a failure of any binary with "timeout" in its name). Any BinDiff failure was recorded
+  as `binexport_ghidra_crash`, because the command line names the `.BinExport` files. A BinDiff
+  failure is now `bindiff_flowgraph` only when BinDiff's own output says so, and `bindiff_failed`
+  (new) otherwise. A BinDiff run that exits 0 without writing a result is also `bindiff_failed`
+  (it was `binexport_no_file`).
+
 - **A sink called through an unresolved lazy-binding stub now gets its def-use provenance.** In a
   stripped binary the decompiler renders such a call as `FUN_<stub-addr>(…)`; the extractor did not
   recognise it as `system` / `printf` / a writer / an nvram accessor, so the call carried no

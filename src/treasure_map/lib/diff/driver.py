@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -57,6 +58,12 @@ from treasure_map.lib.diff.currency import (
     side_stamp,
     stamps_equal,
 )
+from treasure_map.lib.diff.export_report import (
+    ExportReport,
+    ExportReportError,
+    read_export_report,
+    report_path,
+)
 from treasure_map.lib.diff.layer0 import (
     _confirmed_same_version,
     _next_attempts,
@@ -85,6 +92,8 @@ if TYPE_CHECKING:
 # is not on that hash path.
 _SCRIPT_DIR = Path(__file__).parent / "ghidra"
 _BINEXPORT_SCRIPT = "ExportBinExport.java"
+# The modified copy of the extension's builder the script falls back to; compiled with it.
+_FALLBACK_BUILDER = "FallbackBinExport2Builder.java"
 
 # BinExport JVM heap for a diff. Deliberately a conservative fixed ceiling, NOT the per-binary
 # adaptive_heap_mb ladder scan uses: RSS (~950MB measured) is not the -Xmx a peak analysis needs,
@@ -105,10 +114,25 @@ _DIFF_BINEXPORT_HEAP_MB = 4096
 _DIFF_PER_JVM_MB = 1600
 
 
+# What a toolchain failure is, as recorded in a failed diff's diff_status_reason. Set where the
+# failure is raised, from what the step itself observed (a TimeoutExpired, its own exit code, its
+# own output), never read back out of a message that also carries argv and paths.
+FAIL_TIMEOUT = "timeout"  # a toolchain subprocess ran past its timeout
+FAIL_BINEXPORT_NO_FILE = "binexport_no_file"  # Ghidra exited 0, but the export script did not
+FAIL_BINEXPORT_CRASH = "binexport_ghidra_crash"  # Ghidra exited non-zero
+FAIL_BINDIFF_FLOWGRAPH = "bindiff_flowgraph"  # BinDiff rejected a flow graph of an export
+FAIL_BINDIFF = "bindiff_failed"  # any other BinDiff failure (or no .BinDiff written)
+FAIL_OTHER = "other"
+
+
 class DiffToolchainError(TreasureMapError):
     """The external diff toolchain (Ghidra + BinExport plugin + BinDiff CLI) is not available, or a
     toolchain step failed. Distinct from ConfigError (a data/run problem) so the CLI can point at
-    the toolchain install rather than the atlas."""
+    the toolchain install rather than the atlas. ``kind`` is one of the ``FAIL_*`` values."""
+
+    def __init__(self, message: str, *, kind: str = FAIL_OTHER) -> None:
+        super().__init__(message)
+        self.kind = kind
 
 
 @dataclass(frozen=True)
@@ -184,24 +208,19 @@ class ExtractionUnstampedError(ConfigError):
 
 
 def _classify_failure_reason(exc: BaseException) -> str:
-    """Bucket a toolchain failure so a consumer can tell a likely-transient failure from a hard
-    boundary. Matches the DETERMINISTIC message text the toolchain steps raise (``_run_binexport`` /
-    ``_run_bindiff``); anything unrecognized is 'other'. Order matters -- timeout is checked before
-    the generic step failure so a timed-out export is not miscounted as a crash."""
+    """Bucket a diff failure so a consumer can tell a likely-transient failure from a hard boundary.
+
+    A toolchain failure carries its bucket (``DiffToolchainError.kind``, set where it was raised);
+    the message is never parsed for it. The message holds the argv, the binary's path and the
+    tools' output, so words in any of them (a library named ``…timeout…``, the
+    ``-analysisTimeoutPerFile`` flag, an export path) would otherwise pick the bucket."""
     if isinstance(exc, AmbiguousBinarySelectorError):
         return AMBIGUOUS_SELECTOR_REASON
     if isinstance(exc, ExtractionUnstampedError):
         return EXTRACTION_UNSTAMPED_REASON
-    msg = str(exc).lower()
-    if "timed out" in msg or "timeout" in msg:
-        return "timeout"
-    if "produced no file" in msg or "produced no .bindiff" in msg:
-        return "binexport_no_file"
-    if "basic block" in msg or "flowgraph" in msg or "flow graph" in msg:
-        return "bindiff_flowgraph"
-    if "binexport" in msg:
-        return "binexport_ghidra_crash"
-    return "other"
+    if isinstance(exc, DiffToolchainError):
+        return exc.kind
+    return FAIL_OTHER
 
 
 def _record_diff_failure(
@@ -512,11 +531,12 @@ def _check_toolchain(config: Config) -> None:
         missing.append("the BinExport Ghidra extension (install the prebuilt BinExport for 11.4.3)")
     # tmap's OWN export script is a runtime .java asset — a wheel that dropped the package-data glob
     # would ship without it, so verify it here (a packaging problem, not a missing 3rd-party tool).
-    if not (_SCRIPT_DIR / _BINEXPORT_SCRIPT).is_file():
-        missing.append(
-            f"tmap's own {_BINEXPORT_SCRIPT} (expected at {_SCRIPT_DIR}) — a packaging problem, "
-            "not a missing third-party tool: reinstall tmap"
-        )
+    for script in (_BINEXPORT_SCRIPT, _FALLBACK_BUILDER):
+        if not (_SCRIPT_DIR / script).is_file():
+            missing.append(
+                f"tmap's own {script} (expected at {_SCRIPT_DIR}) — a packaging problem, "
+                "not a missing third-party tool: reinstall tmap"
+            )
     if _find_bindiff() is None:
         missing.append("the 'bindiff' CLI on PATH (install BinDiff 8)")
     if missing:
@@ -712,6 +732,7 @@ def _run_binexport(so_path: Path, config: Config, out_dir: Path, side: str, time
             "-postScript",
             _BINEXPORT_SCRIPT,
             str(export_path),
+            str(report_path(export_path)),
             "-scriptPath",
             str(_SCRIPT_DIR),
             "-deleteProject",
@@ -727,18 +748,21 @@ def _run_binexport(so_path: Path, config: Config, out_dir: Path, side: str, time
             )
         except subprocess.TimeoutExpired as exc:
             raise DiffToolchainError(
-                f"BinExport timed out for side {side} ({so_path.name})"
+                f"BinExport timed out for side {side} ({so_path.name})", kind=FAIL_TIMEOUT
             ) from exc
     if proc.returncode != 0:
         raise DiffToolchainError(
             f"BinExport subprocess failed (side {side}, {so_path.name}, rc={proc.returncode})\n"
-            + _diag(cmd, proc, log_path)
+            + _diag(cmd, proc, log_path),
+            kind=FAIL_BINEXPORT_CRASH,
         )
-    if not export_path.exists():
+    if not export_path.exists() or not report_path(export_path).is_file():
         raise DiffToolchainError(
             f"BinExport produced no file for side {side} ({so_path.name}) although the process "
             "exited 0 — the postScript did not run to completion (analyzeHeadless returns 0 even "
-            f"when a postScript aborts). Expected: {export_path}\n" + _diag(cmd, proc, log_path)
+            f"when a postScript aborts). Expected: {export_path} and its report\n"
+            + _diag(cmd, proc, log_path),
+            kind=FAIL_BINEXPORT_NO_FILE,
         )
     return export_path
 
@@ -750,7 +774,9 @@ def _run_bindiff(export_a: Path, export_b: Path, out_dir: Path, timeout_s: int) 
     line is the adjustment point if the CLI's flags change across versions."""
     bindiff = _find_bindiff()
     if bindiff is None:
-        raise DiffToolchainError("the 'bindiff' CLI is not on PATH (install BinDiff 8)")
+        raise DiffToolchainError(
+            "the 'bindiff' CLI is not on PATH (install BinDiff 8)", kind=FAIL_BINDIFF
+        )
     cmd = [
         str(bindiff),
         "--primary",
@@ -765,15 +791,42 @@ def _run_bindiff(export_a: Path, export_b: Path, out_dir: Path, timeout_s: int) 
             cmd, capture_output=True, timeout=timeout_s
         )
     except subprocess.TimeoutExpired as exc:
-        raise DiffToolchainError("BinDiff timed out") from exc
+        raise DiffToolchainError("BinDiff timed out", kind=FAIL_TIMEOUT) from exc
+    output = (proc.stdout or b"") + (proc.stderr or b"")
+    (out_dir / _BINDIFF_LOG).write_bytes(output)
     if proc.returncode != 0:
-        raise DiffToolchainError(f"BinDiff failed (rc={proc.returncode})\n" + _diag(cmd, proc))
+        # Bucketed on BinDiff's OWN output only: the argv (export paths) is not looked at.
+        text = output.decode(errors="replace").lower()
+        flow_graph = any(w in text for w in ("flow graph", "flowgraph", "basic block"))
+        raise DiffToolchainError(
+            f"BinDiff failed (rc={proc.returncode})\n" + _diag(cmd, proc),
+            kind=FAIL_BINDIFF_FLOWGRAPH if flow_graph else FAIL_BINDIFF,
+        )
     produced = sorted(out_dir.glob("*.BinDiff"))
     if not produced:
         raise DiffToolchainError(
-            "BinDiff exited 0 but produced no .BinDiff output\n" + _diag(cmd, proc)
+            "BinDiff exited 0 but produced no .BinDiff output\n" + _diag(cmd, proc),
+            kind=FAIL_BINDIFF,
         )
     return produced[0]
+
+
+# BinDiff's output of a run, kept beside the .BinDiff so the compute phase can count from it.
+_BINDIFF_LOG = "bindiff.log"
+# The line BinDiff logs, once per flow-graph edge, when the edge's target is not a basic block of
+# that flow graph (the export left the target index unset, which reads as block 0); BinDiff then
+# carries on from the flow graph's first vertex.
+_VERTEX0_FALLBACK = re.compile(rb"Could not find basic block: [0-9A-Fa-f]+")
+
+
+def _vertex0_fallbacks(out_dir: Path) -> int | None:
+    """How many flow-graph edges BinDiff resolved to the graph's first vertex because their target
+    was not one of the graph's basic blocks, from its log; None when there is no log (BinDiff did
+    not run)."""
+    log = out_dir / _BINDIFF_LOG
+    if not log.is_file():
+        return None
+    return len(_VERTEX0_FALLBACK.findall(log.read_bytes()))
 
 
 # ── the whole pipeline: preflight (atlas) -> compute (zero-atlas) -> persist (atlas) ───
@@ -798,6 +851,12 @@ class DiffArtifacts:
     targets_a: dict[str, list[str]] | None = None
     targets_b: dict[str, list[str]] | None = None
     decode_warnings: tuple[str, ...] = ()
+    # Each side's export report (lib/diff/export_report: the functions the export could not
+    # represent faithfully) and BinDiff's first-vertex fallbacks. None = not produced by the real
+    # toolchain (a stubbed compute), recorded as unknown.
+    report_a: ExportReport | None = None
+    report_b: ExportReport | None = None
+    bindiff_vertex0_fallbacks: int | None = None
 
 
 def _decode_targets(path: Path, side: str) -> tuple[dict[str, list[str]] | None, str | None]:
@@ -818,6 +877,8 @@ def compute_diff(so_a: Path, so_b: Path, td: Path, config: Config) -> DiffArtifa
     timeout_s = config.ghidra.headless_timeout_seconds
     export_a = _run_binexport(so_a, config, td, "a", timeout_s)
     export_b = _run_binexport(so_b, config, td, "b", timeout_s)
+    report_a = _read_report(export_a, "a")
+    report_b = _read_report(export_b, "b")
     bindiff_path = _run_bindiff(export_a, export_b, td, timeout_s)
     targets_a, warn_a = _decode_targets(export_a, "a")
     targets_b, warn_b = _decode_targets(export_b, "b")
@@ -828,7 +889,23 @@ def compute_diff(so_a: Path, so_b: Path, td: Path, config: Config) -> DiffArtifa
         targets_a=targets_a,
         targets_b=targets_b,
         decode_warnings=tuple(w for w in (warn_a, warn_b) if w is not None),
+        report_a=report_a,
+        report_b=report_b,
+        bindiff_vertex0_fallbacks=_vertex0_fallbacks(td),
     )
+
+
+def _read_report(export_path: Path, side: str) -> ExportReport | None:
+    """One side's export report. One that is there but unreadable fails the diff: it lists the
+    functions every reader must treat as undetermined, so going on without it would let them read
+    as determined."""
+    try:
+        return read_export_report(export_path)
+    except (OSError, ExportReportError) as exc:
+        raise DiffToolchainError(
+            f"the export report for side {side} ({export_path.name}) cannot be read: {exc}",
+            kind=FAIL_BINEXPORT_NO_FILE,
+        ) from exc
 
 
 def _persist_success(
@@ -845,6 +922,9 @@ def _persist_success(
     targets_b: dict[str, list[str]] | None,
     version_skew: bool,
     warnings: tuple[str, ...],
+    report_a: ExportReport | None = None,
+    report_b: ExportReport | None = None,
+    bindiff_vertex0_fallbacks: int | None = None,
 ) -> DiffSummary:
     """The serial persist phase for a SUCCESSFUL compute: parse the .BinDiff into the atlas (layer0)
     and project the deltas (layer2), as ONE atomic write. The call-site facts for the chosen
@@ -879,6 +959,9 @@ def _persist_success(
             diff_id=diff_id,
             commit=False,
             stamps=stamps,
+            report_a=report_a,
+            report_b=report_b,
+            bindiff_vertex0_fallbacks=bindiff_vertex0_fallbacks,
         )
         # Sink-overlay cross-side bridge: store this diff's candidate-callsite instruction matches
         # (either side's candidates) while the .BinDiff is still on disk (the caller rmtrees the
@@ -1007,6 +1090,9 @@ def run_version_diff(
             targets_b=artifacts.targets_b,
             version_skew=pf.version_skew,
             warnings=currency_warnings + pf.warnings + artifacts.decode_warnings,
+            report_a=artifacts.report_a,
+            report_b=artifacts.report_b,
+            bindiff_vertex0_fallbacks=artifacts.bindiff_vertex0_fallbacks,
         )
     finally:
         shutil.rmtree(td, ignore_errors=True)
@@ -1284,6 +1370,9 @@ def _persist_outcome(
             targets_b=artifacts.targets_b,
             version_skew=rd.version_skew,
             warnings=rd.warnings + artifacts.decode_warnings,
+            report_a=artifacts.report_a,
+            report_b=artifacts.report_b,
+            bindiff_vertex0_fallbacks=artifacts.bindiff_vertex0_fallbacks,
         )
     except TreasureMapError as exc:
         # _persist_success already recorded the failed row atomically; belt-and-braces rollback so

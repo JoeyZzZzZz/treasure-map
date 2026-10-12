@@ -1716,8 +1716,10 @@ def make_tools(
         only ``persisted`` / ``presence_undetermined`` (anything else is an error; filter whole
         unmatched functions with ``reason="function_unmatched"``). ``presence_undetermined`` is NOT
         'unchanged': read ``presence_reason`` (function_unmatched / instruction_unmatched /
-        crossside_match_degraded / present_different_callee / alignment_low_confidence / ... — an
-        enum that may grow; do not branch on it). ``persisted`` at the callsite level requires the
+        crossside_match_degraded / present_different_callee / alignment_low_confidence /
+        degenerate_block_source (the candidate's function, or its counterpart, is one its export
+        could not hold as it is — see list_diff_blindspots' ``partial``) / ... — an enum that may
+        grow; do not branch on it). ``persisted`` at the callsite level requires the
         matched call on the other side to call the SAME sink.
 
         When BinDiff matched a candidate's call to an other-side instruction that is NOT a
@@ -1976,7 +1978,10 @@ def make_tools(
 
         ★ UNKNOWN is not SAFE: a binary missing from the deltas may simply have FAILED to diff. Each
         row gives ``diff_status_reason`` (why it failed — e.g. binexport_ghidra_crash likely
-        transient, bindiff_flowgraph likely a hard boundary), ``diff_attempts`` (how many tries),
+        transient; timeout; binexport_no_file = the export script did not finish;
+        bindiff_flowgraph = BinDiff rejected a flow graph, which the export repair is meant to
+        prevent, so report it; bindiff_failed = any other BinDiff failure), ``diff_attempts`` (how
+        many tries),
         and ``suspected_hard`` (1 = hit the retry cap, so later full diffs skip it unless
         force_retry; a HINT from repeated identical-content failures, never proof the binary is
         undiffable — its content changing resets the count). Read this alongside get_diff_deltas so
@@ -1984,7 +1989,15 @@ def make_tools(
         the binary has no recorded extraction (re-scan the run). ``baseline_dropped=1`` = the
         diff had a stored candidate baseline, dropped by this failure or an earlier re-diff and not
         stored again. Each row also
-        carries ``source_stale`` / ``source_stale_reason`` (as in list_diffs)."""
+        carries ``source_stale`` / ``source_stale_reason`` (as in list_diffs).
+
+        ★ ``partial``: the diffs that SUCCEEDED but whose export could not hold some functions as
+        they are — a flow graph dropped because it had no entry block, or (when the export had to
+        be rebuilt) a basic block entered through a delay slot. Those functions are
+        ``unmatched_analysis_incomplete`` or ``alignment_undetermined`` in the diff, and every
+        delta / overlay row resting on them is undetermined with reason
+        ``degenerate_block_source``. Each row gives the per-side export counts and
+        ``marked_rows``."""
         conn = open_atlas(atlas_path)
         try:
             return _list_diff_blindspots(conn, run_a_id, run_b_id)

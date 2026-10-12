@@ -230,7 +230,10 @@ def test_full_diff_compute_exc_classified_in_persist(
     monkeypatch.setattr(driver, "preflight", _fake_preflight(tmp_path))
 
     def _compute(so_a, so_b, td, config):  # type: ignore[no-untyped-def]
-        raise DiffToolchainError("BinDiff failed (rc=1) Could not find basic block 000E1920")
+        raise DiffToolchainError(
+            "BinDiff failed (rc=1) Could not find basic block 000E1920",
+            kind=driver.FAIL_BINDIFF_FLOWGRAPH,
+        )
 
     monkeypatch.setattr(driver, "compute_diff", _compute)
     con = open_atlas(atlas_path)
@@ -256,7 +259,9 @@ def test_full_diff_one_failure_does_not_corrupt_others(
 
     def _compute(so_a, so_b, td, config):  # type: ignore[no-untyped-def]
         if "boom" in so_a.name:
-            raise DiffToolchainError("BinExport subprocess failed (rc=1)")
+            raise DiffToolchainError(
+                "BinExport subprocess failed (rc=1)", kind=driver.FAIL_BINEXPORT_CRASH
+            )
         return driver.DiffArtifacts(so_a, so_b, td)
 
     monkeypatch.setattr(driver, "compute_diff", _compute)

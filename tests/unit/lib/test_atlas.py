@@ -865,6 +865,18 @@ def test_open_atlas_drops_a_stale_exec_edge_resolved_via(tmp_path: Path) -> None
         ("diff_meta", "hunt_instances_b"),
         ("diff_meta", "diff_code_version"),
         ("diff_meta", "baseline_dropped"),
+        ("diff_meta", "export_builder_a"),
+        ("diff_meta", "export_builder_b"),
+        ("diff_meta", "export_entry_addresses_added_a"),
+        ("diff_meta", "export_entry_addresses_added_b"),
+        ("diff_meta", "export_flow_graphs_dropped_a"),
+        ("diff_meta", "export_flow_graphs_dropped_b"),
+        ("diff_meta", "export_degenerate_functions_a"),
+        ("diff_meta", "export_degenerate_functions_b"),
+        ("diff_meta", "bindiff_vertex0_fallbacks"),
+        ("function_alignment", "export_gap_a"),
+        ("function_alignment", "export_gap_b"),
+        ("function_presence", "export_gap"),
     ],
 )
 def test_open_atlas_reopens_old_shape_missing_migrated_column(

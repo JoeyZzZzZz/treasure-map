@@ -22,6 +22,7 @@ _ASSETS = [
     ("treasure_map.lib.analyze.ghidra", "ExportFunctions.java"),
     ("treasure_map.lib.analyze.ghidra", "extractor_names.tsv"),
     ("treasure_map.lib.diff.ghidra", "ExportBinExport.java"),
+    ("treasure_map.lib.diff.ghidra", "FallbackBinExport2Builder.java"),
     ("treasure_map.lib.storage", "atlas_schema.sql"),
     ("treasure_map.lib.storage", "schema.sql"),
 ]

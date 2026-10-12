@@ -67,7 +67,8 @@ carry no function address and cannot be lined up; they are counted as ``excluded
   different content hash was diffed instead).
   function level: ``function_unmatched`` (no counterpart function; this side's analysis is
   complete), ``counterpart_not_analyzed``, ``no_counterpart_undetermined``,
-  ``alignment_low_confidence``.
+  ``alignment_low_confidence``, ``degenerate_block_source`` (the candidate's function, or the
+  function it is paired with, is one its export could not hold as it is — lib/diff/export_report).
   callsite level: ``crossside_match_degraded`` (this diff has no instruction-match data at all),
   ``instruction_unmatched`` (instruction data exists but this callsite was not matched — an export
   gap or a changed basic block; this backend cannot tell which), ``present_different_callee``,
@@ -113,6 +114,7 @@ from treasure_map.lib.callsite_ref import (
     ref_suffix_parts,
     wrapper_call_abs_addr,
 )
+from treasure_map.lib.diff.export_report import DEGENERATE_BLOCK_SOURCE, load_export_gaps
 from treasure_map.lib.errors import TreasureMapError
 from treasure_map.version import UNKNOWN_VERSION
 
@@ -447,6 +449,9 @@ class _DiffCtx:
     facts_hash_b: str | None = None
     stub_state_a: str | None = None
     stub_state_b: str | None = None
+    # per side, the functions whose comparison rests on an export gap (lib/diff/export_report)
+    gaps_a: frozenset[str] = frozenset()
+    gaps_b: frozenset[str] = frozenset()
 
 
 def _load_diff_ctx(atlas: sqlite3.Connection, diff_id: str) -> _DiffCtx | None:
@@ -488,6 +493,7 @@ def _load_diff_ctx(atlas: sqlite3.Connection, diff_id: str) -> _DiffCtx | None:
         imatch_b[addr_b] = addr_a
         facts_a[addr_a] = _parse_facts(fa)
         facts_b[addr_b] = _parse_facts(fb)
+    gaps_a, gaps_b = load_export_gaps(atlas, diff_id)
     return _DiffCtx(
         diff_id=diff_id,
         binary=binary_a,
@@ -513,6 +519,8 @@ def _load_diff_ctx(atlas: sqlite3.Connection, diff_id: str) -> _DiffCtx | None:
         facts_hash_b=fh_b,
         stub_state_a=ss_a,
         stub_state_b=ss_b,
+        gaps_a=frozenset(gaps_a),
+        gaps_b=frozenset(gaps_b),
     )
 
 
@@ -642,6 +650,10 @@ class _Dir:
     other_facts_state: str | None = None
     other_facts_stale: bool = False
     other_stub_state: str | None = None
+    # this / the other side's functions whose comparison rests on an export gap
+    # (lib/diff/export_report)
+    gaps: frozenset[str] = frozenset()
+    other_gaps: frozenset[str] = frozenset()
 
 
 # (presence, reason, match_basis, counterpart_call, other-side candidate or None,
@@ -940,6 +952,11 @@ def _funclevel_verdict(cand: _Cand, other_fe: str, d: _Dir) -> _Verdict:
 
 def _verdict(cand: _Cand, d: _Dir) -> tuple[_Verdict, float | None]:
     fe = cand.func_entry
+    if fe in d.gaps:
+        # the function, or its counterpart, is not held as it is by its export: whatever BinDiff
+        # paired or left unpaired there is not evidence either way
+        conf = d.align[fe][1] if fe in d.align else None
+        return (_P_UNDET, DEGENERATE_BLOCK_SOURCE, "function_level", None, None, None), conf
     if fe not in d.align:
         p, reason = _function_unmatched(fe, d)
         return (p, reason, "function_level", None, None, None), None
@@ -1059,6 +1076,8 @@ def _key_row(
     reason: str | None
     if poisoned:
         p, reason = _P_UNDET, "coclaim_unresolved"
+    elif fe in d.gaps or (other_rep is not None and other_rep.func_entry in d.other_gaps):
+        p, reason = _P_UNDET, DEGENERATE_BLOCK_SOURCE
     elif fe not in d.align:
         p, reason = _function_unmatched(fe, d)
     elif d.align[fe][2] != "aligned":
@@ -1246,6 +1265,8 @@ def _compute(
         other_facts_state=ctx.facts_state_b,
         other_facts_stale=_facts_stale(atlas, ctx.run_b, ctx.facts_hash_b),
         other_stub_state=ctx.stub_state_b,
+        gaps=ctx.gaps_a,
+        other_gaps=ctx.gaps_b,
     )
     db = _Dir(
         side="b",
@@ -1261,6 +1282,8 @@ def _compute(
         other_facts_state=ctx.facts_state_a,
         other_facts_stale=_facts_stale(atlas, ctx.run_a, ctx.facts_hash_a),
         other_stub_state=ctx.stub_state_a,
+        gaps=ctx.gaps_b,
+        other_gaps=ctx.gaps_a,
     )
     b_row_of: dict[int, int] = {}
     _judge_pass(out, da, diff_id, ctx.binary, b_row_of)

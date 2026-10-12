@@ -27,6 +27,7 @@ from treasure_map.lib.atlas.writer import (
 from treasure_map.lib.diff import currency, driver
 from treasure_map.lib.diff.driver import _DIFF_RETRY_LIMIT, DiffToolchainError
 from treasure_map.lib.diff.layer0 import make_diff_id
+from treasure_map.lib.errors import ConfigError
 from treasure_map.lib.query import diff_align
 from treasure_map.lib.storage.connection import open_db
 
@@ -177,7 +178,10 @@ def test_record_diff_failure_writes_honest_row(tmp_path: Path) -> None:
         run_a_id="run_a",
         run_b_id="run_b",
         binary_short="liba",
-        exc=DiffToolchainError("BinDiff failed (rc=1) ... Could not find basic block 000E1920"),
+        exc=DiffToolchainError(
+            "BinDiff failed (rc=1) ... Could not find basic block 000E1920",
+            kind=driver.FAIL_BINDIFF_FLOWGRAPH,
+        ),
     )
     row = con.execute(
         "SELECT diff_ok, diff_status, diff_status_reason, diff_attempts, sha256_a, sha256_b, "
@@ -188,7 +192,7 @@ def test_record_diff_failure_writes_honest_row(tmp_path: Path) -> None:
     assert row is not None  # ★ the failure is persisted, not dropped
     assert row[0] == 0  # diff_ok
     assert row[1] == "failed"
-    assert row[2] == "bindiff_flowgraph"  # classified from the message
+    assert row[2] == "bindiff_flowgraph"  # the bucket the raising step gave it
     assert row[3] == 1 and attempts == 1
     assert (row[4], row[5]) == ("s1", "s1b")  # the content it ran on, for the incremental gate
     assert row[6] == "liba"  # binary_a set so plan_full_diff can map it
@@ -196,17 +200,22 @@ def test_record_diff_failure_writes_honest_row(tmp_path: Path) -> None:
 
 
 def test_failure_reason_buckets() -> None:
-    # the classifier distinguishes a likely-transient crash from a hard boundary from a timeout.
+    # The classifier reads the bucket the raising step set, never the message: a message naming
+    # another bucket's words does not move it, and an untagged toolchain error is 'other'.
     c = driver._classify_failure_reason
-    assert c(DiffToolchainError("BinExport subprocess failed (side a, x.so, rc=1)")) == (
-        "binexport_ghidra_crash"
-    )
-    assert c(DiffToolchainError("BinDiff failed (rc=1) Could not find basic block 000E1920")) == (
-        "bindiff_flowgraph"
-    )
-    assert c(DiffToolchainError("BinExport produced no file for side b")) == "binexport_no_file"
-    assert c(DiffToolchainError("BinExport timed out for side a")) == "timeout"
-    assert c(DiffToolchainError("something unexpected")) == "other"
+    for kind in (
+        driver.FAIL_TIMEOUT,
+        driver.FAIL_BINEXPORT_NO_FILE,
+        driver.FAIL_BINEXPORT_CRASH,
+        driver.FAIL_BINDIFF_FLOWGRAPH,
+        driver.FAIL_BINDIFF,
+    ):
+        assert (
+            c(DiffToolchainError("timed out; produced no file; flow graph; binexport", kind=kind))
+            == kind
+        )
+    assert c(DiffToolchainError("BinExport timed out for side a")) == "other"
+    assert c(ConfigError("BinExport produced no file")) == "other"
 
 
 # ── the atomic sequence: a second failure of the same binary must not crash ─────────────

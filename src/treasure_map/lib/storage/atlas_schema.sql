@@ -489,6 +489,10 @@ CREATE TABLE IF NOT EXISTS function_alignment (
     basicblocks           INTEGER,         -- carried for candidate-level alignment
     edges                 INTEGER,
     instructions          INTEGER,
+    export_gap_a          TEXT,            -- NULL, or why side A's function is not represented
+    export_gap_b          TEXT,            --   faithfully in its export: 'degenerate_block' /
+                                           --   'flow_graph_dropped' (lib/diff/export_report). Such
+                                           --   a pair is always 'alignment_undetermined'.
     UNIQUE(diff_id, addr_a, addr_b)
 );
 CREATE INDEX IF NOT EXISTS idx_falign_diff ON function_alignment(diff_id);
@@ -528,6 +532,9 @@ CREATE TABLE IF NOT EXISTS function_presence (
                                     --   lacks this address
     decompiled     INTEGER,         -- 1 / 0 / NULL(unknown): was this side's decompile a success?
                                     --   NULL when size_bytes is unrecorded (cannot classify)
+    export_gap     TEXT,            -- NULL, or why this function is not represented faithfully
+                                    --   in its export ('degenerate_block' / 'flow_graph_dropped');
+                                    --   such a function is always 'unmatched_analysis_incomplete'
     UNIQUE(diff_id, side, addr)
 );
 CREATE INDEX IF NOT EXISTS idx_fpres ON function_presence(diff_id, side);
@@ -657,6 +664,18 @@ CREATE TABLE IF NOT EXISTS diff_meta (
     baseline_dropped        INTEGER NOT NULL DEFAULT 0,  -- 1 = the diff had a stored candidate
                                              --   baseline that a re-diff dropped (it failed, or
                                              --   the baseline could not be stored again)
+    export_builder_a        TEXT,            -- per side: 'extension' | 'fallback' (the export was
+    export_builder_b        TEXT,            --   rebuilt, lib/diff/export_report); NULL = not
+                                             --   recorded
+    export_entry_addresses_added_a INTEGER,  -- flow-graph entries given the explicit address the
+    export_entry_addresses_added_b INTEGER,  --   reader would have derived (changes no address)
+    export_flow_graphs_dropped_a INTEGER,    -- flow graphs removed for having no entry block
+    export_flow_graphs_dropped_b INTEGER,
+    export_degenerate_functions_a INTEGER,   -- functions holding a block entered through a
+    export_degenerate_functions_b INTEGER,   --   delay slot (fallback exports only)
+    bindiff_vertex0_fallbacks INTEGER,       -- flow-graph edges BinDiff resolved to the graph's
+                                             --   first vertex (their target was not one of the
+                                             --   graph's blocks)
     created_at              DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
