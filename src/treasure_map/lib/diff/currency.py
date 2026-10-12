@@ -18,14 +18,19 @@ with what the same input is now:
     re-extraction, which says nothing about this one.
   * hunt inputs — a digest of exactly the hunt output the diff reads (``hunt_inputs_digest``), so
     a re-hunt that reproduces the same output leaves the diff current.
-  * diff code — ``DIFF_CODE_VERSION``.
+  * diff code — ``diff_code_version()``, a hash of the Python code that writes the diff
+    (lib/diff/code_version), and per side ``export_code_hash``, a hash of the export script files
+    that side's export took.
+  * the external toolchain — the versions of Ghidra, the BinExport extension and BinDiff used
+    (lib/diff/toolchain). Compared only when the current ones can be read; a machine that cannot
+    read them does not reset or force anything on their account.
 
 Equality is plain equality: None equals None. A binary that has never been extracted has no pass
 on either occasion, and that is the same answer twice, not an unknown.
 
-BOUNDARY: the versions of the external diff toolchain (Ghidra, BinDiff, the BinExport plugin) used
-at diff time are not recorded, so upgrading them is not detected here. ``ghidra_version`` is the
-version the scan recorded for the binary, not one measured at diff time.
+BOUNDARY: third-party Python libraries and the interpreter are not recorded (the diff modules use
+only the standard library and sqlite). ``ghidra_version`` is the version the scan recorded for the
+binary; the Ghidra the diff ran is the toolchain stamp.
 """
 
 from __future__ import annotations
@@ -37,15 +42,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-# The diff code's version: a hand-bumped epoch, then the first 12 hex digits of the digest of what
-# the diff writes for a fixed input (the golden diff in tests/unit/lib/test_diff_currency.py). A
-# change to the diff code that changes its output for that input changes the digest, and the golden
-# test fails until this constant is updated to match — so a diff stored by other code reads as
-# stale rather than current. The golden input cannot reach everything the diff output depends on
-# (the export script ExportBinExport.java, the BinExport decoder's handling of shapes it does not
-# contain, the shared ref / binary-identity / callee-name helpers on inputs it does not exercise):
-# bump the epoch by hand when such a change alters what a diff writes.
-DIFF_CODE_VERSION = "1-0f7ac1cdb02b"
+from treasure_map.lib.diff.code_version import export_code_hash
+from treasure_map.lib.diff.toolchain import Toolchain
 
 # The diff_meta columns a re-diff decision compares (scanned_at / hunt_instances are not among
 # them: they only let a reader skip recomputing the hunt-input digest, see the read side).
@@ -57,7 +55,13 @@ COMPARED_COLUMNS = (
     "hunt_inputs_hash_a",
     "hunt_inputs_hash_b",
     "diff_code_version",
+    "export_code_hash_a",
+    "export_code_hash_b",
+    "toolchain_ghidra",
+    "toolchain_binexport",
+    "toolchain_bindiff",
 )
+TOOLCHAIN_COLUMNS = ("toolchain_ghidra", "toolchain_binexport", "toolchain_bindiff")
 
 
 @dataclass(frozen=True)
@@ -69,6 +73,7 @@ class SideStamp:
     hunt_inputs_hash: str | None
     scanned_at: str | None
     hunt_instances: int | None
+    export_code_hash: str | None = None
 
 
 @dataclass(frozen=True)
@@ -76,6 +81,7 @@ class DiffStamps:
     a: SideStamp
     b: SideStamp
     diff_code_version: str | None
+    toolchain: Toolchain | None = None
 
     def compared(self) -> dict[str, object]:
         """The compared stamps keyed by their diff_meta column (see COMPARED_COLUMNS)."""
@@ -87,7 +93,19 @@ class DiffStamps:
             "hunt_inputs_hash_a": self.a.hunt_inputs_hash,
             "hunt_inputs_hash_b": self.b.hunt_inputs_hash,
             "diff_code_version": self.diff_code_version,
+            "export_code_hash_a": self.a.export_code_hash,
+            "export_code_hash_b": self.b.export_code_hash,
+            **toolchain_columns(self.toolchain),
         }
+
+
+def toolchain_columns(toolchain: Toolchain | None) -> dict[str, str | None]:
+    """The diff_meta toolchain columns for ``toolchain`` (all None when it was not read)."""
+    return {
+        "toolchain_ghidra": toolchain.ghidra if toolchain else None,
+        "toolchain_binexport": toolchain.binexport if toolchain else None,
+        "toolchain_bindiff": toolchain.bindiff if toolchain else None,
+    }
 
 
 UNSTAMPED = DiffStamps(
@@ -209,8 +227,10 @@ def side_stamp(
     analysis_db_path: str | None,
     sha: str | None,
     binary: str | None,
+    export_builder: str | None = None,
 ) -> SideStamp:
-    """The current stamps of one side."""
+    """The current stamps of one side; ``export_builder`` is the path its export took (None when
+    not known: a failed attempt), which picks the export script files hashed."""
     pv, gv = extraction_stamp(analysis_db_path, sha)
     marks = run_hunt_marks(atlas, run_id) or (None, None)
     return SideStamp(
@@ -219,4 +239,5 @@ def side_stamp(
         hunt_inputs_hash=hunt_inputs_digest(atlas, run_id, sha, binary),
         scanned_at=marks[0],
         hunt_instances=marks[1],
+        export_code_hash=export_code_hash(export_builder),
     )

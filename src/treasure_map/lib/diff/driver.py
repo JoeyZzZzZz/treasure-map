@@ -42,14 +42,16 @@ from treasure_map.lib.analyze.ghidra_runner import current_pass_version as _curr
 from treasure_map.lib.atlas.models import DiffMetaRow
 from treasure_map.lib.atlas.writer import add_diff_meta, delete_diff
 from treasure_map.lib.binary_id import BinaryRow, resolve_binary_in_db
+from treasure_map.lib.diff import toolchain as _toolchain
 from treasure_map.lib.diff.binexport2 import BinExportDecodeError, decode_call_targets
 from treasure_map.lib.diff.callsite_facts import (
     _build_hash_with_rows,
     derive_and_store_callsite_facts,
 )
+from treasure_map.lib.diff.code_version import diff_code_version, export_code_hash
 from treasure_map.lib.diff.currency import (
     COMPARED_COLUMNS,
-    DIFF_CODE_VERSION,
+    TOOLCHAIN_COLUMNS,
     DiffStamps,
     SideStamp,
     extraction_stamp,
@@ -57,6 +59,7 @@ from treasure_map.lib.diff.currency import (
     read_extraction,
     side_stamp,
     stamps_equal,
+    toolchain_columns,
 )
 from treasure_map.lib.diff.export_report import (
     ExportReport,
@@ -77,7 +80,7 @@ from treasure_map.lib.diff.layer2 import run_layer2_delta
 from treasure_map.lib.errors import ConfigError, GhidraNotFoundError, TreasureMapError
 from treasure_map.lib.machine import clamp_parallelism_to_memory
 from treasure_map.lib.query.runs import run_staleness
-from treasure_map.lib.query.sink_overlay import persist_sink_overlay
+from treasure_map.lib.query.sink_overlay import persist_sink_overlay, read_sink_overlay_baseline
 from treasure_map.version import installed_commit as _installed_commit
 
 logger = logging.getLogger(__name__)
@@ -117,7 +120,7 @@ _DIFF_PER_JVM_MB = 1600
 # What a toolchain failure is, as recorded in a failed diff's diff_status_reason. Set where the
 # failure is raised, from what the step itself observed (a TimeoutExpired, its own exit code, its
 # own output), never read back out of a message that also carries argv and paths.
-FAIL_TIMEOUT = "timeout"  # a toolchain subprocess ran past its timeout
+FAIL_TIMEOUT = "timeout"  # a toolchain subprocess, or Ghidra's own analysis, ran past its limit
 FAIL_BINEXPORT_NO_FILE = "binexport_no_file"  # Ghidra exited 0, but the export script did not
 FAIL_BINEXPORT_CRASH = "binexport_ghidra_crash"  # Ghidra exited non-zero
 FAIL_BINDIFF_FLOWGRAPH = "bindiff_flowgraph"  # BinDiff rejected a flow graph of an export
@@ -231,6 +234,7 @@ def _record_diff_failure(
     run_b_id: str,
     binary_short: str,
     exc: BaseException,
+    toolchain: _toolchain.Toolchain | None = None,
 ) -> tuple[int, str]:
     """Persist ONE binary's diff FAILURE as a self-contained atomic transaction; return
     (attempts, reason).
@@ -259,10 +263,11 @@ def _record_diff_failure(
     keeps saying so through further failures until a successful re-diff stores it again."""
     atlas.rollback()  # ① drop layer-0's uncommitted diff_meta/alignment residue, if any
     sha_a, sha_b = _current_shas(atlas, run_a_id, run_b_id, binary_short)
-    stamps = _failure_stamps(atlas, run_a_id, run_b_id, binary_short, sha_a, sha_b)
+    stamps = _failure_stamps(atlas, run_a_id, run_b_id, binary_short, sha_a, sha_b, toolchain)
     attempts = _next_attempts(atlas, diff_id, sha_a, sha_b, stamps)  # read prior BEFORE delete
     dropped = _baseline_dropped_by_replacing(atlas, diff_id)  # ditto
     reason = _classify_failure_reason(exc)
+    tools = toolchain_columns(stamps.toolchain)
     delete_diff(atlas, diff_id, commit=False)  # ② clear any prior failed row -> no PK conflict
     add_diff_meta(
         atlas,
@@ -290,6 +295,11 @@ def _record_diff_failure(
             hunt_instances_b=stamps.b.hunt_instances,
             diff_code_version=stamps.diff_code_version,
             baseline_dropped=dropped,
+            export_code_hash_a=stamps.a.export_code_hash,
+            export_code_hash_b=stamps.b.export_code_hash,
+            toolchain_ghidra=tools["toolchain_ghidra"],
+            toolchain_binexport=tools["toolchain_binexport"],
+            toolchain_bindiff=tools["toolchain_bindiff"],
         ),
         commit=False,  # ③ INSERT now cannot conflict (prior row deleted, residue rolled back)
     )
@@ -329,6 +339,7 @@ def _failure_stamps(
     binary: str,
     sha_a: str | None,
     sha_b: str | None,
+    toolchain: _toolchain.Toolchain | None,
 ) -> DiffStamps:
     """The input stamps of a failed attempt, best-effort. Runs inside an except handler, so it never
     raises: a side whose stamps cannot be read gets None for them (which a later attempt that CAN
@@ -339,21 +350,31 @@ def _failure_stamps(
             db = _resolve_run(atlas, run_id, side).analysis_db_path
             return side_stamp(atlas, run_id, db, sha, binary)
         except (ConfigError, sqlite3.Error, OSError, ValueError):
-            return SideStamp(None, None, None, None, None)
+            return SideStamp(None, None, None, None, None, export_code_hash(None))
 
-    return DiffStamps(one(run_a_id, "a", sha_a), one(run_b_id, "b", sha_b), DIFF_CODE_VERSION)
+    return DiffStamps(
+        one(run_a_id, "a", sha_a), one(run_b_id, "b", sha_b), diff_code_version(), toolchain
+    )
 
 
 def _current_stamps(
-    atlas: sqlite3.Connection, run_a_id: str, run_b_id: str, bin_a: BinaryRow, bin_b: BinaryRow
+    atlas: sqlite3.Connection,
+    run_a_id: str,
+    run_b_id: str,
+    bin_a: BinaryRow,
+    bin_b: BinaryRow,
+    builders: tuple[str | None, str | None],
+    toolchain: _toolchain.Toolchain | None,
 ) -> DiffStamps:
-    """The input stamps of a diff about to be written (called inside its write transaction)."""
+    """The input stamps of a diff about to be written (called inside its write transaction).
+    ``builders`` is the path each side's export took, which picks the export script files hashed."""
     db_a = _resolve_run(atlas, run_a_id, "a").analysis_db_path
     db_b = _resolve_run(atlas, run_b_id, "b").analysis_db_path
     return DiffStamps(
-        side_stamp(atlas, run_a_id, db_a, bin_a.sha256, bin_a.name),
-        side_stamp(atlas, run_b_id, db_b, bin_b.sha256, bin_b.name),
-        DIFF_CODE_VERSION,
+        side_stamp(atlas, run_a_id, db_a, bin_a.sha256, bin_a.name, builders[0]),
+        side_stamp(atlas, run_b_id, db_b, bin_b.sha256, bin_b.name, builders[1]),
+        diff_code_version(),
+        toolchain,
     )
 
 
@@ -454,8 +475,13 @@ class FullDiffSummary:
     outcomes: tuple[BinaryDiffOutcome, ...]
     cancelled: bool
     retry_limit: int = _DIFF_RETRY_LIMIT
-    # run-pair notes that did not stop the sweep (check_run_pair_currency's warnings)
+    # run-pair notes that did not stop the sweep (check_run_pair_currency's warnings, refused
+    # baseline refreshes)
     warnings: tuple[str, ...] = ()
+    # already-ok diffs whose stale or dropped candidate baseline was stored again (binary names),
+    # and those whose store was refused (their old rows kept, reading stale)
+    baselines_refreshed: tuple[str, ...] = ()
+    baselines_refresh_refused: tuple[str, ...] = ()
 
 
 # ── binary .so location (finding-1 fail-fast) ────────────────────────────────────────
@@ -756,6 +782,16 @@ def _run_binexport(so_path: Path, config: Config, out_dir: Path, side: str, time
             + _diag(cmd, proc, log_path),
             kind=FAIL_BINEXPORT_CRASH,
         )
+    if _analysis_timed_out(proc, log_path):
+        # Checked before the files: an export written after the analysis stopped is complete as a
+        # file and still describes a half-analysed program, and when no export was written the
+        # timeout says more about why.
+        raise DiffToolchainError(
+            f"Ghidra's analysis of side {side} ({so_path.name}) ran past -analysisTimeoutPerFile "
+            f"({timeout_s}s): the export would describe a program it did not finish analysing\n"
+            + _diag(cmd, proc, log_path),
+            kind=FAIL_TIMEOUT,
+        )
     if not export_path.exists() or not report_path(export_path).is_file():
         raise DiffToolchainError(
             f"BinExport produced no file for side {side} ({so_path.name}) although the process "
@@ -765,6 +801,24 @@ def _run_binexport(so_path: Path, config: Config, out_dir: Path, side: str, time
             kind=FAIL_BINEXPORT_NO_FILE,
         )
     return export_path
+
+
+# The line analyzeHeadless reports when -analysisTimeoutPerFile stops the analysis. It then still
+# runs the post-script and exits 0, so this line is the only sign. Ghidra's own wording only: a
+# library or flag with "timeout" in its name must not match.
+_ANALYSIS_TIMED_OUT = re.compile(rb"REPORT: Analysis timed out at \d+ seconds")
+
+
+def _analysis_timed_out(proc: subprocess.CompletedProcess[bytes], log_path: Path) -> bool:
+    """Whether Ghidra reported its analysis timed out, on stdout or in its -log file. Both are
+    read: the console always has it, but either can be missing (a log that was never written, an
+    output that was not captured), and one missing must not pass the check silently."""
+    if _ANALYSIS_TIMED_OUT.search(proc.stdout or b""):
+        return True
+    try:
+        return bool(_ANALYSIS_TIMED_OUT.search(log_path.read_bytes()))
+    except OSError:
+        return False
 
 
 def _run_bindiff(export_a: Path, export_b: Path, out_dir: Path, timeout_s: int) -> Path:
@@ -925,6 +979,7 @@ def _persist_success(
     report_a: ExportReport | None = None,
     report_b: ExportReport | None = None,
     bindiff_vertex0_fallbacks: int | None = None,
+    toolchain: _toolchain.Toolchain | None = None,
 ) -> DiffSummary:
     """The serial persist phase for a SUCCESSFUL compute: parse the .BinDiff into the atlas (layer0)
     and project the deltas (layer2), as ONE atomic write. The call-site facts for the chosen
@@ -948,7 +1003,11 @@ def _persist_success(
         if not atlas.in_transaction:
             atlas.execute("BEGIN IMMEDIATE")
         keep_baseline = _has_candidate_baseline(atlas, diff_id) or _marked_dropped(atlas, diff_id)
-        stamps = _current_stamps(atlas, run_a_id, run_b_id, bin_a, bin_b)
+        builders = (
+            report_a.builder if report_a is not None else None,
+            report_b.builder if report_b is not None else None,
+        )
+        stamps = _current_stamps(atlas, run_a_id, run_b_id, bin_a, bin_b, builders, toolchain)
         l0 = run_layer0_parse(
             atlas,
             bindiff_path=bindiff_path,
@@ -999,6 +1058,7 @@ def _persist_success(
             run_b_id=run_b_id,
             binary_short=binary_short,
             exc=exc,
+            toolchain=toolchain,
         )
         raise
 
@@ -1058,6 +1118,7 @@ def run_version_diff(
         _resolve_run(atlas, run_a_id, "a"), _resolve_run(atlas, run_b_id, "b")
     )
     pf = preflight(atlas, run_a_id, run_b_id, binary_name, config=config, force=force)
+    toolchain = _toolchain.detect_toolchain(config)
     # pf.binary_a is the normalized short name (preflight resolved it, asserted non-None). Include
     # it in the diff_id so this binary's diff does not overwrite another binary's under the same
     # run-pair (make_diff_id / delete_diff then scope to this one binary).
@@ -1075,6 +1136,7 @@ def run_version_diff(
                 run_b_id=run_b_id,
                 binary_short=pf.binary_a,
                 exc=exc,
+                toolchain=toolchain,
             )
             raise
         return _persist_success(
@@ -1093,6 +1155,7 @@ def run_version_diff(
             report_a=artifacts.report_a,
             report_b=artifacts.report_b,
             bindiff_vertex0_fallbacks=artifacts.bindiff_vertex0_fallbacks,
+            toolchain=toolchain,
         )
     finally:
         shutil.rmtree(td, ignore_errors=True)
@@ -1154,6 +1217,8 @@ class _DiffStatusRecord:
     sha256_b: str | None
     # the compared input stamps (lib/diff/currency.COMPARED_COLUMNS) the diff was recorded with
     stamps: dict[str, object]
+    # the path each side's export took (None when not recorded): picks the export files compared
+    builders: tuple[str | None, str | None] = (None, None)
 
 
 def _read_diff_status_map(
@@ -1166,6 +1231,7 @@ def _read_diff_status_map(
     'never diffed' and is re-diffed, which backfills the new columns (honest, not a silent skip)."""
     rows = atlas.execute(
         "SELECT binary_a, diff_ok, diff_attempts, sha256_a, sha256_b, "  # noqa: S608 -- literal
+        "export_builder_a, export_builder_b, "
         f"{', '.join(COMPARED_COLUMNS)} FROM diff_meta "
         "WHERE run_a_id = ? AND run_b_id = ? AND binary_a IS NOT NULL",
         (run_a_id, run_b_id),
@@ -1176,7 +1242,8 @@ def _read_diff_status_map(
             diff_attempts=r[2] or 0,
             sha256_a=r[3],
             sha256_b=r[4],
-            stamps=dict(zip(COMPARED_COLUMNS, r[5:], strict=True)),
+            builders=(r[5], r[6]),
+            stamps=dict(zip(COMPARED_COLUMNS, r[7:], strict=True)),
         )
         for r in rows
     }
@@ -1190,18 +1257,29 @@ def _inputs_unchanged(
     binary: str,
     ext_a: dict[str, tuple[str | None, str | None]],
     ext_b: dict[str, tuple[str | None, str | None]],
+    toolchain: _toolchain.Toolchain | None,
 ) -> bool:
     """Whether every input stamp recorded with this binary's diff equals the current one (plain
-    equality, lib/diff/currency). The extraction and code-version stamps are compared first; the
-    hunt-input digests, the one part that costs a query, only when those already agree."""
+    equality, lib/diff/currency). The extraction, code and toolchain stamps are compared first; the
+    hunt-input digests, the one part that costs a query, only when those already agree. The export
+    script files are those the diff's own export path took. A toolchain that cannot be read now is
+    not compared: the recorded one stands (nothing could be diffed without it anyway)."""
     pv_a, gv_a = ext_a.get(rec.sha256_a or "", (None, None))
     pv_b, gv_b = ext_b.get(rec.sha256_b or "", (None, None))
+    tools = (
+        toolchain_columns(toolchain)
+        if toolchain is not None
+        else {c: rec.stamps.get(c) for c in TOOLCHAIN_COLUMNS}
+    )
     cheap = {
         "extraction_pass_a": pv_a,
         "extraction_pass_b": pv_b,
         "ghidra_version_a": gv_a,
         "ghidra_version_b": gv_b,
-        "diff_code_version": DIFF_CODE_VERSION,
+        "diff_code_version": diff_code_version(),
+        "export_code_hash_a": export_code_hash(rec.builders[0]),
+        "export_code_hash_b": export_code_hash(rec.builders[1]),
+        **tools,
     }
     if any(rec.stamps.get(c) != v for c, v in cheap.items()):
         return False
@@ -1220,6 +1298,7 @@ def plan_full_diff(
     *,
     retry_limit: int = _DIFF_RETRY_LIMIT,
     assume_current: bool = False,
+    toolchain: _toolchain.Toolchain | None = None,
 ) -> FullDiffPlan:
     """Decide which binaries a full diff should diff: those present in BOTH runs whose content
     (sha256) differs, PARTITIONED by their recorded diff status so the sweep is incremental +
@@ -1268,7 +1347,8 @@ def plan_full_diff(
         if rec.sha256_a != a[n][0] or rec.sha256_b != b[n][0]:
             to_diff.append(n)  # content changed (or unrecorded sha) -> re-diff, attempts reset
         elif not (
-            assume_current or _inputs_unchanged(atlas, rec, run_a_id, run_b_id, n, ext_a, ext_b)
+            assume_current
+            or _inputs_unchanged(atlas, rec, run_a_id, run_b_id, n, ext_a, ext_b, toolchain)
         ):
             to_diff.append(n)  # what it was computed from changed -> re-diff, attempts reset
         elif rec.diff_ok == 1:
@@ -1330,6 +1410,7 @@ def _persist_outcome(
     *,
     artifacts: DiffArtifacts | None,
     compute_exc: BaseException | None,
+    toolchain: _toolchain.Toolchain | None = None,
 ) -> BinaryDiffOutcome:
     """The serial persist step for ONE binary's compute result -> its outcome. Main thread only.
 
@@ -1345,6 +1426,7 @@ def _persist_outcome(
             run_b_id=run_b_id,
             binary_short=rd.binary_short,
             exc=compute_exc,
+            toolchain=toolchain,
         )
         attempts, reason = _read_recorded_status(atlas, rd.diff_id)
         return BinaryDiffOutcome(
@@ -1373,6 +1455,7 @@ def _persist_outcome(
             report_a=artifacts.report_a,
             report_b=artifacts.report_b,
             bindiff_vertex0_fallbacks=artifacts.bindiff_vertex0_fallbacks,
+            toolchain=toolchain,
         )
     except TreasureMapError as exc:
         # _persist_success already recorded the failed row atomically; belt-and-braces rollback so
@@ -1479,14 +1562,36 @@ def run_full_diff(
             "same toolchain, or pass --force to diff anyway (the result stays honestly degraded)."
         )
     warnings = check_run_pair_currency(run_a, run_b)
+    # Read before the plan: the plan compares it with the toolchain each diff was computed by.
+    toolchain = _toolchain.detect_toolchain(config)
     plan = plan_full_diff(
-        atlas, run_a_id, run_b_id, retry_limit=retry_limit, assume_current=assume_current
+        atlas,
+        run_a_id,
+        run_b_id,
+        retry_limit=retry_limit,
+        assume_current=assume_current,
+        toolchain=toolchain,
     )
     to_run = plan.binaries_to_run(force_retry=force_retry)
+    # Before the "nothing to diff" return: a re-hunt that reproduced its output leaves every diff
+    # already ok, and that is exactly when their baselines go stale.
+    refreshed: tuple[str, ...] = ()
+    refused: tuple[str, ...] = ()
+    if not assume_current:
+        refreshed, refused, notes = _refresh_unchanged_baselines(
+            atlas, run_a_id, run_b_id, plan.already_ok
+        )
+        warnings = (*warnings, *notes)
     if not to_run:
         # nothing NEEDS diffing: no changed binaries, or all already-ok / suspected-hard (skipped).
         return FullDiffSummary(
-            plan, (), cancelled=False, retry_limit=retry_limit, warnings=warnings
+            plan,
+            (),
+            cancelled=False,
+            retry_limit=retry_limit,
+            warnings=warnings,
+            baselines_refreshed=refreshed,
+            baselines_refresh_refused=refused,
         )
     _check_toolchain(config)
     # notify the caller of the sweep size (no confirmation gate — a full diff is normal use)
@@ -1517,6 +1622,7 @@ def run_full_diff(
                     run_b_id=run_b_id,
                     binary_short=binary,
                     exc=exc,
+                    toolchain=toolchain,
                 )
                 attempts, reason = _read_recorded_status(
                     atlas, make_diff_id(run_a_id, run_b_id, binary)
@@ -1582,6 +1688,7 @@ def run_full_diff(
                         run_b_id,
                         artifacts=artifacts,
                         compute_exc=compute_exc,
+                        toolchain=toolchain,
                     )
                 finally:
                     # consume-and-clean: the orchestrator owns each temp dir (compute produced into
@@ -1610,8 +1717,48 @@ def run_full_diff(
                 shutil.rmtree(td, ignore_errors=True)
 
     return FullDiffSummary(
-        plan, tuple(outcomes), cancelled=cancelled, retry_limit=retry_limit, warnings=warnings
+        plan,
+        tuple(outcomes),
+        cancelled=cancelled,
+        retry_limit=retry_limit,
+        warnings=warnings,
+        baselines_refreshed=refreshed,
+        baselines_refresh_refused=refused,
     )
+
+
+def _refresh_unchanged_baselines(
+    atlas: sqlite3.Connection, run_a_id: str, run_b_id: str, already_ok: tuple[str, ...]
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Store again the candidate baseline of each already-ok diff whose stored one reads stale, or
+    that a re-diff dropped. Returns (refreshed, refused, warnings).
+
+    A diff is already ok when nothing it reads has moved; its baseline also reads the runs' hunt
+    commit, build hash and candidate count, so a re-hunt that reproduced its output leaves the diff
+    current and the baseline stale, and no re-diff will ever come to store it again. Called only
+    when the plan compared the inputs (not under assume_current): stamping a baseline fresh vouches
+    for a diff nobody checked otherwise. A refused store (the baseline's own gates) leaves the old
+    rows in place, still reading stale, and the sweep goes on."""
+    refreshed: list[str] = []
+    refused: list[str] = []
+    notes: list[str] = []
+    for binary in already_ok:
+        diff_id = make_diff_id(run_a_id, run_b_id, binary)
+        stale = (
+            _has_candidate_baseline(atlas, diff_id)
+            and read_sink_overlay_baseline(atlas, diff_id).get("stale_baseline") is True
+        )
+        if not (stale or _marked_dropped(atlas, diff_id)):
+            continue
+        try:
+            persist_sink_overlay(atlas, diff_id, commit=True)
+        except TreasureMapError as exc:
+            atlas.rollback()
+            refused.append(binary)
+            notes.append(f"{binary}: its candidate baseline could not be stored again: {exc}")
+        else:
+            refreshed.append(binary)
+    return tuple(refreshed), tuple(refused), tuple(notes)
 
 
 def _concrete_hash(value: str | None) -> bool:

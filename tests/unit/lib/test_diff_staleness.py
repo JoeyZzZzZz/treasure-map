@@ -20,7 +20,7 @@ from typing import Any
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import DiffMetaRow, DimensionDeltaRow
 from treasure_map.lib.atlas.writer import add_diff_meta, add_dimension_deltas, begin_run
-from treasure_map.lib.diff import currency
+from treasure_map.lib.diff import code_version, currency
 from treasure_map.lib.query.diff_align import (
     STALE_CHANGED,
     STALE_GONE,
@@ -98,7 +98,9 @@ def _atlas(
             scanned_at_b=st_b.scanned_at,
             hunt_instances_a=st_a.hunt_instances,
             hunt_instances_b=st_b.hunt_instances,
-            diff_code_version=currency.DIFF_CODE_VERSION,
+            diff_code_version=code_version.diff_code_version(),
+            export_code_hash_a=st_a.export_code_hash,
+            export_code_hash_b=st_b.export_code_hash,
         ),
     )
     if with_deltas:
@@ -357,7 +359,9 @@ def test_the_generation_of_each_run_is_read_once(tmp_path: Path) -> None:
                     scanned_at_b=st.scanned_at,
                     hunt_instances_a=st.hunt_instances,
                     hunt_instances_b=st.hunt_instances,
-                    diff_code_version=currency.DIFF_CODE_VERSION,
+                    diff_code_version=code_version.diff_code_version(),
+                    export_code_hash_a=st.export_code_hash,
+                    export_code_hash_b=st.export_code_hash,
                 ),
             )
         opened: list[str] = []

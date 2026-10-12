@@ -6,7 +6,7 @@ What a diff reads besides the bytes — the binary's extraction, the hunt output
 — is stamped on the diff (lib/diff/currency). These tests cover the stamps' storage and migration,
 the full diff's re-diff decision and attempt count, the run-pair currency refusals, the read
 side's ``source_stale`` on every diff surface, keeping a stored candidate baseline across a re-diff,
-and the golden diff that binds DIFF_CODE_VERSION to the diff code's output.
+and a golden diff that pins what the diff code writes for a fixed input.
 
 Synthetic data only. The toolchain steps (BinExport, BinDiff) are stubbed to hand back a crafted
 ``.BinDiff`` and hand-encoded BinExport files; everything from the layer-0 parse on runs for real.
@@ -28,7 +28,7 @@ from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import DiffMetaRow
 from treasure_map.lib.atlas.writer import add_diff_meta, begin_run, finish_run
 from treasure_map.lib.config.config import Config
-from treasure_map.lib.diff import currency, driver
+from treasure_map.lib.diff import code_version, currency, driver, toolchain
 from treasure_map.lib.diff.driver import DiffToolchainError
 from treasure_map.lib.diff.layer0 import make_diff_id
 from treasure_map.lib.errors import ConfigError
@@ -394,7 +394,9 @@ def test_equal_extraction_stamps_are_current_including_none_and_unknown(tmp_path
             extraction_pass_b=st_b.extraction_pass,
             hunt_inputs_hash_a=st_a.hunt_inputs_hash,
             hunt_inputs_hash_b=st_b.hunt_inputs_hash,
-            diff_code_version=currency.DIFF_CODE_VERSION,
+            diff_code_version=code_version.diff_code_version(),
+            export_code_hash_a=st_a.export_code_hash,
+            export_code_hash_b=st_b.export_code_hash,
         ),
     )
     assert _plan(w).already_ok == ("liba",)
@@ -746,7 +748,14 @@ def test_each_side_is_looked_up_by_its_own_binary_name() -> None:
         "binary_b": "libb",
         "sha256_a": _sha("a"),
         "sha256_b": _sha("b"),
-        "diff_code_version": currency.DIFF_CODE_VERSION,
+        "diff_code_version": code_version.diff_code_version(),
+        "export_builder_a": None,
+        "export_builder_b": None,
+        "export_code_hash_a": code_version.export_code_hash(None),
+        "export_code_hash_b": code_version.export_code_hash(None),
+        "toolchain_ghidra": None,
+        "toolchain_binexport": None,
+        "toolchain_bindiff": None,
         **{
             f"{c}_{s}": v
             for s in "ab"
@@ -1007,7 +1016,7 @@ def _baseline_rows(w: _World) -> int:
         w.atlas.execute(
             "SELECT COUNT(*) FROM dimension_delta WHERE diff_id = ? AND subject_kind = 'candidate' "
             "AND overlay_version = ?",
-            (_did(), so.SINK_OVERLAY_LOGIC_VERSION),
+            (_did(), so.sink_overlay_logic_version()),
         ).fetchone()[0]
     )
 
@@ -1072,6 +1081,92 @@ def test_storing_the_baseline_directly_clears_the_mark(
     w.atlas.commit()
     assert so.persist_sink_overlay(w.atlas, _did()) > 0
     assert _row(w)["baseline_dropped"] == 0
+
+
+def _baseline_rows_without_stamps(w: _World) -> list[tuple[Any, ...]]:
+    """The stored candidate rows, less their ids and the run stamps a re-store rewrites."""
+    rows = w.atlas.execute(
+        "SELECT * FROM dimension_delta WHERE diff_id = ? AND subject_kind = 'candidate'", (_did(),)
+    )
+    cols = [d[0] for d in rows.description]
+    stamps = {"id", "hunt_commit_a", "hunt_commit_b", "build_hash_a", "build_hash_b"}
+    stamps |= {"hunt_instances_a", "hunt_instances_b"}
+    keep = [i for i, c in enumerate(cols) if c not in stamps]
+    return sorted(tuple(r[i] for i in keep) for r in rows)
+
+
+def _rehunted_unchanged(w: _World, monkeypatch: pytest.MonkeyPatch, commit: str) -> None:
+    """A re-hunt by another installed build that wrote the same output: only the commit moves."""
+    w.atlas.execute("UPDATE run SET hunt_commit = ?", (commit,))
+    w.atlas.commit()
+    _stub(monkeypatch, w, commit=commit)
+
+
+def test_an_unchanged_rehunt_refreshes_the_baseline_of_a_diff_left_as_it_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The diff is current (its inputs did not move) and is not re-run; its baseline, stamped with
+    the old commit, reads stale. The full diff stores it again, though nothing is left to diff.
+
+    MUTATION (verified RED): refresh after the "nothing to diff" return -> the baseline stays
+    stale; skip the refresh -> the same."""
+    w = _baselined(tmp_path, monkeypatch)
+    before = _baseline_rows_without_stamps(w)
+    _rehunted_unchanged(w, monkeypatch, "beadfeed")
+    assert so.read_sink_overlay_baseline(w.atlas, _did())["stale_baseline"] is True
+    fs = _full(w)
+    assert fs.outcomes == () and fs.plan.already_ok == ("liba",)
+    assert (fs.baselines_refreshed, fs.baselines_refresh_refused) == (("liba",), ())
+    assert so.read_sink_overlay_baseline(w.atlas, _did())["stale_baseline"] is False
+    assert _baseline_rows_without_stamps(w) == before
+
+
+def test_assume_current_leaves_a_stale_baseline_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With assume_current the plan did not compare the inputs, so an already-ok diff may not be
+    current: stamping its baseline fresh would vouch for a diff nobody checked.
+
+    MUTATION (verified RED): refresh regardless of assume_current -> the baseline reads fresh."""
+    w = _baselined(tmp_path, monkeypatch)
+    _rehunted_unchanged(w, monkeypatch, "beadfeed")
+    fs = _full(w, assume_current=True)
+    assert fs.baselines_refreshed == ()
+    assert so.read_sink_overlay_baseline(w.atlas, _did())["stale_baseline"] is True
+
+
+def test_a_refused_refresh_keeps_the_old_rows_and_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MUTATION (verified RED): drop the rows before the store is attempted -> the refused refresh
+    leaves the diff with no baseline at all."""
+    w = _baselined(tmp_path, monkeypatch)
+    n = _baseline_rows(w)
+    _rehunted_unchanged(w, monkeypatch, UNKNOWN_VERSION)
+    fs = _full(w)
+    assert (fs.baselines_refreshed, fs.baselines_refresh_refused) == ((), ("liba",))
+    assert any("baseline" in m and "liba" in m for m in fs.warnings)
+    assert _baseline_rows(w) == n
+    assert so.read_sink_overlay_baseline(w.atlas, _did())["stale_baseline"] is True
+
+
+def test_a_dropped_baseline_of_an_unchanged_diff_is_stored_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A re-diff that could not store the baseline marked it dropped; once storing is possible the
+    next full diff stores it, although the diff itself is not re-run.
+
+    MUTATION (verified RED): refresh only stale baselines -> the dropped one is never stored."""
+    w = _baselined(tmp_path, monkeypatch)
+    w.atlas.execute("UPDATE run SET hunt_commit = 'unknown' WHERE run_id = 'run_b'")
+    _extraction(w)
+    _full(w)
+    assert _row(w)["baseline_dropped"] == 1 and _baseline_rows(w) == 0
+    w.atlas.execute("UPDATE run SET hunt_commit = ? WHERE run_id = 'run_b'", (_COMMIT,))
+    w.atlas.commit()
+    fs = _full(w)
+    assert fs.outcomes == () and fs.baselines_refreshed == ("liba",)
+    assert _row(w)["baseline_dropped"] == 0 and _baseline_rows(w) > 0
 
 
 def test_reading_an_absent_baseline_says_absent(
@@ -1153,7 +1248,206 @@ def test_the_cli_passes_assume_current_through(
     assert "a note" in res.output
 
 
-# ── T-golden: DIFF_CODE_VERSION is bound to what the diff code writes ─────────────────────────────
+def _summary(binary: str, changed: int, unchanged: int, undetermined: int) -> driver.DiffSummary:
+    return driver.DiffSummary(
+        diff_id=_did(binary),
+        binary=binary,
+        matched_pairs=1,
+        version_skew=False,
+        delta_layer_changed=changed,
+        delta_layer_unchanged=unchanged,
+        delta_undetermined=undetermined,
+        warnings=(),
+    )
+
+
+def test_the_cli_says_when_a_binary_has_nothing_to_compare(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Three zero counts mean no string-keyed edge on either side, not 'nothing changed'; the
+    refreshed baselines get their own line.
+
+    MUTATION (verified RED): print the three counts as before -> "0 changed / 0 unchanged"."""
+    from treasure_map.cli.main import main
+
+    def fake_full(atlas: Any, a: str, b: str, **kw: Any) -> driver.FullDiffSummary:
+        oks = (
+            driver.BinaryDiffOutcome("liba", _summary("liba", 0, 0, 0), None),
+            driver.BinaryDiffOutcome("libb", _summary("libb", 2, 1, 0), None),
+        )
+        for i, o in enumerate(oks, start=1):
+            kw["on_outcome"](i, len(oks), o)
+        plan = driver.FullDiffPlan(("liba", "libb", "libc"), (), (), (), to_diff=("liba", "libb"))
+        return driver.FullDiffSummary(plan, oks, cancelled=False, baselines_refreshed=("libc",))
+
+    monkeypatch.setattr(driver, "run_full_diff", fake_full)
+    res = CliRunner().invoke(main, ["diff", "run_a", "run_b", "--atlas", str(tmp_path / "x.db")])
+    assert res.exit_code == 0, res.output
+    assert "liba: no string-keyed edges (0 subjects)" in res.output
+    assert "libb: 2 edges changed / 1 unchanged / 0 undetermined" in res.output
+    assert "0 changed / 0 unchanged" not in res.output
+    assert "baselines refreshed (unchanged diffs): 1, 0 refused" in res.output
+
+
+def test_the_diff_listing_counts_edges_not_functions(tmp_path: Path) -> None:
+    from treasure_map import mcp_app
+
+    note = diff_align._LIST_DIFFS_NOTE
+    assert "string_keyed_edge" in note and "aligned functions" not in note
+    doc = mcp_app.make_tools(tmp_path / "x.db")["list_diffs"].__doc__ or ""
+    assert "string_keyed_edge" in doc and "how much each moved" not in doc
+
+
+# ── what code and which toolchain computed a diff (no hand-bumped version) ─────────────────────
+
+
+def _two_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _World:
+    """liba exported by the extension's builder, libb by the fallback builder, both diffed."""
+    w = _world(
+        tmp_path,
+        {"liba": (_sha("a"), _PV), "libb": (_sha("c"), _PV)},
+        {"liba": (_sha("b"), _PV), "libb": (_sha("d"), _PV)},
+    )
+    _stub(monkeypatch, w)
+    _full(w)
+    for binary, builder in (("liba", "extension"), ("libb", "fallback")):
+        h = code_version.export_code_hash(builder)
+        w.atlas.execute(
+            "UPDATE diff_meta SET export_builder_a = ?, export_builder_b = ?, "
+            "export_code_hash_a = ?, export_code_hash_b = ? WHERE diff_id = ?",
+            (builder, builder, h, h, _did(binary)),
+        )
+    w.atlas.commit()
+    assert _plan(w).already_ok == ("liba", "libb")
+    return w
+
+
+def _scripts_changed(monkeypatch: pytest.MonkeyPatch, *, which: str) -> None:
+    """The export script files as they would hash after an edit to ``which``."""
+    real = code_version.export_code_hash
+
+    def changed(builder: str | None) -> str:
+        if which == "fallback" and builder == "extension":
+            return real(builder)  # the extension path does not take the fallback builder
+        return "edited-" + real(builder)
+
+    monkeypatch.setattr(driver, "export_code_hash", changed)
+    monkeypatch.setattr(diff_align, "export_code_hash", changed)
+
+
+def _listed_reasons(w: _World) -> dict[str, tuple[bool | None, str | None]]:
+    return {
+        r["binary"]: (r["source_stale"], r["source_stale_reason"])
+        for r in diff_align.list_diffs(w.atlas)["diffs"]
+    }
+
+
+def test_an_edit_to_the_fallback_builder_reruns_only_the_fallback_exports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MUTATION (verified RED): compare one export hash for every diff, whatever its path -> the
+    extension export is re-diffed too."""
+    w = _two_paths(tmp_path, monkeypatch)
+    _scripts_changed(monkeypatch, which="fallback")
+    plan = _plan(w)
+    assert (plan.to_diff, plan.already_ok) == (("libb",), ("liba",))
+    assert _listed_reasons(w) == {"liba": (False, None), "libb": (True, "diff_logic_changed")}
+
+
+def test_an_edit_to_the_export_script_reruns_every_export(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    w = _two_paths(tmp_path, monkeypatch)
+    _scripts_changed(monkeypatch, which="export")
+    assert _plan(w).to_diff == ("liba", "libb")
+    assert set(_listed_reasons(w).values()) == {(True, "diff_logic_changed")}
+
+
+def test_an_edit_to_the_diff_code_reruns_every_diff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MUTATION (verified RED): leave the code version out of the plan's comparison -> nothing
+    is re-diffed."""
+    w = _two_paths(tmp_path, monkeypatch)
+    monkeypatch.setattr(driver, "diff_code_version", lambda: "src-other")
+    monkeypatch.setattr(diff_align, "diff_code_version", lambda: "src-other")
+    assert _plan(w).to_diff == ("liba", "libb")
+    assert set(_listed_reasons(w).values()) == {(True, "diff_logic_changed")}
+
+
+def test_an_edit_to_the_overlay_logic_restores_every_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The baseline's version is the overlay code's hash: another hash reads stale, and the next
+    full diff stores it again by the current code, without re-diffing.
+
+    MUTATION (verified RED): keep a hand-written version -> the stored baseline still reads
+    current."""
+    w = _baselined(tmp_path, monkeypatch)
+    monkeypatch.setattr(so, "sink_overlay_logic_version", lambda: "src-other")
+    got = so.read_sink_overlay_baseline(w.atlas, _did())
+    assert got["stale_baseline"] is True
+    fs = _full(w)
+    assert fs.outcomes == () and fs.baselines_refreshed == ("liba",)
+    assert so.read_sink_overlay_baseline(w.atlas, _did())["stale_baseline"] is False
+    versions = {
+        r[0]
+        for r in w.atlas.execute(
+            "SELECT overlay_version FROM dimension_delta WHERE subject_kind = 'candidate'"
+        )
+    }
+    assert versions == {"src-other"}
+
+
+_TOOLS = toolchain.Toolchain("11.4.3", "11.4.3", "BinDiff 8 (@568181968, Sep 25 2023)")
+
+
+def _installed(monkeypatch: pytest.MonkeyPatch, tools: toolchain.Toolchain | None) -> None:
+    monkeypatch.setattr(toolchain, "detect_toolchain", lambda config: tools)
+    monkeypatch.setattr(toolchain, "_current", [tools])
+
+
+def test_a_diff_records_its_toolchain_and_an_upgrade_reruns_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MUTATION (verified RED): leave the toolchain out of the plan's comparison -> the upgraded
+    BinDiff re-diffs nothing; out of the read side -> the diff reads current."""
+    w = _two(tmp_path)
+    _stub(monkeypatch, w)
+    _installed(monkeypatch, _TOOLS)
+    _full(w)
+    row = _row(w)
+    assert (row["toolchain_ghidra"], row["toolchain_bindiff"]) == ("11.4.3", _TOOLS.bindiff)
+    (listed,) = diff_align.list_diffs(w.atlas)["diffs"]
+    assert (listed["source_stale"], listed["toolchain_checked"]) == (False, True)
+    _installed(monkeypatch, toolchain.Toolchain("11.4.3", "11.4.3", "BinDiff 9"))
+    assert _plan(w, toolchain=toolchain.detect_toolchain(Config())).to_diff == ("liba",)
+    (listed,) = diff_align.list_diffs(w.atlas)["diffs"]
+    assert (listed["source_stale"], listed["source_stale_reason"]) == (True, "toolchain_changed")
+    assert diff_align.get_diff_meta(w.atlas, _did())["source_stale_reason"] == "toolchain_changed"
+
+
+def test_a_toolchain_that_cannot_be_read_is_said_and_decides_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No Ghidra configured on the reading machine: the diff is neither stale nor re-diffed on
+    that account, and every answer says the toolchain was not checked.
+
+    MUTATION (verified RED): compare an unreadable toolchain as None -> every diff reads
+    toolchain_changed and is re-diffed."""
+    w = _two(tmp_path)
+    _stub(monkeypatch, w)
+    _installed(monkeypatch, _TOOLS)
+    _full(w)
+    _installed(monkeypatch, None)
+    assert _plan(w, toolchain=None).already_ok == ("liba",)
+    (listed,) = diff_align.list_diffs(w.atlas)["diffs"]
+    assert (listed["source_stale"], listed["toolchain_checked"]) == (False, False)
+    meta = diff_align.get_diff_meta(w.atlas, _did())
+    assert (meta["source_stale"], meta["toolchain_checked"]) == (False, False)
+
+
+# ── T-golden: what the diff code writes for a fixed input ────────────────────────────────────────
 
 _GOLDEN_TABLES = (
     "diff_meta",
@@ -1163,8 +1457,23 @@ _GOLDEN_TABLES = (
     "dimension_delta",
     "dimension_capability_state",
 )
-# row ids and timestamps are not output; the code version is what the digest determines
-_GOLDEN_SKIP = frozenset({"id", "created_at", "diff_code_version"})
+# row ids and timestamps are not output, and neither are the stamps of the code and toolchain that
+# computed it (they change with any edit to that code, whatever the output)
+_GOLDEN_SKIP = frozenset(
+    {
+        "id",
+        "created_at",
+        "diff_code_version",
+        "export_code_hash_a",
+        "export_code_hash_b",
+        "toolchain_ghidra",
+        "toolchain_binexport",
+        "toolchain_bindiff",
+    }
+)
+# The digest of the golden diff's output. An output regression test: the version stamped on a diff
+# is a hash of the code itself (lib/diff/code_version), not this value.
+_GOLDEN_OUTPUT = "0f7ac1cdb02b"
 
 
 def _golden_analysis(path: Path, sha: str, side: str) -> None:
@@ -1283,15 +1592,13 @@ def _golden_digest(atlas: sqlite3.Connection, diff_id: str) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
-def test_the_diff_code_version_is_bound_to_the_golden_diff(
+def test_the_golden_diff_writes_what_it_wrote(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The real fixture ``.BinDiff`` plus hand-encoded BinExport files, through the whole persist
     path (layer-0 parse, instruction matches, call-site facts, layer-2 deltas). The digest of what
-    it writes must be the suffix of DIFF_CODE_VERSION. A change to the diff code that changes this
-    output fails here until the constant is updated — which then marks every stored diff stale.
-
-    Covers only what this input reaches (see the DIFF_CODE_VERSION comment for the rest).
+    it writes must equal ``_GOLDEN_OUTPUT``: a change to the diff code that changes this output on
+    purpose updates it here; one that does not mean to fails.
 
     MUTATION (verified RED): change layer2's opaque state summary prefix (``callees=``) -> the
     digest moves and this fails; likewise renaming a call identity kind in lib/diff/callsite_facts.
@@ -1342,7 +1649,7 @@ def test_the_diff_code_version_is_bound_to_the_golden_diff(
     assert count("SELECT COUNT(*) FROM dimension_capability_state WHERE diff_id = ?") > 0
 
     digest = _golden_digest(atlas, did)
-    assert currency.DIFF_CODE_VERSION.split("-", 1)[1] == digest[:12], (
-        f"the diff code's output changed: set DIFF_CODE_VERSION's suffix to {digest[:12]} "
-        "(lib/diff/currency) — every stored diff then reads as stale and is re-diffed"
+    assert digest[:12] == _GOLDEN_OUTPUT, (
+        f"the diff code's output for the golden input changed to {digest[:12]}; if intended, "
+        "update _GOLDEN_OUTPUT (stored diffs read as stale through the code hash either way)"
     )

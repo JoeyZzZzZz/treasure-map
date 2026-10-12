@@ -482,10 +482,11 @@ def add_diff_meta(conn: sqlite3.Connection, row: DiffMetaRow, *, commit: bool = 
             baseline_dropped, export_builder_a, export_builder_b, export_entry_addresses_added_a,
             export_entry_addresses_added_b, export_flow_graphs_dropped_a,
             export_flow_graphs_dropped_b, export_degenerate_functions_a,
-            export_degenerate_functions_b, bindiff_vertex0_fallbacks)
+            export_degenerate_functions_b, bindiff_vertex0_fallbacks, export_code_hash_a,
+            export_code_hash_b, toolchain_ghidra, toolchain_binexport, toolchain_bindiff)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             row.diff_id,
             row.run_a_id,
@@ -549,6 +550,11 @@ def add_diff_meta(conn: sqlite3.Connection, row: DiffMetaRow, *, commit: bool = 
             row.export_degenerate_functions_a,
             row.export_degenerate_functions_b,
             row.bindiff_vertex0_fallbacks,
+            row.export_code_hash_a,
+            row.export_code_hash_b,
+            row.toolchain_ghidra,
+            row.toolchain_binexport,
+            row.toolchain_bindiff,
         ),
     )
     if commit:

@@ -22,14 +22,16 @@ import sqlite3
 from collections.abc import Iterable
 from typing import Any
 
+from treasure_map.lib.diff.code_version import diff_code_version, export_code_hash
 from treasure_map.lib.diff.currency import (
-    DIFF_CODE_VERSION,
     hunt_inputs_digest,
     read_extraction,
     run_hunt_marks,
+    toolchain_columns,
 )
 from treasure_map.lib.diff.driver import _DIFF_RETRY_LIMIT
 from treasure_map.lib.diff.layer0 import norm_hex
+from treasure_map.lib.diff.toolchain import current_toolchain
 
 _ALIGN_NOTE = (
     "an ALIGNMENT FACT (BinDiff matched these addresses), NOT a change verdict. "
@@ -68,6 +70,7 @@ STALE_GONE = "source_binary_absent"
 # and the hunt's output for it, and it is produced by the diff code — each recorded with the diff
 # as a stamp (lib/diff/currency) and compared here with what it is now, by plain equality.
 STALE_DIFF_LOGIC = "diff_logic_changed"  # computed by different diff code than is running
+STALE_TOOLCHAIN = "toolchain_changed"  # computed by another Ghidra / BinExport / BinDiff version
 STALE_EXTRACTION = "extraction_changed"  # the binary's extraction pass differs
 STALE_GHIDRA = "ghidra_changed"  # the binary's recorded decompiler version differs
 STALE_HUNT_INPUTS = "hunt_inputs_changed"  # the hunt output the diff read differs
@@ -77,6 +80,7 @@ _REASON_RANK = (
     STALE_GONE,
     STALE_CHANGED,
     STALE_DIFF_LOGIC,
+    STALE_TOOLCHAIN,
     STALE_EXTRACTION,
     STALE_GHIDRA,
     STALE_HUNT_INPUTS,
@@ -84,7 +88,7 @@ _REASON_RANK = (
     STALE_UNKNOWN,
 )
 # The reasons that make a diff stale (source_stale true); the other two leave it unverified (null).
-_STALE_REASONS = frozenset(_REASON_RANK[:6])
+_STALE_REASONS = frozenset(_REASON_RANK[:7])
 
 # The diff_meta columns the staleness check reads.
 _STAMP_COLS = (
@@ -105,6 +109,13 @@ _STAMP_COLS = (
     "hunt_instances_a",
     "hunt_instances_b",
     "diff_code_version",
+    "export_builder_a",
+    "export_builder_b",
+    "export_code_hash_a",
+    "export_code_hash_b",
+    "toolchain_ghidra",
+    "toolchain_binexport",
+    "toolchain_bindiff",
 )
 
 
@@ -265,8 +276,17 @@ def diff_staleness(cache: _GenerationCache, meta: Any) -> tuple[bool | None, str
     describes its inputs, null for one that means it could not be checked (no stamp, or the source
     unreadable), and false only when every axis was checked and matched."""
     reasons = _side_reasons(cache, meta, "a") | _side_reasons(cache, meta, "b")
-    if meta["diff_code_version"] is not None and meta["diff_code_version"] != DIFF_CODE_VERSION:
-        reasons.add(STALE_DIFF_LOGIC)
+    if meta["diff_code_version"] is not None:
+        if meta["diff_code_version"] != diff_code_version() or any(
+            meta[f"export_code_hash_{s}"] != export_code_hash(meta[f"export_builder_{s}"])
+            for s in "ab"
+        ):
+            reasons.add(STALE_DIFF_LOGIC)
+        toolchain = current_toolchain()
+        if toolchain is not None and any(
+            meta[c] != v for c, v in toolchain_columns(toolchain).items()
+        ):
+            reasons.add(STALE_TOOLCHAIN)
     rank = {r: i for i, r in enumerate(_REASON_RANK)}
     higher = [r for r in reasons if rank[r] < rank[STALE_HUNT_INPUTS]]
     if meta["diff_code_version"] is not None and not higher:
@@ -292,13 +312,30 @@ def _meta_stamps(atlas: sqlite3.Connection, diff_id: str) -> Any:
 def diff_source_staleness(
     atlas: sqlite3.Connection, diff_id: str, cache: _GenerationCache | None = None
 ) -> dict[str, Any]:
-    """``{"source_stale", "source_stale_reason"}`` for one diff, for every diff read surface. A
-    diff_id with no diff_meta row cannot be checked: null with ``source_unavailable``."""
+    """``{"source_stale", "source_stale_reason", "toolchain_checked"}`` for one diff, for every diff
+    read surface. A diff_id with no diff_meta row cannot be checked: null with
+    ``source_unavailable``. ``toolchain_checked`` says whether this reader could read the installed
+    toolchain to compare with (see ``toolchain_checked``)."""
     meta = _meta_stamps(atlas, diff_id)
     if meta is None:
-        return {"source_stale": None, "source_stale_reason": STALE_UNKNOWN}
+        return {
+            "source_stale": None,
+            "source_stale_reason": STALE_UNKNOWN,
+            "toolchain_checked": toolchain_checked(),
+        }
     stale, reason = diff_staleness(cache or _GenerationCache(atlas), meta)
-    return {"source_stale": stale, "source_stale_reason": reason}
+    return {
+        "source_stale": stale,
+        "source_stale_reason": reason,
+        "toolchain_checked": toolchain_checked(),
+    }
+
+
+def toolchain_checked() -> bool:
+    """Whether this reader can read the installed Ghidra / BinExport / BinDiff versions. When it
+    cannot, a diff computed by other versions cannot be told apart, and the answer says so here
+    instead of turning every diff's source_stale into null."""
+    return current_toolchain() is not None
 
 
 def _is_whole_run_row(diff_id: str, run_a_id: str, run_b_id: str) -> bool:
@@ -621,9 +658,13 @@ def get_diff_capabilities(atlas: sqlite3.Connection, diff_id: str) -> dict[str, 
 
 
 _LIST_DIFFS_NOTE = (
-    "Each row is ONE binary's diff between two runs (diff_id = {run_a}::{run_b}::{binary}). The "
-    "counts are tri-state PROJECTIONS, not verdicts: layer_changed = the binary's changed aligned "
-    "functions, NOT proof the change matters; delta_undetermined is NOT 'unchanged'. An EMPTY list "
+    "Each row is ONE binary's diff between two runs (diff_id = {run_a}::{run_b}::{binary}). "
+    "layer_changed / layer_unchanged / delta_undetermined count the binary's string-keyed dispatch "
+    "edges (the reachability.string_keyed_edge dimension), NOT functions: tri-state projections, "
+    "not verdicts; layer_changed is not proof the change matters and delta_undetermined is NOT "
+    "'unchanged'. All three 0 = neither side has such an edge, so nothing was compared — that is "
+    "NOT 'unchanged'. How much a function moved is the similarity in get_function_alignment; "
+    "whether a sink call is still there is get_diff_sink_overlay. An EMPTY list "
     "means no diff has been run for that filter yet — not 'nothing changed'. diff_ok=0 rows are "
     "BLIND SPOTS (diff_status='failed', diff_status_reason = why, diff_attempts = tries): the "
     "binary did not diff, so its zero counts are 'unknown', never 'no change' — "
@@ -632,9 +673,13 @@ _LIST_DIFFS_NOTE = (
     "a binary, then read get_diff_deltas / meta. "
     "★ source_stale says whether the diff still describes what it was computed from: true = a "
     "side's binary content changed or is gone (source_content_changed / source_binary_absent), "
-    "the diff code changed (diff_logic_changed), the binary was re-extracted "
-    "(extraction_changed / ghidra_changed), or the hunt output the diff read changed "
-    "(hunt_inputs_changed) — re-run the diff before reading its deltas as current. false = every "
+    "the diff code or the export script it ran changed (diff_logic_changed), the diff was "
+    "computed by another Ghidra / BinExport / BinDiff than is installed (toolchain_changed), the "
+    "binary was re-extracted (extraction_changed / ghidra_changed), or the hunt output the diff "
+    "read changed (hunt_inputs_changed) — re-run the diff before reading its deltas as current. "
+    "toolchain_checked=false = this reader could not read the installed toolchain, so a diff "
+    "computed by other tool versions cannot be told apart here (it does not make source_stale "
+    "null). false = every "
     "input was checked and still matches, the normal result of re-scanning or re-hunting without "
     "a change. null = could not be checked (source analysis.db unreachable, or the diff predates "
     "the stamps: generation_unstamped) — read source_stale_reason; it is NOT a clean bill. When "
@@ -703,6 +748,7 @@ def list_diffs(
         # unanswerable side does not make it stale — it makes it unverified, which is said out loud
         # rather than rounded to either answer.
         row["source_stale"], row["source_stale_reason"] = diff_staleness(cache, meta)
+        row["toolchain_checked"] = toolchain_checked()
         diffs.append(row)
     return {
         "diffs": diffs,
@@ -780,6 +826,7 @@ def list_diff_blindspots(
                 "baseline_dropped": r[4] or 0,
                 "source_stale": stale,
                 "source_stale_reason": reason,
+                "toolchain_checked": toolchain_checked(),
             }
         )
     return {
@@ -852,6 +899,7 @@ def _partial_blindspots(
                 "marked_rows": marked,
                 "source_stale": stale,
                 "source_stale_reason": reason,
+                "toolchain_checked": toolchain_checked(),
             }
         )
     return out

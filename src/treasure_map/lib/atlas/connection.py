@@ -251,6 +251,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("export_degenerate_functions_a", "INTEGER"),
         ("export_degenerate_functions_b", "INTEGER"),
         ("bindiff_vertex0_fallbacks", "INTEGER"),
+        ("export_code_hash_a", "TEXT"),
+        ("export_code_hash_b", "TEXT"),
+        ("toolchain_ghidra", "TEXT"),
+        ("toolchain_binexport", "TEXT"),
+        ("toolchain_bindiff", "TEXT"),
     ):
         if dm_cols and _dmcol not in dm_cols:
             conn.execute(f"ALTER TABLE diff_meta ADD COLUMN {_dmcol} {_dmtype}")  # noqa: S608

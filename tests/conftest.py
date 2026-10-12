@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 import treasure_map.lib.config.config as _config
+import treasure_map.lib.diff.toolchain as _toolchain
 import treasure_map.lib.last_run as _last_run
 
 
@@ -35,3 +36,13 @@ def _isolate_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     tm = fake_home / ".treasure-map"
     monkeypatch.setattr(_last_run, "_POINTER_PATH", tm / "last_run.json")
     monkeypatch.setattr(_config, "_DEFAULT_CONFIG_PATH", tm / "config.yaml")
+
+
+@pytest.fixture(autouse=True)
+def _no_external_toolchain(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test reads the machine's Ghidra / BinExport / BinDiff versions: a GHIDRA_HOME in the
+    environment or a bindiff on PATH would otherwise make a diff's toolchain stamps, and the
+    readers' ``toolchain_checked``, depend on the machine. A test that needs a toolchain sets
+    one."""
+    monkeypatch.setattr(_toolchain, "_current", [None])
+    monkeypatch.setattr(_toolchain, "detect_toolchain", lambda config: None)

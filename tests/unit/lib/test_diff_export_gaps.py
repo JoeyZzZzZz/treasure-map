@@ -52,6 +52,7 @@ def _fake_run(
     stderr: bytes = b"",
     writes: tuple[Path, ...] = (),
     raises: BaseException | None = None,
+    files: dict[Path, bytes] | None = None,
 ) -> Any:
     def run(cmd: list[str], **_kw: Any) -> subprocess.CompletedProcess[bytes]:
         seen.append(cmd)
@@ -59,6 +60,8 @@ def _fake_run(
             raise raises
         for p in writes:
             p.write_bytes(b"\x01")
+        for p, body in (files or {}).items():
+            p.write_bytes(body)
         return subprocess.CompletedProcess(cmd, rc, stdout, stderr)
 
     return run
@@ -132,6 +135,72 @@ def test_a_crashed_export_of_a_library_named_for_timeouts_is_a_crash(
             _export(tmp_path, "libnetfilter_cttimeout.so.1"), Config(), tmp_path, "a", 300
         )
     assert driver._classify_failure_reason(ei.value) == driver.FAIL_BINEXPORT_CRASH
+
+
+_TIMED_OUT = (
+    b"ERROR (HeadlessAnalyzer) REPORT: Analysis timed out at 10 seconds. Processing not completed "
+    b"for file: file:///x/liba.so\n"
+)
+
+
+def _complete_export(tmp_path: Path) -> tuple[Path, ...]:
+    return (tmp_path / "a.BinExport", tmp_path / "a.export_report.json")
+
+
+@pytest.mark.usefixtures("headless")
+@pytest.mark.parametrize("where", ["stdout", "log"])
+def test_an_export_of_an_analysis_that_timed_out_is_a_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, where: str
+) -> None:
+    """Ghidra stops analysing at -analysisTimeoutPerFile, runs the export script anyway and exits
+    0: the export is complete as a file and describes a half-analysed program.
+
+    MUTATION (verified RED): drop the check -> the export is returned as a success; look at stdout
+    only -> the case where only the -log file holds the line is returned as a success."""
+    seen: list[list[str]] = []
+    files = {tmp_path / "a.ghidra.log": _TIMED_OUT if where == "log" else b"INFO ok\n"}
+    stdout = _TIMED_OUT if where == "stdout" else b"INFO ok\n"
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        _fake_run(seen, stdout=stdout, writes=_complete_export(tmp_path), files=files),
+    )
+    with pytest.raises(DiffToolchainError) as ei:
+        driver._run_binexport(_export(tmp_path), Config(), tmp_path, "a", 10)
+    assert ei.value.kind == driver.FAIL_TIMEOUT
+    assert "analysis" in str(ei.value).lower()
+
+
+@pytest.mark.usefixtures("headless")
+def test_an_analysis_that_finished_is_not_a_timeout_whatever_it_is_named(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only Ghidra's own timed-out line counts: the library's name and the -analysisTimeoutPerFile
+    flag in argv do not.
+
+    MUTATION (verified RED): match any "timeout" in the output -> this export is refused."""
+    seen: list[list[str]] = []
+    stdout = b"INFO REPORT: Analysis succeeded for file: file:///x/libnetfilter_cttimeout.so.1\n"
+    monkeypatch.setattr(
+        subprocess, "run", _fake_run(seen, stdout=stdout, writes=_complete_export(tmp_path))
+    )
+    so_path = _export(tmp_path, "libnetfilter_cttimeout.so.1")
+    assert driver._run_binexport(so_path, Config(), tmp_path, "a", 300) == tmp_path / "a.BinExport"
+    assert "-analysisTimeoutPerFile" in seen[0]
+
+
+@pytest.mark.usefixtures("headless")
+def test_a_timed_out_analysis_without_an_export_is_still_a_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The timeout says more about why than the missing file does.
+
+    MUTATION (verified RED): check for the file before the timeout -> binexport_no_file."""
+    seen: list[list[str]] = []
+    monkeypatch.setattr(subprocess, "run", _fake_run(seen, stdout=_TIMED_OUT))
+    with pytest.raises(DiffToolchainError) as ei:
+        driver._run_binexport(_export(tmp_path), Config(), tmp_path, "a", 10)
+    assert ei.value.kind == driver.FAIL_TIMEOUT
 
 
 @pytest.mark.usefixtures("headless")
@@ -607,6 +676,80 @@ def test_an_unreadable_report_fails_the_diff_as_no_file(
         _diff(w)
     m = _meta(w)
     assert (m["diff_ok"], m["diff_status_reason"]) == (0, driver.FAIL_BINEXPORT_NO_FILE)
+
+
+def test_a_gap_on_one_side_marks_only_that_sides_unmatched_function(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """helper is unmatched on both sides; only side b's export dropped it.
+
+    MUTATION (verified RED): compute side b's presence with side a's gaps -> b's helper reads
+    unmatched_analysis_complete."""
+    w = _world(tmp_path, pairs=((0x1000, 0x1000),), reports={"b": _report(dropped=(0x2000,))})
+    _stub(monkeypatch, w)
+    _diff(w)
+    assert _presence(w)[("b", "00002000")] == (
+        "unmatched_analysis_incomplete",
+        "flow_graph_dropped",
+    )
+    assert _presence(w)[("a", "00002000")] == ("unmatched_analysis_complete", None)
+
+
+def test_an_edge_only_side_b_has_is_checked_against_side_bs_gaps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Side b alone has a gate in helper, and side b's helper is degenerate: the edge rests on it.
+
+    MUTATION (verified RED): check side a's subject only -> the edge reads
+    completeness_not_complete, naming a symptom instead of the export."""
+    w = _world(tmp_path, reports={"b": _report(degenerate=(0x2000,))})
+    w.atlas.execute(
+        "INSERT INTO string_keyed_edge (source_run_id, binary, from_function, from_func_addr, "
+        "key, mechanism, callee_name, callee_addr, callee_kind, completeness_status) VALUES "
+        "('run_b', 'liba', 'helper', '00002000', 'other', 'strcmp_gate', 'puts', NULL, "
+        "'import', 'complete')"
+    )
+    w.atlas.commit()
+    _stub(monkeypatch, w)
+    _diff(w)
+    only_b = [(k, r) for s, k, r in _edges(w) if "|other|" in s]
+    assert only_b == [("delta_undetermined", DEGENERATE_BLOCK_SOURCE)]
+
+
+def test_a_degraded_key_row_checks_the_other_sides_function_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pair marking puts both halves of a marked pair among the gaps, so this side's function
+    is normally marked whenever its counterpart is. The key row checks the counterpart on its own
+    as well; this pins that check with only the other half marked.
+
+    MUTATION (verified RED): check only this side's function in ``_key_row`` -> the row names the
+    low-confidence alignment instead of the export."""
+    w = _world(tmp_path, reports={"b": _report(degenerate=(0x1000,))})
+    _add_degraded_candidates(w)
+    _stub(monkeypatch, w)
+    _diff(w)
+    monkeypatch.setattr(so, "load_export_gaps", lambda atlas, did: (set(), {"00001000"}))
+    rows = so.compute_sink_overlay(w.atlas, _DID).rows
+    (key_row,) = [r for r in rows if r.key_granularity == "degraded_out_of_body"]
+    assert (key_row.presence, key_row.presence_reason) == (
+        "presence_undetermined",
+        DEGENERATE_BLOCK_SOURCE,
+    )
+
+
+def test_a_diff_with_only_degenerate_functions_is_a_partial_blind_spot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rebuilt export may hold degenerate blocks and drop no flow graph.
+
+    MUTATION (verified RED): count only dropped flow graphs for 'partial' -> the diff is missing."""
+    w = _world(tmp_path, reports={"a": _report(degenerate=(0x1000,))})
+    _stub(monkeypatch, w)
+    _diff(w)
+    (row,) = diff_align.list_diff_blindspots(w.atlas)["partial"]
+    assert row["diff_id"] == _DID and row["export_flow_graphs_dropped_a"] == 0
+    assert row["export_degenerate_functions_a"] == 1
 
 
 # ── a pair outside the inventory ────────────────────────────────────────────────────────────────

@@ -114,6 +114,7 @@ from treasure_map.lib.callsite_ref import (
     ref_suffix_parts,
     wrapper_call_abs_addr,
 )
+from treasure_map.lib.diff.code_version import sink_overlay_logic_version
 from treasure_map.lib.diff.export_report import DEGENERATE_BLOCK_SOURCE, load_export_gaps
 from treasure_map.lib.errors import TreasureMapError
 from treasure_map.version import UNKNOWN_VERSION
@@ -139,10 +140,9 @@ _DELTA_KIND = {
     _P_UNDET: "delta_undetermined",
 }
 
-# The logic version stamped on every persisted baseline row. Bump it whenever the way a row is
-# computed changes (a verdict, a reason, a key, a fold): a baseline written by other logic is then
-# read as stale instead of being compared as if it were current.
-SINK_OVERLAY_LOGIC_VERSION = "4"
+# The logic version stamped on every persisted baseline row is computed from this module's code and
+# what it takes from others (lib/diff/code_version.sink_overlay_logic_version): a change to how a
+# row is computed makes every baseline written by other code read as stale, with nothing to bump.
 
 # Where the callee of a matched other-side instruction that is NOT a candidate comes from.
 # ``callsite_facts`` (the default) reads the call-site facts stored beside instruction_match;
@@ -1619,7 +1619,7 @@ def persist_sink_overlay(atlas: sqlite3.Connection, diff_id: str, *, commit: boo
                 build_hash_b=bh_b,
                 hunt_instances_a=hi_a,
                 hunt_instances_b=hi_b,
-                overlay_version=SINK_OVERLAY_LOGIC_VERSION,
+                overlay_version=sink_overlay_logic_version(),
                 counterpart_callee=(
                     json.dumps(r.counterpart_callee, sort_keys=True)
                     if r.counterpart_callee is not None
@@ -1645,8 +1645,8 @@ def read_sink_overlay_baseline(atlas: sqlite3.Connection, diff_id: str) -> dict[
     Every stored row's generation stamps (hunt_commit / build_hash / hunt_instances, both sides)
     are compared with the runs' CURRENT values. Any difference means a run was re-hunted or
     re-scanned after the baseline was written, so its rows describe candidates that may no longer
-    exist. Its ``overlay_version`` is compared with SINK_OVERLAY_LOGIC_VERSION: rows written by
-    other overlay logic would not match a live computation. Either way the answer is
+    exist. Its ``overlay_version`` is compared with ``sink_overlay_logic_version()``: rows written
+    by other overlay logic would not match a live computation. Either way the answer is
     ``stale_baseline: true`` with the differing fields, and no rows.
 
     A diff with no stored baseline answers ``baseline_absent: true`` (``stale_baseline`` null, rows
@@ -1683,7 +1683,7 @@ def read_sink_overlay_baseline(atlas: sqlite3.Connection, diff_id: str) -> dict[
                 stored_val = row[offset + 2 * i]
                 if cur is None or stored_val != cur[i]:
                     mismatched.add(f"{name}_{side}")
-        if row[17] != SINK_OVERLAY_LOGIC_VERSION:  # NULL (a pre-stamp baseline) is stale too
+        if row[17] != sink_overlay_logic_version():  # NULL (a pre-stamp baseline) is stale too
             mismatched.add("overlay_version")
     if mismatched:
         return {

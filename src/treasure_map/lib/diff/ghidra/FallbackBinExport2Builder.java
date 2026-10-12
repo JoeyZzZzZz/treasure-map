@@ -18,8 +18,10 @@
 //     the export script (it imports MnemonicMapper / IdentityMnemonicMapper from the extension);
 //   - build() promotes undefined functions BEFORE exporting instructions and indexing basic blocks,
 //     so the block index and the explicit entry addresses describe the promoted program;
-//   - buildFlowGraphs() registers a basic block the program-wide block iteration did not return
-//     instead of failing on its missing index (one entry per start address, also when shared);
+//   - buildFlowGraphs() first registers every basic block of every function body that the
+//     program-wide block iteration did not return (one entry per start address, also when shared),
+//     so an edge to a block of a later function still finds its target index, instead of failing
+//     on the missing index;
 //   - functions that contain a multi-entry basic block whose non-first entry is a delay-slot
 //     instruction are recorded (getDegenerateFunctionEntries) so the caller can treat them as
 //     unreliable.
@@ -823,6 +825,21 @@ public class FallbackBinExport2Builder {
 
   private void buildFlowGraphs(Map<Long, Integer> basicBlockIndices) throws CancelledException {
     FunctionManager funcManager = program.getFunctionManager();
+    // Register every block of every function body before any edge is built: an edge looks its
+    // target up in the index, and a target in a later function would otherwise not be there yet.
+    for (Function func : funcManager.getFunctions(true)) {
+      if (func.getEntryPoint().isNonLoadedMemoryAddress()) {
+        continue;
+      }
+      for (var bbIter = bbModel.getCodeBlocksContaining(func.getBody(), monitor);
+          bbIter.hasNext(); ) {
+        CodeBlock bb = bbIter.next();
+        long bbAddress = getMappedAddress(bb.getFirstStartAddress());
+        if (!basicBlockIndices.containsKey(bbAddress)) {
+          basicBlockIndices.put(bbAddress, addBasicBlock(bb));
+        }
+      }
+    }
     monitor.setIndeterminate(false);
     monitor.setMaximum(funcManager.getFunctionCount());
     int i = 0;

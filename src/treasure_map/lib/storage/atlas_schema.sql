@@ -630,8 +630,11 @@ CREATE TABLE IF NOT EXISTS diff_meta (
                                              --   + layer0/2 all succeeded); 0 = this diff failed
     diff_status             TEXT,            -- tri-state outcome: ok / failed / NULL (pre-feature)
     diff_status_reason      TEXT,            -- WHY a failed diff failed: binexport_ghidra_crash /
-                                             --   bindiff_flowgraph / binexport_no_file / timeout /
-                                             --   other; NULL on success. Lets a consumer tell a
+                                             --   binexport_no_file / bindiff_flowgraph /
+                                             --   bindiff_failed / timeout (a toolchain subprocess,
+                                             --   or Ghidra's own analysis, ran past its limit) /
+                                             --   ambiguous_binary_selector / extraction_unstamped
+                                             --   / other; NULL on success. Lets a consumer tell a
                                              --   likely-transient failure from a hard boundary
     diff_attempts           INTEGER NOT NULL DEFAULT 0,  -- cumulative attempts at the SAME content;
                                              --   reset to 1 when either side's sha256 changes (a
@@ -676,6 +679,11 @@ CREATE TABLE IF NOT EXISTS diff_meta (
     bindiff_vertex0_fallbacks INTEGER,       -- flow-graph edges BinDiff resolved to the graph's
                                              --   first vertex (their target was not one of the
                                              --   graph's blocks)
+    export_code_hash_a      TEXT,            -- per side: hash of the export script files that
+    export_code_hash_b      TEXT,            --   side's export took (lib/diff/code_version)
+    toolchain_ghidra        TEXT,            -- the external toolchain the diff ran (Ghidra's
+    toolchain_binexport     TEXT,            --   application.version, the BinExport extension's
+    toolchain_bindiff       TEXT,            --   version, `bindiff --version`); NULL = not read
     created_at              DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 

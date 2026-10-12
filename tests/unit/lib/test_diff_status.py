@@ -24,7 +24,7 @@ from treasure_map.lib.atlas.writer import (
     add_diff_meta,
     begin_run,
 )
-from treasure_map.lib.diff import currency, driver
+from treasure_map.lib.diff import code_version, currency, driver
 from treasure_map.lib.diff.driver import _DIFF_RETRY_LIMIT, DiffToolchainError
 from treasure_map.lib.diff.layer0 import make_diff_id
 from treasure_map.lib.errors import ConfigError
@@ -155,7 +155,9 @@ def _seed_committed_status(
             extraction_pass_b=st_b.extraction_pass,
             hunt_inputs_hash_a=st_a.hunt_inputs_hash,
             hunt_inputs_hash_b=st_b.hunt_inputs_hash,
-            diff_code_version=currency.DIFF_CODE_VERSION,
+            diff_code_version=code_version.diff_code_version(),
+            export_code_hash_a=st_a.export_code_hash,
+            export_code_hash_b=st_b.export_code_hash,
         ),
         commit=True,
     )

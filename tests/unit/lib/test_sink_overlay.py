@@ -960,9 +960,10 @@ def test_detail_and_limit_validation(atlas: sqlite3.Connection, tmp_path: Path) 
 
 # ── no removed / added; logic-versioned baselines ────────────────────────────────────
 
-# The run-pair summary of the fixture, keyed by SINK_OVERLAY_LOGIC_VERSION. When a logic change
-# moves this summary, ADD a new version key with the new value and bump the constant — never edit
-# an existing key's value (it records what that logic version computed).
+# The run-pair summary of the fixture, by the logic that computed it (the hand-numbered versions
+# used before the version became a hash of the code). The current logic must reproduce _CURRENT;
+# when a logic change moves the summary on purpose, ADD a new key and point _CURRENT at it — never
+# edit an existing key's value (it records what that logic computed).
 _GOLDEN: dict[str, dict[str, object]] = {
     "2": {
         "total_rows": 13,
@@ -1056,13 +1057,16 @@ _GOLDEN: dict[str, dict[str, object]] = {
 }
 
 
+_CURRENT = "4"
+
+
 def test_golden_summary_matches_logic_version(atlas: sqlite3.Connection) -> None:
     """From logic "4" on, the golden fixture adds wrapper calls (same W, another W, an unaligned W)
     and call-site facts (``_golden_v4``) to the base fixture "2"/"3" were recorded on."""
     _golden_v4(atlas)
     rows = so.compute_sink_overlay_runs(atlas, "runA", "runB").rows
     summary = so.summarize_overlay(rows, by_binary=True)
-    assert summary == _GOLDEN[so.SINK_OVERLAY_LOGIC_VERSION]
+    assert summary == _GOLDEN[_CURRENT]
     assert "wrapper_callsite" in summary["by_key_granularity"]
 
 
@@ -1135,7 +1139,7 @@ def test_persist_stamps_logic_version(atlas: sqlite3.Connection) -> None:
         "SELECT overlay_version FROM dimension_delta WHERE subject_kind = 'candidate'"
     ).fetchall()
     assert len(versions) == n > 0
-    assert {v[0] for v in versions} == {so.SINK_OVERLAY_LOGIC_VERSION}
+    assert {v[0] for v in versions} == {so.sink_overlay_logic_version()}
 
 
 @pytest.mark.parametrize("stored", ["1", "3", None])
@@ -1694,7 +1698,7 @@ def test_persist_writes_the_counterpart_callee(atlas: sqlite3.Connection) -> Non
     stored = [json.loads(v) for v in raw]
     assert stored and stored[0]["callees"][0]["name"] == "popen"
     versions = {r[0] for r in atlas.execute("SELECT overlay_version FROM dimension_delta")}
-    assert versions == {"4"}
+    assert versions == {so.sink_overlay_logic_version()}
 
 
 def _golden_v4(conn: sqlite3.Connection) -> None:

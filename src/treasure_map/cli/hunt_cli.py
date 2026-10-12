@@ -88,6 +88,18 @@ def _echo_legal_notice(*, as_json: bool = False) -> None:
     click.echo("", err=True)
 
 
+def _edge_counts(summary: Any) -> str:
+    """The delta line of one binary's diff. The three counts are string-keyed dispatch edges, not
+    functions; all three zero means neither side has such an edge — nothing was compared, which is
+    not 'unchanged'."""
+    changed = summary.delta_layer_changed
+    unchanged = summary.delta_layer_unchanged
+    undetermined = summary.delta_undetermined
+    if changed + unchanged + undetermined == 0:
+        return "no string-keyed edges (0 subjects)"
+    return f"{changed} edges changed / {unchanged} unchanged / {undetermined} undetermined"
+
+
 def _echo_single_diff(summary: Any, resolved_atlas: Path) -> None:
     """Print one binary's diff result (the --binary or single-binary path)."""
     for w in summary.warnings:
@@ -97,12 +109,7 @@ def _echo_single_diff(summary: Any, resolved_atlas: Path) -> None:
     click.echo(f"  binary        : {summary.binary}")
     click.echo(f"  matched_pairs : {summary.matched_pairs}")
     click.echo(f"  version_skew  : {summary.version_skew}")
-    click.echo(
-        "  delta         : "
-        f"layer_changed={summary.delta_layer_changed}, "
-        f"layer_unchanged={summary.delta_layer_unchanged}, "
-        f"delta_undetermined={summary.delta_undetermined}"
-    )
+    click.echo(f"  delta         : {_edge_counts(summary)}")
     if summary.baseline is not None:
         click.echo(f"  baseline      : {summary.baseline.replace('_', ' ')}")
     click.echo(
@@ -162,6 +169,12 @@ def _echo_full_diff(fsum: Any, resolved_atlas: Path) -> None:
         click.echo(
             f"  baselines     : {len(restored)} stored again, {len(lost)} not"
             + (f" (now without one — see the diff's warnings): {', '.join(lost)}" if lost else "")
+        )
+    if fsum.baselines_refreshed or fsum.baselines_refresh_refused:
+        # Diffs left as they are (nothing they read moved) whose baseline read stale or was dropped.
+        click.echo(
+            f"  baselines refreshed (unchanged diffs): {len(fsum.baselines_refreshed)}, "
+            f"{len(fsum.baselines_refresh_refused)} refused"
         )
     if still_hard:
         click.echo(
@@ -276,11 +289,7 @@ def hunt_diff(
         if outcome.error is not None:
             click.echo(f"  [{i}/{total}] {outcome.binary}: FAILED — {outcome.error}")
         else:
-            s = outcome.summary
-            click.echo(
-                f"  [{i}/{total}] {outcome.binary}: {s.delta_layer_changed} changed / "
-                f"{s.delta_layer_unchanged} unchanged / {s.delta_undetermined} undetermined"
-            )
+            click.echo(f"  [{i}/{total}] {outcome.binary}: {_edge_counts(outcome.summary)}")
 
     atlas = open_atlas(Path(resolved_atlas))
     try:

@@ -35,7 +35,13 @@ from treasure_map.lib.atlas.writer import (
 )
 from treasure_map.lib.binary_id import BinaryRow
 from treasure_map.lib.callsite_ref import callsite_abs_addr, wrapper_call_abs_addr
-from treasure_map.lib.diff.currency import COMPARED_COLUMNS, UNSTAMPED, DiffStamps, stamps_equal
+from treasure_map.lib.diff.currency import (
+    COMPARED_COLUMNS,
+    UNSTAMPED,
+    DiffStamps,
+    stamps_equal,
+    toolchain_columns,
+)
 from treasure_map.lib.diff.export_report import ExportReport
 from treasure_map.lib.errors import ConfigError
 from treasure_map.lib.facts import _DECOMPILE_MIN_SIZE
@@ -639,6 +645,7 @@ def run_layer0_parse(
     attempts = _next_attempts(atlas, did, sha_a, sha_b, st)
 
     undetermined = sum(1 for r in parsed.rows if r.alignment_state == "alignment_undetermined")
+    tools = toolchain_columns(st.toolchain)
     meta = DiffMetaRow(
         diff_id=did,
         run_a_id=run_a_id,
@@ -706,6 +713,11 @@ def run_layer0_parse(
         export_degenerate_functions_a=len(report_a.degenerate_functions) if report_a else None,
         export_degenerate_functions_b=len(report_b.degenerate_functions) if report_b else None,
         bindiff_vertex0_fallbacks=bindiff_vertex0_fallbacks,
+        export_code_hash_a=st.a.export_code_hash,
+        export_code_hash_b=st.b.export_code_hash,
+        toolchain_ghidra=tools["toolchain_ghidra"],
+        toolchain_binexport=tools["toolchain_binexport"],
+        toolchain_bindiff=tools["toolchain_bindiff"],
     )
 
     delete_diff(atlas, did, commit=False)

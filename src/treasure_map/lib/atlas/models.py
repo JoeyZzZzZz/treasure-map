@@ -437,6 +437,13 @@ class DiffMetaRow:
     export_degenerate_functions_a: int | None = None
     export_degenerate_functions_b: int | None = None
     bindiff_vertex0_fallbacks: int | None = None
+    # The export script files each side's export took (hashed) and the external toolchain the
+    # diff ran (lib/diff/currency); None = not recorded.
+    export_code_hash_a: str | None = None
+    export_code_hash_b: str | None = None
+    toolchain_ghidra: str | None = None
+    toolchain_binexport: str | None = None
+    toolchain_bindiff: str | None = None
 
 
 @dataclass(frozen=True)

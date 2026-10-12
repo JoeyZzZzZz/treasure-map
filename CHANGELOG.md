@@ -103,6 +103,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **What computed a stored diff is recorded and compared by itself; nothing is bumped by hand.**
+  - The diff code version is a hash of the Python code that writes the diff (comments, docstrings
+    and formatting do not count; the same under every supported Python). The stored baseline's
+    `overlay_version` is a hash of the overlay code. A test locks the hashed code against what it
+    takes from other modules, so a new helper cannot be left out unnoticed.
+  - Each side records a hash of the export script files its export took: an edit to the fallback
+    builder re-runs only the diffs that used it.
+  - Each diff records the Ghidra, BinExport extension and BinDiff versions it ran. An upgrade
+    re-runs it, and the readers report `source_stale` with the new reason `toolchain_changed`.
+    Every diff reader also reports `toolchain_checked`: false when the reader cannot read the
+    installed toolchain, in which case nothing is called stale or current on its account.
+  - **After upgrading,** every stored diff reads `diff_logic_changed` and the next full diff of
+    each run pair re-runs all of them once; every stored baseline reads stale and is stored again
+    by it. The new `diff_meta` columns are added when an older atlas is opened.
+
 - **Reading the stored overlay baseline of a diff that has none says so.**
   `read_sink_overlay_baseline` now returns `baseline_absent: true`, `stale_baseline: null` and
   `rows: null` for such a diff, instead of `stale_baseline: false` with an empty row list, which
@@ -168,6 +183,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an earlier extraction) carries `extraction_current: false`, also surfaced under `anchor_facts`.
 
 ### Fixed
+
+- **A rebuilt export no longer loses the targets of its flow-graph edges.** The fallback builder
+  registered a basic block the program-wide iteration missed only when it reached the function
+  holding it, so an edge into a block of a later function found no index and was written without a
+  target; BinDiff then resolved each such edge to the flow graph's first vertex. Every function
+  body's blocks are now registered before any edge is built. On the three binaries measured, the
+  edges without a target went from thousands to none, and BinDiff's first-vertex fallbacks from
+  11,236 to 58; matched pairs, similarities, instruction matches and the listed functions are
+  unchanged, and more pairs reach high confidence.
+- **An export of an analysis that ran out of time is refused.** When Ghidra stops analysing at
+  `-analysisTimeoutPerFile` it still runs the export script and exits 0, so the export of a
+  half-analysed program was diffed as complete. Ghidra's own "Analysis timed out" report, on its
+  console or in its log, now fails the diff with reason `timeout`.
+- **A baseline left stale by a re-hunt that changed nothing is stored again.** Such a re-hunt
+  leaves every diff current, so none is re-run, while their stored baselines (stamped with the
+  runs' hunt commit) read stale with nothing to store them again. A full diff now stores the
+  baseline of every already-current diff whose baseline reads stale or was dropped, even when
+  nothing is left to diff, and reports it on its own line (`baselines refreshed (unchanged diffs):
+  N, M refused`). A refused store keeps the old rows. Not done under `--assume-current`, which
+  skips the check that the diff is current.
+- **`list_diffs` and `tmap diff` no longer present the edge counts as changed functions.** The
+  three counts are the binary's string-keyed dispatch edges. `tmap diff` prints
+  `N edges changed / N unchanged / N undetermined`, or `no string-keyed edges (0 subjects)` when
+  neither side has one — nothing was compared, which is not "unchanged".
 
 - **Version diffs of MIPS binaries whose export BinDiff rejected now complete.** Two kinds of flow
   graph in the BinExport extension's output made BinDiff refuse the whole binary

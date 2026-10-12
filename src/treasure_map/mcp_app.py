@@ -87,6 +87,7 @@ from treasure_map.lib.query.diff_align import get_diff_meta as _get_diff_meta
 from treasure_map.lib.query.diff_align import list_diff_blindspots as _list_diff_blindspots
 from treasure_map.lib.query.diff_align import list_diffs as _list_diffs
 from treasure_map.lib.query.diff_align import staleness_summary as _staleness_summary
+from treasure_map.lib.query.diff_align import toolchain_checked as _toolchain_checked
 from treasure_map.lib.query.sink_overlay import compute_sink_overlay as _compute_sink_overlay
 from treasure_map.lib.query.sink_overlay import (
     compute_sink_overlay_runs as _compute_sink_overlay_runs,
@@ -1869,9 +1870,14 @@ def make_tools(
         by_diff: dict[str, dict[str, Any]], row_diff_id: str | None
     ) -> dict[str, Any]:
         """A run-pair overlay row's own diff's staleness; null for a row no diff covers."""
+        none = {
+            "source_stale": None,
+            "source_stale_reason": None,
+            "toolchain_checked": _toolchain_checked(),
+        }
         if row_diff_id is None:
-            return {"source_stale": None, "source_stale_reason": None}
-        return by_diff.get(row_diff_id, {"source_stale": None, "source_stale_reason": None})
+            return none
+        return by_diff.get(row_diff_id, none)
 
     def get_diff_meta(diff_id: str) -> dict[str, Any]:
         """The meta facts of one version diff (``diff_id`` = ``{run_a}::{run_b}::{binary}``, one per
@@ -1941,12 +1947,18 @@ def make_tools(
 
     def list_diffs(run_a_id: str | None = None, run_b_id: str | None = None) -> dict[str, Any]:
         """Browse the version diffs in the atlas: one row per binary diffed between two runs, with
-        its change profile (matched_pairs, layer_changed / unchanged / undetermined, version_skew)
-        AND its diff status (diff_ok / diff_status / diff_status_reason / diff_attempts). Optionally
-        filter to a run-pair. ``baseline_dropped=1`` = the diff had a stored candidate baseline that
-        a re-diff dropped (it failed, or the baseline could not be stored again). The entry point
-        after a full diff — see which binaries were compared, how much each moved, and which FAILED
-        to diff, then open one with get_diff_deltas / get_diff_meta.
+        matched_pairs, version_skew, the string-keyed edge counts (layer_changed / layer_unchanged /
+        delta_undetermined) AND its diff status (diff_ok / diff_status / diff_status_reason /
+        diff_attempts). Optionally filter to a run-pair. ``baseline_dropped=1`` = the diff had a
+        stored candidate baseline that a re-diff dropped (it failed, or the baseline could not be
+        stored again). The entry point after a full diff — see which binaries were compared and
+        which FAILED to diff, then open one with get_diff_deltas / get_diff_meta.
+
+        ★ The three counts are the binary's string-keyed dispatch edges
+        (reachability.string_keyed_edge), NOT functions. All three 0 means neither side has such an
+        edge: nothing was compared, which is NOT 'unchanged'. How much a function moved is the
+        similarity in get_function_alignment; whether a sink call is still there is
+        get_diff_sink_overlay.
 
         ★ Counts are tri-state PROJECTIONS, never verdicts or a ranking: ``layer_changed`` is not
         proof the change matters, and an EMPTY list means no diff has been run for that filter --
@@ -1957,12 +1969,15 @@ def make_tools(
         ★ Each row's ``source_stale`` says whether the diff still describes what it was computed
         from. true, with ``source_stale_reason``: ``source_binary_absent`` /
         ``source_content_changed`` (a side's binary is gone or its bytes changed),
-        ``diff_logic_changed`` (computed by different diff code), ``extraction_changed`` /
-        ``ghidra_changed`` (the binary was re-extracted), ``hunt_inputs_changed`` (the hunt output
-        the diff read changed) — re-run the diff. null: ``generation_unstamped`` (written before
-        the stamps were recorded) / ``source_unavailable`` (the source could not be read) — NOT a
-        clean bill. false: checked and current. The first applicable reason in that order is the
-        one reported."""
+        ``diff_logic_changed`` (computed by different diff code, or another export script),
+        ``toolchain_changed`` (computed by another Ghidra / BinExport / BinDiff version than is
+        installed), ``extraction_changed`` / ``ghidra_changed`` (the binary was re-extracted),
+        ``hunt_inputs_changed`` (the hunt output the diff read changed) — re-run the diff. null:
+        ``generation_unstamped`` (written before the stamps were recorded) / ``source_unavailable``
+        (the source could not be read) — NOT a clean bill. false: checked and current. The first
+        applicable reason in that order is the one reported. ``toolchain_checked=false``: this
+        server could not read the installed toolchain, so a diff computed by other tool versions
+        is not told apart (source_stale is not made null for it)."""
         conn = open_atlas(atlas_path)
         try:
             return _list_diffs(conn, run_a_id, run_b_id)
@@ -1978,11 +1993,12 @@ def make_tools(
 
         ★ UNKNOWN is not SAFE: a binary missing from the deltas may simply have FAILED to diff. Each
         row gives ``diff_status_reason`` (why it failed — e.g. binexport_ghidra_crash likely
-        transient; timeout; binexport_no_file = the export script did not finish;
-        bindiff_flowgraph = BinDiff rejected a flow graph, which the export repair is meant to
-        prevent, so report it; bindiff_failed = any other BinDiff failure), ``diff_attempts`` (how
-        many tries),
-        and ``suspected_hard`` (1 = hit the retry cap, so later full diffs skip it unless
+        transient; timeout = a toolchain step, or Ghidra's own analysis, ran past its limit (an
+        export of a half-analysed program is refused); binexport_no_file = the export script did
+        not finish; bindiff_flowgraph = BinDiff rejected a flow graph, which the export repair is
+        meant to prevent, so report it; bindiff_failed = any other BinDiff failure),
+        ``diff_attempts`` (how many tries), and ``suspected_hard`` (1 = hit the retry cap, so later
+        full diffs skip it unless
         force_retry; a HINT from repeated identical-content failures, never proof the binary is
         undiffable — its content changing resets the count). Read this alongside get_diff_deltas so
         a consumer of the change map always sees the coverage gaps too. ``extraction_unstamped`` =
