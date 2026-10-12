@@ -324,6 +324,7 @@ def test_a_diff_is_refused_when_either_side_is_stale(atlas: Path, side: str) -> 
 
     tools = mcp_app.make_tools(atlas)
     for call in (
+        lambda: tools["get_diff_patch_view"]("d1"),
         lambda: tools["get_diff_deltas"]("d1"),
         lambda: tools["get_diff_sink_overlay"]("d1"),
         lambda: tools["get_diff_meta"]("d1"),

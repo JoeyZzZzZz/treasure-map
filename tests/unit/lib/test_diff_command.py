@@ -362,6 +362,7 @@ def test_diff_mcp_tools_have_no_write_sql(tmp_path: Path) -> None:
     tools = make_tools(atlas_path)
     write = re.compile(r"\b(INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER)\b", re.IGNORECASE)
     for name in (
+        "get_diff_patch_view",
         "get_diff_deltas",
         "get_diff_meta",
         "get_function_alignment",

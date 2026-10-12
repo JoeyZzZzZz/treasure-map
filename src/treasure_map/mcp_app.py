@@ -88,6 +88,7 @@ from treasure_map.lib.query.diff_align import list_diff_blindspots as _list_diff
 from treasure_map.lib.query.diff_align import list_diffs as _list_diffs
 from treasure_map.lib.query.diff_align import staleness_summary as _staleness_summary
 from treasure_map.lib.query.diff_align import toolchain_checked as _toolchain_checked
+from treasure_map.lib.query.patch_view import get_diff_patch_view as _get_diff_patch_view
 from treasure_map.lib.query.sink_overlay import compute_sink_overlay as _compute_sink_overlay
 from treasure_map.lib.query.sink_overlay import (
     compute_sink_overlay_runs as _compute_sink_overlay_runs,
@@ -1664,6 +1665,77 @@ def make_tools(
         finally:
             conn.close()
 
+    def get_diff_patch_view(
+        diff_id: str,
+        view: str = "sink_patch",
+        sort_by: str | None = None,
+        bucket: str | None = None,
+        subclass: str | None = None,
+        tier: str | int | None = None,
+        blind_spot: str | None = None,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """START HERE for one diff (``diff_id`` = ``{run_a}::{run_b}::{binary}``; list_diffs gives
+        the ids): one entry per FUNCTION PAIR that changed, with what happened around its sink
+        calls, sorted into buckets — plus a ledger of what this view cannot see. Read-only;
+        evidence, never a verdict or a score.
+
+        ``bucket``: ``A`` = at the call instruction BinDiff matched, the other side calls a
+        different callee and the paired function holds no candidate with the original callee;
+        ``B`` = a sink candidate whose cross-side reading stayed undetermined (``subclass`` says
+        why — ``sink_presence_signal:*`` first), a changed pair whose candidates all line up
+        (``sink_present_no_visible_delta``), or a changed pair with no candidate that calls a sink
+        the hunt does not recall (``recall_gap_sink:<family>``); ``R`` = the pair itself is
+        undetermined; ``C`` = a changed pair with no sink candidate on either side
+        (``no_sink_candidate_unchecked`` when the callee lists could not be read); ``P`` = a
+        function with no counterpart. Identical pairs whose candidates line up, or that have none,
+        are counted under ``not_listed``, not listed.
+
+        Order: A, then the R / B entries carrying a candidate (by ``tier`` — the candidates'
+        sink-impact tier — then R before B), then the entries with no candidate, then P; each
+        entry's ``rank_key`` names the components. ``sort_by`` (``tier`` / ``similarity`` /
+        ``address``) puts one component first. Filters: ``bucket``, ``subclass`` (an entry's or any
+        of its rows'), ``tier`` (a number, ``no_sink`` or ``unknown``), ``blind_spot`` (a key of
+        the ``blind_spots`` ledger — page through the entries it covers). Page with ``limit``
+        (1-2000, default 200) / ``offset``; follow ``next_offset`` until null.
+
+        Each entry carries its candidate overlay rows (as get_diff_sink_overlay states them, each
+        with its ``landing`` and ``subclass``), and for an aligned pair ``callee_set``: the two
+        extracted callee lists compared (``equal`` / ``differs`` with ``only_in_a`` /
+        ``only_in_b`` / ``undetermined`` with the reason). A differing list is NOT proof a call was
+        made or dropped — tmap's decompile can miss a call — and it never moves an entry.
+
+        ``view``: ``string_edge`` returns get_diff_deltas' rows, ``candidate_flat``
+        get_diff_sink_overlay's rows in its order; the envelope (``subject_counts`` of all three
+        subjects, ``counts``, ``not_listed``, ``blind_spots``, ``banners``) is the same in every
+        view. ``baseline_state``: ``fresh`` = the stored candidate baseline was read;
+        ``recomputed_*`` = it was absent / stale / inconsistent, so the overlay was computed for
+        this read and not stored. ``banners``: ``diff_undetermined:<reason>`` = the whole diff
+        cannot be compared and no entry is listed; ``instruction_data_absent`` = no instruction
+        pairs were stored, so A cannot occur. ``source_stale`` / ``source_stale_reason`` /
+        ``toolchain_checked`` as in list_diffs; when ``source_stale`` is not false the callee lists
+        are not compared."""
+        conn = open_atlas(atlas_path)
+        try:
+            refusal = _refuse_stale_diff(conn, diff_id)
+            if refusal is not None:
+                return refusal
+            return _get_diff_patch_view(
+                conn,
+                diff_id,
+                view=view,
+                sort_by=sort_by,
+                bucket=bucket,
+                subclass=subclass,
+                tier=tier,
+                blind_spot=blind_spot,
+                limit=limit,
+                offset=offset,
+            )
+        finally:
+            conn.close()
+
     def get_diff_sink_overlay(
         diff_id: str | None = None,
         binary: str | None = None,
@@ -1886,10 +1958,11 @@ def make_tools(
         ★ ``version_skew=1`` means every delta in this diff is version_skew undetermined -- do not
         read it as 'no change'; it compares only the analysis-tool version, not the firmware. A NULL
         ``ghidra_version`` = that side recorded none. ``unmatched_b`` = B-side functions with no
-        A-side match (the presence layer, the WEAKEST signal -- to find changes look at
-        ``layer_changed`` via get_diff_deltas, not this). ★ ``diff_ok=0`` means this binary did NOT
-        diff (``diff_status='failed'``, ``diff_status_reason`` = why, ``diff_attempts`` = tries): an
-        empty get_diff_deltas for it is a BLIND SPOT, never 'no change' (list_diff_blindspots).
+        A-side match (the presence layer, the WEAKEST signal -- to find changes start with
+        get_diff_patch_view; string-keyed edge ``layer_changed`` is via get_diff_deltas, not this).
+        ★ ``diff_ok=0`` means this binary did NOT diff (``diff_status='failed'``,
+        ``diff_status_reason`` = why, ``diff_attempts`` = tries): an empty get_diff_deltas for it
+        is a BLIND SPOT, never 'no change' (list_diff_blindspots).
         ``source_stale`` / ``source_stale_reason``: whether the diff still describes what it was
         computed from (true / null = unverified / false; reasons in list_diffs)."""
         conn = open_atlas(atlas_path)
@@ -1952,7 +2025,8 @@ def make_tools(
         diff_attempts). Optionally filter to a run-pair. ``baseline_dropped=1`` = the diff had a
         stored candidate baseline that a re-diff dropped (it failed, or the baseline could not be
         stored again). The entry point after a full diff — see which binaries were compared and
-        which FAILED to diff, then open one with get_diff_deltas / get_diff_meta.
+        which FAILED to diff, then open one with get_diff_patch_view (get_diff_deltas for its
+        string-keyed edges, get_diff_meta).
 
         ★ The three counts are the binary's string-keyed dispatch edges
         (reachability.string_keyed_edge), NOT functions. All three 0 means neither side has such an
@@ -2583,6 +2657,7 @@ def make_tools(
         "get_nvram_key_flow": get_nvram_key_flow,
         "get_string_keyed_edges": get_string_keyed_edges,
         "launched_by": launched_by,
+        "get_diff_patch_view": get_diff_patch_view,
         "get_diff_deltas": get_diff_deltas,
         "get_diff_sink_overlay": get_diff_sink_overlay,
         "get_diff_meta": get_diff_meta,

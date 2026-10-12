@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A function-level view of one diff (MCP `get_diff_patch_view`), now the place to start.** One
+  entry per function pair that changed, or per function with no counterpart, sorted into buckets:
+  `A` (the call instruction BinDiff matched now calls a different callee, and the paired function
+  holds no candidate with the original callee), `B` (a candidate whose cross-side reading stayed
+  undetermined; a changed pair whose candidates line up; a changed pair with no candidate that calls
+  a sink the hunt does not recall), `R` (the pair itself is undetermined), `C` (a changed pair with
+  no sink candidate on either side) and `P` (a function with no counterpart). Evidence, not a
+  verdict, and no score.
+  - Each entry carries its candidate overlay rows and, for an aligned pair, the two functions'
+    extracted callee lists compared (`callee_set`: equal, differs, or undetermined with the reason;
+    `FUN_` names are compared through the alignment). The comparison never moves an entry.
+  - Order: A, then the R and B entries carrying a candidate by sink-impact tier, then the entries
+    with none, then P. Each entry names its ordering components (`rank_key`); `sort_by` puts one
+    first. Filters by bucket, subclass, tier and blind spot; pages like `get_diff_sink_overlay`.
+  - Identical pairs whose candidates line up, or that have none, are counted under `not_listed`.
+    `blind_spots` counts what the view cannot see (calls BinDiff matched to nothing, callee lists
+    that cannot be compared, sinks the hunt does not recall) and names the structural limits.
+  - Read-only: it reads the stored candidate baseline when that is current, and otherwise computes
+    the overlay in memory without storing it (`baseline_state`). `view="string_edge"` and
+    `view="candidate_flat"` return `get_diff_deltas`' and `get_diff_sink_overlay`'s rows inside the
+    same envelope, so switching views drops nothing.
+  - `tmap diff`, `list_diffs` and `get_diff_meta` now point here first; `get_diff_deltas` stays as
+    the string-keyed edge view.
 - **Candidate-level sink overlay across a version diff (MCP `get_diff_sink_overlay`).** On top of
   the function alignment, each sink candidate of the two runs is lined up with its counterpart and
   given a `presence`: `persisted`, or `presence_undetermined` when that cannot be established

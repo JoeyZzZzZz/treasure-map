@@ -113,8 +113,8 @@ def _echo_single_diff(summary: Any, resolved_atlas: Path) -> None:
     if summary.baseline is not None:
         click.echo(f"  baseline      : {summary.baseline.replace('_', ' ')}")
     click.echo(
-        "Read the deltas: get_diff_deltas / get_diff_meta / get_function_alignment / "
-        "get_diff_capabilities"
+        "Read the diff: start with get_diff_patch_view; get_diff_deltas (string-keyed edges) / "
+        "get_diff_meta / get_function_alignment / get_diff_capabilities"
     )
 
 
@@ -194,8 +194,8 @@ def _echo_full_diff(fsum: Any, resolved_atlas: Path) -> None:
             f"{', '.join(plan.hard_failed)} (list_diff_blindspots / --force-retry)"
         )
     click.echo(
-        "Read the deltas: list_diffs, then get_diff_deltas / get_diff_meta; "
-        "list_diff_blindspots for un-diffed binaries."
+        "Read the diffs: list_diffs, then get_diff_patch_view per binary (get_diff_deltas for "
+        "string-keyed edges, get_diff_meta); list_diff_blindspots for un-diffed binaries."
     )
 
 
@@ -269,7 +269,8 @@ def hunt_diff(
     external aligner end-to-end (BinExport -> BinDiff, you never touch an intermediate file), then
     writes alignment facts and tri-state dimension deltas to the atlas. A delta is a PROJECTION of
     existing annotations, never a change/defect verdict -- read it with the get_diff_* MCP tools
-    (list_diffs to browse, then get_diff_deltas) and judge it yourself.
+    (list_diffs to browse, then get_diff_patch_view; get_diff_deltas for string-keyed edges) and
+    judge it yourself.
     """
     from treasure_map.lib.atlas.connection import open_atlas
     from treasure_map.lib.config.config import load_config
