@@ -33,6 +33,14 @@ from treasure_map.lib.query import sink_overlay as so
 from treasure_map.lib.storage.connection import open_db
 from treasure_map.version import UNKNOWN_VERSION
 
+
+@pytest.fixture(autouse=True)
+def _clear_view_caches() -> None:
+    """Every World reuses one diff_id, run ids and build hash, so drop the view's process-wide
+    caches (lib/query/patch_view) between tests to keep one test's reading out of the next."""
+    pv._clear_view_caches()
+
+
 PAIR = "runA::runB"
 DX = "runA::runB::libx"
 DY = "runA::runB::liby"
@@ -683,8 +691,8 @@ def test_band_moves_an_entry_only_inside_its_subclass_rank() -> None:
 
     MUTATION: put the band ahead of ``subclass_rank`` in ``_default_key`` -> RED."""
     hi = _e("B", 3, "hi", sim=0.9, subclass="sink_presence_signal_added")  # subclass_rank 0
-    lo = _e("B", 3, "lo", sim=0.1)  # instruction_unmatched -> subclass_rank 1
-    assert (hi.rank["subclass_rank"], lo.rank["subclass_rank"]) == (0, 1)
+    lo = _e("B", 3, "lo", sim=0.1)  # instruction_unmatched -> subclass_rank 2 (the catch-all)
+    assert (hi.rank["subclass_rank"], lo.rank["subclass_rank"]) == (0, 2)
     entries = [lo, hi]
     assert [e.entry_id for e in pv._sort(entries, None)] == [hi.entry_id, lo.entry_id]
 

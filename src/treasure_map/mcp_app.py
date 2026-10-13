@@ -1720,6 +1720,7 @@ def make_tools(
         limit: int = 200,
         offset: int = 0,
         band: bool = False,
+        not_listed_page: str | None = None,
     ) -> dict[str, Any]:
         """START HERE for one diff (``diff_id`` = ``{run_a}::{run_b}::{binary}``; list_diffs gives
         the ids): one entry per FUNCTION PAIR that changed, with what happened around its sink
@@ -1729,13 +1730,16 @@ def make_tools(
         ``bucket``: ``A`` = at the call instruction BinDiff matched, the other side calls a
         different callee and the paired function holds no candidate with the original callee;
         ``B`` = a sink candidate whose cross-side reading stayed undetermined (``subclass`` says
-        why — ``sink_presence_signal:*`` first), a changed pair whose candidates all line up
+        why), a persisted candidate whose length constant changed (``sink_arg_constant_delta`` —
+        visible even at similarity 1), a changed pair whose candidates all line up
         (``sink_present_no_visible_delta``), or a changed pair with no candidate that calls a sink
-        the hunt does not recall (``recall_gap_sink:<family>``); ``R`` = the pair itself is
-        undetermined; ``C`` = a changed pair with no sink candidate on either side
-        (``no_sink_candidate_unchecked`` when the callee lists could not be read); ``P`` = a
-        function with no counterpart. Identical pairs whose candidates line up, or that have none,
-        are counted under ``not_listed``, not listed.
+        the hunt does not recall (``recall_gap_sink:<family>``); inside B,
+        ``sink_presence_signal:*`` sorts first, then ``sink_arg_constant_delta``, then the rest;
+        ``R`` = the pair itself is undetermined; ``C`` = a changed pair with no sink candidate on
+        either side (``no_sink_candidate_unchecked`` when the callee lists could not be read);
+        ``P`` = a function with no counterpart. A similarity-1 pair whose candidates line up, or
+        that has none, is not listed UNLESS a length constant changed; the rest are counted under
+        ``not_listed`` by ``pseudocode_sameness`` (below).
 
         Order: A, then the R / B entries carrying a candidate (by ``tier`` — the candidates'
         sink-impact tier — then R before B), then the entries with no candidate, then P; each
@@ -1750,6 +1754,16 @@ def make_tools(
         extracted callee lists compared (``equal`` / ``differs`` with ``only_in_a`` /
         ``only_in_b`` / ``undetermined`` with the reason). A differing list is NOT proof a call was
         made or dropped — tmap's decompile can miss a call — and it never moves an entry.
+
+        Two signals BinDiff similarity is blind to, on the function-pair view: each aligned entry
+        carries ``pseudocode_sameness`` — ``identical`` (address-normalised pseudocode AND callees
+        match), ``identical_callee_unverified`` (text matches, callees not verified — NOT
+        "unchanged"), ``differs``, ``no_body`` (an import/PLT stub, not in the functions table) or
+        ``unavailable`` (in the table, empty body); the similarity-1 pairs that place no entry are
+        counted by it under ``not_listed`` (``not_listed_page=<name>`` walks one category, e.g.
+        ``aligned_pseudocode_differs``). A persisted candidate whose size constant changed carries
+        ``sink_arg_constant_delta`` (callee + from/to, direction-neutral); a changed size KIND is
+        the weaker ``size_kind_shifted``.
 
         ``view``: ``string_edge`` returns get_diff_deltas' rows, ``candidate_flat``
         get_diff_sink_overlay's rows in its order; the envelope (``subject_counts`` of all three
@@ -1790,6 +1804,7 @@ def make_tools(
                 limit=limit,
                 offset=offset,
                 band=band,
+                not_listed_page=not_listed_page,
             )
         finally:
             conn.close()

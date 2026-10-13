@@ -108,11 +108,12 @@ class World:
         name: str | None = None,
         truncated: int = 0,
         unresolved: list[str] | None = None,
+        pseudocode: str | None = None,
     ) -> None:
         self.adb[side].execute(
             "INSERT INTO functions (binary_id, name, address, callees, callees_truncated, "
-            "unresolved_external_calls) VALUES (1, ?, ?, ?, ?, ?)",
-            (name, addr, json.dumps(callees), truncated, json.dumps(unresolved or [])),
+            "unresolved_external_calls, pseudocode) VALUES (1, ?, ?, ?, ?, ?, ?)",
+            (name, addr, json.dumps(callees), truncated, json.dumps(unresolved or []), pseudocode),
         )
 
     def commit(self) -> None:
@@ -311,8 +312,11 @@ def _rich(w: World) -> None:
 
 @pytest.fixture(autouse=True)
 def _servable(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The MCP gate compares a run's hunt commit with the install's; this install's is unknown."""
+    """The MCP gate compares a run's hunt commit with the install's; this install's is unknown. Also
+    drop the process-wide pseudocode cache: every World reuses one diff_id, so a stale reading from
+    another test would otherwise be served."""
     monkeypatch.setattr(mcp_app, "_installed_commit", lambda: UNKNOWN_VERSION)
+    pv._clear_view_caches()
 
 
 @pytest.fixture
@@ -420,10 +424,12 @@ def test_identical_pairs_are_counted_not_listed_unless_a_row_says_otherwise(worl
     """MUTATION (verified RED): list a pair only when its similarity is below 1 -> the identical
     pair carrying an A row disappears."""
     v = _view(world)
-    assert v["not_listed"] == {
-        "aligned_identical_all_persisted": 1,
-        "aligned_identical_no_candidate": 2,
-    }
+    # Three aligned, similarity-1 pairs place no entry. The fixture puts no function body in the
+    # analysis.db for them, so all three read ``no_body`` (absent from the functions table);
+    # counted by pseudocode_sameness, never dropped.
+    nl = v["not_listed"]
+    assert nl["aligned_pseudocode_no_body"]["count"] == 3
+    assert sum(c["count"] for c in nl.values()) == 3
     assert _pair_id("0000d000", "0000e000") not in v["by_id"]
     assert _pair_id("00011000", "00012000") not in v["by_id"]
     # The same identical pair, now with the matched call calling another callee: listed, in A.
@@ -439,10 +445,198 @@ def test_every_pair_and_function_is_listed_or_counted(world: World) -> None:
         "SELECT COUNT(*) FROM function_alignment WHERE diff_id = ?", (DIFF,)
     ).fetchone()[0]
     listed_pairs = sum(1 for e in v["entries"] if e["entry_id"].startswith("pair:"))
-    assert listed_pairs + sum(v["not_listed"].values()) == pairs
+    assert listed_pairs + sum(c["count"] for c in v["not_listed"].values()) == pairs
     assert (
         v["subject_counts"]["candidate_row"] == sum(len(e["rows"]) for e in v["entries"]) + 1
     )  # the identical pair's persisted row is the one row of a pair not listed
+
+
+# ── pseudocode_sameness: the reading similarity is blind to ────────────────────────────────────
+
+
+def test_pseudocode_sameness_reads_its_five_states(tmp_path: Path, current: None) -> None:
+    """Each aligned similarity-1 pair that places no entry is counted by pseudocode_sameness: a
+    verified match, a match whose callees could not be verified, a real difference, a stub with no
+    body at all, and a function whose body is empty — each kept apart.
+
+    MUTATION: fold ``identical_callee_unverified`` into ``identical`` (treat 'undetermined' callees
+    as equal) -> RED; call every missing body ``unavailable`` (drop the no_body split) -> RED."""
+    w = World(tmp_path)
+    # identical: same body, same resolved callees (callee_set equal)
+    w.pair("00001000", "00002000", 0.97, 1.0)
+    w.fn("a", "00001000", ["foo"], pseudocode="iVar = foo(0x40);")
+    w.fn("b", "00002000", ["foo"], pseudocode="iVar = foo(0x40);")
+    # identical_callee_unverified: same body, a side's callee list is a prefix (truncated)
+    w.pair("00003000", "00004000", 0.97, 1.0)
+    w.fn("a", "00003000", ["foo"], pseudocode="iVar = foo(0x40);", truncated=1)
+    w.fn("b", "00004000", ["foo"], pseudocode="iVar = foo(0x40);")
+    # differs: a small constant in the body changed (normalisation keeps it)
+    w.pair("00005000", "00006000", 0.97, 1.0)
+    w.fn("a", "00005000", ["foo"], pseudocode="iVar = foo(0x40);")
+    w.fn("b", "00006000", ["foo"], pseudocode="iVar = foo(0x3f);")
+    # no_body: the b side is not in the functions table (an import / PLT stub)
+    w.pair("00007000", "00008000", 0.97, 1.0)
+    w.fn("a", "00007000", ["foo"], pseudocode="iVar = foo(0x40);")
+    # unavailable: the b side is in the table but its pseudocode is empty
+    w.pair("00009000", "0000a000", 0.97, 1.0)
+    w.fn("a", "00009000", ["foo"], pseudocode="iVar = foo(0x40);")
+    w.fn("b", "0000a000", ["foo"], pseudocode=None)
+    w.commit()
+    nl = pv.get_diff_patch_view(w.atlas, DIFF)["not_listed"]
+    counts = {k.replace("aligned_pseudocode_", ""): c["count"] for k, c in nl.items()}
+    assert counts == {
+        "identical": 1,
+        "identical_callee_unverified": 1,
+        "differs": 1,
+        "no_body": 1,
+        "unavailable": 1,
+    }
+
+
+def test_a_changed_length_constant_lists_an_otherwise_identical_pair(
+    tmp_path: Path, current: None
+) -> None:
+    """★ The whole point: a persisted candidate whose length constant changed lists a similarity-1
+    pair BinDiff saw as unchanged, as B|sink_arg_constant_delta, with the from->to and the callee —
+    direction-neutral, no fixed/regression. It ranks between sink_presence_signal and
+    sink_present_no_visible_delta.
+
+    MUTATION: read the length from sink_arg_provenance / const_sink_arg instead of size_flow ->
+    the signal is empty and the pair is not listed -> RED."""
+    w = World(tmp_path)
+    w.pair("00001000", "00002000", 0.97, 1.0)  # similarity 1: BinDiff sees nothing
+    fa = json.dumps({"size_kind": "cap_const", "size_flow": {"size_arg": "0x200"}})
+    fb = json.dumps({"size_kind": "cap_const", "size_flow": {"size_arg": "0x400"}})
+    w.inst("a", _ref("runA", "00001000", "copy", "0x10"), "copy", "snprintf", fa)
+    w.inst("b", _ref("runB", "00002000", "copy", "0x10"), "copy", "snprintf", fb)
+    w.im("00001010", "00002010", "00001000")
+    w.fn("a", "00001000", ["snprintf"])
+    w.fn("b", "00002000", ["snprintf"])
+    w.commit()
+    by_id = _view(w)["by_id"]
+    assert _pair_id("00001000", "00002000") in by_id  # listed at all
+    e = by_id[_pair_id("00001000", "00002000")]
+    assert (e["bucket"], e["subclass"]) == ("B", "sink_arg_constant_delta")
+    row = next(r for r in e["rows"] if "sink_arg_constant_delta" in r)
+    assert row["sink_arg_constant_delta"] == {
+        "size_kind": "cap_const",
+        "from": "0x200",
+        "to": "0x400",
+        "callee": "snprintf",
+    }
+    assert e["rank_key"]["subclass_rank"] == 1  # between sink_presence_signal (0) and the rest (2)
+
+
+def test_a_changed_size_kind_is_a_weak_hint_not_a_delta(tmp_path: Path, current: None) -> None:
+    """The size KIND changing (const -> untraced) is ``size_kind_shifted``, never a value delta,
+    and does not on its own list a similarity-1 pair.
+
+    MUTATION: emit the kind shift as a sink_arg_constant_delta -> the pair lists in B -> RED."""
+    w = World(tmp_path)
+    w.pair("00001000", "00002000", 0.97, 1.0)
+    fa = json.dumps({"size_kind": "const", "size_flow": {"size_arg": "0x40"}})
+    fb = json.dumps({"size_kind": "untraced", "size_flow": {"size_arg": "len"}})
+    w.inst("a", _ref("runA", "00001000", "copy", "0x10"), "copy", "strncpy", fa)
+    w.inst("b", _ref("runB", "00002000", "copy", "0x10"), "copy", "strncpy", fb)
+    w.im("00001010", "00002010", "00001000")
+    w.fn("a", "00001000", ["strncpy"])
+    w.fn("b", "00002000", ["strncpy"])
+    w.commit()
+    assert (
+        _pair_id("00001000", "00002000") not in _view(w)["by_id"]
+    )  # not listed: a shift, no delta
+    # the persisted row that exists carries size_kind_shifted, not a delta
+    row = pv.get_diff_patch_view(w.atlas, DIFF, view="candidate_flat")["entries"][0]
+    assert "sink_arg_constant_delta" not in row
+
+
+def test_a_listed_entry_keeps_its_place_and_only_gains_pseudocode_sameness(
+    tmp_path: Path, current: None
+) -> None:
+    """★ B1 iron law: pseudocode_sameness is a fact added to a listed entry, never a reason to drop
+    one. A changed pair whose candidate lines up stays listed and reads sameness='differs' when its
+    pseudocode matches but its callees differ.
+
+    MUTATION: exclude 'differs' (or any sameness state) entries from the sink_patch listing -> the
+    entry disappears -> RED."""
+    w = World(tmp_path)
+    w.pair("00001000", "00002000", 0.97, 0.5)  # similarity below 1: a changed, listed pair
+    w.inst("a", _ref("runA", "00001000", "cmd", "0x10"), "cmd", "system")
+    w.inst("b", _ref("runB", "00002000", "cmd", "0x10"), "cmd", "system")
+    w.im("00001010", "00002010", "00001000")
+    w.fn("a", "00001000", ["system", "log_a"], pseudocode="x = FUN_00012340();")
+    w.fn("b", "00002000", ["system", "log_b"], pseudocode="x = FUN_00099990();")
+    w.commit()
+    by_id = _view(w)["by_id"]
+    assert _pair_id("00001000", "00002000") in by_id  # still listed
+    e = by_id[_pair_id("00001000", "00002000")]
+    assert e["bucket"] == "B"
+    # the body matches after normalising the FUN_ address, but the callee sets differ -> differs
+    assert e["pseudocode_sameness"] == "differs"
+
+
+def test_what_the_length_signal_cannot_see_is_declared_not_guessed(
+    tmp_path: Path, current: None
+) -> None:
+    """A changed local buffer size with the call's length argument unchanged is not a
+    sink_arg_constant_delta (the signal reads the call's argument only) — and that blind spot, with
+    the allocation-expression one, is named in the ledger rather than left silent.
+
+    MUTATION: drop either key from the structural blind spots -> RED."""
+    w = World(tmp_path)
+    w.pair("00001000", "00002000", 0.97, 1.0)
+    same = json.dumps({"size_kind": "const", "size_flow": {"size_arg": "0x200"}})
+    w.inst("a", _ref("runA", "00001000", "copy", "0x10"), "copy", "strncpy", same)
+    w.inst("b", _ref("runB", "00002000", "copy", "0x10"), "copy", "strncpy", same)
+    w.im("00001010", "00002010", "00001000")
+    w.fn("a", "00001000", ["strncpy"], pseudocode="char buf[512]; strncpy(buf,s,0x200);")
+    w.fn("b", "00002000", ["strncpy"], pseudocode="char buf[4096]; strncpy(buf,s,0x200);")
+    w.commit()
+    v = pv.get_diff_patch_view(w.atlas, DIFF)
+    assert _pair_id("00001000", "00002000") not in {e["entry_id"] for e in v["entries"]}
+    assert v["not_listed"]["aligned_pseudocode_differs"]["count"] == 1  # the body did change
+    keys = {s["key"] for s in v["blind_spots"] if s.get("count") is None}
+    assert {"size_constant_outside_sink_arg", "local_buffer_size_unread"} <= keys
+
+
+def test_a_re_extraction_is_not_served_a_stale_reading(tmp_path: Path, current: None) -> None:
+    """The reading is cached per process, keyed on BOTH runs' build hash: a re-extraction leaves
+    the content hash alone but rewrites the pseudocode, and a long-lived server must read the new
+    one.
+
+    MUTATION: drop the build hashes from the cache key -> the old 'identical' is served -> RED."""
+    w = World(tmp_path)
+    w.pair("00001000", "00002000", 0.97, 1.0)
+    w.fn("a", "00001000", ["foo"], pseudocode="p = foo(0x40);")
+    w.fn("b", "00002000", ["foo"], pseudocode="p = foo(0x40);")
+    w.commit()
+    nl = pv.get_diff_patch_view(w.atlas, DIFF)["not_listed"]
+    assert nl["aligned_pseudocode_identical"]["count"] == 1
+    w.adb["b"].execute("UPDATE functions SET pseudocode = 'p = foo(0x3f);'")
+    w.atlas.execute("UPDATE run SET build_hash = 'rebuilt'")  # both runs: no generation mismatch
+    w.commit()
+    nl = pv.get_diff_patch_view(w.atlas, DIFF)["not_listed"]
+    assert nl["aligned_pseudocode_differs"]["count"] == 1
+
+
+def test_pseudocode_is_read_in_the_view_never_in_the_build(
+    tmp_path: Path, current: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ Cost placement: build_diff_view (the path annotate_diff / promote / the cross-scope
+    progress block share) must never read pseudocode; only the read face does.
+
+    MUTATION: call _pseudo_readings from build_diff_view -> the build reads pseudocode -> RED."""
+    w = World(tmp_path)
+    w.pair("00001000", "00002000", 0.97, 1.0)
+    w.fn("a", "00001000", ["foo"], pseudocode="p")
+    w.fn("b", "00002000", ["foo"], pseudocode="p")
+    w.commit()
+    calls: list[int] = []
+    monkeypatch.setattr(pv.sameness, "read_function_bodies", lambda *a: calls.append(1) or {})
+    pv.build_diff_view(w.atlas, DIFF)
+    assert calls == []  # the build pays nothing for pseudocode
+    pv.get_diff_patch_view(w.atlas, DIFF)
+    assert calls  # the read face does read it
 
 
 # ── tier ─────────────────────────────────────────────────────────────────────────────────────

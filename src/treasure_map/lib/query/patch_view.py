@@ -17,24 +17,42 @@ all three subjects, so switching the view re-projects the same diff and drops no
 BUCKETS (``bucket``):
   A  at the call instruction BinDiff matched, the other side calls a different callee, and the
      paired function holds no candidate with the original callee.
-  B  a sink candidate whose cross-side reading stayed undetermined; a changed pair whose candidates
-     all line up (``sink_present_no_visible_delta``); or a changed pair with no candidate that calls
-     a sink the hunt does not recall (``recall_gap_sink:<family>``).
+  B  a sink candidate whose cross-side reading stayed undetermined; a persisted candidate whose
+     length constant changed (``sink_arg_constant_delta`` — visible even at similarity 1); a
+     changed pair whose candidates all line up (``sink_present_no_visible_delta``); or a changed
+     pair with no candidate that calls a sink the hunt does not recall
+     (``recall_gap_sink:<family>``).
   R  the pair itself is undetermined (its alignment confidence is low, or its export could not hold
      one of the two functions as it is).
   C  a changed pair (similarity below 1) with no sink candidate on either side.
   P  a function with no counterpart (``presence_state`` from function_presence, ``absent`` when the
      function has no presence record at all).
-A pair that is identical (similarity 1) and whose candidates all line up, or that has none, is not
-listed; it is counted under ``not_listed``. Where each overlay ``presence_reason`` lands is
-``row_landing``; a reason it does not know lands in B as ``unmapped_reason:<reason>`` and is
-counted, never dropped.
+A similarity-1 pair whose candidates all line up, or that has none, places no entry UNLESS a length
+constant changed on one of its candidates (then it is B ``sink_arg_constant_delta``); the rest are
+counted under ``not_listed`` by ``pseudocode_sameness`` (below), never dropped. Where each overlay
+``presence_reason`` lands is ``row_landing``; a reason it does not know lands in B as
+``unmapped_reason:<reason>`` and is counted, never dropped.
 
 THE SECOND SIGNAL (``callee_set``): for an aligned pair, the two functions' extracted callee lists
 compared as sets. A ``FUN_<addr>`` callee is compared by address through this diff's alignment,
 never by name; one that cannot be mapped (or is a stub the extractor could not name) makes the
 comparison undetermined. It never moves an entry between buckets: an entry with a sink candidate
 is never C because its callees look unchanged.
+
+TWO SIGNALS SIMILARITY IS BLIND TO (lib/query/sameness), read on the function-pair view only:
+  ``pseudocode_sameness`` — an aligned pair's honest state, folding an address-normalised pseudocode
+  comparison with ``callee_set``: ``identical`` (both agree), ``identical_callee_unverified`` (text
+  matches, callees unverified — never read as "unchanged"), ``differs``, ``no_body`` (an import/PLT
+  stub, not in the functions table) or ``unavailable`` (in the table, empty body). On every listed
+  aligned entry as a fact; the similarity-1 pairs that place no entry are counted by it under
+  ``not_listed`` (``not_listed_page=<name>`` walks one category, ``aligned_pseudocode_differs``
+  above all).
+  ``sink_arg_constant_delta`` — a persisted candidate whose size constant moved (0x40 -> 0x3f),
+  with the callee and from/to, direction-neutral. A changed size KIND is the weaker
+  ``size_kind_shifted``.
+  Reading pseudocode is the costly half, so it is computed in get_diff_patch_view (cached per
+  diff + content + build), never in build_diff_view — annotate/promote and the progress block stay
+  cheap.
 
 ORDER: A first, then the R and B entries that carry a sink candidate, then the entries with none,
 then P; inside each, by the named components of ``rank_key`` (visible on every entry). ``tier`` is
@@ -56,7 +74,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from treasure_map.lib.diff.layer0 import norm_hex
-from treasure_map.lib.query import diff_review
+from treasure_map.lib.query import diff_review, sameness
 from treasure_map.lib.query.diff_align import diff_source_staleness, get_diff_deltas
 from treasure_map.lib.query.sink_impact import impact_tier
 from treasure_map.lib.query.sink_overlay import (
@@ -132,6 +150,16 @@ _STRUCTURAL_BLIND_SPOTS = {
     ),
     "one_hop_cmd_only": (
         "one_hop_sink covers only the command thin wrappers the hunt records, not other classes"
+    ),
+    "size_constant_outside_sink_arg": (
+        "sink_arg_constant_delta reads only a copy / formatter call's own length argument; a "
+        "constant that changed inside an allocation or realloc length expression feeding the "
+        "buffer is not seen"
+    ),
+    "local_buffer_size_unread": (
+        "the size of a local array or source buffer is not compared (only the call's length "
+        "argument is), so a changed buffer declaration with an unchanged length argument is not "
+        "seen"
     ),
 }
 
@@ -495,12 +523,19 @@ def _read_side(atlas: sqlite3.Connection, run_id: str, sha: str | None) -> _Side
     return side
 
 
-def _instance_index(
-    atlas: sqlite3.Connection, run_id: str, refs: set[str]
-) -> dict[str, tuple[set[str], set[str]]]:
-    """evidence_ref -> (sink classes, sink names) of the run's candidate rows carrying it, for
-    ``refs``: every row of the run with that ref, whichever binary it was recorded under."""
-    out: dict[str, tuple[set[str], set[str]]] = {}
+@dataclass
+class _Inst:
+    """What one candidate's rows carry, folded: its sink classes and names (the first non-null,
+    candidates of one ref agreeing)."""
+
+    classes: set[str] = field(default_factory=set)
+    sinks: set[str] = field(default_factory=set)
+
+
+def _instance_index(atlas: sqlite3.Connection, run_id: str, refs: set[str]) -> dict[str, _Inst]:
+    """evidence_ref -> its folded candidate facts, for ``refs``: every row of the run with that ref,
+    whichever binary it was recorded under."""
+    out: dict[str, _Inst] = {}
     wanted = sorted(refs)
     for i in range(0, len(wanted), _REF_CHUNK):
         chunk = wanted[i : i + _REF_CHUNK]
@@ -511,10 +546,36 @@ def _instance_index(
             f"WHERE i.source_run_id = ? AND i.evidence_ref IN ({marks})",
             (run_id, *chunk),
         ):
-            classes, sinks = out.setdefault(ref, (set(), set()))
+            inst = out.setdefault(ref, _Inst())
             if sink_class:
-                classes.add(sink_class)
-            sinks.add(sink or "")
+                inst.classes.add(sink_class)
+            inst.sinks.add(sink or "")
+    return out
+
+
+# evidence_ref -> (size_kind, size_arg) for a run's size-bearing candidates, cached per
+# (run_id, build_hash): read once by json_extract, not the per-diff IN scan, so the length-constant
+# signal does not re-scan the whole run for every diff of a pair. build_hash in the key so a
+# re-extraction (same content hash, new pseudocode-derived evidence) is not served a stale fact.
+_SIZE_FACT_CACHE: dict[tuple[str, str], dict[str, tuple[str, str | None]]] = {}
+
+
+def _size_facts(atlas: sqlite3.Connection, run_id: str) -> dict[str, tuple[str, str | None]]:
+    """evidence_ref -> (size_kind, size_arg) for the run's candidates that carry a size axis."""
+    row = atlas.execute("SELECT build_hash FROM run WHERE run_id = ?", (run_id,)).fetchone()
+    key = (run_id, (row[0] if row else None) or "")
+    hit = _SIZE_FACT_CACHE.get(key)
+    if hit is not None:
+        return hit
+    out: dict[str, tuple[str, str | None]] = {}
+    for ref, kind, arg in atlas.execute(
+        "SELECT evidence_ref, json_extract(flow_evidence, '$.size_kind'), "
+        "json_extract(flow_evidence, '$.size_flow.size_arg') FROM instance WHERE source_run_id = ?",
+        (run_id,),
+    ):
+        if kind is not None and ref not in out:
+            out[ref] = (kind, arg)
+    _SIZE_FACT_CACHE[key] = out
     return out
 
 
@@ -678,6 +739,7 @@ class _Builder:
             "a": _instance_index(atlas, diff.run_a, {r.a_ref for r in overlay.rows if r.a_ref}),
             "b": _instance_index(atlas, diff.run_b, {r.b_ref for r in overlay.rows if r.b_ref}),
         }
+        self.size_facts = {"a": _size_facts(atlas, diff.run_a), "b": _size_facts(atlas, diff.run_b)}
         self.sides = {"a": _read_side(atlas, diff.run_a, diff.sha_a)}
         self.sides["b"] = _read_side(atlas, diff.run_b, diff.sha_b)
         self.wrappers = {
@@ -700,15 +762,19 @@ class _Builder:
         if ref is None:
             return None
         found = self.inst[side].get(ref)
-        return _one(found[0]) if found is not None else None
+        return _one(found.classes) if found is not None else None
 
     def sink_of(self, side: str, ref: str) -> str | None:
         found = self.inst[side].get(ref)
-        return _one(found[1]) if found is not None else None
+        return _one(found.sinks) if found is not None else None
+
+    def size_fact(self, side: str, ref: str) -> tuple[str | None, str | None]:
+        """(size_kind, size_arg) of a candidate's size axis, (None, None) when it has none."""
+        return self.size_facts[side].get(ref, (None, None))
 
     # ── grouping the rows by function ──
 
-    def entries(self) -> tuple[list[_Entry], dict[str, int]]:
+    def entries(self) -> list[_Entry]:
         by_pair: dict[tuple[str, str], _Entry] = {}
         by_fn: dict[tuple[str, str], _Entry] = {}
 
@@ -734,18 +800,13 @@ class _Builder:
                 by_pair[(pair.addr_a, pair.addr_b)].rows.append(r)
             else:
                 unpaired_entry(side, fe).rows.append(r)
-        listed: list[_Entry] = []
-        not_listed = {"aligned_identical_all_persisted": 0, "aligned_identical_no_candidate": 0}
         self.placed = [*by_pair.values(), *by_fn.values()]
         for e in self.placed:
             self._place(e)
-            if e.bucket:
-                listed.append(e)
-            elif e.rows:
-                not_listed["aligned_identical_all_persisted"] += 1
-            else:
-                not_listed["aligned_identical_no_candidate"] += 1
-        return listed, not_listed
+        # A placed entry with no bucket is an aligned, similarity-1 pair that places no entry; the
+        # read face names those by pseudocode_sameness (lib/query/sameness) — a read that reads
+        # pseudocode, kept out of this build so annotate/promote never pay for it.
+        return [e for e in self.placed if e.bucket]
 
     # ── placing one entry ──
 
@@ -770,6 +831,10 @@ class _Builder:
             e.subclass = next(v["subclass"] for v in e.row_views if v["landing"] in ("R", "P"))
         elif "B" in landings:
             e.bucket, e.subclass = "B", self._best_b(e)
+        elif any("sink_arg_constant_delta" in v for v in e.row_views):
+            # A length constant changed on a persisted candidate — visible even at similarity 1,
+            # where this pair would otherwise not be listed at all.
+            e.bucket, e.subclass = "B", "sink_arg_constant_delta"
         elif e.rows:
             if _changed(p):
                 e.bucket, e.subclass = "B", "sink_present_no_visible_delta"
@@ -892,6 +957,17 @@ class _Builder:
             view["sink_name_in_paired_callees"] = in_paired
         if r.key_granularity == _WRAPPER_FUNCTION_LEVEL:
             view["facts"] = ["wrapper_granularity_blind"]
+        if r.a_ref and r.b_ref:  # a persisted candidate: its two sides' length constants compare
+            (ak, aa), (bk, bb) = self.size_fact("a", r.a_ref), self.size_fact("b", r.b_ref)
+            delta = sameness.const_delta(ak, aa, bk, bb)
+            if delta is not None:
+                view["sink_arg_constant_delta"] = {
+                    **delta,
+                    "callee": self.sink_of("a", r.a_ref) or self.sink_of("b", r.b_ref),
+                }
+            shift = sameness.kind_shift(ak, bk)
+            if shift is not None:  # mutually exclusive with a delta (same kind vs changed kind)
+                view["size_kind_shifted"] = shift
         return view
 
     def _other_class(self, r: SinkOverlayRow) -> str:
@@ -1091,7 +1167,14 @@ def _rank(e: _Entry) -> dict[str, Any]:
             v["landing"] == "B" and "wrapper_granularity_blind" in v.get("facts", ())
             for v in e.row_views
         )
-        b_rank = 0 if e.subclass.startswith(_SPS) or wrapper_b else 1
+        # sink_presence_signal first, then sink_arg_constant_delta (a visible length change),
+        # then the rest (sink_present_no_visible_delta and the undetermined B subclasses).
+        if e.subclass.startswith(_SPS) or wrapper_b:
+            b_rank = 0
+        elif e.subclass == "sink_arg_constant_delta":
+            b_rank = 1
+        else:
+            b_rank = 2
     if e.bucket == "P":
         side = e.unpaired.side if e.unpaired is not None else ""
         return {"segment": 4, "tier": t, "side": side, "address": e.address}
@@ -1318,7 +1401,6 @@ class BuiltDiff:
     banners: list[str]
     entries: list[_Entry]  # the listed entries
     placed: list[_Entry]  # every entry placed, listed or not; empty when withheld
-    not_listed: dict[str, int]
     withheld: dict[str, Any] | None  # set when the whole diff is undetermined
     unavailable: dict[str, str]
 
@@ -1351,7 +1433,6 @@ def build_diff_view(atlas: sqlite3.Connection, diff_id: str) -> BuiltDiff | None
 
     entries: list[_Entry] = []
     placed: list[_Entry] = []
-    not_listed = {"aligned_identical_all_persisted": 0, "aligned_identical_no_candidate": 0}
     withheld: dict[str, Any] | None = None
     unavailable: dict[str, str] = {}
     unattributed = 0
@@ -1367,7 +1448,7 @@ def build_diff_view(atlas: sqlite3.Connection, diff_id: str) -> BuiltDiff | None
         }
     else:
         builder = _Builder(atlas, diff, overlay, staleness["source_stale"])
-        entries, not_listed = builder.entries()
+        entries = builder.entries()
         placed = builder.placed
         unattributed = builder.unattributed
         unavailable = {s: str(builder.sides[s].error) for s in builder.unavailable}
@@ -1386,10 +1467,122 @@ def build_diff_view(atlas: sqlite3.Connection, diff_id: str) -> BuiltDiff | None
         banners=banners,
         entries=entries,
         placed=placed,
-        not_listed=not_listed,
         withheld=withheld,
         unavailable=unavailable,
     )
+
+
+# ── pseudocode_sameness: a read-face reading, never built into build_diff_view ───────────────
+
+# Process-wide cache of the expensive read: per (diff_id, sha_a, sha_b), each aligned pair's
+# address-normalised pseudocode match (True / False / None). The callee-set state it folds with
+# comes from the build and is re-read each call, so the cache need only hold the pseudocode verdict.
+# (addr_a, addr_b) -> (matches, reason) of a pseudocode reading; see _pseudo_readings for the key.
+_Readings = dict[tuple[str, str], tuple[bool | None, str | None]]
+_PSEUDO_READING_CACHE: dict[tuple[str, ...], _Readings] = {}
+
+
+def _clear_view_caches() -> None:
+    """Drop the process-wide pseudocode-reading and size-fact caches (tests reuse one diff_id, run
+    ids and build hash across databases)."""
+    _PSEUDO_READING_CACHE.clear()
+    _SIZE_FACT_CACHE.clear()
+
+
+def _run_source(atlas: sqlite3.Connection, run_id: str) -> tuple[str | None, str | None]:
+    """(analysis_db_path, build_hash) of a run."""
+    row = atlas.execute(
+        "SELECT analysis_db_path, build_hash FROM run WHERE run_id = ?", (run_id,)
+    ).fetchone()
+    return (row[0] if row and row[0] else None, row[1] if row else None)
+
+
+def _pseudo_readings(atlas: sqlite3.Connection, built: BuiltDiff) -> _Readings:
+    """(addr_a, addr_b) -> (matches, reason) of each aligned pair's pseudocode reading. Reads both
+    runs' analysis.db pseudocode once and caches by (diff_id, sha_a, sha_b, build_hash_a,
+    build_hash_b): the build hash is in the key so a re-extraction that leaves the content hash
+    alone but rewrites the pseudocode is not served a stale reading. This is the cost
+    lib/query/sameness keeps out of build_diff_view (and so out of annotate / promote / the
+    cross-scope progress block)."""
+    d = built.diff
+    pa, ha = _run_source(atlas, d.run_a)
+    pb, hb = _run_source(atlas, d.run_b)
+    key = (d.diff_id, d.sha_a or "", d.sha_b or "", ha or "", hb or "")
+    hit = _PSEUDO_READING_CACHE.get(key)
+    if hit is not None:
+        return hit
+    ba = sameness.read_function_bodies(pa, d.sha_a)
+    bb = sameness.read_function_bodies(pb, d.sha_b)
+    out: _Readings = {}
+    for e in built.placed:
+        p = e.pair
+        if p is not None and p.aligned:
+            out[(p.addr_a, p.addr_b)] = sameness.pair_reading(ba, bb, p.addr_a, p.addr_b)
+    _PSEUDO_READING_CACHE[key] = out
+    return out
+
+
+def _sameness_of(e: _Entry, readings: _Readings) -> str | None:
+    """The pseudocode_sameness of one aligned pair; None when the entry is not an aligned pair (a
+    function with no counterpart, or an undetermined pair)."""
+    p = e.pair
+    if p is None or not p.aligned:
+        return None
+    matches, reason = readings.get((p.addr_a, p.addr_b), (None, sameness.UNAVAILABLE))
+    return sameness.sameness_state(matches, (e.callee_set or {}).get("state"), reason)
+
+
+def _not_listed_counts(built: BuiltDiff, readings: _Readings) -> dict[str, dict[str, Any]]:
+    """The aligned, similarity-1 pairs that place no entry, counted by pseudocode_sameness. The
+    'differs' count carries a ``page_with`` recipe: the view's filters only reach LISTED entries,
+    so a dedicated ``not_listed_page`` is the way to walk these."""
+    tally: dict[str, int] = {}
+    for e in built.placed:
+        if e.bucket:
+            continue
+        state = _sameness_of(e, readings)
+        if state is not None:
+            tally[state] = tally.get(state, 0) + 1
+    out: dict[str, dict[str, Any]] = {
+        name: {"count": tally.get(state, 0)} for state, name in sameness.NOT_LISTED_NAME.items()
+    }
+    differs = sameness.NOT_LISTED_NAME[sameness.DIFFERS]
+    out[differs]["page_with"] = f"not_listed_page={differs}"
+    return out
+
+
+def _not_listed_page(
+    built: BuiltDiff,
+    readings: _Readings,
+    name: str,
+    *,
+    limit: int,
+    offset: int,
+) -> dict[str, Any]:
+    """One page of the not-listed pairs of a pseudocode_sameness category, by address. Lightweight:
+    these are not entries, so they carry only their addresses, similarity and sameness state."""
+    state = sameness.STATE_BY_NOT_LISTED_NAME[name]
+    pairs = sorted(
+        (e for e in built.placed if not e.bucket and _sameness_of(e, readings) == state),
+        key=lambda e: (e.pair.addr_a, e.pair.addr_b) if e.pair is not None else ("", ""),
+    )
+    end = offset + limit
+    rows = [
+        {
+            "entry_id": e.entry_id,
+            "addr_a": e.pair.addr_a,
+            "addr_b": e.pair.addr_b,
+            "similarity": e.pair.similarity,
+            "pseudocode_sameness": state,
+        }
+        for e in pairs[offset:end]
+        if e.pair is not None
+    ]
+    return {
+        "entries": rows,
+        "total_entries": len(pairs),
+        "next_offset": end if end < len(pairs) else None,
+    }
 
 
 def get_diff_patch_view(
@@ -1405,6 +1598,7 @@ def get_diff_patch_view(
     limit: int = 200,
     offset: int = 0,
     band: bool = False,
+    not_listed_page: str | None = None,
 ) -> dict[str, Any]:
     """The function-level view of one diff (see the module docstring), one page of it.
 
@@ -1416,7 +1610,15 @@ def get_diff_patch_view(
     ``band`` (``sink_patch`` only, off by default) moves the judged entries inside the groups the
     default order already forms (diff_review.band_bias); off, the order is the base order. The
     judgement keys (``anchor_ref`` / ``review_state`` on each entry, ``review_progress`` and
-    ``annotation`` on the envelope) are there either way."""
+    ``annotation`` on the envelope) are there either way.
+
+    ``not_listed_page`` names one ``not_listed`` category (e.g. ``aligned_pseudocode_differs``) and
+    returns ITS pairs instead of the listed entries — the only way to walk pairs no entry holds,
+    since the filters reach listed entries alone. Each listed sink_patch entry that is an aligned
+    pair also carries its ``pseudocode_sameness``."""
+    if not_listed_page is not None and not_listed_page not in sameness.STATE_BY_NOT_LISTED_NAME:
+        names = list(sameness.STATE_BY_NOT_LISTED_NAME)
+        return {"diff_id": diff_id, "error": f"not_listed_page must be one of {names}"}
     filters = {"bucket": bucket, "subclass": subclass, "tier": tier, "blind_spot": blind_spot}
     filtered = any(v is not None for v in filters.values())
     error = _check_args(view, sort_by, bucket, tier, limit, offset, filtered, band)
@@ -1426,6 +1628,7 @@ def get_diff_patch_view(
     if built is None:
         return {"diff_id": diff_id, "found": False, "error": "no such diff (see list_diffs)"}
     overlay, banners, entries = built.overlay, built.banners, built.entries
+    readings = _pseudo_readings(atlas, built)
 
     # Counted over every overlay row of the diff, listed entry or not.
     rows_by_spot = {
@@ -1493,7 +1696,7 @@ def get_diff_patch_view(
         **built.staleness,
         "banners": banners,
         "counts": counts,
-        "not_listed": built.not_listed,
+        "not_listed": _not_listed_counts(built, readings),
         "blind_spots": ledger,
         "overlay_coverage": overlay.coverage,
         "review_progress": review.progress(chosen, filters, ledger),
@@ -1505,6 +1708,11 @@ def get_diff_patch_view(
             "subclass rank), entries due a re-check first, then change_inconclusive, then "
             "unjudged, then changed_real, then no_real_change"
         )
+    if not_listed_page is not None:
+        envelope.update(
+            _not_listed_page(built, readings, not_listed_page, limit=limit, offset=offset)
+        )
+        return envelope
     if view == "string_edge":
         deltas = get_diff_deltas(atlas, diff_id, limit=limit, offset=offset)
         page = deltas["page"]
@@ -1528,9 +1736,17 @@ def get_diff_patch_view(
         return envelope
     ordered = _sort(chosen, sort_by, review.bands() if band else None)
     end = offset + limit
+
+    def _render(e: _Entry) -> dict[str, Any]:
+        out = review.entry_json(e, band)
+        state = _sameness_of(e, readings)
+        if state is not None:
+            out["pseudocode_sameness"] = state
+        return out
+
     envelope.update(
         {
-            "entries": [review.entry_json(e, band) for e in ordered[offset:end]],
+            "entries": [_render(e) for e in ordered[offset:end]],
             "total_entries": len(ordered),
             "next_offset": end if end < len(ordered) else None,
         }
