@@ -574,13 +574,12 @@ def _delta(con: sqlite3.Connection, diff_id: str, kind: str, delta_kind: str, ke
     )
 
 
-def test_list_diffs_counts_edge_deltas_only(tmp_path: Path) -> None:
-    """Candidate overlay rows share dimension_delta but are not edge deltas: list_diffs counts
-    edges only, and a diff holding ONLY candidate rows is still listed (with zero counts).
+def test_list_diffs_no_longer_counts_edges_and_still_lists_every_diff(tmp_path: Path) -> None:
+    """The string-keyed edge deltas are a switchable view (get_diff_deltas), no longer counted by
+    list_diffs; every diff still lists, a diff holding only candidate rows included, and the edge
+    rows are still there for get_diff_deltas.
 
-    MUTATION (verified RED): drop the ``subject_kind != 'candidate'`` scope -> the candidate rows
-    are counted. MUTATION (verified RED): move the scope from ON into WHERE -> the candidate-only
-    diff disappears."""
+    MUTATION (verified RED): put the three edge counts back on the rows -> RED."""
     atlas_path = _seed_pair(tmp_path, {"both": "a1", "cand": "c1"}, {"both": "a2", "cand": "c2"})
     con = open_atlas(atlas_path)
     both = _seed_committed_status(con, "both", diff_ok=1, attempts=1, sha_a="a1", sha_b="a2")
@@ -588,12 +587,13 @@ def test_list_diffs_counts_edge_deltas_only(tmp_path: Path) -> None:
     _delta(con, both, "edge", "layer_changed", "e1")
     _delta(con, both, "edge", "layer_unchanged", "e2")
     _delta(con, both, "candidate", "delta_undetermined", "c1")
-    _delta(con, both, "candidate", "layer_unchanged", "c2")
     _delta(con, cand, "candidate", "delta_undetermined", "c3")
     by_bin = {d["binary"]: d for d in diff_align.list_diffs(con, "run_a", "run_b")["diffs"]}
-    counts = ("layer_changed", "layer_unchanged", "delta_undetermined")
-    assert tuple(by_bin["both"][k] for k in counts) == (1, 1, 0)
-    assert tuple(by_bin["cand"][k] for k in counts) == (0, 0, 0)
+    assert set(by_bin) == {"both", "cand"}
+    for row in by_bin.values():
+        assert not {"layer_changed", "layer_unchanged", "delta_undetermined"} & set(row)
+    kinds = {d["delta_kind"] for d in diff_align.get_diff_deltas(con, both)["deltas"]}
+    assert kinds == {"layer_changed", "layer_unchanged"}
     con.close()
 
 

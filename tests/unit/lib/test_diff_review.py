@@ -704,6 +704,68 @@ def test_band_moves_an_entry_only_inside_its_subclass_rank() -> None:
     assert banded == [hi.entry_id, lo.entry_id]  # subclass_rank holds hi above lo despite the band
 
 
+def _judged(state: str, verdict: str | None) -> dr.Item:
+    return dr.Item("x", "", "B", "", 3, state, verdict, (0,))
+
+
+def _with_delta(e: Any) -> Any:
+    e.row_views = [{"landing": "persisted", "sink_arg_constant_delta": {"from": "1", "to": "2"}}]
+    return e
+
+
+def test_significance_floats_scoped_signals_and_never_sinks_what_must_stay_in_view() -> None:
+    """★ The lens's tiers, from the entry's own facts. A scoped sink signal floats (and wins over
+    sinking); a pseudocode-identical or C entry sinks — except an R entry, a guard
+    (sink_present_no_visible_delta, labelled so) and anything judged changed_real, inconclusive or
+    due a re-check / relabel, C included. A judged no_real_change may sink.
+
+    MUTATION: let a held-up judgement sink (drop ``_held_up``) -> RED; sink an R entry -> RED;
+    exempt nothing for the guard -> RED; check sinking before the scoped signals -> RED."""
+    sig = pv.significance
+    b = _e("B", 3, "b1")
+    c = _e("C", "no_sink", "c1", subclass="no_sink_candidate")
+    assert sig(_e("A", 3, "a1"), "identical", None) == (0, "matched_call_other_callee")
+    assert sig(_with_delta(_e("B", 3, "d1")), "identical", None) == (0, "sink_arg_constant_delta")
+    assert sig(b, "identical", None) == (2, "pseudocode_identical")
+    assert sig(b, "differs", None) == (1, "similarity")
+    assert sig(c, None, None) == (2, "no_sink_candidate")
+    guard = _e("B", 3, "g1", subclass="sink_present_no_visible_delta")
+    assert sig(guard, "identical", None) == (1, "recheckable_no_visible_delta")
+    r = _e("R", 3, "r1", subclass="degenerate_block_source")
+    assert sig(r, "identical", None) == (1, "undetermined_never_sunk")
+    held = (
+        (coverage.CONCLUDED, "changed_real"),
+        (coverage.NEEDS_RECHECK, "no_real_change"),
+        (coverage.NEEDS_RELABEL, "a_retired_word"),
+        (coverage.OPEN, "change_inconclusive"),
+    )
+    for state, verdict in held:
+        assert sig(b, "identical", _judged(state, verdict)) == (1, "judged_never_sunk")
+        assert sig(c, None, _judged(state, verdict)) == (1, "judged_never_sunk")
+    assert sig(b, "identical", _judged(coverage.CONCLUDED, "no_real_change"))[0] == 2
+
+
+def test_the_significance_order_is_attention_then_band_then_similarity() -> None:
+    """MUTATION: put similarity ahead of attention -> RED; leave the band out with band on ->
+    RED."""
+    sunk, hi, lo, top = (
+        _e("B", 3, "s", sim=0.1),
+        _e("B", 3, "h", sim=0.9),
+        _e("B", 3, "l", sim=0.2),
+        _e("B", 3, "t", sim=0.95),
+    )
+    att = {sunk.entry_id: 2, hi.entry_id: 1, lo.entry_id: 1, top.entry_id: 0}
+    ents = [sunk, hi, lo, top]
+    order = [e.entry_id for e in pv._sort(ents, "significance", None, att)]
+    assert order == [top.entry_id, lo.entry_id, hi.entry_id, sunk.entry_id]
+    bands = {
+        lo.entry_id: dr.band_bias(coverage.CONCLUDED, "no_real_change"),
+        hi.entry_id: dr.band_bias(coverage.NEEDS_RECHECK, "changed_real"),
+    }
+    order = [e.entry_id for e in pv._sort(ents, "significance", bands, att)]
+    assert order == [top.entry_id, hi.entry_id, lo.entry_id, sunk.entry_id]
+
+
 def test_band_orders_recheck_then_open_then_unseen() -> None:
     """MUTATION: rank OPEN after UNSEEN in ``band_bias`` -> RED."""
     ent = [_e("B", 2, n, sim=s) for n, s in (("u", 0.1), ("o", 0.5), ("k", 0.9), ("n", 0.2))]
@@ -917,7 +979,7 @@ def test_a_run_pair_is_never_complete_while_a_binary_is_not_covered(
     MUTATION: compute ``complete`` from the entry count alone -> RED on both parameters."""
     world.pair(DX, "00001000", "00002000")
     world.rows[DX] = [a_row("00001000")]
-    monkeypatch.setattr(dann, "_not_diffed", lambda *a: {})
+    monkeypatch.setattr(dann, "not_diffed_binaries", lambda *a: {})
     world.atlas.execute("DELETE FROM diff_meta WHERE diff_id = ?", (DY,))
     world.judge(DX, _pair_anchor(DX, "00001000", "00002000"), "changed_real")
     clean = overlay.list_overlays(world.atlas, anchor_kind="diff_subject", run_id=PAIR)
@@ -937,7 +999,7 @@ def test_a_run_pair_is_never_complete_while_a_binary_is_not_covered(
     world.atlas.execute("DELETE FROM diff_meta WHERE diff_id = ?", (DY,))
     monkeypatch.setattr(
         dann,
-        "_not_diffed",
+        "not_diffed_binaries",
         lambda *a: {"b": {"binary_not_diffed": {"binaries": 1, "candidates": 2, "names": ["z"]}}},
     )
     undiffed = overlay.list_overlays(world.atlas, anchor_kind="diff_subject", run_id=PAIR)
@@ -950,7 +1012,7 @@ def test_the_not_diffed_binaries_are_split_by_whether_they_are_blind_spots(world
     this side only is ``binary_not_diffed``; one whose NAME matches a diffed binary but whose bytes
     do not is ``shadowed_by_name_collision``. (The diffs are of libx/liby.)
 
-    MUTATION: drop the identical check in ``_not_diffed_reason`` (call it binary_not_diffed) -> the
+    MUTATION: drop the identical check in ``not_diffed_reason`` (call it binary_not_diffed) -> the
     libz rows go RED; drop the shadowed check -> the libx row goes RED."""
     insert = (
         # (evidence_ref, run, path, content_hash)
@@ -973,7 +1035,7 @@ def test_the_not_diffed_binaries_are_split_by_whether_they_are_blind_spots(world
         )
     world.atlas.commit()
     one = {"binaries": 1, "candidates": 1}
-    assert dann._not_diffed(world.atlas, "runA", "runB") == {
+    assert da.not_diffed_binaries(world.atlas, "runA", "runB") == {
         "a": {
             "binary_not_diffed": {**one, "names": ["libq"]},
             "identical_both_sides": {**one, "names": ["libz"]},
@@ -983,6 +1045,64 @@ def test_the_not_diffed_binaries_are_split_by_whether_they_are_blind_spots(world
             "shadowed_by_name_collision": {**one, "names": ["libx"]},
         },
     }
+
+
+def _cand(world: World, ref: str, run: str, path: str, sha: str) -> None:
+    world.atlas.execute(
+        "INSERT INTO pattern (source_class, sink_class, call_sequence_shape, "
+        "structural_fingerprint, fingerprint_algo_version) "
+        "VALUES ('external_input', 'cmd', 's', ?, 'v1')",
+        (f"fp_{ref}",),
+    )
+    world.atlas.execute(
+        "INSERT INTO instance (pattern_id, evidence_ref, source_run_id, binary_path, "
+        "binary_content_hash) VALUES (last_insert_rowid(), ?, ?, ?, ?)",
+        (ref, run, path, sha),
+    )
+    world.atlas.commit()
+
+
+def test_list_diffs_reads_the_same_split_and_an_identical_binary_never_blocks_coverage(
+    world: World,
+) -> None:
+    """★ The run-pair coverage beside list_diffs uses the one shared classifier: a binary
+    byte-identical in both runs is information (with the scan-map pointer), never a blind spot; a
+    binary on one side only is, and keeps ``all_candidate_binaries_covered`` false.
+
+    MUTATION: fold identical_both_sides into the blind-spot reasons -> RED."""
+    _cand(world, _ref("runA", "00007000"), "runA", "/fw/usr/lib/libz", "e" * 64)
+    _cand(world, _ref("runB", "00008000"), "runB", "/fw/usr/lib/libz", "e" * 64)
+    _cand(world, _ref("runA", "00009000"), "runA", "/fw/sbin/libq", "f" * 64)
+    cov = da.list_diffs(world.atlas, "runA", "runB")["coverage"]
+    one = {"binaries": 1, "candidates": 1}
+    assert cov["identical_binaries"] == {"a": one, "b": one}
+    assert cov["not_diffed_binaries"] == {"a": {"binary_not_diffed": {**one, "names": ["libq"]}}}
+    assert cov["all_candidate_binaries_covered"] is False
+    assert "list_candidates(run_id='runB')" in cov["see"]
+    world.atlas.execute("DELETE FROM instance WHERE binary_content_hash = ?", ("f" * 64,))
+    world.atlas.commit()
+    cov = da.list_diffs(world.atlas, "runA", "runB")["coverage"]
+    assert cov["all_candidate_binaries_covered"] is True  # the identical binary alone never blocks
+    assert cov["identical_binaries"] == {"a": one, "b": one}
+
+
+def test_get_diff_meta_carries_the_views_function_split_and_a_failed_diff_has_none(
+    world: World,
+) -> None:
+    """get_diff_meta's ``functions`` is function_states — the view's facts, not a second reading;
+    a diff that did not run says so and gives no counts.
+
+    MUTATION: compute get_diff_meta's split from similarity instead -> RED (it no longer equals
+    the view's); print zeros for the failed diff -> RED."""
+    world.pair(DX, "00001000", "00002000", sim=1.0)
+    world.rows[DX] = [a_row("00001000")]
+    meta = da.get_diff_meta(world.atlas, DX)
+    assert meta["functions"] == pv.function_states(world.atlas, DX)
+    assert meta["functions"]["aligned"] == 1
+    world.atlas.execute("UPDATE diff_meta SET diff_ok = 0 WHERE diff_id = ?", (DX,))
+    failed = da.get_diff_meta(world.atlas, DX)["functions"]
+    assert failed["withheld"] is True and failed["blind_spot"] == "did_not_diff"
+    assert "aligned" not in failed
 
 
 def test_a_binary_identical_on_both_sides_does_not_keep_a_pair_incomplete(
@@ -998,7 +1118,7 @@ def test_a_binary_identical_on_both_sides_does_not_keep_a_pair_incomplete(
     world.judge(DX, _pair_anchor(DX, "00001000", "00002000"), "changed_real")
     monkeypatch.setattr(
         dann,
-        "_not_diffed",
+        "not_diffed_binaries",
         lambda *a: {
             "a": {"identical_both_sides": {"binaries": 2, "candidates": 9, "names": ["x", "y"]}}
         },

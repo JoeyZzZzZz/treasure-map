@@ -57,14 +57,15 @@ STATE_BY_NOT_LISTED_NAME = {name: state for state, name in NOT_LISTED_NAME.items
 
 # ── address normalisation (single definition) ────────────────────────────────────────────────
 
-# Ghidra's synthetic symbol names carry an absolute address in a ``_<hex>`` suffix (FUN_00012a40,
-# DAT_000200f8, s_hi_0001ccd0, LAB_/UNK_/SUB_/jump tables). Two identical functions in two binaries
-# whose other code shifted read the same body with these suffixes moved, so the suffix is blanked
-# and the name before it kept. The threshold is six hex digits (>= 0x100000): a stack offset
-# (auStack_1050) and a length constant (0x40 .. 0xfff) are far smaller and never touched — the
-# "small constants stay put" rule that keeps a changed size visible to this reading and to
-# size_const_delta alike.
-_ADDR_SUFFIX = re.compile(r"_[0-9a-fA-F]{6,}\b")
+# Ghidra's synthetic symbol names carry an absolute address after an underscore (FUN_00012a40,
+# DAT_000200f8, s_hi_0001ccd0, LAB_/UNK_/SUB_), sometimes mid-name (the switch label
+# switchD_004492cc_caseD_3) or as ``r0x<addr>`` (the branch labels joined_r0x00449e60 /
+# code_r0x00449e60). Two identical functions in two binaries whose other code shifted read the same
+# body with these addresses moved, so the address is blanked and the rest of the name kept. The
+# threshold is six hex digits (>= 0x100000): a stack offset (auStack_1050) and a length constant
+# (0x40 .. 0xfff) are far smaller and never touched — the "small constants stay put" rule that
+# keeps a changed size visible to this reading and to const_delta alike.
+_ADDR_SUFFIX = re.compile(r"_(?:r0x)?[0-9a-fA-F]{6,}(?![0-9a-zA-Z])")
 # A bare absolute address / GOT offset literal, same six-digit floor.
 _ABS_HEX = re.compile(r"\b0x[0-9a-fA-F]{6,}\b")
 

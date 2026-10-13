@@ -612,19 +612,61 @@ def _seed_two_diffs(atlas_path: Path) -> None:
     con.close()
 
 
-def test_list_diffs_returns_every_binary_with_counts(tmp_path: Path) -> None:
+def test_list_diffs_leads_with_stored_function_counts_and_builds_no_view(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ list_diffs leads with what each diff STORED — aligned pairs, how many scored below
+    similarity 1, the undetermined ones, the functions with no counterpart by presence_state — and
+    never builds a view or reads pseudocode (the per-function split is get_diff_meta's). A diff
+    that did not run has no counts, never zeros; string-keyed edges are not counted here.
+
+    MUTATION: build each diff's view inside list_diffs -> the spy records it -> RED."""
+    from treasure_map.lib.query import patch_view, sameness
+
     atlas_path = tmp_path / "atlas.db"
     open_atlas(atlas_path).close()
     _seed_two_diffs(atlas_path)
     con = open_atlas(atlas_path)
+    did = "run_a::run_b::liba"
+    con.execute(
+        "UPDATE diff_meta SET diff_ok = 1, matched_pairs = 3, alignment_undetermined = 1 "
+        "WHERE diff_id = ?",
+        (did,),
+    )
+    con.execute("UPDATE diff_meta SET diff_ok = 0, diff_status = 'failed' WHERE binary_a = 'libb'")
+    for a, b, sim, state in (
+        ("00001000", "00002000", 1.0, "aligned"),
+        ("00003000", "00004000", 0.7, "aligned"),
+        ("00005000", "00006000", 0.4, "alignment_undetermined"),
+    ):
+        con.execute(
+            "INSERT INTO function_alignment (diff_id, addr_a, addr_b, alignment_confidence, "
+            "similarity, alignment_state) VALUES (?, ?, ?, 0.97, ?, ?)",
+            (did, a, b, sim, state),
+        )
+    con.execute(
+        "INSERT INTO function_presence (diff_id, side, addr, presence_state) "
+        "VALUES (?, 'b', '00007000', 'unmatched_analysis_complete')",
+        (did,),
+    )
+    con.commit()
+    calls: list[str] = []
+    monkeypatch.setattr(patch_view, "build_diff_view", lambda *a, **k: calls.append("view"))
+    monkeypatch.setattr(sameness, "read_function_bodies", lambda *a: calls.append("pseudocode"))
     res = diff_align.list_diffs(con)
     con.close()
-    assert res["count"] == 2
+    assert calls == []
     by_bin = {d["binary"]: d for d in res["diffs"]}
-    assert (
-        by_bin["liba"]["layer_changed"] == 2 and by_bin["liba"]["diff_id"] == "run_a::run_b::liba"
-    )
-    assert by_bin["libb"]["layer_changed"] == 5 and by_bin["libb"]["matched_pairs"] == 100
+    assert by_bin["liba"]["functions"] == {
+        "aligned": 2,
+        "aligned_similarity_below_1": 1,
+        "alignment_undetermined": 1,
+        "one_sided": {"b": {"unmatched_analysis_complete": 1}},
+    }
+    assert by_bin["liba"]["blind_spot"] is None and by_bin["liba"]["matched_pairs"] == 3
+    assert by_bin["libb"]["functions"] is None and by_bin["libb"]["blind_spot"] == "did_not_diff"
+    assert not {"layer_changed", "layer_unchanged", "delta_undetermined"} & set(by_bin["liba"])
+    assert "get_diff_deltas" in res["note"] and "get_diff_meta" in res["note"]
 
 
 def test_list_diffs_filters_by_run_pair(tmp_path: Path) -> None:

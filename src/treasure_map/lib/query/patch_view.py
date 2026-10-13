@@ -75,6 +75,7 @@ from typing import Any
 
 from treasure_map.lib.diff.layer0 import norm_hex
 from treasure_map.lib.query import diff_review, sameness
+from treasure_map.lib.query.coverage import CONCLUDED, NEEDS_RECHECK, NEEDS_RELABEL, OPEN
 from treasure_map.lib.query.diff_align import diff_source_staleness, get_diff_deltas
 from treasure_map.lib.query.sink_impact import impact_tier
 from treasure_map.lib.query.sink_overlay import (
@@ -89,7 +90,7 @@ from treasure_map.version import UNKNOWN_VERSION
 
 VIEWS = ("sink_patch", "string_edge", "candidate_flat")
 BUCKETS = ("A", "B", "C", "R", "P")
-SORT_BY = ("tier", "similarity", "address")
+SORT_BY = ("tier", "similarity", "address", "significance")
 NO_SINK = "no_sink"
 UNKNOWN = "unknown"
 MAX_LIMIT = 2000
@@ -553,17 +554,20 @@ def _instance_index(atlas: sqlite3.Connection, run_id: str, refs: set[str]) -> d
     return out
 
 
-# evidence_ref -> (size_kind, size_arg) for a run's size-bearing candidates, cached per
-# (run_id, build_hash): read once by json_extract, not the per-diff IN scan, so the length-constant
-# signal does not re-scan the whole run for every diff of a pair. build_hash in the key so a
-# re-extraction (same content hash, new pseudocode-derived evidence) is not served a stale fact.
-_SIZE_FACT_CACHE: dict[tuple[str, str], dict[str, tuple[str, str | None]]] = {}
+# evidence_ref -> (size_kind, size_arg) for a run's size-bearing candidates, cached per run and the
+# run row's build hash, hunt commit and last update: read once by json_extract, not the per-diff IN
+# scan, so the length-constant signal does not re-scan the whole run for every diff of a pair. The
+# run's stamps are in the key so a re-extraction or a re-hunt (same run id, new evidence) is not
+# served a stale fact.
+_SIZE_FACT_CACHE: dict[tuple[str, ...], dict[str, tuple[str, str | None]]] = {}
 
 
 def _size_facts(atlas: sqlite3.Connection, run_id: str) -> dict[str, tuple[str, str | None]]:
     """evidence_ref -> (size_kind, size_arg) for the run's candidates that carry a size axis."""
-    row = atlas.execute("SELECT build_hash FROM run WHERE run_id = ?", (run_id,)).fetchone()
-    key = (run_id, (row[0] if row else None) or "")
+    row = atlas.execute(
+        "SELECT build_hash, hunt_commit, updated_at FROM run WHERE run_id = ?", (run_id,)
+    ).fetchone()
+    key = (run_id, *(str(v or "") for v in (row or (None, None, None))))
     hit = _SIZE_FACT_CACHE.get(key)
     if hit is not None:
         return hit
@@ -1222,16 +1226,77 @@ def _default_key(r: dict[str, Any], band: int = 0) -> tuple[Any, ...]:
     return (4, -r["tier"], 0, 0, band, 0.0, r["side"], r["address"])
 
 
+# ── the significance lens (sort_by="significance"): an opt-in order, never a relabel ──────────
+
+# attention 0 floats, 1 is the similarity-ordered middle, 2 sinks; every entry stays listed.
+ATTENTION_FLOAT, ATTENTION_MIDDLE, ATTENTION_SINK = 0, 1, 2
+
+
+def _held_up(item: diff_review.Item | None) -> bool:
+    """A judgement that must keep its entry off the bottom tier: judged changed_real, due a
+    re-check or a relabel, or left inconclusive. A lens never buries what an agent marked."""
+    if item is None:
+        return False
+    if item.state in (NEEDS_RECHECK, NEEDS_RELABEL, OPEN):
+        return True
+    return item.state == CONCLUDED and item.verdict == "changed_real"
+
+
+def significance(e: _Entry, state: str | None, item: diff_review.Item | None) -> tuple[int, str]:
+    """``(attention, basis)`` of one listed entry under the significance lens, from facts the view
+    already holds (bucket, the rows' sink_arg_constant_delta, pseudocode_sameness, the entry's
+    review state) — nothing re-derived, no verdict. In order:
+
+      * bucket A, or a row carrying sink_arg_constant_delta -> 0 (wins over everything below);
+      * B ``sink_present_no_visible_delta`` -> 1, labelled ``recheckable_no_visible_delta``: it
+        stays where similarity puts it, neither floated nor sunk;
+      * pseudocode ``identical``, or bucket C -> 2 — unless the entry is R (an undetermined pair is
+        never buried under the pairs that were read) or its judgement is held up (changed_real,
+        needs_recheck / needs_relabel, inconclusive), which stops it at 1;
+      * everything else -> 1, ordered by similarity, lowest first."""
+    if e.bucket == "A":
+        return ATTENTION_FLOAT, "matched_call_other_callee"
+    if any("sink_arg_constant_delta" in v for v in e.row_views):
+        return ATTENTION_FLOAT, "sink_arg_constant_delta"
+    if e.subclass == "sink_present_no_visible_delta":
+        return ATTENTION_MIDDLE, "recheckable_no_visible_delta"
+    if state == sameness.IDENTICAL or e.bucket == "C":
+        basis = "pseudocode_identical" if state == sameness.IDENTICAL else "no_sink_candidate"
+        if e.bucket == "R":
+            return ATTENTION_MIDDLE, "undetermined_never_sunk"
+        if _held_up(item):
+            return ATTENTION_MIDDLE, "judged_never_sunk"
+        return ATTENTION_SINK, basis
+    if e.bucket == "P":
+        return ATTENTION_MIDDLE, "no_counterpart"
+    return ATTENTION_MIDDLE, "similarity"
+
+
 def _sort(
-    entries: list[_Entry], sort_by: str | None, band: dict[str, int] | None = None
+    entries: list[_Entry],
+    sort_by: str | None,
+    band: dict[str, int] | None = None,
+    attention: dict[str, int] | None = None,
 ) -> list[_Entry]:
     """The default order, or ``sort_by`` (one named component) ahead of it. P stays last either
     way: a function with no counterpart is not ordered among the pairs. ``band`` maps an entry id
-    to its judgement band (diff_review.band_bias); None leaves the order as it is."""
+    to its judgement band (diff_review.band_bias); None leaves the order as it is.
+
+    ``sort_by="significance"`` orders by ``(attention, band, similarity, default key)`` —
+    ``attention`` from :func:`significance`, the band only when it is on (judgements move nothing
+    unless asked), similarity lowest first, then the default order."""
 
     def key(e: _Entry) -> tuple[Any, ...]:
         r = e.rank
         p_last = 1 if r["segment"] == 4 else 0
+        if sort_by == "significance":
+            return (
+                p_last,
+                (attention or {}).get(e.entry_id, ATTENTION_MIDDLE),
+                band.get(e.entry_id, 0) if band else 0,
+                r.get("similarity", -1.0),
+                *_default_key(r, 0),
+            )
         if sort_by == "tier":
             head: tuple[Any, ...] = (-r["tier"] if "tier" in r else 1,)
         elif sort_by == "similarity":
@@ -1585,6 +1650,83 @@ def _not_listed_page(
     }
 
 
+_SIGNIFICANCE_LENS = (
+    "sort_by='significance' reorders the listed entries, never relabels them: attention 0 = bucket "
+    "A or a row carrying sink_arg_constant_delta; 2 = pseudocode_sameness identical, or bucket C "
+    "(sunk, still listed and pageable); 1 = the rest, lowest similarity first. Never sunk: an R "
+    "entry, a B sink_present_no_visible_delta (labelled recheckable_no_visible_delta), and an "
+    "entry judged changed_real, inconclusive or due a re-check / relabel. With band=true the "
+    "judgement band orders entries inside each attention tier. Each entry's ``significance`` "
+    "names its tier and why. Not seen by this lens: a constant in an allocation expression or a "
+    "local buffer's declared size (blind_spots), and anything in a binary the two runs hold "
+    "byte-identical — that is in the scan's candidate map, not in any diff."
+)
+
+
+def _carries_scoped_sink_delta(e: _Entry) -> bool:
+    """A changed pair whose change reaches a sink in scope: its matched call now calls another
+    callee (bucket A), or a candidate row carries a changed length constant. Read from the ROW
+    field, never the entry's subclass — an entry placed in B by another row keeps that subclass."""
+    return e.bucket == "A" or any("sink_arg_constant_delta" in v for v in e.row_views)
+
+
+def function_states(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] | None:
+    """One diff's functions split by what the view's own facts say about them — the counts a reader
+    is shown first (get_diff_meta, the diff command). Consumes pseudocode_sameness and
+    sink_arg_constant_delta exactly as get_diff_patch_view computes them; never a second reading.
+
+    Every aligned pair is in exactly one of ``unchanged`` (identical: pseudocode AND callees),
+    ``changed`` (split into ``with_scoped_sink_delta`` — bucket A, or a row carrying
+    sink_arg_constant_delta — and ``no_scoped_signal``, which says no in-scope sink signal, NOT
+    noise), ``unverified`` (identical_callee_unverified + unavailable) and ``no_body`` (an import /
+    PLT stub, kept out of every other count). Pairs whose alignment is undetermined and functions
+    with no counterpart (by presence_state, never "added"/"removed") are counted beside them. A diff
+    undetermined as a whole is ``withheld`` with its banners and NO counts — a blind spot, not zero
+    changes. None when there is no such diff."""
+    built = build_diff_view(atlas, diff_id)
+    if built is None:
+        return None
+    if built.withheld is not None:
+        return {"diff_id": diff_id, "withheld": True, "banners": list(built.banners)}
+    d = built.diff
+    one_sided: dict[str, dict[str, int]] = {}
+    for u in d.unpaired.values():
+        presence = u.presence_state or "unrecorded"
+        side = one_sided.setdefault(u.side, {})
+        side[presence] = side.get(presence, 0) + 1
+    undetermined = sum(1 for p in d.pairs if not p.aligned)
+    readings = _pseudo_readings(atlas, built)
+    tally: dict[str, int] = {}
+    scoped = 0
+    for e in built.placed:
+        state = _sameness_of(e, readings)
+        if state is None:
+            continue
+        tally[state] = tally.get(state, 0) + 1
+        if state == sameness.DIFFERS and _carries_scoped_sink_delta(e):
+            scoped += 1
+    changed = tally.get(sameness.DIFFERS, 0)
+    unverified = {
+        sameness.IDENTICAL_CALLEE_UNVERIFIED: tally.get(sameness.IDENTICAL_CALLEE_UNVERIFIED, 0),
+        sameness.UNAVAILABLE: tally.get(sameness.UNAVAILABLE, 0),
+    }
+    return {
+        "diff_id": diff_id,
+        "withheld": False,
+        "aligned": sum(tally.values()),
+        "unchanged": tally.get(sameness.IDENTICAL, 0),
+        "changed": {
+            "total": changed,
+            "with_scoped_sink_delta": scoped,
+            "no_scoped_signal": changed - scoped,
+        },
+        "unverified": {"total": sum(unverified.values()), **unverified},
+        "no_body": tally.get(sameness.NO_BODY, 0),
+        "alignment_undetermined": undetermined,
+        "one_sided": {s: dict(sorted(v.items())) for s, v in sorted(one_sided.items())},
+    }
+
+
 def get_diff_patch_view(
     atlas: sqlite3.Connection,
     diff_id: str,
@@ -1734,7 +1876,19 @@ def get_diff_patch_view(
             }
         )
         return envelope
-    ordered = _sort(chosen, sort_by, review.bands() if band else None)
+    lens: dict[str, tuple[int, str]] = {}
+    if sort_by == "significance":
+        lens = {
+            e.entry_id: significance(e, _sameness_of(e, readings), review.items.get(e.entry_id))
+            for e in chosen
+        }
+        envelope["lens"]["significance"] = _SIGNIFICANCE_LENS
+    ordered = _sort(
+        chosen,
+        sort_by,
+        review.bands() if band else None,
+        {k: v[0] for k, v in lens.items()},
+    )
     end = offset + limit
 
     def _render(e: _Entry) -> dict[str, Any]:
@@ -1742,6 +1896,10 @@ def get_diff_patch_view(
         state = _sameness_of(e, readings)
         if state is not None:
             out["pseudocode_sameness"] = state
+        if e.entry_id in lens:
+            attention, basis = lens[e.entry_id]
+            out["rank_key"] = {**out["rank_key"], "attention": attention}
+            out["significance"] = {"attention": attention, "basis": basis}
         return out
 
     envelope.update(

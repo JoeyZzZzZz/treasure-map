@@ -619,6 +619,226 @@ def test_a_re_extraction_is_not_served_a_stale_reading(tmp_path: Path, current: 
     assert nl["aligned_pseudocode_differs"]["count"] == 1
 
 
+def _size(kind: str, arg: str) -> str:
+    return json.dumps({"size_kind": kind, "size_flow": {"size_arg": arg}})
+
+
+def _function_world(tmp_path: Path) -> World:
+    """One pair (or function) per count function_states makes."""
+    w = World(tmp_path)
+    a, b = "runA", "runB"
+    # unchanged: same body, same resolved callees
+    w.pair("00001000", "00002000", 0.97, 1.0)
+    w.fn("a", "00001000", ["foo"], pseudocode="p = foo(0x40);")
+    w.fn("b", "00002000", ["foo"], pseudocode="p = foo(0x40);")
+    # unverified: same body, a side's callee list a prefix
+    w.pair("00003000", "00004000", 0.97, 1.0)
+    w.fn("a", "00003000", ["foo"], pseudocode="p = foo(0x40);", truncated=1)
+    w.fn("b", "00004000", ["foo"], pseudocode="p = foo(0x40);")
+    # unverified: the b body is in the table but empty
+    w.pair("00005000", "00006000", 0.97, 1.0)
+    w.fn("a", "00005000", ["foo"], pseudocode="p = foo(0x40);")
+    w.fn("b", "00006000", ["foo"], pseudocode=None)
+    # no_body: the b side is not in the functions table at all
+    w.pair("00007000", "00008000", 0.97, 1.0)
+    w.fn("a", "00007000", ["foo"], pseudocode="p = foo(0x40);")
+    # changed, with a scoped sink delta: a persisted copy whose length constant moved
+    w.pair("00009000", "0000a000", 0.97, 1.0)
+    w.inst(
+        "a", _ref(a, "00009000", "copy", "0x10"), "copy", "snprintf", _size("cap_const", "0x200")
+    )
+    w.inst(
+        "b", _ref(b, "0000a000", "copy", "0x10"), "copy", "snprintf", _size("cap_const", "0x400")
+    )
+    w.im("00009010", "0000a010", "00009000")
+    w.fn("a", "00009000", ["snprintf"], pseudocode="snprintf(d,0x200,f);")
+    w.fn("b", "0000a000", ["snprintf"], pseudocode="snprintf(d,0x400,f);")
+    # changed, with a scoped sink delta: bucket A (the matched call now calls another callee)
+    w.pair("0000b000", "0000c000", 0.97, 0.9)
+    w.inst("a", _ref(a, "0000b000", "cmd", "0x10"), "cmd", "system")
+    w.inst("b", _ref(b, "0000c000", "cmd", "0x10"), "cmd", "popen")
+    w.im("0000b010", "0000c010", "0000b000")
+    w.fn("a", "0000b000", ["system"], pseudocode="system(c);")
+    w.fn("b", "0000c000", ["popen"], pseudocode="popen(c);")
+    # changed, no scoped signal: only a local buffer's declared size moved (similarity 1)
+    w.pair("0000d000", "0000e000", 0.97, 1.0)
+    w.fn("a", "0000d000", ["bar"], pseudocode="char buf[512]; bar(buf);")
+    w.fn("b", "0000e000", ["bar"], pseudocode="char buf[4096]; bar(buf);")
+    # alignment undetermined, and one function with no counterpart on each side
+    w.pair("0000f000", "00010000", 0.5, 0.4)
+    w.unpaired("a", "00011000", "unmatched_analysis_complete")
+    w.unpaired("b", "00012000", "unmatched_analysis_incomplete")
+    w.commit()
+    return w
+
+
+def test_function_states_count_each_function_once_by_the_views_own_facts(
+    tmp_path: Path, current: None
+) -> None:
+    """★ The first counts a reader sees. 'unchanged' is pseudocode AND callees matching — never
+    similarity 1 alone; a pseudocode match with unverified callees, and an empty body, are
+    'unverified', in neither of the other two; a stub with no body is counted apart; 'changed'
+    splits by whether a sink in scope moved (bucket A, or a changed length constant on a ROW), and
+    a change with no such signal (a local buffer resized) is 'no_scoped_signal', not unchanged.
+
+    MUTATION: count identical_callee_unverified as unchanged -> RED; fold no_body into
+    unverified -> RED; drop bucket A from the scoped split -> RED."""
+    w = _function_world(tmp_path)
+    s = pv.function_states(w.atlas, DIFF)
+    assert s is not None and s["withheld"] is False
+    assert s["unchanged"] == 1
+    assert s["changed"] == {"total": 3, "with_scoped_sink_delta": 2, "no_scoped_signal": 1}
+    assert s["unverified"] == {"total": 2, "identical_callee_unverified": 1, "unavailable": 1}
+    assert s["no_body"] == 1
+    assert s["aligned"] == 7 == s["unchanged"] + 3 + 2 + 1
+    assert s["alignment_undetermined"] == 1
+    assert s["one_sided"] == {
+        "a": {"unmatched_analysis_complete": 1},
+        "b": {"unmatched_analysis_incomplete": 1},
+    }
+
+
+def test_a_diff_undetermined_as_a_whole_has_no_function_counts(
+    tmp_path: Path, current: None
+) -> None:
+    """MUTATION: return the counts of an undetermined diff (zeros) -> RED."""
+    w = _function_world(tmp_path)
+    w.atlas.execute("UPDATE diff_meta SET version_skew = 1")
+    w.commit()
+    s = pv.function_states(w.atlas, DIFF)
+    assert s is not None and s["withheld"] is True and "aligned" not in s
+    assert "diff_undetermined:version_skew" in s["banners"]
+
+
+def test_the_significance_lens_reorders_and_never_relabels(tmp_path: Path, current: None) -> None:
+    """★ sort_by='significance' moves entries, never their labels: the same entries, buckets and
+    subclasses as the default view; A / a changed length constant first; a pseudocode-identical
+    entry sunk but still listed; each tier named on the entry, from facts the entry itself reports.
+
+    MUTATION: give a pseudocode-identical entry attention 1 (do not sink) -> RED; float by bucket B
+    instead of by the row's delta field -> RED."""
+    w = _function_world(tmp_path)
+    w.pair("00013000", "00014000", 0.97, 0.6)  # a changed pair whose candidate lines up, identical
+    w.inst("a", _ref("runA", "00013000", "cmd", "0x10"), "cmd", "system")
+    w.inst("b", _ref("runB", "00014000", "cmd", "0x10"), "cmd", "system")
+    w.im("00013010", "00014010", "00013000")
+    w.fn("a", "00013000", ["system"], pseudocode="system(FUN_00012340());")
+    w.fn("b", "00014000", ["system"], pseudocode="system(FUN_00099990());")
+    w.pair("00015000", "00016000", 0.97, 0.7)  # a changed pair, no candidate, identical body: C
+    w.fn("a", "00015000", ["memset"], pseudocode="memset(b,0,8);")
+    w.fn("b", "00016000", ["memset"], pseudocode="memset(b,0,8);")
+    w.commit()
+    base = _view(w)
+    lens = _view(w, sort_by="significance")
+    assert set(lens["by_id"]) == set(base["by_id"])
+    for eid, e in lens["by_id"].items():
+        assert (e["bucket"], e["subclass"]) == (
+            base["by_id"][eid]["bucket"],
+            base["by_id"][eid]["subclass"],
+        )
+        assert "significance" not in base["by_id"][eid]
+    order = [e["entry_id"] for e in lens["entries"]]
+    att = {e["entry_id"]: e["significance"]["attention"] for e in lens["entries"]}
+    assert att[_pair_id("00009000", "0000a000")] == 0  # the length constant moved
+    assert att[_pair_id("0000b000", "0000c000")] == 0  # bucket A
+    assert att[_pair_id("00013000", "00014000")] == 1  # guard: sink_present_no_visible_delta
+    assert lens["by_id"][_pair_id("00013000", "00014000")]["significance"]["basis"] == (
+        "recheckable_no_visible_delta"
+    )
+    assert att[_pair_id("00015000", "00016000")] == 2  # C, sunk — still listed
+    assert att[_pair_id("0000f000", "00010000")] == 1  # R
+    assert order.index(_pair_id("00015000", "00016000")) > order.index(
+        _pair_id("0000f000", "00010000")
+    )
+    for e in lens["entries"]:  # the tier follows from what the entry itself reports
+        rows_delta = any("sink_arg_constant_delta" in r for r in e["rows"])
+        if e["bucket"] == "A" or rows_delta:
+            assert e["significance"]["attention"] == 0
+        elif e["bucket"] in ("B", "C") and e["significance"]["attention"] == 2:
+            assert e.get("pseudocode_sameness") == "identical" or e["bucket"] == "C"
+
+
+def test_an_entry_in_b_by_another_row_keeps_its_subclass_and_the_row_keeps_the_delta(
+    tmp_path: Path, current: None
+) -> None:
+    """An entry another row already placed in B keeps that subclass; the changed length constant
+    stays a fact on its own row (and still floats the entry under the lens, which reads the row).
+
+    MUTATION: test the delta before the B landings in ``_place`` -> the subclass becomes
+    sink_arg_constant_delta -> RED."""
+    w = World(tmp_path)
+    w.pair("00001000", "00002000", 0.97, 1.0)
+    w.inst(
+        "a",
+        _ref("runA", "00001000", "copy", "0x10"),
+        "copy",
+        "snprintf",
+        _size("cap_const", "0x80"),
+    )
+    w.inst(
+        "b",
+        _ref("runB", "00002000", "copy", "0x10"),
+        "copy",
+        "snprintf",
+        _size("cap_const", "0x100"),
+    )
+    w.im("00001010", "00002010", "00001000")
+    w.inst("a", _ref("runA", "00001000", "cmd", "0x30"), "cmd", "system")  # matched to nothing
+    w.fn("a", "00001000", ["snprintf", "system"])
+    w.fn("b", "00002000", ["snprintf"])
+    w.commit()
+    by_id = _view(w)["by_id"]
+    assert _pair_id("00001000", "00002000") in by_id
+    e = by_id[_pair_id("00001000", "00002000")]
+    assert e["bucket"] == "B" and e["subclass"] != "sink_arg_constant_delta"
+    assert any("sink_arg_constant_delta" in r for r in e["rows"])
+
+
+@pytest.mark.parametrize(
+    "restamp",
+    [
+        "UPDATE run SET updated_at = '2099-01-01T00:00:00Z' WHERE run_id = 'runB'",
+        "UPDATE run SET hunt_commit = 'rehunted'",  # both runs: no generation mismatch
+    ],
+    ids=["updated_at", "hunt_commit"],
+)
+def test_a_re_hunt_is_not_served_stale_size_facts(
+    tmp_path: Path, current: None, restamp: str
+) -> None:
+    """The size facts are cached per run, keyed on its build hash, hunt commit and last update: a
+    re-hunt rewrites the evidence under the same run id and must be read again.
+
+    MUTATION: key the cache on (run_id, build_hash) alone -> the old delta is served -> RED."""
+    w = World(tmp_path)
+    w.pair("00001000", "00002000", 0.97, 1.0)
+    w.inst(
+        "a",
+        _ref("runA", "00001000", "copy", "0x10"),
+        "copy",
+        "snprintf",
+        _size("cap_const", "0x200"),
+    )
+    w.inst(
+        "b",
+        _ref("runB", "00002000", "copy", "0x10"),
+        "copy",
+        "snprintf",
+        _size("cap_const", "0x400"),
+    )
+    w.im("00001010", "00002010", "00001000")
+    w.fn("a", "00001000", ["snprintf"])
+    w.fn("b", "00002000", ["snprintf"])
+    w.commit()
+    assert _pair_id("00001000", "00002000") in _view(w)["by_id"]  # listed by its delta
+    w.atlas.execute(
+        "UPDATE instance SET flow_evidence = ? WHERE source_run_id = 'runB'",
+        (_size("cap_const", "0x200"),),
+    )
+    w.atlas.execute(restamp)
+    w.commit()
+    assert _pair_id("00001000", "00002000") not in _view(w)["by_id"]  # no delta any more
+
+
 def test_pseudocode_is_read_in_the_view_never_in_the_build(
     tmp_path: Path, current: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:

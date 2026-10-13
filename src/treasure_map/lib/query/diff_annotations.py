@@ -28,7 +28,11 @@ from treasure_map.lib.errors import ConfigError
 from treasure_map.lib.overlay import _DIFF_VERDICTS
 from treasure_map.lib.query import diff_review as dr
 from treasure_map.lib.query.coverage import NEEDS_RECHECK
-from treasure_map.lib.query.diff_align import list_diff_blindspots
+from treasure_map.lib.query.diff_align import (
+    list_diff_blindspots,
+    not_diffed_binaries,
+    split_not_diffed,
+)
 from treasure_map.lib.query.patch_view import BuiltDiff, ViewReview, _Entry, build_diff_view
 
 # Where a candidate row has to land for its entry's judgement to be carried onto it. A row that
@@ -368,84 +372,6 @@ def list_diff_overlays(
 # ── progress over a whole run pair ─────────────────────────────────────────────────────────
 
 
-# Why a candidate whose binary was not diffed sits where it does. The two blind-spot reasons mirror
-# the run-pair reasons lib/query/sink_overlay emits for get_diff_sink_overlay; identical_both_sides
-# is this review layer's own finer split — a binary byte-for-byte present on the OTHER side was not
-# diffed because there was nothing to diff, so it is no blind spot and must not keep complete false.
-_NOT_DIFFED_IDENTICAL = "identical_both_sides"
-_NOT_DIFFED_BLIND = ("binary_not_diffed", "shadowed_by_name_collision")
-
-
-def _short_name(path: str | None) -> str | None:
-    """A binary path's short name (its basename), matched against diff_meta.binary_a / binary_b."""
-    return path.rsplit("/", 1)[-1] if path else None
-
-
-def _not_diffed_reason(
-    sha: str | None, name: str | None, *, diffed_names: set[str], other_shas: set[str]
-) -> str:
-    """Why a candidate whose binary content is not among the pair's diffed hashes is where it is.
-    Identical content on the other side is not a blind spot; a same-named binary that WAS diffed
-    shadowed it; otherwise the binary is on this side only."""
-    if sha is not None and sha in other_shas:
-        return _NOT_DIFFED_IDENTICAL
-    if name in diffed_names:
-        return "shadowed_by_name_collision"
-    return "binary_not_diffed"
-
-
-def _not_diffed(atlas: sqlite3.Connection, run_a: str, run_b: str) -> dict[str, Any]:
-    """The binaries holding candidates that no diff of the pair covers, read straight from the atlas
-    — diff_meta for what was diffed, instance for every candidate — WITHOUT recomputing the pair's
-    sink overlay (which rebuilds every diff; this reads the same set, by content hash).
-
-    Per side and reason: how many binaries (by path), how many candidates, and every binary's short
-    name. A candidate whose binary content is present on the OTHER side too is identical across the
-    pair and reads as ``identical_both_sides``, kept apart from the two genuine blind-spot reasons
-    (``binary_not_diffed``, ``shadowed_by_name_collision``) so it never counts as one."""
-    diffs = atlas.execute(
-        "SELECT sha256_a, sha256_b, binary_a, binary_b FROM diff_meta "
-        "WHERE run_a_id = ? AND run_b_id = ?",
-        (run_a, run_b),
-    ).fetchall()
-    run_shas = {
-        side: {
-            sha
-            for (sha,) in atlas.execute(
-                "SELECT DISTINCT binary_content_hash FROM instance WHERE source_run_id = ?", (run,)
-            )
-            if sha
-        }
-        for side, run in (("a", run_a), ("b", run_b))
-    }
-    out: dict[str, Any] = {}
-    for side, run, sha_col, name_col in (("a", run_a, 0, 2), ("b", run_b, 1, 3)):
-        diffed_sha = {d[sha_col] for d in diffs if d[sha_col]}
-        diffed_names = {d[name_col] for d in diffs if d[name_col]}
-        other_shas = run_shas["b" if side == "a" else "a"]
-        groups: dict[str, dict[str, set[str | None]]] = {}
-        for ref, sha, path in atlas.execute(
-            "SELECT evidence_ref, binary_content_hash, binary_path FROM instance "
-            "WHERE source_run_id = ?",
-            (run,),
-        ):
-            if sha is not None and sha in diffed_sha:
-                continue  # its binary content was one side of a diff — covered
-            reason = _not_diffed_reason(
-                sha, _short_name(path), diffed_names=diffed_names, other_shas=other_shas
-            )
-            g = groups.setdefault(reason, {"refs": set(), "paths": set()})
-            g["refs"].add(ref)
-            g["paths"].add(path)
-        for reason, g in sorted(groups.items()):
-            out.setdefault(side, {})[reason] = {
-                "binaries": len(g["paths"]),
-                "candidates": len(g["refs"]),
-                "names": sorted({_short_name(p) or "(no path recorded)" for p in g["paths"]}),
-            }
-    return out
-
-
 def pair_progress(
     atlas: sqlite3.Connection,
     pair: str,
@@ -495,19 +421,9 @@ def pair_progress(
         {k: b[k] for k in ("diff_id", "binary", "diff_status_reason", "diff_attempts")}
         for b in blind["blindspots"]
     ]
-    not_diffed = _not_diffed(atlas, run_a, run_b)
-    blind_not_diffed: dict[str, Any] = {}
-    identical_not_diffed: dict[str, Any] = {}
-    for side, by_reason in not_diffed.items():
-        blind = {r: v for r, v in by_reason.items() if r in _NOT_DIFFED_BLIND}
-        if blind:
-            blind_not_diffed[side] = blind
-        identical = by_reason.get(_NOT_DIFFED_IDENTICAL)
-        if identical is not None:
-            identical_not_diffed[side] = {
-                "binaries": identical["binaries"],
-                "candidates": identical["candidates"],
-            }
+    blind_not_diffed, identical_not_diffed = split_not_diffed(
+        not_diffed_binaries(atlas, run_a, run_b)
+    )
     numbers = dr.counts(items)
     return {
         "unit": "entry",

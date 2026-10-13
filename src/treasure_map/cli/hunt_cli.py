@@ -90,19 +90,32 @@ def _echo_legal_notice(*, as_json: bool = False) -> None:
     click.echo("", err=True)
 
 
-def _edge_counts(summary: Any) -> str:
-    """The delta line of one binary's diff. The three counts are string-keyed dispatch edges, not
-    functions; all three zero means neither side has such an edge — nothing was compared, which is
-    not 'unchanged'."""
-    changed = summary.delta_layer_changed
-    unchanged = summary.delta_layer_unchanged
-    undetermined = summary.delta_undetermined
-    if changed + unchanged + undetermined == 0:
-        return "no string-keyed edges (0 subjects)"
-    return f"{changed} edges changed / {unchanged} unchanged / {undetermined} undetermined"
+def _function_line(states: dict[str, Any] | None) -> str:
+    """One binary's functions as the diff left them (lib/query/patch_view.function_states): what
+    its aligned pairs' pseudocode says, never similarity alone. A diff that did not run, or is
+    undetermined as a whole, prints no counts — zeros would read as 'nothing moved'."""
+    if states is None:
+        return "no diff row to read (see get_diff_meta)"
+    if states.get("withheld"):
+        banners = states.get("banners", [])
+        if "diff_undetermined:diff_failed" in banners:
+            return "BLIND SPOT (did not diff)"
+        return f"undetermined as a whole ({', '.join(banners)}) — no counts"
+    changed, unverified = states["changed"], states["unverified"]
+    line = (
+        f"{states['aligned']} aligned: {states['unchanged']} unchanged, {changed['total']} changed "
+        f"({changed['with_scoped_sink_delta']} with a scoped sink delta, "
+        f"{changed['no_scoped_signal']} no scoped signal), {unverified['total']} unverified, "
+        f"{states['no_body']} no body; {states['alignment_undetermined']} alignment undetermined"
+    )
+    sides = "; ".join(
+        f"{side.upper()} " + ", ".join(f"{n} {state}" for state, n in by_state.items())
+        for side, by_state in states["one_sided"].items()
+    )
+    return line + (f"; no counterpart — {sides}" if sides else "")
 
 
-def _echo_single_diff(summary: Any, resolved_atlas: Path) -> None:
+def _echo_single_diff(summary: Any, resolved_atlas: Path, states: dict[str, Any] | None) -> None:
     """Print one binary's diff result (the --binary or single-binary path)."""
     for w in summary.warnings:
         click.echo(f"warning: {w}", err=True)
@@ -111,16 +124,50 @@ def _echo_single_diff(summary: Any, resolved_atlas: Path) -> None:
     click.echo(f"  binary        : {summary.binary}")
     click.echo(f"  matched_pairs : {summary.matched_pairs}")
     click.echo(f"  version_skew  : {summary.version_skew}")
-    click.echo(f"  delta         : {_edge_counts(summary)}")
+    click.echo(f"  functions     : {_function_line(states)}")
     if summary.baseline is not None:
         click.echo(f"  baseline      : {summary.baseline.replace('_', ' ')}")
     click.echo(
-        "Read the diff: start with get_diff_patch_view; get_diff_deltas (string-keyed edges) / "
-        "get_diff_meta / get_function_alignment / get_diff_capabilities"
+        "Read the diff: start with get_diff_patch_view (sort_by='significance' floats the scoped "
+        "signals); get_diff_meta / get_function_alignment / get_diff_capabilities; "
+        "get_diff_deltas for the string-keyed edges (a switchable view)."
     )
 
 
-def _echo_full_diff(fsum: Any, resolved_atlas: Path) -> None:
+def _echo_coverage(coverage: dict[str, Any] | None, after: str) -> None:
+    """What no diff of the pair can see (lib/query/diff_align.run_pair_coverage): the genuine blind
+    spots, and — apart, never as one — the binaries byte-identical in both runs."""
+    if coverage is None:
+        return
+    identical = coverage["identical_binaries"]
+    same = identical.get("b") or identical.get("a")
+    if same:
+        click.echo(
+            f"  identical     : {same['binaries']} candidate-holding binaries are byte-identical "
+            f"in both runs (no diff needed, none can show them); their {same['candidates']} "
+            f"candidates are on the scan map — tmap triage {after}"
+        )
+    for side, by_reason in coverage["not_diffed_binaries"].items():
+        for reason, g in by_reason.items():
+            click.echo(
+                f"  not diffed    : {side.upper()} {g['binaries']} binaries / {g['candidates']} "
+                f"candidates ({reason}) — {', '.join(g['names'])}"
+            )
+    if coverage["all_candidate_binaries_covered"]:
+        click.echo(
+            "  coverage      : every candidate-holding binary is diffed or byte-identical in "
+            "both runs"
+        )
+    else:
+        click.echo(
+            "  coverage      : NOT every candidate-holding binary is covered — the failed diffs "
+            "and the not-diffed binaries above are blind spots"
+        )
+
+
+def _echo_full_diff(
+    fsum: Any, resolved_atlas: Path, coverage: dict[str, Any] | None = None, after: str = ""
+) -> None:
     """Print a full diff's roll-up: what was diffed vs skipped (incremental), which failures
     self-healed, and which persist as blind spots — so a coverage gap is never invisible."""
     plan = fsum.plan
@@ -195,9 +242,11 @@ def _echo_full_diff(fsum: Any, resolved_atlas: Path) -> None:
             f"  blind spots   : {len(plan.hard_failed)} suspected-hard skipped this run — "
             f"{', '.join(plan.hard_failed)} (list_diff_blindspots / --force-retry)"
         )
+    _echo_coverage(coverage, after)
     click.echo(
-        "Read the diffs: list_diffs, then get_diff_patch_view per binary (get_diff_deltas for "
-        "string-keyed edges, get_diff_meta); list_diff_blindspots for un-diffed binaries."
+        "Read the diffs: list_diffs, then get_diff_patch_view per binary (sort_by='significance' "
+        "floats the scoped signals; get_diff_meta for the per-function split; get_diff_deltas for "
+        "the string-keyed edges, a switchable view); list_diff_blindspots for un-diffed binaries."
     )
 
 
@@ -610,6 +659,8 @@ def hunt_diff(
     from treasure_map.lib.atlas.connection import open_atlas
     from treasure_map.lib.config.config import load_config
     from treasure_map.lib.diff.driver import run_full_diff, run_version_diff
+    from treasure_map.lib.query.diff_align import list_diffs
+    from treasure_map.lib.query.patch_view import function_states
 
     # Refused before anything is opened: nothing has been read, so nothing can have been written.
     if legacy_runs:
@@ -663,12 +714,16 @@ def hunt_diff(
         if outcome.error is not None:
             click.echo(f"  [{i}/{total}] {outcome.binary}: FAILED — {outcome.error}")
         else:
-            click.echo(f"  [{i}/{total}] {outcome.binary}: {_edge_counts(outcome.summary)}")
+            states = function_states(atlas, outcome.summary.diff_id)
+            click.echo(f"  [{i}/{total}] {outcome.binary}: {_function_line(states)}")
 
     atlas = open_atlas(Path(resolved_atlas))
+    states: dict[str, Any] | None = None
+    coverage: dict[str, Any] | None = None
     try:
         if binary_name is not None:
             single = run_version_diff(atlas, before, after, binary_name, config=cfg, force=force)
+            states = function_states(atlas, single.diff_id)
             full = None
         else:
             single = None
@@ -683,15 +738,16 @@ def hunt_diff(
                 on_start=_on_start,
                 on_outcome=_on_outcome,
             )
+            coverage = list_diffs(atlas, before, after).get("coverage")
     except TreasureMapError as exc:
         raise _driver_refusal(exc) from exc
     finally:
         atlas.close()
 
     if single is not None:
-        _echo_single_diff(single, resolved_atlas)
+        _echo_single_diff(single, resolved_atlas, states)
     else:
-        _echo_full_diff(full, resolved_atlas)
+        _echo_full_diff(full, resolved_atlas, coverage, after)
 
 
 def _rescan_interrupted(ctx: click.Context, run_ids: tuple[str, ...]) -> None:

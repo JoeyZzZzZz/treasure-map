@@ -460,7 +460,15 @@ _META_NOTE = (
     "version_skew=1 -> every delta in this diff is version_skew undetermined; do not read it as "
     "'no change'. It compares only the analysis-tool version, not the firmware. A NULL "
     "ghidra_version means that side did not record one. unmatched_b = B-side functions with no "
-    "A-side match (presence layer, the WEAKEST signal -- look at layer_changed, not this). "
+    "A-side match (presence layer, the WEAKEST signal: a function with no counterpart is never "
+    "read as added or removed). ``functions`` splits the aligned pairs by what their pseudocode "
+    "and callee sets say (get_diff_patch_view's pseudocode_sameness): unchanged (both match), "
+    "changed (with_scoped_sink_delta = bucket A or a changed sink length constant; "
+    "no_scoped_signal = no in-scope sink signal, NOT 'noise'), unverified "
+    "(identical_callee_unverified + unavailable — neither unchanged nor changed), and no_body (an "
+    "import / PLT stub, counted apart); beside them alignment_undetermined and one_sided by "
+    "presence_state. withheld = the whole diff is undetermined: no counts at all (a blind spot, "
+    "with blind_spot='did_not_diff' when it failed), never zeros. "
     "diff_ok=0 means this binary did NOT diff (diff_status='failed', diff_status_reason = why): an "
     "empty get_diff_deltas for it is a BLIND SPOT, not 'no change'. diff_ok=1 = usable output. "
     "baseline_dropped=1 = the diff had a stored candidate baseline that a re-diff dropped (it "
@@ -630,10 +638,18 @@ def get_diff_meta(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any]:
             "diff_id": diff_id,
             "note": "no diff_meta for this diff_id -- run `tmap diff` for it first.",
         }
+    # patch_view imports this module, so the view is imported here, at call time.
+    from treasure_map.lib.query.patch_view import function_states
+
+    meta = dict(zip(_META_COLS, row, strict=True))
+    functions = function_states(atlas, diff_id)
+    if functions is not None and functions.get("withheld") and not meta["diff_ok"]:
+        functions["blind_spot"] = "did_not_diff"
     return {
         "found": True,
         "diff_id": diff_id,
-        "meta": dict(zip(_META_COLS, row, strict=True)),
+        "meta": meta,
+        "functions": functions,
         **diff_source_staleness(atlas, diff_id),
         "note": _META_NOTE,
     }
@@ -659,19 +675,23 @@ def get_diff_capabilities(atlas: sqlite3.Connection, diff_id: str) -> dict[str, 
 
 _LIST_DIFFS_NOTE = (
     "Each row is ONE binary's diff between two runs (diff_id = {run_a}::{run_b}::{binary}). "
-    "layer_changed / layer_unchanged / delta_undetermined count the binary's string-keyed dispatch "
-    "edges (the reachability.string_keyed_edge dimension), NOT functions: tri-state projections, "
-    "not verdicts; layer_changed is not proof the change matters and delta_undetermined is NOT "
-    "'unchanged'. All three 0 = neither side has such an edge, so nothing was compared — that is "
-    "NOT 'unchanged'. How much a function moved is the similarity in get_function_alignment; "
-    "whether a sink call is still there is get_diff_sink_overlay. An EMPTY list "
-    "means no diff has been run for that filter yet — not 'nothing changed'. diff_ok=0 rows are "
-    "BLIND SPOTS (diff_status='failed', diff_status_reason = why, diff_attempts = tries): the "
-    "binary did not diff, so its zero counts are 'unknown', never 'no change' — "
-    "list_diff_blindspots focuses just those. baseline_dropped=1 = the diff had a stored candidate "
+    "``functions`` counts FUNCTIONS from what the diff stored: aligned pairs, how many of them "
+    "BinDiff scored below similarity 1, pairs whose alignment is undetermined, and the functions "
+    "with no counterpart by presence_state (never 'added' / 'removed'). Similarity 1 is NOT "
+    "'unchanged' — it is blind to constants and buffer sizes; whether an aligned pair really "
+    "changed (unchanged / changed / unverified / no_body, by pseudocode) is per diff: "
+    "get_diff_meta(diff_id). The string-keyed dispatch edges are a switchable view, "
+    "get_diff_deltas(diff_id), not counted here. An EMPTY list means no diff has been run for "
+    "that filter yet — not 'nothing changed'. diff_ok=0 rows are BLIND SPOTS (blind_spot="
+    "'did_not_diff', diff_status='failed', diff_status_reason = why, diff_attempts = tries): the "
+    "binary did not diff, so it has no counts (functions=null), never zeros — "
+    "list_diff_blindspots focuses just those. With both run ids, ``coverage`` says what no diff "
+    "of the pair can see: the failed diffs and the candidate-holding binaries no diff covers, "
+    "with the binaries byte-identical in both runs kept apart (no diff needed; their candidates "
+    "are on the scan map). baseline_dropped=1 = the diff had a stored candidate "
     "baseline that a re-diff dropped (it failed, or the baseline could not be stored again). Pick "
-    "a binary, then start with get_diff_patch_view (get_diff_deltas is its string-keyed edge "
-    "view; get_diff_meta for the meta). "
+    "a binary, then start with get_diff_patch_view (get_diff_meta for the meta and the "
+    "per-function split). "
     "★ source_stale says whether the diff still describes what it was computed from: true = a "
     "side's binary content changed or is gone (source_content_changed / source_binary_absent), "
     "the diff code or the export script it ran changed (diff_logic_changed), the diff was "
@@ -699,10 +719,8 @@ _LIST_DIFFS_COLS = (
     "diff_status",
     "diff_status_reason",
     "diff_attempts",
-    "layer_changed",
-    "layer_unchanged",
-    "delta_undetermined",
     "baseline_dropped",
+    "alignment_undetermined",
 )
 
 
@@ -751,17 +769,29 @@ def list_diffs(
     rows = atlas.execute(
         "SELECT dm.diff_id, dm.binary_a, dm.run_a_id, dm.run_b_id, dm.matched_pairs, "  # noqa: S608
         "dm.version_skew, dm.diff_ok, dm.diff_status, dm.diff_status_reason, dm.diff_attempts, "
-        "SUM(CASE WHEN dd.delta_kind='layer_changed' THEN 1 ELSE 0 END), "
-        "SUM(CASE WHEN dd.delta_kind='layer_unchanged' THEN 1 ELSE 0 END), "
-        "SUM(CASE WHEN dd.delta_kind='delta_undetermined' THEN 1 ELSE 0 END), "
-        "dm.baseline_dropped, " + ", ".join(f"dm.{c}" for c in _STAMP_COLS) + " "
-        # Edge deltas only: the candidate overlay's rows share the table. The scope sits in the ON
-        # clause, not WHERE, so a diff with no edge rows still lists (with zero counts).
-        "FROM diff_meta dm LEFT JOIN dimension_delta dd ON dd.diff_id = dm.diff_id "
-        "AND dd.subject_kind != 'candidate' "
-        f"{clause} GROUP BY dm.diff_id ORDER BY dm.run_a_id, dm.run_b_id, dm.binary_a",
+        "dm.baseline_dropped, dm.alignment_undetermined, "
+        + ", ".join(f"dm.{c}" for c in _STAMP_COLS)
+        + f" FROM diff_meta dm {clause} ORDER BY dm.run_a_id, dm.run_b_id, dm.binary_a",
         params,
     ).fetchall()
+    # Two grouped counts over the stored tables, scoped like the listing: never a view, never a
+    # pseudocode read — the per-diff split by pseudocode_sameness is get_diff_meta's.
+    scope = f"SELECT dm.diff_id FROM diff_meta dm {clause}"  # noqa: S608
+    below_1 = dict(
+        atlas.execute(
+            "SELECT diff_id, COUNT(*) FROM function_alignment "  # noqa: S608
+            "WHERE alignment_state = 'aligned' AND (similarity IS NULL OR similarity < 1) "
+            f"AND diff_id IN ({scope}) GROUP BY diff_id",
+            params,
+        ).fetchall()
+    )
+    one_sided: dict[str, dict[str, dict[str, int]]] = {}
+    for did, side, state, n in atlas.execute(
+        "SELECT diff_id, side, presence_state, COUNT(*) FROM function_presence "  # noqa: S608
+        f"WHERE diff_id IN ({scope}) GROUP BY diff_id, side, presence_state",
+        params,
+    ):
+        one_sided.setdefault(did, {}).setdefault(side, {})[state or "unrecorded"] = n
     cache = _GenerationCache(atlas)
     diffs: list[dict[str, Any]] = []
     for r in rows:
@@ -769,17 +799,59 @@ def list_diffs(
         if _is_whole_run_row(row["diff_id"], row["run_a_id"], row["run_b_id"]):
             continue  # a leftover run-pair row: it describes no binary, so it answers nothing
         meta = dict(zip(_STAMP_COLS, r[len(_LIST_DIFFS_COLS) :], strict=True))
+        undetermined = int(row.pop("alignment_undetermined") or 0)
+        if row["diff_ok"]:
+            row["functions"] = {
+                "aligned": int(row["matched_pairs"] or 0) - undetermined,
+                "aligned_similarity_below_1": int(below_1.get(row["diff_id"], 0)),
+                "alignment_undetermined": undetermined,
+                "one_sided": one_sided.get(row["diff_id"], {}),
+            }
+            row["blind_spot"] = None
+        else:
+            # A diff that did not run has no counts to give: zeros would read as "nothing moved".
+            row["functions"] = None
+            row["blind_spot"] = "did_not_diff"
         # ★ Either side moving makes the diff a statement about inputs that are gone. An
         # unanswerable side does not make it stale — it makes it unverified, which is said out loud
         # rather than rounded to either answer.
         row["source_stale"], row["source_stale_reason"] = diff_staleness(cache, meta)
         row["toolchain_checked"] = toolchain_checked()
         diffs.append(row)
-    return {
+    result: dict[str, Any] = {
         "diffs": diffs,
         "count": len(diffs),
         "filters": {"run_a_id": run_a_id, "run_b_id": run_b_id},
         "note": _LIST_DIFFS_NOTE,
+    }
+    if run_a_id is not None and run_b_id is not None:
+        result["coverage"] = run_pair_coverage(atlas, run_a_id, run_b_id, diffs)
+    return result
+
+
+def run_pair_coverage(
+    atlas: sqlite3.Connection, run_a: str, run_b: str, diffs: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """What the diffs of one run pair cannot see, beside their counts: the diffs that failed, and
+    the candidate-holding binaries no diff covers — the genuine blind spots (one side only, or
+    shadowed by a same-named binary that was diffed) apart from the binaries byte-identical in both
+    runs, which needed no diff and are only a pointer to the scan's candidate map.
+    ``all_candidate_binaries_covered`` is false while a failed diff or a genuine blind spot
+    remains; an identical binary never makes it false."""
+    blind, identical = split_not_diffed(not_diffed_binaries(atlas, run_a, run_b))
+    failed = [d["diff_id"] for d in diffs if not d["diff_ok"]]
+    return {
+        "failed_diffs": failed,
+        "not_diffed_binaries": blind,
+        "identical_binaries": identical,
+        "all_candidate_binaries_covered": not failed and not blind,
+        "see": (
+            "list_diff_blindspots for the failed diffs. identical_binaries are byte-identical in "
+            f"both runs, so no diff covers them and none can show what is in them — their "
+            f"candidates are on the scan's candidate map: list_candidates(run_id={run_b!r}). "
+            "get_diff_sink_overlay's binary_not_diffed rows still include those identical "
+            "binaries; this split is the one to read as blind spots."
+        ),
     }
 
 
@@ -862,6 +934,105 @@ def list_diff_blindspots(
         "retry_limit": retry_limit,
         "note": _BLINDSPOT_NOTE,
     }
+
+
+# ── the binaries no diff of a run pair covers (one classifier, shared) ──────────────────────
+
+# Why a candidate whose binary was not diffed sits where it does. The two blind-spot reasons mirror
+# the run-pair reasons lib/query/sink_overlay emits for get_diff_sink_overlay; identical_both_sides
+# is the finer split that map does not make — a binary byte-for-byte present on the OTHER side was
+# not diffed because there was nothing to diff, so it is no blind spot. One classifier, read by the
+# review progress block, list_diffs and the diff command alike, so they cannot disagree.
+NOT_DIFFED_IDENTICAL = "identical_both_sides"
+NOT_DIFFED_BLIND = ("binary_not_diffed", "shadowed_by_name_collision")
+
+
+def _short_name(path: str | None) -> str | None:
+    """A binary path's short name (its basename), matched against diff_meta.binary_a / binary_b."""
+    return path.rsplit("/", 1)[-1] if path else None
+
+
+def not_diffed_reason(
+    sha: str | None, name: str | None, *, diffed_names: set[str], other_shas: set[str]
+) -> str:
+    """Why a candidate whose binary content is not among the pair's diffed hashes is where it is.
+    Identical content on the other side is not a blind spot; a same-named binary that WAS diffed
+    shadowed it; otherwise the binary is on this side only."""
+    if sha is not None and sha in other_shas:
+        return NOT_DIFFED_IDENTICAL
+    if name in diffed_names:
+        return "shadowed_by_name_collision"
+    return "binary_not_diffed"
+
+
+def not_diffed_binaries(atlas: sqlite3.Connection, run_a: str, run_b: str) -> dict[str, Any]:
+    """The binaries holding candidates that no diff of the pair covers, read straight from the atlas
+    — diff_meta for what was diffed, instance for every candidate — WITHOUT recomputing the pair's
+    sink overlay (which rebuilds every diff; this reads the same set, by content hash).
+
+    Per side and reason: how many binaries (by path), how many candidates, and every binary's short
+    name. A candidate whose binary content is present on the OTHER side too is identical across the
+    pair and reads as ``identical_both_sides``, kept apart from the two genuine blind-spot reasons
+    (``binary_not_diffed``, ``shadowed_by_name_collision``) so it never counts as one."""
+    diffs = atlas.execute(
+        "SELECT sha256_a, sha256_b, binary_a, binary_b FROM diff_meta "
+        "WHERE run_a_id = ? AND run_b_id = ?",
+        (run_a, run_b),
+    ).fetchall()
+    run_shas = {
+        side: {
+            sha
+            for (sha,) in atlas.execute(
+                "SELECT DISTINCT binary_content_hash FROM instance WHERE source_run_id = ?", (run,)
+            )
+            if sha
+        }
+        for side, run in (("a", run_a), ("b", run_b))
+    }
+    out: dict[str, Any] = {}
+    for side, run, sha_col, name_col in (("a", run_a, 0, 2), ("b", run_b, 1, 3)):
+        diffed_sha = {d[sha_col] for d in diffs if d[sha_col]}
+        diffed_names = {d[name_col] for d in diffs if d[name_col]}
+        other_shas = run_shas["b" if side == "a" else "a"]
+        groups: dict[str, dict[str, set[str | None]]] = {}
+        for ref, sha, path in atlas.execute(
+            "SELECT evidence_ref, binary_content_hash, binary_path FROM instance "
+            "WHERE source_run_id = ?",
+            (run,),
+        ):
+            if sha is not None and sha in diffed_sha:
+                continue  # its binary content was one side of a diff — covered
+            reason = not_diffed_reason(
+                sha, _short_name(path), diffed_names=diffed_names, other_shas=other_shas
+            )
+            g = groups.setdefault(reason, {"refs": set(), "paths": set()})
+            g["refs"].add(ref)
+            g["paths"].add(path)
+        for reason, g in sorted(groups.items()):
+            out.setdefault(side, {})[reason] = {
+                "binaries": len(g["paths"]),
+                "candidates": len(g["refs"]),
+                "names": sorted({_short_name(p) or "(no path recorded)" for p in g["paths"]}),
+            }
+    return out
+
+
+def split_not_diffed(
+    not_diffed: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """``(blind, identical)`` of a :func:`not_diffed_binaries` result: the genuine blind spots
+    (one side only, or shadowed by a same-named binary that was diffed) per side and reason, and —
+    apart, as counts only — the binaries byte-identical on both sides, which needed no diff."""
+    blind: dict[str, Any] = {}
+    identical: dict[str, Any] = {}
+    for side, by_reason in not_diffed.items():
+        mine = {r: v for r, v in by_reason.items() if r in NOT_DIFFED_BLIND}
+        if mine:
+            blind[side] = mine
+        same = by_reason.get(NOT_DIFFED_IDENTICAL)
+        if same is not None:
+            identical[side] = {"binaries": same["binaries"], "candidates": same["candidates"]}
+    return blind, identical
 
 
 _PARTIAL_COLS = (

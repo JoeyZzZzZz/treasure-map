@@ -31,6 +31,21 @@ def test_an_address_shift_normalises_but_a_small_constant_does_not() -> None:
     assert sm.normalize_pseudocode(dec) != sm.normalize_pseudocode(dec2)  # 256->255 is not hidden
 
 
+def test_the_switch_and_branch_labels_normalise_too() -> None:
+    """Ghidra writes a switch label as switchD_<addr>_caseD_<n> and a branch label as
+    joined_r0x<addr> / code_r0x<addr>: two identical functions whose code moved differ only there
+    and must read the same — while the case number itself stays.
+
+    MUTATION: end the address at a word boundary (no mid-name address) or drop the ``r0x`` form ->
+    RED."""
+    a = "goto switchD_004492cc_caseD_3; if (x) goto joined_r0x00449e60; y = code_r0x00449e70;"
+    b = "goto switchD_00449338_caseD_3; if (x) goto joined_r0x00449ecc; y = code_r0x00449ee0;"
+    assert sm.normalize_pseudocode(a) == sm.normalize_pseudocode(b)
+    assert sm.normalize_pseudocode("switchD_004492cc_caseD_3;") != sm.normalize_pseudocode(
+        "switchD_004492cc_caseD_4;"
+    )
+
+
 def test_pair_reading_tells_no_body_apart_from_an_empty_body() -> None:
     """A reader must not have to recompute WHY a body was missing: ``no_body`` (a side absent from
     the functions table — an import/PLT stub) is kept apart from ``unavailable`` (present, empty).

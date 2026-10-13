@@ -1265,19 +1265,45 @@ def _summary(binary: str, changed: int, unchanged: int, undetermined: int) -> dr
     )
 
 
-def test_the_cli_says_when_a_binary_has_nothing_to_compare(
+def test_the_cli_prints_each_binarys_function_split_and_the_pairs_coverage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Three zero counts mean no string-keyed edge on either side, not 'nothing changed'; the
-    refreshed baselines get their own line.
+    """★ Each diffed binary's line is its functions as the view's facts split them — no string-keyed
+    edge counts, and 'no scoped signal' never written as noise; a diff that did not run prints
+    BLIND SPOT, never zeros. The roll-up names what no diff of the pair covers, with the binaries
+    byte-identical in both runs kept apart (a pointer to the scan map, never a blind spot).
 
-    MUTATION (verified RED): print the three counts as before -> "0 changed / 0 unchanged"."""
+    MUTATION: print the edge counts as before -> RED; print counts for the failed diff -> RED;
+    treat identical binaries as not covered -> RED."""
     from treasure_map.cli.main import main
+    from treasure_map.lib.query import diff_align, patch_view
+
+    states = {
+        _did("liba"): {
+            "withheld": False,
+            "aligned": 9,
+            "unchanged": 5,
+            "changed": {"total": 3, "with_scoped_sink_delta": 1, "no_scoped_signal": 2},
+            "unverified": {"total": 1, "identical_callee_unverified": 1, "unavailable": 0},
+            "no_body": 0,
+            "alignment_undetermined": 2,
+            "one_sided": {"b": {"unmatched_analysis_complete": 4}},
+        },
+        _did("libb"): {"withheld": True, "banners": ["diff_undetermined:diff_failed"]},
+    }
+    monkeypatch.setattr(patch_view, "function_states", lambda atlas, did: states.get(did))
+    coverage = {
+        "failed_diffs": [],
+        "not_diffed_binaries": {},
+        "identical_binaries": {"b": {"binaries": 7, "candidates": 30}},
+        "all_candidate_binaries_covered": True,
+    }
+    monkeypatch.setattr(diff_align, "list_diffs", lambda *a, **k: {"coverage": coverage})
 
     def fake_full(atlas: Any, a: str, b: str, **kw: Any) -> driver.FullDiffSummary:
         oks = (
-            driver.BinaryDiffOutcome("liba", _summary("liba", 0, 0, 0), None),
-            driver.BinaryDiffOutcome("libb", _summary("libb", 2, 1, 0), None),
+            driver.BinaryDiffOutcome("liba", _summary("liba", 2, 1, 0), None),
+            driver.BinaryDiffOutcome("libb", _summary("libb", 0, 0, 0), None),
         )
         for i, o in enumerate(oks, start=1):
             kw["on_outcome"](i, len(oks), o)
@@ -1291,19 +1317,32 @@ def test_the_cli_says_when_a_binary_has_nothing_to_compare(
         ["diff", "--before", "run_a", "--after", "run_b", "--atlas", str(tmp_path / "atlas.db")],
     )
     assert res.exit_code == 0, res.output
-    assert "liba: no string-keyed edges (0 subjects)" in res.output
-    assert "libb: 2 edges changed / 1 unchanged / 0 undetermined" in res.output
-    assert "0 changed / 0 unchanged" not in res.output
+    assert (
+        "liba: 9 aligned: 5 unchanged, 3 changed (1 with a scoped sink delta, 2 no scoped "
+        "signal), 1 unverified, 0 no body; 2 alignment undetermined; no counterpart — B 4 "
+        "unmatched_analysis_complete" in res.output
+    )
+    assert "libb: BLIND SPOT (did not diff)" in res.output
+    assert "edges changed" not in res.output and "noise" not in res.output
+    assert "7 candidate-holding binaries are byte-identical in both runs" in res.output
+    assert "tmap triage run_b" in res.output
+    assert "every candidate-holding binary is diffed or byte-identical" in res.output
     assert "baselines refreshed (unchanged diffs): 1, 0 refused" in res.output
 
 
-def test_the_diff_listing_counts_edges_not_functions(tmp_path: Path) -> None:
+def test_the_diff_listing_counts_functions_and_leaves_edges_to_their_view(tmp_path: Path) -> None:
+    """The listing leads with functions, says similarity 1 is not 'unchanged', and points at
+    get_diff_deltas for the string-keyed edges rather than counting them.
+
+    MUTATION: describe the rows as edge counts again -> RED."""
     from treasure_map import mcp_app
 
     note = diff_align._LIST_DIFFS_NOTE
-    assert "string_keyed_edge" in note and "aligned functions" not in note
+    assert "FUNCTIONS" in note and "Similarity 1 is NOT 'unchanged'" in note
+    assert "get_diff_deltas" in note and "switchable view" in note and "layer_changed" not in note
     doc = mcp_app.make_tools(tmp_path / "x.db")["list_diffs"].__doc__ or ""
-    assert "string_keyed_edge" in doc and "how much each moved" not in doc
+    assert "get_diff_deltas" in doc and "switchable view" in doc
+    assert "layer_changed / layer_unchanged" not in doc
 
 
 # ── what code and which toolchain computed a diff (no hand-bumped version) ─────────────────────

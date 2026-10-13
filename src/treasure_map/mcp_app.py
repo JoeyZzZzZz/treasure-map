@@ -1744,9 +1744,16 @@ def make_tools(
         Order: A, then the R / B entries carrying a candidate (by ``tier`` — the candidates'
         sink-impact tier — then R before B), then the entries with no candidate, then P; each
         entry's ``rank_key`` names the components. ``sort_by`` (``tier`` / ``similarity`` /
-        ``address``) puts one component first. Filters: ``bucket``, ``subclass`` (an entry's or any
-        of its rows'), ``tier`` (a number, ``no_sink`` or ``unknown``), ``blind_spot`` (a key of
-        the ``blind_spots`` ledger — page through the entries it covers). Page with ``limit``
+        ``address``) puts one component first. ``sort_by='significance'`` is a lens, not a
+        relabel: attention 0 = bucket A or a row carrying ``sink_arg_constant_delta``; 2 (sunk,
+        still listed) = pseudocode_sameness ``identical`` or bucket C; 1 = the rest, lowest
+        similarity first. Never sunk: an R entry, a ``sink_present_no_visible_delta`` B (labelled
+        ``recheckable_no_visible_delta``), and an entry judged changed_real, inconclusive or due a
+        re-check / relabel; with ``band=true`` the judgement band orders entries inside each tier.
+        Each entry then carries ``significance`` (its tier and why) — never a verdict. Filters:
+        ``bucket``, ``subclass`` (an entry's or any of its rows'), ``tier`` (a number, ``no_sink``
+        or ``unknown``), ``blind_spot`` (a key of the ``blind_spots`` ledger — page through the
+        entries it covers). Page with ``limit``
         (1-2000, default 200) / ``offset``; follow ``next_offset`` until null.
 
         Each entry carries its candidate overlay rows (as get_diff_sink_overlay states them, each
@@ -2038,7 +2045,15 @@ def make_tools(
         read it as 'no change'; it compares only the analysis-tool version, not the firmware. A NULL
         ``ghidra_version`` = that side recorded none. ``unmatched_b`` = B-side functions with no
         A-side match (the presence layer, the WEAKEST signal -- to find changes start with
-        get_diff_patch_view; string-keyed edge ``layer_changed`` is via get_diff_deltas, not this).
+        get_diff_patch_view; string-keyed edges are a switchable view, get_diff_deltas).
+        ★ ``functions`` splits this diff's functions by the view's own facts: ``unchanged``
+        (pseudocode AND callees match), ``changed`` (``with_scoped_sink_delta`` = bucket A or a
+        changed sink length constant; ``no_scoped_signal`` = no in-scope sink signal, NOT
+        'noise'), ``unverified`` (identical_callee_unverified + unavailable — neither unchanged nor
+        changed), ``no_body`` (an import / PLT stub, counted apart), ``alignment_undetermined``,
+        and ``one_sided`` by presence_state (never 'added' / 'removed'). ``withheld`` = the whole
+        diff is undetermined: no counts, a blind spot (``blind_spot='did_not_diff'`` when it
+        failed). It reads pseudocode, so it costs what one get_diff_patch_view does.
         ★ ``diff_ok=0`` means this binary did NOT diff (``diff_status='failed'``,
         ``diff_status_reason`` = why, ``diff_attempts`` = tries): an empty get_diff_deltas for it
         is a BLIND SPOT, never 'no change' (list_diff_blindspots).
@@ -2099,25 +2114,32 @@ def make_tools(
 
     def list_diffs(run_a_id: str | None = None, run_b_id: str | None = None) -> dict[str, Any]:
         """Browse the version diffs in the atlas: one row per binary diffed between two runs, with
-        matched_pairs, version_skew, the string-keyed edge counts (layer_changed / layer_unchanged /
-        delta_undetermined) AND its diff status (diff_ok / diff_status / diff_status_reason /
-        diff_attempts). Optionally filter to a run-pair. ``baseline_dropped=1`` = the diff had a
-        stored candidate baseline that a re-diff dropped (it failed, or the baseline could not be
-        stored again). The entry point after a full diff — see which binaries were compared and
-        which FAILED to diff, then open one with get_diff_patch_view (get_diff_deltas for its
-        string-keyed edges, get_diff_meta).
+        matched_pairs, version_skew, its ``functions`` counts AND its diff status (diff_ok /
+        diff_status / diff_status_reason / diff_attempts). Optionally filter to a run-pair.
+        ``baseline_dropped=1`` = the diff had a stored candidate baseline that a re-diff dropped (it
+        failed, or the baseline could not be stored again). The entry point after a full diff —
+        see which binaries were compared and which FAILED to diff, then open one with
+        get_diff_patch_view (get_diff_meta for the per-function split).
 
-        ★ The three counts are the binary's string-keyed dispatch edges
-        (reachability.string_keyed_edge), NOT functions. All three 0 means neither side has such an
-        edge: nothing was compared, which is NOT 'unchanged'. How much a function moved is the
-        similarity in get_function_alignment; whether a sink call is still there is
-        get_diff_sink_overlay.
+        ★ ``functions`` is read from what the diff stored, at no cost: ``aligned`` pairs, how many
+        of them scored below similarity 1 (``aligned_similarity_below_1``),
+        ``alignment_undetermined``, and ``one_sided`` functions by presence_state (never 'added' /
+        'removed'). Similarity 1 is NOT 'unchanged' — BinDiff is blind to constants and buffer
+        sizes; whether an aligned pair really changed (unchanged / changed / unverified / no_body)
+        is per diff, in get_diff_meta. The string-keyed dispatch edges are a switchable view,
+        get_diff_deltas, not counted here.
 
-        ★ Counts are tri-state PROJECTIONS, never verdicts or a ranking: ``layer_changed`` is not
-        proof the change matters, and an EMPTY list means no diff has been run for that filter --
-        not 'nothing changed'. ★ A ``diff_ok=0`` row is a BLIND SPOT (the binary did not diff --
-        diff_status_reason says why): its zero counts are 'unknown', NOT 'no change'. Use
-        list_diff_blindspots to focus just the un-diffed binaries.
+        ★ Counts are PROJECTIONS, never verdicts or a ranking, and an EMPTY list means no diff has
+        been run for that filter -- not 'nothing changed'. ★ A ``diff_ok=0`` row is a BLIND SPOT
+        (``blind_spot='did_not_diff'``; diff_status_reason says why): it carries no counts
+        (``functions`` null), never zeros. Use list_diff_blindspots to focus just the un-diffed
+        binaries. ★ With both run ids, ``coverage`` lists what no diff of the pair can see: the
+        failed diffs and the candidate-holding binaries no diff covers (one side only / shadowed by
+        a same-named diffed binary), with the binaries byte-identical in both runs kept apart —
+        they needed no diff, their candidates are on the scan map (list_candidates) — so
+        ``all_candidate_binaries_covered`` is false only for a real gap. Read those blind spots
+        here, not as get_diff_sink_overlay's binary_not_diffed rows, which still include the
+        identical binaries.
 
         ★ Each row's ``source_stale`` says whether the diff still describes what it was computed
         from. true, with ``source_stale_reason``: ``source_binary_absent`` /
