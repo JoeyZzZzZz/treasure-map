@@ -126,6 +126,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: `tmap diff` takes the two runs as roles, `--before <run_id> --after <run_id>`.**
+  The positional form `tmap diff X Y` is refused (exit 2) with the command that replaces it, ready
+  to copy, carrying the other options given. `--before` is side A and `--after` side B, as before;
+  diff ids and stored diffs are unchanged. A refusal from the diff that names run A or run B now
+  ends with `(A = --before, B = --after)`.
+  - A diff asked for in the direction opposite to diffs already recorded for the two runs is
+    refused as the likely sign of swapped options, before anything runs; `--allow-reverse` diffs
+    in that direction anyway.
+  - `list_diffs`, `list_diff_blindspots` and `get_diff_sink_overlay` (run-pair mode), given a pair
+    no diff records in that direction while some record it the other way round, add
+    `reverse_direction_diffs` (how many) and `reverse_direction_note`. Nothing is swapped.
+
+- **`tmap diff` rescans a run proven out of date before diffing it.** Previously such a run was
+  refused with the `tmap rescan` command to run. Now, unless `--no-rescan` is given, the diff runs
+  `tmap rescan` on that run (and only that run) first, after saying for each one what is out of
+  date, what the rescan costs (the same tiers `tmap rescan` reports), how many other diffs of the
+  run it affects, and, when the decompiler will run, that evidence refs may be re-keyed.
+  - Everything that would refuse the diff is checked on both runs before any rescan: an unknown
+    run, swapped roles, a `--binary` that does not resolve, a scan that did not finish (refused,
+    never rescanned: it may still be running), an analysis.db holding another extraction than the
+    run row, and a run that cannot be rescanned (no firmware root, a firmware root that is gone, a
+    workspace outside `workspace_dir`).
+  - A run whose currency cannot be confirmed either way (an install with no recorded commit, a
+    mixed or missing stamp) is diffed as it is, with a warning naming the run and its role; diffing
+    it again never rescans it.
+  - After the rescan the two runs are checked once more; a run still out of date, or tool versions
+    that now differ without `--force`, refuse the diff. At most one rescan per command. Ctrl-C
+    during the rescan stops the command (exit 130) before the diff starts.
+
 - **What computed a stored diff is recorded and compared by itself; nothing is bumped by hand.**
   - The diff code version is a hash of the Python code that writes the diff (comments, docstrings
     and formatting do not count; the same under every supported Python). The stored baseline's

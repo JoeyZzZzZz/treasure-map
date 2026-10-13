@@ -1241,8 +1241,11 @@ def test_the_cli_passes_assume_current_through(
         return driver.FullDiffSummary(plan, (), cancelled=False, warnings=("a note",))
 
     monkeypatch.setattr(driver, "run_full_diff", fake_full)
+    _two(tmp_path)  # the command reads both run rows before it diffs
     res = CliRunner().invoke(
-        main, ["diff", "run_a", "run_b", "--assume-current", "--atlas", str(tmp_path / "x.db")]
+        main,
+        ["diff", "--before", "run_a", "--after", "run_b", "--assume-current"]
+        + ["--atlas", str(tmp_path / "atlas.db")],
     )
     assert res.exit_code == 0, res.output
     assert seen["assume_current"] is True
@@ -1282,7 +1285,11 @@ def test_the_cli_says_when_a_binary_has_nothing_to_compare(
         return driver.FullDiffSummary(plan, oks, cancelled=False, baselines_refreshed=("libc",))
 
     monkeypatch.setattr(driver, "run_full_diff", fake_full)
-    res = CliRunner().invoke(main, ["diff", "run_a", "run_b", "--atlas", str(tmp_path / "x.db")])
+    _two(tmp_path)  # the command reads both run rows before it diffs
+    res = CliRunner().invoke(
+        main,
+        ["diff", "--before", "run_a", "--after", "run_b", "--atlas", str(tmp_path / "atlas.db")],
+    )
     assert res.exit_code == 0, res.output
     assert "liba: no string-keyed edges (0 subjects)" in res.output
     assert "libb: 2 edges changed / 1 unchanged / 0 undetermined" in res.output

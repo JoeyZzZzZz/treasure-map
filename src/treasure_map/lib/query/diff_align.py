@@ -706,6 +706,30 @@ _LIST_DIFFS_COLS = (
 )
 
 
+def pair_diffs(atlas: sqlite3.Connection, run_a_id: str, run_b_id: str) -> tuple[int, str | None]:
+    """How many diff rows record ``run_a_id`` as the A side and ``run_b_id`` as the B side, and the
+    smallest of their ids (None when there is none). Every row counts, failed ones included: a
+    failed diff was still asked for in that direction."""
+    row = atlas.execute(
+        "SELECT COUNT(*), MIN(diff_id) FROM diff_meta WHERE run_a_id = ? AND run_b_id = ?",
+        (run_a_id, run_b_id),
+    ).fetchone()
+    return int(row[0]), row[1]
+
+
+def reverse_direction_diffs(atlas: sqlite3.Connection, run_a_id: str, run_b_id: str) -> int:
+    """How many diffs record the two runs the other way round, when NONE records them this way
+    round; 0 otherwise.
+
+    A and B are the before and after roles, and a diff is not symmetric in them. A pair asked for
+    in the direction nothing was diffed in, while diffs exist in the other, is most often the two
+    roles passed swapped; the count lets a reader say so without answering for the other
+    direction. A run paired with itself has no other way round."""
+    if run_a_id == run_b_id or pair_diffs(atlas, run_a_id, run_b_id)[0]:
+        return 0
+    return pair_diffs(atlas, run_b_id, run_a_id)[0]
+
+
 def list_diffs(
     atlas: sqlite3.Connection,
     run_a_id: str | None = None,

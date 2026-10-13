@@ -86,6 +86,9 @@ from treasure_map.lib.query.diff_align import get_diff_deltas as _get_diff_delta
 from treasure_map.lib.query.diff_align import get_diff_meta as _get_diff_meta
 from treasure_map.lib.query.diff_align import list_diff_blindspots as _list_diff_blindspots
 from treasure_map.lib.query.diff_align import list_diffs as _list_diffs
+from treasure_map.lib.query.diff_align import (
+    reverse_direction_diffs as _reverse_direction_diffs,
+)
 from treasure_map.lib.query.diff_align import staleness_summary as _staleness_summary
 from treasure_map.lib.query.diff_align import toolchain_checked as _toolchain_checked
 from treasure_map.lib.query.patch_view import get_diff_patch_view as _get_diff_patch_view
@@ -655,6 +658,25 @@ def make_tools(
                 err["run_lineage"] = _lineage_inline(run)
                 return err
         return None
+
+    def _reverse_hint(
+        atlas: sqlite3.Connection, run_a: str | None, run_b: str | None, names: tuple[str, str]
+    ) -> dict[str, Any]:
+        """``reverse_direction_diffs`` + its note when the two runs were asked for in the direction
+        no diff records while diffs record the other one, else nothing. The note uses the calling
+        tool's own parameter ``names``. Nothing is swapped: the answer stays the one asked for."""
+        if run_a is None or run_b is None:
+            return {}
+        n = _reverse_direction_diffs(atlas, run_a, run_b)
+        if not n:
+            return {}
+        return {
+            "reverse_direction_diffs": n,
+            "reverse_direction_note": (
+                f"{names[0]} / {names[1]} are the before / after roles; {n} diffs exist with them "
+                "the other way round. Pass them swapped to read those."
+            ),
+        }
 
     def _stale_run_index(atlas: sqlite3.Connection) -> dict[str, dict[str, Any]]:
         """Every PROVABLY stale run in this atlas, keyed by run_id, each with its refusal detail.
@@ -1764,6 +1786,10 @@ def make_tools(
             same-named, different-content binary that was diffed (``shadowed_by_name_collision``).
             Those rows carry ``diff_id: null``. Both runs are checked for staleness. This mode
             recomputes every diff of the pair, so it takes on the order of ten-plus seconds.
+            ``run_a`` / ``run_b`` are the before / after roles: when no diff records them in that
+            direction and some record them the other way round, the answer carries
+            ``reverse_direction_diffs`` (how many) and ``reverse_direction_note``; nothing is
+            swapped.
 
         Response size — ``detail``:
           * ``"summary"`` (default): NO rows. ``summary`` counts the filtered rows — ``total_rows``,
@@ -1893,6 +1919,8 @@ def make_tools(
                 "detail": detail,
                 "coverage": asdict(result.coverage),
             }
+            if by_runs:
+                out.update(_reverse_hint(conn, run_a, run_b, ("run_a", "run_b")))
             # Whether each diff the rows come from still describes its inputs: one answer for a
             # single diff, per row (by its own diff) plus counts for a run pair.
             stale_by_diff: dict[str, dict[str, Any]] = {}
@@ -2051,10 +2079,17 @@ def make_tools(
         (the source could not be read) — NOT a clean bill. false: checked and current. The first
         applicable reason in that order is the one reported. ``toolchain_checked=false``: this
         server could not read the installed toolchain, so a diff computed by other tool versions
-        is not told apart (source_stale is not made null for it)."""
+        is not told apart (source_stale is not made null for it).
+
+        ★ ``run_a_id`` / ``run_b_id`` are the before / after roles. When both are given, none is
+        recorded in that direction and some are recorded the other way round, the answer carries
+        ``reverse_direction_diffs`` (how many) and ``reverse_direction_note``; nothing is
+        swapped."""
         conn = open_atlas(atlas_path)
         try:
-            return _list_diffs(conn, run_a_id, run_b_id)
+            out = _list_diffs(conn, run_a_id, run_b_id)
+            out.update(_reverse_hint(conn, run_a_id, run_b_id, ("run_a_id", "run_b_id")))
+            return out
         finally:
             conn.close()
 
@@ -2087,10 +2122,17 @@ def make_tools(
         ``unmatched_analysis_incomplete`` or ``alignment_undetermined`` in the diff, and every
         delta / overlay row resting on them is undetermined with reason
         ``degenerate_block_source``. Each row gives the per-side export counts and
-        ``marked_rows``."""
+        ``marked_rows``.
+
+        ★ ``run_a_id`` / ``run_b_id`` are the before / after roles. When both are given, none is
+        recorded in that direction and some are recorded the other way round, the answer carries
+        ``reverse_direction_diffs`` (how many) and ``reverse_direction_note``; nothing is
+        swapped."""
         conn = open_atlas(atlas_path)
         try:
-            return _list_diff_blindspots(conn, run_a_id, run_b_id)
+            out = _list_diff_blindspots(conn, run_a_id, run_b_id)
+            out.update(_reverse_hint(conn, run_a_id, run_b_id, ("run_a_id", "run_b_id")))
+            return out
         finally:
             conn.close()
 

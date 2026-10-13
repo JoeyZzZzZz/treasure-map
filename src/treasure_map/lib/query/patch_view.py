@@ -818,12 +818,23 @@ class _Builder:
                 e.facts.append(f"source_gap:{family}")
 
     def _tier(self, rows: list[SinkOverlayRow]) -> int | str:
-        """The highest impact tier of the entry's candidates, each side's class read from its own
-        candidate record; ``unknown`` when no class could be read."""
+        """The highest impact tier of the entry's candidates; ``unknown`` when no class could be
+        read.
+
+        A row carries its own candidate's class (``sink_class``), so that side is never looked up:
+        a candidate record that resolves to several classes cannot take away the class the row
+        already states. Only the other side's candidate is read from its own record, and when that
+        cannot be read (no record, or records that disagree) only that side drops out. A row naming
+        a candidate on both sides does not record which of the two it carries, so both are read;
+        the one that is its own adds nothing new."""
         tiers = [
             impact_tier(cls)
             for r in rows
-            for cls in (self.class_of("a", r.a_ref), self.class_of("b", r.b_ref))
+            for cls in (
+                r.sink_class or None,
+                self.class_of("a", r.a_ref) if r.b_ref else None,
+                self.class_of("b", r.b_ref) if r.a_ref else None,
+            )
             if cls is not None
         ]
         return max(tiers) if tiers else UNKNOWN

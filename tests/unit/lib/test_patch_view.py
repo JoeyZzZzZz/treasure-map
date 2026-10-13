@@ -466,15 +466,25 @@ def test_a_wrapper_row_is_tiered_by_the_class_it_forwards_to(world: World) -> No
     assert e["tier"] == 3
 
 
-def test_a_ref_whose_rows_disagree_on_the_class_has_no_tier(world: World) -> None:
-    """Two candidate rows under one ref with different classes: that side's class is unknown, and
-    an entry with no readable class is ``unknown`` (sorted ahead, never below a known tier)."""
+def test_a_rows_own_class_is_read_from_the_row_not_from_its_candidate_records(
+    world: World,
+) -> None:
+    """The ref of a cmd row also carries a log candidate, so its candidate records disagree on the
+    class; the entry also holds a plain log row. The cmd row still states its own class, so the
+    entry is tiered cmd — only a lookup of the OTHER side's candidate can come back unreadable.
+
+    MUTATION (verified RED): read the row's own side from its candidate records too -> both rows
+    under the ref drop out and the entry is tiered by the log row (1)."""
     ref = _ref("runA", "00020000", "cmd", "0x10")
-    world.inst("a", ref, "copy", "strcpy")
+    world.inst("a", ref, "log", "syslog")
+    world.inst("a", _ref("runA", "00020000", "log", "0x30"), "log", "syslog")
     world.commit()
     e = _entry(world, _pair_id("00020000", "00021000"))
-    assert e["tier"] == "unknown"
-    assert len(e["rows"]) == 2 and {r["class_a"] for r in e["rows"]} == {"unknown"}
+    assert e["tier"] == 3
+    under_ref = [r for r in e["rows"] if r["a_ref"] == ref]
+    assert sorted(r["sink_class"] for r in under_ref) == ["cmd", "log"]
+    # The row view's per-side class is still read from the candidate records.
+    assert {r["class_a"] for r in under_ref} == {"unknown"}
 
 
 # ── the second signal: callee sets ───────────────────────────────────────────────────────────

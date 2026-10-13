@@ -9,13 +9,15 @@ top-level commands; not a file-per-analyzer.
 from __future__ import annotations
 
 import logging
+import shlex
 import sqlite3
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import click
 
-from treasure_map.lib.errors import ConfigError
+from treasure_map.lib.errors import ConfigError, TreasureMapError
 from treasure_map.version import UNKNOWN_VERSION, installed_commit
 
 if TYPE_CHECKING:
@@ -199,11 +201,322 @@ def _echo_full_diff(fsum: Any, resolved_atlas: Path) -> None:
     )
 
 
+# ── tmap diff ─────────────────────────────────────────────────────────────────────────────────
+
+_DIFF_USAGE = "usage: tmap diff --before <run_id> --after <run_id> [options]"
+# The driver names the two sides A and B in what it refuses; this says which option is which.
+_DIFF_ROLES = "(A = --before, B = --after)"
+# Said whenever the rescan a diff starts will run the decompiler: a re-extraction can re-key the
+# evidence refs that durable judgements are anchored on.
+_REKEY_WARNING = (
+    "This re-extracts (the decompiler runs): evidence refs may be re-keyed, so annotations and "
+    "ruler anchors may lose their anchor. Back up the atlas first, and run the gates and the "
+    "ruler after the rescan. To do it yourself later, add --no-rescan."
+)
+_DIFF_SKEW = (
+    "the two runs were produced by different tmap/Ghidra versions (or a version was not "
+    "recorded), so every delta would be version_skew undetermined. Re-scan both with the same "
+    "toolchain, or pass --force to diff anyway (the result stays honestly degraded)."
+)
+
+
+def _legacy_diff_refusal(ctx: click.Context, legacy: tuple[str, ...]) -> click.UsageError:
+    """The refusal for the positional form ``tmap diff X Y``.
+
+    Two values and no role option given: the command that replaces it, ready to copy, carrying
+    every other option of this invocation. Anything else cannot be read as the two roles without a
+    guess, so it gets the usage line."""
+    if len(legacy) != 2 or ctx.params.get("before") or ctx.params.get("after"):
+        return click.UsageError(_DIFF_USAGE, ctx=ctx)
+    words = ["tmap", "diff", "--before", legacy[0], "--after", legacy[1]]
+    for param in ctx.command.params:
+        if not isinstance(param, click.Option) or param.name in ("before", "after"):
+            continue
+        value = ctx.params.get(param.name or "")
+        flag = next(o for o in param.opts if o.startswith("--"))
+        if param.is_flag:
+            if value:
+                words.append(flag)
+        elif value is not None:
+            words += [flag, str(value)]
+    command = " ".join(shlex.quote(w) for w in words)
+    return click.UsageError(f"tmap diff now takes the two runs as roles: `{command}`", ctx=ctx)
+
+
+def _driver_refusal(exc: TreasureMapError) -> click.ClickException:
+    """A driver error as the CLI states it; a ConfigError may name the sides A and B, so it says
+    which option each one is."""
+    roles = f" {_DIFF_ROLES}" if isinstance(exc, ConfigError) else ""
+    return click.ClickException(f"{type(exc).__name__}: {exc}{roles}")
+
+
+@dataclass(frozen=True)
+class _DiffRescan:
+    """One run the diff rescans first, and what to tell the user about it before it starts."""
+
+    role: str
+    run: RunRow
+    axis: str
+    why: str
+    rebuilds: bool  # the decompiler runs: a re-extraction, a whole scan, or a missing extraction
+    other_diffs: int
+
+
+def _diff_rescan_plan(
+    *,
+    before: str,
+    after: str,
+    binary_name: str | None,
+    no_rescan: bool,
+    allow_reverse: bool,
+    resolved_atlas: Path,
+    workspace_dir: Path,
+) -> list[_DiffRescan]:
+    """Every refusal a diff can give before it starts, and the runs it has to rescan first.
+
+    Both runs are checked to the end before anything runs: a run that cannot be diffed must not be
+    found after the other one has spent a rescan. Only a run PROVEN out of date is rescanned; one
+    whose currency cannot be confirmed either way is diffed as it is, with a warning — so diffing
+    the same pair twice never rescans anything the second time.
+
+    Raises ``click.ClickException`` on a refusal."""
+    from treasure_map.lib.analyze.ghidra_runner import current_pass_version
+    from treasure_map.lib.atlas.connection import open_atlas
+    from treasure_map.lib.binary_id import resolve_binary_in_db
+    from treasure_map.lib.diff.driver import _analysis_build_hash, _concrete_hash, _selector_error
+    from treasure_map.lib.diff.layer0 import _resolve_run, make_diff_id
+    from treasure_map.lib.query.diff_align import pair_diffs
+    from treasure_map.lib.query.runs import Staleness, _remedy_for, run_staleness
+
+    build = current_pass_version()
+    commit = installed_commit()
+    roles = (("before", "A", before), ("after", "B", after))
+    warnings: list[str] = []
+    stale: list[tuple[str, RunRow, Staleness]] = []
+    # Not opened read-only: an atlas no newer tmap has opened yet lacks columns the run reader
+    # selects, and opening it is what adds them.
+    conn = open_atlas(resolved_atlas)
+    try:
+        try:
+            runs = {role: _resolve_run(conn, rid, role) for role, _side, rid in roles}
+        except ConfigError as exc:
+            raise click.ClickException(f"{type(exc).__name__}: {exc}") from exc
+
+        # The roles first: a pair asked for the other way round from the diffs already recorded is
+        # most often two swapped options, and every check below would be spent on the wrong one.
+        if before != after and not allow_reverse:
+            n, example = pair_diffs(conn, after, before)
+            if n:
+                raise click.ClickException(
+                    f"{n} diffs already exist with these runs the other way round (e.g. "
+                    f"`{example}`): --before and --after may be swapped. To run in this direction "
+                    "anyway, add --allow-reverse."
+                )
+
+        # Resolved here as well as in the driver, so a mistyped name is refused before it has cost
+        # a rescan; the short name is what this command's own diff id is made from.
+        this_diff: str | None = None
+        if binary_name is not None:
+            names: list[str] = []
+            for role, _side, rid in roles:
+                row, miss = resolve_binary_in_db(str(runs[role].analysis_db_path), binary_name)
+                if row is None:
+                    refusal = _selector_error(rid, binary_name, miss, runs[role])
+                    unreadable = (
+                        f" (its analysis.db could not be read: {miss.get('detail')})"
+                        if miss and miss.get("reason") == "db_error"
+                        else ""
+                    )
+                    raise click.ClickException(f"{type(refusal).__name__}: {refusal}{unreadable}")
+                names.append(row.name)
+            this_diff = make_diff_id(before, after, names[0])
+
+        for role, side, rid in roles:
+            run = runs[role]
+            label = f"run '{rid}' (--{role})"
+            # ★ Before the staleness check, which cannot see this state: a scan that started
+            # clears the hunt stamp, so the run reads as unconfirmable rather than out of date while
+            # its old candidates may still be in the table. It is refused, not rescanned — scans
+            # take no lock, and the scan that has not finished may be running right now.
+            if run.scan_status != "complete":
+                raise click.ClickException(
+                    f"{label}: its last scan did not finish (scan_status={run.scan_status}). Run "
+                    f"`tmap rescan {rid}` to finish it; if another terminal is scanning it, wait "
+                    "for that to end."
+                )
+            db_hash = _analysis_build_hash(run.analysis_db_path)
+            if _concrete_hash(db_hash) and _concrete_hash(run.build_hash):
+                if db_hash != run.build_hash:
+                    raise click.ClickException(
+                        f"ConfigError: run {side} '{rid}' was hunted from extraction "
+                        f"{run.build_hash}, but its analysis.db now holds extraction {db_hash}: "
+                        "the candidates the diff would read belong to the earlier extraction. "
+                        f"Re-hunt run '{rid}' first. `tmap rescan --force {rid}` re-hunts it. "
+                        f"{_DIFF_ROLES}"
+                    )
+            else:
+                warnings.append(
+                    f"{label}: its extraction hash ({run.build_hash}) and that of its analysis.db "
+                    f"({db_hash}) cannot be compared, so whether its candidates come from the "
+                    "extraction it holds now is not known."
+                )
+            st = run_staleness(run, build_hash=build, commit=commit)
+            if not st.stale:
+                if st.remedy:  # named exactly when the run could not be confirmed current
+                    warnings.append(
+                        f"{label}: {st.detail} Not rescanned: it is not shown to be out of date."
+                    )
+                continue
+            if no_rescan:
+                raise click.ClickException(
+                    f"ConfigError: run {side} '{rid}' is out of date ({st.axis}): {st.detail} "
+                    f"{st.remedy} {_DIFF_ROLES}"
+                )
+            if not run.firmware_path:
+                raise click.ClickException(
+                    f"{label} is out of date ({st.axis}) and cannot be rescanned: "
+                    f"{_remedy_for(run)}"
+                )
+            if not Path(run.firmware_path).is_dir():
+                # Not _remedy_for: it reads only whether a root was recorded, and would offer a
+                # rescan of a directory that is not there.
+                ws_name = Path(str(run.analysis_db_path)).parent.name
+                raise click.ClickException(
+                    f"run '{rid}' (--{role}): its firmware root `{run.firmware_path}` no longer "
+                    "exists, so it cannot be rescanned. Put the firmware back there and run "
+                    f"`tmap rescan {rid}`, or rescan from a new location: "
+                    f"`tmap scan <firmware-root> -w {shlex.quote(ws_name)} --run-id {rid}`."
+                )
+            # Refuses a workspace a rescan would re-resolve somewhere else.
+            _recorded_workspace_name(run, workspace_dir=workspace_dir)
+            if all(r.run_id != rid for _role, r, _st in stale):
+                stale.append((role, run, st))
+
+        live = _live_instance_counts(conn)
+        plan: list[_DiffRescan] = []
+        for role, run, st in stale:
+            reason = _rescan_reason(
+                run,
+                current_build=build,
+                commit=commit,
+                live_instances=live.get(run.run_id, 0),
+            )
+            # The looser rescan rule never confirms a proven-stale run current; were it to, the
+            # proof itself is what is reported.
+            axis, why = reason or (st.axis or "hunt", st.detail)
+            rebuilds = axis in ("incomplete", "extraction")
+            if not rebuilds:
+                try:
+                    rebuilds = _no_stored_facts(Path(str(run.analysis_db_path))) is not None
+                except sqlite3.DatabaseError as exc:
+                    raise click.ClickException(
+                        f"run '{run.run_id}' (--{role}): its recorded analysis.db is not a "
+                        f"readable database ({exc}); a rescan leaves it untouched, so it cannot "
+                        "be brought up to date here."
+                    ) from exc
+            involving = conn.execute(
+                "SELECT diff_id, run_a_id, run_b_id FROM diff_meta "
+                "WHERE run_a_id = ? OR run_b_id = ?",
+                (run.run_id, run.run_id),
+            ).fetchall()
+            # This command's own diffs are re-run, so they are not among the ones left behind.
+            own = [
+                d
+                for d, a, b in involving
+                if a == before and b == after and (this_diff is None or d == this_diff)
+            ]
+            plan.append(_DiffRescan(role, run, axis, why, rebuilds, len(involving) - len(own)))
+    finally:
+        conn.close()
+
+    for w in warnings:
+        click.echo(f"warning: {w}", err=True)
+    return plan
+
+
+def _announce_diff_rescan(plan: list[_DiffRescan]) -> None:
+    """What the rescan about to start is, for each run, in full: it can take a long time, and it
+    can move what other diffs and stored judgements rest on."""
+    unstamped = installed_commit() == UNKNOWN_VERSION
+    for p in plan:
+        r = p.run
+        click.echo(
+            f"\nrun '{r.run_id}' (--{p.role}) is out of date for the running tmap; rescanning it "
+            "before the diff."
+        )
+        click.echo(f"  {_TIER_LABEL[p.axis]}: {_reason_human(p.axis, p.why, binaries=r.binaries)}")
+        click.echo(f"  cost: {_TIER_COST[p.axis]}")
+        click.echo(f"  {_tier_line(r, p.why, p.axis)}")
+        if p.rebuilds:
+            click.echo(f"  {_REKEY_WARNING}")
+            click.echo(
+                f"  {p.other_diffs} other diffs involving this run will read as source_stale."
+            )
+        else:
+            click.echo(
+                f"  {p.other_diffs} other diffs involving this run will have their stored "
+                "baseline read as stale (recomputed in memory on read); they become source_stale "
+                "only if the hunt output actually changes."
+            )
+        if unstamped:
+            click.echo(
+                "  This install records no commit, so the rescan will write this run's "
+                "hunt_commit as unknown."
+            )
+
+
+def _recheck_after_rescan(*, before: str, after: str, force: bool, resolved_atlas: Path) -> None:
+    """The one look at the two runs after the rescan. A rescan that failed returns normally (it
+    names the run and moves on), so its outcome is read from the atlas, never assumed. Refuses
+    rather than rescanning again."""
+    from treasure_map.lib.atlas.connection import open_atlas
+    from treasure_map.lib.diff.driver import check_run_pair_currency
+    from treasure_map.lib.diff.layer0 import _resolve_run, _version_skew
+
+    again = "Not rescanning again; see the rescan output above."
+    conn = open_atlas(resolved_atlas)
+    try:
+        try:
+            run_a = _resolve_run(conn, before, "before")
+            run_b = _resolve_run(conn, after, "after")
+        except ConfigError as exc:
+            raise click.ClickException(f"{type(exc).__name__}: {exc}") from exc
+    finally:
+        conn.close()
+    for role, run in (("before", run_a), ("after", run_b)):
+        if run.scan_status != "complete":
+            raise click.ClickException(
+                f"run '{run.run_id}' (--{role}) is still out of date after the rescan: its last "
+                f"scan did not finish (scan_status={run.scan_status}). {again}"
+            )
+    try:
+        check_run_pair_currency(run_a, run_b)
+    except ConfigError as exc:
+        raise click.ClickException(
+            f"still out of date after the rescan: {exc} {again} {_DIFF_ROLES}"
+        ) from exc
+    if _version_skew(run_a, run_b) and not force:
+        raise click.ClickException(f"ConfigError: after the rescan, {_DIFF_SKEW}")
+
+
 @click.command(
     "diff", short_help="Compare two firmware runs (all changed binaries, or one with --binary)"
 )
-@click.argument("run_a_id", shell_complete=_complete_run_id)
-@click.argument("run_b_id", shell_complete=_complete_run_id)
+# Only so the positional form `tmap diff X Y` is refused with the command that replaces it, rather
+# than with click's "unexpected extra argument".
+@click.argument("legacy_runs", nargs=-1, metavar="", shell_complete=_complete_run_id)
+@click.option(
+    "--before",
+    default=None,
+    shell_complete=_complete_run_id,
+    help="The run diffed FROM (side A): a run id (scan's --run-id), not a path. Required.",
+)
+@click.option(
+    "--after",
+    default=None,
+    shell_complete=_complete_run_id,
+    help="The run diffed TO (side B): a run id (scan's --run-id), not a path. Required.",
+)
 @click.option(
     "--binary",
     "binary_name",
@@ -238,6 +551,19 @@ def _echo_full_diff(fsum: Any, resolved_atlas: Path) -> None:
     "the refusal to diff a run that is out of date.",
 )
 @click.option(
+    "--no-rescan",
+    is_flag=True,
+    default=False,
+    help="Do not rescan a run proven out of date first; refuse to diff it instead.",
+)
+@click.option(
+    "--allow-reverse",
+    is_flag=True,
+    default=False,
+    help="Diff in this direction even though diffs of the two runs exist the other way round "
+    "(refused by default, as the sign of swapped --before / --after).",
+)
+@click.option(
     "--config",
     "-c",
     type=click.Path(exists=True, path_type=Path),
@@ -251,19 +577,24 @@ def _echo_full_diff(fsum: Any, resolved_atlas: Path) -> None:
     default=None,
     help="Atlas DB path (defaults to the configured atlas.db_path).",
 )
+@click.pass_context
 def hunt_diff(
-    run_a_id: str,
-    run_b_id: str,
+    ctx: click.Context,
+    legacy_runs: tuple[str, ...],
+    before: str | None,
+    after: str | None,
     binary_name: str | None,
     force: bool,
     force_retry: bool,
     assume_current: bool,
+    no_rescan: bool,
+    allow_reverse: bool,
     config: Path | None,
     atlas_path: Path | None,
 ) -> None:
     """Diff two runs through the map-model pipeline, in a single command.
 
-    RUN_A_ID / RUN_B_ID are run ids (a run id is scan's --run-id, default = the -w workspace name),
+    --before / --after are run ids (a run id is scan's --run-id, default = the -w workspace name),
     NOT paths; tab-completion lists this atlas's runs. By default diffs every binary that changed
     between the two runs (in parallel, with progress); ``--binary NAME`` focuses one. Drives the
     external aligner end-to-end (BinExport -> BinDiff, you never touch an intermediate file), then
@@ -271,14 +602,56 @@ def hunt_diff(
     existing annotations, never a change/defect verdict -- read it with the get_diff_* MCP tools
     (list_diffs to browse, then get_diff_patch_view; get_diff_deltas for string-keyed edges) and
     judge it yourself.
+
+    A run proven out of date for the running tmap is rescanned first (`tmap rescan`), with what
+    that costs said before it starts; --no-rescan refuses instead. A run that cannot be confirmed
+    either way is diffed as it is, with a warning.
     """
     from treasure_map.lib.atlas.connection import open_atlas
     from treasure_map.lib.config.config import load_config
     from treasure_map.lib.diff.driver import run_full_diff, run_version_diff
-    from treasure_map.lib.errors import TreasureMapError
+
+    # Refused before anything is opened: nothing has been read, so nothing can have been written.
+    if legacy_runs:
+        raise _legacy_diff_refusal(ctx, legacy_runs)
+    if not before or not after:
+        raise click.UsageError("both --before and --after are required.", ctx=ctx)
 
     cfg = load_config(config)
     resolved_atlas = atlas_path if atlas_path is not None else cfg.atlas.db_path
+
+    plan = _diff_rescan_plan(
+        before=before,
+        after=after,
+        binary_name=binary_name,
+        no_rescan=no_rescan,
+        allow_reverse=allow_reverse,
+        resolved_atlas=Path(resolved_atlas),
+        workspace_dir=cfg.workspace_dir,
+    )
+    if plan:
+        _announce_diff_rescan(plan)
+        run_ids = tuple(p.run.run_id for p in plan)
+        try:
+            ctx.invoke(
+                rescan,
+                run_ids=run_ids,
+                force=False,
+                dry_run=False,
+                config=config,
+                atlas_path=atlas_path,
+            )
+        except SystemExit as exc:
+            # The decompile stage turns Ctrl-C into exit code 130; any other exit is not ours.
+            if exc.code != 130:
+                raise
+            _rescan_interrupted(ctx, run_ids)
+        except (KeyboardInterrupt, click.exceptions.Abort):
+            # The hunt stage lets the interrupt itself through.
+            _rescan_interrupted(ctx, run_ids)
+        _recheck_after_rescan(
+            before=before, after=after, force=force, resolved_atlas=Path(resolved_atlas)
+        )
 
     def _on_start(n: int) -> None:
         # The full sweep is the normal usage, so it runs unconfirmed. Announce the size + the escape
@@ -295,16 +668,14 @@ def hunt_diff(
     atlas = open_atlas(Path(resolved_atlas))
     try:
         if binary_name is not None:
-            single = run_version_diff(
-                atlas, run_a_id, run_b_id, binary_name, config=cfg, force=force
-            )
+            single = run_version_diff(atlas, before, after, binary_name, config=cfg, force=force)
             full = None
         else:
             single = None
             full = run_full_diff(
                 atlas,
-                run_a_id,
-                run_b_id,
+                before,
+                after,
                 config=cfg,
                 force=force,
                 force_retry=force_retry,
@@ -313,7 +684,7 @@ def hunt_diff(
                 on_outcome=_on_outcome,
             )
     except TreasureMapError as exc:
-        raise click.ClickException(f"{type(exc).__name__}: {exc}") from exc
+        raise _driver_refusal(exc) from exc
     finally:
         atlas.close()
 
@@ -321,6 +692,16 @@ def hunt_diff(
         _echo_single_diff(single, resolved_atlas)
     else:
         _echo_full_diff(full, resolved_atlas)
+
+
+def _rescan_interrupted(ctx: click.Context, run_ids: tuple[str, ...]) -> None:
+    """Stop the command after an interrupted rescan, before the diff starts."""
+    click.echo(
+        f"\nRescan interrupted; the diff did not start. `tmap rescan {' '.join(run_ids)}` "
+        "resumes it on its own.",
+        err=True,
+    )
+    ctx.exit(130)
 
 
 @click.command(
