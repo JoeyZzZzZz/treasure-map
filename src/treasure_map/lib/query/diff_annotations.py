@@ -30,7 +30,6 @@ from treasure_map.lib.query import diff_review as dr
 from treasure_map.lib.query.coverage import NEEDS_RECHECK
 from treasure_map.lib.query.diff_align import list_diff_blindspots
 from treasure_map.lib.query.patch_view import BuiltDiff, ViewReview, _Entry, build_diff_view
-from treasure_map.lib.query.sink_overlay import compute_sink_overlay_runs
 
 # Where a candidate row has to land for its entry's judgement to be carried onto it. A row that
 # lands A, or persisted, or P as a function whose counterpart is established to be missing, says
@@ -279,8 +278,9 @@ def list_diff_overlays(
     (``run_id`` = ``{run_a}::{run_b}``), each read against its diff's view as it is now.
 
     With ``run_id`` it also carries ``review_progress`` over EVERY diff of that pair — which
-    rebuilds every one of their views, and reads the pair's candidate overlay to find the binaries
-    no diff covers: seconds per hundred diffs (about 25 s for a pair of 126 diffs)."""
+    rebuilds every one of their views: seconds per hundred diffs (about 10 s for a pair of 126
+    diffs). The binaries no diff covers are read straight from the atlas, not by recomputing the
+    pair's sink overlay."""
     if verdict is not None and verdict not in _DIFF_VERDICTS:
         raise ConfigError(f"verdict must be one of {list(_DIFF_VERDICTS)}; got {verdict!r}")
     conds, params = ["anchor_kind = 'diff_subject'"], []
@@ -368,40 +368,81 @@ def list_diff_overlays(
 # ── progress over a whole run pair ─────────────────────────────────────────────────────────
 
 
+# Why a candidate whose binary was not diffed sits where it does. The two blind-spot reasons mirror
+# the run-pair reasons lib/query/sink_overlay emits for get_diff_sink_overlay; identical_both_sides
+# is this review layer's own finer split — a binary byte-for-byte present on the OTHER side was not
+# diffed because there was nothing to diff, so it is no blind spot and must not keep complete false.
+_NOT_DIFFED_IDENTICAL = "identical_both_sides"
+_NOT_DIFFED_BLIND = ("binary_not_diffed", "shadowed_by_name_collision")
+
+
+def _short_name(path: str | None) -> str | None:
+    """A binary path's short name (its basename), matched against diff_meta.binary_a / binary_b."""
+    return path.rsplit("/", 1)[-1] if path else None
+
+
+def _not_diffed_reason(
+    sha: str | None, name: str | None, *, diffed_names: set[str], other_shas: set[str]
+) -> str:
+    """Why a candidate whose binary content is not among the pair's diffed hashes is where it is.
+    Identical content on the other side is not a blind spot; a same-named binary that WAS diffed
+    shadowed it; otherwise the binary is on this side only."""
+    if sha is not None and sha in other_shas:
+        return _NOT_DIFFED_IDENTICAL
+    if name in diffed_names:
+        return "shadowed_by_name_collision"
+    return "binary_not_diffed"
+
+
 def _not_diffed(atlas: sqlite3.Connection, run_a: str, run_b: str) -> dict[str, Any]:
-    """The binaries holding candidates that no diff of the pair covers, as the pair's candidate
-    overlay names them (``binary_not_diffed``, or ``shadowed_by_name_collision`` when a same-named
-    binary with other content was diffed instead), per side: how many binaries (by path) and
-    candidates, and every binary's short name."""
-    result = compute_sink_overlay_runs(atlas, run_a, run_b)
-    refs: dict[tuple[str, str], set[str]] = {}
-    for r in result.rows:
-        if r.diff_id is not None:
-            continue
-        side, ref = ("a", r.a_ref) if r.a_ref else ("b", r.b_ref)
-        if ref is not None:
-            refs.setdefault((side, r.presence_reason or ""), set()).add(ref)
-    out: dict[str, Any] = {}
-    for (side, reason), side_refs in sorted(refs.items()):
-        run = run_a if side == "a" else run_b
-        paths: set[str] = set()
-        wanted = sorted(side_refs)
-        for i in range(0, len(wanted), 500):
-            chunk = wanted[i : i + 500]
-            marks = ", ".join("?" * len(chunk))
-            paths.update(
-                path or ""
-                for (path,) in atlas.execute(
-                    "SELECT DISTINCT binary_path FROM instance "  # noqa: S608
-                    f"WHERE source_run_id = ? AND evidence_ref IN ({marks})",
-                    (run, *chunk),
-                )
+    """The binaries holding candidates that no diff of the pair covers, read straight from the atlas
+    — diff_meta for what was diffed, instance for every candidate — WITHOUT recomputing the pair's
+    sink overlay (which rebuilds every diff; this reads the same set, by content hash).
+
+    Per side and reason: how many binaries (by path), how many candidates, and every binary's short
+    name. A candidate whose binary content is present on the OTHER side too is identical across the
+    pair and reads as ``identical_both_sides``, kept apart from the two genuine blind-spot reasons
+    (``binary_not_diffed``, ``shadowed_by_name_collision``) so it never counts as one."""
+    diffs = atlas.execute(
+        "SELECT sha256_a, sha256_b, binary_a, binary_b FROM diff_meta "
+        "WHERE run_a_id = ? AND run_b_id = ?",
+        (run_a, run_b),
+    ).fetchall()
+    run_shas = {
+        side: {
+            sha
+            for (sha,) in atlas.execute(
+                "SELECT DISTINCT binary_content_hash FROM instance WHERE source_run_id = ?", (run,)
             )
-        out.setdefault(side, {})[reason] = {
-            "binaries": len(paths),
-            "candidates": len(side_refs),
-            "names": sorted({p.rsplit("/", 1)[-1] or "(no path recorded)" for p in paths}),
+            if sha
         }
+        for side, run in (("a", run_a), ("b", run_b))
+    }
+    out: dict[str, Any] = {}
+    for side, run, sha_col, name_col in (("a", run_a, 0, 2), ("b", run_b, 1, 3)):
+        diffed_sha = {d[sha_col] for d in diffs if d[sha_col]}
+        diffed_names = {d[name_col] for d in diffs if d[name_col]}
+        other_shas = run_shas["b" if side == "a" else "a"]
+        groups: dict[str, dict[str, set[str | None]]] = {}
+        for ref, sha, path in atlas.execute(
+            "SELECT evidence_ref, binary_content_hash, binary_path FROM instance "
+            "WHERE source_run_id = ?",
+            (run,),
+        ):
+            if sha is not None and sha in diffed_sha:
+                continue  # its binary content was one side of a diff — covered
+            reason = _not_diffed_reason(
+                sha, _short_name(path), diffed_names=diffed_names, other_shas=other_shas
+            )
+            g = groups.setdefault(reason, {"refs": set(), "paths": set()})
+            g["refs"].add(ref)
+            g["paths"].add(path)
+        for reason, g in sorted(groups.items()):
+            out.setdefault(side, {})[reason] = {
+                "binaries": len(g["paths"]),
+                "candidates": len(g["refs"]),
+                "names": sorted({_short_name(p) or "(no path recorded)" for p in g["paths"]}),
+            }
     return out
 
 
@@ -455,6 +496,18 @@ def pair_progress(
         for b in blind["blindspots"]
     ]
     not_diffed = _not_diffed(atlas, run_a, run_b)
+    blind_not_diffed: dict[str, Any] = {}
+    identical_not_diffed: dict[str, Any] = {}
+    for side, by_reason in not_diffed.items():
+        blind = {r: v for r, v in by_reason.items() if r in _NOT_DIFFED_BLIND}
+        if blind:
+            blind_not_diffed[side] = blind
+        identical = by_reason.get(_NOT_DIFFED_IDENTICAL)
+        if identical is not None:
+            identical_not_diffed[side] = {
+                "binaries": identical["binaries"],
+                "candidates": identical["candidates"],
+            }
     numbers = dr.counts(items)
     return {
         "unit": "entry",
@@ -465,23 +518,29 @@ def pair_progress(
         # per diff of the pair, by its binary (the diff_id is {run_pair}::{binary})
         "by_binary": by_binary,
         "dangling_annotations": sorted(dangling),
+        # binaries byte-identical on both sides: no diff was warranted, so no blind spot — kept out
+        # of 'complete' and apart from the genuine not-diffed binaries below.
+        "identical_not_diffed_binaries": identical_not_diffed,
         "blind_spots": {
             "failed_diffs": failed,
             "withheld_diffs": withheld,
-            "not_diffed_binaries": not_diffed,
+            "not_diffed_binaries": blind_not_diffed,
             "see": (
                 "list_diff_blindspots(run_a, run_b) for the failed diffs; "
-                "get_diff_sink_overlay(run_a, run_b, reason='binary_not_diffed') for the "
-                "candidates of binaries no diff covers"
+                "get_diff_sink_overlay(run_a, run_b, reason='binary_not_diffed') for their "
+                "candidates — note that map counts a binary identical on both sides as "
+                "binary_not_diffed too, so it also lists the identical_not_diffed_binaries this "
+                "block keeps separate"
             ),
         },
         "complete": (
-            numbers["not_looked_at"] == 0 and not failed and not withheld and not not_diffed
+            numbers["not_looked_at"] == 0 and not failed and not withheld and not blind_not_diffed
         ),
         "note": (
             dr.PROGRESS_NOTE
             + " Over a run pair, 'complete' also needs no failed diff, no diff undetermined as a "
             "whole, and no binary that no diff covers: entries cannot be listed for those, so "
-            "having judged every listed entry does not reach them."
+            "having judged every listed entry does not reach them. A binary byte-identical on both "
+            "sides is not one of those — it needed no diff (identical_not_diffed_binaries)."
         ),
     }

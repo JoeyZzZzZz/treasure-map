@@ -640,10 +640,16 @@ def test_no_real_change_with_its_basis_is_stored(world: World) -> None:
 # ── band: moves judged entries only inside the groups the base order forms ────────────────────
 
 
-def _e(bucket: str, tier: int | str, addr: str, sim: float = 0.5) -> Any:
+def _e(
+    bucket: str,
+    tier: int | str,
+    addr: str,
+    sim: float = 0.5,
+    subclass: str = "instruction_unmatched",
+) -> Any:
     pair = pv._Pair(addr, addr, None, None, 0.95, sim, "aligned", None, None)
     e = pv._Entry(pair=pair, unpaired=None, bucket=bucket)
-    e.tier, e.subclass = tier, "instruction_unmatched"
+    e.tier, e.subclass = tier, subclass
     e.rank = pv._rank(e)
     return e
 
@@ -668,6 +674,26 @@ def test_band_moves_an_entry_only_inside_its_group() -> None:
     bands[b3_sunk.entry_id] = dr.band_bias(coverage.CONCLUDED, "no_real_change")
     banded = [e.entry_id for e in pv._sort(entries, None, bands)]
     assert banded == [r3.entry_id, b3.entry_id, b3_sunk.entry_id, b2.entry_id, c.entry_id]
+
+
+def test_band_moves_an_entry_only_inside_its_subclass_rank() -> None:
+    """★ Within segment 2 the B subclass rank sorts sink-presence-signal B (rank 0) ahead of the
+    rest (rank 1) BEFORE the band. A rank-0 B marked no_real_change (the band that sinks furthest)
+    stays above an unseen rank-1 B: the band orders only inside a subclass rank, never across it.
+
+    MUTATION: put the band ahead of ``subclass_rank`` in ``_default_key`` -> RED."""
+    hi = _e("B", 3, "hi", sim=0.9, subclass="sink_presence_signal_added")  # subclass_rank 0
+    lo = _e("B", 3, "lo", sim=0.1)  # instruction_unmatched -> subclass_rank 1
+    assert (hi.rank["subclass_rank"], lo.rank["subclass_rank"]) == (0, 1)
+    entries = [lo, hi]
+    assert [e.entry_id for e in pv._sort(entries, None)] == [hi.entry_id, lo.entry_id]
+
+    bands = {
+        hi.entry_id: dr.band_bias(coverage.CONCLUDED, "no_real_change"),  # 5: sinks furthest
+        lo.entry_id: dr.band_bias(coverage.UNSEEN, None),  # 2
+    }
+    banded = [e.entry_id for e in pv._sort(entries, None, bands)]
+    assert banded == [hi.entry_id, lo.entry_id]  # subclass_rank holds hi above lo despite the band
 
 
 def test_band_orders_recheck_then_open_then_unseen() -> None:
@@ -849,6 +875,31 @@ def test_a_withheld_diff_counts_nothing_and_cannot_be_judged(world: World) -> No
         world.judge(DX, _pair_anchor(DX, "00001000", "00002000"), "changed_real")
 
 
+def test_a_judgement_already_on_a_now_withheld_diff_reads_diff_withheld(world: World) -> None:
+    """A diff undetermined as a whole lists no entry, but a judgement already written on one is
+    still read — and must read ``diff_withheld`` / needs_recheck, never ``unchanged`` (its facts
+    cannot be checked while the diff is withheld) and never dangling (the subject is not gone, the
+    diff is).
+
+    MUTATION: in ``judge``, drop the ``withheld`` branch -> the judgement reads anchor_unresolved
+    (basis_state goes RED) and is reported as dangling; let the view compute as if determined ->
+    it reads unchanged / concluded (both review_state and basis_state go RED)."""
+    world.pair(DX, "00001000", "00002000")
+    world.rows[DX] = [a_row("00001000")]
+    anchor = _pair_anchor(DX, "00001000", "00002000")
+    world.judge(DX, anchor, "changed_real")
+    settled = overlay.list_overlays(world.atlas, anchor_kind="diff_subject", run_id=PAIR)
+    assert settled["overlays"][0]["basis_state"] == dr.UNCHANGED
+    assert settled["overlays"][0]["review_state"] == coverage.CONCLUDED
+
+    world.atlas.execute("UPDATE diff_meta SET version_skew = 1 WHERE diff_id = ?", (DX,))
+    withheld = overlay.list_overlays(world.atlas, anchor_kind="diff_subject", run_id=PAIR)
+    row = withheld["overlays"][0]
+    assert row["basis_state"] == dr.DIFF_WITHHELD
+    assert row["review_state"] == coverage.NEEDS_RECHECK
+    assert withheld["review_progress"]["dangling_annotations"] == []
+
+
 def test_a_run_pair_is_never_complete_while_a_binary_is_not_covered(
     world: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -885,8 +936,22 @@ def test_a_run_pair_is_never_complete_while_a_binary_is_not_covered(
     assert undiffed["review_progress"]["complete"] is False
 
 
-def test_the_not_diffed_binaries_come_from_the_run_pair_overlay(world: World) -> None:
-    for ref, run in ((_ref("runA", "00007000"), "runA"), (_ref("runB", "00008000"), "runB")):
+def test_the_not_diffed_binaries_are_split_by_whether_they_are_blind_spots(world: World) -> None:
+    """Read straight from the atlas, by content hash: a binary whose bytes are on BOTH sides was
+    not diffed because there was nothing to diff (``identical_both_sides`` — no blind spot); one on
+    this side only is ``binary_not_diffed``; one whose NAME matches a diffed binary but whose bytes
+    do not is ``shadowed_by_name_collision``. (The diffs are of libx/liby.)
+
+    MUTATION: drop the identical check in ``_not_diffed_reason`` (call it binary_not_diffed) -> the
+    libz rows go RED; drop the shadowed check -> the libx row goes RED."""
+    insert = (
+        # (evidence_ref, run, path, content_hash)
+        (_ref("runA", "00007000"), "runA", "/fw/usr/lib/libz", "e" * 64),  # identical, both sides
+        (_ref("runB", "00008000"), "runB", "/fw/usr/lib/libz", "e" * 64),  # identical, both sides
+        (_ref("runA", "00009000"), "runA", "/fw/sbin/libq", "f" * 64),  # a-side only
+        (_ref("runB", "0000a000"), "runB", "/fw/usr/lib/libx", "cafe" * 16),  # name libx diffed
+    )
+    for ref, run, path, sha in insert:
         world.atlas.execute(
             "INSERT INTO pattern (source_class, sink_class, call_sequence_shape, "
             "structural_fingerprint, fingerprint_algo_version) "
@@ -895,15 +960,47 @@ def test_the_not_diffed_binaries_come_from_the_run_pair_overlay(world: World) ->
         )
         world.atlas.execute(
             "INSERT INTO instance (pattern_id, evidence_ref, source_run_id, binary_path, "
-            "binary_content_hash) VALUES (last_insert_rowid(), ?, ?, '/fw/usr/lib/libz', ?)",
-            (ref, run, "e" * 64),
+            "binary_content_hash) VALUES (last_insert_rowid(), ?, ?, ?, ?)",
+            (ref, run, path, sha),
         )
     world.atlas.commit()
-    found = dann._not_diffed(world.atlas, "runA", "runB")
-    assert found == {
-        "a": {"binary_not_diffed": {"binaries": 1, "candidates": 1, "names": ["libz"]}},
-        "b": {"binary_not_diffed": {"binaries": 1, "candidates": 1, "names": ["libz"]}},
+    one = {"binaries": 1, "candidates": 1}
+    assert dann._not_diffed(world.atlas, "runA", "runB") == {
+        "a": {
+            "binary_not_diffed": {**one, "names": ["libq"]},
+            "identical_both_sides": {**one, "names": ["libz"]},
+        },
+        "b": {
+            "identical_both_sides": {**one, "names": ["libz"]},
+            "shadowed_by_name_collision": {**one, "names": ["libx"]},
+        },
     }
+
+
+def test_a_binary_identical_on_both_sides_does_not_keep_a_pair_incomplete(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ A binary byte-identical on both sides needed no diff, so — unlike a genuine not-diffed
+    binary — it must not keep ``complete`` false. It is reported apart, never as a blind spot.
+
+    MUTATION: fold identical_both_sides into the blind-spot reasons -> RED (complete goes false)."""
+    world.pair(DX, "00001000", "00002000")
+    world.rows[DX] = [a_row("00001000")]
+    world.atlas.execute("DELETE FROM diff_meta WHERE diff_id = ?", (DY,))
+    world.judge(DX, _pair_anchor(DX, "00001000", "00002000"), "changed_real")
+    monkeypatch.setattr(
+        dann,
+        "_not_diffed",
+        lambda *a: {
+            "a": {"identical_both_sides": {"binaries": 2, "candidates": 9, "names": ["x", "y"]}}
+        },
+    )
+    progress = overlay.list_overlays(world.atlas, anchor_kind="diff_subject", run_id=PAIR)[
+        "review_progress"
+    ]
+    assert progress["complete"] is True
+    assert progress["blind_spots"]["not_diffed_binaries"] == {}
+    assert progress["identical_not_diffed_binaries"] == {"a": {"binaries": 2, "candidates": 9}}
 
 
 # ── discoverable without a single judgement ──────────────────────────────────────────────────
