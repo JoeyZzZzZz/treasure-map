@@ -1653,13 +1653,16 @@ def _not_listed_page(
 _SIGNIFICANCE_LENS = (
     "sort_by='significance' reorders the listed entries, never relabels them: attention 0 = bucket "
     "A or a row carrying sink_arg_constant_delta; 2 = pseudocode_sameness identical, or bucket C "
-    "(sunk, still listed and pageable); 1 = the rest, lowest similarity first. Never sunk: an R "
-    "entry, a B sink_present_no_visible_delta (labelled recheckable_no_visible_delta), and an "
-    "entry judged changed_real, inconclusive or due a re-check / relabel. With band=true the "
-    "judgement band orders entries inside each attention tier. Each entry's ``significance`` "
-    "names its tier and why. Not seen by this lens: a constant in an allocation expression or a "
-    "local buffer's declared size (blind_spots), and anything in a binary the two runs hold "
-    "byte-identical — that is in the scan's candidate map, not in any diff."
+    "(sunk, still listed and pageable); 1 = the rest, lowest similarity first, R and B entries "
+    "ordered together. Attention 0 holds B entries too (a row's sink_arg_constant_delta) beside "
+    "A. Never sunk: an R entry (attention 2 never holds one), a B sink_present_no_visible_delta "
+    "(labelled recheckable_no_visible_delta), and an entry judged changed_real, inconclusive or "
+    "due a re-check / relabel — none of them reaches attention 2, whether band is on or off. "
+    "Only with band=true does the judgement band order entries inside each attention tier. Each "
+    "entry's ``significance`` names its tier and why. Not seen by this lens: a constant in an "
+    "allocation expression or a local buffer's declared size (blind_spots), and anything in a "
+    "binary the two runs hold byte-identical — that is in the scan's candidate map, not in any "
+    "diff."
 )
 
 

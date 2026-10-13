@@ -22,6 +22,7 @@ from typing import Any
 import pytest
 
 from treasure_map import mcp_app
+from treasure_map.lib import overlay
 from treasure_map.lib.analyze.ghidra_runner import current_pass_version
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.diff import code_version as cv
@@ -166,6 +167,16 @@ class World:
             "INSERT INTO instruction_match (diff_id, func_addr_a, addr_a, addr_b, facts_b) "
             "VALUES (?, ?, ?, ?, ?)",
             (DIFF, func_a, a, b, facts_b),
+        )
+
+    def judge(self, diff_id: str, anchor: str, verdict: str, **kw: Any) -> overlay.UpsertResult:
+        return overlay.annotate_diff(
+            self.atlas,
+            diff_id=diff_id,
+            anchor_ref=anchor,
+            verdict=verdict,
+            rationale="looked at both sides",
+            **kw,
         )
 
     def edge(self, subject_key: str, delta_kind: str) -> None:
@@ -792,6 +803,58 @@ def test_an_entry_in_b_by_another_row_keeps_its_subclass_and_the_row_keeps_the_d
     e = by_id[_pair_id("00001000", "00002000")]
     assert e["bucket"] == "B" and e["subclass"] != "sink_arg_constant_delta"
     assert any("sink_arg_constant_delta" in r for r in e["rows"])
+
+
+def test_the_lens_and_the_counts_read_each_fact_through_their_wiring(
+    tmp_path: Path, current: None
+) -> None:
+    """★ End to end through get_diff_patch_view(sort_by='significance') and function_states, three
+    entries B by an unmatched call: (a) pseudocode and callees identical -> sunk on that basis;
+    (b) the same, but judged changed_real -> held at 1; (c) a body that differs, with ANOTHER row
+    carrying a changed length constant -> floated, its subclass still instruction_unmatched, and
+    counted as a change with a scoped sink delta.
+
+    MUTATION: hand ``significance`` None for the entry's judgement -> (b) sinks -> RED; None for
+    its pseudocode_sameness -> (a) is not sunk -> RED; read the scoped delta from the entry's
+    subclass in ``_carries_scoped_sink_delta`` -> (c) is not counted -> RED."""
+    w = World(tmp_path)
+    a, b = "runA", "runB"
+    for fa, fb in (("00001000", "00002000"), ("00003000", "00004000")):  # (a), (b): identical
+        w.pair(fa, fb, 0.97, 0.9)
+        w.inst("a", _ref(a, fa, "cmd", "0x30"), "cmd", "system")  # its call matched to nothing
+        w.fn("a", fa, ["system"], pseudocode="system(c);")
+        w.fn("b", fb, ["system"], pseudocode="system(c);")
+    w.pair("00005000", "00006000", 0.97, 0.9)  # (c): a changed body, a constant row beside it
+    w.inst("a", _ref(a, "00005000", "copy", "0x10"), "copy", "snprintf", _size("cap_const", "0x80"))
+    w.inst(
+        "b", _ref(b, "00006000", "copy", "0x10"), "copy", "snprintf", _size("cap_const", "0x100")
+    )
+    w.im("00005010", "00006010", "00005000")
+    w.inst("a", _ref(a, "00005000", "cmd", "0x30"), "cmd", "system")  # matched to nothing
+    w.fn("a", "00005000", ["snprintf", "system"], pseudocode="snprintf(d,0x80,f); system(c);")
+    w.fn("b", "00006000", ["snprintf", "system"], pseudocode="snprintf(d,0x100,f); system(c);")
+    w.commit()
+    ids = {
+        "a": _pair_id("00001000", "00002000"),
+        "b": _pair_id("00003000", "00004000"),
+        "c": _pair_id("00005000", "00006000"),
+    }
+    base = _view(w)["by_id"]
+    assert set(ids.values()) <= set(base)
+    for k in "ab":
+        assert (base[ids[k]]["bucket"], base[ids[k]]["subclass"]) == ("B", "instruction_unmatched")
+        assert base[ids[k]]["pseudocode_sameness"] == "identical"
+    w.judge(DIFF, base[ids["b"]]["anchor_ref"], "changed_real")
+    lens = _view(w, sort_by="significance")["by_id"]
+    assert lens[ids["a"]]["significance"] == {"attention": 2, "basis": "pseudocode_identical"}
+    assert lens[ids["b"]]["significance"] == {"attention": 1, "basis": "judged_never_sunk"}
+    assert lens[ids["c"]]["significance"] == {"attention": 0, "basis": "sink_arg_constant_delta"}
+    assert (lens[ids["c"]]["bucket"], lens[ids["c"]]["subclass"]) == ("B", "instruction_unmatched")
+    assert lens[ids["c"]]["pseudocode_sameness"] == "differs"
+    s = pv.function_states(w.atlas, DIFF)
+    assert s is not None
+    assert s["changed"] == {"total": 1, "with_scoped_sink_delta": 1, "no_scoped_signal": 0}
+    assert s["unchanged"] == 2
 
 
 @pytest.mark.parametrize(

@@ -46,6 +46,43 @@ def test_the_switch_and_branch_labels_normalise_too() -> None:
     )
 
 
+def _same(a: str, b: str) -> bool:
+    return sm.normalize_pseudocode(a) == sm.normalize_pseudocode(b)
+
+
+def test_an_address_mid_name_is_blanked_only_in_the_two_labels_that_carry_one() -> None:
+    """★ Mid-name, only the switch and the numbered branch label carry an address (exactly eight
+    hex digits); every other hex-looking word inside a name is part of what the code says — a real
+    symbol, the text a string label spells out, a local's access offset — and blanking it would
+    read two different bodies as identical. Constants are never touched.
+
+    MUTATION: restore the earlier mid-name rule (an address may be followed by ``_`` anywhere) ->
+    the second group goes RED; restore the plain word-boundary rule (no mid-name labels, no
+    ``r0x``) -> the first group goes RED."""
+    for a, b in (
+        ("goto switchD_004492cc_caseD_3;", "goto switchD_00449338_caseD_3;"),
+        ("goto switchD_000b7c68_default;", "goto switchD_000b7d00_default;"),
+        ("goto LAB_0008f0a0_1;", "goto LAB_0008f5e0_1;"),
+        ("if (x) goto joined_r0x00449e60;", "if (x) goto joined_r0x00449ecc;"),
+        ("y = code_r0x00449e70;", "y = code_r0x00449ee0;"),
+        ("FUN_00012a40();", "FUN_00013b50();"),
+        ("puts(s_hi_0001ccd0);", "puts(s_hi_0001cd00);"),
+    ):
+        assert _same(a, b), (a, b)
+    for a, b in (
+        ("p->cb = CRYPTO_cbc128_encrypt;", "p->cb = CRYPTO_cfb128_encrypt;"),
+        (
+            "puts(s_abcdefabcdefabcdefabcdefabcdefab_001a2464);",
+            "puts(s_fedcbafedcbafedcbafedcbafedcbafe_001a2464);",
+        ),
+        ("x = l._153920_4_;", "x = l._253920_4_;"),
+        ("puts(s_deadbeef_00412345);", "puts(s_cafebabe_00412345);"),
+        ("goto switchD_004492cc_caseD_3;", "goto switchD_004492cc_caseD_4;"),
+        ("uVar1 = 0x40;", "uVar1 = 0x3f;"),
+    ):
+        assert not _same(a, b), (a, b)
+
+
 def test_pair_reading_tells_no_body_apart_from_an_empty_body() -> None:
     """A reader must not have to recompute WHY a body was missing: ``no_body`` (a side absent from
     the functions table — an import/PLT stub) is kept apart from ``unavailable`` (present, empty).

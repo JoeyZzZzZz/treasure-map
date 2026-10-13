@@ -57,15 +57,30 @@ STATE_BY_NOT_LISTED_NAME = {name: state for state, name in NOT_LISTED_NAME.items
 
 # ── address normalisation (single definition) ────────────────────────────────────────────────
 
-# Ghidra's synthetic symbol names carry an absolute address after an underscore (FUN_00012a40,
-# DAT_000200f8, s_hi_0001ccd0, LAB_/UNK_/SUB_), sometimes mid-name (the switch label
-# switchD_004492cc_caseD_3) or as ``r0x<addr>`` (the branch labels joined_r0x00449e60 /
-# code_r0x00449e60). Two identical functions in two binaries whose other code shifted read the same
-# body with these addresses moved, so the address is blanked and the rest of the name kept. The
-# threshold is six hex digits (>= 0x100000): a stack offset (auStack_1050) and a length constant
-# (0x40 .. 0xfff) are far smaller and never touched — the "small constants stay put" rule that
-# keeps a changed size visible to this reading and to const_delta alike.
-_ADDR_SUFFIX = re.compile(r"_(?:r0x)?[0-9a-fA-F]{6,}(?![0-9a-zA-Z])")
+# Ghidra's synthetic symbol names carry an absolute address after an underscore, at the END of the
+# name (FUN_00012a40, DAT_000200f8, s_hi_0001ccd0, LAB_/UNK_/SUB_), or as ``r0x<addr>`` (the branch
+# labels joined_r0x00449e60 / code_r0x00449e60). Two identical functions in two binaries whose
+# other code shifted read the same body with these addresses moved, so the address is blanked and
+# the rest of the name kept. The threshold is six hex digits (>= 0x100000): a stack offset
+# (auStack_1050) and a length constant (0x40 .. 0xfff) are far smaller and never touched — the
+# "small constants stay put" rule that keeps a changed size visible to this reading and to
+# const_delta alike.
+#
+# An address in the MIDDLE of a name is blanked for two label prefixes only, and only as exactly
+# eight hex digits: the switch label switchD_004492cc_caseD_3 / switchD_<addr>_default and the
+# numbered branch label LAB_0008f0a0_1. Any other hex-looking word inside a name is not an address
+# — a real symbol (CRYPTO_cbc128_encrypt, AES_cfb128_encrypt), the content a string label spells out
+# (s_0123456789abcdef_<addr>), a local's access offset (local._153920_4_) — and blanking it would
+# read two different bodies as the same.
+#
+# BOUNDARY: a 64-bit image's address wider than eight digits is not blanked mid-name, so such a
+# pair reads ``differs`` (the cautious direction). A name that is not a synthetic label but ENDS in
+# a hex-looking word of six or more characters (foo_abcdef) is still blanked there.
+_ADDR_SUFFIX = re.compile(
+    r"_(?:r0x)?[0-9a-fA-F]{6,}\b"  # at the end of a name: FUN_ / DAT_ / s_..._ / joined_r0x
+    r"|(?<=\bswitchD)_[0-9a-fA-F]{8}(?=_)"  # switchD_<addr>_caseD_n / switchD_<addr>_default
+    r"|(?<=\bLAB)_[0-9a-fA-F]{8}(?=_)"  # LAB_<addr>_<n>
+)
 # A bare absolute address / GOT offset literal, same six-digit floor.
 _ABS_HEX = re.compile(r"\b0x[0-9a-fA-F]{6,}\b")
 

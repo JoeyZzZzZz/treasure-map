@@ -1747,9 +1747,12 @@ def make_tools(
         ``address``) puts one component first. ``sort_by='significance'`` is a lens, not a
         relabel: attention 0 = bucket A or a row carrying ``sink_arg_constant_delta``; 2 (sunk,
         still listed) = pseudocode_sameness ``identical`` or bucket C; 1 = the rest, lowest
-        similarity first. Never sunk: an R entry, a ``sink_present_no_visible_delta`` B (labelled
+        similarity first, R and B entries ordered together. Attention 0 holds B entries too (a
+        row's ``sink_arg_constant_delta``) beside A. Never sunk: an R entry (attention 2 never
+        holds one), a ``sink_present_no_visible_delta`` B (labelled
         ``recheckable_no_visible_delta``), and an entry judged changed_real, inconclusive or due a
-        re-check / relabel; with ``band=true`` the judgement band orders entries inside each tier.
+        re-check / relabel — none of them reaches attention 2, whether ``band`` is on or off; only
+        with ``band=true`` does the judgement band order entries inside each tier.
         Each entry then carries ``significance`` (its tier and why) — never a verdict. Filters:
         ``bucket``, ``subclass`` (an entry's or any of its rows'), ``tier`` (a number, ``no_sink``
         or ``unknown``), ``blind_spot`` (a key of the ``blind_spots`` ledger — page through the
@@ -2122,7 +2125,8 @@ def make_tools(
         get_diff_patch_view (get_diff_meta for the per-function split).
 
         ★ ``functions`` is read from what the diff stored, at no cost: ``aligned`` pairs, how many
-        of them scored below similarity 1 (``aligned_similarity_below_1``),
+        of them scored below similarity 1 (``aligned_similarity_below_1``; a pair with no
+        recorded score is counted there, never read as 1),
         ``alignment_undetermined``, and ``one_sided`` functions by presence_state (never 'added' /
         'removed'). Similarity 1 is NOT 'unchanged' — BinDiff is blind to constants and buffer
         sizes; whether an aligned pair really changed (unchanged / changed / unverified / no_body)

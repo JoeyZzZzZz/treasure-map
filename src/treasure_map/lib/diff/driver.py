@@ -57,6 +57,7 @@ from treasure_map.lib.diff.currency import (
     extraction_stamp,
     hunt_inputs_digest,
     read_extraction,
+    run_hunt_marks,
     side_stamp,
     stamps_equal,
     toolchain_columns,
@@ -482,6 +483,10 @@ class FullDiffSummary:
     # and those whose store was refused (their old rows kept, reading stale)
     baselines_refreshed: tuple[str, ...] = ()
     baselines_refresh_refused: tuple[str, ...] = ()
+    # already-ok diffs whose recorded hunt marks (scanned_at / hunt_instances) were brought up to
+    # the runs' current ones, and those left as they were (see _restamp_hunt_marks)
+    hunt_marks_restamped: tuple[str, ...] = ()
+    hunt_marks_left: tuple[str, ...] = ()
 
 
 # ── binary .so location (finding-1 fail-fast) ────────────────────────────────────────
@@ -1577,11 +1582,14 @@ def run_full_diff(
     # already ok, and that is exactly when their baselines go stale.
     refreshed: tuple[str, ...] = ()
     refused: tuple[str, ...] = ()
+    restamped: tuple[str, ...] = ()
+    marks_left: tuple[str, ...] = ()
     if not assume_current:
         refreshed, refused, notes = _refresh_unchanged_baselines(
             atlas, run_a_id, run_b_id, plan.already_ok
         )
         warnings = (*warnings, *notes)
+        restamped, marks_left = _restamp_hunt_marks(atlas, run_a_id, run_b_id, plan.already_ok)
     if not to_run:
         # nothing NEEDS diffing: no changed binaries, or all already-ok / suspected-hard (skipped).
         return FullDiffSummary(
@@ -1592,6 +1600,8 @@ def run_full_diff(
             warnings=warnings,
             baselines_refreshed=refreshed,
             baselines_refresh_refused=refused,
+            hunt_marks_restamped=restamped,
+            hunt_marks_left=marks_left,
         )
     _check_toolchain(config)
     # notify the caller of the sweep size (no confirmation gate — a full diff is normal use)
@@ -1724,6 +1734,8 @@ def run_full_diff(
         warnings=warnings,
         baselines_refreshed=refreshed,
         baselines_refresh_refused=refused,
+        hunt_marks_restamped=restamped,
+        hunt_marks_left=marks_left,
     )
 
 
@@ -1759,6 +1771,79 @@ def _refresh_unchanged_baselines(
         else:
             refreshed.append(binary)
     return tuple(refreshed), tuple(refused), tuple(notes)
+
+
+def _restamp_hunt_marks(
+    atlas: sqlite3.Connection, run_a_id: str, run_b_id: str, already_ok: tuple[str, ...]
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Bring the recorded hunt marks of each already-ok diff up to the runs' current ones. Returns
+    (restamped, left): the binaries whose marks were rewritten, and those with a side that could
+    not be. A diff whose marks already match is in neither.
+
+    ``scanned_at_{a,b}`` / ``hunt_instances_{a,b}`` decide nothing: they are not among the compared
+    stamps (lib/diff/currency.COMPARED_COLUMNS) and only let a reader skip recomputing a side's
+    hunt-input digest while no hunt has run since the diff. Every re-scan rewrites
+    ``run.scanned_at``, so a diff left as it is keeps marks that never match again and every later
+    read recomputes the digest. A side is rewritten only when, at this moment, the run is still
+    there, the digest recomputed here equals the one the diff recorded (the hunt output it read is
+    unchanged), and the run holds exactly ``run.hunt_instances`` candidate rows; otherwise that
+    side is left as it is and the reader keeps recomputing. Nothing compared — no stamp, no
+    digest — is written. One transaction for the run pair. Called only when the plan compared the
+    inputs (not under assume_current).
+
+    BOUNDARY: as for the reader's own guard, a write to the digested tables made outside a hunt
+    after this point is not seen by the marks, beyond a change to the run's instance row count."""
+    live: dict[str, tuple[str | None, int | None, int] | None] = {}
+
+    def run_marks(run_id: str) -> tuple[str | None, int | None, int] | None:
+        if run_id not in live:
+            marks = run_hunt_marks(atlas, run_id)
+            rows = atlas.execute(
+                "SELECT COUNT(*) FROM instance WHERE source_run_id = ?", (run_id,)
+            ).fetchone()[0]
+            live[run_id] = None if marks is None else (marks[0], marks[1], rows)
+        return live[run_id]
+
+    restamped: list[str] = []
+    left: list[str] = []
+    try:
+        for binary in already_ok:
+            diff_id = make_diff_id(run_a_id, run_b_id, binary)
+            meta = atlas.execute(
+                "SELECT sha256_a, sha256_b, binary_a, binary_b, hunt_inputs_hash_a, "
+                "hunt_inputs_hash_b, scanned_at_a, scanned_at_b, hunt_instances_a, "
+                "hunt_instances_b FROM diff_meta WHERE diff_id = ?",
+                (diff_id,),
+            ).fetchone()
+            if meta is None:
+                continue
+            moved = skipped = False
+            for i, (side, run_id) in enumerate((("a", run_a_id), ("b", run_b_id))):
+                sha, name, recorded = meta[i], meta[2 + i], meta[4 + i]
+                marks = run_marks(run_id)
+                if marks is not None and (meta[6 + i], meta[8 + i]) == marks[:2]:
+                    continue  # already the run's current marks: nothing to write
+                moved = True
+                if (
+                    marks is None
+                    or marks[0] is None
+                    or marks[2] != marks[1]
+                    or hunt_inputs_digest(atlas, run_id, sha, name) != recorded
+                ):
+                    skipped = True
+                    continue
+                atlas.execute(
+                    f"UPDATE diff_meta SET scanned_at_{side} = ?, hunt_instances_{side} = ? "  # noqa: S608 -- side is a or b
+                    "WHERE diff_id = ?",
+                    (marks[0], marks[1], diff_id),
+                )
+            if moved:
+                (left if skipped else restamped).append(binary)
+        atlas.commit()
+    except BaseException:
+        atlas.rollback()
+        raise
+    return tuple(restamped), tuple(left)
 
 
 def _concrete_hash(value: str | None) -> bool:

@@ -167,6 +167,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The candidate map parses each candidate's evidence once.** `triage` (and so `tmap triage` and
+  MCP `list_candidates`) read a dozen fields of a candidate's stored `flow_evidence`, and each
+  reader parsed the JSON text again — about fifteen parses per candidate. It is now parsed once per
+  candidate and the parsed object is handed to every reader (readers still accept the text, so
+  other callers are unchanged); nothing is shared between candidates. The output is unchanged; on
+  the largest run measured the map is built about seven times faster.
+- **A full diff brings the hunt marks of a diff it leaves as it is up to date.** Every re-scan
+  rewrites the run's `scanned_at`, so a diff that needed no re-run kept marks that no longer
+  matched, and every later read (`list_diffs` and the other diff read tools) recomputed the
+  hunt-input digests of every diff. When the full diff finds a diff already ok, it rewrites that
+  diff's `scanned_at_{a,b}` / `hunt_instances_{a,b}` — side by side, and only where the digest
+  recomputed at that moment equals the recorded one and the run's candidate row count matches. No
+  compared stamp is written. `tmap diff` reports `hunt marks : N refreshed, M left`. This changes
+  the diff code version, so every stored diff reads `diff_logic_changed` once and is re-run by the
+  next `tmap diff`.
+- The significance lens and the `list_diffs` note now state three rules they already followed: an
+  R entry never sits in the bottom tier and is ordered with B entries by similarity; a judgement
+  holds its entry off the bottom tier whether `band` is on or off, while the judgement band orders
+  entries only with `band=true`; `aligned_similarity_below_1` counts a pair with no recorded score.
+
 - **Breaking: `tmap diff` takes the two runs as roles, `--before <run_id> --after <run_id>`.**
   The positional form `tmap diff X Y` is refused (exit 2) with the command that replaces it, ready
   to copy, carrying the other options given. `--before` is side A and `--after` side B, as before;
@@ -276,6 +296,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an earlier extraction) carries `extraction_current: false`, also surfaced under `anchor_facts`.
 
 ### Fixed
+
+- **Pseudocode sameness no longer blanks hex-looking words inside names.** The address
+  normalisation treated any word of six or more hex characters followed by `_` as an address, so a
+  real symbol (`CRYPTO_cbc128_encrypt` against `CRYPTO_cfb128_encrypt`), the text a string label
+  spells out, or a local's access offset was blanked, and two different bodies could read
+  `identical` (sunk by the significance lens, counted unchanged). An address is now blanked at the
+  end of a name, or mid-name only in the switch label `switchD_<addr>_…` and the numbered branch
+  label `LAB_<addr>_<n>`, as exactly eight hex digits. On the diffs measured no pair's reading
+  changed.
+- **`tmap diff` no longer stops when one binary's function split cannot be read.** The per-binary
+  line is printed from inside the diff's loop; an error building it now prints `functions
+  unreadable (…)` on that line and the diff goes on (the binary's diff is stored).
 
 - **A rebuilt export no longer loses the targets of its flow-graph edges.** The fallback builder
   registered a basic block the program-wide iteration missed only when it reached the function

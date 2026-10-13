@@ -854,6 +854,98 @@ def test_assume_current_keeps_the_diff_and_the_reader_still_flags_it(
     assert (got["source_stale"], got["source_stale_reason"]) == (True, "extraction_changed")
 
 
+def _compared(w: _World) -> dict[str, Any]:
+    row = _row(w)
+    return {c: row[c] for c in currency.COMPARED_COLUMNS}
+
+
+def _marks(w: _World) -> tuple[Any, ...]:
+    row = _row(w)
+    return tuple(row[f"{c}_{s}"] for c in ("scanned_at", "hunt_instances") for s in "ab")
+
+
+def _counting_digest(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    calls: list[str] = []
+    real = diff_align.hunt_inputs_digest
+
+    def counting(*a: Any) -> str:
+        calls.append(a[1])
+        return real(*a)
+
+    monkeypatch.setattr(diff_align, "hunt_inputs_digest", counting)
+    return calls
+
+
+def test_a_diff_left_as_it_is_takes_the_runs_new_hunt_marks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ A re-scan rewrites run.scanned_at even when the hunt reproduces its output. The full diff
+    leaves the diff as it is (already ok) and brings its recorded hunt marks up to the runs' new
+    ones, so a later read takes the fast path instead of recomputing both digests every time — and
+    nothing the re-diff decision compares is written.
+
+    MUTATION (verified RED): skip the restamp in run_full_diff -> nothing is restamped and
+    list_diffs would recompute the digest -> RED."""
+    w = _two(tmp_path)
+    _stub(monkeypatch, w)
+    _full(w)
+    compared = _compared(w)
+    _rehunt(w, "run_a")
+    _rehunt(w, "run_b")
+    fs = _full(w)
+    assert fs.outcomes == () and fs.plan.already_ok == ("liba",)
+    assert (fs.hunt_marks_restamped, fs.hunt_marks_left) == (("liba",), ())
+    now = w.atlas.execute("SELECT run_id, scanned_at, hunt_instances FROM run").fetchall()
+    marks = {r[0]: (r[1], r[2]) for r in now}
+    assert _marks(w) == (*(marks[r][0] for r in ("run_a", "run_b")), 1, 1)
+    assert _compared(w) == compared
+    calls = _counting_digest(monkeypatch)
+    got = diff_align.list_diffs(w.atlas)["diffs"][0]
+    assert calls == []
+    assert (got["source_stale"], got["source_stale_reason"]) == (False, None)
+    assert _full(w).hunt_marks_restamped == ()  # marks already current: nothing to rewrite
+
+
+def test_a_side_whose_hunt_output_moved_keeps_its_marks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A moved digest is not restamped: the full diff re-runs that diff (it is not already ok), and
+    restamping it directly leaves the side as it was, so a reader still recomputes the digest and
+    reads it stale. Nothing compared is written.
+
+    MUTATION (verified RED): drop the guards (restamp unconditionally) -> the side is restamped,
+    its marks move and a reader would take the fast path to source_stale false; write the side's
+    hunt_inputs_hash before the guards -> the compared columns move."""
+    w = _two(tmp_path)
+    _stub(monkeypatch, w)
+    _full(w)
+    _hunt_output(w)
+    plan = _plan(w)
+    assert (plan.to_diff, plan.already_ok) == (("liba",), ())
+    compared, marks = _compared(w), _marks(w)
+    assert driver._restamp_hunt_marks(w.atlas, "run_a", "run_b", ("liba",)) == ((), ("liba",))
+    assert _marks(w) == marks
+    assert _compared(w) == compared
+    got = diff_align.list_diffs(w.atlas)["diffs"][0]
+    assert (got["source_stale"], got["source_stale_reason"]) == (True, "hunt_inputs_changed")
+
+
+def test_assume_current_leaves_the_hunt_marks_as_they_were(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With assume_current the plan did not compare the inputs, so the marks are not touched.
+
+    MUTATION (verified RED): restamp regardless of assume_current -> the marks move."""
+    w = _two(tmp_path)
+    _stub(monkeypatch, w)
+    _full(w)
+    marks = _marks(w)
+    _rehunt(w, "run_a")
+    fs = _full(w, assume_current=True)
+    assert (fs.hunt_marks_restamped, fs.hunt_marks_left) == ((), ())
+    assert _marks(w) == marks
+
+
 def test_a_run_pair_overlay_marks_each_row_by_its_own_diff(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1328,6 +1420,103 @@ def test_the_cli_prints_each_binarys_function_split_and_the_pairs_coverage(
     assert "tmap triage run_b" in res.output
     assert "every candidate-holding binary is diffed or byte-identical" in res.output
     assert "baselines refreshed (unchanged diffs): 1, 0 refused" in res.output
+
+
+_STATES = {
+    "withheld": False,
+    "aligned": 9,
+    "unchanged": 5,
+    "changed": {"total": 3, "with_scoped_sink_delta": 1, "no_scoped_signal": 2},
+    "unverified": {"total": 1, "identical_callee_unverified": 1, "unavailable": 0},
+    "no_body": 0,
+    "alignment_undetermined": 2,
+    "one_sided": {},
+}
+
+
+def _cli_full_diff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    states: Any,
+    coverage: dict[str, Any] | None,
+    **summary: Any,
+) -> Any:
+    """``tmap diff`` over two binaries, liba and libb, both diffed ok; ``states`` stands in for
+    function_states and ``coverage`` for the run pair's coverage."""
+    from treasure_map.cli.main import main
+    from treasure_map.lib.query import patch_view
+
+    monkeypatch.setattr(patch_view, "function_states", states)
+    monkeypatch.setattr(diff_align, "list_diffs", lambda *a, **k: {"coverage": coverage})
+
+    def fake_full(atlas: Any, a: str, b: str, **kw: Any) -> driver.FullDiffSummary:
+        oks = (
+            driver.BinaryDiffOutcome("liba", _summary("liba", 0, 0, 0), None),
+            driver.BinaryDiffOutcome("libb", _summary("libb", 0, 0, 0), None),
+        )
+        for i, o in enumerate(oks, start=1):
+            kw["on_outcome"](i, len(oks), o)
+        plan = driver.FullDiffPlan(("liba", "libb"), (), (), (), to_diff=("liba", "libb"))
+        return driver.FullDiffSummary(plan, oks, cancelled=False, **summary)
+
+    monkeypatch.setattr(driver, "run_full_diff", fake_full)
+    _two(tmp_path)  # the command reads both run rows before it diffs
+    return CliRunner().invoke(
+        main,
+        ["diff", "--before", "run_a", "--after", "run_b", "--atlas", str(tmp_path / "atlas.db")],
+    )
+
+
+def test_a_function_split_that_cannot_be_read_does_not_stop_the_diff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ Each binary's line is printed from inside the diff's loop. Reading one binary's function
+    split failing is said on that line — its diff is stored — and the diff goes on to the next
+    binary; it never ends the run. The hunt-mark line reports the diffs left as they are.
+
+    MUTATION: call function_states without the guard -> liba's error ends the command -> RED."""
+
+    def states(atlas: Any, did: str) -> dict[str, Any]:
+        if did == _did("liba"):
+            raise RuntimeError("view could not be built")
+        return _STATES
+
+    res = _cli_full_diff(
+        tmp_path,
+        monkeypatch,
+        states,
+        None,
+        hunt_marks_restamped=("libc",),
+        hunt_marks_left=("libd", "libe"),
+    )
+    assert res.exit_code == 0, res.output
+    assert (
+        "[1/2] liba: functions unreadable (RuntimeError: view could not be built) — the diff "
+        "itself is stored; see get_diff_meta" in res.output
+    )
+    assert "[2/2] libb: 9 aligned: 5 unchanged" in res.output
+    assert "diffed        : 2 ok" in res.output
+    assert "hunt marks    : 1 refreshed, 2 left (digest moved or run changed)" in res.output
+
+
+def test_the_cli_says_a_failed_diff_leaves_the_pair_uncovered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Display only: the coverage it is handed says a diff failed, and the roll-up says the pair is
+    not covered (the rule itself is held in test_diff_review). No hunt marks moved, no line.
+
+    MUTATION: print the covered sentence whatever the flag says -> RED."""
+    coverage = {
+        "failed_diffs": [_did("libc")],
+        "not_diffed_binaries": {},
+        "identical_binaries": {},
+        "all_candidate_binaries_covered": False,
+    }
+    res = _cli_full_diff(tmp_path, monkeypatch, lambda atlas, did: _STATES, coverage)
+    assert res.exit_code == 0, res.output
+    assert "NOT every candidate-holding binary is covered" in res.output
+    assert "every candidate-holding binary is diffed or byte-identical" not in res.output
+    assert "hunt marks" not in res.output
 
 
 def test_the_diff_listing_counts_functions_and_leaves_edges_to_their_view(tmp_path: Path) -> None:

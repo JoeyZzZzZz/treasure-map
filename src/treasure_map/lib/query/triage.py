@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -173,17 +173,38 @@ class TriageCandidate:
         return Dimension(name, "unknown", "unknown", "not computed")
 
 
-def _entry_reach_sites(flow_evidence: str | None) -> list[dict[str, Any]]:
-    """The ``entry_reach.sites`` list (rootfs invocation evidence) from the stored flow_evidence; []
-    when the evidence is missing, unparsable, or carries no sites. Each site carries a ``kind``
-    (``web_endpoint`` / ``script_call``) — the fact the evidence layer already recorded."""
+# A candidate's stored flow_evidence: the JSON text as the atlas holds it, or that text already
+# parsed. Every reader below accepts either, so a caller holding the text keeps passing it, and one
+# that reads many fields of the same candidate parses it once and hands the result down.
+Evidence = str | Mapping[str, Any] | None
+
+
+def _parse_evidence(flow_evidence: str | None) -> dict[str, Any] | None:
+    """The one place flow_evidence text is parsed. None when it is missing, unparsable, or not a
+    JSON object — the three cases every reader answers with its own empty default."""
     if not flow_evidence:
-        return []
+        return None
     try:
         data = json.loads(flow_evidence)
     except (ValueError, TypeError):
-        return []
-    reach = data.get("entry_reach") if isinstance(data, dict) else None
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _as_evidence(flow_evidence: Evidence) -> Mapping[str, Any] | None:
+    """``flow_evidence`` as a parsed mapping: text is parsed (``_parse_evidence``), an already
+    parsed mapping is used as it is. Readers only read it — none of them changes it."""
+    if isinstance(flow_evidence, Mapping):
+        return flow_evidence
+    return _parse_evidence(flow_evidence)
+
+
+def _entry_reach_sites(flow_evidence: Evidence) -> list[dict[str, Any]]:
+    """The ``entry_reach.sites`` list (rootfs invocation evidence) from the stored flow_evidence; []
+    when the evidence is missing, unparsable, or carries no sites. Each site carries a ``kind``
+    (``web_endpoint`` / ``script_call``) — the fact the evidence layer already recorded."""
+    data = _as_evidence(flow_evidence)
+    reach = data.get("entry_reach") if data is not None else None
     sites = reach.get("sites") if isinstance(reach, dict) else None
     if not isinstance(sites, list):
         return []
@@ -200,7 +221,7 @@ _ENTRY_KIND_LABELS: tuple[tuple[str, str], ...] = (
 )
 
 
-def _entry_reach_status(flow_evidence: str | None) -> str:
+def _entry_reach_status(flow_evidence: Evidence) -> str:
     """Classify the entry evidence into an HONEST, multi-valued MECHANISTIC label, reading each
     ``entry_reach.sites`` entry's ``kind`` (the fact the evidence layer recorded) — NOT collapsing
     every site to a single misleading "found":
@@ -221,7 +242,7 @@ def _entry_reach_status(flow_evidence: str | None) -> str:
     return f"entry:{'+'.join(present)}" if present else "unknown"
 
 
-def _entry_web_triggers(flow_evidence: str | None, *, limit: int = 3) -> tuple[str, ...]:
+def _entry_web_triggers(flow_evidence: Evidence, *, limit: int = 3) -> tuple[str, ...]:
     """Short ``"METHOD endpoint"`` labels for the web_endpoint entry sites, so an entry:web reading
     shows WHICH endpoint triggered it (the consumer confirms the dispatch themselves — a textual
     reference is not proof). Capped at ``limit``; script sites carry no endpoint and are omitted."""
@@ -239,20 +260,15 @@ def _entry_web_triggers(flow_evidence: str | None, *, limit: int = 3) -> tuple[s
     return tuple(out)
 
 
-def _source_kind_from_evidence(flow_evidence: str | None) -> str:
+def _source_kind_from_evidence(flow_evidence: Evidence) -> str:
     """Surface ``source_kind`` from the stored flow_evidence JSON; ``unknown`` when absent.
 
     A pure read of the value the evidence layer already recorded (free_string / charset_safe /
     charset_maybe / unknown) — this does NOT recompute the classification, it only exposes it.
     Conservative: any missing / unparsable evidence, or an absent / non-string source_kind, reports
     ``unknown`` (never fabricates a class)."""
-    if not flow_evidence:
-        return "unknown"
-    try:
-        data = json.loads(flow_evidence)
-    except (ValueError, TypeError):
-        return "unknown"
-    kind = data.get("source_kind") if isinstance(data, dict) else None
+    data = _as_evidence(flow_evidence)
+    kind = data.get("source_kind") if data is not None else None
     return kind if isinstance(kind, str) and kind else "unknown"
 
 
@@ -270,7 +286,7 @@ _OLDER_PASS_NOTE = (
 )
 
 
-def anchor_facts(flow_evidence: str | None) -> dict[str, Any]:
+def anchor_facts(flow_evidence: Evidence) -> dict[str, Any]:
     """The stored facts about a candidate's ANCHOR and EXTRACTION, verbatim, each with its note.
 
     Two facts, both recorded by the hunt and both easy to miss inside flow_evidence: the ref is a
@@ -278,13 +294,8 @@ def anchor_facts(flow_evidence: str | None) -> dict[str, Any]:
     candidate was read from an earlier extraction (``extraction_current: false`` +
     ``extraction_pass`` [+ ``attempted_pass``]). Empty when neither applies, so a reader can surface
     the dict whenever it is non-empty. A pure read; never computes either fact."""
-    if not flow_evidence:
-        return {}
-    try:
-        data = json.loads(flow_evidence)
-    except (ValueError, TypeError):
-        return {}
-    if not isinstance(data, dict):
+    data = _as_evidence(flow_evidence)
+    if data is None:
         return {}
     out: dict[str, Any] = {}
     if data.get("callsite_located") is False:
@@ -302,18 +313,13 @@ def anchor_facts(flow_evidence: str | None) -> dict[str, Any]:
     return out
 
 
-def _sink_provenance_records(flow_evidence: str | None) -> list[dict[str, Any]]:
+def _sink_provenance_records(flow_evidence: Evidence) -> list[dict[str, Any]]:
     """The full sink_arg_provenance list (Ghidra def-use fact) from the stored flow_evidence.
 
     A pure read of what the analysis layer already recorded; empty list when the evidence is
     absent, unparsable, or carries no provenance. Never recomputes or invents provenance."""
-    if not flow_evidence:
-        return []
-    try:
-        data = json.loads(flow_evidence)
-    except (ValueError, TypeError):
-        return []
-    prov = data.get("sink_arg_provenance") if isinstance(data, dict) else None
+    data = _as_evidence(flow_evidence)
+    prov = data.get("sink_arg_provenance") if data is not None else None
     if not isinstance(prov, list):
         return []
     return [r for r in prov if isinstance(r, dict)]
@@ -648,7 +654,7 @@ def _record_class(conn: sqlite3.Connection, rec: dict[str, Any]) -> str:
 
 
 def _scoped_records(
-    flow_evidence: str | None, sink_anchor: str | None, *, callsite_addr: int | None = None
+    flow_evidence: Evidence, sink_anchor: str | None, *, callsite_addr: int | None = None
 ) -> list[dict[str, Any]]:
     """The sink_arg_provenance records for the candidate's ANCHORED sink (rec.sink == sink_anchor).
 
@@ -676,7 +682,7 @@ def _scoped_records(
 
 
 def _writer_scoped_records(
-    flow_evidence: str | None, sink_anchor: str | None, *, callsite_addr: int | None = None
+    flow_evidence: Evidence, sink_anchor: str | None, *, callsite_addr: int | None = None
 ) -> list[dict[str, Any]]:
     """The sink_arg_provenance records for the candidate's anchored sink — STRICTLY, no fallback.
 
@@ -715,7 +721,7 @@ def _writer_scoped_records(
 
 def _verdict_from_provenance(
     conn: sqlite3.Connection,
-    flow_evidence: str | None,
+    flow_evidence: Evidence,
     sink_anchor: str | None,
     *,
     callsite_addr: int | None = None,
@@ -750,36 +756,26 @@ def _verdict_from_provenance(
 _DEF_USE_SINKS: frozenset[str] = CMD | FMT_STRING
 
 
-def _flow_is_via_wrapper(flow_evidence: str | None) -> bool:
+def _flow_is_via_wrapper(flow_evidence: Evidence) -> bool:
     """True when this candidate's sink sits one hop away, inside a thin forwarding wrapper.
 
     Reads the single marker the evidence writer sets for that shape
     (``flow_path.sink_via_wrapper``), never the evidence_ref's suffix. Anything absent or
     unparseable is False, which is the conservative direction HERE: a False keeps an ordinary
     copy/path candidate's empty provenance trusted instead of sweeping it in."""
-    if not flow_evidence:
-        return False
-    try:
-        data = json.loads(flow_evidence)
-    except (TypeError, ValueError):
-        return False
-    if not isinstance(data, dict):
+    data = _as_evidence(flow_evidence)
+    if data is None:
         return False
     flow_path = data.get("flow_path")
     return isinstance(flow_path, dict) and flow_path.get("sink_via_wrapper") is True
 
 
-def _flow_wrapped_sink(flow_evidence: str | None) -> str | None:
+def _flow_wrapped_sink(flow_evidence: Evidence) -> str | None:
     """The real sink name behind a thin wrapper (``flow_path.wrapper.wrapped_sink``), or None when
     the shape does not record one. None is NOT read as "not a command sink" — see
     ``_wrapper_empty_evidence``, which keeps it a third, explicitly unknown class."""
-    if not flow_evidence:
-        return None
-    try:
-        data = json.loads(flow_evidence)
-    except (TypeError, ValueError):
-        return None
-    if not isinstance(data, dict):
+    data = _as_evidence(flow_evidence)
+    if data is None:
         return None
     flow_path = data.get("flow_path")
     if not isinstance(flow_path, dict):
@@ -792,7 +788,7 @@ def _flow_wrapped_sink(flow_evidence: str | None) -> str | None:
 
 
 def _anchor_missed(
-    flow_evidence: str | None, sink_anchor: str | None, *, callsite_addr: int | None = None
+    flow_evidence: Evidence, sink_anchor: str | None, *, callsite_addr: int | None = None
 ) -> bool:
     """True ONLY when the def-use provenance SHOULD carry the anchored sink but does NOT.
 
@@ -833,6 +829,7 @@ def _anchor_missed(
         return False
     if sink_anchor not in _DEF_USE_SINKS:  # (a) defensive
         return False
+    flow_evidence = _as_evidence(flow_evidence)  # parsed once for the two readers below
     records = _sink_provenance_records(flow_evidence)
     if not records:  # (b) load-bearing — SPLIT by whether the sink was forwarded through a wrapper
         # A via_wrapper candidate's sink lives in a DIFFERENT function at a DIFFERENT address, so
@@ -856,7 +853,7 @@ def _anchor_missed(
 
 def _web_settable_keys_reaching_sink(
     conn: sqlite3.Connection,
-    flow_evidence: str | None,
+    flow_evidence: Evidence,
     sink_anchor: str | None,
     *,
     callsite_addr: int | None = None,
@@ -887,7 +884,7 @@ def _web_settable_keys_reaching_sink(
 
 def _likely_settable_keys_reaching_sink(
     conn: sqlite3.Connection,
-    flow_evidence: str | None,
+    flow_evidence: Evidence,
     sink_anchor: str | None,
     wrapper_names: frozenset[str],
     *,
@@ -940,7 +937,7 @@ _ARGS_CLASS_TO_STATE: dict[str, str] = {
 
 def _sink_provenance_summary(
     conn: sqlite3.Connection,
-    flow_evidence: str | None,
+    flow_evidence: Evidence,
     *,
     sink_anchor: str | None = None,
     callsite_addr: int | None = None,
@@ -1225,7 +1222,7 @@ def _nvram_key_from_source(source: Any, wrapper_names: frozenset[str] = frozense
 
 
 def _nvram_source_key(
-    flow_evidence: str | None,
+    flow_evidence: Evidence,
     wrapper_names: frozenset[str],
     sink_anchor: str | None,
     *,
@@ -1295,7 +1292,7 @@ _SOURCE_ORIGIN_COMPLETENESS = (
 )
 
 
-def _dispatch_origins(flow_evidence: str | None) -> list[dict[str, Any]]:
+def _dispatch_origins(flow_evidence: Evidence) -> list[dict[str, Any]]:
     """Origins from the string-keyed dispatch leads: which key routes to this function.
 
     Field names are the lead's own, read off real data rather than guessed — a lead carries
@@ -1324,7 +1321,7 @@ def _dispatch_origins(flow_evidence: str | None) -> list[dict[str, Any]]:
 
 
 def _provenance_origins(
-    flow_evidence: str | None,
+    flow_evidence: Evidence,
     wrapper_names: frozenset[str],
     sink_anchor: str | None,
     *,
@@ -1435,7 +1432,7 @@ def _origin_cross_references(conn: sqlite3.Connection, origins: list[dict[str, A
 
 def source_origin(
     conn: sqlite3.Connection,
-    flow_evidence: str | None,
+    flow_evidence: Evidence,
     *,
     sink_anchor: str | None,
     wrapper_names: frozenset[str] = frozenset(),
@@ -1453,6 +1450,7 @@ def source_origin(
     deliberately not scoped: a string-keyed lead says which key routes to the FUNCTION, so it is
     the same fact for every candidate in it and has no sink to be scoped by.
     """
+    flow_evidence = _as_evidence(flow_evidence)  # parsed once for both halves
     origins = _dispatch_origins(flow_evidence) + _provenance_origins(
         flow_evidence, wrapper_names, sink_anchor, callsite_addr=callsite_addr
     )
@@ -1587,7 +1585,7 @@ _FORMAT_STRING_READING: dict[str, str] = {
 }
 
 
-def _copy_surface(evidence: dict[str, Any]) -> dict[str, Any] | None:
+def _copy_surface(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
     """The length picture for a copy candidate, or None when the producer recorded none.
 
 
@@ -1633,7 +1631,7 @@ def _copy_surface(evidence: dict[str, Any]) -> dict[str, Any] | None:
     return out
 
 
-def _fmt_surface(evidence: dict[str, Any]) -> dict[str, Any] | None:
+def _fmt_surface(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
     """Which argument of a format sink carries the format string.
 
     Returns None when neither key was written at all. That is the state a candidate recovered
@@ -1688,7 +1686,7 @@ def _exec_shape_surface(blocking_mechanism: str | None) -> dict[str, Any] | None
 
 
 def evidence_surface(
-    flow_evidence: str | None,
+    flow_evidence: Evidence,
     sink_class: str | None,
     blocking_mechanism: str | None = None,
 ) -> dict[str, Any] | None:
@@ -1702,14 +1700,7 @@ def evidence_surface(
 
     Derived and read-only. It states what shape was found and what was not decided; it decides
     nothing, and it is not an input to any reading of controllability."""
-    evidence: dict[str, Any] = {}
-    if flow_evidence:
-        try:
-            parsed = json.loads(flow_evidence)
-        except (ValueError, TypeError):
-            parsed = None
-        if isinstance(parsed, dict):
-            evidence = parsed
+    evidence = _as_evidence(flow_evidence) or {}
     if sink_class in (_CLASS_COPY, _CLASS_FORMAT):
         # One reader for both: a buffer formatter is read on the same write-length axis a copy is,
         # and its record has the same shape plus a format-string field the copy path never writes.
@@ -1721,41 +1712,26 @@ def evidence_surface(
     return None
 
 
-def _flow_path_obj(flow_evidence: str | None) -> dict[str, Any]:
+def _flow_path_obj(flow_evidence: Evidence) -> dict[str, Any]:
     """The stored flow_evidence.flow_path dict (sink_arg / one_hop / wrapper markers); {} when
     absent or unparsable."""
-    if not flow_evidence:
-        return {}
-    try:
-        data = json.loads(flow_evidence)
-    except (ValueError, TypeError):
-        return {}
-    fp = data.get("flow_path") if isinstance(data, dict) else None
+    data = _as_evidence(flow_evidence)
+    fp = data.get("flow_path") if data is not None else None
     return fp if isinstance(fp, dict) else {}
 
 
-def _flow_list(flow_evidence: str | None, key: str) -> list[Any]:
+def _flow_list(flow_evidence: Evidence, key: str) -> list[Any]:
     """A top-level LIST stored on flow_evidence under ``key``; [] when absent or unparsable (so a
     candidate written before the field existed simply carries none)."""
-    if not flow_evidence:
-        return []
-    try:
-        data = json.loads(flow_evidence)
-    except (ValueError, TypeError):
-        return []
-    val = data.get(key) if isinstance(data, dict) else None
+    data = _as_evidence(flow_evidence)
+    val = data.get(key) if data is not None else None
     return val if isinstance(val, list) else []
 
 
-def _sanitizer_records(flow_evidence: str | None) -> list[dict[str, Any]]:
+def _sanitizer_records(flow_evidence: Evidence) -> list[dict[str, Any]]:
     """The stored flow_evidence.sanitizer_seen list; [] when absent or unparsable."""
-    if not flow_evidence:
-        return []
-    try:
-        data = json.loads(flow_evidence)
-    except (ValueError, TypeError):
-        return []
-    san = data.get("sanitizer_seen") if isinstance(data, dict) else None
+    data = _as_evidence(flow_evidence)
+    san = data.get("sanitizer_seen") if data is not None else None
     return [s for s in san if isinstance(s, dict)] if isinstance(san, list) else []
 
 
@@ -1765,7 +1741,7 @@ def _sanitizer_records(flow_evidence: str | None) -> list[dict[str, Any]]:
 def _controllability_reading(
     conn: sqlite3.Connection,
     *,
-    flow_evidence: str | None,
+    flow_evidence: Evidence,
     sink_anchor: str | None,
     source_kind: str,
     blocking_mechanism: str | None,
@@ -1812,6 +1788,7 @@ def _controllability_reading(
     extractor emits no such marker today, so argv-free rides step 4.) The provenance verdict is
     computed by _verdict_from_provenance — the SAME classifier the explain rollup uses, so a
     candidate carries one controllability reading, never two that disagree."""
+    flow_evidence = _as_evidence(flow_evidence)  # parsed once for every reader below
     prov_verdict = _verdict_from_provenance(
         conn, flow_evidence, sink_anchor, callsite_addr=callsite_addr
     )
@@ -1993,7 +1970,7 @@ _WRAPPER_EMPTY_UNKNOWN_DETAIL = (
 )
 
 
-def _wrapper_empty_evidence(flow_evidence: str | None) -> dict[str, Any]:
+def _wrapper_empty_evidence(flow_evidence: Evidence) -> dict[str, Any]:
     """The drill-down row for a candidate whose const reading was withdrawn because its sink was
     forwarded into a wrapper and never traced.
 
@@ -2027,7 +2004,7 @@ def _wrapper_empty_evidence(flow_evidence: str | None) -> dict[str, Any]:
 def _dim_controllability(
     conn: sqlite3.Connection,
     *,
-    flow_evidence: str | None,
+    flow_evidence: Evidence,
     sink_anchor: str | None,
     source_kind: str,
     blocking_mechanism: str | None,
@@ -2051,6 +2028,7 @@ def _dim_controllability(
     ★ ``replace`` touches ``evidence`` and nothing else: the fallback's own note (the "OPTIMISTIC,
     confirm byte-freedom by hand" honesty) stays verbatim. Two independent honest signals, two
     slots — neither overwrites the other."""
+    flow_evidence = _as_evidence(flow_evidence)  # parsed once for every reader below
     via_wrapper_empty = not _sink_provenance_records(flow_evidence) and _flow_is_via_wrapper(
         flow_evidence
     )
@@ -2143,7 +2121,7 @@ _REACH_CAVEAT_COMPLETENESS = (
 
 
 def _edge_leads(
-    edges: tuple[dict[str, Any], ...], flow_evidence: str | None
+    edges: tuple[dict[str, Any], ...], flow_evidence: Evidence
 ) -> tuple[dict[str, Any], ...]:
     """The structured string-key leads for this candidate — machine-readable, unambiguous.
 
@@ -2222,7 +2200,7 @@ def _dim_reachability(
     entry_reach: str,
     web_triggers: tuple[str, ...] = (),
     string_keyed_edges: tuple[dict[str, Any], ...] = (),
-    flow_evidence: str | None = None,
+    flow_evidence: Evidence = None,
 ) -> Dimension:
     """Which kind of entry edge references this binary? A MECHANISTIC label — entry:web /
     entry:script / entry:exec / their ``+`` combinations / unknown — NEVER a reachability verdict
@@ -2272,7 +2250,7 @@ def _dim_reachability(
     )
 
 
-def _dim_filtering(flow_evidence: str | None) -> Dimension:
+def _dim_filtering(flow_evidence: Evidence) -> Dimension:
     """Is there sanitization on the path? Near-always '?' this phase: tmap does a generic
     name-match only and cannot prove a sanitizer covers the path, so it claims neither present
     or proven-absent — it does not save the agent from reading the filter code."""
@@ -2311,7 +2289,7 @@ def _dim_sink_impact(sink_class: str, overrides: dict[str, int] | None = None) -
 
 
 def _dim_writer(
-    flow_evidence: str | None, sink_anchor: str | None, *, callsite_addr: int | None = None
+    flow_evidence: Evidence, sink_anchor: str | None, *, callsite_addr: int | None = None
 ) -> Dimension:
     """Who writes the sink argument's value? located / via_wrapper / not_traced, from the def-use
     provenance of THIS candidate's own sink. A ? (not_traced) never sinks.
@@ -2324,6 +2302,7 @@ def _dim_writer(
     ``located`` off a constant sibling call to the same sink; a function-level ref keeps the
     by-name scope. Not ``_scoped_records``: its liberal fallback is right for controllability and
     wrong here (see that pair's docstrings)."""
+    flow_evidence = _as_evidence(flow_evidence)  # parsed once for both readers
     if _flow_path_obj(flow_evidence).get("sink_via_wrapper"):
         return Dimension(
             "writer",
@@ -2417,7 +2396,7 @@ def _dim_source(source_class: str, source_kind: str) -> Dimension:
 def _build_dimensions(
     conn: sqlite3.Connection,
     *,
-    flow_evidence: str | None,
+    flow_evidence: Evidence,
     source_class: str,
     source_kind: str,
     blocking_mechanism: str | None,
@@ -2435,6 +2414,7 @@ def _build_dimensions(
     controllability layer runs the single verdict over the anchored sink's def-use provenance. The
     orthogonal ``source`` layer consumes the coarse ``source_class`` and is INDEPENDENT of the
     controllability verdict (never a certainty-chain step)."""
+    flow_evidence = _as_evidence(flow_evidence)  # parsed once for every layer
     web_settable = _web_settable(conn, nvram_key) if nvram_key else None
     return (
         _dim_controllability(
@@ -2462,7 +2442,9 @@ def _candidate(
     wrapper_names: frozenset[str] = frozenset(),
 ) -> TriageCandidate:
     reach = row["reachability_status"]
-    fe = _row_get(row, "flow_evidence")
+    # Parsed ONCE for this candidate and handed to every reader below (none of them changes it). A
+    # parse is never shared with another candidate, even one whose evidence text is the same.
+    fe = _parse_evidence(_row_get(row, "flow_evidence"))
     entry_reach = _entry_reach_status(fe)
     web_triggers = _entry_web_triggers(fe)
     source_kind = _source_kind_from_evidence(fe)

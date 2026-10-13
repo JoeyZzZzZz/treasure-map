@@ -1086,6 +1086,55 @@ def test_list_diffs_reads_the_same_split_and_an_identical_binary_never_blocks_co
     assert cov["identical_binaries"] == {"a": one, "b": one}
 
 
+def test_a_diffed_binary_holding_candidates_on_both_sides_is_covered(world: World) -> None:
+    """★ A binary whose content WAS one side of a diff is covered, whatever else shares its name:
+    its candidates are in no not-diffed reason and the pair reads covered.
+
+    MUTATION: drop the "content is a diffed hash" skip in ``not_diffed_binaries`` -> libx's
+    candidates fall to its diffed name and read shadowed_by_name_collision -> RED."""
+    _cand(world, _ref("runA", "00001000"), "runA", "/fw/usr/lib/libx", SHAS[DX][0])
+    _cand(world, _ref("runB", "00002000"), "runB", "/fw/usr/lib/libx", SHAS[DX][1])
+    assert da.not_diffed_binaries(world.atlas, "runA", "runB") == {}
+    cov = da.list_diffs(world.atlas, "runA", "runB")["coverage"]
+    assert cov["not_diffed_binaries"] == {} and cov["identical_binaries"] == {}
+    assert cov["all_candidate_binaries_covered"] is True
+
+
+def test_identical_content_wins_over_a_same_named_diffed_binary(world: World) -> None:
+    """A binary byte-identical on both sides needed no diff, even when another file of the same name
+    was diffed: it is identical_both_sides, never read as shadowed by that name.
+
+    MUTATION: test the name collision before the identical content in ``not_diffed_reason`` -> both
+    sides read shadowed_by_name_collision -> RED."""
+    _cand(world, _ref("runA", "00007000"), "runA", "/fw/opt/lib/libx", "e" * 64)
+    _cand(world, _ref("runB", "00008000"), "runB", "/fw/opt/lib/libx", "e" * 64)
+    same = {"identical_both_sides": {"binaries": 1, "candidates": 1, "names": ["libx"]}}
+    assert da.not_diffed_binaries(world.atlas, "runA", "runB") == {"a": same, "b": same}
+    cov = da.list_diffs(world.atlas, "runA", "runB")["coverage"]
+    assert cov["not_diffed_binaries"] == {}
+    assert cov["all_candidate_binaries_covered"] is True
+
+
+def test_a_failed_diff_alone_keeps_the_pair_uncovered(world: World) -> None:
+    """★ A diff that failed covers nothing, though it names its binary's content (a failure row
+    records both sides' sha256, as the driver writes it): with no other blind spot, the failure
+    alone keeps ``all_candidate_binaries_covered`` false, and is listed.
+
+    MUTATION: compute the flag from the not-diffed binaries alone (ignore the failed diffs) ->
+    RED."""
+    world.atlas.execute(
+        "UPDATE diff_meta SET diff_ok = 0, diff_status = 'failed', "
+        "diff_status_reason = 'bindiff_failed' WHERE diff_id = ?",
+        (DY,),
+    )
+    _cand(world, _ref("runA", "00003000"), "runA", "/fw/usr/lib/liby", SHAS[DY][0])
+    _cand(world, _ref("runB", "00004000"), "runB", "/fw/usr/lib/liby", SHAS[DY][1])
+    cov = da.list_diffs(world.atlas, "runA", "runB")["coverage"]
+    assert cov["failed_diffs"] == [DY]
+    assert cov["not_diffed_binaries"] == {}  # the failure's content is named: no blind spot
+    assert cov["all_candidate_binaries_covered"] is False
+
+
 def test_get_diff_meta_carries_the_views_function_split_and_a_failed_diff_has_none(
     world: World,
 ) -> None:

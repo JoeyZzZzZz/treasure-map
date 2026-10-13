@@ -90,12 +90,29 @@ def _echo_legal_notice(*, as_json: bool = False) -> None:
     click.echo("", err=True)
 
 
+def _safe_function_states(atlas: Any, diff_id: str) -> dict[str, Any] | None:
+    """lib/query/patch_view.function_states for the progress line, or ``{"unreadable": why}`` when
+    reading them fails. The line is printed from inside the diff's loop, so an error here must not
+    end the diff: the binary's diff is already stored, only its summary could not be shown."""
+    from treasure_map.lib.query.patch_view import function_states
+
+    try:
+        return function_states(atlas, diff_id)
+    except Exception as exc:  # a display step: report it on the line and let the sweep go on
+        return {"unreadable": f"{type(exc).__name__}: {exc}"}
+
+
 def _function_line(states: dict[str, Any] | None) -> str:
     """One binary's functions as the diff left them (lib/query/patch_view.function_states): what
     its aligned pairs' pseudocode says, never similarity alone. A diff that did not run, or is
     undetermined as a whole, prints no counts — zeros would read as 'nothing moved'."""
     if states is None:
         return "no diff row to read (see get_diff_meta)"
+    if "unreadable" in states:
+        return (
+            f"functions unreadable ({states['unreadable']}) — the diff itself is stored; "
+            "see get_diff_meta"
+        )
     if states.get("withheld"):
         banners = states.get("banners", [])
         if "diff_undetermined:diff_failed" in banners:
@@ -224,6 +241,13 @@ def _echo_full_diff(
         click.echo(
             f"  baselines refreshed (unchanged diffs): {len(fsum.baselines_refreshed)}, "
             f"{len(fsum.baselines_refresh_refused)} refused"
+        )
+    if fsum.hunt_marks_restamped or fsum.hunt_marks_left:
+        # Diffs left as they are whose recorded hunt marks were brought up to the runs' current
+        # ones, so a later read need not recompute their hunt-input digests.
+        click.echo(
+            f"  hunt marks    : {len(fsum.hunt_marks_restamped)} refreshed, "
+            f"{len(fsum.hunt_marks_left)} left (digest moved or run changed)"
         )
     if still_hard:
         click.echo(
@@ -660,7 +684,6 @@ def hunt_diff(
     from treasure_map.lib.config.config import load_config
     from treasure_map.lib.diff.driver import run_full_diff, run_version_diff
     from treasure_map.lib.query.diff_align import list_diffs
-    from treasure_map.lib.query.patch_view import function_states
 
     # Refused before anything is opened: nothing has been read, so nothing can have been written.
     if legacy_runs:
@@ -714,7 +737,7 @@ def hunt_diff(
         if outcome.error is not None:
             click.echo(f"  [{i}/{total}] {outcome.binary}: FAILED — {outcome.error}")
         else:
-            states = function_states(atlas, outcome.summary.diff_id)
+            states = _safe_function_states(atlas, outcome.summary.diff_id)
             click.echo(f"  [{i}/{total}] {outcome.binary}: {_function_line(states)}")
 
     atlas = open_atlas(Path(resolved_atlas))
@@ -723,7 +746,7 @@ def hunt_diff(
     try:
         if binary_name is not None:
             single = run_version_diff(atlas, before, after, binary_name, config=cfg, force=force)
-            states = function_states(atlas, single.diff_id)
+            states = _safe_function_states(atlas, single.diff_id)
             full = None
         else:
             single = None

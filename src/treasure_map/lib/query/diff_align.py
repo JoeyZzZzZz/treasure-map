@@ -676,7 +676,8 @@ def get_diff_capabilities(atlas: sqlite3.Connection, diff_id: str) -> dict[str, 
 _LIST_DIFFS_NOTE = (
     "Each row is ONE binary's diff between two runs (diff_id = {run_a}::{run_b}::{binary}). "
     "``functions`` counts FUNCTIONS from what the diff stored: aligned pairs, how many of them "
-    "BinDiff scored below similarity 1, pairs whose alignment is undetermined, and the functions "
+    "BinDiff scored below similarity 1 (a pair with no recorded score counted among them, never "
+    "read as 1), pairs whose alignment is undetermined, and the functions "
     "with no counterpart by presence_state (never 'added' / 'removed'). Similarity 1 is NOT "
     "'unchanged' — it is blind to constants and buffer sizes; whether an aligned pair really "
     "changed (unchanged / changed / unverified / no_body, by pseudocode) is per diff: "
