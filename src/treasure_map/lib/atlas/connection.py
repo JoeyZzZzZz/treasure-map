@@ -361,6 +361,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
         if "verdict_basis" not in _column_names(conn, "overlay"):
             conn.execute("ALTER TABLE overlay ADD COLUMN verdict_basis TEXT")
 
+        # overlay.promoted_from (this round): the diff entry a candidate judgement was carried over
+        # from. Additive and nullable — existing rows keep NULL. Same ordering rule as
+        # verdict_basis above, for the same reason: it must follow the fixed-column rebuild.
+        if "promoted_from" not in _column_names(conn, "overlay"):
+            conn.execute("ALTER TABLE overlay ADD COLUMN promoted_from TEXT")
+
     # run.hunt_commit (added this round): which tmap commit produced this run's instances, so a
     # re-hunt can be skipped when the code that would run is the same code that already ran.
     # Nullable on purpose — a run hunted before this column existed carries NULL, which compares

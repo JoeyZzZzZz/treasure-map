@@ -39,6 +39,12 @@ is never C because its callees look unchanged.
 ORDER: A first, then the R and B entries that carry a sink candidate, then the entries with none,
 then P; inside each, by the named components of ``rank_key`` (visible on every entry). ``tier`` is
 the sink-impact tier of the entry's candidates (lib/query/sink_impact), ``no_sink`` without any.
+
+JUDGEMENTS are a separate, writable layer (lib/query/diff_review, written by lib/overlay.py): the
+view stays read-only and its facts never change because of one. Every entry carries its
+``anchor_ref`` and ``review_state`` and the envelope ``review_progress`` and ``annotation``, with
+or without any judgement; only with ``band`` on do they move entries, and then only among entries
+the default order already holds together.
 """
 
 from __future__ import annotations
@@ -50,6 +56,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from treasure_map.lib.diff.layer0 import norm_hex
+from treasure_map.lib.query import diff_review
 from treasure_map.lib.query.diff_align import diff_source_staleness, get_diff_deltas
 from treasure_map.lib.query.sink_impact import impact_tier
 from treasure_map.lib.query.sink_overlay import (
@@ -685,6 +692,7 @@ class _Builder:
         elif self.unavailable:
             self.callee_block = "analysis_db_unavailable"
         self.unattributed = 0
+        self.placed: list[_Entry] = []
 
     # ── per-ref facts ──
 
@@ -728,7 +736,8 @@ class _Builder:
                 unpaired_entry(side, fe).rows.append(r)
         listed: list[_Entry] = []
         not_listed = {"aligned_identical_all_persisted": 0, "aligned_identical_no_candidate": 0}
-        for e in [*by_pair.values(), *by_fn.values()]:
+        self.placed = [*by_pair.values(), *by_fn.values()]
+        for e in self.placed:
             self._place(e)
             if e.bucket:
                 listed.append(e)
@@ -1107,20 +1116,35 @@ def _rank(e: _Entry) -> dict[str, Any]:
     }
 
 
-def _default_key(r: dict[str, Any]) -> tuple[Any, ...]:
+def _default_key(r: dict[str, Any], band: int = 0) -> tuple[Any, ...]:
+    """The default order's key. ``band`` (the judgement band, 0 when it is off) sits after the
+    first four components and before similarity, so it only ever reorders entries those four
+    already hold together — never across a segment, a tier, a lane or a subclass rank."""
     seg = r["segment"]
     if seg == 1:
-        return (1, -r["tier"], 0, 0, r["similarity"], "", r["address"])
+        return (1, -r["tier"], 0, 0, band, r["similarity"], "", r["address"])
     if seg == 2:
-        return (2, -r["tier"], r["lane"], r["subclass_rank"], r["similarity"], "", r["address"])
+        return (
+            2,
+            -r["tier"],
+            r["lane"],
+            r["subclass_rank"],
+            band,
+            r["similarity"],
+            "",
+            r["address"],
+        )
     if seg == 3:
-        return (3, r["lane"], r["subclass_rank"], 0, r["similarity"], "", r["address"])
-    return (4, -r["tier"], 0, 0, 0.0, r["side"], r["address"])
+        return (3, r["lane"], r["subclass_rank"], 0, band, r["similarity"], "", r["address"])
+    return (4, -r["tier"], 0, 0, band, 0.0, r["side"], r["address"])
 
 
-def _sort(entries: list[_Entry], sort_by: str | None) -> list[_Entry]:
+def _sort(
+    entries: list[_Entry], sort_by: str | None, band: dict[str, int] | None = None
+) -> list[_Entry]:
     """The default order, or ``sort_by`` (one named component) ahead of it. P stays last either
-    way: a function with no counterpart is not ordered among the pairs."""
+    way: a function with no counterpart is not ordered among the pairs. ``band`` maps an entry id
+    to its judgement band (diff_review.band_bias); None leaves the order as it is."""
 
     def key(e: _Entry) -> tuple[Any, ...]:
         r = e.rank
@@ -1133,7 +1157,7 @@ def _sort(entries: list[_Entry], sort_by: str | None) -> list[_Entry]:
             head = (r["address"],)
         else:
             head = ()
-        return (p_last, *head, *_default_key(r))
+        return (p_last, *head, *_default_key(r, band.get(e.entry_id, 0) if band else 0))
 
     return sorted(entries, key=key)
 
@@ -1257,9 +1281,14 @@ def _check_args(
     limit: Any,
     offset: Any,
     filtered: bool,
+    band: Any = False,
 ) -> str | None:
     if view not in VIEWS:
         return f"view must be one of {VIEWS}, got {view!r}"
+    if not isinstance(band, bool):
+        return f"band must be true or false, got {band!r}"
+    if view != "sink_patch" and band:
+        return "band applies to view='sink_patch' only"
     if sort_by is not None and sort_by not in SORT_BY:
         return f"sort_by must be one of {SORT_BY} or null, got {sort_by!r}"
     if bucket is not None and bucket not in BUCKETS:
@@ -1275,33 +1304,30 @@ def _check_args(
     return None
 
 
-def get_diff_patch_view(
-    atlas: sqlite3.Connection,
-    diff_id: str,
-    *,
-    view: str = "sink_patch",
-    sort_by: str | None = None,
-    bucket: str | None = None,
-    subclass: str | None = None,
-    tier: str | int | None = None,
-    blind_spot: str | None = None,
-    limit: int = 200,
-    offset: int = 0,
-) -> dict[str, Any]:
-    """The function-level view of one diff (see the module docstring), one page of it.
+@dataclass
+class BuiltDiff:
+    """One diff's view, built: what get_diff_patch_view reads, and what a judgement on one of its
+    entries is checked against (lib/query/diff_annotations), so the two always see the same
+    entries."""
 
-    ``view``: ``sink_patch`` (function pairs, the default), ``string_edge`` (get_diff_deltas'
-    rows), ``candidate_flat`` (get_diff_sink_overlay's rows, in its order). The filters and
-    ``sort_by`` apply to ``sink_patch``; ``counts`` / ``not_listed`` / ``blind_spots`` always
-    describe the whole diff. Pages are in a fixed order; follow ``next_offset`` until null."""
-    filters = {"bucket": bucket, "subclass": subclass, "tier": tier, "blind_spot": blind_spot}
-    filtered = any(v is not None for v in filters.values())
-    error = _check_args(view, sort_by, bucket, tier, limit, offset, filtered)
-    if error is not None:
-        return {"diff_id": diff_id, "error": error}
+    diff: _Diff
+    staleness: dict[str, Any]
+    overlay: _Overlay
+    n_edges: int
+    edges_by_anchor: dict[str, Any]
+    banners: list[str]
+    entries: list[_Entry]  # the listed entries
+    placed: list[_Entry]  # every entry placed, listed or not; empty when withheld
+    not_listed: dict[str, int]
+    withheld: dict[str, Any] | None  # set when the whole diff is undetermined
+    unavailable: dict[str, str]
+
+
+def build_diff_view(atlas: sqlite3.Connection, diff_id: str) -> BuiltDiff | None:
+    """Build one diff's view; None when there is no such diff."""
     diff = _load_diff(atlas, diff_id)
     if diff is None:
-        return {"diff_id": diff_id, "found": False, "error": "no such diff (see list_diffs)"}
+        return None
     staleness = diff_source_staleness(atlas, diff_id)
     overlay = read_overlay_rows(atlas, diff_id, diff.run_a, diff.run_b)
     n_edges, edges_by_anchor = _string_edges(atlas, diff_id)
@@ -1324,6 +1350,7 @@ def get_diff_patch_view(
         banners.append("overlay_coverage_violation")
 
     entries: list[_Entry] = []
+    placed: list[_Entry] = []
     not_listed = {"aligned_identical_all_persisted": 0, "aligned_identical_no_candidate": 0}
     withheld: dict[str, Any] | None = None
     unavailable: dict[str, str] = {}
@@ -1341,6 +1368,7 @@ def get_diff_patch_view(
     else:
         builder = _Builder(atlas, diff, overlay, staleness["source_stale"])
         entries, not_listed = builder.entries()
+        placed = builder.placed
         unattributed = builder.unattributed
         unavailable = {s: str(builder.sides[s].error) for s in builder.unavailable}
         for e in entries:
@@ -1349,6 +1377,55 @@ def get_diff_patch_view(
             e.rank = _rank(e)
     if unattributed:
         banners.append(f"overlay_rows_unattributed:{unattributed}")
+    return BuiltDiff(
+        diff=diff,
+        staleness=staleness,
+        overlay=overlay,
+        n_edges=n_edges,
+        edges_by_anchor=edges_by_anchor,
+        banners=banners,
+        entries=entries,
+        placed=placed,
+        not_listed=not_listed,
+        withheld=withheld,
+        unavailable=unavailable,
+    )
+
+
+def get_diff_patch_view(
+    atlas: sqlite3.Connection,
+    diff_id: str,
+    *,
+    view: str = "sink_patch",
+    sort_by: str | None = None,
+    bucket: str | None = None,
+    subclass: str | None = None,
+    tier: str | int | None = None,
+    blind_spot: str | None = None,
+    limit: int = 200,
+    offset: int = 0,
+    band: bool = False,
+) -> dict[str, Any]:
+    """The function-level view of one diff (see the module docstring), one page of it.
+
+    ``view``: ``sink_patch`` (function pairs, the default), ``string_edge`` (get_diff_deltas'
+    rows), ``candidate_flat`` (get_diff_sink_overlay's rows, in its order). The filters and
+    ``sort_by`` apply to ``sink_patch``; ``counts`` / ``not_listed`` / ``blind_spots`` always
+    describe the whole diff. Pages are in a fixed order; follow ``next_offset`` until null.
+
+    ``band`` (``sink_patch`` only, off by default) moves the judged entries inside the groups the
+    default order already forms (diff_review.band_bias); off, the order is the base order. The
+    judgement keys (``anchor_ref`` / ``review_state`` on each entry, ``review_progress`` and
+    ``annotation`` on the envelope) are there either way."""
+    filters = {"bucket": bucket, "subclass": subclass, "tier": tier, "blind_spot": blind_spot}
+    filtered = any(v is not None for v in filters.values())
+    error = _check_args(view, sort_by, bucket, tier, limit, offset, filtered, band)
+    if error is not None:
+        return {"diff_id": diff_id, "error": error}
+    built = build_diff_view(atlas, diff_id)
+    if built is None:
+        return {"diff_id": diff_id, "found": False, "error": "no such diff (see list_diffs)"}
+    overlay, banners, entries = built.overlay, built.banners, built.entries
 
     # Counted over every overlay row of the diff, listed entry or not.
     rows_by_spot = {
@@ -1376,13 +1453,16 @@ def get_diff_patch_view(
             if v["landing"] != "persisted"
         ),
     }
-    if withheld is not None:
-        counts["withheld"] = withheld
+    if built.withheld is not None:
+        counts["withheld"] = built.withheld
     subject_counts = {
         "function_pair": len(entries),
         "candidate_row": len(overlay.rows),
-        "string_edge": n_edges,
+        "string_edge": built.n_edges,
     }
+    ledger = _ledger(entries, rows_by_spot, built.unavailable)
+    chosen = [e for e in entries if _matches(e, bucket, subclass, tier, blind_spot)]
+    review = ViewReview(atlas, built)
     envelope: dict[str, Any] = {
         "diff_id": diff_id,
         "lens": {
@@ -1410,13 +1490,21 @@ def get_diff_patch_view(
         "legend": _LEGEND,
         "caveats": _CAVEATS,
         "baseline_state": overlay.baseline_state,
-        **staleness,
+        **built.staleness,
         "banners": banners,
         "counts": counts,
-        "not_listed": not_listed,
-        "blind_spots": _ledger(entries, rows_by_spot, unavailable),
+        "not_listed": built.not_listed,
+        "blind_spots": ledger,
         "overlay_coverage": overlay.coverage,
+        "review_progress": review.progress(chosen, filters, ledger),
+        "annotation": review.annotation(),
     }
+    if band:
+        envelope["lens"]["band"] = (
+            "on: inside each group the default order holds together (segment, tier, lane, "
+            "subclass rank), entries due a re-check first, then change_inconclusive, then "
+            "unjudged, then changed_real, then no_real_change"
+        )
     if view == "string_edge":
         deltas = get_diff_deltas(atlas, diff_id, limit=limit, offset=offset)
         page = deltas["page"]
@@ -1438,17 +1526,137 @@ def get_diff_patch_view(
             }
         )
         return envelope
-    chosen = [e for e in entries if _matches(e, bucket, subclass, tier, blind_spot)]
-    ordered = _sort(chosen, sort_by)
+    ordered = _sort(chosen, sort_by, review.bands() if band else None)
     end = offset + limit
     envelope.update(
         {
-            "entries": [_entry_json(e) for e in ordered[offset:end]],
+            "entries": [review.entry_json(e, band) for e in ordered[offset:end]],
             "total_entries": len(ordered),
             "next_offset": end if end < len(ordered) else None,
         }
     )
     return envelope
+
+
+class ViewReview:
+    """The judgements on one built diff, read against it: each listed entry's anchor and review
+    state, the progress over a scope of entries, and the annotation block."""
+
+    def __init__(self, atlas: sqlite3.Connection, built: BuiltDiff) -> None:
+        d = built.diff
+        self.built = built
+        self.binary = d.binary
+        self.withheld = built.withheld is not None
+        rows = diff_review.read_judgements(atlas, d.run_a, d.run_b)
+        subjects = (
+            diff_review.subjects_of(built.placed, d.run_a, d.run_b, d.binary) if d.binary else {}
+        )
+        self.judged, self.dangling = diff_review.judgements_for(
+            rows,
+            diff_id=d.diff_id,
+            run_a=d.run_a,
+            run_b=d.run_b,
+            binary=d.binary,
+            subjects=subjects,
+            withheld=self.withheld,
+            staleness=built.staleness,
+        )
+        self.anchor: dict[str, str | None] = {
+            e.entry_id: (
+                diff_review.entry_anchor(e, d.run_a, d.run_b, d.binary) if d.binary else None
+            )
+            for e in built.entries
+        }
+        position = {e.entry_id: i for i, e in enumerate(_sort(built.entries, None))}
+        self.items: dict[str, diff_review.Item] = {}
+        for e in built.entries:
+            anchor = self.anchor[e.entry_id]
+            judged = self.judged.get(anchor) if anchor is not None else None
+            self.items[e.entry_id] = diff_review.Item(
+                entry_id=e.entry_id,
+                anchor_ref=anchor or "",
+                bucket=e.bucket,
+                subclass=e.subclass,
+                tier=e.tier,
+                state=diff_review.review_state(judged),
+                verdict=judged.verdict if judged is not None else None,
+                order=(position[e.entry_id],),
+            )
+
+    def bands(self) -> dict[str, int]:
+        return {k: diff_review.band_bias(i.state, i.verdict) for k, i in self.items.items()}
+
+    def entry_json(self, e: _Entry, band: bool) -> dict[str, Any]:
+        out = _entry_json(e)
+        item = self.items[e.entry_id]
+        if band:
+            bias = diff_review.band_bias(item.state, item.verdict)
+            out["rank_key"] = {**e.rank, "band_bias": bias}
+        out["anchor_ref"] = self.anchor[e.entry_id]
+        out["review_state"] = item.state
+        return out
+
+    def progress(
+        self, chosen: list[_Entry], filters: dict[str, Any], ledger: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        blind = {
+            "ledger": [
+                {"key": s["key"], "count": s["count"], "unit": s["unit"]}
+                for s in ledger
+                if s.get("count") is not None
+            ],
+            "structural": [s["key"] for s in ledger if s.get("count") is None],
+            "banners": list(self.built.banners),
+            "see": "blind_spots (top-level) — every key with its entries",
+        }
+        if self.withheld:
+            return {
+                "unit": "entry",
+                "withheld": True,
+                "banners": list(self.built.banners),
+                "judgements_on_this_diff": len(self.judged),
+                "blind_spots": blind,
+                "complete": False,
+                "note": (
+                    "The whole diff is undetermined (banners), so it lists no entry and nothing "
+                    "in it can be counted as looked at or not. Resolve what the banners name — "
+                    "re-run the diff, or re-scan the run — and read this again."
+                ),
+            }
+        chosen_ids = {e.entry_id for e in chosen}
+        scope = [self.items[e.entry_id] for e in chosen]
+        rest = [i for k, i in self.items.items() if k not in chosen_ids]
+        numbers = diff_review.counts(scope)
+        rest_numbers = diff_review.counts(rest)
+        return {
+            "unit": "entry",
+            "scope": filters,
+            **numbers,
+            "next_page": diff_review.next_page(scope),
+            "dangling_annotations": self.dangling,
+            "outside_this_scope": {
+                "not_looked_at": rest_numbers["not_looked_at"],
+                "pages_remaining": rest_numbers["pages_remaining"],
+            },
+            "blind_spots": blind,
+            "complete": numbers["not_looked_at"] == 0,
+            "note": diff_review.PROGRESS_NOTE,
+        }
+
+    def annotation(self) -> dict[str, Any]:
+        d = self.built.diff
+        if self.withheld:
+            return diff_review.annotation_unavailable(
+                "the whole diff is undetermined (banners): nothing in it can be judged until "
+                "that is resolved — re-run the diff, or re-scan the run the banners name",
+                self.built.banners,
+            )
+        if not d.binary:
+            return diff_review.annotation_unavailable(
+                "this diff records no binary name, which every anchor carries — re-run the diff",
+                self.built.banners,
+            )
+        return diff_review.annotation_block(d.diff_id, d.run_a, d.run_b, list(self.items.values()))
 
 
 def _matches(

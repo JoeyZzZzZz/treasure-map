@@ -834,9 +834,12 @@ CREATE VIEW IF NOT EXISTS dimension_delta_full AS
 -- undoes the annotation is the consumer's judgement, never asserted here.
 CREATE TABLE IF NOT EXISTS overlay (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- 'evidence_ref': a judgement on one candidate (anchor_ref is its evidence_ref).
+    -- 'diff_subject': a judgement on one entry of a version diff's function-level view
+    -- (anchor_ref is '{run_a}::{run_b}#{function_pair|function_presence|candidate}#{key}').
     anchor_kind   TEXT NOT NULL DEFAULT 'evidence_ref'
-        CHECK (anchor_kind IN ('evidence_ref','diff_subject')),  -- diff_subject reserved (unused)
-    anchor_ref    TEXT NOT NULL,            -- evidence_ref (run_id#sha8:addr@suffix) for the MVP kind
+        CHECK (anchor_kind IN ('evidence_ref','diff_subject')),
+    anchor_ref    TEXT NOT NULL,
     -- Which firmware this annotation belongs to. DERIVED from anchor_ref (the segment before '#'),
     -- stored explicitly so filtering to one firmware is an exact equality match instead of a
     -- string prefix probe. Nullable: an anchor kind that carries no run segment leaves it NULL
@@ -862,6 +865,10 @@ CREATE TABLE IF NOT EXISTS overlay (
     verdict_basis TEXT,
     created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    -- Where a candidate judgement came from when it was carried over from a diff entry
+    -- (overlay.py::promote): JSON {diff_id, anchor_ref}. NULL for every other row; any other
+    -- write to the row sets it back to NULL, so a stale origin is never left behind.
+    promoted_from TEXT,
     -- one annotation per anchor: a re-annotation UPDATES in place (last write wins)
     UNIQUE (anchor_kind, anchor_ref)
 );

@@ -877,6 +877,7 @@ def test_open_atlas_drops_a_stale_exec_edge_resolved_via(tmp_path: Path) -> None
         ("function_alignment", "export_gap_a"),
         ("function_alignment", "export_gap_b"),
         ("function_presence", "export_gap"),
+        ("overlay", "promoted_from"),
     ],
 )
 def test_open_atlas_reopens_old_shape_missing_migrated_column(
@@ -1143,6 +1144,7 @@ def test_rebuilt_overlay_keeps_every_other_constraint(tmp_path: Path) -> None:
             "verdict_basis",
             "created_at",
             "updated_at",
+            "promoted_from",
         }
     finally:
         conn.close()

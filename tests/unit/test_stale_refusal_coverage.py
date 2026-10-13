@@ -330,6 +330,9 @@ def test_a_diff_is_refused_when_either_side_is_stale(atlas: Path, side: str) -> 
         lambda: tools["get_diff_meta"]("d1"),
         lambda: tools["get_diff_capabilities"]("d1"),
         lambda: tools["get_function_alignment"]("d1", "0x1000"),
+        lambda: tools["annotate_diff"]("d1", f"{a_id}::{b_id}#function_pair#x::1::2", "x", "r"),
+        lambda: tools["promote"]("d1", "pair:1:2", "r#x", "suspicious", "r"),
+        lambda: tools["list_overlays"](anchor_kind="diff_subject", run_id=f"{a_id}::{b_id}"),
     ):
         result = call()
         assert result["stale_scan"]["axis"] == "extraction"

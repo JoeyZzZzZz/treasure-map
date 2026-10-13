@@ -42,8 +42,10 @@ from treasure_map.lib.atlas.models import PublicCvePatternRow, RunRow
 from treasure_map.lib.atlas.writer import add_public_cve_patterns as _add_public_cve_patterns
 from treasure_map.lib.errors import ConfigError
 from treasure_map.lib.notice import LEGAL_NOTICE
+from treasure_map.lib.overlay import annotate_diff as _annotate_diff
 from treasure_map.lib.overlay import clear_overlay as _clear_overlay
 from treasure_map.lib.overlay import list_overlays as _list_overlays
+from treasure_map.lib.overlay import promote as _promote
 from treasure_map.lib.overlay import upsert_overlay as _upsert_overlay
 from treasure_map.lib.query import DEFAULT_LENS_LABEL as _LENS_LABEL
 from treasure_map.lib.query import PHASE1_CAVEATS as _LENS_CAVEATS
@@ -218,7 +220,12 @@ _AGENT_INSTRUCTIONS = (
     "with it off. list_overlays(run_id=...) reviews what you concluded last time and flags any "
     "whose underlying facts have since moved. A row already marked in_exploit_ledger was confirmed "
     "by a person — you cannot write that (people do, from the command line), and it is usually not "
-    "worth re-verifying."
+    "worth re-verifying. For a version diff, start at get_diff_patch_view(diff_id): every entry "
+    "carries its anchor_ref and review_state; annotate_diff(diff_id, anchor_ref, verdict="
+    "changed_real|no_real_change|change_inconclusive, rationale) records your judgement on one "
+    "entry, promote(diff_id, entry_id, row_ref, verdict, rationale) carries it onto one of the "
+    "entry's candidates as a candidate verdict, and list_overlays(anchor_kind='diff_subject', "
+    "run_id='<run_a>::<run_b>') reviews them with the progress over the whole run pair."
 )
 
 
@@ -294,6 +301,10 @@ def _overlay_marker(o: dict[str, Any]) -> dict[str, Any]:
         "verdict": o["verdict"],
         "attributed_to": o["attributed_to"],  # coarse authorship; never fabricated as a human
         "basis_state": o["basis_state"],
+        # Where a judgement carried over from a diff entry came from, and whether that diff is
+        # current now (null on every row that was not promoted). When it is not current,
+        # basis_state above reads source_diff_stale and the row is flagged below like any other.
+        "promoted_from": o.get("promoted_from"),
     }
     if o["basis_state"] != "unchanged":
         delta = o.get("basis_delta") or {}
@@ -658,6 +669,17 @@ def make_tools(
                 err["run_lineage"] = _lineage_inline(run)
                 return err
         return None
+
+    def _refuse_stale_pair(atlas: sqlite3.Connection, pair: str | None) -> dict[str, Any] | None:
+        """The diff refusal, for a call scoped to a whole run pair (``{run_a}::{run_b}``): the two
+        runs are those of the pair's diffs, matched on the pair as a whole. None when no diff of
+        that pair exists — then there is nothing of it to serve."""
+        if pair is None:
+            return None
+        row = atlas.execute(
+            "SELECT diff_id FROM diff_meta WHERE run_a_id || '::' || run_b_id = ? LIMIT 1", (pair,)
+        ).fetchone()
+        return _refuse_stale_diff(atlas, row[0]) if row is not None else None
 
     def _reverse_hint(
         atlas: sqlite3.Connection, run_a: str | None, run_b: str | None, names: tuple[str, str]
@@ -1697,6 +1719,7 @@ def make_tools(
         blind_spot: str | None = None,
         limit: int = 200,
         offset: int = 0,
+        band: bool = False,
     ) -> dict[str, Any]:
         """START HERE for one diff (``diff_id`` = ``{run_a}::{run_b}::{binary}``; list_diffs gives
         the ids): one entry per FUNCTION PAIR that changed, with what happened around its sink
@@ -1737,7 +1760,19 @@ def make_tools(
         cannot be compared and no entry is listed; ``instruction_data_absent`` = no instruction
         pairs were stored, so A cannot occur. ``source_stale`` / ``source_stale_reason`` /
         ``toolchain_checked`` as in list_diffs; when ``source_stale`` is not false the callee lists
-        are not compared."""
+        are not compared.
+
+        YOUR JUDGEMENTS on the entries are a separate, writable layer; the view's facts never
+        change because of them. Every entry carries ``anchor_ref`` (what to judge it by) and
+        ``review_state`` (``none`` = not judged yet, ``inconclusive`` = judged
+        change_inconclusive, ``concluded``, ``needs_recheck`` = its facts moved or the diff is
+        not current, ``needs_relabel``). ``review_progress`` counts them over the filtered entries
+        (per bucket, with the next unjudged ones named and the rest under
+        ``outside_this_scope``), with the blind spots beside it — ``complete`` is about this scope
+        only. ``annotation`` gives the calls to copy with this diff filled in. ``band`` (off by
+        default) moves judged entries only inside the groups the default order already forms:
+        due a re-check first, then change_inconclusive, unjudged, changed_real, no_real_change;
+        off, the order is the default one."""
         conn = open_atlas(atlas_path)
         try:
             refusal = _refuse_stale_diff(conn, diff_id)
@@ -1754,6 +1789,7 @@ def make_tools(
                 blind_spot=blind_spot,
                 limit=limit,
                 offset=offset,
+                band=band,
             )
         finally:
             conn.close()
@@ -2637,7 +2673,168 @@ def make_tools(
             )
         return result
 
-    def list_overlays(verdict: str | None = None, run_id: str | None = None) -> dict[str, Any]:
+    def annotate_diff(
+        diff_id: str,
+        anchor_ref: str,
+        verdict: str,
+        rationale: str,
+        checked: list[str] | None = None,
+        why_unchanged: str | None = None,
+    ) -> dict[str, Any]:
+        """Record YOUR OWN judgement about one entry of a diff's function-level view
+        (get_diff_patch_view) — did this change do something real. A writable layer over the
+        read-only view: the view's facts are unchanged whether it is empty or full.
+
+        ``anchor_ref`` is the entry's ``anchor_ref`` as get_diff_patch_view prints it (a function
+        pair, or a function with no counterpart), or a candidate row's
+        ``{run_a}::{run_b}#candidate#{key_granularity}|{sink_class}|{a_ref}|{b_ref}`` (an absent
+        side written ``(none)``). It must name something the view lists for ``diff_id`` now —
+        unlike a candidate annotation this is never a blind write: what the judgement rests on is
+        snapshotted from the entry.
+
+        ``verdict`` is one of ``changed_real`` (the change does something real), ``no_real_change``
+        (it does not — REQUIRES ``checked``, two or more facts or anchors you read, and
+        ``why_unchanged``), ``change_inconclusive`` (looked, could not decide — it stays in view;
+        put the next step in the rationale). Candidate verdicts are refused here; to carry this
+        judgement onto one of the entry's candidates, use promote.
+
+        One judgement per anchor: re-annotating OVERWRITES. When the entry's facts move later (its
+        alignment, similarity, bucket or candidate rows), or the diff stops being current, the
+        entry reads ``needs_recheck``."""
+        if not (rationale and rationale.strip()):
+            return {
+                "written": False,
+                "error": "rationale must be non-blank — record why + the next step + confidence.",
+            }
+        supplied = {"checked": checked, "why_unchanged": why_unchanged}
+        given = {k: v for k, v in supplied.items() if v is not None}
+        atlas = open_atlas(atlas_path)
+        try:
+            refusal = _refuse_stale_diff(atlas, diff_id)
+            if refusal is not None:
+                return refusal
+            try:
+                res = _annotate_diff(
+                    atlas,
+                    diff_id=diff_id,
+                    anchor_ref=anchor_ref,
+                    verdict=verdict,
+                    rationale=rationale,
+                    attributed_to="agent-via-mcp",
+                    verdict_basis=given or None,
+                )
+            except ConfigError as exc:
+                return {"written": False, "error": str(exc)}
+        finally:
+            atlas.close()
+        result: dict[str, Any] = {
+            "written": True,
+            "action": res.action,
+            "id": res.id,
+            "diff_id": diff_id,
+            "anchor_ref": anchor_ref,
+            "verdict": verdict,
+            "atlas": str(atlas_path),
+            "note": "recorded on the diff layer (YOUR judgement, never a tool fact). The view is "
+            "unchanged; list_overlays(anchor_kind='diff_subject', run_id=<run pair>) resumes "
+            "these.",
+        }
+        if res.action == "updated":
+            result["overwrote"] = {
+                "attributed_to": res.prior_attributed_to,
+                "updated_at": res.prior_updated_at,
+            }
+        return result
+
+    def promote(
+        diff_id: str,
+        entry_id: str,
+        row_ref: str,
+        verdict: str,
+        rationale: str,
+        block_source: str | None = None,
+        block_point: str | None = None,
+        block_why: str | None = None,
+        chain: str | None = None,
+        verification_gaps: list[str] | None = None,
+        shared_prereq: str | None = None,
+        allow_stale_source: bool = False,
+    ) -> dict[str, Any]:
+        """Carry a judgement reached on a diff entry onto ONE of its candidates, as that
+        candidate's own annotation (a candidate verdict, exactly as annotate writes it, plus where
+        it came from).
+
+        ``diff_id`` is one binary's diff (a run pair is refused); ``entry_id`` the entry's
+        ``entry_id`` or ``anchor_ref``; ``row_ref`` the ``a_ref`` or ``b_ref`` of one of its rows —
+        the candidate written to. ``verdict`` / ``rationale`` / the basis fields are annotate's;
+        ``exploitable`` REQUIRES ``chain`` + ``verification_gaps`` here.
+
+        Refused, with the facts that refused it, unless: the row lands A or persisted, or P with
+        subclass ``unmatched_analysis_complete`` (B, R and the rest cannot say what a candidate
+        verdict would be taken to say); the entry's counterpart is determined (an
+        ``alignment_undetermined`` pair, or a function whose presence is not
+        ``unmatched_analysis_complete``, is refused); and the diff is current (``source_stale``
+        false — otherwise only with ``allow_stale_source``, which is recorded).
+
+        The candidate's annotation then carries ``promoted_from`` (the diff and the entry's anchor)
+        on list_overlays and list_candidates(overlay=true); once that diff is no longer current, or
+        is gone, it reads ``source_diff_stale`` there, so it is re-checked rather than trusted. A
+        later plain annotate on the same candidate replaces the judgement and drops the origin."""
+        supplied = {
+            "block_source": block_source,
+            "block_point": block_point,
+            "block_why": block_why,
+            "chain": chain,
+            "verification_gaps": verification_gaps,
+            "shared_prereq": shared_prereq,
+        }
+        given = {k: v for k, v in supplied.items() if v is not None}
+        atlas = open_atlas(atlas_path)
+        try:
+            refusal = _refuse_stale_diff(atlas, diff_id)
+            if refusal is not None:
+                return refusal
+            try:
+                res = _promote(
+                    atlas,
+                    diff_id=diff_id,
+                    entry_id=entry_id,
+                    row_ref=row_ref,
+                    verdict=verdict,
+                    rationale=rationale,
+                    verdict_basis=given or None,
+                    allow_stale_source=allow_stale_source,
+                    attributed_to="agent-via-mcp",
+                )
+            except ConfigError as exc:
+                out: dict[str, Any] = {"written": False, "error": str(exc)}
+                details = getattr(exc, "details", None)
+                if details is not None:
+                    out["refused"] = details
+                return out
+        finally:
+            atlas.close()
+        result: dict[str, Any] = {
+            "written": True,
+            "action": res.written.action,
+            "id": res.written.id,
+            "evidence_ref": res.evidence_ref,
+            "verdict": verdict,
+            "promoted_from": res.promoted_from,
+            "atlas": str(atlas_path),
+            "note": "recorded on the candidate's annotation, with where it came from. It reads "
+            "source_diff_stale once that diff is no longer current.",
+        }
+        if res.written.action == "updated":
+            result["overwrote"] = {
+                "attributed_to": res.written.prior_attributed_to,
+                "updated_at": res.written.prior_updated_at,
+            }
+        return result
+
+    def list_overlays(
+        verdict: str | None = None, run_id: str | None = None, anchor_kind: str = "evidence_ref"
+    ) -> dict[str, Any]:
         """Your overlay annotations, optionally filtered to one ``verdict`` — the resume view: "what
         did I mark ``inconclusive`` / ``suspicious`` / ``excluded``". Each row carries its live
         ``basis_state``: ``unchanged`` (the pseudocode + dimensions it rested on have not moved),
@@ -2650,42 +2847,77 @@ def make_tools(
         Both filters AND together.
 
         ★ These are AGENT decisions on the overlay, not tool facts. ``bias`` is the opt-in
-        overlay-on view's float(+1)/sink(-1); the base map's own ordering is untouched."""
+        overlay-on view's float(+1)/sink(-1); the base map's own ordering is untouched.
+
+        A judgement carried over from a diff entry (promote) carries ``promoted_from``: the diff,
+        the entry, and whether that diff is current now. When it is not, the row reads
+        ``basis_state`` = ``source_diff_stale``.
+
+        ``anchor_kind="diff_subject"`` lists YOUR judgements on diff entries (annotate_diff)
+        instead, each with its ``review_state`` and what moved; ``run_id`` is then a run pair,
+        ``{run_a}::{run_b}``, and with it the result also carries ``review_progress`` over every
+        diff of that pair — with the failed diffs, the diffs undetermined as a whole and the
+        binaries no diff covers beside it, without which ``complete`` is never true. That
+        rebuilds every diff's view of the pair: tens of seconds for a pair of a hundred diffs."""
         atlas = open_atlas(atlas_path)
         try:
-            refusal = _refuse_stale_run(atlas, run_id)
+            if anchor_kind == "diff_subject":
+                refusal = _refuse_stale_pair(atlas, run_id)
+            else:
+                refusal = _refuse_stale_run(atlas, run_id)
             if refusal is not None:
                 return refusal
-            return _list_overlays(atlas, verdict=verdict, run_id=run_id)
+            return _list_overlays(atlas, verdict=verdict, run_id=run_id, anchor_kind=anchor_kind)
         finally:
             atlas.close()
 
-    def clear_overlay(run_id: str | None = None, evidence_ref: str | None = None) -> dict[str, Any]:
+    def clear_overlay(
+        run_id: str | None = None,
+        evidence_ref: str | None = None,
+        anchor_ref: str | None = None,
+        anchor_kind: str = "evidence_ref",
+    ) -> dict[str, Any]:
         """Delete overlay annotations and report how many went. The base map is untouched either
         way — it reads byte-identical afterward. This is scratch space you own.
 
-        With NO argument this wipes every annotation, across every firmware. Pass ONE scope to
-        clear less: ``run_id`` drops just that firmware's annotations, ``evidence_ref`` drops the
-        single annotation on one candidate — the one to reach for when retiring an entry you no
-        longer stand behind, rather than starting over. The two scopes cannot be combined."""
+        With NO argument this wipes every candidate annotation, across every firmware. Pass ONE
+        scope to clear less: ``run_id`` drops just that firmware's annotations, ``evidence_ref``
+        drops the single annotation on one candidate — the one to reach for when retiring an entry
+        you no longer stand behind, rather than starting over. The scopes cannot be combined.
+
+        ``anchor_kind="diff_subject"`` clears YOUR judgements on diff entries instead, and only
+        those: ``run_id`` is then a run pair (``{run_a}::{run_b}``) and ``anchor_ref`` names one
+        judgement; with no scope, every one of them."""
         atlas = open_atlas(atlas_path)
         try:
-            removed = _clear_overlay(atlas, run_id=run_id, evidence_ref=evidence_ref)
+            removed = _clear_overlay(
+                atlas,
+                run_id=run_id,
+                evidence_ref=evidence_ref,
+                anchor_ref=anchor_ref,
+                anchor_kind=anchor_kind,
+            )
         except ConfigError as exc:
             return {"cleared": 0, "error": str(exc)}
         finally:
             atlas.close()
-        if evidence_ref is not None:
-            scope = f"the annotation on {evidence_ref}"
+        kind = "judgement on a diff entry" if anchor_kind == "diff_subject" else "annotation"
+        if evidence_ref is not None or anchor_ref is not None:
+            scope = f"the {kind} on {evidence_ref if evidence_ref is not None else anchor_ref}"
         elif run_id is not None:
-            scope = f"annotations for run {run_id}"
+            scope = f"{kind}s for {'run pair' if anchor_kind == 'diff_subject' else 'run'} {run_id}"
+        elif anchor_kind == "diff_subject":
+            scope = "EVERY judgement on a diff entry"
         else:
             scope = "EVERY annotation, across every firmware"
-        return {
+        out: dict[str, Any] = {
             "cleared": removed,
             "scope": {"run_id": run_id, "evidence_ref": evidence_ref},
             "note": f"removed {scope}; the read-only base map is unchanged.",
         }
+        if anchor_ref is not None or anchor_kind != "evidence_ref":
+            out["scope"].update({"anchor_ref": anchor_ref, "anchor_kind": anchor_kind})
+        return out
 
     def legal_notice() -> dict[str, Any]:
         """The tool's intended-use / legal notice."""
@@ -2722,6 +2954,8 @@ def make_tools(
         "get_script_callsites": get_script_callsites,
         "get_disassembly": get_disassembly,
         "annotate": annotate,
+        "annotate_diff": annotate_diff,
+        "promote": promote,
         "list_overlays": list_overlays,
         "clear_overlay": clear_overlay,
         "list_verified_exploits": list_verified_exploits,

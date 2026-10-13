@@ -39,7 +39,13 @@ import sqlite3
 from dataclasses import dataclass, field
 from typing import Any
 
-from treasure_map.lib.overlay import _VERDICTS, Basis, basis_delta
+from treasure_map.lib.overlay import (
+    _VERDICTS,
+    Basis,
+    basis_delta,
+    effective_basis_state,
+    promoted_sources,
+)
 from treasure_map.lib.query.sink_impact import impact_tier
 
 # ── the states a candidate can be in ──────────────────────────────────────────────────
@@ -128,24 +134,32 @@ def load_coverage_index(atlas: sqlite3.Connection) -> CoverageIndex:
     The basis state is re-derived rather than read from the stored column, because the stored one
     records what was true when the annotation was written. An annotation whose candidate has since
     disappeared was perfectly resolvable at write time, so reading the stored value would report it
-    as healthy — which is exactly the case that most needs surfacing."""
+    as healthy — which is exactly the case that most needs surfacing.
+
+    A promoted annotation also counts the diff it came from: when that diff is not current, it
+    reads as due a re-check (overlay.effective_basis_state), the same as on list_overlays."""
     try:
         rows = atlas.execute(
             # ★ The snapshot lives in `basis_state`, despite the name. `verdict_basis` is a
             # different thing entirely — the justification a `safe` verdict owes — and reading it
             # here would hand Basis.from_json a shape it does not understand, leaving every
             # annotation looking unverifiable.
-            "SELECT anchor_ref, verdict, basis_state FROM overlay WHERE anchor_kind = ?",
+            "SELECT anchor_ref, verdict, basis_state, promoted_from FROM overlay "
+            "WHERE anchor_kind = ?",
             ("evidence_ref",),
         ).fetchall()
     except sqlite3.OperationalError:
         return CoverageIndex()  # no overlay table (older atlas) -> nothing has been looked at
+    sources = promoted_sources(
+        atlas, {r["anchor_ref"]: r["promoted_from"] for r in rows if r["promoted_from"]}
+    )
     by_ref: dict[str, Annotation] = {}
     for row in rows:
         ref = row["anchor_ref"]
         if not ref:
             continue
-        state = basis_delta(atlas, ref, Basis.from_json(row["basis_state"]))["state"]
+        own = basis_delta(atlas, ref, Basis.from_json(row["basis_state"]))["state"]
+        state = effective_basis_state(own, sources.get(ref))
         by_ref[ref] = Annotation(verdict=row["verdict"], basis_state=state)
     return CoverageIndex(by_ref=by_ref)
 

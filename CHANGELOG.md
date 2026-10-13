@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Judgements on a diff's entries (MCP `annotate_diff`, `promote`).** A writable layer over
+  `get_diff_patch_view`, which itself stays read-only: `annotate_diff(diff_id, anchor_ref, verdict,
+  rationale)` records whether one entry's change does something real (`changed_real`,
+  `no_real_change` — which needs `checked`, two or more facts read, and `why_unchanged` —, or
+  `change_inconclusive`). Diff verdicts go on diff entries only, candidate verdicts on candidates
+  only.
+  - Every entry carries an `anchor_ref` naming its subject, not its position:
+    `{run_a}::{run_b}#function_pair#{binary}::{addr_a}::{addr_b}`,
+    `…#function_presence#{binary}::{side}:{addr}`, or `…#candidate#{subject_key}` for one candidate
+    row. The binary is in it because two binaries of one run pair can hold a function at the same
+    address.
+  - A judgement snapshots the entry's own diff facts (alignment state, similarity, export gaps,
+    bucket, and each candidate row's refs, presence, reason and counterpart call). When any of them
+    moves, or the diff stops being current (`source_stale` not false), the entry reads
+    `needs_recheck`; a pair BinDiff no longer makes, or a candidate row whose ref was re-keyed,
+    leaves its judgement dangling.
+  - `get_diff_patch_view` now carries, with or without any judgement, `anchor_ref` and
+    `review_state` on every entry, `review_progress` (per bucket, per page, the next unjudged
+    entries named, the blind spots beside it; a diff undetermined as a whole reads `withheld` and
+    counts nothing) and `annotation` (the calls to copy, with this diff filled in). `band=true`
+    moves judged entries only inside the groups the default order already forms: due a re-check
+    first, then `change_inconclusive`, unjudged, `changed_real`, `no_real_change`. Off by default,
+    and off the order is unchanged.
+  - `promote(diff_id, entry_id, row_ref, verdict, rationale)` carries an entry's judgement onto one
+    of its candidates as a candidate verdict. Only from a row that lands `A` or `persisted`, or `P`
+    with subclass `unmatched_analysis_complete`; only when the pair's alignment, or the function's
+    absence, is determined; only on a diff that is current (or with `allow_stale_source`, which is
+    recorded). `exploitable` needs its basis here. Refusals name the landing, subclass and reason.
+  - The promoted candidate annotation carries `promoted_from` (the diff and the entry) on
+    `list_overlays` and `list_candidates(overlay=true)`; once that diff is no longer current, or is
+    gone, it reads `basis_state` `source_diff_stale` there, in coverage, and in the overlay band. A
+    later plain `annotate` replaces the judgement and drops the origin. Annotations that were never
+    promoted read exactly as before, with `promoted_from` null.
+  - `list_overlays(anchor_kind="diff_subject", run_id="{run_a}::{run_b}")` lists the diff
+    judgements with their review state and what moved, plus progress over every diff of the pair
+    with the failed diffs, the diffs undetermined as a whole and the binaries no diff covers beside
+    it (`complete` stays false while any of those exist). It rebuilds every diff's view of the
+    pair, so it takes tens of seconds on a pair of a hundred diffs. `clear_overlay` takes the same
+    `anchor_kind` (and `anchor_ref`); by default both still act on candidate annotations only.
+  - The atlas gains `overlay.promoted_from` (added in place on open; existing rows read null).
+
 - **A function-level view of one diff (MCP `get_diff_patch_view`), now the place to start.** One
   entry per function pair that changed, or per function with no counterpart, sorted into buckets:
   `A` (the call instruction BinDiff matched now calls a different callee, and the paired function

@@ -64,6 +64,8 @@ _EXPECTED_TOOLS = {
     "get_script_callsites",
     "get_disassembly",
     "annotate",
+    "annotate_diff",
+    "promote",
     "list_overlays",
     "clear_overlay",
     "list_verified_exploits",

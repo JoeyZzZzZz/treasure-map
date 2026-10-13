@@ -22,6 +22,19 @@ Two things keep the layer honest:
     dimensions of which sibling changed — so an annotation standing on now-stale facts is flagged
     for re-review instead of silently trusted. The layer reports those facts ONLY; whether a changed
     basis undoes the annotation is the consumer's judgement, never asserted here.
+
+TWO ANCHOR KINDS share the table and the write path, each with its own vocabulary:
+
+  * ``evidence_ref`` — a judgement on one candidate (the above). Candidate verdicts only.
+  * ``diff_subject`` — a judgement on one entry of a version diff's function-level view
+    (lib/query/patch_view): did this change do something real. Diff verdicts only; its basis is the
+    entry's own diff facts (lib/query/diff_annotations), never the candidate snapshot above, and it
+    reads the diff tables without writing them.
+
+A diff verdict is refused on a candidate and a candidate verdict on a diff entry. ``promote`` is the
+one way across: it carries a judgement reached on a diff entry onto one of that entry's candidates,
+as a candidate verdict, after checking the entry can say what it would be taken to say, and records
+where it came from (``promoted_from``) so a later read can tell when that diff stops being current.
 """
 
 from __future__ import annotations
@@ -56,6 +69,12 @@ _VERDICT_BIAS = {
     "safe": -1,
     "exploitable": 1,
 }
+# The verdicts a judgement on a DIFF ENTRY may carry. A different question from the candidate
+# verdicts above — not "can this be reached" but "did this change do something real" — so a
+# different vocabulary, written onto a ``diff_subject`` anchor only. ``change_inconclusive`` is the
+# diff side's ``inconclusive``: looked at, could not decide, and it stays in view.
+_DIFF_VERDICTS = ("changed_real", "no_real_change", "change_inconclusive")
+_ANCHOR_KINDS = ("evidence_ref", "diff_subject")
 # Coarse attribution only. NULL means "not recorded"; a fabricated identity is never written (the
 # schema CHECK enforces this set). A real identity matters only at a later promotion boundary.
 _ATTRIBUTION = ("agent", "agent-via-mcp")
@@ -203,6 +222,67 @@ def _validate_verdict_basis(verdict: str, vb: dict[str, Any] | None) -> str | No
     return None
 
 
+def _validate_diff_verdict_basis(verdict: str, vb: dict[str, Any] | None) -> str | None:
+    """The diff side's counterpart of ``_validate_verdict_basis``, and the same kind of check.
+
+    ``no_real_change`` REQUIRES ``checked`` (two or more facts or anchors that were read) and
+    ``why_unchanged``, wherever the entry sits. It is the verdict that sinks an entry, and like
+    ``safe`` a wrong one only comes back when the diff's facts move — so it has to say what was
+    looked at and why that shows nothing real changed. The other two carry no basis.
+
+    ★ Same honest limit as above: non-blank checks, which filler passes."""
+    if verdict == "no_real_change":
+        if not vb:
+            raise ConfigError(
+                "no_real_change requires verdict_basis with checked / why_unchanged — the facts "
+                "or anchors read, and why they show nothing real changed"
+            )
+        checked = vb.get("checked")
+        if not (
+            isinstance(checked, list)
+            and len(checked) >= 2
+            and all(isinstance(c, str) and c.strip() for c in checked)
+        ):
+            raise ConfigError(
+                "no_real_change.checked needs at least 2 non-blank items — the facts or anchors "
+                "that were read to reach it"
+            )
+        why = vb.get("why_unchanged")
+        if not (isinstance(why, str) and why.strip()):
+            raise ConfigError("no_real_change.why_unchanged must be non-blank")
+        return json.dumps(
+            {
+                "kind": "no_real_change",
+                "checked": [c.strip() for c in checked],
+                "why_unchanged": why.strip(),
+            }
+        )
+    if vb is not None:
+        raise ConfigError(f"verdict_basis applies to no_real_change only, not {verdict!r}")
+    return None
+
+
+def _check_candidate_verdict(verdict: str) -> None:
+    """A candidate verdict, or a refusal that says where a diff verdict goes instead."""
+    if verdict in _VERDICTS:
+        return
+    if verdict in _DIFF_VERDICTS:
+        raise ConfigError(
+            f"verdict must be one of {list(_VERDICTS)} on a candidate; {verdict!r} is a diff-entry "
+            "verdict and goes on a diff entry (annotate_diff)"
+        )
+    raise ConfigError(f"verdict must be one of {list(_VERDICTS)}; got {verdict!r}")
+
+
+def _check_text_and_attribution(rationale: str, attributed_to: str | None) -> None:
+    if not (rationale and rationale.strip()):
+        raise ConfigError("rationale must be non-blank (why + next step + confidence)")
+    if attributed_to is not None and attributed_to not in _ATTRIBUTION:
+        raise ConfigError(
+            f"attributed_to must be NULL or one of {list(_ATTRIBUTION)} (never fabricated)"
+        )
+
+
 def capture_basis(atlas: sqlite3.Connection, evidence_ref: str) -> Basis:
     """Snapshot the base-map facts one ``evidence_ref`` rests on: the function's pseudocode hash
     (function-level, shared across siblings — first non-null wins) plus the ref-level SET of
@@ -327,6 +407,70 @@ def _run_id_from_ref(anchor_ref: str) -> str | None:
     return head or None
 
 
+def _write_row(
+    atlas: sqlite3.Connection,
+    *,
+    anchor_kind: str,
+    anchor_ref: str,
+    verdict: str,
+    rationale: str,
+    attributed_to: str | None,
+    basis_state: str,
+    verdict_basis: str | None,
+    promoted_from: str | None,
+    basis_resolved: bool,
+) -> UpsertResult:
+    """Insert or overwrite the one row of ``(anchor_kind, anchor_ref)``, validated by the caller.
+
+    ★ ``promoted_from`` is written on BOTH branches, NULL included. An overwrite that left it out
+    would keep the previous write's origin on a row whose judgement no longer came from there."""
+    prior = atlas.execute(
+        "SELECT id, attributed_to, updated_at FROM overlay "
+        "WHERE anchor_kind = ? AND anchor_ref = ?",
+        (anchor_kind, anchor_ref),
+    ).fetchone()
+    if prior is not None:
+        atlas.execute(
+            "UPDATE overlay SET verdict = ?, rationale = ?, attributed_to = ?, basis_state = ?, "
+            "verdict_basis = ?, promoted_from = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (
+                verdict,
+                rationale.strip(),
+                attributed_to,
+                basis_state,
+                verdict_basis,
+                promoted_from,
+                prior["id"],
+            ),
+        )
+        return UpsertResult(
+            action="updated",
+            id=int(prior["id"]),
+            basis_resolved=basis_resolved,
+            prior_attributed_to=prior["attributed_to"],
+            prior_updated_at=prior["updated_at"],
+        )
+    cur = atlas.execute(
+        "INSERT INTO overlay (anchor_kind, anchor_ref, run_id, verdict, rationale, "
+        "attributed_to, basis_state, verdict_basis, promoted_from) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            anchor_kind,
+            anchor_ref,
+            _run_id_from_ref(anchor_ref),
+            verdict,
+            rationale.strip(),
+            attributed_to,
+            basis_state,
+            verdict_basis,
+            promoted_from,
+        ),
+    )
+    new_id = cur.lastrowid
+    assert new_id is not None
+    return UpsertResult(action="inserted", id=new_id, basis_resolved=basis_resolved)
+
+
 def upsert_overlay(
     atlas: sqlite3.Connection,
     *,
@@ -336,6 +480,7 @@ def upsert_overlay(
     attributed_to: str | None = "agent-via-mcp",
     verdict_basis: dict[str, Any] | None = None,
     commit: bool = True,
+    promoted_from: dict[str, Any] | None = None,
 ) -> UpsertResult:
     """Write (or overwrite) the annotation for one ``evidence_ref`` — last write wins, one row per
     anchor. Rejects an unknown verdict, a blank rationale, or a fabricated attribution. Snapshots
@@ -345,64 +490,156 @@ def upsert_overlay(
     ``verdict_basis`` carries the structured justification the strong verdicts owe — required for
     ``safe``, validated-if-given for ``exploitable``, refused for the rest. See
     ``_validate_verdict_basis`` for what each shape must contain and for the honest limits of the
-    checking."""
-    if verdict not in _VERDICTS:
-        raise ConfigError(f"verdict must be one of {list(_VERDICTS)}; got {verdict!r}")
+    checking.
+
+    ``promoted_from`` is passed by ``promote`` and by nothing else. Every other write stores NULL
+    there, on an overwrite too: a judgement re-written by hand no longer came from the diff."""
+    _check_candidate_verdict(verdict)
     basis_json = _validate_verdict_basis(verdict, verdict_basis)
-    if not (rationale and rationale.strip()):
-        raise ConfigError("rationale must be non-blank (why + next step + confidence)")
-    if attributed_to is not None and attributed_to not in _ATTRIBUTION:
-        raise ConfigError(
-            f"attributed_to must be NULL or one of {list(_ATTRIBUTION)} (never fabricated)"
-        )
+    _check_text_and_attribution(rationale, attributed_to)
     _refuse_degraded_anchor(atlas, evidence_ref)
     basis = capture_basis(atlas, evidence_ref)
-    prior = atlas.execute(
-        "SELECT id, attributed_to, updated_at FROM overlay "
-        "WHERE anchor_kind = 'evidence_ref' AND anchor_ref = ?",
-        (evidence_ref,),
-    ).fetchone()
-    if prior is not None:
-        atlas.execute(
-            "UPDATE overlay SET verdict = ?, rationale = ?, attributed_to = ?, basis_state = ?, "
-            "verdict_basis = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (
-                verdict,
-                rationale.strip(),
-                attributed_to,
-                basis.to_json(),
-                basis_json,
-                prior["id"],
-            ),
-        )
-        result = UpsertResult(
-            action="updated",
-            id=int(prior["id"]),
-            basis_resolved=basis.resolved,
-            prior_attributed_to=prior["attributed_to"],
-            prior_updated_at=prior["updated_at"],
-        )
-    else:
-        cur = atlas.execute(
-            "INSERT INTO overlay (anchor_kind, anchor_ref, run_id, verdict, rationale, "
-            "attributed_to, basis_state, verdict_basis) "
-            "VALUES ('evidence_ref', ?, ?, ?, ?, ?, ?, ?)",
-            (
-                evidence_ref,
-                _run_id_from_ref(evidence_ref),
-                verdict,
-                rationale.strip(),
-                attributed_to,
-                basis.to_json(),
-                basis_json,
-            ),
-        )
-        new_id = cur.lastrowid
-        assert new_id is not None
-        result = UpsertResult(action="inserted", id=new_id, basis_resolved=basis.resolved)
+    result = _write_row(
+        atlas,
+        anchor_kind="evidence_ref",
+        anchor_ref=evidence_ref,
+        verdict=verdict,
+        rationale=rationale,
+        attributed_to=attributed_to,
+        basis_state=basis.to_json(),
+        verdict_basis=basis_json,
+        promoted_from=json.dumps(promoted_from) if promoted_from is not None else None,
+        basis_resolved=basis.resolved,
+    )
     if commit:
         atlas.commit()
     return result
+
+
+def annotate_diff(
+    atlas: sqlite3.Connection,
+    *,
+    diff_id: str,
+    anchor_ref: str,
+    verdict: str,
+    rationale: str,
+    attributed_to: str | None = "agent-via-mcp",
+    verdict_basis: dict[str, Any] | None = None,
+    commit: bool = True,
+) -> UpsertResult:
+    """Write (or overwrite) the judgement on one entry of a diff's function-level view.
+
+    ``anchor_ref`` names the entry (a function pair, a function with no counterpart, or one
+    candidate row of an entry) inside ``diff_id``; get_diff_patch_view prints it on every entry.
+    Refused unless it names something the view lists now — this is not a blind write: the basis
+    snapshotted here is the entry's own diff facts (its alignment or presence, its bucket and its
+    candidate rows), and with nothing to snapshot there would be nothing to re-check later.
+
+    Diff verdicts only (``_DIFF_VERDICTS``); ``no_real_change`` owes a basis (see
+    ``_validate_diff_verdict_basis``). The degraded-anchor refusal of a candidate write does not
+    apply: it reads a candidate's flow evidence, which a diff entry does not have."""
+    if verdict not in _DIFF_VERDICTS:
+        if verdict in _VERDICTS:
+            raise ConfigError(
+                f"verdict must be one of {list(_DIFF_VERDICTS)} on a diff entry; {verdict!r} is a "
+                "candidate verdict — annotate the candidate, or carry this entry's judgement to "
+                "one of its candidates with promote"
+            )
+        raise ConfigError(f"verdict must be one of {list(_DIFF_VERDICTS)}; got {verdict!r}")
+    basis_json = _validate_diff_verdict_basis(verdict, verdict_basis)
+    _check_text_and_attribution(rationale, attributed_to)
+    # Imported here, not at the top: the query package imports this module on its own import, so a
+    # top-level import from it would run before this module had finished loading.
+    from treasure_map.lib.query.diff_annotations import capture_diff_basis
+
+    snapshot = capture_diff_basis(atlas, diff_id, anchor_ref)
+    result = _write_row(
+        atlas,
+        anchor_kind="diff_subject",
+        anchor_ref=anchor_ref,
+        verdict=verdict,
+        rationale=rationale,
+        attributed_to=attributed_to,
+        basis_state=json.dumps(snapshot, sort_keys=True),
+        verdict_basis=basis_json,
+        promoted_from=None,
+        basis_resolved=True,
+    )
+    if commit:
+        atlas.commit()
+    return result
+
+
+@dataclass(frozen=True)
+class PromoteResult:
+    """A promoted write: the candidate write itself, and the origin stored with it."""
+
+    written: UpsertResult
+    evidence_ref: str
+    promoted_from: dict[str, Any]
+
+
+def promote(
+    atlas: sqlite3.Connection,
+    *,
+    diff_id: str,
+    entry_id: str,
+    row_ref: str,
+    verdict: str,
+    rationale: str,
+    verdict_basis: dict[str, Any] | None = None,
+    allow_stale_source: bool = False,
+    attributed_to: str | None = "agent-via-mcp",
+    commit: bool = True,
+) -> PromoteResult:
+    """Carry a judgement reached on a diff entry onto one of its candidates, as a candidate verdict.
+
+    ``row_ref`` is the candidate written to: the ``a_ref`` or ``b_ref`` of one of the entry's rows.
+    ``entry_id`` is the entry's id in get_diff_patch_view, or its ``anchor_ref``. ``diff_id`` names
+    one binary's diff; a run pair is refused, because the currency check below is per diff.
+
+    Before anything is written, lib/query/diff_annotations.check_promotion refuses an entry that
+    cannot say what the candidate verdict would be taken to say (where its rows land, whether the
+    function's counterpart is determined) and a diff that is not current — unless
+    ``allow_stale_source``, which is then recorded with the origin. The write itself goes through
+    ``upsert_overlay``, which validates the verdict as for any candidate write.
+
+    ★ Stricter than a plain candidate write in one place: ``exploitable`` REQUIRES its basis here.
+    A promoted verdict rests on a diff the candidate's own snapshot cannot see, so the reason it
+    was reached has to travel with it."""
+    _check_candidate_verdict(verdict)
+    if verdict == "exploitable" and verdict_basis is None:
+        raise ConfigError(
+            "promoting as exploitable requires verdict_basis (chain + verification_gaps): the "
+            "judgement rests on a diff, and its reason has to be written down with it"
+        )
+    _validate_verdict_basis(verdict, verdict_basis)
+    _check_text_and_attribution(rationale, attributed_to)
+    from treasure_map.lib.query.diff_annotations import check_promotion
+
+    origin = check_promotion(
+        atlas,
+        diff_id=diff_id,
+        entry_id=entry_id,
+        row_ref=row_ref,
+        allow_stale_source=allow_stale_source,
+    )
+    written = upsert_overlay(
+        atlas,
+        evidence_ref=row_ref,
+        verdict=verdict,
+        rationale=rationale,
+        attributed_to=attributed_to,
+        verdict_basis=verdict_basis,
+        commit=commit,
+        promoted_from=origin,
+    )
+    return PromoteResult(written=written, evidence_ref=row_ref, promoted_from=origin)
+
+
+def _check_anchor_kind(anchor_kind: str) -> None:
+    if anchor_kind not in _ANCHOR_KINDS:
+        raise ConfigError(f"anchor_kind must be one of {list(_ANCHOR_KINDS)}; got {anchor_kind!r}")
 
 
 def clear_overlay(
@@ -410,31 +647,43 @@ def clear_overlay(
     *,
     run_id: str | None = None,
     evidence_ref: str | None = None,
+    anchor_ref: str | None = None,
+    anchor_kind: str = "evidence_ref",
     commit: bool = True,
 ) -> int:
-    """Delete annotations and return how many rows went. The base map is untouched either way, so
-    it reads byte-identical afterward — this is scratch space a consumer owns and may clear.
+    """Delete annotations of one ``anchor_kind`` and return how many rows went. The base map is
+    untouched either way, so it reads byte-identical afterward — this is scratch space a consumer
+    owns and may clear.
 
-    With no scope this wipes every annotation, which is the original behaviour. Pass ONE scope to
-    clear less: ``run_id`` drops one firmware's annotations, ``evidence_ref`` drops the single
-    annotation on one candidate. Keeping a layer that stores conclusions tidy means retiring
-    individual entries, not starting over, so the narrow forms are the ones to reach for.
+    With no scope this wipes every annotation of that kind — every candidate annotation by default,
+    which is the original behaviour; the diff-entry annotations are a separate kind and are cleared
+    only when asked for by name. Pass ONE scope to clear less: ``run_id`` drops one firmware's
+    annotations (for ``diff_subject``, one run pair's, written ``{run_a}::{run_b}``), ``anchor_ref``
+    the single annotation on one anchor, and ``evidence_ref`` is that same scope under the name a
+    candidate annotation has always used. Keeping a layer that stores conclusions tidy means
+    retiring individual entries, not starting over, so the narrow forms are the ones to reach for.
 
-    The two scopes are mutually exclusive: accepting both would have to invent a meaning for their
+    The scopes are mutually exclusive: accepting two would have to invent a meaning for their
     combination, and guessing wrong here deletes the consumer's own work."""
-    if run_id is not None and evidence_ref is not None:
+    _check_anchor_kind(anchor_kind)
+    if sum(s is not None for s in (run_id, evidence_ref, anchor_ref)) > 1:
         raise ConfigError(
-            "clear_overlay takes at most one scope: run_id OR evidence_ref, never both"
+            "clear_overlay takes at most one scope: run_id OR evidence_ref OR anchor_ref, never two"
         )
-    if evidence_ref is not None:
+    if evidence_ref is not None and anchor_kind != "evidence_ref":
+        raise ConfigError("evidence_ref names a candidate annotation; use anchor_ref for this kind")
+    one = evidence_ref if evidence_ref is not None else anchor_ref
+    if one is not None:
         cur = atlas.execute(
-            "DELETE FROM overlay WHERE anchor_kind = 'evidence_ref' AND anchor_ref = ?",
-            (evidence_ref,),
+            "DELETE FROM overlay WHERE anchor_kind = ? AND anchor_ref = ?",
+            (anchor_kind, one),
         )
     elif run_id is not None:
-        cur = atlas.execute("DELETE FROM overlay WHERE run_id = ?", (run_id,))
+        cur = atlas.execute(
+            "DELETE FROM overlay WHERE anchor_kind = ? AND run_id = ?", (anchor_kind, run_id)
+        )
     else:
-        cur = atlas.execute("DELETE FROM overlay")
+        cur = atlas.execute("DELETE FROM overlay WHERE anchor_kind = ?", (anchor_kind,))
     if commit:
         atlas.commit()
     return cur.rowcount
@@ -460,12 +709,76 @@ def repoint_overlay_anchor(
     return cur.rowcount
 
 
+# The basis state a PROMOTED annotation reads with when the diff it was promoted from is not
+# current, or is gone. The candidate's own snapshot cannot see a diff move, so this is the only way
+# that shows up. It is just another state that is not 'unchanged', and every reader already treats
+# such a row as due a look — the row marker, the overlay band and coverage alike.
+SOURCE_DIFF_STALE = "source_diff_stale"
+
 _STALE_NOTE = {
     "unchanged": "basis unchanged since the annotation",
     "changed": "basis CHANGED since the annotation — re-review",
     "unverifiable": "basis cannot be fully verified (no pseudocode hash) — not a clean 'unchanged'",
     "anchor_unresolved": "the anchor no longer resolves to any candidate — re-check the ref",
+    SOURCE_DIFF_STALE: (
+        "promoted from a diff that is not current now (or is gone) — re-check it there; "
+        "promoted_from says why"
+    ),
 }
+
+
+def promoted_sources(atlas: sqlite3.Connection, raw: dict[str, str]) -> dict[str, dict[str, Any]]:
+    """For each anchor that carries a ``promoted_from``, that origin with whether its diff is
+    current NOW: ``source_stale`` / ``source_stale_reason`` as every diff reader reports them, or
+    null with ``source_diff_gone`` when the diff is no longer in this atlas. One staleness lookup
+    shared by all of them; rows that were never promoted are not passed in and cost nothing."""
+    from treasure_map.lib.query.diff_align import diffs_source_staleness  # see annotate_diff
+
+    origins: dict[str, dict[str, Any]] = {}
+    for ref, text in raw.items():
+        try:
+            data = json.loads(text)
+        except (ValueError, TypeError):
+            data = None
+        origins[ref] = data if isinstance(data, dict) else {}
+    wanted = sorted({o["diff_id"] for o in origins.values() if isinstance(o.get("diff_id"), str)})
+    present: set[str] = set()
+    for i in range(0, len(wanted), 500):
+        chunk = wanted[i : i + 500]
+        marks = ", ".join("?" * len(chunk))
+        present.update(
+            d
+            for (d,) in atlas.execute(
+                f"SELECT diff_id FROM diff_meta WHERE diff_id IN ({marks})",  # noqa: S608
+                chunk,
+            )
+        )
+    stale = diffs_source_staleness(atlas, present)
+    out: dict[str, dict[str, Any]] = {}
+    for ref, origin in origins.items():
+        diff_id = origin.get("diff_id")
+        if not isinstance(diff_id, str):
+            now: dict[str, Any] = {"source_stale": None, "source_stale_reason": "origin_unreadable"}
+        elif diff_id not in present:
+            now = {"source_stale": None, "source_stale_reason": "source_diff_gone"}
+        else:
+            now = {k: stale[diff_id][k] for k in ("source_stale", "source_stale_reason")}
+        out[ref] = {**origin, **now}
+    return out
+
+
+def effective_basis_state(own: str, source: dict[str, Any] | None) -> str:
+    """A row's basis state once the diff it was promoted from is counted in: the worse of the two.
+
+    Not promoted, or promoted from a diff that is current (``source_stale`` false, and only false):
+    its own state. Otherwise ``source_diff_stale`` — unless its own state already says the
+    candidate itself moved or is gone, which says more about the candidate and is kept."""
+    if source is None or source.get("source_stale") is False:
+        return own
+    if own in ("anchor_unresolved", "changed"):
+        return own
+    return SOURCE_DIFF_STALE
+
 
 _LIST_NOTE = (
     "An AGENT annotation layer over the read-only candidate map — consumer decisions, NOT tool "
@@ -478,17 +791,32 @@ _LIST_NOTE = (
 
 
 def list_overlays(
-    atlas: sqlite3.Connection, *, verdict: str | None = None, run_id: str | None = None
+    atlas: sqlite3.Connection,
+    *,
+    verdict: str | None = None,
+    run_id: str | None = None,
+    anchor_kind: str = "evidence_ref",
 ) -> dict[str, Any]:
-    """Every annotation, optionally narrowed to one verdict and/or one firmware run (the resume
-    view: 'what did I mark inconclusive / suspicious / excluded, on THIS firmware'). Each row
-    carries its live basis_state so a stale annotation is visibly flagged, never silently trusted.
+    """Every annotation of one ``anchor_kind``, optionally narrowed to one verdict and/or one
+    firmware run (the resume view: 'what did I mark inconclusive / suspicious / excluded, on THIS
+    firmware'). Each row carries its live basis_state so a stale annotation is visibly flagged,
+    never silently trusted.
 
     The two filters AND together. ``run_id`` is an exact match on the stored column — the run is a
     real field here, not a prefix of the anchor string, so nothing depends on how the anchor
-    happens to be punctuated."""
-    params: list[str] = []
-    conds: list[str] = []
+    happens to be punctuated.
+
+    Candidate annotations by default. A promoted one also carries ``promoted_from`` (the diff it
+    came from, and whether that diff is current now); when it is not, the row reads
+    ``source_diff_stale`` (see ``effective_basis_state``). ``diff_subject`` lists the diff-entry
+    annotations instead, through lib/query/diff_annotations."""
+    _check_anchor_kind(anchor_kind)
+    if anchor_kind == "diff_subject":
+        from treasure_map.lib.query.diff_annotations import list_diff_overlays
+
+        return list_diff_overlays(atlas, verdict=verdict, run_id=run_id)
+    params: list[str] = [anchor_kind]
+    conds: list[str] = ["anchor_kind = ?"]
     if verdict is not None:
         if verdict not in _VERDICTS:
             raise ConfigError(f"verdict must be one of {list(_VERDICTS)}; got {verdict!r}")
@@ -497,17 +825,23 @@ def list_overlays(
     if run_id is not None:
         conds.append("run_id = ?")
         params.append(run_id)
-    clause = ("WHERE " + " AND ".join(conds)) if conds else ""
+    clause = "WHERE " + " AND ".join(conds)
     rows = atlas.execute(
         "SELECT id, anchor_kind, anchor_ref, run_id, verdict, rationale, attributed_to, "
-        f"basis_state, verdict_basis, created_at, updated_at FROM overlay {clause} "  # noqa: S608
+        "basis_state, verdict_basis, promoted_from, created_at, updated_at "
+        f"FROM overlay {clause} "  # noqa: S608
         "ORDER BY verdict, updated_at DESC",
         params,
     ).fetchall()
+    sources = promoted_sources(
+        atlas, {r["anchor_ref"]: r["promoted_from"] for r in rows if r["promoted_from"]}
+    )
     overlays = []
     counts: dict[str, int] = {}
     for r in rows:
         delta = basis_delta(atlas, r["anchor_ref"], Basis.from_json(r["basis_state"]))
+        source = sources.get(r["anchor_ref"])
+        state = effective_basis_state(delta["state"], source)
         overlays.append(
             {
                 "id": r["id"],
@@ -521,13 +855,16 @@ def list_overlays(
                 # falls back to neutral rather than raising. Reading an old annotation must never
                 # fail just because the vocabulary moved on.
                 "bias": _VERDICT_BIAS.get(r["verdict"], 0),
-                "basis_state": delta["state"],
-                "basis_note": _STALE_NOTE.get(delta["state"], ""),
+                "basis_state": state,
+                "basis_note": _STALE_NOTE.get(state, ""),
                 # The structured justification a safe / exploitable annotation was written with,
                 # parsed back for the reader; None for verdicts that carry none.
                 "verdict_basis": json.loads(r["verdict_basis"]) if r["verdict_basis"] else None,
                 "basis_delta": delta,
                 "updated_at": r["updated_at"],
+                # Where a promoted judgement came from, and whether that diff is current now; None
+                # on every row that was not promoted.
+                "promoted_from": source,
             }
         )
         counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
