@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from treasure_map.lib.setup.discover import (
     check_jdk,
     discover_bindiff,
@@ -116,3 +118,55 @@ def test_bindiff_is_checked_by_running_it(tmp_path: Path) -> None:
     assert cands[0].ok and cands[0].version == fakes.BINDIFF_LINE and cands[0].note is None
     other = discover_bindiff(host, config_bindiff=None, version_line="BinDiff 8 (@1, Jan 1 2024)")
     assert other[0].ok and other[0].note  # accepted, with the difference said
+
+
+def test_a_scanned_directory_without_java_is_not_listed(tmp_path: Path) -> None:
+    """A distribution's source-only sibling (``/usr/lib/jvm/openjdk-21`` holding just src.zip) is
+    no Java install: listing it as "not used" reads like a missing JDK.
+
+    MUTATION: list every scanned directory -> the source-only one appears -> RED."""
+    import dataclasses
+
+    jvm = tmp_path / "jvm"
+    jdk = fakes.make_jdk(jvm / "java-21-openjdk-amd64")
+    (jvm / "openjdk-21").mkdir()
+    (jvm / "openjdk-21" / "src.zip").write_bytes(b"")
+    broken = jvm / "half-installed"
+    (broken / "bin").mkdir(parents=True)
+    (broken / "bin" / "java").write_text("")
+    host = dataclasses.replace(fakes.make_host(tmp_path / "home"), jdk_globs=(str(jvm / "*"),))
+    cands = discover_jdk(host, config_java_home=None, ghidra_home=None, pinned="21.0.12.1+1")
+    assert [c.path for c in cands] == [broken, jdk]  # a java with no release is still reported
+    assert not cands[0].ok and cands[1].ok
+
+
+def test_the_scan_skips_tmaps_directory_and_mnt(tmp_path: Path) -> None:
+    """MUTATION: drop the skip list -> a Ghidra inside ~/.treasure-map is offered as the user's
+    -> RED."""
+    from treasure_map.lib.setup.discover import _shallow_ghidra_scan
+
+    home = tmp_path / "home"
+    fakes.make_ghidra(home / ".treasure-map" / "old" / "ghidra_11.4.3_PUBLIC")
+    mine = fakes.make_ghidra(home / "tools" / "ghidra_11.4.3_PUBLIC")
+    assert discover_ghidra(fakes.make_host(home), config_home=None, want="11.4.3")[0].path == mine
+    assert len(discover_ghidra(fakes.make_host(home), config_home=None, want="11.4.3")) == 1
+    mnt = tmp_path / "mnt"
+    fakes.make_ghidra(mnt / "c" / "ghidra_11.4.3_PUBLIC")
+    assert _shallow_ghidra_scan([tmp_path], skip=[mnt, home]) == []
+
+
+def test_the_real_machine_probe_lists(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The system locations the unit conftest switches off are still the right ones.
+
+    MUTATION: drop /usr/lib/jvm/* (or the /opt/bindiff, ~/.jdks entries) -> RED."""
+    from treasure_map.lib.setup import discover
+
+    monkeypatch.setattr(discover, "SYSTEM_PROBES", True)
+    linux = discover.current_host(fakes.linux())
+    assert "/usr/lib/jvm/*" in linux.jdk_globs
+    assert any(g.endswith("/.jdks/*") for g in linux.jdk_globs)
+    assert Path("/opt/bindiff/bin/bindiff") in linux.bindiff_paths
+    assert Path("/opt") in linux.ghidra_scan_roots
+    mac = discover.current_host(fakes.darwin_arm())
+    assert "/Library/Java/JavaVirtualMachines/*/Contents/Home" in mac.jdk_globs
+    assert Path("/Applications/BinDiff/BinDiff.app/Contents/MacOS/bin/bindiff") in mac.bindiff_paths

@@ -61,7 +61,7 @@ def test_a_direct_url_install_never_reads_the_baked_commit(
     MUTATION: fall back to the baked commit whenever the VCS record has none -> RED."""
     for record in (
         '{"url":"file:///src","dir_info":{"editable":true}}',
-        '{"url":"file:///dist/tmap_agents-0.2.0-py3-none-any.whl","archive_info":{}}',
+        '{"url":"file:///dist/tmap_agents-0.1.0-py3-none-any.whl","archive_info":{}}',
     ):
         _install(monkeypatch, **{"tmap-agents": _Dist(record)})
         assert tm_version.installed_commit() == UNKNOWN_VERSION, record

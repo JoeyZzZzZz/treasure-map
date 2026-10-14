@@ -23,7 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - It registers the MCP server with the agents you select (Claude Code, Codex, Cursor, Claude
     Desktop, dsh; detected ones pre-selected): `command = <absolute tmap> mcp`, no env. Entries that
     are not tmap's are never modified; a Claude Code project-local entry that shadows the user one
-    is found and removed; JSON files are backed up, written atomically and read back.
+    is found and removed; JSON files are backed up, written atomically (through a symlink, never
+    over it) and read back. For dsh the
+    entry goes to the home-level `$DSH_HOME/cordis.patch.yml`, which every profile reads; a
+    `treasure-map` server already inserted in any profile's own layer (any id) is recognised and
+    never duplicated or edited.
   - Plan → confirm → apply → doctor; `--dry-run` and `--check-only` write nothing. `--yes` adds
     downloads and registers only `--client` agents; `--non-interactive` neither asks nor downloads.
     `--ghidra / --java-home / --bindiff PATH` use exactly that path or fail. `--offline DIR` and
@@ -38,8 +42,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   readable, each agent's entry, the atlas the server would bind, and starts `tmap mcp` the way an
   agent does.
 - **`tmap uninstall`** removes the agent entries and only the paths the install ledger records
-  (never a user's own JDK / Ghidra / BinDiff; a BinExport whose jars changed is refused). Data stays
+  (never a user's own JDK / Ghidra / BinDiff; a BinExport whose jars changed is refused), then, when
+  tmap runs from uv's `tmap-agents` tool environment, offers to remove the program itself with
+  `uv tool uninstall tmap-agents` (skipped while anything above still needs fixing). Data stays
   unless `--purge-data` and the typed phrase.
+- **`tmap update`** installs the newest `tmap-agents` from PyPI in place of the running one (a
+  `uv tool` install), removes the `treasure-map` tool the program was published as before, names any
+  other `tmap` on PATH, and then runs the new version's `tmap init`. `--check` only reports. A failed
+  install puts the running version back. Any other kind of install is told how to update itself.
 - **`tmap --version`.**
 
 - **Judgements on a diff's entries (MCP `annotate_diff`, `promote`).** A writable layer over

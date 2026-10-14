@@ -185,6 +185,10 @@ def _ghidra_checks(inp: DoctorInputs) -> tuple[list[Check], Path | None]:
         return [check("ghidra", "wrong", f"{home}: {why}")], None
     if not (home / "support" / "analyzeHeadless").is_file():
         return [check("ghidra", "wrong", f"{home}: no support/analyzeHeadless")], None
+    if not (home / "support" / "launch.properties").is_file():
+        return [
+            check("ghidra", "wrong", f"{home}: no support/launch.properties — Ghidra cannot start")
+        ], None
     out = [check("ghidra", "ok", f"{home} ({version})")]
     native_dir = inp.platform.ghidra_native_dir
     decompile = (
@@ -284,7 +288,7 @@ def _bindiff_check(inp: DoctorInputs) -> Check:
     return check("bindiff", "ok", f"{found} ({line})" + (f"; {note}" if note else ""))
 
 
-def _diff_toolchain_check(inp: DoctorInputs) -> Check:
+def _diff_toolchain_check(inp: DoctorInputs, blockers: Sequence[str] = ()) -> Check:
     detect = inp.detect_toolchain
     if detect is None:
 
@@ -298,11 +302,15 @@ def _diff_toolchain_check(inp: DoctorInputs) -> Check:
     except Exception as exc:
         return check("diff_toolchain_readable", "wrong", f"cannot read the toolchain: {exc}")
     if found is None:
+        cause = (
+            f"because {' and '.join(blockers)} failed above"
+            if blockers
+            else "Ghidra / BinExport / BinDiff versions unreadable"
+        )
         return check(
             "diff_toolchain_readable",
             "wrong",
-            "Ghidra / BinExport / BinDiff versions unreadable: stored diffs cannot be checked "
-            "for staleness",
+            f"{cause}: stored diffs cannot be checked for staleness",
         )
     return check("diff_toolchain_readable", "ok", str(found))
 
@@ -341,7 +349,8 @@ def _client_checks(inp: DoctorInputs) -> list[Check]:
         name = f"mcp.{cid}"
         detail = st.detail
         if st.state == "aligned":
-            out.append(check(name, "ok", f"registered in {st.config_path}"))
+            note = f" ({detail})" if detail else ""
+            out.append(check(name, "ok", f"registered in {st.config_path}{note}"))
         elif st.state == "missing":
             if cid in inp.requested_clients:
                 out.append(check(name, "missing", "not registered"))
@@ -455,15 +464,32 @@ def _runs_check(inp: DoctorInputs) -> Check | None:
     )
 
 
+def _config_check(inp: DoctorInputs) -> Check:
+    path = inp.tm_home / "config.yaml"
+    if not path.exists():
+        return check("config", "missing", f"{path}: not written yet — run `tmap init`")
+    from treasure_map.lib.config.config import load_config
+    from treasure_map.lib.errors import ConfigError
+
+    try:
+        load_config(None)
+    except ConfigError as exc:
+        return check("config", "wrong", str(exc).splitlines()[0])
+    return check("config", "ok", str(path))
+
+
 def run_doctor(inp: DoctorInputs) -> list[Check]:
     out = _platform_checks(inp)
+    out.append(_config_check(inp))
     out.append(_java_check(inp))
     ghidra, home = _ghidra_checks(inp)
     out += ghidra
     if home is not None:
         out += _binexport_checks(inp, home)
     out.append(_bindiff_check(inp))
-    out.append(_diff_toolchain_check(inp))
+    toolchain_parts = ("ghidra", "binexport", "bindiff")
+    blockers = [c.name for c in out if c.name in toolchain_parts and c.state in COUNTED]
+    out.append(_diff_toolchain_check(inp, blockers))
     out += _dir_checks(inp)
     out += _client_checks(inp)
     atlas = _mcp_atlas_check(inp)

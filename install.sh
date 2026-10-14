@@ -84,8 +84,10 @@ find_uv() {
 UV="$(find_uv || true)"
 if [ -n "$UV" ]; then
     UV_STATE="found at $UV"
+    BIN_PLAN="$("$UV" tool dir --bin 2>/dev/null || echo '<uv tool bin dir>')/tmap"
 else
     UV_STATE="not found -> will install (astral.sh installer, UV_NO_MODIFY_PATH=1: your shell rc is not edited)"
+    BIN_PLAN="<uv tool bin dir>/tmap (known once uv is installed)"
 fi
 
 if [ "$NO_INIT" -eq 0 ] && (exec </dev/tty) 2>/dev/null && [ -t 1 ]; then
@@ -99,6 +101,7 @@ say "  Version  : $TMAP_VERSION"
 say "  Platform : $PLATFORM"
 say "  uv       : $UV_STATE"
 say "  Command  : uv tool install --python 3.11 tmap-agents==$TMAP_VERSION   (uv-managed Python only)"
+say "  Binary   : $BIN_PLAN"
 say "  Next     : $NEXT"
 
 if [ "$DRY_RUN" -eq 1 ]; then
@@ -107,7 +110,12 @@ if [ "$DRY_RUN" -eq 1 ]; then
 fi
 
 if [ -z "$UV" ]; then
-    curl -LsSf https://astral.sh/uv/install.sh | env UV_NO_MODIFY_PATH=1 sh
+    UV_INSTALLER="$(mktemp)"
+    trap 'rm -f "$UV_INSTALLER"' EXIT
+    curl -LsSf -o "$UV_INSTALLER" https://astral.sh/uv/install.sh \
+        || die "could not download the uv installer from astral.sh (network or proxy?)"
+    env UV_NO_MODIFY_PATH=1 sh "$UV_INSTALLER" || die "the uv installer failed (see its output above)"
+    rm -f "$UV_INSTALLER"
     UV="$(find_uv || true)"
     [ -n "$UV" ] || die "uv was installed but cannot be found; see https://docs.astral.sh/uv/"
 fi

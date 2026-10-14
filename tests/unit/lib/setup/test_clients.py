@@ -195,3 +195,255 @@ def test_tmap_executable_requires_the_name(tmp_path: Path) -> None:
     assert cl.tmap_executable(str(exe)) == exe
     other = fakes._exe(tmp_path / "bin" / "python3")
     assert cl.tmap_executable(str(other)) is None
+
+
+def _profile(home: Path, name: str, patch: str) -> Path:
+    prof = home / ".dsh" / "profiles" / name
+    prof.mkdir(parents=True)
+    (prof / "cordis.yml").write_text("[]\n")
+    (prof / "cordis.patch.yml").write_text(patch)
+    return prof / "cordis.patch.yml"
+
+
+def _hand_entry(command: str, entry_id: str = "mcp-treasure-map") -> str:
+    return (
+        "# Your patch layer for this dsh profile\n"
+        "- insert:\n"
+        f"    - id: {entry_id}\n"
+        "      name: '@deepseek-ai/dsh-mcp-client'\n"
+        "      config:\n"
+        "        serverName: treasure-map\n"
+        "        transport: stdio\n"
+        f"        command: {command}\n"
+        "        args: [ 'mcp' ]\n"
+    )
+
+
+def test_dsh_reads_a_hand_written_profile_entry_and_adds_no_second_one(
+    tmp_path: Path, tmap: Path
+) -> None:
+    """★ dsh layers the profile's cordis.patch.yml under the home-level one, so an entry the user
+    wrote in a profile already serves treasure-map — whatever its id. Appending another to the
+    home layer would start the server twice.
+
+    MUTATION: recognise tmap's entry by tmap's own id only -> 'missing' -> a second entry is
+    appended -> RED."""
+    home = tmp_path / "h"
+    prof = _profile(home, "web", _hand_entry(str(tmap)))
+    before = prof.read_text()
+    host = _host(home)
+    st = cl.inspect("dsh", host, tmap)
+    assert st.state == "aligned" and st.config_path == prof and not st.editable
+    assert cl.register("dsh", host, tmap).ok
+    assert not (home / ".dsh" / "cordis.patch.yml").exists()
+    assert prof.read_text() == before
+    outs = cl.unregister("dsh", host, tmap)
+    assert all(o.ok and o.message.startswith("left alone") for o in outs)
+    assert prof.read_text() == before
+
+
+def test_dsh_a_profile_entry_for_another_tmap_is_stale_and_not_edited(
+    tmp_path: Path, tmap: Path
+) -> None:
+    """MUTATION: skip the profile layers -> 'missing' -> the home layer gets a second entry ->
+    RED."""
+    home = tmp_path / "h"
+    prof = _profile(home, "web", _hand_entry("/old/place/tmap"))
+    host = _host(home)
+    st = cl.inspect("dsh", host, tmap)
+    assert st.state == "stale" and st.config_path == prof
+    out = cl.register("dsh", host, tmap)
+    assert not out.ok and out.manual
+    assert not (home / ".dsh" / "cordis.patch.yml").exists()
+
+
+def test_dsh_writes_the_home_layer_that_reaches_every_profile(tmp_path: Path, tmap: Path) -> None:
+    home = tmp_path / "h"
+    _profile(home, "web", "- id: ui-settings-general\n")
+    _profile(home, "headless", "[]\n")
+    (home / ".dsh" / "profiles" / "node_modules").mkdir()  # not a profile: no cordis.yml
+    host = _host(home)
+    assert cl.register("dsh", host, tmap).ok
+    st = cl.inspect("dsh", host, tmap)
+    assert st.state == "aligned" and st.config_path == home / ".dsh" / "cordis.patch.yml"
+
+
+def test_dsh_home_follows_dsh_rules(tmp_path: Path) -> None:
+    """A blank $DSH_HOME is unset; ``~`` expands — as dsh itself resolves its home.
+
+    MUTATION: take $DSH_HOME verbatim -> a blank one becomes the working directory -> RED."""
+    home = tmp_path / "h"
+
+    def at(value: str | None) -> Path:
+        env = {} if value is None else {"DSH_HOME": value}
+        return cl.dsh_home(
+            cl.ClientHost(home, env, fakes.linux(), lambda _n: None, fakes.fake_run())
+        )
+
+    assert at(None) == home / ".dsh"
+    assert at("   ") == home / ".dsh"
+    assert at("~/alt") == home / "alt"
+    assert at("/srv/dsh") == Path("/srv/dsh")
+
+
+def test_dsh_same_server_name_over_http_is_foreign(tmp_path: Path, tmap: Path) -> None:
+    home = tmp_path / "h"
+    _profile(
+        home,
+        "web",
+        "- insert:\n    - id: x\n      name: n\n      config:\n        serverName: treasure-map\n"
+        "        transport: streamable-http\n        url: http://127.0.0.1:1/mcp\n",
+    )
+    assert cl.inspect("dsh", _host(home), tmap).state == "foreign"
+
+
+# ── audit follow-ups ─────────────────────────────────────────────────────────────────────────
+
+
+def test_uninstall_leaves_a_foreign_entry_alone(tmp_path: Path, tmap: Path) -> None:
+    """MUTATION: count a foreign entry as tmap's in unregister -> it is deleted -> RED."""
+    home = tmp_path / "h"
+    cfg = home / ".cursor" / "mcp.json"
+    cfg.parent.mkdir(parents=True)
+    raw = json.dumps({"mcpServers": {"treasure-map": {"command": "node", "args": ["s.js"]}}})
+    cfg.write_text(raw)
+    outs = cl.unregister("cursor", _host(home), tmap)
+    assert cfg.read_text() == raw and all(o.ok for o in outs)
+
+
+def test_a_symlinked_config_stays_a_link(tmp_path: Path, tmap: Path) -> None:
+    """★ A config kept in a dotfiles repository: the link stays, the file it points at changes.
+
+    MUTATION: write onto the link path -> it becomes a detached regular file -> RED."""
+    home = tmp_path / "h"
+    real = tmp_path / "dotfiles" / "mcp.json"
+    real.parent.mkdir(parents=True)
+    real.write_text(json.dumps({"mcpServers": {}}))
+    link = home / ".cursor" / "mcp.json"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(real)
+    assert cl.register("cursor", _host(home), tmap).ok
+    assert link.is_symlink()
+    assert json.loads(real.read_text())["mcpServers"]["treasure-map"]["command"] == str(tmap)
+
+
+def test_other_keys_keep_their_characters(tmp_path: Path, tmap: Path) -> None:
+    home = tmp_path / "h"
+    cfg = home / ".cursor" / "mcp.json"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(json.dumps({"note": "固件 ✓", "mcpServers": {}}, ensure_ascii=False))
+    assert cl.register("cursor", _host(home), tmap).ok
+    assert "固件 ✓" in cfg.read_text(encoding="utf-8")
+
+
+def test_removing_a_shadowing_entry_runs_inside_that_project(tmp_path: Path) -> None:
+    """MUTATION: run `claude mcp remove -s local` without cwd -> it acts on whatever directory
+    init was started from -> RED."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    seen: list[Path | None] = []
+
+    def run(argv: list[str], *, cwd: Path | None = None, timeout: float = 30) -> RunResult:
+        seen.append(cwd)
+        return RunResult(0, "", "")
+
+    out = cl.remove_shadowing(_host(tmp_path / "h", which={"claude": "/x/claude"}, run=run), proj)
+    assert out.ok and seen == [proj]
+
+
+def test_tmap_executable_keeps_the_shim_path(tmp_path: Path) -> None:
+    """A uv tool shim is a symlink into a versioned environment; registering the target would
+    break on the next upgrade.
+
+    MUTATION: resolve symlinks -> the environment path is returned -> RED."""
+    target = fakes._exe(tmp_path / "env" / "bin" / "tmap")
+    shim = tmp_path / "bin" / "tmap"
+    shim.parent.mkdir()
+    shim.symlink_to(target)
+    assert cl.tmap_executable(str(shim)) == shim
+
+
+def test_a_project_mcp_json_is_reported_and_shadows(tmp_path: Path, tmap: Path) -> None:
+    """MUTATION: skip the project .mcp.json files -> 'aligned' -> RED."""
+    home = tmp_path / "h"
+    home.mkdir()
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / ".mcp.json").write_text(json.dumps({"mcpServers": {"treasure-map": {"command": "x"}}}))
+    good = {"type": "stdio", "command": str(tmap), "args": ["mcp"], "env": {}}
+    (home / ".claude.json").write_text(
+        json.dumps({"mcpServers": {"treasure-map": good}, "projects": {str(proj): {}}})
+    )
+    st = cl.inspect("claude-code", _host(home), tmap)
+    assert st.state == "shadowed" and any(".mcp.json" in r for r in st.reported)
+
+
+def test_a_vanished_project_directory_shadows_nothing(tmp_path: Path, tmap: Path) -> None:
+    home = tmp_path / "h"
+    home.mkdir()
+    good = {"type": "stdio", "command": str(tmap), "args": ["mcp"], "env": {}}
+    gone = str(tmp_path / "deleted-project")
+    (home / ".claude.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {"treasure-map": good},
+                "projects": {gone: {"mcpServers": {"treasure-map": {"command": str(tmap)}}}},
+            }
+        )
+    )
+    st = cl.inspect("claude-code", _host(home), tmap)
+    assert st.state == "aligned" and st.shadowing == () and gone in st.detail
+
+
+def test_a_failed_re_add_puts_the_previous_entry_back(tmp_path: Path, tmap: Path) -> None:
+    """MUTATION: drop the put-back -> the user is left with no entry at all -> RED."""
+    home = tmp_path / "h"
+    home.mkdir()
+    old = {"type": "stdio", "command": "/old/tmap", "args": ["mcp"], "env": {}}
+    (home / ".claude.json").write_text(json.dumps({"mcpServers": {"treasure-map": old}}))
+    calls: list[list[str]] = []
+
+    def run(argv: list[str], *, cwd: Path | None = None, timeout: float = 30) -> RunResult:
+        calls.append(list(argv))
+        return RunResult(1 if argv[2] == "add" else 0, "", "boom")
+
+    out = cl.register("claude-code", _host(home, which={"claude": "/x/claude"}, run=run), tmap)
+    assert not out.ok and "put back" in out.message
+    assert calls[-1][:3] == ["claude", "mcp", "add-json"] and json.loads(calls[-1][-1]) == old
+
+
+def test_a_hand_edited_dsh_block_is_not_removed(tmp_path: Path, tmap: Path) -> None:
+    """MUTATION: remove tmap's entry by rewriting the parsed YAML -> the user's edit and every
+    comment in the file are lost -> RED."""
+    home = tmp_path / "h"
+    (home / ".dsh").mkdir(parents=True)
+    host = _host(home)
+    assert cl.register("dsh", host, tmap).ok
+    patch = home / ".dsh" / "cordis.patch.yml"
+    edited = "# my notes\n" + patch.read_text().replace(
+        "transport: stdio", "transport: stdio  # ok"
+    )
+    patch.write_text(edited)
+    outs = cl.unregister("dsh", host, tmap)
+    assert not outs[0].ok and patch.read_text() == edited
+
+
+def test_claude_desktop_is_not_written_while_it_runs(tmp_path: Path, tmap: Path) -> None:
+    """Unattended: skipped. Interactive: asked to quit, and checked again afterwards.
+
+    MUTATION: skip either the running check or the re-check -> the file is written under a
+    running app -> RED."""
+    home = tmp_path / "h"
+    cfg = home / "Library" / "Application Support" / "Claude" / "claude_desktop_config.json"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text("{}")
+
+    def running(argv: list[str], *, cwd: Path | None = None, timeout: float = 30) -> RunResult:
+        return RunResult(0 if argv[0] == "pgrep" else 1, "", "")
+
+    host = cl.ClientHost(home, {}, fakes.darwin_arm(), lambda _n: None, running)
+    assert not cl.register("claude-desktop", host, tmap).ok
+    asked: list[str] = []
+    out = cl.register("claude-desktop", host, tmap, confirm_quit=asked.append)
+    assert asked and not out.ok and "still running" in out.message
+    assert cfg.read_text() == "{}"

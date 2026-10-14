@@ -111,3 +111,81 @@ def test_a_foreign_entry_reads_wrong_and_not_modified(tmp_path: Path) -> None:
     inp.client_host = cl.ClientHost(home, {}, fakes.linux(), lambda _n: None, fakes.fake_run())
     checks = {c.name: c for c in _client_checks(inp)}
     assert checks["mcp.cursor"].state == "wrong" and "not modified" in checks["mcp.cursor"].detail
+
+
+def test_an_unreadable_toolchain_names_what_failed_above() -> None:
+    """MUTATION: drop the blockers -> the generic line -> RED."""
+    from treasure_map.lib.setup.doctor import _diff_toolchain_check
+
+    inp = _inputs(Path.home(), detect_toolchain=lambda: None)
+    res = _diff_toolchain_check(inp, ["binexport"])
+    assert res.state == "wrong" and res.detail.startswith("because binexport failed above")
+    generic = _diff_toolchain_check(inp, [])
+    assert generic.state == "wrong" and "BinExport" in generic.detail
+
+
+def test_ghidras_launcher_is_asked_without_save(tmp_path: Path) -> None:
+    """★ ``-save`` would write the user's java_home.save — the doctor reads only.
+
+    MUTATION: add -save -> RED."""
+    from treasure_map.lib.setup.discover import RunResult
+    from treasure_map.lib.setup.doctor import _ghidra_jdk_effective
+
+    log: list[list[str]] = []
+    jdk = fakes.make_jdk(tmp_path / "jdk")
+
+    def run(argv: list[str], **_k: object) -> RunResult:
+        log.append(list(argv))
+        return RunResult(0, f"{jdk}\n", "")
+
+    host = fakes.make_host(tmp_path / "home", which={"java": str(jdk / "bin" / "java")}, run=run)
+    inp = _inputs(Path.home(), host=host)
+    res = _ghidra_jdk_effective(inp, fakes.make_ghidra(tmp_path / "g"))
+    assert res.state == "ok"
+    assert "-jdk_home" in log[0] and "-save" not in log[0]
+
+
+def test_a_shadowed_registration_is_wrong(tmp_path: Path) -> None:
+    """MUTATION: report 'shadowed' as ok -> RED."""
+    from treasure_map.lib.setup.doctor import _client_checks
+
+    home = Path.home()
+    tmap = fakes._exe(tmp_path / "bin" / "tmap")
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    good = {"type": "stdio", "command": str(tmap), "args": ["mcp"], "env": {}}
+    (home / ".claude.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {"treasure-map": good},
+                "projects": {str(proj): {"mcpServers": {"treasure-map": {"command": str(tmap)}}}},
+            }
+        )
+    )
+    checks = {c.name: c for c in _client_checks(_inputs(home, tmap=tmap))}
+    assert checks["mcp.claude-code"].state == "wrong"
+
+
+def test_a_ghidra_without_launch_properties_is_wrong(tmp_path: Path) -> None:
+    """The launcher refuses to start without support/launch.properties — never a ✅.
+
+    MUTATION: drop the check -> 'ok' -> RED."""
+    from treasure_map.lib.config.config import Config, GhidraConfig, GhidraLocalConfig
+    from treasure_map.lib.setup.doctor import _ghidra_checks
+
+    g = fakes.make_ghidra(tmp_path / "g")
+    (g / "support" / "launch.properties").unlink()
+    cfg = Config(ghidra=GhidraConfig(local=GhidraLocalConfig(home=g)))
+    checks, _home = _ghidra_checks(_inputs(Path.home(), cfg=cfg))
+    assert checks[0].state == "wrong" and "launch.properties" in checks[0].detail
+
+
+def test_the_config_check() -> None:
+    from treasure_map.lib.setup.doctor import _config_check
+
+    tm = Path.home() / ".treasure-map"
+    assert _config_check(_inputs(Path.home())).state == "missing"
+    (tm / "config.yaml").write_text("ghidra: [unclosed\n")
+    assert _config_check(_inputs(Path.home())).state == "wrong"
+    (tm / "config.yaml").write_text("log_level: INFO\n")
+    assert _config_check(_inputs(Path.home())).state == "ok"

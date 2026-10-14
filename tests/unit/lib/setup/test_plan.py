@@ -160,6 +160,11 @@ def test_a_fresh_install_reads_as_a_readable_toolchain_in_the_same_process(
     props = tdir / "ghidra_11.4.3_PUBLIC" / "support" / "launch.properties"
     assert props.read_text() == f"JAVA_HOME_OVERRIDE={tdir / 'jdk-21.0.12.1+1'}\n"
     ledger = json.loads((tdir / "installed.json").read_text())
+    # the installed BinExport's digest is recorded — uninstall refuses a copy without one
+    from treasure_map.lib.diff.toolchain import binexport_lib_digest
+
+    be = next(e for e in ledger["entries"] if e["id"] == "binexport")
+    assert be.get("lib_digest") == binexport_lib_digest(Path(be["path"]))
     assert {e["id"] for e in ledger["entries"] if e["state"] == "committed"} >= {
         "jdk",
         "ghidra",
@@ -286,3 +291,131 @@ def test_unpublished_binexport_is_reported_not_skipped(home: Path) -> None:
     assert g.exists()
     assert "unavailable: BinExport artifact not published yet" in result.needs_you
     assert any("unavailable: BinExport artifact not published yet" in ln for ln in lines)
+
+
+# ── audit follow-ups ─────────────────────────────────────────────────────────────────────────
+
+
+def test_init_sweeps_staging_left_by_an_interrupted_run(home: Path) -> None:
+    """MUTATION: make sweep_staging a no-op -> the leftover stays -> RED."""
+    left = home / ".treasure-map" / "toolchain" / ".staging-deadbeef"
+    (left / "unpacked").mkdir(parents=True)
+    run_init(
+        non_interactive=True,
+        prompt=lambda _m: "",
+        platform=fakes.linux(),
+        host=_host(home),
+        tmap=None,
+    )
+    assert not left.exists()
+
+
+def test_force_writes_back_what_it_found(home: Path, tmp_path: Path) -> None:
+    """--force rebuilds config.yaml from defaults AND writes the chosen toolchain back in the
+    same run — never a config that has lost its Ghidra.
+
+    MUTATION: write only changed keys under --force -> ghidra.local.home is gone -> RED."""
+    import yaml
+
+    g = fakes.make_ghidra(tmp_path / "g")
+    jdk = fakes.make_jdk(tmp_path / "jdk")
+    bd = fakes.make_bindiff(tmp_path / "bd" / "bindiff")
+    cfg = home / ".treasure-map" / "config.yaml"
+    cfg.write_text(
+        yaml.safe_dump(
+            {
+                "ghidra": {"local": {"home": str(g)}},
+                "toolchain": {"java_home": str(jdk), "bindiff": str(bd)},
+                "workspace_dir": str(tmp_path / "ws"),
+            }
+        )
+    )
+    run_init(
+        force=True,
+        non_interactive=True,
+        prompt=lambda _m: "",
+        platform=fakes.linux(),
+        host=_host(home),
+        tmap=None,
+    )
+    data = yaml.safe_load(cfg.read_text())
+    assert data["ghidra"]["local"]["home"] == str(g)
+    assert data["toolchain"] == {"java_home": str(jdk), "bindiff": str(bd)}
+    assert data["workspace_dir"] == str(tmp_path / "ws")
+
+
+def test_binexport_for_a_users_ghidra_goes_to_its_settings_dir(home: Path, tmp_path: Path) -> None:
+    """★ tmap never writes into a Ghidra install it did not make.
+
+    MUTATION: install into <ghidra>/Ghidra/Extensions regardless -> RED."""
+    from treasure_map.lib.setup.ledger import Ledger
+    from treasure_map.lib.setup.plan import binexport_target
+
+    g = fakes.make_ghidra(tmp_path / "users-ghidra")
+    host = _host(home)
+    ledger = Ledger(home / ".treasure-map" / "toolchain" / "installed.json")
+    target = binexport_target(host, g, ledger)
+    assert (
+        target == home / ".config" / "ghidra" / "ghidra_11.4.3_PUBLIC" / "Extensions" / "BinExport"
+    )
+    ledger.add_pending("ghidra", "dir", g)
+    ledger.commit("ghidra")
+    assert binexport_target(host, g, ledger) == g / "Ghidra" / "Extensions" / "BinExport"
+
+
+def test_a_rerun_neither_rewrites_the_ledger_nor_forgets_the_rc(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MUTATION: record completion on every run with this run's rc -> an unattended re-run drops
+    the rc block an earlier yes added (uninstall would leave it behind) -> RED."""
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+    run_init(
+        prompt=lambda _m: "",
+        platform=fakes.linux(),
+        host=_host(home),
+        tmap=None,
+        use_tty=False,
+        fetcher=fakes.RefusingFetcher(),
+    )
+    ledger_file = home / ".treasure-map" / "toolchain" / "installed.json"
+    first = json.loads(ledger_file.read_text())
+    comp = next(e for e in first["entries"] if e["id"] == "completion")
+    assert comp["rc_block"] == str(home / ".zshrc")
+    before = (ledger_file.read_bytes(), ledger_file.stat().st_mtime_ns)
+    run_init(
+        non_interactive=True,
+        prompt=lambda _m: "",
+        platform=fakes.linux(),
+        host=_host(home),
+        tmap=None,
+    )
+    assert (ledger_file.read_bytes(), ledger_file.stat().st_mtime_ns) == before
+
+
+def test_an_entry_already_in_place_is_neither_a_to_do_nor_a_restart(home: Path) -> None:
+    """A dsh profile already serving treasure-map: nothing written, nothing to do, no restart.
+
+    MUTATION: list the profile layer under 'needs you', or name every selected agent in the
+    restart line -> RED."""
+    tmap = fakes._exe(home / "bin" / "tmap")
+    prof = home / ".dsh" / "profiles" / "web"
+    prof.mkdir(parents=True)
+    (prof / "cordis.yml").write_text("[]\n")
+    (prof / "cordis.patch.yml").write_text(
+        "- insert:\n    - id: mcp-treasure-map\n      name: '@deepseek-ai/dsh-mcp-client'\n"
+        f"      config:\n        serverName: treasure-map\n        transport: stdio\n"
+        f"        command: {tmap}\n        args: [mcp]\n"
+    )
+    result = run_init(
+        assume_yes=True,
+        clients=("dsh",),
+        prompt=lambda _m: "",
+        platform=fakes.linux(),
+        host=_host(home),
+        fetcher=fakes.RefusingFetcher(),
+        tmap=tmap,
+        mcp_probe=lambda *_a: McpProbe(None, False, "not probed"),
+    )
+    assert not any(n.startswith("dsh:") for n in result.needs_you)
+    assert result.registered == ()
+    assert not (home / ".dsh" / "cordis.patch.yml").exists()

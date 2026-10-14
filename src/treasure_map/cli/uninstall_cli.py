@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 
 import click
@@ -14,7 +16,8 @@ import click
 @click.option("--yes", "-y", "assume_yes", is_flag=True, help="Do not ask to confirm the plan.")
 @click.option("--dry-run", is_flag=True, help="Print the plan; change nothing.")
 def uninstall(purge_data: bool, assume_yes: bool, dry_run: bool) -> None:
-    """Remove tmap's agent registrations and the toolchain tmap downloaded.
+    """Remove tmap's agent registrations, the toolchain tmap downloaded, and — when it was
+    installed with ``uv tool`` — the tmap program itself (the last step, after you confirm).
 
     Only what the install ledger records is removed — never a JDK, Ghidra or BinDiff you
     installed yourself. config.yaml, .env, the atlas and the workspaces stay unless
@@ -47,9 +50,12 @@ def uninstall(purge_data: bool, assume_yes: bool, dry_run: bool) -> None:
     except ConfigError as exc:
         raise click.ClickException(str(exc)) from exc
     survey = cl.survey(chost, tmap)
+    self_argv = un.uv_self_uninstall(Path(sys.prefix), home, host.which, host.run)
     click.echo("Uninstall plan:")
     for line in un.plan_lines(ledger, survey, toolchain_dir=tm_home / "toolchain", home=home):
         click.echo(f"  • {line}")
+    if self_argv is not None:
+        click.echo(f"  • last: remove the tmap program itself ({' '.join(self_argv[1:])})")
     data = un.data_paths(cfg.atlas.db_path, cfg.workspace_dir)
     if purge_data:
         click.echo("  • --purge-data: delete (after you type the phrase):")
@@ -93,6 +99,25 @@ def uninstall(purge_data: bool, assume_yes: bool, dry_run: bool) -> None:
         for p in data:
             click.echo(f"  {p}")
     click.echo("  any JDK / Ghidra / BinDiff tmap did not install")
-    click.echo("now run: uv tool uninstall tmap-agents")
+    if self_argv is None:
+        click.echo(
+            "the tmap program stays: it was not installed with `uv tool install tmap-agents`; "
+            "remove it the way you installed it"
+        )
+        if report.failed:
+            raise SystemExit(1)
+        return
     if report.failed:
+        click.echo(
+            f"the tmap program stays until the items above are fixed; then: {' '.join(self_argv)}"
+        )
         raise SystemExit(1)
+    if assume_yes or click.confirm(
+        f"Also remove the tmap program itself ({' '.join(self_argv[1:])})?", default=True
+    ):
+        sys.stdout.flush()
+        sys.stderr.flush()
+        # Replace this process: uv then removes the environment tmap was running from, with no
+        # tmap process left inside it.
+        os.execvp(self_argv[0], self_argv)
+    click.echo(f"now run: {' '.join(self_argv)}")

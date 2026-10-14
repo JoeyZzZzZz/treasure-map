@@ -28,7 +28,7 @@ from typing import IO, Protocol
 
 from treasure_map.lib.errors import TreasureMapError
 from treasure_map.lib.setup.discover import Runner
-from treasure_map.lib.setup.ledger import Ledger
+from treasure_map.lib.setup.ledger import Entry, Ledger, strictly_under
 from treasure_map.lib.setup.toolchain_lock import Asset
 
 STAGING_PREFIX = ".staging-"
@@ -364,6 +364,9 @@ def _move(src: Path, target: Path) -> None:
         shutil.move(str(src), str(target))  # another filesystem: the pending entry covers it
 
 
+DOWNLOADS = ".downloads"
+
+
 def install_archive(
     entry_id: str,
     asset: Asset,
@@ -377,26 +380,44 @@ def install_archive(
     mirror: str | None = None,
     progress: Progress | None = None,
     extra: dict[str, object] | None = None,
+    pending_extra: Callable[[Path], dict[str, object]] | None = None,
 ) -> Path:
     """Download, verify and unpack ``asset``, then move its top directory to ``target``.
 
     Order is what makes it safe to interrupt: the ledger records ``target`` as pending BEFORE the
-    move, the installed copy is checked with ``verify`` (None = usable), and only then is the entry
+    move (with ``pending_extra(unpacked)`` — what lets a later run recognise this very copy), the
+    installed copy is checked with ``verify`` (None = usable), and only then is the entry
     committed. A failed check removes ``target`` and the entry. The staging directory is removed
-    on every path out, Ctrl-C included."""
+    on every path out, Ctrl-C included. The download itself sits in ``.downloads/`` until it is
+    verified, so an interrupted download resumes where it stopped on the next run."""
     if target.exists():
         raise FetchError(f"{target} already exists and tmap did not record installing it")
+    # A newer pin replacing an older install of the same component: the entry is rewritten below,
+    # so the old path is remembered here and removed once the new copy is in place and checked —
+    # never left behind unrecorded, never removed before its replacement works.
+    previous = ledger.committed(entry_id)
     staging = new_staging(toolchain_dir)
     try:
         archive = download_verified(
-            asset, staging / "download", fetcher, mirror=mirror, progress=progress
+            asset, toolchain_dir / DOWNLOADS, fetcher, mirror=mirror, progress=progress
         )
         unpacked = staging / "unpacked"
-        unpack(asset, archive, unpacked, run)
+        try:
+            unpack(asset, archive, unpacked, run)
+        finally:
+            archive.unlink(missing_ok=True)
         src = unpacked / asset.root if asset.root else unpacked
         if not src.is_dir():
             raise FetchError(f"{asset.file_name} has no {asset.root or 'content'}/ at its top")
-        ledger.add_pending(entry_id, "dir", target, source_sha256=asset.sha256, **dict(extra or {}))
+        recognise = pending_extra(src) if pending_extra is not None else {}
+        ledger.add_pending(
+            entry_id,
+            "dir",
+            target,
+            source_sha256=asset.sha256,
+            **dict(extra or {}),
+            **recognise,
+        )
         _move(src, target)
         why = verify(target)
         if why is not None:
@@ -404,9 +425,39 @@ def install_archive(
             ledger.remove(entry_id)
             raise FetchError(f"installed {entry_id} at {target} failed its check: {why}")
         ledger.commit(entry_id)
+        if previous is not None and Path(previous.path) != target:
+            remove_superseded(previous, toolchain_dir)
         return target
     finally:
         shutil.rmtree(staging, ignore_errors=True)
+        downloads = toolchain_dir / DOWNLOADS
+        if downloads.is_dir() and not any(downloads.iterdir()):
+            downloads.rmdir()
+
+
+def remove_superseded(entry: Entry, toolchain_dir: Path) -> bool:
+    """Remove the install a newer one replaced — only when it is provably tmap's: strictly under
+    the toolchain directory, or (BinExport in a user's Ghidra) a copy whose jars still hash to what
+    tmap recorded. True when it was removed."""
+    from treasure_map.lib.diff.toolchain import binexport_lib_digest
+
+    path = Path(entry.path)
+    if not path.exists() or path.is_symlink():
+        return False
+    recorded = entry.extra.get("lib_digest")
+    ours = strictly_under(path, toolchain_dir) or (
+        entry.id == "binexport"
+        and path.is_dir()
+        and isinstance(recorded, str)
+        and binexport_lib_digest(path) == recorded
+    )
+    if not ours:
+        return False
+    if path.is_dir():
+        shutil.rmtree(path, ignore_errors=True)
+    else:
+        path.unlink(missing_ok=True)
+    return True
 
 
 def recover_pending(
@@ -415,10 +466,16 @@ def recover_pending(
     *,
     toolchain_dir: Path,
 ) -> list[str]:
-    """Settle the entries an interrupted install left pending: a path that exists and passes its
-    check is committed; anything else is removed (only under ``toolchain_dir`` — a pending path
-    elsewhere is dropped from the ledger and reported, never deleted) with its entry. Returns
-    report lines."""
+    """Settle the entries an interrupted run left pending. Returns report lines.
+
+    * An entry whose path passes its check is committed.
+    * An EDIT entry (a line tmap changes inside a file) is never deleted: the file is not tmap's
+      to remove. Applied -> committed; otherwise the entry is dropped and the file left as is.
+    * A directory strictly under ``toolchain_dir`` that fails its check is removed with its entry.
+    * Elsewhere (BinExport in a user's Ghidra settings), only a copy whose jars still hash to what
+      was recorded before the move is removed — else it is left in place and reported."""
+    from treasure_map.lib.diff.toolchain import binexport_lib_digest
+
     lines: list[str] = []
     for entry in list(ledger.pending()):
         path = Path(entry.path)
@@ -426,16 +483,28 @@ def recover_pending(
         why = "no check for it" if check is None else (check(path) if path.exists() else "absent")
         if why is None:
             ledger.commit(entry.id)
-            lines.append(f"recovered {entry.id} at {path} (interrupted install verified)")
+            lines.append(f"recovered {entry.id} at {path} (interrupted run verified)")
             continue
-        inside = path.resolve().is_relative_to(toolchain_dir.resolve())
-        if path.exists() and inside:
+        if entry.kind == "edit":
+            ledger.remove(entry.id)
+            lines.append(f"left {path} as it is: tmap's edit there was not completed ({why})")
+            continue
+        expect = entry.extra.get("expect_digest")
+        ours_outside = (
+            isinstance(expect, str)
+            and path.is_dir()
+            and not path.is_symlink()
+            and binexport_lib_digest(path) == expect
+        )
+        if path.exists() and (strictly_under(path, toolchain_dir) or ours_outside):
             if path.is_dir() and not path.is_symlink():
                 shutil.rmtree(path, ignore_errors=True)
             else:
                 path.unlink(missing_ok=True)
             lines.append(f"removed unfinished {entry.id} at {path} ({why})")
         elif path.exists():
-            lines.append(f"left {path} in place: an unfinished {entry.id} outside tmap's directory")
+            lines.append(
+                f"left {path} in place: an unfinished {entry.id} tmap cannot prove is its own"
+            )
         ledger.remove(entry.id)
     return lines

@@ -38,8 +38,13 @@ def runs_currency(cfg: Config | None) -> RunsCurrency:
     atlas = (cfg or _Config()).atlas.db_path
     if not atlas.exists():
         return RunsCurrency(None, absent=True)
+    # Read without writing a byte: a WAL database read through mode=ro creates -wal and -shm beside
+    # it and leaves them. With neither present (the atlas was closed cleanly) nothing can be
+    # mid-write, so it is opened immutable; with them present, mode=ro reads the live state.
+    side = [atlas.with_name(atlas.name + s) for s in ("-wal", "-shm")]
+    flag = "mode=ro" if any(p.exists() for p in side) else "immutable=1"
     try:
-        conn = sqlite3.connect(f"file:{atlas}?mode=ro", uri=True)
+        conn = sqlite3.connect(f"{atlas.resolve().as_uri()}?{flag}", uri=True)
     except sqlite3.Error as exc:
         return RunsCurrency(None, why=f"cannot open {atlas} read-only: {exc}")
     conn.row_factory = sqlite3.Row
@@ -73,6 +78,23 @@ def render_checks(result: InitResult) -> bool:
     return any_red
 
 
+# What to say to the agent, written out in full (one sentence per line) so it can be copied as is.
+_AUDIT_PROMPT = (
+    "Audit firmware my-fw using treasure-map.",
+    "Work down its ranked candidate list from the top:",
+    "open a lead's pseudocode, trace where its input comes from, and judge it yourself.",
+    "The candidates are leads to verify, not confirmed bugs.",
+    "Record each conclusion with annotate so the next session starts from it.",
+)
+_DIFF_PROMPT = (
+    "Review the diff fw-v1 → fw-v2 using treasure-map.",
+    "Start from the function patch view (get_diff_patch_view):",
+    "for each changed function, compare the pseudocode of both versions",
+    "and decide whether the change does something real, such as a new check or a changed bound.",
+    "Record each judgement with annotate_diff.",
+)
+
+
 def _next_steps(result: InitResult, any_red: bool) -> None:
     runs = result.runs
     if result.needs_you or any_red:
@@ -87,7 +109,7 @@ def _next_steps(result: InitResult, any_red: bool) -> None:
             if not c[1]:
                 click.echo(f"  - {c[0]}: {c[2]}")
     upgrade = [
-        "After upgrading tmap:",
+        "After upgrading tmap (tmap update):",
         "   tmap rescan                                   "
         "# re-scan every run made by an older tmap",
         "   tmap diff --before fw-v1 --after fw-v2        "
@@ -107,17 +129,16 @@ def _next_steps(result: InitResult, any_red: bool) -> None:
     click.echo("① Audit one firmware")
     click.echo("   tmap scan ./fw.extracted -w my-fw")
     click.echo("   Then in your agent:")
-    click.echo('     "Audit firmware my-fw using treasure-map. Work down its ranked candidates…"')
+    for line in _AUDIT_PROMPT:
+        click.echo(f"     {line}")
     click.echo("")
     click.echo("② Find what a firmware update changed (patch diff)")
     click.echo("   tmap scan ./fw_v1.extracted -w fw-v1")
     click.echo("   tmap scan ./fw_v2.extracted -w fw-v2")
     click.echo("   tmap diff --before fw-v1 --after fw-v2")
     click.echo("   Then in your agent:")
-    click.echo(
-        '     "Review the diff fw-v1 → fw-v2 using treasure-map. Start from the function '
-        'patch view…"'
-    )
+    for line in _DIFF_PROMPT:
+        click.echo(f"     {line}")
     if not stale_first:
         click.echo("")
         for line in upgrade:
@@ -139,7 +160,9 @@ def _run(**kwargs: object) -> InitResult:
         raise click.ClickException(str(exc)) from exc
     except TreasureMapError as exc:
         raise click.ClickException(f"{type(exc).__name__}: {exc}") from exc
-    except KeyboardInterrupt as exc:
+    except (KeyboardInterrupt, click.exceptions.Abort) as exc:
+        # Ctrl-C at a raw-mode key, or at any line prompt (click turns that into Abort): the same
+        # interruption, the same 130.
         click.echo("\ninterrupted; staging cleaned up — run tmap init again to continue", err=True)
         raise SystemExit(130) from exc
 
@@ -227,5 +250,7 @@ def init(
             raise SystemExit(1)
         return
     _next_steps(result, any_red)
-    if result.failed:
+    # Unattended (--yes / --non-interactive) a script reads the exit code alone, so a machine left
+    # not ready is a failure there. Interactively the person has read the checks above.
+    if result.failed or (any_red and (assume_yes or non_interactive)):
         raise SystemExit(1)

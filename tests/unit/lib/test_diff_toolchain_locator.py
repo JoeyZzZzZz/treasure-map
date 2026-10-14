@@ -160,3 +160,22 @@ def test_the_stamp_follows_the_jars(
     (ext / "lib" / "protobuf-java-3.25.jar").write_bytes(b"x")
     third = tc._binexport_version(ghidra)
     assert len({first, second, third}) == 3
+
+
+def test_what_counts_as_a_loaded_copy(tmp_path: Path, ghidra: Path) -> None:
+    """A Module.manifest.uninstalled marker removes a copy; a copy without lib/BinExport.jar is not
+    loadable; the same directory reached twice (a symlinked settings dir) is one copy.
+
+    MUTATION: drop any of the three rules -> RED."""
+    home = tmp_path / "home"
+    installed = fakes.make_binexport(ghidra / "Ghidra" / "Extensions" / "BinExport")
+    (installed / "Module.manifest.uninstalled").write_text("")
+    assert _dirs(ghidra, home) == []
+    (installed / "Module.manifest.uninstalled").unlink()
+    (installed / "lib" / "BinExport.jar").unlink()
+    assert _dirs(ghidra, home) == []
+    (installed / "lib" / "BinExport.jar").write_bytes(b"jar")
+    settings_ext = home / ".config" / "ghidra" / "ghidra_11.4.3_PUBLIC" / "Extensions"
+    settings_ext.mkdir(parents=True)
+    (settings_ext / "BinExport").symlink_to(installed)
+    assert _dirs(ghidra, home) == [installed]

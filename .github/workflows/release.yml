@@ -50,7 +50,9 @@ jobs:
               "treasure_map/lib/analyze/ghidra/ExportFunctions.java",
               "treasure_map/lib/analyze/ghidra/extractor_names.tsv",
               "treasure_map/lib/diff/ghidra/ExportBinExport.java",
+              "treasure_map/lib/diff/ghidra/FallbackBinExport2Builder.java",
               "treasure_map/lib/storage/atlas_schema.sql",
+              "treasure_map/lib/storage/schema.sql",
               "treasure_map/lib/setup/toolchain_lock.json",
               "treasure_map/_build_info.py",
           ]
@@ -76,9 +78,11 @@ jobs:
           [ "$(/tmp/v/bin/tmap --version)" = "tmap $V" ]
           [ "$(/tmp/v/bin/python -c 'from treasure_map.version import installed_commit; print(installed_commit())')" = "$GITHUB_SHA" ]
 
-      - uses: pypa/gh-action-pypi-publish@release/v1
-
-      - name: Attach install.sh (this version) and mark the release latest
+      # The release is drafted first (a draft is never "latest", so the install URL does not move
+      # yet), then the package goes to PyPI, then the draft is published as latest. A failure at
+      # any step leaves a re-runnable state: the draft is updated in place, PyPI skips a version
+      # it already has.
+      - name: Draft the release with install.sh (this version)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -87,5 +91,18 @@ jobs:
           sed "s/^TMAP_VERSION=\"__TMAP_VERSION__\"\$/TMAP_VERSION=\"$V\"/" install.sh > upload/install.sh
           grep -q "^TMAP_VERSION=\"$V\"\$" upload/install.sh
           sh upload/install.sh --dry-run --no-init </dev/null
-          gh release create "$GITHUB_REF_NAME" upload/install.sh --latest \
-            --title "tmap $V" --notes "pip/uv: tmap-agents==$V"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" upload/install.sh --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" upload/install.sh --draft \
+              --title "tmap $V" --notes "pip/uv: tmap-agents==$V"
+          fi
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+
+      - name: Publish the release as latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false --latest

@@ -123,3 +123,32 @@ class Ledger:
 
     def pending(self) -> list[Entry]:
         return [e for e in self.entries if e.state == "pending"]
+
+
+def strictly_under(path: Path, root: Path) -> bool:
+    """``path`` resolves to something INSIDE ``root`` — never ``root`` itself (a tampered ledger
+    naming the toolchain directory must not get the whole directory removed)."""
+    try:
+        real = Path(os.path.realpath(path))
+        base = Path(os.path.realpath(root))
+    except OSError:
+        return False
+    return real != base and real.is_relative_to(base)
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    """Replace ``path``'s content in one step (temporary file in the same directory, fsync,
+    ``os.replace``), keeping its permission bits: an interruption leaves the old file or the new
+    one, never neither."""
+    mode = path.stat().st_mode & 0o777 if path.exists() else 0o644
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise

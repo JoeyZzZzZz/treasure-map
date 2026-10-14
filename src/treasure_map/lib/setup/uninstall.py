@@ -27,7 +27,14 @@ import yaml
 from treasure_map.lib.diff.toolchain import binexport_lib_digest
 from treasure_map.lib.setup import clients as cl
 from treasure_map.lib.setup.completion import _MARK_END, _MARK_START, target_path
-from treasure_map.lib.setup.ledger import LEDGER_NAME, Entry, Ledger
+from treasure_map.lib.setup.discover import Runner
+from treasure_map.lib.setup.ledger import (
+    LEDGER_NAME,
+    Entry,
+    Ledger,
+    atomic_write_text,
+    strictly_under,
+)
 
 PURGE_PHRASE = "delete my data"
 
@@ -69,7 +76,7 @@ def safe_to_remove(entry: Entry, *, toolchain_dir: Path, home: Path) -> str | No
         return f"{path} is not where tmap installs completion"
     if entry.kind == "edit":
         return None  # restored, never deleted; checked in _restore_edit
-    if _inside(path, toolchain_dir):
+    if strictly_under(path, toolchain_dir):
         return None
     if entry.id == "binexport" and path.name == "BinExport":
         recorded = entry.extra.get("lib_digest")
@@ -89,12 +96,10 @@ def _restore_edit(entry: Entry) -> str:
     after = entry.extra.get("line_after")
     if not isinstance(before, str) or not isinstance(after, str):
         return f"left {path}: the ledger does not record the line"
-    lines = path.read_text().splitlines(keepends=True)
-    for i, ln in enumerate(lines):
-        if ln.rstrip("\r\n") == after:
-            lines[i] = before + "\n"
-            path.write_text("".join(lines))
-            return f"restored {path}"
+    from treasure_map.lib.setup.plan import replace_line
+
+    if replace_line(path, after, before):
+        return f"restored {path}"
     return f"left {path}: its line is no longer tmap's"
 
 
@@ -127,7 +132,7 @@ def plan_lines(ledger: Ledger, survey: cl.Survey, *, toolchain_dir: Path, home: 
     lines: list[str] = []
     for cid in cl.CLIENT_IDS:
         st = survey.states[cid]
-        if st.state in ("aligned", "stale", "shadowed", "unknown"):
+        if st.state in ("aligned", "stale", "shadowed", "unknown") and st.editable:
             lines.append(f"remove treasure-map from {st.label} ({st.config_path})")
         for d in st.shadowing:
             lines.append(f"remove the local-scope entry in {d}")
@@ -186,8 +191,11 @@ def uninstall(
     if config_path.exists() and removed_paths:
         try:
             data = yaml.safe_load(config_path.read_text()) or {}
-        except (OSError, yaml.YAMLError):
+        except (OSError, yaml.YAMLError) as exc:
             data = None
+            report.manual.append(
+                f"{config_path} is unreadable ({exc}); clear any key pointing at a removed path"
+            )
         if isinstance(data, dict):
             touched = False
             for keys in (
@@ -208,7 +216,11 @@ def uninstall(
                     touched = True
                     report.removed.append(f"cleared {'.'.join(keys)} in {config_path}")
             if touched:
-                config_path.write_text(yaml.safe_dump(data, default_flow_style=False))
+                atomic_write_text(config_path, yaml.safe_dump(data, default_flow_style=False))
+    downloads = toolchain_dir / ".downloads"
+    if downloads.is_dir() and not downloads.is_symlink():
+        shutil.rmtree(downloads, ignore_errors=True)
+        report.removed.append(f"removed {downloads} (unfinished downloads)")
     if not ledger.entries and ledger_path.exists():
         ledger_path.unlink()
         try:
@@ -247,3 +259,21 @@ def purge_data(paths: list[Path], answer: str) -> bool:
     for p in paths:
         _remove_path(p)
     return True
+
+
+DIST = "tmap-agents"
+
+
+def uv_self_uninstall(
+    prefix: Path, home: Path, which: Callable[[str], str | None], run: Runner
+) -> list[str] | None:
+    """The command that removes the running tmap itself — ``uv tool uninstall tmap-agents`` —
+    or None when this tmap does not run from uv's ``tmap-agents`` tool environment (an editable
+    checkout, a pip install, another tool name): then tmap does not know how it was installed and
+    leaves the program alone."""
+    from treasure_map.lib.setup.update import find_uv, runs_from_uv_tool
+
+    uv = find_uv(home, which)
+    if uv is None or not runs_from_uv_tool(prefix, uv, run):
+        return None
+    return [uv, "tool", "uninstall", DIST]

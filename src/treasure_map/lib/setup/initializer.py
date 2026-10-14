@@ -67,7 +67,7 @@ class InitResult:
     applied: bool = False
     nothing_to_do: bool = False
     dry_run: bool = False
-    registered: tuple[str, ...] = ()  # the agents now carrying the entry (labels)
+    registered: tuple[str, ...] = ()  # agents whose entry this run wrote (they need a restart)
     needs_you: tuple[str, ...] = ()
     runs: Any = None  # doctor.RunsCurrency | None
 
@@ -796,6 +796,11 @@ def run_init(
                 return None
             return "no configured Ghidra loads it"
 
+        def _override_ok(p: Path) -> str | None:
+            e = ledger.find("ghidra_jdk_override")
+            want = e.extra.get("line_after") if e is not None else None
+            return None if want is not None and override_line(p) == want else "not applied"
+
         for line in recover_pending(
             ledger,
             {
@@ -803,6 +808,7 @@ def run_init(
                 "ghidra": lambda p: check_ghidra(p, plat, want_ghidra)[1],
                 "bindiff": _bindiff_ok,
                 "binexport": _binexport_ok,
+                "ghidra_jdk_override": _override_ok,
             },
             toolchain_dir=host.toolchain_dir,
         ):
@@ -1028,8 +1034,9 @@ def run_init(
                     project_dir=d,
                 )
             )
-        for r in st.reported:
-            plan.needs_you.append(f"{label}: {r}")
+        if st.state != "aligned":  # a working entry noted where it lives is not a to-do
+            for r in st.reported:
+                plan.needs_you.append(f"{label}: {r}")
 
     # 4. confirm
     echo("")
@@ -1145,6 +1152,8 @@ def run_init(
                 confirm_quit=_confirm_quit if mode == "interactive" else None,
             )
             echo(f"  {'✓' if out.ok else '✗'} {cl.LABELS[a.client]}: {out.message}")
+            if out.ok:
+                registered.append(cl.LABELS[a.client])
             if not out.ok and out.manual:
                 needs_you.append(
                     f"{cl.LABELS[a.client]}: {out.message}; add by hand:\n{out.manual}"
@@ -1154,16 +1163,19 @@ def run_init(
             echo(f"  {'✓' if out.ok else '✗'} {out.message}")
             if not out.ok and out.manual:
                 needs_you.append(f"{out.message}; run: {out.manual}")
-    for cid in selected:
-        if cl.inspect(cid, chost, tmap_path).state in ("aligned", "shadowed"):
-            registered.append(cl.LABELS[cid])
 
     script, rc = _configure_completion(
         non_interactive=(mode != "interactive"), prompt=prompt, echo=echo
     )
     if script is not None:
-        ledger.add_pending("completion", "file", script, rc_block=str(rc) if rc else None)
-        ledger.commit("completion")
+        # Keep an rc already recorded: a later run that does not ask (or is declined) must not
+        # forget the block an earlier yes added. Unchanged -> the ledger is not rewritten.
+        prior = ledger.committed("completion")
+        prior_rc = prior.extra.get("rc_block") if prior is not None else None
+        rc_block = str(rc) if rc else prior_rc
+        if prior is None or prior.path != str(script) or prior_rc != rc_block:
+            ledger.add_pending("completion", "file", script, rc_block=rc_block)
+            ledger.commit("completion")
 
     if cfg is not None:
         _provision_dirs(_configured_dirs(cfg))

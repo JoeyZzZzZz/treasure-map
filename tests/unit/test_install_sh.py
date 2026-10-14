@@ -56,14 +56,14 @@ def test_the_script_parses_as_posix_sh() -> None:
 
 
 def test_dry_run_prints_the_plan_and_runs_nothing(tmp_path: Path) -> None:
-    res = _run(tmp_path, "--version", "0.2.0", "--dry-run", "--no-init")
+    res = _run(tmp_path, "--version", "0.1.0", "--dry-run", "--no-init")
     assert res.returncode == 0, res.stderr
-    assert "Version  : 0.2.0" in res.stdout and "Platform : linux-x86_64" in res.stdout
-    assert "tmap-agents==0.2.0" in res.stdout and "uv-called" not in res.stderr
+    assert "Version  : 0.1.0" in res.stdout and "Platform : linux-x86_64" in res.stdout
+    assert "tmap-agents==0.1.0" in res.stdout and "uv-called" not in res.stderr
     assert not (tmp_path / "sh-home").exists()
 
 
-@pytest.mark.parametrize("bad", ["1.2", "v0.2.0", "0.2.0; rm -rf /", ""])
+@pytest.mark.parametrize("bad", ["1.2", "v0.1.0", "0.1.0; rm -rf /", ""])
 def test_a_malformed_version_is_refused(tmp_path: Path, bad: str) -> None:
     res = _run(tmp_path, "--version", bad, "--dry-run")
     assert res.returncode != 0 and "not a version" in res.stderr
@@ -75,7 +75,7 @@ def test_an_unversioned_script_refuses(tmp_path: Path) -> None:
 
 
 def test_linux_arm_is_refused_with_the_reason(tmp_path: Path) -> None:
-    res = _run(tmp_path, "--version", "0.2.0", "--dry-run", machine="aarch64")
+    res = _run(tmp_path, "--version", "0.1.0", "--dry-run", machine="aarch64")
     assert res.returncode != 0 and "linux_arm_64" in res.stderr
 
 
@@ -93,12 +93,12 @@ def test_the_released_script_runs(tmp_path: Path) -> None:
         ["/bin/sh", "-c", command],
         capture_output=True,
         text=True,
-        env={"V": "0.2.0", "PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+        env={"V": "0.1.0", "PATH": os.environ.get("PATH", "/usr/bin:/bin")},
         timeout=30,
     )
     assert res.returncode == 0, res.stderr
     script = tmp_path / "r.sh"
-    assert 'TMAP_VERSION="0.2.0"' in script.read_text()
+    assert 'TMAP_VERSION="0.1.0"' in script.read_text()
     bin_dir = _fake_bin(tmp_path)
     res = subprocess.run(  # noqa: S603
         [_SH, str(script), "--dry-run", "--no-init"],
@@ -109,4 +109,26 @@ def test_the_released_script_runs(tmp_path: Path) -> None:
         timeout=30,
     )
     assert res.returncode == 0, res.stderr
-    assert "Version  : 0.2.0" in res.stdout
+    assert "Version  : 0.1.0" in res.stdout
+
+
+def test_the_plan_names_the_binary_and_a_failed_uv_download_says_so(tmp_path: Path) -> None:
+    """MUTATION: pipe the uv installer straight into sh -> a failed download is reported as
+    "uv cannot be found" -> RED."""
+    res = _run(tmp_path, "--version", "0.1.0", "--dry-run", "--no-init")
+    assert "Binary   :" in res.stdout and "tmap" in res.stdout
+    bin_dir = _fake_bin(tmp_path)
+    (bin_dir / "uv").unlink()  # no uv: the installer must be fetched, and curl fails
+    for tool in ("mktemp", "rm", "sh"):
+        found = shutil.which(tool)
+        if found and not (bin_dir / tool).exists():
+            (bin_dir / tool).symlink_to(found)
+    res = subprocess.run(  # noqa: S603
+        [_SH, str(_SCRIPT), "--version", "0.1.0", "--no-init"],
+        capture_output=True,
+        text=True,
+        env={"PATH": str(bin_dir), "HOME": str(tmp_path / "sh-home")},
+        stdin=subprocess.DEVNULL,
+        timeout=30,
+    )
+    assert res.returncode != 0 and "could not download the uv installer" in res.stderr

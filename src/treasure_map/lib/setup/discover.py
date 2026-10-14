@@ -189,6 +189,8 @@ def check_ghidra(root: Path, platform: Platform, want: str) -> tuple[str | None,
         return version, f"Ghidra {version}; tmap needs {want}"
     if not (root / "support" / "analyzeHeadless").is_file():
         return version, "no support/analyzeHeadless"
+    if not (root / "support" / "launch.properties").is_file():
+        return version, "no support/launch.properties (its launcher refuses to start)"
     native = platform.ghidra_native_dir
     if native is None:
         return version, f"Ghidra has no native decompiler for {platform.key}"
@@ -446,7 +448,10 @@ def discover_jdk(
             c.add(Path(res.stdout.strip().splitlines()[0]), "java_home -v 21")
     for pattern in host.jdk_globs:
         for p in _glob(pattern):
-            c.add(p, f"scan:{p.parent}")
+            # A scanned directory without bin/java is not a Java install at all (a distribution's
+            # source-only sibling, say): it is skipped, not listed as a JDK that failed its check.
+            if (p / "bin" / "java").exists():
+                c.add(p, f"scan:{p.parent}")
     out: list[Candidate] = []
     for path, source, is_managed in c.out:
         version, why = check_jdk(path)

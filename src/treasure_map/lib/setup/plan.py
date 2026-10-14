@@ -31,7 +31,7 @@ from treasure_map.lib.setup.fetch import (
     install_archive,
     stderr_progress,
 )
-from treasure_map.lib.setup.ledger import Ledger
+from treasure_map.lib.setup.ledger import Ledger, atomic_write_text
 from treasure_map.lib.setup.toolchain_lock import Asset, Lock
 
 TOOLCHAIN_KINDS = (
@@ -110,18 +110,39 @@ def override_line(launch_properties: Path) -> str | None:
     return next((ln for ln in lines if ln.startswith(OVERRIDE_KEY)), None)
 
 
-def set_override(launch_properties: Path, java_home: Path) -> str:
-    """Point the managed Ghidra at ``java_home`` (the launcher's top priority); returns the line
-    it replaced."""
-    text = launch_properties.read_text()
-    lines = text.splitlines(keepends=True)
+def replace_line(path: Path, before: str, after: str) -> bool:
+    """Swap the first line equal to ``before`` for ``after``, atomically. False (and nothing
+    written) when no such line is there."""
+    lines = path.read_text().splitlines(keepends=True)
     for i, ln in enumerate(lines):
-        if ln.startswith(OVERRIDE_KEY):
-            before = ln.rstrip("\r\n")
-            lines[i] = f"{OVERRIDE_KEY}{java_home}\n"
-            launch_properties.write_text("".join(lines))
-            return before
-    raise FetchError(f"{launch_properties} has no {OVERRIDE_KEY} line")
+        if ln.rstrip("\r\n") == before:
+            lines[i] = after + "\n"
+            atomic_write_text(path, "".join(lines))
+            return True
+    return False
+
+
+def set_override(ledger: Ledger, launch_properties: Path, java_home: Path) -> None:
+    """Point the managed Ghidra at ``java_home`` (its launcher's top priority). The ledger
+    records the line before and after BEFORE the file is touched, so an interrupted or failed
+    edit is recognised later — and the file, which Ghidra cannot start without, is never
+    removed on its account."""
+    before = override_line(launch_properties)
+    if before is None:
+        raise FetchError(f"{launch_properties} has no {OVERRIDE_KEY} line")
+    after = f"{OVERRIDE_KEY}{java_home}"
+    ledger.add_pending(
+        "ghidra_jdk_override", "edit", launch_properties, line_before=before, line_after=after
+    )
+    try:
+        replace_line(launch_properties, before, after)
+    finally:
+        if override_line(launch_properties) == after:
+            ledger.commit("ghidra_jdk_override")
+        else:
+            ledger.remove("ghidra_jdk_override")
+    if override_line(launch_properties) != after:
+        raise FetchError(f"{launch_properties}: {OVERRIDE_KEY} could not be set")
 
 
 # ── carrying out the toolchain actions ───────────────────────────────────────────────────────
@@ -196,13 +217,7 @@ def apply_toolchain(
             elif action.kind == "set_ghidra_jdk_override":
                 assert res.ghidra_home is not None and res.java_home is not None
                 props = res.ghidra_home / "support" / "launch.properties"
-                ledger.add_pending("ghidra_jdk_override", "edit", props)
-                before = set_override(props, res.java_home)
-                ledger.commit(
-                    "ghidra_jdk_override",
-                    line_before=before,
-                    line_after=f"{OVERRIDE_KEY}{res.java_home}",
-                )
+                set_override(ledger, props, res.java_home)
             elif action.kind == "install_binexport":
                 asset = _asset(action)
                 assert res.ghidra_home is not None
@@ -221,6 +236,7 @@ def apply_toolchain(
                     run=host.run,
                     mirror=mirror,
                     progress=stderr_progress("BinExport"),
+                    pending_extra=_binexport_fingerprint,
                 )
                 ledger.commit("binexport", lib_digest=binexport_lib_digest(ext_dir))
             elif action.kind == "download_bindiff":
@@ -248,6 +264,11 @@ def apply_toolchain(
             res.failed.append(f"{action.title}: {exc}")
             echo(f"  ✗ {action.title}: {exc}")
     return res
+
+
+def _binexport_fingerprint(unpacked: Path) -> dict[str, object]:
+    """What lets a later run prove an unfinished BinExport is the copy tmap was installing."""
+    return {"expect_digest": binexport_lib_digest(unpacked)}
 
 
 def _jdk_verifier(java_home: Path) -> Callable[[Path], str | None]:

@@ -1,90 +1,62 @@
 # Contributing to Treasure Map
 
-Thank you for your interest in contributing to Treasure Map.
+Thanks for your interest. Bug reports, feature ideas, documentation fixes and pull requests are all
+welcome. Treasure Map is a developer preview and changes quickly, so for anything larger than a
+small fix, please open an issue first to talk it through — it saves you from building on something
+that is about to move.
 
-## Current Status
+## Licensing of contributions
 
-This project is in early development. We welcome:
+Treasure Map is licensed under the [Apache License 2.0](LICENSE). As section 5 of that license says,
+anything you intentionally submit for inclusion (a pull request, a patch, a suggested change) is
+licensed under the same Apache-2.0 terms, with no additional conditions. There is no CLA to sign.
 
-- Bug reports
-- Feature suggestions (via issues)
-- Documentation improvements
-- Benchmark sample contributions
-- Configuration files and rule files
+By submitting a contribution you confirm that you have the right to do so — it is your own work, or
+you have permission to contribute it under Apache-2.0. If you include code from elsewhere, keep its
+license notice and say where it comes from in the pull request.
 
-We currently do NOT accept:
+## Reporting bugs
 
-- Pull requests for core algorithm changes (please open an issue first)
-- New core capability additions (please open an issue first)
+Open an issue with:
 
-## Contributor License Agreement
+- what you did, what you expected, and what happened instead;
+- `tmap --version` and the output of `tmap doctor`;
+- your OS (and whether it is WSL).
 
-All code contributions require signing a Contributor License Agreement 
-(CLA). This will be automated via cla-assistant.io once we begin 
-accepting code contributions.
+Please do not attach firmware images or anything you are not allowed to share.
 
-## Reporting Bugs
+## Suggesting features
 
-Please open an issue with:
-
-- A clear description of the problem
-- Steps to reproduce
-- Expected vs actual behavior
-- Your environment (OS, Python version, etc.)
-
-## Suggesting Features
-
-Open an issue describing your use case and the feature you'd like to see.
+Open an issue describing your use case and what you would like to see.
 
 ## Development setup
 
-End users install with `uv tool` (see the README); contributors work from a clone in an
-editable virtual environment instead:
+End users install with the one-line installer (see the README). To work on the code, use a clone
+with an editable install:
 
 ```bash
 git clone https://github.com/JoeyZzZzZz/treasure-map.git
 cd treasure-map
 python3.11 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-./scripts/install-hooks.sh   # REQUIRED: activates the git hooks (see below)
+./scripts/install-hooks.sh   # activates the git hooks in .githooks/
+tmap init                    # finds or installs the Ghidra / BinExport / BinDiff toolchain
 ```
 
-**You must run `./scripts/install-hooks.sh` after cloning.** It points
-`core.hooksPath` at `.githooks/` so the `pre-commit` and `commit-msg` checks
-actually run. Git does not pick up `.githooks/` on its own — without this step the
-hooks are inert and a vendor name or model number can slip into a commit or its
-message locally. CI re-runs the same checks (the `vendor-neutrality` job) as a
-backstop, so an un-installed hook surfaces as a failed PR rather than a clean
-local commit, but installing the hooks catches it before you push.
-
-Run the same checks CI runs before pushing:
+Before opening a pull request, run the same checks CI runs:
 
 ```bash
-./scripts/ci-local.sh    # ruff, ruff format --check, mypy strict, pytest
+./scripts/ci-local.sh        # ruff, ruff format --check, mypy strict, pytest
 ```
 
-You still need Ghidra 11.x + JDK 21 on the host for `tmap analyze` (README → Setup) and
-`tmap init` to configure them; the editable install does not bundle them.
+A behaviour change should come with a test that fails without it. Unit tests never touch the
+network or your real `~/.treasure-map`; the fixtures in `tests/conftest.py` take care of that.
 
-## Vendor Denylist (git hooks + CI)
+## Keeping the repository vendor-neutral
 
-Vendor neutrality is enforced in three layers (all sharing `.githooks/lib.sh`):
-
-- **`pre-commit`** scans the staged diff content.
-- **`commit-msg`** scans the commit message (a model number must not hide there).
-- **CI `vendor-neutrality`** re-scans both the diff and every commit message over
-  the pushed range — the backstop for an un-installed hook or `--no-verify`.
-
-The committed file `.githooks/vendor-watchlist.example.txt` contains only generic
-model-number regex patterns (no brand names), including a lower-case run-together
-form that whitelists common technical tokens (`sha256`, `base64`, `arm32`, …) so
-they are not flagged. For full brand-name coverage, obtain the complete local
-denylist from the project owner and point the hooks at it:
-
-```bash
-# Set TM_VENDOR_WATCHLIST to the path of your local denylist before committing:
-export TM_VENDOR_WATCHLIST=/path/to/your/vendor-watchlist.txt
-```
-
-Without the full list the hooks and CI still block model-number-shaped strings via
-the example template and print an informational notice.
+The repository does not name specific device vendors or model numbers. A `pre-commit` and a
+`commit-msg` hook (installed by `./scripts/install-hooks.sh`) check the staged diff and the commit
+message against `.githooks/vendor-watchlist.example.txt`, a list of generic model-number patterns;
+CI runs the same check on every push and pull request. If a check flags something, rephrase it in
+generic terms. Maintainers can point the hooks at a fuller local list with
+`TM_VENDOR_WATCHLIST=/path/to/list`.

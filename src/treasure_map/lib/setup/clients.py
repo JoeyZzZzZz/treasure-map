@@ -87,6 +87,7 @@ class ClientState:
     shadowing: tuple[Path, ...] = ()  # Claude Code project dirs whose local tmap entry wins
     reported: tuple[str, ...] = ()  # same-name entries tmap reports but never edits
     has_cli: bool = False
+    editable: bool = True  # False: the entry sits in a file tmap reports but does not edit
 
     @property
     def label(self) -> str:
@@ -196,12 +197,31 @@ def desktop_config(host: ClientHost) -> Path:
 
 
 def dsh_home(host: ClientHost) -> Path:
-    base = host.environ.get("DSH_HOME")
-    return Path(base) if base else host.home / ".dsh"
+    """dsh's home as dsh resolves it: a non-blank ``$DSH_HOME`` (``~`` expanded), else
+    ``~/.dsh`` — the same for a global and an npx install, since the package decides it."""
+    base = (host.environ.get("DSH_HOME") or "").strip()
+    if not base:
+        return host.home / ".dsh"
+    if base == "~" or base.startswith(("~/", "~\\")):
+        return host.home / base[2:] if len(base) > 1 else host.home
+    return Path(base)
 
 
 def dsh_patch(host: ClientHost) -> Path:
+    """The home-level patch layer ``$DSH_HOME/cordis.patch.yml``: dsh applies it over every
+    profile's own layer, so one entry here reaches every profile. This is the file tmap writes."""
     return dsh_home(host) / DSH_PATCH_FILE
+
+
+def dsh_profile_patches(host: ClientHost) -> list[Path]:
+    """Each profile's own layer (``profiles/<name>/cordis.patch.yml``; a profile is a directory
+    holding ``cordis.yml``). tmap only reads these — an entry the user wrote there counts."""
+    root = dsh_home(host) / "profiles"
+    try:
+        dirs = sorted(d for d in root.iterdir() if (d / "cordis.yml").is_file())
+    except OSError:
+        return []
+    return [d / DSH_PATCH_FILE for d in dirs if (d / DSH_PATCH_FILE).is_file()]
 
 
 def detected(client: str, host: ClientHost) -> bool:
@@ -253,8 +273,15 @@ def _inspect_claude(host: ClientHost, tmap: Path | None) -> ClientState:
     top = classify(_servers(data).get(SERVER), tmap)
     shadowing: list[Path] = []
     reported: list[str] = []
+    gone: list[str] = []
     projects = data.get("projects")
     for proj_dir, proj in sorted(projects.items()) if isinstance(projects, dict) else []:
+        if not Path(proj_dir).is_dir():
+            # A project directory that no longer exists shadows nothing (no session can start
+            # there), and `cd` into it could not remove the entry anyway: noted, not counted.
+            if isinstance(proj, dict) and _servers(proj).get(SERVER) is not None:
+                gone.append(proj_dir)
+            continue
         if isinstance(proj, dict):
             local = _servers(proj).get(SERVER)
             if local is not None:
@@ -269,6 +296,10 @@ def _inspect_claude(host: ClientHost, tmap: Path | None) -> ClientState:
             reported.append(f"{mcp_json} (project file; tmap does not edit it)")
     state: EntryState = top.state
     detail = top.why
+    if gone:
+        detail = (detail + "; " if detail else "") + (
+            "ignored: entries for project directories that no longer exist: " + ", ".join(gone)
+        )
     if top.state == "aligned" and (shadowing or reported):
         state = "shadowed"
         where = [str(d) for d in shadowing] + reported
@@ -339,13 +370,26 @@ def _read_dsh(path: Path) -> _DshRead:
 
 
 def _dsh_entries(items: Sequence[Any]) -> list[dict[str, Any]]:
+    """Every inserted entry serving ``treasure-map`` — whatever its id (a hand-written one is
+    tmap's server too, and a second one beside it would start the server twice)."""
     out: list[dict[str, Any]] = []
     for item in items:
         inserts = item.get("insert") if isinstance(item, dict) else None
         for e in inserts if isinstance(inserts, list) else []:
-            if isinstance(e, dict) and e.get("id") == DSH_ENTRY_ID:
+            config = e.get("config") if isinstance(e, dict) else None
+            if isinstance(config, dict) and config.get("serverName") == SERVER:
                 out.append(e)
     return out
+
+
+def _dsh_classify(entry: dict[str, Any], tmap: Path | None) -> _Classified:
+    config = entry.get("config") or {}
+    if config.get("transport") not in (None, "stdio"):
+        return _Classified("foreign", f"transport {config.get('transport')!r}")
+    return classify(
+        {"command": config.get("command"), "args": config.get("args"), "env": config.get("env")},
+        tmap,
+    )
 
 
 def _dsh_expected(tmap: Path) -> dict[str, Any]:
@@ -354,20 +398,59 @@ def _dsh_expected(tmap: Path) -> dict[str, Any]:
     return expected
 
 
+_DSH_SEVERITY = ("foreign", "invalid", "stale", "unknown", "aligned")
+
+
 def _inspect_dsh(host: ClientHost, tmap: Path | None) -> ClientState:
-    path = dsh_patch(host)
+    """Read the home layer AND every profile layer: an entry in any of them is the server."""
+    home_patch = dsh_patch(host)
     found = detected("dsh", host)
-    read = _read_dsh(path)
+    read = _read_dsh(home_patch)
     if read.items is None:
-        return ClientState("dsh", found, "invalid", f"{path} {read.why}", path)
-    ours = _dsh_entries(read.items)
-    if not ours:
-        return ClientState("dsh", found, "missing", "", path)
-    if tmap is None:
-        return ClientState("dsh", found, "unknown", "cannot tell which tmap is running", path)
-    if len(ours) == 1 and ours[0] == _dsh_expected(tmap):
-        return ClientState("dsh", found, "aligned", "", path)
-    return ClientState("dsh", found, "stale", f"{DSH_ENTRY_ID} differs from the expected", path)
+        return ClientState("dsh", found, "invalid", f"{home_patch} {read.why}", home_patch)
+    hits: list[tuple[Path, dict[str, Any]]] = [(home_patch, e) for e in _dsh_entries(read.items)]
+    for prof in dsh_profile_patches(host):
+        pr = _read_dsh(prof)
+        if pr.items is None:
+            if SERVER in pr.text:
+                return ClientState(
+                    "dsh",
+                    found,
+                    "unknown",
+                    f"{prof} {pr.why}; cannot read its {SERVER} entry",
+                    prof,
+                )
+            continue
+        hits += [(prof, e) for e in _dsh_entries(pr.items)]
+    if not hits:
+        return ClientState("dsh", found, "missing", "", home_patch)
+    states = [(_dsh_classify(e, tmap), where) for where, e in hits]
+    worst = min(states, key=lambda s: _DSH_SEVERITY.index(s[0].state))
+    in_home = any(w == home_patch for _c, w in states)
+    reported = [
+        f"{w} (a profile layer: tmap reads it, never edits it)"
+        for w in dict.fromkeys(w for _c, w in states if w != home_patch)
+    ]
+    if len(hits) > 1 and worst[0].state == "aligned":
+        files = ", ".join(str(w) for _c, w in states)
+        return ClientState(
+            "dsh",
+            found,
+            "stale",
+            f"{SERVER} is inserted {len(hits)} times: {files}",
+            worst[1],
+            reported=tuple(reported),
+            editable=in_home,
+        )
+    return ClientState(
+        "dsh",
+        found,
+        worst[0].state,
+        worst[0].why,
+        worst[1],
+        reported=tuple(reported),
+        editable=in_home,
+    )
 
 
 def inspect(client: str, host: ClientHost, tmap: Path | None) -> ClientState:
@@ -393,6 +476,10 @@ def _read_back(path: Path) -> bytes:
 
 
 def _atomic_write(path: Path, data: bytes, mode: int) -> None:
+    """Replace the content of ``path`` atomically. A symlink is written THROUGH: the file it
+    points at gets the new content and the link stays a link (a config kept in a dotfiles
+    repository must not be turned into a detached copy)."""
+    path = Path(os.path.realpath(path))
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
@@ -449,7 +536,7 @@ def json_transaction(path: Path, desired: dict[str, Any] | None) -> Outcome:
     backup = path.with_name(path.name + ".tmap.backup")
     if existed and not backup.exists() and original is not None:
         _atomic_write(backup, original, mode)
-    _atomic_write(path, (json.dumps(new, indent=2) + "\n").encode(), mode)
+    _atomic_write(path, (json.dumps(new, indent=2, ensure_ascii=False) + "\n").encode(), mode)
     try:
         back = json.loads(_read_back(path))
     except (OSError, ValueError):
@@ -505,12 +592,20 @@ def register(
     if client == "claude-code":
         if not state.has_cli:
             return Outcome(False, "the claude CLI is not on PATH", manual)
+        old = None
         if state.state == "stale":
+            old = _servers(_load_json_object(claude_json(host)) or {}).get(SERVER)
             ok, why = _cli(host, ["claude", "mcp", "remove", "-s", "user", SERVER])
             if not ok:
                 return Outcome(False, why, manual)
         ok, why = _cli(host, ["claude", "mcp", "add", "-s", "user", SERVER, "--", str(tmap), "mcp"])
         if not ok:
+            if old is not None:  # never leave the user with less than they had
+                back, _w = _cli(
+                    host,
+                    ["claude", "mcp", "add-json", "-s", "user", SERVER, json.dumps(old)],
+                )
+                why += "; the previous entry was " + ("put back" if back else "NOT put back")
             return Outcome(False, why, manual)
         after = inspect(client, host, tmap)
         if after.state not in ("aligned", "shadowed"):
@@ -548,11 +643,14 @@ def register(
 
 
 def _register_dsh(host: ClientHost, tmap: Path, state: ClientState) -> Outcome:
+    """Append to the home layer — only when no layer serves treasure-map yet."""
     manual = dsh_block(tmap)
     path = dsh_patch(host)
-    if state.state == "stale":
+    if state.state != "missing":
         return Outcome(
-            False, f"{path} has a different {DSH_ENTRY_ID} entry; edit it by hand", manual
+            False,
+            f"{state.config_path} has a {SERVER} entry ({state.detail}); edit it by hand",
+            manual,
         )
     read = _read_dsh(path)
     if read.items is None:
@@ -618,7 +716,9 @@ def unregister(client: str, host: ClientHost, tmap: Path | None) -> list[Outcome
         assert state.config_path is not None
         return [json_transaction(state.config_path, None)]
     if client == "dsh":
-        return [_unregister_dsh(host)]
+        if not state.editable:
+            return [Outcome(True, f"left alone: {r}") for r in state.reported]
+        return [_unregister_dsh(host), *(Outcome(True, f"left alone: {r}") for r in state.reported)]
     raise ValueError(client)
 
 

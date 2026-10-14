@@ -273,3 +273,210 @@ def test_mirror_and_offline(tmp_path: Path) -> None:
     (tmp_path / "a+b.zip").write_bytes(b"z")
     out = download_verified(asset, tmp_path / "st", OfflineFetcher(tmp_path))
     assert out.read_bytes() == b"z"
+
+
+# ── audit follow-ups ─────────────────────────────────────────────────────────────────────────
+
+
+def test_a_pending_edit_never_deletes_the_file(tmp_path: Path) -> None:
+    """★ An interrupted JAVA_HOME_OVERRIDE edit left a pending EDIT entry on Ghidra's
+    launch.properties: recovery must never remove that file (Ghidra cannot start without it).
+
+    MUTATION: treat an edit entry like an unfinished directory -> the file is unlinked -> RED."""
+    tdir = tmp_path / "toolchain"
+    props = tdir / "ghidra" / "support" / "launch.properties"
+    props.parent.mkdir(parents=True)
+    props.write_text("JAVA_HOME_OVERRIDE=\n")
+    ledger = Ledger(tdir / LEDGER_NAME)
+    ledger.add_pending(
+        "ghidra_jdk_override", "edit", props, line_before="JAVA_HOME_OVERRIDE=", line_after="X"
+    )
+    lines = recover_pending(ledger, {}, toolchain_dir=tdir)  # no verifier at all
+    assert props.is_file(), "recovery removed Ghidra's launch.properties"
+    assert props.read_text() == "JAVA_HOME_OVERRIDE=\n"
+    assert ledger.entries == [] and "left" in lines[0]
+
+
+def test_set_override_records_before_writing_and_cleans_up_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MUTATION: keep the pending entry when the write fails -> the next run finds a pending edit
+    for a line that was never written -> RED."""
+    from treasure_map.lib.setup import plan
+    from treasure_map.lib.setup.plan import set_override
+
+    tdir = tmp_path / "toolchain"
+    props = tdir / "g" / "support" / "launch.properties"
+    props.parent.mkdir(parents=True)
+    props.write_text("# x\nJAVA_HOME_OVERRIDE=\nVMARGS=-Xmx1g\n")
+    ledger = Ledger(tdir / LEDGER_NAME)
+    set_override(ledger, props, tmp_path / "jdk")
+    assert props.read_text() == f"# x\nJAVA_HOME_OVERRIDE={tmp_path / 'jdk'}\nVMARGS=-Xmx1g\n"
+    e = ledger.committed("ghidra_jdk_override")
+    assert e is not None and e.extra["line_before"] == "JAVA_HOME_OVERRIDE="
+    no_line = tdir / "h" / "launch.properties"
+    no_line.parent.mkdir()
+    no_line.write_text("VMARGS=x\n")
+    ledger.remove("ghidra_jdk_override")
+    with pytest.raises(FetchError):
+        set_override(ledger, no_line, tmp_path / "jdk")
+    assert ledger.entries == [] and no_line.read_text() == "VMARGS=x\n"
+    # the write itself fails after the entry was recorded: the entry goes with it
+    fresh = tdir / "k" / "launch.properties"
+    fresh.parent.mkdir()
+    fresh.write_text("JAVA_HOME_OVERRIDE=\n")
+
+    def disk_full(_p: Path, _t: str) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(plan, "atomic_write_text", disk_full)
+    with pytest.raises(OSError):
+        set_override(ledger, fresh, tmp_path / "jdk")
+    assert ledger.entries == [] and fresh.read_text() == "JAVA_HOME_OVERRIDE=\n"
+
+
+def test_install_refuses_a_target_it_did_not_make(tmp_path: Path) -> None:
+    """MUTATION: drop the exists() refusal -> the user's directory is overwritten -> RED."""
+    tdir = tmp_path / "toolchain"
+    target = tdir / "thing"
+    target.mkdir(parents=True)
+    (target / "theirs").write_text("keep")
+    data = _tool_zip()
+    with pytest.raises(Exception) as raised:
+        install_archive(
+            "thing",
+            _asset(data),
+            target,
+            toolchain_dir=tdir,
+            ledger=Ledger(tdir / LEDGER_NAME),
+            fetcher=fakes.BytesFetcher({"thing.zip": data}),
+            verify=lambda _p: None,
+            run=fakes.fake_run(),
+        )
+    assert isinstance(raised.value, FetchError) and "already exists" in str(raised.value)
+    assert (target / "theirs").read_text() == "keep"
+
+
+def test_the_pending_entry_is_on_disk_before_the_move(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ A crash during the move must leave a pending entry naming the target, or the next run
+    could not find what to settle.
+
+    MUTATION: write the pending entry after the move -> no entry survives the crash -> RED."""
+    from treasure_map.lib.setup import fetch
+
+    tdir = tmp_path / "toolchain"
+    data = _tool_zip()
+
+    def crash(_src: Path, _target: Path) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(fetch, "_move", crash)
+    with pytest.raises(KeyboardInterrupt):
+        install_archive(
+            "thing",
+            _asset(data),
+            tdir / "thing",
+            toolchain_dir=tdir,
+            ledger=Ledger(tdir / LEDGER_NAME),
+            fetcher=fakes.BytesFetcher({"thing.zip": data}),
+            verify=lambda _p: None,
+            run=fakes.fake_run(),
+        )
+    e = Ledger.load(tdir / LEDGER_NAME).find("thing")
+    assert e is not None and e.state == "pending" and e.path == str(tdir / "thing")
+
+
+class _ResumingFetcher:
+    """Serves the rest of ``data`` after whatever ``dest`` already holds (a Range request)."""
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+        self.resumed_from: list[int] = []
+
+    def fetch(self, url: str, dest: Path, *, progress: object = None) -> None:
+        have = dest.stat().st_size if dest.exists() else 0
+        self.resumed_from.append(have)
+        with dest.open("ab") as fh:
+            fh.write(self.data[have:])
+
+
+def test_an_interrupted_download_resumes(tmp_path: Path) -> None:
+    """MUTATION: download into the per-run staging directory -> the earlier part is never seen
+    -> resumed from 0 -> RED."""
+    tdir = tmp_path / "toolchain"
+    data = _tool_zip()
+    part = tdir / ".downloads" / "thing.zip.part"
+    part.parent.mkdir(parents=True)
+    part.write_bytes(data[:100])
+    fetcher = _ResumingFetcher(data)
+    install_archive(
+        "thing",
+        _asset(data),
+        tdir / "thing",
+        toolchain_dir=tdir,
+        ledger=Ledger(tdir / LEDGER_NAME),
+        fetcher=fetcher,
+        verify=lambda _p: None,
+        run=fakes.fake_run(),
+    )
+    assert fetcher.resumed_from == [100]
+    assert not (tdir / ".downloads").exists()
+
+
+def test_an_unfinished_binexport_outside_is_removed_only_when_provably_ours(
+    tmp_path: Path,
+) -> None:
+    """MUTATION: ignore the recorded digest -> both copies stay (or both go) -> RED."""
+    from treasure_map.lib.diff.toolchain import binexport_lib_digest
+
+    tdir = tmp_path / "toolchain"
+    ours = fakes.make_binexport(tmp_path / "s1" / "Extensions" / "BinExport")
+    theirs = fakes.make_binexport(tmp_path / "s2" / "Extensions" / "BinExport", jar=b"other")
+    ledger = Ledger(tdir / LEDGER_NAME)
+    ledger.add_pending("binexport", "dir", ours, expect_digest=binexport_lib_digest(ours))
+    recover_pending(ledger, {"binexport": lambda _p: "half"}, toolchain_dir=tdir)
+    assert not ours.exists()
+    ledger.add_pending("binexport", "dir", theirs, expect_digest="0" * 64)
+    recover_pending(ledger, {"binexport": lambda _p: "half"}, toolchain_dir=tdir)
+    assert theirs.is_dir()
+
+
+def test_the_toolchain_directory_itself_is_never_removed(tmp_path: Path) -> None:
+    """A tampered ledger naming the toolchain directory itself.
+
+    MUTATION: accept the root as 'under' itself -> the whole directory goes -> RED."""
+    tdir = tmp_path / "toolchain"
+    (tdir / "keep").mkdir(parents=True)
+    ledger = Ledger(tdir / LEDGER_NAME)
+    ledger.add_pending("jdk", "dir", tdir)
+    recover_pending(ledger, {"jdk": lambda _p: "bad"}, toolchain_dir=tdir)
+    assert (tdir / "keep").is_dir()
+
+
+def test_a_reinstall_removes_what_it_replaced(tmp_path: Path) -> None:
+    """A newer pin installs a component at a new path: the old copy goes once the new one is in
+    place and checked — or it would be an unrecorded directory nothing ever removes.
+
+    MUTATION: skip removing the superseded install -> the old directory stays -> RED."""
+    tdir = tmp_path / "toolchain"
+    old = tdir / "thing-old"
+    (old / "bin").mkdir(parents=True)
+    ledger = Ledger(tdir / LEDGER_NAME)
+    ledger.add_pending("thing", "dir", old)
+    ledger.commit("thing")
+    data = _tool_zip()
+    install_archive(
+        "thing",
+        _asset(data),
+        tdir / "thing",
+        toolchain_dir=tdir,
+        ledger=ledger,
+        fetcher=fakes.BytesFetcher({"thing.zip": data}),
+        verify=lambda _p: None,
+        run=fakes.fake_run(),
+    )
+    assert not old.exists() and (tdir / "thing").is_dir()
+    e = Ledger.load(tdir / LEDGER_NAME).committed("thing")
+    assert e is not None and e.path == str(tdir / "thing")
