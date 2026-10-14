@@ -665,7 +665,7 @@ def hunt_diff(
     config: Path | None,
     atlas_path: Path | None,
 ) -> None:
-    """Diff two runs through the map-model pipeline, in a single command.
+    """Diff two scanned firmware runs, in a single command.
 
     --before / --after are run ids (a run id is scan's --run-id, default = the -w workspace name),
     NOT paths; tab-completion lists this atlas's runs. By default diffs every binary that changed
@@ -819,8 +819,8 @@ def hunt_pattern(
 ) -> None:
     """Scan one analysis.db for call-sequence shape candidates and write atlas instances.
 
-    Hermetic (no LLM / no key needed). OSS is excluded at scan time. Writes graded leads at
-    provenance L0/L1 only; every instance is a candidate/lead, not a confirmed result.
+    Runs locally, with no model and no API key. Every instance it writes is a lead to verify, not
+    a confirmed result.
     """
     from treasure_map.lib.config.config import load_config
     from treasure_map.lib.hunt import run_analyzer2

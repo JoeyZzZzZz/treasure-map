@@ -184,7 +184,7 @@ def _resolve_mcp_target(
     "(default: the configured workspace directory). The atlas run table is the authority.",
 )
 def mcp_serve(atlas_db: str | None, workspaces_root: str | None) -> None:
-    """Run the Treasure Map MCP server over stdio (exposes the fact substrate to an AI client).
+    """Run the Treasure Map MCP server over stdio (serves the atlas's facts to your AI agent).
 
     Binds the ATLAS (not one firmware): a fact tool routes run_id -> analysis.db through the atlas
     run table, so one server serves every scanned firmware. No firmware is preselected. Launch this

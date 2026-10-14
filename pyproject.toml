@@ -1,7 +1,7 @@
 [project]
 name = "tmap-agents"
 dynamic = ["version"]
-description = "Reconnaissance tooling for AI-driven IoT firmware vulnerability research"
+description = "A firmware map for your AI agent. Treasure Map draws the map; your agent finds the treasure."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"

@@ -2,7 +2,7 @@
 
 [English](README.md) | [中文](README.zh.md)
 
-**A firmware map for your AI agent. It marks the terrain; it never tells you where the treasure is.**
+**A firmware map for your AI agent. Treasure Map draws the map; your agent finds the treasure.**
 
 Treasure Map turns an unpacked firmware filesystem into facts your coding agent (Claude Code, Codex,
 Cursor and others) reads through a bundled MCP server: every dangerous call it recognizes, where the

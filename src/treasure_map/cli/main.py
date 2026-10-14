@@ -85,7 +85,12 @@ class _AliasGroup(click.Group):
 @click.version_option(version=__version__, prog_name="tmap", message="%(prog)s %(version)s")
 @click.option("--debug", is_flag=True, default=False, help="Enable debug logging.")
 def main(debug: bool) -> None:
-    """Treasure Map is a reconnaissance tool for AI-driven firmware vulnerability research."""
+    """A firmware map for your AI agent. Treasure Map draws the map; your agent finds the treasure.
+
+    It turns an extracted firmware filesystem into facts your agent reads through the bundled MCP
+    server (`tmap mcp`). It runs no model of its own: deciding which lead is a real bug is your
+    agent's job. Start with `tmap init`.
+    """
     level = logging.DEBUG if debug else logging.INFO
     logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s")
     # Third-party request logs (one "HTTP/1.1 200 OK" per call) are noise at INFO; keep them
