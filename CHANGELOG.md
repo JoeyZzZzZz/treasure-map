@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **One-line install and an out-of-the-box `tmap init`.**
+  `curl -LsSf https://github.com/JoeyZzZzZz/treasure-map/releases/latest/download/install.sh | sh`
+  installs uv when missing (without editing the shell rc), installs `tmap` (PyPI `tmap-agents`) with
+  a uv-managed Python 3.11 and starts `tmap init` (`--dry-run`, `--version`, `--no-init`).
+  - `tmap init` reuses an existing JDK 21, Ghidra 11.4.3, BinExport and BinDiff 8 when each checks
+    out at file level (a JDK must carry `javac`; Ghidra exactly 11.4.3 with this platform's
+    decompiler; exactly one loaded BinExport of Ghidra's version; `BinDiff 8`), and otherwise
+    downloads the archive pinned in `lib/setup/toolchain_lock.json` — size and sha256 checked
+    before anything is unpacked — to `~/.treasure-map/toolchain/`. Installs are recorded in a
+    ledger (pending before the move, committed after a re-check), so an interrupted run is settled
+    by the next one.
+  - It registers the MCP server with the agents you select (Claude Code, Codex, Cursor, Claude
+    Desktop, dsh; detected ones pre-selected): `command = <absolute tmap> mcp`, no env. Entries that
+    are not tmap's are never modified; a Claude Code project-local entry that shadows the user one
+    is found and removed; JSON files are backed up, written atomically and read back.
+  - Plan → confirm → apply → doctor; `--dry-run` and `--check-only` write nothing. `--yes` adds
+    downloads and registers only `--client` agents; `--non-interactive` neither asks nor downloads.
+    `--ghidra / --java-home / --bindiff PATH` use exactly that path or fail. `--offline DIR` and
+    `--mirror URL` keep the checksums. Platforms other than linux-x86_64 / macOS are refused before
+    anything is written.
+  - Config gains `toolchain.java_home` / `toolchain.bindiff`; every tmap command puts them first in
+    its own environment, so Ghidra and BinDiff are the ones init chose (MCP clients with a bare PATH
+    included).
+- **`tmap doctor`** (= `tmap init --check-only`): ok / warn / info / missing / wrong / unknown;
+  `unknown` is never ✅ and fails the run. Checks the JDK by version and `javac`, the JDK Ghidra's
+  own launcher picks, BinExport where Ghidra 11.4.3 actually loads it, whether the diff toolchain is
+  readable, each agent's entry, the atlas the server would bind, and starts `tmap mcp` the way an
+  agent does.
+- **`tmap uninstall`** removes the agent entries and only the paths the install ledger records
+  (never a user's own JDK / Ghidra / BinDiff; a BinExport whose jars changed is refused). Data stays
+  unless `--purge-data` and the typed phrase.
+- **`tmap --version`.**
+
 - **Judgements on a diff's entries (MCP `annotate_diff`, `promote`).** A writable layer over
   `get_diff_patch_view`, which itself stays read-only: `annotate_diff(diff_id, anchor_ref, verdict,
   rationale)` records whether one entry's change does something real (`changed_real`,
@@ -166,6 +199,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `get_diff_sink_overlay`) are MCP-only; there is no CLI for them yet.
 
 ### Changed
+
+- **Distribution name `tmap-agents`** (import name `treasure_map` and command `tmap` unchanged); the
+  version is written once, in `treasure_map/version.py`.
+- **The installed commit is read for index installs too.** A wheel from the package index carries
+  no `direct_url.json`; the release build bakes the commit in, and it is read only then. With a
+  `direct_url.json` only its VCS commit counts; with both distribution names installed it is
+  `unknown`.
+- **BinExport is looked for where Ghidra 11.4.3 loads it** — its own `Ghidra/Extensions` and the user
+  settings directory, not the old `~/.ghidra/.ghidra_*` — by the diff preflight and the toolchain
+  stamp alike, and two loaded copies count as not present. The stamp now carries a digest of the
+  extension's jars (`11.4.3+lib:<12 hex>`), so two builds of one version stamp apart. Both changes
+  make every stored diff read as stale once (the code version and the toolchain stamp move
+  together); `tmap diff` re-runs them.
+- **A broken `config.yaml` is always a `ConfigError`** naming the file (YAML errors, unreadable
+  files and non-mapping content included), and it no longer stops `tmap init` from repairing it.
 
 - **The candidate map parses each candidate's evidence once.** `triage` (and so `tmap triage` and
   MCP `list_candidates`) read a dozen fields of a candidate's stored `flow_evidence`, and each
@@ -460,6 +508,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   position, 116 of them downward and the rest rising to meet them. Nothing crosses the
   proven-safe line: the set of candidates that sink is unchanged, because only a constant
   controllability sinks one and this touches neither.
+
+### Removed
+
+- **The `treasure-map-mcp` entry point.** Started by an agent without the environment it read, it
+  bound a relative `atlas.db` in the agent's working directory and created an empty atlas there.
+  `tmap mcp` (which resolves the atlas from the last run or the config) is the one server command;
+  `tmap init` and `tmap doctor` replace an old entry with it.
 
 ### Added
 

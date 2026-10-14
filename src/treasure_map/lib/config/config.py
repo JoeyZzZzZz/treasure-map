@@ -65,8 +65,25 @@ class GhidraConfig(BaseModel):
     remote: GhidraRemoteConfig = Field(default_factory=GhidraRemoteConfig)
 
 
+class ToolchainConfig(BaseModel):
+    """Where the JDK and BinDiff that tmap runs live. ``tmap init`` writes these; when one is set,
+    every tmap command puts it first in its own environment (``JAVA_HOME`` and ``PATH``) before
+    starting Ghidra or BinDiff. None = leave the environment as it is."""
+
+    java_home: Path | None = None  # a JDK root (bin/java and bin/javac)
+    bindiff: Path | None = None  # the bindiff executable
+
+    @field_validator("java_home", "bindiff", mode="before")
+    @classmethod
+    def expand_path(cls, v: Any) -> Path | None:
+        if v is None:
+            return None
+        return Path(os.path.expanduser(str(v)))
+
+
 class Config(BaseModel):
     ghidra: GhidraConfig = Field(default_factory=GhidraConfig)
+    toolchain: ToolchainConfig = Field(default_factory=ToolchainConfig)
     workspace_dir: Path = Field(
         default_factory=lambda: Path.home() / ".treasure-map" / "workspaces"
     )
@@ -135,6 +152,20 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
+def _merge_file(raw: dict[str, Any], path: Path) -> dict[str, Any]:
+    """``raw`` with one config file merged over it. Every way the file can fail — unreadable, not
+    YAML, not a mapping where a mapping is expected — is a ConfigError naming the file, so a bad
+    config surfaces as one exception type."""
+    try:
+        with path.open() as f:
+            loaded = yaml.safe_load(f) or {}
+        if not isinstance(loaded, dict):
+            raise TypeError(f"top level is a {type(loaded).__name__}, not a mapping")
+        return _deep_merge(raw, loaded)
+    except (OSError, yaml.YAMLError, TypeError, AttributeError, ValueError) as exc:
+        raise ConfigError(f"Invalid configuration in {path}: {exc}") from exc
+
+
 def load_config(extra_path: Path | None = None) -> Config:
     """Load config from ~/.treasure-map/config.yaml, ./config.yaml, env vars (in that order)."""
     env_file_override = os.environ.get("TM_ENV_FILE")
@@ -144,18 +175,13 @@ def load_config(extra_path: Path | None = None) -> Config:
 
     raw: dict[str, Any] = {}
 
-    for path in [_DEFAULT_CONFIG_PATH, _LOCAL_CONFIG_PATH]:
+    paths = [_DEFAULT_CONFIG_PATH, _LOCAL_CONFIG_PATH]
+    if extra_path is not None:
+        paths.append(extra_path)
+    for path in paths:
         if path.exists():
             logger.debug("Loading config from %s", path)
-            with path.open() as f:
-                loaded = yaml.safe_load(f) or {}
-            raw = _deep_merge(raw, loaded)
-
-    if extra_path and extra_path.exists():
-        logger.debug("Loading config from %s", extra_path)
-        with extra_path.open() as f:
-            loaded = yaml.safe_load(f) or {}
-        raw = _deep_merge(raw, loaded)
+            raw = _merge_file(raw, path)
 
     raw = _apply_env_overrides(raw)
 

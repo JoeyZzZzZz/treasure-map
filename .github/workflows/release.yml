@@ -1,0 +1,91 @@
+# Publish tmap to PyPI (tmap-agents) and attach install.sh to the release, on a v* tag.
+#
+# Refuses to publish a lock that still carries a placeholder (the BinExport build must be
+# published first by the BinExport workflow and its values merged), a tag that does not match
+# treasure_map.version.__version__, or a wheel that installs without its commit.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Tag matches the version; clean tree
+        run: |
+          set -e
+          V="$(python -c 'import runpy; print(runpy.run_path("src/treasure_map/version.py")["__version__"])')"
+          [ "$GITHUB_REF_NAME" = "v$V" ] || { echo "tag $GITHUB_REF_NAME != v$V"; exit 1; }
+          [ -z "$(git status --porcelain)" ] || { git status; exit 1; }
+          echo "V=$V" >> "$GITHUB_ENV"
+
+      - name: Bake the commit into the wheel
+        run: printf 'COMMIT = "%s"\n' "$GITHUB_SHA" > src/treasure_map/_build_info.py
+
+      - name: Build
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Wheel contents and lock
+        run: |
+          set -e
+          python - <<'PY'
+          import glob, json, sys, zipfile
+          wheel = zipfile.ZipFile(glob.glob("dist/*.whl")[0])
+          names = wheel.namelist()
+          need = [
+              "treasure_map/lib/analyze/ghidra/ExportFunctions.java",
+              "treasure_map/lib/analyze/ghidra/extractor_names.tsv",
+              "treasure_map/lib/diff/ghidra/ExportBinExport.java",
+              "treasure_map/lib/storage/atlas_schema.sql",
+              "treasure_map/lib/setup/toolchain_lock.json",
+              "treasure_map/_build_info.py",
+          ]
+          missing = [n for n in need if n not in names]
+          if missing:
+              sys.exit(f"wheel is missing {missing}")
+          from treasure_map.lib.setup.toolchain_lock import parse_lock, placeholders
+          left = placeholders(parse_lock(json.loads(wheel.read("treasure_map/lib/setup/toolchain_lock.json"))))
+          if left:
+              sys.exit(f"toolchain_lock.json still has placeholders: {left}")
+          PY
+        env:
+          PYTHONPATH: src
+
+      - name: Install from the index form (no direct_url.json) and check
+        run: |
+          set -e
+          python -m venv /tmp/v
+          # dependencies from the index; then tmap itself again by name from dist/ alone
+          # (never by file path: that would write a direct_url.json and skip the baked commit)
+          /tmp/v/bin/pip install --find-links dist "tmap-agents==$V"
+          /tmp/v/bin/pip install --force-reinstall --no-deps --no-index --find-links dist "tmap-agents==$V"
+          [ "$(/tmp/v/bin/tmap --version)" = "tmap $V" ]
+          [ "$(/tmp/v/bin/python -c 'from treasure_map.version import installed_commit; print(installed_commit())')" = "$GITHUB_SHA" ]
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+      - name: Attach install.sh (this version) and mark the release latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          mkdir -p upload
+          sed "s/^TMAP_VERSION=\"__TMAP_VERSION__\"\$/TMAP_VERSION=\"$V\"/" install.sh > upload/install.sh
+          grep -q "^TMAP_VERSION=\"$V\"\$" upload/install.sh
+          sh upload/install.sh --dry-run --no-init </dev/null
+          gh release create "$GITHUB_REF_NAME" upload/install.sh --latest \
+            --title "tmap $V" --notes "pip/uv: tmap-agents==$V"

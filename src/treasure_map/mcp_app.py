@@ -26,7 +26,6 @@ summary / vuln_hint / has_user_input) is ever produced.
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 from collections.abc import Callable
 from dataclasses import asdict
@@ -3017,24 +3016,3 @@ def build_server(atlas_db: Path | str, *, workspaces_root: Path | str | None = N
     for fn in make_tools(atlas_db, workspaces_root=workspaces_root).values():
         server.add_tool(fn)
     return server
-
-
-def main() -> None:
-    """Entry point: serve over stdio.
-
-    The atlas path comes from TREASURE_MAP_ATLAS_DB (else the last-run pointer's atlas); the
-    optional workspaces root from TREASURE_MAP_WORKSPACES_ROOT (a fallback run_id -> analysis.db
-    resolver). The server binds the ATLAS, not one firmware — a fact tool routes by run_id."""
-    from treasure_map.lib.last_run import read_last_run
-
-    atlas_db = os.environ.get("TREASURE_MAP_ATLAS_DB")
-    workspaces_root = os.environ.get("TREASURE_MAP_WORKSPACES_ROOT")
-    if atlas_db is None:
-        ptr = read_last_run()
-        if ptr is not None:
-            atlas_db = str(ptr.atlas_db)
-    build_server(atlas_db or "atlas.db", workspaces_root=workspaces_root).run()
-
-
-if __name__ == "__main__":
-    main()

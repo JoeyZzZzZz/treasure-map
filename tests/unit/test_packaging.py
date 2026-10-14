@@ -25,6 +25,7 @@ _ASSETS = [
     ("treasure_map.lib.diff.ghidra", "FallbackBinExport2Builder.java"),
     ("treasure_map.lib.storage", "atlas_schema.sql"),
     ("treasure_map.lib.storage", "schema.sql"),
+    ("treasure_map.lib.setup", "toolchain_lock.json"),
 ]
 
 
@@ -44,3 +45,16 @@ def test_pyproject_declares_package_data() -> None:
     assert "*.tsv" in package_data["treasure_map.lib.analyze.ghidra"]
     assert "*.java" in package_data["treasure_map.lib.diff.ghidra"]
     assert "*.sql" in package_data["treasure_map.lib.storage"]
+    assert "*.json" in package_data["treasure_map.lib.setup"]
+
+
+def test_one_command_and_one_version_source() -> None:
+    """``tmap`` is the only entry point (``treasure-map-mcp`` bound a relative atlas.db and is
+    gone), and the version is read from treasure_map/version.py, not written twice."""
+    data = tomllib.loads(_PYPROJECT.read_text())
+    project = data["project"]
+    assert project["name"] == "tmap-agents"
+    assert project["scripts"] == {"tmap": "treasure_map.cli.main:main"}
+    assert "version" not in project and "version" in project["dynamic"]
+    attr = data["tool"]["setuptools"]["dynamic"]["version"]["attr"]
+    assert attr == "treasure_map.version.__version__"

@@ -7,6 +7,7 @@ import logging
 import click
 
 from treasure_map.cli.analyze_cli import analyze
+from treasure_map.cli.doctor_cli import doctor
 from treasure_map.cli.exploit_cli import exploit
 from treasure_map.cli.hunt_cli import (
     atlas_view,
@@ -19,6 +20,8 @@ from treasure_map.cli.hunt_cli import (
 )
 from treasure_map.cli.init_cli import init
 from treasure_map.cli.mcp_cli import fact, mcp_serve
+from treasure_map.cli.uninstall_cli import uninstall
+from treasure_map.version import __version__
 
 
 class _AliasGroup(click.Group):
@@ -40,7 +43,7 @@ class _AliasGroup(click.Group):
     # (section title, ordered command names). A person drives the Main group; an agent over MCP is
     # the recommended way to do the analysis itself; Advanced is manual inspection / single-stage.
     _GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
-        ("Main", ("init", "scan", "rescan", "diff", "runs", "exploit")),
+        ("Main", ("init", "scan", "rescan", "diff", "runs", "exploit", "doctor", "uninstall")),
         ("Analysis (recommended)", ("mcp",)),
         (
             "Advanced (inspect results yourself / re-run a single step)",
@@ -75,6 +78,7 @@ class _AliasGroup(click.Group):
 
 
 @click.group(cls=_AliasGroup, context_settings={"max_content_width": 100})
+@click.version_option(version=__version__, prog_name="tmap", message="%(prog)s %(version)s")
 @click.option("--debug", is_flag=True, default=False, help="Enable debug logging.")
 def main(debug: bool) -> None:
     """Treasure Map is a reconnaissance tool for AI-driven firmware vulnerability research."""
@@ -85,6 +89,26 @@ def main(debug: bool) -> None:
     if not debug:
         for noisy in ("httpx", "httpcore", "openai", "anthropic"):
             logging.getLogger(noisy).setLevel(logging.WARNING)
+    _apply_configured_toolchain()
+
+
+def _apply_configured_toolchain() -> None:
+    """Put the JDK / BinDiff named in config.yaml first in this process's environment, so every
+    command (``tmap mcp`` started by a GUI client with a bare PATH included) runs the toolchain
+    ``tmap init`` chose. A broken config must not stop ``tmap init`` from repairing it, so it is a
+    warning here, not an error."""
+    from treasure_map.lib.config.config import load_config
+    from treasure_map.lib.errors import ConfigError
+    from treasure_map.lib.setup.toolchain_env import apply_toolchain_env
+
+    try:
+        notes = apply_toolchain_env(load_config(None))
+    except ConfigError as exc:
+        click.echo(f"warning: {exc}; toolchain paths from config not applied", err=True)
+        return
+    for note in notes:
+        if note.endswith("not used"):
+            logging.getLogger(__name__).warning("%s", note)
 
 
 main.add_command(scan)
@@ -99,6 +123,8 @@ main.add_command(atlas_view)
 main.add_command(fact)
 main.add_command(mcp_serve)
 main.add_command(exploit)
+main.add_command(doctor)
+main.add_command(uninstall)
 
 if __name__ == "__main__":
     main()

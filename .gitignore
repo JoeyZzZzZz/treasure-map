@@ -65,3 +65,6 @@ TODO-PRIVATE.md
 
 # Local-only full vendor denylist (brand names must not be committed)
 .githooks/vendor-watchlist.txt
+
+# Written by the release workflow only (the tagged commit a wheel was built from); never committed.
+src/treasure_map/_build_info.py

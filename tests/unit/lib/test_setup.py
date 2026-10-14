@@ -16,25 +16,32 @@ from treasure_map.lib.errors import GhidraNotFoundError
 from treasure_map.lib.setup.initializer import (
     _DEFAULT_CONFIG_YAML,
     _collect_default_env_vars,
-    _configure_ghidra,
     _configure_workspace_dir,
     _provision_dirs,
-    _run_doctor,
     _set_ghidra_home,
     _write_config,
     _write_env,
     run_init,
 )
 
+from .setup import fakes
+
 _FIND_HEADLESS = "treasure_map.lib.analyze.ghidra_runner.find_headless"
+_GHIDRA_PROMPT = "No Ghidra 11.4.3 found"
 
 
-def _make_ghidra_root(base: Path, name: str = "ghidra_11") -> Path:
-    """Create a fake Ghidra install root containing support/analyzeHeadless."""
-    root = base / name
-    (root / "support").mkdir(parents=True)
-    (root / "support" / "analyzeHeadless").write_text("#!/bin/sh\n")
-    return root
+def _make_ghidra_root(base: Path, name: str = "myghidra") -> Path:
+    """A fake Ghidra 11.4.3 install root. The default name is NOT ghidra_*_PUBLIC, so discovery's
+    directory scan does not find it — only config, $GHIDRA_HOME, PATH or the prompt do."""
+    return fakes.make_ghidra(base / name)
+
+
+@pytest.fixture(autouse=True)
+def _offline_linux(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every init here runs as linux-x86_64 and offline: a download the plan includes fails as a
+    FetchError (reported, never the network)."""
+    monkeypatch.setattr("treasure_map.lib.setup.platform.detect_platform", lambda: fakes.linux())
+    monkeypatch.setattr("treasure_map.lib.setup.fetch.UrlFetcher", fakes.RefusingFetcher)
 
 
 def _ghidra_home(fake_home: Path) -> Any:
@@ -219,14 +226,16 @@ def test_run_init_force_succeeds_on_second_call(fake_home: Path) -> None:
 # ── run_init — doctor checks ──────────────────────────────────────────────────
 
 
-def test_run_init_checks_is_tuple_of_triples(fake_home: Path) -> None:
+def test_run_init_checks_carry_name_ok_detail_and_state(fake_home: Path) -> None:
     result = run_init(force=False, non_interactive=True, prompt=_noop_prompt)
     assert isinstance(result.checks, tuple)
     for item in result.checks:
-        name, ok, detail = item
+        name, ok, detail, state = item
         assert isinstance(name, str)
         assert isinstance(ok, bool)
         assert isinstance(detail, str)
+        # ok is False exactly for the states that fail a --check-only run
+        assert ok is (state not in ("missing", "wrong", "unknown"))
 
 
 def test_run_init_atlas_dir_check_is_green_after_provisioning(fake_home: Path) -> None:
@@ -288,35 +297,48 @@ def test_check_only_atlas_dir_red_when_not_provisioned(fake_home: Path) -> None:
     assert atlas_check[1] is False
 
 
-# ── _run_doctor — isolated unit ───────────────────────────────────────────────
+# ── the doctor's java check — by version and javac, not by presence ──────────────────
 
 
-def test_run_doctor_java_check_reflects_path(tmp_path: Path) -> None:
-    with patch("treasure_map.lib.setup.initializer.shutil.which") as mock_which:
-        mock_which.side_effect = lambda x: "/usr/bin/java" if x == "java" else None
-        checks = _run_doctor(tmp_path, None)
-    java_check = next(c for c in checks if c[0] == "java")
-    assert java_check[1] is True
-    assert java_check[2] == "/usr/bin/java"
+def test_doctor_java_check_reads_the_version_and_javac(tmp_path: Path) -> None:
+    """A JDK 17 on PATH used to read ✅ because only ``which java`` was asked; Ghidra 11.4.3
+    refuses it. The check now reads the JDK's release file and wants javac.
+
+    MUTATION: return to ``shutil.which("java")`` alone -> the JDK 17 and the JRE read ok -> RED."""
+    from treasure_map.lib.setup.doctor import DoctorInputs, _java_check
+    from treasure_map.lib.setup.toolchain_lock import load_lock
+
+    def state_for(home: Path) -> str:
+        host = fakes.make_host(tmp_path, which={"java": str(home / "bin" / "java")})
+        inp = DoctorInputs(fakes.linux(), host, None, None, load_lock(), None, True)  # type: ignore[arg-type]
+        return _java_check(inp).state
+
+    assert state_for(fakes.make_jdk(tmp_path / "jdk17", "17.0.9")) == "wrong"
+    assert state_for(fakes.make_jdk(tmp_path / "jre21", javac=False)) == "wrong"
+    assert state_for(fakes.make_jdk(tmp_path / "jdk21")) == "ok"
+    assert state_for(fakes.make_jdk(tmp_path / "jdk25", "25.0.1")) == "warn"
 
 
 # ── run_init — Ghidra configuration step (R0-fix) ─────────────────────────────
 
 
-def test_init_ghidra_autodetect_accepts_without_prompt(fake_home: Path) -> None:
+def test_init_ghidra_autodetect_accepts_without_prompt(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _make_ghidra_root(fake_home)
+    monkeypatch.setenv("GHIDRA_HOME", str(root))
     msgs: list[str] = []
 
     def _record_prompt(msg: str) -> str:
         msgs.append(msg)
         return ""
 
-    with patch(_FIND_HEADLESS, return_value=Path("/opt/ghidra/support/analyzeHeadless")):
-        run_init(non_interactive=False, prompt=_record_prompt)
+    run_init(non_interactive=False, prompt=_record_prompt)
 
-    # Auto-detected: no Ghidra prompt fired, and the resolved install root is PERSISTED to
-    # config.yaml so a later analyze in a new shell (no GHIDRA_HOME/PATH) still finds it.
-    assert not any("Ghidra install root" in m for m in msgs)
-    assert _ghidra_home(fake_home) == "/opt/ghidra"
+    # Found: no Ghidra prompt fired, and the install root is PERSISTED to config.yaml so a later
+    # analyze in a new shell (no GHIDRA_HOME/PATH) still finds it.
+    assert not any(_GHIDRA_PROMPT in m for m in msgs)
+    assert _ghidra_home(fake_home) == str(root)
 
 
 def test_init_ghidra_prompt_validates_and_writes(fake_home: Path) -> None:
@@ -324,21 +346,33 @@ def test_init_ghidra_prompt_validates_and_writes(fake_home: Path) -> None:
     answers = iter([str(fake_home / "nope"), str(root)])  # invalid, then valid
 
     def _prompt(msg: str) -> str:
-        return next(answers) if "Ghidra install root" in msg else ""
+        return next(answers) if _GHIDRA_PROMPT in msg else ""
 
-    with patch(_FIND_HEADLESS, side_effect=GhidraNotFoundError("not found")):
-        run_init(non_interactive=False, prompt=_prompt)
+    run_init(non_interactive=False, prompt=_prompt)
 
     assert _ghidra_home(fake_home) == str(root)
 
 
+def test_init_ghidra_wrong_version_is_not_accepted(fake_home: Path) -> None:
+    """A Ghidra that is not exactly the pinned version is refused at the prompt as it is in
+    discovery."""
+    old = fakes.make_ghidra(fake_home / "old", version="11.4.2")
+
+    def _prompt(msg: str) -> str:
+        return str(old) if _GHIDRA_PROMPT in msg else ""
+
+    result = run_init(non_interactive=False, prompt=_prompt)
+
+    assert _ghidra_home(fake_home) is None
+    assert any("Ghidra" in n for n in result.needs_you)
+
+
 def test_init_ghidra_invalid_path_not_written(fake_home: Path) -> None:
     def _prompt(msg: str) -> str:
-        # Always return a path lacking support/analyzeHeadless.
-        return str(fake_home / "not-ghidra") if "Ghidra install root" in msg else ""
+        # Always return a path that is no Ghidra.
+        return str(fake_home / "not-ghidra") if _GHIDRA_PROMPT in msg else ""
 
-    with patch(_FIND_HEADLESS, side_effect=GhidraNotFoundError("not found")):
-        run_init(non_interactive=False, prompt=_prompt)
+    run_init(non_interactive=False, prompt=_prompt)
 
     assert _ghidra_home(fake_home) is None  # bad path never written
 
@@ -350,10 +384,9 @@ def test_init_non_interactive_no_ghidra_leaves_unset(fake_home: Path) -> None:
         msgs.append(msg)
         return ""
 
-    with patch(_FIND_HEADLESS, side_effect=GhidraNotFoundError("not found")):
-        result = run_init(non_interactive=True, prompt=_record_prompt)
+    result = run_init(non_interactive=True, prompt=_record_prompt)
 
-    assert not any("Ghidra install root" in m for m in msgs)  # never prompts
+    assert not any(_GHIDRA_PROMPT in m for m in msgs)  # never prompts
     assert _ghidra_home(fake_home) is None
     assert result.config_path.exists()  # init still succeeds
 
@@ -362,10 +395,9 @@ def test_init_ghidra_path_goes_to_config_not_env(fake_home: Path) -> None:
     root = _make_ghidra_root(fake_home)
 
     def _prompt(msg: str) -> str:
-        return str(root) if "Ghidra install root" in msg else ""
+        return str(root) if _GHIDRA_PROMPT in msg else ""
 
-    with patch(_FIND_HEADLESS, side_effect=GhidraNotFoundError("not found")):
-        run_init(non_interactive=False, prompt=_prompt)
+    run_init(non_interactive=False, prompt=_prompt)
 
     env_text = (fake_home / ".treasure-map" / ".env").read_text()
     assert "ghidra" not in env_text.lower()  # secrets file is untouched by the Ghidra step
@@ -376,12 +408,12 @@ def test_init_ghidra_path_goes_to_config_not_env(fake_home: Path) -> None:
 
 def test_prompt_messages_carry_no_trailing_colon(fake_home: Path) -> None:
     # click's prompt() appends its own ": " suffix, so a message that already ends in ": "
-    # would render a double colon. Guard both prompts: their messages must NOT end with a colon.
+    # would render a double colon. Guard every prompt init asks: none may end with a colon.
     captured: list[str] = []
 
     def _capture(msg: str) -> str:
         captured.append(msg)
-        return ""  # skip / leave unset
+        return "n" if msg.startswith("Apply") else ""
 
     env_path = fake_home / ".treasure-map" / ".env"
     env_path.parent.mkdir(parents=True, exist_ok=True)
@@ -394,13 +426,12 @@ def test_prompt_messages_carry_no_trailing_colon(fake_home: Path) -> None:
 
     config_path = fake_home / ".treasure-map" / "config.yaml"
     _write_config(config_path, force=True)
-    with patch(_FIND_HEADLESS, side_effect=GhidraNotFoundError("not found")):
-        _configure_ghidra(config_path, non_interactive=False, prompt=_capture, echo=lambda _m: None)
     _configure_workspace_dir(
         config_path, non_interactive=False, prompt=_capture, echo=lambda _m: None
     )
+    run_init(non_interactive=False, prompt=_capture)
 
-    assert captured  # all prompts actually fired
+    assert any(_GHIDRA_PROMPT in m for m in captured)  # the toolchain prompts fired too
     for msg in captured:
         assert not msg.rstrip().endswith(":"), f"message would double click's colon: {msg!r}"
 
@@ -435,7 +466,7 @@ def test_force_leaves_env_intact(fake_home: Path) -> None:
 
 
 def test_reinit_reuses_configured_ghidra_without_prompt(fake_home: Path) -> None:
-    # ghidra.local.home already set + valid: reuse it, do not re-prompt or re-detect.
+    # ghidra.local.home already set + valid: reuse it, do not re-prompt.
     root = _make_ghidra_root(fake_home)
     config_path = fake_home / ".treasure-map" / "config.yaml"
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -448,12 +479,11 @@ def test_reinit_reuses_configured_ghidra_without_prompt(fake_home: Path) -> None
         msgs.append(msg)
         return ""
 
-    # find_headless raises: if reuse fails, the only way to succeed would be the prompt — so a
-    # silent no-prompt run proves the existing config path was honored.
-    with patch(_FIND_HEADLESS, side_effect=GhidraNotFoundError("not found")):
-        _configure_ghidra(config_path, non_interactive=False, prompt=_record, echo=_noop_prompt)
+    # Nothing else can find it (no GHIDRA_HOME, no PATH, a name the scan skips): a silent
+    # no-prompt run proves the existing config path was honored.
+    run_init(non_interactive=False, prompt=_record)
 
-    assert not any("Ghidra install root" in m for m in msgs)  # not re-prompted
+    assert not any(_GHIDRA_PROMPT in m for m in msgs)  # not re-prompted
     assert _ghidra_home(fake_home) == str(root)  # still configured
 
 
@@ -542,7 +572,10 @@ def test_interactive_no_leaves_the_rc_alone(
     monkeypatch.setenv("SHELL", "/bin/zsh")
     lines: list[str] = []
     result = run_init(
-        force=False, non_interactive=False, prompt=lambda _msg: "n", echo=lines.append
+        force=False,
+        non_interactive=False,
+        prompt=lambda msg: "n" if "completion line" in msg else "",
+        echo=lines.append,
     )
 
     assert not (fake_home / ".zshrc").exists()
@@ -556,5 +589,9 @@ def test_unrecognised_answer_is_treated_as_no(
 ) -> None:
     # Ambiguity errs toward leaving the user's file alone — only Enter / y / yes writes.
     monkeypatch.setenv("SHELL", "/bin/zsh")
-    run_init(force=False, non_interactive=False, prompt=lambda _msg: "maybe")
+    run_init(
+        force=False,
+        non_interactive=False,
+        prompt=lambda msg: "maybe" if "completion line" in msg else "",
+    )
     assert not (fake_home / ".zshrc").exists()

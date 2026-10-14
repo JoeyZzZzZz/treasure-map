@@ -44,64 +44,58 @@ agent 越强,事实底座越有用:工具给 AI 喂它自己产不出来的、�
 
 ## 环境要求
 
-| 你需要自备 | 版本 | 用途 |
+`tmap init` 会替你装好工具链——如果你已经装了、而且核验通过,就直接复用:
+
+| 工具 | 版本 | 用途 |
 |---|---|---|
+| **JDK** | 21(要 JDK,不是 JRE) | 运行 Ghidra 11.4.3——JDK 11/17 会让它启动失败 |
 | **Ghidra** | 11.4.3 | 反编译每个二进制(headless 模式) |
-| **JDK** | 21 | Ghidra 11.4.3 要求——JDK 11/17 会让它启动失败 |
+| **BinExport** | 对应 Ghidra 11.4.3 | 为 `tmap diff` 导出二进制 |
+| **BinDiff** | 8 | 为 `tmap diff` 在两个固件版本之间匹配函数 |
 
-Ghidra 和 JDK 由你自己安装;下面的安装步骤会帮你装好 Treasure Map 和对应的 Python。**无需任何 API
-key。**(一个开箱即用、把一切都打包好的 Docker 镜像正在计划中。)
+下载地址是钉死的;解包之前先按钉死的大小和 sha256 核验。下载内容放在 `~/.treasure-map/toolchain/`。
+**无需任何 API key。**
 
-Treasure Map 是一个命令行工具(`tmap`),内置一个面向 AI 的 MCP server。它**支持 macOS 和 Linux**;
-Windows 上走 WSL。
+| 平台 | 状态 |
+|---|---|
+| Linux x86_64(含 WSL2) | 支持 |
+| Apple Silicon 上的 macOS | 支持 |
+| Intel 上的 macOS | 跑同一套工具链;未经验收 |
+| Linux arm64、原生 Windows | 不支持(没有 Ghidra 反编译器 / BinDiff 的对应构建);Windows 上用 WSL2 |
 
 **输入 = 一个已经解压好的固件文件系统。** 解包固件镜像不在 Treasure Map 的范围内——用你惯用的任意
 解包工具,然后把 Treasure Map 指向解出来的目录即可。
-
-Ghidra 11.4.3 是钉死、经过测试的工具链(实验性的 `diff` 阶段也要求它);`scan` 本身对任意 Ghidra
-11.x 都能跑,但钉死版本是为了结果可复现。
 
 ---
 
 ## 安装
 
-**1. 安装 [uv](https://docs.astral.sh/uv/)**(单个二进制,同时帮你管理对应的 Python):
-
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh   # macOS / Linux
+curl -LsSf https://github.com/JoeyZzZzZz/treasure-map/releases/latest/download/install.sh | sh
 ```
 
-**2. 安装 JDK 21**——用 `java -version` 确认(必须报告 21):
+脚本会先打印计划;没有 [uv](https://docs.astral.sh/uv/) 就装上(不改你的 shell rc);用 uv 管理的
+Python 3.11 装好 `tmap`(PyPI 包名 `tmap-agents`);然后进入 `tmap init`。`install.sh --dry-run`
+只显示计划、什么都不改。已经有 uv 的话,`uv tool install --python 3.11 tmap-agents` 再 `tmap init`
+效果相同。
 
-```bash
-# Debian/Ubuntu:  sudo apt install -y openjdk-21-jdk
-# macOS:          brew install openjdk@21
-# 其他:           Eclipse Temurin (https://adoptium.net)
-```
+`tmap init` 会:
 
-**3. 安装 Ghidra 11.4.3**——下载并解压即可,无需安装程序、无需管理员权限:
+1. **查找**已有的 JDK 21、Ghidra 11.4.3、BinExport、BinDiff 8(config、`GHIDRA_HOME`、`JAVA_HOME`、
+   PATH、常见安装位置),逐个做文件级核验;
+2. 对缺的组件,**问你**路径,或提供钉死版本的下载;
+3. **列出你的 agent**(Claude Code、Codex、Cursor、Claude Desktop、dsh),本机装了的已默认勾选——
+   空格取消,回车确认;
+4. **展示计划**(每个下载的 URL、大小、sha256;每个要改的文件),问 `Apply N changes? [Y/n]`;
+5. **执行**,然后跑 **doctor**,并打印两大功能的用法。
 
-```bash
-curl -L -o ghidra.zip \
-  https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.4.3_build/ghidra_11.4.3_PUBLIC_20251203.zip
-unzip ghidra.zip -d ~/ghidra && rm ghidra.zip
-export GHIDRA_HOME=~/ghidra/ghidra_11.4.3_PUBLIC   # 指向包含 support/analyzeHeadless 的那个目录
-```
+随时可以重跑:已是最新的环境会报告 "everything current, nothing to do"。常用参数:`--dry-run`(只看
+计划)、`--yes`(不提问、包含下载;只注册用 `--client` 点名的 agent)、`--non-interactive`(不提问、
+不下载)、`--ghidra / --java-home / --bindiff PATH`(就用这个)、`--offline DIR` / `--mirror URL`
+(从别处取归档,校验和不变)。`tmap doctor` 重跑检查、不写任何文件。
 
-**4. 安装 Treasure Map:**
-
-```bash
-uv tool install --python 3.11 "git+https://github.com/JoeyZzZzZz/treasure-map.git"
-```
-
-**5. 一次性配置:**
-
-```bash
-tmap init
-```
-
-`init` 会写入 `~/.treasure-map/config.yaml`,从 `GHIDRA_HOME` 检测 Ghidra(或问你一次),并跑一遍
-预检。把它标 `❌` 的项修好,再重跑。没有 `❌` 时,你就准备好了。
+> Ghidra 会记住它上次用的 JDK(其设置目录里的 `java_home.save`)。tmap 运行 Ghidra 11.4.3 时会把
+> tmap 所用的 JDK 记进去;你自己不设 `JAVA_HOME` 启动的 Ghidra 11.4.3 之后可能会选用这个 JDK。
 
 ---
 
@@ -125,29 +119,34 @@ MCP server 完成 ↓
 
 ## 接入你的 AI agent
 
-Treasure Map 自带一个 MCP(Model Context Protocol)server。**只需注册一次**——不用填路径、不用为每
-个固件单独配置。这个 server 绑定你的整个 `atlas`(你扫过的一切汇成的知识库);**由 agent 按 `run_id`
-自己挑要处理哪个固件**,新跑的 `tmap scan` 无需重新配置即可用。
+Treasure Map 自带一个 MCP(Model Context Protocol)server,`tmap init` 会把它注册进你选中的 agent。
+这个 server 绑定你的整个 `atlas`(你扫过的一切汇成的知识库);**由 agent 按 `run_id` 自己挑要处理
+哪个固件**,新跑的 `tmap scan` 无需重新配置即可用。注册后重启一下 agent。
 
-| Agent | 注册一次 |
+手动注册时,命令一律是 `<tmap 的绝对路径> mcp`(`command -v tmap`):
+
+| Agent | 注册 |
 |---|---|
-| **Claude Code** | `claude mcp add -s user treasure-map -- tmap mcp` |
-| **Codex (OpenAI)** | `codex mcp add treasure-map -- tmap mcp` |
-| **Cursor / Windsurf / Gemini CLI / 其他 JSON 客户端** | 把下面这段加进客户端的 MCP 配置文件 |
+| **Claude Code** | `claude mcp add -s user treasure-map -- "$(command -v tmap)" mcp` |
+| **Codex (OpenAI)** | `codex mcp add treasure-map -- "$(command -v tmap)" mcp` |
+| **Cursor / Claude Desktop / 其他 JSON 客户端** | 把下面这段加进客户端的 MCP 配置文件 |
+| **dsh** | `tmap init --client dsh` 会把条目追加到 `~/.dsh/cordis.patch.yml` |
 
 ```json
 {
   "mcpServers": {
     "treasure-map": {
-      "command": "tmap",
+      "command": "/absolute/path/to/tmap",
       "args": ["mcp"]
     }
   }
 }
 ```
 
-配置文件位置:Cursor `~/.cursor/mcp.json`、Windsurf `~/.codeium/windsurf/mcp_config.json`、Gemini
-CLI `~/.gemini/settings.json`;VS Code——`code --add-mcp '{"name":"treasure-map","command":"tmap","args":["mcp"]}'`。
+配置文件位置:Cursor `~/.cursor/mcp.json`、Claude Desktop `~/Library/Application Support/Claude/
+claude_desktop_config.json`(macOS)、Windsurf `~/.codeium/windsurf/mcp_config.json`、Gemini CLI
+`~/.gemini/settings.json`。Claude Code 请用 `-s user`:同名的项目级条目会在那个项目里遮住它
+(`tmap doctor` 会把这类条目指出来)。
 
 然后就用大白话跟你的 agent 说——工具不用你驱动,由它来驱动:
 
@@ -191,27 +190,29 @@ CLI `~/.gemini/settings.json`;VS Code——`code --add-mcp '{"name":"treasure-ma
 
 ## 排障
 
+先跑 `tmap doctor`:每项检查给出 ✅、⚠(可用,但值得注意)、`·`(仅供参考)、❌ 或 `?`(无法确定——
+永远不显示为 ✅);有任何 ❌ 或 `?` 时以非 0 退出。
+
 - **`tmap: command not found`**——工具的 bin 目录不在 PATH 上。跑 `uv tool update-shell`,然后开一个
   新 shell。
-- **`Ghidra : not found` / `not auto-detected`**——在 `~/.treasure-map/config.yaml` 里把
-  `ghidra.local.home` 设为你的 Ghidra 安装根目录;确认 `<root>/support/analyzeHeadless` 存在。
-  (WSL:装 **Linux** 版,并用 Linux 路径,而不是 `/mnt/c/...`。)
-- **`java: not on PATH`**——确保 `java -version` 报告 **21**(装了多个的话用 `update-alternatives
-  --config java`)。
-
-任何修复之后,重跑 `tmap init` 再检一遍。
+- **`ghidra` / `java` / `bindiff` ❌**——重跑 `tmap init`,它会提供钉死版本的下载;或者传
+  `--ghidra / --java-home / --bindiff PATH`。(WSL:全部放在 Linux 一侧,不要放在 `/mnt/c/...` 下。)
+- **`binexport` ❌ "two copies"**——Ghidra 会从自己的 `Ghidra/Extensions` 和它的用户设置目录两处加载
+  扩展;删掉其中一份。
 
 ---
 
 ## 卸载
 
 ```bash
-uv tool uninstall treasure-map
+tmap uninstall              # agent 注册 + tmap 下载的工具链
+uv tool uninstall tmap-agents
 ```
 
-这会**保留 `~/.treasure-map/`**——你的配置,尤其是 **`atlas.db`**,那个跨固件的知识库会随每次运行
-累积、永不重建。重新安装会复用其中全部内容。要连 `atlas.db` 一起彻底清除:`rm -rf ~/.treasure-map`
-(不可恢复——不推荐)。
+`tmap uninstall` 只删除 `tmap init` 记录过自己安装的东西——绝不碰你自己装的 JDK、Ghidra 或 BinDiff——
+并且**保留 `~/.treasure-map/`**:你的配置,尤其是 **`atlas.db`**,那个跨固件的知识库会随每次运行累积、
+永不重建。重新安装会复用其中全部内容。`tmap uninstall --purge-data` 会在你输入确认短语之后连 atlas 和
+工作区一起删除(不可恢复——不推荐)。
 
 ---
 

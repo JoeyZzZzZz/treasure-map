@@ -1,0 +1,131 @@
+# Build the BinExport Ghidra extension tmap pins, once, and publish it as a release asset.
+#
+# Run by hand (Actions -> BinExport -> Run workflow) with the full 40-character google/binexport
+# commit. The release it creates is a PRERELEASE and never "latest" — otherwise
+# releases/latest/download/install.sh would point at it. The three values it prints (zip sha256,
+# size, lib digest) go into src/treasure_map/lib/setup/toolchain_lock.json through a pull request;
+# this workflow never edits the repository.
+name: BinExport
+
+on:
+  workflow_dispatch:
+    inputs:
+      binexport_commit:
+        description: "google/binexport commit (full 40-character hash)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      COMMIT: ${{ inputs.binexport_commit }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the commit argument
+        run: |
+          echo "$COMMIT" | grep -Eq '^[0-9a-f]{40}$' || { echo "need a full 40-character commit"; exit 1; }
+          echo "C12=${COMMIT:0:12}" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install tmap from this checkout (lock reader, digest, export script)
+        run: pip install .
+
+      - name: Download Ghidra (pinned, sha256-checked)
+        run: |
+          python - <<'PY' > ghidra.env
+          from treasure_map.lib.setup.toolchain_lock import asset_for, load_lock
+          a = asset_for(load_lock(), "ghidra", "linux-x86_64")
+          print(f"URL={a.url}\nSHA={a.sha256}\nROOT={a.root}")
+          PY
+          . ./ghidra.env
+          curl -LsSf -o ghidra.zip "$URL"
+          echo "$SHA  ghidra.zip" | sha256sum -c -
+          unzip -q ghidra.zip -d "$RUNNER_TEMP"
+          echo "GHIDRA=$RUNNER_TEMP/$ROOT" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: google/binexport
+          ref: ${{ inputs.binexport_commit }}
+          path: binexport
+
+      - name: Build the extension
+        working-directory: binexport/java
+        run: |
+          "$GHIDRA/support/gradle/gradlew" -PGHIDRA_INSTALL_DIR="$GHIDRA" buildExtension
+          ls -l dist/
+
+      - name: Package with the license, under tmap's name
+        run: |
+          set -e
+          SRC="$(ls binexport/java/dist/*_BinExport.zip)"
+          OUT="BinExport-ghidra_11.4.3-$C12.zip"
+          mkdir pkg && (cd pkg && unzip -q "../$SRC")
+          test -d pkg/BinExport
+          cp binexport/LICENSE pkg/BinExport/LICENSE
+          (cd pkg && zip -qr "../$OUT" BinExport)
+          echo "OUT=$OUT" >> "$GITHUB_ENV"
+
+      - name: Load smoke (headless loads the extension's classes)
+        run: |
+          set -e
+          unzip -q "$OUT" -d "$GHIDRA/Ghidra/Extensions/"
+          mkdir -p probe proj
+          cat > probe/ProbeBinExport.java <<'JAVA'
+          import ghidra.app.script.GhidraScript;
+          public class ProbeBinExport extends GhidraScript {
+            @Override
+            protected void run() throws Exception {
+              Class.forName("com.google.security.binexport.BinExport2Builder");
+              println("PROBE-OK BinExport2Builder loaded");
+            }
+          }
+          JAVA
+          "$GHIDRA/support/analyzeHeadless" "$PWD/proj" P -import tests/fixtures/elfs/libz_x86_64.so \
+            -noanalysis -scriptPath "$PWD/probe" -postScript ProbeBinExport.java -deleteProject \
+            2>&1 | tee probe.log
+          grep -q "PROBE-OK" probe.log
+
+      - name: Export smoke (tmap's own export script on an OSS fixture)
+        run: |
+          set -e
+          SCRIPTS="$(python -c 'import treasure_map.lib.diff.ghidra as g, os; print(os.path.dirname(g.__file__))')"
+          "$GHIDRA/support/analyzeHeadless" "$PWD/proj" Q -import tests/fixtures/elfs/libz_x86_64.so \
+            -scriptPath "$SCRIPTS" -postScript ExportBinExport.java "$PWD/out.BinExport" "$PWD/out.report.json" \
+            -deleteProject
+          test -s out.BinExport
+
+      - name: Values for toolchain_lock.json
+        run: |
+          set -e
+          SHA="$(sha256sum "$OUT" | cut -d' ' -f1)"
+          SIZE="$(stat -c %s "$OUT")"
+          DIGEST="$(python -c 'import sys; from pathlib import Path; from treasure_map.lib.diff.toolchain import binexport_lib_digest; print(binexport_lib_digest(Path(sys.argv[1])))' "$GHIDRA/Ghidra/Extensions/BinExport")"
+          {
+            echo "### toolchain_lock.json values"
+            echo "- binexport.source_commit: \`$COMMIT\`"
+            echo "- binexport.lib_digest: \`$DIGEST\`"
+            echo "- asset sha256: \`$SHA\`"
+            echo "- asset size: \`$SIZE\`"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish (prerelease, never latest)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "toolchain-binexport-11.4.3-$C12" "$OUT" \
+            --prerelease --latest=false \
+            --title "BinExport for Ghidra 11.4.3 ($C12)" \
+            --notes "Built from google/binexport@$COMMIT for Ghidra 11.4.3. Apache-2.0 (LICENSE inside the zip)."

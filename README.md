@@ -55,65 +55,62 @@ can't produce for itself, so the AI can reason deeper on top of them.
 
 ## Requirements
 
-| You provide | Version | Why |
+`tmap init` installs the toolchain for you — or reuses what you already have when it checks out:
+
+| Tool | Version | Why |
 |---|---|---|
+| **JDK** | 21 (a JDK, not a JRE) | runs Ghidra 11.4.3 — JDK 11/17 make it fail to launch |
 | **Ghidra** | 11.4.3 | decompiles every binary (headless) |
-| **JDK** | 21 | required by Ghidra 11.4.3 — JDK 11/17 make it fail to launch |
+| **BinExport** | for Ghidra 11.4.3 | exports a binary for `tmap diff` |
+| **BinDiff** | 8 | matches functions between two firmware versions for `tmap diff` |
 
-You install Ghidra and JDK yourself; the install below sets up Treasure Map and the right Python for
-you. **No API keys are required.** (A zero-setup Docker image bundling everything is planned.)
+Downloads come from pinned URLs and are checked against a pinned size and sha256 before anything is
+unpacked. They go to `~/.treasure-map/toolchain/`. **No API keys are required.**
 
-Treasure Map is a CLI (`tmap`) with a bundled AI-facing MCP server. It **runs on macOS and Linux**;
-on Windows, use WSL.
+| Platform | Status |
+|---|---|
+| Linux x86_64 (including WSL2) | supported |
+| macOS on Apple Silicon | supported |
+| macOS on Intel | runs the same toolchain; not acceptance-tested |
+| Linux arm64, native Windows | not supported (no Ghidra decompiler / BinDiff build); on Windows use WSL2 |
 
 **Input = an already-extracted firmware filesystem.** Unpacking the firmware image is outside
 Treasure Map's scope — use whatever extraction tool you prefer, and point Treasure Map at the
 resulting directory.
 
-Ghidra 11.4.3 is the pinned, tested toolchain (and is required for the experimental `diff` stage);
-`scan` itself works with any Ghidra 11.x, but pinning keeps results reproducible.
-
 ---
 
 ## Install
 
-**1. Install [uv](https://docs.astral.sh/uv/)** (a single binary that also manages the right Python):
-
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh   # macOS / Linux
+curl -LsSf https://github.com/JoeyZzZzZz/treasure-map/releases/latest/download/install.sh | sh
 ```
 
-**2. Install JDK 21** — check with `java -version` (must report 21):
+The script prints its plan, installs [uv](https://docs.astral.sh/uv/) if it is missing (without
+editing your shell rc), installs `tmap` (PyPI package `tmap-agents`) with a uv-managed Python 3.11,
+and starts `tmap init`. `install.sh --dry-run` shows the plan and changes nothing. Already have uv?
+`uv tool install --python 3.11 tmap-agents` then `tmap init` does the same.
 
-```bash
-# Debian/Ubuntu:  sudo apt install -y openjdk-21-jdk
-# macOS:          brew install openjdk@21
-# Other:          Eclipse Temurin (https://adoptium.net)
-```
+`tmap init`:
 
-**3. Install Ghidra 11.4.3** — download and unzip it (no installer, no admin rights):
+1. **finds** an existing JDK 21, Ghidra 11.4.3, BinExport and BinDiff 8 (config, `GHIDRA_HOME`,
+   `JAVA_HOME`, PATH, common install locations) and checks each one at file level;
+2. **asks** for a path, or offers the pinned download, for anything missing;
+3. **lists your agents** (Claude Code, Codex, Cursor, Claude Desktop, dsh) with the ones installed on
+   this machine pre-selected — Space to unselect, Enter to confirm;
+4. **shows the plan** (every download with its URL, size and sha256; every file it will change) and
+   asks `Apply N changes? [Y/n]`;
+5. **applies** it, then runs the **doctor** and prints how to use the two main features.
 
-```bash
-curl -L -o ghidra.zip \
-  https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.4.3_build/ghidra_11.4.3_PUBLIC_20251203.zip
-unzip ghidra.zip -d ~/ghidra && rm ghidra.zip
-export GHIDRA_HOME=~/ghidra/ghidra_11.4.3_PUBLIC   # the folder that contains support/analyzeHeadless
-```
+Run it again any time: an up-to-date setup reports "everything current, nothing to do". Useful flags:
+`--dry-run` (plan only), `--yes` (no questions, downloads included; registers only the agents named
+with `--client`), `--non-interactive` (no questions, no downloads), `--ghidra / --java-home /
+--bindiff PATH` (use exactly this), `--offline DIR` / `--mirror URL` (archives from elsewhere, same
+checksums). `tmap doctor` re-runs the checks and writes nothing.
 
-**4. Install Treasure Map:**
-
-```bash
-uv tool install --python 3.11 "git+https://github.com/JoeyZzZzZz/treasure-map.git"
-```
-
-**5. Configure once:**
-
-```bash
-tmap init
-```
-
-`init` writes `~/.treasure-map/config.yaml`, detects Ghidra from `GHIDRA_HOME` (or asks once), and
-runs a preflight check. Fix anything it marks `❌`, then re-run. When there's no `❌`, you're ready.
+> Ghidra remembers the JDK it last ran with (`java_home.save` in its settings directory). When tmap
+> runs Ghidra 11.4.3 it records the JDK tmap uses there; a Ghidra 11.4.3 you start yourself without
+> `JAVA_HOME` may then pick that JDK.
 
 ---
 
@@ -138,30 +135,35 @@ across the firmware, recording judgments — is done by your AI agent through th
 
 ## Connect your AI agent
 
-Treasure Map ships an MCP (Model Context Protocol) server. Register it **once** — no paths, no
-per-firmware setup. The server binds your whole `atlas` (the knowledge base of everything you've
+Treasure Map ships an MCP (Model Context Protocol) server, and `tmap init` registers it with the
+agents you select. The server binds your whole `atlas` (the knowledge base of everything you've
 scanned); the **agent picks which firmware to work on** by `run_id`, and a new `tmap scan` is
-available with no reconfiguration.
+available with no reconfiguration. Restart the agent after registering.
 
-| Agent | Register once |
+To register by hand, the command is always `<absolute path of tmap> mcp` (`command -v tmap`):
+
+| Agent | Register |
 |---|---|
-| **Claude Code** | `claude mcp add -s user treasure-map -- tmap mcp` |
-| **Codex (OpenAI)** | `codex mcp add treasure-map -- tmap mcp` |
-| **Cursor / Windsurf / Gemini CLI / other JSON clients** | add the block below to the client's MCP config file |
+| **Claude Code** | `claude mcp add -s user treasure-map -- "$(command -v tmap)" mcp` |
+| **Codex (OpenAI)** | `codex mcp add treasure-map -- "$(command -v tmap)" mcp` |
+| **Cursor / Claude Desktop / other JSON clients** | add the block below to the client's MCP config file |
+| **dsh** | `tmap init --client dsh` appends the entry to `~/.dsh/cordis.patch.yml` |
 
 ```json
 {
   "mcpServers": {
     "treasure-map": {
-      "command": "tmap",
+      "command": "/absolute/path/to/tmap",
       "args": ["mcp"]
     }
   }
 }
 ```
 
-Config file: Cursor `~/.cursor/mcp.json`, Windsurf `~/.codeium/windsurf/mcp_config.json`, Gemini CLI
-`~/.gemini/settings.json`; VS Code — `code --add-mcp '{"name":"treasure-map","command":"tmap","args":["mcp"]}'`.
+Config file: Cursor `~/.cursor/mcp.json`, Claude Desktop `~/Library/Application Support/Claude/
+claude_desktop_config.json` (macOS), Windsurf `~/.codeium/windsurf/mcp_config.json`, Gemini CLI
+`~/.gemini/settings.json`. Use `-s user` with Claude Code: a project-local entry of the same name
+would hide it inside that project (`tmap doctor` points such entries out).
 
 Then just talk to your agent in plain language — you don't drive the tools, it does:
 
@@ -213,27 +215,31 @@ before proceeding.
 
 ## Troubleshooting
 
+Run `tmap doctor` first: every check says ✅, ⚠ (works, worth knowing), `·` (information), ❌ or `?`
+(could not be determined — never shown as ✅), and it exits non-zero on any ❌ or `?`.
+
 - **`tmap: command not found`** — the tool's bin dir isn't on PATH. Run `uv tool update-shell`, then
   open a new shell.
-- **`Ghidra : not found` / `not auto-detected`** — set `ghidra.local.home` in
-  `~/.treasure-map/config.yaml` to your Ghidra install root; verify `<root>/support/analyzeHeadless`
-  exists. (WSL: install the **Linux** build and use a Linux path, not `/mnt/c/...`.)
-- **`java: not on PATH`** — ensure `java -version` reports **21** (`update-alternatives --config
-  java` if you have several).
-
-Re-run `tmap init` after any fix to re-check.
+- **`ghidra` / `java` / `bindiff` ❌** — run `tmap init` again; it offers the pinned download, or
+  pass `--ghidra / --java-home / --bindiff PATH`. (WSL: keep everything on the Linux side, not under
+  `/mnt/c/...`.)
+- **`binexport` ❌ "two copies"** — Ghidra loads extensions from its own `Ghidra/Extensions` and from
+  its user settings directory; remove one of the two.
 
 ---
 
 ## Uninstalling
 
 ```bash
-uv tool uninstall treasure-map
+tmap uninstall              # agent registrations + the toolchain tmap downloaded
+uv tool uninstall tmap-agents
 ```
 
-This **keeps `~/.treasure-map/`** — your config and especially **`atlas.db`**, the cross-firmware
-knowledge base that accumulates across runs and is never rebuilt. Reinstalling reuses all of it. To
-wipe everything including `atlas.db`: `rm -rf ~/.treasure-map` (not recoverable — not recommended).
+`tmap uninstall` removes only what `tmap init` recorded installing — never a JDK, Ghidra or BinDiff
+you installed yourself — and **keeps `~/.treasure-map/`**: your config and especially **`atlas.db`**,
+the cross-firmware knowledge base that accumulates across runs and is never rebuilt. Reinstalling
+reuses all of it. `tmap uninstall --purge-data` also deletes the atlas and the workspaces after you
+type the confirmation phrase (not recoverable — not recommended).
 
 ---
 

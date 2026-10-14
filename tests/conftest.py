@@ -46,3 +46,18 @@ def _no_external_toolchain(monkeypatch: pytest.MonkeyPatch) -> None:
     one."""
     monkeypatch.setattr(_toolchain, "_current", [None])
     monkeypatch.setattr(_toolchain, "detect_toolchain", lambda config: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test reaches the network: ``tmap init`` downloads the toolchain, and a test that forgot
+    to inject a fake fetcher would otherwise pull hundreds of megabytes (or hang offline). A test
+    that needs download semantics injects a ``Fetcher``."""
+    import socket
+    import urllib.request
+
+    def _refuse(*_a: object, **_k: object) -> None:
+        raise AssertionError("network in unit test")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _refuse)
+    monkeypatch.setattr(socket, "create_connection", _refuse)

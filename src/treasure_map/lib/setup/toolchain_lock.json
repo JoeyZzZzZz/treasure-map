@@ -1,0 +1,82 @@
+{
+  "schema": 1,
+  "components": {
+    "jdk": {
+      "version": "21.0.12.1+1",
+      "assets": {
+        "linux-x86_64": {
+          "url": "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.12.1%2B1/OpenJDK21U-jdk_x64_linux_hotspot_21.0.12.1_1.tar.gz",
+          "sha256": "ce79869e1307ed8ee1e2baa86a412b1eb5b75d10a01006d788a6f968bcfaee94",
+          "size": 207473347,
+          "kind": "tar.gz",
+          "root": "jdk-21.0.12.1+1",
+          "java_home": "jdk-21.0.12.1+1"
+        },
+        "darwin-arm64": {
+          "url": "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.12.1%2B1/OpenJDK21U-jdk_aarch64_mac_hotspot_21.0.12.1_1.tar.gz",
+          "sha256": "3623232f33a9c3baadf304480b2535f9a3cba8a58d42ecbb438ba267315d9998",
+          "size": 200073404,
+          "kind": "tar.gz",
+          "root": "jdk-21.0.12.1+1",
+          "java_home": "jdk-21.0.12.1+1/Contents/Home"
+        },
+        "darwin-x86_64": {
+          "url": "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.12.1%2B1/OpenJDK21U-jdk_x64_mac_hotspot_21.0.12.1_1.tar.gz",
+          "sha256": "44db0f08196daf19a47f90d13388b0c943b67663cb537f998fe29e836fa842ce",
+          "size": 194316575,
+          "kind": "tar.gz",
+          "root": "jdk-21.0.12.1+1",
+          "java_home": "jdk-21.0.12.1+1/Contents/Home"
+        }
+      }
+    },
+    "ghidra": {
+      "version": "11.4.3",
+      "assets": {
+        "*": {
+          "url": "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.4.3_build/ghidra_11.4.3_PUBLIC_20251203.zip",
+          "sha256": "b22a8baebb14339f19903c54363ba7e01781930cc43ab430539aabce0d58547a",
+          "size": 456551841,
+          "kind": "zip",
+          "root": "ghidra_11.4.3_PUBLIC"
+        }
+      }
+    },
+    "binexport": {
+      "version": "11.4.3",
+      "source_commit": "b56dea7b0a8baff0971466d422030c496464b6b6",
+      "lib_digest": "<filled from the binexport workflow output: lib digest>",
+      "assets": {
+        "*": {
+          "url": "https://github.com/JoeyZzZzZz/treasure-map/releases/download/toolchain-binexport-11.4.3-b56dea7b0a8b/BinExport-ghidra_11.4.3-b56dea7b0a8b.zip",
+          "sha256": "<filled from the binexport workflow output: zip sha256>",
+          "size": 0,
+          "kind": "zip",
+          "root": "BinExport"
+        }
+      }
+    },
+    "bindiff": {
+      "version": "8",
+      "version_line": "BinDiff 8 (@568181968, Sep 25 2023)",
+      "assets": {
+        "linux-x86_64": {
+          "url": "https://github.com/google/bindiff/releases/download/v8/bindiff_8_amd64.deb",
+          "sha256": "821990e3974a9df6733794370e485486ac276ba5d777a06b4ebe575f092f4dda",
+          "size": 62663460,
+          "kind": "deb",
+          "member_prefix": "./opt/bindiff/",
+          "exe": "opt/bindiff/bin/bindiff"
+        },
+        "darwin-*": {
+          "url": "https://github.com/google/bindiff/releases/download/v8/BinDiff8.dmg",
+          "sha256": "2962fd337529a59fe4ba3b4a5596be53bfacd1bd0a3952ea7bedd6276eeb4db8",
+          "size": 97465630,
+          "kind": "dmg-pkg",
+          "app": "BinDiff.app",
+          "exe": "BinDiff.app/Contents/MacOS/bin/bindiff"
+        }
+      }
+    }
+  }
+}

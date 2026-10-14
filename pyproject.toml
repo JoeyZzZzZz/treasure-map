@@ -1,17 +1,17 @@
 [project]
-name = "treasure-map"
-version = "0.1.0"
+name = "tmap-agents"
+dynamic = ["version"]
 description = "Reconnaissance tooling for AI-driven IoT firmware vulnerability research"
 readme = "README.md"
 requires-python = ">=3.11"
-license = {file = "LICENSE"}
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 authors = [
     {name = "JoeyZzZzZz", email = "86097996+JoeyZzZzZz@users.noreply.github.com"}
 ]
 keywords = ["iot", "firmware", "security", "reverse-engineering", "patch-diff"]
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
-    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Security",
@@ -44,11 +44,18 @@ dev = [
 
 [project.scripts]
 tmap = "treasure_map.cli.main:main"
-treasure-map-mcp = "treasure_map.mcp_app:main"
+
+[project.urls]
+Homepage = "https://github.com/JoeyZzZzZz/treasure-map"
+Repository = "https://github.com/JoeyZzZzZz/treasure-map"
+Changelog = "https://github.com/JoeyZzZzZz/treasure-map/blob/main/CHANGELOG.md"
 
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.dynamic]
+version = {attr = "treasure_map.version.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -60,6 +67,7 @@ where = ["src"]
 "treasure_map.lib.analyze.ghidra" = ["*.java", "*.tsv"]
 "treasure_map.lib.diff.ghidra" = ["*.java"]
 "treasure_map.lib.storage" = ["*.sql"]
+"treasure_map.lib.setup" = ["*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

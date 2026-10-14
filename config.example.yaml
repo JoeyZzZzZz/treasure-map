@@ -1,6 +1,6 @@
 # Treasure Map configuration example
-# Copy to ~/.treasure-map/config.yaml. Analysis is hermetic (no network calls) — there are no
-# API keys to fill in.
+# `tmap init` writes ~/.treasure-map/config.yaml for you; this file shows every key. Analysis is
+# hermetic (no network calls) — there are no API keys to fill in.
 
 ghidra:
   mode: local    # 'local' is the only implemented mode
@@ -21,6 +21,13 @@ ghidra:
   #
   # remote:
   #   endpoint: http://localhost:8080
+
+# toolchain: the JDK and BinDiff tmap runs. `tmap init` writes these; when set, every tmap command
+# puts them first in its own environment (JAVA_HOME and PATH) before starting Ghidra or BinDiff —
+# also `tmap mcp` started by an agent with a bare PATH. Unset (null) = the environment is left as is.
+toolchain:
+  java_home: ~     # a JDK 21 root (bin/java and bin/javac)
+  bindiff: ~       # the bindiff executable, e.g. ~/.treasure-map/toolchain/bindiff-8/opt/bindiff/bin/bindiff
 
 workspace_dir: ~/.treasure-map/workspaces
 

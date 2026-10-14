@@ -531,19 +531,17 @@ def _find_bindiff() -> Path | None:
 
 
 def _binexport_present(headless: Path) -> bool:
-    """Best-effort: is the BinExport Ghidra extension installed for the discovered Ghidra?
+    """Is exactly one BinExport extension loaded by the discovered Ghidra?
 
-    ``analyzeHeadless`` lives at ``<ghidra_home>/support/analyzeHeadless``, so the home is its
-    parent's parent; the extension unpacks under ``<home>/Ghidra/Extensions/BinExport`` or the
-    user's ``~/.ghidra/.ghidra_*/Extensions/BinExport``. Detection is heuristic (a nonstandard
-    install location is not seen), so the caller treats a False as 'not confirmed present' and says
-    so -- it never silently proceeds as if it were there."""
-    home = headless.parent.parent
-    roots = [home / "Ghidra" / "Extensions"]
-    user_ghidra = Path(os.path.expanduser("~")) / ".ghidra"
-    if user_ghidra.is_dir():
-        roots.extend(p / "Extensions" for p in user_ghidra.glob(".ghidra_*"))
-    return any((root / "BinExport").exists() for root in roots if root.is_dir())
+    ``analyzeHeadless`` lives at ``<ghidra_home>/support/analyzeHeadless``, so the home is the
+    resolved file's parent's parent. Where Ghidra loads the extension from is answered by the same
+    locator the toolchain stamp reads (lib.diff.toolchain): the install's own Extensions directory
+    and the user settings directory. Two loaded copies, or a settings directory that cannot be
+    determined, both read as 'not confirmed present', so the caller reports it missing rather than
+    silently proceeding; ``tmap doctor`` shows where it looked."""
+    home = headless.resolve().parent.parent
+    dirs = _toolchain.binexport_dirs(home)
+    return dirs is not None and len(dirs) == 1
 
 
 def _check_toolchain(config: Config) -> None:

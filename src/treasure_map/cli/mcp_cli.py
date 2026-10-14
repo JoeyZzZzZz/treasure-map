@@ -201,8 +201,8 @@ def mcp_serve(atlas_db: str | None, workspaces_root: str | None) -> None:
     # JSON-RPC for the client.
     click.echo(
         "treasure-map MCP server (stdio). Binds the atlas; fact tools route by run_id (see "
-        f"list_runs). Launch from an MCP client, e.g.:  claude mcp add treasure-map -- tmap mcp "
-        f"--atlas {atlas_db}   — now waiting for JSON-RPC on stdin (Ctrl-C to exit).",
+        'list_runs). Register it with your agent via "tmap init" — now waiting for JSON-RPC on '
+        "stdin (Ctrl-C to exit).",
         err=True,
     )
     server.run()

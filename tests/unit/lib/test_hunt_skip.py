@@ -382,6 +382,16 @@ def test_a_malformed_install_record_reads_as_unknown(monkeypatch: pytest.MonkeyP
         def read_text(self, _name: str) -> str | None:
             return self._p
 
+    def _only_current(payload: str | None) -> object:
+        # One distribution installed, under the current name; the old name is absent. (A fake
+        # answering for both names would read as two installs, which is unknown on its own.)
+        def _distribution(name: str) -> _Dist:
+            if name != "tmap-agents":
+                raise ModuleNotFoundError(name)
+            return _Dist(payload)
+
+        return _distribution
+
     for payload in [
         None,
         "",
@@ -392,11 +402,11 @@ def test_a_malformed_install_record_reads_as_unknown(monkeypatch: pytest.MonkeyP
         '{"vcs_info":{"commit_id":""}}',
         '{"vcs_info":{"commit_id":5}}',
     ]:
-        monkeypatch.setattr(tm_version, "distribution", lambda _n, p=payload: _Dist(p))
+        monkeypatch.setattr(tm_version, "distribution", _only_current(payload))
         assert tm_version.installed_commit() == UNKNOWN_VERSION, payload
 
     monkeypatch.setattr(
-        tm_version, "distribution", lambda _n: _Dist('{"vcs_info":{"commit_id":"abc"}}')
+        tm_version, "distribution", _only_current('{"vcs_info":{"commit_id":"abc"}}')
     )
     assert tm_version.installed_commit() == "abc"
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import tomllib
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parents[2]
@@ -152,9 +153,13 @@ def test_license_file_is_the_apache_text_and_notice_exists() -> None:
 def test_package_metadata_declares_the_same_licence() -> None:
     # The classifier is what an installer and an index show; disagreeing with LICENSE there is the
     # version of this drift the most people would see.
-    pyproject = (_REPO / "pyproject.toml").read_text()
-    assert "License :: OSI Approved :: Apache Software License" in pyproject
-    assert "License :: OSI Approved :: GNU" not in pyproject
+    # PEP 639: the SPDX expression is the declaration, and a licence classifier beside it is an
+    # error for the build backend, so there must be exactly the expression.
+    data = tomllib.loads((_REPO / "pyproject.toml").read_text())
+    project = data["project"]
+    assert project["license"] == "Apache-2.0"
+    assert set(project["license-files"]) >= {"LICENSE", "NOTICE"}
+    assert not [c for c in project.get("classifiers", []) if c.startswith("License ::")]
 
 
 def test_the_declared_version_is_one_value() -> None:
@@ -162,11 +167,15 @@ def test_the_declared_version_is_one_value() -> None:
     # itself is stamped onto every run this tool records.
     #
     # ★ MUTATION (verified RED, 1 failed): change either of the two and this fails naming both.
+    # The package metadata reads the version FROM version.py (a dynamic version), so there is no
+    # second string to drift: pyproject must not write one, and must point at version.py.
     pyproject = (_REPO / "pyproject.toml").read_text()
     version_py = (_REPO / "src" / "treasure_map" / "version.py").read_text()
-    packaged = re.search(r'^version\s*=\s*"([^"]+)"', pyproject, re.MULTILINE)
-    runtime = re.search(r'^__version__\s*=\s*"([^"]+)"', version_py, re.MULTILINE)
-    assert packaged and runtime
-    assert packaged.group(1) == runtime.group(1), (
-        f"pyproject says {packaged.group(1)}, version.py says {runtime.group(1)}"
-    )
+    data = tomllib.loads(pyproject)
+    assert "version" not in data["project"], "pyproject writes a second version string"
+    assert "version" in data["project"].get("dynamic", [])
+    assert data["tool"]["setuptools"]["dynamic"]["version"] == {
+        "attr": "treasure_map.version.__version__"
+    }
+    runtime = re.findall(r'^__version__\s*=\s*"([^"]+)"', version_py, re.MULTILINE)
+    assert len(runtime) == 1, f"version.py assigns __version__ {len(runtime)} times"
