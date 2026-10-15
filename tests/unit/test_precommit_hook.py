@@ -36,7 +36,12 @@ _FAKE_MODEL_NUM = "ZZ-X" + "99"
 # from two halves so the literal never appears in this committed source file: the
 # prefix half has no trailing digits and the digit half has no leading letters, so
 # neither half matches the model regex on this file.
-_FAKE_LC_MODEL = "dcs" + "932"
+_FAKE_LC_MODEL = "zqx" + "481"
+
+# Upper-case run-together model form with a ONE-letter prefix run into four digits — the shape the
+# lower-case rule (which needs at least two letters) does not reach. Assembled from halves for the
+# same reason as above.
+_FAKE_UC_MODEL = "Q" + "7310"
 
 # Technical tokens of the same letters+digits shape that MUST NOT be flagged. Only
 # sha256 actually reaches the >=3-digit regex (the rest have <3 digits); all are
@@ -175,8 +180,30 @@ def test_hook_blocks_model_number_via_example(tmp_path: Path) -> None:
     assert result2.returncode == 0, f"plain hyphenated word must pass; stdout={result2.stdout!r}"
 
 
+def test_hook_blocks_uppercase_runtogether_model(tmp_path: Path) -> None:
+    """A one-letter upper-case model-shaped token is blocked by the example, while a lint code of
+    the same letter-then-digits shape (three digits) is not.
+
+    MUTATION: delete the pattern from the example -> RED (the model-shaped token passes); widen
+    it to three digits -> RED (the lint code is blocked)."""
+    repo, _ = _init_repo(tmp_path)
+    example = repo / ".githooks" / "vendor-watchlist.example.txt"
+    bad_file = repo / "notes.md"
+    bad_file.write_text(f"tested on {_FAKE_UC_MODEL} hardware\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "notes.md"], check=True, capture_output=True)
+    result = _run_hook(repo, example)
+    assert result.returncode != 0, "upper-case run-together model should block via example regex"
+
+    subprocess.run(["git", "-C", str(repo), "reset"], check=True, capture_output=True)
+    ok_file = repo / "ok.md"
+    ok_file.write_text("the S608 and E501 lint codes are suppressed here\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "ok.md"], check=True, capture_output=True)
+    result2 = _run_hook(repo, example)
+    assert result2.returncode == 0, f"a lint code must pass; stdout={result2.stdout!r}"
+
+
 def test_hook_blocks_lowercase_runtogether_model(tmp_path: Path) -> None:
-    """A lowercase, no-hyphen model (e.g. dcs932) in diff content is blocked by the example."""
+    """A lowercase, no-hyphen model-shaped token in diff content is blocked by the example."""
     repo, _ = _init_repo(tmp_path)
     example = repo / ".githooks" / "vendor-watchlist.example.txt"
     bad_file = repo / "notes.md"

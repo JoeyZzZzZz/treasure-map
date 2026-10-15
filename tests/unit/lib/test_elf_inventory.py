@@ -20,8 +20,8 @@ from treasure_map.lib.analyze.elf_inventory import (
 )
 
 FIXTURES = Path(__file__).parent.parent.parent / "fixtures" / "elfs"
-TRUE_ELF = FIXTURES / "true_x86_64"
-LIBZ_ELF = FIXTURES / "libz_x86_64.so"
+EXE_ELF = FIXTURES / "exe_x86_64"
+LIB_ELF = FIXTURES / "libfixture_x86_64.so"
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -34,11 +34,11 @@ def _skip_if_missing(path: Path) -> pytest.MarkDecorator:
 # ── has_substantial_text (red-line: tell a failed empty from a code-free empty) ──────
 
 
-@_skip_if_missing(LIBZ_ELF)
+@_skip_if_missing(LIB_ELF)
 def test_has_substantial_text_true_on_code_binary() -> None:
     # A real shared library carries an executable .text section -> a 0-function result would be a
     # FAILED analysis, not "clean".
-    assert has_substantial_text(LIBZ_ELF) is True
+    assert has_substantial_text(LIB_ELF) is True
 
 
 def test_has_substantial_text_false_on_non_elf(tmp_path: Path) -> None:
@@ -52,9 +52,9 @@ def test_has_substantial_text_false_on_non_elf(tmp_path: Path) -> None:
 # ── detect_arch ────────────────────────────────────────────────────────────────
 
 
-@_skip_if_missing(TRUE_ELF)
+@_skip_if_missing(EXE_ELF)
 def test_detect_arch_x86_64(tmp_path):
-    arch = detect_arch(TRUE_ELF)
+    arch = detect_arch(EXE_ELF)
     assert arch == "x86:LE:64:default"
 
 
@@ -71,24 +71,24 @@ def test_detect_arch_non_elf(tmp_path):
 # ── get_elf_type ───────────────────────────────────────────────────────────────
 
 
-@_skip_if_missing(TRUE_ELF)
+@_skip_if_missing(EXE_ELF)
 def test_get_elf_type_executable():
-    # true_x86_64 is a PIE (ET_DYN with interpreter), but raw type check is ET_DYN
-    result = get_elf_type(TRUE_ELF)
+    # exe_x86_64 is a PIE (ET_DYN with interpreter), but raw type check is ET_DYN
+    result = get_elf_type(EXE_ELF)
     assert result in ("executable", "shared_library")
 
 
-@_skip_if_missing(LIBZ_ELF)
+@_skip_if_missing(LIB_ELF)
 def test_get_elf_type_shared_library():
-    assert get_elf_type(LIBZ_ELF) == "shared_library"
+    assert get_elf_type(LIB_ELF) == "shared_library"
 
 
 # ── has_loadable_segments ──────────────────────────────────────────────────────
 
 
-@_skip_if_missing(TRUE_ELF)
+@_skip_if_missing(EXE_ELF)
 def test_has_loadable_segments_real_elf():
-    assert has_loadable_segments(TRUE_ELF) is True
+    assert has_loadable_segments(EXE_ELF) is True
 
 
 def test_has_loadable_segments_empty_file(tmp_path):
@@ -110,9 +110,9 @@ def test_sha256_file(tmp_path):
 # ── get_dt_needed ──────────────────────────────────────────────────────────────
 
 
-@_skip_if_missing(TRUE_ELF)
+@_skip_if_missing(EXE_ELF)
 def test_get_dt_needed_has_entries():
-    deps = get_dt_needed(TRUE_ELF)
+    deps = get_dt_needed(EXE_ELF)
     assert isinstance(deps, list)
     # /usr/bin/true links against libc at minimum
     assert any("libc" in d for d in deps)
@@ -121,7 +121,7 @@ def test_get_dt_needed_has_entries():
 # ── scan_filesystem ────────────────────────────────────────────────────────────
 
 
-@_skip_if_missing(TRUE_ELF)
+@_skip_if_missing(EXE_ELF)
 def test_scan_filesystem_finds_elfs(tmp_path):
     # Build a mini fs_root with the two fixtures
     fs = tmp_path / "rootfs"
@@ -129,14 +129,14 @@ def test_scan_filesystem_finds_elfs(tmp_path):
     lib_dir = fs / "lib"
     bin_dir.mkdir(parents=True)
     lib_dir.mkdir(parents=True)
-    shutil.copy(TRUE_ELF, bin_dir / "true")
-    shutil.copy(LIBZ_ELF, lib_dir / "libz.so")
+    shutil.copy(EXE_ELF, bin_dir / "exe")
+    shutil.copy(LIB_ELF, lib_dir / "libfixture.so")
 
     records = scan_filesystem(fs)
     assert len(records) == 2
     names = {r.name for r in records}
-    assert "true" in names
-    assert "libz.so" in names
+    assert "exe" in names
+    assert "libfixture.so" in names
 
 
 def test_scan_filesystem_skips_non_elf(tmp_path):
@@ -150,24 +150,24 @@ def test_scan_filesystem_skips_non_elf(tmp_path):
 
 def test_scan_filesystem_deduplicates(tmp_path):
     """Two files with the same content → only one ElfRecord."""
-    if not TRUE_ELF.exists():
+    if not EXE_ELF.exists():
         pytest.skip("fixture missing")
     fs = tmp_path / "rootfs"
     (fs / "bin").mkdir(parents=True)
     (fs / "usr" / "bin").mkdir(parents=True)
-    shutil.copy(TRUE_ELF, fs / "bin" / "true")
-    shutil.copy(TRUE_ELF, fs / "usr" / "bin" / "true")  # identical content
+    shutil.copy(EXE_ELF, fs / "bin" / "exe")
+    shutil.copy(EXE_ELF, fs / "usr" / "bin" / "exe")  # identical content
     records = scan_filesystem(fs)
     assert len(records) == 1
 
 
 def test_scan_filesystem_skips_symlinks(tmp_path):
-    if not TRUE_ELF.exists():
+    if not EXE_ELF.exists():
         pytest.skip("fixture missing")
     fs = tmp_path / "rootfs" / "bin"
     fs.mkdir(parents=True)
-    real = fs / "true"
-    shutil.copy(TRUE_ELF, real)
+    real = fs / "exe"
+    shutil.copy(EXE_ELF, real)
     link = fs / "true_link"
     link.symlink_to(real)
     records = scan_filesystem(tmp_path / "rootfs")
@@ -210,7 +210,7 @@ def test_a_binary_without_section_headers_is_read_from_its_program_headers(tmp_p
     section only -> it needs nothing -> RED."""
     from treasure_map.lib.analyze.elf_inventory import get_dt_needed, has_substantial_text
 
-    src = Path(__file__).resolve().parents[2] / "fixtures" / "elfs" / "true_x86_64"
+    src = Path(__file__).resolve().parents[2] / "fixtures" / "elfs" / "exe_x86_64"
     stripped = _sstrip(src, tmp_path / "true_stripped")
     assert has_substantial_text(stripped)
     assert get_dt_needed(stripped) == get_dt_needed(src) != []

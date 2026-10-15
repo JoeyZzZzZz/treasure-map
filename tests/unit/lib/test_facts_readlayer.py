@@ -45,11 +45,11 @@ def _mkdb(tmp_path: Path) -> Path:
         "INSERT INTO functions (id, binary_id, name, address, pseudocode, callees, is_exported) "
         "VALUES (3, 2, 'foo_entry', '0x500', 'int foo_entry(){}', '[]', 1)"
     )
-    # a function whose address is stored in the real zero-padded 8-hex form (00038de8), with no
+    # a function whose address is stored in the real zero-padded 8-hex form (0040a020), with no
     # caller of any kind: exercises address normalization (item 1) and the indirect-call note (2).
     conn.execute(
         "INSERT INTO functions (id, binary_id, name, address, pseudocode, callees, is_exported) "
-        "VALUES (4, 1, 'netool_handler', '00038de8', 'int netool_handler(){}', '[]', 0)"
+        "VALUES (4, 1, 'linktool_handler', '0040a020', 'int linktool_handler(){}', '[]', 0)"
     )
     # cross-binary xref: webd.handle_req -> libfoo.foo_entry
     conn.execute(
@@ -108,7 +108,7 @@ def _mkdb(tmp_path: Path) -> Path:
     )
     conn.execute(
         "INSERT INTO strings (binary_id, value, address, category) "
-        "VALUES (1, '/var/run/netool_socket', '00073d5c', 'path')"
+        "VALUES (1, '/var/run/linktool_socket', '00073d5c', 'path')"
     )
     conn.execute(
         "INSERT INTO imports (binary_id, func_name, lib_soname) "
@@ -164,6 +164,24 @@ def test_get_pseudocode_missing_is_not_found(tmp_path: Path) -> None:
     conn.close()
 
 
+def test_a_sha256_selects_the_binary_for_a_function_lookup(tmp_path: Path) -> None:
+    """``binary`` accepts a sha256 or a >= 8-hex prefix of one, as the MCP contract says. The
+    function-anchored reads used to match only the short name or the path, so the digest an
+    ambiguous answer hands back came back not found.
+
+    MUTATION: drop the sha256 terms from ``_binary_selector`` -> RED."""
+    conn = _ro(tmp_path)
+    for selector in ("a" * 64, "a" * 12, "A" * 12):
+        r = facts.get_pseudocode(conn, func="handle_req", binary=selector)
+        assert r["found"] is True, selector
+        assert r["anchor"]["binary"] == "webd"
+    # the digest of the OTHER binary does not find a function that lives in this one
+    assert facts.get_pseudocode(conn, func="handle_req", binary="b" * 64)["found"] is False
+    hits = facts.get_functions_referencing_string(conn, text="do_cmd", binary="a" * 16)
+    assert [h["function"] for h in hits["functions"]] == ["handle_req"]
+    conn.close()
+
+
 def test_get_callees_marks_intra_binary_resolution(tmp_path: Path) -> None:
     conn = _ro(tmp_path)
     r = facts.get_callees(conn, func="handle_req")
@@ -188,7 +206,7 @@ def test_get_xrefs_callers_and_callees_cross_binary(tmp_path: Path) -> None:
 
 
 def test_get_xrefs_address_taken_literalpool_names_the_registrar(tmp_path: Path) -> None:
-    # ★ flagship shape (the messagingagent case): F's address is taken in a .text literal-pool
+    # ★ flagship shape (the notifyagent case): F's address is taken in a .text literal-pool
     # `ldr =F` inside a registrar, so taken_in_func names WHO registered F — the answer get_xrefs
     # callers can't give (a runtime/heap registration has no direct caller edge). taken_at is
     # canonicalized with the SAME _norm_addr as evidence_ref (0x-free, zero-padded 8-hex).
@@ -252,7 +270,7 @@ def _trunc_db(tmp_path: Path) -> Path:
         "VALUES (2, 'httpd', 'usr/sbin/httpd', ?, 2, 0, '2026-01-01T00:00:00')",
         ("b" * 64,),
     )
-    conn.execute("INSERT INTO strings (binary_id, value, address) VALUES (1, 'sw_mode', '0x10')")
+    conn.execute("INSERT INTO strings (binary_id, value, address) VALUES (1, 'node_role', '0x10')")
     conn.execute("INSERT INTO strings (binary_id, value, address) VALUES (2, 'lan_ip', '0x20')")
     conn.execute("INSERT INTO strings (binary_id, value, address) VALUES (2, 'wan_ip', '0x24')")
     conn.commit()
@@ -355,13 +373,13 @@ def test_get_script_callsites_is_entry_evidence(tmp_path: Path) -> None:
 
 
 def test_get_pseudocode_address_forms_all_resolve(tmp_path: Path) -> None:
-    # The real schema stores 00038de8; a consumer may type the address any of these ways.
+    # The real schema stores 0040a020; a consumer may type the address any of these ways.
     conn = _ro(tmp_path)
-    # 0x38de8 == 232936 decimal; all forms must resolve to the same stored 00038de8.
-    for form in ("0x38de8", "38de8", "00038de8", "232936", "FUN_00038de8"):
+    # 0x40a020 == 4235296 decimal; all forms must resolve to the same stored 0040a020.
+    for form in ("0x40a020", "40a020", "0040a020", "4235296", "FUN_0040a020"):
         r = facts.get_pseudocode(conn, func=form)
         assert r["found"] is True, form
-        assert r["anchor"]["function"] == "netool_handler", form
+        assert r["anchor"]["function"] == "linktool_handler", form
     conn.close()
 
 
@@ -385,10 +403,10 @@ def test_get_xrefs_callers_recovered_from_callee_lists(tmp_path: Path) -> None:
 
 
 def test_get_xrefs_no_callers_is_honest_about_indirect(tmp_path: Path) -> None:
-    # netool_handler has no caller of any kind -> none found, with the indirect-call note so a
+    # linktool_handler has no caller of any kind -> none found, with the indirect-call note so a
     # true unresolved (dispatch-table) caller is not mistaken for "genuinely uncalled".
     conn = _ro(tmp_path)
-    r = facts.get_xrefs(conn, func="netool_handler", direction="callers")
+    r = facts.get_xrefs(conn, func="linktool_handler", direction="callers")
     assert r["edges"] == []
     assert "indirect" in r["note"] and "dispatch-table" in r["note"]
     conn.close()
@@ -396,9 +414,9 @@ def test_get_xrefs_no_callers_is_honest_about_indirect(tmp_path: Path) -> None:
 
 def test_get_strings_by_value_locates_with_binary_and_note(tmp_path: Path) -> None:
     conn = _ro(tmp_path)
-    r = facts.get_strings(conn, value="netool_socket")
+    r = facts.get_strings(conn, value="linktool_socket")
     (hit,) = r["strings"]
-    assert hit["value"] == "/var/run/netool_socket"
+    assert hit["value"] == "/var/run/linktool_socket"
     assert hit["address"] == "00073d5c"
     assert hit["binary"] == "webd"
     # honest boundary: reverse "which function references this string" is not provided
@@ -598,7 +616,7 @@ def _mk_refdb(tmp_path: Path) -> Path:
     )
     conn.execute(
         "INSERT INTO functions (id, binary_id, name, address, pseudocode, callees) "
-        "VALUES (1, 1, 'caller', '0x100', 'void caller(){ set_iperf3_svr(v); }', '[]')"
+        "VALUES (1, 1, 'caller', '0x100', 'void caller(){ set_perf_svr(v); }', '[]')"
     )
     conn.execute(
         "INSERT INTO functions (id, binary_id, name, address, pseudocode, callees) "
@@ -606,7 +624,7 @@ def _mk_refdb(tmp_path: Path) -> Path:
     )
     conn.execute(
         "INSERT INTO functions (id, binary_id, name, address, pseudocode, callees) VALUES "
-        "(3, 2, 'commented', '0x300', 'void commented(){ /* calls set_iperf3_svr later */ x(); }', "
+        "(3, 2, 'commented', '0x300', 'void commented(){ /* calls set_perf_svr later */ x(); }', "
         "'[]')"
     )
     conn.commit()
@@ -617,7 +635,7 @@ def _mk_refdb(tmp_path: Path) -> Path:
 def test_referencing_string_matches_only_referencing_functions(tmp_path: Path) -> None:
     conn = facts.open_analysis_ro(_mk_refdb(tmp_path))
     try:
-        r = facts.get_functions_referencing_string(conn, text="set_iperf3_svr")
+        r = facts.get_functions_referencing_string(conn, text="set_perf_svr")
     finally:
         conn.close()
     names = {f["function"] for f in r["functions"]}
@@ -631,10 +649,10 @@ def test_referencing_string_matches_only_referencing_functions(tmp_path: Path) -
 def test_referencing_string_binary_filter(tmp_path: Path) -> None:
     conn = facts.open_analysis_ro(_mk_refdb(tmp_path))
     try:
-        webd = facts.get_functions_referencing_string(conn, text="set_iperf3_svr", binary="webd")
-        apid = facts.get_functions_referencing_string(conn, text="set_iperf3_svr", binary="apid")
+        webd = facts.get_functions_referencing_string(conn, text="set_perf_svr", binary="webd")
+        apid = facts.get_functions_referencing_string(conn, text="set_perf_svr", binary="apid")
         by_path = facts.get_functions_referencing_string(
-            conn, text="set_iperf3_svr", binary="sbin/apid"
+            conn, text="set_perf_svr", binary="sbin/apid"
         )
     finally:
         conn.close()
@@ -648,19 +666,19 @@ def test_referencing_string_hit_in_comment_is_a_text_match(tmp_path: Path) -> No
     # is a pseudocode TEXT substring match, not a resolved symbol reference. The result says so.
     conn = facts.open_analysis_ro(_mk_refdb(tmp_path))
     try:
-        r = facts.get_functions_referencing_string(conn, text="set_iperf3_svr", binary="apid")
+        r = facts.get_functions_referencing_string(conn, text="set_perf_svr", binary="apid")
     finally:
         conn.close()
     (hit,) = r["functions"]
     assert hit["function"] == "commented"
-    assert "calls set_iperf3_svr later" in hit["match_line"]  # the matched line snippet
+    assert "calls set_perf_svr later" in hit["match_line"]  # the matched line snippet
     assert r["match_kind"] == "pseudocode_text_substring"
     assert "text" in r["note"].lower() and "not a resolved symbol" in r["note"].lower()
 
 
 def test_referencing_string_underscore_is_literal_not_wildcard(tmp_path: Path) -> None:
     # LIKE treats '_' as a single-char wildcard; the reverse lookup escapes it so a name full of
-    # underscores does not over-match. 'set_iperf3_svr' must NOT match 'setXiperf3Ysvr'.
+    # underscores does not over-match. 'set_perf_svr' must NOT match 'setXiperf3Ysvr'.
     db = tmp_path / "esc.db"
     conn = open_db(db)
     conn.execute(
@@ -670,7 +688,7 @@ def test_referencing_string_underscore_is_literal_not_wildcard(tmp_path: Path) -
     )
     conn.execute(
         "INSERT INTO functions (id, binary_id, name, address, pseudocode, callees) "
-        "VALUES (1, 1, 'exact', '0x1', 'void exact(){ set_iperf3_svr(v); }', '[]')"
+        "VALUES (1, 1, 'exact', '0x1', 'void exact(){ set_perf_svr(v); }', '[]')"
     )
     conn.execute(
         "INSERT INTO functions (id, binary_id, name, address, pseudocode, callees) "
@@ -680,7 +698,7 @@ def test_referencing_string_underscore_is_literal_not_wildcard(tmp_path: Path) -
     conn.close()
     ro = facts.open_analysis_ro(db)
     try:
-        r = facts.get_functions_referencing_string(ro, text="set_iperf3_svr")
+        r = facts.get_functions_referencing_string(ro, text="set_perf_svr")
     finally:
         ro.close()
     assert {f["function"] for f in r["functions"]} == {"exact"}  # underscore matched literally

@@ -21,7 +21,7 @@ instruction's own address), first rule that applies:
 6. ``name_only``       the name and nothing else.
 
 Every address is normalized with ``refs._norm_addr`` before it is compared or used as a key — the
-extractor writes ``op_addr`` and the unresolved-stub list unpadded (``0x56ff0``), and an
+extractor writes ``op_addr`` and the unresolved-stub list unpadded (``0x4114f4``), and an
 unnormalized key would simply never match, without any error.
 
 This is a FACT about what the call token names, never a verdict; an address with no identity says

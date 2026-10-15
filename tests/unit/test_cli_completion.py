@@ -26,14 +26,14 @@ def test_scan_w_completion_suggests_existing_workspaces(
 ) -> None:
     wsdir = tmp_path / "ws"
     wsdir.mkdir()
-    for n in ("rt_ax55_unpatched", "rt_ax55_patched", "miwifi_rn02"):
+    for n in ("router_a_unpatched", "router_a_patched", "router_c"):
         (wsdir / n).mkdir()
     _fake_config(monkeypatch, workspace_dir=wsdir, atlas=tmp_path / "atlas.db")
 
     # a prefix narrows to matching existing names (helps re-scan without a typo)
-    assert sorted(c.value for c in _complete_workspace(None, None, "rt")) == [  # type: ignore[arg-type]
-        "rt_ax55_patched",
-        "rt_ax55_unpatched",
+    assert sorted(c.value for c in _complete_workspace(None, None, "router_a")) == [  # type: ignore[arg-type]
+        "router_a_patched",
+        "router_a_unpatched",
     ]
     # empty prefix -> all workspaces
     assert len(_complete_workspace(None, None, "")) == 3  # type: ignore[arg-type]
@@ -63,7 +63,7 @@ def test_run_id_completion_suggests_atlas_runs(
         structural_fingerprint="fp",
         fingerprint_algo_version="callseq-v1",
     )
-    for rid in ("rt_ax55_unpatched", "miwifi_rn02"):
+    for rid in ("router_a_unpatched", "router_c"):
         add_instance(
             conn,
             InstanceRow(
@@ -83,10 +83,10 @@ def test_run_id_completion_suggests_atlas_runs(
     _fake_config(monkeypatch, workspace_dir=tmp_path / "ws", atlas=atlas)
 
     assert sorted(c.value for c in _complete_run_id(None, None, "")) == [  # type: ignore[arg-type]
-        "miwifi_rn02",
-        "rt_ax55_unpatched",
+        "router_a_unpatched",
+        "router_c",
     ]
-    assert [c.value for c in _complete_run_id(None, None, "rt")] == ["rt_ax55_unpatched"]  # type: ignore[arg-type]
+    assert [c.value for c in _complete_run_id(None, None, "router_a")] == ["router_a_unpatched"]  # type: ignore[arg-type]
 
 
 def test_run_id_completion_is_empty_and_safe_without_atlas(

@@ -94,7 +94,7 @@ def _open_fact_db(analysis_db: str) -> Any:
 
 @click.group(
     name="fact",
-    short_help="Read structured facts (same as an agent sees via MCP — for manual cross-check)",
+    short_help="Read a few of the MCP facts by hand (pseudocode, disassembly, callees, xrefs, …)",
 )
 def fact() -> None:
     """Read structured facts from an analysis database (the layer MCP also serves)."""

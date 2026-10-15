@@ -284,7 +284,7 @@ def _aligned_callee_set(
       - else (name missing or an address-derived FUN_/thunk_ name) the ADDRESS anchor: an A callee
         maps forward via function_alignment (``addr:<addr_b>``), a B callee uses its own addr. ★ Bug
         D: every address is canonicalized with norm_hex BEFORE it is looked up or emitted, so a raw
-        ``0x30664`` and an aligned ``00030664`` are one identity (two before -> 100% miss);
+        ``0x4129a8`` and an aligned ``004129a8`` are one identity (two before -> 100% miss);
       - else (no address either) -> callee_unalignable (honest undetermined, no fabricated id).
 
     ``spaces`` reports which anchor spaces this side used ({'name'}/{'addr'}/both) so the caller
@@ -511,8 +511,8 @@ def _completeness_guard(
     ★ STATIC-TABLE-SPECIFIC boundary (weaker): a static_string_table edge has anchor=None and no
     per-function region, so the counterpart side's completeness CANNOT be verified -- only the
     present side is checked. A static-table edge that one side's table detector silently missed can
-    therefore read as layer_changed. (Small blast radius -- ~546 rows -- and the present side is
-    still completeness-checked, but omitting it would be dishonest.)"""
+    therefore read as layer_changed. (Small blast radius -- a few hundred rows at most -- and the
+    present side is still completeness-checked, but omitting it would be dishonest.)"""
     anchor = canonical[3]
     # present side(s) must be complete
     if a is not None and a.completeness != {"complete"}:

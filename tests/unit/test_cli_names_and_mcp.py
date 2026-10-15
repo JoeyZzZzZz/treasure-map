@@ -48,8 +48,8 @@ def test_help_is_grouped_into_three_sections() -> None:
 def test_help_fact_points_at_the_mcp_equivalence_and_stages_are_labelled() -> None:
     out = CliRunner().invoke(main, ["--help"]).output
     flat = " ".join(out.split())
-    # fact is the human cross-check of what an agent sees via MCP — say so.
-    assert "Read structured facts (same as an agent sees via MCP" in flat
+    # fact is a hand-run subset of the MCP facts — it says so, without claiming parity.
+    assert "Read a few of the MCP facts by hand" in flat
     # the advanced single-stage commands are labelled as scan's stages.
     assert "scan's 1st stage" in flat and "scan's 2nd stage" in flat and "scan's 3rd stage" in flat
 

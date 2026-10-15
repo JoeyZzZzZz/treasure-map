@@ -163,8 +163,8 @@ def test_ingest_parses_router_defaults_located(tmp_path: Path) -> None:
                 "located": True,
                 "symbol_addr": "0x884e4",
                 "members": [
-                    {"index": 0, "key": "sw_mode", "flags": 0, "default_value": "0"},
-                    {"index": 894, "key": "oauth_auth_code", "flags": 128, "default_value": ""},
+                    {"index": 0, "key": "node_role", "flags": 0, "default_value": "0"},
+                    {"index": 894, "key": "acct_link_code", "flags": 128, "default_value": ""},
                 ],
                 "unresolved_members": [{"index": 900}],
                 "truncated": False,
@@ -176,8 +176,8 @@ def test_ingest_parses_router_defaults_located(tmp_path: Path) -> None:
         r[0]: (r[1], r[2])
         for r in conn.execute("SELECT member_index, key, default_value FROM nvram_defaults")
     }
-    assert rows[0] == ("sw_mode", "0")
-    assert rows[894] == ("oauth_auth_code", "")  # empty-string default preserved, not null
+    assert rows[0] == ("node_role", "0")
+    assert rows[894] == ("acct_link_code", "")  # empty-string default preserved, not null
     assert rows[900] == (None, None)  # unresolved member recorded as a key=NULL row
     conn.close()
 
@@ -221,14 +221,14 @@ def test_ingest_parses_string_tables(tmp_path: Path) -> None:
             "string_tables": {
                 "tables": [
                     {
-                        "table_addr": "0x74920",
+                        "table_addr": "0x445b58",
                         "stride": 8,
                         "count": 2,
                         "entries": [
                             {
-                                "key": "nvram_dump",
-                                "func_name": "FUN_000561e4",
-                                "func_addr": "0x000561e4",
+                                "key": "cfg_dump",
+                                "func_name": "FUN_0042741c",
+                                "func_addr": "0x0042741c",
                                 "func_kind": "direct",
                             },
                             {
@@ -256,11 +256,11 @@ def test_ingest_parses_string_tables(tmp_path: Path) -> None:
             "completeness_scope FROM string_tables"
         )
     }
-    assert rows["nvram_dump"][:4] == ("FUN_000561e4", "0x000561e4", "direct", 0)
+    assert rows["cfg_dump"][:4] == ("FUN_0042741c", "0x0042741c", "direct", 0)
     assert rows["sys_reboot"][:4] == ("do_reboot", "0x00011000", "direct", 1)
     # the detector-level completeness rides on every row (incomplete by construction)
     st = conn.execute(
-        "SELECT completeness_status, completeness_scope FROM string_tables WHERE key='nvram_dump'"
+        "SELECT completeness_status, completeness_scope FROM string_tables WHERE key='cfg_dump'"
     ).fetchone()
     assert st[0] == "incomplete"
     assert st[1] == "absolute_2field_only"
@@ -402,7 +402,7 @@ def test_ingest_stores_a2_wrapper_fields(tmp_path: Path) -> None:
                     "callees": ["wget"],
                     "pseudocode": "void biz(void){}",
                     "wrapper_call_args": [
-                        {"callee": "wget", "key": "sw_mode", "key_kind": "constant"}
+                        {"callee": "wget", "key": "node_role", "key_kind": "constant"}
                     ],
                 },
                 {"name": "plain", "address": "3000", "callees": [], "pseudocode": "void p(){}"},
@@ -418,7 +418,7 @@ def test_ingest_stores_a2_wrapper_fields(tmp_path: Path) -> None:
         for r in conn.execute("SELECT name, nvram_wrapper, wrapper_call_args FROM functions")
     }
     assert json.loads(rows["wget"][0]) == {"op": "read", "api": "nvram_get"}
-    assert json.loads(rows["biz"][1])[0]["key"] == "sw_mode"
+    assert json.loads(rows["biz"][1])[0]["key"] == "node_role"
     assert rows["plain"][0] is None and json.loads(rows["plain"][1]) == []
     conn.close()
 
@@ -696,14 +696,14 @@ def test_ingest_replaces_existing_rows(tmp_path: Path) -> None:
 
 
 def test_ingest_persists_nvram_ops(tmp_path: Path) -> None:
-    """gap② transport: a function's nvram_ops array round-trips into the column verbatim."""
+    """transport: a function's nvram_ops array round-trips into the column verbatim."""
     conn, sha_to_id = _setup_db(tmp_path)
     output_dir = tmp_path / "ghidra_output"
     ops = [
         {
             "api": "nvram_set",
             "op": "write",
-            "key": "sw_mode",
+            "key": "node_role",
             "key_kind": "constant",
             "value_source": {"kind": "param", "name": "param_2"},
         },
@@ -785,8 +785,8 @@ def _ingest_with_resolution(
                     "name": "handler",
                     "address": "1000",
                     "size": 64,
-                    "callees": ["FUN_004125b0"],
-                    "pseudocode": "void handler(char *c){ FUN_004125b0(c); }",
+                    "callees": ["FUN_0041eb38"],
+                    "pseudocode": "void handler(char *c){ FUN_0041eb38(c); }",
                 }
             ],
             "imports": [],
@@ -819,10 +819,10 @@ def test_a_resolved_stub_table_is_stored_for_the_binary(tmp_path: Path, monkeypa
         tmp_path,
         monkeypatch,
         StubResolution(
-            names={0x4125B0: "system", 0x412450: "popen"}, regions=((0x412400, 0x413000),)
+            names={0x41EB38: "system", 0x41E9D8: "popen"}, regions=((0x41E988, 0x41F588),)
         ),
     )
-    assert json.loads(str(stored)) == {"4125b0": "system", "412450": "popen"}
+    assert json.loads(str(stored)) == {"41eb38": "system", "41e9d8": "popen"}
 
 
 def test_read_but_empty_is_not_the_same_as_not_determined(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -916,11 +916,11 @@ def test_ingest_checks_the_stub_marker_against_this_binarys_table(
 
     MUTATION (verified RED): drop the stub_marker comparison from EC3 -> the mismatching exports
     are ingested."""
-    resolution = StubResolution(names={0x4125B0: "system"}, regions=())
+    resolution = StubResolution(names={0x41EB38: "system"}, regions=())
     monkeypatch.setattr(ingest_mod, "resolve_stubs", lambda path: resolution)
     rec = _make_record("test_bin", "a" * 64)
     good = stub_table_marker(resolution.names)
-    for marker in ("none", stub_table_marker({0x4125B0: "popen"}), None):
+    for marker in ("none", stub_table_marker({0x41EB38: "popen"}), None):
         case = tmp_path / f"bad_{marker}"
         case.mkdir()
         conn, sha_to_id = _setup_db(case)

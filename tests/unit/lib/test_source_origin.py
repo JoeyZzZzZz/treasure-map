@@ -46,7 +46,7 @@ _LEAD = {
     "hops": 1,
     "key": "relay",
     "mechanism": "strcmp_gate",
-    "through": "FUN_0001437c",
+    "through": "FUN_0040ef58",
     "via": "string_keyed_edge",
 }
 
@@ -129,7 +129,7 @@ def test_source_origin_never_changes_the_verdict(
     being a claim about today's code.
 
     MUTATION (must go RED, verified by deliberately breaking the build): make any verdict exit in
-    `_controllability_reading` consult `source_origin`. On a real atlas that moved 1685 candidates
+    `_controllability_reading` consult `source_origin`. On a real atlas that moves many candidates
     into proven:controllable; here it changes at least the case whose evidence carries a lead."""
     conn = _atlas(tmp_path)
     try:
@@ -226,7 +226,7 @@ def test_dispatch_origin_carries_the_leads_real_fields(tmp_path: Path) -> None:
         "axis": "dispatch",
         "endpoint": "relay",
         "mechanism": "strcmp_gate",
-        "through": "FUN_0001437c",
+        "through": "FUN_0040ef58",
         "lead_via": "string_keyed_edge",
         "hops": 1,
     }
@@ -309,7 +309,7 @@ def test_nvram_origin_found_inside_a_writer_vararg(tmp_path: Path) -> None:
 
 def test_call_return_origin_is_stated_unresolved(tmp_path: Path) -> None:
     """A call nobody has classified is still an origin — and is marked unresolved rather than
-    dressed up. Real data makes the point: the commonest such callees are `get_wanx_ifname`,
+    dressed up. Real data makes the point: the commonest such callees are `get_uplink_ifname`,
     `dcgettext`, `strsep`. Naming where a value came back from is a lead; deciding what that means
     is the reader's, and `resolved: false` is what keeps the two apart."""
     conn = _atlas(tmp_path)
@@ -320,7 +320,7 @@ def test_call_return_origin_is_stated_unresolved(tmp_path: Path) -> None:
                 "sink_arg_provenance": [
                     {
                         "sink": "system",
-                        "provenance": {"kind": "call_return", "callee": "get_wanx_ifname"},
+                        "provenance": {"kind": "call_return", "callee": "get_uplink_ifname"},
                     }
                 ]
             },
@@ -330,7 +330,7 @@ def test_call_return_origin_is_stated_unresolved(tmp_path: Path) -> None:
     assert out is not None
     assert out["origins"][0] == {
         "axis": "call_return",
-        "callee": "get_wanx_ifname",
+        "callee": "get_uplink_ifname",
         "resolved": False,
     }
 
@@ -356,7 +356,7 @@ def test_cross_reference_states_membership_not_control(tmp_path: Path) -> None:
                     default_value="dhcp",
                     flags=0,
                     member_index=0,
-                    binary="libshared",
+                    binary="libcommon",
                 )
             ],
         )

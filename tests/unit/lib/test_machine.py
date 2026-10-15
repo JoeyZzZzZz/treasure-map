@@ -85,7 +85,7 @@ def test_mem_total_mb_unreadable_is_conservative(tmp_path: Path) -> None:
 
 
 def test_derive_parallelism_takes_the_smaller_arm() -> None:
-    # owner machine: 6 cores / 9945MB -> cpu=6, mem=9945*0.6//1024=5 -> 5.
+    # a reference machine: 6 cores / 9945MB -> cpu=6, mem=9945*0.6//1024=5 -> 5.
     assert derive_parallelism(6, 9945) == 5
     # many cores, same memory -> memory caps it at 5 (not 12).
     assert derive_parallelism(12, 9945) == 5
@@ -118,7 +118,7 @@ def test_memory_arm_is_load_bearing() -> None:
 
 
 def test_clamp_reduces_when_memory_tight() -> None:
-    # owner machine snapshot: 1316MB available -> 5 JVMs would need ~5GB -> clamp to 1.
+    # a reference machine snapshot: 1316MB available -> 5 JVMs would need ~5GB -> clamp to 1.
     eff, note = clamp_parallelism_to_memory(5, avail_mb=1316)
     assert eff == 1
     assert note is not None and "parallelism 5->1" in note

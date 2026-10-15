@@ -230,8 +230,8 @@ def build_flow_evidence(
     """Assemble the five-field flow evidence for one command-sink candidate (JSON-serializable).
 
     Pure and deterministic. ``entry_sites`` is the rootfs invocation evidence gathered separately
-    (see ``find_entry_sites``); None or [] means none was found — reported as ``unknown``, NOT as
-    "unreachable".
+    (see ``EntryIndex.sites_for``); None or [] means none was found — reported as ``unknown``,
+    NOT as "unreachable".
 
     ``wrapper`` is set for a factor-① wrapper-propagated candidate (the real sink is one hop away
     inside a thin wrapper): it carries the wrapper's name + wrapped_sink, and here ``sink_arg`` is

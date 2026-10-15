@@ -303,7 +303,7 @@ def test_reachability_web_note_carries_endpoint_and_method(tmp_path: Path) -> No
 def test_reachability_entry_note_has_two_caveats_and_no_pre_auth(tmp_path: Path) -> None:
     # ★ seam (reachability-caveat contract, mechanistic-label invariant): an entry:web note carries
     # BOTH the standard-flow caveat (textual reference != dispatch proof) and the completeness
-    # caveat (service-dispatch/notify_rc unmodeled), and NEVER a pre-auth/attack-surface claim.
+    # caveat (service-dispatch bridges unmodeled), and NEVER a pre-auth/attack-surface claim.
     conn = _atlas(tmp_path)
     p = _pattern(conn, "fp", sink_class="cmd", source_class="external_input")
     _inst(conn, p, fn="web_fn", entry_reach="entry:web")
@@ -312,7 +312,7 @@ def test_reachability_entry_note_has_two_caveats_and_no_pre_auth(tmp_path: Path)
     for fn in ("web_fn", "script_fn"):
         note = by_fn[fn].dim("reachability").note.lower()
         assert "not proof" in note or "textual reference" in note  # standard-flow caveat
-        assert "notify_rc" in note and "not modeled" in note  # completeness caveat
+        assert "service-dispatch" in note and "not modeled" in note  # completeness caveat
         assert "pre-auth" not in note  # mechanistic label, never a pre-auth attack-surface claim
     # entry:script must NOT read as 'probably unreachable' (a gap is not lower reachability).
     assert "probably unreachable" not in by_fn["script_fn"].dim("reachability").note.lower()
@@ -768,12 +768,14 @@ def test_external_input_builds_param_source_and_floats_above_nonparam(tmp_path: 
     conn = _atlas(tmp_path)
     ext = _pattern(conn, "fp_ext", sink_class="cmd", source_class="external_input")
     non = _pattern(conn, "fp_non", sink_class="cmd", source_class="unknown")
-    _inst(conn, ext, fn="netool")  # external_input, source_kind unknown -> controllability unknown
+    _inst(
+        conn, ext, fn="linktool"
+    )  # external_input, source_kind unknown -> controllability unknown
     _inst(conn, non, fn="plain_unknown")  # non-external, controllability unknown
     ranked = triage(conn)
-    param = next(c for c in ranked if c.function == "netool")
+    param = next(c for c in ranked if c.function == "linktool")
     assert param.dim("source").state == "structural" and param.dim("source").value == "param"
-    assert [c.function for c in ranked] == ["netool", "plain_unknown"]  # param floats above
+    assert [c.function for c in ranked] == ["linktool", "plain_unknown"]  # param floats above
     plain = next(c for c in ranked if c.function == "plain_unknown")
     assert plain.dim("source").value != "param"  # non-external: no param signal
     conn.close()
@@ -1413,12 +1415,12 @@ def test_every_view_carries_a_when_to_use_note() -> None:
     assert canonical_view("reachable-only") == "reachable-first"
     # reachable-first FLOATS (not prunes) and must stay honest: a mechanistic reference (web-asset
     # endpoint or boot script), NOT call-graph reachability, an INCOMPLETE slice (service-dispatch
-    # bridges like notify_rc are unmodeled), corpus whole — so an agent never reads the top as
+    # bridges are unmodeled), corpus whole — so an agent never reads the top as
     # 'all reachable candidates'.
     ro = VIEWS["reachable-first"]["desc"].lower()
     assert "web-asset" in ro
     assert "not call-graph reachability" in ro
-    assert "incomplete" in ro and "notify_rc" in ro  # names the unmodeled service-dispatch gap
+    assert "incomplete" in ro and "service-dispatch" in ro  # names the unmodeled dispatch gap
     assert "floats" in ro and "whole" in ro  # a float lens: corpus stays whole, nothing pruned
     assert "pre-auth" not in ro  # mechanistic label, never a pre-auth attack-surface claim
     # nvram-source likewise floats (never prunes an optimistic, late-resolving source attribution).
@@ -1924,7 +1926,7 @@ def test_callsite_addr_round_trips_every_class_and_offset_shape() -> None:
     MUTATION (must go RED): drop the sign handling in callsite_abs_addr (always add the offset) ->
     the negative-offset case reconstructs the wrong address."""
     cases = [
-        ("cmd", 0x00401000, 0x00401218),  # positive offset
+        ("cmd", 0x00401000, 0x0041CE98),  # positive offset
         ("copy", 0x00401000, 0x00400FC0),  # negative offset (out-of-line block below entry)
         ("format", 0x00010000, 0x01234567),  # offset wider than six hex digits
         ("fmt_string", 0x7F0000001000, 0x7F0000001240),  # 64-bit entry
@@ -1998,7 +2000,7 @@ def test_wrapper_ref_names_the_wrapper_call_never_a_sink_call() -> None:
     MUTATION (verified RED): drop the wrapper-class check in ``callsite_abs_addr``."""
     entry = 0x00401000
     for axis in ("cmd_via_wrapper", "fmt_via_wrapper"):
-        for call in (0x00401218, 0x00400FC0):  # a positive and a negative offset
+        for call in (0x0041CE98, 0x00400FC0):  # a positive and a negative offset
             wref = build_evidence_ref(
                 "run_1",
                 suffix=callsite_offset_suffix(axis, _norm_offset(call, entry)),
@@ -2009,11 +2011,11 @@ def test_wrapper_ref_names_the_wrapper_call_never_a_sink_call() -> None:
             assert callsite_abs_addr(wref) is None
     direct = build_evidence_ref(
         "run_1",
-        suffix=callsite_offset_suffix("cmd", _norm_offset(0x00401218, entry)),
+        suffix=callsite_offset_suffix("cmd", _norm_offset(0x0041CE98, entry)),
         binary_sha256="deadbeef",
         address=hex(entry),
     )
-    assert callsite_abs_addr(direct) == 0x00401218
+    assert callsite_abs_addr(direct) == 0x0041CE98
     assert wrapper_call_abs_addr(direct) is None
     bare = build_evidence_ref(
         "run_1", suffix="cmd_via_wrapper", binary_sha256="deadbeef", address=hex(entry)
@@ -2083,9 +2085,9 @@ def test_addressed_wrapper_fmt_candidate_keeps_its_recovered_constant(tmp_path: 
 def test_record_addr_parses_or_honestly_returns_none() -> None:
     """_record_addr reads one record's sink_addr ``"0x…"`` string to an int, and returns None —
     never a guess — when the field is missing, not a string, or unparseable."""
-    assert _record_addr({"sink_addr": "0x401218"}) == 0x401218
-    assert _record_addr({"sink_addr": "0X401218"}) == 0x401218  # case-insensitive 0x prefix
+    assert _record_addr({"sink_addr": "0x41ce98"}) == 0x41CE98
+    assert _record_addr({"sink_addr": "0X41CE98"}) == 0x41CE98  # case-insensitive 0x prefix
     assert _record_addr({}) is None  # missing
-    assert _record_addr({"sink_addr": 0x401218}) is None  # not a string (an int)
+    assert _record_addr({"sink_addr": 0x41CE98}) is None  # not a string (an int)
     assert _record_addr({"sink_addr": "deadzz"}) is None  # unparseable
     assert _record_addr({"sink_addr": ""}) is None  # empty

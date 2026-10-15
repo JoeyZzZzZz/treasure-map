@@ -33,6 +33,8 @@ from treasure_map.lib.atlas.writer import (
 from treasure_map.lib.query.triage import Dimension, TriageCandidate
 from treasure_map.lib.storage.connection import open_db
 
+from .boundary_words import listed_words_in
+
 _EXPECTED_TOOLS = {
     "list_candidates",
     "list_runs",
@@ -275,7 +277,7 @@ def test_get_nvram_key_flow_tool(tmp_path: Path) -> None:
         [
             NvramFlowRow(
                 source_run_id="run_m",
-                key="sw_mode",
+                key="node_role",
                 key_kind="constant",
                 binary="rc",
                 func="set_mode",
@@ -285,7 +287,7 @@ def test_get_nvram_key_flow_tool(tmp_path: Path) -> None:
             ),
             NvramFlowRow(
                 source_run_id="run_m",
-                key="sw_mode",
+                key="node_role",
                 key_kind="constant",
                 binary="httpd",
                 func="read_mode",
@@ -306,7 +308,7 @@ def test_get_nvram_key_flow_tool(tmp_path: Path) -> None:
     conn.close()
     tools = mcp_app.make_tools(atlas)
 
-    res = tools["get_nvram_key_flow"]("sw_mode")
+    res = tools["get_nvram_key_flow"]("node_role")
     assert res["found"] is True
     assert [w["binary"] for w in res["writers"]] == ["rc"]
     assert [r["binary"] for r in res["readers"]] == ["httpd"]
@@ -550,15 +552,15 @@ def test_no_lineage_run_never_revived_by_ws_root_fallback(tmp_path: Path) -> Non
     pid = upsert_pattern(
         conn, source_class="external_input", sink_class="cmd", call_sequence_shape="s"
     )
-    # 'miwifi' is instance-only -> resolved=False, analysis_db_path=None (a pre-existing scan)
+    # 'fwbeta' is instance-only -> resolved=False, analysis_db_path=None (a pre-existing scan)
     add_instance(
         conn,
         InstanceRow(
             pattern_id=pid,
             pseudocode_hash="h_m",
             sink_anchor="FUN_m",
-            source_run_id="miwifi",
-            evidence_ref="miwifi#fn1",
+            source_run_id="fwbeta",
+            evidence_ref="fwbeta#fn1",
         ),
     )
     # 'rt' carries an instance for FUN_present -> it exists in ANOTHER run (the lethal-probe target)
@@ -575,8 +577,8 @@ def test_no_lineage_run_never_revived_by_ws_root_fallback(tmp_path: Path) -> Non
     conn.close()
     # a residual OLD analysis.db sitting exactly where the ws_root fallback would find it
     ws_root = tmp_path / "workspaces"
-    (ws_root / "miwifi").mkdir(parents=True)
-    old = open_db(ws_root / "miwifi" / "analysis.db")
+    (ws_root / "fwbeta").mkdir(parents=True)
+    old = open_db(ws_root / "fwbeta" / "analysis.db")
     old.execute(
         "INSERT INTO binaries (id, name, path, sha256, last_seen_at) "
         "VALUES (1, 'mtd', 'sbin/mtd', ?, '2026-01-01T00:00:00')",
@@ -587,7 +589,7 @@ def test_no_lineage_run_never_revived_by_ws_root_fallback(tmp_path: Path) -> Non
     tools = mcp_app.make_tools(atlas_p, workspaces_root=ws_root)
 
     # any function on the no-lineage run -> no-DB re-scan, NOT a search-miss; residual db not opened
-    r = tools["get_pseudocode"]("main", run_id="miwifi")
+    r = tools["get_pseudocode"]("main", run_id="fwbeta")
     assert r["found"] is False
     assert "no recorded analysis.db" in r["error"] and "re-scan" in r["error"]
     assert "cross_run_note" not in r  # never ran a function search on the residual db
@@ -595,7 +597,7 @@ def test_no_lineage_run_never_revived_by_ws_root_fallback(tmp_path: Path) -> Non
 
     # ★ lethal probe: a function that exists in ANOTHER run STILL yields no-DB on the no-lineage run
     # (never "wrong run / not in ANY run") — this is what separates UNKNOWN from NO.
-    lethal = tools["get_pseudocode"]("FUN_present", run_id="miwifi")
+    lethal = tools["get_pseudocode"]("FUN_present", run_id="fwbeta")
     assert "no recorded analysis.db" in lethal["error"]
     assert "cross_run_note" not in lethal and "found_in_runs" not in lethal
 
@@ -1170,9 +1172,11 @@ def test_public_server_files_carry_no_private_references() -> None:
     # the author's private working notes, and the defensive legal notice must be wired into the
     # server instructions.
     src = Path(__file__).resolve().parents[2] / "src" / "treasure_map"
-    privdoc = re.compile(r"private (design )?notes|treasure-map-notes", re.IGNORECASE)
+    privdoc = re.compile(r"private (design )?notes", re.IGNORECASE)
     for rel in ("lib/facts.py", "mcp_app.py", "cli/mcp_cli.py"):
-        assert not privdoc.search((src / rel).read_text()), f"private-note reference in {rel}"
+        text = (src / rel).read_text()
+        assert not privdoc.search(text), f"private-note reference in {rel}"
+        assert not listed_words_in(text), f"private-note reference in {rel}"
     # the defensive notice is the server's standing instruction
     assert "LEGAL_NOTICE" in (src / "mcp_app.py").read_text()
 

@@ -65,9 +65,9 @@ def test_density_groups_by_run_sink_and_fingerprint(tmp_path: Path) -> None:
     conn = _atlas(tmp_path)
     p_cmd = _pattern(conn, "fp_cmd", "cmd")
     p_copy = _pattern(conn, "fp_copy", "copy")
-    _inst(conn, p_cmd, status="unknown", run_id="run_dcs", h="a")
-    _inst(conn, p_cmd, status="unknown", run_id="run_dcs", h="b")
-    _inst(conn, p_copy, status="unknown", run_id="run_dcs", h="c")
+    _inst(conn, p_cmd, status="unknown", run_id="run_cam", h="a")
+    _inst(conn, p_cmd, status="unknown", run_id="run_cam", h="b")
+    _inst(conn, p_copy, status="unknown", run_id="run_cam", h="c")
 
     rows = density(conn)
     by_fp = {r.structural_fingerprint: r for r in rows}
@@ -178,8 +178,8 @@ def test_relabelling_stock_to_unknown_only_widens_breadth_and_by_a_bounded_amoun
 
     ★ Per PATTERN, not summed across them. The summed delta can EXCEED the globally-distinct count
     of excluded fingerprints, because one pseudocode_hash can sit under several patterns and be
-    counted once in each — measured on the real atlas at the time of writing: +429 summed against
-    424 globally-distinct, so an aggregate bound stated that way is simply not an upper bound. The
+    counted once in each — so a summed delta can exceed the globally-distinct count, and an
+    aggregate bound stated that way is simply not an upper bound. The
     per-pattern form is the one that is arithmetically true.
 
     MUTATION (must go RED): change the origin clause to admit a different set (e.g. drop 'custom',

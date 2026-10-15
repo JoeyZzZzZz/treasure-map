@@ -17,7 +17,7 @@ layer2's job.
 
 BOUNDARY — the external-tool orchestration (Ghidra headless + the BinExport plugin + the BinDiff
 CLI) is real-machine engineering that CANNOT run in CI (no Ghidra / BinExport / BinDiff here). The
-preflight is fully unit-tested; the export/diff subprocess steps are exercised by the owner's
+preflight is fully unit-tested; the export/diff subprocess steps are exercised by the maintainer's
 end-to-end smoke on a pinned toolchain (Ghidra 11.4.3 + BinDiff 8 + the prebuilt BinExport). Their
 command lines are isolated in ``_run_binexport`` / ``_run_bindiff`` so a toolchain revision touches
 only those two functions.

@@ -6,7 +6,7 @@ Zero third-party dependencies (Linux ``/proc`` + ``lscpu``, macOS ``sysctl``, ``
 Used by ``tmap init`` to derive ``max_parallel_jvms`` once at setup, and by the scan/diff parallel
 pools to clamp that stable value down at runtime if the machine is momentarily short on memory.
 
-The two axes come from owner real-machine measurement, not guesses:
+The two axes come from real-machine measurement, not guesses:
   * CPU: the effective parallelism knee is the PHYSICAL core count, not the logical count. Ghidra
     analysis is CPU-bound, so two hyperthreads on one physical core contend for the same execute
     units — pushing past physical cores makes the total SLOWER (measured: 6 cores was the knee, 8
@@ -28,7 +28,7 @@ from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
-# A single JVM's measured resident footprint under diff/scan (owner: ~950MB RSS; 1024 leaves
+# A single JVM's measured resident footprint under diff/scan (measured: ~950MB RSS; 1024 leaves
 # headroom above the measured value, and is NOT the -Xmx heap ceiling — RSS runs well below -Xmx).
 PER_JVM_MB = 1024
 # The conservative fraction of MemTotal a run may claim (leaves the OS + other processes + the JVM

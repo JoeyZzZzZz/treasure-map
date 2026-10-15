@@ -45,7 +45,7 @@ def test_source_kind_charset_safe_inline() -> None:
 
 
 def test_source_kind_charset_maybe_via_intermediate() -> None:
-    # 0x13578 shape: a charset converter is in the function but the value reaches the sink through
+    # 0x418494 shape: a charset converter is in the function but the value reaches the sink through
     # an intermediate variable -> NOT value-tracked here. Marked charset_maybe (a lead), not safe,
     # and the boundary is stated honestly.
     pc = (
@@ -322,7 +322,7 @@ def test_entry_index_no_match_is_empty() -> None:
 def test_ref_at_boundary_rejects_word_internal_substring() -> None:
     # The real false positive: "rc" inside per(rc)ent — a firmware-upgrade ajax endpoint that has
     # nothing to do with sbin/rc. A bare substring test attached it; boundary matching rejects it.
-    assert _ref_at_boundary("rc", "/ajax_fwdl_percent.asp") is False
+    assert _ref_at_boundary("rc", "/ajax_upgrade_progress.asp") is False
     assert _ref_at_boundary("rc", "search.asp") is False  # sea-rc-h, word-internal
 
 
@@ -331,7 +331,7 @@ def test_ref_at_boundary_accepts_real_segment_references() -> None:
     assert _ref_at_boundary("rc", "/rc.cgi") is True
     assert _ref_at_boundary("rc", "rc?x=1") is True
     assert _ref_at_boundary("rc", "/cgi-bin/rc") is True
-    assert _ref_at_boundary("rc", "start_apply.cgi?rc=1") is True
+    assert _ref_at_boundary("rc", "begin_apply.cgi?rc=1") is True
 
 
 def test_ref_at_boundary_underscore_is_word_internal_strict() -> None:
@@ -347,7 +347,7 @@ def test_sites_for_web_boundary_drops_substring_false_positive() -> None:
     idx = EntryIndex(
         script_calls=[],
         web_endpoints=[
-            ("www/fwdl.html", "asp", "GET", "/ajax_fwdl_percent.asp", "ajax"),
+            ("www/fwdl.html", "asp", "GET", "/ajax_upgrade_progress.asp", "ajax"),
             ("www/rc.html", "cgi", "POST", "/rc.cgi", "form"),
         ],
     )
@@ -561,7 +561,7 @@ def test_the_design_rationale_measurements_are_left_alone() -> None:
     assert "~90-fold" in triage  # why the non-empty guard has to be there
     assert "written anyway so a future one cannot slip" in triage  # a guard that admits it is idle
     layer0 = (_SRC / "lib/diff/layer0.py").read_text()
-    assert "1815/1848" in layer0  # where ALIGN_THRESHOLD came from
+    assert "matching BinDiff's own overall confidence" in layer0  # where ALIGN_THRESHOLD came from
 
 
 # ── the fortified-call object-size fact rides on the size record, and only there ──────────────

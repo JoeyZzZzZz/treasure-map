@@ -290,8 +290,8 @@ def test_executable_segment_bytes_are_served_with_their_warning(tmp_path: Path) 
     this machine against Ghidra 12.1.2 -- a stripped firmware binary yields ``segment_2``
     (init=true, exec=true, holding its .rodata) plus ``segment_3`` (init=true, exec=false), whereas
     a binary that kept its section headers yields a separate non-executable ``.rodata`` block; and
-    454/456, 455/455, 417/417 binaries of three real images are section-header-free. Excluding RX
-    would therefore leave a .rodata address unanswerable on the vast majority of real binaries.
+    nearly every binary of a typical firmware image is section-header-free. Excluding RX would
+    therefore leave a .rodata address unanswerable on the vast majority of real binaries.
 
     The price is that .rodata and .text are indistinguishable there, so the caveat is mandatory.
 

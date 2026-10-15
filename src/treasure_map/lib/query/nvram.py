@@ -1,6 +1,6 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""Read-side nvram key-flow query over the atlas nvram_key_flow table (gap② phase 2).
+"""Read-side nvram key-flow query over the atlas nvram_key_flow table.
 
 The table holds per-op nvram read/write facts flattened at hunt time; this reader assembles the
 key GRAPH on read — "who writes / who reads this key" across binaries — with a three-tier honesty
@@ -193,11 +193,11 @@ def _wl_normalize(key: str) -> str:
 
 
 def _frontend_settable(conn: sqlite3.Connection, key: str, run_id: str | None = None) -> bool | str:
-    """Is ``key`` an editable front-end form field (web_form_fields, M1)? True/False/'uncertain'.
+    """Is ``key`` an editable front-end form field (web_form_fields)? True/False/'uncertain'.
 
-    ``uncertain`` when the front-end table is EMPTY (M1 not collected) — NEVER False (a
+    ``uncertain`` when the front-end table is EMPTY (not collected) — NEVER False (a
     false-negative red line), OR when only a NAMING-VARIANT field exists (a front-end
-    ``http_username_x`` for a back-end ``http_username``): a variant MIGHT be the editable mirror,
+    ``admin_user_form`` for a back-end ``admin_user``): a variant MIGHT be the editable mirror,
     so 'not settable' is not asserted. A hit is exact or via the generic wl-index normalization."""
     try:
         sql, args = _scoped(run_id)
@@ -206,7 +206,7 @@ def _frontend_settable(conn: sqlite3.Connection, key: str, run_id: str | None = 
             is not None
         )
     except sqlite3.OperationalError:
-        return "uncertain"  # table absent (older atlas / M1 not run) -> never 'not settable'
+        return "uncertain"  # table absent (older atlas / not collected) -> never 'not settable'
     if not collected:
         return "uncertain"  # front-end not collected -> unknown, never 'not settable'
     exact = conn.execute(
@@ -215,17 +215,15 @@ def _frontend_settable(conn: sqlite3.Connection, key: str, run_id: str | None = 
     ).fetchone()
     if exact is not None:
         return True
-    # A naming-variant editable field (starts with ``key_`` — e.g. http_username_x for
-    # http_username) may be the editable mirror; report uncertain, not False. GLOB '_' is literal
+    # A naming-variant editable field (starts with ``key_`` — e.g. admin_user_form for
+    # admin_user) may be the editable mirror; report uncertain, not False. GLOB '_' is literal
     # (only * ? [ are special) and nvram keys carry none of those, so the pattern is safe.
     #
-    # ⑥ PROMOTION-RECALL — the known collection gap, stated explicitly (NOT hidden as "已知漏"):
-    #   http_username / http_passwd land here because their editable field is a ``_x`` MIRROR field
-    #   (http_username_x, http_passwd_x, http_passwd_2_x) — the form-input copy of the committed
-    #   nvram key. The COLLECTION RULE TO ADD (next phase) is a generic ``X_x`` / ``X_N_x`` suffix
-    #   normalization (mirror of the wl-index _wl_normalize) that would promote these to an exact
-    #   match -> web_settable=yes. Deferred this phase (kept 'uncertain', never a false 'no'); a key
-    #   with NO editable field at all (e.g. modem_apn: no name="modem_apn*" in the assets) is a true
+    # The known collection gap, stated explicitly: a key whose editable field is a suffixed MIRROR
+    #   (the form-input copy of the committed nvram key, e.g. admin_user_form for admin_user) lands
+    #   here. A generic suffix normalization (like the wl-index _wl_normalize) would promote these
+    #   to an exact match -> web_settable=yes; until then they stay 'uncertain', never a false
+    #   'no'. A key with NO editable field at all (no name="key*" anywhere in the assets) is a true
     #   absence, not a mappable miss, and stays uncertain honestly.
     variant = conn.execute(
         f"SELECT 1 FROM web_form_fields WHERE field_keyword GLOB ?{sql} LIMIT 1",  # noqa: S608
@@ -254,7 +252,7 @@ def _frontend_evidence(
             (key, _wl_normalize(key), *args),
         ).fetchall()
     except sqlite3.OperationalError:
-        return []  # table absent (older atlas / M1 not run)
+        return []  # table absent (older atlas / not collected)
     if exact:
         return [
             {
@@ -328,7 +326,7 @@ def _router_defaults_lookup(
             "in_router_defaults": True,
             "default_value": hit["default_value"],
             "flags": hit["flags"],
-            "source": f"{hit['binary'] or 'libshared'} router_defaults",
+            "source": f"{hit['binary'] or '(binary not recorded)'} router_defaults",
         }
     incomplete = (
         conn.execute(
@@ -345,13 +343,13 @@ def _router_defaults_lookup(
 def _web_settable(conn: sqlite3.Connection, key: str, run_id: str | None = None) -> dict[str, Any]:
     """Source-side web-settability by a SaTC front/back cross — is ``key`` editable via the web?
 
-    Crosses the front-end editable form fields (M1 web_form_fields) against the back-end nvram op
+    Crosses the front-end editable form fields (web_form_fields) against the back-end nvram op
     keys (nvram_key_flow constant, ALL binaries). THREE-STATE ``web_settable`` — deliberately NO
     "no":
       "yes"       — front-end editable AND back-end nvram key: a real, PROVEN user-settable web key.
-      "likely"    — NOT a proven cross, but the key is a ``router_defaults`` member (M2). An
+      "likely"    — NOT a proven cross, but the key is a ``router_defaults`` member. An
                     optimistic web-settable signal — most router_defaults keys are user-facing — but
-                    the table also holds read-only internal defaults (nvramver / *_state / *_time),
+                    the table also holds read-only internal defaults (cfgver / *_state / *_time),
                     so it is a LEAD, not proof. Ranked below "yes" everywhere it is consumed.
       "uncertain" — EVERYTHING ELSE (not a proven cross AND not a router_defaults member). NOT "no":
                     inferring "not settable" from a missing side is a false-negative — a truly
@@ -361,7 +359,7 @@ def _web_settable(conn: sqlite3.Connection, key: str, run_id: str | None = None)
     NEVER a false one. "likely" only ever ADDS visibility over "uncertain"; it never demotes. The
     cross is direction-safe but possibly slightly WIDE (the all-binary cross may attribute a key to
     the web when another service is the real writer — a caveat, not a single-service). A surfaced
-    fact only. RED LINE (M3): the likely tier is a source-side MEMBERSHIP signal — never narrow it
+    fact only. RED LINE: the likely tier is a source-side MEMBERSHIP signal — never narrow it
     with a key-side filter (flags / write-side value / name), which would false-demote a real key.
     """
     run = run_id if run_id is not None else _RUN_SCOPE.get()
@@ -499,7 +497,7 @@ def get_nvram_key_flow(
         "unresolved_count": unresolved_count,
         # source-side writability by the SaTC front-end x back-end cross: is this a USER-EDITABLE
         # nvram key? A THREE-state fact ("yes" / "likely" / "uncertain") — there is no "no":
-        # "likely" is a router_defaults-member signal (M2), non-YES/likely is always uncertain,
+        # "likely" is a router_defaults-member signal, non-YES/likely is always uncertain,
         # never a "not settable" inferred from a missing side. router_defaults drives likely.
         "web_settable": _web_settable(conn, key, run_id),
         "coverage": COVERAGE_NOTE,

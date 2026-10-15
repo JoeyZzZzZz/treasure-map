@@ -27,6 +27,8 @@ from treasure_map.lib.query.sink_impact import PROVABLY_CONSTANT_MARKERS
 from treasure_map.lib.query.triage import _CONTROLLABILITY_RANK, _controllability_rank
 from treasure_map.lib.storage.connection import open_db
 
+from ..boundary_words import listed_words_in
+
 _SRC = Path(__file__).resolve().parents[3] / "src" / "treasure_map"
 _HUNT_A2 = _SRC / "lib" / "hunt" / "analyzer2.py"
 _QUERY_PKG = _SRC / "lib" / "query"
@@ -134,7 +136,7 @@ def _make_db(
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     bid,
-                    e.get("table_addr", "0x74920"),
+                    e.get("table_addr", "0x445b58"),
                     e.get("stride", 8),
                     e.get("index", i),
                     e.get("key"),
@@ -261,7 +263,7 @@ def test_writer_scans_widely_shipped_binary(tmp_path: Path) -> None:
         ],
     )
     atlas = tmp_path / "atlas.db"
-    stats = run_analyzer2(db, atlas, source_run_id="run_dcs")
+    stats = run_analyzer2(db, atlas, source_run_id="run_cam")
 
     # Per class rather than a bare total: each function's snprintf is a command candidate AND a
     # buffer-formatter write candidate, so "how many matches" is no longer "how many cmd shapes".
@@ -382,11 +384,11 @@ def test_decompile_error_body_is_a_counted_data_gap(tmp_path: Path) -> None:
     assert _count(atlas, "instance") == 0
 
 
-# ── gap② phase 2: nvram_ops flattened into the cross-binary nvram_key_flow table ────
+# ── nvram_ops flattened into the cross-binary nvram_key_flow table ────
 
 
 def test_nvram_ops_flattened_cross_binary(tmp_path: Path) -> None:
-    # rc writes sw_mode; httpd reads it — a real cross-process config flow. A parametric and an
+    # rc writes node_role; httpd reads it — a real cross-process config flow. A parametric and an
     # unresolved op ride along; the keyless commit op is NOT flattened (no key -> not a key fact).
     db = _make_db(
         tmp_path,
@@ -400,7 +402,7 @@ def test_nvram_ops_flattened_cross_binary(tmp_path: Path) -> None:
                             {
                                 "api": "nvram_set",
                                 "op": "write",
-                                "key": "sw_mode",
+                                "key": "node_role",
                                 "key_kind": "constant",
                                 "value_source": {"kind": "param", "name": "param_2"},
                             },
@@ -433,7 +435,7 @@ def test_nvram_ops_flattened_cross_binary(tmp_path: Path) -> None:
                             {
                                 "api": "nvram_get",
                                 "op": "read",
-                                "key": "sw_mode",
+                                "key": "node_role",
                                 "key_kind": "constant",
                             }
                         ],
@@ -448,17 +450,17 @@ def test_nvram_ops_flattened_cross_binary(tmp_path: Path) -> None:
     assert stats.nvram_flows_written == 4  # 3 writes + 1 read; the commit op is dropped
     rows = _nvram_rows(atlas)
     as_tuples = [(r["key"], r["key_kind"], r["binary"], r["func"], r["op"]) for r in rows]
-    # cross-binary: rc writes sw_mode (constant), httpd reads sw_mode (constant)
-    assert ("sw_mode", "constant", "rc", "set_mode", "write") in as_tuples
-    assert ("sw_mode", "constant", "httpd", "read_mode", "read") in as_tuples
+    # cross-binary: rc writes node_role (constant), httpd reads node_role (constant)
+    assert ("node_role", "constant", "rc", "set_mode", "write") in as_tuples
+    assert ("node_role", "constant", "httpd", "read_mode", "read") in as_tuples
     assert {r["key_kind"] for r in rows} == {"constant", "parametric", "unresolved"}
     # unresolved key is stored with NULL key — never masquerading as a concrete key
     unresolved = [r for r in rows if r["key_kind"] == "unresolved"]
     assert len(unresolved) == 1 and unresolved[0]["key"] is None
     # write-side value source rides along as JSON (controllability signal); reads carry none
-    w = next(r for r in rows if r["key"] == "sw_mode" and r["op"] == "write")
+    w = next(r for r in rows if r["key"] == "node_role" and r["op"] == "write")
     assert json.loads(w["value_source"]) == {"kind": "param", "name": "param_2"}
-    rd = next(r for r in rows if r["key"] == "sw_mode" and r["op"] == "read")
+    rd = next(r for r in rows if r["key"] == "node_role" and r["op"] == "read")
     assert rd["value_source"] is None
 
 
@@ -530,7 +532,7 @@ def test_nvram_flow_replace_by_run_is_idempotent(tmp_path: Path) -> None:
     assert len(_nvram_rows(atlas)) == 1  # not 2
 
 
-# ── gap② A2: wrapper-indirect key edges recovered from constant call-site literals ──
+# ── wrapper-indirect key edges recovered from constant call-site literals ──
 
 
 def _wrapper_reader_fn(name: str) -> dict[str, object]:
@@ -567,7 +569,7 @@ def test_wrapper_indirect_edge_recovered_with_via_wrapper(tmp_path: Path) -> Non
                 "name": "rc",
                 "funcs": [
                     _wrapper_reader_fn("wget"),
-                    _wrapper_caller_fn("biz", "wget", "oauth_auth_code"),
+                    _wrapper_caller_fn("biz", "wget", "acct_link_code"),
                 ],
             }
         ],
@@ -576,7 +578,7 @@ def test_wrapper_indirect_edge_recovered_with_via_wrapper(tmp_path: Path) -> Non
     stats = run_analyzer2(db, atlas, source_run_id="run_a2")
     assert stats.nvram_wrapper_edges == 1
     edge = next(r for r in _nvram_rows(atlas) if r["via_wrapper"] is not None)
-    assert edge["key"] == "oauth_auth_code"
+    assert edge["key"] == "acct_link_code"
     assert edge["func"] == "biz" and edge["op"] == "read"
     assert edge["via_wrapper"] == "wget" and edge["key_kind"] == "constant"
 
@@ -642,11 +644,11 @@ def test_router_defaults_flattened_to_atlas(tmp_path: Path) -> None:
         tmp_path,
         [
             {
-                "name": "libshared.so",
+                "name": "libcommon.so",
                 "funcs": [_nvram_fn("noop", [])],
                 "nvram_defaults": [
-                    {"key": "sw_mode", "default_value": "0", "flags": 0, "index": 0},
-                    {"key": "oauth_auth_code", "default_value": "", "flags": 128, "index": 894},
+                    {"key": "node_role", "default_value": "0", "flags": 0, "index": 0},
+                    {"key": "acct_link_code", "default_value": "", "flags": 128, "index": 894},
                     {"key": None, "default_value": None, "flags": None, "index": 900},  # unresolved
                 ],
             }
@@ -656,8 +658,8 @@ def test_router_defaults_flattened_to_atlas(tmp_path: Path) -> None:
     stats = run_analyzer2(db, atlas, source_run_id="run_rd")
     assert stats.nvram_defaults_written == 3  # resolved members + the unresolved one (not dropped)
     rows = _nvram_defaults_rows(atlas)
-    hit = next(r for r in rows if r["key"] == "oauth_auth_code")
-    assert hit["default_value"] == "" and hit["flags"] == 128 and hit["binary"] == "libshared.so"
+    hit = next(r for r in rows if r["key"] == "acct_link_code")
+    assert hit["default_value"] == "" and hit["flags"] == 128 and hit["binary"] == "libcommon.so"
     # the unresolved member is preserved as a key=NULL row (keeps the table honestly incomplete)
     assert any(r["key"] is None for r in rows)
 
@@ -665,9 +667,9 @@ def test_router_defaults_flattened_to_atlas(tmp_path: Path) -> None:
 def test_router_defaults_replace_by_run_is_idempotent(tmp_path: Path) -> None:
     spec = [
         {
-            "name": "libshared.so",
+            "name": "libcommon.so",
             "funcs": [_nvram_fn("noop", [])],
-            "nvram_defaults": [{"key": "sw_mode", "default_value": "0", "flags": 0, "index": 0}],
+            "nvram_defaults": [{"key": "node_role", "default_value": "0", "flags": 0, "index": 0}],
         }
     ]
     db = _make_db(tmp_path, spec)
@@ -685,8 +687,8 @@ def test_web_form_fields_flattened_to_atlas(tmp_path: Path) -> None:
         tmp_path,
         [{"name": "webd", "funcs": [_nvram_fn("noop", [])]}],
         web_form_fields=[
-            {"key": "fb_comment", "rule": "textarea", "asset": "Feedback.asp"},
-            {"key": "wl_ssid", "rule": "input", "asset": "Wireless.asp"},
+            {"key": "rpt_comment", "rule": "textarea", "asset": "Report.asp"},
+            {"key": "wl_ssid", "rule": "input", "asset": "Radio.asp"},
         ],
     )
     atlas = tmp_path / "atlas.db"
@@ -703,14 +705,14 @@ def test_web_form_fields_flattened_to_atlas(tmp_path: Path) -> None:
         }
     finally:
         conn.close()
-    assert rows == {"fb_comment": "Feedback.asp", "wl_ssid": "Wireless.asp"}
+    assert rows == {"rpt_comment": "Report.asp", "wl_ssid": "Radio.asp"}
 
 
 def test_web_form_fields_replace_by_run_is_idempotent(tmp_path: Path) -> None:
     db = _make_db(
         tmp_path,
         [{"name": "webd", "funcs": [_nvram_fn("noop", [])]}],
-        web_form_fields=[{"key": "fb_comment", "rule": "textarea"}],
+        web_form_fields=[{"key": "rpt_comment", "rule": "textarea"}],
     )
     atlas = tmp_path / "atlas.db"
     run_analyzer2(db, atlas, source_run_id="run_wff2")
@@ -779,7 +781,7 @@ def test_string_keyed_edges_flattened_per_key_callee(tmp_path: Path) -> None:
                         "handle_dispatch",
                         [
                             {
-                                "key": "oauth_auth_code",
+                                "key": "acct_link_code",
                                 "mechanism": "strcmp_gate",
                                 "gate_api": "strcmp",
                                 "gate_addr": "0x00010040",
@@ -788,7 +790,7 @@ def test_string_keyed_edges_flattened_per_key_callee(tmp_path: Path) -> None:
                                 "callees": [
                                     {
                                         "name": "process_token",
-                                        "addr": "0x000b643c",
+                                        "addr": "0x0040bcc8",
                                         "kind": "direct",
                                     }
                                 ],
@@ -818,14 +820,14 @@ def test_string_keyed_edges_flattened_per_key_callee(tmp_path: Path) -> None:
     rows = _ske_rows(atlas)
     assert len(rows) == 2
     by_key = {r["key"]: r for r in rows}
-    tok = by_key["oauth_auth_code"]
+    tok = by_key["acct_link_code"]
     assert tok["mechanism"] == "strcmp_gate"
     assert tok["binary"] == "rc"
     assert tok["from_function"] == "handle_dispatch"
     assert tok["from_func_addr"] == "0x00010000"  # source anchor rides from functions.address
     # the callee anchor is the BinDiff-alignable {name, addr, kind}, not a bare address
     assert tok["callee_name"] == "process_token"
-    assert tok["callee_addr"] == "0x000b643c"
+    assert tok["callee_addr"] == "0x0040bcc8"
     assert tok["callee_kind"] == "direct"
     assert tok["ladder_size"] == 2
     assert tok["completeness_status"] == "complete"
@@ -845,7 +847,7 @@ def test_string_keyed_edge_partial_gate_keeps_key_as_callee_less_row(tmp_path: P
                         "opaque",
                         [
                             {
-                                "key": "cfg_mode",
+                                "key": "cfg_kind",
                                 "mechanism": "strcmp_gate",
                                 "ladder_size": 1,
                                 "callees": [],
@@ -866,7 +868,7 @@ def test_string_keyed_edge_partial_gate_keeps_key_as_callee_less_row(tmp_path: P
     rows = _ske_rows(atlas)
     assert len(rows) == 1
     r = rows[0]
-    assert r["key"] == "cfg_mode"
+    assert r["key"] == "cfg_kind"
     assert (
         r["callee_name"] is None
     )  # callee-less: the key is kept as a lead, never silently dropped
@@ -987,13 +989,13 @@ def test_string_keyed_edges_query_by_callee_and_by_run(tmp_path: Path) -> None:
                         "handle_dispatch",
                         [
                             {
-                                "key": "oauth_auth_code",
+                                "key": "acct_link_code",
                                 "mechanism": "strcmp_gate",
                                 "ladder_size": 1,
                                 "callees": [
                                     {
                                         "name": "process_token",
-                                        "addr": "0x000b643c",
+                                        "addr": "0x0040bcc8",
                                         "kind": "direct",
                                     }
                                 ],
@@ -1012,16 +1014,16 @@ def test_string_keyed_edges_query_by_callee_and_by_run(tmp_path: Path) -> None:
         # by callee (reachability lookup): the callee's function is reached via a keyed edge
         hits = edges_reaching_callee(conn, "rc", "process_token")
         assert len(hits) == 1
-        assert hits[0]["key"] == "oauth_auth_code"
+        assert hits[0]["key"] == "acct_link_code"
         assert hits[0]["callee"] == {
             "name": "process_token",
-            "addr": "0x000b643c",
+            "addr": "0x0040bcc8",
             "kind": "direct",
         }
         # a function that is NOT any edge's callee returns [] (NOT a proof of unreachability)
         assert edges_reaching_callee(conn, "rc", "handle_dispatch") == []
         # by run + key (agent / diff enumeration)
-        out = get_string_keyed_edges(conn, run_id="run_q", key="oauth_auth_code")
+        out = get_string_keyed_edges(conn, run_id="run_q", key="acct_link_code")
         assert out["count"] == 1
         assert out["edges"][0]["from_function"] == "handle_dispatch"
         assert out["edges"][0]["mechanism"] == "strcmp_gate"
@@ -1043,11 +1045,11 @@ def _fat_handler_fw() -> list[dict[str, object]]:
                     "handle_notifications",
                     [
                         {
-                            "key": "oauth_auth_code",
+                            "key": "acct_link_code",
                             "mechanism": "strcmp_gate",
                             "ladder_size": 3,
                             "callees": [
-                                {"name": "gen_token_email", "addr": "0x000b643c", "kind": "direct"}
+                                {"name": "gen_token_mail", "addr": "0x0040bcc8", "kind": "direct"}
                             ],
                             "completeness": {"status": "complete"},
                         }
@@ -1055,14 +1057,14 @@ def _fat_handler_fw() -> list[dict[str, object]]:
                     address="000b6000",
                 ),
                 {  # the FAT edge callee: calls two sinks, plus unrelated work
-                    "name": "gen_token_email",
-                    "address": "000b643c",
-                    "pseudocode": "void gen_token_email(void){}",
+                    "name": "gen_token_mail",
+                    "address": "0040bcc8",
+                    "pseudocode": "void gen_token_mail(void){}",
                     "hash": "h_gen",
                     "callees": ["run_cmd", "log_status", "strlen"],
                 },
-                {**_cmd_injection_fn("run_cmd"), "address": "000b32a0"},
-                {**_cmd_injection_fn("log_status"), "address": "000b2ec0"},
+                {**_cmd_injection_fn("run_cmd"), "address": "00408b2c"},
+                {**_cmd_injection_fn("log_status"), "address": "0040874c"},
             ],
         }
     ]
@@ -1093,9 +1095,9 @@ def test_one_hop_lead_reaches_the_sink_below_a_fat_edge_callee(tmp_path: Path) -
     assert len(leads) == 1
     assert leads[0] == {
         "via": "string_keyed_edge",
-        "key": "oauth_auth_code",
+        "key": "acct_link_code",
         "hops": 1,
-        "through": "gen_token_email",
+        "through": "gen_token_mail",
         "mechanism": "strcmp_gate",
     }
 
@@ -1107,8 +1109,8 @@ def test_fanout_edge_callee_hands_the_key_to_both_sinks_below(tmp_path: Path) ->
     run_analyzer2(db, atlas, source_run_id="run_fan")
     for sink in ("run_cmd", "log_status"):
         leads = _leads_of(atlas, sink)
-        assert [x["key"] for x in leads] == ["oauth_auth_code"], sink
-        assert leads[0]["through"] == "gen_token_email"
+        assert [x["key"] for x in leads] == ["acct_link_code"], sink
+        assert leads[0]["through"] == "gen_token_mail"
 
 
 def test_one_hop_leads_are_pure_annotation(tmp_path: Path) -> None:
@@ -1154,16 +1156,16 @@ def test_static_string_table_flattened_to_edges(tmp_path: Path) -> None:
                 "funcs": [_nvram_fn("noop", [])],
                 "string_tables": [
                     {
-                        "key": "nvram_dump",
-                        "func_name": "FUN_000561e4",
-                        "func_addr": "0x000561e4",
-                        "table_addr": "0x74920",
+                        "key": "cfg_dump",
+                        "func_name": "FUN_0042741c",
+                        "func_addr": "0x0042741c",
+                        "table_addr": "0x445b58",
                     },
                     {
                         "key": "sys_reboot",
                         "func_name": "do_reboot",
                         "func_addr": "0x00011000",
-                        "table_addr": "0x74920",
+                        "table_addr": "0x445b58",
                     },
                 ],
             }
@@ -1174,12 +1176,12 @@ def test_static_string_table_flattened_to_edges(tmp_path: Path) -> None:
     rows = _ske_rows(atlas)
     assert len(rows) == 2
     by_key = {r["key"]: r for r in rows}
-    dump = by_key["nvram_dump"]
+    dump = by_key["cfg_dump"]
     assert dump["mechanism"] == "static_string_table"
     assert dump["binary"] == "httpd"
     assert dump["from_function"] is None  # a static table has no source function
-    assert dump["callee_name"] == "FUN_000561e4"
-    assert dump["callee_addr"] == "0x000561e4"
+    assert dump["callee_name"] == "FUN_0042741c"
+    assert dump["callee_addr"] == "0x0042741c"
     assert dump["ladder_size"] is None  # N/A for a static table
     assert dump["completeness_status"] == "incomplete"
     assert dump["completeness_scope"] == "absolute_2field_only"
@@ -1199,15 +1201,15 @@ def test_static_table_undefined_text_handler_survives_to_the_edge(tmp_path: Path
                 "funcs": [_nvram_fn("noop", [])],
                 "string_tables": [
                     {
-                        "key": "nvram_dump",
-                        "func_name": "FUN_000561e4",
-                        "func_addr": "0x561e4",
+                        "key": "cfg_dump",
+                        "func_name": "FUN_0042741c",
+                        "func_addr": "0x42741c",
                         "func_kind": "direct",
                     },
                     {
-                        "key": "select_channel",
-                        "func_name": "FUN_0002a774",
-                        "func_addr": "0x2a774",
+                        "key": "pick_channel",
+                        "func_name": "FUN_003fb9ac",
+                        "func_addr": "0x3fb9ac",
                         "func_kind": "undefined_text",
                     },
                 ],
@@ -1217,11 +1219,11 @@ def test_static_table_undefined_text_handler_survives_to_the_edge(tmp_path: Path
     atlas = tmp_path / "atlas.db"
     run_analyzer2(db, atlas, source_run_id="run_ut")
     by_key = {r["key"]: r for r in _ske_rows(atlas)}
-    assert by_key["nvram_dump"]["callee_kind"] == "direct"
+    assert by_key["cfg_dump"]["callee_kind"] == "direct"
     # the undefined-but-real handler is an edge like any other, honestly kinded
-    ut = by_key["select_channel"]
+    ut = by_key["pick_channel"]
     assert ut["callee_kind"] == "undefined_text"
-    assert ut["callee_addr"] == "0x2a774"  # the address is the anchor, defined or not
+    assert ut["callee_addr"] == "0x3fb9ac"  # the address is the anchor, defined or not
     assert ut["mechanism"] == "static_string_table"
 
 
@@ -1252,7 +1254,7 @@ def test_static_table_and_strcmp_gate_share_query_and_capability(tmp_path: Path)
                     )
                 ],
                 "string_tables": [
-                    {"key": "nvram_dump", "func_name": "FUN_000561e4", "func_addr": "0x000561e4"}
+                    {"key": "cfg_dump", "func_name": "FUN_0042741c", "func_addr": "0x0042741c"}
                 ],
             }
         ],
@@ -1262,7 +1264,7 @@ def test_static_table_and_strcmp_gate_share_query_and_capability(tmp_path: Path)
     conn = open_atlas(atlas)
     try:
         # the static-table handler is reachable-via-key like a strcmp callee (same lookup)
-        a_hit = edges_reaching_callee(conn, "httpd", "FUN_000561e4")
+        a_hit = edges_reaching_callee(conn, "httpd", "FUN_0042741c")
         assert len(a_hit) == 1 and a_hit[0]["mechanism"] == "static_string_table"
         # both mechanisms live under one enumeration surface
         allq = get_string_keyed_edges(conn, run_id="run_ab")
@@ -1279,8 +1281,8 @@ def test_static_table_and_strcmp_gate_share_query_and_capability(tmp_path: Path)
 
 
 # ── evidence_ref is RE-SCAN STABLE (a durable per-ref judgement store depends on it) ──
-# Real-firmware root cause these guard: func_id is an AUTOINCREMENT rowid and the analysis DB is
-# delete-and-reingest per binary, so a re-scanned DB held 88,178 functions numbered 266,156..354,333
+# The root cause these guard: func_id is an AUTOINCREMENT rowid and the analysis DB is
+# delete-and-reingest per binary, so a re-scanned DB numbers the same functions far apart
 # — every id shifted by the function count on EVERY re-scan, with zero code change. A ref built on
 # it drifts, and every judgement stored against the old ref silently loses its anchor.
 
@@ -1291,8 +1293,8 @@ def _rc_dispatch_fw() -> list[dict[str, object]]:
         {
             "name": "rc",
             "funcs": [
-                {**_cmd_injection_fn("FUN_000b32a0"), "address": "000b32a0"},
-                {**_cmd_injection_fn("FUN_000b643c"), "address": "000b643c"},
+                {**_cmd_injection_fn("FUN_00408b2c"), "address": "00408b2c"},
+                {**_cmd_injection_fn("FUN_0040bcc8"), "address": "0040bcc8"},
             ],
         }
     ]
@@ -1320,24 +1322,24 @@ def _func_id_of(db: Path, name: str) -> int:
 
 def test_evidence_ref_survives_a_rescan(tmp_path: Path) -> None:
     # ★ THE property: re-scan the same firmware, get the SAME ref for the same function. The old
-    # func_id-derived ref failed exactly here (fn109348 -> fn199770 on real firmware, one function).
+    # func_id-derived ref failed exactly here (the same function came back under a new number).
     fw = _rc_dispatch_fw()
     db = _make_db(tmp_path, fw)
     atlas = tmp_path / "atlas.db"
     run_analyzer2(db, atlas, source_run_id="run_1")
-    ref_before = _ref_of(atlas, "FUN_000b32a0")
-    id_before = _func_id_of(db, "FUN_000b32a0")
+    ref_before = _ref_of(atlas, "FUN_00408b2c")
+    id_before = _func_id_of(db, "FUN_00408b2c")
 
     _rescan_funcs(db, fw)  # same firmware, same order — only the ingest bookkeeping moves
     run_analyzer2(db, atlas, source_run_id="run_1")
-    ref_after = _ref_of(atlas, "FUN_000b32a0")
-    id_after = _func_id_of(db, "FUN_000b32a0")
+    ref_after = _ref_of(atlas, "FUN_00408b2c")
+    id_after = _func_id_of(db, "FUN_00408b2c")
 
     # The drift mechanism really fired (else this test would pass vacuously on any scheme):
     assert id_after != id_before, "fixture did not reproduce func_id drift — test is vacuous"
     # ...and the ref did NOT move with it.
     assert ref_after == ref_before
-    assert "000b32a0" in ref_before  # anchored on the entry address, not on ingest bookkeeping
+    assert "00408b2c" in ref_before  # anchored on the entry address, not on ingest bookkeeping
     assert f"fn{id_before}" not in ref_before  # never the rowid
 
 
@@ -1362,17 +1364,17 @@ def test_copy_callsite_refs_survive_a_rescan(tmp_path: Path) -> None:
     db = _make_db(tmp_path, fw)
     atlas = tmp_path / "atlas.db"
     run_analyzer2(db, atlas, source_run_id="run_1")
-    before = [str(r["evidence_ref"]) for r in _copy_rows(atlas, "ResponseSetup")]
-    id_before = _func_id_of(db, "ResponseSetup")
+    before = [str(r["evidence_ref"]) for r in _copy_rows(atlas, "ReplySetup")]
+    id_before = _func_id_of(db, "ReplySetup")
 
     _rescan_funcs(db, fw)  # same firmware, same order — only the ingest bookkeeping moves
     run_analyzer2(db, atlas, source_run_id="run_1")
-    assert _func_id_of(db, "ResponseSetup") != id_before, "fixture did not reproduce id drift"
-    assert [str(r["evidence_ref"]) for r in _copy_rows(atlas, "ResponseSetup")] == before
+    assert _func_id_of(db, "ReplySetup") != id_before, "fixture did not reproduce id drift"
+    assert [str(r["evidence_ref"]) for r in _copy_rows(atlas, "ReplySetup")] == before
 
     _rescan_funcs(db, fw, reverse=True)  # enumeration order flipped too
     run_analyzer2(db, atlas, source_run_id="run_1")
-    after = [str(r["evidence_ref"]) for r in _copy_rows(atlas, "ResponseSetup")]
+    after = [str(r["evidence_ref"]) for r in _copy_rows(atlas, "ReplySetup")]
 
     assert after == before
     assert [r.rsplit("@", 1)[1] for r in after] == ["copy#0", "copy#1", "copy#2"]
@@ -1385,12 +1387,12 @@ def test_evidence_ref_survives_enumeration_order_change(tmp_path: Path) -> None:
     db = _make_db(tmp_path, fw)
     atlas = tmp_path / "atlas.db"
     run_analyzer2(db, atlas, source_run_id="run_1")
-    ref_before = _ref_of(atlas, "FUN_000b32a0")
+    ref_before = _ref_of(atlas, "FUN_00408b2c")
 
     _rescan_funcs(db, fw, reverse=True)  # enumeration order flipped
     run_analyzer2(db, atlas, source_run_id="run_1")
 
-    assert _ref_of(atlas, "FUN_000b32a0") == ref_before
+    assert _ref_of(atlas, "FUN_00408b2c") == ref_before
 
 
 def test_stored_judgement_keeps_its_anchor_across_a_rescan(tmp_path: Path) -> None:
@@ -1404,7 +1406,7 @@ def test_stored_judgement_keeps_its_anchor_across_a_rescan(tmp_path: Path) -> No
     db = _make_db(tmp_path, fw)
     atlas_p = tmp_path / "atlas.db"
     run_analyzer2(db, atlas_p, source_run_id="run_1")
-    ref = _ref_of(atlas_p, "FUN_000b32a0")
+    ref = _ref_of(atlas_p, "FUN_00408b2c")
 
     conn = open_atlas(atlas_p)
     add_private_exploit(conn, evidence_ref=ref, pattern="p", exploit_note="verified by hand")
@@ -1426,13 +1428,13 @@ def test_stored_judgement_keeps_its_anchor_across_a_rescan(tmp_path: Path) -> No
         "the stored judgement lost its anchor after a re-scan"
     )
     assert still_anchored == 1
-    assert _ref_of(atlas_p, "FUN_000b32a0") == ref  # the candidate still carries the same ref
+    assert _ref_of(atlas_p, "FUN_00408b2c") == ref  # the candidate still carries the same ref
 
 
 def test_evidence_ref_distinguishes_same_named_binaries(tmp_path: Path) -> None:
-    # Real firmware ships DISTINCT binaries under one name (measured: 479 binaries, 475 names —
-    # libstdc++.so.6/mtdinfo/nanddump/ubinfo each twice). Anchoring the binary by NAME would collide
-    # 4,460 functions' refs; the content-hash prefix keeps them apart even at the same address.
+    # Real firmware ships DISTINCT binaries under one name (two builds of the same library is
+    # common). Anchoring the binary by NAME would collide those functions' refs; the content-hash
+    # prefix keeps them apart even at the same address.
     fw: list[dict[str, object]] = [
         {
             "name": "mtdinfo",
@@ -1478,7 +1480,7 @@ def test_evidence_ref_distinguishes_same_named_binaries(tmp_path: Path) -> None:
 def test_raw_evidence_is_not_persisted(tmp_path: Path) -> None:
     db = _make_db(tmp_path, [{"name": "webd", "funcs": [_cmd_injection_fn("handle")]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_dcs")
+    run_analyzer2(db, atlas, source_run_id="run_cam")
 
     (row,) = _instances_of(atlas, "cmd")
     # evidence_ref holds a neutral per-instance locator (run-scoped function id), not the
@@ -1604,7 +1606,7 @@ def test_second_run_appends_and_recomputes_breadth(tmp_path: Path) -> None:
     assert breadth == 2  # two distinct source_run_id over the same fingerprint
 
 
-def _multi_sink_fn(name: str = "ma_utils_exec") -> dict[str, object]:
+def _multi_sink_fn(name: str = "svc_utils_exec") -> dict[str, object]:
     # One function that matches BOTH a cmd shape (recv->snprintf+%s literal->popen) and a copy
     # shape (recv->strcpy) -> two distinct instances over the same function.
     body = (
@@ -2067,7 +2069,7 @@ def test_cross_function_source_system_enters_candidates(tmp_path: Path) -> None:
     apply_mac = {
         "name": "apply_mac",
         "pseudocode": "void apply_mac(char* param_1){ char cmd[128]; "
-        'snprintf(cmd,128,"kickmac %s; reboot",param_1); system(cmd); }',
+        'snprintf(cmd,128,"dropmac %s; reboot",param_1); system(cmd); }',
         "hash": "h_apply",
         "callees": ["snprintf", "system"],
     }
@@ -2484,11 +2486,11 @@ def test_free_string_via_wrapper_becomes_high_band_candidate(tmp_path: Path) -> 
     assert row["evidence_ref"].endswith("@cmd_via_wrapper#0")
 
 
-def _json_free_via_wrapper_fn(name: str = "set_wifi") -> dict[str, object]:
+def _json_free_via_wrapper_fn(name: str = "set_radio_cfg") -> dict[str, object]:
     # The exact 0x6b90 shape: a json string getter -> intermediate var -> snprintf -> wrapper.
     body = (
         f"void {name}(void){{ char* s=json_object_get_string(o); char cmd[256]; "
-        f'snprintf(cmd,256,"netctl set %s",s); do_cmd(cmd); }}'
+        f'snprintf(cmd,256,"netcfg set %s",s); do_cmd(cmd); }}'
     )
     return {
         "name": name,
@@ -2507,14 +2509,14 @@ def test_json_free_string_via_wrapper_floats_high(tmp_path: Path) -> None:
     )
     atlas = tmp_path / "atlas.db"
     run_analyzer2(db, atlas, source_run_id="run_json")
-    row = _by_anchor(atlas)["set_wifi"]
+    row = _by_anchor(atlas)["set_radio_cfg"]
     assert row["blocking_mechanism"] is None  # free string -> not downweighted
     ev = json.loads(row["flow_evidence"])
     assert ev["source_kind"] == "free_string"
     assert ev["flow_path"]["sink_via_wrapper"] is True
     # free string -> controllability=free (top of the impact band), never sunk
-    assert _ctrl_of(atlas, "set_wifi") == "free"
-    assert not _is_safe(atlas, "set_wifi")
+    assert _ctrl_of(atlas, "set_radio_cfg") == "free"
+    assert not _is_safe(atlas, "set_radio_cfg")
 
 
 def test_safe_fanout_to_wrapper_is_suppressed_below_real_concat(tmp_path: Path) -> None:
@@ -2531,12 +2533,11 @@ def test_safe_fanout_to_wrapper_is_suppressed_below_real_concat(tmp_path: Path) 
     # sound. `reboot_now` forwards a single constant argument to `do_cmd(p){system(p);}`, so the
     # constant really was the whole command; `arp_set` forwards a charset-constrained buffer. The
     # mis-attribution the suppression exists for needs a forwarding call that passes MORE than the
-    # one argument the marker looked at — the vararg case. Measured on a real atlas, of the 170
-    # candidates that stopped being asserted safe, 117 (69%) are multi-argument forwards where the
-    # vararg was genuinely never examined and 53 (31%) are single-argument forwards like these two,
-    # lifted as collateral. Narrowing the rule by argument count is the follow-up that would recover
-    # them; until something actually traces into the wrapper, the map says "not verified" rather
-    # than "safe".
+    # one argument the marker looked at — the vararg case. Most candidates that stopped being
+    # asserted safe are multi-argument forwards where the vararg was genuinely never examined; the
+    # rest are single-argument forwards like these two, lifted as collateral. Narrowing the rule
+    # by argument count is the follow-up that would recover them; until something actually traces
+    # into the wrapper, the map says "not verified" rather than "safe".
     db = _make_db(
         tmp_path,
         [
@@ -2804,7 +2805,7 @@ def _path_sink_fn(
     """A function calling a path/file ``sink``. ``path`` picks the PATH-argument form:
     const (a string literal), free (a recv-sourced buffer), or unknown (an untraceable local)."""
     if path == "const":
-        params, pre, arg, callees = "", "", '"/tmp/nc/nc.conf"', [sink]
+        params, pre, arg, callees = "", "", '"/tmp/nc/evt.conf"', [sink]
     elif path == "free":
         params, pre, arg, callees = "", "char buf[64]; recv(fd,buf,64); ", "buf", ["recv", sink]
     else:  # unknown: a local with no recognized source, not a parameter, not a literal
@@ -3019,8 +3020,7 @@ def test_a2_sources_are_boundary_clean() -> None:
     # — so the carve-out is
     # exactly one word, exactly two surfaces.
     hard = re.compile(
-        r"\b(vuln\w*|payload|\bpoc\b|finding|defect|incomplete_patch|fix_quality|"
-        r"priority|risk[_ ]?score)\b",
+        r"\b(vuln\w*|payload|\bpoc\b|finding|defect|priority|risk[_ ]?score)\b",
         re.IGNORECASE,
     )
     section_ref = re.compile(r"§|PRD\s")
@@ -3034,6 +3034,7 @@ def test_a2_sources_are_boundary_clean() -> None:
     for path in [_HUNT_A2, *_QUERY_PKG.glob("*.py"), _ATLAS_SCHEMA]:
         text = path.read_text()
         assert not hard.search(text), f"offensive framing in {path.name}"
+        assert not listed_words_in(text), f"listed framing in {path.name}"
         assert not section_ref.search(text), f"section/private-doc ref in {path.name}"
         # the schema stores the exploit ledger (that whole DDL block is "exploit" prose), so
         # the exploit-word check applies to the neutral files only, never the two sanctioned
@@ -3151,8 +3152,8 @@ def test_static_table_status_no_row_is_unknown_not_none(tmp_path: Path) -> None:
 # that wrong argument happened to be a literal, the candidate read as constant while its actual
 # format was a variable: a false negative, on the one argument that carries the injection.
 #
-# Measured on real firmware before writing these: 11 candidates in one image alone have a literal
-# argument 0 and a NON-literal real format — exactly the shape below.
+# The shape is not hypothetical: firmware carries candidates with a literal argument 0 and a
+# NON-literal real format — exactly the shape below.
 #
 # The fixtures drive the whole live path (run_analyzer2 -> flow evidence -> triage), not a helper
 # in isolation, so a mutation that restores the argument-0 reading has to fail here.
@@ -3420,13 +3421,13 @@ def _tag_first_caller(name: str, fmt_expr: str) -> dict[str, object]:
     """A caller whose argument 0 is a constant TAG and whose real format sits at argument 1.
 
     The shape that made the mis-attribution visible on real firmware:
-    `log_at("auth_enhance", "user=%s password=%s", p)`. Argument 0 being a literal is what the
+    `log_at("auth_extra", "user=%s password=%s", p)`. Argument 0 being a literal is what the
     command-axis form note keys on."""
     return {
         "name": name,
         "pseudocode": (
             f'void {name}(char *param_1){{ char *pcVar2; pcVar2 = getenv("X"); '
-            f'log_at("auth_enhance",{fmt_expr},param_1); }}'
+            f'log_at("auth_extra",{fmt_expr},param_1); }}'
         ),
         "hash": f"h_{name}",
         "callees": ["getenv", "log_at"],
@@ -3442,8 +3443,8 @@ def test_fmt_tagfirst_const_traced_not_arg0marker(tmp_path: Path) -> None:
     "constant" through that note — the right verdict credited to the wrong argument, while the
     format actually recovered from the call site sat unused.
 
-    Measured on real firmware before the fix: 41 and 64 format candidates in two images took the
-    note's path. After it, 0 do, and not one verdict changed — the fault was attribution only.
+    Before the fix, real format candidates took the note's path; after it none do, and no verdict
+    changed — the fault was attribution only.
 
     MUTATION (must go RED): restore the unconditional call in analyzer2's wrapper loop
     (`blocking = wrapper_propagation_form_note(...)` for both axes) -> the reading is credited to
@@ -3484,7 +3485,7 @@ def test_cmd_axis_keeps_its_form_note(tmp_path: Path) -> None:
 # ── copy candidates are per CALLSITE, end to end ─────────────────────────────────────
 
 
-def _multi_copy_fn(name: str = "ResponseSetup") -> dict[str, object]:
+def _multi_copy_fn(name: str = "ReplySetup") -> dict[str, object]:
     """A handler that copies a fixed 4 bytes, then two caller-supplied lengths into stack buffers.
 
     The shape this whole change is about, in the form it was found in: the bounded copy comes
@@ -3493,7 +3494,7 @@ def _multi_copy_fn(name: str = "ResponseSetup") -> dict[str, object]:
     it were represented by it, and demoted with it."""
     return {
         "name": name,
-        "address": "0x527998",
+        "address": "0x405a1c",
         "hash": f"h_{name}",
         "pseudocode": (
             f"void {name}(int param_1, char *param_2) {{\n"
@@ -3561,7 +3562,7 @@ def test_a_copy_the_safe_one_stood_in_for_becomes_its_own_candidate(tmp_path: Pa
     atlas = tmp_path / "atlas.db"
     run_analyzer2(db, atlas, source_run_id="run_copy")
 
-    rows = _copy_rows(atlas, "ResponseSetup")
+    rows = _copy_rows(atlas, "ReplySetup")
     assert len(rows) == 3
     assert [r["blocking_mechanism"] for r in rows] == ["const_size", None, None]
     assert {r["reachability_status"] for r in rows} == {"unknown"}
@@ -3607,7 +3608,7 @@ def test_sibling_copy_candidates_get_distinct_refs_that_each_resolve(tmp_path: P
     atlas = tmp_path / "atlas.db"
     run_analyzer2(db, atlas, source_run_id="run_copy")
 
-    refs = [str(r["evidence_ref"]) for r in _copy_rows(atlas, "ResponseSetup")]
+    refs = [str(r["evidence_ref"]) for r in _copy_rows(atlas, "ReplySetup")]
     assert len(set(refs)) == 3
     assert [r.rsplit("@", 1)[1] for r in refs] == ["copy#0", "copy#1", "copy#2"]
 
@@ -3634,7 +3635,7 @@ def test_each_copy_candidate_says_which_call_it_is_about(tmp_path: Path) -> None
     run_analyzer2(db, atlas, source_run_id="run_copy")
 
     seen = []
-    for row in _copy_rows(atlas, "ResponseSetup"):
+    for row in _copy_rows(atlas, "ReplySetup"):
         ev = json.loads(str(row["flow_evidence"]))
         seen.append((ev["copy_callsite"], ev["size_kind"], ev["size_flow"]["size_var"]))
     assert [c["index"] for c, _k, _v in seen] == [0, 1, 2]
@@ -3649,7 +3650,7 @@ def test_each_copy_candidate_says_which_call_it_is_about(tmp_path: Path) -> None
     try:
         surfaced = [
             explain_candidate(conn, str(r["evidence_ref"])).evidence_surface  # type: ignore[union-attr]
-            for r in _copy_rows(atlas, "ResponseSetup")
+            for r in _copy_rows(atlas, "ReplySetup")
         ]
     finally:
         conn.close()
@@ -3953,7 +3954,7 @@ def test_a_stub_rendered_sink_call_is_recovered_end_to_end(tmp_path: Path) -> No
     """★ THE POINT OF THE STUB TABLE, every hop of it, which no unit test covers.
 
     On a stripped binary the decompiler names a libc call after the stub it goes through, so the
-    body spells ``FUN_004125b0(...)`` and never ``system(``. The callee LIST already says
+    body spells ``FUN_0041eb38(...)`` and never ``system(``. The callee LIST already says
     ``system`` — it is relabelled at ingest — so the shape scan knows the sink is there and falls
     back to ONE function-level candidate: the recall floor, anchored at no call, carrying no
     argument to trace.
@@ -3971,7 +3972,7 @@ def test_a_stub_rendered_sink_call_is_recovered_end_to_end(tmp_path: Path) -> No
     fn = {
         "name": "handle",
         "pseudocode": (
-            "void handle(char *cmd, char *other){ FUN_004125b0(cmd); FUN_004125b0(other); }"
+            "void handle(char *cmd, char *other){ FUN_0041eb38(cmd); FUN_0041eb38(other); }"
         ),
         "hash": "h_handle",
         "callees": ["system"],
@@ -3984,7 +3985,7 @@ def test_a_stub_rendered_sink_call_is_recovered_end_to_end(tmp_path: Path) -> No
     assert [r["evidence_ref"].rsplit("@", 1)[1] for r in rows] == ["cmd"]
     assert json.loads(rows[0]["flow_evidence"])["flow_path"]["sink_arg"] is None
 
-    _store_stub_table(db, {"4125b0": "system"})
+    _store_stub_table(db, {"41eb38": "system"})
     seeing = tmp_path / "seeing.db"
     run_analyzer2(db, seeing, source_run_id="r_seeing")
     rows = _instances_of(seeing, "cmd")
@@ -4012,13 +4013,13 @@ def test_interleaved_textual_and_stub_calls_keep_the_reader_aligned(tmp_path: Pa
         "name": "mix",
         "pseudocode": (
             "void mix(char *first, char *second, char *third)"
-            "{ system(first); FUN_004125b0(second); system(third); }"
+            "{ system(first); FUN_0041eb38(second); system(third); }"
         ),
         "hash": "h_mix",
         "callees": ["system"],
     }
     db = _make_db(tmp_path, [{"name": "svcd", "funcs": [fn]}])
-    _store_stub_table(db, {"4125b0": "system"})
+    _store_stub_table(db, {"41eb38": "system"})
     atlas = tmp_path / "atlas.db"
     run_analyzer2(db, atlas, source_run_id="r_mix")
     rows = _instances_of(atlas, "cmd")
@@ -4028,7 +4029,8 @@ def test_interleaved_textual_and_stub_calls_keep_the_reader_aligned(tmp_path: Pa
 
 
 def test_a_recovered_copy_is_graded_on_its_own_length(tmp_path: Path) -> None:
-    """★ No false safety travels along the recovery (the §4.4 direction).
+    """★ No false safety travels along the recovery (a safe marking needs stronger proof than an
+    unknown one, so it never rides on another call's evidence).
 
     The textual call copies a literal 4 bytes and earns a bounded-length note; the stub-rendered
     call copies a caller-supplied ``n`` and must NOT inherit it. Anchored per callsite but graded
@@ -4042,13 +4044,13 @@ def test_a_recovered_copy_is_graded_on_its_own_length(tmp_path: Path) -> None:
     fn = {
         "name": "cp",
         "pseudocode": (
-            "void cp(char *d, char *s, int n){ memcpy(d, s, 4); FUN_00412450(d, s, n); }"
+            "void cp(char *d, char *s, int n){ memcpy(d, s, 4); FUN_0041e9d8(d, s, n); }"
         ),
         "hash": "h_cp",
         "callees": ["memcpy"],
     }
     db = _make_db(tmp_path, [{"name": "svcd", "funcs": [fn]}])
-    _store_stub_table(db, {"412450": "memcpy"})
+    _store_stub_table(db, {"41e9d8": "memcpy"})
     atlas = tmp_path / "atlas.db"
     run_analyzer2(db, atlas, source_run_id="r_cp")
     rows = _instances_of(atlas, "copy")

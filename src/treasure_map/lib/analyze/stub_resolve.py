@@ -5,7 +5,7 @@
 When a program calls a libc function like ``system``, the compiler emits a call to a small stub in
 ``.plt`` (or ``.MIPS.stubs``) that jumps through the GOT. If the decompiler does not stitch that
 stub back to the import — which happens routinely, depending on its configuration and how the
-binary was linked — the caller is left calling ``FUN_004125b0`` instead of ``system``, and a real
+binary was linked — the caller is left calling ``FUN_0041eb38`` instead of ``system``, and a real
 command-execution sink drops out of every downstream reading. That is a false negative on a sink
 that is objectively there.
 

@@ -147,18 +147,18 @@ def test_lib_binary_wrapper_propagated() -> None:
     MUTATION: put the name-based ``continue`` back -> RED.
     """
     wrapper = _fn(
-        1, "do_cmd", "void do_cmd(char* p){ system(p); }", ["system"], binary="libshared.so"
+        1, "do_cmd", "void do_cmd(char* p){ system(p); }", ["system"], binary="libcommon.so"
     )
     caller = _fn(
         2,
         "forward",
         'void forward(void){ char c[64]; snprintf(c,64,"%s",x); do_cmd(c); }',
         ["snprintf", "do_cmd"],
-        binary="libshared.so",
+        binary="libcommon.so",
     )
     (c,) = find_wrapper_propagated_candidates([wrapper, caller])
     assert c.func.name == "forward"
-    assert c.func.binary_name == "libshared.so"
+    assert c.func.binary_name == "libcommon.so"
 
 
 def test_no_wrapper_means_no_candidates() -> None:

@@ -521,8 +521,8 @@ def test_a_script_without_a_dot_sh_suffix_still_resolves() -> None:
     # MUTATION (verified RED, 1 failed): in exec_edges.classify_target_resolution restore the
     # suffix gate — `if in_non_binary and token.endswith(".sh"):` — and this token falls to
     # 'unmatched'.
-    inv = _inventory(binaries={"web_daemon"}, scripts={"getmac": ("usr/sbin/getmac",)})
-    (edge,) = _edges([_prov("system", _const("getmac eth0"))], inv)
+    inv = _inventory(binaries={"web_daemon"}, scripts={"readmac": ("usr/sbin/readmac",)})
+    (edge,) = _edges([_prov("system", _const("readmac eth0"))], inv)
     assert edge.target_resolution == "resolved_script"
 
 
@@ -535,9 +535,9 @@ def test_single_path_script_records_the_path_so_the_edge_is_answerable() -> None
     # MUTATION (verified RED, 1 failed): in exec_edges._build_row delete the
     # `elif resolution == RESOLVED_SCRIPT and len(script_paths) == 1:` branch -> target_binary is
     # None again and the edge is unanswerable.
-    inv = _inventory(binaries={"web_daemon"}, scripts={"getmac": ("usr/sbin/getmac",)})
-    (edge,) = _edges([_prov("system", _const("/usr/sbin/getmac eth0"))], inv)
-    assert (edge.target_resolution, edge.target_binary) == ("resolved_script", "usr/sbin/getmac")
+    inv = _inventory(binaries={"web_daemon"}, scripts={"readmac": ("usr/sbin/readmac",)})
+    (edge,) = _edges([_prov("system", _const("/usr/sbin/readmac eth0"))], inv)
+    assert (edge.target_resolution, edge.target_binary) == ("resolved_script", "usr/sbin/readmac")
 
 
 def test_a_name_held_by_several_scripts_is_left_unpicked() -> None:
@@ -551,16 +551,16 @@ def test_a_name_held_by_several_scripts_is_left_unpicked() -> None:
     # -> one of the two candidates is silently chosen.
     inv = _inventory(
         binaries={"web_daemon"},
-        scripts={"led_ctl": ("etc/init.d/led_ctl", "usr/sbin/led_ctl")},
+        scripts={"light_ctl": ("etc/init.d/light_ctl", "usr/sbin/light_ctl")},
     )
-    (edge,) = _edges([_prov("system", _const("led_ctl on"))], inv)
+    (edge,) = _edges([_prov("system", _const("light_ctl on"))], inv)
     assert edge.target_resolution == "resolved_script"
     assert edge.target_binary is None
 
 
 def test_script_edge_answers_to_both_its_short_name_and_its_path(tmp_path: Path) -> None:
     # ★ A2-r. Storing scripts by path makes the lookup key heterogeneous: binaries answer to a
-    # short name, scripts to a path. A reader asking `launched_by("getmac")` would get 0 rows and
+    # short name, scripts to a path. A reader asking `launched_by("readmac")` would get 0 rows and
     # read it as "nothing launches it" — the exact misreading this whole surface exists to prevent.
     # A short name is therefore matched against the stored path's basename as well.
     #
@@ -579,17 +579,17 @@ def test_script_edge_answers_to_both_its_short_name_and_its_path(tmp_path: Path)
                     launcher_binary="web_daemon",
                     launcher_function="starter",
                     exec_api="system",
-                    target_token="getmac",
+                    target_token="readmac",
                     target_resolution="resolved_script",
-                    target_binary="usr/sbin/getmac",
+                    target_binary="usr/sbin/readmac",
                 )
             ],
         )
-        assert launched_by(conn, "getmac", run_id="run1")["count"] == 1
-        assert launched_by(conn, "usr/sbin/getmac", run_id="run1")["count"] == 1
+        assert launched_by(conn, "readmac", run_id="run1")["count"] == 1
+        assert launched_by(conn, "usr/sbin/readmac", run_id="run1")["count"] == 1
         # exact basename comparison, never a suffix match
         assert launched_by(conn, "mac", run_id="run1")["count"] == 0
-        assert launched_by(conn, "foogetmac", run_id="run1")["count"] == 0
+        assert launched_by(conn, "fooreadmac", run_id="run1")["count"] == 0
     finally:
         conn.close()
 
@@ -620,12 +620,12 @@ def _seeded_atlas(tmp_path: Path) -> Any:
         [
             # a script: stored by its root-relative path, the token as the code wrote it
             _edge_row(
-                target_token="/usr/sbin/webs_update.sh",
-                target_binary="usr/sbin/webs_update.sh",
+                target_token="/usr/sbin/fw_check.sh",
+                target_binary="usr/sbin/fw_check.sh",
                 target_resolution="resolved_script",
             ),
             # a binary: stored by short name, the token again as the code wrote it
-            _edge_row(target_token="/usr/sbin/pluginmanager", target_binary="pluginmanager"),
+            _edge_row(target_token="/usr/sbin/addonmanager", target_binary="addonmanager"),
             # a symlink-renamed target: no spelling of the token is the stored name
             _edge_row(
                 target_token="/bin/sh",
@@ -633,7 +633,7 @@ def _seeded_atlas(tmp_path: Path) -> Any:
                 target_resolution="resolved_symlink",
             ),
             # decoys: only a prefix/suffix match would return these
-            _edge_row(target_token="foopluginmanager", target_binary="foopluginmanager"),
+            _edge_row(target_token="fooaddonmanager", target_binary="fooaddonmanager"),
             _edge_row(target_token="manager", target_binary="manager"),
         ],
     )
@@ -651,13 +651,13 @@ def test_a_token_copied_verbatim_out_of_an_edge_finds_that_edge(tmp_path: Path) 
     #  (b) the third comparison and its `query_basename` param -> the binary query returns 0.
     conn = _seeded_atlas(tmp_path)
     try:
-        assert launched_by(conn, "/usr/sbin/webs_update.sh")["count"] == 1  # stored relative
-        assert launched_by(conn, "/usr/sbin/pluginmanager")["count"] == 1  # stored short
+        assert launched_by(conn, "/usr/sbin/fw_check.sh")["count"] == 1  # stored relative
+        assert launched_by(conn, "/usr/sbin/addonmanager")["count"] == 1  # stored short
         # the stored spellings keep working, unchanged
-        assert launched_by(conn, "usr/sbin/webs_update.sh")["count"] == 1
-        assert launched_by(conn, "pluginmanager")["count"] == 1
+        assert launched_by(conn, "usr/sbin/fw_check.sh")["count"] == 1
+        assert launched_by(conn, "addonmanager")["count"] == 1
         # a short name still reaches a script stored by path
-        assert launched_by(conn, "webs_update.sh")["count"] == 1
+        assert launched_by(conn, "fw_check.sh")["count"] == 1
     finally:
         conn.close()
 
@@ -699,11 +699,11 @@ def test_lookup_never_matches_on_a_prefix_or_suffix(tmp_path: Path) -> None:
     # launcher to this one.
     #
     # MUTATION (verified RED, 1 failed): in query/exec_edges.launched_by widen the first comparison
-    # to `target_binary LIKE '%' || ?` -> the foopluginmanager decoy is returned too.
+    # to `target_binary LIKE '%' || ?` -> the fooaddonmanager decoy is returned too.
     conn = _seeded_atlas(tmp_path)
     try:
-        assert launched_by(conn, "pluginmanager")["count"] == 1
-        assert launched_by(conn, "/usr/sbin/pluginmanager")["count"] == 1
+        assert launched_by(conn, "addonmanager")["count"] == 1
+        assert launched_by(conn, "/usr/sbin/addonmanager")["count"] == 1
         assert launched_by(conn, "manager")["count"] == 1  # the decoy answers only to itself
     finally:
         conn.close()
@@ -715,7 +715,7 @@ def test_a_short_name_query_is_one_comparison_repeated(tmp_path: Path) -> None:
     # safe to widen. Asserted on the queries themselves rather than on a remembered count.
     import posixpath
 
-    for name in ("busybox", "sh", "pluginmanager", "manager"):
+    for name in ("busybox", "sh", "addonmanager", "manager"):
         assert name == name.lstrip("/") == posixpath.basename(name)
     conn = _seeded_atlas(tmp_path)
     try:
@@ -752,7 +752,7 @@ def test_status_detail_rides_only_with_an_empty_answer(tmp_path: Path) -> None:
                 DetectorScanStatusRow("run1", "quiet_lib", "exec_argv", 1, "scope", "note", 0, 0),
             ],
         )
-        answered = launched_by(conn, "pluginmanager")
+        answered = launched_by(conn, "addonmanager")
         empty = launched_by(conn, "nothing_launches_this")
 
         assert answered["count"] == 1
@@ -981,15 +981,15 @@ def test_hunt_wires_the_script_inventory_end_to_end(tmp_path: Path) -> None:
         "INSERT INTO functions (binary_id, name, address, pseudocode, callees, sink_provenance) "
         "VALUES (1, 'starter', '00011000', ?, ?, ?)",
         (
-            'void starter(void){ system("getmac eth0"); }',
+            'void starter(void){ system("readmac eth0"); }',
             json.dumps(["system"]),
-            json.dumps([_prov("system", _const("getmac eth0"))]),
+            json.dumps([_prov("system", _const("readmac eth0"))]),
         ),
     )
     # a launched script with NO .sh suffix — the shape the suffix gate used to hide
     conn.execute(
         "INSERT INTO non_binary_files (kind, name, path, sha256) "
-        "VALUES ('shell_script', 'getmac', 'usr/sbin/getmac', ?)",
+        "VALUES ('shell_script', 'readmac', 'usr/sbin/readmac', ?)",
         ("e" * 64,),
     )
     conn.commit()
@@ -1003,11 +1003,11 @@ def test_hunt_wires_the_script_inventory_end_to_end(tmp_path: Path) -> None:
         rows = conn2.execute(
             "SELECT target_resolution, target_binary FROM exec_edge WHERE source_run_id='run1'"
         ).fetchall()
-        by_short = launched_by(conn2, "getmac", run_id="run1")
-        by_path = launched_by(conn2, "usr/sbin/getmac", run_id="run1")
+        by_short = launched_by(conn2, "readmac", run_id="run1")
+        by_path = launched_by(conn2, "usr/sbin/readmac", run_id="run1")
     finally:
         conn2.close()
-    assert [tuple(r) for r in rows] == [("resolved_script", "usr/sbin/getmac")]
+    assert [tuple(r) for r in rows] == [("resolved_script", "usr/sbin/readmac")]
     assert by_short["count"] == 1, "a reader asking by short name must not get a silent 0"
     assert by_path["count"] == 1
 

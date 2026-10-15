@@ -50,9 +50,9 @@ from treasure_map.lib.query.runs import get_run
 from treasure_map.lib.ro_db import ro_connect
 from treasure_map.version import UNKNOWN_VERSION
 
-# The confidence boundary between an aligned pair and an undetermined one. Owner-set: on the
-# reference fixture it cuts 1815/1848 high-confidence (~98%), matching BinDiff's own overall
-# confidence -- a natural boundary. Overridable, but this is the default.
+# The confidence boundary between an aligned pair and an undetermined one. On a real-firmware diff
+# it keeps roughly 98% of the pairs as high-confidence, matching BinDiff's own overall confidence
+# -- a natural boundary. Overridable, but this is the default.
 ALIGN_THRESHOLD = 0.9
 
 

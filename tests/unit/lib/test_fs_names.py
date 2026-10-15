@@ -16,7 +16,7 @@ from treasure_map.lib.analyze.symlinks import SymlinkCollector, write_symlinks
 from treasure_map.lib.storage.connection import open_db
 
 _GBK = "测试".encode("gbk")  # b'\xb2\xe2\xca\xd4' — not UTF-8
-_ELF = Path(__file__).resolve().parents[2] / "fixtures" / "elfs" / "true_x86_64"
+_ELF = Path(__file__).resolve().parents[2] / "fixtures" / "elfs" / "exe_x86_64"
 
 
 def _name(suffix: bytes) -> str:

@@ -93,16 +93,16 @@ jobs:
             }
           }
           JAVA
-          "$GHIDRA/support/analyzeHeadless" "$PWD/proj" P -import tests/fixtures/elfs/libz_x86_64.so \
+          "$GHIDRA/support/analyzeHeadless" "$PWD/proj" P -import tests/fixtures/elfs/libfixture_x86_64.so \
             -noanalysis -scriptPath "$PWD/probe" -postScript ProbeBinExport.java -deleteProject \
             2>&1 | tee probe.log
           grep -q "PROBE-OK" probe.log
 
-      - name: Export smoke (tmap's own export script on an OSS fixture)
+      - name: Export smoke (tmap's own export script on the repository-built fixture)
         run: |
           set -e
           SCRIPTS="$(python -c 'from treasure_map.lib.diff.driver import _SCRIPT_DIR; print(_SCRIPT_DIR)')"
-          "$GHIDRA/support/analyzeHeadless" "$PWD/proj" Q -import tests/fixtures/elfs/libz_x86_64.so \
+          "$GHIDRA/support/analyzeHeadless" "$PWD/proj" Q -import tests/fixtures/elfs/libfixture_x86_64.so \
             -scriptPath "$SCRIPTS" -postScript ExportBinExport.java "$PWD/out.BinExport" "$PWD/out.export_report.json" \
             -deleteProject
           test -s out.BinExport

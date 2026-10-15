@@ -3,7 +3,7 @@
 """Ghidra JSON ingest: parses ghidra_output/*.json and populates
 functions / imports / exports / strings tables.
 
-Designed to align with Round 2 partial invalidation:
+Designed to align with partial invalidation:
 - Only ingests JSON files for the `dirty_records` set
 - Per-binary DELETE-then-INSERT (destructive, idempotent within a run)
 - Skips gracefully when JSON file missing (binary failed Ghidra) or malformed. Such a binary is
@@ -64,7 +64,7 @@ def ingest_ghidra_output(
 
     Per-binary semantics: DELETE existing rows for this binary_id before
     INSERT. This means re-ingesting the same binary in a single run is safe
-    (idempotent), and Round 2 partial invalidation cleanly refreshes only
+    (idempotent), and partial invalidation cleanly refreshes only
     the changed binary's data while leaving unchanged binaries' data intact.
 
     Args:
@@ -154,7 +154,7 @@ def ingest_ghidra_output(
         # which stays distinct from "exports nothing".
         exports = dynamic_function_exports(rec.path)
         _ingest_one_binary(conn, binary_id, data, stats, resolution, exports)
-        # ★ R6: stamp pass_version HERE — in the same transaction as this binary's function rows,
+        # ★ stamp pass_version HERE — in the same transaction as this binary's function rows,
         # committed together at the end of this function. Stamped in the pipeline's own loop (and
         # committed there) BEFORE ingest, an interrupt between the two left a binary marked done
         # with no functions, which the next scan read as a finished extraction and skipped forever.
@@ -298,10 +298,10 @@ def _ingest_one_binary(
                 # function's command/format sinks, carried verbatim to be merged into the atlas
                 # instance's flow_evidence at hunt time. Missing/old exports -> '[]' (never null).
                 json.dumps(func.get("sink_provenance", []), ensure_ascii=False),
-                # gap② nvram_ops transport: per-function nvram read/write ops (key + written
+                # nvram_ops transport: per-function nvram read/write ops (key + written
                 # value source), carried verbatim for the phase-2 key graph. Old exports -> '[]'.
                 json.dumps(func.get("nvram_ops", []), ensure_ascii=False),
-                # gap② A2 transport: thin-nvram-wrapper flag (JSON obj or NULL) + this function's
+                # thin-wrapper transport: wrapper flag (JSON obj or NULL) + this function's
                 # calls that pass a constant literal to a local function (resolved at hunt time into
                 # wrapper-indirect key edges). Old exports -> NULL / '[]'.
                 json.dumps(func["nvram_wrapper"], ensure_ascii=False)
@@ -321,7 +321,7 @@ def _ingest_one_binary(
                 # body address ranges, carried verbatim for hunt-time ref-offset + out-of-body.
                 json.dumps(func.get("call_tokens", []), ensure_ascii=False),
                 json.dumps(func.get("body_ranges", []), ensure_ascii=False),
-                # which additive detectors threw on this function (gap G1#1): a crash is named
+                # which additive detectors threw on this function: a crash is named
                 # here, never read as a clean empty by the layer that consumes the detector.
                 json.dumps(func.get("detector_errors", []), ensure_ascii=False),
             )
@@ -363,7 +363,7 @@ def _ingest_one_binary(
         )
         stats.exports_ingested += len(exp_rows)
 
-    # strings (category=NULL — Round B fills it)
+    # strings (category=NULL — string classification fills it)
     str_rows = [(binary_id, s.get("value"), s.get("address")) for s in data.get("strings", [])]
     if str_rows:
         conn.executemany(

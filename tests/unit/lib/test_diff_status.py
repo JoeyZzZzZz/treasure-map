@@ -8,7 +8,7 @@ the read-side surfacing (list_diffs status, list_diff_blindspots, the empty-delt
 Hermetic and synthetic: the external toolchain (Ghidra / BinExport / BinDiff) never runs. Tests that
 need the real layer-0 parse monkeypatch only the two subprocess steps to hand back a crafted
 ``.BinDiff`` (a plain SQLite file); everything downstream is exercised for real. Each fix is paired
-with a reverse-validation assertion (a naive alternative that would go red), per the spec.
+with a reverse-validation assertion (a naive alternative that would go red).
 """
 
 from __future__ import annotations

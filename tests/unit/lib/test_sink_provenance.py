@@ -479,7 +479,7 @@ def test_fmt_arity_counts_conversions_and_star_args() -> None:
 # The single verdict's de-optimism: a bare call_return / param is NO LONGER controllable. This phase
 # the ONLY controllable class is a WEB-SETTABLE key (⑦ registry) — external readers (getenv/recv)
 # are a FUTURE class, so they read 'unknown' now. The acon fixture seeds one web-settable key
-# (fb_comment) so a controllable case is testable; an unseeded key reads uncertain -> not control.
+# (rpt_comment) so a controllable case is testable; an unseeded key reads uncertain -> not control.
 
 
 @pytest.fixture
@@ -488,9 +488,9 @@ def acon(tmp_path: Path) -> Any:
     from treasure_map.lib.atlas.writer import add_nvram_flow_rows, add_web_form_field_rows
 
     conn = open_atlas(tmp_path / "atlas.db")
-    add_web_form_field_rows(conn, [WebFormFieldRow("r", "fb_comment", "F.asp", "textarea")])
+    add_web_form_field_rows(conn, [WebFormFieldRow("r", "rpt_comment", "F.asp", "textarea")])
     add_nvram_flow_rows(
-        conn, [NvramFlowRow("r", "fb_comment", "constant", "httpd", "save", "write")]
+        conn, [NvramFlowRow("r", "rpt_comment", "constant", "httpd", "save", "write")]
     )
     yield conn
     conn.close()
@@ -530,7 +530,7 @@ def test_wac_bare_call_return_and_param_are_unknown_not_controllable(acon: Any) 
 
 def test_wac_web_settable_key_is_controllable(acon: Any) -> None:
     # This phase's ONLY controllable class: a const_args key that crosses to web_settable=yes.
-    assert _writer_args_class(acon, "%s", [_webkey("fb_comment")]) == "controllable"
+    assert _writer_args_class(acon, "%s", [_webkey("rpt_comment")]) == "controllable"
 
 
 def test_wac_external_reader_is_deferred_not_controllable_this_phase(acon: Any) -> None:
@@ -546,7 +546,7 @@ def test_wac_unresolved_and_stack_buf_are_unknown(acon: Any) -> None:
 
 
 def test_wac_ambiguous0x_under_integer_spec_is_const(acon: Any) -> None:
-    # %d + ambiguous_0x = a known INTEGER literal (value pinned by the spec) -> const.
+    # %d + ambiguous_0x = a known INTEGER literal (value pinned by the extractor) -> const.
     assert (
         _writer_args_class(acon, "[%s:(%d)]", [_lit("handle_notifications"), _amb("%d", "0x432f")])
         == "const"
@@ -556,7 +556,7 @@ def test_wac_ambiguous0x_under_integer_spec_is_const(acon: Any) -> None:
 
 def test_wac_ambiguous0x_under_string_spec_is_unknown(acon: Any) -> None:
     # %s + ambiguous_0x = a constant POINTER, pointee unknown -> unknown (the red line).
-    assert _writer_args_class(acon, "%s", [_amb("%s", "0x1525f0")]) == "unknown"
+    assert _writer_args_class(acon, "%s", [_amb("%s", "0x41aa30")]) == "unknown"
 
 
 def test_wac_ambiguous0x_with_no_spec_is_unknown(acon: Any) -> None:
@@ -570,7 +570,7 @@ def test_wac_arity_shortfall_is_unknown(acon: Any) -> None:
 
 def test_wac_controllable_wins_over_unknown(acon: Any) -> None:
     assert (
-        _writer_args_class(acon, "%s %s", [_webkey("fb_comment"), _src("unresolved")])
+        _writer_args_class(acon, "%s %s", [_webkey("rpt_comment"), _src("unresolved")])
         == "controllable"
     )
 
@@ -581,7 +581,7 @@ def test_wac_missing_source_is_unknown(acon: Any) -> None:
 
 def test_wac_bare_0x_without_value_kind_falls_back(acon: Any) -> None:
     amb_d = {"spec": "%d", "source": {"kind": "constant", "value": "0x432f"}}  # no value_kind
-    amb_s = {"spec": "%s", "source": {"kind": "constant", "value": "0x1525f0"}}  # no value_kind
+    amb_s = {"spec": "%s", "source": {"kind": "constant", "value": "0x41aa30"}}  # no value_kind
     assert _writer_args_class(acon, "%d", [amb_d]) == "const"  # %d -> integer
     assert _writer_args_class(acon, "%s", [amb_s]) == "unknown"  # %s -> pointer, unknown
 

@@ -1,6 +1,5 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-# Adapted from treasure-map-history scripts/01_find_elfs.py
 from __future__ import annotations
 
 import hashlib
@@ -82,7 +81,7 @@ def has_loadable_segments(elf_path: Path) -> bool:
                 if seg.header.p_type != "PT_LOAD" or seg.header.p_filesz == 0:
                     continue
                 if seg.header.p_offset + seg.header.p_filesz > file_size:
-                    return False  # segment data lives outside this file (Qualcomm PIL etc.)
+                    return False  # segment data lives in a separate file (split loader images)
                 has_load = True
             return has_load
     except Exception:

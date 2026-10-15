@@ -1,6 +1,6 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for the nvram key-flow query (gap② phase 2): the three-tier honesty contract over
+"""Unit tests for the nvram key-flow query (phase 2): the three-tier honesty contract over
 the atlas nvram_key_flow table — exact (constant), template (parametric, flagged), and unresolved
 (never connected to a concrete key, but exposed via completeness)."""
 
@@ -45,7 +45,7 @@ def _seed(
 
 def _field(keyword: str, *, rule: str = "input", run: str = "run_a") -> WebFormFieldRow:
     return WebFormFieldRow(
-        source_run_id=run, field_keyword=keyword, source_asset="Feedback.asp", source_rule=rule
+        source_run_id=run, field_keyword=keyword, source_asset="Report.asp", source_rule=rule
     )
 
 
@@ -55,7 +55,7 @@ def _default(
     default_value: str | None = None,
     flags: int | None = None,
     member_index: int = 0,
-    binary: str = "libshared.so",
+    binary: str = "libcommon.so",
     run: str = "run_a",
 ) -> NvramDefaultRow:
     return NvramDefaultRow(
@@ -101,7 +101,7 @@ def test_exact_cross_binary_writers_and_readers(tmp_path: Path) -> None:
         tmp_path,
         [
             _flow(
-                "sw_mode",
+                "node_role",
                 "constant",
                 "rc",
                 "set_mode",
@@ -109,12 +109,12 @@ def test_exact_cross_binary_writers_and_readers(tmp_path: Path) -> None:
                 value_source='{"kind": "param", "name": "param_2"}',
                 api="nvram_set",
             ),
-            _flow("sw_mode", "constant", "httpd", "read_mode", "read", api="nvram_get"),
+            _flow("node_role", "constant", "httpd", "read_mode", "read", api="nvram_get"),
         ],
     )
     conn = open_atlas(atlas)
     try:
-        res = get_nvram_key_flow(conn, "sw_mode")
+        res = get_nvram_key_flow(conn, "node_role")
     finally:
         conn.close()
 
@@ -191,9 +191,9 @@ def test_wrapper_indirect_edge_is_surfaced_and_flagged(tmp_path: Path) -> None:
     atlas = _seed(
         tmp_path,
         [
-            _flow("oauth_auth_code", "constant", "rc", "save", "write", api="nvram_set"),
+            _flow("acct_link_code", "constant", "rc", "save", "write", api="nvram_set"),
             _flow(
-                "oauth_auth_code",
+                "acct_link_code",
                 "constant",
                 "rc",
                 "biz_caller",
@@ -205,7 +205,7 @@ def test_wrapper_indirect_edge_is_surfaced_and_flagged(tmp_path: Path) -> None:
     )
     conn = open_atlas(atlas)
     try:
-        res = get_nvram_key_flow(conn, "oauth_auth_code")
+        res = get_nvram_key_flow(conn, "acct_link_code")
     finally:
         conn.close()
     assert res["match"] == "exact"
@@ -225,18 +225,18 @@ def test_unresolved_ops_drive_completeness_not_the_graph(tmp_path: Path) -> None
     atlas = _seed(
         tmp_path,
         [
-            _flow("sw_mode", "constant", "rc", "set_mode", "write"),
+            _flow("node_role", "constant", "rc", "set_mode", "write"),
             _flow(None, "unresolved", "httpd", "fwd", "write"),
             _flow(None, "unresolved", "httpd", "fwd2", "read"),
         ],
     )
     conn = open_atlas(atlas)
     try:
-        res = get_nvram_key_flow(conn, "sw_mode")
+        res = get_nvram_key_flow(conn, "node_role")
     finally:
         conn.close()
 
-    # the unresolved ops are NOT attributed to sw_mode (they could touch any key)...
+    # the unresolved ops are NOT attributed to node_role (they could touch any key)...
     assert [w["func"] for w in res["writers"]] == ["set_mode"]
     # ...but they are exposed: the result is honestly marked possibly-incomplete with a count,
     # and the dynamic-key note is kept SEPARATE from the wrapper-indirect note.
@@ -244,7 +244,7 @@ def test_unresolved_ops_drive_completeness_not_the_graph(tmp_path: Path) -> None
     assert res["unresolved_count"] == 2
     dyn = [n for n in res["notes"] if "unresolved/dynamically-built" in n]
     assert len(dyn) == 1 and "2 nvram ops" in dyn[0]
-    # sw_mode has a direct writer but no direct reader -> a distinct wrapper-indirect note fires
+    # node_role has a direct writer but no direct reader -> a distinct wrapper-indirect note fires
     assert any("empty readers" in n and "wrapper" in n for n in res["notes"])
 
 
@@ -258,7 +258,7 @@ def test_absent_key_is_never_confirmed_unused(tmp_path: Path) -> None:
     atlas = _seed(tmp_path, [_flow("other_key", "constant", "rc", "f", "write")])
     conn = open_atlas(atlas)
     try:
-        res = get_nvram_key_flow(conn, "oauth_auth_code")
+        res = get_nvram_key_flow(conn, "acct_link_code")
     finally:
         conn.close()
     assert res["found"] is False
@@ -273,10 +273,10 @@ def test_absent_key_is_never_confirmed_unused(tmp_path: Path) -> None:
 def test_direct_writer_but_no_direct_reader_warns_wrapper(tmp_path: Path) -> None:
     # A key written directly but read only via a wrapper: readers is empty, but the tool must warn
     # that a wrapper reader is uncaptured — never letting readers:[] read as "no consumer".
-    atlas = _seed(tmp_path, [_flow("oauth_auth_code", "constant", "httpd", "save", "write")])
+    atlas = _seed(tmp_path, [_flow("acct_link_code", "constant", "httpd", "save", "write")])
     conn = open_atlas(atlas)
     try:
-        res = get_nvram_key_flow(conn, "oauth_auth_code")
+        res = get_nvram_key_flow(conn, "acct_link_code")
     finally:
         conn.close()
     assert [w["binary"] for w in res["writers"]] == ["httpd"]
@@ -292,13 +292,13 @@ def test_web_settable_yes_when_frontend_editable_and_backend_key(tmp_path: Path)
     # The money path: an editable front-end field AND a back-end nvram key -> a web-settable key.
     atlas = _seed(
         tmp_path,
-        [_flow("fb_comment", "constant", "httpd", "save", "write")],
-        form_fields=[_field("fb_comment", rule="textarea")],
+        [_flow("rpt_comment", "constant", "httpd", "save", "write")],
+        form_fields=[_field("rpt_comment", rule="textarea")],
     )
     conn = open_atlas(atlas)
     try:
-        ws = _web_settable(conn, "fb_comment")
-        res = get_nvram_key_flow(conn, "fb_comment")
+        ws = _web_settable(conn, "rpt_comment")
+        res = get_nvram_key_flow(conn, "rpt_comment")
     finally:
         conn.close()
     assert ws["web_settable"] == "yes"
@@ -312,20 +312,20 @@ def test_web_settable_carries_frontend_evidence_rows(tmp_path: Path) -> None:
     # demote a keyword collision. The verdict itself is unchanged (still 'yes').
     atlas = _seed(
         tmp_path,
-        [_flow("fb_comment", "constant", "httpd", "save", "write")],
-        form_fields=[_field("fb_comment", rule="textarea")],
+        [_flow("rpt_comment", "constant", "httpd", "save", "write")],
+        form_fields=[_field("rpt_comment", rule="textarea")],
     )
     conn = open_atlas(atlas)
     try:
-        ws = _web_settable(conn, "fb_comment")
-        res = get_nvram_key_flow(conn, "fb_comment")
+        ws = _web_settable(conn, "rpt_comment")
+        res = get_nvram_key_flow(conn, "rpt_comment")
     finally:
         conn.close()
     assert ws["web_settable"] == "yes"  # verdict unchanged by exposing evidence
     assert ws["evidence"] == [
         {
-            "field_keyword": "fb_comment",
-            "source_asset": "Feedback.asp",
+            "field_keyword": "rpt_comment",
+            "source_asset": "Report.asp",
             "source_rule": "textarea",
             "source_run_id": "run_a",
             "match_kind": "exact",
@@ -336,24 +336,24 @@ def test_web_settable_carries_frontend_evidence_rows(tmp_path: Path) -> None:
 
 
 def test_web_settable_naming_variant_evidence_is_tagged(tmp_path: Path) -> None:
-    # A key whose only front-end field is a naming-variant mirror (http_username -> http_username_x)
+    # A key whose only front-end field is a naming-variant mirror (web_user -> web_user_x)
     # is 'uncertain', but the evidence still exposes the variant row tagged naming_variant, so an
     # agent sees WHY it is uncertain — a mirror field, not an exact editable field.
     atlas = _seed(
         tmp_path,
-        [_flow("http_username", "constant", "httpd", "auth", "read")],
-        form_fields=[_field("http_username_x")],
+        [_flow("web_user", "constant", "httpd", "auth", "read")],
+        form_fields=[_field("web_user_x")],
     )
     conn = open_atlas(atlas)
     try:
-        ws = _web_settable(conn, "http_username")
+        ws = _web_settable(conn, "web_user")
     finally:
         conn.close()
     assert ws["web_settable"] == "uncertain"  # variant is not a proven exact editable field
     assert ws["evidence"] == [
         {
-            "field_keyword": "http_username_x",
-            "source_asset": "Feedback.asp",
+            "field_keyword": "web_user_x",
+            "source_asset": "Report.asp",
             "source_rule": "input",
             "source_run_id": "run_a",
             "match_kind": "naming_variant",
@@ -362,25 +362,25 @@ def test_web_settable_naming_variant_evidence_is_tagged(tmp_path: Path) -> None:
 
 
 def test_web_settable_three_state_never_emits_no(tmp_path: Path) -> None:
-    # ④/M2 THREE-STATE {yes, likely, uncertain}: back-end-only (firmver, a read-only display) and
-    # front-end-only (Connect_btn, a UI control), NEITHER a router_defaults member (no defaults
+    # ④/M2 THREE-STATE {yes, likely, uncertain}: back-end-only (fwrev, a read-only display) and
+    # front-end-only (Link_btn, a UI control), NEITHER a router_defaults member (no defaults
     # seeded -> table not located), both land 'uncertain' — NEVER 'no' (inferring 'not settable'
     # from a missing side is a false-negative) and NEVER 'likely' (not a defaults member). The
     # frontend/backend flags still expose which side was present, honestly.
     atlas = _seed(
         tmp_path,
-        [_flow("firmver", "constant", "httpd", "show", "read")],
-        form_fields=[_field("fb_comment", rule="textarea"), _field("Connect_btn")],
+        [_flow("fwrev", "constant", "httpd", "show", "read")],
+        form_fields=[_field("rpt_comment", rule="textarea"), _field("Link_btn")],
     )
     conn = open_atlas(atlas)
     try:
-        firmver = _web_settable(conn, "firmver")  # back-end only
-        btn = _web_settable(conn, "Connect_btn")  # front-end only
+        fwrev = _web_settable(conn, "fwrev")  # back-end only
+        btn = _web_settable(conn, "Link_btn")  # front-end only
     finally:
         conn.close()
-    assert firmver["web_settable"] == "uncertain"
-    assert firmver["web_settable"] not in ("no", "likely")
-    assert firmver["backend"] is True and firmver["frontend"] is False
+    assert fwrev["web_settable"] == "uncertain"
+    assert fwrev["web_settable"] not in ("no", "likely")
+    assert fwrev["backend"] is True and fwrev["frontend"] is False
     assert btn["web_settable"] == "uncertain"
     assert btn["web_settable"] not in ("no", "likely")
     assert btn["frontend"] is True and btn["backend"] is False
@@ -388,17 +388,17 @@ def test_web_settable_three_state_never_emits_no(tmp_path: Path) -> None:
 
 def test_web_settable_likely_when_router_defaults_member_but_not_a_cross(tmp_path: Path) -> None:
     # M2 positive: a key that is NOT a proven SaTC cross (back-end read only, no editable front-end
-    # field) but IS a router_defaults member -> 'likely' (the OAuth shape: oauth_auth_code is
+    # field) but IS a router_defaults member -> 'likely' (the OAuth shape: acct_link_code is
     # read back-end and sits in router_defaults, but is not a front-end form field).
     atlas = _seed(
         tmp_path,
-        [_flow("oauth_auth_code", "constant", "httpd", "wrap_read", "read")],
-        defaults=[_default("oauth_auth_code", default_value="")],
+        [_flow("acct_link_code", "constant", "httpd", "wrap_read", "read")],
+        defaults=[_default("acct_link_code", default_value="")],
     )
     conn = open_atlas(atlas)
     try:
-        ws = _web_settable(conn, "oauth_auth_code")
-        res = get_nvram_key_flow(conn, "oauth_auth_code")
+        ws = _web_settable(conn, "acct_link_code")
+        res = get_nvram_key_flow(conn, "acct_link_code")
     finally:
         conn.close()
     assert ws["web_settable"] == "likely"  # router_defaults member, not a proven cross
@@ -409,15 +409,15 @@ def test_web_settable_not_likely_when_not_a_router_defaults_member(tmp_path: Pat
     # ★ SEAM #13 guardrail: a key that is NOT a router_defaults member (the table is located AND
     # complete, another key is present) must NOT read 'likely' — it stays 'uncertain'. This is the
     # M3 red line in test form: the likely gate is in_router_defaults membership ONLY, never
-    # widened. log_wlstat_dir / productid are exactly this internal-key case.
+    # widened. log_radiostat_dir / modelcode are exactly this internal-key case.
     atlas = _seed(
         tmp_path,
-        [_flow("log_wlstat_dir", "constant", "httpd", "wrap_read", "read")],
-        defaults=[_default("http_passwd", default_value="")],  # located+complete, other key present
+        [_flow("log_radiostat_dir", "constant", "httpd", "wrap_read", "read")],
+        defaults=[_default("web_pass", default_value="")],  # located+complete, other key present
     )
     conn = open_atlas(atlas)
     try:
-        ws = _web_settable(conn, "log_wlstat_dir")
+        ws = _web_settable(conn, "log_radiostat_dir")
     finally:
         conn.close()
     assert ws["router_defaults"]["in_router_defaults"] is False  # definite non-member
@@ -427,10 +427,10 @@ def test_web_settable_not_likely_when_not_a_router_defaults_member(tmp_path: Pat
 
 def test_web_settable_uncertain_when_frontend_not_collected(tmp_path: Path) -> None:
     # ★ false-negative red line: no web_form_fields rows (M1 not run) -> uncertain, NEVER 'no'.
-    atlas = _seed(tmp_path, [_flow("sw_mode", "constant", "rc", "set_mode", "write")])
+    atlas = _seed(tmp_path, [_flow("node_role", "constant", "rc", "set_mode", "write")])
     conn = open_atlas(atlas)
     try:
-        ws = _web_settable(conn, "sw_mode")
+        ws = _web_settable(conn, "node_role")
     finally:
         conn.close()
     assert ws["web_settable"] == "uncertain"
@@ -453,16 +453,16 @@ def test_web_settable_yes_via_wl_index_normalization(tmp_path: Path) -> None:
 
 
 def test_web_settable_uncertain_for_naming_variant_field(tmp_path: Path) -> None:
-    # http_username: the editable field is http_username_x (a naming variant); the bare key is
+    # web_user: the editable field is web_user_x (a naming variant); the bare key is
     # front-end-missed -> uncertain, NOT a false 'no' (a variant may be the editable mirror).
     atlas = _seed(
         tmp_path,
-        [_flow("http_username", "constant", "httpd", "read_cred", "read")],
-        form_fields=[_field("http_username_x", rule="input")],
+        [_flow("web_user", "constant", "httpd", "read_cred", "read")],
+        form_fields=[_field("web_user_x", rule="input")],
     )
     conn = open_atlas(atlas)
     try:
-        ws = _web_settable(conn, "http_username")
+        ws = _web_settable(conn, "web_user")
     finally:
         conn.close()
     assert ws["web_settable"] == "uncertain"
@@ -473,13 +473,13 @@ def test_web_settable_router_defaults_rides_along_as_auxiliary(tmp_path: Path) -
     # router_defaults is kept as an auxiliary reference field, not the primary judgement.
     atlas = _seed(
         tmp_path,
-        [_flow("fb_comment", "constant", "httpd", "save", "write")],
-        defaults=[_default("fb_comment", default_value="", flags=0x80, member_index=894)],
-        form_fields=[_field("fb_comment", rule="textarea")],
+        [_flow("rpt_comment", "constant", "httpd", "save", "write")],
+        defaults=[_default("rpt_comment", default_value="", flags=0x80, member_index=894)],
+        form_fields=[_field("rpt_comment", rule="textarea")],
     )
     conn = open_atlas(atlas)
     try:
-        ws = _web_settable(conn, "fb_comment")
+        ws = _web_settable(conn, "rpt_comment")
     finally:
         conn.close()
     assert ws["web_settable"] == "yes"
@@ -523,10 +523,10 @@ def test_run_id_scopes_every_part_of_the_graph(tmp_path: Path) -> None:
     conn = open_atlas(tmp_path / "atlas.db")
     rows = [
         # (run, key, kind) — the same key in two firmwares, plus a template and an unresolved op
-        ("fw_a", "http_passwd", "constant"),
-        ("fw_b", "http_passwd", "constant"),
-        ("fw_a", "http_%s", "parametric"),
-        ("fw_b", "http_%s", "parametric"),
+        ("fw_a", "web_pass", "constant"),
+        ("fw_b", "web_pass", "constant"),
+        ("fw_a", "web_%s", "parametric"),
+        ("fw_b", "web_%s", "parametric"),
         ("fw_a", None, "unresolved"),
         ("fw_b", None, "unresolved"),
     ]
@@ -546,12 +546,12 @@ def test_run_id_scopes_every_part_of_the_graph(tmp_path: Path) -> None:
         ],
     )
 
-    everywhere = get_nvram_key_flow(conn, "http_passwd")
+    everywhere = get_nvram_key_flow(conn, "web_pass")
     assert {e["source_run_id"] for e in everywhere["readers"]} == {"fw_a", "fw_b"}
     assert len(everywhere["template_matches"]) == 2
     assert everywhere["unresolved_count"] == 2
 
-    scoped = get_nvram_key_flow(conn, "http_passwd", run_id="fw_a")
+    scoped = get_nvram_key_flow(conn, "web_pass", run_id="fw_a")
     assert {e["source_run_id"] for e in scoped["readers"]} == {"fw_a"}
     assert [t["source_run_id"] for t in scoped["template_matches"]] == ["fw_a"]
     assert scoped["unresolved_count"] == 1  # the caveat is now about THIS run, not the atlas
@@ -568,15 +568,15 @@ def test_web_settable_reads_only_the_candidates_own_run(tmp_path: Path) -> None:
 
     atlas = _seed(
         tmp_path,
-        [_flow("fb_comment", "constant", "httpd", "save", "read")],
-        form_fields=[_field("fb_comment", run="run_b")],
+        [_flow("rpt_comment", "constant", "httpd", "save", "read")],
+        form_fields=[_field("rpt_comment", run="run_b")],
     )
     conn = open_atlas(atlas)
     try:
-        own = _web_settable(conn, "fb_comment", "run_a")
+        own = _web_settable(conn, "rpt_comment", "run_a")
         with run_scope("run_a"):
-            scoped = _web_settable(conn, "fb_comment")
-        whole = _web_settable(conn, "fb_comment")
+            scoped = _web_settable(conn, "rpt_comment")
+        whole = _web_settable(conn, "rpt_comment")
     finally:
         conn.close()
     assert own["web_settable"] == "uncertain" and own["frontend"] == "uncertain"

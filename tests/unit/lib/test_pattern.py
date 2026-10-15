@@ -40,6 +40,8 @@ from treasure_map.lib.pattern.models import FuncRef, PatternStats
 from treasure_map.lib.pattern.scanner import DETECTORS, shape_scan_invariant_holds
 from treasure_map.lib.storage.connection import open_db
 
+from ..boundary_words import listed_words_in
+
 _PATTERN_PKG = Path(__file__).resolve().parents[3] / "src" / "treasure_map" / "lib" / "pattern"
 
 
@@ -550,13 +552,14 @@ def test_fingerprint_stable_and_shape_distinct(tmp_path: Path) -> None:
 
 def test_pattern_package_is_boundary_clean() -> None:
     label_vocab = re.compile(
-        r"\b(vuln\w*|exploit\w*|payload|finding|incomplete_patch|fix_quality|priority)\b",
+        r"\b(vuln\w*|exploit\w*|payload|finding|priority)\b",
         re.IGNORECASE,
     )
     section_ref = re.compile(r"§|PRD\s")
     for path in _PATTERN_PKG.glob("*.py"):
         text = path.read_text()
         assert not label_vocab.search(text), f"vuln/judgment label in {path.name}"
+        assert not listed_words_in(text), f"listed judgment label in {path.name}"
         assert not section_ref.search(text), f"section/private-doc ref in {path.name}"
 
 
@@ -1209,7 +1212,7 @@ def test_command_callee_never_spelled_out_still_yields_one_candidate(tmp_path: P
 # and the authority merges them into the SAME source order as the textual ones — so "the Nth call"
 # means one thing no matter how each call happened to be rendered.
 
-_STUB_BODY = "memcpy(a, b, 4); FUN_004125b0(c); memcpy(d, e, n);"
+_STUB_BODY = "memcpy(a, b, 4); FUN_0041eb38(c); memcpy(d, e, n);"
 
 
 def test_call_offsets_without_a_stub_table_is_unchanged() -> None:
@@ -1235,10 +1238,10 @@ def test_a_stub_rendered_call_joins_in_source_order() -> None:
 
     MUTATION (measured: 1 failed, this test alone): concatenate without sorting -> the merged
     offsets stop ascending and the stub call is reported last instead of second."""
-    offsets = call_offsets(_STUB_BODY, "system", {0x4125B0: "system"})
+    offsets = call_offsets(_STUB_BODY, "system", {0x41EB38: "system"})
     assert len(offsets) == 1
-    assert offsets[0] == _STUB_BODY.index("FUN_004125b0(") + len("FUN_004125b0")
-    merged = call_offsets(_STUB_BODY, "memcpy", {0x4125B0: "memcpy"})
+    assert offsets[0] == _STUB_BODY.index("FUN_0041eb38(") + len("FUN_0041eb38")
+    merged = call_offsets(_STUB_BODY, "memcpy", {0x41EB38: "memcpy"})
     assert len(merged) == 3
     assert list(merged) == sorted(merged)  # the stub call is second, not appended last
 
@@ -1252,7 +1255,7 @@ def test_a_stub_address_mapping_to_another_import_is_not_this_callee() -> None:
     MUTATION (measured: 2 failed): treat any address present in the table as a match -> this guard
     and the enumerator's both go red, because the stub counts as a system call while the table
     says it is memcpy."""
-    assert call_offsets(_STUB_BODY, "system", {0x4125B0: "memcpy"}) == ()
+    assert call_offsets(_STUB_BODY, "system", {0x41EB38: "memcpy"}) == ()
     assert call_offsets(_STUB_BODY, "system", {0x999999: "system"}) == ()  # address not in the text
 
 
@@ -1265,7 +1268,7 @@ def test_sink_callsites_enumerates_stub_rendered_calls_too() -> None:
 
     MUTATION (measured: 1 failed, this test alone): drop the stub_names forward in sink_callsites
     -> only the two memcpys are enumerated and the recovered sink has no callsite at all."""
-    sites = sink_callsites(_STUB_BODY, {"memcpy", "system"}, {0x4125B0: "system"})
+    sites = sink_callsites(_STUB_BODY, {"memcpy", "system"}, {0x41EB38: "system"})
     assert [(s.index, s.sink_name, s.occurrence) for s in sites] == [
         (0, "memcpy", 0),
         (1, "system", 0),
@@ -1292,9 +1295,9 @@ def test_a_stub_rendered_path_call_can_only_turn_constant_off() -> None:
     MUTATION (measured: 1 failed, this test alone): drop the stub_names forward in
     all_path_calls_literal -> the second assertion reads True, i.e. a variable path is reported as
     a fixed one and the candidate is sunk as provably safe."""
-    body = 'fopen("/etc/svc.conf", "r"); FUN_004125b0(p, "w");'
+    body = 'fopen("/etc/svc.conf", "r"); FUN_0041eb38(p, "w");'
     assert all_path_calls_literal(body, "fopen") is True  # only the textual call is visible
-    assert all_path_calls_literal(body, "fopen", {0x4125B0: "fopen"}) is False
+    assert all_path_calls_literal(body, "fopen", {0x41EB38: "fopen"}) is False
 
 
 def test_a_stub_rendered_format_call_is_judged_with_the_others() -> None:
@@ -1306,9 +1309,9 @@ def test_a_stub_rendered_format_call_is_judged_with_the_others() -> None:
     MUTATION (measured: 1 failed, this test alone): drop the stub_names forward in
     all_format_calls_literal -> the exemption survives a non-literal call, which is the gate
     firing on a call nobody looked at."""
-    body = 'printf("ready\\n"); FUN_00412560(user);'
+    body = 'printf("ready\\n"); FUN_0041eae8(user);'
     assert all_format_calls_literal(body, "printf") is True
-    assert all_format_calls_literal(body, "printf", {0x412560: "printf"}) is False
+    assert all_format_calls_literal(body, "printf", {0x41EAE8: "printf"}) is False
 
 
 def test_the_danger_axis_identifiers_come_from_the_stub_call_too() -> None:
@@ -1320,12 +1323,12 @@ def test_the_danger_axis_identifiers_come_from_the_stub_call_too() -> None:
     MUTATION (measured: 1 failed each, this test alone): drop the stub_names forward in
     format_string_ident, or in path_arg_ident -> that reader returns None while a variable really
     is reaching the sink. Both were measured separately; each fails only this guard."""
-    fmt_body = 'printf("ready\\n"); FUN_00412560(user);'
+    fmt_body = 'printf("ready\\n"); FUN_0041eae8(user);'
     assert format_string_ident(fmt_body, "printf") is None
-    assert format_string_ident(fmt_body, "printf", {0x412560: "printf"}) == "user"
-    path_body = 'fopen("/etc/svc.conf", "r"); FUN_004125b0(chosen, "w");'
+    assert format_string_ident(fmt_body, "printf", {0x41EAE8: "printf"}) == "user"
+    path_body = 'fopen("/etc/svc.conf", "r"); FUN_0041eb38(chosen, "w");'
     assert path_arg_ident(path_body, "fopen") is None
-    assert path_arg_ident(path_body, "fopen", {0x4125B0: "fopen"}) == "chosen"
+    assert path_arg_ident(path_body, "fopen", {0x41EB38: "fopen"}) == "chosen"
 
 
 # ── sink-alias completion: same-signature aliases of covered sinks are recalled ─────────

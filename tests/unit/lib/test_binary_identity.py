@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """A short name is a LABEL; the binary's identity is its row.
 
-One firmware ships the same ``libshared.so.6`` under two roots, with different content, different
+One firmware ships the same ``libcommon.so.6`` under two roots, with different content, different
 function tables and different data. Every read that selected a binary by name and took what came
 back was answering about whichever row the database returned — silently, and not necessarily the
 same row for two queries over the same firmware. This file pins the replacement: one resolver,
@@ -29,12 +29,12 @@ from treasure_map.lib import facts
 from treasure_map.lib.binary_id import resolve_binary, resolve_binary_in_db
 from treasure_map.lib.storage.connection import open_db
 
-NAME = "libshared.so.6"
+NAME = "libcommon.so.6"
 SHA = {"A": "a" * 64, "B": "b" * 64, "C": "c" * 64}
 PATHS = {
-    "A": "ftpclient/usr/lib/libshared.so.6",
-    "B": "lib/libshared.so.6",
-    "C": "opt/lib/libshared.so.6",
+    "A": "xferclient/usr/lib/libcommon.so.6",
+    "B": "lib/libcommon.so.6",
+    "C": "opt/lib/libcommon.so.6",
 }
 # Same short name, same address, different function name: the shape that makes a merged baseline
 # domain wrong about the entries it does contain rather than merely short.

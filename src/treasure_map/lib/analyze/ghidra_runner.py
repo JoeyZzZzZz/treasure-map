@@ -233,8 +233,8 @@ def adaptive_heap_mb(size_bytes: int) -> tuple[int, int]:
 
     A per-binary ladder is why a 500KB library runs in 512MB while a 60MB one gets 2048MB: a single
     machine-wide heap would either starve the big binary or waste memory on the small one (and cut
-    how many can run in parallel). Shared so ``diff``'s BinExport can adopt the same model in place
-    of a hardcoded ceiling. xms is 1/8 of xmx (min 64MB), matching the JVM's usual init/max ratio.
+    how many can run in parallel). ``diff``'s BinExport does not use it (it keeps its own fixed
+    heap). xms is 1/8 of xmx (min 64MB), matching the JVM's usual init/max ratio.
     """
     size_mb = size_bytes / 1024 / 1024
     xmx = 512 if size_mb < 1 else 768 if size_mb < 10 else 1536 if size_mb < 50 else 2048
@@ -647,8 +647,9 @@ class GhidraRunner:
           binary with a doubled budget (capped at the ceiling), ONLY when ``retry`` is True.
 
         ★ ``retry`` gates the TIMEOUT retry so ``run_all`` can defer it: phase 1 runs every binary
-        once IN PARALLEL (retry=False), phase 2 re-runs the failures SERIALLY (retry=True) so a big
-        binary retries with the CPU to itself instead of competing in the pool. A still-failing
+        once IN PARALLEL (retry=False), phase 2 re-runs the failures SERIALLY as ONE more attempt
+        at an already-doubled budget (also retry=False), so a big binary retries with the CPU to
+        itself instead of competing in the pool. A still-failing
         retry returns success=False with an explicit ``reason`` — never a fabricated 'ok'.
         """
         headless = self.get_headless()

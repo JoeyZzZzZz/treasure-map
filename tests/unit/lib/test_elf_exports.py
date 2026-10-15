@@ -29,8 +29,8 @@ from treasure_map.lib.analyze.ghidra_ingest import ingest_ghidra_output
 from treasure_map.lib.storage.connection import open_db
 
 _FIXTURES = Path(__file__).resolve().parents[2] / "fixtures" / "elfs"
-_LIBZ = _FIXTURES / "libz_x86_64.so"
-_TRUE = _FIXTURES / "true_x86_64"
+_LIB = _FIXTURES / "libfixture_x86_64.so"
+_EXE = _FIXTURES / "exe_x86_64"
 
 
 def _exports_via_section(path: Path) -> set[str]:
@@ -70,12 +70,12 @@ def test_the_exports_match_an_independently_read_symbol_table() -> None:
     #
     # MUTATION (measured: 1 failed, this test): in dynamic_function_exports drop the STT_FUNC
     # test -> non-function symbols join the set and it stops equalling the oracle.
-    exports = dynamic_function_exports(_LIBZ)
+    exports = dynamic_function_exports(_LIB)
     assert exports is not None
-    assert set(exports) == _exports_via_section(_LIBZ)
+    assert set(exports) == _exports_via_section(_LIB)
     # and the anchor is non-empty, so "both empty" cannot be what makes this pass
     assert len(exports) > 50
-    assert "compress" in exports and "adler32" in exports
+    assert "fx_checksum" in exports and "fx_pack" in exports
 
 
 def test_an_imported_function_is_not_an_export() -> None:
@@ -86,9 +86,9 @@ def test_an_imported_function_is_not_an_export() -> None:
     # MUTATION (measured: 3 failed — this test, the oracle-equality test, and the three-state
     # test): drop the `st_shndx == SHN_UNDEF` skip -> the undefined imports below join the set,
     # and an executable that exports nothing stops reading as empty.
-    exports = dynamic_function_exports(_LIBZ)
+    exports = dynamic_function_exports(_LIB)
     assert exports is not None
-    with _LIBZ.open("rb") as fh:
+    with _LIB.open("rb") as fh:
         section = ELFFile(fh).get_section_by_name(".dynsym")
         assert section is not None
         undefined = {
@@ -101,17 +101,17 @@ def test_an_imported_function_is_not_an_export() -> None:
 
 
 def test_a_section_stripped_binary_still_answers(tmp_path: Path) -> None:
-    # ★ THE REASON THE SEGMENT IS READ AND NOT THE SECTION. Real firmware ships shared objects with
-    # no section table: of the shared objects sampled from one ARM firmware, 5 of 5 were in this
-    # state. A section-based read answers None for every one of them — every export lost, silently.
+    # ★ THE REASON THE SEGMENT IS READ AND NOT THE SECTION. Real firmware commonly ships shared
+    # objects with no section table. A section-based read answers None for every one of them —
+    # every export lost, silently.
     #
     # MUTATION (measured: 1 failed, this test): read `.dynsym` via get_section_by_name instead of
-    # the DYNAMIC segment -> this returns None where the unstripped copy returned its 88 names.
+    # the DYNAMIC segment -> this returns None where the unstripped copy returned its 60 names.
     stripped = tmp_path / "stripped.so"
-    _strip_section_headers(_LIBZ, stripped)
+    _strip_section_headers(_LIB, stripped)
     with stripped.open("rb") as fh:
         assert ELFFile(fh).get_section_by_name(".dynsym") is None, "the strip must really strip"
-    assert dynamic_function_exports(stripped) == dynamic_function_exports(_LIBZ)
+    assert dynamic_function_exports(stripped) == dynamic_function_exports(_LIB)
 
 
 def test_exporting_nothing_is_not_the_same_as_being_unreadable(tmp_path: Path) -> None:
@@ -121,7 +121,7 @@ def test_exporting_nothing_is_not_the_same_as_being_unreadable(tmp_path: Path) -
     #
     # MUTATION (measured: 1 failed, this test): return frozenset() instead of None on both
     # unreadable paths -> the three states below stop being distinguishable.
-    empty = dynamic_function_exports(_TRUE)
+    empty = dynamic_function_exports(_EXE)
     assert empty == frozenset()
     assert dynamic_function_exports(tmp_path / "does_not_exist") is None
     assert dynamic_function_exports(tmp_path) is None  # a directory, not an ELF
@@ -132,7 +132,7 @@ def test_exporting_nothing_is_not_the_same_as_being_unreadable(tmp_path: Path) -
 
 def _one_binary_db(tmp_path: Path) -> tuple[sqlite3.Connection, dict[str, int]]:
     conn = open_db(tmp_path / "analysis.db")
-    conn.execute("INSERT INTO binaries (name, sha256) VALUES (?, ?)", ("libz", "b" * 64))
+    conn.execute("INSERT INTO binaries (name, sha256) VALUES (?, ?)", ("libfixture", "b" * 64))
     conn.commit()
     binary_id = conn.execute("SELECT id FROM binaries WHERE sha256 = ?", ("b" * 64,)).fetchone()[0]
     return conn, {"b" * 64: binary_id}
@@ -158,23 +158,23 @@ def test_ingest_flags_the_real_exports_and_not_the_claimed_ones(tmp_path: Path) 
     # reads is_exported from the payload again, instead of both happening to agree.
     #
     # MUTATION (measured: 2 failed — this test and the unreadable-binary one): restore
-    # `int(func.get("is_exported", 0))` in ghidra_ingest -> compress reads 0 and
+    # `int(func.get("is_exported", 0))` in ghidra_ingest -> fx_checksum reads 0 and
     # not_a_real_symbol reads 1, i.e. exactly inverted.
     conn, sha_to_id = _one_binary_db(tmp_path)
     output_dir = tmp_path / "ghidra_output"
     _write_json(
         output_dir,
-        "libz",
+        "libfixture",
         "b" * 64,
         {
             "functions": [
                 {
-                    "name": "compress",  # a real export of the fixture
+                    "name": "fx_checksum",  # a real export of the fixture
                     "address": "1000",
                     "size": 64,
                     "is_exported": 0,  # the payload says NO; the ELF says yes
                     "callees": ["memcpy"],
-                    "pseudocode": "int compress(void){ return 0; }",
+                    "pseudocode": "int fx_checksum(void){ return 0; }",
                 },
                 {
                     "name": "not_a_real_symbol",  # not in the fixture's dynamic table
@@ -191,10 +191,10 @@ def test_ingest_flags_the_real_exports_and_not_the_claimed_ones(tmp_path: Path) 
         },
     )
 
-    ingest_ghidra_output(conn, output_dir, [_record(_LIBZ, "libz", "b" * 64)], sha_to_id)
+    ingest_ghidra_output(conn, output_dir, [_record(_LIB, "libfixture", "b" * 64)], sha_to_id)
 
     flags = dict(conn.execute("SELECT name, is_exported FROM functions").fetchall())
-    assert flags == {"compress": 1, "not_a_real_symbol": 0}
+    assert flags == {"fx_checksum": 1, "not_a_real_symbol": 0}
     conn.close()
 
 
@@ -209,17 +209,17 @@ def test_an_unreadable_binary_ingests_as_not_shown_to_be_exported(tmp_path: Path
     output_dir = tmp_path / "ghidra_output"
     _write_json(
         output_dir,
-        "libz",
+        "libfixture",
         "b" * 64,
         {
             "functions": [
                 {
-                    "name": "compress",
+                    "name": "fx_checksum",
                     "address": "1000",
                     "size": 64,
                     "is_exported": 1,
                     "callees": ["memcpy"],
-                    "pseudocode": "int compress(void){ return 0; }",
+                    "pseudocode": "int fx_checksum(void){ return 0; }",
                 }
             ],
             "imports": [],
@@ -229,7 +229,9 @@ def test_an_unreadable_binary_ingests_as_not_shown_to_be_exported(tmp_path: Path
     )
 
     missing = tmp_path / "no_such_binary.so"
-    stats = ingest_ghidra_output(conn, output_dir, [_record(missing, "libz", "b" * 64)], sha_to_id)
+    stats = ingest_ghidra_output(
+        conn, output_dir, [_record(missing, "libfixture", "b" * 64)], sha_to_id
+    )
 
     assert stats.functions_ingested == 1
     assert conn.execute("SELECT is_exported FROM functions").fetchone()[0] == 0

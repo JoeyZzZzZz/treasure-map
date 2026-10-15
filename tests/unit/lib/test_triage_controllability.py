@@ -52,23 +52,23 @@ _FID = [0]
 
 
 def _seed_cross(conn: sqlite3.Connection) -> None:
-    """A minimal SaTC cross: fb_comment/wl_ssid editable + a back-end key; firmver back-end only
-    (a read-only hidden display); wrs_cc_t editable + back-end."""
+    """A minimal SaTC cross: rpt_comment/wl_ssid editable + a back-end key; fwrev back-end only
+    (a read-only hidden display); flt_rule_t editable + back-end."""
     add_web_form_field_rows(
         conn,
         [
-            WebFormFieldRow("run_1", "fb_comment", "Feedback.asp", "textarea"),
-            WebFormFieldRow("run_1", "wl_ssid", "Advanced_Wireless.asp", "input"),
-            WebFormFieldRow("run_1", "wrs_cc_t", "Protection.asp", "input"),
+            WebFormFieldRow("run_1", "rpt_comment", "Report.asp", "textarea"),
+            WebFormFieldRow("run_1", "wl_ssid", "Setup_Radio.asp", "input"),
+            WebFormFieldRow("run_1", "flt_rule_t", "Filter_Rules.asp", "input"),
         ],
     )
     add_nvram_flow_rows(
         conn,
         [
-            NvramFlowRow("run_1", "fb_comment", "constant", "httpd", "save", "write"),
+            NvramFlowRow("run_1", "rpt_comment", "constant", "httpd", "save", "write"),
             NvramFlowRow("run_1", "wl0_ssid", "constant", "httpd", "save", "write"),
-            NvramFlowRow("run_1", "wrs_cc_t", "constant", "wrs", "load", "read"),
-            NvramFlowRow("run_1", "firmver", "constant", "httpd", "show", "read"),
+            NvramFlowRow("run_1", "flt_rule_t", "constant", "wrs", "load", "read"),
+            NvramFlowRow("run_1", "fwrev", "constant", "httpd", "show", "read"),
         ],
     )
 
@@ -181,7 +181,7 @@ def test_web_settable_key_reaching_sink_is_controllable(tmp_path: Path) -> None:
         conn,
         p,
         sink_anchor="fprintf",
-        flow_evidence=_stack_buf_prov("fprintf", [_getter_vararg("fb_comment")]),
+        flow_evidence=_stack_buf_prov("fprintf", [_getter_vararg("rpt_comment")]),
         source_kind="unknown",  # top-level source_kind is collapsed — the verdict must not need it
     )
     conn.close()
@@ -190,7 +190,7 @@ def test_web_settable_key_reaching_sink_is_controllable(tmp_path: Path) -> None:
 
 
 def test_another_firmwares_front_end_does_not_make_a_key_settable(tmp_path: Path) -> None:
-    """run_2 reads fb_comment into the same sink, but only run_1 has the form field and the
+    """run_2 reads rpt_comment into the same sink, but only run_1 has the form field and the
     back-end key: in run_2 the key is not proven settable, so nothing is promoted on it.
 
     MUTATION: read web_settable over the whole atlas for a candidate (no run scope) -> RED."""
@@ -200,7 +200,7 @@ def test_another_firmwares_front_end_does_not_make_a_key_settable(tmp_path: Path
         conn,
         p,
         sink_anchor="fprintf",
-        flow_evidence=_stack_buf_prov("fprintf", [_getter_vararg("fb_comment")]),
+        flow_evidence=_stack_buf_prov("fprintf", [_getter_vararg("rpt_comment")]),
         source_kind="unknown",
         run="run_2",
     )
@@ -223,7 +223,7 @@ def test_explain_reads_the_settable_key_with_the_candidates_own_run(tmp_path: Pa
             conn,
             p,
             sink_anchor="fprintf",
-            flow_evidence=_stack_buf_prov("fprintf", [_getter_vararg("fb_comment")]),
+            flow_evidence=_stack_buf_prov("fprintf", [_getter_vararg("rpt_comment")]),
             source_kind="unknown",
             run=run,
         )
@@ -243,7 +243,7 @@ def test_explain_reads_the_settable_key_with_the_candidates_own_run(tmp_path: Pa
 
 
 def test_non_web_settable_getter_key_is_not_promoted(tmp_path: Path) -> None:
-    # firmver: a back-end key but not an editable front-end field -> web_settable=uncertain (④: no
+    # fwrev: a back-end key but not an editable front-end field -> web_settable=uncertain (④: no
     # 'no' state) -> NOT controllable -> falls through to source_kind.
     conn = _atlas(tmp_path)
     p = _pattern(conn, "fp_fw", sink_class="fmt_string")
@@ -251,7 +251,7 @@ def test_non_web_settable_getter_key_is_not_promoted(tmp_path: Path) -> None:
         conn,
         p,
         sink_anchor="fprintf",
-        flow_evidence=_stack_buf_prov("fprintf", [_getter_vararg("firmver")]),
+        flow_evidence=_stack_buf_prov("fprintf", [_getter_vararg("fwrev")]),
         source_kind="unknown",
     )
     conn.close()
@@ -365,8 +365,9 @@ def test_system_single_constant_arg_is_still_constant(tmp_path: Path) -> None:
 def test_verdict_is_scoped_to_the_anchored_sink(tmp_path: Path) -> None:
     conn = _atlas(tmp_path)
     p = _pattern(conn, "fp_two", sink_class="cmd")
-    # One function, TWO sinks: system(constant) + fprintf(fb_comment). The @cmd candidate anchors on
-    # system (constant) and must stay constant; the fb_comment reaches only the fprintf sibling.
+    # One function, TWO sinks: system(constant) + fprintf(rpt_comment). The @cmd candidate anchors
+    # on system (constant) and must stay constant; the rpt_comment reaches only the fprintf
+    # sibling.
     prov = {
         "sink_arg_provenance": [
             {
@@ -389,7 +390,7 @@ def test_verdict_is_scoped_to_the_anchored_sink(tmp_path: Path) -> None:
                             "writer": "snprintf@0x2",
                             "dominates_sink": True,
                             "fmt": "%s",
-                            "varargs": [_getter_vararg("fb_comment")],
+                            "varargs": [_getter_vararg("rpt_comment")],
                         }
                     ],
                 },
@@ -413,7 +414,7 @@ def test_controllable_ranks_above_free(tmp_path: Path) -> None:
         conn,
         p,
         sink_anchor="system",
-        flow_evidence=_stack_buf_prov("system", [_getter_vararg("wrs_cc_t")]),
+        flow_evidence=_stack_buf_prov("system", [_getter_vararg("flt_rule_t")]),
     )
     free_ref = _inst(conn, q, sink_anchor="system", source_kind="free_string")
     conn.close()
@@ -426,7 +427,7 @@ def test_controllable_ranks_above_free(tmp_path: Path) -> None:
 
 
 def test_proven_controllable_ranks_above_param_unknown_same_tier(tmp_path: Path) -> None:
-    # ★ param guardrail 3 (spec M3b): the orthogonal source=param float NEVER overrides certainty —
+    # ★ param guardrail: the orthogonal source=param float NEVER overrides certainty —
     # in the same impact tier (cmd) a proven-controllable nvram candidate outranks an external_input
     # source=param one whose controllability is only unknown. param lifts a lead to "worth a look";
     # it does not vault it past a proven-controllable verdict.
@@ -436,7 +437,7 @@ def test_proven_controllable_ranks_above_param_unknown_same_tier(tmp_path: Path)
         conn,
         p,
         sink_anchor="system",
-        flow_evidence=_stack_buf_prov("system", [_getter_vararg("wrs_cc_t")]),
+        flow_evidence=_stack_buf_prov("system", [_getter_vararg("flt_rule_t")]),
     )
     ext_pid = upsert_pattern(
         conn,
@@ -508,7 +509,7 @@ def test_no_constant_candidate_hides_a_web_settable_key(tmp_path: Path) -> None:
         conn,
         p,
         sink_anchor="fprintf",
-        flow_evidence=_stack_buf_prov("fprintf", [_getter_vararg("fb_comment")]),
+        flow_evidence=_stack_buf_prov("fprintf", [_getter_vararg("rpt_comment")]),
     )
     atlas = open_atlas(tmp_path / "atlas.db")
     cands = triage(atlas)
@@ -532,7 +533,7 @@ def test_reranking_never_reduces_candidate_count(tmp_path: Path) -> None:
         conn,
         p,
         sink_anchor="fprintf",
-        flow_evidence=_stack_buf_prov("fprintf", [_getter_vararg("fb_comment")]),
+        flow_evidence=_stack_buf_prov("fprintf", [_getter_vararg("rpt_comment")]),
     )
     _inst(conn, p, sink_anchor="system", source_kind="free_string")
     _inst(conn, p, sink_anchor="popen", blocking="const_sink_arg")
@@ -579,7 +580,9 @@ def test_proven_note_never_calls_its_own_reading_optimistic_or_unproven(tmp_path
     # re-imports either word into a proven note (e.g. a comparative 'above the optimistic free') is
     # caught — and a real proof is still present, guarding against over-correction.
     conn = _atlas(tmp_path)
-    ctrl_ev = _stack_buf_prov("system", [_getter_vararg("fb_comment")])  # fb_comment: seeded cross
+    ctrl_ev = _stack_buf_prov(
+        "system", [_getter_vararg("rpt_comment")]
+    )  # rpt_comment: seeded cross
     _inst(conn, _pattern(conn, "fp_ctrl"), sink_anchor="system", flow_evidence=ctrl_ev)
     _inst(conn, _pattern(conn, "fp_const"), sink_anchor="system", blocking="const_sink_arg")
     _inst(conn, _pattern(conn, "fp_free"), sink_anchor="system", source_kind="free_string")
@@ -631,7 +634,7 @@ def test_promotion_recall_label_set_crosses_yes(tmp_path: Path) -> None:
     from treasure_map.lib.query.nvram import _web_settable
 
     conn = open_atlas(tmp_path / "atlas.db")
-    labels = ["fb_comment", "wl_ssid", "wl0_ssid", "ddns_hostname_x"]
+    labels = ["rpt_comment", "wl_ssid", "wl0_ssid", "dyndns_host_x"]
     add_web_form_field_rows(
         conn,
         [
@@ -648,16 +651,16 @@ def test_promotion_recall_label_set_crosses_yes(tmp_path: Path) -> None:
 
 
 def test_promotion_recall_x_suffix_variant_is_uncertain_with_named_rule(tmp_path: Path) -> None:
-    # ⑥ known gap, NAMED not hidden: http_username's editable field is the _x mirror
-    # (http_username_x) -> uncertain this phase (never a false 'no'). Rule to add: an X_x suffix.
+    # ⑥ known gap, NAMED not hidden: web_user's editable field is the _x mirror
+    # (web_user_x) -> uncertain this phase (never a false 'no'). Rule to add: an X_x suffix.
     from treasure_map.lib.query.nvram import _web_settable
 
     conn = open_atlas(tmp_path / "atlas.db")
-    add_web_form_field_rows(conn, [WebFormFieldRow("run_1", "http_username_x", "F.asp", "input")])
+    add_web_form_field_rows(conn, [WebFormFieldRow("run_1", "web_user_x", "F.asp", "input")])
     add_nvram_flow_rows(
-        conn, [NvramFlowRow("run_1", "http_username", "constant", "httpd", "cred", "read")]
+        conn, [NvramFlowRow("run_1", "web_user", "constant", "httpd", "cred", "read")]
     )
-    assert _web_settable(conn, "http_username")["web_settable"] == "uncertain"
+    assert _web_settable(conn, "web_user")["web_settable"] == "uncertain"
     conn.close()
 
 
@@ -723,7 +726,7 @@ def _stack_buf_multi(sink: str, writers: list) -> dict:  # type: ignore[type-arg
 
 
 def test_dominating_const_beats_nondominating_controllable_is_const(tmp_path: Path) -> None:
-    # M2 case 3 (the wrs_cc_t core): a DOMINATING const writer + a NON-dominating writer carrying a
+    # The flt_rule_t core: a DOMINATING const writer + a NON-dominating writer carrying a
     # web-settable key that the extractor shows never reaching the sink (overwritten on every path)
     # -> const, NOT controllable. The non-dominating key flows to a different sink.
     conn = _atlas(tmp_path)
@@ -733,7 +736,7 @@ def test_dominating_const_beats_nondominating_controllable_is_const(tmp_path: Pa
         [
             _writer("fixed cmd %s", [_const_va()], dominates=True),  # dominating: all const
             _writer(
-                "SELECT %s", [_getter_vararg("fb_comment")], dominates=False, reaches=False
+                "SELECT %s", [_getter_vararg("rpt_comment")], dominates=False, reaches=False
             ),  # web key, non-dom, never reaching
         ],
     )
@@ -770,7 +773,7 @@ def test_a_non_dominating_writer_that_may_reach_the_sink_blocks_constant(tmp_pat
 
 
 def test_all_dominating_writers_non_controllable_is_not_controllable(tmp_path: Path) -> None:
-    # ★ seam property #8 (wrs_cc_t shape): if every DOMINATING writer lacks a controllable source,
+    # ★ the flt_rule_t shape: if every DOMINATING writer lacks a controllable source,
     # the verdict is not controllable — even though a controllable web key sits in a non-dominating
     # writer. Guards against the dominance filter being bypassed / reverted to ANY-writer.
     conn = _atlas(tmp_path)
@@ -779,9 +782,11 @@ def test_all_dominating_writers_non_controllable_is_not_controllable(tmp_path: P
         "system",
         [
             _writer(
-                "echo [BWMON]%s", [_param_va()], dominates=True
+                "echo [NETMON]%s", [_param_va()], dominates=True
             ),  # dominating: unknown (DPI echo)
-            _writer("SELECT %s", [_getter_vararg("wrs_cc_t")], dominates=False),  # web key, non-dom
+            _writer(
+                "SELECT %s", [_getter_vararg("flt_rule_t")], dominates=False
+            ),  # web key, non-dom
         ],
     )
     ref = _inst(conn, p, sink_anchor="system", flow_evidence=prov, source_kind="unknown")
@@ -791,7 +796,7 @@ def test_all_dominating_writers_non_controllable_is_not_controllable(tmp_path: P
 
 
 def test_dominating_web_key_is_controllable_despite_nondominating_noise(tmp_path: Path) -> None:
-    # ★ seam property #7 (Chain 3 shape): the UNIQUE dominating writer's vararg is a web_settable
+    # ★ the stack-buffer shape: the UNIQUE dominating writer's vararg is a web_settable
     # =YES key -> controllable, even with non-dominating noise writers present. Guards against a
     # future regression to ANY-writer (which would still pass) AND over-filtering that drops it.
     conn = _atlas(tmp_path)
@@ -799,7 +804,9 @@ def test_dominating_web_key_is_controllable_despite_nondominating_noise(tmp_path
     prov = _stack_buf_multi(
         "fprintf",
         [
-            _writer("Feedback: %s", [_getter_vararg("fb_comment")], dominates=True),  # web key, dom
+            _writer(
+                "Feedback: %s", [_getter_vararg("rpt_comment")], dominates=True
+            ),  # web key, dom
             _writer("noise %s", [_const_va()], dominates=False),  # non-dominating const noise
         ],
     )
@@ -815,7 +822,7 @@ def test_no_dominating_writer_falls_back_to_all_not_unknown(tmp_path: Path) -> N
     conn = _atlas(tmp_path)
     p = _pattern(conn, "fp_fallback", sink_class="cmd")
     prov = _stack_buf_multi(
-        "system", [_writer("%s", [_getter_vararg("fb_comment")], dominates=False)]
+        "system", [_writer("%s", [_getter_vararg("rpt_comment")], dominates=False)]
     )
     ref = _inst(conn, p, sink_anchor="system", flow_evidence=prov, source_kind="unknown")
     conn.close()
@@ -828,7 +835,7 @@ def test_pre_field_provenance_without_dominates_sink_falls_back(tmp_path: Path) 
     # w.get() is None -> falsy -> dominating empty -> fall back to all writers (old semantics).
     conn = _atlas(tmp_path)
     p = _pattern(conn, "fp_prefield", sink_class="cmd")
-    prov = _stack_buf_multi("system", [_writer_no_dom_field("%s", [_getter_vararg("fb_comment")])])
+    prov = _stack_buf_multi("system", [_writer_no_dom_field("%s", [_getter_vararg("rpt_comment")])])
     ref = _inst(conn, p, sink_anchor="system", flow_evidence=prov, source_kind="unknown")
     conn.close()
     c = _find(triage(open_atlas(tmp_path / "atlas.db")), ref)
@@ -840,7 +847,7 @@ def test_single_dominating_writer_behavior_unchanged(tmp_path: Path) -> None:
     conn = _atlas(tmp_path)
     p = _pattern(conn, "fp_single", sink_class="fmt_string")
     prov = _stack_buf_multi(
-        "fprintf", [_writer("Feedback: %s", [_getter_vararg("fb_comment")], dominates=True)]
+        "fprintf", [_writer("Feedback: %s", [_getter_vararg("rpt_comment")], dominates=True)]
     )
     ref = _inst(conn, p, sink_anchor="fprintf", flow_evidence=prov, source_kind="unknown")
     conn.close()
@@ -878,20 +885,20 @@ def test_wrapper_read_key_resolves_nvram_source_key(tmp_path: Path) -> None:
     # ★ SEAM #12: a wrapper-read nvram candidate whose getter-return const_args[0] is the key ⇒
     # nvram_source_key is non-None. Guards against M1 regressing to direct-getter-only attribution.
     conn = _atlas(tmp_path)
-    _register_wrapper(conn, "FUN_000b2e80", "oauth_auth_code")
+    _register_wrapper(conn, "FUN_0040870c", "acct_link_code")
     p = _pattern(conn, "fp_wrap", sink_class="cmd")
     ref = _inst(
         conn,
         p,
         sink_anchor="system",
         flow_evidence=_stack_buf_prov(
-            "system", [_getter_vararg("oauth_auth_code", callee="FUN_000b2e80")]
+            "system", [_getter_vararg("acct_link_code", callee="FUN_0040870c")]
         ),
         source_kind="unknown",
     )
     conn.close()
     c = _find(triage(open_atlas(tmp_path / "atlas.db")), ref)
-    assert c.nvram_source_key == "oauth_auth_code"  # wrapper-read key attributed, not None
+    assert c.nvram_source_key == "acct_link_code"  # wrapper-read key attributed, not None
 
 
 def test_unregistered_callee_leaves_nvram_source_key_unresolved(tmp_path: Path) -> None:
@@ -918,15 +925,15 @@ def test_router_defaults_member_wrapper_key_is_likely_controllable(tmp_path: Pat
     # M2/M3 verdict: a wrapper-read key that is a router_defaults member but NOT a proven SaTC cross
     # -> controllability value 'controllable' with state 'likely' (the OAuth shape).
     conn = _atlas(tmp_path)
-    _register_wrapper(conn, "FUN_000b2e80", "oauth_auth_code")
-    _seed_default(conn, "oauth_auth_code")
+    _register_wrapper(conn, "FUN_0040870c", "acct_link_code")
+    _seed_default(conn, "acct_link_code")
     p = _pattern(conn, "fp_oauth", sink_class="cmd")
     ref = _inst(
         conn,
         p,
         sink_anchor="system",
         flow_evidence=_stack_buf_prov(
-            "system", [_getter_vararg("oauth_auth_code", callee="FUN_000b2e80")]
+            "system", [_getter_vararg("acct_link_code", callee="FUN_0040870c")]
         ),
         source_kind="unknown",
     )
@@ -946,14 +953,14 @@ def test_source_writability_dimension_carries_web_evidence() -> None:
 
     ev = [
         {
-            "field_keyword": "fb_comment",
-            "source_asset": "Feedback_Info.asp",
+            "field_keyword": "rpt_comment",
+            "source_asset": "Report_Info.asp",
             "source_rule": "textarea",
             "match_kind": "exact",
         }
     ]
     d = _dim_source_writability(
-        "fb_comment", {"web_settable": "yes", "source": "x", "evidence": ev}
+        "rpt_comment", {"web_settable": "yes", "source": "x", "evidence": ev}
     )
     assert (d.state, d.value) == ("proven", "web_settable")  # verdict unchanged by evidence
     assert d.evidence == tuple(ev)  # the concrete drill-down rows are surfaced
@@ -962,17 +969,17 @@ def test_source_writability_dimension_carries_web_evidence() -> None:
 def test_wrapper_read_non_default_key_stays_unknown(tmp_path: Path) -> None:
     # ★ M4.5 guardrail: a wrapper-read key that is NOT a router_defaults member (table located) must
     # NOT be promoted to likely -- the in_router_defaults gate holds internal keys out. It falls
-    # through to unknown, never a false 'likely' (the log_wlstat_dir / productid case).
+    # through to unknown, never a false 'likely' (the log_radiostat_dir / modelcode case).
     conn = _atlas(tmp_path)
-    _register_wrapper(conn, "FUN_000b2e80", "log_wlstat_dir")
-    _seed_default(conn, "http_passwd")  # table located+complete; log_wlstat_dir is NOT a member
+    _register_wrapper(conn, "FUN_0040870c", "log_radiostat_dir")
+    _seed_default(conn, "web_pass")  # table located+complete; log_radiostat_dir is NOT a member
     p = _pattern(conn, "fp_internal", sink_class="cmd")
     ref = _inst(
         conn,
         p,
         sink_anchor="system",
         flow_evidence=_stack_buf_prov(
-            "system", [_getter_vararg("log_wlstat_dir", callee="FUN_000b2e80")]
+            "system", [_getter_vararg("log_radiostat_dir", callee="FUN_0040870c")]
         ),
         source_kind="unknown",
     )
@@ -986,22 +993,22 @@ def test_proven_controllable_outranks_likely_controllable(tmp_path: Path) -> Non
     # M3.8: within the SAME sink-impact tier, a proven SaTC cross (state proven) ranks above a
     # likely router_defaults key (state likely) -- the certainty tiebreak, proven micro-leads.
     conn = _atlas(tmp_path)
-    _register_wrapper(conn, "FUN_000b2e80", "oauth_auth_code")
-    _seed_default(conn, "oauth_auth_code")
+    _register_wrapper(conn, "FUN_0040870c", "acct_link_code")
+    _seed_default(conn, "acct_link_code")
     pv = _pattern(conn, "fp_proven", sink_class="cmd")
     lk = _pattern(conn, "fp_likely", sink_class="cmd")
     proven_ref = _inst(
         conn,
         pv,
         sink_anchor="system",
-        flow_evidence=_stack_buf_prov("system", [_getter_vararg("fb_comment")]),
+        flow_evidence=_stack_buf_prov("system", [_getter_vararg("rpt_comment")]),
     )
     likely_ref = _inst(
         conn,
         lk,
         sink_anchor="system",
         flow_evidence=_stack_buf_prov(
-            "system", [_getter_vararg("oauth_auth_code", callee="FUN_000b2e80")]
+            "system", [_getter_vararg("acct_link_code", callee="FUN_0040870c")]
         ),
     )
     conn.close()
@@ -1018,8 +1025,8 @@ def test_likely_controllable_outranks_free(tmp_path: Path) -> None:
     # outranks the optimistic 'free' (source_kind=free_string). A router_defaults RCE lead beats a
     # bare argv guess -- harm plus a real key both point up.
     conn = _atlas(tmp_path)
-    _register_wrapper(conn, "FUN_000b2e80", "oauth_auth_code")
-    _seed_default(conn, "oauth_auth_code")
+    _register_wrapper(conn, "FUN_0040870c", "acct_link_code")
+    _seed_default(conn, "acct_link_code")
     lk = _pattern(conn, "fp_lk", sink_class="cmd")
     fr = _pattern(conn, "fp_fr", sink_class="cmd")
     likely_ref = _inst(
@@ -1027,7 +1034,7 @@ def test_likely_controllable_outranks_free(tmp_path: Path) -> None:
         lk,
         sink_anchor="system",
         flow_evidence=_stack_buf_prov(
-            "system", [_getter_vararg("oauth_auth_code", callee="FUN_000b2e80")]
+            "system", [_getter_vararg("acct_link_code", callee="FUN_0040870c")]
         ),
     )
     free_ref = _inst(conn, fr, sink_anchor="system", source_kind="free_string")
@@ -1045,8 +1052,8 @@ def test_likely_cmd_outranks_optimistic_free_lower_impact(tmp_path: Path) -> Non
     # worst bug never falls off the top screen. (Both are unproven leads: likely-controllable and
     # the optimistic 'free' fallback -- impact, not a 'proven' band, governs.)
     conn = _atlas(tmp_path)
-    _register_wrapper(conn, "FUN_000b2e80", "oauth_auth_code")
-    _seed_default(conn, "oauth_auth_code")
+    _register_wrapper(conn, "FUN_0040870c", "acct_link_code")
+    _seed_default(conn, "acct_link_code")
     lk = _pattern(conn, "fp_lkcmd", sink_class="cmd")
     lg = _pattern(conn, "fp_provenlog", sink_class="log")
     likely_ref = _inst(
@@ -1054,7 +1061,7 @@ def test_likely_cmd_outranks_optimistic_free_lower_impact(tmp_path: Path) -> Non
         lk,
         sink_anchor="system",
         flow_evidence=_stack_buf_prov(
-            "system", [_getter_vararg("oauth_auth_code", callee="FUN_000b2e80")]
+            "system", [_getter_vararg("acct_link_code", callee="FUN_0040870c")]
         ),
     )
     log_ref = _inst(conn, lg, sink_anchor="syslog", source_kind="free_string")
@@ -1070,13 +1077,13 @@ def test_proven_controllable_not_regressed_by_likely_tier(tmp_path: Path) -> Non
     # with router_defaults seeded (so the key is ALSO a member), a proven cross stays
     # proven-controllable, never demoted to likely (the 'yes' branch precedes the likely branch).
     conn = _atlas(tmp_path)
-    _seed_default(conn, "fb_comment")  # fb_comment is BOTH a proven cross AND a defaults member
+    _seed_default(conn, "rpt_comment")  # rpt_comment is BOTH a proven cross AND a defaults member
     p = _pattern(conn, "fp_noreg", sink_class="fmt_string")
     ref = _inst(
         conn,
         p,
         sink_anchor="fprintf",
-        flow_evidence=_stack_buf_prov("fprintf", [_getter_vararg("fb_comment")]),
+        flow_evidence=_stack_buf_prov("fprintf", [_getter_vararg("rpt_comment")]),
         source_kind="unknown",
     )
     conn.close()
@@ -1096,14 +1103,14 @@ def test_string_keyed_edge_never_flips_reachability_to_proven() -> None:
     from treasure_map.lib.query.triage import _dim_reachability
 
     edge = {
-        "key": "oauth_auth_code",
+        "key": "acct_link_code",
         "from_function": "handle_dispatch",
         "mechanism": "strcmp_gate",
     }
     d = _dim_reachability("unknown", (), (edge,))
     assert d.state == "unknown"  # NOT proven / reachable — the edge does not grant reach
     assert d.value == "unknown"
-    assert "oauth_auth_code" in d.note  # the key lead is surfaced for the agent
+    assert "acct_link_code" in d.note  # the key lead is surfaced for the agent
     assert "STAYS unknown" in d.note  # explicit: enumerated edge, not a reachability judgement
 
 
@@ -1142,13 +1149,13 @@ def test_one_hop_lead_is_structured_and_carries_the_data_arrival_caveat() -> Non
     from treasure_map.lib.query.triage import _dim_reachability
 
     ev = _one_hop_ev(
-        {"via": "string_keyed_edge", "key": "oauth_auth_code", "hops": 1, "through": "FUN_000b643c"}
+        {"via": "string_keyed_edge", "key": "acct_link_code", "hops": 1, "through": "FUN_0040bcc8"}
     )
     d = _dim_reachability("unknown", (), (), ev)
     assert d.state == "unknown" and d.value == "unknown"  # ★ IRON LAW: a lead is not a grant
     lead = next(x for x in d.evidence if x["hops"] == 1)
-    assert lead["key"] == "oauth_auth_code"
-    assert lead["through"] == "FUN_000b643c"
+    assert lead["key"] == "acct_link_code"
+    assert lead["through"] == "FUN_0040bcc8"
     assert lead["via"] == "string_keyed_edge"
     assert "NOT proven" in d.note  # the data-arrival caveat is mandatory on a 1-hop lead
     assert "STAYS unknown" in d.note
@@ -1159,18 +1166,18 @@ def test_fanout_edge_callee_hands_its_key_to_every_candidate_below() -> None:
     # A fat edge callee calls several sinks; each of them gets the same key lead through it.
     from treasure_map.lib.query.triage import _dim_reachability
 
-    for sink in ("FUN_000b32a0", "FUN_000b2ec0"):
+    for sink in ("FUN_00408b2c", "FUN_0040874c"):
         ev = _one_hop_ev(
             {
                 "via": "string_keyed_edge",
-                "key": "oauth_auth_code",
+                "key": "acct_link_code",
                 "hops": 1,
-                "through": "FUN_000b643c",
+                "through": "FUN_0040bcc8",
             }
         )
         d = _dim_reachability("unknown", (), (), ev)
         assert d.state == "unknown", sink
-        assert d.evidence[0]["through"] == "FUN_000b643c"
+        assert d.evidence[0]["through"] == "FUN_0040bcc8"
 
 
 def test_zero_hop_keeps_its_tight_wording_and_gains_a_structured_lead() -> None:
@@ -1179,7 +1186,7 @@ def test_zero_hop_keeps_its_tight_wording_and_gains_a_structured_lead() -> None:
     from treasure_map.lib.query.triage import _dim_reachability
 
     edge = {
-        "key": "oauth_auth_code",
+        "key": "acct_link_code",
         "from_function": "handle_dispatch",
         "mechanism": "strcmp_gate",
     }
@@ -1188,7 +1195,7 @@ def test_zero_hop_keeps_its_tight_wording_and_gains_a_structured_lead() -> None:
     assert "callee of a STRING-KEYED EDGE" in d.note  # the existing tight 0-hop wording, unchanged
     assert "one call above" not in d.note  # the loose 1-hop wording must NOT leak onto 0 hop
     assert d.evidence[0]["hops"] == 0
-    assert d.evidence[0]["key"] == "oauth_auth_code"
+    assert d.evidence[0]["key"] == "acct_link_code"
 
 
 def test_zero_and_one_hop_leads_coexist_without_changing_state() -> None:
@@ -1215,11 +1222,11 @@ def test_static_string_table_edge_also_stays_unknown() -> None:
     # key lead exactly like a strcmp gate — the candidate stays reachability=unknown.
     from treasure_map.lib.query.triage import _dim_reachability
 
-    edge = {"key": "nvram_dump", "from_function": None, "mechanism": "static_string_table"}
+    edge = {"key": "cfg_dump", "from_function": None, "mechanism": "static_string_table"}
     d = _dim_reachability("unknown", (), (edge,))
     assert d.state == "unknown"
     assert d.value == "unknown"
-    assert "nvram_dump" in d.note
+    assert "cfg_dump" in d.note
 
 
 # ── the completeness gate: a sink that left no def-use record here cannot be called constant ──
@@ -1308,7 +1315,7 @@ def test_gate_never_suppresses_a_controllable_reading(tmp_path: Path) -> None:
     try:
         _seed_cross(conn)
         pid = _pattern(conn, "fp_g2")
-        prov = _stack_buf_prov("syslog", [_getter_vararg("fb_comment")])
+        prov = _stack_buf_prov("syslog", [_getter_vararg("rpt_comment")])
         ref = _inst(conn, pid, sink_anchor="system", flow_evidence=prov)
         assert _dim_of(conn, ref) == ("proven", "controllable")
     finally:
@@ -1696,9 +1703,9 @@ def test_cmd_evidence_names_vararg_surface(tmp_path: Path) -> None:
 # dominating-writer machinery runs on the argument that becomes the command. Nothing about how a
 # value is judged changed — these pin what the read side does with records it never used to get.
 #
-# Verified against real firmware through Ghidra before writing: on one binary the recovery produced
-# 28 records (17 stack_buf + 11 constant), washing `system("/usr/sbin/mesh_connect.sh meshed")` to
-# constant and recording `snprintf(buf, "…cac_ctrl %s", param_1)` as a dominating writer.
+# Verified through Ghidra before writing: the recovery produces both stack_buf and constant
+# records, washing a literal `system("/usr/sbin/svc_ctl.sh start")` to constant and recording an
+# `snprintf(buf, "…svc_opt %s", param_1)` as a dominating writer.
 
 
 def _wrapper_record(sink: str, provenance: dict[str, object], wrapper: str = "do_cmd") -> dict:  # type: ignore[type-arg]
@@ -1766,8 +1773,8 @@ def test_cmd_wrapper_recognized_and_stackbuf_run(tmp_path: Path) -> None:
 
 def test_cmd_direct_literal_command_is_washed(tmp_path: Path) -> None:
     # The other half of what the recovery reaches, and the larger one in practice: the caller hands
-    # the wrapper a literal outright, so there is no buffer at all. Measured on real firmware,
-    # 11 of 28 recovered records took this path.
+    # the wrapper a literal outright, so there is no buffer at all — a large share of recovered
+    # records take this path.
     conn = _atlas(tmp_path)
     try:
         pid = _pattern(conn, "fp_ccmd_lit")
@@ -1782,7 +1789,7 @@ def test_cmd_direct_literal_command_is_washed(tmp_path: Path) -> None:
                         "system",
                         {
                             "kind": "constant",
-                            "value": "/usr/sbin/mesh_connect.sh meshed",
+                            "value": "/usr/sbin/mesh_join.sh paired_up",
                             "value_kind": "literal_string",
                         },
                     )
@@ -1798,7 +1805,7 @@ def test_cmd_injection_surface_recorded_not_const(tmp_path: Path) -> None:
     """A command template with a `%s` filled from an unresolved source: the surface becomes a
     RECORDED FACT, and the reading is neither constant nor controllable.
 
-    This is the real shape recovered from firmware — `uci set account.common.admin='%s'` with a
+    This is the real shape recovered from firmware — `uci set acct.main.admin='%s'` with a
     phi-merged vararg. Not constant, because a value is spliced in. Not controllable either: the
     map calls a source controllable only on a proven web-settable cross, and inferring control from
     "there is a %s" would be a judgement the evidence does not carry.
@@ -1809,10 +1816,10 @@ def test_cmd_injection_surface_recorded_not_const(tmp_path: Path) -> None:
         pid = _pattern(conn, "fp_ccmd_inject")
         prov = {
             "kind": "stack_buf",
-            "nearest_dominating_writer": "snprintf@0x2746c",
+            "nearest_dominating_writer": "snprintf@0x41602c",
             "writers": [
                 _cmd_writer(
-                    "uci set account.common.admin='%s'",
+                    "uci set acct.main.admin='%s'",
                     [
                         {
                             "pos": 3,
@@ -1821,7 +1828,7 @@ def test_cmd_injection_surface_recorded_not_const(tmp_path: Path) -> None:
                         }
                     ],
                     dominates=True,
-                    at="0x2746c",
+                    at="0x41602c",
                 )
             ],
         }
@@ -1858,7 +1865,7 @@ def test_cmd_controllable_needs_a_web_settable_key_not_a_percent_s(tmp_path: Pat
             "nearest_dominating_writer": "snprintf@0x1",
             "writers": [
                 _cmd_writer(
-                    "uci set x='%s'", [_getter_vararg("fb_comment")], dominates=True, at="0x1"
+                    "uci set x='%s'", [_getter_vararg("rpt_comment")], dominates=True, at="0x1"
                 )
             ],
         }
@@ -1900,7 +1907,7 @@ def test_cmd_form2_dominating_writer(tmp_path: Path) -> None:
                 # reaches this wrapper call, so it must not decide this reading.
                 _cmd_writer(
                     "/sbin/route add %s",
-                    [_getter_vararg("fb_comment")],
+                    [_getter_vararg("rpt_comment")],
                     dominates=False,
                     at="0x10",
                     reaches=False,
@@ -2116,9 +2123,9 @@ def test_fmt_variable_survives_marker_still_unknown(tmp_path: Path) -> None:
 # exits took it at face value: one constant call vouched for every other call in the same function,
 # overriding a per-sink record that had come back unknown.
 #
-# Measured on a real atlas: 25 candidates read proven:constant that way, every one of them a
-# multi-sink function whose def-use had actually returned None. Closing it moved exactly those 25
-# to unknown and touched nothing else — free, controllable and constrained counts unchanged.
+# Every candidate that read proven:constant that way was a multi-sink function whose def-use had
+# actually returned None. Closing it moved exactly those to unknown and touched nothing else —
+# free, controllable and constrained counts unchanged.
 
 
 def _unknown_record(sink: str) -> dict[str, object]:
@@ -2144,10 +2151,10 @@ def _unknown_record(sink: str) -> dict[str, object]:
 
 
 def test_direct_multisink_const_marker_yields_to_unknown(tmp_path: Path) -> None:
-    """The main shape, and a DIRECT sink — not a wrapper one. Of the 25 candidates this fixes on a
-    real atlas, all 25 are direct.
+    """The main shape, and a DIRECT sink — not a wrapper one (every candidate this fixes in
+    practice is direct).
 
-    `system("which envrams")` beside a `system(<buffer>)` whose contents did not resolve: the
+    `system("which envdump")` beside a `system(<buffer>)` whose contents did not resolve: the
     literal call earns the marker, and the marker used to speak for the unresolved one too.
 
     MUTATION (must go RED): drop `and not has_unsafe_record` from the constant marker exit ->
@@ -2163,7 +2170,7 @@ def test_direct_multisink_const_marker_yields_to_unknown(tmp_path: Path) -> None
             flow_evidence={
                 "source_kind": "unknown",
                 "sink_arg_provenance": [
-                    _const_record("popen", "which envrams"),
+                    _const_record("popen", "which envdump"),
                     _unknown_record("popen"),
                 ],
             },
@@ -2207,14 +2214,14 @@ def test_singlesink_constant_still_constant(tmp_path: Path) -> None:
 
     ★ HONEST LIMIT, measured rather than assumed: this does NOT distinguish the gate's two possible
     spellings. Writing it as "any record at all vetoes" (dropping the `prov_verdict is None` half)
-    changes ZERO verdicts across a real atlas of 12803 candidates — because an all-constant record
-    set is caught by the provenance exit just below, which returns the same reading. What that
-    spelling would change is ATTRIBUTION: 217 candidates move from being credited to the marker to
-    being credited to the provenance. The precise spelling is kept because a gate should mean what
+    changes ZERO verdicts in practice — because an all-constant record set is caught by the
+    provenance exit just below, which returns the same reading. What that spelling would change is
+    ATTRIBUTION: candidates move from being credited to the marker to being credited to the
+    provenance. The precise spelling is kept because a gate should mean what
     its name says and attribution should stay put, not because a wrong verdict is at stake.
 
     The over-correction that IS dangerous is dropping the OTHER half — see
-    test_copy_const_size_unaffected_by_prefix, where the measurement is 3480 candidates."""
+    test_copy_const_size_unaffected_by_prefix, where it floods thousands of candidates."""
     conn = _atlas(tmp_path)
     try:
         pid = _pattern(conn, "fp_singlesink_const")
@@ -2253,8 +2260,8 @@ def test_copy_const_size_unaffected_by_prefix(tmp_path: Path) -> None:
 
     MUTATION (must go RED): drop the `bool(_scoped_records(...))` half of the gate (leaving
     `has_unsafe_record = prov_verdict is None`) -> it fires on every candidate the def-use pass does
-    not cover. Measured on a real atlas: 3480 candidates demoted from proven:constant to unknown,
-    which is the false-positive flood this half exists to prevent."""
+    not cover — thousands of candidates demoted from proven:constant to unknown, which is the
+    false-positive flood this half exists to prevent."""
     conn = _atlas(tmp_path)
     try:
         pid = _pattern(conn, "fp_copy_constsize", sink_class="copy")
@@ -2485,9 +2492,9 @@ def test_web_settable_key_is_not_leaked_across_callsites(tmp_path: Path) -> None
     """B2 #6. A constant call beside a call that splices a web-settable key: scoped to the constant
     call's address no key reaches it (constant); scoped to the key's call it is controllable. The
     key must not float the constant call, nor the constant silence the key's call."""
-    conn = _atlas(tmp_path)  # _atlas seeds the SaTC cross (fb_comment crosses web_settable=yes)
+    conn = _atlas(tmp_path)  # _atlas seeds the SaTC cross (rpt_comment crosses web_settable=yes)
     try:
-        fe = _fe(_const_at("system", 0x1000), _controllable_at("system", 0x2000, "fb_comment"))
+        fe = _fe(_const_at("system", 0x1000), _controllable_at("system", 0x2000, "rpt_comment"))
         assert _web_settable_keys_reaching_sink(conn, fe, "system", callsite_addr=0x1000) == []
         a_dim = _dim_controllability(
             conn,
@@ -2499,7 +2506,7 @@ def test_web_settable_key_is_not_leaked_across_callsites(tmp_path: Path) -> None
         )
         assert (a_dim.state, a_dim.value) == ("proven", "constant")
         assert _web_settable_keys_reaching_sink(conn, fe, "system", callsite_addr=0x2000) == [
-            "fb_comment"
+            "rpt_comment"
         ]
         b_dim = _dim_controllability(
             conn,

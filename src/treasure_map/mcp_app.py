@@ -16,8 +16,11 @@ tool:
   1. No anchor, no output — every result carries an evidence pointer (binary+function+address, or
      script+line); a lookup that resolves nothing returns a "not found" record, never a guess.
   2. Facts + chains + reachability evidence + honest bounds + trigger CONDITIONS only — the server
-     never emits a payload / trigger bytes / PoC. (An AI reasoning over the facts we return may
-     reach its own conclusion — that is the point; we do not write the attack input for it.)
+     never GENERATES a payload / trigger bytes / PoC. (An AI reasoning over the facts we return may
+     reach its own conclusion — that is the point; we do not write the attack input for it.) The
+     one tool that can return attack-method text is list_verified_exploits(reveal=True): it hands
+     back, verbatim, what a person recorded in the private ledger — stored content, not output
+     tmap produced.
 
 Derived signals (the review-ordering score, entry-reach, blocking_mechanism) are always labelled
 DERIVED, EVIDENCE-BACKED, NOT A VERDICT. No interpretation/prediction field (the dropped
@@ -164,7 +167,7 @@ def _fit_candidates(
 
 
 # The server's standing instruction to an AI client: the working loop, not legalese. The legal
-# notice stays reachable via the legal_notice tool (B4).
+# notice stays reachable via the legal_notice tool.
 _AGENT_INSTRUCTIONS = (
     "Treasure Map exposes a firmware analysis knowledge base as read-only fact tools, plus four "
     "that write only YOUR judgements onto an overlay (annotate, annotate_diff, promote, "
@@ -215,7 +218,8 @@ _AGENT_INSTRUCTIONS = (
     "(3) Judge value with the cross-firmware signal cross_firmware_patterns (a pattern "
     "recurring across many firmware images). Prefer narrow filters (run_id / sink "
     "/ status) and paging over pulling everything; fetch detail per evidence_ref. The tools draw "
-    "no conclusion and emit no payload/PoC — that judgement is yours. (4) RECORD a conclusion "
+    "no conclusion and generate no payload/PoC (list_verified_exploits(reveal=true) returns only "
+    "what a person recorded) — that judgement is yours. (4) RECORD a conclusion "
     "worth keeping past this session, so the next one inherits it instead of starting over: "
     "annotate(evidence_ref, verdict, rationale) writes YOUR judgement onto an overlay — "
     "suspicious/exploitable float a real lead the base map had sunk, excluded/safe sink noise you "
@@ -254,7 +258,7 @@ _COMPACT_ROW_LEGEND = (
 )
 
 
-# A one-line legend on the list envelope (M-A3): how to pull ANY row's code without typing three
+# A one-line legend on the list envelope: how to pull ANY row's code without typing three
 # args. evidence_ref is already on every row and self-resolves run+binary+function, so this replaces
 # a per-row fetch hint (which would bloat the list and go stale against the tool signature).
 _FETCH_CODE_LEGEND = (
@@ -271,7 +275,7 @@ def _dim_label(d: Any) -> str:
 
 
 def _lineage_inline(run: RunRow) -> dict[str, Any]:
-    """The run's scan lineage, inlined on EVERY fact return (M6) so a consumer spots a STALE scan
+    """The run's scan lineage, inlined on EVERY fact return so a consumer spots a STALE scan
     without a separate list_runs call (a stale scan is silent — the lineage must be printed, not
     fetched). ``resolved`` is False for a pre-existing run with no lineage row.
 
@@ -512,7 +516,7 @@ def make_tools(
     ws_root = Path(workspaces_root) if workspaces_root is not None else None
 
     def _error(atlas: sqlite3.Connection, msg: str) -> dict[str, Any]:
-        """A hard-error fact result: never a silent empty. Carries ``runs_in_atlas`` (M-A1) so the
+        """A hard-error fact result: never a silent empty. Carries ``runs_in_atlas`` so the
         consumer can immediately see which runs DO exist and re-issue against the right one."""
         return {
             "found": False,
@@ -560,7 +564,7 @@ def make_tools(
 
         evidence_ref (via_ref) self-resolves run+binary+function; else an explicit run_id; else a
         hard error. Returns {run, run_source, function, binary, warning} or an error dict (has
-        'error'). A run absent from the atlas is the run-not-found hard error (G3)."""
+        'error'). A run absent from the atlas is the run-not-found hard error."""
         fn, bn, warning = function, binary, None
         if evidence_ref is not None:
             ref = _resolve_ref(atlas, evidence_ref)
@@ -733,7 +737,7 @@ def make_tools(
         return index
 
     def _resolve_db(atlas: sqlite3.Connection, run: RunRow) -> Path | dict[str, Any]:
-        """The run's analysis.db Path, or a hard error (G4) — never a silent empty.
+        """The run's analysis.db Path, or a hard error — never a silent empty.
 
         ★ Honesty red-line (non-match must not collapse into absent): a run in the atlas but with NO
         recorded analysis.db (``analysis_db_path`` empty = a pre-existing scan never trustworthily
@@ -806,7 +810,7 @@ def make_tools(
 
         Resolves the run (or errors), opens THAT run's analysis.db (or errors), runs ``call`` with
         the effective (function, binary), then stamps ``resolved_run`` + ``run_source`` + inline
-        ``run_lineage`` (M6) so the consumer sees which scan answered and whether it is stale.
+        ``run_lineage`` so the consumer sees which scan answered and whether it is stale.
         ``diagnose`` turns on the wrong-run/no-such-function cross-run note for function lookups."""
         atlas = open_atlas(atlas_path)
         try:
@@ -826,7 +830,7 @@ def make_tools(
                 err["run_lineage"] = _lineage_inline(run)
                 return err
             db = _resolve_db(atlas, run)
-            if isinstance(db, dict):  # hard error (G4) — still stamped with the run it refers to
+            if isinstance(db, dict):  # hard error — still stamped with the run it refers to
                 db["resolved_run"] = run.run_id
                 db["run_lineage"] = _lineage_inline(run)
                 return db
@@ -1008,8 +1012,8 @@ def make_tools(
           (sweep one sink class, e.g. all system()), ``nvram-source`` (hunt nvram-mediated bugs —
           the router-bug hotspot), ``reachable-first`` (FLOATS candidates with a direct rootfs entry
           reference to the top — MECHANISTIC, NOT call-graph reachability, an INCOMPLETE slice that
-          misses the notify_rc bridge; the corpus stays whole; ``reachable-only`` is a deprecated
-          alias). ``available_views`` lists each.
+          misses service-dispatch bridges; the corpus stays whole; ``reachable-only`` is a
+          deprecated alias). ``available_views`` lists each.
         - ``filters``: circle-and-weight dimension filters, ``"dim=value,dim2=value2"``
           (controllability=free / sink_impact=cmd / source=nvram / reachability=entry:web ...).
           Matches FLOAT to the first screen; the corpus is NEVER reduced (``corpus`` stays the full
@@ -1220,15 +1224,15 @@ def make_tools(
             # The honest phase-1 blind spots — surfaced so the map is never read as complete. ALWAYS
             # present (honesty is never traded for tokens), regardless of ``verbose``.
             "caveats": list(_LENS_CAVEATS),
-            # ★ M7: the run this listing was scoped to (None = every run), the canonical name every
+            # ★ the run this listing was scoped to (None = every run), the canonical name every
             # tool uses. The old ambient current_run_id + per-row is_current_run are GONE — an
             # ambient 'current run' was the run-binding hazard; each row carries its own ``run``.
             "resolved_run": run_id,
-            # ★ M-A1: the bare run-id list — ALWAYS present (even when scoped) so switching firmware
+            # ★ the bare run-id list — ALWAYS present (even when scoped) so switching firmware
             # is one glance; ``runs`` is the per-run count split of THIS listing.
             "runs_in_atlas": runs_in_atlas,
             "runs": _run_summary(ranked),
-            # ★ M-A3: pull any row's code without retyping args — its evidence_ref self-resolves.
+            # ★ pull any row's code without retyping args — its evidence_ref self-resolves.
             "how_to_fetch": _FETCH_CODE_LEGEND,
             # ★ Red-line (per-scan fact): binaries with incomplete/partial analysis, so absence of a
             # candidate is not proof of cleanliness.
@@ -1367,7 +1371,7 @@ def make_tools(
         function-level anchor.
 
         Returns a not-found record when no instance carries ``evidence_ref`` (no fabrication).
-        Echoes the canonical ``resolved_run`` + inline ``run_lineage`` (M6/M7): a ref anchors ONE
+        Echoes the canonical ``resolved_run`` + inline ``run_lineage``: a ref anchors ONE
         firmware run, so the explanation names the scan it came from (never an ambient run).
 
         Carries ``coverage``: whether a conclusion has been recorded for this candidate. When none
@@ -1462,7 +1466,7 @@ def make_tools(
             conn.close()
         result["note"] = _DERIVED_SIGNAL_NOTE
         result["atlas"] = str(atlas_path)
-        # ★ G1/verification 1b: this reads the atlas by ref, so it routes to the RIGHT firmware even
+        # ★ this reads the atlas by ref, so it routes to the RIGHT firmware even
         # under a mismatched session — echo the canonical resolved_run + lineage to prove it.
         if run is not None:
             result["resolved_run"] = run.run_id
@@ -1470,7 +1474,7 @@ def make_tools(
         return result
 
     def get_nvram_key_flow(key: str, run_id: str | None = None) -> dict[str, Any]:
-        """Cross-binary nvram key graph: who WRITES and who READS one nvram key (gap② phase 2).
+        """Cross-binary nvram key graph: who WRITES and who READS one nvram key.
 
         Turns "trace this config value across processes" from two manual reverse-lookups into one
         table read. For the concrete ``key``: ``writers`` / ``readers`` are EXACT (constant-key)
@@ -1550,9 +1554,9 @@ def make_tools(
         table, instead of grepping every command string by hand.
 
         ``target`` takes either a binary's SHORT NAME as the inventory lists it (``busybox``,
-        ``httpd``) or a launched SCRIPT's path under the firmware root (``usr/sbin/getmac``).
+        ``httpd``) or a launched SCRIPT's path under the firmware root (``usr/sbin/helper_tool``).
         Scripts are stored by path, and a short name is matched against that path's basename too,
-        so ``getmac`` finds the script edge either way. Pass ``run_id`` to stay inside one
+        so ``helper_tool`` finds the script edge either way. Pass ``run_id`` to stay inside one
         firmware; without it the answer spans every run in the atlas and each edge names its own.
         Each edge carries the launcher (binary + function + address), the API, whether a shell
         wraps it, and the command template when one is visible.

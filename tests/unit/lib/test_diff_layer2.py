@@ -372,17 +372,17 @@ def test_g2_partial_callee_unalignable_blocks_the_whole_edge(tmp_path: Path) -> 
 
 
 def test_bug_d_raw_0x_callee_addr_aligns_after_norm(tmp_path: Path) -> None:
-    # ★ Bug D core: callee_addr in raw Ghidra form (0x30664) vs function_alignment in norm_hex
-    # (00030664) -- only norm_hex reconciles them (raw -> 100% miss -> false unalignable before).
+    # ★ Bug D core: callee_addr in raw Ghidra form (0x4129a8) vs function_alignment in norm_hex
+    # (004129a8) -- only norm_hex reconciles them (raw -> 100% miss -> false unalignable before).
     con = _atlas(tmp_path)
     _cap(con, "ra", _SKE, 1)
     _cap(con, "rb", _SKE, 1)
-    add_string_keyed_edges(con, [_edge("ra", "k", "1000", "0x30664")])
-    add_string_keyed_edges(con, [_edge("rb", "k", "1100", "0x30670")])
-    _align(con, "d", [("1000", "1100", 0.98, "aligned"), ("30664", "30670", 0.98, "aligned")])
+    add_string_keyed_edges(con, [_edge("ra", "k", "1000", "0x4129a8")])
+    add_string_keyed_edges(con, [_edge("rb", "k", "1100", "0x4129b4")])
+    _align(con, "d", [("1000", "1100", 0.98, "aligned"), ("4129a8", "4129b4", 0.98, "aligned")])
     run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
     (row,) = _deltas(con, "d")
-    assert row[1] == "layer_unchanged"  # 0x30664 aligns to 0x30670 -> same callee
+    assert row[1] == "layer_unchanged"  # 0x4129a8 aligns to 0x4129b4 -> same callee
     con.close()
 
 
@@ -394,9 +394,9 @@ def test_bug_d_both_sides_symmetric_direct_callee_is_unchanged(tmp_path: Path) -
     con = _atlas(tmp_path)
     _cap(con, "ra", _SKE, 1)
     _cap(con, "rb", _SKE, 1)
-    add_string_keyed_edges(con, [_edge("ra", "k", "1000", "30664")])
-    add_string_keyed_edges(con, [_edge("rb", "k", "1100", "30670")])
-    _align(con, "d", [("1000", "1100", 0.98, "aligned"), ("30664", "30670", 0.98, "aligned")])
+    add_string_keyed_edges(con, [_edge("ra", "k", "1000", "4129a8")])
+    add_string_keyed_edges(con, [_edge("rb", "k", "1100", "4129b4")])
+    _align(con, "d", [("1000", "1100", 0.98, "aligned"), ("4129a8", "4129b4", 0.98, "aligned")])
     run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
     (row,) = _deltas(con, "d")
     assert row[1] == "layer_unchanged"
@@ -404,21 +404,21 @@ def test_bug_d_both_sides_symmetric_direct_callee_is_unchanged(tmp_path: Path) -
 
 
 def test_bug_d_subject_anchor_survives_dirty_from_func(tmp_path: Path) -> None:
-    # ★ a from_func_addr in DIRTY form (0x29ed8) on the A side must still pair with B -- the
+    # ★ a from_func_addr in DIRTY form (0x40c21c) on the A side must still pair with B -- the
     # canonical key normalizes it. Without the A-side norm_hex in _canonical_and_key, A and B become
     # two orphan subjects (pairing collapses), not one comparable subject.
     con = _atlas(tmp_path)
     _cap(con, "ra", _SKE, 1)
     _cap(con, "rb", _SKE, 1)
     add_string_keyed_edges(
-        con, [_edge("ra", "k", "0x29ed8", "2000", raw_from=True)]
+        con, [_edge("ra", "k", "0x40c21c", "2000", raw_from=True)]
     )  # dirty A anchor
     add_string_keyed_edges(con, [_edge("rb", "k", "29100", "2100")])  # clean B anchor (normalized)
-    _align(con, "d", [("29ed8", "29100", 0.98, "aligned"), ("2000", "2100", 0.98, "aligned")])
+    _align(con, "d", [("40c21c", "29100", 0.98, "aligned"), ("2000", "2100", 0.98, "aligned")])
     run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
     # ★ the assertion is about PAIRING, not the verdict: ONE subject means the dirty A anchor and
     # the clean B anchor resolved to the SAME canonical key. (Verdict = from_function_unaligned:
-    # G1 aligns the host by the raw from_func_addr, a separate axis the spec's three norm_hex points
+    # alignment pairs the host by the raw from_func_addr, a separate axis the three norm_hex points
     # deliberately do not touch; from_func is dirty here by construction.)
     # Without the A-side norm_hex in _canonical_and_key, A and B would be two orphan subjects.
     rows = _deltas(con, "d")
@@ -476,7 +476,7 @@ def test_bug_b_no_identity_is_honestly_unalignable(tmp_path: Path) -> None:
     # ★ an address-derived FUN_% name with NO addr, and a callee with no name and no addr,
     # both stay callee_unalignable -- honest undetermined, never a fabricated identity.
     for tag, kw in (
-        ("fun_noaddr", {"callee_name": "FUN_00030664", "callee_addr": None}),
+        ("fun_noaddr", {"callee_name": "FUN_004129a8", "callee_addr": None}),
         ("nothing", {"callee_name": None, "callee_addr": None}),
     ):
         con = open_atlas(tmp_path / f"u_{tag}.db")

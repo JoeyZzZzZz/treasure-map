@@ -12,7 +12,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 
-# M2 fine fingerprint = instance.pseudocode_hash. Every surfaced pattern_breadth carries this
+# The fine fingerprint = instance.pseudocode_hash. Every surfaced pattern_breadth carries this
 # so the count is never read apart from the algorithm version it was computed under.
 FINE_FP_ALGO_VERSION = "fp0:pseudocode_hash"
 

@@ -23,9 +23,10 @@ ReachabilityStatus = Literal["confirmed", "blocked", "unknown"]
 class ReachabilityVerdict:
     """A graded verdict for one candidate.
 
-    blocking_mechanism is a neutral description of why a path is blocked (set only for
-    "blocked"); basis is a one-line neutral reason for the verdict; degraded is True when
-    the input was too incomplete to grade (degrade-and-flag, never a silent miss).
+    blocking_mechanism is a neutral form note (e.g. a constant-size copy) that read-side
+    ordering may downweight; it can ride on an "unknown" verdict and never removes a candidate.
+    basis is a one-line neutral reason for the verdict; degraded is True when the input was too
+    incomplete to grade (degrade-and-flag, never a silent miss).
     """
 
     status: ReachabilityStatus

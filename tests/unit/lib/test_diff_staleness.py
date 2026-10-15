@@ -39,7 +39,7 @@ _SHA_OTHER = "c" * 64
 
 def _analysis(path: Path, binaries: list[tuple[str, str]]) -> Path:
     """An analysis.db whose current scan holds ``(name, sha256)`` — several rows may share a name,
-    which is what a real firmware does (four such names in one measured run)."""
+    which is what a real firmware does (several names commonly cover more than one file)."""
     conn = open_db(path)
     for i, (name, sha) in enumerate(binaries, start=1):
         conn.execute(
@@ -166,9 +166,9 @@ def test_a_diff_whose_binary_left_the_scan_is_stale(tmp_path: Path) -> None:
 
 def test_one_name_covering_several_files_is_judged_by_existence(tmp_path: Path) -> None:
     # ★ THE COIN-FLIP GUARD. A diff records a binary's SHORT NAME, and one name really can cover
-    # several files in a scan — a real firmware has four such names in one run, one of which was
-    # itself diffed. Reading "the" hash for a name would be a coin flip, and half the time it would
-    # call an unchanged diff stale. The stored hash matching ANY hash under that name means the
+    # several files in a scan — real firmware does this, and such a name can itself be diffed.
+    # Reading "the" hash for a name would be a coin flip, and half the time it would call an
+    # unchanged diff stale. The stored hash matching ANY hash under that name means the
     # file that was diffed is still there.
     #
     # MUTATION (verified RED, 1 failed): in diff_align._current_generation keep one hash per name —
@@ -187,7 +187,7 @@ def test_one_name_covering_several_files_is_judged_by_existence(tmp_path: Path) 
 def test_no_stamp_is_unverified_not_stale_and_not_clean(tmp_path: Path) -> None:
     # ★ A diff written before the content stamp existed cannot be checked either way. Reported as
     # its own answer: calling it stale would brand old-but-valid work, calling it fresh would be a
-    # clean bill nobody earned. A real atlas holds exactly one such row.
+    # clean bill nobody earned. Atlases written before the stamp hold such rows.
     #
     # MUTATION (verified RED, 1 failed): in diff_align._freshness treat a missing stamp as changed
     # — `return True, STALE_CHANGED` — and an unverifiable diff is reported as definitely stale.

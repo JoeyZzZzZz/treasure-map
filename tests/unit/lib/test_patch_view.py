@@ -526,7 +526,7 @@ def test_pseudocode_sameness_reads_its_six_states(tmp_path: Path, current: None)
     w.fn("b", "0000a000", ["foo"], pseudocode=None)
     # identical_text_unverified: same text and callees, but the decompiler says it gave up a table
     w.pair("0000b000", "0000c000", 0.97, 1.0)
-    body = "/* WARNING: Could not recover jumptable at 0x0040b668. Too many branches */\nfoo(0x40);"
+    body = "/* WARNING: Could not recover jumptable at 0x00408218. Too many branches */\nfoo(0x40);"
     w.fn("a", "0000b000", ["foo"], pseudocode=body)
     w.fn("b", "0000c000", ["foo"], pseudocode=body)
     w.commit()
@@ -614,7 +614,7 @@ def test_a_listed_entry_keeps_its_place_and_only_gains_pseudocode_sameness(
     w.inst("b", _ref("runB", "00002000", "cmd", "0x10"), "cmd", "system")
     w.im("00001010", "00002010", "00001000")
     w.fn("a", "00001000", ["system", "log_a"], pseudocode="x = FUN_00012340();")
-    w.fn("b", "00002000", ["system", "log_b"], pseudocode="x = FUN_00099990();")
+    w.fn("b", "00002000", ["system", "log_b"], pseudocode="x = FUN_00407fb8();")
     w.commit()
     by_id = _view(w)["by_id"]
     assert _pair_id("00001000", "00002000") in by_id  # still listed
@@ -778,7 +778,7 @@ def test_the_significance_lens_reorders_and_never_relabels(tmp_path: Path, curre
     w.inst("b", _ref("runB", "00014000", "cmd", "0x10"), "cmd", "system")
     w.im("00013010", "00014010", "00013000")
     w.fn("a", "00013000", ["system"], pseudocode="system(FUN_00012340());")
-    w.fn("b", "00014000", ["system"], pseudocode="system(FUN_00099990());")
+    w.fn("b", "00014000", ["system"], pseudocode="system(FUN_00407fb8());")
     w.pair("00015000", "00016000", 0.97, 0.7)  # a changed pair, no candidate, identical body: C
     w.fn("a", "00015000", ["memset"], pseudocode="memset(b,0,8);")
     w.fn("b", "00016000", ["memset"], pseudocode="memset(b,0,8);")
@@ -2326,8 +2326,8 @@ def test_a_re_extraction_is_never_served_an_earlier_reading(tmp_path: Path, curr
     w.fn("a", "00001000", ["foo"], pseudocode="foo(1);")
     w.fn("b", "00002000", ["foo"], pseudocode="foo(1);")
     w.pair("00003000", "00004000", 0.97, 0.9)  # aligned: a moved address inside the image
-    w.fn("a", "00003000", ["foo"], pseudocode="p = (char *)0x412340;")
-    w.fn("b", "00004000", ["foo"], pseudocode="p = (char *)0x412560;")
+    w.fn("a", "00003000", ["foo"], pseudocode="p = (char *)0x41e8c8;")
+    w.fn("b", "00004000", ["foo"], pseudocode="p = (char *)0x41eae8;")
     w.pair("00005000", "00006000", 0.97, 0.9)  # aligned: a changed size, its delta
     w.fn("a", "00005000", ["foo"], pseudocode="char buf[0x60];")
     w.fn("b", "00006000", ["foo"], pseudocode="char buf[0x64];")

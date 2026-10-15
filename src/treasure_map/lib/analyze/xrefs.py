@@ -20,7 +20,9 @@ NOTE on imports and Layer 1 on stripped MIPS/ARM firmware:
   walked NAMED external libraries and skipped the <EXTERNAL> placeholder, where PLT-resolved
   imports land on stripped firmware / headless single-binary runs). That has been fixed in
   the export script; a binary that still reports imports=0 should be treated as a
-  data-quality gap to investigate, not as normal.
+  data-quality gap to investigate, not as normal. Layer 1 additionally needs each import's
+  library soname, and imports that land on the <EXTERNAL> placeholder carry none — so on
+  stripped firmware Layer 1 commonly adds nothing, and Layer 0 carries the graph.
 """
 
 from __future__ import annotations
@@ -448,7 +450,7 @@ def _layer0_callees_exports(
     total = len(parsed)
     for done, (caller_func_id, caller_binary_id, names) in enumerate(parsed, 1):
         # ★ periodic progress so a long L0 pass (218k functions on a large firmware) is visibly
-        # RUNNING, not hung -- the owner should not need py-spy to tell the difference.
+        # RUNNING, not hung -- an operator should not need py-spy to tell the difference.
         if done % _L0_PROGRESS_EVERY == 0:
             logger.info(
                 "xrefs L0: %d/%d funcs, %d edges so far", done, total, stats.layer0_callees_exports
@@ -490,9 +492,10 @@ def _layer1_import_export(
 ) -> None:
     """Layer 1: Ghidra imports × exports (fallback).
 
-    Only effective when Ghidra populated imports.lib_soname. On stripped
-    MIPS/ARM IoT firmware, imports table is empty — this layer produces 0
-    rows. That is expected, not a bug.
+    Only effective when Ghidra recorded the import's library (imports.lib_soname). Imports
+    resolved through the <EXTERNAL> placeholder carry none, which is the common case on
+    stripped MIPS/ARM firmware: the imports are there, but this layer then produces 0 rows.
+    That is expected, not a bug — Layer 0 carries the graph.
     """
     imports = cur.execute(
         """SELECT binary_id, func_name, lib_soname

@@ -127,7 +127,7 @@ ImageRanges = list[tuple[int, int]] | None
 # ── address normalisation (single definition) ────────────────────────────────────────────────
 
 # Ghidra's synthetic symbol names carry an absolute address after an underscore, at the END of the
-# name (FUN_00012a40, DAT_000200f8, s_hi_0001ccd0, LAB_/UNK_/SUB_), or as ``r0x<addr>`` (the branch
+# name (FUN_0040caf0, DAT_000200f8, s_hi_0001ccd0, LAB_/UNK_/SUB_), or as ``r0x<addr>`` (the branch
 # labels joined_r0x00449e60 / code_r0x00449e60). Two identical functions in two binaries whose
 # other code shifted read the same body with these addresses moved, so the address is blanked and
 # the rest of the name kept. The threshold is six hex digits (>= 0x100000): a stack offset
@@ -276,7 +276,7 @@ _MARKER_ADDR = re.compile(r"0x[0-9a-fA-F]+")
 def _markers(text: str) -> list[tuple[int, str, str | None]]:
     """``(position, tag, address)`` of every W marker in one raw body, in text order. The address is
     the first ``0x`` literal after the marker on its own line, inside its comment
-    (``... jumptable at 0x0040b668`` / ``block (ram,0x0040ccb0)``); None when it names none."""
+    (``... jumptable at 0x00408218`` / ``block (ram,0x00409860)``); None when it names none."""
     out: list[tuple[int, str, str | None]] = []
     for tag, pattern in W_MARKERS:
         for m in pattern.finditer(text):

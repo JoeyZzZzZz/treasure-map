@@ -7,13 +7,14 @@ The load-bearing invariant: scanning the SAME firmware again must yield the SAME
 same function, or every stored judgement silently loses its anchor. The single trap is the
 analysis DB's AUTOINCREMENT ``functions.id`` — delete-and-reingest per binary plus never-reused
 ids means the id of one unchanged function drifts by the whole function count on every re-scan
-(measured on real firmware: a 4x-scanned DB numbered its 88,178 functions 266,156..354,333). So
+(a database scanned several times numbers the same functions far apart on each pass). So
 ``func_id`` must NOT reach the ref while a real anchor (address, then name) exists.
 
 The core test constructs the invariant by INVARIANCE, not by absence: it varies only ``func_id``
-across two calls (real-magnitude drift 266,156 vs 354,333) and asserts the two full ref strings are
-*equal*. Asserting merely "the func_id digits are not in the string" would be fooled by a func_id
-whose digits coincidentally landed in the sha8/address; string equality cannot be so fooled.
+across two calls (a realistic-magnitude drift, 120,004 vs 210,017) and asserts the two full ref
+strings are *equal*. Asserting merely "the func_id digits are not in the string" would be fooled
+by a func_id whose digits coincidentally landed in the sha8/address; string equality cannot be so
+fooled.
 
 Reverse mutation (break-the-code proof — run once, expect RED, then restore):
     In ``src/treasure_map/lib/hunt/refs.py`` change the ``fn_anchor`` line
@@ -25,9 +26,9 @@ Reverse mutation (break-the-code proof — run once, expect RED, then restore):
         fn_anchor = f"{_norm_addr(address) or (func_name or '').strip()}-{func_id}"
 
     Expected: **2 failed**, both genuine assertion reds (not *error* / not a syntax blow-up) —
-    ``test_rescan_id_drift_yields_identical_ref`` (the two refs now differ by their ``-266156`` /
-    ``-354333`` tails) and ``test_id_fallback_reachable_only_without_address_or_name`` (the same
-    injected id displaces the degenerate ``id<func_id>`` tail — ``-266156`` replaces the
+    ``test_rescan_id_drift_yields_identical_ref`` (the two refs now differ by their ``-120004`` /
+    ``-210017`` tails) and ``test_id_fallback_reachable_only_without_address_or_name`` (the same
+    injected id displaces the degenerate ``id<func_id>`` tail — ``-120004`` replaces the
     ``id``-prefixed form).
     Restore the line to re-green.
 """
@@ -38,15 +39,15 @@ from treasure_map.lib.hunt.refs import build_evidence_ref
 
 # Real-firmware AUTOINCREMENT drift: the SAME unchanged function is numbered differently on each
 # re-scan of a delete-and-reingest analysis DB. These two ids bracket a measured real range.
-_ID_SCAN_A = 266156
-_ID_SCAN_B = 354333
+_ID_SCAN_A = 120004
+_ID_SCAN_B = 210017
 
 # A function that carries a real anchor (both address and stripped name are present, as on real
 # firmware). ``_ANCHORED`` is everything about the row EXCEPT the drifting func_id.
 _ANCHORED = {
-    "binary_sha256": "b32a0ffe1c4d7a90e5b6c8d2f0a1b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b",
-    "address": "0x000b32a0",
-    "func_name": "FUN_000b32a0",
+    "binary_sha256": "d00dfeed1c4d7a90e5b6c8d2f0a1b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b",
+    "address": "0x00408b2c",
+    "func_name": "FUN_00408b2c",
     "suffix": "cmd",
 }
 
@@ -95,7 +96,7 @@ def test_norm_offset_is_signed_and_zero_padded() -> None:
     out-of-line block below the entry) keeps its sign so it never aliases onto a positive call.
 
     MUTATION (must go RED): drop the sign (``abs`` both sides), or drop the zero pad (``:x``)."""
-    assert _norm_offset("0x409bc8", "0x409748") == "0x000480"
+    assert _norm_offset("0x416150", "0x415cd0") == "0x000480"
     assert _norm_offset("0x400", "0x440") == "-0x000040"
     assert _norm_offset("0x1000", "0x1000") == "0x000000"
     # the "0x1218" vs "0x001218" aliasing the pad exists to prevent
@@ -129,11 +130,11 @@ def test_offset_ref_splits_on_the_first_at_sign() -> None:
     This pins the wire contract the rekey executor relies on for parsing the new-form ref."""
     ref = build_evidence_ref(
         "runx",
-        suffix=callsite_offset_suffix("cmd", _norm_offset("0x409bc8", "0x409748")),
-        binary_sha256="a886defeaabbccdd",
-        address="0x409748",
+        suffix=callsite_offset_suffix("cmd", _norm_offset("0x416150", "0x415cd0")),
+        binary_sha256="c0ffee01aabbccdd",
+        address="0x415cd0",
     )
-    assert ref == "runx#a886defe:00409748@cmd@0x000480"
+    assert ref == "runx#c0ffee01:00415cd0@cmd@0x000480"
     head, suffix = ref.split("@", 1)
-    assert head == "runx#a886defe:00409748"
+    assert head == "runx#c0ffee01:00415cd0"
     assert suffix.split("@") == ["cmd", "0x000480"]

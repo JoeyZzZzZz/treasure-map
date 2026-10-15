@@ -38,7 +38,7 @@ class NonBinaryStats:
 
 
 def _walk_non_binary(fs_root: Path) -> list[NonBinaryFile]:
-    """Yield NonBinaryFile records for every candidate non-ELF file under fs_root.
+    """Return NonBinaryFile records for every candidate non-ELF file under fs_root.
 
     Skips: symlinks, directories, ELF magic files, files > _MAX_BYTES.
     """

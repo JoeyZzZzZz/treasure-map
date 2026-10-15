@@ -4,8 +4,8 @@
 
 ★ THE FOUNDATION IS MEASURED, NOT ASSUMED. Skipping a hunt is only defensible because the hunt
 produces the same content rows twice from the same analysis.db and the same code. That property
-was established by EXECUTION on three real firmware before the skip was enabled — 3163, 4187 and
-4812 instances, each digesting identically across two consecutive hunts of the same database.
+was established by EXECUTION on real firmware before the skip was enabled — each run digesting
+identically across two consecutive hunts of the same database.
 Those runs cannot live in this file (they need multi-hundred-MB analysis databases and minutes of
 CPU), so what is pinned here is everything downstream of that measurement: that the decision only
 skips on a CONFIRMED match, that the stamp is written only after the instances it describes, and

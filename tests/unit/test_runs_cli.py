@@ -231,8 +231,8 @@ def test_an_unmapped_reason_passes_through_verbatim() -> None:
     assert _reason_human("extraction", novel) == novel
     # and the mapped ones ARE rewritten, so the passthrough is not simply doing nothing
     assert "needs no decompile" in _reason_human("hunt", "hunted by abc123def456, running 789")
-    assert "decompiles 484 binaries" in _reason_human(
-        "extraction", "extracted by abc, running def", binaries=484
+    assert "decompiles 37 binaries" in _reason_human(
+        "extraction", "extracted by abc, running def", binaries=37
     )
 
 
@@ -246,7 +246,7 @@ def test_runs_groups_by_which_input_moved(tmp_path: Path) -> None:
     atlas = tmp_path / "atlas.db"
     conn = open_atlas(atlas)
     begin_run(conn, "old_extract", analysis_db_path="/ws/a.db", build_hash="facefeedfacefeed")
-    finish_run(conn, "old_extract", binaries=484, functions=9)
+    finish_run(conn, "old_extract", binaries=37, functions=9)
     begin_run(conn, "old_hunt", analysis_db_path="/ws/b.db", build_hash=current_pass_version())
     finish_run(conn, "old_hunt", binaries=2, functions=3)
     conn.close()
@@ -421,7 +421,7 @@ def test_the_closing_line_counts_the_unfinished_tier_too(
     monkeypatch.setattr(hunt_cli, "installed_commit", lambda: "c" * 40)
     out = CliRunner().invoke(runs, ["--atlas", str(_unfinished_atlas(tmp_path, firmware=None))])
     assert out.exit_code == 0, out.output
-    assert "readable via `tmap fact --analysis-db" in out.output
+    assert "readable via `tmap fact pseudocode <func> --analysis-db" in out.output
     assert "`tmap rescan` refreshes them." not in out.output
 
     # and the counterweight: with the root present, the plain sentence is the true one

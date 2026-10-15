@@ -18,6 +18,8 @@ import pytest
 
 from treasure_map.lib.diff.loader import load_functions
 
+from ..boundary_words import listed_words_in
+
 _DIFF_PKG = Path(__file__).resolve().parents[3] / "src" / "treasure_map" / "lib" / "diff"
 
 
@@ -32,11 +34,12 @@ def test_load_functions_rejects_missing_db(tmp_path: Path) -> None:
 
 def test_diff_package_is_boundary_clean() -> None:
     judgment = re.compile(
-        r"fix_quality|incomplete_patch|vulnerab|severity|exploit|\bsecurity\b",
+        r"vulnerab|severity|exploit|\bsecurity\b",
         re.IGNORECASE,
     )
     section_ref = re.compile(r"§|PRD\s")
     for path in _DIFF_PKG.glob("*.py"):
         text = path.read_text()
         assert not judgment.search(text), f"judgment vocab in {path.name}"
+        assert not listed_words_in(text), f"listed vocab in {path.name}"
         assert not section_ref.search(text), f"section/private-doc ref in {path.name}"

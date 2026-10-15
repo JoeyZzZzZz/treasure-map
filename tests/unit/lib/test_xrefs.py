@@ -44,7 +44,7 @@ def test_categorize_misc_when_no_match() -> None:
 
 
 def test_useful_ipc_string_passes_typical_sock() -> None:
-    assert is_useful_ipc_string("/var/run/audiopush.sock") is True
+    assert is_useful_ipc_string("/var/run/audiorelay.sock") is True
 
 
 def test_too_short_rejected() -> None:
@@ -260,13 +260,13 @@ def test_layer3_shared_ipc_sock_creates_xref(tmp_path: Path) -> None:
     conn = open_db(tmp_path / "analysis.db")
     conn.execute(
         "INSERT INTO binaries (id, name, sha256, dt_needed) VALUES (?, ?, ?, ?)",
-        (1, "audiopush", "a" * 64, "[]"),
+        (1, "audiorelay", "a" * 64, "[]"),
     )
     conn.execute(
         "INSERT INTO binaries (id, name, sha256, dt_needed) VALUES (?, ?, ?, ?)",
-        (2, "signalc", "b" * 64, "[]"),
+        (2, "sigclient", "b" * 64, "[]"),
     )
-    sock = "/var/run/audiopush.sock"
+    sock = "/var/run/audiorelay.sock"
     conn.execute(
         "INSERT INTO strings (binary_id, value, address) VALUES (?, ?, ?)",
         (1, sock, "00010000"),
@@ -453,7 +453,7 @@ def test_config_fold_threshold_stays_in_sync_with_xrefs_default() -> None:
 
 
 def test_l0_emits_periodic_progress_log(tmp_path: Path, monkeypatch, caplog) -> None:  # type: ignore[no-untyped-def]
-    # ★ Fix ③: a long L0 pass logs periodic progress so it is visibly RUNNING, not hung (the owner
+    # ★ A long L0 pass logs periodic progress so it is visibly RUNNING, not hung (an operator
     # should not need py-spy to tell). Threshold shrunk so a small fixture crosses it.
     import logging
 
@@ -475,7 +475,7 @@ def _ambiguous_soname_db(tmp_path: Path, *, copies: int = 2, versioned: bool = F
     different content. ``versioned`` makes the dependency name carry a version the library rows do
     not, so the hit lands on the stripped-version fallback instead of the exact name."""
     conn = open_db(tmp_path / "analysis.db")
-    dep = "libshared.so.6.0" if versioned else "libshared.so.6"
+    dep = "libcommon.so.6.0" if versioned else "libcommon.so.6"
     conn.execute(
         "INSERT INTO binaries (id, name, path, sha256, last_seen_at, dt_needed) "
         "VALUES (1, 'appd', 'usr/sbin/appd', ?, '2026-01-01T00:00:00', ?)",
@@ -484,8 +484,8 @@ def _ambiguous_soname_db(tmp_path: Path, *, copies: int = 2, versioned: bool = F
     for i in range(copies):
         conn.execute(
             "INSERT INTO binaries (id, name, path, sha256, last_seen_at, dt_needed) "
-            "VALUES (?, 'libshared.so.6', ?, ?, '2026-01-01T00:00:00', '[]')",
-            (2 + i, f"root{i}/lib/libshared.so.6", chr(ord("b") + i) * 64),
+            "VALUES (?, 'libcommon.so.6', ?, ?, '2026-01-01T00:00:00', '[]')",
+            (2 + i, f"root{i}/lib/libcommon.so.6", chr(ord("b") + i) * 64),
         )
     conn.commit()
     return conn
@@ -519,7 +519,7 @@ def test_a_soname_naming_two_binaries_writes_no_edge_and_is_recorded(tmp_path: P
     )
     rows = _ledger(conn)
     assert len(rows) == 1
-    assert rows[0]["soname"] == "libshared.so.6"
+    assert rows[0]["soname"] == "libcommon.so.6"
     assert rows[0]["edge_layer"] == "dt_needed"
     assert rows[0]["import_func_name"] is None
     assert rows[0]["match_kind"] == "exact"
@@ -547,7 +547,7 @@ def test_a_fallback_match_is_recorded_as_a_fallback(tmp_path: Path) -> None:
     build_xrefs(conn)
     rows = _ledger(conn)
     assert len(rows) == 1
-    assert rows[0]["soname"] == "libshared.so.6.0"
+    assert rows[0]["soname"] == "libcommon.so.6.0"
     assert rows[0]["match_kind"] == "versioned_fallback"
     conn.close()
 
@@ -575,7 +575,7 @@ def test_an_ambiguous_import_names_the_symbol_it_lost(tmp_path: Path) -> None:
     conn = _ambiguous_soname_db(tmp_path)
     conn.execute(
         "INSERT INTO imports (binary_id, func_name, lib_soname) VALUES (1, 'shared_entry', ?)",
-        ("libshared.so.6",),
+        ("libcommon.so.6",),
     )
     conn.commit()
     stats = build_xrefs(conn)
@@ -612,15 +612,15 @@ def test_get_imports_exports_surfaces_the_unresolved_dependencies(tmp_path: Path
     res = facts.get_imports_exports(conn, binary="usr/sbin/appd")
     unresolved = res["dt_needed_unresolved"]
     assert len(unresolved) == 1
-    assert unresolved[0]["soname"] == "libshared.so.6"
+    assert unresolved[0]["soname"] == "libcommon.so.6"
     assert {c["binary_path"] for c in unresolved[0]["candidates"]} == {
-        "root0/lib/libshared.so.6",
-        "root1/lib/libshared.so.6",
+        "root0/lib/libcommon.so.6",
+        "root1/lib/libcommon.so.6",
     }
     assert all(c["sha256"] for c in unresolved[0]["candidates"])
     # the counterpart read: a binary with nothing unresolved says so with an empty list, not by
     # omitting the key
-    clean = facts.get_imports_exports(conn, binary="root0/lib/libshared.so.6")
+    clean = facts.get_imports_exports(conn, binary="root0/lib/libcommon.so.6")
     assert clean["dt_needed_unresolved"] == []
     assert facts.count_unresolved_soname_edges(conn) == 1
     conn.close()

@@ -21,9 +21,8 @@ that safe thing"; conflating the two is how a constant-prefixed-but-tainted call
 (not value-flowing) external input, or a mixed safe+free format string would be wrongly hidden.
 
 Name-based and intra-procedural by design (like the validator filters): it can miss, and it
-prefers to stay silent rather than mislabel. Library recognition fires only on strongly
-namespaced public symbols and never defaults to `custom` (a false `custom` would wrongly inflate
-the custom/unknown breadth count; a false `stock` is recoverable on review).
+prefers to stay silent rather than mislabel. There is no library recognition here (see the
+retired library_origin below): origin is not guessed from names.
 """
 
 from __future__ import annotations
@@ -130,8 +129,8 @@ _CHARSET_SAFE: frozenset[str] = frozenset(
 #
 # It was also weak where it was not wrong. It matched eight libraries' EXPORTED API prefixes, so a
 # library's internal functions — most of its code — were already 'unknown' and already counted
-# everywhere the label was meant to keep them out of. On the real atlas it labelled 558 of 28,383
-# instances (2.0%); the other 98% of the same libraries went through unlabelled. It never
+# everywhere the label was meant to keep them out of. It labelled a small share of instances; the
+# rest of the same libraries went through unlabelled. It never
 # separated stock code from custom code, it skimmed the exported layer off the top.
 #
 # Nothing replaces it here. ``origin`` is written 'unknown' at both hunt call sites, which is the
@@ -147,7 +146,7 @@ def _cmd_callees(callees: list[str]) -> set[str]:
 def _exec_is_no_shell(callees: list[str], pseudocode: str) -> bool:
     """The function's WHOLE command-sink capability is exec-without-a-shell.
 
-    Bug1 fix — parameter-specific: it is not enough that the anchored sink is an exec; the
+    Parameter-specific: it is not enough that the anchored sink is an exec; the
     function must have NO shell-running command sink at all (`cmd ⊆ exec-no-shell`). A function
     that calls both system and execl is shell-capable and must never be downweighted no_shell."""
     cmd = _cmd_callees(callees)

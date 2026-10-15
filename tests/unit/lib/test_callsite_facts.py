@@ -238,7 +238,7 @@ def _tok(name: str, op_addr: str, opcode: int = 7, text_off: int = 0) -> dict[st
 
 def test_read_side_facts_normalizes_addresses_and_reads_calls_only(tmp_path: Path) -> None:
     """Only CALL tokens (opcode 7) count; ``op_addr`` and the unresolved-stub list are normalized
-    before matching (``0x56ff0`` and ``00056ff0`` are one address).
+    before matching (``0x4114f4`` and ``004114f4`` are one address).
 
     MUTATION (verified RED): compare the unresolved-stub entries without normalizing them -> the
     stub reads as a parsed FUN_ name instead of an unresolved stub."""
@@ -246,11 +246,11 @@ def test_read_side_facts_normalizes_addresses_and_reads_calls_only(tmp_path: Pat
         tmp_path / "a.db",
         tokens=[
             _tok("FUN_00000400", "0x1010"),
-            _tok("FUN_00056ff0", "0x1020"),
+            _tok("FUN_004114f4", "0x1020"),
             _tok("helper", "0x1030", opcode=-1),  # the function's own name token: ignored
             _tok("helper", "0x1034"),
         ],
-        unresolved=["0x56ff0"],
+        unresolved=["0x4114f4"],
         other_funcs=[("helper", "0x2000")],
     )
     side = cf.read_side_facts(
@@ -264,7 +264,7 @@ def test_read_side_facts_normalizes_addresses_and_reads_calls_only(tmp_path: Pat
     }
     assert got == {
         "00001010": [("system", "00000400", "stub_resolved")],
-        "00001020": [("FUN_00056ff0", "00056ff0", "stub_unresolved")],
+        "00001020": [("FUN_004114f4", "004114f4", "stub_unresolved")],
         "00001030": [],
         "00001034": [("helper", "00002000", "table_entry")],
     }

@@ -3,9 +3,9 @@
 """Reachability grading primitive (intra-procedural v1).
 
 Grades a candidate (a function's pseudocode + callees + the sink it reaches) as
-confirmed / blocked / unknown. Pure-static, hermetic (no LLM); a single-function
-heuristic that is honest about its limits — "unknown" is first-class. Returns a graded
-lead, never a claimed bug; depends on no downstream store.
+confirmed / unknown ("blocked" is a reserved status this grader never emits). Pure-static,
+hermetic (no LLM); a single-function heuristic that is honest about its limits — "unknown" is
+first-class. Returns a graded lead, never a claimed bug; depends on no downstream store.
 """
 
 from __future__ import annotations

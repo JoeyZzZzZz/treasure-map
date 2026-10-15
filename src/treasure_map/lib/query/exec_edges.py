@@ -111,9 +111,9 @@ def _exec_scan_status(
         rows = []  # pre-feature atlas / not re-hunted -> no status recorded (also UNKNOWN)
     # Every row of a run carries the SAME scope and note — they describe the PASS, not the binary.
     # Repeating them per binary made the status dwarf the answer it was attached to (on a real
-    # atlas, ~1500 rows each carrying the same ~700 characters), to the point that a count:0 result
-    # could not be returned inline. Hoisted to one shared copy; the per-binary rows keep only what
-    # actually varies per binary.
+    # atlas, every row carrying the same several hundred characters), to the point that a count:0
+    # result could not be returned inline. Hoisted to one shared copy; the per-binary rows keep
+    # only what actually varies per binary.
     scopes = {r["supported_scope"] for r in rows if r["supported_scope"]}
     notes = {r["unsupported_note"] for r in rows if r["unsupported_note"]}
     status: dict[str, Any] = {
@@ -163,14 +163,14 @@ def launched_by(
     ``target`` takes any spelling a reader plausibly has in hand:
 
       * a binary's SHORT NAME as the inventory lists it (``busybox``, ``httpd``);
-      * a launched SCRIPT's stored path (``usr/sbin/getmac``);
+      * a launched SCRIPT's stored path (``usr/sbin/helper_tool``);
       * an edge's ``target_token`` copied VERBATIM out of a result — which is how the code wrote it,
-        so it usually carries a leading slash (``/usr/sbin/pluginmanager``).
+        so it usually carries a leading slash (``/usr/sbin/svc_manager``).
 
     ★ A launched SCRIPT is stored under the path the extraction produced, whose first segment can
     differ from the runtime path the code names — an overlay physical path such as
-    ``rom/etc/init.d/wifi.sh`` against a token ``/etc/init.d/wifi.sh``. No spelling of the one is
-    the other, so a logical-path token answers zero: ASK FOR THE SHORT NAME (``wifi.sh``), which
+    ``rom/etc/init.d/svc.sh`` against a token ``/etc/init.d/svc.sh``. No spelling of the one is
+    the other, so a logical-path token answers zero: ASK FOR THE SHORT NAME (``svc.sh``), which
     reaches the stored path by its basename. The prefix is not stripped automatically because it
     differs per firmware and per extraction, so there is nothing exact to strip — a pattern loose
     enough to cover them all would be guessing, and this layer does not guess. Naming the exit is
@@ -197,8 +197,8 @@ def launched_by(
     attacker reaches it. An EMPTY result is NOT proof that nothing launches the binary — read the
     accompanying scan status, which names the shapes this pass cannot see (a caller behind a thin
     command wrapper being the sharpest one)."""
-    # ★ Every comparison is exact equality — never a LIKE, which would answer `getmac` with an
-    # unrelated `foogetmac`. Registered per call: the connection is the caller's.
+    # ★ Every comparison is exact equality — never a LIKE, which would answer `helper_tool` with
+    # an unrelated `foohelper_tool`. Registered per call: the connection is the caller's.
     conn.create_function("tm_basename", 1, lambda p: posixpath.basename(p) if p else p)
     # For a query with no slash in it all three spellings collapse to the same string, so a
     # short-name lookup runs exactly the comparison it always did.

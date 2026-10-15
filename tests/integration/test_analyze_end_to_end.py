@@ -25,10 +25,10 @@ from treasure_map.lib.storage.connection import open_db
 from treasure_map.lib.workspace.workspace import Workspace
 
 _FIXTURES = Path(__file__).parent.parent / "fixtures" / "elfs"
-_TRUE_ELF = _FIXTURES / "true_x86_64"
-_LIBZ_ELF = _FIXTURES / "libz_x86_64.so"
+_EXE_ELF = _FIXTURES / "exe_x86_64"
+_LIB_ELF = _FIXTURES / "libfixture_x86_64.so"
 
-no_fixture = not _TRUE_ELF.exists() or not _LIBZ_ELF.exists()
+no_fixture = not _EXE_ELF.exists() or not _LIB_ELF.exists()
 no_ghidra = shutil.which("analyzeHeadless") is None
 
 _PIPELINE_MODULE = "treasure_map.lib.analyze.pipeline"
@@ -99,8 +99,8 @@ def test_round1_self_test(tmp_path: Path) -> None:
     """
     fs_root = tmp_path / "rootfs"
     (fs_root / "bin").mkdir(parents=True)
-    shutil.copy(_TRUE_ELF, fs_root / "bin" / "true")
-    shutil.copy(_LIBZ_ELF, fs_root / "bin" / "libz.so")
+    shutil.copy(_EXE_ELF, fs_root / "bin" / "exe")
+    shutil.copy(_LIB_ELF, fs_root / "bin" / "libfixture.so")
 
     workspace_path = tmp_path / "workspace"
     cfg = Config()
@@ -158,18 +158,18 @@ def test_round2_partial_invalidation(tmp_path: Path) -> None:
     has been patched.  Only the modified binary should be re-analyzed by
     Ghidra; the unchanged binary should be skipped via sha256 cache.
 
-    Real-world scenario: user analyzed firmware v1.058, vendor releases
-    v1.060 with httpd patched for CVE-XXXX.  User re-extracts to same dir
+    Real-world scenario: user analyzed firmware v1.010, vendor releases
+    v1.020 with httpd patched for CVE-XXXX.  User re-extracts to same dir
     and re-runs `tmap analyze`.  Only httpd should re-run Ghidra.
 
-    Test technique: flip 1 byte in libz ELF header to change its sha256.
+    Test technique: flip 1 byte in the library's ELF header to change its sha256.
     This is a test shortcut that simulates "binary content changed by vendor
     patch" — not a use case where users manually edit bytes.
     """
     fs_root = tmp_path / "rootfs"
     (fs_root / "bin").mkdir(parents=True)
-    shutil.copy(_TRUE_ELF, fs_root / "bin" / "true")
-    shutil.copy(_LIBZ_ELF, fs_root / "bin" / "libz.so")
+    shutil.copy(_EXE_ELF, fs_root / "bin" / "exe")
+    shutil.copy(_LIB_ELF, fs_root / "bin" / "libfixture.so")
 
     workspace_path = tmp_path / "workspace"
     cfg = Config()
@@ -188,14 +188,14 @@ def test_round2_partial_invalidation(tmp_path: Path) -> None:
     assert result1.ghidra_skipped == 0
     assert result1.functions_ingested == 2  # one function per binary
 
-    # Flip 1 byte in e_type field (offset 0x10) of libz.so.
+    # Flip 1 byte in e_type field (offset 0x10) of libfixture.so.
     # Simulates: vendor released a patched binary in new firmware version.
-    libz_path = fs_root / "bin" / "libz.so"
-    data = bytearray(libz_path.read_bytes())
+    lib_path = fs_root / "bin" / "libfixture.so"
+    data = bytearray(lib_path.read_bytes())
     data[0x10] ^= 0xFF
-    libz_path.write_bytes(bytes(data))
+    lib_path.write_bytes(bytes(data))
 
-    # Second run: only libz should be dirty (sha256 changed)
+    # Second run: only the library should be dirty (sha256 changed)
     runner2 = _mock_runner()
     captured_records: list[list[ElfRecord]] = []
 
@@ -212,9 +212,9 @@ def test_round2_partial_invalidation(tmp_path: Path) -> None:
             result2 = asyncio.run(run_analyze(fs_root, ws, cfg))
 
     assert result2.binary_count == 2
-    assert result2.dirty_count == 1, "Only libz should be dirty (sha256 changed)"
+    assert result2.dirty_count == 1, "Only the library should be dirty (sha256 changed)"
     assert result2.ghidra_skipped == 1, "true should be skipped (sha256 unchanged)"
-    assert result2.functions_ingested == 1, "Only new libz ingested"
+    assert result2.functions_ingested == 1, "Only the new library ingested"
     # xrefs rebuild after partial ingest; verify field coherence
     assert result2.total_xrefs >= 0
     assert result2.total_xrefs == (
@@ -222,30 +222,30 @@ def test_round2_partial_invalidation(tmp_path: Path) -> None:
     )
     assert len(captured_records) == 1, "run_all called once"
     assert len(captured_records[0]) == 1, "exactly 1 record passed to run_all"
-    assert captured_records[0][0].name == "libz.so"
+    assert captured_records[0][0].name == "libfixture.so"
 
-    # DB state after Run 2: 3 rows total (true + old libz + new libz)
+    # DB state after Run 2: 3 rows total (exe + old library + new library)
     conn = open_db(workspace_path / "analysis.db")
     try:
         all_rows = conn.execute("SELECT sha256, ghidra_ok FROM binaries").fetchall()
-        assert len(all_rows) == 3, "content-identity: old libz row is preserved"
+        assert len(all_rows) == 3, "content-identity: old library row is preserved"
         assert all(row["ghidra_ok"] == 1 for row in all_rows), "all 3 rows analyzed"
 
-        # current_binaries view returns exactly 2 (true + new libz from this scan)
+        # current_binaries view returns exactly 2 (exe + new library from this scan)
         current = conn.execute("SELECT name FROM current_binaries").fetchall()
         current_names = sorted(row["name"] for row in current)
-        assert current_names == ["libz.so", "true"]
+        assert current_names == ["exe", "libfixture.so"]
 
-        # functions joined with current_binaries: true (run 1) + new libz (run 2) = 2
+        # functions joined with current_binaries: exe (run 1) + new library (run 2) = 2
         current_func_count = conn.execute(
             """SELECT COUNT(*) FROM functions f
                JOIN current_binaries cb ON f.binary_id = cb.id"""
         ).fetchone()[0]
         assert current_func_count == 2
 
-        # Old libz's function row is an orphan (not in current_binaries) but still exists
+        # The old library's function row is an orphan (not in current_binaries) but still exists
         total_func_count = conn.execute("SELECT COUNT(*) FROM functions").fetchone()[0]
-        assert total_func_count == 3  # true + old libz + new libz
+        assert total_func_count == 3  # exe + old library + new library
     finally:
         conn.close()
 
@@ -259,7 +259,7 @@ def test_round1_full_pipeline(tmp_path: Path) -> None:
     """Round 1 Full: scan + real Ghidra, second run all cached."""
     fs_root = tmp_path / "rootfs"
     (fs_root / "bin").mkdir(parents=True)
-    shutil.copy(_TRUE_ELF, fs_root / "bin" / "true")
+    shutil.copy(_EXE_ELF, fs_root / "bin" / "exe")
 
     workspace_path = tmp_path / "workspace"
     cfg = Config()

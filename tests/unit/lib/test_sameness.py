@@ -28,7 +28,7 @@ def test_an_address_shift_normalises_but_a_small_constant_does_not() -> None:
     MUTATION: add ``0x[0-9a-f]{1,}`` (any hex) to the address regex -> 0x100 and 0xff collapse and
     the second assertion goes RED."""
     a = "iVar1 = FUN_00012340(DAT_000200f8); puts(s_hi_0001ccd0);"
-    b = "iVar1 = FUN_00099990(DAT_00077abc); puts(s_hi_00088eee);"
+    b = "iVar1 = FUN_00407fb8(DAT_00077abc); puts(s_hi_00088eee);"
     assert _skel(a) == _skel(b)  # only addresses moved
 
     lo = "strncpy(dst,src,0x100);"
@@ -72,7 +72,7 @@ def test_an_address_mid_name_is_blanked_only_in_the_two_labels_that_carry_one() 
         ("goto LAB_0008f0a0_1;", "goto LAB_0008f5e0_1;"),
         ("if (x) goto joined_r0x00449e60;", "if (x) goto joined_r0x00449ecc;"),
         ("y = code_r0x00449e70;", "y = code_r0x00449ee0;"),
-        ("FUN_00012a40();", "FUN_00013b50();"),
+        ("FUN_0040caf0();", "FUN_0040a554();"),
         ("puts(s_hi_0001ccd0);", "puts(s_hi_0001cd00);"),
     ):
         assert _same(a, b), (a, b)
@@ -263,9 +263,9 @@ def test_a_large_literal_is_an_address_only_when_both_values_lie_in_their_images
     assert sm.literal_reading(same, same, image_a, image_b) == (True, False)
     big_a, big_b = "if (n < 0x7fffffff) {}", "if (n < 0xffffffff) {}"
     assert sm.literal_reading(big_a, big_b, image_a, image_b) == (False, False)
-    moved_a, moved_b = "p = (char *)0x412340;", "p = (char *)0x412560;"
+    moved_a, moved_b = "p = (char *)0x41e8c8;", "p = (char *)0x41eae8;"
     assert sm.literal_reading(moved_a, moved_b, image_a, image_b) == (True, False)
-    assert sm.literal_reading("f(0x412340);", "f(0x412340, 0x412340);", image_a, image_b) == (
+    assert sm.literal_reading("f(0x41e8c8);", "f(0x41e8c8, 0x41e8c8);", image_a, image_b) == (
         False,
         False,
     )
@@ -279,7 +279,7 @@ def test_a_moved_literal_read_on_an_unknown_image_is_named_not_trusted() -> None
     MUTATION: mark ``relied`` whenever an image is unknown, whatever the values -> the unchanged
     literal is flagged -> RED."""
     image = [(0x400000, 0x500000)]
-    a, b = "p = (char *)0x412340;", "p = (char *)0x412560;"
+    a, b = "p = (char *)0x41e8c8;", "p = (char *)0x41eae8;"
     assert sm.literal_reading(a, b, None, image) == (True, True)
     assert sm.literal_reading(a, a, None, image) == (True, False)
     bodies_a, bodies_b = {"1000": _body(a)}, {"2000": _body(b)}
@@ -302,7 +302,7 @@ def test_a_text_match_the_decompiler_marked_incomplete_is_not_identical() -> Non
 
     MUTATION: match ``jumptable`` on "Could not recover jumptable" alone -> the second note is
     missed -> RED."""
-    first = "/* WARNING: Could not recover jumptable at 0x0040b668. Too many branches */\nf();"
+    first = "/* WARNING: Could not recover jumptable at 0x00408218. Too many branches */\nf();"
     second = "/* WARNING: Could not find normalized switch variable to match jumptable */\nf();"
     for text in (first, second):
         reasons = _reasons(text)

@@ -17,6 +17,8 @@ import pytest
 from treasure_map.lib.reachability import grade_candidate
 from treasure_map.lib.reachability.filters import VALIDATOR_PATTERNS
 
+from ..boundary_words import listed_words_in
+
 _REACH_PKG = Path(__file__).resolve().parents[3] / "src" / "treasure_map" / "lib" / "reachability"
 
 
@@ -308,7 +310,7 @@ _BLOCKED_PRONE_SHAPES: list[tuple[str, list[str], str]] = [
         "system",
     ),
     # cross-branch leakage: validator in one switch case, unfiltered sink in another, on a
-    # different offset of the same (collapsed) base name (the ipd_rcv regression shape).
+    # different offset of the same (collapsed) base name (the evt_rcv regression shape).
     (
         "switch (op) { case 1: check_field(st + 0x12); break; case 2: system(st + 0x14); break; }",
         ["check_field", "system"],
@@ -414,18 +416,19 @@ def test_fmtstr_literal_format_grades_unknown_degraded() -> None:
     assert verdict.status == "unknown"
 
 
-# ── BOUNDARY: no vendor/spike symbols, no bug-labeling vocab, generic validators ────
+# ── BOUNDARY: no vendor/firmware symbols, no bug-labeling vocab, generic validators ──
 
 
 def test_reachability_package_is_boundary_clean() -> None:
     banned = re.compile(
-        r"\b(vuln\w*|exploit\w*|payload|\bpoc\b|finding|check_id_char|incomplete_patch|fix_quality)\b",
+        r"\b(vuln\w*|exploit\w*|payload|\bpoc\b|finding)\b",
         re.IGNORECASE,
     )
     section_ref = re.compile(r"§|PRD\s")
     for path in _REACH_PKG.glob("*.py"):
         text = path.read_text()
-        assert not banned.search(text), f"banned vocab/spike symbol in {path.name}"
+        assert not banned.search(text), f"banned vocab in {path.name}"
+        assert not listed_words_in(text), f"listed vocab/firmware symbol in {path.name}"
         assert not section_ref.search(text), f"section/private-doc ref in {path.name}"
 
 
@@ -434,8 +437,8 @@ def test_validator_patterns_are_generic() -> None:
     for pat in VALIDATOR_PATTERNS:
         src = pat.pattern
         assert src.startswith("^")
-        # Anchored prefix only; no literal full symbol like a specific check_id_char.
-        assert "id_char" not in src
+        # Anchored prefix only; no literal full symbol taken from one firmware.
+        assert not listed_words_in(src)
 
 
 # ── unrecovered calling convention (stripped MIPS/ARM) -> never confirmed ───────────
@@ -521,11 +524,11 @@ def test_locate_sink_arg_reads_a_call_named_after_its_stub() -> None:
     -> the second assertion returns None while a real value is reaching the sink."""
     from treasure_map.lib.reachability.taint import locate_sink_arg
 
-    stubbed = "void f(char *cmd){ FUN_004125b0(cmd); }"
+    stubbed = "void f(char *cmd){ FUN_0041eb38(cmd); }"
     assert locate_sink_arg(stubbed, "system") is None
-    assert locate_sink_arg(stubbed, "system", {0x4125B0: "system"}) == "cmd"
+    assert locate_sink_arg(stubbed, "system", {0x41EB38: "system"}) == "cmd"
     # an address the table resolves elsewhere is not a call to this sink
-    assert locate_sink_arg(stubbed, "system", {0x4125B0: "memcpy"}) is None
+    assert locate_sink_arg(stubbed, "system", {0x41EB38: "memcpy"}) is None
 
 
 def test_locate_sink_arg_keeps_its_first_argument_semantics() -> None:

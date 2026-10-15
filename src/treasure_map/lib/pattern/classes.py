@@ -512,7 +512,7 @@ def _is_phantom_offset(paren_off: int, decl_end: int, spans: tuple[tuple[int, in
 
 # ── Call locations: one authority on "where are the calls to NAME" ──────────────────────────────
 
-# A call the decompiler named after the stub it goes through (``FUN_004125b0(...)``) rather than
+# A call the decompiler named after the stub it goes through (``FUN_0041eb38(...)``) rather than
 # after the import behind it. The address is recoverable from the name, which is what lets a
 # resolved stub table turn such a call back into a call to ``system`` / ``memcpy`` / ….
 _STUB_CALL_RE = re.compile(r"\bFUN_([0-9a-fA-F]+)\s*\(")
@@ -532,7 +532,7 @@ def call_offsets(
     by coincidence, and stop agreeing the first time either one is adjusted.
 
     ``stub_names`` maps a lazy-binding stub's ENTRY ADDRESS to the import it calls (see
-    analyze/stub_resolve). When it is given, a call the decompiler rendered as ``FUN_004125b0(...)``
+    analyze/stub_resolve). When it is given, a call the decompiler rendered as ``FUN_0041eb38(...)``
     counts as a call to ``name`` whenever that address maps to ``name`` — merged into the same
     source order as the textual calls, so the Nth call is the Nth call however it was rendered. A
     plain mapping rather than the resolver's own dataclass keeps this layer free of the analyze

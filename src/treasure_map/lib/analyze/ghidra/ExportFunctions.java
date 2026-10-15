@@ -66,7 +66,7 @@ public class ExportFunctions extends GhidraScript {
     private final Set<String> TOKENIZERS = new HashSet<>();
     private static final int PROV_MAX_DEPTH = 2;   // vararg / nested-source recursion cap (the provenance design)
 
-    // ---- gap② nvram op lexicon (registry role nvram). Per API:
+    // ---- nvram op lexicon (registry role nvram). Per API:
     //   op    read / write / commit / getall
     //   keyIdx  0-based arg holding the key (-1 = whole-store op, no key: commit/getall)
     //   nameIdx pf family only — the composite key is prefix(keyIdx)+name(nameIdx); -1 otherwise
@@ -423,12 +423,6 @@ public class ExportFunctions extends GhidraScript {
     // Registry role forward_cmd: shell-running sinks whose first argument IS the command.
     private final Set<String> FORWARD_CMD_SINKS = new HashSet<>();
     private static final int WRAPPER_MAX_STATEMENTS = 20;   // mirrors lib/hunt/facts.py
-    // Caller-supplied placeholders the decompiler emits for a parameter it could not tie to the
-    // signature. Recognised as parameters (mirroring the Python side) but NOT indexable, so a
-    // wrapper whose command rides one of these is never registered — see the index rule below.
-    private static final Pattern CALLER_SUPPLIED_RE =
-        Pattern.compile("param_\\d+|in_stack_[0-9a-fx]+|unaff_\\w+"
-                      + "|in_(?:a[0-3]|v[01]|t\\d|s[0-8]|k[01]|at|gp|sp|fp|ra)");
     // Type / keyword words that are never a parameter NAME (mirrors taint._TYPE_WORDS), so a slot
     // spelling only a type is recorded as unnamed rather than as a parameter called "char".
     private static final Set<String> WRAPPER_TYPE_WORDS = new HashSet<>(Arrays.asList(
@@ -720,10 +714,9 @@ public class ExportFunctions extends GhidraScript {
         return arr.toString();
     }
 
-    // gap② phase 1: per-function nvram read/write ops. One record per nvram API call:
+    // Per-function nvram read/write ops. One record per nvram API call:
     //   {api, op, key + honest key three-state (constant / parametric-template / unresolved), and for
-    //    writes value_source via the SAME classify as sink_provenance (a controllability signal;
-    //    143/143 accurate on that axis in the probe)}. A surfaced def-use FACT — a key that cannot be
+    //    writes value_source via the SAME classify as sink_provenance (a controllability signal)}. A surfaced def-use FACT — a key that cannot be
     //    read is marked parametric/unresolved, NEVER silently dropped. No cross-function key chasing
     //    (an unresolved key is flagged key_from_caller and left to the agent).
     private String buildNvramOps(HighFunction hf) {
@@ -1023,7 +1016,7 @@ public class ExportFunctions extends GhidraScript {
         return ",\"completeness\":{\"status\":\"complete\",\"scope\":\"" + esc(scope) + "\"}";
     }
 
-    // gap② A2: recognize a THIN nvram wrapper — a function whose sole job is to forward a
+    // recognize a THIN nvram wrapper — a function whose sole job is to forward a
     // caller-supplied key into ONE nvram accessor (so phase-1 records that key as key_from_caller
     // and the direct key graph misses the wrapper's callers). Conservative by construction, because
     // a mis-recognition would mint a FALSE key edge (worse than a missing one):
@@ -1065,7 +1058,7 @@ public class ExportFunctions extends GhidraScript {
         return "";
     }
 
-    // gap② A2: at each CALL to a known LOCAL/imported function, resolve the FIRST argument to a
+    // at each CALL to a known LOCAL/imported function, resolve the FIRST argument to a
     // CONSTANT string. If that callee is a recognized nvram wrapper (decided cross-function at hunt
     // time), this literal is the indirect key the caller reads/writes through it — the wrapper edge
     // that direct extraction misses. Only a resolved constant is emitted (the resolvable majority);
@@ -1098,8 +1091,8 @@ public class ExportFunctions extends GhidraScript {
 
     // Naming-bridge phase 1: parse the router_defaults data-segment table — the array of
     // {char* name, char* value(default), int flags, ...} 20-byte members that enumerates every
-    // web-settable nvram default key (libshared). A PURE data-segment fact (no code / no
-    // pseudocode), the source-side key-writability signal the decompiler cannot surface. Probe-nailed
+    // web-settable nvram default key (in a shared config library). A PURE data-segment fact (no
+    // code / no pseudocode), the source-side key-writability signal the decompiler cannot surface. Probe-nailed
     // layout: 20-byte stride, offset 0 = name ptr (.rodata), offset 4 = value ptr (default, nullable),
     // offset 8 = flags int; walk from the symbol until a NULL/invalid name ptr (the table-end
     // sentinel). Emits a JSON object. A binary WITHOUT the symbol emits {"located":false} — NOT an
@@ -2278,7 +2271,7 @@ public class ExportFunctions extends GhidraScript {
     /** Ghidra's own listing for this function, one row per code unit, deflated+Base64.
      *
      *  This is the disassembly get_disassembly serves. The operands come from CodeUnitFormat, so a
-     *  call reads ``bl FUN_0001a2b4`` / ``bl printf`` with the SAME names the pseudocode uses, and
+     *  call reads ``bl FUN_00413bc4`` / ``bl printf`` with the SAME names the pseudocode uses, and
      *  an ARM/Thumb or MIPS16 unit is rendered in the mode Ghidra decoded it in (length distinguishes
      *  them). Each row: a=address, n=byte length, k=code|data, and for code m=mnemonic, o=operands.
      *  The raw bytes are NOT stored here — the read layer takes them from data_blocks by (a,n), so a
@@ -2558,7 +2551,7 @@ public class ExportFunctions extends GhidraScript {
             // Which additive detectors threw on this function. A detector that FAILED returns its
             // empty value just like one that genuinely found nothing; without this list a reader
             // cannot tell "looked, found none" from "the look crashed", and a crash would read as a
-            // clean result. Each catch below names itself here (gap G1#1).
+            // clean result. Each catch below names itself here.
             List<String> detectorErrors = new ArrayList<>();
 
             // sink_arg_provenance: Ghidra def-use fact for each command/format sink's key argument.
@@ -2572,7 +2565,7 @@ public class ExportFunctions extends GhidraScript {
                 detectorErrors.add("sink_provenance");
             }
 
-            // gap② phase 1: per-function nvram read/write ops. Additive evidence, never a gate.
+            // per-function nvram read/write ops. Additive evidence, never a gate.
             String nvramOps = "[]";
             try {
                 if (hf != null) nvramOps = buildNvramOps(hf);
@@ -2602,7 +2595,7 @@ public class ExportFunctions extends GhidraScript {
                 detectorErrors.add("address_taken");
             }
 
-            // gap② A2: thin-nvram-wrapper flag + its callers' resolved literal keys. Additive and
+            // thin-nvram-wrapper flag + its callers' resolved literal keys. Additive and
             // isolated — a wrapper edge is recovered cross-function at hunt time; a failure here
             // just yields no wrapper data, never breaking the scan (honesty > coverage).
             String nvramWrapper = "";
@@ -2722,7 +2715,7 @@ public class ExportFunctions extends GhidraScript {
         exportsJson.append("]");
 
         // 4. Strings from Ghidra defined Data.
-        // STR_LIMIT raised from 2000: real config binaries (rc / libshared) carry several thousand
+        // STR_LIMIT raised from 2000: real configuration binaries carry several thousand
         // defined strings and were silently HALVED at 2000, so get_strings read a capped binary's
         // dropped string as "absent" (a fake-empty — the same silent-drop red line as readers:[] and
         // data-gap). Iterating defined string Data is cheap (not the decompile cost), so the cap is a

@@ -25,7 +25,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal
 
-from treasure_map.lib.binary_id import resolve_binary
+from treasure_map.lib.binary_id import _SHA_PREFIX, resolve_binary
 from treasure_map.lib.hunt.refs import _norm_addr
 from treasure_map.lib.ro_db import ro_connect
 from treasure_map.version import UNKNOWN_VERSION
@@ -318,8 +318,8 @@ def _addr_candidates(func: str) -> set[str]:
     """Canonical stored-address forms ``func`` could denote.
 
     The analysis schema stores a function address as zero-padded 8-digit lowercase hex (e.g.
-    ``00038de8``). A consumer may type the same address many ways: ``0x38de8`` / ``38de8`` /
-    ``00038de8`` / ``232424`` (decimal) / ``FUN_00038de8`` (the decompiler's address-named symbol).
+    ``0040a1c0``). A consumer may type the same address many ways: ``0x40a1c0`` / ``40a1c0`` /
+    ``0040a1c0`` / ``4235712`` (decimal) / ``FUN_0040a1c0`` (the decompiler's address-named symbol).
     Each is normalized to the stored form so any of them resolves the function. An ``0x`` or
     ``FUN_`` prefix marks the token as unambiguously hex; a bare all-digit token is offered as BOTH
     hex and decimal (only the form that actually exists can match, so offering both is safe)."""
@@ -341,13 +341,26 @@ def _addr_candidates(func: str) -> set[str]:
     return out
 
 
+def _binary_selector(binary: str) -> tuple[str, list[str]]:
+    """A WHERE fragment (over ``b``) matching ``binary`` as a short name, a full path, a sha256, or
+    a sha256 prefix of at least 8 hex digits. Every form at once, not the first that hits: a short
+    name shared by several binaries keeps matching all of them, so a function that exists in only
+    one still resolves without the caller first naming which."""
+    sel = ["b.name = ?", "b.path = ?", "b.sha256 = ?"]
+    params = [binary, binary, binary.lower()]
+    if _SHA_PREFIX.match(binary):
+        sel.append("b.sha256 LIKE ? || '%'")
+        params.append(binary.lower())
+    return f"({' OR '.join(sel)})", params
+
+
 def _match_functions(conn: sqlite3.Connection, func: str, binary: str | None) -> list[sqlite3.Row]:
     """Functions whose name OR address denotes ``func`` (optionally scoped to one binary).
 
     Address matching is twofold: the literal ``func`` as stored (covers a DB that keeps the typed
     form) AND any normalized 8-hex candidate (covers the zero-padded stored form). ``binary`` is
-    matched against the short name OR the full path, so the binary_path a candidate listing returns
-    resolves directly."""
+    matched by ``_binary_selector`` (short name, full path, sha256 or a sha256 prefix), so the
+    binary_path or sha256 an ambiguous listing returns resolves directly."""
     addrs = sorted(_addr_candidates(func))
     where = ["f.name = ?", "f.address = ?"]
     params: list[str] = [func, func]
@@ -357,13 +370,14 @@ def _match_functions(conn: sqlite3.Connection, func: str, binary: str | None) ->
     later = ", ".join(_function_column(conn, c) for c in _LATER_FUNCTION_COLUMNS)
     sql = (
         "SELECT f.id, f.binary_id, f.name, f.address, f.size_bytes, f.pseudocode, f.callees, "
-        f"{later}, b.name AS binary_name, b.path AS binary_path "
+        f"{later}, b.name AS binary_name, b.path AS binary_path, b.sha256 AS binary_sha256 "
         f"FROM functions f JOIN {_CURRENT_BINARIES} b ON b.id = f.binary_id "
         f"WHERE ({' OR '.join(where)})"  # noqa: S608 -- placeholders only; values stay bound params
     )
     if binary is not None:
-        sql += " AND (b.name = ? OR b.path = ?)"
-        params.extend([binary, binary])
+        clause, bparams = _binary_selector(binary)
+        sql += f" AND {clause}"
+        params.extend(bparams)
     sql += " ORDER BY b.name, f.address"
     return conn.execute(sql, params).fetchall()
 
@@ -383,8 +397,14 @@ def _resolve_one(
             "found": False,
             "reason": "ambiguous",
             "query": {"function": func, "binary": binary},
+            # sha256 rides each candidate: two binaries can share a name AND a path across
+            # extraction roots, and the digest is the selector that always tells them apart.
             "candidates": [
-                _anchor(r["binary_name"], r["binary_path"], r["name"], r["address"]) for r in rows
+                {
+                    **_anchor(r["binary_name"], r["binary_path"], r["name"], r["address"]),
+                    "sha256": r["binary_sha256"],
+                }
+                for r in rows
             ],
         }
     return rows[0], None
@@ -417,10 +437,11 @@ def get_pseudocode(
 ) -> dict[str, Any]:
     """Decompiler pseudocode for one function (the default read view), with its anchor.
 
-    ``func`` may be a function name or an address in any common form (``0x38de8`` / ``38de8`` /
-    ``00038de8`` / ``232424`` decimal / ``FUN_00038de8``). ``binary`` accepts the short name or the
-    full path. Returns a not-found record (never a guess) when the function does not resolve
-    uniquely; an ambiguous name lists the candidate anchors to disambiguate."""
+    ``func`` may be a function name or an address in any common form (``0x40a1c0`` / ``40a1c0`` /
+    ``0040a1c0`` / ``4235712`` decimal / ``FUN_0040a1c0``). ``binary`` accepts the short name, the
+    full path, the sha256 or a sha256 prefix (>= 8 hex). Returns a not-found record (never a
+    guess) when the function does not resolve uniquely; an ambiguous name lists the candidate
+    anchors to disambiguate."""
     row, miss = _resolve_one(conn, func, binary)
     if row is None:
         assert miss is not None
@@ -907,7 +928,7 @@ def get_strings(
     ).fetchone()
     truncated = bool(meta and meta["strings_truncated"])
     total = int(meta["strings_total"]) if meta and meta["strings_total"] is not None else len(rows)
-    # ★ M6: byte-paginate the (func-narrowed) items so a huge by-binary listing (a wide dispatcher's
+    # ★ byte-paginate the (func-narrowed) items so a huge by-binary listing (a wide dispatcher's
     # 400k+ of strings) is reachable page by page. ``paging.truncated`` (byte-paging) is DISTINCT
     # from the top-level ``truncated`` below (the export-cap prefix flag) — both can hold at once.
     page_items, paging = _byte_page(items, offset, max_chars)
@@ -975,12 +996,13 @@ def get_functions_referencing_string(
 
     The schema stores no string->function link, but functions.pseudocode is kept in full, so this
     answers "which functions mention this text" by scanning that pseudocode — the same manual
-    ``LIKE`` reverse-lookup a reviewer runs by hand, wrapped as one call. ``binary`` (short name OR
-    full path) narrows to one binary; omitted, it scans every binary. Capped at ``limit`` hits
-    (default 50); the result carries ``truncated`` when more exist. HONEST BOUND: this is a TEXT
-    match, not a resolved symbol reference — the ``note`` says so; the text can occur in a comment
-    or an unrelated string literal, so each hit is a lead to confirm. Each hit carries its anchor
-    (binary + function + address) and the first matching pseudocode line."""
+    ``LIKE`` reverse-lookup a reviewer runs by hand, wrapped as one call. ``binary`` (short name,
+    full path, sha256 or sha256 prefix) narrows to one binary; omitted, it scans every binary.
+    Capped at ``limit`` hits (default 50); the result carries ``truncated`` when more exist.
+    HONEST BOUND: this is a TEXT match, not a resolved symbol reference — the ``note`` says so; the
+    text can occur in a comment or an unrelated string literal, so each hit is a lead to confirm.
+    Each hit carries its anchor (binary + function + address) and the first matching pseudocode
+    line."""
     if not text.strip():
         return {"found": False, "reason": "empty search text", "query": {"text": text}}
     lim = max(1, limit)
@@ -991,8 +1013,9 @@ def get_functions_referencing_string(
     )
     params: list[Any] = [f"%{_like_escape(text)}%"]
     if binary is not None:
-        sql += " AND (b.name = ? OR b.path = ?)"
-        params.extend([binary, binary])
+        clause, bparams = _binary_selector(binary)
+        sql += f" AND {clause}"
+        params.extend(bparams)
     sql += " ORDER BY b.name, f.address LIMIT ?"
     params.append(lim + 1)  # fetch one extra to detect truncation without a second COUNT query
     rows = conn.execute(sql, params).fetchall()

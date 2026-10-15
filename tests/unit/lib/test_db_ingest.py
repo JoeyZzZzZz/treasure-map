@@ -274,7 +274,7 @@ def test_migration_adds_sink_provenance_to_old_db(tmp_path: Path) -> None:
 
 
 def test_migration_adds_nvram_ops_to_old_db(tmp_path: Path) -> None:
-    # gap②: functions.nvram_ops was added to schema.sql AND _ADDED_COLUMNS together. A database
+    # functions.nvram_ops was added to schema.sql AND _ADDED_COLUMNS together. A database
     # built before it must gain the column on open (back-filling '[]'), so ghidra_ingest can write
     # it without "no column named nvram_ops"; existing rows are preserved.
     db_path = tmp_path / "legacy_nvram.db"
@@ -1061,17 +1061,17 @@ def test_ingest_writes_bridge_transport_verbatim(tmp_path: Path) -> None:
     tokens = [
         {
             "call_token": "system",
-            "token_addr": "0x409bc8",
-            "op_addr": "0x409bc8",
+            "token_addr": "0x416150",
+            "op_addr": "0x416150",
             "opcode": 7,
             "text_off": 45,
             "line": 5,
         }
     ]
-    ranges = [["0x409748", "0x409c00"]]
+    ranges = [["0x415cd0", "0x416188"]]
     data = {
         "functions": [
-            {"name": "f", "address": "00409748", "call_tokens": tokens, "body_ranges": ranges}
+            {"name": "f", "address": "00415cd0", "call_tokens": tokens, "body_ranges": ranges}
         ]
     }
     _ingest_one_binary(conn, 1, data, IngestStats(), None)

@@ -178,7 +178,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # exec_edge's indexes references the column, so no index has to be dropped first.
         conn.execute("ALTER TABLE exec_edge DROP COLUMN resolved_via")
 
-    # gap② A2 (added this round): the thin nvram wrapper a wrapper-indirect key edge was resolved
+    # the thin nvram wrapper a wrapper-indirect key edge was resolved
     # through. Nullable TEXT — existing rows carry NULL (a DIRECT edge) until re-hunted. Idempotent.
     nvkf_cols = _column_names(conn, "nvram_key_flow")
     if nvkf_cols and "via_wrapper" not in nvkf_cols:

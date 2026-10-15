@@ -710,9 +710,10 @@ def add_private_exploit(
     """Append one verified-exploit record (admission bar = EXPLOITED); return the row id.
 
     Storage-side guard for the bar: ``evidence_ref`` / ``pattern`` / ``exploit_note`` must be
-    non-blank after stripping (SQLite's NOT NULL only blocks NULL, letting ''/'   ' through — the
-    bar is "an exploited hole with proof", so a blank proof field is rejected here too). This does
-    NOT verify the exploit is real — that is a human's judgement, never asserted by the tool.
+    non-blank after stripping (SQLite's NOT NULL only blocks NULL, letting ''/'   ' through — a
+    record without its proof text does not meet the bar, so a blank field is rejected here too).
+    This does NOT verify the exploit is real — that is a human's judgement, never asserted by the
+    tool.
     Append-only: one evidence_ref may gather several rows (corroboration), a later write never
     overwrites."""
     for field, val in (

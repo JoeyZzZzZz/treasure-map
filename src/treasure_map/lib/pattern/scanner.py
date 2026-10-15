@@ -117,7 +117,8 @@ def scan(db_path: Path | str) -> ScanResult:
 
     # Each binary's resolved stub table, so a sink call the decompiler named after its stub is
     # seen by the detectors. Loaded once per scan rather than per function: it is a property of the
-    # binary, and re-reading it 88,000 times would be the same answer at 88,000 times the cost.
+    # binary, and re-reading it once per function would be the same answer at that many times the
+    # cost.
     stub_by_binary = load_stub_names(db_path)
 
     matches: list[PatternMatch] = []

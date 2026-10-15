@@ -294,9 +294,9 @@ _DIFF_ROLES = "(A = --before, B = --after)"
 # Said whenever the rescan a diff starts will run the decompiler: a re-extraction can re-key the
 # evidence refs that durable judgements are anchored on.
 _REKEY_WARNING = (
-    "This re-extracts (the decompiler runs): evidence refs may be re-keyed, so annotations and "
-    "ruler anchors may lose their anchor. Back up the atlas first, and run the gates and the "
-    "ruler after the rescan. To do it yourself later, add --no-rescan."
+    "This re-extracts (the decompiler runs): evidence refs may be re-keyed, so annotations may "
+    "lose their anchor. Back up the atlas first; after the rescan, list_overlays flags any "
+    "annotation whose anchor moved. To rescan yourself later, add --no-rescan."
 )
 _DIFF_SKEW = (
     "the two runs were produced by different tmap/Ghidra versions (or a version was not "
@@ -1302,7 +1302,7 @@ def _run_provenance_line(r: RunRow) -> str:
 
 
 def _echo_run_lineage(atlas_path: Path, selected_run: str) -> None:
-    """Print the run's scan lineage at the top of a CLI view (M8c) — the stale-scan guard.
+    """Print the run's scan lineage at the top of a CLI view — the stale-scan guard.
 
     Print the run's lineage line so its build/date/status is in front of the reader (a stale scan
     is otherwise silent); a run id the atlas does not hold prints the run count + how to list them.
@@ -1436,7 +1436,7 @@ def runs(config: Path | None, atlas_path: Path | None, as_json: bool) -> None:
         # that would send the reader at a command that fails on a subset, with no hint which.
         click.echo(
             "\n`tmap rescan` refreshes the runs that still have a firmware root; the others are "
-            "readable via `tmap fact --analysis-db <path>`."
+            "readable via `tmap fact pseudocode <func> --analysis-db <path>`."
         )
     else:
         click.echo("\n`tmap rescan` refreshes them.")
@@ -1583,7 +1583,7 @@ def triage(
     cfg = load_config(config)
     resolved_atlas = atlas_path if atlas_path is not None else cfg.atlas.db_path
     _require_atlas(resolved_atlas)
-    # ★ A run is REQUIRED (owner decision): the whole-atlas triage materialised every run's
+    # ★ A run is REQUIRED: the whole-atlas triage materialised every run's
     # candidates. Name the scan; `tmap runs` lists them.
     if selected_run is None:
         from treasure_map.lib.atlas.connection import open_atlas
@@ -1599,7 +1599,7 @@ def triage(
             "tmap triage needs a run: pass one as the argument or --run. "
             f"Runs in this atlas: {listed}"
         )
-    # ★ M8c: print the current run's scan lineage (build / date / status) at the top — a stale scan
+    # ★ print the current run's scan lineage (build / date / status) at the top — a stale scan
     # is otherwise silent, and this is exactly where a reader forgets an old build was scanned.
     if not as_json:
         _echo_run_lineage(resolved_atlas, selected_run)

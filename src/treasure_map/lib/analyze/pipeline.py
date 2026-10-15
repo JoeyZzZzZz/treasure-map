@@ -2,13 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Analyze pipeline: scan_filesystem → ingest_elfs → ghidra_runner.run_all → ghidra_ingest.
 
-Binary-level idempotency: scan_filesystem always runs (fast).  Ghidra runs
-only on dirty records — sha256 values that are new or still have ghidra_ok=0.
-DB is the truth source; workspace step checkpoints are not used here.
-Week 2 scope: Ghidra. Week 3 Round A: Ghidra JSON ingest.
-Week 3 Round B: xrefs + string classification (wipe-and-rebuild each run).
-Week 3 Round C: non-binary ingester framework (wipe-and-rebuild each run).
-Week 3 Round D: config_file ingester + per-kind sub_rows stats.
+Binary-level idempotency: scan_filesystem always runs (fast). Ghidra runs only on dirty
+records — a binary that is new, has no successful extraction yet, was extracted by a different
+pass_version, timed out under a different pass, or is cached but code-rich and empty (the
+self-heal in db_ingest). The database is the source of truth; there are no step checkpoints.
+xrefs, string classification and the non-binary ingesters are rebuilt on every run.
 """
 
 from __future__ import annotations
@@ -44,21 +42,21 @@ class AnalyzeResult:
     ghidra_ok: int  # of dirty, how many Ghidra succeeded
     ghidra_failed: int  # of dirty, how many Ghidra failed
     ghidra_skipped: int  # binary_count - dirty_count (cache hits)
-    functions_ingested: int  # Round A: rows written to functions table
+    functions_ingested: int  # rows written to functions table
     imports_ingested: int
     exports_ingested: int
     strings_ingested: int
-    layer0_xrefs: int  # Round B: callees × exports function-level
-    layer1_xrefs: int  # Round B: import × export (sum func + lib)
-    layer2_xrefs: int  # Round B: dt_needed library-level
-    layer3_xrefs: int  # Round B: string_ipc soft links
-    strings_classified: int  # Round B: strings.category filled
-    total_xrefs: int  # Round B: sum of all layers
-    non_binary_files_ingested: int  # Round C: rows written to non_binary_files
-    script_calls_ingested: int  # Round C: rows written to script_calls
-    config_entries_ingested: int  # Round D: rows written to config_entries
-    credentials_ingested: int  # Round E: rows written to credentials
-    web_endpoints_ingested: int  # Round F: rows written to web_endpoints
+    layer0_xrefs: int  # callees × exports function-level
+    layer1_xrefs: int  # import × export (sum func + lib)
+    layer2_xrefs: int  # dt_needed library-level
+    layer3_xrefs: int  # string_ipc soft links
+    strings_classified: int  # strings.category filled
+    total_xrefs: int  # sum of all layers
+    non_binary_files_ingested: int  # rows written to non_binary_files
+    script_calls_ingested: int  # rows written to script_calls
+    config_entries_ingested: int  # rows written to config_entries
+    credentials_ingested: int  # rows written to credentials
+    web_endpoints_ingested: int  # rows written to web_endpoints
     elapsed: float
     # ★ Red-line (degrade must be visible): current-scan binaries that hold 0 functions but are NOT
     # legitimately code-free (ghidra_status != ok_empty) — analysis is incomplete for them, NOT
@@ -186,7 +184,7 @@ async def run_analyze(
                     len(dirty_records),
                 )
 
-            # ★ R6: the SUCCESS stamp (ghidra_ok/status/pass_version) is NOT written here. It is
+            # ★ the SUCCESS stamp (ghidra_ok/status/pass_version) is NOT written here. It is
             # written inside ingest_ghidra_output, in the same transaction as the function rows, so
             # a binary is never marked extracted while its functions are missing. A FAILURE has no
             # functions to lose, so it is stamped and committed here as before.
@@ -224,7 +222,7 @@ async def run_analyze(
         else:
             logger.info("ghidra: all binaries up-to-date (0 dirty)")
 
-        # Round A: ingest Ghidra JSON output into functions/imports/exports/strings
+        # ingest Ghidra JSON output into functions/imports/exports/strings
         ingest_stats = ingest_ghidra_output(
             conn,
             workspace.path / "ghidra_output",
@@ -234,7 +232,7 @@ async def run_analyze(
             success_stamp=success_stamp if dirty_records else None,
         )
 
-        # Round B: build cross-binary xrefs + classify strings (wipe-and-rebuild)
+        # build cross-binary xrefs + classify strings (wipe-and-rebuild)
         xref_stats = build_xrefs(conn, fold_edge_threshold=config.xref_fold_edge_threshold)
 
         # ★ Red-line visibility: current-scan binaries that hold 0 functions and are NOT a
@@ -251,7 +249,7 @@ async def run_analyze(
             ).fetchall()
         ]
 
-        # Round C: non-binary ingester framework (wipe-and-rebuild)
+        # non-binary ingester framework (wipe-and-rebuild)
         if not skip_non_binary:
             nb_stats = run_all_ingesters(
                 conn,

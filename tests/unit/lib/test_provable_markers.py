@@ -75,7 +75,7 @@ REGISTRY: dict[str, dict[str, list[Case] | str]] = {
         ],
         "every_danger_arg": (
             "N/A: a copy's danger is its length, the one argument read; whether a fixed length "
-            "fits the destination is not claimed (owner decision: a fixed length is provable)"
+            "fits the destination is not claimed (a fixed length is treated as provable)"
         ),
         "every_caller": "N/A: read from the call's own text; nothing about callers enters it",
         "literal_parse": [

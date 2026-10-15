@@ -162,8 +162,8 @@ def analyze(
 
     Produces an analysis.db in the workspace directory. -w/--workspace takes a workspace NAME,
     managed under your workspace base; omitted, a deterministic auto name is derived from the
-    firmware dir. Resume-safe: re-running with the same -w skips completed steps (the same name
-    always maps to the same directory).
+    firmware dir. Re-running with the same -w re-extracts only the binaries that changed (the
+    same name always maps to the same directory).
     """
     from treasure_map.lib.analyze.pipeline import run_analyze
     from treasure_map.lib.config.config import load_config

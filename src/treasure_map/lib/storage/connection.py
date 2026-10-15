@@ -38,7 +38,7 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # sink_arg_provenance transport column; back-fills as '[]' on DBs built before it existed so
     # ghidra_ingest can write it without "no column named sink_provenance". Must match schema.sql.
     ("functions", "sink_provenance", "TEXT DEFAULT '[]'"),
-    # gap② nvram_ops transport column (per-function nvram read/write ops); back-fills '[]' on older
+    # nvram_ops transport column (per-function nvram read/write ops); back-fills '[]' on older
     # DBs so ghidra_ingest can write it without "no column named nvram_ops". Must match schema.sql.
     ("functions", "nvram_ops", "TEXT DEFAULT '[]'"),
     # D4 bridge transport columns; back-fill '[]' on older DBs so ghidra_ingest can write them
@@ -74,7 +74,7 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # dispatcher), so get_callees / synthesized reverse-callers must not read it as complete. Back-
     # fills 0 on older DBs (pre-cap default = complete). Must match schema.sql.
     ("functions", "callees_truncated", "INTEGER DEFAULT 0"),
-    # gap② A2 transport (thin nvram wrapper flag + callers' resolved literal keys). Back-fill
+    # thin-wrapper transport (thin nvram wrapper flag + callers' resolved literal keys). Back-fill
     # NULL/'[]' on older DBs (no wrapper data until re-scan). Must match schema.sql.
     ("functions", "nvram_wrapper", "TEXT"),
     ("functions", "wrapper_call_args", "TEXT DEFAULT '[]'"),

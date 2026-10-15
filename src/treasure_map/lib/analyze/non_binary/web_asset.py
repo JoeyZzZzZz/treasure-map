@@ -11,8 +11,9 @@ A .cgi that begins with a shell shebang is claimed first by the shell_script
 ingester (registry index 0) -- its command-injection view is the higher-value analysis.
 web_asset covers pure web assets (html/js/templates) and non-shell CGI/PHP only.
 
-ENDPOINT_RULES note: goform and cgi-bin are generic embedded-web-server conventions
-(boa/GoAhead), not vendor brands. Do NOT add vendor-specific handler names.
+ENDPOINT_RULES note: goform and cgi-bin are generic embedded-web-server conventions, not vendor
+brands. Field extraction additionally recognises one SDK form-fill helper (nvram_char_to_ascii,
+below): a matcher name kept because it is how such pages pre-fill an editable field.
 """
 
 from __future__ import annotations
@@ -77,7 +78,7 @@ _RULES: list[tuple[str, re.Pattern[str]]] = [
 _FORM_ACTION_RE = re.compile(r"""\baction\s*=\s*['"]([^'"]+)['"]""", re.IGNORECASE)
 _FORM_METHOD_RE = re.compile(r"""\bmethod\s*=\s*['"]([^'"]+)['"]""", re.IGNORECASE)
 
-# ── SaTC front-end surface: USER-EDITABLE form field names (M1) ────────────────────────────────
+# ── SaTC front-end surface: USER-EDITABLE form field names ────────────────────────────────
 # A field name is collected only when it is EDITABLE. The name/type attributes sit before any value,
 # so matching a tag up to its first '>' is enough even when the value carries a server-side <% %>
 # template (which itself contains '>'). Field names are nvram-key-shaped ([A-Za-z0-9_]).
@@ -202,7 +203,7 @@ def _ingest_web_asset(conn: sqlite3.Connection, file_id: int, f: NonBinaryFile) 
             rows,
         )
 
-    # M1 SaTC front-end surface: user-editable form field names (a separate table; does not affect
+    # SaTC front-end surface: user-editable form field names (a separate table; does not affect
     # the endpoint count this returns). Read-only <input type=hidden> round-trip fields are excluded
     # inside _extract_form_fields, so a displayed-but-not-settable key never enters the surface.
     field_rows = [(file_id, kw, rule) for kw, rule in _extract_form_fields(text)]

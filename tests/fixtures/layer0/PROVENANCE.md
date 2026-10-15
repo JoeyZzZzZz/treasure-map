@@ -34,6 +34,5 @@ expect to update them, and check the shapes above still exist before you do.
 
 ## What this fixture cannot show
 
-The previous fixture was a diff of a real firmware library, so it also evidenced that the parse
-copes with production-scale input: about 1800 matched pairs against 48 here. That evidence is gone
-along with the firmware-derived data, deliberately. Scale behaviour is not covered by these tests.
+It is small — a few dozen matched pairs — so it says nothing about how the parse behaves on
+production-scale input. Scale behaviour is not covered by these tests.

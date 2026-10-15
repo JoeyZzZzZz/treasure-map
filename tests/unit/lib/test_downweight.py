@@ -20,6 +20,8 @@ from treasure_map.lib.hunt.downweight import (
     detect_form_signal,
 )
 
+from ..boundary_words import listed_words_in
+
 _SRC = Path(__file__).resolve().parents[3] / "src" / "treasure_map"
 _DOWNWEIGHT = _SRC / "lib" / "hunt" / "downweight.py"
 
@@ -547,8 +549,8 @@ def test_no_code_reads_a_symbol_name_to_decide_a_library_origin() -> None:
     It read a symbol name and answered "this is third-party library code", which is the same
     reasoning the by-name binary exclusion was retired for: it holds only while symbols are named
     the way upstream names them, and a stripped firmware does not promise that. It was weak as well
-    as unsound — eight libraries' exported API prefixes, 558 of 28,383 instances on the real atlas,
-    while the same libraries' internal functions went through unlabelled.
+    as unsound — a few libraries' exported API prefixes covered a small share of instances, while
+    the same libraries' internal functions went through unlabelled.
 
     Parsed rather than grepped for a specific reason: the retirement NOTE in downweight.py names
     both symbols on purpose, so that someone about to re-add this reads why it went first. A text
@@ -582,11 +584,12 @@ def test_no_code_reads_a_symbol_name_to_decide_a_library_origin() -> None:
 
 def test_downweight_module_is_boundary_clean() -> None:
     banned = re.compile(
-        r"\b(vuln\w*|exploit\w*|payload|\bpoc\b|finding|incomplete_patch|fix_quality)\b",
+        r"\b(vuln\w*|exploit\w*|payload|\bpoc\b|finding)\b",
         re.IGNORECASE,
     )
     text = _DOWNWEIGHT.read_text()
     assert not banned.search(text)
+    assert not listed_words_in(text)
     assert not re.search(r"§|PRD\s", text)
 
 
@@ -608,7 +611,7 @@ def test_a_constant_command_named_after_its_stub_is_recognised() -> None:
     detect_form_signal, or in _sink_arg_is_literal -> the second assertion reads None. Both hops
     were measured separately, which is what says the chain is connected end to end rather than
     merely present at one end."""
-    pseudo = 'void f(void){ FUN_004125b0("/sbin/reboot"); }'
+    pseudo = 'void f(void){ FUN_0041eb38("/sbin/reboot"); }'
     kwargs: dict[str, object] = {
         "sink_name": "system",
         "pseudocode": pseudo,
@@ -617,7 +620,7 @@ def test_a_constant_command_named_after_its_stub_is_recognised() -> None:
     }
     assert detect_form_signal(**kwargs) is None  # type: ignore[arg-type]
     assert (
-        detect_form_signal(**kwargs, stub_names={0x4125B0: "system"})  # type: ignore[arg-type]
+        detect_form_signal(**kwargs, stub_names={0x41EB38: "system"})  # type: ignore[arg-type]
         == CONST_SINK_ARG
     )
 

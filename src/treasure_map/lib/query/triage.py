@@ -398,7 +398,7 @@ def _conversion_char(spec: Any) -> str | None:
 
 def _classify_source(conn: sqlite3.Connection, source: Any, spec: Any = None) -> str:
     """One value source's controllability: 'controllable' | 'const' | 'unknown'. THE single
-    classifier both the triage verdict (M3) and the explain rollup call — so a candidate carries one
+    classifier both the triage verdict and the explain rollup call — so a candidate carries one
     controllability reading, never two that disagree.
 
     - constant: a literal string -> 'const'; an ambiguous_0x -> 'const' under an integer spec, else
@@ -590,7 +590,7 @@ def _judged_writers(prov: dict[str, Any]) -> list[dict[str, Any]]:
     Dominance propagation: only a CHK-dominating writer (``dominates_sink``) lies on EVERY path to
     the sink, so only it forwards a value that actually reaches the sink argument. A non-dominating
     writer is a mutually-exclusive branch — it may carry a controllable source that flows to a
-    DIFFERENT sink (e.g. a wrs_cc_t query into sqlite3_exec, not into this system() call), and must
+    DIFFERENT sink (e.g. a key_x query into sqlite3_exec, not into this system() call), and must
     NOT light up this sink. That is the rule for PROMOTING; calling the argument CONSTANT also
     needs every non-dominating writer still on a path to the sink to be constant
     (_other_reaching_writers).
@@ -916,7 +916,7 @@ def _likely_settable_keys_reaching_sink(
     *,
     callsite_addr: int | None = None,
 ) -> list[str]:
-    """nvram keys reaching the anchored sink argument that are web_settable=='likely' (M2: an
+    """nvram keys reaching the anchored sink argument that are web_settable=='likely' (an
     in_router_defaults member — the middle tier below a proven SaTC 'yes').
 
     Two gates, both DELIBERATELY narrower than the proven 'yes' path (``_source_web_settable_key``,
@@ -925,9 +925,9 @@ def _likely_settable_keys_reaching_sink(
       1. GETTER/WRAPPER-gated. 'likely' is only router_defaults membership — a weaker signal that
          includes read-only internal keys — so it is trusted ONLY for a key genuinely READ from
          nvram (a direct getter or an A2 thin wrapper, via ``_nvram_key_from_source``), never any
-         const literal that merely happens to sit in router_defaults. This gate is exactly what M1's
-         wrapper attribution buys: without it the likely tier could not tell an nvram read from an
-         incidental string.
+         const literal that merely happens to sit in router_defaults. This gate is exactly what
+         the front-end cross's wrapper attribution buys: without it the likely tier could not tell
+         an nvram read from an incidental string.
       2. DOMINANCE-filtered (``_judged_writers``, the SAME filter as the verdict): a likely key in a
          non-dominating branch flows to a different sink and must not light this one.
     Order-preserving, deduped. Empty when nothing qualifies (the caller then falls through the
@@ -1797,14 +1797,14 @@ def _controllability_reading(
 ) -> Dimension:
     """Attacker byte-freedom over the sink argument, from the SINGLE verdict: controllable / free /
     constrained / constant / unknown. A ``controllable`` reading carries a certainty in ``state``:
-    ``proven`` (a hard SaTC cross) or ``likely`` (a weaker router_defaults signal, M2).
+    ``proven`` (a hard SaTC cross) or ``likely`` (a weaker router_defaults signal).
 
     Detection FALLBACK CHAIN (⑤), in precedence order — 'single verdict' means PROVENANCE-FIRST,
     source_kind as a fallback, NOT source_kind abandoned:
       1. controllable/proven — provenance shows a proven WEB-SETTABLE key (SaTC front x back cross)
          reaching the sink argument. The strongest controllability the map asserts.
       2. controllable/likely — a key READ from nvram (getter or A2 thin wrapper) that reaches the
-         sink is a router_defaults member but NOT a proven cross (M2). Gated to a genuine nvram read
+         sink is a router_defaults member but NOT a proven cross. Gated to a genuine nvram read
          and dominance-scoped (via _likely_settable_keys_reaching_sink); ranked below
          proven-controllable and above the optimistic 'free'. Placed before the constant steps: a
          dynamic nvram key reaching the arg cannot co-occur with a proven-constant reading — and if
@@ -2094,7 +2094,7 @@ def _dim_source_writability(
     nvram_key: str | None, web_settable: dict[str, Any] | None
 ) -> Dimension:
     """If the source is an nvram key, can the web UI set it? By the SaTC front↔back cross —
-    web_settable (proven) / web_settable (likely, M2) / uncertain. There is NO 'not_settable':
+    web_settable (proven) / web_settable (likely) / uncertain. There is NO 'not_settable':
     inferring 'not settable' from a missing front-end field or a missing back-end constant key is a
     false-negative (a key written via a dynamic-key op is absent from the constant set yet still
     settable). The ``likely`` state (router_defaults membership) carries the same value word
@@ -2156,7 +2156,8 @@ _REACH_CAVEAT_STANDARD_FLOW = (
     "dispatches here"
 )
 _REACH_CAVEAT_COMPLETENESS = (
-    "service-dispatch / IPC bridges (notify_rc / rc_service: httpd->rc) are NOT modeled, so a "
+    "service-dispatch / IPC bridges (a web server notifying a service daemon) are NOT modeled, "
+    "so a "
     "binary reachable only via that bridge shows entry:script or unknown, never entry:web — "
     "entry:web is an INCOMPLETE slice of the web-reachable set, and entry:script is not evidence "
     "of lower reachability"
@@ -2287,7 +2288,7 @@ def _dim_reachability(
         "no script/web/launch entry found — reported unknown (a coverage gap), NOT unreachable: "
         "cross-binary launch edges are enumerated but INCOMPLETE (a caller behind a thin command "
         "wrapper is invisible to that pass, and a token that could not be read resolves to "
-        "nothing), and a service-dispatch/IPC bridge (notify_rc) is not modeled at all; a ? never "
+        "nothing), and a service-dispatch/IPC bridge is not modeled at all; a ? never "
         "sinks" + edge_note,
         leads,
     )
@@ -2512,7 +2513,7 @@ def _candidate_in_run(
     callsite_addr = callsite_abs_addr(row["evidence_ref"])
     # The resolved nvram key for the source_writability layer: a recognized nvram accessor — a
     # direct getter (NVRAM_GETTERS) OR an A2 thin wrapper (wrapper_names) — first, else the first
-    # web-settable key the verdict found reaching the sink. Wrapper-aware (M1) so a key read through
+    # web-settable key the verdict found reaching the sink. Wrapper-aware so a key read through
     # a shared accessor (the common case) still shows in source_writability and the nvram-source
     # view, coherent with the controllability reading.
     nvram_key = _nvram_source_key(fe, wrapper_names, sink_anchor, callsite_addr=callsite_addr)
@@ -2626,7 +2627,7 @@ def filter_candidates(
 # makes every lens safe: no angle can bury a candidate by "not yet known".
 
 # Controllability bands, high rank first. proven-controllable (a hard SaTC cross) is the top band;
-# likely-controllable (M2: a router_defaults-member nvram key reaching the sink — value
+# likely-controllable (a router_defaults-member nvram key reaching the sink — value
 # 'controllable' with state 'likely') sits just below it via _LIKELY_CONTROLLABLE_RANK, ABOVE the
 # optimistic 'free' (source_kind=free_string): a real-but-unconfirmed nvram key outranks an
 # optimistic guess, and both outrank unknown. constant stays the bottom (the demotion iron law sinks
@@ -2639,7 +2640,7 @@ _CONTROLLABILITY_RANK: dict[str, int] = {
     "unknown": 1,
     "constant": 0,
 }
-# A 'controllable' reading with state=='likely' (M2) ranks here — between proven-controllable (5)
+# A 'controllable' reading with state=='likely' ranks here — between proven-controllable (5)
 # and 'free' (3). The value word stays 'controllable' (so a controllability=controllable filter sees
 # both proven and likely); only state distinguishes the certainty, and only the sort consumes it.
 _LIKELY_CONTROLLABLE_RANK = 4
@@ -2655,7 +2656,7 @@ def _controllability_rank(dim: Dimension) -> int:
 
 
 # Command/exec-injection FEASIBILITY of an external_input source, by its charset (source_kind),
-# strongest first — the honest layering within the orthogonal param signal (spec M2). free_string
+# strongest first — the honest layering within the orthogonal param signal. free_string
 # (no charset constraint, metachars pass) is most feasible; charset_safe (a converter constrained
 # the value inline) is least — proven-safe against injection, so the param float excludes it.
 _CHARSET_FEASIBILITY_RANK: dict[str, int] = {
@@ -2730,7 +2731,7 @@ def _sort_atoms(c: TriageCandidate, overrides: dict[str, int] | None) -> dict[st
         "proven_safe": int(_is_proven_safe(c)),
         "impact": impact_tier(c.sink_class, overrides),
         "controllability": _controllability_rank(c.dim("controllability")),
-        # orthogonal param signal (spec M2): floats an external_input lead above same-certainty
+        # orthogonal param signal: floats an external_input lead above same-certainty
         # peers, then layers by charset feasibility — both AFTER certainty (guardrail 3).
         "param_float": _param_float(c),
         "charset_rank": _charset_rank(c),
@@ -2760,7 +2761,7 @@ def _sort_key(
     # composite secondary (rides under every lens): band by impact, then controllability-certainty
     key.append(-a["impact"])
     key.append(-a["controllability"])
-    # orthogonal param float (spec M2, rides under every lens): AFTER certainty so a
+    # orthogonal param float (rides under every lens): AFTER certainty so a
     # proven/likely-controllable candidate always outranks a source=param one in the same tier
     # (guardrail 3); floats external_input leads above same-certainty peers, then layers by charset.
     key.append(-a["param_float"])
@@ -2994,7 +2995,7 @@ VIEWS: dict[str, dict[str, Any]] = {
         "a boot script naming the binary — to the first screen; the corpus stays WHOLE, nothing is "
         "pruned (renamed from 'reachable-only', which now aliases here). A MECHANISTIC reference, "
         "NOT call-graph reachability: an INCOMPLETE slice that misses candidates reachable only "
-        "via an unmodeled service-dispatch bridge (notify_rc / rc_service), so do not read the "
+        "via an unmodeled service-dispatch bridge, so do not read the "
         "top as 'all reachable candidates'. Split by kind with "
         "reachability=entry:web / entry:script.",
     },
@@ -3120,7 +3121,7 @@ def triage(conn: sqlite3.Connection, *, run_id: str | None = None) -> list[Triag
         params.append(run_id)
     rows = conn.execute(sql, params).fetchall()
     # Compute the A2 thin-nvram-wrapper set ONCE per run (not per candidate) and thread it down —
-    # the candidate-layer source attribution reuses it to recognise wrapper-read keys (M1).
+    # the candidate-layer source attribution reuses it to recognise wrapper-read keys.
     wrapper_names = _nvram_wrapper_names(conn)
     candidates = [_candidate(conn, r, wrapper_names) for r in rows]
     return sort_candidates(candidates, spine="impact")

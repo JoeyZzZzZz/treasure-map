@@ -21,6 +21,8 @@ from treasure_map.lib.atlas import (
 from treasure_map.lib.atlas import connection as atlas_connection
 from treasure_map.lib.errors import ConfigError
 
+from ..boundary_words import listed_words_in
+
 _PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
 _ATLAS_SRC = _PROJECT_ROOT / "src" / "treasure_map" / "lib" / "atlas"
 
@@ -674,11 +676,12 @@ def test_static_no_unscoped_wipe_in_atlas() -> None:
 
 
 def test_static_no_judgment_tokens_in_atlas() -> None:
-    judgment_tokens = ("_SCORE", "_PRIORITY", "INCOMPLETE_PATCH", "FIX_QUALITY")
+    judgment_tokens = ("_SCORE", "_PRIORITY")
     for py_file in _ATLAS_SRC.glob("*.py"):
-        text = py_file.read_text().upper()
+        text = py_file.read_text()
         for token in judgment_tokens:
-            assert token not in text, f"Judgment token {token!r} found in {py_file.name}"
+            assert token not in text.upper(), f"Judgment token {token!r} found in {py_file.name}"
+        assert not listed_words_in(text), f"listed judgment vocab in {py_file.name}"
 
 
 # ---------------------------------------------------------------------------

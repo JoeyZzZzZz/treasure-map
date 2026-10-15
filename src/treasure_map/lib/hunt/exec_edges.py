@@ -32,9 +32,9 @@ EXEC (``execl`` / ``execlp`` / ``execle`` / ``execv`` / ``execvp`` / ``execve``)
 exec points has EVERY one of its writers read at EVERY one of those points — dropping a writer
 would drop a real launch, so the widening is the safe direction. The consequence is that
 ``sink_addr`` means "some exec point in this function", not "the point that runs this token": in a
-function that reuses one buffer, each callsite carries the whole buffer's command set (a real
-firmware has one function with 102 callsites all carrying the same token set; about a quarter of
-all callsites expand to several targets, and most resolved edges come from such callsites).
+function that reuses one buffer, each callsite carries the whole buffer's command set (a single
+function with a hundred callsites all carrying the same token set is not unusual, and a sizable
+share of callsites expand to several targets).
 "Function A can run X" is TRUE; "this callsite runs X" is not guaranteed. Fragments of a command
 assembled piecewise (``strcpy(buf, " > /tmp/out")``) are read as tokens of their own and land
 unmatched with a bare token form; no heuristic tries to tell a whole command from a fragment,

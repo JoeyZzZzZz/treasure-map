@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Recovering a stub's import name from ELF structure, so a dropped sink comes back.
 
-A call to ``system`` that the decompiler left as ``FUN_004125b0`` is a false negative on a sink
+A call to ``system`` that the decompiler left as ``FUN_0041eb38`` is a false negative on a sink
 that objectively exists. These prove the name is recovered from the ELF alone — independent of the
 decompiler — and, just as important, that a binary which cannot be resolved cleanly yields no name
 rather than a fabricated one, because a wrong ``system`` is a manufactured candidate.
@@ -32,74 +32,66 @@ from treasure_map.lib.analyze.stub_resolve import (
     stub_table_marker,
 )
 
-# The stub resolver's headline case is proven against a REAL extracted MIPS firmware, which is not
-# in the repo (a real firmware image cannot be committed). Point TM_STUB_FIXTURE_ROOT at an
-# extracted rootfs containing a new-ABI MIPS PLT binary and a classic global-GOT one; without it
-# these skip and the pure-logic domain-guard tests below still run. The two binaries used are a
-# web cgi (the origin case: FUN_00409748 calls the stub at 0x4125b0, which is system) and a shared
-# library with .MIPS.stubs but no .plt.
-_FW = Path(os.environ.get("TM_STUB_FIXTURE_ROOT", ""))
-_IUX = _FW / "usr/www/cgi/iux_get.cgi" if _FW.name else Path("/nonexistent")
-_LIBWL = _FW / "lib/libwl.so" if _FW.name else Path("/nonexistent")
+# The stub resolver's headline case is proven against a REAL MIPS binary, which is not in the
+# repo (a real firmware image cannot be committed). Point TM_STUB_FIXTURE_PLT at a new-ABI MIPS
+# binary with a .plt (a web cgi is the typical case) and TM_STUB_FIXTURE_CLASSIC at a classic
+# global-GOT shared library with .MIPS.stubs but no .plt; without them these skip and the
+# pure-logic domain-guard tests below still run. Every expectation is derived from the binary
+# itself, so any such pair of files will do.
+_PLT = Path(os.environ.get("TM_STUB_FIXTURE_PLT", "/nonexistent"))
+_CLASSIC = Path(os.environ.get("TM_STUB_FIXTURE_CLASSIC", "/nonexistent"))
 
-_needs_fw = pytest.mark.skipif(
-    not _IUX.exists(), reason="set TM_STUB_FIXTURE_ROOT to an extracted MIPS rootfs to run"
+_needs_plt = pytest.mark.skipif(
+    not _PLT.is_file(), reason="set TM_STUB_FIXTURE_PLT to a new-ABI MIPS PLT binary to run"
+)
+_needs_classic = pytest.mark.skipif(
+    not _CLASSIC.is_file(), reason="set TM_STUB_FIXTURE_CLASSIC to a classic MIPS library to run"
 )
 
 
-# ── the real binary: the name the decompiler dropped ──────────────────────────────────
+# ── a real binary: the names the decompiler dropped ───────────────────────────────────
 
 
-@_needs_fw
-def test_plt_stub_resolves_to_its_import_name() -> None:
-    # ★ The origin case, end to end through the resolver. The stub at 0x4125b0 IS system, recovered
+@_needs_plt
+def test_plt_stubs_resolve_to_their_import_names() -> None:
+    # ★ The origin case, end to end through the resolver: each PLT stub's import name, recovered
     # from .rel.plt with the decompiler nowhere in the loop.
-    resolution = resolve_stubs(_IUX)
+    resolution = resolve_stubs(_PLT)
     assert resolution is not None
-    assert resolution.names[0x4125B0] == "system"
-    assert resolution.names[0x412450] == "popen"
+    assert resolution.names, "a PLT binary that resolves no stub proves nothing"
+    assert all(name.isidentifier() for name in resolution.names.values())
+    assert resolution.regions
 
 
-@_needs_fw
-def test_the_caller_the_decompiler_left_blind_gets_its_sink_back() -> None:
-    # FUN_00409748's real callee list — the stub call at 0x4125b0 hides a system() never named.
-    resolution = resolve_stubs(_IUX)
+@_needs_plt
+def test_the_caller_the_decompiler_left_blind_gets_its_sinks_back() -> None:
+    # A caller whose callee list names every stub by address, the way the decompiler leaves it:
+    # each one is relabelled in place to its import name, and none is left as a lead.
+    resolution = resolve_stubs(_PLT)
     assert resolution is not None
-    origin = [
-        "FUN_0040c890",
-        "FUN_004128d0",
-        "FUN_00412460",
-        "FUN_004125a0",
-        "FUN_00412840",
-        "FUN_00412560",
-        "FUN_00412890",
-        "FUN_00409660",
-        "FUN_00412510",
-        "FUN_004125b0",
-        "FUN_004127a0",
-    ]
+    origin = [f"FUN_{addr:08x}" for addr in sorted(resolution.names)]
     result = relabel_callees(origin, resolution)
-    assert "system" in result.callees  # the sink is back
-    assert "FUN_004125b0" not in result.callees  # relabelled in place
+    assert set(resolution.names.values()) <= set(result.callees)  # the sinks are back
+    assert not set(origin) & set(result.callees)  # relabelled in place
     assert result.unresolved_stub_addrs == []  # every stub call resolved
 
 
-@_needs_fw
+@_needs_plt
 def test_the_answer_does_not_depend_on_the_decompiler() -> None:
     # ★ The whole point of resolving from ELF: the same file resolves to the same names no matter
     # what the decompiler did with its thunks. Reading it twice is deterministic to the byte.
-    a = resolve_stubs(_IUX)
-    b = resolve_stubs(_IUX)
+    a = resolve_stubs(_PLT)
+    b = resolve_stubs(_PLT)
     assert a is not None and b is not None
     assert a.names == b.names
     assert a.regions == b.regions
 
 
-@_needs_fw
+@_needs_classic
 def test_a_classic_binary_without_a_plt_fabricates_no_stub_names() -> None:
-    # libwl.so has .MIPS.stubs but no .plt, so there are no FUN_<plt-addr> callees to relabel, and
-    # the resolver must invent none. (Its inline %call16 calls are a different shape, out of scope.)
-    resolution = resolve_stubs(_LIBWL)
+    # A library with .MIPS.stubs but no .plt has no FUN_<plt-addr> callees to relabel, and the
+    # resolver must invent none. (Its inline %call16 calls are a different shape, out of scope.)
+    resolution = resolve_stubs(_CLASSIC)
     assert resolution is not None
     assert resolution.names == {}
 
@@ -170,9 +162,9 @@ def test_a_non_mips_or_unreadable_file_is_a_cannot_tell(tmp_path: Path) -> None:
 def test_relabel_leaves_an_unmatched_internal_call_alone() -> None:
     # A FUN_<addr> that is NOT in a stub region is an ordinary internal function; it passes through
     # untouched and is NOT recorded as an unclassified external call.
-    resolution = StubResolution(names={0x4125B0: "system"}, regions=((0x412400, 0x412A44),))
-    result = relabel_callees(["FUN_00409660", "FUN_004125b0"], resolution)
-    assert result.callees == ["FUN_00409660", "system"]
+    resolution = StubResolution(names={0x41EB38: "system"}, regions=((0x41E988, 0x41EFCC),))
+    result = relabel_callees(["FUN_00415be8", "FUN_0041eb38"], resolution)
+    assert result.callees == ["FUN_00415be8", "system"]
     assert result.unresolved_stub_addrs == []
 
 
@@ -183,45 +175,45 @@ def test_an_unresolved_stub_call_stays_visible_as_a_lead() -> None:
     # MUTATION (verified RED, 1 failed): in stub_resolve.relabel_callees drop the
     # `elif resolution.in_stub_region(addr)` branch -> the unresolved stub call vanishes from
     # unresolved_stub_addrs.
-    resolution = StubResolution(names={}, regions=((0x412400, 0x412A44),))
-    result = relabel_callees(["FUN_004125b0", "FUN_00409660"], resolution)
-    assert result.callees == ["FUN_004125b0", "FUN_00409660"]  # both kept in the graph
-    assert result.unresolved_stub_addrs == ["0x4125b0"]  # the stub-region one flagged
+    resolution = StubResolution(names={}, regions=((0x41E988, 0x41EFCC),))
+    result = relabel_callees(["FUN_0041eb38", "FUN_00415be8"], resolution)
+    assert result.callees == ["FUN_0041eb38", "FUN_00415be8"]  # both kept in the graph
+    assert result.unresolved_stub_addrs == ["0x41eb38"]  # the stub-region one flagged
 
 
 # ── the ingest wiring: the relabel actually reaches the stored callees ─────────────────
 
 
-@_needs_fw
+@_needs_plt
 def test_ingest_writes_the_resolved_name_into_the_callees(tmp_path: Path) -> None:
     # ★ END-TO-END WIRING, not just the helper. The relabel must run where callees are stored, or
-    # the whole recovery is a library nobody calls. This drives ghidra_ingest with a real
-    # binary + a synthetic Ghidra JSON whose one function calls the stub at 0x4125b0, and asserts
-    # the stored callees carry `system`.
+    # the whole recovery is a library nobody calls. This drives ghidra_ingest with a real binary +
+    # a synthetic Ghidra JSON whose one function calls the binary's first stub, and asserts the
+    # stored callees carry that stub's import name.
     #
-    # MUTATION (verified RED, 1 failed): in ghidra_ingest._ingest_one_binary use `raw_callees`
-    # instead of the relabelled list -> the stored callee stays FUN_004125b0.
+    # MUTATION: in ghidra_ingest._ingest_one_binary use `raw_callees` instead of the relabelled
+    # list -> the stored callee stays FUN_<stub address>.
     import json
 
     from treasure_map.lib.analyze.ghidra_ingest import _ingest_one_binary
     from treasure_map.lib.storage.connection import open_db
 
+    resolution = resolve_stubs(_PLT)
+    assert resolution is not None and resolution.names
+    stub = min(resolution.names)
+    stub_callee = f"FUN_{stub:08x}"
     conn = open_db(tmp_path / "a.db")
     conn.execute(
-        "INSERT INTO binaries (id, name, path, sha256) VALUES (1, 'iux_get.cgi', ?, 'h')",
-        (str(_IUX),),
+        "INSERT INTO binaries (id, name, path, sha256) VALUES (1, 'plt.bin', ?, 'h')",
+        (str(_PLT),),
     )
-    data = {
-        "functions": [
-            {"name": "caller", "address": "00409748", "callees": ["FUN_004125b0", "FUN_00409660"]}
-        ]
-    }
-    _ingest_one_binary(conn, 1, data, _Stats(), resolve_stubs(_IUX))
+    data = {"functions": [{"name": "caller", "address": "00401000", "callees": [stub_callee]}]}
+    _ingest_one_binary(conn, 1, data, _Stats(), resolution)
     conn.commit()
     row = conn.execute("SELECT callees, unresolved_external_calls FROM functions").fetchone()
     conn.close()
-    assert "system" in json.loads(row[0])
-    assert "FUN_004125b0" not in json.loads(row[0])
+    assert resolution.names[stub] in json.loads(row[0])
+    assert stub_callee not in json.loads(row[0])
     assert json.loads(row[1]) == []  # it resolved, so no unclassified-external lead
 
 
@@ -235,13 +227,13 @@ def test_ingest_records_an_unresolved_stub_call_as_a_lead(tmp_path: Path) -> Non
 
     conn = open_db(tmp_path / "a.db")
     conn.execute("INSERT INTO binaries (id, name, sha256) VALUES (1, 'x', 'h')")
-    resolution = StubResolution(names={}, regions=((0x412400, 0x412A44),))
-    data = {"functions": [{"name": "f", "address": "1000", "callees": ["FUN_004125b0"]}]}
+    resolution = StubResolution(names={}, regions=((0x41E988, 0x41EFCC),))
+    data = {"functions": [{"name": "f", "address": "1000", "callees": ["FUN_0041eb38"]}]}
     _ingest_one_binary(conn, 1, data, _Stats(), resolution)
     conn.commit()
     row = conn.execute("SELECT unresolved_external_calls FROM functions").fetchone()
     conn.close()
-    assert json.loads(row[0]) == ["0x4125b0"]
+    assert json.loads(row[0]) == ["0x41eb38"]
 
 
 class _Stats:
@@ -258,8 +250,8 @@ class _Stats:
 
 
 def test_the_stub_table_is_sorted_lowercase_hex_one_entry_per_line() -> None:
-    table = serialize_stub_table({0x4125B0: "system", 0x400010: "memcpy"})
-    assert table == "400010\tmemcpy\n4125b0\tsystem\n"
+    table = serialize_stub_table({0x41EB38: "system", 0x400010: "memcpy"})
+    assert table == "400010\tmemcpy\n41eb38\tsystem\n"
     # the address reads back the way a FUN_ callee's does
     assert all(_stub_addr_of(f"FUN_{line.split(chr(9))[0]}") for line in table.splitlines())
 

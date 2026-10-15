@@ -28,9 +28,9 @@ class AtlasConfig(BaseModel):
 
 
 class GhidraMode(StrEnum):
-    LOCAL = "local"  # M1 implemented
-    DOCKER = "docker"  # M4 planned
-    REMOTE = "remote"  # M4 planned
+    LOCAL = "local"  # the only implemented mode
+    DOCKER = "docker"  # accepted by the schema, not implemented
+    REMOTE = "remote"  # accepted by the schema, not implemented
 
 
 class GhidraLocalConfig(BaseModel):

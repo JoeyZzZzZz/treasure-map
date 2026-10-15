@@ -14,19 +14,19 @@ from treasure_map.lib.analyze.ghidra_runner import GhidraRunner
 from treasure_map.lib.config.config import GhidraConfig
 
 _FIXTURES = Path(__file__).parent.parent / "fixtures" / "elfs"
-_TRUE_ELF = _FIXTURES / "true_x86_64"
+_EXE_ELF = _FIXTURES / "exe_x86_64"
 
 no_ghidra = shutil.which("analyzeHeadless") is None
-no_fixture = not _TRUE_ELF.exists()
+no_fixture = not _EXE_ELF.exists()
 
 
 @pytest.mark.skipif(no_ghidra, reason="analyzeHeadless not in PATH")
-@pytest.mark.skipif(no_fixture, reason="fixture true_x86_64 missing")
+@pytest.mark.skipif(no_fixture, reason="fixture exe_x86_64 missing")
 def test_run_ghidra_real_binary(tmp_path: Path) -> None:
-    """Run Ghidra on the true_x86_64 fixture and verify output JSON structure."""
+    """Run Ghidra on the exe_x86_64 fixture and verify output JSON structure."""
     runner = GhidraRunner(GhidraConfig())
     result = runner.run_ghidra(
-        binary=_TRUE_ELF,
+        binary=_EXE_ELF,
         output_dir=tmp_path / "output",
         timeout=120,
         arch="x86:LE:64:default",

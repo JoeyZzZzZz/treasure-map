@@ -25,7 +25,7 @@ class FuncRow:
     binary_path: str | None
     binary_sha256: str | None
     name: str | None
-    # The function's entry address as the extractor recorded it (e.g. "000b32a0"). Unlike func_id
+    # The function's entry address as the extractor recorded it (e.g. "0040a1c0"). Unlike func_id
     # (a per-ingest AUTOINCREMENT rowid that shifts on every re-scan), this is a property of the
     # BINARY, so it is the stable anchor a re-scan-stable evidence_ref is built from.
     address: str | None

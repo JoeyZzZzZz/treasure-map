@@ -1110,33 +1110,33 @@ def test_orchestrator_isolates_ingester_exceptions(
 # ── M1: editable web form field extraction (SaTC front-end surface) ───────────
 # The critical filter: a <input type=hidden> populated from nvram_get is a read-only round-trip
 # DISPLAY (e.g. a firmware-version echo) and must NOT be collected as editable — else it would
-# cross to web_settable=yes and wrongly promote. Real firmware carries firmver exactly this way.
+# cross to web_settable=yes and wrongly promote. A typical page carries fwrev exactly this way.
 _FIXTURE_FORM_FIELDS = """\
 <form action="/apply.cgi" method="post">
-  <input type="hidden" name="firmver" value="<% nvram_get("firmver"); %>">
+  <input type="hidden" name="fwrev" value="<% nvram_get("fwrev"); %>">
   <input type="text" maxlength="32" name="wl_ssid" value="<% nvram_get("wl_ssid"); %>">
-  <textarea name="fb_comment" rows="8"></textarea>
-  <select name="fb_ptype" onChange="reload();"></select>
+  <textarea name="rpt_comment" rows="8"></textarea>
+  <select name="rpt_ptype" onChange="reload();"></select>
   <input type="checkbox" name="enable_x">
-  <input type="hidden" name="wl_ssid_org" value='<% nvram_char_to_ascii("cfg","wl_key"); %>'>
+  <input type="hidden" name="wl_ssid_prev" value='<% nvram_char_to_ascii("cfg","wl_key"); %>'>
 </form>
 <script>document.form.custom_field.value = "seed";</script>
 """
 
 
 def test_extract_form_fields_excludes_hidden_input() -> None:
-    """A hidden input (firmver, read-only nvram_get round-trip) is NEVER collected as editable."""
+    """A hidden input (fwrev, read-only nvram_get round-trip) is NEVER collected as editable."""
     fields = dict(_extract_form_fields(_FIXTURE_FORM_FIELDS))
-    assert "firmver" not in fields  # the firmver filter — the whole point
-    assert "wl_ssid_org" not in fields  # also hidden
+    assert "fwrev" not in fields  # the fwrev filter — the whole point
+    assert "wl_ssid_prev" not in fields  # also hidden
 
 
 def test_extract_form_fields_collects_editable_inputs() -> None:
     """A non-hidden <input>, a <textarea>, a <select> are all collected with their rule."""
     fields = dict(_extract_form_fields(_FIXTURE_FORM_FIELDS))
     assert fields.get("wl_ssid") == "input"
-    assert fields.get("fb_comment") == "textarea"
-    assert fields.get("fb_ptype") == "select"
+    assert fields.get("rpt_comment") == "textarea"
+    assert fields.get("rpt_ptype") == "select"
     assert fields.get("enable_x") == "input"
 
 
@@ -1154,9 +1154,9 @@ def test_extract_form_fields_deduplicates_within_file() -> None:
 
 
 def test_ingest_web_asset_writes_form_fields(tmp_path: Path) -> None:
-    """End-to-end: editable fields land in web_form_fields; firmver (hidden) does not."""
+    """End-to-end: editable fields land in web_form_fields; fwrev (hidden) does not."""
     conn = open_db(tmp_path / "analysis.db")
-    f = _make_file(tmp_path, "Feedback.asp", _FIXTURE_FORM_FIELDS)
+    f = _make_file(tmp_path, "Report.asp", _FIXTURE_FORM_FIELDS)
     file_id = _insert_nbf(conn, "web_asset", "asp", f)
     _ingest_web_asset(conn, file_id, f)
     conn.commit()
@@ -1166,8 +1166,8 @@ def test_ingest_web_asset_writes_form_fields(tmp_path: Path) -> None:
             "SELECT field_keyword FROM web_form_fields WHERE file_id = ?", (file_id,)
         )
     }
-    assert "fb_comment" in rows and "wl_ssid" in rows and "fb_ptype" in rows
-    assert "firmver" not in rows  # hidden input excluded end to end
+    assert "rpt_comment" in rows and "wl_ssid" in rows and "rpt_ptype" in rows
+    assert "fwrev" not in rows  # hidden input excluded end to end
     conn.close()
 
 

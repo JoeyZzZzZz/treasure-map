@@ -225,7 +225,7 @@ def test_the_two_tiers_are_reported_separately_with_what_they_cost(tmp_path: Pat
                 "scan_status": "complete",
                 "firmware_path": str(fw),
                 "build_hash": OTHER_BUILD,
-                "binaries": 484,
+                "binaries": 37,
             },
             {
                 "run_id": "old_hunt",
@@ -239,7 +239,7 @@ def test_the_two_tiers_are_reported_separately_with_what_they_cost(tmp_path: Pat
     assert out.exit_code == 0, out.output
     assert "needs re-extraction (1)" in out.output
     assert "decompiler runs over every binary again" in out.output
-    assert "old_extract:" in out.output and "[484 binaries]" in out.output
+    assert "old_extract:" in out.output and "[37 binaries]" in out.output
     assert "needs re-hunt (1)" in out.output
     # The hunt tier states BOTH halves: no decompiler on a cache hit, and the rebuild that happens
     # anyway. "no decompile" alone was the half that made a rebuilt inventory read as nothing.

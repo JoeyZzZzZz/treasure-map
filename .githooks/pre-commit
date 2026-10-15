@@ -46,7 +46,7 @@ fi
 # CI uses. Covers tests/ too — a private-doc/path reference is caught here at
 # commit time instead of one CI round-trip later.
 ADDED_FRAMING=$(git diff --cached -U0 --diff-filter=ACM -- . \
-        "${TM_DIFF_MACHINERY_EXCLUDES[@]}" "${TM_DIFF_SELF_REFERENTIAL_EXCLUDES[@]}" \
+        "${TM_DIFF_MACHINERY_EXCLUDES[@]}" ${TM_DIFF_SELF_REFERENTIAL_EXCLUDES[@]+"${TM_DIFF_SELF_REFERENTIAL_EXCLUDES[@]}"} \
         | grep '^+' | grep -v '^+++' || true)
 HITS=$(printf '%s' "$ADDED_FRAMING" | grep -nIE "$TM_PRIVDOC" || true)
 if [ -n "$HITS" ]; then

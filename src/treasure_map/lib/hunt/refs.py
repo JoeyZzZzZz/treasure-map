@@ -14,12 +14,11 @@ The ref is built from facts that belong to the BINARY, never from ingest bookkee
   binaries under one name (libstdc++.so.6, mtdinfo, …), whose functions would otherwise share a ref.
   The full PATH is unique too but carries the vendor/model string, and a ref must stay neutral.
 * the function anchor = its entry ADDRESS. A property of the binary; a stripped function's name is
-  itself address-derived (FUN_000b32a0 <-> 000b32a0).
+  itself address-derived (FUN_0040a1c0 <-> 0040a1c0).
 
 ★ NEVER derive a ref from a rowid / AUTOINCREMENT id / enumeration index. ``functions.id`` fails
 BOTH ways: the analysis DB is delete-and-reingest per binary, and AUTOINCREMENT never reuses a
-number, so every re-scan shifts every id by the function count (measured on real firmware: a
-4-times-scanned DB held 88,178 functions numbered 266,156..354,333) — the ref drifts with ZERO code
+number, so every re-scan shifts every id by the function count — the ref drifts with ZERO code
 change. Enumeration order is the second, smaller trap: it also moves ids when the extractor changes.
 
 Scope: re-scan stable, which is what a durable judgement store needs. NOT cross-recompile stable —
@@ -29,7 +28,7 @@ anchors carry {name, addr, kind} for exactly that. A ref deliberately does not p
 
 from __future__ import annotations
 
-_BIN_ANCHOR_LEN = 8  # sha256 prefix; 479 real binaries -> 479 distinct prefixes (no collision)
+_BIN_ANCHOR_LEN = 8  # sha256 prefix; distinct across every binary of a real firmware tested
 
 # Per-axis labels for a wrapper-propagated candidate: (call_sequence_shape prefix, evidence_ref
 # suffix), keyed by the candidate's sink_class. "cmd" keeps its historical strings byte-for-byte.
@@ -83,10 +82,10 @@ def callsite_offset_suffix(
 
 
 def _norm_addr(address: str | None) -> str | None:
-    """Canonicalize an entry address to lowercase, 0x-free, zero-padded hex ("000b32a0").
+    """Canonicalize an entry address to lowercase, 0x-free, zero-padded hex ("0040a1c0").
 
     Canonicalizing (rather than trusting the raw string) keeps the ref stable even if the extractor
-    ever changes its address formatting — "0xb32a0" and "000b32a0" must not be two anchors for one
+    ever changes its address formatting — "0x40a1c0" and "0040a1c0" must not be two anchors for one
     function. A non-hex form is kept verbatim: still deterministic, never silently dropped.
     """
     if not address:
@@ -101,7 +100,7 @@ def _norm_addr(address: str | None) -> str | None:
 
 
 def _addr_to_int(address: str | int | None) -> int | None:
-    """Parse an address (``"0xb32a0"`` / ``"000b32a0"`` / int) to int, or None when unparseable.
+    """Parse an address (``"0x40a1c0"`` / ``"0040a1c0"`` / int) to int, or None when unparseable.
 
     Shared by _norm_offset; kept separate from _norm_addr, which renders a STRING and deliberately
     passes a non-hex form through verbatim, a policy the arithmetic here must not inherit."""
@@ -156,7 +155,7 @@ def build_evidence_ref(
     worst-anchor
     last: binary = sha256 prefix -> name -> "nobin"; function = address -> name -> "id<func_id>".
     The ``id<func_id>`` tail is the only unstable form and is unreachable on real firmware (every
-    one of 88,178 functions carried an address); it exists so a degenerate row still gets a unique
+    function there carries an address); it exists so a degenerate row still gets a unique
     ref rather than silently colliding with another.
     """
     bin_anchor = (binary_sha256 or "").strip()[:_BIN_ANCHOR_LEN] or (binary_name or "").strip()

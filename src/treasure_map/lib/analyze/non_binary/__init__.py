@@ -6,11 +6,11 @@ Adding an ingester: implement its module, then append its NonBinaryIngester here
 Order matters: first detect()-match wins.
 
 Current registry:
-  [0] shell_script  — ShellScript ingester (Round C)
-  [1] config_file   — ConfigFile ingester (Round D)
-  [2] credential    — Credential ingester (Round E)
-  [3] web_asset     — WebAsset ingester (Round F, M2)
-  [ ] kernel_module — placeholder (Round G, M3)
+  [0] shell_script  — ShellScript ingester
+  [1] config_file   — ConfigFile ingester
+  [2] credential    — Credential ingester
+  [3] web_asset     — WebAsset ingester
+  [ ] kernel_module — placeholder (not implemented)
 """
 
 from __future__ import annotations
@@ -28,11 +28,11 @@ from treasure_map.lib.analyze.non_binary.shell_script import SHELL_SCRIPT_INGEST
 from treasure_map.lib.analyze.non_binary.web_asset import WEB_ASSET_INGESTER
 
 INGESTER_REGISTRY: list[NonBinaryIngester] = [
-    SHELL_SCRIPT_INGESTER,  # [0] Round C
-    CONFIG_FILE_INGESTER,  # [1] Round D
-    CREDENTIAL_INGESTER,  # [2] Round E
-    WEB_ASSET_INGESTER,  # [3] Round F
-    # Round G: kernel_module ingester (append here, M3)
+    SHELL_SCRIPT_INGESTER,  # [0]
+    CONFIG_FILE_INGESTER,  # [1]
+    CREDENTIAL_INGESTER,  # [2]
+    WEB_ASSET_INGESTER,  # [3]
+    # a kernel_module ingester would be appended here
 ]
 
 __all__ = [

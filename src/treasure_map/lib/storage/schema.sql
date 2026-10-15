@@ -1,5 +1,4 @@
 -- Treasure Map analysis database schema
--- Adapted from treasure-map-history database/schema.sql
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
@@ -8,18 +7,18 @@ PRAGMA foreign_keys = ON;
 -- every open, emptied the current table — the shell-script evidence — whenever the database was
 -- reopened without a full re-analysis.)
 
--- 二进制文件
+-- binaries
 CREATE TABLE IF NOT EXISTS binaries (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     name         TEXT    NOT NULL,
     path         TEXT,
-    arch         TEXT,                     -- Ghidra 处理器串: ARM:LE:32:v7
+    arch         TEXT,                     -- Ghidra language id, e.g. ARM:LE:32:v7
     bits         INTEGER,                  -- 32 or 64
     sha256       TEXT    UNIQUE,           -- content-identity; same content → one row
     file_type    TEXT,                     -- executable / shared_library / relocatable
-    dt_needed    TEXT    DEFAULT '[]',     -- JSON: DT_NEEDED 动态库依赖
-    size_bytes   INTEGER DEFAULT 0,        -- ELF 文件大小 (bytes)
-    ghidra_ok    INTEGER NOT NULL DEFAULT 0, -- Round 2 partial-invalidation flag (1 = usable output)
+    dt_needed    TEXT    DEFAULT '[]',     -- JSON: DT_NEEDED shared-library dependencies
+    size_bytes   INTEGER DEFAULT 0,        -- ELF file size (bytes)
+    ghidra_ok    INTEGER NOT NULL DEFAULT 0, -- partial-invalidation flag (1 = usable output)
     ghidra_status TEXT,                    -- tri-state analysis outcome: ok / ok_empty / failed / NULL
     ghidra_status_reason TEXT,             -- WHY a failed run failed: timeout / import_failed /
                                            --   no_output / incomplete / stale_output; NULL on
@@ -68,16 +67,16 @@ CREATE VIEW IF NOT EXISTS current_binaries AS
   SELECT * FROM binaries
   WHERE last_seen_at IS (SELECT MAX(last_seen_at) FROM binaries);
 
--- 函数
+-- functions
 CREATE TABLE IF NOT EXISTS functions (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     binary_id       INTEGER NOT NULL,
     name            TEXT,
     address         TEXT,
     size_bytes      INTEGER DEFAULT 0,
-    pseudocode      TEXT,               -- Ghidra 反编译 C 伪代码
-    pseudocode_hash TEXT,               -- MD5，用于去重
-    callees         TEXT    DEFAULT '[]',   -- JSON: 直接被调函数名
+    pseudocode      TEXT,               -- Ghidra-decompiled C pseudocode
+    pseudocode_hash TEXT,               -- MD5, for de-duplication
+    callees         TEXT    DEFAULT '[]',   -- JSON: direct callee names
     callees_truncated INTEGER DEFAULT 0,    -- 1 = callee list hit the extractor cap (a wide dispatcher):
                                             --   the list is a prefix, so get_callees / reverse-caller
                                             --   synthesis must not read it as the complete call graph
@@ -101,13 +100,13 @@ CREATE TABLE IF NOT EXISTS functions (
     -- (AddressRangeIterator), not the size_bytes count. A non-contiguous body has several; a sink
     -- address outside all of them is out-of-body -> not_traced. '[]' if none.
     body_ranges     TEXT    DEFAULT '[]',
-    -- gap② phase 1: per-function nvram read/write ops (which key this function reads/writes + the
+    -- per-function nvram read/write ops (which key this function reads/writes + the
     -- written value's source). Feeds the phase-2 cross-binary key graph. Empty '[]' when none.
     nvram_ops       TEXT    DEFAULT '[]',
-    -- gap② A2: JSON {op,api} when this function is a THIN nvram wrapper (forwards a caller-supplied
+    -- JSON {op,api} when this function is a THIN nvram wrapper (forwards a caller-supplied
     -- key into one nvram accessor); NULL otherwise. Feeds hunt-time wrapper-indirect edge recovery.
     nvram_wrapper   TEXT,
-    -- gap② A2: JSON [{callee,key,key_kind}] — calls to a local function passing a CONSTANT literal
+    -- JSON [{callee,key,key_kind}] — calls to a local function passing a CONSTANT literal
     -- as arg0. Resolved against nvram_wrapper cross-function at hunt time into wrapper-indirect edges.
     wrapper_call_args TEXT DEFAULT '[]',
     -- string-keyed edges: JSON {edges:[{key,mechanism,callees:[{name,addr,kind}],...}],completeness}
@@ -146,7 +145,7 @@ CREATE TABLE IF NOT EXISTS function_listing (
     FOREIGN KEY(function_id) REFERENCES functions(id) ON DELETE CASCADE
 );
 
--- 导入符号
+-- imported symbols
 CREATE TABLE IF NOT EXISTS imports (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     binary_id   INTEGER NOT NULL,
@@ -155,7 +154,7 @@ CREATE TABLE IF NOT EXISTS imports (
     FOREIGN KEY(binary_id) REFERENCES binaries(id) ON DELETE CASCADE
 );
 
--- 导出符号
+-- exported symbols
 CREATE TABLE IF NOT EXISTS exports (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     binary_id   INTEGER NOT NULL,
@@ -164,13 +163,13 @@ CREATE TABLE IF NOT EXISTS exports (
     FOREIGN KEY(binary_id) REFERENCES binaries(id) ON DELETE CASCADE
 );
 
--- 跨库交叉引用
+-- cross-binary references
 CREATE TABLE IF NOT EXISTS xrefs (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     caller_binary_id    INTEGER,
-    caller_func_id      INTEGER,        -- NULL = 库级别引用
+    caller_func_id      INTEGER,        -- NULL = a library-level reference
     callee_binary_id    INTEGER,
-    callee_func_id      INTEGER,        -- NULL = 库级别引用
+    callee_func_id      INTEGER,        -- NULL = a library-level reference
     xref_type           TEXT,           -- import_export / dt_needed / string_ipc
     confidence          REAL    DEFAULT 1.0
 );
@@ -210,7 +209,7 @@ CREATE TABLE IF NOT EXISTS xref_unresolved_sonames (
     reason               TEXT NOT NULL DEFAULT 'ambiguous_soname'
 );
 
--- 字符串
+-- strings
 CREATE TABLE IF NOT EXISTS strings (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     binary_id   INTEGER NOT NULL,
@@ -244,7 +243,7 @@ CREATE INDEX IF NOT EXISTS idx_string_refs_binary ON string_refs(binary_id);
 CREATE INDEX IF NOT EXISTS idx_string_refs_value  ON string_refs(binary_id, string_value);
 
 -- naming-bridge phase 1: the router_defaults data-segment table — one row per web-settable nvram
--- default key (parsed from libshared's 20-byte struct array). A resolved member has key=name; a
+-- default key (parsed from the config library's 20-byte struct array). A resolved member has key=name; a
 -- member whose name ptr was unreadable is recorded with key=NULL (not silently skipped), so a
 -- located-but-incomplete table is honest. NO rows for a binary means the symbol was not located
 -- there (unknown — NEVER "no web-settable keys").
@@ -349,7 +348,7 @@ CREATE TABLE IF NOT EXISTS fs_symlinks (
 CREATE INDEX IF NOT EXISTS idx_fs_symlinks_path ON fs_symlinks(link_path);
 CREATE INDEX IF NOT EXISTS idx_fs_symlinks_name ON fs_symlinks(link_name);
 
--- 非二进制文件主表 (Round C framework; WIPE-AND-REBUILD each analyze run)
+-- non-binary files (the ingester framework; WIPE-AND-REBUILD each analyze run)
 -- sha256 = cross-firmware identity key for the knowledge base. Indexed,
 -- intentionally NOT unique (a file + its copy at another path are two findings).
 CREATE TABLE IF NOT EXISTS non_binary_files (
@@ -363,7 +362,7 @@ CREATE TABLE IF NOT EXISTS non_binary_files (
     detected_via TEXT                 -- shebang / extension / heuristic
 );
 
--- 脚本命令调用 (ShellScript ingester sub-table; FK -> non_binary_files)
+-- script command calls (ShellScript ingester sub-table; FK -> non_binary_files)
 CREATE TABLE IF NOT EXISTS script_calls (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     file_id         INTEGER NOT NULL,
@@ -374,7 +373,7 @@ CREATE TABLE IF NOT EXISTS script_calls (
     FOREIGN KEY(file_id) REFERENCES non_binary_files(id) ON DELETE CASCADE
 );
 
--- 配置文件条目 (ConfigFile ingester sub-table, Round D; FK -> non_binary_files)
+-- config file entries (ConfigFile ingester sub-table; FK -> non_binary_files)
 -- Flagged-only: one row per security-relevant entry. value is evidence of
 -- firmware content, never a generated payload. Export/case-study paths MUST redact
 -- sensitive values + vendor strings.
@@ -388,7 +387,7 @@ CREATE TABLE IF NOT EXISTS config_entries (
     FOREIGN KEY(file_id) REFERENCES non_binary_files(id) ON DELETE CASCADE
 );
 
--- 索引
+-- indexes
 CREATE INDEX IF NOT EXISTS idx_functions_name     ON functions(name);
 CREATE INDEX IF NOT EXISTS idx_functions_binary   ON functions(binary_id);
 CREATE INDEX IF NOT EXISTS idx_exports_func       ON exports(func_name);
@@ -404,7 +403,7 @@ CREATE INDEX IF NOT EXISTS idx_script_calls_file ON script_calls(file_id);
 CREATE INDEX IF NOT EXISTS idx_script_calls_cmd  ON script_calls(command);
 CREATE INDEX IF NOT EXISTS idx_config_entries_file ON config_entries(file_id);
 
--- 凭据条目 (Credential ingester sub-table, Round E; FK -> non_binary_files)
+-- credential entries (Credential ingester sub-table; FK -> non_binary_files)
 -- Stores the observed artifact as verifiable evidence (deterministically
 -- re-derivable from the firmware). is_sensitive=1 flags material that the
 -- export/case-study/commit path MUST redact before publishing. Treasure Map
@@ -423,7 +422,7 @@ CREATE TABLE IF NOT EXISTS credentials (
 CREATE INDEX IF NOT EXISTS idx_credentials_file ON credentials(file_id);
 CREATE INDEX IF NOT EXISTS idx_credentials_type ON credentials(cred_type);
 
--- Web 端点 (WebAsset ingester sub-table, Round F; FK -> non_binary_files)
+-- web endpoints (WebAsset ingester sub-table; FK -> non_binary_files)
 -- Attack-surface evidence: endpoints the firmware's web assets reference. path is the
 -- asset's OWN content (evidence), not generated. vuln_hint is categorical.
 CREATE TABLE IF NOT EXISTS web_endpoints (
@@ -438,7 +437,7 @@ CREATE TABLE IF NOT EXISTS web_endpoints (
 
 CREATE INDEX IF NOT EXISTS idx_web_endpoints_file ON web_endpoints(file_id);
 
--- Web 表单可编辑字段 (WebAsset ingester sub-table; FK -> non_binary_files)
+-- editable web form fields (WebAsset ingester sub-table; FK -> non_binary_files)
 -- SaTC front-end surface: the names of USER-EDITABLE form fields the firmware's own web assets
 -- expose (<input> non-hidden / <textarea> / <select> / a JS form-value assignment / an
 -- nvram_char_to_ascii form-fill). field_keyword is the asset's OWN content (evidence), never

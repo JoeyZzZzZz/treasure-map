@@ -15,17 +15,16 @@ TM_SECTREF='§[0-9]|PRD §|\b(DD|ED|FD)[0-9]\b'
 # backstop (git diff BASE HEAD), so the two can never drift. Each site runs its
 # own `git diff … -- . "${set[@]}"` and picks the set per the scan it is running.
 
-# MACHINERY: files whose whole job is to hold scan patterns / real brand names
-# verbatim — the hook scripts, the watchlists, and the hook's own test (which
-# embeds real vendor tokens to prove detection). Exempt from EVERY scan; scanning
-# them would only match their own pattern definitions.
+# MACHINERY: files whose whole job is to hold scan patterns verbatim — the hook
+# scripts and the watchlists. Exempt from EVERY scan; scanning them would only
+# match their own pattern definitions. (The hook's own test is NOT here: it builds
+# every token it probes with from two non-matching halves, so it scans clean.)
 TM_DIFF_MACHINERY_EXCLUDES=(
     ":(exclude).githooks/vendor-watchlist.txt"
     ":(exclude).githooks/vendor-watchlist.example.txt"
     ":(exclude).githooks/pre-commit"
     ":(exclude).githooks/commit-msg"
     ":(exclude).githooks/lib.sh"
-    ":(exclude)tests/unit/test_precommit_hook.py"
 )
 
 # SELF-REFERENTIAL TESTS: tests that read project source and assert it does not
@@ -38,16 +37,10 @@ TM_DIFF_MACHINERY_EXCLUDES=(
 # scans project source for the ABSENCE of private-note references. This is NOT a
 # general escape hatch: anything else that trips a scan must be fixed in the
 # source, never parked here.
-TM_DIFF_SELF_REFERENTIAL_EXCLUDES=(
-    ":(exclude)tests/unit/test_mcp_app.py"
-    ":(exclude)tests/unit/lib/test_analyzer2.py"
-    ":(exclude)tests/unit/lib/test_diff.py"
-    ":(exclude)tests/unit/lib/test_diff_analyzer.py"
-    ":(exclude)tests/unit/lib/test_downweight.py"
-    ":(exclude)tests/unit/lib/test_pattern.py"
-    ":(exclude)tests/unit/lib/test_reachability.py"
-    ":(exclude)tests/unit/lib/test_triage_explain.py"
-)
+# Empty today: those tests now check by digest (tests/unit/boundary_words.py), so none of them
+# spells a private-note token any more. Expand it as ${TM_DIFF_SELF_REFERENTIAL_EXCLUDES[@]+"…"}
+# so an empty list is safe under `set -u` on old bash.
+TM_DIFF_SELF_REFERENTIAL_EXCLUDES=()
 
 # Echo the watchlist path to use (env override -> local full list -> committed
 # brand-free example). When falling back to the example, print a notice to stderr.

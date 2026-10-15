@@ -9,11 +9,10 @@ not an ELF export — so the answer is read from the ELF itself, the same way th
 relocations rather than asking the decompiler.
 
 ★ The DYNAMIC SEGMENT, not the ``.dynsym`` SECTION. Section headers are optional at run time and
-real firmware ships without them: of the shared objects sampled from one ARM firmware, 5 of 5
-carried no section table at all, so ``get_section_by_name('.dynsym')`` answered None while the
-dynamic segment still carried every symbol. The segment is what the loader itself follows, so it
-survives stripping. Where both are readable the two agree exactly (measured on sampled MIPS
-objects), which is why reading the weaker one costs nothing.
+real firmware commonly ships shared objects without them, so ``get_section_by_name('.dynsym')``
+answers None while the dynamic segment still carries every symbol. The segment is what the loader
+itself follows, so it survives stripping. Where both are readable the two agree exactly, which is
+why reading the weaker one costs nothing.
 
 ★ Matched by NAME, never by entry address. An ARM Thumb function carries the Thumb bit in bit 0 of
 its ``st_value``, so its symbol address is one past the even address a decompiler reports, and an

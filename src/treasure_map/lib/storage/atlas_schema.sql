@@ -129,7 +129,7 @@ CREATE VIEW IF NOT EXISTS density_candidate AS
 --   device_spread   = COUNT(DISTINCT source_run_id) over the pattern's instances.
 --   pattern_breadth = COUNT(DISTINCT pseudocode_hash) over the pattern's instances with
 --                     origin IN ('custom','unknown') and pseudocode_hash IS NOT NULL — the count
---                     of distinct fine fingerprints (M2 fine fingerprint = pseudocode_hash).
+--                     of distinct fine fingerprints (fine fingerprint = pseudocode_hash).
 --                     ★ The origin clause currently excludes NOTHING from a freshly hunted run:
 --                     every instance is written 'unknown' since the symbol-name guess was
 --                     retired, so the count is over all of them. It is kept, not simplified
@@ -407,7 +407,7 @@ CREATE TABLE IF NOT EXISTS public_cve_pattern (
     created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
--- private_exploit (PRIVATE): a candidate its owner PROVED exploitable. Admission bar =
+-- private_exploit (PRIVATE): a candidate a person PROVED exploitable. Admission bar =
 -- EXPLOITED: exploit_note is NOT NULL (schema) AND the write tool rejects blank/whitespace — a
 -- structural lead that was never exploited does NOT belong here (it stays in the pending-to-exploit
 -- queue). distinct_exploits counts THIS table only, by COUNT(DISTINCT evidence_ref) (one per
@@ -421,11 +421,11 @@ CREATE TABLE IF NOT EXISTS private_exploit (
     evidence_ref  TEXT NOT NULL,      -- the candidate this record anchors to (stable handle, not id)
     pattern       TEXT NOT NULL,      -- exploit form (free text)
     exploit_note  TEXT NOT NULL,      -- proof: how it triggers, effect obtained, guard bypassed (bar)
-    patch_form    TEXT,               -- empty; the diff line backfills the correct patch form later.
+    patch_form    TEXT,               -- free text; empty unless the person recording it fills it.
                                       --   patch_form is a property of the CANDIDATE (evidence_ref), not
                                       --   of a corroboration row: read it as the latest non-empty
                                       --   value per evidence_ref (same candidate-vs-row rule as the count).
-    cve_id        TEXT,               -- empty; backfilled on disclosure (credibility compounding)
+    cve_id        TEXT,               -- free text; empty unless the person recording it fills it.
     redact        TEXT DEFAULT 'vendor_sensitive',  -- export-sensitivity marker (marker only here)
     attributed_to TEXT,               -- auto-attribution; nullable; NULL = "attribution unrecorded",
                                       --   NEVER a fabricated identity (no process user / model name)

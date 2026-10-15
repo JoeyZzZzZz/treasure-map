@@ -68,11 +68,11 @@ def test_a_call_named_after_its_stub_is_found_with_the_resolved_table() -> None:
 
     MUTATION (measured: 1 failed, this test alone): drop the stub_names forward in call_arguments
     -> the second assertion returns None and the record silently stops being produced."""
-    pc = 'void f(void){ FUN_004125b0(2, "done: %s", x); }'
+    pc = 'void f(void){ FUN_0041eb38(2, "done: %s", x); }'
     assert call_arguments(pc, "log_at") is None
-    assert call_arguments(pc, "log_at", {0x4125B0: "log_at"}) == ["2", '"done: %s"', "x"]
+    assert call_arguments(pc, "log_at", {0x41EB38: "log_at"}) == ["2", '"done: %s"', "x"]
     # a table that resolves the address to something else is not this callee
-    assert call_arguments(pc, "log_at", {0x4125B0: "syslog"}) is None
+    assert call_arguments(pc, "log_at", {0x41EB38: "syslog"}) is None
 
 
 def test_no_index_declines_rather_than_guessing() -> None:

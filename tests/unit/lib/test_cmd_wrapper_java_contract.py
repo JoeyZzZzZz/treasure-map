@@ -11,8 +11,8 @@ whole recovery silently inert). Both are one-line edits away, and neither change
 
 Behaviour was verified against real firmware through Ghidra 12.1.2 while building this:
   * one binary yielded 28 recovered records (17 stack-buffer, 11 direct literal), washing
-    `system("/usr/sbin/mesh_connect.sh meshed")` to constant and recording
-    `snprintf(buf, "uci set account.common.admin='%s'", …)` as a dominating writer;
+    `system("/usr/sbin/mesh_join.sh paired_up")` to constant and recording
+    `snprintf(buf, "uci set acct.main.admin='%s'", …)` as a dominating writer;
   * the same function NAME in two binaries — one forking, one calling system — registered 0 and 1
     wrappers respectively, i.e. the body decided, not the name;
   * the extra decompilation touched 7 functions in a 66 KB binary (only shell-sink callers are

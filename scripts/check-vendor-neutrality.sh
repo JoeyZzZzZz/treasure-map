@@ -40,7 +40,7 @@ if [ -n "$BASE_REF" ]; then
             "${TM_DIFF_MACHINERY_EXCLUDES[@]}" \
             | grep '^+' | grep -v '^+++' || true)
     ADDED_FRAMING=$(git diff "$BASE_REF" "$HEAD_REF" -U0 --diff-filter=ACM -- . \
-            "${TM_DIFF_MACHINERY_EXCLUDES[@]}" "${TM_DIFF_SELF_REFERENTIAL_EXCLUDES[@]}" \
+            "${TM_DIFF_MACHINERY_EXCLUDES[@]}" ${TM_DIFF_SELF_REFERENTIAL_EXCLUDES[@]+"${TM_DIFF_SELF_REFERENTIAL_EXCLUDES[@]}"} \
             | grep '^+' | grep -v '^+++' || true)
 
     if HITS=$(printf '%s' "$ADDED_ALL" | tm_scan_text "$WATCHLIST"); then :; else

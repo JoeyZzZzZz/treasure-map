@@ -966,11 +966,11 @@ def test_a_resolved_stub_table_is_written_for_the_binary_and_handed_in(tmp_path:
 
     MUTATION (verified RED): drop the `env["TMAP_STUB_NAMES"] = ...` line -> the extractor echoes
     "none", the expected marker is the table's hash, the run is refused."""
-    result, env, out = _run_with(tmp_path, _resolution({0x4125B0: "system", 0x400010: "memcpy"}))
+    result, env, out = _run_with(tmp_path, _resolution({0x41EB38: "system", 0x400010: "memcpy"}))
     table = out / "httpd_deadbeef.stubs.tsv"
     assert result.success is True
     assert env["TMAP_STUB_NAMES"] == str(table)
-    assert table.read_text() == "400010\tmemcpy\n4125b0\tsystem\n"
+    assert table.read_text() == "400010\tmemcpy\n41eb38\tsystem\n"
 
 
 def test_no_resolution_hands_no_table_even_if_the_environment_carries_one(
@@ -990,17 +990,17 @@ def test_an_output_that_read_the_wrong_stub_table_is_refused(tmp_path: Path) -> 
     hash; its output is not this binary's extraction, however right its pass and sha8 markers are.
 
     MUTATION (verified RED): drop the stub check from _markers_mismatch -> both runs succeed."""
-    other = stub_table_marker({0x4125B0: "popen"})
-    result, _, _ = _run_with(tmp_path / "a", _resolution({0x4125B0: "system"}), lambda env: other)
+    other = stub_table_marker({0x41EB38: "popen"})
+    result, _, _ = _run_with(tmp_path / "a", _resolution({0x41EB38: "system"}), lambda env: other)
     assert result.success is False
     assert result.reason == "stale_output"
-    result, _, _ = _run_with(tmp_path / "b", _resolution({0x4125B0: "system"}), lambda env: "none")
+    result, _, _ = _run_with(tmp_path / "b", _resolution({0x41EB38: "system"}), lambda env: "none")
     assert result.success is False
     assert result.reason == "stale_output"
 
 
 def test_a_table_where_none_was_meant_is_refused(tmp_path: Path) -> None:
-    result, _, _ = _run_with(tmp_path, None, lambda env: stub_table_marker({0x4125B0: "system"}))
+    result, _, _ = _run_with(tmp_path, None, lambda env: stub_table_marker({0x41EB38: "system"}))
     assert result.success is False
     assert result.reason == "stale_output"
 
@@ -1009,7 +1009,7 @@ def test_an_earlier_runs_stub_table_is_cleared_before_the_run(tmp_path: Path) ->
     out = tmp_path / "out"
     out.mkdir()
     stale = out / "httpd_deadbeef.stubs.tsv"
-    stale.write_text("4125b0\tsystem\n")
+    stale.write_text("41eb38\tsystem\n")
     result, env, _ = _run_with(tmp_path, None)
     assert result.success is True
     assert not stale.exists()

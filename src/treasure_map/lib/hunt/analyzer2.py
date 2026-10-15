@@ -10,8 +10,8 @@ table was designed for exactly this.
 
 Fully hermetic: neither R-pattern nor R2 uses an LLM, so A2 needs no router.
 
-Discipline (same as A1, enforced here and by the schema):
-- L0/L1 only (confirmed/blocked -> L1, unknown -> L0); never L2/L3, never an external_anchor.
+Discipline (enforced here and by the schema):
+- L0/L1 only (confirmed -> L1, unknown -> L0); never L2/L3, never an external_anchor.
 - Evidence neutralization: R-pattern's raw, firmware-derived evidence (a matched format
   literal may carry a device path) is NEVER persisted. Traceability rides pseudocode_hash;
   evidence_ref holds only a neutral per-instance locator (run + binary/function anchor).
@@ -266,10 +266,10 @@ class Analyzer2Stats:
     # gap about those functions, not a decision about them — reported so an incomplete candidate
     # set is never read as a complete one.
     callee_parse_failed: int = 0
-    nvram_flows_written: int = 0  # gap② per-op nvram read/write rows flattened into the atlas
-    nvram_wrapper_edges: int = 0  # gap② A2 indirect key edges recovered through thin nvram wrappers
+    nvram_flows_written: int = 0  # per-op nvram read/write rows flattened into the atlas
+    nvram_wrapper_edges: int = 0  # indirect key edges recovered through thin nvram wrappers
     nvram_defaults_written: int = 0  # naming-bridge phase 1: router_defaults members flattened
-    web_form_fields_written: int = 0  # M1 SaTC front-end: editable web form fields flattened
+    web_form_fields_written: int = 0  # SaTC front-end: editable web form fields flattened
     # fmt-wrapper candidates DEMOTED (not dropped) because the forwarded value's controllability is
     # unknown. They stay in the corpus and stay queryable; the read-side ladder ranks them below a
     # controllable source. Counted so the summary shows how much of the fmt axis rests on a '?'.
@@ -543,7 +543,7 @@ def _load_nvram_ops(db_path: Path | str) -> dict[int, list[dict[str, Any]]]:
     try:
         rows = conn.execute("SELECT id, nvram_ops FROM functions").fetchall()
     except sqlite3.OperationalError:
-        return out  # no column (pre-gap② analysis.db) -> no data
+        return out  # no column (an older analysis.db) -> no data
     finally:
         conn.close()
     for func_id, raw in rows:
@@ -1135,11 +1135,11 @@ def _load_nvram_defaults(db_path: Path | str, source_run_id: str) -> list[NvramD
 
 
 def _load_web_form_fields(db_path: Path | str, source_run_id: str) -> list[WebFormFieldRow]:
-    """Load editable web form field names from analysis.db into atlas rows (M1 SaTC front-end).
+    """Load editable web form field names from analysis.db into atlas rows (SaTC front-end).
 
-    Each row is a USER-EDITABLE field name + the asset it came from. A missing table (an analysis.db
-    built before M1, or one with no web assets) yields no rows — web_settable then reads
-    'uncertain', NEVER 'not settable' (the false-negative red line)."""
+    Each row is a USER-EDITABLE field name + the asset it came from. A missing table (an
+    analysis.db built before form fields were collected, or one with no web assets) yields no rows
+    — web_settable then reads 'uncertain', NEVER 'not settable' (the false-negative red line)."""
     uri = ro_uri(Path(db_path))
     conn = sqlite3.connect(uri, uri=True)
     try:
@@ -1148,7 +1148,8 @@ def _load_web_form_fields(db_path: Path | str, source_run_id: str) -> list[WebFo
             "FROM web_form_fields w LEFT JOIN non_binary_files f ON f.id = w.file_id"
         ).fetchall()
     except sqlite3.OperationalError:
-        return []  # pre-M1 analysis.db -> no data (web_settable reads 'uncertain', never 'not')
+        # analysis.db without form fields -> no data (web_settable reads 'uncertain', never 'not')
+        return []
     finally:
         conn.close()
     return [
@@ -1267,11 +1268,11 @@ def run_analyzer2(
     # resolved to a real binary become entry sites, and a site never produces a 'blocked' status.
     exec_edge_rows = _flatten_exec_edges(db_path, all_funcs, sink_prov_by_func, source_run_id)
     entry_index = _load_entry_index(db_path, exec_sites=exec_entry_sites(exec_edge_rows))
-    # gap② phase 2: per-function nvram read/write ops, flattened into the atlas nvram_key_flow
+    # per-function nvram read/write ops, flattened into the atlas nvram_key_flow
     # table below so an agent can trace a key's writers/readers across binaries. Empty when the
     # analysis.db predates the nvram_ops column.
     nvram_flow_rows = _flatten_nvram_ops(all_funcs, _load_nvram_ops(db_path), source_run_id)
-    # gap② A2: resolve each caller's constant-literal call into a recognized thin nvram wrapper into
+    # resolve each caller's constant-literal call into a recognized thin nvram wrapper into
     # an INDIRECT key edge (via_wrapper) — the wrapper-indirect reads/writes the direct graph
     # misses. Empty when the analysis.db predates the A2 columns. Appended to the run's flow rows.
     _wrappers, _call_args = _load_wrapper_data(db_path)
@@ -1281,9 +1282,9 @@ def run_analyzer2(
     # get_nvram_key_flow answers "is this source key web-settable?". Empty when analysis.db predates
     # the nvram_defaults table (web_settable then reads 'uncertain', never 'not web-settable').
     nvram_default_rows = _load_nvram_defaults(db_path, source_run_id)
-    # M1 SaTC front-end surface: editable web form fields, flattened into the atlas so web_settable
+    # SaTC front-end surface: editable web form fields, flattened into the atlas so web_settable
     # can cross them against the back-end nvram_key_flow constant keys. Empty when the analysis.db
-    # predates M1 (web_settable then reads 'uncertain', never 'not settable').
+    # predates form-field collection (web_settable then reads 'uncertain', never 'not settable').
     web_form_field_rows = _load_web_form_fields(db_path, source_run_id)
     # detector B: strcmp-ladder string-keyed edges, flattened into the atlas string_keyed_edge table
     # so the reachability layer can annotate a candidate that is an edge callee (a key lead, still
@@ -1347,14 +1348,14 @@ def run_analyzer2(
         # instances are deleted; pattern rows (shared accumulation layer) are not.
         with atlas:
             delete_run_instances(atlas, source_run_id, commit=False)
-            # gap② phase 2: refresh this run's nvram key-flow rows in the SAME transaction as its
+            # refresh this run's nvram key-flow rows in the SAME transaction as its
             # instances (replace-by-run: delete own rows, then insert the fresh flatten).
             delete_run_nvram_flow(atlas, source_run_id, commit=False)
             add_nvram_flow_rows(atlas, nvram_flow_rows, commit=False)
             # naming-bridge phase 1: refresh this run's router_defaults rows in the same txn.
             delete_run_nvram_defaults(atlas, source_run_id, commit=False)
             add_nvram_default_rows(atlas, nvram_default_rows, commit=False)
-            # M1: refresh this run's editable-web-form-field rows in the same txn (replace-by-run).
+            # refresh this run's editable-web-form-field rows in the same txn (replace-by-run).
             delete_run_web_form_fields(atlas, source_run_id, commit=False)
             add_web_form_field_rows(atlas, web_form_field_rows, commit=False)
             # detector B: refresh this run's string-keyed-edge rows + capability registration in the
