@@ -207,9 +207,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     stored before this change is re-run once.
 - **Known gap:** the diff readers (`get_diff_deltas`, `get_diff_meta`, `get_function_alignment`,
   `get_diff_sink_overlay`) are MCP-only; there is no CLI for them yet.
+- **The function patch view reads undetermined pairs, qualified matches and text differences.**
+  - An undetermined pair (bucket R) carries `proposed_pair_reading`: the pseudocode and callee
+    reading it would get if it were paired — `identical_unique` only when its body occurs once on
+    each side, `identical_not_unique` otherwise, beside `identical_text_unverified`,
+    `identical_callee_unverified`, `differs`, `no_body` and `unavailable` — with where else each
+    body occurs. It is a proposal beside the entry, never its `pseudocode_sameness`; buckets,
+    subclasses and the default order are unchanged. Under the significance lens an R entry read
+    `identical_unique` closes attention 1, still ahead of every sunk entry.
+  - A qualified text match carries `hidden_region`: each decompiler warning with the address it
+    names and whether that lies in the function's own body, `body` (`structure_differs` when the
+    two body byte counts differ, else `unknown` — never `identical`), the byte counts, and BinDiff's
+    matched-instruction count and similarity as stored.
+  - A pair whose texts differ carries `pseudocode_delta`: `substitution_only`, `structural` or
+    `layout_only`, the substituted tokens by kind, and the callees whose call counts differ. It is
+    computed only for the page being read and never moves or files an entry.
+  - `get_diff_patch_view(body=structure_differs|unknown)` lists one class of qualified match
+    (listed entries and `not_listed_page=aligned_pseudocode_identical_text_unverified`); the
+    significance lens counts the sunk ones whose byte counts differ
+    (`lens.sunk_with_body_size_differs`). `function_states` / `get_diff_meta` add
+    `identical_text_unverified_by_body` and `alignment_undetermined_reading`, and the `tmap diff`
+    line names the undetermined pairs' readings.
 
 ### Changed
 
+- **Pseudocode `identical` is stricter: a text match that rests on something unchecked reads
+  `identical_text_unverified`.** Its `text_unverified_reasons` name why: a large literal read as a
+  moved address only because a side's image extent is unknown (`literal_basis_unknown`), a
+  decompile the decompiler itself marked incomplete (`decompile_incomplete:<tag>` — an unrecovered
+  jump table, bad instruction data, a removed unreachable block and five more), or two body byte
+  counts that differ (`body_size_differs`). It counts under `unverified`, never `unchanged`, and is
+  sunk by the significance lens only in bucket C. A large hex literal is now compared position by
+  position: a value that changed reads as a moved address only when each side's value lies in that
+  side's image, so a large constant that changed outside it is a difference. The addresses in
+  Ghidra's try/catch annotation are blanked like the other synthetic addresses. No stored data or
+  code version moves; on the diffs measured, the pairs that left `identical` all went to
+  `identical_text_unverified`, a few to `differs`, and none was made equal by the try/catch rule.
 - **Distribution name `tmap-agents`** (import name `treasure_map` and command `tmap` unchanged); the
   version is written once, in `treasure_map/version.py`.
 - **The installed commit is read for index installs too.** A wheel from the package index carries

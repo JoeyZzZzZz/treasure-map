@@ -125,6 +125,11 @@ def _function_line(states: dict[str, Any] | None) -> str:
         f"{changed['no_scoped_signal']} no scoped signal), {unverified['total']} unverified, "
         f"{states['no_body']} no body; {states['alignment_undetermined']} alignment undetermined"
     )
+    # An undetermined pair's proposed reading (never counted into the aligned states above).
+    proposed = states.get("alignment_undetermined_reading") or {}
+    read = ", ".join(f"{n} {state}" for state, n in proposed.items() if n)
+    if states["alignment_undetermined"] and read:
+        line += f" (read: {read})"
     sides = "; ".join(
         f"{side.upper()} " + ", ".join(f"{n} {state}" for state, n in by_state.items())
         for side, by_state in states["one_sided"].items()

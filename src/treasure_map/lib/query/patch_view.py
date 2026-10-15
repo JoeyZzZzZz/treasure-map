@@ -41,18 +41,25 @@ is never C because its callees look unchanged.
 
 TWO SIGNALS SIMILARITY IS BLIND TO (lib/query/sameness), read on the function-pair view only:
   ``pseudocode_sameness`` — an aligned pair's honest state, folding an address-normalised pseudocode
-  comparison with ``callee_set``: ``identical`` (both agree), ``identical_callee_unverified`` (text
-  matches, callees unverified — never read as "unchanged"), ``differs``, ``no_body`` (an import/PLT
-  stub, not in the functions table) or ``unavailable`` (in the table, empty body). On every listed
-  aligned entry as a fact; the similarity-1 pairs that place no entry are counted by it under
-  ``not_listed`` (``not_listed_page=<name>`` walks one category, ``aligned_pseudocode_differs``
-  above all).
+  comparison with ``callee_set``: ``identical`` (both agree, nothing left unverified),
+  ``identical_text_unverified`` (the text matches but rests on something unchecked — an unknown
+  image extent, a decompile marked incomplete, two body byte counts that differ; named in
+  ``text_unverified_reasons``, with the ``hidden_region`` facts behind it),
+  ``identical_callee_unverified`` (text matches, callees unverified), ``differs``, ``no_body`` (an
+  import/PLT stub, not in the functions table) or ``unavailable`` (in the table, empty body). None
+  of the unverified states is ever read as "unchanged". On every listed aligned entry as a fact; the
+  similarity-1 pairs that place no entry are counted by it under ``not_listed``
+  (``not_listed_page=<name>`` walks one category, ``aligned_pseudocode_differs`` above all). A pair
+  whose texts differ carries ``pseudocode_delta``, the lexical shape of the difference. An
+  undetermined pair carries ``proposed_pair_reading`` instead — the same reading as if it were
+  paired, with whether its body is unique on each side — beside the entry, never its pairing; it
+  moves no entry between buckets.
   ``sink_arg_constant_delta`` — a persisted candidate whose size constant moved (0x40 -> 0x3f),
   with the callee and from/to, direction-neutral. A changed size KIND is the weaker
   ``size_kind_shifted``.
   Reading pseudocode is the costly half, so it is computed in get_diff_patch_view (cached per
   diff + content + build), never in build_diff_view — annotate/promote and the progress block stay
-  cheap.
+  cheap. A pseudocode_delta is computed only for the page being rendered.
 
 ORDER: A first, then the R and B entries that carry a sink candidate, then the entries with none,
 then P; inside each, by the named components of ``rank_key`` (visible on every entry). ``tier`` is
@@ -70,7 +77,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
 from treasure_map.lib.diff.layer0 import norm_hex
@@ -417,6 +424,7 @@ class _Pair:
     state: str
     export_gap_a: str | None
     export_gap_b: str | None
+    instructions: int | None = None  # BinDiff's matched-instruction count, as stored
 
     @property
     def aligned(self) -> bool:
@@ -661,7 +669,7 @@ def _load_diff(atlas: sqlite3.Connection, diff_id: str) -> _Diff | None:
         _Pair(*r)
         for r in atlas.execute(
             "SELECT addr_a, addr_b, name_a, name_b, alignment_confidence, similarity, "
-            "alignment_state, export_gap_a, export_gap_b FROM function_alignment "
+            "alignment_state, export_gap_a, export_gap_b, instructions FROM function_alignment "
             "WHERE diff_id = ? ORDER BY addr_a, addr_b",
             (diff_id,),
         )
@@ -706,6 +714,9 @@ class _Entry:
     tier: int | str = NO_SINK
     row_views: list[dict[str, Any]] = field(default_factory=list)
     callee_set: dict[str, Any] | None = None
+    # An undetermined pair's callee lists compared the same way, for its proposed reading only: it
+    # adds no fact and moves nothing.
+    proposed_callee_set: dict[str, Any] | None = None
     facts: list[str] = field(default_factory=list)
     blind_spots: list[str] = field(default_factory=list)
     string_edges: dict[str, Any] | None = None
@@ -828,6 +839,7 @@ class _Builder:
             gap = p.export_gap_a or p.export_gap_b
             e.bucket = "R"
             e.subclass = "degenerate_block_source" if gap else "alignment_low_confidence"
+            e.proposed_callee_set = self._callee_comparison(p)
         elif "A" in landings:
             e.bucket, e.subclass = "A", "matched_call_other_callee"
         elif "R" in landings or "P" in landings:
@@ -1018,8 +1030,26 @@ class _Builder:
     # ── the second signal: the two callee sets ──
 
     def _callee_set(self, e: _Entry) -> dict[str, Any]:
+        """An aligned pair's callee comparison, with the facts it adds to the entry: a callee only
+        one side calls that is a thin command wrapper (``one_hop_sink``), and
+        ``callee_set_unchanged``."""
         p = e.pair
         assert p is not None
+        out = self._callee_comparison(p)
+        named = out.get("named_callees_differ")
+        if named is not None:
+            self._one_hop(e, named["only_in_a"], "a")
+            self._one_hop(e, named["only_in_b"], "b")
+        elif out["state"] == "equal":
+            e.facts.append("callee_set_unchanged")
+        elif out["state"] == "differs":
+            self._one_hop(e, out["only_in_a"], "a")
+            self._one_hop(e, out["only_in_b"], "b")
+        return out
+
+    def _callee_comparison(self, p: _Pair) -> dict[str, Any]:
+        """The two functions' callee lists compared as sets — no side effect, so an undetermined
+        pair's proposed reading can use it without adding a fact to its entry."""
         if self.callee_block == "source_stale":
             return {"state": "undetermined", "reason": "source_stale"}
         if self.callee_block == "analysis_db_unavailable":
@@ -1055,16 +1085,11 @@ class _Builder:
                     "only_in_a": sorted(named_a - named_b),
                     "only_in_b": sorted(named_b - named_a),
                 }
-                self._one_hop(e, out["named_callees_differ"]["only_in_a"], "a")
-                self._one_hop(e, out["named_callees_differ"]["only_in_b"], "b")
             return out
         if ia.keys() == ib.keys():
-            e.facts.append("callee_set_unchanged")
             return {"state": "equal"}
         only_a = sorted(ia[k] for k in ia.keys() - ib.keys())
         only_b = sorted(ib[k] for k in ib.keys() - ia.keys())
-        self._one_hop(e, only_a, "a")
-        self._one_hop(e, only_b, "b")
         return {"state": "differs", "only_in_a": only_a, "only_in_b": only_b}
 
     def _identities(self, side: str, fn: _Fn) -> tuple[dict[tuple[str, ...], str], set[str]]:
@@ -1242,25 +1267,33 @@ def _held_up(item: diff_review.Item | None) -> bool:
     return item.state == CONCLUDED and item.verdict == "changed_real"
 
 
-def significance(e: _Entry, state: str | None, item: diff_review.Item | None) -> tuple[int, str]:
+def significance(
+    e: _Entry,
+    state: str | None,
+    item: diff_review.Item | None,
+    u_state: str | None = None,
+) -> tuple[int, str]:
     """``(attention, basis)`` of one listed entry under the significance lens, from facts the view
-    already holds (bucket, the rows' sink_arg_constant_delta, pseudocode_sameness, the entry's
-    review state) — nothing re-derived, no verdict. In order:
+    already holds (bucket, the rows' sink_arg_constant_delta, pseudocode_sameness, an undetermined
+    pair's proposed reading ``u_state``, the entry's review state) — nothing re-derived, no verdict.
+    In order:
 
       * bucket A, or a row carrying sink_arg_constant_delta -> 0 (wins over everything below);
       * B ``sink_present_no_visible_delta`` -> 1, labelled ``recheckable_no_visible_delta``: it
         stays where similarity puts it, neither floated nor sunk;
-      * pseudocode ``identical``, or bucket C -> 2 — unless the entry is R (an undetermined pair is
-        never buried under the pairs that were read) or its judgement is held up (changed_real,
-        needs_recheck / needs_relabel, inconclusive), which stops it at 1;
-      * everything else -> 1, ordered by similarity, lowest first."""
+      * pseudocode ``identical``, a proposed ``identical_unique``, or bucket C -> 2 — unless the
+        entry is R (an undetermined pair is never buried under the pairs that were read) or its
+        judgement is held up (changed_real, needs_recheck / needs_relabel, inconclusive), which
+        stops it at 1;
+      * everything else -> 1, ordered by similarity, lowest first. ``identical_text_unverified``
+        is never sunk outside C."""
     if e.bucket == "A":
         return ATTENTION_FLOAT, "matched_call_other_callee"
     if any("sink_arg_constant_delta" in v for v in e.row_views):
         return ATTENTION_FLOAT, "sink_arg_constant_delta"
     if e.subclass == "sink_present_no_visible_delta":
         return ATTENTION_MIDDLE, "recheckable_no_visible_delta"
-    if state == sameness.IDENTICAL or e.bucket == "C":
+    if state == sameness.IDENTICAL or u_state == sameness.U_IDENTICAL_UNIQUE or e.bucket == "C":
         basis = "pseudocode_identical" if state == sameness.IDENTICAL else "no_sink_candidate"
         if e.bucket == "R":
             return ATTENTION_MIDDLE, "undetermined_never_sunk"
@@ -1277,14 +1310,17 @@ def _sort(
     sort_by: str | None,
     band: dict[str, int] | None = None,
     attention: dict[str, int] | None = None,
+    settled: dict[str, int] | None = None,
 ) -> list[_Entry]:
     """The default order, or ``sort_by`` (one named component) ahead of it. P stays last either
     way: a function with no counterpart is not ordered among the pairs. ``band`` maps an entry id
     to its judgement band (diff_review.band_bias); None leaves the order as it is.
 
-    ``sort_by="significance"`` orders by ``(attention, band, similarity, default key)`` —
+    ``sort_by="significance"`` orders by ``(attention, band, settled, similarity, default key)`` —
     ``attention`` from :func:`significance`, the band only when it is on (judgements move nothing
-    unless asked), similarity lowest first, then the default order."""
+    unless asked), ``settled`` (1 for an R entry whose proposed reading is ``identical_unique``,
+    so it closes its tier, still ahead of every sunk entry), similarity lowest first, then the
+    default order."""
 
     def key(e: _Entry) -> tuple[Any, ...]:
         r = e.rank
@@ -1294,6 +1330,7 @@ def _sort(
                 p_last,
                 (attention or {}).get(e.entry_id, ATTENTION_MIDDLE),
                 band.get(e.entry_id, 0) if band else 0,
+                (settled or {}).get(e.entry_id, 0),
                 r.get("similarity", -1.0),
                 *_default_key(r, 0),
             )
@@ -1444,7 +1481,9 @@ def _check_args(
     if tier is not None and str(tier) not in (NO_SINK, UNKNOWN) and not str(tier).isdigit():
         return f"tier must be a number, 'no_sink' or 'unknown', got {tier!r}"
     if view != "sink_patch" and (filtered or sort_by is not None):
-        return "sort_by / bucket / subclass / tier / blind_spot apply to view='sink_patch' only"
+        return (
+            "sort_by / bucket / subclass / tier / blind_spot / body apply to view='sink_patch' only"
+        )
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_LIMIT:
         return f"limit must be an integer in 1..{MAX_LIMIT}, got {limit!r}"
     if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
@@ -1539,18 +1578,56 @@ def build_diff_view(atlas: sqlite3.Connection, diff_id: str) -> BuiltDiff | None
 
 # ── pseudocode_sameness: a read-face reading, never built into build_diff_view ───────────────
 
-# Process-wide cache of the expensive read: per (diff_id, sha_a, sha_b), each aligned pair's
-# address-normalised pseudocode match (True / False / None). The callee-set state it folds with
-# comes from the build and is re-read each call, so the cache need only hold the pseudocode verdict.
-# (addr_a, addr_b) -> (matches, reason) of a pseudocode reading; see _pseudo_readings for the key.
-_Readings = dict[tuple[str, str], tuple[bool | None, str | None]]
-_PSEUDO_READING_CACHE: dict[tuple[str, ...], _Readings] = {}
+
+@dataclass(frozen=True)
+class _Read:
+    """One pair's pseudocode reading: ``matches`` / ``reason`` / ``text_reasons`` as
+    sameness.pair_reading gives them, the ``hidden_region`` facts behind a qualified match, and —
+    for an undetermined pair whose two bodies were read — how often each body occurs on each side
+    and where else it is."""
+
+    matches: bool | None
+    reason: str | None
+    text_reasons: tuple[str, ...] = ()
+    hidden_region: dict[str, Any] | None = None
+    occurrences: dict[str, int] | None = None
+    a_body_elsewhere_in_b: dict[str, Any] | None = None
+    b_body_elsewhere_in_a: dict[str, Any] | None = None
+
+
+_UNREAD = _Read(None, sameness.UNAVAILABLE)
+_PairReads = dict[tuple[str, str], _Read]
+
+
+@dataclass(frozen=True)
+class _Readings:
+    """Every pair's reading for one diff: the aligned pairs and the undetermined ones, apart (an
+    undetermined pair's reading is a proposal, never its pseudocode_sameness). ``key`` is the cache
+    key the pseudocode_delta cache extends; ``sources`` each side's (analysis.db path, content hash)
+    for the delta's own read."""
+
+    key: tuple[str, ...]
+    sources: tuple[tuple[str | None, str | None], tuple[str | None, str | None]]
+    aligned: _PairReads
+    undetermined: _PairReads
+
+
+# Process-wide caches of the expensive read, per (diff_id, sha_a, sha_b, build_hash_a,
+# build_hash_b): each pair's small reading — never the bodies or the skeleton index. The callee-set
+# state a reading folds with comes from the build and is re-read each call. The pseudocode_delta
+# cache adds the pair's two addresses to that key.
+_PSEUDO_READING_CACHE: dict[tuple[str, ...], _PairReads] = {}
+_UNDETERMINED_READING_CACHE: dict[tuple[str, ...], _PairReads] = {}
+_DELTA_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
+_ELSEWHERE_SAMPLE = 3  # addresses shown of a body found elsewhere
 
 
 def _clear_view_caches() -> None:
-    """Drop the process-wide pseudocode-reading and size-fact caches (tests reuse one diff_id, run
-    ids and build hash across databases)."""
+    """Drop the process-wide pseudocode-reading, delta and size-fact caches (tests reuse one
+    diff_id, run ids and build hash across databases)."""
     _PSEUDO_READING_CACHE.clear()
+    _UNDETERMINED_READING_CACHE.clear()
+    _DELTA_CACHE.clear()
     _SIZE_FACT_CACHE.clear()
 
 
@@ -1562,39 +1639,223 @@ def _run_source(atlas: sqlite3.Connection, run_id: str) -> tuple[str | None, str
     return (row[0] if row and row[0] else None, row[1] if row else None)
 
 
+def _read_pair(
+    ba: sameness.Bodies | None,
+    bb: sameness.Bodies | None,
+    p: _Pair,
+    ra: sameness.ImageRanges,
+    rb: sameness.ImageRanges,
+) -> _Read:
+    matches, reason, reasons = sameness.pair_reading(ba, bb, p.addr_a, p.addr_b, ra, rb)
+    hidden = None
+    if matches and ba is not None and bb is not None:
+        hidden = sameness.hidden_region(
+            ba[p.addr_a],
+            bb[p.addr_b],
+            reasons,
+            similarity=p.similarity,
+            instructions=p.instructions,
+        )
+    return _Read(matches, reason, reasons, hidden)
+
+
+def _skeleton_index(bodies: sameness.Bodies) -> dict[str, list[str]]:
+    """skeleton_key -> the entries of every function on one side with that body."""
+    out: dict[str, list[str]] = {}
+    for addr, body in bodies.items():
+        text = body.get("pseudocode")
+        if text:
+            out.setdefault(sameness.skeleton_key(text), []).append(addr)
+    return out
+
+
+def _elsewhere(index: dict[str, list[str]], key: str, own: str) -> dict[str, Any]:
+    others = sorted((a for a in index.get(key, []) if a != own), key=lambda a: int(a, 16))
+    return {"count": len(others), "addrs": others[:_ELSEWHERE_SAMPLE]}
+
+
+def _read_undetermined(
+    ba: sameness.Bodies | None,
+    bb: sameness.Bodies | None,
+    pairs: list[_Pair],
+    ra: sameness.ImageRanges,
+    rb: sameness.ImageRanges,
+) -> _PairReads:
+    """Each undetermined pair read like an aligned one, plus — when both bodies were read — how
+    often each body occurs on each side and where else it is. The skeleton index over both sides'
+    functions is built only when some pair has two bodies to look up, and never kept."""
+    out: _PairReads = {}
+    index: dict[str, dict[str, list[str]]] | None = None
+    for p in pairs:
+        read = _read_pair(ba, bb, p, ra, rb)
+        if read.matches is not None and ba is not None and bb is not None:
+            if index is None:
+                index = {"a": _skeleton_index(ba), "b": _skeleton_index(bb)}
+            ka = sameness.skeleton_key(ba[p.addr_a]["pseudocode"])
+            kb = sameness.skeleton_key(bb[p.addr_b]["pseudocode"])
+            read = replace(
+                read,
+                occurrences={"a": len(index["a"].get(ka, [])), "b": len(index["b"].get(kb, []))},
+                a_body_elsewhere_in_b=_elsewhere(index["b"], ka, p.addr_b),
+                b_body_elsewhere_in_a=_elsewhere(index["a"], kb, p.addr_a),
+            )
+        out[(p.addr_a, p.addr_b)] = read
+    return out
+
+
 def _pseudo_readings(atlas: sqlite3.Connection, built: BuiltDiff) -> _Readings:
-    """(addr_a, addr_b) -> (matches, reason) of each aligned pair's pseudocode reading. Reads both
-    runs' analysis.db pseudocode once and caches by (diff_id, sha_a, sha_b, build_hash_a,
-    build_hash_b): the build hash is in the key so a re-extraction that leaves the content hash
-    alone but rewrites the pseudocode is not served a stale reading. This is the cost
-    lib/query/sameness keeps out of build_diff_view (and so out of annotate / promote / the
-    cross-scope progress block)."""
+    """Every placed pair's pseudocode reading — aligned and undetermined apart. Reads both runs'
+    analysis.db pseudocode and image extents once and caches by (diff_id, sha_a, sha_b,
+    build_hash_a, build_hash_b): the build hash is in the key so a re-extraction that leaves the
+    content hash alone but rewrites the pseudocode (or the extents) is not served a stale reading.
+    This is the cost lib/query/sameness keeps out of build_diff_view (and so out of annotate /
+    promote / the cross-scope progress block)."""
     d = built.diff
     pa, ha = _run_source(atlas, d.run_a)
     pb, hb = _run_source(atlas, d.run_b)
     key = (d.diff_id, d.sha_a or "", d.sha_b or "", ha or "", hb or "")
-    hit = _PSEUDO_READING_CACHE.get(key)
-    if hit is not None:
-        return hit
-    ba = sameness.read_function_bodies(pa, d.sha_a)
-    bb = sameness.read_function_bodies(pb, d.sha_b)
-    out: _Readings = {}
-    for e in built.placed:
-        p = e.pair
-        if p is not None and p.aligned:
-            out[(p.addr_a, p.addr_b)] = sameness.pair_reading(ba, bb, p.addr_a, p.addr_b)
-    _PSEUDO_READING_CACHE[key] = out
-    return out
+    aligned = _PSEUDO_READING_CACHE.get(key)
+    undetermined = _UNDETERMINED_READING_CACHE.get(key)
+    if aligned is None or undetermined is None:
+        ba = sameness.read_function_bodies(pa, d.sha_a)
+        bb = sameness.read_function_bodies(pb, d.sha_b)
+        ra = sameness.read_image_ranges(pa, d.sha_a)
+        rb = sameness.read_image_ranges(pb, d.sha_b)
+        pairs = [e.pair for e in built.placed if e.pair is not None]
+        if aligned is None:
+            aligned = {
+                (p.addr_a, p.addr_b): _read_pair(ba, bb, p, ra, rb) for p in pairs if p.aligned
+            }
+            _PSEUDO_READING_CACHE[key] = aligned
+        if undetermined is None:
+            undetermined = _read_undetermined(ba, bb, [p for p in pairs if not p.aligned], ra, rb)
+            _UNDETERMINED_READING_CACHE[key] = undetermined
+    return _Readings(key, ((pa, d.sha_a), (pb, d.sha_b)), aligned, undetermined)
+
+
+def _aligned_read(e: _Entry, readings: _Readings) -> _Read | None:
+    p = e.pair
+    if p is None or not p.aligned:
+        return None
+    return readings.aligned.get((p.addr_a, p.addr_b), _UNREAD)
 
 
 def _sameness_of(e: _Entry, readings: _Readings) -> str | None:
     """The pseudocode_sameness of one aligned pair; None when the entry is not an aligned pair (a
     function with no counterpart, or an undetermined pair)."""
-    p = e.pair
-    if p is None or not p.aligned:
+    read = _aligned_read(e, readings)
+    if read is None:
         return None
-    matches, reason = readings.get((p.addr_a, p.addr_b), (None, sameness.UNAVAILABLE))
-    return sameness.sameness_state(matches, (e.callee_set or {}).get("state"), reason)
+    return sameness.sameness_state(
+        read.matches, (e.callee_set or {}).get("state"), read.reason, read.text_reasons
+    )
+
+
+def _proposed_of(e: _Entry, readings: _Readings) -> tuple[str, _Read] | None:
+    """(state, reading) of an undetermined pair's proposed reading; None for any other entry."""
+    p = e.pair
+    if p is None or p.aligned:
+        return None
+    read = readings.undetermined.get((p.addr_a, p.addr_b), _UNREAD)
+    state = sameness.undetermined_pair_state(
+        read.matches,
+        (e.proposed_callee_set or {}).get("state"),
+        read.reason,
+        read.text_reasons,
+        read.occurrences,
+    )
+    return state, read
+
+
+def _body_of(e: _Entry, readings: _Readings) -> str | None:
+    """The ``body`` class of an identical_text_unverified entry (aligned, or an undetermined pair's
+    proposed reading); None for any other entry — the ``body`` filter keeps no other entry."""
+    state = _sameness_of(e, readings)
+    read = _aligned_read(e, readings)
+    if state is None:
+        proposed = _proposed_of(e, readings)
+        state, read = proposed if proposed is not None else (None, None)
+    if state != sameness.IDENTICAL_TEXT_UNVERIFIED or read is None:
+        return None
+    return sameness.text_unverified_body(read.text_reasons)
+
+
+def _hidden_region(read: _Read, p: _Pair) -> dict[str, Any] | None:
+    """The reading's hidden_region with the pair's BinDiff counts as the alignment stores them now
+    (the reading is cached by content, the alignment row is not)."""
+    if read.hidden_region is None:
+        return None
+    return {
+        **read.hidden_region,
+        "bindiff_matched_instructions": p.instructions,
+        "similarity": p.similarity,
+    }
+
+
+def _deltas(readings: _Readings, pairs: list[_Pair]) -> dict[tuple[str, str], dict[str, Any]]:
+    """pseudocode_delta of each of ``pairs`` (pairs whose texts were read and differ), computed only
+    for the page being rendered: the bodies are read once, and only when one of them is not cached;
+    the result is cached per pair, the bodies are not kept."""
+    out: dict[tuple[str, str], dict[str, Any]] = {}
+    missing: list[_Pair] = []
+    for p in pairs:
+        hit = _DELTA_CACHE.get((readings.key, p.addr_a, p.addr_b))
+        if hit is None:
+            missing.append(p)
+        else:
+            out[(p.addr_a, p.addr_b)] = hit
+    if missing:
+        (pa, sha_a), (pb, sha_b) = readings.sources
+        ba = sameness.read_function_bodies(pa, sha_a) or {}
+        bb = sameness.read_function_bodies(pb, sha_b) or {}
+        ra = sameness.read_image_ranges(pa, sha_a)
+        rb = sameness.read_image_ranges(pb, sha_b)
+        for p in missing:
+            ta = (ba.get(p.addr_a) or {}).get("pseudocode")
+            tb = (bb.get(p.addr_b) or {}).get("pseudocode")
+            if not ta or not tb:  # the bodies moved since the reading: nothing to compare
+                continue
+            delta = sameness.pseudocode_delta(ta, tb, ra, rb)
+            _DELTA_CACHE[(readings.key, p.addr_a, p.addr_b)] = delta
+            out[(p.addr_a, p.addr_b)] = delta
+    return out
+
+
+def _delta_pair(e: _Entry, readings: _Readings) -> _Pair | None:
+    """The entry's pair when its two texts were read and differ (a delta is owed), else None."""
+    p = e.pair
+    if p is None:
+        return None
+    reads = readings.aligned if p.aligned else readings.undetermined
+    return p if reads.get((p.addr_a, p.addr_b), _UNREAD).matches is False else None
+
+
+def _proposed_json(
+    e: _Entry, state: str, read: _Read, deltas: dict[tuple[str, str], dict[str, Any]]
+) -> dict[str, Any]:
+    """An undetermined pair's ``proposed_pair_reading``: read as if it were paired, beside the
+    entry and never as its pseudocode_sameness. ``occurrences`` and the two ``*_elsewhere_*`` are
+    null unless both bodies were read."""
+    p = e.pair
+    assert p is not None
+    out: dict[str, Any] = {"pairing": "undetermined", "state": state}
+    if state == sameness.U_IDENTICAL_TEXT_UNVERIFIED:
+        out["text_unverified_reasons"] = list(read.text_reasons)
+    out.update(
+        {
+            "callee_set": e.proposed_callee_set,
+            "occurrences": read.occurrences,
+            "a_body_elsewhere_in_b": read.a_body_elsewhere_in_b,
+            "b_body_elsewhere_in_a": read.b_body_elsewhere_in_a,
+        }
+    )
+    hidden = _hidden_region(read, p)
+    if hidden is not None:
+        out["hidden_region"] = hidden
+    delta = deltas.get((p.addr_a, p.addr_b))
+    if delta is not None:
+        out["pseudocode_delta"] = delta
+    return out
 
 
 def _not_listed_counts(built: BuiltDiff, readings: _Readings) -> dict[str, dict[str, Any]]:
@@ -1623,26 +1884,51 @@ def _not_listed_page(
     *,
     limit: int,
     offset: int,
+    body: str | None = None,
 ) -> dict[str, Any]:
     """One page of the not-listed pairs of a pseudocode_sameness category, by address. Lightweight:
-    these are not entries, so they carry only their addresses, similarity and sameness state."""
+    these are not entries, so they carry only their addresses, similarity and sameness state — plus
+    the ``body`` class and reasons of a qualified match, and the pseudocode_delta of a text that
+    differs. ``body`` keeps only the qualified matches of that class."""
     state = sameness.STATE_BY_NOT_LISTED_NAME[name]
     pairs = sorted(
-        (e for e in built.placed if not e.bucket and _sameness_of(e, readings) == state),
+        (
+            e
+            for e in built.placed
+            if not e.bucket
+            and _sameness_of(e, readings) == state
+            and (body is None or _body_of(e, readings) == body)
+        ),
         key=lambda e: (e.pair.addr_a, e.pair.addr_b) if e.pair is not None else ("", ""),
     )
     end = offset + limit
-    rows = [
-        {
+    page = [e for e in pairs[offset:end] if e.pair is not None]
+    deltas = _deltas(
+        readings,
+        [
+            e.pair
+            for e in page
+            if e.pair is not None and (_aligned_read(e, readings) or _UNREAD).matches is False
+        ],
+    )
+    rows: list[dict[str, Any]] = []
+    for e in page:
+        assert e.pair is not None
+        read = _aligned_read(e, readings) or _UNREAD
+        row: dict[str, Any] = {
             "entry_id": e.entry_id,
             "addr_a": e.pair.addr_a,
             "addr_b": e.pair.addr_b,
             "similarity": e.pair.similarity,
             "pseudocode_sameness": state,
         }
-        for e in pairs[offset:end]
-        if e.pair is not None
-    ]
+        if state == sameness.IDENTICAL_TEXT_UNVERIFIED:
+            row["body"] = sameness.text_unverified_body(read.text_reasons)
+            row["text_unverified_reasons"] = list(read.text_reasons)
+        delta = deltas.get((e.pair.addr_a, e.pair.addr_b))
+        if delta is not None:
+            row["pseudocode_delta"] = delta
+        rows.append(row)
     return {
         "entries": rows,
         "total_entries": len(pairs),
@@ -1655,14 +1941,19 @@ _SIGNIFICANCE_LENS = (
     "A or a row carrying sink_arg_constant_delta; 2 = pseudocode_sameness identical, or bucket C "
     "(sunk, still listed and pageable); 1 = the rest, lowest similarity first, R and B entries "
     "ordered together. Attention 0 holds B entries too (a row's sink_arg_constant_delta) beside "
-    "A. Never sunk: an R entry (attention 2 never holds one), a B sink_present_no_visible_delta "
-    "(labelled recheckable_no_visible_delta), and an entry judged changed_real, inconclusive or "
-    "due a re-check / relabel — none of them reaches attention 2, whether band is on or off. "
-    "Only with band=true does the judgement band order entries inside each attention tier. Each "
-    "entry's ``significance`` names its tier and why. Not seen by this lens: a constant in an "
-    "allocation expression or a local buffer's declared size (blind_spots), and anything in a "
-    "binary the two runs hold byte-identical — that is in the scan's candidate map, not in any "
-    "diff."
+    "A. Never sunk: an R entry (attention 2 never holds one; one whose proposed_pair_reading is "
+    "identical_unique closes attention 1 instead), a B sink_present_no_visible_delta (labelled "
+    "recheckable_no_visible_delta), an identical_text_unverified entry outside bucket C, and an "
+    "entry judged changed_real, inconclusive or due a re-check / relabel — none of them reaches "
+    "attention 2, whether band is on or off. A bucket C entry is sunk even when its text match is "
+    "identical_text_unverified; sunk_with_body_size_differs counts the sunk ones whose two body "
+    "byte counts differ, with the filter that lists them. Only with band=true does the judgement "
+    "band order entries inside each attention tier. Each entry's ``significance`` names its tier "
+    "and why. Not seen by this lens: a constant in an allocation expression or a local buffer's "
+    "declared size (blind_spots); the target a DAT_ / PTR_ reference points at, once its address "
+    "is blanked (a pseudocode match does not check it; a string label keeps its content in the "
+    "name); and anything in a binary the two runs hold byte-identical — that is in the scan's "
+    "candidate map, not in any diff."
 )
 
 
@@ -1681,11 +1972,13 @@ def function_states(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] |
     Every aligned pair is in exactly one of ``unchanged`` (identical: pseudocode AND callees),
     ``changed`` (split into ``with_scoped_sink_delta`` — bucket A, or a row carrying
     sink_arg_constant_delta — and ``no_scoped_signal``, which says no in-scope sink signal, NOT
-    noise), ``unverified`` (identical_callee_unverified + unavailable) and ``no_body`` (an import /
-    PLT stub, kept out of every other count). Pairs whose alignment is undetermined and functions
-    with no counterpart (by presence_state, never "added"/"removed") are counted beside them. A diff
-    undetermined as a whole is ``withheld`` with its banners and NO counts — a blind spot, not zero
-    changes. None when there is no such diff."""
+    noise), ``unverified`` (identical_text_unverified + identical_callee_unverified + unavailable;
+    ``identical_text_unverified_by_body`` splits the first by its body class) and ``no_body`` (an
+    import / PLT stub, kept out of every other count). Pairs whose alignment is undetermined are
+    counted beside them, and ``alignment_undetermined_reading`` splits them by their proposed
+    reading (never into the aligned counts); functions with no counterpart are counted by
+    presence_state, never "added"/"removed". A diff undetermined as a whole is ``withheld`` with
+    its banners and NO counts — a blind spot, not zero changes. None when there is no such diff."""
     built = build_diff_view(atlas, diff_id)
     if built is None:
         return None
@@ -1700,16 +1993,24 @@ def function_states(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] |
     undetermined = sum(1 for p in d.pairs if not p.aligned)
     readings = _pseudo_readings(atlas, built)
     tally: dict[str, int] = {}
+    by_body = {cls: 0 for cls in sameness.BODY_CLASSES}
+    proposed = {state: 0 for state in sameness.U_STATES}
     scoped = 0
     for e in built.placed:
+        reading = _proposed_of(e, readings)
+        if reading is not None:
+            proposed[reading[0]] += 1
         state = _sameness_of(e, readings)
         if state is None:
             continue
         tally[state] = tally.get(state, 0) + 1
         if state == sameness.DIFFERS and _carries_scoped_sink_delta(e):
             scoped += 1
+        if state == sameness.IDENTICAL_TEXT_UNVERIFIED:
+            by_body[_body_of(e, readings) or sameness.BODY_UNKNOWN] += 1
     changed = tally.get(sameness.DIFFERS, 0)
     unverified = {
+        sameness.IDENTICAL_TEXT_UNVERIFIED: tally.get(sameness.IDENTICAL_TEXT_UNVERIFIED, 0),
         sameness.IDENTICAL_CALLEE_UNVERIFIED: tally.get(sameness.IDENTICAL_CALLEE_UNVERIFIED, 0),
         sameness.UNAVAILABLE: tally.get(sameness.UNAVAILABLE, 0),
     }
@@ -1724,8 +2025,10 @@ def function_states(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] |
             "no_scoped_signal": changed - scoped,
         },
         "unverified": {"total": sum(unverified.values()), **unverified},
+        "identical_text_unverified_by_body": by_body,
         "no_body": tally.get(sameness.NO_BODY, 0),
         "alignment_undetermined": undetermined,
+        "alignment_undetermined_reading": proposed,
         "one_sided": {s: dict(sorted(v.items())) for s, v in sorted(one_sided.items())},
     }
 
@@ -1744,6 +2047,7 @@ def get_diff_patch_view(
     offset: int = 0,
     band: bool = False,
     not_listed_page: str | None = None,
+    body: str | None = None,
 ) -> dict[str, Any]:
     """The function-level view of one diff (see the module docstring), one page of it.
 
@@ -1760,11 +2064,28 @@ def get_diff_patch_view(
     ``not_listed_page`` names one ``not_listed`` category (e.g. ``aligned_pseudocode_differs``) and
     returns ITS pairs instead of the listed entries — the only way to walk pairs no entry holds,
     since the filters reach listed entries alone. Each listed sink_patch entry that is an aligned
-    pair also carries its ``pseudocode_sameness``."""
+    pair also carries its ``pseudocode_sameness``; an undetermined pair carries its
+    ``proposed_pair_reading`` instead.
+
+    ``body`` (``structure_differs`` / ``unknown``) keeps only the identical_text_unverified entries
+    of that body class — listed ones (an aligned pair's, or an undetermined pair's proposed
+    reading) and, with ``not_listed_page``, the not-listed pairs of
+    ``aligned_pseudocode_identical_text_unverified``."""
     if not_listed_page is not None and not_listed_page not in sameness.STATE_BY_NOT_LISTED_NAME:
         names = list(sameness.STATE_BY_NOT_LISTED_NAME)
         return {"diff_id": diff_id, "error": f"not_listed_page must be one of {names}"}
-    filters = {"bucket": bucket, "subclass": subclass, "tier": tier, "blind_spot": blind_spot}
+    if body is not None and body not in sameness.BODY_CLASSES:
+        return {
+            "diff_id": diff_id,
+            "error": f"body must be one of {sameness.BODY_CLASSES} or null, got {body!r}",
+        }
+    filters = {
+        "bucket": bucket,
+        "subclass": subclass,
+        "tier": tier,
+        "blind_spot": blind_spot,
+        "body": body,
+    }
     filtered = any(v is not None for v in filters.values())
     error = _check_args(view, sort_by, bucket, tier, limit, offset, filtered, band)
     if error is not None:
@@ -1809,7 +2130,12 @@ def get_diff_patch_view(
         "string_edge": built.n_edges,
     }
     ledger = _ledger(entries, rows_by_spot, built.unavailable)
-    chosen = [e for e in entries if _matches(e, bucket, subclass, tier, blind_spot)]
+    chosen = [
+        e
+        for e in entries
+        if _matches(e, bucket, subclass, tier, blind_spot)
+        and (body is None or _body_of(e, readings) == body)
+    ]
     review = ViewReview(atlas, built)
     envelope: dict[str, Any] = {
         "diff_id": diff_id,
@@ -1822,7 +2148,7 @@ def get_diff_patch_view(
             ),
             "sort_by": sort_by or "default",
             "filters": filters,
-            "switchable": "view / sort_by / bucket / subclass / tier / blind_spot",
+            "switchable": "view / sort_by / bucket / subclass / tier / blind_spot / body",
         },
         "subject_unit": {
             "sink_patch": "function_pair",
@@ -1855,7 +2181,9 @@ def get_diff_patch_view(
         )
     if not_listed_page is not None:
         envelope.update(
-            _not_listed_page(built, readings, not_listed_page, limit=limit, offset=offset)
+            _not_listed_page(
+                built, readings, not_listed_page, limit=limit, offset=offset, body=body
+            )
         )
         return envelope
     if view == "string_edge":
@@ -1879,26 +2207,61 @@ def get_diff_patch_view(
             }
         )
         return envelope
+    proposed = {e.entry_id: r for e in chosen if (r := _proposed_of(e, readings)) is not None}
     lens: dict[str, tuple[int, str]] = {}
+    settled: dict[str, int] = {}
     if sort_by == "significance":
         lens = {
-            e.entry_id: significance(e, _sameness_of(e, readings), review.items.get(e.entry_id))
+            e.entry_id: significance(
+                e,
+                _sameness_of(e, readings),
+                review.items.get(e.entry_id),
+                proposed[e.entry_id][0] if e.entry_id in proposed else None,
+            )
             for e in chosen
         }
+        settled = {
+            k: 1 for k, (state, _read) in proposed.items() if state == sameness.U_IDENTICAL_UNIQUE
+        }
         envelope["lens"]["significance"] = _SIGNIFICANCE_LENS
+        envelope["lens"]["sunk_with_body_size_differs"] = {
+            "count": sum(
+                1
+                for e in chosen
+                if lens[e.entry_id][0] == ATTENTION_SINK
+                and _body_of(e, readings) == sameness.BODY_STRUCTURE_DIFFERS
+            ),
+            "filter": {"body": sameness.BODY_STRUCTURE_DIFFERS},
+        }
     ordered = _sort(
         chosen,
         sort_by,
         review.bands() if band else None,
         {k: v[0] for k, v in lens.items()},
+        settled,
     )
     end = offset + limit
+    page = ordered[offset:end]
+    page_deltas = _deltas(
+        readings, [p for e in page if (p := _delta_pair(e, readings)) is not None]
+    )
 
     def _render(e: _Entry) -> dict[str, Any]:
         out = review.entry_json(e, band)
         state = _sameness_of(e, readings)
-        if state is not None:
+        read = _aligned_read(e, readings)
+        if state is not None and read is not None and e.pair is not None:
             out["pseudocode_sameness"] = state
+            if state == sameness.IDENTICAL_TEXT_UNVERIFIED:
+                out["text_unverified_reasons"] = list(read.text_reasons)
+            hidden = _hidden_region(read, e.pair)
+            if hidden is not None:
+                out["hidden_region"] = hidden
+            delta = page_deltas.get((e.pair.addr_a, e.pair.addr_b))
+            if delta is not None:
+                out["pseudocode_delta"] = delta
+        if e.entry_id in proposed and e.pair is not None:
+            out["proposed_pair_reading"] = _proposed_json(e, *proposed[e.entry_id], page_deltas)
         if e.entry_id in lens:
             attention, basis = lens[e.entry_id]
             out["rank_key"] = {**out["rank_key"], "attention": attention}
@@ -1907,7 +2270,7 @@ def get_diff_patch_view(
 
     envelope.update(
         {
-            "entries": [_render(e) for e in ordered[offset:end]],
+            "entries": [_render(e) for e in page],
             "total_entries": len(ordered),
             "next_offset": end if end < len(ordered) else None,
         }

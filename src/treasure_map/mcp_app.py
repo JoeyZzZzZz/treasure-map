@@ -1720,6 +1720,7 @@ def make_tools(
         offset: int = 0,
         band: bool = False,
         not_listed_page: str | None = None,
+        body: str | None = None,
     ) -> dict[str, Any]:
         """START HERE for one diff (``diff_id`` = ``{run_a}::{run_b}::{binary}``; list_diffs gives
         the ids): one entry per FUNCTION PAIR that changed, with what happened around its sink
@@ -1748,10 +1749,14 @@ def make_tools(
         still listed) = pseudocode_sameness ``identical`` or bucket C; 1 = the rest, lowest
         similarity first, R and B entries ordered together. Attention 0 holds B entries too (a
         row's ``sink_arg_constant_delta``) beside A. Never sunk: an R entry (attention 2 never
-        holds one), a ``sink_present_no_visible_delta`` B (labelled
-        ``recheckable_no_visible_delta``), and an entry judged changed_real, inconclusive or due a
-        re-check / relabel — none of them reaches attention 2, whether ``band`` is on or off; only
-        with ``band=true`` does the judgement band order entries inside each tier.
+        holds one; one whose proposed reading is ``identical_unique`` closes attention 1), a
+        ``sink_present_no_visible_delta`` B (labelled ``recheckable_no_visible_delta``), an
+        ``identical_text_unverified`` entry outside bucket C, and an entry judged changed_real,
+        inconclusive or due a re-check / relabel — none of them reaches attention 2, whether
+        ``band`` is on or off; only with ``band=true`` does the judgement band order entries
+        inside each tier. A bucket C entry sinks even when its text match is unverified;
+        ``lens.sunk_with_body_size_differs`` counts the sunk ones whose body byte counts differ,
+        with the ``body`` filter that lists them.
         Each entry then carries ``significance`` (its tier and why) — never a verdict. Filters:
         ``bucket``, ``subclass`` (an entry's or any of its rows'), ``tier`` (a number, ``no_sink``
         or ``unknown``), ``blind_spot`` (a key of the ``blind_spots`` ledger — page through the
@@ -1766,13 +1771,32 @@ def make_tools(
 
         Two signals BinDiff similarity is blind to, on the function-pair view: each aligned entry
         carries ``pseudocode_sameness`` — ``identical`` (address-normalised pseudocode AND callees
-        match), ``identical_callee_unverified`` (text matches, callees not verified — NOT
-        "unchanged"), ``differs``, ``no_body`` (an import/PLT stub, not in the functions table) or
-        ``unavailable`` (in the table, empty body); the similarity-1 pairs that place no entry are
-        counted by it under ``not_listed`` (``not_listed_page=<name>`` walks one category, e.g.
-        ``aligned_pseudocode_differs``). A persisted candidate whose size constant changed carries
-        ``sink_arg_constant_delta`` (callee + from/to, direction-neutral); a changed size KIND is
-        the weaker ``size_kind_shifted``.
+        match, nothing left unverified), ``identical_text_unverified`` (the text matches but the
+        match rests on something unchecked; ``text_unverified_reasons``: ``literal_basis_unknown``
+        = a large literal read as an address only because a side's image extent is unknown,
+        ``decompile_incomplete:<tag>`` = the decompiler marked its output incomplete,
+        ``body_size_differs`` = the two body byte counts differ), ``identical_callee_unverified``
+        (text matches, callees not verified — NOT "unchanged"), ``differs``, ``no_body`` (an
+        import/PLT stub, not in the functions table) or ``unavailable`` (in the table, empty
+        body); the similarity-1 pairs that place no entry are counted by it under ``not_listed``
+        (``not_listed_page=<name>`` walks one category, e.g. ``aligned_pseudocode_differs``). A
+        qualified match carries ``hidden_region``: each decompiler warning with the address it
+        names and whether that lies in the function's own body, ``body`` (``structure_differs``
+        when the byte counts differ, else ``unknown`` — never ``identical``), the byte counts,
+        BinDiff's matched-instruction count and similarity as stored. ``body``
+        (``structure_differs`` / ``unknown``) keeps only the identical_text_unverified entries of
+        that class, and the not-listed ones with ``not_listed_page``. A pair whose texts differ
+        carries ``pseudocode_delta``: its lexical shape (``substitution_only`` /
+        ``structural`` / ``layout_only``, with the substituted tokens and the calls whose counts
+        differ) — a shape, never a verdict; a number-only substitution is what a size fix looks
+        like. An UNDETERMINED pair (bucket R) carries ``proposed_pair_reading`` instead: the same
+        reading as if it were paired (``identical_unique`` only when its body occurs once on each
+        side, ``identical_not_unique`` otherwise, plus the other states), with where else each
+        body occurs — a proposal beside the entry, never its pairing. Not checked by any of
+        these: the target a ``DAT_`` / ``PTR_`` reference points at once its address is blanked
+        (a string label keeps its content in the name). A persisted candidate whose size
+        constant changed carries ``sink_arg_constant_delta`` (callee + from/to,
+        direction-neutral); a changed size KIND is the weaker ``size_kind_shifted``.
 
         ``view``: ``string_edge`` returns get_diff_deltas' rows, ``candidate_flat``
         get_diff_sink_overlay's rows in its order; the envelope (``subject_counts`` of all three
@@ -1814,6 +1838,7 @@ def make_tools(
                 offset=offset,
                 band=band,
                 not_listed_page=not_listed_page,
+                body=body,
             )
         finally:
             conn.close()
@@ -2051,9 +2076,12 @@ def make_tools(
         ★ ``functions`` splits this diff's functions by the view's own facts: ``unchanged``
         (pseudocode AND callees match), ``changed`` (``with_scoped_sink_delta`` = bucket A or a
         changed sink length constant; ``no_scoped_signal`` = no in-scope sink signal, NOT
-        'noise'), ``unverified`` (identical_callee_unverified + unavailable — neither unchanged nor
-        changed), ``no_body`` (an import / PLT stub, counted apart), ``alignment_undetermined``,
-        and ``one_sided`` by presence_state (never 'added' / 'removed'). ``withheld`` = the whole
+        'noise'), ``unverified`` (identical_text_unverified + identical_callee_unverified +
+        unavailable — neither unchanged nor changed; ``identical_text_unverified_by_body`` splits
+        the first by body class), ``no_body`` (an import / PLT stub, counted apart),
+        ``alignment_undetermined`` (``alignment_undetermined_reading`` splits it by each pair's
+        proposed reading, never into the aligned counts), and ``one_sided`` by presence_state
+        (never 'added' / 'removed'). ``withheld`` = the whole
         diff is undetermined: no counts, a blind spot (``blind_spot='did_not_diff'`` when it
         failed). It reads pseudocode, so it costs what one get_diff_patch_view does.
         ★ ``diff_ok=0`` means this binary did NOT diff (``diff_status='failed'``,

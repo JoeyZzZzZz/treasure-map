@@ -84,13 +84,22 @@ class World:
             (DIFF, SHA_A, SHA_B, self.build, self.build),
         )
 
-    def pair(self, a: str, b: str, conf: float, sim: float, **gaps: str | None) -> None:
+    def pair(
+        self,
+        a: str,
+        b: str,
+        conf: float,
+        sim: float,
+        *,
+        instructions: int | None = None,
+        **gaps: str | None,
+    ) -> None:
         state = "aligned" if conf >= 0.9 else "alignment_undetermined"
         self.atlas.execute(
             "INSERT INTO function_alignment (diff_id, addr_a, addr_b, alignment_confidence, "
-            "similarity, alignment_state, export_gap_a, export_gap_b) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (DIFF, a, b, conf, sim, state, gaps.get("gap_a"), gaps.get("gap_b")),
+            "similarity, alignment_state, export_gap_a, export_gap_b, instructions) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (DIFF, a, b, conf, sim, state, gaps.get("gap_a"), gaps.get("gap_b"), instructions),
         )
 
     def unpaired(self, side: str, addr: str, state: str, gap: str | None = None) -> None:
@@ -110,11 +119,32 @@ class World:
         truncated: int = 0,
         unresolved: list[str] | None = None,
         pseudocode: str | None = None,
+        size_bytes: int | None = None,
+        body_ranges: list[list[str]] | None = None,
     ) -> None:
         self.adb[side].execute(
             "INSERT INTO functions (binary_id, name, address, callees, callees_truncated, "
-            "unresolved_external_calls, pseudocode) VALUES (1, ?, ?, ?, ?, ?, ?)",
-            (name, addr, json.dumps(callees), truncated, json.dumps(unresolved or []), pseudocode),
+            "unresolved_external_calls, pseudocode, size_bytes, body_ranges) "
+            "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                name,
+                addr,
+                json.dumps(callees),
+                truncated,
+                json.dumps(unresolved or []),
+                pseudocode,
+                size_bytes,
+                json.dumps(body_ranges or []),
+            ),
+        )
+
+    def block(self, side: str, start: str, size: int) -> None:
+        """One memory block of the side's binary (data_blocks: the image extents a large literal
+        is read against)."""
+        self.adb[side].execute(
+            "INSERT INTO data_blocks (binary_id, block_name, start_addr, size, initialized) "
+            "VALUES (1, '.text', ?, ?, 1)",
+            (start, size),
         )
 
     def commit(self) -> None:
@@ -465,13 +495,15 @@ def test_every_pair_and_function_is_listed_or_counted(world: World) -> None:
 # ── pseudocode_sameness: the reading similarity is blind to ────────────────────────────────────
 
 
-def test_pseudocode_sameness_reads_its_five_states(tmp_path: Path, current: None) -> None:
+def test_pseudocode_sameness_reads_its_six_states(tmp_path: Path, current: None) -> None:
     """Each aligned similarity-1 pair that places no entry is counted by pseudocode_sameness: a
-    verified match, a match whose callees could not be verified, a real difference, a stub with no
-    body at all, and a function whose body is empty — each kept apart.
+    verified match, a match whose text rests on something unchecked, a match whose callees could
+    not be verified, a real difference, a stub with no body at all, and a function whose body is
+    empty — each kept apart. The five earlier states read exactly as they did.
 
     MUTATION: fold ``identical_callee_unverified`` into ``identical`` (treat 'undetermined' callees
-    as equal) -> RED; call every missing body ``unavailable`` (drop the no_body split) -> RED."""
+    as equal) -> RED; call every missing body ``unavailable`` (drop the no_body split) -> RED;
+    ignore text_reasons in the fold -> the qualified match reads identical -> RED."""
     w = World(tmp_path)
     # identical: same body, same resolved callees (callee_set equal)
     w.pair("00001000", "00002000", 0.97, 1.0)
@@ -492,11 +524,17 @@ def test_pseudocode_sameness_reads_its_five_states(tmp_path: Path, current: None
     w.pair("00009000", "0000a000", 0.97, 1.0)
     w.fn("a", "00009000", ["foo"], pseudocode="iVar = foo(0x40);")
     w.fn("b", "0000a000", ["foo"], pseudocode=None)
+    # identical_text_unverified: same text and callees, but the decompiler says it gave up a table
+    w.pair("0000b000", "0000c000", 0.97, 1.0)
+    body = "/* WARNING: Could not recover jumptable at 0x0040b668. Too many branches */\nfoo(0x40);"
+    w.fn("a", "0000b000", ["foo"], pseudocode=body)
+    w.fn("b", "0000c000", ["foo"], pseudocode=body)
     w.commit()
     nl = pv.get_diff_patch_view(w.atlas, DIFF)["not_listed"]
     counts = {k.replace("aligned_pseudocode_", ""): c["count"] for k, c in nl.items()}
     assert counts == {
         "identical": 1,
+        "identical_text_unverified": 1,
         "identical_callee_unverified": 1,
         "differs": 1,
         "no_body": 1,
@@ -699,7 +737,13 @@ def test_function_states_count_each_function_once_by_the_views_own_facts(
     assert s is not None and s["withheld"] is False
     assert s["unchanged"] == 1
     assert s["changed"] == {"total": 3, "with_scoped_sink_delta": 2, "no_scoped_signal": 1}
-    assert s["unverified"] == {"total": 2, "identical_callee_unverified": 1, "unavailable": 1}
+    assert s["unverified"] == {
+        "total": 2,
+        "identical_text_unverified": 0,
+        "identical_callee_unverified": 1,
+        "unavailable": 1,
+    }
+    assert s["identical_text_unverified_by_body"] == {"structure_differs": 0, "unknown": 0}
     assert s["no_body"] == 1
     assert s["aligned"] == 7 == s["unchanged"] + 3 + 2 + 1
     assert s["alignment_undetermined"] == 1
@@ -1811,3 +1855,444 @@ def test_the_filters_narrow_the_entries_not_the_counts(world: World) -> None:
     by_row = _view(world, subclass="instruction_unmatched")["entries"]
     assert _pair_id("00005000", "00006000") in {e["entry_id"] for e in by_row}
     assert {e["tier"] for e in _view(world, tier=3)["entries"]} == {3}
+
+
+# ── the R bucket's proposed reading, the qualified text match, hidden_region, deltas ──────────
+
+U_PAIRS = {
+    "identical_unique": ("00001000", "00002000"),
+    "identical_not_unique": ("00003000", "00004000"),
+    "identical_callee_unverified": ("00005000", "00006000"),
+    "identical_text_unverified": ("00007000", "00008000"),
+    "differs": ("00009000", "0000a000"),
+    "no_body": ("0000b000", "0000c000"),
+    "unavailable": ("0000d000", "0000e000"),
+}
+TWIN_B = "00004f00"  # a second B function holding identical_not_unique's body
+
+
+def _undetermined_world(tmp_path: Path) -> World:
+    """One undetermined pair per proposed-reading state, each with its own body (so no two pairs
+    share one), plus one aligned, unchanged pair."""
+    w = World(tmp_path)
+    p = U_PAIRS
+    for i, (fa, fb) in enumerate(p.values(), start=1):
+        w.pair(fa, fb, 0.5, 0.8)
+        w.fn("a", fa, ["foo"], pseudocode=f"foo({i});", size_bytes=16)
+    w.fn("b", p["identical_unique"][1], ["foo"], pseudocode="foo(1);", size_bytes=16)
+    w.fn("b", p["identical_not_unique"][1], ["foo"], pseudocode="foo(2);", size_bytes=16)
+    w.fn("b", TWIN_B, ["foo"], pseudocode="foo(2);", size_bytes=16)
+    w.fn("b", p["identical_callee_unverified"][1], ["foo"], pseudocode="foo(3);", truncated=1)
+    w.fn("b", p["identical_text_unverified"][1], ["foo"], pseudocode="foo(4);", size_bytes=20)
+    w.fn("b", p["differs"][1], ["foo"], pseudocode="foo(6);", size_bytes=16)
+    # no_body: the B side is not in the functions table at all
+    w.fn("b", p["unavailable"][1], ["foo"], pseudocode=None)
+    w.pair("00010000", "00020000", 0.97, 1.0)  # aligned and unchanged
+    w.fn("a", "00010000", ["foo"], pseudocode="bar();")
+    w.fn("b", "00020000", ["foo"], pseudocode="bar();")
+    w.commit()
+    return w
+
+
+def _proposed(v: dict[str, Any], state: str) -> dict[str, Any]:
+    entry_id = _pair_id(*U_PAIRS[state])
+    assert entry_id in v["by_id"], entry_id
+    reading = v["by_id"][entry_id]["proposed_pair_reading"]
+    assert isinstance(reading, dict)
+    return reading
+
+
+def test_an_undetermined_pair_carries_a_proposed_reading_never_a_sameness(
+    tmp_path: Path, current: None
+) -> None:
+    """T1. The proposed reading sits beside the R entry; its pseudocode_sameness key is never
+    there, and it moves the entry nowhere.
+
+    MUTATION: drop the aligned gate in ``_aligned_read`` -> every R entry gains a
+    pseudocode_sameness -> RED."""
+    v = _view(_undetermined_world(tmp_path))
+    for state, pair in U_PAIRS.items():
+        e = v["by_id"][_pair_id(*pair)]
+        assert e["bucket"] == "R" and e["subclass"] == "alignment_low_confidence", state
+        assert "pseudocode_sameness" not in e, state
+        assert e["callee_set"] is None  # the entry's own callee_set is for aligned pairs only
+        assert e["proposed_pair_reading"]["pairing"] == "undetermined"
+        assert e["proposed_pair_reading"]["state"] == state
+
+
+def test_the_proposed_readings_never_enter_the_aligned_counts(
+    tmp_path: Path, current: None
+) -> None:
+    """T2 / T3. Seven undetermined pairs, one per state: counted in
+    alignment_undetermined_reading, whose states sum to alignment_undetermined, and never in the
+    aligned counts.
+
+    MUTATION: add each proposed state into the aligned tally -> aligned/unchanged move -> RED;
+    skip one state in the proposed count -> RED."""
+    s = pv.function_states(_undetermined_world(tmp_path).atlas, DIFF)
+    assert s is not None
+    assert (s["aligned"], s["unchanged"], s["no_body"]) == (1, 1, 0)
+    assert s["changed"]["total"] == 0 and s["unverified"]["total"] == 0
+    assert s["alignment_undetermined"] == 7
+    assert s["alignment_undetermined_reading"] == {state: 1 for state in U_PAIRS}
+    assert sum(s["alignment_undetermined_reading"].values()) == s["alignment_undetermined"]
+
+
+def test_a_body_found_twice_on_a_side_is_not_unique(tmp_path: Path, current: None) -> None:
+    """T4 / T7. The same body twice on B: identical_not_unique, and B's other copy is named —
+    never the pair's own B function.
+
+    MUTATION: skip the uniqueness check -> identical_unique -> RED; keep addr_b in
+    a_body_elsewhere_in_b -> count 2 -> RED."""
+    v = _view(_undetermined_world(tmp_path))
+    twin = _proposed(v, "identical_not_unique")
+    assert twin["state"] == "identical_not_unique"
+    assert twin["occurrences"] == {"a": 1, "b": 2}
+    assert twin["a_body_elsewhere_in_b"] == {"count": 1, "addrs": [TWIN_B]}
+    assert twin["b_body_elsewhere_in_a"] == {"count": 0, "addrs": []}
+    unique = _proposed(v, "identical_unique")
+    assert unique["occurrences"] == {"a": 1, "b": 1}
+    assert unique["a_body_elsewhere_in_b"] == {"count": 0, "addrs": []}
+
+
+def test_a_proposed_reading_states_its_facts(tmp_path: Path, current: None) -> None:
+    """T6 / T15c and the shape. Unverified callees stop at identical_callee_unverified; byte counts
+    that differ stop a unique text match at identical_text_unverified with hidden_region; a text
+    that differs carries its delta; a missing body has no occurrence counts.
+
+    MUTATION: read undetermined callees as equal -> identical_unique -> RED; let the R fold ignore
+    body_size_differs -> identical_unique -> RED."""
+    v = _view(_undetermined_world(tmp_path))
+    unverified = _proposed(v, "identical_callee_unverified")
+    assert unverified["state"] == "identical_callee_unverified"
+    assert unverified["callee_set"]["state"] == "undetermined"
+    sized = _proposed(v, "identical_text_unverified")
+    assert sized["state"] == "identical_text_unverified"
+    assert sized["text_unverified_reasons"] == ["body_size_differs"]
+    assert sized["hidden_region"]["body"] == "structure_differs"
+    assert sized["hidden_region"]["size_bytes"] == {"a": 16, "b": 20}
+    differs = _proposed(v, "differs")
+    assert differs["pseudocode_delta"]["kind"] == "substitution_only"
+    assert differs["pseudocode_delta"]["substitutions"]["number"]["first"] == [["5", "6"]]
+    for state in ("no_body", "unavailable"):
+        gone = _proposed(v, state)
+        assert gone["occurrences"] is None and gone["a_body_elsewhere_in_b"] is None, state
+        assert "pseudocode_delta" not in gone and "hidden_region" not in gone
+
+
+def test_a_changed_callee_set_wins_over_an_equal_text(tmp_path: Path, current: None) -> None:
+    """T5. The same text over callee sets that differ is differs — a callee change outranks every
+    text reading.
+
+    MUTATION: read the text before the callee set in the R fold -> identical_unique -> RED."""
+    w = World(tmp_path)
+    w.pair("00001000", "00002000", 0.5, 0.8)
+    w.fn("a", "00001000", ["foo"], pseudocode="foo(1);")
+    w.fn("b", "00002000", ["foo", "bar"], pseudocode="foo(1);")
+    w.commit()
+    e = _entry(w, _pair_id("00001000", "00002000"))
+    assert e["proposed_pair_reading"]["state"] == "differs"
+    assert e["proposed_pair_reading"]["callee_set"]["only_in_b"] == ["bar"]
+    assert "pseudocode_delta" not in e["proposed_pair_reading"]  # the texts themselves agree
+
+
+def test_an_r_entry_over_an_aligned_pair_is_never_sunk_on_an_identical_body(
+    tmp_path: Path, current: None
+) -> None:
+    """T8. Reachable: an ALIGNED pair whose candidate row lands in R (its export did not hold the
+    function as it is), with an identical body — the R guard holds it at attention 1.
+
+    MUTATION: delete the R guard in ``significance`` -> attention 2 -> RED."""
+    w = World(tmp_path)
+    w.pair("00001000", "00002000", 0.97, 0.9, gap_a="degenerate_block")
+    w.inst("a", _ref("runA", "00001000", "cmd", "0x10"), "cmd", "system")
+    w.fn("a", "00001000", ["system"], pseudocode="system(c);")
+    w.fn("b", "00002000", ["system"], pseudocode="system(c);")
+    w.commit()
+    e = _entry(w, _pair_id("00001000", "00002000"), sort_by="significance")
+    assert (e["bucket"], e["subclass"]) == ("R", "degenerate_block_source")
+    assert e["pseudocode_sameness"] == "identical"
+    assert e["significance"] == {"attention": 1, "basis": "undetermined_never_sunk"}
+
+
+def test_a_settled_r_entry_closes_attention_one_ahead_of_every_sunk_entry(
+    tmp_path: Path, current: None
+) -> None:
+    """T9. Under the significance lens an R entry read identical_unique comes after the other
+    attention-1 entries (whatever its similarity) and before every attention-2 entry.
+
+    MUTATION: drop ``settled`` from the key -> the R entry (lower similarity) comes first -> RED;
+    put ``settled`` before ``attention`` -> it falls behind the sunk C entry -> RED."""
+    w = World(tmp_path)
+    w.pair("00001000", "00002000", 0.97, 0.9)  # B, attention 1: an unmatched call, a body change
+    w.inst("a", _ref("runA", "00001000", "cmd", "0x30"), "cmd", "system")
+    w.fn("a", "00001000", ["system"], pseudocode="system(a);")
+    w.fn("b", "00002000", ["system"], pseudocode="system(b);")
+    w.pair("00003000", "00004000", 0.97, 0.8)  # C, attention 2
+    w.fn("a", "00003000", ["foo"], pseudocode="foo(1);")
+    w.fn("b", "00004000", ["foo"], pseudocode="foo(2);")
+    w.pair("00005000", "00006000", 0.5, 0.1)  # R, identical_unique
+    w.fn("a", "00005000", ["foo"], pseudocode="foo(3);")
+    w.fn("b", "00006000", ["foo"], pseudocode="foo(3);")
+    w.commit()
+    v = _view(w, sort_by="significance")
+    order = [e["entry_id"] for e in v["entries"]]
+    b, c, r = (
+        _pair_id("00001000", "00002000"),
+        _pair_id("00003000", "00004000"),
+        _pair_id("00005000", "00006000"),
+    )
+    assert order == [b, r, c]
+    assert v["by_id"][r]["proposed_pair_reading"]["state"] == "identical_unique"
+    assert v["by_id"][r]["significance"] == {"attention": 1, "basis": "undetermined_never_sunk"}
+    assert v["by_id"][c]["significance"]["attention"] == 2
+
+
+def test_the_judgement_facts_of_an_r_entry_do_not_carry_its_reading(
+    tmp_path: Path, current: None
+) -> None:
+    """T10. What a judgement rests on (diff_review.entry_facts) is unchanged by the proposed
+    reading: a judgement is never invalidated by a reading the view merely shows.
+
+    MUTATION: add the proposed callee set to entry_facts -> RED."""
+    from treasure_map.lib.query import diff_review
+
+    built = pv.build_diff_view(_undetermined_world(tmp_path).atlas, DIFF)
+    assert built is not None
+    (e,) = [x for x in built.entries if x.entry_id == _pair_id(*U_PAIRS["identical_unique"])]
+    assert diff_review.entry_facts(e) == {
+        "alignment_state": "alignment_undetermined",
+        "similarity": 0.8,
+        "export_gap_a": None,
+        "export_gap_b": None,
+        "bucket": "R",
+        "rows": [],
+    }
+
+
+def test_an_r_pairs_callee_comparison_adds_no_fact(tmp_path: Path, current: None) -> None:
+    """T11. An aligned pair's callee comparison adds callee_set_unchanged / one_hop_sink as it
+    always did; an undetermined pair's (for its proposed reading) adds neither.
+
+    MUTATION: compute the R comparison with the side-effecting ``_callee_set`` -> the R entries
+    gain the facts -> RED."""
+    w = World(tmp_path)
+    w.unpaired("b", "00005000", "unmatched_analysis_complete")
+    w.fn("b", "00005000", ["system"], name="run_cmd")
+    w.inst("b", _ref("runB", "00005000", "cmd", "0x8"), "cmd", "system", wraps="system")
+    for fa, fb, conf in (
+        ("00001000", "00002000", 0.97),
+        ("00003000", "00004000", 0.97),
+        ("00006000", "00007000", 0.5),
+        ("00008000", "00009000", 0.5),
+    ):
+        w.pair(fa, fb, conf, 0.9)
+    w.fn("a", "00001000", ["foo"])
+    w.fn("b", "00002000", ["foo"])
+    w.fn("a", "00003000", [])
+    w.fn("b", "00004000", ["run_cmd"])
+    w.fn("a", "00006000", ["foo"])
+    w.fn("b", "00007000", ["foo"])
+    w.fn("a", "00008000", [])
+    w.fn("b", "00009000", ["run_cmd"])
+    w.commit()
+    v = _view(w)["by_id"]
+    assert "callee_set_unchanged" in v[_pair_id("00001000", "00002000")]["facts"]
+    assert "one_hop_sink:system" in v[_pair_id("00003000", "00004000")]["facts"]
+    same_r, hop_r = v[_pair_id("00006000", "00007000")], v[_pair_id("00008000", "00009000")]
+    assert same_r["proposed_pair_reading"]["callee_set"] == {"state": "equal"}
+    assert hop_r["proposed_pair_reading"]["callee_set"]["only_in_b"] == ["run_cmd"]
+    assert same_r["facts"] == [] and hop_r["facts"] == []
+
+
+def _qualified_world(tmp_path: Path) -> World:
+    """Aligned pairs whose texts match but are qualified: listed (bucket C) and not listed
+    (similarity 1), by byte counts that differ and by a decompiler marker alone, plus a plain
+    difference and a plain identical."""
+    w = World(tmp_path)
+    marker = "/* WARNING: Removing unreachable block (ram,0x00003010) */\n"
+    rows = (
+        ("00001000", "00002000", 0.9, "c1();", 1064, 1060),  # C, structure_differs
+        ("00003000", "00004000", 0.9, marker + "c3();", 64, 64),  # C, marker only: unknown
+        ("00005000", "00006000", 0.9, None, 32, 32),  # C, differs
+        ("00007000", "00008000", 1.0, "n1();", 128, 120),  # not listed, structure_differs
+        ("00009000", "0000a000", 1.0, marker + "n2();", 64, 64),  # not listed, unknown
+        ("0000b000", "0000c000", 1.0, "same();", 32, 32),  # not listed, identical
+    )
+    for fa, fb, sim, text, size_a, size_b in rows:
+        w.pair(fa, fb, 0.97, sim, instructions=264)
+        w.fn("a", fa, ["foo"], pseudocode=text or "x = 1;", size_bytes=size_a)
+        w.fn("b", fb, ["foo"], pseudocode=text or "x = 2;", size_bytes=size_b)
+    w.commit()
+    return w
+
+
+def test_a_qualified_match_carries_its_reasons_and_hidden_region(
+    tmp_path: Path, current: None
+) -> None:
+    """T15 / T27, wired end to end: byte counts that differ under equal texts read
+    identical_text_unverified with hidden_region.body structure_differs, the BinDiff instruction
+    count as its stored scalar; a marker alone reads unknown.
+
+    MUTATION: report bindiff_matched_instructions per side ({a, b}) -> RED; attach no
+    hidden_region on a size-only qualification -> RED."""
+    v = _view(_qualified_world(tmp_path))["by_id"]
+    sized = v[_pair_id("00001000", "00002000")]
+    assert sized["pseudocode_sameness"] == "identical_text_unverified"
+    assert sized["text_unverified_reasons"] == ["body_size_differs"]
+    assert "hidden_region" in sized
+    region = sized["hidden_region"]
+    assert region["body"] == "structure_differs" and region["markers"] == []
+    assert region["size_bytes"] == {"a": 1064, "b": 1060}
+    assert region["bindiff_matched_instructions"] == 264 and region["similarity"] == 0.9
+    marked = v[_pair_id("00003000", "00004000")]
+    assert marked["text_unverified_reasons"] == ["decompile_incomplete:unreachable_block_removed"]
+    assert marked["hidden_region"]["body"] == "unknown"
+    assert [m["side"] for m in marked["hidden_region"]["markers"]] == ["a", "b"]
+    assert v[_pair_id("00005000", "00006000")]["pseudocode_sameness"] == "differs"
+    assert "hidden_region" not in v[_pair_id("00005000", "00006000")]
+
+
+def test_a_qualified_match_is_unverified_never_unchanged(tmp_path: Path, current: None) -> None:
+    """T18. identical_text_unverified counts in unverified (its total included), never in
+    unchanged; its split by body class is a key of its own and every unverified value stays an
+    int.
+
+    MUTATION: put the body split inside ``unverified`` -> a dict among the ints -> RED."""
+    s = pv.function_states(_qualified_world(tmp_path).atlas, DIFF)
+    assert s is not None
+    assert s["unchanged"] == 1
+    assert s["unverified"] == {
+        "total": 4,
+        "identical_text_unverified": 4,
+        "identical_callee_unverified": 0,
+        "unavailable": 0,
+    }
+    assert all(isinstance(n, int) for n in s["unverified"].values())
+    assert s["identical_text_unverified_by_body"] == {"structure_differs": 2, "unknown": 2}
+    assert s["changed"]["total"] == 1
+
+
+def test_the_body_filter_keeps_one_class_of_qualified_match(tmp_path: Path, current: None) -> None:
+    """T19. ``body`` keeps only the identical_text_unverified entries of its class — listed, and
+    the not-listed ones of that category with their body named; a bad value is an error. The MCP
+    tool passes it through.
+
+    MUTATION: ignore ``body`` when choosing the listed entries -> every entry comes back -> RED."""
+    w = _qualified_world(tmp_path)
+    ids = [e["entry_id"] for e in _view(w, body="structure_differs")["entries"]]
+    assert ids == [_pair_id("00001000", "00002000")]
+    ids = [e["entry_id"] for e in _view(w, body="unknown")["entries"]]
+    assert ids == [_pair_id("00003000", "00004000")]
+    page = pv.get_diff_patch_view(
+        w.atlas,
+        DIFF,
+        not_listed_page="aligned_pseudocode_identical_text_unverified",
+        body="structure_differs",
+    )
+    assert [(r["entry_id"], r["body"]) for r in page["entries"]] == [
+        (_pair_id("00007000", "00008000"), "structure_differs")
+    ]
+    bad = pv.get_diff_patch_view(w.atlas, DIFF, body="identical")
+    assert bad["error"] == (
+        "body must be one of ('structure_differs', 'unknown') or null, got 'identical'"
+    )
+    tool = mcp_app.make_tools(w.path)["get_diff_patch_view"]
+    out = tool(DIFF, body="structure_differs")
+    assert [e["entry_id"] for e in out["entries"]] == [_pair_id("00001000", "00002000")]
+
+
+def test_the_lens_counts_the_sunk_entries_whose_byte_counts_differ(
+    tmp_path: Path, current: None
+) -> None:
+    """T19b. A bucket C entry whose text match is qualified by differing byte counts is still
+    sunk; the lens counts it and names the filter that lists it. A held-up one stops at attention
+    1 and is not counted. Without the lens there is no count.
+
+    MUTATION: lift a qualified C entry to attention 1 -> the count is 0 -> RED; count without the
+    attention test -> the held-up entry is counted too -> RED."""
+    w = _qualified_world(tmp_path)
+    w.pair("0000d000", "0000e000", 0.97, 0.9)  # a second C structure_differs, judged changed_real
+    w.fn("a", "0000d000", ["foo"], pseudocode="c5();", size_bytes=40)
+    w.fn("b", "0000e000", ["foo"], pseudocode="c5();", size_bytes=44)
+    w.commit()
+    held = _pair_id("0000d000", "0000e000")
+    w.judge(DIFF, _view(w)["by_id"][held]["anchor_ref"], "changed_real")
+    v = _view(w, sort_by="significance")
+    sunk = v["by_id"][_pair_id("00001000", "00002000")]
+    assert sunk["bucket"] == "C" and sunk["significance"]["attention"] == 2
+    assert v["by_id"][held]["significance"]["attention"] == 1
+    assert v["lens"]["sunk_with_body_size_differs"] == {
+        "count": 1,
+        "filter": {"body": "structure_differs"},
+    }
+    assert "sunk_with_body_size_differs" not in _view(w)["lens"]
+
+
+def test_the_build_reads_no_body_and_function_states_computes_no_delta(
+    tmp_path: Path, current: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T24. build_diff_view reads neither pseudocode nor image extents; function_states reads them
+    but computes no delta; only the page read does.
+
+    MUTATION: compute the page's deltas in function_states -> RED."""
+    w = _qualified_world(tmp_path)
+    calls: list[str] = []
+    for name in ("read_function_bodies", "read_image_ranges", "pseudocode_delta"):
+        real = getattr(pv.sameness, name)
+
+        def probe(*a: Any, _real: Any = real, _name: str = name) -> Any:
+            calls.append(_name)
+            return _real(*a)
+
+        monkeypatch.setattr(pv.sameness, name, probe)
+    pv.build_diff_view(w.atlas, DIFF)
+    assert calls == []
+    pv.function_states(w.atlas, DIFF)
+    assert "read_function_bodies" in calls and "read_image_ranges" in calls
+    assert "pseudocode_delta" not in calls
+    pv.get_diff_patch_view(w.atlas, DIFF)
+    assert "pseudocode_delta" in calls
+
+
+def test_a_re_extraction_is_never_served_an_earlier_reading(tmp_path: Path, current: None) -> None:
+    """T25. Same diff, same content hashes, a new build hash on both runs: the proposed reading,
+    the image extents and the delta are all read again.
+
+    MUTATION: drop the build hashes from the reading cache key -> the earlier readings are served
+    -> RED."""
+    w = World(tmp_path)
+    w.pair("00001000", "00002000", 0.5, 0.8)  # R: identical_unique, then differs
+    w.fn("a", "00001000", ["foo"], pseudocode="foo(1);")
+    w.fn("b", "00002000", ["foo"], pseudocode="foo(1);")
+    w.pair("00003000", "00004000", 0.97, 0.9)  # aligned: a moved address inside the image
+    w.fn("a", "00003000", ["foo"], pseudocode="p = (char *)0x412340;")
+    w.fn("b", "00004000", ["foo"], pseudocode="p = (char *)0x412560;")
+    w.pair("00005000", "00006000", 0.97, 0.9)  # aligned: a changed size, its delta
+    w.fn("a", "00005000", ["foo"], pseudocode="char buf[0x60];")
+    w.fn("b", "00006000", ["foo"], pseudocode="char buf[0x64];")
+    for side in "ab":
+        w.block(side, "0x400000", 0x100000)
+    w.commit()
+    r, moved, sized = (
+        _pair_id("00001000", "00002000"),
+        _pair_id("00003000", "00004000"),
+        _pair_id("00005000", "00006000"),
+    )
+    v = _view(w)["by_id"]
+    assert v[r]["proposed_pair_reading"]["state"] == "identical_unique"
+    assert v[moved]["pseudocode_sameness"] == "identical"
+    assert v[sized]["pseudocode_delta"]["substitutions"]["number"]["first"] == [["0x60", "0x64"]]
+    w.adb["b"].execute("UPDATE functions SET pseudocode = 'foo(9);' WHERE address = '00002000'")
+    w.adb["b"].execute(
+        "UPDATE functions SET pseudocode = 'char buf[0x68];' WHERE address = '00006000'"
+    )
+    for side in "ab":
+        w.adb[side].execute("DELETE FROM data_blocks")
+        w.block(side, "0x10000", 0x1000)
+    w.atlas.execute("UPDATE run SET build_hash = 'rebuilt'")
+    w.commit()
+    v = _view(w)["by_id"]
+    assert v[r]["proposed_pair_reading"]["state"] == "differs"
+    assert v[moved]["pseudocode_sameness"] == "differs"
+    assert v[sized]["pseudocode_delta"]["substitutions"]["number"]["first"] == [["0x60", "0x68"]]

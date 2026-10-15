@@ -6,7 +6,16 @@ exercised in test_patch_view."""
 
 from __future__ import annotations
 
+import pytest
+
 from treasure_map.lib.query import sameness as sm
+
+
+def _skel(text: str) -> str:
+    """The skeleton text alone: what two bodies must share before their large literals are
+    compared position by position."""
+    return sm.skeleton(text)[0]
+
 
 # ── normalisation: addresses collapse, constants do not ──────────────────────────────────────
 
@@ -20,15 +29,15 @@ def test_an_address_shift_normalises_but_a_small_constant_does_not() -> None:
     the second assertion goes RED."""
     a = "iVar1 = FUN_00012340(DAT_000200f8); puts(s_hi_0001ccd0);"
     b = "iVar1 = FUN_00099990(DAT_00077abc); puts(s_hi_00088eee);"
-    assert sm.normalize_pseudocode(a) == sm.normalize_pseudocode(b)  # only addresses moved
+    assert _skel(a) == _skel(b)  # only addresses moved
 
     lo = "strncpy(dst,src,0x100);"
     hi = "strncpy(dst,src,0xff);"
-    assert sm.normalize_pseudocode(lo) != sm.normalize_pseudocode(hi)  # a constant stays put
+    assert _skel(lo) != _skel(hi)  # a constant stays put
 
     dec = "if (n < 256) {}"
     dec2 = "if (n < 255) {}"
-    assert sm.normalize_pseudocode(dec) != sm.normalize_pseudocode(dec2)  # 256->255 is not hidden
+    assert _skel(dec) != _skel(dec2)  # 256->255 is not hidden
 
 
 def test_the_switch_and_branch_labels_normalise_too() -> None:
@@ -40,14 +49,12 @@ def test_the_switch_and_branch_labels_normalise_too() -> None:
     RED."""
     a = "goto switchD_004492cc_caseD_3; if (x) goto joined_r0x00449e60; y = code_r0x00449e70;"
     b = "goto switchD_00449338_caseD_3; if (x) goto joined_r0x00449ecc; y = code_r0x00449ee0;"
-    assert sm.normalize_pseudocode(a) == sm.normalize_pseudocode(b)
-    assert sm.normalize_pseudocode("switchD_004492cc_caseD_3;") != sm.normalize_pseudocode(
-        "switchD_004492cc_caseD_4;"
-    )
+    assert _skel(a) == _skel(b)
+    assert _skel("switchD_004492cc_caseD_3;") != _skel("switchD_004492cc_caseD_4;")
 
 
 def _same(a: str, b: str) -> bool:
-    return sm.normalize_pseudocode(a) == sm.normalize_pseudocode(b)
+    return _skel(a) == _skel(b)
 
 
 def test_an_address_mid_name_is_blanked_only_in_the_two_labels_that_carry_one() -> None:
@@ -83,23 +90,39 @@ def test_an_address_mid_name_is_blanked_only_in_the_two_labels_that_carry_one() 
         assert not _same(a, b), (a, b)
 
 
+def _body(
+    pseudocode: str | None, size: int | None = None, ranges: list[list[int]] | None = None
+) -> sm.Body:
+    return {"pseudocode": pseudocode, "size_bytes": size, "body_ranges": ranges or []}
+
+
 def test_pair_reading_tells_no_body_apart_from_an_empty_body() -> None:
     """A reader must not have to recompute WHY a body was missing: ``no_body`` (a side absent from
     the functions table — an import/PLT stub) is kept apart from ``unavailable`` (present, empty).
 
     MUTATION: drop the ``NO_BODY in (sa, sb)`` branch (call every missing body 'unavailable') ->
     RED."""
-    bodies_a = {"1000": "FUN_00001000();", "2000": None}  # 2000 present but empty
-    bodies_b = {"1000": "FUN_00009999();"}  # 3000 absent -> an import/PLT stub
-    assert sm.pair_reading(bodies_a, bodies_b, "1000", "1000") == (
+    bodies_a = {"1000": _body("FUN_00001000();"), "2000": _body(None)}  # 2000 present but empty
+    bodies_b = {"1000": _body("FUN_00009999();")}  # 3000 absent -> an import/PLT stub
+    assert sm.pair_reading(bodies_a, bodies_b, "1000", "1000", None, None) == (
         True,
         None,
+        (),
     )  # addresses only moved
-    assert sm.pair_reading(bodies_a, bodies_b, "2000", "1000") == (None, sm.UNAVAILABLE)  # a empty
-    assert sm.pair_reading(bodies_a, bodies_b, "1000", "3000") == (None, sm.NO_BODY)  # b absent
-    assert sm.pair_reading(None, bodies_b, "1000", "1000") == (
+    assert sm.pair_reading(bodies_a, bodies_b, "2000", "1000", None, None) == (
         None,
         sm.UNAVAILABLE,
+        (),
+    )  # a empty
+    assert sm.pair_reading(bodies_a, bodies_b, "1000", "3000", None, None) == (
+        None,
+        sm.NO_BODY,
+        (),
+    )  # b absent
+    assert sm.pair_reading(None, bodies_b, "1000", "1000", None, None) == (
+        None,
+        sm.UNAVAILABLE,
+        (),
     )  # a db unreadable
 
 
@@ -110,19 +133,19 @@ def test_sameness_state_keeps_unverified_apart_and_prefers_a_changed_callee_set(
     """MUTATION: fold callee_state 'undetermined' into 'equal' (-> identical) or treat it as
     'differs' -> RED; drop the 'differs callee wins over no body' rule -> the last two lines go
     RED."""
-    assert sm.sameness_state(True, "equal", None) == sm.IDENTICAL
-    assert sm.sameness_state(True, "undetermined", None) == sm.IDENTICAL_CALLEE_UNVERIFIED
+    assert sm.sameness_state(True, "equal", None, ()) == sm.IDENTICAL
+    assert sm.sameness_state(True, "undetermined", None, ()) == sm.IDENTICAL_CALLEE_UNVERIFIED
     assert (
-        sm.sameness_state(True, "differs", None) == sm.DIFFERS
+        sm.sameness_state(True, "differs", None, ()) == sm.DIFFERS
     )  # text matched, a FUN_ call changed
-    assert sm.sameness_state(False, "equal", None) == sm.DIFFERS  # the text itself differs
+    assert sm.sameness_state(False, "equal", None, ()) == sm.DIFFERS  # the text itself differs
     assert (
-        sm.sameness_state(None, "equal", sm.NO_BODY) == sm.NO_BODY
+        sm.sameness_state(None, "equal", sm.NO_BODY, ()) == sm.NO_BODY
     )  # no body, nothing proves change
-    assert sm.sameness_state(None, "undetermined", sm.UNAVAILABLE) == sm.UNAVAILABLE
+    assert sm.sameness_state(None, "undetermined", sm.UNAVAILABLE, ()) == sm.UNAVAILABLE
     # No body to read, but the callee sets differ -> that alone is proof of change.
-    assert sm.sameness_state(None, "differs", sm.NO_BODY) == sm.DIFFERS
-    assert sm.sameness_state(None, "differs", sm.UNAVAILABLE) == sm.DIFFERS
+    assert sm.sameness_state(None, "differs", sm.NO_BODY, ()) == sm.DIFFERS
+    assert sm.sameness_state(None, "differs", sm.UNAVAILABLE, ()) == sm.DIFFERS
 
 
 # ── the length-constant signals ──────────────────────────────────────────────────────────────
@@ -168,3 +191,230 @@ def test_kind_shift_reports_a_changed_kind_both_sides_present() -> None:
     assert sm.kind_shift("const", "const") is None  # same kind
     assert sm.kind_shift("const", None) is None  # b has no size axis
     assert sm.kind_shift(None, "const") is None  # a has no size axis
+
+
+# ── N1: the try/catch annotation's addresses ─────────────────────────────────────────────────
+
+
+def test_a_try_annotation_address_is_blanked_and_no_other_bare_hex() -> None:
+    """T12. The try/catch annotation names code addresses that move with the code; any other
+    comment (a WARNING) keeps its bare hex, and a small constant always stays put. "entry from" in
+    a string or comment is not "try from".
+
+    MUTATION: drop the ``try from`` restriction (blank bare hex in every comment) -> the WARNING
+    pair reads equal -> RED."""
+    a = "/* try { // try from 00406208 to 0040620f has its CatchHandler @ 00406d84 */\nfoo();"
+    b = "/* try { // try from 00407308 to 0040730f has its CatchHandler @ 00407e84 */\nfoo();"
+    assert sm.literal_reading(a, b, None, None) == (True, False)
+    wa = "/* WARNING: Unknown calling convention at 00406208 */\nfoo();"
+    wb = "/* WARNING: Unknown calling convention at 00407308 */\nfoo();"
+    assert sm.literal_reading(wa, wb, None, None)[0] is False
+    ea = "/* delete an entry from 00406208 */\nfoo();"
+    eb = "/* delete an entry from 00407308 */\nfoo();"
+    assert sm.literal_reading(ea, eb, None, None)[0] is False
+    assert sm.literal_reading("x = 0x60;", "x = 0x64;", None, None)[0] is False
+
+
+# ── N0: a large literal, position by position ───────────────────────────────────────────────
+
+
+def test_a_large_literal_is_an_address_only_when_both_values_lie_in_their_images() -> None:
+    """T13. A value the same on both sides is never looked up; a value that changed reads as a
+    moved address only when each side's value lies in that side's image; a large constant that
+    changed outside the image is a difference.
+
+    MUTATION: blank each side by its own image (the old one-side-at-a-time rule) -> the unchanged
+    0x100000 outside A's image stays raw on A and is blanked on B -> RED."""
+    image_a = [(0x400000, 0x500000)]
+    image_b = [(0x100000, 0x200000), (0x400000, 0x500000)]
+    same = "p = 0x100000;"
+    assert sm.literal_reading(same, same, image_a, image_b) == (True, False)
+    big_a, big_b = "if (n < 0x7fffffff) {}", "if (n < 0xffffffff) {}"
+    assert sm.literal_reading(big_a, big_b, image_a, image_b) == (False, False)
+    moved_a, moved_b = "p = (char *)0x412340;", "p = (char *)0x412560;"
+    assert sm.literal_reading(moved_a, moved_b, image_a, image_b) == (True, False)
+    assert sm.literal_reading("f(0x412340);", "f(0x412340, 0x412340);", image_a, image_b) == (
+        False,
+        False,
+    )
+
+
+def test_a_moved_literal_read_on_an_unknown_image_is_named_not_trusted() -> None:
+    """T13b. A changed value read as an address only because a side's image is unknown makes the
+    match ``literal_basis_unknown`` (identical_text_unverified); a value the same on both sides
+    needs no image and adds nothing.
+
+    MUTATION: mark ``relied`` whenever an image is unknown, whatever the values -> the unchanged
+    literal is flagged -> RED."""
+    image = [(0x400000, 0x500000)]
+    a, b = "p = (char *)0x412340;", "p = (char *)0x412560;"
+    assert sm.literal_reading(a, b, None, image) == (True, True)
+    assert sm.literal_reading(a, a, None, image) == (True, False)
+    bodies_a, bodies_b = {"1000": _body(a)}, {"2000": _body(b)}
+    matches, reason, reasons = sm.pair_reading(bodies_a, bodies_b, "1000", "2000", None, image)
+    assert (matches, reason, reasons) == (True, None, (sm.LITERAL_BASIS_UNKNOWN,))
+    assert sm.sameness_state(matches, "equal", reason, reasons) == sm.IDENTICAL_TEXT_UNVERIFIED
+    same = sm.pair_reading({"1000": _body(a)}, {"2000": _body(a)}, "1000", "2000", None, image)
+    assert same == (True, None, ())
+
+
+# ── W: the decompiler's own "incomplete" notes ───────────────────────────────────────────────
+
+
+def _reasons(text: str) -> tuple[str, ...]:
+    return sm.pair_reading({"1": _body(text)}, {"2": _body(text)}, "1", "2", None, None)[2]
+
+
+def test_a_text_match_the_decompiler_marked_incomplete_is_not_identical() -> None:
+    """T14. Either jumptable note makes an otherwise equal text identical_text_unverified.
+
+    MUTATION: match ``jumptable`` on "Could not recover jumptable" alone -> the second note is
+    missed -> RED."""
+    first = "/* WARNING: Could not recover jumptable at 0x0040b668. Too many branches */\nf();"
+    second = "/* WARNING: Could not find normalized switch variable to match jumptable */\nf();"
+    for text in (first, second):
+        reasons = _reasons(text)
+        assert reasons == ("decompile_incomplete:jumptable",), text
+        assert sm.sameness_state(True, "equal", None, reasons) == sm.IDENTICAL_TEXT_UNVERIFIED
+
+
+def test_the_three_later_markers_match_their_raw_text() -> None:
+    """T14b. ``Switch with N destination removed`` carries a number, so it is a pattern, not a
+    fixed string; the other two later markers match as written.
+
+    MUTATION: write switch_destination_removed as the fixed text "Switch with destination
+    removed" -> the numbered note is missed -> RED."""
+    cases = {
+        "/* WARNING: Switch with 3 destination removed at 0x1234 */": "switch_destination_removed",
+        "/* WARNING: Ignoring partial resolution of indirect */": "indirect_partially_resolved",
+        "/* WARNING: Exceeded maximum restarts with more pending */": (
+            "decompile_restarts_exceeded"
+        ),
+    }
+    for text, tag in cases.items():
+        assert _reasons(text + "\nf();") == (f"decompile_incomplete:{tag}",), text
+    assert _reasons("/* WARNING: Load size is inaccurate */\nf();") == ()  # not a hiding marker
+
+
+# ── S: the two body byte counts ──────────────────────────────────────────────────────────────
+
+
+def test_two_byte_counts_that_differ_qualify_a_text_match_and_mark_the_structure() -> None:
+    """T15 / T16. Equal texts over byte counts that differ: body_size_differs, and hidden_region
+    says structure_differs. Equal counts with a W marker: hidden_region says unknown — never
+    identical.
+
+    MUTATION: look at the byte counts only when a W marker hit -> the first pair reads identical
+    -> RED; read equal counts as an unchanged body (``identical``) -> RED."""
+    a, b = _body("f();", size=1064), _body("f();", size=1060)
+    matches, _, reasons = sm.pair_reading({"1": a}, {"2": b}, "1", "2", None, None)
+    assert matches is True and reasons == (sm.BODY_SIZE_DIFFERS,)
+    assert sm.sameness_state(True, "equal", None, reasons) == sm.IDENTICAL_TEXT_UNVERIFIED
+    region = sm.hidden_region(a, b, reasons, similarity=0.949, instructions=264)
+    assert region is not None
+    assert region["body"] == "structure_differs" and region["markers"] == []
+    assert region["size_bytes"] == {"a": 1064, "b": 1060}
+    w = "/* WARNING: Treating indirect jump as call */\nf();"
+    wa, wb = _body(w, size=40), _body(w, size=40)
+    w_reasons = sm.pair_reading({"1": wa}, {"2": wb}, "1", "2", None, None)[2]
+    w_region = sm.hidden_region(wa, wb, w_reasons, similarity=1.0, instructions=10)
+    assert w_region is not None and w_region["body"] == "unknown"
+
+
+def test_a_byte_count_missing_on_one_side_adds_nothing() -> None:
+    """T15b. A side with no recorded byte count proves nothing about the size: no reason, and the
+    match stays identical when nothing else qualifies it.
+
+    MUTATION: read a missing count as unequal -> body_size_differs -> RED."""
+    a, b = _body("f();", size=1064), _body("f();", size=None)
+    matches, reason, reasons = sm.pair_reading({"1": a}, {"2": b}, "1", "2", None, None)
+    assert reasons == ()
+    assert sm.sameness_state(matches, "equal", reason, reasons) == sm.IDENTICAL
+    assert sm.hidden_region(a, b, reasons, similarity=1.0, instructions=1) is None
+
+
+def test_a_marker_address_is_placed_in_or_out_of_its_own_closed_body_ranges() -> None:
+    """T17. Ghidra's body range includes its max: an address equal to ``hi`` is inside. A marker
+    naming no address is null.
+
+    MUTATION: read the ranges half-open -> the ``hi`` marker reads outside -> RED; return true
+    for every marker -> the outside one reads inside -> RED."""
+    text = (
+        "/* WARNING: Removing unreachable block (ram,0x00001010) */\n"
+        "/* WARNING: Removing unreachable block (ram,0x00002000) */\n"
+        "/* WARNING: Removing unreachable block (ram,0x000010ff) */\n"
+        "/* WARNING: Treating indirect jump as call */\nf();"
+    )
+    a = _body(text, size=256, ranges=[[0x1000, 0x10FF]])
+    reasons = sm.pair_reading({"1": a}, {"2": a}, "1", "2", None, None)[2]
+    region = sm.hidden_region(a, a, reasons, similarity=1.0, instructions=64)
+    assert region is not None
+    on_a = [(m["tag"], m["addr"], m["in_own_body"]) for m in region["markers"] if m["side"] == "a"]
+    assert on_a == [
+        ("unreachable_block_removed", "0x00001010", True),
+        ("unreachable_block_removed", "0x00002000", False),
+        ("unreachable_block_removed", "0x000010ff", True),
+        ("indirect_jump_as_call", None, None),
+    ]
+
+
+def test_an_empty_body_on_both_sides_is_unavailable_never_identical() -> None:
+    """T28 (n1). A row whose pseudocode is empty is in the table (so not no_body) but has nothing to
+    compare; two of them must not compare equal.
+
+    MUTATION: test the body dict's truth instead of its ``pseudocode`` (a dict is always true) ->
+    two empty bodies compare as identical -> RED."""
+    bodies_a, bodies_b = {"1": _body(None, size=8)}, {"2": _body(None, size=8)}
+    assert sm.pair_reading(bodies_a, bodies_b, "1", "2", None, None) == (None, sm.UNAVAILABLE, ())
+    assert sm.sameness_state(None, "equal", sm.UNAVAILABLE, ()) == sm.UNAVAILABLE
+
+
+# ── pseudocode_delta: the lexical shape of a difference ──────────────────────────────────────
+
+
+def test_a_size_only_change_is_a_number_substitution() -> None:
+    """T20. A buffer whose size moved reads as a substitution of numbers and nothing else, and the
+    pair still differs.
+
+    MUTATION: normalise small constants away -> the texts compare equal -> RED."""
+    a = "void f(void)\n{\n  char buf[0x60];\n  memcpy(buf,src,0x60);\n}"
+    b = "void f(void)\n{\n  char buf[0x64];\n  memcpy(buf,src,0x64);\n}"
+    assert sm.literal_reading(a, b, None, None)[0] is False
+    delta = sm.pseudocode_delta(a, b, None, None)
+    assert delta["kind"] == "substitution_only" and delta["structural_spans"] == 0
+    assert delta["substitutions"] == {
+        "number": {"total": 2, "first": [["0x60", "0x64"], ["0x60", "0x64"]]}
+    }
+    assert delta["calls"] == {}
+
+
+def test_dropped_calls_are_counted_by_name() -> None:
+    """T21. Three calls cut to one is structural, and the call counts say which callee moved.
+
+    MUTATION: count calls as a set -> both sides read 1 -> the callee is not listed -> RED."""
+    a = 'void f(void)\n{\n  system("a");\n  system("b");\n  system("c");\n}'
+    b = 'void f(void)\n{\n  system("a");\n}'
+    delta = sm.pseudocode_delta(a, b, None, None)
+    assert delta["kind"] == "structural" and delta["structural_spans"] >= 1
+    assert delta["calls"] == {"system": {"a": 3, "b": 1}}
+
+
+def test_a_spacing_only_difference_is_layout_and_still_differs() -> None:
+    """T22. Only the spacing differs: the token streams agree (layout_only), yet the texts are not
+    the same and the pair is never read as identical.
+
+    MUTATION: strip whitespace before the text comparison -> the pair reads identical -> RED."""
+    a = "void f(void)\n{\n  x = y + 1;\n}"
+    b = "void f(void)\n{\n  x  =  y+1;\n\n}"
+    assert sm.literal_reading(a, b, None, None)[0] is False
+    assert sm.pseudocode_delta(a, b, None, None)["kind"] == "layout_only"
+
+
+def test_a_delta_over_the_line_cap_is_not_computed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """T23. Above the cap the delta says so and does not run (or raise).
+
+    MUTATION: drop the cap branch -> a delta is computed -> RED."""
+    monkeypatch.setattr(sm, "DELTA_LINE_CAP", 3)
+    a = "\n".join(f"x{i} = {i};" for i in range(5))
+    b = "\n".join(f"x{i} = {i + 1};" for i in range(5))
+    assert sm.pseudocode_delta(a, b, None, None) == {"kind": "not_computed", "reason": "too_large"}

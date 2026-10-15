@@ -1366,6 +1366,7 @@ def test_the_cli_prints_each_binarys_function_split_and_the_pairs_coverage(
     byte-identical in both runs kept apart (a pointer to the scan map, never a blind spot).
 
     MUTATION: print the edge counts as before -> RED; print counts for the failed diff -> RED;
+    drop the undetermined pairs' proposed readings from the line -> RED;
     treat identical binaries as not covered -> RED."""
     from treasure_map.cli.main import main
     from treasure_map.lib.query import diff_align, patch_view
@@ -1376,9 +1377,24 @@ def test_the_cli_prints_each_binarys_function_split_and_the_pairs_coverage(
             "aligned": 9,
             "unchanged": 5,
             "changed": {"total": 3, "with_scoped_sink_delta": 1, "no_scoped_signal": 2},
-            "unverified": {"total": 1, "identical_callee_unverified": 1, "unavailable": 0},
+            "unverified": {
+                "total": 1,
+                "identical_text_unverified": 0,
+                "identical_callee_unverified": 1,
+                "unavailable": 0,
+            },
+            "identical_text_unverified_by_body": {"structure_differs": 0, "unknown": 0},
             "no_body": 0,
             "alignment_undetermined": 2,
+            "alignment_undetermined_reading": {
+                "identical_unique": 1,
+                "identical_not_unique": 0,
+                "identical_callee_unverified": 0,
+                "identical_text_unverified": 0,
+                "differs": 1,
+                "no_body": 0,
+                "unavailable": 0,
+            },
             "one_sided": {"b": {"unmatched_analysis_complete": 4}},
         },
         _did("libb"): {"withheld": True, "banners": ["diff_undetermined:diff_failed"]},
@@ -1411,8 +1427,8 @@ def test_the_cli_prints_each_binarys_function_split_and_the_pairs_coverage(
     assert res.exit_code == 0, res.output
     assert (
         "liba: 9 aligned: 5 unchanged, 3 changed (1 with a scoped sink delta, 2 no scoped "
-        "signal), 1 unverified, 0 no body; 2 alignment undetermined; no counterpart — B 4 "
-        "unmatched_analysis_complete" in res.output
+        "signal), 1 unverified, 0 no body; 2 alignment undetermined (read: 1 identical_unique, "
+        "1 differs); no counterpart — B 4 unmatched_analysis_complete" in res.output
     )
     assert "libb: BLIND SPOT (did not diff)" in res.output
     assert "edges changed" not in res.output and "noise" not in res.output
@@ -1427,9 +1443,24 @@ _STATES = {
     "aligned": 9,
     "unchanged": 5,
     "changed": {"total": 3, "with_scoped_sink_delta": 1, "no_scoped_signal": 2},
-    "unverified": {"total": 1, "identical_callee_unverified": 1, "unavailable": 0},
+    "unverified": {
+        "total": 1,
+        "identical_text_unverified": 0,
+        "identical_callee_unverified": 1,
+        "unavailable": 0,
+    },
+    "identical_text_unverified_by_body": {"structure_differs": 0, "unknown": 0},
     "no_body": 0,
     "alignment_undetermined": 2,
+    "alignment_undetermined_reading": {
+        "identical_unique": 2,
+        "identical_not_unique": 0,
+        "identical_callee_unverified": 0,
+        "identical_text_unverified": 0,
+        "differs": 0,
+        "no_body": 0,
+        "unavailable": 0,
+    },
     "one_sided": {},
 }
 

@@ -1,43 +1,70 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""Signals a BinDiff similarity score cannot carry: whether two aligned functions are really the
+"""Signals a BinDiff similarity score cannot carry: whether two paired functions are really the
 same, and whether a sink call's length constant changed.
 
 similarity is blind to immediates, constants and buffer sizes: a pair can read ``similarity=1.0``
-while a bound was tightened or loosened. This module holds the two facts the function patch view
+while a bound was tightened or loosened. This module holds the facts the function patch view
 (lib/query/patch_view) adds to close that gap, and NOTHING that judges them — direction and meaning
 are the reader's:
 
   * ``pseudocode_sameness`` — an honest reading of an aligned pair, folding an address-normalised
     pseudocode comparison together with the callee-set state the view already computed.
-    ``identical`` only when both agree; a pseudocode match whose callees could not be verified is
-    ``identical_callee_unverified``, never folded into "unchanged" or "changed". A changed callee
-    set is ``differs`` even when there is no body to read. When there is no body, the reason is
-    carried, not swallowed: ``no_body`` (an import / PLT stub absent from the functions table) is
-    kept apart from ``unavailable`` (a function in the table whose pseudocode is empty), so a
-    reader need not recompute which it was.
+    ``identical`` only when the text matches with nothing left unverified AND the callees agree. A
+    text match that rests on something this reading cannot check is ``identical_text_unverified``
+    with its ``text_reasons``: a literal read as an address only because a side's image extent is
+    unknown (``literal_basis_unknown``), a decompile the decompiler itself marked incomplete
+    (``decompile_incomplete:<tag>``), or two bodies whose byte counts differ
+    (``body_size_differs``). A text match whose callees could not be verified is
+    ``identical_callee_unverified``. Neither is ever folded into "unchanged" or "changed". A changed
+    callee set is ``differs`` even when there is no body to read. When there is no body, the reason
+    is carried, not swallowed: ``no_body`` (an import / PLT stub absent from the functions table) is
+    kept apart from ``unavailable`` (a function in the table whose pseudocode is empty), so a reader
+    need not recompute which it was.
+  * the same reading of an UNDETERMINED pair (``undetermined_pair_state``), as a proposal beside it,
+    never a pairing: its seven states add whether the body is unique on both sides, since a body
+    that occurs twice could have been paired with the wrong twin.
+  * ``hidden_region`` — the facts behind a text match that may hide code (the decompiler's own
+    warnings, with the address each names and whether it lies in the function's own body, and the
+    two body byte counts). Facts only: ``body`` is ``structure_differs`` when the byte counts
+    differ and ``unknown`` otherwise, never ``identical``.
+  * ``pseudocode_delta`` — the lexical shape of a text difference (substitutions only, structural,
+    layout only), and the calls whose counts differ. A shape, not a verdict.
   * the length-constant signals on a persisted candidate's two sides: ``const_delta`` when the same
     constant size kind holds a different value (0x40 -> 0x3f, and an off-by-one like 256 -> 255),
     and ``kind_shift`` when the size kind itself changed (const -> cap_const, const -> untraced). A
     kind change is never read as a value delta.
 
-The address normalisation is defined once here (``normalize_pseudocode``) so the "small constants
-stay put" rule has a single home: absolute addresses and the hex suffixes of Ghidra's synthetic
-symbol names are blanked, numeric constants are not — else a changed buffer size would normalise
-away and the whole point would be lost.
+The address normalisation is defined once here (``skeleton`` + ``literal_reading``) so the "small
+constants stay put" rule has a single home: synthetic-symbol address suffixes and the addresses in
+a try/catch annotation are blanked; a large hex literal is compared position by position and read
+as an address only when the two values differ AND each lies in its own side's image; small numeric
+constants are never touched — else a changed buffer size would normalise away and the whole point
+would be lost.
+
+BOUNDARIES: a constant whose two values differ but both happen to lie inside their images is still
+read as an address (telling them apart needs data flow); the target a ``DAT_`` / ``PTR_`` name
+refers to is not checked once its address is blanked (a string label keeps its content in the name,
+so a changed string stays visible).
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import sqlite3
+from difflib import SequenceMatcher
 from typing import Any
 
 from treasure_map.lib.diff.layer0 import norm_hex
 
-# ── the four states of an aligned pair ───────────────────────────────────────────────────────
+# ── the six states of an aligned pair ────────────────────────────────────────────────────────
 
-IDENTICAL = "identical"  # pseudocode matches and the callee sets are equal: really unchanged
+IDENTICAL = "identical"  # text matches with nothing unverified, callee sets equal: really unchanged
+IDENTICAL_TEXT_UNVERIFIED = (
+    "identical_text_unverified"  # text matches, but the match rests on something unchecked
+)
 IDENTICAL_CALLEE_UNVERIFIED = (
     "identical_callee_unverified"  # pseudocode matches, callees unverified
 )
@@ -48,12 +75,50 @@ UNAVAILABLE = "unavailable"  # a side IS in the table but its pseudocode is empt
 # The not_listed count name for each state (aligned, similarity-1 pairs that place no entry).
 NOT_LISTED_NAME = {
     IDENTICAL: "aligned_pseudocode_identical",
+    IDENTICAL_TEXT_UNVERIFIED: "aligned_pseudocode_identical_text_unverified",
     IDENTICAL_CALLEE_UNVERIFIED: "aligned_pseudocode_identical_callee_unverified",
     DIFFERS: "aligned_pseudocode_differs",
     NO_BODY: "aligned_pseudocode_no_body",
     UNAVAILABLE: "aligned_pseudocode_unavailable",
 }
 STATE_BY_NOT_LISTED_NAME = {name: state for state, name in NOT_LISTED_NAME.items()}
+
+# ── the seven states of an undetermined pair's proposed reading ─────────────────────────────
+
+U_IDENTICAL_UNIQUE = "identical_unique"
+U_IDENTICAL_NOT_UNIQUE = "identical_not_unique"
+U_IDENTICAL_CALLEE_UNVERIFIED = "identical_callee_unverified"
+U_IDENTICAL_TEXT_UNVERIFIED = "identical_text_unverified"
+U_DIFFERS = "differs"
+U_NO_BODY = "no_body"
+U_UNAVAILABLE = "unavailable"
+U_STATES = (
+    U_IDENTICAL_UNIQUE,
+    U_IDENTICAL_NOT_UNIQUE,
+    U_IDENTICAL_CALLEE_UNVERIFIED,
+    U_IDENTICAL_TEXT_UNVERIFIED,
+    U_DIFFERS,
+    U_NO_BODY,
+    U_UNAVAILABLE,
+)
+
+# ── why a text match is not "identical" (text_reasons) ──────────────────────────────────────
+
+LITERAL_BASIS_UNKNOWN = "literal_basis_unknown"
+DECOMPILE_INCOMPLETE = "decompile_incomplete"  # written decompile_incomplete:<tag>
+BODY_SIZE_DIFFERS = "body_size_differs"
+
+# hidden_region.body: the two byte counts differ, or nothing can be said. Never "identical": equal
+# byte counts do not show an unchanged body.
+BODY_STRUCTURE_DIFFERS = "structure_differs"
+BODY_UNKNOWN = "unknown"
+BODY_CLASSES = (BODY_STRUCTURE_DIFFERS, BODY_UNKNOWN)
+
+# A side's function bodies: entry (normalised hex) -> {"pseudocode", "size_bytes", "body_ranges"}.
+Body = dict[str, Any]
+Bodies = dict[str, Body]
+# Half-open [lo, hi) extents of a binary's memory blocks (data_blocks), or None when unknown.
+ImageRanges = list[tuple[int, int]] | None
 
 # ── address normalisation (single definition) ────────────────────────────────────────────────
 
@@ -81,18 +146,157 @@ _ADDR_SUFFIX = re.compile(
     r"|(?<=\bswitchD)_[0-9a-fA-F]{8}(?=_)"  # switchD_<addr>_caseD_n / switchD_<addr>_default
     r"|(?<=\bLAB)_[0-9a-fA-F]{8}(?=_)"  # LAB_<addr>_<n>
 )
-# A bare absolute address / GOT offset literal, same six-digit floor.
-_ABS_HEX = re.compile(r"\b0x[0-9a-fA-F]{6,}\b")
+# A large hex literal (an absolute address, a GOT offset — or a large constant), same six-digit
+# floor. Never blanked outright: literal_reading compares the values position by position.
+_HEX6 = re.compile(r"\b0x[0-9a-fA-F]{6,}\b")
+# Ghidra's try/catch annotation (``/* try { // try from 00406208 to 0040620f has its CatchHandler @
+# 00406d84 */``) names code addresses as bare hex, which move whenever the code before them does.
+# Only a comment holding ``try from`` is touched; every other comment and bare hex in the body is
+# left as it is.
+_TRY_COMMENT = re.compile(r"/\*[^*]*?\btry from\b.*?\*/", re.S)
+_BARE_HEX = re.compile(r"\b[0-9a-fA-F]{6,}\b")
 
 
-def normalize_pseudocode(text: str) -> str:
-    """``text`` with absolute addresses and synthetic-symbol address suffixes blanked, numeric
-    constants left exactly as they are."""
+def _blank_try_comment(text: str) -> str:
+    return _TRY_COMMENT.sub(lambda m: _BARE_HEX.sub("@", m.group(0)), text)
+
+
+def skeleton(text: str) -> tuple[str, list[int]]:
+    """``(skeleton, literals)``: ``text`` with the try/catch annotation's addresses and the
+    synthetic-symbol address suffixes blanked and every large hex literal replaced by ``0x#``, and
+    those literals' values in the order they occur. Small numeric constants stay exactly as they
+    are."""
+    text = _blank_try_comment(text)
     text = _ADDR_SUFFIX.sub("_@", text)
-    return _ABS_HEX.sub("0x@", text)
+    values: list[int] = []
+
+    def one(m: re.Match[str]) -> str:
+        values.append(int(m.group(0), 16))
+        return "0x#"
+
+    return _HEX6.sub(one, text), values
 
 
-def _body_status(bodies: dict[str, str | None] | None, addr: str) -> str:
+def skeleton_key(text: str) -> str:
+    """A body's identity for counting where else it occurs: the hash of its skeleton TEXT alone
+    (the large literals' values are left out, so a body whose addresses moved keeps its key)."""
+    return hashlib.sha256(skeleton(text)[0].encode()).hexdigest()
+
+
+def _hex_int(text: object) -> int | None:
+    """An address string read as HEX, bare or ``0x``-prefixed (as lib/facts reads one); None when it
+    is not one."""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    try:
+        return int(text.strip().lower().removeprefix("0x"), 16)
+    except ValueError:
+        return None
+
+
+def _in_image(value: int, ranges: ImageRanges) -> bool:
+    """Whether ``value`` lies in one of a side's half-open block extents; True when the extents are
+    unknown (the caller records that it relied on that)."""
+    return ranges is None or any(lo <= value < hi for lo, hi in ranges)
+
+
+def literal_reading(
+    a: str, b: str, ranges_a: ImageRanges, ranges_b: ImageRanges
+) -> tuple[bool, bool]:
+    """``(equal, relied_on_unknown_basis)`` of two bodies. Equal only when the skeletons match, the
+    literal counts match, and at every position the two values are the same — or differ with each
+    value inside its own side's image, i.e. an address that moved. A value the same on both sides
+    is never looked up (an unchanged constant is not an address question). ``relied`` is True when
+    a position was read as an address only because a side's image is unknown."""
+    sa, va = skeleton(a)
+    sb, vb = skeleton(b)
+    if sa != sb or len(va) != len(vb):
+        return (False, False)
+    relied = False
+    for x, y in zip(va, vb, strict=True):
+        if x == y:
+            continue
+        if not (_in_image(x, ranges_a) and _in_image(y, ranges_b)):
+            return (False, False)
+        if ranges_a is None or ranges_b is None:
+            relied = True
+    return (True, relied)
+
+
+# ── decompile-incomplete markers (W) ─────────────────────────────────────────────────────────
+
+# The decompiler's own notes that what it printed is not the whole function. Matched on the raw
+# text (before any normalisation); a hit on either side keeps a text match from reading
+# ``identical``. Not listed, measured not to hide code: "Heritage AFTER dead removal", "Load size is
+# inaccurate", "Do nothing block with infinite loop".
+W_MARKERS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "jumptable",
+        re.compile(r"Could not recover jumptable|Could not find normalized switch variable"),
+    ),
+    ("bad_instruction", re.compile(r"Bad instruction - Truncating control flow here")),
+    (
+        "bad_instruction_data",
+        re.compile(r"Control flow encountered bad instruction data|halt_baddata\("),
+    ),
+    ("unreachable_block_removed", re.compile(r"Removing unreachable block")),
+    ("indirect_jump_as_call", re.compile(r"Treating indirect jump as call")),
+    ("switch_destination_removed", re.compile(r"Switch with \d+ destination removed")),
+    ("indirect_partially_resolved", re.compile(r"Ignoring partial resolution of indirect")),
+    ("decompile_restarts_exceeded", re.compile(r"Exceeded maximum restarts")),
+)
+_MARKER_ADDR = re.compile(r"0x[0-9a-fA-F]+")
+
+
+def _markers(text: str) -> list[tuple[int, str, str | None]]:
+    """``(position, tag, address)`` of every W marker in one raw body, in text order. The address is
+    the first ``0x`` literal after the marker on its own line, inside its comment
+    (``... jumptable at 0x0040b668`` / ``block (ram,0x0040ccb0)``); None when it names none."""
+    out: list[tuple[int, str, str | None]] = []
+    for tag, pattern in W_MARKERS:
+        for m in pattern.finditer(text):
+            end = len(text)
+            for stop in ("\n", "*/"):
+                i = text.find(stop, m.end())
+                if i != -1:
+                    end = min(end, i)
+            found = _MARKER_ADDR.search(text, m.end(), end)
+            out.append((m.start(), tag, found.group(0).lower() if found else None))
+    return sorted(out)
+
+
+def incomplete_tags(a: str, b: str) -> list[str]:
+    """The W tags found in either raw body, in W_MARKERS order."""
+    return [tag for tag, pattern in W_MARKERS if pattern.search(a) or pattern.search(b)]
+
+
+# ── a body's byte count and extents ──────────────────────────────────────────────────────────
+
+
+def _size(body: Body) -> int | None:
+    value = body.get("size_bytes")
+    return value if isinstance(value, int) else None
+
+
+def body_key(size_a: int | None, size_b: int | None) -> str:
+    """hidden_region.body: ``structure_differs`` when both byte counts are known and differ, else
+    ``unknown`` — never ``identical`` (equal counts do not show an unchanged body)."""
+    if size_a is not None and size_b is not None and size_a != size_b:
+        return BODY_STRUCTURE_DIFFERS
+    return BODY_UNKNOWN
+
+
+def _in_own_body(addr: str | None, ranges: list[list[int]]) -> bool | None:
+    """Whether a marker's address lies in the function's own body (CLOSED ranges: Ghidra's
+    AddressRange includes its max). None when the marker names no address or the body records no
+    ranges."""
+    n = _hex_int(addr)
+    if n is None or not ranges:
+        return None
+    return any(lo <= n <= hi for lo, hi in ranges)
+
+
+def _body_status(bodies: Bodies | None, addr: str) -> str:
     """One side's body status at ``addr``: ``ok`` (there is pseudocode to compare), ``no_body`` (the
     function is absent from the table — an import / PLT stub), or ``unavailable`` (in the table but
     its pseudocode is empty, or the analysis.db could not be read)."""
@@ -100,38 +304,60 @@ def _body_status(bodies: dict[str, str | None] | None, addr: str) -> str:
         return UNAVAILABLE
     if addr not in bodies:
         return NO_BODY
-    return "ok" if bodies[addr] else UNAVAILABLE
+    return "ok" if (bodies[addr] or {}).get("pseudocode") else UNAVAILABLE
 
 
 def pair_reading(
-    a_bodies: dict[str, str | None] | None,
-    b_bodies: dict[str, str | None] | None,
+    a_bodies: Bodies | None,
+    b_bodies: Bodies | None,
     addr_a: str,
     addr_b: str,
-) -> tuple[bool | None, str | None]:
-    """``(matches, reason)`` for one aligned pair: ``matches`` True / False (reason None) when both
-    sides have a body to compare after normalisation; else ``matches`` None with the reason a reader
-    would otherwise have to recompute — ``no_body`` when a side is an import / PLT stub, else
-    ``unavailable`` (``no_body`` wins when both apply, so a stub pair is named as one)."""
+    ranges_a: ImageRanges,
+    ranges_b: ImageRanges,
+) -> tuple[bool | None, str | None, tuple[str, ...]]:
+    """``(matches, reason, text_reasons)`` for one pair: ``matches`` True / False (reason None) when
+    both sides have a body to compare; else ``matches`` None with the reason a reader would
+    otherwise have to recompute — ``no_body`` when a side is an import / PLT stub, else
+    ``unavailable`` (``no_body`` wins when both apply, so a stub pair is named as one).
+
+    ``text_reasons`` qualify a MATCH (empty otherwise — a text that differs is a difference, and a
+    warning does not change that): ``literal_basis_unknown``, ``decompile_incomplete:<tag>`` for
+    each W tag on either side, and ``body_size_differs`` when both byte counts are known and
+    differ (a count missing on a side adds nothing and infers nothing)."""
     sa, sb = _body_status(a_bodies, addr_a), _body_status(b_bodies, addr_b)
-    if sa == "ok" and sb == "ok":
-        pa, pb = (a_bodies or {})[addr_a], (b_bodies or {})[addr_b]
-        return (normalize_pseudocode(pa or "") == normalize_pseudocode(pb or ""), None)
-    return (None, NO_BODY if NO_BODY in (sa, sb) else UNAVAILABLE)
+    if sa != "ok" or sb != "ok":
+        return (None, NO_BODY if NO_BODY in (sa, sb) else UNAVAILABLE, ())
+    ba, bb = (a_bodies or {})[addr_a], (b_bodies or {})[addr_b]
+    pa, pb = ba.get("pseudocode") or "", bb.get("pseudocode") or ""
+    equal, relied = literal_reading(pa, pb, ranges_a, ranges_b)
+    if not equal:
+        return (False, None, ())
+    reasons: list[str] = [LITERAL_BASIS_UNKNOWN] if relied else []
+    reasons += [f"{DECOMPILE_INCOMPLETE}:{tag}" for tag in incomplete_tags(pa, pb)]
+    if body_key(_size(ba), _size(bb)) == BODY_STRUCTURE_DIFFERS:
+        reasons.append(BODY_SIZE_DIFFERS)
+    return (True, None, tuple(reasons))
 
 
-def sameness_state(matches: bool | None, callee_state: str | None, reason: str | None) -> str:
-    """Fold a pseudocode reading and the pair's callee-set state into one state. A changed callee
-    set is proof of change even with no body to read (so ``differs`` wins over a missing body); a
-    match is ``identical`` only when the callees are proven equal, else unverified — never silently
-    "unchanged". When there is no body and nothing proves a change, the reason stands as the state
-    (``no_body`` / ``unavailable``)."""
+def sameness_state(
+    matches: bool | None,
+    callee_state: str | None,
+    reason: str | None,
+    text_reasons: tuple[str, ...] | list[str],
+) -> str:
+    """Fold a pseudocode reading and the pair's callee-set state into one of the six states. A
+    changed callee set is proof of change even with no body to read (so ``differs`` wins over a
+    missing body); a match is ``identical`` only when nothing qualifies the text AND the callees
+    are proven equal, else unverified — never silently "unchanged". When there is no body and
+    nothing proves a change, the reason stands as the state (``no_body`` / ``unavailable``)."""
     if callee_state == "differs":
         return DIFFERS  # a changed call set is proof of change, even with no body to read
     if matches is None:
         return reason or UNAVAILABLE
     if not matches:
         return DIFFERS
+    if text_reasons:
+        return IDENTICAL_TEXT_UNVERIFIED
     if callee_state == "equal":
         return IDENTICAL
     return (
@@ -139,17 +365,259 @@ def sameness_state(matches: bool | None, callee_state: str | None, reason: str |
     )
 
 
-# ── reading pseudocode from a run's analysis.db ──────────────────────────────────────────────
+def undetermined_pair_state(
+    matches: bool | None,
+    callee_state: str | None,
+    reason: str | None,
+    text_reasons: tuple[str, ...] | list[str],
+    occurrences: dict[str, int] | None,
+) -> str:
+    """The proposed reading of an UNDETERMINED pair, in the order: a changed callee set, a missing
+    body, a text difference, a qualified text match, unverified callees, then uniqueness — a body
+    found more than once on either side (``occurrences``) is ``identical_not_unique``, since its
+    pairing could have taken the wrong twin; ``identical_unique`` needs exactly one on each side.
+    No occurrence count proves nothing unique."""
+    if callee_state == "differs":
+        return U_DIFFERS
+    if matches is None:
+        return U_NO_BODY if reason == NO_BODY else U_UNAVAILABLE
+    if not matches:
+        return U_DIFFERS
+    if text_reasons:
+        return U_IDENTICAL_TEXT_UNVERIFIED
+    if callee_state != "equal":
+        return U_IDENTICAL_CALLEE_UNVERIFIED
+    if occurrences is None or occurrences.get("a") != 1 or occurrences.get("b") != 1:
+        return U_IDENTICAL_NOT_UNIQUE
+    return U_IDENTICAL_UNIQUE
 
 
-def read_function_bodies(
-    analysis_db_path: str | None, sha: str | None
-) -> dict[str, str | None] | None:
-    """function entry (normalised hex) -> its pseudocode (None when the row's pseudocode is empty),
-    for one diffed binary, read in one pass from the run's own analysis.db (read-only). EVERY
-    function the table holds is a key — so a key's absence means the function is not in the table at
-    all (an import / PLT stub), told apart from a present-but-empty body. None when the db or binary
-    cannot be read."""
+def text_unverified_body(text_reasons: tuple[str, ...] | list[str]) -> str:
+    """The ``body`` class a qualified text match is filtered and counted by: ``structure_differs``
+    when its byte counts differ, else ``unknown``."""
+    return BODY_STRUCTURE_DIFFERS if BODY_SIZE_DIFFERS in text_reasons else BODY_UNKNOWN
+
+
+def hidden_region(
+    a: Body,
+    b: Body,
+    text_reasons: tuple[str, ...] | list[str],
+    *,
+    similarity: float | None,
+    instructions: int | None,
+) -> dict[str, Any] | None:
+    """The facts behind a text match that may hide code, or None when the match carries no W marker
+    and no ``body_size_differs``. Each marker with the address its warning names and whether that
+    address lies in the side's own body; ``body`` from the byte counts (never ``identical``); the
+    two byte counts, BinDiff's matched-instruction count and similarity as they are stored — no
+    flag derived from them, nothing compared; how often each text still says
+    UNRECOVERED_JUMPTABLE."""
+    hit = BODY_SIZE_DIFFERS in text_reasons or any(
+        r.startswith(f"{DECOMPILE_INCOMPLETE}:") for r in text_reasons
+    )
+    if not hit:
+        return None
+    markers: list[dict[str, Any]] = []
+    for side, body in (("a", a), ("b", b)):
+        ranges = body.get("body_ranges") or []
+        for _pos, tag, addr in _markers(body.get("pseudocode") or ""):
+            markers.append(
+                {"tag": tag, "addr": addr, "side": side, "in_own_body": _in_own_body(addr, ranges)}
+            )
+    size_a, size_b = _size(a), _size(b)
+    return {
+        "markers": markers,
+        "body": body_key(size_a, size_b),
+        "size_bytes": {"a": size_a, "b": size_b},
+        "bindiff_matched_instructions": instructions,
+        "similarity": similarity,
+        "unrecovered_jumptable_refs": {
+            "a": (a.get("pseudocode") or "").count("UNRECOVERED_JUMPTABLE"),
+            "b": (b.get("pseudocode") or "").count("UNRECOVERED_JUMPTABLE"),
+        },
+    }
+
+
+# ── the lexical shape of a text difference (pseudocode_delta) ────────────────────────────────
+
+DELTA_LINE_CAP = 20000  # lines per side above which the delta is not computed
+_DELTA_FIRST = 5  # substitution pairs shown per token kind
+
+_TOK = re.compile(
+    r"""
+   (?P<comment>/\*.*?\*/|//[^\n]*)
+  |(?P<string>"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')
+  |(?P<number>0x[0-9a-fA-F@#]+[uUlL]*|\d+[uUlL]*)
+  |(?P<ident>[A-Za-z_@#][A-Za-z0-9_@#]*)
+  |(?P<punct>->|<<=|>>=|\+\+|--|<<|>>|<=|>=|==|!=|&&|\|\||[+\-*/%&|^!~<>=]=?|[^\s])
+""",
+    re.S | re.X,
+)
+_CALL_KEYWORDS = {
+    "if",
+    "else",
+    "while",
+    "for",
+    "do",
+    "switch",
+    "case",
+    "return",
+    "goto",
+    "sizeof",
+    "break",
+    "continue",
+    "default",
+}
+
+
+def _delta_text(text: str, ranges: ImageRanges) -> str:
+    """The skeleton a delta reads: as ``skeleton``, except that a large literal outside its own
+    side's image keeps its value — a changed large constant shows as a substitution instead of
+    vanishing into ``0x#``. Unknown extents read every literal as an address, as the match does."""
+    text = _ADDR_SUFFIX.sub("_@", _blank_try_comment(text))
+    return _HEX6.sub(
+        lambda m: "0x#" if _in_image(int(m.group(0), 16), ranges) else m.group(0), text
+    )
+
+
+def _tokens(text: str) -> list[tuple[str, str]]:
+    return [(m.lastgroup or "punct", m.group(0)) for m in _TOK.finditer(text)]
+
+
+def _calls(tokens: list[tuple[str, str]]) -> dict[str, int]:
+    """Call counts by callee name, after the body's first ``{``: an identifier directly followed by
+    ``(``, keywords excluded, a name holding a blanked address counted as ``unnamed``. A call
+    through a function pointer (``(*p)(...)``) is not counted."""
+    counts: dict[str, int] = {}
+    try:
+        start = tokens.index(("punct", "{")) + 1
+    except ValueError:
+        return counts
+    for (kind, text), nxt in zip(tokens[start:], tokens[start + 1 :], strict=False):
+        if kind != "ident" or nxt != ("punct", "(") or text in _CALL_KEYWORDS:
+            continue
+        name = "unnamed" if ("@" in text or "#" in text) else text
+        counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
+def pseudocode_delta(
+    a: str, b: str, ranges_a: ImageRanges, ranges_b: ImageRanges
+) -> dict[str, Any]:
+    """The lexical shape of how two bodies' texts differ. Lines (stripped, blank lines dropped) are
+    matched first; inside each block that differs, tokens are. A same-length run of tokens each of
+    the same non-punctuation kind is a SUBSTITUTION (recorded by kind, with the first few pairs);
+    anything else is a structural span. ``kind``: ``structural`` (any structural span),
+    ``substitution_only``, or ``layout_only`` (the token streams agree — only spacing or line
+    breaks differ); ``not_computed`` (``too_large``) above DELTA_LINE_CAP lines. ``calls`` lists
+    the callees whose call counts differ. A shape, never a verdict: a number-only substitution is
+    exactly what a size fix looks like, and nothing here ranks or files it."""
+    la = [ln.strip() for ln in _delta_text(a, ranges_a).splitlines() if ln.strip()]
+    lb = [ln.strip() for ln in _delta_text(b, ranges_b).splitlines() if ln.strip()]
+    if len(la) > DELTA_LINE_CAP or len(lb) > DELTA_LINE_CAP:
+        return {"kind": "not_computed", "reason": "too_large"}
+    spans = 0
+    subs: dict[str, dict[str, Any]] = {}
+    lines = SequenceMatcher(None, la, lb, autojunk=False)
+    for op, i1, i2, j1, j2 in lines.get_opcodes():
+        if op == "equal":
+            continue
+        ta, tb = _tokens("\n".join(la[i1:i2])), _tokens("\n".join(lb[j1:j2]))
+        toks = SequenceMatcher(None, [t[1] for t in ta], [t[1] for t in tb], autojunk=False)
+        for top, k1, k2, m1, m2 in toks.get_opcodes():
+            if top == "equal":
+                continue
+            run_a, run_b = ta[k1:k2], tb[m1:m2]
+            if (
+                top == "replace"
+                and len(run_a) == len(run_b)
+                and all(x[0] == y[0] != "punct" for x, y in zip(run_a, run_b, strict=True))
+            ):
+                for x, y in zip(run_a, run_b, strict=True):
+                    entry = subs.setdefault(x[0], {"total": 0, "first": []})
+                    entry["total"] += 1
+                    if len(entry["first"]) < _DELTA_FIRST:
+                        entry["first"].append([x[1], y[1]])
+            else:
+                spans += 1
+    ca = _calls(_tokens("\n".join(la)))
+    cb = _calls(_tokens("\n".join(lb)))
+    calls = {
+        name: {"a": ca.get(name, 0), "b": cb.get(name, 0)}
+        for name in sorted(set(ca) | set(cb))
+        if ca.get(name, 0) != cb.get(name, 0)
+    }
+    kind = "structural" if spans else ("substitution_only" if subs else "layout_only")
+    return {
+        "kind": kind,
+        "structural_spans": spans,
+        "substitutions": dict(sorted(subs.items())),
+        "calls": calls,
+    }
+
+
+# ── reading a run's analysis.db ──────────────────────────────────────────────────────────────
+
+
+def _closed_ranges(raw: Any) -> list[list[int]]:
+    """``body_ranges`` (JSON ``[["0x<lo>","0x<hi>"], ...]``, closed) as integer pairs; ``[]`` when
+    absent or unreadable."""
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else None
+    except ValueError:
+        return []
+    out: list[list[int]] = []
+    for item in data if isinstance(data, list) else []:
+        if isinstance(item, list) and len(item) == 2:
+            lo, hi = _hex_int(item[0]), _hex_int(item[1])
+            if lo is not None and hi is not None:
+                out.append([lo, hi])
+    return out
+
+
+def read_function_bodies(analysis_db_path: str | None, sha: str | None) -> Bodies | None:
+    """function entry (normalised hex) -> ``{"pseudocode", "size_bytes", "body_ranges"}`` for one
+    diffed binary, read in one pass from the run's own analysis.db (read-only). EVERY function the
+    table holds is a key — so a key's absence means the function is not in the table at all (an
+    import / PLT stub), told apart from a present-but-empty body (``pseudocode`` None).
+    ``size_bytes`` is None when not recorded — the ingest writes 0 for an export that carried no
+    size, and no function body holds zero addresses; ``body_ranges`` is ``[]`` when not recorded.
+    None when the db or binary cannot be read."""
+    if not analysis_db_path or not sha:
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{analysis_db_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        found = conn.execute("SELECT id FROM binaries WHERE sha256 = ?", (sha,)).fetchone()
+        if found is None:
+            return None
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(functions)")}
+        select = "SELECT address, pseudocode"
+        select += ", size_bytes" if "size_bytes" in cols else ", NULL"
+        select += ", body_ranges" if "body_ranges" in cols else ", NULL"
+        rows = conn.execute(select + " FROM functions WHERE binary_id = ?", (found[0],)).fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+    out: Bodies = {}
+    for address, pseudocode, size, ranges in rows:
+        addr = norm_hex(address) if address else None
+        if addr is not None:
+            out[addr] = {
+                "pseudocode": pseudocode or None,
+                "size_bytes": size if isinstance(size, int) and size > 0 else None,
+                "body_ranges": _closed_ranges(ranges),
+            }
+    return out
+
+
+def read_image_ranges(analysis_db_path: str | None, sha: str | None) -> ImageRanges:
+    """The binary's memory-block extents (``data_blocks``: code and data alike), each half-open
+    ``[start, start + size)``, read-only. None — unknown, never "no image" — when the binary has no
+    block rows, the table is absent, or the read fails."""
     if not analysis_db_path or not sha:
         return None
     try:
@@ -161,18 +629,18 @@ def read_function_bodies(
         if found is None:
             return None
         rows = conn.execute(
-            "SELECT address, pseudocode FROM functions WHERE binary_id = ?", (found[0],)
+            "SELECT start_addr, size FROM data_blocks WHERE binary_id = ?", (found[0],)
         ).fetchall()
     except sqlite3.Error:
         return None
     finally:
         conn.close()
-    out: dict[str, str | None] = {}
-    for address, pseudocode in rows:
-        addr = norm_hex(address) if address else None
-        if addr is not None:
-            out[addr] = pseudocode
-    return out
+    out: list[tuple[int, int]] = []
+    for start, size in rows:
+        lo = _hex_int(start)
+        if lo is not None and isinstance(size, int) and size > 0:
+            out.append((lo, lo + size))
+    return out or None
 
 
 # ── the length-constant signals (size evidence of a copy / buffer-formatter candidate) ───────
