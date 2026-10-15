@@ -906,6 +906,7 @@ def finish_run(
     functions_empty: int | None = None,
     hunt_commit: str | None = None,
     hunt_instances: int | None = None,
+    hunt_input_fingerprint: str | None = None,
     commit: bool = True,
 ) -> None:
     """Mark a run's scan FINISHED: set scan_status (default 'complete') + the analysis counts.
@@ -918,7 +919,8 @@ def finish_run(
     untouched rather than clearing it — a caller that does not know has no grounds to erase what a
     previous hunt established. Together they are what lets a later run decide the stored result is
     reproducible and skip re-hunting it: the commit says the same code would produce it, the count
-    says the rows it produced are still in the table."""
+    says the rows it produced are still in the table, and ``hunt_input_fingerprint`` says it read
+    the same firmware."""
     if scan_status not in ("in_progress", "complete", "partial", "failed"):
         raise ConfigError(
             f"scan_status must be in_progress/complete/partial/failed; got {scan_status!r}"
@@ -927,6 +929,7 @@ def finish_run(
         """UPDATE run SET scan_status = ?, binaries = ?, functions = ?, functions_empty = ?,
                hunt_commit = COALESCE(?, hunt_commit),
                hunt_instances = COALESCE(?, hunt_instances),
+               hunt_input_fingerprint = COALESCE(?, hunt_input_fingerprint),
                updated_at = CURRENT_TIMESTAMP
            WHERE run_id = ?""",
         (
@@ -936,6 +939,7 @@ def finish_run(
             functions_empty,
             hunt_commit,
             hunt_instances,
+            hunt_input_fingerprint,
             run_id,
         ),
     )
@@ -943,8 +947,8 @@ def finish_run(
         conn.execute(
             """INSERT INTO run
                    (run_id, scan_status, binaries, functions, functions_empty, hunt_commit,
-                    hunt_instances, scanned_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)""",
+                    hunt_instances, hunt_input_fingerprint, scanned_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)""",
             (
                 run_id,
                 scan_status,
@@ -953,6 +957,7 @@ def finish_run(
                 functions_empty,
                 hunt_commit,
                 hunt_instances,
+                hunt_input_fingerprint,
             ),
         )
     if commit:

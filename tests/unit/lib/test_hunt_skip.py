@@ -31,6 +31,7 @@ from treasure_map.version import UNKNOWN_VERSION
 COMMIT = "a" * 40
 OTHER = "b" * 40
 BUILD = "8beedde56942dbb1"
+FP = "f" * 32  # the hunt input fingerprint
 
 
 def _row(**over: object) -> dict[str, object]:
@@ -45,6 +46,7 @@ def _row(**over: object) -> dict[str, object]:
         "build_hash": BUILD,
         "hunt_instances": 3,
         "live_instances": 3,
+        "hunt_input_fingerprint": FP,
     }
     base.update(over)
     return base
@@ -55,7 +57,7 @@ def _row(**over: object) -> dict[str, object]:
 
 def test_same_commit_and_same_extraction_is_current() -> None:
     """The one case that skips: both inputs to the hunt are demonstrably the ones already used."""
-    c = hunt_currency(_row(), build_hash=BUILD, commit=COMMIT)
+    c = hunt_currency(_row(), build_hash=BUILD, commit=COMMIT, input_fingerprint=FP)
     assert c.current is True
     assert COMMIT[:12] in c.reason
 
@@ -75,6 +77,8 @@ def test_same_commit_and_same_extraction_is_current() -> None:
         (_row(), None, COMMIT, "this analysis.db records no extraction hash"),
         (_row(build_hash=None), BUILD, COMMIT, "the run recorded no extraction hash"),
         (_row(build_hash="0000"), BUILD, COMMIT, "the extraction changed"),
+        (_row(hunt_input_fingerprint=None), BUILD, COMMIT, "hunted before the fingerprint"),
+        (_row(hunt_input_fingerprint="0" * 32), BUILD, COMMIT, "another firmware was read"),
     ],
 )
 def test_every_unconfirmed_case_re_hunts(
@@ -91,7 +95,7 @@ def test_every_unconfirmed_case_re_hunts(
     the ``scan_status`` check, or accept a NULL ``hunt_commit`` as matching, or compare only the
     commit and not the build hash — and the corresponding row here goes RED.
     """
-    c = hunt_currency(row, build_hash=build, commit=commit)
+    c = hunt_currency(row, build_hash=build, commit=commit, input_fingerprint=FP)
     assert c.current is False, why
     assert c.reason, "a decision must always say why, in both directions"
 
@@ -107,7 +111,12 @@ def test_unknown_running_commit_never_skips_even_against_an_unknown_stamp() -> N
     test goes RED while every other case above still passes, which is what makes it worth its own
     test rather than another parametrize row.
     """
-    c = hunt_currency(_row(hunt_commit=UNKNOWN_VERSION), build_hash=BUILD, commit=UNKNOWN_VERSION)
+    c = hunt_currency(
+        _row(hunt_commit=UNKNOWN_VERSION),
+        build_hash=BUILD,
+        commit=UNKNOWN_VERSION,
+        input_fingerprint=FP,
+    )
     assert c.current is False
 
 
@@ -203,6 +212,7 @@ def test_an_atlas_predating_the_column_gains_it_and_keeps_its_rows(tmp_path: Pat
             dict(row) | {"scan_status": "complete", "build_hash": BUILD},
             build_hash=BUILD,
             commit=COMMIT,
+            input_fingerprint=FP,
         ).current
         is False
     )
@@ -496,7 +506,12 @@ def test_rehunt_overrides_the_skip(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert again.instances_written == 2  # cmd + the snprintf's own write candidate
 
 
-@pytest.mark.parametrize("axis", ["commit", "extraction"])
+def test_an_unreadable_input_fingerprint_never_skips() -> None:
+    c = hunt_currency(_row(), build_hash=BUILD, commit=COMMIT, input_fingerprint=None)
+    assert c.current is False
+
+
+@pytest.mark.parametrize("axis", ["commit", "extraction", "firmware"])
 def test_either_input_changing_defeats_the_skip(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, axis: str
 ) -> None:
@@ -505,7 +520,8 @@ def test_either_input_changing_defeats_the_skip(
     MUTATION: drop the build_hash comparison from ``hunt_currency`` -> the 'extraction' case goes
     RED (an edited extraction pass would be silently ignored, which is the exact failure mode that
     made pass_version span the whole pipeline in the first place). Drop the commit comparison ->
-    the 'commit' case goes RED.
+    the 'commit' case goes RED. Drop the input fingerprint -> the 'firmware' case goes RED: a
+    release install (a known commit) re-scanning changed firmware kept the old candidates.
     """
     from treasure_map.lib.hunt import analyzer2 as a2
 
@@ -516,9 +532,16 @@ def test_either_input_changing_defeats_the_skip(
 
     if axis == "commit":
         monkeypatch.setattr(a2, "installed_commit", lambda: OTHER)
-    else:
+    elif axis == "extraction":
         stamp = sqlite3.connect(db)
         stamp.execute("UPDATE binaries SET pass_version = 'pv_edited'")
+        stamp.commit()
+        stamp.close()
+    else:
+        # Same tmap, same extraction code, another firmware: a binary's content changed. The
+        # extraction hash cannot see this — it names the code, not the image.
+        stamp = sqlite3.connect(db)
+        stamp.execute("UPDATE binaries SET sha256 = 'e' || substr(sha256, 2)")
         stamp.commit()
         stamp.close()
     assert a2.run_analyzer2(db, atlas, source_run_id="r").skipped is False
@@ -844,3 +867,27 @@ def test_relocation_never_invents_a_run(tmp_path: Path) -> None:
         assert conn.execute("SELECT COUNT(*) FROM run").fetchone()[0] == 0
     finally:
         conn.close()
+
+
+def test_an_atlas_without_the_fingerprint_column_gains_it_and_re_hunts(tmp_path: Path) -> None:
+    """MUTATION: drop the hunt_input_fingerprint migration -> the old atlas never gains the column
+    (the stamp write fails) -> RED."""
+    db = tmp_path / "atlas.db"
+    conn = open_atlas(db)
+    conn.close()
+    old = sqlite3.connect(db)
+    old.execute("ALTER TABLE run DROP COLUMN hunt_input_fingerprint")
+    old.execute("INSERT INTO run (run_id, scan_status) VALUES ('old', 'complete')")
+    old.commit()
+    old.close()
+    conn = open_atlas(db)
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(run)")}
+        assert "hunt_input_fingerprint" in cols
+        finish_run(conn, "old", hunt_commit=COMMIT, hunt_input_fingerprint=FP)
+        stored = conn.execute(
+            "SELECT hunt_input_fingerprint FROM run WHERE run_id = 'old'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert stored == FP

@@ -8,6 +8,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from elftools.elf.elffile import ELFFile
 
@@ -109,6 +110,16 @@ def has_substantial_text(elf_path: Path) -> bool:
     try:
         with elf_path.open("rb") as f:
             elf = ELFFile(f)
+            if elf.num_sections() == 0:
+                # No section headers (stripped by sstrip, common in firmware): the program
+                # headers still say what is loaded executable. Reading only sections called every
+                # such binary code-free, so a failed analysis of one was cached as ok_empty.
+                return any(
+                    seg.header.p_type == "PT_LOAD"
+                    and (seg.header.p_flags & 0x1)  # PF_X
+                    and seg.header.p_filesz >= _MIN_TEXT_BYTES
+                    for seg in elf.iter_segments()
+                )
             for section in elf.iter_sections():
                 # SHT_PROGBITS carries real bytes (SHT_NOBITS does not); SHF_EXECINSTR (0x4) marks
                 # it executable. A sizable executable-PROGBITS section (normally .text) means code.
@@ -124,13 +135,19 @@ def has_substantial_text(elf_path: Path) -> bool:
 
 
 def get_dt_needed(elf_path: Path) -> list[str]:
-    """Extract DT_NEEDED entries from the .dynamic section."""
+    """DT_NEEDED entries: from the ``.dynamic`` section, or — when the binary carries no section
+    headers (sstrip) — from the PT_DYNAMIC segment the loader itself reads. Reading the section
+    only stored ``[]`` for most of such a firmware, and the library-level xrefs went empty."""
     deps: list[str] = []
     try:
         with elf_path.open("rb") as f:
             elf = ELFFile(f)
-            dyn = elf.get_section_by_name(".dynamic")
-            if dyn:
+            dyn: Any = elf.get_section_by_name(".dynamic")
+            if dyn is None:
+                dyn = next(
+                    (s for s in elf.iter_segments() if s.header.p_type == "PT_DYNAMIC"), None
+                )
+            if dyn is not None:
                 for tag in dyn.iter_tags():
                     if tag.entry.d_tag == "DT_NEEDED":
                         deps.append(tag.needed)

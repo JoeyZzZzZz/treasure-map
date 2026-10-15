@@ -93,6 +93,11 @@ CREATE TABLE IF NOT EXISTS run (
                                         -- hunted before this column existed. The skip gate
                                         -- requires it to equal the live count — a stamp cannot
                                         -- vouch for rows that are no longer there.
+    hunt_input_fingerprint TEXT,        -- digest of what the hunt read from the analysis.db (the
+                                        -- current binaries' content, the non-binary files, the
+                                        -- links, every table's row count). build_hash names the
+                                        -- extraction CODE; this names the firmware it read. The
+                                        -- skip gate requires it to match; NULL re-hunts.
     tool_version      TEXT,             -- treasure_map __version__ that produced this run
     ghidra_version    TEXT,             -- decompiler version, when known; else NULL
     machine           TEXT,             -- host that ran the scan, when known; else NULL

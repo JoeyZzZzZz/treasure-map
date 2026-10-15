@@ -7,6 +7,7 @@ import sqlite3
 from datetime import UTC, datetime
 
 from treasure_map.lib.analyze.elf_inventory import ElfRecord, has_substantial_text
+from treasure_map.lib.analyze.fs_names import db_text
 from treasure_map.lib.analyze.ghidra_runner import retry_budget_seconds
 
 logger = logging.getLogger(__name__)
@@ -226,8 +227,8 @@ def ingest_elfs(
                 dt_needed, protections, size_bytes, last_seen_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                rec.name,
-                str(rec.path),
+                db_text(rec.name),
+                db_text(str(rec.path)),
                 rec.arch,
                 bits,
                 rec.sha256,
@@ -247,10 +248,14 @@ def ingest_elfs(
     # `tmap diff`. path is a LOCATION property (same content can live at a new place), correctly
     # keyed by sha256; it is not a content property like arch/sha that must never move with the
     # scan. records dedupe by sha256, so no row is updated twice with conflicting paths.
+    #
+    # dt_needed rides along although it is a property of the bytes: it is READ by this code, and a
+    # row ingested by an older reader keeps what that reader saw (an sstrip'd binary read as
+    # needing nothing) until the reader's own answer is written back.
     if records:
         conn.executemany(
-            "UPDATE binaries SET last_seen_at = ?, path = ? WHERE sha256 = ?",
-            [(scan_timestamp, str(r.path), r.sha256) for r in records],
+            "UPDATE binaries SET last_seen_at = ?, path = ?, dt_needed = ? WHERE sha256 = ?",
+            [(scan_timestamp, db_text(str(r.path)), r.dt_needed_json(), r.sha256) for r in records],
         )
 
     conn.commit()

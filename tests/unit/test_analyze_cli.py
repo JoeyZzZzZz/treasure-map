@@ -135,3 +135,24 @@ def test_analyze_says_nothing_when_nothing_was_skipped(
     result = CliRunner().invoke(analyze, [str(fs_root), "--workspace", "ws"])
     assert result.exit_code == 0, result.output
     assert "timed out at the current budget" not in result.output
+
+
+def test_analyze_hands_the_pipeline_an_absolute_firmware_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """binaries.path is written from this root; a relative one breaks `tmap diff` elsewhere.
+
+    MUTATION: drop the resolve in the analyze command -> RED."""
+    _patch_pipeline(monkeypatch, tmp_path / "analysis.db")
+    seen: list[Path] = []
+
+    async def _capture(fs_root: Path, *_: Any, **__: Any) -> AnalyzeResult:
+        seen.append(fs_root)
+        return _fake_result(tmp_path / "analysis.db")
+
+    monkeypatch.setattr("treasure_map.lib.analyze.pipeline.run_analyze", _capture)
+    (tmp_path / "fs").mkdir()
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(analyze, ["fs", "--workspace", "ws"])
+    assert result.exit_code == 0, result.output
+    assert seen == [tmp_path.resolve() / "fs"]

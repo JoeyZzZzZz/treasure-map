@@ -178,6 +178,10 @@ def analyze(
     except TreasureMapError as exc:
         raise click.ClickException(str(exc)) from exc
     ws_path = resolved.path
+    # Absolute from here on, as `tmap scan` does it (and for the same reason: binaries.path is
+    # written from this root, and a relative one breaks `tmap diff` from another directory). After
+    # resolve_workspace, which names an automatic workspace after the root as it was typed.
+    fs_root = fs_root.resolve()
 
     def _progress(step: str, meta: dict[str, Any]) -> None:
         click.echo(f"  [{step}] {meta}")

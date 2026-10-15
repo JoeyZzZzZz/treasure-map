@@ -1169,3 +1169,43 @@ def test_ingest_web_asset_writes_form_fields(tmp_path: Path) -> None:
     assert "fb_comment" in rows and "wl_ssid" in rows and "fb_ptype" in rows
     assert "firmver" not in rows  # hidden input excluded end to end
     conn.close()
+
+
+def test_a_line_that_launches_a_firmware_binary_is_recorded(tmp_path: Path) -> None:
+    """`/usr/sbin/webd -p 80 &` carries no risk word, and it is the line that answers "which
+    script starts webd". command is the executable, past nohup / start-stop-daemon -x.
+
+    MUTATION: gate recording on the risk rules alone again -> RED. Store the first token as the
+    command again -> RED (``nohup`` / ``start-stop-daemon``)."""
+    from treasure_map.lib.analyze.non_binary.shell_script import _ingest_shell
+
+    conn = open_db(tmp_path / "analysis.db")
+    for i, name in enumerate(("webd", "agent", "svc"), start=1):
+        conn.execute(
+            "INSERT INTO binaries (id, name, path, sha256, last_seen_at) VALUES (?, ?, ?, ?, ?)",
+            (i, name, f"usr/sbin/{name}", str(i) * 64, "2026-01-01 00:00:00"),
+        )
+    script = (
+        "#!/bin/sh\n"
+        "/usr/sbin/webd -p 80 &\n"
+        "nohup /usr/bin/agent >/dev/null 2>&1 &\n"
+        "start-stop-daemon -S -x /usr/sbin/svc -- -d\n"
+        "echo started\n"
+    )
+    f = _make_file(tmp_path, "rcS", script)
+    file_id = conn.execute(
+        "INSERT INTO non_binary_files (kind, subtype, name, path, sha256, size_bytes, detected_via)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("shell_script", "sh", f.name, f.rel_path, f.sha256, f.size_bytes, "shebang"),
+    ).lastrowid
+    _ingest_shell(conn, int(file_id), f)  # type: ignore[arg-type]
+    rows = conn.execute(
+        "SELECT command, line_number FROM script_calls WHERE file_id = ? ORDER BY line_number",
+        (file_id,),
+    ).fetchall()
+    conn.close()
+    assert [tuple(r) for r in rows] == [
+        ("/usr/sbin/webd", 2),
+        ("/usr/bin/agent", 3),
+        ("/usr/sbin/svc", 4),
+    ]

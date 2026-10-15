@@ -28,7 +28,8 @@ _FUNCTIONS_SQL = """
 SELECT f.id, f.binary_id, b.name AS binary_name, f.name, f.pseudocode, f.callees
   FROM functions f
   JOIN binaries b ON b.id = f.binary_id
- WHERE f.pseudocode IS NOT NULL
+ WHERE b.last_seen_at IS (SELECT MAX(last_seen_at) FROM binaries)
+   AND f.pseudocode IS NOT NULL
    AND f.callees IS NOT NULL
    AND f.callees != '[]'
  ORDER BY b.name, f.id

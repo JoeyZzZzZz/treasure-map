@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from treasure_map.lib.analyze.elf_inventory import sha256_file
+from treasure_map.lib.analyze.fs_names import db_text
 from treasure_map.lib.analyze.non_binary.framework import NonBinaryFile, NonBinaryIngester
 
 logger = logging.getLogger(__name__)
@@ -93,7 +94,15 @@ def _register_file(
         """INSERT INTO non_binary_files
            (kind, subtype, name, path, sha256, size_bytes, detected_via)
            VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (ingester.kind, subtype, f.name, f.rel_path, f.sha256, f.size_bytes, detected_via),
+        (
+            ingester.kind,
+            subtype,
+            db_text(f.name),
+            db_text(f.rel_path),
+            f.sha256,
+            f.size_bytes,
+            detected_via,
+        ),
     )
     return int(cur.lastrowid)  # type: ignore[arg-type]
 

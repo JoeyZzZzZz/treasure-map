@@ -3,9 +3,10 @@
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
--- Round C: supersede inherited standalone script tables (dormant, never populated).
-DROP TABLE IF EXISTS script_calls;
-DROP TABLE IF EXISTS scripts;
+-- (The inherited standalone script tables an older database may hold are dropped by
+-- storage/connection.py before this runs, by their SHAPE: dropping script_calls here by name, on
+-- every open, emptied the current table — the shell-script evidence — whenever the database was
+-- reopened without a full re-analysis.)
 
 -- 二进制文件
 CREATE TABLE IF NOT EXISTS binaries (
@@ -62,9 +63,12 @@ CREATE TABLE IF NOT EXISTS binaries (
 
 -- current_binaries: rows whose last_seen_at equals the most recent scan
 -- Use this view for all "current firmware" queries; do not join binaries directly.
+-- `IS`, not `=`: when no row is dated (NULL everywhere) every row is current, rather than none.
+-- Recreated on every open (connection.py drops it first), so a database built with the older
+-- definition picks this one up.
 CREATE VIEW IF NOT EXISTS current_binaries AS
   SELECT * FROM binaries
-  WHERE last_seen_at = (SELECT MAX(last_seen_at) FROM binaries);
+  WHERE last_seen_at IS (SELECT MAX(last_seen_at) FROM binaries);
 
 -- 函数
 CREATE TABLE IF NOT EXISTS functions (

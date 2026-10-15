@@ -274,14 +274,21 @@ def _dim_label(d: Any) -> str:
 def _lineage_inline(run: RunRow) -> dict[str, Any]:
     """The run's scan lineage, inlined on EVERY fact return (M6) so a consumer spots a STALE scan
     without a separate list_runs call (a stale scan is silent — the lineage must be printed, not
-    fetched). ``resolved`` is False for a pre-existing run with no lineage row."""
-    return {
+    fetched). ``resolved`` is False for a pre-existing run with no lineage row.
+
+    A run PROVEN stale is refused before it gets here. One that could not be compared is served —
+    and ``currency`` says what could not be compared, so "served" is never read as "current"."""
+    out: dict[str, Any] = {
         "build_hash": run.build_hash,
         "scanned_at": run.scanned_at,
         "scan_status": run.scan_status,
         "tool_version": run.tool_version,
         "resolved": run.resolved,
     }
+    stale = _run_staleness(run, build_hash=_current_pass_version(), commit=_installed_commit())
+    if not stale.stale and stale.remedy:  # a stated reason: something could not be compared
+        out["currency"] = {"confirmed": False, "detail": stale.detail, "remedy": stale.remedy}
+    return out
 
 
 def _short_binary(binary_path: str | None) -> str | None:

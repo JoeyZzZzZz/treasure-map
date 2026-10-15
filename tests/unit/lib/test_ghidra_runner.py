@@ -1041,3 +1041,66 @@ def test_run_all_refuses_a_malformed_registry_before_any_jvm(tmp_path: Path) -> 
     with patch(f"{MODULE}._run_subprocess", fake_sub), pytest.raises(RegistryError):
         runner.run_all([rec], tmp_path / "out")
     assert calls == []
+
+
+# ── R5: a launch failure is not a timeout; Ghidra's own analysis timeout is one ──────
+
+
+def test_a_launch_failure_is_not_a_timeout(tmp_path: Path) -> None:
+    """A launcher that could not start spent no budget: recorded as launch_failed with no
+    budget, so the next scan tries again instead of skipping it as a known timeout.
+
+    MUTATION: report a launch error as returncode -1 again -> RED."""
+    from treasure_map.lib.analyze.ghidra_runner import LAUNCH_FAILED_RC
+
+    output_dir = tmp_path / "output"
+    binary = tmp_path / "httpd"
+    _write_small_elf(binary)
+
+    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+        return LAUNCH_FAILED_RC, "[Errno 13] Permission denied: 'analyzeHeadless'"
+
+    with patch(f"{MODULE}._run_subprocess", fake_sub):
+        result = _make_runner(tmp_path).run_ghidra(
+            binary, output_dir, timeout=60, arch="x86:LE:64:default", sha8="00000000"
+        )
+    assert result.success is False
+    assert (result.reason, result.timeout_budget) == ("launch_failed", None)
+
+
+def test_a_launch_error_from_the_subprocess_layer_is_launch_failed(tmp_path: Path) -> None:
+    """MUTATION: return -1 for an exception raised by Popen -> RED."""
+    from treasure_map.lib.analyze.ghidra_runner import LAUNCH_FAILED_RC, _run_subprocess
+
+    rc, text = _run_subprocess([str(tmp_path / "missing-launcher")], {}, 5)
+    assert rc == LAUNCH_FAILED_RC and text
+
+
+def test_ghidras_own_analysis_timeout_is_a_timeout_not_ok(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """-analysisTimeoutPerFile stops the analysis, the post-script still exports, the exit is 0:
+    the JSON is half an analysis. It must read as a timeout, and say so in the log.
+
+    MUTATION: ignore the analysis-timeout line in the log -> the half JSON is cached as ok -> RED.
+    MUTATION: drop the failure warning -> RED."""
+    output_dir = tmp_path / "output"
+    binary = tmp_path / "httpd"
+    _write_small_elf(binary)
+    sha8 = "aabb1122"
+
+    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+        out = output_dir / f"httpd_{sha8}_ghidra.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(_good_json(env))
+        (output_dir / f"httpd_{sha8}.log").write_text(
+            "INFO  ANALYZING all memory\nINFO  REPORT: Analysis timed out at 60 seconds\n"
+        )
+        return 0, ""
+
+    with caplog.at_level("WARNING"), patch(f"{MODULE}._run_subprocess", fake_sub):
+        result = _make_runner(tmp_path).run_ghidra(
+            binary, output_dir, timeout=60, arch="x86:LE:64:default", sha8=sha8, retry=False
+        )
+    assert result.success is False and result.reason == "timeout"
+    assert any("httpd failed (timeout)" in r.getMessage() for r in caplog.records)

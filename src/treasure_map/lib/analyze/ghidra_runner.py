@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import struct
@@ -532,11 +533,29 @@ def _build_cmd(
     ]
 
 
+# returncode of a process that could not be started at all (the launcher missing, not executable):
+# never a timeout — a timeout settles a budget and is skipped at that budget on the next scan.
+LAUNCH_FAILED_RC = -2
+
+# What analyzeHeadless logs when -analysisTimeoutPerFile stops the analysis. It still runs the
+# post-script and exits 0, so the JSON on disk is a HALF analysis that reads exactly like a whole
+# one. (The diff driver reads the same line for its export: lib/diff/driver.py.)
+_ANALYSIS_TIMED_OUT = re.compile(rb"REPORT: Analysis timed out at \d+ seconds")
+
+
+def _analysis_timed_out(log_path: Path) -> bool:
+    try:
+        return bool(_ANALYSIS_TIMED_OUT.search(log_path.read_bytes()))
+    except OSError:
+        return False
+
+
 def _run_subprocess(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
     """Spawn cmd in a new session/process group; kill the whole group on timeout
     or interrupt.
 
-    Returns (returncode, stderr_tail). returncode -1 = timeout or launch error.
+    Returns (returncode, stderr_tail). returncode -1 = timeout; LAUNCH_FAILED_RC = the process
+    could not be started (the text says why).
     analyzeHeadless is a shell wrapper that spawns Java without exec, so the whole
     process group must be killed to avoid orphan JVMs. The pgid is registered so a
     top-level interrupt can tear every live group down (terminal SIGINT never
@@ -573,7 +592,7 @@ def _run_subprocess(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[
             except Exception:
                 pass
         if isinstance(exc, Exception):
-            return -1, str(exc)  # ordinary launch error: behave as before
+            return LAUNCH_FAILED_RC, str(exc)  # could not start: not a timeout
         raise  # KeyboardInterrupt / SystemExit propagate
     finally:
         if pgid is not None:
@@ -683,6 +702,15 @@ class GhidraRunner:
                 r2.retried = True
                 return r2
 
+        failed_reason = "import_failed" if import_failed else last.reason
+        # Said where a person sees it: the reason, the end of Ghidra's stderr and its log.
+        logger.warning(
+            "ghidra: %s failed (%s)%s%s",
+            binary.name,
+            failed_reason or "unknown",
+            f"; log: {r1.log_path}" if r1.log_path is not None else "",
+            f"; stderr: {r1.stderr_tail.strip()[-300:]}" if r1.stderr_tail else "",
+        )
         return GhidraResult(
             binary=binary,
             output_file=None,
@@ -691,7 +719,7 @@ class GhidraRunner:
             retried=did_retry,
             log_path=r1.log_path,
             stderr_tail=r1.stderr_tail,
-            reason="import_failed" if import_failed else last.reason,
+            reason=failed_reason,
             # The budget of the attempt that actually failed last — ``last`` is the retry when one
             # ran, ``r1`` when none did. Taking r1's would under-report the time this binary was
             # given and make the next scan skip it on a budget it never had.
@@ -763,9 +791,20 @@ class GhidraRunner:
         log_path = output_dir / f"{binary.name}_{sha8}.log"
 
         reason: str | None = None
+        budget: int | None = timeout
         if rc == -1:
             # Killed at the wall-clock budget: a failure no matter what file is on disk. The
             # extractor never reached its atomic move, so any JSON present is not this run's.
+            analysis_status, function_count = "failed", 0
+            reason = "timeout"
+        elif rc == LAUNCH_FAILED_RC:
+            # Ghidra never ran. No budget was spent, so none is recorded: the next scan tries
+            # again instead of skipping this binary as one that "would only time out again".
+            analysis_status, function_count = "failed", 0
+            reason, budget = "launch_failed", None
+        elif log_path.exists() and _analysis_timed_out(log_path):
+            # Ghidra stopped its own analysis at -analysisTimeoutPerFile and exported what it had:
+            # a timeout at this budget, whatever the JSON says.
             analysis_status, function_count = "failed", 0
             reason = "timeout"
         else:
@@ -797,7 +836,7 @@ class GhidraRunner:
             log_path=log_path if log_path.exists() else None,
             stderr_tail=stderr_raw if stderr_raw else None,
             reason=reason,
-            timeout_budget=timeout,
+            timeout_budget=budget,
         )
 
     def run_all(

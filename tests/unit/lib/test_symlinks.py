@@ -211,3 +211,22 @@ def test_write_symlinks_is_wipe_and_rebuild(tmp_path: Path) -> None:
         assert conn.execute("SELECT COUNT(*) FROM fs_symlinks").fetchone()[0] == 0
     finally:
         conn.close()
+
+
+def test_a_link_through_a_firmware_directory_link_never_reaches_the_host(tmp_path: Path) -> None:
+    """`a -> /etc` is the FIRMWARE's /etc. Resolving `a/hostname` on the host read the host's
+    /etc/hostname and reported the firmware link resolved.
+
+    MUTATION: test the target's existence with the host following the directory link -> RED."""
+    from treasure_map.lib.analyze.symlinks import classify_symlink
+
+    root = tmp_path / "rootfs"
+    root.mkdir()
+    (root / "a").symlink_to("/etc")
+    (root / "x").symlink_to("a/hostname")
+    rec = classify_symlink(root / "x", root)
+    assert rec.resolved == 0  # the firmware has no etc/hostname
+    (root / "etc").mkdir()
+    (root / "etc" / "hostname").write_text("fw\n")
+    rec = classify_symlink(root / "x", root)
+    assert (rec.resolved, rec.target_name) == (1, "hostname")

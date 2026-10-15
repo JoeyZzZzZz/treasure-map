@@ -50,6 +50,24 @@ _ADDRTAKEN_TRUNC_NOTE = (
 )
 
 
+# The current scan's binaries, as a table expression. A workspace re-scanned in place keeps the
+# previous scan's binaries (older last_seen_at); a fact read across binaries — by function name,
+# by text — must not answer from them. `IS`: a database whose rows were never dated reads all.
+_CURRENT_BINARIES = (
+    "(SELECT * FROM binaries WHERE last_seen_at IS (SELECT MAX(last_seen_at) FROM binaries))"
+)
+
+# functions columns added after the first schemas; an older analysis.db (read-only here, so never
+# migrated) lacks them, and selecting one by name would raise instead of reading NULL.
+_LATER_FUNCTION_COLUMNS = ("callees_truncated", "is_exported", "unresolved_external_calls")
+
+
+def _function_column(conn: sqlite3.Connection, name: str) -> str:
+    """``f.<name>`` when the functions table has the column, else ``NULL AS <name>``."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(functions)")}
+    return f"f.{name}" if name in cols else f"NULL AS {name}"
+
+
 def open_analysis_ro(db_path: Path | str) -> sqlite3.Connection:
     """Open an analysis database strictly read-only, with a Row factory."""
     conn = sqlite3.connect(f"file:{Path(db_path)}?mode=ro", uri=True)
@@ -334,11 +352,11 @@ def _match_functions(conn: sqlite3.Connection, func: str, binary: str | None) ->
     if addrs:
         where.append(f"f.address IN ({','.join('?' for _ in addrs)})")
         params.extend(addrs)
+    later = ", ".join(_function_column(conn, c) for c in _LATER_FUNCTION_COLUMNS)
     sql = (
         "SELECT f.id, f.binary_id, f.name, f.address, f.size_bytes, f.pseudocode, f.callees, "
-        "f.callees_truncated, f.is_exported, f.unresolved_external_calls, "
-        "b.name AS binary_name, b.path AS binary_path "
-        "FROM functions f JOIN binaries b ON b.id = f.binary_id "
+        f"{later}, b.name AS binary_name, b.path AS binary_path "
+        f"FROM functions f JOIN {_CURRENT_BINARIES} b ON b.id = f.binary_id "
         f"WHERE ({' OR '.join(where)})"  # noqa: S608 -- placeholders only; values stay bound params
     )
     if binary is not None:
@@ -675,15 +693,6 @@ def _binary_name_path_by_id(
     return (r["name"], r["path"]) if r else (None, None)
 
 
-def _addr_int(address: str | None) -> int | None:
-    if not address:
-        return None
-    try:
-        return int(address, 16) if address.lower().startswith("0x") else int(address)
-    except ValueError:
-        return None
-
-
 # The schema records each string's own location, never which function references it (Ghidra does
 # not export string xrefs). Said honestly on every result so a consumer does not assume a reverse
 # lookup the substrate cannot back.
@@ -724,7 +733,7 @@ def _truncated_binaries(conn: sqlite3.Connection, binary_id: int | None = None) 
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT name FROM binaries WHERE strings_truncated = 1 ORDER BY name"
+            f"SELECT name FROM {_CURRENT_BINARIES} WHERE strings_truncated = 1 ORDER BY name"  # noqa: S608
         ).fetchall()
     return [r["name"] for r in rows]
 
@@ -801,10 +810,11 @@ def get_strings(
     reverse "which function references this string" lookup is NOT provided (that index does not
     exist, and we do not fake it)."""
     if value is not None:
-        # ★ M6: value mode now honours ``func`` (previously it was silently dropped — a search
-        # could not be scoped to a function). Resolve func first; a non-resolving func is SURFACED
-        # (not-found / ambiguous), never ignored. func narrows the search to its address range.
-        lo = hi = None
+        # ``func`` picks the binary searched — the function's own — and a func that does not
+        # resolve is SURFACED (not-found / ambiguous), never ignored. It does not narrow to the
+        # function's address range: strings live in data, outside every function's code, so that
+        # range holds none of them (and reading a bare hex address as decimal once made it a
+        # random range instead — see func_scope_applied).
         bid: int | None = None
         scope_path: str | None = None
         if func is not None:
@@ -818,9 +828,6 @@ def get_strings(
             # could scope the search to a different binary than the one the function lives in.
             bid = frow["binary_id"]
             scope_path = frow["binary_path"]
-            lo = _addr_int(frow["address"])
-            if lo is not None and frow["size_bytes"]:
-                hi = lo + int(frow["size_bytes"])
         elif binary is not None:
             brow, miss = resolve_binary(conn, binary)
             if brow is None:
@@ -829,7 +836,7 @@ def get_strings(
             bid, scope_path = brow.id, brow.path
         sql = (
             "SELECT s.value, s.address, s.category, b.name AS bn FROM strings s "
-            "JOIN binaries b ON b.id = s.binary_id WHERE s.value LIKE ?"
+            f"JOIN {_CURRENT_BINARIES} b ON b.id = s.binary_id WHERE s.value LIKE ?"  # noqa: S608
         )
         params: list[Any] = [f"%{value}%"]
         if bid is not None:
@@ -838,10 +845,6 @@ def get_strings(
         sql += " ORDER BY b.name, s.address"
         hits: list[dict[str, Any]] = []
         for r in conn.execute(sql, params):
-            if lo is not None and hi is not None:
-                a = _addr_int(r["address"])
-                if a is None or not (lo <= a < hi):
-                    continue
             hits.append(
                 {
                     "value": r["value"],
@@ -894,19 +897,8 @@ def get_strings(
         "SELECT value, address, category FROM strings WHERE binary_id = ? ORDER BY address",
         (bid,),
     ).fetchall()
-    lo = hi = None
-    if func is not None:
-        frow, _ = _resolve_one(conn, func, binary)
-        if frow is not None:
-            lo = _addr_int(frow["address"])
-            if lo is not None and frow["size_bytes"]:
-                hi = lo + int(frow["size_bytes"])
     items: list[dict[str, Any]] = []
     for r in rows:
-        if lo is not None and hi is not None:
-            a = _addr_int(r["address"])
-            if a is None or not (lo <= a < hi):
-                continue
         items.append({"value": r["value"], "address": r["address"], "category": r["category"]})
     meta = conn.execute(
         "SELECT strings_total, strings_truncated FROM binaries WHERE id = ?", (bid,)
@@ -992,7 +984,7 @@ def get_functions_referencing_string(
     lim = max(1, limit)
     sql = (
         "SELECT f.name, f.address, f.pseudocode, b.name AS binary_name, b.path AS binary_path "
-        "FROM functions f JOIN binaries b ON b.id = f.binary_id "
+        f"FROM functions f JOIN {_CURRENT_BINARIES} b ON b.id = f.binary_id "  # noqa: S608
         "WHERE f.pseudocode LIKE ? ESCAPE '\\'"
     )
     params: list[Any] = [f"%{_like_escape(text)}%"]
@@ -1106,7 +1098,8 @@ def get_string_reference_anchors(
     sql = (
         "SELECT r.string_addr, r.string_value, r.ref_at, r.ref_in_func, r.ref_in_func_addr, "
         "r.segment, r.truncated, b.name AS binary_name "
-        "FROM string_refs r JOIN binaries b ON b.id = r.binary_id WHERE r.string_value = ?"
+        f"FROM string_refs r JOIN {_CURRENT_BINARIES} b ON b.id = r.binary_id "  # noqa: S608
+        "WHERE r.string_value = ?"
     )
     params: list[Any] = [text]
     if bid is not None:

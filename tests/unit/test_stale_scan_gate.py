@@ -237,3 +237,18 @@ def test_cli_fact_tolerates_an_analysis_db_without_the_column(tmp_path: Path) ->
     )
     assert out.exit_code == 0, out.output
     assert json.loads(out.output)["found"] is True
+
+
+def test_a_run_that_cannot_be_compared_is_served_with_the_reason(tmp_path: Path) -> None:
+    """An unprovable mismatch is served, never refused — and never silently: the lineage on the
+    answer says what could not be compared and what to run.
+
+    MUTATION: drop the currency entry from the inlined lineage -> RED."""
+    from treasure_map.lib.atlas.models import RunRow
+    from treasure_map.mcp_app import _lineage_inline
+
+    run = RunRow(run_id="r", scan_status="complete", build_hash=None, firmware_path="/fw")
+    out = _lineage_inline(run)
+    assert out.get("currency", {}).get("confirmed") is False
+    assert "could not compare" in out["currency"]["detail"]
+    assert "tmap rescan r" in out["currency"]["remedy"]

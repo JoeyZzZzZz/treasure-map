@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -1084,3 +1085,29 @@ def test_ingest_bridge_transport_defaults_empty_on_old_export(tmp_path: Path) ->
     conn.close()
     assert row["call_tokens"] == "[]"
     assert row["body_ranges"] == "[]"
+
+
+def test_a_rescan_writes_the_current_readers_dt_needed_onto_an_existing_row(
+    tmp_path: Path,
+) -> None:
+    """A row an older reader ingested (an sstrip'd binary read as needing nothing) gets the
+    current reader's answer on the next scan of the same bytes.
+
+    MUTATION: leave dt_needed out of the per-scan refresh -> the row keeps '[]' -> RED."""
+    from treasure_map.lib.analyze.elf_inventory import ElfRecord
+
+    conn = open_db(tmp_path / "analysis.db")
+    rec = ElfRecord(
+        path=tmp_path / "httpd",
+        name="httpd",
+        arch="MIPS:BE:32:default",
+        elf_type="executable",
+        sha256="d" * 64,
+    )
+    ingest_elfs(conn, [rec])
+    assert conn.execute("SELECT dt_needed FROM binaries").fetchone()[0] == "[]"
+    rec.dt_needed = ["libc.so.0", "libnvram.so"]
+    ingest_elfs(conn, [rec])
+    stored = conn.execute("SELECT dt_needed FROM binaries").fetchone()[0]
+    conn.close()
+    assert json.loads(stored) == ["libc.so.0", "libnvram.so"]

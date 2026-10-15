@@ -121,6 +121,21 @@ def _migrate(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coldef}")
 
 
+def _drop_superseded(conn: sqlite3.Connection) -> None:
+    """Objects an older schema made under a name the current one reuses with another shape,
+    dropped BEFORE the schema runs so its ``CREATE ... IF NOT EXISTS`` builds the current shape.
+
+    Only what is provably the old shape goes: the inherited ``script_calls`` keyed by
+    ``script_id`` (the current one is keyed by ``file_id`` and holds data that must survive a
+    reopen), its parent ``scripts``, and the ``current_binaries`` view — a view holds no rows, and
+    rebuilding it is how a changed definition reaches an existing database."""
+    cols = _columns(conn, "script_calls")
+    if cols and "file_id" not in cols:
+        conn.execute("DROP TABLE script_calls")
+    conn.execute("DROP TABLE IF EXISTS scripts")
+    conn.execute("DROP VIEW IF EXISTS current_binaries")
+
+
 def open_db(db_path: Path) -> sqlite3.Connection:
     """Open (or create) the analysis SQLite database and apply the schema.
 
@@ -132,6 +147,7 @@ def open_db(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     schema = _SCHEMA_PATH.read_text()
+    _drop_superseded(conn)
     conn.executescript(schema)
     _migrate(conn)
     conn.commit()

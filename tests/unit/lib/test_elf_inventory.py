@@ -213,3 +213,29 @@ def test_elf_record_json_helpers():
     )
     assert '"libc.so.0"' in rec.dt_needed_json()
     assert '"nx": true' in rec.protections_json()
+
+
+# ── a binary with no section headers (sstrip) ─────────────────────────────────────────
+
+
+def _sstrip(src: Path, dst: Path) -> Path:
+    """What sstrip does to an ELF64: no section header table at all."""
+    import struct
+
+    data = bytearray(src.read_bytes())
+    struct.pack_into("<Q", data, 0x28, 0)  # e_shoff
+    struct.pack_into("<HH", data, 0x3C, 0, 0)  # e_shnum, e_shstrndx
+    dst.write_bytes(bytes(data))
+    return dst
+
+
+def test_a_binary_without_section_headers_is_read_from_its_program_headers(tmp_path: Path) -> None:
+    """MUTATION: read code presence from sections only -> the stripped binary is "code-free"
+    (a failed analysis is then cached as ok_empty) -> RED. Read DT_NEEDED from the .dynamic
+    section only -> it needs nothing -> RED."""
+    from treasure_map.lib.analyze.elf_inventory import get_dt_needed, has_substantial_text
+
+    src = Path(__file__).resolve().parents[2] / "fixtures" / "elfs" / "true_x86_64"
+    stripped = _sstrip(src, tmp_path / "true_stripped")
+    assert has_substantial_text(stripped)
+    assert get_dt_needed(stripped) == get_dt_needed(src) != []

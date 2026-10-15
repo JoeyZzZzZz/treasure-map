@@ -442,18 +442,18 @@ def _strings_db(tmp_path: Path) -> Path:
     return db
 
 
-def test_get_strings_value_mode_honours_func(tmp_path: Path) -> None:
-    # ★ M6: value mode now scopes to a function's address range (func was previously DROPPED, so
-    # "a substring inside this function" could not be asked — forcing a full-binary page).
+def test_get_strings_func_picks_the_binary_and_does_not_cut_by_address(tmp_path: Path) -> None:
+    """func names the binary searched and must resolve; it never cuts results by the function's
+    address range (strings are not in it, and the range was read wrongly besides).
+
+    MUTATION: filter strings by the function's address range again -> RED."""
     conn = facts.open_analysis_ro(_strings_db(tmp_path))
-    scoped = facts.get_strings(conn, binary="rc", func="dispatch", value="oauth")
-    assert {s["value"] for s in scoped["strings"]} == {
-        "oauth_in_a",
-        "oauth_in_b",
-    }  # out-of-range cut
-    # without func the same search returns all three — func is what narrows it
-    allv = facts.get_strings(conn, binary="rc", value="oauth")
-    assert {s["value"] for s in allv["strings"]} == {"oauth_in_a", "oauth_in_b", "oauth_out"}
+    every = {"oauth_in_a", "oauth_in_b", "oauth_out"}
+    scoped = facts.get_strings(conn, func="dispatch", value="oauth")
+    assert {s["value"] for s in scoped["strings"]} == every
+    assert scoped["func_scope_applied"] is False
+    by_binary = facts.get_strings(conn, binary="rc", func="dispatch")
+    assert {s["value"] for s in by_binary["strings"]} == every
     conn.close()
 
 

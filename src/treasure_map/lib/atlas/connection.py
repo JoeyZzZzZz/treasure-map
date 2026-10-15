@@ -385,6 +385,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if run_cols and "hunt_instances" not in run_cols:
         conn.execute("ALTER TABLE run ADD COLUMN hunt_instances INTEGER")
 
+    # run.hunt_input_fingerprint: what the hunt read, condensed. build_hash is the extraction
+    # CODE's hash, the same for every firmware a given tmap scans, so a re-scan of DIFFERENT
+    # firmware into the same run looked "already hunted". Nullable: a run without it re-hunts once.
+    run_cols = _column_names(conn, "run")
+    if run_cols and "hunt_input_fingerprint" not in run_cols:
+        conn.execute("ALTER TABLE run ADD COLUMN hunt_input_fingerprint TEXT")
+
     # binary_path columns (added this round). Every one of these tables scoped a row to a binary by
     # its SHORT NAME, which is a label: one firmware ships two files under the same name, so a
     # per-binary filter on the name matched both. The path is added beside the name rather than

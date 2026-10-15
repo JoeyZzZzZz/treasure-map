@@ -316,11 +316,53 @@ class HuntCurrency:
     reason: str
 
 
+def hunt_input_fingerprint(db_path: Path | str) -> str | None:
+    """A digest of what the hunt reads from ``db_path``, or None when it cannot be read.
+
+    ``build_hash`` is the extraction CODE's hash: every firmware a given tmap scans carries the
+    same one, so it cannot say whether the firmware changed. This reads the inputs themselves —
+    the current binaries' content (path, sha256, extraction pass, Ghidra outcome and version), the
+    non-binary files, the filesystem links, and every table's row count (a changed setting such as
+    the xref fold threshold shows up there). Equal digests over a deterministic hunt mean the same
+    result; anything unreadable is None, which re-hunts."""
+    try:
+        conn = facts.open_analysis_ro(db_path)
+    except sqlite3.Error:
+        return None
+    try:
+        h = hashlib.sha256()
+        for sql in (
+            "SELECT path, sha256, pass_version, ghidra_status, ghidra_version "
+            "FROM current_binaries ORDER BY path, sha256",
+            "SELECT kind, path, sha256 FROM non_binary_files ORDER BY path, sha256, kind",
+            "SELECT link_path, target_raw, target_name, resolved, corrupt_reason "
+            "FROM fs_symlinks ORDER BY link_path, target_raw",
+        ):
+            for row in conn.execute(sql):
+                h.update(json.dumps(list(row), default=str).encode() + b"\n")
+        tables = [
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            )
+        ]
+        for table in tables:
+            n = conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]  # noqa: S608
+            h.update(f"{table}={n}\n".encode())
+        return h.hexdigest()[:32]
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+
 def hunt_currency(
     run_row: Mapping[str, object] | None,
     *,
     build_hash: str | None,
     commit: str,
+    input_fingerprint: str | None,
 ) -> HuntCurrency:
     """Decide whether a stored hunt result is reproducible by the current code + extraction.
 
@@ -361,6 +403,12 @@ def hunt_currency(
         return HuntCurrency(False, "this analysis.db records no extraction hash")
     if run_row.get("build_hash") != build_hash:
         return HuntCurrency(False, "the extraction changed since this run was hunted")
+    if input_fingerprint is None:
+        return HuntCurrency(False, "this analysis.db's inputs could not be read")
+    if run_row.get("hunt_input_fingerprint") != input_fingerprint:
+        # The extraction CODE can be identical while the firmware is another one: a re-scan of a
+        # changed image into the same workspace, a new firmware under the same run id.
+        return HuntCurrency(False, "the firmware or its analysis changed since this run was hunted")
     # Last, because it is the only check that had to count rows. Both halves land on re-hunt: a run
     # stamped before the count was recorded cannot be confirmed, and a count that no longer matches
     # is a stamp describing rows that are not there.
@@ -387,8 +435,8 @@ def _stored_run_row(atlas_path: Path | str, run_id: str) -> dict[str, object] | 
     try:
         try:
             row = conn.execute(
-                "SELECT scan_status, hunt_commit, hunt_instances, build_hash "
-                "FROM run WHERE run_id = ?",
+                "SELECT scan_status, hunt_commit, hunt_instances, build_hash, "
+                "hunt_input_fingerprint FROM run WHERE run_id = ?",
                 (run_id,),
             ).fetchone()
         except sqlite3.OperationalError:
@@ -1184,10 +1232,12 @@ def run_analyzer2(
         lineage_conn.close()
 
     commit = installed_commit()
+    fingerprint = hunt_input_fingerprint(db_path)
     currency = hunt_currency(
         _stored_run_row(atlas_path, source_run_id),
         build_hash=lineage["build_hash"],
         commit=commit,
+        input_fingerprint=fingerprint,
     )
     if currency.current and not rehunt:
         # NOTHING IS DELETED and no result is written: the stored instances stay exactly as they
@@ -1931,6 +1981,8 @@ def run_analyzer2(
             # A later skip re-reads it and refuses to trust the stamp unless the table still holds
             # exactly this many rows for the run.
             hunt_instances=instances_written,
+            # ...and what it read, so a later skip can tell the same firmware from another one.
+            hunt_input_fingerprint=fingerprint,
         )
     finally:
         atlas.close()

@@ -44,6 +44,7 @@ SELECT f.id, f.binary_id, b.name AS binary_name, b.path AS binary_path,
        __BRIDGE_COLS__
   FROM functions f
   JOIN binaries b ON b.id = f.binary_id
+ WHERE b.last_seen_at IS (SELECT MAX(last_seen_at) FROM binaries)
  ORDER BY b.name, f.id
 """
 

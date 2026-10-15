@@ -39,6 +39,8 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
+from treasure_map.lib.analyze.fs_names import db_text
+
 logger = logging.getLogger(__name__)
 
 # The placeholder some extraction tools leave behind for a link they could not reproduce.
@@ -94,6 +96,38 @@ def _reroot(target: str, link_parent: Path, fs_root: Path) -> Path | None:
     return norm
 
 
+def _resolve_parents(path: Path, fs_root: Path) -> tuple[Path | None, str | None]:
+    """``path`` with every DIRECTORY on the way to it that is a link followed inside the firmware
+    root — the last component is left for the caller. (None, reason) when a link escapes the root
+    or the links do not end.
+
+    Asking the host about ``<root>/a/hostname`` follows ``a`` on the HOST: a firmware link
+    ``a -> /etc`` turns it into the host's /etc/hostname. Walking one component at a time from the
+    root, each lstat is of a path whose parents are real directories inside the root, so nothing
+    is ever resolved against the host."""
+    root = _norm(fs_root)
+    parts = list(path.relative_to(root).parts)
+    if not parts:
+        return path, None
+    last = parts.pop()
+    cur = root
+    hops = 0
+    while parts:
+        nxt = cur / parts.pop(0)
+        if nxt.is_symlink():
+            hops += 1
+            if hops > _MAX_CHAIN:
+                return None, CORRUPT_CHAIN
+            landed = _reroot(os.readlink(nxt), cur, root)
+            if landed is None:
+                return None, CORRUPT_ESCAPES_ROOT
+            parts = list(landed.relative_to(root).parts) + parts
+            cur = root
+            continue
+        cur = nxt
+    return cur / last, None
+
+
 def classify_symlink(link: Path, fs_root: Path) -> SymlinkRecord:
     """Follow ``link`` to its final target inside ``fs_root`` and record the outcome.
 
@@ -113,6 +147,10 @@ def classify_symlink(link: Path, fs_root: Path) -> SymlinkRecord:
         nxt = _reroot(value, current.parent, fs_root)
         if nxt is None:
             return SymlinkRecord(rel, link.name, raw, Path(value).name, 0, CORRUPT_ESCAPES_ROOT)
+        nxt, broken = _resolve_parents(nxt, fs_root)
+        if nxt is None:
+            reason = broken or CORRUPT_CHAIN
+            return SymlinkRecord(rel, link.name, raw, Path(value).name, 0, reason)
         if nxt.is_symlink():
             current = nxt
             value = os.readlink(nxt)
@@ -172,7 +210,14 @@ def write_symlinks(conn: sqlite3.Connection, records: list[SymlinkRecord]) -> in
         "(link_path, link_name, target_raw, target_name, resolved, corrupt_reason) "
         "VALUES (?, ?, ?, ?, ?, ?)",
         [
-            (r.link_path, r.link_name, r.target_raw, r.target_name, r.resolved, r.corrupt_reason)
+            (
+                db_text(r.link_path),
+                db_text(r.link_name),
+                db_text(r.target_raw),
+                db_text(r.target_name),
+                r.resolved,
+                r.corrupt_reason,
+            )
             for r in records
         ],
     )
