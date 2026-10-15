@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import pytest
 
+import treasure_map.lib.setup.completion as _completion
 import treasure_map.lib.setup.discover as _discover
 
 _HOST_VARS = (
@@ -29,5 +30,7 @@ _HOST_VARS = (
 @pytest.fixture(autouse=True)
 def _hermetic_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(_discover, "SYSTEM_PROBES", False)
+    # the machine's own bash is never asked for its version (unknown = not a reason to skip)
+    monkeypatch.setattr(_completion, "bash_version", lambda *_a: None)
     for name in _HOST_VARS:
         monkeypatch.delenv(name, raising=False)

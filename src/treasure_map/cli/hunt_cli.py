@@ -76,6 +76,12 @@ def _complete_run_id(ctx: click.Context, param: click.Parameter, incomplete: str
     return [CompletionItem(i) for i in ids if i.startswith(incomplete)]
 
 
+def _require_atlas(path: Path) -> None:
+    """A read-only command never creates the atlas it was asked to read."""
+    if not Path(path).exists():
+        raise click.ClickException(f"no atlas yet at {path}: `tmap scan` creates it")
+
+
 def _echo_legal_notice(*, as_json: bool = False) -> None:
     """Print the intended-use / legal reminder to stderr (skipped under --json).
 
@@ -1362,6 +1368,7 @@ def runs(config: Path | None, atlas_path: Path | None, as_json: bool) -> None:
 
     cfg = load_config(config)
     resolved_atlas = atlas_path if atlas_path is not None else cfg.atlas.db_path
+    _require_atlas(resolved_atlas)
     conn = open_atlas(resolved_atlas)
     try:
         run_rows = run_list_runs(conn)
@@ -1590,6 +1597,7 @@ def triage(
     selected_run = run_opt if run_opt is not None else run_id
     cfg = load_config(config)
     resolved_atlas = atlas_path if atlas_path is not None else cfg.atlas.db_path
+    _require_atlas(resolved_atlas)
     # ★ M8c: print the current run's scan lineage (build / date / status) at the top — a stale scan
     # is otherwise silent, and this is exactly where a reader forgets an old build was scanned.
     if not as_json:
@@ -1727,6 +1735,7 @@ def atlas_view(view: str, config: Path | None, atlas_path: Path | None) -> None:
 
     cfg = load_config(config)
     resolved_atlas = atlas_path if atlas_path is not None else cfg.atlas.db_path
+    _require_atlas(resolved_atlas)
     conn = open_atlas(resolved_atlas)
     try:
         if view == "dormant":

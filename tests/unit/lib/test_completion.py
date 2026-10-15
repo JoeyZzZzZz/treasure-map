@@ -205,3 +205,38 @@ def test_unwritable_rc_fails_honestly(shell: str, tmp_path: Path, monkeypatch) -
     # and the rc really was not created/changed
     rc = comp.rc_path(shell, tmp_path)
     assert rc is not None and not rc.exists()
+
+
+def test_a_bash_older_than_4_4_gets_no_script_and_is_told_why(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """macOS's bash 3.2 cannot load Click's script (`complete -o nosort`): skipped and said so,
+    never installed nor counted as a problem.
+
+    MUTATION: ignore the bash version -> a script bash cannot load is installed -> RED."""
+    from treasure_map.lib.setup import completion as comp
+    from treasure_map.lib.setup.initializer import _configure_completion
+
+    monkeypatch.setattr(comp, "bash_version", lambda *_a: (3, 2))
+    monkeypatch.setenv("SHELL", "/bin/bash")
+    lines: list[str] = []
+    script, rc = _configure_completion(
+        non_interactive=True, prompt=lambda _m: "", echo=lines.append
+    )
+    path = comp.target_path("bash", Path.home())
+    assert script is None and rc is None and path is not None and not path.exists()
+    assert any("needs bash 4.4" in ln for ln in lines)
+    name, ok, detail = comp.completion_check(Path.home(), "bash")
+    assert ok and "needs bash 4.4" in detail
+
+
+def test_macos_bash_activates_in_bash_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A macOS terminal starts a login shell, which reads ~/.bash_profile, not ~/.bashrc.
+
+    MUTATION: keep ~/.bashrc on macOS -> RED."""
+    from treasure_map.lib.setup import completion as comp
+
+    monkeypatch.setattr(comp.sys, "platform", "darwin")
+    assert comp.rc_path("bash", Path("/h")) == Path("/h/.bash_profile")
+    monkeypatch.setattr(comp.sys, "platform", "linux")
+    assert comp.rc_path("bash", Path("/h")) == Path("/h/.bashrc")

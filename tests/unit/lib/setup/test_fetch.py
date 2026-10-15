@@ -480,3 +480,220 @@ def test_a_reinstall_removes_what_it_replaced(tmp_path: Path) -> None:
     assert not old.exists() and (tdir / "thing").is_dir()
     e = Ledger.load(tdir / LEDGER_NAME).committed("thing")
     assert e is not None and e.path == str(tdir / "thing")
+
+
+class _ShortFetcher:
+    """The connection drops: only the first ``n`` bytes arrive, without an error."""
+
+    def __init__(self, data: bytes, n: int) -> None:
+        self.data, self.n = data, n
+        self.calls: list[str] = []
+
+    def fetch(self, url: str, dest: Path, *, progress: object = None) -> None:
+        self.calls.append(url)
+        dest.write_bytes(self.data[: self.n])
+
+
+def test_a_dropped_connection_keeps_the_part_for_the_next_run(tmp_path: Path) -> None:
+    """MUTATION: treat a short download as a mismatch (delete it) -> RED."""
+    data = _tool_zip()
+    staging = tmp_path / "dl"
+    outcome = ""
+    try:
+        download_verified(_asset(data), staging, _ShortFetcher(data, 100))
+    except FetchError as exc:
+        outcome = str(exc)
+    assert "run again to resume" in outcome
+    assert (staging / "thing.zip.part").is_file()
+    assert (staging / "thing.zip.part").stat().st_size == 100
+
+
+class _CountingFetcher:
+    """Records the call and leaves the file as it is (a server that has nothing more)."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def fetch(self, url: str, dest: Path, *, progress: object = None) -> None:
+        self.calls.append(url)
+
+
+def test_a_complete_part_is_verified_without_fetching(tmp_path: Path) -> None:
+    """An interrupted run left the whole file: asking for the rest gets HTTP 416 forever.
+
+    MUTATION: always fetch -> RED."""
+    data = _tool_zip()
+    staging = tmp_path / "dl"
+    staging.mkdir()
+    (staging / "thing.zip.part").write_bytes(data)
+    fetcher = _CountingFetcher()
+    out = download_verified(_asset(data), staging, fetcher)
+    assert fetcher.calls == []
+    assert out.read_bytes() == data
+
+
+class _Resp:
+    def __init__(self, status: int, headers: dict[str, str], body: bytes) -> None:
+        self.status, self.headers, self._body = status, headers, io.BytesIO(body)
+
+    def read(self, n: int = -1) -> bytes:
+        return self._body.read(n)
+
+    def __enter__(self) -> _Resp:
+        return self
+
+    def __exit__(self, *_a: object) -> None:
+        return None
+
+
+def test_416_on_a_resume_is_left_to_the_size_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MUTATION: treat HTTP 416 as a failed download -> RED."""
+    import urllib.error
+
+    from treasure_map.lib.setup.fetch import UrlFetcher
+
+    def _416(req: object, timeout: float = 0) -> None:
+        raise urllib.error.HTTPError("https://x/a", 416, "Range Not Satisfiable", {}, None)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("urllib.request.urlopen", _416)
+    part = tmp_path / "a.part"
+    part.write_bytes(b"12345")
+    outcome = "ok"
+    try:
+        UrlFetcher().fetch("https://x/a", part)
+    except FetchError as exc:
+        outcome = str(exc)
+    assert outcome == "ok" and part.read_bytes() == b"12345"
+
+
+def test_a_resume_at_the_wrong_offset_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MUTATION: append whatever a 206 sends -> the file is corrupt -> RED."""
+    from treasure_map.lib.setup.fetch import UrlFetcher
+
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda req, timeout=0: _Resp(206, {"Content-Range": "bytes 0-9/10"}, b"0123456789"),
+    )
+    part = tmp_path / "a.part"
+    part.write_bytes(b"12345")
+    outcome = "ok"
+    try:
+        UrlFetcher().fetch("https://x/a", part)
+    except FetchError as exc:
+        outcome = str(exc)
+    assert "wrong offset" in outcome and not part.exists()
+
+
+def test_a_broken_managed_install_is_repaired(tmp_path: Path) -> None:
+    """The ledger records tmap's own copy at the target, and it no longer checks out: init
+    replaces it instead of claiming tmap never installed it.
+
+    MUTATION: refuse any existing target -> RED."""
+    tdir = tmp_path / "toolchain"
+    target = tdir / "thing"
+    (target / "support").mkdir(parents=True)  # broken: the launcher is gone
+    ledger = Ledger(tdir / LEDGER_NAME)
+    ledger.add_pending("thing", "dir", target)
+    ledger.commit("thing")
+    data = _tool_zip()
+    outcome = "ok"
+    try:
+        install_archive(
+            "thing",
+            _asset(data),
+            target,
+            toolchain_dir=tdir,
+            ledger=ledger,
+            fetcher=fakes.BytesFetcher({"thing.zip": data}),
+            verify=lambda p: None if (p / "support" / "run").is_file() else "no launcher",
+            run=fakes.fake_run(),
+        )
+    except FetchError as exc:
+        outcome = str(exc)
+    assert outcome == "ok"
+    assert (target / "support" / "run").is_file()
+    assert ledger.committed("thing") is not None
+    assert [p.name for p in tdir.iterdir() if p.name.startswith(".staging-")] == []
+
+
+def test_an_unrecorded_existing_target_is_still_refused(tmp_path: Path) -> None:
+    tdir = tmp_path / "toolchain"
+    target = tdir / "thing"
+    target.mkdir(parents=True)
+    (target / "mine.txt").write_text("mine")
+    data = _tool_zip()
+    with pytest.raises(FetchError, match="did not record"):
+        install_archive(
+            "thing",
+            _asset(data),
+            target,
+            toolchain_dir=tdir,
+            ledger=Ledger(tdir / LEDGER_NAME),
+            fetcher=fakes.BytesFetcher({"thing.zip": data}),
+            verify=lambda _p: None,
+            run=fakes.fake_run(),
+        )
+    assert (target / "mine.txt").read_text() == "mine"
+
+
+class _Hdiutil:
+    """A fake runner for the dmg steps; ``detach_rc`` answers each plain detach in turn."""
+
+    def __init__(
+        self, *, attach_ok: bool = True, detach_rc: tuple[int, ...] = (0,), force_rc: int = 0
+    ):
+        from treasure_map.lib.setup.discover import RunResult
+
+        self.RunResult = RunResult
+        self.attach_ok, self.detach_rc, self.force_rc = attach_ok, list(detach_rc), force_rc
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv: list[str], *, cwd: object = None, timeout: float = 0) -> object:
+        self.calls.append(list(argv))
+        if argv[:2] == ["hdiutil", "attach"]:
+            if not self.attach_ok:
+                return None  # timed out: the image may be mounted anyway
+            (Path(argv[-2]) / "BinDiff.pkg").write_bytes(b"pkg")
+            return self.RunResult(0, "", "")
+        if argv[:2] == ["hdiutil", "detach"]:
+            rc = (
+                self.force_rc
+                if "-force" in argv
+                else (self.detach_rc.pop(0) if self.detach_rc else 16)
+            )
+            return self.RunResult(rc, "", "")
+        if argv[0] == "pkgutil":
+            (Path(argv[-1]) / "Payload" / "BinDiff.app").mkdir(parents=True)
+            return self.RunResult(0, "", "")
+        if argv[0] == "ditto":
+            Path(argv[-1]).mkdir(parents=True)
+            return self.RunResult(0, "", "")
+        return self.RunResult(1, "", "")
+
+
+def test_a_timed_out_attach_that_mounted_is_still_detached(tmp_path: Path) -> None:
+    """MUTATION: detach only after a successful attach -> the mount stays -> RED."""
+    from treasure_map.lib.setup.fetch import extract_dmg_pkg
+
+    run = _Hdiutil(attach_ok=False, detach_rc=(16, 16), force_rc=0)
+    with pytest.raises(FetchError, match="attach failed"):
+        extract_dmg_pkg(tmp_path / "b.dmg", tmp_path / "out", "BinDiff.app", run, lambda _p: True)
+    detaches = [c for c in run.calls if c[:2] == ["hdiutil", "detach"]]
+    assert detaches and "-force" in detaches[-1]
+
+
+def test_a_mount_that_will_not_detach_is_reported_with_the_command(tmp_path: Path) -> None:
+    """MUTATION: ignore what detach returns -> the image stays mounted silently -> RED."""
+    from treasure_map.lib.setup.fetch import extract_dmg_pkg
+
+    run = _Hdiutil(detach_rc=(16, 16), force_rc=16)
+    outcome = "ok"
+    try:
+        extract_dmg_pkg(tmp_path / "b.dmg", tmp_path / "out", "BinDiff.app", run, lambda _p: True)
+    except FetchError as exc:
+        outcome = str(exc)
+    assert "still mounted" in outcome and "hdiutil detach -force" in outcome

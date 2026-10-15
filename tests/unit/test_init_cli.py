@@ -140,7 +140,7 @@ def test_non_check_only_prints_paths(tmp_path: Path, monkeypatch: pytest.MonkeyP
     )
     result = CliRunner().invoke(init, ["--non-interactive"])
     assert "Config" in result.output
-    assert "Secrets" in result.output
+    assert ".env   :" in result.output
 
 
 def test_check_only_prints_checks_not_paths(

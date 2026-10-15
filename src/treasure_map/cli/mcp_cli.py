@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from pathlib import Path
+from typing import Any
 
 import click
 
@@ -79,6 +81,17 @@ def _emit_fact(conn: sqlite3.Connection, record: dict[str, object]) -> None:
     _emit(record)
 
 
+def _open_fact_db(analysis_db: str) -> Any:
+    """The analysis database, read-only — or a message naming the path when there is none (a
+    missing file would otherwise surface as a sqlite traceback)."""
+    if not Path(analysis_db).is_file():
+        raise click.ClickException(
+            f"no analysis database at {analysis_db}: pass --analysis-db "
+            "<workspace>/analysis.db (tmap runs shows each run's)"
+        )
+    return facts.open_analysis_ro(analysis_db)
+
+
 @click.group(
     name="fact",
     short_help="Read structured facts (same as an agent sees via MCP — for manual cross-check)",
@@ -93,7 +106,7 @@ def fact() -> None:
 @click.option("--analysis-db", default="analysis.db", help="Path to the analysis database.")
 def pseudocode(function: str, binary: str | None, analysis_db: str) -> None:
     """Print the decompiler pseudocode for FUNCTION (name or address)."""
-    conn = facts.open_analysis_ro(analysis_db)
+    conn = _open_fact_db(analysis_db)
     try:
         _emit_fact(conn, facts.get_pseudocode(conn, func=function, binary=binary))
     finally:
@@ -106,7 +119,7 @@ def pseudocode(function: str, binary: str | None, analysis_db: str) -> None:
 @click.option("--analysis-db", default="analysis.db", help="Path to the analysis database.")
 def callees(function: str, binary: str | None, analysis_db: str) -> None:
     """Print the direct callees of FUNCTION (intra-binary edges flagged resolved)."""
-    conn = facts.open_analysis_ro(analysis_db)
+    conn = _open_fact_db(analysis_db)
     try:
         _emit_fact(conn, facts.get_callees(conn, func=function, binary=binary))
     finally:
@@ -126,7 +139,7 @@ def callees(function: str, binary: str | None, analysis_db: str) -> None:
 def xrefs(function: str, direction: str, binary: str | None, analysis_db: str) -> None:
     """Print the cross-reference edges for FUNCTION."""
     d: facts.XrefDirection = "callees" if direction == "callees" else "callers"
-    conn = facts.open_analysis_ro(analysis_db)
+    conn = _open_fact_db(analysis_db)
     try:
         _emit_fact(conn, facts.get_xrefs(conn, func=function, direction=d, binary=binary))
     finally:
@@ -138,7 +151,7 @@ def xrefs(function: str, direction: str, binary: str | None, analysis_db: str) -
 @click.option("--analysis-db", default="analysis.db", help="Path to the analysis database.")
 def script_callsites(binary: str, analysis_db: str) -> None:
     """Print the rootfs scripts that invoke BINARY (entry-reach evidence)."""
-    conn = facts.open_analysis_ro(analysis_db)
+    conn = _open_fact_db(analysis_db)
     try:
         _emit_fact(conn, facts.get_script_callsites(conn, binary=binary))
     finally:

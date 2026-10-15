@@ -21,11 +21,15 @@ Two hard rules (mirrors the rest of init):
     appended to reports the failure and falls back to printing the line — never a false "added".
 
 bash and zsh only — the vast majority of users. fish and others are added on demand, not pre-built.
+Click's bash completion needs bash 4.4 or newer (``complete -o nosort``); an older bash — macOS
+ships 3.2 — is skipped and said so, never given a script it cannot load.
 """
 
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -66,6 +70,38 @@ def detect_shell(env: dict[str, str] | None = None) -> str | None:
     shell = (env if env is not None else os.environ).get("SHELL", "")
     base = Path(shell).name
     return base if base in SUPPORTED_SHELLS else None
+
+
+_MIN_BASH = (4, 4)
+
+
+def bash_version(shell_path: str | None = None) -> tuple[int, int] | None:
+    """(major, minor) of the user's bash — ``$SHELL`` when it is a bash — or None when unread."""
+    exe = shell_path or os.environ.get("SHELL") or "bash"
+    try:
+        out = subprocess.run(  # noqa: S603 -- the user's own shell, fixed script
+            [exe, "-c", 'echo "${BASH_VERSINFO[0]} ${BASH_VERSINFO[1]}"'],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            stdin=subprocess.DEVNULL,
+        ).stdout.split()
+        return int(out[0]), int(out[1])
+    except (OSError, subprocess.SubprocessError, IndexError, ValueError):
+        return None
+
+
+def unsupported_reason(shell: str) -> str | None:
+    """Why tmap's completion cannot work in this ``shell``, or None. An unread version is not a
+    reason: the script is installed and the activation check stays the judge."""
+    if shell == "bash":
+        version = bash_version()
+        if version is not None and version < _MIN_BASH:
+            return (
+                f"bash {version[0]}.{version[1]}: tmap's completion needs bash 4.4 or newer "
+                "(a newer bash, e.g. from Homebrew, works)"
+            )
+    return None
 
 
 def _completion_script(shell: str) -> str | None:
@@ -124,7 +160,7 @@ def _zshrc_puts_dir_on_fpath(home: Path, comp_dir: Path) -> bool:
     needles = (str(comp_dir), "~/.zsh/completions", "$HOME/.zsh/completions", ".zsh/completions")
     for rc in (home / ".zshrc", home / ".zprofile"):
         try:
-            text = rc.read_text()
+            text = rc.read_text(errors="replace")
         except OSError:
             continue
         for line in text.splitlines():
@@ -143,7 +179,7 @@ def _bashrc_sources_completion(home: Path, path: Path) -> bool:
     needle = str(path)
     for rc in (home / ".bashrc", home / ".bash_profile"):
         try:
-            text = rc.read_text()
+            text = rc.read_text(errors="replace")
         except OSError:
             continue
         for raw in text.splitlines():
@@ -158,7 +194,8 @@ def rc_path(shell: str, home: Path) -> Path | None:
 
     This is the ONLY file init ever appends to, and only with the user's explicit yes."""
     if shell == "bash":
-        return home / ".bashrc"
+        # macOS terminals start login shells, which read ~/.bash_profile and not ~/.bashrc
+        return home / (".bash_profile" if sys.platform == "darwin" else ".bashrc")
     if shell == "zsh":
         return home / ".zshrc"
     return None
@@ -190,7 +227,8 @@ def _activation(shell: str, home: Path, path: Path) -> tuple[bool, str | None]:
     if shell == "bash":
         if _bash_completion_present() or _bashrc_sources_completion(home, path):
             return True, None
-        return False, f"add to ~/.bashrc:  {line}"
+        rc = rc_path(shell, home)
+        return False, f"add to ~/{rc.name if rc is not None else '.bashrc'}:  {line}"
     if shell == "zsh":
         if _zshrc_puts_dir_on_fpath(home, path.parent):
             return True, None
@@ -255,7 +293,7 @@ def activate_completion(shell: str, home: Path, path: Path) -> CompletionActivat
     if rc is None or line is None:
         return None
     try:
-        existing = rc.read_text() if rc.exists() else ""
+        existing = rc.read_text(errors="replace") if rc.exists() else ""
     except OSError as exc:
         return CompletionActivation(shell, rc, added=False, already=False, error=str(exc))
     if _MARK_START in existing:
@@ -281,6 +319,9 @@ def completion_check(home: Path, shell: str | None = None) -> tuple[str, bool, s
     shell = shell or detect_shell()
     if shell is None:
         return ("completion", True, "shell is not bash/zsh — nothing to install")
+    why = unsupported_reason(shell)
+    if why is not None:
+        return ("completion", True, f"{why} — not installed")
     path = target_path(shell, home)
     if path is None or not path.exists():
         return ("completion", False, f"{shell}: not installed — run `tmap init`")

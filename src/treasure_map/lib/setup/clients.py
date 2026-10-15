@@ -8,8 +8,8 @@ is read straight from its configuration file:
 
   * ``missing``  — no ``treasure-map`` entry.
   * ``aligned``  — exactly the entry above.
-  * ``stale``    — a tmap entry that differs (another path, ``--atlas``, an env, the retired
-    ``treasure-map-mcp`` command); it is replaced.
+  * ``stale``    — a tmap entry that differs (another path, ``--atlas``, an env); it is
+    replaced.
   * ``foreign``  — a ``treasure-map`` entry that is not tmap's; it is NEVER modified.
   * ``invalid``  — the file cannot be parsed; that client is not written.
   * ``shadowed`` — (Claude Code) the user entry is right, but a project-local entry of the same
@@ -108,7 +108,7 @@ class _Classified:
 
 
 def _is_tmap_command(command: object) -> bool:
-    return isinstance(command, str) and Path(command).name in ("tmap", "treasure-map-mcp")
+    return isinstance(command, str) and Path(command).name == "tmap"
 
 
 def classify(entry: object, tmap: Path | None) -> _Classified:
@@ -124,8 +124,6 @@ def classify(entry: object, tmap: Path | None) -> _Classified:
         return _Classified("foreign", f"command {command!r} is not tmap")
     if tmap is None:
         return _Classified("unknown", "cannot tell which tmap is running (not started as `tmap`)")
-    if Path(str(command)).name == "treasure-map-mcp":
-        return _Classified("stale", "uses the retired treasure-map-mcp command")
     if args != ["mcp"]:
         return _Classified("stale", f"args {args!r} (expected ['mcp'])")
     if env:

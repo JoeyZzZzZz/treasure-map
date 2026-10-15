@@ -45,7 +45,7 @@ class _Uv:
         return RunResult(0, "", "")
 
 
-_LISTING = "tmap-agents v0.1.0\n- tmap\ntreasure-map v0.1.0\n- tmap\n- treasure-map-mcp\n"
+_LISTING = "tmap-agents v0.1.0\n- tmap\n"
 
 
 def _plan(tmp_path: Path, uv: _Uv, prefix: Path, latest: str | None = "0.2.0") -> up.UpdatePlan:
@@ -61,13 +61,16 @@ def _plan(tmp_path: Path, uv: _Uv, prefix: Path, latest: str | None = "0.2.0") -
     )
 
 
-def test_the_plan_removes_the_old_tool_and_installs_the_newest(tmp_path: Path) -> None:
+def test_the_plan_installs_the_newest_and_touches_no_other_tool(tmp_path: Path) -> None:
+    """Another uv tool — whatever its name — is not tmap's to remove.
+
+    MUTATION: uninstall a tool by its name (the unrelated PyPI `treasure-map`) -> RED."""
     tools = tmp_path / "tools"
     (tools / "tmap-agents").mkdir(parents=True)
-    plan = _plan(tmp_path, _Uv(tools, _LISTING), tools / "tmap-agents")
-    assert plan.from_uv_tool and plan.newer and plan.remove_old_tool
-    lines = up.plan_lines(plan)
-    assert any("remove the old tool `treasure-map`" in ln for ln in lines)
+    uv = _Uv(tools, _LISTING + "treasure-map v0.1.3\n- dof\n")
+    plan = _plan(tmp_path, uv, tools / "tmap-agents")
+    assert plan.from_uv_tool and plan.newer
+    assert not any("uninstall" in ln for ln in up.plan_lines(plan))
     assert plan.install_argv("0.2.0")[-1] == "tmap-agents==0.2.0"
 
 
@@ -122,20 +125,19 @@ def _raise() -> str:
     raise OSError("offline")
 
 
-def test_update_removes_the_old_tool_before_installing_then_runs_the_new_init(
+def test_update_installs_the_newest_then_runs_the_new_init(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """★ Order matters: the old tool goes first (it may take the shared `tmap` command with it),
-    the new install last (it puts the command back), and the NEW program runs init.
+    """★ One change — the tmap-agents install, whatever other uv tools exist (an unrelated PyPI
+    `treasure-map` among them) — and the NEW program runs init.
 
-    MUTATION: skip removing the old tool -> RED; install before removing -> RED."""
+    MUTATION: uninstall another tool by its name -> RED."""
     tools = tmp_path / "tools"
     (tools / "tmap-agents").mkdir(parents=True)
-    uv = _Uv(tools, _LISTING)
+    uv = _Uv(tools, _LISTING + "treasure-map v0.1.3\n- dof\n")
     out, code, execs = _cli(monkeypatch, tmp_path, uv, ["--yes"], "0.2.0")
     changes = [c for c in uv.calls if c[1:3] in (["tool", "uninstall"], ["tool", "install"])]
     assert changes == [
-        ["/x/uv", "tool", "uninstall", "treasure-map"],
         ["/x/uv", "tool", "install", "--force", "--python", "3.11", "tmap-agents==0.2.0"],
     ]
     assert execs and execs[0][-1] == "init" and code == 0

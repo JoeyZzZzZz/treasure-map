@@ -17,9 +17,7 @@ __version__ = "0.1.0"
 # would instead let a comparison short-circuit into a silent "no skew".
 UNKNOWN_VERSION = "unknown"
 
-# The distribution names this package has been published under: the current one first, the name
-# a source checkout installed under before the rename second.
-_DIST_NAMES = ("tmap-agents", "treasure-map")
+_DIST_NAME = "tmap-agents"
 
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 
@@ -62,14 +60,12 @@ def installed_commit() -> str:
         a tree may describe some other build, so it is never read there.
       * an install from a package index, which writes no ``direct_url.json`` — the commit the
         release build baked into ``_build_info.py``.
-      * both distribution names installed in one environment — unknown: which of the two is
-        running cannot be told from here.
     """
-    dists = [d for d in (_dist(n) for n in _DIST_NAMES) if d is not None]
-    if len(dists) != 1:
+    dist = _dist(_DIST_NAME)
+    if dist is None:
         return UNKNOWN_VERSION
     try:
-        raw = dists[0].read_text("direct_url.json")
+        raw = dist.read_text("direct_url.json")
     except Exception:
         return UNKNOWN_VERSION
     if raw:

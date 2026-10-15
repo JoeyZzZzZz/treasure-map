@@ -11,7 +11,7 @@ authors = [
 ]
 keywords = ["iot", "firmware", "security", "reverse-engineering", "patch-diff"]
 classifiers = [
-    "Development Status :: 2 - Pre-Alpha",
+    "Development Status :: 3 - Alpha",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Security",
@@ -25,14 +25,12 @@ dependencies = [
     # The AI-facing MCP server is the substrate's primary consumer entry point, not an add-on:
     # `tmap mcp` must connect out of the box on any install, so its SDK is a core dependency
     # (imported at module top level like every other core dep, never behind an extra).
-    "mcp>=1.0,<2",  # 2.0 removed mcp.server.fastmcp (used by mcp_app); pin until we migrate the API
+    # >=1.21.2: older releases lack mcp.server.fastmcp (<1.2) or fail to import under a current
+    # pydantic (1.20, 1.21.0); <2: 2.0 removed mcp.server.fastmcp, which mcp_app uses.
+    "mcp>=1.21.2,<2",
 ]
 
 [project.optional-dependencies]
-rag = [
-    "chromadb>=0.5",
-    "sentence-transformers>=3.0",
-]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",

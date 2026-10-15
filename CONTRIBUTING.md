@@ -15,6 +15,15 @@ By submitting a contribution you confirm that you have the right to do so — it
 you have permission to contribute it under Apache-2.0. If you include code from elsewhere, keep its
 license notice and say where it comes from in the pull request.
 
+## Developer Certificate of Origin
+
+Every commit in a pull request must be signed off: commit with `git commit -s`, which adds a
+`Signed-off-by: Your Name <you@example.com>` line matching the commit's author. The sign-off
+certifies the [Developer Certificate of Origin 1.1](https://developercertificate.org/) — in short,
+that you wrote the change or otherwise have the right to submit it under the project's license. A
+CI check verifies the sign-off on each commit of the pull request; to fix a missing one, run
+`git commit --amend -s` (or `git rebase --signoff main` for several commits) and push again.
+
 ## Reporting bugs
 
 Open an issue with:

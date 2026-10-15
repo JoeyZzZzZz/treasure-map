@@ -21,7 +21,9 @@ def uninstall(purge_data: bool, assume_yes: bool, dry_run: bool) -> None:
 
     Only what the install ledger records is removed — never a JDK, Ghidra or BinDiff you
     installed yourself. config.yaml, .env, the atlas and the workspaces stay unless
-    --purge-data is given and you type the confirmation phrase (--yes does not stand in for it).
+    --purge-data is given and you type the confirmation phrase (--yes does not stand in for it);
+    even then only what is provably tmap's goes: the atlas and the workspace directories when they
+    are tmap's databases, config.yaml and .env when tmap init wrote them.
     """
     from treasure_map.lib.config.config import load_config
     from treasure_map.lib.errors import ConfigError
@@ -56,11 +58,15 @@ def uninstall(purge_data: bool, assume_yes: bool, dry_run: bool) -> None:
         click.echo(f"  • {line}")
     if self_argv is not None:
         click.echo(f"  • last: remove the tmap program itself ({' '.join(self_argv[1:])})")
-    data = un.data_paths(cfg.atlas.db_path, cfg.workspace_dir)
+    data = un.purge_plan(
+        tm_home=tm_home, atlas=cfg.atlas.db_path, workspace_dir=cfg.workspace_dir, home=home
+    )
     if purge_data:
         click.echo("  • --purge-data: delete (after you type the phrase):")
-        for line in un.describe_data(data):
+        for line in un.describe_data(data.delete):
             click.echo(f"      {line}")
+        for line in data.keep:
+            click.echo(f"      keep {line}")
     if dry_run:
         click.echo("Dry run: nothing changed.")
         return
@@ -80,23 +86,21 @@ def uninstall(purge_data: bool, assume_yes: bool, dry_run: bool) -> None:
     for line in report.refused + report.manual:
         click.echo(f"  ✗ {line}")
     purged = False
-    if purge_data and data:
+    if purge_data and data.delete:
         answer = click.prompt(
             f'Type "{un.PURGE_PHRASE}" to delete the data above', default="", show_default=False
         )
         purged = un.purge_data(data, answer)
         click.echo("  ✓ data deleted" if purged else "  data kept (phrase not entered)")
-    kept = [
-        tm_home / "config.yaml",
-        tm_home / ".env",
-        tm_home / "last_run.json",
-    ]
     click.echo("kept:")
-    for p in kept:
-        if p.exists():
-            click.echo(f"  {p}")
-    if not purged:
-        for p in data:
+    if purged:
+        for line in data.keep:
+            click.echo(f"  {line}")
+    else:
+        for p in (tm_home / "config.yaml", tm_home / ".env", tm_home / "last_run.json"):
+            if p.exists() and p not in data.delete:
+                click.echo(f"  {p}")
+        for p in data.delete:
             click.echo(f"  {p}")
     click.echo("  any JDK / Ghidra / BinDiff tmap did not install")
     if self_argv is None:

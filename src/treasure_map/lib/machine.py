@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Machine capability probe — physical cores + memory, and the parallelism they imply.
 
-Zero third-party dependencies (Linux ``/proc`` + ``lscpu`` + ``os.cpu_count`` only). Used by
-``tmap init`` to derive ``max_parallel_jvms`` once at setup, and by the scan/diff parallel pools to
-clamp that stable value down at runtime if the machine is momentarily short on memory.
+Zero third-party dependencies (Linux ``/proc`` + ``lscpu``, macOS ``sysctl``, ``os.cpu_count``).
+Used by ``tmap init`` to derive ``max_parallel_jvms`` once at setup, and by the scan/diff parallel
+pools to clamp that stable value down at runtime if the machine is momentarily short on memory.
 
 The two axes come from owner real-machine measurement, not guesses:
   * CPU: the effective parallelism knee is the PHYSICAL core count, not the logical count. Ghidra
@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import sys
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -86,6 +87,21 @@ def _cores_from_lscpu() -> int:
     return per_socket * sockets
 
 
+def _platform() -> str:
+    return sys.platform
+
+
+def _sysctl_int(name: str) -> int:
+    """``sysctl -n NAME`` as an integer (macOS), or 0 when it cannot be read."""
+    try:
+        out = subprocess.run(  # noqa: S603,S607 -- fixed argv, no shell
+            ["sysctl", "-n", name], capture_output=True, text=True, timeout=5
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    return _int_or_zero(out)
+
+
 def _int_or_zero(s: str) -> int:
     try:
         return int(s.strip())
@@ -104,6 +120,11 @@ def physical_cores(cpuinfo_path: str = _CPUINFO) -> CoreProbe:
     machine still lands on 1 via the tail rungs, so the gate only fixes the bogus-1 case, never
     understates a real multi-core box. The chosen rung rides on the return so the caller can log it.
     """
+    if _platform() == "darwin":
+        # no /proc, no lscpu; Apple Silicon has no SMT, so halving cpu_count would be wrong
+        n = _sysctl_int("hw.physicalcpu")
+        if n >= 1:
+            return CoreProbe(n, "sysctl hw.physicalcpu")
     n = _cores_from_cpuinfo(cpuinfo_path)
     if n > 1:
         return CoreProbe(n, "cpuinfo")
@@ -118,16 +139,34 @@ def physical_cores(cpuinfo_path: str = _CPUINFO) -> CoreProbe:
     return CoreProbe(max(1, logical), "cpu_count")
 
 
-def mem_total_mb(meminfo_path: str = _MEMINFO) -> int:
-    """MemTotal in MB, or a conservative 4096 if ``/proc/meminfo`` is unreadable."""
+@dataclass(frozen=True)
+class MemProbe:
+    """Total memory in MB and where the number came from — ``assumed`` when nothing could be read,
+    so a fallback is never reported as a measurement."""
+
+    mb: int
+    method: str
+
+
+def mem_total(meminfo_path: str = _MEMINFO) -> MemProbe:
+    """MemTotal from ``/proc/meminfo`` (Linux) or ``hw.memsize`` (macOS); else an assumed 4096."""
+    if _platform() == "darwin":
+        size = _sysctl_int("hw.memsize")
+        if size > 0:
+            return MemProbe(size // (1024 * 1024), "sysctl hw.memsize")
     try:
         with open(meminfo_path) as fh:
             for line in fh:
                 if line.startswith("MemTotal"):
-                    return int(line.split()[1]) // 1024
+                    return MemProbe(int(line.split()[1]) // 1024, "meminfo")
     except OSError:
         pass
-    return 4096
+    return MemProbe(4096, "unknown, assumed")
+
+
+def mem_total_mb(meminfo_path: str = _MEMINFO) -> int:
+    """``mem_total(...).mb``."""
+    return mem_total(meminfo_path).mb
 
 
 def mem_available_mb(meminfo_path: str = _MEMINFO) -> int | None:

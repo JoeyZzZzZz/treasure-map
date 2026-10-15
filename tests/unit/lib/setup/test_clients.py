@@ -83,7 +83,6 @@ def test_a_foreign_entry_is_never_modified(tmp_path: Path, tmap: Path) -> None:
 @pytest.mark.parametrize(
     "entry",
     [
-        {"command": "/old/bin/treasure-map-mcp", "args": []},
         {"command": "TMAP", "args": ["mcp", "--atlas", "/x/atlas.db"]},
         {"command": "TMAP", "args": ["mcp"], "env": {"TREASURE_MAP_ATLAS_DB": "/x"}},
         {"command": "/elsewhere/tmap", "args": ["mcp"]},

@@ -53,23 +53,17 @@ def update(check: bool, assume_yes: bool) -> None:
         return
     if check:
         return
-    if latest is None and not plan.remove_old_tool:
+    if latest is None:
         raise SystemExit(1)
     if not plan.has_work:
-        click.echo("tmap is up to date; nothing to remove.")
+        click.echo("tmap is up to date.")
         return
     if not assume_yes and not click.confirm("Proceed?", default=True):
         click.echo("Nothing changed.")
         return
 
-    steps: list[list[str]] = []
-    if plan.remove_old_tool:
-        steps.append(plan.remove_old_argv())
     target = plan.latest if plan.newer and plan.latest is not None else plan.current
-    # Always (re)install last: removing the old tool may take the shared `tmap` command with it,
-    # and this puts it back pointing at tmap-agents.
-    steps.append(plan.install_argv(target))
-    ok, why = up.run_steps(steps, host.run)
+    ok, why = up.run_steps([plan.install_argv(target)], host.run)
     if not ok:
         click.echo(f"✗ {why}", err=True)
         back_ok, _ = up.run_steps([plan.install_argv(plan.current)], host.run)
@@ -79,10 +73,7 @@ def update(check: bool, assume_yes: bool) -> None:
             err=True,
         )
         raise SystemExit(1)
-    click.echo(
-        f"✓ tmap {target} installed"
-        + (f"; `{up.OLD_DIST}` removed" if plan.remove_old_tool else "")
-    )
+    click.echo(f"✓ tmap {target} installed")
     for p in plan.shadowing:
         click.echo(f"note: {p} is another tmap on PATH and may run instead of the new one")
     tmap = tmap_executable()

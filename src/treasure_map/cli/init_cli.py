@@ -161,6 +161,8 @@ def _run(**kwargs: object) -> InitResult:
         raise click.ClickException(str(exc)) from exc
     except TreasureMapError as exc:
         raise click.ClickException(f"{type(exc).__name__}: {exc}") from exc
+    except OSError as exc:  # ~/.treasure-map itself cannot be written: say what, no traceback
+        raise click.ClickException(str(exc)) from exc
     except (KeyboardInterrupt, click.exceptions.Abort) as exc:
         # Ctrl-C at a raw-mode key, or at any line prompt (click turns that into Abort): the same
         # interruption, the same 130.
@@ -242,7 +244,7 @@ def init(
     if not check_only:
         click.echo("")
         click.echo(f"  Config : {result.config_path}")
-        click.echo(f"  Secrets: {result.env_path}")
+        click.echo(f"  .env   : {result.env_path}")
         click.echo(f"  Atlas  : {result.atlas_dir}")
         click.echo("")
     any_red = render_checks(result)

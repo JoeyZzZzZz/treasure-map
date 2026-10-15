@@ -16,7 +16,6 @@ from treasure_map.lib.errors import ConfigError
 logger = logging.getLogger(__name__)
 
 _DEFAULT_CONFIG_PATH = Path.home() / ".treasure-map" / "config.yaml"
-_LOCAL_CONFIG_PATH = Path("config.yaml")
 
 
 class AtlasConfig(BaseModel):
@@ -167,7 +166,11 @@ def _merge_file(raw: dict[str, Any], path: Path) -> dict[str, Any]:
 
 
 def load_config(extra_path: Path | None = None) -> Config:
-    """Load config from ~/.treasure-map/config.yaml, ./config.yaml, env vars (in that order)."""
+    """Load config from ~/.treasure-map/config.yaml, then ``extra_path`` (``-c``), then TM_* env
+    vars, each over the last.
+
+    Never from the working directory: tmap is run inside unpacked, untrusted firmware trees, and a
+    ``config.yaml`` there would choose the Ghidra it executes and what goes first on PATH."""
     env_file_override = os.environ.get("TM_ENV_FILE")
     _source_env_file(
         Path(env_file_override) if env_file_override else Path.home() / ".treasure-map" / ".env"
@@ -175,7 +178,7 @@ def load_config(extra_path: Path | None = None) -> Config:
 
     raw: dict[str, Any] = {}
 
-    paths = [_DEFAULT_CONFIG_PATH, _LOCAL_CONFIG_PATH]
+    paths = [_DEFAULT_CONFIG_PATH]
     if extra_path is not None:
         paths.append(extra_path)
     for path in paths:

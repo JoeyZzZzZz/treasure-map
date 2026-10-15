@@ -23,6 +23,7 @@ import yaml
 
 from treasure_map.lib.config.config import Config, _source_env_file
 from treasure_map.lib.errors import TreasureMapError
+from treasure_map.lib.setup.tmap_files import ENV_TEXT, config_text
 
 logger = logging.getLogger(__name__)
 
@@ -72,16 +73,6 @@ class InitResult:
     runs: Any = None  # doctor.RunsCurrency | None
 
 
-def _collect_default_env_vars() -> list[str]:
-    """API key env var names to scaffold into .env.
-
-    The tool ships no built-in secrets — analysis is hermetic (no network calls), so there
-    are no default keys to provision. Returns an empty list; the .env scaffold stays a bare
-    placeholder the operator can add their own TM_* / env vars to.
-    """
-    return []
-
-
 def _provision_dirs(paths: Iterable[Path]) -> None:
     for d in paths:
         d.mkdir(parents=True, exist_ok=True)
@@ -113,63 +104,17 @@ def _write_config(
         echo("  Config : config.yaml exists — reusing (pass --force to regenerate the structure).")
         return
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(yaml.safe_dump(_DEFAULT_CONFIG_YAML, default_flow_style=False))
+    config_path.write_text(config_text(config_path, _DEFAULT_CONFIG_YAML))
 
 
-def _existing_env_keys(env_path: Path) -> set[str]:
-    """Return the variable names already present in an existing .env (KEY=value lines)."""
-    keys: set[str] = set()
-    for line in env_path.read_text().splitlines():
-        stripped = line.strip()
-        if stripped and not stripped.startswith("#") and "=" in stripped:
-            keys.add(stripped.split("=", 1)[0].strip())
-    return keys
-
-
-def _write_env(
-    env_path: Path,
-    *,
-    env_vars: list[str],
-    prompt: Callable[[str], str],
-    non_interactive: bool,
-    echo: Callable[[str], None] = _noop_echo,
-) -> None:
-    """Write .env on first run; on a re-run never clobber existing secrets (idempotent).
-
-    If .env already exists, present keys are preserved untouched and only configured vars
-    that are MISSING are prompted for and appended — pressing Enter on a re-run can never
-    wipe a saved key. This is independent of --force: init never regenerates or deletes .env.
-    """
-    env_path.parent.mkdir(parents=True, exist_ok=True)
-
+def _write_env(env_path: Path, *, echo: Callable[[str], None] = _noop_echo) -> None:
+    """Create ~/.treasure-map/.env — KEY=value lines every tmap command sets, unless the variable
+    is already in its environment — when there is none. An existing .env is never changed."""
     if env_path.exists():
-        present = _existing_env_keys(env_path)
-        missing = [v for v in env_vars if v not in present]
-        if non_interactive or not missing:
-            echo(f"  Secrets: keeping existing .env ({len(present)} keys).")
-            return
-        appended: list[str] = []
-        for var_name in missing:
-            value = prompt(f"Enter value for {var_name} (press Enter to skip)").strip()
-            if value:
-                appended.append(f"{var_name}={value}\n")
-        if appended:
-            with env_path.open("a") as fh:
-                fh.write("".join(appended))
-        echo(f"  Secrets: kept existing .env ({len(present)} keys), added {len(appended)}.")
-        os.chmod(env_path, 0o600)
+        echo(f"  .env   : {env_path} exists — kept as it is.")
         return
-
-    lines: list[str] = []
-    for var_name in env_vars:
-        value = (
-            ""
-            if non_interactive
-            else prompt(f"Enter value for {var_name} (press Enter to skip)").strip()
-        )
-        if value:
-            lines.append(f"{var_name}={value}\n")
-    env_path.write_text("".join(lines))
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    env_path.write_text(ENV_TEXT)
     os.chmod(env_path, 0o600)
 
 
@@ -193,7 +138,7 @@ def _set_ghidra_home(config_path: Path, home: Path) -> None:
     """Write ghidra.local.home into config.yaml, preserving the rest of the file."""
     data: dict[str, Any] = yaml.safe_load(config_path.read_text()) or {}
     data.setdefault("ghidra", {}).setdefault("local", {})["home"] = str(home)
-    config_path.write_text(yaml.safe_dump(data, default_flow_style=False))
+    config_path.write_text(config_text(config_path, data))
 
 
 def _default_workspace_dir() -> str:
@@ -216,7 +161,7 @@ def _set_workspace_dir(config_path: Path, value: str) -> None:
     """Write the top-level workspace_dir into config.yaml, preserving the rest of the file."""
     data: dict[str, Any] = yaml.safe_load(config_path.read_text()) or {}
     data["workspace_dir"] = value
-    config_path.write_text(yaml.safe_dump(data, default_flow_style=False))
+    config_path.write_text(config_text(config_path, data))
 
 
 def _configure_workspace_dir(
@@ -260,7 +205,7 @@ def _set_max_parallel(config_path: Path, value: int) -> None:
     """Write ghidra.max_parallel_jvms into config.yaml, preserving the rest of the file."""
     data: dict[str, Any] = yaml.safe_load(config_path.read_text()) or {}
     data.setdefault("ghidra", {})["max_parallel_jvms"] = value
-    config_path.write_text(yaml.safe_dump(data, default_flow_style=False))
+    config_path.write_text(config_text(config_path, data))
 
 
 def _configure_parallelism(
@@ -279,7 +224,7 @@ def _configure_parallelism(
     """
     from treasure_map.lib.machine import (
         derive_parallelism,
-        mem_total_mb,
+        mem_total,
         physical_cores,
     )
 
@@ -288,12 +233,12 @@ def _configure_parallelism(
         echo(f"  Parallelism: max_parallel_jvms={current} (kept; --force to re-detect).")
         return
     probe = physical_cores()
-    mem = mem_total_mb()
-    derived = derive_parallelism(probe.count, mem)
+    mem = mem_total()
+    derived = derive_parallelism(probe.count, mem.mb)
     _set_max_parallel(config_path, derived)
     echo(
-        f"  Parallelism: detected {probe.count} physical cores ({probe.method}) / {mem}MB "
-        f"-> max_parallel_jvms={derived}."
+        f"  Parallelism: {probe.count} physical cores ({probe.method}) / {mem.mb}MB "
+        f"({mem.method}) -> max_parallel_jvms={derived}."
     )
 
 
@@ -317,11 +262,19 @@ def _configure_completion(
     Returns (the installed script, the rc now carrying the activation block) — what the install
     ledger records so ``tmap uninstall`` removes exactly these and nothing else.
     """
-    from treasure_map.lib.setup.completion import detect_shell, install_completion
+    from treasure_map.lib.setup.completion import (
+        detect_shell,
+        install_completion,
+        unsupported_reason,
+    )
 
     shell = detect_shell()
     if shell is None:
         echo("  Completion: shell is not bash/zsh — skipped (nothing to install).")
+        return None, None
+    why = unsupported_reason(shell)
+    if why is not None:
+        echo(f"  Completion: {why} — skipped.")
         return None, None
     try:
         outcome = install_completion(shell, Path.home())
@@ -401,6 +354,44 @@ _GHIDRA_HOME_KEY = ("ghidra", "local", "home")
 _JAVA_HOME_KEY = ("toolchain", "java_home")
 _BINDIFF_KEY = ("toolchain", "bindiff")
 _WORKSPACE_KEY = ("workspace_dir",)
+_ATLAS_KEY = ("atlas", "db_path")
+
+
+def _flatten(node: Any, prefix: str = "") -> dict[str, Any]:
+    """A nested mapping as ``{"a.b.c": leaf}``."""
+    if not isinstance(node, dict):
+        return {prefix: node} if prefix else {}
+    out: dict[str, Any] = {}
+    for k, v in node.items():
+        out.update(_flatten(v, f"{prefix}.{k}" if prefix else str(k)))
+    return out
+
+
+def _force_resets(raw: dict[str, Any], kept: dict[tuple[str, ...], str]) -> list[str]:
+    """What ``--force`` changes in a readable config.yaml: every value it holds that the rebuilt
+    file (the defaults plus ``kept``) will not — so the plan names each one before it goes."""
+    after = _flatten(_DEFAULT_CONFIG_YAML)
+    after.update({".".join(k): v for k, v in kept.items()})
+    out = []
+    for key, old in _flatten(raw).items():
+        if key == "ghidra.max_parallel_jvms":
+            continue  # re-detected, listed on its own
+        new = after.get(key)
+        if old != new and not _same_path(old, new):
+            out.append(f"{key}: {old!r} -> {'unset' if key not in after else repr(new)}")
+    return out
+
+
+def _backup_config(config_path: Path) -> Path:
+    """Copy config.yaml to the first free ``config.yaml.tmap.backup[.N]``; an earlier backup is
+    never overwritten."""
+    base = config_path.with_name(config_path.name + ".tmap.backup")
+    backup, n = base, 0
+    while backup.exists():
+        n += 1
+        backup = base.with_name(f"{base.name}.{n}")
+    shutil.copy2(config_path, backup)
+    return backup
 
 
 def _read_config(config_path: Path) -> tuple[Config | None, dict[str, Any], str | None]:
@@ -446,7 +437,7 @@ def _set_keys(config_path: Path, values: dict[tuple[str, ...], str]) -> None:
                 node[k] = child
             node = child
         node[keys[-1]] = value
-    config_path.write_text(yaml.safe_dump(data, default_flow_style=False))
+    config_path.write_text(config_text(config_path, data))
 
 
 def _ask_workspace_dir(
@@ -953,6 +944,8 @@ def run_init(
         desired[_WORKSPACE_KEY] = workspace
     elif force:  # --force rebuilds the structure: carry the kept workspace base across
         desired[_WORKSPACE_KEY] = _configured_workspace_dir(config_path)
+    if force and cfg_error is None and isinstance(_raw_get(raw_cfg, _ATLAS_KEY), str):
+        desired[_ATLAS_KEY] = str(_raw_get(raw_cfg, _ATLAS_KEY))  # where the data is, kept too
     changed = {
         k: v
         for k, v in desired.items()
@@ -965,7 +958,13 @@ def run_init(
                 "write config.yaml",
                 target=config_path,
                 lines=[f"{'.'.join(k)}: {v}" for k, v in changed.items()]
-                + (["ghidra.max_parallel_jvms: re-detected"] if force else []),
+                + (["ghidra.max_parallel_jvms: re-detected"] if force else [])
+                + (
+                    [f"reset {r}" for r in _force_resets(raw_cfg, desired)]
+                    + [f"the current file is backed up first ({config_path.name}.tmap.backup)"]
+                    if force and cfg_error is None and config_path.exists()
+                    else []
+                ),
                 values={".".join(k): v for k, v in changed.items()},
             )
         )
@@ -1085,18 +1084,10 @@ def run_init(
 
     # 5. apply
     _provision_dirs([tm_home])
-    if cfg_error is not None:
-        backup = config_path.with_name(config_path.name + ".tmap.backup")
-        if not backup.exists():
-            shutil.copy2(config_path, backup)
+    if cfg_error is not None or (force and config_path.exists()):
+        echo(f"  Config : backed up to {_backup_config(config_path)}")
     _write_config(config_path, force=force or cfg_error is not None, echo=echo)
-    _write_env(
-        env_path,
-        env_vars=_collect_default_env_vars(),
-        prompt=prompt,
-        non_interactive=(mode != "interactive"),
-        echo=echo,
-    )
+    _write_env(env_path, echo=echo)
     _seed_watchlist()
 
     tres = ToolchainResult(java_home=j.path, ghidra_home=g.path, bindiff=b.path)
@@ -1145,12 +1136,17 @@ def run_init(
 
     for a in plan.actions:
         if a.kind == "register_client" and a.client is not None:
-            out = cl.register(
-                a.client,
-                chost,
-                tmap_path,
-                confirm_quit=_confirm_quit if mode == "interactive" else None,
-            )
+            try:
+                out = cl.register(
+                    a.client,
+                    chost,
+                    tmap_path,
+                    confirm_quit=_confirm_quit if mode == "interactive" else None,
+                )
+            except OSError as exc:  # a permission or disk error: this agent only, reported
+                echo(f"  ✗ {cl.LABELS[a.client]}: {exc}")
+                needs_you.append(f"{cl.LABELS[a.client]}: could not write its configuration: {exc}")
+                continue
             echo(f"  {'✓' if out.ok else '✗'} {cl.LABELS[a.client]}: {out.message}")
             if out.ok:
                 registered.append(cl.LABELS[a.client])
@@ -1159,7 +1155,12 @@ def run_init(
                     f"{cl.LABELS[a.client]}: {out.message}; add by hand:\n{out.manual}"
                 )
         elif a.kind == "remove_shadowing_entry" and a.project_dir is not None:
-            out = cl.remove_shadowing(chost, a.project_dir)
+            try:
+                out = cl.remove_shadowing(chost, a.project_dir)
+            except OSError as exc:
+                echo(f"  ✗ {a.project_dir}: {exc}")
+                needs_you.append(f"remove the local-scope entry in {a.project_dir}: {exc}")
+                continue
             echo(f"  {'✓' if out.ok else '✗'} {out.message}")
             if not out.ok and out.manual:
                 needs_you.append(f"{out.message}; run: {out.manual}")
@@ -1178,7 +1179,10 @@ def run_init(
             ledger.commit("completion")
 
     if cfg is not None:
-        _provision_dirs(_configured_dirs(cfg))
+        try:
+            _provision_dirs(_configured_dirs(cfg))
+        except OSError as exc:
+            needs_you.append(f"create the atlas and workspace directories: {exc}")
     _source_env_file(env_path)
 
     # 6. doctor

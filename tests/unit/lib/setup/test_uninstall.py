@@ -14,12 +14,34 @@ from treasure_map.lib.diff.toolchain import binexport_lib_digest
 from treasure_map.lib.setup import clients as cl
 from treasure_map.lib.setup import uninstall as un
 from treasure_map.lib.setup.ledger import LEDGER_NAME, Ledger
+from treasure_map.lib.setup.tmap_files import ENV_TEXT, config_text
 
 from . import fakes
 
 
 def _chost(home: Path) -> cl.ClientHost:
     return cl.ClientHost(home, {}, fakes.linux(), lambda _n: None, fakes.fake_run())
+
+
+def _tmap_db(path: Path, tables: tuple[str, ...]) -> Path:
+    import sqlite3
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    for name in tables:
+        conn.execute(f"CREATE TABLE {name} (id INTEGER)")
+    conn.commit()
+    conn.close()
+    return path
+
+
+def _atlas(path: Path) -> Path:
+    return _tmap_db(path, ("run", "instance"))
+
+
+def _workspace(path: Path) -> Path:
+    _tmap_db(path / "analysis.db", ("binaries", "functions"))
+    return path
 
 
 def _run(home: Path) -> un.UninstallReport:
@@ -118,8 +140,8 @@ def test_data_stays_without_the_phrase(tmp_path: Path) -> None:
 
     home = Path.home()
     tm = home / ".treasure-map"
-    (tm / "atlas.db").write_bytes(b"atlas")
-    (tm / "workspaces" / "w1").mkdir(parents=True)
+    _atlas(tm / "atlas.db")
+    _workspace(tm / "workspaces" / "w1")
     result = CliRunner().invoke(uninstall, ["--yes"], input="")
     assert result.exit_code == 0, result.output
     assert (tm / "atlas.db").exists() and (tm / "workspaces" / "w1").exists()
@@ -130,6 +152,69 @@ def test_data_stays_without_the_phrase(tmp_path: Path) -> None:
     assert not (tm / "atlas.db").exists() and not (tm / "workspaces").exists()
     # not running from uv's tool environment here: the program is left to the user
     assert "the tmap program stays" in result.output
+
+
+def test_purge_deletes_only_what_is_provably_tmaps(tmp_path: Path) -> None:
+    """★ The workspace base may be any directory the user named: only its tmap workspaces go,
+    and the base stays while anything else is in it. config.yaml / .env go only when tmap wrote
+    them.
+
+    MUTATION: delete the whole workspace base (rmtree) -> the user's directory and file go -> RED.
+    MUTATION: delete .env whoever wrote it -> the user's .env goes -> RED."""
+    home = tmp_path / "home"
+    tm = home / ".treasure-map"
+    base = tmp_path / "projects"
+    _workspace(base / "w1")
+    (base / "mine").mkdir()
+    (base / "mine" / "notes.txt").write_text("mine")
+    (base / "plain").mkdir()  # no analysis.db: not provably a workspace
+    _atlas(tm / "atlas.db")
+    (tm / "config.yaml").write_text(config_text(tm / "config.yaml", {"workspace_dir": str(base)}))
+    (tm / ".env").write_text("MY_KEY=1\n")
+    plan = un.purge_plan(tm_home=tm, atlas=tm / "atlas.db", workspace_dir=base, home=home)
+    assert un.purge_data(plan, un.PURGE_PHRASE)
+    assert not (base / "w1").exists() and not (tm / "atlas.db").exists()
+    assert (base / "mine" / "notes.txt").is_file() and (base / "plain").is_dir()
+    assert not (tm / "config.yaml").exists()
+    assert (tm / ".env").is_file() and (tm / ".env").read_text() == "MY_KEY=1\n"
+    assert any(".env: not written by tmap init" in k for k in plan.keep)
+    assert any("2 entries that are not tmap workspaces" in k for k in plan.keep)
+
+
+def test_purge_takes_tmaps_env_and_an_older_inits_empty_one(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    tm = home / ".treasure-map"
+    tm.mkdir(parents=True, exist_ok=True)
+    (tm / ".env").write_text(ENV_TEXT + "TM_X=1\n")  # tmap's, edited since: still tmap's
+    plan = un.purge_plan(tm_home=tm, atlas=tm / "atlas.db", workspace_dir=tm / "ws", home=home)
+    assert tm / ".env" in plan.delete
+    (tm / ".env").write_text("")
+    plan = un.purge_plan(tm_home=tm, atlas=tm / "atlas.db", workspace_dir=tm / "ws", home=home)
+    assert tm / ".env" in plan.delete
+
+
+def test_purge_deletes_no_workspace_when_the_base_is_home_or_above(tmp_path: Path) -> None:
+    """★ workspace_dir: "~" (or "/") must not turn a purge into deleting the user's directories,
+    even ones holding a tmap analysis.db.
+
+    MUTATION: drop the home/ancestor refusal -> the directory under home goes -> RED."""
+    home = tmp_path / "home"
+    tm = home / ".treasure-map"
+    _workspace(home / "proj")
+    for base in (home, tmp_path):
+        plan = un.purge_plan(tm_home=tm, atlas=tm / "atlas.db", workspace_dir=base, home=home)
+        assert home / "proj" not in plan.delete and base not in plan.rmdir_if_empty
+        assert any("the home directory or above it" in k for k in plan.keep)
+
+
+def test_a_non_tmap_atlas_is_kept(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    tm = home / ".treasure-map"
+    tm.mkdir(parents=True, exist_ok=True)
+    (tm / "atlas.db").write_bytes(b"not a database")
+    plan = un.purge_plan(tm_home=tm, atlas=tm / "atlas.db", workspace_dir=tm / "ws", home=home)
+    assert tm / "atlas.db" not in plan.delete
+    assert any("not a tmap atlas" in k for k in plan.keep)
 
 
 def test_uv_self_uninstall_only_for_the_uv_tool_environment(tmp_path: Path) -> None:
@@ -264,3 +349,53 @@ def test_an_unreadable_config_is_reported_not_skipped(tmp_path: Path) -> None:
     ledger.commit("jdk")
     report = _run(home)
     assert any("config.yaml is unreadable" in m for m in report.manual)
+
+
+def test_the_rc_block_comes_out_of_a_non_utf8_rc_byte_for_byte(tmp_path: Path) -> None:
+    """An rc with a latin-1 line: the block goes, every other byte stays.
+
+    MUTATION: read the rc as UTF-8 text -> UnicodeDecodeError, nothing removed -> RED."""
+    from treasure_map.lib.setup.completion import _MARK_END, _MARK_START
+
+    rc = tmp_path / ".zshrc"
+    mine = b"# caf\xe9\nalias l=ls\n"
+    rc.write_bytes(mine + f"\n{_MARK_START}\nfpath=(x $fpath)\n{_MARK_END}\n".encode())
+    outcome = "ok"
+    try:
+        note = un._remove_rc_block(rc)
+    except Exception as exc:  # noqa: BLE001 -- the mutation's failure must read as an assertion
+        outcome, note = repr(exc), ""
+    assert outcome == "ok" and note.startswith("removed")
+    assert rc.read_bytes() == mine
+
+
+def test_a_failed_rc_rewrite_leaves_the_rc_and_the_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rc is rewritten atomically: a failure mid-write leaves it exactly as it was, says so,
+    and keeps the ledger entry so a later run removes the block.
+
+    MUTATION: rewrite the rc in place (write_text) -> it is changed and reported removed -> RED."""
+    from treasure_map.lib.setup.completion import _MARK_END, _MARK_START, target_path
+
+    home = Path.home()
+    tm = home / ".treasure-map"
+    script = target_path("zsh", home)
+    assert script is not None
+    script.parent.mkdir(parents=True)
+    script.write_text("#compdef tmap\n")
+    rc = home / ".zshrc"
+    before = f"# mine\n\n{_MARK_START}\nfpath=(x $fpath)\n{_MARK_END}\n"
+    rc.write_text(before)
+    ledger = Ledger(tm / "toolchain" / LEDGER_NAME)
+    ledger.add_pending("completion", "file", script, rc_block=str(rc))
+    ledger.commit("completion")
+
+    def _no_disk(_path: Path, _data: bytes, _mode: int) -> None:
+        raise OSError("disk full")  # the atomic writer fails before its rename: nothing changed
+
+    monkeypatch.setattr(cl, "_atomic_write", _no_disk)
+    report = _run(home)
+    assert rc.read_text() == before
+    assert any("could not write" in m for m in report.manual)
+    assert Ledger.load(tm / "toolchain" / LEDGER_NAME).find("completion") is not None

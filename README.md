@@ -223,15 +223,14 @@ such entries out).
 ## Upgrading
 
 ```bash
-tmap update                                 # newest tmap in, old tmap out
+tmap update                                 # install the newest tmap
 tmap rescan                                 # re-scan every run an older tmap made
 tmap diff --before fw-v1 --after fw-v2      # re-runs the diffs that are out of date
 ```
 
 `tmap update` checks PyPI for the newest version, shows its plan and asks once (`--check` only
-reports, `--yes` skips the question). It replaces the installed version, removes the older
-`treasure-map` tool if it is still there, names any other `tmap` on PATH that would shadow the new
-one, and then starts the new version's `tmap init` by itself — you do not type it. That init also
+reports, `--yes` skips the question). It replaces the installed version, names any other `tmap` on
+PATH that would shadow the new one, and then starts the new version's `tmap init` by itself — you do not type it. That init also
 tells you how many of your runs predate the new version. A diff made by an older tmap, or with
 another toolchain, is recomputed once.
 
@@ -275,9 +274,12 @@ It shows its plan, asks once, then removes the treasure-map entry from each agen
 toolchain `tmap init` downloaded (never a JDK, Ghidra or BinDiff you installed yourself), and offers
 to remove the program itself.
 
-**Your data stays:** `~/.treasure-map/config.yaml`, the **atlas** and the workspaces — reinstalling
-reuses all of it. `tmap uninstall --purge-data` deletes them too, after you type a confirmation
-phrase (not recoverable).
+**Your data stays:** `~/.treasure-map/config.yaml`, `.env`, the **atlas** and the workspaces —
+reinstalling reuses all of it. `tmap uninstall --purge-data` deletes them too, after you type a
+confirmation phrase (not recoverable), but only what is provably tmap's: the atlas, each workspace
+directory holding a tmap `analysis.db` (never the workspace base itself, and nothing when the base
+is your home directory or above it), and the `config.yaml` / `.env` that `tmap init` wrote. A file
+you wrote yourself, and anything else in the workspace base, is kept and listed.
 
 <details>
 <summary>Details</summary>
@@ -314,7 +316,8 @@ ensuring your activity is lawful in your jurisdiction. If unsure, consult qualif
 
 ## Contributing
 
-Issues and pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
+Issues and pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). Each commit in a pull
+request is signed off with `git commit -s` ([DCO](https://developercertificate.org/)).
 
 ## License
 

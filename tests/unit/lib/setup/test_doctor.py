@@ -189,3 +189,35 @@ def test_the_config_check() -> None:
     assert _config_check(_inputs(Path.home())).state == "wrong"
     (tm / "config.yaml").write_text("log_level: INFO\n")
     assert _config_check(_inputs(Path.home())).state == "ok"
+
+
+def test_an_inactive_completion_warns_without_failing_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh zsh user after `tmap init --yes`: the script is installed, the rc is (rightly) not
+    edited without a yes. tmap works; the line to add is shown.
+
+    MUTATION: count installed-but-inactive as wrong -> RED."""
+    from treasure_map.lib.setup import doctor
+
+    detail = "zsh: installed at /x/_tmap; not active yet — add this line to ~/.zshrc: fpath=(…)"
+    monkeypatch.setattr(
+        "treasure_map.lib.setup.completion.completion_check",
+        lambda _home, shell=None: ("completion", False, detail),
+    )
+    checks = doctor._dir_checks(_inputs(tmp_path, tm_home=tmp_path / ".treasure-map"))
+    comp = next(c for c in checks if c.name == "completion")
+    assert comp.state == "warn" and comp.ok and comp.detail == detail
+
+
+def test_the_doctor_does_not_read_the_macos_java_stub_as_a_jdk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MUTATION: take /usr/bin/java's /usr as the JDK home on macOS -> 'unknown' -> RED."""
+    import sys
+
+    from treasure_map.lib.setup import doctor
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(doctor.os.path, "realpath", lambda p: str(p))
+    assert doctor.effective_java_home({}, lambda _n: "/usr/bin/java") is None

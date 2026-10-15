@@ -73,18 +73,13 @@ def test_a_vcs_install_reads_its_commit(monkeypatch: pytest.MonkeyPatch, baked: 
     assert tm_version.installed_commit() == VCS
 
 
-def test_the_old_distribution_name_still_reads(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_another_distribution_is_never_read(monkeypatch: pytest.MonkeyPatch, baked: None) -> None:
+    """Only tmap-agents' record counts: an unrelated `treasure-map` package says nothing about
+    which tmap runs.
+
+    MUTATION: read the record of a distribution named treasure-map -> RED."""
     record = f'{{"url":"https://x/y.git","vcs_info":{{"vcs":"git","commit_id":"{VCS}"}}}}'
     _install(monkeypatch, **{"treasure-map": _Dist(record)})
-    assert tm_version.installed_commit() == VCS
-
-
-def test_both_names_installed_is_unknown(monkeypatch: pytest.MonkeyPatch, baked: None) -> None:
-    """Two distributions in one environment: which one is running cannot be told.
-
-    MUTATION: read the first one found -> RED."""
-    record = f'{{"url":"https://x/y.git","vcs_info":{{"vcs":"git","commit_id":"{VCS}"}}}}'
-    _install(monkeypatch, **{"tmap-agents": _Dist(record), "treasure-map": _Dist(record)})
     assert tm_version.installed_commit() == UNKNOWN_VERSION
 
 

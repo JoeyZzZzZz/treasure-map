@@ -1,14 +1,12 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""``tmap update``: install the newest tmap and leave no old tmap behind.
+"""``tmap update``: install the newest tmap.
 
 Only a tmap installed with ``uv tool install tmap-agents`` is updated in place — tmap cannot know
 how else it was installed, so any other install is told how to update itself and left alone. The
-update replaces the ``tmap-agents`` tool environment (``uv tool install --force``), removes the
-tool the program was published as before its rename (``treasure-map``, which also carried the
-retired ``treasure-map-mcp`` command), and names every other ``tmap`` on PATH that would shadow
-the new one. It then hands over to the NEW version's ``tmap init``, which checks the toolchain
-and agent entries that version expects.
+update replaces the ``tmap-agents`` tool environment (``uv tool install --force``) and names every
+other ``tmap`` on PATH that would shadow the new one. It then hands over to the NEW version's
+``tmap init``, which checks the toolchain and agent entries that version expects.
 
 The only network access is one request for the newest published version.
 """
@@ -25,7 +23,6 @@ from pathlib import Path
 from treasure_map.lib.setup.discover import Runner
 
 DIST = "tmap-agents"
-OLD_DIST = "treasure-map"  # the distribution name before the rename
 PYPI_JSON = f"https://pypi.org/pypi/{DIST}/json"
 
 _VERSION_RE = re.compile(r"^(\d+(?:\.\d+)*)(.*)$")
@@ -92,25 +89,6 @@ def runs_from_uv_tool(prefix: Path, uv: str, run: Runner) -> bool:
     return tools is not None and os.path.realpath(prefix) == os.path.realpath(tools / DIST)
 
 
-def uv_tools(uv: str, run: Runner) -> dict[str, list[str]]:
-    """``uv tool list``: tool name -> its commands."""
-    res = run([uv, "tool", "list"])
-    out: dict[str, list[str]] = {}
-    if res is None or res.returncode != 0:
-        return out
-    current: str | None = None
-    for line in res.stdout.splitlines():
-        if not line.strip():
-            continue
-        if line.startswith("- "):
-            if current is not None:
-                out[current].append(line[2:].strip())
-            continue
-        current = line.split()[0]
-        out[current] = []
-    return out
-
-
 def other_tmaps(path_env: str, keep: Path | None) -> list[Path]:
     """Every ``tmap`` on PATH other than ``keep`` (the uv tool's command)."""
     seen: set[str] = set()
@@ -136,7 +114,6 @@ class UpdatePlan:
     latest: str | None
     uv: str | None
     from_uv_tool: bool
-    remove_old_tool: bool
     shadowing: list[Path] = field(default_factory=list)
     reason: str = ""  # why tmap will not update itself (another kind of install)
 
@@ -146,15 +123,11 @@ class UpdatePlan:
 
     @property
     def has_work(self) -> bool:
-        return self.from_uv_tool and (self.newer or self.remove_old_tool)
+        return self.from_uv_tool and self.newer
 
     def install_argv(self, version: str) -> list[str]:
         assert self.uv is not None
         return [self.uv, "tool", "install", "--force", "--python", "3.11", f"{DIST}=={version}"]
-
-    def remove_old_argv(self) -> list[str]:
-        assert self.uv is not None
-        return [self.uv, "tool", "uninstall", OLD_DIST]
 
 
 def plan_update(
@@ -170,7 +143,7 @@ def plan_update(
 ) -> UpdatePlan:
     uv = find_uv(home, which)
     if uv is None:
-        return UpdatePlan(current, latest, None, False, False, reason="uv is not installed")
+        return UpdatePlan(current, latest, None, False, reason="uv is not installed")
     from_uv = runs_from_uv_tool(prefix, uv, run)
     if not from_uv:
         return UpdatePlan(
@@ -178,18 +151,9 @@ def plan_update(
             latest,
             uv,
             False,
-            False,
             reason="this tmap was not installed with `uv tool install tmap-agents`",
         )
-    tools = uv_tools(uv, run)
-    return UpdatePlan(
-        current,
-        latest,
-        uv,
-        True,
-        OLD_DIST in tools,
-        shadowing=other_tmaps(path_env, tmap_command),
-    )
+    return UpdatePlan(current, latest, uv, True, shadowing=other_tmaps(path_env, tmap_command))
 
 
 def plan_lines(plan: UpdatePlan) -> list[str]:
@@ -202,11 +166,6 @@ def plan_lines(plan: UpdatePlan) -> list[str]:
     if not plan.from_uv_tool:
         lines.append(f"not updated here: {plan.reason}")
         return lines
-    if plan.remove_old_tool:
-        lines.append(
-            f"remove the old tool `{OLD_DIST}` (its tmap and treasure-map-mcp): "
-            + " ".join(plan.remove_old_argv()[1:])
-        )
     if plan.newer and plan.latest is not None:
         lines.append(f"install: {' '.join(plan.install_argv(plan.latest)[1:])}")
         lines.append("then: tmap init (the new version checks its toolchain and agent entries)")

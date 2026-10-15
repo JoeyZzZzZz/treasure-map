@@ -426,3 +426,27 @@ def test_the_closing_line_counts_the_unfinished_tier_too(
     )
     assert out2.exit_code == 0, out2.output
     assert "`tmap rescan` refreshes them." in out2.output
+
+
+def test_read_only_commands_never_create_the_atlas(tmp_path: Path) -> None:
+    """MUTATION: open (and so create) the atlas before checking it exists -> RED."""
+    from click.testing import CliRunner
+
+    from treasure_map.cli.hunt_cli import atlas_view, runs, triage
+
+    atlas = tmp_path / "none" / "atlas.db"
+    for cmd, args in ((runs, []), (triage, []), (atlas_view, ["density"])):
+        result = CliRunner().invoke(cmd, [*args, "--atlas", str(atlas)])
+        assert result.exit_code == 1 and "no atlas yet" in result.output, result.output
+        assert not atlas.exists()
+
+
+def test_a_missing_analysis_db_is_a_message_not_a_traceback(tmp_path: Path) -> None:
+    """MUTATION: open the path without checking it -> sqlite OperationalError -> RED."""
+    from click.testing import CliRunner
+
+    from treasure_map.cli.mcp_cli import fact
+
+    result = CliRunner().invoke(fact, ["pseudocode", "main", "--analysis-db", str(tmp_path / "x")])
+    assert isinstance(result.exception, SystemExit) and result.exit_code == 1
+    assert "no analysis database at" in result.output

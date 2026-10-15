@@ -144,7 +144,7 @@ def test_configure_parallelism_detects_then_keeps(
     from treasure_map.lib.setup import initializer
 
     monkeypatch.setattr(machine, "physical_cores", lambda: CoreProbe(6, "cpuinfo"))
-    monkeypatch.setattr(machine, "mem_total_mb", lambda: 9945)
+    monkeypatch.setattr(machine, "mem_total", lambda: machine.MemProbe(9945, "meminfo"))
     cfg_path = tmp_path / "config.yaml"
     cfg_path.write_text("ghidra:\n  mode: local\n")
     msgs: list[str] = []
@@ -156,10 +156,34 @@ def test_configure_parallelism_detects_then_keeps(
 
     # re-run without force: keep the written value even if the machine "changes"
     monkeypatch.setattr(machine, "physical_cores", lambda: CoreProbe(2, "cpuinfo"))
-    monkeypatch.setattr(machine, "mem_total_mb", lambda: 2000)
+    monkeypatch.setattr(machine, "mem_total", lambda: machine.MemProbe(2000, "meminfo"))
     initializer._configure_parallelism(cfg_path, force=False, echo=msgs.append)
     assert initializer._configured_max_parallel(cfg_path) == 5  # kept
 
     # --force: re-detect (now 1 for the smaller machine)
     initializer._configure_parallelism(cfg_path, force=True, echo=msgs.append)
     assert initializer._configured_max_parallel(cfg_path) == 1
+
+
+# ── macOS: sysctl, and a fallback never reported as a measurement ──────────────────────
+
+
+def test_macos_reads_cores_and_memory_from_sysctl(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A Mac has neither /proc nor lscpu, and Apple Silicon has no SMT to halve.
+
+    MUTATION: drop the darwin branch -> 16 cores read as 8, 64GB as an assumed 4096MB -> RED."""
+    values = {"hw.physicalcpu": 16, "hw.memsize": 64 * 1024**3}
+    monkeypatch.setattr(machine, "_platform", lambda: "darwin")
+    monkeypatch.setattr(machine, "_sysctl_int", lambda name: values.get(name, 0))
+    monkeypatch.setattr(machine, "_cores_from_lscpu", lambda: 0)
+    monkeypatch.setattr(machine.os, "cpu_count", lambda: 16)
+    probe = physical_cores("/nonexistent")
+    mem = machine.mem_total("/nonexistent")
+    assert (probe.count, probe.method) == (16, "sysctl hw.physicalcpu")
+    assert (mem.mb, mem.method) == (64 * 1024, "sysctl hw.memsize")
+
+
+def test_an_unread_memory_size_says_it_is_assumed(tmp_path: Path) -> None:
+    """MUTATION: label the 4096 fallback like a reading -> RED."""
+    mem = machine.mem_total(str(tmp_path / "nope"))
+    assert mem.mb == 4096 and "assumed" in mem.method

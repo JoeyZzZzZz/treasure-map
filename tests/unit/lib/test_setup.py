@@ -15,7 +15,6 @@ import yaml
 from treasure_map.lib.errors import GhidraNotFoundError
 from treasure_map.lib.setup.initializer import (
     _DEFAULT_CONFIG_YAML,
-    _collect_default_env_vars,
     _configure_workspace_dir,
     _provision_dirs,
     _set_ghidra_home,
@@ -23,6 +22,7 @@ from treasure_map.lib.setup.initializer import (
     _write_env,
     run_init,
 )
+from treasure_map.lib.setup.tmap_files import ENV_TEXT, written_by_tmap
 
 from .setup import fakes
 
@@ -67,15 +67,6 @@ def fake_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 def _noop_prompt(msg: str) -> str:  # noqa: ARG001
     return ""
-
-
-# ── _collect_default_env_vars ─────────────────────────────────────────────────
-
-
-def test_collect_default_env_vars_is_empty() -> None:
-    # The tool ships no built-in secrets — analysis is hermetic (no network calls), so there are no
-    # default API-key env vars to scaffold. The .env stays a bare operator-owned placeholder.
-    assert _collect_default_env_vars() == []
 
 
 # ── _provision_dirs ───────────────────────────────────────────────────────────
@@ -142,43 +133,26 @@ def test_write_config_force_overwrites(fake_home: Path) -> None:
 def test_write_env_mode_0600(fake_home: Path) -> None:
     env_path = fake_home / ".treasure-map" / ".env"
     env_path.parent.mkdir(parents=True, exist_ok=True)
-    _write_env(env_path, env_vars=["DEEPSEEK_API_KEY"], prompt=_noop_prompt, non_interactive=True)
+    _write_env(env_path)
     mode = stat.S_IMODE(env_path.stat().st_mode)
     assert mode == 0o600
 
 
-def test_write_env_non_interactive_writes_empty_file(fake_home: Path) -> None:
+def test_write_env_writes_tmaps_marked_placeholder(fake_home: Path) -> None:
+    """No secrets are asked for (tmap needs none): .env is a marked placeholder, so
+    --purge-data can tell it is tmap's."""
+    env_path = fake_home / ".treasure-map" / ".env"
+    _write_env(env_path)
+    assert env_path.read_text() == ENV_TEXT
+    assert written_by_tmap(env_path)
+
+
+def test_write_env_never_changes_an_existing_file(fake_home: Path) -> None:
     env_path = fake_home / ".treasure-map" / ".env"
     env_path.parent.mkdir(parents=True, exist_ok=True)
-    _write_env(
-        env_path,
-        env_vars=["DEEPSEEK_API_KEY", "ANTHROPIC_API_KEY"],
-        prompt=_noop_prompt,
-        non_interactive=True,
-    )
-    assert env_path.read_text() == ""
-
-
-def test_write_env_interactive_captures_values(fake_home: Path) -> None:
-    env_path = fake_home / ".treasure-map" / ".env"
-    env_path.parent.mkdir(parents=True, exist_ok=True)
-    responses = {"DEEPSEEK_API_KEY": "sk-deep-123", "ANTHROPIC_API_KEY": ""}
-
-    def _fake_prompt(msg: str) -> str:
-        for k, v in responses.items():
-            if k in msg:
-                return v
-        return ""
-
-    _write_env(
-        env_path,
-        env_vars=["DEEPSEEK_API_KEY", "ANTHROPIC_API_KEY"],
-        prompt=_fake_prompt,
-        non_interactive=False,
-    )
-    content = env_path.read_text()
-    assert "DEEPSEEK_API_KEY=sk-deep-123" in content
-    assert "ANTHROPIC_API_KEY" not in content  # empty → not written
+    env_path.write_text("TM_X=1\n")
+    _write_env(env_path)
+    assert env_path.read_text() == "TM_X=1\n"
 
 
 # ── run_init — file creation ──────────────────────────────────────────────────
@@ -417,12 +391,7 @@ def test_prompt_messages_carry_no_trailing_colon(fake_home: Path) -> None:
 
     env_path = fake_home / ".treasure-map" / ".env"
     env_path.parent.mkdir(parents=True, exist_ok=True)
-    _write_env(
-        env_path,
-        env_vars=["DEEPSEEK_API_KEY"],
-        prompt=_capture,
-        non_interactive=False,
-    )
+    _write_env(env_path)
 
     config_path = fake_home / ".treasure-map" / "config.yaml"
     _write_config(config_path, force=True)
@@ -568,7 +537,7 @@ def test_interactive_yes_appends_the_block_and_flips_the_doctor(
 def test_interactive_no_leaves_the_rc_alone(
     fake_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Declining keeps the current behaviour exactly: no rc write, the hint printed, doctor red.
+    # Declining: no rc write, the hint printed, and the doctor warns (tmap itself works).
     monkeypatch.setenv("SHELL", "/bin/zsh")
     lines: list[str] = []
     result = run_init(
@@ -581,7 +550,7 @@ def test_interactive_no_leaves_the_rc_alone(
     assert not (fake_home / ".zshrc").exists()
     assert any("to activate" in line for line in lines)
     completion = [c for c in result.checks if c[0] == "completion"]
-    assert completion and completion[0][1] is False
+    assert completion and completion[0].state == "warn" and "not active yet" in completion[0].detail
 
 
 def test_unrecognised_answer_is_treated_as_no(
@@ -595,3 +564,23 @@ def test_unrecognised_answer_is_treated_as_no(
         prompt=lambda msg: "maybe" if "completion line" in msg else "",
     )
     assert not (fake_home / ".zshrc").exists()
+
+
+# ── config.yaml: tmap's mark ──────────────────────────────────────────────────
+
+
+def test_a_rewrite_keeps_who_wrote_config_yaml(fake_home: Path) -> None:
+    """init marks the config.yaml it creates (so --purge-data deletes it) and keeps the mark
+    through its own rewrites; a config.yaml the user wrote stays unmarked however often init
+    writes a key into it.
+
+    MUTATION: mark every file config_text writes -> the user's file turns into tmap's -> RED.
+    MUTATION: never carry the mark over -> init's own file loses it on the first rewrite -> RED."""
+    cfg = fake_home / ".treasure-map" / "config.yaml"
+    _write_config(cfg, force=False)
+    _set_ghidra_home(cfg, fake_home / "g")
+    assert written_by_tmap(cfg)
+    cfg.write_text("workspace_dir: /x\n")
+    _set_ghidra_home(cfg, fake_home / "g")
+    assert not written_by_tmap(cfg)
+    assert "workspace_dir: /x" in cfg.read_text()

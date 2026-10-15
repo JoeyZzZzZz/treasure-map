@@ -54,13 +54,24 @@ class Runner(Protocol):
     ) -> RunResult | None: ...
 
 
+def is_macos_java_stub(java: str) -> bool:
+    """macOS ships ``/usr/bin/java``: a launcher stub that finds an installed JDK (or offers to
+    install one), not a JDK whose home is ``/usr``."""
+    return os.path.realpath(java) == "/usr/bin/java"
+
+
 def run_command(
     argv: Sequence[str], *, cwd: Path | None = None, timeout: float = _RUN_TIMEOUT
 ) -> RunResult | None:
     """Run a fixed argv (no shell) with a timeout; None when it cannot be started or times out."""
     try:
         proc = subprocess.run(  # noqa: S603 -- fixed argv, no shell
-            list(argv), capture_output=True, timeout=timeout, cwd=cwd, check=False
+            list(argv),
+            capture_output=True,
+            timeout=timeout,
+            cwd=cwd,
+            check=False,
+            stdin=subprocess.DEVNULL,  # nothing may stop to ask the user's terminal
         )
     except (OSError, subprocess.TimeoutExpired, ValueError):
         return None
@@ -111,11 +122,15 @@ def current_host(platform: Platform) -> Host:
     except Exception:
         user = environ.get("USER", "")
     home_roots = (home, home / "tools", home / "opt", home / "Downloads")
-    home_jdks = (
+    home_jdks: tuple[str, ...] = (
         str(home / ".sdkman/candidates/java/*"),
         str(home / ".asdf/installs/java/*"),
         str(home / ".jdks/*"),
     )
+    if platform.is_darwin:  # the same managers keep a macOS JDK in its bundle layout
+        home_jdks += tuple(f"{g}/Contents/Home" for g in home_jdks) + (
+            str(home / "Library/Java/JavaVirtualMachines/*/Contents/Home"),
+        )
     if not SYSTEM_PROBES:
         return Host(
             environ=environ,
@@ -440,7 +455,7 @@ def discover_jdk(
             if saved:
                 c.add(Path(saved), "java_home.save")
     java = host.which("java")
-    if java:
+    if java and not (host.platform.is_darwin and is_macos_java_stub(java)):
         c.add(Path(os.path.realpath(java)).parent.parent, "PATH")
     if host.platform.is_darwin and host.darwin_java_home_tool:
         res = host.run(["/usr/libexec/java_home", "-v", "21"])

@@ -12,10 +12,17 @@ left last_run.json pointing at a deleted /tmp path, breaking a live MCP binding.
 This fixture redirects every home path to a per-test throwaway home. Patching ``Path.home`` covers
 the call-time users; the import-frozen constants (``last_run._POINTER_PATH`` and
 ``config._DEFAULT_CONFIG_PATH``) were bound before the patch, so each is reset explicitly.
+
+The environment is the other way a real path gets in: a ``TM_ATLAS__DB_PATH`` or
+``TM_WORKSPACE_DIR`` exported in the developer's shell would point a test that deletes data at
+the real atlas. Every ``TM_*`` variable is removed for the test, and whatever a test's ``.env``
+sourcing put into ``os.environ`` is taken out again afterwards.
 """
 
 from __future__ import annotations
 
+import os
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -26,7 +33,7 @@ import treasure_map.lib.last_run as _last_run
 
 
 @pytest.fixture(autouse=True)
-def _isolate_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def _isolate_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     fake_home = tmp_path / "home"
     (fake_home / ".treasure-map").mkdir(parents=True, exist_ok=True)
     # (1) call-time Path.home() users: config default_factory, the .env lookup, init, etc.
@@ -36,6 +43,13 @@ def _isolate_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     tm = fake_home / ".treasure-map"
     monkeypatch.setattr(_last_run, "_POINTER_PATH", tm / "last_run.json")
     monkeypatch.setattr(_config, "_DEFAULT_CONFIG_PATH", tm / "config.yaml")
+    # (3) no TM_* override from the developer's shell; .env sourcing does not outlive the test.
+    for name in [n for n in os.environ if n.startswith("TM_")]:
+        monkeypatch.delenv(name)
+    saved = dict(os.environ)
+    yield
+    os.environ.clear()
+    os.environ.update(saved)
 
 
 @pytest.fixture(autouse=True)

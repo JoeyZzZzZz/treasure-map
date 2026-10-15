@@ -181,12 +181,12 @@ Record each judgement with annotate_diff.
 ## 升级
 
 ```bash
-tmap update                                 # 装上最新版 tmap，移除旧版
+tmap update                                 # 装上最新版 tmap
 tmap rescan                                 # 重新扫描旧版 tmap 生成的所有 run
 tmap diff --before fw-v1 --after fw-v2      # 重新运行已过期的对比
 ```
 
-`tmap update` 会到 PyPI 查询最新版本，展示计划并询问一次（`--check` 只报告不安装，`--yes` 跳过询问）。它会替换已安装的版本；如果旧的 `treasure-map` 工具还在，会一并移除；如果 PATH 上还有别的 `tmap` 会遮住新版本，会把它们指出来；最后自动启动新版本的 `tmap init`，你不用自己输入。这次 init 也会告诉你有多少个
+`tmap update` 会到 PyPI 查询最新版本，展示计划并询问一次（`--check` 只报告不安装，`--yes` 跳过询问）。它会替换已安装的版本；如果 PATH 上还有别的 `tmap` 会遮住新版本，会把它们指出来；最后自动启动新版本的 `tmap init`，你不用自己输入。这次 init 也会告诉你有多少个
 run 早于新版本。旧版 tmap 或其他工具链生成的对比，会重新计算一次。
 
 不带参数时，`tmap rescan` 会重新扫描所有由旧版 tmap 生成的 run。只想重扫某一个固件，就写上它的 run 名：默认就是扫描时用的 `-w` 名字（除非你另外设置了 `--run-id`），例如 `tmap rescan fw-v1`。加上 `--dry-run`
@@ -219,8 +219,10 @@ tmap uninstall
 
 它会先展示计划并询问一次，然后从每个 agent 中移除 treasure-map 条目，删除 `tmap init` 下载的工具链（绝不会删除你自己安装的 JDK、Ghidra 或 BinDiff），并询问是否卸载程序本身。
 
-**你的数据会保留：** `~/.treasure-map/config.yaml`、**atlas** 和各个工作区，重新安装后全部可以继续使用。
-`tmap uninstall --purge-data` 会把它们一并删除，需要你输入确认短语（不可恢复）。
+**你的数据会保留：** `~/.treasure-map/config.yaml`、`.env`、**atlas** 和各个工作区，重新安装后全部可以继续使用。
+`tmap uninstall --purge-data` 会把它们一并删除，需要你输入确认短语（不可恢复），但只删能证明属于 tmap 的：
+atlas、含 tmap `analysis.db` 的工作区目录（工作区根目录本身不删；根目录是你的家目录或更上层时一个都不删），
+以及 `tmap init` 写的 `config.yaml` / `.env`。你自己写的文件、工作区根目录里的其他东西都会保留并列出。
 
 <details>
 <summary>细节</summary>
@@ -249,7 +251,7 @@ tmap uninstall
 
 ## 参与贡献
 
-欢迎提交 issue 和 pull request，详见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+欢迎提交 issue 和 pull request，详见 [CONTRIBUTING.md](CONTRIBUTING.md)。pull request 里的每个提交都要用 `git commit -s` 签署 [DCO](https://developercertificate.org/)。
 
 ## 许可证
 

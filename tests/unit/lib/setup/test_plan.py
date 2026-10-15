@@ -419,3 +419,87 @@ def test_an_entry_already_in_place_is_neither_a_to_do_nor_a_restart(home: Path) 
     assert not any(n.startswith("dsh:") for n in result.needs_you)
     assert result.registered == ()
     assert not (home / ".dsh" / "cordis.patch.yml").exists()
+
+
+def test_an_agent_config_that_cannot_be_written_is_a_to_do(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A permission error writing one agent's configuration is that agent's to-do, not a
+    traceback that leaves the rest of init undone.
+
+    MUTATION: let the OSError out of the register step -> RED."""
+    from treasure_map.lib.setup import clients as cl
+
+    def _denied(*_a: object, **_k: object) -> None:
+        raise PermissionError("[Errno 13] Permission denied: 'cordis.patch.yml'")
+
+    monkeypatch.setattr(cl, "register", _denied)
+    (home / ".dsh").mkdir()
+    outcome = "ok"
+    result = None
+    try:
+        result = run_init(
+            assume_yes=True,
+            clients=("dsh",),
+            prompt=lambda _m: "",
+            platform=fakes.linux(),
+            host=_host(home),
+            fetcher=fakes.RefusingFetcher(),
+            tmap=fakes._exe(home / "bin" / "tmap"),
+            mcp_probe=lambda *_a: McpProbe(None, False, "not probed"),
+        )
+    except OSError as exc:
+        outcome = repr(exc)
+    assert outcome == "ok" and result is not None
+    assert any("could not write its configuration" in n for n in result.needs_you)
+
+
+def test_an_unwritable_home_is_a_message_not_a_traceback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """MUTATION: drop the OSError catch in the init command -> a traceback -> RED."""
+    from click.testing import CliRunner
+
+    from treasure_map.cli import init_cli
+
+    def _denied(**_k: object) -> None:
+        raise PermissionError("[Errno 13] Permission denied: '/home/u/.treasure-map'")
+
+    monkeypatch.setattr(init_cli, "run_init", _denied)
+    result = CliRunner().invoke(init_cli.init, ["--yes"])
+    assert isinstance(result.exception, SystemExit) and result.exit_code == 1
+    assert "Permission denied" in result.output
+
+
+def test_force_keeps_the_atlas_names_each_reset_and_backs_up(home: Path, tmp_path: Path) -> None:
+    """--force rebuilds the structure but never quietly moves where the data is, says which
+    values it resets, and keeps the old file.
+
+    MUTATION: drop the atlas carry-over -> atlas.db_path is back at the default -> RED.
+    MUTATION: drop the backup -> RED. MUTATION: drop the reset lines from the plan -> RED."""
+    import yaml
+
+    cfg = home / ".treasure-map" / "config.yaml"
+    atlas = tmp_path / "data" / "atlas.db"
+    original = yaml.safe_dump(
+        {
+            "atlas": {"db_path": str(atlas)},
+            "ghidra": {"headless_timeout_seconds": 900},
+            "workspace_dir": str(tmp_path / "ws"),
+        }
+    )
+    cfg.write_text(original)
+    lines: list[str] = []
+    run_init(
+        force=True,
+        non_interactive=True,
+        prompt=lambda _m: "",
+        echo=lines.append,
+        platform=fakes.linux(),
+        host=_host(home),
+        tmap=None,
+    )
+    data = yaml.safe_load(cfg.read_text())
+    assert data["atlas"]["db_path"] == str(atlas)
+    assert data["workspace_dir"] == str(tmp_path / "ws")
+    backup = cfg.with_name("config.yaml.tmap.backup")
+    assert backup.is_file() and backup.read_text() == original
+    assert any("reset ghidra.headless_timeout_seconds: 900 -> 300" in ln for ln in lines)

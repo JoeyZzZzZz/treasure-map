@@ -70,7 +70,6 @@ _EXPECTED_TOOLS = {
     "clear_overlay",
     "list_verified_exploits",
     "list_cve_patterns",
-    "import_cve_patterns",
     "legal_notice",
 }
 
@@ -1086,8 +1085,12 @@ def test_annotate_writes_lists_and_clears_without_touching_base(tmp_path: Path) 
     assert lst["overlays"][0]["basis_state"] == "unchanged"  # nothing has moved yet
     # verdict filter
     assert tools["list_overlays"](verdict="excluded")["count"] == 0
+    # no scope deletes nothing unless asked for in so many words
+    refused = tools["clear_overlay"]()
+    assert refused["cleared"] == 0 and "clear_all=true" in refused.get("error", "")
+    assert tools["list_overlays"]()["count"] == 1
     # clear leaves the base map untouched
-    assert tools["clear_overlay"]()["cleared"] == 1
+    assert tools["clear_overlay"](clear_all=True)["cleared"] == 1
     assert tools["list_overlays"]()["count"] == 0
     assert tools["list_candidates"]() == base_before
 
@@ -1124,8 +1127,7 @@ def test_agent_cannot_write_the_exploit_ledger(tmp_path: Path) -> None:
     # not one that relays a person's summary. Reading stays available.
     tools = _tools(tmp_path)
     assert "mark_exploited" not in tools
-    # The ledger's only remaining tool is the read one. `import_cve_patterns` fills the PUBLIC
-    # CVE-form table — reference material anyone may add, and a different table entirely.
+    # The ledger's only remaining tool is the read one.
     assert {n for n in tools if "exploit" in n} == {"list_verified_exploits"}
 
 
@@ -1164,28 +1166,6 @@ def test_list_verified_exploits_counts_distinct_refs_via_tool(tmp_path: Path) ->
     _seed_ledger(tmp_path, evidence_ref="run_m#fn1@cmd", pattern="cmd", exploit_note="via cli too")
     m = tools["list_verified_exploits"]()
     assert m["distinct_exploits"] == 1 and m["records"] == 2
-
-
-def test_import_cve_patterns_idempotent_via_tool(tmp_path: Path) -> None:
-    # ★ verification 8: public import fills the public table and re-running never doubles;
-    # public volume never enters distinct_exploits.
-    tools = _tools(tmp_path)
-    payload = [
-        {"pattern": "nvram->system", "cve_id": "CVE-1", "source": "lan_ip", "sink": "system"},
-        {"pattern": "post->popen", "cve_id": "CVE-2", "sink": "popen"},
-    ]
-    first = tools["import_cve_patterns"](payload)
-    assert first["inserted"] == 2 and first["skipped"] == 0
-    again = tools["import_cve_patterns"](payload)
-    assert again["inserted"] == 0 and again["skipped"] == 2  # idempotent
-    assert tools["list_cve_patterns"]()["count"] == 2
-    assert tools["list_cve_patterns"](sink="pop")["count"] == 1  # substring filter
-    assert (
-        tools["list_verified_exploits"]()["distinct_exploits"] == 0
-    )  # public volume is not counted as a verified exploit
-
-
-# ── published surface: no private-note references, and the legal notice is wired in ──
 
 
 def test_public_server_files_carry_no_private_references() -> None:
@@ -1264,3 +1244,18 @@ def test_a_clean_candidate_carries_no_anchor_key(tmp_path: Path) -> None:
     (cand,) = tools["list_candidates"]()["candidates"]
     assert "anchor_facts" not in cand
     assert "anchor_facts" not in tools["get_pseudocode"](evidence_ref="run_m#fn1@cmd")
+
+
+def test_every_tool_says_whether_it_writes(tmp_path: Path) -> None:
+    """The overlay writers are marked as such and clear_overlay as destructive; every other tool
+    is read-only. A client can then ask before a write that a firmware string talked it into.
+
+    MUTATION: register the tools without annotations, or mark clear_overlay non-destructive ->
+    RED."""
+    _mk_analysis(tmp_path)
+    server = mcp_app.build_server(_mk_atlas(tmp_path))
+    tools = {t.name: t.annotations for t in asyncio.run(server.list_tools())}
+    writers = {n for n, a in tools.items() if a is None or a.readOnlyHint is not True}
+    assert writers == {"annotate", "annotate_diff", "promote", "clear_overlay"}
+    assert tools["clear_overlay"].destructiveHint is True
+    assert tools["annotate"].destructiveHint is False

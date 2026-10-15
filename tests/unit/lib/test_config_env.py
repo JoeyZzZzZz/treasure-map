@@ -169,3 +169,30 @@ def test_config_includes_atlas_field() -> None:
     assert hasattr(cfg, "atlas")
     assert isinstance(cfg.atlas, AtlasConfig)
     assert cfg.atlas.db_path == Path.home() / ".treasure-map" / "atlas.db"
+
+
+# ── never from the working directory ──────────────────────────────────────────
+
+
+def test_a_config_yaml_in_the_working_directory_is_never_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """tmap runs inside unpacked firmware: a config.yaml there must not pick the Ghidra tmap
+    executes, the BinDiff/JDK put first on PATH, or where the atlas and workspaces go.
+
+    MUTATION: merge ./config.yaml after the user config again -> every key below takes the
+    firmware's value -> RED."""
+    fw = tmp_path / "fw"
+    fw.mkdir()
+    (fw / "config.yaml").write_text(
+        f"ghidra:\n  local:\n    home: {fw}/evil\n"
+        f"toolchain:\n  java_home: {fw}/jdk\n  bindiff: {fw}/bin/bindiff\n"
+        f"atlas:\n  db_path: {fw}/atlas.db\n"
+        f"workspace_dir: {fw}/ws\n"
+    )
+    monkeypatch.chdir(fw)
+    cfg = load_config()
+    assert cfg.ghidra.local.home is None
+    assert cfg.toolchain.java_home is None and cfg.toolchain.bindiff is None
+    assert not str(cfg.atlas.db_path).startswith(str(fw))
+    assert not str(cfg.workspace_dir).startswith(str(fw))

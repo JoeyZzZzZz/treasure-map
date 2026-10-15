@@ -84,6 +84,21 @@ def _is_wsl(environ: Mapping[str, str], osrelease: Path) -> bool:
         return False
 
 
+def _rosetta() -> bool:
+    """Whether this process is translated by Rosetta — only ever asked on a real Mac."""
+    if _stdlib_platform.system() != "Darwin":
+        return False
+    import subprocess
+
+    try:
+        out = subprocess.run(  # noqa: S603,S607 -- fixed argv, no shell
+            ["sysctl", "-n", "sysctl.proc_translated"], capture_output=True, text=True, timeout=5
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return out.strip() == "1"
+
+
 def detect_platform(
     *,
     system: str | None = None,
@@ -91,16 +106,29 @@ def detect_platform(
     environ: Mapping[str, str] | None = None,
     osrelease: Path = Path("/proc/sys/kernel/osrelease"),
     glibc: tuple[int, int] | None | Literal["detect"] = "detect",
+    translated: bool | Literal["detect"] = "detect",
 ) -> Platform:
-    """The running platform. Every input can be given, so a test can stand on any platform."""
+    """The running platform. Every input can be given, so a test can stand on any platform.
+
+    An x86_64 Python under Rosetta on Apple Silicon reports x86_64; the machine is arm64, and the
+    toolchain tmap starts (a JDK, Ghidra, BinDiff) runs natively — so it is read as darwin-arm64,
+    with the translation named in ``reason``."""
     sys_name = (system if system is not None else _stdlib_platform.system()).lower()
     mach = machine if machine is not None else _stdlib_platform.machine()
+    rosetta = (
+        sys_name == "darwin"
+        and _arch(sys_name, mach) == "x86_64"
+        and (_rosetta() if translated == "detect" else translated)
+    )
+    if rosetta:
+        mach = "arm64"
     env = os.environ if environ is None else environ
     key = f"{sys_name}-{_arch(sys_name, mach)}"
     wsl = sys_name == "linux" and _is_wsl(env, osrelease)
     libc = (_glibc_version() if sys_name == "linux" else None) if glibc == "detect" else glibc
     if key in SUPPORTED:
-        return Platform(key, "supported", wsl, libc, "")
+        note = "Python runs under Rosetta; the toolchain is arm64" if rosetta else ""
+        return Platform(key, "supported", wsl, libc, note)
     if key in UNVERIFIED:
         return Platform(
             key, "unverified", wsl, libc, "Intel Mac: supported toolchain, not acceptance-tested"

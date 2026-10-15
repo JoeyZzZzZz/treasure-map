@@ -53,3 +53,11 @@ def test_macho_slices(tmp_path: Path) -> None:
     elf.write_bytes(b"\x7fELF" + b"\0" * 20)
     assert macho_cputypes(elf) is None
     assert macho_cputypes(tmp_path / "absent") is None
+
+
+def test_rosetta_reads_as_the_arm64_mac_it_is() -> None:
+    """MUTATION: ignore the translation -> darwin-x86_64 and an x64 JDK -> RED."""
+    p = detect_platform(system="Darwin", machine="x86_64", environ={}, glibc=None, translated=True)
+    assert p.key == "darwin-arm64" and p.support == "supported" and "Rosetta" in p.reason
+    p = detect_platform(system="Darwin", machine="x86_64", environ={}, glibc=None, translated=False)
+    assert p.key == "darwin-x86_64"

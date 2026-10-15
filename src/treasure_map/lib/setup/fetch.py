@@ -4,9 +4,10 @@
 
 A download lands in ``<file>.part`` inside a staging directory and is resumed with a ``Range``
 request when the server allows it. Its size and sha256 are checked against the lock before
-anything reads it as an archive; a mismatch deletes it. Unpacking refuses absolute paths, ``..``,
-anything that resolves outside the destination, and link entries; zip permission bits are
-restored (Ghidra's launchers and decompiler must stay executable).
+anything reads it as an archive: a short file is kept for the next run to resume, a complete one
+from an interrupted run is verified without fetching again, and a mismatch deletes it. Unpacking
+refuses absolute paths, ``..``, anything that resolves outside the destination, and link entries;
+zip permission bits are restored (Ghidra's launchers and decompiler must stay executable).
 
 The network sits behind the ``Fetcher`` protocol so a test (or ``--offline DIR``) supplies the
 bytes instead.
@@ -55,6 +56,8 @@ class UrlFetcher:
         self.timeout = timeout
 
     def fetch(self, url: str, dest: Path, *, progress: Progress | None = None) -> None:
+        import http.client
+        import urllib.error
         import urllib.request
 
         have = dest.stat().st_size if dest.exists() else 0
@@ -65,6 +68,9 @@ class UrlFetcher:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:  # noqa: S310
                 status = getattr(resp, "status", 200)
                 if status == 206:
+                    if not str(resp.headers.get("Content-Range", "")).startswith(f"bytes {have}-"):
+                        dest.unlink(missing_ok=True)
+                        raise FetchError(f"download failed: {url}: resumed at the wrong offset")
                     mode = "ab"
                 else:
                     mode, have = "wb", 0
@@ -72,7 +78,11 @@ class UrlFetcher:
                 total = have + int(length) if length and length.isdigit() else 0
                 with dest.open(mode) as out:
                     _copy(resp, out, have, total, progress)
-        except OSError as exc:
+        except urllib.error.HTTPError as exc:
+            if exc.code == 416 and have:
+                return  # nothing past what is here: the size and sha256 check decides
+            raise FetchError(f"download failed: {url}: {exc}") from exc
+        except (OSError, http.client.HTTPException) as exc:
             raise FetchError(f"download failed: {url}: {exc}") from exc
 
 
@@ -148,16 +158,26 @@ def download_verified(
     mirror: str | None = None,
     progress: Progress | None = None,
 ) -> Path:
-    """Fetch ``asset`` into ``staging`` and return the verified file. On a size or sha256
-    mismatch the partial file is deleted and FetchError raised — the bytes are never opened as
-    an archive."""
+    """Fetch ``asset`` into ``staging`` and return the verified file — the bytes are never opened
+    as an archive before that. A ``.part`` already as long as the asset (an interrupted run) is
+    checked without fetching; a longer one is deleted first. A short result (the connection
+    dropped) is kept for the next run to resume, with FetchError; a size or sha256 mismatch
+    deletes it, with FetchError."""
     staging.mkdir(parents=True, exist_ok=True)
     part = staging / (asset.file_name + ".part")
     url = source_url(asset, mirror)
-    fetcher.fetch(url, part, progress=progress)
+    if part.is_file() and part.stat().st_size > asset.size:
+        part.unlink()
+    if not (part.is_file() and part.stat().st_size == asset.size):
+        fetcher.fetch(url, part, progress=progress)
     if not part.is_file():
         raise FetchError(f"download produced no file: {url}")
     size = part.stat().st_size
+    if size < asset.size:
+        raise FetchError(
+            f"{asset.file_name}: download stopped at {size} of {asset.size} bytes; "
+            "run again to resume it"
+        )
     digest = sha256_file(part)
     if size != asset.size or digest != asset.sha256:
         part.unlink(missing_ok=True)
@@ -271,9 +291,30 @@ def extract_deb(archive: Path, dest: Path, member_prefix: str) -> None:
         raise FetchError(f"{archive.name}: {exc}") from exc
 
 
-def extract_dmg_pkg(archive: Path, dest: Path, app: str, run: Runner) -> None:
+def _detach(mnt: Path, run: Runner, mounted: Callable[[Path], bool]) -> bool:
+    """Detach the image at ``mnt``: twice as asked (Spotlight often holds a fresh mount busy),
+    then with ``-force``. True once it is no longer mounted."""
+    for argv in (
+        ["hdiutil", "detach", str(mnt)],
+        ["hdiutil", "detach", str(mnt)],
+        ["hdiutil", "detach", "-force", str(mnt)],
+    ):
+        res = run(argv, timeout=120)
+        if (res is not None and res.returncode == 0) or not mounted(mnt):
+            return True
+    return False
+
+
+def extract_dmg_pkg(
+    archive: Path,
+    dest: Path,
+    app: str,
+    run: Runner,
+    mounted: Callable[[Path], bool] = os.path.ismount,
+) -> None:
     """macOS only: mount the dmg read-only, expand its installer package, copy the one ``app``
-    bundle out, and always detach."""
+    bundle out, and always detach — an attach that timed out may still have mounted it, and a
+    detach that fails is retried, then forced, then reported with the command to run."""
     work = dest.parent / f"dmg-{uuid.uuid4().hex[:8]}"
     mnt = work / "mnt"
     pkg = work / "pkg"
@@ -294,6 +335,7 @@ def extract_dmg_pkg(archive: Path, dest: Path, app: str, run: Runner) -> None:
             timeout=300,
         )
         if res is None or res.returncode != 0:
+            attached = mounted(mnt)
             raise FetchError(f"hdiutil attach failed for {archive.name}")
         attached = True
         pkgs = sorted(mnt.glob("*.pkg"))
@@ -310,9 +352,13 @@ def extract_dmg_pkg(archive: Path, dest: Path, app: str, run: Runner) -> None:
         if res is None or res.returncode != 0:
             raise FetchError(f"ditto failed copying {app}")
     finally:
-        if attached:
-            run(["hdiutil", "detach", str(mnt)], timeout=120)
-        shutil.rmtree(work, ignore_errors=True)
+        stuck = attached and not _detach(mnt, run, mounted)
+        if not stuck:
+            shutil.rmtree(work, ignore_errors=True)
+    if stuck:
+        raise FetchError(
+            f"{archive.name} is still mounted at {mnt}; run: hdiutil detach -force {mnt}"
+        )
 
 
 def unpack(asset: Asset, archive: Path, dest: Path, run: Runner) -> None:
@@ -389,13 +435,22 @@ def install_archive(
     installed copy is checked with ``verify`` (None = usable), and only then is the entry
     committed. A failed check removes ``target`` and the entry. The staging directory is removed
     on every path out, Ctrl-C included. The download itself sits in ``.downloads/`` until it is
-    verified, so an interrupted download resumes where it stopped on the next run."""
-    if target.exists():
-        raise FetchError(f"{target} already exists and tmap did not record installing it")
+    verified, so an interrupted download resumes where it stopped on the next run.
+
+    An existing ``target`` is replaced only when it is tmap's own copy of this component (the
+    ledger records it at this path and it is provably tmap's — a broken managed install being
+    repaired), and only once the new copy is unpacked; anything else there is refused."""
     # A newer pin replacing an older install of the same component: the entry is rewritten below,
     # so the old path is remembered here and removed once the new copy is in place and checked —
     # never left behind unrecorded, never removed before its replacement works.
     previous = ledger.committed(entry_id)
+    if target.exists() or target.is_symlink():
+        if previous is None or Path(previous.path) != target:
+            raise FetchError(f"{target} already exists and tmap did not record installing it")
+        if not _provably_ours(previous, toolchain_dir):
+            raise FetchError(
+                f"{target} is where tmap installed {entry_id}, but it changed since; not replaced"
+            )
     staging = new_staging(toolchain_dir)
     try:
         archive = download_verified(
@@ -410,6 +465,8 @@ def install_archive(
         if not src.is_dir():
             raise FetchError(f"{asset.file_name} has no {asset.root or 'content'}/ at its top")
         recognise = pending_extra(src) if pending_extra is not None else {}
+        if target.exists():  # tmap's own copy, failing its check: out of the way, gone with staging
+            _move(target, staging / "replaced")
         ledger.add_pending(
             entry_id,
             "dir",
@@ -435,23 +492,31 @@ def install_archive(
             downloads.rmdir()
 
 
-def remove_superseded(entry: Entry, toolchain_dir: Path) -> bool:
-    """Remove the install a newer one replaced — only when it is provably tmap's: strictly under
-    the toolchain directory, or (BinExport in a user's Ghidra) a copy whose jars still hash to what
-    tmap recorded. True when it was removed."""
+def _provably_ours(entry: Entry, toolchain_dir: Path) -> bool:
+    """Whether the path ``entry`` records is still tmap's: strictly under the toolchain directory,
+    or (BinExport in a user's Ghidra) a directory whose jars hash to what tmap recorded."""
     from treasure_map.lib.diff.toolchain import binexport_lib_digest
 
     path = Path(entry.path)
-    if not path.exists() or path.is_symlink():
+    if path.is_symlink():
         return False
     recorded = entry.extra.get("lib_digest")
-    ours = strictly_under(path, toolchain_dir) or (
+    return strictly_under(path, toolchain_dir) or (
         entry.id == "binexport"
         and path.is_dir()
         and isinstance(recorded, str)
         and binexport_lib_digest(path) == recorded
     )
-    if not ours:
+
+
+def remove_superseded(entry: Entry, toolchain_dir: Path) -> bool:
+    """Remove the install a newer one replaced — only when it is provably tmap's: strictly under
+    the toolchain directory, or (BinExport in a user's Ghidra) a copy whose jars still hash to what
+    tmap recorded. True when it was removed."""
+    path = Path(entry.path)
+    if not path.exists() or path.is_symlink():
+        return False
+    if not _provably_ours(entry, toolchain_dir):
         return False
     if path.is_dir():
         shutil.rmtree(path, ignore_errors=True)

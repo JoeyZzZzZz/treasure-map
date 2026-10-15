@@ -27,6 +27,23 @@ jobs:
       - name: Check vendor neutrality (diff + commit messages)
         run: bash scripts/check-vendor-neutrality.sh "${{ steps.range.outputs.base }}" "${{ steps.range.outputs.head }}"
 
+  dco:
+    name: DCO
+    # A pull request's own commits only: the history before this check was never signed off.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Every commit is signed off by its author (git commit -s)
+        run: >-
+          python scripts/check_dco.py
+          "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}"
+
   recall-integrity:
     name: Recall Integrity
     runs-on: ubuntu-latest

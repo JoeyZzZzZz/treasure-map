@@ -44,3 +44,41 @@ def test_default_config_atlas_path_is_in_fake_home(tmp_path: Path) -> None:
     cfg = Config()
     assert str(cfg.atlas.db_path).startswith(str(tmp_path))
     assert not str(cfg.atlas.db_path).startswith(str(_real_home() / ".treasure-map"))
+
+
+def test_a_tm_override_in_the_shell_never_reaches_a_test(tmp_path: Path) -> None:
+    """A developer who exported TM_ATLAS__DB_PATH / TM_WORKSPACE_DIR must not have a test that
+    deletes data (tmap uninstall --purge-data) aim at the atlas those name; nor may one test's
+    .env sourcing carry into the next.
+
+    MUTATION: drop the TM_* removal, or the os.environ restore, from the autouse fixture -> the
+    child run's second test sees a TM_* variable -> RED."""
+    import subprocess
+    import sys
+
+    real = tmp_path / "real"
+    env = {
+        **os.environ,
+        "TM_ATLAS__DB_PATH": str(real / "atlas.db"),
+        "TM_WORKSPACE_DIR": str(real / "ws"),
+    }
+    probe = Path(__file__).with_name("home_isolation_probe.py")
+    res = subprocess.run(  # noqa: S603 -- this interpreter, fixed arguments
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            f"{probe}::test_a_dotenv_is_sourced",
+            f"{probe}::test_no_tm_variable_reaches_the_next_test",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+        ],
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert res.returncode == 0, res.stdout[-3000:]
+    assert "2 passed" in res.stdout

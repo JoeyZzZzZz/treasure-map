@@ -15,6 +15,7 @@ its runs (under a throwaway home whenever touching the user's atlas is not wante
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -29,6 +30,7 @@ from treasure_map.lib.setup.discover import (
     check_bindiff,
     check_ghidra,
     discover_binexport,
+    is_macos_java_stub,
     read_jdk,
 )
 from treasure_map.lib.setup.platform import CPU_ARM64, Platform, macho_cputypes
@@ -99,7 +101,13 @@ def _platform_checks(inp: DoctorInputs) -> list[Check]:
     p = inp.platform
     out = []
     if p.support == "supported":
-        out.append(check("platform", "ok", p.key + (" (WSL2)" if p.is_wsl else "")))
+        out.append(
+            check(
+                "platform",
+                "ok",
+                p.key + (" (WSL2)" if p.is_wsl else "") + (f" ({p.reason})" if p.reason else ""),
+            )
+        )
     elif p.support == "unverified":
         out.append(check("platform", "warn", f"{p.key}: {p.reason}"))
     else:
@@ -140,7 +148,7 @@ def effective_java_home(
         if info.major is not None and info.major >= 21 and info.javac:
             return Path(jh)
     java = which("java")
-    if java:
+    if java and not (sys.platform == "darwin" and is_macos_java_stub(java)):
         return Path(os.path.realpath(java)).parent.parent
     return None
 
@@ -334,7 +342,9 @@ def _dir_checks(inp: DoctorInputs) -> list[Check]:
     if ok:
         out.append(check(name, "ok", detail))
     else:
-        out.append(check(name, "missing" if "not installed" in detail else "wrong", detail))
+        # Installed but not loaded by the shell yet is not a failure of tmap: the line to add is in
+        # the detail, and `tmap init` never edits an rc without a yes.
+        out.append(check(name, "missing" if "not installed" in detail else "warn", detail))
     return out
 
 

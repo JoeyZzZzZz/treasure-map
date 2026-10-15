@@ -170,3 +170,27 @@ def test_the_real_machine_probe_lists(monkeypatch: pytest.MonkeyPatch) -> None:
     mac = discover.current_host(fakes.darwin_arm())
     assert "/Library/Java/JavaVirtualMachines/*/Contents/Home" in mac.jdk_globs
     assert Path("/Applications/BinDiff/BinDiff.app/Contents/MacOS/bin/bindiff") in mac.bindiff_paths
+
+
+def test_the_macos_java_stub_is_not_a_jdk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """/usr/bin/java on a Mac is a launcher stub: listing /usr as a JDK that failed its check is
+    noise on every init.
+
+    MUTATION: take the java on PATH as a JDK home on macOS too -> /usr is a candidate -> RED."""
+    from treasure_map.lib.setup import discover as d
+
+    host = fakes.make_host(tmp_path, platform=fakes.darwin_arm(), which={"java": "/usr/bin/java"})
+    monkeypatch.setattr(d.os.path, "realpath", lambda p: str(p))
+    found = d.discover_jdk(host, config_java_home=None, ghidra_home=None, pinned="21.0.12.1")
+    assert all(c.path != Path("/usr") for c in found)
+
+
+def test_macos_home_jdks_are_looked_for_in_their_bundle_layout() -> None:
+    """MUTATION: drop the macOS bundle globs -> an IntelliJ / sdkman JDK on a Mac is never seen
+    and ~200MB is downloaded again -> RED."""
+    from treasure_map.lib.setup.discover import current_host
+
+    globs = current_host(fakes.darwin_arm()).jdk_globs
+    assert any(g.endswith("Library/Java/JavaVirtualMachines/*/Contents/Home") for g in globs)
+    assert any(g.endswith(".sdkman/candidates/java/*/Contents/Home") for g in globs)
+    assert not any("Contents/Home" in g for g in current_host(fakes.linux()).jdk_globs)
