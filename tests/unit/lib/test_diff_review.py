@@ -1245,7 +1245,7 @@ def test_the_tools_write_list_and_refuse_with_the_facts(world: World) -> None:
     done = tools["promote"](DX, "pair:00001000:00002000", ref, "suspicious", "r")
     assert done["written"] is True and done["promoted_from"]["anchor_ref"] == anchor
 
-    listed = tools["list_candidates"](overlay=True)
+    listed = tools["list_candidates"](run_id="runA", overlay=True)
     marker = next(c for c in listed["candidates"] if c["evidence_ref"] == ref)["overlay"]
     assert marker["promoted_from"]["diff_id"] == DX
     judged = tools["list_overlays"](anchor_kind="diff_subject", run_id=PAIR)

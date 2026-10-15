@@ -9,7 +9,6 @@ the full pipeline including real Ghidra.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import shutil
 from pathlib import Path
@@ -113,7 +112,7 @@ def test_round1_self_test(tmp_path: Path) -> None:
 
     with patch(_PIPELINE_MODULE + ".GhidraRunner", return_value=runner1):
         with Workspace(workspace_path) as ws:
-            result1 = asyncio.run(run_analyze(fs_root, ws, cfg))
+            result1 = run_analyze(fs_root, ws, cfg)
 
     assert result1.binary_count == 2
     assert result1.dirty_count == 2
@@ -123,7 +122,7 @@ def test_round1_self_test(tmp_path: Path) -> None:
     runner2 = _mock_runner()
     with patch(_PIPELINE_MODULE + ".GhidraRunner", return_value=runner2):
         with Workspace(workspace_path) as ws:
-            result2 = asyncio.run(run_analyze(fs_root, ws, cfg))
+            result2 = run_analyze(fs_root, ws, cfg)
 
     runner2.run_all.assert_not_called()
     assert result2.binary_count == 2
@@ -180,7 +179,7 @@ def test_round2_partial_invalidation(tmp_path: Path) -> None:
 
     with patch(_PIPELINE_MODULE + ".GhidraRunner", return_value=runner1):
         with Workspace(workspace_path) as ws:
-            result1 = asyncio.run(run_analyze(fs_root, ws, cfg))
+            result1 = run_analyze(fs_root, ws, cfg)
 
     assert result1.binary_count == 2
     assert result1.dirty_count == 2
@@ -209,7 +208,7 @@ def test_round2_partial_invalidation(tmp_path: Path) -> None:
 
     with patch(_PIPELINE_MODULE + ".GhidraRunner", return_value=runner2):
         with Workspace(workspace_path) as ws:
-            result2 = asyncio.run(run_analyze(fs_root, ws, cfg))
+            result2 = run_analyze(fs_root, ws, cfg)
 
     assert result2.binary_count == 2
     assert result2.dirty_count == 1, "Only the library should be dirty (sha256 changed)"
@@ -266,7 +265,7 @@ def test_round1_full_pipeline(tmp_path: Path) -> None:
 
     # First run: real Ghidra
     with Workspace(workspace_path) as ws:
-        result1 = asyncio.run(run_analyze(fs_root, ws, cfg))
+        result1 = run_analyze(fs_root, ws, cfg)
 
     assert result1.binary_count >= 1
 
@@ -275,7 +274,7 @@ def test_round1_full_pipeline(tmp_path: Path) -> None:
         mock_runner = _mock_runner()
         mock_runner_cls.return_value = mock_runner
         with Workspace(workspace_path) as ws:
-            result2 = asyncio.run(run_analyze(fs_root, ws, cfg))
+            result2 = run_analyze(fs_root, ws, cfg)
         mock_runner.run_all.assert_not_called()
 
     assert result2.binary_count == result1.binary_count

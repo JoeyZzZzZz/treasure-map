@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 import click
 
+from treasure_map.cli.interrupts import interrupt_exit_code, is_interrupt_exit
 from treasure_map.lib.errors import ConfigError, TreasureMapError
 from treasure_map.lib.ro_db import ro_connect
 from treasure_map.version import UNKNOWN_VERSION, installed_commit
@@ -421,8 +422,9 @@ def _diff_rescan_plan(
             label = f"run '{rid}' (--{role})"
             # ★ Before the staleness check, which cannot see this state: a scan that started
             # clears the hunt stamp, so the run reads as unconfirmable rather than out of date while
-            # its old candidates may still be in the table. It is refused, not rescanned — scans
-            # take no lock, and the scan that has not finished may be running right now.
+            # its old candidates may still be in the table. It is refused, not rescanned — the
+            # scan that has not finished may be running right now in another terminal (its
+            # workspace lock would refuse a rescan, but this reads the atlas, not the workspace).
             if run.scan_status != "complete":
                 raise click.ClickException(
                     f"{label}: its last scan did not finish (scan_status={run.scan_status}). Run "
@@ -551,9 +553,9 @@ def _announce_diff_rescan(plan: list[_DiffRescan]) -> None:
 
 
 def _recheck_after_rescan(*, before: str, after: str, force: bool, resolved_atlas: Path) -> None:
-    """The one look at the two runs after the rescan. A rescan that failed returns normally (it
-    names the run and moves on), so its outcome is read from the atlas, never assumed. Refuses
-    rather than rescanning again."""
+    """The one look at the two runs after the rescan. A rescan where a run failed does not stop
+    the diff (it names the run and exits RESCAN_PARTIAL_EXIT, which the caller lets through), so
+    its outcome is read from the atlas, never assumed. Refuses rather than rescanning again."""
     from treasure_map.lib.atlas.connection import open_atlas
     from treasure_map.lib.diff.driver import check_run_pair_currency
     from treasure_map.lib.diff.layer0 import _resolve_run, _version_skew
@@ -728,10 +730,13 @@ def hunt_diff(
                 atlas_path=atlas_path,
             )
         except SystemExit as exc:
-            # The decompile stage turns Ctrl-C into exit code 130; any other exit is not ours.
-            if exc.code != 130:
+            # The decompile stage turns an interrupt into 128 + its signal. A rescan where some
+            # runs failed is not a reason to stop here: the recheck below names whatever is still
+            # stale. Any other exit is not ours.
+            if is_interrupt_exit(exc.code):
+                _rescan_interrupted(ctx, run_ids)
+            elif exc.code != RESCAN_PARTIAL_EXIT:
                 raise
-            _rescan_interrupted(ctx, run_ids)
         except (KeyboardInterrupt, click.exceptions.Abort):
             # The hunt stage lets the interrupt itself through.
             _rescan_interrupted(ctx, run_ids)
@@ -783,6 +788,14 @@ def hunt_diff(
         _echo_single_diff(single, resolved_atlas, states)
     else:
         _echo_full_diff(full, resolved_atlas, coverage, after)
+        if full is not None and full.cancelled:
+            # The completed binaries are kept, but the run did not finish: not a 0.
+            ctx.exit(interrupt_exit_code())
+
+
+# `tmap rescan` finished, but some selected runs failed: distinct from 1 (an error before any work)
+# and from the interrupt exits, so a caller can tell a partial refresh apart.
+RESCAN_PARTIAL_EXIT = 3
 
 
 def _rescan_interrupted(ctx: click.Context, run_ids: tuple[str, ...]) -> None:
@@ -792,7 +805,7 @@ def _rescan_interrupted(ctx: click.Context, run_ids: tuple[str, ...]) -> None:
         "resumes it on its own.",
         err=True,
     )
-    ctx.exit(130)
+    ctx.exit(interrupt_exit_code())
 
 
 @click.command(
@@ -840,7 +853,15 @@ def hunt_pattern(
 
     cfg = load_config(config)
     resolved_atlas = atlas_path if atlas_path is not None else cfg.atlas.db_path
-    stats = run_analyzer2(db, resolved_atlas, source_run_id=run_id, rehunt=rehunt)
+    try:
+        stats = run_analyzer2(db, resolved_atlas, source_run_id=run_id, rehunt=rehunt)
+    except KeyboardInterrupt:
+        click.echo(
+            "\nAborted — the hunt's write was rolled back (stored candidates unchanged); the run "
+            "reads in_progress until a hunt finishes.",
+            err=True,
+        )
+        raise SystemExit(interrupt_exit_code()) from None
     # Record this as the last run so `tmap mcp` can serve it without explicit paths.
     write_last_run(db, resolved_atlas, run_id)
 
@@ -915,7 +936,13 @@ def _effective_top(top_n: int | None, *, show_all: bool, sink: str | None) -> in
 
 
 def _parse_dim_filters(specs: tuple[str, ...]) -> list[tuple[str, str]]:
-    """Parse repeated --filter ``dim=value`` options into (dim, value) pairs; malformed skipped."""
+    """Parse repeated --filter ``dim=value`` options into (dim, value) pairs. A fragment that is not
+    dim=value is refused: dropping it ran the command unfiltered and said nothing."""
+    from treasure_map.lib.query import malformed_filter_refusal
+
+    bad = malformed_filter_refusal(list(specs))
+    if bad is not None:
+        raise click.UsageError(bad)
     out: list[tuple[str, str]] = []
     for spec in specs:
         d, sep, v = spec.partition("=")
@@ -1301,6 +1328,29 @@ def _run_provenance_line(r: RunRow) -> str:
     return "   ".join(parts)
 
 
+def _refuse_stale_triage_run(atlas_path: Path, run_id: str) -> None:
+    """Raise when ``run_id`` is a PROVEN stale scan (run_staleness), with its remedy. An unknown
+    run, or one whose currency cannot be confirmed, is left to the listing."""
+    from treasure_map.lib.analyze.ghidra_runner import current_pass_version
+    from treasure_map.lib.atlas.connection import open_atlas
+    from treasure_map.lib.query import get_run as run_get_run
+    from treasure_map.lib.query.runs import run_staleness
+
+    conn = open_atlas(atlas_path)
+    try:
+        run = run_get_run(conn, run_id)
+    finally:
+        conn.close()
+    if run is None:
+        return
+    stale = run_staleness(run, build_hash=current_pass_version(), commit=installed_commit())
+    if stale.stale:
+        raise click.ClickException(
+            f"run '{run_id}' is a STALE scan ({stale.axis}): {stale.detail.rstrip('.')}. "
+            f"{stale.remedy}"
+        )
+
+
 def _echo_run_lineage(atlas_path: Path, selected_run: str) -> None:
     """Print the run's scan lineage at the top of a CLI view — the stale-scan guard.
 
@@ -1452,7 +1502,11 @@ def runs(config: Path | None, atlas_path: Path | None, as_json: bool) -> None:
     shell_complete=_complete_run_id,
 )
 @click.option(
-    "--top", "top_n", type=int, default=None, help="Show at most N candidates (default 20)."
+    "--top",
+    "top_n",
+    type=click.IntRange(min=0),
+    default=None,
+    help="Show at most N candidates (default 20).",
 )
 @click.option(
     "--all", "show_all", is_flag=True, default=False, help="Show every candidate (no cap)."
@@ -1599,6 +1653,10 @@ def triage(
             "tmap triage needs a run: pass one as the argument or --run. "
             f"Runs in this atlas: {listed}"
         )
+    # ★ The same gate MCP's list_candidates stands behind: a run PROVEN to have been graded by
+    # different code than is running is refused here too. Serving it from the CLI while the MCP
+    # refused it gave two answers to one question — and a script reading --json could not tell.
+    _refuse_stale_triage_run(resolved_atlas, selected_run)
     # ★ print the current run's scan lineage (build / date / status) at the top — a stale scan
     # is otherwise silent, and this is exactly where a reader forgets an old build was scanned.
     if not as_json:
@@ -1778,7 +1836,11 @@ def atlas_view(view: str, config: Path | None, atlas_path: Path | None) -> None:
     help="Neutral per-run id written to the atlas. Defaults to the workspace name.",
 )
 @click.option(
-    "--top", "top_n", type=int, default=None, help="Show at most N candidates (default 20)."
+    "--top",
+    "top_n",
+    type=click.IntRange(min=0),
+    default=None,
+    help="Show at most N candidates (default 20).",
 )
 @click.option(
     "--all", "show_all", is_flag=True, default=False, help="Show every candidate (no cap)."
@@ -1872,69 +1934,81 @@ def scan(
     three sub-commands stay independent for re-running a single step; this is the one-shot path.
     Slow stage is analyze (one Ghidra JVM per binary) — progress is shown per stage.
     """
-    import asyncio
 
-    from treasure_map.cli.analyze_cli import _report_timeout_skips, _warn_incomplete
-    from treasure_map.lib.atlas.connection import open_atlas
-    from treasure_map.lib.config.config import load_config
-    from treasure_map.lib.errors import GhidraNotFoundError, TreasureMapError
-    from treasure_map.lib.hunt import run_analyzer2
-    from treasure_map.lib.query import DEFAULT_LENS_LABEL, PHASE1_CAVEATS
-    from treasure_map.lib.query import triage as run_triage
-    from treasure_map.lib.workspace.resolver import resolve_workspace
-    from treasure_map.lib.workspace.workspace import Workspace
+    # --json: stdout carries the JSON and nothing else. Every progress line of the two stages
+    # (and of the helpers they call) goes to stderr instead, so the output parses.
+    import contextlib
+    import sys
 
-    _echo_legal_notice(as_json=as_json)
-    cfg = load_config(config)
-    try:
-        resolved = resolve_workspace(workspace, workspace_dir=cfg.workspace_dir, fs_root=fs_root)
-    except TreasureMapError as exc:
-        raise click.ClickException(str(exc)) from exc
-    ws_path = resolved.path
+    progress = contextlib.redirect_stdout(sys.stderr) if as_json else contextlib.nullcontext()
+    with progress:
+        from treasure_map.cli.analyze_cli import _report_timeout_skips, _warn_incomplete
+        from treasure_map.lib.atlas.connection import open_atlas
+        from treasure_map.lib.config.config import load_config
+        from treasure_map.lib.errors import GhidraNotFoundError, TreasureMapError
+        from treasure_map.lib.hunt import run_analyzer2
+        from treasure_map.lib.query import DEFAULT_LENS_LABEL, PHASE1_CAVEATS
+        from treasure_map.lib.query import triage as run_triage
+        from treasure_map.lib.workspace.resolver import resolve_workspace
+        from treasure_map.lib.workspace.workspace import Workspace
 
-    # ★ Store an ABSOLUTE firmware root so a later `tmap diff` can locate the binaries from ANY cwd
-    # (binaries.path and firmware_path both derive from this one fs_root). The window is tight and
-    # bounded on BOTH sides: resolve AFTER resolve_workspace (auto-naming without -w uses the raw
-    # fs_root.name — resolving '.' first would rename the workspace and silently re-scan from
-    # scratch) but BEFORE run_analyze (the traversal that writes binaries.path runs there, well
-    # before firmware_path is recorded — resolving only near firmware_path would leave binaries.path
-    # relative, exactly the half that blocks diff). One resolve here keeps both paths consistent
-    # (mirrors analyzer2's resolve of analysis_db_path).
-    fs_root = fs_root.resolve()
+        _echo_legal_notice(as_json=as_json)
+        cfg = load_config(config)
+        try:
+            resolved = resolve_workspace(
+                workspace, workspace_dir=cfg.workspace_dir, fs_root=fs_root
+            )
+        except TreasureMapError as exc:
+            raise click.ClickException(str(exc)) from exc
+        ws_path = resolved.path
 
-    effective_run_id = run_id if run_id is not None else ws_path.name
-    resolved_atlas = atlas_path if atlas_path is not None else cfg.atlas.db_path
+        # ★ Store an ABSOLUTE firmware root so a later `tmap diff` can locate the binaries from ANY
+        # cwd (binaries.path and firmware_path both derive from this one fs_root). The window is
+        # tight and bounded on BOTH sides: resolve AFTER resolve_workspace (auto-naming without -w
+        # uses the raw fs_root.name — resolving '.' first would rename the workspace and silently
+        # re-scan from scratch) but BEFORE run_analyze (the traversal that writes binaries.path runs
+        # there, well before firmware_path is recorded — resolving only near firmware_path would
+        # leave binaries.path relative, exactly the half that blocks diff). One resolve here keeps
+        # both paths consistent (mirrors analyzer2's resolve of analysis_db_path).
+        fs_root = fs_root.resolve()
 
-    def _progress(step: str, meta: dict[str, Any]) -> None:
-        click.echo(f"  [{step}] {meta}")
+        effective_run_id = run_id if run_id is not None else ws_path.name
+        resolved_atlas = atlas_path if atlas_path is not None else cfg.atlas.db_path
 
-    click.echo(
-        f"note: re-running run-id '{effective_run_id}' refreshes its atlas entries "
-        "(replace-by-run); keep one run-id per device+firmware version"
-    )
+        def _progress(step: str, meta: dict[str, Any]) -> None:
+            click.echo(f"  [{step}] {meta}")
 
-    # rescan invokes scan with top_n=0 to refresh WITHOUT reading — the candidate list is a separate
-    # act (`tmap triage <run>`), so a multi-run refresh is neither buried under six triage tables
-    # nor contradicted by a "showing top 0 of N" summary (the renderer's header, lens and caveats
-    # print regardless of the cap, so a 0 cap left an empty table under a line counting thousands).
-    #
-    # This 0 is a MAGIC-VALUE OVERLOAD, not an internal-only value: --top carries no IntRange, so a
-    # user can type `tmap scan --top 0` and land here too, and they get no triage stage rather than
-    # an empty one. Acceptable — that input only ever rendered an empty list.
-    #
-    # ★ Computed ONCE. The stage denominator and the skip are two statements of one fact, and
-    # deriving them separately is how a label comes to say "of 3" over a run that does 2.
-    show_triage = top_n != 0
-    total_stages = 3 if show_triage else 2
+        click.echo(
+            f"note: re-running run-id '{effective_run_id}' refreshes its atlas entries "
+            "(replace-by-run); keep one run-id per device+firmware version"
+        )
 
-    # Stage 1 — analyze: reuse the analyze command's resolve_workspace + Workspace + asyncio.run.
-    click.echo(f"\n[1/{total_stages}] analyzing firmware (Ghidra) …")
-    from treasure_map.lib.analyze.pipeline import run_analyze
+        # rescan invokes scan with top_n=0 to refresh WITHOUT reading — the candidate list is a
+        # separate act (`tmap triage <run>`), so a multi-run refresh is neither buried under six
+        # triage tables nor contradicted by a "showing top 0 of N" summary (the renderer's header,
+        # lens and caveats print regardless of the cap, so a 0 cap left an empty table under a line
+        # counting thousands).
+        #
+        # This 0 is a MAGIC-VALUE OVERLOAD, not an internal-only value: --top carries no IntRange,
+        # so a user can type `tmap scan --top 0` and land here too, and they get no triage stage
+        # rather than an empty one. Acceptable — that input only ever rendered an empty list.
+        #
+        # ★ Computed ONCE. The stage denominator and the skip are two statements of one fact, and
+        # deriving them separately is how a label comes to say "of 3" over a run that does 2.
+        show_triage = top_n != 0
+        total_stages = 3 if show_triage else 2
 
-    try:
-        with Workspace(ws_path) as ws:
-            result = asyncio.run(
-                run_analyze(
+        # Stage 1 — analyze: reuse the analyze command's resolve_workspace + Workspace +
+        # run_analyze.
+        click.echo(f"\n[1/{total_stages}] analyzing firmware (Ghidra) …")
+        from treasure_map.lib.analyze.pipeline import run_analyze
+
+        try:
+            with Workspace(ws_path) as ws:
+                # A plain call, not asyncio.run: the analysis has no await points, and asyncio's own
+                # SIGINT handling turned the first Ctrl-C into a cancel that waited for the whole
+                # run.
+                result = run_analyze(
                     fs_root,
                     ws,
                     cfg,
@@ -1944,79 +2018,90 @@ def scan(
                     reanalyze=reanalyze,
                     force_retry=force_retry,
                 )
+        except KeyboardInterrupt:
+            click.echo("\nAborted — all Ghidra processes terminated.", err=True)
+            raise SystemExit(interrupt_exit_code()) from None
+        except GhidraNotFoundError as exc:
+            raise click.ClickException(str(exc)) from exc
+        except TreasureMapError as exc:
+            raise click.ClickException(f"{type(exc).__name__}: {exc}") from exc
+        click.echo(
+            f"      → analysis.db: {result.binary_count} binaries, "
+            f"{result.functions_ingested} functions"
+        )
+        _report_timeout_skips(result.timeout_skipped)
+        _warn_incomplete(result.incomplete_binaries)
+
+        # Stage 2 — hunt call-sequence shapes -> atlas.
+        click.echo(
+            f"\n[2/{total_stages}] hunting call-sequence shapes → atlas "
+            f"(run-id={effective_run_id}) …"
+        )
+        try:
+            h = run_analyzer2(
+                result.db_path,
+                resolved_atlas,
+                source_run_id=effective_run_id,
+                firmware_path=str(fs_root),
+                rehunt=rehunt,
             )
-    except KeyboardInterrupt:
-        click.echo("\nAborted by user — all Ghidra processes terminated.", err=True)
-        raise SystemExit(130) from None
-    except GhidraNotFoundError as exc:
-        raise click.ClickException(str(exc)) from exc
-    except TreasureMapError as exc:
-        raise click.ClickException(f"{type(exc).__name__}: {exc}") from exc
-    click.echo(
-        f"      → analysis.db: {result.binary_count} binaries, "
-        f"{result.functions_ingested} functions"
-    )
-    _report_timeout_skips(result.timeout_skipped)
-    _warn_incomplete(result.incomplete_binaries)
+        except KeyboardInterrupt:
+            click.echo(
+                "\nAborted — the hunt's write was rolled back (stored candidates unchanged); "
+                "the run reads in_progress until a hunt finishes.",
+                err=True,
+            )
+            raise SystemExit(interrupt_exit_code()) from None
+        except TreasureMapError as exc:
+            raise click.ClickException(f"{type(exc).__name__}: {exc}") from exc
+        if h.skipped:
+            # Said out loud, because the counts below would otherwise print as zeros and read as a
+            # hunt that found nothing. The stored candidates are untouched and still queryable.
+            click.echo(
+                f"      → hunt SKIPPED — {h.hunt_currency}; stored candidates kept as they are"
+            )
+            click.echo("        (--rehunt runs it anyway)")
+        else:
+            click.echo(
+                f"      → {h.instances_written} candidates written "
+                f"(confirmed={h.by_status.get('confirmed', 0)}, "
+                f"unknown={h.by_status.get('unknown', 0)})"
+            )
+        if h.data_gap_skipped:
+            # Honesty flag: matches whose body Ghidra could not decompile were dropped — candidate
+            # set is incomplete for this run (a real sink can hide in an un-decompilable function).
+            click.echo(
+                f"      → {h.data_gap_skipped} shape matches skipped (data gap: no decompilable "
+                "body) — candidate set INCOMPLETE"
+            )
+        if h.callee_parse_failed:
+            # The same honesty, one stage earlier: admitted for scanning, callee list unparseable.
+            click.echo(
+                f"      → {h.callee_parse_failed} functions whose stored callees could not be "
+                "parsed — NOT scanned, candidate set INCOMPLETE"
+            )
+        if h.fmt_wrapper_unknown_source_demoted:
+            # Not a recall flag: kept in the set, only ranked lower (a '?' is never removed).
+            click.echo(
+                f"      → {h.fmt_wrapper_unknown_source_demoted} fmt-wrapper candidates KEPT but "
+                "ranked low (forwarded source unknown)"
+            )
+        if h.nvram_flows_written:
+            click.echo(f"      → {h.nvram_flows_written} nvram key-flow ops flattened → atlas")
+        if h.nvram_wrapper_edges:
+            click.echo(
+                f"      → {h.nvram_wrapper_edges} nvram wrapper-indirect key edges recovered (A2)"
+            )
+        if h.nvram_defaults_written:
+            click.echo(
+                f"      → {h.nvram_defaults_written} router_defaults web-settable keys → atlas"
+            )
+        if h.web_form_fields_written:
+            click.echo(f"      → {h.web_form_fields_written} editable web form fields → atlas")
+        # Record this as the last run so `tmap mcp` (no args) serves this firmware's analysis.db.
+        from treasure_map.lib.last_run import write_last_run
 
-    # Stage 2 — hunt call-sequence shapes -> atlas.
-    click.echo(
-        f"\n[2/{total_stages}] hunting call-sequence shapes → atlas (run-id={effective_run_id}) …"
-    )
-    try:
-        h = run_analyzer2(
-            result.db_path,
-            resolved_atlas,
-            source_run_id=effective_run_id,
-            firmware_path=str(fs_root),
-            rehunt=rehunt,
-        )
-    except TreasureMapError as exc:
-        raise click.ClickException(f"{type(exc).__name__}: {exc}") from exc
-    if h.skipped:
-        # Said out loud, because the counts below would otherwise print as zeros and read as a
-        # hunt that found nothing. The stored candidates are untouched and still queryable.
-        click.echo(f"      → hunt SKIPPED — {h.hunt_currency}; stored candidates kept as they are")
-        click.echo("        (--rehunt runs it anyway)")
-    else:
-        click.echo(
-            f"      → {h.instances_written} candidates written "
-            f"(confirmed={h.by_status.get('confirmed', 0)}, "
-            f"unknown={h.by_status.get('unknown', 0)})"
-        )
-    if h.data_gap_skipped:
-        # Honesty flag: matches whose body Ghidra could not decompile were dropped — candidate
-        # set is incomplete for this run (a real sink can hide in an un-decompilable function).
-        click.echo(
-            f"      → {h.data_gap_skipped} shape matches skipped (data gap: no decompilable "
-            "body) — candidate set INCOMPLETE"
-        )
-    if h.callee_parse_failed:
-        # The same honesty, one stage earlier: admitted for scanning, callee list unparseable.
-        click.echo(
-            f"      → {h.callee_parse_failed} functions whose stored callees could not be parsed "
-            "— NOT scanned, candidate set INCOMPLETE"
-        )
-    if h.fmt_wrapper_unknown_source_demoted:
-        # Not a recall flag: kept in the set, only ranked lower (a '?' is never removed).
-        click.echo(
-            f"      → {h.fmt_wrapper_unknown_source_demoted} fmt-wrapper candidates KEPT but "
-            "ranked low (forwarded source unknown)"
-        )
-    if h.nvram_flows_written:
-        click.echo(f"      → {h.nvram_flows_written} nvram key-flow ops flattened → atlas")
-    if h.nvram_wrapper_edges:
-        click.echo(
-            f"      → {h.nvram_wrapper_edges} nvram wrapper-indirect key edges recovered (A2)"
-        )
-    if h.nvram_defaults_written:
-        click.echo(f"      → {h.nvram_defaults_written} router_defaults web-settable keys → atlas")
-    if h.web_form_fields_written:
-        click.echo(f"      → {h.web_form_fields_written} editable web form fields → atlas")
-    # Record this as the last run so `tmap mcp` (no args) serves this firmware's analysis.db.
-    from treasure_map.lib.last_run import write_last_run
-
-    write_last_run(result.db_path, resolved_atlas, effective_run_id)
+        write_last_run(result.db_path, resolved_atlas, effective_run_id)
 
     if show_triage:
         # [3/3] triage — the readable, ranked candidate list (same renderer as `tmap triage`).
@@ -2024,7 +2109,7 @@ def scan(
         # the total 3. The whole stage is inside the condition, the ranking included — capping the
         # render at 0 rows still sorted every candidate in the run first, which is a full sort
         # computed so that none of it could be shown.
-        click.echo("\n[3/3] triage — ranked candidates for manual review:\n")
+        click.echo("\n[3/3] triage — ranked candidates for manual review:\n", err=as_json)
         conn = open_atlas(resolved_atlas)
         try:
             candidates = run_triage(conn, run_id=effective_run_id)
@@ -2397,7 +2482,7 @@ def rescan(
     extraction is already current costs no decompiler time — the scan finds every binary cached —
     but it does rebuild the parts no fingerprint covers: the ELF inventory, the symlinks, the
     cross-binary xrefs and the non-binary facts. Runs already produced by this commit are left alone
-    (--force re-runs them anyway).
+    (--force re-runs them anyway). Exits 3 when some selected runs failed to refresh.
 
     WHAT --force CAN AND CANNOT REFRESH. It re-runs the scan, so a changed config or a firmware
     directory whose contents moved is picked up. It does NOT re-extract: the scan it drives carries
@@ -2566,3 +2651,6 @@ def rescan(
         for rid, msg in failed:
             click.echo(f"  {rid}: {msg}")
     click.echo("`tmap triage <run-id>` for the refreshed candidate list.")
+    if failed:
+        # Not 0: a script must be able to tell "everything refreshed" from "some runs did not".
+        raise SystemExit(RESCAN_PARTIAL_EXIT)

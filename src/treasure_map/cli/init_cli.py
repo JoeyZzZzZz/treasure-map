@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 import click
 
+from treasure_map.cli.interrupts import interrupt_exit_code
 from treasure_map.lib.errors import TreasureMapError
 from treasure_map.lib.setup.initializer import (
     InitAbortedError,
@@ -156,7 +157,7 @@ def _run(**kwargs: object) -> InitResult:
         raise click.ClickException(str(exc)) from exc
     except InitAbortedError as exc:
         click.echo(str(exc), err=True)
-        raise SystemExit(130) from exc
+        raise SystemExit(interrupt_exit_code()) from exc
     except FileExistsError as exc:
         raise click.ClickException(str(exc)) from exc
     except TreasureMapError as exc:
@@ -167,7 +168,7 @@ def _run(**kwargs: object) -> InitResult:
         # Ctrl-C at a raw-mode key, or at any line prompt (click turns that into Abort): the same
         # interruption, the same 130.
         click.echo("\ninterrupted; staging cleaned up — run tmap init again to continue", err=True)
-        raise SystemExit(130) from exc
+        raise SystemExit(interrupt_exit_code()) from exc
 
 
 @click.command("init", short_help="Set up tmap: toolchain, config, agents (run this first)")

@@ -1889,6 +1889,21 @@ def test_the_filters_narrow_the_entries_not_the_counts(world: World) -> None:
     assert {e["tier"] for e in _view(world, tier=3)["entries"]} == {3}
 
 
+def test_a_filter_value_this_diff_does_not_carry_is_named(world: World) -> None:
+    """An empty page reads the same whether the value was misspelled or simply absent; the view
+    names a value no entry carries, with the ones that do occur. A value that does occur gets no
+    note.
+
+    MUTATION: drop the filter_note -> RED."""
+    typo = _view(world, subclass="instruction_unmatchd")
+    assert typo["entries"] == []
+    note = typo["lens"].get("filter_note") or ""
+    assert "instruction_unmatchd" in note and "instruction_unmatched" in note, typo["lens"]
+    spot = _view(world, blind_spot="callee_identity_unresolve")
+    assert "callee_identity_unresolved" in (spot["lens"].get("filter_note") or ""), spot["lens"]
+    assert "filter_note" not in _view(world, subclass="instruction_unmatched")["lens"]
+
+
 # ── the R bucket's proposed reading, the qualified text match, hidden_region, deltas ──────────
 
 U_PAIRS = {
@@ -2356,3 +2371,32 @@ def test_a_re_extraction_is_never_served_an_earlier_reading(tmp_path: Path, curr
     assert v[r]["proposed_pair_reading"]["state"] == "differs"
     assert v[moved]["pseudocode_sameness"] == "differs"
     assert v[sized]["pseudocode_delta"]["substitutions"]["number"]["first"] == [["0x60", "0x68"]]
+
+
+def test_the_view_caches_are_bounded_and_keyed_by_atlas(tmp_path: Path) -> None:
+    """A long-lived server must not keep every diff and every re-hunted run it ever showed, and
+    two atlases with the same ids must not share an entry.
+
+    MUTATION: drop the eviction loop in _BoundedCache.__setitem__ -> RED (it grows past its bound).
+    MUTATION: return "" from _atlas_identity -> RED (two atlases read as one)."""
+    import sqlite3 as _sqlite3
+
+    from treasure_map.lib.query import patch_view as pv
+
+    cache: pv._BoundedCache[int, int] = pv._BoundedCache(3)
+    for i in range(10):
+        cache[i] = i
+    assert len(cache) == 3
+    assert cache.get(0) is None and cache.get(9) == 9
+    cache.get(7)  # touched: survives the next insert, 8 (now the oldest) does not
+    cache[10] = 10
+    assert cache.get(7) == 7 and cache.get(8) is None
+
+    a = _sqlite3.connect(tmp_path / "a.db")
+    b = _sqlite3.connect(tmp_path / "b.db")
+    try:
+        assert pv._atlas_identity(a) != pv._atlas_identity(b)
+        assert pv._atlas_identity(a).endswith("a.db")
+    finally:
+        a.close()
+        b.close()

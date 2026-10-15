@@ -336,10 +336,15 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # Backfill from the anchor: everything before the first '#'. `> 1` (not `> 0`) so a ref
         # that STARTS with '#' is left NULL rather than backfilled to an empty string — the same
         # rule the write path applies, so a backfilled row and a freshly written one agree.
-        conn.execute(
-            "UPDATE overlay SET run_id = substr(anchor_ref, 1, instr(anchor_ref, '#') - 1) "
-            "WHERE run_id IS NULL AND instr(anchor_ref, '#') > 1"
-        )
+        # Looked for first, then written: an UPDATE takes the write lock even when it matches
+        # nothing, so an unconditional one made every open wait on any running writer.
+        if conn.execute(
+            "SELECT 1 FROM overlay WHERE run_id IS NULL AND instr(anchor_ref, '#') > 1 LIMIT 1"
+        ).fetchone():
+            conn.execute(
+                "UPDATE overlay SET run_id = substr(anchor_ref, 1, instr(anchor_ref, '#') - 1) "
+                "WHERE run_id IS NULL AND instr(anchor_ref, '#') > 1"
+            )
 
     # overlay.verdict CHECK removal (this round): the vocabulary is still moving, and pinning it in
     # the schema made every wording change cost a rebuild that has to carry real annotations across.
@@ -363,7 +368,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # could be established" is itself a conclusion. Data-only, so no rebuild and no shape test:
         # the statement is self-idempotent, matching nothing once it has run. It follows the rebuild
         # so it updates the final table rather than one about to be replaced.
-        conn.execute("UPDATE overlay SET verdict = 'inconclusive' WHERE verdict = 'to-review'")
+        if conn.execute("SELECT 1 FROM overlay WHERE verdict = 'to-review' LIMIT 1").fetchone():
+            conn.execute("UPDATE overlay SET verdict = 'inconclusive' WHERE verdict = 'to-review'")
 
         # overlay.verdict_basis (this round): the structured justification a `safe` or `exploitable`
         # annotation must carry. Additive and nullable — existing rows keep NULL.
@@ -453,7 +459,10 @@ def open_atlas(db_path: Path) -> sqlite3.Connection:
     before any file-copy — never a bare cp while WAL side-files exist.
     """
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
+    # 30s, not the default 5: a write (an annotation) that meets another writer's short transaction
+    # waits it out instead of failing. Opening and reading never wait — _migrate writes only when
+    # there is something to migrate, so an up-to-date atlas opens without the write lock.
+    conn = sqlite3.connect(db_path, timeout=30)
     conn.row_factory = sqlite3.Row
     schema = _SCHEMA_PATH.read_text()
     _migrate(conn)  # ★ BEFORE executescript — see the load-bearing-order note above

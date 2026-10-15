@@ -217,6 +217,11 @@ def mcp_serve(atlas_db: str | None, workspaces_root: str | None) -> None:
     run table, so one server serves every scanned firmware. No firmware is preselected. Launch this
     from an MCP client, not by hand — it speaks JSON-RPC on stdin/stdout.
     """
+    # A client stops its server with SIGTERM; the default action is exactly right for a stdio
+    # server that starts no child processes, so the interrupt routing main() installs is undone.
+    from treasure_map.cli.interrupts import restore_default_termination
+
+    restore_default_termination()
     atlas_db, workspaces_root = _resolve_mcp_target(atlas_db, workspaces_root)
     # `mcp` is a core dependency, so build_server is imported like any other module. A missing
     # `mcp` here means a corrupted install, not an unselected extra — let it surface as a normal

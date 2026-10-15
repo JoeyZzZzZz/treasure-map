@@ -1260,3 +1260,33 @@ def test_every_tool_says_whether_it_writes(tmp_path: Path) -> None:
     assert writers == {"annotate", "annotate_diff", "promote", "clear_overlay"}
     assert tools["clear_overlay"].destructiveHint is True
     assert tools["annotate"].destructiveHint is False
+
+
+def test_a_misspelled_lens_parameter_is_refused_not_answered(tmp_path: Path) -> None:
+    """A wrong status used to come back as an empty map, and a wrong sort_by / view as the default
+    order labelled with the lens that was asked for. Each now names the values that exist.
+
+    MUTATION: drop the lens_parameter_refusal call in list_candidates -> RED.
+    MUTATION: drop the malformed_filter_refusal call -> RED (the filter is silently ignored)."""
+    tools = _tools(tmp_path)
+    for kwargs, word in (
+        ({"status": "to_verify"}, "to-verify"),
+        ({"sort_by": "controlability"}, "controllability"),
+        ({"view": "nvram_source"}, "nvram-source"),
+        ({"filters": "controllability"}, "dim=value"),
+    ):
+        res = tools["list_candidates"](run_id="run_m", **kwargs)
+        assert "error" in res and word in res["error"], (kwargs, res.get("error"))
+        assert "candidates" not in res
+    assert "error" not in tools["list_candidates"](run_id="run_m", status="reachable")
+
+
+def test_a_misspelled_direction_or_side_is_refused(tmp_path: Path) -> None:
+    """An unknown xref direction used to answer as callers, and any side but "b" as side "a".
+
+    MUTATION: drop either check -> RED (an answer for the other question comes back)."""
+    tools = _tools(tmp_path)
+    res = tools["get_xrefs"](function="handle_req", direction="caller", run_id="run_m")
+    assert "error" in res and "callers" in res["error"]
+    aligned = tools["get_function_alignment"]("x::y::z", "00401000", side="B")
+    assert "error" in aligned and "'a' or 'b'" in aligned["error"]

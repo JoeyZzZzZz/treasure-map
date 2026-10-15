@@ -351,7 +351,8 @@ def test_one_failing_firmware_does_not_abandon_the_rest(
     """A half-done refresh that stops silently is worse than one that says what broke.
 
     MUTATION: let the ``click.ClickException`` propagate instead of collecting it -> RED (the
-    second run is never attempted and the exit code is non-zero). Measured RED at 1 failed.
+    second run is never attempted). MUTATION: drop the partial-failure exit -> RED (exit 0 over a
+    run that did not refresh).
     """
     db = _two_runnable(tmp_path, monkeypatch)
     seen: list[str | None] = []
@@ -371,7 +372,8 @@ def test_one_failing_firmware_does_not_abandon_the_rest(
 
     monkeypatch.setattr(hunt_cli, "scan", _fake_scan)
     out = CliRunner().invoke(rescan, ["--atlas", str(db)])
-    assert out.exit_code == 0, out.output
+    # Partial: every run was attempted, one failed — said in the exit code, not just the text.
+    assert out.exit_code == hunt_cli.RESCAN_PARTIAL_EXIT, out.output
     assert seen == ["one", "two"], "a failure must not abandon the runs after it"
     assert "rescanned 1/2" in out.output
     assert "one: ghidra exploded" in out.output
@@ -641,9 +643,9 @@ def test_a_custom_named_run_is_rescanned_in_place_rebuilding_without_the_decompi
     analyzed: list[object] = []
     real_run_analyze = pipeline.run_analyze
 
-    async def _spy_run_analyze(*a: object, **k: object) -> object:
+    def _spy_run_analyze(*a: object, **k: object) -> object:
         analyzed.append(a)
-        return await real_run_analyze(*a, **k)  # type: ignore[arg-type]
+        return real_run_analyze(*a, **k)  # type: ignore[arg-type]
 
     monkeypatch.setattr(pipeline, "run_analyze", _spy_run_analyze)
 
@@ -986,7 +988,7 @@ def test_a_file_that_is_not_a_database_fails_one_run_and_is_left_untouched(
 
     monkeypatch.setattr(hunt_cli, "scan", _fake_scan)
     out = CliRunner().invoke(rescan, ["--atlas", str(atlas)])
-    assert out.exit_code == 0, out.output
+    assert out.exit_code == hunt_cli.RESCAN_PARTIAL_EXIT, out.output
     assert "rescanned 1/2" in out.output
     assert "a_junk: recorded analysis.db is not a readable database" in out.output
     assert seen == ["b_good"], "the unreadable path must not be scanned over"

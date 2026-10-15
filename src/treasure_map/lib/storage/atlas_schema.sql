@@ -440,6 +440,9 @@ CREATE INDEX IF NOT EXISTS idx_instance_reach   ON instance(reachability_status)
 CREATE INDEX IF NOT EXISTS idx_instance_prov    ON instance(provenance_level);
 CREATE INDEX IF NOT EXISTS idx_instance_scope   ON instance(scope_origin);
 CREATE INDEX IF NOT EXISTS idx_instance_run     ON instance(source_run_id);
+-- An annotation's basis is re-read per ref, on every candidate listing; without this each one
+-- was a full scan of the instance table, so the listing slowed with every annotation recorded.
+CREATE INDEX IF NOT EXISTS idx_instance_evref  ON instance(evidence_ref);
 
 -- ── layer-0 diff: function_alignment ─────────────────────────────────────────
 -- One BinDiff-matched function pair (A-side <-> B-side), parsed from a .BinDiff

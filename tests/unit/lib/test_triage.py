@@ -2091,3 +2091,17 @@ def test_record_addr_parses_or_honestly_returns_none() -> None:
     assert _record_addr({"sink_addr": 0x41CE98}) is None  # not a string (an int)
     assert _record_addr({"sink_addr": "deadzz"}) is None  # unparseable
     assert _record_addr({"sink_addr": ""}) is None  # empty
+
+
+def test_cli_refuses_a_negative_top_and_a_malformed_filter(tmp_path: Path) -> None:
+    """A negative --top used to slice from the end; a --filter without '=' was dropped and the
+    command ran unfiltered.
+
+    MUTATION: --top back to type=int -> RED. MUTATION: skip the malformed-filter refusal -> RED."""
+    atlas = _seed_for_cli(tmp_path)
+    neg = CliRunner().invoke(triage_cmd, ["run_cli", "--top", "-1", "--atlas", str(atlas)])
+    assert neg.exit_code == 2, neg.output
+    bad = CliRunner().invoke(
+        triage_cmd, ["run_cli", "--filter", "controllability", "--atlas", str(atlas)]
+    )
+    assert bad.exit_code == 2 and "dim=value" in bad.output, bad.output

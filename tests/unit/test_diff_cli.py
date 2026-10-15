@@ -54,6 +54,7 @@ class Env:
         self.rescan_does: Any = "fix"
         self.after_fix: dict[str, Any] = {}
         self.diff_raises: Exception | None = None
+        self.full_cancelled = False
         self.running(build=BUILD, commit=COMMIT)
         monkeypatch.setattr(hunt_cli, "rescan", self._rescan)
         monkeypatch.setattr(driver, "run_full_diff", self._full)
@@ -202,7 +203,9 @@ class Env:
         self.diffs.append((run_a, run_b))
         if self.diff_raises is not None:
             raise self.diff_raises
-        return driver.FullDiffSummary(driver.FullDiffPlan((), (), (), ()), (), cancelled=False)
+        return driver.FullDiffSummary(
+            driver.FullDiffPlan((), (), (), ()), (), cancelled=self.full_cancelled
+        )
 
     def _single(
         self, atlas: sqlite3.Connection, run_a: str, run_b: str, binary: str, **kw: Any
@@ -619,7 +622,33 @@ def test_an_interrupted_rescan_stops_before_the_diff(env: Env, interrupt: BaseEx
 def test_another_exit_from_the_rescan_is_not_an_interrupt(env: Env) -> None:
     env.run("old")
     _stale_hunt(env, "new")
-    env.rescan_does = SystemExit(3)
+    env.rescan_does = SystemExit(2)
     res = env.diff()
-    assert res.exit_code == 3
+    assert res.exit_code == 2
     assert "Rescan interrupted" not in res.output and env.diffs == []
+
+
+def test_an_interrupted_full_diff_does_not_exit_zero(env: Env) -> None:
+    """The completed binaries are kept, but a run that did not finish is not a success.
+
+    MUTATION: drop the cancelled exit after the full-diff roll-up -> RED (exit 0)."""
+    env.run("old")
+    env.run("new")
+    env.full_cancelled = True
+    res = env.diff()
+    assert "Interrupted" in res.output
+    assert res.exit_code == 130, res.output
+
+
+def test_a_partial_rescan_does_not_stop_the_diff(env: Env) -> None:
+    """Some runs failing to refresh is not an interrupt: the diff goes on, and the recheck after
+    the rescan names whatever is still stale.
+
+    MUTATION: treat RESCAN_PARTIAL_EXIT like any other exit (re-raise it) -> RED."""
+    env.run("old")
+    _stale_hunt(env, "new")
+    env.rescan_does = SystemExit(hunt_cli.RESCAN_PARTIAL_EXIT)
+    res = env.diff()
+    assert "Rescan interrupted" not in res.output
+    assert "after the rescan" in res.output, res.output  # the recheck ran and named what is stale
+    assert res.exit_code != hunt_cli.RESCAN_PARTIAL_EXIT, res.output

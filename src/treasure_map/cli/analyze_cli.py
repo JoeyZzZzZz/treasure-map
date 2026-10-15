@@ -7,12 +7,13 @@ Thin Click wrapper only — all logic lives in lib/analyze/pipeline.py.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from pathlib import Path
 from typing import Any
 
 import click
+
+from treasure_map.cli.interrupts import interrupt_exit_code
 
 logger = logging.getLogger(__name__)
 
@@ -193,21 +194,21 @@ def analyze(
 
     try:
         with Workspace(ws_path) as ws:
-            result = asyncio.run(
-                run_analyze(
-                    fs_root,
-                    ws,
-                    cfg,
-                    _progress,
-                    skip_non_binary=skip_non_binary,
-                    skip_ingesters=frozenset(skip_ingesters),
-                    reanalyze=reanalyze,
-                    force_retry=force_retry,
-                )
+            # A plain call, not asyncio.run: the analysis has no await points, and asyncio's own
+            # SIGINT handling turned the first Ctrl-C into a cancel that waited for the whole run.
+            result = run_analyze(
+                fs_root,
+                ws,
+                cfg,
+                _progress,
+                skip_non_binary=skip_non_binary,
+                skip_ingesters=frozenset(skip_ingesters),
+                reanalyze=reanalyze,
+                force_retry=force_retry,
             )
     except KeyboardInterrupt:
-        click.echo("\nAborted by user — all Ghidra processes terminated.", err=True)
-        raise SystemExit(130) from None
+        click.echo("\nAborted — all Ghidra processes terminated.", err=True)
+        raise SystemExit(interrupt_exit_code()) from None
     except GhidraNotFoundError as exc:
         raise click.ClickException(str(exc)) from exc
     except TreasureMapError as exc:

@@ -18,8 +18,8 @@ def update(check: bool, assume_yes: bool) -> None:
     """Install the newest tmap, remove the old tmap, then run the new version's ``tmap init``.
 
     Works on a tmap installed with ``uv tool install tmap-agents`` (the one-line installer does
-    that). The old ``treasure-map`` tool is removed with it. Another kind of install is told how
-    to update itself and left as it is."""
+    that). Another kind of install is told how to update itself and left as it is. Exits 1 when
+    the newest version cannot be learned (``--check`` included)."""
     from treasure_map.lib.setup import update as up
     from treasure_map.lib.setup.clients import tmap_executable
     from treasure_map.lib.setup.discover import current_host
@@ -48,13 +48,16 @@ def update(check: bool, assume_yes: bool) -> None:
     click.echo("Update plan:")
     for line in up.plan_lines(plan):
         click.echo(f"  {line}")
+    if latest is None:
+        # The newest version could not be learned: no answer to give, --check included.
+        if not plan.from_uv_tool:
+            click.echo(up.manual_update_hint())
+        raise SystemExit(1)
     if not plan.from_uv_tool:
         click.echo(up.manual_update_hint())
         return
     if check:
         return
-    if latest is None:
-        raise SystemExit(1)
     if not plan.has_work:
         click.echo("tmap is up to date.")
         return

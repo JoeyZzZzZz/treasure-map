@@ -77,8 +77,9 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from collections import OrderedDict
 from dataclasses import asdict, dataclass, field, replace
-from typing import Any
+from typing import Any, Generic, TypeVar
 
 from treasure_map.lib.diff.layer0 import norm_hex
 from treasure_map.lib.query import diff_review, sameness
@@ -568,7 +569,50 @@ def _instance_index(atlas: sqlite3.Connection, run_id: str, refs: set[str]) -> d
 # scan, so the length-constant signal does not re-scan the whole run for every diff of a pair. The
 # run's stamps are in the key so a re-extraction or a re-hunt (same run id, new evidence) is not
 # served a stale fact.
-_SIZE_FACT_CACHE: dict[tuple[str, ...], dict[str, tuple[str, str | None]]] = {}
+_K = TypeVar("_K")
+_V = TypeVar("_V")
+
+
+class _BoundedCache(Generic[_K, _V]):
+    """A process-wide cache with a ceiling: least recently used entries go first. The MCP server
+    is long-lived, and every diff it shows and every re-hunted run would otherwise leave an entry
+    behind for good."""
+
+    def __init__(self, maxsize: int) -> None:
+        self._maxsize = maxsize
+        self._data: OrderedDict[_K, _V] = OrderedDict()
+
+    def get(self, key: _K) -> _V | None:
+        if key not in self._data:
+            return None
+        self._data.move_to_end(key)
+        return self._data[key]
+
+    def __setitem__(self, key: _K, value: _V) -> None:
+        self._data[key] = value
+        self._data.move_to_end(key)
+        while len(self._data) > self._maxsize:
+            self._data.popitem(last=False)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def clear(self) -> None:
+        self._data.clear()
+
+
+def _atlas_identity(atlas: sqlite3.Connection) -> str:
+    """The atlas file this connection reads, so two atlases served by one process never share a
+    cache entry that happens to carry the same run ids or diff id."""
+    for row in atlas.execute("PRAGMA database_list"):
+        if row[1] == "main":
+            return str(row[2] or "")
+    return ""
+
+
+_SIZE_FACT_CACHE: _BoundedCache[tuple[str, ...], dict[str, tuple[str, str | None]]] = _BoundedCache(
+    16
+)
 
 
 def _size_facts(atlas: sqlite3.Connection, run_id: str) -> dict[str, tuple[str, str | None]]:
@@ -576,7 +620,7 @@ def _size_facts(atlas: sqlite3.Connection, run_id: str) -> dict[str, tuple[str, 
     row = atlas.execute(
         "SELECT build_hash, hunt_commit, updated_at FROM run WHERE run_id = ?", (run_id,)
     ).fetchone()
-    key = (run_id, *(str(v or "") for v in (row or (None, None, None))))
+    key = (_atlas_identity(atlas), run_id, *(str(v or "") for v in (row or (None, None, None))))
     hit = _SIZE_FACT_CACHE.get(key)
     if hit is not None:
         return hit
@@ -1617,9 +1661,9 @@ class _Readings:
 # build_hash_b): each pair's small reading — never the bodies or the skeleton index. The callee-set
 # state a reading folds with comes from the build and is re-read each call. The pseudocode_delta
 # cache adds the pair's two addresses to that key.
-_PSEUDO_READING_CACHE: dict[tuple[str, ...], _PairReads] = {}
-_UNDETERMINED_READING_CACHE: dict[tuple[str, ...], _PairReads] = {}
-_DELTA_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
+_PSEUDO_READING_CACHE: _BoundedCache[tuple[str, ...], _PairReads] = _BoundedCache(32)
+_UNDETERMINED_READING_CACHE: _BoundedCache[tuple[str, ...], _PairReads] = _BoundedCache(32)
+_DELTA_CACHE: _BoundedCache[tuple[Any, ...], dict[str, Any]] = _BoundedCache(4096)
 _ELSEWHERE_SAMPLE = 3  # addresses shown of a body found elsewhere
 
 
@@ -1714,7 +1758,20 @@ def _pseudo_readings(atlas: sqlite3.Connection, built: BuiltDiff) -> _Readings:
     d = built.diff
     pa, ha = _run_source(atlas, d.run_a)
     pb, hb = _run_source(atlas, d.run_b)
-    key = (d.diff_id, d.sha_a or "", d.sha_b or "", ha or "", hb or "")
+    # The atlas and the diff code that wrote the pairs are in the key too: one process can serve
+    # two atlases with the same diff id, and a diff re-run by newer code can pair functions anew.
+    dcv = atlas.execute(
+        "SELECT diff_code_version FROM diff_meta WHERE diff_id = ?", (d.diff_id,)
+    ).fetchone()
+    key = (
+        _atlas_identity(atlas),
+        d.diff_id,
+        str(dcv[0] or "") if dcv else "",
+        d.sha_a or "",
+        d.sha_b or "",
+        ha or "",
+        hb or "",
+    )
     aligned = _PSEUDO_READING_CACHE.get(key)
     undetermined = _UNDETERMINED_READING_CACHE.get(key)
     if aligned is None or undetermined is None:
@@ -2150,6 +2207,7 @@ def get_diff_patch_view(
         and (body is None or _body_of(e, readings) == body)
     ]
     review = ViewReview(atlas, built)
+    unknown_filter = _unknown_filter_value(entries, subclass, blind_spot)
     envelope: dict[str, Any] = {
         "diff_id": diff_id,
         "lens": {
@@ -2162,6 +2220,9 @@ def get_diff_patch_view(
             "sort_by": sort_by or "default",
             "filters": filters,
             "switchable": "view / sort_by / bucket / subclass / tier / blind_spot / body",
+            # A value no entry of this diff carries is named, with the ones that do exist — an
+            # empty page alone reads the same whether the value was misspelled or absent.
+            **({"filter_note": unknown_filter} if unknown_filter else {}),
         },
         "subject_unit": {
             "sink_patch": "function_pair",
@@ -2427,6 +2488,34 @@ def _matches(
     if tier is not None and str(tier) != str(e.tier):
         return False
     return blind_spot is None or blind_spot in e.blind_spots
+
+
+def _unknown_filter_value(
+    entries: list[_Entry], subclass: str | None, blind_spot: str | None
+) -> str | None:
+    """A note when a subclass / blind_spot filter names a value no entry of this diff carries.
+    These vocabularies are open (a subclass can carry a sink or reason name), so an absent value
+    is not refused — it may be right and simply not occur here — but it is said, with the values
+    that do occur."""
+    notes = []
+    if subclass is not None:
+        present = sorted(
+            {e.subclass for e in entries if e.subclass}
+            | {v["subclass"] for e in entries for v in e.row_views if v["subclass"]}
+        )
+        if subclass not in present:
+            notes.append(
+                f"subclass {subclass!r} occurs in no entry of this diff (present: "
+                f"{', '.join(present) or 'none'})"
+            )
+    if blind_spot is not None:
+        present = sorted({b for e in entries for b in e.blind_spots})
+        if blind_spot not in present:
+            notes.append(
+                f"blind_spot {blind_spot!r} occurs in no entry of this diff (present: "
+                f"{', '.join(present) or 'none'})"
+            )
+    return "; ".join(notes) or None
 
 
 def _count(keys: Any) -> dict[str, int]:

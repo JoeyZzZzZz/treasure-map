@@ -152,6 +152,20 @@ def test_check_changes_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     assert all(c[1:3] in (["tool", "dir"], ["tool", "list"]) for c in uv.calls)
 
 
+def test_check_without_an_answer_exits_non_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--check`` that could not learn the newest version has no answer to give.
+
+    MUTATION: return before the unreachable-PyPI exit when --check is set -> RED (exit 0)."""
+    tools = tmp_path / "tools"
+    (tools / "tmap-agents").mkdir(parents=True)
+    uv = _Uv(tools, _LISTING)
+    out, code, execs = _cli(monkeypatch, tmp_path, uv, ["--check"], None)
+    assert "could not reach PyPI" in out
+    assert code == 1 and execs == []
+
+
 def test_a_failed_install_puts_the_current_version_back(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

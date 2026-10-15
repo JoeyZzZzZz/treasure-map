@@ -73,7 +73,7 @@ class AnalyzeResult:
     timeout_skipped: list[dict[str, Any]] = field(default_factory=list)
 
 
-async def run_analyze(
+def run_analyze(
     fs_root: Path,
     workspace: Workspace,
     config: Config,

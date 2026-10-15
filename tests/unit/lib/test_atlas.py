@@ -1125,3 +1125,55 @@ def test_fresh_atlas_has_the_callsite_fact_columns_and_reopens_unchanged(tmp_pat
         conn = open_atlas(db)
         assert {t: _table_cols(conn, t) for t in shape} == shape
         conn.close()
+
+
+def test_opening_an_up_to_date_atlas_never_waits_on_a_writer(tmp_path: Path) -> None:
+    """A hunt holds a write transaction for minutes; every read tool opens the atlas meanwhile.
+    Opening must not need the write lock when there is nothing to migrate.
+
+    MUTATION: make either overlay backfill UPDATE in _migrate unconditional -> RED (the open blocks
+    behind the writer and the thread is still waiting when the join times out)."""
+    import threading
+
+    db = tmp_path / "atlas.db"
+    open_atlas(db).close()
+    writer = sqlite3.connect(db)
+    writer.execute("BEGIN IMMEDIATE")
+    writer.execute("INSERT INTO run (run_id) VALUES ('busy')")
+    done: list[int] = []
+
+    def _read() -> None:
+        conn = open_atlas(db)
+        try:
+            done.append(int(conn.execute("SELECT COUNT(*) FROM run").fetchone()[0]))
+        finally:
+            conn.close()
+
+    reader = threading.Thread(target=_read, daemon=True)
+    reader.start()
+    reader.join(timeout=3)
+    finished = not reader.is_alive()
+    writer.rollback()  # release the reader either way, so a red run does not hang
+    reader.join(timeout=40)
+    writer.close()
+    assert finished, "open_atlas waited on another connection's write transaction"
+    assert done == [0]  # it read the committed state, not the writer's pending row
+
+
+def test_a_lookup_by_evidence_ref_uses_an_index(tmp_path: Path) -> None:
+    """Coverage re-reads each annotation's basis by ref on every listing; a scan per ref made the
+    listing slower with every annotation.
+
+    MUTATION: drop idx_instance_evref from the schema -> RED (the plan is a full SCAN)."""
+    conn = open_atlas(tmp_path / "atlas.db")
+    try:
+        plan = " ".join(
+            str(r[3])
+            for r in conn.execute(
+                "EXPLAIN QUERY PLAN SELECT pattern_id FROM instance WHERE evidence_ref = ?",
+                ("r#x",),
+            )
+        )
+    finally:
+        conn.close()
+    assert "USING INDEX" in plan or "USING COVERING INDEX" in plan, plan

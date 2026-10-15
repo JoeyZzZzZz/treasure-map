@@ -68,9 +68,11 @@ from treasure_map.lib.query import get_sink_provenance as _get_sink_provenance
 from treasure_map.lib.query import get_string_keyed_edges as _get_string_keyed_edges
 from treasure_map.lib.query import launched_by as _launched_by
 from treasure_map.lib.query import ledger as _ledger
+from treasure_map.lib.query import lens_parameter_refusal as _lens_parameter_refusal
 from treasure_map.lib.query import list_runs as _list_runs
 from treasure_map.lib.query import list_verified_exploits as _list_verified_exploits
 from treasure_map.lib.query import load_coverage_index as _load_coverage_index
+from treasure_map.lib.query import malformed_filter_refusal as _malformed_filter_refusal
 from treasure_map.lib.query import only_refusal as _only_refusal
 from treasure_map.lib.query import parse_impact_order as _parse_impact_order
 from treasure_map.lib.query import refs_in_ledger as _refs_in_ledger
@@ -1074,6 +1076,14 @@ def make_tools(
                     "listing is retired (it materialised every run). Cross-run questions go to "
                     "cross_firmware_patterns / pattern_density.",
                 )
+            # A misspelled status / sort_by / view, or a filter fragment that is not dim=value, is
+            # refused rather than answered: each used to come back as an empty map, or as the
+            # default order labelled with the lens that was asked for.
+            bad = _lens_parameter_refusal(
+                status=status, sort_by=sort_by, view=view
+            ) or _malformed_filter_refusal([*(filters or "").split(","), *(only or "").split(",")])
+            if bad is not None:
+                return {"note": _DERIVED_SIGNAL_NOTE, "error": bad}
             # ★ The stale gate stands HERE, before any candidate is read — this is the entry an
             # agent is told to start from, so a scan proven to have been graded by other code has
             # to be refused here or the refusal does not exist.
@@ -2030,6 +2040,9 @@ def make_tools(
         removed (see function_presence). ``source_stale`` / ``source_stale_reason``: whether the
         diff still describes what it was computed from (true / null = unverified / false; reasons
         in list_diffs)."""
+        if side not in ("a", "b"):
+            # Anything but "b" used to be read as "a", answering for the other version unasked.
+            return {"found": False, "error": f"side {side!r} does not exist; use 'a' or 'b'"}
         conn = open_atlas(atlas_path)
         try:
             refusal = _refuse_stale_diff(conn, diff_id)
@@ -2238,6 +2251,13 @@ def make_tools(
         ``binary_path`` and ``sha256`` — re-issue with one of them. That is an answer about
         the firmware, not an error.
         When ``func`` resolves, ITS binary is used and ``binary`` does not re-select."""
+        if direction not in ("callers", "callees", "address_taken"):
+            # An unknown direction used to fall back to callers — another question's answer.
+            return {
+                "found": False,
+                "error": f"direction {direction!r} does not exist; use one of: callers, callees, "
+                "address_taken",
+            }
         d: facts.XrefDirection = (
             "callees"
             if direction == "callees"

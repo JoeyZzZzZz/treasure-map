@@ -75,8 +75,12 @@ def test_runs_empty_atlas_is_friendly(tmp_path: Path) -> None:
     assert "no runs" in r.output and "tmap scan" in r.output
 
 
-def test_triage_prints_run_lineage_header(tmp_path: Path) -> None:
-    # ★ M8c: the current run's lineage rides the top of the triage view (the stale-scan guard).
+def test_triage_prints_run_lineage_header(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # ★ The run's lineage rides the top of the triage view. A PROVEN stale run is refused before
+    # it (see the stale-refusal tests), so this run is made current: the running pass is pv_a.
+    monkeypatch.setattr(
+        "treasure_map.lib.analyze.ghidra_runner.current_pass_version", lambda: "pv_a"
+    )
     atlas = _atlas_with_runs(tmp_path)
     r = CliRunner().invoke(triage, ["--run", "rt_scanned", "--atlas", str(atlas)])
     assert r.exit_code == 0, r.output
@@ -154,13 +158,18 @@ def test_the_human_listing_carries_no_provenance(
     assert "`tmap rescan`" in out.output
 
 
-def test_the_one_run_banner_keeps_its_provenance(tmp_path: Path) -> None:
+def test_the_one_run_banner_keeps_its_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """★ The counterweight. The banner at the top of a candidate view exists so a STALE scan
     cannot be read in silence, and that view has no ``--json`` to fall back on — so the build hash
     stays there even though the listing dropped it. Two surfaces, two questions.
 
     MUTATION: point ``_echo_run_lineage`` at ``_run_lineage_line`` -> RED.
     """
+    monkeypatch.setattr(
+        "treasure_map.lib.analyze.ghidra_runner.current_pass_version", lambda: "pv_a"
+    )
     atlas = _atlas_with_runs(tmp_path)
     out = CliRunner().invoke(triage, ["--run", "rt_scanned", "--atlas", str(atlas)])
     assert out.exit_code == 0, out.output

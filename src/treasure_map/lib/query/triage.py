@@ -2925,6 +2925,46 @@ def reducible(dim: str, candidates: list[TriageCandidate]) -> bool:
 _FILTERABLE_DIMENSION_NAMES = frozenset(_CANONICAL_DIMENSION_NAMES | {"sink_class", "sink"})
 
 
+VALID_STATUSES: tuple[str, ...] = ("to-verify", "reachable", "all")
+
+
+def lens_parameter_refusal(
+    *, status: str | None, sort_by: str | None, view: str | None
+) -> str | None:
+    """The refusal for a status / sort_by / view value that does not exist, else None.
+
+    Each one used to be taken on trust: a misspelled status matched nothing and came back as an
+    empty map, and a misspelled sort_by or view fell back to the default order while the reply
+    still named the misspelled lens as the one in force. Both read as an answer. They are refused
+    instead, with the values that do exist."""
+    if status is not None and status not in VALID_STATUSES:
+        return f"status {status!r} does not exist; use one of: {', '.join(VALID_STATUSES)}"
+    if sort_by is not None and sort_by not in _VALID_SPINES:
+        spines = ", ".join(sorted(_VALID_SPINES))
+        return f"sort_by {sort_by!r} does not exist; use one of: {spines}"
+    if view is not None and canonical_view(view) not in VIEWS:
+        views = ", ".join([*VIEWS, *_VIEW_ALIASES])
+        return f"view {view!r} does not exist; use one of: {views}"
+    return None
+
+
+def malformed_filter_refusal(fragments: list[str]) -> str | None:
+    """The refusal for filter fragments that are not ``dim=value``, else None. A fragment without
+    its ``=`` used to be dropped, so the call ran unfiltered and said nothing."""
+    bad = [f for f in fragments if f.strip() and not _well_formed(f)]
+    if not bad:
+        return None
+    return (
+        f"filter fragment(s) {', '.join(repr(f) for f in bad)} are not dim=value "
+        "(e.g. controllability=free); nothing was filtered"
+    )
+
+
+def _well_formed(fragment: str) -> bool:
+    d, sep, v = fragment.strip().partition("=")
+    return bool(sep and d.strip() and v.strip())
+
+
 def unknown_dimension_refusal(filters: list[tuple[str, str]]) -> str | None:
     """The refusal message when a filter names a dimension that does not exist, else None.
 

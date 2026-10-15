@@ -442,14 +442,35 @@ def test_a_spacing_only_difference_is_layout_and_still_differs() -> None:
     assert sm.pseudocode_delta(a, b, None, None, "1000", "2000")["kind"] == "layout_only"
 
 
-def test_a_delta_over_the_line_cap_is_not_computed(monkeypatch: pytest.MonkeyPatch) -> None:
-    """T23. Above the cap the delta says so and does not run (or raise).
+def test_a_delta_over_the_line_product_cap_is_not_computed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T23. Above the line-pair bound the delta says so and does not run (or raise).
 
-    MUTATION: drop the cap branch -> a delta is computed -> RED."""
-    monkeypatch.setattr(sm, "DELTA_LINE_CAP", 3)
+    MUTATION: drop the line-product branch -> a delta is computed -> RED."""
+    monkeypatch.setattr(sm, "DELTA_LINE_PRODUCT_CAP", 24)  # 5 x 5 lines = 25 pairs
     a = "\n".join(f"x{i} = {i};" for i in range(5))
     b = "\n".join(f"x{i} = {i + 1};" for i in range(5))
     assert sm.pseudocode_delta(a, b, None, None, "1000", "2000") == {
         "kind": "not_computed",
         "reason": "too_large",
     }
+
+
+def test_a_changed_block_over_the_token_product_cap_is_not_computed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cost is the token-pair product of a changed block, so a few long lines rewritten
+    whole are as expensive as many short ones: bounded by the product, not by the line count.
+    A smaller rewrite of the same function is still computed.
+
+    MUTATION: drop the token-product branch -> the large block is computed -> RED."""
+    monkeypatch.setattr(sm, "DELTA_TOKEN_PRODUCT_CAP", 400)
+    wide_a = "x = " + " + ".join(f"a{i}" for i in range(12)) + ";"
+    wide_b = "x = " + " + ".join(f"b{i}" for i in range(12)) + ";"
+    assert sm.pseudocode_delta(wide_a, wide_b, None, None, "1000", "2000") == {
+        "kind": "not_computed",
+        "reason": "too_large",
+    }
+    small = sm.pseudocode_delta("x = a1;", "x = b1;", None, None, "1000", "2000")
+    assert small["kind"] == "substitution_only"

@@ -19,6 +19,7 @@ from treasure_map.cli.hunt_cli import (
     triage,
 )
 from treasure_map.cli.init_cli import init
+from treasure_map.cli.interrupts import install_termination_handlers
 from treasure_map.cli.mcp_cli import fact, mcp_serve
 from treasure_map.cli.uninstall_cli import uninstall
 from treasure_map.cli.update_cli import update
@@ -91,6 +92,9 @@ def main(debug: bool) -> None:
     server (`tmap mcp`). It runs no model of its own: deciding which lead is a real bug is your
     agent's job. Start with `tmap init`.
     """
+    # SIGTERM / SIGHUP take the same cleanup path as Ctrl-C (see cli.interrupts): without this a
+    # kill or a closed terminal ends the process with every Ghidra JVM it started still running.
+    install_termination_handlers()
     level = logging.DEBUG if debug else logging.INFO
     logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s")
     # Third-party request logs (one "HTTP/1.1 200 OK" per call) are noise at INFO; keep them

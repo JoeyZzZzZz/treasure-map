@@ -311,3 +311,22 @@ def test_a_completeness_check_that_ran_says_so(atlas: Path) -> None:
     block = listing["analysis_completeness"]
     assert block["unavailable"] is None
     assert "UNAVAILABLE" not in block["note"]
+
+
+def test_the_cli_triage_refuses_a_stale_run_like_the_mcp_does(
+    atlas: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One question, one answer: a run the MCP refuses must not be served by `tmap triage` — and a
+    script reading --json could not tell it had been.
+
+    MUTATION: drop the _refuse_stale_triage_run call in triage -> RED (exit 0, a listing)."""
+    from click.testing import CliRunner
+
+    from treasure_map.cli import hunt_cli
+
+    monkeypatch.setattr(hunt_cli, "installed_commit", lambda: "c" * 40)
+    stale = CliRunner().invoke(hunt_cli.triage, ["run_stale", "--atlas", str(atlas), "--json"])
+    assert stale.exit_code != 0, stale.output
+    assert "STALE scan" in stale.output and "tmap rescan run_stale" in stale.output
+    ok = CliRunner().invoke(hunt_cli.triage, ["run_ok", "--atlas", str(atlas), "--json"])
+    assert ok.exit_code == 0, ok.output

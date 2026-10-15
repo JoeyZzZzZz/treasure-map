@@ -141,7 +141,7 @@ def test_scan_runs_three_steps_in_order(tmp_path: Path, monkeypatch: pytest.Monk
     calls: list[str] = []
     seen: dict[str, Any] = {}
 
-    async def _fake_analyze(*_: Any, **__: Any) -> SimpleNamespace:
+    def _fake_analyze(*_: Any, **__: Any) -> SimpleNamespace:
         calls.append("analyze")
         return _fake_analyze_result(tmp_path / "analysis.db")
 
@@ -200,7 +200,7 @@ def test_scan_stores_absolute_firmware_path_from_relative_cwd(
     monkeypatch.chdir(tmp_path)
     seen: dict[str, Any] = {}
 
-    async def _fake_analyze(fs_root: Any, *_: Any, **__: Any) -> SimpleNamespace:
+    def _fake_analyze(fs_root: Any, *_: Any, **__: Any) -> SimpleNamespace:
         seen["analyze_fs_root"] = fs_root
         return _fake_analyze_result(tmp_path / "analysis.db")
 
@@ -239,7 +239,7 @@ def test_scan_explicit_run_id_overrides_default(
     _base_patches(monkeypatch)
     seen: dict[str, Any] = {}
 
-    async def _fake_analyze(*_: Any, **__: Any) -> SimpleNamespace:
+    def _fake_analyze(*_: Any, **__: Any) -> SimpleNamespace:
         return _fake_analyze_result(tmp_path / "analysis.db")
 
     def _fake_hunt(
@@ -284,7 +284,7 @@ def test_scan_analyze_failure_short_circuits(
     _base_patches(monkeypatch)
     downstream: list[str] = []
 
-    async def _boom(*_: Any, **__: Any) -> SimpleNamespace:
+    def _boom(*_: Any, **__: Any) -> SimpleNamespace:
         raise GhidraNotFoundError("ghidra missing")
 
     monkeypatch.setattr("treasure_map.lib.analyze.pipeline.run_analyze", _boom)
@@ -313,7 +313,7 @@ def test_scan_triage_segment_matches_triage_command(
     _base_patches(monkeypatch)
     atlas = _seed_atlas(tmp_path, "ws_x")
 
-    async def _fake_analyze(*_: Any, **__: Any) -> SimpleNamespace:
+    def _fake_analyze(*_: Any, **__: Any) -> SimpleNamespace:
         return _fake_analyze_result(tmp_path / "analysis.db")
 
     monkeypatch.setattr("treasure_map.lib.analyze.pipeline.run_analyze", _fake_analyze)
@@ -342,7 +342,7 @@ def test_scan_passes_through_triage_options(
     _base_patches(monkeypatch)
     atlas = _seed_atlas(tmp_path, "ws_x")
 
-    async def _fake_analyze(*_: Any, **__: Any) -> SimpleNamespace:
+    def _fake_analyze(*_: Any, **__: Any) -> SimpleNamespace:
         return _fake_analyze_result(tmp_path / "analysis.db")
 
     monkeypatch.setattr("treasure_map.lib.analyze.pipeline.run_analyze", _fake_analyze)
@@ -361,9 +361,15 @@ def test_scan_passes_through_triage_options(
 
     as_json = runner.invoke(scan, [*base, "--json"])
     assert as_json.exit_code == 0, as_json.output
-    tail = as_json.output.split("ranked candidates for manual review:\n", 1)[1].strip()
-    parsed = json.loads(tail)  # the final segment is valid JSON
-    assert isinstance(parsed, list) and parsed and "evidence_ref" in parsed[0]
+    # stdout is the JSON and nothing else (progress goes to stderr), so it parses whole.
+    # MUTATION: drop the stderr redirect of the two stages -> RED (progress lines precede the JSON).
+    try:
+        parsed = json.loads(as_json.stdout)
+    except json.JSONDecodeError:
+        parsed = None
+    assert isinstance(parsed, list), f"stdout is not one JSON document:\n{as_json.stdout[:300]}"
+    assert parsed and "evidence_ref" in parsed[0]
+    assert "[1/" in as_json.stderr  # the progress is still shown, on stderr
 
 
 # ── 5. empty candidate set is not an error ──────────────────────────────────────────
@@ -374,7 +380,7 @@ def test_scan_empty_candidates_is_ok(tmp_path: Path, monkeypatch: pytest.MonkeyP
     # an atlas with no instances for this run id -> triage returns nothing
     open_atlas(tmp_path / "atlas.db").close()
 
-    async def _fake_analyze(*_: Any, **__: Any) -> SimpleNamespace:
+    def _fake_analyze(*_: Any, **__: Any) -> SimpleNamespace:
         return _fake_analyze_result(tmp_path / "analysis.db")
 
     monkeypatch.setattr("treasure_map.lib.analyze.pipeline.run_analyze", _fake_analyze)
@@ -409,7 +415,7 @@ def test_scan_says_out_loud_when_the_hunt_was_skipped(
     """
     _base_patches(monkeypatch)
 
-    async def _fake_analyze(*_: Any, **__: Any) -> SimpleNamespace:
+    def _fake_analyze(*_: Any, **__: Any) -> SimpleNamespace:
         return _fake_analyze_result(tmp_path / "analysis.db")
 
     stats = _hunt_stats()
@@ -451,7 +457,7 @@ def test_scan_names_the_binaries_it_did_not_re_run_and_forwards_force_retry(
     _base_patches(monkeypatch)
     seen: dict[str, Any] = {}
 
-    async def _fake_analyze(*_: Any, force_retry: bool = False, **__: Any) -> AnalyzeResult:
+    def _fake_analyze(*_: Any, force_retry: bool = False, **__: Any) -> AnalyzeResult:
         seen["force_retry"] = force_retry
         res = _fake_analyze_result(tmp_path / "analysis.db")
         res.timeout_skipped.append(
@@ -483,3 +489,26 @@ def test_scan_names_the_binaries_it_did_not_re_run_and_forwards_force_retry(
     assert "big_daemon" in result.output
     assert "846s budget" in result.output
     assert "--force-retry" in result.output
+
+
+def test_an_interrupted_hunt_exits_like_any_other_interrupt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ctrl-C during the hunt stage exits 130, the same as during the decompile stage.
+
+    MUTATION: drop the KeyboardInterrupt branch around the hunt -> RED (click turns it into 1)."""
+    _base_patches(monkeypatch)
+
+    def _fake_analyze(*_: Any, **__: Any) -> SimpleNamespace:
+        return _fake_analyze_result(tmp_path / "analysis.db")
+
+    def _interrupted_hunt(*_: Any, **__: Any) -> Any:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("treasure_map.lib.analyze.pipeline.run_analyze", _fake_analyze)
+    monkeypatch.setattr("treasure_map.lib.hunt.run_analyzer2", _interrupted_hunt)
+    result = CliRunner().invoke(
+        scan, [str(_mkfs(tmp_path)), "-w", "router_v1", "--atlas", str(tmp_path / "atlas.db")]
+    )
+    assert result.exit_code == 130, result.output
+    assert "rolled back" in result.output

@@ -70,7 +70,7 @@ def _mock_ingest(dirty_shas: set[str]) -> MagicMock:
 # ── fail-fast ─────────────────────────────────────────────────────────────────
 
 
-async def test_fail_fast_before_any_disk_work(tmp_path: Path) -> None:
+def test_fail_fast_before_any_disk_work(tmp_path: Path) -> None:
     """GhidraNotFoundError is raised before scan_filesystem is called."""
     runner = MagicMock()
     runner.get_headless.side_effect = GhidraNotFoundError("Ghidra not found")
@@ -79,7 +79,7 @@ async def test_fail_fast_before_any_disk_work(tmp_path: Path) -> None:
         with patch(f"{MODULE}.scan_filesystem") as mock_scan:
             with Workspace(tmp_path / "ws") as ws:
                 with pytest.raises(GhidraNotFoundError):
-                    await run_analyze(tmp_path / "fs", ws, _cfg())
+                    run_analyze(tmp_path / "fs", ws, _cfg())
 
             mock_scan.assert_not_called()
 
@@ -87,7 +87,7 @@ async def test_fail_fast_before_any_disk_work(tmp_path: Path) -> None:
 # ── dirty set routing ─────────────────────────────────────────────────────────
 
 
-async def test_dirty_set_empty_skips_ghidra(tmp_path: Path) -> None:
+def test_dirty_set_empty_skips_ghidra(tmp_path: Path) -> None:
     """When ingest_elfs reports 0 dirty shas, runner.run_all is not called."""
     rec = _rec()
     runner = _mock_runner()
@@ -96,7 +96,7 @@ async def test_dirty_set_empty_skips_ghidra(tmp_path: Path) -> None:
         with patch(f"{MODULE}.scan_filesystem", return_value=[rec]):
             with patch(f"{MODULE}.ingest_elfs", _mock_ingest(set())):
                 with Workspace(tmp_path / "ws") as ws:
-                    result = await run_analyze(tmp_path / "fs", ws, _cfg())
+                    result = run_analyze(tmp_path / "fs", ws, _cfg())
 
     runner.run_all.assert_not_called()
     assert result.binary_count == 1
@@ -105,7 +105,7 @@ async def test_dirty_set_empty_skips_ghidra(tmp_path: Path) -> None:
     assert result.ghidra_ok == 0
 
 
-async def test_dirty_set_partial_only_runs_dirty(tmp_path: Path) -> None:
+def test_dirty_set_partial_only_runs_dirty(tmp_path: Path) -> None:
     """With 2 records and 1 already done, run_all receives only the dirty one."""
     rec1 = _rec("httpd", "deadbeef")
     rec2 = _rec("dropbear", "cafebabe")
@@ -123,7 +123,7 @@ async def test_dirty_set_partial_only_runs_dirty(tmp_path: Path) -> None:
             # Only rec2 is dirty (rec1 has ghidra_ok=1 in DB)
             with patch(f"{MODULE}.ingest_elfs", _mock_ingest({"cafebabe"})):
                 with Workspace(tmp_path / "ws") as ws:
-                    result = await run_analyze(tmp_path / "fs", ws, _cfg())
+                    result = run_analyze(tmp_path / "fs", ws, _cfg())
 
     assert len(captured) == 1
     assert len(captured[0]) == 1
@@ -136,13 +136,13 @@ async def test_dirty_set_partial_only_runs_dirty(tmp_path: Path) -> None:
 # ── empty filesystem ──────────────────────────────────────────────────────────
 
 
-async def test_empty_fs_ghidra_skipped(tmp_path: Path) -> None:
+def test_empty_fs_ghidra_skipped(tmp_path: Path) -> None:
     """Zero ELFs found → Ghidra step is not called."""
     runner = _mock_runner()
     with patch(f"{MODULE}.GhidraRunner", return_value=runner):
         with patch(f"{MODULE}.scan_filesystem", return_value=[]):
             with Workspace(tmp_path / "ws") as ws:
-                result = await run_analyze(tmp_path / "fs", ws, _cfg())
+                result = run_analyze(tmp_path / "fs", ws, _cfg())
 
     runner.run_all.assert_not_called()
     assert result.binary_count == 0
@@ -153,7 +153,7 @@ async def test_empty_fs_ghidra_skipped(tmp_path: Path) -> None:
 # ── AnalyzeResult fields ──────────────────────────────────────────────────────
 
 
-async def test_analyze_result_fields(tmp_path: Path) -> None:
+def test_analyze_result_fields(tmp_path: Path) -> None:
     """AnalyzeResult carries correct counts and db_path."""
     rec1 = _rec("httpd", "deadbeef")
     rec2 = _rec("dropbear", "cafebabe")
@@ -165,7 +165,7 @@ async def test_analyze_result_fields(tmp_path: Path) -> None:
             # Both records are dirty
             with patch(f"{MODULE}.ingest_elfs", _mock_ingest({"deadbeef", "cafebabe"})):
                 with Workspace(tmp_path / "ws") as ws:
-                    result = await run_analyze(tmp_path / "fs", ws, _cfg())
+                    result = run_analyze(tmp_path / "fs", ws, _cfg())
 
     assert isinstance(result, AnalyzeResult)
     assert result.binary_count == 2
@@ -190,7 +190,7 @@ async def test_analyze_result_fields(tmp_path: Path) -> None:
 # ── progress callback ─────────────────────────────────────────────────────────
 
 
-async def test_progress_callback_passed_to_run_all(tmp_path: Path) -> None:
+def test_progress_callback_passed_to_run_all(tmp_path: Path) -> None:
     """run_analyze forwards progress_callback to GhidraRunner.run_all."""
     rec = _rec()
     runner = _mock_runner([_ok_ghidra(rec)])
@@ -202,7 +202,7 @@ async def test_progress_callback_passed_to_run_all(tmp_path: Path) -> None:
         with patch(f"{MODULE}.scan_filesystem", return_value=[rec]):
             with patch(f"{MODULE}.ingest_elfs", _mock_ingest({rec.sha256})):
                 with Workspace(tmp_path / "ws") as ws:
-                    await run_analyze(tmp_path / "fs", ws, _cfg(), progress_callback=cb)
+                    run_analyze(tmp_path / "fs", ws, _cfg(), progress_callback=cb)
 
     _args, kwargs = runner.run_all.call_args
     assert kwargs.get("progress_callback") is cb or cb in _args
@@ -211,7 +211,7 @@ async def test_progress_callback_passed_to_run_all(tmp_path: Path) -> None:
 # ── what a failed attempt ran under, and what the report says about a skip ────────────
 
 
-async def test_a_failed_attempt_records_its_budget_and_its_extractor(tmp_path: Path) -> None:
+def test_a_failed_attempt_records_its_budget_and_its_extractor(tmp_path: Path) -> None:
     """The failure UPDATE stores the two facts the next scan's decision is made from.
 
     ``pass_version`` is deliberately NOT stamped on failure — it describes the OUTPUT a row
@@ -247,7 +247,7 @@ async def test_a_failed_attempt_records_its_budget_and_its_extractor(tmp_path: P
                     )
                     seed.commit()
                     seed.close()
-                    result = await run_analyze(tmp_path / "fs", ws, _cfg())
+                    result = run_analyze(tmp_path / "fs", ws, _cfg())
 
     conn = open_db(result.db_path)
     row = conn.execute(
@@ -262,7 +262,7 @@ async def test_a_failed_attempt_records_its_budget_and_its_extractor(tmp_path: P
     assert row["pass_version"] is None  # the output column stays empty — there was no output
 
 
-async def test_the_report_names_what_was_skipped_and_follows_the_decision(
+def test_the_report_names_what_was_skipped_and_follows_the_decision(
     tmp_path: Path,
 ) -> None:
     """★ A skip must be visible: the scan gets faster and covers less, and only saying so tells
@@ -298,14 +298,14 @@ async def test_the_report_names_what_was_skipped_and_follows_the_decision(
             with patch(f"{MODULE}.ingest_elfs", _mock_ingest({retried.sha256})):
                 with Workspace(tmp_path / "ws") as ws:
                     _seed(ws.db_path)
-                    result = await run_analyze(tmp_path / "fs", ws, _cfg())
+                    result = run_analyze(tmp_path / "fs", ws, _cfg())
 
     assert [e["binary"] for e in result.timeout_skipped] == ["big_daemon"]
     assert result.timeout_skipped[0]["budget_seconds"] == 846
     assert result.timeout_skipped[0]["size_bytes"] == 14789215
 
 
-async def test_force_retry_reaches_the_dirty_check(tmp_path: Path) -> None:
+def test_force_retry_reaches_the_dirty_check(tmp_path: Path) -> None:
     """The escape hatch is plumbed, not just accepted at the CLI and dropped on the way down."""
     rec = _rec()
     runner = _mock_runner([_ok_ghidra(rec)])
@@ -315,7 +315,7 @@ async def test_force_retry_reaches_the_dirty_check(tmp_path: Path) -> None:
         with patch(f"{MODULE}.scan_filesystem", return_value=[rec]):
             with patch(f"{MODULE}.ingest_elfs", ingest):
                 with Workspace(tmp_path / "ws") as ws:
-                    await run_analyze(tmp_path / "fs", ws, _cfg(), force_retry=True)
+                    run_analyze(tmp_path / "fs", ws, _cfg(), force_retry=True)
 
     assert ingest.call_args.kwargs["force_retry"] is True
     assert ingest.call_args.kwargs["timeout_base"] == _cfg().ghidra.headless_timeout_seconds
@@ -324,7 +324,7 @@ async def test_force_retry_reaches_the_dirty_check(tmp_path: Path) -> None:
 # ── stale-output wiring: only this run's successes are ingested, against this run's pass ───────
 
 
-async def test_only_this_runs_successes_are_ingested_against_its_pass(tmp_path: Path) -> None:
+def test_only_this_runs_successes_are_ingested_against_its_pass(tmp_path: Path) -> None:
     """The ingest receives ONLY the binaries whose Ghidra run succeeded in this scan, plus the
     scan's pass_version to check every JSON against. A failed binary's leftover JSON never reaches
     the ingest, so its rows stay those of its last good extraction.
@@ -341,7 +341,7 @@ async def test_only_this_runs_successes_are_ingested_against_its_pass(tmp_path: 
                 with patch(f"{MODULE}.ingest_ghidra_output", ingest):
                     with Workspace(tmp_path / "ws") as ws:
                         # dirty order follows scan order; make it deterministic
-                        await run_analyze(tmp_path / "fs", ws, _cfg())
+                        run_analyze(tmp_path / "fs", ws, _cfg())
     args, kwargs = ingest.call_args
     passed = args[2] if len(args) > 2 else kwargs["dirty_records"]
     assert [r.sha256 for r in passed] == ["deadbeef"]

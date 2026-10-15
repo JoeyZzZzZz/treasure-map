@@ -63,7 +63,7 @@ def _patch_pipeline(
 ) -> None:
     """Stub load_config / Workspace / run_analyze so analyze runs without Ghidra."""
 
-    async def _fake_run_analyze(*_: Any, **__: Any) -> AnalyzeResult:
+    def _fake_run_analyze(*_: Any, **__: Any) -> AnalyzeResult:
         return _fake_result(db_path, timeout_skipped)
 
     monkeypatch.setattr(
@@ -146,7 +146,7 @@ def test_analyze_hands_the_pipeline_an_absolute_firmware_root(
     _patch_pipeline(monkeypatch, tmp_path / "analysis.db")
     seen: list[Path] = []
 
-    async def _capture(fs_root: Path, *_: Any, **__: Any) -> AnalyzeResult:
+    def _capture(fs_root: Path, *_: Any, **__: Any) -> AnalyzeResult:
         seen.append(fs_root)
         return _fake_result(tmp_path / "analysis.db")
 

@@ -13,16 +13,19 @@ from __future__ import annotations
 import os
 import subprocess
 import time
+from pathlib import Path
 
 import pytest
 
 from treasure_map.lib.analyze import ghidra_runner
+from treasure_map.lib.analyze.elf_inventory import ElfRecord
 from treasure_map.lib.analyze.ghidra_runner import (
     _active_pgids,
     _register_pgid,
     _run_subprocess,
     terminate_all,
 )
+from treasure_map.lib.config.config import GhidraConfig
 
 
 def _group_alive(pgid: int) -> bool:
@@ -109,3 +112,59 @@ def test_run_subprocess_interrupt_kills_group_and_reraises(monkeypatch: pytest.M
     pgid = captured["pgid"]
     assert not _group_alive(pgid)  # group killed on the interrupt path
     assert pgid not in _active_pgids  # finally-unregistered, no leak
+
+
+def test_no_jvm_starts_once_a_teardown_has_begun() -> None:
+    """A worker caught between its checks and Popen at the moment of an interrupt used to start a
+    fresh JVM after terminate_all had run, and the pool's shutdown then waited on it.
+
+    MUTATION: drop the _shutting_down check in _run_subprocess -> RED (the child is started and
+    runs to completion)."""
+    ghidra_runner.begin_shutdown()
+    try:
+        t0 = time.monotonic()
+        rc, text = _run_subprocess(["sleep", "3"], dict(os.environ), 30)
+        elapsed = time.monotonic() - t0
+    finally:
+        ghidra_runner._reset_shutdown()
+    assert rc == ghidra_runner.LAUNCH_FAILED_RC
+    assert "interrupted" in text
+    assert elapsed < 1.0
+    assert not _active_pgids
+
+
+def test_a_new_run_clears_the_previous_runs_teardown(tmp_path: Path) -> None:
+    """The flag is per run: a scan after an interrupted one in the same process must start JVMs.
+
+    MUTATION: drop the _reset_shutdown() call at the top of run_all -> RED."""
+    ghidra_runner.begin_shutdown()
+    runner = ghidra_runner.GhidraRunner(GhidraConfig())
+    seen: list[bool] = []
+
+    def _probe(*_a: object, **_k: object) -> ghidra_runner.GhidraResult:
+        seen.append(ghidra_runner._shutting_down)
+        return ghidra_runner.GhidraResult(
+            binary=Path("x"), output_file=None, success=True, elapsed=0.0
+        )
+
+    runner.get_headless = lambda: Path("/bin/true")  # type: ignore[method-assign]
+    runner.run_ghidra = _probe  # type: ignore[method-assign]
+    import treasure_map.lib.analyze.ghidra_runner as gr
+
+    real_validate = gr.validate_registry
+    gr.validate_registry = lambda _p: None  # type: ignore[assignment]
+    try:
+        rec = ElfRecord(
+            path=tmp_path / "b",
+            name="b",
+            arch="x86:LE:64:default",
+            elf_type="executable",
+            sha256="a" * 64,
+            dt_needed=[],
+            size=1,
+        )
+        runner.run_all([rec], tmp_path / "out")
+    finally:
+        gr.validate_registry = real_validate
+        ghidra_runner._reset_shutdown()
+    assert seen == [False]

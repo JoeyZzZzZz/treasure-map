@@ -47,7 +47,27 @@ logger = logging.getLogger(__name__)
 # the whole tree (analyzeHeadless wrapper + java + children) — terminal SIGINT does
 # NOT reach them because they are in their own session.
 _active_pgids: set[int] = set()
-_active_lock = threading.Lock()
+# Re-entrant: a launch holds it across the shutdown check, Popen AND _register_pgid.
+_active_lock = threading.RLock()
+# Set (under _active_lock) when a run is being torn down. A worker checks it under the SAME lock it
+# registers its process group with, so at an interrupt every worker is either already registered
+# (and terminate_all kills it) or sees the flag and never starts a JVM. Without that, a worker
+# caught between its checks and Popen started a fresh JVM after the teardown, and the pool's
+# shutdown then waited on it.
+_shutting_down = False
+
+
+def begin_shutdown() -> None:
+    """Refuse every Ghidra launch from now on in this process (until the next run_all)."""
+    global _shutting_down
+    with _active_lock:
+        _shutting_down = True
+
+
+def _reset_shutdown() -> None:
+    global _shutting_down
+    with _active_lock:
+        _shutting_down = False
 
 
 def _register_pgid(pgid: int) -> None:
@@ -564,15 +584,18 @@ def _run_subprocess(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[
     proc: subprocess.Popen[bytes] | None = None
     pgid: int | None = None
     try:
-        proc = subprocess.Popen(
-            cmd,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
-        pgid = proc.pid  # session leader: pgid == pid
-        _register_pgid(pgid)
+        with _active_lock:
+            if _shutting_down:
+                return LAUNCH_FAILED_RC, "not started: the run is being interrupted"
+            proc = subprocess.Popen(
+                cmd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            pgid = proc.pid  # session leader: pgid == pid
+            _register_pgid(pgid)
         try:
             _, stderr_bytes = proc.communicate(timeout=timeout)
             snippet = stderr_bytes.decode(errors="replace")[-500:]
@@ -737,56 +760,63 @@ class GhidraRunner:
         headless: Path,
     ) -> GhidraResult:
         t0 = time.monotonic()
-        proj_dir = Path(tempfile.mkdtemp(prefix="tm_ghidra_proj_"))
-        ghidra_home_dir = Path(tempfile.mkdtemp(prefix="tm_ghidra_home_"))
-
-        cmd = _build_cmd(
-            headless, binary, arch, proj_dir, output_dir, self._script_dir, sha8, timeout
-        )
-        expected_out = output_dir / f"{binary.name}_{sha8}_ghidra.json"
-        stub_table = output_dir / f"{binary.name}_{sha8}.stubs.tsv"
-        # A file left at the target path by an earlier run must never be read as this run's output:
-        # clear it (and its in-flight .tmp, and an earlier run's stub table) before starting, so the
-        # only files present afterwards are ones THIS run wrote. The markers checked below catch
-        # every other way a foreign file appears.
-        for leftover in (
-            expected_out,
-            expected_out.with_name(expected_out.name + ".tmp"),
-            stub_table,
-        ):
-            leftover.unlink(missing_ok=True)
-        expected_pass = self.pass_version()
-        # This binary's lazy-binding stubs, resolved from ELF structure and handed to the extractor
-        # so a call it renders as FUN_<stub-addr> is recognised as the import it reaches. None (not
-        # a readable MIPS ELF with dynamic symbols) hands nothing in, and the extractor must then
-        # report "none" — an empty table and no table are different answers.
-        resolution = resolve_stubs(binary)
-        expected_stub = stub_table_marker(None if resolution is None else resolution.names)
-        if resolution is not None:
-            output_dir.mkdir(parents=True, exist_ok=True)
-            stub_table.write_text(serialize_stub_table(resolution.names), encoding="utf-8")
-
-        heap_mb, xms_mb = adaptive_heap_mb(binary.stat().st_size)
-        env: dict[str, str] = {
-            **dict(os.environ),
-            "OUTPUT_DIR": str(output_dir),
-            "SHA8": sha8,
-            # echoed back into the JSON by the extractor, so the output proves which pass wrote it
-            "PASS_VERSION": expected_pass,
-            "JAVA_TOOL_OPTIONS": f"-Xmx{heap_mb}m -Xms{xms_mb}m -Duser.home={ghidra_home_dir}",
-        }
-        # Never inherit a table from the parent environment: this binary's table, or none.
-        env.pop("TMAP_STUB_NAMES", None)
-        if resolution is not None:
-            env["TMAP_STUB_NAMES"] = str(stub_table)
-
-        rc = 0
-        stderr_raw = ""
+        proj_dir: Path | None = None
+        ghidra_home_dir: Path | None = None
+        # ONE try from the first mkdtemp to the end of the JVM: an interrupt anywhere in between
+        # (stub resolution, the table write) must not leave the two directories behind.
         try:
+            proj_dir = Path(tempfile.mkdtemp(prefix="tm_ghidra_proj_"))
+            ghidra_home_dir = Path(tempfile.mkdtemp(prefix="tm_ghidra_home_"))
+
+            cmd = _build_cmd(
+                headless, binary, arch, proj_dir, output_dir, self._script_dir, sha8, timeout
+            )
+            expected_out = output_dir / f"{binary.name}_{sha8}_ghidra.json"
+            stub_table = output_dir / f"{binary.name}_{sha8}.stubs.tsv"
+            # A file left at the target path by an earlier run must never be read as this run's
+            # output: clear it (and its in-flight .tmp, and an earlier run's stub table) before
+            # starting, so the only files present afterwards are ones THIS run wrote. The markers
+            # checked below catch every other way a foreign file appears.
+            for leftover in (
+                expected_out,
+                expected_out.with_name(expected_out.name + ".tmp"),
+                stub_table,
+            ):
+                leftover.unlink(missing_ok=True)
+            expected_pass = self.pass_version()
+            # This binary's lazy-binding stubs, resolved from ELF structure and handed to the
+            # extractor so a call it renders as FUN_<stub-addr> is recognised as the import it
+            # reaches. None (not a readable MIPS ELF with dynamic symbols) hands nothing in, and the
+            # extractor must then report "none" — an empty table and no table are different
+            # answers.
+            resolution = resolve_stubs(binary)
+            expected_stub = stub_table_marker(None if resolution is None else resolution.names)
+            if resolution is not None:
+                output_dir.mkdir(parents=True, exist_ok=True)
+                stub_table.write_text(serialize_stub_table(resolution.names), encoding="utf-8")
+
+            heap_mb, xms_mb = adaptive_heap_mb(binary.stat().st_size)
+            env: dict[str, str] = {
+                **dict(os.environ),
+                "OUTPUT_DIR": str(output_dir),
+                "SHA8": sha8,
+                # echoed back into the JSON by the extractor, so the output proves which pass
+                # wrote it
+                "PASS_VERSION": expected_pass,
+                "JAVA_TOOL_OPTIONS": (
+                    f"-Xmx{heap_mb}m -Xms{xms_mb}m -Duser.home={ghidra_home_dir}"
+                ),
+            }
+            # Never inherit a table from the parent environment: this binary's table, or none.
+            env.pop("TMAP_STUB_NAMES", None)
+            if resolution is not None:
+                env["TMAP_STUB_NAMES"] = str(stub_table)
+
             rc, stderr_raw = _run_subprocess(cmd, env, timeout + 60)
         finally:
-            shutil.rmtree(proj_dir, ignore_errors=True)
-            shutil.rmtree(ghidra_home_dir, ignore_errors=True)
+            for d in (proj_dir, ghidra_home_dir):
+                if d is not None:
+                    shutil.rmtree(d, ignore_errors=True)
 
         elapsed = time.monotonic() - t0
         log_path = output_dir / f"{binary.name}_{sha8}.log"
@@ -863,6 +893,7 @@ class GhidraRunner:
         # here, once and loudly, instead of failing every binary one JVM at a time.
         validate_registry(self._script_dir / "extractor_names.tsv")
         output_dir.mkdir(parents=True, exist_ok=True)
+        _reset_shutdown()  # a previous run's interrupt must not refuse this run's launches
         base = self._config.headless_timeout_seconds
         n = len(records)
         by_idx: dict[int, GhidraResult] = {}
@@ -911,9 +942,13 @@ class GhidraRunner:
                     "interrupted — terminating %d live Ghidra process group(s)",
                     len(_active_pgids),
                 )
-                terminate_all()
+                # Refuse new launches FIRST, then drop the queue, then kill what is running: a
+                # worker between its checks and Popen now sees the flag instead of starting a JVM
+                # after the teardown.
+                begin_shutdown()
                 for f in future_to_idx:
                     f.cancel()
+                terminate_all()
                 raise
         finally:
             # On the interrupt path the JVMs are already dead, so each worker's
@@ -963,6 +998,7 @@ class GhidraRunner:
                 logger.warning(
                     "interrupted during serial retry — terminating live process group(s)"
                 )
+                begin_shutdown()
                 terminate_all()
                 raise
 

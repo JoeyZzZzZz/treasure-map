@@ -469,7 +469,15 @@ def hidden_region(
 
 # ── the lexical shape of a text difference (pseudocode_delta) ────────────────────────────────
 
-DELTA_LINE_CAP = 20000  # lines per side above which the delta is not computed
+# The matcher's cost grows with the PRODUCT of the two sides, not with either side alone: a line
+# cap of 20,000 per side let one wholly rewritten dispatcher take minutes. Measured on a real
+# 8,000-line function: rewritten whole, a changed block of 58M token pairs took 2.8s, 249M took
+# 8.2s, 977M took 32s; with every 7th line changed, the LINE match alone (64M line pairs, the
+# repeated lines of real code being what makes it slow) took 7.9s. So both matchers are bounded
+# by the product, and a function whose delta would exceed either bound is not_computed
+# (too_large) as a whole — a half-analysed delta would misstate its own kind.
+DELTA_LINE_PRODUCT_CAP = 25_000_000  # line pairs for the line-level match (about 3s at worst)
+DELTA_TOKEN_PRODUCT_CAP = 20_000_000  # token pairs inside any one changed block (about 1s)
 _DELTA_FIRST = 5  # substitution pairs shown per token kind
 
 _TOK = re.compile(
@@ -540,7 +548,7 @@ def pseudocode_delta(
     the same non-punctuation kind is a SUBSTITUTION (recorded by kind, with the first few pairs);
     anything else is a structural span. ``kind``: ``structural`` (any structural span),
     ``substitution_only``, or ``layout_only`` (the token streams agree — only spacing or line
-    breaks differ); ``not_computed`` (``too_large``) above DELTA_LINE_CAP lines. ``calls`` lists
+    breaks differ); ``not_computed`` (``too_large``) above the product caps. ``calls`` lists
     the callees whose call counts differ. A shape, never a verdict: a number-only substitution is
     exactly what a size fix looks like, and nothing here ranks or files it. The try/catch
     annotation's addresses are blanked under the reading's own rule (``addr_a`` / ``addr_b`` are
@@ -549,8 +557,9 @@ def pseudocode_delta(
     blank_try = try_shift_consistent(a, b, _hex_int(addr_a), _hex_int(addr_b))
     la = [ln.strip() for ln in _delta_text(a, ranges_a, blank_try).splitlines() if ln.strip()]
     lb = [ln.strip() for ln in _delta_text(b, ranges_b, blank_try).splitlines() if ln.strip()]
-    if len(la) > DELTA_LINE_CAP or len(lb) > DELTA_LINE_CAP:
-        return {"kind": "not_computed", "reason": "too_large"}
+    too_large = {"kind": "not_computed", "reason": "too_large"}
+    if len(la) * len(lb) > DELTA_LINE_PRODUCT_CAP:
+        return too_large
     spans = 0
     subs: dict[str, dict[str, Any]] = {}
     lines = SequenceMatcher(None, la, lb, autojunk=False)
@@ -558,6 +567,8 @@ def pseudocode_delta(
         if op == "equal":
             continue
         ta, tb = _tokens("\n".join(la[i1:i2])), _tokens("\n".join(lb[j1:j2]))
+        if len(ta) * len(tb) > DELTA_TOKEN_PRODUCT_CAP:
+            return too_large
         toks = SequenceMatcher(None, [t[1] for t in ta], [t[1] for t in tb], autojunk=False)
         for top, k1, k2, m1, m2 in toks.get_opcodes():
             if top == "equal":
