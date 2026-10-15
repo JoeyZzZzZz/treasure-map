@@ -27,6 +27,7 @@ from typing import Any, Literal
 
 from treasure_map.lib.binary_id import resolve_binary
 from treasure_map.lib.hunt.refs import _norm_addr
+from treasure_map.lib.ro_db import ro_connect
 from treasure_map.version import UNKNOWN_VERSION
 
 XrefDirection = Literal["callers", "callees", "address_taken"]
@@ -71,7 +72,7 @@ def _function_column(conn: sqlite3.Connection, name: str) -> str:
 
 def open_analysis_ro(db_path: Path | str) -> sqlite3.Connection:
     """Open an analysis database strictly read-only, with a Row factory."""
-    conn = sqlite3.connect(f"file:{Path(db_path)}?mode=ro", uri=True)
+    conn = ro_connect(Path(db_path))
     conn.row_factory = sqlite3.Row
     return conn
 

@@ -82,6 +82,7 @@ from treasure_map.lib.errors import ConfigError, GhidraNotFoundError, TreasureMa
 from treasure_map.lib.machine import clamp_parallelism_to_memory
 from treasure_map.lib.query.runs import run_staleness
 from treasure_map.lib.query.sink_overlay import persist_sink_overlay, read_sink_overlay_baseline
+from treasure_map.lib.ro_db import ro_connect
 from treasure_map.version import installed_commit as _installed_commit
 
 logger = logging.getLogger(__name__)
@@ -716,6 +717,33 @@ def _tail(raw: bytes | None, n: int) -> str:
     return raw.decode("utf-8", "replace")[-n:] if raw else ""
 
 
+def _run_killable(
+    cmd: list[str], env: dict[str, str], timeout: int
+) -> subprocess.CompletedProcess[bytes]:
+    """Run ``cmd`` in its OWN process group and, on timeout, kill the whole group.
+
+    analyzeHeadless is a shell wrapper that starts the JVM WITHOUT exec, so ``subprocess.run``'s
+    timeout kills only the wrapper and leaves a 4GB-heap JVM orphaned — the same leak the scan
+    runner already guards against. A new session makes the child a group leader; SIGKILL to the
+    group (-pid) takes the JVM with it. Returns a CompletedProcess so the callers that read
+    stdout / stderr / returncode are unchanged; re-raises TimeoutExpired after the kill."""
+    import signal
+
+    proc = subprocess.Popen(  # noqa: S603 -- fixed argv, no shell
+        cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True
+    )
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)  # pid == pgid (session leader)
+        except OSError:
+            pass
+        proc.communicate()
+        raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
 def _diag(
     cmd: list[str], proc: subprocess.CompletedProcess[bytes], log_path: Path | None = None
 ) -> str:
@@ -772,9 +800,7 @@ def _run_binexport(so_path: Path, config: Config, out_dir: Path, side: str, time
         ]
         env = {**os.environ, "JAVA_TOOL_OPTIONS": f"-Xmx{_DIFF_BINEXPORT_HEAP_MB}m"}
         try:
-            proc = subprocess.run(  # noqa: S603 -- fixed argv, no shell
-                cmd, env=env, capture_output=True, timeout=timeout_s + 120
-            )
+            proc = _run_killable(cmd, env, timeout_s + 120)
         except subprocess.TimeoutExpired as exc:
             raise DiffToolchainError(
                 f"BinExport timed out for side {side} ({so_path.name})", kind=FAIL_TIMEOUT
@@ -1052,6 +1078,11 @@ def _persist_success(
             targets_b=targets_b,
             commit=False,
         )
+        if keep_baseline:
+            # Mark the baseline dropped in the SAME transaction as the new rows;
+            # below clears it to 0 on success. An interrupt between that commit and this one then
+            # leaves an honest baseline_dropped=1 (re-stored next diff), not a silent 0.
+            atlas.execute("UPDATE diff_meta SET baseline_dropped = 1 WHERE diff_id = ?", (diff_id,))
         run_layer2_delta(atlas, diff_id=diff_id, run_a_id=run_a_id, run_b_id=run_b_id, commit=True)
     except TreasureMapError as exc:
         _record_diff_failure(
@@ -1197,7 +1228,7 @@ def _read_binaries(analysis_db_path: str) -> dict[str, tuple[str, ...]]:
 
     Final shape is per relative firmware path; that is blocked on the recorded paths being
     comparable across runs (see _locate_binary_so), which has its own ticket."""
-    con = sqlite3.connect(f"file:{analysis_db_path}?mode=ro", uri=True)
+    con = ro_connect(analysis_db_path)
     try:
         rows = con.execute(
             "SELECT name, sha256 FROM binaries WHERE name IS NOT NULL AND sha256 IS NOT NULL"
@@ -1618,7 +1649,10 @@ def run_full_diff(
     for binary in to_run:
         try:
             pf = preflight(atlas, run_a_id, run_b_id, binary, config=config, force=force)
-        except TreasureMapError as exc:
+        except (TreasureMapError, sqlite3.Error) as exc:
+            # A sqlite error on ONE binary (a locked row, a corrupt page) is that binary's failure,
+            # not grounds to abandon the whole sweep — the other binaries still diff. It records as
+            # a blind spot like any other failure below.
             if isinstance(exc, (AmbiguousBinarySelectorError, ExtractionUnstampedError)):
                 # Persist it as this binary's blind spot, the same shape a toolchain failure gets.
                 # A refusal that lives only in the console scrolls away; recorded, it shows up in
@@ -1855,7 +1889,7 @@ def _analysis_build_hash(analysis_db_path: str | None) -> str | None:
     if not analysis_db_path or not Path(analysis_db_path).exists():
         return None
     try:
-        conn = sqlite3.connect(f"file:{analysis_db_path}?mode=ro", uri=True)
+        conn = ro_connect(analysis_db_path)
     except sqlite3.Error:
         return None
     try:

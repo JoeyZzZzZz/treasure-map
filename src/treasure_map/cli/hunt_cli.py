@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 import click
 
 from treasure_map.lib.errors import ConfigError, TreasureMapError
+from treasure_map.lib.ro_db import ro_connect
 from treasure_map.version import UNKNOWN_VERSION, installed_commit
 
 if TYPE_CHECKING:
@@ -65,7 +66,7 @@ def _complete_run_id(ctx: click.Context, param: click.Parameter, incomplete: str
         atlas = Path(override) if override else load_config(None).atlas.db_path
         if not atlas.exists():
             return []
-        conn = sqlite3.connect(f"file:{atlas}?mode=ro", uri=True)
+        conn = ro_connect(atlas)
         conn.row_factory = sqlite3.Row
         try:
             ids = [r.run_id for r in list_runs(conn) if r.run_id]
@@ -2361,7 +2362,7 @@ def _no_stored_facts(db: Path | None) -> str | None:
         # error"), while bytes that are not a database get all the way to the first query ("file is
         # not a database"). Connecting outside meant the whole class raised past this decision and
         # was never classified — it reached the right outcome by escaping rather than by deciding.
-        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        conn = ro_connect(db)
         try:
             row = conn.execute("SELECT COUNT(*) FROM binaries").fetchone()
         finally:

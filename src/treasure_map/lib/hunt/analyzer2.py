@@ -111,6 +111,7 @@ from treasure_map.lib.pattern.scanner import load_stub_names
 from treasure_map.lib.query.nvram import template_has_anchor
 from treasure_map.lib.reachability import grade_candidate
 from treasure_map.lib.reachability.taint import _IDENT_RE, locate_sink_arg
+from treasure_map.lib.ro_db import ro_connect, ro_uri
 from treasure_map.version import UNKNOWN_VERSION, __version__, installed_commit
 
 logger = logging.getLogger(__name__)
@@ -124,7 +125,7 @@ def _db_has_bridge(db_path: Path | str) -> bool:
     GAP (an export the bridge never reached), not a pre-bridge row, so it must degrade to the bare
     class rather than fall back to the legacy ``#index`` — the per-row test that used to decide this
     let such a row emit a shifted ordinal that the ref rekey then trusted."""
-    conn = sqlite3.connect(f"file:{Path(db_path)}?mode=ro", uri=True)
+    conn = ro_connect(Path(db_path))
     try:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(functions)")}
         if "call_tokens" not in cols:
@@ -153,7 +154,7 @@ def _load_extraction_notes(db_path: Path | str) -> dict[int, dict[str, Any]]:
     names none). ``run.build_hash`` cannot serve: it is the distinct pass_version over the binaries,
     so a single failed binary turns it into ``mixed:2``. When no scan pass can be named, only the
     failed binaries are marked."""
-    conn = sqlite3.connect(f"file:{Path(db_path)}?mode=ro", uri=True)
+    conn = ro_connect(Path(db_path))
     try:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(binaries)")}
         if not {"ghidra_ok", "pass_version", "timeout_pass_version", "last_seen_at"} <= cols:
@@ -211,7 +212,7 @@ def _load_caller_ids(db_path: Path | str) -> dict[int, list[int]]:
 
     One-hop only: the direct function-level callers recorded for each function. Used by the
     caller-constant downweight; absent/empty xrefs simply yield no callers (no downweight)."""
-    uri = f"file:{Path(db_path)}?mode=ro"
+    uri = ro_uri(Path(db_path))
     conn = sqlite3.connect(uri, uri=True)
     callers: dict[int, list[int]] = {}
     try:
@@ -235,7 +236,7 @@ def _load_entry_index(
 
     ``exec_sites`` adds the cross-binary launch sites computed earlier in this hunt — a different
     source from the two rootfs tables, so it arrives as an argument instead of a query."""
-    uri = f"file:{Path(db_path)}?mode=ro"
+    uri = ro_uri(Path(db_path))
     conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row
     try:
@@ -540,7 +541,7 @@ def _load_sink_provenance(db_path: Path | str) -> dict[int, list[dict[str, Any]]
     instance's flow_evidence (the persistent home). A missing column (older analysis.db) or an
     unparsable cell yields no entry — provenance is additive; its absence never blocks a candidate.
     """
-    uri = f"file:{Path(db_path)}?mode=ro"
+    uri = ro_uri(Path(db_path))
     conn = sqlite3.connect(uri, uri=True)
     out: dict[int, list[dict[str, Any]]] = {}
     try:
@@ -569,7 +570,7 @@ def _load_nvram_ops(db_path: Path | str) -> dict[int, list[dict[str, Any]]]:
     they are loaded so the hunt flattens them into the atlas nvram_key_flow table. A missing column
     (older analysis.db) or an unparsable cell yields no entry — the key graph is additive.
     """
-    uri = f"file:{Path(db_path)}?mode=ro"
+    uri = ro_uri(Path(db_path))
     conn = sqlite3.connect(uri, uri=True)
     out: dict[int, list[dict[str, Any]]] = {}
     try:
@@ -656,7 +657,7 @@ def _load_string_keyed_edges(db_path: Path | str) -> dict[int, dict[str, Any]]:
     here it is loaded so the hunt flattens it into the atlas string_keyed_edge table. A missing
     column (older analysis.db) or an unparsable cell yields no entry — the edge layer is additive.
     """
-    uri = f"file:{Path(db_path)}?mode=ro"
+    uri = ro_uri(Path(db_path))
     conn = sqlite3.connect(uri, uri=True)
     out: dict[int, dict[str, Any]] = {}
     try:
@@ -772,7 +773,7 @@ def _flatten_string_tables(db_path: Path | str, source_run_id: str) -> list[Stri
     cross-version delta in an unhandled table form reads as undetermined, not a real add/remove. A
     missing table (older analysis.db) yields no rows — the capability is still registered anyway.
     """
-    uri = f"file:{Path(db_path)}?mode=ro"
+    uri = ro_uri(Path(db_path))
     conn = sqlite3.connect(uri, uri=True)
     try:
         rows = conn.execute(
@@ -820,7 +821,7 @@ def _load_exec_inventory(db_path: Path | str) -> ExecEdgeInventory:
     same set a reader can open — so "resolved" always means "you can go and read this", and the
     script map carries paths for the same reason: a resolved script edge names a file the reader
     can open, not a bare word."""
-    uri = f"file:{Path(db_path)}?mode=ro"
+    uri = ro_uri(Path(db_path))
     conn = sqlite3.connect(uri, uri=True)
     try:
         try:
@@ -934,7 +935,7 @@ def _flatten_detector_status(
     reads ATLAS) can attach a detector's honesty status to an EMPTY string_keyed_edge result. A
     missing table (older analysis.db, not re-scanned) yields no rows -- the query then reports 'no
     status recorded', never a confident negative."""
-    uri = f"file:{Path(db_path)}?mode=ro"
+    uri = ro_uri(Path(db_path))
     conn = sqlite3.connect(uri, uri=True)
     try:
         rows = conn.execute(
@@ -1039,7 +1040,7 @@ def _load_wrapper_data(
     """Load the A2 transport columns: func_id -> nvram_wrapper {op,api}, and func_id -> the calls
     that pass a constant literal to a local function. A missing column (older analysis.db) or an
     unparsable cell yields no entry — wrapper-indirect recovery is additive."""
-    uri = f"file:{Path(db_path)}?mode=ro"
+    uri = ro_uri(Path(db_path))
     conn = sqlite3.connect(uri, uri=True)
     wrappers: dict[int, dict[str, Any]] = {}
     call_args: dict[int, list[dict[str, Any]]] = {}
@@ -1140,7 +1141,7 @@ def _load_nvram_defaults(db_path: Path | str, source_run_id: str) -> list[NvramD
     (recorded, not dropped, so a located-but-incomplete table stays honest). A missing table (older
     analysis.db) yields no rows — web_settable then reads as 'uncertain', never 'not web-settable'.
     """
-    uri = f"file:{Path(db_path)}?mode=ro"
+    uri = ro_uri(Path(db_path))
     conn = sqlite3.connect(uri, uri=True)
     try:
         rows = conn.execute(
@@ -1172,7 +1173,7 @@ def _load_web_form_fields(db_path: Path | str, source_run_id: str) -> list[WebFo
     Each row is a USER-EDITABLE field name + the asset it came from. A missing table (an analysis.db
     built before M1, or one with no web assets) yields no rows — web_settable then reads
     'uncertain', NEVER 'not settable' (the false-negative red line)."""
-    uri = f"file:{Path(db_path)}?mode=ro"
+    uri = ro_uri(Path(db_path))
     conn = sqlite3.connect(uri, uri=True)
     try:
         rows = conn.execute(

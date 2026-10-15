@@ -61,6 +61,7 @@ from difflib import SequenceMatcher
 from typing import Any
 
 from treasure_map.lib.diff.layer0 import norm_hex
+from treasure_map.lib.ro_db import ro_connect
 
 # ── the six states of an aligned pair ────────────────────────────────────────────────────────
 
@@ -620,7 +621,7 @@ def read_function_bodies(analysis_db_path: str | None, sha: str | None) -> Bodie
     if not analysis_db_path or not sha:
         return None
     try:
-        conn = sqlite3.connect(f"file:{analysis_db_path}?mode=ro", uri=True)
+        conn = ro_connect(analysis_db_path)
     except sqlite3.Error:
         return None
     try:
@@ -655,7 +656,7 @@ def read_image_ranges(analysis_db_path: str | None, sha: str | None) -> ImageRan
     if not analysis_db_path or not sha:
         return None
     try:
-        conn = sqlite3.connect(f"file:{analysis_db_path}?mode=ro", uri=True)
+        conn = ro_connect(analysis_db_path)
     except sqlite3.Error:
         return None
     try:

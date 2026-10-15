@@ -21,6 +21,7 @@ from pathlib import Path
 from treasure_map.lib.errors import ConfigError
 from treasure_map.lib.pattern.models import FuncRef, PatternMatch, PatternStats, ScanResult
 from treasure_map.lib.pattern.shapes import DETECTORS
+from treasure_map.lib.ro_db import ro_uri
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +61,7 @@ def load_stub_names(db_path: Path | str) -> dict[int, dict[int, str]]:
     but for a reader they are the same instruction: apply no mapping. An older database with no
     such column yields no entries at all, so the scan runs exactly as it did before.
     """
-    uri = f"file:{Path(db_path)}?mode=ro"
+    uri = ro_uri(Path(db_path))
     conn = sqlite3.connect(uri, uri=True)
     try:
         rows = conn.execute("SELECT id, stub_names FROM binaries").fetchall()
@@ -106,7 +107,7 @@ def scan(db_path: Path | str) -> ScanResult:
     callees cannot be parsed is counted in ``callee_parse_failed`` and surfaced as a data gap,
     never silently dropped.
     """
-    uri = f"file:{Path(db_path)}?mode=ro"
+    uri = ro_uri(Path(db_path))
     conn = sqlite3.connect(uri, uri=True)
     try:
         conn.row_factory = sqlite3.Row

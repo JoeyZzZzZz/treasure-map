@@ -45,6 +45,7 @@ from treasure_map.lib.binary_id import BinaryRow
 from treasure_map.lib.facts import analysis_run_counts
 from treasure_map.lib.hunt.refs import _norm_addr
 from treasure_map.lib.pattern.classes import stub_resolved_name
+from treasure_map.lib.ro_db import ro_connect
 
 KIND_STUB_RESOLVED = "stub_resolved"
 KIND_STUB_UNRESOLVED = "stub_unresolved"
@@ -239,7 +240,7 @@ def read_side_facts(
     if not analysis_db_path or not bin_row.sha256:
         return SideFacts(FACTS_NOT_READ, None, None, None)
     try:
-        conn = sqlite3.connect(f"file:{Path(analysis_db_path)}?mode=ro", uri=True)
+        conn = ro_connect(Path(analysis_db_path))
     except sqlite3.Error:
         return SideFacts(FACTS_NOT_READ, None, None, None)
     try:

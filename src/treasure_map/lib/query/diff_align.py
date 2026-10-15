@@ -32,6 +32,7 @@ from treasure_map.lib.diff.currency import (
 from treasure_map.lib.diff.driver import _DIFF_RETRY_LIMIT
 from treasure_map.lib.diff.layer0 import norm_hex
 from treasure_map.lib.diff.toolchain import current_toolchain
+from treasure_map.lib.ro_db import ro_connect
 
 _ALIGN_NOTE = (
     "an ALIGNMENT FACT (BinDiff matched these addresses), NOT a change verdict. "
@@ -135,7 +136,7 @@ def _current_generation(atlas: sqlite3.Connection, run_id: str) -> dict[str, set
     if row is None or not row[0]:
         return None
     try:
-        conn = sqlite3.connect(f"file:{row[0]}?mode=ro", uri=True)
+        conn = ro_connect(row[0])
     except sqlite3.Error:
         return None
     try:

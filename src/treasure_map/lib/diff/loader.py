@@ -12,6 +12,8 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
+from treasure_map.lib.ro_db import ro_uri
+
 
 @dataclass(frozen=True)
 class FuncRow:
@@ -55,7 +57,7 @@ def load_functions(db_path: Path | str) -> list[FuncRow]:
     Raises sqlite3.OperationalError if the file does not exist (read-only mode does
     not create it) — a missing input is a caller error, surfaced rather than masked.
     """
-    uri = f"file:{Path(db_path)}?mode=ro"
+    uri = ro_uri(Path(db_path))
     conn = sqlite3.connect(uri, uri=True)
     try:
         conn.row_factory = sqlite3.Row

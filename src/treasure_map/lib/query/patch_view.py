@@ -93,6 +93,7 @@ from treasure_map.lib.query.sink_overlay import (
     page_overlay,
     read_sink_overlay_baseline,
 )
+from treasure_map.lib.ro_db import ro_connect
 from treasure_map.version import UNKNOWN_VERSION
 
 VIEWS = ("sink_patch", "string_edge", "candidate_flat")
@@ -503,7 +504,7 @@ def _read_side(atlas: sqlite3.Connection, run_id: str, sha: str | None) -> _Side
     if not sha:
         return _Side(error="the diff records no content hash for this side")
     try:
-        conn = sqlite3.connect(f"file:{row[0]}?mode=ro", uri=True)
+        conn = ro_connect(row[0])
     except sqlite3.Error as e:
         return _Side(error=f"analysis.db could not be opened: {e}")
     try:

@@ -40,6 +40,7 @@ from treasure_map.lib.overlay import repoint_overlay_anchor
 from treasure_map.lib.pattern.classes import call_offsets, sink_callsites
 from treasure_map.lib.pattern.scanner import load_stub_names
 from treasure_map.lib.pattern.shapes import classify
+from treasure_map.lib.ro_db import ro_connect, ro_uri
 
 # sink_class -> the CallClasses attribute holding that class's sink names (shapes.classify)
 _CLASS_ATTR: dict[str, str] = {
@@ -220,7 +221,7 @@ class RekeyReport:
 def _func_facts(analysis_db: Path, bin_anchor: str, func_addr: str) -> FuncFacts | None:
     """Load one re-hunted function's facts from a workspace analysis.db (read-only), or None when
     the binary/function is not present."""
-    uri = f"file:{analysis_db}?mode=ro"
+    uri = ro_uri(analysis_db)
     conn = sqlite3.connect(uri, uri=True)
     try:
         conn.row_factory = sqlite3.Row
@@ -255,7 +256,7 @@ def _func_facts(analysis_db: Path, bin_anchor: str, func_addr: str) -> FuncFacts
 def _degraded_refs(new_atlas: Path) -> set[str]:
     """Refs of the re-hunt that some row marks ``callsite_located: false`` (function-level degraded
     anchors). No per-callsite judgement may be moved onto one."""
-    conn = sqlite3.connect(f"file:{new_atlas}?mode=ro", uri=True)
+    conn = ro_connect(new_atlas)
     try:
         out: set[str] = set()
         for ref, fe in conn.execute("SELECT evidence_ref, flow_evidence FROM instance"):
@@ -271,7 +272,7 @@ def _degraded_refs(new_atlas: Path) -> set[str]:
 
 
 def _new_instance_refs(new_atlas: Path) -> set[str]:
-    conn = sqlite3.connect(f"file:{new_atlas}?mode=ro", uri=True)
+    conn = ro_connect(new_atlas)
     try:
         return {r[0] for r in conn.execute("SELECT evidence_ref FROM instance")}
     finally:
@@ -291,7 +292,7 @@ def build_mapping(
     index the producing pass can no longer place, raises RekeyStopError — never a guess."""
     new_refs = _new_instance_refs(new_atlas)
     degraded = _degraded_refs(new_atlas)
-    old = sqlite3.connect(f"file:{old_atlas}?mode=ro", uri=True)
+    old = ro_connect(old_atlas)
     try:
         old.row_factory = sqlite3.Row
         rows = old.execute(

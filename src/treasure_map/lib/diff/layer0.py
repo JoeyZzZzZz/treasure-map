@@ -47,6 +47,7 @@ from treasure_map.lib.errors import ConfigError
 from treasure_map.lib.facts import _DECOMPILE_MIN_SIZE
 from treasure_map.lib.hunt.refs import _norm_addr
 from treasure_map.lib.query.runs import get_run
+from treasure_map.lib.ro_db import ro_connect
 from treasure_map.version import UNKNOWN_VERSION
 
 # The confidence boundary between an aligned pair and an undetermined one. Owner-set: on the
@@ -110,7 +111,7 @@ def parse_bindiff(
     the export held, and the export did not hold that function as it is."""
     gaps_a = gaps_a or {}
     gaps_b = gaps_b or {}
-    con = sqlite3.connect(f"file:{bindiff_path}?mode=ro", uri=True)
+    con = ro_connect(bindiff_path)
     try:
         con.row_factory = sqlite3.Row
         raw = con.execute(
@@ -207,7 +208,7 @@ def parse_instruction_matches(
     .BinDiff has no instruction table (an older / hand-made one)."""
     if not candidate_addrs_a and not candidate_addrs_b:
         return []
-    con = sqlite3.connect(f"file:{bindiff_path}?mode=ro", uri=True)
+    con = ro_connect(bindiff_path)
     try:
         try:
             raw = con.execute(
@@ -320,7 +321,7 @@ def load_baseline(analysis_db_path: str, bin_row: BinaryRow) -> BaselineDomain:
     omits thunks / externals / micro-functions the diff tool keeps -- so presence uses THIS set,
     not the diff tool's larger one. ``size_bytes`` is read so an empty body is classified
     (design-skip vs real failure), never lumped 'missing'."""
-    con = sqlite3.connect(f"file:{analysis_db_path}?mode=ro", uri=True)
+    con = ro_connect(analysis_db_path)
     try:
         con.row_factory = sqlite3.Row
         rows = con.execute(
@@ -537,7 +538,7 @@ def _bindiff_file_hashes(bindiff_path: Path) -> list[str]:
     (id=1 = A/before ↔ address1, id=2 = B/after ↔ address2). The declared ``CHARACTER(40)`` does not
     truncate under SQLite dynamic typing, so a 64-char sha256 rides intact. [] when there is no
     ``file`` table (an older / hand-made .BinDiff) -- then the binary identity cannot be checked."""
-    con = sqlite3.connect(f"file:{bindiff_path}?mode=ro", uri=True)
+    con = ro_connect(bindiff_path)
     try:
         try:
             rows = con.execute("SELECT hash FROM file ORDER BY id").fetchall()

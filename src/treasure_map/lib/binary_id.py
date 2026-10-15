@@ -24,6 +24,8 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any
 
+from treasure_map.lib.ro_db import ro_connect
+
 # A selector is treated as a sha256 PREFIX only in this shape. Eight hex characters is where a
 # prefix stops being a plausible file name; the upper bound is the full digest.
 _SHA_PREFIX = re.compile(r"^[0-9a-fA-F]{8,64}$")
@@ -100,7 +102,7 @@ def resolve_binary_in_db(
     where an exception would mask the error being reported, so an unreadable database comes back as
     a ``db_error`` miss like any other unresolvable selector."""
     try:
-        con = sqlite3.connect(f"file:{analysis_db_path}?mode=ro", uri=True)
+        con = ro_connect(analysis_db_path)
     except sqlite3.Error as exc:
         return None, {
             "found": False,

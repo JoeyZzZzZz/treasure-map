@@ -44,6 +44,7 @@ from pathlib import Path
 
 from treasure_map.lib.diff.code_version import export_code_hash
 from treasure_map.lib.diff.toolchain import Toolchain
+from treasure_map.lib.ro_db import ro_connect
 
 # The diff_meta columns a re-diff decision compares (scanned_at / hunt_instances are not among
 # them: they only let a reader skip recomputing the hunt-input digest, see the read side).
@@ -126,7 +127,7 @@ def read_extraction(
     if not analysis_db_path or not Path(analysis_db_path).exists():
         return None
     try:
-        conn = sqlite3.connect(f"file:{analysis_db_path}?mode=ro", uri=True)
+        conn = ro_connect(analysis_db_path)
     except sqlite3.Error:
         return None
     try:
@@ -150,7 +151,7 @@ def extraction_stamp(
     if not sha or not analysis_db_path or not Path(analysis_db_path).exists():
         return None, None
     try:
-        conn = sqlite3.connect(f"file:{analysis_db_path}?mode=ro", uri=True)
+        conn = ro_connect(analysis_db_path)
     except sqlite3.Error:
         return None, None
     try:

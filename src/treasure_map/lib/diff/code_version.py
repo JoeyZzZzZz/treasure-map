@@ -57,6 +57,7 @@ DIFF_CODE_ENTRIES: tuple[str, ...] = (
     "lib.callsite_ref",
     "lib.hunt.refs",
     "lib.query.runs",
+    "lib.ro_db",
     "lib.atlas.models:DiffMetaRow",
     "lib.atlas.models:DimensionCapabilityStateRow",
     "lib.atlas.models:DimensionDeltaRow",
