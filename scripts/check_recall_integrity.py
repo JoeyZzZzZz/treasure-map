@@ -31,6 +31,14 @@ Gate D — the shape scan skips no function with callees (one authority on what 
     to every reader of the result. The equation makes "was it looked at" answerable from the
     numbers instead of from the code.
 
+Gate E — a provably-constant marker holds on the function it was read from (needs both databases):
+    a ``const_sink_arg`` on a PATH sink means every call to that sink in the function passes a
+    literal at every path argument (rename's destination as much as its source); on a shell sink,
+    at least one call to it opens with a literal and splices no variable into it. A marker the
+    function's own text contradicts was written by a reader that has since been fixed, or by one
+    that is wrong now. Calls the text does not show (a stub-rendered ``FUN_<addr>(…)``) cannot be
+    checked here: such instances are counted as unverifiable, never as violations.
+
 Usage:
     check_recall_integrity.py --atlas ATLAS.db --analysis ANALYSIS.db   # check real databases
     check_recall_integrity.py --self-test                              # CI: synthetic clean+dirty
@@ -125,6 +133,56 @@ def gate_d_violations(analysis_db: Path) -> int:
     return stats.functions_scanned - stats.functions_with_callees - stats.callee_parse_failed
 
 
+_GATE_E_SQL = (
+    "SELECT i.evidence_ref, i.sink_anchor, p.sink_class FROM instance i "
+    "JOIN pattern p ON p.pattern_id = i.pattern_id WHERE i.blocking_mechanism = 'const_sink_arg'"
+)
+
+
+def _function_text(analysis: sqlite3.Connection, evidence_ref: str) -> str | None:
+    """The pseudocode of the function ``run#<sha8>:<entry>@…`` names, or None."""
+    try:
+        ident = evidence_ref.split("#", 1)[1].split("@", 1)[0]
+        sha8, addr = ident.split(":", 1)
+    except (IndexError, ValueError):
+        return None
+    row = analysis.execute(
+        "SELECT f.pseudocode FROM functions f JOIN binaries b ON b.id = f.binary_id "
+        "WHERE b.sha256 LIKE ? AND f.address = ? LIMIT 1",
+        (sha8 + "%", addr),
+    ).fetchone()
+    return row[0] if row is not None and row[0] else None
+
+
+def gate_e_violations(atlas_db: Path, analysis_db: Path) -> tuple[int, int]:
+    """(violations, unverifiable) of Gate E over the instances whose function is in this
+    analysis database."""
+    from treasure_map.lib.hunt.downweight import _SHELL_RUN_SINKS, _sink_arg_is_literal
+    from treasure_map.lib.pattern.classes import all_path_calls_literal, call_offsets
+
+    atlas = sqlite3.connect(f"{atlas_db.resolve().as_uri()}?mode=ro", uri=True)
+    analysis = sqlite3.connect(f"{analysis_db.resolve().as_uri()}?mode=ro", uri=True)
+    violations = unverifiable = 0
+    try:
+        for ref, sink, sink_class in atlas.execute(_GATE_E_SQL).fetchall():
+            text = _function_text(analysis, ref)
+            if text is None:
+                continue  # another run's function, or one this database does not hold
+            n = len(call_offsets(text, sink)) if sink else 0
+            if n == 0:
+                unverifiable += 1
+            elif sink_class == "path_sink":
+                violations += not all_path_calls_literal(text, sink)
+            elif sink in _SHELL_RUN_SINKS:
+                violations += not any(
+                    _sink_arg_is_literal(text, sink, None, None, k) for k in range(n)
+                )
+    finally:
+        atlas.close()
+        analysis.close()
+    return violations, unverifiable
+
+
 def _check_real(atlas_db: Path | None, analysis_db: Path | None) -> int:
     fail = 0
     if atlas_db is not None:
@@ -153,6 +211,13 @@ def _check_real(atlas_db: Path | None, analysis_db: Path | None) -> int:
             fail = 1
         else:
             print("✓ Gate D: every function with callees was scanned or counted as a parse failure")
+    if atlas_db is not None and analysis_db is not None:
+        n, unread = gate_e_violations(atlas_db, analysis_db)
+        if n:
+            print(f"❌ Gate E: {n} const_sink_arg marker(s) the function's own text contradicts")
+            fail = 1
+        else:
+            print(f"✓ Gate E: every checkable const_sink_arg holds ({unread} unverifiable)")
     return fail
 
 
@@ -172,6 +237,19 @@ def _build_self_test_dbs(root: Path, *, violating: bool) -> tuple[Path, Path]:
         "VALUES (1, 'good', 'bin/good', 'g', 'ok', '2026-01-01')"
     )
     conn.execute("INSERT INTO functions (binary_id, name) VALUES (1, 'main')")
+    # Gate E: the function a path-sink const_sink_arg was read from — rename's destination a
+    # literal (clean) or the caller's parameter (violating).
+    destination = "param_1" if violating else '"/tmp/b"'
+    conn.execute(
+        "INSERT INTO binaries (id, name, path, sha256, ghidra_status, last_seen_at) "
+        "VALUES (3, 'mover', 'bin/mover', ?, 'ok', '2026-01-01')",
+        ("c" * 64,),
+    )
+    conn.execute(
+        "INSERT INTO functions (binary_id, name, address, pseudocode) VALUES "
+        "(3, 'FUN_00001000', '00001000', ?)",
+        (f'void FUN_00001000(char *param_1){{ rename("/tmp/a", {destination}); }}',),
+    )
     if violating:
         # Gate B violation: 'ok' but no functions.
         conn.execute(
@@ -196,6 +274,31 @@ def _build_self_test_dbs(root: Path, *, violating: bool) -> tuple[Path, Path]:
         call_sequence_shape="source->cmd",
         structural_fingerprint="fp_selftest",
         fingerprint_algo_version="callseq-v1",
+    )
+    path_pid = upsert_pattern(
+        aconn,
+        source_class="unknown",
+        sink_class="path_sink",
+        call_sequence_shape="path_sink",
+        structural_fingerprint="fp_selftest_path",
+        fingerprint_algo_version="callseq-v1",
+    )
+    add_instance(
+        aconn,
+        InstanceRow(
+            pattern_id=path_pid,
+            pseudocode_hash="h_path",
+            source_anchor="FUN_00001000",
+            sink_anchor="rename",
+            source_run_id="run_selftest",
+            reachability_status="unknown",
+            blocking_mechanism="const_sink_arg",
+            provenance_level="L0",
+            evidence_ref="run_selftest#cccccccc:00001000@path_sink@0x000010",
+            scope_origin="intra",
+            origin="unknown",
+            binary_path="bin/mover",
+        ),
     )
     # A clean instance: const_sink_arg with a non-free source_kind is allowed.
     add_instance(
@@ -257,6 +360,8 @@ def _self_test() -> int:
             "violating Gate A > 0": gate_a_violations(bad_atlas) > 0,
             "violating Gate B > 0": gate_b_violations(bad_analysis) > 0,
             "violating Gate C > 0": gate_c_violations(bad_atlas) > 0,
+            "clean Gate E == 0": gate_e_violations(clean_atlas, clean_analysis)[0] == 0,
+            "violating Gate E > 0": gate_e_violations(bad_atlas, bad_analysis)[0] > 0,
             # Gate D is a pure arithmetic property of the stats, so it is exercised as one: a
             # partition that adds up, and one that does not. Stubbing the scan body to fake a
             # skip would test the stub. The real scan is what `--analysis` checks.

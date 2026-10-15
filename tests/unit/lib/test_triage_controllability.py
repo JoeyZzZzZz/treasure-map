@@ -92,12 +92,13 @@ def _inst(
     flow_evidence: dict[str, object] | None = None,
     blocking: str | None = None,
     source_kind: str | None = None,
+    run: str = "run_1",
 ) -> str:
     _FID[0] += 1
     ev: dict[str, object] = dict(flow_evidence or {})
     if source_kind is not None:
         ev["source_kind"] = source_kind
-    ref = f"run_1#fn{_FID[0]}@{sink_anchor}"
+    ref = f"{run}#fn{_FID[0]}@{sink_anchor}"
     add_instance(
         conn,
         InstanceRow(
@@ -105,7 +106,7 @@ def _inst(
             pseudocode_hash=f"h{_FID[0]}",
             source_anchor=f"fn{_FID[0]}",
             sink_anchor=sink_anchor,
-            source_run_id="run_1",
+            source_run_id=run,
             reachability_status="unknown",
             blocking_mechanism=blocking,
             provenance_level="L0",
@@ -186,6 +187,59 @@ def test_web_settable_key_reaching_sink_is_controllable(tmp_path: Path) -> None:
     conn.close()
     c = _find(triage(open_atlas(tmp_path / "atlas.db")), ref)
     assert _ctrl(c) == "controllable"  # SEAM PROPERTY: survives the merge
+
+
+def test_another_firmwares_front_end_does_not_make_a_key_settable(tmp_path: Path) -> None:
+    """run_2 reads fb_comment into the same sink, but only run_1 has the form field and the
+    back-end key: in run_2 the key is not proven settable, so nothing is promoted on it.
+
+    MUTATION: read web_settable over the whole atlas for a candidate (no run scope) -> RED."""
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp_fb2", sink_class="fmt_string")
+    ref = _inst(
+        conn,
+        p,
+        sink_anchor="fprintf",
+        flow_evidence=_stack_buf_prov("fprintf", [_getter_vararg("fb_comment")]),
+        source_kind="unknown",
+        run="run_2",
+    )
+    conn.close()
+    c = _find(triage(open_atlas(tmp_path / "atlas.db")), ref)
+    assert c is not None and _ctrl(c) != "controllable"
+
+
+def test_explain_reads_the_settable_key_with_the_candidates_own_run(tmp_path: Path) -> None:
+    """The explain summary classifies the same writer arguments: run_2's must not borrow run_1's
+    front end either.
+
+    MUTATION: drop the run scope around explain_candidate's summary -> RED."""
+    from treasure_map.lib.query.triage import explain_candidate
+
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp_fb3", sink_class="fmt_string")
+    refs = {
+        run: _inst(
+            conn,
+            p,
+            sink_anchor="fprintf",
+            flow_evidence=_stack_buf_prov("fprintf", [_getter_vararg("fb_comment")]),
+            source_kind="unknown",
+            run=run,
+        )
+        for run in ("run_1", "run_2")
+    }
+    conn.close()
+    conn = open_atlas(tmp_path / "atlas.db")
+    try:
+        got = {}
+        for run, ref in refs.items():
+            ex = explain_candidate(conn, ref)
+            assert ex is not None
+            got[run] = ex.sink_arg_provenance_summary[0]["fmt_args_provenance"]
+    finally:
+        conn.close()
+    assert got == {"run_1": "has_controllable", "run_2": "undetermined"}
 
 
 def test_non_web_settable_getter_key_is_not_promoted(tmp_path: Path) -> None:
@@ -636,8 +690,11 @@ def test_call_return_classifier_registry_is_extensible(tmp_path: Path) -> None:
 # ── 支配传导 (dominance propagation): only a dominating writer decides a stack_buf sink ──
 
 
-def _writer(fmt: str, varargs: list, *, dominates: bool) -> dict:  # type: ignore[type-arg]
-    return {"writer": "snprintf@0x1", "dominates_sink": dominates, "fmt": fmt, "varargs": varargs}
+def _writer(fmt: str, varargs: list, *, dominates: bool, reaches: bool | None = None) -> dict:  # type: ignore[type-arg]
+    w = {"writer": "snprintf@0x1", "dominates_sink": dominates, "fmt": fmt, "varargs": varargs}
+    if reaches is not None:
+        w["may_reach_sink"] = reaches  # the extractor's path fact: overwritten on every path or not
+    return w
 
 
 def _writer_no_dom_field(fmt: str, varargs: list) -> dict:  # type: ignore[type-arg]
@@ -667,7 +724,8 @@ def _stack_buf_multi(sink: str, writers: list) -> dict:  # type: ignore[type-arg
 
 def test_dominating_const_beats_nondominating_controllable_is_const(tmp_path: Path) -> None:
     # M2 case 3 (the wrs_cc_t core): a DOMINATING const writer + a NON-dominating writer carrying a
-    # web-settable key -> const, NOT controllable. The non-dominating key flows to a different sink.
+    # web-settable key that the extractor shows never reaching the sink (overwritten on every path)
+    # -> const, NOT controllable. The non-dominating key flows to a different sink.
     conn = _atlas(tmp_path)
     p = _pattern(conn, "fp_case3", sink_class="cmd")
     prov = _stack_buf_multi(
@@ -675,14 +733,40 @@ def test_dominating_const_beats_nondominating_controllable_is_const(tmp_path: Pa
         [
             _writer("fixed cmd %s", [_const_va()], dominates=True),  # dominating: all const
             _writer(
-                "SELECT %s", [_getter_vararg("fb_comment")], dominates=False
-            ),  # web key, non-dom
+                "SELECT %s", [_getter_vararg("fb_comment")], dominates=False, reaches=False
+            ),  # web key, non-dom, never reaching
         ],
     )
     ref = _inst(conn, p, sink_anchor="system", flow_evidence=prov, source_kind="unknown")
     conn.close()
     c = _find(triage(open_atlas(tmp_path / "atlas.db")), ref)
     assert _ctrl(c) == "constant"  # only the dominating (const) writer decided the sink
+
+
+def test_a_non_dominating_writer_that_may_reach_the_sink_blocks_constant(tmp_path: Path) -> None:
+    """snprintf(buf, "tar %s", const); if (x) strlcat(buf, v); system(buf): the dominating writer
+    is constant, the later conditional one is not, and it is on a path to the sink. Without the
+    extractor's word that it never reaches (may_reach_sink: false), the command is NOT constant —
+    and the conditional writer still does not PROMOTE it (it may go elsewhere).
+
+    MUTATION: decide 'const' from the dominating writers alone -> RED."""
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp_case3b", sink_class="cmd")
+    refs = []
+    for reaches in (None, True):
+        prov = _stack_buf_multi(
+            "system",
+            [
+                _writer("tar czf %s", [_const_va()], dominates=True),
+                _writer("%s", [_param_va()], dominates=False, reaches=reaches),
+            ],
+        )
+        refs.append(_inst(conn, p, sink_anchor="system", flow_evidence=prov, source_kind="unknown"))
+    conn.close()
+    cands = triage(open_atlas(tmp_path / "atlas.db"))
+    for ref in refs:
+        c = _find(cands, ref)
+        assert c is not None and _ctrl(c) not in ("constant", "controllable")
 
 
 def test_all_dominating_writers_non_controllable_is_not_controllable(tmp_path: Path) -> None:
@@ -1633,10 +1717,20 @@ def _wrapper_record(sink: str, provenance: dict[str, object], wrapper: str = "do
     }
 
 
-def _cmd_writer(fmt: str, varargs: list[dict[str, object]], *, dominates: bool, at: str) -> dict:  # type: ignore[type-arg]
+def _cmd_writer(
+    fmt: str,
+    varargs: list[dict[str, object]],
+    *,
+    dominates: bool,
+    at: str,
+    reaches: bool | None = None,
+) -> dict:  # type: ignore[type-arg]
     """One stack-buffer writer of a recovered command. Named apart from the module's own ``_writer``
     on purpose — this file already has one, and shadowing it silently broke five tests."""
-    return {"writer": f"snprintf@{at}", "dominates_sink": dominates, "fmt": fmt, "varargs": varargs}
+    w = {"writer": f"snprintf@{at}", "dominates_sink": dominates, "fmt": fmt, "varargs": varargs}
+    if reaches is not None:
+        w["may_reach_sink"] = reaches
+    return w
 
 
 def test_cmd_wrapper_recognized_and_stackbuf_run(tmp_path: Path) -> None:
@@ -1809,6 +1903,7 @@ def test_cmd_form2_dominating_writer(tmp_path: Path) -> None:
                     [_getter_vararg("fb_comment")],
                     dominates=False,
                     at="0x10",
+                    reaches=False,
                 ),
                 # the writer that actually reaches the wrapper argument on every path
                 _cmd_writer("/bin/true", [], dominates=True, at="0x20"),

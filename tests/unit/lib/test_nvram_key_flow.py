@@ -327,6 +327,7 @@ def test_web_settable_carries_frontend_evidence_rows(tmp_path: Path) -> None:
             "field_keyword": "fb_comment",
             "source_asset": "Feedback.asp",
             "source_rule": "textarea",
+            "source_run_id": "run_a",
             "match_kind": "exact",
         }
     ]
@@ -354,6 +355,7 @@ def test_web_settable_naming_variant_evidence_is_tagged(tmp_path: Path) -> None:
             "field_keyword": "http_username_x",
             "source_asset": "Feedback.asp",
             "source_rule": "input",
+            "source_run_id": "run_a",
             "match_kind": "naming_variant",
         }
     ]
@@ -554,3 +556,29 @@ def test_run_id_scopes_every_part_of_the_graph(tmp_path: Path) -> None:
     assert [t["source_run_id"] for t in scoped["template_matches"]] == ["fw_a"]
     assert scoped["unresolved_count"] == 1  # the caveat is now about THIS run, not the atlas
     conn.close()
+
+
+def test_web_settable_reads_only_the_candidates_own_run(tmp_path: Path) -> None:
+    """Two firmware in one atlas: run_b has the form field, run_a only the back-end key. Read for
+    run_a, the key is NOT proven settable — another image's front end proves nothing about this
+    one — and with no front end collected for run_a it is uncertain, never 'no'.
+
+    MUTATION: drop the run filter from the front-end lookup -> run_a reads 'yes' -> RED."""
+    from treasure_map.lib.query.nvram import run_scope
+
+    atlas = _seed(
+        tmp_path,
+        [_flow("fb_comment", "constant", "httpd", "save", "read")],
+        form_fields=[_field("fb_comment", run="run_b")],
+    )
+    conn = open_atlas(atlas)
+    try:
+        own = _web_settable(conn, "fb_comment", "run_a")
+        with run_scope("run_a"):
+            scoped = _web_settable(conn, "fb_comment")
+        whole = _web_settable(conn, "fb_comment")
+    finally:
+        conn.close()
+    assert own["web_settable"] == "uncertain" and own["frontend"] == "uncertain"
+    assert scoped["web_settable"] == "uncertain"
+    assert whole["web_settable"] == "yes"  # unscoped (no run named) reads the whole atlas

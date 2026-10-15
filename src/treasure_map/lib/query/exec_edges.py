@@ -80,9 +80,10 @@ def _exec_scan_status(
     """The launch-edge pass's honesty status for the queried scope, so an EMPTY result carries
     whether the silence can be trusted.
 
-    ★ Scoped to the ``exec_argv`` pass only. An empty edge list is a confident 'nothing launches
-    this' ONLY when a status row says scanned=1 AND the shapes in ``unsupported_note`` do not
-    apply to the code you care about. No status row => not scanned or not re-hunted => UNKNOWN.
+    ★ Scoped to the ``exec_argv`` pass only. An empty edge list means 'nothing the pass read
+    launches this'; it covers a launcher only when that binary's status row says scanned=1 (0: a
+    command-calling function there was not read) AND the shapes in ``unsupported_note`` do not
+    apply to it. No status row => not scanned or not re-hunted => UNKNOWN.
 
     Two shapes, because the per-binary rows are only ever READ in one situation. ``scanned_total``
     and ``found_total`` always ride along: they are what an "is this pass covering anything?"
@@ -126,10 +127,11 @@ def _exec_scan_status(
         "scanned_total": len(rows),
         "found_total": sum(r["found_count"] or 0 for r in rows),
         "note": (
-            "Honesty status for the exec_argv pass ONLY. An EMPTY launched_by result is a "
-            "confident 'nothing in this firmware launches it' ONLY when a status has scanned=1 "
-            "and none of the unsupported_note shapes covers the caller you care about. No "
-            "statuses => not scanned or not re-hunted => UNKNOWN, never 'nothing launches it'. "
+            "Honesty status for the exec_argv pass ONLY. An EMPTY launched_by result means "
+            "nothing the pass READ launches it. It covers a launcher only when that binary's "
+            "status has scanned=1 (0: a function there calls a command sink but was not read) "
+            "and none of the unsupported_note shapes covers it. No statuses => not scanned or not "
+            "re-hunted => UNKNOWN, never 'nothing launches it'. "
             "The per-binary rows ride along whenever the answer is empty — the moment you need "
             "them to check whether the launcher you suspect was in the scanned set at all."
         ),
@@ -239,8 +241,8 @@ def launched_by(
         "count": len(edges),
         "truncated": len(edges) >= limit,
         "launcher_binaries": sorted({str(e["launcher"]["binary"]) for e in edges if e["launcher"]}),
-        # ★ The pass's honesty travels WITH the result so an EMPTY one is never read as a
-        # confident 'nothing launches this' — and the per-binary rows come with it precisely then.
+        # ★ The pass's honesty travels WITH the result so an EMPTY one is never read as
+        # 'nothing launches this' on its own — and the per-binary rows come with it precisely then.
         "exec_argv_status": _exec_scan_status(conn, run_id, None, per_binary=not edges),
         "note": (
             "Enumerated cross-binary launch edges (A's code calls a command/exec sink whose "

@@ -30,7 +30,7 @@ from treasure_map.lib.fmt_spec import arity as fmt_arity
 from treasure_map.lib.fmt_spec import conversions as fmt_conversions
 from treasure_map.lib.pattern.classes import CMD, FMT_STRING
 from treasure_map.lib.pattern.extractor_names import REGISTRY as _EXTRACTOR_NAMES
-from treasure_map.lib.query.nvram import _web_settable
+from treasure_map.lib.query.nvram import _web_settable, run_scope
 from treasure_map.lib.query.sink_impact import (
     CONSTRAINED_MARKERS,
     NVRAM_GETTERS,
@@ -589,7 +589,9 @@ def _judged_writers(prov: dict[str, Any]) -> list[dict[str, Any]]:
     the sink, so only it forwards a value that actually reaches the sink argument. A non-dominating
     writer is a mutually-exclusive branch — it may carry a controllable source that flows to a
     DIFFERENT sink (e.g. a wrs_cc_t query into sqlite3_exec, not into this system() call), and must
-    NOT light up this sink.
+    NOT light up this sink. That is the rule for PROMOTING; calling the argument CONSTANT also
+    needs every non-dominating writer still on a path to the sink to be constant
+    (_other_reaching_writers).
 
     ★ Boundary — no dominating writer marked (dominating empty) -> FALL BACK to ALL writers. A
     missing dominance mark is analysis-incomplete (a truncated/MULTIEQUAL def-use) or pre-field
@@ -603,6 +605,23 @@ def _judged_writers(prov: dict[str, Any]) -> list[dict[str, Any]]:
     writers = [w for w in (prov.get("writers") or []) if isinstance(w, dict)]
     dominating = [w for w in writers if w.get("dominates_sink")]
     return dominating if dominating else writers
+
+
+def _other_reaching_writers(prov: dict[str, Any]) -> list[dict[str, Any]]:
+    """The writers ``_judged_writers`` set aside that may STILL reach the sink.
+
+    Setting a non-dominating writer aside is right for PROMOTING (a branch's controllable value may
+    go to a different sink), and wrong for calling the argument CONSTANT: a writer after the
+    dominating one, on some path to the sink — ``snprintf(buf, "tar %s", const); if (x)
+    strlcat(buf, v); system(buf);`` — changes what the sink runs. Only a writer the extractor
+    marks ``may_reach_sink: false`` (overwritten on every path before the sink) is left out; one
+    without the mark is kept, the conservative reading."""
+    judged = _judged_writers(prov)
+    return [
+        w
+        for w in (prov.get("writers") or [])
+        if isinstance(w, dict) and w not in judged and w.get("may_reach_sink") is not False
+    ]
 
 
 def _record_class(conn: sqlite3.Connection, rec: dict[str, Any]) -> str:
@@ -633,8 +652,13 @@ def _record_class(conn: sqlite3.Connection, rec: dict[str, Any]) -> str:
             wclasses = [_writer_args_class(conn, w.get("fmt"), w.get("varargs")) for w in judged]
             if "controllable" in wclasses:
                 cls = "controllable"
+            elif all(c == "const" for c in wclasses) and all(
+                _writer_args_class(conn, w.get("fmt"), w.get("varargs")) == "const"
+                for w in _other_reaching_writers(prov)
+            ):
+                cls = "const"
             else:
-                cls = "const" if all(c == "const" for c in wclasses) else "unknown"
+                cls = "unknown"
     else:
         cls = "unknown"
     # Iron law: a variadic exec proven constant only at arg0 is NOT a constant command.
@@ -969,10 +993,10 @@ def _sink_provenance_summary(
             summary["writer_count"] = prov.get("writer_count")
         writers = prov.get("writers")
         if isinstance(writers, list):
-            # How many writers are on EVERY path to the sink (sound CHK-dominating). Distinguishes
-            # "already resolved to 1-3 dominating writers" from the raw writer_count, which also
-            # counts the mutually-exclusive branch writers (noise) — a high writer_count with a low
-            # dominating_writer_count is resolved, not ambiguous.
+            # How many writers are on EVERY path to the sink (CHK-dominating). Distinguishes
+            # "resolved to 1-3 dominating writers" from the raw writer_count, which also counts the
+            # branch writers — most go elsewhere, but one after the dominating write can still
+            # reach the sink, so a low dominating_writer_count is not "nothing else gets in".
             summary["dominating_writer_count"] = sum(
                 1 for w in writers if isinstance(w, dict) and w.get("dominates_sink")
             )
@@ -1032,7 +1056,7 @@ def _trim_writer_varargs(writer: dict[str, Any]) -> dict[str, Any]:
 
 def _present_provenance(prov: dict[str, Any], *, dominating_only: bool) -> dict[str, Any]:
     """Read-side presentation of a stack_buf provenance: dominating writers first (so the agent
-    reads the sound ones without scanning the branch-noise tail), fmt-arity vararg trim applied, and
+    reads the ones on every path first, before the rest), fmt-arity vararg trim applied, and
     optionally only the dominating writers. Non-stack_buf provenance is returned unchanged."""
     writers = prov.get("writers")
     if not isinstance(writers, list):
@@ -1064,7 +1088,7 @@ def get_sink_provenance(
     """Full sink_arg_provenance detail for a candidate (the on-demand companion to the explain
     summary). Returns every sink's record when ``sink_idx`` is None, otherwise the one record with
     that idx. Writers are presented dominating-first with fmt-arity vararg trimming; pass
-    ``dominating_only`` to return only the sound dominating writers. Read-only; a surfaced def-use
+    ``dominating_only`` to return only the dominating writers. Read-only; a surfaced def-use
     fact, never a verdict. Unknown ref / idx is reported honestly, never as an empty-but-successful
     result.
 
@@ -1685,6 +1709,26 @@ def _exec_shape_surface(blocking_mechanism: str | None) -> dict[str, Any] | None
     }
 
 
+def _caller_hint_surface(blocking_mechanism: str | None) -> dict[str, Any] | None:
+    """caller_constant, framed: a one-hop reading of the callers, which no verdict consumes."""
+    if blocking_mechanism != "caller_constant":
+        return None
+    return {
+        "axis": "caller_hint",
+        "caller_hint": "caller_constant",
+        "reading": (
+            "every call to this function that the callers one hop up show passes a string or "
+            "numeric literal at the parameter the sink uses"
+        ),
+        "coverage": "unjudged",
+        "not_asserted": (
+            "NOT a proof the value is constant: the caller set is not proven complete — an "
+            "exported function is called from other binaries, and a function pointer from places "
+            "no call site shows — and callers of the callers are not read"
+        ),
+    }
+
+
 def evidence_surface(
     flow_evidence: Evidence,
     sink_class: str | None,
@@ -1708,7 +1752,7 @@ def evidence_surface(
     if sink_class == _CLASS_FMT:
         return _fmt_surface(evidence)
     if sink_class in (_CLASS_CMD, _CLASS_PATH):
-        return _exec_shape_surface(blocking_mechanism)
+        return _exec_shape_surface(blocking_mechanism) or _caller_hint_surface(blocking_mechanism)
     return None
 
 
@@ -1794,15 +1838,12 @@ def _controllability_reading(
     )
     # ★ "The provenance holds a record that was NOT shown to be constant."
     #
-    # The constant markers below are not all per-callsite. const_sink_arg IS parameter-specific
-    # (downweight._sink_arg_is_literal reads THIS candidate's own call by its occurrence);
-    # caller_constant is still a FUNCTION-level reading — the sole caller only ever passes
-    # constants — so it is carried by every sink in the body alike. A function with several sinks —
-    # `system("reboot")` beside a `system(<unresolved>)` — can therefore still let one constant
-    # vouch for another call through the function-level marker, and even a per-callsite
-    # const_sink_arg says nothing about whether the ANCHORED sink left a def-use record at all (a
-    # sink forwarded through a wrapper leaves only the caller's OWN records). The marker exits below
-    # cannot be trusted on a marker alone, which is why the completeness gate runs.
+    # const_sink_arg is parameter-specific (downweight._sink_arg_is_literal reads THIS candidate's
+    # own call by its occurrence), but even a per-callsite marker says nothing about whether the
+    # ANCHORED sink left a def-use record at all (a sink forwarded through a wrapper leaves only the
+    # caller's OWN records). The marker exits below cannot be trusted on a marker alone, which is
+    # why the completeness gate runs. (caller_constant is not a provable marker at all: its caller
+    # set is not provably complete — see sink_impact.PROVABLY_CONSTANT_MARKERS.)
     #
     # `prov_verdict is None` is exactly the state to refuse: a controllable verdict already
     # returned above, and an all-constant one returns "const", so None with records present means
@@ -2328,7 +2369,8 @@ def _dim_writer(
                 "proven",
                 "located",
                 f"sink_arg_provenance (dominating writer {prov.get('nearest_dominating_writer')})",
-                "a sound dominating writer for the sink argument was located",
+                "a writer on every path to the sink argument was located (a later, conditional "
+                "writer may still add to what the sink receives)",
             )
     return Dimension(
         "writer",
@@ -2440,6 +2482,17 @@ def _candidate(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
     wrapper_names: frozenset[str] = frozenset(),
+) -> TriageCandidate:
+    """One candidate, read with ITS run's evidence only: whether an nvram key is user-settable is
+    a fact about that firmware's front end, never another image's in the same atlas."""
+    with run_scope(row["source_run_id"]):
+        return _candidate_in_run(conn, row, wrapper_names)
+
+
+def _candidate_in_run(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    wrapper_names: frozenset[str],
 ) -> TriageCandidate:
     reach = row["reachability_status"]
     # Parsed ONCE for this candidate and handed to every reader below (none of them changes it). A
@@ -3179,6 +3232,13 @@ def explain_candidate(conn: sqlite3.Connection, evidence_ref: str) -> CandidateE
         )
     row = rows[0]
 
+    with run_scope(row["source_run_id"]):  # the summary reads web_settable too
+        return _explain_in_run(conn, evidence_ref, row)
+
+
+def _explain_in_run(
+    conn: sqlite3.Connection, evidence_ref: str, row: sqlite3.Row
+) -> CandidateExplanation:
     candidate = _candidate(conn, row, _nvram_wrapper_names(conn))
     callsite_addr = callsite_abs_addr(evidence_ref)
     claims_does = (

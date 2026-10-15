@@ -227,8 +227,8 @@ PATH_SINK: frozenset[str] = frozenset(
 # The PATH argument index for each path/file sink (0-based). MUST be per-sink: fopen's path is
 # arg0, but openat/openat64/unlinkat take a dirfd first so their path is arg1, and renameat's
 # source path is arg1 (arg0 is olddirfd). Reading arg0 blindly would judge the dirfd, not the path
-# — missing the real sink and mis-classifying a constant one. rename/renameat expose two path
-# args; the source path (0 / 1) is taken this phase — the destination path is a later refinement.
+# — missing the real sink and mis-classifying a constant one. This is the FIRST path argument;
+# a sink with more than one carries the rest in PATH_SINK_EXTRA_ARGS.
 PATH_SINK_ARG: dict[str, int] = {
     "fopen": 0,
     "fopen64": 0,
@@ -250,47 +250,15 @@ PATH_SINK_ARG: dict[str, int] = {
     "truncate64": 0,
 }
 
+# Further path arguments, each as dangerous as the first: rename's destination (arg1) and
+# renameat's (arg3, after newdirfd). A call is a constant path only when EVERY one of its path
+# arguments is a literal — rename("/tmp/x", param_1) moves a fixed file to wherever the caller says.
+PATH_SINK_EXTRA_ARGS: dict[str, tuple[int, ...]] = {"rename": (1,), "renameat": (3,)}
+
 # A whole argument that is a plain string literal (optionally an L"..." wide literal). A format
 # argument matching this is a fixed format string — the overwhelmingly common, safe shape.
 _FMT_LITERAL_RE = re.compile(r'^\s*L?"(?:[^"\\]|\\.)*"\s*$')
 _IDENT_RE = re.compile(r"[A-Za-z_]\w*")
-
-
-def _split_top_args(arglist: str) -> list[str]:
-    """Split a call's argument text on top-level commas (respecting strings / parens / brackets)."""
-    parts: list[str] = []
-    depth = 0
-    in_str = False
-    buf: list[str] = []
-    i = 0
-    while i < len(arglist):
-        ch = arglist[i]
-        if in_str:
-            buf.append(ch)
-            if ch == "\\" and i + 1 < len(arglist):
-                buf.append(arglist[i + 1])
-                i += 2
-                continue
-            if ch == '"':
-                in_str = False
-        elif ch == '"':
-            in_str = True
-            buf.append(ch)
-        elif ch in "([":
-            depth += 1
-            buf.append(ch)
-        elif ch in ")]":
-            depth -= 1
-            buf.append(ch)
-        elif ch == "," and depth == 0:
-            parts.append("".join(buf))
-            buf = []
-        else:
-            buf.append(ch)
-        i += 1
-    if buf:
-        parts.append("".join(buf))
-    return parts
 
 
 def _iter_format_args(
@@ -311,17 +279,9 @@ def _iter_format_args(
         return []
     out: list[str | None] = []
     for i in call_offsets(pseudocode, sink_name, stub_names):
-        depth = 0
-        for j in range(i, len(pseudocode)):
-            ch = pseudocode[j]
-            if ch == "(":
-                depth += 1
-            elif ch == ")":
-                depth -= 1
-                if depth == 0:
-                    args = _split_top_args(pseudocode[i + 1 : j])
-                    out.append(args[pos].strip() if pos < len(args) else None)
-                    break
+        # one entry per call, an unreadable one included (as None): entry N must stay call N
+        args = call_args_at(pseudocode, i)
+        out.append(args[pos].strip() if args is not None and pos < len(args) else None)
     return out
 
 
@@ -397,29 +357,25 @@ def format_string_ident(
 
 def _iter_path_args(
     pseudocode: str, sink_name: str, stub_names: Mapping[int, str] | None = None
-) -> list[str | None]:
-    """The PATH-argument text of EVERY call to ``sink_name`` (None when its position is absent).
+) -> list[list[str | None]]:
+    """The PATH-argument texts of EVERY call to ``sink_name``: one list per call, one entry per
+    path argument (PATH_SINK_ARG, then PATH_SINK_EXTRA_ARGS), None where a position is absent.
 
-    Mirrors _iter_format_args but keyed on PATH_SINK_ARG (the per-sink path position), so a sink
-    called several times (a constant path here, a variable path there) is judged on all calls —
-    and, like it, takes its call positions from ``call_offsets`` so the enumerator and this reader
-    cannot drift apart, stub-rendered calls included."""
+    Mirrors _iter_format_args but keyed on the per-sink path positions, so a sink called several
+    times (a constant path here, a variable path there) is judged on all calls — and, like it,
+    takes its call positions from ``call_offsets`` so the enumerator and this reader cannot drift
+    apart, stub-rendered calls included."""
     pos = PATH_SINK_ARG.get(sink_name)
     if pos is None:
         return []
-    out: list[str | None] = []
+    positions = (pos, *PATH_SINK_EXTRA_ARGS.get(sink_name, ()))
+    out: list[list[str | None]] = []
     for i in call_offsets(pseudocode, sink_name, stub_names):
-        depth = 0
-        for j in range(i, len(pseudocode)):
-            ch = pseudocode[j]
-            if ch == "(":
-                depth += 1
-            elif ch == ")":
-                depth -= 1
-                if depth == 0:
-                    args = _split_top_args(pseudocode[i + 1 : j])
-                    out.append(args[pos].strip() if pos < len(args) else None)
-                    break
+        # one entry per call, an unreadable one included (all None): entry N must stay call N
+        args = call_args_at(pseudocode, i)
+        out.append(
+            [args[p].strip() if args is not None and p < len(args) else None for p in positions]
+        )
     return out
 
 
@@ -440,7 +396,7 @@ def all_path_calls_literal(
     path_args = _iter_path_args(pseudocode, sink_name, stub_names)
     if not path_args:
         return False  # the call could not be located -> do not mark constant
-    return all(a is not None and bool(_FMT_LITERAL_RE.match(a)) for a in path_args)
+    return all(a is not None and bool(_FMT_LITERAL_RE.match(a)) for call in path_args for a in call)
 
 
 def path_arg_ident(
@@ -460,17 +416,18 @@ def path_arg_ident(
     ``occurrence=None`` keeps the function-level reading (first non-literal across all calls) for
     callers that hold no callsite.
     """
-    args = _iter_path_args(pseudocode, sink_name, stub_names)
+    calls = _iter_path_args(pseudocode, sink_name, stub_names)
     if occurrence is not None:
-        if occurrence < 0 or occurrence >= len(args):
+        if occurrence < 0 or occurrence >= len(calls):
             return None
-        args = [args[occurrence]]
-    for arg in args:
-        if arg is None or _FMT_LITERAL_RE.match(arg):
-            continue
-        ident = _IDENT_RE.search(arg)
-        if ident is not None:
-            return ident.group(0)
+        calls = [calls[occurrence]]
+    for call in calls:
+        for arg in call:  # every path argument: rename's destination as much as its source
+            if arg is None or _FMT_LITERAL_RE.match(arg):
+                continue
+            ident = _IDENT_RE.search(arg)
+            if ident is not None:
+                return ident.group(0)
     return None
 
 
@@ -498,6 +455,50 @@ def _literal_spans(text: str) -> tuple[tuple[int, int], ...]:
         else:
             i += 1
     return tuple(spans)
+
+
+def call_args_at(pseudocode: str, open_paren: int) -> list[str] | None:
+    """The top-level argument texts (unstripped) of the call whose ``(`` is at ``open_paren``, or
+    None when it never closes (a truncated body: no argument of it can be trusted).
+
+    THE argument splitter every per-call reader shares. String and character literals are skipped
+    whole — the same spans ``_literal_spans`` reads — so a ``(``, ``)`` or ``,`` written inside
+    ``"…"`` or ``'…'`` neither opens, closes nor splits anything. Matching parentheses by bare
+    characters let ``printf("done)\\n")`` close early and hand the NEXT call's arguments to this
+    one. ``f()`` has no arguments: ``[]``."""
+    n = len(pseudocode)
+    args: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    i = open_paren
+    while i < n:
+        ch = pseudocode[i]
+        if ch == '"' or ch == "'":
+            j = i + 1
+            while j < n and pseudocode[j] != ch and pseudocode[j] != "\n":
+                j += 2 if pseudocode[j] == "\\" else 1
+            end = min(j + 1, n)
+            buf.append(pseudocode[i:end])
+            i = end
+            continue
+        if ch in "([{":
+            depth += 1
+            if depth > 1:
+                buf.append(ch)
+        elif ch in ")]}":
+            depth -= 1
+            if depth == 0:
+                if args or "".join(buf).strip():
+                    args.append("".join(buf))
+                return args
+            buf.append(ch)
+        elif ch == "," and depth == 1:
+            args.append("".join(buf))
+            buf = []
+        elif depth >= 1:
+            buf.append(ch)
+        i += 1
+    return None
 
 
 def _is_phantom_offset(paren_off: int, decl_end: int, spans: tuple[tuple[int, int], ...]) -> bool:

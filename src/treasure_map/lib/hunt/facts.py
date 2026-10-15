@@ -122,7 +122,9 @@ def _signature_params(pseudocode: str) -> set[str]:
     return {s for s in signature_slots(pseudocode) if s is not None}
 
 
-def fmt_wrapper_format_index(pseudocode: str, wrapped_sink: str) -> int | None:
+def fmt_wrapper_format_index(
+    pseudocode: str, wrapped_sink: str, stub_names: Mapping[int, str] | None = None
+) -> int | None:
     """The POSITION of a thin fmt wrapper's format parameter in its own signature, or None.
 
     Pairs with ``is_thin_fmt_wrapper``, which answers "is this a fmt wrapper, and which sink" but
@@ -136,8 +138,8 @@ def fmt_wrapper_format_index(pseudocode: str, wrapped_sink: str) -> int | None:
     because a guessed position reads a DIFFERENT value than the one that reaches the sink.
 
     Indexed over ``signature_slots``, so an unnamed slot occupies its position instead of shifting
-    the parameters after it."""
-    ident = locate_format_arg(pseudocode, wrapped_sink)
+    the parameters after it. ``stub_names`` as in ``is_thin_fmt_wrapper``."""
+    ident = locate_format_arg(pseudocode, wrapped_sink, stub_names)
     if ident is None:
         return None
     slots = signature_slots(pseudocode)
@@ -212,6 +214,7 @@ def is_thin_fmt_wrapper(
     callees: list[str],
     *,
     max_statements: int = _WRAPPER_MAX_STATEMENTS,
+    stub_names: Mapping[int, str] | None = None,
 ) -> tuple[bool, str | None]:
     """Recognize a thin format-string-forwarding wrapper. Returns (is_wrapper, wrapped_sink).
 
@@ -232,6 +235,10 @@ def is_thin_fmt_wrapper(
     (even with a forwarded data argument) is rejected. locate_format_arg enforces this: it skips
     every literal-format call and yields an identifier only from a non-literal format position.
 
+    ``stub_names`` lets step 2 read a sink call the decompiler rendered as ``FUN_<stub-addr>(…)``,
+    exactly as in ``is_thin_cmd_wrapper``: the callee list already says ``syslog``, but without
+    the table the call itself is invisible in the text.
+
     Structural fact only: it does NOT assert the forwarded format is attacker-controlled. Returns
     (False, None) under any doubt. See the module docstring."""
     fmt_sinks = sorted({c.strip() for c in callees} & FMT_STRING)
@@ -245,7 +252,7 @@ def is_thin_fmt_wrapper(
     for sink in fmt_sinks:
         # The identifier at the FORMAT position (per-sink index), skipping literal-format calls.
         # None => every call to this sink passed a literal format (safe) or was unreadable.
-        arg = locate_format_arg(pseudocode, sink)
+        arg = locate_format_arg(pseudocode, sink, stub_names)
         if arg is None:
             continue
         is_param = arg in params or _CALLER_SUPPLIED_RE.fullmatch(arg) is not None

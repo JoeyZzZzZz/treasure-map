@@ -63,15 +63,20 @@ def test_caller_of_thin_wrapper_becomes_candidate() -> None:
     assert c.wrapped_sink == "system"
 
 
-def test_function_with_direct_cmd_sink_is_not_propagated() -> None:
-    # Already a direct command candidate (the shape scan owns it) -> not recovered here.
+def test_a_direct_cmd_sink_does_not_hide_the_wrapper_call_beside_it() -> None:
+    """The direct system(c) is its own candidate; do_cmd(c) is another call and another lead.
+
+    MUTATION: skip a function's wrapper calls when it also calls a sink of the axis -> RED."""
     direct = _fn(
         2,
         "has_system",
         'void has_system(char* p){ char c[64]; snprintf(c,64,"%s",p); system(c); do_cmd(c); }',
         ["snprintf", "system", "do_cmd"],
     )
-    assert find_wrapper_propagated_candidates([_WRAPPER, direct]) == []
+    cands = find_wrapper_propagated_candidates([_WRAPPER, direct])
+    assert [(c.func.name, c.wrapper_name, c.occurrence) for c in cands] == [
+        ("has_system", "do_cmd", 0)
+    ]
 
 
 def test_wrapper_itself_is_not_a_propagated_candidate() -> None:
@@ -198,15 +203,18 @@ def test_caller_of_thin_fmt_wrapper_becomes_fmt_candidate() -> None:
     assert c.sink_class == "fmt_string"
 
 
-def test_function_with_direct_fmt_sink_is_not_propagated() -> None:
-    # Already a direct format-string candidate (the shape scan owns it) -> not recovered here.
+def test_a_direct_fmt_sink_does_not_hide_the_wrapper_call_beside_it() -> None:
+    """MUTATION: skip a function's wrapper calls when it also calls a sink of the axis -> RED."""
     direct = _fn(
         2,
         "has_fmt",
         "void has_fmt(char* p){ fprintf(stderr, p, 0); log_msg(p); }",
         ["fprintf", "log_msg"],
     )
-    assert find_wrapper_propagated_candidates([_FMT_WRAPPER, direct]) == []
+    cands = find_wrapper_propagated_candidates([_FMT_WRAPPER, direct])
+    assert [(c.func.name, c.wrapper_name, c.sink_class) for c in cands] == [
+        ("has_fmt", "log_msg", "fmt_string")
+    ]
 
 
 def test_cross_binary_fmt_wrapper_is_not_propagated() -> None:
@@ -294,14 +302,15 @@ def test_one_candidate_per_call_in_text_order() -> None:
     ]
 
 
-def test_direct_sink_on_the_axis_skips_every_wrapper_call() -> None:
+def test_every_wrapper_call_is_kept_beside_a_direct_sink() -> None:
     caller = _fn(
         9,
         "both",
         "void both(void){ system(a); do_cmd(b); do_cmd(c); }",
         ["system", "do_cmd"],
     )
-    assert find_wrapper_propagated_candidates([_WRAPPER, caller]) == []
+    cands = find_wrapper_propagated_candidates([_WRAPPER, caller])
+    assert [(c.wrapper_name, c.occurrence) for c in cands] == [("do_cmd", 0), ("do_cmd", 1)]
 
 
 def test_unlocatable_wrapper_call_keeps_one_function_level_candidate() -> None:
@@ -335,3 +344,25 @@ def test_calls_are_counted_with_the_stub_table_the_readers_use() -> None:
     assert [c.occurrence for c in cands] == [0, 1]
     read = [_wrapper_sink_arg(pc, "do_cmd", None, stubs, c.occurrence) for c in cands]
     assert read == ["first", "second"]
+
+
+def test_a_fmt_wrapper_whose_sink_call_is_stub_rendered_is_found_with_the_stub_table() -> None:
+    """The format-string twin of the command case: `FUN_00412000(3, param_1)` is syslog in a
+    stripped MIPS binary, and only the stub table says so.
+
+    MUTATION: stop passing `stub_names` to is_thin_fmt_wrapper (or to fmt_wrapper_format_index)
+    in find_wrapper_propagated_candidates -> no candidate, or no format position -> RED."""
+    wrapper = _fn(
+        1, "log_msg", "void log_msg(char* param_1){ FUN_00412000(3, param_1); }", ["syslog"]
+    )
+    caller = _fn(
+        2,
+        "on_event",
+        "void on_event(char* param_1){ log_msg(param_1); }",
+        ["log_msg"],
+    )
+    assert find_wrapper_propagated_candidates([wrapper, caller]) == []
+    cands = find_wrapper_propagated_candidates([wrapper, caller], {1: {0x412000: "syslog"}})
+    assert _names(cands) == {"on_event"}
+    assert cands[0].wrapped_sink == "syslog"
+    assert cands[0].format_param_index == 0

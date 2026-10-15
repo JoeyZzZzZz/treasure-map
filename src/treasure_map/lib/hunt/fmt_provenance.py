@@ -36,7 +36,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from treasure_map.lib.pattern.classes import call_offsets
+from treasure_map.lib.pattern.classes import call_args_at, call_offsets
 
 # The literal escapes a decompiler emits inside a C string, mapped back to the byte they stand for.
 # Only these; an unknown escape keeps its backslash rather than being silently dropped.
@@ -60,9 +60,10 @@ def call_arguments(
     """The argument expressions of the ``occurrence``-th call to ``callee`` (0-based, default the
     first), split at top level. None when that call does not exist.
 
-    Depth- and string-aware, unlike a plain ``split(",")``: a nested call
-    (``log(2, "%s", f(a, b))``) and a comma inside a string literal both keep their argument
-    together, so argument N is really argument N. Returns None when the call is not found.
+    Depth- and literal-aware (``classes.call_args_at``), unlike a plain ``split(",")``: a nested
+    call (``log(2, "%s", f(a, b))``) and a comma or parenthesis inside a string or character literal
+    all keep their argument together, so argument N is really argument N. Returns None when the
+    call is not found or never closes; ``f()`` reads as no arguments.
 
     The call is located through ``call_offsets``, the one authority the callsite enumerator counts
     with, so a call the decompiler rendered as ``FUN_<addr>(…)`` is found too when ``stub_names``
@@ -73,39 +74,9 @@ def call_arguments(
     offsets = call_offsets(pseudocode, callee, stub_names)
     if occurrence < 0 or occurrence >= len(offsets):
         return None
-    args: list[str] = []
-    current: list[str] = []
-    depth = 1
-    in_string = False
-    escaped = False
-    for ch in pseudocode[offsets[occurrence] + 1 :]:
-        if in_string:
-            current.append(ch)
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == '"':
-                in_string = False
-            continue
-        if ch == '"':
-            in_string = True
-            current.append(ch)
-        elif ch in "([{":
-            depth += 1
-            current.append(ch)
-        elif ch in ")]}":
-            depth -= 1
-            if depth == 0:
-                args.append("".join(current))
-                return [a.strip() for a in args]
-            current.append(ch)
-        elif ch == "," and depth == 1:
-            args.append("".join(current))
-            current = []
-        else:
-            current.append(ch)
-    return None  # unterminated call: the body was truncated, so no argument list is trustworthy
+    # None for an unterminated call: the body was truncated, so no argument list is trustworthy
+    args = call_args_at(pseudocode, offsets[occurrence])
+    return None if args is None else [a.strip() for a in args]
 
 
 def _string_literal(expr: str) -> str | None:

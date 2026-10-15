@@ -35,7 +35,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from treasure_map.lib.pattern.classes import FORMAT, call_offsets
+from treasure_map.lib.pattern.classes import FORMAT, call_args_at, call_offsets
 from treasure_map.lib.reachability.taint import _IDENT_RE
 
 # Size-source kinds (mechanism labels, not verdicts).
@@ -183,43 +183,6 @@ def copy_size_form_note(kind: str) -> str | None:
     return _FORM_NOTE.get(kind)
 
 
-def _split_top(arglist: str) -> list[str]:
-    """Split a call's argument text on top-level commas (respecting strings / parens / brackets)."""
-    parts: list[str] = []
-    depth = 0
-    in_str = False
-    buf: list[str] = []
-    i = 0
-    while i < len(arglist):
-        ch = arglist[i]
-        if in_str:
-            buf.append(ch)
-            if ch == "\\" and i + 1 < len(arglist):
-                buf.append(arglist[i + 1])
-                i += 2
-                continue
-            if ch == '"':
-                in_str = False
-        elif ch == '"':
-            in_str = True
-            buf.append(ch)
-        elif ch in "([":
-            depth += 1
-            buf.append(ch)
-        elif ch in ")]":
-            depth -= 1
-            buf.append(ch)
-        elif ch == "," and depth == 0:
-            parts.append("".join(buf))
-            buf = []
-        else:
-            buf.append(ch)
-        i += 1
-    if buf:
-        parts.append("".join(buf))
-    return parts
-
-
 def _call_args(
     pseudocode: str, name: str, occurrence: int, stub_names: Mapping[int, str] | None = None
 ) -> list[str] | None:
@@ -239,17 +202,21 @@ def _call_args(
     offsets = call_offsets(pseudocode, name, stub_names)
     if occurrence < 0 or occurrence >= len(offsets):
         return None
-    i = offsets[occurrence]  # at the '('
-    depth = 0
-    for j in range(i, len(pseudocode)):
-        ch = pseudocode[j]
-        if ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-            if depth == 0:
-                return _split_top(pseudocode[i + 1 : j])
-    return None
+    return call_args_at(pseudocode, offsets[occurrence])
+
+
+_SIZEOF_TERM_RE = re.compile(r"\bsizeof\s*\((?:[^()]|\([^()]*\))*\)|\bsizeof\s+[A-Za-z_]\w*")
+_NUMBER_RE = re.compile(r"\b(?:0[xX][0-9a-fA-F]+|\d+)[uUlL]*\b")
+
+
+def _is_sizeof_expr(size: str) -> bool:
+    """A length built only from ``sizeof`` terms and numeric literals (``sizeof(dst)``,
+    ``sizeof(dst) - 1``) — fixed at compile time. Any other name in it makes it a variable length:
+    ``n * sizeof(int)`` and ``len - sizeof(hdr)`` are as long as ``n`` and ``len`` say."""
+    if "sizeof" not in size:
+        return False
+    rest = _NUMBER_RE.sub(" ", _SIZEOF_TERM_RE.sub(" ", size))
+    return _IDENT_RE.search(rest) is None
 
 
 def _lead_ident(text: str) -> str | None:
@@ -371,7 +338,7 @@ def classify_format_size(
     size = args[pos].strip()
     if _NUM_LITERAL_RE.match(size):
         return CopySize(const_kind, size, None)
-    if "sizeof" in size:
+    if _is_sizeof_expr(size):
         # A sizeof still bounds only the WRITE here, not the destination's capacity relative to
         # what gets formatted into it, so it stays a cap/append kind rather than borrowing the
         # copy path's sizeof — which does carry a form note and would demote this.
@@ -425,7 +392,7 @@ def classify_copy_size(
     size = args[2].strip()
     if _NUM_LITERAL_RE.match(size):
         return CopySize(SIZE_CONST, size, None)
-    if "sizeof" in size:
+    if _is_sizeof_expr(size):
         if sink_name in _WIDE_ELEMENT_COPY:
             # A wide-character copy takes an element count; sizeof(dst) is bytes, so it is the
             # classic unit error, not a size-of bound. Keep it live rather than demote it.

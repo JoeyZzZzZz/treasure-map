@@ -620,3 +620,80 @@ def test_a_constant_command_named_after_its_stub_is_recognised() -> None:
         detect_form_signal(**kwargs, stub_names={0x4125B0: "system"})  # type: ignore[arg-type]
         == CONST_SINK_ARG
     )
+
+
+# ── caller_constant: the parameter, every call, every caller ─────────────────────────
+
+
+def _cc(pc: str, caller: str, sink_arg: str | None, **kw: object) -> str | None:
+    return detect_form_signal(
+        sink_name="system",
+        pseudocode=pc,
+        callees=["system"],
+        sink_arg=sink_arg,
+        func_name="run",
+        callers_pseudocode=[caller],
+        **kw,  # type: ignore[arg-type]
+    )
+
+
+def test_a_second_call_with_a_variable_is_not_caller_constant() -> None:
+    """MUTATION: read only each caller's first call -> RED."""
+    pc = "void run(char *param_1){ system(param_1); }"
+    caller = 'void boot(void){ run("/etc/rc start"); run(websGetVar(wp,"cmd","")); }'
+    assert _cc(pc, caller, "param_1") is None
+
+
+def test_the_danger_value_must_be_the_parameter_itself() -> None:
+    """The callers pass param_1; the sink runs a global. What callers pass is not what reaches the
+    sink.
+
+    MUTATION: drop the 'sink argument is a parameter' check -> RED."""
+    pc = "void run(int param_1){ log_level(param_1); system(g_cmd); }"
+    assert _cc(pc, "void boot(void){ run(1); }", "g_cmd") is None
+
+
+def test_only_the_sinks_parameter_position_is_checked() -> None:
+    pc = "void run(char *param_1, char *param_2){ log(param_1); system(param_2); }"
+    assert _cc(pc, 'void h(char *q){ run(q, "/etc/rc start"); }', "param_2") == CALLER_CONSTANT
+
+
+def test_a_rewritten_parameter_is_not_caller_constant() -> None:
+    """MUTATION: ignore writes to the parameter in the body -> RED."""
+    pc = 'void run(char *param_1){ param_1 = nvram_get("x"); system(param_1); }'
+    assert _cc(pc, 'void boot(void){ run("/etc/rc"); }', "param_1") is None
+
+
+def test_a_function_whose_address_is_taken_is_not_caller_constant() -> None:
+    """A callback has callers no call site shows.
+
+    MUTATION: drop the address-taken check -> RED."""
+    pc = "void run(char *param_1){ system(param_1); }"
+    caller = 'void boot(void){ run("/etc/rc"); register_handler("x", run); }'
+    assert _cc(pc, caller, "param_1") is None
+
+
+def test_no_shell_exec_is_a_command_axis_note_only() -> None:
+    """A path candidate in a function whose only command sinks are exec-family must not carry the
+    command-side note (it also blocked the path's own literal check).
+
+    MUTATION: emit no_shell_exec for any sink class -> RED."""
+    pc = 'void f(char *param_1){ execv("/bin/x", argv); fopen(param_1, "r"); }'
+    common = dict(pseudocode=pc, callees=["execv", "fopen"], sink_arg="param_1")
+    assert detect_form_signal(sink_name="execv", sink_class="cmd", **common) == "no_shell_exec"  # type: ignore[arg-type]
+    assert detect_form_signal(sink_name="fopen", sink_class="path_sink", **common) is None  # type: ignore[arg-type]
+
+
+def test_a_dosystem_template_with_a_variable_is_not_a_constant_command() -> None:
+    """doSystem("ifconfig %s up", name) runs what name holds; the literal is only the template.
+
+    MUTATION: accept any literal first argument for doSystem -> RED."""
+
+    def note(pc: str) -> str | None:
+        return detect_form_signal(
+            sink_name="doSystem", pseudocode=pc, callees=["doSystem"], sink_arg=None
+        )
+
+    assert note('void f(char *n){ doSystem("ifconfig %s up", n); }') is None
+    assert note('void f(void){ doSystem("ifconfig %s up", "br0"); }') == CONST_SINK_ARG
+    assert note('void f(void){ doSystem("reboot 100%% now"); }') == CONST_SINK_ARG

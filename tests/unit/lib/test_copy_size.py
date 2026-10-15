@@ -404,3 +404,14 @@ def test_objsize_fact_reads_a_stub_rendered_call() -> None:
     assert objsize_fact(pc, "__memcpy_chk")["objsize_arg"] is None  # type: ignore[index]
     fact = objsize_fact(pc, "__memcpy_chk", stub_names={0x412000: "__memcpy_chk"})
     assert fact == {"objsize_arg": "0xffffffff", "unbounded": True}
+
+
+def test_a_sizeof_mixed_with_a_variable_is_not_a_sizeof_bound() -> None:
+    """``n * sizeof(int)`` is as long as n says; only sizeof terms and literals are fixed.
+
+    MUTATION: treat any length mentioning sizeof as a sizeof bound -> RED."""
+    for expr in ("n * sizeof(int)", "len - sizeof(hdr)", "sizeof(hdr) + len"):
+        cs = classify_copy_size(f"memcpy(dst, src, {expr});", "memcpy")
+        assert cs.kind != SIZE_SIZEOF and copy_size_form_note(cs.kind) is None, expr
+    for expr in ("sizeof(dst)", "sizeof(dst) - 1", "sizeof(a) / sizeof(a[0])", "0x10 + sizeof(x)"):
+        assert classify_copy_size(f"memcpy(dst, src, {expr});", "memcpy").kind == SIZE_SIZEOF, expr

@@ -832,14 +832,27 @@ def _flatten_exec_edges(
 
 
 def _exec_scan_status(
-    edge_rows: list[ExecEdgeRow], all_funcs: list[FuncRow], source_run_id: str
+    edge_rows: list[ExecEdgeRow],
+    all_funcs: list[FuncRow],
+    source_run_id: str,
+    sink_prov_by_func: Mapping[int, list[dict[str, Any]]] | None = None,
 ) -> list[DetectorScanStatusRow]:
     """One honesty row per binary for the launch-edge pass, written EVEN AT zero edges.
 
     Without it an empty result reads as a confident "this binary launches nothing", which would be
     wrong in every one of the ways ``unsupported_note`` lists — most sharply for a binary whose
     command sinks all sit behind a thin wrapper, where the pass genuinely cannot see the callsite.
-    A binary with no functions at all still gets a row: it was in scope, and the scan ran."""
+    A binary with no functions at all still gets a row: it was in scope, and the scan ran.
+
+    ``scanned`` is 0 for a binary in which some function calls a command sink but was not read —
+    no pseudocode (the decompiler failed on it) or no recorded provenance — because its launches
+    are exactly the ones this pass could not see."""
+    prov = sink_prov_by_func or {}
+    unread = {
+        f.binary_name
+        for f in all_funcs
+        if set(_parse_callees(f.callees)) & CMD and not (f.pseudocode and prov.get(f.func_id))
+    }
     found: dict[str | None, int] = {}
     for row in edge_rows:
         found[row.launcher_binary] = found.get(row.launcher_binary, 0) + 1
@@ -854,7 +867,7 @@ def _exec_scan_status(
             binary=binary,
             binary_path=paths.get(binary),
             detector="exec_argv",
-            scanned=1,
+            scanned=0 if binary in unread else 1,
             supported_scope="system/popen/doSystem command strings + execl*/execv* arg0",
             unsupported_note=UNSUPPORTED_NOTE,
             cap_hit=0,
@@ -1268,7 +1281,9 @@ def run_analyzer2(
     detector_status_rows = _flatten_detector_status(db_path, source_run_id)
     # Launch-edge honesty status (per binary), written even at zero edges — an empty result must
     # not read as "this binary launches nothing" when the pass has known structural gaps.
-    detector_status_rows += _exec_scan_status(exec_edge_rows, all_funcs, source_run_id)
+    detector_status_rows += _exec_scan_status(
+        exec_edge_rows, all_funcs, source_run_id, sink_prov_by_func
+    )
     # ONE-HOP string-key leads: which candidates sit one direct call below an edge callee. Computed
     # here because the call graph lives in the analysis DB (the atlas holds no callgraph), and rides
     # to the reachability layer on flow_evidence — the same compute-at-hunt/read-at-triage path as
@@ -1431,6 +1446,19 @@ def run_analyzer2(
                 # POINTER, and a note attached from it would demote on a reading of the wrong
                 # value). Their FP-suppression lives elsewhere: copy and format in the size grade,
                 # the format-string literal exemption in the recall detector.
+                # Path/file sinks: a string-literal PATH argument is a compile-time constant
+                # (proven-safe). _sink_arg_is_literal (the cmd axis) is shell-gated and reads arg0,
+                # so it misses a path literal; mark it on the path axis here. The demotion iron law
+                # then sinks a hard-coded path (fopen("/etc/x")) out of the first screen. Read
+                # BEFORE the one-hop caller hint below, which must never stand in front of a
+                # call's own literal.
+                if (
+                    blocking is None
+                    and match.sink_class == "path_sink"
+                    and sink_name is not None
+                    and all_path_calls_literal(row.pseudocode, sink_name, stub_names)
+                ):
+                    blocking = CONST_SINK_ARG
                 if blocking is None and match.sink_class not in ("copy", "fmt_string", "format"):
                     callers_pc = [
                         funcs[cid].pseudocode or ""
@@ -1446,18 +1474,8 @@ def run_analyzer2(
                         callers_pseudocode=callers_pc,
                         stub_names=stub_names,
                         occurrence=copy_occurrence,
+                        sink_class=match.sink_class,
                     )
-                # Path/file sinks: a string-literal PATH argument is a compile-time constant
-                # (proven-safe). _sink_arg_is_literal (the cmd axis) is shell-gated and reads arg0,
-                # so it misses a path literal; mark it on the path axis here. The demotion iron law
-                # then sinks a hard-coded path (fopen("/etc/x")) out of the first screen.
-                if (
-                    blocking is None
-                    and match.sink_class == "path_sink"
-                    and sink_name is not None
-                    and all_path_calls_literal(row.pseudocode, sink_name, stub_names)
-                ):
-                    blocking = CONST_SINK_ARG
                 # Recall fallback: a bare sink with no recognized in-function source (and no
                 # constructed shell command — cmd_injection_shape is exempt; its shell-ish literal
                 # is signal enough that the value may be caller-supplied) is listed but ranked low.

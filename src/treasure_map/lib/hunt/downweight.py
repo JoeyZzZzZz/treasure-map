@@ -31,8 +31,17 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 
+from treasure_map.lib.hunt.facts import signature_slots
 from treasure_map.lib.hunt.fmt_provenance import _string_literal, call_arguments
-from treasure_map.lib.pattern.classes import CMD, COPY, FORMAT, SOURCE, call_offsets
+from treasure_map.lib.pattern.classes import (
+    CMD,
+    COPY,
+    FORMAT,
+    SOURCE,
+    _literal_spans,
+    call_args_at,
+    call_offsets,
+)
 from treasure_map.lib.reachability.taint import _IDENT_RE, flows_into, free_taint_reaches
 
 # Leading callee name of a call expression (used to find builder calls in a statement).
@@ -61,6 +70,24 @@ _SHELL_TARGET_RE = re.compile(r'"/bin/sh"|"/bin/bash"|"-c"')
 # their first argument is the program path (a constant path is normal) and the controllable argv
 # is a later argument, so a literal first argument says nothing about the dangerous value.
 _SHELL_RUN_SINKS: frozenset[str] = frozenset({"system", "popen", "doSystem"})
+
+# Shell-running sinks whose first argument is a printf-style TEMPLATE, the command being the
+# template with its varargs spliced in: doSystem("ifconfig %s up", name) runs whatever name holds.
+_TEMPLATE_CMD_SINKS: frozenset[str] = frozenset({"doSystem"})
+_CONVERSION_RE = re.compile(r"%(?!%)")
+
+
+def _splices_a_variable(pseudocode: str, offset: int) -> bool:
+    """The template call at ``offset`` has a conversion and a non-literal argument to fill it —
+    or cannot be read, which counts the same."""
+    args = call_args_at(pseudocode, offset)
+    if not args:
+        return True
+    template = args[0].strip().replace("%%", "")
+    if not _CONVERSION_RE.search(template):
+        return False
+    return any(not _LITERAL_ARG_RE.match(a) for a in args[1:])
+
 
 # Numeric conversion / digit-check callees: a value passed through one is constrained to a
 # number and cannot carry shell syntax.
@@ -175,6 +202,8 @@ def _sink_arg_is_literal(
         return False
     if not _call_opens_with_a_string_literal(pseudocode, offsets[occurrence]):
         return False
+    if sink_name in _TEMPLATE_CMD_SINKS and _splices_a_variable(pseudocode, offsets[occurrence]):
+        return False  # a constant template is not a constant command: the vararg is the danger
     # Parameter-specific guard: a free value reaching this candidate's sink argument means the
     # literal above is a different callsite — do not downweight this (tainted) candidate.
     if sink_arg is not None and free_taint_reaches(pseudocode, sink_arg, safe_vars=set()):
@@ -248,10 +277,8 @@ def _inline_constrained_results(pseudocode: str, converters: frozenset[str]) -> 
 
     for stmt in re.split(r"[;\n{}]", pseudocode):
         for name in {m.group(1) for m in _CALL_RE_HEAD.finditer(stmt)} & builders:
-            args = _call_arglist(stmt, name)
-            if args is None:
-                continue
-            parts = _split_args(args)
+            offsets = call_offsets(stmt, name)
+            parts = call_args_at(stmt, offsets[0]) if offsets else None
             if not parts:
                 continue
             dst_ident = _IDENT_RE.search(parts[0])
@@ -290,93 +317,68 @@ def _value_is_constrained(pseudocode: str, sink_arg: str, converters: frozenset[
     return not free_taint_reaches(pseudocode, sink_arg, safe_vars=safe)
 
 
-def _split_args(arglist: str) -> list[str]:
-    """Split a call's argument text on top-level commas (respecting string literals)."""
-    parts: list[str] = []
-    depth = 0
-    in_str = False
-    buf: list[str] = []
-    i = 0
-    while i < len(arglist):
-        ch = arglist[i]
-        if in_str:
-            buf.append(ch)
-            if ch == "\\" and i + 1 < len(arglist):
-                buf.append(arglist[i + 1])
-                i += 2
-                continue
-            if ch == '"':
-                in_str = False
-        elif ch == '"':
-            in_str = True
-            buf.append(ch)
-        elif ch in "([":
-            depth += 1
-            buf.append(ch)
-        elif ch in ")]":
-            depth -= 1
-            buf.append(ch)
-        elif ch == "," and depth == 0:
-            parts.append("".join(buf))
-            buf = []
-        else:
-            buf.append(ch)
-        i += 1
-    if buf:
-        parts.append("".join(buf))
-    return parts
-
-
 _LITERAL_ARG_RE = re.compile(r'^\s*(?:"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)\'|[+-]?\d[\w.]*)\s*$')
 
 
-def _all_args_literal(arglist: str) -> bool:
-    """True when EVERY argument is a string / char / numeric literal (no controllable identifier).
-
-    Bug2 fix — parameter-specific: a constant in some argument slot is not enough; a single
-    non-literal argument means a controllable value may reach the sink's dangerous parameter, so
-    `f("prefix", tainted)` must not be downweighted."""
-    args = _split_args(arglist)
-    if not args:
-        return False
-    return all(_LITERAL_ARG_RE.match(a) for a in args)
-
-
-def _call_arglist(caller_pseudocode: str, func_name: str) -> str | None:
-    """Return the paren-balanced argument text of the first call to func_name, or None."""
-    for m in re.finditer(rf"\b{re.escape(func_name)}\s*\(", caller_pseudocode):
-        i = m.end() - 1  # at the '('
-        depth = 0
-        for j in range(i, len(caller_pseudocode)):
-            ch = caller_pseudocode[j]
-            if ch == "(":
-                depth += 1
-            elif ch == ")":
-                depth -= 1
-                if depth == 0:
-                    return caller_pseudocode[i + 1 : j]
-    return None
+def _address_taken(src: str, name: str) -> bool:
+    """Whether ``src`` names ``name`` other than in a call — outside its own declaration line and
+    outside string/char literals: a function pointer has callers no call site shows."""
+    spans = _literal_spans(src)
+    decl_end = src.find("{")
+    for m in re.finditer(rf"\b{re.escape(name)}\b(?!\s*\()", src):
+        if decl_end != -1 and m.start() < decl_end:
+            continue
+        if any(lo <= m.start() <= hi for lo, hi in spans):
+            continue
+        return True
+    return False
 
 
 def _caller_only_constants(
-    func_name: str | None, callees: list[str], callers_pseudocode: list[str]
+    func_name: str | None,
+    callees: list[str],
+    callers_pseudocode: list[str],
+    *,
+    pseudocode: str = "",
+    sink_arg: str | None = None,
 ) -> bool:
-    """One-hop: the function pulls no in-function source and EVERY direct caller passes ONLY
-    string/numeric literals in its call to it (so the dangerous parameter is a caller constant).
+    """One-hop: the sink's dangerous argument IS one of this function's parameters, the function
+    neither reads external input nor rewrites that parameter, and EVERY call to it in EVERY
+    caller passes a string/numeric literal at that parameter's position.
 
-    Conservative — returns False when there are no callers, when any caller's call cannot be
-    located, or when any caller passes a non-literal argument (a controllable value could reach
-    the dangerous parameter; `f("prefix", tainted)` is NOT a caller constant). Strictly one hop
-    (no transitive propagation; multi-hop / cross-artifact constant tracing is L3, out of scope)."""
-    if not func_name or not callers_pseudocode:
+    Each condition closes a way a non-constant reached the sink while this read "constant":
+      * the dangerous argument must be the parameter itself — a value the body looks up or reads
+        from a global is not what the callers pass, whatever they pass;
+      * the parameter's own position is checked, at every call: a caller whose first call passes a
+        literal and whose second passes ``websGetVar(...)`` is a caller of the second kind too;
+      * a function whose name is also used other than as a call (its address taken — a callback,
+        a dispatch table) has callers this one hop cannot see.
+    Conservative everywhere else: no callers, a call that cannot be read, an unnamed or unknown
+    parameter all return False. Strictly one hop; it says nothing about callers of the callers,
+    and the caller set it is given may itself be incomplete — which is why this note is a ranking
+    hint and never a proof (see sink_impact.PROVABLY_CONSTANT_MARKERS)."""
+    if not func_name or not callers_pseudocode or sink_arg is None:
         return False
     if {c.strip() for c in callees} & SOURCE:
-        # the function takes external input directly; a constant caller arg is not the whole story
-        return False
+        return False  # the function takes external input directly
+    slots = signature_slots(pseudocode)
+    if sink_arg not in slots:
+        return False  # the dangerous value is not a parameter: what callers pass is not it
+    k = slots.index(sink_arg)
+    p = re.escape(sink_arg)
+    body = pseudocode[pseudocode.find("{") + 1 :]
+    if re.search(rf"\b{p}\s*(?:<<|>>|[-+*/%&|^])?=(?!=)|\+\+\s*{p}\b|\b{p}\s*(?:\+\+|--)", body):
+        return False  # the parameter is rewritten before the sink: callers pass something else
+    if re.search(rf"(?<!&)&\s*{p}\b", body):
+        return False  # handed out by address: a callee may rewrite it
     for caller_src in callers_pseudocode:
-        args = _call_arglist(caller_src, func_name)
-        if args is None or not _all_args_literal(args):
-            return False
+        offsets = call_offsets(caller_src, func_name)
+        if not offsets or _address_taken(caller_src, func_name):
+            return False  # no call to read, or named other than as a call (a callback, a table)
+        for off in offsets:
+            args = call_args_at(caller_src, off)
+            if args is None or k >= len(args) or not _LITERAL_ARG_RE.match(args[k]):
+                return False
     return True
 
 
@@ -390,6 +392,7 @@ def detect_form_signal(
     callers_pseudocode: list[str] | None = None,
     stub_names: Mapping[int, str] | None = None,
     occurrence: int = 0,
+    sink_class: str | None = None,
 ) -> str | None:
     """Return one neutral form note to downweight this candidate, or None.
 
@@ -397,12 +400,16 @@ def detect_form_signal(
     dangerous argument truly comes only from the recognized safe/constant source. Returns None
     under any doubt (no downweight), so recall is never reduced — a missed downweight only leaves
     a candidate at its normal score."""
-    if _caller_only_constants(func_name, callees, callers_pseudocode or []):
-        return CALLER_CONSTANT
+    # The call's own literal first: it is the per-callsite proof; caller_constant is a one-hop
+    # hint read from callers that may not all be known, and must not stand in front of it.
     if sink_name is not None and _sink_arg_is_literal(
         pseudocode, sink_name, sink_arg, stub_names, occurrence
     ):
         return CONST_SINK_ARG
+    if _caller_only_constants(
+        func_name, callees, callers_pseudocode or [], pseudocode=pseudocode, sink_arg=sink_arg
+    ):
+        return CALLER_CONSTANT
     if sink_arg is not None and _value_is_constrained(pseudocode, sink_arg, _NUMERIC_VALIDATORS):
         return NUMERIC_SANITIZED
     if sink_arg is not None and _charset_inline_constrained(pseudocode, sink_arg):
@@ -410,8 +417,8 @@ def detect_form_signal(
         # value laundered through an intermediate variable is not value-tracked (no chain to two
         # hops, three hops, …); the evidence layer marks it `charset_maybe` instead.
         return CHARSET_CONSTRAINED
-    if _exec_is_no_shell(callees, pseudocode):
-        return NO_SHELL_EXEC
+    if sink_class in (None, "cmd") and _exec_is_no_shell(callees, pseudocode):
+        return NO_SHELL_EXEC  # a statement about the COMMAND sinks: not one for a path or format
     return None
 
 

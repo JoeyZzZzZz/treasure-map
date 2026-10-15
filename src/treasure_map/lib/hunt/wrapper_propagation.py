@@ -19,9 +19,9 @@ rounds, so it must not re-explode the candidate set):
   (`f -> g -> W`), an indirect/function-pointer call, or a wrapper in a different binary is NOT
   propagated (a known blind spot left to the agent, not silently followed). Cross-binary is a
   separate, deliberately unaddressed gap here.
-- Per-axis skip: a function that already has a sink of THAT axis among its direct callees is
-  skipped — it is already a direct candidate on that axis; propagation only recovers the functions
-  whose sink of that kind is ONLY reachable through the wrapper.
+- Per call, not per function: a function that also calls a sink of the same axis directly keeps
+  its wrapper calls. Each call is its own candidate, and the direct sink's candidates name other
+  calls — a constant `system("reboot")` beside `do_cmd(user_value)` once hid the second entirely.
 - Name + same-binary match. The wrapper registry is keyed by (binary_id, function name); a callee
   name resolves to a wrapper only when a thin wrapper of that name exists in the SAME binary.
 
@@ -45,7 +45,7 @@ from treasure_map.lib.hunt.facts import (
     is_thin_cmd_wrapper,
     is_thin_fmt_wrapper,
 )
-from treasure_map.lib.pattern.classes import CMD, FMT_STRING, call_offsets
+from treasure_map.lib.pattern.classes import call_offsets
 
 
 @dataclass(frozen=True)
@@ -92,24 +92,21 @@ def _parse_callees(raw: str | None) -> list[str]:
 def _axis_candidates(
     f: FuncRow,
     callee_names: set[str],
-    direct_sinks: frozenset[str],
     wrappers: dict[tuple[int, str], tuple[str, int | None, str | None]],
     sink_class: str,
     stub_names: Mapping[int, str] | None,
 ) -> list[WrapperCandidate]:
     """Recover ``f`` on one sink axis: one candidate per CALL to a same-binary wrapper.
 
-    ``f`` is skipped entirely when it has a direct sink of this axis (already a direct candidate).
-    Otherwise every wrapper it calls (by name, deterministic) contributes one candidate per call to
-    it, in text order — each call forwards its own argument, so each is its own lead. The calls are
+    Every wrapper it calls (by name, deterministic) contributes one candidate per call to it, in
+    text order, whether or not ``f`` also calls a sink of this axis directly (those calls are their
+    own candidates) — each call forwards its own argument, so each is its own lead. The calls are
     counted with ``call_offsets`` and the SAME ``stub_names`` every per-call reader is later handed,
     so "the Nth call" here and the call whose argument gets read are the same call.
 
     When the callee list names a wrapper but no call to any of them can be found in the text (a
     call through a function pointer, ``(*ptr)(…)``), ONE function-level candidate is kept for the
     first wrapper by name, with ``occurrence`` None — never dropped, never guessed onto a call."""
-    if callee_names & direct_sinks:
-        return []  # already a direct candidate on this axis (the shape scan owns it)
     called = sorted(
         (name, wrappers[(f.binary_id, name)])
         for name in callee_names
@@ -154,7 +151,7 @@ def find_wrapper_propagated_candidates(
 ) -> list[WrapperCandidate]:
     """Return the calls, in every binary, through which a function reaches a sink of a given axis
     one hop away — via a thin wrapper in the same binary — on BOTH the command and the format-string
-    axis, for functions with no direct sink of that axis.
+    axis, whether or not the function also calls a sink of that axis directly.
 
     One candidate per (axis, wrapper, call): ``occurrence`` is the call's 0-based ordinal among the
     function's calls to that wrapper in TEXT order (not address order). A function whose wrappers
@@ -182,7 +179,7 @@ def find_wrapper_propagated_candidates(
         is_cmd, cmd_sink = is_thin_cmd_wrapper(f.pseudocode, callees, stub_names=stub_names)
         if is_cmd and cmd_sink is not None:
             cmd_wrappers[(f.binary_id, f.name)] = (cmd_sink, None, f.address)
-        is_fmt, fmt_sink = is_thin_fmt_wrapper(f.pseudocode, callees)
+        is_fmt, fmt_sink = is_thin_fmt_wrapper(f.pseudocode, callees, stub_names=stub_names)
         if is_fmt and fmt_sink is not None:
             # The format position is recorded HERE, with the wrapper's own body in hand. Doing it
             # later, from the candidate, would mean finding the wrapper by name again — and a name
@@ -191,19 +188,17 @@ def find_wrapper_propagated_candidates(
             # function. The registry key is (binary_id, name), so this cannot happen.
             fmt_wrappers[(f.binary_id, f.name)] = (
                 fmt_sink,
-                fmt_wrapper_format_index(f.pseudocode, fmt_sink),
+                fmt_wrapper_format_index(f.pseudocode, fmt_sink, stub_names),
                 f.address,
             )
 
-    # 2) Callers of a same-binary wrapper that have no direct sink of that axis of their own.
+    # 2) Every call to a same-binary wrapper.
     out: list[WrapperCandidate] = []
     for f in funcs:
         if not f.pseudocode:
             continue
         callee_names = {c.strip() for c in _parse_callees(f.callees) if c.strip()}
         stub_names = stub_by_binary.get(f.binary_id) if stub_by_binary else None
-        out.extend(_axis_candidates(f, callee_names, CMD, cmd_wrappers, "cmd", stub_names))
-        out.extend(
-            _axis_candidates(f, callee_names, FMT_STRING, fmt_wrappers, "fmt_string", stub_names)
-        )
+        out.extend(_axis_candidates(f, callee_names, cmd_wrappers, "cmd", stub_names))
+        out.extend(_axis_candidates(f, callee_names, fmt_wrappers, "fmt_string", stub_names))
     return out

@@ -1766,3 +1766,39 @@ def test_call_offsets_stripping_never_swallows_a_real_call() -> None:
     assert call_offsets(pc, "memcpy") == call_offsets(pc, "memcpy", strip_phantoms=False)
     assert len(call_offsets(pc, "memcpy")) == 2
     assert len(call_offsets(pc, "printf")) == 1
+
+
+# ── a path sink with two paths, and literals that contain parentheses ─────────────────
+
+
+def test_rename_is_constant_only_when_both_paths_are() -> None:
+    """rename("/tmp/x", param_1) moves a fixed file to wherever the caller says.
+
+    MUTATION: read only the source path of rename / renameat -> RED."""
+    from treasure_map.lib.pattern.classes import all_path_calls_literal, path_arg_ident
+
+    pc = 'void f(char *param_1){ rename("/tmp/x", param_1); }'
+    assert not all_path_calls_literal(pc, "rename")
+    assert path_arg_ident(pc, "rename", occurrence=0) == "param_1"
+    pc_at = 'void f(char *param_1){ renameat(0, "/tmp/x", 0, param_1); }'
+    assert not all_path_calls_literal(pc_at, "renameat")
+    assert all_path_calls_literal('void f(void){ rename("/tmp/a", "/tmp/b"); }', "rename")
+
+
+def test_a_parenthesis_inside_a_literal_does_not_end_the_call() -> None:
+    """fopen(q,"(") once read as `fopen(q,"` — and the NEXT call's path was handed to it.
+
+    MUTATION: match parentheses without skipping string / char literals -> RED."""
+    from treasure_map.lib.pattern.classes import (
+        all_format_calls_literal,
+        all_path_calls_literal,
+        format_call_is_risky,
+    )
+
+    pc = 'void f(char *q){ fopen(q, "("); fopen("/etc/x", "r"); }'
+    assert not all_path_calls_literal(pc, "fopen")
+    pf = 'void f(char *v){ printf("done)\\n"); printf(v); printf("(%d\\n", 3); printf(v); }'
+    assert [format_call_is_risky(pf, "printf", i) for i in range(4)] == [False, True, False, True]
+    assert not all_format_calls_literal(
+        'void f(char *q){ printf(q, "("); printf("ok %d", 1); }', "printf"
+    )

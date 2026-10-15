@@ -10,6 +10,7 @@ made it into the binary inventory.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import sqlite3
 from pathlib import Path
@@ -1273,3 +1274,21 @@ def test_an_ambiguous_target_grants_no_entry_site() -> None:
         assert enters_entry_reach(state) is False
     inv = _inventory(binaries={"helper": ("usr/sbin/helper", "opt/bin/helper")})
     assert exec_entry_sites(_edges([_prov("system", _const("helper -d"))], inventory=inv)) == {}
+
+
+def test_a_binary_with_an_unread_command_caller_is_not_scanned() -> None:
+    """A function that calls system but has no pseudocode (or no provenance) was not read; an
+    empty launched_by must not cover its binary as if it had been.
+
+    MUTATION: write scanned=1 whatever was read -> RED."""
+    from treasure_map.lib.hunt.analyzer2 import _exec_scan_status
+
+    read = _func(name="ok", binary="web_daemon", fid=1)
+    read = dataclasses.replace(read, pseudocode="void ok(){ system(x); }", callees='["system"]')
+    unread = _func(name="lost", binary="helper", fid=2)
+    unread = dataclasses.replace(unread, pseudocode="", callees='["system"]')
+    quiet = _func(name="plain", binary="busybox", fid=3)
+    rows = _exec_scan_status([], [read, unread, quiet], "run1", {1: [_const("/sbin/x")]})
+    assert {r.binary: r.scanned for r in rows} == {"web_daemon": 1, "helper": 0, "busybox": 1}
+    no_prov = _exec_scan_status([], [read], "run1", {})
+    assert [r.scanned for r in no_prov] == [0]

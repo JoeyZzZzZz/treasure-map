@@ -41,8 +41,8 @@ from treasure_map.lib.pattern.classes import (
     FMT_STRING_ARG,
     FORMAT_ARG,
     SOURCE,
-    _split_top_args,
     all_format_calls_literal,
+    call_args_at,
     call_offsets,
     format_string_ident,
 )
@@ -385,17 +385,7 @@ def _format_string_resolution(
     offsets = call_offsets(pseudocode, sink_name, stub_names)
     if occurrence < 0 or occurrence >= len(offsets):
         return FMT_UNRESOLVED
-    i = offsets[occurrence]
-    depth = 0
-    args: list[str] = []
-    for j in range(i, len(pseudocode)):
-        if pseudocode[j] == "(":
-            depth += 1
-        elif pseudocode[j] == ")":
-            depth -= 1
-            if depth == 0:
-                args = _split_top_args(pseudocode[i + 1 : j])
-                break
+    args = call_args_at(pseudocode, offsets[occurrence]) or []
     if pos >= len(args):
         return FMT_UNRESOLVED
     fmt = args[pos].strip()

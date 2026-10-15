@@ -135,7 +135,9 @@ UNSUPPORTED_NOTE = (
     "a program name from a command template widens which edges this covers without changing the "
     "proportion. A token naming several candidates (two scripts sharing a basename, a link with "
     "several targets) keeps its resolution state but no target_binary — look the basename up in "
-    "the script or link inventory to see the candidates."
+    "the script or link inventory to see the candidates. A binary whose status says scanned=0 has "
+    "at least one function that calls a command sink but was not read — no pseudocode (the "
+    "decompiler failed on it) or no recorded provenance — so launches from it can be missing."
 )
 
 

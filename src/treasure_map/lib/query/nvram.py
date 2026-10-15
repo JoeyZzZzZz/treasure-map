@@ -26,6 +26,9 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 # One printf conversion specifier: flags, width, precision, length modifier, then the conversion
@@ -159,6 +162,28 @@ COVERAGE_NOTE = (
 )
 
 
+# The run whose evidence a web_settable reading may use, when the caller did not name one: set by
+# ``run_scope`` around the reading of ONE candidate, so another firmware's front end can never make
+# this one's key read user-settable. None (no scope) reads the whole atlas, as before.
+_RUN_SCOPE: ContextVar[str | None] = ContextVar("web_settable_run", default=None)
+
+
+@contextmanager
+def run_scope(run_id: str | None) -> Iterator[None]:
+    """Inside the block, ``_web_settable`` reads only ``run_id``'s front-end fields, back-end keys
+    and router defaults."""
+    token = _RUN_SCOPE.set(run_id)
+    try:
+        yield
+    finally:
+        _RUN_SCOPE.reset(token)
+
+
+def _scoped(run_id: str | None) -> tuple[str, tuple[str, ...]]:
+    """(" AND source_run_id = ?", (run_id,)) — or nothing at all when unscoped."""
+    return (" AND source_run_id = ?", (run_id,)) if run_id is not None else ("", ())
+
+
 def _wl_normalize(key: str) -> str:
     """Collapse an indexed wireless-interface prefix (``wl0_`` / ``wl1_`` / ``wl%d_``) to the
     generic ``wl_`` the front-end templates use, so a back-end ``wl0_ssid`` can match a front-end
@@ -167,7 +192,7 @@ def _wl_normalize(key: str) -> str:
     return re.sub(r"^wl\d+_", "wl_", key)
 
 
-def _frontend_settable(conn: sqlite3.Connection, key: str) -> bool | str:
+def _frontend_settable(conn: sqlite3.Connection, key: str, run_id: str | None = None) -> bool | str:
     """Is ``key`` an editable front-end form field (web_form_fields, M1)? True/False/'uncertain'.
 
     ``uncertain`` when the front-end table is EMPTY (M1 not collected) — NEVER False (a
@@ -175,14 +200,18 @@ def _frontend_settable(conn: sqlite3.Connection, key: str) -> bool | str:
     ``http_username_x`` for a back-end ``http_username``): a variant MIGHT be the editable mirror,
     so 'not settable' is not asserted. A hit is exact or via the generic wl-index normalization."""
     try:
-        collected = conn.execute("SELECT 1 FROM web_form_fields LIMIT 1").fetchone() is not None
+        sql, args = _scoped(run_id)
+        collected = (
+            conn.execute(f"SELECT 1 FROM web_form_fields WHERE 1 = 1{sql} LIMIT 1", args).fetchone()  # noqa: S608
+            is not None
+        )
     except sqlite3.OperationalError:
         return "uncertain"  # table absent (older atlas / M1 not run) -> never 'not settable'
     if not collected:
         return "uncertain"  # front-end not collected -> unknown, never 'not settable'
     exact = conn.execute(
-        "SELECT 1 FROM web_form_fields WHERE field_keyword IN (?, ?) LIMIT 1",
-        (key, _wl_normalize(key)),
+        f"SELECT 1 FROM web_form_fields WHERE field_keyword IN (?, ?){sql} LIMIT 1",  # noqa: S608
+        (key, _wl_normalize(key), *args),
     ).fetchone()
     if exact is not None:
         return True
@@ -199,13 +228,15 @@ def _frontend_settable(conn: sqlite3.Connection, key: str) -> bool | str:
     #   with NO editable field at all (e.g. modem_apn: no name="modem_apn*" in the assets) is a true
     #   absence, not a mappable miss, and stays uncertain honestly.
     variant = conn.execute(
-        "SELECT 1 FROM web_form_fields WHERE field_keyword GLOB ? LIMIT 1",
-        (key + "_*",),
+        f"SELECT 1 FROM web_form_fields WHERE field_keyword GLOB ?{sql} LIMIT 1",  # noqa: S608
+        (key + "_*", *args),
     ).fetchone()
     return "uncertain" if variant is not None else False
 
 
-def _frontend_evidence(conn: sqlite3.Connection, key: str) -> list[dict[str, Any]]:
+def _frontend_evidence(
+    conn: sqlite3.Connection, key: str, run_id: str | None = None
+) -> list[dict[str, Any]]:
     """The web_form_fields rows backing a front-end match for ``key`` — the concrete evidence an
     agent drills into to CONFIRM the web reach or DEMOTE a keyword collision (``type`` etc. recur
     across assets). Each row carries the matched ``field_keyword`` + the ``source_asset`` it was
@@ -214,11 +245,13 @@ def _frontend_evidence(conn: sqlite3.Connection, key: str) -> list[dict[str, Any
     hit are the naming-variant (``key_*``) mirrors returned. [] when the table is absent/empty or
     nothing matches. This is the SAME join ``_frontend_settable`` decides the verdict from — the
     verdict is unchanged; this only exposes the rows behind it so the agent judges collisions."""
+    sql, args = _scoped(run_id)
     try:
         exact = conn.execute(
-            "SELECT field_keyword, source_asset, source_rule FROM web_form_fields "
-            "WHERE field_keyword IN (?, ?)",
-            (key, _wl_normalize(key)),
+            "SELECT field_keyword, source_asset, source_rule, source_run_id FROM web_form_fields "
+            f"WHERE field_keyword IN (?, ?){sql} "  # noqa: S608
+            "ORDER BY source_run_id, source_asset, field_keyword, source_rule",
+            (key, _wl_normalize(key), *args),
         ).fetchall()
     except sqlite3.OperationalError:
         return []  # table absent (older atlas / M1 not run)
@@ -228,57 +261,67 @@ def _frontend_evidence(conn: sqlite3.Connection, key: str) -> list[dict[str, Any
                 "field_keyword": r["field_keyword"],
                 "source_asset": r["source_asset"],
                 "source_rule": r["source_rule"],
+                "source_run_id": r["source_run_id"],
                 "match_kind": "exact",
             }
             for r in exact
         ]
     variant = conn.execute(
-        "SELECT field_keyword, source_asset, source_rule FROM web_form_fields "
-        "WHERE field_keyword GLOB ?",
-        (key + "_*",),
+        "SELECT field_keyword, source_asset, source_rule, source_run_id FROM web_form_fields "
+        f"WHERE field_keyword GLOB ?{sql} "  # noqa: S608
+        "ORDER BY source_run_id, source_asset, field_keyword, source_rule",
+        (key + "_*", *args),
     ).fetchall()
     return [
         {
             "field_keyword": r["field_keyword"],
             "source_asset": r["source_asset"],
             "source_rule": r["source_rule"],
+            "source_run_id": r["source_run_id"],
             "match_kind": "naming_variant",
         }
         for r in variant
     ]
 
 
-def _backend_nvram_key(conn: sqlite3.Connection, key: str) -> bool | str:
+def _backend_nvram_key(conn: sqlite3.Connection, key: str, run_id: str | None = None) -> bool | str:
     """Is ``key`` a back-end nvram op key — a constant key in nvram_key_flow, ANY binary, read or
     write? True / False / 'uncertain' ('uncertain' only when the table is absent, an older atlas).
 
     ALL binaries (not just the web server): a key the web server writes through a generic loop can
     be invisible in the httpd binary yet read by another daemon — the all-binary cross recovers it.
     A constant back-end key confirms this is a real nvram key, not a pure UI control."""
+    sql, args = _scoped(run_id)
     try:
         hit = conn.execute(
-            "SELECT 1 FROM nvram_key_flow WHERE key_kind = 'constant' AND key = ? LIMIT 1",
-            (key,),
+            f"SELECT 1 FROM nvram_key_flow WHERE key_kind = 'constant' AND key = ?{sql} LIMIT 1",  # noqa: S608
+            (key, *args),
         ).fetchone()
     except sqlite3.OperationalError:
         return "uncertain"
     return hit is not None
 
 
-def _router_defaults_lookup(conn: sqlite3.Connection, key: str) -> dict[str, Any]:
+def _router_defaults_lookup(
+    conn: sqlite3.Connection, key: str, run_id: str | None = None
+) -> dict[str, Any]:
     """The legacy router_defaults membership fact, kept as an AUXILIARY reference field (not the
     primary web-settability judgement). Same three-state honesty as before (True / False /
     'uncertain'); a not-located table is 'uncertain', never False."""
+    sql, args = _scoped(run_id)
     try:
-        located = conn.execute("SELECT 1 FROM nvram_defaults LIMIT 1").fetchone() is not None
+        located = (
+            conn.execute(f"SELECT 1 FROM nvram_defaults WHERE 1 = 1{sql} LIMIT 1", args).fetchone()  # noqa: S608
+            is not None
+        )
     except sqlite3.OperationalError:
         located = False
     if not located:
         return {"in_router_defaults": "uncertain", "reason": "router_defaults not located"}
     hit = conn.execute(
-        "SELECT default_value, flags, binary FROM nvram_defaults WHERE key = ? "
-        "ORDER BY binary LIMIT 1",
-        (key,),
+        f"SELECT default_value, flags, binary FROM nvram_defaults WHERE key = ?{sql} "  # noqa: S608
+        "ORDER BY binary, default_value LIMIT 1",
+        (key, *args),
     ).fetchone()
     if hit is not None:
         return {
@@ -288,7 +331,10 @@ def _router_defaults_lookup(conn: sqlite3.Connection, key: str) -> dict[str, Any
             "source": f"{hit['binary'] or 'libshared'} router_defaults",
         }
     incomplete = (
-        conn.execute("SELECT 1 FROM nvram_defaults WHERE key IS NULL LIMIT 1").fetchone()
+        conn.execute(
+            f"SELECT 1 FROM nvram_defaults WHERE key IS NULL{sql} LIMIT 1",
+            args,  # noqa: S608
+        ).fetchone()
         is not None
     )
     if incomplete:
@@ -296,7 +342,7 @@ def _router_defaults_lookup(conn: sqlite3.Connection, key: str) -> dict[str, Any
     return {"in_router_defaults": False, "source": "router_defaults (located, complete)"}
 
 
-def _web_settable(conn: sqlite3.Connection, key: str) -> dict[str, Any]:
+def _web_settable(conn: sqlite3.Connection, key: str, run_id: str | None = None) -> dict[str, Any]:
     """Source-side web-settability by a SaTC front/back cross — is ``key`` editable via the web?
 
     Crosses the front-end editable form fields (M1 web_form_fields) against the back-end nvram op
@@ -318,10 +364,11 @@ def _web_settable(conn: sqlite3.Connection, key: str) -> dict[str, Any]:
     fact only. RED LINE (M3): the likely tier is a source-side MEMBERSHIP signal — never narrow it
     with a key-side filter (flags / write-side value / name), which would false-demote a real key.
     """
-    frontend = _frontend_settable(conn, key)
-    backend = _backend_nvram_key(conn, key)
-    router = _router_defaults_lookup(conn, key)
-    evidence = _frontend_evidence(conn, key)
+    run = run_id if run_id is not None else _RUN_SCOPE.get()
+    frontend = _frontend_settable(conn, key, run)
+    backend = _backend_nvram_key(conn, key, run)
+    router = _router_defaults_lookup(conn, key, run)
+    evidence = _frontend_evidence(conn, key, run)
     if frontend is True and backend is True:
         verdict = "yes"
         source = "front-end editable field x back-end nvram key (SaTC cross)"
@@ -454,7 +501,7 @@ def get_nvram_key_flow(
         # nvram key? A THREE-state fact ("yes" / "likely" / "uncertain") — there is no "no":
         # "likely" is a router_defaults-member signal (M2), non-YES/likely is always uncertain,
         # never a "not settable" inferred from a missing side. router_defaults drives likely.
-        "web_settable": _web_settable(conn, key),
+        "web_settable": _web_settable(conn, key, run_id),
         "coverage": COVERAGE_NOTE,
         "completeness": completeness,
         "notes": notes,

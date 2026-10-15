@@ -189,7 +189,6 @@ def test_the_demotable_marker_set_is_exactly_the_one_written_out_here() -> None:
     assert PROVABLY_CONSTANT_MARKERS == frozenset(
         {
             "const_sink_arg",  # sink's dangerous argument is a fixed .rodata string constant
-            "caller_constant",  # a constant supplied by the sole caller
             "const_size",  # copy length is a literal constant, at THIS callsite
             "sizeof_bound",  # copy length is a sizeof (non-controllable)
         }
@@ -313,9 +312,20 @@ def test_exec_shape_arrives_with_a_frame_around_it(sink_class: str) -> None:
 def test_form_notes_the_verdict_already_reads_are_not_repeated() -> None:
     # A note the controllability layer consumes already reaches the reader there, with its state.
     # Echoing it here would be a second, stateless copy of the same signal.
-    for marker in ("const_sink_arg", "caller_constant", "numeric_sanitized", "charset_constrained"):
+    for marker in ("const_sink_arg", "numeric_sanitized", "charset_constrained"):
         assert _surface({"source_kind": "unknown"}, "cmd", marker) is None, marker
     assert _surface({"source_kind": "unknown"}, "cmd", None) is None
+
+
+def test_caller_constant_is_surfaced_as_a_hint_never_a_proof() -> None:
+    """No verdict reads caller_constant any more, so it would otherwise reach a reader as a bare
+    name that sounds like an all-clear.
+
+    MUTATION: surface nothing for it -> RED."""
+    for sink_class in ("cmd", "path_sink"):
+        out = _surface({"source_kind": "unknown"}, sink_class, "caller_constant")
+        assert out is not None and out["axis"] == "caller_hint"
+        assert out["coverage"] == "unjudged" and "NOT a proof" in out["not_asserted"]
 
 
 def test_a_class_with_no_such_analysis_gets_nothing() -> None:

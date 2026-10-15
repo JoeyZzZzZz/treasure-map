@@ -101,11 +101,18 @@ NVRAM_GETTERS: frozenset[str] = frozenset(
 # --- controllability markers (blocking_mechanism notes) -----------------------------------------
 # Notes that PROVE the sink's dangerous value is a compile-time constant (not attacker-influenced).
 # This is the ONLY 'proven-safe' controllability the map can assert this phase: it is
-# what lets the default lens sink constant command junk out of the first screen. Extensible.
+# what lets the default lens sink constant command junk out of the first screen.
+#
+# A member is a PROOF over every argument that carries the danger, every call it is read from and
+# every caller that could supply it — tests/unit/lib/test_provable_markers.py holds each one to
+# that, and a new member does not pass it without its own adversarial cases.
+#
+# NOT a member: caller_constant. It reads the callers one hop up, and the caller set is not
+# provably complete — an exported function is called from other binaries and through pointers the
+# xref table never shows — so it is a ranking hint on the blocking_mechanism note, never a proof.
 PROVABLY_CONSTANT_MARKERS: frozenset[str] = frozenset(
     {
         "const_sink_arg",  # sink's dangerous arg is a fixed .rodata string constant
-        "caller_constant",  # a constant supplied by the sole caller
         "const_size",  # copy length is a literal constant
         "sizeof_bound",  # copy length is a sizeof (non-controllable)
     }

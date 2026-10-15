@@ -182,7 +182,9 @@ _AGENT_INSTRUCTIONS = (
     "benign. (2) For a lead, follow its evidence_ref (the "
     "cross-tool anchor). explain_candidate carries a sink_arg_provenance_summary (per sink: where "
     "the sink argument's value comes from, by Ghidra def-use — kind, whether it resolved, and the "
-    "sound nearest_dominating_writer for a reused stack buffer); get_sink_provenance(evidence_ref, "
+    "nearest_dominating_writer for a reused stack buffer — a write on every path to the sink, not "
+    "necessarily the last: a later, conditional write may still add to it); "
+    "get_sink_provenance(evidence_ref, "
     "sink_idx) then pulls that sink's full writers + format string + vararg sources, so you read "
     "the value origin from a table instead of rebuilding it by hand. get_nvram_key_flow(key) gives "
     "one nvram key's cross-binary writers/readers (exact constant matches + separately flagged "
@@ -1523,10 +1525,11 @@ def make_tools(
         explain_candidate summary (which stays compact to fit the token budget).
 
         Omit ``sink_idx`` to get every sink's record for the function; pass one (the sink_idx from
-        the explain summary) for a single sink's full detail: the writer set with sound CHK
-        dominance ordering (``dominates_sink`` + ``nearest_dominating_writer``), each writer's
-        format string and vararg sources, getter ``const_args``, or an honest ``unresolved``.
-        Writers come dominating-first (the sound ones lead; the branch-noise tail follows) with each
+        the explain summary) for a single sink's full detail: the writer set with CHK dominance
+        ordering (``dominates_sink`` + ``nearest_dominating_writer``), each writer's format string
+        and vararg sources, getter ``const_args``, or an honest ``unresolved``. Writers come
+        dominating-first (those on every path lead; the rest follow, and a later conditional one
+        can still reach the sink — ``may_reach_sink`` says so where the extractor knows) with each
         writer's varargs trimmed to what its format string actually consumes; pass
         ``dominating_only`` to return only the dominating writers. A surfaced Ghidra def-use FACT of
         where a sink argument's value comes from — never a verdict, and an unreachable origin is
