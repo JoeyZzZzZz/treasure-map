@@ -901,6 +901,38 @@ def test_the_lens_and_the_counts_read_each_fact_through_their_wiring(
     assert s["unchanged"] == 2
 
 
+def test_a_qualified_match_outside_c_is_never_sunk(tmp_path: Path, current: None) -> None:
+    """I10. Three entries B by an unmatched call, texts and callees the same: the control (equal
+    byte counts, no marker) sinks on its identical pseudocode; one whose byte counts differ and one
+    the decompiler marked incomplete read identical_text_unverified and stay at attention 1.
+
+    MUTATION: sink identical_text_unverified alongside identical in ``significance`` -> the two
+    qualified entries reach attention 2 -> RED."""
+    w = World(tmp_path)
+    marker = "/* WARNING: Removing unreachable block (ram,0x00005010) */\n"
+    rows = {
+        "control": ("00001000", "00002000", "system(c);", 64, 64),
+        "size": ("00003000", "00004000", "system(c);", 64, 72),
+        "marker": ("00005000", "00006000", marker + "system(c);", 64, 64),
+    }
+    for fa, fb, text, size_a, size_b in rows.values():
+        w.pair(fa, fb, 0.97, 0.9)
+        w.inst("a", _ref("runA", fa, "cmd", "0x30"), "cmd", "system")  # matched to nothing
+        w.fn("a", fa, ["system"], pseudocode=text, size_bytes=size_a)
+        w.fn("b", fb, ["system"], pseudocode=text, size_bytes=size_b)
+    w.commit()
+    lens = _view(w, sort_by="significance")["by_id"]
+    ids = {k: _pair_id(fa, fb) for k, (fa, fb, *_rest) in rows.items()}
+    for eid in ids.values():
+        assert lens[eid]["bucket"] == "B"
+    control = lens[ids["control"]]
+    assert control["pseudocode_sameness"] == "identical"
+    assert control["significance"] == {"attention": 2, "basis": "pseudocode_identical"}
+    for k in ("size", "marker"):
+        assert lens[ids[k]]["pseudocode_sameness"] == "identical_text_unverified", k
+        assert lens[ids[k]]["significance"] == {"attention": 1, "basis": "similarity"}, k
+
+
 @pytest.mark.parametrize(
     "restamp",
     [
@@ -2153,6 +2185,25 @@ def test_a_qualified_match_carries_its_reasons_and_hidden_region(
     assert "hidden_region" not in v[_pair_id("00005000", "00006000")]
 
 
+def test_a_zero_byte_count_is_not_recorded_and_qualifies_nothing(
+    tmp_path: Path, current: None
+) -> None:
+    """A byte count of 0 is the ingest's default for an export that carried none: it is read as not
+    recorded, so beside a known count it adds no body_size_differs and no hidden_region.
+
+    MUTATION: read 0 as a byte count in read_function_bodies -> 0 vs 64 differ -> the pair reads
+    identical_text_unverified -> RED."""
+    w = World(tmp_path)
+    w.pair("00001000", "00002000", 0.97, 0.9)
+    w.fn("a", "00001000", ["foo"], pseudocode="foo(1);", size_bytes=0)
+    w.fn("b", "00002000", ["foo"], pseudocode="foo(1);", size_bytes=64)
+    w.commit()
+    e = _view(w)["by_id"][_pair_id("00001000", "00002000")]
+    assert e["pseudocode_sameness"] == "identical"
+    assert "text_unverified_reasons" not in e
+    assert "hidden_region" not in e
+
+
 def test_a_qualified_match_is_unverified_never_unchanged(tmp_path: Path, current: None) -> None:
     """T18. identical_text_unverified counts in unverified (its total included), never in
     unchanged; its split by body class is a key of its own and every unverified value stays an
@@ -2175,10 +2226,12 @@ def test_a_qualified_match_is_unverified_never_unchanged(tmp_path: Path, current
 
 def test_the_body_filter_keeps_one_class_of_qualified_match(tmp_path: Path, current: None) -> None:
     """T19. ``body`` keeps only the identical_text_unverified entries of its class — listed, and
-    the not-listed ones of that category with their body named; a bad value is an error. The MCP
-    tool passes it through.
+    the not-listed ones of that category with their body named; a bad value is an error, and so is
+    ``body`` beside any other not_listed_page (never a silent empty page). The MCP tool passes it
+    through.
 
-    MUTATION: ignore ``body`` when choosing the listed entries -> every entry comes back -> RED."""
+    MUTATION: ignore ``body`` when choosing the listed entries -> every entry comes back -> RED;
+    drop the not_listed_page check -> an empty page, no error -> RED."""
     w = _qualified_world(tmp_path)
     ids = [e["entry_id"] for e in _view(w, body="structure_differs")["entries"]]
     assert ids == [_pair_id("00001000", "00002000")]
@@ -2196,6 +2249,13 @@ def test_the_body_filter_keeps_one_class_of_qualified_match(tmp_path: Path, curr
     bad = pv.get_diff_patch_view(w.atlas, DIFF, body="identical")
     assert bad["error"] == (
         "body must be one of ('structure_differs', 'unknown') or null, got 'identical'"
+    )
+    unrelated = pv.get_diff_patch_view(
+        w.atlas, DIFF, not_listed_page="aligned_pseudocode_differs", body="structure_differs"
+    )
+    assert unrelated.get("error") == (
+        "body applies to the listed entries and to "
+        "not_listed_page='aligned_pseudocode_identical_text_unverified' only"
     )
     tool = mcp_app.make_tools(w.path)["get_diff_patch_view"]
     out = tool(DIFF, body="structure_differs")

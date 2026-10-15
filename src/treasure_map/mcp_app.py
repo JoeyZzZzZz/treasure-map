@@ -1756,7 +1756,8 @@ def make_tools(
         ``band`` is on or off; only with ``band=true`` does the judgement band order entries
         inside each tier. A bucket C entry sinks even when its text match is unverified;
         ``lens.sunk_with_body_size_differs`` counts the sunk ones whose body byte counts differ,
-        with the ``body`` filter that lists them.
+        with the ``body`` filter that lists them, counted over the entries the current filters
+        keep.
         Each entry then carries ``significance`` (its tier and why) — never a verdict. Filters:
         ``bucket``, ``subclass`` (an entry's or any of its rows'), ``tier`` (a number, ``no_sink``
         or ``unknown``), ``blind_spot`` (a key of the ``blind_spots`` ledger — page through the
@@ -1785,7 +1786,9 @@ def make_tools(
         when the byte counts differ, else ``unknown`` — never ``identical``), the byte counts,
         BinDiff's matched-instruction count and similarity as stored. ``body``
         (``structure_differs`` / ``unknown``) keeps only the identical_text_unverified entries of
-        that class, and the not-listed ones with ``not_listed_page``. A pair whose texts differ
+        that class, and the not-listed ones with
+        ``not_listed_page='aligned_pseudocode_identical_text_unverified'`` (any other
+        ``not_listed_page`` with ``body`` is an error). A pair whose texts differ
         carries ``pseudocode_delta``: its lexical shape (``substitution_only`` /
         ``structural`` / ``layout_only``, with the substituted tokens and the calls whose counts
         differ) — a shape, never a verdict; a number-only substitution is what a size fix looks
@@ -1794,7 +1797,10 @@ def make_tools(
         side, ``identical_not_unique`` otherwise, plus the other states), with where else each
         body occurs — a proposal beside the entry, never its pairing. Not checked by any of
         these: the target a ``DAT_`` / ``PTR_`` reference points at once its address is blanked
-        (a string label keeps its content in the name). A persisted candidate whose size
+        (a string label keeps its content in the name); a C++ catch handler (landing pad), which
+        usually lies outside every function body, so its code is never decompiled and no reading
+        compares it — a try/catch annotation that moved with its function says nothing about the
+        handler. A persisted candidate whose size
         constant changed carries ``sink_arg_constant_delta`` (callee + from/to,
         direction-neutral); a changed size KIND is the weaker ``size_kind_shifted``.
 

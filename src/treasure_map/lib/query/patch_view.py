@@ -1815,7 +1815,7 @@ def _deltas(readings: _Readings, pairs: list[_Pair]) -> dict[tuple[str, str], di
             tb = (bb.get(p.addr_b) or {}).get("pseudocode")
             if not ta or not tb:  # the bodies moved since the reading: nothing to compare
                 continue
-            delta = sameness.pseudocode_delta(ta, tb, ra, rb)
+            delta = sameness.pseudocode_delta(ta, tb, ra, rb, p.addr_a, p.addr_b)
             _DELTA_CACHE[(readings.key, p.addr_a, p.addr_b)] = delta
             out[(p.addr_a, p.addr_b)] = delta
     return out
@@ -1947,13 +1947,16 @@ _SIGNIFICANCE_LENS = (
     "entry judged changed_real, inconclusive or due a re-check / relabel — none of them reaches "
     "attention 2, whether band is on or off. A bucket C entry is sunk even when its text match is "
     "identical_text_unverified; sunk_with_body_size_differs counts the sunk ones whose two body "
-    "byte counts differ, with the filter that lists them. Only with band=true does the judgement "
-    "band order entries inside each attention tier. Each entry's ``significance`` names its tier "
-    "and why. Not seen by this lens: a constant in an allocation expression or a local buffer's "
-    "declared size (blind_spots); the target a DAT_ / PTR_ reference points at, once its address "
-    "is blanked (a pseudocode match does not check it; a string label keeps its content in the "
-    "name); and anything in a binary the two runs hold byte-identical — that is in the scan's "
-    "candidate map, not in any diff."
+    "byte counts differ, with the filter that lists them, counted over the entries the current "
+    "filters keep. Only with band=true does the judgement band order entries inside each "
+    "attention tier. Each entry's ``significance`` names its tier and why. Not seen by this lens: "
+    "a constant in an allocation expression or a local buffer's declared size (blind_spots); the "
+    "target a DAT_ / PTR_ reference points at, once its address is blanked (a pseudocode match "
+    "does not check it; a string label keeps its content in the name); a C++ catch handler "
+    "(landing pad), which usually lies outside every function body, so its code is never "
+    "decompiled and no reading compares it — a try/catch annotation that moved with its function "
+    "says nothing about the handler; and anything in a binary the two runs hold byte-identical — "
+    "that is in the scan's candidate map, not in any diff."
 )
 
 
@@ -2070,7 +2073,8 @@ def get_diff_patch_view(
     ``body`` (``structure_differs`` / ``unknown``) keeps only the identical_text_unverified entries
     of that body class — listed ones (an aligned pair's, or an undetermined pair's proposed
     reading) and, with ``not_listed_page``, the not-listed pairs of
-    ``aligned_pseudocode_identical_text_unverified``."""
+    ``aligned_pseudocode_identical_text_unverified`` (with any other ``not_listed_page`` it is an
+    error, not an empty page)."""
     if not_listed_page is not None and not_listed_page not in sameness.STATE_BY_NOT_LISTED_NAME:
         names = list(sameness.STATE_BY_NOT_LISTED_NAME)
         return {"diff_id": diff_id, "error": f"not_listed_page must be one of {names}"}
@@ -2078,6 +2082,14 @@ def get_diff_patch_view(
         return {
             "diff_id": diff_id,
             "error": f"body must be one of {sameness.BODY_CLASSES} or null, got {body!r}",
+        }
+    qualified = sameness.NOT_LISTED_NAME[sameness.IDENTICAL_TEXT_UNVERIFIED]
+    if body is not None and not_listed_page not in (None, qualified):
+        return {
+            "diff_id": diff_id,
+            "error": (
+                f"body applies to the listed entries and to not_listed_page={qualified!r} only"
+            ),
         }
     filters = {
         "bucket": bucket,

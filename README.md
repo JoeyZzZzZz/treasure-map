@@ -14,7 +14,7 @@ It does two things:
 
 - **Map one firmware.** Every place the compiled code runs a shell command, copies into a memory
   buffer, formats a string or opens a file by path — each marked with what is known, what is not, and
-  why. Your agent works down the list, reads the code, and records its verdicts.
+  why. Your agent picks the views it needs, reads the code, and records its verdicts.
 - **Diff two versions.** Every function that changed between two releases, grouped by what happened
   around its dangerous calls. Instead of thousands of functions, your agent reviews the few that
   changed: is this a security fix, and which 1-day does it close in the old version? Is the fix
@@ -46,7 +46,8 @@ Then ask your agent:
 
 ```text
 Audit firmware my-fw using treasure-map.
-Work down its ranked candidate list from the top:
+Choose for yourself which views of its candidate map to review
+(by sink, by data source, or by any other layer) and find the issues in them:
 open a lead's pseudocode, trace where its input comes from, and judge it yourself.
 The candidates are leads to verify, not confirmed bugs.
 Record each conclusion with annotate so the next session starts from it.
@@ -189,15 +190,7 @@ Run it again any time; an up-to-date setup reports "everything current, nothing 
 
 `tmap init` registers the MCP server for you; restart the agent afterwards.
 
-Under the hood the agent loops over read-only fact tools. For a diff: `list_diffs` (what was compared,
-and what could not be), `get_diff_patch_view` (the changed functions), `get_function_alignment` and
-`get_pseudocode` (both sides), `list_diff_blindspots` (what the diff could not see). For one firmware:
-`list_candidates`, `explain_candidate`, `get_pseudocode`, `get_callees`, `get_xrefs`,
-`get_sink_provenance` and more. Conclusions go into the annotation layer with `annotate` and
-`annotate_diff`.
-
-<details>
-<summary>Registering by hand</summary>
+### Registering by hand
 
 The command is always `<absolute path of tmap> mcp` (`command -v tmap` prints the path).
 
@@ -224,8 +217,6 @@ Config files: Cursor `~/.cursor/mcp.json`; Claude Desktop
 `~/.codeium/windsurf/mcp_config.json`; Gemini CLI `~/.gemini/settings.json`. With Claude Code use
 `-s user`: a project-local entry of the same name hides it inside that project (`tmap doctor` points
 such entries out).
-
-</details>
 
 ---
 

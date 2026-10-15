@@ -215,6 +215,38 @@ def test_a_try_annotation_address_is_blanked_and_no_other_bare_hex() -> None:
     assert sm.literal_reading("x = 0x60;", "x = 0x64;", None, None)[0] is False
 
 
+def _try_body(start: int, end: int, handler: int) -> str:
+    return (
+        f"/* try {{ // try from {start:08x} to {end:08x} has its CatchHandler @ {handler:08x} */\n"
+        "foo();"
+    )
+
+
+def test_a_try_annotation_matches_only_when_every_address_moved_with_the_entry() -> None:
+    """T12b. Entries 0x1000 -> 0x2000. The blanked try/catch addresses keep a match only when each
+    moved by exactly that offset (or none moved); a handler that moved by another offset reads
+    differs, and its delta is a comment substitution, not layout. A body with no annotation is not
+    touched.
+
+    MUTATION: drop the offset check from pair_reading -> the handler pair matches -> RED; compare
+    only each annotation's first two values (miss the handler) -> RED; blank the annotation in the
+    delta whatever the offsets -> the delta is layout_only -> RED."""
+    base = _try_body(0x406208, 0x40620F, 0x406D84)
+    moved = _try_body(0x407208, 0x40720F, 0x407D84)
+    handler_off = _try_body(0x407208, 0x40720F, 0x407E84)
+
+    def read(a: str, b: str) -> tuple[bool | None, str | None, tuple[str, ...]]:
+        return sm.pair_reading({"1000": _body(a)}, {"2000": _body(b)}, "1000", "2000", None, None)
+
+    assert read(base, moved) == (True, None, ())
+    assert read(base, handler_off) == (False, None, ())
+    assert read(base, base) == (True, None, ())  # the entry moved, the annotation did not
+    assert read("FUN_00401000();", "FUN_00402000();") == (True, None, ())  # no annotation
+    delta = sm.pseudocode_delta(base, handler_off, None, None, "1000", "2000")
+    assert delta["kind"] != "layout_only"
+    assert "comment" in delta["substitutions"]
+
+
 # ── N0: a large literal, position by position ───────────────────────────────────────────────
 
 
@@ -380,7 +412,7 @@ def test_a_size_only_change_is_a_number_substitution() -> None:
     a = "void f(void)\n{\n  char buf[0x60];\n  memcpy(buf,src,0x60);\n}"
     b = "void f(void)\n{\n  char buf[0x64];\n  memcpy(buf,src,0x64);\n}"
     assert sm.literal_reading(a, b, None, None)[0] is False
-    delta = sm.pseudocode_delta(a, b, None, None)
+    delta = sm.pseudocode_delta(a, b, None, None, "1000", "2000")
     assert delta["kind"] == "substitution_only" and delta["structural_spans"] == 0
     assert delta["substitutions"] == {
         "number": {"total": 2, "first": [["0x60", "0x64"], ["0x60", "0x64"]]}
@@ -394,7 +426,7 @@ def test_dropped_calls_are_counted_by_name() -> None:
     MUTATION: count calls as a set -> both sides read 1 -> the callee is not listed -> RED."""
     a = 'void f(void)\n{\n  system("a");\n  system("b");\n  system("c");\n}'
     b = 'void f(void)\n{\n  system("a");\n}'
-    delta = sm.pseudocode_delta(a, b, None, None)
+    delta = sm.pseudocode_delta(a, b, None, None, "1000", "2000")
     assert delta["kind"] == "structural" and delta["structural_spans"] >= 1
     assert delta["calls"] == {"system": {"a": 3, "b": 1}}
 
@@ -407,7 +439,7 @@ def test_a_spacing_only_difference_is_layout_and_still_differs() -> None:
     a = "void f(void)\n{\n  x = y + 1;\n}"
     b = "void f(void)\n{\n  x  =  y+1;\n\n}"
     assert sm.literal_reading(a, b, None, None)[0] is False
-    assert sm.pseudocode_delta(a, b, None, None)["kind"] == "layout_only"
+    assert sm.pseudocode_delta(a, b, None, None, "1000", "2000")["kind"] == "layout_only"
 
 
 def test_a_delta_over_the_line_cap_is_not_computed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -417,4 +449,7 @@ def test_a_delta_over_the_line_cap_is_not_computed(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(sm, "DELTA_LINE_CAP", 3)
     a = "\n".join(f"x{i} = {i};" for i in range(5))
     b = "\n".join(f"x{i} = {i + 1};" for i in range(5))
-    assert sm.pseudocode_delta(a, b, None, None) == {"kind": "not_computed", "reason": "too_large"}
+    assert sm.pseudocode_delta(a, b, None, None, "1000", "2000") == {
+        "kind": "not_computed",
+        "reason": "too_large",
+    }

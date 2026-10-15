@@ -9,7 +9,7 @@ Code、Codex、Cursor 等）：它认得的每一处危险调用，流到那里�
 
 它做两件事：
 
-- **给一个固件画地图。** 编译后的代码里每一处执行 shell 命令、拷贝内存缓冲区、格式化字符串、按路径打开文件的地方，都标明哪些已经查清、哪些还不知道、为什么。你的 agent 从列表顶部往下看，读代码，记下结论。
+- **给一个固件画地图。** 编译后的代码里每一处执行 shell 命令、拷贝内存缓冲区、格式化字符串、按路径打开文件的地方，都标明哪些已经查清、哪些还不知道、为什么。你的 agent 自己挑要看的视图，读代码，记下结论。
 - **对比两个版本。** 两个版本之间所有改动过的函数，按危险调用附近发生了什么分好类。agent 不用在几千个函数里大海捞针，只需审改过的那几个：这是不是一次安全修补，它修掉的是旧版本里的哪个 1day？修得够不够，同样的调用是不是还留在别处？新加的检查能不能被绕过？
 
 > **开发者预览版。** 命令、配置文件、atlas 数据库和 MCP 工具的字段，在版本之间可能出现不兼容的变化。升级后请看 [升级](#升级)。
@@ -36,7 +36,8 @@ tmap scan ./firmware.extracted -w my-fw
 
 ```text
 Audit firmware my-fw using treasure-map.
-Work down its ranked candidate list from the top:
+Choose for yourself which views of its candidate map to review
+(by sink, by data source, or by any other layer) and find the issues in them:
 open a lead's pseudocode, trace where its input comes from, and judge it yourself.
 The candidates are leads to verify, not confirmed bugs.
 Record each conclusion with annotate so the next session starts from it.
@@ -148,14 +149,7 @@ Record each judgement with annotate_diff.
 
 `tmap init` 会替你注册 MCP 服务器，注册后重启 agent 即可。
 
-agent 在背后循环调用一组只读的事实工具。对比时：`list_diffs`（对比了什么、哪些没能对比）、
-`get_diff_patch_view`（改动过的函数）、`get_function_alignment` 和 `get_pseudocode`（读两边的代码）、
-`list_diff_blindspots`（对比看不到的部分）。单个固件：`list_candidates`、`explain_candidate`、
-`get_pseudocode`、`get_callees`、`get_xrefs`、`get_sink_provenance` 等。结论用 `annotate` 和
-`annotate_diff` 写进标注层。
-
-<details>
-<summary>手动注册</summary>
+### 手动注册
 
 命令始终是 `<tmap 的绝对路径> mcp`（`command -v tmap` 可以打印路径）。
 
@@ -181,8 +175,6 @@ agent 在背后循环调用一组只读的事实工具。对比时：`list_diffs
 `~/Library/Application Support/Claude/claude_desktop_config.json`（macOS）；Windsurf
 `~/.codeium/windsurf/mcp_config.json`；Gemini CLI `~/.gemini/settings.json`。Claude Code 请用
 `-s user`：项目内同名的本地条目会在该项目里覆盖它（`tmap doctor` 会指出这类条目）。
-
-</details>
 
 ---
 

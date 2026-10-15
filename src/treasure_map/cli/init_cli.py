@@ -81,7 +81,8 @@ def render_checks(result: InitResult) -> bool:
 # What to say to the agent, written out in full (one sentence per line) so it can be copied as is.
 _AUDIT_PROMPT = (
     "Audit firmware my-fw using treasure-map.",
-    "Work down its ranked candidate list from the top:",
+    "Choose for yourself which views of its candidate map to review",
+    "(by sink, by data source, or by any other layer) and find the issues in them:",
     "open a lead's pseudocode, trace where its input comes from, and judge it yourself.",
     "The candidates are leads to verify, not confirmed bugs.",
     "Record each conclusion with annotate so the next session starts from it.",

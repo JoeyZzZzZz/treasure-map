@@ -36,16 +36,19 @@ are the reader's:
     kind change is never read as a value delta.
 
 The address normalisation is defined once here (``skeleton`` + ``literal_reading``) so the "small
-constants stay put" rule has a single home: synthetic-symbol address suffixes and the addresses in
-a try/catch annotation are blanked; a large hex literal is compared position by position and read
-as an address only when the two values differ AND each lies in its own side's image; small numeric
-constants are never touched — else a changed buffer size would normalise away and the whole point
-would be lost.
+constants stay put" rule has a single home: synthetic-symbol address suffixes are blanked; the
+addresses in a try/catch annotation are blanked only when every one of them moved by the pair's own
+entry offset (``try_shift_consistent``), else the pair is read as it stands; a large hex literal is
+compared position by position and read as an address only when the two values differ AND each lies
+in its own side's image; small numeric constants are never touched — else a changed buffer size
+would normalise away and the whole point would be lost.
 
 BOUNDARIES: a constant whose two values differ but both happen to lie inside their images is still
 read as an address (telling them apart needs data flow); the target a ``DAT_`` / ``PTR_`` name
 refers to is not checked once its address is blanked (a string label keeps its content in the name,
-so a changed string stays visible).
+so a changed string stays visible); a C++ catch handler (landing pad) usually lies outside every
+function body, so its code is never decompiled and no reading compares it — a try/catch annotation
+that moved with its function says nothing about the handler.
 """
 
 from __future__ import annotations
@@ -152,7 +155,8 @@ _HEX6 = re.compile(r"\b0x[0-9a-fA-F]{6,}\b")
 # Ghidra's try/catch annotation (``/* try { // try from 00406208 to 0040620f has its CatchHandler @
 # 00406d84 */``) names code addresses as bare hex, which move whenever the code before them does.
 # Only a comment holding ``try from`` is touched; every other comment and bare hex in the body is
-# left as it is.
+# left as it is. The skeleton blanks them; a reading then keeps the match only when they all moved
+# by the pair's own entry offset (try_shift_consistent).
 _TRY_COMMENT = re.compile(r"/\*[^*]*?\btry from\b.*?\*/", re.S)
 _BARE_HEX = re.compile(r"\b[0-9a-fA-F]{6,}\b")
 
@@ -161,11 +165,31 @@ def _blank_try_comment(text: str) -> str:
     return _TRY_COMMENT.sub(lambda m: _BARE_HEX.sub("@", m.group(0)), text)
 
 
+def try_annotation_values(text: str) -> list[int]:
+    """The addresses ``_blank_try_comment`` blanks in one body: every bare hex value inside a
+    try/catch annotation, in the order they occur."""
+    return [int(h, 16) for m in _TRY_COMMENT.finditer(text) for h in _BARE_HEX.findall(m.group(0))]
+
+
+def try_shift_consistent(a: str, b: str, entry_a: int | None, entry_b: int | None) -> bool:
+    """Whether the try/catch annotation addresses of two bodies are the same, or all moved by
+    exactly the pair's entry offset (``entry_b - entry_a``) — a function that moved as a whole. An
+    unknown entry proves no offset."""
+    va, vb = try_annotation_values(a), try_annotation_values(b)
+    if va == vb:
+        return True
+    if entry_a is None or entry_b is None:
+        return False
+    d = entry_b - entry_a
+    return len(va) == len(vb) and all(y - x == d for x, y in zip(va, vb, strict=True))
+
+
 def skeleton(text: str) -> tuple[str, list[int]]:
     """``(skeleton, literals)``: ``text`` with the try/catch annotation's addresses and the
     synthetic-symbol address suffixes blanked and every large hex literal replaced by ``0x#``, and
     those literals' values in the order they occur. Small numeric constants stay exactly as they
-    are."""
+    are. The try/catch addresses are blanked unconditionally here (the skeleton keys a body's
+    occurrences); a reading compares them by offset (try_shift_consistent)."""
     text = _blank_try_comment(text)
     text = _ADDR_SUFFIX.sub("_@", text)
     values: list[int] = []
@@ -318,7 +342,9 @@ def pair_reading(
     """``(matches, reason, text_reasons)`` for one pair: ``matches`` True / False (reason None) when
     both sides have a body to compare; else ``matches`` None with the reason a reader would
     otherwise have to recompute — ``no_body`` when a side is an import / PLT stub, else
-    ``unavailable`` (``no_body`` wins when both apply, so a stub pair is named as one).
+    ``unavailable`` (``no_body`` wins when both apply, so a stub pair is named as one). Two texts
+    that match only because their try/catch annotation addresses were blanked match only when those
+    addresses all moved by the pair's entry offset; else the pair differs, as read.
 
     ``text_reasons`` qualify a MATCH (empty otherwise — a text that differs is a difference, and a
     warning does not change that): ``literal_basis_unknown``, ``decompile_incomplete:<tag>`` for
@@ -331,6 +357,8 @@ def pair_reading(
     pa, pb = ba.get("pseudocode") or "", bb.get("pseudocode") or ""
     equal, relied = literal_reading(pa, pb, ranges_a, ranges_b)
     if not equal:
+        return (False, None, ())
+    if not try_shift_consistent(pa, pb, _hex_int(addr_a), _hex_int(addr_b)):
         return (False, None, ())
     reasons: list[str] = [LITERAL_BASIS_UNKNOWN] if relied else []
     reasons += [f"{DECOMPILE_INCOMPLETE}:{tag}" for tag in incomplete_tags(pa, pb)]
@@ -470,11 +498,13 @@ _CALL_KEYWORDS = {
 }
 
 
-def _delta_text(text: str, ranges: ImageRanges) -> str:
+def _delta_text(text: str, ranges: ImageRanges, blank_try: bool) -> str:
     """The skeleton a delta reads: as ``skeleton``, except that a large literal outside its own
     side's image keeps its value — a changed large constant shows as a substitution instead of
-    vanishing into ``0x#``. Unknown extents read every literal as an address, as the match does."""
-    text = _ADDR_SUFFIX.sub("_@", _blank_try_comment(text))
+    vanishing into ``0x#`` — and that the try/catch annotation's addresses are blanked only when
+    ``blank_try`` (they moved by the pair's entry offset, as the reading requires). Unknown extents
+    read every literal as an address, as the match does."""
+    text = _ADDR_SUFFIX.sub("_@", _blank_try_comment(text) if blank_try else text)
     return _HEX6.sub(
         lambda m: "0x#" if _in_image(int(m.group(0), 16), ranges) else m.group(0), text
     )
@@ -502,7 +532,7 @@ def _calls(tokens: list[tuple[str, str]]) -> dict[str, int]:
 
 
 def pseudocode_delta(
-    a: str, b: str, ranges_a: ImageRanges, ranges_b: ImageRanges
+    a: str, b: str, ranges_a: ImageRanges, ranges_b: ImageRanges, addr_a: str, addr_b: str
 ) -> dict[str, Any]:
     """The lexical shape of how two bodies' texts differ. Lines (stripped, blank lines dropped) are
     matched first; inside each block that differs, tokens are. A same-length run of tokens each of
@@ -511,9 +541,13 @@ def pseudocode_delta(
     ``substitution_only``, or ``layout_only`` (the token streams agree — only spacing or line
     breaks differ); ``not_computed`` (``too_large``) above DELTA_LINE_CAP lines. ``calls`` lists
     the callees whose call counts differ. A shape, never a verdict: a number-only substitution is
-    exactly what a size fix looks like, and nothing here ranks or files it."""
-    la = [ln.strip() for ln in _delta_text(a, ranges_a).splitlines() if ln.strip()]
-    lb = [ln.strip() for ln in _delta_text(b, ranges_b).splitlines() if ln.strip()]
+    exactly what a size fix looks like, and nothing here ranks or files it. The try/catch
+    annotation's addresses are blanked under the reading's own rule (``addr_a`` / ``addr_b`` are
+    the pair's entries): when they did not all move by the entry offset, the changed annotation is
+    a ``comment`` substitution, never ``layout_only``."""
+    blank_try = try_shift_consistent(a, b, _hex_int(addr_a), _hex_int(addr_b))
+    la = [ln.strip() for ln in _delta_text(a, ranges_a, blank_try).splitlines() if ln.strip()]
+    lb = [ln.strip() for ln in _delta_text(b, ranges_b, blank_try).splitlines() if ln.strip()]
     if len(la) > DELTA_LINE_CAP or len(lb) > DELTA_LINE_CAP:
         return {"kind": "not_computed", "reason": "too_large"}
     spans = 0

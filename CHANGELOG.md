@@ -223,9 +223,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `layout_only`, the substituted tokens by kind, and the callees whose call counts differ. It is
     computed only for the page being read and never moves or files an entry.
   - `get_diff_patch_view(body=structure_differs|unknown)` lists one class of qualified match
-    (listed entries and `not_listed_page=aligned_pseudocode_identical_text_unverified`); the
-    significance lens counts the sunk ones whose byte counts differ
-    (`lens.sunk_with_body_size_differs`). `function_states` / `get_diff_meta` add
+    (listed entries and `not_listed_page=aligned_pseudocode_identical_text_unverified`; with any
+    other `not_listed_page` it is an error); the significance lens counts the sunk ones whose byte
+    counts differ, over the entries the current filters keep (`lens.sunk_with_body_size_differs`). `function_states` / `get_diff_meta` add
     `identical_text_unverified_by_body` and `alignment_undetermined_reading`, and the `tmap diff`
     line names the undetermined pairs' readings.
 
@@ -240,9 +240,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sunk by the significance lens only in bucket C. A large hex literal is now compared position by
   position: a value that changed reads as a moved address only when each side's value lies in that
   side's image, so a large constant that changed outside it is a difference. The addresses in
-  Ghidra's try/catch annotation are blanked like the other synthetic addresses. No stored data or
-  code version moves; on the diffs measured, the pairs that left `identical` all went to
-  `identical_text_unverified`, a few to `differs`, and none was made equal by the try/catch rule.
+  Ghidra's try/catch annotation are blanked only when every one of them moved by the pair's own
+  entry offset (the function moved as a whole); otherwise the pair reads `differs` and its
+  `pseudocode_delta` shows the annotation as a `comment` substitution. Unlike the rest, this rule
+  can make a pair equal that read `differs` before. No stored data or code version moves; on the
+  diffs measured, the pairs that left `identical` all went to `identical_text_unverified`, a few to
+  `differs`.
+  - Not seen by any of these readings: a C++ catch handler (landing pad) usually lies outside every
+    function body, so its code is never decompiled and no reading compares it; a try/catch
+    annotation that moved with its function says nothing about the handler.
 - **Distribution name `tmap-agents`** (import name `treasure_map` and command `tmap` unchanged); the
   version is written once, in `treasure_map/version.py`.
 - **The installed commit is read for index installs too.** A wheel from the package index carries
