@@ -39,11 +39,11 @@ jobs:
           python -m pip install --upgrade pip build
           python -m build
 
-      - name: Wheel contents and lock
+      - name: Wheel contents
         run: |
           set -e
           python - <<'PY'
-          import glob, json, sys, zipfile
+          import glob, sys, zipfile
           wheel = zipfile.ZipFile(glob.glob("dist/*.whl")[0])
           names = wheel.namelist()
           need = [
@@ -59,13 +59,7 @@ jobs:
           missing = [n for n in need if n not in names]
           if missing:
               sys.exit(f"wheel is missing {missing}")
-          from treasure_map.lib.setup.toolchain_lock import parse_lock, placeholders
-          left = placeholders(parse_lock(json.loads(wheel.read("treasure_map/lib/setup/toolchain_lock.json"))))
-          if left:
-              sys.exit(f"toolchain_lock.json still has placeholders: {left}")
           PY
-        env:
-          PYTHONPATH: src
 
       - name: Install from the index form (no direct_url.json) and check
         run: |
@@ -77,6 +71,19 @@ jobs:
           /tmp/v/bin/pip install --force-reinstall --no-deps --no-index --find-links dist "tmap-agents==$V"
           [ "$(/tmp/v/bin/tmap --version)" = "tmap $V" ]
           [ "$(/tmp/v/bin/python -c 'from treasure_map.version import installed_commit; print(installed_commit())')" = "$GITHUB_SHA" ]
+
+      # Read by the installed tmap (-I: never the checkout's src/), whose dependencies the venv has.
+      - name: The shipped lock has no placeholder
+        run: |
+          set -e
+          /tmp/v/bin/python -I - <<'PY'
+          import glob, json, sys, zipfile
+          from treasure_map.lib.setup.toolchain_lock import parse_lock, placeholders
+          wheel = zipfile.ZipFile(glob.glob("dist/*.whl")[0])
+          left = placeholders(parse_lock(json.loads(wheel.read("treasure_map/lib/setup/toolchain_lock.json"))))
+          if left:
+              sys.exit(f"toolchain_lock.json still has placeholders: {left}")
+          PY
 
       # The release is drafted first (a draft is never "latest", so the install URL does not move
       # yet), then the package goes to PyPI, then the draft is published as latest. A failure at

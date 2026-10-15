@@ -101,7 +101,7 @@ jobs:
       - name: Export smoke (tmap's own export script on an OSS fixture)
         run: |
           set -e
-          SCRIPTS="$(python -c 'import treasure_map.lib.diff.ghidra as g, os; print(os.path.dirname(g.__file__))')"
+          SCRIPTS="$(python -c 'from treasure_map.lib.diff.driver import _SCRIPT_DIR; print(_SCRIPT_DIR)')"
           "$GHIDRA/support/analyzeHeadless" "$PWD/proj" Q -import tests/fixtures/elfs/libz_x86_64.so \
             -scriptPath "$SCRIPTS" -postScript ExportBinExport.java "$PWD/out.BinExport" "$PWD/out.export_report.json" \
             -deleteProject
