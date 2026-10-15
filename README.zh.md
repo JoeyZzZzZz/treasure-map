@@ -251,7 +251,7 @@ atlas、含 tmap `analysis.db` 的工作区目录（工作区根目录本身不�
 
 ## 参与贡献
 
-欢迎提交 issue 和 pull request，详见 [CONTRIBUTING.md](CONTRIBUTING.md)。pull request 里的每个提交都要用 `git commit -s` 签署 [DCO](https://developercertificate.org/)。
+欢迎提交 issue 和 pull request，详见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 许可证
 

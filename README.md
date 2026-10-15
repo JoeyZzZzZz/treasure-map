@@ -316,8 +316,7 @@ ensuring your activity is lawful in your jurisdiction. If unsure, consult qualif
 
 ## Contributing
 
-Issues and pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). Each commit in a pull
-request is signed off with `git commit -s` ([DCO](https://developercertificate.org/)).
+Issues and pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
