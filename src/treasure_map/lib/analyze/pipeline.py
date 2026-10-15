@@ -186,19 +186,14 @@ async def run_analyze(
                     len(dirty_records),
                 )
 
+            # ★ R6: the SUCCESS stamp (ghidra_ok/status/pass_version) is NOT written here. It is
+            # written inside ingest_ghidra_output, in the same transaction as the function rows, so
+            # a binary is never marked extracted while its functions are missing. A FAILURE has no
+            # functions to lose, so it is stamped and committed here as before.
+            success_stamp: dict[str, tuple[str, str]] = {}
             for rec, res in zip(dirty_records, results, strict=False):
-                # ★ Red-line: persist the tri-state outcome. ghidra_ok stays a 0/1 usability flag
-                # (ok/ok_empty -> 1) for back-compat; ghidra_status records WHICH of the three, so a
-                # failed run is visibly not "clean" (ghidra_ok=0) and is retried next run.
-                # Stamp the pass_version that produced this output, but ONLY on success: a failed
-                # run leaves pass_version untouched (still stale/NULL) so it stays dirty next time.
                 if res.success:
-                    conn.execute(
-                        "UPDATE binaries SET ghidra_ok=?, ghidra_status=?, "
-                        "ghidra_status_reason=NULL, pass_version=?, ghidra_version=? "
-                        "WHERE sha256=?",
-                        (1, res.analysis_status, pass_version, ghidra_version, rec.sha256),
-                    )
+                    success_stamp[rec.sha256] = (res.analysis_status, ghidra_version)
                 else:
                     # record WHY it failed (timeout/import_failed/no_output/incomplete/
                     # stale_output) so the incomplete surfacing can tell a recoverable timeout
@@ -225,7 +220,7 @@ async def run_analyze(
                     ingest_records.append(rec)
                 else:
                     ghidra_failed += 1
-            conn.commit()
+            conn.commit()  # the FAILURE stamps only; successes commit with their functions below
         else:
             logger.info("ghidra: all binaries up-to-date (0 dirty)")
 
@@ -236,6 +231,7 @@ async def run_analyze(
             ingest_records,
             sha_to_id,
             pass_version=pass_version,
+            success_stamp=success_stamp if dirty_records else None,
         )
 
         # Round B: build cross-binary xrefs + classify strings (wipe-and-rebuild)

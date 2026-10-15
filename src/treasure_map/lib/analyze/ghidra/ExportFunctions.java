@@ -14,7 +14,7 @@
 // Name lists come from extractor_names.tsv next to this script (see loadRegistry).
 //
 // No external dependencies - JSON is built manually (no Gson).
-// Tested on Ghidra 11.1.2
+// Tested on Ghidra 11.4.3 (the pinned toolchain version)
 
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.listing.*;
@@ -1270,9 +1270,9 @@ public class ExportFunctions extends GhidraScript {
     //
     // ★ SCOPE INCLUDES EXECUTABLE BLOCKS, and that is deliberate. On an ELF stripped of section
     // headers Ghidra builds one block per PT_LOAD and the read-only data rides INSIDE the executable
-    // RX segment — measured on real firmware, 454/456, 455/455 and 417/417 binaries of three images
-    // are section-header-free, so collecting non-executable blocks only would have failed to answer
-    // a .rodata address on the overwhelming majority of real binaries. The price of that reach is an
+    // RX segment — on the firmware measured, nearly every binary is section-header-free, so
+    // collecting non-executable blocks only would have failed to answer a .rodata address on the
+    // overwhelming majority of binaries. The price of that reach is an
     // honesty duty the consumer must not lose: without section headers NOTHING here can tell .rodata
     // from .text inside an RX block, so `executable` travels with every record and the read side
     // turns it into a standing warning that the returned run may be DATA or may be INSTRUCTIONS.
@@ -1284,12 +1284,12 @@ public class ExportFunctions extends GhidraScript {
     //   initialized=false a .bss block: the ELF reserves the extent but stores no bytes, so the
     //                     value exists only at runtime. Exported WITH its extent and NO bytes —
     //                     declared missing, never silently zero-filled (a zero would be a reading).
-    // Caps, CALIBRATED against real firmware images (456 / 417 / 479 binaries) with the EXECUTABLE
-    // segments included: per binary the median is 0.02 MiB, p99 is 1.4 MiB and the worst single
-    // binary measured is 14.1 MiB — which is why the caps sit at 16 MiB per block and 32 MiB per
-    // binary rather than the 4/8 MiB that sufficed while only data blocks were collected. Whole-
-    // image cost is 36-64 MiB of exported bytes (+8% to +22% of the analysis.db those images
-    // already produce) — the deliberate price of answering a .rodata address on a section-header-
+    // Caps, CALIBRATED against the firmware images measured with the EXECUTABLE segments included:
+    // per binary the median exported size is tiny, the high percentiles a megabyte or two, and the
+    // worst single binary measured about 14 MiB — which is why the caps sit at 16 MiB per block and
+    // 32 MiB per binary rather than the 4/8 MiB that sufficed while only data blocks were collected.
+    // Whole-image cost is a modest fraction over the analysis.db those images already produce — the
+    // deliberate price of answering a .rodata address on a section-header-
     // stripped binary at all. Should a future image exceed a cap, truncated/cap_hit is what keeps
     // the shortfall visible instead of silent.
     private static final long DATABLK_MAX_BYTES_PER_BLOCK = 16_777_216L;  // 16 MiB, per block
@@ -1376,7 +1376,7 @@ public class ExportFunctions extends GhidraScript {
     // object here". A dispatch table is very often the ONLY reference to its handler, so nothing
     // calls it directly and auto-analysis never defines it. Requiring a defined Function silently
     // TERMINATED a table at every such slot, cutting one real table into fragments and dropping any
-    // fragment shorter than the run minimum — measured on real firmware: of one 32-entry handler
+    // fragment shorter than the run minimum — measured on firmware: of one 32-entry handler
     // table (all 32 strictly contiguous, every word0 a .rodata string, every word1 inside .text),
     // only 17 handlers were Ghidra-defined, so the table shattered and even DEFINED handlers were
     // lost when their undefined neighbours broke the run around them.
@@ -1496,10 +1496,10 @@ public class ExportFunctions extends GhidraScript {
     // whole binary's export. Neither drops silently: the per-string cap sets truncated on THAT
     // string's record, the total cap sets cap_hit on the whole result.
     //
-    // CALIBRATED on real firmware: references run at ~0.96 per defined string (2252 refs over 2356
-    // strings on a measured binary), 83% of strings carry exactly one, and the busiest single string
-    // carried 13 — so the per-string cap of 100 has ~8x headroom. The richest real binary in the
-    // corpus holds 14,317 defined strings, projecting to ~13.7k references, and STR_LIMIT bounds any
+    // CALIBRATED on firmware measured: references run at roughly one per defined string, the large
+    // majority of strings carry exactly one, and the busiest single string a low double-digit count
+    // — so the per-string cap of 100 has ample headroom. The richest binary measured holds on the
+    // order of ten thousand defined strings, and STR_LIMIT bounds any
     // binary at 20,000 strings (~19k projected references) — so the total cap of 200,000 has ~10x
     // headroom and did not bite anywhere measured. Cost measured on the same binary: +0.39 MiB of
     // payload and NO measurable analyze time (29.93s before, 29.78s after, on an already-analyzed
@@ -1520,8 +1520,8 @@ public class ExportFunctions extends GhidraScript {
     //   who points AT the string. FILTER: by REFERENCE TYPE (drop isCall / isFlow — those are
     //   control flow, not a data reference), NEVER by source segment: an ARM literal-pool `ldr =S`
     //   is a DATA ref that sits in an EXECUTABLE block, so a segment filter would drop the ordinary
-    //   case — and on real ARM firmware it is not merely the ordinary case but the ONLY one:
-    //   measured on a real binary, 2252 of 2252 references were ".text-literalpool", so a segment
+    //   case — and on the ARM firmware measured it is not merely the ordinary case but the ONLY
+    //   one: every reference measured on such a binary was ".text-literalpool", so a segment
     //   filter would have deleted the entire feature there. ``segment`` is metadata only. ★ IRON LAW: a fact (S is referenced HERE), NEVER a
     //   dispatch/reachability verdict — what the referencing code then does with S is the
     //   consumer's to trace.
@@ -1795,7 +1795,9 @@ public class ExportFunctions extends GhidraScript {
              + "\",\"value_kind\":\"ambiguous_0x\"}";
     }
 
-    // stack_buf: writer set (stackKey equal-match) + sound CHK-dominance ordering (the provenance design, gap ①).
+    // stack_buf: writer set (stackKey equal-match) + CHK-dominance ordering. "dominates_sink" is a
+    // write on every path to the sink, not necessarily the last — a later writer may add to the
+    // buffer (may_reach_sink below); the read side weighs both (the provenance design, gap ①).
     private String stackBuf(String key, PcodeOpAST sink, List<PcodeOpAST> ops, DomCtx dom, int depth) {
         List<PcodeOpAST> writers = new ArrayList<>();
         for (PcodeOpAST op : ops) {
@@ -1826,9 +1828,19 @@ public class ExportFunctions extends GhidraScript {
             if (!firstW) wsb.append(",");
             firstW = false;
             wsb.append("{\"writer\":\"").append(esc(cn + "@" + addr0x(w))).append("\"")
-               .append(",\"dominates_sink\":").append(dominates)
-               .append(fmtAndVarargs(w, cn, depth))
-               .append("}");
+               .append(",\"dominates_sink\":").append(dominates);
+            // may_reach_sink=false ONLY when this writer is provably dead: another writer that
+            // OVERWRITES the whole buffer (not strcat/strncat, which append) runs after it on every
+            // path to the sink. The sound, simple case is a later overwrite in the SAME block,
+            // itself before the sink. Absent proof the field is omitted — the reader then treats
+            // the writer as reaching, the conservative default. A wrong 'false' would hide a real
+            // controllable writer, so only the certain case is emitted.
+            if (!deadByLaterOverwrite(w, wa, wblk, sinkBlk, sinkAddr, writers)) {
+                // omit: default is may-reach
+            } else {
+                wsb.append(",\"may_reach_sink\":false");
+            }
+            wsb.append(fmtAndVarargs(w, cn, depth)).append("}");
         }
         wsb.append("]");
 
@@ -1842,6 +1854,28 @@ public class ExportFunctions extends GhidraScript {
         }
         sb.append(",\"writers\":").append(wsb).append(",\"attribution\":\"chk_dominance\"}");
         return sb.toString();
+    }
+
+    // Writers that OVERWRITE their destination buffer from offset 0 — everything in WRITERS except
+    // the appending strcat/strncat. An overwrite after another writer, before the sink, erases it.
+    private static final Set<String> APPEND_WRITERS = new HashSet<>(Arrays.asList(
+            "strcat", "strncat", "wcscat", "wcsncat"));
+
+    /** Whether writer ``w`` is provably overwritten before the sink: a same-block OVERWRITE writer
+     *  (strcat/strncat excluded) after ``w`` and before the sink. Sound and deliberately narrow —
+     *  false (not dead) under any doubt, so the reader never drops a writer that might reach. */
+    private boolean deadByLaterOverwrite(PcodeOpAST w, long wa, int wblk,
+                                         int sinkBlk, long sinkAddr, List<PcodeOpAST> writers) {
+        if (wblk != sinkBlk) return false;   // only the straight-line, same-block case is certain
+        for (PcodeOpAST w2 : writers) {
+            if (w2 == w) continue;
+            String cn2 = calleeNameOf(w2);
+            if (cn2 == null || APPEND_WRITERS.contains(cn2)) continue;   // an append does not erase
+            if (w2.getParent().getIndex() != sinkBlk) continue;
+            long w2a = w2.getSeqnum().getTarget().getOffset();
+            if (w2a > wa && w2a < sinkAddr) return true;   // overwrites w, before the sink
+        }
+        return false;
     }
 
     // A writer's format string + its varargs' shallow source classification. The fmt reaches the
@@ -2236,6 +2270,78 @@ public class ExportFunctions extends GhidraScript {
         return arr.toString();
     }
 
+    // Per-function listing cap. A function past it stores its prefix and listing_truncated=1 —
+    // the same honest-truncation rule as callees/strings, never a silent clip.
+    private static final int LISTING_MAX_UNITS = 20000;
+    private final CodeUnitFormat cuFormat = CodeUnitFormat.DEFAULT;
+
+    /** Ghidra's own listing for this function, one row per code unit, deflated+Base64.
+     *
+     *  This is the disassembly get_disassembly serves. The operands come from CodeUnitFormat, so a
+     *  call reads ``bl FUN_0001a2b4`` / ``bl printf`` with the SAME names the pseudocode uses, and
+     *  an ARM/Thumb or MIPS16 unit is rendered in the mode Ghidra decoded it in (length distinguishes
+     *  them). Each row: a=address, n=byte length, k=code|data, and for code m=mnemonic, o=operands.
+     *  The raw bytes are NOT stored here — the read layer takes them from data_blocks by (a,n), so a
+     *  code unit's bytes live in exactly one place. Compressed because the text of a large .text can
+     *  be several MB; the result is a ``listing`` object carrying the Base64 stream and the counts. */
+    private String buildListing(Function func) {
+        Listing listing = currentProgram.getListing();
+        CodeUnitIterator it = listing.getCodeUnits(func.getBody(), true);
+        StringBuilder rows = new StringBuilder("[");
+        boolean first = true;
+        int units = 0, insns = 0;
+        boolean truncated = false;
+        while (it.hasNext()) {
+            CodeUnit cu = it.next();
+            if (units >= LISTING_MAX_UNITS) { truncated = true; break; }
+            String a = "0x" + Long.toHexString(cu.getMinAddress().getOffset());
+            int n = cu.getLength();
+            if (!first) rows.append(",");
+            first = false;
+            if (cu instanceof Instruction) {
+                Instruction instr = (Instruction) cu;
+                StringBuilder ops = new StringBuilder();
+                int nops = instr.getNumOperands();
+                for (int i = 0; i < nops; i++) {
+                    if (i > 0) ops.append(", ");
+                    ops.append(cuFormat.getOperandRepresentationString(cu, i));
+                }
+                rows.append("{\"a\":\"").append(a).append("\",\"n\":").append(n)
+                    .append(",\"k\":\"code\",\"m\":\"").append(esc(instr.getMnemonicString()))
+                    .append("\",\"o\":\"").append(esc(ops.toString())).append("\"}");
+                insns++;
+            } else {
+                // Data (or undefined) inside the body: recorded as a data row, never as an
+                // instruction — the decompiler read these bytes as data, and so must the reader.
+                rows.append("{\"a\":\"").append(a).append("\",\"n\":").append(n)
+                    .append(",\"k\":\"data\"}");
+            }
+            units++;
+        }
+        rows.append("]");
+        String z;
+        try {
+            z = deflateB64(rows.toString());
+        } catch (Exception e) {
+            return ",\"listing\":null";
+        }
+        return ",\"listing\":{\"z\":\"" + z + "\",\"units\":" + units
+             + ",\"insns\":" + insns + ",\"truncated\":" + truncated + "}";
+    }
+
+    private static String deflateB64(String s) throws IOException {
+        byte[] raw = s.getBytes("UTF-8");
+        java.util.zip.Deflater d = new java.util.zip.Deflater(
+                java.util.zip.Deflater.BEST_COMPRESSION);
+        d.setInput(raw);
+        d.finish();
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        byte[] buf = new byte[8192];
+        while (!d.finished()) out.write(buf, 0, d.deflate(buf));
+        d.end();
+        return Base64.getEncoder().encodeToString(out.toByteArray());
+    }
+
     private String addr0x(PcodeOp op) {
         return "0x" + Long.toHexString(op.getSeqnum().getTarget().getOffset());
     }
@@ -2353,7 +2459,7 @@ public class ExportFunctions extends GhidraScript {
             HighFunction hf = null;   // Varnode/def-use + block graph from the SAME decompile (design B)
             DecompileResults drKeep = null;   // D4 bridge: kept so the C markup can be walked below
             if (funcSize < 10) {
-                // Leave pseudocode empty — populate_db.py handles null pseudocode fine.
+                // Leave pseudocode empty — ghidra_ingest handles null pseudocode fine.
             } else try {
                 DecompileResults dr = decomp.decompileFunction(func, 20, monitor);
                 if (dr != null && dr.decompileCompleted()) {
@@ -2449,6 +2555,12 @@ public class ExportFunctions extends GhidraScript {
             calleesArr.append("]");
             edgesArr.append("]");
 
+            // Which additive detectors threw on this function. A detector that FAILED returns its
+            // empty value just like one that genuinely found nothing; without this list a reader
+            // cannot tell "looked, found none" from "the look crashed", and a crash would read as a
+            // clean result. Each catch below names itself here (gap G1#1).
+            List<String> detectorErrors = new ArrayList<>();
+
             // sink_arg_provenance: Ghidra def-use fact for each command/format sink's key argument.
             // Reuses the decompile above (hf); empty [] when unavailable or no sink present. Never
             // throws out of the loop — provenance is additive evidence, not a gate.
@@ -2457,6 +2569,7 @@ public class ExportFunctions extends GhidraScript {
                 if (hf != null) sinkProv = buildSinkProvenance(hf);
             } catch (Throwable ignore) {
                 sinkProv = "[]";
+                detectorErrors.add("sink_provenance");
             }
 
             // gap② phase 1: per-function nvram read/write ops. Additive evidence, never a gate.
@@ -2465,6 +2578,7 @@ public class ExportFunctions extends GhidraScript {
                 if (hf != null) nvramOps = buildNvramOps(hf);
             } catch (Throwable ignore) {
                 nvramOps = "[]";
+                detectorErrors.add("nvram_ops");
             }
 
             // detector B: string-keyed edges (strcmp-ladder dispatch). Additive, isolated fact
@@ -2474,6 +2588,7 @@ public class ExportFunctions extends GhidraScript {
                 if (hf != null) strKeyedEdges = buildStringKeyedEdges(hf);
             } catch (Throwable ignore) {
                 strKeyedEdges = "{\"edges\":[]}";
+                detectorErrors.add("string_keyed_edges");
             }
 
             // address-taken: who references THIS function's entry as data/pointer (non-call, non-flow)
@@ -2484,6 +2599,7 @@ public class ExportFunctions extends GhidraScript {
                 addressTaken = buildAddressTaken(func);
             } catch (Throwable ignore) {
                 addressTaken = "{\"edges\":[],\"truncated\":false}";
+                detectorErrors.add("address_taken");
             }
 
             // gap② A2: thin-nvram-wrapper flag + its callers' resolved literal keys. Additive and
@@ -2507,7 +2623,19 @@ public class ExportFunctions extends GhidraScript {
             catch (Throwable ignore) { callTokens = "[]"; }
             String bodyRanges = "[]";
             try { bodyRanges = buildBodyRanges(func); }
-            catch (Throwable ignore) { bodyRanges = "[]"; }
+            catch (Throwable ignore) { bodyRanges = "[]"; detectorErrors.add("body_ranges"); }
+
+            // Ghidra's listing for this function (the get_disassembly source), deflated+Base64.
+            String listing = ",\"listing\":null";
+            try { listing = buildListing(func); }
+            catch (Throwable ignore) { listing = ",\"listing\":null"; detectorErrors.add("listing"); }
+
+            StringBuilder deArr = new StringBuilder("[");
+            for (int di = 0; di < detectorErrors.size(); di++) {
+                if (di > 0) deArr.append(",");
+                deArr.append("\"").append(esc(detectorErrors.get(di))).append("\"");
+            }
+            deArr.append("]");
 
             if (!firstFunc) funcsJson.append(",");
             firstFunc = false;
@@ -2525,7 +2653,9 @@ public class ExportFunctions extends GhidraScript {
                      .append("\"string_keyed_edges\":").append(strKeyedEdges).append(",")
                      .append("\"address_taken\":").append(addressTaken).append(",")
                      .append("\"call_tokens\":").append(callTokens).append(",")
-                     .append("\"body_ranges\":").append(bodyRanges).append(",")
+                     .append("\"body_ranges\":").append(bodyRanges)
+                     .append(listing)             // ",\"listing\":{...}" or ",\"listing\":null"
+                     .append(",\"detector_errors\":").append(deArr).append(",")
                      .append("\"pseudocode\":")  .append("\"").append(esc(pseudocode)).append("\"")
                      .append("}");
             funcCount++;
@@ -2729,7 +2859,7 @@ public class ExportFunctions extends GhidraScript {
         // 5. Write JSON output file — atomically.
         // Write to a .tmp sibling first, then ATOMIC_MOVE into place so an
         // interrupted JVM (killpg on timeout / OOM) can never leave a partial
-        // file that 05_populate_db.py would mistake for a complete export.
+        // file that ghidra_ingest would mistake for a complete export.
         new File(outputDir).mkdirs();
         String outFileName = binaryName + "_" + sha8 + "_ghidra.json";
         String outPath     = outputDir + "/" + outFileName;

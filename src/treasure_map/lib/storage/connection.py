@@ -93,6 +93,8 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # different answers and only a re-scan turns the first into the second. Must match
     # schema.sql.
     ("binaries", "stub_names", "TEXT"),
+    # which additive detectors threw on a function (older DBs: '[]', i.e. none recorded)
+    ("functions", "detector_errors", "TEXT DEFAULT '[]'"),
 )
 
 

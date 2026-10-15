@@ -1111,3 +1111,49 @@ def test_a_rescan_writes_the_current_readers_dt_needed_onto_an_existing_row(
     stored = conn.execute("SELECT dt_needed FROM binaries").fetchone()[0]
     conn.close()
     assert json.loads(stored) == ["libc.so.0", "libnvram.so"]
+
+
+def test_ingest_stores_the_listing_and_marks_the_binary(tmp_path: Path) -> None:
+    """A function JSON carrying a base64 listing lands in function_listing, keyed by functions.id,
+    and the binary gets a detector_scan_status(detector='listing') row.
+
+    MUTATION: drop the _ingest_listings call, or the per-binary listing status -> RED."""
+    import base64
+    import zlib
+
+    from treasure_map.lib.analyze.ghidra_ingest import IngestStats, _ingest_one_binary
+
+    conn = open_db(tmp_path / "analysis.db")
+    conn.execute(
+        "INSERT INTO binaries (id, name, path, sha256, last_seen_at) VALUES "
+        "(1, 'd', 'sbin/d', ?, '2026-01-01')",
+        ("f" * 64,),
+    )
+    z = base64.b64encode(
+        zlib.compress(b'[{"a":"0x10","n":4,"k":"code","m":"nop","o":""}]')
+    ).decode()
+    data = {
+        "functions": [
+            {
+                "name": "f1",
+                "address": "0x10",
+                "pseudocode": "void f1(){}",
+                "callees": [],
+                "listing": {"z": z, "units": 1, "insns": 1, "truncated": False},
+                "detector_errors": ["sink_provenance"],
+            }
+        ]
+    }
+    _ingest_one_binary(conn, 1, data, IngestStats())
+    de = conn.execute("SELECT detector_errors FROM functions WHERE name='f1'").fetchone()[0]
+    fl = conn.execute(
+        "SELECT unit_count, insn_count FROM function_listing fl "
+        "JOIN functions f ON f.id = fl.function_id WHERE f.name = 'f1'"
+    ).fetchone()
+    status = conn.execute(
+        "SELECT scanned FROM detector_scan_status WHERE binary_id=1 AND detector='listing'"
+    ).fetchone()
+    conn.close()
+    assert json.loads(de) == ["sink_provenance"]
+    assert tuple(fl) == (1, 1)
+    assert status is not None and status[0] == 1

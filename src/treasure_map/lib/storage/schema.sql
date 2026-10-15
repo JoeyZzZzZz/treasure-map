@@ -128,7 +128,24 @@ CREATE TABLE IF NOT EXISTS functions (
     -- '[]' when every external call resolved (or the binary is not MIPS). A completeness lead, not
     -- a verdict.
     unresolved_external_calls TEXT DEFAULT '[]',
+    -- detector_errors: JSON array of the additive detectors that THREW on this function (e.g.
+    -- ["sink_provenance"]). A detector that failed returns its empty value like one that found
+    -- nothing; this names the ones that crashed so a reader does not read a crash as a clean empty.
+    detector_errors TEXT DEFAULT '[]',
     FOREIGN KEY(binary_id) REFERENCES binaries(id) ON DELETE CASCADE
+);
+
+-- function_listing: Ghidra's disassembly listing for one function, deflated. Kept out of the hot
+-- functions table (a blob per row would slow every function scan) and joined by id when
+-- get_disassembly asks. listing is the raw zlib stream of the listing JSON the extractor emitted;
+-- the instruction bytes are NOT here — the read layer takes them from data_blocks by (addr,len).
+CREATE TABLE IF NOT EXISTS function_listing (
+    function_id  INTEGER PRIMARY KEY,
+    listing      BLOB,                  -- zlib(JSON [{a,n,k,m,o}, ...]); NULL if the export was null
+    unit_count   INTEGER DEFAULT 0,
+    insn_count   INTEGER DEFAULT 0,
+    truncated    INTEGER DEFAULT 0,     -- 1 = capped at LISTING_MAX_UNITS; the stored rows are a prefix
+    FOREIGN KEY(function_id) REFERENCES functions(id) ON DELETE CASCADE
 );
 
 -- 导入符号
@@ -281,11 +298,11 @@ CREATE TABLE IF NOT EXISTS data_blocks (
     size        INTEGER,    -- the block's full extent in bytes (may exceed len(bytes) — see truncated)
     bytes       BLOB,       -- raw stored bytes; NULL when initialized=0 (.bss has none)
     initialized INTEGER,    -- 1 = the ELF stores bytes here; 0 = .bss (runtime-only value)
-    executable  INTEGER DEFAULT 0,  -- 1 = an EXECUTABLE block: extent recorded, bytes deliberately
-                                    --   NOT exported (data only, never code). On a section-header-
-                                    --   stripped ELF the read-only data rides inside the executable
-                                    --   PT_LOAD, so this row is what makes "the scope excluded it"
-                                    --   distinguishable from "no block covers this address".
+    executable  INTEGER DEFAULT 0,  -- 1 = an EXECUTABLE block. Its bytes ARE exported (an sstrip'd
+                                    --   ELF carries .rodata inside the executable PT_LOAD, and
+                                    --   get_disassembly reads instruction bytes from here); the
+                                    --   flag only warns a get_data_bytes reader that a run from
+                                    --   such a block may be code rather than data.
     truncated   INTEGER DEFAULT 0,  -- 1 = a cap cut the export: bytes cover < size
     FOREIGN KEY(binary_id) REFERENCES binaries(id) ON DELETE CASCADE
 );

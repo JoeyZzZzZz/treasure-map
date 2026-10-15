@@ -2549,8 +2549,14 @@ def make_tools(
         binary: str | None = None,
         run_id: str | None = None,
         evidence_ref: str | None = None,
+        offset: int = 0,
     ) -> dict[str, Any]:
-        """On-demand disassembly — same-source aligned, or an honest 'unavailable' (never wrong).
+        """The disassembly listing Ghidra produced for one function (addresses line up with the
+        pseudocode — same load), paged by ``offset``, or an honest ``available: false`` when the
+        run was analysed before tmap stored listings (re-scan to get it).
+
+        Each instruction carries its ``bytes`` from the stored segments; where none covers it the
+        bytes are null with a reason, never zeroed.
 
         Run-aware: ``run_id`` + ``function`` or ``evidence_ref``; echoes ``resolved_run``.
 
@@ -2561,7 +2567,7 @@ def make_tools(
         the firmware, not an error.
         When ``func`` resolves, ITS binary is used and ``binary`` does not re-select."""
         return _fact(
-            lambda c, fn, bn: facts.get_disassembly(c, func=fn or "", binary=bn),
+            lambda c, fn, bn: facts.get_disassembly(c, func=fn or "", binary=bn, offset=offset),
             run_id=run_id,
             evidence_ref=evidence_ref,
             function=function,

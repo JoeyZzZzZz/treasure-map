@@ -57,6 +57,7 @@ def ingest_ghidra_output(
     dirty_records: list[ElfRecord],
     sha_to_id: dict[str, int],
     pass_version: str | None = None,
+    success_stamp: dict[str, tuple[str, str]] | None = None,
 ) -> IngestStats:
     """For each dirty binary, locate its <name>_<sha8>_ghidra.json,
     parse, and write to functions/imports/exports/strings tables.
@@ -153,6 +154,18 @@ def ingest_ghidra_output(
         # which stays distinct from "exports nothing".
         exports = dynamic_function_exports(rec.path)
         _ingest_one_binary(conn, binary_id, data, stats, resolution, exports)
+        # ★ R6: stamp pass_version HERE — in the same transaction as this binary's function rows,
+        # committed together at the end of this function. Stamped in the pipeline's own loop (and
+        # committed there) BEFORE ingest, an interrupt between the two left a binary marked done
+        # with no functions, which the next scan read as a finished extraction and skipped forever.
+        stamp = (success_stamp or {}).get(rec.sha256)
+        if stamp is not None:
+            analysis_status, ghidra_version = stamp
+            conn.execute(
+                "UPDATE binaries SET ghidra_ok = 1, ghidra_status = ?, "
+                "ghidra_status_reason = NULL, pass_version = ?, ghidra_version = ? WHERE id = ?",
+                (analysis_status, pass_version, ghidra_version, binary_id),
+            )
         stats.binaries_processed += 1
 
     conn.commit()
@@ -183,6 +196,47 @@ def _exported_flag(func_name: Any, exports: frozenset[str] | None) -> int:
     if exports is None or not isinstance(func_name, str):
         return 0
     return 1 if func_name in exports else 0
+
+
+def _ingest_listings(conn: sqlite3.Connection, binary_id: int, funcs: list[dict[str, Any]]) -> None:
+    """Store each function's deflated listing in function_listing, keyed by the functions.id just
+    written, and record ONE detector_scan_status(detector='listing', scanned=1) for the binary so
+    an old analysis.db (no listing at all) is told apart from a function that genuinely has none."""
+    import base64
+
+    by_addr = {
+        r[0]: r[1]
+        for r in conn.execute("SELECT address, id FROM functions WHERE binary_id = ?", (binary_id,))
+    }
+    rows: list[tuple[Any, ...]] = []
+    for func in funcs:
+        listing = func.get("listing")
+        fid = by_addr.get(func.get("address"))
+        if not isinstance(listing, dict) or fid is None:
+            continue
+        z = listing.get("z")
+        blob = base64.b64decode(z) if isinstance(z, str) and z else None
+        rows.append(
+            (
+                fid,
+                blob,
+                int(listing.get("units") or 0),
+                int(listing.get("insns") or 0),
+                1 if listing.get("truncated") else 0,
+            )
+        )
+    if rows:
+        conn.executemany(
+            "INSERT OR REPLACE INTO function_listing "
+            "(function_id, listing, unit_count, insn_count, truncated) VALUES (?, ?, ?, ?, ?)",
+            rows,
+        )
+    # The per-binary 'this binary was extracted with listing support' mark (0 rows is still a run).
+    conn.execute(
+        "INSERT INTO detector_scan_status (binary_id, detector, scanned, found_count) "
+        "VALUES (?, 'listing', 1, ?)",
+        (binary_id, len(rows)),
+    )
 
 
 def _ingest_one_binary(
@@ -267,6 +321,9 @@ def _ingest_one_binary(
                 # body address ranges, carried verbatim for hunt-time ref-offset + out-of-body.
                 json.dumps(func.get("call_tokens", []), ensure_ascii=False),
                 json.dumps(func.get("body_ranges", []), ensure_ascii=False),
+                # which additive detectors threw on this function (gap G1#1): a crash is named
+                # here, never read as a clean empty by the layer that consumes the detector.
+                json.dumps(func.get("detector_errors", []), ensure_ascii=False),
             )
         )
     if func_rows:
@@ -276,11 +333,12 @@ def _ingest_one_binary(
                 pseudocode_hash, callees, callees_truncated, is_exported,
                 sink_provenance, nvram_ops, nvram_wrapper, wrapper_call_args,
                 string_keyed_edges, address_taken, unresolved_external_calls,
-                call_tokens, body_ranges)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                call_tokens, body_ranges, detector_errors)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             func_rows,
         )
         stats.functions_ingested += len(func_rows)
+        _ingest_listings(conn, binary_id, data.get("functions", []))
 
     # imports (JSON's lib_name maps to DB's lib_soname)
     imp_rows = [

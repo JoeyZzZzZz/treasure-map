@@ -113,6 +113,20 @@ def pseudocode(function: str, binary: str | None, analysis_db: str) -> None:
         conn.close()
 
 
+@fact.command(name="disassembly")
+@click.argument("function")
+@click.option("--binary", default=None, help="Scope to one binary (disambiguates a shared name).")
+@click.option("--offset", default=0, type=int, help="Instruction offset to page from.")
+@click.option("--analysis-db", default="analysis.db", help="Path to the analysis database.")
+def disassembly(function: str, binary: str | None, offset: int, analysis_db: str) -> None:
+    """Print FUNCTION's stored Ghidra disassembly listing (addresses match the pseudocode)."""
+    conn = _open_fact_db(analysis_db)
+    try:
+        _emit_fact(conn, facts.get_disassembly(conn, func=function, binary=binary, offset=offset))
+    finally:
+        conn.close()
+
+
 @fact.command(name="callees")
 @click.argument("function")
 @click.option("--binary", default=None, help="Scope to one binary.")

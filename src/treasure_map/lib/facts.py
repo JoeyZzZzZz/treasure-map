@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal
 
@@ -1425,28 +1426,135 @@ def get_script_callsites(conn: sqlite3.Connection, *, binary: str) -> dict[str, 
     return {"found": True, "binary": binary, "callsites": sites}
 
 
-def get_disassembly(
-    conn: sqlite3.Connection, *, func: str, binary: str | None = None
-) -> dict[str, Any]:
-    """On-demand disassembly for one function (assembly is NOT stored; produced on request).
+def _byte_reader(
+    conn: sqlite3.Connection, binary_id: int
+) -> Callable[[int, int], tuple[str | None, str | None]]:
+    """A reader (addr, length) -> (hex bytes, None) or (None, reason) over one binary's stored data
+    blocks. Those blocks hold the executable segments' bytes too (an sstrip'd ELF carries code and
+    rodata in one RX block), so a code unit's bytes come from here — in ONE place, never re-stored
+    on the listing row."""
+    try:
+        blocks = [
+            (_hex_addr_int(b["start_addr"]) or 0, int(b["size"] or 0), b["bytes"], b["initialized"])
+            for b in conn.execute(
+                "SELECT start_addr, size, bytes, initialized FROM data_blocks WHERE binary_id = ?",
+                (binary_id,),
+            )
+        ]
+    except sqlite3.OperationalError:
+        blocks = []
 
-    HARD CONSTRAINT: on-demand assembly must be same-source aligned with the stored pseudocode
-    (same decompiler project / load base) or addresses would not line up and would mislead rather
-    than help. This server context does not retain the original decompiler project, so it CANNOT
-    establish that alignment — it degrades HONESTLY (``available: False`` with a reason) rather
-    than emit possibly-misaligned addresses. The function anchor is still returned so a consumer
-    can disassemble it in their own aligned tool."""
+    def read(addr: int, length: int) -> tuple[str | None, str | None]:
+        for start, size, raw, initialized in blocks:
+            if not (start <= addr < start + size):
+                continue
+            if not initialized or raw is None:
+                return None, "bytes_unavailable: uninitialized block"
+            off = addr - start
+            chunk = bytes(raw)[off : off + length]
+            if len(chunk) < length:
+                return None, "bytes_unavailable: block_truncated"
+            return chunk.hex(), None
+        return None, "bytes_unavailable: no block covers this address"
+
+    return read
+
+
+def get_disassembly(
+    conn: sqlite3.Connection,
+    *,
+    func: str,
+    binary: str | None = None,
+    offset: int = 0,
+    max_chars: int = 200_000,
+) -> dict[str, Any]:
+    """The disassembly listing Ghidra produced for one function, page by page.
+
+    The listing is stored at scan time (function_listing), so this reads it back — it does not
+    re-run Ghidra, and the addresses are the ones the pseudocode already uses, from the same load.
+    Each instruction carries its ``bytes`` taken from the stored data blocks by (address, length);
+    where a block does not cover it or was truncated, ``bytes`` is null with a reason, never zeroed.
+
+    ``available`` is False with a reason when this binary was extracted before tmap exported the
+    listing (re-scan to get it) — distinct from a function that genuinely has no instructions."""
     row, miss = _resolve_one(conn, func, binary)
     if row is None:
         assert miss is not None
         return miss
+    anchor = _anchor(row["binary_name"], row["binary_path"], row["name"], row["address"])
+    try:
+        has_pass = (
+            conn.execute(
+                "SELECT 1 FROM detector_scan_status WHERE binary_id = ? AND detector = 'listing' "
+                "LIMIT 1",
+                (row["binary_id"],),
+            ).fetchone()
+            is not None
+        )
+        lrow = conn.execute(
+            "SELECT listing, unit_count, insn_count, truncated FROM function_listing "
+            "WHERE function_id = ?",
+            (row["id"],),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        has_pass, lrow = False, None
+    if lrow is None or lrow["listing"] is None:
+        if has_pass and lrow is not None:
+            return {
+                "found": True,
+                "available": True,
+                "instructions": [],
+                "total": 0,
+                "anchor": anchor,
+            }
+        return {
+            "found": True,
+            "available": False,
+            "reason": (
+                "this binary was analysed before tmap exported disassembly; it is produced at scan "
+                f"time now — re-scan this run (tmap rescan) to get the listing for {row['name']}"
+            ),
+            "anchor": anchor,
+        }
+    import zlib
+
+    try:
+        units = json.loads(zlib.decompress(bytes(lrow["listing"])).decode("utf-8"))
+    except (zlib.error, ValueError, TypeError):
+        return {
+            "found": True,
+            "available": False,
+            "reason": "the stored listing could not be decompressed; re-scan to rebuild it",
+            "anchor": anchor,
+        }
+    read = _byte_reader(conn, row["binary_id"])
+    insns: list[dict[str, Any]] = []
+    for u in units:
+        a = u.get("a")
+        n = int(u.get("n") or 0)
+        addr_int = _hex_addr_int(a)
+        bytes_hex: str | None
+        why: str | None
+        if addr_int is None:
+            bytes_hex, why = None, "bytes_unavailable: bad address"
+        else:
+            bytes_hex, why = read(addr_int, n)
+        item: dict[str, Any] = {"address": a, "length": n, "kind": u.get("k")}
+        if u.get("k") == "code":
+            item["mnemonic"] = u.get("m")
+            item["operands"] = u.get("o")
+        item["bytes"] = bytes_hex
+        if why is not None:
+            item["bytes_unavailable"] = why.split(": ", 1)[1]
+        insns.append(item)
+    page, paging = _byte_page(insns, offset, max_chars)
     return {
         "found": True,
-        "available": False,
-        "reason": (
-            "on-demand disassembly requires the original decompiler project for same-source "
-            "address alignment, which this server context does not retain; refusing to emit "
-            "possibly-misaligned addresses (open the anchor in an aligned tool instead)"
-        ),
-        "anchor": _anchor(row["binary_name"], row["binary_path"], row["name"], row["address"]),
+        "available": True,
+        "anchor": anchor,
+        "instructions": page,
+        "total": len(insns),
+        "insn_count": lrow["insn_count"],
+        "listing_truncated": bool(lrow["truncated"]),
+        "paging": paging,
     }

@@ -1628,9 +1628,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the `tmap fact …` CLI commands, so a fact fetched either way is identical (one query, two
   thin wrappers). Two contracts hold on every tool: no anchor → no output (a miss returns a
   "not found" record, never a guess), and facts/chains/reachability-evidence/trigger-conditions
-  only — never a payload, trigger bytes, or PoC. `get_disassembly` is produced on demand and, when
-  same-source address alignment cannot be established, degrades honestly to "unavailable" rather
-  than emit possibly-misaligned addresses. Derived signals are labelled "derived, evidence-backed,
+  only — never a payload, trigger bytes, or PoC. `get_disassembly` returns the disassembly listing
+  Ghidra produced at scan time (its addresses line up with the pseudocode, from the same load),
+  with each instruction's bytes taken from the stored segments; a binary analysed before the
+  listing existed reads "unavailable" until it is re-scanned. Derived signals are labelled "derived, evidence-backed,
   not a verdict"; no interpretation column is reconstructed.
 - The shared read layer (`treasure_map.lib.facts`, used by both the MCP server and the `tmap
   fact …` CLI) gained three lookups so verification rarely has to leave the substrate: (1)
