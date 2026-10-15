@@ -39,7 +39,6 @@ def _rec(name: str = "httpd", sha: str = "abc123def4567890") -> ElfRecord:
         elf_type="executable",
         sha256=sha,
         dt_needed=["libc.so.0"],
-        protections={"nx": True, "pie": False, "canary": False, "relro": "none", "fortify": False},
     )
 
 

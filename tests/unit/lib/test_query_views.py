@@ -1,9 +1,9 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for lib/query/views — neutral atlas aggregations (density / twins / dormant).
+"""Unit tests for lib/query/views — neutral atlas aggregations (density / ledger).
 
 Builds atlas instances directly (no analyzer) to isolate the view logic, then asserts the
-group-by counts, the twin (mixed-status) detection, and the dormant reuse.
+group-by counts and the two derived recurrence ledgers.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from pathlib import Path
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import InstanceRow
 from treasure_map.lib.atlas.writer import add_instance, upsert_pattern
-from treasure_map.lib.query import FINE_FP_ALGO_VERSION, density, dormant, ledger, twins
+from treasure_map.lib.query import FINE_FP_ALGO_VERSION, density, ledger
 
 
 def _pattern(conn: sqlite3.Connection, fp: str, sink_class: str = "cmd") -> int:
@@ -74,44 +74,6 @@ def test_density_groups_by_run_sink_and_fingerprint(tmp_path: Path) -> None:
     assert by_fp["fp_cmd"].instance_count == 2
     assert by_fp["fp_cmd"].sink_class == "cmd"
     assert by_fp["fp_copy"].instance_count == 1
-    conn.close()
-
-
-# ── twins ─────────────────────────────────────────────────────────────────────────
-
-
-def test_twins_surface_only_mixed_status_fingerprints(tmp_path: Path) -> None:
-    conn = _atlas(tmp_path)
-    mixed = _pattern(conn, "fp_mixed", "cmd")
-    uniform = _pattern(conn, "fp_uniform", "copy")
-    # mixed: one blocked + one unknown over the same fingerprint -> a twin.
-    _inst(conn, mixed, status="blocked", run_id="r1", h="m1")
-    _inst(conn, mixed, status="unknown", run_id="r1", h="m2")
-    # uniform: two unknown -> NOT a twin.
-    _inst(conn, uniform, status="unknown", run_id="r1", h="u1")
-    _inst(conn, uniform, status="unknown", run_id="r1", h="u2")
-
-    rows = twins(conn)
-    fps = {r.structural_fingerprint for r in rows}
-    assert fps == {"fp_mixed"}
-    (twin,) = rows
-    assert twin.blocked_count == 1
-    assert twin.non_blocked_count == 1
-    conn.close()
-
-
-# ── dormant ─────────────────────────────────────────────────────────────────────────
-
-
-def test_dormant_returns_blocked_instances(tmp_path: Path) -> None:
-    conn = _atlas(tmp_path)
-    p = _pattern(conn, "fp", "cmd")
-    _inst(conn, p, status="blocked", run_id="r1", h="b1")
-    _inst(conn, p, status="unknown", run_id="r1", h="u1")
-
-    rows = dormant(conn)
-    assert len(rows) == 1  # only the blocked instance
-    assert rows[0]["reachability_status"] == "blocked"
     conn.close()
 
 

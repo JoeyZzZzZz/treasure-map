@@ -4,8 +4,9 @@
 
 Builds a synthetic atlas directly (no analyzer), then asserts the default-lens ordering (spine
 on sink-impact, band by impact x controllability, only-up promotes, demotion iron law), the
-presentation-only relabel (raw schema field stays confirmed/blocked/unknown), the gated fold in
-the CLI, the evidence_ref anchor on every row, and that triage writes nothing.
+presentation-only relabel (raw schema field stays confirmed/blocked/unknown), that the CLI's
+default view hides no status, the evidence_ref anchor on every row, and that triage writes
+nothing.
 
 There is NO collapsed score: ordering is a lens over first-class dimension layers, and a '?' layer
 never sinks a candidate.
@@ -949,10 +950,10 @@ def test_source_param_filter_matches_and_floats(tmp_path: Path) -> None:
 # ── gating is a presentation fold, NOT a sort demotion ──
 
 
-def test_blocked_is_relabelled_gated_not_sunk(tmp_path: Path) -> None:
-    # A blocked candidate is relabelled review_status='gated' (folded in the CLI), but the MAP still
-    # orders it by its dimensions — gating is presentation; the sort never reads the raw status
-    # (the sort key contains no reachability_status term at all).
+def test_blocked_relabels_to_verify_and_is_not_sunk(tmp_path: Path) -> None:
+    # 'blocked' is never emitted (grader.py), so the 'gated' bucket is retired. A hypothetical
+    # blocked row relabels to the VISIBLE 'to-verify' (never a hidden bucket) and the MAP still
+    # orders it by its dimensions — the sort key contains no reachability_status term at all.
     conn = _atlas(tmp_path)
     cmd_p = _pattern(conn, "fp_cmd", sink_class="cmd", source_class="external_input")
     copy_p = _pattern(conn, "fp_copy", sink_class="copy", source_class="external_input")
@@ -961,8 +962,8 @@ def test_blocked_is_relabelled_gated_not_sunk(tmp_path: Path) -> None:
 
     ranked = triage(conn)
     by_fn = {c.function: c for c in ranked}
-    assert by_fn["blk_cmd"].review_status == "gated"
-    # the gated cmd (impact 3) still sorts ABOVE the live copy (impact 2) — not sunk by its status.
+    assert by_fn["blk_cmd"].review_status == "to-verify"  # visible, never hidden
+    # the cmd (impact 3) still sorts ABOVE the live copy (impact 2) — not sunk by its status.
     assert [c.function for c in ranked] == ["blk_cmd", "live_copy"]
     conn.close()
 
@@ -980,7 +981,8 @@ def test_review_status_relabel_does_not_touch_stored_field(tmp_path: Path) -> No
     by_fn = {c.function: c for c in triage(conn)}
     assert by_fn["u"].review_status == "to-verify"
     assert by_fn["c"].review_status == "reachable"
-    assert by_fn["b"].review_status == "gated"
+    # blocked is never emitted; the relabel still points at a VISIBLE bucket
+    assert by_fn["b"].review_status == "to-verify"
 
     # The atlas itself still holds the raw mechanism values — the relabel is presentation-only.
     stored = {
@@ -1039,12 +1041,12 @@ def test_triage_does_not_write_back(tmp_path: Path) -> None:
     conn.close()
 
 
-# ── CLI: gated folded by default, shown on demand ───────────────────────────────────
+# ── CLI: every status shown by default ────────────────────────────────────────────
 
 
 def _seed_for_cli(tmp_path: Path) -> Path:
     # A dimension-driven ranking: rc_fn (cmd + free + found) is the clear #1; tv_fn (cmd, unknown)
-    # #2; gt_fn (copy sink, blocked -> gated) #3 and folded by default.
+    # #2; gt_fn (copy sink, blocked status never emitted -> relabels to the visible to-verify) #3.
     conn = _atlas(tmp_path)
     cmd_p = _pattern(conn, "fp_cmd", sink_class="cmd")
     copy_p = _pattern(conn, "fp_copy", sink_class="copy")
@@ -1072,20 +1074,14 @@ def _seed_for_cli(tmp_path: Path) -> Path:
     return tmp_path / "atlas.db"
 
 
-def test_cli_folds_gated_by_default(tmp_path: Path) -> None:
+def test_cli_shows_every_status_by_default(tmp_path: Path) -> None:
+    # The 'gated' fold is retired (blocked is never emitted): every row is in one of the two live
+    # statuses (to-verify / reachable) and the default view hides none of them.
     atlas = _seed_for_cli(tmp_path)
     result = CliRunner().invoke(triage_cmd, ["run_cli", "--atlas", str(atlas)])
     assert result.exit_code == 0, result.output
-    assert "gt_fn" not in result.output  # gated row folded
-    assert "1 hidden" in result.output  # but counted as hidden
-    assert "tv_fn" in result.output and "rc_fn" in result.output
-
-
-def test_cli_include_gated_shows_gated(tmp_path: Path) -> None:
-    atlas = _seed_for_cli(tmp_path)
-    result = CliRunner().invoke(triage_cmd, ["run_cli", "--include-gated", "--atlas", str(atlas)])
-    assert result.exit_code == 0, result.output
-    assert "gt_fn" in result.output  # gated now visible
+    assert "hidden" not in result.output  # nothing is folded
+    assert "gt_fn" in result.output and "tv_fn" in result.output and "rc_fn" in result.output
 
     result_all = CliRunner().invoke(
         triage_cmd, ["run_cli", "--status", "all", "--atlas", str(atlas)]
@@ -1130,15 +1126,15 @@ def test_cli_rank_is_stable_across_filters(tmp_path: Path) -> None:
         triage_cmd, ["run_cli", "--status", "reachable", "--atlas", str(atlas)]
     )
     out_top = CliRunner().invoke(triage_cmd, ["run_cli", "--top", "5", "--atlas", str(atlas)])
-    out_gated = CliRunner().invoke(
-        triage_cmd, ["run_cli", "--status", "gated", "--atlas", str(atlas)]
+    out_tv = CliRunner().invoke(
+        triage_cmd, ["run_cli", "--status", "to-verify", "--atlas", str(atlas)]
     )
     # rc_fn's global rank is identical no matter the filter/top.
     assert _rank_of(out_all.output, "rc_fn") == 1
     assert _rank_of(out_reach.output, "rc_fn") == 1
     assert _rank_of(out_top.output, "rc_fn") == 1
-    # a gated-only view keeps the GLOBAL rank (3), not a per-view #1.
-    assert _rank_of(out_gated.output, "gt_fn") == 3
+    # a to-verify-only view keeps each row's GLOBAL rank (gt_fn is #3), not a per-view #1.
+    assert _rank_of(out_tv.output, "gt_fn") == 3
 
 
 def test_cli_top_n_is_global_front(tmp_path: Path) -> None:

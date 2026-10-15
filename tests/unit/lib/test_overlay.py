@@ -798,19 +798,3 @@ def test_overlay_allows_a_multi_row_ref_that_is_not_degraded(tmp_path: Path) -> 
     con = _seed_rows(tmp_path, ref, [{"copy_callsite": {}}, None])
     overlay.upsert_overlay(con, evidence_ref=ref, verdict="suspicious", rationale="dig here")
     assert con.execute("SELECT COUNT(*) FROM overlay").fetchone()[0] == 1
-
-
-def test_repoint_refuses_a_degraded_target(tmp_path: Path) -> None:
-    """The rekey's write path refuses a degraded target the same way.
-
-    MUTATION (must go RED): drop the _refuse_degraded_anchor call in repoint_overlay_anchor."""
-    old_ref = "run1#deadbeef:00401000@copy#0"
-    target = "run1#deadbeef:00401000@copy"
-    con = _seed_rows(tmp_path, target, [{"callsite_located": False, "anchor_degraded": "x"}])
-    con.execute(
-        "INSERT INTO overlay (anchor_ref, run_id, verdict, rationale) "
-        "VALUES (?, 'run1', 'suspicious', 'r')",
-        (old_ref,),
-    )
-    with pytest.raises(ConfigError, match="degraded anchor"):
-        overlay.repoint_overlay_anchor(con, old_ref=old_ref, new_ref=target, commit=False)

@@ -38,7 +38,6 @@ from treasure_map.lib.setup.toolchain_lock import Lock
 
 State = Literal["ok", "warn", "info", "missing", "wrong", "unknown"]
 COUNTED: frozenset[str] = frozenset({"missing", "wrong", "unknown"})
-ICON = {"ok": "✅", "warn": "⚠", "info": "·", "missing": "❌", "wrong": "❌", "unknown": "?"}
 
 
 class Check(NamedTuple):
@@ -48,10 +47,6 @@ class Check(NamedTuple):
     ok: bool
     detail: str
     state: str
-
-    @property
-    def icon(self) -> str:
-        return ICON[self.state]
 
 
 def check(name: str, state: State, detail: str) -> Check:
@@ -509,7 +504,3 @@ def run_doctor(inp: DoctorInputs) -> list[Check]:
     if runs is not None:
         out.append(runs)
     return out
-
-
-def failing(checks: Sequence[Check]) -> list[Check]:
-    return [c for c in checks if c.state in COUNTED]

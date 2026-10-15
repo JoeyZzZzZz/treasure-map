@@ -67,10 +67,7 @@ def _candidates(conn: object, run_id: str, n: int) -> None:
                 binary_path="usr/sbin/webd",
                 source_run_id=run_id,
                 evidence_ref=f"{run_id}#handle_req_{i}",
-                # The first of each run is 'blocked', so the dormant view (blocked + L0/L1) has
-                # rows to exclude. Without one, the exclusion assertion below runs over an empty
-                # list and passes without the exclusion having happened.
-                reachability_status="blocked" if i == 0 else "unknown",
+                reachability_status="unknown",
                 provenance_level="L1",
             ),
         )
@@ -195,107 +192,34 @@ def test_an_unprovable_mismatch_is_still_served(tmp_path: Path) -> None:
     tools = mcp_app.make_tools(a)
     listing = tools["list_candidates"](run_id="run_unknown")
     assert "stale_scan" not in listing
-    assert listing["corpus"] == 1  # 2 seeded, the blocked one is gated out of the default lens
+    assert listing["corpus"] == 2  # both seeded rows are served
     assert tools["explain_candidate"]("run_unknown#handle_req_0")["found"] is True
 
 
-def test_an_all_runs_listing_drops_the_stale_rows_and_names_the_run(atlas: Path) -> None:
-    """Unscoped, the map spans firmware, so a refusal would take the current runs down with the
-    stale one. The stale run's rows leave the corpus instead — and are COUNTED where they left, so
-    "this firmware produced nothing" and "this firmware was not served" stay different answers.
-
-    MUTATION: move the exclusion after ``ranked`` is built (i.e. after ``corpus`` is taken) -> RED,
-    because corpus then still counts rows that are not in the listing. Measured RED at 1 failed.
-    """
-    tools = mcp_app.make_tools(atlas)
-    listing = tools["list_candidates"]()
-
-    # run_ok seeds 2 rows and run_stale 3; the first of each is 'blocked', which the default lens
-    # gates out. So 1 is served and 2 left — and both numbers are counted AFTER that gating, which
-    # is what makes "corpus excludes 2" an arithmetic statement rather than a slogan.
-    assert listing["corpus"] == 1, "only the servable run's candidates are in the denominator"
-    refused = listing["stale_runs_refused"]
-    assert [r["run_id"] for r in refused] == ["run_stale"]
-    assert refused[0]["candidates_excluded"] == 2
-    assert refused[0]["axis"] == "extraction"
-    assert "tmap rescan run_stale" in refused[0]["remedy"]
-    assert "excludes 2 candidates" in listing["corpus_note"]
-    assert all(c["run"] != "run_stale" for c in listing["candidates"])
-
-
-def test_the_excluded_count_is_measured_on_the_same_basis_as_corpus(atlas: Path) -> None:
-    """★ ``corpus excludes N`` is arithmetic, so N has to be counted the way corpus is.
-
-    This call's own filters narrow the corpus. Counting the refused rows BEFORE those filters would
-    report rows that would not have been in the listing anyway — telling a caller who asked for one
-    sink class that the corpus is missing candidates of every other class. Turning the gate off
-    admits the blocked row on BOTH sides, so both numbers move together.
-
-    MUTATION: count the refused rows where they are removed (before ``_narrow``) -> RED, because
-    the excluded count then stays at 3 while corpus is 1.
-    """
-    tools = mcp_app.make_tools(atlas)
-    default = tools["list_candidates"]()
-    gated = tools["list_candidates"](include_gated=True)
-
-    assert (default["corpus"], default["stale_runs_refused"][0]["candidates_excluded"]) == (1, 2)
-    assert (gated["corpus"], gated["stale_runs_refused"][0]["candidates_excluded"]) == (2, 3)
-
-
-def test_a_clean_atlas_reports_no_refusals_and_an_untouched_corpus(tmp_path: Path) -> None:
-    """The regression on the other side: with nothing stale, the corpus is the whole corpus and
-    the two new keys say so without inventing a placeholder entry.
-
-    MUTATION: emit ``corpus_note`` unconditionally -> RED (a note about zero refused runs reads as
-    if some had been).
-    """
-    a = tmp_path / "atlas.db"
-    conn = open_atlas(a)
-    begin_run(
-        conn,
-        "run_ok",
-        analysis_db_path=str(_analysis(tmp_path, "run_ok").resolve()),
-        build_hash=current_pass_version(),
-    )
-    finish_run(conn, "run_ok", binaries=1, functions=1)
-    _candidates(conn, "run_ok", 4)
-    conn.commit()
-    conn.close()
-
-    listing = mcp_app.make_tools(a)["list_candidates"]()
-    assert listing["corpus"] == 3  # 4 seeded, one blocked
-    assert listing["stale_runs_refused"] == []
-    assert listing["corpus_note"] is None
-
-
-@pytest.mark.parametrize("tool", ["dormant_candidates", "pattern_density"])
-def test_the_cross_run_aggregates_drop_stale_rows_and_name_them(atlas: Path, tool: str) -> None:
-    """These readers span firmware, so they annotate rather than refuse — but a row that leaves
+def test_the_cross_run_aggregate_drops_stale_rows_and_names_them(atlas: Path) -> None:
+    """pattern_density spans firmware, so it annotates rather than refuses — but a row that leaves
     silently is a row that was never there, so the run is named with what it cost.
 
-    MUTATION: drop the exclusion loop from either reader -> RED.
+    MUTATION: drop the exclusion loop from the reader -> RED.
     """
-    tools = mcp_app.make_tools(atlas)
-    result = tools[tool]()
+    result = mcp_app.make_tools(atlas)["pattern_density"]()
     refused = result["stale_runs_refused"]
     assert [r["run_id"] for r in refused] == ["run_stale"]
-    # 1 blocked instance for dormant; all 3 of the run's instances for the density counts
-    assert refused[0]["candidates_excluded"] == (1 if tool == "dormant_candidates" else 3)
-    rows = result.get("dormant", result.get("density", []))
+    assert refused[0]["candidates_excluded"] == 3  # all 3 of the run's instances
+    rows = result["density"]
     assert rows, "the reader must return the SERVABLE run's rows, or the exclusion proves nothing"
     assert all((r.get("source_run_id") != "run_stale") for r in rows)
 
 
-@pytest.mark.parametrize("tool", ["pattern_twins", "cross_firmware_patterns"])
-def test_an_aggregate_that_cannot_drop_the_rows_says_so(atlas: Path, tool: str) -> None:
-    """★ Null is not zero. These two count ACROSS runs and carry no run column, so a refused run's
-    instances are still inside the numbers. Reporting ``candidates_excluded: 0`` would claim the
-    run contributed nothing; null says its contribution could not be separated out, and the note
-    says which numbers still include it.
+def test_an_aggregate_that_cannot_drop_the_rows_says_so(atlas: Path) -> None:
+    """★ Null is not zero. cross_firmware_patterns counts ACROSS runs and carries no run column, so
+    a refused run's instances are still inside the numbers. Reporting ``candidates_excluded: 0``
+    would claim the run contributed nothing; null says its contribution could not be separated
+    out, and the note says which numbers still include it.
 
-    MUTATION: report 0 instead of None for these -> RED.
+    MUTATION: report 0 instead of None -> RED.
     """
-    result = mcp_app.make_tools(atlas)[tool]()
+    result = mcp_app.make_tools(atlas)["cross_firmware_patterns"]()
     refused = result["stale_runs_refused"]
     assert [r["run_id"] for r in refused] == ["run_stale"]
     assert refused[0]["candidates_excluded"] is None
@@ -387,11 +311,3 @@ def test_a_completeness_check_that_ran_says_so(atlas: Path) -> None:
     block = listing["analysis_completeness"]
     assert block["unavailable"] is None
     assert "UNAVAILABLE" not in block["note"]
-
-
-def test_an_unscoped_listing_does_not_claim_a_clean_completeness_check(atlas: Path) -> None:
-    """Across every run there is no single scan to answer for, so the empty lists are neither a
-    result nor a failure — and the note says which."""
-    block = mcp_app.make_tools(atlas)["list_candidates"]()["analysis_completeness"]
-    assert block["unavailable"] is None
-    assert "pass run_id" in block["note"]

@@ -32,12 +32,3 @@ class ReachabilityVerdict:
     blocking_mechanism: str | None
     basis: str
     degraded: bool = False
-
-
-@dataclass(frozen=True)
-class ReachabilityStats:
-    graded: int
-    confirmed: int
-    blocked: int
-    unknown: int
-    degraded: int

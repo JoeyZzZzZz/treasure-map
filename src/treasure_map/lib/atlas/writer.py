@@ -23,7 +23,6 @@ from treasure_map.lib.atlas.models import (
     InstructionMatchRow,
     NvramDefaultRow,
     NvramFlowRow,
-    PublicCvePatternRow,
     RunCapabilityRow,
     StringKeyedEdgeRow,
     WebFormFieldRow,
@@ -758,39 +757,6 @@ def delete_private_exploit(conn: sqlite3.Connection, *, id: int, commit: bool = 
     if commit:
         conn.commit()
     return int(cur.rowcount)
-
-
-def add_public_cve_patterns(
-    conn: sqlite3.Connection, rows: list[PublicCvePatternRow], *, commit: bool = True
-) -> dict[str, int]:
-    """Idempotent import of public-CVE exploit forms; return {inserted, skipped}.
-
-    A row whose ``(cve_id, pattern, source, sink)`` already exists is SKIPPED, so re-running the
-    same import never silently doubles the rows (which would not inflate the distinct count — that
-    private only — but would pollute the public listing). ``pattern`` must be non-blank."""
-    inserted = skipped = 0
-    for r in rows:
-        if not (r.pattern and r.pattern.strip()):
-            raise ConfigError("public_cve_pattern.pattern must be non-blank")
-        exists = conn.execute(
-            """SELECT 1 FROM public_cve_pattern
-               WHERE IFNULL(cve_id, '') = IFNULL(?, '') AND pattern = ?
-                 AND IFNULL(source, '') = IFNULL(?, '') AND IFNULL(sink, '') = IFNULL(?, '')
-               LIMIT 1""",
-            (r.cve_id, r.pattern, r.source, r.sink),
-        ).fetchone()
-        if exists is not None:
-            skipped += 1
-            continue
-        conn.execute(
-            """INSERT INTO public_cve_pattern (cve_id, pattern, source, sink, ref, notes, origin)
-               VALUES (?, ?, ?, ?, ?, ?, 'external_import')""",
-            (r.cve_id, r.pattern, r.source, r.sink, r.ref, r.notes),
-        )
-        inserted += 1
-    if commit:
-        conn.commit()
-    return {"inserted": inserted, "skipped": skipped}
 
 
 def begin_run(

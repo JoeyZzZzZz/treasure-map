@@ -52,7 +52,6 @@ class Action:
     asset: Asset | None = None
     client: str | None = None
     project_dir: Path | None = None
-    values: dict[str, str | None] = field(default_factory=dict)  # write_config keys
 
     def render(self) -> list[str]:
         head = f"  • {self.title}"
@@ -154,7 +153,6 @@ class ToolchainResult:
     ghidra_home: Path | None = None
     bindiff: Path | None = None
     failed: list[str] = field(default_factory=list)
-    done: list[str] = field(default_factory=list)
 
 
 def apply_toolchain(
@@ -258,7 +256,6 @@ def apply_toolchain(
                     extra={"exe": str(exe)},
                 )
                 res.bindiff = exe
-            res.done.append(action.title)
             echo(f"  ✓ {action.title}")
         except (FetchError, OSError) as exc:
             res.failed.append(f"{action.title}: {exc}")

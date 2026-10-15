@@ -125,14 +125,6 @@ def _mkdb(tmp_path: Path) -> Path:
         "INSERT INTO script_calls (file_id, command, raw_line, line_number, args_pattern) "
         "VALUES (1, 'webd', 'webd -c /etc/webd.conf', 12, 'literal')"
     )
-    conn.execute(
-        "INSERT INTO components (id, binary_id, product, version, cpe, source) "
-        "VALUES (1, 1, 'genlib', '1.2.3', 'cpe:/a:gen:genlib:1.2.3', 'string_match')"
-    )
-    conn.execute(
-        "INSERT INTO cve_matches (component_id, binary_id, cve_id, cvss_score, severity) "
-        "VALUES (1, 1, 'synthetic-cve', 9.8, 'critical')"
-    )
     conn.commit()
     conn.close()
     return db

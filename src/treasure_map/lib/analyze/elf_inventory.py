@@ -25,14 +25,10 @@ class ElfRecord:
     elf_type: str  # executable / shared_library / relocatable
     sha256: str
     dt_needed: list[str] = field(default_factory=list)
-    protections: dict[str, object] = field(default_factory=dict)
     size: int = 0
 
     def dt_needed_json(self) -> str:
         return json.dumps(self.dt_needed)
-
-    def protections_json(self) -> str:
-        return json.dumps(self.protections)
 
 
 def detect_arch(elf_path: Path) -> str | None:
@@ -156,57 +152,6 @@ def get_dt_needed(elf_path: Path) -> list[str]:
     return deps
 
 
-def get_protections(elf_path: Path) -> dict[str, object]:
-    """Detect ELF hardening: NX, PIE, stack canary, RELRO, fortify."""
-    result: dict[str, object] = {
-        "nx": True,
-        "pie": False,
-        "canary": False,
-        "relro": "none",
-        "fortify": False,
-    }
-    try:
-        with elf_path.open("rb") as f:
-            elf = ELFFile(f)
-            segments = list(elf.iter_segments())
-
-            # NX: PT_GNU_STACK present and PF_X not set
-            for seg in segments:
-                if seg.header.p_type == "PT_GNU_STACK":
-                    result["nx"] = not bool(seg.header.p_flags & 0x1)
-                    break
-
-            # PIE: ET_DYN + PT_INTERP
-            if elf.header.e_type == "ET_DYN":
-                result["pie"] = any(s.header.p_type == "PT_INTERP" for s in segments)
-
-            # RELRO: PT_GNU_RELRO = partial; DT_BIND_NOW or DT_FLAGS BIND_NOW = full
-            if any(s.header.p_type == "PT_GNU_RELRO" for s in segments):
-                result["relro"] = "partial"
-                dyn = elf.get_section_by_name(".dynamic")
-                if dyn:
-                    for tag in dyn.iter_tags():
-                        if tag.entry.d_tag == "DT_BIND_NOW":
-                            result["relro"] = "full"
-                            break
-                        if tag.entry.d_tag == "DT_FLAGS" and (tag.entry.d_val & 0x8):
-                            result["relro"] = "full"
-                            break
-
-            # Canary + Fortify: look for undefined dynamic symbols
-            for section in elf.iter_sections():
-                if section.header.sh_type == "SHT_DYNSYM":
-                    for sym in section.iter_symbols():
-                        if sym.entry.st_shndx == "SHN_UNDEF" and sym.name:
-                            if sym.name in ("__stack_chk_fail", "__stack_chk_guard"):
-                                result["canary"] = True
-                            if sym.name.startswith("__") and sym.name.endswith("_chk"):
-                                result["fortify"] = True
-    except Exception:
-        pass
-    return result
-
-
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -270,7 +215,6 @@ def scan_filesystem(
                 elf_type=get_elf_type(fpath),
                 sha256=sha,
                 dt_needed=get_dt_needed(fpath),
-                protections=get_protections(fpath),
                 size=fpath.stat().st_size,
             )
             results.append(record)

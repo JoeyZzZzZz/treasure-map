@@ -53,8 +53,11 @@ def test_open_atlas_creates_tables(atlas_conn: sqlite3.Connection) -> None:
     }
     assert "pattern" in tables
     assert "instance" in tables
-    assert "dormant_instance" in tables
-    assert "public_finding" in tables
+    # the dormant_instance / public_finding / twin_candidate views are retired (they selected on a
+    # reachability_status the grader never emits); a fresh schema must not recreate them
+    assert "dormant_instance" not in tables
+    assert "public_finding" not in tables
+    assert "twin_candidate" not in tables
 
 
 def test_open_atlas_idempotent(tmp_path: Path) -> None:
@@ -321,122 +324,27 @@ def test_schema_check_rejects_both_null_trace_raw_sql(
 # ---------------------------------------------------------------------------
 
 
-def test_dormant_instance_view(atlas_conn: sqlite3.Connection) -> None:
-    pid = upsert_pattern(atlas_conn, source_class="sc", sink_class="snk", call_sequence_shape="s")
-
-    add_instance(
-        atlas_conn,
-        InstanceRow(
-            pattern_id=pid,
-            pseudocode_hash="h1",
-            source_run_id="run-A",
-            reachability_status="blocked",
-            provenance_level="L1",
-        ),
+def test_migration_drops_retired_views(tmp_path: Path) -> None:
+    # An atlas written by an older schema carries the dormant_instance / public_finding /
+    # twin_candidate views. The atlas is append-only and never rebuilt, so open_atlas must DROP
+    # the stale views in-place.
+    db_path = tmp_path / "old.db"
+    open_atlas(db_path).close()  # a current-shape atlas, then give it the old views back
+    raw = sqlite3.connect(db_path)
+    raw.executescript(
+        "CREATE VIEW dormant_instance AS SELECT * FROM instance;\n"
+        "CREATE VIEW public_finding AS SELECT * FROM instance;\n"
+        "CREATE VIEW twin_candidate AS SELECT * FROM instance;\n"
     )
-    add_instance(
-        atlas_conn,
-        InstanceRow(
-            pattern_id=pid,
-            pseudocode_hash="h2",
-            source_run_id="run-B",
-            reachability_status="blocked",
-            provenance_level="L0",
-        ),
-    )
+    raw.commit()
+    raw.close()
 
-    dormant = atlas_conn.execute("SELECT COUNT(*) FROM dormant_instance").fetchone()[0]
-    assert dormant == 2
-
-
-def test_public_finding_view(atlas_conn: sqlite3.Connection) -> None:
-    pid = upsert_pattern(atlas_conn, source_class="sc", sink_class="snk", call_sequence_shape="s")
-
-    add_instance(
-        atlas_conn,
-        InstanceRow(
-            pattern_id=pid,
-            pseudocode_hash="h3",
-            source_run_id="run-C",
-            reachability_status="confirmed",
-            provenance_level="L2",
-        ),
-        external_anchor="patch:ext-ref-abc123",
-    )
-
-    public = atlas_conn.execute("SELECT COUNT(*) FROM public_finding").fetchone()[0]
-    assert public == 1
-
-
-def test_confirmed_l0_in_neither_view(atlas_conn: sqlite3.Connection) -> None:
-    pid = upsert_pattern(atlas_conn, source_class="sc", sink_class="snk", call_sequence_shape="s")
-
-    add_instance(
-        atlas_conn,
-        InstanceRow(
-            pattern_id=pid,
-            pseudocode_hash="h4",
-            source_run_id="run-D",
-            reachability_status="confirmed",
-            provenance_level="L0",
-        ),
-    )
-
-    dormant = atlas_conn.execute("SELECT COUNT(*) FROM dormant_instance").fetchone()[0]
-    public = atlas_conn.execute("SELECT COUNT(*) FROM public_finding").fetchone()[0]
-    assert dormant == 0
-    assert public == 0
-
-
-def test_view_semantics_combined(atlas_conn: sqlite3.Connection) -> None:
-    pid = upsert_pattern(atlas_conn, source_class="sc", sink_class="snk", call_sequence_shape="s")
-
-    add_instance(
-        atlas_conn,
-        InstanceRow(
-            pattern_id=pid,
-            pseudocode_hash="h1",
-            source_run_id="run-A",
-            reachability_status="blocked",
-            provenance_level="L1",
-        ),
-    )
-    add_instance(
-        atlas_conn,
-        InstanceRow(
-            pattern_id=pid,
-            pseudocode_hash="h2",
-            source_run_id="run-B",
-            reachability_status="blocked",
-            provenance_level="L0",
-        ),
-    )
-    add_instance(
-        atlas_conn,
-        InstanceRow(
-            pattern_id=pid,
-            pseudocode_hash="h3",
-            source_run_id="run-C",
-            reachability_status="confirmed",
-            provenance_level="L2",
-        ),
-        external_anchor="patch:ext-ref-abc123",
-    )
-    add_instance(
-        atlas_conn,
-        InstanceRow(
-            pattern_id=pid,
-            pseudocode_hash="h4",
-            source_run_id="run-D",
-            reachability_status="confirmed",
-            provenance_level="L0",
-        ),
-    )
-
-    dormant = atlas_conn.execute("SELECT COUNT(*) FROM dormant_instance").fetchone()[0]
-    public = atlas_conn.execute("SELECT COUNT(*) FROM public_finding").fetchone()[0]
-    assert dormant == 2  # h1 (blocked+L1), h2 (blocked+L0)
-    assert public == 1  # h3 only (confirmed+L2+anchor)
+    conn = open_atlas(db_path)
+    views = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'view'")}
+    assert "dormant_instance" not in views
+    assert "public_finding" not in views
+    assert "twin_candidate" not in views
+    conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -710,12 +618,18 @@ def _droptable_line_forbidden(line: str) -> bool:
 
 
 def test_static_no_unscoped_wipe_in_atlas() -> None:
-    # No table-wide wipe path. DROP VIEW / DROP INDEX are forbidden outright; DROP TABLE is
-    # forbidden for every table EXCEPT overlay (see _droptable_line_forbidden). The ONLY permitted
-    # DELETEs are SCOPED replace refreshes: run-scoped (WHERE source_run_id/run_id = ?) or
-    # diff-scoped (WHERE diff_id = ?), each touching one run's / one diff's rows — not cross-run
-    # accumulation. Any other DELETE FROM fails.
-    forbidden_sql = ("DROP VIEW", "DROP INDEX")
+    # No table-wide wipe path. DROP INDEX is forbidden outright; DROP VIEW is forbidden except the
+    # three retired views the migration removes (a view holds no rows, and these selected on a
+    # status the grader never emits); DROP TABLE is forbidden for every table EXCEPT overlay (see
+    # _droptable_line_forbidden). The ONLY permitted DELETEs are SCOPED replace refreshes:
+    # run-scoped (WHERE source_run_id/run_id = ?) or diff-scoped (WHERE diff_id = ?), each touching
+    # one run's / one diff's rows — not cross-run accumulation. Any other DELETE FROM fails.
+    forbidden_sql = ("DROP INDEX",)
+    permitted_view_drops = (
+        "DROP VIEW IF EXISTS dormant_instance",
+        "DROP VIEW IF EXISTS public_finding",
+        "DROP VIEW IF EXISTS twin_candidate",
+    )
     permitted_deletes = (
         "DELETE FROM instance WHERE source_run_id = ?",
         "DELETE FROM nvram_key_flow WHERE source_run_id = ?",
@@ -743,6 +657,11 @@ def test_static_no_unscoped_wipe_in_atlas() -> None:
         upper = text.upper()
         for token in forbidden_sql:
             assert token not in upper, f"SQL {token!r} found in {py_file.name}"
+        view_drops = upper.count("DROP VIEW")
+        sanctioned = sum(text.count(v) for v in permitted_view_drops)
+        assert view_drops == sanctioned, (
+            f"{py_file.name} drops a view other than the three retired ones"
+        )
         for lineno, line in enumerate(text.splitlines(), 1):
             assert not _droptable_line_forbidden(line), (
                 f"DROP TABLE of a non-overlay table in {py_file.name}:{lineno}: {line.strip()}"

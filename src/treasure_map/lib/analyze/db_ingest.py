@@ -224,8 +224,8 @@ def ingest_elfs(
         conn.execute(
             """INSERT OR IGNORE INTO binaries
                (name, path, arch, bits, sha256, file_type,
-                dt_needed, protections, size_bytes, last_seen_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                dt_needed, size_bytes, last_seen_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 db_text(rec.name),
                 db_text(str(rec.path)),
@@ -234,7 +234,6 @@ def ingest_elfs(
                 rec.sha256,
                 rec.elf_type,
                 rec.dt_needed_json(),
-                rec.protections_json(),
                 rec.size,
                 scan_timestamp,
             ),

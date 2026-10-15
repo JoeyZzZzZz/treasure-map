@@ -88,6 +88,19 @@ def _migrate(conn: sqlite3.Connection) -> None:
     already exists, so an atlas written by an older schema would keep its old shape. These
     ALTER TABLEs run only when the target column is missing, so the rows are preserved.
     """
+    # Views an older schema built that this one no longer defines. The atlas is append-only and
+    # never rebuilt, so a view is dropped here (before executescript) rather than just removed from
+    # the schema — otherwise the stale definition would survive forever. dormant_instance /
+    # public_finding / twin_candidate selected on a reachability_status the grader never emits
+    # ('blocked'), so they were always empty.
+    # Spelled out as literals: the static wipe guard (test_atlas) permits exactly these three.
+    for stmt in (
+        "DROP VIEW IF EXISTS dormant_instance",
+        "DROP VIEW IF EXISTS public_finding",
+        "DROP VIEW IF EXISTS twin_candidate",
+    ):
+        conn.execute(stmt)
+
     inst_cols = _column_names(conn, "instance")
     if inst_cols and "origin" not in inst_cols:
         # SQLite >= 3.25 allows ADD COLUMN with NOT NULL DEFAULT and a column-level CHECK;

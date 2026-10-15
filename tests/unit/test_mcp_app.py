@@ -51,8 +51,6 @@ _EXPECTED_TOOLS = {
     "list_diff_blindspots",
     "cross_firmware_patterns",
     "pattern_density",
-    "pattern_twins",
-    "dormant_candidates",
     "get_pseudocode",
     "get_callees",
     "get_xrefs",
@@ -69,7 +67,6 @@ _EXPECTED_TOOLS = {
     "list_overlays",
     "clear_overlay",
     "list_verified_exploits",
-    "list_cve_patterns",
     "legal_notice",
 }
 
@@ -254,7 +251,7 @@ def test_no_anchor_no_output(tmp_path: Path) -> None:
 def test_outputs_carry_no_payload(tmp_path: Path) -> None:
     tools = _tools(tmp_path)
     blobs = [
-        tools["list_candidates"](),
+        tools["list_candidates"](run_id="run_m"),
         tools["explain_candidate"]("run_m#fn1@cmd"),
         tools["get_pseudocode"]("handle_req", run_id="run_m"),
         tools["get_callees"]("handle_req", run_id="run_m"),
@@ -331,7 +328,7 @@ def test_get_nvram_key_flow_tool(tmp_path: Path) -> None:
 
 def test_list_candidates_carries_anchor_entry_reach_and_note(tmp_path: Path) -> None:
     tools = _tools(tmp_path)
-    out = tools["list_candidates"]()
+    out = tools["list_candidates"](run_id="run_m")
     assert "DERIVED" in out["note"] and "NOT a verdict" in out["note"]
     # the map carries a switchable lens + honest caveats, no collapsed score
     assert out["lens"]["label"] and out["lens"]["spine"] == "impact"
@@ -353,7 +350,7 @@ def test_list_candidates_exposes_view_catalog_with_when_to_use(tmp_path: Path) -
     # Views are DISCOVERABLE from the result: available_views lists every preset with its spine
     # and a when-to-use note, so an agent knows which lens fits its goal (not just how to switch).
     tools = _tools(tmp_path)
-    out = tools["list_candidates"]()
+    out = tools["list_candidates"](run_id="run_m")
     views = {v["view"]: v for v in out["available_views"]}
     assert set(views) == {"default", "by-sink", "nvram-source", "reachable-first"}
     for v in views.values():
@@ -418,12 +415,12 @@ def test_list_candidates_filter_floats_corpus_invariant(tmp_path: Path) -> None:
     # reduces the corpus. source=nvram (the OAuth-hiding regression) keeps all 5; sink_impact=cmd
     # returns the corpus (5) floated, NOT the 2 matches.
     tools = mcp_app.make_tools(_mk_multi_atlas(tmp_path))
-    base = tools["list_candidates"]()
+    base = tools["list_candidates"](run_id="run_m")
     assert base["corpus"] == 5 and base["total"] == 5
-    src = tools["list_candidates"](filters="source=nvram")
+    src = tools["list_candidates"](run_id="run_m", filters="source=nvram")
     assert src["corpus"] == 5 and src["total"] == 5  # NOT reduced — no candidate hidden
     assert src["lens"]["filter_match"] == 0
-    si = tools["list_candidates"](filters="sink_impact=cmd")
+    si = tools["list_candidates"](run_id="run_m", filters="sink_impact=cmd")
     assert si["corpus"] == 5 and si["total"] == 5  # floated, not the 2 reduced
     assert si["lens"]["filter_match"] == 2
 
@@ -432,9 +429,9 @@ def test_list_candidates_only_sweeps_and_refuses_on_mcp(tmp_path: Path) -> None:
     # ★ 步骤 2.5 M2 on MCP: --only sweeps a ground-truth dim (corpus stays whole via `corpus`) and
     # REFUSES an optimistic one with an error, never silently pruning it.
     tools = mcp_app.make_tools(_mk_multi_atlas(tmp_path))
-    swept = tools["list_candidates"](only="sink_class=cmd")
+    swept = tools["list_candidates"](run_id="run_m", only="sink_class=cmd")
     assert swept["corpus"] == 5 and swept["total"] == 2  # corpus whole, view pruned to the sweep
-    refused = tools["list_candidates"](only="controllability=free")
+    refused = tools["list_candidates"](run_id="run_m", only="controllability=free")
     assert "error" in refused and "refused" in refused["error"]
     assert refused["corpus"] == 5  # the refusal still reports the whole corpus
 
@@ -451,8 +448,8 @@ def test_list_candidates_carries_fingerprint_and_incomplete_field(tmp_path: Path
     (cand,) = out["candidates"]
     assert cand["structural_fingerprint"] == "fp_demo"
     # the fingerprint filter round-trips (cross_firmware_patterns -> list_candidates(fingerprint=))
-    assert tools["list_candidates"](fingerprint="fp_demo")["total"] == 1
-    assert tools["list_candidates"](fingerprint="no_such_fp")["total"] == 0
+    assert tools["list_candidates"](run_id="run_m", fingerprint="fp_demo")["total"] == 1
+    assert tools["list_candidates"](run_id="run_m", fingerprint="no_such_fp")["total"] == 0
 
 
 def test_per_scan_completeness_rides_scoped_list_not_cross_run_views(tmp_path: Path) -> None:
@@ -470,23 +467,23 @@ def test_per_scan_completeness_rides_scoped_list_not_cross_run_views(tmp_path: P
 
 def test_list_candidates_sink_class_filter(tmp_path: Path) -> None:
     tools = _tools(tmp_path)
-    assert tools["list_candidates"](sink_class="copy")["total"] == 0
-    assert tools["list_candidates"](sink_class="cmd")["total"] == 1
+    assert tools["list_candidates"](run_id="run_m", sink_class="copy")["total"] == 0
+    assert tools["list_candidates"](run_id="run_m", sink_class="cmd")["total"] == 1
 
 
 def test_list_candidates_sink_and_pagination_metadata(tmp_path: Path) -> None:
     tools = _tools(tmp_path)
     # B2: --sink semantics (concrete callee OR class) align with the CLI.
-    assert tools["list_candidates"](sink="do_fwd")["total"] == 1  # by sink_anchor
-    assert tools["list_candidates"](sink="cmd")["total"] == 1  # by class
-    assert tools["list_candidates"](sink="nope")["total"] == 0
+    assert tools["list_candidates"](run_id="run_m", sink="do_fwd")["total"] == 1  # by sink_anchor
+    assert tools["list_candidates"](run_id="run_m", sink="cmd")["total"] == 1  # by class
+    assert tools["list_candidates"](run_id="run_m", sink="nope")["total"] == 0
     # B5: pagination metadata + limit clamp.
-    out = tools["list_candidates"](limit=1, offset=0)
+    out = tools["list_candidates"](run_id="run_m", limit=1, offset=0)
     assert out["total"] == 1 and out["returned"] == 1 and out["truncated"] is False
     assert out["next_offset"] is None
-    page2 = tools["list_candidates"](limit=1, offset=1)
+    page2 = tools["list_candidates"](run_id="run_m", limit=1, offset=1)
     assert page2["returned"] == 0
-    assert tools["list_candidates"](limit=9999)["limit"] <= 200  # clamped
+    assert tools["list_candidates"](run_id="run_m", limit=9999)["limit"] <= 200  # clamped
 
 
 def test_list_candidates_scopes_by_run_and_carries_runs_in_atlas(tmp_path: Path) -> None:
@@ -500,9 +497,10 @@ def test_list_candidates_scopes_by_run_and_carries_runs_in_atlas(tmp_path: Path)
     assert out["runs_in_atlas"] == ["run_m"]  # bare id list, always present
     assert all(c["run"] == "run_m" for c in out["candidates"])
     assert all("is_current_run" not in c for c in out["candidates"])  # per-row flag gone
-    # unscoped spans every run; runs_in_atlas still lists them
-    allruns = tools["list_candidates"]()
-    assert allruns["resolved_run"] is None and allruns["runs_in_atlas"] == ["run_m"]
+    # run_id is REQUIRED: the unscoped whole-atlas listing is retired (it materialised every run).
+    refused = tools["list_candidates"]()
+    assert "error" in refused and "run_id" in refused["error"]
+    assert refused["runs_in_atlas"] == ["run_m"]  # the refusal still names the runs to pick from
 
 
 def test_fact_tool_requires_run_and_hard_errors_on_the_four_modes(tmp_path: Path) -> None:
@@ -640,9 +638,8 @@ def test_cross_firmware_and_aggregation_tools(tmp_path: Path) -> None:
     assert "DERIVED" in xf["note"]
     (pat,) = xf["patterns"]
     assert "device_spread" in pat and "pattern_breadth" in pat
-    for name in ("pattern_density", "pattern_twins", "dormant_candidates"):
-        r = tools[name]()
-        assert "note" in r and "count" in r  # may be empty, but always anchored + noted
+    r = tools["pattern_density"]()
+    assert "note" in r and "count" in r  # may be empty, but always anchored + noted
 
 
 def test_aggregation_paging_never_silently_drops_the_tail(tmp_path: Path) -> None:
@@ -667,7 +664,7 @@ def test_aggregation_paging_never_silently_drops_the_tail(tmp_path: Path) -> Non
 def test_milestone_recall_to_facts_chain(tmp_path: Path) -> None:
     tools = _tools(tmp_path)
     # 1. recall
-    cand = tools["list_candidates"]()["candidates"][0]
+    cand = tools["list_candidates"](run_id="run_m")["candidates"][0]
     assert cand["function"] == "handle_req"
     # 2. fetch the candidate function's facts (by its address anchor) — the ref self-routes the run
     pc = tools["get_pseudocode"](evidence_ref=cand["evidence_ref"])
@@ -759,7 +756,7 @@ def test_explain_and_list_surface_source_kind(tmp_path: Path) -> None:
     assert ex["source_class"] == "external_input"
     # still also carried on the nested candidate (unchanged)
     assert ex["candidate"]["source_kind"] == "free_string"
-    (cand,) = tools["list_candidates"]()["candidates"]
+    (cand,) = tools["list_candidates"](run_id="run_m")["candidates"]
     # the compact row folds source_kind into the resolved controllability label (free_string with no
     # provenance verdict -> likely:free, an OPTIMISTIC fallback, NEVER proven); the RAW source_kind
     # stays on explain, not the list row.
@@ -793,7 +790,7 @@ def test_source_kind_defaults_unknown_and_no_regression(tmp_path: Path) -> None:
     assert ex["candidate"]["entry_reach"] == "entry:web"
     assert "score" not in ex["candidate"]  # collapsed score gone; dimension layers replace it
     assert {d["name"] for d in ex["candidate"]["dimensions"]}  # non-empty layer set
-    cand = tools["list_candidates"]()["candidates"][0]
+    cand = tools["list_candidates"](run_id="run_m")["candidates"][0]
     # compact row: source_kind unknown + no verdict -> controllability unknown:unknown (folded, not
     # a raw row field); the raw source_kind now lives on explain only.
     assert cand["controllability"] == "unknown:unknown"
@@ -922,7 +919,7 @@ def test_compact_list_envelope_carries_legend(tmp_path: Path) -> None:
     # ★ C8-6: the compact list envelope states once that an omitted dimension is unknown, NOT proven
     # safe (unknown ≠ safe), and points at explain for the full note.
     tools = _tools(tmp_path)
-    out = tools["list_candidates"]()
+    out = tools["list_candidates"](run_id="run_m")
     legend = out["legend"].lower()
     assert "unknown" in legend and "not proven safe" in legend
     assert "explain_candidate" in out["legend"]
@@ -932,7 +929,7 @@ def test_list_verbose_default_carries_available_views(tmp_path: Path) -> None:
     # ★ 4.5.1: verbose defaults True — the full available_views enumeration rides the envelope
     # (unchanged behaviour), so nothing regresses for a consumer that relied on it.
     tools = _tools(tmp_path)
-    out = tools["list_candidates"]()
+    out = tools["list_candidates"](run_id="run_m")
     assert "available_views" in out and out["available_views"]
     assert "available_views_note" not in out
 
@@ -942,8 +939,8 @@ def test_list_non_verbose_drops_only_navigational_boilerplate(tmp_path: Path) ->
     # boilerplate that repeats every call) — the honest caveats stay in FULL (never traded for
     # tokens), and a one-line switchable pointer stays so the lens is never read as 'all there is'.
     tools = _tools(tmp_path)
-    full = tools["list_candidates"](verbose=True)
-    lean = tools["list_candidates"](verbose=False)
+    full = tools["list_candidates"](run_id="run_m", verbose=True)
+    lean = tools["list_candidates"](run_id="run_m", verbose=False)
     assert "available_views" not in lean  # the big enumeration is gone
     assert "available_views_note" in lean and "switchable" in lean["available_views_note"]
     assert lean["caveats"] == full["caveats"]  # IRON LAW 1: honest caveats untouched
@@ -963,11 +960,11 @@ def test_compact_row_reachability_seam_real_dimension(tmp_path: Path) -> None:
     d_no = tmp_path / "nosite"
     d_no.mkdir()
     _mk_analysis(d_web)
-    web = mcp_app.make_tools(_mk_atlas(d_web))["list_candidates"]()
+    web = mcp_app.make_tools(_mk_atlas(d_web))["list_candidates"](run_id="run_m")
     (web_cand,) = web["candidates"]
     assert web_cand["dimensions"]["reachability"] == "proven:entry:web"
     _mk_analysis(d_no)
-    nosite = mcp_app.make_tools(_mk_multi_atlas(d_no))["list_candidates"]()
+    nosite = mcp_app.make_tools(_mk_multi_atlas(d_no))["list_candidates"](run_id="run_m")
     assert nosite["candidates"]  # the corpus is non-empty
     assert all("reachability" not in c["dimensions"] for c in nosite["candidates"])
 
@@ -976,7 +973,7 @@ def test_note_moves_from_list_to_explain(tmp_path: Path) -> None:
     # ★ M2: the per-dimension note is DROPPED from the compact list row (each dim is one bare
     # state:value label) and preserved IN FULL on explain_candidate — moved, never deleted.
     tools = _tools(tmp_path)
-    (cand,) = tools["list_candidates"]()["candidates"]
+    (cand,) = tools["list_candidates"](run_id="run_m")["candidates"]
     assert all(
         isinstance(v, str) for v in cand["dimensions"].values()
     )  # bare labels, no note dicts
@@ -1012,7 +1009,7 @@ def test_compact_row_carries_param_source_when_controllability_unknown(tmp_path:
     # external_input candidate STILL surfaces source=structural:param on the compact row — the
     # axis-agnostic carry from step 3 picks the new axis up with no serializer edit.
     tools = _tools(tmp_path)  # _mk_atlas uses source_class=external_input
-    (cand,) = tools["list_candidates"]()["candidates"]
+    (cand,) = tools["list_candidates"](run_id="run_m")["candidates"]
     assert cand["controllability"] == "unknown:unknown"
     assert cand["dimensions"]["source"] == "structural:param"
 
@@ -1054,7 +1051,7 @@ def test_mcp_get_strings_no_warning_when_function_absent(tmp_path: Path) -> None
 
 def test_annotate_writes_lists_and_clears_without_touching_base(tmp_path: Path) -> None:
     tools = _tools(tmp_path)
-    base_before = tools["list_candidates"]()  # the read-only base map, overlay empty
+    base_before = tools["list_candidates"](run_id="run_m")  # the read-only base map, overlay empty
     r = tools["annotate"](
         evidence_ref="run_m#fn1@cmd", verdict="suspicious", rationale="arg0 looks attacker-fed"
     )
@@ -1064,7 +1061,7 @@ def test_annotate_writes_lists_and_clears_without_touching_base(tmp_path: Path) 
     # been through a candidate is unconditional, on the same footing as the ledger marker, so it
     # appears with the overlay view off. The narrowing is the point: the ranking is protected,
     # the presence fact is not hidden. See test_coverage.py for the difference pinned exactly.
-    after = tools["list_candidates"]()
+    after = tools["list_candidates"](run_id="run_m")
 
     def _without_coverage(result: dict) -> dict:
         return {
@@ -1092,7 +1089,7 @@ def test_annotate_writes_lists_and_clears_without_touching_base(tmp_path: Path) 
     # clear leaves the base map untouched
     assert tools["clear_overlay"](clear_all=True)["cleared"] == 1
     assert tools["list_overlays"]()["count"] == 0
-    assert tools["list_candidates"]() == base_before
+    assert tools["list_candidates"](run_id="run_m") == base_before
 
 
 def test_annotate_rejects_blank_rationale_and_bad_verdict(tmp_path: Path) -> None:
@@ -1185,14 +1182,14 @@ def test_list_candidates_refuses_a_filter_dimension_that_does_not_exist(tmp_path
     # matches every candidate, so without this the call returns the whole corpus labelled as
     # matched — which reads as "everything matched your filter", not "no such dimension".
     tools = _tools(tmp_path)
-    res = tools["list_candidates"](filters="binary=ip")
+    res = tools["list_candidates"](run_id="run_m", filters="binary=ip")
     assert "error" in res, f"expected a refusal, got a listing of {res.get('total')} candidates"
     assert "binary" in res["error"] and "does not exist" in res["error"]
     assert "sink_class" in res["error"]  # names the dimensions that do exist
 
     # the same check guards --only, and a real dimension still works
-    assert "error" in tools["list_candidates"](only="binary=ip")
-    ok = tools["list_candidates"](filters="sink_class=cmd")
+    assert "error" in tools["list_candidates"](run_id="run_m", only="binary=ip")
+    ok = tools["list_candidates"](run_id="run_m", filters="sink_class=cmd")
     assert "error" not in ok and ok["total"] >= 1
 
 
@@ -1226,7 +1223,7 @@ def test_degraded_and_earlier_extraction_facts_reach_every_reader(tmp_path: Path
     MUTATION (must go RED): drop the anchor stamp in the shared fact envelope, or the row key."""
     tools = _tools(tmp_path)
     _mark_degraded_and_old(tmp_path)
-    (cand,) = tools["list_candidates"]()["candidates"]
+    (cand,) = tools["list_candidates"](run_id="run_m")["candidates"]
     pc = tools["get_pseudocode"](evidence_ref="run_m#fn1@cmd")
     ex = tools["explain_candidate"](evidence_ref="run_m#fn1@cmd")
     for anchor in (cand["anchor_facts"], pc["anchor_facts"], ex["candidate"]["anchor_facts"]):
@@ -1241,7 +1238,7 @@ def test_degraded_and_earlier_extraction_facts_reach_every_reader(tmp_path: Path
 
 def test_a_clean_candidate_carries_no_anchor_key(tmp_path: Path) -> None:
     tools = _tools(tmp_path)
-    (cand,) = tools["list_candidates"]()["candidates"]
+    (cand,) = tools["list_candidates"](run_id="run_m")["candidates"]
     assert "anchor_facts" not in cand
     assert "anchor_facts" not in tools["get_pseudocode"](evidence_ref="run_m#fn1@cmd")
 

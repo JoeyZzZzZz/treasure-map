@@ -65,6 +65,8 @@ class InitResult:
     atlas_dir: Path
     checks: tuple[Any, ...]
     failed: bool = False  # a toolchain action failed
+    # applied / nothing_to_do: what this run did with the plan. The CLI renders from the plan
+    # itself; these two are the result's own record of it, read by the plan tests.
     applied: bool = False
     nothing_to_do: bool = False
     dry_run: bool = False
@@ -134,13 +136,6 @@ def _seed_watchlist() -> None:
         shutil.copy2(src, dst)
 
 
-def _set_ghidra_home(config_path: Path, home: Path) -> None:
-    """Write ghidra.local.home into config.yaml, preserving the rest of the file."""
-    data: dict[str, Any] = yaml.safe_load(config_path.read_text()) or {}
-    data.setdefault("ghidra", {}).setdefault("local", {})["home"] = str(home)
-    config_path.write_text(config_text(config_path, data))
-
-
 def _default_workspace_dir() -> str:
     return str(_DEFAULT_CONFIG_YAML["workspace_dir"])
 
@@ -155,38 +150,6 @@ def _configured_workspace_dir(config_path: Path) -> str:
         return _default_workspace_dir()
     value = data.get("workspace_dir")
     return str(value) if value else _default_workspace_dir()
-
-
-def _set_workspace_dir(config_path: Path, value: str) -> None:
-    """Write the top-level workspace_dir into config.yaml, preserving the rest of the file."""
-    data: dict[str, Any] = yaml.safe_load(config_path.read_text()) or {}
-    data["workspace_dir"] = value
-    config_path.write_text(config_text(config_path, data))
-
-
-def _configure_workspace_dir(
-    config_path: Path,
-    *,
-    non_interactive: bool,
-    prompt: Callable[[str], str],
-    echo: Callable[[str], None],
-) -> None:
-    """Confirm (or change) the workspace base directory; persist any override to config.yaml.
-
-    Shows the current value (existing config value, else the default), lets the user press
-    Enter to keep it or type a new path. Idempotent per R0e: re-init shows the existing value
-    and does not clobber it; non-interactive keeps it with no prompt. Single-colon prompt (R0d).
-    """
-    current = _configured_workspace_dir(config_path)
-    if non_interactive:
-        echo(f"  Workspace base: {current}")
-        return
-    entered = prompt(f"Workspace base directory [{current}], Enter to keep").strip()
-    if not entered:
-        echo(f"  Workspace base: {current} (kept)")
-        return
-    _set_workspace_dir(config_path, entered)
-    echo(f"  Workspace base: {entered} (saved)")
 
 
 def _configured_max_parallel(config_path: Path) -> int | None:
@@ -447,8 +410,8 @@ def _ask_workspace_dir(
     prompt: Callable[[str], str],
     echo: Callable[[str], None],
 ) -> str | None:
-    """The workspace base the user typed, or None to keep the current one (same questions as
-    ``_configure_workspace_dir``, collected now and written only once the plan is applied)."""
+    """The workspace base the user typed, or None to keep the current one (collected now and
+    written only once the plan is applied)."""
     current = _configured_workspace_dir(config_path)
     if non_interactive:
         echo(f"  Workspace base: {current}")
@@ -965,7 +928,6 @@ def run_init(
                     if force and cfg_error is None and config_path.exists()
                     else []
                 ),
-                values={".".join(k): v for k, v in changed.items()},
             )
         )
 

@@ -83,11 +83,17 @@ def test_triage_prints_run_lineage_header(tmp_path: Path) -> None:
     assert "run: rt_scanned" in r.output and "build pv_a" in r.output
 
 
-def test_triage_unscoped_shows_run_count(tmp_path: Path) -> None:
+def test_triage_without_a_run_is_refused_and_names_the_runs(tmp_path: Path) -> None:
+    """A run is required: the whole-atlas triage materialised every run's candidates. The refusal
+    names the runs to pick from, so it is a step forward, not a dead end.
+
+    MUTATION: delete the ``selected_run is None`` refusal in triage -> RED (exit 0, a listing).
+    """
     atlas = _atlas_with_runs(tmp_path)
     r = CliRunner().invoke(triage, ["--atlas", str(atlas)])
-    assert r.exit_code == 0, r.output
-    assert "run(s)" in r.output and "tmap runs" in r.output
+    assert r.exit_code != 0, r.output
+    assert "needs a run" in r.output
+    assert "rt_scanned" in r.output
 
 
 def test_run_id_completion_matches_prefix(tmp_path: Path) -> None:

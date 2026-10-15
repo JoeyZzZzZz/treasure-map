@@ -87,17 +87,6 @@ ENUMERATOR_OUT_OF_RANGE = "enumerator_out_of_range"  # the occurrence is past th
 OFFSET_UNPARSEABLE = "offset_unparseable"  # an address that does not parse as hex
 NO_FUNC_ENTRY = "no_func_entry"  # the function row has no entry address to measure from
 NO_SINK_NAME = "no_sink_name"  # the candidate names no concrete sink to enumerate
-ANCHOR_DEGRADED_REASONS: frozenset[str] = frozenset(
-    {
-        NO_BRIDGE_DATA,
-        NO_BRIDGE_TOKEN,
-        OUT_OF_BODY,
-        ENUMERATOR_OUT_OF_RANGE,
-        OFFSET_UNPARSEABLE,
-        NO_FUNC_ENTRY,
-        NO_SINK_NAME,
-    }
-)
 
 
 def bridge_tokens_present(call_tokens_json: str | None) -> bool:
@@ -152,7 +141,7 @@ def callsite_address_offset(
     """``(offset, None)`` — the normalized ADDRESS offset of the ``occurrence``-th call to
     ``sink_name`` — or ``(None, reason)`` when it cannot be pinned to an in-body address.
 
-    ``reason`` is one of ``ANCHOR_DEGRADED_REASONS``; the candidate is then not_traced and the hunt
+    ``reason`` is one of the reason constants above; the candidate is then not_traced and the hunt
     records the reason on it. ``(None, None)`` only when ``occurrence`` is None: a function-level
     candidate has no callsite to locate, so nothing degraded. Steps: locate the callsite's text
     position with the SAME enumerator the detector used (so the Nth call is the same call), find the
@@ -186,9 +175,8 @@ def callsite_addr_out_of_body(
     when it falls outside the function's body ranges.
 
     ``address_offset_at`` DROPS that address on the ``out_of_body`` degrade (returns only a reason),
-    but the sink overlay's co-claim fold / cross-side address alignment need it back. Recovered
-    WITHOUT changing any existing signature (``rekey_d4`` shares ``address_offset_at`` /
-    ``op_addr_at`` and must keep seeing them unchanged). It reuses the SAME enumeration
+    but the sink overlay's co-claim fold / cross-side address alignment need it back. It reuses
+    the SAME enumeration
     (``call_offsets`` + ``op_addr_at``) as ``callsite_address_offset``, so the address is the very
     same callsite the detector enumerated.
     None when no bridge token pins the call (register-indirect, no tokens, occurrence out of range)

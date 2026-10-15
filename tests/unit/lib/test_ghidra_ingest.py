@@ -26,7 +26,6 @@ def _make_record(name: str, sha256: str) -> ElfRecord:
         elf_type="executable",
         sha256=sha256,
         dt_needed=[],
-        protections={},
         size=4096,
     )
 

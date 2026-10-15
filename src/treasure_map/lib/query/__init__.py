@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Neutral read-side aggregation views over the atlas.
 
-density / twins / dormant — mechanism aggregations only. Every row is a lead/candidate;
+density — mechanism aggregations only. Every row is a lead/candidate;
 nothing here scores, ranks, or judges.
 """
 
@@ -16,7 +16,6 @@ from treasure_map.lib.query.coverage import (
 )
 from treasure_map.lib.query.exec_edges import launched_by
 from treasure_map.lib.query.exploit_ledger import (
-    list_cve_patterns,
     list_verified_exploits,
     refs_in_ledger,
 )
@@ -67,11 +66,8 @@ from treasure_map.lib.query.views import (
     FINE_FP_ALGO_VERSION,
     DensityRow,
     LedgerRow,
-    TwinRow,
     density,
-    dormant,
     ledger,
-    twins,
 )
 
 __all__ = [
@@ -86,12 +82,10 @@ __all__ = [
     "Dimension",
     "LedgerRow",
     "TriageCandidate",
-    "TwinRow",
     "apply_overlay_view",
     "apply_view",
     "canonical_view",
     "density",
-    "dormant",
     "edges_reaching_callee",
     "explain_candidate",
     "get_string_keyed_edges",
@@ -109,7 +103,6 @@ __all__ = [
     "impact_tier",
     "launched_by",
     "ledger",
-    "list_cve_patterns",
     "list_verified_exploits",
     "list_runs",
     "run_staleness",
@@ -125,6 +118,5 @@ __all__ = [
     "sort_candidates",
     "state_value_label",
     "triage",
-    "twins",
     "unknown_dimension_refusal",
 ]

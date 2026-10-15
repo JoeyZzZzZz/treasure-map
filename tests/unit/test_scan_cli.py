@@ -64,7 +64,7 @@ def _fake_analyze_result(db_path: Path) -> AnalyzeResult:
 def _hunt_stats(written: int = 0) -> SimpleNamespace:
     return SimpleNamespace(
         instances_written=written,
-        by_status={"confirmed": 0, "blocked": 0, "unknown": written},
+        by_status={"confirmed": 0, "unknown": written},
         data_gap_skipped=0,
         # Mirrors the real stats field-for-field ON PURPOSE (no getattr fallback, no **kwargs): a
         # field added to Analyzer2Stats and not surfaced here shows up as a failure rather than as
@@ -90,7 +90,7 @@ def _base_patches(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("treasure_map.lib.workspace.workspace.Workspace", _DummyWorkspace)
 
 
-def _seed_atlas(tmp_path: Path, run_id: str, *, with_gated: bool = False) -> Path:
+def _seed_atlas(tmp_path: Path, run_id: str) -> Path:
     conn = open_atlas(tmp_path / "atlas.db")
     p = upsert_pattern(
         conn,
@@ -123,8 +123,6 @@ def _seed_atlas(tmp_path: Path, run_id: str, *, with_gated: bool = False) -> Pat
 
     _inst("unknown", "tv_fn")
     _inst("confirmed", "rc_fn")
-    if with_gated:
-        _inst("blocked", "gt_fn", blocking="char_filter")
     conn.close()
     return tmp_path / "atlas.db"
 
@@ -342,7 +340,7 @@ def test_scan_passes_through_triage_options(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _base_patches(monkeypatch)
-    atlas = _seed_atlas(tmp_path, "ws_x", with_gated=True)
+    atlas = _seed_atlas(tmp_path, "ws_x")
 
     async def _fake_analyze(*_: Any, **__: Any) -> SimpleNamespace:
         return _fake_analyze_result(tmp_path / "analysis.db")
@@ -355,11 +353,11 @@ def test_scan_passes_through_triage_options(
 
     default = runner.invoke(scan, base)
     assert default.exit_code == 0, default.output
-    assert "gt_fn" not in default.output and "hidden" in default.output  # gated folded
+    assert "tv_fn" in default.output and "rc_fn" in default.output
 
-    gated = runner.invoke(scan, [*base, "--include-gated"])
-    assert gated.exit_code == 0, gated.output
-    assert "gt_fn" in gated.output  # --include-gated passed through to the renderer
+    reach = runner.invoke(scan, [*base, "--status", "reachable"])
+    assert reach.exit_code == 0, reach.output
+    assert "rc_fn" in reach.output and "tv_fn" not in reach.output  # --status reached the renderer
 
     as_json = runner.invoke(scan, [*base, "--json"])
     assert as_json.exit_code == 0, as_json.output
@@ -402,7 +400,7 @@ def test_scan_says_out_loud_when_the_hunt_was_skipped(
     """★ A skipped hunt writes nothing, so every count it reports is zero.
 
     Printing those zeros through the normal line would read "0 candidates written (confirmed=0,
-    blocked=0, unknown=0)" — indistinguishable from a hunt that ran and found nothing on this
+    unknown=0)" — indistinguishable from a hunt that ran and found nothing on this
     firmware. The stored candidates are in fact untouched and still there, which is the opposite
     conclusion. So the skip gets its own line, and it names the way to override it.
 

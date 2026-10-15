@@ -2,14 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for Analyzer-2 (A2) — the pattern-driven atlas writer.
 
-Synthetic, vendor-neutral analysis.db (incl. one OSS binary) + temp atlas; hermetic (no
-LLM). Proves the R-pattern -> R2 -> atlas write, OSS exclusion, the L0/L1 mapping, the
-empty-public_finding gate, evidence neutralization (raw literal never persisted), and the
-boundary.
+Synthetic, vendor-neutral analysis.db (incl. one widely-shipped stock binary) + temp atlas;
+hermetic (no LLM). Proves the R-pattern -> R2 -> atlas write, that every binary is scanned, the
+L0/L1 mapping (a hunt never writes L2/L3), evidence neutralization (raw literal never persisted),
+and the boundary.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import re
@@ -116,11 +117,6 @@ def _make_db(
             "INSERT INTO binaries (id, name, path, sha256, ghidra_ok) VALUES (?, ?, ?, ?, 1)",
             (bid, spec["name"], spec.get("path"), _sha(str(spec["name"]))),
         )
-        if spec.get("oss"):
-            conn.execute(
-                "INSERT INTO components (binary_id, product, version) VALUES (?, 'tp', '1')",
-                (bid,),
-            )
         for func in spec.get("funcs", []):  # type: ignore[union-attr]
             fid += 1
             _insert_func(conn, bid, func, fid=fid)
@@ -237,19 +233,19 @@ def _instances(atlas_path: Path) -> list[sqlite3.Row]:
         conn.close()
 
 
-def _count(atlas_path: Path, view: str) -> int:
+def _count(atlas_path: Path, table: str) -> int:
     conn = open_atlas(atlas_path)
     try:
-        return int(conn.execute(f"SELECT COUNT(*) FROM {view}").fetchone()[0])
+        return int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
     finally:
         conn.close()
 
 
-# ── writer: rich patterns + instances, every binary scanned, L0/L1, empty public_finding ──
+# ── writer: rich patterns + instances, every binary scanned, L0/L1 only ──
 
 
-def test_writer_scans_component_table_binary(tmp_path: Path) -> None:
-    """End to end: a binary recorded in the components table produces a written instance.
+def test_writer_scans_widely_shipped_binary(tmp_path: Path) -> None:
+    """End to end: a widely-shipped stock binary produces a written instance like any other.
 
     MUTATION: skip `busybox` in the scanner loop -> RED (one match, one instance, one name).
     """
@@ -260,7 +256,6 @@ def test_writer_scans_component_table_binary(tmp_path: Path) -> None:
             {
                 "name": "busybox",
                 "path": "bin/busybox",
-                "oss": True,
                 "funcs": [_cmd_injection_fn("applet")],
             },
         ],
@@ -270,7 +265,7 @@ def test_writer_scans_component_table_binary(tmp_path: Path) -> None:
 
     # Per class rather than a bare total: each function's snprintf is a command candidate AND a
     # buffer-formatter write candidate, so "how many matches" is no longer "how many cmd shapes".
-    # What this test is about — every binary was scanned, including the components-table one — is
+    # What this test is about — every binary was scanned, including the stock one — is
     # the cmd count.
     assert _class_counts(atlas) == {"cmd": 2, "format": 2}
     assert stats.matches == stats.instances_written == 4
@@ -280,7 +275,12 @@ def test_writer_scans_component_table_binary(tmp_path: Path) -> None:
     finally:
         conn.close()
     assert {Path(p).name for p in paths} == {"webd", "busybox"}
-    assert _count(atlas, "public_finding") == 0
+    conn = open_atlas(atlas)
+    try:
+        levels = {r[0] for r in conn.execute("SELECT DISTINCT provenance_level FROM instance")}
+    finally:
+        conn.close()
+    assert levels <= {"L0", "L1"}  # a hunt never writes L2/L3
 
     conn = open_atlas(atlas)
     try:
@@ -2888,10 +2888,10 @@ def test_each_path_callsite_reaches_the_atlas_with_its_own_callee(tmp_path: Path
     The fixture makes the two rules DIVERGE: unlink is called first, fopen sorts first. Re-deriving
     gives both rows "fopen"; reading the detector's evidence gives unlink then fopen.
 
-    MUTATION (measured: 1 failed of 111, this test alone): drop "path_sink" from the
-    evidence-anchored tuple in analyzer2, so sink_name falls back to _sink_name_for(callees, ...)
-    -> both rows read "fopen". Nothing else in the file noticed — which is why this guard is here
-    and not left to the detector-level tests."""
+    MUTATION: re-derive the path_sink anchor from the callee list (the alphabetically-first
+    path sink among ``callees``) instead of reading ``match.evidence`` -> both rows read "fopen".
+    Nothing else in the file noticed — which is why this guard is here and not left to the
+    detector-level tests."""
     fn = {
         "name": "fs_op",
         "pseudocode": 'void fs_op(char *a, char *b){ unlink(a); fopen(b, "r"); }',
@@ -2904,6 +2904,31 @@ def test_each_path_callsite_reaches_the_atlas_with_its_own_callee(tmp_path: Path
     rows = _instances_of(atlas, "path_sink")
     assert [r["sink_anchor"] for r in rows] == ["unlink", "fopen"]
     assert len({r["evidence_ref"] for r in rows}) == 2  # distinct refs, one per callsite
+
+
+def test_a_sink_class_without_a_detector_anchor_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sink class whose detector carries no concrete sink is refused, never re-derived.
+
+    Re-deriving the anchor from the callee list is the per-function mistake the evidence anchor
+    exists to prevent (every callsite handed one alphabetically-chosen name). The old fallback did
+    exactly that, silently; a new detector added without an anchor must fail loudly instead.
+
+    MUTATION: restore a silent fallback (``sink_name = None``) for an unlisted class -> RED (the
+    hunt completes and writes an unanchored row instead of raising)."""
+    real_scan = analyzer2_mod.scan
+
+    def _scan_with_an_unanchored_class(db_path: Path):  # type: ignore[no-untyped-def]
+        res = real_scan(db_path)
+        return dataclasses.replace(
+            res, matches=tuple(dataclasses.replace(m, sink_class="bogus") for m in res.matches)
+        )
+
+    monkeypatch.setattr(analyzer2_mod, "scan", _scan_with_an_unanchored_class)
+    db = _make_db(tmp_path, [{"name": "webd", "funcs": [_cmd_injection_fn("handle")]}])
+    with pytest.raises(ValueError, match="carries no detector sink anchor"):
+        run_analyzer2(db, tmp_path / "atlas.db", source_run_id="r")
 
 
 def test_each_command_callsite_reaches_the_atlas_with_its_own_callee(tmp_path: Path) -> None:

@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from typing import Literal
 
 from treasure_map.lib.pattern.classes import (
     CMD,
@@ -32,8 +31,6 @@ from treasure_map.lib.pattern.classes import (
     call_offsets,
     format_string_ident,
 )
-
-OriginKind = Literal["strong_source", "weak_source", "parameter", "unknown"]
 
 # Identifiers that are NOT variables and must not become flow edges (they pollute the flow
 # set and let an unrelated validator spuriously "cover" a dangerous input). Callee names are
@@ -240,59 +237,6 @@ def _seed_source(
     # is the safe direction (it biases toward "unknown", never toward over-claiming).
 
 
-def _taint_sets(pseudocode: str) -> tuple[set[str], set[str], set[str]]:
-    """Return (strong_tainted, weak_tainted, param_tainted) variable-name sets.
-
-    strong_tainted: variables fed by a STRONG (network/request) in-function source.
-    weak_tainted: variables fed by a WEAK (env/config/device-self/file) in-function source.
-    param_tainted: variables that are, or derive from, a function parameter.
-    Propagation runs to a fixed point over real assignments and formatter/copy builders.
-    """
-    statements = re.split(r"[;\n{}]", pseudocode)
-    strong: set[str] = set()
-    weak: set[str] = set()
-    par: set[str] = set(_CALLER_SUPPLIED_RE.findall(pseudocode))
-
-    prev = (-1, -1, -1)
-    for _ in range(len(statements) + 2):
-        for stmt in statements:
-            assign = _ASSIGN_RE.match(stmt)
-            lhs = assign.group(1) if assign else None
-            rhs = assign.group(2) if assign else ""
-
-            for name, args in _CALL_RE.findall(stmt):
-                if name in SOURCE_STRONG or name in SOURCE_WEAK:
-                    _seed_source(name, args, lhs, rhs, strong, weak)
-                if name in FORMAT or name in COPY:
-                    # Builders: first arg is the destination, the rest are inputs; the
-                    # destination inherits whatever taint flows in.
-                    ids = _IDENT_RE.findall(args)
-                    if ids:
-                        dst, rest = ids[0], set(ids[1:])
-                        if rest & strong:
-                            strong.add(dst)
-                        if rest & weak:
-                            weak.add(dst)
-                        if rest & par:
-                            par.add(dst)
-
-            if lhs is not None:
-                rhs_idents = set(_IDENT_RE.findall(rhs))
-                if rhs_idents & strong:
-                    strong.add(lhs)
-                if rhs_idents & weak:
-                    weak.add(lhs)
-                if rhs_idents & par:
-                    par.add(lhs)
-
-        snapshot = (len(strong), len(weak), len(par))
-        if snapshot == prev:
-            break
-        prev = snapshot
-
-    return strong, weak, par
-
-
 def _dep_idents(text: str, call_names: set[str]) -> set[str]:
     """Plausible variable identifiers in ``text`` — pollution (callee names, type words,
     hex fragments) removed so the flow set stays trustworthy."""
@@ -400,20 +344,3 @@ def free_taint_reaches(pseudocode: str, sink_var: str, *, safe_vars: set[str]) -
                 seen.add(src)
                 stack.append(src)
     return False
-
-
-def origin_of(pseudocode: str, var: str) -> OriginKind:
-    """Classify where ``var`` reaching a sink originates, within this function.
-
-    Parameter origin wins over any in-function source under doubt: any caller-supplied
-    contribution makes the path unprovable here, which must never grade as confirmed. A
-    strong source outranks a weak one only when no parameter contributes.
-    """
-    strong, weak, par = _taint_sets(pseudocode)
-    if var in par or _CALLER_SUPPLIED_RE.fullmatch(var):
-        return "parameter"
-    if var in strong:
-        return "strong_source"
-    if var in weak:
-        return "weak_source"
-    return "unknown"

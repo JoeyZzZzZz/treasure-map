@@ -174,7 +174,7 @@ def plan_lines(plan: UpdatePlan) -> list[str]:
     return lines
 
 
-def manual_update_hint(prefix: Path) -> str:
+def manual_update_hint() -> str:
     """How to update a tmap that tmap does not manage."""
     direct = None
     try:

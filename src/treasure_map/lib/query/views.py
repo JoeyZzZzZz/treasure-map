@@ -28,16 +28,6 @@ class DensityRow:
 
 
 @dataclass(frozen=True)
-class TwinRow:
-    """A fingerprint seen with both a blocked and a non-blocked instance (same shape, mixed)."""
-
-    structural_fingerprint: str | None
-    sink_class: str
-    blocked_count: int
-    non_blocked_count: int
-
-
-@dataclass(frozen=True)
 class LedgerRow:
     """The two derived recurrence ledgers for one pattern, computed on read.
 
@@ -64,11 +54,6 @@ class LedgerRow:
     fine_fp_algo_version: str
 
 
-def dormant(conn: sqlite3.Connection) -> list[sqlite3.Row]:
-    """Return the blocked candidate instances (R2's blocked partition, L0/L1) — free reuse."""
-    return conn.execute("SELECT * FROM dormant_instance ORDER BY instance_id").fetchall()
-
-
 def density(conn: sqlite3.Connection) -> list[DensityRow]:
     """Return candidate-instance density per (run, sink_class, fingerprint)."""
     rows = conn.execute(
@@ -82,24 +67,6 @@ def density(conn: sqlite3.Connection) -> list[DensityRow]:
             sink_class=r["sink_class"],
             structural_fingerprint=r["structural_fingerprint"],
             instance_count=int(r["instance_count"]),
-        )
-        for r in rows
-    ]
-
-
-def twins(conn: sqlite3.Connection) -> list[TwinRow]:
-    """Return fingerprints observed with both a blocked and a non-blocked instance."""
-    rows = conn.execute(
-        "SELECT structural_fingerprint, sink_class, blocked_count, non_blocked_count "
-        "FROM twin_candidate "
-        "ORDER BY sink_class, structural_fingerprint"
-    ).fetchall()
-    return [
-        TwinRow(
-            structural_fingerprint=r["structural_fingerprint"],
-            sink_class=r["sink_class"],
-            blocked_count=int(r["blocked_count"]),
-            non_blocked_count=int(r["non_blocked_count"]),
         )
         for r in rows
     ]

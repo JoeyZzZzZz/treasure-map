@@ -100,10 +100,6 @@ from treasure_map.lib.hunt.wrapper_propagation import (
 from treasure_map.lib.pattern import scan
 from treasure_map.lib.pattern.classes import (
     CMD,
-    COPY,
-    FMT_STRING,
-    FORMAT,
-    PATH_SINK,
     all_path_calls_literal,
     path_arg_ident,
 )
@@ -243,20 +239,6 @@ def _load_entry_index(
         return load_entry_index(conn, exec_sites=exec_sites)
     finally:
         conn.close()
-
-
-_SINK_CLASS_MEMBERS: dict[str, frozenset[str]] = {
-    "cmd": CMD,
-    "copy": COPY,
-    "format": FORMAT,
-    "fmt_string": FMT_STRING,
-    "path_sink": PATH_SINK,
-}
-
-# Shell-running command sinks. When a function calls several command sinks, anchor to one of
-# these over an exec-family sink (Bug1): system/popen/doSystem run a shell, so anchoring to the
-# alphabetically-first execX would let the no_shell_exec form note hide the real shell sink.
-_SHELL_CMD_SINKS: frozenset[str] = frozenset({"system", "popen", "doSystem"})
 
 
 def _form_note_contradicts_source(blocking_mechanism: str | None, source_kind: str | None) -> bool:
@@ -506,21 +488,6 @@ def _wrapper_fingerprint(sink_class: str, source_class: str, wrapped_sink: str) 
     axis reproduces the historical `wrapper-cmd|…` basis exactly (no fingerprint churn)."""
     basis = f"{_WRAPPER_AXIS[sink_class][0]}|{source_class}|{wrapped_sink}"
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
-
-
-def _sink_name_for(callees: list[str], sink_class: str) -> str | None:
-    """Return the concrete sink callee for a sink_class, anchoring to the most dangerous one.
-
-    Deterministic: a shell-running command sink (system/popen/doSystem) is preferred over an
-    exec-family sink so a coexisting shell sink is never masked (Bug1); ties break alphabetically.
-    """
-    members = _SINK_CLASS_MEMBERS.get(sink_class)
-    if not members:
-        return None
-    hits = sorted(name for name in callees if name in members)
-    if not hits:
-        return None
-    return min(hits, key=lambda name: (name not in _SHELL_CMD_SINKS, name))
 
 
 def _parse_callees(raw: str | None) -> list[str]:
@@ -1265,7 +1232,7 @@ def run_analyzer2(
             scanned=0,
             matches=0,
             instances_written=0,
-            by_status={"confirmed": 0, "blocked": 0, "unknown": 0},
+            by_status={"confirmed": 0, "unknown": 0},
             skipped=True,
             hunt_currency=currency.reason,
         )
@@ -1352,7 +1319,7 @@ def run_analyzer2(
         RunCapabilityRow(run_id=source_run_id, capability="reachability.exec_argv_edge", present=1),
     ]
 
-    by_status = {"confirmed": 0, "blocked": 0, "unknown": 0}
+    by_status = {"confirmed": 0, "unknown": 0}
     instances_written = 0
     wrapper_propagated = 0
     data_gap_skipped = 0
@@ -1422,10 +1389,10 @@ def run_analyzer2(
 
                 callees = _parse_callees(row.callees)
                 stub_names = stub_by_binary.get(row.binary_id)
-                # Every shape now chooses its concrete sink in the DETECTOR and carries it in
-                # evidence; anchor to THAT rather than re-deriving one from the callee list. The
-                # resolver below is the fallback for a sink class whose detector carries no anchor
-                # — none does today, so it is reached only if one is added without one.
+                # Every shape chooses its concrete sink in the DETECTOR and carries it in evidence;
+                # anchor to THAT rather than re-deriving one from the callee list. A sink class
+                # whose detector carries no anchor is refused outright: re-deriving one from the
+                # callee list is exactly the per-function mistake each line below describes.
                 #   cmd        — the command sink AT THIS CALLSITE. Re-deriving had to pick one
                 #                name per function, and an execv sorting ahead of a coexisting
                 #                system would anchor the row at the non-shell sink and let the
@@ -1442,11 +1409,11 @@ def run_analyzer2(
                 #   path_sink  — same again, and for the same reason the position matters: fopen's
                 #                path is argument 0 while openat's is argument 1. Re-deriving would
                 #                give every callsite in the function one alphabetically-chosen name.
-                sink_name: str | None
-                if match.sink_class in ("cmd", "fmt_string", "copy", "format", "path_sink"):
-                    sink_name = match.evidence
-                else:
-                    sink_name = _sink_name_for(callees, match.sink_class)
+                if match.sink_class not in ("cmd", "fmt_string", "copy", "format", "path_sink"):
+                    raise ValueError(
+                        f"sink class {match.sink_class!r} carries no detector sink anchor"
+                    )
+                sink_name: str | None = match.evidence
                 # Which call to that sink this candidate is about. None (every function-level
                 # shape, and a copy whose call is not in the text) reads the first call, which is
                 # what every candidate did before per-callsite emission existed.
@@ -1657,7 +1624,7 @@ def run_analyzer2(
                     )
                     flow_evidence = json.dumps(path_ev, sort_keys=True)
 
-                provenance = "L1" if status in {"confirmed", "blocked"} else "L0"
+                provenance = "L1" if status == "confirmed" else "L0"
                 callsite_offset, anchor_degraded = callsite_address_offset(
                     row.pseudocode,
                     sink_name,
@@ -1754,7 +1721,7 @@ def run_analyzer2(
                     commit=False,
                 )
                 instances_written += 1
-                by_status[status] += 1
+                by_status[status] = by_status.get(status, 0) + 1
 
             # ── Factor ① recall pass: one-hop thin-wrapper propagation ──────────────────
             # A function whose sink hides inside a thin wrapper it calls becomes a candidate here

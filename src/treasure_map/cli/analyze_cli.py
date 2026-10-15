@@ -192,7 +192,7 @@ def analyze(
         click.echo(f"Workspace: '{workspace}' → {ws_path}")
 
     try:
-        with Workspace(ws_path, progress_callback=_progress) as ws:
+        with Workspace(ws_path) as ws:
             result = asyncio.run(
                 run_analyze(
                     fs_root,

@@ -18,8 +18,6 @@ CREATE TABLE IF NOT EXISTS binaries (
     sha256       TEXT    UNIQUE,           -- content-identity; same content → one row
     file_type    TEXT,                     -- executable / shared_library / relocatable
     dt_needed    TEXT    DEFAULT '[]',     -- JSON: DT_NEEDED 动态库依赖
-    capa_tags    TEXT    DEFAULT '[]',     -- JSON: 二进制级 Capa 能力标签
-    protections  TEXT    DEFAULT '{}',     -- JSON: {nx, pie, canary, relro, fortify}
     size_bytes   INTEGER DEFAULT 0,        -- ELF 文件大小 (bytes)
     ghidra_ok    INTEGER NOT NULL DEFAULT 0, -- Round 2 partial-invalidation flag (1 = usable output)
     ghidra_status TEXT,                    -- tri-state analysis outcome: ok / ok_empty / failed / NULL
@@ -390,33 +388,6 @@ CREATE TABLE IF NOT EXISTS config_entries (
     FOREIGN KEY(file_id) REFERENCES non_binary_files(id) ON DELETE CASCADE
 );
 
--- 第三方组件 + 版本（M5 CVE 匹配用）
-CREATE TABLE IF NOT EXISTS components (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    binary_id   INTEGER NOT NULL,
-    product     TEXT,
-    version     TEXT,
-    cpe         TEXT,
-    source      TEXT,
-    evidence    TEXT,
-    FOREIGN KEY(binary_id) REFERENCES binaries(id) ON DELETE CASCADE
-);
-
--- CVE 匹配结果（M5）
-CREATE TABLE IF NOT EXISTS cve_matches (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    component_id INTEGER,
-    binary_id    INTEGER,
-    cve_id       TEXT,
-    cvss_score   REAL,
-    severity     TEXT,
-    summary      TEXT,
-    published    TEXT,
-    url          TEXT,
-    FOREIGN KEY(component_id) REFERENCES components(id) ON DELETE CASCADE,
-    FOREIGN KEY(binary_id)    REFERENCES binaries(id)   ON DELETE CASCADE
-);
-
 -- 索引
 CREATE INDEX IF NOT EXISTS idx_functions_name     ON functions(name);
 CREATE INDEX IF NOT EXISTS idx_functions_binary   ON functions(binary_id);
@@ -486,8 +457,3 @@ CREATE TABLE IF NOT EXISTS web_form_fields (
 
 CREATE INDEX IF NOT EXISTS idx_web_form_fields_file ON web_form_fields(file_id);
 CREATE INDEX IF NOT EXISTS idx_web_form_fields_kw   ON web_form_fields(field_keyword);
-CREATE INDEX IF NOT EXISTS idx_components_binary  ON components(binary_id);
-CREATE INDEX IF NOT EXISTS idx_components_product ON components(product);
-CREATE INDEX IF NOT EXISTS idx_cve_binary         ON cve_matches(binary_id);
-CREATE INDEX IF NOT EXISTS idx_cve_severity       ON cve_matches(severity);
-CREATE INDEX IF NOT EXISTS idx_cve_id             ON cve_matches(cve_id);

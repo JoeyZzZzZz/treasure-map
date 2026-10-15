@@ -11,7 +11,6 @@ from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import (
     InstanceRow,
     PatternRow,
-    PublicCvePatternRow,
     RunRow,
 )
 from treasure_map.lib.atlas.writer import (
@@ -19,7 +18,6 @@ from treasure_map.lib.atlas.writer import (
     add_instance,
     add_instances,
     add_private_exploit,
-    add_public_cve_patterns,
     begin_run,
     delete_private_exploit,
     finish_run,
@@ -30,12 +28,10 @@ __all__ = [
     "AtlasStats",
     "InstanceRow",
     "PatternRow",
-    "PublicCvePatternRow",
     "RunRow",
     "add_instance",
     "add_instances",
     "add_private_exploit",
-    "add_public_cve_patterns",
     "begin_run",
     "delete_private_exploit",
     "finish_run",

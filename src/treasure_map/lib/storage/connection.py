@@ -16,6 +16,8 @@ _DROPPED_COLUMNS: tuple[tuple[str, str, str | None], ...] = (
     ("functions", "func_types", "idx_functions_types"),
     ("functions", "vuln_hints", "idx_functions_vuln"),
     ("functions", "capa_tags", None),
+    ("binaries", "capa_tags", None),
+    ("binaries", "protections", None),
     ("script_calls", "has_user_input", "idx_script_calls_ui"),
     ("script_calls", "vuln_hint", None),
     ("config_entries", "vuln_hint", "idx_config_entries_hint"),
@@ -24,7 +26,7 @@ _DROPPED_COLUMNS: tuple[tuple[str, str, str | None], ...] = (
 )
 
 # Tables dropped entirely (never read; no writer). DROP TABLE IF EXISTS is idempotent.
-_DROPPED_TABLES: tuple[str, ...] = ("library_summaries",)
+_DROPPED_TABLES: tuple[str, ...] = ("library_summaries", "cve_matches", "components")
 
 # Columns ADDED after the initial schema. CREATE TABLE IF NOT EXISTS does not alter an existing
 # table, so a database built before the column existed needs an explicit, idempotent ALTER. Each

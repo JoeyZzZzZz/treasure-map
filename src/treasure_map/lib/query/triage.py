@@ -10,8 +10,8 @@ spines on sink-impact, bands by impact x controllability, and sinks ONLY provabl
 candidates — a '?' never sinks (the demotion iron law). Every lens rides that same iron law, so no
 angle can bury a candidate by "not yet known".
 
-Nothing here is a verdict or a written-back value; the review-status words (to-verify / reachable /
-gated) remain a presentation-only relabel of the raw reachability_status, kept for the status
+Nothing here is a verdict or a written-back value; the review-status words (to-verify /
+reachable) remain a presentation-only relabel of the raw reachability_status, kept for the status
 filter. tmap annotates facts; the security judgement is the consumer's.
 """
 
@@ -47,7 +47,9 @@ logger = logging.getLogger(__name__)
 REVIEW_STATUS_BY_REACHABILITY: dict[str, str] = {
     "confirmed": "reachable",  # a clean source->sink flow was seen within one function
     "unknown": "to-verify",  # the triage body: a lead that warrants manual reverse-engineering
-    "blocked": "gated",  # a filter/guard was identified on the path (likely dormant/false)
+    # 'blocked' is never emitted (grader.py), so 'gated' is retired; map it to a VISIBLE lead
+    # rather than a hidden bucket, so even a hypothetical blocked row is never silently dropped.
+    "blocked": "to-verify",
 }
 
 # The map's default lens label + the honest phase-1 caveats. Surfaced verbatim in every candidate
@@ -2577,7 +2579,7 @@ def _row_get(row: sqlite3.Row, key: str) -> str | None:
 
 # Display order of the presentation review statuses (highest-intent first). Shared by the CLI
 # renderer and the MCP candidate list so the two fold/show the same statuses.
-_SECTION_ORDER = ("to-verify", "reachable", "gated")
+_SECTION_ORDER = ("to-verify", "reachable")
 
 
 def sink_matches(candidate: TriageCandidate, sink: str) -> bool:
@@ -2587,20 +2589,16 @@ def sink_matches(candidate: TriageCandidate, sink: str) -> bool:
     return (candidate.sink_anchor or "").lower() == needle or candidate.sink_class.lower() == needle
 
 
-def shown_statuses(status: str | None, *, include_gated: bool, sink: str | None) -> set[str]:
+def shown_statuses(status: str | None, *, sink: str | None) -> set[str]:
     """Which review statuses to display, matching the CLI triage semantics exactly.
 
-    A --sink filter or status='all' shows every status (so a recalled-but-low sink is never hidden
-    by the default fold); an explicit status shows only that one; otherwise the default shows
-    to-verify + reachable, with gated folded unless include_gated."""
+    A --sink filter or status='all' shows every status; an explicit status shows only that one;
+    otherwise the default shows to-verify + reachable (the only two statuses there are)."""
     if status == "all" or sink is not None:
         return set(_SECTION_ORDER)
     if status is not None:
         return {status}
-    base = {"to-verify", "reachable"}
-    if include_gated:
-        base.add("gated")
-    return base
+    return {"to-verify", "reachable"}
 
 
 def filter_candidates(
@@ -2608,10 +2606,9 @@ def filter_candidates(
     *,
     sink: str | None = None,
     status: str | None = None,
-    include_gated: bool = False,
 ) -> list[TriageCandidate]:
-    """Apply the shared sink/status/include_gated filters to a ranked list (input order kept)."""
-    statuses = shown_statuses(status, include_gated=include_gated, sink=sink)
+    """Apply the shared sink/status filters to a ranked list (input order kept)."""
+    statuses = shown_statuses(status, sink=sink)
     return [
         c
         for c in candidates

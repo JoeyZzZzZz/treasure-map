@@ -857,7 +857,6 @@ def hunt_pattern(
     click.echo(
         "  By reachability   : "
         f"confirmed={stats.by_status.get('confirmed', 0)}, "
-        f"blocked={stats.by_status.get('blocked', 0)}, "
         f"unknown={stats.by_status.get('unknown', 0)}"
     )
     if stats.data_gap_skipped:
@@ -970,7 +969,6 @@ def _render_triage(
     top_n: int | None,
     status: str | None,
     sink: str | None,
-    include_gated: bool,
     as_json: bool,
     corpus_size: int | None = None,
     filter_note: str | None = None,
@@ -994,13 +992,13 @@ def _render_triage(
 
     tier_name = {3: "hi", 2: "med", 1: "lo", 0: "?"}
 
-    counts = {"reachable": 0, "to-verify": 0, "gated": 0}
+    counts = {"reachable": 0, "to-verify": 0}
     for c in candidates:
         counts[c.review_status] = counts.get(c.review_status, 0) + 1
 
     # Rank over the lens-ordered list, before the status/sink visibility fold + truncation.
     ranked = list(enumerate(candidates, 1))  # [(rank, candidate), ...]
-    visible_statuses = _shown_statuses(status, include_gated=include_gated, sink=sink)
+    visible_statuses = _shown_statuses(status, sink=sink)
     visible = [
         (r, c)
         for r, c in ranked
@@ -1045,9 +1043,7 @@ def _render_triage(
         )
         return
 
-    counts_str = (
-        f"{counts['reachable']} reachable, {counts['to-verify']} to-verify, {counts['gated']} gated"
-    )
+    counts_str = f"{counts['reachable']} reachable, {counts['to-verify']} to-verify"
     if corpus_size is not None and corpus_size != len(candidates):
         # --only prune: the corpus stays whole, the sweep is a reduced VIEW (its own honest header,
         # never the "never reduce" footer's promise).
@@ -1087,8 +1083,6 @@ def _render_triage(
         for key in ("anchor_note", "extraction_note"):
             if key in c.anchor_facts:
                 click.echo(f"        ! {c.anchor_facts[key]}")
-    if "gated" not in visible_statuses and counts["gated"]:
-        click.echo(f"\n  (gated: {counts['gated']} hidden; --include-gated to show)")
     click.echo("\ncaveats (this map is honest but low-resolution — do not read it as complete):")
     for cav in caveats:
         click.echo(f"  - {cav}")
@@ -1241,8 +1235,6 @@ def _reachability_inline(status: str) -> str:
             "a source->sink flow was seen within ONE function (L1 at most) — not caller-confirmed, "
             "not cross-function"
         )
-    if status == "blocked":
-        return "a filter/guard was identified on the in-function path"
     return "not shown reachable within the function (a lead to verify)"
 
 
@@ -1309,11 +1301,11 @@ def _run_provenance_line(r: RunRow) -> str:
     return "   ".join(parts)
 
 
-def _echo_run_lineage(atlas_path: Path, selected_run: str | None) -> None:
+def _echo_run_lineage(atlas_path: Path, selected_run: str) -> None:
     """Print the run's scan lineage at the top of a CLI view (M8c) — the stale-scan guard.
 
-    When scoped to one run, print its lineage line so its build/date/status is in front of the
-    reader (a stale scan is otherwise silent); unscoped, print the run count + how to scope.
+    Print the run's lineage line so its build/date/status is in front of the reader (a stale scan
+    is otherwise silent); a run id the atlas does not hold prints the run count + how to list them.
     Best-effort: any read failure is silent (a lineage banner never breaks the command)."""
     try:
         from treasure_map.lib.atlas.connection import open_atlas
@@ -1322,17 +1314,16 @@ def _echo_run_lineage(atlas_path: Path, selected_run: str | None) -> None:
 
         conn = open_atlas(atlas_path)
         try:
-            if selected_run is not None:
-                r = run_get_run(conn, selected_run)
-                if r is not None:
-                    click.echo(f"run: {_run_provenance_line(r)}")
-                    return
+            r = run_get_run(conn, selected_run)
+            if r is not None:
+                click.echo(f"run: {_run_provenance_line(r)}")
+                return
             n = len(run_list_runs(conn))
         finally:
             conn.close()
     except Exception:
         return
-    click.echo(f"atlas: {n} run(s) — `tmap runs` for lineage, --run <id> to scope")
+    click.echo(f"atlas: {n} run(s), none named {selected_run!r} — `tmap runs` to list them")
 
 
 @click.command("runs", short_help="List scanned firmware runs")
@@ -1475,15 +1466,9 @@ def runs(config: Path | None, atlas_path: Path | None, as_json: bool) -> None:
 )
 @click.option(
     "--status",
-    type=click.Choice(["to-verify", "reachable", "gated", "all"]),
+    type=click.Choice(["to-verify", "reachable", "all"]),
     default=None,
-    help="Show only this review status. Default shows to-verify + reachable (gated folded).",
-)
-@click.option(
-    "--include-gated",
-    is_flag=True,
-    default=False,
-    help="Also show gated candidates (folded by default — they are likely dormant/false).",
+    help="Show only this review status. Default shows to-verify + reachable.",
 )
 @click.option(
     "--sort-by",
@@ -1557,7 +1542,6 @@ def triage(
     show_all: bool,
     sink: str | None,
     status: str | None,
-    include_gated: bool,
     sort_by: str | None,
     view: str | None,
     dim_filter_specs: tuple[str, ...],
@@ -1599,6 +1583,22 @@ def triage(
     cfg = load_config(config)
     resolved_atlas = atlas_path if atlas_path is not None else cfg.atlas.db_path
     _require_atlas(resolved_atlas)
+    # ★ A run is REQUIRED (owner decision): the whole-atlas triage materialised every run's
+    # candidates. Name the scan; `tmap runs` lists them.
+    if selected_run is None:
+        from treasure_map.lib.atlas.connection import open_atlas
+        from treasure_map.lib.query import list_runs as _list_runs
+
+        conn = open_atlas(resolved_atlas)
+        try:
+            ids = [r.run_id for r in _list_runs(conn) if r.run_id]
+        finally:
+            conn.close()
+        listed = ", ".join(ids) if ids else "none yet — run `tmap scan`"
+        raise click.ClickException(
+            "tmap triage needs a run: pass one as the argument or --run. "
+            f"Runs in this atlas: {listed}"
+        )
     # ★ M8c: print the current run's scan lineage (build / date / status) at the top — a stale scan
     # is otherwise silent, and this is exactly where a reader forgets an old build was scanned.
     if not as_json:
@@ -1658,7 +1658,7 @@ def triage(
                         ref = candidates[n - 1].evidence_ref
                         explanation = explain_candidate(conn, ref) if ref else None
                     else:
-                        run_hint = selected_run if selected_run is not None else "<run>"
+                        run_hint = selected_run
                         error = (
                             f"rank {n} out of range; {len(candidates)} candidates — "
                             f"run `tmap triage {run_hint}` to list"
@@ -1699,13 +1699,12 @@ def triage(
 
     _render_triage(
         candidates,
-        run_label=selected_run if selected_run is not None else "all runs",
+        run_label=selected_run,
         lens_label=lens_label,
         caveats=PHASE1_CAVEATS,
         top_n=_effective_top(top_n, show_all=show_all, sink=sink),
         status=status,
         sink=sink,
-        include_gated=include_gated,
         as_json=as_json,
         corpus_size=corpus_size,
         filter_note=filter_note,
@@ -1713,7 +1712,7 @@ def triage(
 
 
 @click.command("atlas-view", short_help="Query the atlas database")
-@click.argument("view", type=click.Choice(["dormant", "density", "twins", "ledger"]))
+@click.argument("view", type=click.Choice(["density", "ledger"]))
 @click.option(
     "--config",
     "-c",
@@ -1732,37 +1731,20 @@ def atlas_view(view: str, config: Path | None, atlas_path: Path | None) -> None:
     """Print a neutral atlas aggregation view. Every row is a lead/candidate, not a result."""
     from treasure_map.lib.atlas.connection import open_atlas
     from treasure_map.lib.config.config import load_config
-    from treasure_map.lib.query import density, dormant, ledger, twins
+    from treasure_map.lib.query import density, ledger
 
     cfg = load_config(config)
     resolved_atlas = atlas_path if atlas_path is not None else cfg.atlas.db_path
     _require_atlas(resolved_atlas)
     conn = open_atlas(resolved_atlas)
     try:
-        if view == "dormant":
-            rows = dormant(conn)
-            click.echo(f"dormant candidates (blocked, L0/L1): {len(rows)}")
-            for r in rows:
-                click.echo(
-                    f"  instance {r['instance_id']} pattern {r['pattern_id']} "
-                    f"| {r['reachability_status']} {r['provenance_level']} "
-                    f"| mechanism: {r['blocking_mechanism']}"
-                )
-        elif view == "density":
+        if view == "density":
             drows = density(conn)
             click.echo(f"density (count per run / sink_class / fingerprint): {len(drows)}")
             for d in drows:
                 click.echo(
                     f"  run={d.source_run_id} sink_class={d.sink_class} "
                     f"fp={d.structural_fingerprint} count={d.instance_count}"
-                )
-        elif view == "twins":
-            trows = twins(conn)
-            click.echo(f"twins (same shape, mixed reachability status): {len(trows)}")
-            for t in trows:
-                click.echo(
-                    f"  fp={t.structural_fingerprint} sink_class={t.sink_class} "
-                    f"blocked={t.blocked_count} non_blocked={t.non_blocked_count}"
                 )
         else:  # ledger
             lrows = ledger(conn)
@@ -1809,15 +1791,9 @@ def atlas_view(view: str, config: Path | None, atlas_path: Path | None) -> None:
 )
 @click.option(
     "--status",
-    type=click.Choice(["to-verify", "reachable", "gated", "all"]),
+    type=click.Choice(["to-verify", "reachable", "all"]),
     default=None,
-    help="Show only this review status. Default shows to-verify + reachable (gated folded).",
-)
-@click.option(
-    "--include-gated",
-    is_flag=True,
-    default=False,
-    help="Also show gated candidates (folded by default — they are likely dormant/false).",
+    help="Show only this review status. Default shows to-verify + reachable.",
 )
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit triage list as JSON.")
 @click.option(
@@ -1881,7 +1857,6 @@ def scan(
     show_all: bool,
     sink: str | None,
     status: str | None,
-    include_gated: bool,
     as_json: bool,
     skip_non_binary: bool,
     skip_ingesters: tuple[str, ...],
@@ -1957,7 +1932,7 @@ def scan(
     from treasure_map.lib.analyze.pipeline import run_analyze
 
     try:
-        with Workspace(ws_path, progress_callback=_progress) as ws:
+        with Workspace(ws_path) as ws:
             result = asyncio.run(
                 run_analyze(
                     fs_root,
@@ -2007,7 +1982,6 @@ def scan(
         click.echo(
             f"      → {h.instances_written} candidates written "
             f"(confirmed={h.by_status.get('confirmed', 0)}, "
-            f"blocked={h.by_status.get('blocked', 0)}, "
             f"unknown={h.by_status.get('unknown', 0)})"
         )
     if h.data_gap_skipped:
@@ -2064,7 +2038,6 @@ def scan(
             top_n=_effective_top(top_n, show_all=show_all, sink=sink),
             status=status,
             sink=sink,
-            include_gated=include_gated,
             as_json=as_json,
         )
 

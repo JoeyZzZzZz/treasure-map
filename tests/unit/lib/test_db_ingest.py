@@ -21,7 +21,6 @@ def _make_record(name: str, sha: str, arch: str = "ARM:LE:32:v7") -> ElfRecord:
         elf_type="executable",
         sha256=sha,
         dt_needed=["libc.so.0"],
-        protections={"nx": True, "pie": False, "canary": False, "relro": "none", "fortify": False},
         size=4096,
     )
 
@@ -103,7 +102,7 @@ def _functions_columns(conn: sqlite3.Connection) -> set[str]:
 
 def test_fresh_schema_omits_dropped_columns(tmp_path: Path) -> None:
     """A newly created db carries none of the removed pre-judgment fields/tables,
-    but keeps the binary-level capa_tags placeholder."""
+    nor the binary-level capa_tags / protections columns that nothing ever filled."""
     conn = open_db(tmp_path / "new.db")
     fcols = _functions_columns(conn)
     for gone in ("summary", "func_types", "vuln_hints", "capa_tags"):
@@ -124,7 +123,11 @@ def test_fresh_schema_omits_dropped_columns(tmp_path: Path) -> None:
     assert no_libsum is None
 
     bcols = {row[1] for row in conn.execute("PRAGMA table_info(binaries)")}
-    assert "capa_tags" in bcols  # binary-level placeholder is retained
+    assert "capa_tags" not in bcols and "protections" not in bcols
+    gone_tables = conn.execute(
+        "SELECT name FROM sqlite_master WHERE name IN ('components', 'cve_matches')"
+    ).fetchall()
+    assert gone_tables == []
     conn.close()
 
 
@@ -152,6 +155,10 @@ def _build_pre_cleanup_db(db_path: Path) -> None:
         CREATE INDEX idx_credentials_hint ON credentials(vuln_hint);
         ALTER TABLE web_endpoints  ADD COLUMN vuln_hint TEXT;
         CREATE INDEX idx_web_endpoints_hint ON web_endpoints(vuln_hint);
+        ALTER TABLE binaries ADD COLUMN capa_tags TEXT DEFAULT '[]';
+        ALTER TABLE binaries ADD COLUMN protections TEXT DEFAULT '{}';
+        CREATE TABLE components (id INTEGER PRIMARY KEY, binary_id INTEGER);
+        CREATE TABLE cve_matches (id INTEGER PRIMARY KEY, binary_id INTEGER);
         """
     )
     conn.execute("INSERT INTO binaries(name, capa_tags) VALUES('busybox', '[\"x\"]')")
@@ -179,8 +186,15 @@ def test_migration_drops_stale_columns_and_preserves_data(tmp_path: Path) -> Non
     frow = conn.execute("SELECT name, callees FROM functions").fetchone()
     assert frow["name"] == "main"
     assert frow["callees"] == '["helper"]'
-    brow = conn.execute("SELECT capa_tags FROM binaries").fetchone()
-    assert brow["capa_tags"] == '["x"]'  # binary capa_tags retained with its value
+    bcols = {row[1] for row in conn.execute("PRAGMA table_info(binaries)")}
+    assert "capa_tags" not in bcols and "protections" not in bcols
+    assert conn.execute("SELECT name FROM binaries").fetchone()["name"] == "busybox"  # row kept
+    assert (
+        conn.execute(
+            "SELECT name FROM sqlite_master WHERE name IN ('components', 'cve_matches')"
+        ).fetchall()
+        == []
+    )
 
     assert (
         conn.execute("SELECT name FROM sqlite_master WHERE name='library_summaries'").fetchone()
@@ -593,7 +607,6 @@ def _rec_at(name: str, sha: str, path: Path) -> ElfRecord:
         elf_type="shared_library",
         sha256=sha,
         dt_needed=[],
-        protections={"nx": True, "pie": False, "canary": False, "relro": "none", "fortify": False},
         size=4096,
     )
 
@@ -667,7 +680,6 @@ def _rec_for(path: Path, sha: str) -> ElfRecord:
         elf_type="executable",
         sha256=sha,
         dt_needed=[],
-        protections={},
         size=path.stat().st_size,
     )
 

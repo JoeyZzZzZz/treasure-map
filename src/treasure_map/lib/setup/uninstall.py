@@ -47,7 +47,6 @@ PURGE_PHRASE = "delete my data"
 class UninstallReport:
     removed: list[str] = field(default_factory=list)
     refused: list[str] = field(default_factory=list)
-    kept: list[str] = field(default_factory=list)
     manual: list[str] = field(default_factory=list)
 
     @property

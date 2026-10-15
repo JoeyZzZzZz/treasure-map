@@ -8,9 +8,9 @@ so "confirmed" is rare and tightly gated and "unknown" is the expected, correct 
 most candidates. Under any doubt the verdict is "unknown".
 
 v1 emits only "confirmed" / "unknown". "blocked" stays a valid ReachabilityStatus and is
-reserved for the deep data-flow engine (R2-deep): deciding NON-reachability soundly needs
+reserved for a future deep data-flow engine: deciding NON-reachability soundly needs
 path-/alias-sensitivity an intra-procedural regex read does not have, and a false "blocked"
-would route a live path into the dormant partition and halt investigation — the one error
+would hide a live path as unreachable and halt investigation — the one error
 v1 must never make. So a would-be "blocked" (a validator appears to cover the inputs) grades
 "unknown" with an honest basis. The validator/clamp/taint machinery stays wired — it gates
 "confirmed" (a validator on the path, a parameter contribution, or a clamp demotes a
@@ -165,7 +165,6 @@ def grade_candidate(
     callees: list[str],
     sink_name: str,
     *,
-    source_class: str | None = None,
     copy_occurrence: int | None = None,
     stub_names: Mapping[int, str] | None = None,
 ) -> ReachabilityVerdict:
@@ -173,8 +172,8 @@ def grade_candidate(
 
     v1 returns only "confirmed" or "unknown"; a would-be "blocked" grades "unknown" (see the
     module docstring — deciding non-reachability soundly is left to the deep engine, so "blocked"
-    stays a valid but unused ReachabilityStatus). source_class is accepted for interface symmetry
-    with the detection layer; the grade is decided from the pseudocode, callees, and sink alone.
+    stays a valid but unused ReachabilityStatus). The grade is decided from the pseudocode,
+    callees, and sink alone.
 
     ``copy_occurrence`` selects WHICH call to ``sink_name`` this candidate is about (0-based).
     ``None`` means the caller holds no callsite, and each branch then keeps its own historical
@@ -236,7 +235,7 @@ def grade_candidate(
     # The dangerous SEED inputs that reach the sink, and whether each is covered by a
     # validator on its own path INTO the sink. blocked requires a trustworthy flow set and
     # that EVERY dangerous seed is cleanly, directly covered; ANY doubt grades unknown so a
-    # possibly-reachable path is never hidden in the dormant partition.
+    # possibly-reachable path is never hidden as unreachable.
     flow = flows_into(pseudocode, sink_arg)  # cleaned flow set
     path = {sink_arg} | flow
     strong_seeds, weak_seeds, par_seeds = _seed_sets(pseudocode)

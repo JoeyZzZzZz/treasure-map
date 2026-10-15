@@ -4,8 +4,8 @@
 
 These functions expose the structured, deterministically re-derivable facts the analysis pass
 recorded (pseudocode, cross-references, callees, strings, imports/exports, cross-artifact script
-call sites, SBOM components + CVE matches). They are a single read layer so the CLI and the MCP
-server are thin wrappers over the SAME query — neither re-implements a lookup.
+call sites, raw data-segment bytes, disassembly listing). They are a single read layer so the
+CLI and the MCP server are thin wrappers over the SAME query — neither re-implements a lookup.
 
 Discipline (these are public-facing facts, the strictest neutrality applies):
 - FACTS ONLY. No interpretation, no prediction, no score. The dropped pre-judgment columns

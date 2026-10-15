@@ -96,8 +96,8 @@ def test_unnamed_slot_does_not_shift_the_format_position() -> None:
     reported at position 0, so the caller's argument 0 gets judged while argument 1 is what
     reaches the sink — a wrong-but-plausible constant, which is worse than no answer.
 
-    MUTATION (must go RED): drop unnamed slots instead of recording them as None (index over
-    signature_params_ordered rather than signature_slots)."""
+    MUTATION (must go RED): drop unnamed slots instead of recording them as None (index over the
+    named parameters only rather than signature_slots)."""
     pc = "void log_x(int,char *param_2){ FILE *s; vfprintf(s,param_2,0); }"
     assert signature_slots(pc) == [None, "param_2"]
     assert fmt_wrapper_format_index(pc, "vfprintf") == 1

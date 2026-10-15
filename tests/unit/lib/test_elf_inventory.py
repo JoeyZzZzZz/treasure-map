@@ -13,7 +13,6 @@ from treasure_map.lib.analyze.elf_inventory import (
     detect_arch,
     get_dt_needed,
     get_elf_type,
-    get_protections,
     has_loadable_segments,
     has_substantial_text,
     scan_filesystem,
@@ -119,22 +118,6 @@ def test_get_dt_needed_has_entries():
     assert any("libc" in d for d in deps)
 
 
-# ── get_protections ────────────────────────────────────────────────────────────
-
-
-@_skip_if_missing(TRUE_ELF)
-def test_get_protections_keys():
-    prot = get_protections(TRUE_ELF)
-    for key in ("nx", "pie", "canary", "relro", "fortify"):
-        assert key in prot
-
-
-@_skip_if_missing(TRUE_ELF)
-def test_get_protections_true_has_pie():
-    prot = get_protections(TRUE_ELF)
-    assert prot["pie"] is True
-
-
 # ── scan_filesystem ────────────────────────────────────────────────────────────
 
 
@@ -202,17 +185,9 @@ def test_elf_record_json_helpers():
         elf_type="executable",
         sha256="abc123",
         dt_needed=["libc.so.0", "libssl.so.1"],
-        protections={
-            "nx": True,
-            "pie": False,
-            "canary": True,
-            "relro": "partial",
-            "fortify": False,
-        },
         size=12345,
     )
     assert '"libc.so.0"' in rec.dt_needed_json()
-    assert '"nx": true' in rec.protections_json()
 
 
 # ── a binary with no section headers (sstrip) ─────────────────────────────────────────

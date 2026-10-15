@@ -1,82 +1,26 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
+"""The Workspace provisions a run's directory and names its analysis.db — nothing more."""
+
 from __future__ import annotations
 
-from treasure_map.lib.workspace import Workspace
+from pathlib import Path
+
+from treasure_map.lib.workspace.workspace import Workspace
 
 
-def test_mark_and_check(tmp_path):
-    ws = Workspace(tmp_path / "ws")
-    assert not ws.is_done("step1")
-    ws.mark_done("step1")
-    assert ws.is_done("step1")
-    ws.close()
+def test_workspace_provisions_the_directory_and_names_its_db(tmp_path: Path) -> None:
+    ws_path = tmp_path / "router_v1"
+    with Workspace(ws_path) as ws:
+        assert ws.path == ws_path and ws_path.is_dir()
+        assert ws.db_path == ws_path / "analysis.db"
 
 
-def test_persistence_across_reopen(tmp_path):
-    ws_path = tmp_path / "ws"
-    ws = Workspace(ws_path)
-    ws.mark_done("parse")
-    ws.close()
+def test_workspace_keeps_no_checkpoint_database(tmp_path: Path) -> None:
+    """The step-checkpoint state.db is gone: a scan resumes from analysis.db's per-binary
+    pass_version, not a steps table that only its own tests ever read.
 
-    ws2 = Workspace(ws_path)
-    assert ws2.is_done("parse")
-    ws2.close()
-
-
-def test_clear_downstream(tmp_path):
-    ws = Workspace(tmp_path / "ws")
-    ws.mark_done("a")
-    ws.mark_done("b")
-    ws.mark_done("c")
-    ws.clear_downstream("a", ["b", "c"])
-    assert ws.is_done("a")
-    assert not ws.is_done("b")
-    assert not ws.is_done("c")
-    ws.close()
-
-
-def test_list_done(tmp_path):
-    ws = Workspace(tmp_path / "ws")
-    ws.mark_done("x")
-    ws.mark_done("y")
-    done = ws.list_done()
-    assert "x" in done
-    assert "y" in done
-    ws.close()
-
-
-def test_progress_callback(tmp_path):
-    events: list[tuple[str, dict]] = []
-
-    def cb(step, meta):
-        events.append((step, meta))
-
-    ws = Workspace(tmp_path / "ws", progress_callback=cb)
-    ws.mark_done("elf_scan", {"count": 12})
-    ws.close()
-
-    assert events == [("elf_scan", {"count": 12})]
-
-
-def test_reset(tmp_path):
-    ws = Workspace(tmp_path / "ws")
-    ws.mark_done("step1")
-    ws.mark_done("step2")
-    ws.reset()
-    assert ws.list_done() == []
-    ws.close()
-
-
-def test_context_manager(tmp_path):
-    with Workspace(tmp_path / "ws") as ws:
-        ws.mark_done("init")
-        assert ws.is_done("init")
-
-
-def test_idempotent_mark_done(tmp_path):
-    ws = Workspace(tmp_path / "ws")
-    ws.mark_done("step")
-    ws.mark_done("step")  # should not raise
-    assert ws.is_done("step")
-    ws.close()
+    MUTATION: recreate state.db in __init__ -> RED."""
+    with Workspace(tmp_path / "w"):
+        pass
+    assert not (tmp_path / "w" / "state.db").exists()

@@ -3,7 +3,6 @@
 # hermetic (no network calls) — there are no API keys to fill in.
 
 ghidra:
-  mode: local    # 'local' is the only implemented mode
   headless_timeout_seconds: 300
   max_parallel_jvms: 4   # `tmap init` overwrites this with a value derived from the machine
                          #   (physical cores + memory); `tmap init --force` re-detects it
@@ -11,16 +10,6 @@ ghidra:
   local:
     home: ~      # null = auto-discover via GHIDRA_HOME env or PATH; or set explicit path
     # home: /path/to/ghidra_11.4.3_PUBLIC   # Ghidra 11.4.3 is the pinned, tested toolchain
-
-  # NOT IMPLEMENTED — there is no container image and no remote service; setting either mode does
-  # not work today. The config schema still accepts these keys, so the shape is shown for when one
-  # of them is built, commented out so it cannot be mistaken for a working option.
-  #
-  # docker:
-  #   image: <no image is published>
-  #
-  # remote:
-  #   endpoint: http://localhost:8080
 
 # toolchain: the JDK and BinDiff tmap runs. `tmap init` writes these; when set, every tmap command
 # puts them first in its own environment (JAVA_HOME and PATH) before starting Ghidra or BinDiff —
@@ -36,4 +25,7 @@ workspace_dir: ~/.treasure-map/workspaces
 # atlas:
 #   db_path: ~/.treasure-map/atlas.db
 
-log_level: INFO
+# A library symbol called from many places would put callers × exporters edges in the xrefs table.
+# Above this many edges the symbol is folded instead: its edges are not written, and it is listed
+# (with its counts) under folded_xref_symbols, so the omission is visible rather than silent.
+xref_fold_edge_threshold: 25000

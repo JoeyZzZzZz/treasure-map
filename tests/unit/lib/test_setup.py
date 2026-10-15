@@ -15,9 +15,8 @@ import yaml
 from treasure_map.lib.errors import GhidraNotFoundError
 from treasure_map.lib.setup.initializer import (
     _DEFAULT_CONFIG_YAML,
-    _configure_workspace_dir,
     _provision_dirs,
-    _set_ghidra_home,
+    _set_keys,
     _write_config,
     _write_env,
     run_init,
@@ -395,10 +394,7 @@ def test_prompt_messages_carry_no_trailing_colon(fake_home: Path) -> None:
 
     config_path = fake_home / ".treasure-map" / "config.yaml"
     _write_config(config_path, force=True)
-    _configure_workspace_dir(
-        config_path, non_interactive=False, prompt=_capture, echo=lambda _m: None
-    )
-    run_init(non_interactive=False, prompt=_capture)
+    run_init(non_interactive=False, prompt=_capture)  # asks the workspace base too
 
     assert any(_GHIDRA_PROMPT in m for m in captured)  # the toolchain prompts fired too
     for msg in captured:
@@ -440,7 +436,7 @@ def test_reinit_reuses_configured_ghidra_without_prompt(fake_home: Path) -> None
     config_path = fake_home / ".treasure-map" / "config.yaml"
     config_path.parent.mkdir(parents=True, exist_ok=True)
     _write_config(config_path, force=True)
-    _set_ghidra_home(config_path, root)
+    _set_keys(config_path, {("ghidra", "local", "home"): str(root)})
 
     msgs: list[str] = []
 
@@ -578,9 +574,9 @@ def test_a_rewrite_keeps_who_wrote_config_yaml(fake_home: Path) -> None:
     MUTATION: never carry the mark over -> init's own file loses it on the first rewrite -> RED."""
     cfg = fake_home / ".treasure-map" / "config.yaml"
     _write_config(cfg, force=False)
-    _set_ghidra_home(cfg, fake_home / "g")
+    _set_keys(cfg, {("ghidra", "local", "home"): str(fake_home / "g")})
     assert written_by_tmap(cfg)
     cfg.write_text("workspace_dir: /x\n")
-    _set_ghidra_home(cfg, fake_home / "g")
+    _set_keys(cfg, {("ghidra", "local", "home"): str(fake_home / "g")})
     assert not written_by_tmap(cfg)
     assert "workspace_dir: /x" in cfg.read_text()

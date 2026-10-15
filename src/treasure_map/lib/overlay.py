@@ -689,26 +689,6 @@ def clear_overlay(
     return cur.rowcount
 
 
-def repoint_overlay_anchor(
-    atlas: sqlite3.Connection, *, old_ref: str, new_ref: str, commit: bool = True
-) -> int:
-    """Move an annotation from one anchor ref to another when a re-scan changed a candidate's ref
-    FORM (the offset-ref rekey), leaving the judgement itself untouched. Returns rows changed (0 or
-    1; the anchor is unique). run_id is re-derived from the new ref, the same rule upsert uses, so a
-    re-pointed row and a freshly written row agree. Lives here because overlay writes have one home;
-    the rekey calls it inside its own transaction (``commit=False``) so the whole migration is
-    atomic. Refuses a degraded target (see ``_refuse_degraded_anchor``) like any other write."""
-    _refuse_degraded_anchor(atlas, new_ref)
-    cur = atlas.execute(
-        "UPDATE overlay SET anchor_ref = ?, run_id = ? "
-        "WHERE anchor_kind = 'evidence_ref' AND anchor_ref = ?",
-        (new_ref, _run_id_from_ref(new_ref), old_ref),
-    )
-    if commit:
-        atlas.commit()
-    return cur.rowcount
-
-
 # The basis state a PROMOTED annotation reads with when the diff it was promoted from is not
 # current, or is gone. The candidate's own snapshot cannot see a diff move, so this is the only way
 # that shows up. It is just another state that is not 'unchanged', and every reader already treats

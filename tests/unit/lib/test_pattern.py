@@ -44,7 +44,7 @@ _PATTERN_PKG = Path(__file__).resolve().parents[3] / "src" / "treasure_map" / "l
 
 
 def _make_db(tmp_path: Path, binaries: list[dict[str, object]]) -> Path:
-    """Build an analysis.db. Each binary: {name, oss?, funcs:[{name,pseudocode,callees}]}."""
+    """Build an analysis.db. Each binary: {name, funcs:[{name,pseudocode,callees}]}."""
     db_path = tmp_path / "analysis.db"
     conn = open_db(db_path)
     fid = 0
@@ -53,11 +53,6 @@ def _make_db(tmp_path: Path, binaries: list[dict[str, object]]) -> Path:
             "INSERT INTO binaries (id, name, sha256) VALUES (?, ?, ?)",
             (bid, spec["name"], str(bid).zfill(64)),
         )
-        if spec.get("oss"):
-            conn.execute(
-                "INSERT INTO components (binary_id, product, version) VALUES (?, ?, ?)",
-                (bid, "thirdparty", "1.0"),
-            )
         for func in spec.get("funcs", []):  # type: ignore[union-attr]
             fid += 1
             conn.execute(
@@ -380,8 +375,8 @@ def test_path_sink_set_disjoint_from_other_classes() -> None:
 # ── every binary is scanned ─────────────────────────────────────────────────────────
 
 
-def test_component_table_binary_is_scanned(tmp_path: Path) -> None:
-    """★ Being recorded in the components table is a LABEL, not a reason not to look.
+def test_widely_shipped_binary_is_scanned(tmp_path: Path) -> None:
+    """★ A widely-shipped stock binary's name is a LABEL, not a reason not to look.
 
     The scan used to skip such a binary outright, so a perfect shape inside it produced nothing
     at all — a recall decision taken by name at scan time, whose only trace was a CLI counter.
@@ -395,8 +390,7 @@ def test_component_table_binary_is_scanned(tmp_path: Path) -> None:
         tmp_path,
         [
             {
-                "name": "busybox",  # widely-shipped stock binary, also recorded in components
-                "oss": True,
+                "name": "busybox",  # widely-shipped stock binary
                 "funcs": [
                     {
                         "name": "applet",
@@ -430,7 +424,6 @@ def test_every_binary_scanned_alongside(tmp_path: Path) -> None:
         [
             {
                 "name": "busybox",
-                "oss": True,
                 "funcs": [
                     {
                         "name": "applet",
@@ -1703,21 +1696,13 @@ def test_call_offsets_skips_the_functions_own_declaration_line() -> None:
     ``system`` call, inventing a phantom callsite before the body and shifting the real call to
     occurrence 1. The declaration sits before the body's opening brace, so it is dropped.
 
-    MUTATION (must go RED): drop the ``decl_end`` test in ``_is_phantom_offset``, or default
-    ``strip_phantoms`` to False."""
+    MUTATION (must go RED): drop the ``decl_end`` test in ``_is_phantom_offset``."""
     pc = "\nvoid FUN_00409000(char *param_1)\n\n{\n  system(param_1);\n  return;\n}\n"
     stub = {0x409000: "system"}
     real_paren = pc.index("system(") + len("system")
-    assert call_offsets(pc, "system", stub) == (real_paren,)
-    # without stripping, the declaration's FUN_00409000( counts too -> the phantom
-    assert call_offsets(pc, "system", stub, strip_phantoms=False) == (
-        pc.index("FUN_00409000(") + len("FUN_00409000"),
-        real_paren,
-    )
+    assert call_offsets(pc, "system", stub) == (real_paren,)  # the declaration is not a call
     sites = sink_callsites(pc, {"system"}, stub)
-    assert [(s.index, s.sink_name, s.occurrence, s.offset) for s in sites] == [
-        (0, "system", 0, real_paren)
-    ]
+    assert [(s.index, s.sink_name, s.occurrence) for s in sites] == [(0, "system", 0)]
 
 
 def test_call_offsets_skips_a_match_inside_a_string_literal() -> None:
@@ -1732,25 +1717,7 @@ def test_call_offsets_skips_a_match_inside_a_string_literal() -> None:
         '  syslog(3,"fopen() failed");\n  return 0;\n}\n'
     )
     real_paren = pc.index('fopen("/tmp') + len("fopen")
-    assert call_offsets(pc, "fopen") == (real_paren,)
-    assert len(call_offsets(pc, "fopen", strip_phantoms=False)) == 2
-
-
-def test_call_offsets_strip_phantoms_false_reproduces_pre_fix_output() -> None:
-    """The unstripped path is byte-for-byte the old behaviour, so the D4 rekey can diff for the
-    phantom callsites it retires (PHANTOM = offsets(strip=off) - offsets(strip=on)).
-
-    MUTATION (must go RED): ignore the ``strip_phantoms`` flag (always strip)."""
-    pc = "\nvoid FUN_00409000(char *p)\n\n{\n  system(p);\n}\n"
-    stub = {0x409000: "system"}
-    off = call_offsets(pc, "system", stub, strip_phantoms=False)
-    assert off == (
-        pc.index("FUN_00409000(") + len("FUN_00409000"),
-        pc.index("system(") + len("system"),
-    )
-    assert set(off) - set(call_offsets(pc, "system", stub)) == {
-        pc.index("FUN_00409000(") + len("FUN_00409000")
-    }
+    assert call_offsets(pc, "fopen") == (real_paren,)  # the fopen( inside the syslog string is not
 
 
 def test_call_offsets_stripping_never_swallows_a_real_call() -> None:
@@ -1763,7 +1730,6 @@ def test_call_offsets_stripping_never_swallows_a_real_call() -> None:
     pc = (
         '\nint g(int a)\n\n{\n  printf("x"); memcpy(d, s, 4);\n  memcpy(e, t, a);\n  return 0;\n}\n'
     )
-    assert call_offsets(pc, "memcpy") == call_offsets(pc, "memcpy", strip_phantoms=False)
     assert len(call_offsets(pc, "memcpy")) == 2
     assert len(call_offsets(pc, "printf")) == 1
 

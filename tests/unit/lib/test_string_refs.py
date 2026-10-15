@@ -136,7 +136,6 @@ def _ingest(tmp_path: Path, payload: dict[str, Any] | None) -> Path:
             elf_type="executable",
             sha256=sha,
             dt_needed=[],
-            protections={},
             size=4096,
         )
         for name, sha in (("webd", _SHA), ("bare_bin", _OTHER_SHA))
@@ -378,7 +377,6 @@ def test_reingest_wipes_and_rebuilds(tmp_path: Path) -> None:
         elf_type="executable",
         sha256=_SHA,
         dt_needed=[],
-        protections={},
         size=4096,
     )
     ingest_ghidra_output(conn, tmp_path / "ghidra_output", [rec], sha_to_id)

@@ -110,13 +110,6 @@ def signature_slots(pseudocode: str) -> list[str | None]:
     return slots
 
 
-def signature_params_ordered(pseudocode: str) -> list[str]:
-    """The signature's NAMED parameters, in declaration order (the named view of
-    ``signature_slots``). Positions are NOT preserved here — anything indexing by position must
-    use ``signature_slots``."""
-    return [s for s in signature_slots(pseudocode) if s is not None]
-
-
 def _signature_params(pseudocode: str) -> set[str]:
     """The signature's parameter NAMES (order-free view of ``signature_slots``)."""
     return {s for s in signature_slots(pseudocode) if s is not None}

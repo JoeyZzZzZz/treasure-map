@@ -49,7 +49,7 @@ def update(check: bool, assume_yes: bool) -> None:
     for line in up.plan_lines(plan):
         click.echo(f"  {line}")
     if not plan.from_uv_tool:
-        click.echo(up.manual_update_hint(Path(sys.prefix)))
+        click.echo(up.manual_update_hint())
         return
     if check:
         return
