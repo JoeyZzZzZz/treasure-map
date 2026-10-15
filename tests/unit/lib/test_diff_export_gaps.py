@@ -71,6 +71,15 @@ def _fake_run(
 def headless(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(ghidra_runner, "find_headless", lambda cfg: tmp_path / "analyzeHeadless")
     monkeypatch.setattr(driver, "_find_bindiff", lambda: tmp_path / "bindiff")
+    # The BinExport step runs through _run_killable (its own process group, killed whole on a
+    # timeout), which has subprocess.run's contract. Route it to whatever subprocess.run is when
+    # the call happens, so each test's fake stands in for both steps; _run_killable itself is
+    # covered by test_run_killable.
+    monkeypatch.setattr(
+        driver,
+        "_run_killable",
+        lambda cmd, env, timeout: subprocess.run(cmd, env=env, timeout=timeout),  # noqa: S603
+    )
 
 
 def _export(tmp_path: Path, name: str = "liba.so") -> Path:
