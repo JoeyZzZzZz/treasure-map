@@ -11,22 +11,28 @@ declaration is dropped from pyproject.toml.
 
 from __future__ import annotations
 
+import importlib.util
 import tomllib
 from importlib.resources import files
 from pathlib import Path
 
-_PYPROJECT = Path(__file__).resolve().parents[2] / "pyproject.toml"
+_ROOT = Path(__file__).resolve().parents[2]
+_PYPROJECT = _ROOT / "pyproject.toml"
 
-# (package, resource) pairs for every non-.py asset the runtime loads from disk.
-_ASSETS = [
-    ("treasure_map.lib.analyze.ghidra", "ExportFunctions.java"),
-    ("treasure_map.lib.analyze.ghidra", "extractor_names.tsv"),
-    ("treasure_map.lib.diff.ghidra", "ExportBinExport.java"),
-    ("treasure_map.lib.diff.ghidra", "FallbackBinExport2Builder.java"),
-    ("treasure_map.lib.storage", "atlas_schema.sql"),
-    ("treasure_map.lib.storage", "schema.sql"),
-    ("treasure_map.lib.setup", "toolchain_lock.json"),
-]
+
+def _load_asset_list() -> tuple[tuple[str, str], ...]:
+    """The ONE asset list (scripts/wheel_assets.py), also read by CI and the release."""
+    spec = importlib.util.spec_from_file_location("wheel_assets", _ROOT / "scripts/wheel_assets.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.ASSETS  # type: ignore[no-any-return]
+
+
+# (package, resource) pairs for every non-.py asset the runtime loads from disk. Under an editable
+# install this resolves from the source tree; CI's package job checks the BUILT wheel installed
+# into a fresh venv, which is the check an editable install cannot fake.
+_ASSETS = _load_asset_list()
 
 
 def test_runtime_assets_are_resolvable() -> None:

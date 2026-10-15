@@ -17,8 +17,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from treasure_map.lib.analyze.elf_inventory import ElfRecord
-from treasure_map.lib.analyze.ghidra_runner import GhidraResult
+from treasure_map.lib.analyze.ghidra_runner import GhidraResult, GhidraRunner
 from treasure_map.lib.analyze.pipeline import run_analyze
+from treasure_map.lib.analyze.stub_resolve import resolve_stubs, stub_table_marker
 from treasure_map.lib.config.config import Config
 from treasure_map.lib.storage.connection import open_db
 from treasure_map.lib.workspace.workspace import Workspace
@@ -49,14 +50,24 @@ def _mock_runner() -> MagicMock:
 def _run_all_with_json(
     recs: list[ElfRecord], output_dir: Path, *_a: object, **_kw: object
 ) -> list[GhidraResult]:
-    """Mock run_all: write minimal JSON for each record and return success."""
+    """Mock run_all: write minimal JSON for each record and return success.
+
+    The JSON carries the three markers the ingest checks before trusting a file (the pass that
+    wrote it, the binary it is for, the stub table it read) — the same echo the real extractor
+    writes. Without them the ingest rightly reads it as some other run's leftover output."""
     results = []
     for r in recs:
         sha8 = r.sha256[:8]
         json_path = output_dir / f"{r.name}_{sha8}_ghidra.json"
+        resolution = resolve_stubs(r.path)
         json_path.write_text(
             json.dumps(
                 {
+                    "pass_version": "testpass",
+                    "sha8": sha8,
+                    "stub_marker": stub_table_marker(
+                        None if resolution is None else resolution.names
+                    ),
                     "functions": [
                         {
                             "name": f"func_{r.name}",
@@ -269,9 +280,14 @@ def test_round1_full_pipeline(tmp_path: Path) -> None:
 
     assert result1.binary_count >= 1
 
-    # Second run: all sha256 should be done → run_all not called
+    # Second run: all sha256 should be done → run_all not called. The stand-in reports the SAME
+    # pass and Ghidra version the real first run recorded; a different pass is a real reason to
+    # re-extract, and the test would then be measuring that instead of the cache.
+    real = GhidraRunner(cfg.ghidra)
     with patch(_PIPELINE_MODULE + ".GhidraRunner") as mock_runner_cls:
         mock_runner = _mock_runner()
+        mock_runner.pass_version.return_value = real.pass_version()
+        mock_runner.ghidra_version.return_value = real.ghidra_version()
         mock_runner_cls.return_value = mock_runner
         with Workspace(workspace_path) as ws:
             result2 = run_analyze(fs_root, ws, cfg)

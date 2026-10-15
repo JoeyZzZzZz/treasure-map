@@ -43,11 +43,15 @@ pip install -e ".[dev]"
 tmap init                    # finds or installs the Ghidra / BinExport / BinDiff toolchain
 ```
 
-Before opening a pull request, run the same checks CI runs:
+Before opening a pull request, run the local half of CI:
 
 ```bash
-./scripts/ci-local.sh        # ruff, ruff format --check, mypy strict, pytest
+./scripts/ci-local.sh        # ruff, mypy, the gates, vendor neutrality, unit + integration tests
 ```
+
+The integration tests need Ghidra on PATH and are skipped without it. CI also builds the wheel and
+installs it into a fresh environment, and tests the lowest declared dependency versions; those two
+run only there.
 
 A behaviour change should come with a test that fails without it. Unit tests never touch the
 network or your real `~/.treasure-map`; the fixtures in `tests/conftest.py` take care of that.

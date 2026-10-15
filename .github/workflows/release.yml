@@ -1,6 +1,8 @@
 # Publish tmap to PyPI (tmap-agents) and attach install.sh to the release, on a v* tag.
 #
-# Refuses to publish a lock that still carries a placeholder (the BinExport build must be
+# The whole CI workflow runs first (tests, lint, types, the Ghidra integration, the built wheel);
+# nothing is published unless every job of it passes. Refuses to publish a lock that still carries
+# a placeholder (the BinExport build must be
 # published first by the BinExport workflow and its values merged), a tag that does not match
 # treasure_map.version.__version__, or a wheel that installs without its commit.
 name: Release
@@ -10,16 +12,22 @@ on:
     tags: ["v*"]
 
 jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
   release:
+    needs: ci
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
       id-token: write
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: "3.11"
 
@@ -39,27 +47,8 @@ jobs:
           python -m pip install --upgrade pip build
           python -m build
 
-      - name: Wheel contents
-        run: |
-          set -e
-          python - <<'PY'
-          import glob, sys, zipfile
-          wheel = zipfile.ZipFile(glob.glob("dist/*.whl")[0])
-          names = wheel.namelist()
-          need = [
-              "treasure_map/lib/analyze/ghidra/ExportFunctions.java",
-              "treasure_map/lib/analyze/ghidra/extractor_names.tsv",
-              "treasure_map/lib/diff/ghidra/ExportBinExport.java",
-              "treasure_map/lib/diff/ghidra/FallbackBinExport2Builder.java",
-              "treasure_map/lib/storage/atlas_schema.sql",
-              "treasure_map/lib/storage/schema.sql",
-              "treasure_map/lib/setup/toolchain_lock.json",
-              "treasure_map/_build_info.py",
-          ]
-          missing = [n for n in need if n not in names]
-          if missing:
-              sys.exit(f"wheel is missing {missing}")
-          PY
+      - name: Wheel contents (the one asset list, plus the baked commit)
+        run: python scripts/wheel_assets.py dist/*.whl --with-build-info
 
       - name: Install from the index form (no direct_url.json) and check
         run: |
@@ -105,7 +94,7 @@ jobs:
               --title "tmap $V" --notes "pip/uv: tmap-agents==$V"
           fi
 
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2
         with:
           skip-existing: true
 

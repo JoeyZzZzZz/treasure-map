@@ -38,7 +38,7 @@ def test_the_binexport_export_smoke_finds_the_export_script() -> None:
 
 def _steps(name: str) -> list[dict[str, Any]]:
     doc = yaml.safe_load((_WORKFLOWS / name).read_text())
-    return [s for job in doc["jobs"].values() for s in job["steps"]]
+    return [s for job in doc["jobs"].values() for s in job.get("steps", [])]
 
 
 def test_the_release_imports_tmap_only_from_the_installed_venv() -> None:
@@ -63,3 +63,37 @@ def test_the_release_imports_tmap_only_from_the_installed_venv() -> None:
     for i, s in enumerate(steps):
         for interpreter in _ONE_LINER.findall(s.get("run", "")):
             assert interpreter == "/tmp/v/bin/python" and i >= install, s.get("name")
+
+
+def test_nothing_is_published_unless_the_whole_ci_passes() -> None:
+    """A v* tag used to publish straight to PyPI whatever the tests said.
+
+    MUTATION: drop ``needs: ci`` from the release job -> RED. MUTATION: drop ``workflow_call``
+    from ci.yml (the release could no longer run it) -> RED."""
+    release = yaml.safe_load((_WORKFLOWS / "release.yml").read_text())
+    jobs = release["jobs"]
+    assert jobs["ci"]["uses"] == "./.github/workflows/ci.yml"
+    assert jobs["release"].get("needs") in ("ci", ["ci"])
+    ci = yaml.safe_load((_WORKFLOWS / "ci.yml").read_text())
+    # PyYAML reads the bare key `on` as the boolean True.
+    triggers = ci.get("on", ci.get(True))
+    assert "workflow_call" in triggers
+    for name in ("test", "lint", "typecheck", "integration", "package"):
+        assert name in ci["jobs"], name
+
+
+def test_every_third_party_action_is_pinned_to_a_commit() -> None:
+    """A tag can be moved to other code; a 40-character commit cannot. The release job holds
+    id-token: write, so what runs there must be exactly what was reviewed.
+
+    MUTATION: write any action as @v4 -> RED."""
+    pinned = re.compile(r"^[\w.-]+/[\w.-]+(?:/[\w.-]+)*@[0-9a-f]{40}$")
+    for wf in sorted(_WORKFLOWS.glob("*.yml")):
+        doc = yaml.safe_load(wf.read_text())
+        for job in doc["jobs"].values():
+            uses = [job["uses"]] if "uses" in job else []
+            uses += [s["uses"] for s in job.get("steps", []) if "uses" in s]
+            for ref in uses:
+                if ref.startswith("./"):
+                    continue  # this repository's own reusable workflow
+                assert pinned.match(ref), f"{wf.name}: {ref} is not pinned to a commit"

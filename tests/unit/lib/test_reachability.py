@@ -35,7 +35,7 @@ def test_covered_validator_is_unknown() -> None:
     assert not verdict.degraded  # input was complete; v1 just cannot prove non-reachability
 
 
-# ── unknown: parameter-sourced sink (the section-6.4 invariant) ─────────────────────
+# ── unknown: parameter-sourced sink (a caller-supplied value never grades confirmed) ──
 
 
 def test_unknown_when_parameter_sourced() -> None:

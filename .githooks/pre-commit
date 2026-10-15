@@ -21,10 +21,14 @@ fi
 # in lib.sh); the neutrality tests stay IN — they must never name a brand.
 WATCHLIST="$(tm_resolve_watchlist || true)"
 if [ -n "$WATCHLIST" ]; then
-    ADDED_ALL=$(git diff --cached -U0 --diff-filter=ACM -- . \
+    # --no-renames: a renamed file's content is scanned whole, not skipped as "unchanged".
+    ADDED_ALL=$(git diff --cached -U0 --no-renames --diff-filter=ACM -- . \
             "${TM_DIFF_MACHINERY_EXCLUDES[@]}" \
             | grep '^+' | grep -v '^+++' || true)
-    if HITS=$(printf '%s' "$ADDED_ALL" | tm_scan_text "$WATCHLIST"); then
+    # The staged paths themselves are scanned too: a file name can carry a model number.
+    PATHS=$(git diff --cached --name-only --no-renames --diff-filter=ACM -- . \
+            "${TM_DIFF_MACHINERY_EXCLUDES[@]}" || true)
+    if HITS=$(printf '%s\n%s' "$ADDED_ALL" "$PATHS" | tm_scan_text "$WATCHLIST"); then
         :
     else
         echo ""
@@ -45,7 +49,7 @@ fi
 # the self-referential tests (whose literals embed these very tokens). Same view
 # CI uses. Covers tests/ too — a private-doc/path reference is caught here at
 # commit time instead of one CI round-trip later.
-ADDED_FRAMING=$(git diff --cached -U0 --diff-filter=ACM -- . \
+ADDED_FRAMING=$(git diff --cached -U0 --no-renames --diff-filter=ACM -- . \
         "${TM_DIFF_MACHINERY_EXCLUDES[@]}" ${TM_DIFF_SELF_REFERENTIAL_EXCLUDES[@]+"${TM_DIFF_SELF_REFERENTIAL_EXCLUDES[@]}"} \
         | grep '^+' | grep -v '^+++' || true)
 HITS=$(printf '%s' "$ADDED_FRAMING" | grep -nIE "$TM_PRIVDOC" || true)

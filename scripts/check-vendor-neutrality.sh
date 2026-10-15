@@ -5,8 +5,8 @@
 # never installed or were bypassed with --no-verify.
 #
 # Usage: check-vendor-neutrality.sh [BASE_REF] [HEAD_REF]
-#   BASE_REF defaults to HEAD~1 (or, if absent/invalid, the diff scan is skipped
-#   and only HEAD's message is checked). HEAD_REF defaults to HEAD.
+#   BASE_REF absent or not a commit (a first push, a force-push over an unknown base): the WHOLE
+#   tree at HEAD_REF is scanned, and HEAD_REF's own message. HEAD_REF defaults to HEAD.
 set -uo pipefail
 
 ROOT="$(git rev-parse --show-toplevel)"
@@ -14,10 +14,15 @@ ROOT="$(git rev-parse --show-toplevel)"
 
 HEAD_REF="${2:-HEAD}"
 BASE_REF="${1:-}"
+WHOLE_TREE=0
 if [ -z "$BASE_REF" ] || ! git rev-parse --verify --quiet "${BASE_REF}^{commit}" >/dev/null 2>&1; then
-    BASE_REF="$(git rev-parse --verify --quiet "${HEAD_REF}~1^{commit}" 2>/dev/null || true)"
+    # No usable base: diff against the empty tree, so every file at HEAD_REF is scanned. Only
+    # looking at HEAD~1 here let everything before it through unseen.
+    BASE_REF="$(git hash-object -t tree /dev/null)"
+    WHOLE_TREE=1
 fi
-RANGE="${BASE_REF:-<root>}..${HEAD_REF}"
+RANGE="${BASE_REF}..${HEAD_REF}"
+[ "$WHOLE_TREE" -eq 1 ] && RANGE="whole tree at ${HEAD_REF}"
 
 WATCHLIST="$(tm_resolve_watchlist || true)"
 if [ -z "$WATCHLIST" ]; then
@@ -36,15 +41,18 @@ fail=0
 #                   private-note / section-ref literals they detect. The
 #                   private-doc + section-ref scans run here.
 if [ -n "$BASE_REF" ]; then
-    ADDED_ALL=$(git diff "$BASE_REF" "$HEAD_REF" -U0 --diff-filter=ACM -- . \
+    # --no-renames: a renamed file is scanned whole, never skipped as "unchanged".
+    ADDED_ALL=$(git diff "$BASE_REF" "$HEAD_REF" -U0 --no-renames --diff-filter=ACM -- . \
             "${TM_DIFF_MACHINERY_EXCLUDES[@]}" \
             | grep '^+' | grep -v '^+++' || true)
-    ADDED_FRAMING=$(git diff "$BASE_REF" "$HEAD_REF" -U0 --diff-filter=ACM -- . \
+    ADDED_FRAMING=$(git diff "$BASE_REF" "$HEAD_REF" -U0 --no-renames --diff-filter=ACM -- . \
             "${TM_DIFF_MACHINERY_EXCLUDES[@]}" ${TM_DIFF_SELF_REFERENTIAL_EXCLUDES[@]+"${TM_DIFF_SELF_REFERENTIAL_EXCLUDES[@]}"} \
             | grep '^+' | grep -v '^+++' || true)
 
-    if HITS=$(printf '%s' "$ADDED_ALL" | tm_scan_text "$WATCHLIST"); then :; else
-        echo "❌ vendor identifier(s) in diff content ($RANGE):"
+    PATHS=$(git diff "$BASE_REF" "$HEAD_REF" --name-only --no-renames --diff-filter=ACM -- . \
+            "${TM_DIFF_MACHINERY_EXCLUDES[@]}" || true)
+    if HITS=$(printf '%s\n%s' "$ADDED_ALL" "$PATHS" | tm_scan_text "$WATCHLIST"); then :; else
+        echo "❌ vendor identifier(s) in diff content or file names ($RANGE):"
         echo "$HITS"
         fail=1
     fi
@@ -67,13 +75,16 @@ fi
 # ── 2) commit messages over the range ────────────────────────────────────────
 # This is the path the local hooks historically missed: a model number can sit in
 # the message even when the diff is clean.
-RANGE_SPEC="${HEAD_REF}"
-[ -n "$BASE_REF" ] && RANGE_SPEC="${BASE_REF}..${HEAD_REF}"
+RANGE_SPEC="${BASE_REF}..${HEAD_REF}"
+# Without a base, only HEAD_REF's own message: the history before it is not this push's.
+[ "$WHOLE_TREE" -eq 1 ] && RANGE_SPEC="-1 ${HEAD_REF}"
 # Scan ONLY the human-written subject + body (%s%n%b). The git-generated short hash (%h) is
 # deliberately NOT included: a hex short hash can incidentally match the model-number regex
 # ([a-z]{2,6}[0-9]{3,}) — that is unrelated to vendor neutrality and would redden CI on a false
 # positive (also the source of test_ci_backstop_passes_clean_range's intermittent flake).
-MSGS=$(git log --no-merges --format='%s%n%b' "$RANGE_SPEC" 2>/dev/null || true)
+# Merge commits included: a merge message can name a branch, and a branch name can carry one.
+# shellcheck disable=SC2086  # RANGE_SPEC is "-1 <ref>" or "<a>..<b>", split on purpose
+MSGS=$(git log --format='%s%n%b' $RANGE_SPEC 2>/dev/null || true)
 
 if HITS=$(printf '%s' "$MSGS" | tm_scan_text "$WATCHLIST"); then :; else
     echo "❌ vendor identifier(s) in commit message(s) ($RANGE):"

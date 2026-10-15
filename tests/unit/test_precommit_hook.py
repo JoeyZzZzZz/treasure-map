@@ -340,3 +340,101 @@ def test_hook_watchlist_not_scanned_against_itself(tmp_path: Path) -> None:
     assert result.returncode == 0, (
         f"modifying the watchlist itself should not be blocked; stdout={result.stdout!r}"
     )
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def test_a_renamed_file_is_scanned_whole(tmp_path: Path) -> None:
+    """A pure rename used to show no content to the scan, so a file committed past the hook could
+    be moved in again unseen.
+
+    MUTATION: drop --no-renames from the hook's diff -> RED."""
+    repo, watchlist = _init_repo(tmp_path)
+    _commit(repo, "a.md", f"analysed device {_FAKE_LC_MODEL} firmware\n", "docs: add")
+    _git(repo, "mv", "a.md", "b.md")
+    result = _run_hook(repo, watchlist)
+    assert result.returncode != 0 and "COMMIT BLOCKED" in result.stdout, result.stdout
+
+
+def test_a_file_name_is_scanned(tmp_path: Path) -> None:
+    """A model number in a FILE NAME is as public as one in its content.
+
+    MUTATION: drop the staged-path scan from the hook -> RED."""
+    repo, watchlist = _init_repo(tmp_path)
+    name = f"{_FAKE_LC_MODEL}.md"
+    (repo / name).write_text("generic notes\n", encoding="utf-8")
+    _git(repo, "add", name)
+    result = _run_hook(repo, watchlist)
+    assert result.returncode != 0 and name in result.stdout, result.stdout
+
+
+def test_the_generic_patterns_apply_alongside_a_fuller_list(tmp_path: Path) -> None:
+    """A fuller local list adds names; it must not take the example's generic model shapes away.
+    The synthetic list here holds only a vendor name, not the model-number regexes.
+
+    MUTATION: scan only the given list in tm_scan_text -> RED."""
+    repo, watchlist = _init_repo(tmp_path)  # watchlist = [_FAKE_VENDOR] only
+    bad = repo / "notes.md"
+    bad.write_text(f"analysed device {_FAKE_LC_MODEL} firmware\n", encoding="utf-8")
+    _git(repo, "add", "notes.md")
+    result = _run_hook(repo, watchlist)
+    assert result.returncode != 0 and "COMMIT BLOCKED" in result.stdout, result.stdout
+
+
+def test_dotted_section_and_private_doc_references_are_blocked(tmp_path: Path) -> None:
+    """The section scan missed a dashed, dotted reference; the private-doc scan missed a design
+    or spec file named in passing. Plain prose with a number passes.
+
+    MUTATION: drop the dotted-section alternative from TM_SECTREF -> RED.
+    MUTATION: drop the *_spec/_design.md alternative from TM_PRIVDOC -> RED."""
+    for i, text in enumerate(
+        ("the section" + "-6.4 invariant\n", "as the map" + "_design.md notes say\n")
+    ):
+        (tmp_path / f"case{i}").mkdir()
+        repo, watchlist = _init_repo(tmp_path / f"case{i}")
+        (repo / "x.py").write_text(f"# {text}", encoding="utf-8")
+        _git(repo, "add", "x.py")
+        result = _run_hook(repo, watchlist)
+        assert result.returncode != 0 and "COMMIT BLOCKED" in result.stdout, text
+    (tmp_path / "clean").mkdir()
+    repo, watchlist = _init_repo(tmp_path / "clean")
+    (repo / "x.py").write_text("# section 6 lists the limits\n", encoding="utf-8")
+    _git(repo, "add", "x.py")
+    assert _run_hook(repo, watchlist).returncode == 0
+
+
+def test_ci_without_a_base_scans_the_whole_tree(tmp_path: Path) -> None:
+    """A first push (no usable base) used to look only at HEAD~1..HEAD, so anything committed
+    earlier went through unseen.
+
+    MUTATION: fall back to HEAD~1 again when the base is not a commit -> RED."""
+    repo, _ = _init_repo(tmp_path)
+    example = repo / ".githooks" / "vendor-watchlist.example.txt"
+    _commit(repo, "old.md", f"flashed {_FAKE_LC_MODEL} image\n", "docs: old note")
+    head = _commit(repo, "new.md", "a clean note\n", "docs: new note")
+    result = _run_ci(repo, example, "0" * 40, head)
+    assert result.returncode != 0 and "whole tree" in result.stdout, result.stdout
+
+
+def test_ci_scans_merge_commit_messages(tmp_path: Path) -> None:
+    """A merge message names a branch, and a branch name can carry a model number.
+
+    MUTATION: put --no-merges back on the message scan -> RED."""
+    repo, _ = _init_repo(tmp_path)
+    example = repo / ".githooks" / "vendor-watchlist.example.txt"
+    base = _git(repo, "rev-parse", "HEAD")
+    main_branch = _git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    _git(repo, "checkout", "-q", "-b", "topic")
+    _commit(repo, "t.md", "topic work\n", "docs: topic")
+    _git(repo, "checkout", "-q", main_branch)
+    _commit(repo, "m.md", "main work\n", "docs: main")
+    _git(
+        repo, "merge", "-q", "--no-ff", "--no-verify", "-m", f"merge {_FAKE_LC_MODEL} work", "topic"
+    )
+    head = _git(repo, "rev-parse", "HEAD")
+    result = _run_ci(repo, example, base, head)
+    assert result.returncode != 0 and "commit message" in result.stdout, result.stdout

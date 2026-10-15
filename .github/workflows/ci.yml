@@ -5,13 +5,18 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # release.yml runs this whole workflow first and publishes only if every job here passes.
+  workflow_call:
+
+# Third-party actions are pinned to a commit (the tag it was taken from is in the comment): a tag
+# can be moved, a commit cannot.
 
 jobs:
   vendor-neutrality:
     name: Vendor Neutrality
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
           fetch-depth: 0  # need history to diff the range and read commit messages
       - name: Resolve commit range
@@ -24,22 +29,35 @@ jobs:
             echo "base=${{ github.event.before }}" >> "$GITHUB_OUTPUT"
             echo "head=${{ github.sha }}" >> "$GITHUB_OUTPUT"
           fi
-      - name: Check vendor neutrality (diff + commit messages)
+      # The full brand list is private and never committed. When the repository holds it as the
+      # TM_VENDOR_WATCHLIST secret it is used (the example's generic patterns apply alongside);
+      # without it (a fork's pull request, a repository that never set it) only the example runs.
+      - name: Private watchlist from the repository secret, when there is one
+        env:
+          WATCHLIST: ${{ secrets.TM_VENDOR_WATCHLIST }}
+        run: |
+          if [ -n "$WATCHLIST" ]; then
+            printf '%s\n' "$WATCHLIST" > "$RUNNER_TEMP/vendor-watchlist.txt"
+            echo "TM_VENDOR_WATCHLIST=$RUNNER_TEMP/vendor-watchlist.txt" >> "$GITHUB_ENV"
+          fi
+      - name: Check vendor neutrality (diff, file names, commit messages)
         run: bash scripts/check-vendor-neutrality.sh "${{ steps.range.outputs.base }}" "${{ steps.range.outputs.head }}"
 
   recall-integrity:
     name: Recall Integrity
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: "3.11"
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
-      - name: Red-line gates (never wrongly downweight; degrade must be visible)
+      # The checker's self-test: it proves the gates tell a clean database from a seeded violation.
+      # It checks the checker, not the product — the product's own red lines are unit tests.
+      - name: Recall-integrity checker self-test
         run: python scripts/check_recall_integrity.py --self-test
       - name: Binary-selector gate (one resolver; an ambiguous name is refused, never picked)
         run: bash scripts/check-binary-selector-resolution.sh
@@ -50,12 +68,14 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: "3.11"
+      # The same version the dev extra pins: a newer ruff formats differently and lints more, so
+      # an unpinned one turns a green local run into a red CI one with no code change.
       - name: Install ruff
-        run: pip install ruff
+        run: pip install "ruff==0.16.0"
       - name: ruff check
         run: ruff check src/ tests/
       - name: ruff format check
@@ -65,8 +85,8 @@ jobs:
     name: Type Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: "3.11"
       - name: Install dependencies
@@ -83,8 +103,8 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install dependencies
@@ -92,4 +112,88 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
       - name: Run unit tests
-        run: pytest tests/unit/ -v --cov=src/treasure_map --cov-report=term-missing
+        run: python -m pytest tests/unit/ -v --cov=src/treasure_map --cov-report=term-missing
+
+  # The real decompiler: every Ghidra-backed integration test, which also compiles the shipped
+  # ExportFunctions.java the way a user's scan does (a Java error is otherwise invisible until a
+  # scan writes no output).
+  integration:
+    name: Integration (Ghidra)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3  # v4.9.1
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Ghidra archive (pinned in the toolchain lock)
+        id: ghidra
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          from treasure_map.lib.setup.toolchain_lock import asset_for, load_lock
+          a = asset_for(load_lock(), "ghidra", "linux-x86_64")
+          print(f"url={a.url}\nsha={a.sha256}\nroot={a.root}")
+          PY
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ghidra.zip
+          key: ghidra-${{ steps.ghidra.outputs.sha }}
+      - name: Download (when not cached) and unpack, sha256-checked
+        run: |
+          set -e
+          [ -f ghidra.zip ] || curl -LsSf -o ghidra.zip "${{ steps.ghidra.outputs.url }}"
+          echo "${{ steps.ghidra.outputs.sha }}  ghidra.zip" | sha256sum -c -
+          unzip -q ghidra.zip -d "$RUNNER_TEMP"
+          G="$RUNNER_TEMP/${{ steps.ghidra.outputs.root }}"
+          echo "GHIDRA_HOME=$G" >> "$GITHUB_ENV"
+          echo "$G/support" >> "$GITHUB_PATH"
+      - name: Run integration tests
+        run: python -m pytest tests/integration/ -v
+
+  # The wheel a user installs: built, installed into a fresh venv (never editable — an editable
+  # install resolves every asset from the source tree and so cannot miss one), and checked there.
+  package:
+    name: Package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.11"
+      - name: Build
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+      - name: The wheel carries every runtime asset
+        run: python scripts/wheel_assets.py dist/*.whl
+      - name: Install the wheel into a fresh venv and resolve the assets from it
+        run: |
+          set -e
+          python -m venv /tmp/w
+          /tmp/w/bin/pip install dist/*.whl
+          cd /tmp
+          /tmp/w/bin/tmap --version
+          /tmp/w/bin/python -I "$GITHUB_WORKSPACE/scripts/wheel_assets.py" --installed
+
+  # The lower bounds pyproject declares, installed as such: a bound nothing ever runs is a guess.
+  lowest-deps:
+    name: Lowest direct dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
+      - name: Install at the declared lower bounds
+        run: |
+          uv venv -p 3.11 /tmp/low
+          uv pip install --python /tmp/low/bin/python --resolution lowest-direct ".[dev]"
+      - name: Smoke tests
+        run: |
+          /tmp/low/bin/tmap --version
+          /tmp/low/bin/python -m pytest -q tests/unit/test_mcp_app.py tests/unit/test_cli_names_and_mcp.py tests/unit/test_packaging.py tests/unit/lib/test_atlas.py tests/unit/lib/test_elf_inventory.py tests/unit/lib/test_triage.py tests/unit/test_scan_cli.py

@@ -5,10 +5,13 @@
 # detection logic lives in exactly one place. Pure POSIX-ish bash; no side effects
 # on source beyond defining the TM_* variables and functions below.
 
+# The directory this file lives in (the hooks dir), for the brand-free example beside it.
+TM_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # Regexes shared between the local hooks and the CI fallback. Defined here so a
 # fix to one pattern applies everywhere at once.
-TM_PRIVDOC='treasure-map-notes|private (design )?notes|design note|PRD §|private notes dir'
-TM_SECTREF='§[0-9]|PRD §|\b(DD|ED|FD)[0-9]\b'
+TM_PRIVDOC='treasure-map-notes|private (design )?notes|design note|PRD §|private notes dir|[A-Za-z0-9_]+_(spec|design)(_v[0-9]+)?\.md\b'
+TM_SECTREF='§[0-9]|PRD §|\b(DD|ED|FD)[0-9]\b|\b[Ss]ection[- ][0-9]+\.[0-9]+'
 
 # ── shared diff pathspec exclude sets ────────────────────────────────────────
 # One source of truth for BOTH the local hooks (git diff --cached) and the CI
@@ -73,17 +76,27 @@ tm_scan_text() {
     [ -z "$text" ] && return 0
     [ -f "$watchlist" ] || return 0
 
-    local hits="" pat match
-    while IFS= read -r pat; do
-        case "$pat" in ''|\#*) continue ;; esac
-        case "$pat" in
-            \[*|\(*) match=$(printf '%s\n' "$text" | grep -P -- "$pat" || true) ;;
-            *)        match=$(printf '%s\n' "$text" | grep -iwE -- "$pat" || true) ;;
-        esac
-        if [ -n "$match" ]; then
-            hits="${hits}"$'\n'"  pattern: ${pat}"$'\n'"$(printf '%s' "$match" | sed 's/^/    /')"
-        fi
-    done < "$watchlist"
+    # The brand-free example's generic patterns ALWAYS apply: a fuller local list adds names, it
+    # must not take the generic model-number shapes away (using one used to drop the other).
+    local lists=("$watchlist")
+    local example="$TM_LIB_DIR/vendor-watchlist.example.txt"
+    if [ -f "$example" ] && ! [ "$example" -ef "$watchlist" ]; then
+        lists+=("$example")
+    fi
+
+    local hits="" pat match list
+    for list in "${lists[@]}"; do
+        while IFS= read -r pat; do
+            case "$pat" in ''|\#*) continue ;; esac
+            case "$pat" in
+                \[*|\(*) match=$(printf '%s\n' "$text" | grep -P -- "$pat" || true) ;;
+                *)        match=$(printf '%s\n' "$text" | grep -iwE -- "$pat" || true) ;;
+            esac
+            if [ -n "$match" ]; then
+                hits="${hits}"$'\n'"  pattern: ${pat}"$'\n'"$(printf '%s' "$match" | sed 's/^/    /')"
+            fi
+        done < "$list"
+    done
 
     if [ -n "$hits" ]; then
         printf '%s\n' "$hits"
