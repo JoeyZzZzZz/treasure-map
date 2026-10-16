@@ -7,7 +7,7 @@ import logging
 import os
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 
 import yaml
 from pydantic import BaseModel, Field, field_validator
@@ -106,6 +106,10 @@ def _source_env_file(path: Path) -> None:
 
     Already-set env vars are never overwritten. Absent file is a silent no-op.
     Supports: blank lines, # comments, optional 'export ' prefix, single/double quotes.
+
+    A relative path given to a ``TM_*`` variable that sets a path key (``PATH_KEYS``) is read from
+    this file's directory, as a config file's is, and set already absolute: a child process
+    inherits it absolute too.
     """
     if not path.exists():
         return
@@ -126,6 +130,8 @@ def _source_env_file(path: Path) -> None:
         if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
             value = value[1:-1]
         if key not in os.environ:
+            if key.startswith("TM_") and _env_keys(key) in PATH_KEYS and _is_relative(value):
+                value = str(path.absolute().parent / value)
             os.environ[key] = value
 
 
@@ -139,12 +145,31 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
     return result
 
 
+def _env_keys(name: str) -> tuple[str, ...]:
+    """The config key a ``TM_*`` variable sets: ``TM_ATLAS__DB_PATH`` sets atlas.db_path."""
+    return tuple(name[3:].lower().split("__"))
+
+
+def _relative_env_path(name: str, value: str) -> ConfigError:
+    return ConfigError(
+        f"{name}={value!r} is a relative path; give it absolute or starting with ~ (a path in "
+        "the environment has no file to be read from, and tmap never reads one from the working "
+        "directory)"
+    )
+
+
 def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
-    """Apply TM_* environment variable overrides using __ as nesting separator."""
+    """Apply TM_* environment variable overrides using __ as nesting separator.
+
+    A path key (``PATH_KEYS``) must be given absolute or starting with ``~``: a relative one is a
+    ConfigError naming the variable. A ``.env`` has already made its own relative paths absolute
+    (``_source_env_file``)."""
     for key, value in os.environ.items():
         if not key.startswith("TM_"):
             continue
-        parts = key[3:].lower().split("__")
+        parts = _env_keys(key)
+        if parts in PATH_KEYS and _is_relative(value):
+            raise _relative_env_path(key, value)
         node: dict[str, Any] = data
         for part in parts[:-1]:
             node = node.setdefault(part, {})
@@ -162,6 +187,11 @@ PATH_KEYS: tuple[tuple[str, ...], ...] = (
 )
 
 
+def _is_relative(value: object) -> TypeGuard[str]:
+    """A non-empty path string that is neither absolute nor ``~``-based."""
+    return isinstance(value, str) and bool(value) and not os.path.isabs(os.path.expanduser(value))
+
+
 def resolve_relative_paths(data: dict[str, Any], config_file: Path) -> dict[str, Any]:
     """A copy of ``data`` — one config file's mapping — with every relative path under
     ``PATH_KEYS`` made absolute against the directory ``config_file`` is in. A ``~`` path counts as
@@ -177,7 +207,7 @@ def resolve_relative_paths(data: dict[str, Any], config_file: Path) -> dict[str,
         for k in keys[:-1]:
             node = node.get(k) if isinstance(node, dict) else None
         value = node.get(keys[-1]) if isinstance(node, dict) else None
-        if isinstance(value, str) and value and not os.path.isabs(os.path.expanduser(value)):
+        if _is_relative(value):
             node[keys[-1]] = str(base / value)
     return out
 
@@ -199,11 +229,15 @@ def _merge_file(raw: dict[str, Any], path: Path) -> dict[str, Any]:
 
 def load_config(extra_path: Path | None = None) -> Config:
     """Load config from ~/.treasure-map/config.yaml, then ``extra_path`` (``-c``), then TM_* env
-    vars, each over the last. A relative path in a file is read from that file's directory.
+    vars, each over the last. A relative path in a file — a config file or the ``.env`` — is read
+    from that file's directory. A path in the environment itself (a ``TM_*`` path key, and
+    ``TM_ENV_FILE``) must be absolute or start with ``~``; a relative one is a ConfigError.
 
     Never from the working directory: tmap is run inside unpacked, untrusted firmware trees, and a
     ``config.yaml`` there would choose the Ghidra it executes and what goes first on PATH."""
     env_file_override = os.environ.get("TM_ENV_FILE")
+    if _is_relative(env_file_override):
+        raise _relative_env_path("TM_ENV_FILE", env_file_override)
     _source_env_file(
         Path(env_file_override) if env_file_override else Path.home() / ".treasure-map" / ".env"
     )

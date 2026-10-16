@@ -9,7 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from treasure_map.lib.config.config import AtlasConfig, _source_env_file, load_config
+from treasure_map.lib.config.config import AtlasConfig, Config, _source_env_file, load_config
+from treasure_map.lib.errors import ConfigError
 
 # ── _source_env_file ──────────────────────────────────────────────────────────
 
@@ -244,3 +245,111 @@ def test_a_relative_path_in_an_extra_config_is_read_from_that_files_directory(
     monkeypatch.chdir(tmp_path)
     cfg = load_config(Path("profiles/big.yaml"))
     assert cfg.workspace_dir == tmp_path / "profiles" / "ws"
+
+
+# ── a path from the .env or the environment is never read from the working directory ──────────
+
+_PATH_VARS = (
+    "TM_GHIDRA__LOCAL__HOME",
+    "TM_TOOLCHAIN__JAVA_HOME",
+    "TM_TOOLCHAIN__BINDIFF",
+    "TM_ATLAS__DB_PATH",
+    "TM_WORKSPACE_DIR",
+)
+
+
+def _load() -> tuple[Config | None, str | None]:
+    """``load_config()``, with a ConfigError turned into the outcome a test asserts on."""
+    try:
+        return load_config(), None
+    except ConfigError as exc:
+        return None, str(exc)
+
+
+@pytest.mark.parametrize("where", ["default", "named by TM_ENV_FILE"])
+def test_a_relative_path_in_the_env_file_is_read_from_its_directory(
+    where: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``TM_TOOLCHAIN__JAVA_HOME=jdk/21`` in a .env means jdk/21 beside that .env wherever tmap
+    is run, as the same key in a config file would — and it is set absolute in the environment,
+    so a child tmap inherits it that way. A .env outside ~/.treasure-map tells "the .env's
+    directory" apart from "~/.treasure-map".
+
+    MUTATION: read it from the working directory (``Path.cwd() / value``) -> every path lands in
+    the firmware tree -> RED (observed).
+    MUTATION: read it from ~/.treasure-map whatever the .env -> RED for the second case (observed).
+    MUTATION: drop the resolution -> the relative value reaches the environment check and loading
+    fails -> RED (assertion on the outcome; observed)."""
+    env_dir = Path.home() / ".treasure-map"
+    if where != "default":
+        env_dir = tmp_path / "profiles"
+        env_dir.mkdir()
+        monkeypatch.setenv("TM_ENV_FILE", str(env_dir / "big.env"))
+    (env_dir / ("big.env" if where != "default" else ".env")).write_text(
+        "TM_GHIDRA__LOCAL__HOME=foo\n"
+        "TM_TOOLCHAIN__JAVA_HOME=jdk/21\n"
+        "TM_TOOLCHAIN__BINDIFF=bin/bindiff\n"
+        "TM_ATLAS__DB_PATH=data/atlas.db\n"
+        "TM_WORKSPACE_DIR=ws\n"
+    )
+    fw = tmp_path / "fw"
+    fw.mkdir()
+    monkeypatch.chdir(fw)
+    cfg, error = _load()
+    assert error is None and cfg is not None, error
+    assert cfg.ghidra.local.home == env_dir / "foo"
+    assert cfg.toolchain.java_home == env_dir / "jdk" / "21"
+    assert cfg.toolchain.bindiff == env_dir / "bin" / "bindiff"
+    assert cfg.atlas.db_path == env_dir / "data" / "atlas.db"
+    assert cfg.workspace_dir == env_dir / "ws"
+    assert os.environ["TM_TOOLCHAIN__JAVA_HOME"] == str(env_dir / "jdk" / "21")
+
+
+@pytest.mark.parametrize("var", _PATH_VARS)
+def test_a_relative_path_in_the_environment_is_refused(
+    var: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``TM_*`` path exported in the shell has no file whose directory it could be read from,
+    and the working directory is never that base: a relative one stops loading with an error
+    naming the variable, instead of naming another file in each firmware tree tmap is run in.
+
+    MUTATION: drop the check in _apply_env_overrides -> the relative path is loaded -> RED
+    (observed)."""
+    monkeypatch.setenv(var, "rel/x")
+    monkeypatch.chdir(tmp_path)
+    cfg, error = _load()
+    assert cfg is None and error is not None
+    assert f"{var}='rel/x' is a relative path" in error, error
+
+
+def test_an_absolute_or_home_path_in_the_environment_is_used_as_given(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MUTATION: count a ``~`` path as relative (``os.path.isabs`` without ``expanduser``) ->
+    ``~/ws`` is refused -> RED (observed)."""
+    monkeypatch.setenv("TM_WORKSPACE_DIR", "~/ws")
+    monkeypatch.setenv("TM_ATLAS__DB_PATH", str(tmp_path / "a.db"))
+    cfg, error = _load()
+    assert error is None and cfg is not None, error
+    assert cfg.workspace_dir == Path.home() / "ws"
+    assert cfg.atlas.db_path == tmp_path / "a.db"
+
+
+def test_a_relative_env_file_name_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``TM_ENV_FILE=conf/.env`` would source a .env from whatever directory tmap runs in, and a
+    firmware tree's own one could then pick the Ghidra tmap executes. It is refused, and nothing
+    from that file reaches the environment.
+
+    MUTATION: drop the TM_ENV_FILE check -> the firmware tree's .env is sourced and its Ghidra is
+    loaded -> RED (observed)."""
+    fw = tmp_path / "fw"
+    (fw / "conf").mkdir(parents=True)
+    (fw / "conf" / ".env").write_text(f"TM_GHIDRA__LOCAL__HOME={fw}/evil\n")
+    monkeypatch.chdir(fw)
+    monkeypatch.setenv("TM_ENV_FILE", "conf/.env")
+    cfg, error = _load()
+    assert cfg is None and error is not None
+    assert "TM_ENV_FILE='conf/.env' is a relative path" in error, error
+    assert "TM_GHIDRA__LOCAL__HOME" not in os.environ

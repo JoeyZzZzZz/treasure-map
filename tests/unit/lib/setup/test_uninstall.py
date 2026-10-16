@@ -485,7 +485,8 @@ def test_an_unwritable_dsh_patch_file_is_a_manual_step() -> None:
 @_needs_non_root
 def test_an_unreadable_agent_directory_does_not_stop_the_uninstall() -> None:
     """~/.cursor without read or search permission: even reading the entry fails. unregister's
-    catch-all turns that into a to-do, and the toolchain is still removed.
+    catch-all turns that into a to-do, and the toolchain is still removed. This calls the library
+    step directly; the command, which surveys the agents first, is tested below.
 
     MUTATION: call the unguarded _unregister from unregister -> PermissionError escapes, the
     toolchain stays -> RED (assertion)."""
@@ -525,22 +526,66 @@ def test_a_toolchain_path_that_cannot_be_removed_leaves_its_entry_and_the_rest_g
     assert left.find("bindiff") is not None and left.find("jdk") is None
 
 
-@_needs_non_root
-def test_the_cli_reports_a_filesystem_error_instead_of_a_traceback() -> None:
-    """An agent directory tmap cannot even read stops the plan itself: the command says so and
-    exits 1 — no traceback.
+def _no_agent_dirs_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The command reads the real environment: an agent directory exported in the developer's
+    shell must not be what it surveys."""
+    for var in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "DSH_HOME"):
+        monkeypatch.delenv(var, raising=False)
 
-    MUTATION: drop the CLI's OSError guard -> the PermissionError escapes -> RED (assertion)."""
+
+@_needs_non_root
+def test_the_cli_goes_on_past_an_agent_directory_it_cannot_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``tmap uninstall --yes`` with ~/.cursor unreadable (mode 000): the survey that makes the
+    plan cannot read Cursor's configuration either. Cursor's entry becomes a step to do by hand,
+    the toolchain is still removed, and the command exits 1 for that step — it does not stop at
+    the plan.
+
+    MUTATION: survey calls inspect unguarded -> "stopped: [Errno 13] ..." before the plan, the
+    JDK still there -> RED (assertion; observed)."""
     from treasure_map.cli.uninstall_cli import uninstall
 
+    _no_agent_dirs_from_the_environment(monkeypatch)
+    monkeypatch.setattr(un, "uv_self_uninstall", lambda *_a: None)
     home = Path.home()
+    jdk = _managed_jdk(home / ".treasure-map")
     cursor = home / ".cursor"
     cursor.mkdir()
-    (cursor / "mcp.json").write_text("{}")
+    body = json.dumps({"mcpServers": {"treasure-map": {"command": "/x/tmap", "args": ["mcp"]}}})
+    (cursor / "mcp.json").write_text(body)
     with _mode(cursor, 0o000):
         result = CliRunner().invoke(uninstall, ["--yes"])
+    out = result.output
+    assert "stopped:" not in out, out
+    assert f"remove treasure-map from Cursor ({cursor / 'mcp.json'})" in out, out
+    assert "✗ Cursor: could not change its configuration" in out, out
+    assert "remove its treasure-map entry by hand" in out
+    assert not jdk.exists()
+    assert (cursor / "mcp.json").read_text() == body
+    assert isinstance(result.exception, SystemExit) and result.exit_code == 1
+
+
+def test_the_cli_reports_a_filesystem_error_instead_of_a_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A filesystem error that no step expected (here the uninstall step itself raises one) ends
+    the command with "stopped: ..." and exit 1 — no traceback.
+
+    MUTATION: drop the CLI's OSError guard -> the PermissionError escapes -> RED (assertion;
+    observed)."""
+    from treasure_map.cli.uninstall_cli import uninstall
+
+    def _refused(**_k: object) -> un.UninstallReport:
+        raise PermissionError(13, "Permission denied", str(Path.home() / "somewhere"))
+
+    _no_agent_dirs_from_the_environment(monkeypatch)
+    monkeypatch.setattr(un, "uninstall", _refused)
+    monkeypatch.setattr(un, "uv_self_uninstall", lambda *_a: None)
+    result = CliRunner().invoke(uninstall, ["--yes"])
     assert isinstance(result.exception, SystemExit), repr(result.exception)
-    assert result.exit_code == 1 and "stopped:" in result.output + result.stderr
+    assert result.exit_code == 1
+    assert "stopped: [Errno 13] Permission denied" in result.output + result.stderr
 
 
 def _completion_entry(home: Path, rc: Path, **extra: object) -> Path:
@@ -584,6 +629,30 @@ def test_an_rc_tmap_created_but_the_user_wrote_to_stays() -> None:
     assert rc.is_file() and rc.read_text() == "export EDITOR=vi\n"
 
 
+def test_an_rc_tmap_created_that_is_now_a_symlink_is_written_through_not_deleted(
+    tmp_path: Path,
+) -> None:
+    """tmap created ~/.bash_profile; the user later made it a link into a dotfiles repository,
+    and the linked file holds only the block. The block comes out of the linked file and the link
+    stays: deleting it would take the user's link, not a file tmap made.
+
+    MUTATION: delete a created rc left empty even when it is a symbolic link (drop
+    ``not rc.is_symlink()``) -> the link is gone -> RED (observed)."""
+    from treasure_map.lib.setup.completion import _MARK_END, _MARK_START
+
+    home = Path.home()
+    target = tmp_path / "dotfiles" / "bash_profile"
+    target.parent.mkdir()
+    target.write_text(f"\n{_MARK_START}\nsource x\n{_MARK_END}\n")
+    rc = home / ".bash_profile"
+    rc.symlink_to(target)
+    _completion_entry(home, rc, rc_created=True)
+    report = _run(home)
+    assert rc.is_symlink() and os.path.realpath(rc) == os.path.realpath(target)
+    assert target.read_text() == ""
+    assert f"removed tmap's completion block from {rc}" in report.removed, report.removed
+
+
 def test_an_rc_the_user_had_stays_even_when_empty() -> None:
     """The rc existed before tmap (no rc_created): emptied of the block, it is still the user's.
 
@@ -610,6 +679,24 @@ def test_a_sqlite_atlas_without_tmaps_tables_is_kept(tmp_path: Path) -> None:
     plan = un.purge_plan(tm_home=tm, atlas=atlas, workspace_dir=tm / "ws", home=home)
     assert atlas not in plan.delete
     assert any(f"{atlas}: not a tmap atlas" in k for k in plan.keep)
+
+
+def test_a_symlinked_atlas_is_kept_and_named(tmp_path: Path) -> None:
+    """An atlas path that is a symbolic link is not followed — not even to tmap's own database:
+    it is kept, and named with that reason rather than as "not a tmap atlas".
+
+    MUTATION: drop the symbolic-link branch -> the link to a real tmap atlas is listed as "not a
+    tmap atlas" -> RED (observed)."""
+    home = Path.home()
+    tm = home / ".treasure-map"
+    real = _atlas(tmp_path / "elsewhere" / "atlas.db")
+    link = tm / "atlas.db"
+    link.symlink_to(real)
+    plan = un.purge_plan(tm_home=tm, atlas=link, workspace_dir=tm / "ws", home=home)
+    assert link not in plan.delete and real not in plan.delete
+    assert f"{link}: a symbolic link; tmap does not follow it" in plan.keep, plan.keep
+    assert un.purge_data(plan, un.PURGE_PHRASE)
+    assert link.is_symlink() and real.is_file()
 
 
 def test_a_workspace_whose_sqlite_analysis_db_is_not_tmaps_is_kept(tmp_path: Path) -> None:

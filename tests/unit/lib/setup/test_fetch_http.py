@@ -3,10 +3,11 @@
 """``UrlFetcher`` + ``download_verified`` against a real HTTP server on the loopback interface.
 
 urllib returns a short body without an error when a connection drops before Content-Length is
-reached, and raises HTTPError for a 416. Faking ``urlopen`` would test a guess of those semantics;
-here the real client talks to a real ``http.server``, so a transfer that stopped (kept, resumed
-next run) is told apart from a file the server sent whole but smaller than the lock (a mismatch,
-deleted — resuming it could never succeed).
+reached (or before the end of a body sent without one), raises IncompleteRead when a chunked body
+loses its closing chunk, and raises HTTPError for a 416. Faking ``urlopen`` would test a guess of
+those semantics; here the real client talks to a real ``http.server``, so a transfer that stopped
+(kept, resumed next run) is told apart from a file the server sent whole but smaller than the lock
+(a mismatch, deleted — resuming it could never succeed).
 """
 
 from __future__ import annotations
@@ -38,6 +39,8 @@ DROP_AT = 1200  # where a dropped connection stops
 @dataclass
 class _State:
     mode: str = "ok"  # ok | small | drop
+    framing: str = "length"  # how a 200 body ends: length (Content-Length) | chunked | close
+    honours_range: bool = True  # False: a Range request gets the whole file again (200)
     ranges: list[str | None] = field(default_factory=list)
 
 
@@ -51,7 +54,7 @@ def _handler(state: _State) -> type[http.server.BaseHTTPRequestHandler]:
             rng = self.headers.get("Range")
             state.ranges.append(rng)
             body = SMALL if state.mode == "small" else PAYLOAD
-            if rng:
+            if rng and state.honours_range:
                 start = int(rng.removeprefix("bytes=").split("-")[0])
                 if start >= len(body):
                     self.send_response(416)
@@ -65,11 +68,27 @@ def _handler(state: _State) -> type[http.server.BaseHTTPRequestHandler]:
                 self.end_headers()
                 self.wfile.write(body[start:])
                 return
+            sent = body[:DROP_AT] if state.mode == "drop" else body
+            if state.framing == "chunked":
+                # "drop": the connection closes before the closing zero-size chunk
+                self.protocol_version = "HTTP/1.1"
+                self.send_response(200)
+                self.send_header("Transfer-Encoding", "chunked")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                for i in range(0, len(sent), 400):
+                    piece = sent[i : i + 400]
+                    self.wfile.write(f"{len(piece):x}\r\n".encode() + piece + b"\r\n")
+                if state.mode != "drop":
+                    self.wfile.write(b"0\r\n\r\n")
+                return
             self.send_response(200)
-            self.send_header("Content-Length", str(len(body)))
+            if state.framing == "length":
+                self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            # "drop": the connection closes (HTTP/1.0) before Content-Length is reached
-            self.wfile.write(body[:DROP_AT] if state.mode == "drop" else body)
+            # "drop": the connection closes (HTTP/1.0) before the whole body is sent; without a
+            # Content-Length ("close") that end looks the same as the real one
+            self.wfile.write(sent)
 
     return Handler
 
@@ -161,6 +180,88 @@ def test_a_dropped_connection_is_kept_and_resumed(
     mismatch -> RED."""
     state, asset = server
     state.mode = "drop"
+    staging = tmp_path / "dl"
+    outcome = _download(asset, staging)
+    assert "run again to resume" in outcome, outcome
+    assert (staging / "tool.zip.part").stat().st_size == DROP_AT
+    state.mode = "ok"
+    assert _download(asset, staging) == "ok"
+    assert state.ranges == [None, f"bytes={DROP_AT}-"]
+
+
+def test_a_resume_that_reaches_the_servers_whole_size_short_of_the_lock_is_a_mismatch(
+    server: tuple[_State, Asset], tmp_path: Path
+) -> None:
+    """A .part of 500 bytes resumed with a 206 whose Content-Range total is the server's whole
+    file (1000 bytes, short of the lock): that total is where the resource ends, so the .part is
+    a mismatch on this run — not kept for a run that would only meet a 416.
+
+    MUTATION: read no total from the 206's Content-Range (end = None) -> "run again to resume
+    it", the .part kept at 1000 bytes -> RED (observed)."""
+    state, asset = server
+    state.mode = "small"
+    staging = tmp_path / "dl"
+    staging.mkdir()
+    (staging / "tool.zip.part").write_bytes(SMALL[:500])
+    outcome = _download(asset, staging)
+    assert state.ranges == ["bytes=500-"]
+    assert "pinned 3072 bytes" in outcome and "deleted" in outcome, outcome
+    assert not (staging / "tool.zip.part").exists()
+
+
+def test_a_chunked_body_shorter_than_the_lock_is_a_mismatch_from_the_first_run(
+    server: tuple[_State, Asset], tmp_path: Path
+) -> None:
+    """No Content-Length and no Range support: the body comes in chunks, and its closing chunk
+    is where the server says the file ends (a body cut before it raises instead). Shorter than
+    the lock, it is a mismatch on every run — never "run again to resume", which a server that
+    ignores Range could not honour anyway.
+
+    MUTATION: do not count a chunked body's end as the resource's (drop ``chunked or``) -> the
+    first run asks to resume 1000 bytes the server will never add to -> RED (observed)."""
+    state, asset = server
+    state.mode, state.framing, state.honours_range = "small", "chunked", False
+    staging = tmp_path / "dl"
+    for _run in range(2):
+        outcome = _download(asset, staging)
+        assert "pinned 3072 bytes" in outcome and "deleted" in outcome, outcome
+        assert "resume" not in outcome
+        assert not (staging / "tool.zip.part").exists()
+    assert state.ranges == [None, None]
+
+
+def test_a_whole_answer_to_a_resume_without_a_length_is_final(
+    server: tuple[_State, Asset], tmp_path: Path
+) -> None:
+    """A .part to resume, and a server that ignores Range and sends no Content-Length: it
+    answers with the whole file again, ended only by closing the connection. Whether that body
+    is complete cannot be told, but a later run could not resume it either — so a body short of
+    the lock is a mismatch here, not a promise to resume.
+
+    MUTATION: drop ``have > 0`` (a body without a length is final only when chunked) -> "run
+    again to resume it", the .part kept -> RED (observed)."""
+    state, asset = server
+    state.mode, state.framing, state.honours_range = "small", "close", False
+    staging = tmp_path / "dl"
+    staging.mkdir()
+    (staging / "tool.zip.part").write_bytes(SMALL[:500])
+    outcome = _download(asset, staging)
+    assert state.ranges == ["bytes=500-"]
+    assert "pinned 3072 bytes" in outcome and "deleted" in outcome, outcome
+    assert not (staging / "tool.zip.part").exists()
+
+
+def test_a_body_without_a_length_cut_on_a_first_request_is_kept_and_resumed(
+    server: tuple[_State, Asset], tmp_path: Path
+) -> None:
+    """The other side: no Content-Length, no chunks, and the connection drops. On a first request
+    (no Range sent) the end of such a body may be a dropped connection, so it is kept, and the
+    next run resumes it from a server that supports Range.
+
+    MUTATION: count the end of any body without a length as final (``ends_at_eof = body is
+    None``) -> the cut transfer is deleted as a mismatch -> RED (observed)."""
+    state, asset = server
+    state.mode, state.framing = "drop", "close"
     staging = tmp_path / "dl"
     outcome = _download(asset, staging)
     assert "run again to resume" in outcome, outcome

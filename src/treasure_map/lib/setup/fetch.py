@@ -48,9 +48,11 @@ class Fetcher(Protocol):
         """Write the resource at ``url`` to ``dest``, resuming from ``dest``'s current size when
         it exists and the source allows it (else starting over).
 
-        True when the source declared where the resource ends and ``dest`` reaches that end: what
-        is there is all the source has, not a transfer that stopped short. False when that is not
-        known."""
+        True when no later fetch could add to ``dest``: the source declared where the resource
+        ends (a length, a range's total, a chunked body's closing chunk, nothing past what is
+        here) and ``dest`` reaches that end, or it answered a resume with the whole resource and
+        no length, so a later run would start over as well. False when that is not known: the
+        transfer may have stopped short, and a later run may resume it."""
         ...
 
 
@@ -74,6 +76,7 @@ class UrlFetcher:
                 status = getattr(resp, "status", 200)
                 length = resp.headers.get("Content-Length")
                 body = int(length) if length and length.isdigit() else None
+                ends_at_eof = False
                 if status == 206:
                     content_range = str(resp.headers.get("Content-Range", ""))
                     if not content_range.startswith(f"bytes {have}-"):
@@ -83,11 +86,20 @@ class UrlFetcher:
                     whole = content_range.rpartition("/")[2]  # "bytes a-b/N": N, or "*"
                     end = int(whole) if whole.isdigit() else None
                 else:
+                    # A whole response: the resource is its body. With no Content-Length, the
+                    # body's end is still the resource's when it came in chunks (http.client
+                    # raises when the closing chunk never arrives), and is all there is when the
+                    # server answered a Range with the whole resource: a later run could not
+                    # resume it either.
+                    chunked = str(resp.headers.get("Transfer-Encoding", "")).lower() == "chunked"
+                    ends_at_eof = body is None and (chunked or have > 0)
                     mode, have = "wb", 0
-                    end = body  # a whole response: the resource is its body
+                    end = body
                 total = have + body if body is not None else 0
                 with dest.open(mode) as out:
                     size = _copy(resp, out, have, total, progress)
+                if ends_at_eof:
+                    end = size
         except urllib.error.HTTPError as exc:
             if exc.code == 416 and have:
                 return True  # nothing past what is here: the source's resource ends within it
@@ -178,8 +190,9 @@ def download_verified(
     as an archive before that. A ``.part`` already as long as the asset (an interrupted run) is
     checked without fetching; a longer one is deleted first. A short result whose transfer stopped
     (the connection dropped) is kept for the next run to resume, with FetchError. A size or sha256
-    mismatch deletes it, with FetchError — a short file the source declared complete included:
-    the source has no more to give, so resuming it would fail the same way on every run."""
+    mismatch deletes it, with FetchError — a short file the source declared complete, or sent
+    whole in answer to a resume, included: the source has no more to give, so resuming it would
+    fail the same way on every run."""
     staging.mkdir(parents=True, exist_ok=True)
     part = staging / (asset.file_name + ".part")
     url = source_url(asset, mirror)
