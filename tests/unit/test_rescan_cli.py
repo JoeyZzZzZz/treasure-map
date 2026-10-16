@@ -142,6 +142,24 @@ def test_a_present_firmware_root_is_listed_as_rescannable(tmp_path: Path) -> Non
     assert "--dry-run: nothing was run." in out.output
 
 
+def test_dry_run_does_not_create_the_atlas(tmp_path: Path) -> None:
+    """A read/plan command must not write state. Under a fresh HOME with no atlas, ``tmap rescan
+    --dry-run`` used to CREATE atlas.db just by opening it (open_atlas builds the schema). With no
+    atlas there are no runs to rescan, so it says so and leaves the filesystem untouched.
+
+    MUTATION (verified RED): remove the not-exists guard before open_atlas in rescan -> open_atlas
+    creates the db and the ``not .exists()`` assertion fails."""
+    missing = tmp_path / "home" / "atlas.db"
+    out = CliRunner().invoke(rescan, ["--atlas", str(missing), "--dry-run"])
+    assert out.exit_code == 0, out.output
+    assert "nothing to rescan" in out.output
+    assert not missing.exists()  # the plan command created nothing
+    # and a plain (non-dry-run) rescan with no atlas is the same: nothing to do, nothing created
+    out2 = CliRunner().invoke(rescan, ["--atlas", str(missing)])
+    assert out2.exit_code == 0, out2.output
+    assert not missing.exists()
+
+
 def test_naming_an_unknown_run_is_an_error_not_an_empty_success(tmp_path: Path) -> None:
     """Asking to rescan a run that is not there must not report "nothing to rescan" — that reads
     as "you are already up to date" when in fact the request was never understood.

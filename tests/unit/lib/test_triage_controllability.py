@@ -726,10 +726,17 @@ def _stack_buf_multi(sink: str, writers: list) -> dict:  # type: ignore[type-arg
     }
 
 
-def test_dominating_const_beats_nondominating_controllable_is_const(tmp_path: Path) -> None:
-    # The flt_rule_t core: a DOMINATING const writer + a NON-dominating writer carrying a
-    # web-settable key that the extractor shows never reaching the sink (overwritten on every path)
-    # -> const, NOT controllable. The non-dominating key flows to a different sink.
+def test_a_may_reach_sink_false_mark_does_not_drop_a_nondominating_writer(tmp_path: Path) -> None:
+    """A DOMINATING const writer + a NON-dominating writer carrying a web-settable key, the latter
+    stamped ``may_reach_sink: false`` by the extractor. That mark is NOT trusted on the read side:
+    the extractor emits it only for a DOMINATING writer, its overwrite analysis miscounts appends
+    and partial copies, and the conservative reading keeps every non-dominating writer regardless.
+    So the non-dominating controllable writer is still weighed and the command is NOT called
+    constant — '?' (could-not-prove-constant), never a confident 'constant'.
+
+    MUTATION (verified RED): restore the ``and w.get("may_reach_sink") is not False`` condition in
+    ``_other_reaching_writers`` -> the writer is dropped, the reading collapses to 'constant', and
+    this assertion fails (a real controllable writer silently erased by an unreliable mark)."""
     conn = _atlas(tmp_path)
     p = _pattern(conn, "fp_case3", sink_class="cmd")
     prov = _stack_buf_multi(
@@ -738,13 +745,13 @@ def test_dominating_const_beats_nondominating_controllable_is_const(tmp_path: Pa
             _writer("fixed cmd %s", [_const_va()], dominates=True),  # dominating: all const
             _writer(
                 "SELECT %s", [_getter_vararg("rpt_comment")], dominates=False, reaches=False
-            ),  # web key, non-dom, never reaching
+            ),  # web key, non-dom, stamped may_reach_sink:false — kept anyway
         ],
     )
     ref = _inst(conn, p, sink_anchor="system", flow_evidence=prov, source_kind="unknown")
     conn.close()
     c = _find(triage(open_atlas(tmp_path / "atlas.db")), ref)
-    assert _ctrl(c) == "constant"  # only the dominating (const) writer decided the sink
+    assert _ctrl(c) == "unknown"  # not 'constant': the kept web-key writer blocks the const verdict
 
 
 def test_a_non_dominating_writer_that_may_reach_the_sink_blocks_constant(tmp_path: Path) -> None:
@@ -1888,18 +1895,18 @@ def test_cmd_controllable_needs_a_web_settable_key_not_a_percent_s(tmp_path: Pat
 
 
 def test_cmd_form2_dominating_writer(tmp_path: Path) -> None:
-    """Only the writer that reaches the wrapper argument on every path decides the reading.
+    """The dominance filter keeps a non-dominating web-settable writer from PROMOTING this sink, but
+    the conservative reading still keeps it from being called CONSTANT.
 
     A function that builds several buffers has several snprintf calls, and the recovered record
-    carries them all. Judging the ones that do not reach THIS call reads templates belonging to a
-    different sink — here a web-settable key filled into a buffer that never reaches the wrapper.
+    carries them all. The dominating writer (``/bin/true``) is the only one that PROMOTES, so the
+    unrelated web-settable buffer never makes this read 'controllable'. But whether that buffer
+    reaches this sink is not provable from the record — the extractor's ``may_reach_sink`` mark is
+    not trusted on the read side — so keeping it conservatively blocks a confident 'constant': the
+    reading is '?' (could not prove constant), never a false 'constant' and never 'controllable'.
 
-    ★ Note the direction this can fail in: including extra writers can only make a reading MORE
-    alarming, never less (any controllable writer wins), so the risk is a false positive on a
-    genuinely constant command, which is what this pins.
-
-    MUTATION (must go RED): drop the dominance filter in _judged_writers (judge all writers) ->
-    the unrelated web-settable buffer drags this off constant."""
+    MUTATION (verified RED): drop the dominance filter in _judged_writers (judge all writers) ->
+    the web-settable buffer is PROMOTED and the reading becomes 'controllable', not 'unknown'."""
     conn = _atlas(tmp_path)
     try:
         pid = _pattern(conn, "fp_ccmd_dom")
@@ -1907,8 +1914,9 @@ def test_cmd_form2_dominating_writer(tmp_path: Path) -> None:
             "kind": "stack_buf",
             "nearest_dominating_writer": "snprintf@0x20",
             "writers": [
-                # a DIFFERENT buffer in the same function, filled from a web-settable key. It never
-                # reaches this wrapper call, so it must not decide this reading.
+                # a DIFFERENT buffer in the same function, filled from a web-settable key. It is
+                # non-dominating, so it never PROMOTES this sink; kept conservatively, it still
+                # blocks the constant verdict (its reach cannot be proven from the record).
                 _cmd_writer(
                     "/sbin/route add %s",
                     [_getter_vararg("rpt_comment")],
@@ -1929,8 +1937,9 @@ def test_cmd_form2_dominating_writer(tmp_path: Path) -> None:
                 "sink_arg_provenance": [_wrapper_record("system", prov)],
             },
         )
-        # judged on the dominating writer alone, this command IS the constant it is built from
-        assert _dim_of(conn, ref) == ("proven", "constant")
+        # the dominating writer blocks promotion (not 'controllable'); the kept non-dominating
+        # web-key writer blocks the constant verdict -> '?', the honest conservative reading.
+        assert _dim_of(conn, ref) == ("unknown", "unknown")
     finally:
         conn.close()
 
@@ -2622,3 +2631,65 @@ def test_candidate_threads_callsite_addr_end_to_end(tmp_path: Path) -> None:
     assert cb.dim("writer").value == "not_traced"
     # function-level ref keeps the pre-fix borrowing (writer located off the constant sibling)
     assert cfn.dim("writer").value == "located"
+
+
+# ── a detector that errored on the function marks its layer '?', never a confident empty ──
+
+
+def _ev_with_errors(prov: dict[str, object], errors: list[str]) -> dict[str, object]:
+    """A stack_buf flow_evidence plus the detector_errors list the hunt would flatten in."""
+    return {**prov, "detector_errors": errors}
+
+
+def test_an_errored_sink_provenance_detector_marks_controllability_unknown(tmp_path: Path) -> None:
+    """When the sink-provenance detector THREW on the function, the empty value it stored must not
+    read as a confident 'constant'. The controllability layer is forced to '?' (could not check),
+    while an identical candidate with no detector error keeps its confident reading.
+
+    MUTATION (verified RED): drop the _mark_errored_dimensions call at the end of _build_dimensions
+    (or empty _DETECTOR_DIMENSIONS) -> the errored candidate also reads 'constant', so the two rows
+    below no longer differ and the '?' assertion fails."""
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp_det", sink_class="cmd")
+    prov = _stack_buf_multi("system", [_writer("fixed cmd %s", [_const_va()], dominates=True)])
+    clean = _inst(conn, p, sink_anchor="system", flow_evidence=prov, source_kind="unknown")
+    errored = _inst(
+        conn,
+        p,
+        sink_anchor="system",
+        flow_evidence=_ev_with_errors(prov, ["sink_provenance"]),
+        source_kind="unknown",
+    )
+    conn.close()
+    cands = triage(open_atlas(tmp_path / "atlas.db"))
+    c_clean = _find(cands, clean)
+    c_err = _find(cands, errored)
+    # the base reading really is confident (so the override is what changes it, not a weak fixture)
+    assert c_clean.dim("controllability").value == "constant"
+    assert c_clean.dim("controllability").state != "unknown"
+    # the errored candidate is forced to '?' with a note that names the cause
+    assert c_err.dim("controllability").value == "unknown"
+    assert c_err.dim("controllability").state == "unknown"
+    assert "errored" in c_err.dim("controllability").note
+
+
+def test_an_errored_detector_only_marks_the_layer_it_feeds(tmp_path: Path) -> None:
+    """A detector error touches only its mapped layer. A detector that feeds no triage layer
+    ('listing', disassembly-only) leaves every layer alone — the controllability reading stays
+    confident, so the mark is scoped, never a blanket downgrade.
+
+    MUTATION (verified RED): map 'listing' to a layer in _DETECTOR_DIMENSIONS -> controllability
+    goes '?' here and the 'constant' assertion fails."""
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp_det2", sink_class="cmd")
+    prov = _stack_buf_multi("system", [_writer("fixed cmd %s", [_const_va()], dominates=True)])
+    ref = _inst(
+        conn,
+        p,
+        sink_anchor="system",
+        flow_evidence=_ev_with_errors(prov, ["listing"]),
+        source_kind="unknown",
+    )
+    conn.close()
+    c = _find(triage(open_atlas(tmp_path / "atlas.db")), ref)
+    assert c.dim("controllability").value == "constant"  # unmapped detector left it alone

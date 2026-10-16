@@ -18,6 +18,8 @@ from __future__ import annotations
 import signal
 from types import FrameType
 
+import click
+
 _HANDLED: tuple[int, ...] = tuple(
     s for s in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGHUP", None)) if s is not None
 )
@@ -57,3 +59,29 @@ def interrupt_exit_code() -> int:
 def is_interrupt_exit(code: object) -> bool:
     """Whether a ``SystemExit`` code is one of the interrupt exits above."""
     return code in _INTERRUPT_EXITS
+
+
+class InterruptCommand(click.Command):
+    """A click command that exits 128 + signal on an interrupt, like the scan/hunt commands do by
+    hand. Without it click's default turns a Ctrl-C (or a SIGTERM/SIGHUP routed to one) into an
+    ``Abort`` that exits 1 — indistinguishable from an ordinary error for a read command that has
+    no other cleanup to run. ``invoke`` is where the callback runs, so catching here covers the
+    whole command body."""
+
+    def invoke(self, ctx: click.Context) -> object:
+        try:
+            return super().invoke(ctx)
+        except KeyboardInterrupt:
+            raise SystemExit(interrupt_exit_code()) from None
+
+
+class InterruptGroup(click.Group):
+    """The same, for a command GROUP: a KeyboardInterrupt raised inside any subcommand propagates
+    through the group's ``invoke`` and becomes the 128 + signal exit, so every subcommand of the
+    group follows the interrupt contract without repeating the handler on each one."""
+
+    def invoke(self, ctx: click.Context) -> object:
+        try:
+            return super().invoke(ctx)
+        except KeyboardInterrupt:
+            raise SystemExit(interrupt_exit_code()) from None

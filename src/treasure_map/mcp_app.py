@@ -2,13 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Treasure Map MCP server — exposes the trustworthy fact substrate to an AI client.
 
-This is the AI-facing surface of the analysis knowledge base. It is NOT an arbitrary
-disassembly proxy: its value is the full, cross-artifact, deterministically re-derivable
-structure (pseudocode / xrefs / callees / strings / imports-exports / cross-artifact script
-call sites / raw data bytes / disassembly) plus the derived, evidence-backed review-ordering
-signals — so an AI can chase a lead across an entire firmware faster, more completely, and
-reproducibly, and make
-the judgement itself.
+This is the read surface an AI client reads the analysis knowledge base through. It serves the
+full, cross-artifact, deterministically re-derivable structure (pseudocode / xrefs / callees /
+strings / imports-exports / cross-artifact script call sites / raw data bytes / disassembly) plus
+the derived, evidence-backed review-ordering signals, so a lead can be chased across an entire
+firmware quickly and reproducibly. Every tool returns evidence and draws no conclusion of its own.
 
 The server is a THIN wrapper: every tool delegates to ``treasure_map.lib`` (facts + query), the
 same layer the CLI uses — neither side re-implements a query. Two output contracts hold on every
@@ -1090,6 +1088,13 @@ def make_tools(
             scoped_refusal = _refuse_stale_run(atlas, run_id)
             if scoped_refusal is not None:
                 return scoped_refusal
+            # A misspelled run_id is a HARD error naming the available runs, never an empty map
+            # labelled resolved_run='<typo>'. The stale gate above leaves an unknown run alone
+            # (staleness cannot be proven for a run that is not there), so it is caught here.
+            if _get_run(atlas, run_id) is None:
+                return _error(
+                    atlas, f"run '{run_id}' is not in this atlas — pick one from runs_in_atlas."
+                )
             # run_id scopes the listing to one firmware. There is NO ambient 'current run'
             # fallback — the old current_run_id binding (which could silently isolate to the wrong
             # scan) is gone; each row carries its own ``run``.
@@ -1446,8 +1451,8 @@ def make_tools(
         ordering (``dominates_sink`` + ``nearest_dominating_writer``), each writer's format string
         and vararg sources, getter ``const_args``, or an honest ``unresolved``. Writers come
         dominating-first (those on every path lead; the rest follow, and a later conditional one
-        can still reach the sink — ``may_reach_sink`` says so where the extractor knows) with each
-        writer's varargs trimmed to what its format string actually consumes; pass
+        can still reach the sink, so every non-dominating writer is kept — none is assumed away)
+        with each writer's varargs trimmed to what its format string actually consumes; pass
         ``dominating_only`` to return only the dominating writers. A surfaced Ghidra def-use FACT of
         where a sink argument's value comes from — never a verdict, and an unreachable origin is
         stated (``resolved: false``/``indirect_unresolved``), never dropped.
@@ -2840,6 +2845,13 @@ def make_tools(
                 refusal = _refuse_stale_pair(atlas, run_id)
             else:
                 refusal = _refuse_stale_run(atlas, run_id)
+                # A misspelled run_id is a hard error naming the available runs, not a silent empty
+                # list. The stale gate leaves an unknown run alone, so it is caught here. (The pair
+                # form carries two run ids and its own shape, so it is left to _refuse_stale_pair.)
+                if refusal is None and run_id is not None and _get_run(atlas, run_id) is None:
+                    return _error(
+                        atlas, f"run '{run_id}' is not in this atlas — pick one from runs_in_atlas."
+                    )
             if refusal is not None:
                 return refusal
             return _list_overlays(atlas, verdict=verdict, run_id=run_id, anchor_kind=anchor_kind)
@@ -2879,6 +2891,7 @@ def make_tools(
                 evidence_ref=evidence_ref,
                 anchor_ref=anchor_ref,
                 anchor_kind=anchor_kind,
+                clear_all=clear_all,
             )
         except ConfigError as exc:
             return {"cleared": 0, "error": str(exc)}
@@ -2963,11 +2976,14 @@ WRITE_TOOLS = frozenset({"annotate", "annotate_diff", "promote", "clear_overlay"
 
 def tool_annotations(name: str) -> ToolAnnotations:
     """How a client may treat tool ``name``: every tool reads a local database only (closed
-    world); the four overlay writers are not read-only, and clear_overlay deletes."""
+    world); the four overlay writers are not read-only, and all four are DESTRUCTIVE updates, not
+    additive ones. annotate / annotate_diff / promote overwrite the one existing judgement on an
+    anchor (last write wins, replacing the prior one), and clear_overlay deletes — none of them
+    only adds, so a client is told to confirm before any of them runs."""
     if name in WRITE_TOOLS:
         return ToolAnnotations(
             readOnlyHint=False,
-            destructiveHint=name == "clear_overlay",
+            destructiveHint=True,
             idempotentHint=False,
             openWorldHint=False,
         )

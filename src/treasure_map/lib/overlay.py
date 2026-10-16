@@ -649,19 +649,25 @@ def clear_overlay(
     evidence_ref: str | None = None,
     anchor_ref: str | None = None,
     anchor_kind: str = "evidence_ref",
+    clear_all: bool = False,
     commit: bool = True,
 ) -> int:
     """Delete annotations of one ``anchor_kind`` and return how many rows went. The base map is
     untouched either way, so it reads byte-identical afterward — this is scratch space a consumer
     owns and may clear.
 
-    With no scope this wipes every annotation of that kind — every candidate annotation by default,
-    which is the original behaviour; the diff-entry annotations are a separate kind and are cleared
-    only when asked for by name. Pass ONE scope to clear less: ``run_id`` drops one firmware's
-    annotations (for ``diff_subject``, one run pair's, written ``{run_a}::{run_b}``), ``anchor_ref``
-    the single annotation on one anchor, and ``evidence_ref`` is that same scope under the name a
-    candidate annotation has always used. Keeping a layer that stores conclusions tidy means
-    retiring individual entries, not starting over, so the narrow forms are the ones to reach for.
+    Pass ONE scope: ``run_id`` drops one firmware's annotations (for ``diff_subject``, one run
+    pair's, written ``{run_a}::{run_b}``), ``anchor_ref`` the single annotation on one anchor, and
+    ``evidence_ref`` is that same scope under the name a candidate annotation has always used.
+    Keeping a layer that stores conclusions tidy means retiring individual entries, not starting
+    over, so the narrow forms are the ones to reach for.
+
+    ★ With NO scope nothing is deleted unless ``clear_all=True`` is passed explicitly: the whole-
+    table wipe is a destructive act a consumer must ask for by name, never the default of a call
+    that simply forgot its scope. ``clear_all`` wipes every annotation of that kind (candidate
+    annotations by default; the diff-entry annotations are a separate kind, cleared only when asked
+    for by name). The guard lives here, not only in the MCP layer, so a library caller cannot wipe
+    the table by accident either.
 
     The scopes are mutually exclusive: accepting two would have to invent a meaning for their
     combination, and guessing wrong here deletes the consumer's own work."""
@@ -669,6 +675,11 @@ def clear_overlay(
     if sum(s is not None for s in (run_id, evidence_ref, anchor_ref)) > 1:
         raise ConfigError(
             "clear_overlay takes at most one scope: run_id OR evidence_ref OR anchor_ref, never two"
+        )
+    if run_id is None and evidence_ref is None and anchor_ref is None and not clear_all:
+        raise ConfigError(
+            "clear_overlay with no scope would wipe every annotation: pass a scope (run_id / "
+            "evidence_ref / anchor_ref), or clear_all=True to delete them all on purpose"
         )
     if evidence_ref is not None and anchor_kind != "evidence_ref":
         raise ConfigError("evidence_ref names a candidate annotation; use anchor_ref for this kind")

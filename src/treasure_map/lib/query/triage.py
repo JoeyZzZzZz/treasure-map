@@ -615,15 +615,19 @@ def _other_reaching_writers(prov: dict[str, Any]) -> list[dict[str, Any]]:
     Setting a non-dominating writer aside is right for PROMOTING (a branch's controllable value may
     go to a different sink), and wrong for calling the argument CONSTANT: a writer after the
     dominating one, on some path to the sink — ``snprintf(buf, "tar %s", const); if (x)
-    strlcat(buf, v); system(buf);`` — changes what the sink runs. Only a writer the extractor
-    marks ``may_reach_sink: false`` (overwritten on every path before the sink) is left out; one
-    without the mark is kept, the conservative reading."""
+    strlcat(buf, v); system(buf);`` — changes what the sink runs. EVERY non-dominating writer is
+    kept here, the fully conservative reading: calling the argument constant then requires every one
+    of them to be constant too.
+
+    No writer is dropped on a ``may_reach_sink: false`` mark. That mark is emitted only for a
+    DOMINATING writer provably overwritten before the sink (a later same-block full overwrite), and
+    a dominating writer is never in this set — so the mark could never drop anything here, and its
+    value is not conservative evidence to lean on anyway: the overwrite analysis counts an append
+    (strlcat / __strncat_chk), a partial copy that leaves no terminating NUL, and a call that only
+    reads the buffer as a full rewrite, so a ``false`` from it can be wrong. Keeping every
+    non-dominating writer never hides a controllable one."""
     judged = _judged_writers(prov)
-    return [
-        w
-        for w in (prov.get("writers") or [])
-        if isinstance(w, dict) and w not in judged and w.get("may_reach_sink") is not False
-    ]
+    return [w for w in (prov.get("writers") or []) if isinstance(w, dict) and w not in judged]
 
 
 def _record_class(conn: sqlite3.Connection, rec: dict[str, Any]) -> str:
@@ -1056,6 +1060,16 @@ def _trim_writer_varargs(writer: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _strip_writer_internal(writer: dict[str, Any]) -> dict[str, Any]:
+    """Drop keys that must not reach the agent. ``may_reach_sink`` is stripped: the reading no
+    longer consults it (``_other_reaching_writers`` keeps every non-dominating writer), and its
+    ``false`` can be wrong (an append or partial copy miscounted as a full overwrite), so surfacing
+    it would show a false "may_reach_sink: false" claim for a writer that is in fact kept."""
+    if "may_reach_sink" not in writer:
+        return writer
+    return {k: v for k, v in writer.items() if k != "may_reach_sink"}
+
+
 def _present_provenance(prov: dict[str, Any], *, dominating_only: bool) -> dict[str, Any]:
     """Read-side presentation of a stack_buf provenance: dominating writers first (so the agent
     reads the ones on every path first, before the rest), fmt-arity vararg trim applied, and
@@ -1063,7 +1077,10 @@ def _present_provenance(prov: dict[str, Any], *, dominating_only: bool) -> dict[
     writers = prov.get("writers")
     if not isinstance(writers, list):
         return prov
-    trimmed = [_trim_writer_varargs(w) if isinstance(w, dict) else w for w in writers]
+    trimmed = [
+        _strip_writer_internal(_trim_writer_varargs(w)) if isinstance(w, dict) else w
+        for w in writers
+    ]
     dom = [w for w in trimmed if isinstance(w, dict) and w.get("dominates_sink")]
     non = [w for w in trimmed if not (isinstance(w, dict) and w.get("dominates_sink"))]
     out = dict(prov)
@@ -2438,6 +2455,59 @@ def _dim_source(source_class: str, source_kind: str) -> Dimension:
     )
 
 
+# Which dimension layer each additive detector feeds, so a detector that THREW on the function
+# forces its layer to '?' rather than letting the empty value it returned read as a confident
+# "checked, found none". Keyed by the extractor's detector name (see the analysis detector_errors
+# list); a name not listed here has no mapped layer and marks nothing. 'listing' feeds
+# get_disassembly only (no triage layer), so it is intentionally absent.
+_DETECTOR_DIMENSIONS: dict[str, tuple[str, ...]] = {
+    "sink_provenance": ("controllability",),
+    "nvram_ops": ("source_writability",),
+    "string_keyed_edges": ("reachability",),
+    "address_taken": ("reachability",),
+    "body_ranges": ("reachability",),
+}
+
+
+def _errored_detectors(flow_evidence: Mapping[str, Any] | None) -> frozenset[str]:
+    """The additive detectors that threw on this candidate's function, from the flow_evidence
+    ``detector_errors`` list. Empty when the evidence carries none (the current, pre-flatten case),
+    is not a list, or is absent — the honest default is "none recorded", not a fabricated error."""
+    errs = flow_evidence.get("detector_errors") if flow_evidence is not None else None
+    if not isinstance(errs, list):
+        return frozenset()
+    return frozenset(str(e) for e in errs)
+
+
+# Said on a layer whose feeding detector raised: its empty reading is a could-not-check, not proof.
+_DETECTOR_ERROR_DIM_NOTE = (
+    "a detector feeding this layer errored on this function, so its reading is '?' (could not "
+    "check), NEVER a confident empty — re-scan to retry it"
+)
+
+
+def _mark_errored_dimensions(
+    dims: tuple[Dimension, ...], errored: frozenset[str]
+) -> tuple[Dimension, ...]:
+    """Force each layer whose feeding detector threw to an honest '?' (unknown), never a confident
+    empty. A '?' never sinks (the demotion iron law), so this only makes a layer MORE visible — it
+    can never bury a lead. A no-op when no mapped detector errored (the current case: nothing flows
+    the detector_errors list into the atlas yet)."""
+    if not errored:
+        return dims
+    affected = {dim for det in errored for dim in _DETECTOR_DIMENSIONS.get(det, ())}
+    if not affected:
+        return dims
+    out: list[Dimension] = []
+    for d in dims:
+        if d.name in affected and d.state != "unknown":
+            note = f"{d.note} — {_DETECTOR_ERROR_DIM_NOTE}" if d.note else _DETECTOR_ERROR_DIM_NOTE
+            out.append(Dimension(d.name, "unknown", "unknown", d.source, note, d.evidence))
+        else:
+            out.append(d)
+    return tuple(out)
+
+
 def _build_dimensions(
     conn: sqlite3.Connection,
     *,
@@ -2458,10 +2528,13 @@ def _build_dimensions(
     up once when the source resolved to an nvram key (shared by source_writability); the
     controllability layer runs the single verdict over the anchored sink's def-use provenance. The
     orthogonal ``source`` layer consumes the coarse ``source_class`` and is INDEPENDENT of the
-    controllability verdict (never a certainty-chain step)."""
+    controllability verdict (never a certainty-chain step).
+
+    A layer whose feeding additive detector THREW on this function is then forced to '?' (see
+    ``_mark_errored_dimensions``), so a detector crash is never read as a clean empty."""
     flow_evidence = _as_evidence(flow_evidence)  # parsed once for every layer
     web_settable = _web_settable(conn, nvram_key) if nvram_key else None
-    return (
+    dims = (
         _dim_controllability(
             conn,
             flow_evidence=flow_evidence,
@@ -2479,6 +2552,7 @@ def _build_dimensions(
         _dim_writer(flow_evidence, sink_anchor, callsite_addr=callsite_addr),
         _dim_completeness(),
     )
+    return _mark_errored_dimensions(dims, _errored_detectors(flow_evidence))
 
 
 def _candidate(

@@ -454,6 +454,25 @@ def test_list_candidates_carries_fingerprint_and_incomplete_field(tmp_path: Path
     assert tools["list_candidates"](run_id="run_m", fingerprint="no_such_fp")["total"] == 0
 
 
+def test_a_misspelled_run_id_is_an_error_not_an_empty_map(tmp_path: Path) -> None:
+    """list_candidates / list_overlays with a run_id the atlas does not hold must be a hard error
+    that names the runs that DO exist, never an empty map labelled resolved_run='<typo>' (which
+    reads as "this run has no candidates", so a typo looks like a clean scan).
+
+    MUTATION (verified RED): drop the run-existence check added after the stale gate -> the typo
+    comes back with total:0 / resolved_run:'nope' and no error, and this assertion fails."""
+    tools = _tools(tmp_path)
+    out = tools["list_candidates"](run_id="nope")
+    assert "error" in out and "not in this atlas" in out["error"]
+    assert "run_m" in out["runs_in_atlas"]
+    # the valid run still answers normally (the check does not refuse a real run)
+    assert "error" not in tools["list_candidates"](run_id="run_m")
+
+    ov = tools["list_overlays"](run_id="nope")
+    assert "error" in ov and "not in this atlas" in ov["error"]
+    assert "run_m" in ov["runs_in_atlas"]
+
+
 def test_per_scan_completeness_rides_scoped_list_not_cross_run_views(tmp_path: Path) -> None:
     # The analysis-completeness red-line is a per-SCAN fact — it now rides list_candidates(run_id=…)
     # (which resolves ONE run's analysis.db), NOT the cross-run aggregations (there is no single
@@ -1247,18 +1266,20 @@ def test_a_clean_candidate_carries_no_anchor_key(tmp_path: Path) -> None:
 
 
 def test_every_tool_says_whether_it_writes(tmp_path: Path) -> None:
-    """The overlay writers are marked as such and clear_overlay as destructive; every other tool
-    is read-only. A client can then ask before a write that a firmware string talked it into.
+    """The overlay writers are marked not-read-only, and ALL of them destructive: annotate /
+    annotate_diff / promote overwrite the prior judgement on an anchor (last write wins, not an
+    additive insert) and clear_overlay deletes. Every other tool is read-only. A client can then
+    ask before any write that a firmware string talked it into.
 
-    MUTATION: register the tools without annotations, or mark clear_overlay non-destructive ->
-    RED."""
+    MUTATION: register the tools without annotations, or mark any overlay writer non-destructive ->
+    RED (an overwrite flagged as a purely additive write understates what the call does)."""
     _mk_analysis(tmp_path)
     server = mcp_app.build_server(_mk_atlas(tmp_path))
     tools = {t.name: t.annotations for t in asyncio.run(server.list_tools())}
     writers = {n for n, a in tools.items() if a is None or a.readOnlyHint is not True}
     assert writers == {"annotate", "annotate_diff", "promote", "clear_overlay"}
-    assert tools["clear_overlay"].destructiveHint is True
-    assert tools["annotate"].destructiveHint is False
+    for w in writers:
+        assert tools[w].destructiveHint is True, w
 
 
 def test_a_misspelled_lens_parameter_is_refused_not_answered(tmp_path: Path) -> None:

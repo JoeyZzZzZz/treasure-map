@@ -17,7 +17,11 @@ from typing import TYPE_CHECKING, Any
 
 import click
 
-from treasure_map.cli.interrupts import interrupt_exit_code, is_interrupt_exit
+from treasure_map.cli.interrupts import (
+    InterruptCommand,
+    interrupt_exit_code,
+    is_interrupt_exit,
+)
 from treasure_map.lib.errors import ConfigError, TreasureMapError
 from treasure_map.lib.ro_db import ro_connect
 from treasure_map.version import UNKNOWN_VERSION, installed_commit
@@ -587,7 +591,9 @@ def _recheck_after_rescan(*, before: str, after: str, force: bool, resolved_atla
 
 
 @click.command(
-    "diff", short_help="Compare two firmware runs (all changed binaries, or one with --binary)"
+    "diff",
+    cls=InterruptCommand,
+    short_help="Compare two firmware runs (all changed binaries, or one with --binary)",
 )
 # Only so the positional form `tmap diff X Y` is refused with the command that replaces it, rather
 # than with click's "unexpected extra argument".
@@ -1492,7 +1498,11 @@ def runs(config: Path | None, atlas_path: Path | None, as_json: bool) -> None:
         click.echo("\n`tmap rescan` refreshes them.")
 
 
-@click.command("triage", short_help="Rank & show candidates only (scan's 3rd stage)")
+@click.command(
+    "triage",
+    cls=InterruptCommand,
+    short_help="Rank & show candidates only (scan's 3rd stage)",
+)
 @click.argument("run_id", required=False, default=None, shell_complete=_complete_run_id)
 @click.option(
     "--run",
@@ -1657,6 +1667,21 @@ def triage(
     # different code than is running is refused here too. Serving it from the CLI while the MCP
     # refused it gave two answers to one question — and a script reading --json could not tell.
     _refuse_stale_triage_run(resolved_atlas, selected_run)
+    # ★ A misspelled --run is a hard error naming the available runs, never an empty list at exit 0
+    # (which reads as "this run has no candidates"). The stale check above leaves an unknown run
+    # alone, so it is caught here against the same authority on which runs exist.
+    from treasure_map.lib.query import list_runs as _list_runs_for_check
+
+    conn = open_atlas(resolved_atlas)
+    try:
+        known_runs = [r.run_id for r in _list_runs_for_check(conn) if r.run_id]
+    finally:
+        conn.close()
+    if selected_run not in known_runs:
+        listed = ", ".join(known_runs) if known_runs else "none yet — run `tmap scan`"
+        raise click.ClickException(
+            f"no such run in this atlas: {selected_run}. Runs in this atlas: {listed}"
+        )
     # ★ print the current run's scan lineage (build / date / status) at the top — a stale scan
     # is otherwise silent, and this is exactly where a reader forgets an old build was scanned.
     if not as_json:
@@ -2502,6 +2527,14 @@ def rescan(
 
     cfg = load_config(config)
     resolved_atlas = atlas_path if atlas_path is not None else cfg.atlas.db_path
+    # ★ Do not CREATE the atlas just to read it. open_atlas builds the file and schema when it is
+    # absent, so under a fresh HOME a plain (or --dry-run) rescan would leave an empty atlas.db
+    # behind — a read/plan command writing state. With no atlas there are no runs to rescan, so
+    # say so and stop before anything is opened.
+    if not Path(resolved_atlas).exists():
+        click.echo(f"atlas: {resolved_atlas}")
+        click.echo("no atlas yet — nothing to rescan (run `tmap scan` to create one).")
+        return
     conn = open_atlas(resolved_atlas)
     try:
         all_runs = run_list_runs(conn)

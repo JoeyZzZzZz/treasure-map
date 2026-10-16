@@ -1212,7 +1212,8 @@ def test_diff_judgements_stay_out_of_the_candidate_layer(world: World) -> None:
     world.judge(DX, _pair_anchor(DX, "00001000", "00002000"), "changed_real")
     assert overlay.list_overlays(world.atlas)["count"] == 0
     assert coverage.load_coverage_index(world.atlas).by_ref == {}
-    assert overlay.clear_overlay(world.atlas) == 0  # no scope: candidate annotations only
+    # no scope + clear_all: candidate (evidence_ref) annotations only, not the diff-entry kind
+    assert overlay.clear_overlay(world.atlas, clear_all=True) == 0
     assert overlay.list_overlays(world.atlas, anchor_kind="diff_subject")["count"] == 1
     assert overlay.clear_overlay(world.atlas, anchor_kind="diff_subject", run_id=PAIR) == 1
     with pytest.raises(ConfigError, match="anchor_kind"):
