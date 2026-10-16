@@ -46,7 +46,8 @@ def _handler(state: _State) -> type[http.server.BaseHTTPRequestHandler]:
         def log_message(self, *_a: object) -> None:
             return None
 
-        def do_GET(self) -> None:  # noqa: N802 -- the name http.server dispatches to
+        # do_GET is the handler name http.server dispatches to, so it cannot be snake_case.
+        def do_GET(self) -> None:  # noqa
             rng = self.headers.get("Range")
             state.ranges.append(rng)
             body = SMALL if state.mode == "small" else PAYLOAD
