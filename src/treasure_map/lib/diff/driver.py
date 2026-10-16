@@ -29,9 +29,11 @@ import logging
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import tempfile
+import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -717,30 +719,65 @@ def _tail(raw: bytes | None, n: int) -> str:
     return raw.decode("utf-8", "replace")[-n:] if raw else ""
 
 
+# Process groups of BinExport subprocesses that are running right now, so a sweep interrupted
+# from the main thread can take them all down at once instead of waiting each one out to its own
+# timeout. A worker thread adds its group while it runs and removes it when it returns; the lock
+# guards the set because the parallel full diff runs several at a time.
+_RUNNING_PGIDS: set[int] = set()
+_RUNNING_PGIDS_LOCK = threading.Lock()
+
+
+def _register_pgid(pgid: int) -> None:
+    with _RUNNING_PGIDS_LOCK:
+        _RUNNING_PGIDS.add(pgid)
+
+
+def _unregister_pgid(pgid: int) -> None:
+    with _RUNNING_PGIDS_LOCK:
+        _RUNNING_PGIDS.discard(pgid)
+
+
+def _kill_running_groups() -> None:
+    """SIGKILL every BinExport process group still running. Called when the sweep is interrupted:
+    the 4GB-heap JVMs die at once, instead of each being waited on until it hits its own timeout."""
+    with _RUNNING_PGIDS_LOCK:
+        pgids = list(_RUNNING_PGIDS)
+    for pgid in pgids:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
 def _run_killable(
     cmd: list[str], env: dict[str, str], timeout: int
 ) -> subprocess.CompletedProcess[bytes]:
-    """Run ``cmd`` in its OWN process group and, on timeout, kill the whole group.
+    """Run ``cmd`` in its OWN process group and, on timeout OR interrupt, kill the whole group.
 
     analyzeHeadless is a shell wrapper that starts the JVM WITHOUT exec, so ``subprocess.run``'s
     timeout kills only the wrapper and leaves a 4GB-heap JVM orphaned — the same leak the scan
     runner already guards against. A new session makes the child a group leader; SIGKILL to the
-    group (-pid) takes the JVM with it. Returns a CompletedProcess so the callers that read
-    stdout / stderr / returncode are unchanged; re-raises TimeoutExpired after the kill."""
-    import signal
-
+    group (-pid) takes the JVM with it. The group is registered while it runs so an interrupt
+    reaching another thread can reap it too (see ``_kill_running_groups``). Returns a
+    CompletedProcess so the callers that read stdout / stderr / returncode are unchanged;
+    re-raises whatever stopped it (TimeoutExpired, KeyboardInterrupt, …) after the kill."""
     proc = subprocess.Popen(  # noqa: S603 -- fixed argv, no shell
         cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True
     )
+    _register_pgid(proc.pid)  # pid == pgid (session leader)
     try:
         out, err = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
+    except BaseException:
+        # A timeout, or an interrupt delivered to this thread: take the JVM group down before
+        # propagating, so no 4GB-heap orphan survives this subprocess.
         try:
-            os.killpg(proc.pid, signal.SIGKILL)  # pid == pgid (session leader)
+            os.killpg(proc.pid, signal.SIGKILL)
         except OSError:
             pass
         proc.communicate()
         raise
+    finally:
+        _unregister_pgid(proc.pid)
     return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
 
@@ -1491,11 +1528,34 @@ def _persist_outcome(
             bindiff_vertex0_fallbacks=artifacts.bindiff_vertex0_fallbacks,
             toolchain=toolchain,
         )
-    except TreasureMapError as exc:
-        # _persist_success already recorded the failed row atomically; belt-and-braces rollback so
-        # no stray uncommitted state rides the next binary's commit.
-        atlas.rollback()
-        attempts, reason = _read_recorded_status(atlas, rd.diff_id)
+    except (TreasureMapError, sqlite3.Error) as exc:
+        # Isolate this one binary's persist failure so the sweep continues to the next. A
+        # TreasureMapError was already written as an atomic failed row inside _persist_success; a
+        # raw sqlite3.Error (e.g. "database is locked") can escape before that write, so record the
+        # failed row here too. Each step is best-effort: if the fault persists (the lock is still
+        # held), roll back and report the binary as failed without a recorded row rather than
+        # aborting the whole diff.
+        try:
+            atlas.rollback()
+        except sqlite3.Error:
+            pass
+        if isinstance(exc, sqlite3.Error):
+            try:
+                _record_diff_failure(
+                    atlas,
+                    diff_id=rd.diff_id,
+                    run_a_id=run_a_id,
+                    run_b_id=run_b_id,
+                    binary_short=rd.binary_short,
+                    exc=exc,
+                    toolchain=toolchain,
+                )
+            except sqlite3.Error:
+                pass
+        try:
+            attempts, reason = _read_recorded_status(atlas, rd.diff_id)
+        except sqlite3.Error:
+            attempts, reason = 0, "persist_error"
         return BinaryDiffOutcome(
             rd.binary,
             None,
@@ -1740,12 +1800,13 @@ def run_full_diff(
                 done += 1
                 on_outcome(done, total, oc)
         except KeyboardInterrupt:
-            # Ctrl-C: stop SCHEDULING more binaries. Discard the current in-flight (uncommitted)
+            # Ctrl-C (or SIGTERM/SIGHUP, which the CLI turns into this): stop the sweep NOW. First
+            # kill every in-flight BinExport group so the 4GB-heap JVMs die at once — without this
+            # the already-running subprocesses (<= workers) would each run to its own timeout while
+            # shutdown(wait=True) waits them out. Then discard the current in-flight (uncommitted)
             # persist — every COMPLETED binary already committed its own transaction, so a rollback
-            # drops at most the one mid-write. The finally then cancels the QUEUED computes; the
-            # already-running BinExport subprocesses (<= workers) cannot be killed from a pool
-            # thread, so they finish (bounded by the per-file timeout) before the process exits — a
-            # clean cancel of the SCHEDULE, not an instant kill.
+            # drops at most the one mid-write.
+            _kill_running_groups()
             cancelled = True
             atlas.rollback()
             logger.warning(

@@ -476,8 +476,14 @@ def hidden_region(
 # repeated lines of real code being what makes it slow) took 7.9s. So both matchers are bounded
 # by the product, and a function whose delta would exceed either bound is not_computed
 # (too_large) as a whole — a half-analysed delta would misstate its own kind.
-DELTA_LINE_PRODUCT_CAP = 25_000_000  # line pairs for the line-level match (about 3s at worst)
-DELTA_TOKEN_PRODUCT_CAP = 20_000_000  # token pairs inside any one changed block (about 1s)
+# Caps on the line-level and per-block token-level matches. Both run difflib's O(n*m)
+# get_opcodes, a single uninterruptible call, so the product is the only lever — a wall-clock
+# budget checked afterwards cannot preempt it. The worst-case time is strongly content- and
+# machine-dependent (duplicate-heavy bodies blow difflib's matching up), and the previous 25M
+# line cap was measured in the tens of seconds on a real firmware function, so both are kept
+# conservative rather than tied to a promised time.
+DELTA_LINE_PRODUCT_CAP = 5_000_000  # line pairs for the line-level match
+DELTA_TOKEN_PRODUCT_CAP = 5_000_000  # token pairs inside any one changed block
 _DELTA_FIRST = 5  # substitution pairs shown per token kind
 
 _TOK = re.compile(
