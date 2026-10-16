@@ -45,12 +45,12 @@
     "binexport": {
       "version": "11.4.3",
       "source_commit": "b56dea7b0a8baff0971466d422030c496464b6b6",
-      "lib_digest": "<filled from the binexport workflow output: lib digest>",
+      "lib_digest": "03395d021cc669778487df667a8d3d26b27d3b61a88514259932799fb526fdf7",
       "assets": {
         "*": {
           "url": "https://github.com/JoeyZzZzZz/treasure-map/releases/download/toolchain-binexport-11.4.3-b56dea7b0a8b/BinExport-ghidra_11.4.3-b56dea7b0a8b.zip",
-          "sha256": "<filled from the binexport workflow output: zip sha256>",
-          "size": 0,
+          "sha256": "36ba9c299aaa2835e8d6398be557b4333600004e6d5a31278bcc5b991ccc079b",
+          "size": 313318,
           "kind": "zip",
           "root": "BinExport"
         }

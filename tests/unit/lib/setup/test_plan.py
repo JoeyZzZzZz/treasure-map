@@ -274,8 +274,15 @@ def test_an_explicit_path_that_fails_is_not_replaced(home: Path, tmp_path: Path)
     assert good.exists()
 
 
-def test_unpublished_binexport_is_reported_not_skipped(home: Path) -> None:
-    """The shipped lock still carries the BinExport placeholder: init says so."""
+def test_published_binexport_is_a_real_install_step_not_flagged_unpublished(home: Path) -> None:
+    """Once the shipped lock pins a published BinExport, init treats it as a normal fetchable tool:
+    it is no longer flagged "not published yet" anywhere, and appears as a real "install BinExport"
+    step in the plan. Here it cannot complete because the offline fetcher refuses every download, so
+    it reports a fetch/earlier-failure reason — attempted and reported, never silently skipped.
+
+    MUTATION: blank binexport's sha256 / size / lib_digest back to a placeholder in the shipped lock
+    -> unavailable_reason returns "...not published yet" again, which reappears in needs_you and
+    replaces the "install BinExport" step, failing all three assertions."""
     g = fakes.make_ghidra(home / "tools" / "ghidra_11.4.3_PUBLIC")
     fakes.make_jdk(home / ".jdks" / "jdk21")
     lines: list[str] = []
@@ -289,8 +296,11 @@ def test_unpublished_binexport_is_reported_not_skipped(home: Path) -> None:
         tmap=None,
     )
     assert g.exists()
-    assert "unavailable: BinExport artifact not published yet" in result.needs_you
-    assert any("unavailable: BinExport artifact not published yet" in ln for ln in lines)
+    # the published artifact is no longer reported as unavailable, anywhere init speaks
+    assert not any("not published yet" in item for item in result.needs_you)
+    assert not any("not published yet" in ln for ln in lines)
+    # it is a real install step now, not an unpublished flag
+    assert any(item.startswith("install BinExport") for item in result.needs_you)
 
 
 # ── audit follow-ups ─────────────────────────────────────────────────────────────────────────
