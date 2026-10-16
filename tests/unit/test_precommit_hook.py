@@ -48,6 +48,15 @@ _FAKE_UC_MODEL = "Q" + "7310"
 # whitelisted by the example's negative lookahead.
 _TECH_SAFE_WORDS = ["md5", "sha256", "base64", "arm32", "ipv4", "crc32", "utf8", "int64"]
 
+# Lower-case model with a single trailing letter (a size/revision suffix). Assembled from halves
+# so the full token never appears literally in this committed source file.
+_FAKE_LC_MODEL_SUFFIX = _FAKE_LC_MODEL + "m"
+
+# Lint rule codes, an interpreter tag and key/cipher sizes of the letters+digits shape that the
+# generic lowercase regex must let through (all whitelisted by its negative lookahead), so they
+# are safe to spell out in this committed source file.
+_WHITELISTED_TECH = ["UP035", "TRY003", "py312", "ed25519", "aes256"]
+
 
 def _init_repo(tmp_path: Path, watchlist_lines: list[str] | None = None) -> tuple[Path, Path]:
     """Create a minimal git repo with the hook + a synthetic watchlist installed.
@@ -230,6 +239,47 @@ def test_hook_does_not_flag_technical_words(tmp_path: Path) -> None:
     assert result.returncode == 0, (
         f"technical words must not false-positive; stdout={result.stdout!r}"
     )
+
+
+def test_example_whitelists_lint_crypto_and_interpreter_tokens(tmp_path: Path) -> None:
+    """The generic lowercase regex must let lint rule codes (UP035, TRY003), an interpreter tag
+    (py312) and key/cipher sizes (ed25519, aes256) through, while STILL catching a real lowercase
+    model shape — so the exemption did not simply switch the regex off.
+
+    MUTATION: delete ``|ed25519`` from the example's negative-lookahead whitelist -> ed25519 is
+    flagged, the clean-tokens run returns non-zero -> RED (observed: 1 failed). MUTATION: delete
+    the whole lowercase regex line -> the model-shape run returns 0 -> RED (observed: 1 failed)."""
+    repo, _ = _init_repo(tmp_path)
+    example = repo / ".githooks" / "vendor-watchlist.example.txt"
+
+    clean = repo / "tech.md"
+    clean.write_text("rule codes " + " ".join(_WHITELISTED_TECH) + " are fine\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "tech.md"], check=True, capture_output=True)
+    result = _run_hook(repo, example)
+    assert result.returncode == 0, (
+        f"whitelisted technical tokens must not be flagged; stdout={result.stdout!r}"
+    )
+
+    subprocess.run(["git", "-C", str(repo), "reset"], check=True, capture_output=True)
+    model = repo / "model.md"
+    model.write_text(f"analysed device {_FAKE_LC_MODEL} firmware\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "model.md"], check=True, capture_output=True)
+    assert _run_hook(repo, example).returncode != 0, "a real model shape must still be caught"
+
+
+def test_example_catches_lowercase_model_with_trailing_letter(tmp_path: Path) -> None:
+    """A lowercase run-together model can carry a single trailing letter (a size/revision suffix);
+    that form slipped through because the digit run had to end at a word boundary.
+
+    MUTATION: drop the trailing ``[a-z]?`` from the example's lowercase regex -> the suffixed
+    model passes the hook -> RED (observed: 1 failed)."""
+    repo, _ = _init_repo(tmp_path)
+    example = repo / ".githooks" / "vendor-watchlist.example.txt"
+    bad = repo / "notes.md"
+    bad.write_text(f"tested on {_FAKE_LC_MODEL_SUFFIX} units\n", encoding="utf-8")
+    _git(repo, "add", "notes.md")
+    result = _run_hook(repo, example)
+    assert result.returncode != 0 and "COMMIT BLOCKED" in result.stdout, result.stdout
 
 
 def test_commit_msg_blocks_model_number(tmp_path: Path) -> None:
@@ -438,3 +488,41 @@ def test_ci_scans_merge_commit_messages(tmp_path: Path) -> None:
     head = _git(repo, "rev-parse", "HEAD")
     result = _run_ci(repo, example, base, head)
     assert result.returncode != 0 and "commit message" in result.stdout, result.stdout
+
+
+def test_ci_backstop_scans_a_renamed_file_whole(tmp_path: Path) -> None:
+    """A pure rename shows no added content over the range, so a model committed past the hook
+    could be moved to a new name unseen by CI. --no-renames makes CI diff the renamed file as a
+    fresh add and scan it whole.
+
+    MUTATION: drop --no-renames from ADDED_ALL in check-vendor-neutrality.sh -> git reports the
+    change as a rename (filtered out by --diff-filter=ACM), its content is not re-scanned -> RED
+    (observed: 1 failed)."""
+    repo, _ = _init_repo(tmp_path)
+    example = repo / ".githooks" / "vendor-watchlist.example.txt"
+    base = _commit(repo, "a.md", f"analysed device {_FAKE_LC_MODEL} firmware\n", "docs: add")
+    _git(repo, "mv", "a.md", "b.md")
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "--no-verify", "-m", "docs: rename"],
+        check=True,
+        capture_output=True,
+    )
+    head = _git(repo, "rev-parse", "HEAD")
+    result = _run_ci(repo, example, base, head)
+    assert result.returncode != 0 and "diff content" in result.stdout, result.stdout
+
+
+def test_ci_backstop_scans_a_file_name(tmp_path: Path) -> None:
+    """A model number in a FILE NAME is as public as one in content; CI scans the added paths too,
+    not only the added lines.
+
+    MUTATION: drop the staged-path scan (the ``$PATHS`` half of the scanned text) from
+    check-vendor-neutrality.sh -> the model in the name is not scanned, the clean content passes
+    -> RED (observed: 1 failed)."""
+    repo, _ = _init_repo(tmp_path)
+    example = repo / ".githooks" / "vendor-watchlist.example.txt"
+    base = _git(repo, "rev-parse", "HEAD")
+    name = f"{_FAKE_LC_MODEL}.md"
+    head = _commit(repo, name, "generic notes\n", "docs: add a note")
+    result = _run_ci(repo, example, base, head)
+    assert result.returncode != 0 and name in result.stdout, result.stdout

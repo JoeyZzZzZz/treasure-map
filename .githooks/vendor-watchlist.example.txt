@@ -24,11 +24,15 @@
 (?<![A-Za-z])(?!(?:SHA|MD|CRC|UTF|ISO|RFC|CVE)-)[A-Z]{2,4}-(?=[A-Z0-9]*[0-9])[A-Z0-9]{2,6}[LWHABM]?
 (?<![A-Za-z0-9_])(?!SC[0-9]{4}\b)[A-Z]{1,2}[0-9]{4,5}(?![A-Za-z0-9_])
 
-# Lower-case run-together model form: a short letter prefix immediately followed
-# by >=3 digits (e.g. an IoT camera model written all-lowercase, no hyphen). The
-# leading (?i) makes it case-insensitive; the negative lookahead whitelists common
+# Lower-case run-together model form: a >=2-letter prefix immediately followed by
+# >=3 digits and an optional single trailing letter (e.g. an IoT camera model
+# written all-lowercase, no hyphen, with or without a suffix letter). The leading
+# (?i) makes it case-insensitive; the negative lookahead whitelists common
 # technical tokens of the same shape (hashes, charsets, int/float widths, arch and
-# OS tags, lint rule codes, this project's own fn<id> refs and test placeholders) so they are
-# NOT flagged. >=3 digits is required so 2-digit tech words
-# (base64, arm32, crc32, int64, ...) never reach the regex at all.
-(?i)\b(?!(?:sha1|sha224|sha256|sha384|sha512|sha3|md4|md5|crc8|crc16|crc32|crc64|base32|base64|utf8|utf16|utf32|int8|int16|int32|int64|int128|uint8|uint16|uint32|uint64|float16|float32|float64|ipv4|ipv6|arm32|arm64|aarch64|x86|mips32|mips64|win32|win64|py311|fn[0-9]+|abc[0-9]+|foo(?:bar)?[0-9]+|aabb[0-9]+|secret[0-9]+|(?:sc|ble|arg|plr|plw|plc|ple|ruf|ann|fbt|ptc)[0-9]{3,4})\b)[a-z]{2,6}[0-9]{3,}\b
+# OS tags, interpreter tags like py3xx, key/curve/cipher sizes such as ed25519 /
+# aes256 / rsa2048, port numbers, lint rule codes, this project's own fn<id> refs
+# and test placeholders) so they are NOT flagged. >=3 digits is required so
+# 2-digit tech words (base64, arm32, crc32, int64, ...) never reach the regex at
+# all. A one-letter prefix or an underscore-joined form is left to the local list:
+# a generic one-letter lowercase rule would also match tokens like ed25519.
+(?i)\b(?!(?:sha1|sha224|sha256|sha384|sha512|sha3|md4|md5|crc8|crc16|crc32|crc64|base32|base64|utf8|utf16|utf32|int8|int16|int32|int64|int128|uint8|uint16|uint32|uint64|float16|float32|float64|ipv4|ipv6|arm32|arm64|aarch64|x86|mips32|mips64|win32|win64|py3[0-9]{2}|ed25519|curve25519|aes(?:128|192|256)|rsa(?:1024|2048|3072|4096)|poly1305|port[0-9]+|fn[0-9]+|abc[0-9]+|foo(?:bar)?[0-9]+|aabb[0-9]+|secret[0-9]+|(?:sc|up|try|sim|pth|ble|arg|plr|plw|plc|ple|ruf|ann|fbt|ptc)[0-9]{3,4})\b)[a-z]{2,6}[0-9]{3,}[a-z]?\b

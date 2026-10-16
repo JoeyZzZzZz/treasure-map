@@ -14,6 +14,10 @@ on:
 jobs:
   ci:
     uses: ./.github/workflows/ci.yml
+    # Pass the caller's secrets through: a reusable workflow gets none by default, so without
+    # this the release-time vendor-neutrality check would silently run on the brand-free example
+    # only, never the private watchlist held as the TM_VENDOR_WATCHLIST repository secret.
+    secrets: inherit
     permissions:
       contents: read
 
