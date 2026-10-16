@@ -32,9 +32,10 @@ class FuncRow:
     pseudocode: str | None
     pseudocode_hash: str | None
     callees: str | None
-    # D4 bridge transport (analysis.db functions; None on a pre-bridge / un-migrated DB). The hunt
-    # layer reads the per-callsite ref's ADDRESS offset from call_tokens and the out-of-body test
-    # from body_ranges; the diff layer ignores both. Defaulted so synthetic FuncRows stay valid.
+    # Call-token bridge transport (analysis.db functions; None on a pre-bridge / un-migrated DB).
+    # The hunt layer reads the per-callsite ref's ADDRESS offset from call_tokens and the
+    # out-of-body test from body_ranges; the diff layer ignores both. Defaulted so synthetic
+    # FuncRows stay valid.
     call_tokens: str | None = None
     body_ranges: str | None = None
 
@@ -61,7 +62,7 @@ def load_functions(db_path: Path | str) -> list[FuncRow]:
     conn = sqlite3.connect(uri, uri=True)
     try:
         conn.row_factory = sqlite3.Row
-        # The bridge columns may be absent on a DB built before D4 / not yet migrated (this opens
+        # The bridge columns may be absent on a DB built before them / not yet migrated (this opens
         # read-only, so it never migrates). Select them only when present, else NULL, so a stale
         # analysis.db still loads instead of raising "no such column".
         fcols = {r[1] for r in conn.execute("PRAGMA table_info(functions)")}

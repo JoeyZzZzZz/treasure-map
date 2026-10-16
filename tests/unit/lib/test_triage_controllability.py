@@ -2637,7 +2637,7 @@ def test_candidate_threads_callsite_addr_end_to_end(tmp_path: Path) -> None:
 
 
 def _ev_with_errors(prov: dict[str, object], errors: list[str]) -> dict[str, object]:
-    """A stack_buf flow_evidence plus the detector_errors list the hunt would flatten in."""
+    """A stack_buf flow_evidence plus the detector_errors list the hunt carries in."""
     return {**prov, "detector_errors": errors}
 
 
@@ -2693,3 +2693,73 @@ def test_an_errored_detector_only_marks_the_layer_it_feeds(tmp_path: Path) -> No
     conn.close()
     c = _find(triage(open_atlas(tmp_path / "atlas.db")), ref)
     assert c.dim("controllability").value == "constant"  # unmapped detector left it alone
+
+
+def test_an_errored_nvram_detector_marks_source_writability_unknown(tmp_path: Path) -> None:
+    """The nvram-ops detector feeds the source_writability layer. When it threw on the function,
+    a web-settable reading that would otherwise be proven reads '?', while an identical candidate
+    with no detector error keeps it. Controllability, which that detector does not feed, is left
+    alone on the errored candidate.
+
+    MUTATION (verified RED): delete the "nvram_ops" entry from _DETECTOR_DIMENSIONS -> the errored
+    candidate keeps the proven source_writability and the '?' assertion fails."""
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp_det_nv", sink_class="fmt_string")
+    prov = _stack_buf_prov("fprintf", [_getter_vararg("rpt_comment")])
+    clean = _inst(conn, p, sink_anchor="fprintf", flow_evidence=prov, source_kind="unknown")
+    errored = _inst(
+        conn,
+        p,
+        sink_anchor="fprintf",
+        flow_evidence=_ev_with_errors(prov, ["nvram_ops"]),
+        source_kind="unknown",
+    )
+    conn.close()
+    cands = triage(open_atlas(tmp_path / "atlas.db"))
+    c_clean = _find(cands, clean)
+    c_err = _find(cands, errored)
+    assert c_clean is not None and c_err is not None
+    # the base reading really is confident, so the mark is what changes it
+    assert c_clean.dim("source_writability").state == "proven"
+    assert c_err.dim("source_writability").state == "unknown"
+    assert c_err.dim("source_writability").value == "unknown"
+    assert "errored" in c_err.dim("source_writability").note
+    # scoped: the layer this detector does not feed keeps its reading
+    assert c_err.dim("controllability") == c_clean.dim("controllability")
+
+
+@pytest.mark.parametrize("detector", ["string_keyed_edges", "address_taken", "body_ranges"])
+def test_an_errored_reachability_detector_marks_reachability_unknown(
+    tmp_path: Path, detector: str
+) -> None:
+    """Each detector mapped to the reachability layer forces it to '?' when it threw on the
+    function: an entry reference that reads proven on a clean candidate reads '?' on the errored
+    twin, and the layers that detector does not feed keep their readings.
+
+    MUTATION (verified RED, one per case): delete that detector's entry from _DETECTOR_DIMENSIONS
+    -> its case keeps 'proven' reachability and the '?' assertion fails; the other two cases stay
+    green, so each entry is pinned by its own case."""
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, f"fp_det_{detector}", sink_class="cmd")
+    ev: dict[str, object] = {
+        **_stack_buf_multi("system", [_writer("fixed cmd %s", [_const_va()], dominates=True)]),
+        "entry_reach": {"sites": [{"kind": "script_call", "script": "/etc/init.d/rcS"}]},
+    }
+    clean = _inst(conn, p, sink_anchor="system", flow_evidence=ev, source_kind="unknown")
+    errored = _inst(
+        conn,
+        p,
+        sink_anchor="system",
+        flow_evidence=_ev_with_errors(ev, [detector]),
+        source_kind="unknown",
+    )
+    conn.close()
+    cands = triage(open_atlas(tmp_path / "atlas.db"))
+    c_clean = _find(cands, clean)
+    c_err = _find(cands, errored)
+    assert c_clean is not None and c_err is not None
+    assert c_clean.dim("reachability").state == "proven"
+    assert c_err.dim("reachability").state == "unknown"
+    assert c_err.dim("reachability").value == "unknown"
+    assert "errored" in c_err.dim("reachability").note
+    assert c_err.dim("controllability") == c_clean.dim("controllability")
