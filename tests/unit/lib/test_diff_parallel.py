@@ -12,6 +12,7 @@ resolves without a real located binary / toolchain.
 from __future__ import annotations
 
 import inspect
+import sqlite3
 import threading
 from pathlib import Path
 
@@ -353,6 +354,77 @@ def test_ctrl_c_cancels_queue_keeps_completed_marks_cancelled(
     ran = [f for f in pool.subs if f.ran]
     cancelled = [f for f in pool.subs if f.cancelled]
     assert len(ran) == 1 and len(cancelled) == 2  # 1 completed, 2 queued -> cancelled (not drained)
+
+
+def test_ctrl_c_kills_the_in_flight_binexport_groups(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ★ Ctrl-C mid-sweep must reap the running BinExport groups AT ONCE (so their 4GB-heap JVMs do
+    # not linger while shutdown(wait=True) waits each out to its own timeout), before the rollback.
+    # Reverse: dropping the _kill_running_groups() call in the handler leaves `killed` False.
+    atlas_path = _seed(tmp_path, {"a": "1", "b": "2"}, {"a": "1x", "b": "2x"})
+    monkeypatch.setattr(driver, "_check_toolchain", lambda config: None)
+    monkeypatch.setattr(driver, "preflight", _fake_preflight(tmp_path))
+    monkeypatch.setattr(
+        driver, "compute_diff", lambda so_a, so_b, td, config: driver.DiffArtifacts(so_a, so_b, td)
+    )
+    monkeypatch.setattr(driver, "_persist_success", _ok_persist)
+    killed = {"n": 0}
+    monkeypatch.setattr(driver, "_kill_running_groups", lambda: killed.__setitem__("n", 1))
+
+    def _mk_pool(max_workers):  # type: ignore[no-untyped-def]
+        return _FakePool(max_workers)
+
+    def _one_then_interrupt(fut_map):  # type: ignore[no-untyped-def]
+        yield next(iter(fut_map))
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(driver, "ThreadPoolExecutor", _mk_pool)
+    monkeypatch.setattr(driver, "as_completed", _one_then_interrupt)
+    con = open_atlas(atlas_path)
+    fsum = driver.run_full_diff(con, "run_a", "run_b", config=_cfg())
+    con.close()
+    assert fsum.cancelled is True
+    assert killed["n"] == 1  # the interrupt handler took the in-flight groups down
+
+
+def test_sqlite_error_in_persist_does_not_abort_the_sweep(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ★ a raw sqlite3.Error during ONE binary's persist (e.g. "database is locked") must be isolated
+    # to that binary — recorded as its own failed row — and the sweep must go on to the next, not
+    # propagate out of run_full_diff. Reverse: narrowing the persist catch back to TreasureMapError
+    # only lets the sqlite3.Error escape and abort the whole diff.
+    atlas_path = _seed(tmp_path, {"ok": "1", "boom": "2"}, {"ok": "1x", "boom": "2x"})
+    monkeypatch.setattr(driver, "_check_toolchain", lambda config: None)
+    monkeypatch.setattr(driver, "preflight", _fake_preflight(tmp_path))
+    monkeypatch.setattr(
+        driver, "compute_diff", lambda so_a, so_b, td, config: driver.DiffArtifacts(so_a, so_b, td)
+    )
+
+    def _persist(atlas, **kw):  # type: ignore[no-untyped-def]
+        if "boom" in kw["binary_short"]:
+            raise sqlite3.OperationalError("database is locked")
+        return _ok_persist(atlas, **kw)
+
+    monkeypatch.setattr(driver, "_persist_success", _persist)
+    con = open_atlas(atlas_path)
+    try:
+        fsum = driver.run_full_diff(con, "run_a", "run_b", config=_cfg())
+    except sqlite3.Error as exc:  # the regression: one locked write aborting the whole diff
+        pytest.fail(f"a persist sqlite error aborted the whole sweep: {exc}")
+    outcomes = {o.binary: o for o in fsum.outcomes}
+    con.close()
+    assert set(outcomes) == {"ok", "boom"}  # both binaries were processed; the sweep continued
+    assert outcomes["boom"].summary is None  # boom is a failure, not a success
+    boom = (
+        open_atlas(atlas_path)
+        .execute(
+            "SELECT diff_ok, diff_status FROM diff_meta WHERE diff_id=?", ("run_a::run_b::boom",)
+        )
+        .fetchone()
+    )
+    assert (boom[0], boom[1]) == (0, "failed")  # recorded as its own atomic failed row
 
 
 # ── diff-side memory budget is decoupled from the shared scan/init constant ─────────────
