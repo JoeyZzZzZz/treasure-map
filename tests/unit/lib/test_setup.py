@@ -31,7 +31,7 @@ _GHIDRA_PROMPT = "No Ghidra 11.4.3 found"
 
 def _make_ghidra_root(base: Path, name: str = "myghidra") -> Path:
     """A fake Ghidra 11.4.3 install root. The default name is NOT ghidra_*_PUBLIC, so discovery's
-    directory scan does not find it — only config, $GHIDRA_HOME, PATH or the prompt do."""
+    directory scan does not find it — only config, $GHIDRA_HOME, PATH or --ghidra do."""
     return fakes.make_ghidra(base / name)
 
 
@@ -331,40 +331,25 @@ def test_init_ghidra_autodetect_accepts_without_prompt(
     assert _ghidra_home(fake_home) == str(root)
 
 
-def test_init_ghidra_prompt_validates_and_writes(fake_home: Path) -> None:
-    root = _make_ghidra_root(fake_home)
-    answers = iter([str(fake_home / "nope"), str(root)])  # invalid, then valid
+def test_init_interactive_missing_toolchain_downloads_without_prompting(fake_home: Path) -> None:
+    """Interactive init no longer asks for a path per tool. A missing Ghidra/JDK/BinDiff is simply
+    downloaded — one "will download" notice stands in for the old per-tool prompts, and the single
+    Apply confirmation covers it. (The download itself fails here: the fixture is offline.)
 
-    def _prompt(msg: str) -> str:
-        return next(answers) if _GHIDRA_PROMPT in msg else ""
+    MUTATION: restore the per-component "Enter its path, or press Enter to download" prompt ->
+    _GHIDRA_PROMPT fires -> RED."""
+    asked: list[str] = []
+    said: list[str] = []
+    with patch(_FIND_HEADLESS, side_effect=GhidraNotFoundError("not found")):
+        run_init(
+            non_interactive=False,
+            prompt=lambda m: (asked.append(m), "")[1],
+            echo=said.append,
+        )
 
-    run_init(non_interactive=False, prompt=_prompt)
-
-    assert _ghidra_home(fake_home) == str(root)
-
-
-def test_init_ghidra_wrong_version_is_not_accepted(fake_home: Path) -> None:
-    """A Ghidra that is not exactly the pinned version is refused at the prompt as it is in
-    discovery."""
-    old = fakes.make_ghidra(fake_home / "old", version="11.4.2")
-
-    def _prompt(msg: str) -> str:
-        return str(old) if _GHIDRA_PROMPT in msg else ""
-
-    result = run_init(non_interactive=False, prompt=_prompt)
-
-    assert _ghidra_home(fake_home) is None
-    assert any("Ghidra" in n for n in result.needs_you)
-
-
-def test_init_ghidra_invalid_path_not_written(fake_home: Path) -> None:
-    def _prompt(msg: str) -> str:
-        # Always return a path that is no Ghidra.
-        return str(fake_home / "not-ghidra") if _GHIDRA_PROMPT in msg else ""
-
-    run_init(non_interactive=False, prompt=_prompt)
-
-    assert _ghidra_home(fake_home) is None  # bad path never written
+    assert not any(_GHIDRA_PROMPT in m for m in asked)  # never asks for a path
+    assert any("Not installed — will download" in m for m in said)  # ...but says it will
+    assert any("Ghidra 11.4.3" in m for m in said)
 
 
 def test_init_non_interactive_no_ghidra_leaves_unset(fake_home: Path) -> None:
@@ -384,10 +369,7 @@ def test_init_non_interactive_no_ghidra_leaves_unset(fake_home: Path) -> None:
 def test_init_ghidra_path_goes_to_config_not_env(fake_home: Path) -> None:
     root = _make_ghidra_root(fake_home)
 
-    def _prompt(msg: str) -> str:
-        return str(root) if _GHIDRA_PROMPT in msg else ""
-
-    run_init(non_interactive=False, prompt=_prompt)
+    run_init(non_interactive=True, prompt=_noop_prompt, ghidra=root)
 
     env_text = (fake_home / ".treasure-map" / ".env").read_text()
     assert "ghidra" not in env_text.lower()  # secrets file is untouched by the Ghidra step
@@ -413,7 +395,7 @@ def test_prompt_messages_carry_no_trailing_colon(fake_home: Path) -> None:
     _write_config(config_path, force=True)
     run_init(non_interactive=False, prompt=_capture)  # asks the workspace base too
 
-    assert any(_GHIDRA_PROMPT in m for m in captured)  # the toolchain prompts fired too
+    assert any("Workspace base" in m for m in captured)  # at least one prompt fired
     for msg in captured:
         assert not msg.rstrip().endswith(":"), f"message would double click's colon: {msg!r}"
 
@@ -649,17 +631,3 @@ def test_init_reads_a_relative_config_path_from_the_config_directory(
     assert err is None and cfg is not None
     assert cfg.ghidra.local.home == tm / "myghidra"
     assert raw == {"ghidra": {"local": {"home": "myghidra"}}}  # the file's own text is kept
-
-
-def test_a_relative_ghidra_typed_at_the_prompt_is_stored_absolute(
-    fake_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """MUTATION: keep the typed path relative -> config.yaml holds "g" -> RED."""
-    g = _make_ghidra_root(tmp_path, "g")
-    monkeypatch.chdir(tmp_path)
-
-    def _prompt(msg: str) -> str:
-        return "g" if _GHIDRA_PROMPT in msg else ""
-
-    run_init(non_interactive=False, prompt=_prompt)
-    assert _ghidra_home(fake_home) == str(g)

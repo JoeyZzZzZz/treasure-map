@@ -497,12 +497,24 @@ def test_force_keeps_the_atlas_names_each_reset_and_backs_up(home: Path, tmp_pat
         }
     )
     cfg.write_text(original)
-    lines: list[str] = []
+    # The terse Apply summary no longer spells out every reset; --dry-run's full plan still does.
+    dry_lines: list[str] = []
+    run_init(
+        force=True,
+        dry_run=True,
+        non_interactive=True,
+        prompt=lambda _m: "",
+        echo=dry_lines.append,
+        platform=fakes.linux(),
+        host=_host(home),
+        tmap=None,
+    )
+    assert any("reset ghidra.headless_timeout_seconds: 900 -> 300" in ln for ln in dry_lines)
+    assert cfg.read_text() == original  # dry run wrote nothing
     run_init(
         force=True,
         non_interactive=True,
         prompt=lambda _m: "",
-        echo=lines.append,
         platform=fakes.linux(),
         host=_host(home),
         tmap=None,
@@ -512,7 +524,6 @@ def test_force_keeps_the_atlas_names_each_reset_and_backs_up(home: Path, tmp_pat
     assert data["workspace_dir"] == str(tmp_path / "ws")
     backup = cfg.with_name("config.yaml.tmap.backup")
     assert backup.is_file() and backup.read_text() == original
-    assert any("reset ghidra.headless_timeout_seconds: 900 -> 300" in ln for ln in lines)
 
 
 def test_init_records_an_rc_it_created_and_not_one_that_existed(

@@ -4,10 +4,12 @@
 carrying it out.
 
 A plan is a list of actions, each naming its target and — for a download — the URL, size and
-sha256 it will be checked against. Things already in place are not listed, so a second run of an
-up-to-date setup plans nothing. Things tmap will NOT do for the user (a placeholder artifact, a
-BinExport of another version already loaded, an entry it does not own) are listed as needing
-the user, never dropped.
+sha256 it will be checked against. ``render`` prints that in full (what ``--dry-run`` shows);
+``summary`` prints the terse numbered checklist the Apply confirmation shows — titles, and a big
+download's size, without the URL, sha256 or install path. Things already in place are not listed,
+so a second run of an up-to-date setup plans nothing. Things tmap will NOT do for the user (a
+placeholder artifact, a BinExport of another version already loaded, an entry it does not own) are
+listed as needing the user, never dropped.
 """
 
 from __future__ import annotations
@@ -89,6 +91,29 @@ class Plan:
         out: list[str] = []
         for a in self.actions:
             out += a.render()
+        if self.needs_you:
+            out.append("  Needs you (tmap will not do these):")
+            out += [f"    - {n}" for n in self.needs_you]
+        return out
+
+    def summary(self) -> list[str]:
+        """The plan as a short numbered checklist for the Apply confirmation — one line per action,
+        with a big download's size but not its URL, sha256, byte count or install path. ``render``
+        (``--dry-run``) carries all of those; this is the everyday terse view so the user can see at
+        a glance which few things init will do and answer [Y/n]."""
+        titles = [f"{a.title[:1].upper()}{a.title[1:]}" for a in self.actions]
+
+        def _sized(a: Action) -> bool:
+            return a.asset is not None and a.asset.size >= 1_000_000
+
+        width = max((len(t) for a, t in zip(self.actions, titles) if _sized(a)), default=0)
+        out: list[str] = []
+        for i, (a, title) in enumerate(zip(self.actions, titles), start=1):
+            if _sized(a):
+                assert a.asset is not None
+                out.append(f"  {i}. {title.ljust(width)}   {_mb(a.asset.size)}")
+            else:
+                out.append(f"  {i}. {title}")
         if self.needs_you:
             out.append("  Needs you (tmap will not do these):")
             out += [f"    - {n}" for n in self.needs_you]

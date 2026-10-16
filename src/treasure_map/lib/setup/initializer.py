@@ -15,7 +15,7 @@ import logging
 import os
 import shutil
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
@@ -462,7 +462,6 @@ class _Context:
     mode: Mode
     prompt: Callable[[str], str]
     echo: Callable[[str], None]
-    needs_you: list[str] = field(default_factory=list)
 
 
 _SIZE_LABEL = {"jdk": "JDK 21", "ghidra": "Ghidra 11.4.3", "bindiff": "BinDiff 8"}
@@ -476,34 +475,20 @@ def _managed_paths(ledger: Any, entry_id: str, key: str | None = None) -> list[P
     return [Path(value)] if isinstance(value, str) else []
 
 
-def _ask_or_download(
-    ctx: _Context,
-    component: str,
-    validate: Callable[[Path], str | None],
-    size: int,
-) -> _Choice:
-    """Nothing usable was found: ask for a path (interactive), download (``--yes``), or leave it
-    unset (``--non-interactive``)."""
-    label = _SIZE_LABEL[component]
-    if ctx.mode == "yes":
-        return _Choice(download=True)
+def _ask_or_download(ctx: _Context, component: str) -> _Choice:
+    """Nothing usable was found: download it (interactive and ``--yes``), or leave it unset
+    (``--non-interactive``).
+
+    Interactive init no longer asks for a path per component — the per-tool "enter a path or press
+    Enter to download" prompts were the ones that felt like too many download confirmations. A
+    single "Not installed — will download" notice is printed once for all missing tools (see
+    run_init), and the one Apply confirmation covers the downloads. Anyone with an install tmap did
+    not discover points at it with ``--ghidra`` / ``--java-home`` / ``--bindiff``."""
     if ctx.mode == "non-interactive":
+        label = _SIZE_LABEL[component]
         ctx.echo(f"  {label}: not found; left unset (--non-interactive does not download).")
         return _Choice()
-    mb = f"{size / 1_000_000:.0f} MB"
-    for attempt in range(2):
-        entered = ctx.prompt(
-            f"No {label} found. Enter its path, or press Enter to download ({mb})"
-        ).strip()
-        if not entered:
-            return _Choice(download=True)
-        path = Path(os.path.expanduser(_absolute(entered)))
-        why = validate(path)
-        if why is None:
-            return _Choice(path=path)
-        ctx.echo(f"  {label}: {path}: {why}" + (" — try again." if attempt == 0 else ""))
-    ctx.needs_you.append(f"{label}: no usable path entered")
-    return _Choice()
+    return _Choice(download=True)
 
 
 def _report_candidates(ctx: _Context, label: str, cands: Sequence[Any], chosen: Any) -> None:
@@ -535,12 +520,7 @@ def _choose_ghidra(
     _report_candidates(ctx, "Ghidra", cands, chosen)
     if chosen is not None:
         return _Choice(path=chosen.path, managed=chosen.managed, note=chosen.note)
-    return _ask_or_download(
-        ctx,
-        "ghidra",
-        lambda p: check_ghidra(p, plat, want)[1],
-        _asset_size(ctx, "ghidra"),
-    )
+    return _ask_or_download(ctx, "ghidra")
 
 
 def _choose_jdk(
@@ -569,7 +549,7 @@ def _choose_jdk(
     _report_candidates(ctx, "JDK", cands, chosen)
     if chosen is not None:
         return _Choice(path=chosen.path, managed=chosen.managed, note=chosen.note)
-    return _ask_or_download(ctx, "jdk", lambda p: check_jdk(p)[1], _asset_size(ctx, "jdk"))
+    return _ask_or_download(ctx, "jdk")
 
 
 def _choose_bindiff(
@@ -598,7 +578,7 @@ def _choose_bindiff(
     _report_candidates(ctx, "BinDiff", cands, chosen)
     if chosen is not None:
         return _Choice(path=chosen.path, managed=chosen.managed, note=chosen.note)
-    return _ask_or_download(ctx, "bindiff", validate, _asset_size(ctx, "bindiff"))
+    return _ask_or_download(ctx, "bindiff")
 
 
 def _asset_size(ctx: _Context, component: str) -> int:
@@ -825,13 +805,27 @@ def run_init(
                 "  warning: Ghidra I/O over /mnt is an order of magnitude slower; "
                 "keep workspaces under ~"
             )
+    # One consolidated "will download" notice for the tools that are not installed — instead of a
+    # separate path-or-download prompt per tool. The single Apply confirmation below covers them.
+    if mode == "interactive":
+        pending = [
+            (_SIZE_LABEL[key], _asset_size(ctx, key))
+            for key, choice in (("ghidra", g), ("jdk", j), ("bindiff", b))
+            if choice.download
+        ]
+        if pending:
+            width = max(len(label) for label, _ in pending)
+            echo("")
+            echo("Not installed — will download:")
+            for label, size in pending:
+                echo(f"  {label.ljust(width)}   {size / 1_000_000:.0f} MB")
+            echo("  (use your own with --ghidra / --java-home / --bindiff)")
     survey = cl.survey(chost, tmap_path)
 
     # 2. plan
     plan = Plan()
-    plan.needs_you.extend(ctx.needs_you)
     if not tm_home.is_dir():
-        plan.add(Action("mkdir", "create", target=tm_home))
+        plan.add(Action("mkdir", "create ~/.treasure-map", target=tm_home))
     if cfg_error is not None:
         plan.add(
             Action(
@@ -1022,12 +1016,10 @@ def run_init(
     # 4. confirm
     echo("")
     echo("Plan:")
-    if plan.actions:
-        for line in plan.render():
-            echo(line)
-    else:
-        for line in plan.render():
-            echo(line)
+    # Terse numbered checklist for the confirmation; --dry-run prints the full plan (URLs, sha256).
+    for line in plan.render() if dry_run else plan.summary():
+        echo(line)
+    if not plan.actions:
         echo("  everything current, nothing to do")
     if mode == "interactive":
         names = [cl.LABELS[c] for c in survey.detected()]
@@ -1051,7 +1043,7 @@ def run_init(
             needs_you=tuple(plan.needs_you),
         )
     if plan.actions and mode == "interactive":
-        answer = prompt(f"Apply {len(plan.actions)} changes? [Y/n]").strip().lower()
+        answer = prompt("Apply? [Y/n]").strip().lower()
         if answer not in ("", "y", "yes"):
             echo("Nothing changed.")
             runs = runs_probe(existing_cfg) if runs_probe is not None else None
