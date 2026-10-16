@@ -158,7 +158,7 @@ def test_overlay_off_is_identical_to_no_overlay(tmp_path: Path) -> None:
 
     con = open_atlas(atlas_path)
     try:
-        overlay.clear_overlay(con)
+        overlay.clear_overlay(con, clear_all=True)
     finally:
         con.close()
     assert _order(tools) == baseline  # and clearing restores nothing, because nothing had moved

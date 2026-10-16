@@ -61,7 +61,12 @@ _CURRENT_BINARIES = (
 
 # functions columns added after the first schemas; an older analysis.db (read-only here, so never
 # migrated) lacks them, and selecting one by name would raise instead of reading NULL.
-_LATER_FUNCTION_COLUMNS = ("callees_truncated", "is_exported", "unresolved_external_calls")
+_LATER_FUNCTION_COLUMNS = (
+    "callees_truncated",
+    "is_exported",
+    "unresolved_external_calls",
+    "detector_errors",
+)
 
 
 def _function_column(conn: sqlite3.Connection, name: str) -> str:
@@ -314,6 +319,21 @@ def _parse_callees(raw: str | None) -> list[str]:
     return [str(x) for x in data] if isinstance(data, list) else []
 
 
+def _detector_errors(raw: str | None) -> list[str]:
+    """The additive-detector names that threw on a function, from the stored JSON array.
+
+    Empty on the default ``'[]'`` (none errored), on an older analysis.db with no column (``_col``
+    returns None), or on anything unparseable — the honest degrade is "none recorded", never a
+    fabricated error."""
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return []
+    return [str(x) for x in data] if isinstance(data, list) else []
+
+
 def _addr_candidates(func: str) -> set[str]:
     """Canonical stored-address forms ``func`` could denote.
 
@@ -422,6 +442,14 @@ _UNRESOLVED_EXT_NOTE = (
     "the resolver could not recover. A completeness lead, not a verdict; read the pseudocode at "
     "each address before trusting an empty sink list for this function"
 )
+# One or more additive detectors THREW on this function, so each returned its empty value just like
+# a detector that genuinely found nothing. Surfaced so an empty result from the named detector is
+# read as "could not check", never as "checked, found none".
+_DETECTOR_ERRORS_NOTE = (
+    "DETECTOR ERROR: one or more additive detectors raised on this function and returned nothing "
+    "as a result; an empty value from a NAMED detector here is a could-not-check, NOT a proven "
+    "absence — re-scan to retry it"
+)
 
 
 def _col(row: Any, name: str) -> Any:
@@ -464,6 +492,13 @@ def get_pseudocode(
     if unresolved:
         result["unresolved_external_calls"] = unresolved
         result["unresolved_external_calls_note"] = _UNRESOLVED_EXT_NOTE
+    # Which additive detectors threw on this function. A detector that failed stored its empty value
+    # like one that found nothing, so without this a crash reads as a clean result — surfaced so a
+    # reader does not mistake "the look crashed" for "looked, found none". Only when non-empty.
+    errored = _detector_errors(_col(row, "detector_errors"))
+    if errored:
+        result["detector_errors"] = errored
+        result["detector_errors_note"] = _DETECTOR_ERRORS_NOTE
     if truncated:
         result["note"] = _CALLEES_TRUNC_NOTE
     return result
@@ -1490,9 +1525,13 @@ def get_disassembly(
     func: str,
     binary: str | None = None,
     offset: int = 0,
-    max_chars: int = 200_000,
+    max_chars: int = _FACT_PAGE_CHARS,
 ) -> dict[str, Any]:
     """The disassembly listing Ghidra produced for one function, page by page.
+
+    A large listing is paged LOSSLESSLY by serialized byte size under ``paging`` (the shared
+    fact-tool budget, ``_FACT_PAGE_CHARS``), the same as get_strings: the tail is reachable with
+    ``offset`` = ``paging.next_offset`` and is never summarized away.
 
     The listing is stored at scan time (function_listing), so this reads it back — it does not
     re-run Ghidra, and the addresses are the ones the pseudocode already uses, from the same load.

@@ -89,3 +89,23 @@ def test_check_recall_integrity_self_test_passes() -> None:
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_help_text_does_not_miscount_the_gates() -> None:
+    """--help must not still claim "two" red lines — the script enforces four gates (A-D).
+
+    MUTATION (verified RED): restore the old "machine enforcement of two design red lines" opening
+    line -> the --help text says "two" again and the assertion below fails."""
+    result = subprocess.run(
+        [sys.executable, str(_ROOT / "scripts" / "check_recall_integrity.py"), "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    help_text = result.stdout
+    assert "two design red lines" not in help_text
+    assert "two red lines" not in help_text
+    # the four gates it actually runs are all described, so the count is not understated
+    for gate in ("Gate A", "Gate B", "Gate C", "Gate D"):
+        assert gate in help_text, gate

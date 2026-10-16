@@ -100,6 +100,19 @@ def test_triage_without_a_run_is_refused_and_names_the_runs(tmp_path: Path) -> N
     assert "rt_scanned" in r.output
 
 
+def test_triage_with_a_misspelled_run_is_an_error_that_names_the_runs(tmp_path: Path) -> None:
+    """``tmap triage --run <typo>`` must error and list the real runs, never exit 0 over an empty
+    list (which reads as "this run has no candidates", so a typo looks like a clean scan).
+
+    MUTATION: delete the run-existence check after _refuse_stale_triage_run in triage -> RED
+    (exit 0, an empty listing for a run that does not exist)."""
+    atlas = _atlas_with_runs(tmp_path)
+    r = CliRunner().invoke(triage, ["--run", "nope", "--atlas", str(atlas)])
+    assert r.exit_code != 0, r.output
+    assert "no such run" in r.output
+    assert "rt_scanned" in r.output
+
+
 def test_run_id_completion_matches_prefix(tmp_path: Path) -> None:
     # ★ Tab-completion returns the atlas's run ids that start with the incomplete token; no
     # ambiguous short-prefix auto-match (the user SEES and picks).

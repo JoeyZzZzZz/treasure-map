@@ -81,7 +81,7 @@ def test_base_map_is_byte_identical_whether_overlay_empty_or_full(tmp_path: Path
         con, evidence_ref=_REF, verdict="excluded", rationale="on reflection, noise"
     )
     assert _dump_base(con) == before  # base map unchanged with a full overlay
-    overlay.clear_overlay(con)
+    overlay.clear_overlay(con, clear_all=True)
     assert _dump_base(con) == before  # ...and after clearing it
     con.close()
 
@@ -504,13 +504,19 @@ def test_clear_overlay_scoped(tmp_path: Path) -> None:
     assert overlay.clear_overlay(con, run_id="rC") == 1  # only what is left of that run
     assert _refs(con) == ["rD#s:0x1@cmd", "rE#s:0x1@cmd"]
 
-    assert overlay.clear_overlay(con) == 2  # no scope: everything
+    assert overlay.clear_overlay(con, clear_all=True) == 2  # no scope + clear_all: everything
     assert _refs(con) == []
 
     _seed_rows(con)
     with pytest.raises(ConfigError, match="at most one scope"):
         overlay.clear_overlay(con, run_id="rC", evidence_ref="rC#s:0x1@cmd")
     assert len(_refs(con)) == 4  # the refusal deleted nothing
+
+    # ★ No scope and no clear_all is refused outright — a wipe is asked for by name, never the
+    # default of a call that simply forgot its scope.
+    with pytest.raises(ConfigError, match="no scope would wipe"):
+        overlay.clear_overlay(con)
+    assert len(_refs(con)) == 4  # the guard deleted nothing
     con.close()
 
 

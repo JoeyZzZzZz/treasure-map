@@ -810,3 +810,58 @@ def test_explain_candidate_summary_marks_candidate_callsite_end_to_end(tmp_path:
         assert flags == {0: False, 1: True}
     finally:
         conn.close()
+
+
+# ── may_reach_sink is never surfaced to the agent (it was shown even as a false claim) ───────
+
+
+_PROV_WITH_MRS: list[dict[str, object]] = [
+    {
+        "sink_idx": 0,
+        "sink": "system",
+        "sink_addr": "0x400",
+        "arg_idx": 0,
+        "provenance": {
+            "kind": "stack_buf",
+            "stack_key": "frame[84]+0x10",
+            "writer_count": 2,
+            "nearest_dominating_writer": "snprintf@0x3f0",
+            "writers": [
+                {
+                    "writer": "snprintf@0x3f0",
+                    "dominates_sink": True,
+                    "may_reach_sink": False,  # the unreliable extractor mark
+                    "fmt": "run %s",
+                    "varargs": [{"pos": 2, "spec": "%s", "source": {"kind": "param", "name": "p"}}],
+                },
+                {"writer": "strlcat@0x2a0", "dominates_sink": False, "fmt": "cfg", "varargs": []},
+            ],
+        },
+    },
+]
+
+
+def test_may_reach_sink_is_not_surfaced_to_the_agent(tmp_path: Path) -> None:
+    """The ``may_reach_sink`` key never reaches the agent through get_sink_provenance. It has no
+    effect on the reading (every non-dominating writer is kept regardless), and its ``false`` can be
+    wrong — an append / partial copy miscounted as a full overwrite — so surfacing it would show a
+    false "may_reach_sink: false" claim for a writer that is in fact weighed.
+
+    MUTATION (verified RED): stop stripping ``may_reach_sink`` in ``_present_provenance`` (or make
+    ``_strip_writer_internal`` return the writer unchanged) -> the key reappears in the writer dicts
+    below and the assertion that it is absent fails."""
+    atlas = _seed(tmp_path, provenance=_PROV_WITH_MRS)
+    conn = open_atlas(atlas)
+    try:
+        one = get_sink_provenance(conn, "run_x#fn7@cmd", 0)
+        allrecs = get_sink_provenance(conn, "run_x#fn7@cmd")
+    finally:
+        conn.close()
+    writers = one["record"]["provenance"]["writers"]
+    assert writers, "the fixture has writers to inspect"
+    for w in writers:
+        assert "may_reach_sink" not in w
+    # the no-sink_idx form presents the same records, also stripped
+    for rec in allrecs["records"]:
+        for w in rec["provenance"]["writers"]:
+            assert "may_reach_sink" not in w

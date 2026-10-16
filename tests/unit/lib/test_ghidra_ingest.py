@@ -4,14 +4,17 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import sqlite3
+import zlib
 from pathlib import Path
 
 import pytest
 
 from treasure_map.lib.analyze import ghidra_ingest as ingest_mod
+from treasure_map.lib.analyze.db_ingest import ingest_elfs
 from treasure_map.lib.analyze.elf_inventory import ElfRecord
 from treasure_map.lib.analyze.ghidra_ingest import ingest_ghidra_output
 from treasure_map.lib.analyze.stub_resolve import StubResolution, stub_table_marker
@@ -944,3 +947,129 @@ def test_ingest_checks_the_stub_marker_against_this_binarys_table(
     stats = ingest_ghidra_output(conn, out, [rec], sha_to_id, pass_version="facefeedfacefeed")
     assert stats.binaries_stale_json == 0
     assert stats.binaries_processed == 1
+
+
+# ── the success stamp is what lets a later scan skip Ghidra (R6) ────────────────────────────────
+
+_PASS = "facefeedfacefeed"
+
+
+def test_the_success_stamp_is_what_lets_the_next_scan_skip_ghidra(tmp_path: Path) -> None:
+    """A binary is a cache hit on the next scan ONLY because ingest stamped it ghidra_ok=1 +
+    pass_version at ingest time. Without that stamp the dirty check never clears it, so every scan
+    re-runs Ghidra over it forever.
+
+    MUTATION (verified RED): drop the ``UPDATE binaries SET ghidra_ok=1 ... pass_version=?`` stamp
+    in ingest_ghidra_output -> the binary stays ghidra_ok=0 / pass_version NULL, so the second
+    ingest_elfs still reports it dirty and this assertion fails."""
+    conn, sha_to_id = _setup_db(tmp_path)
+    rec = _make_record("test_bin", "a" * 64)
+    out = tmp_path / "ghidra_output"
+    # new binary -> dirty on the first look
+    _, dirty = ingest_elfs(conn, [rec], pass_version=_PASS)
+    assert "a" * 64 in dirty
+
+    # Ghidra ran (mocked by the JSON on disk) and ingest stamps the binary in the same txn
+    _write_ghidra_json(out, "test_bin", "a" * 64, _marked("a" * 64, _PASS))
+    ingest_ghidra_output(
+        conn, out, [rec], sha_to_id, pass_version=_PASS, success_stamp={"a" * 64: ("ok", "11.4.3")}
+    )
+
+    # second scan at the SAME pass: cached, Ghidra is NOT re-run
+    _, dirty2 = ingest_elfs(conn, [rec], pass_version=_PASS)
+    assert "a" * 64 not in dirty2
+    conn.close()
+
+
+def test_the_success_stamp_and_the_function_rows_are_one_transaction(tmp_path: Path) -> None:
+    """R6: the success stamp lands in the SAME transaction as the function rows, so a crash mid-run
+    never leaves a binary marked extracted (ghidra_ok=1 + pass_version) while its functions are
+    missing — which the next scan would read as a finished extraction and skip forever.
+
+    Two binaries are ingested; the second raises mid-ingest, before the final commit. The first
+    binary's functions AND its stamp must roll back together — not one without the other.
+
+    MUTATION (verified RED): stamp the binary and ``conn.commit()`` it BEFORE _ingest_one_binary
+    (the old split-transaction shape) -> the first binary's stamp survives the rollback while its
+    functions do not, so ``pass_version`` below is no longer None."""
+    conn = open_db(tmp_path / "analysis.db")
+    for name, sha in (("bin_one", "a" * 64), ("bin_two", "b" * 64)):
+        conn.execute("INSERT INTO binaries (name, sha256) VALUES (?, ?)", (name, sha))
+    conn.commit()
+    sha_to_id = {r["sha256"]: r["id"] for r in conn.execute("SELECT id, sha256 FROM binaries")}
+    recs = [_make_record("bin_one", "a" * 64), _make_record("bin_two", "b" * 64)]
+    out = tmp_path / "ghidra_output"
+    _write_ghidra_json(out, "bin_one", "a" * 64, _marked("a" * 64, _PASS))
+    _write_ghidra_json(out, "bin_two", "b" * 64, _marked("b" * 64, _PASS))
+
+    real = ingest_mod._ingest_one_binary
+    calls = {"n": 0}
+
+    def flaky(*args: object, **kwargs: object) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            real(*args, **kwargs)  # bin_one ingests its functions (uncommitted)
+            return
+        raise RuntimeError("boom during the second binary's ingest")
+
+    ingest_mod._ingest_one_binary = flaky
+    try:
+        with pytest.raises(RuntimeError):
+            ingest_ghidra_output(
+                conn,
+                out,
+                recs,
+                sha_to_id,
+                pass_version=_PASS,
+                success_stamp={"a" * 64: ("ok", "11.4.3"), "b" * 64: ("ok", "11.4.3")},
+            )
+    finally:
+        ingest_mod._ingest_one_binary = real
+
+    conn.rollback()  # the aborted transaction is discarded; read what actually committed
+    row = conn.execute(
+        "SELECT ghidra_ok, pass_version FROM binaries WHERE sha256 = ?", ("a" * 64,)
+    ).fetchone()
+    funcs = conn.execute(
+        "SELECT COUNT(*) FROM functions WHERE binary_id = ?", (sha_to_id["a" * 64],)
+    ).fetchone()[0]
+    conn.close()
+    # neither the stamp nor the functions survived — they were one unit of work
+    assert row["pass_version"] is None
+    assert row["ghidra_ok"] == 0
+    assert funcs == 0
+
+
+def test_the_listing_truncation_marker_threads_through_ingest(tmp_path: Path) -> None:
+    """A listing capped at the extractor's unit limit carries ``truncated: true`` in the JSON; that
+    marker must reach function_listing.truncated so the read layer flags a prefix listing instead
+    of reading it as complete.
+
+    MUTATION (verified RED): write 0 instead of ``1 if listing.get('truncated') else 0`` in
+    _ingest_listings -> function_listing.truncated stays 0 and get_disassembly reports
+    listing_truncated=False for a listing that was in fact cut off."""
+    conn, sha_to_id = _setup_db(tmp_path)
+    out = tmp_path / "ghidra_output"
+    units = [{"a": "0x1000", "n": 4, "k": "code", "m": "mov", "o": "r0, r1"}]
+    z = base64.b64encode(zlib.compress(json.dumps(units).encode())).decode()
+    data = _marked("a" * 64, _PASS)
+    data["functions"] = [
+        {
+            "name": "main",
+            "address": "0x1000",
+            "pseudocode": "int main(){}",
+            "listing": {"z": z, "units": 1, "insns": 1, "truncated": True},
+        }
+    ]
+    _write_ghidra_json(out, "test_bin", "a" * 64, data)
+    ingest_ghidra_output(
+        conn, out, [_make_record("test_bin", "a" * 64)], sha_to_id, pass_version=_PASS
+    )
+    stored = conn.execute("SELECT truncated FROM function_listing").fetchone()[0]
+    assert stored == 1  # the marker threaded into the DB column
+    from treasure_map.lib import facts
+
+    out_rec = facts.get_disassembly(conn, func="main")
+    conn.close()
+    assert out_rec["available"] is True
+    assert out_rec["listing_truncated"] is True  # and surfaces on the read layer

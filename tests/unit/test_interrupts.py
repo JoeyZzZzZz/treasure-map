@@ -106,3 +106,48 @@ def test_interrupt_exits_are_recognised() -> None:
     assert interrupts.is_interrupt_exit(143)
     assert not interrupts.is_interrupt_exit(1)
     assert not interrupts.is_interrupt_exit(0)
+
+
+def _raise_interrupt(*_args: object, **_kwargs: object) -> object:
+    raise KeyboardInterrupt
+
+
+def test_triage_exits_on_interrupt_with_the_signal_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``tmap triage`` interrupted returns 128 + signal (130 for Ctrl-C), not click's default
+    Abort/1 — a read command's interrupt reads as an interrupt, not an error.
+
+    MUTATION (verified RED): drop ``cls=InterruptCommand`` from the triage command -> click's
+    standalone mode turns the KeyboardInterrupt into an Abort and exit_code is 1."""
+    from treasure_map.cli.hunt_cli import triage as triage_cmd
+    from treasure_map.lib.config import config as cfgmod
+
+    monkeypatch.setattr(interrupts, "_received", None)
+    monkeypatch.setattr(cfgmod, "load_config", _raise_interrupt)
+    r = CliRunner().invoke(triage_cmd, ["--run", "x", "--atlas", "/nope/atlas.db"])
+    assert r.exit_code == 130, r.output
+
+
+def test_diff_exits_on_interrupt_with_the_signal_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``tmap diff`` interrupted returns 128 + signal, not 1.
+
+    MUTATION (verified RED): drop ``cls=InterruptCommand`` from the diff command -> exit_code 1."""
+    from treasure_map.cli.hunt_cli import hunt_diff
+    from treasure_map.lib.config import config as cfgmod
+
+    monkeypatch.setattr(interrupts, "_received", None)
+    monkeypatch.setattr(cfgmod, "load_config", _raise_interrupt)
+    r = CliRunner().invoke(hunt_diff, ["--before", "a", "--after", "b"])
+    assert r.exit_code == 130, r.output
+
+
+def test_fact_exits_on_interrupt_with_the_signal_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A ``tmap fact`` subcommand interrupted returns 128 + signal, not 1 — the whole group follows
+    the contract through InterruptGroup.
+
+    MUTATION (verified RED): drop ``cls=InterruptGroup`` from the fact group -> exit_code 1."""
+    from treasure_map.cli import mcp_cli
+
+    monkeypatch.setattr(interrupts, "_received", None)
+    monkeypatch.setattr(mcp_cli, "_open_fact_db", _raise_interrupt)
+    r = CliRunner().invoke(mcp_cli.fact, ["pseudocode", "somefunc", "--analysis-db", "x.db"])
+    assert r.exit_code == 130, r.output

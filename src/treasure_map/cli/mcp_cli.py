@@ -16,6 +16,7 @@ from typing import Any
 
 import click
 
+from treasure_map.cli.interrupts import InterruptGroup
 from treasure_map.lib import facts
 from treasure_map.lib.analyze.ghidra_runner import current_pass_version
 
@@ -94,6 +95,7 @@ def _open_fact_db(analysis_db: str) -> Any:
 
 @click.group(
     name="fact",
+    cls=InterruptGroup,
     short_help="Read a few of the MCP facts by hand (pseudocode, disassembly, callees, xrefs, …)",
 )
 def fact() -> None:

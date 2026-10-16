@@ -786,3 +786,56 @@ def test_run_ghidra_version_rollup_is_the_never_null_sentinel(tmp_path: Path) ->
         ("s4", [(0, "x")]),
     ]:
         assert isinstance(rollup(nm, rows), str)
+
+
+def _db_with_detector_errors(tmp_path: Path, errors: object) -> Path:
+    """One function whose ``detector_errors`` column holds ``errors`` (a JSON string as stored)."""
+    db = tmp_path / "analysis.db"
+    conn = open_db(db)
+    conn.execute(
+        "INSERT INTO binaries (id, name, path, sha256, last_seen_at) "
+        "VALUES (1, 'webd', 'usr/sbin/webd', ?, '2026-01-01T00:00:00')",
+        ("a" * 64,),
+    )
+    conn.execute(
+        "INSERT INTO functions (id, binary_id, name, address, pseudocode, callees, is_exported, "
+        "detector_errors) VALUES (1, 1, 'handle', '0x1000', 'void handle(){}', '[]', 0, ?)",
+        (errors,),
+    )
+    conn.commit()
+    conn.close()
+    return db
+
+
+def test_get_pseudocode_surfaces_a_detector_that_errored(tmp_path: Path) -> None:
+    """A detector that THREW on a function stored its empty value like one that found nothing, so
+    without surfacing the error a crash reads as a clean result. get_pseudocode names the detectors
+    that threw, so an empty result from one of them is a could-not-check, never a proven absence.
+
+    MUTATION (verified RED): drop the detector_errors block in get_pseudocode, or remove
+    "detector_errors" from _LATER_FUNCTION_COLUMNS (the column then reads back NULL) -> the key and
+    its note are absent and the assertion that they are present fails."""
+    conn = facts.open_analysis_ro(
+        _db_with_detector_errors(tmp_path, json.dumps(["sink_provenance", "nvram_ops"]))
+    )
+    try:
+        out = facts.get_pseudocode(conn, func="handle")
+    finally:
+        conn.close()
+    assert out["found"] is True
+    assert "detector_errors" in out  # presence first, so the mutation reds on THIS assert
+    assert out["detector_errors"] == ["sink_provenance", "nvram_ops"]
+    assert "could-not-check" in out["detector_errors_note"]
+
+
+def test_get_pseudocode_omits_detector_errors_when_none_threw(tmp_path: Path) -> None:
+    """The default '[]' (no detector errored) surfaces nothing — the key appears only when a
+    detector actually threw, so it is never noise on the ordinary clean case."""
+    conn = facts.open_analysis_ro(_db_with_detector_errors(tmp_path, "[]"))
+    try:
+        out = facts.get_pseudocode(conn, func="handle")
+    finally:
+        conn.close()
+    assert out["found"] is True
+    assert "detector_errors" not in out
+    assert "detector_errors_note" not in out
