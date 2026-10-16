@@ -249,6 +249,13 @@ def _configure_completion(
         return None, None, False
     state = "installed" if outcome.wrote else "already up to date"
     echo(f"  Completion: {state} for {shell} at {outcome.path}")
+    if outcome.wrote and outcome.active:
+        # A shell that is already running does not load a script installed under it (zsh reads
+        # $fpath when compinit runs at startup), so a tab pressed right after init does nothing.
+        echo(
+            "              takes effect in a new shell: open a new terminal, "
+            "or run `exec $SHELL -l`"
+        )
     rc: Path | None = None
     created = False
     if not outcome.active and outcome.activation_hint:

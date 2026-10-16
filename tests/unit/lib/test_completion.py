@@ -357,3 +357,33 @@ def test_the_bash_check_reads_a_latin1_bashrc(
     (tmp_path / ".bashrc").write_bytes(b"# caf\xe9\n" + f"source {path}\n".encode())
     _, ok, detail = _no_decode_error(comp.completion_check, tmp_path, "bash")
     assert ok is True, detail
+
+
+@pytest.mark.parametrize("shell", ["bash", "zsh"])
+def test_a_new_completion_script_says_it_takes_effect_in_a_new_shell(
+    shell: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A running shell does not load a script installed under it — zsh reads $fpath only when
+    compinit runs at startup — so a tab pressed right after init does nothing. A fresh install that
+    will autoload says to open a new shell; a re-run that changed nothing does not repeat it.
+
+    MUTATION (verified RED): drop the hint -> the first run prints no new-shell line -> RED."""
+    from treasure_map.lib.setup.initializer import _configure_completion
+
+    home = Path.home()
+    monkeypatch.setenv("SHELL", f"/bin/{shell}")
+    monkeypatch.setattr(comp, "bash_version", lambda *_a: (5, 2))
+    if shell == "bash":
+        monkeypatch.setattr(comp, "_bash_completion_present", lambda: True)
+    else:
+        comp_dir = comp.target_path("zsh", home).parent  # type: ignore[union-attr]
+        zshrc = f"fpath=({comp_dir} $fpath)\nautoload -Uz compinit\ncompinit\n"
+        (home / ".zshrc").write_text(zshrc)
+    first: list[str] = []
+    _configure_completion(non_interactive=True, prompt=lambda _m: "", echo=first.append)
+    assert any("installed for" in ln for ln in first), first
+    assert any("new shell" in ln and "new terminal" in ln for ln in first), first
+    again: list[str] = []
+    _configure_completion(non_interactive=True, prompt=lambda _m: "", echo=again.append)
+    assert any("already up to date" in ln for ln in again), again
+    assert not any("new shell" in ln for ln in again), again
