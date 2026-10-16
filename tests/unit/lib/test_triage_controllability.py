@@ -43,9 +43,12 @@ from treasure_map.lib.query.triage import (
     _anchor_missed,
     _dim_controllability,
     _dim_writer,
+    _is_proven_safe,
     _scoped_records,
+    _sort_atoms,
     _verdict_from_provenance,
     _web_settable_keys_reaching_sink,
+    filter_by_dimension,
 )
 
 _FID = [0]
@@ -2673,6 +2676,73 @@ def test_an_errored_sink_provenance_detector_marks_controllability_unknown(tmp_p
     assert "errored" in c_err.dim("controllability").note
 
 
+def _likely_controllable_pair(tmp_path: Path, fp: str, errors: list[str]) -> tuple[str, str]:
+    """A clean and an errored instance of one likely-controllable candidate (a router_defaults
+    wrapper-read key reaching system). Returns (clean_ref, errored_ref)."""
+    conn = _atlas(tmp_path)
+    _register_wrapper(conn, "FUN_0040870c", "acct_link_code")
+    _seed_default(conn, "acct_link_code")
+    p = _pattern(conn, fp, sink_class="cmd")
+    prov = _stack_buf_prov("system", [_getter_vararg("acct_link_code", callee="FUN_0040870c")])
+    clean = _inst(conn, p, sink_anchor="system", flow_evidence=prov, source_kind="unknown")
+    errored = _inst(
+        conn,
+        p,
+        sink_anchor="system",
+        flow_evidence=_ev_with_errors(prov, errors),
+        source_kind="unknown",
+    )
+    conn.close()
+    return clean, errored
+
+
+def test_an_errored_detector_keeps_a_likely_controllable_reading_and_its_rank(
+    tmp_path: Path,
+) -> None:
+    """A likely-controllable lead whose sink-provenance detector threw keeps its reading and its
+    exact sort rank — the error can only have failed to find more, so raise-only leaves a positive
+    lead where it was and merely notes the caveat. This is the regression the blanket "force any
+    non-'?' to '?'" caused: it dropped a 4th-rank lead to 1st-rank '?'.
+
+    MUTATION (verified RED): restore the blanket force (every mapped non-'?' reading to '?') -> the
+    errored lead reads '?' , its atoms differ from the clean twin's, and the rank assertion fails.
+    MUTATION: drop the note append -> the note assertion fails."""
+    clean, errored = _likely_controllable_pair(tmp_path, "fp_likely_keep", ["sink_provenance"])
+    cands = triage(open_atlas(tmp_path / "atlas.db"))
+    c_clean = _find(cands, clean)
+    c_err = _find(cands, errored)
+    assert c_clean is not None and c_err is not None
+    # the clean twin proves the base reading is a 4th-rank positive lead
+    assert (c_clean.dim("controllability").state, c_clean.dim("controllability").value) == (
+        "likely",
+        "controllable",
+    )
+    # raise-only: kept, with the caveat noted
+    assert (c_err.dim("controllability").state, c_err.dim("controllability").value) == (
+        "likely",
+        "controllable",
+    )
+    assert "errored" in c_err.dim("controllability").note
+    # and the rank is identical to the no-error twin: neither sinks, both carry the same atoms
+    assert not _is_proven_safe(c_err)
+    assert _sort_atoms(c_err, None) == _sort_atoms(c_clean, None)
+
+
+def test_a_controllable_filter_still_finds_an_errored_likely_controllable_lead(
+    tmp_path: Path,
+) -> None:
+    """`--filter controllability=controllable` (a REDUCE via filter_by_dimension) must still return
+    an errored likely-controllable lead. Under the old blanket force its value became 'unknown' and
+    the filter dropped it from the results entirely — a worse burial than the one the mark fixes.
+
+    MUTATION (verified RED): restore the blanket force -> the errored lead's value is 'unknown', the
+    filter excludes it, and the membership assertion fails."""
+    _, errored = _likely_controllable_pair(tmp_path, "fp_likely_filter", ["sink_provenance"])
+    cands = triage(open_atlas(tmp_path / "atlas.db"))
+    kept = filter_by_dimension(cands, "controllability", "controllable")
+    assert errored in {c.evidence_ref for c in kept}
+
+
 def test_an_errored_detector_only_marks_the_layer_it_feeds(tmp_path: Path) -> None:
     """A detector error touches only its mapped layer. A detector that feeds no triage layer
     ('listing', disassembly-only) leaves every layer alone — the controllability reading stays
@@ -2695,17 +2765,20 @@ def test_an_errored_detector_only_marks_the_layer_it_feeds(tmp_path: Path) -> No
     assert c.dim("controllability").value == "constant"  # unmapped detector left it alone
 
 
-def test_an_errored_nvram_detector_marks_source_writability_unknown(tmp_path: Path) -> None:
-    """The nvram-ops detector feeds the source_writability layer. When it threw on the function,
-    a web-settable reading that would otherwise be proven reads '?', while an identical candidate
-    with no detector error keeps it. Controllability, which that detector does not feed, is left
-    alone on the errored candidate.
+def test_an_errored_nvram_detector_keeps_a_proven_web_settable_reading(tmp_path: Path) -> None:
+    """The nvram-ops detector feeds the source_writability layer. When it threw on the function but
+    still produced a PROVEN web-settable reading, that positive finding is kept (raise-only: the
+    error can only have failed to find more, never unproven what it did find) and only gains the
+    error note. Controllability, which that detector does not feed, is untouched.
 
-    MUTATION (verified RED): delete the "nvram_ops" entry from _DETECTOR_DIMENSIONS -> the errored
-    candidate keeps the proven source_writability and the '?' assertion fails."""
+    MUTATION (verified RED): make _errored_reading_is_replaceable always true (or restore the old
+    "any non-'?' reading forced to '?'") -> the proven reading is replaced and the state assertion
+    fails. MUTATION: drop the note append -> the note assertion fails."""
     conn = _atlas(tmp_path)
+    _register_wrapper(conn, "FUN_0040870c", "rpt_comment")
+    _seed_cross(conn)
     p = _pattern(conn, "fp_det_nv", sink_class="fmt_string")
-    prov = _stack_buf_prov("fprintf", [_getter_vararg("rpt_comment")])
+    prov = _stack_buf_prov("fprintf", [_getter_vararg("rpt_comment", callee="FUN_0040870c")])
     clean = _inst(conn, p, sink_anchor="fprintf", flow_evidence=prov, source_kind="unknown")
     errored = _inst(
         conn,
@@ -2719,26 +2792,60 @@ def test_an_errored_nvram_detector_marks_source_writability_unknown(tmp_path: Pa
     c_clean = _find(cands, clean)
     c_err = _find(cands, errored)
     assert c_clean is not None and c_err is not None
-    # the base reading really is confident, so the mark is what changes it
+    # the clean twin proves the base reading really is a positive web_settable finding
     assert c_clean.dim("source_writability").state == "proven"
-    assert c_err.dim("source_writability").state == "unknown"
-    assert c_err.dim("source_writability").value == "unknown"
+    assert c_clean.dim("source_writability").value == "web_settable"
+    # raise-only: the errored candidate KEEPS it, state/value unchanged, only the note is appended
+    assert c_err.dim("source_writability").state == "proven"
+    assert c_err.dim("source_writability").value == "web_settable"
     assert "errored" in c_err.dim("source_writability").note
     # scoped: the layer this detector does not feed keeps its reading
     assert c_err.dim("controllability") == c_clean.dim("controllability")
 
 
+def test_an_errored_nvram_detector_marks_a_key_it_could_not_resolve(tmp_path: Path) -> None:
+    """The replaceable source_writability reading is the EXCLUSION one: when the source is not a
+    resolved nvram key, the layer reads ✗ n/a — but if the nvram detector threw on the function,
+    that "no key" may be the crash, not a fact, so it reads '?' instead. Raise-only still holds: ✗
+    n/a does not rank above '?'.
+
+    MUTATION (verified RED): make the source_writability branch of _errored_reading_is_replaceable
+    return False -> the excluded reading stays ✗ n/a and the '?' assertion fails."""
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, "fp_det_nokey", sink_class="cmd")
+    # a plain stack_buf with no nvram getter -> source_writability is excluded (no resolved key)
+    prov = _stack_buf_multi("system", [_writer("fixed cmd %s", [_const_va()], dominates=True)])
+    clean = _inst(conn, p, sink_anchor="system", flow_evidence=prov, source_kind="unknown")
+    errored = _inst(
+        conn,
+        p,
+        sink_anchor="system",
+        flow_evidence=_ev_with_errors(prov, ["nvram_ops"]),
+        source_kind="unknown",
+    )
+    conn.close()
+    cands = triage(open_atlas(tmp_path / "atlas.db"))
+    c_clean = _find(cands, clean)
+    c_err = _find(cands, errored)
+    assert c_clean is not None and c_err is not None
+    assert c_clean.dim("source_writability").state == "excluded"  # no resolved key, no error
+    assert c_err.dim("source_writability").state == "unknown"  # the crash could be why -> '?'
+    assert "errored" in c_err.dim("source_writability").note
+
+
 @pytest.mark.parametrize("detector", ["string_keyed_edges", "address_taken", "body_ranges"])
-def test_an_errored_reachability_detector_marks_reachability_unknown(
+def test_an_errored_reachability_detector_keeps_a_found_entry_edge(
     tmp_path: Path, detector: str
 ) -> None:
-    """Each detector mapped to the reachability layer forces it to '?' when it threw on the
-    function: an entry reference that reads proven on a clean candidate reads '?' on the errored
-    twin, and the layers that detector does not feed keep their readings.
+    """Each detector mapped to the reachability layer, when it threw on the function, leaves a found
+    entry edge in place (raise-only: a crash can only fail to find entries, and reachability has no
+    non-entry positive state — an entry ranks above '?', so it is kept) and only gains the error
+    note. The layers that detector does not feed keep their readings.
 
-    MUTATION (verified RED, one per case): delete that detector's entry from _DETECTOR_DIMENSIONS
-    -> its case keeps 'proven' reachability and the '?' assertion fails; the other two cases stay
-    green, so each entry is pinned by its own case."""
+    MUTATION (verified RED, one per case): make the reachability branch of
+    _errored_reading_is_replaceable always true (or restore the old blanket "non-'?' forced to '?'")
+    -> the entry edge is replaced by '?' and the state assertion fails. The note assertion pins the
+    append for each case."""
     conn = _atlas(tmp_path)
     p = _pattern(conn, f"fp_det_{detector}", sink_class="cmd")
     ev: dict[str, object] = {
@@ -2759,7 +2866,8 @@ def test_an_errored_reachability_detector_marks_reachability_unknown(
     c_err = _find(cands, errored)
     assert c_clean is not None and c_err is not None
     assert c_clean.dim("reachability").state == "proven"
-    assert c_err.dim("reachability").state == "unknown"
-    assert c_err.dim("reachability").value == "unknown"
+    # raise-only: the found entry edge stays, state and value unchanged, note appended
+    assert c_err.dim("reachability").state == "proven"
+    assert c_err.dim("reachability").value == c_clean.dim("reachability").value
     assert "errored" in c_err.dim("reachability").note
     assert c_err.dim("controllability") == c_clean.dim("controllability")

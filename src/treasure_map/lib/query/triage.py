@@ -2403,14 +2403,15 @@ def _dim_writer(
 
 
 def _dim_completeness() -> Dimension:
-    """Was the containing function fully decompiled? '?' this phase: the per-function A4 signal
-    lives in analysis.db, and triage is atlas-only. Honestly deferred, never faked complete."""
+    """Was the containing function fully decompiled? '?' this phase: the per-function
+    decompile-completeness signal lives in analysis.db, and triage is atlas-only. Honestly
+    deferred, never faked complete."""
     return Dimension(
         "completeness",
         "unknown",
         "unknown",
-        "A4 per-function decompile completeness (not wired into the atlas-only triage this phase)",
-        "cross-check partially_incomplete_binaries at the listing top level (A4) for this binary — "
+        "per-function decompile completeness (not wired into the atlas-only triage this phase)",
+        "cross-check partially_incomplete_binaries at the listing top level for this binary — "
         "a partial binary means some of its functions never decompiled",
     )
 
@@ -2483,19 +2484,43 @@ def _errored_detectors(flow_evidence: Mapping[str, Any] | None) -> frozenset[str
     return frozenset(str(e) for e in errs)
 
 
-# Said on a layer whose feeding detector raised: its empty reading is a could-not-check, not proof.
+# Said on every layer whose feeding detector raised, whether or not its reading was replaced.
 _DETECTOR_ERROR_DIM_NOTE = (
-    "a detector feeding this layer errored on this function, so its reading is '?' (could not "
-    "check), NEVER a confident empty — re-scan to retry it"
+    "a detector feeding this layer errored on this function, so the layer may be incomplete: "
+    "anything it did not find is a could-not-check, not proof of absence — retry it with "
+    "tmap scan --reanalyze <binary> --rehunt (a re-analysis alone is not re-hunted when the "
+    "binary and the tmap version are unchanged, so this candidate would keep the old reading)"
 )
+
+# The '?' reading a replaced controllability layer takes, ranked by the sort's own function.
+_UNKNOWN_CONTROLLABILITY = Dimension("controllability", "unknown", "unknown", "")
+
+
+def _errored_reading_is_replaceable(d: Dimension) -> bool:
+    """May a reading on a layer whose detector errored be replaced by '?'? Only when '?' ranks no
+    lower than it, judged by the sort's own rank functions, so the replacement can only raise a
+    candidate. controllability: only a reading ranked BELOW unknown, i.e. the confident 'constant'
+    an errored provenance detector's empty result falls back to; a controllable, free or
+    constrained reading ranks above '?' and stays. reachability: anything but an entry edge (an
+    entry ranks above unknown; every other value ranks with it). source_writability does not enter
+    the sort; by the same rule only its exclusion (no resolved key, which an errored key detector
+    can cause) is replaced, never a web_settable finding."""
+    if d.name == "controllability":
+        return _controllability_rank(d) < _controllability_rank(_UNKNOWN_CONTROLLABILITY)
+    if d.name == "reachability":
+        return _reach_rank(d.value) <= _reach_rank("unknown")
+    if d.name == "source_writability":
+        return d.state == "excluded"
+    return False
 
 
 def _mark_errored_dimensions(
     dims: tuple[Dimension, ...], errored: frozenset[str]
 ) -> tuple[Dimension, ...]:
-    """Force each layer whose feeding detector threw to an honest '?' (unknown), never a confident
-    empty. A '?' never sinks (the demotion iron law), so this only makes a layer MORE visible — it
-    can never bury a lead. A no-op when no mapped detector errored."""
+    """Mark each layer whose feeding detector threw. Its note always says so; its reading becomes
+    '?' only where '?' ranks no lower than it (``_errored_reading_is_replaceable``). A '?' never
+    sinks (the demotion iron law) and a positive reading is kept, so this only makes a layer MORE
+    visible — it can never bury a lead. A no-op when no mapped detector errored."""
     if not errored:
         return dims
     affected = {dim for det in errored for dim in _DETECTOR_DIMENSIONS.get(det, ())}
@@ -2503,11 +2528,14 @@ def _mark_errored_dimensions(
         return dims
     out: list[Dimension] = []
     for d in dims:
-        if d.name in affected and d.state != "unknown":
-            note = f"{d.note} — {_DETECTOR_ERROR_DIM_NOTE}" if d.note else _DETECTOR_ERROR_DIM_NOTE
-            out.append(Dimension(d.name, "unknown", "unknown", d.source, note, d.evidence))
-        else:
+        if d.name not in affected:
             out.append(d)
+            continue
+        note = f"{d.note} — {_DETECTOR_ERROR_DIM_NOTE}" if d.note else _DETECTOR_ERROR_DIM_NOTE
+        if d.state != "unknown" and _errored_reading_is_replaceable(d):
+            out.append(replace(d, state="unknown", value="unknown", note=note))
+        else:
+            out.append(replace(d, note=note))
     return tuple(out)
 
 
