@@ -448,7 +448,8 @@ _UNRESOLVED_EXT_NOTE = (
 _DETECTOR_ERRORS_NOTE = (
     "DETECTOR ERROR: one or more additive detectors raised on this function and returned nothing "
     "as a result; an empty value from a NAMED detector here is a could-not-check, NOT a proven "
-    "absence — re-scan to retry it"
+    "absence — re-analyze the binary (tmap scan --reanalyze) to retry it; a plain re-scan reuses "
+    "the cached extraction"
 )
 
 

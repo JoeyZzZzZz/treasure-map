@@ -1,6 +1,6 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""Red-line CI gates — the two invariants enforced by scripts/check_recall_integrity.py.
+"""Red-line CI gates — the invariants enforced by scripts/check_recall_integrity.py.
 
 Gate A (never wrongly downweight): a const_sink_arg note must never sit on a free_string candidate.
 Gate B (degrade must be visible): a ghidra_status='ok' binary must hold functions.
@@ -92,10 +92,11 @@ def test_check_recall_integrity_self_test_passes() -> None:
 
 
 def test_help_text_does_not_miscount_the_gates() -> None:
-    """--help must not still claim "two" red lines — the script enforces four gates (A-D).
+    """--help must not still claim "two" red lines — the script enforces five gates (A-E).
 
     MUTATION (verified RED): restore the old "machine enforcement of two design red lines" opening
-    line -> the --help text says "two" again and the assertion below fails."""
+    line -> the --help text says "two" again and the assertion below fails. MUTATION: name the range
+    "(Gates A-D)" again -> the last assertion fails."""
     result = subprocess.run(
         [sys.executable, str(_ROOT / "scripts" / "check_recall_integrity.py"), "--help"],
         capture_output=True,
@@ -106,9 +107,11 @@ def test_help_text_does_not_miscount_the_gates() -> None:
     help_text = result.stdout
     assert "two design red lines" not in help_text
     assert "two red lines" not in help_text
-    # the four gates it actually runs are all described, so the count is not understated
-    for gate in ("Gate A", "Gate B", "Gate C", "Gate D"):
+    # the five gates it actually runs are all described, so the count is not understated
+    for gate in ("Gate A", "Gate B", "Gate C", "Gate D", "Gate E"):
         assert gate in help_text, gate
+    # and the opening line's range names all of them (argparse rewraps, so compare on one line)
+    assert "(Gates A-E)" in " ".join(help_text.split())
 
 
 def _atlas_with_gate_a(path: Path, *, violating: bool) -> None:

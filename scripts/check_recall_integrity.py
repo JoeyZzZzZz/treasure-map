@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""Recall-integrity gates — machine enforcement of the design red lines below (Gates A-D).
+"""Recall-integrity gates — machine enforcement of the design red lines below (Gates A-E).
 
 These invariants used to be docstring-only contracts, so their breaches surfaced only in a live
 audit. This script turns them into a runnable gate (the same idea as check-vendor-neutrality.sh):
