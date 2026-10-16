@@ -826,6 +826,9 @@ def test_get_pseudocode_surfaces_a_detector_that_errored(tmp_path: Path) -> None
     assert "detector_errors" in out  # presence first, so the mutation reds on THIS assert
     assert out["detector_errors"] == ["sink_provenance", "nvram_ops"]
     assert "could-not-check" in out["detector_errors_note"]
+    # these detectors run in the HUNT, so the retry advice must say --rehunt: a bare --reanalyze
+    # re-extracts but is not re-hunted at an unchanged binary+version, keeping the old reading.
+    assert "--rehunt" in out["detector_errors_note"]
 
 
 def test_get_pseudocode_omits_detector_errors_when_none_threw(tmp_path: Path) -> None:

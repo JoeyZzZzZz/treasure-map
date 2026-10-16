@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import click
 
@@ -23,6 +24,7 @@ from treasure_map.cli.interrupts import install_termination_handlers
 from treasure_map.cli.mcp_cli import fact, mcp_serve
 from treasure_map.cli.uninstall_cli import uninstall
 from treasure_map.cli.update_cli import update
+from treasure_map.lib.errors import ConfigError
 from treasure_map.version import __version__
 
 
@@ -58,6 +60,17 @@ class _AliasGroup(click.Group):
 
     def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
         return super().get_command(ctx, self._ALIASES.get(cmd_name, cmd_name))
+
+    def invoke(self, ctx: click.Context) -> Any:
+        """Every command loads config first, and a bad config (a relative TM_* path, an unparseable
+        file) raises ConfigError. Caught at this one CLI-wide seam so ANY command reports it as a
+        one-line "Error: …" with a non-zero exit, never a traceback. The diff command resolves its
+        own ConfigError into a ClickException (to name the A/B roles) before it reaches here, and a
+        ClickException is not a ConfigError, so it passes through untouched."""
+        try:
+            return super().invoke(ctx)
+        except ConfigError as exc:
+            raise click.ClickException(f"{type(exc).__name__}: {exc}") from exc
 
     def format_commands(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
         grouped = {name for _, names in self._GROUPS for name in names}
@@ -111,7 +124,6 @@ def _apply_configured_toolchain() -> None:
     ``tmap init`` chose. A broken config must not stop ``tmap init`` from repairing it, so it is a
     warning here, not an error."""
     from treasure_map.lib.config.config import load_config
-    from treasure_map.lib.errors import ConfigError
     from treasure_map.lib.setup.toolchain_env import apply_toolchain_env
 
     try:

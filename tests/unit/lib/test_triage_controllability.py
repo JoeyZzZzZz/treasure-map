@@ -2743,6 +2743,64 @@ def test_a_controllable_filter_still_finds_an_errored_likely_controllable_lead(
     assert errored in {c.evidence_ref for c in kept}
 
 
+@pytest.mark.parametrize(
+    ("source_kind", "state", "value"),
+    [
+        # 'likely free' is the reading this whole raise-only rule exists for — the common
+        # provenance-shallow lead (thousands of them on a real atlas). 'constrained' ranks one step
+        # lower, and both must survive an errored detector: raise-only replaces a reading with '?'
+        # only where '?' ranks NO LOWER, and only a confident 'constant' (rank 0) does.
+        ("free_string", "likely", "free"),  # rank 3
+        ("charset_safe", "proven", "constrained"),  # rank 2
+    ],
+)
+def test_an_errored_detector_keeps_a_controllability_reading_that_outranks_unknown(
+    tmp_path: Path, source_kind: str, state: str, value: str
+) -> None:
+    """A controllability reading that ranks ABOVE '?' (free at rank 3, constrained at rank 2) is
+    KEPT when its sink-provenance detector threw — only the error note is appended, the reading and
+    its exact sort position are untouched. The clean twin proves the base reading; the errored twin
+    keeps the same (state, value) and the same sort atoms, so neither sinks and neither moves.
+
+    The companion test above pins rank 4 (likely-controllable) and the one two above pins rank 0
+    (constant → replaced by '?'); together they fix the replaceable threshold at exactly
+    rank(unknown).
+
+    MUTATION (verified RED): raise the threshold in _errored_reading_is_replaceable from
+    ``< _controllability_rank(_UNKNOWN_CONTROLLABILITY)`` (i.e. < 1) to ``< 3`` -> constrained
+    (rank 2) is replaced by '?' and the charset_safe case's (state, value) assertion fails; ``< 4``
+    also replaces free (rank 3) and the free_string case fails too."""
+    conn = _atlas(tmp_path)
+    p = _pattern(conn, f"fp_keep_{source_kind}", sink_class="cmd")
+    clean = _inst(conn, p, sink_anchor="system", source_kind=source_kind)
+    errored = _inst(
+        conn,
+        p,
+        sink_anchor="system",
+        source_kind=source_kind,
+        flow_evidence={"detector_errors": ["sink_provenance"]},
+    )
+    conn.close()
+    cands = triage(open_atlas(tmp_path / "atlas.db"))
+    c_clean = _find(cands, clean)
+    c_err = _find(cands, errored)
+    assert c_clean is not None and c_err is not None
+    # the clean twin proves the base reading really is a positive lead above '?'
+    assert (c_clean.dim("controllability").state, c_clean.dim("controllability").value) == (
+        state,
+        value,
+    )
+    # raise-only: the errored twin keeps it, gaining only the error note
+    assert (c_err.dim("controllability").state, c_err.dim("controllability").value) == (
+        state,
+        value,
+    )
+    assert "errored" in c_err.dim("controllability").note
+    # identical sort position: neither sinks, both carry the same atoms
+    assert not _is_proven_safe(c_err)
+    assert _sort_atoms(c_err, None) == _sort_atoms(c_clean, None)
+
+
 def test_an_errored_detector_only_marks_the_layer_it_feeds(tmp_path: Path) -> None:
     """A detector error touches only its mapped layer. A detector that feeds no triage layer
     ('listing', disassembly-only) leaves every layer alone — the controllability reading stays

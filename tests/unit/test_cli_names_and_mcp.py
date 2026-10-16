@@ -12,6 +12,7 @@ from click.testing import CliRunner
 
 from treasure_map.cli import mcp_cli
 from treasure_map.cli.main import main
+from treasure_map.lib.errors import ConfigError
 
 # ── shortened names listed; old names resolve but hidden ────────────────────────────────
 
@@ -123,3 +124,29 @@ def test_mcp_stderr_launch_hint(monkeypatch: pytest.MonkeyPatch) -> None:
     assert r.exit_code == 0
     assert "stdio" in r.stderr and "JSON-RPC on stdin" in r.stderr
     assert r.stdout == ""  # stdout stays clean for the protocol
+
+
+# ── a bad config surfaces as "Error: …", never a traceback (the _AliasGroup.invoke seam) ──
+
+
+def test_a_bad_config_is_reported_as_an_error_not_a_traceback(tmp_path: Path) -> None:
+    """A ConfigError from load_config — here a relative TM_* path variable, which names no file to
+    be read from — must reach the user as a one-line "Error: …" with a non-zero exit, never a raw
+    traceback. It is caught at the single _AliasGroup.invoke seam so EVERY command gets it (the
+    defect hit runs / triage / rescan / scan alike); diff resolves its own before it reaches here.
+
+    MUTATION (verified RED): drop the ConfigError catch in _AliasGroup.invoke -> the exception
+    leaks out of main(), so result.exception is a raw ConfigError and no "Error:" line is printed
+    (only the toolchain warning) -> both the isinstance and the "Error: ConfigError" assertions
+    fail. The warning carries "relative path" either way, so that line alone has no teeth."""
+    r = CliRunner().invoke(
+        main,
+        ["runs"],
+        env={"TM_ATLAS__DB_PATH": "relative/atlas.db", "HOME": str(tmp_path)},
+    )
+    assert r.exit_code != 0
+    # converted at the entry, never leaked to the user as a raw ConfigError
+    assert not isinstance(r.exception, ConfigError)
+    # shown as a formatted error line carrying the cause
+    assert "Error: ConfigError" in r.stderr
+    assert "relative path" in r.stderr

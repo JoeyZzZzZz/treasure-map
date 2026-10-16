@@ -148,7 +148,10 @@ def test_a_running_export_is_registered_and_a_sweep_kill_reaps_it() -> None:
     thread) ends it at once, so the worker returns in seconds rather than at the child's 60s.
 
     MUTATION: drop the ``_register_pgid`` call -> the registry stays empty while the export runs
-    -> the "registered while running" assertion fails (RED)."""
+    -> the "registered while running" assertion fails (RED).
+    MUTATION: drop ``_SWEEP_CANCELLED.set()`` in ``_kill_running_groups`` -> the kill no longer
+    latches the cancel flag, so the post-kill ``_run_killable`` starts an export instead of
+    refusing -> the ``_SweepCancelledError`` assertion fails (RED)."""
     marker = "tmap_test_sleeper_rk4"
     before = set(driver._RUNNING_PGIDS)
     done: dict[str, object] = {}
@@ -175,6 +178,11 @@ def test_a_running_export_is_registered_and_a_sweep_kill_reaps_it() -> None:
         time.sleep(0.3)
         assert _reap(marker) == []
         assert set(driver._RUNNING_PGIDS) == before  # and it unregistered on the way out
+        # the same kill latched the cancel flag: a worker that had NOT yet reached its Popen now
+        # refuses to start one (the start-after-kill guard), so an interrupted sweep spawns no new
+        # JVM after the kill. ``["true"]`` would otherwise run and return cleanly.
+        with pytest.raises(driver._SweepCancelledError):
+            _run_killable(["true"], dict(os.environ), 30)
     finally:
         _reap(marker)
 
