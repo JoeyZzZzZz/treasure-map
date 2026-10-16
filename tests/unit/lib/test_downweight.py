@@ -661,6 +661,19 @@ def test_only_the_sinks_parameter_position_is_checked() -> None:
     assert _cc(pc, 'void h(char *q){ run(q, "/etc/rc start"); }', "param_2") == CALLER_CONSTANT
 
 
+def test_the_calls_own_literal_is_checked_before_the_caller_hint() -> None:
+    """When both signals hold for one candidate — its call passes a literal, and its sink argument
+    names a parameter every caller passes a constant for — the call's own literal is the note:
+    it is read off this call site, while caller_constant is a hint read from callers that may not
+    all be known, and only the former is a provably-constant marker. The parameter carries a
+    recovered name rather than a ``param_N`` placeholder, because the literal check counts a
+    placeholder parameter as a caller-supplied value and would not hold.
+
+    MUTATION: check caller_constant before the call's own literal -> RED (caller_constant)."""
+    pc = 'void run(char *cmd){ system("/sbin/reboot"); }'
+    assert _cc(pc, 'void boot(void){ run("start"); }', "cmd") == CONST_SINK_ARG
+
+
 def test_a_rewritten_parameter_is_not_caller_constant() -> None:
     """MUTATION: ignore writes to the parameter in the body -> RED."""
     pc = 'void run(char *param_1){ param_1 = nvram_get("x"); system(param_1); }'

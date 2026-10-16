@@ -624,3 +624,82 @@ def test_get_imports_exports_surfaces_the_unresolved_dependencies(tmp_path: Path
     assert clean["dt_needed_unresolved"] == []
     assert facts.count_unresolved_soname_edges(conn) == 1
     conn.close()
+
+
+# ── only the current scan's binaries take part ────────────────────────────────
+
+
+def _rescanned_in_place_db(tmp_path: Path) -> sqlite3.Connection:
+    """A workspace scanned twice: both binaries were replaced, and the first scan's rows stay.
+
+    Ingest de-duplicates by content and never deletes, so the first scan's appd (1) and
+    libcfg.so (2) keep their functions, exports, imports and strings under an older
+    ``last_seen_at``; the current scan holds appd (3) and libcfg.so (4). Every layer has an input
+    on the old rows, so each layer that read them would add an edge naming binary 1 or 2."""
+    conn = open_db(tmp_path / "analysis.db")
+    for bid, name, seen in (
+        (1, "appd", "2026-01-01 00:00:00"),
+        (2, "libcfg.so", "2026-01-01 00:00:00"),
+        (3, "appd", "2026-02-01 00:00:00"),
+        (4, "libcfg.so", "2026-02-01 00:00:00"),
+    ):
+        is_app = name == "appd"
+        conn.execute(
+            "INSERT INTO binaries (id, name, path, sha256, last_seen_at, dt_needed) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (bid, name, f"usr/{name}", str(bid) * 64, seen, '["libcfg.so"]' if is_app else "[]"),
+        )
+        fid = bid * 10
+        conn.execute(
+            "INSERT INTO functions (id, binary_id, name, callees) VALUES (?, ?, ?, ?)",
+            (fid, bid, "main" if is_app else "cfg_get", '["cfg_get"]' if is_app else "[]"),
+        )
+        if is_app:
+            conn.execute(
+                "INSERT INTO imports (binary_id, func_name, lib_soname) "
+                "VALUES (?, 'cfg_get', 'libcfg.so')",
+                (bid,),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO exports (binary_id, func_name, address) VALUES (?, 'cfg_get', '0x10')",
+                (bid,),
+            )
+        conn.execute(
+            "INSERT INTO strings (binary_id, value, address) "
+            "VALUES (?, '/var/run/cfgd.sock', '0x20')",
+            (bid,),
+        )
+    conn.commit()
+    return conn
+
+
+def test_a_rescanned_workspace_links_only_the_current_scans_binaries(tmp_path: Path) -> None:
+    """A removed library must not answer a call, and a replaced one must not sit beside its
+    successor under the same soname: that made the current appd's dependency on libcfg.so read as
+    ambiguous between the old and the new copy, so its edge was not written at all.
+
+    MUTATION (each measured RED on the edge-set assertion): read every binary in the soname map
+    -> the dependency is ambiguous, its edges vanish and the ledger fills; drop the current-binary
+    filter from the layer-0 exports -> an edge to the old library's cfg_get; from the layer-0
+    callers -> an edge from the old appd's main; from the layer-1 imports -> an import edge from
+    the old appd; read every binary in layer 2 -> a dt_needed edge from the old appd; drop it from
+    the layer-3 strings -> string_ipc edges to and from the old binaries.
+    """
+    conn = _rescanned_in_place_db(tmp_path)
+    build_xrefs(conn)
+    edges = {
+        tuple(r)
+        for r in conn.execute(
+            "SELECT caller_binary_id, caller_func_id, callee_binary_id, callee_func_id, xref_type "
+            "FROM xrefs"
+        )
+    }
+    assert edges == {
+        (3, 30, 4, 40, "callees_exports"),
+        (3, 30, 4, 40, "import_export"),
+        (3, None, 4, None, "dt_needed"),
+        (3, None, 4, None, "string_ipc"),
+    }, edges
+    assert _ledger(conn) == []
+    conn.close()

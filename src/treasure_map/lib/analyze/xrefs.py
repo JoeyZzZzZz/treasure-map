@@ -11,6 +11,11 @@ Also classifies all strings via STRING_RULES.
 
 Semantics: wipe-and-rebuild. xrefs is always derivable from current DB state.
 
+Every layer reads the CURRENT scan's binaries only (the ``current_binaries`` view). A workspace
+re-scanned in place keeps the previous scan's binaries and their functions, exports, imports and
+strings; read here, a removed library would still answer a call, and a replaced one would sit
+beside its successor under the same soname and make the dependency read as ambiguous.
+
 NOTE on imports and Layer 1 on stripped MIPS/ARM firmware:
   Layer 0 (callees x exports) is the PRIMARY cross-binary call-graph source and does not
   depend on the ExternalManager, so the graph stands even when imports are sparse.
@@ -198,7 +203,7 @@ def _build_soname_map(cur: sqlite3.Cursor) -> dict[str, dict[str, tuple[int, ...
     exact: dict[str, list[int]] = {}
     versioned: dict[str, list[int]] = {}
     unversioned: dict[str, list[int]] = {}
-    for bid, name in cur.execute("SELECT id, name FROM binaries"):
+    for bid, name in cur.execute("SELECT id, name FROM current_binaries"):
         exact.setdefault(name, []).append(bid)
         base = re.sub(r"\.so(\.\d+)+$", ".so", name)
         if base != name:
@@ -411,14 +416,16 @@ def _layer0_callees_exports(
            FROM exports e
            JOIN functions f
                ON f.binary_id = e.binary_id AND f.name = e.func_name
-           WHERE e.func_name IS NOT NULL AND e.func_name != ''"""
+           WHERE e.func_name IS NOT NULL AND e.func_name != ''
+             AND e.binary_id IN (SELECT id FROM current_binaries)"""
     ).fetchall()
     for exp_binary_id, exp_func_name, callee_func_id in rows:
         export_index[exp_func_name].append((exp_binary_id, callee_func_id))
 
     func_rows = cur.execute(
         """SELECT id, binary_id, callees FROM functions
-           WHERE callees IS NOT NULL AND callees != '[]'"""
+           WHERE callees IS NOT NULL AND callees != '[]'
+             AND binary_id IN (SELECT id FROM current_binaries)"""
     ).fetchall()
 
     # Pass 1: parse callees once, count caller references per exported name (the edge-contribution
@@ -500,7 +507,8 @@ def _layer1_import_export(
     imports = cur.execute(
         """SELECT binary_id, func_name, lib_soname
            FROM imports
-           WHERE lib_soname IS NOT NULL AND lib_soname != ''"""
+           WHERE lib_soname IS NOT NULL AND lib_soname != ''
+             AND binary_id IN (SELECT id FROM current_binaries)"""
     ).fetchall()
 
     if not imports:
@@ -578,7 +586,9 @@ def _layer2_dt_needed(
     previously written: they pointed at whichever binary the index happened to hold, which is not
     the same thing as pointing at the right one. Almost-certainly-right is not right, and the
     candidates are handed over so the question can be settled rather than assumed."""
-    rows = cur.execute("SELECT id, dt_needed FROM binaries WHERE dt_needed != '[]'").fetchall()
+    rows = cur.execute(
+        "SELECT id, dt_needed FROM current_binaries WHERE dt_needed != '[]'"
+    ).fetchall()
     for bid, dt_json in rows:
         try:
             dt_needed = json.loads(dt_json)
@@ -624,6 +634,7 @@ def _layer3_string_ipc(
         """SELECT value, GROUP_CONCAT(DISTINCT binary_id) AS bids
            FROM strings
            WHERE category IN ('ipc_sock', 'path', 'crypto_hint')
+             AND binary_id IN (SELECT id FROM current_binaries)
            GROUP BY value
            HAVING COUNT(DISTINCT binary_id) >= 2"""
     ).fetchall()

@@ -747,7 +747,10 @@ def _flatten_string_tables(db_path: Path | str, source_run_id: str) -> list[Stri
             "SELECT s.table_addr, s.key, s.func_name, s.func_addr, s.func_kind, "
             "s.completeness_status, s.completeness_reason, s.completeness_scope, "
             "b.name AS binary, b.path AS binary_path "
-            "FROM string_tables s LEFT JOIN binaries b ON b.id = s.binary_id"
+            "FROM string_tables s JOIN binaries b ON b.id = s.binary_id "
+            # The current scan's binaries only — the rule the shape scan applies to functions. A
+            # re-scan in place keeps the previous scan's binaries, and their tables, in the db.
+            "WHERE b.last_seen_at IS (SELECT MAX(last_seen_at) FROM binaries)"
         ).fetchall()
     except sqlite3.OperationalError:
         return []  # pre-detector-A analysis.db -> no data (capability still registered)
@@ -908,7 +911,10 @@ def _flatten_detector_status(
         rows = conn.execute(
             "SELECT d.detector, d.scanned, d.supported_scope, d.unsupported_note, d.cap_hit, "
             "d.found_count, b.name AS binary, b.path AS binary_path "
-            "FROM detector_scan_status d LEFT JOIN binaries b ON b.id = d.binary_id"
+            "FROM detector_scan_status d JOIN binaries b ON b.id = d.binary_id "
+            # Current binaries only: a replaced binary's status row would sit beside its
+            # successor's under the same path and make the completeness claim ambiguous.
+            "WHERE b.last_seen_at IS (SELECT MAX(last_seen_at) FROM binaries)"
         ).fetchall()
     except sqlite3.OperationalError:
         return []  # pre-feature analysis.db -> no status (query reports 'no status recorded')
@@ -1114,7 +1120,10 @@ def _load_nvram_defaults(db_path: Path | str, source_run_id: str) -> list[NvramD
         rows = conn.execute(
             "SELECT d.key, d.default_value, d.flags, d.member_index, b.name AS binary, "
             "b.path AS binary_path "
-            "FROM nvram_defaults d LEFT JOIN binaries b ON b.id = d.binary_id"
+            "FROM nvram_defaults d JOIN binaries b ON b.id = d.binary_id "
+            # Current binaries only: a removed or replaced binary's defaults table would still
+            # make its keys read as settable defaults of this firmware.
+            "WHERE b.last_seen_at IS (SELECT MAX(last_seen_at) FROM binaries)"
         ).fetchall()
     except sqlite3.OperationalError:
         return []  # pre-naming-bridge analysis.db -> no data

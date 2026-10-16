@@ -40,3 +40,33 @@ def test_a_second_scan_of_the_same_workspace_is_refused(tmp_path: Path) -> None:
     # released on exit: the next scan of the same workspace goes ahead
     with Workspace(tmp_path / "ws") as ws:
         assert ws.db_path == tmp_path / "ws" / "analysis.db"
+
+
+def test_closing_a_workspace_releases_its_lock_there_and_then(tmp_path: Path) -> None:
+    """``tmap rescan`` scans several runs in one process, so a workspace it has finished with must
+    be free again at once — released by ``close()``, not whenever the file object is collected.
+
+    MUTATION: make ``close()`` a no-op -> RED: the same process is refused its own workspace on
+    the next entry. Drop the unlock and the close but still forget the handle (the form that
+    survived before) -> RED: the lock file is left for the collector to close, which reports it
+    as a ResourceWarning.
+    """
+    import gc
+    import warnings
+
+    from treasure_map.lib.errors import WorkspaceError
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        ws = Workspace(tmp_path / "ws")
+        ws.__enter__()
+        ws.close()
+        gc.collect()
+    try:
+        with Workspace(tmp_path / "ws"):
+            outcome = "re-entered"
+    except WorkspaceError:
+        outcome = "refused"
+    assert outcome == "re-entered"
+    leaked = [str(w.message) for w in caught if issubclass(w.category, ResourceWarning)]
+    assert leaked == [], leaked

@@ -512,3 +512,67 @@ def test_an_interrupted_hunt_exits_like_any_other_interrupt(
     )
     assert result.exit_code == 130, result.output
     assert "rolled back" in result.output
+
+
+def _try_workspace(path: Path) -> str:
+    """Whether another scan of ``path`` could take the workspace now."""
+    from treasure_map.lib.errors import WorkspaceError
+    from treasure_map.lib.workspace.workspace import Workspace
+
+    try:
+        with Workspace(path):
+            return "acquired"
+    except WorkspaceError:
+        return "refused"
+
+
+def test_the_workspace_stays_locked_through_the_hunt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The hunt reads analysis.db, so a second scan of the same workspace must stay out until the
+    hunt is done: re-extracting the database mid-hunt hands the hunt part of each extraction. The
+    lock is the real one here (no stand-in Workspace), probed from inside each stage.
+
+    MUTATION: release the lock when analyze returns (the hunt outside it, as before) -> RED: the
+    probe inside the hunt acquires the workspace. Leaving the stack unclosed stays GREEN here: the
+    collector closes the lock file when the command returns, so the last assertion holds anyway;
+    that ``Workspace.close()`` itself releases the lock is pinned in test_workspace.
+    """
+    monkeypatch.setattr(
+        "treasure_map.lib.config.config.load_config",
+        lambda _cfg=None: Config(llm=None, workspace_dir=tmp_path / "workspaces"),
+    )
+    seen: dict[str, str] = {}
+
+    def _fake_analyze(_fs_root: Path, ws: Any, *_: Any, **__: Any) -> AnalyzeResult:
+        seen["analyze"] = _try_workspace(ws.path)
+        return _fake_analyze_result(ws.db_path)
+
+    def _fake_hunt(
+        db: Any,
+        atlas: Any,
+        *,
+        source_run_id: str,
+        firmware_path: str | None = None,
+        rehunt: bool = False,
+    ) -> Any:
+        seen["hunt"] = _try_workspace(Path(db).parent)
+        return _hunt_stats()
+
+    monkeypatch.setattr("treasure_map.lib.analyze.pipeline.run_analyze", _fake_analyze)
+    monkeypatch.setattr("treasure_map.lib.hunt.run_analyzer2", _fake_hunt)
+    result = CliRunner().invoke(
+        scan,
+        [
+            str(_mkfs(tmp_path)),
+            "-w",
+            "router_v1",
+            "--atlas",
+            str(tmp_path / "atlas.db"),
+            "--top",
+            "0",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert seen == {"analyze": "refused", "hunt": "refused"}
+    assert _try_workspace(tmp_path / "workspaces" / "router_v1") == "acquired"
