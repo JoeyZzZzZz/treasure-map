@@ -427,6 +427,43 @@ def test_sqlite_error_in_persist_does_not_abort_the_sweep(
     assert (boom[0], boom[1]) == (0, "failed")  # recorded as its own atomic failed row
 
 
+def test_a_sqlite_error_in_preflight_is_that_binarys_blind_spot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ★ preflight reads the atlas and each run's analysis.db on the main thread. A sqlite error on
+    # one binary there must stay that binary's failure — recorded as its blind spot while the atlas
+    # can still be written — and the other binaries still diff. Reverse: catching only
+    # TreasureMapError lets it abort the sweep; dropping the record leaves no blind-spot row.
+    atlas_path = _seed(tmp_path, {"ok": "1", "boom": "2"}, {"ok": "1x", "boom": "2x"})
+    monkeypatch.setattr(driver, "_check_toolchain", lambda config: None)
+    real_pf = _fake_preflight(tmp_path)
+
+    def _pf(atlas, run_a_id, run_b_id, binary_name, *, config, force):  # type: ignore[no-untyped-def]
+        if binary_name == "boom":
+            raise sqlite3.OperationalError("database disk image is malformed")
+        return real_pf(atlas, run_a_id, run_b_id, binary_name, config=config, force=force)
+
+    monkeypatch.setattr(driver, "preflight", _pf)
+    monkeypatch.setattr(
+        driver, "compute_diff", lambda so_a, so_b, td, config: driver.DiffArtifacts(so_a, so_b, td)
+    )
+    monkeypatch.setattr(driver, "_persist_success", _ok_persist)
+    con = open_atlas(atlas_path)
+    try:
+        fsum = driver.run_full_diff(con, "run_a", "run_b", config=_cfg())
+    except sqlite3.Error as exc:
+        pytest.fail(f"a preflight sqlite error aborted the whole sweep: {exc}")
+    outcomes = {o.binary: o for o in fsum.outcomes}
+    boom = con.execute(
+        "SELECT diff_ok, diff_status FROM diff_meta WHERE diff_id=?", ("run_a::run_b::boom",)
+    ).fetchone()
+    con.close()
+    assert set(outcomes) == {"ok", "boom"}
+    assert outcomes["boom"].summary is None and outcomes["ok"].summary is not None
+    assert boom is not None, "the preflight failure left no blind-spot row"
+    assert (boom[0], boom[1]) == (0, "failed")
+
+
 # ── diff-side memory budget is decoupled from the shared scan/init constant ─────────────
 
 

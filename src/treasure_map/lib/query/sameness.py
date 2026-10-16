@@ -476,14 +476,16 @@ def hidden_region(
 # repeated lines of real code being what makes it slow) took 7.9s. So both matchers are bounded
 # by the product, and a function whose delta would exceed either bound is not_computed
 # (too_large) as a whole — a half-analysed delta would misstate its own kind.
-# Caps on the line-level and per-block token-level matches. Both run difflib's O(n*m)
+# Caps on the line-level match and on the token-level matches. Both run difflib's O(n*m)
 # get_opcodes, a single uninterruptible call, so the product is the only lever — a wall-clock
-# budget checked afterwards cannot preempt it. The worst-case time is strongly content- and
+# budget checked afterwards cannot preempt it. The token cap is ONE budget for the whole delta,
+# each changed block's product drawn from it: a per-block cap let many blocks, each just under
+# it, add up to a time no single block could reach. The worst-case time is strongly content- and
 # machine-dependent (duplicate-heavy bodies blow difflib's matching up), and the previous 25M
 # line cap was measured in the tens of seconds on a real firmware function, so both are kept
 # conservative rather than tied to a promised time.
 DELTA_LINE_PRODUCT_CAP = 5_000_000  # line pairs for the line-level match
-DELTA_TOKEN_PRODUCT_CAP = 5_000_000  # token pairs inside any one changed block
+DELTA_TOKEN_PRODUCT_CAP = 5_000_000  # token pairs summed over every changed block
 _DELTA_FIRST = 5  # substitution pairs shown per token kind
 
 _TOK = re.compile(
@@ -567,13 +569,15 @@ def pseudocode_delta(
     if len(la) * len(lb) > DELTA_LINE_PRODUCT_CAP:
         return too_large
     spans = 0
+    token_pairs = 0  # drawn from the one DELTA_TOKEN_PRODUCT_CAP budget, block by block
     subs: dict[str, dict[str, Any]] = {}
     lines = SequenceMatcher(None, la, lb, autojunk=False)
     for op, i1, i2, j1, j2 in lines.get_opcodes():
         if op == "equal":
             continue
         ta, tb = _tokens("\n".join(la[i1:i2])), _tokens("\n".join(lb[j1:j2]))
-        if len(ta) * len(tb) > DELTA_TOKEN_PRODUCT_CAP:
+        token_pairs += len(ta) * len(tb)
+        if token_pairs > DELTA_TOKEN_PRODUCT_CAP:
             return too_large
         toks = SequenceMatcher(None, [t[1] for t in ta], [t[1] for t in tb], autojunk=False)
         for top, k1, k2, m1, m2 in toks.get_opcodes():

@@ -1317,6 +1317,51 @@ def test_a_failure_after_a_content_change_still_marks_the_dropped_baseline(
     assert _row(w)["baseline_dropped"] == 0 and _baseline_rows(w) > 0
 
 
+def test_an_interrupt_after_the_new_rows_commit_leaves_the_loss_marked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A re-diff commits its new rows, then stores the baseline again in a second transaction. An
+    interrupt between the two must leave the row saying the baseline is gone (and the next re-diff
+    stores it), which is why the mark is written in the SAME transaction as the new rows.
+
+    MUTATION: drop the ``baseline_dropped = 1`` written with the new rows -> the committed row says
+    0 while no baseline rows exist -> RED."""
+    w = _baselined(tmp_path, monkeypatch)
+    _extraction(w)
+
+    def _interrupted(*_a: Any, **_kw: Any) -> int:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(driver, "persist_sink_overlay", _interrupted)
+    fs = _full(w)
+    assert fs.cancelled is True
+    assert _baseline_rows(w) == 0  # the re-diff's rows replaced the old ones, baseline not back
+    assert _row(w)["baseline_dropped"] == 1
+
+
+def test_a_sqlite_error_restoring_the_baseline_keeps_the_good_diff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The new rows are already committed when the baseline is stored again. A sqlite error there
+    (a lock, say) is that step's failure only: the diff stays a success with its baseline marked
+    dropped, not a failed row recomputed next time.
+
+    MUTATION: catch only TreasureMapError around the baseline restore -> the sqlite error reaches
+    the per-binary handler, which records the good diff as failed -> RED."""
+    w = _baselined(tmp_path, monkeypatch)
+    _extraction(w)
+
+    def _locked(*_a: Any, **_kw: Any) -> int:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(driver, "persist_sink_overlay", _locked)
+    (oc,) = _full(w).outcomes
+    assert oc.summary is not None, f"the good diff was turned into a failure: {oc.error}"
+    assert oc.summary.baseline == "not_restored"
+    row = _row(w)
+    assert (row["diff_ok"], row["baseline_dropped"]) == (1, 1)
+
+
 # ── the CLI passes --assume-current through ──────────────────────────────────────────────────────
 
 

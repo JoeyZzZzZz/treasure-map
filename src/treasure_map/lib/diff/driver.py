@@ -725,6 +725,14 @@ def _tail(raw: bytes | None, n: int) -> str:
 # guards the set because the parallel full diff runs several at a time.
 _RUNNING_PGIDS: set[int] = set()
 _RUNNING_PGIDS_LOCK = threading.Lock()
+# Set when the sweep is interrupted. A worker that had not yet started its BinExport when the
+# running groups were killed (side b after side a, say) would otherwise start a fresh JVM after the
+# kill and keep the shutdown waiting on it; _run_killable checks this before and after it starts.
+_SWEEP_CANCELLED = threading.Event()
+
+
+class _SweepCancelledError(Exception):
+    """A BinExport step refused or stopped because the sweep it belongs to was interrupted."""
 
 
 def _register_pgid(pgid: int) -> None:
@@ -740,6 +748,7 @@ def _unregister_pgid(pgid: int) -> None:
 def _kill_running_groups() -> None:
     """SIGKILL every BinExport process group still running. Called when the sweep is interrupted:
     the 4GB-heap JVMs die at once, instead of each being waited on until it hits its own timeout."""
+    _SWEEP_CANCELLED.set()  # first: a worker about to start a JVM now refuses to
     with _RUNNING_PGIDS_LOCK:
         pgids = list(_RUNNING_PGIDS)
     for pgid in pgids:
@@ -761,11 +770,15 @@ def _run_killable(
     reaching another thread can reap it too (see ``_kill_running_groups``). Returns a
     CompletedProcess so the callers that read stdout / stderr / returncode are unchanged;
     re-raises whatever stopped it (TimeoutExpired, KeyboardInterrupt, …) after the kill."""
+    if _SWEEP_CANCELLED.is_set():
+        raise _SweepCancelledError("the diff sweep was interrupted; not starting another export")
     proc = subprocess.Popen(  # noqa: S603 -- fixed argv, no shell
         cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True
     )
     _register_pgid(proc.pid)  # pid == pgid (session leader)
     try:
+        if _SWEEP_CANCELLED.is_set():  # the kill ran between the check above and the register
+            raise _SweepCancelledError("the diff sweep was interrupted while this export started")
         out, err = proc.communicate(timeout=timeout)
     except BaseException:
         # A timeout, or an interrupt delivered to this thread: take the JVM group down before
@@ -1138,12 +1151,20 @@ def _persist_success(
         try:
             persist_sink_overlay(atlas, diff_id, commit=True)
             baseline = "restored"
-        except TreasureMapError as exc:
-            atlas.rollback()
+        except (TreasureMapError, sqlite3.Error) as exc:
             # The new rows are committed without the baseline: say so on the row, so the loss is
-            # not read as "never had one" and the next re-diff stores it again.
-            atlas.execute("UPDATE diff_meta SET baseline_dropped = 1 WHERE diff_id = ?", (diff_id,))
-            atlas.commit()
+            # not read as "never had one" and the next re-diff stores it again. The row already
+            # carries baseline_dropped=1 from the transaction that wrote it, so if even this write
+            # fails (the database is still locked) the loss stays visible. A sqlite error here is
+            # caught too: it must not turn this committed, good diff into a failed one.
+            try:
+                atlas.rollback()
+                atlas.execute(
+                    "UPDATE diff_meta SET baseline_dropped = 1 WHERE diff_id = ?", (diff_id,)
+                )
+                atlas.commit()
+            except sqlite3.Error:
+                pass
             baseline = "not_restored"
             warnings = (
                 *warnings,
@@ -1188,6 +1209,7 @@ def run_version_diff(
     currency_warnings = check_run_pair_currency(
         _resolve_run(atlas, run_a_id, "a"), _resolve_run(atlas, run_b_id, "b")
     )
+    _SWEEP_CANCELLED.clear()  # an earlier interrupted sweep in this process must not refuse this
     pf = preflight(atlas, run_a_id, run_b_id, binary_name, config=config, force=force)
     toolchain = _toolchain.detect_toolchain(config)
     # pf.binary_a is the normalized short name (preflight resolved it, asserted non-None). Include
@@ -1656,6 +1678,7 @@ def run_full_diff(
             "same toolchain, or pass --force to diff anyway (the result stays honestly degraded)."
         )
     warnings = check_run_pair_currency(run_a, run_b)
+    _SWEEP_CANCELLED.clear()  # a fresh sweep: an earlier interrupted one must not refuse this one
     # Read before the plan: the plan compares it with the toolchain each diff was computed by.
     toolchain = _toolchain.detect_toolchain(config)
     plan = plan_full_diff(
@@ -1711,9 +1734,26 @@ def run_full_diff(
             pf = preflight(atlas, run_a_id, run_b_id, binary, config=config, force=force)
         except (TreasureMapError, sqlite3.Error) as exc:
             # A sqlite error on ONE binary (a locked row, a corrupt page) is that binary's failure,
-            # not grounds to abandon the whole sweep — the other binaries still diff. It records as
-            # a blind spot like any other failure below.
-            if isinstance(exc, (AmbiguousBinarySelectorError, ExtractionUnstampedError)):
+            # not grounds to abandon the whole sweep — the other binaries still diff. It is recorded
+            # as a blind spot when the atlas can still be written; when it cannot (the fault is the
+            # atlas itself), the binary is reported as failed without a row.
+            if isinstance(exc, sqlite3.Error):
+                try:
+                    _record_diff_failure(
+                        atlas,
+                        diff_id=make_diff_id(run_a_id, run_b_id, binary),
+                        run_a_id=run_a_id,
+                        run_b_id=run_b_id,
+                        binary_short=binary,
+                        exc=exc,
+                        toolchain=toolchain,
+                    )
+                    attempts, reason = _read_recorded_status(
+                        atlas, make_diff_id(run_a_id, run_b_id, binary)
+                    )
+                except sqlite3.Error:
+                    attempts, reason = None, None
+            elif isinstance(exc, (AmbiguousBinarySelectorError, ExtractionUnstampedError)):
                 # Persist it as this binary's blind spot, the same shape a toolchain failure gets.
                 # A refusal that lives only in the console scrolls away; recorded, it shows up in
                 # list_diff_blindspots with a reason that names the fix.
@@ -1816,6 +1856,9 @@ def run_full_diff(
             # cancel_futures=True drops the QUEUED computes (the real 'stop the sweep'); wait=True
             # lets the in-flight ones finish so rmtree never races a compute still writing its dir.
             pool.shutdown(wait=True, cancel_futures=True)
+            # Every worker has returned, so nothing is left to refuse: an interrupt's flag ends
+            # with the sweep it stopped instead of outliving it in this process.
+            _SWEEP_CANCELLED.clear()
             for td in tds.values():
                 shutil.rmtree(td, ignore_errors=True)
 

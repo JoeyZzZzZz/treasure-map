@@ -474,3 +474,58 @@ def test_a_changed_block_over_the_token_product_cap_is_not_computed(
     }
     small = sm.pseudocode_delta("x = a1;", "x = b1;", None, None, "1000", "2000")
     assert small["kind"] == "substitution_only"
+
+
+def test_the_token_cap_is_one_budget_for_the_whole_delta(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Changed blocks each under the token cap must still be refused once their products add up
+    past it: the time is the SUM over blocks, and a per-block cap let many blocks, each just under
+    it, run several times longer than any one block could.
+
+    MUTATION: check each block's product alone instead of the running total -> the two-block body
+    is computed -> RED."""
+    monkeypatch.setattr(sm, "DELTA_TOKEN_PRODUCT_CAP", 400)
+
+    def block(tag: str, k: int) -> list[str]:
+        return [f"x{k} = {tag}{k} + {tag}{k + 1};"]  # one changed line: a small token block
+
+    one_a = "\n".join(block("a", 0) + ["keep();"])
+    one_b = "\n".join(block("b", 0) + ["keep();"])
+    assert sm.pseudocode_delta(one_a, one_b, None, None, "1000", "2000")["kind"] != "not_computed"
+    many_a = "\n".join(sum((block("a", k) + [f"keep{k}();"] for k in range(12)), []))
+    many_b = "\n".join(sum((block("b", k) + [f"keep{k}();"] for k in range(12)), []))
+    assert sm.pseudocode_delta(many_a, many_b, None, None, "1000", "2000") == {
+        "kind": "not_computed",
+        "reason": "too_large",
+    }
+
+
+def test_the_line_cap_sits_at_five_million_pairs() -> None:
+    """The line cap is a measured bound (a larger one ran into the tens of seconds), so it is
+    pinned by behaviour at its real value: 2236 x 2236 lines (4,999,696 pairs) is computed,
+    2237 x 2237 (5,004,169) is refused before any matching runs.
+
+    MUTATION: raise DELTA_LINE_PRODUCT_CAP back to 25_000_000 -> the 2237-line body is computed
+    -> RED."""
+
+    def body(n: int, changed: int) -> str:
+        return "\n".join(f"x{i} = {i + (1 if i == changed else 0)};" for i in range(n))
+
+    assert (
+        sm.pseudocode_delta(body(2236, -1), body(2236, 7), None, None, "1000", "2000")["kind"]
+        == "substitution_only"
+    )
+    assert sm.pseudocode_delta(body(2237, -1), body(2237, 7), None, None, "1000", "2000") == {
+        "kind": "not_computed",
+        "reason": "too_large",
+    }
+
+
+def test_the_token_budget_stays_at_five_million_pairs() -> None:
+    """The token budget is pinned at its measured value: one changed block just under it ran about
+    3s, and a block-count multiple of that is what the budget exists to stop. Raising it is a
+    decision to re-measure, not a constant to tweak.
+
+    MUTATION: raise DELTA_TOKEN_PRODUCT_CAP to 20_000_000 -> RED."""
+    assert sm.DELTA_TOKEN_PRODUCT_CAP == 5_000_000
