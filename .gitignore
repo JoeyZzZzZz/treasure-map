@@ -47,10 +47,6 @@ internal_data/
 .env
 .env.local
 
-# Benchmark firmware (only ground_truth files are tracked)
-benchmarks/raw_firmware/
-benchmarks/extracted/
-
 # Logs
 *.log
 logs/
