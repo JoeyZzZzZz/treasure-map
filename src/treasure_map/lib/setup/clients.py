@@ -17,8 +17,10 @@ is read straight from its configuration file:
 
 Where the client has a CLI (Claude Code, Codex) the CLI writes; Cursor and Claude Desktop get a
 JSON transaction (backup, atomic replace, read back, restore the original bytes on any
-difference); dsh's patch file is only ever appended to. Whatever cannot be written comes back as
-the exact text to paste.
+difference); dsh's patch file is appended to (a lone ``[]`` line is replaced, since a list entry
+cannot follow it), and removing tmap's block never leaves a file dsh refuses to load: one that
+held nothing else is deleted, one with other content left is kept a top-level list. Whatever
+cannot be written comes back as the exact text to paste.
 """
 
 from __future__ import annotations
@@ -367,6 +369,23 @@ def _read_dsh(path: Path) -> _DshRead:
     return _DshRead(text, data)
 
 
+def _dsh_accepts(path: Path) -> bool:
+    """dsh's own rule for its optional home patch layer: an absent file is no patches, and a file
+    that exists must load as a top-level YAML array — an empty or comment-only one loads as null
+    and dsh refuses to start. ``_read_dsh`` reads null as an empty list, which is right for
+    appending to, so it is not the check for what tmap leaves behind."""
+    if not path.exists():
+        return True
+    try:
+        return isinstance(yaml.safe_load(path.read_text()), list)
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        return False
+
+
+# A line holding only an empty flow list: what an uninstall leaves when the user's comments stay.
+_EMPTY_LIST_LINE = re.compile(r"^[ \t]*\[\][ \t]*(?:\n|\Z)", re.MULTILINE)
+
+
 def _dsh_entries(items: Sequence[Any]) -> list[dict[str, Any]]:
     """Every inserted entry serving ``treasure-map`` — whatever its id (a hand-written one is
     tmap's server too, and a second one beside it would start the server twice)."""
@@ -659,7 +678,9 @@ def _register_dsh(host: ClientHost, tmap: Path, state: ClientState) -> Outcome:
     if read.items is None:
         return Outcome(False, f"{path} {read.why}; not modified", manual)
     original = path.read_bytes() if path.exists() else None
-    text = read.text
+    # A block entry cannot follow a flow `[]`, so that one line is replaced by our block.
+    base = _EMPTY_LIST_LINE.sub("", read.text, count=1) if read.items == [] else read.text
+    text = base
     if text and not text.endswith("\n"):
         text += "\n"
     new_text = text + dsh_block(tmap)
@@ -667,7 +688,7 @@ def _register_dsh(host: ClientHost, tmap: Path, state: ClientState) -> Outcome:
     _atomic_write(path, new_text.encode(), mode)
     back = _read_dsh(path)
     ours = _dsh_entries(back.items) if back.items is not None else []
-    prefix_kept = _read_back(path).decode(errors="replace").startswith(read.text)
+    prefix_kept = _read_back(path).decode(errors="replace").startswith(base)
     if len(ours) != 1 or ours[0] != _dsh_expected(tmap) or not prefix_kept:
         _restore(path, original, mode)
         return Outcome(False, f"{path}: the append did not read back as intended; restored", manual)
@@ -751,14 +772,31 @@ def _unregister_dsh(host: ClientHost) -> Outcome:
     block = dsh_block(command)
     if read.text.count(block) != 1:
         return Outcome(False, f"tmap's block in {path} was edited; remove it by hand")
+    rest = read.text.replace(block, "", 1)
+    # With our block gone, an empty or comment-only remainder loads as null, which dsh refuses
+    # (_dsh_accepts). A file that held nothing else is removed: absent is "no patches" to dsh.
+    # Otherwise the remainder is closed with an explicit empty list, so the user's comments stay
+    # and a symlink (a dotfiles copy) is written through rather than unlinked.
+    try:
+        nothing_left = yaml.safe_load(rest) is None
+    except yaml.YAMLError:
+        nothing_left = False  # the read-back below refuses it and restores the original
+    remove = nothing_left and not rest.strip() and not path.is_symlink()
+    if nothing_left and not remove:
+        rest = (rest.rstrip("\n") + "\n" if rest.strip() else "") + "[]\n"
     try:
         original = path.read_bytes()
         mode = path.stat().st_mode & 0o777
-        _atomic_write(path, read.text.replace(block, "", 1).encode(), mode)
-    except OSError as exc:  # the atomic write fails before its rename: the file is as it was
+        if remove:
+            path.unlink()
+        else:
+            _atomic_write(path, rest.encode(), mode)
+    except OSError as exc:  # neither the unlink nor the atomic write's rename ran: as it was
         return Outcome(False, f"could not write {path}: {exc}; {_by_hand('dsh')}")
+    if remove:
+        return Outcome(True, f"removed {path}: it held only tmap's block")
     back = _read_dsh(path)
-    if back.items is None or _dsh_entries(back.items):
+    if back.items is None or _dsh_entries(back.items) or not _dsh_accepts(path):
         _restore(path, original, mode)
         return Outcome(False, f"{path}: removal did not read back cleanly; restored")
     return Outcome(True, f"removed tmap's block from {path}")

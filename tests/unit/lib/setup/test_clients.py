@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 from treasure_map.lib.setup import clients as cl
 from treasure_map.lib.setup.discover import RunResult
@@ -187,6 +188,125 @@ def test_dsh_unregister_removes_only_our_block(tmp_path: Path, tmap: Path) -> No
     outs = cl.unregister("dsh", _host(home), tmap)
     assert all(o.ok for o in outs)
     assert patch.read_text() == before
+
+
+def _dsh_would_load(path: Path) -> bool:
+    """dsh's own rule for its home patch layer (dsh-app-boot loadOptionalPatches/parsePatchList):
+    an absent file is no patches; a file that exists must load as a top-level YAML array."""
+    return not path.exists() or isinstance(yaml.safe_load(path.read_text()), list)
+
+
+def test_dsh_unregister_removes_a_patch_file_that_held_only_our_block(
+    tmp_path: Path, tmap: Path
+) -> None:
+    """init created the home patch file for tmap's block alone. Taking the block out must not
+    leave an empty file — dsh loads that as null and refuses to start. The file is removed:
+    absent is "no patches" to dsh, which is how the machine was before init.
+
+    MUTATION (verified RED): the 0.1.0 removal (write the remainder as-is, read it back with
+    tmap's lenient read) -> an empty file stays -> the not-exists assertion fails.
+    MUTATION (verified RED): never take the remove branch -> the file is kept as "[]" -> RED."""
+    home = tmp_path / "h"
+    (home / ".dsh").mkdir(parents=True)
+    patch = home / ".dsh" / "cordis.patch.yml"
+    host = _host(home)
+    assert cl.register("dsh", host, tmap).ok and patch.exists()
+    outs = cl.unregister("dsh", host, tmap)
+    assert all(o.ok for o in outs), [o.message for o in outs]
+    assert not patch.exists()
+    assert _dsh_would_load(patch)
+
+
+def test_dsh_unregister_keeps_the_users_comment_as_a_list_dsh_loads(
+    tmp_path: Path, tmap: Path
+) -> None:
+    """The user's own comment and tmap's block: the comment stays, and since a comment-only file
+    loads as null (refused by dsh), the remainder is closed with an explicit empty list.
+
+    MUTATION (verified RED): drop the closing "[]" -> the comment-only remainder fails the
+    read-back and the original is restored -> the outcome is a failure."""
+    home = tmp_path / "h"
+    (home / ".dsh").mkdir(parents=True)
+    patch = home / ".dsh" / "cordis.patch.yml"
+    patch.write_text("# my dsh notes\n")
+    host = _host(home)
+    assert cl.register("dsh", host, tmap).ok
+    outs = cl.unregister("dsh", host, tmap)
+    assert all(o.ok for o in outs), [o.message for o in outs]
+    assert patch.read_text() == "# my dsh notes\n[]\n"
+    assert _dsh_would_load(patch)
+
+
+def test_dsh_unregister_through_a_symlink_keeps_the_link(tmp_path: Path, tmap: Path) -> None:
+    """A patch file kept in a dotfiles directory and linked into the dsh home: emptied of tmap's
+    block, it stays a link to a file dsh loads — deleting the link would cut the user's dotfiles
+    out of their setup.
+
+    MUTATION (verified RED): drop the symlink exception from the remove branch -> the link itself
+    is deleted -> the is_symlink assertion fails."""
+    home = tmp_path / "h"
+    (home / ".dsh").mkdir(parents=True)
+    dotfiles = tmp_path / "dotfiles"
+    dotfiles.mkdir()
+    target = dotfiles / "cordis.patch.yml"
+    link = home / ".dsh" / "cordis.patch.yml"
+    link.symlink_to(target)  # dangling until the first write goes through it
+    host = _host(home)
+    assert cl.register("dsh", host, tmap).ok
+    assert link.is_symlink() and target.is_file()
+    outs = cl.unregister("dsh", host, tmap)
+    assert all(o.ok for o in outs), [o.message for o in outs]
+    assert link.is_symlink() and link.resolve() == target.resolve()
+    assert target.read_text() == "[]\n"
+    assert _dsh_would_load(link)
+
+
+def test_dsh_init_after_uninstall_replaces_the_closing_empty_list(
+    tmp_path: Path, tmap: Path
+) -> None:
+    """After an uninstall left a comment and "[]", the next init registers again: a block list
+    entry cannot follow a flow "[]" (the result would not parse), so that line is replaced.
+
+    MUTATION (verified RED): append after the "[]" instead -> the result does not parse, the
+    original is restored -> register fails."""
+    home = tmp_path / "h"
+    (home / ".dsh").mkdir(parents=True)
+    patch = home / ".dsh" / "cordis.patch.yml"
+    patch.write_text("# my dsh notes\n[]\n")
+    host = _host(home)
+    out = cl.register("dsh", host, tmap)
+    assert out.ok, out.message
+    assert patch.read_text() == "# my dsh notes\n" + cl.dsh_block(tmap)
+    assert cl.inspect("dsh", host, tmap).state == "aligned"
+    assert _dsh_would_load(patch)
+
+
+def test_dsh_unregister_undoes_a_write_dsh_could_not_load(
+    tmp_path: Path, tmap: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The read-back is dsh's rule, not tmap's lenient read: a write that leaves an empty file
+    (which tmap reads as an empty list, but dsh refuses) is undone and reported as a failure.
+
+    MUTATION (verified RED): drop the dsh-acceptance check from the read-back -> the empty file
+    passes and the outcome is ok -> RED."""
+    home = tmp_path / "h"
+    (home / ".dsh").mkdir(parents=True)
+    patch = home / ".dsh" / "cordis.patch.yml"
+    patch.write_text("- insert:\n    - id: other\n      name: x\n")
+    host = _host(home)
+    assert cl.register("dsh", host, tmap).ok
+    registered = patch.read_text()
+    real = cl._atomic_write
+    calls: list[bytes] = []
+
+    def _bad_first_write(path: Path, data: bytes, mode: int) -> None:
+        calls.append(data)
+        real(path, b"" if len(calls) == 1 else data, mode)
+
+    monkeypatch.setattr(cl, "_atomic_write", _bad_first_write)
+    outs = cl.unregister("dsh", host, tmap)
+    assert not any(o.ok for o in outs), [o.message for o in outs]
+    assert patch.read_text() == registered  # restored: nothing of the user's lost
 
 
 def test_tmap_executable_requires_the_name(tmp_path: Path) -> None:
