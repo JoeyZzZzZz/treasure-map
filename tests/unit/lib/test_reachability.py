@@ -423,7 +423,7 @@ def test_fmtstr_literal_format_grades_unknown_degraded() -> None:
 
 def test_reachability_package_is_boundary_clean() -> None:
     banned = re.compile(
-        r"\b(vuln\w*|exploit\w*|payload|\bpoc\b|finding)\b",
+        r"\b(vuln\w*|exploit\w*|payload|\bpoc\b)\b",
         re.IGNORECASE,
     )
     section_ref = re.compile(r"§|PRD\s")

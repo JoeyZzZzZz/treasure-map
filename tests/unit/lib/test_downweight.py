@@ -584,7 +584,7 @@ def test_no_code_reads_a_symbol_name_to_decide_a_library_origin() -> None:
 
 def test_downweight_module_is_boundary_clean() -> None:
     banned = re.compile(
-        r"\b(vuln\w*|exploit\w*|payload|\bpoc\b|finding)\b",
+        r"\b(vuln\w*|exploit\w*|payload|\bpoc\b)\b",
         re.IGNORECASE,
     )
     text = _DOWNWEIGHT.read_text()

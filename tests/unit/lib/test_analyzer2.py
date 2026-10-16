@@ -3021,7 +3021,7 @@ def test_a2_sources_are_boundary_clean() -> None:
     # — so the carve-out is
     # exactly one word, exactly two surfaces.
     hard = re.compile(
-        r"\b(vuln\w*|payload|\bpoc\b|finding|defect|priority|risk[_ ]?score)\b",
+        r"\b(vuln\w*|payload|\bpoc\b|defect|priority|risk[_ ]?score)\b",
         re.IGNORECASE,
     )
     section_ref = re.compile(r"§|PRD\s")

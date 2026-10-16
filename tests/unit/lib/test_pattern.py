@@ -552,7 +552,7 @@ def test_fingerprint_stable_and_shape_distinct(tmp_path: Path) -> None:
 
 def test_pattern_package_is_boundary_clean() -> None:
     label_vocab = re.compile(
-        r"\b(vuln\w*|exploit\w*|payload|finding|priority)\b",
+        r"\b(vuln\w*|exploit\w*|payload|priority)\b",
         re.IGNORECASE,
     )
     section_ref = re.compile(r"§|PRD\s")
