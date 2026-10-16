@@ -142,6 +142,27 @@ class DiffToolchainError(TreasureMapError):
         self.kind = kind
 
 
+# Compute failures worth ONE serial in-run retry (see run_full_diff's phase 2b). These are the
+# buckets a busy machine produces when it buckles under parallel memory/IO pressure — a BinExport
+# that exited 0 without writing its file (a transient Ghidra read fault, e.g. a .sla that decodes
+# fine on the next read), a Ghidra crash, a BinDiff that wrote nothing, or an unexpected worker
+# error — and they usually clear on a single attempt with the thread pool drained, the same way
+# scan's serial phase 2 re-runs its parallel-phase failures. A timeout is deterministic at a fixed
+# budget (retrying it in-run only burns time), and a BinDiff flow-graph rejection is a documented
+# hard boundary; neither is retried in-run — both fall straight to the cross-run retry-cap path.
+_TRANSIENT_DIFF_RETRY_KINDS = frozenset(
+    {FAIL_BINEXPORT_NO_FILE, FAIL_BINEXPORT_CRASH, FAIL_BINDIFF, FAIL_OTHER}
+)
+
+
+def _is_transient_compute_failure(exc: BaseException) -> bool:
+    """Whether a failed compute should get one serial in-run retry. A DiffToolchainError is judged
+    by its ``kind``; any other (unexpected) worker error classifies as FAIL_OTHER, so it retries."""
+    if isinstance(exc, DiffToolchainError):
+        return exc.kind in _TRANSIENT_DIFF_RETRY_KINDS
+    return True
+
+
 @dataclass(frozen=True)
 class PreflightResult:
     """The resolved inputs a diff run needs, plus the honest version-skew state. Produced only when
@@ -1722,6 +1743,9 @@ def run_full_diff(
     was_failed_before = set(plan.retry) | set(plan.hard_failed)
     total = len(to_run)
     outcomes: list[BinaryDiffOutcome] = []
+    deferred: list[
+        _ResolvedDiff
+    ] = []  # transient parallel-phase failures, held for one serial retry
     done = 0
     cancelled = False
 
@@ -1822,6 +1846,15 @@ def run_full_diff(
                     compute_exc: BaseException | None = None
                 except Exception as exc:  # toolchain error OR unexpected worker crash
                     artifacts, compute_exc = None, exc
+                if compute_exc is not None and _is_transient_compute_failure(compute_exc):
+                    # Hold it for the serial phase-2b retry instead of recording the failure now:
+                    # these are the failures a machine under parallel pressure throws, and they
+                    # usually clear on one attempt with the pool drained. Not persisting here keeps
+                    # the cross-run retry-cap honest — one full diff spends at most one attempt per
+                    # binary, whether or not it took the in-run retry.
+                    shutil.rmtree(tds[rd.diff_id], ignore_errors=True)
+                    deferred.append(rd)
+                    continue
                 try:
                     oc = _persist_outcome(
                         atlas,
@@ -1861,6 +1894,45 @@ def run_full_diff(
             _SWEEP_CANCELLED.clear()
             for td in tds.values():
                 shutil.rmtree(td, ignore_errors=True)
+
+    # ── Phase 2b (serial): one retry of the transient parallel-phase failures, the pool now
+    #    drained so the retry does not fight the pressure that likely caused the failure — the same
+    #    self-heal scan does serially after its parallel phase. A binary that fails again is
+    #    recorded now and its cross-run retry cap takes over. Skipped when the sweep was cancelled:
+    #    the deferred ones then simply run next time, like the binaries that never started. ──
+    for rd in deferred:
+        if cancelled:
+            break
+        td = Path(tempfile.mkdtemp(prefix="tm_diff_retry_"))
+        try:
+            try:
+                artifacts = compute_diff(rd.so_a, rd.so_b, td, config)
+                compute_exc = None
+            except Exception as exc:
+                artifacts, compute_exc = None, exc
+            oc = _persist_outcome(
+                atlas,
+                rd,
+                run_a_id,
+                run_b_id,
+                artifacts=artifacts,
+                compute_exc=compute_exc,
+                toolchain=toolchain,
+            )
+        except KeyboardInterrupt:
+            # Ctrl-C during the serial retry: kill the one in-flight BinExport group, drop the
+            # in-flight (uncommitted) persist, and stop — the rest run next time.
+            _kill_running_groups()
+            cancelled = True
+            atlas.rollback()
+            logger.warning("diff: interrupted during retry after %d/%d binaries", done, total)
+            shutil.rmtree(td, ignore_errors=True)
+            break
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+        outcomes.append(oc)
+        done += 1
+        on_outcome(done, total, oc)
 
     return FullDiffSummary(
         plan,

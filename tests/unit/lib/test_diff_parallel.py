@@ -283,6 +283,71 @@ def test_full_diff_one_failure_does_not_corrupt_others(
     assert ok_rows == 0  # no cross-contamination onto the other binary
 
 
+def test_full_diff_retries_a_transient_compute_failure_in_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ★ scan self-heals a transient failure within one run (its serial phase 2); diff now does too.
+    # A binary whose parallel compute fails transiently (here a BinExport that wrote no file — the
+    # WSL2 "ZipException reading a .sla that is fine on the next read" shape) is retried ONCE,
+    # serially, in the SAME run_full_diff — so a one-off read fault needs no manual re-run.
+    # MUTATION: drop the phase-2b serial retry -> boom ends failed in this run -> RED.
+    atlas_path = _seed(tmp_path, {"boom": "2"}, {"boom": "2x"})
+    monkeypatch.setattr(driver, "_check_toolchain", lambda config: None)
+    monkeypatch.setattr(driver, "preflight", _fake_preflight(tmp_path))
+    calls = {"boom": 0}
+
+    def _compute(so_a, so_b, td, config):  # type: ignore[no-untyped-def]
+        if "boom" in so_a.name:
+            calls["boom"] += 1
+            if calls["boom"] == 1:  # first attempt fails transiently; the retry succeeds
+                raise DiffToolchainError(
+                    "BinExport produced no file", kind=driver.FAIL_BINEXPORT_NO_FILE
+                )
+        return driver.DiffArtifacts(so_a, so_b, td)
+
+    monkeypatch.setattr(driver, "compute_diff", _compute)
+    monkeypatch.setattr(driver, "_persist_success", _ok_persist)
+    con = open_atlas(atlas_path)
+    fsum = driver.run_full_diff(con, "run_a", "run_b", config=_cfg())
+    failed_rows = con.execute(
+        "SELECT COUNT(*) FROM diff_meta WHERE diff_id=? AND diff_status='failed'",
+        ("run_a::run_b::boom",),
+    ).fetchone()[0]
+    con.close()
+    assert calls["boom"] == 2  # failed once in parallel, retried once serially -- all this run
+    assert failed_rows == 0  # no failed blind-spot row survived the self-heal
+    boom = next(o for o in fsum.outcomes if o.binary == "boom")
+    assert boom.summary is not None and boom.error is None  # ended ok, in this run
+
+
+def test_full_diff_does_not_retry_a_timeout_in_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ★ a timeout is deterministic at a fixed budget: an in-run retry only burns time, so it is
+    # recorded on the first failure and left to the cross-run retry cap (which, next run, could hand
+    # a different schedule). compute runs exactly once.
+    # MUTATION: add FAIL_TIMEOUT to _TRANSIENT_DIFF_RETRY_KINDS -> compute runs twice -> RED.
+    atlas_path = _seed(tmp_path, {"slow": "2"}, {"slow": "2x"})
+    monkeypatch.setattr(driver, "_check_toolchain", lambda config: None)
+    monkeypatch.setattr(driver, "preflight", _fake_preflight(tmp_path))
+    calls = {"n": 0}
+
+    def _compute(so_a, so_b, td, config):  # type: ignore[no-untyped-def]
+        calls["n"] += 1
+        raise DiffToolchainError("Ghidra analysis timed out", kind=driver.FAIL_TIMEOUT)
+
+    monkeypatch.setattr(driver, "compute_diff", _compute)
+    con = open_atlas(atlas_path)
+    driver.run_full_diff(con, "run_a", "run_b", config=_cfg())
+    row = con.execute(
+        "SELECT diff_ok, diff_status, diff_status_reason FROM diff_meta WHERE diff_id=?",
+        ("run_a::run_b::slow",),
+    ).fetchone()
+    con.close()
+    assert calls["n"] == 1  # one attempt only; a deterministic timeout is not retried in-run
+    assert (row[0], row[1], row[2]) == (0, "failed", "timeout")
+
+
 # ── Ctrl-C: cancel the queued sweep, keep completed, mark cancelled ─────────────────────
 
 
