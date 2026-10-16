@@ -773,4 +773,33 @@ class Survey:
 
 
 def survey(host: ClientHost, tmap: Path | None) -> Survey:
-    return Survey({c: inspect(c, host, tmap) for c in CLIENT_IDS})
+    """Every client's state. One whose configuration tmap may not even read (a permission or
+    disk error) is ``unknown``, the error as its detail — whether tmap's entry is there cannot be
+    told — and the other clients are still surveyed, so a plan can go on without it."""
+    return Survey({c: _surveyed(c, host, tmap) for c in CLIENT_IDS})
+
+
+def _surveyed(client: str, host: ClientHost, tmap: Path | None) -> ClientState:
+    try:
+        return inspect(client, host, tmap)
+    except OSError as exc:
+        # detected: something is there, reading it is what failed
+        return ClientState(
+            client,
+            True,
+            "unknown",
+            f"cannot read its configuration: {exc}",
+            _config_file(client, host),
+        )
+
+
+def _config_file(client: str, host: ClientHost) -> Path:
+    """The file ``inspect`` reads ``client``'s entry from (dsh: the home-level patch layer)."""
+    paths = {
+        "claude-code": claude_json,
+        "codex": codex_config,
+        "cursor": cursor_config,
+        "claude-desktop": desktop_config,
+        "dsh": dsh_patch,
+    }
+    return paths[client](host)
