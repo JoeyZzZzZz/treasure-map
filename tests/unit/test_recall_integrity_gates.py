@@ -109,3 +109,61 @@ def test_help_text_does_not_miscount_the_gates() -> None:
     # the four gates it actually runs are all described, so the count is not understated
     for gate in ("Gate A", "Gate B", "Gate C", "Gate D"):
         assert gate in help_text, gate
+
+
+def _atlas_with_gate_a(path: Path, *, violating: bool) -> None:
+    """An atlas whose one candidate is a Gate-A violation (const_sink_arg on a free_string sink
+    argument) or a clean one; its run is registered either way, so Gate C holds."""
+    from treasure_map.lib.atlas.connection import open_atlas
+    from treasure_map.lib.atlas.models import InstanceRow
+    from treasure_map.lib.atlas.writer import add_instance, begin_run, upsert_pattern
+
+    conn = open_atlas(path)
+    begin_run(conn, "run_gate", analysis_db_path=str(path.parent / "analysis.db"))
+    pid = upsert_pattern(
+        conn, source_class="external_input", sink_class="cmd", call_sequence_shape="source->cmd"
+    )
+    add_instance(
+        conn,
+        InstanceRow(
+            pattern_id=pid,
+            pseudocode_hash="h1",
+            source_anchor="handle",
+            sink_anchor="system",
+            source_run_id="run_gate",
+            reachability_status="unknown",
+            blocking_mechanism="const_sink_arg" if violating else None,
+            provenance_level="L0",
+            evidence_ref="run_gate#handle@cmd",
+            flow_evidence=json.dumps({"source_kind": "free_string"}),
+        ),
+    )
+    conn.close()
+
+
+def test_a_database_path_holding_a_hash_sign_is_the_one_checked(tmp_path: Path) -> None:
+    """The gates open the database at the path they are given, whatever it holds. A workspace
+    path can carry ``#``; written into a ``file:`` URI unescaped, ``#`` starts the fragment, so
+    the open lands on the path cut at it (and without ``mode=ro``) — here a clean atlas, so a
+    violating one would pass.
+
+    MUTATION (verified RED): open with ``sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)``
+    in the script's ``_count`` -> the clean atlas at the cut path is read, Gate A reports nothing,
+    the script exits 0, and the exit-code assertion fails."""
+    real_dir = tmp_path / "fw#1"
+    real_dir.mkdir()
+    _atlas_with_gate_a(real_dir / "atlas.db", violating=True)
+    _atlas_with_gate_a(tmp_path / "fw", violating=False)  # where the unescaped URI would land
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_ROOT / "scripts" / "check_recall_integrity.py"),
+            "--atlas",
+            str(real_dir / "atlas.db"),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "Gate A: 1 const_sink_arg" in result.stdout

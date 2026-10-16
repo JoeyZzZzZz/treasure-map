@@ -13,6 +13,7 @@ import asyncio
 import json
 import re
 import sqlite3
+import zlib
 from pathlib import Path
 
 from click.testing import CliRunner
@@ -473,6 +474,74 @@ def test_a_misspelled_run_id_is_an_error_not_an_empty_map(tmp_path: Path) -> Non
     assert "run_m" in ov["runs_in_atlas"]
 
 
+def test_a_misspelled_run_id_on_the_atlas_edge_tools_is_an_error(tmp_path: Path) -> None:
+    """get_nvram_key_flow / get_string_keyed_edges / launched_by scoped to a run the atlas does not
+    hold are a hard error naming the runs that DO exist — not ``found: false`` / ``count: 0`` / no
+    edges, which read exactly like "this run has none". A real run still answers.
+
+    MUTATION (verified RED, one at a time): drop the ``_unknown_run`` call from any one of the three
+    tools in mcp_app.make_tools -> that tool's typo comes back as an ordinary empty answer and the
+    ``"error" in out`` assertion for it fails."""
+    tools = _tools(tmp_path)
+    typos = {
+        "get_nvram_key_flow": tools["get_nvram_key_flow"]("wan_proto", run_id="nope"),
+        "get_string_keyed_edges": tools["get_string_keyed_edges"](run_id="nope"),
+        "launched_by": tools["launched_by"]("httpd", run_id="nope"),
+    }
+    for name, out in typos.items():
+        assert "error" in out and "not in this atlas" in out["error"], name
+        assert out["runs_in_atlas"] == ["run_m"], name
+    assert "error" not in tools["get_nvram_key_flow"]("wan_proto", run_id="run_m")
+    assert "error" not in tools["get_string_keyed_edges"](run_id="run_m")
+    assert "error" not in tools["launched_by"]("httpd", run_id="run_m")
+
+
+def test_rows_of_a_run_without_a_lineage_row_are_still_served(tmp_path: Path) -> None:
+    """The unknown-run error must not hide rows the atlas holds: a scan hunted before lineage rows
+    were written can leave nvram rows under a run id with no ``run`` row and no candidates. Asked
+    for by that id, they are served.
+
+    MUTATION (verified RED): make ``_unknown_run`` skip the lookup in the tool's own table (error
+    whenever get_run misses) -> this run is refused as "not in this atlas" and the assertions
+    below fail."""
+    atlas = _mk_atlas(tmp_path)
+    conn = open_atlas(atlas)
+    add_nvram_flow_rows(
+        conn,
+        [
+            NvramFlowRow(
+                source_run_id="early_scan",
+                key="wan_proto",
+                key_kind="constant",
+                binary="rc",
+                func="set_wan",
+                op="write",
+                api="nvram_set",
+            )
+        ],
+    )
+    conn.close()
+    out = mcp_app.make_tools(atlas)["get_nvram_key_flow"]("wan_proto", run_id="early_scan")
+    assert "error" not in out
+    assert out["found"] is True and [w["binary"] for w in out["writers"]] == ["rc"]
+
+
+def test_a_misspelled_run_pair_on_diff_judgements_is_an_error(tmp_path: Path) -> None:
+    """list_overlays(anchor_kind="diff_subject") scoped to a run pair that does not name two runs
+    of this atlas is a hard error naming the runs — not an empty list of judgements, which reads as
+    "nothing judged on this pair". A pair of two real runs (with no diff yet) still answers.
+
+    MUTATION (verified RED): drop the ``_unknown_pair`` call from list_overlays -> the misspelled
+    pair comes back as an empty listing and the ``"error" in out`` assertion fails."""
+    tools = _tools(tmp_path)
+    for pair in ("nope::run_m", "run_m::nope", "run_m"):
+        out = tools["list_overlays"](run_id=pair, anchor_kind="diff_subject")
+        assert "error" in out and "two runs" in out["error"], pair
+        assert out["runs_in_atlas"] == ["run_m"], pair
+    ok = tools["list_overlays"](run_id="run_m::run_m", anchor_kind="diff_subject")
+    assert "error" not in ok and ok["count"] == 0
+
+
 def test_per_scan_completeness_rides_scoped_list_not_cross_run_views(tmp_path: Path) -> None:
     # The analysis-completeness red-line is a per-SCAN fact — it now rides list_candidates(run_id=…)
     # (which resolves ONE run's analysis.db), NOT the cross-run aggregations (there is no single
@@ -704,6 +773,63 @@ def test_disassembly_unavailable_is_honest(tmp_path: Path) -> None:
     tools = _tools(tmp_path)
     r = tools["get_disassembly"]("handle_req", run_id="run_m")
     assert r["available"] is False and r["anchor"]["function"] == "handle_req"
+
+
+def _store_listing(analysis_db: Path, n_units: int) -> None:
+    """Give handle_req a stored listing of ``n_units`` instructions on a binary extracted with
+    listing export — enough that one fact-tool page cannot carry it."""
+    units = [
+        {"a": f"0x{0x6B90 + 4 * i:x}", "n": 4, "k": "code", "m": "mov", "o": "r0, r1"}
+        for i in range(n_units)
+    ]
+    conn = open_db(analysis_db)
+    conn.execute(
+        "INSERT INTO function_listing (function_id, listing, unit_count, insn_count, truncated) "
+        "VALUES (1, ?, ?, ?, 0)",
+        (zlib.compress(json.dumps(units).encode()), n_units, n_units),
+    )
+    conn.execute(
+        "INSERT INTO detector_scan_status (binary_id, detector, scanned, found_count) "
+        "VALUES (1, 'listing', 1, 1)"
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_get_disassembly_pages_to_the_tail_through_the_mcp_tool(tmp_path: Path) -> None:
+    """The MCP tool reaches the tail of a listing that spans several pages: following
+    ``paging.next_offset`` through the tool returns every instruction exactly once, in the order of
+    the one-shot listing. One page is bounded by the fact-tool budget, so ``offset`` is the only way
+    an agent reads past the first ~20KB of a large function.
+
+    MUTATION (verified RED): drop ``offset=offset`` from the get_disassembly wrapper in
+    mcp_app.make_tools -> every call returns the first page again, and the assertion that a page
+    starts at the offset it was asked for fails on the second call."""
+    n = 600
+    tools = _tools(tmp_path)
+    _store_listing(tmp_path / "analysis.db", n)
+    conn = facts.open_analysis_ro(tmp_path / "analysis.db")
+    try:
+        whole = facts.get_disassembly(conn, func="handle_req", max_chars=10**9)
+    finally:
+        conn.close()
+    assert whole["paging"]["truncated"] is False and len(whole["instructions"]) == n
+
+    first = tools["get_disassembly"]("handle_req", run_id="run_m")
+    assert first["resolved_run"] == "run_m" and first["paging"]["truncated"] is True
+    got = list(first["instructions"])
+    off = first["paging"]["next_offset"]
+    calls = 1
+    while off is not None:
+        calls += 1
+        assert calls <= n  # bounded: every page carries at least one instruction
+        page = tools["get_disassembly"]("handle_req", run_id="run_m", offset=off)
+        # the page starts where it was asked to, not at the top of the listing again
+        assert page["instructions"][0] == whole["instructions"][off]
+        got.extend(page["instructions"])
+        off = page["paging"]["next_offset"]
+    assert calls > 2  # the walk crossed more than one page boundary
+    assert got == whole["instructions"]
 
 
 def test_legal_notice_present(tmp_path: Path) -> None:

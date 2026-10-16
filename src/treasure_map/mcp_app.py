@@ -646,6 +646,42 @@ def make_tools(
             err["run_lineage"] = _lineage_inline(run)
         return err
 
+    def _unknown_run(
+        atlas: sqlite3.Connection, run_id: str | None, table: str
+    ) -> dict[str, Any] | None:
+        """The hard error for a ``run_id`` this atlas holds nothing of, else None.
+
+        A misspelled run_id on a run-scoped atlas read comes back empty, which reads exactly like
+        "this run has none". A run is known when ``get_run`` resolves it (a lineage row, or
+        candidates) or when ``table`` — the rows this tool serves — carries it: a scan hunted
+        before lineage rows were written can hold such rows with neither."""
+        if run_id is None or _get_run(atlas, run_id) is not None:
+            return None
+        held = atlas.execute(
+            f"SELECT 1 FROM {table} WHERE source_run_id = ? LIMIT 1",  # noqa: S608 -- fixed names
+            (run_id,),
+        ).fetchone()
+        if held is not None:
+            return None
+        return _error(atlas, f"run '{run_id}' is not in this atlas — pick one from runs_in_atlas.")
+
+    def _unknown_pair(atlas: sqlite3.Connection, pair: str | None) -> dict[str, Any] | None:
+        """The hard error for a run pair (``{run_a}::{run_b}``) that does not name two runs of this
+        atlas, else None. A diff is only computed between two runs the atlas records, and runs are
+        never removed from it, so any pair a diff or a judgement can be filed under passes."""
+        if pair is None:
+            return None
+        parts = pair.split("::")
+        for cut in range(1, len(parts)):
+            run_a, run_b = "::".join(parts[:cut]), "::".join(parts[cut:])
+            if _get_run(atlas, run_a) is not None and _get_run(atlas, run_b) is not None:
+                return None
+        return _error(
+            atlas,
+            f"run pair '{pair}' does not name two runs in this atlas — pass "
+            "'{run_a}::{run_b}' with both taken from runs_in_atlas.",
+        )
+
     def _refused_entries(
         index: dict[str, dict[str, Any]], counts: dict[str, int] | None
     ) -> list[dict[str, Any]]:
@@ -1511,7 +1547,9 @@ def make_tools(
         completeness caveat: it then means "may be incomplete within THIS run"."""
         conn = open_atlas(atlas_path)
         try:
-            refusal = _refuse_stale_run(conn, run_id)
+            refusal = _refuse_stale_run(conn, run_id) or _unknown_run(
+                conn, run_id, "nvram_key_flow"
+            )
             if refusal is not None:
                 return refusal
             result = _get_nvram_key_flow(conn, key, run_id=run_id)
@@ -1544,7 +1582,9 @@ def make_tools(
         string-key-dispatched)."""
         conn = open_atlas(atlas_path)
         try:
-            refusal = _refuse_stale_run(conn, run_id)
+            refusal = _refuse_stale_run(conn, run_id) or _unknown_run(
+                conn, run_id, "string_keyed_edge"
+            )
             if refusal is not None:
                 return refusal
             result = _get_string_keyed_edges(
@@ -1587,7 +1627,7 @@ def make_tools(
         thin forwarding wrapper — that callsite is invisible here)."""
         conn = open_atlas(atlas_path)
         try:
-            refusal = _refuse_stale_run(conn, run_id)
+            refusal = _refuse_stale_run(conn, run_id) or _unknown_run(conn, run_id, "exec_edge")
             if refusal is not None:
                 return refusal
             return _launched_by(conn, target, run_id=run_id, limit=limit)
@@ -2477,8 +2517,9 @@ def make_tools(
         offset: int = 0,
     ) -> dict[str, Any]:
         """The disassembly listing Ghidra produced for one function (addresses line up with the
-        pseudocode — same load), paged by ``offset``, or an honest ``available: false`` when the
-        run was analysed before tmap stored listings (re-scan to get it).
+        pseudocode — same load), paged by ``offset``, or an honest ``available: false`` with its
+        reason: the run was analysed before tmap stored listings (re-scan to get it), or the listing
+        export failed on this function (``detector_errors`` names ``listing``).
 
         Each instruction carries its ``bytes`` from the stored segments; where none covers it the
         bytes are null with a reason, never zeroed.
@@ -2842,12 +2883,13 @@ def make_tools(
         atlas = open_atlas(atlas_path)
         try:
             if anchor_kind == "diff_subject":
-                refusal = _refuse_stale_pair(atlas, run_id)
+                # A misspelled pair is an error naming the runs, not an empty list of judgements.
+                refusal = _refuse_stale_pair(atlas, run_id) or _unknown_pair(atlas, run_id)
             else:
                 refusal = _refuse_stale_run(atlas, run_id)
                 # A misspelled run_id is a hard error naming the available runs, not a silent empty
                 # list. The stale gate leaves an unknown run alone, so it is caught here. (The pair
-                # form carries two run ids and its own shape, so it is left to _refuse_stale_pair.)
+                # form carries two run ids; _unknown_pair checks it above.)
                 if refusal is None and run_id is not None and _get_run(atlas, run_id) is None:
                     return _error(
                         atlas, f"run '{run_id}' is not in this atlas — pick one from runs_in_atlas."

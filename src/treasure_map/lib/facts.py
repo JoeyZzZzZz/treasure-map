@@ -1539,7 +1539,9 @@ def get_disassembly(
     where a block does not cover it or was truncated, ``bytes`` is null with a reason, never zeroed.
 
     ``available`` is False with a reason when this binary was extracted before tmap exported the
-    listing (re-scan to get it) — distinct from a function that genuinely has no instructions."""
+    listing (re-scan to get it), or when the listing export raised on this function during the
+    scan (``detector_errors`` names ``listing``) — both distinct from a function that genuinely has
+    no instructions."""
     row, miss = _resolve_one(conn, func, binary)
     if row is None:
         assert miss is not None
@@ -1562,12 +1564,43 @@ def get_disassembly(
     except sqlite3.OperationalError:
         has_pass, lrow = False, None
     if lrow is None or lrow["listing"] is None:
+        # The extractor records the listing export raising on a function by name and stores no
+        # listing for it. That is a could-not-export on a current scan: neither an empty function
+        # nor an old scan, and a plain re-scan reuses the cached extraction rather than retrying.
+        errored = _detector_errors(_col(row, "detector_errors"))
+        if "listing" in errored:
+            return {
+                "found": True,
+                "available": False,
+                "reason": (
+                    f"the listing export raised on {row['name']} during the scan, so no listing "
+                    "was stored for it; this is a could-not-export, not a function without "
+                    "instructions. A plain re-scan reuses the cached extraction — re-analyze this "
+                    "binary (tmap scan --reanalyze) to retry it"
+                ),
+                "detector_errors": errored,
+                "anchor": anchor,
+            }
         if has_pass and lrow is not None:
             return {
                 "found": True,
                 "available": True,
                 "instructions": [],
                 "total": 0,
+                "anchor": anchor,
+            }
+        if has_pass:
+            # This binary WAS extracted with listing export, so "analysed before tmap exported
+            # disassembly" would be false; the extractor stored nothing for this function and
+            # recorded no error, so why is not known here.
+            return {
+                "found": True,
+                "available": False,
+                "reason": (
+                    "this binary was extracted with listing export, but no listing was stored for "
+                    f"{row['name']} and no error was recorded for it; re-analyze this binary "
+                    "(tmap scan --reanalyze) to retry it"
+                ),
                 "anchor": anchor,
             }
         return {
