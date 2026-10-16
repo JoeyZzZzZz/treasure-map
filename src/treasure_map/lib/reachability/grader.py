@@ -14,7 +14,7 @@ would hide a live path as unreachable and halt investigation — the one error
 v1 must never make. So a would-be "blocked" (a validator appears to cover the inputs) grades
 "unknown" with an honest basis. The validator/clamp/taint machinery stays wired — it gates
 "confirmed" (a validator on the path, a parameter contribution, or a clamp demotes a
-would-be "confirmed" to "unknown") and is reused by R2-deep.
+would-be "confirmed" to "unknown").
 
 A "confirmed" verdict means a path confirmed within one function (provenance L1 at most) —
 it is not a claim that anything can be triggered, and nothing here may treat a verdict as a
@@ -82,7 +82,7 @@ _BASIS_ORIGIN_UNKNOWN = "the origin of the value reaching the sink could not be 
 _BASIS_COVERED_UNVERIFIED = (
     "a validator-style call appears to cover the inputs reaching the sink, but an "
     "intra-procedural read cannot prove this path is bounded; the verdict is unknown, "
-    "not blocked — deep data-flow analysis (R2-deep) is required to decide non-reachability"
+    "not blocked — deciding non-reachability needs a deeper, inter-procedural data-flow analysis"
 )
 _BASIS_CLAMP = (
     "a clamp may bound the value on the path; a clean unfiltered flow is not provable here, "
@@ -91,8 +91,8 @@ _BASIS_CLAMP = (
 _BASIS_ABI = (
     "the decompiler did not soundly recover this function's frame (unrecovered calling "
     "convention / in_stack/unaff/extraout placeholders); a clean source-to-sink flow is not "
-    "fully visible within the function, so the verdict is unknown, not confirmed — deep "
-    "data-flow analysis (R2-deep) is required"
+    "fully visible within the function, so the verdict is unknown, not confirmed — deciding "
+    "it needs a deeper, inter-procedural data-flow analysis"
 )
 
 # Copy sinks are graded on the WRITE LENGTH (the danger axis), not on whether taint reaches the
@@ -279,8 +279,8 @@ def grade_candidate(
             # The decompiler did not soundly recover the frame (unrecovered calling
             # convention / in_stack/unaff/extraout placeholders). "confirmed" claims a clean
             # flow fully visible in this function, which is not establishable here. Downgrade
-            # to unknown (never blocked); R2-deep must decide. Closes the intra-procedural
-            # false-confirm on stripped MIPS/ARM firmware.
+            # to unknown (never blocked); only a deeper, inter-procedural analysis could decide.
+            # Closes the intra-procedural false-confirm on stripped MIPS/ARM firmware.
             return ReachabilityVerdict("unknown", None, _BASIS_ABI)
         return ReachabilityVerdict("confirmed", None, _BASIS_CONFIRMED)
     if uncovered & weak_seeds:

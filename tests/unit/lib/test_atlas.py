@@ -1160,6 +1160,19 @@ def test_opening_an_up_to_date_atlas_never_waits_on_a_writer(tmp_path: Path) -> 
     assert done == [0]  # it read the committed state, not the writer's pending row
 
 
+def test_a_write_waits_out_another_writer_for_thirty_seconds(tmp_path: Path) -> None:
+    """A write (an annotation) that meets another writer's transaction waits up to 30s for it,
+    not sqlite's default 5s. Read off the connection's busy timeout, which is what the wait is,
+    rather than by holding a write lock for more than five seconds in a test.
+
+    MUTATION: open with sqlite's default timeout -> RED (5000 instead of 30000)."""
+    conn = open_atlas(tmp_path / "atlas.db")
+    try:
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 30_000
+    finally:
+        conn.close()
+
+
 def test_a_lookup_by_evidence_ref_uses_an_index(tmp_path: Path) -> None:
     """Coverage re-reads each annotation's basis by ref on every listing; a scan per ref made the
     listing slower with every annotation.

@@ -1941,7 +1941,10 @@ def scan(
     import sys
 
     progress = contextlib.redirect_stdout(sys.stderr) if as_json else contextlib.nullcontext()
-    with progress:
+    # ``held`` keeps the workspace lock taken in stage 1 until both stages are done: the hunt reads
+    # analysis.db, and a second scan of this workspace re-extracting it mid-hunt would hand the
+    # hunt part of each extraction. Released before triage, which reads only the atlas.
+    with progress, contextlib.ExitStack() as held:
         from treasure_map.cli.analyze_cli import _report_timeout_skips, _warn_incomplete
         from treasure_map.lib.atlas.connection import open_atlas
         from treasure_map.lib.config.config import load_config
@@ -2004,20 +2007,19 @@ def scan(
         from treasure_map.lib.analyze.pipeline import run_analyze
 
         try:
-            with Workspace(ws_path) as ws:
-                # A plain call, not asyncio.run: the analysis has no await points, and asyncio's own
-                # SIGINT handling turned the first Ctrl-C into a cancel that waited for the whole
-                # run.
-                result = run_analyze(
-                    fs_root,
-                    ws,
-                    cfg,
-                    _progress,
-                    skip_non_binary=skip_non_binary,
-                    skip_ingesters=frozenset(skip_ingesters),
-                    reanalyze=reanalyze,
-                    force_retry=force_retry,
-                )
+            ws = held.enter_context(Workspace(ws_path))
+            # A plain call, not asyncio.run: the analysis has no await points, and asyncio's own
+            # SIGINT handling turned the first Ctrl-C into a cancel that waited for the whole run.
+            result = run_analyze(
+                fs_root,
+                ws,
+                cfg,
+                _progress,
+                skip_non_binary=skip_non_binary,
+                skip_ingesters=frozenset(skip_ingesters),
+                reanalyze=reanalyze,
+                force_retry=force_retry,
+            )
         except KeyboardInterrupt:
             click.echo("\nAborted — all Ghidra processes terminated.", err=True)
             raise SystemExit(interrupt_exit_code()) from None

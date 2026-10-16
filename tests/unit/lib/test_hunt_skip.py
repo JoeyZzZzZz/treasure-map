@@ -511,7 +511,7 @@ def test_an_unreadable_input_fingerprint_never_skips() -> None:
     assert c.current is False
 
 
-@pytest.mark.parametrize("axis", ["commit", "extraction", "firmware"])
+@pytest.mark.parametrize("axis", ["commit", "extraction", "firmware", "non_binary", "symlink"])
 def test_either_input_changing_defeats_the_skip(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, axis: str
 ) -> None:
@@ -522,11 +522,28 @@ def test_either_input_changing_defeats_the_skip(
     made pass_version span the whole pipeline in the first place). Drop the commit comparison ->
     the 'commit' case goes RED. Drop the input fingerprint -> the 'firmware' case goes RED: a
     release install (a known commit) re-scanning changed firmware kept the old candidates.
+
+    The last two cases change one row's content and no table's row count, so the per-table counts
+    in the fingerprint cannot see them. MUTATION (each measured RED, ``skipped`` stays True): drop
+    the non_binary_files query from ``hunt_input_fingerprint`` -> the 'non_binary' case; drop the
+    fs_symlinks query -> the 'symlink' case.
     """
     from treasure_map.lib.hunt import analyzer2 as a2
 
     monkeypatch.setattr(a2, "installed_commit", lambda: COMMIT)
     db, atlas = _seeded(tmp_path), tmp_path / "atlas.db"
+    files = sqlite3.connect(db)
+    files.execute(
+        "INSERT INTO non_binary_files (kind, name, path, sha256) "
+        "VALUES ('shell_script', 'rcS', 'etc/init.d/rcS', ?)",
+        ("c" * 64,),
+    )
+    files.execute(
+        "INSERT INTO fs_symlinks (link_path, link_name, target_raw, target_name, resolved) "
+        "VALUES ('bin/sh', 'sh', 'busybox', 'busybox', 1)"
+    )
+    files.commit()
+    files.close()
     a2.run_analyzer2(db, atlas, source_run_id="r")
     assert a2.run_analyzer2(db, atlas, source_run_id="r").skipped is True
 
@@ -537,11 +554,23 @@ def test_either_input_changing_defeats_the_skip(
         stamp.execute("UPDATE binaries SET pass_version = 'pv_edited'")
         stamp.commit()
         stamp.close()
-    else:
+    elif axis == "firmware":
         # Same tmap, same extraction code, another firmware: a binary's content changed. The
         # extraction hash cannot see this — it names the code, not the image.
         stamp = sqlite3.connect(db)
         stamp.execute("UPDATE binaries SET sha256 = 'e' || substr(sha256, 2)")
+        stamp.commit()
+        stamp.close()
+    elif axis == "non_binary":
+        # Only an init script's content changed: same file, same path, every binary unchanged.
+        stamp = sqlite3.connect(db)
+        stamp.execute("UPDATE non_binary_files SET sha256 = ?", ("d" * 64,))
+        stamp.commit()
+        stamp.close()
+    else:
+        # Only one link's target changed: bin/sh now names another program.
+        stamp = sqlite3.connect(db)
+        stamp.execute("UPDATE fs_symlinks SET target_raw = 'bash', target_name = 'bash'")
         stamp.commit()
         stamp.close()
     assert a2.run_analyzer2(db, atlas, source_run_id="r").skipped is False
