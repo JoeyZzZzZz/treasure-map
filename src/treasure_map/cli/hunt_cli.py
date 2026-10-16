@@ -2117,7 +2117,7 @@ def scan(
             click.echo(f"      → {h.nvram_flows_written} nvram key-flow ops flattened → atlas")
         if h.nvram_wrapper_edges:
             click.echo(
-                f"      → {h.nvram_wrapper_edges} nvram wrapper-indirect key edges recovered (A2)"
+                f"      → {h.nvram_wrapper_edges} nvram wrapper-indirect key edges recovered"
             )
         if h.nvram_defaults_written:
             click.echo(

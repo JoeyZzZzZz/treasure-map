@@ -2437,11 +2437,12 @@ def _dim_source(source_class: str, source_kind: str) -> Dimension:
             "source",
             "structural",
             "param",
-            "pattern.source_class = external_input (A2)",
+            "pattern.source_class = external_input",
             "external input reaches the sink (a POST/request param); NOT proven web-controllable "
             f"(no key-side web_settable evidence). charset={source_kind}. A STRUCTURAL lead "
             "(state=structural, NOT proven): controllability UNPROVEN — weaker than an nvram "
-            "'likely' reading, and the A2 pattern layer is coarse (near-zero discrimination — it "
+            "'likely' reading, and the pattern-based source label is coarse (near-zero "
+            "discrimination — it "
             "fires on nearly every external-input candidate in ANY sink class: cmd, fmt_string, "
             "path_sink). Confirm the concrete request field and reachability by hand.",
         )
