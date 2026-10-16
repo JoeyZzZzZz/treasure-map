@@ -148,6 +148,14 @@ def source_url(asset: Asset, mirror: str | None) -> str:
     return asset.url
 
 
+def _sizes(done: int, total: int) -> str:
+    """``done / total`` in the unit that fits the total: whole KB under a mebibyte (in whole MB a
+    300 KB download reads "0 / 0 MB", as if nothing came), whole MB otherwise."""
+    if total < 1 << 20:
+        return f"{done >> 10} / {total >> 10} KB"
+    return f"{done >> 20} / {total >> 20} MB"
+
+
 def stderr_progress(label: str) -> Progress:
     """A progress line on stderr: rewritten in place on a terminal, every 10% otherwise."""
     tty = sys.stderr.isatty()
@@ -159,7 +167,7 @@ def stderr_progress(label: str) -> Progress:
         pct = min(100, done * 100 // total)
         if tty:
             if pct != last[0]:
-                sys.stderr.write(f"\r  {label}: {pct:3d}% ({done >> 20} / {total >> 20} MB)")
+                sys.stderr.write(f"\r  {label}: {pct:3d}% ({_sizes(done, total)})")
                 if pct == 100:
                     sys.stderr.write("\n")
                 sys.stderr.flush()

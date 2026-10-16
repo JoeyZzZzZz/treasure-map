@@ -780,3 +780,30 @@ def test_a_part_longer_than_the_lock_is_deleted_before_fetching(tmp_path: Path) 
     out = download_verified(_asset(data), staging, fetcher)
     assert fetcher.had == [0]
     assert out.read_bytes() == data
+
+
+class _Tty(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+@pytest.mark.parametrize(
+    ("total", "shown"),
+    [
+        (313_318, "305 / 305 KB"),  # the BinExport zip: "0 / 0 MB" in whole megabytes
+        (207_473_347, "197 / 197 MB"),  # a JDK-sized archive keeps the whole-MB reading
+    ],
+)
+def test_the_progress_line_reads_a_small_download_in_kb(
+    monkeypatch: pytest.MonkeyPatch, total: int, shown: str
+) -> None:
+    """A download under a mebibyte shows its size in KB: in whole MB a 300 KB archive reads
+    "0 / 0 MB" — as if nothing came, though it arrived whole and verified.
+
+    MUTATION (verified RED): always format in whole MB -> the small case reads "0 / 0 MB"."""
+    import treasure_map.lib.setup.fetch as fetch_mod
+
+    err = _Tty()
+    monkeypatch.setattr(fetch_mod.sys, "stderr", err)
+    fetch_mod.stderr_progress("X")(total, total)
+    assert f"100% ({shown})" in err.getvalue()
