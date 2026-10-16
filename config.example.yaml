@@ -1,6 +1,7 @@
 # Treasure Map configuration example
 # `tmap init` writes ~/.treasure-map/config.yaml for you; this file shows every key. Analysis is
-# hermetic (no network calls) — there are no API keys to fill in.
+# hermetic (no network calls) — there are no API keys to fill in. A relative path is read from the
+# directory the config file is in, never from where tmap is run.
 
 ghidra:
   headless_timeout_seconds: 300

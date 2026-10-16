@@ -12,7 +12,11 @@ import click
 
 
 @click.command("uninstall", short_help="Remove what tmap init installed (keeps your data)")
-@click.option("--purge-data", is_flag=True, help="Also delete the atlas and workspaces.")
+@click.option(
+    "--purge-data",
+    is_flag=True,
+    help="Also delete the atlas and what tmap wrote in the workspaces.",
+)
 @click.option("--yes", "-y", "assume_yes", is_flag=True, help="Do not ask to confirm the plan.")
 @click.option("--dry-run", is_flag=True, help="Print the plan; change nothing.")
 def uninstall(purge_data: bool, assume_yes: bool, dry_run: bool) -> None:
@@ -22,9 +26,17 @@ def uninstall(purge_data: bool, assume_yes: bool, dry_run: bool) -> None:
     Only what the install ledger records is removed — never a JDK, Ghidra or BinDiff you
     installed yourself. config.yaml, .env, the atlas and the workspaces stay unless
     --purge-data is given and you type the confirmation phrase (--yes does not stand in for it);
-    even then only what is provably tmap's goes: the atlas and the workspace directories when they
-    are tmap's databases, config.yaml and .env when tmap init wrote them.
+    even then only what is provably tmap's goes: the atlas when it is tmap's database, what a scan
+    wrote in each workspace whose analysis.db is tmap's, config.yaml and .env when tmap init wrote
+    them. Everything else is kept and listed.
     """
+    try:
+        _uninstall(purge_data, assume_yes, dry_run)
+    except OSError as exc:  # a file tmap could not read or write that no step above expected
+        raise click.ClickException(f"stopped: {exc}") from exc
+
+
+def _uninstall(purge_data: bool, assume_yes: bool, dry_run: bool) -> None:
     from treasure_map.lib.config.config import load_config
     from treasure_map.lib.errors import ConfigError
     from treasure_map.lib.setup import clients as cl

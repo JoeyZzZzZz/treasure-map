@@ -11,7 +11,8 @@ Ghidra) a ``BinExport`` directory whose jars still hash to what tmap installed.
 
 The data stays unless ``--purge-data`` is given AND the user types the confirmation phrase;
 ``--yes`` does not stand in for it. Even then only what is provably tmap's goes (``purge_plan``):
-the atlas and workspaces when they are tmap's databases, config.yaml and .env when tmap wrote them.
+the atlas when it is tmap's database, what a scan wrote in each workspace whose analysis.db is
+tmap's, config.yaml and .env when tmap wrote them. Everything else is kept and listed.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from typing import Any
 
 import yaml
 
+from treasure_map.lib.config.config import resolve_relative_paths
 from treasure_map.lib.diff.toolchain import binexport_lib_digest
 from treasure_map.lib.setup import clients as cl
 from treasure_map.lib.setup.completion import _MARK_END, _MARK_START, target_path
@@ -106,10 +108,12 @@ def _restore_edit(entry: Entry) -> str:
     return f"left {path}: its line is no longer tmap's"
 
 
-def _remove_rc_block(rc: Path) -> str:
+def _remove_rc_block(rc: Path, *, created: bool = False) -> str:
     """Cut tmap's marked block out of the user's rc — as bytes, so a line in any encoding stays
     exactly as it was — and write the rest back atomically, keeping the file's mode (and writing
-    through a symlink)."""
+    through a symlink). An rc tmap ``created`` for the block, and that holds nothing else now,
+    is deleted instead: an empty login file left behind (macOS ~/.bash_profile) would still stop
+    bash from reading ~/.bash_login or ~/.profile."""
     try:
         data = rc.read_bytes()
         mode = stat.S_IMODE(rc.stat().st_mode)
@@ -124,11 +128,25 @@ def _remove_rc_block(rc: Path) -> str:
         end += 1
     if start > 0 and data[start - 1 : start] == b"\n":
         start -= 1  # the newline the block was added with
+    rest = data[:start] + data[end:]
+    if created and not rest.strip() and not rc.is_symlink():
+        try:
+            rc.unlink()
+        except OSError as exc:
+            return f"could not remove {rc}: {exc}; tmap created it for its completion block"
+        return f"removed {rc} (tmap created it for its completion block; nothing else was in it)"
     try:
-        cl._atomic_write(rc, data[:start] + data[end:], mode)
+        cl._atomic_write(rc, rest, mode)
     except OSError as exc:
         return f"could not write {rc}: {exc}; its tmap completion block is still there"
     return f"removed tmap's completion block from {rc}"
+
+
+def _value(data: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    node: Any = data
+    for k in keys:
+        node = node.get(k) if isinstance(node, dict) else None
+    return node
 
 
 def _remove_path(path: Path) -> None:
@@ -184,18 +202,23 @@ def uninstall(
         if why is not None:
             report.refused.append(why)
             continue
-        if e.kind == "edit":
-            report.removed.append(_restore_edit(e))
-            ledger.remove(e.id)
-            continue
         path = Path(e.path)
-        if path.exists() or path.is_symlink():
-            _remove_path(path)
-            report.removed.append(f"removed {path}")
-            removed_paths.append(path)
+        try:
+            if e.kind == "edit":
+                report.removed.append(_restore_edit(e))
+                ledger.remove(e.id)
+                continue
+            if path.exists() or path.is_symlink():
+                _remove_path(path)
+                report.removed.append(f"removed {path}")
+                removed_paths.append(path)
+        except OSError as exc:  # this entry only: it stays in the ledger for a later run
+            verb = "restore" if e.kind == "edit" else "remove"
+            report.manual.append(f"could not {verb} {path}: {exc}; run tmap uninstall again")
+            continue
         rc = e.extra.get("rc_block")
         if e.id == "completion" and isinstance(rc, str) and rc:
-            note = _remove_rc_block(Path(rc))
+            note = _remove_rc_block(Path(rc), created=e.extra.get("rc_created") is True)
             if note.startswith("could not"):
                 report.manual.append(note)
                 continue  # the entry stays, so a later run removes the block
@@ -212,6 +235,7 @@ def uninstall(
             )
         if isinstance(data, dict):
             touched = False
+            resolved = resolve_relative_paths(data, config_path)  # as tmap reads them
             for keys in (
                 ("ghidra", "local", "home"),
                 ("toolchain", "java_home"),
@@ -222,7 +246,7 @@ def uninstall(
                     node = node.get(k) if isinstance(node, dict) else None
                 if not isinstance(node, dict):
                     continue
-                value = node.get(keys[-1])
+                value = _value(resolved, keys)
                 if isinstance(value, str) and any(
                     _inside(Path(os.path.expanduser(value)), p) for p in removed_paths
                 ):
@@ -260,6 +284,14 @@ def _size(path: Path) -> int:
 _SQLITE_MAGIC = b"SQLite format 3\x00"
 _ATLAS_TABLES = frozenset({"run", "instance"})
 _ANALYSIS_TABLES = frozenset({"binaries", "functions"})
+_CHECKPOINT_TABLES = frozenset({"steps"})  # an older version's state.db
+_SQLITE_SIDECARS = ("-wal", "-shm", "-journal")
+_SCAN_LOCK = ".tmap-scan.lock"
+_GHIDRA_OUTPUT = "ghidra_output"
+_LISTED = 10  # names listed per kept directory before "and N more"
+# in ~/.treasure-map, handled by name rather than listed as left over (the toolchain is
+# uninstall's own step; config.yaml and .env are deleted or kept with their reason)
+_ACCOUNTED_IN_TM_HOME = ("toolchain", "config.yaml", ".env")
 
 
 def _tmap_database(path: Path, tables: frozenset[str]) -> bool:
@@ -282,6 +314,38 @@ def _tmap_database(path: Path, tables: frozenset[str]) -> bool:
     return tables <= names
 
 
+def _regular(path: Path) -> bool:
+    return path.is_file() and not path.is_symlink()
+
+
+def _database_files(db: Path) -> list[Path]:
+    return [db] + [p for p in (db.with_name(db.name + s) for s in _SQLITE_SIDECARS) if _regular(p)]
+
+
+def _workspace_files(ws: Path) -> list[Path]:
+    """What a scan wrote in ``ws``, a directory whose analysis.db is tmap's: that database and
+    its SQLite sidecars, the scan lock, the Ghidra output directory, and an older version's
+    state.db. Nothing else in it — a workspace base set to where the firmware lives puts the
+    user's files right beside these."""
+    out = _database_files(ws / "analysis.db")
+    if _regular(ws / _SCAN_LOCK):
+        out.append(ws / _SCAN_LOCK)
+    ghidra = ws / _GHIDRA_OUTPUT
+    if ghidra.is_dir() and not ghidra.is_symlink():
+        out.append(ghidra)
+    if _tmap_database(ws / "state.db", _CHECKPOINT_TABLES):
+        out += _database_files(ws / "state.db")
+    return out
+
+
+def _listed(names: list[str], why: str) -> str:
+    """``"3 other entries (<why>): a, b, c"`` — the first ``_LISTED`` names, then how many more."""
+    count = f"{len(names)} other {'entry' if len(names) == 1 else 'entries'} ({why})"
+    shown = ", ".join(names[:_LISTED])
+    more = f" and {len(names) - _LISTED} more" if len(names) > _LISTED else ""
+    return f"{count}: {shown}{more}"
+
+
 @dataclass(frozen=True)
 class PurgePlan:
     """What ``--purge-data`` deletes, what it leaves (each with the reason), and the directories it
@@ -293,19 +357,20 @@ class PurgePlan:
 
 
 def purge_plan(*, tm_home: Path, atlas: Path, workspace_dir: Path, home: Path) -> PurgePlan:
-    """Only what is provably tmap's: the atlas when it is a SQLite file with tmap's tables, each
-    directory directly under the workspace base whose ``analysis.db`` is tmap's (never the base
-    itself — it may be any directory the user named — and nothing at all when the base is the home
-    directory or above it), config.yaml and .env when tmap wrote them (an empty .env is an older
-    init's placeholder), and tmap's last-run pointer."""
+    """Only what is provably tmap's: the atlas when it is a SQLite file with tmap's tables; in
+    each directory directly under the workspace base whose ``analysis.db`` is tmap's, what a scan
+    wrote there (``_workspace_files``) — the directory itself only once nothing else is left in
+    it; config.yaml and .env when tmap wrote them (an empty .env is an older init's placeholder);
+    and tmap's last-run pointer. Nothing in the workspace base is touched when it is the home
+    directory or above it, and the base itself — it may be any directory the user named — stays,
+    unless it is inside ~/.treasure-map and left empty. Everything kept is named in ``keep``."""
     delete: list[Path] = []
     keep: list[str] = []
     rmdir: list[Path] = []
     if _tmap_database(atlas, _ATLAS_TABLES):
-        delete.append(atlas)
-        delete += [
-            p for p in (atlas.with_name(atlas.name + s) for s in ("-wal", "-shm")) if p.exists()
-        ]
+        delete += _database_files(atlas)
+    elif atlas.is_symlink():
+        keep.append(f"{atlas}: a symbolic link; tmap does not follow it")
     elif atlas.exists():
         keep.append(f"{atlas}: not a tmap atlas")
     base = Path(os.path.realpath(workspace_dir))
@@ -315,29 +380,44 @@ def purge_plan(*, tm_home: Path, atlas: Path, workspace_dir: Path, home: Path) -
             f"{workspace_dir}: the home directory or above it; no workspace there is deleted"
         )
     elif workspace_dir.is_dir():
-        foreign = 0
+        foreign: list[str] = []
         for child in sorted(workspace_dir.iterdir()):
             if (
                 not child.is_symlink()
                 and child.is_dir()
                 and _tmap_database(child / "analysis.db", _ANALYSIS_TABLES)
             ):
-                delete.append(child)
+                ours = _workspace_files(child)
+                delete += ours
+                rest = sorted(p.name for p in child.iterdir() if p not in ours)
+                if rest:
+                    keep.append(f"{child}: {_listed(rest, 'not written by tmap')}")
+                rmdir.append(child)
             else:
-                foreign += 1
+                foreign.append(child.name)
         if foreign:
-            keep.append(f"{workspace_dir}: {foreign} entries that are not tmap workspaces")
-        rmdir.append(workspace_dir)
+            keep.append(f"{workspace_dir}: {_listed(foreign, 'not tmap workspaces')}")
+        if strictly_under(workspace_dir, tm_home):
+            rmdir.append(workspace_dir)
     for name in ("config.yaml", ".env"):
         p = tm_home / name
-        if p.is_symlink() or not p.is_file():
+        if p.is_symlink():
+            keep.append(f"{p}: a symbolic link; tmap does not follow it")
+        elif not p.is_file():
             continue
-        if written_by_tmap(p) or (name == ".env" and p.stat().st_size == 0):
+        elif written_by_tmap(p) or (name == ".env" and p.stat().st_size == 0):
             delete.append(p)
         else:
             keep.append(f"{p}: not written by tmap init")
     if (tm_home / "last_run.json").is_file():
         delete.append(tm_home / "last_run.json")
+    if tm_home.is_dir() and not tm_home.is_symlink():
+        # anything else in ~/.treasure-map is listed too
+        named = (*delete, atlas, workspace_dir, *(tm_home / n for n in _ACCOUNTED_IN_TM_HOME))
+        accounted = {os.path.realpath(p) for p in named}
+        rest = sorted(p.name for p in tm_home.iterdir() if os.path.realpath(p) not in accounted)
+        if rest:
+            keep.append(f"{tm_home}: {_listed(rest, 'not tmap data')}")
     rmdir.append(tm_home)
     return PurgePlan(tuple(delete), tuple(keep), tuple(rmdir))
 

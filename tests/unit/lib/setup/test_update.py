@@ -1,7 +1,7 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""``tmap update``: the newest tmap goes in, the old tmap comes out, and a tmap that uv does not
-manage is never touched."""
+"""``tmap update``: the newest tmap replaces this one in uv's tool environment, and a tmap that uv
+does not manage is never touched."""
 
 from __future__ import annotations
 
@@ -186,3 +186,16 @@ def test_up_to_date_and_nothing_old_means_nothing_runs(
     uv = _Uv(tools, "tmap-agents v0.1.0\n- tmap\n")
     out, code, execs = _cli(monkeypatch, tmp_path, uv, ["--yes"], "0.1.0")
     assert "up to date" in out and code == 0 and execs == []
+
+
+def test_the_help_says_what_update_does() -> None:
+    """The help shown by `tmap --help` and `tmap update --help` describes the in-place install
+    and the hand-over to init — not a removal of another tool, which update does not do.
+
+    MUTATION: put back "and remove the old one" in the short help -> RED."""
+    from treasure_map.cli.update_cli import update
+
+    assert update.short_help == "Update tmap to the newest version, then run its init"
+    text = CliRunner().invoke(update, ["--help"]).output
+    assert "in place of this one" in text and "tmap init" in text
+    assert "remove" not in (update.short_help or "") + text.replace("never removed", "")

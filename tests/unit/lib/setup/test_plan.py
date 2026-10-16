@@ -503,3 +503,74 @@ def test_force_keeps_the_atlas_names_each_reset_and_backs_up(home: Path, tmp_pat
     backup = cfg.with_name("config.yaml.tmap.backup")
     assert backup.is_file() and backup.read_text() == original
     assert any("reset ghidra.headless_timeout_seconds: 900 -> 300" in ln for ln in lines)
+
+
+def test_init_records_an_rc_it_created_and_not_one_that_existed(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ledger says when tmap created the rc for its block (so uninstall can take an empty one
+    away again), and says nothing when the rc was already the user's.
+
+    MUTATION: never record rc_created -> RED.
+    MUTATION: record it whatever activation reported -> RED (second half)."""
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+    ledger_file = home / ".treasure-map" / "toolchain" / "installed.json"
+
+    def completion_entry() -> dict[str, Any]:
+        entries = json.loads(ledger_file.read_text())["entries"]
+        found: dict[str, Any] = next(e for e in entries if e["id"] == "completion")
+        return found
+
+    assert not (home / ".zshrc").exists()
+    run_init(
+        prompt=lambda _m: "",
+        platform=fakes.linux(),
+        host=_host(home),
+        tmap=None,
+        use_tty=False,
+        fetcher=fakes.RefusingFetcher(),
+    )
+    assert completion_entry().get("rc_created") is True
+    ledger_file.unlink()
+    (home / ".zshrc").write_text("# mine\n")
+    run_init(
+        prompt=lambda _m: "",
+        platform=fakes.linux(),
+        host=_host(home),
+        tmap=None,
+        use_tty=False,
+        fetcher=fakes.RefusingFetcher(),
+    )
+    entry = completion_entry()
+    assert entry["rc_block"] == str(home / ".zshrc") and "rc_created" not in entry
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_a_workspace_directory_that_cannot_be_created_is_a_to_do(home: Path) -> None:
+    """config.yaml names a workspace base inside a read-only directory: init reports it as
+    something for the user to fix and finishes, instead of a traceback.
+
+    MUTATION: stop catching OSError around the final _provision_dirs -> PermissionError escapes
+    run_init -> RED (assertion)."""
+    locked = home / "locked"
+    locked.mkdir()
+    tm = home / ".treasure-map"
+    tm.mkdir(exist_ok=True)
+    (tm / "config.yaml").write_text(f"workspace_dir: {locked / 'ws'}\n")
+    os.chmod(locked, 0o555)
+    try:
+        result = run_init(
+            non_interactive=True,
+            prompt=lambda _m: "",
+            platform=fakes.linux(),
+            host=_host(home),
+            tmap=None,
+        )
+        outcome = "ok"
+    except OSError as exc:
+        result, outcome = None, repr(exc)
+    finally:
+        os.chmod(locked, 0o755)
+    assert outcome == "ok" and result is not None, outcome
+    assert any("create the atlas and workspace directories" in n for n in result.needs_you)
+    assert not (locked / "ws").exists()

@@ -275,6 +275,24 @@ def test_mirror_and_offline(tmp_path: Path) -> None:
     assert out.read_bytes() == b"z"
 
 
+def test_a_short_file_in_the_offline_directory_is_a_mismatch(tmp_path: Path) -> None:
+    """--offline copies the whole file: shorter than the lock, it is all there is, so it is
+    deleted as a mismatch — a later run would copy the same file again, never resume it.
+
+    MUTATION: OfflineFetcher reports the copy as not complete -> "run again to resume", the .part
+    kept -> RED."""
+    data = _tool_zip()
+    (tmp_path / "thing.zip").write_bytes(data[:100])
+    staging = tmp_path / "st"
+    outcome = "ok"
+    try:
+        download_verified(_asset(data), staging, OfflineFetcher(tmp_path))
+    except FetchError as exc:
+        outcome = str(exc)
+    assert "deleted, nothing installed" in outcome, outcome
+    assert not (staging / "thing.zip.part").exists()
+
+
 # ── audit follow-ups ─────────────────────────────────────────────────────────────────────────
 
 
@@ -395,11 +413,12 @@ class _ResumingFetcher:
         self.data = data
         self.resumed_from: list[int] = []
 
-    def fetch(self, url: str, dest: Path, *, progress: object = None) -> None:
+    def fetch(self, url: str, dest: Path, *, progress: object = None) -> bool:
         have = dest.stat().st_size if dest.exists() else 0
         self.resumed_from.append(have)
         with dest.open("ab") as fh:
             fh.write(self.data[have:])
+        return True
 
 
 def test_an_interrupted_download_resumes(tmp_path: Path) -> None:
@@ -489,9 +508,10 @@ class _ShortFetcher:
         self.data, self.n = data, n
         self.calls: list[str] = []
 
-    def fetch(self, url: str, dest: Path, *, progress: object = None) -> None:
+    def fetch(self, url: str, dest: Path, *, progress: object = None) -> bool:
         self.calls.append(url)
         dest.write_bytes(self.data[: self.n])
+        return False  # the transfer stopped: nothing says this is all there is
 
 
 def test_a_dropped_connection_keeps_the_part_for_the_next_run(tmp_path: Path) -> None:
@@ -514,8 +534,9 @@ class _CountingFetcher:
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    def fetch(self, url: str, dest: Path, *, progress: object = None) -> None:
+    def fetch(self, url: str, dest: Path, *, progress: object = None) -> bool:
         self.calls.append(url)
+        return True
 
 
 def test_a_complete_part_is_verified_without_fetching(tmp_path: Path) -> None:
@@ -697,3 +718,65 @@ def test_a_mount_that_will_not_detach_is_reported_with_the_command(tmp_path: Pat
     except FetchError as exc:
         outcome = str(exc)
     assert "still mounted" in outcome and "hdiutil detach -force" in outcome
+
+
+def test_a_recorded_binexport_the_user_changed_is_not_repaired_away(tmp_path: Path) -> None:
+    """The ledger records tmap's BinExport in the user's Ghidra settings, but its jar is not the
+    one tmap installed any more (the user put their own build there): a "repair" must not move it
+    out of the way and delete it with the staging directory.
+
+    MUTATION: drop install_archive's _provably_ours check -> the user's build is replaced -> RED
+    (assertion)."""
+    from treasure_map.lib.diff.toolchain import binexport_lib_digest
+
+    tdir = tmp_path / "toolchain"
+    target = fakes.make_binexport(tmp_path / "settings" / "Extensions" / "BinExport")
+    ledger = Ledger(tdir / LEDGER_NAME)
+    ledger.add_pending("binexport", "dir", target)
+    ledger.commit("binexport", lib_digest=binexport_lib_digest(target))
+    (target / "lib" / "BinExport.jar").write_bytes(b"their own build")
+    data = fakes.zip_bytes({"BinExport/lib/BinExport.jar": (b"tmap's build", 0o100644)})
+    outcome = "ok"
+    try:
+        install_archive(
+            "binexport",
+            _asset(data, name="BinExport.zip", root="BinExport"),
+            target,
+            toolchain_dir=tdir,
+            ledger=ledger,
+            fetcher=fakes.BytesFetcher({"BinExport.zip": data}),
+            verify=lambda _p: None,
+            run=fakes.fake_run(),
+        )
+    except FetchError as exc:
+        outcome = str(exc)
+    assert "changed since; not replaced" in outcome, outcome
+    assert (target / "lib" / "BinExport.jar").read_bytes() == b"their own build"
+
+
+class _RecordingFetcher:
+    """Records how much ``dest`` held when asked, then writes the whole payload afresh."""
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+        self.had: list[int] = []
+
+    def fetch(self, url: str, dest: Path, *, progress: object = None) -> bool:
+        self.had.append(dest.stat().st_size if dest.exists() else 0)
+        dest.write_bytes(self.data)
+        return True
+
+
+def test_a_part_longer_than_the_lock_is_deleted_before_fetching(tmp_path: Path) -> None:
+    """A .part longer than the pinned size can never become the pinned file: it is deleted, and
+    the download starts from nothing instead of asking the server for bytes past the end.
+
+    MUTATION: keep the longer .part -> the fetcher is asked to resume after 9999 bytes -> RED."""
+    data = _tool_zip()
+    staging = tmp_path / "dl"
+    staging.mkdir()
+    (staging / "thing.zip.part").write_bytes(b"x" * (len(data) + 9999))
+    fetcher = _RecordingFetcher(data)
+    out = download_verified(_asset(data), staging, fetcher)
+    assert fetcher.had == [0]
+    assert out.read_bytes() == data
