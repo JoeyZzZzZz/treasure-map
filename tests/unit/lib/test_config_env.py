@@ -196,3 +196,51 @@ def test_a_config_yaml_in_the_working_directory_is_never_read(
     assert cfg.toolchain.java_home is None and cfg.toolchain.bindiff is None
     assert not str(cfg.atlas.db_path).startswith(str(fw))
     assert not str(cfg.workspace_dir).startswith(str(fw))
+
+
+# ── a relative path in a config file is read from that file's directory ──────────────────────
+
+
+def test_a_relative_path_in_config_yaml_is_read_from_its_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``ghidra.local.home: foo`` means ~/.treasure-map/foo wherever tmap is run — not a
+    directory named foo inside whatever firmware tree is the working directory.
+
+    MUTATION: merge the file without resolve_relative_paths -> the paths follow the working
+    directory -> RED."""
+    tm = Path.home() / ".treasure-map"
+    (tm / "config.yaml").write_text(
+        "ghidra:\n  local:\n    home: foo\n"
+        "toolchain:\n  java_home: jdk/21\n  bindiff: bin/bindiff\n"
+        "atlas:\n  db_path: data/atlas.db\n"
+        "workspace_dir: ws\n"
+    )
+    fw = tmp_path / "fw"
+    fw.mkdir()
+    monkeypatch.chdir(fw)
+    cfg = load_config()
+    assert cfg.ghidra.local.home == tm / "foo"
+    assert cfg.toolchain.java_home == tm / "jdk" / "21"
+    assert cfg.toolchain.bindiff == tm / "bin" / "bindiff"
+    assert cfg.atlas.db_path == tm / "data" / "atlas.db"
+    assert cfg.workspace_dir == tm / "ws"
+
+
+def test_absolute_and_home_paths_are_left_as_written(tmp_path: Path) -> None:
+    from treasure_map.lib.config.config import resolve_relative_paths
+
+    data = {"workspace_dir": "~/ws", "atlas": {"db_path": str(tmp_path / "a.db")}, "x": "rel"}
+    out = resolve_relative_paths(data, tmp_path / "conf" / "config.yaml")
+    assert out == data and out is not data
+
+
+def test_a_relative_path_in_an_extra_config_is_read_from_that_files_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    extra = tmp_path / "profiles" / "big.yaml"
+    extra.parent.mkdir()
+    extra.write_text("workspace_dir: ws\n")
+    monkeypatch.chdir(tmp_path)
+    cfg = load_config(Path("profiles/big.yaml"))
+    assert cfg.workspace_dir == tmp_path / "profiles" / "ws"

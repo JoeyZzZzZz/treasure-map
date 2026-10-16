@@ -512,7 +512,9 @@ def _without_ours(obj: Mapping[str, Any], had_servers_key: bool) -> dict[str, An
 def json_transaction(path: Path, desired: dict[str, Any] | None) -> Outcome:
     """Set (``desired``) or delete (None) ``mcpServers["treasure-map"]`` in a JSON file, touching
     nothing else: back up the first time, write atomically, read back, and put the original bytes
-    back when the result is not exactly the intended change."""
+    back when the result is not exactly the intended change. A write the filesystem refuses (a
+    permission or disk error) is an Outcome that says so, not an exception: the atomic write fails
+    before its rename, so the file is as it was."""
     existed = path.exists()
     original = path.read_bytes() if existed else None
     obj = _load_json_object(path)
@@ -532,9 +534,12 @@ def json_transaction(path: Path, desired: dict[str, Any] | None) -> Outcome:
         servers[SERVER] = desired
     mode = (path.stat().st_mode & 0o777) if existed else 0o600
     backup = path.with_name(path.name + ".tmap.backup")
-    if existed and not backup.exists() and original is not None:
-        _atomic_write(backup, original, mode)
-    _atomic_write(path, (json.dumps(new, indent=2, ensure_ascii=False) + "\n").encode(), mode)
+    try:
+        if existed and not backup.exists() and original is not None:
+            _atomic_write(backup, original, mode)
+        _atomic_write(path, (json.dumps(new, indent=2, ensure_ascii=False) + "\n").encode(), mode)
+    except OSError as exc:
+        return Outcome(False, f"could not write {path}: {exc}; not modified")
     try:
         back = json.loads(_read_back(path))
     except (OSError, ValueError):
@@ -684,7 +689,22 @@ def remove_shadowing(host: ClientHost, project_dir: Path) -> Outcome:
 
 def unregister(client: str, host: ClientHost, tmap: Path | None) -> list[Outcome]:
     """Remove tmap's entries from ``client`` (user scope, and Claude Code's local scope). A
-    foreign entry and project files are left alone."""
+    foreign entry and project files are left alone. A configuration tmap may not read or write
+    (a permission or disk error) comes back as a failed Outcome to fix by hand, never as an
+    exception: the other agents, and the rest of an uninstall, still go ahead."""
+    try:
+        return _unregister(client, host, tmap)
+    except OSError as exc:
+        return [Outcome(False, f"could not change its configuration ({exc}); {_by_hand(client)}")]
+
+
+def _by_hand(client: str) -> str:
+    if client == "dsh":
+        return f"remove the {DSH_ENTRY_ID} insert (serverName {SERVER}) from its patch file by hand"
+    return f"remove its {SERVER} entry by hand"
+
+
+def _unregister(client: str, host: ClientHost, tmap: Path | None) -> list[Outcome]:
     state = inspect(client, host, tmap)
     outs: list[Outcome] = []
     ours = state.state in ("aligned", "stale", "shadowed", "unknown")
@@ -712,7 +732,8 @@ def unregister(client: str, host: ClientHost, tmap: Path | None) -> list[Outcome
         return [Outcome(ok, why or "removed")]
     if client in ("cursor", "claude-desktop"):
         assert state.config_path is not None
-        return [json_transaction(state.config_path, None)]
+        out = json_transaction(state.config_path, None)
+        return [out if out.ok else Outcome(False, f"{out.message}; {_by_hand(client)}")]
     if client == "dsh":
         if not state.editable:
             return [Outcome(True, f"left alone: {r}") for r in state.reported]
@@ -730,9 +751,12 @@ def _unregister_dsh(host: ClientHost) -> Outcome:
     block = dsh_block(command)
     if read.text.count(block) != 1:
         return Outcome(False, f"tmap's block in {path} was edited; remove it by hand")
-    original = path.read_bytes()
-    mode = path.stat().st_mode & 0o777
-    _atomic_write(path, read.text.replace(block, "", 1).encode(), mode)
+    try:
+        original = path.read_bytes()
+        mode = path.stat().st_mode & 0o777
+        _atomic_write(path, read.text.replace(block, "", 1).encode(), mode)
+    except OSError as exc:  # the atomic write fails before its rename: the file is as it was
+        return Outcome(False, f"could not write {path}: {exc}; {_by_hand('dsh')}")
     back = _read_dsh(path)
     if back.items is None or _dsh_entries(back.items):
         _restore(path, original, mode)

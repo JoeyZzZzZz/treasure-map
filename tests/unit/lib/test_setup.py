@@ -175,7 +175,24 @@ def test_run_init_config_yaml_is_parseable(fake_home: Path) -> None:
     run_init(force=False, non_interactive=True, prompt=_noop_prompt)
     data: dict[str, Any] = yaml.safe_load((fake_home / ".treasure-map" / "config.yaml").read_text())
     assert data["atlas"]["db_path"] == "~/.treasure-map/atlas.db"
-    assert data["log_level"] == "INFO"
+
+
+def test_init_writes_no_key_that_nothing_reads(fake_home: Path) -> None:
+    """ghidra.mode and log_level are read by nothing: init no longer writes them, and a config
+    an older init wrote with them still loads.
+
+    MUTATION: put "mode": "local" back into the default config -> RED.
+    MUTATION: put "log_level": "INFO" back into the default config -> RED."""
+    from treasure_map.lib.config.config import load_config
+
+    run_init(force=False, non_interactive=True, prompt=_noop_prompt)
+    config = fake_home / ".treasure-map" / "config.yaml"
+    data: dict[str, Any] = yaml.safe_load(config.read_text())
+    assert "mode" not in data["ghidra"] and "log_level" not in data
+    data["ghidra"]["mode"] = "local"
+    data["log_level"] = "DEBUG"
+    config.write_text(yaml.safe_dump(data))
+    assert load_config().ghidra.headless_timeout_seconds == 300
 
 
 def test_run_init_check_only_writes_nothing(fake_home: Path) -> None:
@@ -580,3 +597,69 @@ def test_a_rewrite_keeps_who_wrote_config_yaml(fake_home: Path) -> None:
     _set_keys(cfg, {("ghidra", "local", "home"): str(fake_home / "g")})
     assert not written_by_tmap(cfg)
     assert "workspace_dir: /x" in cfg.read_text()
+
+
+# ── relative paths: what init stores, and how it reads config.yaml ───────────────────────────
+
+
+def test_a_relative_workspace_typed_at_the_prompt_is_stored_absolute(
+    fake_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A relative path typed at the prompt meant the current directory; config.yaml reads a
+    relative path from its own directory, so init stores it absolute.
+
+    MUTATION: store the typed text as it is -> RED."""
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+
+    def _prompt(msg: str) -> str:
+        return "big-disk/ws" if "Workspace base" in msg else ""
+
+    with patch(_FIND_HEADLESS, side_effect=GhidraNotFoundError("not found")):
+        run_init(non_interactive=False, prompt=_prompt)
+    assert _workspace_dir(fake_home) == str(work / "big-disk" / "ws")
+
+
+def test_a_relative_ghidra_given_to_init_is_stored_absolute(
+    fake_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MUTATION: keep --ghidra as given -> config.yaml holds "g", which would be read from
+    ~/.treasure-map -> RED."""
+    g = _make_ghidra_root(tmp_path, "g")
+    monkeypatch.chdir(tmp_path)
+    run_init(non_interactive=True, prompt=_noop_prompt, ghidra=Path("g"))
+    assert _ghidra_home(fake_home) == str(g)
+
+
+def test_init_reads_a_relative_config_path_from_the_config_directory(
+    fake_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """init's own reading of config.yaml agrees with every other command's.
+
+    MUTATION: validate the raw mapping in _read_config -> the Ghidra is looked for under the
+    working directory -> RED."""
+    from treasure_map.lib.setup.initializer import _read_config
+
+    tm = fake_home / ".treasure-map"
+    tm.mkdir(exist_ok=True)
+    (tm / "config.yaml").write_text("ghidra:\n  local:\n    home: myghidra\n")
+    monkeypatch.chdir(tmp_path)
+    cfg, raw, err = _read_config(tm / "config.yaml")
+    assert err is None and cfg is not None
+    assert cfg.ghidra.local.home == tm / "myghidra"
+    assert raw == {"ghidra": {"local": {"home": "myghidra"}}}  # the file's own text is kept
+
+
+def test_a_relative_ghidra_typed_at_the_prompt_is_stored_absolute(
+    fake_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MUTATION: keep the typed path relative -> config.yaml holds "g" -> RED."""
+    g = _make_ghidra_root(tmp_path, "g")
+    monkeypatch.chdir(tmp_path)
+
+    def _prompt(msg: str) -> str:
+        return "g" if _GHIDRA_PROMPT in msg else ""
+
+    run_init(non_interactive=False, prompt=_prompt)
+    assert _ghidra_home(fake_home) == str(g)

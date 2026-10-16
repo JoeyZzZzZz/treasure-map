@@ -4,6 +4,10 @@
 
 from __future__ import annotations
 
+import json
+import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -178,7 +182,7 @@ def test_purge_deletes_only_what_is_provably_tmaps(tmp_path: Path) -> None:
     assert not (tm / "config.yaml").exists()
     assert (tm / ".env").is_file() and (tm / ".env").read_text() == "MY_KEY=1\n"
     assert any(".env: not written by tmap init" in k for k in plan.keep)
-    assert any("2 entries that are not tmap workspaces" in k for k in plan.keep)
+    assert f"{base}: 2 other entries (not tmap workspaces): mine, plain" in plan.keep
 
 
 def test_purge_takes_tmaps_env_and_an_older_inits_empty_one(tmp_path: Path) -> None:
@@ -399,3 +403,335 @@ def test_a_failed_rc_rewrite_leaves_the_rc_and_the_entry(
     assert rc.read_text() == before
     assert any("could not write" in m for m in report.manual)
     assert Ledger.load(tm / "toolchain" / LEDGER_NAME).find("completion") is not None
+
+
+# ── a configuration or directory tmap may not write: reported, and the rest still goes ───────
+
+_ROOT = os.geteuid() == 0
+_needs_non_root = pytest.mark.skipif(_ROOT, reason="root ignores directory permissions")
+
+
+@contextmanager
+def _mode(path: Path, mode: int) -> Iterator[None]:
+    os.chmod(path, mode)
+    try:
+        yield
+    finally:
+        os.chmod(path, 0o755)
+
+
+def _managed_jdk(tm: Path) -> Path:
+    jdk = fakes.make_jdk(tm / "toolchain" / "jdk-21")
+    ledger = Ledger(tm / "toolchain" / LEDGER_NAME)
+    ledger.add_pending("jdk", "dir", jdk)
+    ledger.commit("jdk")
+    return jdk
+
+
+def _run_reporting(home: Path) -> tuple[un.UninstallReport | None, str]:
+    """``_run``, with an escaping exception turned into the outcome a test asserts on."""
+    try:
+        return _run(home), "ok"
+    except Exception as exc:  # noqa: BLE001 -- the mutation's failure must read as an assertion
+        return None, repr(exc)
+
+
+@_needs_non_root
+def test_an_unwritable_agent_config_is_a_manual_step_and_the_toolchain_still_goes() -> None:
+    """A read-only ~/.cursor: its entry cannot be removed. That is a to-do for the user with the
+    file untouched — and the toolchain is still removed.
+
+    MUTATION: drop json_transaction's OSError guard -> the message no longer says the file was
+    not modified -> RED (assertion). With unregister's guard dropped too, the PermissionError
+    escapes uninstall and nothing of the toolchain is removed -> RED (assertion)."""
+    home = Path.home()
+    tm = home / ".treasure-map"
+    jdk = _managed_jdk(tm)
+    cursor = home / ".cursor"
+    cursor.mkdir()
+    config = cursor / "mcp.json"
+    body = json.dumps({"mcpServers": {"treasure-map": {"command": "/x/tmap", "args": ["mcp"]}}})
+    config.write_text(body)
+    with _mode(cursor, 0o555):
+        report, outcome = _run_reporting(home)
+    assert outcome == "ok" and report is not None
+    lines = [m for m in report.manual if m.startswith("Cursor:")]
+    assert len(lines) == 1 and "could not write" in lines[0] and "not modified" in lines[0]
+    assert "remove its treasure-map entry by hand" in lines[0]
+    assert config.read_text() == body
+    assert not jdk.exists()
+
+
+@_needs_non_root
+def test_an_unwritable_dsh_patch_file_is_a_manual_step() -> None:
+    """MUTATION: drop _unregister_dsh's OSError guard -> only the catch-all answers, without
+    naming the file it could not write -> RED (assertion)."""
+    home = Path.home()
+    tm = home / ".treasure-map"
+    jdk = _managed_jdk(tm)
+    dsh = home / ".dsh"
+    dsh.mkdir()
+    patch = dsh / cl.DSH_PATCH_FILE
+    patch.write_text(cl.dsh_block("/x/tmap"))
+    with _mode(dsh, 0o555):
+        report, outcome = _run_reporting(home)
+    assert outcome == "ok" and report is not None
+    lines = [m for m in report.manual if m.startswith("dsh:")]
+    assert len(lines) == 1 and f"could not write {patch}" in lines[0], lines
+    assert "treasure-map-mcp insert" in lines[0]
+    assert patch.read_text() == cl.dsh_block("/x/tmap") and not jdk.exists()
+
+
+@_needs_non_root
+def test_an_unreadable_agent_directory_does_not_stop_the_uninstall() -> None:
+    """~/.cursor without read or search permission: even reading the entry fails. unregister's
+    catch-all turns that into a to-do, and the toolchain is still removed.
+
+    MUTATION: call the unguarded _unregister from unregister -> PermissionError escapes, the
+    toolchain stays -> RED (assertion)."""
+    home = Path.home()
+    tm = home / ".treasure-map"
+    jdk = _managed_jdk(tm)
+    cursor = home / ".cursor"
+    cursor.mkdir()
+    (cursor / "mcp.json").write_text("{}")
+    with _mode(cursor, 0o000):
+        report, outcome = _run_reporting(home)
+    assert outcome == "ok" and report is not None
+    lines = [m for m in report.manual if m.startswith("Cursor:")]
+    assert len(lines) == 1 and "could not change its configuration" in lines[0], lines
+    assert not jdk.exists()
+
+
+@_needs_non_root
+def test_a_toolchain_path_that_cannot_be_removed_leaves_its_entry_and_the_rest_goes() -> None:
+    """MUTATION: drop the per-entry OSError guard -> the PermissionError stops the loop before
+    the other entry is removed -> RED (assertion)."""
+    home = Path.home()
+    tm = home / ".treasure-map"
+    jdk = _managed_jdk(tm)
+    stuck = tm / "toolchain" / "bindiff-8"
+    (stuck / "locked").mkdir(parents=True)
+    (stuck / "locked" / "f").write_text("x")
+    ledger = Ledger.load(tm / "toolchain" / LEDGER_NAME)
+    ledger.add_pending("bindiff", "dir", stuck)  # newest: handled first
+    ledger.commit("bindiff")
+    with _mode(stuck / "locked", 0o555):
+        report, outcome = _run_reporting(home)
+    assert outcome == "ok" and report is not None
+    assert any(m.startswith(f"could not remove {stuck}") for m in report.manual), report.manual
+    assert not jdk.exists()
+    left = Ledger.load(tm / "toolchain" / LEDGER_NAME)
+    assert left.find("bindiff") is not None and left.find("jdk") is None
+
+
+@_needs_non_root
+def test_the_cli_reports_a_filesystem_error_instead_of_a_traceback() -> None:
+    """An agent directory tmap cannot even read stops the plan itself: the command says so and
+    exits 1 — no traceback.
+
+    MUTATION: drop the CLI's OSError guard -> the PermissionError escapes -> RED (assertion)."""
+    from treasure_map.cli.uninstall_cli import uninstall
+
+    home = Path.home()
+    cursor = home / ".cursor"
+    cursor.mkdir()
+    (cursor / "mcp.json").write_text("{}")
+    with _mode(cursor, 0o000):
+        result = CliRunner().invoke(uninstall, ["--yes"])
+    assert isinstance(result.exception, SystemExit), repr(result.exception)
+    assert result.exit_code == 1 and "stopped:" in result.output + result.stderr
+
+
+def _completion_entry(home: Path, rc: Path, **extra: object) -> Path:
+    from treasure_map.lib.setup.completion import target_path
+
+    script = target_path("bash", home)
+    assert script is not None
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text("# tmap completion\n")
+    ledger = Ledger(home / ".treasure-map" / "toolchain" / LEDGER_NAME)
+    ledger.add_pending("completion", "file", script, rc_block=str(rc), **extra)
+    ledger.commit("completion")
+    return script
+
+
+def test_an_rc_tmap_created_goes_once_it_is_empty_again() -> None:
+    """macOS: tmap created ~/.bash_profile for its block. Left behind empty, it would still stop
+    bash from reading ~/.profile — so uninstall deletes it once nothing else is in it.
+
+    MUTATION: ignore the ledger's rc_created -> the empty file stays -> RED."""
+    from treasure_map.lib.setup.completion import _MARK_END, _MARK_START
+
+    home = Path.home()
+    rc = home / ".bash_profile"
+    rc.write_text(f"\n{_MARK_START}\nsource x\n{_MARK_END}\n")  # as activate_completion wrote it
+    _completion_entry(home, rc, rc_created=True)
+    report = _run(home)
+    assert not rc.exists(), rc.read_bytes()
+    assert any(f"removed {rc} (tmap created it" in m for m in report.removed)
+
+
+def test_an_rc_tmap_created_but_the_user_wrote_to_stays() -> None:
+    """MUTATION: delete a created rc without checking it is empty -> the user's line goes -> RED."""
+    from treasure_map.lib.setup.completion import _MARK_END, _MARK_START
+
+    home = Path.home()
+    rc = home / ".bash_profile"
+    rc.write_text(f"\n{_MARK_START}\nsource x\n{_MARK_END}\nexport EDITOR=vi\n")
+    _completion_entry(home, rc, rc_created=True)
+    _run(home)
+    assert rc.is_file() and rc.read_text() == "export EDITOR=vi\n"
+
+
+def test_an_rc_the_user_had_stays_even_when_empty() -> None:
+    """The rc existed before tmap (no rc_created): emptied of the block, it is still the user's.
+
+    MUTATION: delete any rc left empty, created or not -> RED."""
+    from treasure_map.lib.setup.completion import _MARK_END, _MARK_START
+
+    home = Path.home()
+    rc = home / ".profile"
+    rc.write_text(f"\n{_MARK_START}\nsource x\n{_MARK_END}\n")
+    _completion_entry(home, rc)
+    _run(home)
+    assert rc.is_file() and rc.read_text() == ""
+
+
+def test_a_sqlite_atlas_without_tmaps_tables_is_kept(tmp_path: Path) -> None:
+    """A real SQLite file at the atlas path is not enough: it must hold tmap's tables (both of
+    them; one name in common is not tmap's database).
+
+    MUTATION: _tmap_database accepts any SQLite file (return True after the header check) ->
+    the file is planned for deletion -> RED."""
+    home = tmp_path / "home"
+    tm = home / ".treasure-map"
+    atlas = _tmap_db(tm / "atlas.db", ("run", "notes"))
+    plan = un.purge_plan(tm_home=tm, atlas=atlas, workspace_dir=tm / "ws", home=home)
+    assert atlas not in plan.delete
+    assert any(f"{atlas}: not a tmap atlas" in k for k in plan.keep)
+
+
+def test_a_workspace_whose_sqlite_analysis_db_is_not_tmaps_is_kept(tmp_path: Path) -> None:
+    """A directory holding an ``analysis.db`` that is SQLite but not tmap's: nothing in it goes.
+
+    MUTATION: _tmap_database accepts any SQLite file -> the directory's contents are planned for
+    deletion -> RED."""
+    home = tmp_path / "home"
+    tm = home / ".treasure-map"
+    base = tmp_path / "projects"
+    theirs = base / "theirs"
+    _tmap_db(theirs / "analysis.db", ("binaries", "notes"))
+    (theirs / "notes.txt").write_text("mine")
+    plan = un.purge_plan(tm_home=tm, atlas=tm / "atlas.db", workspace_dir=base, home=home)
+    assert not [p for p in plan.delete if p == theirs or theirs in p.parents], plan.delete
+    assert un.purge_data(plan, un.PURGE_PHRASE)
+    assert (theirs / "analysis.db").is_file() and (theirs / "notes.txt").is_file()
+
+
+def test_the_rc_keeps_its_permission_bits(tmp_path: Path) -> None:
+    """A 0600 rc stays 0600 once the block is out.
+
+    MUTATION: write the rc back with a fixed 0644 -> RED."""
+    import stat as st
+
+    from treasure_map.lib.setup.completion import _MARK_END, _MARK_START
+
+    rc = tmp_path / ".zshrc"
+    rc.write_text(f"# mine\n\n{_MARK_START}\nfpath=(x $fpath)\n{_MARK_END}\n")
+    os.chmod(rc, 0o600)
+    note = un._remove_rc_block(rc)
+    assert note.startswith("removed") and rc.read_text() == "# mine\n"
+    assert st.S_IMODE(rc.stat().st_mode) == 0o600
+
+
+def test_purge_takes_only_what_a_scan_wrote_in_a_workspace(tmp_path: Path) -> None:
+    """A workspace base set to where the firmware lives: a workspace directory then holds the
+    user's image beside tmap's analysis.db. Only what the scan wrote goes; the image, the
+    unpacked tree and the directory stay, and are listed.
+
+    MUTATION: delete the whole workspace directory (rmtree) -> the user's image goes -> RED.
+    MUTATION: take any state.db, not only tmap's old checkpoint database -> RED."""
+    home = tmp_path / "home"
+    tm = home / ".treasure-map"
+    base = tmp_path / "fw"
+    ws = _workspace(base / "router")
+    (ws / "analysis.db-wal").write_bytes(b"")
+    (ws / ".tmap-scan.lock").write_text("")
+    (ws / "ghidra_output").mkdir()
+    (ws / "ghidra_output" / "busybox_deadbeef_ghidra.json").write_text("{}")
+    _tmap_db(ws / "state.db", ("steps",))
+    (ws / "firmware.img").write_bytes(b"FW")
+    (ws / "squashfs-root" / "bin").mkdir(parents=True)
+    other = _workspace(base / "other")
+    _tmap_db(other / "state.db", ("notes",))  # a state.db that is not tmap's
+    plan = un.purge_plan(tm_home=tm, atlas=tm / "atlas.db", workspace_dir=base, home=home)
+    assert un.purge_data(plan, un.PURGE_PHRASE)
+    assert ws.is_dir() and sorted(p.name for p in ws.iterdir()) == ["firmware.img", "squashfs-root"]
+    assert (ws / "firmware.img").read_bytes() == b"FW" and (ws / "squashfs-root" / "bin").is_dir()
+    assert other.is_dir() and sorted(p.name for p in other.iterdir()) == ["state.db"]
+    assert any(
+        k == f"{ws}: 2 other entries (not written by tmap): firmware.img, squashfs-root"
+        for k in plan.keep
+    ), plan.keep
+
+
+def test_an_emptied_workspace_goes_and_a_base_the_user_chose_stays(tmp_path: Path) -> None:
+    """A workspace directory left empty is removed; the base the user named is not, even empty
+    — only the default base inside ~/.treasure-map goes with it.
+
+    MUTATION: remove the workspace base whenever it is empty -> RED."""
+    home = tmp_path / "home"
+    tm = home / ".treasure-map"
+    base = tmp_path / "projects"
+    _workspace(base / "w1")
+    plan = un.purge_plan(tm_home=tm, atlas=tm / "atlas.db", workspace_dir=base, home=home)
+    assert un.purge_data(plan, un.PURGE_PHRASE)
+    assert not (base / "w1").exists()
+    assert base.is_dir() and list(base.iterdir()) == []
+
+
+def test_what_purge_keeps_is_listed_by_name(tmp_path: Path) -> None:
+    """Kept entries are named, not only counted: the workspace base's other entries (a long list
+    is cut with "and N more"), a symlinked config.yaml, and anything else in ~/.treasure-map.
+
+    MUTATION: list only the count -> RED.
+    MUTATION: leave ~/.treasure-map's other entries unlisted -> RED."""
+    home = tmp_path / "home"
+    tm = home / ".treasure-map"
+    base = tmp_path / "projects"
+    for i in range(12):
+        (base / f"d{i:02d}").mkdir(parents=True)
+    _atlas(tm / "atlas.db")
+    (tm / "atlas.db.bak").write_bytes(b"x")
+    dotfiles = tmp_path / "dotfiles.yaml"
+    dotfiles.write_text(config_text(dotfiles, {"workspace_dir": str(base)}))
+    (tm / "config.yaml").symlink_to(dotfiles)
+    plan = un.purge_plan(tm_home=tm, atlas=tm / "atlas.db", workspace_dir=base, home=home)
+    assert (
+        f"{base}: 12 other entries (not tmap workspaces): "
+        "d00, d01, d02, d03, d04, d05, d06, d07, d08, d09 and 2 more"
+    ) in plan.keep, plan.keep
+    assert f"{tm / 'config.yaml'}: a symbolic link; tmap does not follow it" in plan.keep
+    assert f"{tm}: 1 other entry (not tmap data): atlas.db.bak" in plan.keep, plan.keep
+    assert un.purge_data(plan, un.PURGE_PHRASE)
+    assert (tm / "atlas.db.bak").is_file() and dotfiles.is_file()
+
+
+def test_a_relative_config_key_pointing_at_a_removed_path_is_cleared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``toolchain.java_home: toolchain/jdk-21`` names ~/.treasure-map/toolchain/jdk-21 (read from
+    the config's directory): once that JDK is removed, the key is cleared.
+
+    MUTATION: test the key's raw text (read from the working directory) -> it stays -> RED."""
+    home = Path.home()
+    tm = home / ".treasure-map"
+    _managed_jdk(tm)
+    (tm / "config.yaml").write_text(
+        yaml.safe_dump({"toolchain": {"java_home": "toolchain/jdk-21"}})
+    )
+    monkeypatch.chdir(tmp_path)
+    report = _run(home)
+    assert yaml.safe_load((tm / "config.yaml").read_text())["toolchain"]["java_home"] is None
+    assert any("cleared toolchain.java_home" in r for r in report.removed)

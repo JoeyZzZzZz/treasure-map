@@ -276,10 +276,12 @@ to remove the program itself.
 
 **Your data stays:** `~/.treasure-map/config.yaml`, `.env`, the **atlas** and the workspaces —
 reinstalling reuses all of it. `tmap uninstall --purge-data` deletes them too, after you type a
-confirmation phrase (not recoverable), but only what is provably tmap's: the atlas, each workspace
-directory holding a tmap `analysis.db` (never the workspace base itself, and nothing when the base
-is your home directory or above it), and the `config.yaml` / `.env` that `tmap init` wrote. A file
-you wrote yourself, and anything else in the workspace base, is kept and listed.
+confirmation phrase (not recoverable), but only what is provably tmap's: the atlas, what a scan
+wrote in each workspace directory holding a tmap `analysis.db`, and the `config.yaml` / `.env` that
+`tmap init` wrote. The workspace base itself stays (unless it is the default inside
+`~/.treasure-map` and left empty), and nothing in it is deleted when it is your home directory or
+above it. Anything else — a file you wrote yourself, in a workspace or beside one — is kept and
+listed.
 
 <details>
 <summary>Details</summary>

@@ -11,15 +11,17 @@ from pathlib import Path
 import click
 
 
-@click.command("update", short_help="Update tmap to the newest version and remove the old one")
+@click.command("update", short_help="Update tmap to the newest version, then run its init")
 @click.option("--check", is_flag=True, help="Only say whether a newer version exists.")
 @click.option("--yes", "-y", "assume_yes", is_flag=True, help="Do not ask to confirm the plan.")
 def update(check: bool, assume_yes: bool) -> None:
-    """Install the newest tmap, remove the old tmap, then run the new version's ``tmap init``.
+    """Install the newest tmap in place of this one, then run the new version's ``tmap init``.
 
     Works on a tmap installed with ``uv tool install tmap-agents`` (the one-line installer does
-    that). Another kind of install is told how to update itself and left as it is. Exits 1 when
-    the newest version cannot be learned (``--check`` included)."""
+    that): ``uv tool install --force`` replaces that tool environment, and when the install
+    fails, the current version is installed again. Another kind of install is told how to update
+    itself and left as it is; any other ``tmap`` on PATH is named, never removed. Exits 1 when the
+    newest version cannot be learned (``--check`` included)."""
     from treasure_map.lib.setup import update as up
     from treasure_map.lib.setup.clients import tmap_executable
     from treasure_map.lib.setup.discover import current_host

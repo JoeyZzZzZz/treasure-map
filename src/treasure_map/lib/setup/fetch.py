@@ -5,7 +5,8 @@
 A download lands in ``<file>.part`` inside a staging directory and is resumed with a ``Range``
 request when the server allows it. Its size and sha256 are checked against the lock before
 anything reads it as an archive: a short file is kept for the next run to resume, a complete one
-from an interrupted run is verified without fetching again, and a mismatch deletes it. Unpacking
+from an interrupted run is verified without fetching again, and a mismatch deletes it — a file the
+server sent whole but shorter than the lock included, since no later run could resume it. Unpacking
 refuses absolute paths, ``..``, anything that resolves outside the destination, and link entries;
 zip permission bits are restored (Ghidra's launchers and decompiler must stay executable).
 
@@ -43,9 +44,13 @@ Progress = Callable[[int, int], None]  # (bytes so far, total or 0)
 
 
 class Fetcher(Protocol):
-    def fetch(self, url: str, dest: Path, *, progress: Progress | None = None) -> None:
+    def fetch(self, url: str, dest: Path, *, progress: Progress | None = None) -> bool:
         """Write the resource at ``url`` to ``dest``, resuming from ``dest``'s current size when
-        it exists and the source allows it (else starting over)."""
+        it exists and the source allows it (else starting over).
+
+        True when the source declared where the resource ends and ``dest`` reaches that end: what
+        is there is all the source has, not a transfer that stopped short. False when that is not
+        known."""
         ...
 
 
@@ -55,7 +60,7 @@ class UrlFetcher:
     def __init__(self, timeout: float = 60.0) -> None:
         self.timeout = timeout
 
-    def fetch(self, url: str, dest: Path, *, progress: Progress | None = None) -> None:
+    def fetch(self, url: str, dest: Path, *, progress: Progress | None = None) -> bool:
         import http.client
         import urllib.error
         import urllib.request
@@ -67,23 +72,31 @@ class UrlFetcher:
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:  # noqa: S310
                 status = getattr(resp, "status", 200)
+                length = resp.headers.get("Content-Length")
+                body = int(length) if length and length.isdigit() else None
                 if status == 206:
-                    if not str(resp.headers.get("Content-Range", "")).startswith(f"bytes {have}-"):
+                    content_range = str(resp.headers.get("Content-Range", ""))
+                    if not content_range.startswith(f"bytes {have}-"):
                         dest.unlink(missing_ok=True)
                         raise FetchError(f"download failed: {url}: resumed at the wrong offset")
                     mode = "ab"
+                    whole = content_range.rpartition("/")[2]  # "bytes a-b/N": N, or "*"
+                    end = int(whole) if whole.isdigit() else None
                 else:
                     mode, have = "wb", 0
-                length = resp.headers.get("Content-Length")
-                total = have + int(length) if length and length.isdigit() else 0
+                    end = body  # a whole response: the resource is its body
+                total = have + body if body is not None else 0
                 with dest.open(mode) as out:
-                    _copy(resp, out, have, total, progress)
+                    size = _copy(resp, out, have, total, progress)
         except urllib.error.HTTPError as exc:
             if exc.code == 416 and have:
-                return  # nothing past what is here: the size and sha256 check decides
+                return True  # nothing past what is here: the source's resource ends within it
             raise FetchError(f"download failed: {url}: {exc}") from exc
         except (OSError, http.client.HTTPException) as exc:
             raise FetchError(f"download failed: {url}: {exc}") from exc
+        # urllib returns a short body without an error when the connection drops, so the bytes
+        # are counted against what the server declared
+        return end is not None and size == end
 
 
 class OfflineFetcher:
@@ -92,7 +105,7 @@ class OfflineFetcher:
     def __init__(self, directory: Path) -> None:
         self.directory = directory
 
-    def fetch(self, url: str, dest: Path, *, progress: Progress | None = None) -> None:
+    def fetch(self, url: str, dest: Path, *, progress: Progress | None = None) -> bool:
         from urllib.parse import unquote, urlparse
 
         src = self.directory / unquote(PurePosixPath(urlparse(url).path).name)
@@ -100,9 +113,11 @@ class OfflineFetcher:
             raise FetchError(f"--offline: {src} not found")
         with src.open("rb") as fh, dest.open("wb") as out:
             _copy(fh, out, 0, src.stat().st_size, progress)
+        return True  # the whole file was copied
 
 
-def _copy(src: IO[bytes], out: IO[bytes], have: int, total: int, progress: Progress | None) -> None:
+def _copy(src: IO[bytes], out: IO[bytes], have: int, total: int, progress: Progress | None) -> int:
+    """Append ``src`` to ``out``; returns the size reached (``have`` plus what was copied)."""
     while True:
         chunk = src.read(1 << 20)
         if not chunk:
@@ -111,6 +126,7 @@ def _copy(src: IO[bytes], out: IO[bytes], have: int, total: int, progress: Progr
         have += len(chunk)
         if progress is not None:
             progress(have, total)
+    return have
 
 
 def source_url(asset: Asset, mirror: str | None) -> str:
@@ -160,20 +176,22 @@ def download_verified(
 ) -> Path:
     """Fetch ``asset`` into ``staging`` and return the verified file — the bytes are never opened
     as an archive before that. A ``.part`` already as long as the asset (an interrupted run) is
-    checked without fetching; a longer one is deleted first. A short result (the connection
-    dropped) is kept for the next run to resume, with FetchError; a size or sha256 mismatch
-    deletes it, with FetchError."""
+    checked without fetching; a longer one is deleted first. A short result whose transfer stopped
+    (the connection dropped) is kept for the next run to resume, with FetchError. A size or sha256
+    mismatch deletes it, with FetchError — a short file the source declared complete included:
+    the source has no more to give, so resuming it would fail the same way on every run."""
     staging.mkdir(parents=True, exist_ok=True)
     part = staging / (asset.file_name + ".part")
     url = source_url(asset, mirror)
     if part.is_file() and part.stat().st_size > asset.size:
         part.unlink()
+    complete = False
     if not (part.is_file() and part.stat().st_size == asset.size):
-        fetcher.fetch(url, part, progress=progress)
+        complete = fetcher.fetch(url, part, progress=progress)
     if not part.is_file():
         raise FetchError(f"download produced no file: {url}")
     size = part.stat().st_size
-    if size < asset.size:
+    if size < asset.size and not complete:
         raise FetchError(
             f"{asset.file_name}: download stopped at {size} of {asset.size} bytes; "
             "run again to resume it"

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import copy
 import logging
 import os
 from enum import StrEnum
@@ -56,7 +57,7 @@ class GhidraRemoteConfig(BaseModel):
 
 
 class GhidraConfig(BaseModel):
-    mode: GhidraMode = GhidraMode.LOCAL
+    mode: GhidraMode = GhidraMode.LOCAL  # not read; accepted so an older config.yaml still loads
     headless_timeout_seconds: int = 300
     max_parallel_jvms: int = 4
     local: GhidraLocalConfig = Field(default_factory=GhidraLocalConfig)
@@ -87,7 +88,7 @@ class Config(BaseModel):
         default_factory=lambda: Path.home() / ".treasure-map" / "workspaces"
     )
     atlas: AtlasConfig = Field(default_factory=AtlasConfig)
-    log_level: str = "INFO"
+    log_level: str = "INFO"  # not read; accepted so an older config.yaml still loads
     # L0 xref fold threshold (edge contribution = callers × exporters). A high-fan-out symbol
     # above this is folded into the xref_folded_symbols ledger instead of exploding the xrefs table.
     # Keep in sync with xrefs.DEFAULT_FOLD_EDGE_THRESHOLD (a unit test asserts equality). Tune down
@@ -151,23 +152,54 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
+# The keys whose values are filesystem paths.
+PATH_KEYS: tuple[tuple[str, ...], ...] = (
+    ("ghidra", "local", "home"),
+    ("toolchain", "java_home"),
+    ("toolchain", "bindiff"),
+    ("workspace_dir",),
+    ("atlas", "db_path"),
+)
+
+
+def resolve_relative_paths(data: dict[str, Any], config_file: Path) -> dict[str, Any]:
+    """A copy of ``data`` — one config file's mapping — with every relative path under
+    ``PATH_KEYS`` made absolute against the directory ``config_file`` is in. A ``~`` path counts as
+    absolute; anything else is left as it is.
+
+    Never against the working directory: that is wherever tmap happens to run, often inside an
+    unpacked, untrusted firmware tree, and a path in a config file would then name a different
+    Ghidra or atlas from one directory to the next."""
+    out = copy.deepcopy(data)
+    base = config_file.absolute().parent
+    for keys in PATH_KEYS:
+        node: Any = out
+        for k in keys[:-1]:
+            node = node.get(k) if isinstance(node, dict) else None
+        value = node.get(keys[-1]) if isinstance(node, dict) else None
+        if isinstance(value, str) and value and not os.path.isabs(os.path.expanduser(value)):
+            node[keys[-1]] = str(base / value)
+    return out
+
+
 def _merge_file(raw: dict[str, Any], path: Path) -> dict[str, Any]:
-    """``raw`` with one config file merged over it. Every way the file can fail — unreadable, not
-    YAML, not a mapping where a mapping is expected — is a ConfigError naming the file, so a bad
-    config surfaces as one exception type."""
+    """``raw`` with one config file merged over it, its relative paths read from its own
+    directory (``resolve_relative_paths``). Every way the file can fail — unreadable, not YAML,
+    not a mapping where a mapping is expected — is a ConfigError naming the file, so a bad config
+    surfaces as one exception type."""
     try:
         with path.open() as f:
             loaded = yaml.safe_load(f) or {}
         if not isinstance(loaded, dict):
             raise TypeError(f"top level is a {type(loaded).__name__}, not a mapping")
-        return _deep_merge(raw, loaded)
+        return _deep_merge(raw, resolve_relative_paths(loaded, path))
     except (OSError, yaml.YAMLError, TypeError, AttributeError, ValueError) as exc:
         raise ConfigError(f"Invalid configuration in {path}: {exc}") from exc
 
 
 def load_config(extra_path: Path | None = None) -> Config:
     """Load config from ~/.treasure-map/config.yaml, then ``extra_path`` (``-c``), then TM_* env
-    vars, each over the last.
+    vars, each over the last. A relative path in a file is read from that file's directory.
 
     Never from the working directory: tmap is run inside unpacked, untrusted firmware trees, and a
     ``config.yaml`` there would choose the Ghidra it executes and what goes first on PATH."""

@@ -220,11 +220,12 @@ def test_a_bash_older_than_4_4_gets_no_script_and_is_told_why(
     monkeypatch.setattr(comp, "bash_version", lambda *_a: (3, 2))
     monkeypatch.setenv("SHELL", "/bin/bash")
     lines: list[str] = []
-    script, rc = _configure_completion(
+    script, rc, created = _configure_completion(
         non_interactive=True, prompt=lambda _m: "", echo=lines.append
     )
     path = comp.target_path("bash", Path.home())
-    assert script is None and rc is None and path is not None and not path.exists()
+    assert script is None and rc is None and not created
+    assert path is not None and not path.exists()
     assert any("needs bash 4.4" in ln for ln in lines)
     name, ok, detail = comp.completion_check(Path.home(), "bash")
     assert ok and "needs bash 4.4" in detail
@@ -240,3 +241,119 @@ def test_macos_bash_activates_in_bash_profile(monkeypatch: pytest.MonkeyPatch) -
     assert comp.rc_path("bash", Path("/h")) == Path("/h/.bash_profile")
     monkeypatch.setattr(comp.sys, "platform", "linux")
     assert comp.rc_path("bash", Path("/h")) == Path("/h/.bashrc")
+
+
+# ── macOS: the login file bash really reads ──────────────────────────────────────────────────
+
+
+@pytest.fixture()
+def macos(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(comp.sys, "platform", "darwin")
+    monkeypatch.setattr(comp, "_bash_completion_present", lambda: False)
+
+
+@pytest.mark.usefixtures("macos")
+def test_macos_bash_uses_the_first_login_file_that_exists(tmp_path: Path) -> None:
+    """A login bash reads only the first of ~/.bash_profile, ~/.bash_login, ~/.profile that
+    exists: that file gets the block, and ~/.bash_profile is created only when none exists.
+
+    MUTATION: always ~/.bash_profile on macOS -> a new file hides ~/.profile -> RED."""
+    assert comp.rc_path("bash", tmp_path) == tmp_path / ".bash_profile"
+    (tmp_path / ".profile").write_text("export PATH=/opt/mine/bin:$PATH\n")
+    assert comp.rc_path("bash", tmp_path) == tmp_path / ".profile"
+    (tmp_path / ".bash_login").write_text("# mine\n")
+    assert comp.rc_path("bash", tmp_path) == tmp_path / ".bash_login"
+    (tmp_path / ".bash_profile").write_text("# mine\n")
+    assert comp.rc_path("bash", tmp_path) == tmp_path / ".bash_profile"
+
+
+@pytest.mark.usefixtures("macos")
+def test_macos_activation_appends_to_profile_and_creates_nothing(tmp_path: Path) -> None:
+    """Only ~/.profile: the block goes there, no ~/.bash_profile appears, and the activation says
+    it created no file. With no login file at all, ~/.bash_profile is created and said so.
+
+    MUTATION: report every append as a created file -> RED.
+    MUTATION: never report a created file -> RED."""
+    (tmp_path / ".profile").write_text("export PATH=/opt/mine/bin:$PATH\n")
+    path = _install("bash", tmp_path)
+    res = comp.activate_completion("bash", tmp_path, path)
+    assert res is not None and res.added and res.rc == tmp_path / ".profile"
+    assert res.created is False
+    assert not (tmp_path / ".bash_profile").exists()
+    assert comp._MARK_START in (tmp_path / ".profile").read_text()
+    other = tmp_path / "other"
+    other.mkdir()
+    res = comp.activate_completion("bash", other, _install("bash", other))
+    assert res is not None and res.added and res.rc == other / ".bash_profile"
+    assert res.created is True
+
+
+@pytest.mark.usefixtures("macos")
+def test_macos_a_bashrc_source_line_is_not_active(tmp_path: Path) -> None:
+    """On macOS a terminal's login bash does not read ~/.bashrc: a source line there is not an
+    active completion; the same line in the login file bash reads is.
+
+    MUTATION: read ~/.bashrc on macOS as on Linux -> the doctor says active -> RED."""
+    path = _install("bash", tmp_path)
+    (tmp_path / ".bashrc").write_text(f"source {path}\n")
+    _, ok, detail = comp.completion_check(tmp_path, "bash")
+    assert ok is False and "~/.bash_profile" in detail, detail
+    (tmp_path / ".profile").write_text(f"source {path}\n")
+    _, ok, detail = comp.completion_check(tmp_path, "bash")
+    assert ok is True, detail
+
+
+def test_linux_still_reads_a_bashrc_source_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(comp.sys, "platform", "linux")
+    monkeypatch.setattr(comp, "_bash_completion_present", lambda: False)
+    path = _install("bash", tmp_path)
+    (tmp_path / ".bashrc").write_text(f"source {path}\n")
+    _, ok, _detail = comp.completion_check(tmp_path, "bash")
+    assert ok is True
+
+
+# ── an rc that is not UTF-8 is read, never refused ───────────────────────────────────────────
+
+
+def _no_decode_error(fn, *args):  # type: ignore[no-untyped-def]
+    """Call ``fn``; a UnicodeDecodeError — the regression these tests guard — fails as an
+    assertion naming it."""
+    try:
+        return fn(*args)
+    except UnicodeDecodeError as exc:
+        raise AssertionError(f"a non-UTF-8 rc was refused: {exc}") from exc
+
+
+def test_activation_appends_to_a_latin1_rc(tmp_path: Path) -> None:
+    """MUTATION: read the rc as strict UTF-8 in activate_completion -> RED (assertion)."""
+    rc = tmp_path / ".zshrc"
+    mine = b"# caf\xe9\nalias l=ls\n"
+    rc.write_bytes(mine)
+    path = _install("zsh", tmp_path)
+    res = _no_decode_error(comp.activate_completion, "zsh", tmp_path, path)
+    assert res is not None and res.ok and res.added
+    assert rc.read_bytes().startswith(mine) and comp._MARK_START.encode() in rc.read_bytes()
+
+
+def test_the_zsh_check_reads_a_latin1_zshrc(tmp_path: Path) -> None:
+    """MUTATION: read ~/.zshrc as strict UTF-8 in the fpath check -> RED (assertion)."""
+    path = _install("zsh", tmp_path)
+    (tmp_path / ".zshrc").write_bytes(
+        b"# caf\xe9\n" + f"fpath=({path.parent} $fpath)\ncompinit\n".encode()
+    )
+    _, ok, detail = _no_decode_error(comp.completion_check, tmp_path, "zsh")
+    assert ok is True, detail
+
+
+def test_the_bash_check_reads_a_latin1_bashrc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MUTATION: read ~/.bashrc as strict UTF-8 in the source-line check -> RED (assertion)."""
+    monkeypatch.setattr(comp.sys, "platform", "linux")
+    monkeypatch.setattr(comp, "_bash_completion_present", lambda: False)
+    path = _install("bash", tmp_path)
+    (tmp_path / ".bashrc").write_bytes(b"# caf\xe9\n" + f"source {path}\n".encode())
+    _, ok, detail = _no_decode_error(comp.completion_check, tmp_path, "bash")
+    assert ok is True, detail

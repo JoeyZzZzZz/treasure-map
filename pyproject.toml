@@ -19,7 +19,7 @@ classifiers = [
 
 dependencies = [
     "pyelftools>=0.31",
-    "pydantic>=2.7",
+    "pydantic>=2.11",  # mcp (below) requires 2.11 itself; a lower bound here would never install
     "pyyaml>=6.0",
     "click>=8.2",  # CliRunner captures stderr apart from stdout from 8.2 on; the tests rely on it
     # The AI-facing MCP server is the substrate's primary consumer entry point, not an add-on:

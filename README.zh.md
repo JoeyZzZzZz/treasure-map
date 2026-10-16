@@ -221,8 +221,9 @@ tmap uninstall
 
 **你的数据会保留：** `~/.treasure-map/config.yaml`、`.env`、**atlas** 和各个工作区，重新安装后全部可以继续使用。
 `tmap uninstall --purge-data` 会把它们一并删除，需要你输入确认短语（不可恢复），但只删能证明属于 tmap 的：
-atlas、含 tmap `analysis.db` 的工作区目录（工作区根目录本身不删；根目录是你的家目录或更上层时一个都不删），
-以及 `tmap init` 写的 `config.yaml` / `.env`。你自己写的文件、工作区根目录里的其他东西都会保留并列出。
+atlas、含 tmap `analysis.db` 的工作区目录里扫描写下的文件，以及 `tmap init` 写的 `config.yaml` / `.env`。
+工作区根目录本身不删（它是 `~/.treasure-map` 里的默认目录且已经空了时除外）；根目录是你的家目录或更上层时一个都不删。
+其他东西——你自己写的文件，不论在工作区里还是旁边——都会保留并列出。
 
 <details>
 <summary>细节</summary>

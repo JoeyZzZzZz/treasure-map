@@ -175,9 +175,17 @@ def _bashrc_sources_completion(home: Path, path: Path) -> bool:
     The same conservative READ as the zsh check (never a shell spawn): true only when a source line
     (``source X`` or ``. X``) names our exact script path. Sourcing the script directly is a
     complete activation on its own — it registers the completion without the bash-completion
-    framework — so this is a second, independent way for bash to be genuinely active."""
+    framework — so this is a second, independent way for bash to be genuinely active.
+
+    On macOS only the login file bash reads (``rc_path``) counts: a terminal there starts a login
+    bash, which does not read ~/.bashrc unless that file sources it — a case this read does not
+    follow, so it errs toward printing the step."""
     needle = str(path)
-    for rc in (home / ".bashrc", home / ".bash_profile"):
+    if sys.platform == "darwin":
+        rcs: tuple[Path, ...] = (_macos_bash_login(home),)
+    else:
+        rcs = (home / ".bashrc", home / ".bash_profile")
+    for rc in rcs:
         try:
             text = rc.read_text(errors="replace")
         except OSError:
@@ -189,13 +197,27 @@ def _bashrc_sources_completion(home: Path, path: Path) -> bool:
     return False
 
 
+# A login bash reads the first of these that exists, and no other.
+_BASH_LOGIN_FILES = (".bash_profile", ".bash_login", ".profile")
+
+
+def _macos_bash_login(home: Path) -> Path:
+    """The file a macOS terminal's login bash reads: the first of ``_BASH_LOGIN_FILES`` that
+    exists — ~/.bash_profile when none does. Creating ~/.bash_profile beside an existing
+    ~/.profile or ~/.bash_login would stop bash from reading that file."""
+    for name in _BASH_LOGIN_FILES:
+        if (home / name).exists():
+            return home / name
+    return home / _BASH_LOGIN_FILES[0]
+
+
 def rc_path(shell: str, home: Path) -> Path | None:
     """The startup file whose one line makes an installed completion script actually load.
 
     This is the ONLY file init ever appends to, and only with the user's explicit yes."""
     if shell == "bash":
-        # macOS terminals start login shells, which read ~/.bash_profile and not ~/.bashrc
-        return home / (".bash_profile" if sys.platform == "darwin" else ".bashrc")
+        # macOS terminals start login shells, which do not read ~/.bashrc
+        return _macos_bash_login(home) if sys.platform == "darwin" else home / ".bashrc"
     if shell == "zsh":
         return home / ".zshrc"
     return None
@@ -266,6 +288,7 @@ class CompletionActivation:
     added: bool  # True = the block was appended this run
     already: bool  # True = the marked block was already present, so nothing was written
     error: str | None  # a filesystem failure, reported verbatim; None means it really worked
+    created: bool = False  # True = the rc did not exist: this run created it for the block
 
     @property
     def ok(self) -> bool:
@@ -293,7 +316,8 @@ def activate_completion(shell: str, home: Path, path: Path) -> CompletionActivat
     if rc is None or line is None:
         return None
     try:
-        existing = rc.read_text(errors="replace") if rc.exists() else ""
+        existed = rc.exists()
+        existing = rc.read_text(errors="replace") if existed else ""
     except OSError as exc:
         return CompletionActivation(shell, rc, added=False, already=False, error=str(exc))
     if _MARK_START in existing:
@@ -305,7 +329,9 @@ def activate_completion(shell: str, home: Path, path: Path) -> CompletionActivat
             fh.write(block)
     except OSError as exc:
         return CompletionActivation(shell, rc, added=False, already=False, error=str(exc))
-    return CompletionActivation(shell, rc, added=True, already=False, error=None)
+    return CompletionActivation(
+        shell, rc, added=True, already=False, error=None, created=not existed
+    )
 
 
 def completion_check(home: Path, shell: str | None = None) -> tuple[str, bool, str]:

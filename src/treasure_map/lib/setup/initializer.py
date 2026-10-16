@@ -21,26 +21,25 @@ from typing import Any, Literal
 
 import yaml
 
-from treasure_map.lib.config.config import Config, _source_env_file
+from treasure_map.lib.config.config import Config, _source_env_file, resolve_relative_paths
 from treasure_map.lib.errors import TreasureMapError
 from treasure_map.lib.setup.tmap_files import ENV_TEXT, config_text
 
 logger = logging.getLogger(__name__)
 
-# Default config matching config.example.yaml; stores env var names, never values.
+# Default config matching config.example.yaml; stores env var names, never values. Only keys tmap
+# reads are written (an older init's ghidra.mode and log_level still load; nothing reads them).
 # max_parallel_jvms is deliberately ABSENT here: _configure_parallelism probes the machine at init
 # and writes the derived value (a hardcoded default would mask a wrong-sized pool). If it were ever
 # missing from config.yaml, config.py's GhidraConfig default (4) is the safety fallback.
 _DEFAULT_CONFIG_YAML: dict[str, Any] = {
     "ghidra": {
-        "mode": "local",
         "headless_timeout_seconds": 300,
         "local": {"home": None},
     },
     "toolchain": {"java_home": None, "bindiff": None},
     "workspace_dir": "~/.treasure-map/workspaces",
     "atlas": {"db_path": "~/.treasure-map/atlas.db"},
-    "log_level": "INFO",
 }
 
 
@@ -210,7 +209,7 @@ def _configure_completion(
     non_interactive: bool,
     prompt: Callable[[str], str],
     echo: Callable[[str], None],
-) -> tuple[Path | None, Path | None]:
+) -> tuple[Path | None, Path | None, bool]:
     """Install shell tab-completion (a standard init step; bash + zsh). Best-effort + honest.
 
     The script goes to the shell's own autoload directory. When that alone will not make the shell
@@ -222,8 +221,9 @@ def _configure_completion(
     (installed / active / the one line to add). No ``--no-completion`` flag: a completion script has
     no side effects, so a skip toggle would only push a non-decision onto the user.
 
-    Returns (the installed script, the rc now carrying the activation block) — what the install
-    ledger records so ``tmap uninstall`` removes exactly these and nothing else.
+    Returns (the installed script, the rc now carrying the activation block, whether this run
+    created that rc) — what the install ledger records so ``tmap uninstall`` removes exactly these
+    and nothing else (a file tmap created, and that holds nothing else, goes too).
     """
     from treasure_map.lib.setup.completion import (
         detect_shell,
@@ -234,24 +234,25 @@ def _configure_completion(
     shell = detect_shell()
     if shell is None:
         echo("  Completion: shell is not bash/zsh — skipped (nothing to install).")
-        return None, None
+        return None, None, False
     why = unsupported_reason(shell)
     if why is not None:
         echo(f"  Completion: {why} — skipped.")
-        return None, None
+        return None, None, False
     try:
         outcome = install_completion(shell, Path.home())
     except OSError as exc:
         echo(f"  Completion: could not install for {shell}: {exc}")
-        return None, None
+        return None, None, False
     if outcome is None:
         echo(f"  Completion: no installer for {shell} — skipped.")
-        return None, None
+        return None, None, False
     state = "installed" if outcome.wrote else "already up to date"
     echo(f"  Completion: {state} for {shell} at {outcome.path}")
     rc: Path | None = None
+    created = False
     if not outcome.active and outcome.activation_hint:
-        rc = _offer_activation(
+        rc, created = _offer_activation(
             shell,
             outcome.path,
             outcome.activation_hint,
@@ -259,7 +260,7 @@ def _configure_completion(
             prompt=prompt,
             echo=echo,
         )
-    return outcome.path, rc
+    return outcome.path, rc, created
 
 
 def _offer_activation(
@@ -270,20 +271,21 @@ def _offer_activation(
     non_interactive: bool,
     prompt: Callable[[str], str],
     echo: Callable[[str], None],
-) -> Path | None:
+) -> tuple[Path | None, bool]:
     """Ask whether to add the activation line to the rc, and add it only on a yes.
 
     Non-interactive runs never ask and never write — an unattended init changing a shell rc is
     precisely the no-consent edit the rule forbids, and there is nobody there to agree. Ambiguous
     input is treated as no: only Enter / y / yes writes, so an unrecognised answer errs toward
-    leaving the user's file alone. Returns the rc when it now carries tmap's block.
+    leaving the user's file alone. Returns (the rc when it now carries tmap's block, whether this
+    run created that file).
     """
     from treasure_map.lib.setup.completion import activate_completion, rc_path
 
     rc = rc_path(shell, Path.home())
     if non_interactive or rc is None:
         echo(f"              to activate, {hint}")
-        return None
+        return None, False
     answer = (
         prompt(
             f"Add tmap's completion line to ~/{rc.name} now? "
@@ -294,21 +296,21 @@ def _offer_activation(
     )
     if answer not in ("", "y", "yes"):
         echo(f"              to activate, {hint}")
-        return None
+        return None, False
     result = activate_completion(shell, Path.home(), script_path)
     if result is None or not result.ok:
         detail = f": {result.error}" if result is not None and result.error else ""
         echo(f"              could not write ~/{rc.name}{detail}")
         echo(f"              to activate, {hint}")
-        return None
+        return None, False
     if result.already:
         echo(f"              ~/{rc.name} already has the tmap block — nothing to add.")
-        return rc
+        return rc, False
     echo(
         f"              added to ~/{rc.name} — restart your shell or run "
         f"`source ~/{rc.name}` to activate now."
     )
-    return rc
+    return rc, result.created
 
 
 # ── reading and writing config keys ──────────────────────────────────────────────────────────
@@ -358,14 +360,15 @@ def _backup_config(config_path: Path) -> Path:
 
 
 def _read_config(config_path: Path) -> tuple[Config | None, dict[str, Any], str | None]:
-    """(validated config, raw mapping, why it is unreadable). Absent = (None, {}, None)."""
+    """(validated config, raw mapping, why it is unreadable). Absent = (None, {}, None). The
+    validated config reads a relative path from the file's directory, as every tmap command does."""
     if not config_path.exists():
         return None, {}, None
     try:
         raw = yaml.safe_load(config_path.read_text()) or {}
         if not isinstance(raw, dict):
             raise ValueError(f"top level is a {type(raw).__name__}, not a mapping")
-        return Config.model_validate(raw), raw, None
+        return Config.model_validate(resolve_relative_paths(raw, config_path)), raw, None
     except Exception as exc:
         reason = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
         return None, {}, reason
@@ -403,6 +406,13 @@ def _set_keys(config_path: Path, values: dict[tuple[str, ...], str]) -> None:
     config_path.write_text(config_text(config_path, data))
 
 
+def _absolute(entered: str) -> str:
+    """A path typed at a prompt or given on the command line, as config.yaml must hold it: a
+    relative one meant the current directory, and config.yaml reads a relative path from its own
+    directory — so it is made absolute here. A ``~`` path stays as typed."""
+    return entered if os.path.isabs(os.path.expanduser(entered)) else os.path.abspath(entered)
+
+
 def _ask_workspace_dir(
     config_path: Path,
     *,
@@ -420,7 +430,7 @@ def _ask_workspace_dir(
     if not entered:
         echo(f"  Workspace base: {current} (kept)")
         return None
-    return entered
+    return _absolute(entered)
 
 
 # ── the run ──────────────────────────────────────────────────────────────────────────────────
@@ -480,7 +490,7 @@ def _ask_or_download(
         ).strip()
         if not entered:
             return _Choice(download=True)
-        path = Path(os.path.expanduser(entered))
+        path = Path(os.path.expanduser(_absolute(entered)))
         why = validate(path)
         if why is None:
             return _Choice(path=path)
@@ -691,6 +701,9 @@ def run_init(
     )
     tmap_path = cl.tmap_executable() if tmap == "detect" else tmap
     mode: Mode = "yes" if assume_yes else ("non-interactive" if non_interactive else "interactive")
+    ghidra, java_home, bindiff = (
+        None if p is None else Path(_absolute(str(p))) for p in (ghidra, java_home, bindiff)
+    )
 
     tm_home = Path.home() / ".treasure-map"
     config_path = tm_home / "config.yaml"
@@ -1127,17 +1140,26 @@ def run_init(
             if not out.ok and out.manual:
                 needs_you.append(f"{out.message}; run: {out.manual}")
 
-    script, rc = _configure_completion(
+    script, rc, rc_created = _configure_completion(
         non_interactive=(mode != "interactive"), prompt=prompt, echo=echo
     )
     if script is not None:
         # Keep an rc already recorded: a later run that does not ask (or is declined) must not
-        # forget the block an earlier yes added. Unchanged -> the ledger is not rewritten.
+        # forget the block an earlier yes added — nor that tmap created that rc, which a run
+        # finding the block already there cannot tell. Unchanged -> the ledger is not rewritten.
         prior = ledger.committed("completion")
         prior_rc = prior.extra.get("rc_block") if prior is not None else None
+        prior_created = prior is not None and prior.extra.get("rc_created") is True
         rc_block = str(rc) if rc else prior_rc
-        if prior is None or prior.path != str(script) or prior_rc != rc_block:
-            ledger.add_pending("completion", "file", script, rc_block=rc_block)
+        created = rc_created or (prior_created and rc_block == prior_rc)
+        if (
+            prior is None
+            or prior.path != str(script)
+            or prior_rc != rc_block
+            or prior_created != created
+        ):
+            extra: dict[str, Any] = {"rc_created": True} if created else {}
+            ledger.add_pending("completion", "file", script, rc_block=rc_block, **extra)
             ledger.commit("completion")
 
     if cfg is not None:

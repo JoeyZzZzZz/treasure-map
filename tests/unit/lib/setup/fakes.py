@@ -142,10 +142,11 @@ class BytesFetcher:
         self.payloads = dict(payloads)
         self.calls: list[str] = []
 
-    def fetch(self, url: str, dest: Path, *, progress: object = None) -> None:
+    def fetch(self, url: str, dest: Path, *, progress: object = None) -> bool:
         name = url.rsplit("/", 1)[-1]
         self.calls.append(url)
         dest.write_bytes(self.payloads[name])
+        return True  # the whole payload, as a server that declared its length sends it
 
 
 class RefusingFetcher:
@@ -154,7 +155,7 @@ class RefusingFetcher:
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    def fetch(self, url: str, dest: Path, *, progress: object = None) -> None:
+    def fetch(self, url: str, dest: Path, *, progress: object = None) -> bool:
         from treasure_map.lib.setup.fetch import FetchError
 
         self.calls.append(url)
