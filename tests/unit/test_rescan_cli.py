@@ -301,7 +301,7 @@ def test_rescan_invokes_scan_per_runnable_run(
     by nothing. The stub mirrors the real parameter names ON PURPOSE and takes no ``**kwargs``:
     that is what makes a signature change show up here as a failure instead of being swallowed.
 
-    ``workspace`` is the load-bearing one (INV-1/INV-2): each run is re-scanned into the workspace
+    ``workspace`` is the load-bearing one: each run is re-scanned into the workspace
     it is RECORDED in, so the two runs get two DIFFERENT names. Passing None (what this command used
     to do) makes ``scan`` derive an auto name from the firmware root — and both runs here share one
     firmware root, so the old behaviour collapses them onto one name, which is what the set-level
@@ -798,7 +798,7 @@ def _unusable(kind: str, ws_dir: Path) -> tuple[str, str]:
 def test_a_hunt_tier_run_with_no_stored_facts_is_announced_before_it_decompiles(
     kind: str, says: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """★ M-A3. The tier said "no decompile on cache hit"; with no extraction on disk, there is no
+    """★ The tier said "no decompile on cache hit"; with no extraction on disk, there is no
     cache to hit and ``scan`` will decompile the whole firmware.
 
     Rebuilding is the right repair — an empty or missing database SHOULD be rebuilt, and into the
@@ -912,7 +912,7 @@ def test_a_run_that_recorded_no_database_is_announced_too(
 def test_a_file_that_is_not_a_database_fails_one_run_and_is_left_untouched(
     kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """★ M-A5. The fifth state, and the only one that must NOT be rebuilt over.
+    """★ The fifth state, and the only one that must NOT be rebuilt over.
 
     Bytes that are not a database may still be the only copy of an extraction that took hours —
     a half-written file, a wrong path, a damaged disk. ``scan`` would replace them. So this run is

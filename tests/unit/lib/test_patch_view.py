@@ -602,7 +602,7 @@ def test_a_changed_size_kind_is_a_weak_hint_not_a_delta(tmp_path: Path, current:
 def test_a_listed_entry_keeps_its_place_and_only_gains_pseudocode_sameness(
     tmp_path: Path, current: None
 ) -> None:
-    """★ B1 iron law: pseudocode_sameness is a fact added to a listed entry, never a reason to drop
+    """★ iron law: pseudocode_sameness is a fact added to a listed entry, never a reason to drop
     one. A changed pair whose candidate lines up stays listed and reads sameness='differs' when its
     pseudocode matches but its callees differ.
 
@@ -902,7 +902,7 @@ def test_the_lens_and_the_counts_read_each_fact_through_their_wiring(
 
 
 def test_a_qualified_match_outside_c_is_never_sunk(tmp_path: Path, current: None) -> None:
-    """I10. Three entries B by an unmatched call, texts and callees the same: the control (equal
+    """Three entries B by an unmatched call, texts and callees the same: the control (equal
     byte counts, no marker) sinks on its identical pseudocode; one whose byte counts differ and one
     the decompiler marked incomplete read identical_text_unverified and stay at attention 1.
 
@@ -1952,7 +1952,7 @@ def _proposed(v: dict[str, Any], state: str) -> dict[str, Any]:
 def test_an_undetermined_pair_carries_a_proposed_reading_never_a_sameness(
     tmp_path: Path, current: None
 ) -> None:
-    """T1. The proposed reading sits beside the R entry; its pseudocode_sameness key is never
+    """The proposed reading sits beside the R entry; its pseudocode_sameness key is never
     there, and it moves the entry nowhere.
 
     MUTATION: drop the aligned gate in ``_aligned_read`` -> every R entry gains a
@@ -1970,7 +1970,7 @@ def test_an_undetermined_pair_carries_a_proposed_reading_never_a_sameness(
 def test_the_proposed_readings_never_enter_the_aligned_counts(
     tmp_path: Path, current: None
 ) -> None:
-    """T2 / T3. Seven undetermined pairs, one per state: counted in
+    """Seven undetermined pairs, one per state: counted in
     alignment_undetermined_reading, whose states sum to alignment_undetermined, and never in the
     aligned counts.
 
@@ -1986,7 +1986,7 @@ def test_the_proposed_readings_never_enter_the_aligned_counts(
 
 
 def test_a_body_found_twice_on_a_side_is_not_unique(tmp_path: Path, current: None) -> None:
-    """T4 / T7. The same body twice on B: identical_not_unique, and B's other copy is named —
+    """The same body twice on B: identical_not_unique, and B's other copy is named —
     never the pair's own B function.
 
     MUTATION: skip the uniqueness check -> identical_unique -> RED; keep addr_b in
@@ -2003,9 +2003,10 @@ def test_a_body_found_twice_on_a_side_is_not_unique(tmp_path: Path, current: Non
 
 
 def test_a_proposed_reading_states_its_facts(tmp_path: Path, current: None) -> None:
-    """T6 / T15c and the shape. Unverified callees stop at identical_callee_unverified; byte counts
-    that differ stop a unique text match at identical_text_unverified with hidden_region; a text
-    that differs carries its delta; a missing body has no occurrence counts.
+    """The proposed reading's states and shape. Unverified callees stop at
+    identical_callee_unverified; byte counts that differ stop a unique text match at
+    identical_text_unverified with hidden_region; a text that differs carries its delta; a
+    missing body has no occurrence counts.
 
     MUTATION: read undetermined callees as equal -> identical_unique -> RED; let the R fold ignore
     body_size_differs -> identical_unique -> RED."""
@@ -2028,7 +2029,7 @@ def test_a_proposed_reading_states_its_facts(tmp_path: Path, current: None) -> N
 
 
 def test_a_changed_callee_set_wins_over_an_equal_text(tmp_path: Path, current: None) -> None:
-    """T5. The same text over callee sets that differ is differs — a callee change outranks every
+    """The same text over callee sets that differ is differs — a callee change outranks every
     text reading.
 
     MUTATION: read the text before the callee set in the R fold -> identical_unique -> RED."""
@@ -2046,7 +2047,7 @@ def test_a_changed_callee_set_wins_over_an_equal_text(tmp_path: Path, current: N
 def test_an_r_entry_over_an_aligned_pair_is_never_sunk_on_an_identical_body(
     tmp_path: Path, current: None
 ) -> None:
-    """T8. Reachable: an ALIGNED pair whose candidate row lands in R (its export did not hold the
+    """Reachable: an ALIGNED pair whose candidate row lands in R (its export did not hold the
     function as it is), with an identical body — the R guard holds it at attention 1.
 
     MUTATION: delete the R guard in ``significance`` -> attention 2 -> RED."""
@@ -2065,7 +2066,7 @@ def test_an_r_entry_over_an_aligned_pair_is_never_sunk_on_an_identical_body(
 def test_a_settled_r_entry_closes_attention_one_ahead_of_every_sunk_entry(
     tmp_path: Path, current: None
 ) -> None:
-    """T9. Under the significance lens an R entry read identical_unique comes after the other
+    """Under the significance lens an R entry read identical_unique comes after the other
     attention-1 entries (whatever its similarity) and before every attention-2 entry.
 
     MUTATION: drop ``settled`` from the key -> the R entry (lower similarity) comes first -> RED;
@@ -2098,7 +2099,7 @@ def test_a_settled_r_entry_closes_attention_one_ahead_of_every_sunk_entry(
 def test_the_judgement_facts_of_an_r_entry_do_not_carry_its_reading(
     tmp_path: Path, current: None
 ) -> None:
-    """T10. What a judgement rests on (diff_review.entry_facts) is unchanged by the proposed
+    """What a judgement rests on (diff_review.entry_facts) is unchanged by the proposed
     reading: a judgement is never invalidated by a reading the view merely shows.
 
     MUTATION: add the proposed callee set to entry_facts -> RED."""
@@ -2118,7 +2119,7 @@ def test_the_judgement_facts_of_an_r_entry_do_not_carry_its_reading(
 
 
 def test_an_r_pairs_callee_comparison_adds_no_fact(tmp_path: Path, current: None) -> None:
-    """T11. An aligned pair's callee comparison adds callee_set_unchanged / one_hop_sink as it
+    """An aligned pair's callee comparison adds callee_set_unchanged / one_hop_sink as it
     always did; an undetermined pair's (for its proposed reading) adds neither.
 
     MUTATION: compute the R comparison with the side-effecting ``_callee_set`` -> the R entries
@@ -2177,7 +2178,7 @@ def _qualified_world(tmp_path: Path) -> World:
 def test_a_qualified_match_carries_its_reasons_and_hidden_region(
     tmp_path: Path, current: None
 ) -> None:
-    """T15 / T27, wired end to end: byte counts that differ under equal texts read
+    """Wired end to end: byte counts that differ under equal texts read
     identical_text_unverified with hidden_region.body structure_differs, the BinDiff instruction
     count as its stored scalar; a marker alone reads unknown.
 
@@ -2220,7 +2221,7 @@ def test_a_zero_byte_count_is_not_recorded_and_qualifies_nothing(
 
 
 def test_a_qualified_match_is_unverified_never_unchanged(tmp_path: Path, current: None) -> None:
-    """T18. identical_text_unverified counts in unverified (its total included), never in
+    """identical_text_unverified counts in unverified (its total included), never in
     unchanged; its split by body class is a key of its own and every unverified value stays an
     int.
 
@@ -2240,7 +2241,7 @@ def test_a_qualified_match_is_unverified_never_unchanged(tmp_path: Path, current
 
 
 def test_the_body_filter_keeps_one_class_of_qualified_match(tmp_path: Path, current: None) -> None:
-    """T19. ``body`` keeps only the identical_text_unverified entries of its class — listed, and
+    """``body`` keeps only the identical_text_unverified entries of its class — listed, and
     the not-listed ones of that category with their body named; a bad value is an error, and so is
     ``body`` beside any other not_listed_page (never a silent empty page). The MCP tool passes it
     through.
@@ -2280,7 +2281,7 @@ def test_the_body_filter_keeps_one_class_of_qualified_match(tmp_path: Path, curr
 def test_the_lens_counts_the_sunk_entries_whose_byte_counts_differ(
     tmp_path: Path, current: None
 ) -> None:
-    """T19b. A bucket C entry whose text match is qualified by differing byte counts is still
+    """A bucket C entry whose text match is qualified by differing byte counts is still
     sunk; the lens counts it and names the filter that lists it. A held-up one stops at attention
     1 and is not counted. Without the lens there is no count.
 
@@ -2307,7 +2308,7 @@ def test_the_lens_counts_the_sunk_entries_whose_byte_counts_differ(
 def test_the_build_reads_no_body_and_function_states_computes_no_delta(
     tmp_path: Path, current: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """T24. build_diff_view reads neither pseudocode nor image extents; function_states reads them
+    """build_diff_view reads neither pseudocode nor image extents; function_states reads them
     but computes no delta; only the page read does.
 
     MUTATION: compute the page's deltas in function_states -> RED."""
@@ -2331,7 +2332,7 @@ def test_the_build_reads_no_body_and_function_states_computes_no_delta(
 
 
 def test_a_re_extraction_is_never_served_an_earlier_reading(tmp_path: Path, current: None) -> None:
-    """T25. Same diff, same content hashes, a new build hash on both runs: the proposed reading,
+    """Same diff, same content hashes, a new build hash on both runs: the proposed reading,
     the image extents and the delta are all read again.
 
     MUTATION: drop the build hashes from the reading cache key -> the earlier readings are served

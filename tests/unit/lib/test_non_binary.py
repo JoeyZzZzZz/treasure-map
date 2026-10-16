@@ -1107,7 +1107,7 @@ def test_orchestrator_isolates_ingester_exceptions(
     conn.close()
 
 
-# ── M1: editable web form field extraction (SaTC front-end surface) ───────────
+# ── editable web form field extraction (SaTC front-end surface) ───────────────
 # The critical filter: a <input type=hidden> populated from nvram_get is a read-only round-trip
 # DISPLAY (e.g. a firmware-version echo) and must NOT be collected as editable — else it would
 # cross to web_settable=yes and wrongly promote. A typical page carries fwrev exactly this way.

@@ -189,7 +189,8 @@ def test_alignment_row_has_no_change_verdict_field() -> None:
 #
 # The domain-swap bug (baseline := BinDiff set instead of tmap's inventory) and the operand-swap bug
 # (unmatched := matched - baseline) are DIFFERENT bugs whose symptoms land in DIFFERENT buckets, so
-# they need different guards. Categories injected (NOT ①, which layer-0 has no input channel for):
+# they need different guards. Categories injected (NOT ① out-of-domain ∧ unmatched, which layer-0
+# has no input channel for):
 #   ② out-of-domain ∧ matched -> out_of_inventory ; ③ in-domain ∧ unmatched -> a presence row ;
 # ④ in-domain ∧ matched -> matched_in_domain. ★ Fixture rule |②| != |③| (1 vs 2) so a count-level
 # coincidence can never mask a set-level error; ★ ③ non-empty and covering BOTH presence_states.
@@ -340,7 +341,7 @@ def test_reverse_d3_mapping_broken_reds_g5(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_skipped_micro_is_analysis_complete_not_a_gap(tmp_path: Path) -> None:
-    # ★★ the reverse-pollution guard (this ticket's core): an empty-pseudocode function that is
+    # ★★ the reverse-pollution guard: an empty-pseudocode function that is
     # UNDER the min size is DESIGN-SKIPPED (a thunk/stub the exporter never decompiles), so it is
     # known-benign and MUST read unmatched_analysis_complete — NOT _incomplete (which would invent
     # an analysis blind spot that does not exist). This test FAILS under the pre-fix behavior
@@ -467,7 +468,7 @@ def test_orchestrator_writes_all_three_tables_and_is_idempotent(tmp_path: Path) 
 def test_diff_meta_functions_empty_is_failures_only_micro_skipped_separate(tmp_path: Path) -> None:
     # ★ diff_meta.functions_empty counts ONLY real failures (== run.functions_empty); design-skipped
     # micro-functions go in a SEPARATE micro_skipped column, never merged (same-name-diff-meaning
-    # is exactly the confusion this ticket removes).
+    # is exactly the confusion the separate column removes).
     dba = _mk_analysis(
         tmp_path / "a.db",
         "lib.so",
@@ -658,14 +659,14 @@ def test_bindiff_matching_hashes_proceed(tmp_path: Path) -> None:
     con.close()
 
 
-# ── iron law 6: version_skew must carry a REAL tool+Ghidra version difference (not a constant) ──
+# ── iron law: version_skew must carry a REAL tool+Ghidra version difference (not a constant) ──
 #
-# The consumer side (layer2) is already correct; these anchor
-# the PRODUCER.  (tool_version drives skew, forward+reverse) are covered by
+# The consumer side (layer2) is already correct; these anchor the PRODUCER. The tool_version
+# cases (tool_version drives skew, forward+reverse) are covered by
 # test_version_skew_uses_tool_version_not_firmware_hash above and, on the consumer side, by
 # test_diff_layer2.test_version_skew_degrades_every_edge_subject / _zero_restores. The tests here
-# cover the Ghidra criterion , the both-unknown conservative direction , anchor
-# independence (reverse), and the end-to-end visibility sanity .
+# cover the Ghidra criterion, the both-unknown conservative direction, anchor
+# independence (reverse), and the end-to-end visibility sanity.
 
 
 def _parse_two_runs(tmp_path: Path, **seed_kw: str):  # type: ignore[no-untyped-def]
@@ -684,10 +685,10 @@ def _parse_two_runs(tmp_path: Path, **seed_kw: str):  # type: ignore[no-untyped-
 
 
 def test_confirmed_same_version_contract() -> None:
-    # ★ tight anchor +  unconfirmable: 'confirmed same' is True ONLY for two equal REAL
+    # ★ tight anchor + unconfirmable: 'confirmed same' is True ONLY for two equal REAL
     # versions. A missing value (None) OR the explicit UNKNOWN_VERSION on EITHER side is
     # unconfirmable -> False (cannot-confirm-same != confirmed-same, the conservative direction).
-    # ★ both-unknown is the case CC's review added: two failed detections most need skew, so it MUST
+    # ★ both-unknown: two failed detections most need skew, so it MUST
     # be False. Deleting layer0's `if a == UNKNOWN_VERSION or b == UNKNOWN_VERSION: return False`
     # line flips this one case to True -> this assertion goes red (its teeth). Anchors on the
     # UNKNOWN_VERSION constant (single source), never the literal "unknown".
@@ -701,7 +702,7 @@ def test_confirmed_same_version_contract() -> None:
 
 
 def test_version_skew_ghidra_criterion_is_live(tmp_path: Path) -> None:
-    # ★ /  (regret guard): tool_version EQUAL, Ghidra versions differ -> skew=1. This is
+    # ★ (regret guard): tool_version EQUAL, Ghidra versions differ -> skew=1. This is
     # the criterion the constant-None used to short-circuit; it proves the Ghidra leg is live and
     # cannot silently degrade to comparing only tool_version.
     r = _parse_two_runs(tmp_path, ghidra_a="11.0", ghidra_b="11.1")
@@ -720,7 +721,7 @@ def test_version_skew_ghidra_criterion_is_load_bearing(tmp_path: Path, monkeypat
 
 def test_version_skew_both_unknown_is_conservative(tmp_path: Path) -> None:
     # ★ end-to-end: both sides recorded UNKNOWN_VERSION (two failed detections), tool_version
-    # equal -> cannot confirm the same decompiler -> skew=1. The trap CC's audit named: a truthy
+    # equal -> cannot confirm the same decompiler -> skew=1. The trap: a truthy
     # "unknown" == "unknown" must NOT read as confirmed-same. Deleting layer0's UNKNOWN_VERSION
     # guard line reddens this (both-unknown would fall through to a == b -> skew=0).
     r = _parse_two_runs(tmp_path, ghidra_a=UNKNOWN_VERSION, ghidra_b=UNKNOWN_VERSION)
@@ -748,11 +749,11 @@ def test_diff_meta_records_ghidra_version_not_null(tmp_path: Path) -> None:
     assert r.meta.ghidra_version_b == "11.4.3"
 
 
-# ── Bug A: diff_meta records the diff's target binary short name ──
+# ── diff_meta records the diff's target binary short name ──
 
 
 def test_diff_meta_binary_normalized_to_short_name(tmp_path: Path) -> None:
-    # ★ Bug A: run_layer0_parse given a SHA256-form binary must STORE the short NAME in
+    # ★ run_layer0_parse given a SHA256-form binary must STORE the short NAME in
     # diff_meta.binary_a/b -- layer-2 filters on string_keyed_edge.binary (short name), so a stored
     # sha would zero-match and silently drop every edge (over-filter). _seed_two_runs
     # gives lib.so the sha 'sha_a'/'sha_b'; passing those (the sha form) must still record 'lib.so'.
@@ -770,7 +771,7 @@ def test_diff_meta_binary_normalized_to_short_name(tmp_path: Path) -> None:
     con.close()
 
 
-# ── Route A: diff_id includes the binary, so a second binary's diff never overwrites the first ──
+# ── diff_id includes the binary, so a second binary's diff never overwrites the first ──
 
 
 def _mk_analysis_multi(path: Path, bins: list) -> Path:  # type: ignore[type-arg]
@@ -913,7 +914,7 @@ def test_two_binaries_diff_overwrite_when_binary_dropped_from_id(
 
 
 def test_read_side_scopes_to_one_binary_despite_shared_addr(tmp_path: Path) -> None:
-    # ★ Route A's core claim: read points need ZERO changes because a unique diff_id already scopes
+    # ★ core claim: read points need ZERO changes because a unique diff_id already scopes
     # each WHERE diff_id=? to one binary. Both binaries align addr 0x1000; reading liba's diff_id
     # must return liba's pairing, never libb's, even though the addr collides.
     atlas_path, bd_a, bd_b = _seed_two_binaries(tmp_path)

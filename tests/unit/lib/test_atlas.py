@@ -1,6 +1,6 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for lib/atlas — cross-firmware pattern store (M2 Step 1)."""
+"""Unit tests for lib/atlas — cross-firmware pattern store."""
 
 from __future__ import annotations
 
@@ -553,8 +553,8 @@ def test_open_atlas_migrates_old_schema_in_place(tmp_path: Path) -> None:
         inst_cols = _cols(conn, "instance")
         pat_cols = _cols(conn, "pattern")
         assert "origin" in inst_cols  # added
-        assert "binary_path" in inst_cols  # added this round (locatability)
-        assert "binary_content_hash" in inst_cols  # added this round (store-only)
+        assert "binary_path" in inst_cols  # added (locatability)
+        assert "binary_content_hash" in inst_cols  # added (store-only)
         assert "device_spread" in pat_cols  # renamed
         assert "recurrence_breadth" not in pat_cols  # old name gone
         assert "device_category" not in pat_cols  # legacy column hard-dropped

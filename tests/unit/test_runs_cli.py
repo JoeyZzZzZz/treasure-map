@@ -1,6 +1,6 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""CLI ergonomics for runs (M8): `tmap runs` lists the atlas's scans + lineage, `tmap triage` prints
+"""CLI ergonomics for runs: `tmap runs` lists the atlas's scans + lineage, `tmap triage` prints
 the current run's lineage at the top (the stale-scan guard), and `--run` tab-completes run ids."""
 
 from __future__ import annotations
@@ -101,7 +101,7 @@ def test_triage_without_a_run_is_refused_and_names_the_runs(tmp_path: Path) -> N
 
 
 def test_run_id_completion_matches_prefix(tmp_path: Path) -> None:
-    # ★ M8b: tab-completion returns the atlas's run ids that start with the incomplete token; no
+    # ★ Tab-completion returns the atlas's run ids that start with the incomplete token; no
     # ambiguous short-prefix auto-match (the user SEES and picks).
     atlas = _atlas_with_runs(tmp_path)
 

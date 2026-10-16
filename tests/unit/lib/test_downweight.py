@@ -64,7 +64,7 @@ def test_system_is_never_no_shell_exec() -> None:
 
 
 def test_mixed_system_and_execl_is_not_no_shell_exec() -> None:
-    # Bug1 reverse: the function's cmd capability is NOT all exec-no-shell (it also calls system),
+    # Reverse: the function's cmd capability is NOT all exec-no-shell (it also calls system),
     # so it is shell-capable and must not be downweighted no_shell — even though an exec is present.
     pc = (
         "void h(char* p){ char c[64]; snprintf(c,64,"
@@ -198,7 +198,7 @@ def test_caller_all_constant_args_is_caller_constant() -> None:
 
 
 def test_caller_constant_plus_tainted_arg_is_not_caller_constant() -> None:
-    # Bug2 reverse: f("prefix", tainted) — one constant arg, one controllable arg. A constant in
+    # Reverse: f("prefix", tainted) — one constant arg, one controllable arg. A constant in
     # SOME slot is not enough; a controllable value can reach the dangerous parameter -> no drop.
     pc = "void run(char* param_1, char* param_2){ system(param_2); }"
     caller = 'void h(char* q){ run("prefix", q); }'
@@ -215,7 +215,7 @@ def test_caller_constant_plus_tainted_arg_is_not_caller_constant() -> None:
     )
 
 
-# ── .rodata constant sink argument (#12: gate vs content) ─────────────────────────────
+# ── .rodata constant sink argument (gate vs content) ──────────────────────────────────
 
 
 def test_constant_sink_argument_is_const_sink_arg() -> None:
@@ -228,7 +228,7 @@ def test_constant_sink_argument_is_const_sink_arg() -> None:
 
 
 def test_external_input_gating_a_branch_still_const_sink_arg() -> None:
-    # #12: external input EXISTS (getenv) and gates a branch, but it never flows INTO the sink's
+    # External input EXISTS (getenv) and gates a branch, but it never flows INTO the sink's
     # argument (a constant). Gate != content — the constant command is still downweighted.
     pc = 'void f(void){ char* m = getenv("MODE"); if (m != 0) { system("/sbin/reboot"); } }'
     assert (
@@ -263,7 +263,7 @@ def test_free_string_alongside_a_constant_call_is_not_downweighted() -> None:
 
 
 def test_external_input_flowing_into_sink_arg_is_not_downweighted() -> None:
-    # #12 reverse: the external value actually flows INTO the sink argument (content, not gate) —
+    # Reverse: the external value actually flows INTO the sink argument (content, not gate) —
     # not a constant, not constrained -> must NOT be downweighted (source_class stays lit).
     pc = 'void f(void){ char* m = getenv("X"); char c[64]; snprintf(c,64,"echo %s",m); system(c); }'
     assert (
@@ -277,13 +277,13 @@ def test_external_input_flowing_into_sink_arg_is_not_downweighted() -> None:
     )
 
 
-# ── safe-charset-constrained source (②: ether_ntoa / inet_ntop / base64) ───────────────
+# ── safe-charset-constrained source (ether_ntoa / inet_ntop / base64) ──────────────────
 
 
 def test_ether_ntoa_via_intermediate_variable_is_not_downweighted() -> None:
     # Charset is INLINE-ONLY: once the converter result is bound to an intermediate variable (s)
     # before the command builder, the value is no longer value-tracked here -> NOT downweighted
-    # (the evidence layer marks it charset_maybe instead). Retracted from the prep behaviour.
+    # (the evidence layer marks it charset_maybe instead). Retracted from an earlier behaviour.
     pc = (
         "void f(struct ether_addr* mac){ char* s = ether_ntoa(mac); char c[64]; "
         'snprintf(c,64,"arp -s %s",s); system(c); }'
@@ -300,7 +300,7 @@ def test_ether_ntoa_via_intermediate_variable_is_not_downweighted() -> None:
 
 
 def test_charset_safe_plus_free_source_into_same_sink_is_not_downweighted() -> None:
-    # ② reverse: the SAME sink argument is built from BOTH a charset-safe value (ether_ntoa) AND a
+    # Reverse: the SAME sink argument is built from BOTH a charset-safe value (ether_ntoa) AND a
     # free string source (nvram_get). One safe contributor does not make the argument safe -> the
     # free path bypassing the converter must suppress the downweight.
     pc = (
@@ -318,7 +318,7 @@ def test_charset_safe_plus_free_source_into_same_sink_is_not_downweighted() -> N
     )
 
 
-# ── inline charset-safe converter on the cmd path (②: same口径 as the assigned form) ───
+# ── inline charset-safe converter on the cmd path (same recognition as the assigned form) ──
 #
 # The assigned form (lhs = conv(...)) above already downweights a system() candidate. These
 # cover the realistic command-building shape where the converter RESULT is passed inline into
@@ -360,7 +360,7 @@ def test_inline_inet_ntop_into_system_is_charset_constrained() -> None:
 
 
 def test_inline_charset_on_copy_path_is_unchanged() -> None:
-    # Same口径 on the copy path (no regression / same recognition): a strcpy destination built
+    # The same rule on the copy path (no regression / same recognition): a strcpy destination built
     # inline from a charset-safe converter is charset_constrained just like the cmd path.
     pc = "void f(struct ether_addr* mac){ char d[64]; strcpy(d, ether_ntoa(mac)); }"
     assert (
@@ -488,7 +488,7 @@ def test_charset_via_strlcpy_buffer_is_not_downweighted() -> None:
 
 def test_free_source_via_buffer_is_not_downweighted() -> None:
     # ★ recall-neutral: a free nvram string laundered through the SAME buffer shape must NOT be
-    # downweighted (this is the function-B class — a free string through an intermediate buffer).
+    # downweighted (the class of a free string through an intermediate buffer).
     pc = (
         "void g(void){ char b[32]; char cmd[128]; char* v=nvram_get(0); "
         'strlcpy(b,v,32); snprintf(cmd,128,"echo %s",b); system(cmd); }'
@@ -544,7 +544,7 @@ def test_free_source_two_buffers_deep_is_not_downweighted() -> None:
 
 
 def test_no_code_reads_a_symbol_name_to_decide_a_library_origin() -> None:
-    """MC-1. The retired guess leaves no callable behind — checked as CODE, not as text.
+    """The retired guess leaves no callable behind — checked as CODE, not as text.
 
     It read a symbol name and answered "this is third-party library code", which is the same
     reasoning the by-name binary exclusion was retired for: it holds only while symbols are named

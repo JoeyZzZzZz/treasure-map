@@ -93,7 +93,7 @@ def test_open_db_creates_schema(tmp_path: Path) -> None:
     conn.close()
 
 
-# ── R-cleanup: dropped pre-judgment columns/tables + idempotent migration ─────
+# ── cleanup: dropped pre-judgment columns/tables + idempotent migration ───────
 
 
 def _functions_columns(conn: sqlite3.Connection) -> set[str]:
@@ -132,8 +132,8 @@ def test_fresh_schema_omits_dropped_columns(tmp_path: Path) -> None:
 
 
 def _build_pre_cleanup_db(db_path: Path) -> None:
-    """Create a db shaped like one built before R-cleanup: current schema plus the
-    columns/table/indexes this round removes, then a row of real data in each."""
+    """Create a db shaped like one built before the cleanup: current schema plus the
+    columns/table/indexes the cleanup removes, then a row of real data in each."""
     conn = sqlite3.connect(db_path)
     conn.executescript(_SCHEMA_PATH.read_text())
     conn.executescript(
@@ -303,7 +303,7 @@ def test_migration_sink_provenance_is_idempotent(tmp_path: Path) -> None:
         conn.close()
 
 
-# ── Round 2: new ingest_elfs behaviour ───────────────────────────────────────
+# ── ingest_elfs behaviour ────────────────────────────────────────────────────
 
 
 def test_ingest_returns_dirty_set_for_new_records(tmp_path: Path) -> None:
@@ -529,7 +529,7 @@ def test_self_heal_redirties_code_binary_wrongly_frozen_as_ok_empty(
 def test_ok_empty_is_reverified_not_trusted_when_file_stays_codefree(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The other side of the same coin (acceptance #3): re-verifying ok_empty must NOT churn a
+    # The other side of the same coin: re-verifying ok_empty must NOT churn a
     # genuinely code-free object. Its file is still code-free this scan -> stays cached, stays
     # ok_empty, never re-analyzed. (Re-verification is authoritative, but authority cuts both ways.)
     conn = open_db(tmp_path / "analysis.db")
@@ -1000,11 +1000,11 @@ def test_schema_sql_alone_declares_the_stub_column(tmp_path: Path) -> None:
     assert "stub_names" in cols
 
 
-# ── D4: bridge transport columns (call_tokens + body_ranges), two-place rule ─────────────────────
+# ── bridge transport columns (call_tokens + body_ranges), two-place rule ─────────────────────────
 
 
 def test_migration_adds_call_tokens_and_body_ranges_to_old_db(tmp_path: Path) -> None:
-    """A database built before the D4 bridge columns must gain both on open (back-filling '[]'), so
+    """A database built before the bridge columns must gain both on open (back-filling '[]'), so
     ghidra_ingest can write them without "no column named call_tokens/body_ranges"; rows survive."""
     db_path = tmp_path / "legacy_bridge.db"
     _legacy_functions_db(db_path)

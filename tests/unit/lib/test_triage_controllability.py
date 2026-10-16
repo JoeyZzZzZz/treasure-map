@@ -1,6 +1,6 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for the SINGLE controllability verdict (M3) + its band order (M4).
+"""Unit tests for the SINGLE controllability verdict + its band order.
 
 The verdict is computed from sink_arg_provenance (not the collapsed top-level source_kind), crosses
 each vararg key against the SaTC web_settable, and is scoped to the candidate's anchored sink. These
@@ -171,7 +171,7 @@ def _ctrl(c) -> str:  # type: ignore[no-untyped-def]
     return c.dim("controllability").value
 
 
-# ── M5.7 + M5.12: a web-settable key reaching the sink ⇒ controllable ──────────────────
+# ── a web-settable key reaching the sink ⇒ controllable ──────────────────
 
 
 def test_web_settable_key_reaching_sink_is_controllable(tmp_path: Path) -> None:
@@ -243,8 +243,8 @@ def test_explain_reads_the_settable_key_with_the_candidates_own_run(tmp_path: Pa
 
 
 def test_non_web_settable_getter_key_is_not_promoted(tmp_path: Path) -> None:
-    # fwrev: a back-end key but not an editable front-end field -> web_settable=uncertain (④: no
-    # 'no' state) -> NOT controllable -> falls through to source_kind.
+    # fwrev: a back-end key but not an editable front-end field -> web_settable=uncertain (there is
+    # no 'no' state) -> NOT controllable -> falls through to source_kind.
     conn = _atlas(tmp_path)
     p = _pattern(conn, "fp_fw", sink_class="fmt_string")
     ref = _inst(
@@ -281,7 +281,7 @@ def test_getpid_call_return_is_not_optimistically_controllable(tmp_path: Path) -
     assert _ctrl(c) != "controllable"
 
 
-# ── M5.8: a value-forwarding copy of a constant literal ⇒ constant (fix free≠constant) ─
+# ── a value-forwarding copy of a constant literal ⇒ constant (fix free≠constant) ─
 
 
 def test_strcpy_of_constant_is_constant_despite_unresolved_dst(tmp_path: Path) -> None:
@@ -309,7 +309,7 @@ def test_strcpy_of_constant_is_constant_despite_unresolved_dst(tmp_path: Path) -
     assert _ctrl(c) == "constant"  # one verdict — no free/constant contradiction
 
 
-# ── M5.9: the demotion iron law — a variadic exec seen only at arg0 ⇒ NEVER constant ───
+# ── the demotion iron law — a variadic exec seen only at arg0 ⇒ NEVER constant ───
 
 
 def test_variadic_exec_seen_only_at_arg0_is_unknown_not_constant(tmp_path: Path) -> None:
@@ -403,7 +403,7 @@ def test_verdict_is_scoped_to_the_anchored_sink(tmp_path: Path) -> None:
     assert _ctrl(c) == "constant"  # scoped to system — NOT promoted by the fprintf sibling
 
 
-# ── M4: proven-controllable ranks ABOVE optimistic 'free' ──────────────────────────────
+# ── proven-controllable ranks ABOVE optimistic 'free' ──────────────────────────────
 
 
 def test_controllable_ranks_above_free(tmp_path: Path) -> None:
@@ -475,7 +475,7 @@ def test_proven_controllable_ranks_above_param_unknown_same_tier(tmp_path: Path)
     assert order.index(ctrl_ref) < order.index(param_ref)  # certainty wins over the param float
 
 
-# ── M5.13 demotion audit + M5.14 re-rank invariant ─────────────────────────────────────
+# ── demotion audit + re-rank invariant ─────────────────────────────────────
 
 
 def test_no_constant_candidate_hides_a_web_settable_key(tmp_path: Path) -> None:
@@ -543,11 +543,11 @@ def test_reranking_never_reduces_candidate_count(tmp_path: Path) -> None:
     assert len(sort_candidates(cands, spine="controllability")) == len(cands)
 
 
-# ── ⑤ detection fallback chain: source_kind=free_string is NOT abandoned ────────────────
+# ── detection fallback chain: source_kind=free_string is NOT abandoned ────────────────
 
 
 def test_provenance_shallow_free_string_stays_free_not_unknown(tmp_path: Path) -> None:
-    # The 263-argv protection: a candidate with NO provenance depth (no web-key, not provably const)
+    # The argv protection: a candidate with NO provenance depth (no web-key, not provably const)
     # and source_kind=free_string must read 'free' via the fallback, NOT collapse to unknown.
     conn = _atlas(tmp_path)
     p = _pattern(conn, "fp_argv", sink_class="cmd")
@@ -621,16 +621,17 @@ def test_provenance_deep_const_beats_source_kind_free_fallback(tmp_path: Path) -
     ref = _inst(conn, p, sink_anchor="popen", flow_evidence=prov, source_kind="free_string")
     conn.close()
     c = _find(triage(open_atlas(tmp_path / "atlas.db")), ref)
-    assert _ctrl(c) == "constant"  # const (step 2) wins over the free_string fallback (step 3)
+    assert _ctrl(c) == "constant"  # const (checked first) wins over the free_string fallback
 
 
-# ── ⑥ promotion-recall: the fixed label set crosses YES (else the rule is named) ────────
+# ── promotion-recall: the fixed label set crosses YES (else the rule is named) ────────
 
 
 def test_promotion_recall_label_set_crosses_yes(tmp_path: Path) -> None:
-    # ⑥: the promote path now rides on M1 recall. A fixed label set of known-editable keys must all
-    # cross to web_settable=yes once seeded (both sides present). A miss would be a silent埋没 the
-    # demotion audit cannot catch (it is a missed promote, not a bad demote).
+    # The promote path now rides on the front-end form field recall. A fixed label set of
+    # known-editable keys must all cross to web_settable=yes once seeded (both sides present). A
+    # miss would be silent: the demotion audit cannot catch it (it is a missed promote, not a bad
+    # demote).
     from treasure_map.lib.query.nvram import _web_settable
 
     conn = open_atlas(tmp_path / "atlas.db")
@@ -651,7 +652,7 @@ def test_promotion_recall_label_set_crosses_yes(tmp_path: Path) -> None:
 
 
 def test_promotion_recall_x_suffix_variant_is_uncertain_with_named_rule(tmp_path: Path) -> None:
-    # ⑥ known gap, NAMED not hidden: web_user's editable field is the _x mirror
+    # Known gap, NAMED not hidden: web_user's editable field is the _x mirror
     # (web_user_x) -> uncertain this phase (never a false 'no'). Rule to add: an X_x suffix.
     from treasure_map.lib.query.nvram import _web_settable
 
@@ -664,11 +665,11 @@ def test_promotion_recall_x_suffix_variant_is_uncertain_with_named_rule(tmp_path
     conn.close()
 
 
-# ── ⑦ callee classification is an extensible registry (nvram is class #1) ────────────────
+# ── callee classification is an extensible registry (nvram is class #1) ────────────────
 
 
 def test_call_return_classifier_registry_is_extensible(tmp_path: Path) -> None:
-    # ⑦: adding a FUTURE call_return class (e.g. getenv->controllable) is a registry row, with the
+    # Adding a FUTURE call_return class (e.g. getenv->controllable) is a registry row, with the
     # verdict logic unchanged. Prove the registry is the extension seam and classification is data.
     import importlib
 
@@ -690,7 +691,7 @@ def test_call_return_classifier_registry_is_extensible(tmp_path: Path) -> None:
     conn.close()
 
 
-# ── 支配传导 (dominance propagation): only a dominating writer decides a stack_buf sink ──
+# ── dominance propagation: only a dominating writer decides a stack_buf sink ──
 
 
 def _writer(fmt: str, varargs: list, *, dominates: bool, reaches: bool | None = None) -> dict:  # type: ignore[type-arg]
@@ -817,7 +818,7 @@ def test_dominating_web_key_is_controllable_despite_nondominating_noise(tmp_path
 
 
 def test_no_dominating_writer_falls_back_to_all_not_unknown(tmp_path: Path) -> None:
-    # M2 case 2 (evidence-absent never infers safe): NO writer is marked dominating -> fall back to
+    # Evidence-absent never infers safe: NO writer is marked dominating -> fall back to
     # ALL writers, so a web key still lights controllable instead of collapsing to unknown/safe.
     conn = _atlas(tmp_path)
     p = _pattern(conn, "fp_fallback", sink_class="cmd")
@@ -843,7 +844,7 @@ def test_pre_field_provenance_without_dominates_sink_falls_back(tmp_path: Path) 
 
 
 def test_single_dominating_writer_behavior_unchanged(tmp_path: Path) -> None:
-    # M2 case 5: a single dominating writer -> dominating == [that one] == judged, no change.
+    # A single dominating writer -> dominating == [that one] == judged, no change.
     conn = _atlas(tmp_path)
     p = _pattern(conn, "fp_single", sink_class="fmt_string")
     prov = _stack_buf_multi(
@@ -855,20 +856,21 @@ def test_single_dominating_writer_behavior_unchanged(tmp_path: Path) -> None:
     assert _ctrl(c) == "controllable"
 
 
-# ── Phase 4: wrapper-aware source attribution (M1) + in_router_defaults likely recall (M2/M3) ──
+# ── wrapper-aware source attribution + in_router_defaults likely recall ──
 #
 # The false-low fix: a real web-controllable command injection (the OAuth class) reads its nvram key
 # through a THIN WRAPPER, not a bare getter. Candidate-layer attribution used to recognise only
 # direct getters, so the wrapper-read key was attributed to nothing and the sink collapsed to
-# unknown. M1 reuses A2's already-materialised wrapper set (nvram_key_flow.via_wrapper); M2 adds a
-# ``likely`` web_settable tier for a router_defaults member; M3 ranks likely-controllable below
-# proven-controllable and above optimistic 'free'.
+# unknown. Attribution now reuses A2's already-materialised wrapper set
+# (nvram_key_flow.via_wrapper); a ``likely`` web_settable tier is added for a router_defaults
+# member; likely-controllable ranks below proven-controllable and above optimistic 'free'.
 
 
 def _register_wrapper(conn: sqlite3.Connection, callee: str, key: str) -> None:
     """Materialise ``callee`` as an A2 thin nvram wrapper reading ``key`` — the atlas shape triage
     reads back as ``wrapper_names`` (SELECT DISTINCT via_wrapper). The read edge also makes ``key``
-    a back-end nvram key (so it is a genuine nvram read, exactly as M1's gate requires)."""
+    a back-end nvram key (so it is a genuine nvram read, exactly as the attribution gate
+    requires)."""
     add_nvram_flow_rows(
         conn,
         [NvramFlowRow("run_1", key, "constant", "httpd", "wrap_read", "read", via_wrapper=callee)],
@@ -882,8 +884,8 @@ def _seed_default(conn: sqlite3.Connection, *keys: str) -> None:
 
 
 def test_wrapper_read_key_resolves_nvram_source_key(tmp_path: Path) -> None:
-    # ★ SEAM #12: a wrapper-read nvram candidate whose getter-return const_args[0] is the key ⇒
-    # nvram_source_key is non-None. Guards against M1 regressing to direct-getter-only attribution.
+    # ★ SEAM: a wrapper-read nvram candidate whose getter-return const_args[0] is the key ⇒
+    # nvram_source_key is non-None. Guards against attribution regressing to direct-getter-only.
     conn = _atlas(tmp_path)
     _register_wrapper(conn, "FUN_0040870c", "acct_link_code")
     p = _pattern(conn, "fp_wrap", sink_class="cmd")
@@ -902,9 +904,10 @@ def test_wrapper_read_key_resolves_nvram_source_key(tmp_path: Path) -> None:
 
 
 def test_unregistered_callee_leaves_nvram_source_key_unresolved(tmp_path: Path) -> None:
-    # The honest boundary of M1: an nvram-shaped call_return whose callee is NEITHER a known getter
-    # NOR an A2 thin wrapper is not trusted as an nvram read -> nvram_source_key stays None (the
-    # pre-fix state, kept honest — we do not fabricate a key from any incidental const string).
+    # The honest boundary of wrapper-aware attribution: an nvram-shaped call_return whose callee is
+    # NEITHER a known getter NOR an A2 thin wrapper is not trusted as an nvram read ->
+    # nvram_source_key stays None (the pre-fix state, kept honest — we do not fabricate a key from
+    # any incidental const string).
     conn = _atlas(tmp_path)  # no wrapper registered
     p = _pattern(conn, "fp_unreg", sink_class="cmd")
     ref = _inst(
@@ -922,8 +925,8 @@ def test_unregistered_callee_leaves_nvram_source_key_unresolved(tmp_path: Path) 
 
 
 def test_router_defaults_member_wrapper_key_is_likely_controllable(tmp_path: Path) -> None:
-    # M2/M3 verdict: a wrapper-read key that is a router_defaults member but NOT a proven SaTC cross
-    # -> controllability value 'controllable' with state 'likely' (the OAuth shape).
+    # The likely-tier verdict: a wrapper-read key that is a router_defaults member but NOT a proven
+    # SaTC cross -> controllability value 'controllable' with state 'likely' (the OAuth shape).
     conn = _atlas(tmp_path)
     _register_wrapper(conn, "FUN_0040870c", "acct_link_code")
     _seed_default(conn, "acct_link_code")
@@ -967,7 +970,7 @@ def test_source_writability_dimension_carries_web_evidence() -> None:
 
 
 def test_wrapper_read_non_default_key_stays_unknown(tmp_path: Path) -> None:
-    # ★ M4.5 guardrail: a wrapper-read key that is NOT a router_defaults member (table located) must
+    # ★ guardrail: a wrapper-read key that is NOT a router_defaults member (table located) must
     # NOT be promoted to likely -- the in_router_defaults gate holds internal keys out. It falls
     # through to unknown, never a false 'likely' (the log_radiostat_dir / modelcode case).
     conn = _atlas(tmp_path)
@@ -990,7 +993,7 @@ def test_wrapper_read_non_default_key_stays_unknown(tmp_path: Path) -> None:
 
 
 def test_proven_controllable_outranks_likely_controllable(tmp_path: Path) -> None:
-    # M3.8: within the SAME sink-impact tier, a proven SaTC cross (state proven) ranks above a
+    # Within the SAME sink-impact tier, a proven SaTC cross (state proven) ranks above a
     # likely router_defaults key (state likely) -- the certainty tiebreak, proven micro-leads.
     conn = _atlas(tmp_path)
     _register_wrapper(conn, "FUN_0040870c", "acct_link_code")
@@ -1021,7 +1024,7 @@ def test_proven_controllable_outranks_likely_controllable(tmp_path: Path) -> Non
 
 
 def test_likely_controllable_outranks_free(tmp_path: Path) -> None:
-    # M3: within the same sink-impact tier, likely-controllable (a real-but-unconfirmed nvram key)
+    # Within the same sink-impact tier, likely-controllable (a real-but-unconfirmed nvram key)
     # outranks the optimistic 'free' (source_kind=free_string). A router_defaults RCE lead beats a
     # bare argv guess -- harm plus a real key both point up.
     conn = _atlas(tmp_path)
@@ -1047,7 +1050,7 @@ def test_likely_controllable_outranks_free(tmp_path: Path) -> None:
 
 
 def test_likely_cmd_outranks_optimistic_free_lower_impact(tmp_path: Path) -> None:
-    # M3 harm-respect (impact is the OUTER axis): a likely-controllable cmd sink outranks an
+    # Harm-respect (impact is the OUTER axis): a likely-controllable cmd sink outranks an
     # optimistic-'free' LOG sink -- a high-impact unconfirmed lead beats a low-impact one, so the
     # worst bug never falls off the top screen. (Both are unproven leads: likely-controllable and
     # the optimistic 'free' fallback -- impact, not a 'proven' band, governs.)
@@ -1254,7 +1257,7 @@ def _dim_of(conn: sqlite3.Connection, ref: str) -> tuple[str, str]:
 
 
 def test_escaped_sink_is_not_called_constant_off_its_siblings(tmp_path: Path) -> None:
-    # G1 — the gate itself, on the provenance exit. The anchor is `system`; every record present
+    # The gate itself, on the provenance exit. The anchor is `system`; every record present
     # belongs to some OTHER sink the caller logs through. "All records are constant" is true and
     # meaningless: the value handed to `system` was never looked at.
     #
@@ -1279,7 +1282,7 @@ def test_escaped_sink_is_not_called_constant_off_its_siblings(tmp_path: Path) ->
 
 
 def test_escaped_sink_with_a_constant_marker_is_not_called_constant(tmp_path: Path) -> None:
-    # G5 — the SAME gate on the OTHER exit, end to end. This is the one a gate written only at the
+    # The SAME gate on the OTHER exit, end to end. This is the one a gate written only at the
     # provenance classifier misses entirely: `const_sink_arg` is computed from the caller's body,
     # which for an escaped sink holds a constant shell (a format string) around the conversion the
     # attacker fills. The marker is true about the caller and says nothing about the wrapped sink.
@@ -1303,7 +1306,7 @@ def test_escaped_sink_with_a_constant_marker_is_not_called_constant(tmp_path: Pa
 
 
 def test_gate_never_suppresses_a_controllable_reading(tmp_path: Path) -> None:
-    # G2 — the gate is one-directional. With the anchor missed, the liberal fallback may still show
+    # The gate is one-directional. With the anchor missed, the liberal fallback may still show
     # a controllable source among the sibling records; that reading must survive untouched.
     # Promoting on partial evidence costs a review, demoting on it hides a real lead.
     #
@@ -1323,7 +1326,7 @@ def test_gate_never_suppresses_a_controllable_reading(tmp_path: Path) -> None:
 
 
 def test_constant_still_asserted_when_the_anchored_sink_is_present(tmp_path: Path) -> None:
-    # G3 — the gate must not become a blanket ban. With a record FOR the anchored sink, the
+    # The gate must not become a blanket ban. With a record FOR the anchored sink, the
     # constant reading is exactly as sound as it was, and the thousands of legitimately-constant
     # candidates keep sinking out of the first screen.
     #
@@ -1346,7 +1349,7 @@ def test_constant_still_asserted_when_the_anchored_sink_is_present(tmp_path: Pat
 
 @pytest.mark.parametrize("sink", sorted(exec_edges.EXEC_SINKS))
 def test_variadic_iron_law_is_untouched_by_the_gate(sink: str, tmp_path: Path) -> None:
-    # G4 — the two completeness rules are at different levels and must both keep working. Here the
+    # The two completeness rules are at different levels and must both keep working. Here the
     # anchor IS present (the gate passes), and the RECORD-level rule still refuses to call a
     # variadic exec constant on the strength of arg0 alone.
     #
@@ -1386,7 +1389,8 @@ def test_the_multi_arg_set_is_exactly_the_exec_family() -> None:
       C. the two sets are EQUAL — the membership lock. A and B both pass for `doSystem` (it IS in
          CMD), so C is the only assertion that catches it being folded in here. doSystem is the same
          kind of false negative reached through a different exit and is fixed separately; if it is
-         ever meant to join this set, this line and the G4 anchor move together, deliberately.
+         ever meant to join this set, this line and
+         test_variadic_iron_law_is_untouched_by_the_gate move together, deliberately.
 
     MUTATION: drop `execve` from the literal -> RED (A and C). Add `execvpe` back -> RED (B and C).
     Add `doSystem` -> RED (C only). Measured: 2, 2 and 1 failed respectively.
@@ -1406,7 +1410,7 @@ def test_the_multi_arg_set_is_exactly_the_exec_family() -> None:
 
 
 def test_a_sink_class_def_use_does_not_cover_is_never_read_as_an_escape() -> None:
-    # G6 — the DEFENSIVE guard, and the only one with no real-atlas instance behind it. Def-use
+    # The DEFENSIVE guard, and the only one with no real-atlas instance behind it. Def-use
     # records exist for command and format sinks only, so "no record for fopen" means def-use does
     # not cover path sinks — never that a sink escaped.
     #
@@ -1421,12 +1425,12 @@ def test_a_sink_class_def_use_does_not_cover_is_never_read_as_an_escape() -> Non
     from treasure_map.lib.query.triage import _anchor_missed, _sink_provenance_records
 
     evidence = json.dumps({"sink_arg_provenance": [_const_record("system")]})
-    assert _sink_provenance_records(evidence), "fixture must be non-empty or G6 proves nothing"
+    assert _sink_provenance_records(evidence), "fixture must be non-empty or this proves nothing"
     assert _anchor_missed(evidence, "fopen") is False
 
 
 def test_absent_provenance_is_not_read_as_an_escape() -> None:
-    # G7 — the LOAD-BEARING non-empty guard, anchored on a shape a real atlas is full of: a
+    # The LOAD-BEARING non-empty guard, anchored on a shape a real atlas is full of: a
     # command/format sink whose candidate carries no def-use records at all. That is "nothing was
     # captured here", which the classifier already answers with None — reading it as an escape
     # would widen the gate by roughly two orders of magnitude and start demoting candidates whose
@@ -2316,7 +2320,7 @@ def test_constrained_marker_yields_to_unknown(tmp_path: Path, marker: str) -> No
         conn.close()
 
 
-# ── B2: per-callsite provenance scoping — one call to a sink is not read off a sibling ───────
+# ── per-callsite provenance scoping — one call to a sink is not read off a sibling ───────
 
 
 def _const_at(sink: str, addr: int, value: str = "/sbin/reboot") -> dict[str, object]:
@@ -2416,7 +2420,7 @@ def _addr_inst(
 
 
 def test_writer_located_is_not_borrowed_from_a_sibling_callsite(tmp_path: Path) -> None:
-    """B2 #3. A function with a constant `system("reboot")` beside an untraced `system(var)`: the
+    """A function with a constant `system("reboot")` beside an untraced `system(var)`: the
     untraced call's writer is `not_traced` on its OWN address, but reads `located` off the constant
     sibling when the candidate has no address — the pre-fix borrowing this closes.
 
@@ -2429,7 +2433,7 @@ def test_writer_located_is_not_borrowed_from_a_sibling_callsite(tmp_path: Path) 
 
 
 def test_anchor_missed_is_per_callsite(tmp_path: Path) -> None:
-    """B2 #4. Only the constant sibling left a record; the candidate's own call did not. By NAME a
+    """Only the constant sibling left a record; the candidate's own call did not. By NAME a
     record for `system` exists (not missed); by CALLSITE this candidate has none of its own
     (missed), so the constant exit is suppressed and the reading falls back.
 
@@ -2454,7 +2458,7 @@ def test_anchor_missed_is_per_callsite(tmp_path: Path) -> None:
 
 
 def test_constant_verdict_is_per_callsite(tmp_path: Path) -> None:
-    """B2 #5. With a constant record and an unknown record for the same sink present, the constant
+    """With a constant record and an unknown record for the same sink present, the constant
     call reads `constant` only when scoped to its OWN address; unscoped, the sibling unknown dilutes
     the verdict. The unknown call is never constant either way.
 
@@ -2489,7 +2493,7 @@ def test_constant_verdict_is_per_callsite(tmp_path: Path) -> None:
 
 
 def test_web_settable_key_is_not_leaked_across_callsites(tmp_path: Path) -> None:
-    """B2 #6. A constant call beside a call that splices a web-settable key: scoped to the constant
+    """A constant call beside a call that splices a web-settable key: scoped to the constant
     call's address no key reaches it (constant); scoped to the key's call it is controllable. The
     key must not float the constant call, nor the constant silence the key's call."""
     conn = _atlas(tmp_path)  # _atlas seeds the SaTC cross (rpt_comment crosses web_settable=yes)
@@ -2522,7 +2526,7 @@ def test_web_settable_key_is_not_leaked_across_callsites(tmp_path: Path) -> None
 
 
 def test_scoped_records_fallback_is_unchanged_when_own_is_empty(tmp_path: Path) -> None:
-    """B2 #7. With an address but no record of the candidate's own (only another sink's record
+    """With an address but no record of the candidate's own (only another sink's record
     present), _scoped_records returns exactly what it returns unaddressed — the liberal fallback is
     untouched, so nothing a failed address match can hide a controllable key behind."""
     other = {
@@ -2539,7 +2543,7 @@ def test_scoped_records_fallback_is_unchanged_when_own_is_empty(tmp_path: Path) 
 
 
 def test_empty_provenance_is_governed_by_guard_b_regardless_of_address(tmp_path: Path) -> None:
-    """B2 #8. With NO provenance at all and not a wrapper candidate, guard (b) governs before the
+    """With NO provenance at all and not a wrapper candidate, guard (b) governs before the
     callsite guard (c), so _anchor_missed is False with or without an address, and a const_sink_arg
     marker still reads constant — the ordinary copy/path no-def-use state is unchanged."""
     conn = _atlas(tmp_path)
@@ -2562,7 +2566,7 @@ def test_empty_provenance_is_governed_by_guard_b_regardless_of_address(tmp_path:
 
 
 def test_iron_laws_survive_per_callsite_scoping(tmp_path: Path) -> None:
-    """B2 #9. The two per-record iron laws fire the same under callsite scoping: an execl arg0
+    """The two per-record iron laws fire the same under callsite scoping: an execl arg0
     constant is the program path (never a constant command), and a doSystem constant %s TEMPLATE
     splices an unexamined vararg (never a constant command)."""
     conn = _atlas(tmp_path)
@@ -2586,7 +2590,7 @@ def test_iron_laws_survive_per_callsite_scoping(tmp_path: Path) -> None:
 
 
 def test_candidate_threads_callsite_addr_end_to_end(tmp_path: Path) -> None:
-    """B2 wiring. _candidate must read the address out of the row's evidence_ref and scope every
+    """The wiring. _candidate must read the address out of the row's evidence_ref and scope every
     dimension by it. Two instances share one provenance (a constant call + an untraced call) but
     carry refs addressed to different calls; a third carries a function-level ref.
 

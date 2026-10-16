@@ -193,11 +193,11 @@ def test_kind_shift_reports_a_changed_kind_both_sides_present() -> None:
     assert sm.kind_shift(None, "const") is None  # a has no size axis
 
 
-# ── N1: the try/catch annotation's addresses ─────────────────────────────────────────────────
+# ── the try/catch annotation's addresses ─────────────────────────────────────────────────────
 
 
 def test_a_try_annotation_address_is_blanked_and_no_other_bare_hex() -> None:
-    """T12. The try/catch annotation names code addresses that move with the code; any other
+    """The try/catch annotation names code addresses that move with the code; any other
     comment (a WARNING) keeps its bare hex, and a small constant always stays put. "entry from" in
     a string or comment is not "try from".
 
@@ -223,7 +223,7 @@ def _try_body(start: int, end: int, handler: int) -> str:
 
 
 def test_a_try_annotation_matches_only_when_every_address_moved_with_the_entry() -> None:
-    """T12b. Entries 0x1000 -> 0x2000. The blanked try/catch addresses keep a match only when each
+    """Entries 0x1000 -> 0x2000. The blanked try/catch addresses keep a match only when each
     moved by exactly that offset (or none moved); a handler that moved by another offset reads
     differs, and its delta is a comment substitution, not layout. A body with no annotation is not
     touched.
@@ -247,11 +247,11 @@ def test_a_try_annotation_matches_only_when_every_address_moved_with_the_entry()
     assert "comment" in delta["substitutions"]
 
 
-# ── N0: a large literal, position by position ───────────────────────────────────────────────
+# ── a large literal, position by position ───────────────────────────────────────────────────
 
 
 def test_a_large_literal_is_an_address_only_when_both_values_lie_in_their_images() -> None:
-    """T13. A value the same on both sides is never looked up; a value that changed reads as a
+    """A value the same on both sides is never looked up; a value that changed reads as a
     moved address only when each side's value lies in that side's image; a large constant that
     changed outside the image is a difference.
 
@@ -272,7 +272,7 @@ def test_a_large_literal_is_an_address_only_when_both_values_lie_in_their_images
 
 
 def test_a_moved_literal_read_on_an_unknown_image_is_named_not_trusted() -> None:
-    """T13b. A changed value read as an address only because a side's image is unknown makes the
+    """A changed value read as an address only because a side's image is unknown makes the
     match ``literal_basis_unknown`` (identical_text_unverified); a value the same on both sides
     needs no image and adds nothing.
 
@@ -298,7 +298,7 @@ def _reasons(text: str) -> tuple[str, ...]:
 
 
 def test_a_text_match_the_decompiler_marked_incomplete_is_not_identical() -> None:
-    """T14. Either jumptable note makes an otherwise equal text identical_text_unverified.
+    """Either jumptable note makes an otherwise equal text identical_text_unverified.
 
     MUTATION: match ``jumptable`` on "Could not recover jumptable" alone -> the second note is
     missed -> RED."""
@@ -311,7 +311,7 @@ def test_a_text_match_the_decompiler_marked_incomplete_is_not_identical() -> Non
 
 
 def test_the_three_later_markers_match_their_raw_text() -> None:
-    """T14b. ``Switch with N destination removed`` carries a number, so it is a pattern, not a
+    """``Switch with N destination removed`` carries a number, so it is a pattern, not a
     fixed string; the other two later markers match as written.
 
     MUTATION: write switch_destination_removed as the fixed text "Switch with destination
@@ -328,11 +328,11 @@ def test_the_three_later_markers_match_their_raw_text() -> None:
     assert _reasons("/* WARNING: Load size is inaccurate */\nf();") == ()  # not a hiding marker
 
 
-# ── S: the two body byte counts ──────────────────────────────────────────────────────────────
+# ── the two body byte counts ─────────────────────────────────────────────────────────────────
 
 
 def test_two_byte_counts_that_differ_qualify_a_text_match_and_mark_the_structure() -> None:
-    """T15 / T16. Equal texts over byte counts that differ: body_size_differs, and hidden_region
+    """Equal texts over byte counts that differ: body_size_differs, and hidden_region
     says structure_differs. Equal counts with a W marker: hidden_region says unknown — never
     identical.
 
@@ -354,7 +354,7 @@ def test_two_byte_counts_that_differ_qualify_a_text_match_and_mark_the_structure
 
 
 def test_a_byte_count_missing_on_one_side_adds_nothing() -> None:
-    """T15b. A side with no recorded byte count proves nothing about the size: no reason, and the
+    """A side with no recorded byte count proves nothing about the size: no reason, and the
     match stays identical when nothing else qualifies it.
 
     MUTATION: read a missing count as unequal -> body_size_differs -> RED."""
@@ -366,7 +366,7 @@ def test_a_byte_count_missing_on_one_side_adds_nothing() -> None:
 
 
 def test_a_marker_address_is_placed_in_or_out_of_its_own_closed_body_ranges() -> None:
-    """T17. Ghidra's body range includes its max: an address equal to ``hi`` is inside. A marker
+    """Ghidra's body range includes its max: an address equal to ``hi`` is inside. A marker
     naming no address is null.
 
     MUTATION: read the ranges half-open -> the ``hi`` marker reads outside -> RED; return true
@@ -391,7 +391,7 @@ def test_a_marker_address_is_placed_in_or_out_of_its_own_closed_body_ranges() ->
 
 
 def test_an_empty_body_on_both_sides_is_unavailable_never_identical() -> None:
-    """T28 (n1). A row whose pseudocode is empty is in the table (so not no_body) but has nothing to
+    """A row whose pseudocode is empty is in the table (so not no_body) but has nothing to
     compare; two of them must not compare equal.
 
     MUTATION: test the body dict's truth instead of its ``pseudocode`` (a dict is always true) ->
@@ -405,7 +405,7 @@ def test_an_empty_body_on_both_sides_is_unavailable_never_identical() -> None:
 
 
 def test_a_size_only_change_is_a_number_substitution() -> None:
-    """T20. A buffer whose size moved reads as a substitution of numbers and nothing else, and the
+    """A buffer whose size moved reads as a substitution of numbers and nothing else, and the
     pair still differs.
 
     MUTATION: normalise small constants away -> the texts compare equal -> RED."""
@@ -421,7 +421,7 @@ def test_a_size_only_change_is_a_number_substitution() -> None:
 
 
 def test_dropped_calls_are_counted_by_name() -> None:
-    """T21. Three calls cut to one is structural, and the call counts say which callee moved.
+    """Three calls cut to one is structural, and the call counts say which callee moved.
 
     MUTATION: count calls as a set -> both sides read 1 -> the callee is not listed -> RED."""
     a = 'void f(void)\n{\n  system("a");\n  system("b");\n  system("c");\n}'
@@ -432,7 +432,7 @@ def test_dropped_calls_are_counted_by_name() -> None:
 
 
 def test_a_spacing_only_difference_is_layout_and_still_differs() -> None:
-    """T22. Only the spacing differs: the token streams agree (layout_only), yet the texts are not
+    """Only the spacing differs: the token streams agree (layout_only), yet the texts are not
     the same and the pair is never read as identical.
 
     MUTATION: strip whitespace before the text comparison -> the pair reads identical -> RED."""
@@ -445,7 +445,7 @@ def test_a_spacing_only_difference_is_layout_and_still_differs() -> None:
 def test_a_delta_over_the_line_product_cap_is_not_computed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """T23. Above the line-pair bound the delta says so and does not run (or raise).
+    """Above the line-pair bound the delta says so and does not run (or raise).
 
     MUTATION: drop the line-product branch -> a delta is computed -> RED."""
     monkeypatch.setattr(sm, "DELTA_LINE_PRODUCT_CAP", 24)  # 5 x 5 lines = 25 pairs

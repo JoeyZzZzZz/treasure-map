@@ -240,7 +240,7 @@ def test_unknown_entry_external_lead_not_buried(tmp_path: Path) -> None:
     conn.close()
 
 
-# ── reachability honest split: entry:web / entry:script / entry:web+script / unknown (step 2) ──
+# ── reachability honest split: entry:web / entry:script / entry:web+script / unknown ──
 
 
 def _reach_by_fn(conn: sqlite3.Connection) -> dict[str, str]:
@@ -344,7 +344,7 @@ def test_reachability_filter_axis_matches_by_kind_without_reducing_map(tmp_path:
 
 
 def test_reachability_does_not_change_default_sort_web_vs_script(tmp_path: Path) -> None:
-    # ★ contract C5: reachability does not tiebreak — entry:web and entry:script are equal on the
+    # ★ sort contract: reachability does not tiebreak — entry:web and entry:script are equal on the
     # sort. Two otherwise-identical candidates keep the deterministic (function-name) order
     # regardless of which entry kind each carries.
     conn = _atlas(tmp_path)
@@ -374,7 +374,7 @@ def test_reachability_source_has_no_pre_auth_vocabulary() -> None:
     assert "attack surface" not in reach_strings
 
 
-# ── circle-and-weight: --filter reachability FLOATS matches, NEVER reduces the corpus (修法1) ──
+# ── circle-and-weight: --filter reachability FLOATS matches, NEVER reduces the corpus ──
 
 
 def _mk_reach_corpus(conn: sqlite3.Connection) -> None:
@@ -387,7 +387,7 @@ def _mk_reach_corpus(conn: sqlite3.Connection) -> None:
 
 
 def test_filter_reachability_never_reduces_corpus(tmp_path: Path) -> None:
-    # ★ 修法1 seam: an explicit reachability filter is a circle-and-weight lens — the candidate
+    # ★ seam: an explicit reachability filter is a circle-and-weight lens — the candidate
     # corpus is IDENTICAL to the no-filter corpus for EVERY value, including entry:web (which on
     # this corpus matches web_fn/both_fn) and an entry that matches nothing.
     from treasure_map.lib.query import apply_view
@@ -443,7 +443,7 @@ def test_reachability_match_count_counts_without_reducing(tmp_path: Path) -> Non
 
 
 def test_property_reachability_filter_corpus_invariant(tmp_path: Path) -> None:
-    # ★ property guard (修法1): for ANY reachability value — including an unrecognized one — the
+    # ★ property guard: for ANY reachability value — including an unrecognized one — the
     # corpus size equals the no-filter size. The anti-regression lock: a future reachability value
     # can never take a reduce path. (Reachability is the circle-and-weight axis this fix owns.)
     from treasure_map.lib.query import apply_view
@@ -458,9 +458,9 @@ def test_property_reachability_filter_corpus_invariant(tmp_path: Path) -> None:
 
 
 def test_all_dim_filters_float_never_reduce(tmp_path: Path) -> None:
-    # ★ 步骤 2.5: DEBT PAID — every --filter dimension now FLOATS (circle-and-weight), never reduces
-    # the corpus. Formerly this test recorded the opposite (controllability=free reduced 2->1); now
-    # ALL optimistic dimensions keep the corpus whole and only float their matches to the top.
+    # ★ every --filter dimension now FLOATS (circle-and-weight), never reduces the corpus. Formerly
+    # this test recorded the opposite (controllability=free reduced 2->1); now ALL optimistic
+    # dimensions keep the corpus whole and only float their matches to the top.
     from treasure_map.lib.query import apply_view
 
     conn = _atlas(tmp_path)
@@ -480,7 +480,7 @@ def test_all_dim_filters_float_never_reduce(tmp_path: Path) -> None:
 
 
 def test_cli_filter_reachability_header_shows_full_corpus(tmp_path: Path) -> None:
-    # ★ 修法1 CLI seam (the reported bug): the header candidate total is the FULL corpus under a
+    # ★ CLI seam (the reported bug): the header candidate total is the FULL corpus under a
     # reachability filter, with a separate match count — never the matched count masquerading as the
     # candidate base.
     import re
@@ -505,7 +505,7 @@ def test_cli_filter_reachability_header_shows_full_corpus(tmp_path: Path) -> Non
     assert "corpus NOT reduced" in web.output
 
 
-# ── 步骤 2.5: --filter uniformly floats; --only is the explicit ground-truth prune ──
+# ── --filter uniformly floats; --only is the explicit ground-truth prune ──
 
 
 def _mk_mixed_corpus(conn: sqlite3.Connection) -> None:
@@ -521,7 +521,7 @@ def _mk_mixed_corpus(conn: sqlite3.Connection) -> None:
 
 
 def test_all_filters_preserve_corpus(tmp_path: Path) -> None:
-    # ★ M5-8 property (debt paid): for ANY --filter <dim>=<val>, the corpus equals the no-filter
+    # ★ property: for ANY --filter <dim>=<val>, the corpus equals the no-filter
     # corpus. The anti-regression lock across every dimension — no --filter can take a reduce path.
     from treasure_map.lib.query import apply_view
 
@@ -545,7 +545,7 @@ def test_all_filters_preserve_corpus(tmp_path: Path) -> None:
 
 
 def test_source_filter_does_not_hide_non_nvram(tmp_path: Path) -> None:
-    # ★ M5-2 (the OAuth-hiding regression, synthetic): --filter source=nvram floats nvram-source
+    # ★ the OAuth-hiding regression (synthetic): --filter source=nvram floats nvram-source
     # candidates but keeps EVERY non-nvram one (an unattributed source is unknown, never proven
     # non-nvram) — the exact bug where a 'clean nvram list' would drop the severe unresolved case.
     from treasure_map.lib.query import apply_view
@@ -558,7 +558,7 @@ def test_source_filter_does_not_hide_non_nvram(tmp_path: Path) -> None:
 
 
 def test_reducible_predicate_and_only_refusal(tmp_path: Path) -> None:
-    # ★★ M5-9: reducible is a per-corpus predicate. Ground-truth sink dims are reducible; optimistic
+    # ★★ reducible is a per-corpus predicate. Ground-truth sink dims are reducible; optimistic
     # dims (unknown state) and source are not, and --only refuses them with guidance to --filter.
     from treasure_map.lib.query import only_refusal, reducible
 
@@ -576,7 +576,7 @@ def test_reducible_predicate_and_only_refusal(tmp_path: Path) -> None:
 
 
 def test_reducible_flips_false_on_null_sink_class() -> None:
-    # ★★ M5-9 (gap #2): ONE predicate covers explicit-unknown AND implicit-None. A synthetic
+    # ★★ ONE predicate covers explicit-unknown AND implicit-None. A synthetic
     # candidate with sink_class=None flips sink_class NON-reducible, so null can't smuggle a prune.
     from treasure_map.lib.query import Dimension, TriageCandidate, only_refusal, reducible
 
@@ -603,7 +603,7 @@ def test_reducible_flips_false_on_null_sink_class() -> None:
 
 
 def test_filter_partition_match_floats_above_higher_impact_nonmatch(tmp_path: Path) -> None:
-    # ★ M5-10 (gap #5): float is a hard PARTITION — a low-impact (copy) MATCH sits ABOVE a
+    # ★ float is a hard PARTITION — a low-impact (copy) MATCH sits ABOVE a
     # high-impact (cmd) non-match. Matches band to the top; impact orders only WITHIN a band.
     from treasure_map.lib.query import apply_view
 
@@ -620,7 +620,7 @@ def test_filter_partition_match_floats_above_higher_impact_nonmatch(tmp_path: Pa
 
 
 def test_filter_compound_and_intersection_floats(tmp_path: Path) -> None:
-    # ★ M5-11 (gap #3): filters="controllability=free,sink_impact=cmd" floats ONLY the candidate
+    # ★ filters="controllability=free,sink_impact=cmd" floats ONLY the candidate
     # matching BOTH (AND) to the very top — not those matching just one.
     from treasure_map.lib.query import apply_view
 
@@ -639,7 +639,7 @@ def test_filter_compound_and_intersection_floats(tmp_path: Path) -> None:
 
 
 def test_cli_only_and_filter_three_part_header(tmp_path: Path) -> None:
-    # ★ M5-12 (gap #4): --only X --filter Y → header reads corpus N · sweep shows M, with the
+    # ★ --only X --filter Y → header reads corpus N · sweep shows M, with the
     # --filter floating within the sweep. The corpus stays invariant.
     conn = _atlas(tmp_path)
     _mk_mixed_corpus(conn)
@@ -667,7 +667,7 @@ def test_cli_only_and_filter_three_part_header(tmp_path: Path) -> None:
 
 
 def test_cli_only_ground_truth_sweeps_cmd_and_copy(tmp_path: Path) -> None:
-    # ★ M5-4: --only on a ground-truth dimension sweeps; both cmd AND copy must work (copy is the
+    # ★ --only on a ground-truth dimension sweeps; both cmd AND copy must work (copy is the
     # majority class where --only actually helps). The corpus total stays whole in the header.
     conn = _atlas(tmp_path)
     _mk_mixed_corpus(conn)
@@ -688,7 +688,7 @@ def test_cli_only_ground_truth_sweeps_cmd_and_copy(tmp_path: Path) -> None:
 
 
 def test_cli_only_refuses_optimistic_dimension(tmp_path: Path) -> None:
-    # ★ M5-4: --only on an optimistic dimension errors (never silently prunes) with a --filter hint.
+    # ★ --only on an optimistic dimension errors (never silently prunes) with a --filter hint.
     conn = _atlas(tmp_path)
     _mk_mixed_corpus(conn)
     conn.close()
@@ -758,11 +758,11 @@ def test_source_kind_drives_controllability(tmp_path: Path) -> None:
     conn.close()
 
 
-# ── param-taint: orthogonal source=param signal from A2 external_input (step 4) ──
+# ── param-taint: orthogonal source=param signal from A2 external_input ──
 
 
 def test_external_input_builds_param_source_and_floats_above_nonparam(tmp_path: Path) -> None:
-    # ★ M4-1/9: A2 source_class=external_input on a system sink builds source=structural:param, and
+    # ★ A2 source_class=external_input on a system sink builds source=structural:param, and
     # the candidate floats ABOVE a same-certainty non-param peer (out of the unknown pile), so it is
     # no longer buried. The non-param peer carries NO param dimension.
     conn = _atlas(tmp_path)
@@ -782,7 +782,7 @@ def test_external_input_builds_param_source_and_floats_above_nonparam(tmp_path: 
 
 
 def test_param_source_not_swallowed_by_free_fallback(tmp_path: Path) -> None:
-    # ★ M4-3b (the execution-order trap): an external_input+free_string candidate is judged
+    # ★ the execution-order trap: an external_input+free_string candidate is judged
     # certainty=free by the fallback chain AND carries source=structural:param — the orthogonal
     # signal is built OUTSIDE the chain, so free never short-circuits it (both present).
     conn = _atlas(tmp_path)
@@ -795,7 +795,7 @@ def test_param_source_not_swallowed_by_free_fallback(tmp_path: Path) -> None:
 
 
 def test_param_float_lifts_unconstrained_external_over_name_tiebreak(tmp_path: Path) -> None:
-    # ★ M4-3c(a): the param float lifts an unconstrained-charset external_input lead above a
+    # ★ the param float lifts an unconstrained-charset external_input lead above a
     # same-certainty non-param peer even against the deterministic name tiebreak.
     conn = _atlas(tmp_path)
     ext = _pattern(conn, "fp_ext", sink_class="cmd", source_class="external_input")
@@ -808,7 +808,7 @@ def test_param_float_lifts_unconstrained_external_over_name_tiebreak(tmp_path: P
 
 
 def test_charset_safe_external_is_not_param_floated(tmp_path: Path) -> None:
-    # ★ M4-3c(b) guardrail (param-internal demotion iron law): a charset_safe external_input (a
+    # ★ guardrail (param-internal demotion iron law): a charset_safe external_input (a
     # converter constrained the value inline -> metachars blocked -> can't inject) is NOT floated,
     # even though it still honestly carries source=structural:param. With no float, the name
     # tiebreak stands, so the external one does NOT jump its non-param peer.
@@ -841,7 +841,7 @@ def test_external_input_source_is_structural_never_proven(tmp_path: Path) -> Non
 
 
 def test_external_input_zero_discrimination_note_covers_all_sink_classes(tmp_path: Path) -> None:
-    # ★ 1.2: the 'near-zero discrimination' caveat must NOT read as cmd-only — external_input fires
+    # ★ the 'near-zero discrimination' caveat must NOT read as cmd-only — external_input fires
     # on nearly every candidate in fmt_string and path_sink too, so a fmt_string external_input's
     # source note names the other sink classes (else the coarse label is understated as cmd-only).
     conn = _atlas(tmp_path)
@@ -879,7 +879,7 @@ def test_proven_is_never_spent_on_an_optimistic_or_unproven_reading(tmp_path: Pa
 
 
 def test_param_never_claims_controllable(tmp_path: Path) -> None:
-    # ★ M4-4/10: source=param is a structural signal, NEVER a controllability claim — no param
+    # ★ source=param is a structural signal, NEVER a controllability claim — no param
     # candidate reads controllability=controllable (proven OR likely), and its note says UNPROVEN.
     conn = _atlas(tmp_path)
     p = _pattern(conn, "fp", sink_class="cmd", source_class="external_input")
@@ -893,7 +893,7 @@ def test_param_never_claims_controllable(tmp_path: Path) -> None:
 
 
 def test_non_external_source_leaves_verdict_unchanged(tmp_path: Path) -> None:
-    # ★ M4-7: a non-external_input candidate builds NO param dimension and its controllability
+    # ★ a non-external_input candidate builds NO param dimension and its controllability
     # verdict is untouched (param never touches the certainty computation).
     conn = _atlas(tmp_path)
     p = _pattern(conn, "fp", sink_class="cmd", source_class="unknown")
@@ -905,7 +905,7 @@ def test_non_external_source_leaves_verdict_unchanged(tmp_path: Path) -> None:
 
 
 def test_param_marks_argv_form_exec_family(tmp_path: Path) -> None:
-    # ★ M4-11 guardrail 1: exec-family (execl/execv) is argv-form, not fmt-form — the param mark is
+    # ★ guardrail: exec-family (execl/execv) is argv-form, not fmt-form — the param mark is
     # based on A2 source_class, NOT an fmt %s scan, so an argv-form command-injection sink is NOT
     # missed (it is the core injection sink).
     conn = _atlas(tmp_path)
@@ -916,7 +916,7 @@ def test_param_marks_argv_form_exec_family(tmp_path: Path) -> None:
 
 
 def test_param_float_preserves_nonparam_relative_order(tmp_path: Path) -> None:
-    # ★ M4-6 (contract C5, param's sort obligation): param floats external_input leads up, but the
+    # ★ param's sort obligation: param floats external_input leads up, but the
     # relative order of NON-param candidates is unchanged (impact tier still governs; a param cmd
     # sits inside the cmd tier, above a log, but never past a higher-certainty non-param free cmd).
     conn = _atlas(tmp_path)
@@ -1382,7 +1382,7 @@ def test_cli_sort_by_reachability_preserves_iron_law(tmp_path: Path) -> None:
 
 
 def test_cli_filter_controllability_floats_never_reduces(tmp_path: Path) -> None:
-    # ★ 步骤 2.5: --filter controllability=free is now a circle-and-weight lens — the free candidate
+    # ★ --filter controllability=free is now a circle-and-weight lens — the free candidate
     # FLOATS to the top, but the non-free one STAYS listed (corpus whole, header shows the full 2).
     conn = _atlas(tmp_path)
     p = _pattern(conn, "fp", sink_class="cmd", source_class="external_input")
@@ -1440,7 +1440,7 @@ def test_cli_view_help_lists_when_to_use() -> None:
 
 
 def test_cli_view_reachable_only_alias_resolves_to_reachable_first(tmp_path: Path) -> None:
-    # ★ 2.5.1: reachable-only is a deprecated alias — both --view spellings resolve to the same
+    # ★ reachable-only is a deprecated alias — both --view spellings resolve to the same
     # preset, produce byte-identical output, and keep the corpus whole (float, never prune).
     conn = _atlas(tmp_path)
     _mk_reach_corpus(conn)
@@ -1650,7 +1650,7 @@ _SIBLING_SRC = {"kind": "call_return", "callee": "nvram_get", "const_args": ["si
 
 
 def test_nvram_source_key_reads_only_its_own_sinks_provenance() -> None:
-    """G1. sink_arg_provenance is stored per FUNCTION, so a function that formats and then executes
+    """sink_arg_provenance is stored per FUNCTION, so a function that formats and then executes
     carries a record for each. Reading them unscoped named the command candidate for a key that
     reaches the sprintf beside it, and that key is what floats a candidate into the nvram-source
     lens -- so a borrowed key put it in a view it does not belong in.
@@ -1664,7 +1664,7 @@ def test_nvram_source_key_reads_only_its_own_sinks_provenance() -> None:
 
 
 def test_source_origin_reads_only_its_own_sinks_provenance(tmp_path: Path) -> None:
-    """G2. An origin says where THIS candidate's value came from. A sibling sink's origin is not a
+    """An origin says where THIS candidate's value came from. A sibling sink's origin is not a
     weaker answer to that question, it is an answer to a different one.
 
     MUTATION (must go RED): drop sink_anchor from the _provenance_origins call in source_origin."""
@@ -1680,7 +1680,7 @@ def test_source_origin_reads_only_its_own_sinks_provenance(tmp_path: Path) -> No
 
 
 def test_provenance_consumers_never_fabricate_for_an_unrecorded_sink(tmp_path: Path) -> None:
-    """G3. With no record for the anchored sink the honest answer is nothing: no key, no origin.
+    """With no record for the anchored sink the honest answer is nothing: no key, no origin.
     Not attributed beats attributed to a neighbour -- the borrowed answer reads as a finding about
     this candidate, and a reader has no way to see that it came from another call.
 
@@ -1695,7 +1695,7 @@ def test_provenance_consumers_never_fabricate_for_an_unrecorded_sink(tmp_path: P
 
 
 def test_dispatch_origins_are_deliberately_not_sink_scoped(tmp_path: Path) -> None:
-    """G4, the reverse gate. A string-keyed dispatch lead says which key routes to the FUNCTION, so
+    """The reverse gate. A string-keyed dispatch lead says which key routes to the FUNCTION, so
     it is the same fact for every candidate in it and has no sink to be scoped by. Scoping it too
     would drop a real lead from every candidate whose own sink has no def-use record.
 
@@ -1720,7 +1720,7 @@ def test_dispatch_origins_are_deliberately_not_sink_scoped(tmp_path: Path) -> No
 
 
 def test_provenance_consumers_without_an_anchor_keep_the_unscoped_reading(tmp_path: Path) -> None:
-    """G5, mirroring the writer layer's own no-anchor guard. No candidate in the scanned firmware
+    """This mirrors the writer layer's own no-anchor guard. No candidate in the scanned firmware
     reaches this branch (every stored candidate carries a sink_anchor), so it cannot be checked
     against data at all -- which is exactly why it needs a test. Nothing to scope BY means keeping
     the reading this has always had, not being forced to empty by a scope that cannot apply.
@@ -1754,7 +1754,7 @@ def _rclass(tmp_path: Path, sink: str, value: object, kind: str = "constant") ->
 def test_variadic_format_command_with_an_injectable_conversion_is_not_constant(
     tmp_path: Path,
 ) -> None:
-    """G1. doSystem is printf-style variadic: arg0 is a TEMPLATE, and proving the template constant
+    """doSystem is printf-style variadic: arg0 is a TEMPLATE, and proving the template constant
     says nothing about the vararg it splices. ``doSystem("reboot %s", user)`` was reported
     controllability=constant -- this phase's only proven-safe fact, which sinks a candidate under
     every lens and every filter -- on evidence that never looked at the injected operand.
@@ -1768,7 +1768,7 @@ def test_variadic_format_command_with_an_injectable_conversion_is_not_constant(
 
 
 def test_variadic_format_command_with_no_conversion_stays_constant(tmp_path: Path) -> None:
-    """G2. The downgrade reads the template's CONTENT, unlike the exec law beside it. A variadic
+    """The downgrade reads the template's CONTENT, unlike the exec law beside it. A variadic
     command that splices nothing really does run verbatim, and demoting it would be the mirror
     error -- a wrong demotion hides a real constant behind a '?'.
 
@@ -1777,14 +1777,14 @@ def test_variadic_format_command_with_no_conversion_stays_constant(tmp_path: Pat
 
 
 def test_a_numeric_conversion_does_not_make_a_command_injectable(tmp_path: Path) -> None:
-    """G3. %d/%u/%f emit digits: no shell metacharacter, no command name, nothing to splice.
+    """%d/%u/%f emit digits: no shell metacharacter, no command name, nothing to splice.
 
     MUTATION (must go RED): add "d" to _INJECTABLE_CONVERSIONS."""
     assert _rclass(tmp_path, _DOSYS, "sleep %d") == "const"
 
 
 def test_a_literal_percent_is_not_a_conversion(tmp_path: Path) -> None:
-    """G4. ``%%`` consumes no argument, so it splices nothing. Asserted through the shared format
+    """``%%`` consumes no argument, so it splices nothing. Asserted through the shared format
     scanner rather than a local rule -- a second parser here would drift from the one every other
     reader uses, and then two layers would disagree about the same template.
 
@@ -1797,7 +1797,7 @@ def test_a_literal_percent_is_not_a_conversion(tmp_path: Path) -> None:
 
 
 def test_a_non_variadic_shell_sink_keeps_its_literal_percent(tmp_path: Path) -> None:
-    """G5. ``system("echo %s done")`` really is a constant command: the shell runs that text
+    """``system("echo %s done")`` really is a constant command: the shell runs that text
     verbatim, nothing consumes the conversion. Only a VARIADIC sink -- where arg0 is the format and
     the varargs bypass the writer path -- earns the downgrade, which is why the set is a literal
     and not every shell sink. On the scanned firmware the only constant system templates carrying a
@@ -1809,7 +1809,7 @@ def test_a_non_variadic_shell_sink_keeps_its_literal_percent(tmp_path: Path) -> 
 
 
 def test_format_command_sink_set_is_hand_maintained(tmp_path: Path) -> None:
-    """G6. The set is a literal, not a slice of CMD -- a derived set would make this guard compare a
+    """The set is a literal, not a slice of CMD -- a derived set would make this guard compare a
     value against itself, and the question it answers (is arg0 a format template?) is not the
     question CMD answers (is this a command sink?).
 
@@ -1824,7 +1824,7 @@ def test_format_command_sink_set_is_hand_maintained(tmp_path: Path) -> None:
 
 
 def test_injectable_conversion_set_is_the_written_down_one(tmp_path: Path) -> None:
-    """G11. The membership lock, mirroring the one on the multi-arg exec set: the set is a decision
+    """The membership lock, mirroring the one on the multi-arg exec set: the set is a decision
     about which conversions are attacker-shaped, so it is pinned against a list written here by
     hand. Widening it silently would demote real constants; narrowing it silently would restore the
     certification this exists to refuse.
@@ -1844,7 +1844,7 @@ def test_injectable_conversion_set_is_the_written_down_one(tmp_path: Path) -> No
 
 
 def test_injectable_conversions_are_matched_case_folded(tmp_path: Path) -> None:
-    """G8/G9/G10. %X is %x, and the pointer and write primitives count too: %p is attacker-shaped
+    """%X is %x, and the pointer and write primitives count too: %p is attacker-shaped
     and non-constant inside a command, %n writes.
 
     MUTATION (must go RED): drop the .lower(), or drop "p" / "n" from the set."""
@@ -1871,7 +1871,7 @@ def test_an_unreadable_template_is_a_registered_gap_not_a_judgement(tmp_path: Pa
 def test_a_variadic_format_command_is_no_longer_certified_safe_end_to_end(
     tmp_path: Path,
 ) -> None:
-    """G7. The wiring gate: the marker exit, the def-use constant exit and the parallel
+    """The wiring gate: the marker exit, the def-use constant exit and the parallel
     'constrained' exit all read the same has_unsafe_record, so downgrading the record at their
     shared upstream closes every one of them. The fixture carries the real shape -- a stored
     const_sink_arg marker -- so a fix that only reached one door would still show here.
@@ -1902,7 +1902,7 @@ def test_a_variadic_format_command_is_no_longer_certified_safe_end_to_end(
     assert _float_by_dimension([c], [("source", "param")]) == [c]
 
 
-# ── B2: per-callsite provenance — the ref-address readers (callsite_abs_addr / _record_addr) ──
+# ── per-callsite provenance — the ref-address readers (callsite_abs_addr / _record_addr) ──
 
 
 def _round_trip_ref(sink_class: str, func_entry: int, sink_addr: int) -> str:

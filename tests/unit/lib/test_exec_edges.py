@@ -514,7 +514,7 @@ def test_parse_of_empty_command_yields_an_empty_first_word() -> None:
 
 
 def test_a_script_without_a_dot_sh_suffix_still_resolves() -> None:
-    # ★ C1. A script invoked as a program is usually the one with NO suffix — an init.d entry, an
+    # ★ A script invoked as a program is usually the one with NO suffix — an init.d entry, an
     # sbin helper. Demanding `.sh` on top of inventory membership pushed those into `unmatched`,
     # which reads as "I do not recognize this token" about a file the inventory holds by name.
     #
@@ -527,7 +527,7 @@ def test_a_script_without_a_dot_sh_suffix_still_resolves() -> None:
 
 
 def test_single_path_script_records_the_path_so_the_edge_is_answerable() -> None:
-    # ★ A2. A resolved script edge used to leave target_binary NULL, so the read tool — which looks
+    # ★ A resolved script edge used to leave target_binary NULL, so the read tool — which looks
     # up by that column — could never answer for a script. The path is what gets recorded, not the
     # token: a third of these tokens are bare, and storing whichever spelling the callsite happened
     # to use would fill one column with two kinds of key.
@@ -559,7 +559,7 @@ def test_a_name_held_by_several_scripts_is_left_unpicked() -> None:
 
 
 def test_script_edge_answers_to_both_its_short_name_and_its_path(tmp_path: Path) -> None:
-    # ★ A2-r. Storing scripts by path makes the lookup key heterogeneous: binaries answer to a
+    # ★ Storing scripts by path makes the lookup key heterogeneous: binaries answer to a
     # short name, scripts to a path. A reader asking `launched_by("readmac")` would get 0 rows and
     # read it as "nothing launches it" — the exact misreading this whole surface exists to prevent.
     # A short name is therefore matched against the stored path's basename as well.
@@ -641,7 +641,7 @@ def _seeded_atlas(tmp_path: Path) -> Any:
 
 
 def test_a_token_copied_verbatim_out_of_an_edge_finds_that_edge(tmp_path: Path) -> None:
-    # ★ P1. The spelling a reader has in hand is the edge's own target_token — the code's own text,
+    # ★ The spelling a reader has in hand is the edge's own target_token — the code's own text,
     # so it carries a leading slash. Targets are stored the way the inventory holds them, which
     # never does. Both stored shapes must answer that query, or the reader gets a zero and reads it
     # as "nothing launches this" — the misreading this whole surface exists to prevent.
@@ -781,7 +781,7 @@ def test_status_detail_rides_only_with_an_empty_answer(tmp_path: Path) -> None:
 
 
 def test_constant_argument_is_substituted_back_into_the_template() -> None:
-    # ★ B1. `snprintf(buf, "%s '%s'", "/usr/sbin/tool -j", user)` builds a command whose first word
+    # ★ `snprintf(buf, "%s '%s'", "/usr/sbin/tool -j", user)` builds a command whose first word
     # is a conversion, so the template alone resolves to nothing — while the program name sits
     # right there as a constant argument. Substituting the constants recovers it.
     #

@@ -149,7 +149,7 @@ def test_non_copy_sink_is_untraced() -> None:
 
 
 def test_each_call_is_classified_on_its_own_length() -> None:
-    """INV-2. The length belongs to the CALL, so ``occurrence`` selects which call is read.
+    """The length belongs to the CALL, so ``occurrence`` selects which call is read.
 
     The first copy below is a fixed 4 bytes and the second a caller-supplied length. Reading only
     the first reports ``const`` for both — and ``const`` is a marker that sinks a candidate out of
@@ -247,7 +247,7 @@ def test_reading_a_fixed_argument_position_would_read_the_format_string() -> Non
 
 
 def test_no_formatter_length_can_demote_a_candidate() -> None:
-    """MC-a2, at the source: none of the five kinds carries a form note, structurally.
+    """At the source: none of the five kinds carries a form note, structurally.
 
     Only a length that PROVES the total write is bounded may demote, and none of these does — a cap
     leaves the destination's size unknown, an append leaves the total unknown, and no_bound is the

@@ -518,7 +518,7 @@ def test_patch_elf_patched_file_has_same_name(tmp_path: Path) -> None:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-# ── Fix A: extraction-pass content hash (cache-key dimension) ─────────────────
+# ── extraction-pass content hash (cache-key dimension) ────────────────────────
 
 
 def test_compute_pass_version_changes_when_pass_edited(tmp_path: Path) -> None:
@@ -561,7 +561,7 @@ def test_runner_pass_version_matches_its_script_dir(tmp_path: Path) -> None:
     assert runner.pass_version() == compute_pass_version(d)
 
 
-# ── iron law 6: Ghidra-version detection ────────────────
+# ── Ghidra-version detection ────────────────────────────
 
 
 def test_detect_ghidra_version_reads_application_properties(tmp_path: Path) -> None:
@@ -606,7 +606,7 @@ def test_detect_ghidra_version_missing_key_is_unknown(tmp_path: Path) -> None:
     assert detect_ghidra_version(home / "support" / "analyzeHeadless") == UNKNOWN_VERSION
 
 
-# ── large-firmware scaling (Fix ②): reason, dynamic timeout, two-phase serial retry ──
+# ── large-firmware scaling: reason, dynamic timeout, two-phase serial retry ──
 
 
 def _sized_file(path: Path, mb: int) -> Path:
@@ -1043,7 +1043,7 @@ def test_run_all_refuses_a_malformed_registry_before_any_jvm(tmp_path: Path) -> 
     assert calls == []
 
 
-# ── R5: a launch failure is not a timeout; Ghidra's own analysis timeout is one ──────
+# ── a launch failure is not a timeout; Ghidra's own analysis timeout is one ──────────
 
 
 def test_a_launch_failure_is_not_a_timeout(tmp_path: Path) -> None:

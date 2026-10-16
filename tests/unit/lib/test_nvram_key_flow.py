@@ -161,7 +161,7 @@ def test_parametric_template_match_is_flagged_separately(tmp_path: Path) -> None
 
 
 def test_anchorless_template_never_false_matches(tmp_path: Path) -> None:
-    # 缺口 (probe): an over-broad %s%s "template" regex-matches ANY key. It must NOT surface as a
+    # An over-broad %s%s "template" regex-matches ANY key. It must NOT surface as a
     # possible match for a random key — the query rejects anchorless templates (defense-in-depth,
     # even if a stale row stored one as parametric).
     atlas = _seed(
@@ -285,7 +285,7 @@ def test_direct_writer_but_no_direct_reader_warns_wrapper(tmp_path: Path) -> Non
     assert any("empty readers" in n and "non-literal" in n for n in res["notes"])
 
 
-# ── web_settable: source-side writability by the SaTC front-end x back-end cross (M2) ──
+# ── web_settable: source-side writability by the SaTC front-end x back-end cross ───────
 
 
 def test_web_settable_yes_when_frontend_editable_and_backend_key(tmp_path: Path) -> None:
@@ -362,7 +362,7 @@ def test_web_settable_naming_variant_evidence_is_tagged(tmp_path: Path) -> None:
 
 
 def test_web_settable_three_state_never_emits_no(tmp_path: Path) -> None:
-    # ④/M2 THREE-STATE {yes, likely, uncertain}: back-end-only (fwrev, a read-only display) and
+    # THREE-STATE {yes, likely, uncertain}: back-end-only (fwrev, a read-only display) and
     # front-end-only (Link_btn, a UI control), NEITHER a router_defaults member (no defaults
     # seeded -> table not located), both land 'uncertain' — NEVER 'no' (inferring 'not settable'
     # from a missing side is a false-negative) and NEVER 'likely' (not a defaults member). The
@@ -387,7 +387,7 @@ def test_web_settable_three_state_never_emits_no(tmp_path: Path) -> None:
 
 
 def test_web_settable_likely_when_router_defaults_member_but_not_a_cross(tmp_path: Path) -> None:
-    # M2 positive: a key that is NOT a proven SaTC cross (back-end read only, no editable front-end
+    # Positive: a key that is NOT a proven SaTC cross (back-end read only, no editable front-end
     # field) but IS a router_defaults member -> 'likely' (the OAuth shape: acct_link_code is
     # read back-end and sits in router_defaults, but is not a front-end form field).
     atlas = _seed(
@@ -406,9 +406,9 @@ def test_web_settable_likely_when_router_defaults_member_but_not_a_cross(tmp_pat
 
 
 def test_web_settable_not_likely_when_not_a_router_defaults_member(tmp_path: Path) -> None:
-    # ★ SEAM #13 guardrail: a key that is NOT a router_defaults member (the table is located AND
+    # ★ Guardrail: a key that is NOT a router_defaults member (the table is located AND
     # complete, another key is present) must NOT read 'likely' — it stays 'uncertain'. This is the
-    # M3 red line in test form: the likely gate is in_router_defaults membership ONLY, never
+    # red line in test form: the likely gate is in_router_defaults membership ONLY, never
     # widened. log_radiostat_dir / modelcode are exactly this internal-key case.
     atlas = _seed(
         tmp_path,
@@ -426,7 +426,8 @@ def test_web_settable_not_likely_when_not_a_router_defaults_member(tmp_path: Pat
 
 
 def test_web_settable_uncertain_when_frontend_not_collected(tmp_path: Path) -> None:
-    # ★ false-negative red line: no web_form_fields rows (M1 not run) -> uncertain, NEVER 'no'.
+    # ★ false-negative red line: no web_form_fields rows (front end not collected) -> uncertain,
+    # NEVER 'no'.
     atlas = _seed(tmp_path, [_flow("node_role", "constant", "rc", "set_mode", "write")])
     conn = open_atlas(atlas)
     try:

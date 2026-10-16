@@ -1,6 +1,6 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for the raw data-segment byte substrate (A1): the Ghidra ``data_blocks`` export ->
+"""Unit tests for the raw data-segment byte substrate: the Ghidra ``data_blocks`` export ->
 analysis.db ingest -> ``facts.get_data_bytes`` read path.
 
 The point of the feature is that the decompiler renders a data-segment constant as a bare
@@ -447,7 +447,8 @@ def test_undecodable_transport_is_flagged_not_stored_as_empty(tmp_path: Path) ->
 
 
 def test_absent_data_blocks_key_contributes_no_rows(tmp_path: Path) -> None:
-    # "缺失 -> 贡献 0 行": a pre-feature export writes no placeholder row it could later be read as.
+    # Absent key -> contributes 0 rows: a pre-feature export writes no placeholder row it could
+    # later be read as.
     db = _ingest(tmp_path, None)
     conn = _ro(db)
     try:

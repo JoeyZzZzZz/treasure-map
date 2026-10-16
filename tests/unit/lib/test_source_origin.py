@@ -468,11 +468,11 @@ def test_surfaced_by_both_consumers(tmp_path: Path) -> None:
     assert {o["axis"] for o in ex.source_origin["origins"]} == {"dispatch", "nvram"}
 
 
-# ── B2: both the origin list and the nvram key scope to the candidate's own callsite ─────────
+# ── both the origin list and the nvram key scope to the candidate's own callsite ─────────────
 
 
 def test_source_origin_and_nvram_key_scope_to_their_own_callsite(tmp_path: Path) -> None:
-    """B2 #10. Two calls to the same sink in one function, each reading a DIFFERENT nvram key:
+    """Two calls to the same sink in one function, each reading a DIFFERENT nvram key:
     scoped to a call's own address, source_origin and _nvram_source_key report only that call's key.
     Unscoped, both keys surface and _nvram_source_key returns whichever resolves first.
 

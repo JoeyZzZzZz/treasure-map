@@ -407,7 +407,7 @@ def test_the_blanket_note_now_names_the_bare_form_note() -> None:
 
 
 def test_the_write_length_kinds_partition_into_demotable_and_not() -> None:
-    """MC-a4. Every write-length kind is written out here, on the side it belongs to.
+    """Every write-length kind is written out here, on the side it belongs to.
 
     The two halves are different claims, and only one of them may cost a candidate its place:
 

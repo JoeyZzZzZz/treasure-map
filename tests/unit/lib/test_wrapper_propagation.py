@@ -1,10 +1,11 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for lib/hunt/wrapper_propagation — factor ① one-hop thin-wrapper propagation.
+"""Unit tests for lib/hunt/wrapper_propagation — one-hop thin-wrapper propagation.
 
-Synthetic, vendor-neutral FuncRows. The finder recovers the D-2 blind spot (a function whose
-command sink hides inside a thin wrapper it calls) while staying narrow: one hop, intra-binary,
-and only for functions that have no command sink of their own. These tests pin that boundary.
+Synthetic, vendor-neutral FuncRows. The finder recovers the thin-wrapper blind spot (a function
+whose command sink hides inside a thin wrapper it calls) while staying narrow: one hop,
+intra-binary, and only for functions that have no command sink of their own. These tests pin that
+boundary.
 """
 
 from __future__ import annotations
@@ -184,12 +185,13 @@ def test_deterministic_wrapper_pick_when_several() -> None:
     assert [(c.wrapper_name, c.occurrence) for c in cands] == [("do_cmd", 0), ("run_sh", 0)]
 
 
-# ── the format-string axis (缺口①): symmetric one-hop propagation through a thin fmt wrapper ──
+# ── the format-string axis: symmetric one-hop propagation through a thin fmt wrapper ────────
 
 
 def test_caller_of_thin_fmt_wrapper_becomes_fmt_candidate() -> None:
-    # The D-2 blind spot on the format-string axis: f builds a message and forwards it to a thin
-    # format wrapper; the printf-family sink lives inside the wrapper, invisible to the shape scan.
+    # The same thin-wrapper blind spot on the format-string axis: f builds a message and forwards it
+    # to a thin format wrapper; the printf-family sink lives inside the wrapper, invisible to the
+    # shape scan.
     caller = _fn(
         2,
         "handle_req",

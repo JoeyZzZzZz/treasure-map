@@ -789,7 +789,7 @@ def test_reverse_missing_row_mapped_to_declared_absent_would_be_wrong(tmp_path: 
     con.close()
 
 
-# ── Item 1: every triage dimension is VISIBLE (no gap-by-absence) + a mechanical coverage guard ──
+# ── every triage dimension is VISIBLE (no gap-by-absence) + a mechanical coverage guard ──
 
 
 def test_all_eight_triage_dimensions_are_visible(tmp_path: Path) -> None:
@@ -885,7 +885,7 @@ def test_no_declared_dimension_is_a_phantom_top_level(tmp_path: Path) -> None:
         )
 
 
-# ── Item 2: iron law 6 (version skew) degrades edge deltas; reverse proves the guard acts ──
+# ── iron law: version skew degrades edge deltas; reverse proves the guard acts ──
 
 
 def test_version_skew_degrades_every_edge_subject(tmp_path: Path) -> None:

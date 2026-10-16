@@ -13,7 +13,7 @@ from click.testing import CliRunner
 from treasure_map.cli import mcp_cli
 from treasure_map.cli.main import main
 
-# ── A1: shortened names listed; old names resolve but hidden ────────────────────────────
+# ── shortened names listed; old names resolve but hidden ────────────────────────────────
 
 
 def test_short_names_registered_old_names_hidden() -> None:
@@ -67,7 +67,7 @@ def test_old_names_still_resolve(old: str, new: str) -> None:
     assert r_old.output.split("\n", 1)[1] == r_new.output.split("\n", 1)[1]
 
 
-# ── A2: `tmap mcp` binds the ATLAS (from pointer/config); no firmware preselected ────────
+# ── `tmap mcp` binds the ATLAS (from pointer/config); no firmware preselected ────────────
 
 
 def test_mcp_target_atlas_from_pointer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -106,7 +106,7 @@ def test_mcp_no_pointer_falls_back_to_configured_atlas(
     assert atlas_out.endswith("atlas.db")  # the configured atlas, not a traceback
 
 
-# ── A3: stderr launch hint (mcp is a core dep — no missing-extra path to test) ───────────
+# ── stderr launch hint (mcp is a core dep — no missing-extra path to test) ───────────────
 
 
 def test_mcp_stderr_launch_hint(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -46,7 +46,7 @@ def _mkdb(tmp_path: Path) -> Path:
         "VALUES (3, 2, 'foo_entry', '0x500', 'int foo_entry(){}', '[]', 1)"
     )
     # a function whose address is stored in the real zero-padded 8-hex form (0040a020), with no
-    # caller of any kind: exercises address normalization (item 1) and the indirect-call note (2).
+    # caller of any kind: exercises address normalization and the indirect-call note.
     conn.execute(
         "INSERT INTO functions (id, binary_id, name, address, pseudocode, callees, is_exported) "
         "VALUES (4, 1, 'linktool_handler', '0040a020', 'int linktool_handler(){}', '[]', 0)"
@@ -206,10 +206,10 @@ def test_get_xrefs_callers_and_callees_cross_binary(tmp_path: Path) -> None:
 
 
 def test_get_xrefs_address_taken_literalpool_names_the_registrar(tmp_path: Path) -> None:
-    # ★ flagship shape (the notifyagent case): F's address is taken in a .text literal-pool
-    # `ldr =F` inside a registrar, so taken_in_func names WHO registered F — the answer get_xrefs
-    # callers can't give (a runtime/heap registration has no direct caller edge). taken_at is
-    # canonicalized with the SAME _norm_addr as evidence_ref (0x-free, zero-padded 8-hex).
+    # ★ flagship shape: F's address is taken in a .text literal-pool `ldr =F` inside a registrar, so
+    # taken_in_func names WHO registered F — the answer get_xrefs callers can't give (a runtime/heap
+    # registration has no direct caller edge). taken_at is canonicalized with the SAME _norm_addr as
+    # evidence_ref (0x-free, zero-padded 8-hex).
     conn = _ro(tmp_path)
     r = facts.get_xrefs(conn, func="dispatch_handler_a", direction="address_taken")
     assert r["direction"] == "address_taken"
@@ -476,7 +476,7 @@ def test_get_strings_value_mode_unresolved_func_is_surfaced(tmp_path: Path) -> N
 
 
 def test_get_strings_byte_pagination_reaches_the_tail_losslessly(tmp_path: Path) -> None:
-    # ★ M6: a large result is paged LOSSLESSLY by byte size — the tail is REACHABLE via
+    # ★ a large result is paged LOSSLESSLY by byte size — the tail is REACHABLE via
     # paging.next_offset, NOTHING summarized. A tiny max_chars forces one row per page.
     conn = facts.open_analysis_ro(_strings_db(tmp_path))
     p1 = facts.get_strings(conn, binary="rc", max_chars=1)
@@ -497,7 +497,7 @@ def test_get_strings_byte_pagination_reaches_the_tail_losslessly(tmp_path: Path)
 
 
 def test_get_strings_function_scope_is_honest_not_applied(tmp_path: Path) -> None:
-    # ★ 3.1 declared≠actual: `function` is echoed but does NOT scope strings (no string->func index;
+    # ★ declared≠actual: `function` is echoed but does NOT scope strings (no string->func index;
     # .rodata addresses fall outside code ranges). BOTH modes carry func_scope_applied:false + a
     # note that says so, so a machine consumer never reads the echoed function as a scoping promise.
     conn = facts.open_analysis_ro(_strings_db(tmp_path))
@@ -596,7 +596,7 @@ def test_get_disassembly_degrades_honestly(tmp_path: Path) -> None:
     conn.close()
 
 
-# ── get_functions_referencing_string: pseudocode-text reverse lookup (缺口①) ────────────
+# ── get_functions_referencing_string: pseudocode-text reverse lookup ──────────────────
 
 
 def _mk_refdb(tmp_path: Path) -> Path:
@@ -740,7 +740,7 @@ def test_referencing_string_empty_text_is_rejected(tmp_path: Path) -> None:
     assert r["found"] is False
 
 
-# ── iron law 6: the per-run Ghidra-version rollup ──────
+# ── the per-run Ghidra-version rollup: a run's recorded version is never NULL ──
 
 
 def test_run_ghidra_version_rollup_is_the_never_null_sentinel(tmp_path: Path) -> None:

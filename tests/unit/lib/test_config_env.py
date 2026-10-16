@@ -1,6 +1,6 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for _source_env_file and AtlasConfig (M2 Step 2 config additions)."""
+"""Unit tests for _source_env_file and AtlasConfig."""
 
 from __future__ import annotations
 

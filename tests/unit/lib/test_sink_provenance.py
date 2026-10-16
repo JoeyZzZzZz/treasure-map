@@ -254,7 +254,7 @@ def test_get_sink_provenance_returns_full_writer_detail(tmp_path: Path) -> None:
 
 
 def test_call_return_unresolved_args_flag_survives_to_agent(tmp_path: Path) -> None:
-    # Honesty (缺口 A): a getter callsite with a non-constant argument omits it from const_args
+    # Honesty: a getter callsite with a non-constant argument omits it from const_args
     # but flags has_unresolved_args + arg_count (ExportFunctions). The read side must pass BOTH
     # through verbatim so the agent never reads const_args as the FULL argument list — e.g.
     # custom_get("some_key", param_2) where param_2 is caller-controlled.
@@ -476,8 +476,8 @@ def test_fmt_arity_counts_conversions_and_star_args() -> None:
 
 
 # ── _writer_args_class: the SINGLE classifier (const / controllable / unknown), value_kind-aware ─
-# The single verdict's de-optimism: a bare call_return / param is NO LONGER controllable. This phase
-# the ONLY controllable class is a WEB-SETTABLE key (⑦ registry) — external readers (getenv/recv)
+# The single verdict's de-optimism: a bare call_return / param is NO LONGER controllable. Currently
+# the ONLY controllable registry class is a WEB-SETTABLE key — external readers (getenv/recv)
 # are a FUTURE class, so they read 'unknown' now. The acon fixture seeds one web-settable key
 # (rpt_comment) so a controllable case is testable; an unseeded key reads uncertain -> not control.
 
@@ -529,12 +529,12 @@ def test_wac_bare_call_return_and_param_are_unknown_not_controllable(acon: Any) 
 
 
 def test_wac_web_settable_key_is_controllable(acon: Any) -> None:
-    # This phase's ONLY controllable class: a const_args key that crosses to web_settable=yes.
+    # The ONLY controllable class today: a const_args key that crosses to web_settable=yes.
     assert _writer_args_class(acon, "%s", [_webkey("rpt_comment")]) == "controllable"
 
 
 def test_wac_external_reader_is_deferred_not_controllable_this_phase(acon: Any) -> None:
-    # ⑦ getenv/recv/external are a FUTURE registry class -> 'unknown' now (a row in
+    # getenv/recv/external are a FUTURE registry class -> 'unknown' now (a row in
     # _CALL_RETURN_CLASSIFIERS later), never silently promoted before their class exists.
     assert _writer_args_class(acon, "%s", [_src("call_return", callee="getenv")]) == "unknown"
     assert _writer_args_class(acon, "%s", [_src("external_input")]) == "unknown"
@@ -643,7 +643,7 @@ _BORROWABLE = [
 
 
 def test_get_sink_provenance_scopes_the_origin_to_the_candidates_own_sink(tmp_path: Path) -> None:
-    """G6. The origin travels beside the records, so it is a candidate-level fact and answers for
+    """The origin travels beside the records, so it is a candidate-level fact and answers for
     the candidate's anchored sink -- including when a sink_idx selects another record, because the
     records are addressable by idx on their own and the origin is not one of them.
 
@@ -661,7 +661,7 @@ def test_get_sink_provenance_scopes_the_origin_to_the_candidates_own_sink(tmp_pa
 
 
 def test_triage_candidate_does_not_borrow_a_sibling_sinks_nvram_key(tmp_path: Path) -> None:
-    """G7, the wiring gate. The scoped readers take the anchor as a required argument, which stops
+    """The wiring gate. The scoped readers take the anchor as a required argument, which stops
     a caller forgetting it -- but not a caller passing one that is silently None, and the explain
     path reads the column through a helper that returns None for a column it did not select. Only
     an end-to-end assertion catches that, so this one runs the real triage() over a real instance.
@@ -677,8 +677,9 @@ def test_triage_candidate_does_not_borrow_a_sibling_sinks_nvram_key(tmp_path: Pa
 
 
 def test_explain_candidate_does_not_borrow_a_sibling_sinks_origin(tmp_path: Path) -> None:
-    """G8, the other half of the wiring gate -- the explain path reaches source_origin through its
-    own call site, so G7 passing says nothing about this one.
+    """The other half of the wiring gate -- the explain path reaches source_origin through its own
+    call site, so test_triage_candidate_does_not_borrow_a_sibling_sinks_nvram_key passing says
+    nothing about this one.
 
     MUTATION (must go RED): pass None as the anchor at the explain_candidate call site -> the
     sibling's nvram origin reappears as this candidate's."""
@@ -689,7 +690,7 @@ def test_explain_candidate_does_not_borrow_a_sibling_sinks_origin(tmp_path: Path
     conn.close()
 
 
-# ── B2: is_candidate_callsite — the detail marks the record each dimension reads from ────────
+# ── is_candidate_callsite — the detail marks the record each dimension reads from ────────────
 
 
 def _addr_ref(func_entry: int, sink_addr: int, sink_class: str = "cmd") -> str:
@@ -703,7 +704,7 @@ def _addr_ref(func_entry: int, sink_addr: int, sink_class: str = "cmd") -> str:
 
 
 def test_summary_candidate_callsite_flag_present_only_with_an_address(tmp_path: Path) -> None:
-    """B2 #11. _sink_provenance_summary adds ``is_candidate_callsite`` ONLY when given a callsite
+    """_sink_provenance_summary adds ``is_candidate_callsite`` ONLY when given a callsite
     address, on exactly the record that is the candidate's own (anchored sink name AND matching
     address). Function-level (no address) omits the key entirely.
 
@@ -733,7 +734,7 @@ def test_summary_candidate_callsite_flag_present_only_with_an_address(tmp_path: 
 
 
 def test_get_sink_provenance_marks_candidate_callsite_end_to_end(tmp_path: Path) -> None:
-    """B2 wiring. get_sink_provenance reads the address out of its evidence_ref and flags the one
+    """Wiring. get_sink_provenance reads the address out of its evidence_ref and flags the one
     record that is the candidate's own callsite; a function-level ref adds no flag at all.
 
     MUTATION (must go RED): drop `callsite_addr=callsite_addr` from get_sink_provenance's _marked /
@@ -766,7 +767,7 @@ def test_get_sink_provenance_marks_candidate_callsite_end_to_end(tmp_path: Path)
 
 
 def test_get_sink_provenance_adds_no_flag_for_a_function_level_ref(tmp_path: Path) -> None:
-    """B2 #11 / baseline. A function-level ref leaves the records byte-identical — no new key."""
+    """Baseline. A function-level ref leaves the records byte-identical — no new key."""
     prov = [
         {"sink": "system", "sink_idx": 0, "sink_addr": "0x100", "provenance": {"kind": "constant"}},
     ]
@@ -780,7 +781,7 @@ def test_get_sink_provenance_adds_no_flag_for_a_function_level_ref(tmp_path: Pat
 
 
 def test_explain_candidate_summary_marks_candidate_callsite_end_to_end(tmp_path: Path) -> None:
-    """B2 wiring. explain_candidate threads the ref address into the sink_arg_provenance_summary, so
+    """Wiring. explain_candidate threads the ref address into the sink_arg_provenance_summary, so
     the entry each dimension is read from is flagged; a function-level ref leaves it unflagged.
 
     MUTATION (must go RED): drop `callsite_addr=callsite_addr` from explain_candidate's

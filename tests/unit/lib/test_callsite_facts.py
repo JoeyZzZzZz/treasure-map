@@ -68,7 +68,7 @@ def _message(*insns: bytes, before: bytes = b"", after: bytes = b"") -> bytes:
     return before + b"".join(insns) + after
 
 
-# ── T12: the BinExport2 reader ─────────────────────────────────────────────────────────────
+# ── the BinExport2 reader ──────────────────────────────────────────────────────────────────
 
 
 def test_implicit_addresses_follow_the_previous_instruction_length() -> None:
@@ -142,7 +142,7 @@ def test_unreadable_file_is_a_decode_error(tmp_path: Path) -> None:
         bx.decode_call_targets(tmp_path / "missing.BinExport")
 
 
-# ── T2: call identity ──────────────────────────────────────────────────────────────────────
+# ── call identity ──────────────────────────────────────────────────────────────────────────
 
 
 def _facts(**kw: object) -> cf.BinaryCallFacts:
@@ -297,7 +297,7 @@ def test_facts_json_shapes(tmp_path: Path) -> None:
     assert cf.facts_json(not_read, "00001010", tg) is None
 
 
-# ── T3: the identity reader and the callsite enumerator agree on which call is which ──────────
+# ── the identity reader and the callsite enumerator agree on which call is which ──────────────
 
 
 def test_every_enumerated_call_resolves_to_its_own_name() -> None:
@@ -327,7 +327,7 @@ def test_every_enumerated_call_resolves_to_its_own_name() -> None:
     assert stub_resolved_name("thunk_FUN_00000400", stubs) is None
 
 
-# ── T14: written by the diff, with the pairs, in one transaction ─────────────────────────────
+# ── written by the diff, with the pairs, in one transaction ──────────────────────────────────
 
 
 def _bindiff(path: Path, hashes: tuple[str, str], pairs: list[tuple[int, int]]) -> Path:

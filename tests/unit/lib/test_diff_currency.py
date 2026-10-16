@@ -288,7 +288,7 @@ def _rehunt(w: _World, run: str) -> None:
     w.atlas.commit()
 
 
-# ── T1: the stamp columns, on a fresh atlas and on one from before them ─────────────────────────
+# ── the stamp columns, on a fresh atlas and on one from before them ─────────────────────────────
 
 
 def test_a_fresh_atlas_has_the_stamp_columns(tmp_path: Path) -> None:
@@ -342,7 +342,7 @@ def test_an_atlas_from_before_the_stamps_opens_and_keeps_its_rows(tmp_path: Path
             conn.close()
 
 
-# ── T2: the extraction stamps are compared by plain equality ─────────────────────────────────────
+# ── the extraction stamps are compared by plain equality ─────────────────────────────────────────
 
 
 @pytest.mark.parametrize(
@@ -449,7 +449,7 @@ def test_a_mixed_run_hash_warns_and_does_not_loop(
     assert _plan(w).already_ok == ("liba",)
 
 
-# ── T3: the hunt-input digest covers what the diff reads, and nothing else ───────────────────────
+# ── the hunt-input digest covers what the diff reads, and nothing else ───────────────────────────
 
 
 def _degraded_candidate(w: _World, addr: str) -> None:
@@ -522,7 +522,7 @@ def test_the_hunt_digest_covers_exactly_what_the_diff_reads(
     assert (digest() != before) is changes, what
 
 
-# ── T4 / T5: the diff code version, and content stays its own axis ───────────────────────────────
+# ── the diff code version, and content stays its own axis ────────────────────────────────────────
 
 
 def test_a_diff_from_other_diff_code_is_rediffed(
@@ -570,7 +570,7 @@ def test_the_stamps_are_read_inside_the_write_transaction(
     assert seen == [True]
 
 
-# ── T6: the attempt count continues only at the same content AND inputs ──────────────────────────
+# ── the attempt count continues only at the same content AND inputs ──────────────────────────────
 
 
 def test_attempts_continue_only_at_the_same_inputs(
@@ -637,7 +637,7 @@ def test_a_capped_failure_from_before_the_stamps_is_retried_once(
     assert _row(w)["diff_attempts"] == 2
 
 
-# ── T7: every diff read surface says whether the diff is still current ───────────────────────────
+# ── every diff read surface says whether the diff is still current ───────────────────────────────
 
 
 def _surfaces(w: _World) -> dict[str, tuple[Any, Any]]:
@@ -978,7 +978,7 @@ def test_a_run_pair_overlay_marks_each_row_by_its_own_diff(
     }
 
 
-# ── T8: the run pair is refused only on a proven mismatch ────────────────────────────────────────
+# ── the run pair is refused only on a proven mismatch ────────────────────────────────────────────
 
 
 def _out_of_date_extraction(w: _World) -> dict[str, str]:
@@ -1092,7 +1092,7 @@ def test_a_pair_with_nothing_left_to_diff_still_reports_its_warnings(
     assert fs.outcomes == () and fs.warnings
 
 
-# ── T9: a stored candidate baseline survives a re-diff, or its loss is visible ────────────────────
+# ── a stored candidate baseline survives a re-diff, or its loss is visible ────────────────────────
 
 
 def _baselined(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _World:
@@ -1714,7 +1714,7 @@ def test_a_toolchain_that_cannot_be_read_is_said_and_decides_nothing(
     assert (meta["source_stale"], meta["toolchain_checked"]) == (False, False)
 
 
-# ── T-golden: what the diff code writes for a fixed input ────────────────────────────────────────
+# ── the golden diff: what the diff code writes for a fixed input ─────────────────────────────────
 
 _GOLDEN_TABLES = (
     "diff_meta",

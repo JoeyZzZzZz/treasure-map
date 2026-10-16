@@ -338,10 +338,10 @@ def test_list_candidates_carries_anchor_entry_reach_and_note(tmp_path: Path) -> 
     (cand,) = out["candidates"]
     assert cand["evidence_ref"] == "run_m#fn1@cmd"  # anchor present
     assert "score" not in cand  # the collapsed score is gone
-    # compact row (M1): controllability is a spine state:value label (ALWAYS present); every other
-    # axis rides the AXIS-AGNOSTIC carry rule. entry:web is an established mechanistic label, so the
-    # row carries reachability=proven:entry:web — the cross-step seam (step-2's Dimension reaches
-    # the compact serializer) and sink_impact rides the same rule.
+    # compact row: controllability is a spine state:value label (ALWAYS present); every other axis
+    # rides the AXIS-AGNOSTIC carry rule. entry:web is an established mechanistic label, so the row
+    # carries reachability=proven:entry:web — the seam where the reachability Dimension reaches the
+    # compact serializer — and sink_impact rides the same rule.
     assert cand["controllability"] == "unknown:unknown"
     assert cand["dimensions"]["reachability"] == "proven:entry:web"
     assert cand["dimensions"]["sink_impact"] == "proven:cmd"
@@ -413,9 +413,9 @@ def _mk_multi_atlas(tmp_path: Path) -> Path:
 
 
 def test_list_candidates_filter_floats_corpus_invariant(tmp_path: Path) -> None:
-    # ★★ 步骤 2.5 M5-1b (gap #1 — the agent's ACTUAL surface): on MCP a --filter FLOATS, never
-    # reduces the corpus. source=nvram (the OAuth-hiding regression) keeps all 5; sink_impact=cmd
-    # returns the corpus (5) floated, NOT the 2 matches.
+    # ★★ the agent's ACTUAL surface: on MCP a --filter FLOATS, never reduces the corpus.
+    # source=nvram (the OAuth-hiding regression) keeps all 5; sink_impact=cmd returns the corpus (5)
+    # floated, NOT the 2 matches.
     tools = mcp_app.make_tools(_mk_multi_atlas(tmp_path))
     base = tools["list_candidates"](run_id="run_m")
     assert base["corpus"] == 5 and base["total"] == 5
@@ -428,8 +428,8 @@ def test_list_candidates_filter_floats_corpus_invariant(tmp_path: Path) -> None:
 
 
 def test_list_candidates_only_sweeps_and_refuses_on_mcp(tmp_path: Path) -> None:
-    # ★ 步骤 2.5 M2 on MCP: --only sweeps a ground-truth dim (corpus stays whole via `corpus`) and
-    # REFUSES an optimistic one with an error, never silently pruning it.
+    # ★ on MCP: --only sweeps a ground-truth dim (corpus stays whole via `corpus`) and REFUSES an
+    # optimistic one with an error, never silently pruning it.
     tools = mcp_app.make_tools(_mk_multi_atlas(tmp_path))
     swept = tools["list_candidates"](run_id="run_m", only="sink_class=cmd")
     assert swept["corpus"] == 5 and swept["total"] == 2  # corpus whole, view pruned to the sweep
@@ -439,8 +439,8 @@ def test_list_candidates_only_sweeps_and_refuses_on_mcp(tmp_path: Path) -> None:
 
 
 def test_list_candidates_carries_fingerprint_and_incomplete_field(tmp_path: Path) -> None:
-    # ★ Work item 6 + red-line honesty: each candidate carries its structural_fingerprint (pivot
-    # from cross_firmware_patterns), and the result carries an incomplete_binaries flag.
+    # ★ red-line honesty: each candidate carries its structural_fingerprint (pivot from
+    # cross_firmware_patterns), and the result carries an incomplete_binaries flag.
     tools = _tools(tmp_path)
     # scoped to run_m, the per-scan completeness red-line is computed from its analysis.db
     out = tools["list_candidates"](run_id="run_m")
@@ -475,11 +475,11 @@ def test_list_candidates_sink_class_filter(tmp_path: Path) -> None:
 
 def test_list_candidates_sink_and_pagination_metadata(tmp_path: Path) -> None:
     tools = _tools(tmp_path)
-    # B2: --sink semantics (concrete callee OR class) align with the CLI.
+    # --sink semantics (concrete callee OR class) align with the CLI.
     assert tools["list_candidates"](run_id="run_m", sink="do_fwd")["total"] == 1  # by sink_anchor
     assert tools["list_candidates"](run_id="run_m", sink="cmd")["total"] == 1  # by class
     assert tools["list_candidates"](run_id="run_m", sink="nope")["total"] == 0
-    # B5: pagination metadata + limit clamp.
+    # pagination metadata + limit clamp.
     out = tools["list_candidates"](run_id="run_m", limit=1, offset=0)
     assert out["total"] == 1 and out["returned"] == 1 and out["truncated"] is False
     assert out["next_offset"] is None
@@ -489,7 +489,7 @@ def test_list_candidates_sink_and_pagination_metadata(tmp_path: Path) -> None:
 
 
 def test_list_candidates_scopes_by_run_and_carries_runs_in_atlas(tmp_path: Path) -> None:
-    # M7/M-A1: the listing scopes to an explicit run_id (canonical resolved_run), each row carries
+    # The listing scopes to an explicit run_id (canonical resolved_run), each row carries
     # its own ``run`` (no ambient current_run_id / is_current_run), and runs_in_atlas is ALWAYS
     # present (even when scoped) so switching firmware is one glance.
     tools = _tools(tmp_path)
@@ -506,26 +506,26 @@ def test_list_candidates_scopes_by_run_and_carries_runs_in_atlas(tmp_path: Path)
 
 
 def test_fact_tool_requires_run_and_hard_errors_on_the_four_modes(tmp_path: Path) -> None:
-    # M2/Q1: a fact tool has NO ambient default and hard-errors (never a silent empty) across the
+    # A fact tool has NO ambient default and hard-errors (never a silent empty) across the
     # four failure modes, distinguishing "wrong run" from "no such function".
     tools = _tools(tmp_path)
     # (0) no run_id and no evidence_ref -> refuses, names how to supply one
     none = tools["get_pseudocode"]("handle_req")
     assert none["found"] is False and "evidence_ref" in none["error"]
     assert none["runs_in_atlas"] == ["run_m"]
-    # (1) misspelled run -> not-in-atlas, lists the available runs (G3)
+    # (1) misspelled run -> not-in-atlas, lists the available runs
     bad_run = tools["get_pseudocode"]("handle_req", run_id="run_typo")
     assert "not in this atlas" in bad_run["error"] and "run_m" in bad_run["error"]
-    # (3) function in a DIFFERENT run than the one asked -> names the owning run (Q1-a)
+    # (3) function in a DIFFERENT run than the one asked -> names the owning run
     wrong = tools["get_pseudocode"]("handle_req", run_id="run_m")  # handle_req IS in run_m -> found
     assert wrong["found"] is True and wrong["resolved_run"] == "run_m"
-    # (4) a function in NO run -> "not in ANY run" (Q1-b), the miss is diagnosed not silent
+    # (4) a function in NO run -> "not in ANY run", the miss is diagnosed not silent
     absent = tools["get_pseudocode"]("nope_fn", run_id="run_m")
     assert absent["found"] is False and "not in ANY run" in absent["cross_run_note"]
 
 
 def test_fact_tool_missing_analysis_db_hard_errors(tmp_path: Path) -> None:
-    # G4: a run whose analysis.db was never recorded (a pre-existing scan) hard-errors — never a
+    # A run whose analysis.db was never recorded (a pre-existing scan) hard-errors — never a
     # silent empty that reads as "no findings".
     atlas = _mk_multi_atlas(tmp_path)  # writes run_m -> tmp_path/analysis.db, which does NOT exist
     tools = mcp_app.make_tools(atlas)
@@ -535,7 +535,7 @@ def test_fact_tool_missing_analysis_db_hard_errors(tmp_path: Path) -> None:
 
 
 def test_fact_tool_routes_by_evidence_ref(tmp_path: Path) -> None:
-    # M4: an evidence_ref self-resolves the run (+ binary + function) — no run_id needed. run_source
+    # An evidence_ref self-resolves the run (+ binary + function) — no run_id needed. run_source
     # reflects via_ref, and resolved_run is the ref's run.
     tools = _tools(tmp_path)
     r = tools["get_pseudocode"](evidence_ref="run_m#fn1@cmd")
@@ -634,7 +634,7 @@ def test_ws_root_fallback_still_recovers_a_moved_lineage_run(tmp_path: Path) -> 
 
 
 def test_cross_firmware_and_aggregation_tools(tmp_path: Path) -> None:
-    # B3: the atlas-view aggregations are reachable as tools and carry the derived note.
+    # The atlas-view aggregations are reachable as tools and carry the derived note.
     tools = _tools(tmp_path)
     xf = tools["cross_firmware_patterns"]()
     assert "DERIVED" in xf["note"]
@@ -645,7 +645,7 @@ def test_cross_firmware_and_aggregation_tools(tmp_path: Path) -> None:
 
 
 def test_aggregation_paging_never_silently_drops_the_tail(tmp_path: Path) -> None:
-    # Finding 7: a limited aggregation must expose the capped tail as REACHABLE (offset/truncated/
+    # A limited aggregation must expose the capped tail as REACHABLE (offset/truncated/
     # next_offset), never count rows it silently omits.
     tools = _tools(tmp_path)
     full = tools["cross_firmware_patterns"](limit=1)
@@ -693,7 +693,7 @@ def test_legal_notice_present(tmp_path: Path) -> None:
 
 
 def test_server_instructions_are_workflow_not_just_legalese(tmp_path: Path) -> None:
-    # B4: the standing instructions are the agent workflow guide; the legal notice stays reachable
+    # The standing instructions are the agent workflow guide; the legal notice stays reachable
     # via the legal_notice tool.
     atlas = _mk_atlas(tmp_path)
     server = mcp_app.build_server(atlas)
@@ -705,7 +705,7 @@ def test_server_instructions_are_workflow_not_just_legalese(tmp_path: Path) -> N
     assert "defensive" in tools["legal_notice"]()["notice"].lower()
 
 
-# ── 缺口③: source_kind (fine-grained controllability) surfaced on explain + list ───────
+# ── source_kind (fine-grained controllability) surfaced on explain + list ────────────
 
 
 def test_explain_and_list_surface_source_kind(tmp_path: Path) -> None:
@@ -769,12 +769,12 @@ def test_explain_and_list_surface_source_kind(tmp_path: Path) -> None:
 def test_explain_top_level_exposes_source_kind_and_class(tmp_path: Path) -> None:
     # ★ regression guard for the shipped bug: source_kind was reachable ONLY via the nested
     # candidate object, invisible at the explain TOP LEVEL an agent actually reads. Pin that the
-    # top-level dict itself carries both keys (this is the path A-group tests missed).
+    # top-level dict itself carries both keys (this is the path the earlier tests missed).
     tools = _tools(tmp_path)
     ex = tools["explain_candidate"]("run_m#fn1@cmd")
     assert "source_kind" in ex  # top-level key, NOT ex["candidate"]["source_kind"]
     assert "source_class" in ex  # coarse class also top-level — both agent-visible
-    # ★ 1.3 (MCP face, via asdict): the honest state:value siblings ride the explain top level too,
+    # ★ MCP face, via asdict: the honest state:value siblings ride the explain top level too,
     # so an agent reads the controllability certainty without a bare-value trap. Bare field stays.
     assert ex["controllability"] == "unknown"  # bare value unchanged
     assert ex["controllability_labeled"] == "unknown:unknown"  # honest state:value sibling
@@ -809,7 +809,7 @@ def test_source_kind_defaults_unknown_and_no_regression(tmp_path: Path) -> None:
     assert "score" not in cand
 
 
-# ── 缺口①: pseudocode-text reverse lookup (which functions mention a string) ────────────
+# ── pseudocode-text reverse lookup (which functions mention a string) ─────────────────
 
 
 def test_get_functions_referencing_string_tool(tmp_path: Path) -> None:
@@ -825,7 +825,7 @@ def test_get_functions_referencing_string_tool(tmp_path: Path) -> None:
     assert empty["functions"] == []
 
 
-# ── compact-row serializer contract (compact_row_contract.md C1–C8) ────────────────────
+# ── compact-row serializer contract ────────────────────────────────────────────────────
 
 
 def _mk_candidate(dimensions: list[Dimension], **over: object) -> TriageCandidate:
@@ -851,7 +851,7 @@ def _mk_candidate(dimensions: list[Dimension], **over: object) -> TriageCandidat
 
 
 def test_compact_row_carries_established_dims_and_omits_unknown() -> None:
-    # ★ C8-1 general carry: a non-spine dimension with an established state joins the row; an
+    # ★ general carry: a non-spine dimension with an established state joins the row; an
     # unknown one is omitted (the baseline). controllability is spine — always present, never in the
     # carried dict.
     dims = [
@@ -867,7 +867,7 @@ def test_compact_row_carries_established_dims_and_omits_unknown() -> None:
 
 
 def test_compact_row_carries_a_new_axis_without_a_whitelist() -> None:
-    # ★ C8-4 marker-aware (anti-'hidden marker', the recurring root cause): a BRAND-NEW axis that
+    # ★ marker-aware (anti-'hidden marker', the recurring root cause): a BRAND-NEW axis that
     # is a Dimension with an established state MUST reach the compact row automatically — the carry
     # loop hardcodes NO dimension whitelist, so a future source=param axis is picked up for free.
     dims = [
@@ -879,7 +879,7 @@ def test_compact_row_carries_a_new_axis_without_a_whitelist() -> None:
 
 
 def test_compact_row_baseline_is_unknown_state_not_a_modal_value() -> None:
-    # ★ C8-3 baseline semantics: carry keys on the UNKNOWN state, never on a per-firmware modal
+    # ★ baseline semantics: carry keys on the UNKNOWN state, never on a per-firmware modal
     # value. A dimension whose VALUE looks like a common reading but whose STATE is unknown is
     # omitted; only an established state is carried.
     dims = [
@@ -895,7 +895,7 @@ def test_compact_row_baseline_is_unknown_state_not_a_modal_value() -> None:
 
 
 def test_compact_row_keeps_excluded_visible() -> None:
-    # ★ C8-2 demotion iron law: a proven-safe (excluded) dimension is DEMOTED but stays VISIBLE —
+    # ★ demotion iron law: a proven-safe (excluded) dimension is DEMOTED but stays VISIBLE —
     # hiding it would read as 'not judged' (a re-review waste) or 'still dangerous'.
     dims = [
         Dimension("controllability", "unknown", "unknown", "src"),
@@ -906,7 +906,7 @@ def test_compact_row_keeps_excluded_visible() -> None:
 
 
 def test_compact_row_axis_prefixes_do_not_mix() -> None:
-    # ★ C8-5 axis prefixes: controllability (spine) and reachability (carried) both established —
+    # ★ axis prefixes: controllability (spine) and reachability (carried) both established —
     # each label reads its own axis, none collapsed into the other.
     dims = [
         Dimension("controllability", "proven", "controllable", "src"),
@@ -918,7 +918,7 @@ def test_compact_row_axis_prefixes_do_not_mix() -> None:
 
 
 def test_compact_list_envelope_carries_legend(tmp_path: Path) -> None:
-    # ★ C8-6: the compact list envelope states once that an omitted dimension is unknown, NOT proven
+    # ★ the compact list envelope states once that an omitted dimension is unknown, NOT proven
     # safe (unknown ≠ safe), and points at explain for the full note.
     tools = _tools(tmp_path)
     out = tools["list_candidates"](run_id="run_m")
@@ -928,7 +928,7 @@ def test_compact_list_envelope_carries_legend(tmp_path: Path) -> None:
 
 
 def test_list_verbose_default_carries_available_views(tmp_path: Path) -> None:
-    # ★ 4.5.1: verbose defaults True — the full available_views enumeration rides the envelope
+    # ★ verbose defaults True — the full available_views enumeration rides the envelope
     # (unchanged behaviour), so nothing regresses for a consumer that relied on it.
     tools = _tools(tmp_path)
     out = tools["list_candidates"](run_id="run_m")
@@ -937,7 +937,7 @@ def test_list_verbose_default_carries_available_views(tmp_path: Path) -> None:
 
 
 def test_list_non_verbose_drops_only_navigational_boilerplate(tmp_path: Path) -> None:
-    # ★ 4.5.1 iron laws: verbose=False drops ONLY the available_views enumeration (navigational
+    # ★ iron laws: verbose=False drops ONLY the available_views enumeration (navigational
     # boilerplate that repeats every call) — the honest caveats stay in FULL (never traded for
     # tokens), and a one-line switchable pointer stays so the lens is never read as 'all there is'.
     tools = _tools(tmp_path)
@@ -954,9 +954,9 @@ def test_list_non_verbose_drops_only_navigational_boilerplate(tmp_path: Path) ->
 
 
 def test_compact_row_reachability_seam_real_dimension(tmp_path: Path) -> None:
-    # ★ cross-step seam (the contract anchor): reachability became a Dimension in step 2, but the
-    # compact serializer did not exist then. Verify with the REAL dimension (not a synthetic one):
-    # an entry:web candidate carries reachability=proven:entry:web; a no-site candidate OMITS it.
+    # ★ seam (the contract anchor): reachability became a Dimension before the compact serializer
+    # existed. Verify with the REAL dimension (not a synthetic one): an entry:web candidate carries
+    # reachability=proven:entry:web; a no-site candidate OMITS it.
     d_web = tmp_path / "web"
     d_web.mkdir()
     d_no = tmp_path / "nosite"
@@ -972,7 +972,7 @@ def test_compact_row_reachability_seam_real_dimension(tmp_path: Path) -> None:
 
 
 def test_note_moves_from_list_to_explain(tmp_path: Path) -> None:
-    # ★ M2: the per-dimension note is DROPPED from the compact list row (each dim is one bare
+    # ★ the per-dimension note is DROPPED from the compact list row (each dim is one bare
     # state:value label) and preserved IN FULL on explain_candidate — moved, never deleted.
     tools = _tools(tmp_path)
     (cand,) = tools["list_candidates"](run_id="run_m")["candidates"]
@@ -986,7 +986,7 @@ def test_note_moves_from_list_to_explain(tmp_path: Path) -> None:
 
 
 def test_mcp_get_strings_accepts_offset_and_returns_paging(tmp_path: Path) -> None:
-    # ★ M6: the MCP get_strings wrapper threads ``offset`` into the lossless byte-paging envelope.
+    # ★ the MCP get_strings wrapper threads ``offset`` into the lossless byte-paging envelope.
     tools = _tools(tmp_path)
     r = tools["get_strings"](binary="webd", offset=0, run_id="run_m")
     assert "paging" in r and r["paging"]["offset"] == 0
@@ -1007,9 +1007,9 @@ def test_mcp_get_xrefs_address_taken_passthrough(tmp_path: Path) -> None:
 
 
 def test_compact_row_carries_param_source_when_controllability_unknown(tmp_path: Path) -> None:
-    # ★ step-4 param contract seam (C1/C6, anti-'hidden marker'): a controllability=unknown
-    # external_input candidate STILL surfaces source=structural:param on the compact row — the
-    # axis-agnostic carry from step 3 picks the new axis up with no serializer edit.
+    # ★ param seam (anti-'hidden marker'): a controllability=unknown external_input candidate STILL
+    # surfaces source=structural:param on the compact row — the axis-agnostic carry picks the new
+    # axis up with no serializer edit.
     tools = _tools(tmp_path)  # _mk_atlas uses source_class=external_input
     (cand,) = tools["list_candidates"](run_id="run_m")["candidates"]
     assert cand["controllability"] == "unknown:unknown"
@@ -1017,7 +1017,7 @@ def test_compact_row_carries_param_source_when_controllability_unknown(tmp_path:
 
 
 def test_explain_carries_param_source_with_unproven_note(tmp_path: Path) -> None:
-    # ★ step-4 guardrail 2: the source dimension + its UNPROVEN note ride on explain too (not only
+    # ★ guardrail: the source dimension + its UNPROVEN note ride on explain too (not only
     # the compact list), so a drill-down never loses the "controllability UNPROVEN" caveat.
     tools = _tools(tmp_path)
     ex = tools["explain_candidate"]("run_m#fn1@cmd")
@@ -1027,20 +1027,20 @@ def test_explain_carries_param_source_with_unproven_note(tmp_path: Path) -> None
 
 
 def test_mcp_get_strings_function_scope_flag(tmp_path: Path) -> None:
-    # ★ 3.1 on the MCP face (the surface the agent uses): passing `function` yields
+    # ★ declared≠actual on the MCP face (the surface the agent uses): passing `function` yields
     # func_scope_applied:false + the honest "does NOT narrow" note — the echoed function is never a
     # scoping guarantee.
     tools = _tools(tmp_path)
     r = tools["get_strings"](binary="webd", function="handle_req", run_id="run_m")
     assert r["func_scope_applied"] is False
     assert "does NOT narrow" in r["note"]
-    # ★ 1.4: the honesty is now PROMINENT — a top-level `warning` (not only the bottom note), so a
+    # ★ the honesty is now PROMINENT — a top-level `warning` (not only the bottom note), so a
     # consumer skimming the keys sees `function` is a no-op without reading to the note.
     assert "warning" in r and "does NOT scope" in r["warning"]
 
 
 def test_mcp_get_strings_no_warning_when_function_absent(tmp_path: Path) -> None:
-    # ★ 1.4 guardrail: the warning fires ONLY when `function` was actually passed — a plain
+    # ★ guardrail: the warning fires ONLY when `function` was actually passed — a plain
     # by-binary call must not carry it (else it becomes new noise on every call).
     tools = _tools(tmp_path)
     r = tools["get_strings"](binary="webd", run_id="run_m")
@@ -1142,7 +1142,7 @@ def _seed_ledger(tmp_path: Path, **kw: str) -> None:
 
 
 def test_list_verified_exploits_default_withholds_note_reveal_includes_it(tmp_path: Path) -> None:
-    # ★ verification 4: the default read never sprays exploit_note; reveal=True is the one channel.
+    # ★ the default read never sprays exploit_note; reveal=True is the one channel.
     tools = _tools(tmp_path)
     _seed_ledger(
         tmp_path,
@@ -1158,8 +1158,7 @@ def test_list_verified_exploits_default_withholds_note_reveal_includes_it(tmp_pa
 
 
 def test_list_verified_exploits_counts_distinct_refs_via_tool(tmp_path: Path) -> None:
-    # ★ verification 3: two rows on the SAME ref → distinct_exploits stays 1 (COUNT DISTINCT),
-    # records is 2.
+    # ★ two rows on the SAME ref → distinct_exploits stays 1 (COUNT DISTINCT), records is 2.
     tools = _tools(tmp_path)
     _seed_ledger(tmp_path, evidence_ref="run_m#fn1@cmd", pattern="cmd", exploit_note="via web")
     _seed_ledger(tmp_path, evidence_ref="run_m#fn1@cmd", pattern="cmd", exploit_note="via cli too")

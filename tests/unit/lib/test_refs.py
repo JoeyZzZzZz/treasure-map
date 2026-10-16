@@ -83,7 +83,7 @@ def test_id_fallback_reachable_only_without_address_or_name() -> None:
     assert f"id{_ID_SCAN_A}" in ref
 
 
-# ── D4: address-offset ref form ─────────────────────────────────────────────────────────────────
+# ── address-offset ref form ─────────────────────────────────────────────────────────────────────
 
 from treasure_map.lib.hunt.refs import (  # noqa: E402
     _norm_offset,

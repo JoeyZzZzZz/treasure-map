@@ -153,7 +153,7 @@ def test_begin_run_clears_the_stamp_so_a_crash_leaves_no_claim(tmp_path: Path) -
 
 
 def test_begin_run_without_a_firmware_root_leaves_the_recorded_one_alone(tmp_path: Path) -> None:
-    """★ M-A4. A caller passing no firmware root does not KNOW one; it is not reporting that the run
+    """★ A caller passing no firmware root does not KNOW one; it is not reporting that the run
     has none.
 
     `tmap hunt` is exactly that caller: it re-hunts an analysis.db and is never told which firmware

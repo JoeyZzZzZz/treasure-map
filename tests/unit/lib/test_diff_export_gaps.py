@@ -768,8 +768,9 @@ def test_a_counterpart_outside_the_inventory_is_counted_and_nothing_on_it_is_det
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """BinDiff pairs A's caller with a B function tmap does not list (0x5000). It is counted as
-    out of inventory; the edge in caller cannot verify its counterpart region (G3), and the
-    candidate's matched instruction carries no candidate: both undetermined."""
+    out of inventory; the edge in caller cannot verify its counterpart region (layer 2's
+    completeness check), and the candidate's matched instruction carries no candidate: both
+    undetermined."""
     w = _world(tmp_path, pairs=((0x1000, 0x5000), (0x2000, 0x2000)), insn_b=0x5010)
     _stub(monkeypatch, w)
     _diff(w)

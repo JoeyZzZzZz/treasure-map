@@ -1,6 +1,6 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for the tmap init CLI command (M2 Step 2)."""
+"""Unit tests for the tmap init CLI command."""
 
 from __future__ import annotations
 

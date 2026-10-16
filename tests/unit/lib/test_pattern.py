@@ -648,15 +648,16 @@ def test_shape_scan_invariant_pure() -> None:
 # first — so a function copying a fixed 4 bytes and then a caller-supplied length reported the
 # fixed one, for both.
 
-# MC-2 fixtures. A and C must be RED before the fix (1 candidate each); B is the control that must
-# stay GREEN either way, so a mutation that breaks emission is not mistaken for the fix working.
+# Fixtures for test_each_copy_callsite_gets_its_own_candidate. A and C must be RED before the fix
+# (1 candidate each); B is the control that must stay GREEN either way, so a mutation that breaks
+# emission is not mistaken for the fix working.
 _COPY_A = "memcpy(dst, src, 4); memcpy(other, src, len);"  # 1 fixed + 1 variable
 _COPY_B = "memcpy(dst, src, 4);"  # 1 fixed only — the control
 _COPY_C = "memcpy(a, src, 4); memcpy(b, src, n); memcpy(c, src, m);"  # 1 fixed + 2 variable
 
-# MC-1 counts callsites with its OWN matcher rather than by calling the enumerator under test. The
-# NAMES come from the shared COPY set (a test carrying its own copy of the vocabulary would go
-# quietly stale the day a callee is added); the counting is the test's.
+# The site-coverage check counts callsites with its OWN matcher rather than by calling the
+# enumerator under test. The NAMES come from the shared COPY set (a test carrying its own copy of
+# the vocabulary would go quietly stale the day a callee is added); the counting is the test's.
 _VISIBLE_COPY_CALL = re.compile(rf"\b(?:{'|'.join(sorted(COPY))})\s*\(")
 
 
@@ -682,7 +683,7 @@ def _copy_matches(tmp_path: Path, pseudocode: str, callees: list[str] | None = N
 
 
 def test_each_copy_callsite_gets_its_own_candidate(tmp_path: Path) -> None:
-    """MC-2. Two copies in a function are two candidates; one copy is still one.
+    """Two copies in a function are two candidates; one copy is still one.
 
     Before per-callsite emission all three fixtures produced exactly one candidate, anchored at the
     function and reporting the FIRST copy's length. The second and third calls had no row anywhere
@@ -697,7 +698,7 @@ def test_each_copy_callsite_gets_its_own_candidate(tmp_path: Path) -> None:
 
 
 def test_copy_candidate_count_equals_the_visible_callsites(tmp_path: Path) -> None:
-    """MC-1 site coverage: as many candidates as there are copy calls to see, no more, no fewer.
+    """Site coverage: as many candidates as there are copy calls to see, no more, no fewer.
 
     Counted here with this test's own matcher over the same text, so the check is not the
     enumerator agreeing with itself. Covers the multi-callee case, where the two ordinals a match
@@ -760,7 +761,7 @@ def test_copy_callee_never_spelled_out_still_yields_one_candidate(tmp_path: Path
 def test_per_callsite_siblings_share_one_fingerprint_and_one_scanned_function(
     tmp_path: Path,
 ) -> None:
-    """MC-4 + the recurrence ledgers: more candidates, same shape, same one function scanned.
+    """Fingerprint + the recurrence ledgers: more candidates, same shape, same one function scanned.
 
     Two things ride on this. The fingerprint is over the SHAPE, so the siblings fold into one
     pattern row — which is why the recurrence ledgers (distinct pseudocode hashes, distinct runs)
@@ -858,7 +859,7 @@ def _format_matches(tmp_path: Path, pseudocode: str, callees: list[str] | None =
 
 
 def test_every_formatter_callsite_is_a_candidate(tmp_path: Path) -> None:
-    """MC-a1, precise arm: as many candidates as there are formatter calls to see.
+    """Site coverage, precise arm: as many candidates as there are formatter calls to see.
 
     Counted with this test's own matcher over the same text, so it is not the enumerator agreeing
     with itself. The vocabulary comes from the shared FORMAT set — a test carrying its own copy of
@@ -878,7 +879,8 @@ def test_every_formatter_callsite_is_a_candidate(tmp_path: Path) -> None:
 def test_a_formatter_the_body_never_spells_out_still_yields_one_candidate(
     tmp_path: Path,
 ) -> None:
-    """MC-a1, fallback arm: the recall floor, counted against the CALLEE list rather than the text.
+    """Site coverage, fallback arm: the recall floor, counted against the CALLEE list rather than
+    the text.
 
     A regex denominator cannot express this case — the text holds zero calls and one candidate is
     correct — which is why the site-coverage check has two arms instead of one equation that would
@@ -926,7 +928,7 @@ def test_whether_a_formatter_is_a_candidate_does_not_depend_on_its_destination(
 def test_a_formatter_building_a_shell_command_is_still_a_command_candidate(
     tmp_path: Path,
 ) -> None:
-    """MC-a3. The write-length axis is added alongside the command axis, not instead of it.
+    """The write-length axis is added alongside the command axis, not instead of it.
 
     A sprintf that assembles a shell string feeds the command-injection shape through the same
     callee set. Emitting it as a write candidate must not take it out of that shape: the two are
@@ -1439,7 +1441,7 @@ def test_adding_a_copy_alias_repoints_a_same_name_ordinal() -> None:
     (name, occurrence), never the name alone. #0 additionally re-points by name (memcpy -> mempcpy);
     both forms live in one fixture.
 
-    Synthetic, not copied from a real ref: the old vocabulary is COPY minus this batch's additions,
+    Synthetic, not copied from a real ref: the old vocabulary is COPY minus ``_ADDED_COPY_ALIASES``,
     recomputed on the same body.
 
     MUTATION (must go RED): order sink_callsites by callee name instead of source position, or drop
@@ -1688,7 +1690,7 @@ def test_names_the_alias_rule_reaches_but_does_not_list_stay_out() -> None:
     assert not (_UNLISTED_SOURCE_CANDIDATES & set(_SOURCE_ALIAS_BASE))
 
 
-# ── D4: enumerator phantom-callsite stripping (declaration line + string literal) ────────────────
+# ── enumerator phantom-callsite stripping (declaration line + string literal) ────────────────────
 
 
 def test_call_offsets_skips_the_functions_own_declaration_line() -> None:

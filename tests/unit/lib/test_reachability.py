@@ -27,7 +27,8 @@ _REACH_PKG = Path(__file__).resolve().parents[3] / "src" / "treasure_map" / "lib
 
 def test_covered_validator_is_unknown() -> None:
     # A validator appears to cover the value, but v1 cannot prove non-reachability soundly,
-    # so it grades unknown (NOT blocked) — blocked is reserved for R2-deep.
+    # so it grades unknown (NOT blocked) — blocked is reserved for a deeper, inter-procedural
+    # grade.
     pseudo = "char* v = param_1; if (check_field(v)) { system(v); }"
     verdict = grade_candidate(pseudo, ["check_field", "system"], "system")
     assert verdict.status == "unknown"
@@ -176,7 +177,7 @@ def test_validator_not_on_value_prefers_unknown_not_blocked() -> None:
 
 def test_validator_through_rename_is_unknown() -> None:
     # The validator appears to cover the value (reached under renamed intermediates), but v1
-    # cannot prove non-reachability soundly -> unknown, not blocked (reserved for R2-deep).
+    # cannot prove non-reachability soundly -> unknown, not blocked (reserved for a deeper grade).
     pseudo = (
         "char* buf_a = b64_decode(input); check_field(buf_a); "
         "memcpy(buf_b, buf_a, n); "
@@ -218,7 +219,8 @@ def test_mixed_sink_one_uncovered_input_does_not_block() -> None:
 
 def test_fully_covered_multi_input_is_unknown() -> None:
     # Every input reaching the sink appears validated, but v1 grades unknown (not blocked) —
-    # proving the copy actually carries the validated content is R2-deep's job.
+    # proving the copy actually carries the validated content is left to a deeper,
+    # inter-procedural grade.
     pseudo = (
         "char buf_a[64]; recv(fd, buf_a, 64); check_field(buf_a); "
         "memcpy(buf_b, buf_a, n); system(buf_b);"
@@ -284,7 +286,7 @@ def test_polluted_partial_coverage_does_not_block() -> None:
 
 def test_clean_single_input_validator_is_unknown() -> None:
     # Even the clean single-input validated shape grades unknown in v1: blocked is not a v1
-    # verdict (it is reserved for R2-deep), so v1 never returns it.
+    # verdict (it is reserved for a deeper grade), so v1 never returns it.
     pseudo = "char buf[64]; recv(fd, buf, 64); check_field(buf); system(buf);"
     verdict = grade_candidate(pseudo, ["recv", "check_field", "system"], "system")
     assert verdict.status == "unknown"
@@ -350,7 +352,7 @@ def test_offset_aliased_validator_does_not_block() -> None:
 
 
 def test_confirmed_unchanged() -> None:
-    # The strong-source-unfiltered confirmed path is NOT touched by this round.
+    # The strong-source-unfiltered path still grades confirmed.
     pseudo = "char buf[64]; recv(fd, buf, 64); system(buf);"
     verdict = grade_candidate(pseudo, ["recv", "system"], "system")
     assert verdict.status == "confirmed"

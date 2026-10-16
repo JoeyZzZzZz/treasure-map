@@ -166,7 +166,7 @@ def _breadth(conn: sqlite3.Connection, pattern_id: int) -> int:
 def test_relabelling_stock_to_unknown_only_widens_breadth_and_by_a_bounded_amount(
     tmp_path: Path,
 ) -> None:
-    """MC-3. The one ledger the retirement actually moves, bounded in both directions.
+    """The one ledger the retirement actually moves, bounded in both directions.
 
     Re-hunting a run after the retirement rewrites its instances' origin to 'unknown', which is
     what this simulates. Two things have to hold and they are different claims:

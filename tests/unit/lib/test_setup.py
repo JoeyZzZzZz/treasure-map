@@ -1,6 +1,6 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for lib/setup — local onboarding initializer (M2 Step 2)."""
+"""Unit tests for lib/setup — local onboarding initializer."""
 
 from __future__ import annotations
 
@@ -292,7 +292,7 @@ def test_doctor_java_check_reads_the_version_and_javac(tmp_path: Path) -> None:
     assert state_for(fakes.make_jdk(tmp_path / "jdk25", "25.0.1")) == "warn"
 
 
-# ── run_init — Ghidra configuration step (R0-fix) ─────────────────────────────
+# ── run_init — Ghidra configuration step ──────────────────────────────────────
 
 
 def test_init_ghidra_autodetect_accepts_without_prompt(
@@ -401,7 +401,7 @@ def test_prompt_messages_carry_no_trailing_colon(fake_home: Path) -> None:
         assert not msg.rstrip().endswith(":"), f"message would double click's colon: {msg!r}"
 
 
-# ── run_init — idempotent re-run / reinstall (R0e) ────────────────────────────
+# ── run_init — idempotent re-run / reinstall ──────────────────────────────────
 
 
 def test_reinit_preserves_existing_env_keys(fake_home: Path) -> None:
@@ -452,7 +452,7 @@ def test_reinit_reuses_configured_ghidra_without_prompt(fake_home: Path) -> None
     assert _ghidra_home(fake_home) == str(root)  # still configured
 
 
-# ── run_init — workspace base dir confirm/persist (R0f) ───────────────────────
+# ── run_init — workspace base dir confirm/persist ─────────────────────────────
 
 
 def _workspace_dir(fake_home: Path) -> Any:
