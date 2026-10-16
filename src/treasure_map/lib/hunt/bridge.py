@@ -4,9 +4,10 @@
 
 One source of truth for turning a callsite's TEXT position into its ADDRESS, shared by the two
 places that must agree by construction: the hunt layer, which stamps a per-callsite candidate's
-ref with its address offset, and the D4 rekey, which re-derives the same address to migrate an old
-text-ordinal ref onto it. If these computed the address two different ways they would agree only by
-luck, and a durable judgement would migrate onto the wrong call the first time they diverged.
+ref with its address offset, and the address rekey, which re-derives the same address to migrate
+an old text-ordinal ref onto it. If these computed the address two different ways they would agree
+only by luck, and a durable judgement would migrate onto the wrong call the first time they
+diverged.
 
 The bridge facts (see analyze/ghidra ExportFunctions buildCallTokens / buildBodyRanges):
   * call_tokens: one record per function-name token in the decompiler's C markup — its own address

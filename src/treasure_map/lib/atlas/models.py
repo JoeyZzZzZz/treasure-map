@@ -125,7 +125,7 @@ class NvramFlowRow:
     value_source: str | None = None  # write-side value provenance JSON; None for reads
     api: str | None = None
     via_wrapper: str | None = (
-        None  # A2: thin nvram wrapper an indirect edge resolved through; None=direct
+        None  # thin nvram wrapper an indirect edge resolved through; None=direct
     )
     # The binary's recorded path. The short name beside it is a LABEL that repeats across a
     # firmware, so it is the path that says which file this row is about. None on a row read

@@ -132,7 +132,7 @@ def _entry(row: sqlite3.Row) -> dict[str, Any]:
     }
     via = row["via_wrapper"]
     if via:
-        # A2: an INDIRECT edge — the key was a literal at a thin-nvram-wrapper call site, resolved
+        # An INDIRECT edge — the key was a literal at a thin-nvram-wrapper call site, resolved
         # one hop. func is the CALLER; it reads/writes the key THROUGH via_wrapper. Flagged so a
         # consumer never mistakes a one-hop indirect access for a direct call.
         entry["via_wrapper"] = via

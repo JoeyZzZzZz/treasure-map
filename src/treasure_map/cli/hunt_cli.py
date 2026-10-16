@@ -1126,8 +1126,8 @@ def _render_triage(
         loc = f"        in: {c.binary_path or '?'}"
         if c.nvram_source_key:
             loc += f"   nvram_source_key={c.nvram_source_key}"
-        # the orthogonal source=param signal (A2 external_input) — surfaced here so the human list
-        # carries it too, not only the MCP compact row / explain (contract C6 guardrail 2).
+        # the orthogonal source=param signal (analyzer2 external_input) — surfaced here so the human
+        # list carries it too, not only the MCP compact row / explain (contract C6 guardrail 2).
         if c.dim("source").value == "param":
             loc += "   source=param"
         click.echo(loc)

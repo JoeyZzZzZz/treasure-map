@@ -280,7 +280,7 @@ CREATE TABLE IF NOT EXISTS string_tables (
     FOREIGN KEY(binary_id) REFERENCES binaries(id) ON DELETE CASCADE
 );
 
--- A1: raw initialized data-segment bytes (.rodata/.data), one row per memory block. Stored at
+-- raw initialized data-segment bytes (.rodata/.data), one row per memory block. Stored at
 -- ingest so a query slices the bytes at ANY data-segment address the agent meets in pseudocode
 -- WITHOUT re-running Ghidra. RAW BYTES ONLY — no interpretation is stored or implied.
 -- truncated=1 = a cap hit (the stored bytes cover LESS than size); NEVER read it as "the block ends
