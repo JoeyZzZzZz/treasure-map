@@ -70,3 +70,31 @@ def test_closing_a_workspace_releases_its_lock_there_and_then(tmp_path: Path) ->
     assert outcome == "re-entered"
     leaked = [str(w.message) for w in caught if issubclass(w.category, ResourceWarning)]
     assert leaked == [], leaked
+
+
+def test_workspace_of_names_only_a_workspaces_own_database(tmp_path: Path) -> None:
+    """A hunt locks the workspace its analysis.db belongs to, and nothing else. A database sits in
+    a workspace when its directory is directly under the configured base, or when a scan has
+    already put its lock file there (a workspace made under an earlier base). A copy kept anywhere
+    else is not one, and a file not named analysis.db is not a workspace's database.
+
+    MUTATION (verified RED): drop the lock-file branch -> the workspace under the earlier base
+    reads None. Make workspace_of return the parent unconditionally -> the stray copy is claimed."""
+    from treasure_map.lib.workspace.workspace import workspace_of
+
+    base = tmp_path / "workspaces"
+    (base / "router_v1").mkdir(parents=True)
+    assert workspace_of(base / "router_v1" / "analysis.db", base) == base / "router_v1"
+    # under the base, but not the workspace's database file
+    assert workspace_of(base / "router_v1" / "other.db", base) is None
+
+    # a workspace a scan used under an earlier base still carries its lock file
+    with Workspace(tmp_path / "old_base" / "router_v0"):
+        pass
+    old_db = tmp_path / "old_base" / "router_v0" / "analysis.db"
+    assert workspace_of(old_db, base) == tmp_path / "old_base" / "router_v0"
+
+    # a copy kept elsewhere: not under the base, no lock file
+    (tmp_path / "copies").mkdir()
+    assert workspace_of(tmp_path / "copies" / "analysis.db", base) is None
+    assert not (tmp_path / "copies" / Workspace._LOCK_NAME).exists()

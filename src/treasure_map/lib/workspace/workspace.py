@@ -63,3 +63,21 @@ class Workspace:
     def db_path(self) -> Path:
         """Path to the analysis SQLite database inside this workspace."""
         return self.path / "analysis.db"
+
+
+def workspace_of(db_path: Path, workspace_dir: Path) -> Path | None:
+    """The workspace directory whose analysis.db ``db_path`` is, or None when it is not one.
+
+    A workspace keeps its database at ``<dir>/analysis.db``. That directory counts as a workspace
+    when it sits directly under ``workspace_dir`` (where ``-w`` names resolve), or when it already
+    holds the lock file a scan takes, which covers a workspace made under an earlier base. Any
+    other analysis.db, a copy kept elsewhere for instance, is not one; the caller then takes no
+    lock and creates nothing beside it."""
+    if db_path.name != "analysis.db":
+        return None
+    ws = db_path.parent
+    try:
+        under_base = ws.resolve().parent == workspace_dir.expanduser().resolve()
+        return ws if under_base or (ws / Workspace._LOCK_NAME).is_file() else None
+    except OSError:
+        return None

@@ -1,6 +1,6 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""CLI wrappers for the analyzers (A1 diff-driven, A2 pattern-driven) and atlas views.
+"""CLI wrappers for the analyzers (diff-driven and pattern-driven) and atlas views.
 
 Thin Click wrappers only — all logic lives in lib/hunt/ and lib/query/. A small set of
 top-level commands; not a file-per-analyzer.
@@ -852,15 +852,33 @@ def hunt_pattern(
 
     Runs locally, with no model and no API key. Every instance it writes is a lead to verify, not
     a confirmed result.
+
+    It reads the analysis.db as the last `tmap scan` or `tmap analyze` left it and rebuilds
+    nothing in it, cross-binary call edges included; after upgrading tmap, `tmap rescan`
+    refreshes a scanned firmware end to end.
     """
+    import contextlib
+
     from treasure_map.lib.config.config import load_config
+    from treasure_map.lib.errors import WorkspaceError
     from treasure_map.lib.hunt import run_analyzer2
     from treasure_map.lib.last_run import write_last_run
+    from treasure_map.lib.workspace.workspace import Workspace, workspace_of
 
     cfg = load_config(config)
     resolved_atlas = atlas_path if atlas_path is not None else cfg.atlas.db_path
+    # The hunt reads analysis.db, so when that database is a workspace's it holds the workspace
+    # lock for the whole hunt, as `tmap scan` does: a scan of the same workspace re-extracting the
+    # database mid-hunt would hand the hunt part of each extraction.
+    ws_dir = workspace_of(db, cfg.workspace_dir)
     try:
-        stats = run_analyzer2(db, resolved_atlas, source_run_id=run_id, rehunt=rehunt)
+        with contextlib.ExitStack() as held:
+            if ws_dir is not None:
+                try:
+                    held.enter_context(Workspace(ws_dir))
+                except WorkspaceError as exc:
+                    raise click.ClickException(str(exc)) from exc
+            stats = run_analyzer2(db, resolved_atlas, source_run_id=run_id, rehunt=rehunt)
     except KeyboardInterrupt:
         click.echo(
             "\nAborted — the hunt's write was rolled back (stored candidates unchanged); the run "

@@ -41,8 +41,8 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # nvram_ops transport column (per-function nvram read/write ops); back-fills '[]' on older
     # DBs so ghidra_ingest can write it without "no column named nvram_ops". Must match schema.sql.
     ("functions", "nvram_ops", "TEXT DEFAULT '[]'"),
-    # D4 bridge transport columns; back-fill '[]' on older DBs so ghidra_ingest can write them
-    # without "no column named ...". Must match schema.sql.
+    # call-token bridge transport columns; back-fill '[]' on older DBs so ghidra_ingest can write
+    # them without "no column named ...". Must match schema.sql.
     ("functions", "call_tokens", "TEXT DEFAULT '[]'"),
     ("functions", "body_ranges", "TEXT DEFAULT '[]'"),
     # extraction-pass content hash; back-fills NULL on older DBs, which reads as "unknown pass" and

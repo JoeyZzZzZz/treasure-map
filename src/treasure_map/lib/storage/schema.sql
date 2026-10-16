@@ -90,7 +90,7 @@ CREATE TABLE IF NOT EXISTS functions (
     -- analysis.db is wipe-and-rebuild, so this rides with the function here and is merged into the
     -- atlas instance's flow_evidence at hunt time (the persistent home). Empty '[]' when none.
     sink_provenance TEXT    DEFAULT '[]',
-    -- D4 bridge transport (wipe-and-rebuild with the function, consumed at hunt time):
+    -- call-token bridge transport (wipe-and-rebuild with the function, consumed at hunt time):
     -- call_tokens: JSON [{call_token,token_addr,op_addr,opcode,text_off,line}] — every function-name
     -- token in the decompiler's C markup, giving each textual call BOTH its own address and the
     -- character offset where it prints. The per-callsite ref's ADDRESS offset is read here (the

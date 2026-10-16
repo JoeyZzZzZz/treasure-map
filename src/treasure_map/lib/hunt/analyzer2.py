@@ -203,6 +203,41 @@ def _with_evidence_keys(flow_evidence: str | None, keys: dict[str, Any]) -> str 
     return json.dumps(data, sort_keys=True)
 
 
+def _load_detector_errors(db_path: Path | str) -> dict[int, list[str]]:
+    """Map func_id -> the additive detectors that threw on that function, from analysis.db.
+
+    Transport read (mirrors _load_sink_provenance): a detector that throws leaves the same empty
+    value as one that found nothing, and the extractor names it in functions.detector_errors. The
+    hunt carries those names onto the function's candidates as flow_evidence ``detector_errors``,
+    so triage reads the layer each one feeds as '?' instead of a clean empty. Only functions with
+    a non-empty list get an entry. A missing column (an analysis.db extracted before the list was
+    recorded) or an unparsable cell gives none, so the candidate carries no key: no error recorded,
+    the same reading as before the list was carried."""
+    uri = ro_uri(Path(db_path))
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        rows = conn.execute(
+            "SELECT id, detector_errors FROM functions "
+            "WHERE detector_errors IS NOT NULL AND detector_errors != '[]'"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return {}  # no column (an older analysis.db) -> nothing recorded
+    finally:
+        conn.close()
+    out: dict[int, list[str]] = {}
+    for func_id, raw in rows:
+        names = facts._detector_errors(raw)
+        if names:
+            out[func_id] = names
+    return out
+
+
+def _detector_error_keys(errors_by_func: Mapping[int, list[str]], func_id: int) -> dict[str, Any]:
+    """The flow_evidence key naming the detectors that threw on ``func_id``; empty when none did."""
+    names = errors_by_func.get(func_id)
+    return {"detector_errors": names} if names else {}
+
+
 def _load_caller_ids(db_path: Path | str) -> dict[int, list[int]]:
     """Map callee_func_id -> [caller_func_id, …] from the analysis.db xrefs (read-only).
 
@@ -1258,6 +1293,8 @@ def run_analyzer2(
     # and which binaries' rows come from an earlier extraction than this scan's.
     db_has_bridge = _db_has_bridge(db_path)
     extraction_notes = _load_extraction_notes(db_path)
+    # Which additive detectors threw on which function, carried onto that function's candidates.
+    detector_errors_by_func = _load_detector_errors(db_path)
     # ★ phase-scale progress: on a large firmware (~218k functions) the hunt is a multi-second pass;
     # log its magnitude so it is visibly running, not hung (does NOT change the hunt algorithm).
     logger.info("hunt: analyzing %d functions", len(all_funcs))
@@ -1669,6 +1706,9 @@ def run_analyzer2(
                     if callsite_addr is not None:
                         evidence_keys["callsite_addr"] = callsite_addr
                 evidence_keys.update(extraction_notes.get(row.binary_id, {}))
+                evidence_keys.update(
+                    _detector_error_keys(detector_errors_by_func, match.func_ref.func_id)
+                )
                 flow_evidence = _with_evidence_keys(flow_evidence, evidence_keys)
                 pattern_id = upsert_pattern(
                     atlas,
@@ -1933,7 +1973,10 @@ def run_analyzer2(
                         scope_origin="intra",
                         origin="unknown",  # see the candidate path above: never guessed here
                         flow_evidence=json.dumps(
-                            evidence | wrapper_keys | extraction_notes.get(f.binary_id, {}),
+                            evidence
+                            | wrapper_keys
+                            | extraction_notes.get(f.binary_id, {})
+                            | _detector_error_keys(detector_errors_by_func, f.func_id),
                             sort_keys=True,
                         ),
                     ),

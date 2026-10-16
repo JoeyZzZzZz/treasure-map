@@ -2416,22 +2416,24 @@ def _dim_completeness() -> Dimension:
 
 
 def _dim_source(source_class: str, source_kind: str) -> Dimension:
-    """The ORTHOGONAL source axis: is the sink argument fed by A2-confirmed external input (a
-    request/POST param)? ``source_class == external_input`` => ``structural:param`` — a structural
-    command/exec-injection lead whose controllability is UNPROVEN (no key-side web_settable
-    evidence), WEAKER than an nvram 'likely' reading. NOT ``proven``: the A2 pattern layer is coarse
-    (it fires on nearly EVERY external-input candidate across ALL sink classes — cmd, fmt_string,
-    path_sink — so it is ~zero discrimination, not a cmd-only signal) and a source is not a
-    controllability proof — ``proven`` is reserved for a positive proof, so the state word matches
-    the note's own 'UNPROVEN' instead of contradicting it.
+    """The ORTHOGONAL source axis: is the sink argument fed by external input that the hunt's
+    pattern scan recognised (a request/POST param)? ``source_class == external_input`` =>
+    ``structural:param`` — a structural command/exec-injection lead whose controllability is
+    UNPROVEN (no key-side web_settable evidence), WEAKER than an nvram 'likely' reading. NOT
+    ``proven``: the pattern scan's source label is coarse (it fires on nearly EVERY external-input
+    candidate across ALL sink classes — cmd, fmt_string, path_sink — so it is ~zero
+    discrimination, not a cmd-only signal) and a source is not a controllability proof — ``proven``
+    is reserved for a positive proof, so the state word matches the note's own 'UNPROVEN' instead
+    of contradicting it.
 
-    Orthogonal to controllability, and consumes the COARSE ``source_class`` (A2 pattern layer), NOT
-    the fine flow_evidence marker: it is built whenever A2 marked external_input, EVEN when the
-    certainty verdict fell to unknown/free — so the param signal is never swallowed by the certainty
-    fallback chain (source=param and controllability=unknown:unknown co-exist). It NEVER claims
-    controllable: a source is not a controllability proof (asymmetry — mark weak, never overclaim).
-    ``charset`` (from source_kind) carries the injection feasibility. Non-external => unknown (not
-    carried; the demotion-visible rule leaves a real source untouched)."""
+    Orthogonal to controllability, and consumes the COARSE ``source_class`` (the pattern scan's
+    label), NOT the fine flow_evidence marker: it is built whenever the hunt marked external_input,
+    EVEN when the certainty verdict fell to unknown/free — so the param signal is never swallowed
+    by the certainty fallback chain (source=param and controllability=unknown:unknown co-exist).
+    It NEVER claims controllable: a source is not a controllability proof (asymmetry — mark weak,
+    never overclaim). ``charset`` (from source_kind) carries the injection feasibility.
+    Non-external => unknown (not carried; the demotion-visible rule leaves a real source
+    untouched)."""
     if source_class == "external_input":
         return Dimension(
             "source",
@@ -2451,7 +2453,7 @@ def _dim_source(source_class: str, source_kind: str) -> Dimension:
         "unknown",
         "unknown",
         "pattern.source_class",
-        "source is not an A2-confirmed external input — the param signal does not apply; "
+        "source is not a recognised external input — the param signal does not apply; "
         "controllability stands on its own evidence",
     )
 
@@ -2472,8 +2474,9 @@ _DETECTOR_DIMENSIONS: dict[str, tuple[str, ...]] = {
 
 def _errored_detectors(flow_evidence: Mapping[str, Any] | None) -> frozenset[str]:
     """The additive detectors that threw on this candidate's function, from the flow_evidence
-    ``detector_errors`` list. Empty when the evidence carries none (the current, pre-flatten case),
-    is not a list, or is absent — the honest default is "none recorded", not a fabricated error."""
+    ``detector_errors`` list the hunt carries over from analysis.db. Empty when the evidence carries
+    none (no detector threw, or an analysis.db extracted before the list was recorded), is not a
+    list, or is absent — the honest default is "none recorded", not a fabricated error."""
     errs = flow_evidence.get("detector_errors") if flow_evidence is not None else None
     if not isinstance(errs, list):
         return frozenset()
@@ -2492,8 +2495,7 @@ def _mark_errored_dimensions(
 ) -> tuple[Dimension, ...]:
     """Force each layer whose feeding detector threw to an honest '?' (unknown), never a confident
     empty. A '?' never sinks (the demotion iron law), so this only makes a layer MORE visible — it
-    can never bury a lead. A no-op when no mapped detector errored (the current case: nothing flows
-    the detector_errors list into the atlas yet)."""
+    can never bury a lead. A no-op when no mapped detector errored."""
     if not errored:
         return dims
     affected = {dim for det in errored for dim in _DETECTOR_DIMENSIONS.get(det, ())}
