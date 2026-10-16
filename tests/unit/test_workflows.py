@@ -5,9 +5,12 @@ can be checked off GitHub are checked here."""
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -69,10 +72,15 @@ def test_nothing_is_published_unless_the_whole_ci_passes() -> None:
     """A v* tag used to publish straight to PyPI whatever the tests said.
 
     MUTATION: drop ``needs: ci`` from the release job -> RED. MUTATION: drop ``workflow_call``
-    from ci.yml (the release could no longer run it) -> RED."""
+    from ci.yml (the release could no longer run it) -> RED. MUTATION: drop ``secrets: inherit``
+    from the ci job -> RED (observed: 1 failed) — a reusable workflow gets no secrets by default,
+    so the release-time neutrality check would silently fall back to the brand-free example."""
     release = yaml.safe_load((_WORKFLOWS / "release.yml").read_text())
     jobs = release["jobs"]
     assert jobs["ci"]["uses"] == "./.github/workflows/ci.yml"
+    # The private watchlist is a repository secret; the reusable CI workflow only sees it when the
+    # caller forwards it.
+    assert jobs["ci"].get("secrets") == "inherit"
     assert jobs["release"].get("needs") in ("ci", ["ci"])
     ci = yaml.safe_load((_WORKFLOWS / "ci.yml").read_text())
     # PyYAML reads the bare key `on` as the boolean True.
@@ -97,3 +105,57 @@ def test_every_third_party_action_is_pinned_to_a_commit() -> None:
                 if ref.startswith("./"):
                     continue  # this repository's own reusable workflow
                 assert pinned.match(ref), f"{wf.name}: {ref} is not pinned to a commit"
+
+
+def _clean_lock() -> dict[str, Any]:
+    """A fully-resolved toolchain lock: schema 1, all components present, no placeholder values."""
+    asset = {"url": "https://example.invalid/a.zip", "sha256": "0" * 64, "size": 7, "kind": "zip"}
+    component = {"version": "1.0", "assets": {"linux-x86_64": asset}}
+    return {
+        "schema": 1,
+        "components": {
+            name: json.loads(json.dumps(component))
+            for name in ("jdk", "ghidra", "binexport", "bindiff")
+        },
+    }
+
+
+def test_the_release_lock_check_exits_nonzero_on_a_placeholder(tmp_path: Path) -> None:
+    """The release step that guards the shipped lock must EXIT NON-ZERO (not merely print) when a
+    placeholder is left, or a lock naming an unpublished artifact could ship. The step's own
+    Python is run here over a wheel whose toolchain_lock.json still has a placeholder; a
+    fully-resolved lock is the control, so the failure is the placeholder and not noise.
+
+    MUTATION: change the step's ``sys.exit(...)`` to ``print(...)`` in release.yml -> it exits 0
+    -> RED (observed: the placeholder run returns 0)."""
+    run = next(s["run"] for s in _steps("release.yml") if "placeholders(" in s.get("run", ""))
+    match = re.search(r"<<'PY'\n(.*?)\nPY\b", run, re.DOTALL)
+    assert match is not None, "the lock check no longer uses a PY heredoc"
+    code = match.group(1)
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2] / "src")
+
+    def run_over(lock: dict[str, Any], tag: str) -> subprocess.CompletedProcess[str]:
+        work = tmp_path / tag
+        (work / "dist").mkdir(parents=True)
+        with zipfile.ZipFile(work / "dist" / "pkg.whl", "w") as whl:
+            whl.writestr("treasure_map/lib/setup/toolchain_lock.json", json.dumps(lock))
+        return subprocess.run(  # noqa: S603 -- the workflow's own fixed heredoc
+            [sys.executable, "-"],
+            input=code,
+            cwd=str(work),
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=60,
+        )
+
+    with_placeholder = _clean_lock()
+    with_placeholder["components"]["binexport"]["assets"]["linux-x86_64"]["url"] = "<unpublished>"
+    bad = run_over(with_placeholder, "bad")
+    assert bad.returncode != 0, f"must fail on a placeholder; out={bad.stdout!r} err={bad.stderr!r}"
+    assert "placeholders" in (bad.stdout + bad.stderr)
+
+    good = run_over(_clean_lock(), "good")
+    assert good.returncode == 0, f"clean lock must pass; out={good.stdout!r} err={good.stderr!r}"
