@@ -16,6 +16,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
+
 _REPO_ROOT = Path(__file__).parent.parent.parent
 _HOOK_SRC = _REPO_ROOT / ".githooks" / "pre-commit"
 _COMMIT_MSG_SRC = _REPO_ROOT / ".githooks" / "commit-msg"
@@ -55,7 +57,7 @@ _FAKE_LC_MODEL_SUFFIX = _FAKE_LC_MODEL + "m"
 # Lint rule codes, an interpreter tag and key/cipher sizes of the letters+digits shape that the
 # generic lowercase regex must let through (all whitelisted by its negative lookahead), so they
 # are safe to spell out in this committed source file.
-_WHITELISTED_TECH = ["UP035", "TRY003", "py312", "ed25519", "aes256"]
+_WHITELISTED_TECH = ["UP035", "TRY003", "py312", "ed25519", "aes256", "sha256s", "uint64s"]
 
 
 def _init_repo(tmp_path: Path, watchlist_lines: list[str] | None = None) -> tuple[Path, Path]:
@@ -243,12 +245,15 @@ def test_hook_does_not_flag_technical_words(tmp_path: Path) -> None:
 
 def test_example_whitelists_lint_crypto_and_interpreter_tokens(tmp_path: Path) -> None:
     """The generic lowercase regex must let lint rule codes (UP035, TRY003), an interpreter tag
-    (py312) and key/cipher sizes (ed25519, aes256) through, while STILL catching a real lowercase
+    (py312), key/cipher sizes (ed25519, aes256) and their plurals (sha256s, uint64s — the same
+    optional trailing letter the model form takes) through, while STILL catching a real lowercase
     model shape — so the exemption did not simply switch the regex off.
 
     MUTATION: delete ``|ed25519`` from the example's negative-lookahead whitelist -> ed25519 is
     flagged, the clean-tokens run returns non-zero -> RED (observed: 1 failed). MUTATION: delete
-    the whole lowercase regex line -> the model-shape run returns 0 -> RED (observed: 1 failed)."""
+    the whole lowercase regex line -> the model-shape run returns 0 -> RED (observed: 1 failed).
+    MUTATION: drop the ``[a-z]?`` before the whitelist lookahead's closing ``\\b`` -> sha256s
+    reads as a model -> RED."""
     repo, _ = _init_repo(tmp_path)
     example = repo / ".githooks" / "vendor-watchlist.example.txt"
 
@@ -330,6 +335,26 @@ def _run_ci(repo: Path, watchlist: Path, base: str, head: str) -> subprocess.Com
         text=True,
         env=env,
     )
+
+
+def test_the_whole_tree_at_head_is_clean_under_the_example() -> None:
+    """A v* tag push has no usable base, so the release-time check scans the WHOLE tree at HEAD,
+    not the pushed range. Run that exact mode, with the committed example list, over this
+    repository: any regex change that flags existing text fails here on the main push instead of
+    on the day a tag is cut (where it would stop the release).
+
+    MUTATION: drop the ``[a-z]?`` before the example whitelist lookahead's closing ``\\b`` ->
+    existing "sha256s" text reads as a model -> RED (observed: 1 failed)."""
+    inside = subprocess.run(
+        ["git", "-C", str(_REPO_ROOT), "rev-parse", "--is-inside-work-tree"],
+        capture_output=True,
+        text=True,
+    )
+    if inside.returncode != 0:
+        pytest.skip("not a git checkout")
+    result = _run_ci(_REPO_ROOT, _EXAMPLE_SRC, "", "HEAD")
+    assert "whole tree" in result.stdout + result.stderr, "the scan did not run in whole-tree mode"
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_ci_backstop_blocks_model_in_diff_content(tmp_path: Path) -> None:
