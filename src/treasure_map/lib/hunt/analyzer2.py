@@ -1,18 +1,19 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""Analyzer-2 — the pattern-driven analyzer (R-pattern -> R2 -> atlas).
+"""The pattern-driven analyzer: call-sequence shape detection -> reachability grading -> atlas.
 
-Composes two hermetic primitives and persists the result: R-pattern locates call-sequence
-shape candidates in one analysis.db; R2 grades each candidate's
-reachability; A2 upserts the RICH "callseq-v1" pattern and writes a graded instance into the
-atlas. This is the first time R-pattern's output reaches the persistent store — the pattern
-table was designed for exactly this.
+Composes two hermetic primitives and persists the result: the call-sequence shape detector
+locates shape candidates in one analysis.db; the reachability grader grades each candidate's
+reachability; analyzer2 upserts the RICH "callseq-v1" pattern and writes a graded instance into
+the atlas. This is the first time the shape detector's output reaches the persistent store — the
+pattern table was designed for exactly this.
 
-Fully hermetic: neither R-pattern nor R2 uses an LLM, so A2 needs no router.
+Fully hermetic: neither the shape detector nor the reachability grader uses an LLM, so
+analyzer2 needs no router.
 
 Discipline (enforced here and by the schema):
 - L0/L1 only (confirmed -> L1, unknown -> L0); never L2/L3, never an external_anchor.
-- Evidence neutralization: R-pattern's raw, firmware-derived evidence (a matched format
+- Evidence neutralization: the shape detector's raw, firmware-derived evidence (a matched format
   literal may carry a device path) is NEVER persisted. Traceability rides pseudocode_hash;
   evidence_ref holds only a neutral per-instance locator (run + binary/function anchor).
 - Everything written is a graded lead, never a confirmed bug or a publishable result.
@@ -291,7 +292,7 @@ def _form_note_contradicts_source(blocking_mechanism: str | None, source_kind: s
 
 @dataclass(frozen=True)
 class Analyzer2Stats:
-    scanned: int  # function rows R-pattern considered
+    scanned: int  # function rows the shape detector considered
     matches: int  # call-sequence shape matches found
     instances_written: int  # graded instances persisted into the atlas
     by_status: dict[str, int]  # reachability_status -> count, over written instances
@@ -1045,9 +1046,9 @@ def _attach_edge_leads(
 def _load_wrapper_data(
     db_path: Path | str,
 ) -> tuple[dict[int, dict[str, Any]], dict[int, list[dict[str, Any]]]]:
-    """Load the A2 transport columns: func_id -> nvram_wrapper {op,api}, and func_id -> the calls
-    that pass a constant literal to a local function. A missing column (older analysis.db) or an
-    unparsable cell yields no entry — wrapper-indirect recovery is additive."""
+    """Load the analyzer2 transport columns: func_id -> nvram_wrapper {op,api}, and func_id ->
+    the calls that pass a constant literal to a local function. A missing column (older
+    analysis.db) or an unparsable cell yields no entry — wrapper-indirect recovery is additive."""
     uri = ro_uri(Path(db_path))
     conn = sqlite3.connect(uri, uri=True)
     wrappers: dict[int, dict[str, Any]] = {}
@@ -1055,7 +1056,7 @@ def _load_wrapper_data(
     try:
         rows = conn.execute("SELECT id, nvram_wrapper, wrapper_call_args FROM functions").fetchall()
     except sqlite3.OperationalError:
-        return wrappers, call_args  # pre-A2 analysis.db -> no data
+        return wrappers, call_args  # pre-analyzer2 analysis.db -> no data
     finally:
         conn.close()
     for func_id, w_raw, ca_raw in rows:
@@ -1082,7 +1083,7 @@ def _flatten_wrapper_edges(
     call_args_by_func_id: dict[int, list[dict[str, Any]]],
     source_run_id: str,
 ) -> list[NvramFlowRow]:
-    """A2: resolve each caller's constant-literal wrapper call into an INDIRECT nvram key edge.
+    """Resolve each caller's constant-literal wrapper call into an INDIRECT nvram key edge.
 
     A recognized thin nvram wrapper forwards a caller-supplied key into one nvram accessor, so
     direct extraction records that key as key_from_caller (unresolved). Here, the caller passed a
@@ -1320,7 +1321,8 @@ def run_analyzer2(
     nvram_flow_rows = _flatten_nvram_ops(all_funcs, _load_nvram_ops(db_path), source_run_id)
     # resolve each caller's constant-literal call into a recognized thin nvram wrapper into
     # an INDIRECT key edge (via_wrapper) — the wrapper-indirect reads/writes the direct graph
-    # misses. Empty when the analysis.db predates the A2 columns. Appended to the run's flow rows.
+    # misses. Empty when the analysis.db predates the analyzer2 columns. Appended to the run's
+    # flow rows.
     _wrappers, _call_args = _load_wrapper_data(db_path)
     wrapper_edge_rows = _flatten_wrapper_edges(all_funcs, _wrappers, _call_args, source_run_id)
     nvram_flow_rows = nvram_flow_rows + wrapper_edge_rows
@@ -1694,7 +1696,7 @@ def run_analyzer2(
                     evidence_keys["anchor_degraded"] = anchor_degraded
                     # Callsite-address recovery: recover the call address out_of_body drops,
                     # so the cross-side overlay can fold co-claimed callsites and align by address.
-                    # The ref STAYS the bare class (D4 overlay anchoring is unchanged); the address
+                    # The ref STAYS the bare class (overlay anchoring is unchanged); the address
                     # lives only in flow_evidence. None (register-indirect) writes nothing.
                     callsite_addr = callsite_addr_out_of_body(
                         row.pseudocode,

@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from treasure_map.lib.pattern.extractor_names import REGISTRY
 
 # External-input getters, split by strength of external controllability (neutral,
-# mechanism-based). Strength gates reachability grading only; R-pattern's shape detection
+# mechanism-based). Strength gates reachability grading only; the call-sequence shape detector
 # uses the SOURCE union below and is unaffected by the split.
 #
 # Both sets list libc ABI aliases beside the base they mirror (the __libc_* and *_nocancel forms,
@@ -104,8 +104,8 @@ SOURCE_WEAK: frozenset[str] = frozenset(
     }
 )
 
-# Union — the set R-pattern uses for "is this callee an external-input source" (shape, not
-# strength). Keep this equal to the historical SOURCE so R-pattern stays unchanged.
+# Union — the set the shape detector uses for "is this callee an external-input source" (shape, not
+# strength). Keep this equal to the historical SOURCE so the shape detector stays unchanged.
 SOURCE: frozenset[str] = SOURCE_STRONG | SOURCE_WEAK
 
 # String formatters: build a buffer from a format and arguments, or append to one. The _chk forms

@@ -84,8 +84,9 @@ class Dimension:
     an optimistic fallback or a coarse zero-discrimination pattern label), ``likely`` (~ an
     optimistic-but-unconfirmed reading, e.g. a router_defaults-member controllability or the
     optimistic 'free' text-level fallback — carries ``value`` but never claims proof),
-    ``structural`` (~ a structural lead from the coarse pattern layer, e.g. an A2 external_input
-    source — a fact about shape that points somewhere to look, NOT a controllability proof),
+    ``structural`` (~ a structural lead from the coarse pattern layer, e.g. an analyzer2
+    external_input source — a fact about shape that points somewhere to look, NOT a
+    controllability proof),
     ``excluded`` (✗ established not-applicable / ruled out), ``unknown`` (? not established —
     ``note`` says what is missing and why). ``value`` is the concrete reading (``free`` / ``cmd``);
     ``source`` names where it came from; ``note`` carries the reason for a ? or an honest caveat.
@@ -928,10 +929,10 @@ def _likely_settable_keys_reaching_sink(
     string):
       1. GETTER/WRAPPER-gated. 'likely' is only router_defaults membership — a weaker signal that
          includes read-only internal keys — so it is trusted ONLY for a key genuinely READ from
-         nvram (a direct getter or an A2 thin wrapper, via ``_nvram_key_from_source``), never any
-         const literal that merely happens to sit in router_defaults. This gate is exactly what
-         the front-end cross's wrapper attribution buys: without it the likely tier could not tell
-         an nvram read from an incidental string.
+         nvram (a direct getter or an analyzer2 thin wrapper, via ``_nvram_key_from_source``),
+         never any const literal that merely happens to sit in router_defaults. This gate is
+         exactly what the front-end cross's wrapper attribution buys: without it the likely tier
+         could not tell an nvram read from an incidental string.
       2. DOMINANCE-filtered (``_judged_writers``, the SAME filter as the verdict): a likely key in a
          non-dominating branch flows to a different sink and must not light this one.
     Order-preserving, deduped. Empty when nothing qualifies (the caller then falls through the
@@ -1184,16 +1185,16 @@ def get_sink_provenance(
 
 
 def _nvram_wrapper_names(conn: sqlite3.Connection) -> frozenset[str]:
-    """The thin nvram-wrapper function names A2 recognised, read back from the atlas.
+    """The thin nvram-wrapper function names analyzer2 recognised, read back from the atlas.
 
-    A2 marks a caller's constant-key call THROUGH a thin nvram wrapper as an indirect key edge and
-    stores the wrapper's name in ``nvram_key_flow.via_wrapper``. The candidate-layer source
+    analyzer2 marks a caller's constant-key call THROUGH a thin nvram wrapper as an indirect key
+    edge and stores the wrapper's name in ``nvram_key_flow.via_wrapper``. The candidate-layer source
     attribution never consumed that capability — so a key read via a wrapper (the COMMON case on
     this class of firmware, where almost every nvram access goes through a shared accessor rather
     than a bare nvram_get) was attributed to nothing and its sink collapsed to unknown. Reusing the
-    SAME wrapper set here (not re-recognising wrappers — the one A2 capability the candidate layer
-    lacked, isomorphic to the dominance case: a lower layer computed it, this one didn't read it)
-    closes that gap. Name-only match, cross-binary: an over-match over-promotes a key (the SAFE
+    SAME wrapper set here (not re-recognising wrappers — the one analyzer2 capability the candidate
+    layer lacked, isomorphic to the dominance case: a lower layer computed it, this one didn't read
+    it) closes that gap. Name-only match, cross-binary: an over-match over-promotes a key (the SAFE
     direction — a wrong promote stays visible, a wrong demote hides a bug), it never hides one; the
     downstream web_settable gate, not this set, is what actually decides controllability."""
     try:
@@ -1215,7 +1216,7 @@ _NVRAM_VALUE_READERS: frozenset[str] = _EXTRACTOR_NAMES.nvram_value_getters | NV
 
 def _is_nvram_value_read(callee: Any, wrapper_names: frozenset[str]) -> bool:
     """True when a call_return from ``callee`` carries an nvram VALUE: a value-returning nvram read,
-    or a thin nvram wrapper recognised for this database (``wrapper_names``, from A2)."""
+    or a thin nvram wrapper recognised for this database (``wrapper_names``, from analyzer2)."""
     return isinstance(callee, str) and (callee in _NVRAM_VALUE_READERS or callee in wrapper_names)
 
 
@@ -1230,7 +1231,7 @@ def _key_const(value: Any) -> str | None:
 def _nvram_key_from_source(source: Any, wrapper_names: frozenset[str] = frozenset()) -> str | None:
     """The nvram key if ``source`` is a call_return reading an nvram value — via an accessor the
     extractor registry knows, a read-side getter name, or a thin wrapper (``wrapper_names``, from
-    A2) — else None.
+    analyzer2) — else None.
 
     For a registry accessor the key is read at the accessor's own key position from
     ``const_args_by_pos`` (``nvram_bufget(index, key)`` keeps its key in argument 1, so the first
@@ -1240,8 +1241,8 @@ def _nvram_key_from_source(source: Any, wrapper_names: frozenset[str] = frozense
 
     A record with no positions (an extraction that predates them), a thin wrapper, or a read-side
     getter name takes the first constant argument (``const_args[0]``) — what the extractor recorded
-    for ``nvram_get("wan_proto")``, and what a thin forwarder passes straight through (A2's thin
-    test is what earns that equivalence). A composite accessor without positions is None: its
+    for ``nvram_get("wan_proto")``, and what a thin forwarder passes straight through (analyzer2's
+    thin test is what earns that equivalence). A composite accessor without positions is None: its
     first constant may be the prefix alone. Either way a 0x… constant is never a key."""
     if not isinstance(source, dict) or source.get("kind") != "call_return":
         return None
@@ -1820,8 +1821,8 @@ def _controllability_reading(
     source_kind as a fallback, NOT source_kind abandoned:
       1. controllable/proven — provenance shows a proven WEB-SETTABLE key (SaTC front x back cross)
          reaching the sink argument. The strongest controllability the map asserts.
-      2. controllable/likely — a key READ from nvram (getter or A2 thin wrapper) that reaches the
-         sink is a router_defaults member but NOT a proven cross. Gated to a genuine nvram read
+      2. controllable/likely — a key READ from nvram (getter or analyzer2 thin wrapper) that reaches
+         the sink is a router_defaults member but NOT a proven cross. Gated to a genuine nvram read
          and dominance-scoped (via _likely_settable_keys_reaching_sink); ranked below
          proven-controllable and above the optimistic 'free'. Placed before the constant steps: a
          dynamic nvram key reaching the arg cannot co-occur with a proven-constant reading — and if
@@ -2617,10 +2618,10 @@ def _candidate_in_run(
     # in the function.
     callsite_addr = callsite_abs_addr(row["evidence_ref"])
     # The resolved nvram key for the source_writability layer: a recognized nvram accessor — a
-    # direct getter (NVRAM_GETTERS) OR an A2 thin wrapper (wrapper_names) — first, else the first
-    # web-settable key the verdict found reaching the sink. Wrapper-aware so a key read through
-    # a shared accessor (the common case) still shows in source_writability and the nvram-source
-    # view, coherent with the controllability reading.
+    # direct getter (NVRAM_GETTERS) OR an analyzer2 thin wrapper (wrapper_names) — first, else the
+    # first web-settable key the verdict found reaching the sink. Wrapper-aware so a key read
+    # through a shared accessor (the common case) still shows in source_writability and the
+    # nvram-source view, coherent with the controllability reading.
     nvram_key = _nvram_source_key(fe, wrapper_names, sink_anchor, callsite_addr=callsite_addr)
     if nvram_key is None:
         web_keys = _web_settable_keys_reaching_sink(
@@ -2773,18 +2774,18 @@ _CHARSET_FEASIBILITY_RANK: dict[str, int] = {
 
 
 def _is_param_source(c: TriageCandidate) -> bool:
-    """True when A2 marked this candidate's source external_input (source=structural:param). The
-    param float / charset tiebreak / filter all route through this ONE predicate, so demoting the
-    source state from proven to structural leaves the sort and filter behaviour untouched."""
+    """True when analyzer2 marked this candidate's source external_input (source=structural:param).
+    The param float / charset tiebreak / filter all route through this ONE predicate, so demoting
+    the source state from proven to structural leaves the sort and filter behaviour untouched."""
     d = c.dim("source")
     return d.state == "structural" and d.value == "param"
 
 
 def _param_float(c: TriageCandidate) -> int:
-    """1 when an A2 external_input reaches the sink with an UNCONSTRAINED-or-unknown charset — a
-    structural command/exec-injection lead that floats ABOVE same-certainty non-param peers (lifting
-    the 59 external_input×unknown out of the unknown pile, and the 41 ×free_string to the top of the
-    'free' band). Placed AFTER the certainty key so it NEVER overrides controllability (a
+    """1 when an analyzer2 external_input reaches the sink with an UNCONSTRAINED-or-unknown charset
+    — a structural command/exec-injection lead that floats ABOVE same-certainty non-param peers
+    (lifting the 59 external_input×unknown out of the unknown pile, and the 41 ×free_string to the
+    top of the 'free' band). Placed AFTER the certainty key so it NEVER overrides controllability (a
     proven/likely-controllable candidate still wins its tier — guardrail 3). Gated OUT for
     charset_safe (the param-internal demotion iron law: a converter-constrained value cannot inject,
     so it is never floated)."""
@@ -2963,8 +2964,8 @@ def _matches(c: TriageCandidate, dim: str, value: str) -> bool:
     v = value.lower()
     if dim == "source":
         # 'source' carries two orthogonal lenses: ``source=nvram`` = a resolved nvram source key;
-        # ``source=param`` = the A2 external_input signal (the source Dimension). Any other value is
-        # a no-op (matches all), mirroring the permissive legacy behaviour.
+        # ``source=param`` = the analyzer2 external_input signal (the source Dimension). Any other
+        # value is a no-op (matches all), mirroring the permissive legacy behaviour.
         if v == "nvram":
             return c.nvram_source_key is not None
         if v == "param":
@@ -3265,8 +3266,8 @@ def triage(conn: sqlite3.Connection, *, run_id: str | None = None) -> list[Triag
         sql += " WHERE i.source_run_id = ?"
         params.append(run_id)
     rows = conn.execute(sql, params).fetchall()
-    # Compute the A2 thin-nvram-wrapper set ONCE per run (not per candidate) and thread it down —
-    # the candidate-layer source attribution reuses it to recognise wrapper-read keys.
+    # Compute the analyzer2 thin-nvram-wrapper set ONCE per run (not per candidate) and thread it
+    # down — the candidate-layer source attribution reuses it to recognise wrapper-read keys.
     wrapper_names = _nvram_wrapper_names(conn)
     candidates = [_candidate(conn, r, wrapper_names) for r in rows]
     return sort_candidates(candidates, spine="impact")
