@@ -8,6 +8,7 @@ They verify fail-fast behaviour, dirty-set routing, and result fields.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -346,3 +347,85 @@ def test_only_this_runs_successes_are_ingested_against_its_pass(tmp_path: Path) 
     passed = args[2] if len(args) > 2 else kwargs["dirty_records"]
     assert [r.sha256 for r in passed] == ["deadbeef"]
     assert kwargs.get("pass_version") == "testpass"
+
+
+# ── the success stamp and the function rows are one transaction, seen from the scan ────────────
+
+
+def test_an_ingest_that_dies_leaves_no_success_stamp(tmp_path: Path) -> None:
+    """Ghidra succeeds for the binary, then the ingest dies after writing its function rows and
+    before committing them. Neither the rows nor the success stamp (ghidra_ok=1 + pass_version)
+    may survive the scan: a stamp without its functions is read by the next scan as a finished
+    extraction and skipped forever.
+
+    The stamp is written in the same transaction as the function rows, inside the ingest; this pins
+    that from the pipeline, the side the stamp used to be written and committed on.
+
+    MUTATION (verified RED): in run_analyze's result loop, also write the success stamp
+    (``UPDATE binaries SET ghidra_ok=1, ghidra_status=?, pass_version=?, ghidra_version=?``) and
+    ``conn.commit()`` before ingest_ghidra_output runs -> the stamp survives the failed ingest and
+    the ``pass_version is None`` assertion fails."""
+    from treasure_map.lib.analyze import ghidra_ingest
+    from treasure_map.lib.analyze.stub_resolve import STUB_MARKER_NONE
+    from treasure_map.lib.storage.connection import open_db
+
+    rec = _rec("httpd", "facefeed" * 8)
+    runner = _mock_runner([_ok_ghidra(rec)])
+    real_ingest = ghidra_ingest._ingest_one_binary
+    rows_written: list[int] = []
+
+    def dies_after_writing(conn: Any, binary_id: int, *args: Any) -> None:
+        real_ingest(conn, binary_id, *args)
+        rows_written.append(
+            conn.execute(
+                "SELECT COUNT(*) FROM functions WHERE binary_id = ?", (binary_id,)
+            ).fetchone()[0]
+        )
+        raise RuntimeError("the ingest died before its commit")
+
+    with patch(f"{MODULE}.GhidraRunner", return_value=runner):
+        with patch(f"{MODULE}.scan_filesystem", return_value=[rec]):
+            with patch(f"{MODULE}.ingest_elfs", _mock_ingest({rec.sha256})):
+                with Workspace(tmp_path / "ws") as ws:
+                    # ingest_elfs is mocked, so the row it would have inserted is seeded (id 1).
+                    seed = open_db(ws.db_path)
+                    seed.execute(
+                        "INSERT INTO binaries (id, name, path, sha256, last_seen_at) "
+                        "VALUES (1, ?, ?, ?, '2026-01-01')",
+                        (rec.name, str(rec.path), rec.sha256),
+                    )
+                    seed.commit()
+                    seed.close()
+                    # the extractor's output for this scan's pass, as Ghidra would leave it
+                    out = ws.path / "ghidra_output"
+                    out.mkdir(parents=True, exist_ok=True)
+                    (out / f"{rec.name}_{rec.sha256[:8]}_ghidra.json").write_text(
+                        json.dumps(
+                            {
+                                "pass_version": "testpass",
+                                "sha8": rec.sha256[:8],
+                                "stub_marker": STUB_MARKER_NONE,
+                                "functions": [
+                                    {"name": "main", "address": "0x1000", "pseudocode": "int m(){}"}
+                                ],
+                                "imports": [],
+                                "exports": [],
+                                "strings": [],
+                            }
+                        )
+                    )
+                    with patch.object(ghidra_ingest, "_ingest_one_binary", dies_after_writing):
+                        with pytest.raises(RuntimeError, match="died before its commit"):
+                            run_analyze(tmp_path / "fs", ws, _cfg())
+
+                    conn = open_db(ws.db_path)
+                    row = conn.execute(
+                        "SELECT ghidra_ok, pass_version FROM binaries WHERE id = 1"
+                    ).fetchone()
+                    funcs = conn.execute("SELECT COUNT(*) FROM functions").fetchone()[0]
+                    conn.close()
+
+    assert rows_written == [1]  # the ingest really wrote the function row before it died
+    assert funcs == 0  # ...and it went with the failed transaction
+    assert row["pass_version"] is None  # the stamp went with it: not marked extracted
+    assert row["ghidra_ok"] == 0

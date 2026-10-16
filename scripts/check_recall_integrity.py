@@ -58,6 +58,7 @@ from pathlib import Path
 from treasure_map.lib.errors import ConfigError
 from treasure_map.lib.pattern import scanner
 from treasure_map.lib.pattern.models import PatternStats
+from treasure_map.lib.ro_db import ro_connect
 
 # Gate A: const_sink_arg must never coexist with a free_string sink argument.
 _GATE_A_SQL = (
@@ -88,7 +89,7 @@ _GATE_C_SQL = (
 
 def _count(db_path: Path, sql: str) -> int:
     """Run a COUNT(*) invariant query against a database opened read-only."""
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn = ro_connect(db_path)
     try:
         return int(conn.execute(sql).fetchone()[0])
     finally:
@@ -160,8 +161,8 @@ def gate_e_violations(atlas_db: Path, analysis_db: Path) -> tuple[int, int]:
     from treasure_map.lib.hunt.downweight import _SHELL_RUN_SINKS, _sink_arg_is_literal
     from treasure_map.lib.pattern.classes import all_path_calls_literal, call_offsets
 
-    atlas = sqlite3.connect(f"{atlas_db.resolve().as_uri()}?mode=ro", uri=True)
-    analysis = sqlite3.connect(f"{analysis_db.resolve().as_uri()}?mode=ro", uri=True)
+    atlas = ro_connect(atlas_db)
+    analysis = ro_connect(analysis_db)
     violations = unverifiable = 0
     try:
         for ref, sink, sink_class in atlas.execute(_GATE_E_SQL).fetchall():
