@@ -1691,6 +1691,7 @@ def make_tools(
         not_listed_page: str | None = None,
         body: str | None = None,
         anchored_differs: bool = False,
+        anchored_micro_side: bool = False,
     ) -> dict[str, Any]:
         """START HERE for one diff (``diff_id`` = ``{run_a}::{run_b}::{binary}``; list_diffs gives
         the ids): one entry per FUNCTION PAIR that changed, with what happened around its sink
@@ -1748,8 +1749,12 @@ def make_tools(
         ``decompile_incomplete:<tag>`` = the decompiler marked its output incomplete,
         ``body_size_differs`` = the two body byte counts differ), ``identical_callee_unverified``
         (text matches, callees not verified — NOT "unchanged"), ``differs``, ``no_body`` (an
-        import/PLT stub, not in the functions table) or ``unavailable`` (in the table, empty
-        body); the similarity-1 pairs that place no entry are counted by it under ``not_listed``
+        import/PLT stub, not in the functions table) or ``unavailable`` (in the table, empty body —
+        get_diff_meta's functions.unavailable_by_cause splits these by why: ``skipped_micro`` = the
+        function is under ~10 bytes and tmap does not decompile it BY DESIGN, a binary property and
+        NOT a read failure, told apart from ``decompile_empty`` / ``size_unknown`` /
+        ``db_unavailable``);
+        the similarity-1 pairs that place no entry are counted by it under ``not_listed``
         (``not_listed_page=<name>`` walks one category, e.g. ``aligned_pseudocode_differs``). A
         qualified match carries ``hidden_region``: each decompiler warning with the address it
         names and whether that lies in the function's own body, ``body`` (``structure_differs``
@@ -1776,7 +1781,14 @@ def make_tools(
         flagged pairs, read-first ones first, then by similarity, highest first (``sort_by``
         orders them instead); with ``sort_by='significance'`` they lead attention 1 (basis
         ``anchored_differs``). A fact, not a verdict, and it clears nothing else in R: the other
-        pairs reading differs still need reading. Not checked by any of
+        pairs reading differs still need reading. A flagged pair whose ONLY change is a
+        ``__FILE__``/``__LINE__`` line-number shift stays flagged but is demoted out of the
+        read-first head (``in_read_first`` false, ``line_number_form`` {delta, sites} in its
+        reading). Separately, ``anchored_micro_side=true`` (same scope) lists the undetermined pairs
+        anchored with exactly one side a design-skipped micro-stub (under ~10 bytes, not decompiled
+        BY DESIGN — a binary property, not a read failure) and the other a real body; basis
+        ``anchored_micro_side`` under the significance lens, ``one_side_skipped_micro`` for the
+        aligned pairs of that shape. Not checked by any of
         these: the target a ``DAT_`` / ``PTR_`` reference points at once its address is blanked
         (a string label keeps its content in the name); a C++ catch handler (landing pad), which
         usually lies outside every function body, so its code is never decompiled and no reading
@@ -1827,6 +1839,7 @@ def make_tools(
                 not_listed_page=not_listed_page,
                 body=body,
                 anchored_differs=anchored_differs,
+                anchored_micro_side=anchored_micro_side,
             )
         finally:
             conn.close()
@@ -2066,12 +2079,17 @@ def make_tools(
         changed sink length constant; ``no_scoped_signal`` = no in-scope sink signal, NOT
         'noise'), ``unverified`` (identical_text_unverified + identical_callee_unverified +
         unavailable — neither unchanged nor changed; ``identical_text_unverified_by_body`` splits
-        the first by body class), ``no_body`` (an import / PLT stub, counted apart),
+        the first by body class; ``unavailable_by_cause`` splits the unavailable count by why a side
+        had no text, summing to it), ``no_body`` (an import / PLT stub, counted apart),
         ``alignment_undetermined`` (``alignment_undetermined_reading`` splits it by each pair's
         proposed reading, never into the aligned counts;
-        ``alignment_undetermined_anchored_differs`` = the pairs flagged anchored_differs at or
-        above the read-first floor, ``alignment_undetermined_anchored_differs_all`` = every flagged
-        pair, below the floor included), and ``one_sided`` by presence_state
+        ``alignment_undetermined_anchored_differs`` = the pairs flagged anchored_differs at or above
+        the read-first floor whose change is NOT just a line-number shift (the read-first head),
+        ``alignment_undetermined_anchored_differs_line_number_form`` = those at/above the floor
+        demoted for a __FILE__/__LINE__ shift, ``alignment_undetermined_anchored_differs_all`` =
+        every flagged pair below the floor included, ``alignment_undetermined_anchored_micro_side``
+        = anchored pairs with one side a micro-stub, ``alignment_undetermined_unavailable_by_cause``
+        = the proposed-unavailable pairs split by cause), and ``one_sided`` by presence_state
         (never 'added' / 'removed'). ``banners``: when any pair is flagged, one banner names those
         counts and the total reading differs, with the calls that read them and walk the rest of R
         — the flagged pairs do not stand for the rest; a withheld diff's banners otherwise; empty

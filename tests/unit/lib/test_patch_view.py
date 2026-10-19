@@ -1064,7 +1064,7 @@ def test_fun_names_are_compared_through_the_alignment(world: World) -> None:
 
     MUTATION (verified RED): compare FUN_ names as names -> differs."""
     e = _entry(world, _pair_id("00015000", "00016000"))
-    assert e["callee_set"] == {"state": "equal"}
+    assert e["callee_set"] == {"state": "equal", "callees_complete": True}
     assert "callee_set_unchanged" in e["facts"]
     assert e["bucket"] == "C"
 
@@ -1103,7 +1103,13 @@ def test_a_truncated_list_is_undetermined(world: World) -> None:
 
 def test_a_call_one_side_makes_is_named(world: World) -> None:
     cs = _entry(world, _pair_id("00013000", "00014000"))["callee_set"]
-    assert cs == {"state": "differs", "only_in_a": ["log_it"], "only_in_b": []}
+    # callees_complete: the empty only_in_b is a proven-empty difference, not a list not extracted.
+    assert cs == {
+        "state": "differs",
+        "only_in_a": ["log_it"],
+        "only_in_b": [],
+        "callees_complete": True,
+    }
 
 
 def test_a_callee_that_is_a_thin_command_wrapper_is_marked(world: World) -> None:
@@ -1116,7 +1122,7 @@ def test_an_unchanged_callee_set_never_moves_an_entry_with_a_candidate(world: Wo
     """The persisted pair's lists differ; the A pair's are equal-looking elsewhere: the bucket is
     the rows', whatever the callee set says."""
     e = _entry(world, _pair_id("00028000", "00029000"))
-    assert e["callee_set"] == {"state": "equal"}
+    assert e["callee_set"] == {"state": "equal", "callees_complete": True}
     assert e["bucket"] == "B" and e["subclass"] == "same_callee_non_candidate"
 
 
@@ -2164,7 +2170,10 @@ def test_an_r_pairs_callee_comparison_adds_no_fact(tmp_path: Path, current: None
     assert "callee_set_unchanged" in v[_pair_id("00001000", "00002000")]["facts"]
     assert "one_hop_sink:system" in v[_pair_id("00003000", "00004000")]["facts"]
     same_r, hop_r = v[_pair_id("00006000", "00007000")], v[_pair_id("00008000", "00009000")]
-    assert same_r["proposed_pair_reading"]["callee_set"] == {"state": "equal"}
+    assert same_r["proposed_pair_reading"]["callee_set"] == {
+        "state": "equal",
+        "callees_complete": True,
+    }
     assert hop_r["proposed_pair_reading"]["callee_set"]["only_in_b"] == ["run_cmd"]
     assert same_r["facts"] == [] and hop_r["facts"] == []
 
@@ -2562,6 +2571,260 @@ def test_the_floor_bounds_the_read_first_count_and_nothing_else(
     assert set(listed["by_id"]) == {at, below}
 
 
+# ── B: micro-side surfacing, line-number demotion, unavailable_by_cause ───────────────────────
+
+
+def _micro_pair(w: World, a: str, b: str, sim: float, *, callee_b: str = "foo") -> str:
+    """One undetermined pair anchored at one address: side a a real body, side b a design-skipped
+    micro-stub (empty, 8 bytes). ``callee_b`` controls whether the callee set also differs."""
+    w.pair(a, b, 0.5, sim)
+    w.fn("a", a, ["foo"], pseudocode="x = foo(1);", size_bytes=200)
+    w.fn("b", b, [callee_b], pseudocode=None, size_bytes=8)
+    return _pair_id(a, b)
+
+
+def test_an_anchored_micro_side_pair_floats_to_read_first_and_filters(
+    tmp_path: Path, current: None
+) -> None:
+    """One side a design-skipped micro-stub and the other a real body, anchored, no export gap:
+    basis anchored_micro_side, floated to read_first inside attention 1 AHEAD of a plain R pair of
+    LOWER similarity, counted, and listed by the anchored_micro_side filter.
+
+    MUTATION: give anchored_micro_side its significance basis but not read_first order 1 -> the
+    higher-similarity micro pair no longer sorts ahead of the 0.3 plain pair -> RED."""
+    w = World(tmp_path)
+    micro = _micro_pair(w, "00030000", "00030000", 0.8)  # same callee -> not differs, micro only
+    plain = _ud(w, "00031000", "00032000", 0.3)  # reads differs, unanchored (two addresses)
+    w.commit()
+    v = _view(w, sort_by="significance")
+    assert v["by_id"][micro]["significance"] == {"attention": 1, "basis": "anchored_micro_side"}
+    r = _reading(v, micro)
+    assert r["state"] == "unavailable" and "anchored_differs" not in r  # micro only, not differs
+    order = [e["entry_id"] for e in v["entries"]]
+    assert order.index(micro) < order.index(plain)  # read_first floats it past the lower-sim plain
+    s = pv.function_states(w.atlas, DIFF)
+    assert s is not None and s["alignment_undetermined_anchored_micro_side"] == 1
+    # a micro pair is NOT anchored_differs: it must not inflate the anchored_differs count (the
+    # ``_all`` decoupling) nor carry anchored_differs in its reading (_proposed_json decoupling).
+    assert s["alignment_undetermined_anchored_differs_all"] == 0
+    assert set(_view(w, bucket="R", anchored_micro_side=True)["by_id"]) == {micro}
+
+
+def test_a_micro_side_needs_exactly_one_stub_against_a_real_body(
+    tmp_path: Path, current: None
+) -> None:
+    """Two real bodies, or two micro-stubs, are not anchored_micro_side: only one stub against one
+    real body is.
+
+    MUTATION: read 'both empty' as the condition instead of exactly one skipped_micro -> the
+    both-micro pair is flagged -> RED."""
+    w = World(tmp_path)
+    _ud(w, "00030000", "00030000", 0.8)  # two real bodies (anchored_differs, not micro)
+    w.pair("00031000", "00031000", 0.5, 0.8)  # two micro-stubs
+    w.fn("a", "00031000", ["foo"], pseudocode=None, size_bytes=8)
+    w.fn("b", "00031000", ["foo"], pseudocode=None, size_bytes=8)
+    w.commit()
+    s = pv.function_states(w.atlas, DIFF)
+    assert s is not None and s["alignment_undetermined_anchored_micro_side"] == 0
+    assert _view(w, bucket="R", anchored_micro_side=True)["by_id"] == {}
+
+
+def test_a_pair_that_is_both_micro_side_and_differs_reads_as_micro(
+    tmp_path: Path, current: None
+) -> None:
+    """A micro-side pair whose callee sets ALSO differ is flagged both ways; the significance basis
+    is anchored_micro_side (the micro branch is tried first), and it is counted under both.
+
+    MUTATION: put the anchored_differs branch before anchored_micro_side in significance -> basis
+    anchored_differs -> RED."""
+    w = World(tmp_path)
+    eid = _micro_pair(w, "00030000", "00030000", 0.8, callee_b="bar")  # micro AND callee differs
+    w.commit()
+    v = _view(w, sort_by="significance")
+    assert v["by_id"][eid]["significance"]["basis"] == "anchored_micro_side"
+    assert _reading(v, eid)["state"] == "differs"  # callees differ -> also anchored_differs
+    s = pv.function_states(w.atlas, DIFF)
+    assert s is not None
+    assert s["alignment_undetermined_anchored_micro_side"] == 1
+    assert s["alignment_undetermined_anchored_differs_all"] == 1  # counted under both lenses
+
+
+def test_an_aligned_micro_pair_carries_the_fact_and_is_held_at_attention_one(
+    tmp_path: Path, current: None
+) -> None:
+    """An aligned pair with one side a micro-stub carries the one_side_skipped_micro fact, and the
+    significance lens holds a fact-carrying entry at attention 1 instead of sinking it to 2 as a
+    bucket-C / identical pair would be.
+
+    MUTATION: drop the one_side_skipped_micro branch in significance -> a bucket-C entry carrying
+    the fact sinks to attention 2 -> RED."""
+    w = World(tmp_path)
+    w.pair("00050000", "00051000", 0.97, 1.0)  # aligned
+    w.fn("a", "00050000", ["foo"], pseudocode="y = f();", size_bytes=200)  # ok
+    w.fn("b", "00051000", ["foo"], pseudocode=None, size_bytes=8)  # micro
+    w.commit()
+    built = pv.build_diff_view(w.atlas, DIFF)
+    assert built is not None
+    readings = pv._pseudo_readings(w.atlas, built)
+    pv._annotate_entries(built, readings)
+    e = next(x for x in built.placed if x.pair is not None and x.pair.addr_a == "00050000")
+    assert "one_side_skipped_micro" in e.facts  # the aligned micro fact was attached
+    held = pv._Entry(pair=None, unpaired=None, bucket="C", facts=["one_side_skipped_micro"])
+    assert pv.significance(held, None, None, None) == (
+        pv.ATTENTION_MIDDLE,
+        "one_side_skipped_micro",
+    )
+    sunk = pv._Entry(pair=None, unpaired=None, bucket="C")
+    assert pv.significance(sunk, None, None, None) == (pv.ATTENTION_SINK, "no_sink_candidate")
+
+
+def test_cause_of_splits_the_unavailable_pairs_strongest_gap_first(
+    tmp_path: Path, current: None
+) -> None:
+    """The five-bucket cause of a UNAVAILABLE pair, strongest gap first: a db read failure wins over
+    everything, a real empty decompile over a design skip, and one stub against a real body is
+    one_side_skipped_micro.
+
+    MUTATION: drop the DECOMPILE_EMPTY check -> a micro + decompile_empty pair falls through to
+    one_side_skipped_micro -> RED."""
+    sm = sameness
+
+    def mk(sa: str, sb: str) -> dict[str, Any]:
+        return {"a": {"status": sa, "size_bytes": 0}, "b": {"status": sb, "size_bytes": 0}}
+
+    assert pv._cause_of(mk(sm.DB_UNAVAILABLE, sm.DECOMPILE_EMPTY)) == "db_unavailable"
+    assert pv._cause_of(mk(sm.DECOMPILE_EMPTY, sm.SKIPPED_MICRO)) == "decompile_empty"
+    assert pv._cause_of(mk(sm.SIZE_UNKNOWN, sm.SKIPPED_MICRO)) == "size_unknown"
+    assert pv._cause_of(mk(sm.SKIPPED_MICRO, "ok")) == "one_side_skipped_micro"
+    assert pv._cause_of(mk(sm.SKIPPED_MICRO, sm.SKIPPED_MICRO)) == "both_skipped_micro"
+    assert pv._cause_of(None) == "db_unavailable"
+
+
+def test_unavailable_by_cause_sums_to_its_count(tmp_path: Path, current: None) -> None:
+    """get_diff_meta's aligned unavailable_by_cause splits the aligned unavailable count by cause,
+    its values summing to it; a design-skipped micro-stub is told apart from a real decompile gap.
+
+    MUTATION: fold decompile_empty into skipped_micro in _body_status -> the 64-byte empty pair
+    lands in one_side_skipped_micro -> RED."""
+    w = World(tmp_path)
+    w.pair("00060000", "00060000", 0.97, 1.0)  # one side micro, one ok
+    w.fn("a", "00060000", ["foo"], pseudocode="y = 1;", size_bytes=200)
+    w.fn("b", "00060000", ["foo"], pseudocode=None, size_bytes=8)
+    w.pair("00061000", "00061000", 0.97, 1.0)  # both micro
+    w.fn("a", "00061000", ["foo"], pseudocode=None, size_bytes=8)
+    w.fn("b", "00061000", ["foo"], pseudocode=None, size_bytes=8)
+    w.pair("00062000", "00062000", 0.97, 1.0)  # real empty decompile (>= 10 bytes)
+    w.fn("a", "00062000", ["foo"], pseudocode=None, size_bytes=64)
+    w.fn("b", "00062000", ["foo"], pseudocode="y = 1;", size_bytes=200)
+    w.pair("00063000", "00063000", 0.97, 1.0)  # size unrecorded
+    w.fn("a", "00063000", ["foo"], pseudocode=None, size_bytes=0)
+    w.fn("b", "00063000", ["foo"], pseudocode="y = 1;", size_bytes=200)
+    w.commit()
+    s = pv.function_states(w.atlas, DIFF)
+    assert s is not None
+    assert s["unavailable_by_cause"] == {
+        "db_unavailable": 0,
+        "decompile_empty": 1,
+        "size_unknown": 1,
+        "one_side_skipped_micro": 1,
+        "both_skipped_micro": 1,
+    }
+    assert sum(s["unavailable_by_cause"].values()) == s["unverified"]["unavailable"] == 4
+
+
+def test_a_line_number_shift_is_demoted_out_of_the_read_first_head(
+    tmp_path: Path, current: None
+) -> None:
+    """An anchored_differs pair at/above the floor whose only change is a __FILE__/__LINE__ shift is
+    demoted out of the read-first head: still flagged (listed by anchored_differs=true), but
+    in_read_first false and carrying line_number_form. A pair with a real change stays in the head;
+    the count moves from the head (N) to line_number_form (L) while _all is unchanged.
+
+    MUTATION: lower the count only, not the read_first order -> the shift pair stays in_read_first
+    true and leads the head -> RED."""
+    w = World(tmp_path)
+    w.pair("00040000", "00040000", 0.5, 0.9)  # anchored, undetermined, above the floor
+    w.fn("a", "00040000", ["log"], pseudocode='log("x.c", 10);', size_bytes=200)
+    w.fn("b", "00040000", ["log"], pseudocode='log("x.c", 17);', size_bytes=200)
+    real = _ud(w, "00041000", "00041000", 0.9)  # a real change (an inserted term), stays in head
+    w.commit()
+    shift = _pair_id("00040000", "00040000")
+    v = _view(w)
+    sr = _reading(v, shift)
+    assert sr["anchored_differs"] is True and sr["in_read_first"] is False
+    assert sr["line_number_form"] == {"delta": 7, "sites": 1}
+    hr = _reading(v, real)
+    assert hr["in_read_first"] is True and "line_number_form" not in hr
+    s = pv.function_states(w.atlas, DIFF)
+    assert s is not None
+    assert s["alignment_undetermined_anchored_differs"] == 1  # N: only the real one in the head
+    assert s["alignment_undetermined_anchored_differs_line_number_form"] == 1  # L
+    assert s["alignment_undetermined_anchored_differs_all"] == 2  # _all unchanged
+    assert set(_view(w, bucket="R", anchored_differs=True)["by_id"]) == {shift, real}
+    banner = pv.anchored_differs_banner(s)
+    assert banner is not None
+    assert "1 more anchored pairs were demoted" in banner and "__FILE__/__LINE__" in banner
+
+
+def test_no_body_is_never_flagged_but_unavailable_with_differing_callees_is(
+    tmp_path: Path, current: None
+) -> None:
+    """A no_body side (an import / PLT stub, absent from the table) never carries anchored_differs;
+    an unavailable side (present, empty body) whose callee set is PROVEN different does — a changed
+    call set is proof of change even with no body to read.
+
+    MUTATION: extend the differs exclusion from no_body to unavailable pairs -> the second pair
+    loses its flag -> RED."""
+    w = World(tmp_path)
+    w.pair("00070000", "00070000", 0.5, 0.9)  # side b absent from the table -> no_body
+    w.fn("a", "00070000", ["foo"], pseudocode="x = foo(1);", size_bytes=200)
+    w.pair("00071000", "00071000", 0.5, 0.9)  # side b present, empty body, different callee
+    w.fn("a", "00071000", ["foo"], pseudocode="x = foo(1);", size_bytes=200)
+    w.fn("b", "00071000", ["bar"], pseudocode=None, size_bytes=64)
+    w.commit()
+    v = _view(w)
+    nb = _reading(v, _pair_id("00070000", "00070000"))
+    assert nb["state"] == "no_body" and "anchored_differs" not in nb
+    ua = _reading(v, _pair_id("00071000", "00071000"))
+    assert ua["state"] == "differs" and ua["anchored_differs"] is True
+
+
+def test_the_line_number_name_match_ignores_a_synthetic_name(tmp_path: Path, current: None) -> None:
+    """When the line-number argument follows the function's OWN name (not a path), the match holds
+    only for a REAL symbol name; a synthetic FUN_<addr> name carries no such meaning, so the caller
+    passes it as None and the pair stays in the read-first head.
+
+    MUTATION: pass the synthetic name through to pseudocode_delta -> the FUN_ pair is demoted ->
+    RED."""
+    w = World(tmp_path)
+    w.pair("00080000", "00080000", 0.5, 0.9, name_a="realfn", name_b="realfn")
+    w.fn("a", "00080000", ["log"], pseudocode='log("realfn", 10);', size_bytes=200, name="realfn")
+    w.fn("b", "00080000", ["log"], pseudocode='log("realfn", 17);', size_bytes=200, name="realfn")
+    w.pair("00081000", "00081000", 0.5, 0.9, name_a="FUN_00081000", name_b="FUN_00081000")
+    w.fn(
+        "a",
+        "00081000",
+        ["log"],
+        pseudocode='log("FUN_00081000", 10);',
+        size_bytes=200,
+        name="FUN_00081000",
+    )
+    w.fn(
+        "b",
+        "00081000",
+        ["log"],
+        pseudocode='log("FUN_00081000", 17);',
+        size_bytes=200,
+        name="FUN_00081000",
+    )
+    w.commit()
+    v = _view(w)
+    real = _reading(v, _pair_id("00080000", "00080000"))
+    assert real.get("line_number_form") == {"delta": 7, "sites": 1}  # real name matched -> demoted
+    syn = _reading(v, _pair_id("00081000", "00081000"))
+    assert "line_number_form" not in syn and syn["in_read_first"] is True  # synthetic -> head
+
+
 @pytest.mark.parametrize(
     "name",
     ["sub_9abcd", "FUN_0009abcd", "thunk_FUN_0009abcd", "UndefinedFunction_0009abcd", "LAB_9abcd"],
@@ -2761,9 +3024,12 @@ def test_get_diff_meta_banners_when_there_is_no_diff_or_it_is_withheld(
     assert not any(b.startswith("anchored_differs") for b in meta["banners"])
 
 
-def test_function_states_keeps_its_keys_and_adds_two_counts(tmp_path: Path, current: None) -> None:
-    """The existing keys keep their names and shapes; the two counts are new top-level integers,
-    the read-first one never above the one over every flagged pair.
+def test_function_states_keeps_its_keys_and_adds_the_read_face_counts(
+    tmp_path: Path, current: None
+) -> None:
+    """The existing keys keep their names and shapes; the read-first / line-number / micro-side
+    counts are new top-level integers and the two unavailable_by_cause blocks are new top-level
+    dicts whose values sum to the unavailable count they split.
 
     MUTATION: put the counts inside alignment_undetermined_reading -> its keys are no longer the
     reading states -> RED."""
@@ -2783,12 +3049,25 @@ def test_function_states_keeps_its_keys_and_adds_two_counts(tmp_path: Path, curr
         "alignment_undetermined_reading",
         "one_sided",
     }
-    new = {"alignment_undetermined_anchored_differs", "alignment_undetermined_anchored_differs_all"}
-    assert set(s) == existing | new
+    new_counts = {
+        "alignment_undetermined_anchored_differs",
+        "alignment_undetermined_anchored_differs_line_number_form",
+        "alignment_undetermined_anchored_differs_all",
+        "alignment_undetermined_anchored_micro_side",
+    }
+    new_by_cause = {"unavailable_by_cause", "alignment_undetermined_unavailable_by_cause"}
+    assert set(s) == existing | new_counts | new_by_cause
     assert set(s["alignment_undetermined_reading"]) == set(sameness.U_STATES)
-    assert all(type(s[k]) is int for k in new)
+    assert all(type(s[k]) is int for k in new_counts)
+    assert all(set(s[k]) == set(pv._UNAVAILABLE_CAUSES) for k in new_by_cause)
     assert s["alignment_undetermined_anchored_differs"] == 1
     assert s["alignment_undetermined_anchored_differs_all"] == 2
+    # the by-cause buckets PARTITION their unavailable count: each sums to it.
+    assert sum(s["unavailable_by_cause"].values()) == s["unverified"]["unavailable"]
+    assert (
+        sum(s["alignment_undetermined_unavailable_by_cause"].values())
+        == s["alignment_undetermined_reading"]["unavailable"]
+    )
 
 
 def _filter_world(tmp_path: Path) -> tuple[World, dict[str, str]]:
@@ -2889,12 +3168,19 @@ def test_the_flag_is_on_the_reading_whatever_the_sort(tmp_path: Path, current: N
     assert fields == (True, "addr", False)
 
 
-def test_the_diff_command_line_counts_the_read_first_pairs(tmp_path: Path, current: None) -> None:
-    """The diff command's per-binary line carries the read-first count inside its reading.
+def test_the_diff_command_line_counts_the_read_first_and_micro_pairs(
+    tmp_path: Path, current: None
+) -> None:
+    """The diff command's per-binary line carries the read-first and micro-side counts inside its
+    reading; both print even at zero, so an absent count never reads as 'not computed'.
 
-    MUTATION: drop the count from ``_function_line`` -> RED."""
+    MUTATION: drop the counts from ``_function_line`` -> RED."""
     from treasure_map.cli.hunt_cli import _function_line
 
     w = _banner_world(tmp_path, "both")
     line = _function_line(pv.function_states(w.atlas, DIFF))
-    assert "(read: 3 differs; anchored_differs=1)" in line
+    assert "(read: 3 differs; anchored_differs=1, anchored_micro_side=0)" in line
+    # N=0 still prints anchored_differs=0 (and anchored_micro_side=0) when any pair reads differs.
+    pv._clear_view_caches()
+    none = _function_line(pv.function_states(_banner_world(tmp_path / "none", "none").atlas, DIFF))
+    assert "anchored_differs=0, anchored_micro_side=0" in none

@@ -108,22 +108,53 @@ def test_pair_reading_tells_no_body_apart_from_an_empty_body() -> None:
         True,
         None,
         (),
+        None,  # a match carries no bodies block
     )  # addresses only moved
     assert sm.pair_reading(bodies_a, bodies_b, "2000", "1000", None, None) == (
         None,
         sm.UNAVAILABLE,
         (),
-    )  # a empty
+        {  # a empty (size unrecorded -> size_unknown), b ok
+            "a": {"status": sm.SIZE_UNKNOWN, "size_bytes": None},
+            "b": {"status": "ok", "size_bytes": None},
+        },
+    )
     assert sm.pair_reading(bodies_a, bodies_b, "1000", "3000", None, None) == (
         None,
         sm.NO_BODY,
         (),
-    )  # b absent
+        {  # b absent from the table -> no_body
+            "a": {"status": "ok", "size_bytes": None},
+            "b": {"status": sm.NO_BODY, "size_bytes": None},
+        },
+    )
     assert sm.pair_reading(None, bodies_b, "1000", "1000", None, None) == (
         None,
         sm.UNAVAILABLE,
         (),
-    )  # a db unreadable
+        {  # a db unreadable -> db_unavailable
+            "a": {"status": sm.DB_UNAVAILABLE, "size_bytes": None},
+            "b": {"status": "ok", "size_bytes": None},
+        },
+    )
+
+
+def test_body_status_splits_an_empty_body_by_the_exporter_s_own_reason() -> None:
+    """``_body_status`` tells the six per-side causes apart, reusing layer0._decompile_status for
+    the present-but-empty body: a design-skipped micro-stub, a real empty decompile and an
+    unrecorded size are not one ``unavailable``.
+
+    MUTATION: fold ``failed`` back into one empty bucket (drop the decompile_empty/size_unknown
+    rename) -> RED; read ``bodies is None`` as no_body instead of db_unavailable -> RED."""
+    assert sm._body_status(None, "1") == sm.DB_UNAVAILABLE  # db unreadable
+    assert sm._body_status({}, "1") == sm.NO_BODY  # absent from the table
+    assert sm._body_status({"1": _body("f();", size=4)}, "1") == "ok"  # has pseudocode
+    assert sm._body_status({"1": _body(None, size=8)}, "1") == sm.SKIPPED_MICRO  # empty, < MIN
+    assert sm._body_status({"1": _body(None, size=64)}, "1") == sm.DECOMPILE_EMPTY  # empty, >= MIN
+    assert sm._body_status({"1": _body(None, size=0)}, "1") == sm.SIZE_UNKNOWN  # empty, size 0
+    assert (
+        sm._body_status({"1": _body(None, size=None)}, "1") == sm.SIZE_UNKNOWN
+    )  # empty, unrecorded
 
 
 # ── states: a match is only "identical" when the callees are proven equal ─────────────────────
@@ -235,13 +266,13 @@ def test_a_try_annotation_matches_only_when_every_address_moved_with_the_entry()
     moved = _try_body(0x407208, 0x40720F, 0x407D84)
     handler_off = _try_body(0x407208, 0x40720F, 0x407E84)
 
-    def read(a: str, b: str) -> tuple[bool | None, str | None, tuple[str, ...]]:
+    def read(a: str, b: str) -> tuple[bool | None, str | None, tuple[str, ...], object]:
         return sm.pair_reading({"1000": _body(a)}, {"2000": _body(b)}, "1000", "2000", None, None)
 
-    assert read(base, moved) == (True, None, ())
-    assert read(base, handler_off) == (False, None, ())
-    assert read(base, base) == (True, None, ())  # the entry moved, the annotation did not
-    assert read("FUN_00401000();", "FUN_00402000();") == (True, None, ())  # no annotation
+    assert read(base, moved) == (True, None, (), None)
+    assert read(base, handler_off) == (False, None, (), None)
+    assert read(base, base) == (True, None, (), None)  # the entry moved, the annotation did not
+    assert read("FUN_00401000();", "FUN_00402000();") == (True, None, (), None)  # no annotation
     delta = sm.pseudocode_delta(base, handler_off, None, None, "1000", "2000")
     assert delta["kind"] != "layout_only"
     assert "comment" in delta["substitutions"]
@@ -283,11 +314,13 @@ def test_a_moved_literal_read_on_an_unknown_image_is_named_not_trusted() -> None
     assert sm.literal_reading(a, b, None, image) == (True, True)
     assert sm.literal_reading(a, a, None, image) == (True, False)
     bodies_a, bodies_b = {"1000": _body(a)}, {"2000": _body(b)}
-    matches, reason, reasons = sm.pair_reading(bodies_a, bodies_b, "1000", "2000", None, image)
+    matches, reason, reasons, _bodies = sm.pair_reading(
+        bodies_a, bodies_b, "1000", "2000", None, image
+    )
     assert (matches, reason, reasons) == (True, None, (sm.LITERAL_BASIS_UNKNOWN,))
     assert sm.sameness_state(matches, "equal", reason, reasons) == sm.IDENTICAL_TEXT_UNVERIFIED
     same = sm.pair_reading({"1000": _body(a)}, {"2000": _body(a)}, "1000", "2000", None, image)
-    assert same == (True, None, ())
+    assert same == (True, None, (), None)
 
 
 # ── W: the decompiler's own "incomplete" notes ───────────────────────────────────────────────
@@ -339,7 +372,7 @@ def test_two_byte_counts_that_differ_qualify_a_text_match_and_mark_the_structure
     MUTATION: look at the byte counts only when a W marker hit -> the first pair reads identical
     -> RED; read equal counts as an unchanged body (``identical``) -> RED."""
     a, b = _body("f();", size=1064), _body("f();", size=1060)
-    matches, _, reasons = sm.pair_reading({"1": a}, {"2": b}, "1", "2", None, None)
+    matches, _, reasons, _bodies = sm.pair_reading({"1": a}, {"2": b}, "1", "2", None, None)
     assert matches is True and reasons == (sm.BODY_SIZE_DIFFERS,)
     assert sm.sameness_state(True, "equal", None, reasons) == sm.IDENTICAL_TEXT_UNVERIFIED
     region = sm.hidden_region(a, b, reasons, similarity=0.949, instructions=264)
@@ -359,7 +392,7 @@ def test_a_byte_count_missing_on_one_side_adds_nothing() -> None:
 
     MUTATION: read a missing count as unequal -> body_size_differs -> RED."""
     a, b = _body("f();", size=1064), _body("f();", size=None)
-    matches, reason, reasons = sm.pair_reading({"1": a}, {"2": b}, "1", "2", None, None)
+    matches, reason, reasons, _bodies = sm.pair_reading({"1": a}, {"2": b}, "1", "2", None, None)
     assert reasons == ()
     assert sm.sameness_state(matches, "equal", reason, reasons) == sm.IDENTICAL
     assert sm.hidden_region(a, b, reasons, similarity=1.0, instructions=1) is None
@@ -397,7 +430,15 @@ def test_an_empty_body_on_both_sides_is_unavailable_never_identical() -> None:
     MUTATION: test the body dict's truth instead of its ``pseudocode`` (a dict is always true) ->
     two empty bodies compare as identical -> RED."""
     bodies_a, bodies_b = {"1": _body(None, size=8)}, {"2": _body(None, size=8)}
-    assert sm.pair_reading(bodies_a, bodies_b, "1", "2", None, None) == (None, sm.UNAVAILABLE, ())
+    assert sm.pair_reading(bodies_a, bodies_b, "1", "2", None, None) == (
+        None,
+        sm.UNAVAILABLE,
+        (),
+        {  # both empty and under _DECOMPILE_MIN_SIZE -> skipped_micro, by design not a failure
+            "a": {"status": sm.SKIPPED_MICRO, "size_bytes": 8},
+            "b": {"status": sm.SKIPPED_MICRO, "size_bytes": 8},
+        },
+    )
     assert sm.sameness_state(None, "equal", sm.UNAVAILABLE, ()) == sm.UNAVAILABLE
 
 
@@ -529,3 +570,66 @@ def test_the_token_budget_stays_at_five_million_pairs() -> None:
 
     MUTATION: raise DELTA_TOKEN_PRODUCT_CAP to 20_000_000 -> RED."""
     assert sm.DELTA_TOKEN_PRODUCT_CAP == 5_000_000
+
+
+# ── line_number_form: a __FILE__/__LINE__ shift is demoted, a real change is not ──────────────
+
+
+def _lnf(a: str, b: str, name_a: str | None = None, name_b: str | None = None) -> dict | None:
+    """``line_number_form`` through the public path (pseudocode_delta threads the names)."""
+    return sm.pseudocode_delta(a, b, None, None, "1000", "2000", name_a, name_b).get(
+        "line_number_form"
+    )
+
+
+def test_a_file_line_argument_shift_is_recognised_as_line_number_form() -> None:
+    """A number that is a top-level call argument right after a source-path (or own-function-name)
+    string, shifted by one constant step, is line_number_form — the shape a __FILE__/__LINE__ bump
+    leaves. Two such sites in one body share the one step. A call that spans lines is parsed on the
+    whole text, so it is still recognised.
+
+    MUTATION: drop the name_a/name_b parameter (never thread the names) -> the func-name case stops
+    being recognised -> RED; parse only inside the changed line block -> the cross-line call is
+    missed -> RED."""
+    assert _lnf('log("foo.c", 10);', 'log("foo.c", 20);') == {"delta": 10, "sites": 1}
+    assert _lnf('f("a.c", 10);\nf("a.c", 20);', 'f("a.c", 17);\nf("a.c", 27);') == {
+        "delta": 7,
+        "sites": 2,
+    }
+    assert _lnf('log("foo.c",\n10);', 'log("foo.c",\n17);') == {"delta": 7, "sites": 1}
+    # the string is the side's own function name, passed in (synthetic names are passed as None)
+    assert _lnf('chk("myfn", 5);', 'chk("myfn", 12);', "myfn", "myfn") == {"delta": 7, "sites": 1}
+    assert _lnf('chk("myfn", 5);', 'chk("myfn", 12);') is None  # names not given -> not matched
+
+
+def test_a_real_number_change_is_never_line_number_form() -> None:
+    """Only a number that is a top-level call argument immediately after a STRING LITERAL that is a
+    source path or the function name counts. A size, a port, a non-path/name string, a structural
+    position and a mixed-kind substitution all stay in the read-first head.
+
+    MUTATION: accept any number in a call that also carries a format string -> the snprintf size is
+    matched -> RED."""
+    # the changed number's preceding argument is not a lone string literal
+    assert (
+        _lnf('snprintf(b, 0x40, "%s=%d", "max", 0x20);', 'snprintf(b, 0x40, "%s=%d", "max", 0x80);')
+        is None
+    )
+    assert (
+        _lnf('log("%s:%d", &DAT_00001234, 0x1f90);', 'log("%s:%d", &DAT_00001234, 0x2000);') is None
+    )
+    assert _lnf("memcpy(dst, src, 0x60);", "memcpy(dst, src, 0x64);") is None
+    # the preceding string is neither a source path nor the function name
+    assert _lnf('set("max", 5);', 'set("max", 7);') is None
+    assert _lnf('print("%d items", 5);', 'print("%d items", 7);') is None
+    # the number is not a call argument at all (a structural position)
+    assert _lnf("x = 10;", "x = 20;") is None
+    # a mixed-kind (ident + number) substitution does not count
+    assert _lnf('log("foo.c", a, 10);', 'log("foo.c", b, 20);') is None
+
+
+def test_line_number_form_needs_one_consistent_nonzero_step() -> None:
+    """Every changed number must shift by the same nonzero step; a mix of steps, or no change, is
+    not a line-number bump.
+
+    MUTATION: drop the equal-step check (keep the last step) -> the two-step body matches -> RED."""
+    assert _lnf('f("a.c", 10);\ng("b.c", 0x40);', 'f("a.c", 17);\ng("b.c", 0x3f);') is None

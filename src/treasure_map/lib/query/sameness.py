@@ -60,7 +60,7 @@ import sqlite3
 from difflib import SequenceMatcher
 from typing import Any
 
-from treasure_map.lib.diff.layer0 import norm_hex
+from treasure_map.lib.diff.layer0 import _decompile_status, norm_hex
 from treasure_map.lib.ro_db import ro_connect
 
 # ── the six states of an aligned pair ────────────────────────────────────────────────────────
@@ -75,6 +75,16 @@ IDENTICAL_CALLEE_UNVERIFIED = (
 DIFFERS = "differs"  # pseudocode differs, or the callee sets differ (even with no body to read)
 NO_BODY = "no_body"  # a side has no body at all — an import / PLT stub, not in the functions table
 UNAVAILABLE = "unavailable"  # a side IS in the table but its pseudocode is empty, or the db failed
+
+# ── one side's body CAUSE: finer than the pair states above, NOT a sameness state ─────────────
+# Why a side had no text to compare, told apart so the read face can split the pair-level
+# UNAVAILABLE by cause. The pair state stays NO_BODY / UNAVAILABLE (``sameness_state`` folds these
+# back); these never enter the seven U_STATES or the aligned states. ``ok`` and ``no_body`` are
+# reused from above; the four below name the ways a present body carried no pseudocode.
+DB_UNAVAILABLE = "db_unavailable"  # the analysis.db could not be read at all (bodies is None)
+SKIPPED_MICRO = "skipped_micro"  # empty AND under _DECOMPILE_MIN_SIZE: a design skip, not a failure
+DECOMPILE_EMPTY = "decompile_empty"  # empty AND >= that size: a genuine empty decompile
+SIZE_UNKNOWN = "size_unknown"  # empty AND size 0 / unrecorded: cannot be told apart
 
 # The not_listed count name for each state (aligned, similarity-1 pairs that place no entry).
 NOT_LISTED_NAME = {
@@ -322,14 +332,23 @@ def _in_own_body(addr: str | None, ranges: list[list[int]]) -> bool | None:
 
 
 def _body_status(bodies: Bodies | None, addr: str) -> str:
-    """One side's body status at ``addr``: ``ok`` (there is pseudocode to compare), ``no_body`` (the
-    function is absent from the table — an import / PLT stub), or ``unavailable`` (in the table but
-    its pseudocode is empty, or the analysis.db could not be read)."""
+    """One side's body CAUSE at ``addr`` (see the DB_UNAVAILABLE / SKIPPED_MICRO / … constants):
+    ``ok`` (there is pseudocode to compare), ``no_body`` (absent from the table — an import / PLT
+    stub), ``db_unavailable`` (the analysis.db could not be read), or, for a present-but-empty body,
+    the exporter's own reason via ``layer0._decompile_status`` — ``skipped_micro`` (a design skip),
+    ``decompile_empty`` (a real empty decompile) or ``size_unknown`` (size 0 / unrecorded). The
+    pair-level state (``sameness_state``) still folds these back to NO_BODY / UNAVAILABLE; the cause
+    is a read-face detail, never a verdict."""
     if bodies is None:
-        return UNAVAILABLE
+        return DB_UNAVAILABLE
     if addr not in bodies:
         return NO_BODY
-    return "ok" if (bodies[addr] or {}).get("pseudocode") else UNAVAILABLE
+    body = bodies[addr] or {}
+    if body.get("pseudocode"):
+        return "ok"
+    # pseudocode empty by the branch above; classify the empty body by the exporter's own reason.
+    status = _decompile_status(None, _size(body))
+    return {"failed": DECOMPILE_EMPTY, "unknown": SIZE_UNKNOWN}.get(status, status)
 
 
 def pair_reading(
@@ -339,10 +358,10 @@ def pair_reading(
     addr_b: str,
     ranges_a: ImageRanges,
     ranges_b: ImageRanges,
-) -> tuple[bool | None, str | None, tuple[str, ...]]:
-    """``(matches, reason, text_reasons)`` for one pair: ``matches`` True / False (reason None) when
-    both sides have a body to compare; else ``matches`` None with the reason a reader would
-    otherwise have to recompute — ``no_body`` when a side is an import / PLT stub, else
+) -> tuple[bool | None, str | None, tuple[str, ...], dict[str, Any] | None]:
+    """``(matches, reason, text_reasons, bodies)`` for one pair: ``matches`` True / False (reason
+    None) when both sides have a body to compare; else ``matches`` None with the reason a reader
+    would otherwise have to recompute — ``no_body`` when a side is an import / PLT stub, else
     ``unavailable`` (``no_body`` wins when both apply, so a stub pair is named as one). Two texts
     that match only because their try/catch annotation addresses were blanked match only when those
     addresses all moved by the pair's entry offset; else the pair differs, as read.
@@ -350,22 +369,31 @@ def pair_reading(
     ``text_reasons`` qualify a MATCH (empty otherwise — a text that differs is a difference, and a
     warning does not change that): ``literal_basis_unknown``, ``decompile_incomplete:<tag>`` for
     each W tag on either side, and ``body_size_differs`` when both byte counts are known and
-    differ (a count missing on a side adds nothing and infers nothing)."""
+    differ (a count missing on a side adds nothing and infers nothing).
+
+    ``bodies`` is populated ONLY on the no-text-to-compare branch (one side not ``ok``), None
+    otherwise: ``{a, b}`` with each side's finer body ``status`` (:func:`_body_status`) and its
+    ``size_bytes``, so the read face can split the pair-level UNAVAILABLE by cause and tell a
+    design-skipped micro-stub from a real decompile gap. It adds no fact and changes no state."""
     sa, sb = _body_status(a_bodies, addr_a), _body_status(b_bodies, addr_b)
     if sa != "ok" or sb != "ok":
-        return (None, NO_BODY if NO_BODY in (sa, sb) else UNAVAILABLE, ())
+        bodies = {
+            "a": {"status": sa, "size_bytes": _size((a_bodies or {}).get(addr_a) or {})},
+            "b": {"status": sb, "size_bytes": _size((b_bodies or {}).get(addr_b) or {})},
+        }
+        return (None, NO_BODY if NO_BODY in (sa, sb) else UNAVAILABLE, (), bodies)
     ba, bb = (a_bodies or {})[addr_a], (b_bodies or {})[addr_b]
     pa, pb = ba.get("pseudocode") or "", bb.get("pseudocode") or ""
     equal, relied = literal_reading(pa, pb, ranges_a, ranges_b)
     if not equal:
-        return (False, None, ())
+        return (False, None, (), None)
     if not try_shift_consistent(pa, pb, _hex_int(addr_a), _hex_int(addr_b)):
-        return (False, None, ())
+        return (False, None, (), None)
     reasons: list[str] = [LITERAL_BASIS_UNKNOWN] if relied else []
     reasons += [f"{DECOMPILE_INCOMPLETE}:{tag}" for tag in incomplete_tags(pa, pb)]
     if body_key(_size(ba), _size(bb)) == BODY_STRUCTURE_DIFFERS:
         reasons.append(BODY_SIZE_DIFFERS)
-    return (True, None, tuple(reasons))
+    return (True, None, tuple(reasons), None)
 
 
 def sameness_state(
@@ -549,7 +577,14 @@ def _calls(tokens: list[tuple[str, str]]) -> dict[str, int]:
 
 
 def pseudocode_delta(
-    a: str, b: str, ranges_a: ImageRanges, ranges_b: ImageRanges, addr_a: str, addr_b: str
+    a: str,
+    b: str,
+    ranges_a: ImageRanges,
+    ranges_b: ImageRanges,
+    addr_a: str,
+    addr_b: str,
+    name_a: str | None = None,
+    name_b: str | None = None,
 ) -> dict[str, Any]:
     """The lexical shape of how two bodies' texts differ. Lines (stripped, blank lines dropped) are
     matched first; inside each block that differs, tokens are. A same-length run of tokens each of
@@ -561,7 +596,15 @@ def pseudocode_delta(
     exactly what a size fix looks like, and nothing here ranks or files it. The try/catch
     annotation's addresses are blanked under the reading's own rule (``addr_a`` / ``addr_b`` are
     the pair's entries): when they did not all move by the entry offset, the changed annotation is
-    a ``comment`` substitution, never ``layout_only``."""
+    a ``comment`` substitution, never ``layout_only``.
+
+    ``name_a`` / ``name_b`` are the two sides' own function names, already stripped of synthetic
+    names by the caller (a FUN_/loc_ name is passed as None). When they are given and the shape is
+    ``substitution_only``, :func:`_line_number_form` adds ``line_number_form`` ``{delta, sites}``
+    iff every changed number is a ``__FILE__``/``__LINE__`` build-info argument that shifted by one
+    constant step. A shape, still never a verdict — it says the numbers look like line numbers, not
+    that nothing else changed; the read face uses it only to DEMOTE such a pair out of the
+    read-first head, never to clear it."""
     blank_try = try_shift_consistent(a, b, _hex_int(addr_a), _hex_int(addr_b))
     la = [ln.strip() for ln in _delta_text(a, ranges_a, blank_try).splitlines() if ln.strip()]
     lb = [ln.strip() for ln in _delta_text(b, ranges_b, blank_try).splitlines() if ln.strip()]
@@ -604,12 +647,160 @@ def pseudocode_delta(
         if ca.get(name, 0) != cb.get(name, 0)
     }
     kind = "structural" if spans else ("substitution_only" if subs else "layout_only")
-    return {
+    out: dict[str, Any] = {
         "kind": kind,
         "structural_spans": spans,
         "substitutions": dict(sorted(subs.items())),
         "calls": calls,
     }
+    if kind == "substitution_only":
+        lnf = _line_number_form(la, lb, name_a, name_b)
+        if lnf is not None:
+            out["line_number_form"] = lnf
+    return out
+
+
+# ── line-number form: a __FILE__/__LINE__ shift, told apart from a real substitution ─────────
+
+_SOURCE_SUFFIXES = (".c", ".cc", ".cpp", ".h")
+
+
+def _parse_int_token(text: str) -> int | None:
+    """A number token's integer value — decimal or ``0x`` hex, a trailing u/U/l/L dropped; None when
+    it carries a blanked address marker (``@`` / ``#``) or does not parse."""
+    t = text.strip().rstrip("uUlL")
+    if not t or "@" in t or "#" in t:
+        return None
+    try:
+        return int(t, 16) if t[:2].lower() == "0x" else int(t, 10)
+    except ValueError:
+        return None
+
+
+def _dequote(text: str) -> str:
+    """A string token's content, outer quotes dropped (the token keeps them)."""
+    return text[1:-1] if len(text) >= 2 and text[0] in "\"'" else text
+
+
+def _is_source_path(s: str) -> bool:
+    return s.lower().endswith(_SOURCE_SUFFIXES)
+
+
+def _preceding_string_arg(toks: list[tuple[str, str]], idx: int) -> str | None:
+    """The dequoted string literal that is the call argument immediately before ``toks[idx]``, when
+    ``toks[idx]`` is ALONE a top-level argument of a call (a callee identifier, then ``(``) and the
+    argument before it is exactly one string token; else None. The walk back to the call's ``(``
+    stops at ``;`` ``{`` ``}`` (statement bounds), so a bare number not inside a call is rejected.
+    Only ``()`` drive the enclosing-call depth; ``[]`` / ``{}`` inside an argument stay opaque."""
+    depth = 0
+    open_paren = -1
+    j = idx - 1
+    while j >= 0:
+        t = toks[j][1]
+        if t in (";", "{", "}") and depth == 0:
+            return None
+        if t == ")":
+            depth += 1
+        elif t == "(":
+            if depth == 0:
+                open_paren = j
+                break
+            depth -= 1
+        j -= 1
+    if open_paren <= 0:
+        return None
+    callee = toks[open_paren - 1]
+    if callee[0] != "ident" or callee[1] in _CALL_KEYWORDS:
+        return None
+    depth = 0
+    close = -1
+    for m in range(open_paren, len(toks)):
+        t = toks[m][1]
+        if t == "(":
+            depth += 1
+        elif t == ")":
+            depth -= 1
+            if depth == 0:
+                close = m
+                break
+    if close < 0:
+        return None
+    args: list[list[int]] = [[]]
+    depth = 0
+    for m in range(open_paren + 1, close):
+        t = toks[m][1]
+        if t in ("(", "[", "{"):
+            depth += 1
+            args[-1].append(m)
+        elif t in (")", "]", "}"):
+            depth -= 1
+            args[-1].append(m)
+        elif t == "," and depth == 0:
+            args.append([])
+        else:
+            args[-1].append(m)
+    for ai, arg in enumerate(args):
+        if arg == [idx]:
+            if ai == 0:
+                return None
+            prev = args[ai - 1]
+            if len(prev) == 1 and toks[prev[0]][0] == "string":
+                return _dequote(toks[prev[0]][1])
+            return None
+    return None
+
+
+def _line_number_form(
+    la: list[str], lb: list[str], name_a: str | None, name_b: str | None
+) -> dict[str, Any] | None:
+    """``{delta, sites}`` when the ONLY difference between the two bodies is a set of numbers that
+    each look like a ``__FILE__``/``__LINE__`` build-info argument shifted by one constant step,
+    else None. Parsed on the WHOLE two-sided normalized text (a call may span lines) at token level:
+    the alignment must be substitutions only, every substitution a number, every changed number a
+    top-level call argument whose immediately preceding argument is a single string literal that is
+    either a source-file path or that side's own function name, and every pair must shift by the
+    same nonzero integer step. Any miss leaves the pair in the read-first head — the safe direction.
+    A shape, not a verdict; it never asserts nothing else changed."""
+    ta = _tokens("\n".join(la))
+    tb = _tokens("\n".join(lb))
+    if len(ta) * len(tb) > DELTA_TOKEN_PRODUCT_CAP:
+        return None
+    matcher = SequenceMatcher(None, [t[1] for t in ta], [t[1] for t in tb], autojunk=False)
+    number_subs: list[tuple[int, int]] = []  # (index in ta, index in tb)
+    for op, i1, i2, j1, j2 in matcher.get_opcodes():
+        if op == "equal":
+            continue
+        run_a, run_b = ta[i1:i2], tb[j1:j2]
+        if (
+            op != "replace"
+            or len(run_a) != len(run_b)
+            or not all(x[0] == y[0] != "punct" for x, y in zip(run_a, run_b, strict=True))
+        ):
+            return None  # not a pure substitution over the whole text
+        for off, (x, _y) in enumerate(zip(run_a, run_b, strict=True)):
+            if x[0] != "number":
+                return None  # a non-number substitution: not a line-number shape
+            number_subs.append((i1 + off, j1 + off))
+    if not number_subs:
+        return None
+    delta: int | None = None
+    for ka, kb in number_subs:
+        va, vb = _parse_int_token(ta[ka][1]), _parse_int_token(tb[kb][1])
+        if va is None or vb is None:
+            return None
+        step = vb - va
+        if step == 0 or (delta is not None and step != delta):
+            return None
+        delta = step
+        sa = _preceding_string_arg(ta, ka)
+        sb = _preceding_string_arg(tb, kb)
+        if sa is None or sb is None:
+            return None
+        if not (_is_source_path(sa) or (name_a is not None and sa == name_a)):
+            return None
+        if not (_is_source_path(sb) or (name_b is not None and sb == name_b)):
+            return None
+    return {"delta": delta, "sites": len(number_subs)}
 
 
 # ── reading a run's analysis.db ──────────────────────────────────────────────────────────────

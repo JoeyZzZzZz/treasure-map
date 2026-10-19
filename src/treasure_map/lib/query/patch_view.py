@@ -766,6 +766,12 @@ class _Entry:
     blind_spots: list[str] = field(default_factory=list)
     string_edges: dict[str, Any] | None = None
     rank: dict[str, Any] = field(default_factory=dict)
+    # Read-face facts attached once readings are in hand (``_annotate_entries``): each side's body
+    # status (sameness.pair_reading's ``bodies``), and, for an anchored_differs pair at or above the
+    # read-first floor, its ``line_number_form`` (a __FILE__/__LINE__ shift) — which demotes it out
+    # of the read-first head. None until annotated.
+    body_status: dict[str, Any] | None = None
+    line_number_form: dict[str, Any] | None = None
 
     @property
     def entry_id(self) -> str:
@@ -1131,11 +1137,19 @@ class _Builder:
                     "only_in_b": sorted(named_b - named_a),
                 }
             return out
+        # Both callee lists were read in full here (unreadable / truncated / not_recorded all
+        # returned undetermined above), so ``callees_complete`` says an empty ``only_in_*`` is a
+        # proven-empty difference, NOT a list that could not be extracted.
         if ia.keys() == ib.keys():
-            return {"state": "equal"}
+            return {"state": "equal", "callees_complete": True}
         only_a = sorted(ia[k] for k in ia.keys() - ib.keys())
         only_b = sorted(ib[k] for k in ib.keys() - ia.keys())
-        return {"state": "differs", "only_in_a": only_a, "only_in_b": only_b}
+        return {
+            "state": "differs",
+            "only_in_a": only_a,
+            "only_in_b": only_b,
+            "callees_complete": True,
+        }
 
     def _identities(self, side: str, fn: _Fn) -> tuple[dict[tuple[str, ...], str], set[str]]:
         """(identity -> the name as printed, the names that cannot be identified) of one function's
@@ -1378,13 +1392,47 @@ def _anchored_differs(e: _Entry, u_state: str | None) -> bool:
     )
 
 
-def _read_first_order(e: _Entry, u_state: str | None) -> int:
-    """2 = anchored_differs at or above ``ANCHORED_DIFFERS_SIM_FLOOR`` (the read-first pairs); 1 =
-    anchored_differs below it; 0 = every other entry."""
+def _micro_side(bodies: dict[str, Any] | None) -> bool:
+    """Exactly one side a design-skipped micro-stub (under _DECOMPILE_MIN_SIZE bytes, not
+    decompiled by design), the other a real body — the shape of a function gutted to, or grown from,
+    a stub. Read off sameness.pair_reading's ``bodies``; False when there is no such block (both
+    sides had text, or neither is a plain micro/ok pair)."""
+    if not bodies:
+        return False
+    return {bodies["a"]["status"], bodies["b"]["status"]} == {sameness.SKIPPED_MICRO, "ok"}
+
+
+def _anchored_micro_side(e: _Entry) -> bool:
+    """An undetermined pair confidently paired (no export gap, anchored by address or real symbol)
+    whose two sides are a micro-stub and a real body (:func:`_micro_side`). No callee check and no
+    similarity floor: a function replaced by a stub (or the reverse) is worth reading whatever its
+    similarity. It orders and labels; it moves the entry nowhere and clears nothing else in R."""
     p = e.pair
-    if p is None or not _anchored_differs(e, u_state):
+    return (
+        p is not None
+        and not p.aligned
+        and p.export_gap_a is None
+        and p.export_gap_b is None
+        and _anchor(p) is not None
+        and _micro_side(e.body_status)
+    )
+
+
+def _read_first_order(e: _Entry, u_state: str | None) -> int:
+    """How far an undetermined pair floats inside attention 1: 2 = anchored_differs at or above
+    ``ANCHORED_DIFFERS_SIM_FLOOR`` (the read-first head); 1 = anchored_differs below the floor, an
+    anchored_differs pair whose only change is a ``line_number_form`` shift (demoted OUT of the head
+    but still flagged), or an anchored micro-side pair; 0 = every other entry."""
+    p = e.pair
+    if p is None:
         return 0
-    return 2 if p.similarity is not None and p.similarity >= ANCHORED_DIFFERS_SIM_FLOOR else 1
+    if _anchored_differs(e, u_state):
+        if e.line_number_form is not None:
+            return 1  # a __FILE__/__LINE__ shift: demoted out of the read-first head, still flagged
+        return 2 if p.similarity is not None and p.similarity >= ANCHORED_DIFFERS_SIM_FLOOR else 1
+    if _anchored_micro_side(e):
+        return 1
+    return 0
 
 
 def _held_up(item: diff_review.Item | None) -> bool:
@@ -1411,10 +1459,16 @@ def significance(
       * bucket A, or a row carrying sink_arg_constant_delta -> 0 (wins over everything below);
       * B ``sink_present_no_visible_delta`` -> 1, labelled ``recheckable_no_visible_delta``: it
         stays where similarity puts it, neither floated nor sunk;
+      * an aligned pair carrying ``one_side_skipped_micro`` (one side a design-skipped micro-stub,
+        the other a real body) -> 1, labelled ``one_side_skipped_micro``: held at attention 1, never
+        sunk to 2 as an otherwise identical / bucket-C pair would be;
       * pseudocode ``identical``, a proposed ``identical_unique``, or bucket C -> 2 — unless the
         entry is R (an undetermined pair is never buried under the pairs that were read) or its
         judgement is held up (changed_real, needs_recheck / needs_relabel, inconclusive), which
         stops it at 1;
+      * an undetermined pair flagged :func:`_anchored_micro_side` (micro-stub vs real body) -> 1,
+        labelled ``anchored_micro_side``, BEFORE anchored_differs so a pair that is both reads as
+        the micro side;
       * an undetermined pair flagged :func:`_anchored_differs` -> 1, labelled
         ``anchored_differs``: still attention 1 (an R entry never reaches 0 or 2 on it), ordered
         first inside it (``read_first`` in :func:`_sort`);
@@ -1426,6 +1480,10 @@ def significance(
         return ATTENTION_FLOAT, "sink_arg_constant_delta"
     if e.subclass == "sink_present_no_visible_delta":
         return ATTENTION_MIDDLE, "recheckable_no_visible_delta"
+    if "one_side_skipped_micro" in e.facts:
+        # an aligned pair gutted to (or grown from) a micro-stub on one side: held at attention 1,
+        # never sunk to 2 as an identical / bucket-C pair would be.
+        return ATTENTION_MIDDLE, "one_side_skipped_micro"
     if state == sameness.IDENTICAL or u_state == sameness.U_IDENTICAL_UNIQUE or e.bucket == "C":
         basis = "pseudocode_identical" if state == sameness.IDENTICAL else "no_sink_candidate"
         if e.bucket == "R":
@@ -1435,6 +1493,9 @@ def significance(
         return ATTENTION_SINK, basis
     if e.bucket == "P":
         return ATTENTION_MIDDLE, "no_counterpart"
+    if _anchored_micro_side(e):
+        # before anchored_differs so a pair that is both reads as the micro side.
+        return ATTENTION_MIDDLE, "anchored_micro_side"
     if _anchored_differs(e, u_state):
         return ATTENTION_MIDDLE, "anchored_differs"
     return ATTENTION_MIDDLE, "similarity"
@@ -1732,6 +1793,9 @@ class _Read:
     occurrences: dict[str, int] | None = None
     a_body_elsewhere_in_b: dict[str, Any] | None = None
     b_body_elsewhere_in_a: dict[str, Any] | None = None
+    # Each side's body status + size when there was no text to compare (sameness.pair_reading's
+    # ``bodies``), else None: {a: {status, size_bytes}, b: {...}}. A read-face detail, not a state.
+    bodies: dict[str, Any] | None = None
 
 
 _UNREAD = _Read(None, sameness.UNAVAILABLE)
@@ -1785,7 +1849,7 @@ def _read_pair(
     ra: sameness.ImageRanges,
     rb: sameness.ImageRanges,
 ) -> _Read:
-    matches, reason, reasons = sameness.pair_reading(ba, bb, p.addr_a, p.addr_b, ra, rb)
+    matches, reason, reasons, bodies = sameness.pair_reading(ba, bb, p.addr_a, p.addr_b, ra, rb)
     hidden = None
     if matches and ba is not None and bb is not None:
         hidden = sameness.hidden_region(
@@ -1795,7 +1859,7 @@ def _read_pair(
             similarity=p.similarity,
             instructions=p.instructions,
         )
-    return _Read(matches, reason, reasons, hidden)
+    return _Read(matches, reason, reasons, hidden, bodies=bodies)
 
 
 def _skeleton_index(bodies: sameness.Bodies) -> dict[str, list[str]]:
@@ -1925,6 +1989,79 @@ def _u_state(e: _Entry, readings: _Readings) -> str | None:
     return proposed[0] if proposed is not None else None
 
 
+# The 5-bucket cause of a pair whose reading is UNAVAILABLE (one side had no text), strongest gap
+# first, so the keys PARTITION the UNAVAILABLE pairs (each counted exactly once).
+_UNAVAILABLE_CAUSES = (
+    "db_unavailable",
+    "decompile_empty",
+    "size_unknown",
+    "one_side_skipped_micro",
+    "both_skipped_micro",
+)
+
+
+def _cause_of(bodies: dict[str, Any] | None) -> str:
+    """Which of :data:`_UNAVAILABLE_CAUSES` a UNAVAILABLE pair falls in, from its two sides' body
+    status (sameness.pair_reading's ``bodies``): the first that matches, strongest gap first — so a
+    micro + decompile_empty pair is ``decompile_empty`` and a db read failure on either side wins
+    over everything. Falls back to ``db_unavailable`` only if the block is missing, which an
+    UNAVAILABLE pair never leaves."""
+    if not bodies:
+        return "db_unavailable"
+    a, b = bodies["a"]["status"], bodies["b"]["status"]
+    sides = {a, b}
+    if sameness.DB_UNAVAILABLE in sides:
+        return "db_unavailable"
+    if sameness.DECOMPILE_EMPTY in sides:
+        return "decompile_empty"
+    if sameness.SIZE_UNKNOWN in sides:
+        return "size_unknown"
+    if a == sameness.SKIPPED_MICRO and b == sameness.SKIPPED_MICRO:
+        return "both_skipped_micro"
+    return "one_side_skipped_micro"
+
+
+def _annotate_entries(built: BuiltDiff, readings: _Readings) -> None:
+    """Attach, once readings are in hand, the read-face facts that significance / _read_first_order
+    read straight off the entry: each pair's per-side ``body_status`` (sameness.pair_reading's
+    ``bodies``, consumed by the micro predicates and unavailable_by_cause), the
+    ``one_side_skipped_micro`` fact on an aligned micro pair, and, on an anchored_differs pair at or
+    above the read-first floor, its ``line_number_form`` (computed once through the delta cache),
+    which demotes it out of the read-first head. Entries are rebuilt each call, so this re-annotates
+    cleanly; call it before significance, _sort, _read_first_order or the function_states counts."""
+    anchored: list[_Pair] = []
+    for e in built.placed:
+        p = e.pair
+        if p is None:
+            continue
+        reads = readings.aligned if p.aligned else readings.undetermined
+        read = reads.get((p.addr_a, p.addr_b))
+        if read is None:
+            continue
+        e.body_status = read.bodies
+        if p.aligned:
+            if _micro_side(read.bodies) and "one_side_skipped_micro" not in e.facts:
+                e.facts.append("one_side_skipped_micro")
+            continue
+        proposed = _proposed_of(e, readings)
+        if (
+            proposed is not None
+            and _anchored_differs(e, proposed[0])
+            and p.similarity is not None
+            and p.similarity >= ANCHORED_DIFFERS_SIM_FLOOR
+        ):
+            anchored.append(p)
+    if not anchored:
+        return
+    deltas = _deltas(readings, anchored)
+    want = {(p.addr_a, p.addr_b) for p in anchored}
+    for e in built.placed:
+        p = e.pair
+        if p is not None and (p.addr_a, p.addr_b) in want:
+            delta = deltas.get((p.addr_a, p.addr_b))
+            e.line_number_form = delta.get("line_number_form") if delta else None
+
+
 def _anchored_order(
     entries: list[_Entry], read_first: dict[str, int], band: dict[str, int] | None
 ) -> list[_Entry]:
@@ -1991,7 +2128,11 @@ def _deltas(readings: _Readings, pairs: list[_Pair]) -> dict[tuple[str, str], di
             tb = (bb.get(p.addr_b) or {}).get("pseudocode")
             if not ta or not tb:  # the bodies moved since the reading: nothing to compare
                 continue
-            delta = sameness.pseudocode_delta(ta, tb, ra, rb, p.addr_a, p.addr_b)
+            # the two sides' own names feed line_number_form's "arg equals the function name" test;
+            # a synthetic FUN_/loc_ name carries no such meaning, so it is passed as None.
+            na = p.name_a if p.name_a and not _is_synthetic_name(p.name_a, p.addr_a) else None
+            nb = p.name_b if p.name_b and not _is_synthetic_name(p.name_b, p.addr_b) else None
+            delta = sameness.pseudocode_delta(ta, tb, ra, rb, p.addr_a, p.addr_b, na, nb)
             _DELTA_CACHE[(readings.key, p.addr_a, p.addr_b)] = delta
             out[(p.addr_a, p.addr_b)] = delta
     return out
@@ -2013,13 +2154,19 @@ def _proposed_json(
     entry and never as its pseudocode_sameness. ``occurrences`` and the two ``*_elsewhere_*`` are
     null unless both bodies were read. A pair flagged :func:`_anchored_differs` also carries
     ``anchored_differs: true``, its ``anchor`` and ``in_read_first`` (at or above the floor),
-    whatever the sort."""
+    whatever the sort; one whose only change is a ``line_number_form`` shift carries that shape and
+    ``in_read_first: false`` (demoted out of the head, still flagged). A micro-side R pair is NOT
+    anchored_differs, so it carries no such block here."""
     p = e.pair
     assert p is not None
     out: dict[str, Any] = {"pairing": "undetermined", "state": state}
-    order = _read_first_order(e, state)
-    if order:
+    if _anchored_differs(e, state):
+        order = _read_first_order(e, state)
         out.update({"anchored_differs": True, "anchor": _anchor(p), "in_read_first": order == 2})
+        if e.line_number_form is not None:
+            # demoted out of the read-first head (in_read_first is False): the only change is a
+            # __FILE__/__LINE__ shift. Still flagged — anchored_differs=true pages it.
+            out["line_number_form"] = e.line_number_form
     if state == sameness.U_IDENTICAL_TEXT_UNVERIFIED:
         out["text_unverified_reasons"] = list(read.text_reasons)
     out.update(
@@ -2124,8 +2271,16 @@ _SIGNIFICANCE_LENS = (
     "ordered together — except that an undetermined pair flagged anchored_differs (no export gap, "
     "the same address or the same real symbol name on both sides, proposed reading differs) comes "
     f"first inside attention 1: those at or above similarity {ANCHORED_DIFFERS_SIM_FLOOR} first, "
-    "then those below it, basis anchored_differs. The flag clears nothing else in R: every other "
-    "undetermined pair reading differs is still to be read. "
+    "then those below it, basis anchored_differs — except that a flagged pair whose only change is "
+    "a __FILE__/__LINE__ line-number shift is demoted out of that read-first head (still flagged, "
+    "anchored_differs=true pages it). The flag clears nothing else in R: every other undetermined "
+    "pair reading differs is still to be read. An undetermined pair anchored with one side a "
+    "design-skipped micro-stub (under the decompile size floor, not decompiled by design — a "
+    "binary property, NOT a read failure) and the other a real body gets basis anchored_micro_side "
+    "(before anchored_differs when a pair is both), and an aligned pair of the same shape gets "
+    "basis one_side_skipped_micro, both held at attention 1 rather than sunk; a micro-stub under "
+    "~10 bytes whose disassembly the listing already holds is inlined, else it says a re-scan is "
+    "needed. "
     "Attention 0 holds B entries too (a row's sink_arg_constant_delta) beside "
     "A. Never sunk: an R entry (attention 2 never holds one; one whose proposed_pair_reading is "
     "identical_unique closes attention 1 instead), a B sink_present_no_visible_delta (labelled "
@@ -2163,12 +2318,21 @@ def function_states(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] |
     sink_arg_constant_delta — and ``no_scoped_signal``, which says no in-scope sink signal, NOT
     noise), ``unverified`` (identical_text_unverified + identical_callee_unverified + unavailable;
     ``identical_text_unverified_by_body`` splits the first by its body class) and ``no_body`` (an
-    import / PLT stub, kept out of every other count). Pairs whose alignment is undetermined are
-    counted beside them, and ``alignment_undetermined_reading`` splits them by their proposed
+    import / PLT stub, kept out of every other count). ``unavailable_by_cause`` splits the aligned
+    ``unavailable`` count by why a side had no text (db_unavailable / decompile_empty / size_unknown
+    / one_side_skipped_micro / both_skipped_micro) and its values SUM to that count — a design-
+    skipped micro-stub told apart from a real decompile gap. Pairs whose alignment is undetermined
+    are counted beside them, and ``alignment_undetermined_reading`` splits them by their proposed
     reading (never into the aligned counts); of those reading differs,
     ``alignment_undetermined_anchored_differs`` counts the pairs flagged anchored_differs at or
-    above the read-first floor and ``alignment_undetermined_anchored_differs_all`` every flagged
-    pair, below the floor included. Functions with no counterpart are counted by presence_state,
+    above the read-first floor whose change is NOT just a line-number shift (the read-first head),
+    ``alignment_undetermined_anchored_differs_line_number_form`` the ones at or above the floor
+    demoted because their only change is a __FILE__/__LINE__ shift (still flagged), and
+    ``alignment_undetermined_anchored_differs_all`` every flagged pair, below the floor included.
+    ``alignment_undetermined_anchored_micro_side`` counts undetermined pairs anchored with one side
+    a micro-stub and the other a real body; ``alignment_undetermined_unavailable_by_cause`` splits
+    the proposed-unavailable pairs the same way, summing to their reading count. Functions with no
+    counterpart are counted by presence_state,
     never "added"/"removed". A diff undetermined as a whole is ``withheld`` with its banners and NO
     counts — a blind spot, not zero changes. None when there is no such diff."""
     built = build_diff_view(atlas, diff_id)
@@ -2184,20 +2348,39 @@ def function_states(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] |
         side[presence] = side.get(presence, 0) + 1
     undetermined = sum(1 for p in d.pairs if not p.aligned)
     readings = _pseudo_readings(atlas, built)
+    _annotate_entries(built, readings)
     tally: dict[str, int] = {}
     by_body = {cls: 0 for cls in sameness.BODY_CLASSES}
     proposed = {state: 0 for state in sameness.U_STATES}
     scoped = 0
-    anchored = anchored_all = 0
+    anchored = anchored_all = line_number_form = micro = 0
+    unavail_cause = {k: 0 for k in _UNAVAILABLE_CAUSES}  # aligned pairs reading unavailable
+    u_unavail_cause = {k: 0 for k in _UNAVAILABLE_CAUSES}  # undetermined pairs proposed unavailable
     for e in built.placed:
         reading = _proposed_of(e, readings)
         if reading is not None:
-            proposed[reading[0]] += 1
-            order = _read_first_order(e, reading[0])
-            if order:
+            ustate = reading[0]
+            proposed[ustate] += 1
+            # ``_all`` is every flagged pair; read it off _anchored_differs, NOT a non-zero
+            # read_first order — an anchored_micro_side pair also orders 1 and must not inflate it.
+            if _anchored_differs(e, ustate):
                 anchored_all += 1
-            if order == 2:
-                anchored += 1
+                p = e.pair
+                at_floor = (
+                    p is not None
+                    and p.similarity is not None
+                    and p.similarity >= ANCHORED_DIFFERS_SIM_FLOOR
+                )
+                if at_floor and e.line_number_form is not None:
+                    line_number_form += 1  # flagged, demoted out of the read-first head (L)
+                elif at_floor:
+                    anchored += 1  # the read-first head (N, == read_first order 2)
+            # a separate count, NOT mutually exclusive with anchored_differs: a pair that is both
+            # is listed by the anchored_micro_side filter, so it is counted here too (basis micro).
+            if _anchored_micro_side(e):
+                micro += 1
+            if ustate == sameness.U_UNAVAILABLE:
+                u_unavail_cause[_cause_of(e.body_status)] += 1
         state = _sameness_of(e, readings)
         if state is None:
             continue
@@ -2206,6 +2389,8 @@ def function_states(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] |
             scoped += 1
         if state == sameness.IDENTICAL_TEXT_UNVERIFIED:
             by_body[_body_of(e, readings) or sameness.BODY_UNKNOWN] += 1
+        if state == sameness.UNAVAILABLE:
+            unavail_cause[_cause_of(e.body_status)] += 1
     changed = tally.get(sameness.DIFFERS, 0)
     unverified = {
         sameness.IDENTICAL_TEXT_UNVERIFIED: tally.get(sameness.IDENTICAL_TEXT_UNVERIFIED, 0),
@@ -2224,11 +2409,15 @@ def function_states(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] |
         },
         "unverified": {"total": sum(unverified.values()), **unverified},
         "identical_text_unverified_by_body": by_body,
+        "unavailable_by_cause": unavail_cause,
         "no_body": tally.get(sameness.NO_BODY, 0),
         "alignment_undetermined": undetermined,
         "alignment_undetermined_reading": proposed,
         "alignment_undetermined_anchored_differs": anchored,
+        "alignment_undetermined_anchored_differs_line_number_form": line_number_form,
         "alignment_undetermined_anchored_differs_all": anchored_all,
+        "alignment_undetermined_anchored_micro_side": micro,
+        "alignment_undetermined_unavailable_by_cause": u_unavail_cause,
         "one_sided": {s: dict(sorted(v.items())) for s, v in sorted(one_sided.items())},
     }
 
@@ -2236,25 +2425,45 @@ def function_states(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] |
 def anchored_differs_banner(states: dict[str, Any] | None) -> str | None:
     """The read-first banner of one diff's :func:`function_states`, or None when no undetermined
     pair is flagged anchored_differs (or the diff is withheld, which has no counts). It names the
-    read-first count, every flagged pair, and every undetermined pair reading differs — the flagged
-    ones do not stand for the rest of R."""
+    read-first head (AFTER line-number shifts are demoted out of it), the pairs so demoted, the
+    anchored micro-side pairs, and — ALWAYS — that the head pairs are not yet told apart and that
+    the flagged ones do not stand for the rest of R."""
     if not states or states.get("withheld"):
         return None
     flagged = int(states.get("alignment_undetermined_anchored_differs_all") or 0)
     if flagged <= 0:
         return None
     first = int(states.get("alignment_undetermined_anchored_differs") or 0)
+    lnf = int(states.get("alignment_undetermined_anchored_differs_line_number_form") or 0)
+    micro = int(states.get("alignment_undetermined_anchored_micro_side") or 0)
     differs = int((states.get("alignment_undetermined_reading") or {}).get(sameness.U_DIFFERS, 0))
-    return (
+    parts = [
         f"anchored_differs: {first} undetermined pairs are confidently paired (same address or "
         "same real symbol), their normalized pseudocode differs, and they sit at or above the "
         f"read-first similarity floor ({ANCHORED_DIFFERS_SIM_FLOOR}) — read these first: "
-        'get_diff_patch_view(bucket="R", anchored_differs=true). '
-        f"{flagged} anchored pairs differ in total (incl. below the floor); and this does NOT "
-        f"clear the rest of the R bucket: {differs} undetermined pairs read 'differs' in total. "
-        'Walk the remainder with get_diff_patch_view(bucket="R", sort_by="significance") to the '
-        "end."
+        'get_diff_patch_view(bucket="R", anchored_differs=true).'
+    ]
+    if lnf:
+        parts.append(
+            f"{lnf} more anchored pairs were demoted out of the head because their only change is "
+            "a __FILE__/__LINE__ line-number shift — still flagged (anchored_differs=true pages "
+            "them)."
+        )
+    parts.append(
+        f"The {first} head pairs are NOT yet told apart: each still holds build info, a structure "
+        "shift, a moved string or a real change, unresolved."
     )
+    if micro:
+        parts.append(
+            f"{micro} other anchored pairs have one side a design-skipped micro-stub and the other "
+            'a real body: get_diff_patch_view(bucket="R", anchored_micro_side=true).'
+        )
+    parts.append(
+        f"{flagged} anchored pairs differ in total (incl. below the floor); this does NOT clear "
+        f"the rest of the R bucket: {differs} undetermined pairs read 'differs' in total. Walk the "
+        'remainder with get_diff_patch_view(bucket="R", sort_by="significance") to the end.'
+    )
+    return " ".join(parts)
 
 
 def get_diff_patch_view(
@@ -2273,6 +2482,7 @@ def get_diff_patch_view(
     not_listed_page: str | None = None,
     body: str | None = None,
     anchored_differs: bool = False,
+    anchored_micro_side: bool = False,
 ) -> dict[str, Any]:
     """The function-level view of one diff (see the module docstring), one page of it.
 
@@ -2302,24 +2512,39 @@ def get_diff_patch_view(
     the undetermined pairs flagged anchored_differs — with no similarity bound, so similarity 1
     and the pairs below the read-first floor are kept too — ordered read-first ones (at or above
     the floor) first, then by similarity, highest first; a ``sort_by`` orders them instead. The
-    flag is a fact about these pairs, not a reading of the rest of R."""
+    flag is a fact about these pairs, not a reading of the rest of R. A pair whose only change is a
+    __FILE__/__LINE__ shift is kept here too (it stays flagged), just not in the read-first head.
+
+    ``anchored_micro_side`` (same scope) keeps only the undetermined pairs anchored with exactly one
+    side a design-skipped micro-stub and the other a real body — the shape of a function gutted to,
+    or grown from, a stub, which no similarity or callee reading would surface. A fact about these
+    pairs, not a reading of the rest of R."""
     if not isinstance(anchored_differs, bool):
         return {
             "diff_id": diff_id,
             "error": f"anchored_differs must be true or false, got {anchored_differs!r}",
         }
-    if anchored_differs and view != "sink_patch":
-        return {"diff_id": diff_id, "error": "anchored_differs applies to view='sink_patch' only"}
-    if anchored_differs and not_listed_page is not None:
+    if not isinstance(anchored_micro_side, bool):
         return {
             "diff_id": diff_id,
-            "error": "anchored_differs applies to the listed entries, not to not_listed_page",
+            "error": f"anchored_micro_side must be true or false, got {anchored_micro_side!r}",
         }
-    if anchored_differs and bucket is not None and bucket != "R":
-        return {
-            "diff_id": diff_id,
-            "error": f"anchored_differs keeps bucket R entries only, got bucket={bucket!r}",
-        }
+    for name, on in (
+        ("anchored_differs", anchored_differs),
+        ("anchored_micro_side", anchored_micro_side),
+    ):
+        if on and view != "sink_patch":
+            return {"diff_id": diff_id, "error": f"{name} applies to view='sink_patch' only"}
+        if on and not_listed_page is not None:
+            return {
+                "diff_id": diff_id,
+                "error": f"{name} applies to the listed entries, not to not_listed_page",
+            }
+        if on and bucket is not None and bucket != "R":
+            return {
+                "diff_id": diff_id,
+                "error": f"{name} keeps bucket R entries only, got bucket={bucket!r}",
+            }
     if not_listed_page is not None and not_listed_page not in sameness.STATE_BY_NOT_LISTED_NAME:
         names = list(sameness.STATE_BY_NOT_LISTED_NAME)
         return {"diff_id": diff_id, "error": f"not_listed_page must be one of {names}"}
@@ -2343,6 +2568,7 @@ def get_diff_patch_view(
         "blind_spot": blind_spot,
         "body": body,
         "anchored_differs": True if anchored_differs else None,
+        "anchored_micro_side": True if anchored_micro_side else None,
     }
     filtered = any(v is not None for v in filters.values())
     error = _check_args(view, sort_by, bucket, tier, limit, offset, filtered, band)
@@ -2353,6 +2579,7 @@ def get_diff_patch_view(
         return {"diff_id": diff_id, "found": False, "error": "no such diff (see list_diffs)"}
     overlay, banners, entries = built.overlay, built.banners, built.entries
     readings = _pseudo_readings(atlas, built)
+    _annotate_entries(built, readings)
 
     # Counted over every overlay row of the diff, listed entry or not.
     rows_by_spot = {
@@ -2394,6 +2621,7 @@ def get_diff_patch_view(
         if _matches(e, bucket, subclass, tier, blind_spot)
         and (body is None or _body_of(e, readings) == body)
         and (not anchored_differs or _anchored_differs(e, _u_state(e, readings)))
+        and (not anchored_micro_side or _anchored_micro_side(e))
     ]
     review = ViewReview(atlas, built)
     unknown_filter = _unknown_filter_value(entries, subclass, blind_spot)
@@ -2409,7 +2637,8 @@ def get_diff_patch_view(
             "sort_by": sort_by or "default",
             "filters": filters,
             "switchable": (
-                "view / sort_by / bucket / subclass / tier / blind_spot / body / anchored_differs"
+                "view / sort_by / bucket / subclass / tier / blind_spot / body / anchored_differs "
+                "/ anchored_micro_side"
             ),
             # A value no entry of this diff carries is named, with the ones that do exist — an
             # empty page alone reads the same whether the value was misspelled or absent.
@@ -2446,6 +2675,15 @@ def get_diff_patch_view(
             f"({ANCHORED_DIFFERS_SIM_FLOOR}) first, then by similarity, highest first, unless "
             "sort_by orders them. Not the rest of R: the other undetermined pairs reading differs "
             "are counted in get_diff_meta's functions.alignment_undetermined_reading"
+        )
+    if anchored_micro_side:
+        envelope["lens"]["anchored_micro_side"] = (
+            "on: only the undetermined pairs anchored (no export gap, the same address or the same "
+            "real symbol name on both sides) with exactly one side a design-skipped micro-stub "
+            "(under the decompile size floor, not decompiled by design) and the other a real body "
+            "— a function gutted to, or grown from, a stub. A fact about these pairs, not a "
+            "reading of the rest of R; counted in get_diff_meta's "
+            "functions.alignment_undetermined_anchored_micro_side"
         )
     if band:
         envelope["lens"]["band"] = (

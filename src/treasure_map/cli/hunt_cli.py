@@ -137,13 +137,17 @@ def _function_line(states: dict[str, Any] | None) -> str:
         f"{changed['no_scoped_signal']} no scoped signal), {unverified['total']} unverified, "
         f"{states['no_body']} no body; {states['alignment_undetermined']} alignment undetermined"
     )
-    # An undetermined pair's proposed reading (never counted into the aligned states above), and
-    # how many of those reading differs are anchored and at or above the read-first floor.
+    # An undetermined pair's proposed reading (never counted into the aligned states above): how
+    # many reading differs are anchored at or above the read-first floor (line-number shifts already
+    # demoted out of it), and how many are anchored with one side a micro-stub.
     proposed = states.get("alignment_undetermined_reading") or {}
     read = ", ".join(f"{n} {state}" for state, n in proposed.items() if n)
     anchored = states.get("alignment_undetermined_anchored_differs")
+    micro = states.get("alignment_undetermined_anchored_micro_side")
     if anchored is not None and read:
         read += f"; anchored_differs={anchored}"
+        if micro is not None:
+            read += f", anchored_micro_side={micro}"
     if states["alignment_undetermined"] and read:
         line += f" (read: {read})"
     sides = "; ".join(
