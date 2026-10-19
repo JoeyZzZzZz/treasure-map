@@ -632,7 +632,10 @@ def get_diff_meta(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any]:
     """The diff's meta facts (binary scope, versions, alignment + presence counts).
 
     All non-derived columns, echoed raw. ``found=False`` when there is no such diff -- an empty
-    answer is explicit, never a silent zero-row that reads as 'nothing changed'."""
+    answer is explicit, never a silent zero-row that reads as 'nothing changed'. ``banners``: a
+    withheld diff's banners as the view gives them; otherwise the read-first banner when an
+    undetermined pair is flagged anchored_differs (patch_view.anchored_differs_banner), else
+    empty."""
     row = atlas.execute(
         f"SELECT {', '.join(_META_COLS)} FROM diff_meta WHERE diff_id = ?",  # noqa: S608
         (diff_id,),
@@ -641,20 +644,27 @@ def get_diff_meta(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any]:
         return {
             "found": False,
             "diff_id": diff_id,
+            "banners": [],
             "note": "no diff_meta for this diff_id -- run `tmap diff` for it first.",
         }
     # patch_view imports this module, so the view is imported here, at call time.
-    from treasure_map.lib.query.patch_view import function_states
+    from treasure_map.lib.query.patch_view import anchored_differs_banner, function_states
 
     meta = dict(zip(_META_COLS, row, strict=True))
     functions = function_states(atlas, diff_id)
     if functions is not None and functions.get("withheld") and not meta["diff_ok"]:
         functions["blind_spot"] = "did_not_diff"
+    banners: list[str] = []
+    if functions is not None and functions.get("withheld"):
+        banners = list(functions.get("banners", []))
+    elif (banner := anchored_differs_banner(functions)) is not None:
+        banners.append(banner)
     return {
         "found": True,
         "diff_id": diff_id,
         "meta": meta,
         "functions": functions,
+        "banners": banners,
         **diff_source_staleness(atlas, diff_id),
         "note": _META_NOTE,
     }

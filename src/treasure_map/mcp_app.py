@@ -1690,6 +1690,7 @@ def make_tools(
         band: bool = False,
         not_listed_page: str | None = None,
         body: str | None = None,
+        anchored_differs: bool = False,
     ) -> dict[str, Any]:
         """START HERE for one diff (``diff_id`` = ``{run_a}::{run_b}::{binary}``; list_diffs gives
         the ids): one entry per FUNCTION PAIR that changed, with what happened around its sink
@@ -1764,7 +1765,18 @@ def make_tools(
         like. An UNDETERMINED pair (bucket R) carries ``proposed_pair_reading`` instead: the same
         reading as if it were paired (``identical_unique`` only when its body occurs once on each
         side, ``identical_not_unique`` otherwise, plus the other states), with where else each
-        body occurs — a proposal beside the entry, never its pairing. Not checked by any of
+        body occurs — a proposal beside the entry, never its pairing. An undetermined pair is
+        flagged ``anchored_differs`` (in its proposed_pair_reading, with ``anchor`` = ``addr`` /
+        ``name`` / ``addr+name`` and ``in_read_first``) when all three hold: no export gap on
+        either side, the two sides share an address or one real symbol name (a made-up name such
+        as ``FUN_<addr>`` / ``sub_<addr>`` anchors by address only), and the proposed reading is
+        ``differs`` — at any similarity, 1 included (similarity 1 does not see a changed constant
+        or buffer size). ``in_read_first`` = at or above the read-first similarity floor (0.7).
+        ``anchored_differs=true`` (sink_patch, listed entries, bucket R or unset) lists only the
+        flagged pairs, read-first ones first, then by similarity, highest first (``sort_by``
+        orders them instead); with ``sort_by='significance'`` they lead attention 1 (basis
+        ``anchored_differs``). A fact, not a verdict, and it clears nothing else in R: the other
+        pairs reading differs still need reading. Not checked by any of
         these: the target a ``DAT_`` / ``PTR_`` reference points at once its address is blanked
         (a string label keeps its content in the name); a C++ catch handler (landing pad), which
         usually lies outside every function body, so its code is never decompiled and no reading
@@ -1814,6 +1826,7 @@ def make_tools(
                 band=band,
                 not_listed_page=not_listed_page,
                 body=body,
+                anchored_differs=anchored_differs,
             )
         finally:
             conn.close()
@@ -2055,8 +2068,14 @@ def make_tools(
         unavailable — neither unchanged nor changed; ``identical_text_unverified_by_body`` splits
         the first by body class), ``no_body`` (an import / PLT stub, counted apart),
         ``alignment_undetermined`` (``alignment_undetermined_reading`` splits it by each pair's
-        proposed reading, never into the aligned counts), and ``one_sided`` by presence_state
-        (never 'added' / 'removed'). ``withheld`` = the whole
+        proposed reading, never into the aligned counts;
+        ``alignment_undetermined_anchored_differs`` = the pairs flagged anchored_differs at or
+        above the read-first floor, ``alignment_undetermined_anchored_differs_all`` = every flagged
+        pair, below the floor included), and ``one_sided`` by presence_state
+        (never 'added' / 'removed'). ``banners``: when any pair is flagged, one banner names those
+        counts and the total reading differs, with the calls that read them and walk the rest of R
+        — the flagged pairs do not stand for the rest; a withheld diff's banners otherwise; empty
+        when there is neither. ``withheld`` = the whole
         diff is undetermined: no counts, a blind spot (``blind_spot='did_not_diff'`` when it
         failed). It reads pseudocode, so it costs what one get_diff_patch_view does.
         ★ ``diff_ok=0`` means this binary did NOT diff (``diff_status='failed'``,

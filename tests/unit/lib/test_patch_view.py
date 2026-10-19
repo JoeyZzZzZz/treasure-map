@@ -26,7 +26,9 @@ from treasure_map.lib import overlay
 from treasure_map.lib.analyze.ghidra_runner import current_pass_version
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.diff import code_version as cv
+from treasure_map.lib.query import diff_align as da
 from treasure_map.lib.query import patch_view as pv
+from treasure_map.lib.query import sameness
 from treasure_map.lib.query import sink_overlay as so
 from treasure_map.lib.storage.connection import open_db
 from treasure_map.version import UNKNOWN_VERSION
@@ -92,14 +94,28 @@ class World:
         sim: float,
         *,
         instructions: int | None = None,
+        name_a: str | None = None,
+        name_b: str | None = None,
         **gaps: str | None,
     ) -> None:
         state = "aligned" if conf >= 0.9 else "alignment_undetermined"
         self.atlas.execute(
-            "INSERT INTO function_alignment (diff_id, addr_a, addr_b, alignment_confidence, "
-            "similarity, alignment_state, export_gap_a, export_gap_b, instructions) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (DIFF, a, b, conf, sim, state, gaps.get("gap_a"), gaps.get("gap_b"), instructions),
+            "INSERT INTO function_alignment (diff_id, addr_a, addr_b, name_a, name_b, "
+            "alignment_confidence, similarity, alignment_state, export_gap_a, export_gap_b, "
+            "instructions) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                DIFF,
+                a,
+                b,
+                name_a,
+                name_b,
+                conf,
+                sim,
+                state,
+                gaps.get("gap_a"),
+                gaps.get("gap_b"),
+                instructions,
+            ),
         )
 
     def unpaired(self, side: str, addr: str, state: str, gap: str | None = None) -> None:
@@ -2401,3 +2417,484 @@ def test_the_view_caches_are_bounded_and_keyed_by_atlas(tmp_path: Path) -> None:
     finally:
         a.close()
         b.close()
+
+
+# ── anchored_differs: an undetermined pair confidently paired whose reading is differs ────────
+
+
+def _ud(
+    w: World,
+    a: str,
+    b: str,
+    sim: float,
+    *,
+    differs: bool = True,
+    name_a: str | None = None,
+    name_b: str | None = None,
+    **gaps: str | None,
+) -> str:
+    """One undetermined pair (confidence 0.5) with one callee, ``foo``, on each side: its two
+    bodies differ by a trailing term, or are the same text (``differs=False``). Every pair's bodies
+    are its own. Returns the entry id."""
+    w.pair(a, b, 0.5, sim, name_a=name_a, name_b=name_b, **gaps)
+    n = int(a, 16) // 0x100
+    w.fn("a", a, ["foo"], pseudocode=f"x = foo({n});", size_bytes=16)
+    w.fn("b", b, ["foo"], pseudocode=f"x = foo({n})" + (" + 7;" if differs else ";"), size_bytes=16)
+    return _pair_id(a, b)
+
+
+def _reading(v: dict[str, Any], entry_id: str) -> dict[str, Any]:
+    assert entry_id in v["by_id"], entry_id
+    reading = v["by_id"][entry_id]["proposed_pair_reading"]
+    assert isinstance(reading, dict)
+    return reading
+
+
+def test_an_anchored_differing_undetermined_pair_is_flagged(tmp_path: Path, current: None) -> None:
+    """Baseline (the teeth are in the counter-examples below): no export gap, one address on both
+    sides, a proposed reading of differs -> flagged, anchored by address, read first at similarity
+    0.87, labelled anchored_differs under the lens, and counted."""
+    w = World(tmp_path)
+    eid = _ud(w, "00020000", "00020000", 0.87)
+    w.commit()
+    v = _view(w, sort_by="significance")
+    r = _reading(v, eid)
+    assert r["state"] == "differs"
+    assert (r["anchored_differs"], r["anchor"], r["in_read_first"]) == (True, "addr", True)
+    assert v["by_id"][eid]["significance"] == {"attention": 1, "basis": "anchored_differs"}
+    s = pv.function_states(w.atlas, DIFF)
+    assert s is not None
+    assert s["alignment_undetermined_anchored_differs"] == 1
+    assert s["alignment_undetermined_anchored_differs_all"] == 1
+
+
+def test_a_pair_with_an_export_gap_is_never_flagged(tmp_path: Path, current: None) -> None:
+    """A pair whose export dropped part of a side reads differs, but that difference is not one to
+    trust: an export gap on either side keeps the pair unflagged and uncounted.
+
+    MUTATION: drop the export-gap test in ``_anchored_differs`` -> both flagged -> RED."""
+    w = World(tmp_path)
+    ga = _ud(w, "00020000", "00020000", 0.87, gap_a="degenerate_block")
+    gb = _ud(w, "00021000", "00021000", 0.87, gap_b="degenerate_block")
+    w.commit()
+    v = _view(w)
+    for eid in (ga, gb):
+        r = _reading(v, eid)
+        assert r["state"] == "differs"  # it does read differs: only the gap keeps it out
+        assert "anchored_differs" not in r
+    s = pv.function_states(w.atlas, DIFF)
+    assert s is not None and s["alignment_undetermined_anchored_differs_all"] == 0
+
+
+def test_an_anchored_pair_that_does_not_read_differs_is_not_flagged(
+    tmp_path: Path, current: None
+) -> None:
+    """Anchored at one address, similarity 0.87, but the proposed reading is a text match —
+    identical_callee_unverified (a callee list is a prefix), identical_text_unverified (byte counts
+    differ), identical_unique — so nothing is flagged.
+
+    MUTATION: drop ``u_state == differs`` from ``_anchored_differs`` -> all three flagged -> RED."""
+    w = World(tmp_path)
+    w.pair("00020000", "00020000", 0.5, 0.87)
+    w.fn("a", "00020000", ["foo"], pseudocode="x = foo(1);", truncated=1)
+    w.fn("b", "00020000", ["foo"], pseudocode="x = foo(1);")
+    w.pair("00021000", "00021000", 0.5, 0.87)
+    w.fn("a", "00021000", ["foo"], pseudocode="x = foo(2);", size_bytes=16)
+    w.fn("b", "00021000", ["foo"], pseudocode="x = foo(2);", size_bytes=20)
+    unique = _ud(w, "00022000", "00022000", 0.87, differs=False)
+    w.commit()
+    v = _view(w)
+    expected = {
+        _pair_id("00020000", "00020000"): "identical_callee_unverified",
+        _pair_id("00021000", "00021000"): "identical_text_unverified",
+        unique: "identical_unique",
+    }
+    for eid, state in expected.items():
+        r = _reading(v, eid)
+        assert r["state"] == state
+        assert "anchored_differs" not in r, state
+
+
+def test_similarity_one_is_flagged_and_read_first_when_the_reading_differs(
+    tmp_path: Path, current: None
+) -> None:
+    """BinDiff's similarity 1 does not see a buffer size or a constant: a similarity-1 pair whose
+    normalized text differs is flagged and read first; one whose text matches is not flagged.
+
+    MUTATION: require similarity < 1 in ``_anchored_differs`` -> the differing pair loses its
+    flag -> RED."""
+    w = World(tmp_path)
+    w.pair("00020000", "00020000", 0.5, 1.0)
+    w.fn("a", "00020000", ["memset"], pseudocode="char b[96]; memset(b, 0, 0x60);", size_bytes=16)
+    w.fn("b", "00020000", ["memset"], pseudocode="char b[100]; memset(b, 0, 100);", size_bytes=16)
+    same = _ud(w, "00021000", "00021000", 1.0, differs=False)
+    w.commit()
+    v = _view(w)
+    sized = _reading(v, _pair_id("00020000", "00020000"))
+    assert sized["state"] == "differs"
+    assert (sized.get("anchored_differs"), sized.get("in_read_first")) == (True, True)
+    assert "anchored_differs" not in _reading(v, same)
+    s = pv.function_states(w.atlas, DIFF)
+    assert s is not None and s["alignment_undetermined_anchored_differs"] == 1
+
+
+def test_the_floor_bounds_the_read_first_count_and_nothing_else(
+    tmp_path: Path, current: None
+) -> None:
+    """At similarity 0.70 a flagged pair is read first; at 0.69 it is still flagged, still
+    counted among every flagged pair, and still listed by the filter — only not read first.
+
+    MUTATION: raise the floor to 0.75 -> the 0.70 pair is not read first -> RED; use the floor as
+    a condition of the flag -> the 0.69 pair loses its flag -> RED."""
+    w = World(tmp_path)
+    at = _ud(w, "00020000", "00020000", 0.70)
+    below = _ud(w, "00021000", "00021000", 0.69)
+    w.commit()
+    v = _view(w)
+    assert (_reading(v, at)["anchored_differs"], _reading(v, at)["in_read_first"]) == (True, True)
+    low = _reading(v, below)
+    assert (low.get("anchored_differs"), low.get("in_read_first")) == (True, False)
+    s = pv.function_states(w.atlas, DIFF)
+    assert s is not None
+    assert s["alignment_undetermined_anchored_differs"] == 1
+    assert s["alignment_undetermined_anchored_differs_all"] == 2
+    listed = _view(w, bucket="R", anchored_differs=True)
+    assert set(listed["by_id"]) == {at, below}
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["sub_9abcd", "FUN_0009abcd", "thunk_FUN_0009abcd", "UndefinedFunction_0009abcd", "LAB_9abcd"],
+)
+def test_a_made_up_name_anchors_by_address_only(tmp_path: Path, current: None, name: str) -> None:
+    """A name a decompiler makes up (its number is not this function's address, so only the whole-
+    name pattern can tell) ties nothing: the same such name at two addresses is unanchored; at one
+    address the pair is anchored by the address alone.
+
+    MUTATION: drop the whole-name pattern from ``_is_synthetic_name`` -> the two-address pair is
+    anchored by the name, and the one-address pair reads ``addr+name`` -> RED."""
+    w = World(tmp_path)
+    apart = _ud(w, "00020000", "00030000", 0.87, name_a=name, name_b=name)
+    together = _ud(w, "00021000", "00021000", 0.87, name_a=name, name_b=name)
+    w.commit()
+    v = _view(w)
+    assert _reading(v, apart)["state"] == "differs"
+    assert "anchored_differs" not in _reading(v, apart)
+    assert _reading(v, together)["anchor"] == "addr"
+
+
+def test_a_name_ending_in_its_own_address_is_made_up_on_that_side(
+    tmp_path: Path, current: None
+) -> None:
+    """A ``loc_<addr>`` name (a family the whole-name pattern does not list) is made up on the side
+    whose own entry address it ends in, and only there — so the same name on two addresses
+    anchors nothing, whichever side it names. Each side is judged against its own address.
+
+    MUTATION: drop the own-address rule -> both pairs anchored by name -> RED; judge name_b
+    against addr_a -> the second pair's B name reads as real -> anchored -> RED."""
+    w = World(tmp_path)
+    names_a = _ud(w, "00040000", "00050000", 0.87, name_a="loc_00040000", name_b="loc_00040000")
+    names_b = _ud(w, "00060000", "00070000", 0.87, name_a="loc_00070000", name_b="loc_00070000")
+    w.commit()
+    v = _view(w)
+    for eid in (names_a, names_b):
+        assert _reading(v, eid)["state"] == "differs"
+        assert "anchored_differs" not in _reading(v, eid), eid
+
+
+@pytest.mark.parametrize("name", ["init_engine", "inet_aton", "localtime_r"])
+def test_a_real_name_that_starts_like_a_made_up_one_still_anchors(
+    tmp_path: Path, current: None, name: str
+) -> None:
+    """A real symbol that only starts like a made-up prefix (``in``, ``local``) is matched as a
+    whole, not by its start: it stays a real name and anchors a pair at two addresses.
+
+    MUTATION: match the pattern by prefix instead of as a whole -> the name reads as made up and
+    the pair is unanchored -> RED."""
+    w = World(tmp_path)
+    eid = _ud(w, "00020000", "00030000", 0.87, name_a=name, name_b=name)
+    w.commit()
+    r = _reading(_view(w), eid)
+    assert (r.get("anchored_differs"), r.get("anchor")) == (True, "name")
+
+
+def test_a_pair_with_no_body_is_never_flagged(tmp_path: Path, current: None) -> None:
+    """Anchored at one address, but a side has no body to read: B not in the functions table
+    (no_body), or in it with empty pseudocode (unavailable) — neither reading is differs, so
+    neither is flagged.
+
+    MUTATION: let ``_anchored_differs`` accept no_body / unavailable -> RED."""
+    w = World(tmp_path)
+    w.pair("00020000", "00020000", 0.5, 0.87)
+    w.fn("a", "00020000", ["foo", "bar"], pseudocode="x = foo(1);")
+    w.pair("00021000", "00021000", 0.5, 0.87)
+    w.fn("a", "00021000", ["foo"], pseudocode="x = foo(2);")
+    w.fn("b", "00021000", ["foo"], pseudocode=None)
+    w.commit()
+    v = _view(w)
+    for eid, state in (
+        (_pair_id("00020000", "00020000"), "no_body"),
+        (_pair_id("00021000", "00021000"), "unavailable"),
+    ):
+        r = _reading(v, eid)
+        assert r["state"] == state
+        assert "anchored_differs" not in r, state
+
+
+def _ordered_world(tmp_path: Path) -> tuple[World, dict[str, str]]:
+    """The function world (bucket A and a changed length constant at attention 0) plus: a flagged
+    pair read first (0.9), a flagged pair below the floor (0.5), an unanchored pair reading differs
+    (0.3), an R pair read identical_unique (0.2), and a bucket C pair (sunk)."""
+    w = _function_world(tmp_path)
+    ids = {
+        "a0": _pair_id("0000b000", "0000c000"),
+        "first": _ud(w, "00020000", "00020000", 0.9),
+        "below": _ud(w, "00021000", "00021000", 0.5),
+        "plain": _ud(w, "00022000", "00023000", 0.3),
+        "settled": _ud(w, "00024000", "00025000", 0.2, differs=False),
+    }
+    w.pair("00026000", "00027000", 0.97, 0.7)
+    w.fn("a", "00026000", ["memset"], pseudocode="memset(b,0,8);")
+    w.fn("b", "00027000", ["memset"], pseudocode="memset(b,0,8);")
+    ids["sunk"] = _pair_id("00026000", "00027000")
+    w.commit()
+    return w, ids
+
+
+def test_the_lens_puts_read_first_ahead_of_below_the_floor_ahead_of_the_rest(
+    tmp_path: Path, current: None
+) -> None:
+    """★ Under sort_by='significance': attention 0, then inside attention 1 the read-first pair,
+    then the flagged pair below the floor, then the other entries (lowest similarity first, the
+    identical_unique R entry closing the tier), then the sunk entry. The pair below the floor has
+    the LOWER similarity, so only the read-first level keeps it behind the read-first pair.
+
+    MUTATION: give every flagged pair one level -> the 0.5 pair comes before the 0.9 pair -> RED;
+    put ``read_first`` before ``attention`` in the key -> the flagged pairs pass attention 0 ->
+    RED; drop ``read_first`` from the key -> the 0.3 pair comes first -> RED."""
+    w, ids = _ordered_world(tmp_path)
+    v = _view(w, sort_by="significance")
+    order = [e["entry_id"] for e in v["entries"]]
+    for k, eid in ids.items():
+        assert eid in order, k
+    pos = {k: order.index(eid) for k, eid in ids.items()}
+    assert pos["a0"] < pos["first"] < pos["below"] < pos["plain"] < pos["settled"] < pos["sunk"]
+    assert v["by_id"][ids["a0"]]["significance"]["attention"] == 0
+    assert v["by_id"][ids["sunk"]]["significance"]["attention"] == 2
+    assert _reading(v, ids["settled"])["state"] == "identical_unique"
+
+
+def test_a_flagged_r_entry_stays_at_attention_one(tmp_path: Path, current: None) -> None:
+    """The flag orders inside attention 1; an R entry carrying it never reaches attention 2.
+
+    MUTATION: return ATTENTION_SINK for an anchored_differs entry -> RED."""
+    w, ids = _ordered_world(tmp_path)
+    v = _view(w, sort_by="significance")
+    for k in ("first", "below"):
+        assert v["by_id"][ids[k]]["significance"] == {"attention": 1, "basis": "anchored_differs"}
+    for e in v["entries"]:
+        if e["bucket"] == "R":
+            assert e["significance"]["attention"] <= 1, e["entry_id"]
+
+
+def _banner_world(tmp_path: Path, case: str) -> World:
+    w = World(tmp_path)
+    if case in ("both", "below_only"):
+        _ud(w, "00021000", "00021000", 0.5)  # flagged, below the floor
+    if case == "both":
+        _ud(w, "00020000", "00020000", 0.9)  # flagged, read first
+    if case in ("both", "below_only", "none"):
+        _ud(w, "00022000", "00023000", 0.3)  # reads differs, unanchored
+    w.commit()
+    return w
+
+
+@pytest.mark.parametrize(
+    ("case", "counts"),
+    [("both", (1, 2, 3)), ("below_only", (0, 1, 2)), ("none", None)],
+)
+def test_get_diff_meta_hangs_the_read_first_banner_when_any_pair_is_flagged(
+    tmp_path: Path, current: None, case: str, counts: tuple[int, int, int] | None
+) -> None:
+    """★ One banner whenever ANY pair is flagged — also when none is read first (every flagged
+    pair below the floor) — naming the read-first count, every flagged pair, the total reading
+    differs, the call that walks the rest of R, and that the flagged pairs do not clear it.
+    None when no pair is flagged.
+
+    MUTATION: hang it only when the read-first count is > 0 -> the below_only case has none ->
+    RED; leave the total reading differs out of it -> RED."""
+    w = _banner_world(tmp_path, case)
+    meta = da.get_diff_meta(w.atlas, DIFF)
+    if counts is None:
+        assert meta["banners"] == []
+        return
+    first, flagged, differs = counts
+    assert meta["functions"]["alignment_undetermined_reading"]["differs"] == differs
+    assert len(meta["banners"]) == 1
+    (banner,) = meta["banners"]
+    assert banner.startswith(f"anchored_differs: {first} undetermined pairs are confidently paired")
+    assert f"{flagged} anchored pairs differ in total" in banner
+    assert f"{differs} undetermined pairs read 'differs' in total" in banner
+    assert 'get_diff_patch_view(bucket="R", anchored_differs=true)' in banner
+    assert 'get_diff_patch_view(bucket="R", sort_by="significance")' in banner
+    assert "does NOT clear the rest of the R bucket" in banner
+
+
+def test_get_diff_meta_banners_when_there_is_no_diff_or_it_is_withheld(
+    tmp_path: Path, current: None
+) -> None:
+    """No such diff -> an empty list. A withheld diff -> its own banners as the view gives them,
+    and never the read-first one (a withheld diff has no counts to put in it).
+
+    MUTATION: drop ``banners`` from the not-found answer -> ``.get`` reads None -> RED; give a
+    withheld diff an empty list instead of its own banners -> RED. (A withheld diff carries no
+    counts, so the read-first banner cannot be built for it; the last assertion records that.)"""
+    assert da.get_diff_meta(World(tmp_path).atlas, "runA::runB::nope").get("banners") == []
+    pv._clear_view_caches()
+    w = _banner_world(tmp_path / "withheld", "both")
+    w.atlas.execute("UPDATE diff_meta SET version_skew = 1")
+    w.commit()
+    meta = da.get_diff_meta(w.atlas, DIFF)
+    assert meta["functions"]["withheld"] is True
+    assert meta["banners"] == meta["functions"]["banners"]
+    assert "diff_undetermined:version_skew" in meta["banners"]
+    assert not any(b.startswith("anchored_differs") for b in meta["banners"])
+
+
+def test_function_states_keeps_its_keys_and_adds_two_counts(tmp_path: Path, current: None) -> None:
+    """The existing keys keep their names and shapes; the two counts are new top-level integers,
+    the read-first one never above the one over every flagged pair.
+
+    MUTATION: put the counts inside alignment_undetermined_reading -> its keys are no longer the
+    reading states -> RED."""
+    w, _ids = _ordered_world(tmp_path)
+    s = pv.function_states(w.atlas, DIFF)
+    assert s is not None
+    existing = {
+        "diff_id",
+        "withheld",
+        "aligned",
+        "unchanged",
+        "changed",
+        "unverified",
+        "identical_text_unverified_by_body",
+        "no_body",
+        "alignment_undetermined",
+        "alignment_undetermined_reading",
+        "one_sided",
+    }
+    new = {"alignment_undetermined_anchored_differs", "alignment_undetermined_anchored_differs_all"}
+    assert set(s) == existing | new
+    assert set(s["alignment_undetermined_reading"]) == set(sameness.U_STATES)
+    assert all(type(s[k]) is int for k in new)
+    assert s["alignment_undetermined_anchored_differs"] == 1
+    assert s["alignment_undetermined_anchored_differs_all"] == 2
+
+
+def _filter_world(tmp_path: Path) -> tuple[World, dict[str, str]]:
+    w = World(tmp_path)
+    ids = {
+        "one": _ud(w, "00020000", "00020000", 1.0),
+        "high": _ud(w, "00021000", "00021000", 0.95),
+        "floor": _ud(w, "00022000", "00022000", 0.75),
+        "below": _ud(w, "00023000", "00023000", 0.6),
+        "low": _ud(w, "00024000", "00024000", 0.3),
+    }
+    _ud(w, "00025000", "00026000", 0.8)  # reads differs, unanchored
+    _ud(w, "00027000", "00027000", 0.8, differs=False)  # anchored, identical_unique
+    w.pair("00010000", "00011000", 0.97, 0.9)  # an aligned pair whose body changed
+    w.fn("a", "00010000", ["foo"], pseudocode="y = 1;")
+    w.fn("b", "00011000", ["foo"], pseudocode="y = 2;")
+    w.commit()
+    return w, ids
+
+
+def test_the_anchored_differs_filter_lists_every_flagged_pair_read_first_first(
+    tmp_path: Path, current: None
+) -> None:
+    """★ anchored_differs=true lists exactly the flagged pairs — similarity 1 and the pairs below
+    the floor included — the read-first ones first, each group by similarity, highest first; a
+    sort_by orders them instead. (By construction every read-first pair has a higher similarity
+    than every pair below the floor, so a similarity-descending order alone puts the groups the
+    same way; the ordering's teeth are against the default order, lowest similarity first.)
+
+    MUTATION: drop the filter's own order (fall back to the default one) -> the 0.3 pair comes
+    first -> RED; drop the filter condition -> the unflagged entries are listed -> RED."""
+    w, ids = _filter_world(tmp_path)
+    v = _view(w, bucket="R", anchored_differs=True)
+    order = [e["entry_id"] for e in v["entries"]]
+    assert order == [ids[k] for k in ("one", "high", "floor", "below", "low")]
+    assert [e["proposed_pair_reading"]["in_read_first"] for e in v["entries"]] == [
+        True,
+        True,
+        True,
+        False,
+        False,
+    ]
+    assert v["lens"]["filters"]["anchored_differs"] is True
+    assert "anchored_differs" in v["lens"]
+    s = pv.function_states(w.atlas, DIFF)
+    assert s is not None and s["alignment_undetermined_anchored_differs_all"] == len(order)
+    unset = _view(w, anchored_differs=True)  # bucket unset: the same pairs
+    assert [e["entry_id"] for e in unset["entries"]] == order
+    by_sim = _view(w, bucket="R", anchored_differs=True, sort_by="similarity")
+    assert [e["entry_id"] for e in by_sim["entries"]] == list(reversed(order))
+
+
+def test_the_anchored_differs_filter_refuses_what_it_cannot_apply_to(
+    tmp_path: Path, current: None
+) -> None:
+    """Every combination it cannot honour is an error, never an empty or unfiltered page."""
+    w, _ids = _filter_world(tmp_path)
+    cases = [
+        ({"view": "string_edge"}, "anchored_differs applies to view='sink_patch' only"),
+        ({"view": "candidate_flat"}, "anchored_differs applies to view='sink_patch' only"),
+        (
+            {"not_listed_page": "aligned_pseudocode_differs"},
+            "anchored_differs applies to the listed entries, not to not_listed_page",
+        ),
+        ({"bucket": "A"}, "anchored_differs keeps bucket R entries only, got bucket='A'"),
+    ]
+    for kw, error in cases:
+        out = pv.get_diff_patch_view(w.atlas, DIFF, anchored_differs=True, **kw)
+        assert out.get("error") == error, kw
+    out = pv.get_diff_patch_view(w.atlas, DIFF, anchored_differs="yes")  # type: ignore[arg-type]
+    assert out.get("error") == "anchored_differs must be true or false, got 'yes'"
+
+
+def test_the_mcp_tool_passes_anchored_differs_through(tmp_path: Path, current: None) -> None:
+    """The call the banner names works through the MCP tool and lists the same pairs.
+
+    MUTATION: drop the argument from the tool's call into the view -> every entry is listed ->
+    RED; drop it from the tool's signature -> the call fails -> RED."""
+    w, ids = _filter_world(tmp_path)
+    tool = mcp_app.make_tools(w.path)["get_diff_patch_view"]
+    out = tool(DIFF, bucket="R", anchored_differs=True)
+    assert "error" not in out, out
+    assert {e["entry_id"] for e in out["entries"]} == set(ids.values())
+    assert str(pv.ANCHORED_DIFFERS_SIM_FLOOR) in (tool.__doc__ or "")
+
+
+def test_the_flag_is_on_the_reading_whatever_the_sort(tmp_path: Path, current: None) -> None:
+    """``anchored_differs`` / ``anchor`` / ``in_read_first`` are on the proposed reading with no
+    sort_by at all; the lens's attention and basis are there only under sort_by='significance'.
+
+    MUTATION: compute the flag fields only under the lens -> RED."""
+    w, ids = _filter_world(tmp_path)
+    v = _view(w)
+    e = v["by_id"][ids["below"]]
+    assert "significance" not in e
+    r = e["proposed_pair_reading"]
+    fields = (r.get("anchored_differs"), r.get("anchor"), r.get("in_read_first"))
+    assert fields == (True, "addr", False)
+
+
+def test_the_diff_command_line_counts_the_read_first_pairs(tmp_path: Path, current: None) -> None:
+    """The diff command's per-binary line carries the read-first count inside its reading.
+
+    MUTATION: drop the count from ``_function_line`` -> RED."""
+    from treasure_map.cli.hunt_cli import _function_line
+
+    w = _banner_world(tmp_path, "both")
+    line = _function_line(pv.function_states(w.atlas, DIFF))
+    assert "(read: 3 differs; anchored_differs=1)" in line

@@ -1301,6 +1301,91 @@ def _default_key(r: dict[str, Any], band: int = 0) -> tuple[Any, ...]:
 # attention 0 floats, 1 is the similarity-ordered middle, 2 sinks; every entry stays listed.
 ATTENTION_FLOAT, ATTENTION_MIDDLE, ATTENTION_SINK = 0, 1, 2
 
+# ── an undetermined pair that is confidently paired and reads differs ──
+
+# A function name a decompiler or disassembler makes up from an address or a role, rather than a
+# symbol the binary carries. Matched against the WHOLE name: after the prefix only an optional
+# underscore and hex digits (or '@') may follow, so a real symbol that merely starts like one —
+# ``init_config``, ``inet_aton``, ``localtime_r`` — does not match.
+_SYNTHETIC_NAME_RE = re.compile(
+    r"^(?:thunk_)?(?:FUN|DAT|LAB|UNK|SUB|sub|EXT|SWITCH|switchD|caseD|UndefinedFunction|byte"
+    r"|dword|word|uRam|iRam|param|local|auStack|aStack|unaff|in|extraout|register)"
+    r"_?[0-9a-fA-F@]*$"
+)
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+# The read-first floor: an anchored_differs pair at or above this BinDiff similarity is counted
+# among the pairs to read first. A trade-off that keeps that count short, not a boundary the data
+# proves: a pair below it keeps its flag, is still ordered ahead of the unflagged entries, and is
+# still listed by the anchored_differs filter.
+ANCHORED_DIFFERS_SIM_FLOOR = 0.7
+
+
+def _is_synthetic_name(name: str | None, own_addr: str) -> bool:
+    """Whether ``name`` is made up rather than a symbol the binary carries: it matches
+    ``_SYNTHETIC_NAME_RE`` as a whole, or the part after its last ``_`` is a hex number of 5+
+    digits equal to the function's OWN entry address (a ``loc_<addr>``-style name of a family the
+    pattern does not list). A missing or blank name counts as made up. Separate from ``_FUN_RE``,
+    which identifies callees and must not change with this."""
+    if name is None or not name.strip():
+        return True
+    n = name.strip()
+    if _SYNTHETIC_NAME_RE.fullmatch(n):
+        return True
+    if "_" not in n:
+        return False
+    tail = n.rsplit("_", 1)[1]
+    if len(tail) < 5 or not set(tail) <= _HEX_DIGITS:
+        return False
+    try:
+        return int(tail, 16) == int(own_addr, 16)
+    except ValueError:
+        return False
+
+
+def _anchor(p: _Pair) -> str | None:
+    """How a pair's two sides are tied together, if at all: ``addr`` (both at one address),
+    ``name`` (one real symbol name on both sides, each side's name judged against its own
+    address), ``addr+name``, or None."""
+    at_addr = p.addr_a == p.addr_b
+    named = (
+        p.name_a is not None
+        and p.name_b is not None
+        and p.name_a.strip() == p.name_b.strip()
+        and not _is_synthetic_name(p.name_a, p.addr_a)
+        and not _is_synthetic_name(p.name_b, p.addr_b)
+    )
+    if at_addr and named:
+        return "addr+name"
+    return "addr" if at_addr else "name" if named else None
+
+
+def _anchored_differs(e: _Entry, u_state: str | None) -> bool:
+    """An undetermined pair that is confidently paired and whose normalized pseudocode differs: no
+    export gap on either side (a function the export did not hold as it is cannot be compared
+    faithfully), anchored by address or by a real symbol name (:func:`_anchor`), and a proposed
+    reading of ``differs``. No similarity bound: BinDiff's similarity 1 does not see a changed
+    constant or buffer size. It orders and counts; it moves the entry nowhere and clears nothing
+    else in R."""
+    p = e.pair
+    return (
+        p is not None
+        and not p.aligned
+        and p.export_gap_a is None
+        and p.export_gap_b is None
+        and u_state == sameness.U_DIFFERS
+        and _anchor(p) is not None
+    )
+
+
+def _read_first_order(e: _Entry, u_state: str | None) -> int:
+    """2 = anchored_differs at or above ``ANCHORED_DIFFERS_SIM_FLOOR`` (the read-first pairs); 1 =
+    anchored_differs below it; 0 = every other entry."""
+    p = e.pair
+    if p is None or not _anchored_differs(e, u_state):
+        return 0
+    return 2 if p.similarity is not None and p.similarity >= ANCHORED_DIFFERS_SIM_FLOOR else 1
+
 
 def _held_up(item: diff_review.Item | None) -> bool:
     """A judgement that must keep its entry off the bottom tier: judged changed_real, due a
@@ -1330,6 +1415,9 @@ def significance(
         entry is R (an undetermined pair is never buried under the pairs that were read) or its
         judgement is held up (changed_real, needs_recheck / needs_relabel, inconclusive), which
         stops it at 1;
+      * an undetermined pair flagged :func:`_anchored_differs` -> 1, labelled
+        ``anchored_differs``: still attention 1 (an R entry never reaches 0 or 2 on it), ordered
+        first inside it (``read_first`` in :func:`_sort`);
       * everything else -> 1, ordered by similarity, lowest first. ``identical_text_unverified``
         is never sunk outside C."""
     if e.bucket == "A":
@@ -1347,6 +1435,8 @@ def significance(
         return ATTENTION_SINK, basis
     if e.bucket == "P":
         return ATTENTION_MIDDLE, "no_counterpart"
+    if _anchored_differs(e, u_state):
+        return ATTENTION_MIDDLE, "anchored_differs"
     return ATTENTION_MIDDLE, "similarity"
 
 
@@ -1356,16 +1446,19 @@ def _sort(
     band: dict[str, int] | None = None,
     attention: dict[str, int] | None = None,
     settled: dict[str, int] | None = None,
+    read_first: dict[str, int] | None = None,
 ) -> list[_Entry]:
     """The default order, or ``sort_by`` (one named component) ahead of it. P stays last either
     way: a function with no counterpart is not ordered among the pairs. ``band`` maps an entry id
     to its judgement band (diff_review.band_bias); None leaves the order as it is.
 
-    ``sort_by="significance"`` orders by ``(attention, band, settled, similarity, default key)`` —
-    ``attention`` from :func:`significance`, the band only when it is on (judgements move nothing
-    unless asked), ``settled`` (1 for an R entry whose proposed reading is ``identical_unique``,
-    so it closes its tier, still ahead of every sunk entry), similarity lowest first, then the
-    default order."""
+    ``sort_by="significance"`` orders by ``(attention, read_first, band, settled, similarity,
+    default key)`` — ``attention`` from :func:`significance`; ``read_first``
+    (:func:`_read_first_order`, highest first) so that inside a tier the anchored_differs pairs at
+    or above the floor come first, then those below it, then the rest; the band only when it is on
+    (judgements move nothing unless asked); ``settled`` (1 for an R entry whose proposed reading
+    is ``identical_unique``, so it closes its tier, still ahead of every sunk entry); similarity
+    lowest first; then the default order."""
 
     def key(e: _Entry) -> tuple[Any, ...]:
         r = e.rank
@@ -1374,6 +1467,7 @@ def _sort(
             return (
                 p_last,
                 (attention or {}).get(e.entry_id, ATTENTION_MIDDLE),
+                -(read_first or {}).get(e.entry_id, 0),
                 band.get(e.entry_id, 0) if band else 0,
                 (settled or {}).get(e.entry_id, 0),
                 r.get("similarity", -1.0),
@@ -1825,6 +1919,30 @@ def _proposed_of(e: _Entry, readings: _Readings) -> tuple[str, _Read] | None:
     return state, read
 
 
+def _u_state(e: _Entry, readings: _Readings) -> str | None:
+    """The state of an undetermined pair's proposed reading; None for any other entry."""
+    proposed = _proposed_of(e, readings)
+    return proposed[0] if proposed is not None else None
+
+
+def _anchored_order(
+    entries: list[_Entry], read_first: dict[str, int], band: dict[str, int] | None
+) -> list[_Entry]:
+    """The order of the anchored_differs filter when no ``sort_by`` is given: the read-first pairs
+    (at or above the floor) first, then by similarity, highest first, then the default order."""
+
+    def key(e: _Entry) -> tuple[Any, ...]:
+        sim = e.pair.similarity if e.pair is not None else None
+        return (
+            -read_first.get(e.entry_id, 0),
+            sim is None,
+            -(sim or 0.0),
+            *_default_key(e.rank, band.get(e.entry_id, 0) if band else 0),
+        )
+
+    return sorted(entries, key=key)
+
+
 def _body_of(e: _Entry, readings: _Readings) -> str | None:
     """The ``body`` class of an identical_text_unverified entry (aligned, or an undetermined pair's
     proposed reading); None for any other entry — the ``body`` filter keeps no other entry."""
@@ -1893,10 +2011,15 @@ def _proposed_json(
 ) -> dict[str, Any]:
     """An undetermined pair's ``proposed_pair_reading``: read as if it were paired, beside the
     entry and never as its pseudocode_sameness. ``occurrences`` and the two ``*_elsewhere_*`` are
-    null unless both bodies were read."""
+    null unless both bodies were read. A pair flagged :func:`_anchored_differs` also carries
+    ``anchored_differs: true``, its ``anchor`` and ``in_read_first`` (at or above the floor),
+    whatever the sort."""
     p = e.pair
     assert p is not None
     out: dict[str, Any] = {"pairing": "undetermined", "state": state}
+    order = _read_first_order(e, state)
+    if order:
+        out.update({"anchored_differs": True, "anchor": _anchor(p), "in_read_first": order == 2})
     if state == sameness.U_IDENTICAL_TEXT_UNVERIFIED:
         out["text_unverified_reasons"] = list(read.text_reasons)
     out.update(
@@ -1998,7 +2121,12 @@ _SIGNIFICANCE_LENS = (
     "sort_by='significance' reorders the listed entries, never relabels them: attention 0 = bucket "
     "A or a row carrying sink_arg_constant_delta; 2 = pseudocode_sameness identical, or bucket C "
     "(sunk, still listed and pageable); 1 = the rest, lowest similarity first, R and B entries "
-    "ordered together. Attention 0 holds B entries too (a row's sink_arg_constant_delta) beside "
+    "ordered together — except that an undetermined pair flagged anchored_differs (no export gap, "
+    "the same address or the same real symbol name on both sides, proposed reading differs) comes "
+    f"first inside attention 1: those at or above similarity {ANCHORED_DIFFERS_SIM_FLOOR} first, "
+    "then those below it, basis anchored_differs. The flag clears nothing else in R: every other "
+    "undetermined pair reading differs is still to be read. "
+    "Attention 0 holds B entries too (a row's sink_arg_constant_delta) beside "
     "A. Never sunk: an R entry (attention 2 never holds one; one whose proposed_pair_reading is "
     "identical_unique closes attention 1 instead), a B sink_present_no_visible_delta (labelled "
     "recheckable_no_visible_delta), an identical_text_unverified entry outside bucket C, and an "
@@ -2037,9 +2165,12 @@ def function_states(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] |
     ``identical_text_unverified_by_body`` splits the first by its body class) and ``no_body`` (an
     import / PLT stub, kept out of every other count). Pairs whose alignment is undetermined are
     counted beside them, and ``alignment_undetermined_reading`` splits them by their proposed
-    reading (never into the aligned counts); functions with no counterpart are counted by
-    presence_state, never "added"/"removed". A diff undetermined as a whole is ``withheld`` with
-    its banners and NO counts — a blind spot, not zero changes. None when there is no such diff."""
+    reading (never into the aligned counts); of those reading differs,
+    ``alignment_undetermined_anchored_differs`` counts the pairs flagged anchored_differs at or
+    above the read-first floor and ``alignment_undetermined_anchored_differs_all`` every flagged
+    pair, below the floor included. Functions with no counterpart are counted by presence_state,
+    never "added"/"removed". A diff undetermined as a whole is ``withheld`` with its banners and NO
+    counts — a blind spot, not zero changes. None when there is no such diff."""
     built = build_diff_view(atlas, diff_id)
     if built is None:
         return None
@@ -2057,10 +2188,16 @@ def function_states(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] |
     by_body = {cls: 0 for cls in sameness.BODY_CLASSES}
     proposed = {state: 0 for state in sameness.U_STATES}
     scoped = 0
+    anchored = anchored_all = 0
     for e in built.placed:
         reading = _proposed_of(e, readings)
         if reading is not None:
             proposed[reading[0]] += 1
+            order = _read_first_order(e, reading[0])
+            if order:
+                anchored_all += 1
+            if order == 2:
+                anchored += 1
         state = _sameness_of(e, readings)
         if state is None:
             continue
@@ -2090,8 +2227,34 @@ def function_states(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] |
         "no_body": tally.get(sameness.NO_BODY, 0),
         "alignment_undetermined": undetermined,
         "alignment_undetermined_reading": proposed,
+        "alignment_undetermined_anchored_differs": anchored,
+        "alignment_undetermined_anchored_differs_all": anchored_all,
         "one_sided": {s: dict(sorted(v.items())) for s, v in sorted(one_sided.items())},
     }
+
+
+def anchored_differs_banner(states: dict[str, Any] | None) -> str | None:
+    """The read-first banner of one diff's :func:`function_states`, or None when no undetermined
+    pair is flagged anchored_differs (or the diff is withheld, which has no counts). It names the
+    read-first count, every flagged pair, and every undetermined pair reading differs — the flagged
+    ones do not stand for the rest of R."""
+    if not states or states.get("withheld"):
+        return None
+    flagged = int(states.get("alignment_undetermined_anchored_differs_all") or 0)
+    if flagged <= 0:
+        return None
+    first = int(states.get("alignment_undetermined_anchored_differs") or 0)
+    differs = int((states.get("alignment_undetermined_reading") or {}).get(sameness.U_DIFFERS, 0))
+    return (
+        f"anchored_differs: {first} undetermined pairs are confidently paired (same address or "
+        "same real symbol), their normalized pseudocode differs, and they sit at or above the "
+        f"read-first similarity floor ({ANCHORED_DIFFERS_SIM_FLOOR}) — read these first: "
+        'get_diff_patch_view(bucket="R", anchored_differs=true). '
+        f"{flagged} anchored pairs differ in total (incl. below the floor); and this does NOT "
+        f"clear the rest of the R bucket: {differs} undetermined pairs read 'differs' in total. "
+        'Walk the remainder with get_diff_patch_view(bucket="R", sort_by="significance") to the '
+        "end."
+    )
 
 
 def get_diff_patch_view(
@@ -2109,6 +2272,7 @@ def get_diff_patch_view(
     band: bool = False,
     not_listed_page: str | None = None,
     body: str | None = None,
+    anchored_differs: bool = False,
 ) -> dict[str, Any]:
     """The function-level view of one diff (see the module docstring), one page of it.
 
@@ -2132,7 +2296,30 @@ def get_diff_patch_view(
     of that body class — listed ones (an aligned pair's, or an undetermined pair's proposed
     reading) and, with ``not_listed_page``, the not-listed pairs of
     ``aligned_pseudocode_identical_text_unverified`` (with any other ``not_listed_page`` it is an
-    error, not an empty page)."""
+    error, not an empty page).
+
+    ``anchored_differs`` (``sink_patch`` only, listed entries only, bucket R or unset) keeps only
+    the undetermined pairs flagged anchored_differs — with no similarity bound, so similarity 1
+    and the pairs below the read-first floor are kept too — ordered read-first ones (at or above
+    the floor) first, then by similarity, highest first; a ``sort_by`` orders them instead. The
+    flag is a fact about these pairs, not a reading of the rest of R."""
+    if not isinstance(anchored_differs, bool):
+        return {
+            "diff_id": diff_id,
+            "error": f"anchored_differs must be true or false, got {anchored_differs!r}",
+        }
+    if anchored_differs and view != "sink_patch":
+        return {"diff_id": diff_id, "error": "anchored_differs applies to view='sink_patch' only"}
+    if anchored_differs and not_listed_page is not None:
+        return {
+            "diff_id": diff_id,
+            "error": "anchored_differs applies to the listed entries, not to not_listed_page",
+        }
+    if anchored_differs and bucket is not None and bucket != "R":
+        return {
+            "diff_id": diff_id,
+            "error": f"anchored_differs keeps bucket R entries only, got bucket={bucket!r}",
+        }
     if not_listed_page is not None and not_listed_page not in sameness.STATE_BY_NOT_LISTED_NAME:
         names = list(sameness.STATE_BY_NOT_LISTED_NAME)
         return {"diff_id": diff_id, "error": f"not_listed_page must be one of {names}"}
@@ -2155,6 +2342,7 @@ def get_diff_patch_view(
         "tier": tier,
         "blind_spot": blind_spot,
         "body": body,
+        "anchored_differs": True if anchored_differs else None,
     }
     filtered = any(v is not None for v in filters.values())
     error = _check_args(view, sort_by, bucket, tier, limit, offset, filtered, band)
@@ -2205,6 +2393,7 @@ def get_diff_patch_view(
         for e in entries
         if _matches(e, bucket, subclass, tier, blind_spot)
         and (body is None or _body_of(e, readings) == body)
+        and (not anchored_differs or _anchored_differs(e, _u_state(e, readings)))
     ]
     review = ViewReview(atlas, built)
     unknown_filter = _unknown_filter_value(entries, subclass, blind_spot)
@@ -2219,7 +2408,9 @@ def get_diff_patch_view(
             ),
             "sort_by": sort_by or "default",
             "filters": filters,
-            "switchable": "view / sort_by / bucket / subclass / tier / blind_spot / body",
+            "switchable": (
+                "view / sort_by / bucket / subclass / tier / blind_spot / body / anchored_differs"
+            ),
             # A value no entry of this diff carries is named, with the ones that do exist — an
             # empty page alone reads the same whether the value was misspelled or absent.
             **({"filter_note": unknown_filter} if unknown_filter else {}),
@@ -2247,6 +2438,15 @@ def get_diff_patch_view(
         "review_progress": review.progress(chosen, filters, ledger),
         "annotation": review.annotation(),
     }
+    if anchored_differs:
+        envelope["lens"]["anchored_differs"] = (
+            "on: only the undetermined pairs flagged anchored_differs (no export gap, the same "
+            "address or the same real symbol name on both sides, proposed reading differs), at "
+            "any similarity; those at or above the read-first floor "
+            f"({ANCHORED_DIFFERS_SIM_FLOOR}) first, then by similarity, highest first, unless "
+            "sort_by orders them. Not the rest of R: the other undetermined pairs reading differs "
+            "are counted in get_diff_meta's functions.alignment_undetermined_reading"
+        )
     if band:
         envelope["lens"]["band"] = (
             "on: inside each group the default order holds together (segment, tier, lane, "
@@ -2307,13 +2507,17 @@ def get_diff_patch_view(
             ),
             "filter": {"body": sameness.BODY_STRUCTURE_DIFFERS},
         }
-    ordered = _sort(
-        chosen,
-        sort_by,
-        review.bands() if band else None,
-        {k: v[0] for k, v in lens.items()},
-        settled,
-    )
+    read_first: dict[str, int] = {}
+    for e in chosen:
+        if e.entry_id in proposed and (order := _read_first_order(e, proposed[e.entry_id][0])):
+            read_first[e.entry_id] = order
+    bands = review.bands() if band else None
+    if anchored_differs and sort_by is None:
+        ordered = _anchored_order(chosen, read_first, bands)
+    else:
+        ordered = _sort(
+            chosen, sort_by, bands, {k: v[0] for k, v in lens.items()}, settled, read_first
+        )
     end = offset + limit
     page = ordered[offset:end]
     page_deltas = _deltas(
