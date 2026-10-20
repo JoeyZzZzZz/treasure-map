@@ -2739,13 +2739,15 @@ def test_unavailable_by_cause_sums_to_its_count(tmp_path: Path, current: None) -
 def test_a_line_number_shift_is_demoted_out_of_the_read_first_head(
     tmp_path: Path, current: None
 ) -> None:
-    """An anchored_differs pair at/above the floor whose only change is a __FILE__/__LINE__ shift is
-    demoted out of the read-first head: still flagged (listed by anchored_differs=true), but
-    in_read_first false and carrying line_number_form. A pair with a real change stays in the head;
-    the count moves from the head (N) to line_number_form (L) while _all is unchanged.
+    """An anchored_differs pair at/above the floor whose text changed only by a __FILE__/__LINE__
+    shift, with the same callee set and the same body size on both sides, is demoted out of the
+    read-first head: still flagged (listed by anchored_differs=true), but in_read_first false,
+    demoted true, and carrying line_number_form and both sizes. A pair with a real change stays in
+    the head; the count moves from the head (N) to line_number_form (L) while _all is unchanged.
 
-    MUTATION: lower the count only, not the read_first order -> the shift pair stays in_read_first
-    true and leads the head -> RED."""
+    MUTATION (each verified RED): lower the count only, not the read_first order -> the shift pair
+    stays in_read_first true and leads the head; read the sizes off body_status (which exists only
+    when a side has no text, so never here) -> the shift pair is never demoted."""
     w = World(tmp_path)
     w.pair("00040000", "00040000", 0.5, 0.9)  # anchored, undetermined, above the floor
     w.fn("a", "00040000", ["log"], pseudocode='log("x.c", 10);', size_bytes=200)
@@ -2757,17 +2759,137 @@ def test_a_line_number_shift_is_demoted_out_of_the_read_first_head(
     sr = _reading(v, shift)
     assert sr["anchored_differs"] is True and sr["in_read_first"] is False
     assert sr["line_number_form"] == {"delta": 7, "sites": 1}
+    assert sr.get("demoted") is True and sr.get("size_bytes") == {"a": 200, "b": 200}
     hr = _reading(v, real)
     assert hr["in_read_first"] is True and "line_number_form" not in hr
+    assert "demoted" not in hr and "size_bytes" not in hr
     s = pv.function_states(w.atlas, DIFF)
     assert s is not None
     assert s["alignment_undetermined_anchored_differs"] == 1  # N: only the real one in the head
     assert s["alignment_undetermined_anchored_differs_line_number_form"] == 1  # L
+    assert s["alignment_undetermined_anchored_differs_line_number_kept"] == 0
     assert s["alignment_undetermined_anchored_differs_all"] == 2  # _all unchanged
     assert set(_view(w, bucket="R", anchored_differs=True)["by_id"]) == {shift, real}
     banner = pv.anchored_differs_banner(s)
     assert banner is not None
     assert "1 more anchored pairs were demoted" in banner and "__FILE__/__LINE__" in banner
+
+
+def _line_shift(
+    w: World,
+    addr: str,
+    *,
+    callees_a: list[str] | None = None,
+    callees_b: list[str] | None = None,
+    size_a: int = 200,
+    size_b: int = 200,
+    truncated_a: int = 0,
+) -> str:
+    """One anchored undetermined pair above the floor whose text differs only by a line-number
+    shift (``log("x.c", 10)`` -> ``log("x.c", 17)``); callees ``["log"]`` and 200 bytes on each
+    side unless given. Returns the entry id."""
+    w.pair(addr, addr, 0.5, 0.9)
+    w.fn(
+        "a",
+        addr,
+        callees_a or ["log"],
+        pseudocode='log("x.c", 10);',
+        size_bytes=size_a,
+        truncated=truncated_a,
+    )
+    w.fn("b", addr, callees_b or ["log"], pseudocode='log("x.c", 17);', size_bytes=size_b)
+    return _pair_id(addr, addr)
+
+
+# why a line-number shift stays in the head: (_line_shift kwargs, what its callee_set carries,
+# its size_bytes a / b). FUN_00099000 has no aligned pair, so it cannot be identified.
+_KEPT: dict[str, tuple[dict[str, Any], dict[str, str], tuple[int | None, int | None]]] = {
+    "callee_differs": ({"callees_b": ["log", "system"]}, {"state": "differs"}, (200, 200)),
+    "callee_identity_unresolved": (
+        {"callees_a": ["log", "FUN_00099000"], "callees_b": ["log", "FUN_00099000"]},
+        {"state": "undetermined", "reason": "callee_identity_unresolved"},
+        (200, 200),
+    ),
+    "callees_truncated": (
+        {"truncated_a": 1},
+        {"state": "undetermined", "reason": "callees_truncated"},
+        (200, 200),
+    ),
+    "size_differs": ({"size_b": 204}, {"state": "equal"}, (200, 204)),
+    "size_unrecorded": ({"size_a": 0, "size_b": 0}, {"state": "equal"}, (None, None)),
+}
+
+
+@pytest.mark.parametrize("why", sorted(_KEPT))
+def test_a_line_number_shift_stays_in_the_head_unless_callees_and_sizes_are_proven_equal(
+    tmp_path: Path, current: None, why: str
+) -> None:
+    """A line-number shift in the text does not show a call added or dropped in a block the
+    decompiler removed. It is demoted only when the two callee sets are proven equal and both body
+    sizes are recorded and equal; a shift whose callee set differs or is undetermined, or whose
+    sizes differ or are unrecorded, stays in the read-first head — demoted false, carrying its
+    line_number_form, callee_set and size_bytes — counted in the head (N) and as kept (K), beside a
+    shift on the same page that is demoted (L).
+
+    MUTATION (each verified RED): drop the size condition -> size_differs, size_unrecorded; test
+    the sizes by equality alone -> size_unrecorded; refuse only a callee set that differs ->
+    callee_identity_unresolved, callees_truncated; ``demoted`` from line_number_form alone -> all;
+    gate the counts but not the order -> all; gate the order but not the counts -> all; leave out
+    size_bytes -> all; count no kept pair -> all; take both sizes from side a -> size_differs."""
+    kw, callee_set, (sa, sb) = _KEPT[why]
+    w = World(tmp_path)
+    demoted = _line_shift(w, "00040000")
+    kept = _line_shift(w, "00041000", **kw)
+    w.commit()
+    v = _view(w)
+    d, k = _reading(v, demoted), _reading(v, kept)
+    assert d["line_number_form"] == k["line_number_form"] == {"delta": 7, "sites": 1}
+    assert (d.get("demoted"), d["in_read_first"]) == (True, False)
+    assert d.get("size_bytes") == {"a": 200, "b": 200}
+    assert (k.get("demoted"), k["in_read_first"]) == (False, True)
+    assert {key: k["callee_set"].get(key) for key in callee_set} == callee_set
+    assert k.get("size_bytes") == {"a": sa, "b": sb}
+    order = [e["entry_id"] for e in _view(w, bucket="R", anchored_differs=True)["entries"]]
+    assert order == [kept, demoted]  # the kept pair leads: it is in the read-first head
+    s = pv.function_states(w.atlas, DIFF)
+    assert s is not None
+    assert s["alignment_undetermined_anchored_differs"] == 1  # N: the kept one
+    assert s["alignment_undetermined_anchored_differs_line_number_kept"] == 1  # K, part of N
+    assert s["alignment_undetermined_anchored_differs_line_number_form"] == 1  # L
+    assert s["alignment_undetermined_anchored_differs_all"] == 2
+    banner = pv.anchored_differs_banner(s)
+    assert banner is not None
+    assert "1 of the head pairs changed only by such a line-number shift" in banner
+
+
+def test_a_line_number_shift_on_a_diff_not_shown_current_stays_in_the_head(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a diff not shown current no callee list is compared (callee_set undetermined,
+    source_stale), so a line-number shift stays in the head though its sizes are equal.
+
+    MUTATION (verified RED): refuse only a callee set that differs -> it is demoted -> RED."""
+    monkeypatch.setattr(
+        pv,
+        "diff_source_staleness",
+        lambda atlas, diff_id: {
+            "source_stale": True,
+            "source_stale_reason": "diff_logic_changed",
+            "toolchain_checked": False,
+        },
+    )
+    w = World(tmp_path)
+    shift = _line_shift(w, "00040000")
+    w.commit()
+    r = _reading(_view(w), shift)
+    assert r["line_number_form"] == {"delta": 7, "sites": 1}
+    assert r["callee_set"] == {"state": "undetermined", "reason": "source_stale"}
+    assert (r.get("demoted"), r["in_read_first"]) == (False, True)
+    assert r.get("size_bytes") == {"a": 200, "b": 200}
+    s = pv.function_states(w.atlas, DIFF)
+    assert s is not None
+    assert s["alignment_undetermined_anchored_differs_line_number_kept"] == 1
+    assert s["alignment_undetermined_anchored_differs_line_number_form"] == 0
 
 
 def test_no_body_is_never_flagged_but_unavailable_with_differing_callees_is(
@@ -3011,6 +3133,7 @@ def _banner_states(**kw: int) -> dict[str, Any]:
         "withheld": False,
         "alignment_undetermined_anchored_differs": kw.get("head", 0),
         "alignment_undetermined_anchored_differs_line_number_form": kw.get("lnf", 0),
+        "alignment_undetermined_anchored_differs_line_number_kept": kw.get("kept", 0),
         "alignment_undetermined_anchored_differs_all": kw.get("flagged", 0),
         "alignment_undetermined_anchored_micro_side": kw.get("micro", 0),
         "alignment_undetermined_reading": {sameness.U_DIFFERS: kw.get("differs", 0)},
@@ -3023,8 +3146,11 @@ def test_the_banner_always_says_the_head_is_not_yet_told_apart() -> None:
     only micro-side pairs still gets a banner (the micro count and its filter, and that R is not
     cleared), with no head sentence; with neither there is none.
 
+    A line-number shift kept in the head for want of proven-equal callee sets and sizes gets its own
+    sentence, only when there is one.
+
     MUTATION: drop the "NOT yet told apart" sentence -> RED; banner only when a pair is flagged
-    anchored_differs -> the micro-only diff has none -> RED."""
+    anchored_differs -> the micro-only diff has none -> RED; drop the kept sentence -> RED."""
     plain = pv.anchored_differs_banner(_banner_states(head=3, flagged=4, differs=9))
     assert plain is not None
     assert "The 3 head pairs are NOT yet told apart" in plain
@@ -3032,7 +3158,13 @@ def test_the_banner_always_says_the_head_is_not_yet_told_apart() -> None:
     demoted = pv.anchored_differs_banner(_banner_states(head=3, lnf=2, flagged=6, differs=9))
     assert demoted is not None
     assert "2 more anchored pairs were demoted" in demoted
+    assert "callee sets and body sizes are equal" in demoted
     assert "The 3 head pairs are NOT yet told apart" in demoted
+    assert "stay in the head" not in demoted  # K == 0: no kept sentence
+    kept = pv.anchored_differs_banner(_banner_states(head=3, lnf=2, kept=1, flagged=6, differs=9))
+    assert kept is not None
+    assert "1 of the head pairs changed only by such a line-number shift" in kept
+    assert "demoted=false" in kept and "The 3 head pairs are NOT yet told apart" in kept
     micro_only = pv.anchored_differs_banner(_banner_states(micro=2, differs=5))
     assert micro_only is not None
     assert "2 anchored pairs have one side a design-skipped micro-stub" in micro_only
@@ -3270,6 +3402,7 @@ def test_function_states_keeps_its_keys_and_adds_the_read_face_counts(
     new_counts = {
         "alignment_undetermined_anchored_differs",
         "alignment_undetermined_anchored_differs_line_number_form",
+        "alignment_undetermined_anchored_differs_line_number_kept",
         "alignment_undetermined_anchored_differs_all",
         "alignment_undetermined_anchored_micro_side",
     }
@@ -3280,6 +3413,9 @@ def test_function_states_keeps_its_keys_and_adds_the_read_face_counts(
     assert all(set(s[k]) == set(pv._UNAVAILABLE_CAUSES) for k in new_by_cause)
     assert s["alignment_undetermined_anchored_differs"] == 1
     assert s["alignment_undetermined_anchored_differs_all"] == 2
+    # the kept line-number shifts sit at or above the floor, inside the head count (N)
+    kept = s["alignment_undetermined_anchored_differs_line_number_kept"]
+    assert 0 <= kept <= s["alignment_undetermined_anchored_differs"]
     # the by-cause buckets PARTITION their unavailable count: each sums to it.
     assert sum(s["unavailable_by_cause"].values()) == s["unverified"]["unavailable"]
     assert (

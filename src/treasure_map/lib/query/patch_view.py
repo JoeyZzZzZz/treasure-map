@@ -767,10 +767,13 @@ class _Entry:
     string_edges: dict[str, Any] | None = None
     rank: dict[str, Any] = field(default_factory=dict)
     # Read-face facts attached once readings are in hand (``_annotate_entries``): each side's body
-    # status (sameness.pair_reading's ``bodies``), and, for an anchored_differs pair at or above the
-    # read-first floor, its ``line_number_form`` (a __FILE__/__LINE__ shift) — which demotes it out
-    # of the read-first head. None until annotated.
+    # status (sameness.pair_reading's ``bodies``, only when a side had no text), both sides' body
+    # sizes (``sizes``, only when both bodies were read), and, for an anchored_differs pair at or
+    # above the read-first floor, its ``line_number_form`` (a __FILE__/__LINE__ shift) — which
+    # demotes it out of the read-first head only when its callee sets and sizes are also proven
+    # equal (:func:`_demotable_line_number`). None until annotated.
     body_status: dict[str, Any] | None = None
+    sizes: tuple[int | None, int | None] | None = None
     line_number_form: dict[str, Any] | None = None
 
     @property
@@ -1418,16 +1421,40 @@ def _anchored_micro_side(e: _Entry) -> bool:
     )
 
 
+def _demotable_line_number(e: _Entry) -> bool:
+    """Whether a pair's ``line_number_form`` demotes it out of the read-first head: its text changed
+    only by a __FILE__/__LINE__ shift, AND its two callee SETS are proven equal (the proposed
+    reading's ``callee_set`` state ``equal``, which is read from complete lists), AND both sides'
+    body sizes are recorded and equal.
+
+    The text alone cannot see a call added or dropped in a block the decompiler removed as dead;
+    the callee set can. The set holds callees, not how often each is called, so a second call to a
+    function already called is not in it — equal sizes narrow that (a dead block takes bytes), they
+    do not rule it out. Whatever is not proven keeps the pair in the head, where its reading's
+    ``demoted`` false, ``callee_set`` and ``size_bytes`` say which. The one predicate behind the
+    read-first order, ``demoted`` and the function_states counts."""
+    if e.line_number_form is None:
+        return False
+    if (e.proposed_callee_set or {}).get("state") != "equal":  # differs and undetermined stay
+        return False
+    if e.sizes is None:
+        return False
+    sa, sb = e.sizes
+    return sa is not None and sb is not None and sa == sb
+
+
 def _read_first_order(e: _Entry, u_state: str | None) -> int:
     """How far an undetermined pair floats inside attention 1: 2 = anchored_differs at or above
     ``ANCHORED_DIFFERS_SIM_FLOOR`` (the read-first head); 1 = anchored_differs below the floor, an
-    anchored_differs pair whose only change is a ``line_number_form`` shift (demoted OUT of the head
-    but still flagged), or an anchored micro-side pair; 0 = every other entry."""
+    anchored_differs pair whose only change is a ``line_number_form`` shift with its callee sets and
+    sizes proven equal (:func:`_demotable_line_number`; demoted OUT of the head but still flagged),
+    or an anchored micro-side pair; 0 = every other entry. A line-number shift without that proof
+    stays at 2."""
     p = e.pair
     if p is None:
         return 0
     if _anchored_differs(e, u_state):
-        if e.line_number_form is not None:
+        if _demotable_line_number(e):
             return 1  # a __FILE__/__LINE__ shift: demoted out of the read-first head, still flagged
         return 2 if p.similarity is not None and p.similarity >= ANCHORED_DIFFERS_SIM_FLOOR else 1
     if _anchored_micro_side(e):
@@ -1796,6 +1823,10 @@ class _Read:
     # Each side's body status + size when there was no text to compare (sameness.pair_reading's
     # ``bodies``), else None: {a: {status, size_bytes}, b: {...}}. A read-face detail, not a state.
     bodies: dict[str, Any] | None = None
+    # (size_bytes_a, size_bytes_b) when both sides' bodies were read — each None when not recorded
+    # (sameness.read_function_bodies) — else None. Apart from ``bodies``, which exists only when a
+    # side had no text: a line-number shift has text on both sides.
+    sizes: tuple[int | None, int | None] | None = None
 
 
 _UNREAD = _Read(None, sameness.UNAVAILABLE)
@@ -1859,7 +1890,13 @@ def _read_pair(
             similarity=p.similarity,
             instructions=p.instructions,
         )
-    return _Read(matches, reason, reasons, hidden, bodies=bodies)
+    sizes = None
+    if ba is not None and bb is not None:
+        sizes = (
+            (ba.get(p.addr_a) or {}).get("size_bytes"),
+            (bb.get(p.addr_b) or {}).get("size_bytes"),
+        )
+    return _Read(matches, reason, reasons, hidden, bodies=bodies, sizes=sizes)
 
 
 def _skeleton_index(bodies: sameness.Bodies) -> dict[str, list[str]]:
@@ -2024,11 +2061,13 @@ def _cause_of(bodies: dict[str, Any] | None) -> str:
 def _annotate_entries(built: BuiltDiff, readings: _Readings) -> None:
     """Attach, once readings are in hand, the read-face facts that significance / _read_first_order
     read straight off the entry: each pair's per-side ``body_status`` (sameness.pair_reading's
-    ``bodies``, consumed by the micro predicates and unavailable_by_cause), the
-    ``one_side_skipped_micro`` fact on an aligned micro pair, and, on an anchored_differs pair at or
-    above the read-first floor, its ``line_number_form`` (computed once through the delta cache),
-    which demotes it out of the read-first head. Entries are rebuilt each call, so this re-annotates
-    cleanly; call it before significance, _sort, _read_first_order or the function_states counts."""
+    ``bodies``, consumed by the micro predicates and unavailable_by_cause), both sides' body
+    ``sizes``, the ``one_side_skipped_micro`` fact on an aligned micro pair, and, on an
+    anchored_differs pair at or above the read-first floor, its ``line_number_form`` (computed once
+    through the delta cache), which demotes it out of the read-first head when its callee sets and
+    sizes are proven equal too (:func:`_demotable_line_number`). Entries are rebuilt each call, so
+    this re-annotates cleanly; call it before significance, _sort, _read_first_order or the
+    function_states counts."""
     anchored: list[_Pair] = []
     for e in built.placed:
         p = e.pair
@@ -2039,6 +2078,7 @@ def _annotate_entries(built: BuiltDiff, readings: _Readings) -> None:
         if read is None:
             continue
         e.body_status = read.bodies
+        e.sizes = read.sizes
         if p.aligned:
             if _micro_side(read.bodies) and "one_side_skipped_micro" not in e.facts:
                 e.facts.append("one_side_skipped_micro")
@@ -2187,10 +2227,13 @@ def _proposed_json(
     entry and never as its pseudocode_sameness. ``occurrences`` and the two ``*_elsewhere_*`` are
     null unless both bodies were read. A pair flagged :func:`_anchored_differs` also carries
     ``anchored_differs: true``, its ``anchor`` and ``in_read_first`` (at or above the floor),
-    whatever the sort; one whose only change is a ``line_number_form`` shift carries that shape and
-    ``in_read_first: false`` (demoted out of the head, still flagged). A micro-side R pair is NOT
-    anchored_differs, so it carries no such block here. A pair with no text on a side carries
-    ``bodies`` (:func:`_page_bodies`): which side is the micro-stub, its size and its listing."""
+    whatever the sort; one whose text changed only by a line-number shift carries that shape
+    (``line_number_form``), ``demoted`` and both sides' ``size_bytes``: demoted (``in_read_first:
+    false``, still flagged) when its callee sets and sizes are proven equal, else kept in the head
+    with ``demoted: false``, its ``callee_set`` and ``size_bytes`` showing which was not. A
+    micro-side R pair is NOT anchored_differs, so it carries no such block here. A pair with no text
+    on a side carries ``bodies`` (:func:`_page_bodies`): which side is the micro-stub, its size and
+    its listing."""
     p = e.pair
     assert p is not None
     out: dict[str, Any] = {"pairing": "undetermined", "state": state}
@@ -2198,9 +2241,14 @@ def _proposed_json(
         order = _read_first_order(e, state)
         out.update({"anchored_differs": True, "anchor": _anchor(p), "in_read_first": order == 2})
         if e.line_number_form is not None:
-            # demoted out of the read-first head (in_read_first is False): the only change is a
-            # __FILE__/__LINE__ shift. Still flagged — anchored_differs=true pages it.
+            # The text changed only by a __FILE__/__LINE__ shift. Demoted out of the read-first
+            # head (in_read_first false) only when the callee sets and both sizes are proven equal
+            # too; either way still flagged — anchored_differs=true pages it. line_number_form is
+            # set only at or above the floor, so demoted == (not in_read_first).
             out["line_number_form"] = e.line_number_form
+            out["demoted"] = _demotable_line_number(e)
+            sa, sb = e.sizes if e.sizes is not None else (None, None)
+            out["size_bytes"] = {"a": sa, "b": sb}
     if state == sameness.U_IDENTICAL_TEXT_UNVERIFIED:
         out["text_unverified_reasons"] = list(read.text_reasons)
     out.update(
@@ -2307,9 +2355,14 @@ _SIGNIFICANCE_LENS = (
     "ordered together — except that an undetermined pair flagged anchored_differs (no export gap, "
     "the same address or the same real symbol name on both sides, proposed reading differs) comes "
     f"first inside attention 1: those at or above similarity {ANCHORED_DIFFERS_SIM_FLOOR} first, "
-    "then those below it, basis anchored_differs — except that a flagged pair whose only change is "
-    "a __FILE__/__LINE__ line-number shift is demoted out of that read-first head (still flagged, "
-    "anchored_differs=true pages it). The flag clears nothing else in R: every other undetermined "
+    "then those below it, basis anchored_differs — except that a flagged pair whose text changed "
+    "only by a __FILE__/__LINE__ line-number shift AND whose callee sets and body sizes are both "
+    "proven equal is demoted out of that read-first head (demoted true; still flagged, "
+    "anchored_differs=true pages it). A line-number shift without that proof stays in the head "
+    "with demoted false: a call added or dropped in a block the decompiler removed is not in the "
+    "text, and its callee_set and size_bytes show which was not proven equal. Equal callee sets "
+    "and sizes narrow that, they do not rule it out: the set holds callees, not how often each is "
+    "called. The flag clears nothing else in R: every other undetermined "
     "pair reading differs is still to be read. An undetermined pair anchored with one side a "
     "design-skipped micro-stub (under the decompile size floor, not decompiled by design — a "
     "binary property, NOT a read failure) and the other a real body gets basis anchored_micro_side "
@@ -2363,10 +2416,14 @@ def function_states(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] |
     are counted beside them, and ``alignment_undetermined_reading`` splits them by their proposed
     reading (never into the aligned counts); of those reading differs,
     ``alignment_undetermined_anchored_differs`` counts the pairs flagged anchored_differs at or
-    above the read-first floor whose change is NOT just a line-number shift (the read-first head),
+    above the read-first floor that are not demoted (the read-first head),
     ``alignment_undetermined_anchored_differs_line_number_form`` the ones at or above the floor
-    demoted because their only change is a __FILE__/__LINE__ shift (still flagged), and
-    ``alignment_undetermined_anchored_differs_all`` every flagged pair, below the floor included.
+    demoted because their text changed only by a __FILE__/__LINE__ shift and their callee sets and
+    body sizes are proven equal (still flagged),
+    ``alignment_undetermined_anchored_differs_line_number_kept`` the head pairs whose text changed
+    only by such a shift but whose callee sets or sizes are not proven equal (part of the head
+    count), and ``alignment_undetermined_anchored_differs_all`` every flagged pair, below the floor
+    included.
     ``alignment_undetermined_anchored_micro_side`` counts undetermined pairs anchored with one side
     a micro-stub and the other a real body; ``alignment_undetermined_unavailable_by_cause`` splits
     the proposed-unavailable pairs the same way, summing to their reading count. Functions with no
@@ -2391,7 +2448,7 @@ def function_states(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] |
     by_body = {cls: 0 for cls in sameness.BODY_CLASSES}
     proposed = {state: 0 for state in sameness.U_STATES}
     scoped = 0
-    anchored = anchored_all = line_number_form = micro = 0
+    anchored = anchored_all = line_number_form = line_number_kept = micro = 0
     unavail_cause = {k: 0 for k in _UNAVAILABLE_CAUSES}  # aligned pairs reading unavailable
     u_unavail_cause = {k: 0 for k in _UNAVAILABLE_CAUSES}  # undetermined pairs proposed unavailable
     for e in built.placed:
@@ -2409,10 +2466,14 @@ def function_states(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] |
                     and p.similarity is not None
                     and p.similarity >= ANCHORED_DIFFERS_SIM_FLOOR
                 )
-                if at_floor and e.line_number_form is not None:
+                if at_floor and _demotable_line_number(e):
                     line_number_form += 1  # flagged, demoted out of the read-first head (L)
                 elif at_floor:
                     anchored += 1  # the read-first head (N, == read_first order 2)
+                    if e.line_number_form is not None:
+                        # a line-number shift whose callee sets or sizes are not proven equal:
+                        # kept in the head (K, part of N)
+                        line_number_kept += 1
             # a separate count, NOT mutually exclusive with anchored_differs: a pair that is both
             # is listed by the anchored_micro_side filter, so it is counted here too (basis micro).
             if _anchored_micro_side(e):
@@ -2453,6 +2514,7 @@ def function_states(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] |
         "alignment_undetermined_reading": proposed,
         "alignment_undetermined_anchored_differs": anchored,
         "alignment_undetermined_anchored_differs_line_number_form": line_number_form,
+        "alignment_undetermined_anchored_differs_line_number_kept": line_number_kept,
         "alignment_undetermined_anchored_differs_all": anchored_all,
         "alignment_undetermined_anchored_micro_side": micro,
         "alignment_undetermined_unavailable_by_cause": u_unavail_cause,
@@ -2463,9 +2525,10 @@ def function_states(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] |
 def anchored_differs_banner(states: dict[str, Any] | None) -> str | None:
     """The read-first banner of one diff's :func:`function_states`, or None when no undetermined
     pair is flagged anchored_differs or anchored_micro_side (or the diff is withheld, which has no
-    counts). It names the read-first head (AFTER line-number shifts are demoted out of it), the
-    pairs so demoted, the anchored micro-side pairs, and — ALWAYS — that the flagged pairs do not
-    stand for the rest of R, and, whenever any pair is flagged anchored_differs, that the head
+    counts). It names the read-first head (AFTER line-number shifts with proven-equal callee sets
+    and sizes are demoted out of it), the pairs so demoted, the line-number shifts kept in the head
+    for want of that proof, the anchored micro-side pairs, and — ALWAYS — that the flagged pairs do
+    not stand for the rest of R, and, whenever any pair is flagged anchored_differs, that the head
     pairs are not yet told apart (a demotion or none)."""
     if not states or states.get("withheld"):
         return None
@@ -2475,6 +2538,7 @@ def anchored_differs_banner(states: dict[str, Any] | None) -> str | None:
         return None
     first = int(states.get("alignment_undetermined_anchored_differs") or 0)
     lnf = int(states.get("alignment_undetermined_anchored_differs_line_number_form") or 0)
+    kept = int(states.get("alignment_undetermined_anchored_differs_line_number_kept") or 0)
     differs = int((states.get("alignment_undetermined_reading") or {}).get(sameness.U_DIFFERS, 0))
     parts: list[str] = []
     if flagged > 0:
@@ -2486,9 +2550,15 @@ def anchored_differs_banner(states: dict[str, Any] | None) -> str | None:
         )
         if lnf:
             parts.append(
-                f"{lnf} more anchored pairs were demoted out of the head because their only change "
-                "is a __FILE__/__LINE__ line-number shift — still flagged (anchored_differs=true "
-                "pages them)."
+                f"{lnf} more anchored pairs were demoted out of the head because their text "
+                "changed only by a __FILE__/__LINE__ line-number shift and both sides' callee sets "
+                "and body sizes are equal — still flagged (anchored_differs=true pages them)."
+            )
+        if kept:
+            parts.append(
+                f"{kept} of the head pairs changed only by such a line-number shift in the text, "
+                "but stay in the head: their callee sets or body sizes are not proven equal "
+                "(demoted=false; read their callee_set and size_bytes)."
             )
         parts.append(
             f"The {first} head pairs are NOT yet told apart: each still holds build info, a "

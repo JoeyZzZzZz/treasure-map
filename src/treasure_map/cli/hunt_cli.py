@@ -138,8 +138,9 @@ def _function_line(states: dict[str, Any] | None) -> str:
         f"{states['no_body']} no body; {states['alignment_undetermined']} alignment undetermined"
     )
     # An undetermined pair's proposed reading (never counted into the aligned states above): how
-    # many reading differs are anchored at or above the read-first floor (line-number shifts already
-    # demoted out of it), and how many are anchored with one side a micro-stub.
+    # many reading differs are anchored at or above the read-first floor (line-number shifts with
+    # proven-equal callee sets and sizes already demoted out of it), and how many are anchored with
+    # one side a micro-stub.
     proposed = states.get("alignment_undetermined_reading") or {}
     read = ", ".join(f"{n} {state}" for state, n in proposed.items() if n)
     anchored = states.get("alignment_undetermined_anchored_differs")

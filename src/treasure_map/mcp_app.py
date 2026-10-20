@@ -1781,12 +1781,17 @@ def make_tools(
         flagged pairs, read-first ones first, then by similarity, highest first (``sort_by``
         orders them instead); with ``sort_by='significance'`` they lead attention 1 (basis
         ``anchored_differs``). A fact, not a verdict, and it clears nothing else in R: the other
-        pairs reading differs still need reading. A flagged pair whose ONLY change is a
-        ``__FILE__``/``__LINE__`` line-number shift stays flagged but is demoted out of the
-        read-first head (``in_read_first`` false, ``line_number_form`` {delta, sites} in its
-        reading). Separately, ``anchored_micro_side=true`` (same scope) lists the undetermined pairs
-        anchored with exactly one side a design-skipped micro-stub (under ~10 bytes, not decompiled
-        BY DESIGN — a binary property, not a read failure) and the other a real body; basis
+        pairs reading differs still need reading. A flagged pair whose text changed ONLY by a
+        ``__FILE__``/``__LINE__`` line-number shift, with both sides' callee sets and body sizes
+        proven equal, stays flagged but is demoted out of the read-first head (``in_read_first``
+        false, ``demoted`` true, ``line_number_form`` {delta, sites} in its reading). Without that
+        proof it stays in the head with ``demoted`` false, and its ``callee_set`` and
+        ``size_bytes`` {a, b} show which was not proven equal — a call added or dropped in a block
+        the decompiler removed is not in the text. Equal callee sets and sizes narrow that, they do
+        not rule it out (the set holds callees, not how often each is called). Separately,
+        ``anchored_micro_side=true`` (same scope) lists the undetermined pairs anchored with
+        exactly one side a design-skipped micro-stub (under ~10 bytes, not decompiled BY DESIGN —
+        a binary property, not a read failure) and the other a real body; basis
         ``anchored_micro_side`` under the significance lens, ``one_side_skipped_micro`` for the
         aligned pairs of that shape. A pair with no text on a side carries ``bodies`` (in the
         entry for an aligned pair, in ``proposed_pair_reading`` for an undetermined one): per side
@@ -2089,9 +2094,12 @@ def make_tools(
         ``alignment_undetermined`` (``alignment_undetermined_reading`` splits it by each pair's
         proposed reading, never into the aligned counts;
         ``alignment_undetermined_anchored_differs`` = the pairs flagged anchored_differs at or above
-        the read-first floor whose change is NOT just a line-number shift (the read-first head),
-        ``alignment_undetermined_anchored_differs_line_number_form`` = those at/above the floor
-        demoted for a __FILE__/__LINE__ shift, ``alignment_undetermined_anchored_differs_all`` =
+        the read-first floor that are not demoted (the read-first head) — line-number shifts whose
+        callee sets or sizes are not proven equal included,
+        ``alignment_undetermined_anchored_differs_line_number_kept`` = how many of the head pairs
+        are such shifts, ``alignment_undetermined_anchored_differs_line_number_form`` = those
+        at/above the floor demoted for a __FILE__/__LINE__ shift with their callee sets and body
+        sizes proven equal, ``alignment_undetermined_anchored_differs_all`` =
         every flagged pair below the floor included, ``alignment_undetermined_anchored_micro_side``
         = anchored pairs with one side a micro-stub, ``alignment_undetermined_unavailable_by_cause``
         = the proposed-unavailable pairs split by cause), and ``one_sided`` by presence_state
