@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import zlib
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal
@@ -1522,6 +1523,34 @@ def _byte_reader(
     return read
 
 
+def listing_items(blob: Any) -> list[dict[str, Any]] | None:
+    """A stored function_listing blob (zlib of a JSON list of ``{a, n, k, m, o}`` units) as
+    instruction items without their bytes: ``address``, ``length``, ``kind``, and for a code unit
+    ``mnemonic`` and ``operands``. None when there is no blob or it does not decode to a list of
+    units. get_disassembly adds each item's bytes; the diff view inlines a micro-stub's items as
+    they are — one decoding for both."""
+    if blob is None:
+        return None
+    try:
+        units = json.loads(zlib.decompress(bytes(blob)).decode("utf-8"))
+        if not isinstance(units, list) or not all(isinstance(u, dict) for u in units):
+            return None
+        items: list[dict[str, Any]] = []
+        for u in units:
+            item: dict[str, Any] = {
+                "address": u.get("a"),
+                "length": int(u.get("n") or 0),
+                "kind": u.get("k"),
+            }
+            if u.get("k") == "code":
+                item["mnemonic"] = u.get("m")
+                item["operands"] = u.get("o")
+            items.append(item)
+    except (zlib.error, ValueError, TypeError):
+        return None
+    return items
+
+
 def get_disassembly(
     conn: sqlite3.Connection,
     *,
@@ -1615,37 +1644,26 @@ def get_disassembly(
             ),
             "anchor": anchor,
         }
-    import zlib
-
-    try:
-        units = json.loads(zlib.decompress(bytes(lrow["listing"])).decode("utf-8"))
-    except (zlib.error, ValueError, TypeError):
+    insns = listing_items(lrow["listing"])
+    if insns is None:
         return {
             "found": True,
             "available": False,
-            "reason": "the stored listing could not be decompressed; re-scan to rebuild it",
+            "reason": "the stored listing could not be decoded; re-scan to rebuild it",
             "anchor": anchor,
         }
     read = _byte_reader(conn, row["binary_id"])
-    insns: list[dict[str, Any]] = []
-    for u in units:
-        a = u.get("a")
-        n = int(u.get("n") or 0)
-        addr_int = _hex_addr_int(a)
+    for item in insns:
+        addr_int = _hex_addr_int(item["address"])
         bytes_hex: str | None
         why: str | None
         if addr_int is None:
             bytes_hex, why = None, "bytes_unavailable: bad address"
         else:
-            bytes_hex, why = read(addr_int, n)
-        item: dict[str, Any] = {"address": a, "length": n, "kind": u.get("k")}
-        if u.get("k") == "code":
-            item["mnemonic"] = u.get("m")
-            item["operands"] = u.get("o")
+            bytes_hex, why = read(addr_int, item["length"])
         item["bytes"] = bytes_hex
         if why is not None:
             item["bytes_unavailable"] = why.split(": ", 1)[1]
-        insns.append(item)
     page, paging = _byte_page(insns, offset, max_chars)
     return {
         "found": True,

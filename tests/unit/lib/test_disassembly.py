@@ -10,16 +10,33 @@ import zlib
 from pathlib import Path
 
 from treasure_map.lib import facts
+from treasure_map.lib.diff.layer0 import norm_hex
+from treasure_map.lib.query import sameness
 from treasure_map.lib.storage.connection import open_db
+
+_UNITS = [
+    {"a": "0x1000", "n": 4, "k": "code", "m": "mov", "o": "r0, r1"},
+    {"a": "0x1004", "n": 4, "k": "code", "m": "bl", "o": "printf"},
+    {"a": "0x1008", "n": 4, "k": "data"},  # outside the 8-byte block -> bytes null
+]
 
 
 def _listing(units: list[dict]) -> bytes:
     return zlib.compress(json.dumps(units).encode())
 
 
-def _db(tmp_path: Path, *, with_listing: bool = True, block_bytes: bytes = bytes(range(8))) -> Path:
+def _db(
+    tmp_path: Path,
+    *,
+    with_listing: bool = True,
+    block_bytes: bytes = bytes(range(8)),
+    pseudocode: str | None = "void h(){}",
+    units: list[dict] | None = None,
+) -> Path:
     """``block_bytes`` is what the one 8-byte code block stores: fewer than 8 is a capped capture
-    (``truncated=1``), the shape a block past the extractor's byte cap is stored in."""
+    (``truncated=1``), the shape a block past the extractor's byte cap is stored in. ``pseudocode``
+    None is a function with no text (a micro-stub's shape); ``units`` replaces the stored
+    listing."""
     db = tmp_path / "analysis.db"
     conn = open_db(db)
     conn.execute(
@@ -29,7 +46,8 @@ def _db(tmp_path: Path, *, with_listing: bool = True, block_bytes: bytes = bytes
     )
     conn.execute(
         "INSERT INTO functions (id, binary_id, name, address, pseudocode, callees) "
-        "VALUES (1, 1, 'handle', '0x1000', 'void h(){}', '[]')"
+        "VALUES (1, 1, 'handle', '0x1000', ?, '[]')",
+        (pseudocode,),
     )
     # one code block covering 0x1000.. with recognisable bytes
     conn.execute(
@@ -38,15 +56,10 @@ def _db(tmp_path: Path, *, with_listing: bool = True, block_bytes: bytes = bytes
         (block_bytes, 1 if len(block_bytes) < 8 else 0),
     )
     if with_listing:
-        units = [
-            {"a": "0x1000", "n": 4, "k": "code", "m": "mov", "o": "r0, r1"},
-            {"a": "0x1004", "n": 4, "k": "code", "m": "bl", "o": "printf"},
-            {"a": "0x1008", "n": 4, "k": "data"},  # outside the 8-byte block -> bytes null
-        ]
         conn.execute(
             "INSERT INTO function_listing (function_id, listing, unit_count, insn_count, truncated)"
             " VALUES (1, ?, 3, 2, 0)",
-            (_listing(units),),
+            (_listing(_UNITS if units is None else units),),
         )
         conn.execute(
             "INSERT INTO detector_scan_status (binary_id, detector, scanned, found_count) "
@@ -68,6 +81,29 @@ def test_get_disassembly_returns_units_with_bytes_from_the_blocks(tmp_path: Path
     # the third unit is outside the stored block: bytes null with a reason, never zeroed
     assert insns[2]["kind"] == "data" and insns[2]["bytes"] is None
     assert "no block covers" in insns[2]["bytes_unavailable"]
+
+
+def test_the_diff_view_inlines_the_items_get_disassembly_returns(tmp_path: Path) -> None:
+    """The diff view's inline listing of a micro-stub (sameness.read_micro_listings) and
+    get_disassembly decode a stored listing in one place (facts.listing_items): the items agree
+    field for field, bytes aside — a unit stored without a length included, which reads 0 in both.
+
+    MUTATION (verified RED): give read_micro_listings its own decoder that passes the stored length
+    through (the pre-fix sameness._listing_units) -> the length-less unit reads None there and 0 in
+    get_disassembly -> RED."""
+    db = _db(tmp_path, pseudocode=None, units=[*_UNITS, {"a": "0x100c", "k": "data"}])
+    conn = facts.open_analysis_ro(db)
+    try:
+        full = facts.get_disassembly(conn, func="handle")
+    finally:
+        conn.close()
+    bare = [
+        {k: v for k, v in i.items() if k not in ("bytes", "bytes_unavailable")}
+        for i in full["instructions"]
+    ]
+    assert len(bare) == 4 and bare[3]["length"] == 0
+    inline = sameness.read_micro_listings(str(db), "a" * 64, {norm_hex("0x1000")})
+    assert inline[norm_hex("0x1000")]["listing"] == bare
 
 
 def test_a_binary_without_listing_support_is_unavailable_with_a_reason(tmp_path: Path) -> None:

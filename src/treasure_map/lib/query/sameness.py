@@ -57,11 +57,11 @@ import hashlib
 import json
 import re
 import sqlite3
-import zlib
 from difflib import SequenceMatcher
 from typing import Any
 
 from treasure_map.lib.diff.layer0 import _decompile_status, norm_hex
+from treasure_map.lib.facts import listing_items
 from treasure_map.lib.ro_db import ro_connect
 
 # ── the six states of an aligned pair ────────────────────────────────────────────────────────
@@ -904,35 +904,12 @@ LISTING_NOT_EXPORTED = "not_exported_by_this_scan"
 LISTING_NOT_STORED = "not_stored"
 
 
-def _listing_units(blob: Any) -> list[dict[str, Any]] | None:
-    """A stored function_listing blob as get_disassembly's instruction items, bytes left out (they
-    live in data_blocks); None when there is none or it cannot be decoded."""
-    if blob is None:
-        return None
-    try:
-        units = json.loads(zlib.decompress(bytes(blob)).decode("utf-8"))
-    except (zlib.error, ValueError, TypeError):
-        return None
-    if not isinstance(units, list):
-        return None
-    out: list[dict[str, Any]] = []
-    for u in units:
-        if not isinstance(u, dict):
-            continue
-        item: dict[str, Any] = {"address": u.get("a"), "length": u.get("n"), "kind": u.get("k")}
-        if u.get("k") == "code":
-            item["mnemonic"] = u.get("m")
-            item["operands"] = u.get("o")
-        out.append(item)
-    return out
-
-
 def read_micro_listings(
     analysis_db_path: str | None, sha: str | None, addrs: set[str]
 ) -> dict[str, dict[str, Any]]:
     """entry (normalised hex) -> the stored disassembly of each of ``addrs`` in one diffed binary,
-    read-only: ``{"listing": [...]}`` (get_disassembly's instruction items without the bytes), else
-    ``{"listing": None, "listing_note": ...}`` (:data:`LISTING_NOT_EXPORTED` /
+    read-only: ``{"listing": [...]}`` (facts.listing_items: get_disassembly's items without the
+    bytes), else ``{"listing": None, "listing_note": ...}`` (:data:`LISTING_NOT_EXPORTED` /
     :data:`LISTING_NOT_STORED`). Meant for the design-skipped micro-stub sides of one rendered page:
     a body under the decompile size floor is a handful of units, so it is shown whole. Every one of
     ``addrs`` gets an answer; a db that cannot be read reads as not stored."""
@@ -978,7 +955,7 @@ def read_micro_listings(
                 conn.close()
     out: dict[str, dict[str, Any]] = {}
     for addr in addrs:
-        units = _listing_units(blobs.get(addr))
+        units = listing_items(blobs.get(addr))
         if units is not None:
             out[addr] = {"listing": units}
         else:

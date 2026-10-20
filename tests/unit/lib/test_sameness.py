@@ -637,13 +637,17 @@ def test_line_number_form_needs_one_consistent_nonzero_step() -> None:
 
 def test_a_source_path_is_the_whole_string_not_its_suffix() -> None:
     """The string before the shifted number reads as a source path only when the WHOLE string is a
-    path-like token ending in .c / .cc / .cpp / .h — a message or a format that merely ends in one
-    is not a path, so the pair stays in the read-first head.
+    path-like token ending in .c / .cc / .cpp / .h — a message or a format that merely ends in one,
+    or begins with one, is not a path, so the pair stays in the read-first head.
 
-    MUTATION: test the suffix alone (``endswith``) -> the message and the format are demoted -> RED.
+    MUTATION: test the suffix alone (``endswith``) -> the message and the format are demoted -> RED;
+    anchor only the start (``match`` for ``fullmatch``) -> "util.c: bad" and "net.cfg" (whose
+    start reads as "net.c") are demoted -> RED.
     """
     assert _lnf('err(1, "cannot open config.c", 5);', 'err(1, "cannot open config.c", 6);') is None
     assert _lnf('cfg_set(b, "%s/%s.h", 0x20);', 'cfg_set(b, "%s/%s.h", 0x40);') is None
+    assert _lnf('err(1, "util.c: bad", 5);', 'err(1, "util.c: bad", 6);') is None
+    assert _lnf('load("net.cfg", 5);', 'load("net.cfg", 6);') is None
     assert _lnf('log("src/net/sock-io.c", 10);', 'log("src/net/sock-io.c", 11);') == {
         "delta": 1,
         "sites": 1,

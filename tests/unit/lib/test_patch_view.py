@@ -2976,6 +2976,35 @@ def test_an_aligned_micro_pair_shows_its_bodies_on_the_entry(tmp_path: Path, cur
     assert "bodies" not in v["by_id"][_pair_id("00040000", "00041000")]
 
 
+def test_only_a_micro_stub_side_gets_its_listing_inline(tmp_path: Path, current: None) -> None:
+    """A side with no text that is NOT a micro-stub — a body at or above the decompile size floor
+    that decompiled empty — carries its status and size, but no listing: only a stub is small enough
+    to be shown whole. A micro pair on the same page still gets its listing, so the read itself
+    works here.
+
+    MUTATION (verified RED): read the listing of every side with no text (``!= "ok"`` for
+    ``== SKIPPED_MICRO``) -> the decompile_empty side carries its stored listing -> RED."""
+    w = World(tmp_path)
+    w.pair("00030000", "00031000", 0.97, 0.9)  # aligned; the b side is a micro-stub
+    w.fn("a", "00030000", ["foo"], pseudocode="y = f();", size_bytes=200)
+    w.fn("b", "00031000", ["foo"], pseudocode=None, size_bytes=8)
+    w.pair("00050000", "00051000", 0.97, 0.9)  # aligned; the b side is a big empty decompile
+    w.fn("a", "00050000", ["foo"], pseudocode="y = h();", size_bytes=200)
+    w.fn("b", "00051000", ["foo"], pseudocode=None, size_bytes=200)
+    _listing_pass(w, "b")
+    _listing(w, "b", "00031000", [{**u, "a": "0003100" + u["a"][-1]} for u in _STUB_UNITS])
+    _listing(w, "b", "00051000", [{**u, "a": "0005100" + u["a"][-1]} for u in _STUB_UNITS])
+    w.commit()
+    v = _view(w)
+    micro, empty = _pair_id("00030000", "00031000"), _pair_id("00050000", "00051000")
+    assert micro in v["by_id"] and empty in v["by_id"]
+    assert [u["mnemonic"] for u in v["by_id"][micro]["bodies"]["b"]["listing"]] == ["jr", "_clear"]
+    assert v["by_id"][empty]["bodies"]["b"] == {
+        "status": sameness.DECOMPILE_EMPTY,
+        "size_bytes": 200,
+    }
+
+
 def _banner_states(**kw: int) -> dict[str, Any]:
     """A function_states block carrying only the counts the read-first banner reads."""
     return {
