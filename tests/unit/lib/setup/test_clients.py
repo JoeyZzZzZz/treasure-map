@@ -536,6 +536,138 @@ def test_a_symlinked_config_left_empty_stays_a_link(tmp_path: Path, tmap: Path) 
     assert link.is_symlink() and json.loads(real.read_text()) == {"mcpServers": {}}
 
 
+@pytest.mark.parametrize("edit", ["server", "key"])
+def test_a_config_tmap_created_is_kept_once_the_user_adds_to_it(
+    tmp_path: Path, tmap: Path, edit: str
+) -> None:
+    """A config tmap created (none was there, so there is no backup) that the user has since added
+    to — a server of their own, or a key beside ``mcpServers`` — holds the user's content once
+    tmap's entry is out: it is kept with that content, never removed as tmap's.
+
+    MUTATION (each verified RED): drop ``rest == {"mcpServers": {}}`` from the removal -> the file
+    is removed -> RED (both); test only that ``mcpServers`` is empty -> the added key goes with the
+    file -> RED (key); test only that nothing but ``mcpServers`` is there -> the added server goes
+    -> RED (server)."""
+    home = tmp_path / "h"
+    cfg = home / ".cursor" / "mcp.json"
+    assert cl.register("cursor", _host(home), tmap).ok
+    assert not cfg.with_name("mcp.json.tmap.backup").exists()
+    data = json.loads(cfg.read_text())
+    if edit == "server":
+        data["mcpServers"]["mine"] = {"command": "mine"}
+    else:
+        data["theme"] = "dark"
+    cfg.write_text(json.dumps(data))
+    outs = cl.unregister("cursor", _host(home), tmap)
+    assert all(o.ok for o in outs), outs
+    del data["mcpServers"]["treasure-map"]
+    assert cfg.is_file() and json.loads(cfg.read_text()) == data
+
+
+@pytest.mark.parametrize("raw", [b"{ }\n", b'{"mcpServers": {}}'], ids=["empty", "empty-servers"])
+def test_the_user_s_own_file_that_held_nothing_is_put_back_not_removed(
+    tmp_path: Path, tmap: Path, raw: bytes
+) -> None:
+    """A config the user already had that holds nothing (``{}``, or an empty ``mcpServers``) is
+    still theirs: once tmap's entry is out its exact bytes are put back and it stays, though it
+    holds what a file tmap created would.
+
+    MUTATION (each verified RED): drop ``not original`` from the removal -> the file just put back
+    is removed -> RED; leave the put-back file unmarked as the user's (no ``original = True`` in
+    that branch) -> RED."""
+    home = tmp_path / "h"
+    cfg = home / ".cursor" / "mcp.json"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_bytes(raw)
+    assert cl.register("cursor", _host(home), tmap).ok
+    outs = cl.unregister("cursor", _host(home), tmap)
+    assert all(o.ok for o in outs), outs
+    assert cfg.is_file()
+    assert cfg.read_bytes() == raw
+    assert not cfg.with_name("mcp.json.tmap.backup").exists()
+
+
+def test_the_user_s_own_file_emptied_since_stays_with_its_backup(
+    tmp_path: Path, tmap: Path
+) -> None:
+    """A config the user had, and has since taken their own content out of, is still the user's
+    file: the backup no longer stands for it, so the backup is kept (and said so) and the file
+    stays, though it now holds only an empty ``mcpServers``.
+
+    MUTATION (each verified RED): drop ``not original`` from the removal -> the user's file is
+    removed -> RED; leave the file unmarked as the user's in the kept-backup branch -> RED."""
+    home = tmp_path / "h"
+    cfg = home / ".cursor" / "mcp.json"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(json.dumps({"theme": "dark"}))
+    assert cl.register("cursor", _host(home), tmap).ok
+    data = json.loads(cfg.read_text())
+    del data["theme"]  # the user's own edit, made after tmap's write
+    cfg.write_text(json.dumps(data))
+    outs = cl.unregister("cursor", _host(home), tmap)
+    assert all(o.ok for o in outs) and "kept" in outs[0].message
+    assert cfg.is_file() and json.loads(cfg.read_text()) == {"mcpServers": {}}
+    assert cfg.with_name("mcp.json.tmap.backup").is_file()
+
+
+def test_a_tmap_backup_that_is_a_link_is_left_alone(tmp_path: Path, tmap: Path) -> None:
+    """A ``.tmap.backup`` that is a link is neither put back from nor removed, even when what it
+    points at matches the file.
+
+    MUTATION: accept a linked backup -> what it points at is written over the file and the link is
+    removed -> RED."""
+    home = tmp_path / "h"
+    cfg = home / ".cursor" / "mcp.json"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(json.dumps({"theme": "dark"}))
+    target = tmp_path / "dotfiles" / "mcp.json"
+    target.parent.mkdir(parents=True)
+    target.write_text('{"theme":   "dark"}')
+    link = cfg.with_name("mcp.json.tmap.backup")
+    link.symlink_to(target)
+    assert cl.register("cursor", _host(home), tmap).ok  # a backup is there: none is written
+    assert all(o.ok for o in cl.unregister("cursor", _host(home), tmap))
+    assert link.is_symlink() and link.resolve() == target.resolve()
+    assert target.read_text() == '{"theme":   "dark"}'
+    assert cfg.is_file() and json.loads(cfg.read_text()) == {"theme": "dark", "mcpServers": {}}
+
+
+@pytest.mark.parametrize(
+    ("was", "now"),
+    [(1, True), (True, 1), (1, 1.0), (0, False)],
+    ids=["1-to-true", "true-to-1", "1-to-1.0", "0-to-false"],
+)
+@pytest.mark.parametrize("where", ["top", "server"])
+def test_a_later_edit_between_values_python_calls_equal_is_kept(
+    tmp_path: Path, tmap: Path, was: Any, now: Any, where: str
+) -> None:
+    """``1``, ``1.0`` and ``true`` are three JSON values, though Python's ``==`` takes them for one.
+    A user's change between them after tmap's write is a change: the file keeps it, and the backup
+    is kept rather than put back over it.
+
+    MUTATION: compare the backup with the file by ``==`` -> the backup is put back and the edit is
+    lost -> RED (all eight)."""
+    home = tmp_path / "h"
+    cfg = home / ".cursor" / "mcp.json"
+    cfg.parent.mkdir(parents=True)
+
+    def holder(obj: dict[str, Any]) -> dict[str, Any]:
+        return obj if where == "top" else obj["mcpServers"]["mine"]
+
+    start: dict[str, Any] = (
+        {"n": was} if where == "top" else {"mcpServers": {"mine": {"command": "mine", "n": was}}}
+    )
+    cfg.write_text(json.dumps(start))
+    assert cl.register("cursor", _host(home), tmap).ok
+    data = json.loads(cfg.read_text())
+    holder(data)["n"] = now  # the user's own edit, made after tmap's write
+    cfg.write_text(json.dumps(data))
+    outs = cl.unregister("cursor", _host(home), tmap)
+    assert all(o.ok for o in outs) and "kept" in outs[0].message
+    assert json.dumps(holder(json.loads(cfg.read_text()))["n"]) == json.dumps(now)
+    assert cfg.with_name("mcp.json.tmap.backup").is_file()
+
+
 def test_other_keys_keep_their_characters(tmp_path: Path, tmap: Path) -> None:
     home = tmp_path / "h"
     cfg = home / ".cursor" / "mcp.json"

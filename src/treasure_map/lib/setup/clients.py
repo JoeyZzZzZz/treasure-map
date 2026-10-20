@@ -547,22 +547,31 @@ def _sans_ours(obj: Mapping[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _json_text(obj: Any) -> str:
+    """``obj`` as one canonical JSON text: keys sorted, no spaces. Two values read the same here
+    only when they are the same JSON. ``==`` would take ``1``, ``1.0`` and ``true`` for one value,
+    and a user's later change between them for no change at all."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
 def _tidy_after_removal(path: Path, rest: dict[str, Any], mode: int) -> list[str]:
     """Once tmap's entry is out of ``path`` (which now holds ``rest``), take away what tmap left.
 
     The ``.tmap.backup`` is the file as tmap first found it. When the file differs from it by
     nothing but tmap's entry (and an emptied ``mcpServers``), the backup holds nothing the file
-    does not: a backup of the user's own file has its exact bytes put back, and goes. One that
-    itself holds a tmap entry was taken of a file tmap had already written — not an original — and
-    just goes. A backup that differs by more is kept, and said so. A file with no original behind
-    it that holds nothing now (an empty ``mcpServers``, nothing else) is removed, as dsh's patch
-    file is; a symlink stays."""
+    does not: a backup of the user's own file has its exact bytes put back, and goes. The two are
+    compared as JSON (:func:`_json_text`), so ``1``, ``1.0`` and ``true`` are three values. One
+    that itself holds a tmap entry was taken of a file tmap had already written — not an original —
+    and just goes. A backup that differs by more is kept, and said so. A ``.tmap.backup`` that is a
+    link is left alone: neither it nor what it points at is tmap's to put back from or remove. A
+    file with no original behind it that holds nothing now (an empty ``mcpServers``, nothing else)
+    is removed, as dsh's patch file is; a symlink stays."""
     notes: list[str] = []
     backup = path.with_name(path.name + ".tmap.backup")
     original = False  # the file is the user's own, as they had it before tmap
     if backup.is_file() and not backup.is_symlink():
         before = _load_json_object(backup)
-        if before is None or _sans_ours(before) != _sans_ours(rest):
+        if before is None or _json_text(_sans_ours(before)) != _json_text(_sans_ours(rest)):
             notes.append(f"kept {backup}: it differs from {path.name} by more than tmap's entry")
             original = True
         else:
