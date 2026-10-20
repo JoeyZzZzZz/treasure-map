@@ -634,8 +634,8 @@ def get_diff_meta(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any]:
     All non-derived columns, echoed raw. ``found=False`` when there is no such diff -- an empty
     answer is explicit, never a silent zero-row that reads as 'nothing changed'. ``banners``: a
     withheld diff's banners as the view gives them; otherwise the read-first banner when an
-    undetermined pair is flagged anchored_differs (patch_view.anchored_differs_banner), else
-    empty."""
+    undetermined pair is flagged anchored_differs or anchored_micro_side
+    (patch_view.anchored_differs_banner), else empty."""
     row = atlas.execute(
         f"SELECT {', '.join(_META_COLS)} FROM diff_meta WHERE diff_id = ?",  # noqa: S608
         (diff_id,),

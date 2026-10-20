@@ -633,3 +633,40 @@ def test_line_number_form_needs_one_consistent_nonzero_step() -> None:
 
     MUTATION: drop the equal-step check (keep the last step) -> the two-step body matches -> RED."""
     assert _lnf('f("a.c", 10);\ng("b.c", 0x40);', 'f("a.c", 17);\ng("b.c", 0x3f);') is None
+
+
+def test_a_source_path_is_the_whole_string_not_its_suffix() -> None:
+    """The string before the shifted number reads as a source path only when the WHOLE string is a
+    path-like token ending in .c / .cc / .cpp / .h — a message or a format that merely ends in one
+    is not a path, so the pair stays in the read-first head.
+
+    MUTATION: test the suffix alone (``endswith``) -> the message and the format are demoted -> RED.
+    """
+    assert _lnf('err(1, "cannot open config.c", 5);', 'err(1, "cannot open config.c", 6);') is None
+    assert _lnf('cfg_set(b, "%s/%s.h", 0x20);', 'cfg_set(b, "%s/%s.h", 0x40);') is None
+    assert _lnf('log("src/net/sock-io.c", 10);', 'log("src/net/sock-io.c", 11);') == {
+        "delta": 1,
+        "sites": 1,
+    }
+    assert _lnf('log("ui/view.cpp", 3);', 'log("ui/view.cpp", 5);') == {"delta": 2, "sites": 1}
+
+
+def test_the_shifted_number_must_be_a_whole_call_argument() -> None:
+    """The changed number must be an argument on its own; one inside an argument expression
+    (``x + 10``) is a computed value, not a line number, even right after a source path.
+
+    MUTATION: accept a number anywhere inside the argument -> the ``x + 10`` pair is demoted -> RED.
+    """
+    assert _lnf('f("a.c", x + 10);', 'f("a.c", x + 11);') is None
+
+
+def test_a_statement_bound_ends_the_walk_back_to_the_call() -> None:
+    """The walk back from the number to its call's ``(`` stops at a statement bound (``;`` ``{``
+    ``}``) — so a brace in an earlier argument (a compound literal) ends it too, and the pair stays
+    in the read-first head: the walk never reaches past one to find a call.
+
+    MUTATION: walk past the statement bounds -> the compound-literal call is read and demoted ->
+    RED."""
+    assert (
+        _lnf('log((struct pos){1, 2}, "a.c", 10);', 'log((struct pos){1, 2}, "a.c", 11);') is None
+    )

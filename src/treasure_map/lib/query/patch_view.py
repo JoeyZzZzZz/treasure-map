@@ -2147,8 +2147,41 @@ def _delta_pair(e: _Entry, readings: _Readings) -> _Pair | None:
     return p if reads.get((p.addr_a, p.addr_b), _UNREAD).matches is False else None
 
 
+def _page_bodies(readings: _Readings, page: list[_Entry]) -> dict[tuple[str, str], dict[str, Any]]:
+    """Each paged pair's ``bodies`` block — per side its body ``status`` and ``size_bytes``, present
+    only when a side had no text to compare (sameness.pair_reading) — with a design-skipped micro-
+    stub side's stored disassembly inlined (``listing``, or ``listing: null`` with
+    ``listing_note``). The listings are read only for the page being rendered, and only when a side
+    of it is a micro-stub."""
+    blocks: dict[tuple[str, str], dict[str, Any]] = {}
+    want: dict[str, set[str]] = {"a": set(), "b": set()}
+    for e in page:
+        p = e.pair
+        if p is None or not e.body_status:
+            continue
+        blocks[(p.addr_a, p.addr_b)] = e.body_status
+        for side, addr in (("a", p.addr_a), ("b", p.addr_b)):
+            if e.body_status[side]["status"] == sameness.SKIPPED_MICRO:
+                want[side].add(addr)
+    listings: dict[str, dict[str, dict[str, Any]]] = {"a": {}, "b": {}}
+    for side, (path, sha) in zip(("a", "b"), readings.sources, strict=True):
+        if want[side]:
+            listings[side] = sameness.read_micro_listings(path, sha, want[side])
+    return {
+        key: {
+            side: {**bodies[side], **listings[side].get(addr, {})}
+            for side, addr in zip(("a", "b"), key, strict=True)
+        }
+        for key, bodies in blocks.items()
+    }
+
+
 def _proposed_json(
-    e: _Entry, state: str, read: _Read, deltas: dict[tuple[str, str], dict[str, Any]]
+    e: _Entry,
+    state: str,
+    read: _Read,
+    deltas: dict[tuple[str, str], dict[str, Any]],
+    bodies: dict[tuple[str, str], dict[str, Any]],
 ) -> dict[str, Any]:
     """An undetermined pair's ``proposed_pair_reading``: read as if it were paired, beside the
     entry and never as its pseudocode_sameness. ``occurrences`` and the two ``*_elsewhere_*`` are
@@ -2156,7 +2189,8 @@ def _proposed_json(
     ``anchored_differs: true``, its ``anchor`` and ``in_read_first`` (at or above the floor),
     whatever the sort; one whose only change is a ``line_number_form`` shift carries that shape and
     ``in_read_first: false`` (demoted out of the head, still flagged). A micro-side R pair is NOT
-    anchored_differs, so it carries no such block here."""
+    anchored_differs, so it carries no such block here. A pair with no text on a side carries
+    ``bodies`` (:func:`_page_bodies`): which side is the micro-stub, its size and its listing."""
     p = e.pair
     assert p is not None
     out: dict[str, Any] = {"pairing": "undetermined", "state": state}
@@ -2183,6 +2217,8 @@ def _proposed_json(
     delta = deltas.get((p.addr_a, p.addr_b))
     if delta is not None:
         out["pseudocode_delta"] = delta
+    if (p.addr_a, p.addr_b) in bodies:
+        out["bodies"] = bodies[(p.addr_a, p.addr_b)]
     return out
 
 
@@ -2278,9 +2314,11 @@ _SIGNIFICANCE_LENS = (
     "design-skipped micro-stub (under the decompile size floor, not decompiled by design — a "
     "binary property, NOT a read failure) and the other a real body gets basis anchored_micro_side "
     "(before anchored_differs when a pair is both), and an aligned pair of the same shape gets "
-    "basis one_side_skipped_micro, both held at attention 1 rather than sunk; a micro-stub under "
-    "~10 bytes whose disassembly the listing already holds is inlined, else it says a re-scan is "
-    "needed. "
+    "basis one_side_skipped_micro, both held at attention 1 rather than sunk. Such a pair's "
+    "reading carries bodies: per side its status and size_bytes, and on the micro-stub side its "
+    "stored disassembly inline (listing; listing null with listing_note "
+    "not_exported_by_this_scan when the binary was extracted before tmap stored disassembly — a "
+    "re-scan stores it — or not_stored, which get_disassembly explains). "
     "Attention 0 holds B entries too (a row's sink_arg_constant_delta) beside "
     "A. Never sunk: an R entry (attention 2 never holds one; one whose proposed_pair_reading is "
     "identical_unique closes attention 1 instead), a B sink_present_no_visible_delta (labelled "
@@ -2424,45 +2462,55 @@ def function_states(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] |
 
 def anchored_differs_banner(states: dict[str, Any] | None) -> str | None:
     """The read-first banner of one diff's :func:`function_states`, or None when no undetermined
-    pair is flagged anchored_differs (or the diff is withheld, which has no counts). It names the
-    read-first head (AFTER line-number shifts are demoted out of it), the pairs so demoted, the
-    anchored micro-side pairs, and — ALWAYS — that the head pairs are not yet told apart and that
-    the flagged ones do not stand for the rest of R."""
+    pair is flagged anchored_differs or anchored_micro_side (or the diff is withheld, which has no
+    counts). It names the read-first head (AFTER line-number shifts are demoted out of it), the
+    pairs so demoted, the anchored micro-side pairs, and — ALWAYS — that the flagged pairs do not
+    stand for the rest of R, and, whenever any pair is flagged anchored_differs, that the head
+    pairs are not yet told apart (a demotion or none)."""
     if not states or states.get("withheld"):
         return None
     flagged = int(states.get("alignment_undetermined_anchored_differs_all") or 0)
-    if flagged <= 0:
+    micro = int(states.get("alignment_undetermined_anchored_micro_side") or 0)
+    if flagged <= 0 and micro <= 0:
         return None
     first = int(states.get("alignment_undetermined_anchored_differs") or 0)
     lnf = int(states.get("alignment_undetermined_anchored_differs_line_number_form") or 0)
-    micro = int(states.get("alignment_undetermined_anchored_micro_side") or 0)
     differs = int((states.get("alignment_undetermined_reading") or {}).get(sameness.U_DIFFERS, 0))
-    parts = [
-        f"anchored_differs: {first} undetermined pairs are confidently paired (same address or "
-        "same real symbol), their normalized pseudocode differs, and they sit at or above the "
-        f"read-first similarity floor ({ANCHORED_DIFFERS_SIM_FLOOR}) — read these first: "
-        'get_diff_patch_view(bucket="R", anchored_differs=true).'
-    ]
-    if lnf:
+    parts: list[str] = []
+    if flagged > 0:
         parts.append(
-            f"{lnf} more anchored pairs were demoted out of the head because their only change is "
-            "a __FILE__/__LINE__ line-number shift — still flagged (anchored_differs=true pages "
-            "them)."
+            f"anchored_differs: {first} undetermined pairs are confidently paired (same address or "
+            "same real symbol), their normalized pseudocode differs, and they sit at or above the "
+            f"read-first similarity floor ({ANCHORED_DIFFERS_SIM_FLOOR}) — read these first: "
+            'get_diff_patch_view(bucket="R", anchored_differs=true).'
         )
-    parts.append(
-        f"The {first} head pairs are NOT yet told apart: each still holds build info, a structure "
-        "shift, a moved string or a real change, unresolved."
-    )
+        if lnf:
+            parts.append(
+                f"{lnf} more anchored pairs were demoted out of the head because their only change "
+                "is a __FILE__/__LINE__ line-number shift — still flagged (anchored_differs=true "
+                "pages them)."
+            )
+        parts.append(
+            f"The {first} head pairs are NOT yet told apart: each still holds build info, a "
+            "structure shift, a moved string or a real change, unresolved."
+        )
     if micro:
         parts.append(
-            f"{micro} other anchored pairs have one side a design-skipped micro-stub and the other "
-            'a real body: get_diff_patch_view(bucket="R", anchored_micro_side=true).'
+            f"{micro} anchored pairs have one side a design-skipped micro-stub and the other a "
+            "real body (a pair may also be flagged anchored_differs): "
+            'get_diff_patch_view(bucket="R", anchored_micro_side=true).'
         )
-    parts.append(
-        f"{flagged} anchored pairs differ in total (incl. below the floor); this does NOT clear "
+    rest = (
         f"the rest of the R bucket: {differs} undetermined pairs read 'differs' in total. Walk the "
         'remainder with get_diff_patch_view(bucket="R", sort_by="significance") to the end.'
     )
+    if flagged > 0:
+        parts.append(
+            f"{flagged} anchored pairs differ in total (incl. below the floor); this does NOT "
+            f"clear {rest}"
+        )
+    else:
+        parts.append(f"This does NOT clear {rest}")
     return " ".join(parts)
 
 
@@ -2761,6 +2809,7 @@ def get_diff_patch_view(
     page_deltas = _deltas(
         readings, [p for e in page if (p := _delta_pair(e, readings)) is not None]
     )
+    page_bodies = _page_bodies(readings, page)
 
     def _render(e: _Entry) -> dict[str, Any]:
         out = review.entry_json(e, band)
@@ -2776,8 +2825,12 @@ def get_diff_patch_view(
             delta = page_deltas.get((e.pair.addr_a, e.pair.addr_b))
             if delta is not None:
                 out["pseudocode_delta"] = delta
+            if (e.pair.addr_a, e.pair.addr_b) in page_bodies:
+                out["bodies"] = page_bodies[(e.pair.addr_a, e.pair.addr_b)]
         if e.entry_id in proposed and e.pair is not None:
-            out["proposed_pair_reading"] = _proposed_json(e, *proposed[e.entry_id], page_deltas)
+            out["proposed_pair_reading"] = _proposed_json(
+                e, *proposed[e.entry_id], page_deltas, page_bodies
+            )
         if e.entry_id in lens:
             attention, basis = lens[e.entry_id]
             out["rank_key"] = {**out["rank_key"], "attention": attention}

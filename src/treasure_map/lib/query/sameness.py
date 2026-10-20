@@ -57,6 +57,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import zlib
 from difflib import SequenceMatcher
 from typing import Any
 
@@ -662,7 +663,10 @@ def pseudocode_delta(
 
 # ── line-number form: a __FILE__/__LINE__ shift, told apart from a real substitution ─────────
 
-_SOURCE_SUFFIXES = (".c", ".cc", ".cpp", ".h")
+# A source-file path as __FILE__ expands it: the WHOLE string a path-like token ending in a C/C++
+# source suffix. Matched whole, never by suffix — "cannot open config.c" or "%s/%s.h" end in one
+# too, and are messages / formats, not a path.
+_SOURCE_PATH = re.compile(r"[\w./+-]*\.(?:c|cc|cpp|h)")
 
 
 def _parse_int_token(text: str) -> int | None:
@@ -683,7 +687,7 @@ def _dequote(text: str) -> str:
 
 
 def _is_source_path(s: str) -> bool:
-    return s.lower().endswith(_SOURCE_SUFFIXES)
+    return _SOURCE_PATH.fullmatch(s) is not None
 
 
 def _preceding_string_arg(toks: list[tuple[str, str]], idx: int) -> str | None:
@@ -691,7 +695,10 @@ def _preceding_string_arg(toks: list[tuple[str, str]], idx: int) -> str | None:
     ``toks[idx]`` is ALONE a top-level argument of a call (a callee identifier, then ``(``) and the
     argument before it is exactly one string token; else None. The walk back to the call's ``(``
     stops at ``;`` ``{`` ``}`` (statement bounds), so a bare number not inside a call is rejected.
-    Only ``()`` drive the enclosing-call depth; ``[]`` / ``{}`` inside an argument stay opaque."""
+    Only ``()`` drive the enclosing-call depth; ``[]`` / ``{}`` inside an argument stay opaque. The
+    callee must be a plain identifier: a call through a function pointer (``(*p)(…)``) is never read
+    as such a site, so a shift there stays in the read-first head — narrower than the shape, never
+    wider."""
     depth = 0
     open_paren = -1
     j = idx - 1
@@ -888,6 +895,96 @@ def read_image_ranges(analysis_db_path: str | None, sha: str | None) -> ImageRan
         if lo is not None and isinstance(size, int) and size > 0:
             out.append((lo, lo + size))
     return out or None
+
+
+# Why a micro-stub side carries no inline listing (``listing_note``): the binary was extracted
+# before tmap stored disassembly (a re-scan stores it), or it was and holds none for this function
+# (get_disassembly says why).
+LISTING_NOT_EXPORTED = "not_exported_by_this_scan"
+LISTING_NOT_STORED = "not_stored"
+
+
+def _listing_units(blob: Any) -> list[dict[str, Any]] | None:
+    """A stored function_listing blob as get_disassembly's instruction items, bytes left out (they
+    live in data_blocks); None when there is none or it cannot be decoded."""
+    if blob is None:
+        return None
+    try:
+        units = json.loads(zlib.decompress(bytes(blob)).decode("utf-8"))
+    except (zlib.error, ValueError, TypeError):
+        return None
+    if not isinstance(units, list):
+        return None
+    out: list[dict[str, Any]] = []
+    for u in units:
+        if not isinstance(u, dict):
+            continue
+        item: dict[str, Any] = {"address": u.get("a"), "length": u.get("n"), "kind": u.get("k")}
+        if u.get("k") == "code":
+            item["mnemonic"] = u.get("m")
+            item["operands"] = u.get("o")
+        out.append(item)
+    return out
+
+
+def read_micro_listings(
+    analysis_db_path: str | None, sha: str | None, addrs: set[str]
+) -> dict[str, dict[str, Any]]:
+    """entry (normalised hex) -> the stored disassembly of each of ``addrs`` in one diffed binary,
+    read-only: ``{"listing": [...]}`` (get_disassembly's instruction items without the bytes), else
+    ``{"listing": None, "listing_note": ...}`` (:data:`LISTING_NOT_EXPORTED` /
+    :data:`LISTING_NOT_STORED`). Meant for the design-skipped micro-stub sides of one rendered page:
+    a body under the decompile size floor is a handful of units, so it is shown whole. Every one of
+    ``addrs`` gets an answer; a db that cannot be read reads as not stored."""
+    exported = True
+    blobs: dict[str, Any] = {}
+    if addrs and analysis_db_path and sha:
+        try:
+            conn = ro_connect(analysis_db_path)
+        except sqlite3.Error:
+            conn = None
+        if conn is not None:
+            try:
+                found = conn.execute("SELECT id FROM binaries WHERE sha256 = ?", (sha,)).fetchone()
+                if found is not None:
+                    exported = (
+                        conn.execute(
+                            "SELECT 1 FROM detector_scan_status WHERE binary_id = ? "
+                            "AND detector = 'listing' LIMIT 1",
+                            (found[0],),
+                        ).fetchone()
+                        is not None
+                    )
+                    ids: dict[int, str] = {}
+                    for fid, address in conn.execute(
+                        "SELECT id, address FROM functions WHERE binary_id = ? "
+                        "AND (pseudocode IS NULL OR pseudocode = '')",
+                        (found[0],),
+                    ):
+                        addr = norm_hex(address) if address else None
+                        if addr in addrs:
+                            ids[fid] = addr
+                    if ids:
+                        marks = ", ".join("?" * len(ids))
+                        for fid, blob in conn.execute(
+                            "SELECT function_id, listing FROM function_listing "
+                            f"WHERE function_id IN ({marks})",
+                            tuple(ids),
+                        ):
+                            blobs[ids[fid]] = blob
+            except sqlite3.Error:
+                pass
+            finally:
+                conn.close()
+    out: dict[str, dict[str, Any]] = {}
+    for addr in addrs:
+        units = _listing_units(blobs.get(addr))
+        if units is not None:
+            out[addr] = {"listing": units}
+        else:
+            note = LISTING_NOT_STORED if exported else LISTING_NOT_EXPORTED
+            out[addr] = {"listing": None, "listing_note": note}
+    return out
 
 
 # ── the length-constant signals (size evidence of a copy / buffer-formatter candidate) ───────

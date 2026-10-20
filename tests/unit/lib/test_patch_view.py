@@ -2686,7 +2686,8 @@ def test_cause_of_splits_the_unavailable_pairs_strongest_gap_first(
     one_side_skipped_micro.
 
     MUTATION: drop the DECOMPILE_EMPTY check -> a micro + decompile_empty pair falls through to
-    one_side_skipped_micro -> RED."""
+    one_side_skipped_micro -> RED; test SIZE_UNKNOWN before DECOMPILE_EMPTY -> the empty +
+    unrecorded pair reads size_unknown -> RED."""
     sm = sameness
 
     def mk(sa: str, sb: str) -> dict[str, Any]:
@@ -2694,6 +2695,9 @@ def test_cause_of_splits_the_unavailable_pairs_strongest_gap_first(
 
     assert pv._cause_of(mk(sm.DB_UNAVAILABLE, sm.DECOMPILE_EMPTY)) == "db_unavailable"
     assert pv._cause_of(mk(sm.DECOMPILE_EMPTY, sm.SKIPPED_MICRO)) == "decompile_empty"
+    # a real empty decompile outranks an unrecorded size, whichever side carries which
+    assert pv._cause_of(mk(sm.DECOMPILE_EMPTY, sm.SIZE_UNKNOWN)) == "decompile_empty"
+    assert pv._cause_of(mk(sm.SIZE_UNKNOWN, sm.DECOMPILE_EMPTY)) == "decompile_empty"
     assert pv._cause_of(mk(sm.SIZE_UNKNOWN, sm.SKIPPED_MICRO)) == "size_unknown"
     assert pv._cause_of(mk(sm.SKIPPED_MICRO, "ok")) == "one_side_skipped_micro"
     assert pv._cause_of(mk(sm.SKIPPED_MICRO, sm.SKIPPED_MICRO)) == "both_skipped_micro"
@@ -2823,6 +2827,191 @@ def test_the_line_number_name_match_ignores_a_synthetic_name(tmp_path: Path, cur
     assert real.get("line_number_form") == {"delta": 7, "sites": 1}  # real name matched -> demoted
     syn = _reading(v, _pair_id("00081000", "00081000"))
     assert "line_number_form" not in syn and syn["in_read_first"] is True  # synthetic -> head
+
+
+def test_each_side_s_made_up_name_is_dropped_before_the_name_match(
+    tmp_path: Path, current: None
+) -> None:
+    """The made-up-name filter runs on EACH side by its own address: a ``loc_<addr>`` name is made
+    up only on the side whose entry it ends in, so a pair whose string equals that name on both
+    sides is real on one side and made up on the other — never a name match. The same text with a
+    real name on both sides is one (the control). The tails are 5 hex digits: an 8-digit one is
+    blanked in the delta text itself, so the name test would never see it.
+
+    MUTATION: pass side a's name through unfiltered -> the first pair is demoted -> RED; the same
+    for side b -> the second pair is demoted -> RED."""
+    w = World(tmp_path)
+    for a, b, name in (
+        ("00081000", "00082000", "loc_81000"),  # made up on side a only
+        ("00083000", "00084000", "loc_84000"),  # made up on side b only
+        ("00085000", "00086000", "realfn"),  # real on both sides (control)
+    ):
+        w.pair(a, b, 0.5, 0.9, name_a=name, name_b=name)
+        w.fn("a", a, ["log"], pseudocode=f'log("{name}", 10);', size_bytes=200, name=name)
+        w.fn("b", b, ["log"], pseudocode=f'log("{name}", 17);', size_bytes=200, name=name)
+    w.commit()
+    built = pv.build_diff_view(w.atlas, DIFF)
+    assert built is not None
+    readings = pv._pseudo_readings(w.atlas, built)
+    pairs = [e.pair for e in built.placed if e.pair is not None]
+    deltas = pv._deltas(readings, pairs)
+    assert "line_number_form" not in deltas[("00081000", "00082000")]
+    assert "line_number_form" not in deltas[("00083000", "00084000")]
+    assert deltas[("00085000", "00086000")]["line_number_form"] == {"delta": 7, "sites": 1}
+
+
+def test_a_micro_side_pair_needs_an_anchor(tmp_path: Path, current: None) -> None:
+    """One stub against one real body is anchored_micro_side only when the pair is anchored (same
+    address or same real symbol name); the same shape at two addresses with no name is not.
+
+    MUTATION: drop the anchor condition from ``_anchored_micro_side`` -> the unanchored pair is
+    flagged, counted and listed -> RED."""
+    w = World(tmp_path)
+    anchored = _micro_pair(w, "00030000", "00030000", 0.8)
+    loose = _micro_pair(w, "00031000", "00032000", 0.8)  # two addresses, no names: no anchor
+    w.commit()
+    s = pv.function_states(w.atlas, DIFF)
+    assert s is not None and s["alignment_undetermined_anchored_micro_side"] == 1
+    assert set(_view(w, bucket="R", anchored_micro_side=True)["by_id"]) == {anchored}
+    v = _view(w, sort_by="significance")
+    assert v["by_id"][anchored]["significance"]["basis"] == "anchored_micro_side"
+    assert v["by_id"][loose]["significance"]["basis"] != "anchored_micro_side"
+
+
+def _listing_pass(w: World, side: str) -> None:
+    """Mark side's binary as extracted with listing export (the ingest's per-binary row)."""
+    w.adb[side].execute(
+        "INSERT INTO detector_scan_status (binary_id, detector, scanned, found_count) "
+        "VALUES (1, 'listing', 1, 0)"
+    )
+
+
+def _listing(w: World, side: str, addr: str, units: list[dict[str, Any]]) -> None:
+    """Store one function's listing as the ingest does: zlib(JSON [{a,n,k,m,o}, ...])."""
+    import zlib
+
+    row = w.adb[side].execute("SELECT id FROM functions WHERE address = ?", (addr,)).fetchone()
+    w.adb[side].execute(
+        "INSERT INTO function_listing (function_id, listing, unit_count, insn_count) "
+        "VALUES (?, ?, ?, ?)",
+        (row[0], zlib.compress(json.dumps(units).encode()), len(units), len(units)),
+    )
+
+
+_STUB_UNITS = [
+    {"a": "00030000", "n": 4, "k": "code", "m": "jr", "o": "ra"},
+    {"a": "00030004", "n": 4, "k": "code", "m": "_clear", "o": "v0"},
+]
+
+
+def test_a_micro_side_pair_shows_which_side_is_the_stub_its_size_and_its_listing(
+    tmp_path: Path, current: None
+) -> None:
+    """An undetermined micro-side pair's proposed reading carries ``bodies``: each side's status and
+    size, and on the stub side its stored disassembly inline (address, length, kind, mnemonic,
+    operands — get_disassembly's items without the bytes). The real side carries no listing.
+
+    MUTATION: leave ``bodies`` out of the proposed reading -> RED; read no listing for the stub side
+    -> RED."""
+    w = World(tmp_path)
+    eid = _micro_pair(w, "00030000", "00030000", 0.8)
+    _listing_pass(w, "b")
+    _listing(w, "b", "00030000", _STUB_UNITS)
+    w.commit()
+    bodies = _reading(_view(w), eid)["bodies"]
+    assert bodies["a"] == {"status": "ok", "size_bytes": 200}
+    assert (bodies["b"]["status"], bodies["b"]["size_bytes"]) == (sameness.SKIPPED_MICRO, 8)
+    code = {"length": 4, "kind": "code"}
+    assert bodies["b"]["listing"] == [
+        {"address": "00030000", **code, "mnemonic": "jr", "operands": "ra"},
+        {"address": "00030004", **code, "mnemonic": "_clear", "operands": "v0"},
+    ]
+    assert "listing_note" not in bodies["b"]
+
+
+@pytest.mark.parametrize(
+    ("exported", "note"),
+    [(False, sameness.LISTING_NOT_EXPORTED), (True, sameness.LISTING_NOT_STORED)],
+)
+def test_a_stub_side_with_no_stored_listing_says_why(
+    tmp_path: Path, current: None, exported: bool, note: str
+) -> None:
+    """A stub side with no stored listing carries ``listing: null`` and why: the binary was
+    extracted before tmap stored disassembly (a re-scan stores it), or it was and holds none for
+    this function.
+
+    MUTATION: read the not-exported case off the listing table instead of the binary's listing-pass
+    row -> both read the same note -> RED."""
+    w = World(tmp_path)
+    eid = _micro_pair(w, "00030000", "00030000", 0.8)
+    if exported:
+        _listing_pass(w, "b")
+    w.commit()
+    stub = _reading(_view(w), eid)["bodies"]["b"]
+    assert (stub["listing"], stub["listing_note"]) == (None, note)
+
+
+def test_an_aligned_micro_pair_shows_its_bodies_on_the_entry(tmp_path: Path, current: None) -> None:
+    """An aligned pair with no text on a side carries ``bodies`` on the entry itself (beside
+    pseudocode_sameness): the stub side's status, size and listing; a pair whose two texts were
+    read carries none.
+
+    MUTATION: leave ``bodies`` out of the aligned entry -> RED."""
+    w = World(tmp_path)
+    w.pair("00030000", "00031000", 0.97, 0.9)  # aligned, below similarity 1: listed
+    w.fn("a", "00030000", ["foo"], pseudocode="y = f();", size_bytes=200)
+    w.fn("b", "00031000", ["foo"], pseudocode=None, size_bytes=8)
+    w.pair("00040000", "00041000", 0.97, 0.9)  # both texts read: no bodies block
+    w.fn("a", "00040000", ["foo"], pseudocode="y = g();", size_bytes=200)
+    w.fn("b", "00041000", ["foo"], pseudocode="y = g() + 1;", size_bytes=200)
+    _listing_pass(w, "b")
+    _listing(w, "b", "00031000", [{**u, "a": "0003100" + u["a"][-1]} for u in _STUB_UNITS])
+    w.commit()
+    v = _view(w)
+    entry = v["by_id"][_pair_id("00030000", "00031000")]
+    assert entry["pseudocode_sameness"] == sameness.UNAVAILABLE
+    assert "one_side_skipped_micro" in entry["facts"]
+    assert entry["bodies"]["b"]["size_bytes"] == 8
+    assert [u["mnemonic"] for u in entry["bodies"]["b"]["listing"]] == ["jr", "_clear"]
+    assert "bodies" not in v["by_id"][_pair_id("00040000", "00041000")]
+
+
+def _banner_states(**kw: int) -> dict[str, Any]:
+    """A function_states block carrying only the counts the read-first banner reads."""
+    return {
+        "withheld": False,
+        "alignment_undetermined_anchored_differs": kw.get("head", 0),
+        "alignment_undetermined_anchored_differs_line_number_form": kw.get("lnf", 0),
+        "alignment_undetermined_anchored_differs_all": kw.get("flagged", 0),
+        "alignment_undetermined_anchored_micro_side": kw.get("micro", 0),
+        "alignment_undetermined_reading": {sameness.U_DIFFERS: kw.get("differs", 0)},
+    }
+
+
+def test_the_banner_always_says_the_head_is_not_yet_told_apart() -> None:
+    """Whenever a pair is flagged anchored_differs the banner says the head pairs are NOT yet told
+    apart — with a line-number demotion and without one (then no demotion sentence). A diff with
+    only micro-side pairs still gets a banner (the micro count and its filter, and that R is not
+    cleared), with no head sentence; with neither there is none.
+
+    MUTATION: drop the "NOT yet told apart" sentence -> RED; banner only when a pair is flagged
+    anchored_differs -> the micro-only diff has none -> RED."""
+    plain = pv.anchored_differs_banner(_banner_states(head=3, flagged=4, differs=9))
+    assert plain is not None
+    assert "The 3 head pairs are NOT yet told apart" in plain
+    assert "demoted" not in plain  # L == 0: no demotion sentence, the told-apart one stays
+    demoted = pv.anchored_differs_banner(_banner_states(head=3, lnf=2, flagged=6, differs=9))
+    assert demoted is not None
+    assert "2 more anchored pairs were demoted" in demoted
+    assert "The 3 head pairs are NOT yet told apart" in demoted
+    micro_only = pv.anchored_differs_banner(_banner_states(micro=2, differs=5))
+    assert micro_only is not None
+    assert "2 anchored pairs have one side a design-skipped micro-stub" in micro_only
+    assert "anchored_micro_side=true" in micro_only and "does NOT clear" in micro_only
+    assert "told apart" not in micro_only and "read these first" not in micro_only
+    both = pv.anchored_differs_banner(_banner_states(head=1, flagged=1, micro=1, differs=2))
+    assert both is not None and "may also be flagged anchored_differs" in both
+    assert pv.anchored_differs_banner(_banner_states(differs=5)) is None
 
 
 @pytest.mark.parametrize(

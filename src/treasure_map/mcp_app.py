@@ -1788,7 +1788,12 @@ def make_tools(
         anchored with exactly one side a design-skipped micro-stub (under ~10 bytes, not decompiled
         BY DESIGN — a binary property, not a read failure) and the other a real body; basis
         ``anchored_micro_side`` under the significance lens, ``one_side_skipped_micro`` for the
-        aligned pairs of that shape. Not checked by any of
+        aligned pairs of that shape. A pair with no text on a side carries ``bodies`` (in the
+        entry for an aligned pair, in ``proposed_pair_reading`` for an undetermined one): per side
+        ``status`` and ``size_bytes``, and on a micro-stub side its stored disassembly inline
+        (``listing``, as get_disassembly gives it without the bytes; ``listing`` null with
+        ``listing_note`` = ``not_exported_by_this_scan`` — re-scan to store it — or
+        ``not_stored``, which get_disassembly explains). Not checked by any of
         these: the target a ``DAT_`` / ``PTR_`` reference points at once its address is blanked
         (a string label keeps its content in the name); a C++ catch handler (landing pad), which
         usually lies outside every function body, so its code is never decompiled and no reading
