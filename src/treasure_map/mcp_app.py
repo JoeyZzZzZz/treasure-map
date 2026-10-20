@@ -1750,12 +1750,16 @@ def make_tools(
         entry's ``rank_key`` names the components. ``sort_by`` (``tier`` / ``similarity`` /
         ``address``) puts one component first. ``sort_by='significance'`` is a lens, not a
         relabel: attention 0 = bucket A or a row carrying ``sink_arg_constant_delta``; 2 (sunk,
-        still listed) = pseudocode_sameness ``identical`` or bucket C; 1 = the rest, lowest
-        similarity first, R and B entries ordered together. Attention 0 holds B entries too (a
-        row's ``sink_arg_constant_delta``) beside A. Never sunk: an R entry (attention 2 never
-        holds one; one whose proposed reading is ``identical_unique`` closes attention 1), a
-        ``sink_present_no_visible_delta`` B (labelled ``recheckable_no_visible_delta``), an
-        ``identical_text_unverified`` entry outside bucket C, and an entry judged changed_real,
+        still listed) = pseudocode_sameness ``identical`` or bucket C, except a bucket C entry
+        carrying a narrow ``sink_callee_swap`` (basis ``sink_callee_swap_never_sunk``); 1 = the
+        rest, lowest similarity first, R and B entries ordered together — the entries carrying a
+        narrow ``sink_callee_swap`` first inside it (``rank_key.sink_callee_swap`` = 1; their
+        basis stays their own), then the read-first ``anchored_differs`` pairs. Attention 0 holds
+        B entries too (a row's ``sink_arg_constant_delta``) beside A. Never sunk: an R entry
+        (attention 2 never holds one; one whose proposed reading is ``identical_unique`` closes
+        attention 1), a ``sink_present_no_visible_delta`` B (labelled
+        ``recheckable_no_visible_delta``), an ``identical_text_unverified`` entry outside bucket
+        C, a bucket C entry with a narrow ``sink_callee_swap``, and an entry judged changed_real,
         inconclusive or due a re-check / relabel — none of them reaches attention 2, whether
         ``band`` is on or off; only with ``band=true`` does the judgement band order entries
         inside each tier. A bucket C entry sinks even when its text match is unverified;
@@ -1784,7 +1788,18 @@ def make_tools(
         ``callee_set``: the two extracted callee lists compared (``equal`` / ``differs`` with
         ``only_in_a`` / ``only_in_b`` / ``undetermined`` with the reason). A differing list is NOT
         proof a call was made or dropped — tmap's decompile can miss a call — and it never moves
-        an entry.
+        an entry. When some callees cannot be identified the set is ``undetermined``
+        (``callee_identity_unresolved``) and ``named_callees_differ`` gives the part that can be
+        told: the callees identified on each side — names, and ``FUN_<addr>`` names through their
+        aligned pair — so it is a partial difference, not only the named one. ``sink_callee_swap``
+        (on any entry of a pair, in every sort) names a sink in that difference — the aligned
+        pair's, or for an undetermined pair the one its proposed reading compares (``pairing``
+        ``aligned`` / ``proposed``; a proposed pairing may hold the wrong function): the sinks on
+        each side, how many names differ per side, ``callees_complete`` (false = only the
+        identified part), and ``narrow`` (read in full and at most two names on either side;
+        ``not_narrow`` says why not). Only the hunt's sink names count, and the field is absent
+        whenever no sink is in the difference OR no difference could be read — absent is not "no
+        sink changed". It moves an entry only under ``sort_by='significance'``.
 
         Two signals BinDiff similarity is blind to, on the function-pair view: each aligned entry
         carries ``pseudocode_sameness`` — ``identical`` (address-normalised pseudocode AND callees

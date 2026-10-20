@@ -4009,3 +4009,494 @@ def test_the_mcp_tool_pages_one_entrys_rows(
     (e,) = out["entries"]
     assert [_win_index(v) for v in e["rows"]] == _grouped(_SIZED)[20:]
     assert f"at most {pv.ROWS_INLINE_LIMIT} of its candidate" in (tool.__doc__ or "")
+
+
+# ── a sink name in the callee-set difference (sink_callee_swap) ──────────────────────────────
+
+_SWAP_IDS = {
+    "c_narrow": ("00101000", "00102000"),
+    "c_wide": ("00103000", "00104000"),
+    "c_delete": ("00105000", "00106000"),
+    "c_add": ("00107000", "00108000"),
+    "c_nonsink": ("00109000", "0010a000"),
+    "c_tosink": ("0010b000", "0010c000"),
+    "c_partial": ("0010d000", "0010e000"),
+    "c_trunc": ("0010f000", "00110000"),
+    "c_noinv": ("00111000", "00112000"),
+    "c_pairkey": ("00113000", "00114000"),
+    "c_samekeys": ("00115000", "00116000"),
+    "c_equal": ("00117000", "00118000"),
+    "c_micro": ("00119000", "0011a000"),
+    "r_proposed": ("0011b000", "0011c000"),
+    "r_head_swap": ("0011d000", "0011d000"),
+    "r_head": ("0011e000", "0011e000"),
+    "r_plain": ("0011f000", "00120000"),
+    "a_swap": ("00121000", "00122000"),
+    "b_delta": ("00123000", "00124000"),
+    "b_novis": ("00125000", "00126000"),
+}
+_NOT_A_PAIR = "0009f000"  # a FUN_ callee with no aligned pair: cannot be identified
+
+
+def _swap_world(tmp_path: Path) -> tuple[World, dict[str, str]]:
+    """One entry per shape of callee-set difference the swap reads (the names in ``_SWAP_IDS``).
+    Every pair's bodies are its own text; the bucket C pairs have no candidate."""
+    w = World(tmp_path)
+    a, b = "runA", "runB"
+    ids = {k: _pair_id(*v) for k, v in _SWAP_IDS.items()}
+
+    def c_pair(key: str, ca: list[str], cb: list[str] | None, **kw_a: Any) -> None:
+        fa, fb = _SWAP_IDS[key]
+        n = int(fa, 16) // 0x1000
+        w.pair(fa, fb, 0.97, 0.6)
+        w.fn("a", fa, ca, pseudocode=f"x = f({n});", size_bytes=64, **kw_a)
+        if cb is not None:
+            w.fn("b", fb, cb, pseudocode=f"x = f({n}) + 1;", size_bytes=64)
+
+    c_pair("c_narrow", ["memcpy"], ["strcpy"])
+    c_pair("c_wide", ["strcpy", "log_a", "log_b"], [])
+    c_pair("c_delete", ["system", "foo"], ["foo"])
+    c_pair("c_add", ["foo"], ["foo", "popen"])
+    c_pair("c_nonsink", ["strlcpy"], ["strdup"])
+    c_pair("c_tosink", ["strlcpy"], ["strcpy"])
+    c_pair("c_partial", [f"FUN_{_NOT_A_PAIR}", "memcpy"], ["strcpy"])
+    c_pair("c_trunc", ["strcpy"], ["memcpy"], truncated=1)
+    c_pair("c_noinv", ["strcpy"], None)
+    # The named callees are equal on both sides; only an identified FUN_ (its aligned pair is
+    # 00127000/00128000) differs.
+    c_pair("c_pairkey", ["FUN_00127000", f"FUN_{_NOT_A_PAIR}", "foo"], ["foo"])
+    w.pair("00127000", "00128000", 0.97, 1.0)
+    c_pair("c_samekeys", [f"FUN_{_NOT_A_PAIR}", "foo"], ["foo"])
+    c_pair("c_equal", ["memset"], ["memset"])
+    # One side a design-skipped micro-stub (8 bytes, no text), the other a real body.
+    fa, fb = _SWAP_IDS["c_micro"]
+    w.pair(fa, fb, 0.97, 0.6)
+    w.fn("a", fa, ["memcpy"], pseudocode="x = memcpy(d,s,n);", size_bytes=200)
+    w.fn("b", fb, ["strcpy"], pseudocode=None, size_bytes=8)
+    # Undetermined pairs: one at two addresses (not anchored) whose callees swap a sink, one
+    # anchored at one address whose callees swap a sink, one anchored with no swap, one plain.
+    fa, fb = _SWAP_IDS["r_proposed"]
+    w.pair(fa, fb, 0.5, 0.5)
+    w.fn("a", fa, ["memcpy"], pseudocode="x = g(1);", size_bytes=16)
+    w.fn("b", fb, ["strcpy"], pseudocode="x = g(1) + 7;", size_bytes=16)
+    fa, fb = _SWAP_IDS["r_head_swap"]
+    w.pair(fa, fb, 0.5, 0.9)
+    w.fn("a", fa, ["memcpy"], pseudocode="x = g(2);", size_bytes=16)
+    w.fn("b", fb, ["strcpy"], pseudocode="x = g(2) + 7;", size_bytes=16)
+    _ud(w, *_SWAP_IDS["r_head"], 0.9)
+    _ud(w, *_SWAP_IDS["r_plain"], 0.3)
+    # A: the matched call now calls another callee; the callee lists swap one sink for another.
+    fa, fb = _SWAP_IDS["a_swap"]
+    w.pair(fa, fb, 0.97, 0.9)
+    w.inst("a", _ref(a, fa, "cmd", "0x10"), "cmd", "system")
+    w.inst("b", _ref(b, fb, "cmd", "0x10"), "cmd", "popen")
+    w.im(f"{int(fa, 16) + 0x10:08x}", f"{int(fb, 16) + 0x10:08x}", fa)
+    w.fn("a", fa, ["system"], pseudocode="system(c);")
+    w.fn("b", fb, ["popen"], pseudocode="popen(c);")
+    # B: a persisted copy whose length constant moved, and a sink one side adds.
+    fa, fb = _SWAP_IDS["b_delta"]
+    w.pair(fa, fb, 0.97, 1.0)
+    w.inst("a", _ref(a, fa, "copy", "0x10"), "copy", "snprintf", _size("cap_const", "0x200"))
+    w.inst("b", _ref(b, fb, "copy", "0x10"), "copy", "snprintf", _size("cap_const", "0x400"))
+    w.im(f"{int(fa, 16) + 0x10:08x}", f"{int(fb, 16) + 0x10:08x}", fa)
+    w.fn("a", fa, ["snprintf"], pseudocode="snprintf(d,0x200,f);")
+    w.fn("b", fb, ["snprintf", "strcpy"], pseudocode="snprintf(d,0x400,f); strcpy(d,s);")
+    # B: a changed pair whose candidate lines up, and a sink one side adds.
+    fa, fb = _SWAP_IDS["b_novis"]
+    w.pair(fa, fb, 0.97, 0.7)
+    w.inst("a", _ref(a, fa, "cmd", "0x10"), "cmd", "system")
+    w.inst("b", _ref(b, fb, "cmd", "0x10"), "cmd", "system")
+    w.im(f"{int(fa, 16) + 0x10:08x}", f"{int(fb, 16) + 0x10:08x}", fa)
+    w.fn("a", fa, ["system"], pseudocode="system(c);")
+    w.fn("b", fb, ["system", "popen"], pseudocode="system(c); popen(c);")
+    w.commit()
+    return w, ids
+
+
+def _swap_view(w: World, **kw: Any) -> dict[str, Any]:
+    v = _view(w, **kw)
+    for eid in v["by_id"].values():
+        assert "error" not in eid
+    return v
+
+
+def _swap(v: dict[str, Any], ids: dict[str, str], key: str) -> dict[str, Any] | None:
+    assert ids[key] in v["by_id"], key
+    swap = v["by_id"][ids[key]].get("sink_callee_swap")
+    return dict(swap) if swap is not None else None
+
+
+def test_a_sink_swapped_in_an_aligned_pairs_callees_is_named(tmp_path: Path, current: None) -> None:
+    """★ The callee lists of an aligned pair differ by one copy sink each way: the field names both
+    sinks, on the aligned pairing, read in full, narrow.
+
+    MUTATION (verified RED, 1 failed): leave COPY out of SINK_CALLEE_NAMES -> no field -> RED."""
+    w, ids = _swap_world(tmp_path)
+    v = _swap_view(w)
+    assert _swap(v, ids, "c_narrow") == {
+        "pairing": "aligned",
+        "callees_complete": True,
+        "sinks_only_in_a": ["memcpy"],
+        "sinks_only_in_b": ["strcpy"],
+        "names_only_in_a": 1,
+        "names_only_in_b": 1,
+        "narrow": True,
+        "not_narrow": None,
+    }
+
+
+def test_an_undetermined_pair_reads_the_difference_its_proposed_reading_compares(
+    tmp_path: Path, current: None
+) -> None:
+    """An undetermined pair has no callee_set of its own; the swap reads the one its proposed
+    reading compares, and says so.
+
+    MUTATION (verified RED, 1 failed): read ``callee_set`` only -> no field -> RED."""
+    w, ids = _swap_world(tmp_path)
+    v = _swap_view(w)
+    assert v["by_id"][ids["r_proposed"]]["callee_set"] is None
+    swap = _swap(v, ids, "r_proposed")
+    assert swap is not None
+    assert (swap["pairing"], swap["narrow"]) == ("proposed", True)
+    assert v["by_id"][ids["r_proposed"]]["proposed_pair_reading"]["callee_set"]["state"] == (
+        "differs"
+    )
+
+
+def test_an_aligned_pair_in_bucket_r_reads_its_own_callee_set(
+    tmp_path: Path, current: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An aligned pair lands in R when one of its rows does: it is still an aligned pair, so its
+    own callee_set is read (pairing aligned), not a proposed one it does not have.
+
+    MUTATION (verified RED, 1 failed): pick the difference by bucket R instead of by alignment ->
+    no field -> RED."""
+    w = World(tmp_path)
+    w.pair("00001000", "00002000", 0.97, 0.8)
+    w.fn("a", "00001000", ["memcpy"])
+    w.fn("b", "00002000", ["strcpy"])
+    w.commit()
+    row = replace(_win_row("U", 0), presence_reason="callsite_not_exported", match_basis=None)
+
+    def rows_of(atlas: sqlite3.Connection, diff_id: str) -> so.SinkOverlayResult:
+        return so.SinkOverlayResult([row], so.SinkOverlayCoverage(0, 0, 0, 0, 0, False))
+
+    monkeypatch.setattr(pv, "compute_sink_overlay", rows_of)
+    e = _view(w)["by_id"][_pair_id("00001000", "00002000")]
+    assert (e["bucket"], e["alignment_state"]) == ("R", "aligned")
+    assert (e.get("sink_callee_swap") or {}).get("pairing") == "aligned"
+
+
+def test_a_sink_only_one_side_calls_is_narrow(tmp_path: Path, current: None) -> None:
+    """One side dropping a sink, or adding one, with nothing in its place is narrow too.
+
+    MUTATION (verified RED, 1 failed): require names on both sides for narrow -> RED."""
+    w, ids = _swap_world(tmp_path)
+    v = _swap_view(w)
+    gone, added = _swap(v, ids, "c_delete"), _swap(v, ids, "c_add")
+    assert gone is not None and added is not None
+    assert (gone["sinks_only_in_a"], gone["names_only_in_b"], gone["narrow"]) == (
+        ["system"],
+        0,
+        True,
+    )
+    assert (added["sinks_only_in_b"], added["names_only_in_a"], added["narrow"]) == (
+        ["popen"],
+        0,
+        True,
+    )
+
+
+def test_more_than_two_names_on_a_side_is_not_narrow_and_still_sinks(
+    tmp_path: Path, current: None
+) -> None:
+    """Three names on a side: the field stays, not narrow, and a bucket C entry still sinks.
+
+    MUTATION (verified RED, 1 failed): allow three names -> RED."""
+    w, ids = _swap_world(tmp_path)
+    swap = _swap(_swap_view(w), ids, "c_wide")
+    assert swap is not None
+    assert (swap["names_only_in_a"], swap["narrow"], swap["not_narrow"]) == (
+        3,
+        False,
+        "names_exceed_two",
+    )
+    e = _swap_view(w, sort_by="significance")["by_id"][ids["c_wide"]]
+    assert e["significance"] == {"attention": 2, "basis": "no_sink_candidate"}
+
+
+def test_a_difference_read_in_part_is_never_narrow(tmp_path: Path, current: None) -> None:
+    """With a callee that cannot be identified, only the identified part of the difference is read:
+    the swap says so (callees_complete false) and is not narrow; the set stays undetermined.
+
+    MUTATION (verified RED, 1 failed): treat the identified part as read in full -> RED."""
+    w, ids = _swap_world(tmp_path)
+    v = _swap_view(w)
+    cs = v["by_id"][ids["c_partial"]]["callee_set"]
+    assert (cs["state"], cs["reason"]) == ("undetermined", "callee_identity_unresolved")
+    swap = _swap(v, ids, "c_partial")
+    assert swap is not None
+    assert (swap["callees_complete"], swap["narrow"], swap["not_narrow"]) == (
+        False,
+        False,
+        "callee_identity_unresolved",
+    )
+    assert (swap["sinks_only_in_a"], swap["sinks_only_in_b"]) == (["memcpy"], ["strcpy"])
+
+
+def test_a_set_that_could_not_be_read_carries_no_swap(tmp_path: Path, current: None) -> None:
+    """A truncated list, or a function not in the inventory, gives no difference at all: no field
+    — which is not "no sink changed".
+
+    MUTATION (verified RED, 1 failed): give the truncated case its raw names as a partial
+    difference -> a field appears -> RED."""
+    w, ids = _swap_world(tmp_path)
+    v = _swap_view(w)
+    assert v["by_id"][ids["c_trunc"]]["callee_set"]["reason"] == "callees_truncated"
+    assert v["by_id"][ids["c_noinv"]]["callee_set"]["reason"] == "not_in_inventory"
+    assert _swap(v, ids, "c_trunc") is None
+    assert _swap(v, ids, "c_noinv") is None
+
+
+def test_the_identified_difference_includes_fun_names_through_their_pair(
+    tmp_path: Path, current: None
+) -> None:
+    """★ Partly undetermined sets now give every identified callee that differs: a FUN_<addr>
+    identified through its aligned pair counts, as the differs reading counts it. Here the named
+    callees are equal on both sides and only that FUN_ differs — a named-only comparison sees no
+    difference. Where the identified callees are equal there is none. A FUN_ name is never a sink.
+
+    MUTATION (verified RED, 1 failed): compare the named callees only -> RED."""
+    w, ids = _swap_world(tmp_path)
+    v = _swap_view(w)
+    pk = v["by_id"][ids["c_pairkey"]]["callee_set"]
+    assert pk["state"] == "undetermined"
+    assert pk.get("named_callees_differ") == {"only_in_a": ["FUN_00127000"], "only_in_b": []}
+    assert _swap(v, ids, "c_pairkey") is None
+    same = v["by_id"][ids["c_samekeys"]]["callee_set"]
+    assert same["state"] == "undetermined" and "named_callees_differ" not in same
+
+
+def test_the_wider_identified_difference_moves_no_judgement_basis(
+    tmp_path: Path, current: None
+) -> None:
+    """★ The identified difference is a read-face field. The basis a judgement rests on, the bucket
+    and the state of the set are what they were; an equal set still says callee_set_unchanged.
+
+    MUTATION (verified RED, 1 failed each): fold the callee_set into entry_facts -> RED; let the
+    identified difference decide the state (undetermined -> differs) -> RED."""
+    w, ids = _swap_world(tmp_path)
+    built = pv.build_diff_view(w.atlas, DIFF)
+    assert built is not None
+    by_id = {e.entry_id: e for e in built.entries}
+    assert ids["c_pairkey"] in by_id
+    e = by_id[ids["c_pairkey"]]
+    assert pv.diff_review.entry_facts(e) == {
+        "alignment_state": "aligned",
+        "similarity": 0.6,
+        "export_gap_a": None,
+        "export_gap_b": None,
+        "bucket": "C",
+        "rows": [],
+    }
+    assert (e.bucket, e.subclass) == ("C", "no_sink_candidate")
+    assert e.callee_set is not None and e.callee_set["state"] == "undetermined"
+    assert "callee_set_unchanged" in by_id[ids["c_equal"]].facts
+
+
+def test_only_the_hunts_sink_names_count(tmp_path: Path, current: None) -> None:
+    """strlcpy -> strdup changes no sink the hunt names; strlcpy -> strcpy does.
+
+    MUTATION (verified RED, 1 failed): add strlcpy to SINK_CALLEE_NAMES -> RED."""
+    w, ids = _swap_world(tmp_path)
+    v = _swap_view(w)
+    assert _swap(v, ids, "c_nonsink") is None
+    swap = _swap(v, ids, "c_tosink")
+    assert swap is not None
+    assert (swap["sinks_only_in_a"], swap["sinks_only_in_b"]) == ([], ["strcpy"])
+
+
+def test_a_bucket_c_entry_with_a_narrow_swap_is_not_sunk(tmp_path: Path, current: None) -> None:
+    """★ Under the lens a bucket C entry with a narrow swap stays at attention 1, basis
+    sink_callee_swap_never_sunk; a wide one still sinks.
+
+    MUTATION (verified RED, 1 failed each): hold every swap, narrow or not -> RED; drop the swap
+    branch -> RED."""
+    w, ids = _swap_world(tmp_path)
+    v = _swap_view(w, sort_by="significance")
+    assert v["by_id"][ids["c_narrow"]]["significance"] == {
+        "attention": 1,
+        "basis": "sink_callee_swap_never_sunk",
+    }
+    assert v["by_id"][ids["c_wide"]]["significance"]["attention"] == 2
+
+
+def test_an_earlier_basis_of_a_bucket_c_entry_is_kept(tmp_path: Path, current: None) -> None:
+    """A bucket C entry whose one side is a design-skipped micro-stub keeps that basis, though its
+    callees swap a sink (the swap still orders it).
+
+    MUTATION (verified RED, 1 failed): test the swap before the micro-stub branch -> RED."""
+    w, ids = _swap_world(tmp_path)
+    e = _swap_view(w, sort_by="significance")["by_id"][ids["c_micro"]]
+    assert "one_side_skipped_micro" in e["facts"]
+    assert e["bucket"] == "C"
+    assert e["significance"] == {"attention": 1, "basis": "one_side_skipped_micro"}
+    assert e["rank_key"]["sink_callee_swap"] == 1
+
+
+def _judge_entry(w: World, entry: dict[str, Any], verdict: str) -> None:
+    w.judge(DIFF, entry["anchor_ref"], verdict)
+    w.commit()
+
+
+def test_a_held_up_judgement_keeps_its_basis_over_the_swap(tmp_path: Path, current: None) -> None:
+    """★ A bucket C entry with a narrow swap and a changed_real judgement reads judged_never_sunk:
+    the swap never replaces a judgement's basis.
+
+    MUTATION (verified RED, 1 failed): test the swap before the held-up judgement -> RED."""
+    w, ids = _swap_world(tmp_path)
+    e = _swap_view(w, sort_by="significance")["by_id"][ids["c_narrow"]]
+    _judge_entry(w, e, "changed_real")
+    e = _swap_view(w, sort_by="significance")["by_id"][ids["c_narrow"]]
+    assert e["review_state"] == "concluded"
+    assert e["significance"] == {"attention": 1, "basis": "judged_never_sunk"}
+
+
+def test_a_judgement_moves_no_entry_inside_its_tier(tmp_path: Path, current: None) -> None:
+    """★ Judgements move nothing unless band is on: the bucket C entry with a narrow swap keeps its
+    place when a held-up judgement changes its basis, and an entry whose basis is a micro-stub is
+    lifted like any other.
+
+    MUTATION (verified RED, 1 failed): leave the judged_never_sunk / one_side_skipped_micro bases
+    out of the lift -> the judged entry drops behind the read-first pairs -> RED."""
+    w, ids = _swap_world(tmp_path)
+    before = _swap_view(w, sort_by="significance")
+    order_before = [e["entry_id"] for e in before["entries"]]
+    e = before["by_id"][ids["c_narrow"]]
+    assert e["rank_key"]["sink_callee_swap"] == 1
+    _judge_entry(w, e, "changed_real")
+    after = _swap_view(w, sort_by="significance")
+    judged = after["by_id"][ids["c_narrow"]]
+    assert judged["significance"]["basis"] == "judged_never_sunk"
+    assert judged["rank_key"]["sink_callee_swap"] == 1
+    assert [x["entry_id"] for x in after["entries"]] == order_before
+    assert after["by_id"][ids["c_micro"]]["rank_key"]["sink_callee_swap"] == 1
+
+
+def test_a_narrow_swap_leads_attention_one_ahead_of_the_read_first_pairs(
+    tmp_path: Path, current: None
+) -> None:
+    """★ Inside attention 1: the entries with a narrow swap, then the read-first anchored_differs
+    pairs, then the rest.
+
+    MUTATION (verified RED, 1 failed): order by read_first before the swap -> RED."""
+    w, ids = _swap_world(tmp_path)
+    v = _swap_view(w, sort_by="significance")
+    tier = [e for e in v["entries"] if e["significance"]["attention"] == 1]
+    lifted = [e["rank_key"]["sink_callee_swap"] for e in tier]
+    assert lifted == sorted(lifted, reverse=True) and 1 in lifted and 0 in lifted
+    pos = {e["entry_id"]: i for i, e in enumerate(tier)}
+    assert pos[ids["r_proposed"]] < pos[ids["r_head"]] < pos[ids["r_plain"]]
+
+
+def test_a_read_first_pair_with_a_swap_stays_read_first(
+    tmp_path: Path, current: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read-first anchored_differs pair whose callees swap a sink is still read first, and the
+    read-first counts are those of the same world with no swap read at all.
+
+    MUTATION (verified RED, 1 failed): fold the swap into _read_first_order (order 3) -> RED."""
+    w, ids = _swap_world(tmp_path)
+    v = _swap_view(w, sort_by="significance")
+    reading = _reading(v, ids["r_head_swap"])
+    assert (reading.get("anchored_differs"), reading.get("in_read_first")) == (True, True)
+    assert v["by_id"][ids["r_head_swap"]]["rank_key"]["sink_callee_swap"] == 1
+    states = pv.function_states(w.atlas, DIFF)
+    pv._clear_view_caches()
+    monkeypatch.setattr(pv, "_sink_callee_swap", lambda e: None)
+    assert pv.function_states(w.atlas, DIFF) == states
+    assert _reading(_swap_view(w, sort_by="significance"), ids["r_head_swap"]) == reading
+
+
+def test_attention_zero_is_not_reordered_by_a_swap(tmp_path: Path, current: None) -> None:
+    """A bucket A entry with a narrow swap stays at attention 0 with its own basis, unlifted.
+
+    MUTATION (verified RED, 1 failed): lift every narrow swap whatever its attention -> RED."""
+    w, ids = _swap_world(tmp_path)
+    v = _swap_view(w, sort_by="significance")
+    e = v["by_id"][ids["a_swap"]]
+    assert (e.get("sink_callee_swap") or {}).get("narrow") is True
+    assert e["significance"] == {"attention": 0, "basis": "matched_call_other_callee"}
+    assert e["rank_key"]["sink_callee_swap"] == 0
+
+
+def test_a_swap_never_replaces_a_b_entrys_basis(tmp_path: Path, current: None) -> None:
+    """A B entry keeps its basis: a changed length constant stays at attention 0, a pair whose
+    candidates line up stays recheckable_no_visible_delta — lifted inside attention 1.
+
+    MUTATION (verified RED, 1 failed): let a narrow swap decide the basis ahead of the others ->
+    RED."""
+    w, ids = _swap_world(tmp_path)
+    v = _swap_view(w, sort_by="significance")
+    delta, novis = v["by_id"][ids["b_delta"]], v["by_id"][ids["b_novis"]]
+    assert (delta.get("sink_callee_swap") or {}).get("narrow") is True
+    assert (novis.get("sink_callee_swap") or {}).get("narrow") is True
+    assert delta["significance"] == {"attention": 0, "basis": "sink_arg_constant_delta"}
+    assert novis["significance"] == {"attention": 1, "basis": "recheckable_no_visible_delta"}
+    assert novis["rank_key"]["sink_callee_swap"] == 1
+
+
+@pytest.mark.parametrize("sort_by", [None, "tier", "similarity", "address", "significance"])
+def test_the_field_is_on_every_sort_and_moves_only_the_lens(
+    tmp_path: Path, current: None, monkeypatch: pytest.MonkeyPatch, sort_by: str | None
+) -> None:
+    """The field is there in every sort; outside the lens the order is the one with no swap read.
+
+    MUTATION (verified RED, 4 failed): lift narrow swaps in every sort -> RED; emit the field only
+    under the lens -> RED."""
+    w, ids = _swap_world(tmp_path)
+    v = _swap_view(w, sort_by=sort_by)
+    assert _swap(v, ids, "c_narrow") is not None
+    if sort_by == "significance":
+        return
+    order = [e["entry_id"] for e in v["entries"]]
+    monkeypatch.setattr(pv, "_sink_callee_swap", lambda e: None)
+    assert [e["entry_id"] for e in _swap_view(w, sort_by=sort_by)["entries"]] == order
+
+
+def test_a_swap_is_not_in_what_a_judgement_rests_on(tmp_path: Path, current: None) -> None:
+    """A judged entry with a swap reads its judgement as it was written, and what it rests on is
+    what an entry of the same shape with no swap rests on.
+
+    MUTATION (verified RED, 1 failed): add the swap to entry_facts -> RED."""
+    w, ids = _swap_world(tmp_path)
+    built = pv.build_diff_view(w.atlas, DIFF)
+    assert built is not None
+    by_id = {e.entry_id: e for e in built.entries}
+    hit, plain = by_id[ids["c_narrow"]], by_id[ids["c_equal"]]
+    assert pv.diff_review.entry_facts(hit) == pv.diff_review.entry_facts(plain)
+    e = _swap_view(w)["by_id"][ids["c_narrow"]]
+    _judge_entry(w, e, "change_inconclusive")
+    assert _swap_view(w)["by_id"][ids["c_narrow"]]["review_state"] == "inconclusive"
+
+
+def test_the_sink_names_are_the_sink_classes_and_the_unrecalled_sinks() -> None:
+    """MUTATION (verified RED, 1 failed): union the RECALL_GAP_SINKS dict itself (its family keys)
+    instead of its names -> RED."""
+    from treasure_map.lib.pattern import classes as cl
+
+    want = (cl.FORMAT | cl.CMD | cl.COPY | cl.FMT_STRING | cl.PATH_SINK).union(
+        *pv.RECALL_GAP_SINKS.values()
+    )
+    assert want == pv.SINK_CALLEE_NAMES
+    assert not {"strlcpy", "strlcat", "strdup"} & pv.SINK_CALLEE_NAMES
+    assert {"wcscpy", "wcscat", "vswprintf", "_eval", "execvpe"} <= pv.SINK_CALLEE_NAMES
+    assert not set(pv.RECALL_GAP_SINKS) & pv.SINK_CALLEE_NAMES
+
+
+def test_the_lens_and_the_tool_name_the_swap() -> None:
+    assert "sink_callee_swap_never_sunk" in pv._SIGNIFICANCE_LENS
+    assert "sink_callee_swap" in pv._CAVEATS
+    tool = mcp_app.make_tools(Path("unused.db"))["get_diff_patch_view"]
+    assert "sink_callee_swap" in (tool.__doc__ or "")
+    assert "named_callees_differ" in (tool.__doc__ or "")

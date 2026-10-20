@@ -82,6 +82,7 @@ from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Generic, TypeVar
 
 from treasure_map.lib.diff.layer0 import norm_hex
+from treasure_map.lib.pattern import classes
 from treasure_map.lib.query import diff_review, sameness
 from treasure_map.lib.query.coverage import CONCLUDED, NEEDS_RECHECK, NEEDS_RELABEL, OPEN
 from treasure_map.lib.query.diff_align import diff_source_staleness, get_diff_deltas
@@ -121,6 +122,15 @@ RECALL_GAP_SINKS: dict[str, tuple[str, ...]] = {
     "argv_runner": ("_eval",),
     "exec_path_variant": ("execvpe",),
 }
+# The sink names a callee-set difference is read against (``sink_callee_swap``): the hunt's sink
+# classes, as the extractor registry holds them, plus the sinks it does not recall. Matched by
+# exact name; any other name (strlcpy, strdup, a FUN_<addr>) is not a sink here.
+SINK_CALLEE_NAMES: frozenset[str] = (
+    classes.FORMAT | classes.CMD | classes.COPY | classes.FMT_STRING | classes.PATH_SINK
+).union(*RECALL_GAP_SINKS.values())
+# A sink_callee_swap is narrow when both lists were read in full and neither side differs by more
+# than this many names.
+_SWAP_NARROW_NAMES = 2
 # Callee-name prefixes of an input source the hunt does not model. Only tagged on A / B entries
 # (``source_gap:<family>``); never moves an entry.
 SOURCE_GAP_PREFIXES: dict[str, tuple[str, ...]] = {"uci_ubus": ("uci_", "ubus_")}
@@ -194,6 +204,13 @@ _CAVEATS = {
     "callee_set_differs": (
         "The extracted callee lists differ. tmap's decompile can miss a call, so this is not proof "
         "a call was added or removed."
+    ),
+    "sink_callee_swap": (
+        "A sink name is in the callee-set difference of the two functions. tmap's decompile can "
+        "miss a call, so this is not proof a call was added, removed or replaced. Only the hunt's "
+        "sink names (and the sinks it does not recall) count; any other name does not. With "
+        "pairing='proposed' the difference is read on an undetermined pairing, whose other side "
+        "may be the wrong function."
     ),
     "sink_name_in_paired_callees": (
         "false = the paired function's extracted callee list does not hold this name. It is read "
@@ -1141,12 +1158,13 @@ class _Builder:
                 "unresolved_a": sorted(ua),
                 "unresolved_b": sorted(ub),
             }
-            named_a = {n for k, n in ia.items() if k[0] == "name"}
-            named_b = {n for k, n in ib.items() if k[0] == "name"}
-            if named_a != named_b:
+            # The part of the difference that CAN be told: every callee identified on its side — a
+            # name, or a FUN_<addr> through its aligned pair — printed as that side prints it. The
+            # state stays undetermined: the unresolved names may hide more.
+            if ia.keys() != ib.keys():
                 out["named_callees_differ"] = {
-                    "only_in_a": sorted(named_a - named_b),
-                    "only_in_b": sorted(named_b - named_a),
+                    "only_in_a": sorted(ia[k] for k in ia.keys() - ib.keys()),
+                    "only_in_b": sorted(ib[k] for k in ib.keys() - ia.keys()),
                 }
             return out
         # Both callee lists were read in full here (unreadable / truncated / not_recorded all
@@ -1471,6 +1489,49 @@ def _read_first_order(e: _Entry, u_state: str | None) -> int:
     return 0
 
 
+def _sink_callee_swap(e: _Entry) -> dict[str, Any] | None:
+    """A sink name in the pair's callee-set difference, or None.
+
+    The difference is the aligned pair's ``callee_set`` (``pairing`` aligned), or for an
+    undetermined pair the one its proposed reading compares (``pairing`` proposed); a function with
+    no counterpart has none. A ``differs`` set gives the whole difference (``callees_complete``); an
+    undetermined set gives only its identified part (``named_callees_differ``), and any other
+    undetermined set none at all — so an absent field never means "no sink changed". ``narrow``:
+    both lists read in full, and neither side differs by more than two names (FUN_ names
+    counted)."""
+    p = e.pair
+    if p is None:
+        return None
+    cs = (e.callee_set if p.aligned else e.proposed_callee_set) or {}
+    if cs.get("state") == "differs":
+        only_a, only_b, complete = cs["only_in_a"], cs["only_in_b"], True
+    elif cs.get("state") == "undetermined" and "named_callees_differ" in cs:
+        named = cs["named_callees_differ"]
+        only_a, only_b, complete = named["only_in_a"], named["only_in_b"], False
+    else:
+        return None
+    sinks_a = sorted(set(only_a) & SINK_CALLEE_NAMES)
+    sinks_b = sorted(set(only_b) & SINK_CALLEE_NAMES)
+    if not sinks_a and not sinks_b:
+        return None
+    small = len(only_a) <= _SWAP_NARROW_NAMES and len(only_b) <= _SWAP_NARROW_NAMES
+    narrow = complete and small
+    return {
+        "pairing": "aligned" if p.aligned else "proposed",
+        "callees_complete": complete,
+        "sinks_only_in_a": sinks_a,
+        "sinks_only_in_b": sinks_b,
+        "names_only_in_a": len(only_a),
+        "names_only_in_b": len(only_b),
+        "narrow": narrow,
+        "not_narrow": (
+            None
+            if narrow
+            else ("callee_identity_unresolved" if not complete else "names_exceed_two")
+        ),
+    }
+
+
 def _held_up(item: diff_review.Item | None) -> bool:
     """A judgement that must keep its entry off the bottom tier: judged changed_real, due a
     re-check or a relabel, or left inconclusive. A lens never buries what an agent marked."""
@@ -1501,7 +1562,10 @@ def significance(
       * pseudocode ``identical``, a proposed ``identical_unique``, or bucket C -> 2 — unless the
         entry is R (an undetermined pair is never buried under the pairs that were read) or its
         judgement is held up (changed_real, needs_recheck / needs_relabel, inconclusive), which
-        stops it at 1;
+        stops it at 1; or, after both, a bucket C entry carrying a narrow
+        :func:`_sink_callee_swap` -> 1, labelled ``sink_callee_swap_never_sunk`` (the only basis
+        the swap ever takes: elsewhere it is a field, and orders entries inside attention 1
+        through ``_sort``);
       * an undetermined pair flagged :func:`_anchored_micro_side` (micro-stub vs real body) -> 1,
         labelled ``anchored_micro_side``, BEFORE anchored_differs so a pair that is both reads as
         the micro side;
@@ -1526,6 +1590,10 @@ def significance(
             return ATTENTION_MIDDLE, "undetermined_never_sunk"
         if _held_up(item):
             return ATTENTION_MIDDLE, "judged_never_sunk"
+        # After R and a held-up judgement, so neither basis is ever replaced by the swap: only a
+        # bucket C entry that would otherwise sink is held at 1 by it.
+        if e.bucket == "C" and (swap := _sink_callee_swap(e)) is not None and swap["narrow"]:
+            return ATTENTION_MIDDLE, "sink_callee_swap_never_sunk"
         return ATTENTION_SINK, basis
     if e.bucket == "P":
         return ATTENTION_MIDDLE, "no_counterpart"
@@ -1544,15 +1612,18 @@ def _sort(
     attention: dict[str, int] | None = None,
     settled: dict[str, int] | None = None,
     read_first: dict[str, int] | None = None,
+    swap_lift: dict[str, int] | None = None,
 ) -> list[_Entry]:
     """The default order, or ``sort_by`` (one named component) ahead of it. P stays last either
     way: a function with no counterpart is not ordered among the pairs. ``band`` maps an entry id
     to its judgement band (diff_review.band_bias); None leaves the order as it is.
 
-    ``sort_by="significance"`` orders by ``(attention, read_first, band, settled, similarity,
-    default key)`` — ``attention`` from :func:`significance`; ``read_first``
-    (:func:`_read_first_order`, highest first) so that inside a tier the anchored_differs pairs at
-    or above the floor come first, then those below it, then the rest; the band only when it is on
+    ``sort_by="significance"`` orders by ``(attention, swap_lift, read_first, band, settled,
+    similarity, default key)`` — ``attention`` from :func:`significance`; ``swap_lift`` (1 for an
+    attention-1 entry carrying a narrow :func:`_sink_callee_swap`, whatever its basis or
+    judgement) first inside the tier; ``read_first`` (:func:`_read_first_order`, highest first) so
+    that next the anchored_differs pairs at or above the floor come, then those below it, then the
+    rest; the band only when it is on
     (judgements move nothing unless asked); ``settled`` (1 for an R entry whose proposed reading
     is ``identical_unique``, so it closes its tier, still ahead of every sunk entry); similarity
     lowest first; then the default order."""
@@ -1564,6 +1635,7 @@ def _sort(
             return (
                 p_last,
                 (attention or {}).get(e.entry_id, ATTENTION_MIDDLE),
+                -(swap_lift or {}).get(e.entry_id, 0),
                 -(read_first or {}).get(e.entry_id, 0),
                 band.get(e.entry_id, 0) if band else 0,
                 (settled or {}).get(e.entry_id, 0),
@@ -1652,10 +1724,12 @@ def _entry_json(e: _Entry) -> dict[str, Any]:
         {f"a:{f}" for v in e.row_views for f in v["coclaimed_by"] or ()}
         | {f"b:{f}" for v in e.row_views for f in v["coclaimed_by_b"] or ()}
     )
+    swap = _sink_callee_swap(e)
     out.update(
         {
             "coclaimed_by": coclaimed or None,
             "callee_set": e.callee_set,
+            **({"sink_callee_swap": swap} if swap is not None else {}),
             "facts": sorted(set(e.facts)),
             "blind_spots": e.blind_spots,
             "string_edges": e.string_edges,
@@ -2429,10 +2503,15 @@ def _not_listed_page(
 _SIGNIFICANCE_LENS = (
     "sort_by='significance' reorders the listed entries, never relabels them: attention 0 = bucket "
     "A or a row carrying sink_arg_constant_delta; 2 = pseudocode_sameness identical, or bucket C "
-    "(sunk, still listed and pageable); 1 = the rest, lowest similarity first, R and B entries "
-    "ordered together — except that an undetermined pair flagged anchored_differs (no export gap, "
-    "the same address or the same real symbol name on both sides, proposed reading differs) comes "
-    f"first inside attention 1: those at or above similarity {ANCHORED_DIFFERS_SIM_FLOOR} first, "
+    "(sunk, still listed and pageable) — except that a bucket C entry carrying a narrow "
+    "sink_callee_swap stays at 1, basis sink_callee_swap_never_sunk (a wide one still sinks); 1 = "
+    "the rest, lowest similarity first, R and B entries ordered together — except that, first "
+    "inside attention 1, come the entries carrying a narrow sink_callee_swap (a sink name in a "
+    "callee-set difference read in full, at most two names on either side; rank_key."
+    "sink_callee_swap = 1), whatever their basis, which the swap does not replace (bucket C "
+    "aside); then an undetermined pair flagged anchored_differs (no export gap, "
+    "the same address or the same real symbol name on both sides, proposed reading differs): "
+    f"those at or above similarity {ANCHORED_DIFFERS_SIM_FLOOR} first, "
     "then those below it, basis anchored_differs — except that a flagged pair whose text changed "
     "only by a __FILE__/__LINE__ line-number shift AND whose callee sets and body sizes are both "
     "proven equal is demoted out of that read-first head (demoted true; still flagged, "
@@ -2453,7 +2532,8 @@ _SIGNIFICANCE_LENS = (
     "Attention 0 holds B entries too (a row's sink_arg_constant_delta) beside "
     "A. Never sunk: an R entry (attention 2 never holds one; one whose proposed_pair_reading is "
     "identical_unique closes attention 1 instead), a B sink_present_no_visible_delta (labelled "
-    "recheckable_no_visible_delta), an identical_text_unverified entry outside bucket C, and an "
+    "recheckable_no_visible_delta), an identical_text_unverified entry outside bucket C, a bucket "
+    "C entry with a narrow sink_callee_swap, and an "
     "entry judged changed_real, inconclusive or due a re-check / relabel — none of them reaches "
     "attention 2, whether band is on or off. A bucket C entry is sunk even when its text match is "
     "identical_text_unverified; sunk_with_body_size_differs counts the sunk ones whose two body "
@@ -3006,6 +3086,7 @@ def get_diff_patch_view(
     proposed = {e.entry_id: r for e in chosen if (r := _proposed_of(e, readings)) is not None}
     lens: dict[str, tuple[int, str]] = {}
     settled: dict[str, int] = {}
+    swap_lift: dict[str, int] = {}
     if sort_by == "significance":
         lens = {
             e.entry_id: significance(
@@ -3018,6 +3099,16 @@ def get_diff_patch_view(
         }
         settled = {
             k: 1 for k, (state, _read) in proposed.items() if state == sameness.U_IDENTICAL_UNIQUE
+        }
+        # After the attention is known (a bucket C entry reaches 1 through its swap). Every
+        # attention-1 entry with a narrow swap leads its tier, whatever its basis — a judgement
+        # changes the basis it reads, never its place.
+        swap_lift = {
+            e.entry_id: 1
+            for e in chosen
+            if lens[e.entry_id][0] == ATTENTION_MIDDLE
+            and (swap := _sink_callee_swap(e)) is not None
+            and swap["narrow"]
         }
         envelope["lens"]["significance"] = _SIGNIFICANCE_LENS
         envelope["lens"]["sunk_with_body_size_differs"] = {
@@ -3038,7 +3129,13 @@ def get_diff_patch_view(
         ordered = _anchored_order(chosen, read_first, bands)
     else:
         ordered = _sort(
-            chosen, sort_by, bands, {k: v[0] for k, v in lens.items()}, settled, read_first
+            chosen,
+            sort_by,
+            bands,
+            {k: v[0] for k, v in lens.items()},
+            settled,
+            read_first,
+            swap_lift,
         )
     end = offset + limit
     page = ordered[offset:end]
@@ -3075,7 +3172,11 @@ def get_diff_patch_view(
             )
         if e.entry_id in lens:
             attention, basis = lens[e.entry_id]
-            out["rank_key"] = {**out["rank_key"], "attention": attention}
+            out["rank_key"] = {
+                **out["rank_key"],
+                "attention": attention,
+                "sink_callee_swap": swap_lift.get(e.entry_id, 0),
+            }
             out["significance"] = {"attention": attention, "basis": basis}
         return out
 
