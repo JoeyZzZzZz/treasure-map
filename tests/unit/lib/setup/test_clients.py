@@ -446,6 +446,96 @@ def test_a_symlinked_config_stays_a_link(tmp_path: Path, tmap: Path) -> None:
     assert json.loads(real.read_text())["mcpServers"]["treasure-map"]["command"] == str(tmap)
 
 
+def test_uninstall_removes_a_config_file_tmap_created(tmp_path: Path, tmap: Path) -> None:
+    """A config tmap created (none was there) and that holds nothing else once its entry is out is
+    removed, not left as an empty ``mcpServers`` shell; no backup is left either.
+
+    MUTATION: never remove the emptied file -> ``{"mcpServers": {}}`` stays -> RED."""
+    home = tmp_path / "h"
+    cfg = home / ".cursor" / "mcp.json"
+    assert cl.register("cursor", _host(home), tmap).ok
+    assert cfg.is_file()
+    outs = cl.unregister("cursor", _host(home), tmap)
+    assert all(o.ok for o in outs) and "it held only tmap's entry" in outs[0].message
+    assert not cfg.exists()
+    assert not cfg.with_name("mcp.json.tmap.backup").exists()
+
+
+def test_uninstall_puts_the_user_s_file_back_byte_for_byte(tmp_path: Path, tmap: Path) -> None:
+    """A config the user had: once tmap's entry is out, the file differs from tmap's backup by
+    nothing, so its exact original bytes (formatting included) are put back and the backup goes.
+
+    MUTATION: skip putting the bytes back -> the file keeps tmap's formatting and an empty
+    ``mcpServers`` -> RED; keep the backup -> RED."""
+    home = tmp_path / "h"
+    cfg = home / ".cursor" / "mcp.json"
+    cfg.parent.mkdir(parents=True)
+    raw = b'{"theme":"dark",\n   "n": 1}'
+    cfg.write_bytes(raw)
+    assert cl.register("cursor", _host(home), tmap).ok
+    assert cfg.read_bytes() != raw
+    outs = cl.unregister("cursor", _host(home), tmap)
+    assert all(o.ok for o in outs), outs
+    assert cfg.read_bytes() == raw
+    assert not cfg.with_name("mcp.json.tmap.backup").exists()
+
+
+def test_uninstall_keeps_a_backup_the_user_s_later_edits_differ_from(
+    tmp_path: Path, tmap: Path
+) -> None:
+    """A config the user changed after tmap wrote it: the backup no longer stands for the file, so
+    the file keeps the user's edits and the backup is kept (and said so).
+
+    MUTATION: put the backup back without comparing -> the user's later edit is lost -> RED."""
+    home = tmp_path / "h"
+    cfg = home / ".cursor" / "mcp.json"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(json.dumps({"theme": "dark"}))
+    assert cl.register("cursor", _host(home), tmap).ok
+    data = json.loads(cfg.read_text())
+    data["theme"] = "light"  # the user's own edit, made after tmap's write
+    cfg.write_text(json.dumps(data))
+    outs = cl.unregister("cursor", _host(home), tmap)
+    assert all(o.ok for o in outs) and "kept" in outs[0].message
+    assert json.loads(cfg.read_text()) == {"theme": "light", "mcpServers": {}}
+    assert cfg.with_name("mcp.json.tmap.backup").is_file()
+
+
+def test_a_backup_of_tmap_s_own_earlier_write_is_not_put_back(tmp_path: Path, tmap: Path) -> None:
+    """The first write to an EXISTING file is backed up — and on a re-init that file can be tmap's
+    own earlier write. Such a backup holds a tmap entry, so it is no original: it is removed, never
+    put back, and the file tmap created goes too.
+
+    MUTATION: treat every matching backup as the user's original -> tmap's old entry is written
+    back on uninstall -> RED."""
+    home = tmp_path / "h"
+    cfg = home / ".cursor" / "mcp.json"
+    old = fakes._exe(tmp_path / "old" / "bin" / "tmap")
+    assert cl.register("cursor", _host(home), old).ok  # tmap creates the file (no backup)
+    assert cl.register("cursor", _host(home), tmap).ok  # stale -> rewritten: backup of tmap's own
+    backup = cfg.with_name("mcp.json.tmap.backup")
+    assert json.loads(backup.read_text())["mcpServers"]["treasure-map"]["command"] == str(old)
+    assert all(o.ok for o in cl.unregister("cursor", _host(home), tmap))
+    assert not cfg.exists() and not backup.exists()
+
+
+def test_a_symlinked_config_left_empty_stays_a_link(tmp_path: Path, tmap: Path) -> None:
+    """A linked config (a dotfiles copy) that held only tmap's entry is emptied through the link,
+    never unlinked.
+
+    MUTATION: remove an emptied file whatever it is -> the link is gone -> RED."""
+    home = tmp_path / "h"
+    real = tmp_path / "dotfiles" / "mcp.json"
+    real.parent.mkdir(parents=True)
+    entry = {"command": str(tmap), "args": ["mcp"]}
+    real.write_text(json.dumps({"mcpServers": {"treasure-map": entry}}))
+    link = home / ".cursor" / "mcp.json"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(real)
+    assert all(o.ok for o in cl.unregister("cursor", _host(home), tmap))
+    assert link.is_symlink() and json.loads(real.read_text()) == {"mcpServers": {}}
+
+
 def test_other_keys_keep_their_characters(tmp_path: Path, tmap: Path) -> None:
     home = tmp_path / "h"
     cfg = home / ".cursor" / "mcp.json"

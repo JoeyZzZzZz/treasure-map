@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """``tmap uninstall``: take away what ``tmap init`` put here, and nothing else.
 
-Only two kinds of thing are removed: tmap's own entries in the agents' configurations, and the
-paths the install ledger records (the downloaded toolchain, BinExport, the completion script and
+Only two kinds of thing are removed: tmap's own entries in the agents' configurations (with the
+backup tmap made of such a file, and a file tmap's entry was all that held), and the paths the
+install ledger records (the downloaded toolchain, BinExport, the completion script and
 its rc block). A path the ledger does not record is never removed — not the user's own JDK,
 Ghidra or BinDiff, even when config.yaml points at them. Before a recorded path is deleted it must
 still be what tmap put there: under ``~/.treasure-map/toolchain``, or (BinExport in a user's

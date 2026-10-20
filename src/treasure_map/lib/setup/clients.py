@@ -17,7 +17,8 @@ is read straight from its configuration file:
 
 Where the client has a CLI (Claude Code, Codex) the CLI writes; Cursor and Claude Desktop get a
 JSON transaction (backup, atomic replace, read back, restore the original bytes on any
-difference); dsh's patch file is appended to (a lone ``[]`` line is replaced, since a list entry
+difference; taking tmap's entry out also takes away that backup, and a file left holding nothing);
+dsh's patch file is appended to (a lone ``[]`` line is replaced, since a list entry
 cannot follow it), and removing tmap's block never leaves a file dsh refuses to load: one that
 held nothing else is deleted, one with other content left is kept a top-level list. Whatever
 cannot be written comes back as the exact text to paste.
@@ -528,12 +529,62 @@ def _without_ours(obj: Mapping[str, Any], had_servers_key: bool) -> dict[str, An
     return out
 
 
+def _holds_tmap_entry(obj: Mapping[str, Any]) -> bool:
+    entry = _servers(obj).get(SERVER)
+    return isinstance(entry, dict) and _is_tmap_command(entry.get("command"))
+
+
+def _sans_ours(obj: Mapping[str, Any]) -> dict[str, Any]:
+    """``obj`` without a tmap ``treasure-map`` entry, and then without an ``mcpServers`` that holds
+    nothing: the part of a configuration that is not tmap's to put back or take away."""
+    out = copy.deepcopy(dict(obj))
+    servers = out.get("mcpServers")
+    if isinstance(servers, dict):
+        if _holds_tmap_entry(out):
+            servers.pop(SERVER)
+        if not servers:
+            out.pop("mcpServers")
+    return out
+
+
+def _tidy_after_removal(path: Path, rest: dict[str, Any], mode: int) -> list[str]:
+    """Once tmap's entry is out of ``path`` (which now holds ``rest``), take away what tmap left.
+
+    The ``.tmap.backup`` is the file as tmap first found it. When the file differs from it by
+    nothing but tmap's entry (and an emptied ``mcpServers``), the backup holds nothing the file
+    does not: a backup of the user's own file has its exact bytes put back, and goes. One that
+    itself holds a tmap entry was taken of a file tmap had already written — not an original — and
+    just goes. A backup that differs by more is kept, and said so. A file with no original behind
+    it that holds nothing now (an empty ``mcpServers``, nothing else) is removed, as dsh's patch
+    file is; a symlink stays."""
+    notes: list[str] = []
+    backup = path.with_name(path.name + ".tmap.backup")
+    original = False  # the file is the user's own, as they had it before tmap
+    if backup.is_file() and not backup.is_symlink():
+        before = _load_json_object(backup)
+        if before is None or _sans_ours(before) != _sans_ours(rest):
+            notes.append(f"kept {backup}: it differs from {path.name} by more than tmap's entry")
+            original = True
+        else:
+            if not _holds_tmap_entry(before):
+                _atomic_write(path, backup.read_bytes(), mode)
+                original = True
+                notes.append(f"put {path.name} back as tmap found it")
+            backup.unlink()
+            notes.append(f"removed {backup}")
+    if not original and rest == {"mcpServers": {}} and not path.is_symlink():
+        path.unlink()
+        notes.append(f"removed {path}: it held only tmap's entry")
+    return notes
+
+
 def json_transaction(path: Path, desired: dict[str, Any] | None) -> Outcome:
     """Set (``desired``) or delete (None) ``mcpServers["treasure-map"]`` in a JSON file, touching
     nothing else: back up the first time, write atomically, read back, and put the original bytes
     back when the result is not exactly the intended change. A write the filesystem refuses (a
     permission or disk error) is an Outcome that says so, not an exception: the atomic write fails
-    before its rename, so the file is as it was."""
+    before its rename, so the file is as it was. A delete then takes away what tmap left
+    (:func:`_tidy_after_removal`): its backup, and a file that holds nothing of the user's."""
     existed = path.exists()
     original = path.read_bytes() if existed else None
     obj = _load_json_object(path)
@@ -571,8 +622,14 @@ def json_transaction(path: Path, desired: dict[str, Any] | None) -> Outcome:
     if not good:
         _restore(path, original, mode)
         return Outcome(False, f"{path}: the write did not read back as intended; restored")
-    verb = "removed from" if desired is None else "written to"
-    return Outcome(True, f"{SERVER} {verb} {path}")
+    if desired is not None:
+        return Outcome(True, f"{SERVER} written to {path}")
+    assert isinstance(back, dict)
+    try:
+        notes = _tidy_after_removal(path, back, mode)
+    except OSError as exc:  # the entry is out; only the tidying failed
+        notes = [f"could not take away what tmap left beside it: {exc}"]
+    return Outcome(True, "; ".join([f"{SERVER} removed from {path}", *notes]))
 
 
 def _desktop_running(host: ClientHost) -> bool:
