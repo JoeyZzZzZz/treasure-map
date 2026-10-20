@@ -12,15 +12,22 @@ and no blind-spot count is lost.
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from treasure_map import mcp_app
+from treasure_map.lib.analyze.ghidra_runner import current_pass_version
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import InstanceRow
 from treasure_map.lib.atlas.writer import add_instance, begin_run, upsert_pattern
+from treasure_map.lib.query import patch_view as pv
+from treasure_map.lib.query import sink_overlay as so
 from treasure_map.lib.storage.connection import open_db
 from treasure_map.mcp_app import _RESPONSE_BYTE_BUDGET, _fit_candidates
+from treasure_map.version import UNKNOWN_VERSION
 
 _FID = [0]
 
@@ -247,3 +254,236 @@ def test_the_two_folded_sites_are_the_same_data(tmp_path: Path) -> None:
     assert result["coverage"]["blind_spots"]["folded_xref_symbols"]["count"] == len(
         result["folded_xref_symbols"]
     )
+
+
+# ── C: the diff view's pages are fitted to the same budget ─────────────────────────────
+
+
+_DIFF = "runA::runB::libx"
+
+
+def _diff_rows(n_pairs: int, rows_per_pair: int) -> list[so.SinkOverlayRow]:
+    rows = []
+    for p in range(n_pairs):
+        fa, fb = f"{0x10000 + p * 0x1000:08x}", f"{0x80000 + p * 0x1000:08x}"
+        for i in range(rows_per_pair):
+            off = f"0x{0x10 + 4 * i:x}"
+            rows.append(
+                so.SinkOverlayRow(
+                    diff_id=_DIFF,
+                    binary="libx",
+                    sink_class="copy",
+                    a_ref=f"runA#deadbeef:{fa}@copy@{off}",
+                    b_ref=f"runB#deadbeef:{fb}@copy@{off}",
+                    key_granularity="callsite",
+                    presence="persisted",
+                    presence_reason=None,
+                    match_basis="instruction",
+                    counterpart_call="present_same_callee",
+                    alignment_confidence=0.97,
+                )
+            )
+    return rows
+
+
+def _diff_atlas(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, n_pairs: int, rows_per_pair: int
+) -> Path:
+    """One diff of ``libx`` with ``n_pairs`` changed pairs of ``rows_per_pair`` candidate rows each,
+    one similarity-1 pair (counted, not listed) and one string-keyed edge."""
+    atlas_path = tmp_path / "atlas.db"
+    atlas = open_atlas(atlas_path)
+    build = current_pass_version()
+    for side, run, sha in (("a", "runA", "a" * 64), ("b", "runB", "b" * 64)):
+        db = tmp_path / f"analysis_{side}.db"
+        conn = open_db(db)
+        conn.execute("INSERT INTO binaries (name, sha256) VALUES ('libx', ?)", (sha,))
+        conn.commit()
+        conn.close()
+        atlas.execute(
+            "INSERT INTO run (run_id, hunt_commit, build_hash, hunt_instances, "
+            "analysis_db_path) VALUES (?, 'facade', ?, 10, ?)",
+            (run, build, str(db)),
+        )
+    atlas.execute(
+        "INSERT INTO diff_meta (diff_id, run_a_id, run_b_id, binary_a, binary_b, sha256_a, "
+        "sha256_b, diff_ok, version_skew) VALUES (?, 'runA', 'runB', 'libx', 'libx', ?, ?, 1, 0)",
+        (_DIFF, "a" * 64, "b" * 64),
+    )
+    for p in range(n_pairs):
+        atlas.execute(
+            "INSERT INTO function_alignment (diff_id, addr_a, addr_b, alignment_confidence, "
+            "similarity, alignment_state) VALUES (?, ?, ?, 0.97, 0.8, 'aligned')",
+            (_DIFF, f"{0x10000 + p * 0x1000:08x}", f"{0x80000 + p * 0x1000:08x}"),
+        )
+    atlas.execute(
+        "INSERT INTO function_alignment (diff_id, addr_a, addr_b, alignment_confidence, "
+        "similarity, alignment_state) VALUES (?, '00f00000', '00f80000', 0.97, 1.0, 'aligned')",
+        (_DIFF,),
+    )
+    atlas.execute(
+        "INSERT INTO dimension_delta (diff_id, dimension, subject_kind, subject_key, delta_kind, "
+        "binary) VALUES (?, 'reachability.string_keyed_edge', 'edge', "
+        "'libx|strcmp_gate|ping|00010000', 'layer_changed', 'libx')",
+        (_DIFF,),
+    )
+    atlas.commit()
+    atlas.close()
+    rows = _diff_rows(n_pairs, rows_per_pair)
+
+    def rows_of(conn: sqlite3.Connection, diff_id: str) -> so.SinkOverlayResult:
+        return so.SinkOverlayResult(list(rows), so.SinkOverlayCoverage(0, 0, 0, 0, 0, False))
+
+    def current(conn: sqlite3.Connection, diff_id: str) -> dict[str, Any]:
+        return {"source_stale": False, "source_stale_reason": None, "toolchain_checked": True}
+
+    pv._clear_view_caches()
+    monkeypatch.setattr(pv, "compute_sink_overlay", rows_of)
+    monkeypatch.setattr(pv, "diff_source_staleness", current)
+    monkeypatch.setattr(mcp_app, "_installed_commit", lambda: UNKNOWN_VERSION)
+    return atlas_path
+
+
+def _fit_width(page: dict[str, Any]) -> int:
+    """The width ``_fit_candidates`` measured when it stopped: the page as returned, with the two
+    paging fields put back to the placeholders they were measured with (``entries_truncated``
+    false; ``next_offset`` the wider of null and the total) and every entry it kept."""
+    total = page["total_entries"]
+    placeholder = total if len(json.dumps(total)) > len(json.dumps(None)) else None
+    return len(json.dumps({**page, "entries_truncated": False, "next_offset": placeholder}))
+
+
+def _lib_page(atlas_path: Path, **kw: Any) -> dict[str, Any]:
+    conn = open_atlas(atlas_path)
+    try:
+        return pv.get_diff_patch_view(conn, _DIFF, **kw)
+    finally:
+        conn.close()
+
+
+def test_a_wide_diff_page_is_cut_to_the_budget_full_and_announced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ A page of wide entries is cut to the budget, the cut is announced, the totals and the
+    whole-diff counts stay as the view gives them, and the page is FULL: the next entry would not
+    have fit.
+
+    MUTATION (verified RED, 1 failed each): return the view's page uncut -> RED; hard-set
+    ``entries_truncated`` False -> RED; leave out ``key="entries"`` at the fit (the envelope is
+    then measured with every entry in it, and the page shrinks to one) -> not full -> RED."""
+    atlas_path = _diff_atlas(tmp_path, monkeypatch, 12, 20)
+    tool = _tools(atlas_path)["get_diff_patch_view"]
+    page = tool(_DIFF)
+    lib = _lib_page(atlas_path)
+    assert len(json.dumps(page)) <= _RESPONSE_BYTE_BUDGET
+    assert page.get("entries_truncated") is True
+    assert page["total_entries"] == lib["total_entries"] == 12
+    for key in ("counts", "not_listed", "review_progress", "subject_counts"):
+        assert page[key] == lib[key], key
+    kept = len(page["entries"])
+    assert page["entries"] == lib["entries"][:kept]
+    assert _fit_width(page) + len(json.dumps(lib["entries"][kept])) + 2 > _RESPONSE_BYTE_BUDGET
+
+
+def test_a_diff_walk_returns_every_entry_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ next_offset resumes after the last entry that fit, so a walk returns every entry once,
+    in the view's order.
+
+    MUTATION (verified RED, 1 failed): set next_offset to ``offset + limit`` -> the walk skips the
+    entries the cut dropped -> RED."""
+    atlas_path = _diff_atlas(tmp_path, monkeypatch, 12, 20)
+    tool = _tools(atlas_path)["get_diff_patch_view"]
+    order = [e["entry_id"] for e in _lib_page(atlas_path)["entries"]]
+    got: list[str] = []
+    offset: int | None = 0
+    pages = 0
+    while offset is not None:
+        page = tool(_DIFF, limit=5, offset=offset)
+        assert len(json.dumps(page)) <= _RESPONSE_BYTE_BUDGET
+        got += [e["entry_id"] for e in page["entries"]]
+        offset = page["next_offset"]
+        pages += 1
+    assert got == order
+    assert pages > len(order) // 5 + 1  # the budget, not the limit, set the page size
+
+
+@pytest.mark.parametrize("view", ["sink_patch", "not_listed_page", "string_edge", "candidate_flat"])
+def test_every_view_of_the_diff_carries_the_cut_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, view: str
+) -> None:
+    """Every view is paged the same way: a small page comes back as the view gives it, with
+    ``entries_truncated`` false.
+
+    MUTATION (verified RED, 3 failed): fit the sink_patch view only -> RED."""
+    atlas_path = _diff_atlas(tmp_path, monkeypatch, 2, 3)
+    kw: dict[str, Any] = {"limit": 1}
+    if view == "not_listed_page":
+        names = [k for k, v in _lib_page(atlas_path)["not_listed"].items() if v["count"]]
+        kw["not_listed_page"] = names[0]
+    elif view != "sink_patch":
+        kw["view"] = view
+    lib = _lib_page(atlas_path, **kw)
+    assert lib["entries"], lib  # the view has something to page
+    page = _tools(atlas_path)["get_diff_patch_view"](_DIFF, **kw)
+    assert page == {**lib, "entries_truncated": False}
+
+
+@pytest.mark.parametrize(
+    ("total", "offset"),
+    [(200, 0), (100_000, 99_700)],
+    ids=["next_offset_narrower_than_null", "next_offset_wider_than_null"],
+)
+def test_a_page_at_the_budget_edge_stays_inside_it_byte_by_byte(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, total: int, offset: int
+) -> None:
+    """★ The envelope is measured with the paging fields already at placeholders at least as wide
+    as their final values, so a page that fills the budget to the last byte stays inside it. The
+    envelope is grown one byte at a time through a whole entry's width, so the measured width
+    takes EVERY value up to the budget — the last 60 bytes included, checked.
+
+    MUTATION (verified RED): measure the envelope before ``entries_truncated`` is set -> pages up
+    to 27 bytes over -> 2 failed; keep that placeholder but measure ``next_offset`` as the view
+    gave it (null) -> the wide case is 1 byte over -> 1 failed; leave out ``key="entries"`` at the
+    fit -> pages not full -> 2 failed."""
+    width = 300
+    entries = [{"entry_id": f"e{i:05d}", "pad": "x" * (width - 30)} for i in range(200)]
+    entry_width = len(json.dumps(entries[0]))
+    pad = {"k": 0}
+
+    def view(conn: sqlite3.Connection, diff_id: str, **kw: Any) -> dict[str, Any]:
+        return {
+            "diff_id": diff_id,
+            "pad": "y" * pad["k"],
+            "entries": list(entries),
+            "total_entries": total,
+            "next_offset": None,
+        }
+
+    monkeypatch.setattr(mcp_app, "_get_diff_patch_view", view)
+    tool = _tools(tmp_path / "atlas.db")["get_diff_patch_view"]
+    widths = set()
+    for k in range(entry_width + 3):
+        pad["k"] = k
+        page = tool("d", offset=offset)
+        assert len(json.dumps(page)) <= _RESPONSE_BYTE_BUDGET, k
+        assert page["entries_truncated"] is True
+        kept = len(page["entries"])
+        assert page["next_offset"] == offset + kept
+        fit = _fit_width(page)
+        assert fit <= _RESPONSE_BYTE_BUDGET
+        assert fit + len(json.dumps(entries[kept])) + 2 > _RESPONSE_BYTE_BUDGET, k  # full
+        widths.add(fit)
+    assert set(range(_RESPONSE_BYTE_BUDGET - 60, _RESPONSE_BYTE_BUDGET + 1)) <= widths
+
+
+def test_the_fit_key_defaults_to_the_candidate_array() -> None:
+    """``key`` names the field the rows go in; left out, it is ``candidates`` — list_candidates'
+    call, which passes none, measures what it did before.
+
+    MUTATION (verified RED, 1 failed): default ``key`` to ``"entries"`` -> RED."""
+    env: dict[str, Any] = {"note": "x", "candidates": [_row(500) for _ in range(20)]}
+    rows = [_row(100) for _ in range(50)]
+    assert _fit_candidates(env, rows, 8000) == _fit_candidates(env, rows, 8000, key="candidates")
+    assert _fit_candidates(env, rows, 8000, key="entries") != _fit_candidates(env, rows, 8000)

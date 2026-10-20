@@ -129,17 +129,23 @@ _BARE_FORM_NOTE_CAVEAT = (
 # Hard cap on a single list_candidates page so an over-large limit cannot blow up the context.
 _MAX_LIMIT = 200
 
-# A ceiling on the whole list_candidates response, in bytes. The candidates array is ~86% of the
-# body and grows linearly with the page, so a wide-row query (path_sink rows run ~440 bytes) at a
-# large limit produced a ~95KB response that overflowed to a file. This bounds the response by
-# TRIMMING THE PAGE — not by dropping honesty: every trimmed row is still reachable by paging on
-# (next_offset), the totals stay exact, and the trim is announced (candidates_truncated). Chosen
-# well under the observed overflow point; one constant to raise if the transport allows more.
+# A ceiling on a whole paged response (list_candidates, get_diff_patch_view), in bytes. The row
+# array is most of the body and grows linearly with the page, so a wide-row query (path_sink rows
+# run ~440 bytes) at a large limit produced a ~95KB response that overflowed to a file. This bounds
+# the response by TRIMMING THE PAGE — not by dropping honesty: every trimmed row is still reachable
+# by paging on (next_offset), the totals stay exact, and the trim is announced
+# (candidates_truncated / entries_truncated). One constant to raise if the transport allows more.
+#
+# It is the tool's own page contract, measured as json.dumps' default form (", " / ": "
+# separators), which is never smaller than the compact form. MCP clients each apply their own
+# inline-or-file threshold, counted their own way (characters, tokens, an indented re-dump); none
+# of those is what this constant is set against, and it does not promise that every client keeps
+# a page inline.
 _RESPONSE_BYTE_BUDGET = 48_000
 
 
 def _fit_candidates(
-    envelope: dict[str, Any], rows: list[dict[str, Any]], budget: int
+    envelope: dict[str, Any], rows: list[dict[str, Any]], budget: int, *, key: str = "candidates"
 ) -> tuple[list[dict[str, Any]], bool]:
     """The prefix of ``rows`` whose serialization keeps the whole response within ``budget`` bytes.
 
@@ -151,8 +157,9 @@ def _fit_candidates(
 
     Returns ``(kept_rows, truncated_by_bytes)``. ``truncated_by_bytes`` is True only when the byte
     ceiling cut the page shorter than the rows handed in — a row-count limit reaching its end is a
-    different thing, tracked by the caller's paging fields."""
-    running = len(json.dumps({**envelope, "candidates": []}))
+    different thing, tracked by the caller's paging fields. ``key`` is the envelope field the rows
+    go in; it is measured empty."""
+    running = len(json.dumps({**envelope, key: []}))
     kept: list[dict[str, Any]] = []
     for row in rows:
         # json.dumps' default item separator is ", " (2 chars), added only BETWEEN elements — so
@@ -164,6 +171,28 @@ def _fit_candidates(
         kept.append(row)
         running += cost
     return kept, False
+
+
+def _fit_entries(result: dict[str, Any], offset: int) -> dict[str, Any]:
+    """A get_diff_patch_view page fitted to the response budget, in every view.
+
+    The paging fields are set to placeholders at least as wide as their final values BEFORE the
+    envelope is measured (``entries_truncated`` false is wider than true; ``next_offset`` is the
+    wider of null and the total, and the final value is never past the total), so the page as
+    returned is never wider than what was measured. ``next_offset`` then resumes after what
+    ACTUALLY fit; ``total_entries`` is the lib's, unchanged. A refusal, or any result without
+    ``entries``, is returned as it is."""
+    if "error" in result or "entries" not in result:
+        return result
+    total = result["total_entries"]
+    result["next_offset"] = total if len(json.dumps(total)) > len(json.dumps(None)) else None
+    result["entries_truncated"] = False
+    kept, cut = _fit_candidates(result, result["entries"], _RESPONSE_BYTE_BUDGET, key="entries")
+    end = offset + len(kept)
+    result["entries"] = kept
+    result["next_offset"] = end if end < total else None
+    result["entries_truncated"] = cut
+    return result
 
 
 # The server's standing instruction to an AI client: the working loop, not legalese. The legal
@@ -232,8 +261,10 @@ _AGENT_INSTRUCTIONS = (
     "carries its anchor_ref and review_state; annotate_diff(diff_id, anchor_ref, verdict="
     "changed_real|no_real_change|change_inconclusive, rationale) records your judgement on one "
     "entry, promote(diff_id, entry_id, row_ref, verdict, rationale) carries it onto one of the "
-    "entry's candidates as a candidate verdict, and list_overlays(anchor_kind='diff_subject', "
-    "run_id='<run_a>::<run_b>') reviews them with the progress over the whole run pair."
+    "entry's candidates as a candidate verdict (an entry shows 20 rows inline: to find a row_ref "
+    "past them, page its rows with get_diff_patch_view(diff_id, entry_id=..., rows_offset=...)), "
+    "and list_overlays(anchor_kind='diff_subject', run_id='<run_a>::<run_b>') reviews them with "
+    "the progress over the whole run pair."
 )
 
 
@@ -1692,6 +1723,8 @@ def make_tools(
         body: str | None = None,
         anchored_differs: bool = False,
         anchored_micro_side: bool = False,
+        entry_id: str | None = None,
+        rows_offset: int | None = None,
     ) -> dict[str, Any]:
         """START HERE for one diff (``diff_id`` = ``{run_a}::{run_b}::{binary}``; list_diffs gives
         the ids): one entry per FUNCTION PAIR that changed, with what happened around its sink
@@ -1733,13 +1766,25 @@ def make_tools(
         ``bucket``, ``subclass`` (an entry's or any of its rows'), ``tier`` (a number, ``no_sink``
         or ``unknown``), ``blind_spot`` (a key of the ``blind_spots`` ledger — page through the
         entries it covers). Page with ``limit``
-        (1-2000, default 200) / ``offset``; follow ``next_offset`` until null.
+        (1-2000, default 200) / ``offset``; follow ``next_offset`` until null. A page is also cut
+        to a byte budget (~48KB), in every view: ``entries_truncated`` says when, ``total_entries``
+        stays the whole count, and ``next_offset`` resumes after the last entry returned.
 
-        Each entry carries its candidate overlay rows (as get_diff_sink_overlay states them, each
-        with its ``landing`` and ``subclass``), and for an aligned pair ``callee_set``: the two
-        extracted callee lists compared (``equal`` / ``differs`` with ``only_in_a`` /
-        ``only_in_b`` / ``undetermined`` with the reason). A differing list is NOT proof a call was
-        made or dropped — tmap's decompile can miss a call — and it never moves an entry.
+        Each entry carries at most 20 of its candidate overlay rows inline (as
+        get_diff_sink_overlay states them, each with its ``landing`` and ``subclass``), with
+        ``rows_total`` and ``rows_next_offset``. An entry with more than 20 orders them by
+        ``rows_order`` — rows that did not persist, then persisted rows carrying
+        ``sink_arg_constant_delta`` / ``size_kind_shifted``, then the rest — and counts EVERY row in
+        ``rows_by_presence`` and ``rows_by_order_group``: read those two to see what lies past the
+        window, and page it with ``entry_id`` + ``rows_offset``. An entry's ``significance`` and
+        ``subclass`` say where the entry itself lands in the diff; they do not say which rows lie
+        past the window. ``entry_id`` (an entry's entry_id or its anchor_ref) returns that one
+        listed entry, with the envelope still describing the whole diff; it takes no filter and no
+        ``offset``. ``rows_offset`` needs ``entry_id``. For an aligned pair the entry also carries
+        ``callee_set``: the two extracted callee lists compared (``equal`` / ``differs`` with
+        ``only_in_a`` / ``only_in_b`` / ``undetermined`` with the reason). A differing list is NOT
+        proof a call was made or dropped — tmap's decompile can miss a call — and it never moves
+        an entry.
 
         Two signals BinDiff similarity is blind to, on the function-pair view: each aligned entry
         carries ``pseudocode_sameness`` — ``identical`` (address-normalised pseudocode AND callees
@@ -1834,7 +1879,7 @@ def make_tools(
             refusal = _refuse_stale_diff(conn, diff_id)
             if refusal is not None:
                 return refusal
-            return _get_diff_patch_view(
+            result = _get_diff_patch_view(
                 conn,
                 diff_id,
                 view=view,
@@ -1850,7 +1895,10 @@ def make_tools(
                 body=body,
                 anchored_differs=anchored_differs,
                 anchored_micro_side=anchored_micro_side,
+                entry_id=entry_id,
+                rows_offset=rows_offset,
             )
+            return _fit_entries(result, offset)
         finally:
             conn.close()
 

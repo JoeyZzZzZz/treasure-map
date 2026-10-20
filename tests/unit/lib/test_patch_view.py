@@ -3538,3 +3538,474 @@ def test_the_diff_command_line_counts_the_read_first_and_micro_pairs(
     pv._clear_view_caches()
     none = _function_line(pv.function_states(_banner_world(tmp_path / "none", "none").atlas, DIFF))
     assert "anchored_differs=0, anchored_micro_side=0" in none
+
+
+# ── the rows window: an entry carries a window of its rows, and every row is still counted ──────
+
+_WIN_A, _WIN_B = "00001000", "00002000"
+_WIN_ID = _pair_id(_WIN_A, _WIN_B)
+_WIN_ANCHOR = f"runA::runB#function_pair#libx::{_WIN_A}::{_WIN_B}"
+_IDENTICAL_ID = _pair_id("00003000", "00004000")  # placed, never listed (similarity 1, no row)
+_NO_ROW_ID = _pair_id("00005000", "00006000")  # listed (C), with no candidate row at all
+
+
+def _win_refs(i: int) -> tuple[str, str]:
+    off = f"0x{0x10 + 4 * i:x}"
+    return _ref("runA", _WIN_A, "copy", off), _ref("runB", _WIN_B, "copy", off)
+
+
+def _win_index(view: dict[str, Any]) -> int:
+    """The fixture position of a rendered row, read back from its a_ref's call offset."""
+    return (int(view["a_ref"].rsplit("@", 1)[1], 16) - 0x10) // 4
+
+
+def _win_row(kind: str, i: int) -> so.SinkOverlayRow:
+    """One overlay row of the windowed pair. ``U``: a call matched to nothing (did not persist);
+    ``A``: the matched call now calls another callee (did not persist, lands A); ``P``: persisted;
+    ``D`` / ``K``: persisted, its size constant / size kind changed (the instances carry it)."""
+    a_ref, b_ref = _win_refs(i)
+    base = so.SinkOverlayRow(
+        diff_id=DIFF,
+        binary="libx",
+        sink_class="copy",
+        a_ref=a_ref,
+        b_ref=b_ref,
+        key_granularity="callsite",
+        presence="persisted",
+        presence_reason=None,
+        match_basis="instruction",
+        counterpart_call="present_same_callee",
+        alignment_confidence=0.97,
+    )
+    if kind == "U":
+        return replace(
+            base,
+            b_ref=None,
+            presence="presence_undetermined",
+            presence_reason="instruction_unmatched",
+            counterpart_call=None,
+        )
+    if kind == "A":
+        return replace(
+            base,
+            b_ref=None,
+            presence="presence_undetermined",
+            presence_reason="present_different_callee",
+            counterpart_call="present_different_callee",
+            counterpart_callee={
+                "matched_addr": "00002010",
+                "callees": [{"name": "popen"}],
+                "same_callee_candidate_elsewhere": False,
+            },
+        )
+    return base
+
+
+_WIN_SIZES = {
+    "D": (_size("cap_const", "0x200"), _size("cap_const", "0x400")),
+    "K": (_size("const", "0x40"), _size("untraced", "len")),
+}
+
+
+def _window_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, layout: str) -> World:
+    """One changed, aligned pair whose overlay rows are ``layout`` in this order (one letter per
+    row, see ``_win_row``), plus a placed-but-not-listed pair and a listed pair with no row."""
+    w = World(tmp_path)
+    w.pair(_WIN_A, _WIN_B, 0.97, 0.8)
+    w.fn("a", _WIN_A, ["strcpy"])
+    w.fn("b", _WIN_B, ["strcpy", "popen"])
+    rows = []
+    for i, kind in enumerate(layout):
+        rows.append(_win_row(kind, i))
+        a_ref, b_ref = _win_refs(i)
+        flow_a, flow_b = _WIN_SIZES.get(kind, (None, None))
+        w.inst("a", a_ref, "copy", "strcpy", flow_a)
+        if kind in "PDK":
+            w.inst("b", b_ref, "copy", "strcpy", flow_b)
+    w.pair("00003000", "00004000", 0.97, 1.0)
+    w.pair("00005000", "00006000", 0.97, 0.6)
+    w.fn("a", "00005000", ["memset", "log_it"])
+    w.fn("b", "00006000", ["memset"])
+    w.commit()
+
+    def rows_of(atlas: sqlite3.Connection, diff_id: str) -> so.SinkOverlayResult:
+        return so.SinkOverlayResult(list(rows), so.SinkOverlayCoverage(0, 0, 0, 0, 0, False))
+
+    monkeypatch.setattr(pv, "compute_sink_overlay", rows_of)
+    return w
+
+
+def _grouped(layout: str) -> list[int]:
+    """The fixture positions in the window order, worked out from the layout alone: rows that did
+    not persist, then persisted rows with a size signal, then the rest, each in fixture order."""
+    return [i for kinds in ("UA", "DK", "P") for i, kind in enumerate(layout) if kind in kinds]
+
+
+def _one(w: World, **kw: Any) -> dict[str, Any]:
+    out = pv.get_diff_patch_view(w.atlas, DIFF, **kw)
+    assert "error" not in out, out
+    by_id = {e["entry_id"]: e for e in out["entries"]}
+    assert _WIN_ID in by_id
+    return by_id[_WIN_ID]
+
+
+# 25 rows, three of them not persisted — one of those past the 20th row — and no size signal.
+_MAIN = "UPPPPUPPPPPPPPPPPPPPPPUPP"
+
+
+def test_an_entry_carries_a_window_of_its_rows_and_says_how_many_there_are(
+    tmp_path: Path, current: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ A 25-row entry carries 20 rows inline, with the total and where the next window starts.
+
+    MUTATION (verified RED, 1 failed): in _render keep ``out["rows"]`` whole (no window) -> 25
+    rows inline -> RED."""
+    w = _window_world(tmp_path, monkeypatch, _MAIN)
+    e = _one(w)
+    assert len(e["rows"]) == 20
+    assert e.get("rows_total") == 25
+    assert e.get("rows_next_offset") == 20
+
+
+def test_the_window_never_touches_the_entrys_own_rows(
+    tmp_path: Path, current: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ The rendered dict's ``rows`` IS the entry's own row list: the window replaces it with a new
+    list. Cutting or sorting it in place would cut the rows promote and the judgement basis read,
+    and break the strict pairing of rows with their views.
+
+    MUTATION (verified RED, 1 failed): in _render write the window into the shared list
+    (``out["rows"][:] = page``) -> the entry keeps 20 views of its 25 rows -> RED."""
+    w = _window_world(tmp_path, monkeypatch, _MAIN)
+    real = pv.build_diff_view
+    seen: list[tuple[pv.BuiltDiff, dict[str, Any]]] = []
+
+    def capture(atlas: sqlite3.Connection, diff_id: str) -> pv.BuiltDiff | None:
+        built = real(atlas, diff_id)
+        assert built is not None
+        e = next(x for x in built.entries if x.entry_id == _WIN_ID)
+        seen.append((built, json.loads(json.dumps(pv.diff_review.entry_facts(e)))))
+        return built
+
+    monkeypatch.setattr(pv, "build_diff_view", capture)
+    rendered = _one(w)
+    assert len(rendered["rows"]) == 20  # the window was taken
+    ((built, facts_before),) = seen
+    e = next(x for x in built.entries if x.entry_id == _WIN_ID)
+    assert len(e.rows) == 25
+    assert len(e.row_views) == 25
+    assert [v["a_ref"] for v in e.row_views] == [r.a_ref for r in e.rows]  # still paired in order
+    assert pv.diff_review.entry_facts(e) == facts_before
+    subjects = pv.diff_review.subjects_of(built.placed, "runA", "runB", "libx")
+    assert sum(1 for s in subjects.values() if s.kind == "candidate" and s.entry is e) == 25
+
+
+def test_the_judgement_basis_rests_on_every_row_of_the_entry(
+    tmp_path: Path, current: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ The basis a judgement is stored with holds all 25 rows — a number from the fixture, not
+    ``rows_total`` (a cut made while building would shrink both alike) — and the snapshot equals
+    the one worked out from the fixture rows alone. A build that cut the entry's rows would move
+    every judgement on such an entry into needs_recheck.
+
+    MUTATION (verified RED, 1 failed): in _Builder._place cut ``e.rows = e.rows[:20]`` before the
+    row views are built -> RED; the same cut after them -> RED."""
+    from treasure_map.lib.query import diff_annotations as dann
+
+    w = _window_world(tmp_path, monkeypatch, _MAIN)
+    built = pv.build_diff_view(w.atlas, DIFF)
+    assert built is not None
+    e = next(x for x in built.entries if x.entry_id == _WIN_ID)
+    assert len(pv.diff_review.entry_facts(e)["rows"]) == 25
+    rows = [_win_row(kind, i) for i, kind in enumerate(_MAIN)]
+    want = {
+        "diff_id": DIFF,
+        "subject": "function_pair",
+        "facts": {
+            "alignment_state": "aligned",
+            "similarity": 0.8,
+            "export_gap_a": None,
+            "export_gap_b": None,
+            "bucket": "B",
+            "rows": sorted(
+                (
+                    [r.a_ref, r.b_ref, r.presence, r.presence_reason, r.counterpart_call]
+                    for r in rows
+                ),
+                key=json.dumps,
+            ),
+        },
+    }
+    assert dann.capture_diff_basis(w.atlas, DIFF, _WIN_ANCHOR) == want
+
+
+# 27 rows: two did not persist, a size-constant and two size-kind rows past the 20th, the rest
+# persisted plain. In fixture order the two size kinds would both fall outside the window.
+_SIZED = "PUPDPPPPPPPPPPPPPPPPPUDKPKP"
+
+
+def test_rows_that_did_not_persist_lead_then_the_size_signals_then_the_rest(
+    tmp_path: Path, current: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ More rows than the window: those that did not persist first, then the persisted rows
+    carrying a size signal (both kinds), then the rest — each group in its own order — so a size
+    signal past the 20th row is not left out behind plain persisted rows.
+
+    MUTATION (verified RED, 1 failed each): take the first 20 rows as they come (no grouping) ->
+    RED; two groups only (size rows sorted with the rest) -> RED; reverse each group's order ->
+    RED."""
+    w = _window_world(tmp_path, monkeypatch, _SIZED)
+    e = _one(w)
+    got = [_win_index(v) for v in e["rows"]]
+    assert got == _grouped(_SIZED)[:20]
+    kinds = {_SIZED[i] for i in got}
+    assert {"U", "D", "K"} <= kinds  # both size kinds made it into the window
+    assert e.get("rows_order") == "presence_not_persisted_then_size_signal_then_rest"
+
+
+# An A entry: 21 rows that did not persist, then one persisted size-kind row, then plain ones.
+_A_HEAVY = "A" * 21 + "KPP"
+
+
+def test_a_size_signal_past_a_full_window_is_counted_not_hidden(
+    tmp_path: Path, current: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ When the rows that did not persist fill the window, a size-signal row falls outside it.
+    The entry's significance speaks for the entry (bucket A here), never for its rows: what lies
+    outside the window is told by ``rows_by_order_group``, and paged with ``rows_offset``.
+
+    MUTATION (verified RED, 1 failed each): order the size-signal group ahead of the rows that did
+    not persist -> RED; drop ``rows_by_order_group`` -> RED."""
+    w = _window_world(tmp_path, monkeypatch, _A_HEAVY)
+    e = _one(w, sort_by="significance")
+    assert e["bucket"] == "A"
+    assert e["significance"] == {"attention": 0, "basis": "matched_call_other_callee"}
+    assert {_A_HEAVY[_win_index(v)] for v in e["rows"]} == {"A"}
+    assert e.get("rows_by_order_group") == {"not_persisted": 21, "size_signal": 1, "rest": 2}
+    rest = _one(w, entry_id=_WIN_ID, rows_offset=20)
+    assert [_A_HEAVY[_win_index(v)] for v in rest["rows"]] == ["A", "K", "P", "P"]
+
+
+def test_the_counts_are_over_every_row_and_name_every_group(
+    tmp_path: Path, current: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The presence and group counts are over all 25 rows, not the 20 shown; a group with no row
+    is written as 0, so "no such row" is never confused with "not counted".
+
+    MUTATION (verified RED, 1 failed each): count the window's rows only -> RED; leave out a group
+    with no row (as ``_count`` does) -> RED (``size_signal`` is 0 here)."""
+    w = _window_world(tmp_path, monkeypatch, _MAIN)
+    e = _one(w)
+    assert e.get("rows_by_presence") == {"persisted": 22, "presence_undetermined": 3}
+    assert e.get("rows_by_order_group") == {"not_persisted": 3, "size_signal": 0, "rest": 22}
+
+
+def test_an_entry_within_the_window_keeps_its_rows_as_they_are(
+    tmp_path: Path, current: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Up to 20 rows come back whole, in their own order — here a persisted row before one that
+    did not persist — with no ordering or group fields.
+
+    MUTATION (verified RED, 1 failed): group the rows of every entry, however few -> RED."""
+    layout = "PUPU"
+    w = _window_world(tmp_path, monkeypatch, layout)
+    e = _one(w)
+    assert [_win_index(v) for v in e["rows"]] == [0, 1, 2, 3]
+    assert e.get("rows_total") == 4
+    assert e["rows_next_offset"] is None
+    assert not {"rows_order", "rows_by_presence", "rows_by_order_group"} & set(e)
+
+
+@pytest.mark.parametrize("rows_limit", [pv.ROWS_INLINE_LIMIT, 6])
+def test_paging_one_entrys_rows_returns_each_row_once_in_the_window_order(
+    tmp_path: Path, current: None, monkeypatch: pytest.MonkeyPatch, rows_limit: int
+) -> None:
+    """★ entry_id + rows_offset, followed until null, return every row exactly once, in the window
+    order worked out from the fixture.
+
+    MUTATION (verified RED, 2 failed): set ``rows_next_offset`` one short (``end - 1``) -> a row
+    comes back twice -> RED."""
+    w = _window_world(tmp_path, monkeypatch, _SIZED)
+    got: list[int] = []
+    at: int | None = 0
+    pages = 0
+    while at is not None:
+        e = _one(w, entry_id=_WIN_ID, rows_offset=at, rows_limit=rows_limit)
+        assert e["rows_offset"] == at
+        got += [_win_index(v) for v in e["rows"]]
+        at = e["rows_next_offset"]
+        pages += 1
+        assert pages <= len(_SIZED)  # a window that never moves on is a failure, not a hang
+    assert got == _grouped(_SIZED)
+
+
+def test_a_row_outside_the_window_can_still_be_promoted(
+    tmp_path: Path, current: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Promote reads the entry's own rows, all of them: a persisted row past the window carries a
+    judgement like any other."""
+    w = _window_world(tmp_path, monkeypatch, _MAIN)
+    ref = _win_refs(24)[0]
+    assert ref not in {v["a_ref"] for v in _one(w)["rows"]}  # really outside the window
+    res = overlay.promote(
+        w.atlas,
+        diff_id=DIFF,
+        entry_id=_WIN_ID,
+        row_ref=ref,
+        verdict="suspicious",
+        rationale="carried over from the diff",
+    )
+    assert res.written.action == "inserted"
+    assert res.promoted_from is not None
+    assert res.promoted_from["landing"] == "persisted"
+
+
+@pytest.mark.parametrize(
+    ("kw", "message"),
+    [
+        ({"entry_id": "runA::runB#candidate#callsite|copy|x|y"}, "not a candidate anchor"),
+        ({"entry_id": _IDENTICAL_ID}, "placed but not listed"),
+        (
+            {"entry_id": "runA::runB#function_pair#libx::00003000::00004000"},
+            "placed but not listed",
+        ),
+        ({"entry_id": "pair:0000dead:0000beef"}, "is not an entry get_diff_patch_view lists"),
+        (
+            {"entry_id": f"runX::runB#function_pair#libx::{_WIN_A}::{_WIN_B}"},
+            "is not an anchor of this diff's run pair",
+        ),
+        ({"entry_id": f"runA::runB#function_pair#liby::{_WIN_A}::{_WIN_B}"}, "names binary"),
+        ({"entry_id": _WIN_ID, "view": "string_edge"}, "entry_id apply to view='sink_patch'"),
+        (
+            {"entry_id": _WIN_ID, "not_listed_page": "aligned_pseudocode_differs"},
+            "does not apply to not_listed_page",
+        ),
+        ({"entry_id": _WIN_ID, "bucket": "B"}, r"takes no filter \(got bucket\)"),
+        ({"entry_id": _WIN_ID, "subclass": "x"}, r"takes no filter \(got subclass\)"),
+        ({"entry_id": _WIN_ID, "tier": 1}, r"takes no filter \(got tier\)"),
+        ({"entry_id": _WIN_ID, "blind_spot": "x"}, r"takes no filter \(got blind_spot\)"),
+        ({"entry_id": _WIN_ID, "body": "unknown"}, r"takes no filter \(got body\)"),
+        (
+            {"entry_id": _WIN_ID, "anchored_differs": True},
+            r"takes no filter \(got anchored_differs\)",
+        ),
+        (
+            {"entry_id": _WIN_ID, "anchored_micro_side": True},
+            r"takes no filter \(got anchored_micro_side\)",
+        ),
+        ({"entry_id": _WIN_ID, "offset": 1}, "with rows_offset, not offset"),
+        ({"rows_offset": 0}, "pass that entry's entry_id"),
+        ({"entry_id": _WIN_ID, "rows_offset": 25}, "past the entry's last row"),
+        ({"entry_id": _WIN_ID, "rows_offset": True}, "rows_offset must be an integer"),
+        ({"entry_id": _WIN_ID, "rows_offset": -1}, "rows_offset must be an integer"),
+        ({"rows_limit": 0}, "rows_limit must be an integer"),
+        ({"entry_id": 7}, "entry_id must be"),
+    ],
+)
+def test_reading_one_entry_refuses_what_it_cannot_honour(
+    tmp_path: Path,
+    current: None,
+    monkeypatch: pytest.MonkeyPatch,
+    kw: dict[str, Any],
+    message: str,
+) -> None:
+    """Every combination reading one entry cannot honour is an error naming why — never ignored.
+
+    MUTATION (verified RED): drop the "rows_offset needs entry_id" check -> 1 failed; drop the
+    filter check -> 7 failed; drop ``rows_limit >= 1`` -> 1 failed; accept an offset beside
+    entry_id -> 1 failed."""
+    w = _window_world(tmp_path, monkeypatch, _MAIN)
+    out = pv.get_diff_patch_view(w.atlas, DIFF, **kw)
+    assert re.search(message, out.get("error") or ""), out
+    assert "entries" not in out
+    if "past the entry's last row" in message:
+        assert out.get("rows_total") == 25
+
+
+def test_a_withheld_diff_has_no_entry_to_read(
+    tmp_path: Path, current: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    w = _window_world(tmp_path, monkeypatch, _MAIN)
+    w.atlas.execute("UPDATE diff_meta SET diff_ok = 0")
+    w.commit()
+    out = pv.get_diff_patch_view(w.atlas, DIFF, entry_id=_WIN_ID)
+    assert "undetermined (banners)" in (out.get("error") or ""), out
+    assert "diff_undetermined:diff_failed" in (out.get("banners") or [])
+
+
+def test_reading_one_entry_by_either_name_keeps_the_whole_diffs_envelope(
+    tmp_path: Path, current: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """entry_id takes the entry's entry_id or its anchor_ref, returns that one entry, and leaves
+    the envelope describing the whole diff; an entry with no row pages from 0, and a limit is
+    still honoured.
+
+    MUTATION (verified RED, 1 failed): resolve by entry_id only -> RED."""
+    w = _window_world(tmp_path, monkeypatch, _MAIN)
+    whole = pv.get_diff_patch_view(w.atlas, DIFF)
+    for name in (_WIN_ID, _WIN_ANCHOR):
+        out = pv.get_diff_patch_view(w.atlas, DIFF, entry_id=name, limit=5)
+        assert "error" not in out, out
+        assert [e["entry_id"] for e in out["entries"]] == [_WIN_ID]
+        assert (out["total_entries"], out["next_offset"]) == (1, None)
+        assert out["counts"] == whole["counts"]
+        assert out["not_listed"] == whole["not_listed"]
+        assert out["lens"]["filters"]["entry_id"] == name
+        assert out["review_progress"]["scope"]["entry_id"] == name
+    empty = pv.get_diff_patch_view(w.atlas, DIFF, entry_id=_NO_ROW_ID, rows_offset=0)
+    assert "error" not in empty, empty
+    (e,) = empty["entries"]
+    assert (e["rows"], e["rows_total"], e["rows_next_offset"]) == ([], 0, None)
+
+
+def test_one_entry_is_named_the_way_promote_names_it(
+    tmp_path: Path, current: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The view and promote each resolve an entry name (the view cannot import promote's side,
+    which imports the view): for every kind of name, both find the same entry or both refuse.
+
+    MUTATION (verified RED, 1 failed): resolve anchor_refs differently in the view (drop the
+    anchor lookup) -> the two disagree -> RED."""
+    from treasure_map.lib.errors import ConfigError
+    from treasure_map.lib.query import diff_annotations as dann
+
+    w = _window_world(tmp_path, monkeypatch, _MAIN)
+    built = pv.build_diff_view(w.atlas, DIFF)
+    assert built is not None
+    meta = dann._binary_diff(w.atlas, DIFF)
+    a_ref, b_ref = _win_refs(1)
+    names = {
+        _WIN_ID: _WIN_ID,
+        _WIN_ANCHOR: _WIN_ID,
+        _NO_ROW_ID: _NO_ROW_ID,
+        f"runA::runB#candidate#callsite|copy|{a_ref}|{b_ref}": None,
+        f"runX::runB#function_pair#libx::{_WIN_A}::{_WIN_B}": None,
+        f"runA::runB#function_pair#liby::{_WIN_A}::{_WIN_B}": None,
+        "pair:0000dead:0000beef": None,
+        _IDENTICAL_ID: None,
+        "runA::runB#function_pair#libx::00003000::00004000": None,
+    }
+    for name, want in names.items():
+        found = pv._resolve_entry(built, name)
+        view_says = None if isinstance(found, str) else found.entry_id
+        try:
+            promote_says: str | None = dann._entry(built, meta, name).entry_id
+        except ConfigError:
+            promote_says = None
+        assert (view_says, promote_says) == (want, want), name
+
+
+def test_the_mcp_tool_pages_one_entrys_rows(
+    tmp_path: Path, current: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """entry_id and rows_offset reach the view through the MCP tool.
+
+    MUTATION (verified RED, 1 failed): drop rows_offset from the tool's call into the view -> the
+    first window comes back again -> RED."""
+    w = _window_world(tmp_path, monkeypatch, _SIZED)
+    tool = mcp_app.make_tools(w.path)["get_diff_patch_view"]
+    out = tool(DIFF, entry_id=_WIN_ANCHOR, rows_offset=20)
+    assert "error" not in out, out
+    (e,) = out["entries"]
+    assert [_win_index(v) for v in e["rows"]] == _grouped(_SIZED)[20:]
+    assert f"at most {pv.ROWS_INLINE_LIMIT} of its candidate" in (tool.__doc__ or "")

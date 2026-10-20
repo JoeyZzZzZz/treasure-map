@@ -103,6 +103,15 @@ SORT_BY = ("tier", "similarity", "address", "significance")
 NO_SINK = "no_sink"
 UNKNOWN = "unknown"
 MAX_LIMIT = 2000
+# How many candidate rows an entry carries inline; the rest are paged with entry_id + rows_offset.
+# A window over the rendered rows only: the entry's own rows, and every entry-level field read from
+# them, stay whole.
+ROWS_INLINE_LIMIT = 20
+# The order an entry's rows are windowed in when they do not all fit: rows that did not persist
+# first, then persisted rows carrying a size signal, then the rest, each group in its own order.
+ROWS_ORDER = "presence_not_persisted_then_size_signal_then_rest"
+_SIZE_SIGNALS = ("sink_arg_constant_delta", "size_kind_shifted")
+_ROW_GROUPS = ("not_persisted", "size_signal", "rest")
 
 # Sinks the hunt does not recall as candidates, by family. A changed pair with no candidate whose
 # callees name one of these is B, never C: there the absence of a candidate is the hunt's blind
@@ -1656,6 +1665,41 @@ def _entry_json(e: _Entry) -> dict[str, Any]:
     return out
 
 
+def _row_group(view: dict[str, Any]) -> int:
+    """The window group of one rendered row (an index into ``_ROW_GROUPS``)."""
+    if view["presence"] != "persisted":
+        return 0
+    return 1 if any(k in view for k in _SIZE_SIGNALS) else 2
+
+
+def _rows_window(
+    views: list[dict[str, Any]], offset: int, n: int
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """One window of an entry's rendered rows, and the fields that say what lies outside it.
+
+    Up to ``n`` rows fit as they are, in their own order. More than that are ordered by
+    ``_row_group`` — a stable sort, so each group keeps its order — and ``offset`` picks the window.
+    The counts are over EVERY row, so a row left out of the window is still counted; a group with no
+    row is written as 0, never dropped. Returns a new list: ``views`` (the entry's own list) is
+    never reordered or cut."""
+    total = len(views)
+    ordered = list(views) if total <= n else sorted(views, key=_row_group)
+    page = ordered[offset : offset + n]
+    end = offset + len(page)
+    fields: dict[str, Any] = {
+        "rows_total": total,
+        "rows_next_offset": end if end < total else None,
+    }
+    if total > n:
+        groups = [0] * len(_ROW_GROUPS)
+        for v in views:
+            groups[_row_group(v)] += 1
+        fields["rows_order"] = ROWS_ORDER
+        fields["rows_by_presence"] = _count(v["presence"] for v in views)
+        fields["rows_by_order_group"] = dict(zip(_ROW_GROUPS, groups, strict=True))
+    return page, fields
+
+
 def _ledger(
     entries: list[_Entry], rows_by_spot: dict[str, int], unavailable: dict[str, str]
 ) -> list[dict[str, Any]]:
@@ -1694,6 +1738,7 @@ def _check_args(
     offset: Any,
     filtered: bool,
     band: Any = False,
+    entry_id: str | None = None,
 ) -> str | None:
     if view not in VIEWS:
         return f"view must be one of {VIEWS}, got {view!r}"
@@ -1707,14 +1752,47 @@ def _check_args(
         return f"bucket must be one of {BUCKETS} or null, got {bucket!r}"
     if tier is not None and str(tier) not in (NO_SINK, UNKNOWN) and not str(tier).isdigit():
         return f"tier must be a number, 'no_sink' or 'unknown', got {tier!r}"
-    if view != "sink_patch" and (filtered or sort_by is not None):
+    if view != "sink_patch" and (filtered or sort_by is not None or entry_id is not None):
         return (
-            "sort_by / bucket / subclass / tier / blind_spot / body apply to view='sink_patch' only"
+            "sort_by / bucket / subclass / tier / blind_spot / body / entry_id apply to "
+            "view='sink_patch' only"
         )
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_LIMIT:
         return f"limit must be an integer in 1..{MAX_LIMIT}, got {limit!r}"
     if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
         return f"offset must be an integer >= 0, got {offset!r}"
+    return None
+
+
+def _check_entry_args(
+    entry_id: Any,
+    rows_offset: Any,
+    rows_limit: Any,
+    offset: int,
+    filters: dict[str, Any],
+    not_listed_page: str | None,
+) -> str | None:
+    """The argument combinations of reading one entry, refused before anything is built — a
+    combination this cannot honour is an error, never silently ignored."""
+    if isinstance(rows_limit, bool) or not isinstance(rows_limit, int) or rows_limit < 1:
+        return f"rows_limit must be an integer >= 1, got {rows_limit!r}"
+    if rows_offset is not None and (
+        isinstance(rows_offset, bool) or not isinstance(rows_offset, int) or rows_offset < 0
+    ):
+        return f"rows_offset must be an integer >= 0, got {rows_offset!r}"
+    if entry_id is None:
+        if rows_offset is not None:
+            return "rows_offset pages one entry's rows: pass that entry's entry_id with it"
+        return None
+    if not isinstance(entry_id, str) or not entry_id:
+        return f"entry_id must be an entry's entry_id or anchor_ref, got {entry_id!r}"
+    if not_listed_page is not None:
+        return "entry_id names a listed entry; it does not apply to not_listed_page"
+    given = sorted(k for k, v in filters.items() if v is not None)
+    if given:
+        return f"entry_id reads one entry and takes no filter (got {', '.join(given)})"
+    if offset != 0:
+        return "entry_id reads one entry: page its rows with rows_offset, not offset"
     return None
 
 
@@ -2584,6 +2662,53 @@ def anchored_differs_banner(states: dict[str, Any] | None) -> str | None:
     return " ".join(parts)
 
 
+def _resolve_entry(built: BuiltDiff, entry_id: str) -> _Entry | str:
+    """The listed entry ``entry_id`` names — by its entry_id, or by its anchor_ref — or why none.
+
+    Read the way promote reads its entry (lib/query/diff_annotations), whose wording the refusals
+    share: an anchor of another run pair or binary, or a candidate anchor, is refused by what it
+    is. An entry that is placed but not listed is named as such, with where it is counted."""
+    d = built.diff
+    for e in built.entries:
+        if e.entry_id == entry_id:
+            return e
+    if "#" in entry_id:
+        if not d.binary:
+            return (
+                f"diff {d.diff_id!r} records no binary name, which every anchor carries — re-run "
+                "it, or name the entry by its entry_id"
+            )
+        parts = diff_review.split_anchor(entry_id, d.run_a, d.run_b)
+        if parts is None:
+            return (
+                f"{entry_id!r} is not an anchor of this diff's run pair "
+                f"({diff_review.run_pair(d.run_a, d.run_b)}#<subject>#<key>) — copy it from the "
+                "entry's anchor_ref"
+            )
+        kind, key = parts
+        named = diff_review.key_binary(kind, key)
+        if kind != "candidate" and named != d.binary:
+            return f"{entry_id!r} names binary {named!r}, but diff {d.diff_id!r} is of {d.binary!r}"
+        if kind == "candidate":
+            return (
+                "entry_id takes an entry (its entry_id or anchor_ref), not a candidate anchor — a "
+                "candidate is read in its entry's rows"
+            )
+        for e in built.entries:
+            if diff_review.entry_anchor(e, d.run_a, d.run_b, d.binary) == entry_id:
+                return e
+    for e in built.placed:
+        if e.bucket:
+            continue
+        anchor = diff_review.entry_anchor(e, d.run_a, d.run_b, d.binary) if d.binary else None
+        if entry_id in (e.entry_id, anchor):
+            return (
+                f"{entry_id!r} is placed but not listed: it is counted under not_listed by its "
+                "pseudocode_sameness — walk it with not_listed_page"
+            )
+    return f"{entry_id!r} is not an entry get_diff_patch_view lists for this diff now"
+
+
 def get_diff_patch_view(
     atlas: sqlite3.Connection,
     diff_id: str,
@@ -2601,6 +2726,9 @@ def get_diff_patch_view(
     body: str | None = None,
     anchored_differs: bool = False,
     anchored_micro_side: bool = False,
+    entry_id: str | None = None,
+    rows_offset: int | None = None,
+    rows_limit: int = ROWS_INLINE_LIMIT,
 ) -> dict[str, Any]:
     """The function-level view of one diff (see the module docstring), one page of it.
 
@@ -2608,6 +2736,13 @@ def get_diff_patch_view(
     rows), ``candidate_flat`` (get_diff_sink_overlay's rows, in its order). The filters and
     ``sort_by`` apply to ``sink_patch``; ``counts`` / ``not_listed`` / ``blind_spots`` always
     describe the whole diff. Pages are in a fixed order; follow ``next_offset`` until null.
+
+    Each sink_patch entry carries at most ``rows_limit`` (default ``ROWS_INLINE_LIMIT``) of its
+    candidate rows, with ``rows_total`` and ``rows_next_offset``. When there are more, they are
+    windowed in ``rows_order`` and ``rows_by_presence`` / ``rows_by_order_group`` count every row,
+    so what lies outside the window is counted, not dropped. ``entry_id`` (an entry's entry_id or
+    anchor_ref) returns that one listed entry, and ``rows_offset`` pages its rows; the entry-level
+    fields are read from all of its rows either way.
 
     ``band`` (``sink_patch`` only, off by default) moves the judged entries inside the groups the
     default order already forms (diff_review.band_bias); off, the order is the base order. The
@@ -2689,12 +2824,39 @@ def get_diff_patch_view(
         "anchored_micro_side": True if anchored_micro_side else None,
     }
     filtered = any(v is not None for v in filters.values())
-    error = _check_args(view, sort_by, bucket, tier, limit, offset, filtered, band)
+    error = _check_args(view, sort_by, bucket, tier, limit, offset, filtered, band, entry_id)
+    if error is None:
+        error = _check_entry_args(
+            entry_id, rows_offset, rows_limit, offset, filters, not_listed_page
+        )
     if error is not None:
         return {"diff_id": diff_id, "error": error}
+    filters["entry_id"] = entry_id
     built = build_diff_view(atlas, diff_id)
     if built is None:
         return {"diff_id": diff_id, "found": False, "error": "no such diff (see list_diffs)"}
+    one: _Entry | None = None
+    if entry_id is not None:
+        if built.withheld is not None:
+            return {
+                "diff_id": diff_id,
+                "error": (
+                    "the whole diff is undetermined (banners): it lists no entry until that is "
+                    "resolved"
+                ),
+                "banners": built.banners,
+            }
+        found = _resolve_entry(built, entry_id)
+        if isinstance(found, str):
+            return {"diff_id": diff_id, "error": found}
+        one = found
+        n_rows = len(one.row_views)
+        if rows_offset and rows_offset >= n_rows:
+            return {
+                "diff_id": diff_id,
+                "error": f"rows_offset {rows_offset} is past the entry's last row",
+                "rows_total": n_rows,
+            }
     overlay, banners, entries = built.overlay, built.banners, built.entries
     readings = _pseudo_readings(atlas, built)
     _annotate_entries(built, readings)
@@ -2733,14 +2895,18 @@ def get_diff_patch_view(
         "string_edge": built.n_edges,
     }
     ledger = _ledger(entries, rows_by_spot, built.unavailable)
-    chosen = [
-        e
-        for e in entries
-        if _matches(e, bucket, subclass, tier, blind_spot)
-        and (body is None or _body_of(e, readings) == body)
-        and (not anchored_differs or _anchored_differs(e, _u_state(e, readings)))
-        and (not anchored_micro_side or _anchored_micro_side(e))
-    ]
+    chosen = (
+        [one]
+        if one is not None
+        else [
+            e
+            for e in entries
+            if _matches(e, bucket, subclass, tier, blind_spot)
+            and (body is None or _body_of(e, readings) == body)
+            and (not anchored_differs or _anchored_differs(e, _u_state(e, readings)))
+            and (not anchored_micro_side or _anchored_micro_side(e))
+        ]
+    )
     review = ViewReview(atlas, built)
     unknown_filter = _unknown_filter_value(entries, subclass, blind_spot)
     envelope: dict[str, Any] = {
@@ -2883,6 +3049,12 @@ def get_diff_patch_view(
 
     def _render(e: _Entry) -> dict[str, Any]:
         out = review.entry_json(e, band)
+        # out["rows"] IS e.row_views (the entry's own list, which promote and the judgement basis
+        # read whole): it is REPLACED by the window's new list, never cut or sorted in place.
+        out["rows"], window = _rows_window(e.row_views, rows_offset or 0, rows_limit)
+        out.update(window)
+        if one is not None:
+            out["rows_offset"] = rows_offset or 0
         state = _sameness_of(e, readings)
         read = _aligned_read(e, readings)
         if state is not None and read is not None and e.pair is not None:
