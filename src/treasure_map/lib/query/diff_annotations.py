@@ -174,6 +174,11 @@ def check_promotion(
        refused whatever its rows say.
     3. WHETHER THE DIFF IS CURRENT — ``source_stale`` must be false; true or null is refused unless
        ``allow_stale_source``, which is then recorded in the origin.
+
+    The origin records the diff, the entry's anchor, and the carrying row's ``landing`` +
+    ``subclass`` — where the judgement was carried from. A recorded landing, ``persisted``
+    included, says where it came from, NOT that the code is unchanged; whether the basis has moved
+    is ``basis_state``, read separately.
     """
     meta = _binary_diff(atlas, diff_id)
     built = _built(atlas, diff_id)
@@ -216,7 +221,15 @@ def check_promotion(
             "counterpart is not established",
             {"presence_state": e.unpaired.presence_state},
         )
-    origin: dict[str, Any] = {"diff_id": diff_id, "anchor_ref": anchor}
+    # The carrying row (one ref -> one row) is promotable, checked above; its landing and subclass
+    # travel with the judgement so a later reader knows where it was carried from.
+    promoted = carrying[0]
+    origin: dict[str, Any] = {
+        "diff_id": diff_id,
+        "anchor_ref": anchor,
+        "landing": promoted["landing"],
+        "subclass": promoted["subclass"],
+    }
     stale = built.staleness.get("source_stale")
     if stale is not False:
         now = {

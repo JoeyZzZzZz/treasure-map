@@ -287,6 +287,8 @@ def test_an_a_row_is_promoted_though_its_presence_is_undetermined(world: World) 
     assert res.promoted_from == {
         "diff_id": DX,
         "anchor_ref": _pair_anchor(DX, "00001000", "00002000"),
+        "landing": "A",
+        "subclass": "matched_call_other_callee",
     }
 
 
@@ -350,13 +352,23 @@ def test_a_landing_nobody_named_is_refused(world: World, monkeypatch: pytest.Mon
 
 
 def test_a_persisted_row_is_promoted(world: World) -> None:
+    """★ The origin records the carrying row's landing + subclass; a persisted row lands
+    (persisted, None). 'persisted' is where the judgement was carried from, NOT proof the code is
+    unchanged.
+
+    MUTATION: drop landing/subclass from the origin in check_promotion -> RED."""
     world.pair(DX, "00001000", "00002000")
     ref_a, ref_b = _ref("runA", "00001000"), _ref("runB", "00002000")
     world.rows[DX] = [_row(ref_a, ref_b, presence="persisted", call="present_same_callee")]
     world.candidate(ref_b)
     entry = world.entry("pair:00001000:00002000")
     assert entry["rows"][0]["landing"] == "persisted"
-    assert _promote(world, entry["entry_id"], ref_b).evidence_ref == ref_b
+    res = _promote(world, entry["entry_id"], ref_b)
+    assert res.evidence_ref == ref_b
+    assert (res.promoted_from.get("landing"), res.promoted_from.get("subclass")) == (
+        "persisted",
+        None,
+    )
 
 
 # ── promotion: is the counterpart determined ─────────────────────────────────────────────────
@@ -401,11 +413,18 @@ def test_a_function_with_no_presence_record_lands_absent_and_is_refused(world: W
 
 
 def test_a_function_established_to_have_no_counterpart_is_promoted(world: World) -> None:
+    """MUTATION: drop landing/subclass from the origin in check_promotion -> RED (the P row's
+    landing + subclass are recorded with the judgement)."""
     world.unpaired(DX, "a", "00005000", "unmatched_analysis_complete")
     ref = _ref("runA", "00005000")
     world.rows[DX] = [_row(ref, None, reason="function_unmatched", conf=None)]
     world.candidate(ref)
-    assert _promote(world, "a:00005000", ref).written.action == "inserted"
+    res = _promote(world, "a:00005000", ref)
+    assert res.written.action == "inserted"
+    assert (res.promoted_from.get("landing"), res.promoted_from.get("subclass")) == (
+        "P",
+        "unmatched_analysis_complete",
+    )
 
 
 # ── promotion: is the diff current, and is it one binary's ───────────────────────────────────
@@ -514,6 +533,8 @@ def test_the_origin_is_listed_and_a_plain_rewrite_drops_it(world: World) -> None
     assert row["promoted_from"] == {
         "diff_id": DX,
         "anchor_ref": _pair_anchor(DX, "00001000", "00002000"),
+        "landing": "A",
+        "subclass": "matched_call_other_callee",
         "source_stale": False,
         "source_stale_reason": None,
     }

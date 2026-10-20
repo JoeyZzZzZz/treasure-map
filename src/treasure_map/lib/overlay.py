@@ -798,9 +798,9 @@ def list_overlays(
     happens to be punctuated.
 
     Candidate annotations by default. A promoted one also carries ``promoted_from`` (the diff it
-    came from, and whether that diff is current now); when it is not, the row reads
-    ``source_diff_stale`` (see ``effective_basis_state``). ``diff_subject`` lists the diff-entry
-    annotations instead, through lib/query/diff_annotations."""
+    came from, the carrying row's landing + subclass, and whether that diff is current now); when it
+    is not, the row reads ``source_diff_stale`` (see ``effective_basis_state``). ``diff_subject``
+    lists the diff-entry annotations instead, through lib/query/diff_annotations."""
     _check_anchor_kind(anchor_kind)
     if anchor_kind == "diff_subject":
         from treasure_map.lib.query.diff_annotations import list_diff_overlays
@@ -853,8 +853,9 @@ def list_overlays(
                 "verdict_basis": json.loads(r["verdict_basis"]) if r["verdict_basis"] else None,
                 "basis_delta": delta,
                 "updated_at": r["updated_at"],
-                # Where a promoted judgement came from, and whether that diff is current now; None
-                # on every row that was not promoted.
+                # Where a promoted judgement came from (the diff, the entry anchor, and the row's
+                # landing + subclass), and whether that diff is current now; None on every row that
+                # was not promoted.
                 "promoted_from": source,
             }
         )

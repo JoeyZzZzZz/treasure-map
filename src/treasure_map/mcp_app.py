@@ -2847,10 +2847,11 @@ def make_tools(
         ``unmatched_analysis_complete``, is refused); and the diff is current (``source_stale``
         false — otherwise only with ``allow_stale_source``, which is recorded).
 
-        The candidate's annotation then carries ``promoted_from`` (the diff and the entry's anchor)
-        on list_overlays and list_candidates(overlay=true); once that diff is no longer current, or
-        is gone, it reads ``source_diff_stale`` there, so it is re-checked rather than trusted. A
-        later plain annotate on the same candidate replaces the judgement and drops the origin."""
+        The candidate's annotation then carries ``promoted_from`` (the diff, the entry's anchor, and
+        where its row landed — ``landing`` + ``subclass``) on list_overlays and
+        list_candidates(overlay=true); once that diff is no longer current, or is gone, it reads
+        ``source_diff_stale`` there, so it is re-checked rather than trusted. A later plain annotate
+        on the same candidate replaces the judgement and drops the origin."""
         supplied = {
             "block_source": block_source,
             "block_point": block_point,
@@ -2893,8 +2894,10 @@ def make_tools(
             "verdict": verdict,
             "promoted_from": res.promoted_from,
             "atlas": str(atlas_path),
-            "note": "recorded on the candidate's annotation, with where it came from. It reads "
-            "source_diff_stale once that diff is no longer current.",
+            "note": "recorded on the candidate's annotation, with where it came from (its "
+            "landing + subclass). A landing, 'persisted' included, is where the judgement "
+            "was carried from, not proof the code is unchanged. It reads source_diff_stale "
+            "once that diff is no longer current.",
         }
         if res.written.action == "updated":
             result["overwrote"] = {
@@ -2921,8 +2924,8 @@ def make_tools(
         overlay-on view's float(+1)/sink(-1); the base map's own ordering is untouched.
 
         A judgement carried over from a diff entry (promote) carries ``promoted_from``: the diff,
-        the entry, and whether that diff is current now. When it is not, the row reads
-        ``basis_state`` = ``source_diff_stale``.
+        the entry, the row's landing + subclass, and whether that diff is current now. When it is
+        not, the row reads ``basis_state`` = ``source_diff_stale``.
 
         ``anchor_kind="diff_subject"`` lists YOUR judgements on diff entries (annotate_diff)
         instead, each with its ``review_state`` and what moved; ``run_id`` is then a run pair,
