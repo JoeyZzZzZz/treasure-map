@@ -625,7 +625,17 @@ def pseudocode_delta(
         return _with_hunk(too_large, _trimmed_hunk(la, lb, sides))
     blocks = _delta_blocks(la, lb)
     if blocks is None:
-        return _with_hunk(too_large, _trimmed_hunk(la, lb, sides))
+        # The TOKEN cap was hit over the whole body. Trimming the identical head and tail and
+        # re-matching the middle would, in practice, hit the same cap again — the middle is almost
+        # the whole body — at up to twice the cost, so withhold straight away with the middle's
+        # line counts, the same shape _trimmed_hunk returns when its own middle is over a cap.
+        _p, _s, ma, mb = _trim(la, lb)
+        hunk = {
+            "withheld": "too_large",
+            "lines": {"a": len(ma), "b": len(mb)},
+            "read_with": _READ_WITH,
+        }
+        return _with_hunk(too_large, hunk)
     spans = 0
     subs: dict[str, dict[str, Any]] = {}
     for blk in blocks:
@@ -805,8 +815,10 @@ def _inline_hunk(
 
     Shown: ``structural`` — one list of lines per run of structural blocks, each line prefixed
     ``-`` (the A side's line), ``+`` (the B side's line), `` `` (a context line, A side) or ``=``
-    (the B side's own text of the context line above, given only when it differs — the lines match
-    once addresses are normalised); ``INLINE_HUNK_CONTEXT`` lines around each run, runs that close
+    (the B side's own text at this point, given only where it differs from the A line — the
+    difference is an address, or a substitution already counted in substitution_groups; where B has
+    more lines than A, several ``=`` lines can follow one another); ``INLINE_HUNK_CONTEXT`` lines
+    around each run, runs that close
     merged. ``substitution_groups`` — one per group, in the order first met: ``kind`` (number /
     ident / string / local_or_comment), a number group's ``step``, ``total``, and ``first``: up to
     five ``[a, b, line_a, line_b]``, the token as each side's original text has it and its 1-based
@@ -910,12 +922,10 @@ def _structural_runs(
     return shown
 
 
-def _trimmed_hunk(la: list[str], lb: list[str], sides: _Sides) -> dict[str, Any] | None:
-    """The hunk of a delta too large to compute whole: the identical leading and trailing lines set
-    aside, the changed middle matched as usual when ITS line pairs fit ``DELTA_LINE_PRODUCT_CAP``
-    (its lines and line numbers mapped back past the set-aside head), else — or when its token pairs
-    exceed the token cap — ``{withheld: too_large, lines {a, b}, read_with}`` with the middle's
-    line counts. The delta itself stays ``not_computed``: this is only the hunk."""
+def _trim(la: list[str], lb: list[str]) -> tuple[int, int, list[str], list[str]]:
+    """The identical leading (``p``) and trailing (``s``) line counts the two sides share, and the
+    changed middle of each — what a too-large delta's hunk is computed from, past the set-aside
+    head."""
     n = min(len(la), len(lb))
     p = 0
     while p < n and la[p] == lb[p]:
@@ -923,7 +933,16 @@ def _trimmed_hunk(la: list[str], lb: list[str], sides: _Sides) -> dict[str, Any]
     s = 0
     while s < n - p and la[-1 - s] == lb[-1 - s]:
         s += 1
-    ma, mb = la[p : len(la) - s], lb[p : len(lb) - s]
+    return p, s, la[p : len(la) - s], lb[p : len(lb) - s]
+
+
+def _trimmed_hunk(la: list[str], lb: list[str], sides: _Sides) -> dict[str, Any] | None:
+    """The hunk of a delta too large to compute whole: the identical leading and trailing lines set
+    aside, the changed middle matched as usual when ITS line pairs fit ``DELTA_LINE_PRODUCT_CAP``
+    (its lines and line numbers mapped back past the set-aside head), else — or when its token pairs
+    exceed the token cap — ``{withheld: too_large, lines {a, b}, read_with}`` with the middle's
+    line counts. The delta itself stays ``not_computed``: this is only the hunk."""
+    p, _s, ma, mb = _trim(la, lb)
     withheld = {
         "withheld": "too_large",
         "lines": {"a": len(ma), "b": len(mb)},
@@ -934,7 +953,13 @@ def _trimmed_hunk(la: list[str], lb: list[str], sides: _Sides) -> dict[str, Any]
     blocks = _delta_blocks(ma, mb)
     if blocks is None:
         return withheld
-    return _inline_hunk(blocks, p, len(la), len(lb), sides)
+    hunk = _inline_hunk(blocks, p, len(la), len(lb), sides)
+    if hunk is None:
+        # The middle computed but shows nothing — only layout or address differences, normalised
+        # away. A ``not_computed`` delta with NO hunk leaves the reader unable to tell why; give a
+        # zero-count hunk (the same field shape as a real one) so that state cannot arise here.
+        return {"structural_lines": 0, "groups": 0, "structural": [], "substitution_groups": []}
+    return hunk
 
 
 # ── line-number form: a __FILE__/__LINE__ shift, told apart from a real substitution ─────────

@@ -4851,6 +4851,25 @@ def test_a_zero_row_scan_keeps_every_count_and_no_row(
     ]
 
 
+def test_the_mcp_tool_passes_rows_limit_zero_through_as_a_scan(
+    tmp_path: Path, current: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """At the MCP tool (not just the read layer), rows_limit=0 is a scan, not an error: entries come
+    back, each with rows [] and the counts the scan writes (rows_total, rows_by_presence). The tool
+    must accept 0 AND hand it to the read layer.
+
+    MUTATIONs (audit C06/C07): reject rows_limit=0 at the tool -> an error and no entries -> RED;
+    drop rows_limit from the tool's call to the read layer -> entries carry inline rows, not []
+    -> RED.
+    """
+    w = _window_world(tmp_path, monkeypatch, "UPP")
+    out = mcp_app.make_tools(w.path)["get_diff_patch_view"](DIFF, rows_limit=0)
+    assert "error" not in out, out
+    e = {x["entry_id"]: x for x in out["entries"]}[_WIN_ID]
+    assert e["rows"] == [] and e["rows_total"] == 3
+    assert e["rows_by_presence"] == {"persisted": 2, "presence_undetermined": 1}
+
+
 def test_the_hunk_rides_on_every_delta_the_view_prints(tmp_path: Path, current: None) -> None:
     """The view prints pseudocode_delta in three places — an aligned entry, an undetermined pair's
     proposed_pair_reading, a not-listed page row — and each carries its inline_hunk, shown from the

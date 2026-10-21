@@ -64,7 +64,8 @@ TWO SIGNALS SIMILARITY IS BLIND TO (lib/query/sameness), read on the function-pa
   ``size_kind_shifted``.
   Reading pseudocode is the costly half, so it is computed in get_diff_patch_view (cached per
   diff + content + build), never in build_diff_view — annotate/promote and the progress block stay
-  cheap. A pseudocode_delta is computed only for the page being rendered.
+  cheap. A pseudocode_delta is computed for the whole diff's anchored_differs pairs above the
+  read-first floor, not only the page (see ``_annotate_entries``).
 
 ORDER: A first, then the R and B entries that carry a sink candidate (E among them when it carries
 one, in its own lane), then the entries with none (recall_gap_sink, R, C, then the E with none),
@@ -2684,9 +2685,10 @@ def _hidden_region(read: _Read, p: _Pair) -> dict[str, Any] | None:
 
 
 def _deltas(readings: _Readings, pairs: list[_Pair]) -> dict[tuple[str, str], dict[str, Any]]:
-    """pseudocode_delta of each of ``pairs`` (pairs whose texts were read and differ), computed only
-    for the page being rendered: the bodies are read once, and only when one of them is not cached;
-    the result is cached per pair, the bodies are not kept."""
+    """pseudocode_delta of each of ``pairs`` (pairs whose texts were read and differ) — its caller
+    chooses which, and ``_annotate_entries`` gives it the whole diff's anchored_differs pairs above
+    the read-first floor, not only the page: the bodies are read once, and only when one of them is
+    not cached; the result is cached per pair, the bodies are not kept."""
     out: dict[tuple[str, str], dict[str, Any]] = {}
     missing: list[_Pair] = []
     for p in pairs:

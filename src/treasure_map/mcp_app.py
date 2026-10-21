@@ -1988,9 +1988,11 @@ def make_tools(
         pseudocode to find it: the lines are aligned on the address-normalised text but SHOWN as the
         original text has them. ``structural`` is one list of lines per changed run, each line
         prefixed ``-`` (the A side's), ``+`` (the B side's), a space (an unchanged context line,
-        A side; 2 around each run, close runs merged) or ``=`` (the B side's own text of the context
-        line just above, given only where it differs — the two match once addresses are
-        normalised). ``substitution_groups`` puts each like substitution on one line: numbers by
+        A side; 2 around each run, close runs merged) or ``=`` (the B side's own text at this point,
+        given only where it differs from the A line — the difference is an address, or a
+        substitution already counted in substitution_groups; where B has more lines than A, several
+        ``=`` lines can follow one another). ``substitution_groups`` puts each like substitution on
+        one line: numbers by
         ``step`` (0x40 -> 0x3f is -1), an identifier or string by its old -> new pair, decompiler
         local renames (``local_10`` -> ``local_14``: another stack slot, maybe another buffer)
         together with comment changes as ``local_or_comment`` — each with ``total`` and ``first``:

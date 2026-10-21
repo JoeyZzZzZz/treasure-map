@@ -458,6 +458,28 @@ def test_calls_to_a_wrapper_are_members_and_function_level_candidates_are_not(
     }
 
 
+def test_excluded_non_callsite_counts_by_sink_and_kind_not_sink_alone(world: World) -> None:
+    """``excluded_non_callsite`` counts the function-level candidates of the GROUP's shape — its
+    sink AND its kind. A function-level candidate with the same sink (strcpy) but another kind (a
+    const length, not source_len) is a different shape and is not counted beside this group.
+
+    MUTATION (audit M10): count by sink alone, dropping the kind test -> the const-kind fallback
+    joins the source_len group's excluded count -> RED.
+    """
+    assert (
+        _group(world, LISTED)["sibling_set_bounds"]["excluded_non_callsite"]["function_fallback"]
+        == 1
+    )
+    # same sink (strcpy), different kind (const length, not source_len): a different shape.
+    world.inst("runA", _ref("runA", "00032000", "copy"), "copy", "strcpy", CONST)
+    world.commit()
+    pv._clear_view_caches()
+    excluded = _group(world, LISTED)["sibling_set_bounds"]["excluded_non_callsite"]
+    assert excluded["function_fallback"] == 1, (
+        "a same-sink, different-kind candidate is not counted"
+    )
+
+
 def test_the_calls_to_wrappers_are_counted_per_wrapper(world: World) -> None:
     """d-4: the wrapper is not part of the shape; its entry is on each member and counted on the
     group, by name when an older hunt recorded no address."""
@@ -521,6 +543,27 @@ def test_each_member_lands_where_the_view_puts_its_row(world: World) -> None:
     assert by_ref[P_MEMBER]["similarity"] is None
     assert [by_ref[r]["listed"] for r in UNLISTED] == [False] * 3
     assert all(by_ref[r]["similarity"] == 1.0 for r in UNLISTED)
+
+
+def test_similarity_below_one_counts_an_unrecorded_similarity(world: World) -> None:
+    """``similarity_below_1`` counts members whose pair's similarity is below 1 OR unrecorded — a
+    NULL similarity cannot be called identical, as the tool says ("below 1 or unrecorded"). The
+    existing members cover only explicit < 1 values (0.8 / 0.4 / 0.7).
+
+    MUTATION (audit M14): count only ``similarity < 1`` and drop the None case -> a member whose
+    pair records no similarity is left out -> RED.
+    """
+    assert _group(world, LISTED)["similarity_below_1"] == 3
+    fa, fb = "0003e000", "0003f000"
+    world.pair(fa, fb, 0.97, None)  # aligned, similarity unrecorded (NULL)
+    world.inst("runA", _ref("runA", fa, "copy", "0x10"), "copy", "strcpy", SRC)
+    world.inst("runB", _ref("runB", fb, "copy", "0x10"), "copy", "strcpy", SRC)
+    world.im(_addr(fa, "0x10"), _addr(fb, "0x10"), fa)
+    world.fn("a", fa, ["strcpy"])
+    world.fn("b", fb, ["strcpy"])
+    world.commit()
+    pv._clear_view_caches()
+    assert _group(world, LISTED)["similarity_below_1"] == 4, "a NULL similarity counts too"
 
 
 def test_no_state_word_is_made_up(world: World) -> None:
@@ -641,6 +684,52 @@ def test_recall_gaps_that_cannot_be_read_are_null_never_empty(
     pv._clear_view_caches()
     gaps = _group(world, LISTED)["sibling_set_bounds"]["recall_gaps"]
     assert gaps == {"families": None, "state": "unreadable:analysis_db_unavailable"}
+
+
+def test_recall_gaps_are_three_state_on_truncation_callees_and_source_stale(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T8b's three-state edges: ``truncated`` NOT RECORDED (None, an old analysis.db) and a callee
+    list that cannot be read (None) each make the reading partial, not read; ``source_stale``
+    anything but False — None included — makes it unreadable. Asserting only the recorded / True
+    forms would miss a check narrowed to truthiness.
+
+    MUTATIONs (audit M01/M02/M03b): ``fn.truncated is not False`` -> ``fn.truncated`` (None reads as
+    not truncated); drop the ``fn.callees is None`` guard; ``source_stale is not False`` ->
+    ``source_stale`` (None reads as current) — each goes RED on the None case asserted here.
+    """
+
+    def gaps() -> dict[str, Any]:
+        pv._clear_view_caches()
+        return _group(world, LISTED)["sibling_set_bounds"]["recall_gaps"]
+
+    assert gaps() == {"families": ["wide_char_string"], "state": "read"}
+
+    # M01: truncation not recorded (NULL) is still partial — the list may have been cut.
+    world.adb["a"].execute(
+        "UPDATE functions SET callees_truncated = NULL WHERE address = '00030000'"
+    )
+    world.commit()
+    assert gaps() == {"families": ["wide_char_string"], "state": "partial:1"}
+
+    # M02: a callee list that cannot be read (NULL) is partial, and reads no family from it.
+    world.adb["a"].execute(
+        "UPDATE functions SET callees_truncated = 0, callees = NULL WHERE address = '00030000'"
+    )
+    world.commit()
+    assert gaps() == {"families": [], "state": "partial:1"}
+
+    # M03b: source_stale None (not False) is unreadable, exactly as True is.
+    monkeypatch.setattr(
+        pv,
+        "diff_source_staleness",
+        lambda atlas, diff_id: {
+            "source_stale": None,
+            "source_stale_reason": None,
+            "toolchain_checked": True,
+        },
+    )
+    assert gaps() == {"families": None, "state": "unreadable:source_stale"}
 
 
 def test_a_binary_with_no_such_call_reads_an_empty_list(world: World) -> None:
@@ -864,6 +953,24 @@ def test_a_stale_run_is_refused_on_both_ways_in(world: World, side: str) -> None
         assert out.get("stale_scan", {}).get("diff_side") == side
         assert "remedy" in out and out["diff_id"] == DIFF
     assert cli.get("stale_scan") == mcp["stale_scan"] and cli.get("remedy") == mcp["remedy"]
+
+
+def test_the_mcp_diff_tools_refuse_a_stale_diff_key_for_key(world: World) -> None:
+    """A diff whose side is a provably stale scan is refused the SAME way by every MCP diff tool:
+    same_shape_siblings and get_diff_patch_view both return the one _refuse_stale_diff dict, key for
+    key — stale_scan and run_lineage and all. A weaker refusal on one tool would be an open door
+    beside a locked one.
+
+    MUTATION (audit M23): give same_shape_siblings its own stale refusal (the read layer's, with
+    other keys) instead of the shared _refuse_stale_diff -> the two dicts differ -> RED.
+    """
+    world.atlas.execute("UPDATE run SET build_hash = 'other' WHERE run_id = 'runA'")
+    world.commit()
+    tools = mcp_app.make_tools(world.path)
+    sib = tools["same_shape_siblings"](DIFF, evidence_ref=LISTED)
+    view = tools["get_diff_patch_view"](DIFF)
+    assert sib.get("stale_scan") and "run_lineage" in sib, sib
+    assert sib == view, "both MCP diff tools must refuse a stale diff through the one shared gate"
 
 
 # ── neutral, and outside the hashed code ─────────────────────────────────────────────────────

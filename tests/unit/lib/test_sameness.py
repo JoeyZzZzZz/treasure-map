@@ -525,6 +525,126 @@ def test_a_changed_block_over_the_token_product_cap_is_not_computed(
     assert small["kind"] == "substitution_only"
 
 
+def test_the_token_cap_path_withholds_without_rematching_the_trimmed_middle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the whole-body TOKEN cap is hit, the hunk is withheld straight away: the identical head
+    and tail are set aside only to count the middle's lines, the middle is NOT matched again (it
+    would, in practice, hit the same cap at up to twice the cost). ``_delta_blocks`` is called
+    exactly once on this path.
+
+    MUTATION (audit A1): restore the ``blocks is None`` branch to call ``_trimmed_hunk`` (which
+    re-trims and re-matches) -> ``_delta_blocks`` is called twice -> RED.
+    """
+    monkeypatch.setattr(sm, "DELTA_TOKEN_PRODUCT_CAP", 400)
+    calls = {"n": 0}
+    real = sm._delta_blocks
+
+    def counting(la: list[str], lb: list[str]) -> object:
+        calls["n"] += 1
+        return real(la, lb)
+
+    monkeypatch.setattr(sm, "_delta_blocks", counting)
+    wide_a = "x = " + " + ".join(f"a{i}" for i in range(12)) + ";"
+    wide_b = "x = " + " + ".join(f"b{i}" for i in range(12)) + ";"
+    delta = sm.pseudocode_delta(wide_a, wide_b, None, None, "1000", "2000")
+    assert _without_hunk(delta) == {"kind": "not_computed", "reason": "too_large"}
+    assert delta["inline_hunk"]["withheld"] == "too_large"
+    assert calls["n"] == 1, "the trimmed middle must not be matched a second time"
+
+
+def test_a_too_large_delta_whose_trimmed_middle_shows_nothing_gets_a_zero_count_hunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A delta over the LINE cap whose changed middle — once the identical head and tail are set
+    aside — differs only in layout gets a ZERO-COUNT hunk, not a bare ``not_computed`` with no hunk.
+    Otherwise the reader cannot tell the middle held nothing to show from an oversight.
+
+    MUTATION (audit A5): return None instead of the zero-count hunk when ``_inline_hunk`` finds
+    nothing on the trimmed path -> the delta carries no ``inline_hunk`` -> RED.
+    """
+    monkeypatch.setattr(sm, "DELTA_LINE_PRODUCT_CAP", 10)
+    # over the cap whole (4 x 5 lines); trimmed to a middle that differs only in layout (a blank
+    # line and spacing), so the middle computes as layout_only and _inline_hunk shows nothing.
+    a = "void f(void)\n{\n  x = y + 1;\n}"
+    b = "void f(void)\n{\n  x  =  y+1;\n\n}"
+    delta = sm.pseudocode_delta(a, b, None, None, "1000", "2000")
+    assert _without_hunk(delta) == {"kind": "not_computed", "reason": "too_large"}
+    assert delta["inline_hunk"] == {
+        "structural_lines": 0,
+        "groups": 0,
+        "structural": [],
+        "substitution_groups": [],
+    }
+
+
+def test_two_number_substitutions_of_the_same_step_are_one_group() -> None:
+    """Numbers are grouped by step, not by value: two changes of the same step (0x40->0x3f and
+    0x100->0xff, both -1) are ONE group with ``total`` 2, so a single size-fix shift read across
+    several lines is reported once.
+
+    MUTATION (audit S14): group numbers by their old->new value pair instead of by step -> two
+    groups -> RED.
+    """
+    d = sm.pseudocode_delta("a = 0x40;\nb = 0x100;", "a = 0x3f;\nb = 0xff;", None, None, "1", "2")
+    groups = d["inline_hunk"]["substitution_groups"]
+    assert len(groups) == 1
+    assert groups[0]["kind"] == "number" and groups[0]["step"] == -1 and groups[0]["total"] == 2
+
+
+def test_a_local_name_substitution_needs_both_sides_to_look_local() -> None:
+    """``local_or_comment`` is for a decompiler local renamed to another decompiler local — both
+    sides must look like one. ``local_10 -> local_14`` is local_or_comment; ``local_10 -> buf_len``
+    (a real name on the B side) is a plain ``ident``, not hidden among the renames.
+
+    MUTATION (audit S17): treat it as local_or_comment when EITHER side looks local -> the
+    local_10 -> buf_len change lands local_or_comment -> RED.
+    """
+    both = sm.pseudocode_delta("x = local_10;", "x = local_14;", None, None, "1", "2")
+    assert both["inline_hunk"]["substitution_groups"][0]["kind"] == "local_or_comment"
+    one = sm.pseudocode_delta("x = local_10;", "x = buf_len;", None, None, "1", "2")
+    assert one["inline_hunk"]["substitution_groups"][0]["kind"] == "ident"
+
+
+def test_a_substitution_shows_the_original_token_not_the_normalised_one() -> None:
+    """A changed token is shown as its side's ORIGINAL text, even when the line was aligned on the
+    address-normalised text. A's ``0x401050`` sits in the mirror range and normalises to ``0x#``;
+    ``first`` must still carry ``0x401050``, so the reader sees the real value.
+
+    MUTATION (audit S20): take the normalised token in ``_shown_pair`` -> ``first`` carries ``0x#``
+    -> RED.
+    """
+    d = sm.pseudocode_delta(
+        "foo(0x401050);",
+        "foo(0x999999);",
+        [(0x400000, 0x4FFFFF)],
+        [(0x800000, 0x8FFFFF)],
+        "400000",
+        "800000",
+    )
+    first = d["inline_hunk"]["substitution_groups"][0]["first"]
+    assert first[0][0] == "0x401050", "the A side's own original text, not the normalised 0x#"
+
+
+def test_structural_runs_merge_within_the_context_window_and_split_beyond_it() -> None:
+    """Two structural blocks with at most ``2 * INLINE_HUNK_CONTEXT`` (4) lines between them are
+    shown as one run (no context line printed twice); 5 lines apart, as two.
+
+    MUTATIONs (audit S09/S09b): make the merge test ``<`` instead of ``<=`` -> the 4-line gap
+    splits -> RED; raise the window by one (``2 * INLINE_HUNK_CONTEXT + 1``) -> the 5-line gap
+    merges -> RED.
+    """
+
+    def runs(gap: int) -> int:
+        ctx = "".join(f"c{i}();\n" for i in range(gap))
+        a = "head();\ndelA();\n" + ctx + "delB();\ntail();"
+        b = "head();\n" + ctx + "tail();"
+        return len(sm.pseudocode_delta(a, b, None, None, "1", "2")["inline_hunk"]["structural"])
+
+    assert runs(4) == 1, "a 4-line gap (== 2*INLINE_HUNK_CONTEXT) merges into one run"
+    assert runs(5) == 2, "a 5-line gap stays two runs"
+
+
 def test_the_token_cap_is_one_budget_for_the_whole_delta(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
