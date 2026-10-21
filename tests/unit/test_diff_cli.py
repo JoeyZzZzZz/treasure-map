@@ -505,7 +505,9 @@ def test_a_stale_hunt_is_rescanned_once_and_said_in_full(env: Env) -> None:
     out = res.output
     assert "run 'new' (--after) is out of date" in out
     assert hunt_cli._TIER_LABEL["hunt"] in out and hunt_cli._TIER_COST["hunt"] in out
-    assert "hunted by an older tmap" in out
+    # An old run (no recorded code stamp) is offered for rescan with the generic code-stamp reason;
+    # the human wording that `tmap diff`'s rescan plan prints for it.
+    assert "hunted before tmap recorded what it ran" in out
     assert "will have their stored baseline read as stale" in out
     assert "will read as source_stale" not in out
     assert hunt_cli._REKEY_WARNING not in out

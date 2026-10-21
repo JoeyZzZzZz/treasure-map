@@ -7,6 +7,17 @@ PRAGMA foreign_keys = ON;
 -- every open, emptied the current table — the shell-script evidence — whenever the database was
 -- reopened without a full re-analysis.)
 
+-- scan_stamp: what BUILT this analysis.db, in one row. The canonical-JSON value is
+-- lib/rescan_version.scan_stamp_for(config) — the pipeline code hash, the pyelftools version, and
+-- the content-marked config leaves. A hunt copies it onto its atlas run row; a reader compares the
+-- copy with this row to tell whether the analysis.db was rebuilt since. Written AFTER the non-binary
+-- step (cleared first, so a crash mid-scan leaves no stamp — read as "cannot confirm", re-scan).
+-- CREATE ... IF NOT EXISTS back-fills the table onto an older database on the next open_db.
+CREATE TABLE IF NOT EXISTS scan_stamp (
+    id    INTEGER PRIMARY KEY CHECK (id = 1),
+    stamp TEXT NOT NULL
+);
+
 -- binaries
 CREATE TABLE IF NOT EXISTS binaries (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,

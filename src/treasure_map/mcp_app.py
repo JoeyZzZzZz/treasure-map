@@ -37,10 +37,11 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-from treasure_map.lib import facts
+from treasure_map.lib import facts, rescan_version
 from treasure_map.lib.analyze.ghidra_runner import current_pass_version as _current_pass_version
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import RunRow
+from treasure_map.lib.config.config import Config, load_config
 from treasure_map.lib.errors import ConfigError
 from treasure_map.lib.notice import LEGAL_NOTICE
 from treasure_map.lib.overlay import annotate_diff as _annotate_diff
@@ -386,10 +387,11 @@ def _dim_label(d: Any) -> str:
     return _state_value_label(d)
 
 
-def _lineage_inline(run: RunRow) -> dict[str, Any]:
+def _lineage_inline(run: RunRow, current: rescan_version.CodeStamp) -> dict[str, Any]:
     """The run's scan lineage, inlined on EVERY fact return so a consumer spots a STALE scan
     without a separate list_runs call (a stale scan is silent — the lineage must be printed, not
-    fetched). ``resolved`` is False for a pre-existing run with no lineage row.
+    fetched). ``resolved`` is False for a pre-existing run with no lineage row. ``current`` is the
+    running code stamp the make_tools closure computed once.
 
     A run PROVEN stale is refused before it gets here. One that could not be compared is served —
     and ``currency`` says what could not be compared, so "served" is never read as "current"."""
@@ -400,7 +402,9 @@ def _lineage_inline(run: RunRow) -> dict[str, Any]:
         "tool_version": run.tool_version,
         "resolved": run.resolved,
     }
-    stale = _run_staleness(run, build_hash=_current_pass_version(), commit=_installed_commit())
+    stale = _run_staleness(
+        run, build_hash=_current_pass_version(), current=current, commit=_installed_commit()
+    )
     if not stale.stale and stale.remedy:  # a stated reason: something could not be compared
         out["currency"] = {"confirmed": False, "detail": stale.detail, "remedy": stale.remedy}
     return out
@@ -611,7 +615,10 @@ def _page(rows: list[Any], limit: int, offset: int) -> tuple[list[Any], dict[str
 
 
 def make_tools(
-    atlas_db: Path | str, *, workspaces_root: Path | str | None = None
+    atlas_db: Path | str,
+    *,
+    workspaces_root: Path | str | None = None,
+    config: Config | None = None,
 ) -> dict[str, Callable[..., Any]]:
     """Build the tool callables bound to ONE atlas (not one firmware).
 
@@ -623,9 +630,33 @@ def make_tools(
     OPTIONAL fallback resolver (``<root>/<run_id>/analysis.db``) for the common
     run_id==workspace-name case; the run table is the authority. Returned as plain functions so the
     CLI, the MCP registration, and the tests all invoke the SAME code path (parity by
-    construction)."""
+    construction).
+
+    ``config`` supplies the content-marked settings (the xref fold threshold) that feed the scan
+    stamp the currency decision compares against; None loads it from the usual places. The running
+    code stamp ``_current`` is computed ONCE here and reused for every refusal — a long-lived server
+    holds the stamp of the code it started with, which is what the restart hint below is about."""
     atlas_path = Path(atlas_db)
     ws_root = Path(workspaces_root) if workspaces_root is not None else None
+    _config = config if config is not None else load_config(None)
+    _current = rescan_version.current_code_stamp(_config)
+
+    def _server_code_moved() -> str | None:
+        """A hint to append to a refusal when this server's code stamp no longer matches the code on
+        disk — so a reader who runs a rescan and still sees the refusal knows why: the rescan used
+        the newer on-disk code, but the server is still grading against the code it started with.
+        Recomputes the on-disk stamp (uncached), so it is called only when a refusal is being made,
+        at most once per tool call. None when they match."""
+        disk = rescan_version.on_disk_code_stamp(_config)
+        if disk == _current:
+            return None
+        scans = "equal" if disk.scan == _current.scan else "differ"
+        return (
+            f"this MCP server started before tmap's code on disk changed (server: hunt "
+            f"{_current.hunt}, disk: hunt {disk.hunt}; scan stamps {scans}). Restart the MCP "
+            "server: a rescan from the command line uses the code on disk and cannot make runs "
+            "current for this server."
+        )
 
     def _error(atlas: sqlite3.Connection, msg: str) -> dict[str, Any]:
         """A hard-error fact result: never a silent empty. Carries ``runs_in_atlas`` so the
@@ -733,12 +764,15 @@ def make_tools(
         gate, it is an open door beside a locked one, and the caller has no way to know which they
         walked through.
         """
-        stale = _run_staleness(run, build_hash=_current_pass_version(), commit=_installed_commit())
+        stale = _run_staleness(
+            run, build_hash=_current_pass_version(), current=_current, commit=_installed_commit()
+        )
         if not stale.stale:
             return None
         err = _error(atlas, f"run '{run.run_id}' is a STALE scan ({stale.axis}): {stale.detail}")
         err["stale_scan"] = {"axis": stale.axis, "detail": stale.detail}
-        err["remedy"] = stale.remedy
+        moved = _server_code_moved()
+        err["remedy"] = f"{stale.remedy} {moved}" if moved else stale.remedy
         return err
 
     def _refuse_stale_run(atlas: sqlite3.Connection, run_id: str | None) -> dict[str, Any] | None:
@@ -755,7 +789,7 @@ def make_tools(
         err = _stale_refusal(atlas, run)
         if err is not None:
             err["resolved_run"] = run.run_id
-            err["run_lineage"] = _lineage_inline(run)
+            err["run_lineage"] = _lineage_inline(run, _current)
         return err
 
     def _unknown_run(
@@ -829,7 +863,7 @@ def make_tools(
             if err is not None:
                 err["stale_scan"]["diff_side"] = side
                 err["diff_id"] = diff_id
-                err["run_lineage"] = _lineage_inline(run)
+                err["run_lineage"] = _lineage_inline(run, _current)
                 return err
         return None
 
@@ -873,14 +907,21 @@ def make_tools(
         build = _current_pass_version()
         commit = _installed_commit()
         index: dict[str, dict[str, Any]] = {}
+        # Computed at most once, and only if a refusal is actually made (it recomputes on-disk
+        # hashes): the first stale run fills it, the rest reuse it.
+        moved: str | None = None
+        moved_computed = False
         for r in _list_runs(atlas):
-            stale = _run_staleness(r, build_hash=build, commit=commit)
+            stale = _run_staleness(r, build_hash=build, current=_current, commit=commit)
             if stale.stale:
+                if not moved_computed:
+                    moved = _server_code_moved()
+                    moved_computed = True
                 index[r.run_id] = {
                     "run_id": r.run_id,
                     "axis": stale.axis,
                     "detail": stale.detail,
-                    "remedy": stale.remedy,
+                    "remedy": f"{stale.remedy} {moved}" if moved else stale.remedy,
                 }
         return index
 
@@ -975,12 +1016,12 @@ def make_tools(
                     "this tool needs function=<name/addr> (or an evidence_ref that supplies one).",
                 )
                 err["resolved_run"] = run.run_id
-                err["run_lineage"] = _lineage_inline(run)
+                err["run_lineage"] = _lineage_inline(run, _current)
                 return err
             db = _resolve_db(atlas, run)
             if isinstance(db, dict):  # hard error — still stamped with the run it refers to
                 db["resolved_run"] = run.run_id
-                db["run_lineage"] = _lineage_inline(run)
+                db["run_lineage"] = _lineage_inline(run, _current)
                 return db
             conn = facts.open_analysis_ro(db)
             try:
@@ -993,7 +1034,7 @@ def make_tools(
             result["atlas"] = str(atlas_path)
             result["resolved_run"] = run.run_id
             result["run_source"] = locus["run_source"]
-            result["run_lineage"] = _lineage_inline(run)
+            result["run_lineage"] = _lineage_inline(run, _current)
             if evidence_ref is not None:
                 ref_facts = _ref_anchor_facts(atlas, evidence_ref)
                 if ref_facts:
@@ -1551,7 +1592,7 @@ def make_tools(
                 refusal = _stale_refusal(conn, run)
                 if refusal is not None:
                     refusal["resolved_run"] = run.run_id
-                    refusal["run_lineage"] = _lineage_inline(run)
+                    refusal["run_lineage"] = _lineage_inline(run, _current)
                     refusal["evidence_ref"] = evidence_ref
                     return refusal
             ex = _explain_candidate(conn, evidence_ref)
@@ -1585,7 +1626,7 @@ def make_tools(
             )
         if run is not None:
             data["resolved_run"] = run.run_id
-            data["run_lineage"] = _lineage_inline(run)
+            data["run_lineage"] = _lineage_inline(run, _current)
         return data
 
     def get_sink_provenance(
@@ -1619,7 +1660,7 @@ def make_tools(
                 refusal = _stale_refusal(conn, run)
                 if refusal is not None:
                     refusal["resolved_run"] = run.run_id
-                    refusal["run_lineage"] = _lineage_inline(run)
+                    refusal["run_lineage"] = _lineage_inline(run, _current)
                     refusal["evidence_ref"] = evidence_ref
                     return refusal
             result: dict[str, Any] = _get_sink_provenance(
@@ -1633,7 +1674,7 @@ def make_tools(
         # under a mismatched session — echo the canonical resolved_run + lineage to prove it.
         if run is not None:
             result["resolved_run"] = run.run_id
-            result["run_lineage"] = _lineage_inline(run)
+            result["run_lineage"] = _lineage_inline(run, _current)
         return result
 
     def get_nvram_key_flow(key: str, run_id: str | None = None) -> dict[str, Any]:
@@ -2318,6 +2359,7 @@ def make_tools(
                 candidate_anchor=candidate_anchor,
                 members_offset=members_offset,
                 build_hash=_current_pass_version(),
+                current=_current,
                 commit=_installed_commit(),
             )
             return _fit_members(result, members_offset or 0)
@@ -3315,15 +3357,21 @@ def make_tools(
     }
 
 
-def build_server(atlas_db: Path | str, *, workspaces_root: Path | str | None = None) -> Any:
+def build_server(
+    atlas_db: Path | str,
+    *,
+    workspaces_root: Path | str | None = None,
+    config: Config | None = None,
+) -> Any:
     """Construct a FastMCP server exposing the fact tools bound to one ATLAS (not one firmware).
 
     A fact tool resolves run_id -> analysis.db through the atlas ``run`` table; ``workspaces_root``
-    is an optional fallback resolver. The server's standing instructions are the agent workflow
-    guide; the legal notice stays reachable via the legal_notice tool. ``mcp`` is a core dependency
+    is an optional fallback resolver. ``config`` supplies the content-marked settings the currency
+    stamp reads (None loads them). The server's standing instructions are the agent workflow guide;
+    the legal notice stays reachable via the legal_notice tool. ``mcp`` is a core dependency
     (the server is the substrate's primary consumer), so FastMCP is imported at top level."""
     server = FastMCP("treasure-map", instructions=_AGENT_INSTRUCTIONS)
-    for name, fn in make_tools(atlas_db, workspaces_root=workspaces_root).items():
+    for name, fn in make_tools(atlas_db, workspaces_root=workspaces_root, config=config).items():
         server.add_tool(fn, annotations=tool_annotations(name))
     return server
 

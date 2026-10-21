@@ -27,8 +27,13 @@ from treasure_map.lib.query import diff_annotations as da
 from treasure_map.lib.query import patch_view as pv
 from treasure_map.lib.query import same_shape_siblings as ss
 from treasure_map.lib.query.sink_overlay import _subject_key
+from treasure_map.lib.rescan_version import CodeStamp
 from treasure_map.lib.storage.connection import open_db
 from treasure_map.version import UNKNOWN_VERSION
+
+# An old run (no code stamp) is read through the commit fallback, and this install's commit is
+# UNKNOWN, so the diff is servable regardless of this value — it just has to be supplied.
+_CURRENT = CodeStamp(hunt="src-a1a1a1a1a1a1a1a1", scan="{}")
 
 SHA_A = "a" * 64
 SHA_B = "b" * 64
@@ -325,7 +330,12 @@ def world(tmp_path: Path, current: None) -> World:
 
 def _sib(w: World, **kw: Any) -> dict[str, Any]:
     return ss.same_shape_siblings(
-        w.atlas, kw.pop("diff_id", DIFF), build_hash=w.build, commit=UNKNOWN_VERSION, **kw
+        w.atlas,
+        kw.pop("diff_id", DIFF),
+        build_hash=w.build,
+        current=_CURRENT,
+        commit=UNKNOWN_VERSION,
+        **kw,
     )
 
 

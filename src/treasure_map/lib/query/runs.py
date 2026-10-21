@@ -15,6 +15,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 
+from treasure_map.lib import rescan_version
 from treasure_map.lib.atlas.models import RunRow
 from treasure_map.version import UNKNOWN_VERSION
 
@@ -26,6 +27,8 @@ _RUN_COLUMNS = (
     "build_hash",
     "hunt_commit",
     "hunt_instances",
+    "hunt_code_version",
+    "scan_stamp",
     "tool_version",
     "ghidra_version",
     "machine",
@@ -47,6 +50,8 @@ def _row_to_runrow(row: sqlite3.Row) -> RunRow:
         build_hash=row["build_hash"],
         hunt_commit=row["hunt_commit"],
         hunt_instances=row["hunt_instances"],
+        hunt_code_version=row["hunt_code_version"],
+        scan_stamp=row["scan_stamp"],
         tool_version=row["tool_version"],
         ghidra_version=row["ghidra_version"],
         machine=row["machine"],
@@ -179,11 +184,16 @@ def _remedy_for(run: RunRow) -> str:
     )
 
 
-def run_staleness(run: RunRow, *, build_hash: str | None, commit: str) -> Staleness:
+def run_staleness(
+    run: RunRow, *, build_hash: str | None, current: rescan_version.CodeStamp, commit: str
+) -> Staleness:
     """Compare a run's stored lineage against the code running now.
 
-    ``build_hash`` is the extraction pipeline's current content hash and ``commit`` the running
-    install's commit; either may be unknown, which yields a not-stale result with a stated reason.
+    ``build_hash`` is the extraction pipeline's current content hash; ``current`` is the running
+    code's stamp (hunt code hash + scan stamp). ``commit`` is the running install's commit, used
+    ONLY to fall back for a run hunted before the code stamps existed. A positive mismatch is the
+    bar — a failure to confirm a match (a missing stamp, an unknown dependency) is a caveat, never a
+    refusal.
     """
     stored_build = run.build_hash
     if (
@@ -202,26 +212,53 @@ def run_staleness(run: RunRow, *, build_hash: str | None, commit: str) -> Stalen
             "this run would be re-derived differently by the code answering you now.",
             _remedy_for(run),
         )
-    if (
-        run.hunt_commit
-        and run.hunt_commit != UNKNOWN_VERSION
-        and commit != UNKNOWN_VERSION
-        and run.hunt_commit != commit
-    ):
-        return Staleness(
-            True,
-            "hunt",
-            f"hunted by tmap {run.hunt_commit[:12]}, running {commit[:12]} — the candidates stored "
-            "for this run were graded by different code than is answering you now.",
-            _remedy_for(run),
-        )
+    if run.hunt_code_version is None:
+        # Hunted before the code stamp existed: fall back to comparing git commits, as before. Only
+        # a positive, two-real-commits-differ mismatch refuses; everything else is a caveat below.
+        if (
+            run.hunt_commit
+            and run.hunt_commit != UNKNOWN_VERSION
+            and commit != UNKNOWN_VERSION
+            and run.hunt_commit != commit
+        ):
+            return Staleness(
+                True,
+                "hunt",
+                f"hunted by tmap {run.hunt_commit[:12]}, running {commit[:12]} — the candidates "
+                "stored for this run were graded by different code than is answering you now.",
+                _remedy_for(run),
+            )
+    else:
+        if run.hunt_code_version != current.hunt:
+            return Staleness(
+                True,
+                "hunt",
+                f"hunted by hunt code {run.hunt_code_version}, running {current.hunt} — the "
+                "candidates stored for this run were graded by different code than is answering "
+                "you now.",
+                _remedy_for(run),
+            )
+        cmp = rescan_version.compare_scan_stamps(run.scan_stamp, current.scan)
+        if cmp.differing:
+            return Staleness(
+                True,
+                "hunt",
+                f"scanned with {'; '.join(cmp.differing)} — a rescan now would rebuild the facts "
+                "these candidates were graded from differently.",
+                _remedy_for(run),
+            )
     # Not provably stale. Say which comparisons could not be made, so "not stale" is never read as
     # "confirmed current" when in fact nothing was comparable.
     unknowns = []
     if not stored_build or not build_hash or (stored_build or "").startswith("mixed:"):
         unknowns.append("extraction hash")
-    if not run.hunt_commit or run.hunt_commit == UNKNOWN_VERSION or commit == UNKNOWN_VERSION:
-        unknowns.append("hunt commit")
+    if run.hunt_code_version is None:
+        if not run.hunt_commit or run.hunt_commit == UNKNOWN_VERSION or commit == UNKNOWN_VERSION:
+            unknowns.append("hunt commit")
+    else:
+        cmp = rescan_version.compare_scan_stamps(run.scan_stamp, current.scan)
+        if cmp.unknown:
+            unknowns.append(f"scan stamp ({', '.join(cmp.unknown)})")
     if unknowns:
         return Staleness(
             False,
@@ -230,6 +267,4 @@ def run_staleness(run: RunRow, *, build_hash: str | None, commit: str) -> Stalen
             "which is not the same as shown to be current.",
             _remedy_for(run),
         )
-    return Staleness(
-        False, None, "extraction hash and hunt commit both match the running tmap.", ""
-    )
+    return Staleness(False, None, "extraction hash and code stamps all match the running tmap.", "")

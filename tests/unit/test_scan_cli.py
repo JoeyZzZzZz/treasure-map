@@ -576,3 +576,14 @@ def test_the_workspace_stays_locked_through_the_hunt(
     assert result.exit_code == 0, result.output
     assert seen == {"analyze": "refused", "hunt": "refused"}
     assert _try_workspace(tmp_path / "workspaces" / "router_v1") == "acquired"
+
+
+def test_the_removed_skip_options_are_rejected(tmp_path: Path) -> None:
+    """`tmap scan` no longer accepts `--skip-non-binary` / `--skip-ingester` (the non-binary stage
+    always runs now). Passing either is an unknown-option error.
+
+    MUTATION: restore either option on the scan command -> RED."""
+    for opt in ("--skip-non-binary", "--skip-ingester=shell_script"):
+        out = CliRunner().invoke(scan, [str(tmp_path), opt])
+        assert out.exit_code != 0
+        assert "No such option" in out.output, (opt, out.output)

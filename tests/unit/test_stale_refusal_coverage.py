@@ -26,9 +26,14 @@ from treasure_map.lib.analyze.ghidra_runner import current_pass_version
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import InstanceRow
 from treasure_map.lib.atlas.writer import add_instance, begin_run, finish_run, upsert_pattern
+from treasure_map.lib.rescan_version import CodeStamp
 from treasure_map.lib.storage.connection import open_db
 
 STALE_BUILD = "0000staleaaaa000"
+
+# The staleness in this file is driven by the extraction axis (build_hash), so the code stamp the
+# gate compares against does not decide anything here; a fixed stamp keeps the signature satisfied.
+_CURRENT = CodeStamp(hunt="src-current00000", scan="{}")
 
 
 def _analysis(tmp_path: Path, name: str) -> Path:
@@ -114,12 +119,14 @@ def test_the_fixture_really_is_provably_stale(atlas: Path) -> None:
         stale = run_staleness(
             get_run(conn, "run_stale"),  # type: ignore[arg-type]
             build_hash=current_pass_version(),
+            current=_CURRENT,
             commit="c" * 40,
         )
         assert stale.stale is True and stale.axis == "extraction"
         ok = run_staleness(
             get_run(conn, "run_ok"),  # type: ignore[arg-type]
             build_hash=current_pass_version(),
+            current=_CURRENT,
             commit="c" * 40,
         )
         assert ok.stale is False

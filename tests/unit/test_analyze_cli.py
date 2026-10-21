@@ -156,3 +156,15 @@ def test_analyze_hands_the_pipeline_an_absolute_firmware_root(
     result = CliRunner().invoke(analyze, ["fs", "--workspace", "ws"])
     assert result.exit_code == 0, result.output
     assert seen == [tmp_path.resolve() / "fs"]
+
+
+def test_the_removed_skip_options_are_rejected(tmp_path: Path) -> None:
+    """`--skip-non-binary` / `--skip-ingester` were removed: the non-binary stage now always runs,
+    so a run's facts do not depend on which optional stages a past scan happened to skip. Passing
+    either is an unknown-option error, not a silent no-op.
+
+    MUTATION: restore either option on the analyze command -> RED."""
+    for opt in ("--skip-non-binary", "--skip-ingester=shell_script"):
+        out = CliRunner().invoke(analyze, [str(tmp_path), opt])
+        assert out.exit_code != 0
+        assert "No such option" in out.output, (opt, out.output)

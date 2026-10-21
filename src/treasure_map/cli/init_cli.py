@@ -30,11 +30,11 @@ def runs_currency(cfg: Config | None) -> RunsCurrency:
     """How many runs in the atlas an older tmap made — the same classifier ``tmap rescan`` uses,
     read through a READ-ONLY connection (init never migrates the atlas)."""
     from treasure_map.cli.hunt_cli import _live_instance_counts, _staleness_tiers
+    from treasure_map.lib import rescan_version
     from treasure_map.lib.analyze.ghidra_runner import current_pass_version
     from treasure_map.lib.config.config import Config as _Config
     from treasure_map.lib.query import list_runs
     from treasure_map.lib.setup.doctor import RunsCurrency
-    from treasure_map.version import installed_commit
 
     atlas = (cfg or _Config()).atlas.db_path
     if not atlas.exists():
@@ -57,7 +57,10 @@ def runs_currency(cfg: Config | None) -> RunsCurrency:
     finally:
         conn.close()
     tiers, _current = _staleness_tiers(
-        runs, current_build=current_pass_version(), commit=installed_commit(), live=live
+        runs,
+        current_build=current_pass_version(),
+        current=rescan_version.current_code_stamp(cfg or _Config()),
+        live=live,
     )
     return RunsCurrency(sum(len(v) for v in tiers.values()))
 

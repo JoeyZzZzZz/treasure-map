@@ -98,6 +98,16 @@ CREATE TABLE IF NOT EXISTS run (
                                         -- links, every table's row count). build_hash names the
                                         -- extraction CODE; this names the firmware it read. The
                                         -- skip gate requires it to match; NULL re-hunts.
+    hunt_code_version TEXT,             -- lib/rescan_version.hunt_code_version() when this run was
+                                        -- hunted: the content hash of the hunt code. NULL on a run
+                                        -- hunted before this column existed, which falls back to
+                                        -- the commit. The STALE-hunt signal that replaces comparing
+                                        -- git commits.
+    scan_stamp        TEXT,             -- the analysis.db's scan_stamp the hunt copied here (code
+                                        -- hash + pyelftools + content-config). A reader compares it
+                                        -- with the running scan stamp to tell whether a re-scan
+                                        -- would rebuild the facts differently. NULL when none could
+                                        -- be copied (an older analysis.db).
     tool_version      TEXT,             -- treasure_map __version__ that produced this run
     ghidra_version    TEXT,             -- decompiler version, when known; else NULL
     machine           TEXT,             -- host that ran the scan, when known; else NULL

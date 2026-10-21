@@ -224,7 +224,7 @@ such entries out).
 
 ```bash
 tmap update                                 # install the newest tmap
-tmap rescan                                 # re-scan every run an older tmap made
+tmap rescan                                 # re-scan every run this tmap's code would redo
 tmap diff --before fw-v1 --after fw-v2      # re-runs the diffs that are out of date
 ```
 
@@ -234,7 +234,8 @@ PATH that would shadow the new one, and then starts the new version's `tmap init
 tells you how many of your runs predate the new version. A diff made by an older tmap, or with
 another toolchain, is recomputed once.
 
-With no arguments, `tmap rescan` re-scans every run an older tmap made. To rescan a single firmware,
+With no arguments, `tmap rescan` re-scans every run the installed tmap's code would produce
+differently. To rescan a single firmware,
 name its run — the `-w` name you scanned it with, unless you set `--run-id` — for example
 `tmap rescan fw-v1`. `--dry-run` lists what would be rescanned and why, without running anything.
 

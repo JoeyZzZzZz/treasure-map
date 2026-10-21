@@ -70,6 +70,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from treasure_map.lib import rescan_version
 from treasure_map.lib.query import diff_review
 from treasure_map.lib.query.diff_align import diff_source_staleness
 from treasure_map.lib.query.patch_view import (
@@ -233,10 +234,16 @@ def _meta(atlas: sqlite3.Connection, diff_id: str) -> _Meta | None:
 
 
 def refuse_stale_diff(
-    atlas: sqlite3.Connection, diff_id: str, *, build_hash: str | None, commit: str
+    atlas: sqlite3.Connection,
+    diff_id: str,
+    *,
+    build_hash: str | None,
+    current: rescan_version.CodeStamp,
+    commit: str,
 ) -> dict[str, Any] | None:
     """The refusal for a diff whose A or B side is a PROVABLY stale run (lib/query/runs
-    run_staleness, against the running extraction ``build_hash`` and install ``commit``), else None.
+    run_staleness, against the running extraction ``build_hash`` and code stamp ``current``), else
+    None.
 
     The same refusal the MCP diff tools give, with the same keys, here in the read layer so the
     command line refuses what MCP refuses. An unknown diff_id passes: 'no such diff' is answered by
@@ -250,7 +257,7 @@ def refuse_stale_diff(
         run = get_run(atlas, run_id) if run_id else None
         if run is None:
             continue
-        stale = run_staleness(run, build_hash=build_hash, commit=commit)
+        stale = run_staleness(run, build_hash=build_hash, current=current, commit=commit)
         if stale.stale:
             return {
                 "diff_id": diff_id,
@@ -644,6 +651,7 @@ def same_shape_siblings(
     members_offset: int | None = None,
     members_limit: int = MEMBERS_PAGE_LIMIT,
     build_hash: str | None,
+    current: rescan_version.CodeStamp,
     commit: str,
 ) -> dict[str, Any]:
     """The same-shape group of one sink call of a diff (see the module docstring).
@@ -660,7 +668,9 @@ def same_shape_siblings(
     meta = _meta(atlas, diff_id)
     if meta is None:
         return {"diff_id": diff_id, "error": f"no diff {diff_id!r} in this atlas (see list_diffs)"}
-    refusal = refuse_stale_diff(atlas, diff_id, build_hash=build_hash, commit=commit)
+    refusal = refuse_stale_diff(
+        atlas, diff_id, build_hash=build_hash, current=current, commit=commit
+    )
     if refusal is not None:
         return refusal
     bad = _check_args(evidence_ref, candidate_anchor, members_offset, members_limit)

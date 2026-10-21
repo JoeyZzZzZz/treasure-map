@@ -752,15 +752,33 @@ class _Diff:
     instruction_rows: int
 
 
-def _gen(atlas: sqlite3.Connection, run_id: str) -> tuple[str | None, str | None] | None:
+def _gen(
+    atlas: sqlite3.Connection, run_id: str
+) -> tuple[str | None, str | None, str | None, str | None] | None:
     row = atlas.execute(
-        "SELECT hunt_commit, build_hash FROM run WHERE run_id = ?", (run_id,)
+        "SELECT hunt_commit, build_hash, hunt_code_version, scan_stamp FROM run WHERE run_id = ?",
+        (run_id,),
     ).fetchone()
-    return None if row is None else (row[0], row[1])
+    return None if row is None else (row[0], row[1], row[2], row[3])
 
 
 def _known(commit: str | None) -> bool:
     return bool(commit) and commit != UNKNOWN_VERSION
+
+
+def _gen_mismatch(
+    ga: tuple[str | None, str | None, str | None, str | None],
+    gb: tuple[str | None, str | None, str | None, str | None],
+) -> bool:
+    """Whether two runs' candidates were provably produced by different extraction or hunt code.
+    Kept logic-identical to sink_overlay's ``_generation_mismatch``: build_hash differs; or both
+    carry a hunt code stamp and it differs (or a scan stamp is missing or differs); or, for an older
+    run, both commits are known and differ."""
+    if ga[1] != gb[1]:
+        return True
+    if ga[2] is not None and gb[2] is not None:
+        return ga[2] != gb[2] or ga[3] is None or gb[3] is None or ga[3] != gb[3]
+    return _known(ga[0]) and _known(gb[0]) and ga[0] != gb[0]
 
 
 def _load_diff(atlas: sqlite3.Connection, diff_id: str) -> _Diff | None:
@@ -783,9 +801,8 @@ def _load_diff(atlas: sqlite3.Connection, diff_id: str) -> _Diff | None:
         wide.append("version_skew")
     else:
         ga, gb = _gen(atlas, run_a), _gen(atlas, run_b)
-        if ga is not None and gb is not None:
-            if ga[1] != gb[1] or (_known(ga[0]) and _known(gb[0]) and ga[0] != gb[0]):
-                wide.append("extraction_generation_mismatch")
+        if ga is not None and gb is not None and _gen_mismatch(ga, gb):
+            wide.append("extraction_generation_mismatch")
     pairs = [
         _Pair(*r)
         for r in atlas.execute(

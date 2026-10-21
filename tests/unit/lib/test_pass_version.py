@@ -34,55 +34,101 @@ _INGEST = _ANALYZE / "ghidra_ingest.py"
 
 # ── the mechanical completeness gate ──────────────────────────────────────────────────
 
+# A pipeline module that READS a treasure_map name from a module NOT in _PIPELINE_PY_MODULES folds
+# un-hashed logic into the cached output (the fingerprint hashes exactly the declared set + .java +
+# .tsv). Any such read that is nonetheless safe — it does not shape what is stored — is excused here
+# with the reason, keyed ``reading-module.py:name``. Today none are needed: the pipeline is closed
+# under non-annotation reads.
+_PASS_EXCLUDED: dict[str, str] = {}
+_DECLARED = set(_PIPELINE_PY_MODULES)
 
-def _analyze_modules_called_in(path: Path) -> set[str]:
-    """The ``analyze.*`` modules whose imported symbols are CALLED in ``path``.
 
-    An imported name that is only used as a type annotation (``list[ElfRecord]``) is NOT a call, so
-    the module it came from is not a pipeline member — which is exactly how elf_inventory stays out
-    while stub_resolve, whose ``resolve_stubs`` / ``relabel_callees`` are invoked, stays in. This is
-    the machine reading of "its output is written into the functions cache", tied to the one file
-    that does that writing (ghidra_ingest)."""
+def _non_annotation_name_ids(node: object, ids: set[int]) -> None:
+    """The id()s of every ``ast.Name`` reached WITHOUT descending into an ``annotation`` /
+    ``returns`` field — the same reading test_code_version._used_names takes, so a name used only as
+    a type does not count as a read."""
+    if isinstance(node, ast.AST):
+        for field, value in ast.iter_fields(node):
+            if field in ("annotation", "returns"):
+                continue
+            _non_annotation_name_ids(value, ids)
+        if isinstance(node, ast.Name):
+            ids.add(id(node))
+    elif isinstance(node, list):
+        for item in node:
+            _non_annotation_name_ids(item, ids)
+
+
+def _treasure_map_reads(path: Path) -> set[tuple[str, str]]:
+    """``(source-module .py basename, imported name)`` for every treasure_map name READ outside a
+    type annotation in ``path`` — the reads-based membership criterion, covering ALL treasure_map
+    imports (not only ``.analyze.``) and counting ``alias.attr`` reads of a module alias too."""
     tree = ast.parse(path.read_text())
-    symbol_module: dict[str, str] = {}
+    name_src: dict[str, str] = {}
     for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.module and ".analyze." in f".{node.module}.":
-            module_file = node.module.rsplit(".", 1)[-1] + ".py"
+        if (
+            isinstance(node, ast.ImportFrom)
+            and node.module
+            and node.module.startswith("treasure_map")
+        ):
+            base = node.module.rsplit(".", 1)[-1] + ".py"
             for alias in node.names:
-                symbol_module[alias.asname or alias.name] = module_file
-    called: set[str] = set()
+                # for `from treasure_map.pkg import submod`, the local alias names the submodule, so
+                # an `alias.attr` read is a read of submod.py; record both possibilities.
+                name_src[alias.asname or alias.name] = base
+                name_src.setdefault(f"@{alias.asname or alias.name}", alias.name + ".py")
+    non_ann: set[int] = set()
+    _non_annotation_name_ids(tree, non_ann)
+    reads: set[tuple[str, str]] = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            func = node.func
-            name = func.id if isinstance(func, ast.Name) else None
-            if name and name in symbol_module:
-                called.add(symbol_module[name])
-    return called
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and f"@{node.value.id}" in name_src
+            and id(node.value) in non_ann
+        ):
+            reads.add((name_src[f"@{node.value.id}"], node.value.id))
+        elif isinstance(node, ast.Name) and node.id in name_src and id(node) in non_ann:
+            reads.add((name_src[node.id], node.id))
+    return reads
 
 
 def test_the_declared_set_matches_the_dirty_loop_functions_writers() -> None:
     # ★ THE COMPLETENESS LOCK. The declared pipeline set must equal exactly {ghidra_ingest itself}
-    # plus every analyze module whose output ghidra_ingest CALLS into the functions cache. Add an
-    # extraction step and call it in ingest without declaring it here, and this fails — the set
-    # cannot silently fall behind the code.
+    # plus every analyze module ghidra_ingest READS into the functions cache. Add an extraction step
+    # and use it in ingest without declaring it here, and this fails — the set cannot silently fall
+    # behind the code.
     #
-    # MUTATION (verified RED, 1 failed): drop "stub_resolve.py" from _PIPELINE_PY_MODULES in
-    # ghidra_runner.py -> the computed set includes it (stub_resolve is called in ingest) but the
-    # declared set does not -> mismatch.
-    computed = {"ghidra_ingest.py"} | _analyze_modules_called_in(_INGEST)
-    assert set(_PIPELINE_PY_MODULES) == computed, (
-        f"declared {set(_PIPELINE_PY_MODULES)} != writers-in-dirty-loop {computed}"
-    )
+    # MUTATION (verified RED): drop "stub_resolve.py" from _PIPELINE_PY_MODULES in ghidra_runner.py
+    # -> the computed set includes it (read in ingest) but the declared set does not -> mismatch.
+    computed = {"ghidra_ingest.py"} | {src for src, _ in _treasure_map_reads(_INGEST)}
+    assert _DECLARED == computed, f"declared {_DECLARED} != writers-in-dirty-loop {computed}"
+
+
+def test_the_pipeline_modules_read_only_declared_extraction_code() -> None:
+    # ★ The CLOSURE of the criterion, extended to EVERY declared pipeline module and to every
+    # treasure_map import. Each of them must read only code that is itself in the fingerprint (the
+    # declared set) or excused in _PASS_EXCLUDED — otherwise an un-hashed module's logic reaches the
+    # cached output and a same-content re-scan would skip the change.
+    #
+    # MUTATION: make stub_resolve read a function from an undeclared module (e.g. lib.pattern)
+    # without declaring it -> RED.
+    offenders: list[str] = []
+    for mod in _PIPELINE_PY_MODULES:
+        for src, name in _treasure_map_reads(_ANALYZE / mod):
+            if src not in _DECLARED and f"{mod}:{name}" not in _PASS_EXCLUDED:
+                offenders.append(f"{mod} reads {name} from {src}")
+    assert offenders == [], offenders
 
 
 def test_the_type_only_import_is_not_a_pipeline_member() -> None:
-    # ★ The reason for a call-based criterion, not an import-based one. elf_inventory IS imported by
-    # ghidra_ingest — for the ElfRecord type — but never CALLED to produce cached output, so it is
-    # not a member. An import-closure criterion would wrongly pull it, and symlinks behind it, into
-    # the fingerprint and make an unrelated edit trigger a full re-extraction.
-    called = _analyze_modules_called_in(_INGEST)
-    assert "elf_inventory.py" not in called
-    assert "symlinks.py" not in called
+    # ★ The reason for a reads-based criterion that skips annotations, not an import-based one.
+    # elf_inventory IS imported by ghidra_ingest — for the ElfRecord type — but used ONLY in an
+    # annotation, so it is not a read and not a member. An import-closure criterion would wrongly
+    # pull it, and symlinks behind it, into the fingerprint and force an unrelated re-extraction.
+    sources = {src for src, _ in _treasure_map_reads(_INGEST)}
+    assert "elf_inventory.py" not in sources
+    assert "symlinks.py" not in sources
     # and elf_inventory really is imported (so the exclusion is meaningful, not a missing import)
     assert "from treasure_map.lib.analyze.elf_inventory import" in _INGEST.read_text()
 

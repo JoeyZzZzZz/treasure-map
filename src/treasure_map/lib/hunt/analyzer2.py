@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from treasure_map.lib import facts
+from treasure_map.lib import facts, rescan_version
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import (
     DetectorScanStatusRow,
@@ -109,7 +109,7 @@ from treasure_map.lib.query.nvram import template_has_anchor
 from treasure_map.lib.reachability import grade_candidate
 from treasure_map.lib.reachability.taint import _IDENT_RE, locate_sink_arg
 from treasure_map.lib.ro_db import ro_connect, ro_uri
-from treasure_map.version import UNKNOWN_VERSION, __version__, installed_commit
+from treasure_map.version import __version__, installed_commit
 
 logger = logging.getLogger(__name__)
 
@@ -380,16 +380,21 @@ def hunt_currency(
     run_row: Mapping[str, object] | None,
     *,
     build_hash: str | None,
-    commit: str,
+    hunt_code: str,
+    db_scan_stamp: str | None,
     input_fingerprint: str | None,
 ) -> HuntCurrency:
-    """Decide whether a stored hunt result is reproducible by the current code + extraction.
+    """Decide whether a stored hunt result is reproducible by the current hunt code from this
+    analysis.db.
 
     ★ Every branch that cannot CONFIRM sameness returns not-current. Skipping is the destructive
     direction here: a wrongly-skipped hunt leaves stale candidates that read exactly like fresh
-    ones, while a wrongly-repeated hunt costs only time. So an unknown commit (an install with no
-    recorded commit), a NULL stamp (a run hunted before the stamp existed), a missing lineage hash
-    and an unfinished previous hunt all re-hunt.
+    ones, while a wrongly-repeated hunt costs only time. So a run hunted before the code stamp
+    existed, one hunted by different hunt code, an analysis.db with no scan stamp or one rebuilt
+    since, a changed extraction, a missing lineage hash and an unfinished previous hunt all re-hunt.
+    This asks only whether re-running the hunt over THIS analysis.db reproduces the stored result;
+    it does not compare the running config — whether the analysis.db itself is current is the scan's
+    and the rescan planner's question, not the skip gate's.
 
     ★ The stamp is a claim ABOUT ROWS, so the rows are checked too. ``hunt_commit`` says which code
     produced this run's instances; it says nothing about whether those instances are still in the
@@ -410,14 +415,21 @@ def hunt_currency(
         # An 'in_progress' row is the honest half-written signal begin_run leaves behind; its
         # instances are whatever the crash happened to commit, so they are not a result to keep.
         return HuntCurrency(False, f"previous hunt did not finish (scan_status={status!r})")
-    if commit == UNKNOWN_VERSION:
+    stored_code = run_row.get("hunt_code_version")
+    if stored_code is None:
+        return HuntCurrency(False, "hunted before the code stamp existed")
+    if stored_code != hunt_code:
+        return HuntCurrency(False, f"hunted by hunt code {stored_code}, running {hunt_code}")
+    if db_scan_stamp is None:
         return HuntCurrency(
-            False, "the running install records no commit, so sameness cannot be confirmed"
+            False,
+            "this analysis.db records no scan stamp (scanned before the stamp existed, or by a "
+            "scan that did not finish)",
         )
-    stored_commit = run_row.get("hunt_commit")
-    if stored_commit != commit:
-        shown = stored_commit if stored_commit else "none recorded"
-        return HuntCurrency(False, f"hunted by a different tmap ({shown} != {commit})")
+    if run_row.get("scan_stamp") != db_scan_stamp:
+        return HuntCurrency(
+            False, "the analysis.db was rebuilt since this run was hunted (scan stamp changed)"
+        )
     if build_hash is None:
         return HuntCurrency(False, "this analysis.db records no extraction hash")
     if run_row.get("build_hash") != build_hash:
@@ -440,7 +452,9 @@ def hunt_currency(
             False,
             f"stored candidate rows changed since the hunt ({live_rows} now, {stored_rows} then)",
         )
-    return HuntCurrency(True, f"already hunted by this tmap ({commit[:12]}) from this extraction")
+    return HuntCurrency(
+        True, f"already hunted by this hunt code ({hunt_code}) from this analysis.db"
+    )
 
 
 def _stored_run_row(atlas_path: Path | str, run_id: str) -> dict[str, object] | None:
@@ -455,7 +469,7 @@ def _stored_run_row(atlas_path: Path | str, run_id: str) -> dict[str, object] | 
         try:
             row = conn.execute(
                 "SELECT scan_status, hunt_commit, hunt_instances, build_hash, "
-                "hunt_input_fingerprint FROM run WHERE run_id = ?",
+                "hunt_input_fingerprint, hunt_code_version, scan_stamp FROM run WHERE run_id = ?",
                 (run_id,),
             ).fetchone()
         except sqlite3.OperationalError:
@@ -1231,8 +1245,8 @@ def run_analyzer2(
     (the honest "did not finish" signal), never a run silently missing behind half-written rows.
     ``firmware_path`` is the scanned firmware root when the caller knows it (else NULL).
 
-    SKIPS the whole hunt when the stored result was already produced by this tmap commit from this
-    extraction (see ``hunt_currency``); ``rehunt=True`` forces the work regardless. The skip rests
+    SKIPS the whole hunt when the stored result was already produced by this hunt code from this
+    analysis.db (see ``hunt_currency``); ``rehunt=True`` forces the work regardless. The skip rests
     on the hunt being deterministic over its content columns for a fixed (analysis.db, code) pair.
     """
     # Scan-lineage facts (binary/function counts + extraction build hash) for the run row. Read
@@ -1242,15 +1256,23 @@ def run_analyzer2(
     lineage_conn = facts.open_analysis_ro(db_path)
     try:
         lineage = facts.analysis_run_counts(lineage_conn)
+        # The analysis.db's scan stamp, read on the SAME connection as the counts. Compared against
+        # the copy on the stored run row to tell whether the analysis.db was rebuilt since the hunt.
+        db_stamp = rescan_version.read_scan_stamp(lineage_conn)
     finally:
         lineage_conn.close()
 
+    # Grab the code stamps at the START (cached, fixed for this process); currency and finish_run
+    # both use the same ``hunt_code``, so what is skipped and what is written cannot disagree. The
+    # commit is still recorded for display, the sink-overlay baseline, and the old-run fallback.
     commit = installed_commit()
+    hunt_code = rescan_version.hunt_code_version()
     fingerprint = hunt_input_fingerprint(db_path)
     currency = hunt_currency(
         _stored_run_row(atlas_path, source_run_id),
         build_hash=lineage["build_hash"],
-        commit=commit,
+        hunt_code=hunt_code,
+        db_scan_stamp=db_stamp,
         input_fingerprint=fingerprint,
     )
     if currency.current and not rehunt:
@@ -2006,6 +2028,10 @@ def run_analyzer2(
             hunt_instances=instances_written,
             # ...and what it read, so a later skip can tell the same firmware from another one.
             hunt_input_fingerprint=fingerprint,
+            # The code-content stamps that drive the currency decision: the hunt code's hash, and
+            # the analysis.db's scan stamp copied over so a reader can tell it was rebuilt since.
+            hunt_code_version=hunt_code,
+            scan_stamp=db_stamp,
         )
     finally:
         atlas.close()

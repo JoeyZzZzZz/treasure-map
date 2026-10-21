@@ -25,6 +25,7 @@ from treasure_map.lib.atlas.models import RunRow
 from treasure_map.lib.atlas.writer import begin_run, finish_run
 from treasure_map.lib.hunt.analyzer2 import hunt_currency
 from treasure_map.lib.query import get_run, run_staleness
+from treasure_map.lib.rescan_version import CodeStamp
 from treasure_map.lib.storage.connection import open_db
 from treasure_map.version import UNKNOWN_VERSION
 
@@ -32,6 +33,27 @@ COMMIT = "a" * 40
 OTHER = "b" * 40
 BUILD = "8beedde56942dbb1"
 FP = "f" * 32  # the hunt input fingerprint
+HCODE = "src-a1a1a1a1a1a1a1a1"  # the running hunt code stamp
+OTHER_HCODE = "src-b2b2b2b2b2b2b2b2"
+
+
+def _scan(
+    *, code: str = "src-c3c3c3c3c3c3c3c3", pyelftools: str = "0.33", threshold: int = 25000
+) -> str:
+    """A canonical-JSON scan stamp, so a test can vary one leaf at a time (code / deps / config)."""
+    return json.dumps(
+        {
+            "code": code,
+            "deps": {"pyelftools": pyelftools},
+            "config": {"xref_fold_edge_threshold": threshold},
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+SCAN = _scan()
+CURRENT = CodeStamp(hunt=HCODE, scan=SCAN)  # the running code stamp staleness compares against
 
 
 def _row(**over: object) -> dict[str, object]:
@@ -43,6 +65,8 @@ def _row(**over: object) -> dict[str, object]:
     base: dict[str, object] = {
         "scan_status": "complete",
         "hunt_commit": COMMIT,
+        "hunt_code_version": HCODE,
+        "scan_stamp": SCAN,
         "build_hash": BUILD,
         "hunt_instances": 3,
         "live_instances": 3,
@@ -55,69 +79,51 @@ def _row(**over: object) -> dict[str, object]:
 # --------------------------------------------------------------------------- currency decision
 
 
-def test_same_commit_and_same_extraction_is_current() -> None:
+def test_same_code_and_same_analysis_db_is_current() -> None:
     """The one case that skips: both inputs to the hunt are demonstrably the ones already used."""
-    c = hunt_currency(_row(), build_hash=BUILD, commit=COMMIT, input_fingerprint=FP)
+    c = hunt_currency(
+        _row(), build_hash=BUILD, hunt_code=HCODE, db_scan_stamp=SCAN, input_fingerprint=FP
+    )
     assert c.current is True
-    assert COMMIT[:12] in c.reason
+    assert HCODE in c.reason
 
 
 @pytest.mark.parametrize(
-    ("row", "build", "commit", "why"),
+    ("row", "build", "hunt_code", "db_stamp", "why"),
     [
-        (None, BUILD, COMMIT, "no run row at all"),
-        (_row(scan_status="in_progress"), BUILD, COMMIT, "previous hunt crashed mid-write"),
-        (_row(scan_status="failed"), BUILD, COMMIT, "previous hunt failed"),
-        (_row(scan_status="partial"), BUILD, COMMIT, "previous hunt only partial"),
-        (_row(hunt_commit=None), BUILD, COMMIT, "hunted before the stamp existed"),
-        (_row(hunt_commit=""), BUILD, COMMIT, "empty stamp"),
-        (_row(hunt_commit=UNKNOWN_VERSION), BUILD, COMMIT, "hunting install had no commit"),
-        (_row(), BUILD, OTHER, "a different tmap is running now"),
-        (_row(), BUILD, UNKNOWN_VERSION, "the running install has no commit to compare"),
-        (_row(), None, COMMIT, "this analysis.db records no extraction hash"),
-        (_row(build_hash=None), BUILD, COMMIT, "the run recorded no extraction hash"),
-        (_row(build_hash="0000"), BUILD, COMMIT, "the extraction changed"),
-        (_row(hunt_input_fingerprint=None), BUILD, COMMIT, "hunted before the fingerprint"),
-        (_row(hunt_input_fingerprint="0" * 32), BUILD, COMMIT, "another firmware was read"),
+        (None, BUILD, HCODE, SCAN, "no run row at all"),
+        (_row(scan_status="in_progress"), BUILD, HCODE, SCAN, "previous hunt crashed mid-write"),
+        (_row(scan_status="failed"), BUILD, HCODE, SCAN, "previous hunt failed"),
+        (_row(scan_status="partial"), BUILD, HCODE, SCAN, "previous hunt only partial"),
+        (_row(hunt_code_version=None), BUILD, HCODE, SCAN, "hunted before the code stamp existed"),
+        (_row(hunt_code_version=OTHER_HCODE), BUILD, HCODE, SCAN, "a different hunt code"),
+        (_row(), BUILD, HCODE, None, "this analysis.db records no scan stamp"),
+        (_row(scan_stamp=_scan(code="src-pipeOTHER")), BUILD, HCODE, SCAN, "analysis.db rebuilt"),
+        (_row(), None, HCODE, SCAN, "no current extraction hash to compare"),
+        (_row(build_hash=None), BUILD, HCODE, SCAN, "the run recorded no extraction hash"),
+        (_row(build_hash="0000"), BUILD, HCODE, SCAN, "the extraction changed"),
+        (_row(hunt_input_fingerprint="0" * 32), BUILD, HCODE, SCAN, "another firmware was read"),
     ],
 )
 def test_every_unconfirmed_case_re_hunts(
-    row: dict[str, object] | None, build: str | None, commit: str, why: str
+    row: dict[str, object] | None, build: str | None, hunt_code: str, db_stamp: str | None, why: str
 ) -> None:
     """★ The load-bearing direction: anything short of a proven match does the work again.
 
-    Each row here is a way of failing to CONFIRM that the stored result came from this code and
-    this extraction. None of them is a proven mismatch — several are simply missing information —
+    Each row here is a way of failing to CONFIRM that the stored result came from this hunt code and
+    this analysis.db. None of them is a proven mismatch — several are simply missing information —
     and all of them must still re-hunt, because a wrongly-skipped hunt leaves stale candidates
     that are indistinguishable from fresh ones while a wrongly-repeated hunt only costs time.
 
     MUTATION (proves this has teeth): loosen any single branch in ``hunt_currency`` — e.g. drop
-    the ``scan_status`` check, or accept a NULL ``hunt_commit`` as matching, or compare only the
-    commit and not the build hash — and the corresponding row here goes RED.
-    """
-    c = hunt_currency(row, build_hash=build, commit=commit, input_fingerprint=FP)
-    assert c.current is False, why
-    assert c.reason, "a decision must always say why, in both directions"
-
-
-def test_unknown_running_commit_never_skips_even_against_an_unknown_stamp() -> None:
-    """Two unknowns must not compare equal into a skip.
-
-    ``UNKNOWN_VERSION`` is a sentinel meaning "not recorded", so a stored 'unknown' and a running
-    'unknown' are two absences, not two matching commits. A plain ``==`` on the stamps alone would
-    read them as a match and skip the hunt for every editable install in existence.
-
-    MUTATION: delete the ``commit == UNKNOWN_VERSION`` early return in ``hunt_currency`` — this
-    test goes RED while every other case above still passes, which is what makes it worth its own
-    test rather than another parametrize row.
+    the ``scan_status`` check, or accept a NULL ``hunt_code_version`` as matching, or compare only
+    the code and not the build hash — and the corresponding row here goes RED.
     """
     c = hunt_currency(
-        _row(hunt_commit=UNKNOWN_VERSION),
-        build_hash=BUILD,
-        commit=UNKNOWN_VERSION,
-        input_fingerprint=FP,
+        row, build_hash=build, hunt_code=hunt_code, db_scan_stamp=db_stamp, input_fingerprint=FP
     )
-    assert c.current is False
+    assert c.current is False, why
+    assert c.reason, "a decision must always say why, in both directions"
 
 
 # --------------------------------------------------------------------------- the stamp itself
@@ -211,7 +217,8 @@ def test_an_atlas_predating_the_column_gains_it_and_keeps_its_rows(tmp_path: Pat
         hunt_currency(
             dict(row) | {"scan_status": "complete", "build_hash": BUILD},
             build_hash=BUILD,
-            commit=COMMIT,
+            hunt_code=HCODE,
+            db_scan_stamp=SCAN,
             input_fingerprint=FP,
         ).current
         is False
@@ -241,6 +248,8 @@ def _run(**over: object) -> RunRow:
         "firmware_path": "/fw/root",
         "build_hash": BUILD,
         "hunt_commit": COMMIT,
+        "hunt_code_version": HCODE,
+        "scan_stamp": SCAN,
         "scan_status": "complete",
     }
     base.update(over)
@@ -250,12 +259,22 @@ def _run(**over: object) -> RunRow:
 @pytest.mark.parametrize(
     ("run", "build", "commit", "axis"),
     [
+        # extraction axis (build_hash), unchanged
         (_run(build_hash="deadbeef"), BUILD, COMMIT, "extraction"),
-        (_run(hunt_commit=OTHER), BUILD, COMMIT, "hunt"),
+        # hunt code stamp differs
+        (_run(hunt_code_version=OTHER_HCODE), BUILD, COMMIT, "hunt"),
+        # scan stamp differs — one proven case per leaf (code / deps / config)
+        (_run(scan_stamp=_scan(code="src-pipeX")), BUILD, COMMIT, "hunt"),
+        (_run(scan_stamp=_scan(pyelftools="0.34")), BUILD, COMMIT, "hunt"),
+        (_run(scan_stamp=_scan(threshold=10000)), BUILD, COMMIT, "hunt"),
+        # an OLD run (no code stamp) still falls back to the commit rule
+        (_run(hunt_code_version=None, scan_stamp=None, hunt_commit=OTHER), BUILD, COMMIT, "hunt"),
+        # an editable install (unknown commit) is still refused when the code stamp PROVES a change
+        (_run(hunt_code_version=OTHER_HCODE), BUILD, UNKNOWN_VERSION, "hunt"),
     ],
 )
 def test_a_proven_mismatch_is_stale(run: RunRow, build: str, commit: str, axis: str) -> None:
-    s = run_staleness(run, build_hash=build, commit=commit)
+    s = run_staleness(run, build_hash=build, current=CURRENT, commit=commit)
     assert s.stale is True
     assert s.axis == axis
     assert s.remedy
@@ -264,12 +283,35 @@ def test_a_proven_mismatch_is_stale(run: RunRow, build: str, commit: str, axis: 
 @pytest.mark.parametrize(
     ("run", "build", "commit", "why"),
     [
-        (_run(hunt_commit=None), BUILD, COMMIT, "no stamp is not a mismatch"),
-        (_run(hunt_commit=UNKNOWN_VERSION), BUILD, COMMIT, "an unrecorded commit is not a commit"),
-        (_run(), BUILD, UNKNOWN_VERSION, "an editable install must not mute every run"),
+        (
+            _run(hunt_code_version=None, scan_stamp=None, hunt_commit=None),
+            BUILD,
+            COMMIT,
+            "old run, no stamp",
+        ),
+        (
+            _run(hunt_code_version=None, scan_stamp=None, hunt_commit=UNKNOWN_VERSION),
+            BUILD,
+            COMMIT,
+            "an unrecorded commit is not a commit",
+        ),
+        (
+            _run(hunt_code_version=None, scan_stamp=None),
+            BUILD,
+            UNKNOWN_VERSION,
+            "an editable install on an old run must not mute it",
+        ),
         (_run(build_hash=None), BUILD, COMMIT, "a run with no hash cannot be shown to differ"),
         (_run(), None, COMMIT, "no current hash to compare against"),
         (_run(build_hash="mixed:3"), BUILD, COMMIT, "a count is not a hash — not comparable"),
+        # new-stamp run whose scan stamp cannot be compared is a caveat, never a refusal
+        (_run(scan_stamp=None), BUILD, COMMIT, "a new run with no scan stamp is unconfirmable"),
+        (
+            _run(scan_stamp=_scan(pyelftools=UNKNOWN_VERSION)),
+            BUILD,
+            COMMIT,
+            "an unknown dep leaf is unconfirmable",
+        ),
     ],
 )
 def test_unconfirmable_is_never_stale(
@@ -286,7 +328,7 @@ def test_unconfirmable_is_never_stale(
     MUTATION: make ``run_staleness`` return stale whenever the stamps merely fail to match — every
     row here goes RED while the proven-mismatch test above still passes.
     """
-    s = run_staleness(run, build_hash=build, commit=commit)
+    s = run_staleness(run, build_hash=build, current=CURRENT, commit=commit)
     assert s.stale is False, why
     assert s.detail, "a not-stale reading must still say what could not be compared"
 
@@ -297,10 +339,15 @@ def test_remedy_names_a_runnable_command_only_when_the_firmware_is_recorded() ->
     MUTATION: make ``_remedy_for`` always emit the rescan command -> RED. The wrong remedy is worse
     than a vague one: it sends the reader to a command that cannot work and looks like their fault.
     """
-    have = run_staleness(_run(hunt_commit=OTHER), build_hash=BUILD, commit=COMMIT)
+    have = run_staleness(
+        _run(hunt_code_version=OTHER_HCODE), build_hash=BUILD, current=CURRENT, commit=COMMIT
+    )
     assert "tmap rescan r1" in have.remedy
     lost = run_staleness(
-        _run(hunt_commit=OTHER, firmware_path=None), build_hash=BUILD, commit=COMMIT
+        _run(hunt_code_version=OTHER_HCODE, firmware_path=None),
+        build_hash=BUILD,
+        current=CURRENT,
+        commit=COMMIT,
     )
     assert "tmap rescan r1" not in lost.remedy
     assert "no firmware root" in lost.remedy
@@ -317,8 +364,11 @@ def test_a_run_with_no_firmware_is_told_its_facts_are_still_readable() -> None:
     MUTATION: drop the analysis-db branch from ``_remedy_for`` -> RED.
     """
     reachable = run_staleness(
-        _run(hunt_commit=OTHER, firmware_path=None, analysis_db_path="/ws/r1/analysis.db"),
+        _run(
+            hunt_code_version=OTHER_HCODE, firmware_path=None, analysis_db_path="/ws/r1/analysis.db"
+        ),
         build_hash=BUILD,
+        current=CURRENT,
         commit=COMMIT,
     )
     assert "tmap fact <subcommand> --analysis-db /ws/r1/analysis.db" in reachable.remedy
@@ -333,8 +383,9 @@ def test_the_analysis_db_route_is_not_offered_when_there_is_no_path_to_offer() -
     MUTATION: emit the analysis-db line unconditionally -> RED.
     """
     nothing = run_staleness(
-        _run(hunt_commit=OTHER, firmware_path=None, analysis_db_path=None),
+        _run(hunt_code_version=OTHER_HCODE, firmware_path=None, analysis_db_path=None),
         build_hash=BUILD,
+        current=CURRENT,
         commit=COMMIT,
     )
     assert "--analysis-db" not in nothing.remedy
@@ -451,6 +502,9 @@ def _seeded(tmp_path: Path, pass_version: str = "pv_x") -> Path:
         " VALUES (1, 1, 'handle', '0x1000', ?, 'h_handle', ?)",
         (_BODY, json.dumps(["recv", "snprintf", "system"])),
     )
+    # The scan stamp the hunt copies onto the run row and later compares against: without it the
+    # analysis.db records no stamp and every hunt re-runs (the conservative direction).
+    conn.execute("INSERT INTO scan_stamp (id, stamp) VALUES (1, ?)", (SCAN,))
     conn.commit()
     conn.close()
     return db
@@ -507,11 +561,15 @@ def test_rehunt_overrides_the_skip(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 
 
 def test_an_unreadable_input_fingerprint_never_skips() -> None:
-    c = hunt_currency(_row(), build_hash=BUILD, commit=COMMIT, input_fingerprint=None)
+    c = hunt_currency(
+        _row(), build_hash=BUILD, hunt_code=HCODE, db_scan_stamp=SCAN, input_fingerprint=None
+    )
     assert c.current is False
 
 
-@pytest.mark.parametrize("axis", ["commit", "extraction", "firmware", "non_binary", "symlink"])
+@pytest.mark.parametrize(
+    "axis", ["hunt_code", "scan_stamp", "extraction", "firmware", "non_binary", "symlink"]
+)
 def test_either_input_changing_defeats_the_skip(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, axis: str
 ) -> None:
@@ -519,9 +577,10 @@ def test_either_input_changing_defeats_the_skip(
 
     MUTATION: drop the build_hash comparison from ``hunt_currency`` -> the 'extraction' case goes
     RED (an edited extraction pass would be silently ignored, which is the exact failure mode that
-    made pass_version span the whole pipeline in the first place). Drop the commit comparison ->
-    the 'commit' case goes RED. Drop the input fingerprint -> the 'firmware' case goes RED: a
-    release install (a known commit) re-scanning changed firmware kept the old candidates.
+    made pass_version span the whole pipeline in the first place). Drop the hunt-code comparison ->
+    the 'hunt_code' case goes RED. Drop the scan-stamp comparison -> the 'scan_stamp' case goes RED
+    (a rebuilt analysis.db kept the old candidates). Drop the input fingerprint -> the 'firmware'
+    case goes RED: changed firmware kept the old candidates.
 
     The last two cases change one row's content and no table's row count, so the per-table counts
     in the fingerprint cannot see them. MUTATION (each measured RED, ``skipped`` stays True): drop
@@ -547,8 +606,16 @@ def test_either_input_changing_defeats_the_skip(
     a2.run_analyzer2(db, atlas, source_run_id="r")
     assert a2.run_analyzer2(db, atlas, source_run_id="r").skipped is True
 
-    if axis == "commit":
-        monkeypatch.setattr(a2, "installed_commit", lambda: OTHER)
+    if axis == "hunt_code":
+        # The hunt code changed since this run was hunted (patched on the module the hunt reads
+        # it through, per the rescan_version call convention).
+        monkeypatch.setattr(a2.rescan_version, "hunt_code_version", lambda: OTHER_HCODE)
+    elif axis == "scan_stamp":
+        # The analysis.db was rebuilt: its scan stamp no longer matches the copy on the run row.
+        stamp = sqlite3.connect(db)
+        stamp.execute("UPDATE scan_stamp SET stamp = ? WHERE id = 1", (_scan(code="src-rebuilt"),))
+        stamp.commit()
+        stamp.close()
     elif axis == "extraction":
         stamp = sqlite3.connect(db)
         stamp.execute("UPDATE binaries SET pass_version = 'pv_edited'")
@@ -581,40 +648,45 @@ def test_a_completed_hunt_always_leaves_the_stamp_current(
 ) -> None:
     """The invariant every later skip and every staleness read rests on.
 
-    After any hunt that finished — whether it did the work or skipped it — the run's stamp equals
-    the running commit. If a completed hunt could leave a stale or absent stamp, the next run would
-    re-hunt forever (harmless but pointless) or, worse, a staleness read would report a run as
-    produced by code that did not produce it.
+    After any hunt that finished — whether it did the work or skipped it — the run's code stamp
+    equals the running hunt code. If a completed hunt could leave a stale or absent stamp, the next
+    run would re-hunt forever (harmless but pointless) or, worse, a staleness read would report a
+    run as produced by code that did not produce it.
     """
     from treasure_map.lib.hunt import analyzer2 as a2
 
-    monkeypatch.setattr(a2, "installed_commit", lambda: COMMIT)
     db, atlas = _seeded(tmp_path), tmp_path / "atlas.db"
     for _ in range(2):  # the working pass, then the skipping one
         a2.run_analyzer2(db, atlas, source_run_id="r")
         conn = open_atlas(atlas)
         try:
-            assert get_run(conn, "r").hunt_commit == COMMIT  # type: ignore[union-attr]
+            assert (
+                get_run(conn, "r").hunt_code_version  # type: ignore[union-attr]
+                == a2.rescan_version.hunt_code_version()
+            )
         finally:
             conn.close()
 
 
-def test_an_unknown_install_commit_never_skips_a_real_hunt(
+def test_an_editable_install_skips_when_the_code_stamp_matches(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """★ The developer case, and the one most likely to be got wrong silently.
+    """★ The developer case — and the one whose BEHAVIOUR this change flips.
 
-    An editable install records no commit. Every hunt from it must do the work — which is exactly
-    what makes the skip safe to ship: the environment where the code is changing fastest is the one
-    where the skip never fires. If this regressed, a developer would edit the hunt, re-run it, and
-    be shown the previous version's candidates.
+    An editable install records no commit, so the old commit-based skip never fired there: every
+    hunt redid the work. The code stamp is recorded even for an editable checkout, so now a second
+    hunt of the SAME code over the SAME analysis.db skips, just as a release install does. Editing
+    the hunt still defeats it (the stamp changes), which is what keeps the developer safe.
+
+    MUTATION: make ``hunt_currency`` consult ``commit`` again -> RED (the unknown commit would
+    force a re-hunt and this would never skip).
     """
     from treasure_map.lib.hunt import analyzer2 as a2
 
     monkeypatch.setattr(a2, "installed_commit", lambda: UNKNOWN_VERSION)
     db, atlas = _seeded(tmp_path), tmp_path / "atlas.db"
     a2.run_analyzer2(db, atlas, source_run_id="r")
-    assert a2.run_analyzer2(db, atlas, source_run_id="r").skipped is False
+    assert a2.run_analyzer2(db, atlas, source_run_id="r").skipped is True
 
 
 # ------------------------------------------------------- the stamp must describe rows that exist
@@ -638,6 +710,7 @@ def _seeded_no_candidates(tmp_path: Path) -> Path:
         " VALUES (1, 1, 'quiet', '0x2000', 'void quiet(void){ return; }', 'h_quiet', ?)",
         (json.dumps([]),),
     )
+    conn.execute("INSERT INTO scan_stamp (id, stamp) VALUES (1, ?)", (SCAN,))
     conn.commit()
     conn.close()
     return db
@@ -920,3 +993,60 @@ def test_an_atlas_without_the_fingerprint_column_gains_it_and_re_hunts(tmp_path:
     finally:
         conn.close()
     assert stored == FP
+
+
+# ------------------------------------------------- the code-content stamps (hunt_code / scan_stamp)
+
+
+def test_finish_run_writes_the_code_stamps_and_begin_run_clears_them(tmp_path: Path) -> None:
+    """finish_run records the hunt code and scan stamp; begin_run clears them with the other stamps
+    the next hunt is about to replace.
+
+    MUTATION: drop ``hunt_code_version``/``scan_stamp`` from finish_run's UPDATE -> RED (unstored).
+    Drop ``hunt_code_version = NULL`` / ``scan_stamp = NULL`` from begin_run's upsert -> RED.
+    """
+    conn = open_atlas(tmp_path / "atlas.db")
+    begin_run(conn, "r", analysis_db_path="/x/a.db", build_hash=BUILD)
+    finish_run(conn, "r", hunt_commit=COMMIT, hunt_code_version=HCODE, scan_stamp=SCAN)
+    row = conn.execute("SELECT hunt_code_version, scan_stamp FROM run WHERE run_id='r'").fetchone()
+    assert (row[0], row[1]) == (HCODE, SCAN)
+    begin_run(conn, "r", analysis_db_path="/x/a.db", build_hash=BUILD)  # a second hunt starts
+    row = conn.execute("SELECT hunt_code_version, scan_stamp FROM run WHERE run_id='r'").fetchone()
+    assert (row[0], row[1]) == (None, None)
+    conn.close()
+
+
+def test_finish_run_coalesces_the_code_stamps(tmp_path: Path) -> None:
+    """A finish_run that does not know the stamps leaves the established ones alone (COALESCE)."""
+    conn = open_atlas(tmp_path / "atlas.db")
+    begin_run(conn, "r", analysis_db_path="/x/a.db")
+    finish_run(conn, "r", hunt_code_version=HCODE, scan_stamp=SCAN)
+    finish_run(conn, "r", scan_status="partial")
+    row = conn.execute("SELECT hunt_code_version, scan_stamp FROM run WHERE run_id='r'").fetchone()
+    assert (row[0], row[1]) == (HCODE, SCAN)
+    conn.close()
+
+
+def test_an_atlas_without_the_code_stamp_columns_gains_them(tmp_path: Path) -> None:
+    """The additive migration brings the two columns onto an older atlas, NULL (i.e. fall back to
+    the commit) on the runs that predate them.
+
+    MUTATION: drop either ALTER from the atlas migration -> RED (the column never appears)."""
+    db = tmp_path / "atlas.db"
+    open_atlas(db).close()
+    old = sqlite3.connect(db)
+    old.execute("ALTER TABLE run DROP COLUMN hunt_code_version")
+    old.execute("ALTER TABLE run DROP COLUMN scan_stamp")
+    old.execute("INSERT INTO run (run_id, scan_status) VALUES ('old', 'complete')")
+    old.commit()
+    old.close()
+    conn = open_atlas(db)
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(run)")}
+        assert {"hunt_code_version", "scan_stamp"} <= cols
+        row = conn.execute(
+            "SELECT hunt_code_version, scan_stamp FROM run WHERE run_id='old'"
+        ).fetchone()
+        assert (row[0], row[1]) == (None, None)
+    finally:
+        conn.close()

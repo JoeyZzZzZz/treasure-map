@@ -245,10 +245,11 @@ def test_a_run_that_cannot_be_compared_is_served_with_the_reason(tmp_path: Path)
 
     MUTATION: drop the currency entry from the inlined lineage -> RED."""
     from treasure_map.lib.atlas.models import RunRow
+    from treasure_map.lib.rescan_version import CodeStamp
     from treasure_map.mcp_app import _lineage_inline
 
     run = RunRow(run_id="r", scan_status="complete", build_hash=None, firmware_path="/fw")
-    out = _lineage_inline(run)
+    out = _lineage_inline(run, CodeStamp(hunt="src-current00000", scan="{}"))
     assert out.get("currency", {}).get("confirmed") is False
     assert "could not compare" in out["currency"]["detail"]
     assert "tmap rescan r" in out["currency"]["remedy"]

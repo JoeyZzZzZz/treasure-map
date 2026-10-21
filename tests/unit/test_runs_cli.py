@@ -13,11 +13,19 @@ from click.testing import CliRunner
 
 from treasure_map.cli import hunt_cli
 from treasure_map.cli.hunt_cli import _complete_run_id, runs, triage
+from treasure_map.lib import rescan_version
 from treasure_map.lib.analyze.ghidra_runner import current_pass_version
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import InstanceRow
 from treasure_map.lib.atlas.writer import add_instance, begin_run, finish_run, upsert_pattern
+from treasure_map.lib.config.config import load_config
 from treasure_map.version import UNKNOWN_VERSION
+
+
+def _running_stamp() -> rescan_version.CodeStamp:
+    """The code stamp the in-process ``runs`` / ``rescan`` command will compute (real installed
+    code, same config it loads), so a test can stamp a run row to read as current."""
+    return rescan_version.current_code_stamp(load_config(None))
 
 
 def _atlas_with_runs(tmp_path: Path) -> Path:
@@ -197,19 +205,28 @@ def test_the_reason_is_said_once_per_tier_not_once_per_run(
 
     MUTATION: make ``_reason_human`` return "" -> RED.
     """
-    monkeypatch.setattr(hunt_cli, "installed_commit", lambda: "c" * 40)
     atlas = tmp_path / "atlas.db"
     conn = open_atlas(atlas)
     for rid in ("a_run", "b_run"):
         begin_run(conn, rid, analysis_db_path=f"/ws/{rid}.db", build_hash=current_pass_version())
-        finish_run(conn, rid, binaries=2, functions=3, hunt_commit="f" * 40, hunt_instances=1)
+        # Both hunted by a DIFFERENT hunt code than is running — the same reason for both.
+        finish_run(
+            conn,
+            rid,
+            binaries=2,
+            functions=3,
+            hunt_instances=1,
+            hunt_code_version="src-b2b2b2b2b2b2b2b2",
+        )
     conn.close()
 
     out = CliRunner().invoke(runs, ["--atlas", str(atlas)])
     assert out.exit_code == 0, out.output
     arrows = [ln for ln in out.output.splitlines() if ln.strip().startswith("→")]
     assert len(arrows) == 1, out.output
-    assert arrows[0].strip() == "→ hunted by an older tmap; re-hunt needs no decompile"
+    assert arrows[0].strip() == (
+        "→ the hunt code changed since this run was hunted; re-hunt needs no decompile"
+    )
 
 
 def test_two_reasons_in_one_tier_are_listed_apart_with_their_runs(
@@ -220,23 +237,37 @@ def test_two_reasons_in_one_tier_are_listed_apart_with_their_runs(
 
     MUTATION: emit only the first reason, or drop the run ids when there are several groups -> RED.
     """
-    monkeypatch.setattr(hunt_cli, "installed_commit", lambda: "c" * 40)
     atlas = tmp_path / "atlas.db"
     conn = open_atlas(atlas)
+    stamp = _running_stamp()
     # Both land in the SAME tier (hunt) for DIFFERENT reasons — which is the property under test.
-    # An earlier version used a `failed` run for the second reason; that run now has a tier of its
-    # own, so it stopped exercising the grouping it was written for.
+    # graded_old: a different hunt code. uncounted: the running code and scan stamp, but no recorded
+    # instance count (so the count branch is what fires, reached only past the code/scan branches).
     begin_run(conn, "graded_old", analysis_db_path="/ws/a.db", build_hash=current_pass_version())
-    finish_run(conn, "graded_old", binaries=2, functions=3, hunt_commit="f" * 40, hunt_instances=1)
+    finish_run(
+        conn,
+        "graded_old",
+        binaries=2,
+        functions=3,
+        hunt_instances=1,
+        hunt_code_version="src-b2b2b2b2b2b2b2b2",
+    )
     begin_run(conn, "uncounted", analysis_db_path="/ws/b.db", build_hash=current_pass_version())
-    finish_run(conn, "uncounted", binaries=1, functions=1, hunt_commit="c" * 40)
+    finish_run(
+        conn,
+        "uncounted",
+        binaries=1,
+        functions=1,
+        hunt_code_version=stamp.hunt,
+        scan_stamp=stamp.scan,
+    )
     conn.close()
 
     out = CliRunner().invoke(runs, ["--atlas", str(atlas)])
     assert out.exit_code == 0, out.output
     arrows = [ln.strip() for ln in out.output.splitlines() if ln.strip().startswith("→")]
     assert len(arrows) == 2, out.output
-    assert any(a.endswith(": graded_old") and "older tmap" in a for a in arrows)
+    assert any(a.endswith(": graded_old") and "hunt code changed" in a for a in arrows)
     assert any(a.endswith(": uncounted") and "recorded what it ran" in a for a in arrows)
 
 
@@ -252,7 +283,7 @@ def test_an_unmapped_reason_passes_through_verbatim() -> None:
     assert _reason_human("hunt", novel) == novel
     assert _reason_human("extraction", novel) == novel
     # and the mapped ones ARE rewritten, so the passthrough is not simply doing nothing
-    assert "needs no decompile" in _reason_human("hunt", "hunted by abc123def456, running 789")
+    assert "needs no decompile" in _reason_human("hunt", "hunted by hunt code src-a, running src-b")
     assert "decompiles 37 binaries" in _reason_human(
         "extraction", "extracted by abc, running def", binaries=37
     )
@@ -305,8 +336,14 @@ def test_runs_json_carries_the_stamp_and_the_classification(tmp_path: Path) -> N
 # ── the fourth tier: a run that never finished needs a whole scan, not a fast re-hunt ──
 
 
-def _unfinished_atlas(tmp_path: Path, *, firmware: str | None = None) -> Path:
-    """One run that stopped mid-scan and one that is up to date."""
+def _unfinished_atlas(
+    tmp_path: Path, *, firmware: str | None = None, fine_current: bool = True
+) -> Path:
+    """One run that stopped mid-scan and one that is up to date.
+
+    ``fine_current`` stamps the finished run with the running code stamp so it reads as current;
+    False leaves it an old run (no code stamp), which falls back to the commit and so lands in the
+    hunt tier — used by the ordering test."""
     atlas = tmp_path / "atlas.db"
     conn = open_atlas(atlas)
     begin_run(
@@ -318,7 +355,17 @@ def _unfinished_atlas(tmp_path: Path, *, firmware: str | None = None) -> Path:
     )
     finish_run(conn, "stopped", scan_status="failed", binaries=7, functions=9)
     begin_run(conn, "fine", analysis_db_path="/ws/b.db", build_hash=current_pass_version())
-    finish_run(conn, "fine", binaries=1, functions=1, hunt_commit="c" * 40, hunt_instances=0)
+    stamp = _running_stamp()
+    finish_run(
+        conn,
+        "fine",
+        binaries=1,
+        functions=1,
+        hunt_commit="c" * 40,
+        hunt_instances=0,
+        hunt_code_version=stamp.hunt if fine_current else None,
+        scan_stamp=stamp.scan if fine_current else None,
+    )
     conn.close()
     return atlas
 
@@ -392,23 +439,28 @@ def test_the_unfinished_tier_is_decided_before_the_unknown_commit_branch(
 ) -> None:
     """★ THE ORDER, and the only fixture that can see it.
 
-    An editable install records no commit, and the unknown-commit branch matches EVERY run. Put
-    the unfinished check behind it and this tier is empty exactly where it is most needed — in the
-    environment the command is most often read in. Nothing else in the suite catches that: a
-    fixture with a real commit never reaches the branch that would steal the run.
+    A run with no code stamp (every run before this feature) is caught by the "hunted before the
+    code stamp existed" branch, which matches EVERY old run. Put the unfinished check behind it and
+    this tier is empty exactly where it is most needed. Nothing else in the suite catches that: a
+    fixture whose runs all carry a current code stamp never reaches the branch that would steal the
+    run.
 
     ★ The build_hash matches the running pipeline on purpose too. With a stale one the extraction
     branch answers first, and the test would pass with the unfinished check anywhere after it.
 
-    MUTATION: move the unfinished check below the unknown-commit branch -> RED.
+    MUTATION: move the unfinished check below the code-stamp-missing branch -> RED.
     """
     monkeypatch.setattr(hunt_cli, "installed_commit", lambda: UNKNOWN_VERSION)
-    out = CliRunner().invoke(runs, ["--atlas", str(_unfinished_atlas(tmp_path))])
+    # 'fine' kept as an OLD run (no code stamp), so it IS caught by the catch-all branch — the one
+    # the unfinished check must be ordered ahead of.
+    out = CliRunner().invoke(
+        runs, ["--atlas", str(_unfinished_atlas(tmp_path, fine_current=False))]
+    )
     assert out.exit_code == 0, out.output
     assert "needs a full re-scan (1):" in out.output
     assert "stopped" in out.output
-    # the other run has no confirmable commit, so it lands in the hunt tier — which is what makes
-    # this a real ordering test: the unknown-commit branch IS live here and did not take 'stopped'
+    # the other run has no code stamp, so it lands in the hunt tier — which is what makes this a
+    # real ordering test: the catch-all branch IS live here and did not take 'stopped'
     assert "needs re-hunt (1):" in out.output
 
 

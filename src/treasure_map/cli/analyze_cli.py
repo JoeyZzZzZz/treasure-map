@@ -119,18 +119,6 @@ scopes that to just the binary you are validating.
     help="Path to config.yaml (overrides ~/.treasure-map/config.yaml).",
 )
 @click.option(
-    "--skip-non-binary",
-    is_flag=True,
-    default=False,
-    help="Skip the non-binary file analysis stage entirely.",
-)
-@click.option(
-    "--skip-ingester",
-    "skip_ingesters",
-    multiple=True,
-    help="Skip a specific ingester by kind (e.g. shell_script). Repeatable.",
-)
-@click.option(
     "--reanalyze",
     is_flag=False,
     flag_value="__all__",
@@ -154,8 +142,6 @@ def analyze(
     fs_root: Path,
     workspace: str | None,
     config: Path | None,
-    skip_non_binary: bool,
-    skip_ingesters: tuple[str, ...],
     reanalyze: str | None,
     force_retry: bool,
 ) -> None:
@@ -201,8 +187,6 @@ def analyze(
                 ws,
                 cfg,
                 _progress,
-                skip_non_binary=skip_non_binary,
-                skip_ingesters=frozenset(skip_ingesters),
                 reanalyze=reanalyze,
                 force_retry=force_retry,
             )

@@ -91,6 +91,11 @@ class RunRow:
     # recorded — which is not zero: zero is a run that legitimately produced no candidates, and the
     # two must not collapse, or a real empty result would be indistinguishable from an unknown one.
     hunt_instances: int | None = None
+    # The content hash of the hunt code that produced this run's instances, and the scan stamp the
+    # hunt copied from the analysis.db. The code-content stamps that replace comparing git commits
+    # for run currency; None on a run hunted before they existed (falls back to hunt_commit).
+    hunt_code_version: str | None = None
+    scan_stamp: str | None = None
     tool_version: str | None = None
     ghidra_version: str | None = None
     machine: str | None = None

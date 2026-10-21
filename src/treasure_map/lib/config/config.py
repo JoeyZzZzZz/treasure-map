@@ -93,7 +93,7 @@ class Config(BaseModel):
     # above this is folded into the xref_folded_symbols ledger instead of exploding the xrefs table.
     # Keep in sync with xrefs.DEFAULT_FOLD_EDGE_THRESHOLD (a unit test asserts equality). Tune down
     # from the ledger produced on real large firmware if bombs slip under it.
-    xref_fold_edge_threshold: int = 25_000
+    xref_fold_edge_threshold: int = Field(default=25_000, json_schema_extra={"tmap_content": True})
 
     @field_validator("workspace_dir", mode="before")
     @classmethod

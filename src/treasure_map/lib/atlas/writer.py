@@ -811,6 +811,10 @@ def begin_run(
                -- it: a stale count left behind would describe rows about to be deleted.
                hunt_commit      = NULL,
                hunt_instances   = NULL,
+               -- The code-content stamps vouch for the same instances the commit/count do, so they
+               -- stop being true at the same instant and are cleared with them.
+               hunt_code_version = NULL,
+               scan_stamp       = NULL,
                scan_status      = 'in_progress',
                scanned_at       = CURRENT_TIMESTAMP,
                updated_at       = CURRENT_TIMESTAMP""",
@@ -874,6 +878,8 @@ def finish_run(
     hunt_commit: str | None = None,
     hunt_instances: int | None = None,
     hunt_input_fingerprint: str | None = None,
+    hunt_code_version: str | None = None,
+    scan_stamp: str | None = None,
     commit: bool = True,
 ) -> None:
     """Mark a run's scan FINISHED: set scan_status (default 'complete') + the analysis counts.
@@ -887,7 +893,8 @@ def finish_run(
     previous hunt established. Together they are what lets a later run decide the stored result is
     reproducible and skip re-hunting it: the commit says the same code would produce it, the count
     says the rows it produced are still in the table, and ``hunt_input_fingerprint`` says it read
-    the same firmware."""
+    the same firmware. ``hunt_code_version`` and ``scan_stamp`` are the code-content stamps that
+    replace the commit for the currency decision; they are COALESCEd like ``hunt_commit``."""
     if scan_status not in ("in_progress", "complete", "partial", "failed"):
         raise ConfigError(
             f"scan_status must be in_progress/complete/partial/failed; got {scan_status!r}"
@@ -897,6 +904,8 @@ def finish_run(
                hunt_commit = COALESCE(?, hunt_commit),
                hunt_instances = COALESCE(?, hunt_instances),
                hunt_input_fingerprint = COALESCE(?, hunt_input_fingerprint),
+               hunt_code_version = COALESCE(?, hunt_code_version),
+               scan_stamp = COALESCE(?, scan_stamp),
                updated_at = CURRENT_TIMESTAMP
            WHERE run_id = ?""",
         (
@@ -907,6 +916,8 @@ def finish_run(
             hunt_commit,
             hunt_instances,
             hunt_input_fingerprint,
+            hunt_code_version,
+            scan_stamp,
             run_id,
         ),
     )
@@ -914,8 +925,9 @@ def finish_run(
         conn.execute(
             """INSERT INTO run
                    (run_id, scan_status, binaries, functions, functions_empty, hunt_commit,
-                    hunt_instances, hunt_input_fingerprint, scanned_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)""",
+                    hunt_instances, hunt_input_fingerprint, hunt_code_version, scan_stamp,
+                    scanned_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)""",
             (
                 run_id,
                 scan_status,
@@ -925,6 +937,8 @@ def finish_run(
                 hunt_commit,
                 hunt_instances,
                 hunt_input_fingerprint,
+                hunt_code_version,
+                scan_stamp,
             ),
         )
     if commit:

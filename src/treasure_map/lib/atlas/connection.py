@@ -411,6 +411,19 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if run_cols and "hunt_input_fingerprint" not in run_cols:
         conn.execute("ALTER TABLE run ADD COLUMN hunt_input_fingerprint TEXT")
 
+    # run.hunt_code_version / run.scan_stamp: the code-content stamps that replace comparing git
+    # commits for run currency. hunt_code_version is the hunt code's hash; scan_stamp is the
+    # analysis.db's scan stamp the hunt copied over. Both nullable — a run hunted before they
+    # existed carries NULL, which falls back to the commit. Idempotent; each runs only while its
+    # column is missing.
+    run_cols = _column_names(conn, "run")
+    if run_cols and "hunt_code_version" not in run_cols:
+        conn.execute("ALTER TABLE run ADD COLUMN hunt_code_version TEXT")
+
+    run_cols = _column_names(conn, "run")
+    if run_cols and "scan_stamp" not in run_cols:
+        conn.execute("ALTER TABLE run ADD COLUMN scan_stamp TEXT")
+
     # binary_path columns (added this round). Every one of these tables scoped a row to a binary by
     # its SHORT NAME, which is a label: one firmware ships two files under the same name, so a
     # per-binary filter on the name matched both. The path is added beside the name rather than

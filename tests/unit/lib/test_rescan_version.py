@@ -1,0 +1,358 @@
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
+"""Static guards on the rescan code-version stamps, and the mutation table that proves the hashing
+reacts to code and not to comments.
+
+The stamps are only trustworthy if the import closure is complete (nothing reaches the hashed code
+by a route the walker cannot follow), if the name-granular modules really are used by attribute
+only (so the narrowed digest is the whole surface), if every data file the code reads is hashed,
+and if the Config leaves are classified exhaustively into content / non-content. Each of those is
+locked here against the real tree, so a future edit that breaks an assumption fails a test instead
+of silently stamping the wrong thing.
+"""
+
+from __future__ import annotations
+
+import ast
+import shutil
+from pathlib import Path
+
+import pytest
+
+from treasure_map.lib import rescan_version as rv
+from treasure_map.lib.config.config import Config
+
+PKG = rv._PACKAGE
+ROOTS = (rv.PIPELINE_ROOT, rv.HUNT_ROOT)
+
+
+def _tree(module: str) -> ast.Module:
+    return ast.parse(rv._module_path(PKG, module).read_text(encoding="utf-8"))
+
+
+def _all_closure_modules() -> set[str]:
+    out: set[str] = set()
+    for root in ROOTS:
+        out |= rv._closure(PKG, root)
+    return out
+
+
+# ── 1. only import forms the closure walker can follow ──────────────────────────────
+
+
+def test_the_closure_uses_no_import_form_the_walker_cannot_follow() -> None:
+    """Relative imports, ``import treasure_map…`` and dynamic imports all reach code by a route
+    ``_edges`` does not follow, so a module pulled in only that way would be left out of the hash.
+    The one allowed exception is ``version`` importing the generated ``_build_info`` (git-ignored,
+    never part of the hash); it is whitelisted explicitly.
+
+    MUTATION: add ``from . import x`` or ``import treasure_map.lib.x`` or
+    ``importlib.import_module("treasure_map.lib.x")`` to any closure module -> RED.
+    """
+    offenders: list[str] = []
+    for module in _all_closure_modules():
+        tree = _tree(module)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.level:
+                offenders.append(f"{module}: relative import (level {node.level})")
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == "treasure_map" or alias.name.startswith("treasure_map."):
+                        offenders.append(f"{module}: import {alias.name}")
+            elif isinstance(node, ast.Call):
+                fn = node.func
+                name = (
+                    fn.attr
+                    if isinstance(fn, ast.Attribute)
+                    else fn.id
+                    if isinstance(fn, ast.Name)
+                    else None
+                )
+                if name in ("import_module", "__import__"):
+                    arg = node.args[0] if node.args else None
+                    literal = arg.value if isinstance(arg, ast.Constant) else None
+                    allowed = module == "version" and literal == "treasure_map._build_info"
+                    if not allowed:
+                        offenders.append(f"{module}: dynamic import {literal!r}")
+    assert offenders == [], offenders
+
+
+# ── 2. the name-granular modules are used by attribute only (the narrowed digest is live) ──
+
+
+@pytest.mark.parametrize("module", rv.NAME_GRANULAR)
+def test_a_name_granular_module_is_used_by_attribute_only(module: str) -> None:
+    """If a closure used a name-granular module as a bare value (passed it on, ``getattr`` on it),
+    the attribute set could not be trusted as the whole surface and the digest would silently fall
+    back to the whole module. This asserts that never happens today, so the narrowing is real.
+
+    MUTATION: in any closure module, bind ``facts``/``config`` and then read it bare -> RED
+    (``_used_names`` reports ``whole=True``)."""
+    seen_in_a_closure = False
+    for root in ROOTS:
+        closure = rv._closure(PKG, root)
+        if module not in closure:
+            continue
+        seen_in_a_closure = True
+        _names, whole = rv._used_names(PKG, module, closure)
+        assert whole is False, f"{module} falls back to whole-module hashing in {root}'s closure"
+    assert seen_in_a_closure, f"{module} is in no closure — the parametrize is stale"
+    # and no star-import, which would make the used-name analysis unsound
+    for node in ast.walk(_tree(module)):
+        assert not (isinstance(node, ast.ImportFrom) and any(a.name == "*" for a in node.names))
+
+
+# ── 3. every data file the code reads is hashed, and the .sql has no block comments ──
+
+
+def test_every_package_file_reader_is_a_declared_asset_reader() -> None:
+    """A module that reads a file beside it at run time (``__file__`` / importlib.resources /
+    pkgutil) feeds the extraction from a file the code hash does not see — unless the file is hashed
+    too. Every such closure module must be an ``ASSET_READERS`` key.
+
+    MUTATION: make a closure module read ``Path(__file__).parent / "x"`` without listing it in
+    ASSET_READERS -> RED."""
+    for module in _all_closure_modules():
+        text = rv._module_path(PKG, module).read_text(encoding="utf-8")
+        reads_file = "__file__" in text or "importlib.resources" in text or "pkgutil" in text
+        if reads_file:
+            assert module in rv.ASSET_READERS, f"{module} reads a package file, not an asset reader"
+
+
+def test_sql_assets_have_no_block_comments() -> None:
+    """``_normalize_sql`` strips only ``--`` line comments; a ``/* */`` block would survive
+    normalisation and let a comment move the hash. None exist today, and this keeps it so."""
+    for patterns in rv.ASSET_READERS.values():
+        for pattern in patterns:
+            for path in PKG.glob(pattern):
+                if path.suffix == ".sql":
+                    assert "/*" not in path.read_text(encoding="utf-8"), path
+
+
+# ── 4. an ancestor package __init__ not in the closure carries no hidden code ──
+
+
+def test_ancestor_package_inits_outside_the_closure_hold_no_code() -> None:
+    """A closure module's parent package ``__init__.py`` runs on import. If it is not itself in the
+    closure (nothing imports a name FROM it), its body is never hashed — so it must hold nothing but
+    imports, ``__all__`` and a docstring, or a side effect there would escape the stamp."""
+    closure = _all_closure_modules()
+    checked: set[str] = set()
+    for module in closure:
+        parts = module.split(".")
+        for i in range(1, len(parts)):
+            pkg = ".".join(parts[:i])
+            if pkg in closure or pkg in checked:
+                continue
+            checked.add(pkg)
+            path = PKG / Path(*pkg.split(".")) / "__init__.py"
+            if not path.is_file():
+                continue
+            for stmt in ast.parse(path.read_text(encoding="utf-8")).body:
+                ok = (
+                    isinstance(stmt, ast.Import | ast.ImportFrom)
+                    or (isinstance(stmt, ast.Assign) and _is_dunder_all(stmt))
+                    or _is_docstring(stmt)
+                )
+                assert ok, f"{pkg}/__init__.py has un-hashed code: {ast.dump(stmt)[:80]}"
+
+
+def _is_dunder_all(stmt: ast.Assign) -> bool:
+    return any(isinstance(t, ast.Name) and t.id == "__all__" for t in stmt.targets)
+
+
+def _is_docstring(stmt: ast.stmt) -> bool:
+    return (
+        isinstance(stmt, ast.Expr)
+        and isinstance(stmt.value, ast.Constant)
+        and isinstance(stmt.value.value, str)
+    )
+
+
+# ── 5. every Config leaf is classified content or non-content, exhaustively ──
+
+# The config leaves that do NOT change what a scan would store, each with why it is left out of the
+# scan stamp. Paired with the content-marked leaves, this must cover EVERY leaf of Config — a new
+# setting is then forced to declare which side it is on rather than defaulting to invisible.
+NON_CONTENT_CONFIG: dict[str, str] = {
+    "ghidra.mode": "not read; only local mode is implemented",
+    "ghidra.headless_timeout_seconds": (
+        "decides which binaries time out; a changed budget re-tries timed-out binaries on rescan "
+        "and the per-binary extraction may change, which is surfaced by the per-binary "
+        "incomplete/timeout markers, not by a run-level scan-stamp change"
+    ),
+    "ghidra.max_parallel_jvms": "how many JVMs run in parallel; does not change what is stored",
+    "ghidra.local.home": "where Ghidra is installed; its version is recorded separately",
+    "ghidra.docker.image": "unimplemented docker mode",
+    "ghidra.remote.endpoint": "unimplemented remote mode",
+    "toolchain.java_home": "where the JDK is; does not change what is stored",
+    "toolchain.bindiff": "where BinDiff is; a diff-time tool, not a scan input",
+    "workspace_dir": "where workspaces live on disk",
+    "atlas.db_path": "where the atlas lives on disk",
+    "log_level": "not read; logging verbosity",
+}
+
+
+def test_every_config_leaf_is_classified_content_or_not() -> None:
+    """The scan stamp carries exactly the config that changes what a scan stores. A leaf that is
+    neither content-marked nor listed non-content is unclassified — and would silently be left out
+    of the stamp, so a run scanned under a different value of it would wrongly read as current.
+
+    MUTATION: add a Config field and mark it neither way -> RED (it appears in neither set)."""
+    leaves = set(rv._leaf_fields(Config))
+    content = {
+        path
+        for path, field in rv._leaf_fields(Config).items()
+        if isinstance(getattr(field, "json_schema_extra", None), dict)
+        and field.json_schema_extra.get("tmap_content") is True
+    }
+    non_content = set(NON_CONTENT_CONFIG)
+    assert content & non_content == set(), content & non_content
+    assert leaves == content | non_content, {
+        "unclassified": leaves - content - non_content,
+        "stale_in_lists": (content | non_content) - leaves,
+    }
+    assert content == {"xref_fold_edge_threshold"}
+
+
+# ── 6. the mutation table: the hash reacts to code, not to comments ──
+
+
+def _mutate(edit) -> tuple[str, str]:
+    """Copy the package, apply ``edit``, and return (pipeline, hunt) stamps of the copy."""
+    import tempfile
+
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        dst = tmp / "treasure_map"
+        shutil.copytree(PKG, dst, ignore=shutil.ignore_patterns("__pycache__"))
+        edit(dst)
+        return rv.code_version_of(dst, rv.PIPELINE_ROOT), rv.code_version_of(dst, rv.HUNT_ROOT)
+    finally:
+        shutil.rmtree(tmp)
+
+
+def _edit(dst: Path, rel: str, old: str, new: str) -> None:
+    p = dst / rel
+    text = p.read_text(encoding="utf-8")
+    assert old in text, f"anchor missing in {rel}: {old!r}"
+    p.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+
+def _append(dst: Path, rel: str, text: str) -> None:
+    p = dst / rel
+    p.write_text(p.read_text(encoding="utf-8") + text, encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("name", "edit", "pipe_changes", "hunt_changes"),
+    [
+        (
+            "a function added to a hunt-closure module",
+            lambda d: _append(d, "lib/hunt/exec_edges.py", "\n\ndef _mut():\n    return 1\n"),
+            False,
+            True,
+        ),
+        (
+            "only a comment",
+            lambda d: _append(d, "lib/hunt/exec_edges.py", "\n# a comment\n"),
+            False,
+            False,
+        ),
+        (
+            "a facts function the hunt does not use",
+            lambda d: _append(d, "lib/facts.py", "\n\ndef _unused_by_hunt():\n    return 1\n"),
+            False,
+            False,
+        ),
+        (
+            "open_analysis_ro's body (a used facts function)",
+            lambda d: _edit(
+                d,
+                "lib/facts.py",
+                "conn = ro_connect(Path(db_path))",
+                "conn = ro_connect(Path(str(db_path)))",
+            ),
+            False,
+            True,
+        ),
+        (
+            "re-binding the ro_connect import",
+            lambda d: _edit(
+                d,
+                "lib/facts.py",
+                "from treasure_map.lib.ro_db import ro_connect",
+                "from treasure_map.lib.ro_db import ro_uri as ro_connect",
+            ),
+            False,
+            True,
+        ),
+        (
+            "an unreferenced import added to facts",
+            lambda d: _append(d, "lib/facts.py", "\nimport math as _unused_math\n"),
+            False,
+            False,
+        ),
+        (
+            "a schema.sql comment",
+            lambda d: _append(d, "lib/storage/schema.sql", "\n-- a new comment\n"),
+            False,
+            False,
+        ),
+        (
+            "a schema.sql column",
+            lambda d: _edit(
+                d,
+                "lib/storage/schema.sql",
+                "CREATE TABLE IF NOT EXISTS binaries (",
+                "CREATE TABLE IF NOT EXISTS binaries (\n    mut_col TEXT,",
+            ),
+            True,
+            False,
+        ),
+        (
+            "the shared extractor_names.tsv",
+            lambda d: _append(d, "lib/analyze/ghidra/extractor_names.tsv", "\nmut\tcol\n"),
+            True,
+            True,
+        ),
+        (
+            "rescan_version.py itself (excluded from both)",
+            lambda d: _append(d, "lib/rescan_version.py", "\n_MUT = 1\n"),
+            False,
+            False,
+        ),
+    ],
+)
+def test_the_stamp_reacts_to_code_not_comments(
+    name: str, edit, pipe_changes: bool, hunt_changes: bool
+) -> None:
+    base_pipe, base_hunt = (
+        rv.code_version_of(PKG, rv.PIPELINE_ROOT),
+        rv.code_version_of(PKG, rv.HUNT_ROOT),
+    )
+    pipe, hunt = _mutate(edit)
+    assert (pipe != base_pipe) is pipe_changes, f"{name}: pipeline change expected={pipe_changes}"
+    assert (hunt != base_hunt) is hunt_changes, f"{name}: hunt change expected={hunt_changes}"
+
+
+# ── 7 & 8. closure membership facts ──
+
+
+@pytest.mark.parametrize(
+    ("module", "root"),
+    [
+        ("lib.analyze.xrefs", rv.PIPELINE_ROOT),
+        ("lib.analyze.non_binary.orchestrator", rv.PIPELINE_ROOT),
+        ("lib.hunt.exec_edges", rv.HUNT_ROOT),
+        ("lib.diff.loader", rv.HUNT_ROOT),
+    ],
+)
+def test_expected_members_are_in_the_closure(module: str, root: str) -> None:
+    assert module in rv._closure(PKG, root)
+
+
+def test_version_is_in_the_hunt_closure() -> None:
+    """``version`` feeds the hunt's ``tool_version`` (the _version_skew comparison), so it must be
+    hashed into the hunt stamp."""
+    assert "version" in rv._closure(PKG, rv.HUNT_ROOT)

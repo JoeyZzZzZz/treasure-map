@@ -22,12 +22,14 @@ from treasure_map.cli.interrupts import (
     interrupt_exit_code,
     is_interrupt_exit,
 )
+from treasure_map.lib import rescan_version
 from treasure_map.lib.errors import ConfigError, TreasureMapError
 from treasure_map.lib.ro_db import ro_connect
 from treasure_map.version import UNKNOWN_VERSION, installed_commit
 
 if TYPE_CHECKING:
     from treasure_map.lib.atlas.models import RunRow
+    from treasure_map.lib.config.config import Config
     from treasure_map.lib.query import CandidateExplanation, TriageCandidate
 
 logger = logging.getLogger(__name__)
@@ -370,6 +372,7 @@ def _diff_rescan_plan(
     allow_reverse: bool,
     resolved_atlas: Path,
     workspace_dir: Path,
+    cfg: Config,
 ) -> list[_DiffRescan]:
     """Every refusal a diff can give before it starts, and the runs it has to rescan first.
 
@@ -389,6 +392,7 @@ def _diff_rescan_plan(
 
     build = current_pass_version()
     commit = installed_commit()
+    current = rescan_version.current_code_stamp(cfg)
     roles = (("before", "A", before), ("after", "B", after))
     warnings: list[str] = []
     stale: list[tuple[str, RunRow, Staleness]] = []
@@ -460,7 +464,7 @@ def _diff_rescan_plan(
                     f"({db_hash}) cannot be compared, so whether its candidates come from the "
                     "extraction it holds now is not known."
                 )
-            st = run_staleness(run, build_hash=build, commit=commit)
+            st = run_staleness(run, build_hash=build, current=current, commit=commit)
             if not st.stale:
                 if st.remedy:  # named exactly when the run could not be confirmed current
                     warnings.append(
@@ -498,7 +502,7 @@ def _diff_rescan_plan(
             reason = _rescan_reason(
                 run,
                 current_build=build,
-                commit=commit,
+                current=current,
                 live_instances=live.get(run.run_id, 0),
             )
             # The looser rescan rule never confirms a proven-stale run current; were it to, the
@@ -565,7 +569,9 @@ def _announce_diff_rescan(plan: list[_DiffRescan]) -> None:
             )
 
 
-def _recheck_after_rescan(*, before: str, after: str, force: bool, resolved_atlas: Path) -> None:
+def _recheck_after_rescan(
+    *, before: str, after: str, force: bool, resolved_atlas: Path, cfg: Config
+) -> None:
     """The one look at the two runs after the rescan. A rescan where a run failed does not stop
     the diff (it names the run and exits RESCAN_PARTIAL_EXIT, which the caller lets through), so
     its outcome is read from the atlas, never assumed. Refuses rather than rescanning again."""
@@ -590,7 +596,7 @@ def _recheck_after_rescan(*, before: str, after: str, force: bool, resolved_atla
                 f"scan did not finish (scan_status={run.scan_status}). {again}"
             )
     try:
-        check_run_pair_currency(run_a, run_b)
+        check_run_pair_currency(run_a, run_b, config=cfg)
     except ConfigError as exc:
         raise click.ClickException(
             f"still out of date after the rescan: {exc} {again} {_DIFF_ROLES}"
@@ -731,6 +737,7 @@ def hunt_diff(
         allow_reverse=allow_reverse,
         resolved_atlas=Path(resolved_atlas),
         workspace_dir=cfg.workspace_dir,
+        cfg=cfg,
     )
     if plan:
         _announce_diff_rescan(plan)
@@ -756,7 +763,7 @@ def hunt_diff(
             # The hunt stage lets the interrupt itself through.
             _rescan_interrupted(ctx, run_ids)
         _recheck_after_rescan(
-            before=before, after=after, force=force, resolved_atlas=Path(resolved_atlas)
+            before=before, after=after, force=force, resolved_atlas=Path(resolved_atlas), cfg=cfg
         )
 
     def _on_start(n: int) -> None:
@@ -839,8 +846,8 @@ def _rescan_interrupted(ctx: click.Context, run_ids: tuple[str, ...]) -> None:
     "--rehunt",
     is_flag=True,
     default=False,
-    help="Hunt again even when this run's stored candidates were already produced by this tmap "
-    "commit from this extraction. The skip exists because that pair reproduces the same result; "
+    help="Hunt again even when this run's stored candidates were already produced by this hunt "
+    "code from this analysis.db. The skip exists because that pair reproduces the same result; "
     "use this to re-run it anyway (e.g. to check that it still does).",
 )
 @click.option(
@@ -1355,13 +1362,14 @@ def _run_provenance_line(r: RunRow) -> str:
         parts.append("hunt unknown")
     else:
         parts.append(f"hunt {r.hunt_commit[:12]}")
+    parts.append(f"code {(r.hunt_code_version or 'none')[:12]}")
     parts.append(f"rows {r.hunt_instances if r.hunt_instances is not None else '?'}")
     if r.binaries is not None or r.functions is not None:
         parts.append(f"{r.binaries or 0} bins / {r.functions or 0} fns")
     return "   ".join(parts)
 
 
-def _refuse_stale_triage_run(atlas_path: Path, run_id: str) -> None:
+def _refuse_stale_triage_run(atlas_path: Path, run_id: str, *, cfg: Config) -> None:
     """Raise when ``run_id`` is a PROVEN stale scan (run_staleness), with its remedy. An unknown
     run, or one whose currency cannot be confirmed, is left to the listing."""
     from treasure_map.lib.analyze.ghidra_runner import current_pass_version
@@ -1376,7 +1384,12 @@ def _refuse_stale_triage_run(atlas_path: Path, run_id: str) -> None:
         conn.close()
     if run is None:
         return
-    stale = run_staleness(run, build_hash=current_pass_version(), commit=installed_commit())
+    stale = run_staleness(
+        run,
+        build_hash=current_pass_version(),
+        current=rescan_version.current_code_stamp(cfg),
+        commit=installed_commit(),
+    )
     if stale.stale:
         raise click.ClickException(
             f"run '{run_id}' is a STALE scan ({stale.axis}): {stale.detail.rstrip('.')}. "
@@ -1450,10 +1463,12 @@ def runs(config: Path | None, atlas_path: Path | None, as_json: bool) -> None:
         live = _live_instance_counts(conn)
     finally:
         conn.close()
-    commit = installed_commit()
     current_build = current_pass_version()
     tiers, current = _staleness_tiers(
-        run_rows, current_build=current_build, commit=commit, live=live
+        run_rows,
+        current_build=current_build,
+        current=rescan_version.current_code_stamp(cfg),
+        live=live,
     )
     if as_json:
         # The same classification the human view groups on, per run, so a script does not have to
@@ -1693,7 +1708,7 @@ def triage(
     # ★ The same gate MCP's list_candidates stands behind: a run PROVEN to have been graded by
     # different code than is running is refused here too. Serving it from the CLI while the MCP
     # refused it gave two answers to one question — and a script reading --json could not tell.
-    _refuse_stale_triage_run(resolved_atlas, selected_run)
+    _refuse_stale_triage_run(resolved_atlas, selected_run, cfg=cfg)
     # ★ A misspelled --run is a hard error naming the available runs, never an empty list at exit 0
     # (which reads as "this run has no candidates"). The stale check above leaves an unknown run
     # alone, so it is caught here against the same authority on which runs exist.
@@ -1911,18 +1926,6 @@ def atlas_view(view: str, config: Path | None, atlas_path: Path | None) -> None:
 )
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit triage list as JSON.")
 @click.option(
-    "--skip-non-binary",
-    is_flag=True,
-    default=False,
-    help="Skip the non-binary file analysis stage entirely.",
-)
-@click.option(
-    "--skip-ingester",
-    "skip_ingesters",
-    multiple=True,
-    help="Skip a specific ingester by kind (e.g. shell_script). Repeatable.",
-)
-@click.option(
     "--reanalyze",
     is_flag=False,
     flag_value="__all__",
@@ -1937,8 +1940,8 @@ def atlas_view(view: str, config: Path | None, atlas_path: Path | None) -> None:
     "--rehunt",
     is_flag=True,
     default=False,
-    help="Hunt again even when this run's stored candidates were already produced by this tmap "
-    "commit from this extraction. The skip exists because that pair reproduces the same result; "
+    help="Hunt again even when this run's stored candidates were already produced by this hunt "
+    "code from this analysis.db. The skip exists because that pair reproduces the same result; "
     "use this to re-run it anyway (e.g. to check that it still does).",
 )
 @click.option(
@@ -1972,8 +1975,6 @@ def scan(
     sink: str | None,
     status: str | None,
     as_json: bool,
-    skip_non_binary: bool,
-    skip_ingesters: tuple[str, ...],
     reanalyze: str | None,
     rehunt: bool,
     config: Path | None,
@@ -2067,8 +2068,6 @@ def scan(
                 ws,
                 cfg,
                 _progress,
-                skip_non_binary=skip_non_binary,
-                skip_ingesters=frozenset(skip_ingesters),
                 reanalyze=reanalyze,
                 force_retry=force_retry,
             )
@@ -2182,7 +2181,11 @@ def scan(
 
 
 def _rescan_reason(
-    run: RunRow, *, current_build: str | None, commit: str, live_instances: int | None
+    run: RunRow,
+    *,
+    current_build: str | None,
+    current: rescan_version.CodeStamp,
+    live_instances: int | None,
 ) -> tuple[str, str] | None:
     """WHICH input is out of date and why, or None when both are confirmed current.
 
@@ -2203,15 +2206,16 @@ def _rescan_reason(
     decisions and cannot share a predicate.
     """
     # ★ FIRST, ahead of every comparison. A run that never finished, or that has no lineage row at
-    # all, has nothing to compare: asking whether its extraction is current or whether its commit
-    # can be confirmed presumes a scan that completed. It did not, and the fix is a whole scan —
-    # the decompiler included. Reported as a fast re-hunt (which is where this used to land, via
-    # the scan_status branch below the commit check) it promises seconds and then runs Ghidra.
+    # all, has nothing to compare: asking whether its extraction or its code stamp is current
+    # presumes a scan that completed. It did not, and the fix is a whole scan — the decompiler
+    # included. Reported as a fast re-hunt (which is where this used to land, via the scan_status
+    # branch below) it promises seconds and then runs Ghidra.
     #
-    # The ORDER is load-bearing, not stylistic. On an install that records no commit — an editable
-    # checkout, the environment this is most often read in — the unknown-commit branch below
-    # matches every run there is. Behind it, this branch would never be reached and the tier would
-    # be empty exactly where it is needed.
+    # The ORDER is load-bearing, not stylistic: the incomplete tier costs a full decompile and must
+    # be claimed before the cheaper hunt branches, or an unfinished run would be offered as a fast
+    # re-hunt. (Unlike the old commit stamp, the hunt code stamp is recorded even for an editable
+    # checkout, so that install no longer lands every run in one unknown branch — the code stamp
+    # matching is what leaves a current run alone there.)
     #
     # ``resolved`` appears twice below and only ONE of them decides anything today. In the
     # condition it is implied: every unresolved run also carries scan_status='unknown', so the
@@ -2241,14 +2245,15 @@ def _rescan_reason(
             "extraction",
             f"extracted by {run.build_hash[:12]}, running {current_build[:12]}",
         )
-    if commit == UNKNOWN_VERSION:
-        return ("hunt", "the running install records no commit, so currency cannot be confirmed")
-    if not run.hunt_commit:
-        return ("hunt", "hunted before the commit stamp existed")
-    if run.hunt_commit == UNKNOWN_VERSION:
-        return ("hunt", "hunted by an install that recorded no commit")
-    if run.hunt_commit != commit:
-        return ("hunt", f"hunted by {run.hunt_commit[:12]}, running {commit[:12]}")
+    if run.hunt_code_version is None:
+        return ("hunt", "hunted before the code stamp existed")
+    if run.hunt_code_version != current.hunt:
+        return ("hunt", f"hunted by hunt code {run.hunt_code_version}, running {current.hunt}")
+    cmp = rescan_version.compare_scan_stamps(run.scan_stamp, current.scan)
+    if cmp.differing:
+        return ("hunt", f"scanned with {'; '.join(cmp.differing)}")
+    if cmp.unknown:
+        return ("hunt", f"scan stamp cannot be confirmed: {', '.join(cmp.unknown)}")
     # The stamp vouches for rows, so the rows are checked here too — same rule the skip gate
     # applies (see hunt_currency): a stamp whose count no longer matches the table is describing
     # a result that is no longer there.
@@ -2311,9 +2316,16 @@ _TIER_COST = {
 # and a one-word promise of speed over a rebuild nobody has timed is the kind of claim this file
 # exists to avoid making.
 _REASON_HUMAN: tuple[tuple[str, str], ...] = (
-    ("hunted by ", "hunted by an older tmap; re-hunt needs no decompile"),
     (
-        "hunted before the commit stamp existed",
+        "hunted by hunt code ",
+        "the hunt code changed since this run was hunted; re-hunt needs no decompile",
+    ),
+    (
+        "scan stamp cannot be confirmed",
+        "what built this run's analysis.db cannot be confirmed; rescan needs no decompile",
+    ),
+    (
+        "hunted before the code stamp existed",
         "hunted before tmap recorded what it ran; re-hunt needs no decompile",
     ),
     (
@@ -2323,11 +2335,6 @@ _REASON_HUMAN: tuple[tuple[str, str], ...] = (
     (
         "stored candidate rows changed since the hunt",
         "stored candidates were modified after the hunt; re-hunt needs no decompile",
-    ),
-    (
-        "the running install records no commit",
-        "this install records no commit, so currency cannot be confirmed; "
-        "re-hunt needs no decompile",
     ),
 )
 
@@ -2342,6 +2349,9 @@ def _reason_human(axis: str, reason: str, *, binaries: int | None = None) -> str
     scale = f" (decompiles {binaries} binaries)" if binaries else ""
     if axis == "extraction" and reason.startswith("extracted by "):
         return f"extracted by an older tmap; re-extraction is slow{scale}"
+    if reason.startswith("scanned with "):
+        # Keeps the detail (which names the stamps that differ) and adds what it costs.
+        return f"{reason}; rescan needs no decompile"
     if axis == "incomplete":
         # Sized like the extraction tier, and for the same reason: a full scan decompiles, so how
         # much there is to decompile is the part of "slow" a reader can act on. The machine reason
@@ -2374,7 +2384,11 @@ _TIER_ORDER: tuple[str, ...] = ("incomplete", "extraction", "hunt")
 
 
 def _staleness_tiers(
-    run_rows: list[RunRow], *, current_build: str | None, commit: str, live: dict[str, int]
+    run_rows: list[RunRow],
+    *,
+    current_build: str | None,
+    current: rescan_version.CodeStamp,
+    live: dict[str, int],
 ) -> tuple[dict[str, list[tuple[RunRow, str]]], list[RunRow]]:
     """Split runs into ``{axis -> [(run, reason)]}`` plus the confirmed-current ones.
 
@@ -2386,13 +2400,13 @@ def _staleness_tiers(
     One classifier for both commands, so what `tmap runs` calls out of date and what `tmap rescan`
     offers to redo can never drift apart."""
     tiers: dict[str, list[tuple[RunRow, str]]] = {axis: [] for axis in _TIER_ORDER}
-    current: list[RunRow] = []
+    confirmed: list[RunRow] = []
     for r in run_rows:
         res = _rescan_reason(
-            r, current_build=current_build, commit=commit, live_instances=live.get(r.run_id, 0)
+            r, current_build=current_build, current=current, live_instances=live.get(r.run_id, 0)
         )
         if res is None:
-            current.append(r)
+            confirmed.append(r)
         else:
             # An axis the order does not know would silently vanish from every render, so it is
             # refused here rather than dropped: a new axis must be declared, not just returned.
@@ -2400,7 +2414,7 @@ def _staleness_tiers(
             if axis not in tiers:
                 raise ConfigError(f"unknown staleness axis {axis!r} (not in {_TIER_ORDER})")
             tiers[axis].append((r, res[1]))
-    return tiers, current
+    return tiers, confirmed
 
 
 def _tier_line(r: RunRow, why: str, axis: str) -> str:
@@ -2530,20 +2544,23 @@ def rescan(
 ) -> None:
     """Bring runs scanned by an older tmap up to date with the one installed now.
 
-    With no arguments, selects every run whose stored result was NOT produced by this tmap commit.
-    Name run ids to scope it. Each selected run is re-scanned IN PLACE, into the workspace the atlas
-    records for it, so a refresh never starts a second workspace for a run that has one. A run whose
-    extraction is already current costs no decompiler time — the scan finds every binary cached —
-    but it does rebuild the parts no fingerprint covers: the ELF inventory, the symlinks, the
-    cross-binary xrefs and the non-binary facts. Runs already produced by this commit are left alone
-    (--force re-runs them anyway). Exits 3 when some selected runs failed to refresh.
+    With no arguments, selects every run whose stored result was NOT produced by the code this tmap
+    would run (its hunt and rescan code stamps). Name run ids to scope it. Each selected run is
+    re-scanned IN PLACE, into the workspace the atlas records for it, so a refresh never starts a
+    second workspace for a run that has one. A run whose extraction is already current costs no
+    decompiler time — the scan finds every binary cached — but it does rebuild the parts no
+    fingerprint covers: the ELF inventory, the symlinks, the cross-binary xrefs and the non-binary
+    facts. Runs whose code stamps match are left alone (--force re-runs them anyway). Exits 3 when
+    some selected runs failed to refresh.
 
     WHAT --force CAN AND CANNOT REFRESH. It re-runs the scan, so a changed config or a firmware
     directory whose contents moved is picked up. It does NOT re-extract: the scan it drives carries
     no --reanalyze, and the extraction fingerprint hashes tmap's own pipeline code, not the version
     of the libraries that code calls. After upgrading pyelftools (which the stub-resolve step parses
     ELF with) or Ghidra, the stored extraction is stale in a way nothing here can see — that one
-    needs `tmap scan <firmware-root> --run-id <run> --reanalyze`.
+    needs `tmap scan <firmware-root> --run-id <run> --reanalyze`. The run-level scan stamp records
+    the pyelftools version, but it covers only the inventory/non-binary rebuild, not the per-binary
+    decompile cache (keyed on the extraction fingerprint), so it does not stand in for --reanalyze.
 
     A run whose firmware root was never recorded, or is no longer on disk, CANNOT be rescanned —
     those are listed by name with the reason. They are never dropped from the report: a run that
@@ -2586,16 +2603,14 @@ def rescan(
 
     commit = installed_commit()
     current_build = current_pass_version()
+    stamp = rescan_version.current_code_stamp(cfg)
     click.echo(f"atlas: {resolved_atlas}")
-    unstamped = (
-        "  (this install records no commit, so no run can be shown current)"
-        if commit == UNKNOWN_VERSION
-        else ""
-    )
-    click.echo(f"running tmap commit: {commit}{unstamped}")
+    # The commit is shown for reference only; currency is decided by the code stamps below.
+    click.echo(f"running tmap commit: {commit}")
+    click.echo(f"hunt code {stamp.hunt} / scan code {rescan_version.pipeline_code_version()}")
 
     tiers, current = _staleness_tiers(
-        selected, current_build=current_build, commit=commit, live=live
+        selected, current_build=current_build, current=stamp, live=live
     )
     # ★ Both maps filled from EVERY tier. Missing a tier here fails in two different ways, and
     # neither is loud: leaving it out of ``todo`` drops its runs from the report altogether, while

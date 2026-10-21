@@ -429,3 +429,82 @@ def test_an_ingest_that_dies_leaves_no_success_stamp(tmp_path: Path) -> None:
     assert funcs == 0  # ...and it went with the failed transaction
     assert row["pass_version"] is None  # the stamp went with it: not marked extracted
     assert row["ghidra_ok"] == 0
+
+
+# ── the scan stamp (lib/rescan_version), written once the scan finishes ─────────────────
+
+import sqlite3  # noqa: E402
+
+from treasure_map.lib import rescan_version  # noqa: E402
+
+
+def _stamp(db_path: Path) -> str | None:
+    conn = sqlite3.connect(db_path)
+    try:
+        return rescan_version.read_scan_stamp(conn)
+    finally:
+        conn.close()
+
+
+def test_scan_stamp_is_written_on_a_clean_finish(tmp_path: Path) -> None:
+    """A finished scan records what built the analysis.db: the canonical scan stamp for its config.
+
+    MUTATION: drop the INSERT into scan_stamp at the end of run_analyze -> RED (no stamp)."""
+    with patch(f"{MODULE}.GhidraRunner", return_value=_mock_runner()):
+        with patch(f"{MODULE}.scan_filesystem", return_value=[]):
+            with Workspace(tmp_path / "ws") as ws:
+                run_analyze(tmp_path / "fs", ws, _cfg())
+                db = ws.db_path
+    assert _stamp(db) == rescan_version.scan_stamp_for(_cfg())
+
+
+def test_the_config_threshold_rides_in_the_scan_stamp(tmp_path: Path) -> None:
+    """A content-marked config value (the xref fold threshold) lands in the stamp, so a run scanned
+    under one is stale to an install configured with another."""
+    cfg = Config(xref_fold_edge_threshold=12_345)
+    with patch(f"{MODULE}.GhidraRunner", return_value=_mock_runner()):
+        with patch(f"{MODULE}.scan_filesystem", return_value=[]):
+            with Workspace(tmp_path / "ws") as ws:
+                run_analyze(tmp_path / "fs", ws, cfg)
+                db = ws.db_path
+    assert json.loads(_stamp(db))["config"]["xref_fold_edge_threshold"] == 12_345
+
+
+def test_a_scan_that_raises_leaves_no_stamp_and_clears_any_prior_one(tmp_path: Path) -> None:
+    """The stamp is cleared up front and written only at the very end, so a crash mid-scan leaves
+    NO stamp — never a stale one describing a half-built analysis.db.
+
+    MUTATION: move the DELETE to after the INSERT, or the INSERT before the work -> RED."""
+    # first scan writes a stamp
+    with patch(f"{MODULE}.GhidraRunner", return_value=_mock_runner()):
+        with patch(f"{MODULE}.scan_filesystem", return_value=[]):
+            with Workspace(tmp_path / "ws") as ws:
+                run_analyze(tmp_path / "fs", ws, _cfg())
+                db = ws.db_path
+    assert _stamp(db) is not None
+    # a second scan that raises after the clear must leave the table empty
+    with patch(f"{MODULE}.GhidraRunner", return_value=_mock_runner()):
+        with patch(f"{MODULE}.scan_filesystem", return_value=[]):
+            with patch(f"{MODULE}.run_all_ingesters", side_effect=RuntimeError("boom")):
+                with Workspace(tmp_path / "ws") as ws:
+                    with pytest.raises(RuntimeError):
+                        run_analyze(tmp_path / "fs", ws, _cfg())
+    assert _stamp(db) is None
+
+
+def test_the_scan_stamp_is_grabbed_at_the_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stamp written at the end is the one taken at the START — so a source edit mid-scan does
+    not change what this run is recorded as, and it is computed once.
+
+    MUTATION: compute the stamp at the write site instead of the start -> this would record "B"."""
+    stand_in = MagicMock(side_effect=["A", "B"])
+    monkeypatch.setattr(rescan_version, "scan_stamp_for", stand_in)
+    with patch(f"{MODULE}.GhidraRunner", return_value=_mock_runner()):
+        with patch(f"{MODULE}.scan_filesystem", return_value=[]):
+            with Workspace(tmp_path / "ws") as ws:
+                run_analyze(tmp_path / "fs", ws, _cfg())
+                db = ws.db_path
+    assert _stamp(db) == "A"
+    assert stand_in.call_count == 1

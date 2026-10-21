@@ -25,9 +25,12 @@ from treasure_map.cli.hunt_cli import (
     rescan,
     scan,
 )
+from treasure_map.lib import rescan_version
 from treasure_map.lib.analyze.ghidra_runner import current_pass_version
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import RunRow
+from treasure_map.lib.config.config import load_config
+from treasure_map.lib.rescan_version import CodeStamp
 from treasure_map.lib.storage.connection import open_db
 from treasure_map.lib.workspace.resolver import resolve_workspace
 from treasure_map.version import UNKNOWN_VERSION
@@ -36,6 +39,28 @@ COMMIT = "c" * 40
 OTHER = "d" * 40
 BUILD = "beefbeefbeefbeef"
 OTHER_BUILD = "facefeedfacefeed"
+HCODE = "src-rescan-hunt0"
+OTHER_HCODE = "src-rescan-old00"
+
+
+def _scan(code: str) -> str:
+    body = {
+        "code": code,
+        "config": {"xref_fold_edge_threshold": 25000},
+        "deps": {"pyelftools": "0.33"},
+    }
+    return json.dumps(body, sort_keys=True, separators=(",", ":"))
+
+
+SCAN = _scan("src-rescan-pipe")
+OTHER_SCAN = _scan("src-rescan-diff")
+CURRENT = CodeStamp(hunt=HCODE, scan=SCAN)
+
+
+def _running() -> CodeStamp:
+    """The code stamp the in-process ``rescan`` command will compute, so a CLI test can stamp a run
+    row to read as genuinely current."""
+    return rescan_version.current_code_stamp(load_config(None))
 
 
 def _run(**over: object) -> RunRow:
@@ -43,6 +68,8 @@ def _run(**over: object) -> RunRow:
         "run_id": "r1",
         "firmware_path": "/fw",
         "hunt_commit": COMMIT,
+        "hunt_code_version": HCODE,
+        "scan_stamp": SCAN,
         "hunt_instances": 5,
         "build_hash": BUILD,
         "scan_status": "complete",
@@ -52,39 +79,54 @@ def _run(**over: object) -> RunRow:
 
 
 def _reason(
-    run: RunRow, *, commit: str = COMMIT, build: str | None = BUILD, live: int = 5
+    run: RunRow, *, current: CodeStamp = CURRENT, build: str | None = BUILD, live: int = 5
 ) -> tuple[str, str] | None:
-    return _rescan_reason(run, current_build=build, commit=commit, live_instances=live)
+    return _rescan_reason(run, current_build=build, current=current, live_instances=live)
 
 
-def test_a_run_hunted_by_this_commit_is_left_alone() -> None:
+def test_a_run_hunted_by_this_code_is_left_alone() -> None:
     assert _reason(_run()) is None
 
 
 @pytest.mark.parametrize(
-    ("run", "commit"),
+    "run",
     [
-        (_run(hunt_commit=OTHER), COMMIT),
-        (_run(hunt_commit=None), COMMIT),
-        (_run(hunt_commit=UNKNOWN_VERSION), COMMIT),
-        (_run(scan_status="in_progress"), COMMIT),
-        (_run(scan_status="failed"), COMMIT),
-        (_run(), UNKNOWN_VERSION),
+        _run(hunt_code_version=OTHER_HCODE),  # a different hunt code
+        _run(hunt_code_version=None, scan_stamp=None),  # hunted before the code stamp existed
+        _run(scan_stamp=OTHER_SCAN),  # the analysis.db was scanned differently
+        _run(scan_status="in_progress"),  # never finished
+        _run(scan_status="failed"),
     ],
 )
-def test_anything_not_shown_current_is_offered_for_rescan(run: RunRow, commit: str) -> None:
+def test_anything_not_shown_current_is_offered_for_rescan(run: RunRow) -> None:
     """Rescan uses the SKIP's bar, not the refusal's: offer the work whenever sameness is unproven.
 
     That is the right direction here because the user asked for a refresh and can see the list
     before anything runs — over-offering costs a line of output, under-offering silently leaves a
     stale run in place while reporting success.
 
-    MUTATION: make ``_rescan_reason`` return None for a NULL or 'unknown' stamp -> RED.
+    MUTATION: make ``_rescan_reason`` return None for a NULL code stamp or a differing one -> RED.
     """
-    result = _reason(run, commit=commit)
+    result = _reason(run)
     assert result, "an out-of-date run must come with the reason it is out of date"
     axis, why = result
     assert axis in ("incomplete", "extraction", "hunt") and why
+
+
+def test_the_page_header_shows_code_stamps_not_a_commit_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The header reports the running code stamps. The old "no run can be shown current" line —
+    printed when the install recorded no commit — is gone: an editable install has code stamps too,
+    so its runs CAN be shown current.
+
+    MUTATION: restore the unstamped-commit branch in the rescan page header -> RED."""
+    monkeypatch.setattr(hunt_cli, "installed_commit", lambda: UNKNOWN_VERSION)
+    db = _atlas_with(tmp_path, [{"run_id": "r", "scan_status": "complete"}])
+    out = CliRunner().invoke(rescan, ["--atlas", str(db), "--dry-run"])
+    assert out.exit_code == 0, out.output
+    assert "hunt code src-" in out.output and "scan code src-" in out.output
+    assert "no run can be shown current" not in out.output
 
 
 def _atlas_with(tmp_path: Path, rows: list[dict[str, object]]) -> Path:
@@ -185,7 +227,7 @@ def test_a_changed_extraction_is_reported_on_its_own_axis() -> None:
         "extraction",
         f"extracted by {BUILD[:12]}, running {OTHER_BUILD[:12]}",
     )
-    axis, _why = _reason(_run(hunt_commit=OTHER)) or ("", "")
+    axis, _why = _reason(_run(hunt_code_version=OTHER_HCODE)) or ("", "")
     assert axis == "hunt"
 
 
@@ -208,7 +250,7 @@ def test_an_uncomparable_extraction_is_not_claimed_for_the_expensive_axis(
 def test_both_inputs_changed_lands_on_the_extraction_axis_only() -> None:
     """Re-extracting re-hunts as a matter of course, so listing such a run as a fast re-hunt would
     promise seconds of work and then start a decompiler."""
-    assert _reason(_run(hunt_commit=OTHER), build=OTHER_BUILD)[0] == "extraction"  # type: ignore[index]
+    assert _reason(_run(hunt_code_version=OTHER_HCODE), build=OTHER_BUILD)[0] == "extraction"  # type: ignore[index]
 
 
 def test_the_row_count_is_part_of_the_rescan_answer_too() -> None:
@@ -430,6 +472,8 @@ def test_force_rescans_a_run_that_is_confirmed_current(
                 "scan_status": "complete",
                 "firmware_path": str(fw),
                 "hunt_commit": COMMIT,
+                "hunt_code_version": _running().hunt,
+                "scan_stamp": _running().scan,
                 "hunt_instances": 0,
                 "build_hash": current_pass_version(),
                 "analysis_db_path": str(_workspace(ws_dir, "fresh_ws")),

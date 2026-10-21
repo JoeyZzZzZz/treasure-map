@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from treasure_map.lib import rescan_version
 from treasure_map.lib.analyze.db_ingest import ingest_elfs
 from treasure_map.lib.analyze.elf_inventory import ElfRecord, scan_filesystem
 from treasure_map.lib.analyze.ghidra_ingest import IngestStats, ingest_ghidra_output
@@ -78,8 +79,6 @@ def run_analyze(
     workspace: Workspace,
     config: Config,
     progress_callback: ProgressCallback | None = None,
-    skip_non_binary: bool = False,
-    skip_ingesters: frozenset[str] = frozenset(),
     reanalyze: str | None = None,
     force_retry: bool = False,
 ) -> AnalyzeResult:
@@ -101,6 +100,10 @@ def run_analyze(
     runner = GhidraRunner(config.ghidra)
     runner.get_headless()
 
+    # Grab the scan stamp at the START, so what is written at the end describes the code this
+    # process actually loaded even if the source is edited mid-scan (it is a claim about THIS run).
+    scan_stamp = rescan_version.scan_stamp_for(config)
+
     # Content hash of the extraction pass: a cache-key dimension alongside sha256, so editing
     # ExportFunctions re-extracts every binary automatically (no manual JSON/db deletion).
     pass_version = runner.pass_version()
@@ -111,14 +114,18 @@ def run_analyze(
     ghidra_version = runner.ghidra_version()
 
     # The ELF walk already tests every entry for being a symlink; hand it a collector so those
-    # links become an inventory instead of being dropped. This walk always runs (the non-binary
-    # walk is skippable), so the inventory does not depend on an optional stage.
+    # links become an inventory instead of being dropped. This walk always runs, so the inventory
+    # does not depend on an optional stage.
     symlink_collector = SymlinkCollector(fs_root)
     records = scan_filesystem(
         fs_root, progress_callback=progress_callback, symlink_collector=symlink_collector
     )
 
     conn = open_db(workspace.db_path)
+    # Clear the scan stamp up front: a crash before the end leaves NO stamp (read as "cannot
+    # confirm", which re-scans), never a stale one describing a half-built analysis.db.
+    conn.execute("DELETE FROM scan_stamp")
+    conn.commit()
     dirty_records: list[ElfRecord] = []
     ghidra_ok = 0
     ghidra_failed = 0
@@ -250,13 +257,13 @@ def run_analyze(
         ]
 
         # non-binary ingester framework (wipe-and-rebuild)
-        if not skip_non_binary:
-            nb_stats = run_all_ingesters(
-                conn,
-                fs_root,
-                skip_ingesters=skip_ingesters,
-                progress_callback=progress_callback,
-            )
+        nb_stats = run_all_ingesters(conn, fs_root, progress_callback=progress_callback)
+
+        # The scan finished. Record what built this analysis.db — the stamp grabbed at the start,
+        # so it names the code this process ran. Last, inside the try, so it is written only on a
+        # clean finish; any exception above leaves the table empty (cleared after open_db).
+        conn.execute("INSERT INTO scan_stamp (id, stamp) VALUES (1, ?)", (scan_stamp,))
+        conn.commit()
     finally:
         conn.close()
 

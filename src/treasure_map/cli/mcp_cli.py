@@ -207,7 +207,9 @@ def same_shape_siblings(
 ) -> None:
     """Print the calls of the same shape as one sink call of a diff, in the same binary, and where
     each landed in that diff (the same answer as the MCP tool same_shape_siblings)."""
+    from treasure_map.lib import rescan_version
     from treasure_map.lib.atlas.connection import open_atlas
+    from treasure_map.lib.config.config import load_config
     from treasure_map.lib.query.same_shape_siblings import same_shape_siblings as siblings
 
     atlas, _ = _resolve_mcp_target(atlas_db, None)
@@ -223,6 +225,7 @@ def same_shape_siblings(
                 candidate_anchor=candidate_anchor,
                 members_offset=members_offset,
                 build_hash=current_pass_version(),
+                current=rescan_version.current_code_stamp(load_config(None)),
                 commit=installed_commit(),
             )
         )
@@ -284,9 +287,10 @@ def mcp_serve(atlas_db: str | None, workspaces_root: str | None) -> None:
     # `mcp` is a core dependency, so build_server is imported like any other module. A missing
     # `mcp` here means a corrupted install, not an unselected extra — let it surface as a normal
     # ImportError (the same as a missing click/pyelftools), never a "go install the extra" hint.
+    from treasure_map.lib.config.config import load_config
     from treasure_map.mcp_app import build_server
 
-    server = build_server(atlas_db, workspaces_root=workspaces_root)
+    server = build_server(atlas_db, workspaces_root=workspaces_root, config=load_config(None))
     # Tell a human who ran this by hand what is happening — on stderr, so stdout stays clean
     # JSON-RPC for the client.
     click.echo(

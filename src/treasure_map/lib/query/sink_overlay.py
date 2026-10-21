@@ -553,15 +553,35 @@ def _known_commit(commit: str | None) -> bool:
     return bool(commit) and commit != UNKNOWN_VERSION
 
 
+def _code_stamps(atlas: sqlite3.Connection, run_id: str) -> tuple[str | None, str | None] | None:
+    """(hunt_code_version, scan_stamp) for a run, or None if the run is absent. Read by SQL and
+    compared as strings — this module is an OVERLAY_CODE_ENTRY, so it never imports the stamp code
+    (that would fold the hashing into the baseline it versions)."""
+    row = atlas.execute(
+        "SELECT hunt_code_version, scan_stamp FROM run WHERE run_id = ?", (run_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    return row[0], row[1]
+
+
 def _generation_mismatch(atlas: sqlite3.Connection, ctx: _DiffCtx) -> bool:
     """True when the two runs' candidates were provably produced by different extraction or hunt
-    code: build_hash differs, or both hunt_commits are known and differ. An absent run proves
-    nothing either way."""
+    code. ``build_hash`` differing is always a mismatch. When BOTH runs carry a code stamp (the
+    current path), they differ when their hunt code hash differs or either scan stamp is missing or
+    they differ. When at least one is an older run with no code stamp, the commit rule stands in —
+    both commits known and unequal. An absent run proves nothing either way.
+
+    Kept byte-identical in logic to patch_view's ``_gen`` comparison; a behaviour test asserts the
+    two agree on the same run pairs."""
     sa, sb = _gen_stamps(atlas, ctx.run_a), _gen_stamps(atlas, ctx.run_b)
     if sa is None or sb is None:
         return False
     if sa[1] != sb[1]:
         return True
+    ca, cb = _code_stamps(atlas, ctx.run_a), _code_stamps(atlas, ctx.run_b)
+    if ca is not None and cb is not None and ca[0] is not None and cb[0] is not None:
+        return ca[0] != cb[0] or ca[1] is None or cb[1] is None or ca[1] != cb[1]
     return _known_commit(sa[0]) and _known_commit(sb[0]) and sa[0] != sb[0]
 
 

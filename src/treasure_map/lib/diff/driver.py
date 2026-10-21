@@ -40,6 +40,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from treasure_map.lib import rescan_version
 from treasure_map.lib.analyze.ghidra_runner import current_pass_version as _current_pass_version
 from treasure_map.lib.atlas.models import DiffMetaRow
 from treasure_map.lib.atlas.writer import add_diff_meta, delete_diff
@@ -1228,7 +1229,7 @@ def run_version_diff(
     then re-raised so the caller still sees the error. The run pair is checked for currency first
     (``check_run_pair_currency``), exactly as a full diff checks it."""
     currency_warnings = check_run_pair_currency(
-        _resolve_run(atlas, run_a_id, "a"), _resolve_run(atlas, run_b_id, "b")
+        _resolve_run(atlas, run_a_id, "a"), _resolve_run(atlas, run_b_id, "b"), config=config
     )
     _SWEEP_CANCELLED.clear()  # an earlier interrupted sweep in this process must not refuse this
     pf = preflight(atlas, run_a_id, run_b_id, binary_name, config=config, force=force)
@@ -1698,7 +1699,7 @@ def run_full_diff(
             "recorded), so every delta would be version_skew undetermined. Re-scan both with the "
             "same toolchain, or pass --force to diff anyway (the result stays honestly degraded)."
         )
-    warnings = check_run_pair_currency(run_a, run_b)
+    warnings = check_run_pair_currency(run_a, run_b, config=config)
     _SWEEP_CANCELLED.clear()  # a fresh sweep: an earlier interrupted one must not refuse this one
     # Read before the plan: the plan compares it with the toolchain each diff was computed by.
     toolchain = _toolchain.detect_toolchain(config)
@@ -2076,7 +2077,7 @@ def _analysis_build_hash(analysis_db_path: str | None) -> str | None:
         conn.close()
 
 
-def check_run_pair_currency(run_a: RunRow, run_b: RunRow) -> tuple[str, ...]:
+def check_run_pair_currency(run_a: RunRow, run_b: RunRow, *, config: Config) -> tuple[str, ...]:
     """Refuse to diff a run pair when either run is PROVABLY out of date; return warnings otherwise.
 
     Two refusals (ConfigError), both a positive mismatch between two real values:
@@ -2090,9 +2091,10 @@ def check_run_pair_currency(run_a: RunRow, run_b: RunRow) -> tuple[str, ...]:
     those are routine, and refusing them would leave such an install unable to diff at all."""
     build = _current_pass_version()
     commit = _installed_commit()
+    current = rescan_version.current_code_stamp(config)
     warnings: list[str] = []
     for side, run in (("A", run_a), ("B", run_b)):
-        st = run_staleness(run, build_hash=build, commit=commit)
+        st = run_staleness(run, build_hash=build, current=current, commit=commit)
         if st.stale:
             raise ConfigError(
                 f"run {side} '{run.run_id}' is out of date ({st.axis}): {st.detail} {st.remedy}"

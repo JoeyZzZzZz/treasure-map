@@ -120,7 +120,10 @@ _GHIDRA_RELEASES_URL = "https://github.com/NationalSecurityAgency/ghidra/release
 # import transitivity would make an edit to an unrelated wipe-and-rebuild step trigger a full,
 # hours-long Ghidra re-extraction. The criterion is "its output is written into the functions cache
 # inside the dirty loop", and ``test_pass_version.py`` locks this set against that criterion
-# mechanically, so a future extraction step cannot be added and silently left out.
+# mechanically, so a future extraction step cannot be added and silently left out. The lock also
+# covers the whole of each of these three modules' treasure_map reads: they read only one another
+# (outside type annotations), so the fingerprint — which hashes exactly this set plus the .java and
+# .tsv — is closed, and a read of an undeclared module fails the lock.
 _PIPELINE_PY_MODULES: tuple[str, ...] = ("elf_exports.py", "ghidra_ingest.py", "stub_resolve.py")
 
 

@@ -56,7 +56,9 @@ DIFF_CODE_ENTRIES: tuple[str, ...] = (
     "lib.binary_id",
     "lib.callsite_ref",
     "lib.hunt.refs",
-    "lib.query.runs",
+    "lib.query.runs:get_run",
+    "lib.query.runs:_row_to_runrow",
+    "lib.query.runs:_RUN_COLUMNS",
     "lib.ro_db",
     "lib.atlas.models:DiffMetaRow",
     "lib.atlas.models:DimensionCapabilityStateRow",
@@ -120,6 +122,10 @@ _EXCLUDED: dict[str, str] = {
         "whether a stored baseline is stale, read to decide whether to store it again"
     ),
     "lib.query.runs:run_staleness": "the run currency refusal; nothing it returns is written",
+    "lib.rescan_version": (
+        "the running code stamp, compared for the run currency refusal; nothing it returns is "
+        "written"
+    ),
     "version:installed_commit": "the installed build, compared for the run currency refusal",
 }
 
