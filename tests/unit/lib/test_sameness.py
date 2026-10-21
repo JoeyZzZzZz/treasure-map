@@ -445,6 +445,11 @@ def test_an_empty_body_on_both_sides_is_unavailable_never_identical() -> None:
 # ── pseudocode_delta: the lexical shape of a difference ──────────────────────────────────────
 
 
+def _without_hunk(delta: dict) -> dict:
+    """A delta with its inline_hunk set aside: every other field, as it was before the hunk."""
+    return {k: v for k, v in delta.items() if k != "inline_hunk"}
+
+
 def test_a_size_only_change_is_a_number_substitution() -> None:
     """A buffer whose size moved reads as a substitution of numbers and nothing else, and the
     pair still differs.
@@ -492,9 +497,13 @@ def test_a_delta_over_the_line_product_cap_is_not_computed(
     monkeypatch.setattr(sm, "DELTA_LINE_PRODUCT_CAP", 24)  # 5 x 5 lines = 25 pairs
     a = "\n".join(f"x{i} = {i};" for i in range(5))
     b = "\n".join(f"x{i} = {i + 1};" for i in range(5))
-    assert sm.pseudocode_delta(a, b, None, None, "1000", "2000") == {
-        "kind": "not_computed",
-        "reason": "too_large",
+    delta = sm.pseudocode_delta(a, b, None, None, "1000", "2000")
+    assert _without_hunk(delta) == {"kind": "not_computed", "reason": "too_large"}
+    # every line differs, so no identical head / tail to set aside: the hunk is withheld too
+    assert delta["inline_hunk"] == {
+        "withheld": "too_large",
+        "lines": {"a": 5, "b": 5},
+        "read_with": "get_pseudocode",
     }
 
 
@@ -509,10 +518,9 @@ def test_a_changed_block_over_the_token_product_cap_is_not_computed(
     monkeypatch.setattr(sm, "DELTA_TOKEN_PRODUCT_CAP", 400)
     wide_a = "x = " + " + ".join(f"a{i}" for i in range(12)) + ";"
     wide_b = "x = " + " + ".join(f"b{i}" for i in range(12)) + ";"
-    assert sm.pseudocode_delta(wide_a, wide_b, None, None, "1000", "2000") == {
-        "kind": "not_computed",
-        "reason": "too_large",
-    }
+    wide = sm.pseudocode_delta(wide_a, wide_b, None, None, "1000", "2000")
+    assert _without_hunk(wide) == {"kind": "not_computed", "reason": "too_large"}
+    assert wide["inline_hunk"]["withheld"] == "too_large"  # the middle's tokens are over the cap
     small = sm.pseudocode_delta("x = a1;", "x = b1;", None, None, "1000", "2000")
     assert small["kind"] == "substitution_only"
 
@@ -536,10 +544,9 @@ def test_the_token_cap_is_one_budget_for_the_whole_delta(
     assert sm.pseudocode_delta(one_a, one_b, None, None, "1000", "2000")["kind"] != "not_computed"
     many_a = "\n".join(sum((block("a", k) + [f"keep{k}();"] for k in range(12)), []))
     many_b = "\n".join(sum((block("b", k) + [f"keep{k}();"] for k in range(12)), []))
-    assert sm.pseudocode_delta(many_a, many_b, None, None, "1000", "2000") == {
-        "kind": "not_computed",
-        "reason": "too_large",
-    }
+    many = sm.pseudocode_delta(many_a, many_b, None, None, "1000", "2000")
+    assert _without_hunk(many) == {"kind": "not_computed", "reason": "too_large"}
+    assert many["inline_hunk"]["withheld"] == "too_large"
 
 
 def test_the_line_cap_sits_at_five_million_pairs() -> None:
@@ -557,10 +564,8 @@ def test_the_line_cap_sits_at_five_million_pairs() -> None:
         sm.pseudocode_delta(body(2236, -1), body(2236, 7), None, None, "1000", "2000")["kind"]
         == "substitution_only"
     )
-    assert sm.pseudocode_delta(body(2237, -1), body(2237, 7), None, None, "1000", "2000") == {
-        "kind": "not_computed",
-        "reason": "too_large",
-    }
+    refused = sm.pseudocode_delta(body(2237, -1), body(2237, 7), None, None, "1000", "2000")
+    assert _without_hunk(refused) == {"kind": "not_computed", "reason": "too_large"}
 
 
 def test_the_token_budget_stays_at_five_million_pairs() -> None:
@@ -674,3 +679,481 @@ def test_a_statement_bound_ends_the_walk_back_to_the_call() -> None:
     assert (
         _lnf('log((struct pos){1, 2}, "a.c", 10);', 'log((struct pos){1, 2}, "a.c", 11);') is None
     )
+
+
+# ── inline_hunk: the changed lines themselves, from the original text (S4) ────────────────────
+
+# Handwritten bodies (no firmware text) and their delta as it was BEFORE inline_hunk existed
+# (computed at 7e61b2e): the hunk is added on top and must never move any of these fields.
+_DELTA_CASES = {
+    "structural_deleted_call": (
+        "int handler(int a)\n"
+        "{\n"
+        "  char buf[64];\n"
+        "  int n;\n"
+        "\n"
+        "  n = read_input(buf);\n"
+        "  if (n > 0) {\n"
+        "    FUN_00409748(buf);\n"
+        "  }\n"
+        "  log_it(n);\n"
+        "  return n;\n"
+        "}\n",
+        "int handler(int a)\n"
+        "{\n"
+        "  char buf[64];\n"
+        "  int n;\n"
+        "\n"
+        "  n = read_input(buf);\n"
+        "  if (n > 0) {\n"
+        "  }\n"
+        "  log_it(n);\n"
+        "  return n;\n"
+        "}\n",
+        "00401000",
+        "00402000",
+        "handler",
+        "handler",
+    ),
+    "structural_copy_swap": (
+        "void set_key(char *dst, char *src)\n{\n  strcpy(dst, src);\n  return;\n}\n",
+        'void set_key(char *dst, char *src)\n{\n  snprintf(dst, 0x40, "%s", src);\n  return;\n}\n',
+        "00401100",
+        "00402100",
+        "set_key",
+        "set_key",
+    ),
+    "number_substitution": (
+        "void f(void)\n"
+        "{\n"
+        "  char b[64];\n"
+        "  memset(b, 0, 0x40);\n"
+        "  fgets(b, 0x40, fp);\n"
+        "  return;\n"
+        "}\n",
+        "void f(void)\n"
+        "{\n"
+        "  char b[64];\n"
+        "  memset(b, 0, 0x3f);\n"
+        "  fgets(b, 0x3f, fp);\n"
+        "  return;\n"
+        "}\n",
+        "00401200",
+        "00402200",
+        None,
+        None,
+    ),
+    "local_rename_and_comment": (
+        "void g(void)\n"
+        "{\n"
+        "  int local_10;\n"
+        "  /* old note */\n"
+        "  local_10 = get();\n"
+        "  use(local_10);\n"
+        "  return;\n"
+        "}\n",
+        "void g(void)\n"
+        "{\n"
+        "  int local_14;\n"
+        "  /* new note */\n"
+        "  local_14 = get();\n"
+        "  use(local_14);\n"
+        "  return;\n"
+        "}\n",
+        "00401300",
+        "00402300",
+        None,
+        None,
+    ),
+    "ident_and_string_substitution": (
+        'void h(void)\n{\n  call_a("old");\n  call_a("old");\n  return;\n}\n',
+        'void h(void)\n{\n  call_b("new");\n  call_b("new");\n  return;\n}\n',
+        "00401400",
+        "00402400",
+        None,
+        None,
+    ),
+    "layout_only": (
+        "void k(void)\n{\n  foo(1, 2);\n  return;\n}\n",
+        "void k(void)\n{\n  foo(1,\n      2);\n  return;\n}\n",
+        "00401500",
+        "00402500",
+        None,
+        None,
+    ),
+    "address_shift_only": (
+        "void m(void)\n{\n  FUN_00401000(DAT_00412345);\n  return;\n}\n",
+        "void m(void)\n{\n  FUN_00403000(DAT_00418888);\n  return;\n}\n",
+        "00401600",
+        "00402600",
+        None,
+        None,
+    ),
+    "line_number_form": (
+        "void report(int e)\n"
+        "{\n"
+        '  log_at("src/net.c", 120, e);\n'
+        '  log_at("src/net.c", 131, e);\n'
+        "  return;\n"
+        "}\n",
+        "void report(int e)\n"
+        "{\n"
+        '  log_at("src/net.c", 122, e);\n'
+        '  log_at("src/net.c", 133, e);\n'
+        "  return;\n"
+        "}\n",
+        "00401700",
+        "00402700",
+        "report",
+        "report",
+    ),
+    "two_blocks_mergeable": (
+        "void p(void)\n"
+        "{\n"
+        "  a1();\n"
+        "  a2();\n"
+        "  a3();\n"
+        "  x1();\n"
+        "  a4();\n"
+        "  a5();\n"
+        "  x2();\n"
+        "  a6();\n"
+        "  a7();\n"
+        "  a8();\n"
+        "}\n",
+        "void p(void)\n"
+        "{\n"
+        "  a1();\n"
+        "  a2();\n"
+        "  a3();\n"
+        "  a4();\n"
+        "  a5();\n"
+        "  y2(1);\n"
+        "  a6();\n"
+        "  a7();\n"
+        "  a8();\n"
+        "}\n",
+        "00401800",
+        "00402800",
+        None,
+        None,
+    ),
+}
+
+_DELTA_GOLDEN = {
+    "structural_deleted_call": {
+        "kind": "structural",
+        "structural_spans": 1,
+        "substitutions": {},
+        "calls": {"unnamed": {"a": 1, "b": 0}},
+    },
+    "structural_copy_swap": {
+        "kind": "structural",
+        "structural_spans": 1,
+        "substitutions": {"ident": {"total": 1, "first": [["strcpy", "snprintf"]]}},
+        "calls": {"snprintf": {"a": 0, "b": 1}, "strcpy": {"a": 1, "b": 0}},
+    },
+    "number_substitution": {
+        "kind": "substitution_only",
+        "structural_spans": 0,
+        "substitutions": {"number": {"total": 2, "first": [["0x40", "0x3f"], ["0x40", "0x3f"]]}},
+        "calls": {},
+    },
+    "local_rename_and_comment": {
+        "kind": "substitution_only",
+        "structural_spans": 0,
+        "substitutions": {
+            "comment": {"total": 1, "first": [["/* old note */", "/* new note */"]]},
+            "ident": {
+                "total": 3,
+                "first": [
+                    ["local_10", "local_14"],
+                    ["local_10", "local_14"],
+                    ["local_10", "local_14"],
+                ],
+            },
+        },
+        "calls": {},
+    },
+    "ident_and_string_substitution": {
+        "kind": "substitution_only",
+        "structural_spans": 0,
+        "substitutions": {
+            "ident": {"total": 2, "first": [["call_a", "call_b"], ["call_a", "call_b"]]},
+            "string": {"total": 2, "first": [['"old"', '"new"'], ['"old"', '"new"']]},
+        },
+        "calls": {"call_a": {"a": 2, "b": 0}, "call_b": {"a": 0, "b": 2}},
+    },
+    "layout_only": {"kind": "layout_only", "structural_spans": 0, "substitutions": {}, "calls": {}},
+    "address_shift_only": {
+        "kind": "layout_only",
+        "structural_spans": 0,
+        "substitutions": {},
+        "calls": {},
+    },
+    "line_number_form": {
+        "kind": "substitution_only",
+        "structural_spans": 0,
+        "substitutions": {"number": {"total": 2, "first": [["120", "122"], ["131", "133"]]}},
+        "calls": {},
+        "line_number_form": {"delta": 2, "sites": 2},
+    },
+    "two_blocks_mergeable": {
+        "kind": "structural",
+        "structural_spans": 2,
+        "substitutions": {"ident": {"total": 1, "first": [["x2", "y2"]]}},
+        "calls": {"x1": {"a": 1, "b": 0}, "x2": {"a": 1, "b": 0}, "y2": {"a": 0, "b": 1}},
+    },
+}
+
+
+def _hunk(name: str) -> dict | None:
+    a, b, fa, fb, na, nb = _DELTA_CASES[name]
+    return sm.pseudocode_delta(a, b, None, None, fa, fb, na, nb).get("inline_hunk")
+
+
+def test_the_hunk_leaves_every_other_field_of_the_delta_as_it_was() -> None:
+    """★ inline_hunk is added on top: with it set aside, the delta of every case is byte for byte
+    what it was before the hunk existed, and the hunk is the LAST field.
+
+    MUTATION (verified RED): read the subs from structural blocks only -> RED; let the gate turn a
+    delta not_computed -> RED; normalise decompiler locals before the line match -> RED."""
+    import json
+
+    for name, (a, b, fa, fb, na, nb) in _DELTA_CASES.items():
+        delta = sm.pseudocode_delta(a, b, None, None, fa, fb, na, nb)
+        assert json.dumps(_without_hunk(delta)) == json.dumps(_DELTA_GOLDEN[name]), name
+        if "inline_hunk" in delta:
+            assert list(delta)[-1] == "inline_hunk", name
+
+
+def test_a_deleted_call_is_shown_with_its_original_name() -> None:
+    """★ The lines are aligned on the normalised text, where FUN_00409748 reads FUN_@, but shown as
+    the original text has them, with two context lines on each side.
+
+    MUTATION (verified RED): show the normalised line -> '-FUN_@(buf);' -> RED; context 0 -> RED."""
+    assert _hunk("structural_deleted_call") == {
+        "structural_lines": 1,
+        "groups": 0,
+        "structural": [
+            [" n = read_input(buf);", " if (n > 0) {", "-FUN_00409748(buf);", " }", " log_it(n);"]
+        ],
+        "substitution_groups": [],
+    }
+
+
+def test_a_structural_block_shows_both_sides() -> None:
+    """A replaced call is shown on both sides (the A side's line and the B side's), not the A side
+    alone; only the context comes from one side."""
+    (run,) = (_hunk("structural_copy_swap") or {})["structural"]
+    assert "-strcpy(dst, src);" in run
+    assert '+snprintf(dst, 0x40, "%s", src);' in run
+
+
+def test_a_local_rename_is_a_group_never_aligned_away() -> None:
+    """★ local_10 -> local_14 is another stack slot (maybe another buffer): it is grouped, with the
+    comment change, as local_or_comment — every occurrence counted, the first ones placed by the
+    1-based line of each side's original text — and never folded into the text the lines are
+    aligned on (the delta still records the three ident substitutions, see the golden).
+
+    MUTATION (verified RED): normalise decompiler-local names before the line match -> the rename
+    is gone from the hunk -> RED; group each local pair apart -> two groups -> RED."""
+    assert _hunk("local_rename_and_comment") == {
+        "structural_lines": 0,
+        "groups": 1,
+        "structural": [],
+        "substitution_groups": [
+            {
+                "kind": "local_or_comment",
+                "total": 4,
+                "first": [
+                    ["local_10", "local_14", 3, 3],
+                    ["/* old note */", "/* new note */", 4, 4],
+                    ["local_10", "local_14", 5, 5],
+                    ["local_10", "local_14", 6, 6],
+                ],
+            }
+        ],
+    }
+
+
+def test_the_local_name_rule_is_the_decompiler_s_own_names() -> None:
+    """The rename rule matches the names a decompiler makes up — and no real symbol of the same
+    shape outside those prefixes."""
+    made_up = [
+        "local_10",
+        "param_1",
+        "in_v0",
+        "extraout_v0",
+        "unaff_s0",
+        "auStack_870",
+        "uStack_14",
+        "piStack_8",
+        "uVar1",
+        "iVar22",
+        "bVar3",
+        "auVar4",
+    ]
+    real = ["memcpy", "localtime", "parameter", "var1", "Var1", "stack_top", "uVar"]
+    assert all(sm._DECOMPILER_LOCAL.match(n) for n in made_up)
+    assert not any(sm._DECOMPILER_LOCAL.match(n) for n in real)
+
+
+def test_numbers_group_by_step_and_names_by_pair() -> None:
+    """Each like substitution is one line: numbers by their step (0x40 -> 0x3f is -1), an identifier
+    or a string by its pair, each with its total and first places."""
+    num = _hunk("number_substitution") or {}
+    assert num["substitution_groups"] == [
+        {
+            "kind": "number",
+            "step": -1,
+            "total": 2,
+            "first": [["0x40", "0x3f", 4, 4], ["0x40", "0x3f", 5, 5]],
+        }
+    ]
+    names = _hunk("ident_and_string_substitution") or {}
+    assert [(g["kind"], g["total"]) for g in names["substitution_groups"]] == [
+        ("ident", 2),
+        ("string", 2),
+    ]
+    assert names["groups"] == 2
+
+
+def test_close_runs_merge_and_far_runs_do_not() -> None:
+    """Two structural blocks with at most four (2 x 2) lines between them are one run, so no
+    context line is printed twice; further apart they are two runs, each with its own context.
+
+    MUTATION (verified RED): never merge -> the 2-line gap gives two runs -> RED."""
+    (merged,) = (_hunk("two_blocks_mergeable") or {})["structural"]
+    assert merged == [
+        " a2();",
+        " a3();",
+        "-x1();",
+        " a4();",
+        " a5();",
+        "-x2();",
+        "+y2(1);",
+        " a6();",
+        " a7();",
+    ]
+    a = "\n".join(["{", *[f"k{i}();" for i in range(12)], "}"])
+    b = a.replace("k1();", "z1(2);").replace("k9();", "z9(1);")
+    runs = sm.pseudocode_delta(a, b, None, None, "1000", "2000")["inline_hunk"]["structural"]
+    assert [r[2:4] for r in runs] == [["-k1();", "+z1(2);"], ["-k9();", "+z9(1);"]]
+
+
+def test_a_context_line_whose_b_text_differs_is_given_on_both_sides() -> None:
+    """A context line matches only once addresses are normalised: its B text is given beside it
+    (``=``), so neither side's real address is lost."""
+    a = "void f(void)\n{\n  g = FUN_00401000(1);\n  drop();\n  return;\n}"
+    b = "void f(void)\n{\n  g = FUN_00403000(1);\n  return;\n}"
+    (run,) = sm.pseudocode_delta(a, b, None, None, "1000", "2000")["inline_hunk"]["structural"]
+    assert run == [
+        " {",
+        " g = FUN_00401000(1);",
+        "=g = FUN_00403000(1);",
+        "-drop();",
+        " return;",
+        " }",
+    ]
+
+
+def test_places_are_lines_of_the_original_text_counting_blank_ones() -> None:
+    """A group's places are 1-based lines of each side's original text, blank lines counted, as
+    get_pseudocode returns it — not positions in the blank-free text the lines are aligned on.
+
+    MUTATION (verified RED): number the normalised lines -> 3 / 3 -> RED."""
+    a = "void f(void)\n{\n\n\n  n = 0x40;\n}"
+    b = "void f(void)\n{\n\n  n = 0x3f;\n}"
+    (group,) = sm.pseudocode_delta(a, b, None, None, "1000", "2000")["inline_hunk"][
+        "substitution_groups"
+    ]
+    assert group["first"] == [["0x40", "0x3f", 5, 4]]
+
+
+def test_the_gate_withholds_the_hunk_and_never_the_delta() -> None:
+    """★ Over 50 (structural lines + substitution groups) the hunk is withheld with both counts and
+    the place to read instead; the delta's own fields stay whole (kind, spans, calls). At 50 it is
+    still given. A withheld hunk is never an empty one.
+
+    MUTATION (verified RED): give the hunk over the gate -> RED; turn the delta not_computed over
+    the gate -> RED; count context lines in the gate -> the 50-line case is withheld -> RED."""
+    keep = [f"keep{i}();" for i in range(6)]
+
+    def body(changed: list[str]) -> str:
+        return "\n".join(["{", *keep[:3], *changed, *keep[3:], "}"])
+
+    at_gate = sm.pseudocode_delta(
+        body([f"a{i}();" for i in range(25)]),
+        body([f"b{i}(1);" for i in range(25)]),
+        None,
+        None,
+        "1",
+        "2",
+    )
+    assert at_gate["inline_hunk"]["structural_lines"] == 50
+    assert "withheld" not in at_gate["inline_hunk"]
+    over = sm.pseudocode_delta(
+        body([f"a{i}();" for i in range(26)]),
+        body([f"b{i}(1);" for i in range(25)]),
+        None,
+        None,
+        "1",
+        "2",
+    )
+    assert over["kind"] == "structural" and over["structural_spans"] >= 1
+    assert over["calls"]["a0"] == {"a": 1, "b": 0}
+    assert over["inline_hunk"] == {
+        "withheld": "over_gate",
+        "structural_lines": 51,
+        "groups": 0,
+        "read_with": "get_pseudocode",
+    }
+
+
+def test_nothing_to_show_has_no_hunk() -> None:
+    """A layout-only difference (and a pure address shift) has no hunk at all, not an empty one."""
+    assert _hunk("layout_only") is None
+    assert _hunk("address_shift_only") is None
+
+
+def test_no_block_position_is_output() -> None:
+    """The hunk names no block position: a run is lines of text, and the only numbers are its two
+    counts and each group's step, total and first places.
+
+    MUTATION (verified RED): add the blocks' i1/i2/j1/j2 to the hunk -> RED."""
+    for name in _DELTA_CASES:
+        h = _hunk(name)
+        if h is None:
+            continue
+        assert set(h) == {"structural_lines", "groups", "structural", "substitution_groups"}
+        assert all(isinstance(line, str) for run in h["structural"] for line in run)
+        for g in h["substitution_groups"]:
+            assert set(g) <= {"kind", "step", "total", "first"}
+            assert all(len(f) == 4 for f in g["first"])
+
+
+def test_a_too_large_delta_still_shows_its_changed_middle(monkeypatch: pytest.MonkeyPatch) -> None:
+    """★ A function too large to align whole is still not_computed, but with its identical leading
+    and trailing lines set aside the changed middle is matched and shown, its places mapped back
+    past the set-aside head; a middle still over the cap is withheld with its line counts.
+
+    MUTATION (verified RED): do not set the head and tail aside -> withheld -> RED; forget the head
+    offset -> wrong line -> RED."""
+    monkeypatch.setattr(sm, "DELTA_LINE_PRODUCT_CAP", 99)  # 10 x 10 lines = 100 pairs
+    lines = [f"x{i} = {i};" for i in range(10)]
+    a = "\n".join(lines)
+    b = "\n".join(lines[:6] + ["x6 = 60;"] + lines[7:])
+    delta = sm.pseudocode_delta(a, b, None, None, "1000", "2000")
+    assert _without_hunk(delta) == {"kind": "not_computed", "reason": "too_large"}
+    assert delta["inline_hunk"]["substitution_groups"] == [
+        {"kind": "number", "step": 54, "total": 1, "first": [["6", "60", 7, 7]]}
+    ]
+    monkeypatch.setattr(sm, "DELTA_LINE_PRODUCT_CAP", 3)  # the middle (2 x 2) is over this one
+    b2 = "\n".join(lines[:6] + ["x6 = 60;", "x7 = 70;"] + lines[8:])
+    withheld = sm.pseudocode_delta(a, b2, None, None, "1000", "2000")["inline_hunk"]
+    assert withheld == {
+        "withheld": "too_large",
+        "lines": {"a": 2, "b": 2},
+        "read_with": "get_pseudocode",
+    }

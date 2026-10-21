@@ -54,7 +54,8 @@ TWO SIGNALS SIMILARITY IS BLIND TO (lib/query/sameness), read on the function-pa
   of the unverified states is ever read as "unchanged". On every listed aligned entry as a fact; the
   similarity-1 pairs that place no entry are counted by it under ``not_listed``
   (``not_listed_page=<name>`` walks one category, ``aligned_pseudocode_differs`` above all). A pair
-  whose texts differ carries ``pseudocode_delta``, the lexical shape of the difference. An
+  whose texts differ carries ``pseudocode_delta``, the lexical shape of the difference, with its
+  ``inline_hunk`` (the changed lines themselves from the original text, or why withheld). An
   undetermined pair carries ``proposed_pair_reading`` instead — the same reading as if it were
   paired, with whether its body is unique on each side — beside the entry, never its pairing; it
   moves no entry between buckets.
@@ -2139,8 +2140,10 @@ def _check_entry_args(
 ) -> str | None:
     """The argument combinations of reading one entry, refused before anything is built — a
     combination this cannot honour is an error, never silently ignored."""
-    if isinstance(rows_limit, bool) or not isinstance(rows_limit, int) or rows_limit < 1:
-        return f"rows_limit must be an integer >= 1, got {rows_limit!r}"
+    # 0 is a ranking scan: every entry with its summary and no inline row (the counts still say
+    # what the rows hold). It is refused only where it would read nothing: one entry's rows.
+    if isinstance(rows_limit, bool) or not isinstance(rows_limit, int) or rows_limit < 0:
+        return f"rows_limit must be an integer >= 0, got {rows_limit!r}"
     if rows_offset is not None and (
         isinstance(rows_offset, bool) or not isinstance(rows_offset, int) or rows_offset < 0
     ):
@@ -2151,6 +2154,8 @@ def _check_entry_args(
         return None
     if not isinstance(entry_id, str) or not entry_id:
         return f"entry_id must be an entry's entry_id or anchor_ref, got {entry_id!r}"
+    if rows_limit == 0:
+        return "entry_id reads one entry's rows: rows_limit must be >= 1 there (0 is for a scan)"
     if not_listed_page is not None:
         return "entry_id names a listed entry; it does not apply to not_listed_page"
     given = sorted(k for k, v in filters.items() if v is not None)
@@ -2558,7 +2563,13 @@ def _annotate_entries(built: BuiltDiff, readings: _Readings) -> None:
     through the delta cache), which demotes it out of the read-first head when its callee sets and
     sizes are proven equal too (:func:`_demotable_line_number`). Entries are rebuilt each call, so
     this re-annotates cleanly; call it before significance, _sort, _read_first_order or the
-    function_states counts."""
+    function_states counts.
+
+    These deltas are computed for the WHOLE diff's anchored pairs, not only the page — on every
+    get_diff_patch_view and function_states (get_diff_meta, the diff command) — and each carries
+    its inline_hunk into _DELTA_CACHE although these paths never print it: the cache is capped by
+    entries (4,096), a hunk is ~0.5KB typical / ~12KB at most. The hunk is built in the delta's own
+    pass and never changes the kind or line_number_form this reads."""
     anchored: list[_Pair] = []
     for e in built.placed:
         p = e.pair
@@ -3161,9 +3172,12 @@ def get_diff_patch_view(
     Each sink_patch entry carries at most ``rows_limit`` (default ``ROWS_INLINE_LIMIT``) of its
     candidate rows, with ``rows_total`` and ``rows_next_offset``. When there are more, they are
     windowed in ``rows_order`` and ``rows_by_presence`` / ``rows_by_order_group`` count every row,
-    so what lies outside the window is counted, not dropped. ``entry_id`` (an entry's entry_id or
-    anchor_ref) returns that one listed entry, and ``rows_offset`` pages its rows; the entry-level
-    fields are read from all of its rows either way.
+    so what lies outside the window is counted, not dropped. ``rows_limit=0`` is a scan: every entry
+    with its summary (bucket, subclass, significance, sink_callee_swap, counts, inline_hunk) and no
+    inline row, the counts still written for any entry that has rows. ``entry_id`` (an entry's
+    entry_id or anchor_ref) returns that one listed entry, and ``rows_offset`` pages its rows (there
+    ``rows_limit`` must be at least 1); the entry-level fields are read from all of its rows either
+    way.
 
     ``band`` (``sink_patch`` only, off by default) moves the judged entries inside the groups the
     default order already forms (diff_review.band_bias); off, the order is the base order. The

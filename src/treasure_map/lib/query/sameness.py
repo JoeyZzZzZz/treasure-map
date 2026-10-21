@@ -29,7 +29,10 @@ are the reader's:
     two body byte counts). Facts only: ``body`` is ``structure_differs`` when the byte counts
     differ and ``unknown`` otherwise, never ``identical``.
   * ``pseudocode_delta`` — the lexical shape of a text difference (substitutions only, structural,
-    layout only), and the calls whose counts differ. A shape, not a verdict.
+    layout only), and the calls whose counts differ, plus ``inline_hunk``: the changed blocks
+    themselves, aligned on the normalised text but SHOWN from the original text, with a few lines of
+    context, and the substitutions grouped one line each — or why they are withheld. A shape, not a
+    verdict.
   * the length-constant signals on a persisted candidate's two sides: ``const_delta`` when the same
     constant size kind holds a different value (0x40 -> 0x3f, and an off-by-one like 256 -> 255),
     and ``kind_shift`` when the size kind itself changed (const -> cap_const, const -> untraced). A
@@ -58,7 +61,8 @@ import json
 import re
 import sqlite3
 from difflib import SequenceMatcher
-from typing import Any
+from itertools import zip_longest
+from typing import Any, NamedTuple
 
 from treasure_map.lib.diff.layer0 import _decompile_status, norm_hex
 from treasure_map.lib.facts import listing_items
@@ -605,41 +609,33 @@ def pseudocode_delta(
     iff every changed number is a ``__FILE__``/``__LINE__`` build-info argument that shifted by one
     constant step. A shape, still never a verdict — it says the numbers look like line numbers, not
     that nothing else changed; the read face uses it only to DEMOTE such a pair out of the
-    read-first head, never to clear it."""
+    read-first head, never to clear it.
+
+    ``inline_hunk`` (:func:`_inline_hunk`) is the one field added on top, LAST, and never changes
+    another: every other field is what it was before the hunk existed. It is omitted when there is
+    nothing to show (``layout_only``); a ``not_computed`` delta still carries one when the changed
+    middle, once the identical leading and trailing lines are set aside, fits the line cap
+    (:func:`_trimmed_hunk`)."""
     blank_try = try_shift_consistent(a, b, _hex_int(addr_a), _hex_int(addr_b))
-    la = [ln.strip() for ln in _delta_text(a, ranges_a, blank_try).splitlines() if ln.strip()]
-    lb = [ln.strip() for ln in _delta_text(b, ranges_b, blank_try).splitlines() if ln.strip()]
-    too_large = {"kind": "not_computed", "reason": "too_large"}
+    la, ra, na = _delta_lines(a, ranges_a, blank_try)
+    lb, rb, nb = _delta_lines(b, ranges_b, blank_try)
+    sides = _Sides(ra, na, rb, nb)
+    too_large: dict[str, Any] = {"kind": "not_computed", "reason": "too_large"}
     if len(la) * len(lb) > DELTA_LINE_PRODUCT_CAP:
-        return too_large
+        return _with_hunk(too_large, _trimmed_hunk(la, lb, sides))
+    blocks = _delta_blocks(la, lb)
+    if blocks is None:
+        return _with_hunk(too_large, _trimmed_hunk(la, lb, sides))
     spans = 0
-    token_pairs = 0  # drawn from the one DELTA_TOKEN_PRODUCT_CAP budget, block by block
     subs: dict[str, dict[str, Any]] = {}
-    lines = SequenceMatcher(None, la, lb, autojunk=False)
-    for op, i1, i2, j1, j2 in lines.get_opcodes():
-        if op == "equal":
-            continue
-        ta, tb = _tokens("\n".join(la[i1:i2])), _tokens("\n".join(lb[j1:j2]))
-        token_pairs += len(ta) * len(tb)
-        if token_pairs > DELTA_TOKEN_PRODUCT_CAP:
-            return too_large
-        toks = SequenceMatcher(None, [t[1] for t in ta], [t[1] for t in tb], autojunk=False)
-        for top, k1, k2, m1, m2 in toks.get_opcodes():
-            if top == "equal":
-                continue
-            run_a, run_b = ta[k1:k2], tb[m1:m2]
-            if (
-                top == "replace"
-                and len(run_a) == len(run_b)
-                and all(x[0] == y[0] != "punct" for x, y in zip(run_a, run_b, strict=True))
-            ):
-                for x, y in zip(run_a, run_b, strict=True):
-                    entry = subs.setdefault(x[0], {"total": 0, "first": []})
-                    entry["total"] += 1
-                    if len(entry["first"]) < _DELTA_FIRST:
-                        entry["first"].append([x[1], y[1]])
-            else:
-                spans += 1
+    for blk in blocks:
+        spans += blk.spans
+        for k, m in blk.subs:
+            x, y = blk.ta[k], blk.tb[m]
+            entry = subs.setdefault(x[0], {"total": 0, "first": []})
+            entry["total"] += 1
+            if len(entry["first"]) < _DELTA_FIRST:
+                entry["first"].append([x[1], y[1]])
     ca = _calls(_tokens("\n".join(la)))
     cb = _calls(_tokens("\n".join(lb)))
     calls = {
@@ -658,7 +654,287 @@ def pseudocode_delta(
         lnf = _line_number_form(la, lb, name_a, name_b)
         if lnf is not None:
             out["line_number_form"] = lnf
-    return out
+    return _with_hunk(out, _inline_hunk(blocks, 0, len(la), len(lb), sides))
+
+
+# ── inline_hunk: the changed blocks themselves, read from the original text ──────────────────
+
+# The hunk is given only while the change itself is small: structural lines (both sides) plus
+# substitution groups at most this many. Above it the hunk is withheld with those two counts — the
+# delta's own fields are never touched by the gate.
+INLINE_HUNK_GATE = 50
+# Context lines shown around a structural block; two blocks with at most twice this many lines
+# between them are shown as one, so no context line is printed twice.
+INLINE_HUNK_CONTEXT = 2
+_READ_WITH = "get_pseudocode"
+# Names the decompiler makes up for a stack slot, a parameter or a register temporary. A
+# substitution of one such name by another is grouped with the comment substitutions as one rename
+# group. A GROUPING rule only: it is never applied to the text the lines are aligned on, so a
+# changed stack slot (local_10 -> local_14, possibly another buffer) still shows, as a group.
+_DECOMPILER_LOCAL = re.compile(
+    r"^(local_|param_|in_|extraout_|unaff_|auStack_|abStack_|acStack_|asStack_|aiStack_|auVar|"
+    r"uStack_|iStack_|lStack_|cStack_|bStack_|sStack_|fStack_|dStack_|pStack_|ppStack_|puStack_|"
+    r"piStack_|[a-z]{1,4}Var\d+$)"
+)
+
+
+class _Sides(NamedTuple):
+    """Each side's original lines (stripped, blank lines dropped — index for index with the
+    normalised lines a delta aligns on) and their 1-based line numbers in the original text."""
+
+    ra: list[str]
+    na: list[int]
+    rb: list[str]
+    nb: list[int]
+
+
+class _Block(NamedTuple):
+    """One block the line match found unequal: its line ranges (``la[i1:i2]`` / ``lb[j1:j2]``), how
+    many token spans in it are structural, and the token pairs that are substitutions, in order, as
+    indices into its two token lists. PRIVATE: block positions are never output and never cached —
+    the hunk and a later caller read them, the delta's fields are derived from them."""
+
+    i1: int
+    i2: int
+    j1: int
+    j2: int
+    spans: int
+    subs: tuple[tuple[int, int], ...]
+    ta: list[tuple[str, str, int]]
+    tb: list[tuple[str, str, int]]
+    text_a: str
+    text_b: str
+
+
+def _tokens_at(text: str) -> list[tuple[str, str, int]]:
+    """:func:`_tokens` with each token's start offset (the same tokens, in the same order)."""
+    return [(m.lastgroup or "punct", m.group(0), m.start()) for m in _TOK.finditer(text)]
+
+
+def _delta_lines(
+    text: str, ranges: ImageRanges, blank_try: bool
+) -> tuple[list[str], list[str], list[int]]:
+    """(normalised lines, original lines, their 1-based numbers) of one body: every line split and
+    stripped, blank lines dropped, the normalised and the original kept index for index. The
+    normalisation only rewrites inside a line, so the two line lists are the same length; if they
+    ever were not, the normalised text stands in for the original (never a wrong line)."""
+    norm = _delta_text(text, ranges, blank_try).splitlines()
+    raw = text.splitlines()
+    if len(raw) != len(norm):
+        raw = norm
+    lines: list[str] = []
+    originals: list[str] = []
+    numbers: list[int] = []
+    for k, (n, r) in enumerate(zip(norm, raw, strict=True)):
+        s = n.strip()
+        if s:
+            lines.append(s)
+            originals.append(r.strip() or s)
+            numbers.append(k + 1)
+    return lines, originals, numbers
+
+
+def _delta_blocks(la: list[str], lb: list[str]) -> list[_Block] | None:
+    """Every block the line match finds unequal, its tokens matched and classified: a same-length
+    run of tokens each of the same non-punctuation kind is a substitution, anything else a
+    structural span. None when the token pairs, summed over the blocks, exceed
+    ``DELTA_TOKEN_PRODUCT_CAP``. The one match pseudocode_delta and its hunk both read."""
+    blocks: list[_Block] = []
+    token_pairs = 0  # drawn from the one DELTA_TOKEN_PRODUCT_CAP budget, block by block
+    for op, i1, i2, j1, j2 in SequenceMatcher(None, la, lb, autojunk=False).get_opcodes():
+        if op == "equal":
+            continue
+        text_a, text_b = "\n".join(la[i1:i2]), "\n".join(lb[j1:j2])
+        ta, tb = _tokens_at(text_a), _tokens_at(text_b)
+        token_pairs += len(ta) * len(tb)
+        if token_pairs > DELTA_TOKEN_PRODUCT_CAP:
+            return None
+        spans = 0
+        subs: list[tuple[int, int]] = []
+        toks = SequenceMatcher(None, [t[1] for t in ta], [t[1] for t in tb], autojunk=False)
+        for top, k1, k2, m1, m2 in toks.get_opcodes():
+            if top == "equal":
+                continue
+            run_a, run_b = ta[k1:k2], tb[m1:m2]
+            if (
+                top == "replace"
+                and len(run_a) == len(run_b)
+                and all(x[0] == y[0] != "punct" for x, y in zip(run_a, run_b, strict=True))
+            ):
+                subs.extend((k1 + o, m1 + o) for o in range(k2 - k1))
+            else:
+                spans += 1
+        blocks.append(_Block(i1, i2, j1, j2, spans, tuple(subs), ta, tb, text_a, text_b))
+    return blocks
+
+
+def _with_hunk(delta: dict[str, Any], hunk: dict[str, Any] | None) -> dict[str, Any]:
+    """The delta with ``inline_hunk`` as its LAST field, or as it is when there is none to give."""
+    if hunk is not None:
+        delta["inline_hunk"] = hunk
+    return delta
+
+
+def _group_key(x: tuple[str, str, int], y: tuple[str, str, int]) -> tuple[Any, ...]:
+    """The substitution group a token pair falls in: a number by its step (or the pair itself when
+    a value cannot be read), a decompiler-local rename or a comment in the one rename group, any
+    other identifier or string by the pair."""
+    if x[0] == "number":
+        va, vb = _parse_int_token(x[1]), _parse_int_token(y[1])
+        if va is not None and vb is not None:
+            return ("number", vb - va)
+        return ("number", None, x[1], y[1])
+    if x[0] == "comment" or (
+        x[0] == "ident" and _DECOMPILER_LOCAL.match(x[1]) and _DECOMPILER_LOCAL.match(y[1])
+    ):
+        return ("local_or_comment",)
+    return (x[0], x[1], y[1])
+
+
+def _inline_hunk(
+    blocks: list[_Block], off: int, len_a: int, len_b: int, sides: _Sides
+) -> dict[str, Any] | None:
+    """The changed blocks of one delta, shown — or why not. None when there is nothing to show (no
+    structural block and no substitution: a layout-only difference). ``off`` is where the matched
+    lines start in the whole body (the trimmed head of a too-large one, else 0).
+
+    Gate (counted, never shown): ``structural_lines`` = the lines of every block holding any
+    structural span, both sides added; ``groups`` = the substitution groups of the blocks holding
+    none (a substitution inside a structural block is already in its shown lines). Over
+    ``INLINE_HUNK_GATE`` the hunk is ``{withheld: over_gate, structural_lines, groups, read_with}``.
+
+    Shown: ``structural`` — one list of lines per run of structural blocks, each line prefixed
+    ``-`` (the A side's line), ``+`` (the B side's line), `` `` (a context line, A side) or ``=``
+    (the B side's own text of the context line above, given only when it differs — the lines match
+    once addresses are normalised); ``INLINE_HUNK_CONTEXT`` lines around each run, runs that close
+    merged. ``substitution_groups`` — one per group, in the order first met: ``kind`` (number /
+    ident / string / local_or_comment), a number group's ``step``, ``total``, and ``first``: up to
+    five ``[a, b, line_a, line_b]``, the token as each side's original text has it and its 1-based
+    line there (blank lines counted). Every shown line is the original text, never the normalised
+    one the lines were aligned on. No block position is given."""
+    struct = [b for b in blocks if b.spans]
+    struct_lines = sum((b.i2 - b.i1) + (b.j2 - b.j1) for b in struct)
+    groups: dict[tuple[Any, ...], tuple[int, list[tuple[_Block, int, int]]]] = {}
+    for b in blocks:
+        if b.spans:
+            continue
+        for k, m in b.subs:
+            key = _group_key(b.ta[k], b.tb[m])
+            total, first = groups.get(key, (0, []))
+            if len(first) < _DELTA_FIRST:
+                first.append((b, k, m))
+            groups[key] = (total + 1, first)
+    if not struct and not groups:
+        return None
+    counts = {"structural_lines": struct_lines, "groups": len(groups)}
+    if struct_lines + len(groups) > INLINE_HUNK_GATE:
+        return {"withheld": "over_gate", **counts, "read_with": _READ_WITH}
+    return {
+        **counts,
+        "structural": _structural_runs(blocks, off, len_a, len_b, sides),
+        "substitution_groups": [
+            {
+                "kind": key[0],
+                **({"step": key[1]} if key[0] == "number" else {}),
+                "total": total,
+                "first": [_shown_pair(b, k, m, off, sides) for b, k, m in first],
+            }
+            for key, (total, first) in groups.items()
+        ],
+    }
+
+
+def _shown_pair(b: _Block, k: int, m: int, off: int, sides: _Sides) -> list[Any]:
+    """``[a, b, line_a, line_b]`` of one substituted token pair: each token as its side's original
+    line has it (the block re-tokenised from the original lines, used only when it tokenises the
+    same way; else the normalised token), and its 1-based line in that side's original text."""
+    out: list[Any] = []
+    for toks, text, start, idx, raw, nums in (
+        (b.ta, b.text_a, b.i1, k, sides.ra, sides.na),
+        (b.tb, b.text_b, b.j1, m, sides.rb, sides.nb),
+    ):
+        lo = off + start
+        orig = _tokens_at("\n".join(raw[lo : lo + text.count("\n") + 1]))
+        same = len(orig) == len(toks) and all(o[0] == t[0] for o, t in zip(orig, toks, strict=True))
+        out.append((orig if same else toks)[idx][1])
+        out.append(nums[lo + text.count("\n", 0, toks[idx][2])])
+    return [out[0], out[2], out[1], out[3]]
+
+
+def _structural_runs(
+    blocks: list[_Block], off: int, len_a: int, len_b: int, sides: _Sides
+) -> list[list[str]]:
+    """The structural blocks as shown runs of prefixed lines (see :func:`_inline_hunk`). The whole
+    body is laid out as units — a context line pair, or one structural block — so the context of a
+    block is the units beside it, whatever they are; a substitution block's lines are context here,
+    their B text given where it differs."""
+    units: list[tuple[str, int | None, int | None, int, int]] = []
+    prev_a = prev_b = 0
+    for b in blocks:
+        a1, a2, b1, b2 = off + b.i1, off + b.i2, off + b.j1, off + b.j2
+        units.extend(("ctx", prev_a + t, prev_b + t, 0, 0) for t in range(a1 - prev_a))
+        if b.spans:
+            units.append(("chg", a1, b1, a2, b2))
+        else:
+            units.extend(("ctx", i, j, 0, 0) for i, j in zip_longest(range(a1, a2), range(b1, b2)))
+        prev_a, prev_b = a2, b2
+    units.extend(("ctx", prev_a + t, prev_b + t, 0, 0) for t in range(len_a - prev_a))
+    changes = [n for n, u in enumerate(units) if u[0] == "chg"]
+    runs: list[list[int]] = []
+    for n in changes:
+        if runs and n - runs[-1][-1] - 1 <= 2 * INLINE_HUNK_CONTEXT:
+            runs[-1].append(n)
+        else:
+            runs.append([n])
+    shown: list[list[str]] = []
+    for run in runs:
+        lo, hi = run[0], run[-1]
+        for _ in range(INLINE_HUNK_CONTEXT):
+            if lo > 0 and units[lo - 1][0] == "ctx":
+                lo -= 1
+        for _ in range(INLINE_HUNK_CONTEXT):
+            if hi + 1 < len(units) and units[hi + 1][0] == "ctx":
+                hi += 1
+        lines: list[str] = []
+        for kind, i, j, i2, j2 in units[lo : hi + 1]:
+            if kind == "chg":
+                assert i is not None and j is not None
+                lines += ["-" + sides.ra[t] for t in range(i, i2)]
+                lines += ["+" + sides.rb[t] for t in range(j, j2)]
+                continue
+            if i is not None:
+                lines.append(" " + sides.ra[i])
+            if j is not None and (i is None or sides.rb[j] != sides.ra[i]):
+                lines.append("=" + sides.rb[j])
+        shown.append(lines)
+    return shown
+
+
+def _trimmed_hunk(la: list[str], lb: list[str], sides: _Sides) -> dict[str, Any] | None:
+    """The hunk of a delta too large to compute whole: the identical leading and trailing lines set
+    aside, the changed middle matched as usual when ITS line pairs fit ``DELTA_LINE_PRODUCT_CAP``
+    (its lines and line numbers mapped back past the set-aside head), else — or when its token pairs
+    exceed the token cap — ``{withheld: too_large, lines {a, b}, read_with}`` with the middle's
+    line counts. The delta itself stays ``not_computed``: this is only the hunk."""
+    n = min(len(la), len(lb))
+    p = 0
+    while p < n and la[p] == lb[p]:
+        p += 1
+    s = 0
+    while s < n - p and la[-1 - s] == lb[-1 - s]:
+        s += 1
+    ma, mb = la[p : len(la) - s], lb[p : len(lb) - s]
+    withheld = {
+        "withheld": "too_large",
+        "lines": {"a": len(ma), "b": len(mb)},
+        "read_with": _READ_WITH,
+    }
+    if len(ma) * len(mb) > DELTA_LINE_PRODUCT_CAP:
+        return withheld
+    blocks = _delta_blocks(ma, mb)
+    if blocks is None:
+        return withheld
+    return _inline_hunk(blocks, p, len(la), len(lb), sides)
 
 
 # ── line-number form: a __FILE__/__LINE__ shift, told apart from a real substitution ─────────

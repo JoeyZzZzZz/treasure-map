@@ -3899,7 +3899,9 @@ def test_a_row_outside_the_window_can_still_be_promoted(
         ({"entry_id": _WIN_ID, "rows_offset": 25}, "past the entry's last row"),
         ({"entry_id": _WIN_ID, "rows_offset": True}, "rows_offset must be an integer"),
         ({"entry_id": _WIN_ID, "rows_offset": -1}, "rows_offset must be an integer"),
-        ({"rows_limit": 0}, "rows_limit must be an integer"),
+        ({"rows_limit": -1}, "rows_limit must be an integer"),
+        ({"rows_limit": True}, "rows_limit must be an integer"),
+        ({"entry_id": _WIN_ID, "rows_limit": 0}, r"rows_limit must be >= 1 there"),
         ({"entry_id": 7}, "entry_id must be"),
     ],
 )
@@ -3911,10 +3913,12 @@ def test_reading_one_entry_refuses_what_it_cannot_honour(
     message: str,
 ) -> None:
     """Every combination reading one entry cannot honour is an error naming why — never ignored.
+    ``rows_limit=0`` is refused only with ``entry_id`` (reading one entry's rows, it would read
+    none); as a scan it is allowed (test_a_zero_row_scan_...).
 
     MUTATION (verified RED): drop the "rows_offset needs entry_id" check -> 1 failed; drop the
-    filter check -> 7 failed; drop ``rows_limit >= 1`` -> 1 failed; accept an offset beside
-    entry_id -> 1 failed."""
+    filter check -> 7 failed; drop ``rows_limit >= 0`` -> 1 failed; accept rows_limit=0 with
+    entry_id -> 1 failed; accept an offset beside entry_id -> 1 failed."""
     w = _window_world(tmp_path, monkeypatch, _MAIN)
     out = pv.get_diff_patch_view(w.atlas, DIFF, **kw)
     assert re.search(message, out.get("error") or ""), out
@@ -4820,3 +4824,59 @@ def test_the_swap_lift_outranks_the_caller_edge_mention_key(tmp_path: Path, curr
     assert v["by_id"][plain_id]["b_other_fn_mentions"] is False
     order = [e["entry_id"] for e in v["entries"]]
     assert order.index(swap_id) < order.index(plain_id)  # swap wins over the mention key
+
+
+# ── S4: rows_limit=0 scans, and the inline_hunk rides on every delta the view prints ────────────
+
+
+def test_a_zero_row_scan_keeps_every_count_and_no_row(
+    tmp_path: Path, current: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ rows_limit=0 lists each entry with no inline row but still writes what its rows hold
+    (rows_total, rows_by_presence, rows_by_order_group, rows_order) and where they resume
+    (rows_next_offset 0) — for an entry with only a few rows too. The default (20) leaves such an
+    entry's counts out, as before: rows_limit is only a parameter, the entries and their order are
+    the same.
+
+    MUTATION (verified RED): window against ROWS_INLINE_LIMIT instead of rows_limit (``total > n``
+    -> ``total > ROWS_INLINE_LIMIT``) -> the 3-row entry has no counts -> RED; refuse rows_limit=0
+    outside entry_id -> RED."""
+    w = _window_world(tmp_path, monkeypatch, "UPP")
+    scan = pv.get_diff_patch_view(w.atlas, DIFF, rows_limit=0)
+    assert "error" not in scan, scan
+    e = {x["entry_id"]: x for x in scan["entries"]}[_WIN_ID]
+    assert e["rows"] == [] and e["rows_total"] == 3 and e["rows_next_offset"] == 0
+    assert e["rows_by_presence"] == {"persisted": 2, "presence_undetermined": 1}
+    assert e["rows_by_order_group"] == {"not_persisted": 1, "size_signal": 0, "rest": 2}
+    default = _one(w)
+    assert len(default["rows"]) == 3 and "rows_by_presence" not in default
+    assert [x["entry_id"] for x in scan["entries"]] == [
+        x["entry_id"] for x in pv.get_diff_patch_view(w.atlas, DIFF)["entries"]
+    ]
+
+
+def test_the_hunk_rides_on_every_delta_the_view_prints(tmp_path: Path, current: None) -> None:
+    """The view prints pseudocode_delta in three places — an aligned entry, an undetermined pair's
+    proposed_pair_reading, a not-listed page row — and each carries its inline_hunk, shown from the
+    original text."""
+    w = World(tmp_path)
+    body_a = "void f(void)\n{\n  int n;\n  n = get();\n  FUN_00409748(n);\n  put(n);\n  return;\n}"
+    body_b = "void f(void)\n{\n  int n;\n  n = get();\n  put(n);\n  return;\n}"
+    for a, b, conf, sim in (
+        ("00001000", "00002000", 0.97, 0.6),  # aligned, changed: C
+        ("00003000", "00004000", 0.5, 0.6),  # undetermined: R, proposed reading
+        ("00005000", "00006000", 0.97, 1.0),  # aligned similarity 1 with a text that differs
+    ):
+        w.pair(a, b, conf, sim)
+        w.fn("a", a, ["get", "put"], pseudocode=body_a)
+        w.fn("b", b, ["get", "put"], pseudocode=body_b)
+    w.commit()
+    want = "-FUN_00409748(n);"
+    by_id = _view(w)["by_id"]
+    aligned = by_id[_pair_id("00001000", "00002000")]["pseudocode_delta"]["inline_hunk"]
+    assert want in aligned["structural"][0]
+    proposed = by_id[_pair_id("00003000", "00004000")]["proposed_pair_reading"]
+    assert want in proposed["pseudocode_delta"]["inline_hunk"]["structural"][0]
+    page = pv.get_diff_patch_view(w.atlas, DIFF, not_listed_page="aligned_pseudocode_differs")
+    (row,) = page["entries"]
+    assert want in row["pseudocode_delta"]["inline_hunk"]["structural"][0]

@@ -487,3 +487,101 @@ def test_the_fit_key_defaults_to_the_candidate_array() -> None:
     rows = [_row(100) for _ in range(50)]
     assert _fit_candidates(env, rows, 8000) == _fit_candidates(env, rows, 8000, key="candidates")
     assert _fit_candidates(env, rows, 8000, key="entries") != _fit_candidates(env, rows, 8000)
+
+
+# ── S4: an inline_hunk that cannot fit the page is withheld whole, in the entries path only ──────
+
+
+def _hunk_entry(eid: str, size: int) -> dict[str, Any]:
+    """A rendered entry whose top-level delta and proposed reading each carry a ~size-byte hunk."""
+    hunk = {
+        "structural_lines": 3,
+        "groups": 1,
+        "structural": [["-" + "x" * size]],
+        "substitution_groups": [],
+    }
+    return {
+        "entry_id": eid,
+        "rows": [{"a_ref": "r"}],
+        "pseudocode_delta": {"kind": "structural", "inline_hunk": hunk},
+        "proposed_pair_reading": {
+            "state": "differs",
+            "pseudocode_delta": {"kind": "structural", "inline_hunk": hunk},
+        },
+    }
+
+
+def _entries_result(entries: list[dict[str, Any]], envelope_bytes: int) -> dict[str, Any]:
+    return {
+        "diff_id": "d",
+        "legend": "e" * envelope_bytes,
+        "entries": entries,
+        "total_entries": len(entries),
+        "next_offset": None,
+    }
+
+
+def test_a_hunk_that_cannot_fit_beside_the_envelope_is_withheld_whole() -> None:
+    """★ The test is envelope + that one entry over the budget (the envelope runs 10-20KB), not the
+    entry alone over it: an entry of ~30KB beside a ~20KB envelope has its hunks — the top-level
+    delta's and the proposed reading's — withheld as page_budget with their counts, whole (never cut
+    part-way), and its rows kept. The cached delta it came from is never written. A small entry is
+    left as it is.
+
+    MUTATION (verified RED): test the entry alone against the budget -> the 30KB entry keeps its
+    hunk and is cut off this page -> RED; withhold only the top-level hunk -> RED; write the
+    withheld form into the entry's own delta dict -> the cached object changes -> RED."""
+    big, small = _hunk_entry("big", 14_000), _hunk_entry("small", 50)
+    cached = big["pseudocode_delta"]
+    out = mcp_app._fit_entries(_entries_result([small, big], 20_000), 0)
+    assert len(json.dumps(out)) <= _RESPONSE_BYTE_BUDGET
+    by_id = {e["entry_id"]: e for e in out["entries"]}
+    want = {
+        "withheld": "page_budget",
+        "structural_lines": 3,
+        "groups": 1,
+        "read_with": "get_pseudocode",
+    }
+    assert by_id["big"]["pseudocode_delta"]["inline_hunk"] == want
+    assert by_id["big"]["proposed_pair_reading"]["pseudocode_delta"]["inline_hunk"] == want
+    assert by_id["big"]["rows"] == [{"a_ref": "r"}]
+    assert "withheld" not in by_id["small"]["pseudocode_delta"]["inline_hunk"]
+    assert "structural" in cached["inline_hunk"]  # the original object is untouched
+
+
+def test_member_pages_never_withhold_a_hunk() -> None:
+    """The defence lives in the entries path, never in _fit_page, which member pages share.
+
+    MUTATION (verified RED): move the withholding into _fit_page -> the member row loses its hunk
+    -> RED."""
+    row = _hunk_entry("m", 14_000)
+    result = {"legend": "e" * 20_000, "members": [row], "member_count": 1}
+    out = mcp_app._fit_members(result, 0)
+    assert "structural" in out["members"][0]["pseudocode_delta"]["inline_hunk"]
+
+
+@pytest.mark.parametrize("bad", [-1, 21, True, "5"])
+def test_rows_limit_is_ranged_at_the_tool(tmp_path: Path, bad: Any) -> None:
+    """rows_limit is 0..20 at the tool (0 = a scan with no inline row); outside that it is an
+    error naming the range, never clamped."""
+    tool = mcp_app.make_tools(tmp_path / "atlas.db")["get_diff_patch_view"]
+    out = tool("x::y::z", rows_limit=bad)
+    assert "rows_limit must be an integer in 0..20" in out["error"]
+
+
+def test_the_tool_and_the_instructions_say_how_to_read_a_hunk_and_scan() -> None:
+    doc = " ".join(
+        (mcp_app.make_tools(Path("unused.db"))["get_diff_patch_view"].__doc__ or "").split()
+    )
+    for phrase in (
+        "inline_hunk",
+        "rows_limit=0",
+        "over_gate",
+        "page_budget",
+        "too_large",
+        "local_or_comment",
+        "original text",
+    ):
+        assert phrase in doc, phrase
+    assert "rows_limit=0" in mcp_app._AGENT_INSTRUCTIONS
+    assert "inline_hunk" in mcp_app._AGENT_INSTRUCTIONS

@@ -93,6 +93,7 @@ from treasure_map.lib.query.diff_align import (
 )
 from treasure_map.lib.query.diff_align import staleness_summary as _staleness_summary
 from treasure_map.lib.query.diff_align import toolchain_checked as _toolchain_checked
+from treasure_map.lib.query.patch_view import ROWS_INLINE_LIMIT as _ROWS_INLINE_LIMIT
 from treasure_map.lib.query.patch_view import get_diff_patch_view as _get_diff_patch_view
 from treasure_map.lib.query.same_shape_siblings import (
     same_shape_siblings as _same_shape_siblings,
@@ -201,8 +202,54 @@ def _fit_page(
     return result
 
 
+def _hunk_page_budget(hunk: dict[str, Any]) -> dict[str, Any]:
+    """An inline_hunk that would not fit the page, as withheld (its two gate counts kept). A hunk
+    already withheld stays as it is."""
+    if "withheld" in hunk:
+        return hunk
+    counts = {k: hunk[k] for k in ("structural_lines", "groups") if k in hunk}
+    return {"withheld": "page_budget", **counts, "read_with": "get_pseudocode"}
+
+
+def _entry_without_hunks(entry: dict[str, Any]) -> dict[str, Any]:
+    """A copy of one rendered entry with each inline_hunk it carries withheld (``page_budget``): the
+    top-level pseudocode_delta's and the proposed_pair_reading's. Copied all the way down — the
+    delta is the view's cached object and is never written to."""
+    out = dict(entry)
+    delta = out.get("pseudocode_delta")
+    if isinstance(delta, dict) and isinstance(delta.get("inline_hunk"), dict):
+        out["pseudocode_delta"] = {**delta, "inline_hunk": _hunk_page_budget(delta["inline_hunk"])}
+    reading = out.get("proposed_pair_reading")
+    if isinstance(reading, dict):
+        inner = reading.get("pseudocode_delta")
+        if isinstance(inner, dict) and isinstance(inner.get("inline_hunk"), dict):
+            out["proposed_pair_reading"] = {
+                **reading,
+                "pseudocode_delta": {
+                    **inner,
+                    "inline_hunk": _hunk_page_budget(inner["inline_hunk"]),
+                },
+            }
+    return out
+
+
 def _fit_entries(result: dict[str, Any], offset: int) -> dict[str, Any]:
-    """A get_diff_patch_view page fitted to the response budget, in every view (``_fit_page``)."""
+    """A get_diff_patch_view page fitted to the response budget, in every view (``_fit_page``).
+
+    First, defensively: an entry that would not fit the page even ALONE beside its envelope
+    (envelope + that entry > budget — the envelope is 10-20KB, so the test is not "one entry over
+    the budget") has its inline_hunk(s) withheld as ``page_budget``, whole: a hunk is never cut
+    part-way, which could drop the block that matters, and the rows stay. Here only, never in
+    ``_fit_page``, which other pages share. The live atlas never reaches it."""
+    if "error" not in result and isinstance(result.get("entries"), list):
+        n = result.get("total_entries")
+        widest = n if len(json.dumps(n)) > len(json.dumps(None)) else None
+        envelope = {**result, "entries": [], "next_offset": widest, "entries_truncated": False}
+        base = len(json.dumps(envelope))
+        result["entries"] = [
+            _entry_without_hunks(e) if base + len(json.dumps(e)) > _RESPONSE_BYTE_BUDGET else e
+            for e in result["entries"]
+        ]
     return _fit_page(
         result,
         offset,
@@ -287,7 +334,10 @@ _AGENT_INSTRUCTIONS = (
     "with it off. list_overlays(run_id=...) reviews what you concluded last time and flags any "
     "whose underlying facts have since moved. A row already marked in_exploit_ledger was confirmed "
     "by a person — you cannot write that (people do, from the command line), and it is usually not "
-    "worth re-verifying. For a version diff, start at get_diff_patch_view(diff_id): every entry "
+    "worth re-verifying. For a version diff, start at get_diff_patch_view(diff_id) — "
+    "rows_limit=0 scans the ranking with each entry's summary and inline_hunk (the changed lines "
+    "themselves, as the original text has them, or why withheld: read get_pseudocode then), "
+    "before you page one entry's rows: every entry "
     "carries its anchor_ref and review_state; annotate_diff(diff_id, anchor_ref, verdict="
     "changed_real|no_real_change|change_inconclusive, rationale) records your judgement on one "
     "entry, promote(diff_id, entry_id, row_ref, verdict, rationale) carries it onto one of the "
@@ -1756,6 +1806,7 @@ def make_tools(
         anchored_micro_side: bool = False,
         entry_id: str | None = None,
         rows_offset: int | None = None,
+        rows_limit: int = _ROWS_INLINE_LIMIT,
     ) -> dict[str, Any]:
         """START HERE for one diff (``diff_id`` = ``{run_a}::{run_b}::{binary}``; list_diffs gives
         the ids): one entry per FUNCTION PAIR that changed, with what happened around its sink
@@ -1821,7 +1872,12 @@ def make_tools(
         ``subclass`` say where the entry itself lands in the diff; they do not say which rows lie
         past the window. ``entry_id`` (an entry's entry_id or its anchor_ref) returns that one
         listed entry, with the envelope still describing the whole diff; it takes no filter and no
-        ``offset``. ``rows_offset`` needs ``entry_id``. For an aligned pair the entry also carries
+        ``offset``. ``rows_offset`` needs ``entry_id``. ``rows_limit`` (0-20, default 20) sets that
+        inline window; ``rows_limit=0`` is a scan — every entry with its summary (bucket, subclass,
+        significance, ``sink_callee_swap``, counts, ``inline_hunk``) and no inline row, so many more
+        entries fit a page: rank with it first, then read the rows of the entries you pick with
+        ``entry_id`` + ``rows_offset`` (where ``rows_limit`` must be at least 1). For an aligned
+        pair the entry also carries
         ``callee_set``: the two extracted callee lists compared (``equal`` / ``differs`` with
         ``only_in_a`` / ``only_in_b`` / ``undetermined`` with the reason). A differing list is NOT
         proof a call was made or dropped — tmap's decompile can miss a call — and it never moves
@@ -1864,7 +1920,24 @@ def make_tools(
         carries ``pseudocode_delta``: its lexical shape (``substitution_only`` /
         ``structural`` / ``layout_only``, with the substituted tokens and the calls whose counts
         differ) — a shape, never a verdict; a number-only substitution is what a size fix looks
-        like. An UNDETERMINED pair (bucket R) carries ``proposed_pair_reading`` instead: the same
+        like. Its ``inline_hunk`` shows the change itself, so you need not fetch both sides'
+        pseudocode to find it: the lines are aligned on the address-normalised text but SHOWN as the
+        original text has them. ``structural`` is one list of lines per changed run, each line
+        prefixed ``-`` (the A side's), ``+`` (the B side's), a space (an unchanged context line,
+        A side; 2 around each run, close runs merged) or ``=`` (the B side's own text of the context
+        line just above, given only where it differs — the two match once addresses are
+        normalised). ``substitution_groups`` puts each like substitution on one line: numbers by
+        ``step`` (0x40 -> 0x3f is -1), an identifier or string by its old -> new pair, decompiler
+        local renames (``local_10`` -> ``local_14``: another stack slot, maybe another buffer)
+        together with comment changes as ``local_or_comment`` — each with ``total`` and ``first``:
+        up to five ``[a, b, line_a, line_b]`` with the 1-based line in each side's original text
+        (blank lines counted, as get_pseudocode returns it). ``structural_lines`` + ``groups`` is
+        the change's size; above 50 the hunk is ``withheld: over_gate`` with those counts — the
+        delta's other fields stay whole — and ``withheld: too_large`` (a function too large to
+        align, even after setting its identical leading and trailing lines aside) or ``page_budget``
+        (one entry too large for the response) say the same: read get_pseudocode. A withheld hunk
+        is never "no change". A layout-only difference has no hunk. An UNDETERMINED pair (bucket
+        R) carries ``proposed_pair_reading`` instead: the same
         reading as if it were paired (``identical_unique`` only when its body occurs once on each
         side, ``identical_not_unique`` otherwise, plus the other states), with where else each
         body occurs — a proposal beside the entry, never its pairing. An undetermined pair is
@@ -1926,6 +1999,16 @@ def make_tools(
         default) moves judged entries only inside the groups the default order already forms:
         due a re-check first, then change_inconclusive, unjudged, changed_real, no_real_change;
         off, the order is the default one."""
+        if (
+            isinstance(rows_limit, bool)
+            or not isinstance(rows_limit, int)
+            or not 0 <= rows_limit <= _ROWS_INLINE_LIMIT
+        ):
+            return {
+                "diff_id": diff_id,
+                "error": f"rows_limit must be an integer in 0..{_ROWS_INLINE_LIMIT}, got "
+                f"{rows_limit!r}",
+            }
         conn = open_atlas(atlas_path)
         try:
             refusal = _refuse_stale_diff(conn, diff_id)
@@ -1949,6 +2032,7 @@ def make_tools(
                 anchored_micro_side=anchored_micro_side,
                 entry_id=entry_id,
                 rows_offset=rows_offset,
+                rows_limit=rows_limit,
             )
             return _fit_entries(result, offset)
         finally:
