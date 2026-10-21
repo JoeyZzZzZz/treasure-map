@@ -2309,9 +2309,9 @@ class _Readings:
 _PSEUDO_READING_CACHE: _BoundedCache[tuple[str, ...], _PairReads] = _BoundedCache(32)
 _UNDETERMINED_READING_CACHE: _BoundedCache[tuple[str, ...], _PairReads] = _BoundedCache(32)
 _DELTA_CACHE: _BoundedCache[tuple[Any, ...], dict[str, Any]] = _BoundedCache(4096)
-# The no-mention index of the caller-set edge, on the SAME key as the pseudocode readings: computed
-# when the B bodies are read (never a second read of them), so every page of one diff reads the
-# same set in the same order.
+# The no-mention index of the caller-set edge, on the pseudocode readings' key PLUS the E entries it
+# covers (they move with the candidate rows, which that key does not hold): computed when the B
+# bodies are read, so every page of one diff reads the same set in the same order.
 _B_MENTIONS_CACHE: _BoundedCache[tuple[str, ...], frozenset[str]] = _BoundedCache(32)
 _ELSEWHERE_SAMPLE = 3  # addresses shown of a body found elsewhere
 
@@ -2431,7 +2431,12 @@ def _pseudo_readings(atlas: sqlite3.Connection, built: BuiltDiff) -> _Readings:
     )
     aligned = _PSEUDO_READING_CACHE.get(key)
     undetermined = _UNDETERMINED_READING_CACHE.get(key)
-    mentions = _B_MENTIONS_CACHE.get(key)
+    # The no-mention set covers the E entries of THIS build; which pairs are E moves with the
+    # candidate rows (a re-hunt), which the reading key does not hold — so the targets are in its
+    # key, and a new E set is computed afresh, never served the old set's answer.
+    targets = _e_targets(built)
+    mention_key = (*key, *(f"{addr}={name or ''}" for addr, name in targets))
+    mentions = _B_MENTIONS_CACHE.get(mention_key) if targets else frozenset()
     if aligned is None or undetermined is None or mentions is None:
         ba = sameness.read_function_bodies(pa, d.sha_a)
         bb = sameness.read_function_bodies(pb, d.sha_b)
@@ -2447,21 +2452,31 @@ def _pseudo_readings(atlas: sqlite3.Connection, built: BuiltDiff) -> _Readings:
             undetermined = _read_undetermined(ba, bb, [p for p in pairs if not p.aligned], ra, rb)
             _UNDETERMINED_READING_CACHE[key] = undetermined
         if mentions is None:
-            mentions = _b_other_fn_mentions(bb, built)
-            _B_MENTIONS_CACHE[key] = mentions
+            mentions = _b_other_fn_mentions(bb, targets)
+            _B_MENTIONS_CACHE[mention_key] = mentions
     return _Readings(key, ((pa, d.sha_a), (pb, d.sha_b)), aligned, undetermined, mentions)
 
 
-def _b_other_fn_mentions(bb: sameness.Bodies | None, built: BuiltDiff) -> frozenset[str]:
-    """The B-side addresses of the E entries' functions that ANOTHER B function's pseudocode
-    mentions by an identifier token — the function's extracted name or its ``FUN_<addr>`` form,
-    its OWN body excluded. The token index over every B body is built once and only when the diff
-    has an E entry, so a diff with none pays nothing. Comment and string tokens are not mentions."""
-    targets = [
-        (e.pair.addr_b, built.b_names.get(e.pair.addr_b))
+def _e_targets(built: BuiltDiff) -> list[tuple[str, str | None]]:
+    """(B address, name) of every E entry's B function, sorted. The name is the B scan's own name
+    for it, else the alignment's — a function the B scan does not hold has no extracted name, yet
+    other B bodies still call it by the name the alignment carries; reading only ``FUN_<addr>``
+    there would turn "its name could not be looked up" into "nothing mentions it"."""
+    return sorted(
+        (e.pair.addr_b, built.b_names.get(e.pair.addr_b) or e.pair.name_b)
         for e in built.entries
         if e.bucket == "E" and e.pair is not None
-    ]
+    )
+
+
+def _b_other_fn_mentions(
+    bb: sameness.Bodies | None, targets: list[tuple[str, str | None]]
+) -> frozenset[str]:
+    """The B-side addresses of ``targets`` (the E entries' functions, :func:`_e_targets`) that
+    ANOTHER B function's pseudocode mentions by an identifier token — the function's name or its
+    ``FUN_<addr>`` form, its OWN body excluded. The token index over every B body is built once and
+    only when the diff has an E entry, so a diff with none pays nothing. Comment and string tokens
+    are not mentions."""
     if not targets or not bb:
         return frozenset()
     tok2addr: dict[str, set[str]] = {}
@@ -2887,7 +2902,9 @@ _SIGNIFICANCE_LENS = (
     "direct caller (caller-set edge: basis lost_every_direct_caller_never_sunk, or "
     "caller_signal_undetermined_never_sunk for an E whose B side could not be proven), and an "
     "entry judged changed_real, inconclusive or due a re-check / relabel — none of them reaches "
-    "attention 2, whether band is on or off. A bucket C entry is sunk even when its text match is "
+    "attention 2, whether band is on or off. Inside an E lane the functions no other B function "
+    "names (b_other_fn_mentions false) are read first; that key orders this lens only, never the "
+    "default order or rank_key. A bucket C entry is sunk even when its text match is "
     "identical_text_unverified; sunk_with_body_size_differs counts the sunk ones whose two body "
     "byte counts differ, with the filter that lists them, counted over the entries the current "
     "filters keep. Only with band=true does the judgement band order entries inside each "
@@ -3349,9 +3366,10 @@ def get_diff_patch_view(
         "lens": {
             "view": view,
             "order": (
-                "A; then the R and B entries carrying a sink candidate (tier, R before B, "
-                "sink_presence_signal first, similarity, address); then the entries with none "
-                "(recall_gap_sink, R, C); then P"
+                "A; then the entries carrying a sink candidate (tier; R, then B with "
+                "sink_presence_signal first, then E; similarity, address); then the entries with "
+                "none (recall_gap_sink, R, C, then E by caller relevance: a recall-gap callee, a "
+                "callee that is itself a candidate, the rest); then P"
             ),
             "sort_by": sort_by or "default",
             "filters": filters,

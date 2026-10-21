@@ -1830,9 +1830,13 @@ def make_tools(
         caller-set edge reads lost-or-undetermined (then E); the rest are counted under
         ``not_listed`` by ``pseudocode_sameness`` (below).
 
-        Order: A, then the R / B entries carrying a candidate (by ``tier`` — the candidates'
-        sink-impact tier — then R before B), then the entries with no candidate, then P; each
-        entry's ``rank_key`` names the components. ``sort_by`` (``tier`` / ``similarity`` /
+        Order: A, then the R / B / E entries carrying a candidate (by ``tier`` — the candidates'
+        sink-impact tier — then R, B, E in that order), then the entries with no candidate
+        (recall_gap_sink, R, C, then E by caller relevance: a callee the hunt does not recall as a
+        sink, then a callee that itself holds a candidate, then the rest), then P; each entry's
+        ``rank_key`` names the components. Under ``sort_by='significance'`` an E lane reads first
+        the functions no other B function names (``b_other_fn_mentions`` false) — that key never
+        enters the default order or ``rank_key``. ``sort_by`` (``tier`` / ``similarity`` /
         ``address``) puts one component first. ``sort_by='significance'`` is a lens, not a
         relabel: attention 0 = bucket A or a row carrying ``sink_arg_constant_delta``; 2 (sunk,
         still listed) = pseudocode_sameness ``identical`` or bucket C, except a bucket C entry
