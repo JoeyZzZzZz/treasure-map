@@ -135,7 +135,9 @@ def test_a_refusal_names_a_restart_when_the_on_disk_code_moved(
     _mk_analysis(tmp_path)
     # A run stale on the hunt code, so there is always a refusal to carry the hint.
     atlas = _atlas(
-        tmp_path, hunt_code="src-b2b2b2b2b2b2b2b2", scan_stamp=rescan_version.scan_stamp_for(Config())
+        tmp_path,
+        hunt_code="src-b2b2b2b2b2b2b2b2",
+        scan_stamp=rescan_version.scan_stamp_for(Config()),
     )
     tools = mcp_app.make_tools(atlas, config=Config())
 
@@ -153,7 +155,9 @@ def test_a_refusal_omits_the_restart_when_the_on_disk_code_matches(
     own remedy — the restart hint would be noise, and worse, a false lead."""
     _mk_analysis(tmp_path)
     atlas = _atlas(
-        tmp_path, hunt_code="src-b2b2b2b2b2b2b2b2", scan_stamp=rescan_version.scan_stamp_for(Config())
+        tmp_path,
+        hunt_code="src-b2b2b2b2b2b2b2b2",
+        scan_stamp=rescan_version.scan_stamp_for(Config()),
     )
     tools = mcp_app.make_tools(atlas, config=Config())
 
