@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -264,8 +265,12 @@ def judge(
     *,
     withheld: bool,
     staleness: dict[str, Any],
+    group_delta: dict[str, Any] | None = None,
 ) -> DiffAnnotation:
-    """One judgement read against its diff's current view."""
+    """One judgement read against its diff's current view. ``group_delta`` is what the caller found
+    moved in the same-shape group this judgement leaned on (S6, computed in the view read path
+    where the diff is built), folded in under ``moved["group"]``: a group that moved re-checks the
+    judgement exactly as a move in its own facts does."""
     moved: dict[str, Any] = {}
     if withheld:
         state = DIFF_WITHHELD
@@ -274,6 +279,8 @@ def judge(
     else:
         then = stored.get("facts") if stored is not None else None
         moved = facts_delta(then if isinstance(then, dict) else {}, current.facts)
+        if group_delta is not None:
+            moved["group"] = group_delta
         state = CHANGED if moved else UNCHANGED
     return DiffAnnotation(
         anchor_ref=anchor_ref,
@@ -333,15 +340,21 @@ def judgements_for(
     subjects: dict[str, Subject],
     withheld: bool,
     staleness: dict[str, Any],
+    group_review: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
 ) -> tuple[dict[str, DiffAnnotation], list[str]]:
     """The run pair's judgements that are about this diff, each read against its current view, and
-    the anchors among them whose subject is gone (dangling)."""
+    the anchors among them whose subject is gone (dangling). ``group_review`` (S6), when given, is
+    asked to re-derive the same-shape group a judgement recorded (its stored ``group`` block) and
+    say what moved; the caller owns it because rebuilding a group needs the atlas and the build."""
     judged: dict[str, DiffAnnotation] = {}
     for row in rows:
         anchor = row["anchor_ref"]
         stored = stored_snapshot(row["basis_state"])
         if not belongs_to(anchor, stored, diff_id=diff_id, run_a=run_a, run_b=run_b, binary=binary):
             continue
+        group_delta = None
+        if group_review is not None and not withheld and stored is not None and stored.get("group"):
+            group_delta = group_review(stored["group"])
         judged[anchor] = judge(
             anchor,
             row["verdict"],
@@ -349,6 +362,7 @@ def judgements_for(
             subjects.get(anchor),
             withheld=withheld,
             staleness=staleness,
+            group_delta=group_delta,
         )
     dangling = sorted(a for a, j in judged.items() if j.basis_state == ANCHOR_UNRESOLVED)
     return judged, dangling

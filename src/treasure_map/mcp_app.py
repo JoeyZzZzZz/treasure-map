@@ -212,6 +212,25 @@ def _hunk_page_budget(hunk: dict[str, Any]) -> dict[str, Any]:
     return {"withheld": "page_budget", **counts, "read_with": "get_pseudocode"}
 
 
+def _diff_group_echo(atlas: sqlite3.Connection, row_id: int) -> dict[str, Any] | None:
+    """The group block just stored on a diff judgement (overlay row ``row_id``), as a compact echo
+    for the write result: the group named, the relation it holds by, and its counts and summary."""
+    row = atlas.execute("SELECT basis_state FROM overlay WHERE id = ?", (row_id,)).fetchone()
+    if row is None or not row[0]:
+        return None
+    try:
+        group = json.loads(row[0]).get("group")
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(group, dict):
+        return None
+    return {
+        k: group[k]
+        for k in ("group_ref", "side", "relation", "member_count", "counts", "summary")
+        if k in group
+    }
+
+
 def _entry_without_hunks(entry: dict[str, Any]) -> dict[str, Any]:
     """A copy of one rendered entry with each inline_hunk it carries withheld (``page_budget``): the
     top-level pseudocode_delta's and the proposed_pair_reading's. Copied all the way down — the
@@ -2313,6 +2332,10 @@ def make_tools(
         its ref) returns ``not_a_member`` with ``f2_keys`` — each shape it has and this side's
         group of that shape (``group_ref`` null and ``member_count`` 0 when there is none).
 
+        Pass the ``group_ref`` to annotate_diff when a judgement leaned on this group ("the other
+        calls of this shape did not change"): it is stored with the judgement and re-checked, so a
+        member moving, joining or leaving reads needs_recheck.
+
         The group object (no member list): ``group_ref`` (``{diff_id}#f2:<key>:<side>@<fingerprint
         version>/<recipe version>`` — stable, side included), ``shape``, ``member_count``,
         ``by_landing`` ({landing: {subclass: n}} as the view states each member's row; ``-`` = no
@@ -3055,6 +3078,7 @@ def make_tools(
         rationale: str,
         checked: list[str] | None = None,
         why_unchanged: str | None = None,
+        group_ref: str | None = None,
     ) -> dict[str, Any]:
         """Record YOUR OWN judgement about one entry of a diff's function-level view
         (get_diff_patch_view) — did this change do something real. A writable layer over the
@@ -3073,9 +3097,16 @@ def make_tools(
         put the next step in the rationale). Candidate verdicts are refused here; to carry this
         judgement onto one of the entry's candidates, use promote.
 
+        ``group_ref`` (a ``group_ref`` from same_shape_siblings) records that this judgement also
+        leaned on a same-shape group — that the OTHER calls of this shape did not change. The group
+        must be about this entry (hold a call of it, or be a shape this candidate has) or the write
+        is refused, naming the groups the subject does have. A snapshot of the group is kept beside
+        the facts, and get_diff_patch_view re-checks it: a member moving, joining or leaving reads
+        ``needs_recheck``. Overwriting without ``group_ref`` drops it — pass it again to keep it.
+
         One judgement per anchor: re-annotating OVERWRITES. When the entry's facts move later (its
-        alignment, similarity, bucket or candidate rows), or the diff stops being current, the
-        entry reads ``needs_recheck``."""
+        alignment, similarity, bucket or candidate rows), the group it leaned on moves, or the diff
+        stops being current, the entry reads ``needs_recheck``."""
         if not (rationale and rationale.strip()):
             return {
                 "written": False,
@@ -3084,6 +3115,7 @@ def make_tools(
         supplied = {"checked": checked, "why_unchanged": why_unchanged}
         given = {k: v for k, v in supplied.items() if v is not None}
         atlas = open_atlas(atlas_path)
+        group_echo: dict[str, Any] | None = None
         try:
             refusal = _refuse_stale_diff(atlas, diff_id)
             if refusal is not None:
@@ -3097,9 +3129,12 @@ def make_tools(
                     rationale=rationale,
                     attributed_to="agent-via-mcp",
                     verdict_basis=given or None,
+                    group_ref=group_ref,
                 )
             except ConfigError as exc:
                 return {"written": False, "error": str(exc)}
+            if group_ref is not None:
+                group_echo = _diff_group_echo(atlas, res.id)
         finally:
             atlas.close()
         result: dict[str, Any] = {
@@ -3114,6 +3149,8 @@ def make_tools(
             "unchanged; list_overlays(anchor_kind='diff_subject', run_id=<run pair>) resumes "
             "these.",
         }
+        if group_echo is not None:
+            result["group"] = group_echo
         if res.action == "updated":
             result["overwrote"] = {
                 "attributed_to": res.prior_attributed_to,

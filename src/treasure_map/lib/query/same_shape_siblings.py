@@ -554,18 +554,11 @@ def _wrapper_key(c: _Call) -> str:
     return f"name:{name}" if name else "unrecorded"
 
 
-def _group_object(
-    atlas: sqlite3.Connection,
-    meta: _Meta,
-    built: BuiltDiff,
-    side: str,
-    key: str,
-    members: list[_Call],
-    states: dict[str, _State],
-    calls: list[_Call],
-    side_db: _Side,
-    page_ref: dict[str, Any],
-) -> dict[str, Any]:
+def _group_counts(members: list[_Call], states: dict[str, _State]) -> dict[str, Any]:
+    """Where a group's members landed, tallied from the view: per landing and subclass, those not
+    listed, those whose pair changed, and the unreadable ones by reason. The one place S5's group
+    object and S6's freshness snapshot both read these, so a group and the snapshot a judgement is
+    re-checked against can never disagree on the count."""
     by_landing: dict[str, Counter[str]] = {}
     unreadable: Counter[str] = Counter()
     not_listed = below_1 = 0
@@ -585,6 +578,27 @@ def _group_object(
     landing_counts = {
         landing: dict(sorted(subs.items())) for landing, subs in sorted(by_landing.items())
     }
+    return {
+        "by_landing": landing_counts,
+        "not_listed_sim1": not_listed,
+        "similarity_below_1": below_1,
+        "states_unreadable": dict(sorted(unreadable.items())),
+    }
+
+
+def _group_object(
+    atlas: sqlite3.Connection,
+    meta: _Meta,
+    built: BuiltDiff,
+    side: str,
+    key: str,
+    members: list[_Call],
+    states: dict[str, _State],
+    calls: list[_Call],
+    side_db: _Side,
+    page_ref: dict[str, Any],
+) -> dict[str, Any]:
+    counts = _group_counts(members, states)
     first = members[0]
     out: dict[str, Any] = {
         "diff_id": meta.diff_id,
@@ -597,17 +611,14 @@ def _group_object(
             "kind": first.kind,
         },
         "member_count": len(members),
-        "by_landing": landing_counts,
-        "not_listed_sim1": not_listed,
-        "similarity_below_1": below_1,
-        "states_unreadable": dict(sorted(unreadable.items())),
+        **counts,
     }
     wrappers = Counter(_wrapper_key(m) for m in members if m.granularity == "wrapper_callsite")
     if wrappers:
         out["by_wrapper"] = dict(sorted(wrappers.items()))
     out["sibling_set_bounds"] = {
         "recall_gaps": _recall_gaps(side_db, built.staleness.get("source_stale")),
-        "undetermined_alignment_n": sum(landing_counts.get("R", {}).values()),
+        "undetermined_alignment_n": sum(counts["by_landing"].get("R", {}).values()),
         "binaries_not_diffed": _not_diffed(atlas, meta, side, first.sink, first.kind),
         "excluded_non_callsite": _excluded(calls, first.sink, first.kind),
         "unkeyed": _unkeyed(calls),

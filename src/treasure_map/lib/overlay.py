@@ -525,6 +525,7 @@ def annotate_diff(
     rationale: str,
     attributed_to: str | None = "agent-via-mcp",
     verdict_basis: dict[str, Any] | None = None,
+    group_ref: str | None = None,
     commit: bool = True,
 ) -> UpsertResult:
     """Write (or overwrite) the judgement on one entry of a diff's function-level view.
@@ -537,7 +538,14 @@ def annotate_diff(
 
     Diff verdicts only (``_DIFF_VERDICTS``); ``no_real_change`` owes a basis (see
     ``_validate_diff_verdict_basis``). The degraded-anchor refusal of a candidate write does not
-    apply: it reads a candidate's flow evidence, which a diff entry does not have."""
+    apply: it reads a candidate's flow evidence, which a diff entry does not have.
+
+    ``group_ref`` (from a same_shape_siblings result) declares that this judgement also leaned on a
+    same-shape group — "the other calls of this shape did not change". The group it names must be
+    about this entry (hold a call of it, or be a shape this candidate has) or the write is refused.
+    A snapshot of the group is stored beside the facts, and get_diff_patch_view re-checks it: a
+    member moving, joining or leaving puts the judgement back in needs_recheck. Overwriting the
+    judgement without ``group_ref`` again drops the group — pass it each time to keep it."""
     if verdict not in _DIFF_VERDICTS:
         if verdict in _VERDICTS:
             raise ConfigError(
@@ -553,6 +561,10 @@ def annotate_diff(
     from treasure_map.lib.query.diff_annotations import capture_diff_basis
 
     snapshot = capture_diff_basis(atlas, diff_id, anchor_ref)
+    if group_ref is not None:
+        from treasure_map.lib.query.diff_group_freshness import annotate_group
+
+        snapshot["group"] = annotate_group(atlas, diff_id, anchor_ref, group_ref)
     result = _write_row(
         atlas,
         anchor_kind="diff_subject",

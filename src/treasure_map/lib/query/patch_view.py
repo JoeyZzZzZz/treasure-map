@@ -2342,6 +2342,10 @@ def _clear_view_caches() -> None:
     _B_MENTIONS_CACHE.clear()
     _SIZE_FACT_CACHE.clear()
     _CANDIDATE_ENTRY_CACHE.clear()
+    # S6's process-wide call-list cache (in a module that imports this one, so imported here).
+    from treasure_map.lib.query.diff_group_freshness import _clear_cache
+
+    _clear_cache()
 
 
 def _run_source(atlas: sqlite3.Connection, run_id: str) -> tuple[str | None, str | None]:
@@ -3606,6 +3610,18 @@ class ViewReview:
         subjects = (
             diff_review.subjects_of(built.placed, d.run_a, d.run_b, d.binary) if d.binary else {}
         )
+        # S6: a judgement may have recorded the same-shape group it leaned on. Re-derive it here,
+        # where the build is in hand, and let judgements_for fold any move into needs_recheck. One
+        # cache per review so several judgements on one group rebuild it once; the call list behind
+        # it is cached process-wide (diff_group_freshness). Imported in the body: that module reads
+        # this one, so a top-level import would be a cycle.
+        group_cache: dict[tuple[str, str], Any] = {}
+
+        def _group_review(stored_group: dict[str, Any]) -> dict[str, Any] | None:
+            from treasure_map.lib.query.diff_group_freshness import group_moved
+
+            return group_moved(atlas, built, stored_group, group_cache)
+
         self.judged, self.dangling = diff_review.judgements_for(
             rows,
             diff_id=d.diff_id,
@@ -3615,6 +3631,7 @@ class ViewReview:
             subjects=subjects,
             withheld=self.withheld,
             staleness=built.staleness,
+            group_review=_group_review,
         )
         self.anchor: dict[str, str | None] = {
             e.entry_id: (
