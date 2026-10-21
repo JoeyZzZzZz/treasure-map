@@ -94,6 +94,9 @@ from treasure_map.lib.query.diff_align import (
 from treasure_map.lib.query.diff_align import staleness_summary as _staleness_summary
 from treasure_map.lib.query.diff_align import toolchain_checked as _toolchain_checked
 from treasure_map.lib.query.patch_view import get_diff_patch_view as _get_diff_patch_view
+from treasure_map.lib.query.same_shape_siblings import (
+    same_shape_siblings as _same_shape_siblings,
+)
 from treasure_map.lib.query.sink_overlay import compute_sink_overlay as _compute_sink_overlay
 from treasure_map.lib.query.sink_overlay import (
     compute_sink_overlay_runs as _compute_sink_overlay_runs,
@@ -173,26 +176,53 @@ def _fit_candidates(
     return kept, False
 
 
-def _fit_entries(result: dict[str, Any], offset: int) -> dict[str, Any]:
-    """A get_diff_patch_view page fitted to the response budget, in every view.
+def _fit_page(
+    result: dict[str, Any], offset: int, *, rows: str, total: str, next_offset: str, truncated: str
+) -> dict[str, Any]:
+    """A page of ``result[rows]`` (``result[total]`` rows in all, this page from ``offset``) fitted
+    to the response budget.
 
     The paging fields are set to placeholders at least as wide as their final values BEFORE the
-    envelope is measured (``entries_truncated`` false is wider than true; ``next_offset`` is the
-    wider of null and the total, and the final value is never past the total), so the page as
-    returned is never wider than what was measured. ``next_offset`` then resumes after what
-    ACTUALLY fit; ``total_entries`` is the lib's, unchanged. A refusal, or any result without
-    ``entries``, is returned as it is."""
-    if "error" in result or "entries" not in result:
+    envelope is measured (``truncated`` false is wider than true; ``next_offset`` is the wider of
+    null and the total, and the final value is never past the total), so the page as returned is
+    never wider than what was measured. ``next_offset`` then resumes after what ACTUALLY fit; the
+    total is the lib's, unchanged. A refusal, or any result without ``rows``, is returned as it
+    is."""
+    if "error" in result or rows not in result:
         return result
-    total = result["total_entries"]
-    result["next_offset"] = total if len(json.dumps(total)) > len(json.dumps(None)) else None
-    result["entries_truncated"] = False
-    kept, cut = _fit_candidates(result, result["entries"], _RESPONSE_BYTE_BUDGET, key="entries")
+    n = result[total]
+    result[next_offset] = n if len(json.dumps(n)) > len(json.dumps(None)) else None
+    result[truncated] = False
+    kept, cut = _fit_candidates(result, result[rows], _RESPONSE_BYTE_BUDGET, key=rows)
     end = offset + len(kept)
-    result["entries"] = kept
-    result["next_offset"] = end if end < total else None
-    result["entries_truncated"] = cut
+    result[rows] = kept
+    result[next_offset] = end if end < n else None
+    result[truncated] = cut
     return result
+
+
+def _fit_entries(result: dict[str, Any], offset: int) -> dict[str, Any]:
+    """A get_diff_patch_view page fitted to the response budget, in every view (``_fit_page``)."""
+    return _fit_page(
+        result,
+        offset,
+        rows="entries",
+        total="total_entries",
+        next_offset="next_offset",
+        truncated="entries_truncated",
+    )
+
+
+def _fit_members(result: dict[str, Any], offset: int) -> dict[str, Any]:
+    """A same_shape_siblings members page fitted to the response budget (``_fit_page``)."""
+    return _fit_page(
+        result,
+        offset,
+        rows="members",
+        total="member_count",
+        next_offset="members_next_offset",
+        truncated="members_truncated",
+    )
 
 
 # The server's standing instruction to an AI client: the working loop, not legalese. The legal
@@ -264,7 +294,8 @@ _AGENT_INSTRUCTIONS = (
     "entry's candidates as a candidate verdict (an entry shows 20 rows inline: to find a row_ref "
     "past them, page its rows with get_diff_patch_view(diff_id, entry_id=..., rows_offset=...)), "
     "and list_overlays(anchor_kind='diff_subject', run_id='<run_a>::<run_b>') reviews them with "
-    "the progress over the whole run pair."
+    "the progress over the whole run pair. same_shape_siblings(diff_id, evidence_ref=...) names "
+    "the other calls of one call's shape in the same binary and where each landed in the diff."
 )
 
 
@@ -2125,6 +2156,80 @@ def make_tools(
         finally:
             conn.close()
 
+    def same_shape_siblings(
+        diff_id: str,
+        evidence_ref: str | None = None,
+        candidate_anchor: str | None = None,
+        members_offset: int | None = None,
+    ) -> dict[str, Any]:
+        """For ONE sink call of a diff: the other calls of the SAME SHAPE in the same binary, on the
+        same side, and where each one landed in this diff. Read-only; counts, never a verdict.
+
+        Name the call by ``evidence_ref`` (a candidate row's a_ref / b_ref) or ``candidate_anchor``
+        (``{run_a}::{run_b}#candidate#<subject_key>``, as get_diff_patch_view's rows give it; it
+        names its A ref when it has one). The call must be a candidate of this diff's binary on
+        that side; the group is read on that side only — a B-side call is grouped with B's calls.
+
+        Shape = the pattern's structural_fingerprint + the called sink's name + a kind (the length
+        kind for a copy / formatter call, else the source kind; ``unknown`` when not recorded).
+        Members are the calls with an address of their own (``callsite``, ``wrapper_callsite``),
+        once per evidence_ref, the input included in ``member_count``. A function-level input
+        (``wrapper`` / ``function_fallback`` / ``degraded_out_of_body``: several calls can share
+        its ref) returns ``not_a_member`` with ``f2_keys`` — each shape it has and this side's
+        group of that shape (``group_ref`` null and ``member_count`` 0 when there is none).
+
+        The group object (no member list): ``group_ref`` (``{diff_id}#f2:<key>:<side>@<fingerprint
+        version>/<recipe version>`` — stable, side included), ``shape``, ``member_count``,
+        ``by_landing`` ({landing: {subclass: n}} as the view states each member's row; ``-`` = no
+        subclass), ``not_listed_sim1`` (members in an aligned similarity-1 pair the view does not
+        list), ``similarity_below_1`` (members whose pair's similarity is below 1 or unrecorded; a
+        function with no counterpart is in neither), ``states_unreadable`` ({reason: n}: a diff
+        undetermined as a whole counts every member under each of its ``diff_undetermined:<reason>``
+        banners; ``no_row_in_view`` = the view holds no row for that member;
+        ``several_rows_in_view`` = a call the hunt recorded more than once whose rows land
+        differently) — a member that could not be read is never counted as not listed.
+        ``by_wrapper`` ({wrapper entry, or
+        ``name:<name>``: n}) when the group has wrapper_callsite members.
+
+        ``sibling_set_bounds`` — what can make the group look smaller: ``recall_gaps``
+        ({families, state}: the families of sinks the hunt does not recall that this binary's
+        callee lists name; such a call is never any group's member; ``families`` null when the
+        lists could not be read, ``state`` ``partial:<n>`` when n lists were cut short),
+        ``undetermined_alignment_n`` (= by_landing.R summed), ``binaries_not_diffed`` (calls of this
+        sink name and kind in OTHER binaries of this run that no diff of the run pair covers, by
+        reason, ``{binaries, calls}`` — not members of this group), ``excluded_non_callsite``
+        (function-level candidates of this sink name and kind, per granularity), ``unkeyed`` (calls
+        no shape could be given).
+
+        ``members_offset`` (from ``members_page_ref``) returns one page of members instead, in a
+        stable order (function entry, call address, evidence_ref — never by landing), cut to a byte
+        budget (~48KB): ``members_truncated`` says when, ``members_next_offset`` resumes (null on
+        the last page). Each member: ``evidence_ref`` (for annotate), function entry and name, call
+        address, ``landing`` / ``subclass`` / ``listed`` / ``similarity``; a member in a listed
+        entry also carries ``entry_id`` + ``row_ref`` (what promote takes — promote accepts a row
+        landing A, persisted or P unmatched_analysis_complete in a determined pairing on a current
+        diff, and refuses the rest with its reasons) and ``candidate_anchor`` (what annotate_diff
+        takes). A member in a pair the view does not list has neither: annotate_diff and promote
+        take only what the view lists. ``source_stale`` / ``source_stale_reason`` as in list_diffs.
+        A diff whose side is a proven-stale scan is refused, as on every diff tool."""
+        conn = open_atlas(atlas_path)
+        try:
+            refusal = _refuse_stale_diff(conn, diff_id)
+            if refusal is not None:
+                return refusal
+            result = _same_shape_siblings(
+                conn,
+                diff_id,
+                evidence_ref=evidence_ref,
+                candidate_anchor=candidate_anchor,
+                members_offset=members_offset,
+                build_hash=_current_pass_version(),
+                commit=_installed_commit(),
+            )
+            return _fit_members(result, members_offset or 0)
+        finally:
+            conn.close()
+
     def _row_staleness(
         by_diff: dict[str, dict[str, Any]], row_diff_id: str | None
     ) -> dict[str, Any]:
@@ -3088,6 +3193,7 @@ def make_tools(
         "get_diff_patch_view": get_diff_patch_view,
         "get_diff_deltas": get_diff_deltas,
         "get_diff_sink_overlay": get_diff_sink_overlay,
+        "same_shape_siblings": same_shape_siblings,
         "get_diff_meta": get_diff_meta,
         "get_function_alignment": get_function_alignment,
         "get_diff_capabilities": get_diff_capabilities,

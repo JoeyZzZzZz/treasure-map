@@ -658,6 +658,8 @@ def _surfaces(w: _World) -> dict[str, tuple[Any, Any]]:
     tools = make_tools(w.tmp / "atlas.db")
     take("get_diff_sink_overlay", tools["get_diff_sink_overlay"](diff_id=did))
     take("get_diff_patch_view", tools["get_diff_patch_view"](did))
+    ref = f"run_a#{_sha('a')[:8]}:00001000@cmd@0x000010"
+    take("same_shape_siblings", tools["same_shape_siblings"](did, evidence_ref=ref))
     pair = tools["get_diff_sink_overlay"](run_a="run_a", run_b="run_b", detail="rows")
     rows = [r for r in pair["rows"] if r["diff_id"] == did]
     assert rows
@@ -676,7 +678,7 @@ def test_every_diff_read_surface_carries_source_stale(
     _full(w)
     w.atlas.commit()
     surfaces = _surfaces(w)
-    assert len(surfaces) == 8
+    assert len(surfaces) == 9
     assert set(surfaces.values()) == {(False, None)}
     _set_binary(w, "b", "liba", "pass_version", "pv2")
     assert set(_surfaces(w).values()) == {(True, "extraction_changed")}

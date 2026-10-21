@@ -251,6 +251,7 @@ def test_a_diff_is_refused_when_either_side_is_stale(atlas: Path, side: str) -> 
         lambda: tools["get_diff_patch_view"]("d1"),
         lambda: tools["get_diff_deltas"]("d1"),
         lambda: tools["get_diff_sink_overlay"]("d1"),
+        lambda: tools["same_shape_siblings"]("d1", evidence_ref=f"{a_id}#x:00001000@cmd@0x10"),
         lambda: tools["get_diff_meta"]("d1"),
         lambda: tools["get_diff_capabilities"]("d1"),
         lambda: tools["get_function_alignment"]("d1", "0x1000"),

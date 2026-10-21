@@ -47,6 +47,7 @@ _EXPECTED_TOOLS = {
     "get_diff_patch_view",
     "get_diff_deltas",
     "get_diff_sink_overlay",
+    "same_shape_siblings",
     "get_diff_meta",
     "get_function_alignment",
     "get_diff_capabilities",

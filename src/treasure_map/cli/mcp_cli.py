@@ -19,6 +19,7 @@ import click
 from treasure_map.cli.interrupts import InterruptGroup
 from treasure_map.lib import facts
 from treasure_map.lib.analyze.ghidra_runner import current_pass_version
+from treasure_map.version import installed_commit
 
 
 def _emit(record: dict[str, object]) -> None:
@@ -99,7 +100,8 @@ def _open_fact_db(analysis_db: str) -> Any:
     short_help="Read a few of the MCP facts by hand (pseudocode, disassembly, callees, xrefs, …)",
 )
 def fact() -> None:
-    """Read structured facts from an analysis database (the layer MCP also serves)."""
+    """Read structured facts from an analysis database, or from the atlas (the layer MCP also
+    serves)."""
 
 
 @fact.command(name="pseudocode")
@@ -170,6 +172,60 @@ def script_callsites(binary: str, analysis_db: str) -> None:
     conn = _open_fact_db(analysis_db)
     try:
         _emit_fact(conn, facts.get_script_callsites(conn, binary=binary))
+    finally:
+        conn.close()
+
+
+@fact.command(name="same-shape-siblings")
+@click.option("--diff-id", required=True, help="The diff ({run_a}::{run_b}::{binary}).")
+@click.option(
+    "--evidence-ref", default=None, help="The sink call, by its evidence_ref (a row's a_ref/b_ref)."
+)
+@click.option(
+    "--candidate-anchor",
+    default=None,
+    help="The sink call, by its candidate anchor ({run_a}::{run_b}#candidate#<subject_key>).",
+)
+@click.option(
+    "--members-offset",
+    default=None,
+    type=int,
+    help="Print one page of the group's members from this offset instead of the counts.",
+)
+@click.option(
+    "--atlas",
+    "atlas_db",
+    default=None,
+    help="Atlas DB path (default: the last run's atlas, else the configured atlas.db).",
+)
+def same_shape_siblings(
+    diff_id: str,
+    evidence_ref: str | None,
+    candidate_anchor: str | None,
+    members_offset: int | None,
+    atlas_db: str | None,
+) -> None:
+    """Print the calls of the same shape as one sink call of a diff, in the same binary, and where
+    each landed in that diff (the same answer as the MCP tool same_shape_siblings)."""
+    from treasure_map.lib.atlas.connection import open_atlas
+    from treasure_map.lib.query.same_shape_siblings import same_shape_siblings as siblings
+
+    atlas, _ = _resolve_mcp_target(atlas_db, None)
+    if not Path(atlas).is_file():
+        raise click.ClickException(f"no atlas at {atlas}: pass --atlas <path to atlas.db>")
+    conn = open_atlas(Path(atlas))
+    try:
+        _emit(
+            siblings(
+                conn,
+                diff_id,
+                evidence_ref=evidence_ref,
+                candidate_anchor=candidate_anchor,
+                members_offset=members_offset,
+                build_hash=current_pass_version(),
+                commit=installed_commit(),
+            )
+        )
     finally:
         conn.close()
 
