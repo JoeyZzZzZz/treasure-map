@@ -55,8 +55,8 @@ def check(name: str, state: State, detail: str) -> Check:
 
 @dataclass(frozen=True)
 class RunsCurrency:
-    """How many runs in the atlas an older tmap produced. ``count`` None = unknown (``why``);
-    ``absent`` = there is no atlas yet."""
+    """How many runs in the atlas the installed tmap's code would scan differently. ``count`` None =
+    unknown (``why``); ``absent`` = there is no atlas yet."""
 
     count: int | None
     absent: bool = False

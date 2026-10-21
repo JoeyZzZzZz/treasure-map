@@ -512,9 +512,14 @@ def compare_scan_stamps(stored: str | None, current: str) -> StampCompare:
     if stored is None:
         return StampCompare((), ("scan stamp",))
     try:
-        st = _flatten(json.loads(stored))
+        parsed = json.loads(stored)
     except (TypeError, ValueError):
         return StampCompare((), ("scan stamp",))
+    if not isinstance(parsed, dict):
+        # Valid JSON but not an object (``null``, a list, a scalar): nothing to compare leaf by
+        # leaf, so it reads as unknown, never a crash — the stored value was corrupted out of band.
+        return StampCompare((), ("scan stamp",))
+    st = _flatten(parsed)
     differing: list[str] = []
     unknown: list[str] = []
     for key in sorted(set(st) | set(cur)):

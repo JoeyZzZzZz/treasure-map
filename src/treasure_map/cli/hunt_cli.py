@@ -2198,7 +2198,8 @@ def _rescan_reason(
     redoes the hunt anyway, so listing a run twice would overstate what is left.
 
     Mirrors the hunt-side currency rule and lands on "out of date" wherever sameness cannot be
-    CONFIRMED, so an unstamped or unknown-commit run is offered for rescan rather than passed
+    CONFIRMED, so a run whose code stamp cannot be confirmed (none recorded, or unreadable) is
+    offered for rescan rather than passed
     over — the cost of an unnecessary rescan is time, the cost of a missed one is a stale answer
     that reads exactly like a fresh one. This is why it is NOT ``run_staleness``: that one refuses
     reads and so must only ever fire on a PROVEN mismatch, which means it treats every unknown as

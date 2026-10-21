@@ -62,6 +62,9 @@ def _both_agree(atlas, a: str, b: str) -> bool:
         ({"code": CODE_X, "scan": SCAN_S}, {"code": CODE_X, "scan": SCAN_T}, True),
         # both carry a code stamp but one scan stamp is NULL -> mismatch (cannot confirm same)
         ({"code": CODE_X, "scan": SCAN_S}, {"code": CODE_X, "scan": None}, True),
+        # both scan stamps NULL (same code) -> still a mismatch: two absent stamps confirm nothing,
+        # so they are not read as the same scan (r0 m-2; the G07 mutation calls this same-gen)
+        ({"code": CODE_X, "scan": None}, {"code": CODE_X, "scan": None}, True),
         # different build_hash is always a mismatch
         (
             {"code": CODE_X, "scan": SCAN_S, "build": BH},

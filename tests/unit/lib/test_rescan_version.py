@@ -102,6 +102,37 @@ def test_a_name_granular_module_is_used_by_attribute_only(module: str) -> None:
         assert not (isinstance(node, ast.ImportFrom) and any(a.name == "*" for a in node.names))
 
 
+def test_used_names_falls_back_to_the_whole_module_when_a_name_is_a_bare_value(
+    tmp_path: Path,
+) -> None:
+    """The counterpart of the test above, on a synthetic package: narrowing a module to the names
+    reached by attribute is sound ONLY while the module local is never handed on as a value. The
+    moment it is (passed on, ``getattr``'d), the attribute set is not the whole surface, so
+    ``_used_names`` must report ``whole=True`` and the caller hashes the whole module — otherwise a
+    change to a never-attribute-accessed function slips past the stamp.
+
+    MUTATION: drop the bare-value fallback (``return set(), True``) -> the bare case reads
+    ``whole=False`` and this goes RED.
+    """
+    root = tmp_path / "treasure_map"
+    (root / "lib").mkdir(parents=True)
+    (root / "lib" / "target.py").write_text(
+        "def a():\n    return 1\n\n\ndef b():\n    return 2\n", encoding="utf-8"
+    )
+    (root / "lib" / "user_attr.py").write_text(
+        "from treasure_map.lib import target\n\n\ndef use():\n    return target.a()\n",
+        encoding="utf-8",
+    )
+    (root / "lib" / "user_bare.py").write_text(
+        "from treasure_map.lib import target\n\n\ndef use():\n    return getattr(target, 'a')\n",
+        encoding="utf-8",
+    )
+    attr_names, attr_whole = rv._used_names(root, "lib.target", {"lib.target", "lib.user_attr"})
+    assert attr_whole is False and attr_names == {"a"}, "attribute access narrows to the names used"
+    _names, bare_whole = rv._used_names(root, "lib.target", {"lib.target", "lib.user_bare"})
+    assert bare_whole is True, "an alias used as a bare value forces whole-module hashing"
+
+
 # ── 3. every data file the code reads is hashed, and the .sql has no block comments ──
 
 
@@ -272,6 +303,17 @@ def _append(dst: Path, rel: str, text: str) -> None:
                 "lib/facts.py",
                 "conn = ro_connect(Path(db_path))",
                 "conn = ro_connect(Path(str(db_path)))",
+            ),
+            False,
+            True,
+        ),
+        (
+            "a facts function the hunt reaches only TRANSITIVELY (_run_ghidra_version's body)",
+            lambda d: _edit(
+                d,
+                "lib/facts.py",
+                "SELECT DISTINCT ghidra_version FROM current_binaries WHERE ghidra_ok = 1",
+                "SELECT DISTINCT ghidra_version FROM current_binaries WHERE ghidra_ok=1",
             ),
             False,
             True,

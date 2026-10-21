@@ -671,7 +671,7 @@ def make_tools(
             return None
         scans = "equal" if disk.scan == _current.scan else "differ"
         return (
-            f"this MCP server started before tmap's code on disk changed (server: hunt "
+            f"This MCP server started before tmap's code on disk changed (server: hunt "
             f"{_current.hunt}, disk: hunt {disk.hunt}; scan stamps {scans}). Restart the MCP "
             "server: a rescan from the command line uses the code on disk and cannot make runs "
             "current for this server."

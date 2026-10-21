@@ -25,7 +25,7 @@ import pytest
 from click.testing import CliRunner
 
 from treasure_map.lib.atlas.connection import open_atlas
-from treasure_map.lib.atlas.models import DiffMetaRow
+from treasure_map.lib.atlas.models import DiffMetaRow, RunRow
 from treasure_map.lib.atlas.writer import add_diff_meta, begin_run, finish_run
 from treasure_map.lib.config.config import Config
 from treasure_map.lib.diff import code_version, currency, driver, toolchain
@@ -34,6 +34,7 @@ from treasure_map.lib.diff.layer0 import make_diff_id
 from treasure_map.lib.errors import ConfigError
 from treasure_map.lib.query import diff_align
 from treasure_map.lib.query import sink_overlay as so
+from treasure_map.lib.rescan_version import CodeStamp
 from treasure_map.lib.storage.connection import open_db
 from treasure_map.version import UNKNOWN_VERSION
 
@@ -1051,6 +1052,59 @@ def test_a_confirmed_current_pair_diffs_without_warnings(
     _stub(monkeypatch, w)
     fs = _full(w)
     assert [o.error for o in fs.outcomes] == [None] and fs.warnings == ()
+
+
+_HC = "src-hunthunthunthunt"
+_SCAN_CUR = (
+    '{"code":"src-pipe","config":{"xref_fold_edge_threshold":25000},"deps":{"pyelftools":"0.33"}}'
+)
+_SCAN_OTHER_CFG = (
+    '{"code":"src-pipe","config":{"xref_fold_edge_threshold":10000},"deps":{"pyelftools":"0.33"}}'
+)
+
+
+def _runrow(**over: object) -> RunRow:
+    base: dict[str, object] = {
+        "run_id": "run_x",
+        "analysis_db_path": "/x/analysis.db",
+        "firmware_path": "/fw",
+        "build_hash": _PV,
+    }
+    base.update(over)
+    return RunRow(**base)  # type: ignore[arg-type]
+
+
+def test_pair_currency_reads_the_code_stamp_not_the_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``check_run_pair_currency`` judges new-stamp runs by their CODE STAMP: a differing commit
+    with a matching stamp is current (the whole point of stamping by code), a differing scan-stamp
+    leaf is refused. The other diff-currency tests build only stampless runs, which take the commit
+    fallback, so without this the code-stamp branch of the pair check is unexercised (audit
+    G01/G02).
+
+    MUTATION: in ``check_run_pair_currency`` ignore the computed code stamp (e.g. compute it
+    against a fixed bogus value) -> the matching-stamp pair is wrongly refused and the first assert
+    goes RED.
+    """
+    monkeypatch.setattr(driver, "_current_pass_version", lambda: _PV)
+    monkeypatch.setattr(driver, "_installed_commit", lambda: "running0commit")
+    monkeypatch.setattr(driver, "_analysis_build_hash", lambda _path: _PV)
+    monkeypatch.setattr(
+        driver.rescan_version,
+        "current_code_stamp",
+        lambda _cfg: CodeStamp(hunt=_HC, scan=_SCAN_CUR),
+    )
+    a = _runrow(run_id="run_a", hunt_code_version=_HC, scan_stamp=_SCAN_CUR, hunt_commit="commit0a")
+    b = _runrow(run_id="run_b", hunt_code_version=_HC, scan_stamp=_SCAN_CUR, hunt_commit="commit0b")
+    # same code stamp, different commits -> current: no refusal, no warning
+    assert driver.check_run_pair_currency(a, b, config=Config()) == ()
+    # B's scan stamp moved on one config leaf -> a proven mismatch, refused by run B
+    b_moved = _runrow(
+        run_id="run_b", hunt_code_version=_HC, scan_stamp=_SCAN_OTHER_CFG, hunt_commit="commit0b"
+    )
+    with pytest.raises(ConfigError, match="run B 'run_b' is out of date"):
+        driver.check_run_pair_currency(a, b_moved, config=Config())
 
 
 def _rehunted_by_other_code(w: _World, monkeypatch: pytest.MonkeyPatch) -> None:

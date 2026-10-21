@@ -326,8 +326,9 @@ class HuntCurrency:
     ``current`` True means re-running the hunt would reproduce what is already stored, so the
     work can be skipped. It rests on ONE measured property — that the hunt is deterministic over
     its content columns given the same analysis.db and the same code — which is why both inputs
-    must match, and why every way of failing to CONFIRM a match (a missing row, an unrecorded
-    commit, an unfinished previous hunt) lands on False. ``reason`` states what was established, in
+    must match, and why every way of failing to CONFIRM a match (a missing row, a hunt code stamp
+    that was not recorded or cannot be read, an unfinished previous hunt) lands on False. ``reason``
+    states what was established, in
     words either way, so the decision is reported rather than inferred from silence.
     """
 

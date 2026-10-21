@@ -2086,9 +2086,11 @@ def check_run_pair_currency(run_a: RunRow, run_b: RunRow, *, config: Config) -> 
       2. the run's analysis.db now holds a different extraction hash than the run row recorded:
          the extraction was redone after the run was hunted, so its candidates belong to another
          extraction. Compared only when both are one concrete hash.
-    Whatever only cannot be confirmed -- a ``mixed:N`` or missing hash, an unknown hunt commit, a
-    running install that records no commit (an editable one) -- is a warning, never a refusal:
-    those are routine, and refusing them would leave such an install unable to diff at all."""
+    Whatever only cannot be confirmed -- a ``mixed:N`` or missing hash, or a code stamp that was
+    not recorded or cannot be read -- is a warning, never a refusal: those are routine, and
+    refusing them would leave such a run unable to diff at all. (An editable install is no longer
+    one of these: it records a code stamp like any other, so a run it made whose code has since
+    moved is a PROVEN mismatch, refused by rule 1, not a warning.)"""
     build = _current_pass_version()
     commit = _installed_commit()
     current = rescan_version.current_code_stamp(config)

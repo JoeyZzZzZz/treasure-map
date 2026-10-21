@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -98,6 +99,10 @@ def test_same_code_and_same_analysis_db_is_current() -> None:
         (_row(hunt_code_version=None), BUILD, HCODE, SCAN, "hunted before the code stamp existed"),
         (_row(hunt_code_version=OTHER_HCODE), BUILD, HCODE, SCAN, "a different hunt code"),
         (_row(), BUILD, HCODE, None, "this analysis.db records no scan stamp"),
+        # Both the stored and the live scan stamp absent: the no-scan-stamp branch is what catches
+        # this. Without it the `stored != db` check reads None != None as equal and the run would be
+        # wrongly skipped — the row the audit's G06 mutation (dropping that branch) slips through.
+        (_row(scan_stamp=None), BUILD, HCODE, None, "neither run nor db records a scan stamp"),
         (_row(scan_stamp=_scan(code="src-pipeOTHER")), BUILD, HCODE, SCAN, "analysis.db rebuilt"),
         (_row(), None, HCODE, SCAN, "no current extraction hash to compare"),
         (_row(build_hash=None), BUILD, HCODE, SCAN, "the run recorded no extraction hash"),
@@ -281,41 +286,58 @@ def test_a_proven_mismatch_is_stale(run: RunRow, build: str, commit: str, axis: 
 
 
 @pytest.mark.parametrize(
-    ("run", "build", "commit", "why"),
+    ("run", "build", "commit", "why", "detail_has"),
     [
         (
             _run(hunt_code_version=None, scan_stamp=None, hunt_commit=None),
             BUILD,
             COMMIT,
             "old run, no stamp",
+            None,
         ),
         (
             _run(hunt_code_version=None, scan_stamp=None, hunt_commit=UNKNOWN_VERSION),
             BUILD,
             COMMIT,
             "an unrecorded commit is not a commit",
+            None,
         ),
         (
             _run(hunt_code_version=None, scan_stamp=None),
             BUILD,
             UNKNOWN_VERSION,
             "an editable install on an old run must not mute it",
+            None,
         ),
-        (_run(build_hash=None), BUILD, COMMIT, "a run with no hash cannot be shown to differ"),
-        (_run(), None, COMMIT, "no current hash to compare against"),
-        (_run(build_hash="mixed:3"), BUILD, COMMIT, "a count is not a hash — not comparable"),
-        # new-stamp run whose scan stamp cannot be compared is a caveat, never a refusal
-        (_run(scan_stamp=None), BUILD, COMMIT, "a new run with no scan stamp is unconfirmable"),
+        (
+            _run(build_hash=None),
+            BUILD,
+            COMMIT,
+            "a run with no hash cannot be shown to differ",
+            None,
+        ),
+        (_run(), None, COMMIT, "no current hash to compare against", None),
+        (_run(build_hash="mixed:3"), BUILD, COMMIT, "a count is not a hash — not comparable", None),
+        # new-stamp run whose scan stamp cannot be compared is a caveat, never a refusal — and it
+        # must SAY the scan stamp is what could not be compared, never fall through to "all match".
+        (
+            _run(scan_stamp=None),
+            BUILD,
+            COMMIT,
+            "a new run with no scan stamp is unconfirmable",
+            "scan stamp (",
+        ),
         (
             _run(scan_stamp=_scan(pyelftools=UNKNOWN_VERSION)),
             BUILD,
             COMMIT,
             "an unknown dep leaf is unconfirmable",
+            "scan stamp (",
         ),
     ],
 )
 def test_unconfirmable_is_never_stale(
-    run: RunRow, build: str | None, commit: str, why: str
+    run: RunRow, build: str | None, commit: str, why: str, detail_has: str | None
 ) -> None:
     """★ THE OPPOSITE BAR FROM THE SKIP, AND THE POINT OF SPLITTING THE TWO FUNCTIONS.
 
@@ -327,10 +349,19 @@ def test_unconfirmable_is_never_stale(
 
     MUTATION: make ``run_staleness`` return stale whenever the stamps merely fail to match — every
     row here goes RED while the proven-mismatch test above still passes.
+
+    MUTATION (``detail_has``): make ``run_staleness`` drop the "scan stamp (…)" caveat for a
+    new-stamp run whose scan stamp cannot be compared, so it reads "all match" instead — the two
+    rows that carry ``detail_has`` go RED. Asserting only that ``detail`` is non-empty does not
+    catch it, because the wrong "all match" string is non-empty too; a run reported current when
+    nothing was comparable is the one that serves a stale answer as fresh.
     """
     s = run_staleness(run, build_hash=build, current=CURRENT, commit=commit)
     assert s.stale is False, why
     assert s.detail, "a not-stale reading must still say what could not be compared"
+    if detail_has is not None:
+        assert detail_has in s.detail, why
+        assert s.remedy, why
 
 
 def test_remedy_names_a_runnable_command_only_when_the_firmware_is_recorded() -> None:
@@ -558,6 +589,35 @@ def test_rehunt_overrides_the_skip(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     again = a2.run_analyzer2(db, atlas, source_run_id="r", rehunt=True)
     assert again.skipped is False
     assert again.instances_written == 2  # cmd + the snprintf's own write candidate
+
+
+def test_the_hunt_code_stamp_is_grabbed_once_so_the_skip_and_the_write_agree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``run_analyzer2`` reads the hunt code stamp ONCE at the start; the currency decision and the
+    stamp ``finish_run`` records are the same value, so what is skipped and what is written cannot
+    disagree.
+
+    MUTATION: re-read ``rescan_version.hunt_code_version()`` at the finish_run site instead of
+    reusing the one taken at the start -> the stand-in's second value "B" would be written while the
+    skip judged against "A", and ``call_count`` would be 2.
+    """
+    from treasure_map.lib.hunt import analyzer2 as a2
+
+    monkeypatch.setattr(a2, "installed_commit", lambda: COMMIT)
+    stand_in = MagicMock(side_effect=["A", "B", "C"])
+    monkeypatch.setattr(a2.rescan_version, "hunt_code_version", stand_in)
+    db, atlas = _seeded(tmp_path), tmp_path / "atlas.db"
+
+    a2.run_analyzer2(db, atlas, source_run_id="r", firmware_path="/fw")
+
+    assert stand_in.call_count == 1
+    conn = open_atlas(atlas)
+    try:
+        written = conn.execute("SELECT hunt_code_version FROM run WHERE run_id='r'").fetchone()[0]
+    finally:
+        conn.close()
+    assert written == "A", "finish_run must record the stamp taken at the start, not a re-read"
 
 
 def test_an_unreadable_input_fingerprint_never_skips() -> None:

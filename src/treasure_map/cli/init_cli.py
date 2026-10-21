@@ -27,8 +27,9 @@ _CLIENT_CHOICES = ("claude-code", "codex", "cursor", "claude-desktop", "dsh")
 
 
 def runs_currency(cfg: Config | None) -> RunsCurrency:
-    """How many runs in the atlas an older tmap made — the same classifier ``tmap rescan`` uses,
-    read through a READ-ONLY connection (init never migrates the atlas)."""
+    """How many runs in the atlas the installed tmap's code would scan differently — the same
+    classifier ``tmap rescan`` uses, read through a READ-ONLY connection (init never migrates the
+    atlas)."""
     from treasure_map.cli.hunt_cli import _live_instance_counts, _staleness_tiers
     from treasure_map.lib import rescan_version
     from treasure_map.lib.analyze.ghidra_runner import current_pass_version
@@ -116,7 +117,7 @@ def _next_steps(result: InitResult, any_red: bool) -> None:
     upgrade = [
         "After upgrading tmap (tmap update):",
         "   tmap rescan                                   "
-        "# re-scan every run made by an older tmap",
+        "# re-scan every run this tmap's code would redo",
         "   tmap diff --before fw-v1 --after fw-v2        "
         "# re-runs the diff; stale runs are rescanned first",
     ]

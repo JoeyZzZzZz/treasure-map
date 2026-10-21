@@ -284,6 +284,9 @@ def test_an_unmapped_reason_passes_through_verbatim() -> None:
     assert _reason_human("extraction", novel) == novel
     # and the mapped ones ARE rewritten, so the passthrough is not simply doing nothing
     assert "needs no decompile" in _reason_human("hunt", "hunted by hunt code src-a, running src-b")
+    # the unconfirmable-scan-stamp reason is mapped too (its _REASON_HUMAN entry, audit G13)
+    confirmed = _reason_human("hunt", "scan stamp cannot be confirmed: scan stamp")
+    assert "cannot be confirmed" in confirmed and "rescan needs no decompile" in confirmed
     assert "decompiles 37 binaries" in _reason_human(
         "extraction", "extracted by abc, running def", binaries=37
     )

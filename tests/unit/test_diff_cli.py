@@ -26,6 +26,7 @@ from treasure_map.lib.config.config import load_config
 from treasure_map.lib.diff import driver
 from treasure_map.lib.diff.layer0 import make_diff_id
 from treasure_map.lib.errors import ConfigError
+from treasure_map.lib.rescan_version import CodeStamp
 from treasure_map.lib.storage.connection import open_db
 from treasure_map.version import UNKNOWN_VERSION
 
@@ -254,6 +255,47 @@ def _refused_before_anything(env: Env, res: Result, *, rows: list[Any] | None = 
     assert env.rescans == [] and env.diffs == []
     if rows is not None:
         assert env.diff_ids() == rows
+
+
+_HC = "src-hunthunthunthunt"
+_SC = '{"code":"src-pipe","config":{"xref_fold_edge_threshold":25000},"deps":{"pyelftools":"0.33"}}'
+
+
+def test_the_diff_plan_judges_new_stamp_runs_by_their_code_stamp(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``tmap diff``'s rescan plan (``_diff_rescan_plan``) reads the CODE STAMP of a new-stamp run,
+    not its commit: a pair whose stamps match the running code is diffed with no rescan even though
+    their commits differ, and a run whose scan stamp has moved is rescanned first. The other
+    diff-cli tests build only stampless runs (commit fallback), leaving this branch untested (audit
+    G01).
+
+    MUTATION: in ``_diff_rescan_plan`` judge against a bogus current stamp -> the matching pair is
+    rescanned/refused though its stamps match, and the no-rescan assert goes RED.
+    """
+    monkeypatch.setattr(
+        hunt_cli.rescan_version, "current_code_stamp", lambda _cfg: CodeStamp(hunt=_HC, scan=_SC)
+    )
+    env.run("old")
+    env.run("new")
+    # both current by code stamp, commits differing from each other and from the install
+    env.set_run("old", hunt_code_version=_HC, scan_stamp=_SC, hunt_commit="commit0old")
+    env.set_run("new", hunt_code_version=_HC, scan_stamp=_SC, hunt_commit="commit0new")
+    res = env.diff("old", "new", "--binary", "libx")
+    assert res.exit_code == 0, res.output
+    assert env.rescans == [], "matching code stamps must not trigger a rescan"
+    assert env.diffs == [("old", "new", "libx")]
+
+    # the after-side's scan stamp has moved on one config leaf -> it is rescanned first
+    env.rescans.clear()
+    env.diffs.clear()
+    env.after_fix = {"hunt_code_version": _HC, "scan_stamp": _SC}
+    env.set_run("new", scan_stamp=_SC.replace("25000", "10000"))
+    res2 = env.diff("old", "new", "--binary", "libx")
+    assert res2.exit_code == 0, res2.output
+    assert [r["run_ids"] for r in env.rescans] == [("new",)], (
+        "a moved scan stamp is rescanned first"
+    )
 
 
 # ── the roles ────────────────────────────────────────────────────────────────────────────────

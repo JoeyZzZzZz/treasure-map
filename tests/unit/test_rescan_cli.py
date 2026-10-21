@@ -43,11 +43,11 @@ HCODE = "src-rescan-hunt0"
 OTHER_HCODE = "src-rescan-old00"
 
 
-def _scan(code: str) -> str:
+def _scan(code: str, *, pyelftools: str = "0.33") -> str:
     body = {
         "code": code,
         "config": {"xref_fold_edge_threshold": 25000},
-        "deps": {"pyelftools": "0.33"},
+        "deps": {"pyelftools": pyelftools},
     }
     return json.dumps(body, sort_keys=True, separators=(",", ":"))
 
@@ -94,6 +94,10 @@ def test_a_run_hunted_by_this_code_is_left_alone() -> None:
         _run(hunt_code_version=OTHER_HCODE),  # a different hunt code
         _run(hunt_code_version=None, scan_stamp=None),  # hunted before the code stamp existed
         _run(scan_stamp=OTHER_SCAN),  # the analysis.db was scanned differently
+        # new-stamp runs whose scan stamp cannot be CONFIRMED (not a proven difference) are offered
+        # too — the ``cmp.unknown`` branch. Dropping it would silently leave such a run in place.
+        _run(scan_stamp=None),  # a stamped run whose analysis.db records no scan stamp
+        _run(scan_stamp=_scan("src-rescan-pipe", pyelftools=UNKNOWN_VERSION)),  # a dep leaf unknown
         _run(scan_status="in_progress"),  # never finished
         _run(scan_status="failed"),
     ],
