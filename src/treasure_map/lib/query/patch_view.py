@@ -27,9 +27,13 @@ BUCKETS (``bucket``):
   C  a changed pair (similarity below 1) with no sink candidate on either side.
   P  a function with no counterpart (``presence_state`` from function_presence, ``absent`` when the
      function has no presence record at all).
+  E  an aligned, similarity-1 pair that would otherwise place no entry, whose called function has a
+     direct caller on the A side and none found (or none provable) on the B side — a caller-set edge
+     fact (``callers_a`` / ``callers_b``) similarity is blind to. The ONE bucket this build adds.
 A similarity-1 pair whose candidates all line up, or that has none, places no entry UNLESS a length
-constant changed on one of its candidates (then it is B ``sink_arg_constant_delta``); the rest are
-counted under ``not_listed`` by ``pseudocode_sameness`` (below), never dropped. Where each overlay
+constant changed on one of its candidates (then it is B ``sink_arg_constant_delta``), or its
+caller-set edge reads lost-or-undetermined (then it is E, above); the rest are counted under
+``not_listed`` by ``pseudocode_sameness`` (below), never dropped. Where each overlay
 ``presence_reason`` lands is ``row_landing``; a reason it does not know lands in B as
 ``unmapped_reason:<reason>`` and is counted, never dropped.
 
@@ -61,7 +65,8 @@ TWO SIGNALS SIMILARITY IS BLIND TO (lib/query/sameness), read on the function-pa
   diff + content + build), never in build_diff_view — annotate/promote and the progress block stay
   cheap. A pseudocode_delta is computed only for the page being rendered.
 
-ORDER: A first, then the R and B entries that carry a sink candidate, then the entries with none,
+ORDER: A first, then the R and B entries that carry a sink candidate (E among them when it carries
+one, in its own lane), then the entries with none (recall_gap_sink, R, C, then the E with none),
 then P; inside each, by the named components of ``rank_key`` (visible on every entry). ``tier`` is
 the sink-impact tier of the entry's candidates (lib/query/sink_impact), ``no_sink`` without any.
 
@@ -99,7 +104,7 @@ from treasure_map.lib.ro_db import ro_connect
 from treasure_map.version import UNKNOWN_VERSION
 
 VIEWS = ("sink_patch", "string_edge", "candidate_flat")
-BUCKETS = ("A", "B", "C", "R", "P")
+BUCKETS = ("A", "B", "C", "R", "P", "E")
 SORT_BY = ("tier", "similarity", "address", "significance")
 NO_SINK = "no_sink"
 UNKNOWN = "unknown"
@@ -128,6 +133,14 @@ RECALL_GAP_SINKS: dict[str, tuple[str, ...]] = {
 SINK_CALLEE_NAMES: frozenset[str] = (
     classes.FORMAT | classes.CMD | classes.COPY | classes.FMT_STRING | classes.PATH_SINK
 ).union(*RECALL_GAP_SINKS.values())
+# The recall-gap sink names alone (flattened), for the caller-set edge's relevance ordering: an E
+# entry with no candidate of its own whose callee is one of these leads its lane.
+_RECALL_GAP_NAMES: frozenset[str] = frozenset(
+    name for names in RECALL_GAP_SINKS.values() for name in names
+)
+# How many caller addresses callers_a prints as a sample (the count is always exact).
+_CALLER_SAMPLE = 10
+
 # A sink_callee_swap is narrow when both lists were read in full and neither side differs by more
 # than this many names.
 _SWAP_NARROW_NAMES = 2
@@ -190,6 +203,19 @@ _STRUCTURAL_BLIND_SPOTS = {
         "argument is), so a changed buffer declaration with an unchanged length argument is not "
         "seen"
     ),
+    "caller_via_function_pointer_table": (
+        "a function reached only through a PTR_FUN_ dispatch table or other function-pointer store "
+        "is not in any caller's extracted callee list, so the caller-set reading (callers_a / "
+        "callers_b) does not count it as a direct caller"
+    ),
+    "caller_via_data_reference": (
+        "a function whose address is taken as data rather than called by name is not a direct "
+        "caller in the callee lists, so the caller-set reading does not see that reference"
+    ),
+    "caller_inlined": (
+        "a caller the compiler inlined holds no call to the function, so the caller-set reading "
+        "cannot count it — a function that lost every direct caller may still be reached inlined"
+    ),
 }
 
 _CAVEATS = {
@@ -200,6 +226,22 @@ _CAVEATS = {
     "C": (
         "Neither side has a sink candidate tmap recognizes. This does not mean the change is "
         "unrelated to security."
+    ),
+    "E": (
+        "An aligned, similarity-1 pair whose called function has a direct caller on the A side and "
+        "none found — or none provable — on the B side (callers_a / callers_b). Evidence of a "
+        "caller-set edge similarity cannot see, not a verdict: it does not say the function is "
+        "dead, only that no direct call to it was read on the B side."
+    ),
+    "callers_b": (
+        "The B side's direct callers of this pair's function, read by reverse-scanning extracted "
+        "callee lists by exact name (any side, A / B / C / R / E). state none_found = no caller "
+        "was read AND the B side's lists were complete; undetermined (reason given) = a caller may "
+        "exist but could not be ruled out (a truncated or unreadable callee list, the function not "
+        "in that scan's inventory, or stale sources). tmap's decompile can miss a call and a call "
+        "through a pointer table or a data reference carries no name, so none_found is not proof "
+        "the function is unreferenced. With pairing='proposed' the B side is an undetermined "
+        "pairing, whose function may be the wrong one."
     ),
     "callee_set_differs": (
         "The extracted callee lists differ. tmap's decompile can miss a call, so this is not proof "
@@ -232,6 +274,10 @@ _LEGEND = {
     "R": "the pair itself is undetermined (low confidence, or an export gap)",
     "C": "changed pair, no sink candidate on either side",
     "P": "function with no counterpart",
+    "E": (
+        "similarity-1 pair whose function has a direct caller on the A side and none found (or "
+        "none provable) on the B side — a caller-set edge (callers_a / callers_b)"
+    ),
 }
 
 
@@ -639,6 +685,9 @@ def _atlas_identity(atlas: sqlite3.Connection) -> str:
 _SIZE_FACT_CACHE: _BoundedCache[tuple[str, ...], dict[str, tuple[str, str | None]]] = _BoundedCache(
     16
 )
+# evidence_ref function-entries that hold a candidate, per (run, binary): the caller-set edge's
+# one-hop relevance lands on these. Keyed by the run's stamps so a re-hunt is not served stale.
+_CANDIDATE_ENTRY_CACHE: _BoundedCache[tuple[str, ...], frozenset[str]] = _BoundedCache(16)
 
 
 def _size_facts(atlas: sqlite3.Connection, run_id: str) -> dict[str, tuple[str, str | None]]:
@@ -801,6 +850,17 @@ class _Entry:
     body_status: dict[str, Any] | None = None
     sizes: tuple[int | None, int | None] | None = None
     line_number_form: dict[str, Any] | None = None
+    # The caller-set edge (S3): the A side's direct callers of the pair's function and the B side's
+    # reading of the same, attached to any pair entry (A/B/C/R or the new E) when the A side has a
+    # caller and the B side has none or cannot prove none; None when there is no such signal. A
+    # render/significance fact only — NEVER part of diff_review.entry_facts, so it moves no existing
+    # judgement to needs_recheck. ``pairing`` is ``aligned`` or ``proposed`` (an undetermined pair).
+    # ``caller_relevance`` orders an E entry with no candidate row (0 candidate/recall-gap, 1 a
+    # callee that is itself a candidate, 2 the rest); unused on every other entry.
+    callers_a: dict[str, Any] | None = None
+    callers_b: dict[str, Any] | None = None
+    pairing: str | None = None
+    caller_relevance: int = 2
 
     @property
     def entry_id(self) -> str:
@@ -850,6 +910,11 @@ class _Builder:
             self.callee_block = "analysis_db_unavailable"
         self.unattributed = 0
         self.placed: list[_Entry] = []
+        # side -> (callee_name -> {caller addr}, maybe_truncated): the same-binary reverse-caller
+        # index, built once per side from the callee lists already in memory (_Side.raw), zero extra
+        # SQL. ``maybe_truncated`` is True when ANY function's list was cut, unreadable or does not
+        # record truncation, so a function with no caller there cannot be proven to have none.
+        self._rev: dict[str, tuple[dict[str, set[str]], bool]] = {}
 
     # ── per-ref facts ──
 
@@ -938,6 +1003,20 @@ class _Builder:
             self._place_no_candidate(e)
         if e.bucket in ("A", "B"):
             self._tag_source_gap(e)
+        if p is not None:
+            # The caller-set edge is a field on any pair entry (A/B/C/R); on an aligned pair that
+            # would otherwise place no entry it also PLACES the entry, in the one bucket this build
+            # adds (E). Never on a pair that already has a bucket, so no anchor collides and
+            # not_listed stays conserved.
+            self._caller_signal(e)
+            if not e.bucket and p.aligned and e.callers_b is not None:
+                e.bucket = "E"
+                e.subclass = (
+                    "lost_every_direct_caller"
+                    if e.callers_b["state"] == "none_found"
+                    else "caller_signal_undetermined"
+                )
+                e.caller_relevance = self._e_relevance(e)
         self._ledger(e)
 
     def _best_b(self, e: _Entry) -> str:
@@ -986,6 +1065,151 @@ class _Builder:
         for family, prefixes in SOURCE_GAP_PREFIXES.items():
             if any(n.startswith(prefixes) for n in names):
                 e.facts.append(f"source_gap:{family}")
+
+    # ── the caller-set edge (S3): callers_a / callers_b ──
+
+    def _reverse_index(self, side: str) -> tuple[dict[str, set[str]], bool]:
+        """side -> (callee name -> the addresses that call it, whether that list may be incomplete).
+        Built once from _Side.raw — every function's own callee list, reversed, zero extra SQL. A
+        name a function calls more than once maps to that caller once. ``maybe_truncated`` is True
+        when a function's list was cut, unreadable, or does not record it, so an empty caller set
+        cannot be read as a proven-empty one."""
+        cached = self._rev.get(side)
+        if cached is not None:
+            return cached
+        s = self.sides[side]
+        index: dict[str, set[str]] = {}
+        maybe_truncated = s.error is not None
+        for addr in s.raw:
+            fn = s.fn(addr)
+            if fn is None or fn.callees is None:
+                maybe_truncated = True
+                continue
+            if fn.truncated is not False:  # True (cut) or None (not recorded): a prefix, not proof
+                maybe_truncated = True
+            for callee in fn.callees:
+                index.setdefault(callee, set()).add(addr)
+        self._rev[side] = (index, maybe_truncated)
+        return self._rev[side]
+
+    def _direct_callers(self, side: str, addr: str) -> set[str]:
+        """The addresses that directly call the function at ``addr`` on ``side``, by exact name —
+        its extracted name and its ``FUN_<addr>`` form — itself excluded. Empty when none were read.
+        Read by name, as lib/facts' reverse-caller scan is: a call through a register or a pointer
+        table carries no name and is not here (a structural blind spot)."""
+        index, _ = self._reverse_index(side)
+        callers: set[str] = set()
+        name = self.sides[side].names.get(addr)
+        if name:
+            callers |= index.get(name, set())
+        callers |= index.get(f"FUN_{addr}", set())
+        callers.discard(addr)  # a self-recursive call is not a caller from elsewhere
+        return callers
+
+    def _caller_signal(self, e: _Entry) -> None:
+        """Attach the caller-set edge to a pair entry when the A side's function has a direct caller
+        and the B side has none found (or none provable). Sets callers_a / callers_b / pairing, or
+        leaves them None when there is no edge — the A side has no caller read, or the B side has
+        one. Never writes an empty list as a fact; never emits 'blocked'."""
+        p = e.pair
+        if p is None:
+            return
+        # A caller must be READ for the edge to exist: a side that could not be read, or whose
+        # function is not in that scan's inventory, yields no n_a — "has a caller" is never claimed
+        # on absence.
+        if self.sides["a"].error is not None or self.sides["a"].fn(p.addr_a) is None:
+            return
+        callers_a = self._direct_callers("a", p.addr_a)
+        if not callers_a:
+            return
+        state = self._callers_b_state(p)
+        if state is None:  # the B side has a caller too: no edge
+            return
+        e.callers_a = {"count": len(callers_a), "sample": sorted(callers_a)[:_CALLER_SAMPLE]}
+        e.callers_b = state
+        e.pairing = "aligned" if p.aligned else "proposed"
+
+    def _callers_b_state(self, p: _Pair) -> dict[str, Any] | None:
+        """The B side's reading of the pair's function's direct callers: None when a caller WAS read
+        (no edge); {state: none_found} when none was read and the lists were complete and in
+        inventory; else {state: undetermined, reason}. The order is honest: a stale or unavailable
+        source, then a function the B scan does not hold, then a list that may be truncated, before
+        a proven none_found."""
+        if self.callee_block == "source_stale":
+            return {"state": "undetermined", "reason": "source_stale"}
+        if self.callee_block == "analysis_db_unavailable":
+            return {"state": "undetermined", "reason": "analysis_db_unavailable"}
+        if self.sides["b"].fn(p.addr_b) is None:
+            return {"state": "undetermined", "reason": "not_in_inventory"}
+        if self._direct_callers("b", p.addr_b):
+            return None
+        if self._reverse_index("b")[1]:  # the B side's lists may be incomplete
+            return {"state": "undetermined", "reason": "callees_may_be_truncated"}
+        return {"state": "none_found"}
+
+    def _e_relevance(self, e: _Entry) -> int:
+        """An E entry's ordering tier within its lane: 0 when it carries a candidate row of its own
+        or calls a sink the hunt does not recall, 1 when a callee is itself a sink candidate (one
+        hop from a candidate), else 2."""
+        if e.tier != NO_SINK:
+            return 0
+        names = self._both_callees(e.pair)[0] if e.pair is not None else set()
+        if names & _RECALL_GAP_NAMES:
+            return 0
+        return 1 if self._calls_candidate(e) else 2
+
+    def _candidate_entries(self, side: str) -> frozenset[str]:
+        """The function entries that hold a sink candidate on ``side``'s binary (one hop lands on
+        one of these). Read from the instance table once per (run, binary) and cached across diffs
+        and pages — the run's stamps are in the key so a re-hunt is not served a stale set."""
+        run = self.diff.run_a if side == "a" else self.diff.run_b
+        sha = self.diff.sha_a if side == "a" else self.diff.sha_b
+        stamp = self.atlas.execute(
+            "SELECT build_hash, hunt_commit, updated_at FROM run WHERE run_id = ?", (run,)
+        ).fetchone()
+        key = (
+            _atlas_identity(self.atlas),
+            run,
+            sha or "",
+            *(str(v or "") for v in (stamp or (None, None, None))),
+        )
+        hit = _CANDIDATE_ENTRY_CACHE.get(key)
+        if hit is not None:
+            return hit
+        entries: set[str] = set()
+        for (ref,) in self.atlas.execute(
+            "SELECT evidence_ref FROM instance WHERE source_run_id = ? AND binary_content_hash = ?",
+            (run, sha),
+        ):
+            fe = _func_entry_hex(ref) if ref else None
+            if fe is not None:
+                entries.add(fe)
+        result = frozenset(entries)
+        _CANDIDATE_ENTRY_CACHE[key] = result
+        return result
+
+    def _calls_candidate(self, e: _Entry) -> bool:
+        """Whether either side's function calls a function that itself holds a sink candidate,
+        resolved by address (a ``FUN_<addr>`` callee) or by name (``_Side.by_name``)."""
+        p = e.pair
+        if p is None:
+            return False
+        for side, addr in (("a", p.addr_a), ("b", p.addr_b)):
+            s = self.sides[side]
+            fn = s.fn(addr)
+            if fn is None or not fn.callees:
+                continue
+            cands = self._candidate_entries(side)
+            for name in fn.callees:
+                m = _FUN_RE.fullmatch(name)
+                addrs = (
+                    [a for a in [norm_hex(m.group(1))] if a is not None]
+                    if m is not None
+                    else s.by_name.get(name, [])
+                )
+                if any(a in cands for a in addrs):
+                    return True
+        return False
 
     def _tier(self, rows: list[SinkOverlayRow]) -> int | str:
         """The highest impact tier of the entry's candidates; ``unknown`` when no class could be
@@ -1235,6 +1459,10 @@ class _Builder:
         if e.subclass.startswith("recall_gap_sink:"):
             spots.append(e.subclass)
         spots += [f for f in e.facts if f.startswith("source_gap:")]
+        if e.callers_b is not None and e.callers_b["state"] == "undetermined":
+            # The B side's caller set could not be proven empty — a countable blind spot on THIS
+            # entry (the structural ones a caller is missed through are in _STRUCTURAL_BLIND_SPOTS).
+            spots.append(f"callers_undetermined:{e.callers_b['reason']}")
         for v in e.row_views:
             if "wrapper_granularity_blind" in v.get("facts", ()):
                 spots.append("wrapper_granularity_blind")
@@ -1298,6 +1526,26 @@ def _rank(e: _Entry) -> dict[str, Any]:
         return {"segment": 4, "tier": t, "side": side, "address": e.address}
     if e.bucket == "A":
         return {"segment": 1, "tier": t, "similarity": sim_key, "address": e.address}
+    if e.bucket == "E":
+        # The caller-set edge entry. With a candidate of its own it joins segment 2 in its own lane
+        # (after R lane 0 and B lane 1); with none it joins segment 3 in its own lane, ordered by
+        # caller_relevance. Lanes 2 / 3 are E's alone and leave the R/B lane meanings untouched.
+        if e.tier != NO_SINK:
+            return {
+                "segment": 2,
+                "tier": t,
+                "lane": 2,
+                "subclass_rank": 0,
+                "similarity": sim_key,
+                "address": e.address,
+            }
+        return {
+            "segment": 3,
+            "lane": 3,
+            "subclass_rank": e.caller_relevance,
+            "similarity": sim_key,
+            "address": e.address,
+        }
     if e.tier != NO_SINK:
         return {
             "segment": 2,
@@ -1317,10 +1565,15 @@ def _rank(e: _Entry) -> dict[str, Any]:
     }
 
 
-def _default_key(r: dict[str, Any], band: int = 0) -> tuple[Any, ...]:
+def _default_key(r: dict[str, Any], band: int = 0, e_mention: int = 0) -> tuple[Any, ...]:
     """The default order's key. ``band`` (the judgement band, 0 when it is off) sits after the
     first four components and before similarity, so it only ever reorders entries those four
-    already hold together — never across a segment, a tier, a lane or a subclass rank."""
+    already hold together — never across a segment, a tier, a lane or a subclass rank. ``e_mention``
+    (0 off) is the caller-set edge's B-no-mention key: it is passed ONLY in the significance order,
+    and only for E entries, so it never changes the default order, the rank_key or ViewReview's
+    position — the cheap layers that cannot read pseudocode and so cannot compute it. It sits inside
+    E's own lane (segment 3 subclass rank's tie slot, or segment 2 just before the address), after
+    the relevance tier and before the address."""
     seg = r["segment"]
     if seg == 1:
         return (1, -r["tier"], 0, 0, band, r["similarity"], "", r["address"])
@@ -1332,11 +1585,20 @@ def _default_key(r: dict[str, Any], band: int = 0) -> tuple[Any, ...]:
             r["subclass_rank"],
             band,
             r["similarity"],
-            "",
+            e_mention,
             r["address"],
         )
     if seg == 3:
-        return (3, r["lane"], r["subclass_rank"], 0, band, r["similarity"], "", r["address"])
+        return (
+            3,
+            r["lane"],
+            r["subclass_rank"],
+            e_mention,
+            band,
+            r["similarity"],
+            "",
+            r["address"],
+        )
     return (4, -r["tier"], 0, 0, band, 0.0, r["side"], r["address"])
 
 
@@ -1565,7 +1827,11 @@ def significance(
         stops it at 1; or, after both, a bucket C entry carrying a narrow
         :func:`_sink_callee_swap` -> 1, labelled ``sink_callee_swap_never_sunk`` (the only basis
         the swap ever takes: elsewhere it is a field, and orders entries inside attention 1
-        through ``_sort``);
+        through ``_sort``); or, last, the caller-set edge: an E entry -> 1 (basis
+        ``lost_every_direct_caller_never_sunk`` for a proven-none B side, else
+        ``caller_signal_undetermined_never_sunk``), and any other entry whose B side is a proven
+        none_found -> 1, ``lost_every_direct_caller_never_sunk`` (an undetermined edge on an
+        already-listed entry does not move it);
       * an undetermined pair flagged :func:`_anchored_micro_side` (micro-stub vs real body) -> 1,
         labelled ``anchored_micro_side``, BEFORE anchored_differs so a pair that is both reads as
         the micro side;
@@ -1573,7 +1839,19 @@ def significance(
         ``anchored_differs``: still attention 1 (an R entry never reaches 0 or 2 on it), ordered
         first inside it (``read_first`` in :func:`_sort`);
       * everything else -> 1, ordered by similarity, lowest first. ``identical_text_unverified``
-        is never sunk outside C."""
+        is never sunk outside C.
+
+    The caller-set edge (S3): a bucket-E entry is always attention 1 (basis
+    ``lost_every_direct_caller_never_sunk`` for a proven-none B side, else
+    ``caller_signal_undetermined_never_sunk``) — read FIRST, since E is listed for that edge alone,
+    so its basis never reads as the generic ``similarity`` fall-through. On a NON-E entry the edge
+    only holds one off the bottom, in the identical / C branch below, and only for a proven
+    none_found — never an undetermined edge on an already-listed entry."""
+    if e.bucket == "E":
+        cb = e.callers_b
+        if cb is not None and cb["state"] == "none_found":
+            return ATTENTION_MIDDLE, "lost_every_direct_caller_never_sunk"
+        return ATTENTION_MIDDLE, "caller_signal_undetermined_never_sunk"
     if e.bucket == "A":
         return ATTENTION_FLOAT, "matched_call_other_callee"
     if any("sink_arg_constant_delta" in v for v in e.row_views):
@@ -1594,6 +1872,11 @@ def significance(
         # bucket C entry that would otherwise sink is held at 1 by it.
         if e.bucket == "C" and (swap := _sink_callee_swap(e)) is not None and swap["narrow"]:
             return ATTENTION_MIDDLE, "sink_callee_swap_never_sunk"
+        # The caller-set edge (S3) holds a NON-E entry off the bottom too, LAST so it never replaces
+        # a basis above, and only when the B side is a proven none — an undetermined edge on an
+        # already-listed entry does not move it (E, which IS listed for the edge, is handled first).
+        if e.callers_b is not None and e.callers_b["state"] == "none_found":
+            return ATTENTION_MIDDLE, "lost_every_direct_caller_never_sunk"
         return ATTENTION_SINK, basis
     if e.bucket == "P":
         return ATTENTION_MIDDLE, "no_counterpart"
@@ -1613,6 +1896,7 @@ def _sort(
     settled: dict[str, int] | None = None,
     read_first: dict[str, int] | None = None,
     swap_lift: dict[str, int] | None = None,
+    mention: dict[str, int] | None = None,
 ) -> list[_Entry]:
     """The default order, or ``sort_by`` (one named component) ahead of it. P stays last either
     way: a function with no counterpart is not ordered among the pairs. ``band`` maps an entry id
@@ -1640,7 +1924,7 @@ def _sort(
                 band.get(e.entry_id, 0) if band else 0,
                 (settled or {}).get(e.entry_id, 0),
                 r.get("similarity", -1.0),
-                *_default_key(r, 0),
+                *_default_key(r, 0, (mention or {}).get(e.entry_id, 0)),
             )
         if sort_by == "tier":
             head: tuple[Any, ...] = (-r["tier"] if "tier" in r else 1,)
@@ -1730,6 +2014,13 @@ def _entry_json(e: _Entry) -> dict[str, Any]:
             "coclaimed_by": coclaimed or None,
             "callee_set": e.callee_set,
             **({"sink_callee_swap": swap} if swap is not None else {}),
+            # The caller-set edge (S3): present only when it exists; a field on any pair entry,
+            # never in diff_review.entry_facts, so it moves no existing judgement.
+            **(
+                {"pairing": e.pairing, "callers_a": e.callers_a, "callers_b": e.callers_b}
+                if e.callers_b is not None
+                else {}
+            ),
             "facts": sorted(set(e.facts)),
             "blind_spots": e.blind_spots,
             "string_edges": e.string_edges,
@@ -1886,6 +2177,8 @@ class BuiltDiff:
     placed: list[_Entry]  # every entry placed, listed or not; empty when withheld
     withheld: dict[str, Any] | None  # set when the whole diff is undetermined
     unavailable: dict[str, str]
+    b_names: dict[str, str]  # the B side's function addr -> extracted name (the caller-set edge's
+    # no-mention reading tokenises the B bodies for these names); empty when withheld
 
 
 def build_diff_view(atlas: sqlite3.Connection, diff_id: str) -> BuiltDiff | None:
@@ -1918,6 +2211,7 @@ def build_diff_view(atlas: sqlite3.Connection, diff_id: str) -> BuiltDiff | None
     placed: list[_Entry] = []
     withheld: dict[str, Any] | None = None
     unavailable: dict[str, str] = {}
+    b_names: dict[str, str] = {}
     unattributed = 0
     if any(b.startswith("diff_undetermined:") for b in banners):
         by_reason: dict[str, int] = {}
@@ -1935,6 +2229,7 @@ def build_diff_view(atlas: sqlite3.Connection, diff_id: str) -> BuiltDiff | None
         placed = builder.placed
         unattributed = builder.unattributed
         unavailable = {s: str(builder.sides[s].error) for s in builder.unavailable}
+        b_names = dict(builder.sides["b"].names)
         for e in entries:
             key = f"a:{e.pair.addr_a}" if e.pair is not None else e.entry_id
             e.string_edges = edges_by_anchor.get(key)
@@ -1952,6 +2247,7 @@ def build_diff_view(atlas: sqlite3.Connection, diff_id: str) -> BuiltDiff | None
         placed=placed,
         withheld=withheld,
         unavailable=unavailable,
+        b_names=b_names,
     )
 
 
@@ -1996,6 +2292,9 @@ class _Readings:
     sources: tuple[tuple[str | None, str | None], tuple[str | None, str | None]]
     aligned: _PairReads
     undetermined: _PairReads
+    # The B-side addresses of the E entries' functions that ANOTHER B function's pseudocode mentions
+    # by name (the caller-set edge's no-mention ordering key); empty when the diff has no E entry.
+    b_mentions: frozenset[str] = frozenset()
 
 
 # Process-wide caches of the expensive read, per (diff_id, sha_a, sha_b, build_hash_a,
@@ -2005,6 +2304,10 @@ class _Readings:
 _PSEUDO_READING_CACHE: _BoundedCache[tuple[str, ...], _PairReads] = _BoundedCache(32)
 _UNDETERMINED_READING_CACHE: _BoundedCache[tuple[str, ...], _PairReads] = _BoundedCache(32)
 _DELTA_CACHE: _BoundedCache[tuple[Any, ...], dict[str, Any]] = _BoundedCache(4096)
+# The no-mention index of the caller-set edge, on the SAME key as the pseudocode readings: computed
+# when the B bodies are read (never a second read of them), so every page of one diff reads the
+# same set in the same order.
+_B_MENTIONS_CACHE: _BoundedCache[tuple[str, ...], frozenset[str]] = _BoundedCache(32)
 _ELSEWHERE_SAMPLE = 3  # addresses shown of a body found elsewhere
 
 
@@ -2014,7 +2317,9 @@ def _clear_view_caches() -> None:
     _PSEUDO_READING_CACHE.clear()
     _UNDETERMINED_READING_CACHE.clear()
     _DELTA_CACHE.clear()
+    _B_MENTIONS_CACHE.clear()
     _SIZE_FACT_CACHE.clear()
+    _CANDIDATE_ENTRY_CACHE.clear()
 
 
 def _run_source(atlas: sqlite3.Connection, run_id: str) -> tuple[str | None, str | None]:
@@ -2121,7 +2426,8 @@ def _pseudo_readings(atlas: sqlite3.Connection, built: BuiltDiff) -> _Readings:
     )
     aligned = _PSEUDO_READING_CACHE.get(key)
     undetermined = _UNDETERMINED_READING_CACHE.get(key)
-    if aligned is None or undetermined is None:
+    mentions = _B_MENTIONS_CACHE.get(key)
+    if aligned is None or undetermined is None or mentions is None:
         ba = sameness.read_function_bodies(pa, d.sha_a)
         bb = sameness.read_function_bodies(pb, d.sha_b)
         ra = sameness.read_image_ranges(pa, d.sha_a)
@@ -2135,7 +2441,40 @@ def _pseudo_readings(atlas: sqlite3.Connection, built: BuiltDiff) -> _Readings:
         if undetermined is None:
             undetermined = _read_undetermined(ba, bb, [p for p in pairs if not p.aligned], ra, rb)
             _UNDETERMINED_READING_CACHE[key] = undetermined
-    return _Readings(key, ((pa, d.sha_a), (pb, d.sha_b)), aligned, undetermined)
+        if mentions is None:
+            mentions = _b_other_fn_mentions(bb, built)
+            _B_MENTIONS_CACHE[key] = mentions
+    return _Readings(key, ((pa, d.sha_a), (pb, d.sha_b)), aligned, undetermined, mentions)
+
+
+def _b_other_fn_mentions(bb: sameness.Bodies | None, built: BuiltDiff) -> frozenset[str]:
+    """The B-side addresses of the E entries' functions that ANOTHER B function's pseudocode
+    mentions by an identifier token — the function's extracted name or its ``FUN_<addr>`` form,
+    its OWN body excluded. The token index over every B body is built once and only when the diff
+    has an E entry, so a diff with none pays nothing. Comment and string tokens are not mentions."""
+    targets = [
+        (e.pair.addr_b, built.b_names.get(e.pair.addr_b))
+        for e in built.entries
+        if e.bucket == "E" and e.pair is not None
+    ]
+    if not targets or not bb:
+        return frozenset()
+    tok2addr: dict[str, set[str]] = {}
+    for addr, body in bb.items():
+        text = body.get("pseudocode")
+        if not text:
+            continue
+        for kind, tok in sameness._tokens(text):
+            if kind == "ident":
+                tok2addr.setdefault(tok, set()).add(addr)
+    mentioned: set[str] = set()
+    for addr_b, name in targets:
+        wanted = {f"FUN_{addr_b}"}
+        if name:
+            wanted.add(name)
+        if any(tok2addr.get(w, set()) - {addr_b} for w in wanted):
+            mentioned.add(addr_b)
+    return frozenset(mentioned)
 
 
 def _aligned_read(e: _Entry, readings: _Readings) -> _Read | None:
@@ -2533,7 +2872,9 @@ _SIGNIFICANCE_LENS = (
     "A. Never sunk: an R entry (attention 2 never holds one; one whose proposed_pair_reading is "
     "identical_unique closes attention 1 instead), a B sink_present_no_visible_delta (labelled "
     "recheckable_no_visible_delta), an identical_text_unverified entry outside bucket C, a bucket "
-    "C entry with a narrow sink_callee_swap, and an "
+    "C entry with a narrow sink_callee_swap, an E entry or any entry whose B side lost every "
+    "direct caller (caller-set edge: basis lost_every_direct_caller_never_sunk, or "
+    "caller_signal_undetermined_never_sunk for an E whose B side could not be proven), and an "
     "entry judged changed_real, inconclusive or due a re-check / relabel — none of them reaches "
     "attention 2, whether band is on or off. A bucket C entry is sunk even when its text match is "
     "identical_text_unverified; sunk_with_body_size_differs counts the sunk ones whose two body "
@@ -3124,6 +3465,14 @@ def get_diff_patch_view(
     for e in chosen:
         if e.entry_id in proposed and (order := _read_first_order(e, proposed[e.entry_id][0])):
             read_first[e.entry_id] = order
+    # The caller-set edge's no-mention key: 0 when no OTHER B function names this E entry's function
+    # (read first inside its lane), 1 when one does. E entries only; it reaches the order through
+    # _default_key under significance alone, so it never touches the default order or the rank_key.
+    mention = {
+        e.entry_id: (0 if e.pair is not None and e.pair.addr_b not in readings.b_mentions else 1)
+        for e in chosen
+        if e.bucket == "E"
+    }
     bands = review.bands() if band else None
     if anchored_differs and sort_by is None:
         ordered = _anchored_order(chosen, read_first, bands)
@@ -3136,6 +3485,7 @@ def get_diff_patch_view(
             settled,
             read_first,
             swap_lift,
+            mention,
         )
     end = offset + limit
     page = ordered[offset:end]
@@ -3152,6 +3502,10 @@ def get_diff_patch_view(
         out.update(window)
         if one is not None:
             out["rows_offset"] = rows_offset or 0
+        if e.bucket == "E":
+            # Whether another B function names this one (the no-mention ordering key, as an honest
+            # field). A read-face fact: the index is in readings, never in the cheap build layer.
+            out["b_other_fn_mentions"] = e.pair is not None and e.pair.addr_b in readings.b_mentions
         state = _sameness_of(e, readings)
         read = _aligned_read(e, readings)
         if state is not None and read is not None and e.pair is not None:

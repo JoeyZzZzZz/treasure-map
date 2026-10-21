@@ -58,7 +58,7 @@ if TYPE_CHECKING:  # typing only — patch_view imports this module
 
 SUBJECT_KINDS = ("function_pair", "function_presence", "candidate")
 STATES = (UNSEEN, OPEN, CONCLUDED, NEEDS_RELABEL, NEEDS_RECHECK)
-BUCKET_ORDER = ("A", "B", "C", "R", "P")
+BUCKET_ORDER = ("A", "B", "C", "R", "P", "E")
 
 # The basis states a judgement on a diff entry can read with. Only ``unchanged`` leaves its review
 # state to the verdict; ``anchor_unresolved`` is what dangling means.

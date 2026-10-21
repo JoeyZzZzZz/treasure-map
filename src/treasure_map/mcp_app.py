@@ -1772,8 +1772,11 @@ def make_tools(
         ``sink_presence_signal:*`` sorts first, then ``sink_arg_constant_delta``, then the rest;
         ``R`` = the pair itself is undetermined; ``C`` = a changed pair with no sink candidate on
         either side (``no_sink_candidate_unchecked`` when the callee lists could not be read);
-        ``P`` = a function with no counterpart. A similarity-1 pair whose candidates line up, or
-        that has none, is not listed UNLESS a length constant changed; the rest are counted under
+        ``P`` = a function with no counterpart; ``E`` = a similarity-1 pair whose function has a
+        direct caller on the A side and none found (or none provable) on the B side — a caller-set
+        edge (``callers_a`` / ``callers_b``) similarity is blind to. A similarity-1 pair whose
+        candidates line up, or that has none, is not listed UNLESS a length constant changed or its
+        caller-set edge reads lost-or-undetermined (then E); the rest are counted under
         ``not_listed`` by ``pseudocode_sameness`` (below).
 
         Order: A, then the R / B entries carrying a candidate (by ``tier`` — the candidates'
@@ -1790,7 +1793,10 @@ def make_tools(
         (attention 2 never holds one; one whose proposed reading is ``identical_unique`` closes
         attention 1), a ``sink_present_no_visible_delta`` B (labelled
         ``recheckable_no_visible_delta``), an ``identical_text_unverified`` entry outside bucket
-        C, a bucket C entry with a narrow ``sink_callee_swap``, and an entry judged changed_real,
+        C, a bucket C entry with a narrow ``sink_callee_swap``, a bucket E entry or any entry whose
+        B side lost every direct caller (caller-set edge: basis
+        ``lost_every_direct_caller_never_sunk``, or ``caller_signal_undetermined_never_sunk`` for an
+        E whose B side could not be proven empty), and an entry judged changed_real,
         inconclusive or due a re-check / relabel — none of them reaches attention 2, whether
         ``band`` is on or off; only with ``band=true`` does the judgement band order entries
         inside each tier. A bucket C entry sinks even when its text match is unverified;

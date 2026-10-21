@@ -27,6 +27,7 @@ from treasure_map.lib.analyze.ghidra_runner import current_pass_version
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.diff import code_version as cv
 from treasure_map.lib.query import diff_align as da
+from treasure_map.lib.query import diff_review as dr
 from treasure_map.lib.query import patch_view as pv
 from treasure_map.lib.query import sameness
 from treasure_map.lib.query import sink_overlay as so
@@ -4500,3 +4501,322 @@ def test_the_lens_and_the_tool_name_the_swap() -> None:
     tool = mcp_app.make_tools(Path("unused.db"))["get_diff_patch_view"]
     assert "sink_callee_swap" in (tool.__doc__ or "")
     assert "named_callees_differ" in (tool.__doc__ or "")
+
+
+# ── S3: the caller-set edge (callers_a / callers_b) and bucket E ───────────────────────────────
+
+
+def _built_entry(w: World, entry_id: str) -> pv._Entry:
+    """The listed _Entry object (for reading entry_facts / rank), by its entry_id."""
+    built = pv.build_diff_view(w.atlas, DIFF)
+    assert built is not None
+    for e in built.entries:
+        if e.entry_id == entry_id:
+            return e
+    raise AssertionError(f"{entry_id} is not listed")
+
+
+def test_a_caller_set_edge_lists_and_holds_a_similarity_1_pair(
+    tmp_path: Path, current: None
+) -> None:
+    """★ S3: a similarity-1 aligned pair that would place no entry is listed as bucket E when its
+    A-side function has a direct caller and its B-side counterpart has none found; the edge holds it
+    at attention 1, never sunk, basis lost_every_direct_caller_never_sunk.
+
+    MUTATION: do not place E (leave the pair not_listed) -> RED; sink E at attention 2 -> RED; read
+    the B side's callers from the A index -> callers_b non-empty, no E -> RED."""
+    w = World(tmp_path)
+    w.pair("00001000", "00002000", 0.97, 1.0)
+    w.fn("a", "00001000", ["helper"], name="target_x", pseudocode="return helper();")
+    w.fn("b", "00002000", ["helper"], name="target_x", pseudocode="return helper();")
+    w.fn("a", "00000100", ["target_x"], name="a_caller")  # calls target_x on A
+    w.fn("b", "00000200", ["other"], name="b_other")  # does NOT call target_x on B
+    w.commit()
+    pid = _pair_id("00001000", "00002000")
+    e = _entry(w, pid, sort_by="significance")
+    assert e["bucket"] == "E"
+    assert e["callers_a"]["count"] == 1
+    assert e["callers_a"]["sample"] == ["00000100"]
+    assert e["callers_b"] == {"state": "none_found"}
+    assert e["pairing"] == "aligned"
+    assert e["significance"] == {"attention": 1, "basis": "lost_every_direct_caller_never_sunk"}
+
+
+def test_a_b_side_caller_means_no_edge_and_no_e(tmp_path: Path, current: None) -> None:
+    """A pair whose B-side function HAS a direct caller carries no edge: no callers field, no E, and
+    the pair stays counted under not_listed (a similarity-1 pair with nothing to say).
+
+    MUTATION: emit callers_b as an empty-list fact / 'blocked' when a caller exists -> RED; place E
+    anyway -> RED."""
+    w = World(tmp_path)
+    w.pair("00001000", "00002000", 0.97, 1.0)
+    w.fn("a", "00001000", ["helper"], name="target_x")
+    w.fn("b", "00002000", ["helper"], name="target_x")
+    w.fn("a", "00000100", ["target_x"], name="a_caller")
+    w.fn("b", "00000200", ["target_x"], name="b_caller")  # B calls target_x -> confirmed-has
+    w.commit()
+    v = _view(w, sort_by="significance")
+    pid = _pair_id("00001000", "00002000")
+    assert pid not in v["by_id"]  # not listed
+    assert sum(c["count"] for c in v["not_listed"].values()) == 1  # still counted, never dropped
+    # nothing anywhere claims a caller was lost or blocked
+    for e in v["entries"]:
+        assert "callers_a" not in e and "callers_b" not in e
+        assert "blocked" not in e
+
+
+def test_the_b_side_undetermined_edges_are_never_lost(tmp_path: Path, current: None) -> None:
+    """The B side being undetermined — a function the scan does not hold (not_in_inventory), or a
+    callee list that may be truncated — is an E entry with an undetermined callers_b and a countable
+    blind spot, never dropped and never read as none_found.
+
+    MUTATION: treat an undetermined B side as none_found -> basis lost_every... -> RED; drop the E
+    placement on an undetermined B side -> RED; omit the callers_undetermined blind spot -> RED."""
+    # not_in_inventory: the B function is absent from the analysis.db.
+    w = World(tmp_path)
+    w.pair("00001000", "00002000", 0.97, 1.0)
+    w.fn("a", "00001000", ["helper"], name="target_ni")
+    w.fn("a", "00000100", ["target_ni"], name="a_caller")
+    w.commit()
+    e = _entry(w, _pair_id("00001000", "00002000"), sort_by="significance")
+    assert e["bucket"] == "E"
+    assert e["callers_b"] == {"state": "undetermined", "reason": "not_in_inventory"}
+    assert e["significance"] == {"attention": 1, "basis": "caller_signal_undetermined_never_sunk"}
+    assert "callers_undetermined:not_in_inventory" in e["blind_spots"]
+
+    # callees_may_be_truncated: a (any) B function's callee list is a prefix, so no empty caller set
+    # can be proven on that side.
+    w2 = World(tmp_path / "t2")
+    w2.pair("00001000", "00002000", 0.97, 1.0)
+    w2.fn("a", "00001000", ["helper"], name="target_t")
+    w2.fn("b", "00002000", ["helper"], name="target_t")
+    w2.fn("a", "00000100", ["target_t"], name="a_caller")
+    w2.fn("b", "00000300", ["x"], name="b_cut", truncated=1)  # B side maybe-truncated
+    w2.commit()
+    e2 = _entry(w2, _pair_id("00001000", "00002000"), sort_by="significance")
+    assert e2["bucket"] == "E"
+    assert e2["callers_b"] == {"state": "undetermined", "reason": "callees_may_be_truncated"}
+    assert e2["significance"] == {"attention": 1, "basis": "caller_signal_undetermined_never_sunk"}
+    assert "callers_undetermined:callees_may_be_truncated" in e2["blind_spots"]
+
+
+def test_an_existing_entry_is_held_only_on_a_proven_none(tmp_path: Path, current: None) -> None:
+    """On an entry that is ALREADY listed, the edge holds it off the bottom only when the B side is
+    a proven none_found; an undetermined B side leaves it to sink (it is already listed, so there is
+    nothing to place and nothing to float on a maybe).
+
+    MUTATION: lift an existing entry on an undetermined B side -> RED; stop lifting an existing
+    entry on a proven none_found -> RED."""
+    w = World(tmp_path)
+    # A changed pair with no candidate -> C; its A function has a caller, its B none -> held at 1.
+    w.pair("00001000", "00002000", 0.97, 0.6)
+    w.fn("a", "00001000", ["memset"], name="held_c", pseudocode="memset(b,0,8);")
+    w.fn("b", "00002000", ["memset"], name="held_c", pseudocode="memset(b,0,9);")
+    w.fn("a", "00000100", ["held_c"], name="a_caller")
+    # A changed pair with no candidate whose B function is absent (not_in_inventory) -> C, sinks.
+    w.pair("00003000", "00004000", 0.97, 0.6)
+    w.fn("a", "00003000", ["memcpy"], name="sunk_c", pseudocode="memcpy(b,s,8);")
+    w.fn("a", "00000110", ["sunk_c"], name="a_caller2")
+    w.commit()
+    v = _view(w, sort_by="significance")["by_id"]
+    held = v[_pair_id("00001000", "00002000")]
+    assert held["bucket"] == "C"
+    assert held["callers_b"] == {"state": "none_found"}
+    assert held["significance"] == {
+        "attention": 1,
+        "basis": "lost_every_direct_caller_never_sunk",
+    }
+    sunk = v[_pair_id("00003000", "00004000")]
+    assert sunk["bucket"] == "C"
+    assert sunk["callers_b"]["state"] == "undetermined"
+    assert sunk["significance"]["attention"] == 2  # not held on a maybe
+
+
+def test_a_candidate_bearing_edge_entry_takes_segment_2_lane_2(
+    tmp_path: Path, current: None
+) -> None:
+    """An E entry that carries a persisted candidate of its own joins segment 2 in lane 2 (after the
+    R lane 0 and B lane 1 that carry a candidate); one with none joins segment 3, lane 3.
+
+    MUTATION: give a candidate-bearing E segment 3 / lane != 2 -> RED."""
+    w = World(tmp_path)
+    a, b = "runA", "runB"
+    # candidate-bearing E: a persisted candidate lines up on both sides, pair similarity 1.
+    w.pair("00001000", "00002000", 0.97, 1.0)
+    w.inst("a", _ref(a, "00001000", "cmd", "0x10"), "cmd", "system")
+    w.inst("b", _ref(b, "00002000", "cmd", "0x10"), "cmd", "system")
+    w.im("00001010", "00002010", "00001000")
+    w.fn("a", "00001000", ["system"], name="cand_e")
+    w.fn("b", "00002000", ["system"], name="cand_e")
+    w.fn("a", "00000100", ["cand_e"], name="a_caller")
+    # no-candidate E, for the lane-3 contrast.
+    w.pair("00003000", "00004000", 0.97, 1.0)
+    w.fn("a", "00003000", ["helper"], name="plain_e")
+    w.fn("b", "00004000", ["helper"], name="plain_e")
+    w.fn("a", "00000110", ["plain_e"], name="a_caller2")
+    w.commit()
+    cand = _built_entry(w, _pair_id("00001000", "00002000"))
+    assert cand.bucket == "E" and cand.tier != pv.NO_SINK
+    assert cand.rank["segment"] == 2 and cand.rank["lane"] == 2 and cand.rank["subclass_rank"] == 0
+    plain = _built_entry(w, _pair_id("00003000", "00004000"))
+    assert plain.bucket == "E" and plain.tier == pv.NO_SINK
+    assert plain.rank["segment"] == 3 and plain.rank["lane"] == 3
+
+
+def test_the_edge_is_never_a_judgement_basis(tmp_path: Path, current: None) -> None:
+    """callers_a / callers_b / pairing are a render-face fact, never part of
+    diff_review.entry_facts, so adding them moves no existing judgement to needs_recheck.
+
+    MUTATION: put callers_* into entry_facts -> the keys appear -> RED."""
+    w = World(tmp_path)
+    w.pair("00001000", "00002000", 0.97, 1.0)
+    w.fn("a", "00001000", ["helper"], name="target_x")
+    w.fn("b", "00002000", ["helper"], name="target_x")
+    w.fn("a", "00000100", ["target_x"], name="a_caller")
+    w.commit()
+    e = _built_entry(w, _pair_id("00001000", "00002000"))
+    assert e.callers_b is not None  # the edge is present on the entry
+    facts = dr.entry_facts(e)
+    assert "callers_a" not in facts and "callers_b" not in facts and "pairing" not in facts
+    assert set(facts) == {
+        "alignment_state",
+        "similarity",
+        "export_gap_a",
+        "export_gap_b",
+        "bucket",
+        "rows",
+    }
+
+
+def test_the_edge_never_rebuckets_an_already_listed_pair(tmp_path: Path, current: None) -> None:
+    """E is placed ONLY on a pair that would otherwise place no entry; a pair already in a bucket
+    keeps it and carries the edge as a field alone, anchored on the pair like any entry, so no
+    anchor collides and the subjects stay conserved.
+
+    MUTATION: drop the 'no bucket yet' guard on E placement -> a bucket-C pair with the edge is
+    rebucketed to E -> RED."""
+    w = World(tmp_path)
+    # a changed pair with no candidate -> C, that also carries the caller edge (a caller on A, none
+    # on B); it must stay C, the edge riding as a field.
+    w.pair("00001000", "00002000", 0.97, 0.6)
+    w.fn("a", "00001000", ["memset"], name="c_fn", pseudocode="memset(b,0,8);")
+    w.fn("b", "00002000", ["memset"], name="c_fn", pseudocode="memset(b,0,9);")
+    w.fn("a", "00000100", ["c_fn"], name="a_caller")
+    # a plain similarity-1 pair that stays not_listed (nothing to say)
+    w.pair("00003000", "00004000", 0.97, 1.0)
+    w.fn("a", "00003000", ["foo"], name="plain", pseudocode="foo();")
+    w.fn("b", "00004000", ["foo"], name="plain", pseudocode="foo();")
+    w.commit()
+    v = _view(w, sort_by="significance")
+    e = v["by_id"][_pair_id("00001000", "00002000")]
+    assert e["bucket"] == "C"  # kept, never rebucketed to E
+    assert e["callers_b"] == {"state": "none_found"}  # the edge rides as a field
+    assert e["anchor_ref"] == dr.pair_anchor("runA", "runB", "libx", "00001000", "00002000")
+    # subjects conserved: two pairs -> one listed (C), one not_listed (the plain pair).
+    assert v["total_entries"] == 1
+    assert sum(c["count"] for c in v["not_listed"].values()) == 1
+
+
+def test_the_no_mention_key_orders_only_under_significance(tmp_path: Path, current: None) -> None:
+    """Whether another B function names an E entry's function orders the E lane under significance
+    (no-mention first), as the honest field b_other_fn_mentions — but it NEVER touches the default
+    order, the rank_key or the cheap build layer (which cannot read pseudocode).
+
+    MUTATION: fold the no-mention key into rank_key / the default order -> the default order flips /
+    rank_key gains a field -> RED; include the function's OWN body in the mention index -> both read
+    as mentioned -> the significance order stops splitting them -> RED."""
+    w = World(tmp_path)
+    # two no-candidate E pairs in the same lane; by address, mentioned sorts BEFORE unmentioned.
+    w.pair("00001000", "00002000", 0.97, 1.0)  # lower address: mentioned by another B function
+    w.fn("a", "00001000", ["helper"], name="m_target", pseudocode="helper();")
+    w.fn("b", "00002000", ["helper"], name="m_target", pseudocode="helper();")
+    w.pair("00005000", "00006000", 0.97, 1.0)  # higher address: not mentioned by ANOTHER function
+    w.fn("a", "00005000", ["helper"], name="u_target", pseudocode="helper();")
+    # its OWN body names u_target: excluded, so it stays unmentioned — a mutation that counts the
+    # function's own body would flip it and collapse the significance split.
+    w.fn("b", "00006000", ["helper"], name="u_target", pseudocode="u_target();")
+    w.fn("a", "00000100", ["m_target", "u_target"], name="a_caller")
+    # a B function that NAMES m_target in its body but does not CALL it (callees empty).
+    w.fn("b", "00000300", [], name="b_mentioner", pseudocode="void *p = &m_target;")
+    w.commit()
+    m_id, u_id = _pair_id("00001000", "00002000"), _pair_id("00005000", "00006000")
+    base = _view(w)
+    assert base["by_id"][m_id]["b_other_fn_mentions"] is True
+    assert base["by_id"][u_id]["b_other_fn_mentions"] is False
+    # the default order is by address: m (lower) before u; rank_key carries no mention component.
+    base_order = [e["entry_id"] for e in base["entries"]]
+    assert base_order.index(m_id) < base_order.index(u_id)
+    assert set(base["by_id"][m_id]["rank_key"]) == {
+        "segment",
+        "lane",
+        "subclass_rank",
+        "similarity",
+        "address",
+    }
+    # significance reverses them inside the lane: the unmentioned one is read first.
+    lens = _view(w, sort_by="significance")
+    lens_order = [e["entry_id"] for e in lens["entries"]]
+    assert lens_order.index(u_id) < lens_order.index(m_id)
+    # the rank_key is identical under both orders (only significance adds attention / swap fields).
+    for key in ("segment", "lane", "subclass_rank", "address"):
+        assert base["by_id"][m_id]["rank_key"][key] == lens["by_id"][m_id]["rank_key"][key]
+
+
+def test_the_edge_order_is_stable_across_pages_cold_and_warm(tmp_path: Path, current: None) -> None:
+    """Paging the E entries gives the same order every time — the no-mention index is read once with
+    the bodies and cached, so a cold first walk and a warm second walk agree, with no entry repeated
+    or dropped.
+
+    MUTATION: recompute the no-mention set per call from a re-read of the bodies -> a cold/warm
+    disagreement across pages -> RED."""
+    w = World(tmp_path)
+    a_caller_targets = []
+    for i in range(6):
+        aa, bb = f"0000{i}000", f"0001{i}000"
+        name = f"edge_{i}"
+        w.pair(aa, bb, 0.97, 1.0)
+        w.fn("a", aa, ["helper"], name=name, pseudocode="helper();")
+        w.fn("b", bb, ["helper"], name=name, pseudocode="helper();")
+        a_caller_targets.append(name)
+    w.fn("a", "00099000", a_caller_targets, name="a_caller")
+    # name half of them in another B body (not as callers), to exercise the mention split.
+    w.fn("b", "00099000", [], name="b_mentioner", pseudocode="x = &edge_0 + &edge_2 + &edge_4;")
+    w.commit()
+    cold = [
+        e["entry_id"] for e in _view(w, sort_by="significance")["entries"] if e["bucket"] == "E"
+    ]
+    warm = [
+        e["entry_id"] for e in _view(w, sort_by="significance")["entries"] if e["bucket"] == "E"
+    ]
+    assert cold == warm
+    assert len(cold) == 6 and len(set(cold)) == 6
+
+
+def test_the_swap_lift_outranks_the_caller_edge_mention_key(tmp_path: Path, current: None) -> None:
+    """S3 adds the no-mention key to the TAIL of the significance tuple, after the S2 narrow-swap
+    lift (which sits right after attention). So inside attention 1 the swap lift wins over the
+    mention key: an E entry that itself carries a narrow swap AND is mentioned still leads an E
+    entry with no swap that is unmentioned — swap first, not mention first.
+
+    MUTATION: move the no-mention key ahead of swap_lift in the significance tuple -> the
+    unmentioned no-swap E would lead -> RED."""
+    w = World(tmp_path)
+    # E with a narrow swap (system vs popen in its callees), and named by another B body (mentioned)
+    w.pair("00005000", "00006000", 0.97, 1.0)
+    w.fn("a", "00005000", ["system"], name="e_swap", pseudocode="system(a);")
+    w.fn("b", "00006000", ["popen"], name="e_swap", pseudocode="popen(a);")
+    # E with no swap (same callees both sides), unmentioned, at a LOWER address
+    w.pair("00001000", "00002000", 0.97, 1.0)
+    w.fn("a", "00001000", ["helper"], name="e_plain", pseudocode="helper();")
+    w.fn("b", "00002000", ["helper"], name="e_plain", pseudocode="helper();")
+    w.fn("a", "00000100", ["e_swap", "e_plain"], name="a_caller")  # callers on A
+    w.fn("b", "00000300", [], name="b_mentioner", pseudocode="p = &e_swap;")  # mentions e_swap only
+    w.commit()
+    v = _view(w, sort_by="significance")
+    swap_id, plain_id = _pair_id("00005000", "00006000"), _pair_id("00001000", "00002000")
+    assert v["by_id"][swap_id]["bucket"] == "E"
+    assert v["by_id"][swap_id]["rank_key"]["sink_callee_swap"] == 1  # the swap lift is on
+    assert v["by_id"][swap_id]["b_other_fn_mentions"] is True  # and it is mentioned
+    assert v["by_id"][plain_id]["b_other_fn_mentions"] is False
+    order = [e["entry_id"] for e in v["entries"]]
+    assert order.index(swap_id) < order.index(plain_id)  # swap wins over the mention key
