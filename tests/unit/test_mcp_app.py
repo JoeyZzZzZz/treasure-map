@@ -236,8 +236,90 @@ def test_cli_mcp_lib_parity_pseudocode(tmp_path: Path) -> None:
     )
     assert cli.exit_code == 0, cli.output
     cli_result = json.loads(cli.output)
-    # the underlying fact (minus the MCP run envelope) is identical across lib / MCP / CLI
-    assert lib_result == _fact_payload(mcp_result) == cli_result
+    # the underlying fact (minus the MCP run envelope) is identical across lib / MCP / CLI; the
+    # MCP tool pages the text by line (the lib with the fact-page budget), and a function within
+    # one segment differs only by that ``paging`` block
+    conn = facts.open_analysis_ro(analysis)
+    paged = facts.get_pseudocode(conn, func="handle_req", max_chars=facts._FACT_PAGE_CHARS)
+    conn.close()
+    payload = _fact_payload(mcp_result)
+    assert payload == paged
+    assert payload.get("paging", {}).get("truncated") is False
+    assert lib_result == {k: v for k, v in payload.items() if k != "paging"} == cli_result
+
+
+# A body well over the fact-page budget, with CRLF line ends and no final newline.
+_LONG_BODY = "".join(f"  step_{i:04d}(param_1, 0x{i:x});\r\n" for i in range(2500)) + "  return;"
+
+
+def _with_long_function(tmp_path: Path) -> Path:
+    analysis = _mk_analysis(tmp_path)
+    conn = open_db(analysis)
+    conn.execute(
+        "INSERT INTO functions (binary_id, name, address, pseudocode, callees) "
+        "VALUES (1, 'long_fn', '0x7000', ?, '[]')",
+        (_LONG_BODY,),
+    )
+    conn.commit()
+    conn.close()
+    return analysis
+
+
+def test_the_mcp_tool_pages_a_long_function_by_line(tmp_path: Path) -> None:
+    """★ At the MCP tool a long function comes in line segments, walked with offset =
+    paging.next_offset, that join back to the stored text; each is within the fact-page budget.
+
+    MUTATION (verified RED, 2 failed): drop offset from the tool's call to the fact -> RED."""
+    _with_long_function(tmp_path)
+    tool = mcp_app.make_tools(_mk_atlas(tmp_path))["get_pseudocode"]
+    segments = []
+    offset: int | None = 0
+    while offset is not None and len(segments) < 50:
+        out = tool("long_fn", run_id="run_m", offset=offset)
+        assert out.get("found") is True, out
+        segments.append(out["pseudocode"])
+        assert len(out["pseudocode"]) <= facts._FACT_PAGE_CHARS
+        offset = out["paging"]["next_offset"]
+    assert offset is None and len(segments) > 2
+    assert "".join(segments) == _LONG_BODY
+
+
+def test_an_offset_past_the_last_line_is_no_miss_and_names_no_other_run(tmp_path: Path) -> None:
+    """An offset past the last line is an error giving total_lines, read as such: no found key,
+    so the tool does not go looking for the function in another run (no cross-run note).
+
+    MUTATION (verified RED, 4 failed): give that error found: False -> RED."""
+    _with_long_function(tmp_path)
+    tool = mcp_app.make_tools(_mk_atlas(tmp_path))["get_pseudocode"]
+    out = tool("long_fn", run_id="run_m", offset=10_000)
+    assert out.get("total_lines") == 2501 and "past the last line" in out["error"]
+    assert "found" not in out
+    assert "cross_run_note" not in out and "found_in_runs" not in out
+    assert out["resolved_run"] == "run_m"
+
+
+def test_the_command_line_prints_the_whole_function(tmp_path: Path) -> None:
+    """The CLI reads with no budget: the whole function, however long, and no paging."""
+    analysis = _with_long_function(tmp_path)
+    cli = CliRunner().invoke(fact_group, ["pseudocode", "long_fn", "--analysis-db", str(analysis)])
+    assert cli.exit_code == 0, cli.output
+    out = json.loads(cli.output)
+    assert out["pseudocode"] == _LONG_BODY and "paging" not in out
+
+
+def test_the_tools_and_the_instructions_say_pseudocode_is_paged_and_detail_summarises() -> None:
+    """The get_pseudocode description says how a long function is paged and that its line
+    numbers are the diff's; the server instructions name the paging and the summary detail."""
+    doc = " ".join((mcp_app.make_tools(Path("unused.db"))["get_pseudocode"].__doc__ or "").split())
+    assert (
+        "Paged by line: a function longer than ~20k characters comes in segments — pass "
+        "``offset`` = ``paging.next_offset``; line numbers (``first_line``/``last_line``, 1-based, "
+        "blank lines counted) are the ones inline_hunk and guards use."
+    ) in doc
+    assert "paging.total_chars" in doc
+    assert "get_pseudocode (paged by line (offset);" in mcp_app._AGENT_INSTRUCTIONS
+    assert "detail='summary'" in mcp_app._AGENT_INSTRUCTIONS
+    assert "anchor_ref_template" in mcp_app._AGENT_INSTRUCTIONS
 
 
 # ── contract 1: no anchor, no output ────────────────────────────────────────────────

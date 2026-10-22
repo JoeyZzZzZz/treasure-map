@@ -562,12 +562,57 @@ def test_member_pages_never_withhold_a_hunk() -> None:
 
 
 @pytest.mark.parametrize("bad", [-1, 21, True, "5"])
-def test_rows_limit_is_ranged_at_the_tool(tmp_path: Path, bad: Any) -> None:
+@pytest.mark.parametrize("detail", ["full", "summary"])
+def test_rows_limit_is_ranged_at_the_tool(tmp_path: Path, bad: Any, detail: str) -> None:
     """rows_limit is 0..20 at the tool (0 = a scan with no inline row); outside that it is an
-    error naming the range, never clamped."""
+    error naming the range, never clamped — in a summary too, which ignores a valid one."""
     tool = mcp_app.make_tools(tmp_path / "atlas.db")["get_diff_patch_view"]
-    out = tool("x::y::z", rows_limit=bad)
+    out = tool("x::y::z", rows_limit=bad, detail=detail)
     assert "rows_limit must be an integer in 0..20" in out["error"]
+
+
+def test_the_tool_hands_detail_to_the_view(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """At the MCP tool, detail='summary' reaches the read layer (its entries carry no rank_key and
+    no row), and a detail the view does not know is its error.
+
+    MUTATION (verified RED, 3 failed): drop detail from the tool's call to the view -> RED."""
+    atlas_path = _diff_atlas(tmp_path, monkeypatch, 2, 3)
+    tool = _tools(atlas_path)["get_diff_patch_view"]
+    page = tool(_DIFF, detail="summary")
+    assert "error" not in page, page
+    assert page["detail"] == "summary" and page["entries"]
+    assert all("rank_key" not in e and "rows" not in e for e in page["entries"])
+    assert page["entries"] == _lib_page(atlas_path, detail="summary")["entries"]
+    assert "detail must be 'full' or 'summary'" in tool(_DIFF, detail="rows")["error"]
+
+
+def test_a_summary_page_is_fitted_and_walked_like_a_full_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ A summary walk keeps the four paging rules — each page within the budget and holding at
+    least one entry, the cut announced, total_entries the whole count, next_offset resuming after
+    the last entry that fit — and returns every entry once in the full walk's order, on fewer
+    pages."""
+    atlas_path = _diff_atlas(tmp_path, monkeypatch, 300, 2)
+    tool = _tools(atlas_path)["get_diff_patch_view"]
+    order = [e["entry_id"] for e in _lib_page(atlas_path, limit=2000)["entries"]]
+    pages: dict[str, int] = {}
+    for detail in ("full", "summary"):
+        got: list[str] = []
+        offset: int | None = 0
+        cut = False
+        pages[detail] = 0
+        while offset is not None:
+            page = tool(_DIFF, offset=offset, detail=detail)
+            assert len(json.dumps(page)) <= _RESPONSE_BYTE_BUDGET and page["entries"]
+            assert page["total_entries"] == len(order) == 300
+            cut |= page["entries_truncated"]
+            got += [e["entry_id"] for e in page["entries"]]
+            offset = page["next_offset"]
+            pages[detail] += 1
+        assert got == order, detail
+        assert cut, detail  # the budget, not the limit, cut a page
+    assert pages["summary"] < pages["full"]
 
 
 def test_the_tool_and_the_instructions_say_how_to_read_a_hunk_and_scan() -> None:

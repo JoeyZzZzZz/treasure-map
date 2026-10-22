@@ -1852,21 +1852,61 @@ _WORDS = {"removed", "added", "gone", "new", "bounded", "safe", "fix", "patch", 
 
 
 def _labels(v: dict[str, Any]) -> set[str]:
-    """Every label, subclass, reason, fact, blind-spot key and sub-fact key the view emits."""
+    """Every label, subclass, reason, fact, blind-spot key and sub-fact key the view emits — of a
+    full page or a summary one (whose entries carry fewer keys), with the envelope's own."""
     out: set[str] = set(v["counts"]["by_subclass"]) | set(v["counts"]["by_row_subclass"])
     out |= {s["key"] for s in v["blind_spots"]} | set(v["banners"]) | set(v["not_listed"])
-    for e in v["entries"]:
-        out |= {e["subclass"], *e["subclasses"], *e["facts"], *e["blind_spots"]}
-        out |= set((e["callee_set"] or {}).keys()) | {str((e["callee_set"] or {}).get("reason"))}
-        out |= set((e["callee_set"] or {}).get("named_callees_differ", {}))
-        for r in e["rows"]:
+    for e in v.get("entries") or ():
+        out |= {str(e.get("subclass")), *e.get("subclasses", ()), *e.get("facts", ())}
+        out |= set(e.get("blind_spots", ()))
+        out |= set((e.get("callee_set") or {}).keys())
+        out |= {str((e.get("callee_set") or {}).get("reason"))}
+        out |= set((e.get("callee_set") or {}).get("named_callees_differ", {}))
+        for r in e.get("rows") or ():
             out |= {str(r["presence_reason"]), str(r["subclass"]), str(r["landing"])}
             out |= set(r.get("labels", {})) | {str(r.get("labels", {}).get("mechanism"))}
             out |= set(r.get("facts", ())) | {str(r.get("labels", {}).get("side"))}
         out |= _s7_labels(e)
+        out |= _summary_labels(e)
     read_with = v.get("guards_read_with") or {}
     if read_with:
         out |= {"guards_read_with", *read_with, str(read_with.get("function"))}
+    return out | _envelope_labels(v)
+
+
+def _summary_labels(e: dict[str, Any]) -> set[str]:
+    """The keys and enumerated values a summary entry adds: delta_summary and its hunk,
+    proposed_pair_summary, the lifted reading flags, the counts' names."""
+    out: set[str] = {k for k in e if k in _S_REDUCED_OR_DERIVED}
+    if "anchor" in e:
+        out.add(str(e["anchor"]))
+    proposed = e.get("proposed_pair_summary") or {}
+    if proposed:
+        out |= {"proposed_pair_summary", *proposed, str(proposed.get("state"))}
+    for block in (e, proposed):
+        delta = block.get("delta_summary") or {}
+        out |= set(delta) | {str(delta.get("kind")), str(delta.get("reason"))}
+        hunk = delta.get("hunk") or {}
+        if hunk:
+            out |= {"hunk", *hunk, str(hunk.get("withheld"))}
+        for key in ("hidden_region", "bodies", "sink_callee_swap", "string_edges", "callers_a"):
+            out |= set(block.get(key) or {})
+    return out
+
+
+def _envelope_labels(v: dict[str, Any]) -> set[str]:
+    """The envelope keys a page adds by its detail and its place: detail / detail_with /
+    detail_note, first_page_only with the paths it names, the anchor template. (The view names in
+    available_views are the tool's own, as old as it, and not read here.)"""
+    out: set[str] = {
+        k for k in ("detail", "detail_with", "detail_note", "first_page_only") if k in v
+    }
+    out |= {str(v.get("detail"))} | set(v.get("detail_with") or {})
+    fpo = v.get("first_page_only") or {}
+    out |= set(fpo) | set(fpo.get("keys", ())) | set(fpo.get("shortened", ()))
+    template = (v.get("annotation") or {}).get("anchor_ref_template") or {}
+    if template:
+        out |= {"anchor_ref_template", *template}
     return out
 
 
@@ -1926,6 +1966,60 @@ def test_no_label_says_what_a_change_means(
     page = pv.get_diff_patch_view(g.atlas, DIFF, not_listed_page="aligned_pseudocode_differs")
     for row in page["entries"]:
         s7 |= _s7_labels(row)
+    # The summary pages (each page, so a later page's first_page_only is read too), the
+    # summary of the not-listed pairs, of the overlay rows and of the string edges.
+    (tmp_path / "summary").mkdir()
+    sw = _summary_world(tmp_path / "summary")
+    summary: set[str] = set()
+    for w in (g, sw, world):
+        for page in _pages(w, detail="summary") + _pages(
+            w, detail="summary", sort_by="significance"
+        ):
+            summary |= _labels(page)
+        summary |= _labels(_pages(w, limit=1)[-1])
+    for kw in (
+        {"not_listed_page": "aligned_pseudocode_differs"},
+        {"view": "candidate_flat"},
+    ):
+        summary |= _labels(pv.get_diff_patch_view(sw.atlas, DIFF, detail="summary", **kw))
+    summary |= _envelope_labels(
+        pv.get_diff_patch_view(world.atlas, DIFF, detail="summary", view="string_edge")
+    )
+    assert {
+        "detail",
+        "summary",
+        "full",
+        "detail_with",
+        "one_entry",
+        "its_rows",
+        "its_detail",
+        "detail_note",
+        "first_page_only",
+        "keys",
+        "shortened",
+        "read_with",
+        "lens.order",
+        "review_progress.next_page",
+        "review_progress.note",
+        "annotation.what",
+        "anchor_ref_template",
+        "function_pair",
+        "function_presence",
+        "delta_summary",
+        "hunk",
+        "structural_lines",
+        "withheld",
+        "substitutions_total",
+        "calls_differ",
+        "structural_spans",
+        "line_number_form",
+        "proposed_pair_summary",
+        "a_body_elsewhere_in_b_count",
+        "anchored_micro_side",
+        "in_read_first",
+        "demoted",
+    } <= summary, sorted(summary)
+    s7 |= summary
     # No block match made at all: every scan with a changed block on both sides is not_extracted.
     monkeypatch.setattr(sameness, "DELTA_TOKEN_PRODUCT_CAP", 0)
     pv._clear_view_caches()
@@ -5046,7 +5140,7 @@ def test_a_new_e_entry_is_not_served_the_old_mention_set(tmp_path: Path, current
 
 
 def test_the_order_lens_and_the_tool_name_the_edge(tmp_path: Path, current: None) -> None:
-    """The order every page states, the significance lens, the caveats and the tool's own
+    """The order a scope's first page states, the significance lens, the caveats and the tool's own
     description all name bucket E and where it sits — not only the module docstring.
 
     MUTATION (verified RED): drop E from lens.order -> RED; drop the two caller bases from the
@@ -5540,3 +5634,1033 @@ def test_no_s7_field_reads_as_a_verdict(tmp_path: Path, current: None) -> None:
     for entry_id in (ALIGNED, PROPOSED, CROSS):
         texts.append(json.dumps(pv.get_diff_patch_view(w.atlas, DIFF, entry_id=entry_id)))
     assert not any('"blocked"' in t for t in texts)
+
+
+# ── detail='summary', and what only a scope's first page carries ────────────────────────────
+
+MANY_ROWS = _pair_id("00101000", "00102000")  # 22 candidate rows: more than the inline window
+EDGE = _pair_id("00111000", "00112000")  # bucket E
+P_PLAIN = "a:00121000"
+P_GAP = "a:00122000"  # its export holds it degenerately: export_gap is a string
+R_HEAD = _pair_id("00131000", "00131000")  # anchored_differs, read first
+R_LOW = _pair_id("00132000", "00132000")  # anchored_differs below the floor: in_read_first false
+R_DEMOTED = _pair_id("00133000", "00133000")  # a line-number shift with callees and sizes equal
+R_KEPT = _pair_id("00134000", "00134000")  # a line-number shift, callees differ: demoted false
+R_MICRO = _pair_id("00135000", "00135000")  # anchored micro side
+R_GAP = _pair_id("00136000", "00137000")  # an export gap on side a
+PARTIAL = _pair_id("00141000", "00142000")  # a sink in a callee difference read in part only
+JUMPTABLE = _pair_id("00151000", "00152000")  # qualified match still saying UNRECOVERED_JUMPTABLE
+
+
+def _summary_world(tmp_path: Path) -> World:
+    """The guard world (an aligned and an undetermined pair with guards and a hunk, a pair whose
+    copy call became a capped formatter, a not-listed pair with a guard) plus one entry of each
+    other shape a summary prints: more candidate rows than the inline window holds, bucket E, P
+    with and without an export gap, undetermined pairs read first / below the floor / demoted for a
+    line-number shift / kept in the head despite one, an anchored micro-side pair, an undetermined
+    pair with an export gap, a sink in a callee difference that could be read only in part, and a
+    qualified text match whose body still says UNRECOVERED_JUMPTABLE."""
+    w = _guard_world(tmp_path)
+    w.pair("00101000", "00102000", 0.97, 0.8)
+    for i in range(22):
+        w.inst("a", _ref("runA", "00101000", "cmd", f"0x{0x10 + 4 * i:x}"), "cmd", "system")
+    w.fn("a", "00101000", ["system"], pseudocode="system(a);")
+    w.fn("b", "00102000", ["system"], pseudocode="system(b);")
+    _edge_pair(w, "00111000", "00112000", "edge_fn")
+    w.unpaired("a", "00121000", "unmatched_analysis_complete")
+    w.inst("a", _ref("runA", "00121000", "cmd", "0x10"), "cmd", "system")
+    w.unpaired("a", "00122000", "unmatched_analysis_incomplete", "degenerate_block")
+    w.inst("a", _ref("runA", "00122000", "cmd", "0x10"), "cmd", "system")
+    _ud(w, "00131000", "00131000", 0.9)
+    _ud(w, "00132000", "00132000", 0.5)
+    _line_shift(w, "00133000")
+    _line_shift(w, "00134000", callees_b=["log", "system"])
+    _micro_pair(w, "00135000", "00135000", 0.6)
+    _ud(w, "00136000", "00137000", 0.4, gap_a="degenerate_block")
+    w.pair("00141000", "00142000", 0.97, 0.6)
+    w.fn("a", "00141000", [f"FUN_{_NOT_A_PAIR}", "memcpy"], pseudocode="x = f(1);", size_bytes=64)
+    w.fn("b", "00142000", ["strcpy"], pseudocode="x = f(1) + 1;", size_bytes=64)
+    jump = "/* WARNING: Could not recover jumptable at 0x00151010. Too many branches */\n"
+    jump += "(*(code *)UNRECOVERED_JUMPTABLE)();"
+    w.pair("00151000", "00152000", 0.97, 0.9, instructions=40)
+    w.fn("a", "00151000", ["foo"], pseudocode=jump, size_bytes=64)
+    w.fn("b", "00152000", ["foo"], pseudocode=jump, size_bytes=60)
+    w.commit()
+    return w
+
+
+def _pages(w: World, limit: int = 4, **kw: Any) -> list[dict[str, Any]]:
+    """Every page of one scope through the read layer, in order (``limit`` small, so a fixture
+    takes several pages)."""
+    pages = []
+    offset = 0
+    while True:
+        out = pv.get_diff_patch_view(w.atlas, DIFF, limit=limit, offset=offset, **kw)
+        assert "error" not in out, out
+        pages.append(out)
+        if out.get("next_offset") is None:
+            return pages
+        offset = out["next_offset"]
+
+
+def _listed(pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [e for p in pages for e in p["entries"]]
+
+
+def _by_id(entries: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    out = {e["entry_id"]: e for e in entries}
+    assert len(out) == len(entries)
+    return out
+
+
+def _deep_keys(value: Any) -> set[str]:
+    """Every dict key at any depth."""
+    if isinstance(value, dict):
+        return set(value).union(*(_deep_keys(v) for v in value.values()))
+    if isinstance(value, list):
+        return set().union(*(_deep_keys(v) for v in value))
+    return set()
+
+
+def _micro_ids(w: World) -> set[str]:
+    built = pv.build_diff_view(w.atlas, DIFF)
+    assert built is not None
+    pv._annotate_entries(built, pv._pseudo_readings(w.atlas, built))
+    return {e.entry_id for e in built.entries if pv._anchored_micro_side(e)}
+
+
+# The field rules of a summary entry, written out here apart from patch_view's projection so the
+# two are checked against each other.
+_S_COPY = (
+    "entry_id bucket subclass tier blind_spots review_state addr_a addr_b name_a name_b "
+    "similarity export_gap_a export_gap_b side addr name presence_state export_gap pairing "
+    "callers_b b_other_fn_mentions pseudocode_sameness text_unverified_reasons significance "
+    "rows_total rows_by_presence"
+).split()
+_S_COUNTS = {
+    "rows_total",
+    "count",
+    "structural_spans",
+    "substitutions_total",
+    "calls_differ",
+    "var_const_total",
+    "linked_not_shown",
+    "renumbered_in_a",
+    "markers",
+}
+_S_SWAP = (
+    "pairing",
+    "callees_complete",
+    "narrow",
+    "not_narrow",
+    "sinks_only_in_a",
+    "sinks_only_in_b",
+)
+_S_REDUCED_OR_DERIVED = {
+    "subclasses",
+    "facts",
+    "coclaimed_by_count",
+    "callee_set",
+    "sink_callee_swap",
+    "callers_a",
+    "string_edges",
+    "guard_scan",
+    "hidden_region",
+    "bodies",
+    "delta_summary",
+    "anchored_differs",
+    "anchor",
+    "in_read_first",
+    "demoted",
+    "anchored_micro_side",
+    "proposed_pair_summary",
+}
+_S_ENTRY_KEYS = set(_S_COPY) | _S_REDUCED_OR_DERIVED
+# Never in a summary entry, at any depth: the rows, the bodies, the guards and their listing.
+_S_NEVER = {
+    "rank_key",
+    "rows",
+    "pseudocode_delta",
+    "inline_hunk",
+    "guards",
+    "proposed_pair_reading",
+    "anchor_ref",
+    "alignment_confidence",
+    "alignment_state",
+    "rows_next_offset",
+    "rows_order",
+    "rows_by_order_group",
+    "sink_axes_with",
+    "sink_axes_withheld_rows",
+    "structural",
+    "substitution_groups",
+    "substitutions",
+    "calls",
+    "read_with",
+    "shown_rule",
+    "listing",
+    "listing_note",
+    "sample",
+    "changed",
+    "occurrences",
+    "named_callees_differ",
+    "only_in_a",
+    "only_in_b",
+}
+
+
+def _s_drop(key: str, value: Any) -> bool:
+    if value is None or value == [] or value == {}:
+        return True
+    return not isinstance(value, bool) and key in _S_COUNTS and value == 0
+
+
+def _s_kept(fields: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in fields.items() if not _s_drop(k, v)}
+
+
+def _s_delta(d: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {"kind": d["kind"]}
+    if "reason" in d:
+        out["reason"] = d["reason"]
+    if "structural_spans" in d:
+        out["structural_spans"] = d["structural_spans"]
+    if "substitutions" in d:
+        out["substitutions_total"] = sum(v["total"] for v in d["substitutions"].values())
+    if "calls" in d:
+        out["calls_differ"] = len(d["calls"])
+    if "line_number_form" in d:
+        out["line_number_form"] = True
+    out = _s_kept(out)
+    if "inline_hunk" in d:
+        h = d["inline_hunk"]
+        out["hunk"] = {
+            k: h[k] for k in ("structural_lines", "groups", "withheld", "lines") if k in h
+        }
+    return out
+
+
+def _s_guard_scan(g: dict[str, Any]) -> dict[str, Any]:
+    if "reason" in g:
+        return dict(g)
+    return _s_kept({k: v for k, v in g.items() if k != "shown_rule"})
+
+
+def _s_callee_set(cs: dict[str, Any]) -> dict[str, Any]:
+    out = {"state": cs["state"]}
+    if cs["state"] == "undetermined":
+        out["reason"] = cs["reason"]
+    return out
+
+
+def _s_hidden(h: dict[str, Any]) -> dict[str, Any]:
+    out = _s_kept({"body": h["body"], "markers": len(h["markers"])})
+    refs = {s: n for s, n in h["unrecovered_jumptable_refs"].items() if n}
+    if refs:
+        out["unrecovered_jumptable_refs"] = refs
+    return out
+
+
+def _s_bodies(b: dict[str, Any]) -> dict[str, Any]:
+    return {
+        s: _s_kept({"status": v["status"], "size_bytes": v["size_bytes"]}) for s, v in b.items()
+    }
+
+
+def _s_proposed(pr: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {"state": pr["state"]}
+    if pr.get("text_unverified_reasons"):
+        out["text_unverified_reasons"] = pr["text_unverified_reasons"]
+    if pr.get("callee_set"):
+        out["callee_set"] = _s_callee_set(pr["callee_set"])
+    for key in ("a_body_elsewhere_in_b", "b_body_elsewhere_in_a"):
+        if pr[key] is None:
+            out[f"{key}_count"] = None
+        elif pr[key]["count"]:
+            out[f"{key}_count"] = pr[key]["count"]
+    for key, fn, name in (
+        ("pseudocode_delta", _s_delta, "delta_summary"),
+        ("guard_scan", _s_guard_scan, "guard_scan"),
+        ("hidden_region", _s_hidden, "hidden_region"),
+        ("bodies", _s_bodies, "bodies"),
+    ):
+        if key in pr:
+            out[name] = fn(pr[key])
+    return out
+
+
+def _rules_summary(full: dict[str, Any], micro: bool) -> dict[str, Any]:
+    """The summary entry the field rules give for one full entry rendered with no inline row."""
+    out: dict[str, Any] = {k: full[k] for k in _S_COPY if k in full and not _s_drop(k, full[k])}
+    if full["subclasses"] and full["subclasses"] != [full["subclass"]]:
+        out["subclasses"] = full["subclasses"]
+    facts = [
+        f for f in full["facts"] if not f.startswith("source_gap:") and f != "callee_set_unchanged"
+    ]
+    if facts:
+        out["facts"] = facts
+    if full["coclaimed_by"]:
+        out["coclaimed_by_count"] = len(full["coclaimed_by"])
+    if full["callee_set"]:
+        out["callee_set"] = _s_callee_set(full["callee_set"])
+    if "sink_callee_swap" in full:
+        swap = full["sink_callee_swap"]
+        out["sink_callee_swap"] = _s_kept({k: swap[k] for k in _S_SWAP})
+    if full.get("callers_a"):
+        out["callers_a"] = {"count": full["callers_a"]["count"]}
+    if full["string_edges"] and full["string_edges"]["by_delta_kind"]:
+        out["string_edges"] = {"by_delta_kind": full["string_edges"]["by_delta_kind"]}
+    for key, fn, name in (
+        ("guard_scan", _s_guard_scan, "guard_scan"),
+        ("hidden_region", _s_hidden, "hidden_region"),
+        ("bodies", _s_bodies, "bodies"),
+        ("pseudocode_delta", _s_delta, "delta_summary"),
+    ):
+        if key in full:
+            out[name] = fn(full[key])
+    if "proposed_pair_reading" in full:
+        pr = full["proposed_pair_reading"]
+        out.update(
+            {
+                k: pr[k]
+                for k in ("anchored_differs", "anchor", "in_read_first", "demoted")
+                if k in pr
+            }
+        )
+        out["proposed_pair_summary"] = _s_proposed(pr)
+    if micro:
+        out["anchored_micro_side"] = True
+    return out
+
+
+def _world_of(tmp_path: Path, which: int) -> World:
+    """0: the summary world; 1: the placement world (string edges, P entries, the source-gap /
+    callee_set_unchanged / one_hop_sink facts); 2: one undetermined pair per proposed reading (a
+    body found elsewhere, text_unverified reasons, readings with no body); 3: the swap world (an
+    aligned micro pair's one_side_skipped_micro, every shape of sink_callee_swap)."""
+    if which == 0:
+        return _summary_world(tmp_path)
+    if which == 1:
+        w = World(tmp_path)
+        _rich(w)
+        return w
+    if which == 2:
+        return _undetermined_world(tmp_path)
+    return _swap_world(tmp_path)[0]
+
+
+def test_a_summary_entry_carries_its_whitelisted_keys_only(tmp_path: Path, current: None) -> None:
+    """★ A summary entry carries no row, body, guard, rank_key or anchor_ref — at any depth — and
+    no key outside its whitelist, over a world holding an R entry, a hunk, a guard, more rows than
+    the window, E and P; the full entries of the same world do carry the keys left out.
+
+    MUTATION (verified RED, 7 failed): put pseudocode_delta in the copied keys -> RED."""
+    w = _summary_world(tmp_path)
+    summary = _listed(_pages(w, detail="summary"))
+    full = _listed(_pages(w, rows_limit=0))
+    assert {"A", "B", "C", "R", "E", "P"} <= {e["bucket"] for e in summary}
+    by_id = _by_id(summary)
+    assert by_id[MANY_ROWS].get("rows_total", 0) > pv.ROWS_INLINE_LIMIT
+    assert "hunk" in by_id[ALIGNED].get("delta_summary", {})
+    assert "guard_scan" in by_id[ALIGNED]
+    assert "guard_scan" in by_id[PROPOSED].get("proposed_pair_summary", {})
+    left_out = _S_NEVER & set().union(*(_deep_keys(e) for e in full))
+    assert {"rank_key", "rows", "pseudocode_delta", "inline_hunk", "guards"} <= left_out
+    assert {"proposed_pair_reading", "anchor_ref", "rows_by_order_group", "shown_rule"} <= left_out
+    for e in summary:
+        assert set(e) <= _S_ENTRY_KEYS, (e["entry_id"], set(e) - _S_ENTRY_KEYS)
+        assert not _deep_keys(e) & _S_NEVER, (e["entry_id"], _deep_keys(e) & _S_NEVER)
+
+
+@pytest.mark.parametrize("band", [False, True])
+@pytest.mark.parametrize("sort_by", [None, "tier", "similarity", "address", "significance"])
+def test_the_two_details_list_the_same_entries_with_the_same_counts(
+    tmp_path: Path, current: None, sort_by: str | None, band: bool
+) -> None:
+    """★ A presentation changes nothing a reading rests on: under one sort, filter set and band,
+    both details page the same entry ids in the same order, with the same totals, counts,
+    not_listed and review_progress on every page.
+
+    MUTATION (verified RED, 10 failed): order the page by entry_id before projecting -> RED."""
+    w = _summary_world(tmp_path)
+    first = _listed(_pages(w))
+    w.judge(DIFF, _by_id(first)[R_HEAD]["anchor_ref"], "changed_real")
+    w.judge(DIFF, _by_id(first)[EDGE]["anchor_ref"], "change_inconclusive")
+    kw: dict[str, Any] = {"sort_by": sort_by, "band": band}
+    full, summary = _pages(w, **kw), _pages(w, detail="summary", **kw)
+    ids = [e["entry_id"] for e in _listed(full)]
+    assert ids != sorted(ids)  # the order is not the id order, so a re-sort shows
+    assert [e["entry_id"] for e in _listed(summary)] == ids
+    assert len(full) == len(summary) > 2
+    for f, s in zip(full, summary, strict=True):
+        for key in ("total_entries", "next_offset", "counts", "not_listed", "review_progress"):
+            assert s[key] == f[key], key
+
+
+@pytest.mark.parametrize("which", [0, 1, 2, 3])
+def test_a_summary_entry_is_its_full_entry_projected(
+    tmp_path: Path, current: None, which: int
+) -> None:
+    """★ Each summary entry is exactly what the field rules give from the same entry rendered in
+    full with no inline row (rows_limit=0): the copied fields byte for byte, the reduced and
+    derived ones computed from it. Over four worlds holding every shape the rules name (each
+    world's own shape asserted, so none is read empty).
+
+    MUTATION (verified RED, 4 failed): leave rows_by_presence out of the copied keys -> RED.
+    MUTATION (verified RED, 2 failed): do not lift anchored_differs onto the entry -> RED.
+    MUTATION (verified RED, 4 failed): drop sink_callee_swap.pairing -> RED.
+    MUTATION (verified RED, 5 failed): drop sink_callee_swap.callees_complete -> RED."""
+    w = _world_of(tmp_path, which)
+    micro = _micro_ids(w)
+    full = _by_id(_listed(_pages(w, rows_limit=0)))
+    summary = _by_id(_listed(_pages(w, detail="summary")))
+    assert set(summary) == set(full)
+    for eid, s in summary.items():
+        assert s == _rules_summary(full[eid], eid in micro), eid
+    shape = {
+        0: lambda: micro == {R_MICRO} and summary[R_HEAD].get("anchored_differs") is True,
+        1: lambda: any("string_edges" in s for s in summary.values()),
+        2: lambda: any(
+            (s.get("proposed_pair_summary") or {}).get("a_body_elsewhere_in_b_count")
+            for s in summary.values()
+        ),
+        3: lambda: any("one_side_skipped_micro" in s.get("facts", ()) for s in summary.values()),
+    }[which]
+    assert shape()
+
+
+def test_a_coclaimed_entry_gives_how_many_functions_coclaim_it(
+    tmp_path: Path, current: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An entry whose rows were co-claimed by other functions' degraded candidates gives, in a
+    summary, how many co-claimers there are (both sides counted), not the list."""
+    w = _window_world(tmp_path, monkeypatch, "PP")
+    rows = [
+        replace(_win_row("P", 0), coclaimed_by=["00009000", "0000a000"]),
+        replace(_win_row("P", 1), coclaimed_by_b=["0000b000"]),
+    ]
+    monkeypatch.setattr(
+        pv,
+        "compute_sink_overlay",
+        lambda atlas, diff_id: so.SinkOverlayResult(
+            list(rows), so.SinkOverlayCoverage(0, 0, 0, 0, 0, False)
+        ),
+    )
+    full = _by_id(_listed(_pages(w, rows_limit=0)))[_WIN_ID]
+    s = _by_id(_listed(_pages(w, detail="summary")))[_WIN_ID]
+    assert full["coclaimed_by"] == ["a:00009000", "a:0000a000", "b:0000b000"]
+    assert s.get("coclaimed_by_count") == 3 and "coclaimed_by" not in s
+    assert s == _rules_summary(full, False)
+
+
+@pytest.mark.parametrize("which", [0, 1])
+def test_the_anchor_template_rebuilds_every_entrys_anchor(
+    tmp_path: Path, current: None, which: int
+) -> None:
+    """★ annotation.anchor_ref_template, filled with a summary entry's own addresses (addr_a /
+    addr_b, or side / addr), is that entry's anchor_ref as the full entry gives it — on every page.
+
+    MUTATION (verified RED, 2 failed): swap {addr_a} and {addr_b} in the template -> RED."""
+    w = _world_of(tmp_path, which)
+    full = _by_id(_listed(_pages(w)))
+    pages = _pages(w, detail="summary")
+    seen = {"pair": 0, "presence": 0}
+    for page in pages:
+        template = page["annotation"]["anchor_ref_template"]
+        for e in page["entries"]:
+            if "addr_a" in e:
+                anchor = template["function_pair"]
+                anchor = anchor.replace("{addr_a}", e["addr_a"]).replace("{addr_b}", e["addr_b"])
+                seen["pair"] += 1
+            else:
+                anchor = template["function_presence"]
+                anchor = anchor.replace("{side}", e["side"]).replace("{addr}", e["addr"])
+                seen["presence"] += 1
+            assert anchor == full[e["entry_id"]]["anchor_ref"], e["entry_id"]
+    assert seen["pair"] > 3 and seen["presence"] > 0
+
+
+# Recorded from the code before ``detail`` existed: the summary world's entries through the MCP
+# tool, one key per call below. Re-record it only when a full entry changes on purpose.
+_FULL_GOLDEN = Path(__file__).resolve().parents[2] / "fixtures" / "patch_view_full_entries.json"
+_GOLDEN_CALLS: dict[str, dict[str, Any]] = {
+    "default": {},
+    "scan": {"rows_limit": 0},
+    "significance": {"sort_by": "significance"},
+    "not_listed": {"not_listed_page": "aligned_pseudocode_differs"},
+}
+
+
+def test_a_full_entry_is_byte_for_byte_what_it_was_before_the_summary(
+    tmp_path: Path, current: None
+) -> None:
+    """★ detail='full' (the default) leaves every entry as it was: the summary world's pages
+    through the MCP tool — the default window, a scan (rows_limit=0), the significance sort and
+    the not-listed page — hold byte for byte the entries recorded in the fixture file from the
+    code before detail existed. No entry on these pages is cut for the page budget, so only the
+    envelope may differ."""
+    golden = json.loads(_FULL_GOLDEN.read_text())
+    assert set(golden) == set(_GOLDEN_CALLS)
+    w = _summary_world(tmp_path)
+    tool = mcp_app.make_tools(w.path)["get_diff_patch_view"]
+    for name, kw in _GOLDEN_CALLS.items():
+        entries: list[dict[str, Any]] = []
+        offset: int | None = 0
+        while offset is not None:
+            out = tool(DIFF, offset=offset, **kw)
+            assert "error" not in out and "over_budget" not in out, out
+            assert "page_budget" not in json.dumps(out["entries"])
+            entries += out["entries"]
+            offset = out["next_offset"]
+        assert len(entries) == len(golden[name]) > 0, name
+        assert json.dumps(entries) == json.dumps(golden[name]), name
+
+
+def test_a_summary_page_leaves_what_it_read_as_it_was(
+    tmp_path: Path, current: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ The projection builds new objects only. In one process, after the summary pages (listed,
+    significance, not-listed) are read with the caches left warm, the full pages read byte for
+    byte as they did from cold caches, and every build those summary pages read keeps a fresh
+    build's judgement bases (entry_facts, row_facts).
+
+    MUTATION (verified RED, 1 failed — this test alone): in the projection, pop structural /
+    substitution_groups / read_with off the cached inline_hunk in place -> RED."""
+    w = _summary_world(tmp_path)
+    not_listed = {"not_listed_page": "aligned_pseudocode_differs"}
+
+    def full_pages() -> str:
+        return json.dumps([_pages(w), _pages(w, rows_limit=0), _pages(w, **not_listed)])
+
+    cold = full_pages()
+    pv._clear_view_caches()
+    builds: list[pv.BuiltDiff] = []
+    real = pv.build_diff_view
+
+    def keep(atlas: Any, diff_id: str) -> Any:
+        built = real(atlas, diff_id)
+        builds.append(built)
+        return built
+
+    monkeypatch.setattr(pv, "build_diff_view", keep)
+    for kw in ({}, {"sort_by": "significance"}, not_listed):
+        _pages(w, detail="summary", **kw)
+    monkeypatch.setattr(pv, "build_diff_view", real)
+    assert builds and len(pv._DELTA_CACHE) > 0
+    assert full_pages() == cold
+    fresh = real(w.atlas, DIFF)
+    assert fresh is not None
+    want = {e.entry_id: dr.entry_facts(e) for e in fresh.placed}
+    rows = {e.entry_id: [dr.row_facts(v) for v in e.row_views] for e in fresh.placed}
+    for built in builds:
+        for e in built.placed:
+            assert dr.entry_facts(e) == want[e.entry_id]
+            assert [dr.row_facts(v) for v in e.row_views] == rows[e.entry_id]
+
+
+def _env_paths(page: dict[str, Any]) -> set[str]:
+    """The keys of the three envelope blocks that hold first-page texts, as paths."""
+    return {f"{k}.{sub}" for k in ("lens", "review_progress", "annotation") for sub in page[k]}
+
+
+_PROGRESS_EVERY_PAGE = (
+    "unit",
+    "scope",
+    "total",
+    "looked_at",
+    "not_looked_at",
+    "page_size",
+    "pages_total",
+    "pages_remaining",
+    "states",
+    "by_bucket",
+    "verdict_shape",
+    "dangling_annotations",
+    "outside_this_scope",
+    "blind_spots",
+    "complete",
+)
+_ANNOTATION_EVERY_PAGE = (
+    "available",
+    "annotate_diff",
+    "no_real_change_needs",
+    "candidate_anchor",
+    "promote",
+    "review_with",
+    "by_bucket",
+    "anchor_ref_template",
+)
+_ENVELOPE_EVERY_PAGE = (
+    "legend",
+    "caveats",
+    "counts",
+    "not_listed",
+    "subject_counts",
+    "banners",
+    "available_views",
+    "detail",
+    "baseline_state",
+    "overlay_coverage",
+    "guards_read_with",
+)
+
+
+@pytest.mark.parametrize("detail", ["full", "summary"])
+@pytest.mark.parametrize(
+    "scope",
+    [
+        {},
+        {"sort_by": "significance"},
+        {"band": True, "bucket": "R", "anchored_differs": True},
+        {"anchored_micro_side": True},
+    ],
+)
+def test_a_later_page_names_what_it_leaves_to_the_first(
+    tmp_path: Path, current: None, detail: str, scope: dict[str, Any]
+) -> None:
+    """★ The long texts that are the same on every page of a scope come on its first page (offset
+    0) only: the lens's order and filter texts, review_progress.next_page, annotation.what /
+    promote_note. A later page lists exactly the keys it left out in first_page_only.keys, and
+    gives the progress note as its 'complete' sentence alone, said in first_page_only.shortened.
+    Every count, the ledger with its samples and notes, the legend, the caveats and the
+    annotation calls stay on every page, named one by one — in both details.
+
+    MUTATION (verified RED, 13 failed): treat every page as a later one -> RED.
+    MUTATION (verified RED, 12 failed): leave first_page_only off a later page -> RED.
+    MUTATION (verified RED, 8 failed): leave no_real_change_needs off a later page -> RED.
+    MUTATION (verified RED, 8 failed): leave complete off a later page's progress (and list it
+    in first_page_only.keys) -> RED.
+    MUTATION (verified RED, 9 failed): shorten the note without listing it in shortened -> RED."""
+    w = _summary_world(tmp_path)
+    first = pv.get_diff_patch_view(w.atlas, DIFF, limit=1, detail=detail, **scope)
+    later = pv.get_diff_patch_view(w.atlas, DIFF, limit=1, offset=1, detail=detail, **scope)
+    assert "error" not in first and "error" not in later, (first, later)
+    assert "first_page_only" not in first
+    assert set(later) - set(first) == {"first_page_only"} and set(first) <= set(later)
+    fpo = later["first_page_only"]
+    assert set(fpo) == {"keys", "shortened", "read_with"}
+    assert fpo["read_with"] == "the same call with offset=0"
+    omitted = _env_paths(first) - _env_paths(later)
+    assert len(fpo["keys"]) == len(set(fpo["keys"])) and set(fpo["keys"]) == omitted
+    want = {"lens.order", "review_progress.next_page", "annotation.what", "annotation.promote_note"}
+    want |= {f"lens.{k}" for k in ("band", "anchored_differs", "anchored_micro_side") if k in scope}
+    assert omitted == want
+    assert first["review_progress"]["note"] == dr.PROGRESS_NOTE
+    assert later["review_progress"]["note"] == dr.PROGRESS_NOTE_COMPLETE
+    assert fpo["shortened"] == ["review_progress.note"]
+    for key in _PROGRESS_EVERY_PAGE:
+        assert key in later["review_progress"], key
+        assert later["review_progress"][key] == first["review_progress"][key], key
+    for key in _ANNOTATION_EVERY_PAGE:
+        assert key in later["annotation"], key
+        assert later["annotation"][key] == first["annotation"][key], key
+    for key in _ENVELOPE_EVERY_PAGE:
+        assert later[key] == first[key], key
+    assert any("sample" in s for s in later["blind_spots"])
+    assert any("note" in s for s in later["blind_spots"])
+    assert later["blind_spots"] == first["blind_spots"]
+    lens_every_page = ["view", "sort_by", "filters", "switchable"]
+    if scope.get("sort_by") == "significance":
+        lens_every_page += ["significance", "sunk_with_body_size_differs"]
+    for key in lens_every_page:
+        assert later["lens"][key] == first["lens"][key], key
+
+
+def test_a_withheld_diff_keeps_its_progress_and_annotation_on_every_page(
+    tmp_path: Path, current: None
+) -> None:
+    """A diff undetermined as a whole has a withheld progress block and an unavailable annotation
+    block: neither is shortened past the first page, and first_page_only names neither.
+
+    MUTATION (verified RED, 1 failed): shorten a withheld progress block too -> RED."""
+    w = _summary_world(tmp_path)
+    w.atlas.execute("UPDATE diff_meta SET version_skew = 1")
+    w.commit()
+    first = pv.get_diff_patch_view(w.atlas, DIFF, limit=1)
+    later = pv.get_diff_patch_view(w.atlas, DIFF, limit=1, offset=1)
+    assert first["review_progress"].get("withheld") is True
+    assert first["annotation"].get("available") is False
+    assert later["review_progress"] == first["review_progress"]
+    assert later["annotation"] == first["annotation"]
+    assert "first_page_only" in later
+    assert later["first_page_only"] == {
+        "keys": ["lens.order"],
+        "shortened": [],
+        "read_with": "the same call with offset=0",
+    }
+
+
+def test_reading_one_entry_carries_the_first_pages_envelope(tmp_path: Path, current: None) -> None:
+    """entry_id reads at offset 0, so its envelope is a first page's: every first-page text, the
+    whole note, no first_page_only; the views listed by name, detail named."""
+    w = _summary_world(tmp_path)
+    one = pv.get_diff_patch_view(w.atlas, DIFF, entry_id=R_HEAD)
+    first = pv.get_diff_patch_view(w.atlas, DIFF, limit=1)
+    assert "first_page_only" not in one
+    assert _env_paths(one) == _env_paths(first)
+    assert one["review_progress"]["note"] == dr.PROGRESS_NOTE
+    assert one["detail"] == "full" and one["available_views"] == list(pv.VIEWS)
+    assert one["lens"]["switchable"].endswith(" / detail")
+    assert "anchor_ref_template" in one["annotation"]
+
+
+@pytest.mark.parametrize("view", ["string_edge", "candidate_flat"])
+def test_the_other_views_take_the_first_page_rule_too(world: World, view: str) -> None:
+    """The envelope is the same in every view, and so is its first-page rule."""
+    first = pv.get_diff_patch_view(world.atlas, DIFF, view=view, limit=1)
+    later = pv.get_diff_patch_view(world.atlas, DIFF, view=view, limit=1, offset=1)
+    assert "error" not in later and later["entries"]
+    assert "first_page_only" not in first and "order" in first["lens"]
+    assert "order" not in later["lens"] and "lens.order" in later["first_page_only"]["keys"]
+
+
+@pytest.mark.parametrize(
+    ("kw", "match"),
+    [
+        ({"detail": "compact"}, "detail must be 'full' or 'summary', got 'compact'"),
+        ({"detail": None}, "detail must be 'full' or 'summary', got None"),
+        (
+            {"detail": "summary", "entry_id": ALIGNED},
+            "entry_id reads one entry in full: detail='summary' does not apply there",
+        ),
+        ({"detail": "summary", "view": "candidate_flat", "offset": 3}, "nothing to page"),
+        ({"detail": "summary", "rows_limit": -1}, "rows_limit must be an integer >= 0"),
+        ({"detail": "summary", "rows_limit": True}, "rows_limit must be an integer >= 0"),
+    ],
+)
+def test_a_detail_it_cannot_honour_is_an_error(
+    tmp_path: Path, current: None, kw: dict[str, Any], match: str
+) -> None:
+    """A combination the summary cannot honour is refused by name, never silently ignored.
+
+    MUTATION (verified RED, 1 failed): let detail='summary' take an entry_id -> RED."""
+    out = pv.get_diff_patch_view(_guard_world(tmp_path).atlas, DIFF, **kw)
+    assert match in out.get("error", ""), out
+    assert "entries" not in out
+
+
+def test_a_summary_ignores_a_valid_rows_limit(tmp_path: Path, current: None) -> None:
+    """A summary entry carries no row, so a valid rows_limit changes nothing on its pages (an
+    invalid one is still refused, above).
+
+    MUTATION (verified RED, 5 failed): window a summary's entries by rows_limit -> RED."""
+    w = _summary_world(tmp_path)
+    seen = {json.dumps(_pages(w, detail="summary", rows_limit=n)) for n in (0, 1, 7, 20)}
+    assert len(seen) == 1
+
+
+@pytest.mark.parametrize(
+    ("make", "name"),
+    [
+        (_summary_world, "aligned_pseudocode_differs"),
+        (_qualified_world, "aligned_pseudocode_identical_text_unverified"),
+    ],
+)
+def test_a_not_listed_summary_gives_each_pair_its_counts(
+    tmp_path: Path, current: None, make: Any, name: str
+) -> None:
+    """A not-listed pair in a summary: its addresses, similarity, sameness, body and reasons as
+    they are, its delta as counts and its guard scan without shown_rule — no delta, no guard.
+    The page's total and next offset are the full page's."""
+    w = make(tmp_path)
+    full = pv.get_diff_patch_view(w.atlas, DIFF, not_listed_page=name)
+    summary = pv.get_diff_patch_view(w.atlas, DIFF, not_listed_page=name, detail="summary")
+    assert (summary["total_entries"], summary["next_offset"]) == (
+        full["total_entries"],
+        full["next_offset"],
+    )
+    assert len(summary["entries"]) == len(full["entries"]) > 0
+    copied = (
+        "entry_id",
+        "addr_a",
+        "addr_b",
+        "similarity",
+        "pseudocode_sameness",
+        "body",
+        "text_unverified_reasons",
+    )
+    for f, s in zip(full["entries"], summary["entries"], strict=True):
+        want = {k: f[k] for k in copied if k in f and not _s_drop(k, f[k])}
+        if "pseudocode_delta" in f:
+            want["delta_summary"] = _s_delta(f["pseudocode_delta"])
+        if "guard_scan" in f:
+            want["guard_scan"] = _s_guard_scan(f["guard_scan"])
+        assert s == want
+    shown = {k for s in summary["entries"] for k in s}
+    assert ("delta_summary" in shown) or ("body" in shown)
+
+
+def test_a_candidate_flat_summary_is_the_overlays_own_summary(
+    tmp_path: Path, current: None
+) -> None:
+    """view='candidate_flat' with detail='summary' gives get_diff_sink_overlay(detail='summary')'s
+    counts and the row count, and no row to page."""
+    w = _summary_world(tmp_path)
+    tools = mcp_app.make_tools(w.path)
+    flat = tools["get_diff_patch_view"](DIFF, view="candidate_flat", detail="summary")
+    rows = tools["get_diff_patch_view"](DIFF, view="candidate_flat")
+    overlay = tools["get_diff_sink_overlay"](diff_id=DIFF, detail="summary")
+    assert "error" not in flat, flat
+    assert "entries" not in flat and "next_offset" not in flat
+    assert flat["summary"] == overlay["summary"]
+    assert flat["total_entries"] == rows["total_entries"] > pv.ROWS_INLINE_LIMIT
+
+
+def test_a_string_edge_summary_changes_the_envelope_only(world: World) -> None:
+    """string_edge rows have no compact form: a summary gives them as they are and says so."""
+    full = pv.get_diff_patch_view(world.atlas, DIFF, view="string_edge")
+    summary = pv.get_diff_patch_view(world.atlas, DIFF, view="string_edge", detail="summary")
+    assert summary["entries"] == full["entries"] and len(full["entries"]) == 2
+    assert summary["detail_note"] == (
+        "string_edge rows have no compact form; detail='summary' changes the envelope only"
+    )
+    assert "detail_with" not in summary and "detail_note" not in full
+
+
+@pytest.mark.parametrize("cap", ["DELTA_LINE_PRODUCT_CAP", "DELTA_TOKEN_PRODUCT_CAP"])
+def test_a_delta_that_was_not_computed_counts_nothing(
+    tmp_path: Path, current: None, monkeypatch: pytest.MonkeyPatch, cap: str
+) -> None:
+    """★ A delta over either product cap is not_computed, and its summary says only that — kind,
+    reason, and the hunk's why — never a structural_spans / substitutions_total / calls_differ /
+    line_number_form it does not have; its guard scan, not extracted, is given as it is.
+
+    MUTATION (verified RED, 6 failed): give calls_differ with a fallback after the empty-value
+    rule (``out["calls_differ"] = len(delta.get("calls", {}))``) -> RED. Before that rule the
+    fallback's 0 is left out like any 0 count, so it cannot reach a page (verified: 0 failed, an
+    equivalent mutant)."""
+    monkeypatch.setattr(sameness, cap, 0)
+    w = _summary_world(tmp_path)
+    summary = _listed(_pages(w, detail="summary"))
+    not_listed = pv.get_diff_patch_view(
+        w.atlas, DIFF, detail="summary", not_listed_page="aligned_pseudocode_differs"
+    )["entries"]
+    proposed = [e["proposed_pair_summary"] for e in summary if "proposed_pair_summary" in e]
+    blocks = [*summary, *proposed, *not_listed]
+    # (an insert-only block costs no token pair, so under the token cap a few deltas still compute)
+    deltas = [b["delta_summary"] for b in blocks if "delta_summary" in b]
+    not_computed = [d for d in deltas if d["kind"] == "not_computed"]
+    assert len(not_computed) > 5
+    for d in not_computed:
+        assert set(d) <= {"kind", "reason", "hunk"}, d
+        assert d["reason"] == "too_large"
+        assert set(d["hunk"]) <= {"withheld", "lines", "structural_lines", "groups"}
+    withheld = [b["guard_scan"] for b in blocks if "reason" in b.get("guard_scan", {})]
+    assert withheld
+    for scan in withheld:
+        assert scan == {"state": "not_extracted", "reason": "too_large"}
+
+
+def test_a_zero_count_hunk_is_given_as_it_is(
+    tmp_path: Path, current: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A too-large delta whose trimmed middle shows nothing carries a 0 / 0 hunk: the summary
+    gives it whole (the middle was computed and holds nothing to show), not as an absent hunk."""
+    monkeypatch.setattr(sameness, "DELTA_LINE_PRODUCT_CAP", 10)
+    w = World(tmp_path)
+    w.pair("00001000", "00002000", 0.97, 0.6)
+    w.fn("a", "00001000", ["foo"], pseudocode="void f(void)\n{\n  x = y + 1;\n}")
+    w.fn("b", "00002000", ["foo"], pseudocode="void f(void)\n{\n  x  =  y+1;\n\n}")
+    w.commit()
+    (full,) = pv.get_diff_patch_view(w.atlas, DIFF, rows_limit=0)["entries"]
+    (s,) = pv.get_diff_patch_view(w.atlas, DIFF, detail="summary")["entries"]
+    assert full["pseudocode_delta"]["inline_hunk"]["structural_lines"] == 0
+    assert full["pseudocode_delta"]["inline_hunk"]["groups"] == 0
+    assert s["delta_summary"] == {
+        "kind": "not_computed",
+        "reason": "too_large",
+        "hunk": {"structural_lines": 0, "groups": 0},
+    }
+
+
+def test_substitutions_total_counts_substitutions_not_token_kinds(
+    tmp_path: Path, current: None
+) -> None:
+    """A number substituted twice and a name once are three substitutions of two kinds.
+
+    MUTATION (verified RED, 1 failed): count the kinds (len(substitutions)) -> RED."""
+    w = World(tmp_path)
+    w.pair("00001000", "00002000", 0.97, 0.6)
+    w.fn("a", "00001000", ["foo"], pseudocode="x = 5;\ny = 5;\nz = a;")
+    w.fn("b", "00002000", ["foo"], pseudocode="x = 6;\ny = 6;\nz = b;")
+    w.commit()
+    (full,) = pv.get_diff_patch_view(w.atlas, DIFF, rows_limit=0)["entries"]
+    (s,) = pv.get_diff_patch_view(w.atlas, DIFF, detail="summary")["entries"]
+    subs = full["pseudocode_delta"]["substitutions"]
+    assert {k: v["total"] for k, v in subs.items()} == {"ident": 1, "number": 2}
+    assert s["delta_summary"]["substitutions_total"] == 3
+
+
+def test_every_boolean_is_given_and_only_one_reading_is_left_out(
+    tmp_path: Path, current: None
+) -> None:
+    """★ A summary gives every boolean true or false — callees_complete / narrow false on a
+    difference read in part, in_read_first false below the floor and when demoted, demoted false
+    when the proof is missing, b_other_fn_mentions false on an E entry (and on no other) — and
+    leaves out only what reads one way: a null export gap (a recorded one is given). The guard
+    scan keeps coverage and loses shown_rule; a hidden region keeps its jump-table counts; a
+    body-elsewhere count that could not be read is null, the key present.
+
+    MUTATION (verified RED, 4 failed, and 4 for callees_complete alone): treat a false boolean
+    as empty -> RED.
+    MUTATION (verified RED, 2 failed): leave b_other_fn_mentions out when false -> RED.
+    MUTATION (verified RED, 4 failed): keep shown_rule in the guard scan -> RED.
+    MUTATION (verified RED, 6 failed): leave a null body-elsewhere count out, as a 0 -> RED."""
+    w = _summary_world(tmp_path)
+    full = _by_id(_listed(_pages(w, rows_limit=0)))
+    s = _by_id(_listed(_pages(w, detail="summary")))
+    assert PARTIAL in s and R_LOW in s and R_KEPT in s and R_DEMOTED in s and EDGE in s
+    swap = s[PARTIAL].get("sink_callee_swap") or {}
+    assert swap.get("callees_complete") is False and swap.get("narrow") is False
+    assert swap.get("not_narrow") == "callee_identity_unresolved"
+    assert s[R_LOW].get("in_read_first") is False and "demoted" not in s[R_LOW]
+    assert s[R_KEPT].get("demoted") is False and s[R_KEPT].get("in_read_first") is True
+    assert s[R_DEMOTED].get("demoted") is True and s[R_DEMOTED].get("in_read_first") is False
+    assert s[EDGE].get("b_other_fn_mentions") is False
+    assert [k for k, e in s.items() if "b_other_fn_mentions" in e] == [EDGE]
+    assert full[R_GAP]["export_gap_b"] is None and "export_gap_b" not in s[R_GAP]
+    assert s[R_GAP].get("export_gap_a") == "degenerate_block"
+    assert s[P_GAP].get("export_gap") == "degenerate_block" and "export_gap" not in s[P_PLAIN]
+    assert full[ALIGNED]["guard_scan"].get("shown_rule") == "b_order"
+    assert "shown_rule" not in s[ALIGNED]["guard_scan"]
+    assert s[ALIGNED]["guard_scan"].get("coverage") == "unjudged"
+    assert s[JUMPTABLE].get("hidden_region") == {
+        "body": "structure_differs",
+        "markers": 2,
+        "unrecovered_jumptable_refs": {"a": 1, "b": 1},
+    }
+    reading = full[R_MICRO]["proposed_pair_reading"]
+    assert reading["a_body_elsewhere_in_b"] is None and reading["b_body_elsewhere_in_a"] is None
+    ps = s[R_MICRO]["proposed_pair_summary"]
+    for key in ("a_body_elsewhere_in_b_count", "b_body_elsewhere_in_a_count"):
+        assert key in ps and ps[key] is None, key
+
+
+def test_a_body_elsewhere_count_is_null_unread_left_out_at_zero_given_above(
+    tmp_path: Path, current: None
+) -> None:
+    """The three readings of a body-elsewhere count, side by side: not read (null, given), read
+    and 0 (left out), read and more (given); a proposed text_unverified reading keeps its
+    reasons."""
+    w = _undetermined_world(tmp_path)
+    full = _by_id(_listed(_pages(w, rows_limit=0)))
+    summary = _by_id(_listed(_pages(w, detail="summary")))
+    seen = set()
+    for eid, e in full.items():
+        reading = e.get("proposed_pair_reading")
+        if reading is None:
+            continue
+        ps = summary[eid]["proposed_pair_summary"]
+        source = reading["a_body_elsewhere_in_b"]
+        if source is None:
+            assert "a_body_elsewhere_in_b_count" in ps and ps["a_body_elsewhere_in_b_count"] is None
+            seen.add("null")
+        elif source["count"] == 0:
+            assert "a_body_elsewhere_in_b_count" not in ps
+            seen.add("zero")
+        else:
+            assert ps.get("a_body_elsewhere_in_b_count") == source["count"]
+            seen.add("more")
+        if reading.get("text_unverified_reasons"):
+            assert ps.get("text_unverified_reasons") == reading["text_unverified_reasons"]
+            seen.add("reasons")
+    assert seen == {"null", "zero", "more", "reasons"}
+
+
+def test_a_summary_keeps_every_fact_but_the_two_said_elsewhere(
+    world: World, tmp_path: Path
+) -> None:
+    """A summary's facts are the entry's facts less source_gap:* (in blind_spots) and
+    callee_set_unchanged (in callee_set.state): one_hop_sink:* and one_side_skipped_micro stay.
+
+    MUTATION (verified RED, 3 failed): drop facts whole -> RED.
+    MUTATION (verified RED, 2 failed): drop one_hop_sink:* with the two -> RED."""
+    full = _by_id(_listed(_pages(world, rows_limit=0)))
+    summary = _by_id(_listed(_pages(world, detail="summary")))
+    every = {f for e in full.values() for f in e["facts"]}
+    assert "callee_set_unchanged" in every
+    assert any(f.startswith("source_gap:") for f in every)
+    assert any(f.startswith("one_hop_sink:") for f in every)
+    for eid, e in full.items():
+        kept = [
+            f for f in e["facts"] if not f.startswith("source_gap:") and f != "callee_set_unchanged"
+        ]
+        assert summary[eid].get("facts", []) == kept, eid
+    (tmp_path / "swap").mkdir()
+    sw, ids = _swap_world(tmp_path / "swap")
+    micro = _by_id(_listed(_pages(sw, detail="summary")))[ids["c_micro"]]
+    assert "one_side_skipped_micro" in micro.get("facts", [])
+
+
+def test_the_tool_says_how_a_summary_reads_and_which_detail_it_is() -> None:
+    """The tool's description carries the reading rule of a summary word for word — with its two
+    shapes that count nothing and its null — and says the two tools' detail switches differ."""
+    doc = " ".join(
+        (mcp_app.make_tools(Path("unused.db"))["get_diff_patch_view"].__doc__ or "").split()
+    )
+    assert (
+        "In detail='summary' a missing count is 0 — except inside a delta_summary whose kind is "
+        "not_computed, or a guard_scan that carries a reason: there nothing was counted. A "
+        "body-elsewhere count that could not be read is null, not missing."
+    ) in doc
+    assert (
+        "``detail`` here is ``full`` / ``summary``; get_diff_sink_overlay's ``detail`` is "
+        "``summary`` / ``rows`` — a different switch."
+    ) in doc
+    assert "first_page_only" in doc and "anchor_ref_template" in doc
+
+
+def test_the_complete_sentence_is_the_progress_notes_own() -> None:
+    """A later page's note is the full note's own 'complete' sentence, whole."""
+    assert dr.PROGRESS_NOTE_COMPLETE in dr.PROGRESS_NOTE
+    assert dr.PROGRESS_NOTE_COMPLETE.startswith("'complete' means no entry in THIS scope")
+    assert dr.PROGRESS_NOTE_COMPLETE.endswith("is not in any entry.")
+
+
+def _copied_call(template: str, **fill: str) -> tuple[str, dict[str, Any]]:
+    """A call copied from a template with its placeholders filled: its name and arguments, read by
+    the Python parser — an argument left unquoted does not parse."""
+    for key, value in fill.items():
+        template = template.replace(f"<{key}>", value)
+    try:
+        node = ast.parse(template, mode="eval").body
+    except SyntaxError as exc:
+        pytest.fail(f"{template!r} is not a call that can be copied: {exc}")
+    assert isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    return node.func.id, {kw.arg: ast.literal_eval(kw.value) for kw in node.keywords if kw.arg}
+
+
+def test_a_summary_page_says_how_to_read_what_it_left_out(tmp_path: Path, current: None) -> None:
+    """★ detail_with, by view: on a listed page a call reading one entry (and paging its rows) that
+    works copied with a real entry_id; on a not-listed page the same call with detail='full' (no
+    entry_id names such a pair); on candidate_flat the overlay rows' call; on string_edge none.
+
+    MUTATION (verified RED, 2 failed): give the not-listed page the entry_id call -> RED.
+    MUTATION (verified RED, 1 failed): leave the entry_id placeholder unquoted -> RED."""
+    w = _summary_world(tmp_path)
+    page = pv.get_diff_patch_view(w.atlas, DIFF, detail="summary")
+    with_ = page["detail_with"]
+    assert set(with_) == {"one_entry", "its_rows"}
+    name, args = _copied_call(with_["one_entry"], entry_id=MANY_ROWS)
+    assert (name, args) == ("get_diff_patch_view", {"diff_id": DIFF, "entry_id": MANY_ROWS})
+    (one,) = pv.get_diff_patch_view(w.atlas, **args)["entries"]
+    assert one["entry_id"] == MANY_ROWS and len(one["rows"]) == pv.ROWS_INLINE_LIMIT
+    name, args = _copied_call(with_["its_rows"], entry_id=MANY_ROWS, n="20")
+    assert (name, args) == (
+        "get_diff_patch_view",
+        {"diff_id": DIFF, "entry_id": MANY_ROWS, "rows_offset": 20},
+    )
+    (rest,) = pv.get_diff_patch_view(w.atlas, **args)["entries"]
+    assert len(rest["rows"]) == 2
+    nl = pv.get_diff_patch_view(
+        w.atlas, DIFF, detail="summary", not_listed_page="aligned_pseudocode_differs"
+    )
+    assert nl["detail_with"] == {"its_detail": "the same call with detail='full'"}
+    flat = pv.get_diff_patch_view(w.atlas, DIFF, detail="summary", view="candidate_flat")
+    name, args = _copied_call(flat["detail_with"]["its_rows"])
+    assert (name, args) == ("get_diff_sink_overlay", {"diff_id": DIFF, "detail": "rows"})
+    rows = mcp_app.make_tools(w.path)["get_diff_sink_overlay"](**args)
+    assert rows["total_rows"] == flat["total_entries"] and rows["rows"]
+    edge = pv.get_diff_patch_view(w.atlas, DIFF, detail="summary", view="string_edge")
+    assert "detail_with" not in edge
+    assert "detail_with" not in pv.get_diff_patch_view(w.atlas, DIFF)

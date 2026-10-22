@@ -11,8 +11,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
+
+import pytest
 
 from treasure_map.lib import facts
+from treasure_map.lib.query import sameness
 from treasure_map.lib.storage.connection import open_db
 
 
@@ -842,3 +846,250 @@ def test_get_pseudocode_omits_detector_errors_when_none_threw(tmp_path: Path) ->
     assert out["found"] is True
     assert "detector_errors" not in out
     assert "detector_errors_note" not in out
+
+
+# ── get_pseudocode paged by line ──────────────────────────────────────────────────────────────
+
+_BUDGET = facts._FACT_PAGE_CHARS
+_PAGING_KEYS = {
+    "offset",
+    "returned",
+    "next_offset",
+    "truncated",
+    "first_line",
+    "last_line",
+    "total_lines",
+    "total_chars",
+    "how_to_get_rest",
+}
+
+
+def _db_with_bodies(tmp_path: Path, bodies: dict[str, str | None]) -> Path:
+    """One binary holding one function per ``bodies`` item (name -> pseudocode), plus a function
+    ``dup`` in a second binary of the same short name (so ``dup`` with binary='webd' is
+    ambiguous)."""
+    db = tmp_path / "analysis.db"
+    conn = open_db(db)
+    for bid, path in ((1, "usr/sbin/webd"), (2, "opt/sbin/webd")):
+        conn.execute(
+            "INSERT INTO binaries (id, name, path, sha256, last_seen_at) "
+            "VALUES (?, 'webd', ?, ?, '2026-01-01T00:00:00')",
+            (bid, path, ("a" if bid == 1 else "c") * 64),
+        )
+        conn.execute(
+            "INSERT INTO functions (binary_id, name, address, pseudocode, callees, is_exported) "
+            "VALUES (?, 'dup', '0x9000', 'int dup(){}', '[]', 0)",
+            (bid,),
+        )
+    for n, (name, body) in enumerate(bodies.items()):
+        conn.execute(
+            "INSERT INTO functions (binary_id, name, address, pseudocode, callees, is_exported) "
+            "VALUES (1, ?, ?, ?, '[]', 0)",
+            (name, f"0x{0x1000 + 0x100 * n:x}", body),
+        )
+    conn.commit()
+    conn.close()
+    return db
+
+
+def _segments(conn: Any, func: str) -> list[dict[str, Any]]:
+    """Every segment of one function's pseudocode, following next_offset (bounded, so a segment
+    that made no progress fails instead of looping)."""
+    out: list[dict[str, Any]] = []
+    offset = 0
+    for _ in range(1000):
+        r = facts.get_pseudocode(
+            conn, func=func, binary="usr/sbin/webd", offset=offset, max_chars=_BUDGET
+        )
+        assert r.get("found") is True, r
+        out.append(r)
+        nxt = r["paging"]["next_offset"]
+        if nxt is None:
+            return out
+        assert nxt > offset, r["paging"]
+        offset = nxt
+    raise AssertionError("no last segment")
+
+
+# A body over the budget holding every line shape str.splitlines() reads: CRLF and form-feed line
+# breaks, blank lines, one line longer than the whole budget, and no newline at the end.
+_LONG = (
+    "".join(f"  local_{i:x} = FUN_{i:08x}(param_1, {i});\n" for i in range(400))
+    + "  first();\r\n\r\n  second();\x0c  third();\n\n"
+    + '  table = "'
+    + "x" * (_BUDGET + 5000)
+    + '";\n'
+    + "".join(f"  tail_{i}();\r\n" for i in range(1800))
+    + "  return;"
+)
+
+
+def test_a_long_body_comes_in_whole_lines_that_join_back_to_it_exactly(tmp_path: Path) -> None:
+    """★ A body over the budget comes in segments of whole lines: joined in next_offset order they
+    are the text exactly (CRLF, form feed, blank lines, the missing final newline), each within
+    the budget except the one line longer than it (given whole, line_over_budget), each segment's
+    paging naming where its lines sit in str.splitlines() numbering.
+
+    MUTATION (verified RED, 9 failed): split with splitlines() and join with "\\n" -> RED."""
+    conn = facts.open_analysis_ro(_db_with_bodies(tmp_path, {"big": _LONG}))
+    try:
+        segs = _segments(conn, "big")
+    finally:
+        conn.close()
+    lines = _LONG.splitlines(keepends=True)
+    assert len(segs) > 3
+    assert "".join(str(s["pseudocode"]) for s in segs) == _LONG
+    over = 0
+    for s in segs:
+        text = str(s["pseudocode"])
+        p = s["paging"]
+        assert isinstance(p, dict) and set(p) - {"line_over_budget"} == _PAGING_KEYS
+        assert text == "".join(lines[p["offset"] : p["offset"] + p["returned"]])
+        assert (p["first_line"], p["last_line"]) == (p["offset"] + 1, p["offset"] + p["returned"])
+        assert (p["total_lines"], p["total_chars"]) == (len(lines), len(_LONG))
+        assert p["truncated"] is (p["next_offset"] is not None)
+        assert (p["how_to_get_rest"] is None) is (p["next_offset"] is None)
+        if p.get("line_over_budget"):
+            over += 1
+            assert p["line_over_budget"] is True and p["returned"] == 1 and len(text) > _BUDGET
+        else:
+            assert "line_over_budget" not in p and len(text) <= _BUDGET
+    assert over == 1
+    assert segs[-1]["paging"]["next_offset"] is None
+
+
+def test_lines_that_add_up_to_the_budget_exactly_fill_one_segment(tmp_path: Path) -> None:
+    """Lines whose characters add up to exactly the budget all go in the first segment, the last
+    one included; the next line starts the second.
+
+    MUTATION (verified RED, 1 failed): add a line only while under the budget (``<``) -> RED.
+    MUTATION (verified RED, 2 failed): give no line when the first is over the budget -> RED."""
+    line = "  x" + "y" * 45 + ";\n"  # 50 characters
+    assert len(line) == 50 and _BUDGET % 50 == 0
+    exact = _BUDGET // 50
+    body = line * exact + "  after();\n" + "  tail" + "z" * _BUDGET + ";"
+    conn = facts.open_analysis_ro(_db_with_bodies(tmp_path, {"edge": body}))
+    try:
+        segs = _segments(conn, "edge")
+    finally:
+        conn.close()
+    first = segs[0]["paging"]
+    assert isinstance(first, dict)
+    assert first["returned"] == exact and len(str(segs[0]["pseudocode"])) == _BUDGET
+    assert first["last_line"] == exact and first["next_offset"] == exact
+    assert str(segs[1]["pseudocode"]).startswith("  after();")
+    assert segs[-1]["paging"].get("line_over_budget") is True
+    assert "".join(str(s["pseudocode"]) for s in segs) == body
+
+
+def test_a_segments_line_numbers_are_the_ones_a_guard_names(tmp_path: Path) -> None:
+    """The 1-based line a diff's guard names in the B text (sameness numbering: blank lines, CRLF
+    and form feed counted as str.splitlines() counts them) is found at first_line + its index in
+    the segment that holds it — past the first segment."""
+    head = "".join(f"  step_{i}();\r\n" for i in range(1500)) + "\x0c\n\r\n  \n"
+    a = head + "  n = get();\n  use(n);\n  return;"
+    b = head + "  n = get();\n  if (n < 0x10) {\n  use(n);\n  }\n  return;"
+    _delta, scan = sameness.pseudocode_delta_and_guards(a, b, None, None, "1000", "2000")
+    (guard,) = scan["guards"]
+    conn = facts.open_analysis_ro(_db_with_bodies(tmp_path, {"grown": b}))
+    try:
+        segs = _segments(conn, "grown")
+    finally:
+        conn.close()
+    held = [
+        (n, s)
+        for n, s in enumerate(segs)
+        if s["paging"]["first_line"] <= guard["line_b"] <= s["paging"]["last_line"]
+    ]
+    assert len(held) == 1 and held[0][0] > 0
+    seg = held[0][1]
+    shown = seg["pseudocode"].splitlines()[guard["line_b"] - seg["paging"]["first_line"]]
+    assert "if (n < 0x10)" in shown
+
+
+@pytest.mark.parametrize("offset", [-1, 2, 1.5, True, "1"])
+def test_an_offset_past_the_last_line_or_not_a_line_index_is_an_error(
+    tmp_path: Path, offset: object
+) -> None:
+    """An offset past the last line, or not an integer >= 0, is {error, total_lines} — with no
+    ``found`` key: the function WAS found, so a reader routing a miss to another run is not
+    misled.
+
+    MUTATION (verified RED, 4 failed): give the error found: False -> RED."""
+    conn = facts.open_analysis_ro(_db_with_bodies(tmp_path, {"two": "a();\nb();\n"}))
+    try:
+        r = facts.get_pseudocode(
+            conn, func="two", binary="usr/sbin/webd", offset=offset, max_chars=_BUDGET
+        )
+        ok = facts.get_pseudocode(
+            conn, func="two", binary="usr/sbin/webd", offset=1, max_chars=_BUDGET
+        )
+    finally:
+        conn.close()
+    assert set(r) == {"error", "total_lines"} and r["total_lines"] == 2, r
+    assert ok["pseudocode"] == "b();\n" and ok["paging"]["first_line"] == 2
+
+
+@pytest.mark.parametrize("body", [None, ""])
+def test_an_empty_body_is_one_empty_segment_and_any_later_offset_an_error(
+    tmp_path: Path, body: str | None
+) -> None:
+    """An empty or missing body is returned as it is with a paging of no line (the same keys);
+    offset 0 is always valid, any later one is past the last line.
+
+    MUTATION (verified RED, 2 failed): read an offset past an empty body as offset 0 -> RED."""
+    conn = facts.open_analysis_ro(_db_with_bodies(tmp_path, {"empty": body}))
+    try:
+        r = facts.get_pseudocode(conn, func="empty", binary="usr/sbin/webd", max_chars=_BUDGET)
+        later = facts.get_pseudocode(
+            conn, func="empty", binary="usr/sbin/webd", offset=1, max_chars=_BUDGET
+        )
+    finally:
+        conn.close()
+    assert r["found"] is True and r["pseudocode"] == body
+    assert r["paging"] == {
+        "offset": 0,
+        "returned": 0,
+        "next_offset": None,
+        "truncated": False,
+        "first_line": None,
+        "last_line": None,
+        "total_lines": 0,
+        "total_chars": 0,
+        "how_to_get_rest": None,
+    }
+    assert later == {"error": later.get("error"), "total_lines": 0} and later["error"]
+
+
+def test_a_body_within_the_budget_is_one_segment_and_a_miss_has_no_paging(
+    tmp_path: Path,
+) -> None:
+    """A body within the budget comes whole, with the same paging keys (truncated false); a miss
+    and an ambiguous name carry no paging, as before."""
+    conn = facts.open_analysis_ro(_db_with_bodies(tmp_path, {"small": "a();\n\nb();"}))
+    try:
+        small = facts.get_pseudocode(conn, func="small", binary="usr/sbin/webd", max_chars=_BUDGET)
+        miss = facts.get_pseudocode(conn, func="nothing", offset=5, max_chars=_BUDGET)
+        ambiguous = facts.get_pseudocode(conn, func="dup", binary="webd", max_chars=_BUDGET)
+    finally:
+        conn.close()
+    assert small["pseudocode"] == "a();\n\nb();"
+    assert set(small["paging"]) == _PAGING_KEYS
+    assert small["paging"]["truncated"] is False and small["paging"]["next_offset"] is None
+    assert (small["paging"]["first_line"], small["paging"]["last_line"]) == (1, 3)
+    assert miss["found"] is False and "paging" not in miss
+    assert ambiguous.get("reason") == "ambiguous" and "paging" not in ambiguous
+
+
+def test_with_no_budget_the_whole_body_comes_as_before(tmp_path: Path) -> None:
+    """The command line reads with no budget: the whole text, no paging key, the offset not read.
+
+    MUTATION (verified RED, 3 failed): default max_chars to the fact-page budget -> RED."""
+    conn = facts.open_analysis_ro(_db_with_bodies(tmp_path, {"big": _LONG}))
+    try:
+        whole = facts.get_pseudocode(conn, func="big", binary="usr/sbin/webd")
+        ignored = facts.get_pseudocode(conn, func="big", binary="usr/sbin/webd", offset=7)
+    finally:
+        conn.close()
+    assert whole["pseudocode"] == _LONG and "paging" not in whole
+    assert ignored == whole

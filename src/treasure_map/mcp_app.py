@@ -359,7 +359,7 @@ _AGENT_INSTRUCTIONS = (
     "candidates included (stale_scan + remedy; on a cross-run reader its rows are dropped and it "
     "is named under stale_runs_refused); an unprovable mismatch is served with its reason stated, "
     "never refused. Read "
-    "facts: get_pseudocode (func = a name OR an address in any form; "
+    "facts: get_pseudocode (paged by line (offset); func = a name OR an address in any form; "
     "binary = sha256 (or >=8-hex prefix) OR full path OR short name. A short name shared by "
     "several binaries returns reason='ambiguous' listing each candidate's binary_path and "
     "sha256 — re-issue with one of them; ambiguous is not an error, it is what the firmware "
@@ -389,9 +389,12 @@ _AGENT_INSTRUCTIONS = (
     "by a person — you cannot write that (people do, from the command line), and it is usually not "
     "worth re-verifying. For a version diff, start at get_diff_patch_view(diff_id) — "
     "rows_limit=0 scans the ranking with each entry's summary and inline_hunk (the changed lines "
-    "themselves, as the original text has them, or why withheld: read get_pseudocode then), "
+    "themselves, as the original text has them, or why withheld: read get_pseudocode then), and "
+    "detail='summary' gives each entry only its counts plus the anchor template (walk the whole "
+    "ranking with it, then read the entries you pick with entry_id), "
     "before you page one entry's rows: every entry "
-    "carries its anchor_ref and review_state; annotate_diff(diff_id, anchor_ref, verdict="
+    "carries its anchor_ref (a summary entry rebuilds it from annotation.anchor_ref_template) and "
+    "review_state; annotate_diff(diff_id, anchor_ref, verdict="
     "changed_real|no_real_change|change_inconclusive, rationale) records your judgement on one "
     "entry, promote(diff_id, entry_id, row_ref, verdict, rationale) carries it onto one of the "
     "entry's candidates as a candidate verdict (an entry shows 20 rows inline: to find a row_ref "
@@ -1900,6 +1903,7 @@ def make_tools(
         entry_id: str | None = None,
         rows_offset: int | None = None,
         rows_limit: int = _ROWS_INLINE_LIMIT,
+        detail: str = "full",
     ) -> dict[str, Any]:
         """START HERE for one diff (``diff_id`` = ``{run_a}::{run_b}::{binary}``; list_diffs gives
         the ids): one entry per FUNCTION PAIR that changed, with what happened around its sink
@@ -1927,7 +1931,8 @@ def make_tools(
         sink-impact tier — then R, B, E in that order), then the entries with no candidate
         (recall_gap_sink, R, C, then E by caller relevance: a callee the hunt does not recall as a
         sink, then a callee that itself holds a candidate, then the rest), then P; each entry's
-        ``rank_key`` names the components. Under ``sort_by='significance'`` an E lane reads first
+        ``rank_key`` (``detail='full'``) names the components. Under ``sort_by='significance'``
+        an E lane reads first
         the functions no other B function names (``b_other_fn_mentions`` false) — that key never
         enters the default order or ``rank_key``. ``sort_by`` (``tier`` / ``similarity`` /
         ``address``) puts one component first. ``sort_by='significance'`` is a lens, not a
@@ -1975,8 +1980,45 @@ def make_tools(
         inline window; ``rows_limit=0`` is a scan — every entry with its summary (bucket, subclass,
         significance, ``sink_callee_swap``, counts, ``inline_hunk``) and no inline row, so many more
         entries fit a page: rank with it first, then read the rows of the entries you pick with
-        ``entry_id`` + ``rows_offset`` (where ``rows_limit`` must be at least 1). For an aligned
-        pair the entry also carries
+        ``entry_id`` + ``rows_offset`` (where ``rows_limit`` must be at least 1).
+
+        ``detail`` (``full``, the default, or ``summary``): ``summary`` gives each entry its
+        counts and states only — no ``rank_key``, ``rows``, ``pseudocode_delta`` /
+        ``inline_hunk``, ``guards``, ``proposed_pair_reading`` or ``anchor_ref``
+        (``annotation.anchor_ref_template`` rebuilds it from the entry's ``addr_a`` / ``addr_b``,
+        or ``side`` / ``addr``). It keeps the identity and state fields (bucket, subclass, tier,
+        blind_spots, review_state, the addresses, names and export gaps, similarity,
+        pseudocode_sameness, significance, ``rows_total`` / ``rows_by_presence``), ``facts``
+        (less the source gaps already in blind_spots), ``callee_set`` as its state,
+        ``sink_callee_swap`` with its sinks and qualifiers, and as counts: ``delta_summary`` (kind,
+        structural_spans, substitutions_total, calls_differ, line_number_form, and the hunk's
+        gate counts or why it is withheld), ``guard_scan`` without ``shown_rule``,
+        ``hidden_region`` (body, marker count), ``bodies`` (each side's status and size). An
+        undetermined pair's reading comes as ``proposed_pair_summary``, with its
+        anchored_differs / anchor / in_read_first / demoted on the entry, and an anchored
+        micro-side pair carries ``anchored_micro_side: true``. In detail='summary' a missing count
+        is 0 — except inside a delta_summary whose kind is not_computed, or a guard_scan that
+        carries a reason: there nothing was counted. A body-elsewhere count that could not be
+        read is null, not missing. Every boolean (callees_complete, narrow, in_read_first,
+        demoted, b_other_fn_mentions) is given true or false. The order, filters, counts and
+        review_progress are those of ``detail='full'``; ``rows_limit`` is ignored (a summary
+        entry carries no row), and ``entry_id`` reads one entry in full only — with
+        ``detail='summary'`` it is an error. Walk the whole ranking with it, then read the
+        entries you pick with the call in ``detail_with``. ``not_listed_page`` pairs get the same
+        counts; ``view='candidate_flat'`` gives get_diff_sink_overlay's ``summary`` counts and no
+        row (``offset`` must be 0); ``string_edge`` rows are unchanged. ``detail`` here is
+        ``full`` / ``summary``; get_diff_sink_overlay's ``detail`` is ``summary`` / ``rows`` — a
+        different switch.
+
+        Every page carries the counts, ``blind_spots``, ``legend`` and ``caveats``. The long texts
+        that are the same on every page of a scope — ``lens.order`` and the filter texts,
+        ``review_progress.next_page``, ``annotation.what`` / ``promote_note`` — come on the first
+        page (``offset`` 0) only: a later page lists what it leaves out in
+        ``first_page_only.keys``, and in ``first_page_only.shortened`` what it gives in short
+        (``review_progress.note``: only its 'complete' sentence). ``available_views`` is the list
+        of view names.
+
+        For an aligned pair the entry also carries
         ``callee_set``: the two extracted callee lists compared (``equal`` / ``differs`` with
         ``only_in_a`` / ``only_in_b`` / ``undetermined`` with the reason). A differing list is NOT
         proof a call was made or dropped — tmap's decompile can miss a call — and it never moves
@@ -2132,7 +2174,8 @@ def make_tools(
         are not compared.
 
         YOUR JUDGEMENTS on the entries are a separate, writable layer; the view's facts never
-        change because of them. Every entry carries ``anchor_ref`` (what to judge it by) and
+        change because of them. Every entry carries ``anchor_ref`` (what to judge it by; a
+        ``detail='summary'`` entry rebuilds it from ``annotation.anchor_ref_template``) and
         ``review_state`` (``none`` = not judged yet, ``inconclusive`` = judged
         change_inconclusive, ``concluded``, ``needs_recheck`` = its facts moved or the diff is
         not current, ``needs_relabel``). ``review_progress`` counts them over the filtered entries
@@ -2176,6 +2219,7 @@ def make_tools(
                 entry_id=entry_id,
                 rows_offset=rows_offset,
                 rows_limit=rows_limit,
+                detail=detail,
             )
             return _fit_entries(result, offset)
         finally:
@@ -2681,6 +2725,7 @@ def make_tools(
         binary: str | None = None,
         run_id: str | None = None,
         evidence_ref: str | None = None,
+        offset: int = 0,
     ) -> dict[str, Any]:
         """Decompiler pseudocode for one function (name or address); the default read view.
 
@@ -2694,9 +2739,19 @@ def make_tools(
         when it does, the result is ``reason='ambiguous'`` listing each candidate's
         ``binary_path`` and ``sha256`` — re-issue with one of them. That is an answer about
         the firmware, not an error.
-        When ``func`` resolves, ITS binary is used and ``binary`` does not re-select."""
+        When ``func`` resolves, ITS binary is used and ``binary`` does not re-select.
+
+        Paged by line: a function longer than ~20k characters comes in segments — pass
+        ``offset`` = ``paging.next_offset``; line numbers (``first_line``/``last_line``, 1-based,
+        blank lines counted) are the ones inline_hunk and guards use. Each segment is whole
+        lines (a single line longer than the budget comes whole, ``line_over_budget: true``),
+        and the segments joined in order are the text exactly. ``paging.total_chars`` is the
+        whole text's length in characters. An ``offset`` past the last line is an error that
+        gives ``total_lines``."""
         return _fact(
-            lambda c, fn, bn: facts.get_pseudocode(c, func=fn or "", binary=bn),
+            lambda c, fn, bn: facts.get_pseudocode(
+                c, func=fn or "", binary=bn, offset=offset, max_chars=facts._FACT_PAGE_CHARS
+            ),
             run_id=run_id,
             evidence_ref=evidence_ref,
             function=function,

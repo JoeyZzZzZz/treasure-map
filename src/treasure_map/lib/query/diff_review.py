@@ -468,12 +468,18 @@ def next_page(items: list[Item], page_size: int = DEFAULT_PAGE_SIZE) -> list[dic
     return out
 
 
+# The sentence of PROGRESS_NOTE that says what 'complete' means. get_diff_patch_view gives it alone
+# on a page past the first, where the whole note (the state words defined) is not repeated.
+PROGRESS_NOTE_COMPLETE = (
+    "'complete' means no entry in THIS scope is unjudged — not that the diff, or the firmware, has "
+    "been read: what the view cannot see is in blind_spots beside it, and a sink that never became "
+    "a candidate is not in any entry."
+)
 PROGRESS_NOTE = (
     "Progress over the view's ENTRIES, per page, with the remainder stated every time. An entry "
-    "counts as looked at once a judgement exists on its anchor (annotate_diff). 'complete' means "
-    "no entry in THIS scope is unjudged — not that the diff, or the firmware, has been read: what "
-    "the view cannot see is in blind_spots beside it, and a sink that never became a candidate is "
-    "not in any entry. 'needs_recheck' = the entry's facts moved since the judgement, or the diff "
+    "counts as looked at once a judgement exists on its anchor (annotate_diff). "
+    + PROGRESS_NOTE_COMPLETE
+    + " 'needs_recheck' = the entry's facts moved since the judgement, or the diff "
     "is not current (source_stale not false), or the diff is withheld; 'needs_relabel' = the "
     "verdict word is retired. A judgement that cannot be settled is 'change_inconclusive': it "
     "stays in view."

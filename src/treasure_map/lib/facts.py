@@ -465,7 +465,12 @@ def _col(row: Any, name: str) -> Any:
 
 
 def get_pseudocode(
-    conn: sqlite3.Connection, *, func: str, binary: str | None = None
+    conn: sqlite3.Connection,
+    *,
+    func: str,
+    binary: str | None = None,
+    offset: int = 0,
+    max_chars: int | None = None,
 ) -> dict[str, Any]:
     """Decompiler pseudocode for one function (the default read view), with its anchor.
 
@@ -473,11 +478,25 @@ def get_pseudocode(
     ``0040a1c0`` / ``4235712`` decimal / ``FUN_0040a1c0``). ``binary`` accepts the short name, the
     full path, the sha256 or a sha256 prefix (>= 8 hex). Returns a not-found record (never a
     guess) when the function does not resolve uniquely; an ambiguous name lists the candidate
-    anchors to disambiguate."""
+    anchors to disambiguate.
+
+    ``max_chars`` None (the default) returns the whole text and reads no ``offset``. Given, the text
+    is paged by LINE (:func:`_line_page`): ``pseudocode`` holds whole lines from line index
+    ``offset`` within ``max_chars`` characters (at least one line, never cut), and ``paging`` says
+    where they sit — the segments joined in ``next_offset`` order are the text exactly. An
+    ``offset`` past the last line, or not an integer >= 0, is ``{error, total_lines}`` (no
+    ``found`` key: the function was found)."""
     row, miss = _resolve_one(conn, func, binary)
     if row is None:
         assert miss is not None
         return miss
+    text = row["pseudocode"]
+    paging: dict[str, Any] | None = None
+    if max_chars is not None:
+        page = _line_page(text, offset, max_chars)
+        if "error" in page:
+            return page
+        text, paging = page["text"], page["paging"]
     truncated = bool(row["callees_truncated"])
     result: dict[str, Any] = {
         "found": True,
@@ -487,8 +506,10 @@ def get_pseudocode(
         "is_exported": bool(row["is_exported"]),
         "callees": _parse_callees(row["callees"]),
         "callees_truncated": truncated,
-        "pseudocode": row["pseudocode"],
+        "pseudocode": text,
     }
+    if paging is not None:
+        result["paging"] = paging
     # Stub calls the ELF resolver could not name: a possible unrecognized libc sink this function
     # makes that is left visible rather than read as an ordinary internal call. Surfaced only when
     # present, so it is never noise on the ordinary case.
@@ -848,6 +869,81 @@ def _byte_page(
         ),
     }
     return page, envelope
+
+
+def _line_page(text: str | None, offset: Any, max_chars: int) -> dict[str, Any]:
+    """One segment of a function's pseudocode, by line: ``{text, paging}``, or ``{error,
+    total_lines}`` when ``offset`` is not an integer >= 0 or is past the last line (0 is always
+    valid, an empty body included).
+
+    Lines are ``str.splitlines(keepends=True)`` — numbered from 1, blank lines counted, the same
+    lines a diff's inline_hunk and guards number — so joining the segments gives the text back
+    exactly. From line index ``offset``, lines are taken while their characters add up to at most
+    ``max_chars``, and always one: a single line over the budget is given whole, with
+    ``line_over_budget: true``. ``paging`` has the same keys in every shape — ``offset`` /
+    ``returned`` (lines) / ``next_offset`` / ``truncated`` (a later segment follows, as in
+    _byte_page) / ``first_line`` / ``last_line`` / ``total_lines`` / ``total_chars`` /
+    ``how_to_get_rest`` — with ``line_over_budget`` only when true. ``total_chars`` here is the
+    length of the text itself; _byte_page's key of that name is the length of each row's
+    ``str()``. An empty or missing body is returned as it is, with no line."""
+    lines = text.splitlines(keepends=True) if text else []
+    total = len(lines)
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        return {"error": f"offset must be an integer >= 0, got {offset!r}", "total_lines": total}
+    if offset > 0 and offset >= total:
+        return {
+            "error": (
+                f"offset {offset} is past the last line: the function has {total} lines "
+                "(offset is a 0-based line index)"
+            ),
+            "total_lines": total,
+        }
+    if not lines:
+        return {
+            "text": text,
+            "paging": {
+                "offset": 0,
+                "returned": 0,
+                "next_offset": None,
+                "truncated": False,
+                "first_line": None,
+                "last_line": None,
+                "total_lines": 0,
+                "total_chars": 0,
+                "how_to_get_rest": None,
+            },
+        }
+    assert text is not None
+    page: list[str] = []
+    used = 0
+    i = offset
+    while i < total:
+        cost = len(lines[i])
+        if page and used + cost > max_chars:
+            break
+        page.append(lines[i])
+        used += cost
+        i += 1
+    truncated = i < total
+    paging: dict[str, Any] = {
+        "offset": offset,
+        "returned": len(page),
+        "next_offset": i if truncated else None,
+        "truncated": truncated,
+        "first_line": offset + 1,
+        "last_line": offset + len(page),
+        "total_lines": total,
+        "total_chars": len(text),
+        "how_to_get_rest": (
+            f"more lines remain — call again with offset={i} (lines {i + 1}..{total}); the "
+            "segments joined in order are the whole text"
+            if truncated
+            else None
+        ),
+    }
+    if used > max_chars:
+        paging["line_over_budget"] = True
+    return {"text": "".join(page), "paging": paging}
 
 
 def get_strings(

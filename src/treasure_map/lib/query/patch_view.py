@@ -76,14 +76,22 @@ TWO SIGNALS SIMILARITY IS BLIND TO (lib/query/sameness), read on the function-pa
 
 ORDER: A first, then the R and B entries that carry a sink candidate (E among them when it carries
 one, in its own lane), then the entries with none (recall_gap_sink, R, C, then the E with none),
-then P; inside each, by the named components of ``rank_key`` (visible on every entry). ``tier`` is
-the sink-impact tier of the entry's candidates (lib/query/sink_impact), ``no_sink`` without any.
+then P; inside each, by the named components of ``rank_key`` (on every entry of a
+``detail='full'`` page). ``tier`` is the sink-impact tier of the entry's candidates
+(lib/query/sink_impact), ``no_sink`` without any.
+
+DETAIL: ``detail='summary'`` prints each listed entry as a projection of its full rendering —
+counts, states and the fields an entry is chosen by, no row, body or guard (``_summary_entry``) —
+in the same order, under the same filters and counts. Either way the envelope's long texts that do
+not change from page to page come on a scope's first page only (``first_page_only`` names them on
+the others); its counts, ledger, legend and caveats come on every page.
 
 JUDGEMENTS are a separate, writable layer (lib/query/diff_review, written by lib/overlay.py): the
 view stays read-only and its facts never change because of one. Every entry carries its
-``anchor_ref`` and ``review_state`` and the envelope ``review_progress`` and ``annotation``, with
-or without any judgement; only with ``band`` on do they move entries, and then only among entries
-the default order already holds together.
+``anchor_ref`` (a summary entry through the envelope's ``annotation.anchor_ref_template``) and
+``review_state``, and the envelope ``review_progress`` and ``annotation``, with or without any
+judgement; only with ``band`` on do they move entries, and then only among entries the default
+order already holds together.
 """
 
 from __future__ import annotations
@@ -108,11 +116,15 @@ from treasure_map.lib.query.sink_overlay import (
     compute_sink_overlay,
     page_overlay,
     read_sink_overlay_baseline,
+    summarize_overlay,
 )
 from treasure_map.lib.ro_db import ro_connect
 from treasure_map.version import UNKNOWN_VERSION
 
 VIEWS = ("sink_patch", "string_edge", "candidate_flat")
+# How much of each entry a page prints: ``full`` (every field, the default) or ``summary`` (counts,
+# states and the fields an entry is chosen by; see _summary_entry).
+DETAILS = ("full", "summary")
 BUCKETS = ("A", "B", "C", "R", "P", "E")
 SORT_BY = ("tier", "similarity", "address", "significance")
 NO_SINK = "no_sink"
@@ -2170,9 +2182,12 @@ def _check_args(
     filtered: bool,
     band: Any = False,
     entry_id: str | None = None,
+    detail: Any = "full",
 ) -> str | None:
     if view not in VIEWS:
         return f"view must be one of {VIEWS}, got {view!r}"
+    if not isinstance(detail, str) or detail not in DETAILS:
+        return f"detail must be 'full' or 'summary', got {detail!r}"
     if not isinstance(band, bool):
         return f"band must be true or false, got {band!r}"
     if view != "sink_patch" and band:
@@ -2192,6 +2207,11 @@ def _check_args(
         return f"limit must be an integer in 1..{MAX_LIMIT}, got {limit!r}"
     if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
         return f"offset must be an integer >= 0, got {offset!r}"
+    if detail == "summary" and view == "candidate_flat" and offset != 0:
+        return (
+            "view='candidate_flat' with detail='summary' gives the overlay's counts and no row, "
+            "so there is nothing to page: offset must be 0 (detail='full' pages the rows)"
+        )
     return None
 
 
@@ -2202,9 +2222,11 @@ def _check_entry_args(
     offset: int,
     filters: dict[str, Any],
     not_listed_page: str | None,
+    detail: str = "full",
 ) -> str | None:
     """The argument combinations of reading one entry, refused before anything is built — a
-    combination this cannot honour is an error, never silently ignored."""
+    combination this cannot honour is an error, never silently ignored. A valid ``rows_limit`` is
+    checked here in either ``detail``; a summary page then ignores it (its entries carry no row)."""
     # 0 is a ranking scan: every entry with its summary and no inline row (the counts still say
     # what the rows hold). It is refused only where it would read nothing: one entry's rows.
     if isinstance(rows_limit, bool) or not isinstance(rows_limit, int) or rows_limit < 0:
@@ -2219,6 +2241,8 @@ def _check_entry_args(
         return None
     if not isinstance(entry_id, str) or not entry_id:
         return f"entry_id must be an entry's entry_id or anchor_ref, got {entry_id!r}"
+    if detail == "summary":
+        return "entry_id reads one entry in full: detail='summary' does not apply there"
     if rows_limit == 0:
         return "entry_id reads one entry's rows: rows_limit must be >= 1 there (0 is for a scan)"
     if not_listed_page is not None:
@@ -3074,6 +3098,336 @@ def _not_listed_page(
     }
 
 
+# ── detail='summary': a projection of the rendered entry ─────────────────────────────────────
+#
+# A summary entry is read off what _render printed for that entry (with no inline row), never off
+# the build or a cache: the projection only builds new objects, so the cached pseudocode_delta /
+# inline_hunk it reads stay as they are. Its keys are a whitelist: a field the full entry gains
+# later is not in a summary until it is added here.
+#
+# What a summary leaves out: null, [] and {}, and a count that is 0 (_SUMMARY_COUNTS) — each of
+# which has one reading only. A boolean is always given, true or false, and so is a value that is
+# not a count (a tier of 0, a similarity of 0). Two shapes count nothing and say so themselves: a
+# delta_summary whose kind is not_computed, and a guard_scan carrying a reason. A body-elsewhere
+# count that could not be read is null, never left out.
+
+# The count keys a summary leaves out at 0.
+_SUMMARY_COUNTS = frozenset(
+    {
+        "rows_total",
+        "count",
+        "structural_spans",
+        "substitutions_total",
+        "calls_differ",
+        "var_const_total",
+        "linked_not_shown",
+        "renumbered_in_a",
+        "markers",
+        "a_body_elsewhere_in_b_count",
+        "b_body_elsewhere_in_a_count",
+    }
+)
+# The entry fields a summary copies as the full entry has them.
+_SUMMARY_COPY = frozenset(
+    {
+        "entry_id",
+        "bucket",
+        "subclass",
+        "tier",
+        "blind_spots",
+        "review_state",
+        "addr_a",
+        "addr_b",
+        "name_a",
+        "name_b",
+        "similarity",
+        "export_gap_a",
+        "export_gap_b",
+        "side",
+        "addr",
+        "name",
+        "presence_state",
+        "export_gap",
+        "pairing",
+        "callers_b",
+        "b_other_fn_mentions",
+        "pseudocode_sameness",
+        "text_unverified_reasons",
+        "significance",
+        "rows_total",
+        "rows_by_presence",
+    }
+)
+# The facts a summary drops because another of its fields already says them: a source gap is in
+# blind_spots, an unchanged callee set in callee_set.state. Every other fact is kept.
+_SUMMARY_FACT_GAP_PREFIX = "source_gap:"
+_SUMMARY_FACT_CALLEES_UNCHANGED = "callee_set_unchanged"
+# What an undetermined pair's reading lifts onto the summary entry, as the reading has them.
+_SUMMARY_LIFTED = ("anchored_differs", "anchor", "in_read_first", "demoted")
+_SUMMARY_SWAP = (
+    "pairing",
+    "callees_complete",
+    "narrow",
+    "not_narrow",
+    "sinks_only_in_a",
+    "sinks_only_in_b",
+)
+_SUMMARY_HUNK = ("structural_lines", "groups", "withheld", "lines")
+_NOT_LISTED_COPY = (
+    "entry_id",
+    "addr_a",
+    "addr_b",
+    "similarity",
+    "pseudocode_sameness",
+    "body",
+    "text_unverified_reasons",
+)
+
+
+def _given(key: str, value: Any) -> bool:
+    """Whether a summary keeps ``value`` under ``key`` (see above)."""
+    if value is None or value == [] or value == {}:
+        return False
+    if isinstance(value, bool):
+        return True
+    return not (key in _SUMMARY_COUNTS and value == 0)
+
+
+def _kept(fields: dict[str, Any]) -> dict[str, Any]:
+    return {k: _copy(v) for k, v in fields.items() if _given(k, v)}
+
+
+def _copy(value: Any) -> Any:
+    """A new container for a copied value, so nothing a summary prints is a cached object."""
+    if isinstance(value, dict):
+        return {k: _copy(v) for k, v in value.items()}
+    if isinstance(value, list | tuple):
+        return [_copy(v) for v in value]
+    return value
+
+
+def _summary_delta(delta: dict[str, Any]) -> dict[str, Any]:
+    """A pseudocode_delta as counts: each key only when the delta has its source, so a
+    ``not_computed`` delta gives ``kind`` / ``reason`` / ``hunk`` and nothing else. The hunk keeps
+    its gate counts and why it is withheld; a 0 / 0 hunk is given as it is."""
+    out: dict[str, Any] = {"kind": delta["kind"]}
+    if "reason" in delta:
+        out["reason"] = delta["reason"]
+    if "structural_spans" in delta:
+        out["structural_spans"] = delta["structural_spans"]
+    if "substitutions" in delta:
+        out["substitutions_total"] = sum(s["total"] for s in delta["substitutions"].values())
+    if "calls" in delta:
+        out["calls_differ"] = len(delta["calls"])
+    if "line_number_form" in delta:
+        out["line_number_form"] = True
+    out = _kept(out)
+    hunk = delta.get("inline_hunk")
+    if hunk is not None:
+        out["hunk"] = {k: _copy(hunk[k]) for k in _SUMMARY_HUNK if k in hunk}
+    return out
+
+
+def _summary_guard_scan(scan: dict[str, Any]) -> dict[str, Any]:
+    """A guard_scan without ``shown_rule`` (a summary shows no guard). A scan carrying a reason (not
+    extracted) is given as it is: it counted nothing."""
+    if "reason" in scan:
+        withheld: dict[str, Any] = _copy(scan)
+        return withheld
+    return _kept({k: v for k, v in scan.items() if k != "shown_rule"})
+
+
+def _summary_hidden(hidden: dict[str, Any]) -> dict[str, Any]:
+    out = _kept({"body": hidden.get("body"), "markers": len(hidden.get("markers") or ())})
+    refs = {s: n for s, n in (hidden.get("unrecovered_jumptable_refs") or {}).items() if n}
+    if refs:
+        out["unrecovered_jumptable_refs"] = refs
+    return out
+
+
+def _summary_bodies(bodies: dict[str, Any]) -> dict[str, Any]:
+    return {
+        side: _kept({"status": b.get("status"), "size_bytes": b.get("size_bytes")})
+        for side, b in bodies.items()
+    }
+
+
+def _summary_callee_set(cs: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not cs:
+        return None
+    out = {"state": cs.get("state")}
+    if cs.get("state") == "undetermined" and "reason" in cs:
+        out["reason"] = cs["reason"]
+    return out
+
+
+def _proposed_summary(reading: dict[str, Any]) -> dict[str, Any]:
+    """An undetermined pair's proposed_pair_reading as counts, apart from the entry's own fields (a
+    proposed pairing may hold the wrong function). A body-elsewhere count is null when the two
+    bodies were not both read — never left out, which would read as 0."""
+    out: dict[str, Any] = {"state": reading.get("state")}
+    if reading.get("text_unverified_reasons"):
+        out["text_unverified_reasons"] = list(reading["text_unverified_reasons"])
+    cs = _summary_callee_set(reading.get("callee_set"))
+    if cs is not None:
+        out["callee_set"] = cs
+    for key in ("a_body_elsewhere_in_b", "b_body_elsewhere_in_a"):
+        elsewhere = reading.get(key)
+        if elsewhere is None:
+            out[f"{key}_count"] = None
+        elif elsewhere.get("count"):
+            out[f"{key}_count"] = elsewhere["count"]
+    if "pseudocode_delta" in reading:
+        out["delta_summary"] = _summary_delta(reading["pseudocode_delta"])
+    if "guard_scan" in reading:
+        out["guard_scan"] = _summary_guard_scan(reading["guard_scan"])
+    if "hidden_region" in reading:
+        out["hidden_region"] = _summary_hidden(reading["hidden_region"])
+    if "bodies" in reading:
+        out["bodies"] = _summary_bodies(reading["bodies"])
+    return out
+
+
+def _summary_entry(full: dict[str, Any], *, micro_side: bool) -> dict[str, Any]:
+    """One listed entry as ``detail='summary'`` prints it, projected from ``full`` (what _render
+    printed with no inline row), field by field in its order. ``micro_side``: the entry is an
+    anchored micro-side pair (:func:`_anchored_micro_side`), a flag full entries do not carry."""
+    out: dict[str, Any] = {}
+    for key, value in full.items():
+        if key in _SUMMARY_COPY:
+            if _given(key, value):
+                out[key] = _copy(value)
+        elif key == "subclasses":
+            if value != [full.get("subclass")] and _given(key, value):
+                out[key] = _copy(value)
+        elif key == "facts":
+            facts = [
+                f
+                for f in value
+                if not str(f).startswith(_SUMMARY_FACT_GAP_PREFIX)
+                and f != _SUMMARY_FACT_CALLEES_UNCHANGED
+            ]
+            if facts:
+                out[key] = facts
+        elif key == "coclaimed_by":
+            if value:
+                out["coclaimed_by_count"] = len(value)
+        elif key == "callee_set":
+            cs = _summary_callee_set(value)
+            if cs is not None:
+                out[key] = cs
+        elif key == "sink_callee_swap":
+            out[key] = _kept({k: value[k] for k in _SUMMARY_SWAP if k in value})
+        elif key == "callers_a":
+            if value:
+                out[key] = _kept({"count": value.get("count")})
+        elif key == "string_edges":
+            if value and value.get("by_delta_kind"):
+                out[key] = {"by_delta_kind": _copy(value["by_delta_kind"])}
+        elif key == "guard_scan":
+            out[key] = _summary_guard_scan(value)
+        elif key == "hidden_region":
+            out[key] = _summary_hidden(value)
+        elif key == "bodies":
+            out[key] = _summary_bodies(value)
+        elif key == "pseudocode_delta":
+            out["delta_summary"] = _summary_delta(value)
+        elif key == "proposed_pair_reading":
+            out.update({k: value[k] for k in _SUMMARY_LIFTED if k in value})
+            if micro_side:
+                out["anchored_micro_side"] = True
+            out["proposed_pair_summary"] = _proposed_summary(value)
+    if micro_side:
+        out.setdefault("anchored_micro_side", True)
+    return out
+
+
+def _summary_not_listed(row: dict[str, Any]) -> dict[str, Any]:
+    """One not-listed pair as ``detail='summary'`` prints it: its addresses, similarity and
+    sameness, and its delta and guard scan as counts."""
+    out: dict[str, Any] = {}
+    for key, value in row.items():
+        if key in _NOT_LISTED_COPY:
+            if _given(key, value):
+                out[key] = _copy(value)
+        elif key == "pseudocode_delta":
+            out["delta_summary"] = _summary_delta(value)
+        elif key == "guard_scan":
+            out[key] = _summary_guard_scan(value)
+    return out
+
+
+# ── the envelope: what every page gives, and what only the first one does ───────────────────
+
+# The read-face texts the lens gives on the first page only (offset 0) of a scope.
+_LENS_FIRST_PAGE = ("order", "anchored_differs", "anchored_micro_side", "band")
+_FIRST_PAGE_ONLY_READ_WITH = "the same call with offset=0"
+
+
+def _first_page_only(envelope: dict[str, Any], offset: int) -> None:
+    """Past the first page (``offset`` > 0), drop the envelope's long texts that are the same on
+    every page of a scope — the lens's order and filter texts, the progress block's next unjudged
+    entries, the annotation block's two explanations — and give the progress note's 'complete'
+    sentence alone, naming each in ``first_page_only``. Every count, the ledger, the legend and the
+    caveats stay on every page."""
+    if offset == 0:
+        del envelope["first_page_only"]
+        return
+    keys: list[str] = []
+    lens = envelope["lens"]
+    for key in _LENS_FIRST_PAGE:
+        if key in lens:
+            del lens[key]
+            keys.append(f"lens.{key}")
+    shortened: list[str] = []
+    progress = envelope["review_progress"]
+    if not progress.get("withheld"):
+        if "next_page" in progress:
+            del progress["next_page"]
+            keys.append("review_progress.next_page")
+        progress["note"] = diff_review.PROGRESS_NOTE_COMPLETE
+        shortened.append("review_progress.note")
+    annotation = envelope["annotation"]
+    if annotation.get("available"):
+        for key in ("what", "promote_note"):
+            if key in annotation:
+                del annotation[key]
+                keys.append(f"annotation.{key}")
+    envelope["first_page_only"] = {
+        "keys": keys,
+        "shortened": shortened,
+        "read_with": _FIRST_PAGE_ONLY_READ_WITH,
+    }
+
+
+def _detail_fields(
+    detail: str, view: str, not_listed_page: str | None, diff_id: str
+) -> dict[str, Any]:
+    """The envelope's ``detail`` and, for a summary, where the full detail is read: a call to copy
+    (the diff id filled in) for a listed entry or the overlay rows, the same call with
+    detail='full' for not-listed pairs (no entry_id names them)."""
+    out: dict[str, Any] = {"detail": detail}
+    if detail != "summary":
+        return out
+    did = json.dumps(diff_id)
+    if not_listed_page is not None:
+        out["detail_with"] = {"its_detail": "the same call with detail='full'"}
+    elif view == "sink_patch":
+        out["detail_with"] = {
+            "one_entry": f'get_diff_patch_view(diff_id={did}, entry_id="<entry_id>")',
+            "its_rows": (
+                f'get_diff_patch_view(diff_id={did}, entry_id="<entry_id>", rows_offset=<n>)'
+            ),
+        }
+    elif view == "candidate_flat":
+        out["detail_with"] = {"its_rows": f'get_diff_sink_overlay(diff_id={did}, detail="rows")'}
+    else:
+        out["detail_note"] = (
+            "string_edge rows have no compact form; detail='summary' changes the envelope only"
+        )
+    return out
+
+
 _SIGNIFICANCE_LENS = (
     "sort_by='significance' reorders the listed entries, never relabels them: attention 0 = bucket "
     "A or a row carrying sink_arg_constant_delta; 2 = pseudocode_sameness identical, or bucket C "
@@ -3387,6 +3741,7 @@ def get_diff_patch_view(
     entry_id: str | None = None,
     rows_offset: int | None = None,
     rows_limit: int = ROWS_INLINE_LIMIT,
+    detail: str = "full",
 ) -> dict[str, Any]:
     """The function-level view of one diff (see the module docstring), one page of it.
 
@@ -3405,9 +3760,20 @@ def get_diff_patch_view(
     ``rows_limit`` must be at least 1); the entry-level fields are read from all of its rows either
     way.
 
+    ``detail``: ``full`` (the default) or ``summary`` — each listed entry projected from its
+    ``rows_limit=0`` rendering to counts and states (:func:`_summary_entry`), each not-listed pair
+    likewise (:func:`_summary_not_listed`), ``candidate_flat`` as the overlay's summary counts and
+    no row, ``string_edge`` rows as they are. Order, filters, counts and review_progress are those
+    of ``full``; a valid ``rows_limit`` is ignored; ``entry_id`` reads one entry in full only, so
+    with ``summary`` it is an error. The envelope: the lens's order and filter texts,
+    review_progress's ``next_page`` and the annotation block's ``what`` / ``promote_note`` come on
+    the first page (``offset`` 0) only, named in ``first_page_only`` on the others, where the
+    progress note is its 'complete' sentence alone (``first_page_only.shortened``).
+
     ``band`` (``sink_patch`` only, off by default) moves the judged entries inside the groups the
     default order already forms (diff_review.band_bias); off, the order is the base order. The
-    judgement keys (``anchor_ref`` / ``review_state`` on each entry, ``review_progress`` and
+    judgement keys (``anchor_ref`` / ``review_state`` on each entry — on a summary entry its
+    ``anchor_ref`` through ``annotation.anchor_ref_template`` — and ``review_progress`` and
     ``annotation`` on the envelope) are there either way.
 
     ``not_listed_page`` names one ``not_listed`` category (e.g. ``aligned_pseudocode_differs``) and
@@ -3485,10 +3851,12 @@ def get_diff_patch_view(
         "anchored_micro_side": True if anchored_micro_side else None,
     }
     filtered = any(v is not None for v in filters.values())
-    error = _check_args(view, sort_by, bucket, tier, limit, offset, filtered, band, entry_id)
+    error = _check_args(
+        view, sort_by, bucket, tier, limit, offset, filtered, band, entry_id, detail
+    )
     if error is None:
         error = _check_entry_args(
-            entry_id, rows_offset, rows_limit, offset, filters, not_listed_page
+            entry_id, rows_offset, rows_limit, offset, filters, not_listed_page, detail
         )
     if error is not None:
         return {"diff_id": diff_id, "error": error}
@@ -3584,23 +3952,22 @@ def get_diff_patch_view(
             "filters": filters,
             "switchable": (
                 "view / sort_by / bucket / subclass / tier / blind_spot / body / anchored_differs "
-                "/ anchored_micro_side"
+                "/ anchored_micro_side / detail"
             ),
             # A value no entry of this diff carries is named, with the ones that do exist — an
             # empty page alone reads the same whether the value was misspelled or absent.
             **({"filter_note": unknown_filter} if unknown_filter else {}),
         },
+        **_detail_fields(detail, view, not_listed_page, diff_id),
+        # Set past the first page, dropped on it (_first_page_only); here to keep its place.
+        "first_page_only": None,
         "subject_unit": {
             "sink_patch": "function_pair",
             "string_edge": "string_edge",
             "candidate_flat": "candidate_row",
         }[view],
         "subject_counts": subject_counts,
-        "available_views": {
-            "sink_patch": "one entry per function pair (or function with no counterpart)",
-            "string_edge": "the string-keyed edge deltas (get_diff_deltas)",
-            "candidate_flat": "the candidate overlay rows (get_diff_sink_overlay)",
-        },
+        "available_views": list(VIEWS),
         "legend": _LEGEND,
         "caveats": _CAVEATS,
         "baseline_state": overlay.baseline_state,
@@ -3637,17 +4004,21 @@ def get_diff_patch_view(
             "subclass rank), entries due a re-check first, then change_inconclusive, then "
             "unjudged, then changed_real, then no_real_change"
         )
+    summary = detail == "summary"
     if not_listed_page is not None:
         envelope["guards_read_with"] = _guards_read_with(built.diff)
-        envelope.update(
-            _not_listed_page(
-                built, readings, not_listed_page, limit=limit, offset=offset, body=body
-            )
+        listed = _not_listed_page(
+            built, readings, not_listed_page, limit=limit, offset=offset, body=body
         )
+        if summary:
+            listed["entries"] = [_summary_not_listed(row) for row in listed["entries"]]
+        _first_page_only(envelope, offset)
+        envelope.update(listed)
         return envelope
     if view == "string_edge":
         deltas = get_diff_deltas(atlas, diff_id, limit=limit, offset=offset)
         page = deltas["page"]
+        _first_page_only(envelope, offset)
         envelope.update(
             {
                 "entries": deltas["deltas"],
@@ -3657,6 +4028,16 @@ def get_diff_patch_view(
         )
         return envelope
     if view == "candidate_flat":
+        _first_page_only(envelope, offset)
+        if summary:
+            # The overlay's counts as get_diff_sink_overlay(detail="summary") gives them; no row.
+            envelope.update(
+                {
+                    "summary": summarize_overlay(overlay.rows, by_binary=False),
+                    "total_entries": len(overlay.rows),
+                }
+            )
+            return envelope
         flat = page_overlay(overlay.rows, limit=limit, offset=offset)
         envelope.update(
             {
@@ -3737,7 +4118,9 @@ def get_diff_patch_view(
         readings, [p for e in page if (p := _delta_pair(e, readings)) is not None], page_guards
     )
     page_bodies = _page_bodies(readings, page)
-    windows = {e.entry_id: _rows_window(e.row_views, rows_offset or 0, rows_limit) for e in page}
+    # A summary entry is projected from the entry as a scan (rows_limit=0) renders it.
+    inline = 0 if summary else rows_limit
+    windows = {e.entry_id: _rows_window(e.row_views, rows_offset or 0, inline) for e in page}
     page_axes = _page_axes(atlas, built.diff, page, windows, page_guards, one is not None)
 
     def _render(e: _Entry) -> dict[str, Any]:
@@ -3793,9 +4176,16 @@ def get_diff_patch_view(
             out["significance"] = {"attention": attention, "basis": basis}
         return out
 
+    rendered = [_render(e) for e in page]
+    if summary:
+        rendered = [
+            _summary_entry(out, micro_side=_anchored_micro_side(e))
+            for e, out in zip(page, rendered, strict=True)
+        ]
+    _first_page_only(envelope, offset)
     envelope.update(
         {
-            "entries": [_render(e) for e in page],
+            "entries": rendered,
             "total_entries": len(ordered),
             "next_offset": end if end < len(ordered) else None,
         }
@@ -3934,7 +4324,19 @@ class ViewReview:
                 "this diff records no binary name, which every anchor carries — re-run the diff",
                 self.built.banners,
             )
-        return diff_review.annotation_block(d.diff_id, d.run_a, d.run_b, list(self.items.values()))
+        block = diff_review.annotation_block(d.diff_id, d.run_a, d.run_b, list(self.items.values()))
+        # Every entry's anchor_ref with its own addresses left to fill in: built by the functions
+        # that build the anchors themselves, so a summary entry (which carries no anchor_ref)
+        # rebuilds it from its addr_a / addr_b, or side / addr.
+        block["anchor_ref_template"] = {
+            "function_pair": diff_review.pair_anchor(
+                d.run_a, d.run_b, d.binary, "{addr_a}", "{addr_b}"
+            ),
+            "function_presence": diff_review.presence_anchor(
+                d.run_a, d.run_b, d.binary, "{side}", "{addr}"
+            ),
+        }
+        return block
 
 
 def _matches(
