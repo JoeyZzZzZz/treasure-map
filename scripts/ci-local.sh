@@ -12,8 +12,32 @@ set -euo pipefail
 # A RAM-backed temp dir when there is one and the caller set none: the tests create and commit to
 # many small databases, and on a slow-fsync disk (a WSL2 virtual disk) that wait dominates the run.
 # macOS has no /dev/shm, so there the temp dir is left as it is.
+#
+# Each run gets a directory of its own (it holds about 1 GB after a full run, in memory). It is
+# removed when every check passed, and kept when one failed, so the failed tests' files can be
+# read; the next run removes such leftovers, except one whose run is still going.
 if [ -z "${TMPDIR:-}" ] && [ -d /dev/shm ] && [ -w /dev/shm ]; then
-    export TMPDIR=/dev/shm
+    for old in /dev/shm/tmap-ci.*; do
+        [ -d "$old" ] && [ -O "$old" ] || continue
+        pid="$(cat "$old/.ci-pid" 2>/dev/null || true)"
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            continue  # another ci-local.sh run is still using it
+        fi
+        echo "==> removing the temp dir an earlier run kept: $old"
+        rm -rf "$old"
+    done
+    TMPDIR="$(mktemp -d /dev/shm/tmap-ci.XXXXXX)"
+    export TMPDIR
+    echo "$$" > "$TMPDIR/.ci-pid"
+    _ci_tmp_done() {
+        local status=$?
+        if [ "$status" -eq 0 ]; then
+            rm -rf "$TMPDIR"
+        else
+            echo "==> a check failed: its temp files are kept in $TMPDIR (the next run removes them)" >&2
+        fi
+    }
+    trap _ci_tmp_done EXIT
 fi
 echo "==> temp dir: ${TMPDIR:-default}"
 
