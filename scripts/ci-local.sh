@@ -9,6 +9,14 @@
 # and CI runs them against the pinned Ghidra.
 set -euo pipefail
 
+# A RAM-backed temp dir when there is one and the caller set none: the tests create and commit to
+# many small databases, and on a slow-fsync disk (a WSL2 virtual disk) that wait dominates the run.
+# macOS has no /dev/shm, so there the temp dir is left as it is.
+if [ -z "${TMPDIR:-}" ] && [ -d /dev/shm ] && [ -w /dev/shm ]; then
+    export TMPDIR=/dev/shm
+fi
+echo "==> temp dir: ${TMPDIR:-default}"
+
 echo "==> ruff check"
 ruff check src/ tests/
 
