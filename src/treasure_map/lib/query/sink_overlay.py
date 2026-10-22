@@ -1582,10 +1582,12 @@ def persist_sink_overlay(atlas: sqlite3.Connection, diff_id: str, *, commit: boo
     or ``unknown`` — the generation stamps could never be checked against a later hunt — or when the
     overlay breaks its coverage invariant (a baseline missing candidates would read as complete).
 
-    Writes the diff layer: run it only after the runs are re-hunted and the diff re-run. The read
-    API (get_diff_sink_overlay) computes live and does NOT need this. Re-run it after every re-run
-    of this diff: the diff re-run deletes these rows with the rest of the diff. Storing it clears
-    the diff's ``baseline_dropped`` mark."""
+    Writes the diff layer. Every successful diff stores it for its new rows (lib/diff/driver), and
+    a full diff stores it for an unchanged diff that has none or whose stored one reads stale; call
+    it directly to store one that was refused or dropped once the cause is fixed. The read API
+    (get_diff_sink_overlay) computes live and does NOT need this; a diff re-run deletes these rows
+    with the rest of the diff, and stores them again. Storing it clears the diff's
+    ``baseline_dropped`` mark."""
     from treasure_map.lib.atlas.models import DimensionDeltaRow
     from treasure_map.lib.atlas.writer import add_dimension_deltas, delete_dimension_delta
 

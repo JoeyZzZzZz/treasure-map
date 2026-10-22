@@ -196,10 +196,14 @@ class DiffSummary:
     delta_layer_unchanged: int
     delta_undetermined: int
     warnings: tuple[str, ...]
-    # The diff's stored candidate baseline across this re-diff: None = it had none to keep;
-    # 'restored' = stored again for the new rows; 'not_restored' = refused (see warnings), so the
-    # diff now has none.
+    # The diff's candidate baseline, stored for the new rows: 'stored' (it had none before) or
+    # 'restored' (it had one, or a failed attempt had dropped it); 'not_stored' / 'not_restored' =
+    # refused by the baseline's own gates (``baseline_note`` says why), and the diff has none — a
+    # 'not_restored' row is marked baseline_dropped. None only when no store was attempted.
     baseline: str | None = None
+    # How many rows the stored baseline holds (0: the diff has no candidate to store).
+    baseline_rows: int | None = None
+    baseline_note: str | None = None
 
 
 # How many times a full diff attempts a failing binary AT THE SAME CONTENT before treating it as a
@@ -504,10 +508,12 @@ class FullDiffSummary:
     # run-pair notes that did not stop the sweep (check_run_pair_currency's warnings, refused
     # baseline refreshes)
     warnings: tuple[str, ...] = ()
-    # already-ok diffs whose stale or dropped candidate baseline was stored again (binary names),
-    # and those whose store was refused (their old rows kept, reading stale)
+    # already-ok diffs whose candidate baseline was stored (it was missing, stale or dropped;
+    # binary names), those whose store was refused (their old rows, if any, kept, reading stale),
+    # and those with none that stored one of no row (no candidate to store)
     baselines_refreshed: tuple[str, ...] = ()
     baselines_refresh_refused: tuple[str, ...] = ()
+    baselines_refresh_empty: tuple[str, ...] = ()
     # already-ok diffs whose recorded hunt marks (scanned_at / hunt_instances) were brought up to
     # the runs' current ones, and those left as they were (see _restamp_hunt_marks)
     hunt_marks_restamped: tuple[str, ...] = ()
@@ -1095,15 +1101,18 @@ def _persist_success(
     so a hunt cannot commit between the two and leave a digest describing other rows than the ones
     the instruction pairs and deltas were built from.
 
-    The re-diff replaces the diff's rows, a stored candidate baseline included. When the diff had
-    one (or its row says a failed attempt dropped one), it is stored again for the new rows once
-    they are committed. A refusal to store it (lib/query/sink_overlay's own gates) does not fail
-    the diff: it is reported in the warnings, and the new row is marked ``baseline_dropped=1`` so
-    the loss stays visible and the next re-diff (or a direct store) puts it back."""
+    Every successful diff stores its candidate baseline for the new rows once they are committed,
+    whether or not it had one (a re-diff replaces the diff's rows, a stored baseline included). A
+    refusal to store it (lib/query/sink_overlay's own gates: a run whose hunt commit is unknown, a
+    broken coverage invariant) does not fail the diff: it is reported in the warnings and in
+    ``baseline_note``. When the diff had a baseline (or its row says a failed attempt dropped one),
+    the new row is then marked ``baseline_dropped=1`` so the loss stays visible and the next
+    re-diff (or a direct store) puts it back; a diff that never had one is not marked — the mark
+    says one was lost."""
     try:
         if not atlas.in_transaction:
             atlas.execute("BEGIN IMMEDIATE")
-        keep_baseline = _has_candidate_baseline(atlas, diff_id) or _marked_dropped(atlas, diff_id)
+        had_baseline = _has_candidate_baseline(atlas, diff_id) or _marked_dropped(atlas, diff_id)
         builders = (
             report_a.builder if report_a is not None else None,
             report_b.builder if report_b is not None else None,
@@ -1150,7 +1159,7 @@ def _persist_success(
             targets_b=targets_b,
             commit=False,
         )
-        if keep_baseline:
+        if had_baseline:
             # Mark the baseline dropped in the SAME transaction as the new rows;
             # below clears it to 0 on success. An interrupt between that commit and this one then
             # leaves an honest baseline_dropped=1 (re-stored next diff), not a silent 0.
@@ -1168,31 +1177,39 @@ def _persist_success(
         )
         raise
 
-    baseline: str | None = None
-    if keep_baseline:
+    baseline_rows: int | None = None
+    note: str | None = None
+    try:
+        baseline_rows = persist_sink_overlay(atlas, diff_id, commit=True)
+        baseline = "restored" if had_baseline else "stored"
+    except (TreasureMapError, sqlite3.Error) as exc:
+        # The new rows are committed without the baseline. A sqlite error here is caught too: it
+        # must not turn this committed, good diff into a failed one. A diff that had one says so
+        # on the row, so the loss is not read as "never had one" and the next re-diff stores it
+        # again; the row already carries baseline_dropped=1 from the transaction that wrote it, so
+        # if even this write fails (the database is still locked) the loss stays visible.
         try:
-            persist_sink_overlay(atlas, diff_id, commit=True)
-            baseline = "restored"
-        except (TreasureMapError, sqlite3.Error) as exc:
-            # The new rows are committed without the baseline: say so on the row, so the loss is
-            # not read as "never had one" and the next re-diff stores it again. The row already
-            # carries baseline_dropped=1 from the transaction that wrote it, so if even this write
-            # fails (the database is still locked) the loss stays visible. A sqlite error here is
-            # caught too: it must not turn this committed, good diff into a failed one.
-            try:
-                atlas.rollback()
+            atlas.rollback()
+            if had_baseline:
                 atlas.execute(
                     "UPDATE diff_meta SET baseline_dropped = 1 WHERE diff_id = ?", (diff_id,)
                 )
                 atlas.commit()
-            except sqlite3.Error:
-                pass
+        except sqlite3.Error:
+            pass
+        if had_baseline:
             baseline = "not_restored"
-            warnings = (
-                *warnings,
+            note = (
                 f"this diff had a stored candidate baseline, and it was not stored again for the "
-                f"new rows: {exc}",
+                f"new rows: {exc}"
             )
+        else:
+            baseline = "not_stored"
+            note = (
+                "its candidate baseline was not stored (each read computes the overlay instead): "
+                f"{exc}"
+            )
+        warnings = (*warnings, note)
     counts = _delta_counts(atlas, diff_id)
     return DiffSummary(
         diff_id=diff_id,
@@ -1204,6 +1221,8 @@ def _persist_success(
         delta_undetermined=counts.get("delta_undetermined", 0),
         warnings=warnings,
         baseline=baseline,
+        baseline_rows=baseline_rows,
+        baseline_note=note,
     )
 
 
@@ -1716,10 +1735,11 @@ def run_full_diff(
     # already ok, and that is exactly when their baselines go stale.
     refreshed: tuple[str, ...] = ()
     refused: tuple[str, ...] = ()
+    empty: tuple[str, ...] = ()
     restamped: tuple[str, ...] = ()
     marks_left: tuple[str, ...] = ()
     if not assume_current:
-        refreshed, refused, notes = _refresh_unchanged_baselines(
+        refreshed, refused, empty, notes = _refresh_unchanged_baselines(
             atlas, run_a_id, run_b_id, plan.already_ok
         )
         warnings = (*warnings, *notes)
@@ -1734,6 +1754,7 @@ def run_full_diff(
             warnings=warnings,
             baselines_refreshed=refreshed,
             baselines_refresh_refused=refused,
+            baselines_refresh_empty=empty,
             hunt_marks_restamped=restamped,
             hunt_marks_left=marks_left,
         )
@@ -1943,6 +1964,7 @@ def run_full_diff(
         warnings=warnings,
         baselines_refreshed=refreshed,
         baselines_refresh_refused=refused,
+        baselines_refresh_empty=empty,
         hunt_marks_restamped=restamped,
         hunt_marks_left=marks_left,
     )
@@ -1950,36 +1972,42 @@ def run_full_diff(
 
 def _refresh_unchanged_baselines(
     atlas: sqlite3.Connection, run_a_id: str, run_b_id: str, already_ok: tuple[str, ...]
-) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
-    """Store again the candidate baseline of each already-ok diff whose stored one reads stale, or
-    that a re-diff dropped. Returns (refreshed, refused, warnings).
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Store the candidate baseline of each already-ok diff that has none, whose stored one reads
+    stale, or that a re-diff dropped. Returns (refreshed, refused, empty, warnings): ``empty``
+    holds the diffs with no baseline that stored one of no row — they have no candidate to store,
+    so their reading stays as it was (``recomputed_absent``) and they are told apart from a
+    baseline that came back.
 
     A diff is already ok when nothing it reads has moved; its baseline also reads the runs' hunt
     commit, build hash and candidate count, so a re-hunt that reproduced its output leaves the diff
-    current and the baseline stale, and no re-diff will ever come to store it again. Called only
-    when the plan compared the inputs (not under assume_current): stamping a baseline fresh vouches
-    for a diff nobody checked otherwise. A refused store (the baseline's own gates) leaves the old
-    rows in place, still reading stale, and the sweep goes on."""
+    current and the baseline stale, and no re-diff will ever come to store it again. A diff with
+    none (one from before every diff stored its own, or one whose store was refused) gets one the
+    same way, without a re-diff. Called only when the plan compared the inputs (not under
+    assume_current): stamping a baseline fresh vouches for a diff nobody checked otherwise. A
+    refused store (the baseline's own gates) leaves the old rows, if any, in place, still reading
+    stale, and the sweep goes on."""
     refreshed: list[str] = []
     refused: list[str] = []
+    empty: list[str] = []
     notes: list[str] = []
     for binary in already_ok:
         diff_id = make_diff_id(run_a_id, run_b_id, binary)
-        stale = (
-            _has_candidate_baseline(atlas, diff_id)
-            and read_sink_overlay_baseline(atlas, diff_id).get("stale_baseline") is True
-        )
-        if not (stale or _marked_dropped(atlas, diff_id)):
+        has = _has_candidate_baseline(atlas, diff_id)
+        dropped = _marked_dropped(atlas, diff_id)
+        stale = has and read_sink_overlay_baseline(atlas, diff_id).get("stale_baseline") is True
+        if has and not (stale or dropped):
             continue
         try:
-            persist_sink_overlay(atlas, diff_id, commit=True)
+            rows = persist_sink_overlay(atlas, diff_id, commit=True)
         except TreasureMapError as exc:
             atlas.rollback()
             refused.append(binary)
-            notes.append(f"{binary}: its candidate baseline could not be stored again: {exc}")
+            again = " again" if has or dropped else ""
+            notes.append(f"{binary}: its candidate baseline could not be stored{again}: {exc}")
         else:
-            refreshed.append(binary)
-    return tuple(refreshed), tuple(refused), tuple(notes)
+            (refreshed if rows or has or dropped else empty).append(binary)
+    return tuple(refreshed), tuple(refused), tuple(empty), tuple(notes)
 
 
 def _restamp_hunt_marks(

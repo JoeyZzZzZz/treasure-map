@@ -17,7 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -1418,6 +1418,88 @@ def test_a_sqlite_error_restoring_the_baseline_keeps_the_good_diff(
     assert (row["diff_ok"], row["baseline_dropped"]) == (1, 1)
 
 
+# ── every diff stores its own candidate baseline ─────────────────────────────────────────────────
+
+
+def test_a_new_diff_stores_its_baseline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A diff that never had a baseline stores one with its first rows, so the view reads it
+    (fresh) instead of computing the overlay on every read.
+
+    MUTATION (verified RED, 2 failed — this test and the refused-first one): store the baseline
+    only for a diff that had one -> no baseline rows, the summary reads not_stored."""
+    w = _two(tmp_path, hunt_commit=_COMMIT)
+    _stub(monkeypatch, w)
+    (oc,) = _full(w).outcomes
+    assert oc.summary is not None
+    assert (oc.summary.baseline, oc.summary.baseline_note) == ("stored", None)
+    assert oc.summary.baseline_rows == _baseline_rows(w) > 0
+    got = so.read_sink_overlay_baseline(w.atlas, _did())
+    assert (got["baseline_absent"], got["stale_baseline"]) == (False, False)
+    assert _row(w)["baseline_dropped"] == 0
+
+
+def test_a_refused_first_baseline_leaves_the_diff_good_and_unmarked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run whose hunt commit is unknown: the baseline's own gate refuses it. The diff is still a
+    success, the warnings and ``baseline_note`` say why, and the row is NOT marked dropped — the
+    mark says a baseline was lost, and this diff never had one.
+
+    MUTATION (verified RED, 4 failed — this test, the two unchanged-diff ones and the golden diff):
+    mark every refused store dropped -> baseline_dropped 1."""
+    w = _two(tmp_path)  # hunt commit not recorded
+    _stub(monkeypatch, w)
+    (oc,) = _full(w).outcomes
+    assert oc.error is None and oc.summary is not None
+    assert oc.summary.baseline == "not_stored"
+    note = oc.summary.baseline_note or ""
+    assert "hunt_commit" in note and note in oc.summary.warnings
+    row = _row(w)
+    assert (row["diff_ok"], row["baseline_dropped"]) == (1, 0)
+    assert _baseline_rows(w) == 0
+    assert so.read_sink_overlay_baseline(w.atlas, _did())["baseline_absent"] is True
+
+
+def test_an_unchanged_diff_with_no_baseline_gets_one_without_a_rediff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A diff left with no baseline (its first store was refused) and nothing it reads moved: once
+    storing is possible, the next full diff stores it without re-running the diff.
+
+    MUTATION (verified RED, 2 failed — this test and the no-candidate one): refresh only the stale
+    and the dropped baselines -> the diff stays without one."""
+    w = _two(tmp_path)
+    _stub(monkeypatch, w)
+    _full(w)
+    assert _baseline_rows(w) == 0 and _row(w)["baseline_dropped"] == 0
+    w.atlas.execute("UPDATE run SET hunt_commit = ?", (_COMMIT,))
+    w.atlas.commit()
+    fs = _full(w)
+    assert fs.outcomes == () and fs.plan.already_ok == ("liba",)
+    assert (fs.baselines_refreshed, fs.baselines_refresh_empty) == (("liba",), ())
+    assert _baseline_rows(w) > 0
+    assert so.read_sink_overlay_baseline(w.atlas, _did())["stale_baseline"] is False
+
+
+def test_an_unchanged_diff_with_no_candidate_is_counted_apart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A diff with no baseline whose store holds no row (no candidate to store) is not reported as
+    a baseline that came back: it is counted apart, and its reading is unchanged (absent).
+
+    MUTATION (verified RED, 1 failed): report every successful store as refreshed -> liba is
+    among the refreshed."""
+    w = _two(tmp_path)
+    _stub(monkeypatch, w)
+    _full(w)
+    w.atlas.execute("UPDATE run SET hunt_commit = ?", (_COMMIT,))
+    w.atlas.commit()
+    monkeypatch.setattr(driver, "persist_sink_overlay", lambda *_a, **_kw: 0)
+    fs = _full(w)
+    assert (fs.baselines_refreshed, fs.baselines_refresh_empty) == ((), ("liba",))
+    assert fs.baselines_refresh_refused == ()
+
+
 # ── the CLI passes --assume-current through ──────────────────────────────────────────────────────
 
 
@@ -1537,6 +1619,51 @@ def test_the_cli_prints_each_binarys_function_split_and_the_pairs_coverage(
     assert "tmap triage run_b" in res.output
     assert "every candidate-holding binary is diffed or byte-identical" in res.output
     assert "baselines refreshed (unchanged diffs): 1, 0 refused" in res.output
+
+
+def test_the_cli_counts_the_baselines_stored_and_not_with_why(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One line for every diff run: how many stored their baseline (first time or again; those
+    with no candidate row said apart) and how many did not, each refused one with its reason.
+
+    MUTATION (verified RED, 1 failed): count only the re-stored ones, as before -> "1 stored"."""
+    from treasure_map.cli.main import main
+    from treasure_map.lib.query import patch_view
+
+    monkeypatch.setattr(patch_view, "function_states", lambda atlas, did: None)
+    monkeypatch.setattr(diff_align, "list_diffs", lambda *a, **k: {"coverage": None})
+    refusal = "its candidate baseline was not stored (each read computes the overlay instead): x"
+
+    def outcome(binary: str, baseline: str, rows: int | None, note: str | None) -> Any:
+        summary = replace(
+            _summary(binary, 0, 0, 0), baseline=baseline, baseline_rows=rows, baseline_note=note
+        )
+        return driver.BinaryDiffOutcome(binary, summary, None)
+
+    def fake_full(atlas: Any, a: str, b: str, **kw: Any) -> driver.FullDiffSummary:
+        oks = (
+            outcome("liba", "stored", 3, None),
+            outcome("libb", "restored", 2, None),
+            outcome("libc", "stored", 0, None),
+            outcome("libd", "not_stored", None, refusal),
+        )
+        for i, o in enumerate(oks, start=1):
+            kw["on_outcome"](i, len(oks), o)
+        names = ("liba", "libb", "libc", "libd")
+        plan = driver.FullDiffPlan(names, (), (), (), to_diff=names)
+        return driver.FullDiffSummary(plan, oks, cancelled=False)
+
+    monkeypatch.setattr(driver, "run_full_diff", fake_full)
+    _two(tmp_path)
+    res = CliRunner().invoke(
+        main,
+        ["diff", "--before", "run_a", "--after", "run_b", "--atlas", str(tmp_path / "atlas.db")],
+    )
+    assert res.exit_code == 0, res.output
+    assert "baselines     : 3 stored (1 with no candidate row), 1 not" in res.output
+    assert f"    - libd: {refusal}" in res.output
+    assert "stored again" not in res.output
 
 
 _STATES = {

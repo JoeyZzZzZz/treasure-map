@@ -171,7 +171,9 @@ def _echo_single_diff(summary: Any, resolved_atlas: Path, states: dict[str, Any]
     click.echo(f"  version_skew  : {summary.version_skew}")
     click.echo(f"  functions     : {_function_line(states)}")
     if summary.baseline is not None:
-        click.echo(f"  baseline      : {summary.baseline.replace('_', ' ')}")
+        rows = summary.baseline_rows
+        held = f" ({rows} candidate rows)" if rows is not None else ""
+        click.echo(f"  baseline      : {summary.baseline.replace('_', ' ')}{held}")
     click.echo(
         "Read the diff: start with get_diff_patch_view (sort_by='significance' floats the scoped "
         "signals); get_diff_meta / get_function_alignment / get_diff_capabilities; "
@@ -256,19 +258,27 @@ def _echo_full_diff(
         click.echo(
             f"  recovered     : {len(recovered)} retried and now ok — {', '.join(recovered)}"
         )
-    restored = [o.binary for o in ok if o.summary.baseline == "restored"]
-    lost = [o.binary for o in ok if o.summary.baseline == "not_restored"]
-    if restored or lost:
-        # A re-diff replaces the stored candidate baseline with the rest of the diff's rows.
+    stored = [o for o in ok if o.summary.baseline in ("stored", "restored")]
+    not_stored = [o for o in ok if o.summary.baseline in ("not_stored", "not_restored")]
+    if stored or not_stored:
+        # Every diff run stores its candidate baseline with its rows; a refusal leaves it without
+        # one (each read then computes the overlay), and says why.
+        empty = sum(1 for o in stored if o.summary.baseline_rows == 0)
         click.echo(
-            f"  baselines     : {len(restored)} stored again, {len(lost)} not"
-            + (f" (now without one — see the diff's warnings): {', '.join(lost)}" if lost else "")
+            f"  baselines     : {len(stored)} stored"
+            + (f" ({empty} with no candidate row)" if empty else "")
+            + f", {len(not_stored)} not"
         )
-    if fsum.baselines_refreshed or fsum.baselines_refresh_refused:
-        # Diffs left as they are (nothing they read moved) whose baseline read stale or was dropped.
+        for o in not_stored:
+            click.echo(f"    - {o.binary}: {o.summary.baseline_note}")
+    refresh_empty = fsum.baselines_refresh_empty
+    if fsum.baselines_refreshed or fsum.baselines_refresh_refused or refresh_empty:
+        # Diffs left as they are (nothing they read moved) whose baseline was missing, read stale
+        # or was dropped.
         click.echo(
             f"  baselines refreshed (unchanged diffs): {len(fsum.baselines_refreshed)}, "
             f"{len(fsum.baselines_refresh_refused)} refused"
+            + (f", {len(refresh_empty)} with no candidate row" if refresh_empty else "")
         )
     if fsum.hunt_marks_restamped or fsum.hunt_marks_left:
         # Diffs left as they are whose recorded hunt marks were brought up to the runs' current
