@@ -253,23 +253,51 @@ def _entry_without_hunks(entry: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+_AXES_PAGE_BUDGET = {"withheld": "page_budget", "read_with": "entry_id + rows_offset"}
+
+
+def _entry_within_budget(entry: dict[str, Any], base: int) -> dict[str, Any]:
+    """One rendered entry fitted beside an envelope of ``base`` bytes: as it is when it fits, else
+    a copy with each row's ``sink_axes`` withheld (``page_budget``) from the LAST row of the window
+    backwards, re-measured after each, stopping as soon as it fits (``sink_axes_withheld_rows``
+    counts them; guard_links stay); only when every row's axes are withheld and it still does not
+    fit are its inline_hunks withheld too. The rows and objects it came from are never written."""
+    if base + len(json.dumps(entry)) <= _RESPONSE_BYTE_BUDGET:
+        return entry
+    out = dict(entry)
+    rows = list(out.get("rows") or [])
+    withheld = 0
+    for n in range(len(rows) - 1, -1, -1):
+        row = rows[n]
+        if not isinstance(row, dict) or not isinstance(row.get("sink_axes"), dict):
+            continue
+        if row["sink_axes"] == _AXES_PAGE_BUDGET:
+            continue
+        rows[n] = {**row, "sink_axes": dict(_AXES_PAGE_BUDGET)}
+        withheld += 1
+        out["rows"] = rows
+        out["sink_axes_withheld_rows"] = withheld
+        if base + len(json.dumps(out)) <= _RESPONSE_BYTE_BUDGET:
+            return out
+    return _entry_without_hunks(out)
+
+
 def _fit_entries(result: dict[str, Any], offset: int) -> dict[str, Any]:
     """A get_diff_patch_view page fitted to the response budget, in every view (``_fit_page``).
 
     First, defensively: an entry that would not fit the page even ALONE beside its envelope
     (envelope + that entry > budget — the envelope is 10-20KB, so the test is not "one entry over
-    the budget") has its inline_hunk(s) withheld as ``page_budget``, whole: a hunk is never cut
-    part-way, which could drop the block that matters, and the rows stay. Here only, never in
-    ``_fit_page``, which other pages share. The live atlas never reaches it."""
+    the budget") has its rows' sink_axes withheld as ``page_budget`` from the last row back until
+    it fits, and only then its inline_hunk(s), whole (:func:`_entry_within_budget`): a hunk is
+    never cut part-way, which could drop the block that matters, and the rows stay. Here only,
+    never in ``_fit_page``, which other pages share. The live atlas reaches it only when reading
+    one entry whose rows carry large axes."""
     if "error" not in result and isinstance(result.get("entries"), list):
         n = result.get("total_entries")
         widest = n if len(json.dumps(n)) > len(json.dumps(None)) else None
         envelope = {**result, "entries": [], "next_offset": widest, "entries_truncated": False}
         base = len(json.dumps(envelope))
-        result["entries"] = [
-            _entry_without_hunks(e) if base + len(json.dumps(e)) > _RESPONSE_BYTE_BUDGET else e
-            for e in result["entries"]
-        ]
+        result["entries"] = [_entry_within_budget(e, base) for e in result["entries"]]
     return _fit_page(
         result,
         offset,
@@ -2042,6 +2070,39 @@ def make_tools(
         handler. A persisted candidate whose size
         constant changed carries ``sink_arg_constant_delta`` (callee + from/to,
         direction-neutral); a changed size KIND is the weaker ``size_kind_shifted``.
+
+        Beside every ``pseudocode_delta`` comes ``guard_scan``: the comparisons of a variable
+        against a constant that the B side's structural change introduces, read line by line from
+        the text (no syntax tree, no data flow) — a syntax fact, ``coverage`` unjudged. ``guards``
+        shows up to 20 (``var``, ``const``, ``relation``, ``cast`` = the variable's cast,
+        ``const_class`` ``zero`` / ``nonzero``, ``line_b`` in the B text), in B order: the ones a
+        shown row links ``yes`` first (``shown_rule`` ``linked_first_then_b_order``; more than 20
+        linked are counted in ``linked_not_shown``), else the first (``b_order``, also on a scan
+        with ``rows_limit=0`` and on ``not_listed_page``); another ``rows_offset`` can show
+        another selection, and past ``stored`` (200) none is linked. ``other_comparisons`` counts
+        the rest by kind; ``not_extracted`` (``too_large``) when the delta could not be matched;
+        ``guards_body_ref`` reads the B body. A comparison whose constant only changed is in the
+        hunk's substitution groups, not here. Each row with a B-side candidate carries
+        ``guard_links``: per shown guard, ``sink_arg`` (from the candidate's ``flow_path``) and
+        ``size_arg`` (from its ``size_flow``; for a strcpy-like call the source string, not a
+        length) under ``yes`` (the variable is BY NAME the sink argument / length variable or one
+        of their one-hop sources — where the comparison sits, whether it lies on the way to the
+        call, dominates it or suffices is NOT read), ``no`` (within a complete one-hop reading the
+        name does not match — not "unrelated", not "protected") or ``unknown``; or
+        ``unavailable`` (``not_recorded_for_class`` = this class's records do not hold the field,
+        not "checked, no match"; ``other_function``; ``ambiguous_ref``; ``no_evidence``;
+        ``not_in_record``); ``pairing`` ``proposed`` on an undetermined pair, whose indices point
+        into ``proposed_pair_reading.guards``. Reading ONE entry (``entry_id``; a list entry with
+        rows says so in ``sink_axes_with``), each row also carries ``sink_axes`` {a, b}: what each
+        side's candidate recorded at hunt time — ``bound``, ``source``, ``flow_path``,
+        ``sanitizer``, ``def_use`` (lists cut to 5 with ``*_total``; ``def_use.scope`` callsite /
+        sink_name / unscoped; a full record via get_sink_provenance) — and the rest under
+        ``unavailable`` by reason (``no_evidence``, ``ambiguous_ref``, ``class_unknown``,
+        ``not_recorded_for_class``, ``not_in_record``): not recorded or not single, never "absent"
+        and never "out of reach". A sanitizer's body: get_pseudocode with that side's run, sha256
+        and the ``seen[].name``; its coverage is unjudged. When one entry is too large for the
+        response, rows' ``sink_axes`` are withheld (``page_budget``) from the last row back
+        (``sink_axes_withheld_rows``), and only then its hunks.
 
         ``view``: ``string_edge`` returns get_diff_deltas' rows, ``candidate_flat``
         get_diff_sink_overlay's rows in its order; the envelope (``subject_counts`` of all three

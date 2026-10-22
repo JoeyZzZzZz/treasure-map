@@ -585,3 +585,85 @@ def test_the_tool_and_the_instructions_say_how_to_read_a_hunk_and_scan() -> None
         assert phrase in doc, phrase
     assert "rows_limit=0" in mcp_app._AGENT_INSTRUCTIONS
     assert "inline_hunk" in mcp_app._AGENT_INSTRUCTIONS
+
+
+def _axes_entry(n_rows: int, axes_bytes: int, hunk_bytes: int) -> dict[str, Any]:
+    """A one-entry read whose rows each carry ~axes_bytes of sink_axes, plus a hunk."""
+    entry = _hunk_entry("one", hunk_bytes)
+    entry["rows"] = [
+        {"a_ref": f"r{i}", "sink_axes": {"a": {"class": "cmd", "pad": "x" * axes_bytes}, "b": None}}
+        for i in range(n_rows)
+    ]
+    return entry
+
+
+def test_one_entry_too_large_sheds_its_rows_axes_from_the_last_row_back() -> None:
+    """I3: an entry that cannot fit beside its envelope has its rows' sink_axes withheld
+    (page_budget, read with entry_id + rows_offset) one row at a time from the LAST row, re-measured
+    each time, stopping as soon as it fits — the earlier rows keep theirs, the hunks stay, and
+    sink_axes_withheld_rows counts the rows. Only when every row's axes are withheld and it still
+    does not fit are the hunks withheld as well. The rows it came from are never written.
+
+    MUTATION M21 (verified RED, 1 failed): withhold every row's axes at once -> RED."""
+    envelope = 20_000
+    entry = _axes_entry(6, 5_000, 50)
+    original = json.dumps(entry)
+    out = mcp_app._fit_entries(_entries_result([entry], envelope), 0)
+    (got,) = out["entries"]
+    assert len(json.dumps(out)) <= _RESPONSE_BYTE_BUDGET
+    shed = [r["a_ref"] for r in got["rows"] if r["sink_axes"].get("withheld") == "page_budget"]
+    k = got["sink_axes_withheld_rows"]
+    assert 0 < k < 6 and shed == [f"r{i}" for i in range(6 - k, 6)]  # the last k, the rest kept
+    # one row fewer would not have fitted, measured as the fit measures it: it stopped at the first
+    base = len(
+        json.dumps(
+            {
+                **_entries_result([], envelope),
+                "total_entries": 1,
+                "next_offset": None,
+                "entries_truncated": False,
+            }
+        )
+    )
+    fewer = {**got, "rows": [*got["rows"][: 6 - k], entry["rows"][6 - k], *got["rows"][7 - k :]]}
+    if k == 1:
+        fewer = entry
+    else:
+        fewer["sink_axes_withheld_rows"] = k - 1
+    assert base + len(json.dumps(fewer)) > _RESPONSE_BYTE_BUDGET
+    assert base + len(json.dumps(got)) <= _RESPONSE_BYTE_BUDGET
+    assert got["rows"][-1]["sink_axes"] == {
+        "withheld": "page_budget",
+        "read_with": "entry_id + rows_offset",
+    }
+    assert "structural" in got["pseudocode_delta"]["inline_hunk"]  # the hunk stayed
+    assert json.dumps(entry) == original  # the rendered entry handed in is untouched
+    big = _axes_entry(3, 2_000, 30_000)
+    (both,) = mcp_app._fit_entries(_entries_result([big], envelope), 0)["entries"]
+    assert both["sink_axes_withheld_rows"] == 3
+    assert both["pseudocode_delta"]["inline_hunk"]["withheld"] == "page_budget"
+
+
+def test_the_tool_says_how_to_read_the_guards_and_the_axes() -> None:
+    """The tool description names every S7 field and the bounds of yes / no / unavailable; the
+    view's legend and caveats carry them too."""
+    from treasure_map.lib.query import patch_view as pv
+
+    doc = " ".join(
+        (mcp_app.make_tools(Path("unused.db"))["get_diff_patch_view"].__doc__ or "").split()
+    )
+    for phrase in (
+        "guard_scan",
+        "guards_body_ref",
+        "guard_links",
+        "linked_not_shown",
+        "sink_axes",
+        "sink_axes_with",
+        "sink_axes_withheld_rows",
+        "not_recorded_for_class",
+        "is NOT read",
+    ):
+        assert phrase in doc, phrase
+    assert {"guard_scan", "guard_links", "sink_axes"} <= set(pv._LEGEND)
+    assert {"guards", "guard_links", "sink_axes"} <= set(pv._CAVEATS)
+    assert "get_pseudocode(run_id=" in pv._LEGEND["sink_axes"]

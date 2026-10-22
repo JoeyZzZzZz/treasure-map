@@ -62,6 +62,12 @@ TWO SIGNALS SIMILARITY IS BLIND TO (lib/query/sameness), read on the function-pa
   ``sink_arg_constant_delta`` — a persisted candidate whose size constant moved (0x40 -> 0x3f),
   with the callee and from/to, direction-neutral. A changed size KIND is the weaker
   ``size_kind_shifted``.
+  ``guard_scan`` / ``guards`` (beside every ``pseudocode_delta``) — the variable-against-constant
+  comparisons the B side's structural change introduces (sameness's guard scan), with each
+  rendered row's ``guard_links``: whether a guard's variable is, by name, its B-side candidate's
+  sink argument or length variable. Reading one entry, each row also carries ``sink_axes``: what
+  both sides' candidates recorded at hunt time (lib/query/diff_sink_axes). All of these are added
+  to the rendered copies only — never to the build, an entry's row views or a judgement's basis.
   Reading pseudocode is the costly half, so it is computed in get_diff_patch_view (cached per
   diff + content + build), never in build_diff_view — annotate/promote and the progress block stay
   cheap. A pseudocode_delta is computed for the whole diff's anchored_differs pairs above the
@@ -90,7 +96,7 @@ from typing import Any, Generic, TypeVar
 
 from treasure_map.lib.diff.layer0 import norm_hex
 from treasure_map.lib.pattern import classes
-from treasure_map.lib.query import diff_review, sameness
+from treasure_map.lib.query import diff_review, diff_sink_axes, sameness
 from treasure_map.lib.query.coverage import CONCLUDED, NEEDS_RECHECK, NEEDS_RELABEL, OPEN
 from treasure_map.lib.query.diff_align import diff_source_staleness, get_diff_deltas
 from treasure_map.lib.query.sink_impact import impact_tier
@@ -265,6 +271,20 @@ _CAVEATS = {
         "tier is the highest sink-impact tier of the entry's candidates (the same tiers that "
         "order list_candidates), an ordering aid, not a measure of what the change does."
     ),
+    "guards": (
+        "A syntax fact read line by line, coverage unjudged: where a comparison sits, whether it "
+        "lies on the way to a sink, dominates it or suffices is not read."
+    ),
+    "guard_links": (
+        "yes is a name match only. no = within a complete one-hop reading the name does not "
+        "match: not unrelated, not protected. not_recorded_for_class = the class's records lack "
+        "the field, not 'checked, no match'."
+    ),
+    "sink_axes": (
+        "What each candidate recorded at hunt time, as it is; often empty or constant in real "
+        "records, a gap of the extraction, not of the diff. unavailable = not recorded or not "
+        "single, never absent."
+    ),
 }
 
 _LEGEND = {
@@ -279,6 +299,19 @@ _LEGEND = {
     "E": (
         "similarity-1 pair whose function has a direct caller on the A side and none found (or "
         "none provable) on the B side — a caller-set edge (callers_a / callers_b)"
+    ),
+    "guard_scan": (
+        "beside pseudocode_delta: the comparisons of a variable with a constant the B side's "
+        "structural change introduces (guards: up to 20, linked first, B order)"
+    ),
+    "guard_links": (
+        "per shown guard: is its variable, by name, the row's B-side sink argument / length "
+        "variable or a one-hop source (yes / no / unknown), or unavailable with the reason"
+    ),
+    "sink_axes": (
+        "with entry_id: each side's recorded bound / source / flow_path / sanitizer / def_use. A "
+        "sanitizer's body: get_pseudocode(run_id=<side's run>, binary=<side's sha256>, "
+        "function=<seen[].name>)"
     ),
 }
 
@@ -692,12 +725,18 @@ _SIZE_FACT_CACHE: _BoundedCache[tuple[str, ...], dict[str, tuple[str, str | None
 _CANDIDATE_ENTRY_CACHE: _BoundedCache[tuple[str, ...], frozenset[str]] = _BoundedCache(16)
 
 
-def _size_facts(atlas: sqlite3.Connection, run_id: str) -> dict[str, tuple[str, str | None]]:
-    """evidence_ref -> (size_kind, size_arg) for the run's candidates that carry a size axis."""
+def _run_key(atlas: sqlite3.Connection, run_id: str) -> tuple[str, ...]:
+    """(atlas, run id, the run row's build hash, hunt commit and last update): the key a per-run
+    cache of candidate facts is read under, so a re-extraction or a re-hunt is not served stale."""
     row = atlas.execute(
         "SELECT build_hash, hunt_commit, updated_at FROM run WHERE run_id = ?", (run_id,)
     ).fetchone()
-    key = (_atlas_identity(atlas), run_id, *(str(v or "") for v in (row or (None, None, None))))
+    return (_atlas_identity(atlas), run_id, *(str(v or "") for v in (row or (None, None, None))))
+
+
+def _size_facts(atlas: sqlite3.Connection, run_id: str) -> dict[str, tuple[str, str | None]]:
+    """evidence_ref -> (size_kind, size_arg) for the run's candidates that carry a size axis."""
+    key = _run_key(atlas, run_id)
     hit = _SIZE_FACT_CACHE.get(key)
     if hit is not None:
         return hit
@@ -2327,6 +2366,15 @@ class _Readings:
 _PSEUDO_READING_CACHE: _BoundedCache[tuple[str, ...], _PairReads] = _BoundedCache(32)
 _UNDETERMINED_READING_CACHE: _BoundedCache[tuple[str, ...], _PairReads] = _BoundedCache(32)
 _DELTA_CACHE: _BoundedCache[tuple[Any, ...], dict[str, Any]] = _BoundedCache(4096)
+# The guard scan of each pair (sameness.pseudocode_delta_and_guards), on the delta cache's key: the
+# two are computed in one pass and written together, and a pair missing from EITHER is recomputed
+# whole, so the delta never carries the scan.
+_GUARD_CACHE: _BoundedCache[tuple[Any, ...], dict[str, Any]] = _BoundedCache(4096)
+# One candidate's instance rows, parsed and cut (diff_sink_axes.RowAxes), per (atlas, run, the run
+# row's stamps, evidence_ref): read for the rows a page renders, never the raw record.
+_SINK_AXIS_CACHE: _BoundedCache[tuple[str, ...], tuple[diff_sink_axes.RowAxes, ...]] = (
+    _BoundedCache(8192)
+)
 # The no-mention index of the caller-set edge, on the pseudocode readings' key PLUS the E entries it
 # covers (they move with the candidate rows, which that key does not hold): computed when the B
 # bodies are read, so every page of one diff reads the same set in the same order.
@@ -2340,6 +2388,8 @@ def _clear_view_caches() -> None:
     _PSEUDO_READING_CACHE.clear()
     _UNDETERMINED_READING_CACHE.clear()
     _DELTA_CACHE.clear()
+    _GUARD_CACHE.clear()
+    _SINK_AXIS_CACHE.clear()
     _B_MENTIONS_CACHE.clear()
     _SIZE_FACT_CACHE.clear()
     _CANDIDATE_ENTRY_CACHE.clear()
@@ -2684,19 +2734,30 @@ def _hidden_region(read: _Read, p: _Pair) -> dict[str, Any] | None:
     }
 
 
-def _deltas(readings: _Readings, pairs: list[_Pair]) -> dict[tuple[str, str], dict[str, Any]]:
+def _deltas(
+    readings: _Readings,
+    pairs: list[_Pair],
+    guards: dict[tuple[str, str], dict[str, Any]] | None = None,
+) -> dict[tuple[str, str], dict[str, Any]]:
     """pseudocode_delta of each of ``pairs`` (pairs whose texts were read and differ) — its caller
     chooses which, and ``_annotate_entries`` gives it the whole diff's anchored_differs pairs above
     the read-first floor, not only the page: the bodies are read once, and only when one of them is
-    not cached; the result is cached per pair, the bodies are not kept."""
+    not cached; the result is cached per pair, the bodies are not kept.
+
+    Each pair's guard scan is computed in the same pass and cached beside it (``_GUARD_CACHE``);
+    a pair missing from either cache is recomputed whole. ``guards``, when given, is filled with
+    the scan of each pair returned."""
     out: dict[tuple[str, str], dict[str, Any]] = {}
     missing: list[_Pair] = []
     for p in pairs:
-        hit = _DELTA_CACHE.get((readings.key, p.addr_a, p.addr_b))
-        if hit is None:
+        key = (readings.key, p.addr_a, p.addr_b)
+        hit, scan = _DELTA_CACHE.get(key), _GUARD_CACHE.get(key)
+        if hit is None or scan is None:
             missing.append(p)
         else:
             out[(p.addr_a, p.addr_b)] = hit
+            if guards is not None:
+                guards[(p.addr_a, p.addr_b)] = scan
     if missing:
         (pa, sha_a), (pb, sha_b) = readings.sources
         ba = sameness.read_function_bodies(pa, sha_a) or {}
@@ -2712,9 +2773,14 @@ def _deltas(readings: _Readings, pairs: list[_Pair]) -> dict[tuple[str, str], di
             # a synthetic FUN_/loc_ name carries no such meaning, so it is passed as None.
             na = p.name_a if p.name_a and not _is_synthetic_name(p.name_a, p.addr_a) else None
             nb = p.name_b if p.name_b and not _is_synthetic_name(p.name_b, p.addr_b) else None
-            delta = sameness.pseudocode_delta(ta, tb, ra, rb, p.addr_a, p.addr_b, na, nb)
+            delta, scan = sameness.pseudocode_delta_and_guards(
+                ta, tb, ra, rb, p.addr_a, p.addr_b, na, nb
+            )
             _DELTA_CACHE[(readings.key, p.addr_a, p.addr_b)] = delta
+            _GUARD_CACHE[(readings.key, p.addr_a, p.addr_b)] = scan
             out[(p.addr_a, p.addr_b)] = delta
+            if guards is not None:
+                guards[(p.addr_a, p.addr_b)] = scan
     return out
 
 
@@ -2756,12 +2822,111 @@ def _page_bodies(readings: _Readings, page: list[_Entry]) -> dict[tuple[str, str
     }
 
 
+# ── guards and sink axes: added to the rendered copies only, never to the build ──────────────
+
+_Window = tuple[list[dict[str, Any]], dict[str, Any]]
+
+
+def _page_axes(
+    atlas: sqlite3.Connection,
+    diff: _Diff,
+    page: list[_Entry],
+    windows: dict[str, _Window],
+    guards: dict[tuple[str, str], dict[str, Any]],
+    single: bool,
+) -> dict[str, dict[str, tuple[diff_sink_axes.RowAxes, ...]]]:
+    """side -> ref -> the candidate's parsed rows, for what this page renders: reading one entry,
+    both sides of its window's rows (the axes); a list page, the B side of the window's rows of the
+    entries whose guard scan holds a guard (the links)."""
+    want: dict[str, set[str]] = {"a": set(), "b": set()}
+    for e in page:
+        rows = windows[e.entry_id][0]
+        if not single:
+            p = e.pair
+            scan = guards.get((p.addr_a, p.addr_b)) if p is not None else None
+            if scan is None or scan.get("state") != "done" or not scan.get("guards"):
+                continue
+        for v in rows:
+            for side in ("a", "b") if single else ("b",):
+                ref = v.get(f"{side}_ref")
+                if ref:
+                    want[side].add(ref)
+    out: dict[str, dict[str, tuple[diff_sink_axes.RowAxes, ...]]] = {"a": {}, "b": {}}
+    for side, run in (("a", diff.run_a), ("b", diff.run_b)):
+        if want[side]:
+            out[side] = diff_sink_axes.fetch(
+                atlas, run, want[side], _SINK_AXIS_CACHE, _run_key(atlas, run)
+            )
+    return out
+
+
+def _entry_guards(
+    e: _Entry,
+    diff: _Diff,
+    scan: dict[str, Any],
+    rows: list[dict[str, Any]],
+    axes_b: dict[str, tuple[diff_sink_axes.RowAxes, ...]],
+) -> tuple[dict[str, Any], list[dict[str, Any] | None]]:
+    """The entry's guard fields and each rendered row's guard_links (diff_sink_axes.entry_guards).
+    A row is linked through its B-side candidate; one whose candidate lies in another function
+    than the pair's B side (a row is placed by its A-side ref) links nothing."""
+    p = e.pair
+    assert p is not None
+    links = [
+        None
+        if not v.get("b_ref")
+        else diff_sink_axes.LinkRow(
+            same_function=_func_entry_hex(v["b_ref"]) == p.addr_b,
+            rows=axes_b.get(v["b_ref"], ()),
+            cls=v.get("class_b"),
+        )
+        for v in rows
+    ]
+    body_ref = {
+        "read_with": "get_pseudocode",
+        "run_id": diff.run_b,
+        "binary": diff.sha_b,
+        "function": p.addr_b,
+    }
+    return diff_sink_axes.entry_guards(scan, links, body_ref)
+
+
+def _rendered_rows(
+    rows: list[dict[str, Any]],
+    links: list[dict[str, Any] | None] | None,
+    pairing: str | None,
+    axes: dict[str, dict[str, tuple[diff_sink_axes.RowAxes, ...]]] | None,
+) -> list[dict[str, Any]]:
+    """The window's rows as rendered: a row given guard_links (and, reading one entry, sink_axes)
+    is a COPY carrying them; the entry's own row views are never written."""
+    out: list[dict[str, Any]] = []
+    for n, v in enumerate(rows):
+        extra: dict[str, Any] = {}
+        link = links[n] if links is not None else None
+        if link is not None:
+            extra["guard_links"] = {**link, "pairing": pairing} if pairing else link
+        if axes is not None:
+            extra["sink_axes"] = {
+                side: (
+                    diff_sink_axes.side_axes(
+                        axes[side].get(v[f"{side}_ref"], ()), v[f"class_{side}"]
+                    )
+                    if v.get(f"{side}_ref")
+                    else None
+                )
+                for side in ("a", "b")
+            }
+        out.append({**v, **extra} if extra else v)
+    return out
+
+
 def _proposed_json(
     e: _Entry,
     state: str,
     read: _Read,
     deltas: dict[tuple[str, str], dict[str, Any]],
     bodies: dict[tuple[str, str], dict[str, Any]],
+    guard_fields: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """An undetermined pair's ``proposed_pair_reading``: read as if it were paired, beside the
     entry and never as its pseudocode_sameness. ``occurrences`` and the two ``*_elsewhere_*`` are
@@ -2773,7 +2938,8 @@ def _proposed_json(
     with ``demoted: false``, its ``callee_set`` and ``size_bytes`` showing which was not. A
     micro-side R pair is NOT anchored_differs, so it carries no such block here. A pair with no text
     on a side carries ``bodies`` (:func:`_page_bodies`): which side is the micro-stub, its size and
-    its listing."""
+    its listing. ``guard_fields`` (the pair's guard scan, :func:`_entry_guards`) follow its
+    pseudocode_delta, only when there is one."""
     p = e.pair
     assert p is not None
     out: dict[str, Any] = {"pairing": "undetermined", "state": state}
@@ -2805,6 +2971,8 @@ def _proposed_json(
     delta = deltas.get((p.addr_a, p.addr_b))
     if delta is not None:
         out["pseudocode_delta"] = delta
+        if guard_fields is not None:
+            out.update(guard_fields)
     if (p.addr_a, p.addr_b) in bodies:
         out["bodies"] = bodies[(p.addr_a, p.addr_b)]
     return out
@@ -2855,6 +3023,7 @@ def _not_listed_page(
     )
     end = offset + limit
     page = [e for e in pairs[offset:end] if e.pair is not None]
+    scans: dict[tuple[str, str], dict[str, Any]] = {}
     deltas = _deltas(
         readings,
         [
@@ -2862,6 +3031,7 @@ def _not_listed_page(
             for e in page
             if e.pair is not None and (_aligned_read(e, readings) or _UNREAD).matches is False
         ],
+        scans,
     )
     rows: list[dict[str, Any]] = []
     for e in page:
@@ -2880,6 +3050,9 @@ def _not_listed_page(
         delta = deltas.get((e.pair.addr_a, e.pair.addr_b))
         if delta is not None:
             row["pseudocode_delta"] = delta
+            # The guard scan follows its delta; these pairs carry no candidate row to link.
+            scan = scans[(e.pair.addr_a, e.pair.addr_b)]
+            row.update(_entry_guards(e, built.diff, scan, [], {})[0])
         rows.append(row)
     return {
         "entries": rows,
@@ -3544,19 +3717,33 @@ def get_diff_patch_view(
         )
     end = offset + limit
     page = ordered[offset:end]
+    page_guards: dict[tuple[str, str], dict[str, Any]] = {}
     page_deltas = _deltas(
-        readings, [p for e in page if (p := _delta_pair(e, readings)) is not None]
+        readings, [p for e in page if (p := _delta_pair(e, readings)) is not None], page_guards
     )
     page_bodies = _page_bodies(readings, page)
+    windows = {e.entry_id: _rows_window(e.row_views, rows_offset or 0, rows_limit) for e in page}
+    page_axes = _page_axes(atlas, built.diff, page, windows, page_guards, one is not None)
 
     def _render(e: _Entry) -> dict[str, Any]:
         out = review.entry_json(e, band)
         # out["rows"] IS e.row_views (the entry's own list, which promote and the judgement basis
-        # read whole): it is REPLACED by the window's new list, never cut or sorted in place.
-        out["rows"], window = _rows_window(e.row_views, rows_offset or 0, rows_limit)
+        # read whole): it is REPLACED by the window's new list, never cut or sorted in place, and a
+        # row given guard_links / sink_axes is a copy (_rendered_rows).
+        rows, window = windows[e.entry_id]
+        p = e.pair
+        scan = page_guards.get((p.addr_a, p.addr_b)) if p is not None else None
+        guard_fields: dict[str, Any] | None = None
+        links: list[dict[str, Any] | None] | None = None
+        if scan is not None:
+            guard_fields, links = _entry_guards(e, built.diff, scan, rows, page_axes["b"])
+        pairing = "proposed" if p is not None and not p.aligned else None
+        out["rows"] = _rendered_rows(rows, links, pairing, page_axes if one is not None else None)
         out.update(window)
         if one is not None:
             out["rows_offset"] = rows_offset or 0
+        elif window["rows_total"]:
+            out["sink_axes_with"] = "entry_id"
         if e.bucket == "E":
             # Whether another B function names this one (the no-mention ordering key, as an honest
             # field). A read-face fact: the index is in readings, never in the cheap build layer.
@@ -3573,11 +3760,13 @@ def get_diff_patch_view(
             delta = page_deltas.get((e.pair.addr_a, e.pair.addr_b))
             if delta is not None:
                 out["pseudocode_delta"] = delta
+                if guard_fields is not None:
+                    out.update(guard_fields)
             if (e.pair.addr_a, e.pair.addr_b) in page_bodies:
                 out["bodies"] = page_bodies[(e.pair.addr_a, e.pair.addr_b)]
         if e.entry_id in proposed and e.pair is not None:
             out["proposed_pair_reading"] = _proposed_json(
-                e, *proposed[e.entry_id], page_deltas, page_bodies
+                e, *proposed[e.entry_id], page_deltas, page_bodies, guard_fields
             )
         if e.entry_id in lens:
             attention, basis = lens[e.entry_id]

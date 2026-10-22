@@ -1277,3 +1277,238 @@ def test_a_too_large_delta_still_shows_its_changed_middle(monkeypatch: pytest.Mo
         "lines": {"a": 2, "b": 2},
         "read_with": "get_pseudocode",
     }
+
+
+# ── the guard scan: comparisons the B side's structural change introduces ─────────────────────
+
+
+def _scan(a: str, b: str) -> dict:
+    return sm.pseudocode_delta_and_guards(a, b, None, None, "1000", "2000")[1]
+
+
+def _guard_tuples(scan: dict) -> list[tuple]:
+    return [
+        (g["var"], g["relation"], g["const"], g["cast"], g["const_class"]) for g in scan["guards"]
+    ]
+
+
+def test_a_comparison_added_in_a_structural_block_is_a_guard_at_its_original_line() -> None:
+    """G1: a B-only ``if (uVar3 > 0x40)`` in a structural block is one guard, nonzero, its line_b
+    the 1-based line of the ORIGINAL B text (a blank line counted)."""
+    a = "n = read(buf);\nfoo(n);"
+    b = "n = read(buf);\n\nif (uVar3 > 0x40) {\n  bar();\n}\nfoo(n);"
+    scan = _scan(a, b)
+    assert scan["state"] == "done"
+    assert scan["guards"] == [
+        {
+            "var": "uVar3",
+            "const": "0x40",
+            "relation": ">",
+            "cast": None,
+            "const_class": "nonzero",
+            "line_b": 3,
+        }
+    ]
+    assert scan["var_const_total"] == 1
+    assert scan["by_const_class"] == {"zero": 0, "nonzero": 1}
+
+
+def test_a_constant_on_the_left_is_read_with_the_variable_first() -> None:
+    """G2: ``0x40 < uVar3`` is read ``uVar3 > 0x40`` — a syntax normalisation only.
+
+    MUTATION (verified RED, 1 failed): keep the relation as written when the constant is on the
+    left -> RED."""
+    assert _guard_tuples(_scan("foo();", "if (0x40 < uVar3) bar();")) == [
+        ("uVar3", ">", "0x40", None, "nonzero")
+    ]
+
+
+def test_an_ordering_inside_an_equality_is_read_by_cs_precedence() -> None:
+    """G2b: in ``(int)x < 0 == bVar1`` the ``<`` binds tighter: it is the one guard
+    ``x < 0`` (cast ``(int)``); the ``==`` has a compound left operand and is counted as other.
+
+    MUTATION M18 (verified RED, 1 failed): make the ordering operators boundaries of an
+    equality's scan too -> the ``==`` reads ``0 == bVar1`` (a second guard) -> RED."""
+    scan = _scan("foo();", "if ((int)x < 0 == bVar1) bar();")
+    assert _guard_tuples(scan) == [("x", "<", "0", "(int)", "zero")]
+    assert scan["other_comparisons"] == {"var_var": 0, "call": 0, "field": 0, "other": 1}
+
+
+def test_a_cast_added_on_the_variable_is_another_comparison() -> None:
+    """G2c: ``uVar3 < 0x20`` becoming ``(int)uVar3 < 0x20`` in one structural block is a guard, and
+    ``cast`` shows the difference is the variable's cast.
+
+    MUTATION M20 (verified RED, 1 failed): drop the variable's cast from the key -> the two
+    compare equal -> no guard -> RED."""
+    scan = _scan("a();\nif (uVar3 < 0x20) {", "b();\nif ((int)uVar3 < 0x20) {")
+    assert _guard_tuples(scan) == [("uVar3", "<", "0x20", "(int)", "nonzero")]
+
+
+def test_a_null_constant_retyped_is_the_same_comparison() -> None:
+    """G2d: ``p == (byte *)0x0`` becoming ``p == (char *)0x0`` (the decompiler retyped the null
+    constant) in a structural block — the block also holds a changed call — is no guard.
+
+    MUTATION M22 (verified RED, 1 failed): keep the constant's cast in the key -> a guard -> RED."""
+    scan = _scan("if (p == (byte *)0x0) {\na();", "if (p == (char *)0x0) {\nb(1, 2);")
+    assert scan["state"] == "done"
+    assert scan["guards"] == []
+
+
+def test_a_cast_null_constant_is_zero() -> None:
+    """G3: ``pcVar2 == (char *)0x0`` gives const ``0x0`` (its cast set aside), const_class zero.
+
+    MUTATION M9 (verified RED, 1 failed): read the class from the constant with its cast ->
+    nonzero -> RED."""
+    assert _guard_tuples(_scan("foo();", "if (pcVar2 == (char *)0x0) bar();")) == [
+        ("pcVar2", "==", "0x0", None, "zero")
+    ]
+
+
+def test_a_moved_address_is_no_new_comparison_and_the_name_is_shown_as_written() -> None:
+    """G4: in one structural block, ``DAT_00412a0 == 0`` (A) and ``DAT_00413b0 == 0`` (B) are the
+    same comparison once the address is normalised; the new ``DAT_00413c4 > 5`` is shown by the
+    name the original B text writes.
+
+    MUTATION M4 (verified RED, 1 failed): key the comparisons on the original tokens -> the
+    moved one is a guard -> RED. MUTATION M5 (verified RED, 1 failed): show the normalised
+    tokens -> ``DAT_@`` -> RED."""
+    a = "if (DAT_00412a0 == 0) {"
+    b = "if ((DAT_00413b0 == 0) && (flag != 0)) {\nif (DAT_00413c4 > 5) {"
+    guards = _guard_tuples(_scan(a, b))
+    assert guards == [("flag", "!=", "0", None, "zero"), ("DAT_00413c4", ">", "5", None, "nonzero")]
+
+
+def test_a_threshold_changed_in_a_substitution_block_is_not_a_guard() -> None:
+    """G5: ``len > 0x100`` -> ``len > 0x40`` alone is a substitution-only change (the hunk's
+    substitution groups show it): the scan is done and holds no guard.
+
+    MUTATION M6 (verified RED, 1 failed): read substitution-only blocks too -> RED."""
+    scan = _scan("if (len > 0x100) {\nfoo();", "if (len > 0x40) {\nfoo();")
+    assert scan == {
+        "state": "done",
+        "var_const_total": 0,
+        "by_const_class": {"zero": 0, "nonzero": 0},
+        "other_comparisons": {"var_var": 0, "call": 0, "field": 0, "other": 0},
+        "guards": [],
+    }
+
+
+def test_an_incomplete_operand_is_no_guard_and_is_counted_by_kind() -> None:
+    """G6: an operand that is not one variable or one constant (after one cast) is no guard:
+    ``iVar11 + 1 < (int)param_2``, ``*p != 0`` and ``x < 0x10 + y`` are counted as other; two
+    variables are var_var, a call call, a member read field.
+
+    MUTATION M12 (verified RED, 1 failed): take only the token next to the operator as the
+    operand -> ``*p != 0`` and ``x < 0x10 + y`` read as guards -> RED."""
+    b = "\n".join(
+        [
+            "if (iVar11 + 1 < (int)param_2) {",
+            "if (*p != 0) {",
+            "if (x < 0x10 + y) {",
+            "if (a < b) {",
+            "if (f(x) < 3) {",
+            "if (s->n > 4) {",
+        ]
+    )
+    scan = _scan("foo();", b)
+    assert scan["guards"] == []
+    assert scan["other_comparisons"] == {"var_var": 1, "call": 1, "field": 1, "other": 3}
+
+
+def test_a_moved_comparison_is_not_introduced() -> None:
+    """G7: the same ``if (n > 0x40)`` deleted near the top and inserted far below falls in two
+    blocks, so each block alone would call it new; across the whole function B holds it no more
+    often than A, so it is not a guard. With two in B against one in A, exactly one is.
+
+    MUTATION M13 (verified RED, 1 failed): drop the whole-function count -> the moved one is a
+    guard -> RED."""
+    filler = [f"step_{c}();" for c in "abcdefgh"]
+    a = "\n".join(["start();", "if (n > 0x40) {", *filler, "end();"])
+    b = "\n".join(["start();", *filler, "if (n > 0x40) {", "end();"])
+    assert _scan(a, b)["guards"] == []
+    twice = "\n".join(["start();", *filler, "if (n > 0x40) {", "x();", "if (n > 0x40) {", "end();"])
+    assert _guard_tuples(_scan(a, twice)) == [("n", ">", "0x40", None, "nonzero")]
+
+
+def test_past_the_store_limit_the_guards_are_counted_not_kept() -> None:
+    """G8 (scan side): more introduced guards than GUARD_STORE_LIMIT keeps the first ones in B
+    order; var_const_total and by_const_class count all of them."""
+    n = sm.GUARD_STORE_LIMIT + 7
+    b = "\n".join(f"if (v{i} > {i + 1}) {{" for i in range(n))
+    scan = _scan("foo();", b)
+    assert scan["var_const_total"] == n
+    assert scan["by_const_class"] == {"zero": 0, "nonzero": n}
+    assert len(scan["guards"]) == sm.GUARD_STORE_LIMIT
+    assert [g["var"] for g in scan["guards"][:3]] == ["v0", "v1", "v2"]
+
+
+def _count_blocks(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    calls: list[int] = []
+    real = sm._delta_blocks
+
+    def counting(la: list[str], lb: list[str]) -> object:
+        calls.append(1)
+        return real(la, lb)
+
+    monkeypatch.setattr(sm, "_delta_blocks", counting)
+    return calls
+
+
+def test_a_too_large_body_reads_its_matched_middle_and_says_when_none_was_matched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """G9: on the line-cap path the changed middle's ONE block match serves the hunk and the scan,
+    whose line_b is mapped back past the set-aside head; when the middle is over the cap too the
+    scan is not_extracted (too_large) with no guards key. On the token-cap path the scan is
+    not_extracted after the one match that hit the cap — nothing is re-matched.
+
+    MUTATION (verified RED, 1 failed): forget the head offset in the scan -> wrong line_b -> RED;
+    re-match the middle for the scan -> _delta_blocks called twice -> RED."""
+    lines = [f"x{i} = {i};" for i in range(10)]
+    a = "\n".join(lines)
+    b = "\n".join(lines[:6] + ["if (x6 > 0x60) {", "}"] + lines[6:])
+    monkeypatch.setattr(sm, "DELTA_LINE_PRODUCT_CAP", 99)
+    calls = _count_blocks(monkeypatch)
+    delta, scan = sm.pseudocode_delta_and_guards(a, b, None, None, "1000", "2000")
+    assert delta["kind"] == "not_computed"
+    assert calls == [1]
+    assert scan["state"] == "done"
+    assert [(g["var"], g["line_b"]) for g in scan["guards"]] == [("x6", 7)]
+    monkeypatch.setattr(sm, "DELTA_LINE_PRODUCT_CAP", 1)
+    calls.clear()
+    b_over = "\n".join(lines[:6] + ["if (x6 > 0x60) {", "x6 = 61;"] + lines[7:])
+    _delta, over = sm.pseudocode_delta_and_guards(a, b_over, None, None, "1000", "2000")
+    assert over == {"state": "not_extracted", "reason": "too_large"}
+    assert calls == []  # the middle (1 x 2 lines) is over the cap: never matched
+    monkeypatch.setattr(sm, "DELTA_LINE_PRODUCT_CAP", 10_000)
+    monkeypatch.setattr(sm, "DELTA_TOKEN_PRODUCT_CAP", 4)
+    calls.clear()
+    _delta, token_cap = sm.pseudocode_delta_and_guards(a, b_over, None, None, "1000", "2000")
+    assert token_cap == {"state": "not_extracted", "reason": "too_large"}
+    assert "guards" not in token_cap
+    assert calls == [1]
+
+
+def test_a_hunk_withheld_by_the_gate_does_not_withhold_the_scan() -> None:
+    """G9 (gate): a change over INLINE_HUNK_GATE withholds the hunk; the blocks were matched, so
+    the scan is read as usual."""
+    many = [f"call_{i}(x);" for i in range(sm.INLINE_HUNK_GATE + 5)]
+    b = "\n".join(["if (len >= 0x200) {", *many, "}"])
+    delta, scan = sm.pseudocode_delta_and_guards("foo();", b, None, None, "1000", "2000")
+    assert delta["inline_hunk"]["withheld"] == "over_gate"
+    assert _guard_tuples(scan) == [("len", ">=", "0x200", None, "nonzero")]
+
+
+def test_the_delta_is_the_same_whichever_entry_point_reads_it() -> None:
+    """G10 / I2: pseudocode_delta is the first half of pseudocode_delta_and_guards, byte for byte,
+    and carries no guard key and no block position.
+
+    MUTATION M11 (verified RED, 3 failed): put the scan into the delta's return -> RED here, in
+    the S4 contract test and in the view's cached-delta check."""
+    import json
+
+    for name, (a, b, fa, fb, na, nb) in _DELTA_CASES.items():
+        delta = sm.pseudocode_delta(a, b, None, None, fa, fb, na, nb)
+        both = sm.pseudocode_delta_and_guards(a, b, None, None, fa, fb, na, nb)
+        assert json.dumps(delta) == json.dumps(both[0]), name
+        assert not {"guards", "guard_scan", "state", "var_const_total"} & set(delta), name

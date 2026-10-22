@@ -60,6 +60,7 @@ import hashlib
 import json
 import re
 import sqlite3
+from collections import Counter
 from difflib import SequenceMatcher
 from itertools import zip_longest
 from typing import Any, NamedTuple
@@ -615,14 +616,45 @@ def pseudocode_delta(
     another: every other field is what it was before the hunk existed. It is omitted when there is
     nothing to show (``layout_only``); a ``not_computed`` delta still carries one when the changed
     middle, once the identical leading and trailing lines are set aside, fits the line cap
-    (:func:`_trimmed_hunk`)."""
+    (:func:`_trimmed_hunk`).
+
+    The same pass also reads the comparisons the change introduces:
+    :func:`pseudocode_delta_and_guards` returns them beside this delta, which they never enter."""
+    return pseudocode_delta_and_guards(a, b, ranges_a, ranges_b, addr_a, addr_b, name_a, name_b)[0]
+
+
+def pseudocode_delta_and_guards(
+    a: str,
+    b: str,
+    ranges_a: ImageRanges,
+    ranges_b: ImageRanges,
+    addr_a: str,
+    addr_b: str,
+    name_a: str | None = None,
+    name_b: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """(``pseudocode_delta``, the guard scan) of two bodies, from ONE line match and one block
+    match: the delta is byte for byte what :func:`pseudocode_delta` returns, and the guard scan
+    (:func:`_guard_scan`) is a separate object that never enters it and holds no block position.
+
+    The scan is ``not_extracted`` (``too_large``) exactly when no block match was made: a body over
+    the token cap, or a too-large body whose changed middle is itself over a cap. When the middle
+    of a too-large body was matched, the scan reads that middle's blocks (its lines mapped back past
+    the identical head). A hunk withheld by the gate does not affect it: the blocks were matched."""
     blank_try = try_shift_consistent(a, b, _hex_int(addr_a), _hex_int(addr_b))
     la, ra, na = _delta_lines(a, ranges_a, blank_try)
     lb, rb, nb = _delta_lines(b, ranges_b, blank_try)
     sides = _Sides(ra, na, rb, nb)
     too_large: dict[str, Any] = {"kind": "not_computed", "reason": "too_large"}
     if len(la) * len(lb) > DELTA_LINE_PRODUCT_CAP:
-        return _with_hunk(too_large, _trimmed_hunk(la, lb, sides))
+        middle = _middle_blocks(la, lb)
+        p, _ma, _mb, mid_blocks = middle
+        scan = (
+            _guard_scan(mid_blocks, p, la, lb, sides)
+            if mid_blocks is not None
+            else dict(_GUARDS_TOO_LARGE)
+        )
+        return _with_hunk(too_large, _trimmed_hunk(la, lb, sides, middle)), scan
     blocks = _delta_blocks(la, lb)
     if blocks is None:
         # The TOKEN cap was hit over the whole body. Trimming the identical head and tail and
@@ -635,7 +667,7 @@ def pseudocode_delta(
             "lines": {"a": len(ma), "b": len(mb)},
             "read_with": _READ_WITH,
         }
-        return _with_hunk(too_large, hunk)
+        return _with_hunk(too_large, hunk), dict(_GUARDS_TOO_LARGE)
     spans = 0
     subs: dict[str, dict[str, Any]] = {}
     for blk in blocks:
@@ -664,7 +696,8 @@ def pseudocode_delta(
         lnf = _line_number_form(la, lb, name_a, name_b)
         if lnf is not None:
             out["line_number_form"] = lnf
-    return _with_hunk(out, _inline_hunk(blocks, 0, len(la), len(lb), sides))
+    delta = _with_hunk(out, _inline_hunk(blocks, 0, len(la), len(lb), sides))
+    return delta, _guard_scan(blocks, 0, la, lb, sides)
 
 
 # ── inline_hunk: the changed blocks themselves, read from the original text ──────────────────
@@ -936,23 +969,38 @@ def _trim(la: list[str], lb: list[str]) -> tuple[int, int, list[str], list[str]]
     return p, s, la[p : len(la) - s], lb[p : len(lb) - s]
 
 
-def _trimmed_hunk(la: list[str], lb: list[str], sides: _Sides) -> dict[str, Any] | None:
-    """The hunk of a delta too large to compute whole: the identical leading and trailing lines set
-    aside, the changed middle matched as usual when ITS line pairs fit ``DELTA_LINE_PRODUCT_CAP``
-    (its lines and line numbers mapped back past the set-aside head), else — or when its token pairs
-    exceed the token cap — ``{withheld: too_large, lines {a, b}, read_with}`` with the middle's
-    line counts. The delta itself stays ``not_computed``: this is only the hunk."""
+def _middle_blocks(
+    la: list[str], lb: list[str]
+) -> tuple[int, list[str], list[str], list[_Block] | None]:
+    """``(p, middle_a, middle_b, blocks)`` of a body too large to match whole: the identical leading
+    lines (``p``) and trailing lines set aside, and the changed middle matched as usual when ITS
+    line pairs fit ``DELTA_LINE_PRODUCT_CAP``; ``blocks`` is None when the middle is over the line
+    cap or its token pairs over the token cap. One match, read by both the hunk and the guard scan
+    (their block lines lie ``p`` past the start of the whole body)."""
     p, _s, ma, mb = _trim(la, lb)
-    withheld = {
-        "withheld": "too_large",
-        "lines": {"a": len(ma), "b": len(mb)},
-        "read_with": _READ_WITH,
-    }
     if len(ma) * len(mb) > DELTA_LINE_PRODUCT_CAP:
-        return withheld
-    blocks = _delta_blocks(ma, mb)
+        return p, ma, mb, None
+    return p, ma, mb, _delta_blocks(ma, mb)
+
+
+def _trimmed_hunk(
+    la: list[str],
+    lb: list[str],
+    sides: _Sides,
+    middle: tuple[int, list[str], list[str], list[_Block] | None],
+) -> dict[str, Any] | None:
+    """The hunk of a delta too large to compute whole, from its changed middle
+    (:func:`_middle_blocks`): the middle's blocks shown as usual (lines and line numbers mapped back
+    past the set-aside head) when it was matched, else ``{withheld: too_large, lines {a, b},
+    read_with}`` with the middle's line counts. The delta itself stays ``not_computed``: this is
+    only the hunk."""
+    p, ma, mb, blocks = middle
     if blocks is None:
-        return withheld
+        return {
+            "withheld": "too_large",
+            "lines": {"a": len(ma), "b": len(mb)},
+            "read_with": _READ_WITH,
+        }
     hunk = _inline_hunk(blocks, p, len(la), len(lb), sides)
     if hunk is None:
         # The middle computed but shows nothing — only layout or address differences, normalised
@@ -960,6 +1008,296 @@ def _trimmed_hunk(la: list[str], lb: list[str], sides: _Sides) -> dict[str, Any]
         # zero-count hunk (the same field shape as a real one) so that state cannot arise here.
         return {"structural_lines": 0, "groups": 0, "structural": [], "substitution_groups": []}
     return hunk
+
+
+# ── the guard scan: comparisons the B side's structural change introduces ─────────────────────
+
+# How many of a pair's introduced variable-against-constant comparisons are kept (in B order); the
+# counts are always over all of them.
+GUARD_STORE_LIMIT = 200
+_GUARDS_TOO_LARGE: dict[str, Any] = {"state": "not_extracted", "reason": "too_large"}
+_ORDERING = frozenset({"<", "<=", ">", ">="})
+_EQUALITY = frozenset({"==", "!="})
+_RELATIONS = _ORDERING | _EQUALITY
+# The relation read from the other side, for a constant written on the left (``0x40 < n`` is
+# ``n > 0x40``).
+_FLIPPED = {"<": ">", ">": "<", "<=": ">=", ">=": "<=", "==": "==", "!=": "!="}
+_ASSIGNMENTS = frozenset({"=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="})
+_LEFT_STOPS = frozenset({",", ";", "&&", "||", "?", ":", "{", "}"}) | _ASSIGNMENTS
+_RIGHT_STOPS = frozenset({",", ";", "&&", "||", "?", ":", "{"})
+_BITWISE = frozenset({"&", "|", "^"})
+_STOP_KEYWORDS = frozenset(_CALL_KEYWORDS - {"sizeof"})
+_OTHER_KINDS = ("var_var", "call", "field", "other")
+_Tok = tuple[str, str, int]
+
+
+class _Cmp(NamedTuple):
+    """One relational comparison on a line: its key, what kind it is, and — for a variable against
+    a constant (``kind == "guard"``) — the token index of the variable and the token ranges
+    ``[start, end)`` of the variable's cast and of the constant (its own cast left out)."""
+
+    key: tuple[tuple[str, ...], str, tuple[str, ...]]
+    kind: str
+    relation: str
+    var: int = -1
+    cast: tuple[int, int] | None = None
+    const: tuple[int, int] = (0, 0)
+
+
+def _is_binary_op(toks: list[_Tok], j: int) -> bool:
+    """Whether the ``&`` / ``|`` / ``^`` at ``j`` is a binary operator: the token before it ends an
+    operand (a name that is not a keyword, a number, ``)`` or ``]``). Else it is a unary ``&``."""
+    if j == 0:
+        return False
+    kind, text, _start = toks[j - 1]
+    return (
+        (kind == "ident" and text not in _CALL_KEYWORDS)
+        or kind == "number"
+        or (kind == "punct" and text in (")", "]"))
+    )
+
+
+def _left_start(toks: list[_Tok], k: int, rel_stops: frozenset[str]) -> int:
+    """The first token of the left operand of the comparison at ``k``: scanning left, bracket depth
+    counted, it stops at depth 0 on the line's start, an unmatched ``(`` / ``[``, a separator
+    (``,`` ``;`` ``&&`` ``||`` ``?`` ``:`` ``{`` ``}``), an assignment, a binary ``&`` ``|`` ``^``,
+    a statement keyword (``return``, ``case``, …; not ``sizeof``) or one of ``rel_stops``."""
+    j, depth = k - 1, 0
+    while j >= 0:
+        kind, text, _start = toks[j]
+        if kind == "punct" and text in (")", "]"):
+            depth += 1
+        elif kind == "punct" and text in ("(", "["):
+            if depth == 0:
+                break
+            depth -= 1
+        elif depth == 0 and (
+            (kind == "punct" and (text in _LEFT_STOPS or text in rel_stops))
+            or (kind == "punct" and text in _BITWISE and _is_binary_op(toks, j))
+            or (kind == "ident" and text in _STOP_KEYWORDS)
+        ):
+            break
+        j -= 1
+    return j + 1
+
+
+def _right_end(toks: list[_Tok], k: int, rel_stops: frozenset[str]) -> int:
+    """One past the last token of the right operand of the comparison at ``k``: scanning right,
+    bracket depth counted, it stops at depth 0 on the line's end, an unmatched ``)`` / ``]``, a
+    separator (``,`` ``;`` ``&&`` ``||`` ``?`` ``:`` ``{``), a binary ``&`` ``|`` ``^`` or one of
+    ``rel_stops``."""
+    j, depth, n = k + 1, 0, len(toks)
+    while j < n:
+        kind, text, _start = toks[j]
+        if kind == "punct" and text in ("(", "["):
+            depth += 1
+        elif kind == "punct" and text in (")", "]"):
+            if depth == 0:
+                break
+            depth -= 1
+        elif (
+            depth == 0
+            and kind == "punct"
+            and (
+                text in _RIGHT_STOPS
+                or text in rel_stops
+                or (text in _BITWISE and _is_binary_op(toks, j))
+            )
+        ):
+            break
+        j += 1
+    return j
+
+
+def _cast_len(op: list[_Tok]) -> int:
+    """How many tokens a leading cast takes in an operand: ``(`` then only names and ``*`` (at
+    least one name) then ``)``, followed by more of the operand; 0 when it starts with none."""
+    if len(op) < 3 or op[0][:2] != ("punct", "("):
+        return 0
+    m, names = 1, 0
+    while m < len(op) and (op[m][0] == "ident" or op[m][:2] == ("punct", "*")):
+        names += op[m][0] == "ident"
+        m += 1
+    if names and m < len(op) - 1 and op[m][:2] == ("punct", ")"):
+        return m + 1
+    return 0
+
+
+def _form(op: list[_Tok]) -> tuple[str, int]:
+    """(``var`` / ``const`` / ``compound``, the leading cast's token count) of one operand: after at
+    most one leading cast, one name that is not a keyword is a variable; one number, or ``-`` and a
+    number, is a constant; anything else is compound."""
+    cast = _cast_len(op)
+    rest = op[cast:]
+    if len(rest) == 1 and rest[0][0] == "ident" and rest[0][1] not in _CALL_KEYWORDS:
+        return "var", cast
+    if len(rest) == 1 and rest[0][0] == "number":
+        return "const", cast
+    if len(rest) == 2 and rest[0][:2] == ("punct", "-") and rest[1][0] == "number":
+        return "const", cast
+    return "compound", cast
+
+
+def _calls_in(op: list[_Tok]) -> bool:
+    return any(
+        x[0] == "ident" and x[1] not in _CALL_KEYWORDS and y[:2] == ("punct", "(")
+        for x, y in zip(op, op[1:], strict=False)
+    )
+
+
+def _comparisons(toks: list[_Tok]) -> list[_Cmp]:
+    """Every relational comparison (``<`` ``<=`` ``>`` ``>=`` ``==`` ``!=``) of one line, in order,
+    each operand read to its boundaries (:func:`_left_start` / :func:`_right_end`) — ONE line, no
+    syntax tree: a comparison split over two lines is cut at the line's start or end. Between
+    comparison operators C's precedence holds: scanning from ``==`` / ``!=``, an ordering operator
+    belongs to the operand (``(int)x < 0 == b``: the left operand of ``==`` is ``(int)x < 0``,
+    compound), while from an ordering operator every comparison operator is a boundary.
+
+    A variable against a constant is a ``guard``, its sides normalised as pure syntax: the variable
+    is put on the left, the relation flipped with it (``0x40 < n`` reads ``n > 0x40``). Its key
+    keeps the variable's cast (``(int)n < 0x20`` is another comparison than ``n < 0x20``) and drops
+    the constant's (``p == (byte *)0x0`` and ``p == (char *)0x0`` are one comparison: only the type
+    the decompiler gave a null constant differs). Any other comparison is keyed by its two operands
+    as written and kinded ``var_var`` (two variables), ``call`` (an operand calls something),
+    ``field`` (an operand reads a member) or ``other``."""
+    out: list[_Cmp] = []
+    for k, (kind, rel, _start) in enumerate(toks):
+        if kind != "punct" or rel not in _RELATIONS:
+            continue
+        stops = _EQUALITY if rel in _EQUALITY else _RELATIONS
+        lo, hi = _left_start(toks, k, stops), _right_end(toks, k, stops)
+        left, right = toks[lo:k], toks[k + 1 : hi]
+        (lf, lc), (rf, rc) = _form(left), _form(right)
+        lt, rt = tuple(t[1] for t in left), tuple(t[1] for t in right)
+        if lf == "var" and rf == "const":
+            cmp = _Cmp(
+                key=(lt, rel, rt[rc:]),
+                kind="guard",
+                relation=rel,
+                var=lo + lc,
+                cast=(lo, lo + lc) if lc else None,
+                const=(k + 1 + rc, hi),
+            )
+            out.append(cmp)
+        elif lf == "const" and rf == "var":
+            flipped = _FLIPPED[rel]
+            cmp = _Cmp(
+                key=(rt, flipped, lt[lc:]),
+                kind="guard",
+                relation=flipped,
+                var=k + 1 + rc,
+                cast=(k + 1, k + 1 + rc) if rc else None,
+                const=(lo + lc, k),
+            )
+            out.append(cmp)
+        else:
+            if lf == "var" and rf == "var":
+                other = "var_var"
+            elif _calls_in(left) or _calls_in(right):
+                other = "call"
+            elif any(t[:2] in (("punct", "->"), ("punct", ".")) for t in (*left, *right)):
+                other = "field"
+            else:
+                other = "other"
+            out.append(_Cmp((lt, rel, rt), other, rel))
+    return out
+
+
+def _is_zero(const: str) -> bool:
+    """Whether a constant's value is 0 (``0``, ``0x0``, ``0U``, ``-0``); a value that cannot be read
+    is not."""
+    return _parse_int_token(const.lstrip("-").strip()) == 0
+
+
+def _guard_scan(
+    blocks: list[_Block], off: int, la: list[str], lb: list[str], sides: _Sides
+) -> dict[str, Any]:
+    """The comparisons the B side's structural change introduces — a syntax fact, never a reading of
+    what they check or whether they hold. ``blocks`` were matched on ``la[off:]`` / ``lb[off:]``.
+
+    Only the blocks holding a structural span are read; whatever lies in a substitution-only block
+    (a threshold that merely changed, ``len > 0x100`` -> ``len > 0x40``) is the hunk's, not this.
+    Inside each such block, the B lines' comparisons less the A lines' (as a multiset, by key, the
+    keys read on the normalised lines so a moved address is no change); then, per key, at most as
+    many are kept as the B body holds MORE of that key than the A body (the first in B order), so
+    a comparison that only moved or was reordered is not introduced. What is left are the
+    introduced comparisons: the variable-against-constant ones (``guards``) are given — the
+    variable, constant and cast as the B side's original line writes them (the normalised tokens
+    when that line does not tokenise the same way), the relation, ``const_class`` (``zero`` when the
+    constant is 0, ``nonzero`` otherwise or when its value cannot be read) and ``line_b`` (its
+    1-based line in the original B text) — in B order, at most ``GUARD_STORE_LIMIT``; the rest only
+    counted by kind (``other_comparisons``). No block position is kept."""
+    memo: dict[str, list[_Cmp]] = {}
+
+    def cmps(line: str) -> list[_Cmp]:
+        found = memo.get(line)
+        if found is None:
+            plain = "<" in line or ">" in line or "==" in line or "!=" in line
+            found = memo[line] = _comparisons(_tokens_at(line)) if plain else []
+        return found
+
+    introduced: list[tuple[_Cmp, int]] = []  # (comparison, index into lb), in B order
+    for blk in blocks:
+        if not blk.spans:
+            continue
+        seen = Counter(c.key for i in range(off + blk.i1, off + blk.i2) for c in cmps(la[i]))
+        for j in range(off + blk.j1, off + blk.j2):
+            for c in cmps(lb[j]):
+                if seen[c.key] > 0:
+                    seen[c.key] -= 1
+                else:
+                    introduced.append((c, j))
+    if introduced:
+        wanted = {c.key for c, _j in introduced}
+        excess = Counter(c.key for line in lb for c in cmps(line) if c.key in wanted)
+        excess.subtract(c.key for line in la for c in cmps(line) if c.key in wanted)
+        kept: list[tuple[_Cmp, int]] = []
+        for c, j in introduced:
+            if excess[c.key] > 0:
+                excess[c.key] -= 1
+                kept.append((c, j))
+        introduced = kept
+    others = dict.fromkeys(_OTHER_KINDS, 0)
+    by_class = {"zero": 0, "nonzero": 0}
+    guards: list[dict[str, Any]] = []
+    total = 0
+    for c, j in introduced:
+        if c.kind != "guard":
+            others[c.kind] += 1
+            continue
+        total += 1
+        line, toks = lb[j], _tokens_at(lb[j])
+        raw = sides.rb[j]
+        raw_toks = _tokens_at(raw)
+        if len(raw_toks) == len(toks) and all(
+            x[0] == y[0] for x, y in zip(raw_toks, toks, strict=True)
+        ):
+            line, toks = raw, raw_toks
+
+        def span(lo: int, hi: int, line: str = line, toks: list[_Tok] = toks) -> str:
+            return line[toks[lo][2] : toks[hi - 1][2] + len(toks[hi - 1][1])]
+
+        const = span(*c.const)
+        const_class = "zero" if _is_zero(const) else "nonzero"
+        by_class[const_class] += 1
+        if len(guards) < GUARD_STORE_LIMIT:
+            guards.append(
+                {
+                    "var": toks[c.var][1],
+                    "const": const,
+                    "relation": c.relation,
+                    "cast": span(*c.cast) if c.cast is not None else None,
+                    "const_class": const_class,
+                    "line_b": sides.nb[j],
+                }
+            )
+    return {
+        "state": "done",
+        "var_const_total": total,
+        "by_const_class": by_class,
+        "other_comparisons": others,
+        "guards": guards,
+    }
 
 
 # ── line-number form: a __FILE__/__LINE__ shift, told apart from a real substitution ─────────
