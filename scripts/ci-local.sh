@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Run this before every push: the checks of CI's lint, type-check, recall-integrity,
-# vendor-neutrality, unit and integration jobs, in one chain. `set -e` stops at the first failure.
+# vendor-neutrality, rescan-stamp, unit and integration jobs, in one chain. `set -e` stops at the
+# first failure.
 #
 # Not run here (CI runs them): the Package job (builds the wheel and installs it into a fresh venv)
 # and the Lowest-dependencies job (installs every direct dependency at its declared lower bound).
@@ -32,6 +33,9 @@ if base="$(git merge-base HEAD origin/main 2>/dev/null)" && [ "$base" != "$(git 
 else
     echo "    (nothing ahead of origin/main to check)"
 fi
+
+echo "==> rescan stamp backstop (code stamps equal to HEAD~1 => the same fixture output)"
+python scripts/rescan_same_stamp_check.py --base HEAD~1
 
 echo "==> pytest unit"
 python -m pytest tests/unit/ -q

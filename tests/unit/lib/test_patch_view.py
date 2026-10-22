@@ -1864,25 +1864,28 @@ def _labels(v: dict[str, Any]) -> set[str]:
             out |= set(r.get("labels", {})) | {str(r.get("labels", {}).get("mechanism"))}
             out |= set(r.get("facts", ())) | {str(r.get("labels", {}).get("side"))}
         out |= _s7_labels(e)
+    read_with = v.get("guards_read_with") or {}
+    if read_with:
+        out |= {"guards_read_with", *read_with, str(read_with.get("function"))}
     return out
 
 
 def _s7_labels(e: dict[str, Any]) -> set[str]:
-    """The keys and enumerated values of the guard scan, the guard links and the sink axes."""
+    """The keys and enumerated values of the guard scan, the guard links and the sink axes (of a
+    listed entry, or of a not-listed pair, which has no rows)."""
     out: set[str] = set()
     for block in (e, e.get("proposed_pair_reading") or {}):
-        out |= {k for k in ("guard_scan", "guards", "guards_body_ref") if k in block}
+        out |= {k for k in ("guard_scan", "guards") if k in block}
         scan = block.get("guard_scan")
         if scan:
             out |= set(scan) | {str(scan.get(k)) for k in ("state", "reason", "shown_rule")}
             out |= set(scan.get("by_const_class") or {}) | set(scan.get("other_comparisons") or {})
         for g in block.get("guards") or ():
-            out |= set(g) | {str(g["const_class"])}
-        out |= set(block.get("guards_body_ref") or {})
+            out |= set(g) | {str(g["const_class"])} | set(g.get("renumbered_in_a") or {})
     for key in ("sink_axes_with", "sink_axes_withheld_rows"):
         if key in e:
             out |= {key, str(e[key])}
-    for r in e["rows"]:
+    for r in e.get("rows") or ():
         out |= {k for k in ("guard_links", "sink_axes") if k in r}
         links = r.get("guard_links") or {}
         out |= set(links) | {str(links.get("pairing"))}
@@ -1901,36 +1904,61 @@ def _s7_labels(e: dict[str, Any]) -> set[str]:
     return out
 
 
-def test_no_label_says_what_a_change_means(world: World, tmp_path: Path) -> None:
+def test_no_label_says_what_a_change_means(
+    world: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Every label the view emits — the S7 guard scan, guard links and sink axes among them (a
-    list page and a one-entry read of a world that carries them) — is free of words that say what
-    a change means.
+    list page, a scan, the not-listed page and a one-entry read of every entry of a world that
+    carries their rarer values too, and a read with no block match made) — is free of words that
+    say what a change means.
 
     MUTATION (verified RED): name a subclass ``sink_removed`` -> RED; MUTATION (verified RED, 1
-    failed): name the guard scan's shown_rule ``new_then_b_order`` -> RED."""
+    failed): name the guard scan's shown_rule ``new_then_b_order`` -> RED; MUTATION (verified RED,
+    1 failed): name the link reason ``other_function`` ``removed_to_other_function`` -> RED."""
     labels = _labels(_view(world))
     assert len(labels) > 40
     (tmp_path / "s7").mkdir()
-    g = _guard_world(tmp_path / "s7")
-    s7 = _labels(_view(g))
-    for entry_id in (ALIGNED, PROPOSED, CROSS):
+    g = _vocabulary_world(tmp_path / "s7")
+    listed = _view(g)
+    s7 = _labels(listed) | _labels(_view(g, rows_limit=0))
+    for entry_id in listed["by_id"]:
         s7 |= _labels(pv.get_diff_patch_view(g.atlas, DIFF, entry_id=entry_id))
+    page = pv.get_diff_patch_view(g.atlas, DIFF, not_listed_page="aligned_pseudocode_differs")
+    for row in page["entries"]:
+        s7 |= _s7_labels(row)
+    # No block match made at all: every scan with a changed block on both sides is not_extracted.
+    monkeypatch.setattr(sameness, "DELTA_TOKEN_PRODUCT_CAP", 0)
+    pv._clear_view_caches()
+    s7 |= _labels(_view(g))
     # the S7 vocabulary is really in the set read (not an empty pass)
     assert {
         "guard_scan",
+        "guards_read_with",
         "linked_first_then_b_order",
+        "b_order",
         "linked_not_shown",
+        "renumbered_in_a",
+        "a_name",
         "const_class",
         "zero",
         "nonzero",
         "pairing",
         "proposed",
+        "not_extracted",
+        "too_large",
         "not_recorded_for_class",
+        "other_function",
+        "ambiguous_ref",
+        "no_evidence",
+        "class_unknown",
+        "not_in_record",
         "sink_axes_with",
         "entry_id",
         "callsite",
+        "sink_name",
+        "unscoped",
         "unavailable",
-    } <= s7, s7
+    } <= s7, sorted(s7)
     for label in labels | s7:
         words = set(re.split(r"[^a-z0-9]+", label.lower()))
         assert not words & _WORDS, label
@@ -5252,6 +5280,60 @@ def _guard_world(tmp_path: Path) -> World:
     return w
 
 
+def _vocabulary_world(tmp_path: Path) -> World:
+    """The guard world plus pairs that make the rarer guard and axis values appear: a row whose
+    B-side candidate lies in another function (other_function) beside an A record without its
+    sanitizer field (not_in_record) and a B body whose locals were renumbered (renumbered_in_a); a
+    B ref recorded twice with two sink arguments (ambiguous_ref) beside a function-level B
+    candidate (sink_name); a B candidate of an unknown class (class_unknown) beside an A one with
+    no sink anchor (unscoped); one with no readable record (no_evidence); and more linked guards
+    than are shown (linked_not_shown). Every new pair is listed (similarity below 1)."""
+    w = _guard_world(tmp_path)
+    rec = json.loads(_GUARD_CMD)
+    no_sanitizer = {k: v for k, v in rec.items() if k != "sanitizer_seen"}
+    base_a = "pcVar2 = get();\nlog(pcVar2);\nsystem(pcVar2);"
+    base_b = "pcVar2 = get();\nif (pcVar2 == 0) {\nreturn;\n}\nnote(pcVar2, 1);\nsystem(pcVar2);"
+
+    def pair(a: str, b: str, body_a: str = base_a, body_b: str = base_b) -> None:
+        w.pair(a, b, 0.97, 0.8)
+        w.im(a[:-2] + "10", b[:-2] + "10", a)
+        w.fn("a", a, ["system"], pseudocode=body_a)
+        w.fn("b", b, ["system"], pseudocode=body_b)
+
+    renum_a = "uVar9 = get();\nuse(uVar9);\nkeep(uVar9);\nif (uVar9 == 0x74) {\none();\n}"
+    renum_b = "uVar13 = get();\nuse(uVar13);\nkeep(uVar13);\nextra(1);\n"
+    renum_b += "if (uVar13 == 0x74) {\ntwo(2);\n}"
+    pair("00009000", "0000a000", renum_a, renum_b)
+    w.inst("a", _ref("runA", "00009000", "cmd", "0x10"), "cmd", "system", json.dumps(no_sanitizer))
+    w.inst("b", _ref("runB", "0000c000", "cmd", "0x10"), "cmd", "system", _GUARD_CMD)
+    w.atlas.execute(
+        "UPDATE instruction_match SET addr_b = '0000c010' WHERE func_addr_a = '00009000'"
+    )
+    w.fn("b", "0000c000", ["system"], pseudocode="system(pcVar2);")
+    pair("0000d000", "0000e000")
+    w.inst("a", _ref("runA", "0000d000", "cmd", "0x10"), "cmd", "system", _GUARD_CMD)
+    for arg in ("pcVar2", "pcVar3"):
+        twice = {**rec, "flow_path": {"sink_arg": arg, "one_hop": []}}
+        w.inst("b", _ref("runB", "0000e000", "cmd", "0x10"), "cmd", "system", json.dumps(twice))
+    w.inst("b", _ref("runB", "0000e000", "cmd"), "cmd", "system", _GUARD_CMD)
+    pair("0000f000", "00010000")
+    unanchored = _ref("runA", "0000f000", "cmd", "0x10")
+    w.inst("a", unanchored, "cmd", "system", _GUARD_CMD)
+    w.atlas.execute("UPDATE instance SET sink_anchor = NULL WHERE evidence_ref = ?", (unanchored,))
+    w.inst("b", _ref("runB", "00010000", "unknown", "0x10"), "unknown", "system", _GUARD_CMD)
+    pair("00011000", "00012000")
+    w.inst("a", _ref("runA", "00011000", "cmd", "0x10"), "cmd", "system", _GUARD_CMD)
+    w.inst("b", _ref("runB", "00012000", "cmd", "0x10"), "cmd", "system", None)
+    names = [f"local_{i:x}0" for i in range(22)]
+    many = "pcVar2 = get();\n" + "".join(f"if ({n} == 0) {{\nstep();\n}}\n" for n in names)
+    pair("00013000", "00014000", base_a, many + "system(pcVar2);")
+    w.inst("a", _ref("runA", "00013000", "cmd", "0x10"), "cmd", "system", _GUARD_CMD)
+    hops = {**rec, "flow_path": {"sink_arg": "pcVar2", "one_hop": names}}
+    w.inst("b", _ref("runB", "00014000", "cmd", "0x10"), "cmd", "system", json.dumps(hops))
+    w.commit()
+    return w
+
+
 def _b_row(entry: dict[str, Any]) -> dict[str, Any]:
     (row,) = [r for r in entry["rows"] if r["b_ref"]]
     return row
@@ -5260,15 +5342,19 @@ def _b_row(entry: dict[str, Any]) -> dict[str, Any]:
 def test_a_listed_pair_carries_its_guards_and_its_row_the_links(
     tmp_path: Path, current: None
 ) -> None:
-    """★ Beside the pseudocode_delta: guard_scan (done, coverage unjudged, the counts), the shown
-    guards in B order and the B body to read them in; the persisted row links them by name to its
-    B-side candidate's sink argument. The list entry says where the axes are read (entry_id); the
-    rows carry none.
+    """★ Beside the pseudocode_delta: guard_scan (done, coverage unjudged, the counts that are not
+    0), the shown guards in B order (no ``cast`` key where the variable has none); the envelope
+    says once where their B body is read; the persisted row links them by name to its B-side
+    candidate's sink argument. The list entry says where the axes are read (entry_id); the rows
+    carry none.
 
     MUTATION (verified RED, 1 failed): give the axes on a list page too -> RED; MUTATION (verified
-    RED, 2 failed — this test and the scan one): drop sink_axes_with -> RED."""
+    RED, 2 failed — this test and the scan one): drop sink_axes_with -> RED; MUTATION (verified
+    RED, 2 failed — this test and the not-listed one): give guards_body_ref on each entry again
+    -> RED."""
     w = _guard_world(tmp_path)
-    e = _view(w)["by_id"][ALIGNED]
+    view = _view(w)
+    e = view["by_id"][ALIGNED]
     keys = list(e)
     assert keys.index("pseudocode_delta") < keys.index("guard_scan")
     assert e["guard_scan"] == {
@@ -5276,22 +5362,21 @@ def test_a_listed_pair_carries_its_guards_and_its_row_the_links(
         "coverage": "unjudged",
         "var_const_total": 2,
         "by_const_class": {"zero": 1, "nonzero": 1},
-        "stored": 2,
-        "shown": 2,
         "shown_rule": "linked_first_then_b_order",
-        "linked_not_shown": 0,
-        "other_comparisons": {"var_var": 0, "call": 0, "field": 0, "other": 0},
     }
     assert [(g["var"], g["const"], g["line_b"]) for g in e["guards"]] == [
         ("pcVar2", "0x0", 2),
         ("iVar9", "5", 5),
     ]
-    assert e["guards_body_ref"] == {
+    assert all("cast" not in g for g in e["guards"])
+    assert "guards_body_ref" not in e
+    assert view.get("guards_read_with") == {
         "read_with": "get_pseudocode",
         "run_id": "runB",
         "binary": SHA_B,
-        "function": "00002000",
+        "function": "entry.addr_b",
     }
+    assert e["addr_b"] == "00002000"
     row = _b_row(e)
     assert row["guard_links"] == {
         "sink_arg": {"yes": [0], "no": [1], "unknown": []},
@@ -5357,7 +5442,31 @@ def test_with_no_row_to_link_the_guards_are_shown_in_b_order(tmp_path: Path, cur
     (row,) = page["entries"]
     assert row["guard_scan"]["shown_rule"] == "b_order"
     assert [(g["var"], g["relation"], g["const"]) for g in row["guards"]] == [("n", "<", "0x10")]
-    assert row["guards_body_ref"]["function"] == "00008000"
+    assert "guards_body_ref" not in row
+    assert (page.get("guards_read_with") or {}).get("function") == "entry.addr_b"
+    assert row["addr_b"] == "00008000"
+
+
+def test_a_rehunt_is_not_served_the_earlier_axes(tmp_path: Path, current: None) -> None:
+    """The axis cache is keyed by the run row's stamps: after the B candidate's record changes and
+    the run row says the run was written again, one entry's read gives the new record.
+
+    MUTATION (verified RED, 1 failed): key the axis cache without the run stamps -> the earlier
+    sink argument is served -> RED."""
+    w = _guard_world(tmp_path)
+    (e,) = pv.get_diff_patch_view(w.atlas, DIFF, entry_id=ALIGNED)["entries"]
+    row = _b_row(e)
+    assert row["sink_axes"]["b"]["flow_path"]["sink_arg"] == "pcVar2"
+    rec = json.loads(_GUARD_CMD)
+    rec["flow_path"]["sink_arg"] = "pcVar7"
+    w.atlas.execute(
+        "UPDATE instance SET flow_evidence = ? WHERE evidence_ref = ?",
+        (json.dumps(rec), row["b_ref"]),
+    )
+    w.atlas.execute("UPDATE run SET updated_at = '2099-01-01T00:00:00Z' WHERE run_id = 'runB'")
+    w.commit()
+    (e,) = pv.get_diff_patch_view(w.atlas, DIFF, entry_id=ALIGNED)["entries"]
+    assert _b_row(e)["sink_axes"]["b"]["flow_path"]["sink_arg"] == "pcVar7"
 
 
 def test_a_pair_missing_from_the_guard_cache_alone_is_recomputed(

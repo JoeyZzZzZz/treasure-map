@@ -90,6 +90,21 @@ def test_nothing_is_published_unless_the_whole_ci_passes() -> None:
         assert name in ci["jobs"], name
 
 
+def test_ci_runs_the_rescan_stamp_backstop_on_a_checkout_holding_its_base() -> None:
+    """CI compares the rescan fixture's output against HEAD~1 whenever the code stamps are equal;
+    that needs the script to run and the checkout to hold HEAD~1 (the default clone is one commit
+    deep, where the check could only error).
+
+    MUTATION (verified RED, 1 failed): drop ``fetch-depth: 2`` from the rescan-stamps checkout ->
+    RED."""
+    ci = yaml.safe_load((_WORKFLOWS / "ci.yml").read_text())
+    steps = ci["jobs"]["rescan-stamps"]["steps"]
+    checkout = next(s for s in steps if s.get("uses", "").startswith("actions/checkout@"))
+    depth = int((checkout.get("with") or {}).get("fetch-depth", 1))
+    assert depth == 0 or depth >= 2, f"fetch-depth {depth} holds no HEAD~1"
+    assert any("scripts/rescan_same_stamp_check.py" in s.get("run", "") for s in steps)
+
+
 def test_every_third_party_action_is_pinned_to_a_commit() -> None:
     """A tag can be moved to other code; a 40-character commit cannot. The release job holds
     id-token: write, so what runs there must be exactly what was reviewed.

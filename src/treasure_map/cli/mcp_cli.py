@@ -240,17 +240,33 @@ def _resolve_mcp_target(
 
     The server binds the ATLAS, not one firmware — a fact tool routes run_id -> analysis.db through
     the atlas ``run`` table (there is no single bound analysis.db, and no ambient 'current run').
-    Explicit ``--atlas`` wins; else the last-run pointer's atlas; else the configured atlas.db.
+    Explicit ``--atlas`` wins, and must name an existing file (a missing one is refused: opening it
+    would create an empty atlas that answers "no runs"); else the last-run pointer's atlas while it
+    exists (when it is gone, the configured atlas is used and stderr says so, naming both); else the
+    configured atlas.db — which a fresh install may not have yet, and then an empty one is honest.
     ``workspaces_root`` (an OPTIONAL fallback resolver, ``<root>/<run_id>/analysis.db``) is
     ``--workspaces-root``, else the configured workspace directory."""
     from treasure_map.lib.config.config import load_config
     from treasure_map.lib.last_run import read_last_run
 
     cfg = load_config(None)
-    atlas = atlas_db
-    if atlas is None:
+    if atlas_db is not None:
+        if not Path(atlas_db).is_file():
+            raise click.ClickException(
+                f"no atlas at {atlas_db} (--atlas): it names no file, and none was created"
+            )
+        atlas = atlas_db
+    else:
+        atlas = str(cfg.atlas.db_path)
         ptr = read_last_run()
-        atlas = str(ptr.atlas_db) if ptr is not None else str(cfg.atlas.db_path)
+        if ptr is not None and Path(ptr.atlas_db).is_file():
+            atlas = str(ptr.atlas_db)
+        elif ptr is not None and Path(ptr.atlas_db).resolve() != Path(atlas).resolve():
+            click.echo(
+                f"The last run's atlas {ptr.atlas_db} no longer exists; using the configured "
+                f"atlas {atlas}.",
+                err=True,
+            )
     ws = workspaces_root if workspaces_root is not None else str(cfg.workspace_dir)
     return atlas, ws
 
@@ -263,7 +279,10 @@ def _resolve_mcp_target(
     "--atlas",
     "atlas_db",
     default=None,
-    help="Atlas DB path (default: the last run's atlas, else the configured atlas.db).",
+    help=(
+        "Atlas DB path, which must exist (default: the last run's atlas while it exists, else "
+        "the configured atlas.db)."
+    ),
 )
 @click.option(
     "--workspaces-root",

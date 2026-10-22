@@ -12,6 +12,7 @@ and no blind-spot count is lost.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -642,6 +643,49 @@ def test_one_entry_too_large_sheds_its_rows_axes_from_the_last_row_back() -> Non
     (both,) = mcp_app._fit_entries(_entries_result([big], envelope), 0)["entries"]
     assert both["sink_axes_withheld_rows"] == 3
     assert both["pseudocode_delta"]["inline_hunk"]["withheld"] == "page_budget"
+    # The labels this degradation writes say nothing about what a change means either (the same
+    # words the view's label check refuses).
+    labels = {"sink_axes_withheld_rows", *both["rows"][0]["sink_axes"]}
+    labels |= {str(v) for v in both["rows"][0]["sink_axes"].values()}
+    labels |= {str(both["pseudocode_delta"]["inline_hunk"]["withheld"])}
+    assert {"withheld", "page_budget", "read_with"} <= labels
+    for label in labels:
+        assert not set(re.split(r"[^a-z0-9]+", label.lower())) & _JUDGEMENT_WORDS, label
+
+
+# The words no label may use: they say what a change means (kept as the view's label check has
+# them, tests/unit/lib/test_patch_view.py).
+_JUDGEMENT_WORDS = {
+    "removed",
+    "added",
+    "gone",
+    "new",
+    "bounded",
+    "safe",
+    "fix",
+    "patch",
+    "regression",
+}
+
+
+def test_a_page_over_the_budget_says_so_and_no_other_page_changes() -> None:
+    """A page always holds one entry (or member), so one too large alone makes a page over the
+    budget: it carries ``over_budget: true``. Every page within the budget has no such key — its
+    output is what it was.
+
+    MUTATION (verified RED, 1 failed): drop the over_budget mark -> RED.
+    MUTATION (verified RED, 7 failed): mark every page -> RED."""
+    huge = {"entry_id": "one", "rows": [{"a_ref": "r", "pad": "x" * 60_000}]}
+    out = mcp_app._fit_entries(_entries_result([huge], 100), 0)
+    assert len(json.dumps(out)) > _RESPONSE_BYTE_BUDGET
+    assert out.get("over_budget") is True
+    assert out["entries_truncated"] is False and out["next_offset"] is None
+    small = mcp_app._fit_entries(_entries_result([_hunk_entry("s", 50)], 100), 0)
+    assert "over_budget" not in small
+    member = {"legend": "e", "members": [{"pad": "x" * 60_000}], "member_count": 1}
+    assert mcp_app._fit_members(member, 0).get("over_budget") is True
+    member_small = {"legend": "e", "members": [{"pad": "x"}], "member_count": 1}
+    assert "over_budget" not in mcp_app._fit_members(member_small, 0)
 
 
 def test_the_tool_says_how_to_read_the_guards_and_the_axes() -> None:
@@ -654,16 +698,25 @@ def test_the_tool_says_how_to_read_the_guards_and_the_axes() -> None:
     )
     for phrase in (
         "guard_scan",
-        "guards_body_ref",
+        "guards_read_with",
         "guard_links",
         "linked_not_shown",
+        "renumbered_in_a",
+        "A count left out of ``guard_scan`` is 0",
+        "no ``cast`` key",
+        "links as unknown, never no",
         "sink_axes",
         "sink_axes_with",
         "sink_axes_withheld_rows",
         "not_recorded_for_class",
         "is NOT read",
+        "over_budget",
     ):
         assert phrase in doc, phrase
+    assert "guards_body_ref" not in doc
     assert {"guard_scan", "guard_links", "sink_axes"} <= set(pv._LEGEND)
     assert {"guards", "guard_links", "sink_axes"} <= set(pv._CAVEATS)
     assert "get_pseudocode(run_id=" in pv._LEGEND["sink_axes"]
+    assert "renumbered_in_a" in pv._CAVEATS["guards"]
+    assert "never no" in pv._CAVEATS["guard_links"]
+    assert "guards_read_with" in pv._LEGEND["guard_scan"]

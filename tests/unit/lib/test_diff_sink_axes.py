@@ -11,11 +11,14 @@ import sqlite3
 from typing import Any
 
 from treasure_map.lib.query import diff_sink_axes as ax
+from treasure_map.lib.query import sameness as sm
 
 # A per-callsite ref in the real shape: the call is at 0x401000 + 0x10.
 REF = "runB#deadbeef:00401000@cmd@0x10"
 FN_REF = "runB#deadbeef:00401000@cmd"  # function-level: no call address
-BODY = {"read_with": "get_pseudocode", "run_id": "runB", "binary": "b" * 64, "function": "00401000"}
+# The names the fixtures' records hold as sink arguments / length variables, all of them names
+# the B body holds (a guard link reads a recorded name only as a variable of that body).
+B_NAMES = frozenset({"pcVar2", "local_118", "n", "m", "len"})
 
 
 def _rows(*records: dict[str, Any] | None, ref: str = REF, anchor: str | None = "system") -> Any:
@@ -47,29 +50,27 @@ def _copy(**over: Any) -> dict[str, Any]:
     return rec
 
 
-def _scan(*names: str) -> dict[str, Any]:
+def _scan(*names: str, b_names: frozenset[str] = B_NAMES) -> dict[str, Any]:
+    """A done guard scan of ``names`` (one ``== 0`` guard each, in this order), in the shape
+    sameness gives it: ``b_names`` (the B body's identifiers) whenever there is a guard."""
     guards = [
-        {
-            "var": n,
-            "const": "0",
-            "relation": "==",
-            "cast": None,
-            "const_class": "zero",
-            "line_b": i + 1,
-        }
+        {"var": n, "const": "0", "relation": "==", "const_class": "zero", "line_b": i + 1}
         for i, n in enumerate(names)
     ]
-    return {
+    scan: dict[str, Any] = {
         "state": "done",
         "var_const_total": len(guards),
         "by_const_class": {"zero": len(guards), "nonzero": 0},
         "other_comparisons": {"var_var": 0, "call": 0, "field": 0, "other": 0},
         "guards": guards,
     }
+    if guards:
+        scan["b_names"] = b_names | set(names)
+    return scan
 
 
 def _links(record: dict[str, Any], var: str, cls: str = "cmd") -> dict[str, Any]:
-    _fields, links = ax.entry_guards(_scan(var), [ax.LinkRow(True, _rows(record), cls)], BODY)
+    _fields, links = ax.entry_guards(_scan(var), [ax.LinkRow(True, _rows(record), cls)])
     (one,) = links
     assert one is not None
     return one
@@ -161,7 +162,7 @@ def test_a_candidate_in_another_function_links_nothing() -> None:
 
     MUTATION M16 (verified RED, 1 failed): drop the same-function check -> sink_arg reads yes ->
     RED."""
-    _f, (links,) = ax.entry_guards(_scan("pcVar2"), [ax.LinkRow(False, _rows(_cmd()), "cmd")], BODY)
+    _f, (links,) = ax.entry_guards(_scan("pcVar2"), [ax.LinkRow(False, _rows(_cmd()), "cmd")])
     assert links == {
         "sink_arg": {"unavailable": "other_function"},
         "size_arg": {"unavailable": "other_function"},
@@ -193,17 +194,17 @@ def test_a_linked_guard_is_shown_ahead_of_the_rest_and_the_list_stays_in_b_order
     MUTATION M14 (verified RED, 1 failed): cut to the first 20 before linking -> RED."""
     names = [f"v{i}" for i in range(25)]
     names[22] = "pcVar2"
-    fields, (links,) = ax.entry_guards(
-        _scan(*names), [ax.LinkRow(True, _rows(_cmd()), "cmd")], BODY
-    )
+    fields, (links,) = ax.entry_guards(_scan(*names), [ax.LinkRow(True, _rows(_cmd()), "cmd")])
     shown = [g["var"] for g in fields["guards"]]
     assert len(shown) == 20 and "pcVar2" in shown
     assert shown == sorted(shown, key=names.index)  # B order
     assert links is not None
     assert [shown[i] for i in links["sink_arg"]["yes"]] == ["pcVar2"]
     scan = fields["guard_scan"]
-    assert (scan["stored"], scan["shown"], scan["var_const_total"]) == (25, 20, 25)
-    assert (scan["shown_rule"], scan["linked_not_shown"]) == ("linked_first_then_b_order", 0)
+    assert scan["var_const_total"] == 25
+    assert scan["shown_rule"] == "linked_first_then_b_order"
+    # Derivable or zero counts are left out: stored = min(total, 200), shown = len(guards).
+    assert not {"stored", "shown", "linked_not_shown"} & set(scan)
 
 
 def test_more_linked_guards_than_fit_are_the_first_in_b_order_and_counted() -> None:
@@ -214,32 +215,137 @@ def test_more_linked_guards_than_fit_are_the_first_in_b_order_and_counted() -> N
     last ones -> RED."""
     names = [f"local_{i}" for i in range(30)]
     rec = _cmd(flow_path={"sink_arg": "pcVar2", "one_hop": names})
-    fields, (links,) = ax.entry_guards(_scan(*names), [ax.LinkRow(True, _rows(rec), "cmd")], BODY)
+    fields, (links,) = ax.entry_guards(_scan(*names), [ax.LinkRow(True, _rows(rec), "cmd")])
     assert [g["var"] for g in fields["guards"]] == names[:20]
-    assert fields["guard_scan"]["linked_not_shown"] == 10
+    assert fields["guard_scan"].get("linked_not_shown") == 10
     assert links is not None and links["sink_arg"]["yes"] == list(range(20))
 
 
 def test_with_no_row_to_link_the_first_are_shown_in_b_order() -> None:
     """G8 / L9c (selection side): no row -> b_order, the first 20 of 25 shown, nothing linked."""
     names = [f"v{i}" for i in range(25)]
-    fields, links = ax.entry_guards(_scan(*names), [], BODY)
+    fields, links = ax.entry_guards(_scan(*names), [])
     assert links == []
     assert [g["var"] for g in fields["guards"]] == names[:20]
-    assert fields["guard_scan"]["shown_rule"] == "b_order"
-    assert fields["guard_scan"]["linked_not_shown"] == 0
-    assert fields["guards_body_ref"] == BODY
+    assert fields["guard_scan"].get("shown_rule") == "b_order"
+    assert "linked_not_shown" not in fields["guard_scan"]
+    assert set(fields) == {"guard_scan", "guards"}  # the B body is read by the envelope's recipe
 
 
 def test_a_scan_not_extracted_gives_its_reason_and_no_guards_key() -> None:
     fields, links = ax.entry_guards(
         {"state": "not_extracted", "reason": "too_large"},
         [ax.LinkRow(True, _rows(_cmd()), "cmd")],
-        BODY,
     )
-    assert fields["guard_scan"] == {"state": "not_extracted", "reason": "too_large"}
-    assert "guards" not in fields
+    assert fields == {"guard_scan": {"state": "not_extracted", "reason": "too_large"}}
     assert links == [None]
+
+
+def test_a_scan_that_found_nothing_gives_only_what_cannot_be_derived() -> None:
+    """A done scan with no guard and no other comparison: ``guard_scan`` is its state, coverage and
+    total alone (no zero count, no shown_rule), ``guards`` is ``[]`` — told apart from
+    ``not_extracted``, which has no ``guards`` key — and a row with a B-side candidate gets no
+    links (there is no shown guard to link).
+
+    MUTATION (verified RED, 1 failed): give guard_links whenever a row has a B-side candidate,
+    shown guards or not -> RED.
+    MUTATION (verified RED, 1 failed): keep the zero-valued by_const_class keys -> RED."""
+    empty = _scan()
+    fields, links = ax.entry_guards(empty, [ax.LinkRow(True, _rows(_cmd()), "cmd")])
+    assert fields == {
+        "guard_scan": {"state": "done", "coverage": "unjudged", "var_const_total": 0},
+        "guards": [],
+    }
+    assert links == [None]
+    counted = {**empty, "other_comparisons": {"var_var": 2, "call": 0, "field": 0, "other": 1}}
+    fields, _links = ax.entry_guards(counted, [])
+    assert fields["guard_scan"].get("other_comparisons") == {"var_var": 2, "other": 1}
+    assert "by_const_class" not in fields["guard_scan"]
+
+
+def test_a_renumbered_count_is_given_only_when_there_is_one() -> None:
+    """``renumbered_in_a`` (sameness marks the guards; the scan counts them) is carried into
+    guard_scan when it is above 0, and the shown guard keeps its mark."""
+    scan = _scan("uVar13")
+    scan["guards"][0]["renumbered_in_a"] = {"a_name": "uVar9"}
+    scan["renumbered_in_a"] = 1
+    fields, _links = ax.entry_guards(scan, [])
+    assert fields["guard_scan"].get("renumbered_in_a") == 1
+    assert fields["guards"][0].get("renumbered_in_a") == {"a_name": "uVar9"}
+    fields, _links = ax.entry_guards(_scan("uVar13"), [])
+    assert "renumbered_in_a" not in fields["guard_scan"]
+
+
+# ── a recorded name that is no variable of the B body ────────────────────────────────────────
+
+
+def _real_scan(a: str, b: str) -> dict[str, Any]:
+    scan = sm.pseudocode_delta_and_guards(a, b, None, None, "1000", "2000")[1]
+    assert scan["guards"], "the fixture must introduce a guard"
+    return scan
+
+
+def _verdict(scan: dict[str, Any], record: dict[str, Any], cls: str, link: str) -> Any:
+    _f, (links,) = ax.entry_guards(scan, [ax.LinkRow(True, _rows(record), cls)])
+    assert links is not None
+    return links[link]
+
+
+def test_a_type_name_read_from_a_cast_is_no_variable() -> None:
+    """The hunt read ``remove(*(char **)(param_1 + 0xb8))``'s argument as ``char`` (the cast's
+    type, with no one-hop source) and its trace reached the sink: the B body's new
+    ``if (param_1 == 0)`` is unknown on sink_arg, never no — the one hop was not read. ``char`` IS
+    an identifier of the B text (inside the cast), so only the type-name table tells it apart.
+    The same for a length variable read as ``size_t``.
+
+    MUTATION (verified RED, 1 failed): drop the type-name table (keep the B-names check) ->
+    sink_arg reads no -> RED."""
+    a = "void f(int param_1) {\n  remove(*(char **)(param_1 + 0xb8));\n}"
+    b = a.replace("{\n", "{\n  if (param_1 == 0) return;\n", 1)
+    scan = _real_scan(a, b)
+    assert [g["var"] for g in scan["guards"]] == ["param_1"]
+    assert "char" in scan["b_names"]
+    rec = _cmd(flow_path={"sink_arg": "char", "one_hop": []})
+    assert _verdict(scan, rec, "path_sink", "sink_arg") == {"yes": [], "no": [], "unknown": [0]}
+    sized = "void f(int param_1) {\n  if (param_1 == 0) return;\n"
+    sized += "  memcpy(d, s, (size_t)param_1);\n}"
+    scan = _real_scan(a, sized)
+    rec = _copy(size_flow={"size_arg": "(size_t)param_1", "size_var": "size_t", "one_hop": []})
+    assert _verdict(scan, rec, "copy", "size_arg") == {"yes": [], "no": [], "unknown": [0]}
+
+
+def test_a_word_of_a_string_or_a_hex_tail_is_no_variable() -> None:
+    """A sink argument read as ``killall`` (a word of the string ``"killall worker"``) and a length
+    variable read as ``x800`` (the tail of ``0x800``) are no identifiers of the B text — a string
+    and a number token — so their links are unknown, never no.
+
+    MUTATION (verified RED, 1 failed): drop the B-names check (keep the type-name table) ->
+    both read no -> RED."""
+    a = 'void f(int param_1) {\n  system("killall worker");\n  memcpy(d, s, 0x800);\n}'
+    b = "void f(int param_1) {\n  if (param_1 == 0) return;\n" + a.split("{\n", 1)[1]
+    scan = _real_scan(a, b)
+    assert not {"killall", "worker", "x800"} & scan["b_names"]
+    word = _cmd(flow_path={"sink_arg": "killall", "one_hop": []})
+    assert _verdict(scan, word, "cmd", "sink_arg") == {"yes": [], "no": [], "unknown": [0]}
+    tail = _copy(size_flow={"size_arg": "0x800", "size_var": "x800", "one_hop": []})
+    assert _verdict(scan, tail, "copy", "size_arg") == {"yes": [], "no": [], "unknown": [0]}
+
+
+def test_a_recorded_variable_of_the_b_body_still_reads_no() -> None:
+    """The check never touches a real variable: ``pcVar2`` (and a length variable ``n``), held by
+    the B text and missed by the guard, is no as before (L2 / L6b on a real scan)."""
+    a = "void f(char *pcVar2, int n) {\n  system(pcVar2);\n  memcpy(d, s, n);\n}"
+    b = "void f(char *pcVar2, int n) {\n  if (iVar9 == 0) return;\n" + a.split("{\n", 1)[1]
+    scan = _real_scan(a, b)
+    assert _verdict(scan, _cmd(), "cmd", "sink_arg") == {"yes": [], "no": [0], "unknown": []}
+    assert _verdict(scan, _copy(), "copy", "size_arg") == {"yes": [], "no": [0], "unknown": []}
+
+
+def test_the_type_names_are_types() -> None:
+    for name in ("char", "size_t", "uint", "undefined4", "uint32_t", "int8_t", "code", "uint3"):
+        assert ax.is_type_name(name), name
+    for name in ("pcVar2", "local_10", "param_1", "uVar3", "sVar1", "n", "integer", "undefined9"):
+        assert not ax.is_type_name(name), name
 
 
 # ── the axes ─────────────────────────────────────────────────────────────────────────────────
@@ -301,15 +407,28 @@ def test_each_reason_an_axis_is_not_given() -> None:
     }
 
 
+def test_one_row_with_the_field_and_one_without_is_ambiguous() -> None:
+    """X2 (presence): two rows of one ref, one carrying the sanitizer field and one not, are
+    ambiguous on that axis in either order — not "given" from the row that has it.
+
+    MUTATION (verified RED, 1 failed): compare only rows that both carry the field -> the axis
+    is given -> RED."""
+    bare = {k: v for k, v in _cmd().items() if k != "sanitizer_seen"}
+    for rows in (_rows(_cmd(), bare), _rows(bare, _cmd())):
+        side = ax.side_axes(rows, "cmd")
+        assert side["unavailable"].get("ambiguous_ref") == ["sanitizer"]
+        assert "sanitizer" not in side
+
+
 def test_a_link_is_ambiguous_only_when_its_own_inputs_differ() -> None:
     """X2 (links): two rows whose length variables differ -> size_arg ambiguous_ref; two rows that
     differ only in their clamp shapes -> size_arg read as usual (while the bound axis itself is
     ambiguous)."""
     vary = _rows(_copy(), _copy(size_flow={"size_arg": "m", "size_var": "m", "one_hop": []}))
-    _f, (links,) = ax.entry_guards(_scan("len"), [ax.LinkRow(True, vary, "copy")], BODY)
+    _f, (links,) = ax.entry_guards(_scan("len"), [ax.LinkRow(True, vary, "copy")])
     assert links is not None and links["size_arg"] == {"unavailable": "ambiguous_ref"}
     clamps = _rows(_copy(), _copy(clamp_seen=[{"shape": "min", "coverage": "unjudged"}]))
-    _f, (links,) = ax.entry_guards(_scan("len"), [ax.LinkRow(True, clamps, "copy")], BODY)
+    _f, (links,) = ax.entry_guards(_scan("len"), [ax.LinkRow(True, clamps, "copy")])
     assert links is not None and links["size_arg"] == {"yes": [0], "no": [], "unknown": []}
     assert ax.side_axes(clamps, "copy")["unavailable"].get("ambiguous_ref") == ["bound"]
 

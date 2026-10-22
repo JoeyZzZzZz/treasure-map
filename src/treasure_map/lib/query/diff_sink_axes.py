@@ -24,10 +24,17 @@ variable (lib/query/sameness's guard scan) is, BY NAME, the candidate's sink arg
 of their one-hop sources. ``yes`` = the name is one of them; ``no`` = the one-hop reading was
 complete and the name is not; ``unknown`` = anything else. A name match only: where the comparison
 sits, whether it lies on the way to the sink, dominates it or suffices is not read.
+
+A recorded sink argument or length variable counts as a variable only when the B body's text holds
+it as an identifier and it is not a type name (:data:`TYPE_NAMES`): a record can hold a fragment
+of the argument instead — the type of a cast (``*(char **)(p + 8)`` read as ``char``), the digits
+of a hex constant, a word of a string. Such a link reads as if no variable were recorded: never
+``no``.
 """
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -63,6 +70,46 @@ VALUE_LIMIT = 200
 GUARD_INLINE_LIMIT = 20
 # The link each guard is read against, and the axis whose field it reads.
 LINKS = (("sink_arg", "flow_path"), ("size_arg", "bound"))
+# Names that are types, never a variable: C's type keywords, the common typedefs and the
+# decompiler's own built-in types (a cast in its output writes them).
+TYPE_NAMES = frozenset(
+    {
+        "char",
+        "short",
+        "int",
+        "long",
+        "float",
+        "double",
+        "void",
+        "signed",
+        "unsigned",
+        "bool",
+        "_Bool",
+        "size_t",
+        "ssize_t",
+        "wchar_t",
+        "byte",
+        "sbyte",
+        "uchar",
+        "ushort",
+        "uint",
+        "ulong",
+        "longlong",
+        "ulonglong",
+        "word",
+        "dword",
+        "qword",
+        "code",
+        "undefined",
+        "float10",
+        "longdouble",
+        "wchar16",
+        "wchar32",
+    }
+)
+# ... and these forms: ``int8_t`` .. ``uint64_t``, the decompiler's odd-width ``int3`` /
+# ``uint5`` .., ``undefined1`` .. ``undefined8``.
+_TYPE_NAME_FORMS = re.compile(r"u?int(?:8|16|32|64)_t|u?int[35-7]|undefined[1-8]")
 _SOURCE_RESOLVED_UNTRACED = ("free_string", "charset_safe")
 _REACHED = "reached_sink"
 _REF_CHUNK = 500
@@ -316,8 +363,26 @@ class LinkRow:
     cls: str | None
 
 
-def _row_verdicts(row: LinkRow, guards: list[dict[str, Any]]) -> dict[str, Any]:
-    """link -> ``{"unavailable": reason}``, or the verdict of each guard (in the scan's order)."""
+def is_type_name(name: str) -> bool:
+    """Whether ``name`` is a type (:data:`TYPE_NAMES` and its forms), never a variable."""
+    return name in TYPE_NAMES or _TYPE_NAME_FORMS.fullmatch(name) is not None
+
+
+def _as_variable(inputs: tuple[Any, ...], b_names: frozenset[str]) -> tuple[Any, ...]:
+    """A link's inputs with its recorded variable (the first) set to None unless it is a variable of
+    the B body: a name its text holds as an identifier, and not a type name."""
+    name = inputs[0]
+    if isinstance(name, str) and name in b_names and not is_type_name(name):
+        return inputs
+    return (None, *inputs[1:])
+
+
+def _row_verdicts(
+    row: LinkRow, guards: list[dict[str, Any]], b_names: frozenset[str]
+) -> dict[str, Any]:
+    """link -> ``{"unavailable": reason}``, or the verdict of each guard (in the scan's order). The
+    rows agree or not on what they RECORDED; the verdict then reads the recorded variable only as a
+    variable of the B body (:func:`_as_variable`)."""
     if not row.same_function:
         return {link: {"unavailable": "other_function"} for link, _axis in LINKS}
     out: dict[str, Any] = {}
@@ -327,12 +392,17 @@ def _row_verdicts(row: LinkRow, guards: list[dict[str, Any]]) -> dict[str, Any]:
         if not ok:
             out[link] = {"unavailable": inputs}
         else:
+            inputs = _as_variable(inputs, b_names)
             out[link] = {"verdicts": [_VERDICT[link](inputs, g["var"]) for g in guards]}
     return out
 
 
+def _nonzero(counts: Any) -> dict[str, Any]:
+    return {k: v for k, v in counts.items() if v} if isinstance(counts, dict) else {}
+
+
 def entry_guards(
-    scan: Mapping[str, Any], rows: list[LinkRow | None], body_ref: dict[str, Any]
+    scan: Mapping[str, Any], rows: list[LinkRow | None]
 ) -> tuple[dict[str, Any], list[dict[str, Any] | None]]:
     """(the entry's guard fields, each rendered row's ``guard_links`` or None), for one pair's guard
     scan and its rendered rows (None for a row with no B-side candidate).
@@ -343,16 +413,20 @@ def entry_guards(
     counted in ``linked_not_shown`` — and the others fill the list in B order; with none
     (``b_order``) the first ones are taken. A selection by a mechanism fact, never a ranking;
     another window of the same entry's rows can show another selection. ``guard_links`` index into
-    the shown list."""
-    fields: dict[str, Any]
+    the shown list.
+
+    ``guard_scan`` gives no field its reader can derive: a count that is 0 (``linked_not_shown``,
+    ``renumbered_in_a``, a ``by_const_class`` / ``other_comparisons`` key — the whole object when
+    every key is 0) and ``shown_rule`` with nothing shown are left out; the stored count is
+    min(``var_const_total``, ``GUARD_STORE_LIMIT``) and the shown one ``len(guards)``. A scan done
+    with nothing found still carries ``guards: []``; a ``not_extracted`` one carries no ``guards``
+    key."""
     if scan.get("state") != "done":
-        fields = {
-            "guard_scan": {"state": scan.get("state"), "reason": scan.get("reason")},
-            "guards_body_ref": body_ref,
-        }
-        return fields, [None] * len(rows)
+        withheld = {"guard_scan": {"state": scan.get("state"), "reason": scan.get("reason")}}
+        return withheld, [None] * len(rows)
     stored: list[dict[str, Any]] = list(scan.get("guards") or [])
-    verdicts = [None if r is None else _row_verdicts(r, stored) for r in rows]
+    b_names: frozenset[str] = scan.get("b_names") or frozenset()
+    verdicts = [None if r is None else _row_verdicts(r, stored, b_names) for r in rows]
     if any(r is not None for r in rows):
         rule = "linked_first_then_b_order"
         linked = sorted(
@@ -376,21 +450,21 @@ def entry_guards(
         rule = "b_order"
         chosen = list(range(min(GUARD_INLINE_LIMIT, len(stored))))
         linked_not_shown = 0
-    fields = {
-        "guard_scan": {
-            "state": "done",
-            "coverage": "unjudged",
-            "var_const_total": scan.get("var_const_total"),
-            "by_const_class": scan.get("by_const_class"),
-            "stored": len(stored),
-            "shown": len(chosen),
-            "shown_rule": rule,
-            "linked_not_shown": linked_not_shown,
-            "other_comparisons": scan.get("other_comparisons"),
-        },
-        "guards": [stored[i] for i in chosen],
-        "guards_body_ref": body_ref,
+    guard_scan: dict[str, Any] = {
+        "state": "done",
+        "coverage": "unjudged",
+        "var_const_total": scan.get("var_const_total"),
     }
+    for key, value in (
+        ("by_const_class", _nonzero(scan.get("by_const_class"))),
+        ("shown_rule", rule if chosen else None),
+        ("linked_not_shown", linked_not_shown),
+        ("renumbered_in_a", scan.get("renumbered_in_a")),
+        ("other_comparisons", _nonzero(scan.get("other_comparisons"))),
+    ):
+        if value:
+            guard_scan[key] = value
+    fields: dict[str, Any] = {"guard_scan": guard_scan, "guards": [stored[i] for i in chosen]}
     position = {i: n for n, i in enumerate(chosen)}
     links: list[dict[str, Any] | None] = []
     for v in verdicts:

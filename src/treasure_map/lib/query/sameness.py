@@ -61,6 +61,7 @@ import json
 import re
 import sqlite3
 from collections import Counter
+from collections.abc import Callable
 from difflib import SequenceMatcher
 from itertools import zip_longest
 from typing import Any, NamedTuple
@@ -849,14 +850,14 @@ def _inline_hunk(
     Shown: ``structural`` — one list of lines per run of structural blocks, each line prefixed
     ``-`` (the A side's line), ``+`` (the B side's line), `` `` (a context line, A side) or ``=``
     (the B side's own text at this point, given only where it differs from the A line — the
-    difference is an address, or a substitution already counted in substitution_groups; where B has
-    more lines than A, several ``=`` lines can follow one another); ``INLINE_HUNK_CONTEXT`` lines
-    around each run, runs that close
-    merged. ``substitution_groups`` — one per group, in the order first met: ``kind`` (number /
-    ident / string / local_or_comment), a number group's ``step``, ``total``, and ``first``: up to
-    five ``[a, b, line_a, line_b]``, the token as each side's original text has it and its 1-based
-    line there (blank lines counted). Every shown line is the original text, never the normalised
-    one the lines were aligned on. No block position is given."""
+    difference is an address, or a substitution already counted in substitution_groups; where B
+    has more lines than A, several ``=`` lines can follow one another); ``INLINE_HUNK_CONTEXT``
+    lines around each run, runs that close merged. ``substitution_groups`` — one per group, in
+    the order first met: ``kind`` (number / ident / string / local_or_comment), a number group's
+    ``step``, ``total``, and ``first``: up to five ``[a, b, line_a, line_b]``, the token as each
+    side's original text has it and its 1-based line there (blank lines counted). Every shown
+    line is the original text, never the normalised one the lines were aligned on. No block
+    position is given."""
     struct = [b for b in blocks if b.spans]
     struct_lines = sum((b.i2 - b.i1) + (b.j2 - b.j1) for b in struct)
     groups: dict[tuple[Any, ...], tuple[int, list[tuple[_Block, int, int]]]] = {}
@@ -1044,17 +1045,40 @@ class _Cmp(NamedTuple):
     const: tuple[int, int] = (0, 0)
 
 
-def _is_binary_op(toks: list[_Tok], j: int) -> bool:
-    """Whether the ``&`` / ``|`` / ``^`` at ``j`` is a binary operator: the token before it ends an
-    operand (a name that is not a keyword, a number, ``)`` or ``]``). Else it is a unary ``&``."""
-    if j == 0:
-        return False
-    kind, text, _start = toks[j - 1]
+def _ends_operand(tok: _Tok) -> bool:
+    """Whether a token can end an operand: a name (not a keyword), a number, ``)`` or ``]``."""
+    kind, text, _start = tok
     return (
         (kind == "ident" and text not in _CALL_KEYWORDS)
         or kind == "number"
         or (kind == "punct" and text in (")", "]"))
     )
+
+
+def _closes_a_cast(toks: list[_Tok], j: int) -> bool:
+    """Whether the ``)`` at ``j`` closes a cast: its ``(`` holds only names and ``*`` (at least one
+    name), and what stands before that ``(`` neither ends an operand nor is ``sizeof`` (so the
+    parentheses are not a call's arguments, ``sizeof (type)``, nor a parenthesised operand)."""
+    m, names = j - 1, 0
+    while m >= 0 and (toks[m][0] == "ident" or toks[m][:2] == ("punct", "*")):
+        names += toks[m][0] == "ident"
+        m -= 1
+    if not names or m < 0 or toks[m][:2] != ("punct", "("):
+        return False
+    if m == 0:
+        return True
+    return not _ends_operand(toks[m - 1]) and toks[m - 1][:2] != ("ident", "sizeof")
+
+
+def _is_binary_op(toks: list[_Tok], j: int) -> bool:
+    """Whether the ``&`` / ``|`` / ``^`` at ``j`` is a binary operator: the token before it ends an
+    operand (a name that is not a keyword, a number, ``)`` or ``]``) — except a ``)`` that closes a
+    cast, after which an ``&`` takes an address (``(uint)&local_10``). Else it is a unary ``&``."""
+    if j == 0:
+        return False
+    if toks[j - 1][:2] == ("punct", ")") and _closes_a_cast(toks, j - 1):
+        return False
+    return _ends_operand(toks[j - 1])
 
 
 def _left_start(toks: list[_Tok], k: int, rel_stops: frozenset[str]) -> int:
@@ -1209,6 +1233,83 @@ def _is_zero(const: str) -> bool:
     return _parse_int_token(const.lstrip("-").strip()) == 0
 
 
+_Key = tuple[tuple[str, ...], str, tuple[str, ...]]
+
+# The identifiers _TOK reads in a text, found without matching every punctuation character on
+# the way: a comment, a string or a number is matched whole (and gives no name), an identifier is
+# the one group. The same tokens in the same places as _TOK's, so the same names.
+_IDENTIFIERS = re.compile(
+    r"""(?:/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'"""
+    r"|0x[0-9a-fA-F@#]+[uUlL]*|\d+[uUlL]*)"
+    r"|([A-Za-z_@#][A-Za-z0-9_@#]*)",
+    re.S,
+)
+
+# The names the decompiler numbers for a local (``uVar9``, ``local_48``, ``auStack_120``): when a
+# function's structure moves, these are often renumbered as a whole on one side. A renaming pair
+# counts only when the block match substitutes one for the other at least this many times.
+_RENUMBERED_LOCAL = re.compile(r"[a-z]+Var\d+|local_[0-9a-f]+|[a-z]+Stack_[0-9a-f]+")
+RENUMBER_MIN_SUBSTITUTIONS = 2
+
+
+def _renumbering(blocks: list[_Block]) -> dict[str, str]:
+    """A name -> B name for the decompiler-numbered locals that the block match shows renamed one
+    to one: every substitution of one such name by another, counted per pair; the pairs seen at
+    least ``RENUMBER_MIN_SUBSTITUTIONS`` times kept; then only those whose A name maps to that one B
+    name alone and whose B name comes from that one A name alone. Thresholded first, so a one-off
+    substitution cannot break a mapping that holds everywhere else."""
+    seen: Counter[tuple[str, str]] = Counter()
+    for blk in blocks:
+        for k, m in blk.subs:
+            x, y = blk.ta[k], blk.tb[m]
+            if (
+                x[0] == y[0] == "ident"
+                and _RENUMBERED_LOCAL.fullmatch(x[1])
+                and _RENUMBERED_LOCAL.fullmatch(y[1])
+            ):
+                seen[(x[1], y[1])] += 1
+    kept = [pair for pair, n in seen.items() if n >= RENUMBER_MIN_SUBSTITUTIONS]
+    to_b = Counter(a for a, _b in kept)
+    from_a = Counter(b for _a, b in kept)
+    return {a: b for a, b in kept if to_b[a] == 1 and from_a[b] == 1}
+
+
+def _introduced(
+    blocks: list[_Block],
+    off: int,
+    la: list[str],
+    lb: list[str],
+    cmps: Callable[[str], list[_Cmp]],
+    key_a: Callable[[_Cmp], _Key],
+) -> list[tuple[_Cmp, int]]:
+    """(comparison, index into lb) of each comparison the B side introduces, in B order: inside each
+    block holding a structural span, the B lines' comparisons less the A lines' (a multiset by key);
+    then, per key, at most as many kept as the B body holds MORE of that key than the A body (the
+    first in B order). ``key_a`` gives an A comparison's key (its own, or renamed)."""
+    introduced: list[tuple[_Cmp, int]] = []
+    for blk in blocks:
+        if not blk.spans:
+            continue
+        seen = Counter(key_a(c) for i in range(off + blk.i1, off + blk.i2) for c in cmps(la[i]))
+        for j in range(off + blk.j1, off + blk.j2):
+            for c in cmps(lb[j]):
+                if seen[c.key] > 0:
+                    seen[c.key] -= 1
+                else:
+                    introduced.append((c, j))
+    if not introduced:
+        return introduced
+    wanted = {c.key for c, _j in introduced}
+    excess = Counter(c.key for line in lb for c in cmps(line) if c.key in wanted)
+    excess.subtract(k for line in la for c in cmps(line) if (k := key_a(c)) in wanted)
+    kept: list[tuple[_Cmp, int]] = []
+    for c, j in introduced:
+        if excess[c.key] > 0:
+            excess[c.key] -= 1
+            kept.append((c, j))
+    return kept
+
+
 def _guard_scan(
     blocks: list[_Block], off: int, la: list[str], lb: list[str], sides: _Sides
 ) -> dict[str, Any]:
@@ -1220,13 +1321,25 @@ def _guard_scan(
     Inside each such block, the B lines' comparisons less the A lines' (as a multiset, by key, the
     keys read on the normalised lines so a moved address is no change); then, per key, at most as
     many are kept as the B body holds MORE of that key than the A body (the first in B order), so
-    a comparison that only moved or was reordered is not introduced. What is left are the
-    introduced comparisons: the variable-against-constant ones (``guards``) are given — the
-    variable, constant and cast as the B side's original line writes them (the normalised tokens
-    when that line does not tokenise the same way), the relation, ``const_class`` (``zero`` when the
-    constant is 0, ``nonzero`` otherwise or when its value cannot be read) and ``line_b`` (its
-    1-based line in the original B text) — in B order, at most ``GUARD_STORE_LIMIT``; the rest only
-    counted by kind (``other_comparisons``). No block position is kept."""
+    a comparison that only moved or was reordered is not introduced (:func:`_introduced`). What is
+    left are the introduced comparisons: the variable-against-constant ones (``guards``) are given
+    — the variable, constant and cast as the B side's original line writes them (the normalised
+    tokens when that line does not tokenise the same way; ``cast`` only when the variable has
+    one), the relation, ``const_class`` (``zero`` when the constant is 0, ``nonzero`` otherwise or
+    when its value cannot be read) and ``line_b`` (its 1-based line in the original B text) — in B
+    order, at most ``GUARD_STORE_LIMIT``; the rest only counted by kind (``other_comparisons``). No
+    block position is kept.
+
+    ``renumbered_in_a`` {``a_name``} marks a guard the same two steps no longer introduce once the
+    A side's decompiler-numbered locals are renamed by :func:`_renumbering` (and the scan counts
+    them, when there are any). A syntax fact as well: the A body, so renamed, holds that comparison
+    as often — not that the comparison is old, idle or safe; an unmarked guard is not proven new (a
+    negated or restructured comparison is not matched). Only marked, never dropped: the guards,
+    their order and every count are those of the rule above.
+
+    ``b_names`` (only when there are guards; NEVER output) is the set of names the B body's
+    original text holds as identifiers — not inside a string, a number or a comment — which a
+    guard link reads to tell a recorded variable name from a fragment that is not one."""
     memo: dict[str, list[_Cmp]] = {}
 
     def cmps(line: str) -> list[_Cmp]:
@@ -1236,31 +1349,28 @@ def _guard_scan(
             found = memo[line] = _comparisons(_tokens_at(line)) if plain else []
         return found
 
-    introduced: list[tuple[_Cmp, int]] = []  # (comparison, index into lb), in B order
-    for blk in blocks:
-        if not blk.spans:
-            continue
-        seen = Counter(c.key for i in range(off + blk.i1, off + blk.i2) for c in cmps(la[i]))
-        for j in range(off + blk.j1, off + blk.j2):
-            for c in cmps(lb[j]):
-                if seen[c.key] > 0:
-                    seen[c.key] -= 1
-                else:
-                    introduced.append((c, j))
-    if introduced:
-        wanted = {c.key for c, _j in introduced}
-        excess = Counter(c.key for line in lb for c in cmps(line) if c.key in wanted)
-        excess.subtract(c.key for line in la for c in cmps(line) if c.key in wanted)
-        kept: list[tuple[_Cmp, int]] = []
-        for c, j in introduced:
-            if excess[c.key] > 0:
-                excess[c.key] -= 1
-                kept.append((c, j))
-        introduced = kept
+    introduced = _introduced(blocks, off, la, lb, cmps, lambda c: c.key)
+    renamed: Counter[tuple[int, _Key]] = Counter()
+    inverse: dict[str, str] = {}
+    if any(c.kind == "guard" for c, _j in introduced):
+        renaming = _renumbering(blocks)
+        if renaming:
+
+            def renamed_key(c: _Cmp) -> _Key:
+                left, rel, right = c.key
+                return (
+                    tuple(renaming.get(t, t) for t in left),
+                    rel,
+                    tuple(renaming.get(t, t) for t in right),
+                )
+
+            again = _introduced(blocks, off, la, lb, cmps, renamed_key)
+            renamed.update((j, c.key) for c, j in again if c.kind == "guard")
+            inverse = {b: a for a, b in renaming.items()}
     others = dict.fromkeys(_OTHER_KINDS, 0)
     by_class = {"zero": 0, "nonzero": 0}
     guards: list[dict[str, Any]] = []
-    total = 0
+    total = n_renumbered = 0
     for c, j in introduced:
         if c.kind != "guard":
             others[c.kind] += 1
@@ -1280,24 +1390,44 @@ def _guard_scan(
         const = span(*c.const)
         const_class = "zero" if _is_zero(const) else "nonzero"
         by_class[const_class] += 1
+        # The renamed rule still introduces this one: unmarked. Else the A name its variable was
+        # renamed from (the variable is the key's last left token; a guard whose variable no
+        # renaming reaches is introduced by both rules alike, so it never gets here).
+        a_name: str | None = None
+        if renamed[(j, c.key)] > 0:
+            renamed[(j, c.key)] -= 1
+        elif inverse:
+            a_name = inverse.get(c.key[0][-1])
+        n_renumbered += a_name is not None
         if len(guards) < GUARD_STORE_LIMIT:
-            guards.append(
-                {
-                    "var": toks[c.var][1],
-                    "const": const,
-                    "relation": c.relation,
-                    "cast": span(*c.cast) if c.cast is not None else None,
-                    "const_class": const_class,
-                    "line_b": sides.nb[j],
-                }
-            )
-    return {
+            guard: dict[str, Any] = {
+                "var": toks[c.var][1],
+                "const": const,
+                "relation": c.relation,
+            }
+            if c.cast is not None:
+                guard["cast"] = span(*c.cast)
+            guard["const_class"] = const_class
+            guard["line_b"] = sides.nb[j]
+            if a_name is not None:
+                guard["renumbered_in_a"] = {"a_name": a_name}
+            guards.append(guard)
+    out: dict[str, Any] = {
         "state": "done",
         "var_const_total": total,
         "by_const_class": by_class,
         "other_comparisons": others,
         "guards": guards,
     }
+    if n_renumbered:
+        out["renumbered_in_a"] = n_renumbered
+    if guards:
+        out["b_names"] = frozenset(
+            name
+            for name in _IDENTIFIERS.findall("\n".join(sides.rb))
+            if name and name not in _CALL_KEYWORDS
+        )
+    return out
 
 
 # ── line-number form: a __FILE__/__LINE__ shift, told apart from a real substitution ─────────

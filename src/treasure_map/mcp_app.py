@@ -189,7 +189,10 @@ def _fit_page(
     null and the total, and the final value is never past the total), so the page as returned is
     never wider than what was measured. ``next_offset`` then resumes after what ACTUALLY fit; the
     total is the lib's, unchanged. A refusal, or any result without ``rows``, is returned as it
-    is."""
+    is.
+
+    A page always holds at least one row, so one row too large for the budget makes a page over
+    it; that page says so with ``over_budget: true`` (absent on every page within the budget)."""
     if "error" in result or rows not in result:
         return result
     n = result[total]
@@ -200,6 +203,8 @@ def _fit_page(
     result[rows] = kept
     result[next_offset] = end if end < n else None
     result[truncated] = cut
+    if len(json.dumps(result)) > _RESPONSE_BYTE_BUDGET:
+        result["over_budget"] = True
     return result
 
 
@@ -1952,7 +1957,9 @@ def make_tools(
         entries it covers). Page with ``limit``
         (1-2000, default 200) / ``offset``; follow ``next_offset`` until null. A page is also cut
         to a byte budget (~48KB), in every view: ``entries_truncated`` says when, ``total_entries``
-        stays the whole count, and ``next_offset`` resumes after the last entry returned.
+        stays the whole count, and ``next_offset`` resumes after the last entry returned. A page
+        holds at least one entry; one entry too large for the budget alone makes a page that
+        carries ``over_budget: true``.
 
         Each entry carries at most 20 of its candidate overlay rows inline (as
         get_diff_sink_overlay states them, each with its ``landing`` and ``subclass``), with
@@ -2020,89 +2027,98 @@ def make_tools(
         given only where it differs from the A line — the difference is an address, or a
         substitution already counted in substitution_groups; where B has more lines than A, several
         ``=`` lines can follow one another). ``substitution_groups`` puts each like substitution on
-        one line: numbers by
-        ``step`` (0x40 -> 0x3f is -1), an identifier or string by its old -> new pair, decompiler
-        local renames (``local_10`` -> ``local_14``: another stack slot, maybe another buffer)
-        together with comment changes as ``local_or_comment`` — each with ``total`` and ``first``:
-        up to five ``[a, b, line_a, line_b]`` with the 1-based line in each side's original text
-        (blank lines counted, as get_pseudocode returns it). ``structural_lines`` + ``groups`` is
-        the change's size; above 50 the hunk is ``withheld: over_gate`` with those counts — the
-        delta's other fields stay whole — and ``withheld: too_large`` (a function too large to
-        align, even after setting its identical leading and trailing lines aside) or ``page_budget``
-        (one entry too large for the response) say the same: read get_pseudocode. A withheld hunk
-        is never "no change". A layout-only difference has no hunk. An UNDETERMINED pair (bucket
-        R) carries ``proposed_pair_reading`` instead: the same
-        reading as if it were paired (``identical_unique`` only when its body occurs once on each
-        side, ``identical_not_unique`` otherwise, plus the other states), with where else each
-        body occurs — a proposal beside the entry, never its pairing. An undetermined pair is
-        flagged ``anchored_differs`` (in its proposed_pair_reading, with ``anchor`` = ``addr`` /
-        ``name`` / ``addr+name`` and ``in_read_first``) when all three hold: no export gap on
-        either side, the two sides share an address or one real symbol name (a made-up name such
-        as ``FUN_<addr>`` / ``sub_<addr>`` anchors by address only), and the proposed reading is
-        ``differs`` — at any similarity, 1 included (similarity 1 does not see a changed constant
-        or buffer size). ``in_read_first`` = at or above the read-first similarity floor (0.7).
+        one line: numbers by ``step`` (0x40 -> 0x3f is -1), an identifier or string by its old ->
+        new pair, decompiler local renames (``local_10`` -> ``local_14``: another stack slot, maybe
+        another buffer) together with comment changes as ``local_or_comment`` — each with ``total``
+        and ``first``: up to five ``[a, b, line_a, line_b]`` with the 1-based line in each side's
+        original text (blank lines counted, as get_pseudocode returns it). ``structural_lines`` +
+        ``groups`` is the change's size; above 50 the hunk is ``withheld: over_gate`` with those
+        counts — the delta's other fields stay whole — and ``withheld: too_large`` (a function too
+        large to align, even after setting its identical leading and trailing lines aside) or
+        ``page_budget`` (one entry too large for the response) say the same: read get_pseudocode. A
+        withheld hunk is never "no change". A layout-only difference has no hunk. An UNDETERMINED
+        pair (bucket R) carries ``proposed_pair_reading`` instead: the same reading as if it were
+        paired (``identical_unique`` only when its body occurs once on each side,
+        ``identical_not_unique`` otherwise, plus the other states), with where else each body occurs
+        — a proposal beside the entry, never its pairing. An undetermined pair is flagged
+        ``anchored_differs`` (in its proposed_pair_reading, with ``anchor`` = ``addr`` / ``name`` /
+        ``addr+name`` and ``in_read_first``) when all three hold: no export gap on either side, the
+        two sides share an address or one real symbol name (a made-up name such as ``FUN_<addr>`` /
+        ``sub_<addr>`` anchors by address only), and the proposed reading is ``differs`` — at any
+        similarity, 1 included (similarity 1 does not see a changed constant or buffer size).
+        ``in_read_first`` = at or above the read-first similarity floor (0.7).
         ``anchored_differs=true`` (sink_patch, listed entries, bucket R or unset) lists only the
-        flagged pairs, read-first ones first, then by similarity, highest first (``sort_by``
-        orders them instead); with ``sort_by='significance'`` they lead attention 1 (basis
+        flagged pairs, read-first ones first, then by similarity, highest first (``sort_by`` orders
+        them instead); with ``sort_by='significance'`` they lead attention 1 (basis
         ``anchored_differs``). A fact, not a verdict, and it clears nothing else in R: the other
         pairs reading differs still need reading. A flagged pair whose text changed ONLY by a
         ``__FILE__``/``__LINE__`` line-number shift, with both sides' callee sets and body sizes
         proven equal, stays flagged but is demoted out of the read-first head (``in_read_first``
         false, ``demoted`` true, ``line_number_form`` {delta, sites} in its reading). Without that
-        proof it stays in the head with ``demoted`` false, and its ``callee_set`` and
-        ``size_bytes`` {a, b} show which was not proven equal — a call added or dropped in a block
-        the decompiler removed is not in the text. Equal callee sets and sizes narrow that, they do
-        not rule it out (the set holds callees, not how often each is called). Separately,
-        ``anchored_micro_side=true`` (same scope) lists the undetermined pairs anchored with
-        exactly one side a design-skipped micro-stub (under ~10 bytes, not decompiled BY DESIGN —
-        a binary property, not a read failure) and the other a real body; basis
-        ``anchored_micro_side`` under the significance lens, ``one_side_skipped_micro`` for the
-        aligned pairs of that shape. A pair with no text on a side carries ``bodies`` (in the
-        entry for an aligned pair, in ``proposed_pair_reading`` for an undetermined one): per side
-        ``status`` and ``size_bytes``, and on a micro-stub side its stored disassembly inline
-        (``listing``, as get_disassembly gives it without the bytes; ``listing`` null with
-        ``listing_note`` = ``not_exported_by_this_scan`` — re-scan to store it — or
-        ``not_stored``, which get_disassembly explains). Not checked by any of
-        these: the target a ``DAT_`` / ``PTR_`` reference points at once its address is blanked
-        (a string label keeps its content in the name); a C++ catch handler (landing pad), which
-        usually lies outside every function body, so its code is never decompiled and no reading
-        compares it — a try/catch annotation that moved with its function says nothing about the
-        handler. A persisted candidate whose size
-        constant changed carries ``sink_arg_constant_delta`` (callee + from/to,
-        direction-neutral); a changed size KIND is the weaker ``size_kind_shifted``.
+        proof it stays in the head with ``demoted`` false, and its ``callee_set`` and ``size_bytes``
+        {a, b} show which was not proven equal — a call added or dropped in a block the decompiler
+        removed is not in the text. Equal callee sets and sizes narrow that, they do not rule it out
+        (the set holds callees, not how often each is called). Separately,
+        ``anchored_micro_side=true`` (same scope) lists the undetermined pairs anchored with exactly
+        one side a design-skipped micro-stub (under ~10 bytes, not decompiled BY DESIGN — a binary
+        property, not a read failure) and the other a real body; basis ``anchored_micro_side`` under
+        the significance lens, ``one_side_skipped_micro`` for the aligned pairs of that shape. A
+        pair with no text on a side carries ``bodies`` (in the entry for an aligned pair, in
+        ``proposed_pair_reading`` for an undetermined one): per side ``status`` and ``size_bytes``,
+        and on a micro-stub side its stored disassembly inline (``listing``, as get_disassembly
+        gives it without the bytes; ``listing`` null with ``listing_note`` =
+        ``not_exported_by_this_scan`` — re-scan to store it — or ``not_stored``, which
+        get_disassembly explains). Not checked by any of these: the target a ``DAT_`` / ``PTR_``
+        reference points at once its address is blanked (a string label keeps its content in the
+        name); a C++ catch handler (landing pad), which usually lies outside every function body, so
+        its code is never decompiled and no reading compares it — a try/catch annotation that moved
+        with its function says nothing about the handler. A persisted candidate whose size constant
+        changed carries ``sink_arg_constant_delta`` (callee + from/to, direction-neutral); a changed
+        size KIND is the weaker ``size_kind_shifted``.
 
         Beside every ``pseudocode_delta`` comes ``guard_scan``: the comparisons of a variable
         against a constant that the B side's structural change introduces, read line by line from
         the text (no syntax tree, no data flow) — a syntax fact, ``coverage`` unjudged. ``guards``
-        shows up to 20 (``var``, ``const``, ``relation``, ``cast`` = the variable's cast,
-        ``const_class`` ``zero`` / ``nonzero``, ``line_b`` in the B text), in B order: the ones a
-        shown row links ``yes`` first (``shown_rule`` ``linked_first_then_b_order``; more than 20
-        linked are counted in ``linked_not_shown``), else the first (``b_order``, also on a scan
-        with ``rows_limit=0`` and on ``not_listed_page``); another ``rows_offset`` can show
-        another selection, and past ``stored`` (200) none is linked. ``other_comparisons`` counts
-        the rest by kind; ``not_extracted`` (``too_large``) when the delta could not be matched;
-        ``guards_body_ref`` reads the B body. A comparison whose constant only changed is in the
-        hunk's substitution groups, not here. Each row with a B-side candidate carries
-        ``guard_links``: per shown guard, ``sink_arg`` (from the candidate's ``flow_path``) and
-        ``size_arg`` (from its ``size_flow``; for a strcpy-like call the source string, not a
-        length) under ``yes`` (the variable is BY NAME the sink argument / length variable or one
-        of their one-hop sources — where the comparison sits, whether it lies on the way to the
-        call, dominates it or suffices is NOT read), ``no`` (within a complete one-hop reading the
-        name does not match — not "unrelated", not "protected") or ``unknown``; or
+        shows up to 20 (``var``, ``const``, ``relation``, ``cast`` = the variable's cast (no
+        ``cast`` key when it has none), ``const_class`` ``zero`` / ``nonzero``, ``line_b`` in the B
+        text), in B order: the ones a shown row links ``yes`` first (``shown_rule``
+        ``linked_first_then_b_order``; more than 20 linked are counted in ``linked_not_shown``),
+        else the first (``b_order``, also on a scan with ``rows_limit=0`` and on
+        ``not_listed_page``); another ``rows_offset`` can show another selection, and guards past
+        the 200th are counted, never linked. ``other_comparisons`` counts the rest by kind;
+        ``not_extracted`` (``too_large``) when the delta could not be matched, with no ``guards``
+        key — a scan that found none has ``guards: []``. A count left out of ``guard_scan`` is 0
+        (``by_const_class``, ``other_comparisons``, ``linked_not_shown``, ``renumbered_in_a``), and
+        ``shown_rule`` is left out when no guard is shown. The B body: ``guards_read_with`` in the
+        envelope (get_pseudocode with that run and binary, function = the entry's ``addr_b`` — for
+        an undetermined pair its proposed reading's B side). A guard marked ``renumbered_in_a``
+        {``a_name``} is a syntax fact too: the A body, with its decompiler-numbered locals renamed
+        by the one-to-one renaming the block match's substitutions show (each pair seen at least
+        twice), holds this comparison as often — not that it is old, idle or safe; an unmarked guard
+        is not proven new (a negated or restructured comparison is not matched). A comparison whose
+        constant only changed is in the hunk's substitution groups, not here. Each row with a B-side
+        candidate carries ``guard_links``: per shown guard, ``sink_arg`` (from the candidate's
+        ``flow_path``) and ``size_arg`` (from its ``size_flow``; for a strcpy-like call the source
+        string, not a length) under ``yes`` (the variable is BY NAME the sink argument / length
+        variable or one of their one-hop sources — where the comparison sits, whether it lies on the
+        way to the call, dominates it or suffices is NOT read), ``no`` (within a complete one-hop
+        reading the name does not match — not "unrelated", not "protected") or ``unknown``; or
         ``unavailable`` (``not_recorded_for_class`` = this class's records do not hold the field,
         not "checked, no match"; ``other_function``; ``ambiguous_ref``; ``no_evidence``;
         ``not_in_record``); ``pairing`` ``proposed`` on an undetermined pair, whose indices point
-        into ``proposed_pair_reading.guards``. Reading ONE entry (``entry_id``; a list entry with
-        rows says so in ``sink_axes_with``), each row also carries ``sink_axes`` {a, b}: what each
-        side's candidate recorded at hunt time — ``bound``, ``source``, ``flow_path``,
-        ``sanitizer``, ``def_use`` (lists cut to 5 with ``*_total``; ``def_use.scope`` callsite /
-        sink_name / unscoped; a full record via get_sink_provenance) — and the rest under
-        ``unavailable`` by reason (``no_evidence``, ``ambiguous_ref``, ``class_unknown``,
-        ``not_recorded_for_class``, ``not_in_record``): not recorded or not single, never "absent"
-        and never "out of reach". A sanitizer's body: get_pseudocode with that side's run, sha256
-        and the ``seen[].name``; its coverage is unjudged. When one entry is too large for the
-        response, rows' ``sink_axes`` are withheld (``page_budget``) from the last row back
-        (``sink_axes_withheld_rows``), and only then its hunks.
+        into ``proposed_pair_reading.guards``. A sink argument / length variable the B text does not
+        hold as a variable name (a type name read from a cast, digits of a hex constant, a word of a
+        string) links as unknown, never no. Reading ONE entry (``entry_id``; a list entry with rows
+        says so in ``sink_axes_with``), each row also carries ``sink_axes`` {a, b}: what each side's
+        candidate recorded at hunt time — ``bound``, ``source``, ``flow_path``, ``sanitizer``,
+        ``def_use`` (lists cut to 5 with ``*_total``; ``def_use.scope`` callsite / sink_name /
+        unscoped; a full record via get_sink_provenance) — and the rest under ``unavailable`` by
+        reason (``no_evidence``, ``ambiguous_ref``, ``class_unknown``, ``not_recorded_for_class``,
+        ``not_in_record``): not recorded or not single, never "absent" and never "out of reach". A
+        sanitizer's body: get_pseudocode with that side's run, sha256 and the ``seen[].name``; its
+        coverage is unjudged. When one entry is too large for the response, rows' ``sink_axes`` are
+        withheld (``page_budget``) from the last row back (``sink_axes_withheld_rows``), and only
+        then its hunks.
 
         ``view``: ``string_edge`` returns get_diff_deltas' rows, ``candidate_flat``
         get_diff_sink_overlay's rows in its order; the envelope (``subject_counts`` of all three
@@ -2425,14 +2441,16 @@ def make_tools(
         ``members_offset`` (from ``members_page_ref``) returns one page of members instead, in a
         stable order (function entry, call address, evidence_ref — never by landing), cut to a byte
         budget (~48KB): ``members_truncated`` says when, ``members_next_offset`` resumes (null on
-        the last page). Each member: ``evidence_ref`` (for annotate), function entry and name, call
-        address, ``landing`` / ``subclass`` / ``listed`` / ``similarity``; a member in a listed
-        entry also carries ``entry_id`` + ``row_ref`` (what promote takes — promote accepts a row
-        landing A, persisted or P unmatched_analysis_complete in a determined pairing on a current
-        diff, and refuses the rest with its reasons) and ``candidate_anchor`` (what annotate_diff
-        takes). A member in a pair the view does not list has neither: annotate_diff and promote
-        take only what the view lists. ``source_stale`` / ``source_stale_reason`` as in list_diffs.
-        A diff whose side is a proven-stale scan is refused, as on every diff tool."""
+        the last page); a page holds at least one member, and one too large for the budget alone
+        makes a page that carries ``over_budget: true``. Each member: ``evidence_ref`` (for
+        annotate), function entry and name, call address, ``landing`` / ``subclass`` / ``listed`` /
+        ``similarity``; a member in a listed entry also carries ``entry_id`` + ``row_ref`` (what
+        promote takes — promote accepts a row landing A, persisted or P unmatched_analysis_complete
+        in a determined pairing on a current diff, and refuses the rest with its reasons) and
+        ``candidate_anchor`` (what annotate_diff takes). A member in a pair the view does not list
+        has neither: annotate_diff and promote take only what the view lists. ``source_stale`` /
+        ``source_stale_reason`` as in list_diffs. A diff whose side is a proven-stale scan is
+        refused, as on every diff tool."""
         conn = open_atlas(atlas_path)
         try:
             refusal = _refuse_stale_diff(conn, diff_id)

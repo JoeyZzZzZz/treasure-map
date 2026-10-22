@@ -1288,13 +1288,17 @@ def _scan(a: str, b: str) -> dict:
 
 def _guard_tuples(scan: dict) -> list[tuple]:
     return [
-        (g["var"], g["relation"], g["const"], g["cast"], g["const_class"]) for g in scan["guards"]
+        (g["var"], g["relation"], g["const"], g.get("cast"), g["const_class"])
+        for g in scan["guards"]
     ]
 
 
 def test_a_comparison_added_in_a_structural_block_is_a_guard_at_its_original_line() -> None:
     """G1: a B-only ``if (uVar3 > 0x40)`` in a structural block is one guard, nonzero, its line_b
-    the 1-based line of the ORIGINAL B text (a blank line counted)."""
+    the 1-based line of the ORIGINAL B text (a blank line counted). A guard whose variable has no
+    cast carries no ``cast`` key at all (one with a cast does: G2b).
+
+    MUTATION (verified RED, 1 failed): write ``cast: null`` on every guard -> RED."""
     a = "n = read(buf);\nfoo(n);"
     b = "n = read(buf);\n\nif (uVar3 > 0x40) {\n  bar();\n}\nfoo(n);"
     scan = _scan(a, b)
@@ -1304,7 +1308,6 @@ def test_a_comparison_added_in_a_structural_block_is_a_guard_at_its_original_lin
             "var": "uVar3",
             "const": "0x40",
             "relation": ">",
-            "cast": None,
             "const_class": "nonzero",
             "line_b": 3,
         }
@@ -1331,7 +1334,181 @@ def test_an_ordering_inside_an_equality_is_read_by_cs_precedence() -> None:
     equality's scan too -> the ``==`` reads ``0 == bVar1`` (a second guard) -> RED."""
     scan = _scan("foo();", "if ((int)x < 0 == bVar1) bar();")
     assert _guard_tuples(scan) == [("x", "<", "0", "(int)", "zero")]
+    assert scan["guards"][0].get("cast") == "(int)"
     assert scan["other_comparisons"] == {"var_var": 0, "call": 0, "field": 0, "other": 1}
+
+
+def test_a_constant_on_the_left_of_a_bound_flips_the_bound() -> None:
+    """G2 (bounds): ``0x40 <= n`` reads ``n >= 0x40`` and ``0x40 >= n`` reads ``n <= 0x40``.
+
+    MUTATION (verified RED, 1 failed): flip ``<=`` to ``<`` (and ``>=`` to ``>``) -> RED."""
+    assert _guard_tuples(_scan("foo();", "if (0x40 <= n) bar();")) == [
+        ("n", ">=", "0x40", None, "nonzero")
+    ]
+    assert _guard_tuples(_scan("foo();", "if (0x40 >= n) bar();")) == [
+        ("n", "<=", "0x40", None, "nonzero")
+    ]
+
+
+def test_at_most_one_cast_is_set_aside() -> None:
+    """``(int)(uint)x < 5`` has two casts: the operand is compound, so no guard.
+
+    MUTATION (verified RED, 1 failed): set aside every leading cast -> ``x < 5`` is a guard ->
+    RED."""
+    scan = _scan("foo();", "if ((int)(uint)x < 5) bar();")
+    assert scan["guards"] == []
+    assert scan["other_comparisons"]["other"] == 1
+
+
+def test_an_address_taken_after_a_cast_is_no_guard() -> None:
+    """``(uint)&local_10 < 0x10`` and ``*(int *)&local_10 < 5``: the ``&`` after a cast's ``)``
+    takes an address, so the operand is compound — not the variable ``local_10``. A ``&`` after
+    a parenthesised expression, a call or ``sizeof (type)`` stays binary, and ``<`` binds tighter:
+    ``(a + b) & n < 5`` holds the guard ``n < 5``.
+
+    MUTATION (verified RED, 1 failed): read every ``&`` after ``)`` as binary -> ``local_10 <
+    0x10`` and ``local_10 < 5`` are guards -> RED."""
+    assert _scan("foo();", "if ((uint)&local_10 < 0x10) bar();")["guards"] == []
+    assert _scan("foo();", "if (*(int *)&local_10 < 5) bar();")["guards"] == []
+    for binary in ("(a + b) & n < 5", "f(x) & n < 5", "sizeof(int) & n < 5"):
+        assert _guard_tuples(_scan("foo();", f"if ({binary}) bar();")) == [
+            ("n", "<", "5", None, "nonzero")
+        ], binary
+
+
+def _marks(scan: dict) -> list[tuple]:
+    return [(g["var"], g["line_b"], g.get("renumbered_in_a")) for g in scan["guards"]]
+
+
+def _lines(*lines: str) -> str:
+    return "\n".join(lines)
+
+
+def test_a_guard_whose_local_was_only_renumbered_is_marked() -> None:
+    """A's ``uVar9`` is B's ``uVar13`` (the block match substitutes one for the other on four
+    lines). ``if (uVar13 == 0x74)`` falls in a structural block, so the rule introduces it; under
+    the renaming A holds it as often, so it is marked ``renumbered_in_a`` {``a_name``: ``uVar9``}
+    and counted — and still given, with every count as the rule has it."""
+    a = _lines("uVar9 = get();", "use(uVar9);", "keep(uVar9);", "start();")
+    a += _lines("", "if (uVar9 == 0x74) {", "  one();", "}", "end();")
+    b = _lines("uVar13 = get();", "use(uVar13);", "keep(uVar13);", "start();", "extra(1);")
+    b += _lines("", "if (uVar13 == 0x74) {", "  two(2);", "}", "end();")
+    scan = _scan(a, b)
+    assert _marks(scan) == [("uVar13", 6, {"a_name": "uVar9"})]
+    assert scan.get("renumbered_in_a") == 1
+    assert scan["var_const_total"] == 1
+
+
+def test_a_renaming_seen_once_marks_nothing() -> None:
+    """The only ``uVar9`` -> ``uVar13`` substitution is the comparison's own: one sighting is no
+    renaming, so the guard is not marked and the scan has no count.
+
+    MUTATION (verified RED, 1 failed): keep the pairs seen once -> marked -> RED."""
+    a = _lines("start();", "if (uVar9 == 0x74) {", "  one();", "}", "end();")
+    b = _lines("start();", "if (uVar13 == 0x74) {", "  two(2);", "}", "end();")
+    scan = _scan(a, b)
+    assert _marks(scan) == [("uVar13", 2, None)]
+    assert "renumbered_in_a" not in scan
+
+
+def test_a_negated_and_renumbered_comparison_is_not_marked() -> None:
+    """A's ``if (local_48 != 0)`` is B's ``if (local_44 == 0)``: the renaming holds (three
+    substitutions), but renamed, A's comparison is ``local_44 != 0`` — not B's. Not marked: the
+    mark matches the comparison as written, not what it tests."""
+    a = _lines("local_48 = get();", "use(local_48);", "keep(local_48);", "start();")
+    a += _lines("", "if (local_48 != 0) {", "  one();", "}", "end();")
+    b = _lines("local_44 = get();", "use(local_44);", "keep(local_44);", "start();")
+    b += _lines("", "if (local_44 == 0) {", "  two(2);", "}", "end();")
+    la, *_rest = sm._delta_lines(a, None, False)
+    lb, *_rest = sm._delta_lines(b, None, False)
+    blocks = sm._delta_blocks(la, lb)
+    assert blocks is not None and sm._renumbering(blocks) == {"local_48": "local_44"}
+    assert _marks(_scan(a, b)) == [("local_44", 5, None)]
+
+
+def test_a_copied_comparison_marks_only_the_one_the_a_block_holds() -> None:
+    """A holds ``uVar9 == 0x74`` once; B holds ``uVar13 == 0x74`` in the same block and once more in
+    a copy further down. Both are introduced; renamed, the A block takes back the first — so the
+    first is marked and the copy is not.
+
+    MUTATION (verified RED, 1 failed): rename in the whole-function count only, not in the
+    block subtraction -> the copy is marked instead -> RED."""
+    a = _lines("uVar9 = get();", "use(uVar9);", "keep(uVar9);", "start();")
+    a += _lines("", "if (uVar9 == 0x74) {", "  one();", "}", "mid();", "end();")
+    b = _lines("uVar13 = get();", "use(uVar13);", "keep(uVar13);", "start();")
+    b += _lines("", "if (uVar13 == 0x74) {", "  two(2);", "}", "mid();")
+    b += _lines("", "if (uVar13 == 0x74) {", "  copied();", "}", "end();")
+    scan = _scan(a, b)
+    assert _marks(scan) == [("uVar13", 5, {"a_name": "uVar9"}), ("uVar13", 9, None)]
+    assert scan.get("renumbered_in_a") == 1
+
+
+def test_a_local_renamed_to_two_names_is_no_renaming() -> None:
+    """``uVar9`` is substituted by ``uVar13`` on some lines and by ``uVar14`` on others (each pair
+    seen three times): it maps to no one name, so neither comparison is marked.
+
+    MUTATION (verified RED, 1 failed): drop the one-to-one check -> one of them is marked ->
+    RED."""
+    a = _lines("uVar9 = get();", "use(uVar9);", "put(uVar9);", "keep(uVar9);", "start();")
+    a += _lines("", "if (uVar9 == 0x74) {", "  one();", "}")
+    a += _lines("", "if (uVar9 == 0x75) {", "  three();", "}", "end();")
+    b = _lines("uVar13 = get();", "use(uVar13);", "put(uVar14);", "keep(uVar14);", "start();")
+    b += _lines("", "if (uVar13 == 0x74) {", "  two(2);", "}")
+    b += _lines("", "if (uVar14 == 0x75) {", "  four(4);", "}", "end();")
+    scan = _scan(a, b)
+    assert [m[2] for m in _marks(scan)] == [None, None]
+    assert "renumbered_in_a" not in scan
+
+
+def test_renaming_never_adds_a_guard() -> None:
+    """A's own ``uVar13`` (B's ``uVar14``) is compared ``== 1``, and so is B's ``uVar13`` (A's
+    ``uVar9``) — a coincidence of names that the rule reads as an unchanged comparison. Renamed, B's
+    ``uVar13 == 1`` would be introduced; it is NOT added: the guards and every count are the
+    rule's, the renaming only marks.
+
+    MUTATION (verified RED, 1 failed): add the guards only the renamed rule introduces ->
+    ``uVar13 == 1`` appears, var_const_total 2 -> RED."""
+    a = _lines("uVar9 = get();", "use(uVar9);", "uVar13 = other();", "keep(uVar13);", "start();")
+    a += _lines("", "if (uVar13 == 1) {", "  one();", "}", "end();")
+    b = _lines("uVar13 = get();", "use(uVar13);", "uVar14 = other();", "keep(uVar14);")
+    b += _lines("", "start();", "if ((uVar13 == 1) && (flag != 0)) {", "  two(2);", "}", "end();")
+    scan = _scan(a, b)
+    assert _marks(scan) == [("flag", 6, None)]
+    assert scan["var_const_total"] == 1
+    assert scan["by_const_class"] == {"zero": 1, "nonzero": 0}
+
+
+def test_the_b_names_are_the_identifiers_of_the_b_text() -> None:
+    """``b_names`` (never output; a guard link reads it) holds every identifier of the original B
+    text — not a word inside a string or a comment, not the digits of a number, not a keyword —
+    and only a scan with a guard carries it."""
+    b = (
+        "void f(char *param_1) {\n  /* old copy */\n  if (param_1 == 0) return;\n"
+        '  system("killall worker");\n  memcpy(d, (char *)s, 0x800);\n}'
+    )
+    names = _scan("foo();", b)["b_names"]
+    assert {"f", "param_1", "system", "memcpy", "d", "s", "char", "void"} <= names
+    assert not {"killall", "worker", "old", "copy", "x800", "return", "if"} & names
+    assert "b_names" not in _scan("foo();", "bar();")
+
+
+def test_the_identifier_reader_reads_the_tokenisers_identifiers() -> None:
+    """The fast reader behind ``b_names`` gives exactly the identifier tokens of the tokeniser, on
+    text that mixes every token kind (a multi-line comment, a string with an escaped quote, a char
+    literal, hex and decimal numbers with suffixes, a number running into a name, a blanked
+    address name).
+
+    MUTATION (verified RED, 2 failed — this test and the b_names one): leave numbers out of the
+    reader's skipped tokens -> the tail of ``0x800`` reads as a name -> RED."""
+    text = (
+        "void f(char *p) {\n/* a word\nacross lines */ int n = 0x800U + 12uL;\n"
+        's = "say \\"hi\\" now"; c = \'q\'; x1y = 3abc; DAT_@ = p->next; // tail words\n'
+        "if (n <= 0x1fgh) return; }"
+    )
+    want = {t for k, t, _s in sm._tokens_at(text) if k == "ident"}
+    got = {name for name in sm._IDENTIFIERS.findall(text) if name}
+    assert got == want
+    assert {"x800", "hi", "tail", "word", "q"}.isdisjoint(got)
 
 
 def test_a_cast_added_on_the_variable_is_another_comparison() -> None:

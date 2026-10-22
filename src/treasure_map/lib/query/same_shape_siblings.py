@@ -72,7 +72,7 @@ from typing import Any
 
 from treasure_map.lib import rescan_version
 from treasure_map.lib.query import diff_review
-from treasure_map.lib.query.diff_align import diff_source_staleness
+from treasure_map.lib.query.diff_align import diff_source_staleness, not_diffed_reason
 from treasure_map.lib.query.patch_view import (
     RECALL_GAP_SINKS,
     BuiltDiff,
@@ -414,8 +414,9 @@ def _not_diffed(
 ) -> dict[str, dict[str, int]]:
     """Calls with this sink name and kind, at the member granularities, in this side's run, whose
     binary content no diff of this run pair covers — per reason, binaries counted by content hash
-    and calls by evidence_ref. The reasons are decided in a fixed order: a same-named binary was
-    diffed (as the run-pair overlay decides it), then the same content is on the other side, then
+    and calls by evidence_ref. The reasons are decided in a fixed order, the first three as
+    list_diff_blindspots decides them (diff_align.not_diffed_reason, so one binary gets one reason
+    in both): the same content is on the other side, then a same-named binary was diffed, then
     the other side holds a same-named binary with other content, else this side only."""
     other = "b" if side == "a" else "a"
     sha_col, name_col = ("sha256_a", "binary_a") if side == "a" else ("sha256_b", "binary_b")
@@ -451,14 +452,11 @@ def _not_diffed(
         if call_kind(sink_class or "", flow) != kind:
             continue
         name = _basename(path)
-        if name in diffed_names:
-            reason = "shadowed_by_name_collision"
-        elif sha and sha in other_sha:
-            reason = "identical_both_sides"
-        elif name in other_names:
+        reason = not_diffed_reason(
+            sha or None, name, diffed_names=diffed_names, other_shas=other_sha
+        )
+        if reason == "binary_not_diffed" and name in other_names:
             reason = "other_side_same_name_not_diffed"
-        else:
-            reason = "binary_not_diffed"
         binaries, calls = found[reason]
         binaries.add(sha or f"path:{path}")
         calls.add(ref)

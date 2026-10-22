@@ -91,8 +91,89 @@ def test_mcp_explicit_atlas_and_ws_win(tmp_path: Path, monkeypatch: pytest.Monke
     from treasure_map.lib import last_run
 
     monkeypatch.setattr(last_run, "_POINTER_PATH", tmp_path / "absent.json")
-    atlas_out, ws = mcp_cli._resolve_mcp_target("/custom/x.db", "/custom/ws")
-    assert atlas_out == "/custom/x.db" and ws == "/custom/ws"
+    custom = tmp_path / "x.db"
+    custom.touch()
+    atlas_out, ws = mcp_cli._resolve_mcp_target(str(custom), "/custom/ws")
+    assert atlas_out == str(custom) and ws == "/custom/ws"
+
+
+def _no_server(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """build_server replaced by a recorder: the atlas each `tmap mcp` would serve."""
+    import treasure_map.mcp_app as mcp_app
+
+    served: list[str] = []
+
+    class _FakeServer:
+        def run(self) -> None:
+            return None
+
+    def build(atlas: str, **_kw: object) -> _FakeServer:
+        served.append(atlas)
+        return _FakeServer()
+
+    monkeypatch.setattr(mcp_app, "build_server", build)
+    return served
+
+
+def test_a_pointer_to_a_gone_atlas_serves_the_configured_one_and_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The last-run pointer names an atlas that no longer exists (a deleted scratch copy): the
+    server binds the configured atlas instead, stderr names both paths, and nothing is created at
+    the pointer's path — opening it would create an empty atlas that answers "no runs".
+
+    MUTATION (verified RED, 2 failed — this test and the fresh-install one): use the pointer's
+    atlas whether or not it exists -> RED."""
+    from treasure_map.lib import last_run
+    from treasure_map.lib.config.config import load_config
+
+    gone = tmp_path / "scratch" / "atlas.db"
+    ptr = tmp_path / "last_run.json"
+    last_run.write_last_run(tmp_path / "analysis.db", gone, "run_z", path=ptr)
+    monkeypatch.setattr(last_run, "_POINTER_PATH", ptr)
+    served = _no_server(monkeypatch)
+    r = CliRunner().invoke(main, ["mcp"])
+    assert r.exit_code == 0, r.output
+    configured = str(load_config(None).atlas.db_path)
+    assert served == [configured]
+    assert str(gone) in r.stderr and configured in r.stderr
+    assert not gone.exists()
+
+
+def test_an_explicit_atlas_that_is_not_there_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--atlas`` naming no file: the server does not start, the error names the path, and no
+    file is created there.
+
+    MUTATION (verified RED, 1 failed): accept a missing --atlas as before -> it would be opened
+    (and created) -> RED."""
+    served = _no_server(monkeypatch)
+    missing = tmp_path / "nowhere" / "atlas.db"
+    r = CliRunner().invoke(main, ["mcp", "--atlas", str(missing)])
+    assert r.exit_code != 0
+    assert str(missing) in r.output
+    assert served == [] and not missing.exists()
+
+
+def test_with_no_atlas_anywhere_the_configured_one_is_served(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh install: the pointer's atlas and the configured one are both missing. The
+    configured one is served as before (opened, so created empty: there is nothing yet, and an
+    empty atlas says so honestly)."""
+    from treasure_map.lib import last_run
+    from treasure_map.lib.config.config import load_config
+
+    ptr = tmp_path / "last_run.json"
+    last_run.write_last_run(tmp_path / "analysis.db", tmp_path / "gone.db", "run_z", path=ptr)
+    monkeypatch.setattr(last_run, "_POINTER_PATH", ptr)
+    configured = load_config(None).atlas.db_path
+    assert not Path(configured).exists()
+    served = _no_server(monkeypatch)
+    r = CliRunner().invoke(main, ["mcp"])
+    assert r.exit_code == 0, r.output
+    assert served == [str(configured)]
 
 
 def test_mcp_no_pointer_falls_back_to_configured_atlas(

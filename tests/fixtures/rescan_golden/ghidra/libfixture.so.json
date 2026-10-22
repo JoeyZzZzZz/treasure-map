@@ -1,0 +1,44 @@
+{
+  "functions": [
+    {
+      "name": "fx_checksum",
+      "address": "00102199",
+      "size": 141,
+      "is_exported": 1,
+      "callees": [],
+      "pseudocode": "ulong fx_checksum(ulong param_1,long param_2,ulong param_3)\n\n{\n  ulong uVar1;\n  ulong uVar2;\n  ulong local_10;\n  \n  uVar1 = param_1 & 0xffff;\n  uVar2 = param_1 >> 0x10 & 0xffff;\n  for (local_10 = 0; local_10 < param_3; local_10 = local_10 + 1) {\n    uVar1 = (uVar1 + *(byte *)(param_2 + local_10)) % 0xfff1;\n    uVar2 = (uVar2 + uVar1) % 0xfff1;\n  }\n  return uVar2 << 0x10 | uVar1;\n}\n"
+    },
+    {
+      "name": "fx_pack",
+      "address": "00102226",
+      "size": 83,
+      "is_exported": 1,
+      "callees": ["strlen", "memcpy"],
+      "pseudocode": "size_t fx_pack(void *param_1,ulong param_2,char *param_3)\n\n{\n  size_t local_10;\n  \n  if (param_2 == 0) {\n    local_10 = 0;\n  }\n  else {\n    local_10 = strlen(param_3);\n    if (param_2 <= local_10) {\n      local_10 = param_2 - 1;\n    }\n    memcpy(param_1,param_3,local_10);\n    *(undefined *)((long)param_1 + local_10) = 0;\n  }\n  return local_10;\n}\n"
+    },
+    {
+      "name": "fx_format",
+      "address": "00102279",
+      "size": 46,
+      "is_exported": 1,
+      "callees": ["snprintf"],
+      "pseudocode": "int fx_format(char *param_1,size_t param_2,char *param_3,long param_4)\n\n{\n  int iVar1;\n  \n  iVar1 = snprintf(param_1,param_2,\"%s=%ld\\n\",param_3,param_4);\n  return iVar1;\n}\n"
+    }
+  ],
+  "imports": [
+    {"func_name": "strlen", "lib_name": "libc.so.6"},
+    {"func_name": "memcpy", "lib_name": "libc.so.6"},
+    {"func_name": "snprintf", "lib_name": "libc.so.6"}
+  ],
+  "exports": [
+    {"func_name": "fx_checksum", "address": "00102199"},
+    {"func_name": "fx_pack", "address": "00102226"},
+    {"func_name": "fx_format", "address": "00102279"}
+  ],
+  "strings": [
+    {"value": "%s=%ld\n", "address": "00103000"},
+    {"value": "/var/run/fixtured.sock", "address": "00103008"}
+  ],
+  "strings_total": 2,
+  "strings_truncated": false
+}

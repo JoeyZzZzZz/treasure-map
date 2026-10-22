@@ -10,6 +10,7 @@ libx's own content, which no group may draw from.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 import sqlite3
@@ -26,7 +27,7 @@ from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.query import diff_annotations as da
 from treasure_map.lib.query import patch_view as pv
 from treasure_map.lib.query import same_shape_siblings as ss
-from treasure_map.lib.query.sink_overlay import _subject_key
+from treasure_map.lib.query.sink_overlay import SinkOverlayRow, _subject_key
 from treasure_map.lib.rescan_version import CodeStamp
 from treasure_map.lib.storage.connection import open_db
 from treasure_map.version import UNKNOWN_VERSION
@@ -625,23 +626,130 @@ def test_a_diff_unreadable_as_a_whole_counts_every_member_unreadable(
         assert all(m["unreadable"] == [banner] for m in members)
 
 
+# One member's state read straight from a view (``_states``). The view represents each instance row
+# of the binary once, so a built view never holds a member with no row, nor one call's records in
+# two entries; these views are the real one with a real entry left out, or one real row re-pointed
+# at another call (that call recorded a second time). Every object is the real dataclass, changed
+# by dataclasses.replace, so a renamed field breaks the test rather than leaving a stale stub.
+
+
+def _view_and_calls(w: World) -> tuple[pv.BuiltDiff, dict[str, ss._Call]]:
+    """The diff's real view and side A's real calls, by evidence_ref."""
+    built = pv.build_diff_view(w.atlas, DIFF)
+    assert built is not None and built.withheld is None
+    return built, {c.ref: c for c in ss._calls(w.atlas, "runA", SHA_A) if c.ref}
+
+
+def _placed(built: pv.BuiltDiff, ref: str) -> tuple[pv._Entry, SinkOverlayRow, dict[str, Any]]:
+    """The one (entry, row, row view) the view places for side A's ``ref``."""
+    hits = ss._row_index(built, "a", {ref}).get(ref, [])
+    assert len(hits) == 1, (ref, hits)
+    return hits[0]
+
+
+def _with_rows(
+    built: pv.BuiltDiff,
+    entry: pv._Entry,
+    rows: list[SinkOverlayRow],
+    views: list[dict[str, Any]],
+) -> pv.BuiltDiff:
+    """``built`` with ``entry`` holding ``rows`` (read as ``views``); every other entry as built."""
+    new = dataclasses.replace(entry, rows=rows, row_views=views)
+    return dataclasses.replace(built, placed=[new if e is entry else e for e in built.placed])
+
+
+def test_a_member_with_no_row_in_the_view_is_unreadable_no_row_in_view(world: World) -> None:
+    """A member the view holds no row for reads ``no_row_in_view`` — not a landing, and not the
+    other unreadable reason. The view is the real one without LISTED's entry; another member, still
+    placed, reads its own row, so the index is not simply empty.
+
+    MUTATION (verified RED, 1 failed): give every member with no single reading
+    ``several_rows_in_view`` -> LISTED reads several_rows_in_view."""
+    built, calls = _view_and_calls(world)
+    entry, _row, _view = _placed(built, LISTED)
+    without = dataclasses.replace(built, placed=[e for e in built.placed if e is not entry])
+    states = ss._states(without, "a", [calls[LISTED], calls[UNLISTED[1]]])
+    gone = states[LISTED]
+    assert gone.unreadable == ["no_row_in_view"]
+    assert (gone.entry, gone.row, gone.view) == (None, None, None)
+    kept = states[UNLISTED[1]]
+    assert kept.unreadable == []
+    assert kept.view is _placed(built, UNLISTED[1])[2]
+
+
+def test_a_member_whose_rows_sit_apart_or_land_apart_is_unreadable_several_rows(
+    world: World,
+) -> None:
+    """A call recorded twice has a row per record. They read as one only when they sit in one entry
+    AND land alike. Rows in two entries (landing alike or not), or landing differently in one
+    entry, leave the member ``several_rows_in_view`` — never read as its first row. Each view is the
+    real one with one real row (and its view) re-pointed at LISTED as its second record.
+
+    MUTATION (verified RED, 1 failed): read a member with any row as its first row
+    (``if hits:``) -> LISTED reads as its persisted row."""
+    built, calls = _view_and_calls(world)
+    listed_entry, listed_row, listed_view = _placed(built, LISTED)
+    r_entry, r_row, r_view = _placed(built, R_MEMBER)
+    u_entry, u_row, u_view = _placed(built, UNLISTED[1])
+    assert len(r_entry.rows) == len(u_entry.rows) == 1
+    assert len({listed_entry.entry_id, r_entry.entry_id, u_entry.entry_id}) == 3
+    assert [v["landing"] for v in (listed_view, r_view, u_view)] == ["persisted", "R", "persisted"]
+
+    def again(row: SinkOverlayRow, view: dict[str, Any]) -> tuple[SinkOverlayRow, dict[str, Any]]:
+        return dataclasses.replace(row, a_ref=LISTED), {**view, "a_ref": LISTED}
+
+    r2, r2_view = again(r_row, r_view)
+    u2, u2_view = again(u_row, u_view)
+    views = {
+        "two entries, landing apart": _with_rows(built, r_entry, [r2], [r2_view]),
+        "two entries, landing alike": _with_rows(built, u_entry, [u2], [u2_view]),
+        "one entry, landing apart": _with_rows(
+            built, listed_entry, [listed_row, r2], [listed_view, r2_view]
+        ),
+    }
+    for name, view in views.items():
+        assert len(ss._row_index(view, "a", {LISTED}).get(LISTED, [])) == 2, name
+        st = ss._states(view, "a", [calls[LISTED]])[LISTED]
+        assert st.unreadable == ["several_rows_in_view"], name
+        assert (st.entry, st.row, st.view) == (None, None, None), name
+
+
+def test_a_call_recorded_twice_in_one_entry_landing_alike_reads_as_one(world: World) -> None:
+    """The counterweight, on the view as built: UNLISTED[0] has two instance rows, so two rows in
+    one entry, landing alike. They read as one — its first row, readable.
+
+    MUTATION (verified RED, 5 failed): read a member only when it has exactly one row
+    (``len(hits) == 1``) -> UNLISTED[0] reads several_rows_in_view."""
+    built, calls = _view_and_calls(world)
+    hits = ss._row_index(built, "a", {UNLISTED[0]}).get(UNLISTED[0], [])
+    assert len(hits) == 2
+    assert len({e.entry_id for e, _r, _v in hits}) == 1
+    assert len({(v["landing"], v["subclass"]) for _e, _r, v in hits}) == 1
+    st = ss._states(built, "a", [calls[UNLISTED[0]]])[UNLISTED[0]]
+    assert st.unreadable == []
+    first_entry, first_row, first_view = hits[0]
+    assert st.entry is first_entry and st.row is first_row and st.view is first_view
+
+
 # ── what can make the group look smaller ─────────────────────────────────────────────────────
 
 
 def test_the_bounds_are_each_counted(world: World) -> None:
-    """T8: each of the bounds has its value.
+    """T8: each of the bounds has its value. A binary whose content is on the other side too reads
+    identical_both_sides even when a same-named binary was diffed (/fw/opt/libx) — the order
+    list_diff_blindspots decides it in, so one binary gets one reason in both.
 
-    MUTATION (verified RED): decide identical content before a diffed name -> /fw/opt/libx moves
-    from shadowed to identical. MUTATION (verified RED): leave the other side's names out ->
-    libold reads binary_not_diffed. MUTATION (verified RED): count binaries by path -> libonly,
-    one content at two paths, counts 2. MUTATION (verified RED): undetermined_alignment_n not
-    from by_landing.R -> 0."""
+    MUTATION (verified RED, 1 failed): decide a diffed name before identical content ->
+    /fw/opt/libx moves from identical to shadowed -> RED. MUTATION (verified RED): leave the other
+    side's names out -> libold reads binary_not_diffed. MUTATION (verified RED): count binaries
+    by path -> libonly, one content at two paths, counts 2. MUTATION (verified RED):
+    undetermined_alignment_n not from by_landing.R -> 0."""
     bounds = _group(world, LISTED)["sibling_set_bounds"]
     assert bounds["recall_gaps"] == {"families": ["wide_char_string"], "state": "read"}
     assert bounds["undetermined_alignment_n"] == 1
     assert bounds["binaries_not_diffed"] == {
-        "shadowed_by_name_collision": {"binaries": 2, "calls": 2},
-        "identical_both_sides": {"binaries": 1, "calls": 1},
+        "shadowed_by_name_collision": {"binaries": 1, "calls": 1},
+        "identical_both_sides": {"binaries": 2, "calls": 2},
         "other_side_same_name_not_diffed": {"binaries": 1, "calls": 1},
         "binary_not_diffed": {"binaries": 1, "calls": 2},
     }

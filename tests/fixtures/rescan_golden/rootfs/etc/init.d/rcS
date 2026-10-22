@@ -1,0 +1,5 @@
+#!/bin/sh
+# Synthetic start-up script for the rescan fixture firmware.
+mkdir -p /var/run
+/sbin/fixtured --config /etc/fixture.conf &
+echo "started" > /var/run/fixtured.state

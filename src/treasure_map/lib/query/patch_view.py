@@ -68,6 +68,7 @@ TWO SIGNALS SIMILARITY IS BLIND TO (lib/query/sameness), read on the function-pa
   sink argument or length variable. Reading one entry, each row also carries ``sink_axes``: what
   both sides' candidates recorded at hunt time (lib/query/diff_sink_axes). All of these are added
   to the rendered copies only — never to the build, an entry's row views or a judgement's basis.
+  Where a guard's B body is read is said once, in the envelope (``guards_read_with``).
   Reading pseudocode is the costly half, so it is computed in get_diff_patch_view (cached per
   diff + content + build), never in build_diff_view — annotate/promote and the progress block stay
   cheap. A pseudocode_delta is computed for the whole diff's anchored_differs pairs above the
@@ -273,12 +274,18 @@ _CAVEATS = {
     ),
     "guards": (
         "A syntax fact read line by line, coverage unjudged: where a comparison sits, whether it "
-        "lies on the way to a sink, dominates it or suffices is not read."
+        "lies on the way to a sink, dominates it or suffices is not read. renumbered_in_a: the A "
+        "body, its decompiler-numbered locals renamed one to one as the block match's "
+        "substitutions show (each pair seen at least twice), holds this comparison as often — "
+        "not that it is old, idle or safe; an unmarked guard is not proven new (a negated or "
+        "restructured comparison is not matched)."
     ),
     "guard_links": (
         "yes is a name match only. no = within a complete one-hop reading the name does not "
         "match: not unrelated, not protected. not_recorded_for_class = the class's records lack "
-        "the field, not 'checked, no match'."
+        "the field, not 'checked, no match'. A sink argument / length variable the B text does "
+        "not hold as a variable name (a type name read from a cast, digits of a hex constant, a "
+        "word of a string) links as unknown, never no."
     ),
     "sink_axes": (
         "What each candidate recorded at hunt time, as it is; often empty or constant in real "
@@ -302,7 +309,8 @@ _LEGEND = {
     ),
     "guard_scan": (
         "beside pseudocode_delta: the comparisons of a variable with a constant the B side's "
-        "structural change introduces (guards: up to 20, linked first, B order)"
+        "structural change introduces (guards: up to 20, linked first, B order). A count left "
+        "out is 0, a cast left out is none; the B body: guards_read_with"
     ),
     "guard_links": (
         "per shown guard: is its variable, by name, the row's B-side sink argument / length "
@@ -2860,9 +2868,20 @@ def _page_axes(
     return out
 
 
+def _guards_read_with(diff: _Diff) -> dict[str, Any]:
+    """Where a guard's B body is read, given once in the envelope: ``function`` names the field of
+    the entry (or not-listed pair) that carries the guards — its own ``addr_b``, which for an
+    undetermined pair is its proposed reading's B side."""
+    return {
+        "read_with": "get_pseudocode",
+        "run_id": diff.run_b,
+        "binary": diff.sha_b,
+        "function": "entry.addr_b",
+    }
+
+
 def _entry_guards(
     e: _Entry,
-    diff: _Diff,
     scan: dict[str, Any],
     rows: list[dict[str, Any]],
     axes_b: dict[str, tuple[diff_sink_axes.RowAxes, ...]],
@@ -2882,13 +2901,7 @@ def _entry_guards(
         )
         for v in rows
     ]
-    body_ref = {
-        "read_with": "get_pseudocode",
-        "run_id": diff.run_b,
-        "binary": diff.sha_b,
-        "function": p.addr_b,
-    }
-    return diff_sink_axes.entry_guards(scan, links, body_ref)
+    return diff_sink_axes.entry_guards(scan, links)
 
 
 def _rendered_rows(
@@ -3052,7 +3065,7 @@ def _not_listed_page(
             row["pseudocode_delta"] = delta
             # The guard scan follows its delta; these pairs carry no candidate row to link.
             scan = scans[(e.pair.addr_a, e.pair.addr_b)]
-            row.update(_entry_guards(e, built.diff, scan, [], {})[0])
+            row.update(_entry_guards(e, scan, [], {})[0])
         rows.append(row)
     return {
         "entries": rows,
@@ -3625,6 +3638,7 @@ def get_diff_patch_view(
             "unjudged, then changed_real, then no_real_change"
         )
     if not_listed_page is not None:
+        envelope["guards_read_with"] = _guards_read_with(built.diff)
         envelope.update(
             _not_listed_page(
                 built, readings, not_listed_page, limit=limit, offset=offset, body=body
@@ -3652,6 +3666,7 @@ def get_diff_patch_view(
             }
         )
         return envelope
+    envelope["guards_read_with"] = _guards_read_with(built.diff)
     proposed = {e.entry_id: r for e in chosen if (r := _proposed_of(e, readings)) is not None}
     lens: dict[str, tuple[int, str]] = {}
     settled: dict[str, int] = {}
@@ -3736,7 +3751,7 @@ def get_diff_patch_view(
         guard_fields: dict[str, Any] | None = None
         links: list[dict[str, Any] | None] | None = None
         if scan is not None:
-            guard_fields, links = _entry_guards(e, built.diff, scan, rows, page_axes["b"])
+            guard_fields, links = _entry_guards(e, scan, rows, page_axes["b"])
         pairing = "proposed" if p is not None and not p.aligned else None
         out["rows"] = _rendered_rows(rows, links, pairing, page_axes if one is not None else None)
         out.update(window)

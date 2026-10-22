@@ -398,3 +398,27 @@ def test_version_is_in_the_hunt_closure() -> None:
     """``version`` feeds the hunt's ``tool_version`` (the _version_skew comparison), so it must be
     hashed into the hunt stamp."""
     assert "version" in rv._closure(PKG, rv.HUNT_ROOT)
+
+
+# ── 9. a stored scan stamp that is JSON but not an object ──
+
+
+@pytest.mark.parametrize("stored", ["null", "[]", "123"])
+def test_a_stored_scan_stamp_that_is_not_a_json_object_reads_unknown(stored: str) -> None:
+    """A stored stamp corrupted out of band into valid JSON that is not an object (``null``, a
+    list, a number) has no leaves to compare: it reads as one ``unknown`` of ``"scan stamp"`` and
+    never raises — the run-staleness check behind the stale-scan refusal, and the rescan
+    classifier, would otherwise crash on that one run.
+
+    MUTATION (verified RED, 3 failed): drop the ``isinstance(parsed, dict)`` check -> each of the
+    three raises AttributeError, caught here and failed as an assertion."""
+    current = rv.scan_stamp_for(Config())
+    try:
+        got = rv.compare_scan_stamps(stored, current)
+    except Exception as exc:  # noqa: BLE001 — the point: a corrupt stamp must not crash a gate
+        raised: Exception | None = exc
+        got = None
+    else:
+        raised = None
+    assert raised is None, f"stored stamp {stored!r} raised {raised!r}"
+    assert got == rv.StampCompare((), ("scan stamp",))

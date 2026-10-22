@@ -69,10 +69,10 @@ def world(tmp_path: Path, current: None) -> World:
 # ── helpers ──────────────────────────────────────────────────────────────────────────────────
 
 
-def _group_ref(w: World, ref: str) -> str:
+def _group_ref(w: World, ref: str, diff_id: str = DIFF) -> str:
     out = ss.same_shape_siblings(
         w.atlas,
-        DIFF,
+        diff_id,
         evidence_ref=ref,
         build_hash=w.build,
         current=_CURRENT,
@@ -82,18 +82,24 @@ def _group_ref(w: World, ref: str) -> str:
     return str(out["group_ref"])
 
 
-def _entry_anchor(w: World, needle: str) -> str:
+def _entry_anchor(w: World, needle: str, diff_id: str = DIFF) -> str:
     """The anchor_ref of the one listed entry whose anchor names ``needle`` (an address)."""
-    view = pv.get_diff_patch_view(w.atlas, DIFF, limit=200)
+    view = pv.get_diff_patch_view(w.atlas, diff_id, limit=200)
     hits = [e["anchor_ref"] for e in view["entries"] if needle in e["anchor_ref"]]
     assert len(hits) == 1, (needle, hits)
     return hits[0]
 
 
-def _annotate(w: World, anchor: str, group_ref: str | None, verdict: str = "changed_real") -> Any:
+def _annotate(
+    w: World,
+    anchor: str,
+    group_ref: str | None,
+    verdict: str = "changed_real",
+    diff_id: str = DIFF,
+) -> Any:
     return overlay.annotate_diff(
         w.atlas,
-        diff_id=DIFF,
+        diff_id=diff_id,
         anchor_ref=anchor,
         verdict=verdict,
         rationale="x: the other calls of this shape did not change; next: re-read if they move",
@@ -101,13 +107,115 @@ def _annotate(w: World, anchor: str, group_ref: str | None, verdict: str = "chan
     )
 
 
-def _state_in_view(w: World, anchor: str) -> str:
-    pv._clear_view_caches()
-    view = pv.get_diff_patch_view(w.atlas, DIFF, limit=200)
+def _refusal(w: World, anchor: str, group_ref: str) -> str:
+    """The message a judgement leaning on ``group_ref`` is refused with — a ConfigError, never
+    another exception and never an accepted write — after checking that nothing was written."""
+    try:
+        _annotate(w, anchor, group_ref)
+    except Exception as exc:  # noqa: BLE001 — a refusal is a ConfigError; anything else is a bug
+        assert isinstance(exc, ConfigError), f"{group_ref!r} raised {exc!r}, not a refusal"
+        message = str(exc)
+    else:
+        raise AssertionError(f"a judgement leaning on {group_ref!r} was accepted")
+    written = w.atlas.execute(
+        "SELECT COUNT(*) FROM overlay WHERE anchor_ref = ?", (anchor,)
+    ).fetchone()[0]
+    assert written == 0
+    return message
+
+
+# libx's group shape: strcpy / source_len, of the fixture's ``fp_copy`` pattern.
+_SRC = json.dumps({"size_kind": "source_len"})
+_STRCPY_KEY = ss.f2_key("fp_copy", "strcpy", "source_len")
+
+# A second binary of the same two runs, with its own diff (see _second_diff).
+DIFF2 = "runA::runB::liby"
+_SHA_Y = {"a": "5" * 64, "b": "6" * 64}
+
+
+def _second_diff(w: World) -> list[str]:
+    """A second diff of runA / runB, of another binary (liby), whose side A holds two calls of
+    libx's group shape — the same f2_key, other calls: one in a changed pair (listed), one in an
+    identical pair. Returns the two A refs."""
+    w.atlas.execute(
+        "INSERT INTO diff_meta (diff_id, run_a_id, run_b_id, binary_a, binary_b, sha256_a, "
+        "sha256_b, diff_ok, version_skew, callsite_facts_a, callsite_facts_b, "
+        "callsite_facts_hash_a, callsite_facts_hash_b, stub_state_a, stub_state_b) "
+        "VALUES (?, 'runA', 'runB', 'liby', 'liby', ?, ?, 1, 0, 'read', 'read', ?, ?, "
+        "'not_applicable', 'not_applicable')",
+        (DIFF2, _SHA_Y["a"], _SHA_Y["b"], w.build, w.build),
+    )
+    binary_id = {
+        side: w.adb[side]
+        .execute("INSERT INTO binaries (name, sha256) VALUES ('liby', ?)", (_SHA_Y[side],))
+        .lastrowid
+        for side in ("a", "b")
+    }
+    refs = []
+    for fa, fb, sim in (("00041000", "00042000", 0.8), ("00043000", "00044000", 1.0)):
+        w.atlas.execute(
+            "INSERT INTO function_alignment (diff_id, addr_a, addr_b, alignment_confidence, "
+            "similarity, alignment_state) VALUES (?, ?, ?, 0.97, ?, 'aligned')",
+            (DIFF2, fa, fb, sim),
+        )
+        w.atlas.execute(
+            "INSERT INTO instruction_match (diff_id, func_addr_a, addr_a, addr_b) "
+            "VALUES (?, ?, ?, ?)",
+            (DIFF2, fa, f"{int(fa, 16) + 0x10:08x}", f"{int(fb, 16) + 0x10:08x}"),
+        )
+        for side, run, addr in (("a", "runA", fa), ("b", "runB", fb)):
+            sha = _SHA_Y[side]
+            ref = _ref(run, addr, "copy", "0x10", sha[:8])
+            w.inst(run, ref, "copy", "strcpy", _SRC, sha=sha, path="/fw/lib/liby")
+            w.adb[side].execute(
+                "INSERT INTO functions (binary_id, name, address, callees, callees_truncated, "
+                "unresolved_external_calls) VALUES (?, ?, ?, '[\"strcpy\"]', 0, '[]')",
+                (binary_id[side], f"fn_{addr}", addr),
+            )
+            if side == "a":
+                refs.append(ref)
+    w.commit()
+    return refs
+
+
+def _rescan_strcpy_calls(w: World, *, fingerprint: str, fingerprint_version: str) -> None:
+    """A re-scan of runA: its strcpy instances of the ``fp_copy`` pattern are deleted and
+    re-inserted (fresh ids) against a pattern with this structural fingerprint and version."""
+    rows = w.atlas.execute(
+        "SELECT i.instance_id, i.evidence_ref, i.binary_content_hash, i.binary_path, "
+        "i.sink_anchor, i.flow_evidence FROM instance i JOIN pattern p "
+        "ON i.pattern_id = p.pattern_id WHERE i.source_run_id = 'runA' "
+        "AND i.sink_anchor = 'strcpy' AND p.structural_fingerprint = 'fp_copy'"
+    ).fetchall()
+    assert rows
+    pattern = w.atlas.execute(
+        "INSERT INTO pattern (source_class, sink_class, call_sequence_shape, "
+        "structural_fingerprint, fingerprint_algo_version) VALUES "
+        "('external_input', 'copy', ?, ?, ?)",
+        (f"shape_{fingerprint}_{fingerprint_version}", fingerprint, fingerprint_version),
+    ).lastrowid
+    for iid, ref, sha, path, sink, flow in rows:
+        w.atlas.execute("DELETE FROM instance WHERE instance_id = ?", (iid,))
+        w.atlas.execute(
+            "INSERT INTO instance (pattern_id, evidence_ref, source_run_id, binary_content_hash, "
+            "binary_path, sink_anchor, flow_evidence) VALUES (?, ?, 'runA', ?, ?, ?, ?)",
+            (pattern, ref, sha, path, sink, flow),
+        )
+    w.commit()
+
+
+def _review_state(w: World, anchor: str, diff_id: str = DIFF) -> str:
+    """The entry's review_state, read through get_diff_patch_view with the caches as they are."""
+    view = pv.get_diff_patch_view(w.atlas, diff_id, limit=200)
     for e in view["entries"]:
         if e["anchor_ref"] == anchor:
             return str(e["review_state"])
     raise AssertionError(f"{anchor!r} not listed")
+
+
+def _state_in_view(w: World, anchor: str) -> str:
+    pv._clear_view_caches()
+    return _review_state(w, anchor)
 
 
 def _overlay(w: World, anchor: str) -> dict[str, Any]:
@@ -244,11 +352,80 @@ def test_a_fingerprint_version_bump_rechecks_the_whole_group(world: World) -> No
 
 
 def test_a_group_about_another_entry_is_refused_with_the_entrys_own_groups(world: World) -> None:
+    """A well-formed, current group_ref about some other entry is refused, and the refusal lists
+    the groups the judged subject does belong to on that side — here the one strcpy shape of the
+    entry's A call, by f2_key and group_ref — and not the group that was passed.
+
+    MUTATION (verified RED, 1 failed): drop the relation check -> the cmd group is accepted.
+    MUTATION (verified RED, 1 failed): list no groups in the refusal (``none``) -> the strcpy
+    f2_key is not in it."""
     anchor = _entry_anchor(world, "00001000")  # a strcpy pair; holds no system call
     cmd_group = _group_ref(world, SYSTEM_FREE[0])  # a system / cmd group
-    with pytest.raises(ConfigError) as exc:
-        _annotate(world, anchor, cmd_group)
-    assert "not about this entry" in str(exc.value)
+    message = _refusal(world, anchor, cmd_group)
+    assert "not about this entry" in message
+    _head, sep, listing = message.partition("The shapes it does have on this side: ")
+    assert sep, message
+    assert _STRCPY_KEY in listing
+    assert _group_ref(world, LISTED) in listing
+    cmd_key = gf._f2_from_ref(cmd_group)
+    assert cmd_key is not None and cmd_key not in listing
+
+
+def test_a_group_ref_of_another_diff_is_refused(world: World) -> None:
+    """A group_ref read on another diff of the same runs — even one of the same shape key, whose
+    f2_key this diff also has a group of — is refused, naming the diff it is of.
+
+    MUTATION (verified RED, 1 failed): skip the diff_id check -> the other diff's ref is accepted
+    (this diff's group of the same key holds the entry's call)."""
+    liby = _second_diff(world)
+    other = _group_ref(world, liby[0], DIFF2)
+    assert gf._f2_from_ref(other) == _STRCPY_KEY
+    message = _refusal(world, _entry_anchor(world, "00001000"), other)
+    assert f"group_ref names diff {DIFF2!r}, but this judgement is on {DIFF!r}" in message
+
+
+def test_a_group_ref_of_another_recipe_version_is_refused(world: World) -> None:
+    """A group_ref grouped by another recipe version (an older build's) is refused, naming the
+    recipe it is of and the one this build groups by.
+
+    MUTATION (verified RED, 1 failed): skip the recipe check -> it is accepted."""
+    gref = _group_ref(world, LISTED)
+    assert gref.endswith(f"/{ss.F2_RECIPE_VERSION}")
+    older = gref.rsplit("/", 1)[0] + "/f2-v0"
+    message = _refusal(world, _entry_anchor(world, "00001000"), older)
+    assert f"group_ref is of recipe 'f2-v0', but this build groups by {ss.F2_RECIPE_VERSION!r}" in (
+        message
+    )
+
+
+def test_a_group_ref_of_another_fingerprint_version_is_refused(world: World) -> None:
+    """A group_ref read before a re-scan moved the shape's fingerprint version on (same structural
+    fingerprint, so the same f2_key) is refused, naming both versions.
+
+    MUTATION (verified RED, 1 failed): skip the fingerprint-version check -> the old ref is
+    accepted."""
+    gref = _group_ref(world, LISTED)
+    assert "@fpv-test/" in gref
+    _rescan_strcpy_calls(world, fingerprint="fp_copy", fingerprint_version="fpv-test-2")
+    assert gf._f2_from_ref(_group_ref(world, LISTED)) == _STRCPY_KEY  # the shape key is unmoved
+    message = _refusal(world, _entry_anchor(world, "00001000"), gref)
+    assert (
+        "group_ref is of fingerprint version 'fpv-test', but this build records 'fpv-test-2'"
+        in message
+    )
+
+
+def test_a_group_ref_of_a_shape_that_is_no_group_now_is_refused(world: World) -> None:
+    """A group_ref read before a re-scan gave its calls another structural fingerprint names a
+    shape that is no group now: refused as such, naming the shape and side — never a crash.
+
+    MUTATION (verified RED, 1 failed): skip the absent-shape check -> a TypeError, not a refusal
+    (asserted as such)."""
+    gref = _group_ref(world, LISTED)
+    _rescan_strcpy_calls(world, fingerprint="fp_copy_b", fingerprint_version="fpv-test")
+    assert gf._f2_from_ref(_group_ref(world, LISTED)) != _STRCPY_KEY  # the old shape is retired
+    message = _refusal(world, _entry_anchor(world, "00001000"), gref)
+    assert f"shape {_STRCPY_KEY!r} is no group on side 'a' of diff {DIFF!r} now" in message
 
 
 def test_a_function_level_candidates_own_shape_is_accepted_as_same_shape(world: World) -> None:
@@ -384,49 +561,98 @@ def test_an_unreadable_members_fact_carries_the_reason_so_two_reasons_differ() -
     assert hashed(fa) != hashed(fb)  # the reason is in the hash, not dropped
 
 
-def test_a_wep_shaped_group_pins_its_member_facts_and_summary() -> None:
-    """A four-member group like the real WEP one — one changed/undetermined member, three persisted
-    similarity-1 members — pins the canonical member facts and the summary over them, so a drift in
-    the serialization is caught."""
-    members = {
-        "r_member": {
-            "landing": "R",
-            "subclass": "alignment_low_confidence",
-            "listed": True,
-            "similarity": 0.5466,
-            "unreadable": None,
+# A four-member copy group on side A of a fresh diff: one call in a pair whose alignment could not
+# be determined (R, listed, similarity 0.625), three in identical aligned pairs (persisted, not
+# listed, similarity 1). The similarity is a binary-exact fraction, so its JSON is one string.
+_PIN_R = _ref("runA", "00001000", "copy", "0x10")
+_PIN_PERSISTED = [_ref("runA", f, "copy", "0x10") for f in ("00003000", "00005000", "00007000")]
+
+
+def _four_member_copy_group(tmp_path: Path) -> World:
+    w = World(tmp_path)
+    w.pair("00001000", "00002000", 0.5, 0.625)
+    w.inst("runA", _PIN_R, "copy", "strcpy", _SRC)
+    for fa, fb in (("00003000", "00004000"), ("00005000", "00006000"), ("00007000", "00008000")):
+        w.lined(fa, fb, 1.0)
+    w.commit()
+    return w
+
+
+def test_a_four_member_copy_group_pins_its_member_facts_and_summary(
+    tmp_path: Path, current: None
+) -> None:
+    """The stored snapshot of a four-member group, pinned whole as written by _member_fact and
+    _current / group_snapshot, with every hash a literal. Every snapshot stored before an upgrade is
+    compared against this serialisation: if it drifts, every judgement with a group reads
+    needs_recheck at once. A deliberate change re-pins these values — and makes that mass recheck.
+
+    MUTATION (verified RED, 1 failed): serialise a member's facts with compact separators -> its
+    hashes and the summary differ. MUTATION (verified RED, 1 failed): add one character to the
+    summary's basis (the member count) -> the summary differs. MUTATION (verified RED, 1 failed):
+    count not_listed_sim1 one high -> the counts and the summary differ."""
+    w = _four_member_copy_group(tmp_path)
+    built = pv.build_diff_view(w.atlas, DIFF)
+    assert built is not None
+    members = ss._groups(ss._calls(w.atlas, "runA", "a" * 64)).get(_STRCPY_KEY, [])
+    assert [m.ref for m in members] == [_PIN_R, *_PIN_PERSISTED]
+    states = ss._states(built, "a", members)
+    r_fact = {
+        "landing": "R",
+        "subclass": "alignment_low_confidence",
+        "listed": True,
+        "similarity": 0.625,
+        "unreadable": None,
+    }
+    persisted_fact = {
+        "landing": "persisted",
+        "subclass": None,
+        "listed": False,
+        "similarity": 1.0,
+        "unreadable": None,
+    }
+    assert gf._member_fact(states[_PIN_R]) == r_fact
+    for ref in _PIN_PERSISTED:
+        assert gf._member_fact(states[ref]) == persisted_fact
+
+    # Each member's hash is over its facts' canonical JSON (sort_keys, default separators), e.g.
+    # {"landing": "R", "listed": true, "similarity": 0.625, "subclass": "alignment_low_confidence",
+    # "unreadable": null}; keyed by its evidence_ref's hash. The summary is over
+    # "4|<counts JSON>|<member hashes JSON>". Recomputed by hand from those strings, not read back.
+    pinned = {
+        "group_ref": "runA::runB::libx#f2:f2acad237b9de471:a@fpv-test/f2-v1",
+        "side": "a",
+        "shape": {
+            "structural_fingerprint": "fp_copy",
+            "sink_anchor": "strcpy",
+            "kind": "source_len",
         },
+        "member_count": 4,
+        "counts": {
+            "by_landing": {"R": {"alignment_low_confidence": 1}, "persisted": {"-": 3}},
+            "not_listed_sim1": 3,
+            "similarity_below_1": 1,
+            "states_unreadable": {},
+        },
+        "members": {
+            "de08deba25a5": "2190d06a1fe5",  # _PIN_R: the R fact
+            "6d36717c5621": "8642b32bf678",  # _PIN_PERSISTED[0]: the persisted fact
+            "b60be1dc32f9": "8642b32bf678",  # _PIN_PERSISTED[1]
+            "bb37ce115d43": "8642b32bf678",  # _PIN_PERSISTED[2]
+        },
+        "summary": "e6ea96799dca",
     }
-    for i in range(3):
-        members[f"persisted_{i}"] = {
-            "landing": "persisted",
-            "subclass": None,
-            "listed": False,
-            "similarity": 1.0,
-            "unreadable": None,
-        }
-    member_hashes = {
-        hashlib.sha256(ref.encode()).hexdigest()[:12]: hashlib.sha256(
-            json.dumps(fact, sort_keys=True).encode()
-        ).hexdigest()[:12]
-        for ref, fact in members.items()
+    current_ = gf._current(w.atlas, built, "a", _STRCPY_KEY, {})
+    assert current_ is not None
+    snap, by_hash = current_
+    assert snap == pinned
+    assert {h: ref for h, (ref, _fact) in by_hash.items()} == {
+        "de08deba25a5": _PIN_R,
+        "6d36717c5621": _PIN_PERSISTED[0],
+        "b60be1dc32f9": _PIN_PERSISTED[1],
+        "bb37ce115d43": _PIN_PERSISTED[2],
     }
-    counts = {
-        "by_landing": {"R": {"alignment_low_confidence": 1}, "persisted": {"-": 3}},
-        "not_listed_sim1": 3,
-        "similarity_below_1": 1,
-        "states_unreadable": {},
-    }
-    summary = hashlib.sha256(
-        "|".join(
-            ("4", json.dumps(counts, sort_keys=True), json.dumps(member_hashes, sort_keys=True))
-        ).encode()
-    ).hexdigest()[:12]
-    # The contract the implementation must keep: the fact string is the five keys, sorted; the
-    # summary is count | counts | member hashes. Recompute here exactly as the module does.
-    for fact in members.values():
-        assert set(fact) == {"landing", "subclass", "listed", "similarity", "unreadable"}
-    assert len(summary) == 12
+    assert gf.group_snapshot(w.atlas, built, "a", _STRCPY_KEY) == pinned
+    assert gf.group_moved(w.atlas, built, pinned, {}) is None  # the pinned snapshot reads unmoved
 
 
 # ── S5 refactor: the group object's counts ARE _group_counts (no drift between the two) ───────
@@ -490,6 +716,43 @@ def test_the_call_cache_is_keyed_by_the_atlas_so_two_atlases_never_share(tmp_pat
     cb = gf._calls_cached(b.atlas, "runA", "a" * 64)
     assert len(ca) == len(cb) == 1
     assert ca[0].ref != cb[0].ref  # b read its own row, not a's from the cache
+
+
+def test_two_binaries_of_one_run_each_read_their_own_call_list(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The call-list cache is keyed by the binary's content hash too. Two diffs share runA, and on
+    side A each binary has a group of the SAME shape key (strcpy / source_len) holding other calls.
+    Each judgement is written by a process of its own; then one process reads both views, one after
+    the other: both judgements read concluded, and each binary's call list is read once.
+
+    MUTATION (verified RED, 1 failed): leave the content hash out of the cache key -> the second
+    diff is served the first binary's call list and reads needs_recheck."""
+    liby = _second_diff(world)
+    anchors: dict[str, str] = {}
+    for diff_id, needle, ref in ((DIFF, "00001000", LISTED), (DIFF2, "00041000", liby[0])):
+        pv._clear_view_caches()  # a process of its own
+        gref = _group_ref(world, ref, diff_id)
+        assert gf._f2_from_ref(gref) == _STRCPY_KEY
+        anchors[diff_id] = _entry_anchor(world, needle, diff_id)
+        _annotate(world, anchors[diff_id], gref, diff_id=diff_id)
+    libx_members = _stored_group(world, anchors[DIFF])["members"]
+    liby_members = _stored_group(world, anchors[DIFF2])["members"]
+    assert (len(libx_members), len(liby_members)) == (len(GROUP_A), 2)
+    assert set(libx_members).isdisjoint(liby_members)  # one shape key, other calls
+
+    pv._clear_view_caches()
+    read: list[tuple[str, str]] = []
+    real = ss._calls
+
+    def counting(atlas: Any, run_id: str, sha: str) -> Any:
+        read.append((run_id, sha))
+        return real(atlas, run_id, sha)
+
+    monkeypatch.setattr(ss, "_calls", counting)
+    states = [_review_state(world, anchors[d], d) for d in (DIFF, DIFF2)]  # one process
+    assert states == ["concluded", "concluded"]
+    assert sorted(read) == [("runA", _SHA_Y["a"]), ("runA", "a" * 64)]
 
 
 def test_the_call_cache_is_dropped_when_the_runs_instances_change(world: World) -> None:

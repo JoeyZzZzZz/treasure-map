@@ -1,0 +1,93 @@
+{
+  "functions": [
+    {
+      "name": "main",
+      "address": "00101169",
+      "size": 73,
+      "is_exported": 0,
+      "callees": ["strcmp", "puts", "diag_ping", "copy_label", "report_status"],
+      "pseudocode": "int main(int param_1,long param_2)\n\n{\n  int iVar1;\n  \n  if ((1 < param_1) && (iVar1 = strcmp(*(char **)(param_2 + 8),\"--version\"), iVar1 == 0)) {\n    puts(\"fixture 1.0\");\n    return 0;\n  }\n  if (2 < param_1) {\n    copy_label(*(char **)(param_2 + 0x10));\n    report_status(*(char **)(param_2 + 8),param_1);\n    return 1;\n  }\n  diag_ping();\n  return 0;\n}\n"
+    },
+    {
+      "name": "diag_ping",
+      "address": "001011c0",
+      "size": 112,
+      "is_exported": 0,
+      "callees": ["getenv", "sprintf", "system"],
+      "pseudocode": "void diag_ping(void)\n\n{\n  char *pcVar1;\n  char local_88 [128];\n  \n  pcVar1 = getenv(\"QUERY_STRING\");\n  if (pcVar1 != (char *)0x0) {\n    sprintf(local_88,\"ping -c 1 %s\",pcVar1);\n    system(local_88);\n  }\n  return;\n}\n",
+      "sink_provenance": [
+        {
+          "sink_idx": 0,
+          "sink": "system",
+          "sink_addr": "0x00101220",
+          "arg_idx": 0,
+          "provenance": {
+            "kind": "stack_buf",
+            "stack_key": "frame[136]+0x0",
+            "writer_count": 1,
+            "nearest_dominating_writer": "sprintf@0x00101208",
+            "writers": [
+              {
+                "writer": "sprintf@0x00101208",
+                "dominates_sink": true,
+                "fmt": "ping -c 1 %s",
+                "varargs": [
+                  {
+                    "pos": 2,
+                    "spec": "%s",
+                    "source": {"kind": "call_return", "callee": "getenv", "const_args": ["QUERY_STRING"]}
+                  }
+                ]
+              }
+            ],
+            "attribution": "chk_dominance"
+          }
+        }
+      ]
+    },
+    {
+      "name": "copy_label",
+      "address": "00101230",
+      "size": 64,
+      "is_exported": 0,
+      "callees": ["strcpy", "puts"],
+      "pseudocode": "void copy_label(char *param_1)\n\n{\n  char local_48 [64];\n  \n  strcpy(local_48,param_1);\n  puts(local_48);\n  return;\n}\n"
+    },
+    {
+      "name": "report_status",
+      "address": "00101270",
+      "size": 96,
+      "is_exported": 0,
+      "callees": ["fx_checksum", "sprintf", "puts"],
+      "pseudocode": "void report_status(char *param_1,int param_2)\n\n{\n  ulong uVar1;\n  char local_58 [72];\n  \n  uVar1 = fx_checksum((long)param_2,param_1,8);\n  sprintf(local_58,\"%s:%lu\",param_1,uVar1);\n  puts(local_58);\n  return;\n}\n"
+    },
+    {
+      "name": "FUN_00101000",
+      "address": "00101000",
+      "size": 27,
+      "is_exported": 0,
+      "callees": [],
+      "pseudocode": ""
+    }
+  ],
+  "imports": [
+    {"func_name": "strcmp", "lib_name": "libc.so.6"},
+    {"func_name": "puts", "lib_name": "libc.so.6"},
+    {"func_name": "getenv", "lib_name": "libc.so.6"},
+    {"func_name": "sprintf", "lib_name": "libc.so.6"},
+    {"func_name": "system", "lib_name": "libc.so.6"},
+    {"func_name": "strcpy", "lib_name": "libc.so.6"},
+    {"func_name": "fx_checksum", "lib_name": "libfixture.so"}
+  ],
+  "exports": [],
+  "strings": [
+    {"value": "--version", "address": "00102004"},
+    {"value": "fixture 1.0", "address": "0010200e"},
+    {"value": "QUERY_STRING", "address": "0010201a"},
+    {"value": "ping -c 1 %s", "address": "00102027"},
+    {"value": "%s:%lu", "address": "00102034"},
+    {"value": "/var/run/fixtured.sock", "address": "0010203b"}
+  ],
+  "strings_total": 6,
+  "strings_truncated": false
+}
