@@ -1916,11 +1916,12 @@ def make_tools(
         blocks. ``read_next``: the call that reads one entry in full (``one_entry``) and, when the
         summary has more entries, the call for the next page (``more``).
 
-        The response keeps to the same byte budget (~48KB): the view page is cut as
-        get_diff_patch_view cuts it, then the headline's inline_hunk is withheld (``page_budget``)
-        when the headline does not fit beside the rest; ``over_budget: true`` when it still does
-        not fit. A diff whose A or B side is a proven-stale scan is refused, as on every diff
-        tool."""
+        The response aims at the byte budget (~48KB): the view page is cut as get_diff_patch_view
+        cuts it, then the headline's inline_hunk is withheld (``page_budget``) when the headline
+        does not fit beside the rest. A large ``limit`` can still carry a ``view`` page that fills
+        the budget on its own, so the whole response may not fit — then it carries
+        ``over_budget: true`` (at the default ``limit`` it fits). A diff whose A or B side is a
+        proven-stale scan is refused, as on every diff tool."""
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
             return {
                 "diff_id": diff_id,

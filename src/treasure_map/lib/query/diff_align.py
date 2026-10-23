@@ -708,7 +708,7 @@ _LIST_DIFFS_NOTE = (
     "with the binaries byte-identical in both runs kept apart (no diff needed; their candidates "
     "are on the scan map). baseline_dropped=1 = the diff had a stored candidate "
     "baseline that a re-diff dropped (it failed, or the baseline could not be stored again). Pick "
-    "a binary, then start with get_diff_patch_view (get_diff_meta for the meta and the "
+    "a binary, then start with start_diff_review (get_diff_meta for the meta and the "
     "per-function split). "
     "★ source_stale says whether the diff still describes what it was computed from: true = a "
     "side's binary content changed or is gone (source_content_changed / source_binary_absent), "

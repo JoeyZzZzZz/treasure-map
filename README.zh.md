@@ -53,7 +53,7 @@ tmap diff --before fw-v1 --after fw-v2
 
 ```text
 Review the diff fw-v1 → fw-v2 using treasure-map.
-Start from the function patch view (get_diff_patch_view):
+Start from start_diff_review:
 for each changed function, compare the pseudocode of both versions
 and decide whether the change does something real, such as a new check or a changed bound.
 Record each judgement with annotate_diff.

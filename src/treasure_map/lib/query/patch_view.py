@@ -3451,7 +3451,7 @@ _ORDER_SIGNIFICANCE = (
 )
 # lens.band (band on, first page): the groups the page's order forms.
 _BAND_CANDIDATE_TIER = (
-    "on: inside each group the default order holds together (segment, tier, lane, "
+    "on: inside each group the candidate_tier order holds together (segment, tier, lane, "
     "subclass rank), entries due a re-check first, then change_inconclusive, then "
     "unjudged, then changed_real, then no_real_change"
 )
