@@ -366,3 +366,32 @@ def test_thin_cmd_wrapper_finds_a_stub_rendered_sink_call_with_the_stub_table() 
     )
     # a stub that resolves to something else is not the sink
     assert is_thin_cmd_wrapper(pc, ["system"], stub_names={0x412000: "memcpy"}) == (False, None)
+
+
+# ── R7: two gates on recognising a thin FORMAT-STRING wrapper ─────────────────────────────────
+
+
+def _fmt_wrap(body: str, callees: list[str]) -> bool:
+    return is_thin_fmt_wrapper(f"void f(char *param_1,char *param_2)\n{{\n  {body}\n}}", callees)[0]
+
+
+def test_a_nonchar_pointer_cast_is_not_a_forwarded_format() -> None:
+    """R7 gate 1: a format argument cast to a pointer to a non-character type is a different
+    object, not a forwarded format string.
+
+    MUTATION (verified RED): drop the cast gate -> the ``(Cls *)`` forward is read as a wrapper."""
+    assert _fmt_wrap("vprintf((Cls *)param_1,param_2);", ["vprintf"]) is False
+    assert _fmt_wrap("vprintf((char *)param_1,param_2);", ["vprintf"]) is True  # char* is fine
+
+
+def test_a_definite_arg_call_with_too_many_args_is_not_that_sink() -> None:
+    """R7 gate 2: a v* definite-argument call with MORE top-level arguments than its fixed count is
+    a same-named other function (a C++ method's ``this``), not the sink. FEWER never rejects (the
+    decompiler drops the va_list).
+
+    MUTATION (verified RED): reject on ``!=`` instead of ``>`` -> the dropped-va_list forwards
+    below stop being recognised."""
+    assert _fmt_wrap("vprintf(param_1,2,a,&v);", ["vprintf"]) is False  # 4 > 2
+    assert _fmt_wrap("vasprintf(&p,param_1);", ["vasprintf"]) is True  # 2 < 3, kept
+    assert _fmt_wrap("verr(param_1,param_2);", ["verr"]) is True  # 2 < 3, kept
+    assert _fmt_wrap("vprintf(param_1,param_2);", ["vprintf"]) is True  # exactly 2

@@ -30,7 +30,7 @@ import re
 import sqlite3
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from treasure_map.lib.hunt.downweight import (
     _CHARSET_COPY_EXTRA,
@@ -41,15 +41,17 @@ from treasure_map.lib.pattern.classes import (
     FMT_STRING_ARG,
     FORMAT_ARG,
     SOURCE,
+    ArgRef,
     all_format_calls_literal,
     call_args_at,
     call_offsets,
-    format_string_ident,
+    format_string_ref,
 )
 from treasure_map.lib.reachability.copy_size import (
     SIZE_CONST,
     SIZE_SIZEOF,
     SIZE_UNTRACED,
+    CopySize,
     classify_copy_size,
     classify_format_size,
     objsize_fact,
@@ -156,11 +158,21 @@ def _sanitizer_seen(callees: list[str], pseudocode: str, path: set[str]) -> list
     return seen
 
 
+# Forms whose value is read through memory this function's text does not show the writer of.
+_LOADED_FORMS = frozenset({"load", "const_addr"})
+
+
 def _trace_boundary(
-    pseudocode: str, sink_arg: str | None, source_kind: str, deps: dict[str, set[str]]
+    pseudocode: str,
+    sink_arg: str | None,
+    source_kind: str,
+    deps: dict[str, set[str]],
+    ref: ArgRef | None = None,
+    located: bool = True,
 ) -> str:
     """Honest statement of where the structured trace stops and why.
 
+    sink_arg_unlocated — the sink call or its argument could not be located in the text.
     reached_sink      — the source was resolved to the bottom WITHIN this function (an inline
                         charset converter, an inline free source, or a literal).
     charset_via_intermediate_untraced — a charset-safe converter is in the function but the value
@@ -173,12 +185,23 @@ def _trace_boundary(
     ipc_global        — a global / shared-state / un-threaded value is present.
     copy_alias_untraced — a bounded copy the dependency graph does not track moved a value, so the
                         structured flow chain may be incomplete.
+    loaded_through_pointer — the argument is read through a pointer, an index or a field (or is a
+                        number cast to a pointer): what was stored there is not in this read.
+    sink_arg_unparsed — there is an argument, but no variable could be read out of it.
+
+    ``ref`` is the argument as ``classes.arg_ref`` read it (its form and lead); ``located`` False
+    when there was no argument to read. Without a ``ref`` the argument is taken as the variable
+    ``sink_arg`` names, or as a literal when there is none (the reading before forms existed).
 
     Honest by design — it NEVER claims `reached_sink` when a converter was seen but the value ran
     through an intermediate variable (that would pretend not to have seen the converter). A
     present-but-maybe-unrelated indirect call / global / untracked copy is reported as a boundary
     rather than silently claiming a clean resolution."""
-    if sink_arg is None:
+    if not located:
+        return "sink_arg_unlocated"
+    if ref is None:
+        ref = ArgRef("var", sink_arg, lead="var") if sink_arg is not None else ArgRef("literal")
+    if ref.form == "literal":
         return "reached_sink"
     if source_kind == "charset_maybe":
         return "charset_via_intermediate_untraced"
@@ -190,6 +213,10 @@ def _trace_boundary(
         # A bounded copy the global dependency graph does not track moved a value; the structured
         # chain may be shorter than reality, so flag the alias rather than overclaim resolution.
         return "copy_alias_untraced"
+    if ref.form in _LOADED_FORMS or ref.lead == "load":
+        return "loaded_through_pointer"
+    if ref.form == "none" or sink_arg is None:
+        return "sink_arg_unparsed"
     if source_kind in ("charset_safe", "free_string"):
         return "reached_sink"  # the source was resolved within the intra-procedural read
     depth = _chain_depth(deps, sink_arg)
@@ -226,6 +253,7 @@ def build_flow_evidence(
     sink_arg: str | None,
     entry_sites: list[dict[str, Any]] | None,
     wrapper: dict[str, Any] | None = None,
+    sink_ref: ArgRef | None | Literal["unset"] = "unset",
 ) -> dict[str, Any]:
     """Assemble the five-field flow evidence for one command-sink candidate (JSON-serializable).
 
@@ -237,18 +265,35 @@ def build_flow_evidence(
     inside a thin wrapper): it carries the wrapper's name + wrapped_sink, and here ``sink_arg`` is
     the argument the function forwards to that wrapper. When set, flow_path marks the wrapper hop
     and trace_boundary states `reached_sink_via_one_hop_wrapper` — honest about following exactly
-    one hop. ``source_kind`` still classifies the forwarded argument (the dangerous value)."""
+    one hop. ``source_kind`` still classifies the forwarded argument (the dangerous value).
+
+    ``sink_ref`` is the sink argument as ``classes.arg_ref`` read it, None when it could not be
+    located: its form is recorded (``flow_path.sink_arg_form``) and decides the trace boundary for a
+    literal, a value loaded through a pointer, or one no variable could be read from. Left unset,
+    the boundary reads ``sink_arg`` alone, as before forms were recorded."""
     deps = _derives_map(pseudocode)
     path = ({sink_arg} | flows_into(pseudocode, sink_arg)) if sink_arg is not None else set()
     # Wrapper-propagated candidates reach the forwarded argument possibly through intermediate
     # variables, so a present-but-not-fully-traced free source is reported conservatively.
     source_kind = _source_kind(pseudocode, sink_arg, conservative_free=wrapper is not None)
     flow_path = _flow_path(pseudocode, sink_arg, deps)
+    if sink_ref != "unset":
+        ref = sink_ref if isinstance(sink_ref, ArgRef) else None
+        flow_path = {**flow_path, "sink_arg_form": ref.form if ref is not None else None}
     if wrapper is not None:
         flow_path = {**flow_path, "sink_via_wrapper": True, "wrapper": wrapper}
         trace_boundary = "reached_sink_via_one_hop_wrapper"
-    else:
+    elif sink_ref == "unset":
         trace_boundary = _trace_boundary(pseudocode, sink_arg, source_kind, deps)
+    else:
+        trace_boundary = _trace_boundary(
+            pseudocode,
+            sink_arg,
+            source_kind,
+            deps,
+            ref=sink_ref if isinstance(sink_ref, ArgRef) else None,
+            located=isinstance(sink_ref, ArgRef),
+        )
     return {
         "source_kind": source_kind,
         "flow_path": flow_path,
@@ -262,7 +307,12 @@ def build_flow_evidence(
 
 
 def _size_trace_boundary(
-    pseudocode: str, kind: str, size_var: str | None, deps: dict[str, set[str]]
+    pseudocode: str,
+    kind: str,
+    size_var: str | None,
+    deps: dict[str, set[str]],
+    form: str | None = None,
+    lead: str | None = None,
 ) -> str:
     """Honest statement of where the size trace stops and why (mirror of ``_trace_boundary``).
 
@@ -273,8 +323,14 @@ def _size_trace_boundary(
                           through it and an intra read cannot follow it.
     copy_alias_untraced — a bounded copy the dependency graph does not track moved a value, so the
                           structured size chain may be incomplete.
+    loaded_through_pointer — the length (or the strcpy source) is read through a pointer, an index
+                          or a field, or is a number cast to a pointer: what was stored there is not
+                          in this read.
+    size_arg_unparsed   — the strcpy source is there, but no variable could be read out of it.
     one_hop_limit       — the length came through one intermediate variable, stopped at the cap.
-    two_hop_untraced    — the length came through >=2 intermediates (beyond the cap)."""
+    two_hop_untraced    — the length came through >=2 intermediates (beyond the cap).
+
+    ``form`` / ``lead`` are the length argument's (``CopySize``)."""
     if kind in (SIZE_CONST, SIZE_SIZEOF):
         return "reached_sink"
     if kind == SIZE_UNTRACED:
@@ -283,6 +339,10 @@ def _size_trace_boundary(
         return "indirect_call"
     if any(re.search(rf"\b{re.escape(c)}\s*\(", pseudocode) for c in _CHARSET_COPY_EXTRA):
         return "copy_alias_untraced"
+    if form in _LOADED_FORMS or lead == "load":
+        return "loaded_through_pointer"
+    if form == "none":
+        return "size_arg_unparsed"
     if size_var is None:
         return "reached_sink"
     depth = _chain_depth(deps, size_var)
@@ -291,6 +351,18 @@ def _size_trace_boundary(
     if depth == 2:
         return "one_hop_limit"
     return "two_hop_untraced"
+
+
+def _size_flow(cs: CopySize, one_hop: list[str]) -> dict[str, Any]:
+    """A size record's ``size_flow``: the length text, its root variable and one-hop sources, and —
+    when the argument was read — its form (``size_arg_form``) and, for a length read through a
+    pointer / index / field, the access path the clamp search matched on (``size_arg_path``)."""
+    out: dict[str, Any] = {"size_arg": cs.size_text, "size_var": cs.size_var, "one_hop": one_hop}
+    if cs.form is not None:
+        out["size_arg_form"] = cs.form
+    if cs.lead == "load" and cs.path is not None:
+        out["size_arg_path"] = cs.path
+    return out
 
 
 def _attach_objsize(
@@ -353,13 +425,15 @@ def build_size_evidence(
             "occurrence": occurrence if anchored else None,
             "anchor": "callsite" if anchored else "function",
         },
-        "size_flow": {"size_arg": cs.size_text, "size_var": cs.size_var, "one_hop": one_hop},
+        "size_flow": _size_flow(cs, one_hop),
         "clamp_seen": [{"shape": s, "coverage": "unjudged"} for s in cs.clamps],
         "entry_reach": {
             "status": "found" if entry_sites else "unknown",
             "sites": entry_sites or [],
         },
-        "trace_boundary": _size_trace_boundary(pseudocode, cs.kind, cs.size_var, deps),
+        "trace_boundary": _size_trace_boundary(
+            pseudocode, cs.kind, cs.size_var, deps, cs.form, cs.lead
+        ),
     }
     _attach_objsize(out, pseudocode, sink_name, occurrence, stub_names)
     return out
@@ -434,7 +508,7 @@ def build_format_size_evidence(
         "format_string": _format_string_resolution(pseudocode, sink_name, occurrence, stub_names)
         if anchored
         else FMT_UNRESOLVED,
-        "size_flow": {"size_arg": fs.size_text, "size_var": fs.size_var, "one_hop": one_hop},
+        "size_flow": _size_flow(fs, one_hop),
         # A formatter's length is a cap or an append amount, not a clamped variable, so the
         # clamp search the copy axis runs does not apply. Present and empty rather than absent:
         # the reader treats a missing key as "no picture at all".
@@ -443,7 +517,9 @@ def build_format_size_evidence(
             "status": "found" if entry_sites else "unknown",
             "sites": entry_sites or [],
         },
-        "trace_boundary": _size_trace_boundary(pseudocode, fs.kind, fs.size_var, deps),
+        "trace_boundary": _size_trace_boundary(
+            pseudocode, fs.kind, fs.size_var, deps, fs.form, fs.lead
+        ),
     }
     _attach_objsize(out, pseudocode, sink_name, occurrence, stub_names)
     return out
@@ -466,9 +542,14 @@ def build_fmtstr_evidence(
     string, and whether every call passes a literal format (it must NOT, or this would not be a
     candidate — recorded for transparency). EVIDENCE, never a verdict — it does not
     decide the format is truly controllable."""
-    fmt_arg = format_string_ident(pseudocode, sink_name, stub_names, occurrence)
+    fmt_ref = format_string_ref(pseudocode, sink_name, stub_names, occurrence)
+    fmt_arg = fmt_ref.root if fmt_ref is not None else None
     ev = build_flow_evidence(
-        pseudocode=pseudocode, callees=callees, sink_arg=fmt_arg, entry_sites=entry_sites
+        pseudocode=pseudocode,
+        callees=callees,
+        sink_arg=fmt_arg,
+        entry_sites=entry_sites,
+        sink_ref=fmt_ref,
     )
     ev["fmt_arg_pos"] = FMT_STRING_ARG.get(sink_name)
     ev["fmt_arg_literal"] = all_format_calls_literal(pseudocode, sink_name, stub_names)

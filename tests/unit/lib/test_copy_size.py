@@ -415,3 +415,67 @@ def test_a_sizeof_mixed_with_a_variable_is_not_a_sizeof_bound() -> None:
         assert cs.kind != SIZE_SIZEOF and copy_size_form_note(cs.kind) is None, expr
     for expr in ("sizeof(dst)", "sizeof(dst) - 1", "sizeof(a) / sizeof(a[0])", "0x10 + sizeof(x)"):
         assert classify_copy_size(f"memcpy(dst, src, {expr});", "memcpy").kind == SIZE_SIZEOF, expr
+
+
+# ── R6: the clamp/guard search matches the length's access path, not its base pointer ─────────
+
+
+def _ccs(body: str, sink: str = "memcpy"):
+    return classify_copy_size(f"void f(void *d,void *s,T *p){{\n{body}\n}}", sink)
+
+
+def test_a_load_length_is_clamped_by_its_path_not_its_base() -> None:
+    """A length read through a pointer / field is clamped only by a guard that names the SAME
+    access path. A guard on a different element of the same base is not its clamp.
+
+    MUTATION (verified RED): match on the base pointer (``ref.root``) instead of the path -> the
+    negative cases below find a spurious clamp."""
+    # positive: the guard names the same field as the length
+    pos = _ccs("if (0x20 < p->len) return;\n  memcpy(d,s,p->len);")
+    assert pos.kind == SIZE_CLAMP and pos.lead == "load" and pos.path == "p->len"
+    # negative: the guard names a DIFFERENT element of the same base -> no clamp
+    neg = _ccs("if (1 < p[0x14]) return;\n  memcpy(d,s,p[7]);")
+    assert neg.kind == SIZE_VARIABLE and neg.path == "p[7]"
+
+
+def test_an_arith_length_whose_first_operand_is_a_load_uses_the_path() -> None:
+    """``p->len * 4`` leads with a load, so the clamp search uses ``p->len``; the same guard that
+    clamps ``p->len`` clamps it.
+
+    MUTATION (verified RED): use the root for an arith-with-load lead -> the clamp is not found."""
+    pos = _ccs("if (0x20 < p->len) return;\n  memcpy(d,s,p->len * 4);")
+    assert pos.kind == SIZE_CLAMP and pos.lead == "load" and pos.path == "p->len"
+    neg = _ccs("if (1 < p[0x14]) return;\n  memcpy(d,s,p[7] - n);")
+    assert neg.kind == SIZE_VARIABLE
+
+
+def test_a_subfield_length_is_not_clamped_by_a_wider_path() -> None:
+    """A guard on ``x.f[2]._2_2_`` does not clamp a copy of ``x.f[2]`` — the boundary stops the
+    path from matching a longer member access.
+
+    MUTATION (verified RED): drop the trailing path boundary -> the wider guard matches."""
+    r = classify_copy_size(
+        "void f(void *d,void *s,S x){\n"
+        "  if (0x20 < x.f[2]._2_2_) return;\n  memcpy(d,s,x.f[2]);\n}",
+        "memcpy",
+    )
+    assert r.kind == SIZE_VARIABLE and r.path == "x.f[2]"
+
+
+def test_a_plain_variable_length_still_clamps_by_name() -> None:
+    """The non-load path is unchanged: a bare variable length clamps on its own name."""
+    r = _ccs("if (n >= 0x40) n = 0x40;\n  memcpy(d,s,n);")
+    assert r.kind == SIZE_CLAMP and r.size_var == "n" and r.lead == "var"
+
+
+def test_sizeof_expr_ignores_only_leading_casts() -> None:
+    """``_is_sizeof_expr``: a leading cast is set aside (``(size_t)sizeof(x)`` is compile-time),
+    but a leftover name is a variable even when it reads like a type word (``sizeof(h) + code``).
+
+    MUTATION (verified RED): generalise 'remaining names are type words' to sizeof -> the ``+
+    code`` length is wrongly read as a compile-time bound."""
+    assert _ccs("memcpy(d,s,(ulong)sizeof(x));").kind == SIZE_SIZEOF
+    # 'code' is a Ghidra type word; the point is only that it is NOT read as a compile-time bound.
+    assert _ccs("memcpy(d,s,sizeof(h) + code);").kind != SIZE_SIZEOF
+    assert _ccs("memcpy(d,s,sizeof(h) + n);").kind == SIZE_VARIABLE
+    assert _ccs("memcpy(d,s,(size_t)0x40);").kind == SIZE_CONST  # numeric cast -> const

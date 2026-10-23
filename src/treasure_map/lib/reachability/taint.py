@@ -21,6 +21,15 @@ import re
 from collections.abc import Mapping
 
 from treasure_map.lib.pattern.classes import (
+    _HEX_FRAGMENT_RE as _HEX_FRAGMENT_RE,
+)
+from treasure_map.lib.pattern.classes import (
+    _SIZED_TYPE_RE as _SIZED_TYPE_RE,
+)
+from treasure_map.lib.pattern.classes import (
+    _TYPE_WORDS as _TYPE_WORDS,
+)
+from treasure_map.lib.pattern.classes import (
     CMD,
     COPY,
     FMT_STRING,
@@ -28,6 +37,10 @@ from treasure_map.lib.pattern.classes import (
     SOURCE,
     SOURCE_STRONG,
     SOURCE_WEAK,
+    ArgRef,
+    _literal_spans,
+    arg_ref,
+    call_args_at,
     call_offsets,
     format_string_ident,
 )
@@ -36,50 +49,8 @@ from treasure_map.lib.pattern.classes import (
 # set and let an unrelated validator spuriously "cover" a dangerous input). Callee names are
 # detected per-function; these cover C/Ghidra type words and control keywords.
 _CALL_CLASS_NAMES = SOURCE | FORMAT | COPY | CMD | FMT_STRING
-_TYPE_WORDS = frozenset(
-    {
-        "char",
-        "int",
-        "uint",
-        "void",
-        "short",
-        "long",
-        "size_t",
-        "ssize_t",
-        "bool",
-        "unsigned",
-        "signed",
-        "float",
-        "double",
-        "const",
-        "static",
-        "struct",
-        "union",
-        "enum",
-        "sizeof",
-        "byte",
-        "word",
-        "dword",
-        "qword",
-        "code",
-        "undefined",
-        "return",
-        "if",
-        "else",
-        "for",
-        "while",
-        "do",
-        "switch",
-        "case",
-        "goto",
-        "break",
-        "continue",
-    }
-)
-# Ghidra-style sized type words (undefined4, uint32, int8, ...) and the leftover of a split
-# hex literal (0x96 -> "x96" once the leading 0 is dropped by the identifier regex).
-_SIZED_TYPE_RE = re.compile(r"^(?:undefined|uint|int|u|byte|word|dword|qword|ushort|uchar)\d+$")
-_HEX_FRAGMENT_RE = re.compile(r"^x[0-9a-fA-F]+$")
+_BUILDER_NAMES = FORMAT | COPY
+_SOURCE_NAMES = SOURCE_STRONG | SOURCE_WEAK
 _HEX_LITERAL_RE = re.compile(r"\b0[xX][0-9a-fA-F]+\b")
 
 # Return-value sources: the tainted value is the call's return, bound to the assigned LHS.
@@ -111,7 +82,10 @@ _BUFFER_SOURCE_ARG: dict[str, int] = {
     "gets": 0,
 }
 
-_CALL_RE = re.compile(r"([A-Za-z_]\w*)\s*\(([^()]*)\)")
+# The head of a call: the callee name and its opening parenthesis. Where a call's ARGUMENTS are
+# read, they come from ``call_args_at`` at that parenthesis — an argument that itself holds a
+# parenthesis (a cast, a nested call) does not hide the call.
+_CALL_HEAD_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
 _ASSIGN_RE = re.compile(r"\s*[^=]*?\b([A-Za-z_]\w*)\s*=\s*(?!=)(.*)")
 _IDENT_RE = re.compile(r"[A-Za-z_]\w*")
 
@@ -156,13 +130,33 @@ def abi_unrecovered(pseudocode: str) -> bool:
     return _ABI_UNRECOVERED_RE.search(pseudocode) is not None
 
 
+def locate_sink_arg_ref(
+    pseudocode: str,
+    sink_name: str,
+    stub_names: Mapping[int, str] | None = None,
+    occurrence: int = 0,
+) -> ArgRef | None:
+    """The sink's first argument, read (``classes.arg_ref``): its form, root, access path and cast.
+
+    None when the ``occurrence``-th call is not there, never closes, or passes no argument — the
+    argument could not be located at all, which is not the same as a literal."""
+    offsets = call_offsets(pseudocode, sink_name, stub_names)
+    if occurrence < 0 or occurrence >= len(offsets):
+        return None
+    args = call_args_at(pseudocode, offsets[occurrence])
+    if not args:
+        return None
+    return arg_ref(args[0])
+
+
 def locate_sink_arg(
     pseudocode: str,
     sink_name: str,
     stub_names: Mapping[int, str] | None = None,
     occurrence: int = 0,
 ) -> str | None:
-    """Return the identifier feeding the sink's first argument (the command string).
+    """Return the variable feeding the sink's first argument (the command string) — the ROOT of
+    ``locate_sink_arg_ref``: a literal, a constant address or an unreadable argument give None.
 
     Targets the first argument, which is the command/destination for system/popen-style
     sinks. Returns None when the sink call or a usable argument identifier is not found.
@@ -177,15 +171,8 @@ def locate_sink_arg(
     first call's argument, it would carry a value its own call never passes, and the parameter-
     specific downweights that read this value would then be decided by a different callsite.
     """
-    offsets = call_offsets(pseudocode, sink_name, stub_names)
-    if occurrence < 0 or occurrence >= len(offsets):
-        return None
-    open_paren = offsets[occurrence]
-    end = open_paren + 1
-    while end < len(pseudocode) and pseudocode[end] not in ",)":
-        end += 1
-    ident = _IDENT_RE.search(pseudocode[open_paren + 1 : end])
-    return ident.group(0) if ident else None
+    ref = locate_sink_arg_ref(pseudocode, sink_name, stub_names, occurrence)
+    return ref.root if ref is not None else None
 
 
 def locate_format_arg(
@@ -203,18 +190,41 @@ def locate_format_arg(
     return format_string_ident(pseudocode, sink_name, stub_names, occurrence)
 
 
-def _arg_ident(args: str, pos: int) -> str | None:
-    """Return the leading identifier of the comma-separated argument at ``pos``."""
-    parts = args.split(",")
-    if pos >= len(parts):
+def _arg_ident(args: list[str], pos: int) -> str | None:
+    """The root variable of the argument at ``pos`` (``classes.arg_ref``), or None."""
+    if pos >= len(args):
         return None
-    ident = _IDENT_RE.search(parts[pos])
-    return ident.group(0) if ident else None
+    return arg_ref(args[pos]).root
+
+
+def _calls_in(stmt: str, names: frozenset[str]) -> list[tuple[str, list[str]]]:
+    """Every call in ``stmt`` to one of ``names``, with its top-level arguments, in text order.
+    Located through ``call_offsets`` (a name inside a string literal is not a call) and split by
+    ``call_args_at``; a call that never closes is skipped."""
+    heads = {m.group(1) for m in _CALL_HEAD_RE.finditer(stmt)} & names
+    found: list[tuple[int, str, list[str]]] = []
+    for name in heads:
+        for off in call_offsets(stmt, name):
+            args = call_args_at(stmt, off)
+            if args is not None:
+                found.append((off, name, args))
+    found.sort(key=lambda x: x[0])
+    return [(name, args) for _off, name, args in found]
+
+
+def _call_names(pseudocode: str) -> set[str]:
+    """Every name written as a callee (``name(``) outside string literals."""
+    spans = _literal_spans(pseudocode)
+    return {
+        m.group(1)
+        for m in _CALL_HEAD_RE.finditer(pseudocode)
+        if not any(lo < m.end() - 1 <= hi for lo, hi in spans)
+    }
 
 
 def _seed_source(
     name: str,
-    args: str,
+    args: list[str],
     lhs: str | None,
     rhs: str,
     strong: set[str],
@@ -259,21 +269,18 @@ def _derives_map(pseudocode: str) -> dict[str, set[str]]:
     the remaining args). Identifiers are cleaned (callee names / type words / hex fragments
     dropped) so the flow set is not polluted; conservative — only explicit edges recorded.
     """
-    call_names = {m.group(1) for m in _CALL_RE.finditer(pseudocode)}
+    call_names = _call_names(pseudocode)
     deps: dict[str, set[str]] = {}
     for stmt in re.split(r"[;\n{}]", pseudocode):
         assign = _ASSIGN_RE.match(stmt)
         if assign is not None:
             lhs, rhs = assign.group(1), assign.group(2)
             deps.setdefault(lhs, set()).update(_dep_idents(rhs, call_names) - {lhs})
-        for name, args in _CALL_RE.findall(stmt):
-            if name in FORMAT or name in COPY:
-                parts = args.split(",")
-                dst_match = _IDENT_RE.search(parts[0]) if parts else None
-                if dst_match is not None:
-                    dst = dst_match.group(0)
-                    rest = _dep_idents(",".join(parts[1:]), call_names) - {dst}
-                    deps.setdefault(dst, set()).update(rest)
+        for _name, parts in _calls_in(stmt, _BUILDER_NAMES):
+            dst = arg_ref(parts[0]).root if parts else None
+            if dst is not None:
+                rest = _dep_idents(",".join(parts[1:]), call_names) - {dst}
+                deps.setdefault(dst, set()).update(rest)
     return deps
 
 
@@ -292,9 +299,8 @@ def _seed_sets(pseudocode: str) -> tuple[set[str], set[str], set[str]]:
         assign = _ASSIGN_RE.match(stmt)
         lhs = assign.group(1) if assign else None
         rhs = assign.group(2) if assign else ""
-        for name, args in _CALL_RE.findall(stmt):
-            if name in SOURCE_STRONG or name in SOURCE_WEAK:
-                _seed_source(name, args, lhs, rhs, strong, weak)
+        for name, args in _calls_in(stmt, _SOURCE_NAMES):
+            _seed_source(name, args, lhs, rhs, strong, weak)
     return strong, weak, par
 
 

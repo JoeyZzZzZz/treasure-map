@@ -258,7 +258,6 @@ PATH_SINK_EXTRA_ARGS: dict[str, tuple[int, ...]] = {"rename": (1,), "renameat": 
 # A whole argument that is a plain string literal (optionally an L"..." wide literal). A format
 # argument matching this is a fixed format string — the overwhelmingly common, safe shape.
 _FMT_LITERAL_RE = re.compile(r'^\s*L?"(?:[^"\\]|\\.)*"\s*$')
-_IDENT_RE = re.compile(r"[A-Za-z_]\w*")
 
 
 def _iter_format_args(
@@ -341,18 +340,64 @@ def format_string_ident(
     ``occurrence=None`` keeps the function-level reading — the FIRST non-literal argument across
     all calls — for callers that hold no callsite, and is byte-for-byte what this always did.
     """
-    args = _iter_format_args(pseudocode, sink_name, stub_names)
+    ref = format_string_ref(pseudocode, sink_name, stub_names, occurrence)
+    return ref.root if ref is not None else None
+
+
+def format_string_call(
+    pseudocode: str,
+    sink_name: str,
+    stub_names: Mapping[int, str] | None = None,
+    occurrence: int | None = None,
+    *,
+    with_literal: bool = False,
+) -> tuple[ArgRef, list[str]] | None:
+    """The format argument ``format_string_ident`` reads, with every argument of the call it sits
+    in: the first non-literal format argument that has a root (else the first non-literal one), or
+    None when every call passes a literal format or none could be read. ``occurrence`` as in
+    ``format_string_ident``. ``with_literal``: when every readable call passes a literal, give that
+    as a ``literal`` ArgRef rather than None (None then means nothing could be read)."""
+    pos = FMT_STRING_ARG.get(sink_name)
+    if pos is None:
+        return None
+    literal_args: list[str] | None = None
+    calls: list[list[str] | None] = [
+        call_args_at(pseudocode, i) for i in call_offsets(pseudocode, sink_name, stub_names)
+    ]
     if occurrence is not None:
-        if occurrence < 0 or occurrence >= len(args):
+        if occurrence < 0 or occurrence >= len(calls):
             return None
-        args = [args[occurrence]]
-    for arg in args:
-        if arg is None or _FMT_LITERAL_RE.match(arg):
+        calls = [calls[occurrence]]
+    first: tuple[ArgRef, list[str]] | None = None
+    for args in calls:
+        if args is None or pos >= len(args):
             continue
-        ident = _IDENT_RE.search(arg)
-        if ident is not None:
-            return ident.group(0)
-    return None
+        arg = args[pos].strip()
+        if _FMT_LITERAL_RE.match(arg):
+            if literal_args is None:
+                literal_args = args
+            continue
+        ref = arg_ref(arg)
+        if ref.root is not None:
+            return ref, args
+        if first is None:
+            first = (ref, args)
+    if first is None and literal_args is not None and with_literal:
+        return ArgRef("literal"), literal_args
+    return first
+
+
+def format_string_ref(
+    pseudocode: str,
+    sink_name: str,
+    stub_names: Mapping[int, str] | None = None,
+    occurrence: int | None = None,
+) -> ArgRef | None:
+    """The format argument ``format_string_ident`` reads, as an ``ArgRef`` (its form included): a
+    ``literal`` one when every readable call passes a literal format, None when none could be
+    read."""
+    found = format_string_call(pseudocode, sink_name, stub_names, occurrence, with_literal=True)
+    return found[0] if found is not None else None
 
 
 def _iter_path_args(
@@ -416,19 +461,41 @@ def path_arg_ident(
     ``occurrence=None`` keeps the function-level reading (first non-literal across all calls) for
     callers that hold no callsite.
     """
+    ref = path_arg_ref(pseudocode, sink_name, stub_names, occurrence)
+    return ref.root if ref is not None else None
+
+
+def path_arg_ref(
+    pseudocode: str,
+    sink_name: str,
+    stub_names: Mapping[int, str] | None = None,
+    occurrence: int | None = None,
+) -> ArgRef | None:
+    """The path argument ``path_arg_ident`` reads, as an ``ArgRef``: the first non-literal path
+    argument that has a root (else the first non-literal one); a ``literal`` one when every
+    readable path argument is a literal; None when none could be read."""
     calls = _iter_path_args(pseudocode, sink_name, stub_names)
     if occurrence is not None:
         if occurrence < 0 or occurrence >= len(calls):
             return None
         calls = [calls[occurrence]]
+    first: ArgRef | None = None
+    saw_literal = False
     for call in calls:
         for arg in call:  # every path argument: rename's destination as much as its source
-            if arg is None or _FMT_LITERAL_RE.match(arg):
+            if arg is None:
                 continue
-            ident = _IDENT_RE.search(arg)
-            if ident is not None:
-                return ident.group(0)
-    return None
+            if _FMT_LITERAL_RE.match(arg):
+                saw_literal = True
+                continue
+            ref = arg_ref(arg)
+            if ref.root is not None:
+                return ref
+            if first is None:
+                first = ref
+    if first is None and saw_literal:
+        return ArgRef("literal")
+    return first
 
 
 def _literal_spans(text: str) -> tuple[tuple[int, int], ...]:
@@ -499,6 +566,405 @@ def call_args_at(pseudocode: str, open_paren: int) -> list[str] | None:
             buf.append(ch)
         i += 1
     return None
+
+
+# ── One argument, read: its root variable, its form, and the access path ──────────────────────
+
+# Identifiers that are NOT variables: C/Ghidra type words and control keywords. (The taint layer
+# reads these too, for the same reason — they must never become a flow edge.)
+_TYPE_WORDS = frozenset(
+    {
+        "char",
+        "int",
+        "uint",
+        "void",
+        "short",
+        "long",
+        "size_t",
+        "ssize_t",
+        "bool",
+        "unsigned",
+        "signed",
+        "float",
+        "double",
+        "const",
+        "static",
+        "struct",
+        "union",
+        "enum",
+        "sizeof",
+        "byte",
+        "word",
+        "dword",
+        "qword",
+        "code",
+        "undefined",
+        "return",
+        "if",
+        "else",
+        "for",
+        "while",
+        "do",
+        "switch",
+        "case",
+        "goto",
+        "break",
+        "continue",
+    }
+)
+# Ghidra-style sized type words (undefined4, uint32, int8, ...) and the leftover of a split
+# hex literal (0x96 -> "x96" once the leading 0 is dropped by the identifier regex).
+_SIZED_TYPE_RE = re.compile(r"^(?:undefined|uint|int|u|byte|word|dword|qword|ushort|uchar)\d+$")
+_HEX_FRAGMENT_RE = re.compile(r"^x[0-9a-fA-F]+$")
+_EXTRA_TYPE_WORDS = frozenset(
+    {
+        "ushort",
+        "uchar",
+        "ulong",
+        "longlong",
+        "ulonglong",
+        "sbyte",
+        "wchar_t",
+        "FILE",
+        "off_t",
+        "time_t",
+        "pid_t",
+        "uid_t",
+        "gid_t",
+        "mode_t",
+    }
+)
+_FIXED_WIDTH_TYPE_RE = re.compile(r"^u?int\d+_t$")
+
+
+def is_type_word(name: str) -> bool:
+    """Whether ``name`` names a type (or a keyword), never a variable."""
+    return (
+        name in _TYPE_WORDS
+        or name in _EXTRA_TYPE_WORDS
+        or _SIZED_TYPE_RE.match(name) is not None
+        or _FIXED_WIDTH_TYPE_RE.match(name) is not None
+    )
+
+
+# The forms an argument takes. ``literal`` a constant (string, character, number, NULL);
+# ``var`` one variable; ``addr_of`` ``&var``; ``cast`` ``(T)var``; ``arith`` an expression whose
+# first non-constant operand gives the root; ``load`` a value read through a pointer, an index or a
+# field (``*p``, ``p[7]``, ``p->len``); ``call`` a call's return; ``const_addr`` a number cast to a
+# pointer; ``none`` nothing a variable could be read from.
+ARG_FORMS = ("literal", "var", "addr_of", "cast", "arith", "load", "call", "const_addr", "none")
+# The forms in which the root IS the value passed: only these may support a reading that makes a
+# candidate look safer (the value is a constant, a number, a checked character set).
+SAFE_FORMS = frozenset({"var", "addr_of", "cast"})
+
+
+@dataclass(frozen=True)
+class ArgRef:
+    """One call argument, read.
+
+    ``form`` is one of ``ARG_FORMS``. ``root`` the variable the value is read from (for a load its
+    base pointer; for an expression its first non-constant operand's), None for a literal, a
+    constant address or nothing. ``lead`` the kind of that first operand (``var`` / ``load`` /
+    ``call``); when it is ``load``, ``path`` is the whole access expression (outer cast removed,
+    whitespace collapsed) — the thing a bound has to name, since a bound on ``p[0x14]`` is not a
+    bound on ``p[7]``. ``cast_type`` the outermost cast's type text."""
+
+    form: str
+    root: str | None = None
+    path: str | None = None
+    cast_type: str | None = None
+    lead: str | None = None
+
+
+_NONE_REF = ArgRef("none")
+_IDENT_FULL_RE = re.compile(r"[A-Za-z_]\w*")
+# A Ghidra symbol label that carries '<' / '>' inside it (a string label made from text holding
+# them): one token, not a comparison, and not a variable.
+_ANGLE_LABEL_RE = re.compile(
+    r"(?:DAT|PTR|s|u|LAB|UNK|FUN|SUB|EXT|switchD|caseD)_[A-Za-z0-9_<>]*[<>][A-Za-z0-9_<>]*"
+)
+_STRING_SEQ_RE = re.compile(r'(?:L?"(?:[^"\\\n]|\\.)*"\s*)+')
+_CHAR_LIT_RE = re.compile(r"L?'(?:[^'\\\n]|\\.)+'")
+_NUMBER_LIT_RE = re.compile(
+    r"[+-]?\s*(?:0[xX][0-9a-fA-F]+|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)[uUlLfF]*"
+)
+_SIZEOF_RE = re.compile(r"sizeof\s*(?:\(.*\)|[A-Za-z_]\w*)", re.DOTALL)
+_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+_TEMPLATE_TYPE_RE = re.compile(r"<[^<>]*>")
+_UNARY = "*&-~!"
+
+
+def _is_literal(t: str) -> bool:
+    return (
+        _STRING_SEQ_RE.fullmatch(t) is not None
+        or _CHAR_LIT_RE.fullmatch(t) is not None
+        or _NUMBER_LIT_RE.fullmatch(t) is not None
+        or t in ("NULL", "true", "false")
+    )
+
+
+def _match_close(t: str, i: int) -> int:
+    """Index of the bracket closing the one opened at ``t[i]``, literals skipped; -1 if none."""
+    depth = 0
+    n = len(t)
+    j = i
+    while j < n:
+        ch = t[j]
+        if ch == '"' or ch == "'":
+            k = j + 1
+            while k < n and t[k] != ch:
+                k += 2 if t[k] == "\\" else 1
+            j = k + 1
+            continue
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+            if depth == 0:
+                return j
+        j += 1
+    return -1
+
+
+def _is_type_text(inner: str) -> bool:
+    """Whether a parenthesised text reads as a type: type words, names, ``*`` and spaces only
+    (a C++ template's ``<…>`` allowed), at least one name, not starting with ``*``."""
+    s = inner.strip()
+    while _TEMPLATE_TYPE_RE.search(s):
+        s = _TEMPLATE_TYPE_RE.sub(" ", s)
+    if not s or s.startswith("*") or "sizeof" in s.split():
+        return False
+    if re.fullmatch(r"(?:[A-Za-z_]\w*|\*|\s)+", s) is None:
+        return False
+    return _IDENT_FULL_RE.search(s) is not None
+
+
+def _split_cast(t: str) -> tuple[str, str] | None:
+    """(type text, the rest) when ``t`` opens with a cast ``(T)``, else None. ``(n) - 1`` is not a
+    cast: a single name that is not a type, followed by an operator."""
+    if not t.startswith("("):
+        return None
+    close = _match_close(t, 0)
+    if close <= 0 or close == len(t) - 1:
+        return None
+    inner, rest = t[1:close], t[close + 1 :].lstrip()
+    if not rest or not _is_type_text(inner):
+        return None
+    head = rest[0]
+    if not (head.isalnum() or head in "_\"'(" or head in _UNARY):
+        return None
+    words = inner.split()
+    single_name = len(words) == 1 and "*" not in inner and "<" not in inner
+    if single_name and not is_type_word(words[0]) and head in _UNARY:
+        return None
+    return " ".join(inner.split()), rest
+
+
+def _top_level_operands(t: str) -> tuple[list[str], int | None] | None:
+    """Split ``t`` on its top-level binary operators. Returns (operands, the index of the first
+    operand after a top-level ``?``, or None) — or None when ``t`` has no top-level binary
+    operator. ``->`` / ``.`` are not operators; a ``<`` /
+    ``>`` counts only with whitespace on both sides; ``* & - ~ !`` at the start or after an
+    operator are unary."""
+    n = len(t)
+    i = 0
+    operands: list[str] = []
+    start = 0
+    prev_operand = False
+    found = False
+    branch_start: int | None = None
+    while i < n:
+        ch = t[i]
+        if ch == '"' or ch == "'":
+            k = i + 1
+            while k < n and t[k] != ch:
+                k += 2 if t[k] == "\\" else 1
+            i = k + 1
+            prev_operand = True
+            continue
+        if ch in "([{":
+            close = _match_close(t, i)
+            if close == -1:
+                return None
+            i = close + 1
+            prev_operand = True
+            continue
+        if ch.isspace():
+            i += 1
+            continue
+        if t.startswith("->", i):
+            i += 2
+            continue
+        if ch == "." and not (i + 1 < n and t[i + 1].isdigit() and not prev_operand):
+            i += 1
+            continue
+        if ch in "<>":
+            two = t[i : i + 2]
+            op = two if two in ("<<", ">>", "<=", ">=") else ch
+            before = i == 0 or t[i - 1].isspace()
+            after = i + len(op) >= n or t[i + len(op)].isspace()
+            if before and after and prev_operand:
+                operands.append(t[start:i])
+                i += len(op)
+                start = i
+                prev_operand = False
+                found = True
+                continue
+            i += len(op)
+            continue
+        if ch in "+-*/%&|^=!?:~":
+            two = t[i : i + 2]
+            if ch in _UNARY and not prev_operand:
+                i += 1
+                continue
+            if two in ("&&", "||", "==", "!=", "+=", "-="):
+                op_len = 2
+            else:
+                op_len = 1
+            if ch == "!" and two != "!=":
+                i += 1
+                continue
+            operands.append(t[start:i])
+            if ch == "?" and branch_start is None:
+                branch_start = len(operands)
+            i += op_len
+            start = i
+            prev_operand = False
+            found = True
+            continue
+        # a name or a number
+        j = i
+        while j < n and (t[j].isalnum() or t[j] == "_"):
+            j += 1
+        i = max(j, i + 1)
+        prev_operand = True
+    if not found:
+        return None
+    operands.append(t[start:])
+    return [o.strip() for o in operands], branch_start
+
+
+def _first_postfix(t: str) -> int:
+    """Index of the first top-level ``[`` / ``->`` / ``.`` after a primary, or -1."""
+    n = len(t)
+    i = 0
+    seen_primary = False
+    while i < n:
+        ch = t[i]
+        if ch == '"' or ch == "'":
+            k = i + 1
+            while k < n and t[k] != ch:
+                k += 2 if t[k] == "\\" else 1
+            i = k + 1
+            seen_primary = True
+            continue
+        if ch == "[" and seen_primary:
+            return i
+        if ch in "([{":
+            close = _match_close(t, i)
+            if close == -1:
+                return -1
+            i = close + 1
+            seen_primary = True
+            continue
+        if seen_primary and (t.startswith("->", i) or ch == "."):
+            return i
+        if ch.isalnum() or ch == "_":
+            seen_primary = True
+        i += 1
+    return -1
+
+
+def _norm_space(t: str) -> str:
+    return " ".join(t.split())
+
+
+def arg_ref(arg_text: str) -> ArgRef:
+    """Read one call argument (its text as ``call_args_at`` gives it): its form, its root variable,
+    the access path when it is read through a pointer / index / field, and its outermost cast.
+
+    Shared by every reader that names "the variable behind an argument", so that a type word, a
+    string's first word, a hex literal's tail or a function name is never handed on as one."""
+    return _arg_ref(arg_text, 0)
+
+
+def _arg_ref(arg_text: str, depth: int) -> ArgRef:
+    if depth > 24:
+        return _NONE_REF
+    t = _COMMENT_RE.sub(" ", arg_text).strip()
+    cast_type: str | None = None
+    while True:
+        if not t:
+            return ArgRef("none", cast_type=cast_type)
+        if t.startswith("(") and _match_close(t, 0) == len(t) - 1:
+            t = t[1:-1].strip()
+            continue
+        split = _split_cast(t)
+        if split is not None:
+            if cast_type is None:
+                cast_type = split[0]
+            t = split[1]
+            continue
+        break
+    if _ANGLE_LABEL_RE.fullmatch(t):
+        return ArgRef("none", cast_type=cast_type)
+    if _is_literal(t) or _SIZEOF_RE.fullmatch(t):
+        if cast_type is not None and cast_type.endswith("*"):
+            return ArgRef("const_addr", cast_type=cast_type)
+        return ArgRef("literal", cast_type=cast_type)
+    ops = _top_level_operands(t)
+    if ops is not None:
+        operands, branch_start = ops
+        if branch_start is not None:
+            operands = operands[branch_start:]  # a ternary's value is one of its branches
+        for operand in operands:
+            if not operand or _SIZEOF_RE.fullmatch(operand):
+                continue
+            ref = _arg_ref(operand, depth + 1)
+            if ref.form in ("literal", "const_addr"):
+                continue
+            return ArgRef("arith", ref.root, ref.path, cast_type, ref.lead)
+        return ArgRef("literal", cast_type=cast_type)
+    if t[0] in "-~!":
+        inner = _arg_ref(t[1:], depth + 1)
+        if inner.form in ("literal", "const_addr"):
+            return ArgRef("literal", cast_type=cast_type)
+        return ArgRef("arith", inner.root, inner.path, cast_type, inner.lead)
+    if t.startswith("&"):
+        rest = t[1:].strip()
+        if _IDENT_FULL_RE.fullmatch(rest) and not is_type_word(rest):
+            return ArgRef("addr_of", rest, None, cast_type, "var")
+        inner = _arg_ref(rest, depth + 1)
+        if inner.root is None:
+            return ArgRef("none", cast_type=cast_type)
+        return ArgRef("arith", inner.root, inner.path, cast_type, "load")
+    if t.startswith("*"):
+        return _load_ref(t, cast_type, depth)
+    if _first_postfix(t) != -1:
+        return _load_ref(t, cast_type, depth)
+    m = re.match(r"([A-Za-z_]\w*)\s*\(", t)
+    if m and not is_type_word(m.group(1)) and _match_close(t, m.end() - 1) == len(t) - 1:
+        args = call_args_at(t, m.end() - 1) or []
+        root = next((r.root for a in args if (r := _arg_ref(a, depth + 1)).root), None)
+        return ArgRef("call", root, None, cast_type, "call")
+    if _IDENT_FULL_RE.fullmatch(t):
+        if is_type_word(t) or _HEX_FRAGMENT_RE.match(t):
+            return ArgRef("none", cast_type=cast_type)
+        return ArgRef("cast" if cast_type is not None else "var", t, None, cast_type, "var")
+    return ArgRef("none", cast_type=cast_type)
+
+
+def _load_ref(t: str, cast_type: str | None, depth: int) -> ArgRef:
+    """A value read through a pointer / index / field: the base pointer as root, the whole access
+    as the path."""
+    base = t
+    while base.startswith("*"):
+        base = base[1:].strip()
+    pos = _first_postfix(base)
+    if pos != -1:
+        base = base[:pos]
+    inner = _arg_ref(base, depth + 1)
+    return ArgRef("load", inner.root, _norm_space(t), cast_type, "load")
 
 
 def _is_phantom_offset(paren_off: int, decl_end: int, spans: tuple[tuple[int, int], ...]) -> bool:

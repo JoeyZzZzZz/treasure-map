@@ -36,12 +36,20 @@ from treasure_map.lib.pattern.classes import (
     CMD,
     COPY,
     FORMAT,
+    FORMAT_ARG,
+    SAFE_FORMS,
     SOURCE,
     _literal_spans,
+    arg_ref,
     call_args_at,
     call_offsets,
 )
-from treasure_map.lib.reachability.taint import _IDENT_RE, flows_into, free_taint_reaches
+from treasure_map.lib.reachability.taint import (
+    _CALL_HEAD_RE,
+    _IDENT_RE,
+    flows_into,
+    free_taint_reaches,
+)
 
 # Leading callee name of a call expression (used to find builder calls in a statement).
 _CALL_RE_HEAD = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
@@ -304,16 +312,252 @@ def _charset_inline_constrained(pseudocode: str, sink_arg: str) -> bool:
     return sink_arg in _inline_constrained_results(pseudocode, _CHARSET_SAFE)
 
 
-def _value_is_constrained(pseudocode: str, sink_arg: str, converters: frozenset[str]) -> bool:
-    """The sink argument's value is the result of a ``converters`` conversion AND no free value
-    bypasses it (used by the numeric-sanitizer downweight). Parameter-specific: a converter merely
-    appearing in the function is not enough. Charset uses the stricter inline-only check above."""
-    path = {sink_arg} | flows_into(pseudocode, sink_arg)
-    safe = _constrained_results(pseudocode, path, converters)
-    safe |= _inline_constrained_results(pseudocode, converters) & path
-    if not safe:
+# ── R5: numeric_sanitized by "every write to the sink buffer is safe" ─────────────────────────
+#
+# A command/path buffer is numeric-constrained only when EVERY write to it, in text order up to
+# the sink, is a safe write: a literal, a memset with a constant, a single inline converter, or a
+# format whose conversions are integer (or %s/%c filled by a literal / converter). Nothing escapes
+# it, nothing aliases it, and it is a local array. The old "which SOURCE names reach it" reasoning
+# is gone — correctness is here, not in a name list.
+
+# Read-only argument positions: a call where the buffer sits at one of these does not write it.
+# stat/lstat's path is arg0 (arg1 is the statbuf it WRITES, so it is not whitelisted).
+_READONLY_ARG_POS: dict[str, tuple[int, ...]] = {
+    "stat": (0,),
+    "lstat": (0,),
+    "access": (0,),
+    "open": (0,),
+    "open64": (0,),
+    "fopen": (0,),
+    "fopen64": (0,),
+    "freopen": (0,),
+    "unlink": (0,),
+    "unlinkat": (1,),
+    "remove": (0,),
+    "strlen": (0,),
+    "strnlen": (0,),
+    "strcmp": (0, 1),
+    "strncmp": (0, 1),
+}
+# Copy writers whose destination is arg0 and which are safe only when the source is a literal.
+_COPY_WRITE: frozenset[str] = COPY | {"strcat", "__strcat_chk"}
+_FORMAT_WRITE: frozenset[str] = frozenset(FORMAT_ARG)  # the printf-family buffer writers
+_MEMSET = frozenset({"memset", "bzero", "__memset_chk"})
+_STRING_OR_CHAR_LIT = re.compile(r'^\s*(?:L?"(?:[^"\\]|\\.)*"|L?\'(?:[^\'\\]|\\.)+\')\s*$')
+_NUM_LIT = re.compile(r"^\s*[+-]?\s*(?:0[xX][0-9a-fA-F]+|\d+)[uUlL]*\s*$")
+_CONV_SPEC_RE = re.compile(r"%[-+ #0]*(\*|\d+)?(?:\.(\*|\d+))?(?:hh|h|ll|l|L|j|z|t|q)?([a-zA-Z%])")
+_POSITIONAL_RE = re.compile(r"%\d+\$")
+
+
+def _is_literal_arg(text: str) -> bool:
+    return bool(_STRING_OR_CHAR_LIT.match(text) or _NUM_LIT.match(text)) or text.strip() in (
+        "NULL",
+        "true",
+        "false",
+    )
+
+
+def _fmt_content(text: str) -> str | None:
+    """The concatenated content of a (possibly adjacent-concatenated) string literal, or None when
+    the argument is not a literal format string."""
+    t = text.strip()
+    parts = re.findall(r'L?"((?:[^"\\]|\\.)*)"', t)
+    if not parts or re.sub(r'\s*L?"(?:[^"\\]|\\.)*"\s*', "", t) != "":
+        return None
+    return "".join(parts)
+
+
+def _format_write_safe(fmt_text: str, varargs: list[str], converters: frozenset[str]) -> bool:
+    """A format write is safe when its format string is a literal whose conversions are integer
+    (%d %i %u %x %X %o, width/precision ``*`` taking an int), or %s/%c whose matching vararg is a
+    string/char literal or a single inline converter; and the conversions consume EXACTLY the
+    varargs passed. %n / %p / float / positional (%N$) are never safe."""
+    content = _fmt_content(fmt_text)
+    if content is None or _POSITIONAL_RE.search(content):
         return False
-    return not free_taint_reaches(pseudocode, sink_arg, safe_vars=safe)
+    consumed = 0
+    for m in _CONV_SPEC_RE.finditer(content):
+        width, prec, conv = m.group(1), m.group(2), m.group(3)
+        if conv == "%":
+            continue
+        if width == "*":
+            consumed += 1  # an int width argument
+        if prec == "*":
+            consumed += 1  # an int precision argument
+        if conv in "diuxXo":
+            consumed += 1
+        elif conv in "sc":
+            if consumed >= len(varargs):
+                return False
+            va = varargs[consumed]
+            if not (_STRING_OR_CHAR_LIT.match(va) or _is_converter_call(va, converters)):
+                return False
+            consumed += 1
+        else:
+            return False  # %n %p float, or an unknown conversion
+    return consumed == len(varargs)
+
+
+def _is_buf_target(text: str, buf: str) -> bool:
+    """``text`` writes INTO the buffer: ``buf``, ``buf + k``, ``buf[k]``, ``*buf``, ``&buf`` or
+    ``&buf[k]`` (casts allowed). The root is ``buf`` and the whole argument is about it."""
+    ref = arg_ref(text)
+    return ref.root == buf
+
+
+def _calls_in_function(pseudocode: str) -> list[tuple[int, str, list[str]]]:
+    """(open-paren offset, callee name, top-level arguments) of every call, in text order, string
+    literals skipped by ``call_args_at``. A call that never closes is left out."""
+    out: list[tuple[int, str, list[str]]] = []
+    for m in _CALL_HEAD_RE.finditer(pseudocode):
+        off = m.end() - 1
+        args = call_args_at(pseudocode, off)
+        if args is not None:
+            out.append((off, m.group(1), args))
+    return out
+
+
+def _brace_depths(pseudocode: str) -> list[int]:
+    """Depth BEFORE the character at each index — ``{`` raises the following chars, ``}`` lowers
+    from its own index on. String/char literals do not count."""
+    depths = [0] * (len(pseudocode) + 1)
+    d = 0
+    i, n = 0, len(pseudocode)
+    while i < n:
+        ch = pseudocode[i]
+        if ch == '"' or ch == "'":
+            j = i + 1
+            while j < n and pseudocode[j] != ch:
+                j += 2 if pseudocode[j] == "\\" else 1
+            for k in range(i, min(j + 1, n)):
+                depths[k] = d
+            i = j + 1
+            continue
+        if ch == "}":
+            d -= 1
+        depths[i] = d
+        if ch == "{":
+            d += 1
+        i += 1
+    depths[n] = d
+    return depths
+
+
+def _encloses_and_precedes(depths: list[int], write_pos: int, sink_pos: int) -> bool:
+    """The block holding the write at ``write_pos`` also holds the sink at ``sink_pos`` and the
+    write comes first: the write is earlier in text and the brace depth never drops below the
+    write's between them (so the write's block has not closed before the sink)."""
+    if write_pos >= sink_pos:
+        return False
+    base = depths[write_pos]
+    return all(depths[i] >= base for i in range(write_pos, sink_pos))
+
+
+def _is_local_array(pseudocode: str, buf: str) -> bool:
+    """``buf`` is declared as a local ARRAY in this function body (``T buf [N]``), not a parameter
+    or a global. A ``DAT_*`` / ``g_*`` name is never local; a parameter is in the signature; a
+    local array is indexed somewhere (``buf[...]``) — a plain ``char *`` local that is only ever a
+    format destination is not provably array-backed and stays out."""
+    if buf.startswith(("DAT_", "g_", "PTR_")):
+        return False
+    if buf in signature_slots(pseudocode):
+        return False  # a parameter, not a local
+    brace = pseudocode.find("{")
+    body = pseudocode[brace + 1 :] if brace != -1 else pseudocode
+    return re.search(rf"\b{re.escape(buf)}\s*\[", body) is not None
+
+
+def _buffer_writes_all_safe(
+    pseudocode: str, buf: str, converters: frozenset[str], sink_pos: int
+) -> bool:
+    """Every write to ``buf`` up to the sink is a safe write: a literal, a constant memset,
+    a single inline converter, or an integer/literal-only format; nothing escapes or aliases it;
+    it is a local array; and at least one write is a format/converter (otherwise it is pure
+    constant, not numeric-constrained)."""
+    if not _is_local_array(pseudocode, buf):
+        return False  # F1
+    depths = _brace_depths(pseudocode)
+    saw_fmt_or_conv = False
+
+    def write_ok(pos: int) -> bool:
+        return _encloses_and_precedes(depths, pos, sink_pos)
+
+    # Assignments: a buf-target lvalue is a write; buf / &buf on the RHS of any other assignment is
+    # an alias (F-alias).
+    for m in re.finditer(r"([^;\n{}]*?)(?<![<>!=+\-*/%&|^~])=(?!=)([^;\n{}]*)", pseudocode):
+        lhs, rhs = m.group(1).strip(), m.group(2)
+        lpos = m.start()
+        if lhs and _is_buf_target(lhs, buf):
+            if not _is_literal_arg(rhs) or not write_ok(lpos):
+                return False
+            continue
+        if re.search(rf"(?<![\w>.])&?\s*{re.escape(buf)}(?![\w])", rhs):
+            return False  # F-alias: stored into another variable
+
+    for off, name, args in _calls_in_function(pseudocode):
+        if off == sink_pos:
+            continue  # the sink call itself (类三)
+        positions = [i for i, a in enumerate(args) if _buf_contained(a, buf)]
+        if not positions:
+            continue
+        ro = _READONLY_ARG_POS.get(name, ())
+        if positions == [0] and _is_buf_target(args[0], buf):
+            # buf is the destination of this call.
+            if name in _MEMSET:
+                if len(args) < 2 or not _is_literal_arg(args[1]):
+                    return False
+                if not write_ok(off):
+                    return False
+                continue
+            if name in _COPY_WRITE:
+                src = args[1] if len(args) > 1 else ""
+                if _STRING_OR_CHAR_LIT.match(src):
+                    if not write_ok(off):
+                        return False
+                    continue
+                if _is_converter_call(src, converters):
+                    if not write_ok(off):
+                        return False
+                    saw_fmt_or_conv = True
+                    continue
+                return False
+            if name in _FORMAT_WRITE:
+                fpos = FORMAT_ARG.get(name)
+                if fpos is None or fpos >= len(args):
+                    return False
+                if not _format_write_safe(args[fpos], args[fpos + 1 :], converters):
+                    return False
+                if not write_ok(off):
+                    return False
+                saw_fmt_or_conv = True
+                continue
+            return False  # a destination write by some other call
+        if all(p in ro for p in positions):
+            continue  # buf only at whitelisted read positions (类二)
+        return False  # F-escape: buf handed to a call that is neither a safe write nor a read
+
+    return saw_fmt_or_conv
+
+
+def _buf_contained(arg_text: str, buf: str) -> bool:
+    """``buf`` appears as a token anywhere in this argument (so it is handed to the call)."""
+    return re.search(rf"(?<![\w>.]){re.escape(buf)}(?![\w])", arg_text) is not None
+
+
+def _value_is_constrained(
+    pseudocode: str, sink_arg: str, converters: frozenset[str], sink_pos: int
+) -> bool:
+    """The sink buffer is numeric-constrained (R5): a converter result is on its path (the range
+    filter), AND every write to the buffer up to the sink is a safe write
+    (:func:`_buffer_writes_all_safe`). The old SOURCE-name reasoning is gone — a path with no
+    converter result is simply not checked (no new mark), and correctness rests on the write
+    check, not on which input names reach the argument."""
+    path = {sink_arg} | flows_into(pseudocode, sink_arg)
+    on_path = _constrained_results(pseudocode, path, converters)
+    on_path |= _inline_constrained_results(pseudocode, converters) & path
+    if not on_path:
+        return False  # premise: no converter result on the path -> leave it unchecked
+    return _buffer_writes_all_safe(pseudocode, sink_arg, converters, sink_pos)
 
 
 _LITERAL_ARG_RE = re.compile(r'^\s*(?:"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)\'|[+-]?\d[\w.]*)\s*$')
@@ -392,26 +636,40 @@ def detect_form_signal(
     stub_names: Mapping[int, str] | None = None,
     occurrence: int = 0,
     sink_class: str | None = None,
+    sink_form: str | None = None,
 ) -> str | None:
     """Return one neutral form note to downweight this candidate, or None.
 
     Every branch is parameter-specific (see the module docstring): it fires only when the sink's
     dangerous argument truly comes only from the recognized safe/constant source. Returns None
     under any doubt (no downweight), so recall is never reduced — a missed downweight only leaves
-    a candidate at its normal score."""
+    a candidate at its normal score.
+
+    ``sink_form`` is the sink argument's :class:`classes.ArgRef` form. A note that makes the
+    candidate look SAFE is trusted only when the root IS the value: numeric / charset need a safe
+    form (``var`` / ``addr_of`` / ``cast``), caller_constant needs the argument to BE the parameter
+    (``var`` / ``cast``, not ``&param``). A value read through a pointer / an expression / a call
+    is never read as safe (its root is a base or an operand, not the value)."""
+    offsets = call_offsets(pseudocode, sink_name, stub_names) if sink_name is not None else ()
+    sink_pos = offsets[occurrence] if 0 <= occurrence < len(offsets) else -1
     # The call's own literal first: it is the per-callsite proof; caller_constant is a one-hop
     # hint read from callers that may not all be known, and must not stand in front of it.
     if sink_name is not None and _sink_arg_is_literal(
         pseudocode, sink_name, sink_arg, stub_names, occurrence
     ):
         return CONST_SINK_ARG
-    if _caller_only_constants(
+    if sink_form in ("var", "cast") and _caller_only_constants(
         func_name, callees, callers_pseudocode or [], pseudocode=pseudocode, sink_arg=sink_arg
     ):
         return CALLER_CONSTANT
-    if sink_arg is not None and _value_is_constrained(pseudocode, sink_arg, _NUMERIC_VALIDATORS):
+    safe_form = sink_form in SAFE_FORMS
+    if (
+        safe_form
+        and sink_arg is not None
+        and _value_is_constrained(pseudocode, sink_arg, _NUMERIC_VALIDATORS, sink_pos)
+    ):
         return NUMERIC_SANITIZED
-    if sink_arg is not None and _charset_inline_constrained(pseudocode, sink_arg):
+    if safe_form and sink_arg is not None and _charset_inline_constrained(pseudocode, sink_arg):
         # Charset downweight is INLINE-ONLY: the converter must build the sink argument directly. A
         # value laundered through an intermediate variable is not value-tracked (no chain to two
         # hops, three hops, …); the evidence layer marks it `charset_maybe` instead.
@@ -427,6 +685,7 @@ def wrapper_propagation_form_note(
     sink_arg: str | None,
     stub_names: Mapping[int, str] | None = None,
     occurrence: int | None = None,
+    sink_form: str | None = None,
 ) -> str | None:
     """Form note for a wrapper-propagated command candidate (factor ①).
 
@@ -454,8 +713,16 @@ def wrapper_propagation_form_note(
         sink_arg is not None and free_taint_reaches(pseudocode, sink_arg, safe_vars=set())
     ):
         return CONST_SINK_ARG
-    if sink_arg is not None and _value_is_constrained(pseudocode, sink_arg, _NUMERIC_VALIDATORS):
-        return NUMERIC_SANITIZED
-    if sink_arg is not None and _charset_inline_constrained(pseudocode, sink_arg):
+    safe_form = sink_form in SAFE_FORMS
+    if safe_form and sink_arg is not None:
+        offsets = call_offsets(pseudocode, wrapper_name, stub_names)
+        sink_pos = (
+            offsets[occurrence]
+            if occurrence is not None and 0 <= occurrence < len(offsets)
+            else (offsets[0] if offsets else -1)
+        )
+        if _value_is_constrained(pseudocode, sink_arg, _NUMERIC_VALIDATORS, sink_pos):
+            return NUMERIC_SANITIZED
+    if safe_form and sink_arg is not None and _charset_inline_constrained(pseudocode, sink_arg):
         return CHARSET_CONSTRAINED
     return None

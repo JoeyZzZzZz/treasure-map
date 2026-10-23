@@ -1752,7 +1752,7 @@ def _exec_no_shell_fn(name: str = "run_exec") -> dict[str, object]:
 def _numeric_fn(name: str = "run_num") -> dict[str, object]:
     body = (
         f"void {name}(char* p){{ char b[64]; recv(fd,b,64); long n=strtol(b,0,10); char c[128]; "
-        f'snprintf(c,128,"/bin/tool %s",n); system(c); }}'
+        f'snprintf(c,128,"/bin/tool %d",n); system(c); }}'
     )
     return {
         "name": name,
@@ -4359,8 +4359,8 @@ def test_wrapper_evidence_is_read_per_call(tmp_path: Path) -> None:
     run_analyzer2(db, atlas, source_run_id="run_w")
     cmd_rows = _wrapper_rows(atlas, "Two")
     assert [r["blocking_mechanism"] for _, _, r in cmd_rows] == ["const_sink_arg", None]
-    # each call's own first argument (the literal's first word is the axis's existing reading)
-    assert [ev["flow_path"]["sink_arg"] for _, ev, _ in cmd_rows] == ["sbin", "p"]  # type: ignore[index]
+    # each call's own first argument: a string literal is no variable (None), not its first word
+    assert [ev["flow_path"]["sink_arg"] for _, ev, _ in cmd_rows] == [None, "p"]  # type: ignore[index]
     fmt_rows = _wrapper_rows(atlas, "Fm")
     recovered = [
         [r for r in ev["sink_arg_provenance"] if r.get("recovered_by") == "fmt_wrapper_callsite"]  # type: ignore[union-attr, attr-defined]

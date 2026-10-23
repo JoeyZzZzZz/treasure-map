@@ -112,6 +112,17 @@ TYPE_NAMES = frozenset(
 _TYPE_NAME_FORMS = re.compile(r"u?int(?:8|16|32|64)_t|u?int[35-7]|undefined[1-8]")
 _SOURCE_RESOLVED_UNTRACED = ("free_string", "charset_safe")
 _REACHED = "reached_sink"
+# Forms whose recorded root is a base pointer / an operand, not the value itself: the access path,
+# not the base, is what a guard has to name (S7).
+_LOADED_FORMS = frozenset({"load", "const_addr"})
+_PATH_IDENT_RE = re.compile(r"[A-Za-z_]\w*")
+
+
+def _path_idents(path: Any) -> list[str]:
+    """The identifier tokens of an access-path string (``p->len`` -> p, len), or [] when absent."""
+    return _PATH_IDENT_RE.findall(path) if isinstance(path, str) else []
+
+
 _REF_CHUNK = 500
 _ABSENT: Any = object()
 
@@ -223,7 +234,13 @@ def parse_row(ref: str, sink_anchor: str | None, flow_evidence: str | None) -> R
         axes["bound"] = _bound(fe)
         flow = fe.get("size_flow")
         sf: Mapping[str, Any] = flow if isinstance(flow, dict) else {}
-        links["size_arg"] = (sf.get("size_var"), tuple(_names(sf.get("one_hop"))), tb)
+        links["size_arg"] = (
+            sf.get("size_var"),
+            tuple(_names(sf.get("one_hop"))),
+            tb,
+            sf.get("size_arg_form"),
+            sf.get("size_arg_path"),
+        )
     if "source_kind" in fe:
         axes["source"] = {"source_kind": _source_kind_from_evidence(fe)}
     if isinstance(fe.get("flow_path"), dict):
@@ -234,6 +251,7 @@ def parse_row(ref: str, sink_anchor: str | None, flow_evidence: str | None) -> R
             tuple(_names(fp.get("one_hop"))),
             tb,
             _source_kind_from_evidence(fe),
+            fp.get("sink_arg_form"),
         )
     if "sanitizer_seen" in fe:
         seen = _sanitizer_records(fe)
@@ -325,7 +343,13 @@ def _sink_arg(inputs: tuple[Any, ...], var: str) -> str:
     source was classified without reading the chain — free_string / charset_safe stop there with
     no depth read) and the variable is none of them; else unknown. A wrapper-forwarded candidate
     never reads no (its trace stops one hop past the call)."""
-    sink_arg, one_hop, boundary, source_kind = inputs
+    sink_arg, one_hop, boundary, source_kind, *rest = inputs
+    sink_form = rest[0] if rest else None
+    if sink_form in _LOADED_FORMS:
+        # The value is read through a pointer; the recorded root is a base, not the value, and the
+        # access path is not on this axis. A one-hop source still matches by name; the base alone
+        # neither matches (yes) nor rules out (no) — it goes to unknown. Over-reports, reversible.
+        return "yes" if var in set(one_hop) else "unknown"
     names = set(one_hop) | ({sink_arg} if sink_arg else set())
     if var in names:
         return "yes"
@@ -339,7 +363,16 @@ def _size_arg(inputs: tuple[Any, ...], var: str) -> str:
     length variable, the size trace stopped at the sink (one hop at most, no indirect call or
     untracked copy) and the variable is none of them; else unknown — a constant or sizeof length
     has no length variable, so it is unknown too."""
-    size_var, one_hop, boundary = inputs
+    size_var, one_hop, boundary, *rest = inputs
+    size_form = rest[0] if len(rest) >= 1 else None
+    size_path = rest[1] if len(rest) >= 2 else None
+    if size_form in _LOADED_FORMS or size_path:
+        # Read through a pointer / index / field: match the access path's component names (not the
+        # base). The base pointer alone is neither yes nor no -> unknown. Over-reports, reversible.
+        components = set(_path_idents(size_path)) - ({size_var} if size_var else set())
+        if var in (components | set(one_hop)):
+            return "yes"
+        return "unknown"
     if not size_var:
         return "unknown"
     if var in {size_var, *one_hop}:

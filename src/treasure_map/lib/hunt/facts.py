@@ -26,7 +26,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 
-from treasure_map.lib.pattern.classes import FMT_STRING
+from treasure_map.lib.pattern.classes import FMT_STRING, format_string_call
 from treasure_map.lib.pattern.extractor_names import REGISTRY
 from treasure_map.lib.reachability.taint import (
     _CALLER_SUPPLIED_RE,
@@ -202,6 +202,53 @@ def is_thin_cmd_wrapper(
     return True, wrapped
 
 
+# ── R7: two gates on recognising a thin FORMAT-STRING wrapper ────────────────────────────────
+#
+# A same-named C++ method, or a decompiler that dropped a va_list, can wear the shape of a thin
+# fmt wrapper without being one. Two gates on the call locate_format_arg selected, EITHER failing
+# means this sink is not a wrapper here — they narrow the H1 recall, never the by-name sink set.
+
+# Pointer bases that are "character-like": a format argument cast to one of these is still a
+# string. Any OTHER pointer cast (e.g. ``Log *``) is a different object, not a forwarded format.
+_FMT_CHAR_PTR_BASES: frozenset[str] = frozenset(
+    {"char", "signed char", "unsigned char", "void", "uchar", "byte", "undefined", "undefined1"}
+)
+# Fixed (non-variadic) parameter count of each v* definite-argument family member. A CALL with
+# MORE top-level arguments than this is not that function (a C++ same-name method carries ``this``
+# -> more); FEWER is the decompiler dropping the va_list and is NOT a reason to reject.
+_VARIADIC_FIXED_ARGS: dict[str, int] = {
+    "vprintf": 2,
+    "vwarn": 2,
+    "vwarnx": 2,
+    "vfprintf": 3,
+    "vdprintf": 3,
+    "vsyslog": 3,
+    "verr": 3,
+    "verrx": 3,
+    "vasprintf": 3,
+}
+
+
+def _fmt_cast_is_nonchar_ptr(cast_type: str | None) -> bool:
+    """The format argument is cast to a pointer to a NON-character type (gate 1): a different
+    object was forwarded, not a format string. No cast, or a char / void / undefined pointer, is
+    fine."""
+    if cast_type is None:
+        return False
+    t = cast_type.strip()
+    if not t.endswith("*"):
+        return False
+    base = t[:-1].rstrip("*").strip()
+    return base not in _FMT_CHAR_PTR_BASES
+
+
+def _variadic_arg_count_rejects(sink: str, call_args: list[str]) -> bool:
+    """The selected call passes MORE top-level arguments than the definite-argument family member's
+    fixed count (gate 2): it is a same-named other function, not this sink. Fewer never rejects."""
+    fixed = _VARIADIC_FIXED_ARGS.get(sink)
+    return fixed is not None and len(call_args) > fixed
+
+
 def is_thin_fmt_wrapper(
     pseudocode: str,
     callees: list[str],
@@ -243,10 +290,21 @@ def is_thin_fmt_wrapper(
 
     params = _signature_params(pseudocode)
     for sink in fmt_sinks:
-        # The identifier at the FORMAT position (per-sink index), skipping literal-format calls.
-        # None => every call to this sink passed a literal format (safe) or was unreadable.
-        arg = locate_format_arg(pseudocode, sink, stub_names)
+        # The format-position argument of the first non-literal call (per-sink index), with that
+        # call's own arguments. None => every call passed a literal format (safe) or was unreadable.
+        found = format_string_call(pseudocode, sink, stub_names)
+        if found is None:
+            continue
+        ref, call_args = found
+        arg = ref.root
         if arg is None:
+            continue
+        # R7 gate 1: a cast to a non-character pointer is a different object, not a format forward.
+        if _fmt_cast_is_nonchar_ptr(ref.cast_type):
+            continue
+        # R7 gate 2: a definite-argument v* call with MORE args than its fixed count is a same-named
+        # other function (the C++ ``this`` shape), not this sink.
+        if _variadic_arg_count_rejects(sink, call_args):
             continue
         is_param = arg in params or _CALLER_SUPPLIED_RE.fullmatch(arg) is not None
         if not is_param:

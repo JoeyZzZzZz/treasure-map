@@ -11,6 +11,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
 from treasure_map.lib.hunt.downweight import (
     CALLER_CONSTANT,
     CHARSET_CONSTRAINED,
@@ -89,7 +91,7 @@ def test_numeric_validated_value_is_numeric_sanitized() -> None:
     # carry shell syntax even though the cmd format still interpolates with %s.
     pc = (
         "void h(char* p){ char c[32]; long n = strtol(p,0,10); "
-        'snprintf(c,32,"cmd %s",n); system(c); }'
+        'snprintf(c,32,"cmd %d",n); system(c); }'
     )
     assert (
         detect_form_signal(
@@ -97,6 +99,7 @@ def test_numeric_validated_value_is_numeric_sanitized() -> None:
             pseudocode=pc,
             callees=["strtol", "snprintf", "system"],
             sink_arg="c",
+            sink_form="var",
         )
         == NUMERIC_SANITIZED
     )
@@ -125,6 +128,7 @@ def test_caller_passes_only_constant_is_caller_constant() -> None:
             pseudocode=pc,
             callees=["system"],
             sink_arg="param_1",
+            sink_form="var",
             func_name="run",
             callers_pseudocode=[caller],
         )
@@ -190,6 +194,7 @@ def test_caller_all_constant_args_is_caller_constant() -> None:
             pseudocode=pc,
             callees=["system"],
             sink_arg="param_2",
+            sink_form="var",
             func_name="run",
             callers_pseudocode=[caller],
         )
@@ -338,6 +343,7 @@ def test_inline_ether_ntoa_into_system_is_charset_constrained() -> None:
             pseudocode=pc,
             callees=["ether_ntoa", "snprintf", "system"],
             sink_arg="c",
+            sink_form="var",
         )
         == CHARSET_CONSTRAINED
     )
@@ -354,6 +360,7 @@ def test_inline_inet_ntop_into_system_is_charset_constrained() -> None:
             pseudocode=pc,
             callees=["inet_ntop", "snprintf", "system"],
             sink_arg="c",
+            sink_form="var",
         )
         == CHARSET_CONSTRAINED
     )
@@ -369,6 +376,7 @@ def test_inline_charset_on_copy_path_is_unchanged() -> None:
             pseudocode=pc,
             callees=["ether_ntoa", "strcpy"],
             sink_arg="d",
+            sink_form="var",
         )
         == CHARSET_CONSTRAINED
     )
@@ -634,6 +642,7 @@ def _cc(pc: str, caller: str, sink_arg: str | None, **kw: object) -> str | None:
         pseudocode=pc,
         callees=["system"],
         sink_arg=sink_arg,
+        sink_form=kw.pop("sink_form", "var"),  # these fixtures forward a plain var parameter
         func_name="run",
         callers_pseudocode=[caller],
         **kw,  # type: ignore[arg-type]
@@ -713,3 +722,112 @@ def test_a_dosystem_template_with_a_variable_is_not_a_constant_command() -> None
     assert note('void f(char *n){ doSystem("ifconfig %s up", n); }') is None
     assert note('void f(void){ doSystem("ifconfig %s up", "br0"); }') == CONST_SINK_ARG
     assert note('void f(void){ doSystem("reboot 100%% now"); }') == CONST_SINK_ARG
+
+
+# ── R5: numeric_sanitized is "every write to the sink buffer is safe" ─────────────────────────
+
+
+def _num(body: str, sink_arg: str = "b", form: str = "var", sink: str = "fopen") -> str | None:
+    pc = "void f(char *x)\n{\n  int i;\n  char b [64];\n" + body + "\n}"
+    return detect_form_signal(
+        sink_name=sink,
+        pseudocode=pc,
+        callees=["atoi", sink],
+        sink_arg=sink_arg,
+        sink_class="path_sink",
+        sink_form=form,
+    )
+
+
+# (name, body, is numeric_sanitized). Every body validates x with atoi (the premise).
+_R5 = [
+    ("integer format", 'i = atoi(x);\n  sprintf(b,"/proc/%d",i);\n  fopen(b,"r");', True),
+    ("%s literal", 'i = atoi(x);\n  sprintf(b,"%s/%d","lit",i);\n  fopen(b,"r");', True),
+    (
+        "offset memset",
+        'i = atoi(x);\n  memset(b + 4,0,0x3c);\n  sprintf(b,"/proc/%d",i);\n  fopen(b,"r");',
+        True,
+    ),
+    (
+        "element write",
+        'i = atoi(x);\n  b[0] = \'\\0\';\n  sprintf(b,"/proc/%d",i);\n  fopen(b,"r");',
+        True,
+    ),
+    ("%s non-literal", 'i = atoi(x);\n  snprintf(b,0x40,"/x/%s-%d",g,i);\n  fopen(b,"w");', False),
+    ("vararg count mismatch", 'i = atoi(x);\n  sprintf(b,"/x/%d/%s",i);\n  fopen(b,"r");', False),
+    (
+        "offset strcpy",
+        'i = atoi(x);\n  sprintf(b,"/proc/%d",i);\n  strcpy(b + 6,y);\n  fopen(b,"r");',
+        False,
+    ),
+    ("escape call", 'i = atoi(x);\n  sprintf(b,"/proc/%d",i);\n  foo(b);\n  fopen(b,"r");', False),
+    ("alias store", 'i = atoi(x);\n  sprintf(b,"/proc/%d",i);\n  q = &b;\n  fopen(b,"r");', False),
+    (
+        "F2 not enclosing",
+        'i = atoi(x);\n  if (c) {\n    sprintf(b,"/proc/%d",i);\n  }\n  fopen(b,"r");',
+        False,
+    ),
+    (
+        "L5 stat writes buf",
+        'i = atoi(x);\n  sprintf(b,"/proc/%d",i);\n  stat(y,b);\n  fopen(b,"r");',
+        False,
+    ),
+]
+
+
+@pytest.mark.parametrize("name,body,want", _R5)
+def test_numeric_sanitized_needs_every_buffer_write_safe(name: str, body: str, want: bool) -> None:
+    """numeric_sanitized fires only when every write to the sink buffer up to the sink is a safe
+    write (literal / constant memset / integer or literal-%s format), nothing escapes or aliases
+    it, and it is a local array.
+
+    MUTATION (verified RED): accept a %s with a non-literal vararg -> the ``%s non-literal`` case
+    turns True; drop the escape/alias scan -> ``escape call`` / ``alias store`` turn True; drop F1
+    -> the global/parameter cases below turn True; drop F2 -> ``F2 not enclosing`` turns True."""
+    assert (_num(body) == NUMERIC_SANITIZED) is want, name
+
+
+def test_numeric_sanitized_requires_a_local_array_buffer() -> None:
+    """F1: the buffer must be a local array — a global or a parameter is not provably bounded.
+
+    MUTATION (verified RED): drop the local-array requirement -> both turn numeric_sanitized."""
+    glob = (
+        "void f(char *x)\n{\n  int i;\n  i = atoi(x);\n"
+        '  snprintf(&DAT_0041,0x20,"/proc/%d",i);\n  fopen(&DAT_0041,"w");\n}'
+    )
+    assert (
+        detect_form_signal(
+            sink_name="fopen",
+            pseudocode=glob,
+            callees=["atoi", "fopen"],
+            sink_arg="DAT_0041",
+            sink_class="path_sink",
+            sink_form="addr_of",
+        )
+        is None
+    )
+    par = (
+        "void f(char *param_1,char *x)\n{\n  int i;\n  i = atoi(x);\n"
+        '  sprintf(param_1,"/proc/%d",i);\n  fopen(param_1,"r");\n}'
+    )
+    assert (
+        detect_form_signal(
+            sink_name="fopen",
+            pseudocode=par,
+            callees=["atoi", "fopen"],
+            sink_arg="param_1",
+            sink_class="path_sink",
+            sink_form="var",
+        )
+        is None
+    )
+
+
+def test_a_loaded_sink_argument_is_never_read_as_safe() -> None:
+    """R3: a numeric / charset downweight is trusted only when the root IS the value. A value read
+    through a pointer (form ``load``) is never recognized as safe, even when the premise holds.
+
+    MUTATION (verified RED): drop the SAFE_FORMS gate -> the load form is downweighted."""
+    body = 'i = atoi(x);\n  sprintf(b,"/proc/%d",i);\n  fopen(b,"r");'
+    assert _num(body, form="var") == NUMERIC_SANITIZED  # the var form IS recognized
+    assert _num(body, form="load") is None  # the same body read through a pointer is not

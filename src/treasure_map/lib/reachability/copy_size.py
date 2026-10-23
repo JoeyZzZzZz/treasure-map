@@ -35,7 +35,15 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from treasure_map.lib.pattern.classes import FORMAT, call_args_at, call_offsets
+from treasure_map.lib.pattern.classes import (
+    FORMAT,
+    ArgRef,
+    _match_close,
+    _split_cast,
+    arg_ref,
+    call_args_at,
+    call_offsets,
+)
 from treasure_map.lib.reachability.taint import _IDENT_RE
 
 # Size-source kinds (mechanism labels, not verdicts).
@@ -167,15 +175,22 @@ class CopySize:
     """The size-source classification of one copy call.
 
     kind is one of the SIZE_* labels. size_text is the raw length expression (or, for an
-    unsized strcpy, the source argument that determines the length). size_var is its leading
-    identifier when the length is not a literal. clamps lists the upper-bound/guard shapes seen
-    referencing size_var (each is coverage-unjudged — presence only, never a dominance claim).
+    unsized strcpy, the source argument that determines the length). size_var is its root
+    variable (``classes.arg_ref``) when the length is not a literal. clamps lists the
+    upper-bound/guard shapes seen referencing the length (each is coverage-unjudged — presence
+    only, never a dominance claim). ``form`` / ``lead`` / ``path`` are the argument's form, the
+    kind of its first operand and — when that operand is read through a pointer, an index or a
+    field — the access path the clamp search matched on (a bound on ``p[0x14]`` says nothing about
+    ``p[7]``).
     """
 
     kind: str
     size_text: str | None
     size_var: str | None
     clamps: tuple[str, ...] = ()
+    form: str | None = None
+    lead: str | None = None
+    path: str | None = None
 
 
 def copy_size_form_note(kind: str) -> str | None:
@@ -209,19 +224,56 @@ _SIZEOF_TERM_RE = re.compile(r"\bsizeof\s*\((?:[^()]|\([^()]*\))*\)|\bsizeof\s+[
 _NUMBER_RE = re.compile(r"\b(?:0[xX][0-9a-fA-F]+|\d+)[uUlL]*\b")
 
 
+def _strip_leading_casts(text: str) -> str:
+    """``text`` without the casts (and whole-text parentheses) it opens with: ``(size_t)sizeof(x)``
+    -> ``sizeof(x)``, ``(size_t)0x40`` -> ``0x40``. Nothing else is touched."""
+    t = text.strip()
+    while True:
+        if t.startswith("(") and _match_close(t, 0) == len(t) - 1:
+            t = t[1:-1].strip()
+            continue
+        split = _split_cast(t)
+        if split is None:
+            return t
+        t = split[1]
+
+
 def _is_sizeof_expr(size: str) -> bool:
     """A length built only from ``sizeof`` terms and numeric literals (``sizeof(dst)``,
-    ``sizeof(dst) - 1``) — fixed at compile time. Any other name in it makes it a variable length:
-    ``n * sizeof(int)`` and ``len - sizeof(hdr)`` are as long as ``n`` and ``len`` say."""
+    ``sizeof(dst) - 1``, ``(size_t)sizeof(dst)``) — fixed at compile time. Any other name in it
+    makes it a variable length: ``n * sizeof(int)`` and ``len - sizeof(hdr)`` are as long as ``n``
+    and ``len`` say. Only the casts the length OPENS with are set aside: a name left over is a name,
+    even one that reads like a type (``sizeof(h) + code``)."""
+    size = _strip_leading_casts(size)
     if "sizeof" not in size:
         return False
     rest = _NUMBER_RE.sub(" ", _SIZEOF_TERM_RE.sub(" ", size))
     return _IDENT_RE.search(rest) is None
 
 
-def _lead_ident(text: str) -> str | None:
-    m = _IDENT_RE.search(text)
-    return m.group(0) if m else None
+def _is_number(size: str) -> bool:
+    """A numeric literal, once the casts it opens with are set aside (``(size_t)0x40``)."""
+    return _NUM_LITERAL_RE.match(_strip_leading_casts(size)) is not None
+
+
+def _with_ref(kind: str, size: str, ref: ArgRef, clamps: tuple[str, ...] = ()) -> CopySize:
+    """A CopySize carrying the length argument's root, form, lead and path."""
+    return CopySize(kind, size, ref.root, clamps, form=ref.form, lead=ref.lead, path=ref.path)
+
+
+def _match_expr(ref: ArgRef) -> str | None:
+    """What a bound has to name to bound this length: the access path when the length is read
+    through a pointer / index / field (alone, or as an expression's first operand), else the root
+    variable."""
+    return ref.path if ref.lead == "load" else ref.root
+
+
+def _expr_re(expr: str) -> str:
+    """``expr`` as a pattern that matches it as a whole operand: not a suffix of a longer name or
+    member access (``q->expr``, ``s.expr``), not a prefix of an indexed or member access
+    (``expr[1]``, ``expr.f``, ``expr->f``). Whitespace inside it may vary."""
+    escaped = re.escape(" ".join(expr.split())).replace(r"\ ", r"\s*")
+    return rf"(?<![\w>.]){escaped}(?![\w\[.]|->)"
 
 
 def _clamps_for(pseudocode: str, var: str) -> tuple[str, ...]:
@@ -231,14 +283,17 @@ def _clamps_for(pseudocode: str, var: str) -> tuple[str, ...]:
     this copy, so it must not demote it. Only upper-bound shapes count (``>`` / ``>=`` against a
     non-zero constant, a min()/ternary clamp, or a re-assign guard) — a lower-bound or ``> 0``
     check does not bound the write. Includes the check-then-abort form (``if (CONST < v) ...``),
-    which need not re-assign v to be a guard."""
-    v = re.escape(var)
+    which need not re-assign v to be a guard.
+
+    ``var`` is the length's match expression (``_match_expr``): a variable, or an access path, each
+    matched as a whole operand (``_expr_re``)."""
+    v = _expr_re(var)
     shapes: tuple[tuple[str, str], ...] = (
         (rf"if\s*\(\s*{v}\s*>=?\s*{_BOUND_CONST}", "if (v >= CONST)"),
-        (rf"if\s*\(\s*{_BOUND_CONST}\s*<=?\s*{v}\b", "if (CONST <= v)"),
-        (rf"\b{v}\s*=\s*[^;]*\?\s*{v}\s*:\s*{_BOUND_CONST}", "v = (...) ? v : CONST"),
-        (rf"\b{v}\s*=\s*(?:min|MIN|fmin)\s*\(", "v = min(...)"),
-        (rf"if\s*\([^)]*\b{v}\b[^)]*\)\s*{v}\s*=\s*{_BOUND_CONST}", "if (...v...) v = CONST"),
+        (rf"if\s*\(\s*{_BOUND_CONST}\s*<=?\s*{v}", "if (CONST <= v)"),
+        (rf"{v}\s*=\s*[^;]*\?\s*{v}\s*:\s*{_BOUND_CONST}", "v = (...) ? v : CONST"),
+        (rf"{v}\s*=\s*(?:min|MIN|fmin)\s*\(", "v = min(...)"),
+        (rf"if\s*\([^)]*{v}[^)]*\)\s*{v}\s*=\s*{_BOUND_CONST}", "if (...v...) v = CONST"),
     )
     return tuple(label for pat, label in shapes if re.search(pat, pseudocode))
 
@@ -247,11 +302,11 @@ def _pointer_guards(pseudocode: str, var: str) -> tuple[str, ...]:
     """Pointer/bound comparisons referencing ``var`` (e.g. ``bound < base + n``).
 
     Conservative: the length variable must appear in a comparison that adds it to another value
-    (a source-room proof). Presence only, coverage-unjudged."""
-    v = re.escape(var)
+    (a source-room proof). Presence only, coverage-unjudged. ``var`` as in ``_clamps_for``."""
+    v = _expr_re(var)
     shapes: tuple[tuple[str, str], ...] = (
-        (rf"\w+\s*[<>]=?\s*\w+\s*\+\s*{v}\b", "X < base + v"),
-        (rf"\b{v}\s*\+\s*\w+\s*[<>]=?\s*\w+", "v + X < bound"),
+        (rf"\w+\s*[<>]=?\s*\w+\s*\+\s*{v}", "X < base + v"),
+        (rf"{v}\s*\+\s*\w+\s*[<>]=?\s*\w+", "v + X < bound"),
         (rf"\w+\s*\+\s*{v}\s*[<>]=?\s*\w+", "base + v < bound"),
     )
     return tuple(label for pat, label in shapes if re.search(pat, pseudocode))
@@ -336,17 +391,17 @@ def classify_format_size(
         return CopySize(SIZE_UNTRACED, None, None)
 
     size = args[pos].strip()
-    if _NUM_LITERAL_RE.match(size):
+    if _is_number(size):
         return CopySize(const_kind, size, None)
     if _is_sizeof_expr(size):
         # A sizeof still bounds only the WRITE here, not the destination's capacity relative to
         # what gets formatted into it, so it stays a cap/append kind rather than borrowing the
         # copy path's sizeof — which does carry a form note and would demote this.
         return CopySize(const_kind, size, None)
-    var = _lead_ident(size)
-    if var is None:
-        return CopySize(SIZE_UNTRACED, size, None)
-    return CopySize(var_kind, size, var)
+    ref = arg_ref(size)
+    if ref.root is None:
+        return CopySize(SIZE_UNTRACED, size, None, form=ref.form)
+    return _with_ref(var_kind, size, ref)
 
 
 def classify_copy_size(
@@ -382,7 +437,8 @@ def classify_copy_size(
         src = args[1].strip()
         if _STRING_LITERAL_RE.match(src):
             return CopySize(SIZE_CONST, src, None)  # copying a fixed literal is bounded
-        return CopySize(SIZE_SOURCE_LEN, src, _lead_ident(src))
+        ref = arg_ref(src)
+        return CopySize(SIZE_SOURCE_LEN, src, ref.root, form=ref.form, lead=ref.lead, path=ref.path)
 
     if sink_name not in _SIZED_COPY:
         return CopySize(SIZE_UNTRACED, None, None)
@@ -390,7 +446,7 @@ def classify_copy_size(
     if len(args) < 3:
         return CopySize(SIZE_UNTRACED, None, None)
     size = args[2].strip()
-    if _NUM_LITERAL_RE.match(size):
+    if _is_number(size):
         return CopySize(SIZE_CONST, size, None)
     if _is_sizeof_expr(size):
         if sink_name in _WIDE_ELEMENT_COPY:
@@ -398,15 +454,16 @@ def classify_copy_size(
             # classic unit error, not a size-of bound. Keep it live rather than demote it.
             return CopySize(SIZE_VARIABLE, size, None)
         return CopySize(SIZE_SIZEOF, size, None)
+    ref = arg_ref(size)
     if _STRLEN_RE.search(size):
-        return CopySize(SIZE_SOURCE_LEN, size, _lead_ident(size))
-    var = _lead_ident(size)
-    if var is None:
-        return CopySize(SIZE_UNTRACED, size, None)
-    clamps = _clamps_for(pseudocode, var)
+        return _with_ref(SIZE_SOURCE_LEN, size, ref)
+    match = _match_expr(ref)
+    if ref.root is None or match is None:
+        return CopySize(SIZE_UNTRACED, size, None, form=ref.form)
+    clamps = _clamps_for(pseudocode, match)
     if clamps:
-        return CopySize(SIZE_CLAMP, size, var, clamps)
-    guards = _pointer_guards(pseudocode, var)
+        return _with_ref(SIZE_CLAMP, size, ref, clamps)
+    guards = _pointer_guards(pseudocode, match)
     if guards:
-        return CopySize(SIZE_POINTER_GUARD, size, var, guards)
-    return CopySize(SIZE_VARIABLE, size, var)
+        return _with_ref(SIZE_POINTER_GUARD, size, ref, guards)
+    return _with_ref(SIZE_VARIABLE, size, ref)

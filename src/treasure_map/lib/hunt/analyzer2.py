@@ -101,13 +101,15 @@ from treasure_map.lib.hunt.wrapper_propagation import (
 from treasure_map.lib.pattern import scan
 from treasure_map.lib.pattern.classes import (
     CMD,
+    ArgRef,
     all_path_calls_literal,
-    path_arg_ident,
+    arg_ref,
+    path_arg_ref,
 )
 from treasure_map.lib.pattern.scanner import load_stub_names
 from treasure_map.lib.query.nvram import template_has_anchor
 from treasure_map.lib.reachability import grade_candidate
-from treasure_map.lib.reachability.taint import _IDENT_RE, locate_sink_arg
+from treasure_map.lib.reachability.taint import locate_sink_arg_ref
 from treasure_map.lib.ro_db import ro_connect, ro_uri
 from treasure_map.version import __version__, installed_commit
 
@@ -499,8 +501,21 @@ def _wrapper_sink_arg(
     stub_names: Mapping[int, str] | None = None,
     occurrence: int | None = None,
 ) -> str | None:
-    """The identifier feeding the wrapper's dangerous argument — at the FORMAT position when one is
-    known, otherwise the first argument.
+    """The variable feeding the wrapper's dangerous argument: the root of ``_wrapper_sink_arg_ref``
+    (None for a literal, a constant address, or an argument that could not be read)."""
+    ref = _wrapper_sink_arg_ref(pseudocode, wrapper_name, fmt_index, stub_names, occurrence)
+    return ref.root if ref is not None else None
+
+
+def _wrapper_sink_arg_ref(
+    pseudocode: str,
+    wrapper_name: str,
+    fmt_index: int | None,
+    stub_names: Mapping[int, str] | None = None,
+    occurrence: int | None = None,
+) -> ArgRef | None:
+    """The wrapper's dangerous argument, read (``classes.arg_ref``) — at the FORMAT position when
+    one is known, otherwise the first argument. None when the call or the argument is not there.
 
     ``occurrence`` (0-based, text order, located with ``stub_names``) reads the candidate's OWN call
     to the wrapper. None is the function-level fallback and keeps the historical reading of the
@@ -515,22 +530,19 @@ def _wrapper_sink_arg(
     chasing a name that does not exist. The constant is carried by the provenance record instead."""
     if occurrence is None:
         if fmt_index is None:
-            return locate_sink_arg(pseudocode, wrapper_name)
+            return locate_sink_arg_ref(pseudocode, wrapper_name)
         arg = format_argument(pseudocode, wrapper_name, fmt_index)
         if arg is None:
-            return locate_sink_arg(pseudocode, wrapper_name)
+            return locate_sink_arg_ref(pseudocode, wrapper_name)
     else:
         if fmt_index is None:
-            return locate_sink_arg(pseudocode, wrapper_name, stub_names, occurrence)
+            return locate_sink_arg_ref(pseudocode, wrapper_name, stub_names, occurrence)
         arg = format_argument(
             pseudocode, wrapper_name, fmt_index, stub_names=stub_names, occurrence=occurrence
         )
         if arg is None:
-            return locate_sink_arg(pseudocode, wrapper_name, stub_names, occurrence)
-    ident = _IDENT_RE.search(arg)
-    if ident is None or arg.lstrip().startswith('"'):
-        return None
-    return ident.group(0)
+            return locate_sink_arg_ref(pseudocode, wrapper_name, stub_names, occurrence)
+    return arg_ref(arg)
 
 
 def _wrapper_fingerprint(sink_class: str, source_class: str, wrapped_sink: str) -> str:
@@ -1495,16 +1507,20 @@ def run_analyzer2(
                 # The danger axis differs by sink: a path/file sink is graded on its per-sink PATH
                 # argument (fopen arg0, openat/unlinkat arg1, …), NOT arg0. Every other sink keeps
                 # the historical arg0 command-string axis, byte-for-byte.
+                # Read once as an ArgRef: the danger readings take its root (a load's base pointer
+                # included), the safe-direction notes only the forms whose root IS the value.
+                sink_ref: ArgRef | None
                 if sink_name is None:
-                    sink_arg = None
+                    sink_ref = None
                 elif match.sink_class == "path_sink":
-                    sink_arg = path_arg_ident(
+                    sink_ref = path_arg_ref(
                         row.pseudocode, sink_name, stub_names, match.sink_callsite_occurrence
                     )
                 else:
-                    sink_arg = locate_sink_arg(
+                    sink_ref = locate_sink_arg_ref(
                         row.pseudocode, sink_name, stub_names, copy_occurrence
                     )
+                sink_arg = sink_ref.root if sink_ref is not None else None
                 if sink_name is None:
                     status, blocking = "unknown", None
                 else:
@@ -1565,6 +1581,7 @@ def run_analyzer2(
                         stub_names=stub_names,
                         occurrence=copy_occurrence,
                         sink_class=match.sink_class,
+                        sink_form=sink_ref.form if sink_ref is not None else None,
                     )
                 # Recall fallback: a bare sink with no recognized in-function source (and no
                 # constructed shell command — cmd_injection_shape is exempt; its shell-ish literal
@@ -1601,6 +1618,7 @@ def run_analyzer2(
                         callees=callees,
                         sink_arg=sink_arg,
                         entry_sites=sites,
+                        sink_ref=sink_ref,
                     )
                     # ★ Red-line write-side reconciliation (Gate A): never persist a const_sink_arg
                     # note on a candidate whose sink argument is a free_string source. Drop the
@@ -1683,6 +1701,7 @@ def run_analyzer2(
                         callees=callees,
                         sink_arg=sink_arg,
                         entry_sites=sites,
+                        sink_ref=sink_ref,
                     )
                     # Gate A (same as the cmd axis): never persist a const_sink_arg note on a path
                     # whose argument is a free_string source.
@@ -1826,9 +1845,10 @@ def run_analyzer2(
                 # The SAME stub table the finder counted this candidate's calls with, so the call
                 # every per-call reader below looks at is the call the candidate is anchored to.
                 wc_stub_names = stub_by_binary.get(f.binary_id)
-                sink_arg = _wrapper_sink_arg(
+                wrapper_ref = _wrapper_sink_arg_ref(
                     f_pseudocode, wc.wrapper_name, fmt_index, wc_stub_names, wc.occurrence
                 )
+                sink_arg = wrapper_ref.root if wrapper_ref is not None else None
                 # ★ The form note is a COMMAND-axis reading, and only the command axis may carry it.
                 # All three notes it produces describe the wrapper's FIRST argument: a literal there
                 # is a constant command, a numeric- or charset-constrained one cannot carry shell
@@ -1848,13 +1868,19 @@ def run_analyzer2(
                     None
                     if wc.sink_class == FMT_STRING_CLASS
                     else wrapper_propagation_form_note(
-                        f_pseudocode, wc.wrapper_name, sink_arg, wc_stub_names, wc.occurrence
+                        f_pseudocode,
+                        wc.wrapper_name,
+                        sink_arg,
+                        wc_stub_names,
+                        wc.occurrence,
+                        sink_form=wrapper_ref.form if wrapper_ref is not None else None,
                     )
                 )
                 evidence = build_flow_evidence(
                     pseudocode=f_pseudocode,
                     callees=f_callees,
                     sink_arg=sink_arg,
+                    sink_ref=wrapper_ref,
                     entry_sites=entry_index.sites_for(f.binary_name, f.binary_path),
                     wrapper={
                         "name": wc.wrapper_name,

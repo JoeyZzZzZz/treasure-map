@@ -553,3 +553,38 @@ def test_the_fetch_reads_each_uncached_ref_once_and_keeps_every_row() -> None:
     db.execute("DELETE FROM instance")
     again = ax.fetch(db, "runB", [REF], cache, ("atlas", "runB"))
     assert len(again[REF]) == 2  # served from the cache
+
+
+# ── S7: a loaded sink/length matches by its access path, never by its base pointer ────────────
+
+
+def test_a_loaded_sink_argument_does_not_link_by_its_base_pointer() -> None:
+    """S7: when the sink argument was read through a pointer (``sink_arg_form`` load), the recorded
+    root is a base, not the value, and the access path is not on this axis. A guard on the base
+    neither matches (yes) nor rules out (no) -> unknown; a genuine one-hop source still matches.
+
+    MUTATION (verified RED): ignore sink_arg_form and keep the base in the yes/no set -> the base
+    guard reads yes, and a missed name reads no."""
+    rec = _cmd(flow_path={"sink_arg": "p", "one_hop": ["local_118"], "sink_arg_form": "load"})
+    assert _links(rec, "p")["sink_arg"] == {"yes": [], "no": [], "unknown": [0]}
+    assert _links(rec, "local_118")["sink_arg"]["yes"] == [0]  # a real one-hop source still yes
+    assert _links(rec, "iVar9")["sink_arg"] == {"yes": [], "no": [], "unknown": [0]}  # never no
+
+
+def test_a_loaded_length_matches_the_path_components_not_the_base() -> None:
+    """S7: a length read through a pointer matches a guard that names a component of its access
+    path, not its base pointer; a base-only guard is unknown, never no.
+
+    MUTATION (verified RED): match the base pointer / give no on a miss -> RED."""
+    rec = _copy(
+        size_flow={
+            "size_arg": "p->len",
+            "size_var": "p",
+            "one_hop": [],
+            "size_arg_form": "load",
+            "size_arg_path": "p->len",
+        }
+    )
+    assert _links(rec, "len", "copy")["size_arg"]["yes"] == [0]  # a path component matches
+    assert _links(rec, "p", "copy")["size_arg"] == {"yes": [], "no": [], "unknown": [0]}  # base
+    assert _links(rec, "iVar9", "copy")["size_arg"] == {"yes": [], "no": [], "unknown": [0]}

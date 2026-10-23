@@ -595,3 +595,59 @@ def test_only_a_fortified_call_carries_the_objsize_fact_and_it_never_moves_the_s
     )
     assert fmt["objsize"]["unbounded"] is True
     assert fmt["format_string"] == "literal_with_args"
+
+
+# ── R4 / R9: the trace boundary and form fields follow the argument's ArgRef ──────────────────
+
+from treasure_map.lib.pattern.classes import arg_ref  # noqa: E402
+
+
+def _cmd_boundary(sink_arg_text: str) -> tuple[str, str | None]:
+    """(trace_boundary, flow_path.sink_arg_form) for a command sink whose argument is
+    ``sink_arg_text`` — read exactly as analyzer2 passes it: the ArgRef and its root."""
+    ref = arg_ref(sink_arg_text)
+    ev = build_flow_evidence(
+        pseudocode="void f(void){ system(X); }",
+        callees=["system"],
+        sink_arg=ref.root,
+        entry_sites=None,
+        sink_ref=ref,
+    )
+    return ev["trace_boundary"], ev["flow_path"]["sink_arg_form"]
+
+
+def test_the_boundary_follows_the_sink_argument_form() -> None:
+    """R4: a literal reaches the sink; a value loaded through a pointer, or a constant address, is
+    ``loaded_through_pointer``; an argument that parsed to nothing is ``sink_arg_unparsed``; and a
+    sink whose call/argument could not be located is ``sink_arg_unlocated`` — none of these is
+    ever ``reached_sink``, and the form is recorded either way (R9).
+
+    MUTATION (verified RED): call ``reached_sink`` for a load / const_addr / none -> RED."""
+    assert _cmd_boundary('"/bin/sh -c x"') == ("reached_sink", "literal")
+    assert _cmd_boundary("(char *)0x401234") == ("loaded_through_pointer", "const_addr")
+    assert _cmd_boundary("*(char **)(p + 4)") == ("loaded_through_pointer", "load")
+    assert _cmd_boundary("size_t") == ("sink_arg_unparsed", "none")
+    # the call/argument could not be located at all (analyzer2 passes sink_ref=None)
+    located_none = build_flow_evidence(
+        pseudocode="void f(void){ system(X); }",
+        callees=["system"],
+        sink_arg=None,
+        entry_sites=None,
+        sink_ref=None,
+    )
+    assert located_none["trace_boundary"] == "sink_arg_unlocated"
+    assert located_none["flow_path"]["sink_arg_form"] is None
+
+
+def test_a_loaded_length_records_its_form_and_path_and_boundary() -> None:
+    """R9: a length read through a pointer carries ``size_arg_form`` and ``size_arg_path`` and its
+    boundary is ``loaded_through_pointer`` (R4).
+
+    MUTATION (verified RED): stop recording size_arg_path / reading the load form -> RED."""
+    ev = build_size_evidence(pseudocode="void f(T *p){ memcpy(d,s,p->len); }", sink_name="memcpy")
+    assert ev["size_flow"].get("size_arg_form") == "load"
+    assert ev["size_flow"].get("size_arg_path") == "p->len"
+    assert ev["trace_boundary"] == "loaded_through_pointer"
+    # a plain variable length records its form and no path
+    ev2 = build_size_evidence(pseudocode="void f(int n){ memcpy(d,s,n); }", sink_name="memcpy")
+    assert ev2["size_flow"]["size_arg_form"] == "var" and "size_arg_path" not in ev2["size_flow"]
