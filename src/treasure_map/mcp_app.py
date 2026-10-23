@@ -2198,11 +2198,11 @@ def make_tools(
         ``decompile_incomplete:<tag>`` = the decompiler marked its output incomplete,
         ``body_size_differs`` = the two body byte counts differ), ``identical_callee_unverified``
         (text matches, callees not verified — NOT "unchanged"), ``differs``, ``no_body`` (an
-        import/PLT stub, not in the functions table) or ``unavailable`` (in the table, empty body —
-        get_diff_meta's functions.unavailable_by_cause splits these by why: ``skipped_micro`` = the
-        function is under ~10 bytes and tmap does not decompile it BY DESIGN, a binary property and
-        NOT a read failure, told apart from ``decompile_empty`` / ``size_unknown`` /
-        ``db_unavailable``);
+        import/PLT stub, not in the functions table), ``skipped_micro`` (no text to compare only
+        because a side is under ~10 bytes, which tmap does not decompile BY DESIGN — a binary
+        property, NOT a read failure) or ``unavailable`` (a side's text could not be read: an empty
+        decompile, an unrecorded size or an unreadable analysis.db; get_diff_meta's
+        functions.unavailable_by_cause splits these two states by why);
         the similarity-1 pairs that place no entry are counted by it under ``not_listed``
         (``not_listed_page=<name>`` walks one category, e.g. ``aligned_pseudocode_differs``). A
         qualified match carries ``hidden_region``: each decompiler warning with the address it
@@ -2701,9 +2701,10 @@ def make_tools(
         (pseudocode AND callees match), ``changed`` (``with_scoped_sink_delta`` = bucket A or a
         changed sink length constant; ``no_scoped_signal`` = no in-scope sink signal, NOT
         'noise'), ``unverified`` (identical_text_unverified + identical_callee_unverified +
-        unavailable — neither unchanged nor changed; ``identical_text_unverified_by_body`` splits
-        the first by body class; ``unavailable_by_cause`` splits the unavailable count by why a side
-        had no text, summing to it), ``no_body`` (an import / PLT stub, counted apart),
+        unavailable + skipped_micro — neither unchanged nor changed;
+        ``identical_text_unverified_by_body`` splits the first by body class;
+        ``unavailable_by_cause`` splits unavailable and skipped_micro by why a side had no text,
+        summing to unavailable + skipped_micro), ``no_body`` (an import / PLT stub, counted apart),
         ``alignment_undetermined`` (``alignment_undetermined_reading`` splits it by each pair's
         proposed reading, never into the aligned counts;
         ``alignment_undetermined_anchored_differs`` = the pairs flagged anchored_differs at or above
@@ -2908,7 +2909,12 @@ def make_tools(
         lines (a single line longer than the budget comes whole, ``line_over_budget: true``),
         and the segments joined in order are the text exactly. ``paging.total_chars`` is the
         whole text's length in characters. An ``offset`` past the last line is an error that
-        gives ``total_lines``."""
+        gives ``total_lines``.
+
+        An empty text comes with ``pseudocode_status`` and its note: ``skipped_micro`` (under ~10
+        bytes, not decompiled by design — its ``disassembly`` comes inline, or
+        ``disassembly_status`` says why it cannot), ``decompile_empty`` or ``size_unknown`` (read
+        get_disassembly). A function with text carries none of these."""
         return _fact(
             lambda c, fn, bn: facts.get_pseudocode(
                 c, func=fn or "", binary=bn, offset=offset, max_chars=facts._FACT_PAGE_CHARS

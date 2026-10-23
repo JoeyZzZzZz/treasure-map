@@ -251,6 +251,45 @@ def test_cli_mcp_lib_parity_pseudocode(tmp_path: Path) -> None:
     assert lib_result == {k: v for k, v in payload.items() if k != "paging"} == cli_result
 
 
+def test_cli_mcp_lib_parity_on_a_micro_function_with_no_text(tmp_path: Path) -> None:
+    """A micro-function with no text reads the same through lib, MCP and CLI: its
+    pseudocode_status, note and inline disassembly included."""
+    analysis = _mk_analysis(tmp_path)
+    conn = open_db(analysis)
+    fid = conn.execute(
+        "INSERT INTO functions (binary_id, name, address, size_bytes, pseudocode, callees) "
+        "VALUES (1, 'tiny_stub', '0x7100', 6, '', '[]')"
+    ).lastrowid
+    units = [{"a": "0x7100", "n": 4, "k": "code", "m": "jr", "o": "ra"}]
+    conn.execute(
+        "INSERT INTO function_listing (function_id, listing, unit_count, insn_count, truncated) "
+        "VALUES (?, ?, 1, 1, 0)",
+        (fid, zlib.compress(json.dumps(units).encode())),
+    )
+    conn.execute(
+        "INSERT INTO detector_scan_status (binary_id, detector, scanned, found_count) "
+        "VALUES (1, 'listing', 1, 1)"
+    )
+    conn.commit()
+    conn.close()
+    tools = mcp_app.make_tools(_mk_atlas(tmp_path))
+    conn = facts.open_analysis_ro(analysis)
+    lib_result = facts.get_pseudocode(conn, func="tiny_stub")
+    paged = facts.get_pseudocode(conn, func="tiny_stub", max_chars=facts._FACT_PAGE_CHARS)
+    conn.close()
+    payload = _fact_payload(tools["get_pseudocode"]("tiny_stub", run_id="run_m"))
+    cli = CliRunner().invoke(
+        fact_group, ["pseudocode", "tiny_stub", "--analysis-db", str(analysis)]
+    )
+    assert cli.exit_code == 0, cli.output
+    assert lib_result["pseudocode_status"] == "skipped_micro"
+    assert [i["mnemonic"] for i in lib_result.get("disassembly", ())] == ["jr"]
+    assert payload == paged
+    assert (
+        lib_result == {k: v for k, v in payload.items() if k != "paging"} == json.loads(cli.output)
+    )
+
+
 # A body well over the fact-page budget, with CRLF line ends and no final newline.
 _LONG_BODY = "".join(f"  step_{i:04d}(param_1, 0x{i:x});\r\n" for i in range(2500)) + "  return;"
 

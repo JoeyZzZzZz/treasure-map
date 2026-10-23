@@ -32,11 +32,12 @@ def _db(
     block_bytes: bytes = bytes(range(8)),
     pseudocode: str | None = "void h(){}",
     units: list[dict] | None = None,
+    size: int = 0,
 ) -> Path:
     """``block_bytes`` is what the one 8-byte code block stores: fewer than 8 is a capped capture
     (``truncated=1``), the shape a block past the extractor's byte cap is stored in. ``pseudocode``
     None is a function with no text (a micro-stub's shape); ``units`` replaces the stored
-    listing."""
+    listing. ``size`` is the function's size_bytes."""
     db = tmp_path / "analysis.db"
     conn = open_db(db)
     conn.execute(
@@ -45,9 +46,9 @@ def _db(
         ("a" * 64,),
     )
     conn.execute(
-        "INSERT INTO functions (id, binary_id, name, address, pseudocode, callees) "
-        "VALUES (1, 1, 'handle', '0x1000', ?, '[]')",
-        (pseudocode,),
+        "INSERT INTO functions (id, binary_id, name, address, pseudocode, callees, size_bytes) "
+        "VALUES (1, 1, 'handle', '0x1000', ?, '[]', ?)",
+        (pseudocode, size),
     )
     # one code block covering 0x1000.. with recognisable bytes
     conn.execute(
@@ -84,26 +85,35 @@ def test_get_disassembly_returns_units_with_bytes_from_the_blocks(tmp_path: Path
 
 
 def test_the_diff_view_inlines_the_items_get_disassembly_returns(tmp_path: Path) -> None:
-    """The diff view's inline listing of a micro-stub (sameness.read_micro_listings) and
-    get_disassembly decode a stored listing in one place (facts.listing_items): the items agree
-    field for field, bytes aside — a unit stored without a length included, which reads 0 in both.
+    """The diff view's inline listing of a micro-stub (sameness.read_micro_listings),
+    get_disassembly and get_pseudocode's inline ``disassembly`` of a micro-function decode a stored
+    listing in one place (facts.listing_items): the items agree field for field, bytes aside — a
+    unit stored without a length included, which reads 0 in all three — and get_pseudocode's
+    items are get_disassembly's, bytes included.
 
     MUTATION (verified RED): give read_micro_listings its own decoder that passes the stored length
     through (the pre-fix sameness._listing_units) -> the length-less unit reads None there and 0 in
-    get_disassembly -> RED."""
-    db = _db(tmp_path, pseudocode=None, units=[*_UNITS, {"a": "0x100c", "k": "data"}])
+    get_disassembly -> RED.
+    MUTATION (verified RED): leave the bytes out of get_pseudocode's inline items -> RED."""
+    db = _db(tmp_path, pseudocode=None, units=[*_UNITS, {"a": "0x100c", "k": "data"}], size=6)
     conn = facts.open_analysis_ro(db)
     try:
         full = facts.get_disassembly(conn, func="handle")
+        pseudo = facts.get_pseudocode(conn, func="handle")
     finally:
         conn.close()
-    bare = [
-        {k: v for k, v in i.items() if k not in ("bytes", "bytes_unavailable")}
-        for i in full["instructions"]
-    ]
-    assert len(bare) == 4 and bare[3]["length"] == 0
+
+    def bare(items: list[dict]) -> list[dict]:  # type: ignore[type-arg]
+        return [
+            {k: v for k, v in i.items() if k not in ("bytes", "bytes_unavailable")} for i in items
+        ]
+
+    assert len(bare(full["instructions"])) == 4 and bare(full["instructions"])[3]["length"] == 0
     inline = sameness.read_micro_listings(str(db), "a" * 64, {norm_hex("0x1000")})
-    assert inline[norm_hex("0x1000")]["listing"] == bare
+    assert inline[norm_hex("0x1000")]["listing"] == bare(full["instructions"])
+    assert pseudo["pseudocode_status"] == "skipped_micro"
+    assert bare(pseudo.get("disassembly", [])) == bare(full["instructions"])
+    assert pseudo["disassembly"] == full["instructions"]
 
 
 def test_a_binary_without_listing_support_is_unavailable_with_a_reason(tmp_path: Path) -> None:
@@ -293,3 +303,232 @@ def test_a_missing_listing_on_a_listing_pass_binary_is_not_called_an_old_scan(
     assert out["available"] is False
     assert "analysed before" not in out["reason"]
     assert "no listing was stored" in out["reason"]
+
+
+# ── every outcome, against a recording made before the listing read was shared ─────────────────
+
+_BRANCHES_GOLDEN = Path(__file__).resolve().parents[2] / "fixtures" / "disassembly_branches.json"
+
+
+def _branch_outputs(tmp_path: Path) -> dict[str, dict]:  # type: ignore[type-arg]
+    """get_disassembly over every way a listing can be stored or missing: a full listing (with a
+    unit outside the block), one cut short by a capped block, two pages of a big listing, a NULL
+    blob on a listing-pass binary and on an old one, a listing decoding to no unit, one that does
+    not decode, an errored export, a missing row with no error, and an old scan."""
+    out: dict[str, dict] = {}  # type: ignore[type-arg]
+
+    def at(name: str) -> Path:
+        d = tmp_path / name
+        d.mkdir()
+        return d
+
+    out["full"] = _disassemble(_db(at("full")))
+    out["capped_block"] = _disassemble(_db(at("capped"), block_bytes=bytes(range(6))))
+    conn = facts.open_analysis_ro(_db_big_listing(at("big"), 200))
+    try:
+        first = facts.get_disassembly(conn, func="handle")
+        out["big_first"] = first
+        out["big_second"] = facts.get_disassembly(
+            conn, func="handle", offset=first["paging"]["next_offset"]
+        )
+    finally:
+        conn.close()
+    out["null_blob"] = _disassemble(_db_listing_states(at("null"), row=True, listing=None))
+    out["no_units"] = _disassemble(_db_listing_states(at("none"), row=True, listing=_listing([])))
+    out["undecodable"] = _disassemble(
+        _db_listing_states(at("bad"), row=True, listing=b"not a listing")
+    )
+    out["errored"] = _disassemble(_db_listing_states(at("err"), row=False, errors='["listing"]'))
+    out["no_row"] = _disassemble(_db_listing_states(at("norow"), row=False))
+    out["old_scan"] = _disassemble(_db(at("old"), with_listing=False))
+    old_null = _db(at("oldnull"), with_listing=False)
+    conn = open_db(old_null)
+    conn.execute(
+        "INSERT INTO function_listing (function_id, listing, unit_count, insn_count, truncated) "
+        "VALUES (1, NULL, 0, 0, 0)"
+    )
+    conn.commit()
+    conn.close()
+    out["old_scan_null_blob"] = _disassemble(old_null)
+    return out
+
+
+def test_every_listing_outcome_is_what_it_was_before_the_read_was_shared(tmp_path: Path) -> None:
+    """get_disassembly over every stored shape (:func:`_branch_outputs`) is, key order included,
+    the recording made before its listing read was shared with get_pseudocode (facts._listing_for).
+
+    MUTATIONS (verified RED): give the NULL-blob branch a listing's insn_count; drop
+    detector_errors from the errored export; report an undecodable listing as empty."""
+    golden = json.loads(_BRANCHES_GOLDEN.read_text())
+    out = _branch_outputs(tmp_path)
+    assert list(out) == list(golden)
+    for name, value in out.items():
+        assert json.dumps(value) == json.dumps(golden[name]), name
+
+
+# ── get_pseudocode on a function with no text: its status, and a micro-function's listing ──────
+
+
+def _fn_db(
+    tmp_path: Path,
+    *,
+    pseudocode: str | None,
+    size: int | None,
+    listing: str = "units",
+    truncated: int = 0,
+) -> Path:
+    """One function ``handle`` at 0x1000 with ``pseudocode`` and ``size`` bytes. ``listing``:
+    ``units`` (a stored listing on a listing-pass binary), ``null`` (the pass ran, the row's blob is
+    NULL), ``none`` (an old scan: no pass, no row). ``truncated`` is its callees_truncated."""
+    db = tmp_path / "analysis.db"
+    conn = open_db(db)
+    conn.execute(
+        "INSERT INTO binaries (id, name, path, sha256, last_seen_at) VALUES "
+        "(1, 'httpd', 'usr/sbin/httpd', ?, '2026-01-01')",
+        ("a" * 64,),
+    )
+    conn.execute(
+        "INSERT INTO functions (id, binary_id, name, address, pseudocode, callees, size_bytes, "
+        "callees_truncated) VALUES (1, 1, 'handle', '0x1000', ?, '[]', ?, ?)",
+        (pseudocode, size, truncated),
+    )
+    conn.execute(
+        "INSERT INTO data_blocks (binary_id, block_name, start_addr, size, bytes, initialized, "
+        "executable, truncated) VALUES (1, '.text', '0x1000', 8, ?, 1, 1, 0)",
+        (bytes(range(8)),),
+    )
+    if listing != "none":
+        conn.execute(
+            "INSERT INTO function_listing (function_id, listing, unit_count, insn_count, truncated)"
+            " VALUES (1, ?, 2, 2, 0)",
+            (_listing(_UNITS[:2]) if listing == "units" else None,),
+        )
+        conn.execute(
+            "INSERT INTO detector_scan_status (binary_id, detector, scanned, found_count) "
+            "VALUES (1, 'listing', 1, 1)"
+        )
+    conn.commit()
+    conn.close()
+    return db
+
+
+def _read(db: Path) -> tuple[dict, dict]:  # type: ignore[type-arg]
+    """(get_pseudocode, get_disassembly) of ``handle``."""
+    conn = facts.open_analysis_ro(db)
+    try:
+        return (
+            facts.get_pseudocode(conn, func="handle"),
+            facts.get_disassembly(conn, func="handle"),
+        )
+    finally:
+        conn.close()
+
+
+_PSEUDO_KEYS = [
+    "found",
+    "anchor",
+    "binary_path",
+    "size_bytes",
+    "is_exported",
+    "callees",
+    "callees_truncated",
+    "pseudocode",
+]
+
+
+def test_a_function_with_text_gets_no_status(tmp_path: Path) -> None:
+    """A function with text — a micro-sized one included — carries exactly the keys it did before
+    pseudocode_status existed.
+
+    MUTATION (verified RED): give every function a pseudocode_status -> RED."""
+    for size in (6, 40, 0):
+        (tmp_path / str(size)).mkdir()
+        out, _dis = _read(_fn_db(tmp_path / str(size), pseudocode="int f(void){}", size=size))
+        assert list(out) == _PSEUDO_KEYS, size
+
+
+def test_a_micro_function_with_no_text_is_skipped_micro_with_its_listing_inline(
+    tmp_path: Path,
+) -> None:
+    """Under _DECOMPILE_MIN_SIZE with no text: ``skipped_micro``, its note, and the listing inline —
+    get_disassembly's instructions item for item (bytes included); ``[]`` when the pass stored a
+    NULL listing; ``disassembly_status`` with get_disassembly's own reason on an old scan. The
+    stored text is kept as it was (``""`` stays ``""``, NULL stays None).
+
+    MUTATION (verified RED): inline get_disassembly's whole result instead of its instructions ->
+    RED; leave the micro listing out -> RED."""
+    cases = {
+        "units": ("", "units"),
+        "null": (None, "null"),
+        "old": ("", "none"),
+        "blank": ("  \n", "units"),
+    }
+    for name, (text, listing) in cases.items():
+        (tmp_path / name).mkdir()
+        out, dis = _read(_fn_db(tmp_path / name, pseudocode=text, size=6, listing=listing))
+        assert out["pseudocode"] == text, name
+        assert out["pseudocode_status"] == "skipped_micro", name
+        assert "not decompiled by design" in out.get("pseudocode_status_note", ""), name
+        assert "note" not in out, name
+        if dis["available"]:
+            assert out.get("disassembly") == dis["instructions"], name
+            assert "disassembly_status" not in out, name
+        else:
+            assert "disassembly" not in out, name
+            assert out.get("disassembly_status") == {"available": False, "reason": dis["reason"]}
+    out, _dis = _read(tmp_path / "units" / "analysis.db")
+    assert [i["mnemonic"] for i in out.get("disassembly", ())] == ["mov", "bl"]
+    assert out["disassembly"][0]["bytes"] == "00010203"
+    null_out, _ = _read(tmp_path / "null" / "analysis.db")
+    assert null_out.get("disassembly") == [] and "insn_count" not in null_out
+
+
+def test_a_larger_or_unsized_function_with_no_text_says_why_without_a_listing(
+    tmp_path: Path,
+) -> None:
+    """At or above _DECOMPILE_MIN_SIZE: ``decompile_empty``; size 0 or not recorded:
+    ``size_unknown`` (checked first, so 0 is never a micro-function). Neither inlines a listing;
+    each note points at get_disassembly.
+
+    MUTATION (verified RED): classify by size before checking 0 -> size 0 reads skipped_micro ->
+    RED."""
+    for name, size, status in (
+        ("big", 40, "decompile_empty"),
+        ("floor", 10, "decompile_empty"),
+        ("zero", 0, "size_unknown"),
+        ("null", None, "size_unknown"),
+    ):
+        (tmp_path / name).mkdir()
+        out, _dis = _read(_fn_db(tmp_path / name, pseudocode="", size=size))
+        assert out["pseudocode_status"] == status, name
+        assert "get_disassembly" in out.get("pseudocode_status_note", ""), name
+        assert "disassembly" not in out and "disassembly_status" not in out, name
+
+
+def test_the_status_note_and_the_truncation_note_are_two_keys(tmp_path: Path) -> None:
+    """A micro-function with no text whose callee list is truncated carries both notes, each under
+    its own key.
+
+    MUTATION (verified RED): put the status note under ``note`` -> one overwrites the other ->
+    RED."""
+    out, _dis = _read(_fn_db(tmp_path, pseudocode="", size=6, truncated=1))
+    assert out.get("note") == facts._CALLEES_TRUNC_NOTE
+    assert out["pseudocode_status"] == "skipped_micro"
+    assert "not decompiled by design" in out.get("pseudocode_status_note", "")
+
+
+def test_the_status_splits_empty_text_as_the_diff_baseline_does() -> None:
+    """facts.pseudocode_status and lib/diff/layer0._decompile_status read one empty text the same
+    way over every text and size shape (the text check strips whitespace in both); a function with
+    text gets no status, where layer0 says ok."""
+    from treasure_map.lib.diff.layer0 import _decompile_status
+
+    to_layer0 = {"skipped_micro": "skipped_micro", "decompile_empty": "failed"}
+    to_layer0["size_unknown"] = "unknown"
+    for text in (None, "", "  ", "x"):
+        for size in (None, 0, 9, 10):
+            expected = _decompile_status(text, size)
+            if (text or "").strip():
+                assert expected == "ok", (text, size)
+                continue
+            assert to_layer0[facts.pseudocode_status(size)] == expected, (text, size)

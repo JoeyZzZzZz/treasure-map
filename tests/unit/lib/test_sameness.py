@@ -423,23 +423,79 @@ def test_a_marker_address_is_placed_in_or_out_of_its_own_closed_body_ranges() ->
     ]
 
 
-def test_an_empty_body_on_both_sides_is_unavailable_never_identical() -> None:
+def test_an_empty_body_on_both_sides_is_never_identical() -> None:
     """A row whose pseudocode is empty is in the table (so not no_body) but has nothing to
-    compare; two of them must not compare equal.
+    compare; two of them must not compare equal. Two micro-functions under _DECOMPILE_MIN_SIZE read
+    skipped_micro (a design skip); two empty bodies of a decompilable size read unavailable.
 
     MUTATION: test the body dict's truth instead of its ``pseudocode`` (a dict is always true) ->
     two empty bodies compare as identical -> RED."""
     bodies_a, bodies_b = {"1": _body(None, size=8)}, {"2": _body(None, size=8)}
     assert sm.pair_reading(bodies_a, bodies_b, "1", "2", None, None) == (
         None,
-        sm.UNAVAILABLE,
+        sm.SKIPPED_MICRO_STATE,
         (),
         {  # both empty and under _DECOMPILE_MIN_SIZE -> skipped_micro, by design not a failure
             "a": {"status": sm.SKIPPED_MICRO, "size_bytes": 8},
             "b": {"status": sm.SKIPPED_MICRO, "size_bytes": 8},
         },
     )
+    assert sm.sameness_state(None, "equal", sm.SKIPPED_MICRO_STATE, ()) == "skipped_micro"
+    big_a, big_b = {"1": _body(None, size=40)}, {"2": _body(None, size=40)}
+    matches, reason, _r, _b = sm.pair_reading(big_a, big_b, "1", "2", None, None)
+    assert (matches, reason) == (None, sm.UNAVAILABLE)
     assert sm.sameness_state(None, "equal", sm.UNAVAILABLE, ()) == sm.UNAVAILABLE
+
+
+def _no_text_reason(a: dict | None, b: dict | None) -> tuple[str | None, tuple[str, str]]:
+    """(pair reason, (a status, b status)) of one pair at addresses 1 / 2; None bodies = the side's
+    analysis.db could not be read."""
+    _m, reason, _r, bodies = sm.pair_reading(a, b, "1", "2", None, None)
+    assert bodies is not None
+    return reason, (bodies["a"]["status"], bodies["b"]["status"])
+
+
+def test_a_pair_reads_skipped_micro_only_when_every_side_without_text_is_micro() -> None:
+    """skipped_micro is the pair state when the sides without text are all design-skipped
+    micro-functions (one beside a body with text, or both); a micro side beside an empty decompile,
+    an unrecorded size or an unreadable analysis.db stays unavailable — the stronger gap names the
+    pair — and a stub side stays no_body. The undetermined reading maps the same way.
+
+    MUTATION (verified RED): read skipped_micro whenever EITHER side is micro
+    (``SKIPPED_MICRO in (sa, sb)``) -> the three mixed pairs read skipped_micro -> RED.
+    MUTATION (verified RED): pair_reading never returns skipped_micro -> the micro pairs RED."""
+    micro, text = _body(None, size=6), _body("int f(void){return 1;}", size=24)
+    cases = {
+        "one_side": ({"1": text}, {"2": micro}),
+        "both": ({"1": micro}, {"2": micro}),
+        "micro+decompile_empty": ({"1": micro}, {"2": _body(None, size=40)}),
+        "micro+size0": ({"1": micro}, {"2": _body(None, size=0)}),
+        "micro+db_unavailable": ({"1": micro}, None),
+        "micro+no_body": ({"1": micro}, {}),
+    }
+    got = {name: _no_text_reason(a, b) for name, (a, b) in cases.items()}
+    assert got == {
+        "one_side": (sm.SKIPPED_MICRO_STATE, ("ok", sm.SKIPPED_MICRO)),
+        "both": (sm.SKIPPED_MICRO_STATE, (sm.SKIPPED_MICRO, sm.SKIPPED_MICRO)),
+        "micro+decompile_empty": (sm.UNAVAILABLE, (sm.SKIPPED_MICRO, sm.DECOMPILE_EMPTY)),
+        "micro+size0": (sm.UNAVAILABLE, (sm.SKIPPED_MICRO, sm.SIZE_UNKNOWN)),
+        "micro+db_unavailable": (sm.UNAVAILABLE, (sm.SKIPPED_MICRO, sm.DB_UNAVAILABLE)),
+        "micro+no_body": (sm.NO_BODY, (sm.SKIPPED_MICRO, sm.NO_BODY)),
+    }
+    proposed = {
+        name: sm.undetermined_pair_state(None, "equal", reason, (), None)
+        for name, (reason, _s) in got.items()
+    }
+    assert proposed == {
+        "one_side": sm.U_SKIPPED_MICRO,
+        "both": sm.U_SKIPPED_MICRO,
+        "micro+decompile_empty": sm.U_UNAVAILABLE,
+        "micro+size0": sm.U_UNAVAILABLE,
+        "micro+db_unavailable": sm.U_UNAVAILABLE,
+        "micro+no_body": sm.U_NO_BODY,
+    }
+    assert sm.U_SKIPPED_MICRO in sm.U_STATES and len(sm.U_STATES) == 8
+    assert sm.NOT_LISTED_NAME[sm.SKIPPED_MICRO_STATE] == "aligned_pseudocode_skipped_micro"
 
 
 # ── pseudocode_delta: the lexical shape of a difference ──────────────────────────────────────

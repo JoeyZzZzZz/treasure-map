@@ -464,6 +464,57 @@ def _col(row: Any, name: str) -> Any:
         return None
 
 
+# Why a function's pseudocode is empty, by its recorded size — the same split as
+# lib/diff/layer0._decompile_status (not imported: layer0 imports this module).
+PSEUDOCODE_SKIPPED_MICRO = "skipped_micro"
+PSEUDOCODE_DECOMPILE_EMPTY = "decompile_empty"
+PSEUDOCODE_SIZE_UNKNOWN = "size_unknown"
+_PSEUDOCODE_STATUS_NOTES = {
+    PSEUDOCODE_SKIPPED_MICRO: (
+        "under ~10 bytes; not decompiled by design — a binary property, not a read failure; read "
+        "the inline disassembly"
+    ),
+    PSEUDOCODE_DECOMPILE_EMPTY: (
+        "the decompiler produced no text for a function of this size: an empty decompile, not a "
+        "design skip; its instructions may be read with get_disassembly"
+    ),
+    PSEUDOCODE_SIZE_UNKNOWN: (
+        "no size is recorded for this function, so a design skip cannot be told from an empty "
+        "decompile; its instructions may be read with get_disassembly"
+    ),
+}
+
+
+def pseudocode_status(size_bytes: int | None) -> str:
+    """The status of a function whose pseudocode is empty: ``size_unknown`` (size 0 or not
+    recorded — checked first, so 0 never reads as a micro-function), ``skipped_micro`` (under
+    _DECOMPILE_MIN_SIZE: the extractor does not decompile it, by design) or ``decompile_empty``."""
+    if size_bytes is None or size_bytes == 0:
+        return PSEUDOCODE_SIZE_UNKNOWN
+    if size_bytes < _DECOMPILE_MIN_SIZE:
+        return PSEUDOCODE_SKIPPED_MICRO
+    return PSEUDOCODE_DECOMPILE_EMPTY
+
+
+def _empty_text_status(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+    """The keys get_pseudocode adds when a function has no text: ``pseudocode_status`` and its
+    ``pseudocode_status_note``, and for a ``skipped_micro`` function its listing inline —
+    ``disassembly`` (get_disassembly's instructions, whole: a micro-function holds a few), or
+    ``disassembly_status`` ``{available: false, reason}`` when no listing can be read."""
+    status = pseudocode_status(row["size_bytes"])
+    out: dict[str, Any] = {
+        "pseudocode_status": status,
+        "pseudocode_status_note": _PSEUDOCODE_STATUS_NOTES[status],
+    }
+    if status == PSEUDOCODE_SKIPPED_MICRO:
+        listing = _listing_for(conn, row)
+        if listing["available"]:
+            out["disassembly"] = listing["instructions"]
+        else:
+            out["disassembly_status"] = {"available": False, "reason": listing["reason"]}
+    return out
+
+
 def get_pseudocode(
     conn: sqlite3.Connection,
     *,
@@ -485,7 +536,12 @@ def get_pseudocode(
     ``offset`` within ``max_chars`` characters (at least one line, never cut), and ``paging`` says
     where they sit — the segments joined in ``next_offset`` order are the text exactly. An
     ``offset`` past the last line, or not an integer >= 0, is ``{error, total_lines}`` (no
-    ``found`` key: the function was found)."""
+    ``found`` key: the function was found).
+
+    A function whose stored text is empty keeps it as stored (``""`` or None) and adds
+    ``pseudocode_status`` with ``pseudocode_status_note`` (:func:`_empty_text_status`): a
+    ``skipped_micro`` function carries its ``disassembly`` inline. A function with text adds
+    neither."""
     row, miss = _resolve_one(conn, func, binary)
     if row is None:
         assert miss is not None
@@ -510,6 +566,8 @@ def get_pseudocode(
     }
     if paging is not None:
         result["paging"] = paging
+    if not (row["pseudocode"] or "").strip():
+        result.update(_empty_text_status(conn, row))
     # Stub calls the ELF resolver could not name: a possible unrecognized libc sink this function
     # makes that is left visible rather than read as an ordinary internal call. Surfaced only when
     # present, so it is never noise on the ordinary case.
@@ -1650,6 +1708,96 @@ def listing_items(blob: Any) -> list[dict[str, Any]] | None:
     return items
 
 
+def _listing_for(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+    """One function's stored listing, read once for get_disassembly and get_pseudocode:
+
+    * ``{available: True, instructions, insn_count, listing_truncated}`` — a stored listing, each
+      instruction with its ``bytes`` (null with ``bytes_unavailable`` where no stored block holds
+      them), the counts the listing row recorded;
+    * ``{available: True, instructions: []}`` — the listing pass covered this function and stored
+      no listing for it: a function with no instructions (no count is recorded for it);
+    * ``{available: False, reason}`` (+ ``detector_errors`` when the export raised on it) — the
+      export raised, the pass stored nothing and recorded no error, the stored listing does not
+      decode, or the binary was analysed before listings were exported."""
+    try:
+        has_pass = (
+            conn.execute(
+                "SELECT 1 FROM detector_scan_status WHERE binary_id = ? AND detector = 'listing' "
+                "LIMIT 1",
+                (row["binary_id"],),
+            ).fetchone()
+            is not None
+        )
+        lrow = conn.execute(
+            "SELECT listing, unit_count, insn_count, truncated FROM function_listing "
+            "WHERE function_id = ?",
+            (row["id"],),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        has_pass, lrow = False, None
+    if lrow is None or lrow["listing"] is None:
+        # The extractor records the listing export raising on a function by name and stores no
+        # listing for it. That is a could-not-export on a current scan: neither an empty function
+        # nor an old scan, and a plain re-scan reuses the cached extraction rather than retrying.
+        errored = _detector_errors(_col(row, "detector_errors"))
+        if "listing" in errored:
+            return {
+                "available": False,
+                "reason": (
+                    f"the listing export raised on {row['name']} during the scan, so no listing "
+                    "was stored for it; this is a could-not-export, not a function without "
+                    "instructions. A plain re-scan reuses the cached extraction — re-analyze this "
+                    "binary (tmap scan --reanalyze) to retry it"
+                ),
+                "detector_errors": errored,
+            }
+        if has_pass and lrow is not None:
+            return {"available": True, "instructions": []}
+        if has_pass:
+            # This binary WAS extracted with listing export, so "analysed before tmap exported
+            # disassembly" would be false; the extractor stored nothing for this function and
+            # recorded no error, so why is not known here.
+            return {
+                "available": False,
+                "reason": (
+                    "this binary was extracted with listing export, but no listing was stored for "
+                    f"{row['name']} and no error was recorded for it; re-analyze this binary "
+                    "(tmap scan --reanalyze) to retry it"
+                ),
+            }
+        return {
+            "available": False,
+            "reason": (
+                "this binary was analysed before tmap exported disassembly; it is produced at scan "
+                f"time now — re-scan this run (tmap rescan) to get the listing for {row['name']}"
+            ),
+        }
+    insns = listing_items(lrow["listing"])
+    if insns is None:
+        return {
+            "available": False,
+            "reason": "the stored listing could not be decoded; re-scan to rebuild it",
+        }
+    read = _byte_reader(conn, row["binary_id"])
+    for item in insns:
+        addr_int = _hex_addr_int(item["address"])
+        bytes_hex: str | None
+        why: str | None
+        if addr_int is None:
+            bytes_hex, why = None, "bytes_unavailable: bad address"
+        else:
+            bytes_hex, why = read(addr_int, item["length"])
+        item["bytes"] = bytes_hex
+        if why is not None:
+            item["bytes_unavailable"] = why.split(": ", 1)[1]
+    return {
+        "available": True,
+        "instructions": insns,
+        "insn_count": lrow["insn_count"],
+        "listing_truncated": bool(lrow["truncated"]),
+    }
+
+
 def get_disassembly(
     conn: sqlite3.Connection,
     *,
@@ -1678,91 +1826,13 @@ def get_disassembly(
         assert miss is not None
         return miss
     anchor = _anchor(row["binary_name"], row["binary_path"], row["name"], row["address"])
-    try:
-        has_pass = (
-            conn.execute(
-                "SELECT 1 FROM detector_scan_status WHERE binary_id = ? AND detector = 'listing' "
-                "LIMIT 1",
-                (row["binary_id"],),
-            ).fetchone()
-            is not None
-        )
-        lrow = conn.execute(
-            "SELECT listing, unit_count, insn_count, truncated FROM function_listing "
-            "WHERE function_id = ?",
-            (row["id"],),
-        ).fetchone()
-    except sqlite3.OperationalError:
-        has_pass, lrow = False, None
-    if lrow is None or lrow["listing"] is None:
-        # The extractor records the listing export raising on a function by name and stores no
-        # listing for it. That is a could-not-export on a current scan: neither an empty function
-        # nor an old scan, and a plain re-scan reuses the cached extraction rather than retrying.
-        errored = _detector_errors(_col(row, "detector_errors"))
-        if "listing" in errored:
-            return {
-                "found": True,
-                "available": False,
-                "reason": (
-                    f"the listing export raised on {row['name']} during the scan, so no listing "
-                    "was stored for it; this is a could-not-export, not a function without "
-                    "instructions. A plain re-scan reuses the cached extraction — re-analyze this "
-                    "binary (tmap scan --reanalyze) to retry it"
-                ),
-                "detector_errors": errored,
-                "anchor": anchor,
-            }
-        if has_pass and lrow is not None:
-            return {
-                "found": True,
-                "available": True,
-                "instructions": [],
-                "total": 0,
-                "anchor": anchor,
-            }
-        if has_pass:
-            # This binary WAS extracted with listing export, so "analysed before tmap exported
-            # disassembly" would be false; the extractor stored nothing for this function and
-            # recorded no error, so why is not known here.
-            return {
-                "found": True,
-                "available": False,
-                "reason": (
-                    "this binary was extracted with listing export, but no listing was stored for "
-                    f"{row['name']} and no error was recorded for it; re-analyze this binary "
-                    "(tmap scan --reanalyze) to retry it"
-                ),
-                "anchor": anchor,
-            }
-        return {
-            "found": True,
-            "available": False,
-            "reason": (
-                "this binary was analysed before tmap exported disassembly; it is produced at scan "
-                f"time now — re-scan this run (tmap rescan) to get the listing for {row['name']}"
-            ),
-            "anchor": anchor,
-        }
-    insns = listing_items(lrow["listing"])
-    if insns is None:
-        return {
-            "found": True,
-            "available": False,
-            "reason": "the stored listing could not be decoded; re-scan to rebuild it",
-            "anchor": anchor,
-        }
-    read = _byte_reader(conn, row["binary_id"])
-    for item in insns:
-        addr_int = _hex_addr_int(item["address"])
-        bytes_hex: str | None
-        why: str | None
-        if addr_int is None:
-            bytes_hex, why = None, "bytes_unavailable: bad address"
-        else:
-            bytes_hex, why = read(addr_int, item["length"])
-        item["bytes"] = bytes_hex
-        if why is not None:
-            item["bytes_unavailable"] = why.split(": ", 1)[1]
+    listing = _listing_for(conn, row)
+    if not listing["available"]:
+        return {"found": True, **listing, "anchor": anchor}
+    insns = listing["instructions"]
+    if "insn_count" not in listing:
+        # covered by the listing pass with nothing stored: no instruction, and no count to give
+        return {"found": True, "available": True, "instructions": [], "total": 0, "anchor": anchor}
     page, paging = _byte_page(insns, offset, max_chars)
     return {
         "found": True,
@@ -1770,7 +1840,7 @@ def get_disassembly(
         "anchor": anchor,
         "instructions": page,
         "total": len(insns),
-        "insn_count": lrow["insn_count"],
-        "listing_truncated": bool(lrow["truncated"]),
+        "insn_count": listing["insn_count"],
+        "listing_truncated": listing["listing_truncated"],
         "paging": paging,
     }

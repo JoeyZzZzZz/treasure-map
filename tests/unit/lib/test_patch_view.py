@@ -513,15 +513,16 @@ def test_every_pair_and_function_is_listed_or_counted(world: World) -> None:
 # ── pseudocode_sameness: the reading similarity is blind to ────────────────────────────────────
 
 
-def test_pseudocode_sameness_reads_its_six_states(tmp_path: Path, current: None) -> None:
+def test_pseudocode_sameness_reads_its_seven_states(tmp_path: Path, current: None) -> None:
     """Each aligned similarity-1 pair that places no entry is counted by pseudocode_sameness: a
     verified match, a match whose text rests on something unchecked, a match whose callees could
-    not be verified, a real difference, a stub with no body at all, and a function whose body is
-    empty — each kept apart. The five earlier states read exactly as they did.
+    not be verified, a real difference, a stub with no body at all, a micro-function not decompiled
+    by design, and a function whose empty body cannot be explained so — each kept apart.
 
     MUTATION: fold ``identical_callee_unverified`` into ``identical`` (treat 'undetermined' callees
     as equal) -> RED; call every missing body ``unavailable`` (drop the no_body split) -> RED;
-    ignore text_reasons in the fold -> the qualified match reads identical -> RED."""
+    ignore text_reasons in the fold -> the qualified match reads identical -> RED; read a
+    micro-function's pair as unavailable again -> RED."""
     w = World(tmp_path)
     # identical: same body, same resolved callees (callee_set equal)
     w.pair("00001000", "00002000", 0.97, 1.0)
@@ -538,10 +539,14 @@ def test_pseudocode_sameness_reads_its_six_states(tmp_path: Path, current: None)
     # no_body: the b side is not in the functions table (an import / PLT stub)
     w.pair("00007000", "00008000", 0.97, 1.0)
     w.fn("a", "00007000", ["foo"], pseudocode="iVar = foo(0x40);")
-    # unavailable: the b side is in the table but its pseudocode is empty
+    # unavailable: the b side is in the table, its pseudocode empty, its size not recorded
     w.pair("00009000", "0000a000", 0.97, 1.0)
     w.fn("a", "00009000", ["foo"], pseudocode="iVar = foo(0x40);")
     w.fn("b", "0000a000", ["foo"], pseudocode=None)
+    # skipped_micro: the b side is a 6-byte function the extractor does not decompile
+    w.pair("0000d000", "0000e000", 0.97, 1.0)
+    w.fn("a", "0000d000", ["foo"], pseudocode="iVar = foo(0x40);")
+    w.fn("b", "0000e000", ["foo"], pseudocode=None, size_bytes=6)
     # identical_text_unverified: same text and callees, but the decompiler says it gave up a table
     w.pair("0000b000", "0000c000", 0.97, 1.0)
     body = "/* WARNING: Could not recover jumptable at 0x00408218. Too many branches */\nfoo(0x40);"
@@ -556,6 +561,7 @@ def test_pseudocode_sameness_reads_its_six_states(tmp_path: Path, current: None)
         "identical_callee_unverified": 1,
         "differs": 1,
         "no_body": 1,
+        "skipped_micro": 1,
         "unavailable": 1,
     }
 
@@ -760,6 +766,7 @@ def test_function_states_count_each_function_once_by_the_views_own_facts(
         "identical_text_unverified": 0,
         "identical_callee_unverified": 1,
         "unavailable": 1,
+        "skipped_micro": 0,
     }
     assert s["identical_text_unverified_by_body"] == {"structure_differs": 0, "unknown": 0}
     assert s["no_body"] == 1
@@ -1860,6 +1867,8 @@ def _labels(v: dict[str, Any]) -> set[str]:
     out |= {s["key"] for s in v["blind_spots"]} | set(v["banners"]) | set(v["not_listed"])
     for e in v.get("entries") or ():
         out |= {str(e.get("subclass")), *e.get("subclasses", ()), *e.get("facts", ())}
+        out |= {str(e.get("pseudocode_sameness"))}
+        out |= {str((e.get("proposed_pair_reading") or {}).get("state"))}
         out |= set(e.get("blind_spots", ()))
         out |= set((e.get("callee_set") or {}).keys())
         out |= {str((e.get("callee_set") or {}).get("reason"))}
@@ -1977,7 +1986,8 @@ def test_no_label_says_what_a_change_means(
 
     MUTATION (verified RED): name a subclass ``sink_removed`` -> RED; MUTATION (verified RED, 1
     failed): name the guard scan's shown_rule ``new_then_b_order`` -> RED; MUTATION (verified RED,
-    1 failed): name the link reason ``other_function`` ``removed_to_other_function`` -> RED."""
+    1 failed): name the link reason ``other_function`` ``removed_to_other_function`` -> RED;
+    MUTATION (verified RED): name the micro pair state ``skipped_micro_removed`` -> RED."""
     labels = _labels(_view(world))
     assert len(labels) > 40
     (tmp_path / "s7").mkdir()
@@ -1993,6 +2003,22 @@ def test_no_label_says_what_a_change_means(
     # summary of the not-listed pairs, of the overlay rows and of the string edges.
     (tmp_path / "summary").mkdir()
     sw = _summary_world(tmp_path / "summary")
+    # the pair states, read off full entries: an aligned micro pair's pseudocode_sameness and an
+    # undetermined micro pair's proposed reading, each asserted where it is read
+    (tmp_path / "micro").mkdir()
+    mw = World(tmp_path / "micro")
+    mw.pair("00030000", "00031000", 0.97, 0.9)  # aligned, listed
+    mw.fn("a", "00030000", ["foo"], pseudocode="y = f();", size_bytes=200)
+    mw.fn("b", "00031000", ["foo"], pseudocode=None, size_bytes=8)
+    _micro_pair(mw, "00032000", "00032000", 0.8)
+    mw.commit()
+    micro = _view(mw)
+    assert {str(e.get("pseudocode_sameness")) for e in micro["entries"]} >= {"skipped_micro"}
+    proposed = {str((e.get("proposed_pair_reading") or {}).get("state")) for e in micro["entries"]}
+    assert "skipped_micro" in proposed
+    states = _labels(micro) | _labels(_view(sw)) | _labels(_view(world))
+    assert {"skipped_micro", "aligned_pseudocode_skipped_micro", "identical"} <= states
+    labels |= states
     summary: set[str] = set()
     for w in (g, sw, world):
         for page in _pages(w, detail="summary") + _pages(
@@ -2142,6 +2168,7 @@ U_PAIRS = {
     "identical_text_unverified": ("00007000", "00008000"),
     "differs": ("00009000", "0000a000"),
     "no_body": ("0000b000", "0000c000"),
+    "skipped_micro": ("0000f000", "0000f800"),
     "unavailable": ("0000d000", "0000e000"),
 }
 TWIN_B = "00004f00"  # a second B function holding identical_not_unique's body
@@ -2162,6 +2189,7 @@ def _undetermined_world(tmp_path: Path) -> World:
     w.fn("b", p["identical_text_unverified"][1], ["foo"], pseudocode="foo(4);", size_bytes=20)
     w.fn("b", p["differs"][1], ["foo"], pseudocode="foo(6);", size_bytes=16)
     # no_body: the B side is not in the functions table at all
+    w.fn("b", p["skipped_micro"][1], ["foo"], pseudocode=None, size_bytes=8)
     w.fn("b", p["unavailable"][1], ["foo"], pseudocode=None)
     w.pair("00010000", "00020000", 0.97, 1.0)  # aligned and unchanged
     w.fn("a", "00010000", ["foo"], pseudocode="bar();")
@@ -2199,7 +2227,7 @@ def test_an_undetermined_pair_carries_a_proposed_reading_never_a_sameness(
 def test_the_proposed_readings_never_enter_the_aligned_counts(
     tmp_path: Path, current: None
 ) -> None:
-    """Seven undetermined pairs, one per state: counted in
+    """Eight undetermined pairs, one per state: counted in
     alignment_undetermined_reading, whose states sum to alignment_undetermined, and never in the
     aligned counts.
 
@@ -2209,7 +2237,7 @@ def test_the_proposed_readings_never_enter_the_aligned_counts(
     assert s is not None
     assert (s["aligned"], s["unchanged"], s["no_body"]) == (1, 1, 0)
     assert s["changed"]["total"] == 0 and s["unverified"]["total"] == 0
-    assert s["alignment_undetermined"] == 7
+    assert s["alignment_undetermined"] == 8
     assert s["alignment_undetermined_reading"] == {state: 1 for state in U_PAIRS}
     assert sum(s["alignment_undetermined_reading"].values()) == s["alignment_undetermined"]
 
@@ -2466,6 +2494,7 @@ def test_a_qualified_match_is_unverified_never_unchanged(tmp_path: Path, current
         "identical_text_unverified": 4,
         "identical_callee_unverified": 0,
         "unavailable": 0,
+        "skipped_micro": 0,
     }
     assert all(isinstance(n, int) for n in s["unverified"].values())
     assert s["identical_text_unverified_by_body"] == {"structure_differs": 2, "unknown": 2}
@@ -2807,7 +2836,7 @@ def test_an_anchored_micro_side_pair_floats_to_read_first_and_filters(
     v = _view(w, sort_by="significance")
     assert v["by_id"][micro]["significance"] == {"attention": 1, "basis": "anchored_micro_side"}
     r = _reading(v, micro)
-    assert r["state"] == "unavailable" and "anchored_differs" not in r  # micro only, not differs
+    assert r["state"] == "skipped_micro" and "anchored_differs" not in r  # micro only, not differs
     order = [e["entry_id"] for e in v["entries"]]
     assert order.index(micro) < order.index(plain)  # read_first floats it past the lower-sim plain
     s = pv.function_states(w.atlas, DIFF)
@@ -2912,12 +2941,21 @@ def test_cause_of_splits_the_unavailable_pairs_strongest_gap_first(
     assert pv._cause_of(None) == "db_unavailable"
 
 
-def test_unavailable_by_cause_sums_to_its_count(tmp_path: Path, current: None) -> None:
-    """get_diff_meta's aligned unavailable_by_cause splits the aligned unavailable count by cause,
-    its values summing to it; a design-skipped micro-stub is told apart from a real decompile gap.
+def test_unavailable_by_cause_sums_to_unavailable_and_skipped_micro(
+    tmp_path: Path, current: None
+) -> None:
+    """get_diff_meta's aligned unavailable_by_cause splits the pairs with no text to compare by
+    cause, its values summing to unavailable + skipped_micro: the two micro causes are the
+    skipped_micro pairs, the other three the unavailable ones. A micro side beside an empty
+    decompile or an unrecorded size stays unavailable, named by the stronger gap; not_listed and
+    each not_listed_page split the same pairs the same way.
 
     MUTATION: fold decompile_empty into skipped_micro in _body_status -> the 64-byte empty pair
-    lands in one_side_skipped_micro -> RED."""
+    lands in one_side_skipped_micro -> RED.
+    MUTATION (verified RED): read skipped_micro whenever either side is micro -> the mixed pairs
+    read skipped_micro -> RED.
+    MUTATION (verified RED): count only unavailable pairs by cause -> the micro causes read 0 ->
+    RED; the same on the undetermined pairs -> RED."""
     w = World(tmp_path)
     w.pair("00060000", "00060000", 0.97, 1.0)  # one side micro, one ok
     w.fn("a", "00060000", ["foo"], pseudocode="y = 1;", size_bytes=200)
@@ -2931,17 +2969,61 @@ def test_unavailable_by_cause_sums_to_its_count(tmp_path: Path, current: None) -
     w.pair("00063000", "00063000", 0.97, 1.0)  # size unrecorded
     w.fn("a", "00063000", ["foo"], pseudocode=None, size_bytes=0)
     w.fn("b", "00063000", ["foo"], pseudocode="y = 1;", size_bytes=200)
+    w.pair("00064000", "00064000", 0.97, 1.0)  # micro beside a real empty decompile
+    w.fn("a", "00064000", ["foo"], pseudocode=None, size_bytes=8)
+    w.fn("b", "00064000", ["foo"], pseudocode=None, size_bytes=64)
+    w.pair("00065000", "00065000", 0.97, 1.0)  # micro beside an unrecorded size
+    w.fn("a", "00065000", ["foo"], pseudocode=None, size_bytes=0)
+    w.fn("b", "00065000", ["foo"], pseudocode=None, size_bytes=8)
+    # undetermined pairs: one micro side, and a micro beside a real empty decompile
+    _micro_pair(w, "00070000", "00070000", 0.8)
+    w.pair("00071000", "00071000", 0.5, 0.8)
+    w.fn("a", "00071000", ["foo"], pseudocode=None, size_bytes=64)
+    w.fn("b", "00071000", ["foo"], pseudocode=None, size_bytes=8)
     w.commit()
     s = pv.function_states(w.atlas, DIFF)
     assert s is not None
     assert s["unavailable_by_cause"] == {
         "db_unavailable": 0,
-        "decompile_empty": 1,
-        "size_unknown": 1,
+        "decompile_empty": 2,
+        "size_unknown": 2,
         "one_side_skipped_micro": 1,
         "both_skipped_micro": 1,
     }
-    assert sum(s["unavailable_by_cause"].values()) == s["unverified"]["unavailable"] == 4
+    unverified = s["unverified"]
+    assert (unverified["unavailable"], unverified["skipped_micro"]) == (4, 2)
+    assert sum(s["unavailable_by_cause"].values()) == 6 == unverified["total"]
+    reading = s["alignment_undetermined_reading"]
+    assert (reading["unavailable"], reading["skipped_micro"]) == (1, 1)
+    assert s["alignment_undetermined_unavailable_by_cause"] == {
+        "db_unavailable": 0,
+        "decompile_empty": 1,
+        "size_unknown": 0,
+        "one_side_skipped_micro": 1,
+        "both_skipped_micro": 0,
+    }
+    v = pv.get_diff_patch_view(w.atlas, DIFF)
+    assert v["not_listed"]["aligned_pseudocode_unavailable"]["count"] == 4
+    assert v["not_listed"]["aligned_pseudocode_skipped_micro"]["count"] == 2
+    pages = {
+        name: {
+            r["addr_a"]: r["pseudocode_sameness"]
+            for r in pv.get_diff_patch_view(w.atlas, DIFF, not_listed_page=name)["entries"]
+        }
+        for name in ("aligned_pseudocode_unavailable", "aligned_pseudocode_skipped_micro")
+    }
+    assert pages == {
+        "aligned_pseudocode_unavailable": {
+            "00062000": "unavailable",
+            "00063000": "unavailable",
+            "00064000": "unavailable",
+            "00065000": "unavailable",
+        },
+        "aligned_pseudocode_skipped_micro": {
+            "00060000": "skipped_micro",
+            "00061000": "skipped_micro",
+        },
+    }
 
 
 def test_a_line_number_shift_is_demoted_out_of_the_read_first_head(
@@ -3299,7 +3381,7 @@ def test_an_aligned_micro_pair_shows_its_bodies_on_the_entry(tmp_path: Path, cur
     w.commit()
     v = _view(w)
     entry = v["by_id"][_pair_id("00030000", "00031000")]
-    assert entry["pseudocode_sameness"] == sameness.UNAVAILABLE
+    assert entry["pseudocode_sameness"] == sameness.SKIPPED_MICRO_STATE
     assert "one_side_skipped_micro" in entry["facts"]
     assert entry["bodies"]["b"]["size_bytes"] == 8
     assert [u["mnemonic"] for u in entry["bodies"]["b"]["listing"]] == ["jr", "_clear"]
@@ -3624,11 +3706,15 @@ def test_function_states_keeps_its_keys_and_adds_the_read_face_counts(
     # the kept line-number shifts sit at or above the floor, inside the head count (N)
     kept = s["alignment_undetermined_anchored_differs_line_number_kept"]
     assert 0 <= kept <= s["alignment_undetermined_anchored_differs"]
-    # the by-cause buckets PARTITION their unavailable count: each sums to it.
-    assert sum(s["unavailable_by_cause"].values()) == s["unverified"]["unavailable"]
-    assert (
-        sum(s["alignment_undetermined_unavailable_by_cause"].values())
-        == s["alignment_undetermined_reading"]["unavailable"]
+    # the by-cause buckets PARTITION the pairs with no text: each sums to unavailable +
+    # skipped_micro.
+    unverified = s["unverified"]
+    assert sum(s["unavailable_by_cause"].values()) == (
+        unverified["unavailable"] + unverified["skipped_micro"]
+    )
+    reading = s["alignment_undetermined_reading"]
+    assert sum(s["alignment_undetermined_unavailable_by_cause"].values()) == (
+        reading["unavailable"] + reading["skipped_micro"]
     )
 
 

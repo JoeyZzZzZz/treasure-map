@@ -372,6 +372,50 @@ def _append(dst: Path, rel: str, text: str) -> None:
             True,
         ),
         (
+            "get_pseudocode's empty-text status (a facts function the hunt does not use)",
+            lambda d: _edit(
+                d,
+                "lib/facts.py",
+                '        listing = _listing_for(conn, row)\n        if listing["available"]:',
+                '        listing = dict(_listing_for(conn, row))\n        if listing["available"]:',
+            ),
+            False,
+            False,
+        ),
+        (
+            "the decompile size floor's value",
+            lambda d: _edit(
+                d, "lib/facts.py", "_DECOMPILE_MIN_SIZE = 10", "_DECOMPILE_MIN_SIZE = 12"
+            ),
+            False,
+            True,
+        ),
+        (
+            "the read face's micro pair state (sameness / patch_view / diff_align)",
+            lambda d: (
+                _edit(
+                    d,
+                    "lib/query/sameness.py",
+                    'U_SKIPPED_MICRO = "skipped_micro"',
+                    'U_SKIPPED_MICRO = "sm"',
+                ),
+                _edit(
+                    d,
+                    "lib/query/patch_view.py",
+                    "sameness.SKIPPED_MICRO_STATE: tally.get(",
+                    "sameness.SKIPPED_MICRO_STATE: 0 + tally.get(",
+                ),
+                _edit(
+                    d,
+                    "lib/query/diff_align.py",
+                    "a side is a micro-function not",
+                    "a micro side not",
+                ),
+            ),
+            False,
+            False,
+        ),
+        (
             "rescan_version.py itself (excluded from both)",
             lambda d: _append(d, "lib/rescan_version.py", "\n_MUT = 1\n"),
             False,

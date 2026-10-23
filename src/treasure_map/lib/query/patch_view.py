@@ -50,10 +50,13 @@ TWO SIGNALS SIMILARITY IS BLIND TO (lib/query/sameness), read on the function-pa
   image extent, a decompile marked incomplete, two body byte counts that differ; named in
   ``text_unverified_reasons``, with the ``hidden_region`` facts behind it),
   ``identical_callee_unverified`` (text matches, callees unverified), ``differs``, ``no_body`` (an
-  import/PLT stub, not in the functions table) or ``unavailable`` (in the table, empty body). None
-  of the unverified states is ever read as "unchanged". On every listed aligned entry as a fact; the
-  similarity-1 pairs that place no entry are counted by it under ``not_listed``
-  (``not_listed_page=<name>`` walks one category, ``aligned_pseudocode_differs`` above all). A pair
+  import/PLT stub, not in the functions table), ``skipped_micro`` (in the table, no text only
+  because a side is a micro-function the extractor does not decompile by design) or
+  ``unavailable`` (in the table, a side's text could not be read: an empty decompile, an
+  unrecorded size, an unreadable analysis.db). None of the unverified states is ever read as
+  "unchanged". On every listed aligned entry as a fact; the similarity-1 pairs that place no entry
+  are counted by it under ``not_listed`` (``not_listed_page=<name>`` walks one category,
+  ``aligned_pseudocode_differs`` above all). A pair
   whose texts differ carries ``pseudocode_delta``, the lexical shape of the difference, with its
   ``inline_hunk`` (the changed lines themselves from the original text, or why withheld). An
   undetermined pair carries ``proposed_pair_reading`` instead — the same reading as if it were
@@ -2669,8 +2672,9 @@ def _u_state(e: _Entry, readings: _Readings) -> str | None:
     return proposed[0] if proposed is not None else None
 
 
-# The 5-bucket cause of a pair whose reading is UNAVAILABLE (one side had no text), strongest gap
-# first, so the keys PARTITION the UNAVAILABLE pairs (each counted exactly once).
+# The 5-bucket cause of a pair with no text to compare (reading UNAVAILABLE or SKIPPED_MICRO_STATE),
+# strongest gap first, so the keys PARTITION those pairs (each counted exactly once): the two micro
+# causes are the SKIPPED_MICRO_STATE pairs, the other three the UNAVAILABLE ones.
 _UNAVAILABLE_CAUSES = (
     "db_unavailable",
     "decompile_empty",
@@ -2681,11 +2685,12 @@ _UNAVAILABLE_CAUSES = (
 
 
 def _cause_of(bodies: dict[str, Any] | None) -> str:
-    """Which of :data:`_UNAVAILABLE_CAUSES` a UNAVAILABLE pair falls in, from its two sides' body
+    """Which of :data:`_UNAVAILABLE_CAUSES` an UNAVAILABLE or SKIPPED_MICRO_STATE pair falls in,
+    from its two sides' body
     status (sameness.pair_reading's ``bodies``): the first that matches, strongest gap first — so a
     micro + decompile_empty pair is ``decompile_empty`` and a db read failure on either side wins
-    over everything. Falls back to ``db_unavailable`` only if the block is missing, which an
-    UNAVAILABLE pair never leaves."""
+    over everything. Falls back to ``db_unavailable`` only if the block is missing, which such a
+    pair never leaves."""
     if not bodies:
         return "db_unavailable"
     a, b = bodies["a"]["status"], bodies["b"]["status"]
@@ -3652,12 +3657,14 @@ def function_states(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] |
     Every aligned pair is in exactly one of ``unchanged`` (identical: pseudocode AND callees),
     ``changed`` (split into ``with_scoped_sink_delta`` — bucket A, or a row carrying
     sink_arg_constant_delta — and ``no_scoped_signal``, which says no in-scope sink signal, NOT
-    noise), ``unverified`` (identical_text_unverified + identical_callee_unverified + unavailable;
-    ``identical_text_unverified_by_body`` splits the first by its body class) and ``no_body`` (an
-    import / PLT stub, kept out of every other count). ``unavailable_by_cause`` splits the aligned
-    ``unavailable`` count by why a side had no text (db_unavailable / decompile_empty / size_unknown
-    / one_side_skipped_micro / both_skipped_micro) and its values SUM to that count — a design-
-    skipped micro-stub told apart from a real decompile gap. Pairs whose alignment is undetermined
+    noise), ``unverified`` (identical_text_unverified + identical_callee_unverified + unavailable +
+    skipped_micro; ``identical_text_unverified_by_body`` splits the first by its body class) and
+    ``no_body`` (an import / PLT stub, kept out of every other count). ``unavailable`` is a side
+    whose text could not be read, ``skipped_micro`` a design-skipped micro-stub beside text or
+    another one. ``unavailable_by_cause`` splits the two by why a side had no text (db_unavailable /
+    decompile_empty / size_unknown for unavailable, one_side_skipped_micro / both_skipped_micro for
+    skipped_micro) and its values SUM to unavailable + skipped_micro — the same sum, key for key,
+    as when both were counted under unavailable. Pairs whose alignment is undetermined
     are counted beside them, and ``alignment_undetermined_reading`` splits them by their proposed
     reading (never into the aligned counts); of those reading differs,
     ``alignment_undetermined_anchored_differs`` counts the pairs flagged anchored_differs at or
@@ -3671,9 +3678,9 @@ def function_states(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] |
     included.
     ``alignment_undetermined_anchored_micro_side`` counts undetermined pairs anchored with one side
     a micro-stub and the other a real body; ``alignment_undetermined_unavailable_by_cause`` splits
-    the proposed-unavailable pairs the same way, summing to their reading count. Functions with no
-    counterpart are counted by presence_state,
-    never "added"/"removed". A diff undetermined as a whole is ``withheld`` with its banners and NO
+    the pairs proposed unavailable or skipped_micro the same way, summing to those two counts.
+    Functions with no counterpart are counted by presence_state, never "added"/"removed". A diff
+    undetermined as a whole is ``withheld`` with its banners and NO
     counts — a blind spot, not zero changes. None when there is no such diff."""
     built = build_diff_view(atlas, diff_id)
     if built is None:
@@ -3694,8 +3701,9 @@ def function_states(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] |
     proposed = {state: 0 for state in sameness.U_STATES}
     scoped = 0
     anchored = anchored_all = line_number_form = line_number_kept = micro = 0
-    unavail_cause = {k: 0 for k in _UNAVAILABLE_CAUSES}  # aligned pairs reading unavailable
-    u_unavail_cause = {k: 0 for k in _UNAVAILABLE_CAUSES}  # undetermined pairs proposed unavailable
+    # aligned pairs reading unavailable or skipped_micro; undetermined pairs proposed either
+    unavail_cause = {k: 0 for k in _UNAVAILABLE_CAUSES}
+    u_unavail_cause = {k: 0 for k in _UNAVAILABLE_CAUSES}
     for e in built.placed:
         reading = _proposed_of(e, readings)
         if reading is not None:
@@ -3723,7 +3731,7 @@ def function_states(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] |
             # is listed by the anchored_micro_side filter, so it is counted here too (basis micro).
             if _anchored_micro_side(e):
                 micro += 1
-            if ustate == sameness.U_UNAVAILABLE:
+            if ustate in (sameness.U_UNAVAILABLE, sameness.U_SKIPPED_MICRO):
                 u_unavail_cause[_cause_of(e.body_status)] += 1
         state = _sameness_of(e, readings)
         if state is None:
@@ -3733,13 +3741,14 @@ def function_states(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] |
             scoped += 1
         if state == sameness.IDENTICAL_TEXT_UNVERIFIED:
             by_body[_body_of(e, readings) or sameness.BODY_UNKNOWN] += 1
-        if state == sameness.UNAVAILABLE:
+        if state in (sameness.UNAVAILABLE, sameness.SKIPPED_MICRO_STATE):
             unavail_cause[_cause_of(e.body_status)] += 1
     changed = tally.get(sameness.DIFFERS, 0)
     unverified = {
         sameness.IDENTICAL_TEXT_UNVERIFIED: tally.get(sameness.IDENTICAL_TEXT_UNVERIFIED, 0),
         sameness.IDENTICAL_CALLEE_UNVERIFIED: tally.get(sameness.IDENTICAL_CALLEE_UNVERIFIED, 0),
         sameness.UNAVAILABLE: tally.get(sameness.UNAVAILABLE, 0),
+        sameness.SKIPPED_MICRO_STATE: tally.get(sameness.SKIPPED_MICRO_STATE, 0),
     }
     return {
         "diff_id": diff_id,

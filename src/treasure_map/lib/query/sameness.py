@@ -19,10 +19,11 @@ are the reader's:
     ``identical_callee_unverified``. Neither is ever folded into "unchanged" or "changed". A changed
     callee set is ``differs`` even when there is no body to read. When there is no body, the reason
     is carried, not swallowed: ``no_body`` (an import / PLT stub absent from the functions table) is
-    kept apart from ``unavailable`` (a function in the table whose pseudocode is empty), so a reader
-    need not recompute which it was.
+    kept apart from ``skipped_micro`` (in the table, no text only because a side is a micro-function
+    the extractor does not decompile by design) and ``unavailable`` (in the table, a side's text
+    could not be read), so a reader need not recompute which it was.
   * the same reading of an UNDETERMINED pair (``undetermined_pair_state``), as a proposal beside it,
-    never a pairing: its seven states add whether the body is unique on both sides, since a body
+    never a pairing: its eight states add whether the body is unique on both sides, since a body
     that occurs twice could have been paired with the wrong twin.
   * ``hidden_region`` — the facts behind a text match that may hide code (the decompiler's own
     warnings, with the address each names and whether it lies in the function's own body, and the
@@ -70,7 +71,7 @@ from treasure_map.lib.diff.layer0 import _decompile_status, norm_hex
 from treasure_map.lib.facts import listing_items
 from treasure_map.lib.ro_db import ro_connect
 
-# ── the six states of an aligned pair ────────────────────────────────────────────────────────
+# ── the seven states of an aligned pair ────────────────────────────────────────────────────────
 
 IDENTICAL = "identical"  # text matches with nothing unverified, callee sets equal: really unchanged
 IDENTICAL_TEXT_UNVERIFIED = (
@@ -81,13 +82,18 @@ IDENTICAL_CALLEE_UNVERIFIED = (
 )
 DIFFERS = "differs"  # pseudocode differs, or the callee sets differ (even with no body to read)
 NO_BODY = "no_body"  # a side has no body at all — an import / PLT stub, not in the functions table
-UNAVAILABLE = "unavailable"  # a side IS in the table but its pseudocode is empty, or the db failed
+UNAVAILABLE = "unavailable"  # a side's text could not be read: empty decompile / size / db failed
+# The pair state of two sides with no text to compare whose only reason is a design-skipped
+# micro-function (one side or both; the other side ok) — kept apart from UNAVAILABLE, a side that
+# could not be read. Same value as the body cause SKIPPED_MICRO below, same meaning.
+SKIPPED_MICRO_STATE = "skipped_micro"
 
 # ── one side's body CAUSE: finer than the pair states above, NOT a sameness state ─────────────
 # Why a side had no text to compare, told apart so the read face can split the pair-level
-# UNAVAILABLE by cause. The pair state stays NO_BODY / UNAVAILABLE (``sameness_state`` folds these
-# back); these never enter the seven U_STATES or the aligned states. ``ok`` and ``no_body`` are
-# reused from above; the four below name the ways a present body carried no pseudocode.
+# UNAVAILABLE / SKIPPED_MICRO_STATE by cause. pair_reading folds them into a pair state: NO_BODY,
+# SKIPPED_MICRO_STATE when every side without text is skipped_micro, else UNAVAILABLE. Of these
+# causes only skipped_micro is also a state name (SKIPPED_MICRO_STATE / U_SKIPPED_MICRO). ``ok``
+# and ``no_body`` are reused from above; the four below name the ways a present body had no text.
 DB_UNAVAILABLE = "db_unavailable"  # the analysis.db could not be read at all (bodies is None)
 SKIPPED_MICRO = "skipped_micro"  # empty AND under _DECOMPILE_MIN_SIZE: a design skip, not a failure
 DECOMPILE_EMPTY = "decompile_empty"  # empty AND >= that size: a genuine empty decompile
@@ -100,11 +106,12 @@ NOT_LISTED_NAME = {
     IDENTICAL_CALLEE_UNVERIFIED: "aligned_pseudocode_identical_callee_unverified",
     DIFFERS: "aligned_pseudocode_differs",
     NO_BODY: "aligned_pseudocode_no_body",
+    SKIPPED_MICRO_STATE: "aligned_pseudocode_skipped_micro",
     UNAVAILABLE: "aligned_pseudocode_unavailable",
 }
 STATE_BY_NOT_LISTED_NAME = {name: state for state, name in NOT_LISTED_NAME.items()}
 
-# ── the seven states of an undetermined pair's proposed reading ─────────────────────────────
+# ── the eight states of an undetermined pair's proposed reading ─────────────────────────────
 
 U_IDENTICAL_UNIQUE = "identical_unique"
 U_IDENTICAL_NOT_UNIQUE = "identical_not_unique"
@@ -112,6 +119,7 @@ U_IDENTICAL_CALLEE_UNVERIFIED = "identical_callee_unverified"
 U_IDENTICAL_TEXT_UNVERIFIED = "identical_text_unverified"
 U_DIFFERS = "differs"
 U_NO_BODY = "no_body"
+U_SKIPPED_MICRO = "skipped_micro"
 U_UNAVAILABLE = "unavailable"
 U_STATES = (
     U_IDENTICAL_UNIQUE,
@@ -120,6 +128,7 @@ U_STATES = (
     U_IDENTICAL_TEXT_UNVERIFIED,
     U_DIFFERS,
     U_NO_BODY,
+    U_SKIPPED_MICRO,
     U_UNAVAILABLE,
 )
 
@@ -344,8 +353,8 @@ def _body_status(bodies: Bodies | None, addr: str) -> str:
     stub), ``db_unavailable`` (the analysis.db could not be read), or, for a present-but-empty body,
     the exporter's own reason via ``layer0._decompile_status`` — ``skipped_micro`` (a design skip),
     ``decompile_empty`` (a real empty decompile) or ``size_unknown`` (size 0 / unrecorded). The
-    pair-level state (``sameness_state``) still folds these back to NO_BODY / UNAVAILABLE; the cause
-    is a read-face detail, never a verdict."""
+    pair-level state (:func:`pair_reading`) folds these to NO_BODY / SKIPPED_MICRO_STATE /
+    UNAVAILABLE; the cause is a read-face detail, never a verdict."""
     if bodies is None:
         return DB_UNAVAILABLE
     if addr not in bodies:
@@ -368,10 +377,11 @@ def pair_reading(
 ) -> tuple[bool | None, str | None, tuple[str, ...], dict[str, Any] | None]:
     """``(matches, reason, text_reasons, bodies)`` for one pair: ``matches`` True / False (reason
     None) when both sides have a body to compare; else ``matches`` None with the reason a reader
-    would otherwise have to recompute — ``no_body`` when a side is an import / PLT stub, else
-    ``unavailable`` (``no_body`` wins when both apply, so a stub pair is named as one). Two texts
-    that match only because their try/catch annotation addresses were blanked match only when those
-    addresses all moved by the pair's entry offset; else the pair differs, as read.
+    would otherwise have to recompute — ``no_body`` when a side is an import / PLT stub (it wins
+    over the others, so a stub pair is named as one), ``skipped_micro`` when every side without
+    text is a design-skipped micro-function, else ``unavailable``. Two texts that match only
+    because their try/catch annotation addresses were blanked match only when those addresses all
+    moved by the pair's entry offset; else the pair differs, as read.
 
     ``text_reasons`` qualify a MATCH (empty otherwise — a text that differs is a difference, and a
     warning does not change that): ``literal_basis_unknown``, ``decompile_incomplete:<tag>`` for
@@ -380,15 +390,21 @@ def pair_reading(
 
     ``bodies`` is populated ONLY on the no-text-to-compare branch (one side not ``ok``), None
     otherwise: ``{a, b}`` with each side's finer body ``status`` (:func:`_body_status`) and its
-    ``size_bytes``, so the read face can split the pair-level UNAVAILABLE by cause and tell a
-    design-skipped micro-stub from a real decompile gap. It adds no fact and changes no state."""
+    ``size_bytes``, so the read face can split the pair-level UNAVAILABLE / SKIPPED_MICRO_STATE by
+    cause. It adds no fact and changes no state."""
     sa, sb = _body_status(a_bodies, addr_a), _body_status(b_bodies, addr_b)
     if sa != "ok" or sb != "ok":
         bodies = {
             "a": {"status": sa, "size_bytes": _size((a_bodies or {}).get(addr_a) or {})},
             "b": {"status": sb, "size_bytes": _size((b_bodies or {}).get(addr_b) or {})},
         }
-        return (None, NO_BODY if NO_BODY in (sa, sb) else UNAVAILABLE, (), bodies)
+        if NO_BODY in (sa, sb):
+            reason = NO_BODY
+        elif {sa, sb} <= {"ok", SKIPPED_MICRO}:
+            reason = SKIPPED_MICRO_STATE
+        else:
+            reason = UNAVAILABLE
+        return (None, reason, (), bodies)
     ba, bb = (a_bodies or {})[addr_a], (b_bodies or {})[addr_b]
     pa, pb = ba.get("pseudocode") or "", bb.get("pseudocode") or ""
     equal, relied = literal_reading(pa, pb, ranges_a, ranges_b)
@@ -409,11 +425,12 @@ def sameness_state(
     reason: str | None,
     text_reasons: tuple[str, ...] | list[str],
 ) -> str:
-    """Fold a pseudocode reading and the pair's callee-set state into one of the six states. A
+    """Fold a pseudocode reading and the pair's callee-set state into one of the seven states. A
     changed callee set is proof of change even with no body to read (so ``differs`` wins over a
     missing body); a match is ``identical`` only when nothing qualifies the text AND the callees
     are proven equal, else unverified — never silently "unchanged". When there is no body and
-    nothing proves a change, the reason stands as the state (``no_body`` / ``unavailable``)."""
+    nothing proves a change, the reason stands as the state (``no_body`` / ``skipped_micro`` /
+    ``unavailable``)."""
     if callee_state == "differs":
         return DIFFERS  # a changed call set is proof of change, even with no body to read
     if matches is None:
@@ -444,7 +461,9 @@ def undetermined_pair_state(
     if callee_state == "differs":
         return U_DIFFERS
     if matches is None:
-        return U_NO_BODY if reason == NO_BODY else U_UNAVAILABLE
+        if reason == NO_BODY:
+            return U_NO_BODY
+        return U_SKIPPED_MICRO if reason == SKIPPED_MICRO_STATE else U_UNAVAILABLE
     if not matches:
         return U_DIFFERS
     if text_reasons:
