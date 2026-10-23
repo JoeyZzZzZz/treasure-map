@@ -575,11 +575,13 @@ def prepare_diff_annotation(
     attributed_to: str | None,
     verdict_basis: dict[str, Any] | None,
     group_ref: str | None,
+    group_cache: dict[str, Any] | None = None,
 ) -> PreparedDiffWrite:
     """Validate and snapshot one diff annotation against an already-built view — READ ONLY, no
     write, no commit. ``built`` / ``meta`` are the diff_annotations ``_built`` / ``_binary_diff``;
     ``side_meta`` is same_shape_siblings ``_meta`` (needed for a group_ref). Raises ConfigError on
-    any problem. Shared by the single ``annotate_diff`` and the batch, so both validate alike."""
+    any problem. Shared by the single ``annotate_diff`` and the batch, so both validate alike.
+    ``group_cache`` (see ``annotate_group_on``) lets a batch snapshot each group once."""
     if verdict not in _DIFF_VERDICTS:
         if verdict in _VERDICTS:
             raise ConfigError(
@@ -590,6 +592,11 @@ def prepare_diff_annotation(
         raise ConfigError(f"verdict must be one of {list(_DIFF_VERDICTS)}; got {verdict!r}")
     basis_json = _validate_diff_verdict_basis(verdict, verdict_basis)
     _check_text_and_attribution(rationale, attributed_to)
+    if group_ref is not None and not isinstance(group_ref, str):
+        raise ConfigError(
+            f"group_ref must be a string, not {type(group_ref).__name__} — copy it from a "
+            "same_shape_siblings result"
+        )
     # Imported here, not at the top: the query package imports this module on its own import, so a
     # top-level import from it would run before this module had finished loading.
     from treasure_map.lib.query.diff_annotations import (
@@ -602,7 +609,7 @@ def prepare_diff_annotation(
         from treasure_map.lib.query.diff_group_freshness import annotate_group_on
 
         snapshot["group"] = annotate_group_on(
-            atlas, built, side_meta, diff_id, anchor_ref, group_ref
+            atlas, built, side_meta, diff_id, anchor_ref, group_ref, cache=group_cache
         )
     if verdict == "no_real_change" and verdict_basis is not None:
         require_checked_anchor(atlas, built, meta, side_meta, verdict_basis["checked"], "checked")

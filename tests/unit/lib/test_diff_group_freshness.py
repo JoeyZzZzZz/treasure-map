@@ -773,29 +773,31 @@ def test_the_call_cache_is_dropped_when_the_runs_instances_change(world: World) 
 
 
 def test_batch_echoes_a_leaned_on_group_once_and_carries_the_ref(world: World) -> None:
-    """An entry judged in a batch that leaned on a group carries only the group_ref string in its
-    result; the group itself is echoed once under the top-level ``groups`` block.
+    """Several entries of one batch leaning on the SAME group each carry only the group_ref string
+    in their result; the group itself is echoed once under the top-level ``groups`` block.
 
-    MUTATION (verified RED): inline the whole group echo on each result instead of a top-level
-    deduped block -> the result row is no longer compact."""
+    MUTATIONS (verified RED): inline the whole group echo on each result instead of a top-level
+    block -> the result rows are no longer compact; key the top-level block per entry instead of
+    per group_ref -> the one group is echoed three times."""
     tools = mcp_app.make_tools(world.path)
-    anchor = _entry_anchor(world, "00001000")
     gref = _group_ref(world, LISTED)
+    anchors = [_entry_anchor(world, a) for a in _SHARING]
     out = tools["annotate_diff_batch"](
         DIFF,
         [
             {
-                "anchor_ref": anchor,
+                "anchor_ref": a,
                 "verdict": "changed_real",
                 "rationale": "the shape held",
                 "group_ref": gref,
             }
+            for a in anchors
         ],
     )
-    assert out["written"] is True
-    res = out["results"][0]
-    assert res["group_ref"] == gref and "group" not in res  # ref only on the row
-    assert gref in out["groups"]
+    assert out["written"] is True, out
+    for res in out["results"]:
+        assert res["group_ref"] == gref and "group" not in res  # ref only on the row
+    assert list(out["groups"]) == [gref]
     echoed = out["groups"][gref]
     assert echoed["group_ref"] == gref and echoed["relation"] == "own_call"
     assert echoed["member_count"] == len(GROUP_A)
@@ -836,15 +838,16 @@ def test_batch_builds_the_diff_view_once(world: World, monkeypatch: pytest.Monke
 
 def test_a_group_ref_counts_as_a_checked_anchor_even_for_another_entry(world: World) -> None:
     """A group_ref used in ``checked`` proves a group was READ; it need not be about the judged
-    entry (is_diff_anchor stops before the "about this entry" relation).
+    entry (is_diff_anchor stops before the "about this entry" relation). The judged entry here is
+    one the group is provably NOT about: leaning on it as a group_ref is refused.
 
-    MUTATION (verified RED): include the _relation check in group_in_diff -> a group_ref read for
-    one entry no longer counts as checked on another, and the write is refused."""
-    from treasure_map.lib.query import diff_review as drv
-
+    MUTATION (verified RED): hold a checked group_ref to the "about this entry" relation of the
+    judged anchor -> the write is refused."""
     tools = mcp_app.make_tools(world.path)
-    gref = _group_ref(world, LISTED)  # a current group about 00001000 (own_call)
-    other = _entry_anchor(world, "00009000")  # a different entry the group is NOT about
+    gref = _group_ref(world, LISTED)
+    other = _entry_anchor(world, "00018000")  # a wrapper call's entry: no call or shape of GROUP_A
+    with pytest.raises(ConfigError, match="not about this entry"):
+        gf.annotate_group(world.atlas, DIFF, other, gref)
     out = tools["annotate_diff_batch"](
         DIFF,
         [
@@ -857,4 +860,80 @@ def test_a_group_ref_counts_as_a_checked_anchor_even_for_another_entry(world: Wo
         ],
     )
     assert out["written"] is True, out
-    assert drv is not None
+
+
+# Three entries the LISTED group is about, by both relations: two hold a call of it (own_call), one
+# has its shape as a function-level candidate (same_shape).
+_SHARING = ("00001000", "0000c000", "0001c000")
+_SHARING_RELATION = {"00001000": "own_call", "0000c000": "own_call", "0001c000": "same_shape"}
+
+
+def test_batch_rows_leaning_on_a_shared_group_equal_per_entry_writes(world: World) -> None:
+    """A batch row that leaned on a group is field-for-field the row the single annotate_diff
+    writes for the same inputs — the stored group snapshot included — and the group, snapshotted
+    once for the batch, still carries each entry's own relation.
+
+    MUTATION (verified RED): cache the relation with the group (per group_ref, not per entry) ->
+    the same_shape entry stores own_call and differs from its single-write row."""
+    tools = mcp_app.make_tools(world.path)
+    gref = _group_ref(world, LISTED)
+    anchors = {a: _entry_anchor(world, a) for a in _SHARING}
+    cols = "verdict, rationale, attributed_to, basis_state, verdict_basis, promoted_from, run_id"
+
+    def rows() -> dict[str, tuple[Any, ...]]:
+        return {
+            r[0]: tuple(r[1:])
+            for r in world.atlas.execute(
+                f"SELECT anchor_ref, {cols} FROM overlay WHERE anchor_kind = 'diff_subject'"  # noqa: S608
+            ).fetchall()
+        }
+
+    def item(anchor: str) -> dict[str, Any]:
+        return {
+            "anchor_ref": anchor,
+            "verdict": "changed_real",
+            "rationale": "the other calls of this shape did not change",
+            "group_ref": gref,
+        }
+
+    out = tools["annotate_diff_batch"](DIFF, [item(a) for a in anchors.values()])
+    assert out["written"] is True, out
+    batched = rows()
+    assert set(batched) == set(anchors.values())
+    for addr, anchor in anchors.items():
+        stored = json.loads(batched[anchor][3])
+        assert stored["group"]["relation"] == _SHARING_RELATION[addr], addr
+        assert tools["clear_overlay"](anchor_kind="diff_subject", anchor_ref=anchor)["cleared"] == 1
+    for anchor in anchors.values():
+        one = item(anchor)
+        single = tools["annotate_diff"](DIFF, **one)
+        assert single["written"] is True, single
+    assert rows() == batched
+
+
+def test_batch_snapshots_a_shared_group_once(world: World, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Entries of one batch leaning on the same group_ref check and snapshot that group once; only
+    the per-entry relation is worked out per entry.
+
+    MUTATION (verified RED): give the batch no group cache -> the group is snapshotted once per
+    entry."""
+    tools = mcp_app.make_tools(world.path)
+    gref = _group_ref(world, LISTED)
+    anchors = [_entry_anchor(world, a) for a in _SHARING]
+    snaps = {"n": 0}
+    real = gf.group_snapshot
+
+    def counting(*a: Any, **k: Any) -> Any:
+        snaps["n"] += 1
+        return real(*a, **k)
+
+    monkeypatch.setattr(gf, "group_snapshot", counting)
+    out = tools["annotate_diff_batch"](
+        DIFF,
+        [
+            {"anchor_ref": a, "verdict": "changed_real", "rationale": "x", "group_ref": gref}
+            for a in anchors
+        ],
+    )
+    assert out["written"] is True, out
+    assert snaps["n"] == 1, snaps["n"]

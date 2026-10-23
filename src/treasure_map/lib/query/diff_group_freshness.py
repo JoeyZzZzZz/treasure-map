@@ -307,7 +307,7 @@ def annotate_group(
     its shape is no current group, or the group is about some other entry.
 
     A thin wrapper that builds the view and the side meta once; ``annotate_group_on`` holds the
-    checks, so a batch write that has already built both can reuse them (M-2)."""
+    checks, so a batch write that has already built both can reuse them."""
     built = build_diff_view(atlas, diff_id)
     if built is None:
         raise ConfigError(f"no diff {diff_id!r} in this atlas (see list_diffs)")
@@ -323,9 +323,44 @@ def annotate_group_on(
     diff_id: str,
     anchor_ref: str,
     group_ref: str,
+    *,
+    cache: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """``annotate_group`` against an already-built view and side meta (``_meta`` — run / sha per
-    side, NOT the ``_binary_diff`` dict). Same checks, same errors."""
+    side, NOT the ``_binary_diff`` dict). Same checks, same errors.
+
+    ``cache`` (a batch passes one dict for the whole batch) keeps, per ``group_ref``, everything
+    that depends on the group alone — the ref checks, the grouping and the snapshot — so several
+    entries leaning on one group snapshot it once. Only the "about this entry" relation is worked
+    out per entry. A failed ref is not cached; it fails again, the same way, for each entry."""
+    hit = cache.get(group_ref) if cache is not None else None
+    if hit is None:
+        hit = _checked_group(atlas, built, side_meta, diff_id, group_ref)
+        if cache is not None:
+            cache[group_ref] = hit
+    side, f2_key, calls, groups, members, snapshot = hit
+    relation = _relation(built, side, f2_key, members, calls, anchor_ref)
+    if relation is None:
+        shapes = _subject_shapes_listing(built, side_meta, side, calls, groups, anchor_ref)
+        raise ConfigError(
+            f"group {group_ref!r} is not about this entry: it holds no call of it, and the shape "
+            f"is not one this subject has on side {side!r}. The shapes it does have on this side: "
+            f"{shapes or 'none'}"
+        )
+    return {**snapshot, "relation": relation}
+
+
+def _checked_group(
+    atlas: sqlite3.Connection,
+    built: BuiltDiff,
+    side_meta: sss._Meta,
+    diff_id: str,
+    group_ref: str,
+) -> tuple[str, str, list[sss._Call], dict[str, list[sss._Call]], list[sss._Call], dict[str, Any]]:
+    """The part of ``annotate_group_on`` that depends on the group alone: check the ref (form, this
+    diff, side, recipe, a live shape, its fingerprint version) and snapshot the group. Returns
+    ``(side, f2_key, calls, groups, members, snapshot)``; raises ConfigError naming the failed
+    check."""
     parsed = _parse_ref(group_ref)
     if parsed is None:
         raise ConfigError(
@@ -360,17 +395,9 @@ def annotate_group_on(
             f"group_ref is of fingerprint version {fpv!r}, but this build records "
             f"{current_fpv!r} for the shape — read the group again and annotate against it"
         )
-    relation = _relation(built, side, f2_key, members, calls, anchor_ref)
-    if relation is None:
-        shapes = _subject_shapes_listing(built, side_meta, side, calls, groups, anchor_ref)
-        raise ConfigError(
-            f"group {group_ref!r} is not about this entry: it holds no call of it, and the shape "
-            f"is not one this subject has on side {side!r}. The shapes it does have on this side: "
-            f"{shapes or 'none'}"
-        )
     snapshot = group_snapshot(atlas, built, side, f2_key)
     assert snapshot is not None  # members were just found
-    return {**snapshot, "relation": relation}
+    return side, f2_key, calls, groups, members, snapshot
 
 
 def group_in_diff(

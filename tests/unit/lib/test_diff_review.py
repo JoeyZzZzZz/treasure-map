@@ -1619,3 +1619,215 @@ def test_batch_rejects_a_non_object_item_without_writing(world: World) -> None:
         server.call_tool("annotate_diff_batch", {"diff_id": DX, "annotations": _json.dumps([ok])})
     )
     assert _overlay_rows(world) == 1, res
+
+
+# ── checked: every anchor kind resolves on its own; a wrong-run anchor is refused ─────────────
+
+
+def _checked_kinds() -> dict[str, tuple[str, str]]:
+    """One item per anchor kind (the group_ref kind is in test_diff_group_freshness, which has a
+    group), each naming something in ``_batch_world(world, 2)`` + one unpaired function, and the
+    kind ``is_diff_anchor`` must read it as. None of them is the judged entry's own anchor."""
+    return {
+        "function_pair": (_pair_anchor(DX, "00001001", "00009001"), "function_pair"),
+        "function_presence": (f"{PAIR}#function_presence#libx::b:0000f000", "function_presence"),
+        "candidate": (
+            dr.candidate_anchor("runA", "runB", f"callsite|cmd|{_ref('runA', '00001001')}|(none)"),
+            "candidate",
+        ),
+        "entry_id": ("pair:00001001:00009001", "entry_id"),
+        "row_ref": (_ref("runA", "00001001"), "row_ref"),
+    }
+
+
+@pytest.mark.parametrize("kind", sorted(_checked_kinds()))
+def test_each_anchor_kind_alone_satisfies_checked(world: World, kind: str) -> None:
+    """Every anchor kind the rule names counts on its own — no other anchor in ``checked``, only a
+    plain note beside it (which does not count) — and is read as exactly that kind.
+
+    MUTATIONS (verified RED, one per kind): an entry_id never resolves in ``is_diff_anchor``; a
+    row_ref never resolves; a candidate anchor is not counted; a function_presence anchor is not
+    counted -> that kind's item falls to the "looks like an anchor but names nothing" refusal."""
+    tools, anchors = _batch_world(world, 2)
+    world.unpaired(DX, "b", "0000f000", "unmatched_analysis_complete")
+    item, expected = _checked_kinds()[kind]
+
+    out = tools["annotate_diff_batch"](
+        DX,
+        [
+            {
+                "anchor_ref": anchors[0],
+                "verdict": "no_real_change",
+                "why_unchanged": "w",
+                "checked": [item, "a plain note"],
+            }
+        ],
+    )
+    assert out["written"] is True, out
+    stored = json.loads(
+        world.atlas.execute(
+            "SELECT verdict_basis FROM overlay WHERE anchor_ref = ?", (anchors[0],)
+        ).fetchone()[0]
+    )
+    assert stored["checked"] == [item, "a plain note"]
+
+    built = dann._built(world.atlas, DX)
+    meta = dann._binary_diff(world.atlas, DX)
+    from treasure_map.lib.query.same_shape_siblings import _meta as _side_meta
+
+    side_meta = _side_meta(world.atlas, DX)
+    assert dann.is_diff_anchor(world.atlas, built, meta, side_meta, item) == expected
+
+
+def test_checked_refuses_an_anchor_of_another_run_pair_by_position(world: World) -> None:
+    """An anchor of ANOTHER run pair still looks like an anchor, so it must resolve here — it is
+    refused and named by its position, not kept as a plain note (even beside one that resolves).
+
+    MUTATION (verified RED): only treat this diff's own run pair as anchor-shaped -> the wrong-run
+    anchor passes as plain text and the batch writes."""
+    tools, anchors = _batch_world(world, 1)
+    wrong_run = anchors[0].replace(f"{PAIR}#", "runX::runY#", 1)
+    assert wrong_run != anchors[0]
+    item = {
+        "anchor_ref": anchors[0],
+        "verdict": "no_real_change",
+        "why_unchanged": "w",
+        "checked": [anchors[0], "a plain note", wrong_run],
+    }
+    out = tools["annotate_diff_batch"](DX, [item])
+    assert out["written"] is False
+    (err,) = out["errors"]
+    assert err["indexes"] == [0]
+    assert "checked[2]" in err["error"] and "anchor_ref anchor" in err["error"]
+    assert "names nothing" in err["error"]
+    single = tools["annotate_diff"](
+        DX, anchors[0], "no_real_change", checked=item["checked"], why_unchanged="w"
+    )
+    assert single["written"] is False and "checked[2]" in single["error"]
+    assert _overlay_rows(world) == 0
+
+
+# ── evidence on the other verdicts; rationale on change_inconclusive; a candidate verdict ──────
+
+
+@pytest.mark.parametrize("verdict", ["no_real_change", "change_inconclusive"])
+def test_evidence_on_any_verdict_but_changed_real_is_refused(world: World, verdict: str) -> None:
+    """``evidence`` belongs to changed_real only; on the other two verdicts it is refused with that
+    message — never silently dropped while the rest of the item is written.
+
+    MUTATION (verified RED): drop ``evidence`` from the basis of the other verdicts instead of
+    refusing it -> no_real_change writes (evidence lost), change_inconclusive fails with another
+    message."""
+    tools, anchors = _batch_world(world, 1)
+    item: dict[str, Any] = {
+        "anchor_ref": anchors[0],
+        "verdict": verdict,
+        "rationale": "looked",
+        "evidence": [anchors[0]],
+    }
+    if verdict == "no_real_change":
+        item.update(checked=[anchors[0]], why_unchanged="w")
+    out = tools["annotate_diff_batch"](DX, [item])
+    assert out["written"] is False, out
+    assert out["errors"][0]["error"] == "evidence applies to changed_real only"
+    single = tools["annotate_diff"](
+        DX, **{k: v for k, v in item.items() if k != "anchor_ref"}, anchor_ref=anchors[0]
+    )
+    assert single["written"] is False and single["error"] == "evidence applies to changed_real only"
+    assert _overlay_rows(world) == 0
+
+
+def test_change_inconclusive_without_a_rationale_is_refused(world: World) -> None:
+    """Only no_real_change may default its rationale (to why_unchanged); change_inconclusive owes
+    one — its rationale is where the next step goes.
+
+    MUTATION (verified RED): let change_inconclusive fall back to why_unchanged as no_real_change
+    does -> the refusal no longer names the missing rationale."""
+    tools, anchors = _batch_world(world, 1)
+    out = tools["annotate_diff_batch"](
+        DX, [{"anchor_ref": anchors[0], "verdict": "change_inconclusive"}]
+    )
+    assert out["written"] is False
+    assert "rationale is required for change_inconclusive" in out["errors"][0]["error"]
+    single = tools["annotate_diff"](DX, anchors[0], "change_inconclusive")
+    assert single["written"] is False
+    assert "rationale is required for change_inconclusive" in single["error"]
+    assert _overlay_rows(world) == 0
+
+
+def test_a_candidate_verdict_without_a_rationale_names_the_right_tool(world: World) -> None:
+    """A candidate verdict on a diff entry is refused for what it is (annotate / promote is the
+    tool for it), even when the rationale is missing too — not with "rationale is required".
+
+    MUTATION (verified RED): resolve the rationale before the verdict is known to be a diff verdict
+    -> the refusal reads "rationale is required for suspicious"."""
+    tools, anchors = _batch_world(world, 1)
+    out = tools["annotate_diff_batch"](DX, [{"anchor_ref": anchors[0], "verdict": "suspicious"}])
+    assert out["written"] is False
+    assert "candidate verdict" in out["errors"][0]["error"]
+    single = tools["annotate_diff"](DX, anchors[0], "suspicious")
+    assert single["written"] is False and "candidate verdict" in single["error"]
+    assert _overlay_rows(world) == 0
+
+
+# ── field types: a wrong type fails that item, listed with the rest, never a raw exception ─────
+
+
+@pytest.mark.parametrize("bad", [5, ["a", "b"], {"group_ref": "x"}])
+def test_a_non_string_group_ref_fails_that_item(world: World, bad: Any) -> None:
+    """A group_ref that is not a string fails that one item with a named error, listed beside the
+    other items' errors — the batch neither raises nor writes.
+
+    MUTATION (verified RED): drop the type check -> ``_parse_ref`` calls ``.partition`` on it and
+    the tool raises AttributeError."""
+    tools, anchors = _batch_world(world, 2)
+    items = [
+        {"anchor_ref": anchors[0], "verdict": "changed_real", "rationale": "x", "group_ref": bad},
+        {"anchor_ref": anchors[1], "rationale": "x"},  # missing verdict
+    ]
+    out = tools["annotate_diff_batch"](DX, items)
+    assert out["written"] is False
+    by_index = {i: e["error"] for e in out["errors"] for i in e["indexes"]}
+    assert set(by_index) == {0, 1}
+    assert "group_ref must be a string" in by_index[0]
+    assert by_index[1] == "verdict is required"
+    assert _overlay_rows(world) == 0
+
+
+# ── all or none when a write itself fails (stage two) ─────────────────────────────────────────
+
+
+@pytest.mark.parametrize("fail_at", [2, 4])
+def test_a_write_failing_mid_batch_leaves_nothing_written(
+    world: World, monkeypatch: pytest.MonkeyPatch, fail_at: int
+) -> None:
+    """Every item validated, then the k-th write raises: the batch reports it and NOTHING it wrote
+    persists — the writes before k are rolled back, and a judgement it was overwriting is intact.
+
+    MUTATIONS (verified RED): commit after each write -> the writes before k persist and the prior
+    judgement is overwritten; open the batch's connection in autocommit mode -> the same."""
+    tools, anchors = _batch_world(world, 5)
+    before = tools["annotate_diff"](DX, anchors[0], "changed_real", "before the batch")
+    assert before["written"] is True
+    real = overlay.write_prepared
+    calls = {"n": 0}
+
+    def flaky(atlas: sqlite3.Connection, p: overlay.PreparedDiffWrite) -> overlay.UpsertResult:
+        calls["n"] += 1
+        if calls["n"] == fail_at + 1:
+            raise sqlite3.OperationalError("disk I/O error (injected)")
+        return real(atlas, p)
+
+    monkeypatch.setattr(overlay, "write_prepared", flaky)
+    items = [
+        {"anchor_ref": a, "verdict": "change_inconclusive", "rationale": "in the batch"}
+        for a in anchors
+    ]
+    out = tools["annotate_diff_batch"](DX, items)
+    assert calls["n"] == fail_at + 1  # the injection fired, at the k-th write
+    assert out["written"] is False and out["count"] == 0
+    assert "nothing was written" in out["errors"][0]["error"]
+    rows = world.atlas.execute(
+        "SELECT anchor_ref, verdict, rationale FROM overlay WHERE anchor_kind = 'diff_subject'"
+    ).fetchall()
+    assert [tuple(r) for r in rows] == [(anchors[0], "changed_real", "before the batch")]

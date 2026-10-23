@@ -44,6 +44,7 @@ from treasure_map.lib.atlas.models import RunRow
 from treasure_map.lib.config.config import Config, load_config
 from treasure_map.lib.errors import ConfigError
 from treasure_map.lib.notice import LEGAL_NOTICE
+from treasure_map.lib.overlay import _DIFF_VERDICTS
 from treasure_map.lib.overlay import annotate_diff as _annotate_diff
 from treasure_map.lib.overlay import clear_overlay as _clear_overlay
 from treasure_map.lib.overlay import list_overlays as _list_overlays
@@ -237,8 +238,8 @@ def _diff_group_echo(atlas: sqlite3.Connection, row_id: int) -> dict[str, Any] |
     }
 
 
-# The only keys a batch annotation item may carry (q-5): a stray key (``evidences``, ``checkd``)
-# would otherwise be silently ignored and the agent would think it recorded something it did not.
+# The only keys a batch annotation item may carry: a stray key (``evidences``, ``checkd``) would
+# otherwise be silently ignored and the agent would think it recorded something it did not.
 _BATCH_ITEM_KEYS = frozenset(
     {"anchor_ref", "verdict", "rationale", "checked", "why_unchanged", "evidence", "group_ref"}
 )
@@ -246,10 +247,15 @@ _BATCH_ITEM_KEYS = frozenset(
 
 def _resolve_diff_rationale(verdict: str, rationale: Any, why_unchanged: Any) -> str:
     """The non-blank rationale a diff write owes, with the ``no_real_change`` default: a blank
-    rationale falls back to ``why_unchanged`` there; the other verdicts have no fallback (raise).
-    A ``no_real_change`` with neither returns "" — the lib's why_unchanged check reports it."""
+    rationale falls back to ``why_unchanged`` there; the other diff verdicts have no fallback
+    (raise). A ``no_real_change`` with neither returns "" — the lib's why_unchanged check reports
+    it. A verdict that is not a diff verdict at all is passed through untouched, so the lib's
+    verdict check refuses it first, with the message that names the right tool (a candidate verdict
+    belongs on annotate / promote) rather than a missing rationale."""
     if isinstance(rationale, str) and rationale.strip():
         return rationale
+    if verdict not in _DIFF_VERDICTS:
+        return rationale if isinstance(rationale, str) else ""
     if verdict == "no_real_change":
         return why_unchanged if isinstance(why_unchanged, str) else ""
     raise ConfigError(
@@ -268,7 +274,7 @@ def _diff_verdict_basis(item: Mapping[str, Any]) -> dict[str, Any] | None:
 
 def _anchor_placeholder(text: str, anchor_ref: Any) -> str:
     """A batch error text with THIS item's own ``anchor_ref`` replaced by a fixed placeholder, so
-    200 items that each failed naming their own anchor collapse to one merged error (Q-1). Only the
+    200 items that each failed naming their own anchor collapse to one merged error. Only the
     item's own ref is replaced; a ref it names in ``checked`` is not (that is a different fact)."""
     if isinstance(anchor_ref, str) and anchor_ref:
         return text.replace(repr(anchor_ref), "'<this item's anchor_ref>'")
@@ -277,7 +283,7 @@ def _anchor_placeholder(text: str, anchor_ref: Any) -> str:
 
 def _merge_batch_errors(raw: list[tuple[int, str]]) -> list[dict[str, Any]]:
     """Per-item errors (``(index, text)``) merged by identical text — ``{error, indexes}`` each,
-    ordered by first index. The caller has already placeholdered each item's own anchor (Q-1)."""
+    ordered by first index. The caller has already placeholdered each item's own anchor."""
     by_text: dict[str, list[int]] = {}
     for idx, text in raw:
         by_text.setdefault(text, []).append(idx)
@@ -3489,7 +3495,7 @@ def make_tools(
             except ConfigError as exc:
                 return {"written": False, "error": str(exc)}
 
-            # same anchor_ref more than once -> refuse the whole batch (D-T3-2)
+            # the same anchor_ref more than once -> refuse the whole batch
             anchors_at: dict[str, list[int]] = {}
             for i, item in enumerate(annotations):
                 a = item.get("anchor_ref") if isinstance(item, dict) else None
@@ -3498,7 +3504,9 @@ def make_tools(
             dup_refs = {a: idxs for a, idxs in anchors_at.items() if len(idxs) > 1}
             dup_idx = {i for idxs in dup_refs.values() for i in idxs}
 
-            # stage 1 — validate + snapshot every item, writing nothing
+            # stage 1 — validate + snapshot every item, writing nothing. One group cache for the
+            # batch: entries leaning on the same group_ref check and snapshot that group once.
+            group_cache: dict[str, Any] = {}
             raw_errors: list[tuple[int, str]] = []
             prepared: list[tuple[int, Any, dict[str, Any]]] = []
             for i, item in enumerate(annotations):
@@ -3531,6 +3539,7 @@ def make_tools(
                         attributed_to="agent-via-mcp",
                         verdict_basis=_diff_verdict_basis(item),
                         group_ref=item.get("group_ref"),
+                        group_cache=group_cache,
                     )
                 except ConfigError as exc:
                     raw_errors.append((i, _anchor_placeholder(str(exc), item.get("anchor_ref"))))

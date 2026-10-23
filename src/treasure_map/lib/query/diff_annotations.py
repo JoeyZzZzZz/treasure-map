@@ -145,14 +145,14 @@ def capture_diff_basis_on(
 
 # ── a no_real_change's `checked` / a changed_real's `evidence`: anchors must resolve ─────────
 #
-# `checked` reasons for a verdict that SINKS an entry, so (M-1) an item that looks like an anchor
-# must actually resolve in this diff's current view; one that does not is refused and named. Items
+# `checked` reasons for a verdict that SINKS an entry, so an item that looks like an anchor must
+# actually resolve in this diff's current view; one that does not is refused and named. Items
 # that are not anchor-shaped are kept as plain-text notes and do not count. At least one anchor must
 # resolve. `is_diff_anchor` reuses the view's own parsers; `_anchor_marker` is the closed set of
 # "looks like an anchor" forms (a plain English note never matches one).
 
-# Any run pair's function_pair / function_presence / candidate anchor (n-2: a wrong-run anchor
-# still LOOKS like one, so it must resolve, not pass as plain text).
+# Any run pair's function_pair / function_presence / candidate anchor: an anchor of another run
+# pair still LOOKS like one, so it must resolve here, not pass as plain text.
 _PAIR_ANCHOR_MARKER = re.compile(
     r"^[^\s#]+::[^\s#]+#(?:function_pair|function_presence|candidate)#"
 )
@@ -224,7 +224,7 @@ def require_checked_anchor(
     items: list[str],
     field: str,
 ) -> None:
-    """Enforce the ``checked`` / ``evidence`` anchor rule (M-1): every item that LOOKS like an
+    """Enforce the ``checked`` / ``evidence`` anchor rule: every item that LOOKS like an
     anchor must resolve in the view (else a named refusal), plain text is kept but does not count,
     and at least one anchor must resolve. ``field`` is the key name, for the message wording."""
     run_a, run_b, binary = meta["run_a_id"], meta["run_b_id"], meta["binary_a"]
