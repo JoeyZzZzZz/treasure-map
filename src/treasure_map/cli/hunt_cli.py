@@ -24,6 +24,7 @@ from treasure_map.cli.interrupts import (
 )
 from treasure_map.lib import rescan_version
 from treasure_map.lib.errors import ConfigError, TreasureMapError
+from treasure_map.lib.query.diff_workflow import DIFF_WORKFLOW
 from treasure_map.lib.ro_db import ro_connect
 from treasure_map.version import UNKNOWN_VERSION, installed_commit
 
@@ -175,8 +176,7 @@ def _echo_single_diff(summary: Any, resolved_atlas: Path, states: dict[str, Any]
         held = f" ({rows} candidate rows)" if rows is not None else ""
         click.echo(f"  baseline      : {summary.baseline.replace('_', ' ')}{held}")
     click.echo(
-        "Read the diff: start with get_diff_patch_view (sort_by='significance' floats the scoped "
-        "signals); get_diff_meta / get_function_alignment / get_diff_capabilities; "
+        DIFF_WORKFLOW + " Also: get_diff_meta / get_function_alignment / get_diff_capabilities; "
         "get_diff_deltas for the string-keyed edges (a switchable view)."
     )
 
@@ -306,9 +306,8 @@ def _echo_full_diff(
         )
     _echo_coverage(coverage, after)
     click.echo(
-        "Read the diffs: list_diffs, then get_diff_patch_view per binary (sort_by='significance' "
-        "floats the scoped signals; get_diff_meta for the per-function split; get_diff_deltas for "
-        "the string-keyed edges, a switchable view); list_diff_blindspots for un-diffed binaries."
+        DIFF_WORKFLOW + " Also: get_diff_meta for the per-function split; get_diff_deltas for the "
+        "string-keyed edges (a switchable view); list_diff_blindspots for un-diffed binaries."
     )
 
 

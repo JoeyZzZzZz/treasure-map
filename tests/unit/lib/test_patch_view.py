@@ -31,6 +31,7 @@ from treasure_map.lib.query import diff_review as dr
 from treasure_map.lib.query import patch_view as pv
 from treasure_map.lib.query import sameness
 from treasure_map.lib.query import sink_overlay as so
+from treasure_map.lib.query.diff_workflow import DIFF_WORKFLOW
 from treasure_map.lib.storage.connection import open_db
 from treasure_map.version import UNKNOWN_VERSION
 
@@ -784,8 +785,9 @@ def test_a_diff_undetermined_as_a_whole_has_no_function_counts(
 
 def test_the_significance_lens_reorders_and_never_relabels(tmp_path: Path, current: None) -> None:
     """★ sort_by='significance' moves entries, never their labels: the same entries, buckets and
-    subclasses as the default view; A / a changed length constant first; a pseudocode-identical
-    entry sunk but still listed; each tier named on the entry, from facts the entry itself reports.
+    subclasses as the candidate_tier view; A / a changed length constant first; a
+    pseudocode-identical entry sunk but still listed; each tier named on the entry, from facts the
+    entry itself reports.
 
     MUTATION: give a pseudocode-identical entry attention 1 (do not sink) -> RED; float by bucket B
     instead of by the row's delta field -> RED."""
@@ -800,7 +802,7 @@ def test_the_significance_lens_reorders_and_never_relabels(tmp_path: Path, curre
     w.fn("a", "00015000", ["memset"], pseudocode="memset(b,0,8);")
     w.fn("b", "00016000", ["memset"], pseudocode="memset(b,0,8);")
     w.commit()
-    base = _view(w)
+    base = _view(w, sort_by="candidate_tier")
     lens = _view(w, sort_by="significance")
     assert set(lens["by_id"]) == set(base["by_id"])
     for eid, e in lens["by_id"].items():
@@ -1902,6 +1904,7 @@ def _envelope_labels(v: dict[str, Any]) -> set[str]:
         k for k in ("detail", "detail_with", "detail_note", "first_page_only") if k in v
     }
     out |= {str(v.get("detail"))} | set(v.get("detail_with") or {})
+    out |= {str((v.get("lens") or {}).get("sort_by"))}
     fpo = v.get("first_page_only") or {}
     out |= set(fpo) | set(fpo.get("keys", ())) | set(fpo.get("shortened", ()))
     template = (v.get("annotation") or {}).get("anchor_ref_template") or {}
@@ -2511,7 +2514,7 @@ def test_the_lens_counts_the_sunk_entries_whose_byte_counts_differ(
         "count": 1,
         "filter": {"body": "structure_differs"},
     }
-    assert "sunk_with_body_size_differs" not in _view(w)["lens"]
+    assert "sunk_with_body_size_differs" not in _view(w, sort_by="candidate_tier")["lens"]
 
 
 def test_the_build_reads_no_body_and_function_states_computes_no_delta(
@@ -3694,12 +3697,13 @@ def test_the_mcp_tool_passes_anchored_differs_through(tmp_path: Path, current: N
 
 
 def test_the_flag_is_on_the_reading_whatever_the_sort(tmp_path: Path, current: None) -> None:
-    """``anchored_differs`` / ``anchor`` / ``in_read_first`` are on the proposed reading with no
-    sort_by at all; the lens's attention and basis are there only under sort_by='significance'.
+    """``anchored_differs`` / ``anchor`` / ``in_read_first`` are on the proposed reading in the
+    candidate_tier order too; the lens's attention and basis are there only in the significance
+    order.
 
     MUTATION: compute the flag fields only under the lens -> RED."""
     w, ids = _filter_world(tmp_path)
-    v = _view(w)
+    v = _view(w, sort_by="candidate_tier")
     e = v["by_id"][ids["below"]]
     assert "significance" not in e
     r = e["proposed_pair_reading"]
@@ -4635,18 +4639,21 @@ def test_a_swap_never_replaces_a_b_entrys_basis(tmp_path: Path, current: None) -
     assert novis["rank_key"]["sink_callee_swap"] == 1
 
 
-@pytest.mark.parametrize("sort_by", [None, "tier", "similarity", "address", "significance"])
+@pytest.mark.parametrize(
+    "sort_by", [None, "candidate_tier", "tier", "similarity", "address", "significance"]
+)
 def test_the_field_is_on_every_sort_and_moves_only_the_lens(
     tmp_path: Path, current: None, monkeypatch: pytest.MonkeyPatch, sort_by: str | None
 ) -> None:
-    """The field is there in every sort; outside the lens the order is the one with no swap read.
+    """The field is there in every sort; outside the lens (significance, which no sort_by also
+    reads in) the order is the one with no swap read.
 
     MUTATION (verified RED, 4 failed): lift narrow swaps in every sort -> RED; emit the field only
     under the lens -> RED."""
     w, ids = _swap_world(tmp_path)
     v = _swap_view(w, sort_by=sort_by)
     assert _swap(v, ids, "c_narrow") is not None
-    if sort_by == "significance":
+    if sort_by in (None, "significance"):
         return
     order = [e["entry_id"] for e in v["entries"]]
     monkeypatch.setattr(pv, "_sink_callee_swap", lambda e: None)
@@ -4684,9 +4691,9 @@ def test_the_sink_names_are_the_sink_classes_and_the_unrecalled_sinks() -> None:
 
 
 def test_the_lens_and_the_tool_name_the_swap() -> None:
-    assert "sink_callee_swap_never_sunk" in pv._SIGNIFICANCE_LENS
     assert "sink_callee_swap" in pv._CAVEATS
     tool = mcp_app.make_tools(Path("unused.db"))["get_diff_patch_view"]
+    assert "sink_callee_swap_never_sunk" in (tool.__doc__ or "")
     assert "sink_callee_swap" in (tool.__doc__ or "")
     assert "named_callees_differ" in (tool.__doc__ or "")
 
@@ -4907,10 +4914,10 @@ def test_the_edge_never_rebuckets_an_already_listed_pair(tmp_path: Path, current
 
 def test_the_no_mention_key_orders_only_under_significance(tmp_path: Path, current: None) -> None:
     """Whether another B function names an E entry's function orders the E lane under significance
-    (no-mention first), as the honest field b_other_fn_mentions — but it NEVER touches the default
-    order, the rank_key or the cheap build layer (which cannot read pseudocode).
+    (no-mention first), as the honest field b_other_fn_mentions — but it NEVER touches the
+    candidate_tier order, the rank_key or the cheap build layer (which cannot read pseudocode).
 
-    MUTATION: fold the no-mention key into rank_key / the default order -> the default order flips /
+    MUTATION: fold the no-mention key into rank_key / the candidate_tier order -> that order flips /
     rank_key gains a field -> RED; include the function's OWN body in the mention index -> both read
     as mentioned -> the significance order stops splitting them -> RED."""
     w = World(tmp_path)
@@ -4928,10 +4935,11 @@ def test_the_no_mention_key_orders_only_under_significance(tmp_path: Path, curre
     w.fn("b", "00000300", [], name="b_mentioner", pseudocode="void *p = &m_target;")
     w.commit()
     m_id, u_id = _pair_id("00001000", "00002000"), _pair_id("00005000", "00006000")
-    base = _view(w)
+    base = _view(w, sort_by="candidate_tier")
     assert base["by_id"][m_id]["b_other_fn_mentions"] is True
     assert base["by_id"][u_id]["b_other_fn_mentions"] is False
-    # the default order is by address: m (lower) before u; rank_key carries no mention component.
+    # the candidate_tier order is by address: m (lower) before u; rank_key carries no mention
+    # component.
     base_order = [e["entry_id"] for e in base["entries"]]
     assert base_order.index(m_id) < base_order.index(u_id)
     assert set(base["by_id"][m_id]["rank_key"]) == {
@@ -5140,31 +5148,31 @@ def test_a_new_e_entry_is_not_served_the_old_mention_set(tmp_path: Path, current
 
 
 def test_the_order_lens_and_the_tool_name_the_edge(tmp_path: Path, current: None) -> None:
-    """The order a scope's first page states, the significance lens, the caveats and the tool's own
-    description all name bucket E and where it sits — not only the module docstring.
+    """The order a candidate_tier page's first page states, the caveats and the tool's own
+    description (where the significance rules are) all name bucket E and where it sits — not only
+    the module docstring.
 
     MUTATION (verified RED): drop E from lens.order -> RED; drop the two caller bases from the
-    significance lens -> RED; drop the callers_b caveat -> RED; drop E from the tool's description
+    tool's description -> RED; drop the callers_b caveat -> RED; drop E from the tool's description
     -> RED."""
     w = World(tmp_path)
     _edge_pair(w, "00001000", "00002000", "x_fn")
     w.commit()
-    v = pv.get_diff_patch_view(w.atlas, DIFF, sort_by="significance")
+    v = pv.get_diff_patch_view(w.atlas, DIFF, sort_by="candidate_tier")
     order = v["lens"]["order"]
     assert "sink_presence_signal first, then E;" in order  # with a candidate: after R and B
     assert "C, then E by caller relevance" in order  # with none: the last lane
-    lens = v["lens"]["significance"]
-    for word in (
-        "lost_every_direct_caller_never_sunk",
-        "caller_signal_undetermined_never_sunk",
-        "b_other_fn_mentions",
-    ):
-        assert word in lens, word
     assert {"callers_b", "E"} <= set(v["caveats"])
     assert "E" in v["legend"]
     doc = " ".join(
         (mcp_app.make_tools(Path("unused.db"))["get_diff_patch_view"].__doc__ or "").split()
     )
+    for word in (
+        "lost_every_direct_caller_never_sunk",
+        "caller_signal_undetermined_never_sunk",
+        "b_other_fn_mentions",
+    ):
+        assert word in doc, word
     assert "``E`` = a similarity-1 pair" in doc
     assert "b_other_fn_mentions" in doc and "R / B / E entries carrying a candidate" in doc
 
@@ -6081,11 +6089,12 @@ def test_the_anchor_template_rebuilds_every_entrys_anchor(
 
 
 # Recorded from the code before ``detail`` existed: the summary world's entries through the MCP
-# tool, one key per call below. Re-record it only when a full entry changes on purpose.
+# tool, one key per call below. Re-record it only when a full entry changes on purpose. "default"
+# and "scan" were recorded with no sort_by, when that was the order now named candidate_tier.
 _FULL_GOLDEN = Path(__file__).resolve().parents[2] / "fixtures" / "patch_view_full_entries.json"
 _GOLDEN_CALLS: dict[str, dict[str, Any]] = {
-    "default": {},
-    "scan": {"rows_limit": 0},
+    "default": {"sort_by": "candidate_tier"},
+    "scan": {"rows_limit": 0, "sort_by": "candidate_tier"},
     "significance": {"sort_by": "significance"},
     "not_listed": {"not_listed_page": "aligned_pseudocode_differs"},
 }
@@ -6664,3 +6673,654 @@ def test_a_summary_page_says_how_to_read_what_it_left_out(tmp_path: Path, curren
     edge = pv.get_diff_patch_view(w.atlas, DIFF, detail="summary", view="string_edge")
     assert "detail_with" not in edge
     assert "detail_with" not in pv.get_diff_patch_view(w.atlas, DIFF)
+
+
+# ── the default order: significance; candidate_tier names the one before it ────────────────────
+
+# The entry ids the candidate_tier order took on the summary world before significance became the
+# default, per sort (recorded beside the fixture file's entries, which hold every one of them: on
+# these pages an entry renders the same whatever the order, outside significance).
+_ORDERS_BEFORE: dict[str, tuple[dict[str, Any], list[str]]] = {
+    "tier": (
+        {"sort_by": "tier"},
+        [
+            "pair:00003000:00004000",
+            "pair:00001000:00002000",
+            "pair:00101000:00102000",
+            "pair:00005000:00006000",
+            "pair:00136000:00137000",
+            "pair:00132000:00132000",
+            "pair:00135000:00135000",
+            "pair:00131000:00131000",
+            "pair:00133000:00133000",
+            "pair:00134000:00134000",
+            "pair:00141000:00142000",
+            "pair:00151000:00152000",
+            "pair:00111000:00112000",
+            "a:00121000",
+            "a:00122000",
+        ],
+    ),
+    "similarity": (
+        {"sort_by": "similarity"},
+        [
+            "pair:00136000:00137000",
+            "pair:00132000:00132000",
+            "pair:00135000:00135000",
+            "pair:00141000:00142000",
+            "pair:00005000:00006000",
+            "pair:00003000:00004000",
+            "pair:00001000:00002000",
+            "pair:00101000:00102000",
+            "pair:00131000:00131000",
+            "pair:00133000:00133000",
+            "pair:00134000:00134000",
+            "pair:00151000:00152000",
+            "pair:00111000:00112000",
+            "a:00121000",
+            "a:00122000",
+        ],
+    ),
+    "address": (
+        {"sort_by": "address"},
+        [
+            "pair:00001000:00002000",
+            "pair:00003000:00004000",
+            "pair:00005000:00006000",
+            "pair:00101000:00102000",
+            "pair:00111000:00112000",
+            "pair:00131000:00131000",
+            "pair:00132000:00132000",
+            "pair:00133000:00133000",
+            "pair:00134000:00134000",
+            "pair:00135000:00135000",
+            "pair:00136000:00137000",
+            "pair:00141000:00142000",
+            "pair:00151000:00152000",
+            "a:00121000",
+            "a:00122000",
+        ],
+    ),
+    "anchored": (
+        {"anchored_differs": True},
+        [
+            "pair:00131000:00131000",
+            "pair:00134000:00134000",
+            "pair:00133000:00133000",
+            "pair:00132000:00132000",
+        ],
+    ),
+}
+
+
+def _tool_entries(tool: Any, **kw: Any) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    offset: int | None = 0
+    while offset is not None:
+        out = tool(DIFF, offset=offset, **kw)
+        assert "error" not in out and "over_budget" not in out, out
+        entries += out["entries"]
+        offset = out["next_offset"]
+    return entries
+
+
+def test_the_other_orders_are_entry_for_entry_what_they_were(tmp_path: Path, current: None) -> None:
+    """★ tier / similarity / address, and anchored_differs=true with no sort_by (its own order),
+    list byte for byte the entries they listed before significance became the default, in the
+    order they took then: no significance field, no attention in rank_key, nothing moved.
+
+    MUTATION (verified RED, 3 failed — with the anchored-page and lens tests): judge the anchored
+    page by the resolved sort (significance) instead of the sort_by given -> RED; MUTATION
+    (verified RED, 3 failed, the same three): let the anchored page compute significance -> RED."""
+    golden = {e["entry_id"]: e for e in json.loads(_FULL_GOLDEN.read_text())["default"]}
+    w = _summary_world(tmp_path)
+    tool = mcp_app.make_tools(w.path)["get_diff_patch_view"]
+    for name, (kw, order) in _ORDERS_BEFORE.items():
+        entries = _tool_entries(tool, **kw)
+        assert [e["entry_id"] for e in entries] == order, name
+        assert json.dumps(entries) == json.dumps([golden[k] for k in order]), name
+
+
+def _scopes_j1() -> list[dict[str, Any]]:
+    return [
+        {},
+        {"band": True},
+        {"bucket": "B"},
+        {"tier": "no_sink"},
+        {"rows_limit": 0},
+        {"anchored_micro_side": True},
+        {"not_listed_page": "aligned_pseudocode_differs"},
+    ]
+
+
+@pytest.mark.parametrize("detail", ["full", "summary"])
+def test_no_sort_by_reads_byte_for_byte_as_significance(
+    tmp_path: Path, current: None, detail: str
+) -> None:
+    """★ On view='sink_patch' (anchored_differs aside) a page with no sort_by is byte for byte the
+    page sort_by='significance' gives — every page of the scope, in both details, band on or off,
+    under a filter, the not-listed page and one entry read alone — and it says so:
+    lens.sort_by is 'significance' (a no-sort page that fell back to the candidate_tier order would
+    still equal itself, so the lens is read too).
+
+    MUTATION (verified RED, 4 failed — both details, with the lens and shape tests): resolve no
+    sort_by to None (the candidate_tier order) -> RED; MUTATION (verified RED, 3 failed — both
+    details, with the lens test): give a not-listed page the significance order -> RED."""
+    w = _summary_world(tmp_path)
+    pages = _pages(w, sort_by="candidate_tier")
+    for e in _listed(pages)[:3]:
+        w.judge(DIFF, e["anchor_ref"], "changed_real")
+    for kw in _scopes_j1():
+        plain = _pages(w, detail=detail, **kw)
+        lens = _pages(w, detail=detail, sort_by="significance", **kw)
+        assert json.dumps(plain) == json.dumps(lens), kw
+        want = "default" if "not_listed_page" in kw else "significance"
+        assert {p["lens"]["sort_by"] for p in plain} == {want}, kw
+    if detail == "full":
+        for e in _listed(pages):
+            one = pv.get_diff_patch_view(w.atlas, DIFF, entry_id=e["entry_id"])
+            same = pv.get_diff_patch_view(
+                w.atlas, DIFF, entry_id=e["entry_id"], sort_by="significance"
+            )
+            assert json.dumps(one) == json.dumps(same)
+            assert "significance" in one["entries"][0]
+            assert "attention" in one["entries"][0]["rank_key"]
+
+
+def test_the_lens_says_which_order_a_page_is_in(tmp_path: Path, current: None) -> None:
+    """lens.sort_by is the order the page is actually in: significance with no sort_by, the name
+    given otherwise, anchored_differs for that filter's own order, default for a not-listed page
+    (address order, whatever sort_by says) and the other views. lens.order is the significance
+    text on a significance page, the candidate_tier text on every other; lens.significance (the
+    short text) only on a significance page, on every page of it; lens.band by the order.
+
+    MUTATION (verified RED, 3 failed — with both J1 details): give a not-listed page the
+    significance order's lens -> RED; MUTATION (verified RED, 1 failed — this test alone): give a
+    significance page the candidate_tier band text -> RED."""
+    w = _summary_world(tmp_path)
+
+    def lens(**kw: Any) -> dict[str, Any]:
+        out = pv.get_diff_patch_view(w.atlas, DIFF, **kw)
+        assert "error" not in out, out
+        return dict(out["lens"])
+
+    sig = lens()
+    assert sig["sort_by"] == "significance" and sig["order"] == pv._ORDER_SIGNIFICANCE
+    assert sig["significance"] == pv._SIGNIFICANCE_LENS_SHORT
+    assert "sunk_with_body_size_differs" in sig
+    later = lens(offset=2, limit=2)
+    assert later["significance"] == pv._SIGNIFICANCE_LENS_SHORT and "order" not in later
+    ct = lens(sort_by="candidate_tier")
+    assert ct["sort_by"] == "candidate_tier" and ct["order"] == pv._ORDER_CANDIDATE_TIER
+    assert "significance" not in ct and "sunk_with_body_size_differs" not in ct
+    for sort_by in ("tier", "similarity", "address"):
+        other = lens(sort_by=sort_by)
+        assert other["sort_by"] == sort_by and other["order"] == pv._ORDER_CANDIDATE_TIER
+        assert "significance" not in other
+    anchored = lens(anchored_differs=True)
+    assert anchored["sort_by"] == "anchored_differs"
+    assert anchored["order"] == pv._ORDER_CANDIDATE_TIER and "significance" not in anchored
+    assert lens(anchored_differs=True, sort_by="significance")["sort_by"] == "significance"
+    for kw in ({}, {"sort_by": "significance"}):
+        nl = lens(not_listed_page="aligned_pseudocode_differs", **kw)
+        assert nl["sort_by"] == "default" and nl["order"] == pv._ORDER_CANDIDATE_TIER
+        assert "significance" not in nl
+    for view in ("string_edge", "candidate_flat"):
+        assert lens(view=view)["sort_by"] == "default"
+    assert lens(band=True)["band"] == pv._BAND_SIGNIFICANCE
+    assert lens(band=True, sort_by="candidate_tier")["band"] == pv._BAND_CANDIDATE_TIER
+    assert lens(band=True, sort_by="tier")["band"] == pv._BAND_CANDIDATE_TIER
+
+
+def test_the_short_significance_text_keeps_what_the_lens_cannot_see() -> None:
+    """The text on every significance page says what the lens is blind to; the full rules are in
+    the tool's description, which keeps every rule the long text gave.
+
+    MUTATION (verified RED, 1 failed — this test alone): drop the 'Not seen by this lens'
+    sentence -> RED."""
+    short = pv._SIGNIFICANCE_LENS_SHORT
+    assert "Not seen by this lens: " in short
+    for blind in (
+        "a constant in an allocation expression or a local buffer's declared size (blind_spots)",
+        "the target a DAT_ / PTR_ reference points at once its address is blanked",
+        "a C++ catch handler (landing pad)",
+        "anything in a binary the two runs hold byte-identical",
+    ):
+        assert blind in short, blind
+    doc = " ".join(
+        (mcp_app.make_tools(Path("unused.db"))["get_diff_patch_view"].__doc__ or "").split()
+    )
+    for rule in (
+        "a wide one still sinks",
+        "a constant in an allocation expression or a local buffer's declared size",
+        "anything in a binary the two runs hold byte-identical",
+        "then those below it",
+        "with no ``sort_by`` the page is in the ``significance`` order",
+        "``sort_by='candidate_tier'`` is the order that was the default before it",
+    ):
+        assert rule in doc, rule
+
+
+# The entries the T2 world judges: the first three of both the candidate_tier and the significance
+# order (bucket A, every one of them), so that the first unjudged entry differs in each order.
+_T2_JUDGED = ("pair:0002a000:0002b000", "pair:00001000:00002000", "pair:00003000:00004000")
+_T2_FIRST = {
+    "candidate_tier": "pair:00020000:00021000",
+    "significance": "pair:0001c000:0001d000",
+    "address": "pair:00005000:00006000",
+}
+
+
+def _t2_world(tmp_path: Path) -> World:
+    w = World(tmp_path)
+    _rich(w)
+    base = _view(w, sort_by="candidate_tier")
+    for eid in _T2_JUDGED:
+        w.judge(DIFF, base["by_id"][eid]["anchor_ref"], "changed_real")
+    w.commit()
+    return w
+
+
+def _first_named(annotation: dict[str, Any]) -> str:
+    """The entry id the annotation block's promote call is filled in with."""
+    found = re.search(r'entry_id="([^"]+)"', annotation["promote"])
+    assert found is not None, annotation["promote"]
+    return found.group(1)
+
+
+def test_the_next_unjudged_entries_follow_the_order_of_the_page(
+    tmp_path: Path, current: None
+) -> None:
+    """★ review_progress.next_page and the annotation block's first unjudged entry are named in
+    the order the page is read in — significance with no sort_by, the order sort_by names
+    otherwise — while every count stays the same whatever the order.
+
+    MUTATION (verified RED, 2 failed — with the anchored-page test): name them in the
+    candidate_tier order on every page -> RED; MUTATION (verified RED, 1 failed — this test alone):
+    name them in the significance order on every page -> the address page goes RED."""
+    w = _t2_world(tmp_path)
+    by_bucket = _view(w, sort_by="candidate_tier")["by_id"]
+    assert {k for k, e in by_bucket.items() if e["bucket"] == "A"} == set(_T2_JUDGED)
+    counts: list[str] = []
+    for sort_by in (None, "candidate_tier", "significance", "address", "tier", "similarity"):
+        kw = {} if sort_by is None else {"sort_by": sort_by}
+        order = [e["entry_id"] for e in _view(w, **kw)["entries"]]
+        unjudged = [k for k in order if k not in _T2_JUDGED]
+        page = pv.get_diff_patch_view(w.atlas, DIFF, limit=4, **kw)
+        progress = page["review_progress"]
+        named = [r["entry_id"] for r in progress["next_page"]]
+        assert named == unjudged[: progress["page_size"]], sort_by
+        assert _first_named(page["annotation"]) == unjudged[0], sort_by
+        if sort_by in _T2_FIRST:
+            assert unjudged[0] == _T2_FIRST[sort_by]
+        counts.append(json.dumps({k: v for k, v in progress.items() if k != "next_page"}))
+    assert len(set(counts)) == 1
+    assert len(set(_T2_FIRST.values())) == 3  # the three orders really part here
+
+
+def test_the_annotation_falls_back_to_the_whole_diff_when_the_scope_is_judged(
+    tmp_path: Path, current: None
+) -> None:
+    """A scope with nothing left unjudged (bucket A, all three judged) names no next entry; the
+    annotation block then names the whole diff's first unjudged entry in the candidate_tier order
+    — not the significance order's, which differs.
+
+    MUTATION (verified RED, 1 failed — this test alone): fall back to the diff's first entry,
+    judged or not -> RED."""
+    w = _t2_world(tmp_path)
+    page = pv.get_diff_patch_view(w.atlas, DIFF, bucket="A")
+    assert page["review_progress"]["not_looked_at"] == 0
+    assert page["review_progress"]["next_page"] == []
+    assert _first_named(page["annotation"]) == _T2_FIRST["candidate_tier"]
+
+
+def test_the_run_pair_progress_stays_in_the_candidate_tier_order(
+    tmp_path: Path, current: None
+) -> None:
+    """list_overlays' progress over a run pair still names the next unjudged entries in the
+    candidate_tier order, and its note says where the page order is read instead.
+
+    MUTATION (verified RED, 1 failed — this test alone): order the items' candidate_tier position
+    (Item.order) by significance instead -> RED. (Only the whole list catches it: on this world the
+    first unjudged entry happens to be the same in both orders.)"""
+    w = _t2_world(tmp_path)
+    order = [e["entry_id"] for e in _view(w, sort_by="candidate_tier")["entries"]]
+    unjudged = [k for k in order if k not in _T2_JUDGED]
+    out = mcp_app.make_tools(w.path)["list_overlays"](
+        anchor_kind="diff_subject", run_id="runA::runB"
+    )
+    progress = out["review_progress"]
+    named = [r["entry_id"] for r in progress["next_page"]]
+    assert named == unjudged[: progress["page_size"]]
+    assert named[0] == _T2_FIRST["candidate_tier"]
+    assert progress["note"].endswith(
+        "next_page here is in the candidate_tier order; get_diff_patch_view names the next ones "
+        "in the order its page is read in."
+    )
+
+
+def test_the_anchored_page_names_its_next_entries_in_its_own_order(
+    tmp_path: Path, current: None
+) -> None:
+    """anchored_differs=true with no sort_by: entries as the candidate_tier page renders them (no
+    significance field), in the filter's own order, and the next unjudged ones named in that order
+    — which is not the candidate_tier order's.
+
+    MUTATION (verified RED, 3 failed — with the other-orders and lens tests): let the anchored page
+    compute significance -> RED; MUTATION (verified RED, 2 failed): name the next entries in the
+    candidate_tier order on every page -> RED."""
+    w, ids = _filter_world(tmp_path)
+    v = _view(w, anchored_differs=True)
+    order = [e["entry_id"] for e in v["entries"]]
+    assert order == [ids[k] for k in ("one", "high", "floor", "below", "low")]
+    plain = _view(w, anchored_differs=True, sort_by="candidate_tier")["by_id"]
+    assert [json.dumps(e) for e in v["entries"]] == [json.dumps(plain[k]) for k in order]
+    for e in v["entries"]:
+        assert "significance" not in e and "attention" not in e["rank_key"]
+    page = pv.get_diff_patch_view(w.atlas, DIFF, anchored_differs=True)
+    assert [r["entry_id"] for r in page["review_progress"]["next_page"]] == order
+    assert _first_named(page["annotation"]) == ids["one"]
+    ct = pv.get_diff_patch_view(w.atlas, DIFF, anchored_differs=True, sort_by="candidate_tier")
+    assert ct["review_progress"]["next_page"][0]["entry_id"] == ids["low"]
+
+
+def test_the_progress_blocks_keep_their_place_and_their_first_page_rule(
+    tmp_path: Path, current: None
+) -> None:
+    """review_progress and annotation sit where they always did in the envelope (after
+    overlay_coverage), in every view, and next_page still comes on the first page only.
+
+    MUTATION (verified RED, 1 failed — this test alone): add the two blocks after the order is
+    known instead of filling their places -> RED."""
+    w = World(tmp_path)
+    _rich(w)
+    for kw in (
+        {},
+        {"not_listed_page": "aligned_pseudocode_no_body"},
+        {"view": "string_edge"},
+        {"view": "candidate_flat"},
+    ):
+        first = pv.get_diff_patch_view(w.atlas, DIFF, limit=1, **kw)
+        keys = list(first)
+        i = keys.index("overlay_coverage")
+        assert keys[i + 1 : i + 3] == ["review_progress", "annotation"], kw
+        assert "next_page" in first["review_progress"], kw
+        assert first["next_offset"] == 1, kw  # a second page to read the first-page rule on
+        later = pv.get_diff_patch_view(w.atlas, DIFF, limit=1, offset=1, **kw)
+        assert "next_page" not in later["review_progress"], kw
+        assert "review_progress.next_page" in later["first_page_only"]["keys"], kw
+
+
+# ── the default order by shape: where each kind of entry lands, relative to the others ─────────
+
+
+def _sim1_b(w: World, addr: str, name: str, *, same: bool = True, caller: bool = True) -> str:
+    """A similarity-1 aligned pair holding a candidate on each side (bucket B), equal callee sets,
+    its pseudocode the same text (``same``) or not; ``caller`` gives its A function a direct caller
+    on the A side and none on B (the caller-set edge)."""
+    w.pair(addr, addr, 0.97, 1.0, name_a=name, name_b=name)
+    w.inst("a", _ref("runA", addr, "cmd", "0x10"), "cmd", "system")
+    w.inst("b", _ref("runB", addr, "cmd", "0x10"), "cmd", "system")
+    w.fn("a", addr, ["system"], name=name, pseudocode="system(x);")
+    w.fn("b", addr, ["system"], name=name, pseudocode="system(x);" if same else "system(y);")
+    if caller:
+        w.fn("a", f"{int(addr, 16) + 0x800:08x}", [name], name=f"{name}_caller")
+    return _pair_id(addr, addr)
+
+
+def _shape_world(tmp_path: Path) -> tuple[World, dict[str, str]]:
+    """One entry per shape the default order is asserted on, plus the competitors that tell its
+    place apart: a high-tier B (sink_present_no_visible_delta) the candidate_tier order puts ahead
+    of the anchored pairs, and an unanchored R with the lowest similarity."""
+    w = World(tmp_path)
+    ids: dict[str, str] = {}
+    # 1a / 1b: an undetermined pair anchored by address, reading differs, at or above the floor —
+    # with a low-tier candidate (copy) and with none.
+    ids["1a"] = _ud(w, "00041000", "00041000", 0.85)
+    w.inst("a", _ref("runA", "00041000", "copy", "0x10"), "copy", "strcpy")
+    ids["1b"] = _ud(w, "00042000", "00042000", 0.85)
+    # the high-tier competitor: a changed pair whose cmd candidate lines up.
+    w.pair("00044000", "00044000", 0.97, 0.6)
+    w.inst("a", _ref("runA", "00044000", "cmd", "0x10"), "cmd", "system")
+    w.inst("b", _ref("runB", "00044000", "cmd", "0x10"), "cmd", "system")
+    w.im("00044010", "00044010", "00044000")
+    w.fn("a", "00044000", ["system"], pseudocode="system(a);")
+    w.fn("b", "00044000", ["system", "strlen"], pseudocode="system(a); strlen(a);")
+    ids["b_high"] = _pair_id("00044000", "00044000")
+    # 2: bucket A — the matched call now calls another callee.
+    w.pair("00046000", "00047000", 0.97, 0.9)
+    w.inst("a", _ref("runA", "00046000", "cmd", "0x10"), "cmd", "system")
+    w.inst("b", _ref("runB", "00047000", "cmd", "0x10"), "cmd", "popen")
+    w.im("00046010", "00047010", "00046000")
+    w.fn("a", "00046000", ["system"], pseudocode="system(c);")
+    w.fn("b", "00047000", ["popen"], pseudocode="popen(c);")
+    ids["2"] = _pair_id("00046000", "00047000")
+    # 3: a persisted copy whose length constant moved (similarity 1).
+    w.pair("00048000", "00049000", 0.97, 1.0)
+    w.inst(
+        "a",
+        _ref("runA", "00048000", "copy", "0x10"),
+        "copy",
+        "snprintf",
+        _size("cap_const", "0x200"),
+    )
+    w.inst(
+        "b",
+        _ref("runB", "00049000", "copy", "0x10"),
+        "copy",
+        "snprintf",
+        _size("cap_const", "0x400"),
+    )
+    w.im("00048010", "00049010", "00048000")
+    w.fn("a", "00048000", ["snprintf"], pseudocode="snprintf(d,0x200,f);")
+    w.fn("b", "00049000", ["snprintf"], pseudocode="snprintf(d,0x400,f);")
+    ids["3"] = _pair_id("00048000", "00049000")
+    # 4: anchored, reading differs, below the floor.
+    ids["4"] = _ud(w, "00043000", "00043000", 0.6)
+    # a plain similarity entry: unanchored (another address on each side), the lowest similarity.
+    ids["sim_low"] = _ud(w, "00045000", "0004a000", 0.3)
+    # 5 / 6 / 7: similarity-1 B pairs with equal callee sets.
+    ids["5"] = _sim1_b(w, "00051000", "b_lost_caller")
+    ids["6"] = _sim1_b(w, "00052000", "b_identical", caller=False)
+    ids["7"] = _sim1_b(w, "00053000", "b_differs", same=False, caller=False)
+    w.commit()
+    return w, ids
+
+
+def test_the_default_order_places_each_shape(tmp_path: Path, current: None) -> None:
+    """★ With no sort_by, by shape (relative places only):
+
+    1a / 1b an undetermined pair anchored_differs at or above the floor, with a low-tier candidate
+    or none: attention 1, in_read_first, read first — while the candidate_tier order puts the
+    high-tier B ahead of both. 2 bucket A and 3 a row's sink_arg_constant_delta: attention 0.
+    4 anchored_differs below the floor: still basis anchored_differs, not in the head, read after
+    it and before the plain similarity entries (even one of lower similarity). 5 a similarity-1 B,
+    callee sets equal, pseudocode identical, whose B side lost every direct caller: attention 1,
+    ahead of the sunk entries; 6 the same without the caller edge: attention 2 (sunk, still
+    listed). 7 a similarity-1 B, callee sets equal, pseudocode differs: attention 1 — what sinks
+    an entry is pseudocode_sameness identical, not similarity 1 with equal callee sets.
+
+    MUTATION (verified RED, 1 failed — this test alone): sink on similarity 1 with equal callee
+    sets instead of on identical pseudocode -> 7 goes RED (5 is held at 1 by its caller edge
+    either way, so it cannot tell). MUTATION (verified RED, 2 failed — with the fixture-file
+    test): order candidate_tier through the significance branch -> RED."""
+    w, ids = _shape_world(tmp_path)
+    v = _view(w)
+    assert v["lens"]["sort_by"] == "significance"
+    order = [e["entry_id"] for e in v["entries"]]
+    at = {k: order.index(eid) for k, eid in ids.items()}
+    sig = {k: v["by_id"][eid]["significance"] for k, eid in ids.items()}
+    reading = {k: v["by_id"][ids[k]]["proposed_pair_reading"] for k in ("1a", "1b", "4")}
+    for k in ("1a", "1b"):
+        assert sig[k] == {"attention": 1, "basis": "anchored_differs"}, k
+        assert reading[k]["in_read_first"] is True, k
+        assert at[k] < at["b_high"], k
+    assert v["by_id"][ids["1a"]]["tier"] != v["by_id"][ids["b_high"]]["tier"]
+    ct = [e["entry_id"] for e in _view(w, sort_by="candidate_tier")["entries"]]
+    assert ct.index(ids["b_high"]) < ct.index(ids["1a"]) < ct.index(ids["1b"])
+    assert sig["2"] == {"attention": 0, "basis": "matched_call_other_callee"}
+    assert sig["3"] == {"attention": 0, "basis": "sink_arg_constant_delta"}
+    assert max(at["2"], at["3"]) < min(at["1a"], at["1b"])
+    assert sig["4"] == {"attention": 1, "basis": "anchored_differs"}
+    assert reading["4"]["in_read_first"] is False
+    assert max(at["1a"], at["1b"]) < at["4"] < at["sim_low"]
+    assert sig["sim_low"] == {"attention": 1, "basis": "similarity"}
+    assert sig["5"] == {"attention": 1, "basis": "lost_every_direct_caller_never_sunk"}
+    assert sig["6"] == {"attention": 2, "basis": "pseudocode_identical"}
+    assert at["5"] < at["6"] and at["6"] == len(order) - 1
+    assert sig["7"] == {"attention": 1, "basis": "similarity"}
+    for k in ("5", "6", "7"):
+        e = v["by_id"][ids[k]]
+        assert e["bucket"] == "B" and e["similarity"] == 1.0, k
+        assert e["callee_set"]["state"] == "equal", k
+    assert v["by_id"][ids["5"]]["pseudocode_sameness"] == "identical"
+    assert v["by_id"][ids["6"]]["pseudocode_sameness"] == "identical"
+    assert v["by_id"][ids["7"]]["pseudocode_sameness"] == "differs"
+
+
+# ── start_diff_review: the entries to read first, composed from the view and the meta ──────────
+
+_START_KEYS = {"diff_id", "workflow", "meta", "headline", "headline_note", "view", "read_next"}
+_START_META_KEYS = {
+    "functions",
+    "banners",
+    "source_stale",
+    "source_stale_reason",
+    "toolchain_checked",
+    "version_skew",
+}
+
+
+def test_start_diff_review_is_the_view_and_the_meta_as_they_are(
+    tmp_path: Path, current: None
+) -> None:
+    """★ start_diff_review computes nothing of its own: ``view`` is byte for byte the tool's
+    summary page, ``headline`` the tool's first entry with rows_limit=0 (no inline rows, its
+    inline_hunk kept), each ``meta`` value get_diff_meta's own (version_skew from its ``meta``),
+    and no key comes from anywhere else. ``read_next.more`` is the call for the summary's next page
+    (copied, it reads that page) and is absent when there is none.
+
+    MUTATION (verified RED, 1 failed — this test alone): put a key of its own into ``view`` ->
+    RED; MUTATION (verified RED, 1 failed): read the headline without rows_limit=0 -> RED."""
+    w = _summary_world(tmp_path)
+    tools = mcp_app.make_tools(w.path)
+    start, view_tool = tools["start_diff_review"], tools["get_diff_patch_view"]
+    meta_tool = tools["get_diff_meta"]
+    for limit in (4, 20):
+        out = start(DIFF, limit=limit)
+        assert "error" not in out and "over_budget" not in out, out
+        assert set(out) <= _START_KEYS and "headline_note" not in out
+        assert out["workflow"] == DIFF_WORKFLOW
+        view = view_tool(DIFF, detail="summary", limit=limit)
+        assert json.dumps(out["view"]) == json.dumps(view)
+        head = pv.get_diff_patch_view(w.atlas, DIFF, limit=1, rows_limit=0)["entries"][0]
+        assert json.dumps(out["headline"]) == json.dumps(head)
+        assert out["headline"]["rows"] == [] and out["headline"]["rows_total"] > 0
+        assert out["headline"]["entry_id"] == view["entries"][0]["entry_id"]
+        meta = meta_tool(DIFF)
+        assert set(out["meta"]) == _START_META_KEYS
+        for key in _START_META_KEYS - {"version_skew"}:
+            assert json.dumps(out["meta"][key]) == json.dumps(meta[key]), key
+        assert out["meta"]["version_skew"] == meta["meta"]["version_skew"]
+        assert out["read_next"]["one_entry"] == view["detail_with"]["one_entry"]
+        if view["next_offset"] is None:
+            assert set(out["read_next"]) == {"one_entry"}
+        else:
+            name, args = _copied_call(out["read_next"]["more"])
+            assert name == "get_diff_patch_view"
+            assert args == {"diff_id": DIFF, "detail": "summary", "offset": view["next_offset"]}
+            assert view_tool(**args)["entries"][0]["entry_id"] != view["entries"][0]["entry_id"]
+    assert start(DIFF, limit=4)["read_next"].get("more") is not None
+    assert "more" not in start(DIFF, limit=200)["read_next"]
+
+
+def test_start_diff_review_says_why_there_is_no_headline(tmp_path: Path, current: None) -> None:
+    """No entry to read first: headline null, with why — the whole diff undetermined (its banners
+    in meta), or simply nothing listed."""
+    w = World(tmp_path)
+    w.commit()
+    start = mcp_app.make_tools(w.path)["start_diff_review"]
+    empty = start(DIFF)
+    assert empty["headline"] is None and empty["headline_note"] == "no listed entry"
+    assert empty["view"]["entries"] == []
+    w.atlas.execute("UPDATE diff_meta SET version_skew = 1")
+    w.commit()
+    pv._clear_view_caches()
+    withheld = start(DIFF)
+    assert withheld["headline"] is None
+    assert withheld["headline_note"] == "diff_undetermined (meta.banners)"
+    assert withheld["meta"]["banners"] and withheld["meta"]["version_skew"] == 1
+
+
+def test_start_diff_review_refuses_what_it_cannot_read(tmp_path: Path, current: None) -> None:
+    w = World(tmp_path)
+    w.commit()
+    start = mcp_app.make_tools(w.path)["start_diff_review"]
+    for limit in (0, 201, True, "5"):
+        out = start(DIFF, limit=limit)  # type: ignore[arg-type]
+        assert out.get("error") == f"limit must be an integer in 1..200, got {limit!r}", limit
+    missing = start("runA::runB::nothing")
+    assert missing.get("found") is False and "error" in missing
+
+
+def test_start_diff_review_keeps_to_the_page_budget(
+    tmp_path: Path, current: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The headline is fitted beside the rest of the response: when it does not fit, its
+    inline_hunk is withheld (page_budget) and the view stays as the tool gives it; when even that
+    does not fit, the response says over_budget."""
+    w = _summary_world(tmp_path)
+    start = mcp_app.make_tools(w.path)["start_diff_review"]
+    whole = start(DIFF)
+    hunk = whole["headline"]["pseudocode_delta"]["inline_hunk"]
+    assert "withheld" not in hunk  # the headline really carries a hunk to withhold
+    rest = len(json.dumps({**whole, "headline": None})) - len("null")
+    monkeypatch.setattr(
+        mcp_app, "_RESPONSE_BYTE_BUDGET", rest + len(json.dumps(whole["headline"])) - 1
+    )
+    cut = start(DIFF)
+    assert json.dumps(cut["view"]) == json.dumps(whole["view"])
+    assert cut["headline"]["pseudocode_delta"]["inline_hunk"]["withheld"] == "page_budget"
+    assert "over_budget" not in cut
+    monkeypatch.setattr(mcp_app, "_RESPONSE_BYTE_BUDGET", 2000)
+    assert start(DIFF)["over_budget"] is True
+
+
+def test_start_diff_review_is_registered_read_only_beside_the_view() -> None:
+    tools = mcp_app.make_tools(Path("unused.db"))
+    names = list(tools)
+    assert names.index("start_diff_review") + 1 == names.index("get_diff_patch_view")
+    assert mcp_app.tool_annotations("start_diff_review").readOnlyHint is True
+    doc = " ".join((tools["start_diff_review"].__doc__ or "").split())
+    assert doc.startswith(
+        "START HERE for one diff: the entries to read first and the calls to read and judge them — "
+        "composed from get_diff_patch_view and get_diff_meta, nothing computed of its own."
+    )
+    assert (tools["get_diff_patch_view"].__doc__ or "").startswith(
+        "The function patch view of one diff"
+    )
+
+
+def test_no_start_diff_review_label_says_what_a_change_means(tmp_path: Path, current: None) -> None:
+    """Every key start_diff_review adds, the headline notes, and the words of the workflow and the
+    read_next calls (tool names aside — they are the tools' own, as old as them) are free of words
+    that say what a change means.
+
+    MUTATION (verified RED, 1 failed — this test alone): word the no-entry note 'nothing new
+    listed' -> RED."""
+    labels: set[str] = set()
+    w = _summary_world(tmp_path)
+    start = mcp_app.make_tools(w.path)["start_diff_review"]
+    for out in (start(DIFF, limit=4), start(DIFF, limit=200)):
+        labels |= set(out) | set(out["meta"]) | set(out["read_next"])
+        for text in (out["workflow"], *out["read_next"].values()):
+            labels.add(re.sub(r"\b\w+\(", "(", text))
+    (tmp_path / "none").mkdir()
+    empty = World(tmp_path / "none")
+    empty.commit()
+    out = mcp_app.make_tools(empty.path)["start_diff_review"](DIFF)
+    labels |= {out["headline_note"], mcp_app._HEADLINE_WITHHELD, "headline_note"}
+    assert {"workflow", "read_next", "one_entry", "more", "no listed entry"} <= labels
+    for label in labels:
+        words = set(re.split(r"[^a-z0-9]+", label.lower()))
+        assert not words & _WORDS, label

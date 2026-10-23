@@ -470,6 +470,8 @@ def pair_progress(
             + " Over a run pair, 'complete' also needs no failed diff, no diff undetermined as a "
             "whole, and no binary that no diff covers: entries cannot be listed for those, so "
             "having judged every listed entry does not reach them. A binary byte-identical on both "
-            "sides is not one of those — it needed no diff (identical_not_diffed_binaries)."
+            "sides is not one of those — it needed no diff (identical_not_diffed_binaries). "
+            "next_page here is in the candidate_tier order; get_diff_patch_view names the next "
+            "ones in the order its page is read in."
         ),
     }

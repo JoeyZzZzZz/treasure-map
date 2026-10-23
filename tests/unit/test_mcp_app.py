@@ -44,6 +44,7 @@ _EXPECTED_TOOLS = {
     "get_nvram_key_flow",
     "get_string_keyed_edges",
     "launched_by",
+    "start_diff_review",
     "get_diff_patch_view",
     "get_diff_deltas",
     "get_diff_sink_overlay",

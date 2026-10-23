@@ -242,7 +242,7 @@ def test_a_diff_is_refused_when_either_side_is_stale(atlas: Path, side: str) -> 
     The refusal names WHICH side, because the two need separate re-scans.
 
     MUTATION: check only run_a_id -> the 'b' parameter goes RED. Drop the gate from any one diff
-    tool -> that tool's assertion goes RED.
+    tool -> that tool's assertion goes RED (start_diff_review: verified RED, 2 failed).
     """
     conn = open_atlas(atlas)
     a_id, b_id = ("run_stale", "run_ok") if side == "a" else ("run_ok", "run_stale")
@@ -256,6 +256,7 @@ def test_a_diff_is_refused_when_either_side_is_stale(atlas: Path, side: str) -> 
     tools = mcp_app.make_tools(atlas)
     for call in (
         lambda: tools["get_diff_patch_view"]("d1"),
+        lambda: tools["start_diff_review"]("d1"),
         lambda: tools["get_diff_deltas"]("d1"),
         lambda: tools["get_diff_sink_overlay"]("d1"),
         lambda: tools["same_shape_siblings"]("d1", evidence_ref=f"{a_id}#x:00001000@cmd@0x10"),
@@ -267,6 +268,7 @@ def test_a_diff_is_refused_when_either_side_is_stale(atlas: Path, side: str) -> 
         lambda: tools["list_overlays"](anchor_kind="diff_subject", run_id=f"{a_id}::{b_id}"),
     ):
         result = call()
+        assert "stale_scan" in result, result
         assert result["stale_scan"]["axis"] == "extraction"
         assert result["stale_scan"]["diff_side"] == side
 

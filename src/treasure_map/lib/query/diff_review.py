@@ -38,6 +38,7 @@ reported beside the counts as dangling.
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -405,7 +406,7 @@ class Item:
     tier: int | str
     state: str
     verdict: str | None
-    order: tuple[Any, ...]  # the view's default order; a run pair's items lead with the diff
+    order: tuple[Any, ...]  # the view's candidate_tier order; a run pair's items lead with the diff
     diff_id: str | None = None
 
 
@@ -449,10 +450,22 @@ def counts(items: list[Item], page_size: int = DEFAULT_PAGE_SIZE) -> dict[str, A
     }
 
 
-def next_page(items: list[Item], page_size: int = DEFAULT_PAGE_SIZE) -> list[dict[str, Any]]:
-    """The first ``page_size`` entries nobody has judged, in the view's default order — named, so
-    they can be opened from here."""
-    unseen = sorted((i for i in items if i.state == UNSEEN), key=lambda i: i.order)
+def next_page(
+    items: list[Item],
+    page_size: int = DEFAULT_PAGE_SIZE,
+    positions: dict[str, int] | None = None,
+) -> list[dict[str, Any]]:
+    """The first ``page_size`` entries nobody has judged — named, so they can be opened from here —
+    in the order a page is read in when ``positions`` (entry id -> place in that order) is given,
+    ties and entries it does not hold in the candidate_tier order (``Item.order``); without it, in
+    the candidate_tier order alone."""
+    if positions is None:
+        unseen = sorted((i for i in items if i.state == UNSEEN), key=lambda i: i.order)
+    else:
+        unseen = sorted(
+            (i for i in items if i.state == UNSEEN),
+            key=lambda i: (positions.get(i.entry_id, math.inf), i.order),
+        )
     out = []
     for i in unseen[:page_size]:
         row: dict[str, Any] = {
@@ -493,12 +506,31 @@ def _call(name: str, **args: str) -> str:
     return f"{name}(" + ", ".join(f"{k}={v}" for k, v in args.items()) + ")"
 
 
-def annotation_block(diff_id: str, run_a: str, run_b: str, items: list[Item]) -> dict[str, Any]:
+def annotation_block(
+    diff_id: str,
+    run_a: str,
+    run_b: str,
+    items: list[Item],
+    positions: dict[str, int] | None = None,
+) -> dict[str, Any]:
     """How to judge this diff's entries, with this diff's own values filled in, and how many of
     each bucket have been judged beside the call that opens the rest. Present with no judgement
-    at all — that is when it is needed most."""
+    at all — that is when it is needed most.
+
+    ``items`` are the whole diff's; ``positions`` (entry id -> place in the page's order) covers
+    the page's scope only. The calls to copy name the first unjudged entry in that scope, in that
+    order; when the scope holds none (or no ``positions``), the first unjudged entry of the whole
+    diff in the candidate_tier order (``Item.order``), else its first entry."""
     ordered = sorted(items, key=lambda i: i.order)
-    first = next((i for i in ordered if i.state == UNSEEN), ordered[0] if ordered else None)
+    first: Item | None = None
+    if positions is not None:
+        in_scope = sorted(
+            (i for i in items if i.entry_id in positions and i.state == UNSEEN),
+            key=lambda i: (positions[i.entry_id], i.order),
+        )
+        first = in_scope[0] if in_scope else None
+    if first is None:
+        first = next((i for i in ordered if i.state == UNSEEN), ordered[0] if ordered else None)
     anchor = json.dumps(first.anchor_ref) if first is not None else '"<an entry\'s anchor_ref>"'
     entry = json.dumps(first.entry_id) if first is not None else '"<an entry\'s entry_id>"'
     did = json.dumps(diff_id)
@@ -521,7 +553,7 @@ def annotation_block(diff_id: str, run_a: str, run_b: str, items: list[Item]) ->
             "A writable layer of YOUR judgements over this read-only view: one per entry "
             "(anchor_ref on every entry), or per candidate row. The view's facts never change "
             "because of it; with band=true it reorders entries only inside the groups the "
-            "default order already forms."
+            "page's order already forms."
         ),
         "annotate_diff": _call(
             "annotate_diff",

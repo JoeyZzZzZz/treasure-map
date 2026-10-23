@@ -74,7 +74,9 @@ TWO SIGNALS SIMILARITY IS BLIND TO (lib/query/sameness), read on the function-pa
   cheap. A pseudocode_delta is computed for the whole diff's anchored_differs pairs above the
   read-first floor, not only the page (see ``_annotate_entries``).
 
-ORDER: A first, then the R and B entries that carry a sink candidate (E among them when it carries
+ORDER: with no ``sort_by`` the function-pair view reads in the significance order (:func:`_sort`;
+``anchored_differs`` keeps its own). The ``candidate_tier`` order, which was the default before it:
+A first, then the R and B entries that carry a sink candidate (E among them when it carries
 one, in its own lane), then the entries with none (recall_gap_sink, R, C, then the E with none),
 then P; inside each, by the named components of ``rank_key`` (on every entry of a
 ``detail='full'`` page). ``tier`` is the sink-impact tier of the entry's candidates
@@ -90,7 +92,7 @@ JUDGEMENTS are a separate, writable layer (lib/query/diff_review, written by lib
 view stays read-only and its facts never change because of one. Every entry carries its
 ``anchor_ref`` (a summary entry through the envelope's ``annotation.anchor_ref_template``) and
 ``review_state``, and the envelope ``review_progress`` and ``annotation``, with or without any
-judgement; only with ``band`` on do they move entries, and then only among entries the default
+judgement; only with ``band`` on do they move entries, and then only among entries the page's
 order already holds together.
 """
 
@@ -126,7 +128,9 @@ VIEWS = ("sink_patch", "string_edge", "candidate_flat")
 # states and the fields an entry is chosen by; see _summary_entry).
 DETAILS = ("full", "summary")
 BUCKETS = ("A", "B", "C", "R", "P", "E")
-SORT_BY = ("tier", "similarity", "address", "significance")
+# ``sort_by`` unset reads ``significance`` on view="sink_patch" (anchored_differs=true aside, which
+# keeps its own order); ``candidate_tier`` names the order that was the default before it.
+SORT_BY = ("tier", "similarity", "address", "significance", "candidate_tier")
 NO_SINK = "no_sink"
 UNKNOWN = "unknown"
 MAX_LIMIT = 2000
@@ -1644,14 +1648,14 @@ def _rank(e: _Entry) -> dict[str, Any]:
 
 
 def _default_key(r: dict[str, Any], band: int = 0, e_mention: int = 0) -> tuple[Any, ...]:
-    """The default order's key. ``band`` (the judgement band, 0 when it is off) sits after the
-    first four components and before similarity, so it only ever reorders entries those four
+    """The candidate_tier order's key. ``band`` (the judgement band, 0 when it is off) sits after
+    the first four components and before similarity, so it only ever reorders entries those four
     already hold together — never across a segment, a tier, a lane or a subclass rank. ``e_mention``
     (0 off) is the caller-set edge's B-no-mention key: it is passed ONLY in the significance order,
-    and only for E entries, so it never changes the default order, the rank_key or ViewReview's
-    position — the cheap layers that cannot read pseudocode and so cannot compute it. It sits inside
-    E's own lane (segment 3 subclass rank's tie slot, or segment 2 just before the address), after
-    the relevance tier and before the address."""
+    and only for E entries, so it never changes the candidate_tier order, the rank_key or
+    ViewReview's position — the cheap layers that cannot read pseudocode and so cannot compute it.
+    It sits inside E's own lane (segment 3 subclass rank's tie slot, or segment 2 just before the
+    address), after the relevance tier and before the address."""
     seg = r["segment"]
     if seg == 1:
         return (1, -r["tier"], 0, 0, band, r["similarity"], "", r["address"])
@@ -1976,19 +1980,20 @@ def _sort(
     swap_lift: dict[str, int] | None = None,
     mention: dict[str, int] | None = None,
 ) -> list[_Entry]:
-    """The default order, or ``sort_by`` (one named component) ahead of it. P stays last either
-    way: a function with no counterpart is not ordered among the pairs. ``band`` maps an entry id
-    to its judgement band (diff_review.band_bias); None leaves the order as it is.
+    """The candidate_tier order (``sort_by`` None or ``"candidate_tier"``), or ``sort_by`` (one
+    named component) ahead of it. P stays last either way: a function with no counterpart is not
+    ordered among the pairs. ``band`` maps an entry id to its judgement band
+    (diff_review.band_bias); None leaves the order as it is.
 
     ``sort_by="significance"`` orders by ``(attention, swap_lift, read_first, band, settled,
-    similarity, default key)`` — ``attention`` from :func:`significance`; ``swap_lift`` (1 for an
-    attention-1 entry carrying a narrow :func:`_sink_callee_swap`, whatever its basis or
+    similarity, candidate_tier key)`` — ``attention`` from :func:`significance`; ``swap_lift`` (1
+    for an attention-1 entry carrying a narrow :func:`_sink_callee_swap`, whatever its basis or
     judgement) first inside the tier; ``read_first`` (:func:`_read_first_order`, highest first) so
     that next the anchored_differs pairs at or above the floor come, then those below it, then the
     rest; the band only when it is on
     (judgements move nothing unless asked); ``settled`` (1 for an R entry whose proposed reading
     is ``identical_unique``, so it closes its tier, still ahead of every sunk entry); similarity
-    lowest first; then the default order."""
+    lowest first; then the candidate_tier order."""
 
     def key(e: _Entry) -> tuple[Any, ...]:
         r = e.rank
@@ -2010,7 +2015,7 @@ def _sort(
             head = (r.get("similarity", 0.0),)
         elif sort_by == "address":
             head = (r["address"],)
-        else:
+        else:  # None or "candidate_tier": the candidate_tier order itself
             head = ()
         return (p_last, *head, *_default_key(r, band.get(e.entry_id, 0) if band else 0))
 
@@ -2727,7 +2732,8 @@ def _anchored_order(
     entries: list[_Entry], read_first: dict[str, int], band: dict[str, int] | None
 ) -> list[_Entry]:
     """The order of the anchored_differs filter when no ``sort_by`` is given: the read-first pairs
-    (at or above the floor) first, then by similarity, highest first, then the default order."""
+    (at or above the floor) first, then by similarity, highest first, then the candidate_tier
+    order."""
 
     def key(e: _Entry) -> tuple[Any, ...]:
         sim = e.pair.similarity if e.pair is not None else None
@@ -3428,57 +3434,41 @@ def _detail_fields(
     return out
 
 
-_SIGNIFICANCE_LENS = (
-    "sort_by='significance' reorders the listed entries, never relabels them: attention 0 = bucket "
-    "A or a row carrying sink_arg_constant_delta; 2 = pseudocode_sameness identical, or bucket C "
-    "(sunk, still listed and pageable) — except that a bucket C entry carrying a narrow "
-    "sink_callee_swap stays at 1, basis sink_callee_swap_never_sunk (a wide one still sinks); 1 = "
-    "the rest, lowest similarity first, R and B entries ordered together — except that, first "
-    "inside attention 1, come the entries carrying a narrow sink_callee_swap (a sink name in a "
-    "callee-set difference read in full, at most two names on either side; rank_key."
-    "sink_callee_swap = 1), whatever their basis, which the swap does not replace (bucket C "
-    "aside); then an undetermined pair flagged anchored_differs (no export gap, "
-    "the same address or the same real symbol name on both sides, proposed reading differs): "
-    f"those at or above similarity {ANCHORED_DIFFERS_SIM_FLOOR} first, "
-    "then those below it, basis anchored_differs — except that a flagged pair whose text changed "
-    "only by a __FILE__/__LINE__ line-number shift AND whose callee sets and body sizes are both "
-    "proven equal is demoted out of that read-first head (demoted true; still flagged, "
-    "anchored_differs=true pages it). A line-number shift without that proof stays in the head "
-    "with demoted false: a call added or dropped in a block the decompiler removed is not in the "
-    "text, and its callee_set and size_bytes show which was not proven equal. Equal callee sets "
-    "and sizes narrow that, they do not rule it out: the set holds callees, not how often each is "
-    "called. The flag clears nothing else in R: every other undetermined "
-    "pair reading differs is still to be read. An undetermined pair anchored with one side a "
-    "design-skipped micro-stub (under the decompile size floor, not decompiled by design — a "
-    "binary property, NOT a read failure) and the other a real body gets basis anchored_micro_side "
-    "(before anchored_differs when a pair is both), and an aligned pair of the same shape gets "
-    "basis one_side_skipped_micro, both held at attention 1 rather than sunk. Such a pair's "
-    "reading carries bodies: per side its status and size_bytes, and on the micro-stub side its "
-    "stored disassembly inline (listing; listing null with listing_note "
-    "not_exported_by_this_scan when the binary was extracted before tmap stored disassembly — a "
-    "re-scan stores it — or not_stored, which get_disassembly explains). "
-    "Attention 0 holds B entries too (a row's sink_arg_constant_delta) beside "
-    "A. Never sunk: an R entry (attention 2 never holds one; one whose proposed_pair_reading is "
-    "identical_unique closes attention 1 instead), a B sink_present_no_visible_delta (labelled "
-    "recheckable_no_visible_delta), an identical_text_unverified entry outside bucket C, a bucket "
-    "C entry with a narrow sink_callee_swap, an E entry or any entry whose B side lost every "
-    "direct caller (caller-set edge: basis lost_every_direct_caller_never_sunk, or "
-    "caller_signal_undetermined_never_sunk for an E whose B side could not be proven), and an "
-    "entry judged changed_real, inconclusive or due a re-check / relabel — none of them reaches "
-    "attention 2, whether band is on or off. Inside an E lane the functions no other B function "
-    "names (b_other_fn_mentions false) are read first; that key orders this lens only, never the "
-    "default order or rank_key. A bucket C entry is sunk even when its text match is "
-    "identical_text_unverified; sunk_with_body_size_differs counts the sunk ones whose two body "
-    "byte counts differ, with the filter that lists them, counted over the entries the current "
-    "filters keep. Only with band=true does the judgement band order entries inside each "
-    "attention tier. Each entry's ``significance`` names its tier and why. Not seen by this lens: "
-    "a constant in an allocation expression or a local buffer's declared size (blind_spots); the "
-    "target a DAT_ / PTR_ reference points at, once its address is blanked (a pseudocode match "
-    "does not check it; a string label keeps its content in the name); a C++ catch handler "
-    "(landing pad), which usually lies outside every function body, so its code is never "
-    "decompiled and no reading compares it — a try/catch annotation that moved with its function "
-    "says nothing about the handler; and anything in a binary the two runs hold byte-identical — "
-    "that is in the scan's candidate map, not in any diff."
+# The candidate_tier order (lens.order on such a page's first page).
+_ORDER_CANDIDATE_TIER = (
+    "A; then the entries carrying a sink candidate (tier; R, then B with "
+    "sink_presence_signal first, then E; similarity, address); then the entries with "
+    "none (recall_gap_sink, R, C, then E by caller relevance: a recall-gap callee, a "
+    "callee that is itself a candidate, the rest); then P"
+)
+# The significance order (lens.order on such a page's first page); its rules are in the tool's
+# description, the short reading in lens.significance on every page.
+_ORDER_SIGNIFICANCE = (
+    "significance: attention 0, then 1, then 2 (lens.significance); inside 1 — a narrow "
+    "sink_callee_swap first, then the anchored_differs pairs at or above the floor, then those "
+    "below it (and the demoted __FILE__/__LINE__ and micro-side pairs), then lowest similarity "
+    "first; an R entry reading identical_unique closes 1; P last."
+)
+# lens.band (band on, first page): the groups the page's order forms.
+_BAND_CANDIDATE_TIER = (
+    "on: inside each group the default order holds together (segment, tier, lane, "
+    "subclass rank), entries due a re-check first, then change_inconclusive, then "
+    "unjudged, then changed_real, then no_real_change"
+)
+_BAND_SIGNIFICANCE = (
+    "on: inside each attention tier (after the swap and read-first heads), entries due a re-check "
+    "first, then change_inconclusive, then unjudged, then changed_real, then no_real_change"
+)
+# lens.significance, on every page the significance order is read in. The full rules are in the
+# get_diff_patch_view tool's description; what this lens cannot see is said here every time.
+_SIGNIFICANCE_LENS_SHORT = (
+    "significance reorders the listed entries, never relabels them: attention 0 floats, 1 is the "
+    "middle, 2 is sunk — still listed and pageable. Each entry's `significance` names its "
+    "attention and basis; the full rules are in this tool's description. Not seen by this lens: a "
+    "constant in an allocation expression or a local buffer's declared size (blind_spots); the "
+    "target a DAT_ / PTR_ reference points at once its address is blanked; a C++ catch handler "
+    "(landing pad); anything in a binary the two runs hold byte-identical — that is in the scan's "
+    "candidate map, not in any diff."
 )
 
 
@@ -3750,6 +3740,13 @@ def get_diff_patch_view(
     ``sort_by`` apply to ``sink_patch``; ``counts`` / ``not_listed`` / ``blind_spots`` always
     describe the whole diff. Pages are in a fixed order; follow ``next_offset`` until null.
 
+    ``sort_by`` unset on ``sink_patch`` reads in the ``significance`` order (``lens.sort_by`` says
+    which order a page is in); ``candidate_tier`` names the order that was the default before it.
+    ``anchored_differs`` with no ``sort_by`` keeps its own order (``lens.sort_by``
+    ``anchored_differs``), and a ``not_listed_page`` is in address order (``default``).
+    ``review_progress.next_page`` and the annotation block's first unjudged entry follow the
+    page's order on a listed sink_patch page; elsewhere they are in the candidate_tier order.
+
     Each sink_patch entry carries at most ``rows_limit`` (default ``ROWS_INLINE_LIMIT``) of its
     candidate rows, with ``rows_total`` and ``rows_next_offset``. When there are more, they are
     windowed in ``rows_order`` and ``rows_by_presence`` / ``rows_by_order_group`` count every row,
@@ -3771,7 +3768,7 @@ def get_diff_patch_view(
     progress note is its 'complete' sentence alone (``first_page_only.shortened``).
 
     ``band`` (``sink_patch`` only, off by default) moves the judged entries inside the groups the
-    default order already forms (diff_review.band_bias); off, the order is the base order. The
+    page's order already forms (diff_review.band_bias); off, the order is the page's sort_by. The
     judgement keys (``anchor_ref`` / ``review_state`` on each entry — on a summary entry its
     ``anchor_ref`` through ``annotation.anchor_ref_template`` — and ``review_progress`` and
     ``annotation`` on the envelope) are there either way.
@@ -3860,6 +3857,19 @@ def get_diff_patch_view(
         )
     if error is not None:
         return {"diff_id": diff_id, "error": error}
+    # ``resolved`` is what _sort orders by; ``effective`` the order the page is actually in, which
+    # decides whether significance is computed and what the lens says. The anchored_differs filter
+    # keeps its own order when no sort_by is given (the original argument, not ``resolved``), and a
+    # not-listed page is in address order.
+    resolved = (
+        sort_by if sort_by is not None else ("significance" if view == "sink_patch" else None)
+    )
+    anchored_default = anchored_differs and sort_by is None
+    effective = (
+        None
+        if not_listed_page is not None
+        else ("anchored_differs" if anchored_default else resolved)
+    )
     filters["entry_id"] = entry_id
     built = build_diff_view(atlas, diff_id)
     if built is None:
@@ -3942,13 +3952,8 @@ def get_diff_patch_view(
         "diff_id": diff_id,
         "lens": {
             "view": view,
-            "order": (
-                "A; then the entries carrying a sink candidate (tier; R, then B with "
-                "sink_presence_signal first, then E; similarity, address); then the entries with "
-                "none (recall_gap_sink, R, C, then E by caller relevance: a recall-gap callee, a "
-                "callee that is itself a candidate, the rest); then P"
-            ),
-            "sort_by": sort_by or "default",
+            "order": _ORDER_SIGNIFICANCE if effective == "significance" else _ORDER_CANDIDATE_TIER,
+            "sort_by": effective or "default",
             "filters": filters,
             "switchable": (
                 "view / sort_by / bucket / subclass / tier / blind_spot / body / anchored_differs "
@@ -3977,8 +3982,9 @@ def get_diff_patch_view(
         "not_listed": _not_listed_counts(built, readings),
         "blind_spots": ledger,
         "overlay_coverage": overlay.coverage,
-        "review_progress": review.progress(chosen, filters, ledger),
-        "annotation": review.annotation(),
+        # Set once the page's order is known (it follows that order); here to keep their place.
+        "review_progress": None,
+        "annotation": None,
     }
     if anchored_differs:
         envelope["lens"]["anchored_differs"] = (
@@ -4000,12 +4006,16 @@ def get_diff_patch_view(
         )
     if band:
         envelope["lens"]["band"] = (
-            "on: inside each group the default order holds together (segment, tier, lane, "
-            "subclass rank), entries due a re-check first, then change_inconclusive, then "
-            "unjudged, then changed_real, then no_real_change"
+            _BAND_SIGNIFICANCE if effective == "significance" else _BAND_CANDIDATE_TIER
         )
     summary = detail == "summary"
+
+    def _progress(positions: dict[str, int] | None = None) -> None:
+        envelope["review_progress"] = review.progress(chosen, filters, ledger, positions=positions)
+        envelope["annotation"] = review.annotation(positions=positions)
+
     if not_listed_page is not None:
+        _progress()
         envelope["guards_read_with"] = _guards_read_with(built.diff)
         listed = _not_listed_page(
             built, readings, not_listed_page, limit=limit, offset=offset, body=body
@@ -4016,6 +4026,7 @@ def get_diff_patch_view(
         envelope.update(listed)
         return envelope
     if view == "string_edge":
+        _progress()
         deltas = get_diff_deltas(atlas, diff_id, limit=limit, offset=offset)
         page = deltas["page"]
         _first_page_only(envelope, offset)
@@ -4028,6 +4039,7 @@ def get_diff_patch_view(
         )
         return envelope
     if view == "candidate_flat":
+        _progress()
         _first_page_only(envelope, offset)
         if summary:
             # The overlay's counts as get_diff_sink_overlay(detail="summary") gives them; no row.
@@ -4052,7 +4064,7 @@ def get_diff_patch_view(
     lens: dict[str, tuple[int, str]] = {}
     settled: dict[str, int] = {}
     swap_lift: dict[str, int] = {}
-    if sort_by == "significance":
+    if effective == "significance":
         lens = {
             e.entry_id: significance(
                 e,
@@ -4075,7 +4087,7 @@ def get_diff_patch_view(
             and (swap := _sink_callee_swap(e)) is not None
             and swap["narrow"]
         }
-        envelope["lens"]["significance"] = _SIGNIFICANCE_LENS
+        envelope["lens"]["significance"] = _SIGNIFICANCE_LENS_SHORT
         envelope["lens"]["sunk_with_body_size_differs"] = {
             "count": sum(
                 1
@@ -4091,19 +4103,20 @@ def get_diff_patch_view(
             read_first[e.entry_id] = order
     # The caller-set edge's no-mention key: 0 when no OTHER B function names this E entry's function
     # (read first inside its lane), 1 when one does. E entries only; it reaches the order through
-    # _default_key under significance alone, so it never touches the default order or the rank_key.
+    # _default_key under significance alone, so it never touches the candidate_tier order or the
+    # rank_key.
     mention = {
         e.entry_id: (0 if e.pair is not None and e.pair.addr_b not in readings.b_mentions else 1)
         for e in chosen
         if e.bucket == "E"
     }
     bands = review.bands() if band else None
-    if anchored_differs and sort_by is None:
+    if anchored_default:
         ordered = _anchored_order(chosen, read_first, bands)
     else:
         ordered = _sort(
             chosen,
-            sort_by,
+            resolved,
             bands,
             {k: v[0] for k, v in lens.items()},
             settled,
@@ -4111,6 +4124,8 @@ def get_diff_patch_view(
             swap_lift,
             mention,
         )
+    # The next unjudged entries are named in the order this page is read in.
+    _progress({e.entry_id: i for i, e in enumerate(ordered)})
     end = offset + limit
     page = ordered[offset:end]
     page_guards: dict[tuple[str, str], dict[str, Any]] = {}
@@ -4265,8 +4280,15 @@ class ViewReview:
         return out
 
     def progress(
-        self, chosen: list[_Entry], filters: dict[str, Any], ledger: list[dict[str, Any]]
+        self,
+        chosen: list[_Entry],
+        filters: dict[str, Any],
+        ledger: list[dict[str, Any]],
+        positions: dict[str, int] | None = None,
     ) -> dict[str, Any]:
+        """The progress over ``chosen``. ``positions`` (entry id -> place in the page's order)
+        names the next unjudged entries in that order; None names them in the candidate_tier
+        order (``Item.order``). The counts never depend on it."""
         blind = {
             "ledger": [
                 {"key": s["key"], "count": s["count"], "unit": s["unit"]}
@@ -4300,7 +4322,7 @@ class ViewReview:
             "unit": "entry",
             "scope": filters,
             **numbers,
-            "next_page": diff_review.next_page(scope),
+            "next_page": diff_review.next_page(scope, positions=positions),
             "dangling_annotations": self.dangling,
             "outside_this_scope": {
                 "not_looked_at": rest_numbers["not_looked_at"],
@@ -4311,7 +4333,9 @@ class ViewReview:
             "note": diff_review.PROGRESS_NOTE,
         }
 
-    def annotation(self) -> dict[str, Any]:
+    def annotation(self, positions: dict[str, int] | None = None) -> dict[str, Any]:
+        """The annotation block; its call to copy names the first unjudged entry in the page's
+        order when ``positions`` is given (diff_review.annotation_block)."""
         d = self.built.diff
         if self.withheld:
             return diff_review.annotation_unavailable(
@@ -4324,7 +4348,9 @@ class ViewReview:
                 "this diff records no binary name, which every anchor carries — re-run the diff",
                 self.built.banners,
             )
-        block = diff_review.annotation_block(d.diff_id, d.run_a, d.run_b, list(self.items.values()))
+        block = diff_review.annotation_block(
+            d.diff_id, d.run_a, d.run_b, list(self.items.values()), positions=positions
+        )
         # Every entry's anchor_ref with its own addresses left to fill in: built by the functions
         # that build the anchors themselves, so a summary entry (which carries no anchor_ref)
         # rebuilds it from its addr_a / addr_b, or side / addr.

@@ -32,6 +32,7 @@ from treasure_map.lib.diff.currency import (
 from treasure_map.lib.diff.driver import _DIFF_RETRY_LIMIT
 from treasure_map.lib.diff.layer0 import norm_hex
 from treasure_map.lib.diff.toolchain import current_toolchain
+from treasure_map.lib.query.diff_workflow import DIFF_WORKFLOW
 from treasure_map.lib.ro_db import ro_connect
 
 _ALIGN_NOTE = (
@@ -478,7 +479,8 @@ _META_NOTE = (
     "empty get_diff_deltas for it is a BLIND SPOT, not 'no change'. diff_ok=1 = usable output. "
     "baseline_dropped=1 = the diff had a stored candidate baseline that a re-diff dropped (it "
     "failed, or the baseline could not be stored again). "
-    "ghidra_version is the diffed binary's own (the run's on a diff written before the stamps)."
+    "ghidra_version is the diffed binary's own (the run's on a diff written before the stamps). "
+    + DIFF_WORKFLOW
 )
 
 _CAP_NOTE = (
