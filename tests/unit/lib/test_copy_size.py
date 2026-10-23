@@ -449,6 +449,17 @@ def test_an_arith_length_whose_first_operand_is_a_load_uses_the_path() -> None:
     assert neg.kind == SIZE_VARIABLE
 
 
+def test_a_bracket_ending_path_length_is_clamped_by_a_guard_on_the_same_path() -> None:
+    """A length read as ``p[7]`` (an access path ENDING in ``]``) is clamped by a guard naming the
+    same ``p[7]``. The match must hold even though the guard's ``p[7]`` is followed by ``)`` — the
+    operand boundary, not ``\\b``, is what keeps ``]`` from needing a word character after it.
+
+    MUTATION (verified RED / HM03): replace the operand-boundary match expression with ``\\b…\\b``
+    -> the trailing ``\\b`` after ``]`` fails before ``)`` and the clamp is missed (-> VARIABLE)."""
+    r = _ccs("if (0x20 < p[7]) return;\n  memcpy(d,s,p[7]);")
+    assert r.kind == SIZE_CLAMP and r.lead == "load" and r.path == "p[7]"
+
+
 def test_a_subfield_length_is_not_clamped_by_a_wider_path() -> None:
     """A guard on ``x.f[2]._2_2_`` does not clamp a copy of ``x.f[2]`` — the boundary stops the
     path from matching a longer member access.

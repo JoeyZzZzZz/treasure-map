@@ -46,7 +46,6 @@ from treasure_map.lib.pattern.classes import (
 )
 from treasure_map.lib.reachability.taint import (
     _CALL_HEAD_RE,
-    _IDENT_RE,
     flows_into,
     free_taint_reaches,
 )
@@ -288,13 +287,13 @@ def _inline_constrained_results(pseudocode: str, converters: frozenset[str]) -> 
             parts = call_args_at(stmt, offsets[0]) if offsets else None
             if not parts:
                 continue
-            dst_ident = _IDENT_RE.search(parts[0])
-            if dst_ident is None:
+            dst = arg_ref(parts[0]).root
+            if dst is None:
                 continue
             value_args = parts[1:]
             benign = all(_is_charset_benign(a, converters) for a in value_args)
             converter = any(_is_converter_call(a, converters) for a in value_args)
-            _note(dst_ident.group(0), benign, converter)
+            _note(dst, benign, converter)
         assign = re.match(r"\s*[^=]*?\b([A-Za-z_]\w*)\s*=\s*(?!=)(.*)", stmt)
         if assign is not None:
             lhs, rhs = assign.group(1), assign.group(2)
@@ -304,12 +303,51 @@ def _inline_constrained_results(pseudocode: str, converters: frozenset[str]) -> 
 
 
 def _charset_inline_constrained(pseudocode: str, sink_arg: str) -> bool:
-    """True when the SINK ARGUMENT itself is built inline from a charset-safe converter — the only
-    case charset downweight fires. Inline-only by design: a value laundered through any
-    intermediate variable is not value-tracked here (it is left to the evidence layer to mark as a
-    `charset_maybe` lead). The all-writes rule inside `_inline_constrained_results` already rules
-    out a free value written to the sink argument, so no separate free-bypass guard is needed."""
+    """True when the SINK ARGUMENT itself is built inline from a charset-safe converter. Inline-only
+    by design: a value laundered through any intermediate variable is not value-tracked here (it is
+    left to the evidence layer to mark as a `charset_maybe` lead). The all-writes rule inside
+    `_inline_constrained_results` rules out a free value written to the sink argument.
+
+    This is the lenient PREMISE, shared with the evidence layer (which uses it for a `charset_maybe`
+    recall hint). The downweight — a safety claim — adds F1 / F-escape / F-alias on top of it; see
+    :func:`_charset_downweight`."""
     return sink_arg in _inline_constrained_results(pseudocode, _CHARSET_SAFE)
+
+
+def _charset_downweight(pseudocode: str, sink_arg: str, sink_name: str | None = None) -> bool:
+    """Charset downweight (hardened, H-3): the sink argument is built inline only from charset-safe
+    converter output and literals (``_charset_inline_constrained`` — the all-writes-benign premise),
+    AND it is a local array (F1) with no F-escape and no F-alias that could put a free value into it
+    by a route the inline premise does not see.
+
+    The premise's all-writes rule only inspects the FORMAT / COPY builders; a write through any
+    other call, or an alias handed to one, is invisible to it. These guards close that — the same
+    F1 / escape / alias the numeric path gets from :func:`_buffer_writes_all_safe` — without that
+    function's "sink reads a pre-built buffer" model, so the copy-path shape where the sink itself
+    builds the buffer (``strcpy(d, ether_ntoa(x))``) still qualifies. ``buf`` at the candidate's own
+    sink (``sink_name`` — a command sink, or the thin command WRAPPER a propagated candidate
+    forwards through), at any command sink, or at a whitelisted read is a read of the candidate,
+    never an escape; ``buf`` at any other call that is not a recognized buffer writer escapes."""
+    if not _charset_inline_constrained(pseudocode, sink_arg):
+        return False
+    if not _is_local_array(pseudocode, sink_arg):
+        return False  # F1: a global / parameter could be written by a call this body does not show
+    for m in re.finditer(r"([^;\n{}]*?)(?<![<>!=+\-*/%&|^~])=(?!=)([^;\n{}]*)", pseudocode):
+        if _is_buf_alias(m.group(2), sink_arg):
+            return False  # F-alias
+    writers = _COPY_WRITE | _FORMAT_WRITE | _MEMSET
+    for _off, name, args in _calls_in_function(pseudocode):
+        positions = [i for i, a in enumerate(args) if _buf_contained(a, sink_arg)]
+        if not positions:
+            continue
+        if all(p in _READONLY_ARG_POS.get(name, ()) for p in positions):
+            continue  # whitelisted read position
+        if positions == [0] and _is_buf_target(args[0], sink_arg) and name in writers:
+            continue  # a buffer writer whose destination is buf (benign by the all-writes premise)
+        if name == sink_name or name in _SHELL_RUN_SINKS or name in CMD:
+            continue  # the candidate's sink / a command sink reads buf — that IS the candidate
+        return False  # F-escape: buf handed to a call that is neither a safe write nor a read
+    return True
 
 
 # ── R5: numeric_sanitized by "every write to the sink buffer is safe" ─────────────────────────
@@ -405,6 +443,22 @@ def _is_buf_target(text: str, buf: str) -> bool:
     return ref.root == buf
 
 
+def _is_buf_alias(rhs_text: str, buf: str) -> bool:
+    """The right-hand side of an assignment stores a POINTER aliasing ``buf`` into another variable:
+    ``buf``, ``&buf``, ``buf + k``, ``&buf[k]`` or a cast of these — ``arg_ref`` reads root ``buf``
+    with a form that carries the pointer (``var`` / ``cast`` / ``addr_of`` / ``arith``).
+
+    It is NOT an alias when the value is one READ out of the buffer (``buf[k]`` / ``*buf`` — a
+    scalar, ``load`` form), nor when ``buf`` is merely an argument to a call on the right
+    (``fp = fopen(buf,…)``, ``iVar = system(buf)`` — ``call`` form: the call is judged by the call
+    loop as a read / write / escape, so treating it as an alias here would drop the mark twice).
+    Catching the real aliases keeps an untrackable write through the alias from passing as safe;
+    not catching a captured call return or an element read is what lets a constrained buffer
+    qualify (this is the H-1 fix — the old whole-RHS token search flagged both)."""
+    ref = arg_ref(rhs_text)
+    return ref.root == buf and ref.form in ("var", "cast", "addr_of", "arith")
+
+
 def _calls_in_function(pseudocode: str) -> list[tuple[int, str, list[str]]]:
     """(open-paren offset, callee name, top-level arguments) of every call, in text order, string
     literals skipped by ``call_args_at``. A call that never closes is left out."""
@@ -453,18 +507,39 @@ def _encloses_and_precedes(depths: list[int], write_pos: int, sink_pos: int) -> 
     return all(depths[i] >= base for i in range(write_pos, sink_pos))
 
 
+# A C / Ghidra type word that can head a stack-array declaration (``char buf [N];``,
+# ``undefined1 auStack_428 [1024];``). Deliberately NOT the taint layer's ``_TYPE_WORDS``, which
+# folds in control keywords (``return`` / ``if`` / …): matching one of those before ``buf`` would
+# read ``return buf[0];`` as a declaration. The word right before ``buf`` must be one of these.
+_DECL_TYPE_PAT = (
+    r"(?:undefined\d*|u?int\d{1,2}(?:_t)?|u?int|char|uchar|byte|sbyte|u?short|u?long|"
+    r"longlong|ulonglong|wchar_t|void|bool|float|double|size_t|ssize_t|code|word|dword|qword)"
+)
+
+
 def _is_local_array(pseudocode: str, buf: str) -> bool:
-    """``buf`` is declared as a local ARRAY in this function body (``T buf [N]``), not a parameter
-    or a global. A ``DAT_*`` / ``g_*`` name is never local; a parameter is in the signature; a
-    local array is indexed somewhere (``buf[...]``) — a plain ``char *`` local that is only ever a
-    format destination is not provably array-backed and stays out."""
+    """``buf`` is declared as a local ARRAY in this function body (``T buf [N];``).
+
+    Ghidra renders a stack array as a sized declaration — ``char acStack_38 [32];``, ``undefined1
+    auStack_428 [1024];``. A named global (``cmd_buf``), a ``DAT_*`` / ``g_*`` symbol, a parameter,
+    and a plain ``char *`` local — even one later indexed as ``buf[i]`` — have no sized declaration
+    here, so none is read as a local array. Requiring the declaration, not merely that ``buf`` is
+    indexed somewhere, is what keeps a symbol-named global out: a global can be written by a call
+    this one function body does not show, which would defeat the "every write is safe" check that
+    only a true local can make sound (``free`` direction: an unprovable local stays False, so the
+    candidate keeps its score).
+
+    The declaration is recognised by a real type token directly before ``buf`` and a sized ``[…]``,
+    which a use (``buf[i] = …``, ``x = buf[i]``, ``return buf[0];``) never has — so the text may be
+    one line (a compact fixture) or many (real output) without a line anchor."""
     if buf.startswith(("DAT_", "g_", "PTR_")):
         return False
     if buf in signature_slots(pseudocode):
         return False  # a parameter, not a local
     brace = pseudocode.find("{")
     body = pseudocode[brace + 1 :] if brace != -1 else pseudocode
-    return re.search(rf"\b{re.escape(buf)}\s*\[", body) is not None
+    decl = rf"\b{_DECL_TYPE_PAT}\s+{re.escape(buf)}\s*(?:\[[^\[\]\n]*\]\s*)+;"
+    return re.search(decl, body) is not None
 
 
 def _buffer_writes_all_safe(
@@ -491,8 +566,8 @@ def _buffer_writes_all_safe(
             if not _is_literal_arg(rhs) or not write_ok(lpos):
                 return False
             continue
-        if re.search(rf"(?<![\w>.])&?\s*{re.escape(buf)}(?![\w])", rhs):
-            return False  # F-alias: stored into another variable
+        if _is_buf_alias(rhs, buf):
+            return False  # F-alias: a pointer aliasing buf is stored into another variable
 
     for off, name, args in _calls_in_function(pseudocode):
         if off == sink_pos:
@@ -501,6 +576,8 @@ def _buffer_writes_all_safe(
         if not positions:
             continue
         ro = _READONLY_ARG_POS.get(name, ())
+        if all(p in ro for p in positions):
+            continue  # buf only at whitelisted read positions (类二): a read, never a write
         if positions == [0] and _is_buf_target(args[0], buf):
             # buf is the destination of this call.
             if name in _MEMSET:
@@ -532,8 +609,6 @@ def _buffer_writes_all_safe(
                 saw_fmt_or_conv = True
                 continue
             return False  # a destination write by some other call
-        if all(p in ro for p in positions):
-            continue  # buf only at whitelisted read positions (类二)
         return False  # F-escape: buf handed to a call that is neither a safe write nor a read
 
     return saw_fmt_or_conv
@@ -669,10 +744,11 @@ def detect_form_signal(
         and _value_is_constrained(pseudocode, sink_arg, _NUMERIC_VALIDATORS, sink_pos)
     ):
         return NUMERIC_SANITIZED
-    if safe_form and sink_arg is not None and _charset_inline_constrained(pseudocode, sink_arg):
-        # Charset downweight is INLINE-ONLY: the converter must build the sink argument directly. A
-        # value laundered through an intermediate variable is not value-tracked (no chain to two
-        # hops, three hops, …); the evidence layer marks it `charset_maybe` instead.
+    if safe_form and sink_arg is not None and _charset_downweight(pseudocode, sink_arg, sink_name):
+        # Charset downweight (hardened): the sink argument is built inline only from charset-safe
+        # converter output (MAC/IP/base64 formatting) and literals, it is a local array, and nothing
+        # escapes or aliases it. A value laundered through an intermediate variable is not
+        # value-tracked here (the evidence layer marks it `charset_maybe` instead).
         return CHARSET_CONSTRAINED
     if sink_class in (None, "cmd") and _exec_is_no_shell(callees, pseudocode):
         return NO_SHELL_EXEC  # a statement about the COMMAND sinks: not one for a path or format
@@ -723,6 +799,10 @@ def wrapper_propagation_form_note(
         )
         if _value_is_constrained(pseudocode, sink_arg, _NUMERIC_VALIDATORS, sink_pos):
             return NUMERIC_SANITIZED
-    if safe_form and sink_arg is not None and _charset_inline_constrained(pseudocode, sink_arg):
+    if (
+        safe_form
+        and sink_arg is not None
+        and _charset_downweight(pseudocode, sink_arg, wrapper_name)
+    ):
         return CHARSET_CONSTRAINED
     return None

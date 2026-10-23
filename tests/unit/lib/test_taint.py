@@ -6,7 +6,12 @@ their own parentheses — a cast, a nested call — is no longer invisible."""
 
 from __future__ import annotations
 
-from treasure_map.lib.reachability.taint import _derives_map, _seed_sets, flows_into
+from treasure_map.lib.reachability.taint import (
+    _call_names,
+    _derives_map,
+    _seed_sets,
+    flows_into,
+)
 
 
 def test_a_buffer_source_with_a_parenthesised_argument_is_seeded() -> None:
@@ -45,3 +50,16 @@ def test_a_callee_name_inside_a_string_is_not_a_call() -> None:
     callee set, and a source named only in a message is not seeded."""
     strong, weak, _par = _seed_sets('void f(void){ char b[8]; syslog(1,"recv() failed"); }')
     assert "b" not in strong and "b" not in weak
+
+
+def test_call_names_ignores_a_name_written_inside_a_string() -> None:
+    """``_call_names`` (the derivation callee set) must skip a ``name(`` written inside a string
+    literal. A real flow variable that happens to share that name is dropped from the dependency
+    edges if the string hit pollutes the callee set, so the backward flow misses it.
+
+    MUTATION (verified RED / HM27): count every ``name(`` match, string-embedded ones included ->
+    ``x`` joins the callee set, is pruned from the builder's dependency idents, and the flow misses
+    it."""
+    pc = 'void f(char *x){ char cmd[64]; syslog(1,"x("); snprintf(cmd,64,"%s",x); system(cmd); }'
+    assert "x" not in _call_names(pc)  # 'x(' sits inside a string, so 'x' is not a callee
+    assert "x" in flows_into(pc, "cmd")  # and so 'x' is kept as a dependency of cmd

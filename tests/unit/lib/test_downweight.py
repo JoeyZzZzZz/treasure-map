@@ -831,3 +831,210 @@ def test_a_loaded_sink_argument_is_never_read_as_safe() -> None:
     body = 'i = atoi(x);\n  sprintf(b,"/proc/%d",i);\n  fopen(b,"r");'
     assert _num(body, form="var") == NUMERIC_SANITIZED  # the var form IS recognized
     assert _num(body, form="load") is None  # the same body read through a pointer is not
+
+
+# ── H-1: a captured call return / an element read is NOT a buffer alias ───────────────
+#
+# The old F-alias test searched the whole right-hand side for the buffer token, so `fp = fopen(b)`,
+# `fd = open(b)` and `iVar = system(b)` — the buffer passed to a call whose RETURN is captured —
+# were all read as aliases and wrongly dropped the numeric mark. The call is judged by the call
+# loop (a read / a write / an escape); only a pointer aliasing the buffer stored into another
+# variable is an alias.
+
+
+def _num_sys(body: str, sink_arg: str = "b") -> str | None:
+    # A numeric-built buffer whose command sink is system() (so a readonly call ON the buffer, e.g.
+    # fopen/open, is a NON-sink call the call loop must classify as a read, not a destination).
+    pc = "void f(char *x)\n{\n  int i;\n  FILE *fp;\n  int fd;\n  char b [64];\n" + body + "\n}"
+    return detect_form_signal(
+        sink_name="system",
+        pseudocode=pc,
+        callees=["atoi", "fopen", "open", "system"],
+        sink_arg=sink_arg,
+        sink_class="cmd",
+        sink_form="var",
+    )
+
+
+def test_a_captured_call_return_is_not_a_buffer_alias() -> None:
+    """H-1: capturing a call's return (``fp = fopen(b,…)``) is not an alias — the call reads the
+    buffer and the call loop judges it, so the numeric mark stands.
+
+    MUTATION (verified RED): read the RHS alias with a whole-string token search for ``buf`` instead
+    of ``arg_ref`` form -> each captured return drops the mark."""
+    pre = 'i = atoi(x);\n  sprintf(b,"/proc/%d",i);\n  '
+    assert _num_sys(pre + 'fp = fopen(b,"r");\n  system(b);') == NUMERIC_SANITIZED
+    assert _num_sys(pre + "fd = open(b,0);\n  system(b);") == NUMERIC_SANITIZED
+    assert _num_sys(pre + "i = system(b);") == NUMERIC_SANITIZED  # the sink's own return captured
+
+
+def test_an_element_read_is_not_a_buffer_alias() -> None:
+    """H-1 / p-2: ``x = b[0]`` reads one element (a scalar), not a pointer aliasing the buffer, so
+    it does not disqualify the numeric mark; a real pointer alias (``p = b``, ``p = b + 4``) does.
+
+    MUTATION (verified RED): treat a ``load``-form RHS as an alias -> the element read turns None;
+    stop treating ``var`` / ``arith`` RHS roots as aliases -> the two real aliases turn
+    numeric_sanitized."""
+    pre = "i = atoi(x);\n  "
+    post = '\n  sprintf(b,"/proc/%d",i);\n  system(b);'
+    assert _num_sys("char c;\n  " + pre + "c = b[0];" + post) == NUMERIC_SANITIZED
+    assert _num_sys("char *p;\n  " + pre + "p = b;\n  strcat(p,x);" + post) is None
+    assert _num_sys("char *p;\n  " + pre + "p = b + 4;\n  strcat(p,x);" + post) is None
+
+
+# ── H-2: F1 is "declared a local array", not "indexed somewhere" ──────────────────────
+
+
+def test_a_symbol_named_global_is_not_a_local_array() -> None:
+    """H-2: a symbol-named global (``cmd_buf``) that is merely INDEXED once is not a local array —
+    a call this body does not show could write it, so the "every write is safe" check is not sound.
+    Only a sized local declaration (``char buf [N];``) qualifies.
+
+    MUTATION (verified RED): read F1 as "``buf`` appears as ``buf[``" instead of a typed sized
+    declaration -> the symbol-named global turns numeric_sanitized."""
+    glob = (
+        "void f(char *x)\n{\n  int i;\n  i = atoi(x);\n"
+        "  cmd_buf[0] = '\\0';\n"
+        '  sprintf(cmd_buf,"kill -9 %d",i);\n  FUN_00402000();\n  system(cmd_buf);\n}'
+    )
+    assert (
+        detect_form_signal(
+            sink_name="system",
+            pseudocode=glob,
+            callees=["atoi", "sprintf", "system"],
+            sink_arg="cmd_buf",
+            sink_class="cmd",
+            sink_form="var",
+        )
+        is None
+    )
+    # the same body with a real local declaration IS numeric_sanitized (fix is not a blanket off)
+    local = glob.replace("  int i;\n", "  int i;\n  char cmd_buf [64];\n")
+    assert (
+        detect_form_signal(
+            sink_name="system",
+            pseudocode=local,
+            callees=["atoi", "sprintf", "system"],
+            sink_arg="cmd_buf",
+            sink_class="cmd",
+            sink_form="var",
+        )
+        == NUMERIC_SANITIZED
+    )
+
+
+# ── H-3: charset downweight is hardened (F1 + F-escape + F-alias), not just inline ────
+
+
+def _cs(
+    body: str, sink_arg: str = "c", sink: str = "system", sink_class: str = "cmd"
+) -> str | None:
+    pc = "void f(void *m,char *x)\n{\n  char c [64];\n  char *p;\n" + body + "\n}"
+    return detect_form_signal(
+        sink_name=sink,
+        pseudocode=pc,
+        callees=["snprintf", "ether_ntoa", "strcpy", "foo", sink],
+        sink_arg=sink_arg,
+        sink_class=sink_class,
+        sink_form="var",
+    )
+
+
+# (name, body, is charset_constrained). Every body builds c inline from ether_ntoa (the premise).
+_CS_HARDEN = [
+    ("control", 'snprintf(c,64,"arp -s %s",ether_ntoa(m));\n  system(c);', True),
+    ("escape call", 'snprintf(c,64,"arp -s %s",ether_ntoa(m));\n  foo(c);\n  system(c);', False),
+    (
+        "alias then modify",
+        'snprintf(c,64,"arp -s %s",ether_ntoa(m));\n  p = c;\n  strcat(p,x);\n  system(c);',
+        False,
+    ),
+    (
+        "offset free write",
+        'snprintf(c,64,"arp -s %s",ether_ntoa(m));\n  strcpy(c + 6,x);\n  system(c);',
+        False,
+    ),
+]
+
+
+@pytest.mark.parametrize("name,body,want", _CS_HARDEN)
+def test_charset_downweight_is_hardened(name: str, body: str, want: bool) -> None:
+    """charset_constrained now requires F1 (local array) + no F-escape + no F-alias on top of the
+    inline-converter premise, so a value a call could modify out of band no longer passes as safe.
+
+    MUTATION (verified RED): run only the inline premise (no escape / alias scan) -> ``escape call``
+    and ``alias then modify`` turn charset_constrained."""
+    assert (_cs(body) == CHARSET_CONSTRAINED) is want, name
+
+
+def test_charset_downweight_requires_a_local_array() -> None:
+    """H-3 / F1: a charset-built DAT_ global is not a local array -> not downweighted.
+
+    MUTATION (verified RED): drop the F1 check in the charset downweight -> it turns
+    charset_constrained."""
+    pc = (
+        "void f(void *m)\n{\n"
+        '  snprintf(DAT_0041a000,0x20,"%s",ether_ntoa(m));\n  FUN_x();\n  system(DAT_0041a000);\n}'
+    )
+    assert (
+        detect_form_signal(
+            sink_name="system",
+            pseudocode=pc,
+            callees=["snprintf", "ether_ntoa", "system"],
+            sink_arg="DAT_0041a000",
+            sink_class="cmd",
+            sink_form="var",
+        )
+        is None
+    )
+
+
+# ── gap tests (audit h-1): behaviours the H1 suite left unmutated ─────────────────────
+
+
+def test_a_format_with_more_varargs_than_conversions_is_not_safe() -> None:
+    """A safe format write consumes EXACTLY the varargs passed; an extra vararg the conversions do
+    not account for is not safe (Ghidra drops varargs, so a surplus is a decompiler/real mismatch
+    to keep, not to wash into 'numeric').
+
+    MUTATION (verified RED / HM07): make the format check return True regardless of the vararg
+    count -> this surplus-vararg body turns numeric_sanitized."""
+    body = (
+        'i = atoi(x);\n  sprintf(b,"/proc/%d",i,j);\n  fopen(b,"r");'  # %d consumes i; j is extra
+    )
+    assert _num(body) is None
+
+
+def test_a_pure_constant_format_without_a_converter_is_not_numeric_sanitized() -> None:
+    """The premise is load-bearing: numeric_sanitized needs an actual numeric converter on the
+    buffer's path. A buffer built from a pure-constant format (no atoi/strtol result) is a constant,
+    not a number-constrained value, and must not be marked.
+
+    MUTATION (verified RED / HM15): drop the converter-on-path premise -> the constant-format body
+    turns numeric_sanitized off the write check alone."""
+    body = 'sprintf(b,"/proc/self/exe");\n  fopen(b,"r");'  # a literal format, no converter at all
+    assert _num(body) is None
+
+
+def test_caller_constant_is_refused_when_the_sink_argument_is_an_address_or_a_load() -> None:
+    """caller_constant means the callers pass a literal AT the parameter — trusted only when the
+    sink argument IS that parameter value (``var`` / ``cast``). ``&param`` (addr_of) and a value
+    loaded through it are not the parameter, so the one-hop literal says nothing about them.
+
+    MUTATION (verified RED / HM17, HM18): add ``addr_of`` to the allowed forms, or drop the form
+    gate entirely -> these turn caller_constant."""
+    pc = "void run(char* param_1){ system(param_1); }"
+    caller = 'void boot(void){ run("/etc/init.d/rcS start"); }'
+    for bad_form in ("addr_of", "load"):
+        assert (
+            detect_form_signal(
+                sink_name="system",
+                pseudocode=pc,
+                callees=["system"],
+                sink_arg="param_1",
+                sink_form=bad_form,
+                func_name="run",
+                callers_pseudocode=[caller],
+            )
+            is None
+        ), bad_form

@@ -17,8 +17,10 @@ passed to it.
 
 from __future__ import annotations
 
+import bisect
 import re
 from collections.abc import Mapping
+from functools import lru_cache
 
 from treasure_map.lib.pattern.classes import (
     _HEX_FRAGMENT_RE as _HEX_FRAGMENT_RE,
@@ -212,13 +214,31 @@ def _calls_in(stmt: str, names: frozenset[str]) -> list[tuple[str, list[str]]]:
     return [(name, args) for _off, name, args in found]
 
 
+# ★ Per-function memoization (H-4). _derives_map / _seed_sets / _call_names are pure functions of
+# the pseudocode text, and one function's body is read many times over — once per candidate it
+# holds, and `grader` calls `flows_into` once per covered variable, each rebuilding the whole
+# dependency map. The hunt passes the SAME `row.pseudocode` object to every read of one function
+# (analyzer2 loads it once), so a small bounded cache keyed on that text turns a per-candidate
+# rebuild into a per-function one. The cached dict / sets are treated as READ-ONLY by every caller
+# (verified: flows_into / free_taint_reaches / grader / evidence only read them); a future caller
+# that needs to mutate one must copy it first.
+_CACHE_SIZE = 256
+
+
+@lru_cache(maxsize=_CACHE_SIZE)
 def _call_names(pseudocode: str) -> set[str]:
     """Every name written as a callee (``name(``) outside string literals."""
     spans = _literal_spans(pseudocode)
+    # `spans` are sorted by open-quote index and non-overlapping, so a binary search replaces the
+    # per-call-head linear scan over every literal span (the hot path on a large body).
+    los = [lo for lo, _hi in spans]
+
+    def _inside_a_literal(x: int) -> bool:
+        i = bisect.bisect_left(los, x) - 1  # the last span with lo < x
+        return i >= 0 and x <= spans[i][1]
+
     return {
-        m.group(1)
-        for m in _CALL_HEAD_RE.finditer(pseudocode)
-        if not any(lo < m.end() - 1 <= hi for lo, hi in spans)
+        m.group(1) for m in _CALL_HEAD_RE.finditer(pseudocode) if not _inside_a_literal(m.end() - 1)
     }
 
 
@@ -261,6 +281,7 @@ def _dep_idents(text: str, call_names: set[str]) -> set[str]:
     return out
 
 
+@lru_cache(maxsize=_CACHE_SIZE)
 def _derives_map(pseudocode: str) -> dict[str, set[str]]:
     """Map each variable to the variables it is directly assigned/built from.
 
@@ -284,6 +305,7 @@ def _derives_map(pseudocode: str) -> dict[str, set[str]]:
     return deps
 
 
+@lru_cache(maxsize=_CACHE_SIZE)
 def _seed_sets(pseudocode: str) -> tuple[set[str], set[str], set[str]]:
     """Return the directly-seeded (strong, weak, parameter) inputs — pre-propagation.
 

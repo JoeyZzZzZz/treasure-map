@@ -17,11 +17,15 @@ from pathlib import Path
 from treasure_map.lib.hunt.evidence import (
     EntryIndex,
     _ref_at_boundary,
+    _size_trace_boundary,
+    _trace_boundary,
     build_flow_evidence,
     build_fmtstr_evidence,
     build_size_evidence,
     load_entry_index,
 )
+from treasure_map.lib.pattern.classes import ArgRef
+from treasure_map.lib.reachability.copy_size import SIZE_VARIABLE
 
 _SRC = Path(__file__).resolve().parents[3] / "src" / "treasure_map"
 
@@ -270,6 +274,48 @@ def test_trace_boundary_copy_alias_untraced() -> None:
     )
     assert _ev(pc, ["helper", "strlcpy", "snprintf", "system"])["trace_boundary"] == (
         "copy_alias_untraced"
+    )
+
+
+def test_trace_boundary_checks_a_literal_before_an_indirect_call() -> None:
+    """A literal sink argument resolved the value on the spot — ``reached_sink`` — even in a
+    function that also has an indirect call. The literal check comes FIRST; the indirect-call note
+    is for a value that might arrive through the pointer, not for one that is a constant.
+
+    MUTATION (verified RED / HM19): move the literal check below the indirect/global checks -> the
+    indirect call is reported and the literal's clean resolution is lost."""
+    pc = 'void f(void){ char* v=(*fp)(); system("/bin/true"); }'
+    assert _trace_boundary(pc, None, "unknown", {}, ref=ArgRef("literal")) == "reached_sink"
+
+
+def test_trace_boundary_sink_arg_arith_leading_with_a_load_is_loaded_through_pointer() -> None:
+    """A sink argument whose first operand is read through a pointer (form ``arith``, lead
+    ``load`` — ``p[0] + 1``) is read through a pointer: what was stored there is not in this read.
+
+    MUTATION (verified RED / HM20): drop the ``lead == 'load'`` arm on the sink side -> the arith
+    form falls through and is reported as resolved."""
+    ref = ArgRef("arith", "p", path="p[0]", lead="load")
+    assert _trace_boundary("void f(void){ system(p[0] + 1); }", "p", "unknown", {}, ref=ref) == (
+        "loaded_through_pointer"
+    )
+
+
+def test_size_trace_boundary_length_arith_leading_with_a_load_is_loaded_through_pointer() -> None:
+    """Mirror on the size axis: a length whose first operand is read through a pointer (form
+    ``arith``, lead ``load`` — ``p->len * 4``) is read through a pointer.
+
+    MUTATION (verified RED / HM21): drop the ``lead == 'load'`` arm on the size side -> the arith
+    length falls through and is reported as resolved."""
+    assert (
+        _size_trace_boundary(
+            "void f(void){ memcpy(d,s,p->len * 4); }",
+            SIZE_VARIABLE,
+            "p",
+            {},
+            form="arith",
+            lead="load",
+        )
+        == "loaded_through_pointer"
     )
 
 
