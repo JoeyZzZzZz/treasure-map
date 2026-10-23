@@ -1360,6 +1360,17 @@ _DATA_BYTES_CONTRACT = (
     "is yours. Bytes out of an executable (RX) block additionally carry "
     "`bytes_from_executable_segment` + a `warning`: they may be instructions rather than data."
 )
+# The warning every byte read out of an executable (RX) block carries — get_data_bytes and the
+# data-table reader alike, so the two cannot word it differently.
+_RX_BYTES_WARNING = (
+    "these bytes come from an EXECUTABLE (RX) block. If the binary has no section headers "
+    "there is one block per PT_LOAD, so .rodata and .text share this block and NOTHING "
+    "here can tell them apart: the run returned may be read-only DATA or may be "
+    "INSTRUCTION bytes. Do not read it as data without confirming the address is a data "
+    "constant "
+    "(e.g. the pseudocode references it as DAT_/a string, or a disassembler shows no "
+    "instruction there)."
+)
 # A cap on ONE request, so a single call cannot serialize a whole 4 MiB segment into a response.
 # Independent of the exporter's per-block cap: this one bounds the ANSWER, that one the STORE.
 _DATA_BYTES_MAX_LENGTH = 4096
@@ -1543,15 +1554,7 @@ def get_data_bytes(
         # a worse error than not knowing why a read stopped short. Both keys are unconditional
         # whenever the block is executable.
         result["bytes_from_executable_segment"] = True
-        result["warning"] = (
-            "these bytes come from an EXECUTABLE (RX) block. If the binary has no section headers "
-            "there is one block per PT_LOAD, so .rodata and .text share this block and NOTHING "
-            "here can tell them apart: the run returned may be read-only DATA or may be "
-            "INSTRUCTION bytes. Do not read it as data without confirming the address is a data "
-            "constant "
-            "(e.g. the pseudocode references it as DAT_/a string, or a disassembler shows no "
-            "instruction there)."
-        )
+        result["warning"] = _RX_BYTES_WARNING
     if blk["truncated"]:
         # The block itself is a prefix. Said even on a fully-served read: the bytes returned are
         # right, but "nothing more after this block's stored tail" would be wrong.

@@ -19,6 +19,7 @@ import click
 from treasure_map.cli.interrupts import InterruptGroup
 from treasure_map.lib import facts
 from treasure_map.lib.analyze.ghidra_runner import current_pass_version
+from treasure_map.lib.query import entry_words
 from treasure_map.version import installed_commit
 
 
@@ -159,7 +160,10 @@ def xrefs(function: str, direction: str, binary: str | None, analysis_db: str) -
     d: facts.XrefDirection = "callees" if direction == "callees" else "callers"
     conn = _open_fact_db(analysis_db)
     try:
-        _emit_fact(conn, facts.get_xrefs(conn, func=function, direction=d, binary=binary))
+        _emit_fact(
+            conn,
+            entry_words.xrefs_with_entry_words(conn, func=function, direction=d, binary=binary),
+        )
     finally:
         conn.close()
 

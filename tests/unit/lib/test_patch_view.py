@@ -1870,10 +1870,25 @@ def _labels(v: dict[str, Any]) -> set[str]:
             out |= set(r.get("facts", ())) | {str(r.get("labels", {}).get("side"))}
         out |= _s7_labels(e)
         out |= _summary_labels(e)
+        out |= _entry_words_labels(e)
     read_with = v.get("guards_read_with") or {}
     if read_with:
         out |= {"guards_read_with", *read_with, str(read_with.get("function"))}
     return out | _envelope_labels(v)
+
+
+def _entry_words_labels(e: dict[str, Any]) -> set[str]:
+    """The keys and enumerated values of an entry's entry_words block: the delta, each side's
+    state / reason / block classes, and each word's keys and block class."""
+    block = e.get("entry_words") or {}
+    out: set[str] = set(block) | ({"entry_words", str(block.get("delta"))} if block else set())
+    for side in ("a", "b"):
+        one = block.get(side) or {}
+        out |= set(one) | {str(one.get("state")), str(one.get("reason"))}
+        out |= set(one.get("count_by_class") or {})
+        for word in one.get("words") or ():
+            out |= set(word) | {str(word.get("block_class"))} | set(word.get("run") or {})
+    return out
 
 
 def _summary_labels(e: dict[str, Any]) -> set[str]:
@@ -1910,6 +1925,11 @@ def _envelope_labels(v: dict[str, Any]) -> set[str]:
     template = (v.get("annotation") or {}).get("anchor_ref_template") or {}
     if template:
         out |= {"anchor_ref_template", *template}
+    words = v.get("entry_words_counts") or {}
+    if words:
+        out |= {"entry_words_counts", *words}
+        out |= set(words.get("listed") or {}) | set(words.get("not_listed") or {})
+        out |= set((words.get("unavailable") or {}).values())
     return out
 
 

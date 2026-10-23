@@ -291,6 +291,19 @@ def _append(dst: Path, rel: str, text: str) -> None:
             False,
         ),
         (
+            # The negative control for the entry-words reader: an import inside a facts function
+            # body is still a closure edge, so it would pull the reader into the hunt stamp.
+            "facts imports the entry-words reader inside a function body",
+            lambda d: _append(
+                d,
+                "lib/facts.py",
+                "\n\ndef _probe():\n    from treasure_map.lib.query import entry_words\n\n"
+                "    return entry_words\n",
+            ),
+            False,
+            True,
+        ),
+        (
             "a facts function the hunt does not use",
             lambda d: _append(d, "lib/facts.py", "\n\ndef _unused_by_hunt():\n    return 1\n"),
             False,
@@ -422,3 +435,42 @@ def test_a_stored_scan_stamp_that_is_not_a_json_object_reads_unknown(stored: str
         raised = None
     assert raised is None, f"stored stamp {stored!r} raised {raised!r}"
     assert got == rv.StampCompare((), ("scan stamp",))
+
+
+# ── the entry-words reader stays out of every stamp ──
+
+
+def test_the_entry_words_reader_is_in_no_rescan_closure() -> None:
+    """lib.query.entry_words and the two places that compose it (patch_view, mcp_app) are read on
+    demand and write nothing, so no rescan stamp may hash them — and lib.facts must not import
+    them, or the hunt stamp would move with every change to the reader."""
+    for root in ROOTS:
+        closure = rv._closure(PKG, root)
+        assert "lib.facts" in closure or root == rv.PIPELINE_ROOT
+        for module in ("lib.query.entry_words", "lib.query.patch_view", "mcp_app"):
+            assert module not in closure, (root, module)
+
+
+def test_hoisting_the_rx_warning_moves_no_stamp(tmp_path: Path) -> None:
+    """The RX warning was hoisted out of get_data_bytes into a top-level constant so the data-table
+    reader shares it. With the warning put back inline, all four stamps — pipeline, hunt, diff,
+    overlay — are what they are now."""
+    from treasure_map.lib import facts
+    from treasure_map.lib.diff import code_version as cv
+
+    dst = tmp_path / "treasure_map"
+    shutil.copytree(PKG, dst, ignore=shutil.ignore_patterns("__pycache__"))
+    path = dst / "lib" / "facts.py"
+    text = path.read_text(encoding="utf-8")
+    use = 'result["warning"] = _RX_BYTES_WARNING'
+    start = text.index("_RX_BYTES_WARNING = (")
+    end = text.index(")\n", start) + 2
+    assert text.count(use) == 1 and start > 0
+    inline = text.replace(use, f"result['warning'] = {facts._RX_BYTES_WARNING!r}")
+    inline = inline[:start] + inline[end:]
+    assert "_RX_BYTES_WARNING" not in inline
+    path.write_text(inline, encoding="utf-8")
+    for root in ROOTS:
+        assert rv.code_version_of(dst, root) == rv.code_version_of(PKG, root), root
+    for entries in (cv.DIFF_CODE_ENTRIES, cv.OVERLAY_CODE_ENTRIES):
+        assert cv.code_hash(dst, entries) == cv.code_hash(PKG, entries)

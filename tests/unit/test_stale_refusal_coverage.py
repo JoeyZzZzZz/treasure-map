@@ -174,6 +174,23 @@ def test_a_stale_run_is_refused_on_the_run_scoped_readers(atlas: Path, tool: str
     assert call()["stale_scan"]["axis"] == "extraction"
 
 
+@pytest.mark.parametrize("tool", ["get_xrefs", "get_data_table"])
+def test_a_stale_run_is_refused_on_the_entry_word_readers(atlas: Path, tool: str) -> None:
+    """get_xrefs (now carrying entry_words) and get_data_table read the same analysis.db as every
+    fact tool, through the same gate: a proven-stale run is refused, the current one is served.
+
+    MUTATION: route either one around ``_fact`` -> that parameter goes RED."""
+    tools = mcp_app.make_tools(atlas)
+    call = {
+        "get_xrefs": lambda run: tools[tool](function="handle_req", run_id=run),
+        "get_data_table": lambda run: tools[tool]("0x1000", binary="webd", run_id=run),
+    }[tool]
+    refused = call("run_stale")
+    assert refused["found"] is False and refused["stale_scan"]["axis"] == "extraction"
+    served = call("run_ok")
+    assert "stale_scan" not in served and served["resolved_run"] == "run_ok"
+
+
 def test_an_unprovable_mismatch_is_still_served(tmp_path: Path) -> None:
     """★ THE GATE MUST NOT EAT THE ATLAS — the counterweight to every refusal above.
 

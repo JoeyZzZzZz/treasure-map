@@ -259,3 +259,13 @@ def test_a_change_to_the_export_script_moves_every_export(tmp_path: Path) -> Non
     f = d / "ExportBinExport.java"
     f.write_bytes(f.read_bytes() + b" ")
     assert all(cv.export_code_hash_in(b, d) != h for b, h in before.items())
+
+
+def test_the_entry_words_reader_is_no_diff_or_overlay_entry() -> None:
+    """The entry-words reader (and patch_view / mcp_app, which compose it) is read on demand at
+    view time and stored nowhere, so it is no entry of the diff or overlay stamp."""
+    for entry in cv.DIFF_CODE_ENTRIES + cv.OVERLAY_CODE_ENTRIES:
+        module = entry.partition(":")[0]
+        assert module not in ("lib.query.entry_words", "lib.query.patch_view", "mcp_app"), entry
+    assert "lib.facts:_DECOMPILE_MIN_SIZE" in cv.DIFF_CODE_ENTRIES
+    assert "lib.facts:_RX_BYTES_WARNING" not in cv.DIFF_CODE_ENTRIES

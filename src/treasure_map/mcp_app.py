@@ -59,6 +59,7 @@ from treasure_map.lib.query import canonical_view as _canonical_view
 from treasure_map.lib.query import coverage_report as _coverage_report
 from treasure_map.lib.query import density as _density
 from treasure_map.lib.query import effective_float_filters as _effective_float_filters
+from treasure_map.lib.query import entry_words
 from treasure_map.lib.query import explain_candidate as _explain_candidate
 from treasure_map.lib.query import filter_candidates as _filter_candidates
 from treasure_map.lib.query import filter_match_count as _filter_match_count
@@ -436,7 +437,9 @@ _AGENT_INSTRUCTIONS = (
     "sha256 — re-issue with one of them; ambiguous is not an error, it is what the firmware "
     "actually contains. When func is given, the function's own binary is used), "
     "get_callees / get_xrefs to walk the call chain (an empty "
-    "caller set may mean an indirect/dispatch-table call, not 'unreachable'), get_strings, "
+    "caller set may mean an indirect/dispatch-table call, not 'unreachable'; get_xrefs then lists "
+    "the data-segment words that hold the function's entry value, and get_data_table reads the "
+    "records around one), get_strings, "
     "get_functions_referencing_string (which functions mention a string, by pseudocode text "
     "match — wide and noisy, hits comments too), get_string_reference_anchors (the PARSED "
     "sibling: where a string is referenced by a RESOLVED Ghidra data reference — no comment "
@@ -2957,6 +2960,15 @@ def make_tools(
         It is a FACT (F's address is stored here), NEVER proof F is dispatched/reachable — trace the
         call yourself.
 
+        ``entry_words`` (on 'callers' when no caller is found, and always on 'address_taken'): the
+        word-aligned data words whose stored VALUE equals the function's entry address (ARM: also
+        entry|1), counted by ``block_class`` — data / unnamed / init_fini are the comparable
+        segments, listed first; linkage (GOT/PLT/relocations), symbol tables and unwind info are
+        counted apart, and a word inside a stored string is flagged. Each word carries its nearest
+        recorded label and, when it sits in an evenly spaced series of such words, that series;
+        ``next`` names a get_data_table call for the first comparable one. A stored value, not
+        proof of a call; ``none_found`` only when every block was stored in full.
+
         Run-aware: ``run_id`` + ``function`` or ``evidence_ref``; echoes ``resolved_run``.
 
         ``binary`` is a SELECTOR: a sha256 (a >=8-hex prefix works), a full path, or a
@@ -2979,14 +2991,21 @@ def make_tools(
             if direction == "address_taken"
             else "callers"
         )
-        return _fact(
-            lambda c, fn, bn: facts.get_xrefs(c, func=fn or "", direction=d, binary=bn),
+        result = _fact(
+            lambda c, fn, bn: entry_words.xrefs_with_entry_words(
+                c, func=fn or "", direction=d, binary=bn
+            ),
             run_id=run_id,
             evidence_ref=evidence_ref,
             function=function,
             binary=binary,
             diagnose=True,
         )
+        # The table-reading step names the run that answered, so it can be called as it is.
+        step = (result.get("entry_words") or {}).get("next")
+        if isinstance(step, dict) and result.get("resolved_run"):
+            step["args"]["run_id"] = result["resolved_run"]
+        return result
 
     def get_strings(
         binary: str | None = None,
@@ -3091,6 +3110,66 @@ def make_tools(
             run_id=run_id,
             evidence_ref=evidence_ref,
             binary=binary,
+        )
+
+    def get_data_table(
+        address: str,
+        binary: str | None = None,
+        run_id: str | None = None,
+        evidence_ref: str | None = None,
+        stride: int | str | None = None,
+        field_offset: int | str | None = None,
+        offset: int = 0,
+        limit: int = 64,
+    ) -> dict[str, Any]:
+        """The RECORDS of a data table around ``address``, cut by the spacing of the words that
+        hold a function's entry address — the reading get_xrefs' ``entry_words.next`` points at.
+
+        From ``address`` (hex, any form Ghidra shows) it finds the first word holding a function
+        entry, then the stride: given (``stride``, a multiple of the word size, at most 0x400) or
+        inferred as the smallest spacing at which at least four entry words follow one another.
+        ``stride`` / ``field_offset`` take an int or a hex string (``"0x10"``). ``field_offset`` is
+        where the entry word sits in a record (given, else the distance from ``address`` to that
+        word when it is less than the stride, else 0). Each record carries its entry word (the
+        function it names), the other words that equal a function entry / a stored string's start
+        / an address in a block, its printable runs and its bytes; ``table`` says where the series
+        ended on each side and why. Paged by record (``limit`` 1..256, ``offset``; follow
+        ``next_offset``).
+
+        ★ RECORDS BY ENTRY-WORD SPACING, not a declared layout: a record holding two function
+        pointers reads as two records unless you pass ``stride``. ``words`` / ``ascii_runs`` are
+        mechanical renderings, not field names. Whether, when and with what the code uses a slot
+        is yours to trace. Bytes out of an executable (RX) block carry
+        ``bytes_from_executable_segment`` + ``warning``.
+
+        Run-aware: ``run_id`` + ``binary`` or ``evidence_ref``; echoes ``resolved_run``.
+
+        ``binary`` is a SELECTOR: a sha256 (a >=8-hex prefix works), a full path, or a
+        short name. A short name is a label and can name several binaries in one firmware;
+        when it does, the result is ``reason='ambiguous'`` listing each candidate's
+        ``binary_path`` and ``sha256`` — re-issue with one of them. That is an answer about
+        the firmware, not an error."""
+        result = _fact(
+            lambda c, fn, bn: entry_words.get_data_table(
+                c,
+                binary=bn or "",
+                address=address,
+                stride=stride,
+                field_offset=field_offset,
+                offset=offset,
+                limit=limit,
+            ),
+            run_id=run_id,
+            evidence_ref=evidence_ref,
+            binary=binary,
+        )
+        return _fit_page(
+            result,
+            offset,
+            rows="records",
+            total="total_records",
+            next_offset="next_offset",
+            truncated="truncated_by_bytes",
         )
 
     def get_functions_referencing_string(
@@ -3832,6 +3911,7 @@ def make_tools(
         "get_string_reference_anchors": get_string_reference_anchors,
         "get_imports_exports": get_imports_exports,
         "get_data_bytes": get_data_bytes,
+        "get_data_table": get_data_table,
         "get_script_callsites": get_script_callsites,
         "get_disassembly": get_disassembly,
         "annotate": annotate,

@@ -107,7 +107,7 @@ from typing import Any, Generic, TypeVar
 
 from treasure_map.lib.diff.layer0 import norm_hex
 from treasure_map.lib.pattern import classes
-from treasure_map.lib.query import diff_review, diff_sink_axes, sameness
+from treasure_map.lib.query import diff_review, diff_sink_axes, entry_words, sameness
 from treasure_map.lib.query.coverage import CONCLUDED, NEEDS_RECHECK, NEEDS_RELABEL, OPEN
 from treasure_map.lib.query.diff_align import diff_source_staleness, get_diff_deltas
 from treasure_map.lib.query.sink_impact import impact_tier
@@ -231,11 +231,13 @@ _STRUCTURAL_BLIND_SPOTS = {
     "caller_via_function_pointer_table": (
         "a function reached only through a PTR_FUN_ dispatch table or other function-pointer store "
         "is not in any caller's extracted callee list, so the caller-set reading (callers_a / "
-        "callers_b) does not count it as a direct caller"
+        "callers_b) does not count it as a direct caller; the stored words holding its entry value "
+        "are read separately (entry_words)"
     ),
     "caller_via_data_reference": (
         "a function whose address is taken as data rather than called by name is not a direct "
-        "caller in the callee lists, so the caller-set reading does not see that reference"
+        "caller in the callee lists, so the caller-set reading does not see that reference; the "
+        "stored words holding its entry value are read separately (entry_words)"
     ),
     "caller_inlined": (
         "a caller the compiler inlined holds no call to the function, so the caller-set reading "
@@ -266,7 +268,8 @@ _CAVEATS = {
         "in that scan's inventory, or stale sources). tmap's decompile can miss a call and a call "
         "through a pointer table or a data reference carries no name, so none_found is not proof "
         "the function is unreferenced. With pairing='proposed' the B side is an undetermined "
-        "pairing, whose function may be the wrong one."
+        "pairing, whose function may be the wrong one. For the data words holding the entry value "
+        "see entry_words."
     ),
     "callee_set_differs": (
         "The extracted callee lists differ. tmap's decompile can miss a call, so this is not proof "
@@ -308,6 +311,17 @@ _CAVEATS = {
         "records, a gap of the extraction, not of the diff. unavailable = not recorded or not "
         "single, never absent."
     ),
+    "entry_words": (
+        "A stored word equal to an entry address, read at word-aligned positions. Not proof the "
+        "word is a pointer, that the function is used through it, or that it is reached. "
+        "block_class splits linkage / symbol-table / unwind metadata from data segments; only "
+        "data / unnamed / init_fini feed delta and next, and a word whose bytes fall inside a "
+        "stored string is excluded. On an only-segment-name binary the read/write segments are "
+        "`unnamed` and the executable segments are `code`; a read-only table merged into an "
+        "executable segment is counted, not compared, and gets no next. none_found only when "
+        "every initialized block was stored in full. a_only = A has such a word, B none found — "
+        "not that B cannot reach the function."
+    ),
 }
 
 _LEGEND = {
@@ -336,6 +350,14 @@ _LEGEND = {
         "with entry_id: each side's recorded bound / source / flow_path / sanitizer / def_use. A "
         "sanitizer's body: get_pseudocode(run_id=<side's run>, binary=<side's sha256>, "
         "function=<seen[].name>)"
+    ),
+    "entry_words": (
+        "per side: the aligned data words whose value is the function's entry address (ARM: also "
+        "entry|1), by block_class; delta and next are over the comparable classes (data / unnamed "
+        "/ init_fini) with words that fall inside a stored string excluded; linkage, symbol "
+        "tables and unwind info are counted per side, not compared. Left out = both sides read in "
+        "full with no comparable word (a function with no counterpart: its one side). A side "
+        "that could not be read at all is named once, in entry_words_counts.unavailable"
     ),
 }
 
@@ -2430,6 +2452,7 @@ def _clear_view_caches() -> None:
     _B_MENTIONS_CACHE.clear()
     _SIZE_FACT_CACHE.clear()
     _CANDIDATE_ENTRY_CACHE.clear()
+    _ENTRY_WORDS_IMAGE_CACHE.clear()
     # S6's process-wide call-list cache (in a module that imports this one, so imported here).
     from treasure_map.lib.query.diff_group_freshness import _clear_cache
 
@@ -3038,6 +3061,127 @@ def _not_listed_counts(built: BuiltDiff, readings: _Readings) -> dict[str, dict[
     differs = sameness.NOT_LISTED_NAME[sameness.DIFFERS]
     out[differs]["page_with"] = f"not_listed_page={differs}"
     return out
+
+
+# ── entry_words: each side's data words holding the entry value (a read-face reading) ─────────
+#
+# Never built into build_diff_view, never in an entry's facts, its bucket, its order or its review
+# state: it rides the rendered copy of a full page only (lib/query/entry_words).
+
+# One side's image (blocks, entries, labels, strings) with its word index, per (the run's stamps,
+# the binary's content hash): read once, reused by every page of every diff of that binary.
+_ENTRY_WORDS_IMAGE_CACHE: _BoundedCache[tuple[str, ...], entry_words.Image] = _BoundedCache(8)
+
+# The delta values each tally counts. Not-listed pairs are counted only (never rendered or paged),
+# and their same_shape is not counted.
+_ENTRY_WORDS_LISTED = (
+    "a_only",
+    "b_only",
+    "count_differs",
+    "run_shape_differs",
+    "same_shape",
+    "undetermined",
+    "not_in_inventory",
+)
+_ENTRY_WORDS_NOT_LISTED = tuple(k for k in _ENTRY_WORDS_LISTED if k != "same_shape")
+
+
+def _entry_words_image(
+    atlas: sqlite3.Connection, run_id: str, sha: str | None
+) -> tuple[entry_words.Image | None, str | None]:
+    """(image, None), or (None, why) when the side's analysis.db or binary cannot be read."""
+    if not sha:
+        return None, "side_unreadable"
+    key = (*_run_key(atlas, run_id), sha)
+    hit = _ENTRY_WORDS_IMAGE_CACHE.get(key)
+    if hit is not None:
+        return hit, None
+    path, _build = _run_source(atlas, run_id)
+    if path is None:
+        return None, "side_unreadable"
+    try:
+        conn = ro_connect(path)
+    except sqlite3.Error:
+        return None, "side_unreadable"
+    try:
+        row = conn.execute("SELECT id FROM binaries WHERE sha256 = ?", (sha,)).fetchone()
+        if row is None:
+            return None, "side_unreadable"
+        image = entry_words.load_image(conn, row[0])
+    except sqlite3.Error:
+        return None, "side_unreadable"
+    finally:
+        conn.close()
+    entry_words.word_index(image)
+    _ENTRY_WORDS_IMAGE_CACHE[key] = image
+    return image, None
+
+
+@dataclass(frozen=True)
+class _EntryWordsView:
+    """The whole diff's entry_words: each listed entry's rendered block, and the envelope's
+    counts."""
+
+    rendered: dict[str, dict[str, Any]]
+    counts: dict[str, Any]
+
+
+def _entry_words_view(atlas: sqlite3.Connection, built: BuiltDiff) -> _EntryWordsView:
+    """Every placed entry's two sides read and compared (entry_words.entry_delta). Listed entries
+    are counted under ``listed`` and rendered; not-listed pairs are counted under ``not_listed``
+    only. A side that cannot be read at all is named once under ``unavailable`` — its entries are
+    counted as undetermined, never rendered one by one. A function with no counterpart renders its
+    one side when that side holds a comparable word (or cannot say), with no delta."""
+    d = built.diff
+    sides = {
+        "a": _entry_words_image(atlas, d.run_a, d.sha_a),
+        "b": _entry_words_image(atlas, d.run_b, d.sha_b),
+    }
+    unavailable = {
+        side: (image.unavailable if image is not None else why) or "side_unreadable"
+        for side, (image, why) in sides.items()
+        if image is None or image.unavailable is not None
+    }
+    (img_a, why_a), (img_b, why_b) = sides["a"], sides["b"]
+    listed: dict[str, int] = {}
+    not_listed: dict[str, int] = {}
+    rendered: dict[str, dict[str, Any]] = {}
+    for e in built.placed:
+        if e.pair is not None:
+            ra = entry_words.side_reading(img_a, e.pair.addr_a, why_a)
+            rb = entry_words.side_reading(img_b, e.pair.addr_b, why_b)
+            delta = entry_words.entry_delta(ra, rb)
+            if delta is None:
+                continue
+            if not e.bucket:
+                if delta in _ENTRY_WORDS_NOT_LISTED:
+                    not_listed[delta] = not_listed.get(delta, 0) + 1
+                continue
+            listed[delta] = listed.get(delta, 0) + 1
+            if delta == "not_in_inventory" or (delta == "undetermined" and unavailable):
+                continue
+            rendered[e.entry_id] = {
+                "delta": delta,
+                "a": entry_words.side_json(img_a, ra, e.pair.addr_a),
+                "b": entry_words.side_json(img_b, rb, e.pair.addr_b),
+            }
+        elif e.unpaired is not None and e.bucket:
+            side = e.unpaired.side
+            image, why = sides.get(side, (None, "side_unreadable"))
+            if side in unavailable:
+                continue
+            one = entry_words.side_reading(image, e.unpaired.addr, why)
+            if one.state == "not_in_inventory":
+                continue
+            if one.comparable or entry_words.undetermined_for_delta(one):
+                rendered[e.entry_id] = {side: entry_words.side_json(image, one, e.unpaired.addr)}
+    counts: dict[str, Any] = {
+        "listed": {k: listed[k] for k in _ENTRY_WORDS_LISTED if listed.get(k)},
+        "not_listed": {k: not_listed[k] for k in _ENTRY_WORDS_NOT_LISTED if not_listed.get(k)},
+    }
+    if unavailable:
+        counts["unavailable"] = unavailable
+    return _EntryWordsView(rendered, counts)
 
 
 def _not_listed_page(
@@ -3948,6 +4092,11 @@ def get_diff_patch_view(
     )
     review = ViewReview(atlas, built)
     unknown_filter = _unknown_filter_value(entries, subclass, blind_spot)
+    # entry_words: a full sink_patch page only (the listed entries' blocks and the whole diff's
+    # counts); a summary page and the other views carry neither.
+    words_view = (
+        _entry_words_view(atlas, built) if view == "sink_patch" and detail == "full" else None
+    )
     envelope: dict[str, Any] = {
         "diff_id": diff_id,
         "lens": {
@@ -3980,6 +4129,7 @@ def get_diff_patch_view(
         "banners": banners,
         "counts": counts,
         "not_listed": _not_listed_counts(built, readings),
+        **({"entry_words_counts": words_view.counts} if words_view is not None else {}),
         "blind_spots": ledger,
         "overlay_coverage": overlay.coverage,
         # Set once the page's order is known (it follows that order); here to keep their place.
@@ -4181,6 +4331,8 @@ def get_diff_patch_view(
             out["proposed_pair_reading"] = _proposed_json(
                 e, *proposed[e.entry_id], page_deltas, page_bodies, guard_fields
             )
+        if words_view is not None and e.entry_id in words_view.rendered:
+            out["entry_words"] = words_view.rendered[e.entry_id]
         if e.entry_id in lens:
             attention, basis = lens[e.entry_id]
             out["rank_key"] = {

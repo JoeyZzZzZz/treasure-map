@@ -64,6 +64,7 @@ _EXPECTED_TOOLS = {
     "get_string_reference_anchors",
     "get_imports_exports",
     "get_data_bytes",
+    "get_data_table",
     "get_script_callsites",
     "get_disassembly",
     "annotate",
