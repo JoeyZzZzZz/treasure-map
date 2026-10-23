@@ -69,6 +69,16 @@ CHANGED = "changed"
 ANCHOR_UNRESOLVED = "anchor_unresolved"
 DIFF_WITHHELD = "diff_withheld"
 
+# The one rule for a no_real_change's ``checked`` (and a changed_real's ``evidence``), said in one
+# place so the view's per-page hint, the write-time refusal and the MCP docstring cannot drift. A
+# leaf string: no import, so any layer may use it, and it is not in any code-version stamp.
+CHECKED_RULE = (
+    "checked needs at least one anchor read in this diff's current view — an entry's anchor_ref "
+    "(function_pair / function_presence), a candidate anchor, an entry_id, a row_ref (a row's "
+    "a_ref / b_ref), or a group_ref from same_shape_siblings; an item that looks like an anchor "
+    "but names nothing in the view is refused. Plain-text notes are kept but do not count."
+)
+
 
 # ── anchors ────────────────────────────────────────────────────────────────────────────────
 
@@ -562,10 +572,7 @@ def annotation_block(
             verdict='"changed_real|no_real_change|change_inconclusive"',
             rationale='"..."',
         ),
-        "no_real_change_needs": (
-            'checked=["<a fact or anchor read>", "<another>"] and why_unchanged="..." — two or '
-            "more of the first, and the second non-blank"
-        ),
+        "no_real_change_needs": 'why_unchanged="..." and ' + CHECKED_RULE,
         "candidate_anchor": (
             f"{run_pair(run_a, run_b)}#candidate#<key_granularity>|<sink_class>|"
             "<a_ref or (none)>|<b_ref or (none)>"

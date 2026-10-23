@@ -304,7 +304,28 @@ def annotate_group(
     """Validate a ``group_ref`` for a judgement on ``anchor_ref`` and return the ``group`` block to
     store (the snapshot plus the ``relation`` by which it is about this entry). Raises ConfigError,
     naming the one check that failed, when the ref is not this diff's, its versions are not current,
-    its shape is no current group, or the group is about some other entry."""
+    its shape is no current group, or the group is about some other entry.
+
+    A thin wrapper that builds the view and the side meta once; ``annotate_group_on`` holds the
+    checks, so a batch write that has already built both can reuse them (M-2)."""
+    built = build_diff_view(atlas, diff_id)
+    if built is None:
+        raise ConfigError(f"no diff {diff_id!r} in this atlas (see list_diffs)")
+    side_meta = sss._meta(atlas, diff_id)
+    assert side_meta is not None  # the diff view just built
+    return annotate_group_on(atlas, built, side_meta, diff_id, anchor_ref, group_ref)
+
+
+def annotate_group_on(
+    atlas: sqlite3.Connection,
+    built: BuiltDiff,
+    side_meta: sss._Meta,
+    diff_id: str,
+    anchor_ref: str,
+    group_ref: str,
+) -> dict[str, Any]:
+    """``annotate_group`` against an already-built view and side meta (``_meta`` — run / sha per
+    side, NOT the ``_binary_diff`` dict). Same checks, same errors."""
     parsed = _parse_ref(group_ref)
     if parsed is None:
         raise ConfigError(
@@ -322,12 +343,7 @@ def annotate_group(
             f"group_ref is of recipe {recipe!r}, but this build groups by "
             f"{sss.F2_RECIPE_VERSION!r} — read the group again and annotate against it"
         )
-    built = build_diff_view(atlas, diff_id)
-    if built is None:
-        raise ConfigError(f"no diff {diff_id!r} in this atlas (see list_diffs)")
-    meta = sss._meta(atlas, diff_id)
-    assert meta is not None  # the diff view just built
-    run, sha = meta.run[side], meta.sha[side]
+    run, sha = side_meta.run[side], side_meta.sha[side]
     if not sha:
         raise ConfigError(f"diff {diff_id!r} records no content hash for side {side!r}")
     calls = _calls_cached(atlas, run, sha)
@@ -346,7 +362,7 @@ def annotate_group(
         )
     relation = _relation(built, side, f2_key, members, calls, anchor_ref)
     if relation is None:
-        shapes = _subject_shapes_listing(built, meta, side, calls, groups, anchor_ref)
+        shapes = _subject_shapes_listing(built, side_meta, side, calls, groups, anchor_ref)
         raise ConfigError(
             f"group {group_ref!r} is not about this entry: it holds no call of it, and the shape "
             f"is not one this subject has on side {side!r}. The shapes it does have on this side: "
@@ -355,6 +371,34 @@ def annotate_group(
     snapshot = group_snapshot(atlas, built, side, f2_key)
     assert snapshot is not None  # members were just found
     return {**snapshot, "relation": relation}
+
+
+def group_in_diff(
+    atlas: sqlite3.Connection, built: BuiltDiff, side_meta: sss._Meta, item: str
+) -> bool:
+    """Whether ``item`` is a group_ref that names a CURRENT group of this diff — well-formed, this
+    diff's, current recipe + fingerprint version, a live shape on its side. The read-only slice of
+    ``annotate_group_on`` up to (not including) the ``_relation`` "about this entry" check: a
+    group_ref used as a ``checked`` anchor proves a group was read, it need not be this entry's
+    group. Never raises — any mismatch is False (it answers ``is_diff_anchor``, not a write)."""
+    parsed = _parse_ref(item)
+    if parsed is None:
+        return False
+    g_diff, f2_key, side, fpv, recipe = parsed
+    if g_diff != diff_id_of(side_meta) or side not in ("a", "b") or recipe != sss.F2_RECIPE_VERSION:
+        return False
+    run, sha = side_meta.run.get(side), side_meta.sha.get(side)
+    if not sha or not run:
+        return False
+    members = sss._groups(_calls_cached(atlas, run, sha)).get(f2_key)
+    if not members:
+        return False
+    return fpv == sss._fp_version(members)
+
+
+def diff_id_of(side_meta: sss._Meta) -> str:
+    """The diff_id a side meta carries (named so ``group_in_diff`` reads clearly)."""
+    return side_meta.diff_id
 
 
 def _relation(

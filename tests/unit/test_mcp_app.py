@@ -68,6 +68,7 @@ _EXPECTED_TOOLS = {
     "get_disassembly",
     "annotate",
     "annotate_diff",
+    "annotate_diff_batch",
     "promote",
     "list_overlays",
     "clear_overlay",
@@ -1477,17 +1478,25 @@ def test_a_clean_candidate_carries_no_anchor_key(tmp_path: Path) -> None:
 
 def test_every_tool_says_whether_it_writes(tmp_path: Path) -> None:
     """The overlay writers are marked not-read-only, and ALL of them destructive: annotate /
-    annotate_diff / promote overwrite the prior judgement on an anchor (last write wins, not an
-    additive insert) and clear_overlay deletes. Every other tool is read-only. A client can then
-    ask before any write that a firmware string talked it into.
+    annotate_diff / annotate_diff_batch / promote overwrite the prior judgement on an anchor (last
+    write wins, not an additive insert — annotate_diff_batch on up to 200 at once) and clear_overlay
+    deletes. Every other tool is read-only. A client can then ask before any write that a firmware
+    string talked it into.
 
-    MUTATION: register the tools without annotations, or mark any overlay writer non-destructive ->
-    RED (an overwrite flagged as a purely additive write understates what the call does)."""
+    MUTATION: register the tools without annotations, mark any overlay writer non-destructive, or
+    leave annotate_diff_batch out of WRITE_TOOLS -> RED (an overwrite flagged as a purely additive
+    write, or a 200-wide writer left read-only, understates what the call does)."""
     _mk_analysis(tmp_path)
     server = mcp_app.build_server(_mk_atlas(tmp_path))
     tools = {t.name: t.annotations for t in asyncio.run(server.list_tools())}
     writers = {n for n, a in tools.items() if a is None or a.readOnlyHint is not True}
-    assert writers == {"annotate", "annotate_diff", "promote", "clear_overlay"}
+    assert writers == {
+        "annotate",
+        "annotate_diff",
+        "annotate_diff_batch",
+        "promote",
+        "clear_overlay",
+    }
     for w in writers:
         assert tools[w].destructiveHint is True, w
 

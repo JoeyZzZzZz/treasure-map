@@ -45,7 +45,12 @@ PAIR = "runA::runB"
 DX = "runA::runB::libx"
 DY = "runA::runB::liby"
 SHAS = {DX: ("a" * 64, "b" * 64), DY: ("c" * 64, "d" * 64)}
-NO_BASIS = {"checked": ["the callee list of both sides", "the matched call's target"]}
+
+
+def _nrc(anchor: str, why: str = "same call, renamed wrapper") -> dict[str, Any]:
+    """A valid no_real_change basis: the judged anchor (an entry's own anchor always resolves in
+    the view) plus a plain-text note, and why_unchanged."""
+    return {"checked": [anchor, "the matched call's target"], "why_unchanged": why}
 
 
 def _ref(run: str, func: str, at: str = "0x10") -> str:
@@ -635,7 +640,7 @@ def test_each_vocabulary_is_refused_on_the_other_anchor(world: World) -> None:
     "basis",
     [
         None,
-        {"checked": ["one fact only"], "why_unchanged": "x"},
+        {"checked": [], "why_unchanged": "x"},
         {"checked": ["a", "  "], "why_unchanged": "x"},
         {"checked": ["a", "b"], "why_unchanged": "  "},
     ],
@@ -658,12 +663,17 @@ def test_no_real_change_with_its_basis_is_stored(world: World) -> None:
         DX,
         _pair_anchor(DX, "00001000", "00002000"),
         "no_real_change",
-        verdict_basis={**NO_BASIS, "why_unchanged": "same call, renamed wrapper"},
+        verdict_basis=_nrc(_pair_anchor(DX, "00001000", "00002000")),
     )
     stored = json.loads(world.atlas.execute("SELECT verdict_basis FROM overlay").fetchone()[0])
     assert stored["kind"] == "no_real_change" and len(stored["checked"]) == 2
-    with pytest.raises(ConfigError, match="no_real_change only"):
-        world.judge(DX, _pair_anchor(DX, "00001000", "00002000"), "changed_real", verdict_basis={})
+    with pytest.raises(ConfigError, match="changed_real takes evidence only"):
+        world.judge(
+            DX,
+            _pair_anchor(DX, "00001000", "00002000"),
+            "changed_real",
+            verdict_basis={"checked": ["x"]},
+        )
 
 
 # ── band: moves judged entries only inside the groups the base order forms ────────────────────
@@ -814,7 +824,7 @@ def test_band_off_leaves_the_view_as_it_was(world: World) -> None:
         DX,
         _pair_anchor(DX, "00003000", "00004000"),
         "no_real_change",
-        verdict_basis={**NO_BASIS, "why_unchanged": "x"},
+        verdict_basis=_nrc(_pair_anchor(DX, "00003000", "00004000"), "x"),
     )
     after = world.view()
 
@@ -851,7 +861,7 @@ def test_a_judged_entry_whose_facts_moved_is_due_a_recheck_and_floats(world: Wor
     world.pair(DX, "00003000", "00004000", sim=0.05)
     world.rows[DX] = [a_row("00001000"), a_row("00003000")]
     anchor = _pair_anchor(DX, "00001000", "00002000")
-    world.judge(DX, anchor, "no_real_change", verdict_basis={**NO_BASIS, "why_unchanged": "x"})
+    world.judge(DX, anchor, "no_real_change", verdict_basis=_nrc(anchor, "x"))
     assert world.entry("pair:00001000:00002000")["review_state"] == coverage.CONCLUDED
 
     world.atlas.execute("UPDATE function_alignment SET similarity = 0.3 WHERE addr_a = '00001000'")
@@ -1252,10 +1262,10 @@ def test_the_tools_write_list_and_refuse_with_the_facts(world: World) -> None:
     tools = mcp_app.make_tools(world.path)
     view = tools["get_diff_patch_view"](DX)
     anchor = view["entries"][0]["anchor_ref"]
-    r = tools["annotate_diff"](DX, anchor, "no_real_change", "why", checked=["a", "b"])
+    r = tools["annotate_diff"](DX, anchor, "no_real_change", "why", checked=[anchor])
     assert r["written"] is False and "why_unchanged" in r["error"]
     r = tools["annotate_diff"](
-        DX, anchor, "no_real_change", "why", checked=["a", "b"], why_unchanged="renamed"
+        DX, anchor, "no_real_change", "why", checked=[anchor], why_unchanged="renamed"
     )
     assert r["written"] is True and r["action"] == "inserted"
 
@@ -1273,3 +1283,339 @@ def test_the_tools_write_list_and_refuse_with_the_facts(world: World) -> None:
     judged = tools["list_overlays"](anchor_kind="diff_subject", run_id=PAIR)
     assert judged["count"] == 1 and "review_progress" in judged
     assert tools["clear_overlay"](anchor_kind="diff_subject", anchor_ref=anchor)["cleared"] == 1
+
+
+# ── annotate_diff_batch (T3): all-or-none, checked anchors, rationale, evidence, echo ──────────
+
+
+def _batch_world(world: World, n: int, diff_id: str = DX) -> tuple[Any, list[str]]:
+    """``n`` listed function_pair entries on ``diff_id``, and the tools + each entry's anchor_ref
+    (built directly, so no view pagination hides one)."""
+    for i in range(n):
+        world.pair(diff_id, f"{0x1000 + i:08x}", f"{0x9000 + i:08x}")
+    world.rows[diff_id] = [a_row(f"{0x1000 + i:08x}") for i in range(n)]
+    anchors = [_pair_anchor(diff_id, f"{0x1000 + i:08x}", f"{0x9000 + i:08x}") for i in range(n)]
+    return mcp_app.make_tools(world.path), anchors
+
+
+def _overlay_rows(world: World) -> int:
+    return world.atlas.execute(
+        "SELECT COUNT(*) FROM overlay WHERE anchor_kind = 'diff_subject'"
+    ).fetchone()[0]
+
+
+def test_batch_writes_every_valid_entry_and_echoes_compactly(world: World) -> None:
+    tools, anchors = _batch_world(world, 50)
+    items = [
+        {"anchor_ref": a, "verdict": "changed_real", "rationale": "it does X"} for a in anchors
+    ]
+    out = tools["annotate_diff_batch"](DX, items)
+    assert out["written"] is True and out["count"] == 50
+    assert {r["index"] for r in out["results"]} == set(range(50))
+    assert all(r["action"] == "inserted" for r in out["results"])
+    assert _overlay_rows(world) == 50
+    # each plain result is small (no verdict / id echoed back)
+    assert all(len(json.dumps(r)) <= 160 for r in out["results"])
+    assert len(json.dumps(out)) <= mcp_app._RESPONSE_BYTE_BUDGET
+
+
+def test_batch_all_or_none_one_bad_item_writes_nothing(world: World) -> None:
+    """K6: a single invalid item (a candidate verdict on a diff entry) makes the whole batch a
+    no-op, and the failures are returned once.
+
+    MUTATION (verified RED): write as each item validates (per-item commit) -> the valid ones
+    persist and the batch is no longer all-or-none."""
+    tools, anchors = _batch_world(world, 20)
+    items = [{"anchor_ref": a, "verdict": "changed_real", "rationale": "x"} for a in anchors]
+    items[7] = {
+        "anchor_ref": anchors[7],
+        "verdict": "suspicious",
+        "rationale": "x",
+    }  # candidate verdict
+    out = tools["annotate_diff_batch"](DX, items)
+    assert out["written"] is False and out["count"] == 0
+    assert any(7 in e["indexes"] for e in out["errors"])
+    assert _overlay_rows(world) == 0
+
+
+def test_batch_equals_per_entry_field_for_field(world: World) -> None:
+    """K5: a row written by the batch is identical to one the single annotate_diff writes for the
+    same anchor and inputs — verdict, rationale, attribution, basis_state, verdict_basis."""
+    tools, anchors = _batch_world(world, 1)
+    anchor = anchors[0]
+    cols = "verdict, rationale, attributed_to, basis_state, verdict_basis, promoted_from, run_id"
+
+    def row() -> tuple[Any, ...]:
+        return world.atlas.execute(
+            f"SELECT {cols} FROM overlay WHERE anchor_ref = ?",
+            (anchor,),  # noqa: S608
+        ).fetchone()
+
+    tools["annotate_diff_batch"](
+        DX,
+        [
+            {
+                "anchor_ref": anchor,
+                "verdict": "no_real_change",
+                "why_unchanged": "renamed only",
+                "checked": [anchor, "a note"],
+            }
+        ],
+    )
+    batched = tuple(row())
+    tools["clear_overlay"](anchor_kind="diff_subject", anchor_ref=anchor)
+    tools["annotate_diff"](
+        DX, anchor, "no_real_change", None, checked=[anchor, "a note"], why_unchanged="renamed only"
+    )
+    assert tuple(row()) == batched
+
+
+def test_batch_duplicate_anchor_refuses_the_whole_batch(world: World) -> None:
+    """D-T3-2: the same anchor_ref twice -> integer indexes in one error, nothing written.
+
+    MUTATION (verified RED): let the second write win instead of refusing -> a row is written."""
+    tools, anchors = _batch_world(world, 3)
+    items = [{"anchor_ref": a, "verdict": "changed_real", "rationale": "x"} for a in anchors]
+    items.append({"anchor_ref": anchors[0], "verdict": "changed_real", "rationale": "y"})
+    out = tools["annotate_diff_batch"](DX, items)
+    assert out["written"] is False
+    dup = next(e for e in out["errors"] if sorted(e["indexes"]) == [0, 3])
+    assert anchors[0] in dup["error"]
+    assert _overlay_rows(world) == 0
+
+
+def test_batch_rejects_over_two_hundred(world: World) -> None:
+    tools, anchors = _batch_world(world, 1)
+    item = {"anchor_ref": anchors[0], "verdict": "changed_real", "rationale": "x"}
+    assert tools["annotate_diff_batch"](DX, [item] * 201)["written"] is False
+    assert tools["annotate_diff_batch"](DX, [])["written"] is False
+
+
+def test_batch_checked_needs_a_resolving_anchor_and_names_a_fake_one(world: World) -> None:
+    """M-1: checked needs one anchor that resolves; a plain-text-only checked is refused with
+    the rule, and an item that LOOKS like an anchor but names nothing is refused by position.
+
+    MUTATION (verified RED): count plain text as a hit -> plain-text-only is wrongly accepted;
+    pass a looks-like-but-unresolved anchor as plain text -> the fake one is wrongly accepted."""
+    tools, anchors = _batch_world(world, 2)
+    ok = {
+        "anchor_ref": anchors[0],
+        "verdict": "no_real_change",
+        "why_unchanged": "w",
+        "checked": [anchors[0], "a plain note"],
+    }
+    assert tools["annotate_diff_batch"](DX, [ok])["written"] is True
+    tools["clear_overlay"](anchor_kind="diff_subject", anchor_ref=anchors[0])
+
+    plain = {
+        "anchor_ref": anchors[0],
+        "verdict": "no_real_change",
+        "why_unchanged": "w",
+        "checked": ["just a note", "another note"],
+    }
+    out = tools["annotate_diff_batch"](DX, [plain])
+    assert out["written"] is False
+    assert "at least one anchor" in out["errors"][0]["error"]
+
+    fake = _pair_anchor(DX, "deadbeef", "cafebabe")  # anchor-shaped, not in the view
+    item = {
+        "anchor_ref": anchors[0],
+        "verdict": "no_real_change",
+        "why_unchanged": "w",
+        "checked": [anchors[0], fake],
+    }
+    out = tools["annotate_diff_batch"](DX, [item])
+    assert out["written"] is False
+    assert (
+        "looks like" in out["errors"][0]["error"] and "names nothing" in out["errors"][0]["error"]
+    )
+    assert _overlay_rows(world) == 0
+
+
+def test_batch_rationale_is_optional_for_no_real_change(world: World) -> None:
+    """K2: no_real_change with only why_unchanged writes, and rationale is that why_unchanged;
+    changed_real with no rationale is refused."""
+    tools, anchors = _batch_world(world, 2)
+    out = tools["annotate_diff_batch"](
+        DX,
+        [
+            {
+                "anchor_ref": anchors[0],
+                "verdict": "no_real_change",
+                "why_unchanged": "same call, renamed",
+                "checked": [anchors[0]],
+            }
+        ],
+    )
+    assert out["written"] is True
+    stored = world.atlas.execute(
+        "SELECT rationale FROM overlay WHERE anchor_ref = ?", (anchors[0],)
+    ).fetchone()[0]
+    assert stored == "same call, renamed"
+    out = tools["annotate_diff_batch"](DX, [{"anchor_ref": anchors[1], "verdict": "changed_real"}])
+    assert out["written"] is False and "rationale is required" in out["errors"][0]["error"]
+
+
+def test_batch_changed_real_evidence_is_recorded_and_echoed(world: World) -> None:
+    """changed_real may carry evidence (same anchor rule as checked); P-7: it may carry ONLY
+    evidence, not checked / why_unchanged."""
+    tools, anchors = _batch_world(world, 2)
+    out = tools["annotate_diff_batch"](
+        DX,
+        [
+            {
+                "anchor_ref": anchors[0],
+                "verdict": "changed_real",
+                "rationale": "adds a system call",
+                "evidence": [anchors[0]],
+            }
+        ],
+    )
+    assert out["written"] is True
+    stored = json.loads(
+        world.atlas.execute(
+            "SELECT verdict_basis FROM overlay WHERE anchor_ref = ?", (anchors[0],)
+        ).fetchone()[0]
+    )
+    assert stored == {"kind": "changed_real", "evidence": [anchors[0]]}
+    # K4: evidence does not move basis_state / review_state vs the same verdict without it
+    without = _pair_anchor(DX, f"{0x1000 + 1:08x}", f"{0x9000 + 1:08x}")
+    tools["annotate_diff_batch"](
+        DX, [{"anchor_ref": without, "verdict": "changed_real", "rationale": "adds a system call"}]
+    )
+
+    def basis_and_state(a: str) -> tuple[str, str]:
+        row = overlay.list_overlays(world.atlas, anchor_kind="diff_subject")["overlays"]
+        one = next(o for o in row if o["anchor_ref"] == a)
+        return one["basis_state"], one["review_state"]
+
+    assert basis_and_state(anchors[0]) == basis_and_state(without)
+    bad = tools["annotate_diff_batch"](
+        DX,
+        [
+            {
+                "anchor_ref": anchors[1],
+                "verdict": "changed_real",
+                "rationale": "x",
+                "checked": [anchors[1]],
+            }
+        ],
+    )
+    assert bad["written"] is False and "evidence only" in bad["errors"][0]["error"]
+
+
+def test_batch_unknown_key_and_missing_fields_fail_that_item(world: World) -> None:
+    """q-5 / P-4: an unknown key fails that item (named); a missing anchor_ref / verdict fails it.
+    The framework rejects a non-dict item before the function runs (tested via call_tool elsewhere).
+
+    MUTATION (verified RED): accept unknown keys silently -> the stray-key item is wrongly kept."""
+    tools, anchors = _batch_world(world, 2)
+    items = [
+        {"anchor_ref": anchors[0], "verdict": "changed_real", "rationale": "x", "evidences": ["y"]},
+        {"verdict": "changed_real", "rationale": "x"},
+        {"anchor_ref": anchors[1], "rationale": "x"},
+    ]
+    out = tools["annotate_diff_batch"](DX, items)
+    assert out["written"] is False and _overlay_rows(world) == 0
+    joined = json.dumps(out["errors"])
+    assert (
+        "evidences" in joined
+        and "anchor_ref is required" in joined
+        and "verdict is required" in joined
+    )
+
+
+def test_batch_failures_merge_by_message_within_budget(world: World) -> None:
+    """P-3 + Q-1: 200 same-cause failures come back as one {error, indexes[200]} under budget —
+    both a shared-text cause (plain-text checked) and a per-anchor one (the annotation anchor names
+    nothing), the latter only after its own anchor is placeholdered before merging.
+
+    MUTATION (verified RED): echo one error per item with its anchor_ref -> over budget; or do not
+    placeholder the item's own anchor before merging -> the names-nothing case stays 200 apart."""
+    tools, anchors = _batch_world(world, 200)
+    plain = [
+        {
+            "anchor_ref": a,
+            "verdict": "no_real_change",
+            "why_unchanged": "w",
+            "checked": ["a note", "b note"],
+        }
+        for a in anchors
+    ]
+    out = tools["annotate_diff_batch"](DX, plain)
+    assert (
+        out["written"] is False
+        and len(out["errors"]) == 1
+        and len(out["errors"][0]["indexes"]) == 200
+    )
+    assert len(json.dumps(out)) <= mcp_app._RESPONSE_BYTE_BUDGET
+
+    # W3: the annotation's own anchor names nothing in the view (each error embeds that anchor)
+    missing = [
+        {
+            "anchor_ref": _pair_anchor(DX, f"{0xBEEF0 + i:08x}", f"{0xCAFE0 + i:08x}"),
+            "verdict": "changed_real",
+            "rationale": "x",
+        }
+        for i in range(200)
+    ]
+    out = tools["annotate_diff_batch"](DX, missing)
+    assert (
+        out["written"] is False
+        and len(out["errors"]) == 1
+        and len(out["errors"][0]["indexes"]) == 200
+    )
+    assert len(json.dumps(out)) <= mcp_app._RESPONSE_BYTE_BUDGET
+
+
+def test_checked_rule_is_one_shared_constant(world: World) -> None:
+    """P-2 / q-3: the view's per-page hint, the write-time refusal, and the MCP docstring all carry
+    the one CHECKED_RULE — no copy that could drift to the old "two or more" wording.
+
+    MUTATION (verified RED): leave the annotation block's no_real_change_needs written as the old
+    literal -> the ``endswith`` / no-"two or more" assertion fails."""
+    tools, anchors = _batch_world(world, 1)
+    block = world.view()["annotation"]["no_real_change_needs"]
+    assert block.endswith(dr.CHECKED_RULE)
+    assert "two or more" not in block
+    assert "at least one anchor" in block
+
+    built = dann._built(world.atlas, DX)
+    meta = dann._binary_diff(world.atlas, DX)
+    from treasure_map.lib.query.same_shape_siblings import _meta as _side_meta
+
+    with pytest.raises(ConfigError) as exc:
+        dann.require_checked_anchor(
+            world.atlas, built, meta, _side_meta(world.atlas, DX), ["just a plain note"], "checked"
+        )
+    assert str(exc.value) == dr.CHECKED_RULE  # the same constant, not a paraphrase
+
+    doc = " ".join(mcp_app.make_tools(world.path)["annotate_diff"].__doc__.split())
+    assert " ".join(dr.CHECKED_RULE.split()) in doc  # copied verbatim into the docstring (q-3)
+
+
+def test_batch_rejects_a_non_object_item_without_writing(world: World) -> None:
+    """P-4: a non-object annotation item is rejected by the framework before the tool runs, so the
+    all-or-none guarantee holds — nothing is written, and the tool body never executes."""
+    import asyncio
+
+    tools, anchors = _batch_world(world, 1)
+    server = mcp_app.build_server(world.path)
+    ok = {"anchor_ref": anchors[0], "verdict": "changed_real", "rationale": "x"}
+
+    async def _call() -> Any:
+        return await server.call_tool(
+            "annotate_diff_batch", {"diff_id": DX, "annotations": [ok, 5]}
+        )
+
+    with pytest.raises(Exception):  # noqa: B017 -- FastMCP raises ToolError on a bad item type
+        asyncio.run(_call())
+    assert _overlay_rows(world) == 0
+
+    # a JSON string of valid objects is parsed by the framework and written
+    import json as _json
+
+    res = asyncio.run(
+        server.call_tool("annotate_diff_batch", {"diff_id": DX, "annotations": _json.dumps([ok])})
+    )
+    assert _overlay_rows(world) == 1, res

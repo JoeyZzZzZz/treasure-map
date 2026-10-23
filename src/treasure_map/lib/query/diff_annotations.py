@@ -20,6 +20,7 @@ Nothing here writes.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from dataclasses import replace
 from typing import Any
@@ -118,6 +119,19 @@ def capture_diff_basis(atlas: sqlite3.Connection, diff_id: str, anchor_ref: str)
     meta = _binary_diff(atlas, diff_id)
     _check_anchor(anchor_ref, meta)
     built = _built(atlas, diff_id)
+    return capture_diff_basis_on(atlas, built, meta, diff_id, anchor_ref)
+
+
+def capture_diff_basis_on(
+    atlas: sqlite3.Connection,
+    built: BuiltDiff,
+    meta: dict[str, Any],
+    diff_id: str,
+    anchor_ref: str,
+) -> dict[str, Any]:
+    """``capture_diff_basis`` against an already-built view and ``_binary_diff`` meta — the batch
+    builds both once and reuses them. Same anchor check, same refusal, same snapshot."""
+    _check_anchor(anchor_ref, meta)
     subjects = dr.subjects_of(built.entries, meta["run_a_id"], meta["run_b_id"], meta["binary_a"])
     subject = subjects.get(anchor_ref)
     if subject is None:
@@ -127,6 +141,121 @@ def capture_diff_basis(atlas: sqlite3.Connection, diff_id: str, anchor_ref: str)
             "is matched exactly as the view prints it)"
         )
     return dr.snapshot(diff_id, subject)
+
+
+# ── a no_real_change's `checked` / a changed_real's `evidence`: anchors must resolve ─────────
+#
+# `checked` reasons for a verdict that SINKS an entry, so (M-1) an item that looks like an anchor
+# must actually resolve in this diff's current view; one that does not is refused and named. Items
+# that are not anchor-shaped are kept as plain-text notes and do not count. At least one anchor must
+# resolve. `is_diff_anchor` reuses the view's own parsers; `_anchor_marker` is the closed set of
+# "looks like an anchor" forms (a plain English note never matches one).
+
+# Any run pair's function_pair / function_presence / candidate anchor (n-2: a wrong-run anchor
+# still LOOKS like one, so it must resolve, not pass as plain text).
+_PAIR_ANCHOR_MARKER = re.compile(
+    r"^[^\s#]+::[^\s#]+#(?:function_pair|function_presence|candidate)#"
+)
+_ENTRY_ID_MARKER = re.compile(r"^(?:pair:[0-9a-fx]+:[0-9a-fx]+|[ab]:[0-9a-fx]+)$")
+# An evidence_ref / row_ref: run + a >=8-hex sha prefix + ':' (a function-level short form too).
+_EVIDENCE_REF_MARKER = re.compile(r"^[^#\s]+#[0-9a-f]{8,}:")
+
+
+def _anchor_marker(item: str) -> str | None:
+    """The kind of anchor ``item`` LOOKS like (a closed set), or None for a plain-text note."""
+    if _PAIR_ANCHOR_MARKER.match(item):
+        return "anchor_ref"
+    if _ENTRY_ID_MARKER.match(item):
+        return "entry_id"
+    if "#f2:" in item:
+        return "group_ref"
+    if _EVIDENCE_REF_MARKER.match(item):
+        return "row_ref"
+    return None
+
+
+def is_diff_anchor(
+    atlas: sqlite3.Connection,
+    built: BuiltDiff,
+    meta: dict[str, Any],
+    side_meta: Any,
+    item: str,
+    *,
+    subjects: dict[str, dr.Subject] | None = None,
+    entry_ids: set[str] | None = None,
+    row_refs: set[str] | None = None,
+) -> str | None:
+    """The kind of anchor ``item`` RESOLVES to in this diff's current view, or None. Each branch
+    reuses the view's own parser: an entry / candidate anchor (``split_anchor`` + a live subject),
+    an ``entry_id``, a ``row_ref`` (a row's a_ref / b_ref), or a ``group_ref`` naming a current
+    group (``group_in_diff`` — up to, not including, the "about this entry" relation: a read group
+    counts as read whoever's entry it is). The precomputed lookups let a batch build them once."""
+    from treasure_map.lib.query.diff_group_freshness import group_in_diff
+
+    run_a, run_b, binary = meta["run_a_id"], meta["run_b_id"], meta["binary_a"]
+    if subjects is None:
+        subjects = dr.subjects_of(built.entries, run_a, run_b, binary)
+    if entry_ids is None:
+        entry_ids = {e.entry_id for e in built.entries}
+    if row_refs is None:
+        row_refs = {ref for e in built.entries for r in e.rows for ref in (r.a_ref, r.b_ref) if ref}
+    parts = dr.split_anchor(item, run_a, run_b)
+    if parts is not None and subjects.get(item) is not None:
+        return parts[0]  # function_pair / function_presence / candidate
+    if item in entry_ids:
+        return "entry_id"
+    if item in row_refs:
+        return "row_ref"
+    if group_in_diff(atlas, built, side_meta, item):
+        return "group_ref"
+    return None
+
+
+def _rule_for(field: str) -> str:
+    """``CHECKED_RULE`` worded for the field being checked (``checked`` or ``evidence``)."""
+    return dr.CHECKED_RULE if field == "checked" else dr.CHECKED_RULE.replace("checked", field, 1)
+
+
+def require_checked_anchor(
+    atlas: sqlite3.Connection,
+    built: BuiltDiff,
+    meta: dict[str, Any],
+    side_meta: Any,
+    items: list[str],
+    field: str,
+) -> None:
+    """Enforce the ``checked`` / ``evidence`` anchor rule (M-1): every item that LOOKS like an
+    anchor must resolve in the view (else a named refusal), plain text is kept but does not count,
+    and at least one anchor must resolve. ``field`` is the key name, for the message wording."""
+    run_a, run_b, binary = meta["run_a_id"], meta["run_b_id"], meta["binary_a"]
+    subjects = dr.subjects_of(built.entries, run_a, run_b, binary)
+    entry_ids = {e.entry_id for e in built.entries}
+    row_refs = {ref for e in built.entries for r in e.rows for ref in (r.a_ref, r.b_ref) if ref}
+    hits = 0
+    for i, raw in enumerate(items):
+        item = raw.strip()
+        kind = is_diff_anchor(
+            atlas,
+            built,
+            meta,
+            side_meta,
+            item,
+            subjects=subjects,
+            entry_ids=entry_ids,
+            row_refs=row_refs,
+        )
+        if kind is not None:
+            hits += 1
+            continue
+        marker = _anchor_marker(item)
+        if marker is not None:
+            raise ConfigError(
+                f"{field}[{i}] looks like a {marker} anchor but names nothing in this diff's "
+                "current view"
+            )
+        # a plain-text note: kept, but it does not count toward the anchor threshold
+    if hits == 0:
+        raise ConfigError(_rule_for(field))
 
 
 # ── promotion ──────────────────────────────────────────────────────────────────────────────

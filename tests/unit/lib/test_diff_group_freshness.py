@@ -767,3 +767,94 @@ def test_the_call_cache_is_dropped_when_the_runs_instances_change(world: World) 
     world.commit()
     again = gf._calls_cached(world.atlas, "runA", "a" * 64)  # no manual clear: the stamp moved
     assert len(again) == len(first) + 1
+
+
+# ── annotate_diff_batch with a group_ref (T3 M-2): echo once, build the view once ─────────────
+
+
+def test_batch_echoes_a_leaned_on_group_once_and_carries_the_ref(world: World) -> None:
+    """An entry judged in a batch that leaned on a group carries only the group_ref string in its
+    result; the group itself is echoed once under the top-level ``groups`` block.
+
+    MUTATION (verified RED): inline the whole group echo on each result instead of a top-level
+    deduped block -> the result row is no longer compact."""
+    tools = mcp_app.make_tools(world.path)
+    anchor = _entry_anchor(world, "00001000")
+    gref = _group_ref(world, LISTED)
+    out = tools["annotate_diff_batch"](
+        DIFF,
+        [
+            {
+                "anchor_ref": anchor,
+                "verdict": "changed_real",
+                "rationale": "the shape held",
+                "group_ref": gref,
+            }
+        ],
+    )
+    assert out["written"] is True
+    res = out["results"][0]
+    assert res["group_ref"] == gref and "group" not in res  # ref only on the row
+    assert gref in out["groups"]
+    echoed = out["groups"][gref]
+    assert echoed["group_ref"] == gref and echoed["relation"] == "own_call"
+    assert echoed["member_count"] == len(GROUP_A)
+
+
+def test_batch_builds_the_diff_view_once(world: World, monkeypatch: pytest.MonkeyPatch) -> None:
+    """M-2: a whole batch builds the diff view once — a group-leaning item reuses the batch's built
+    view, it does not rebuild it.
+
+    MUTATION (verified RED): have the group path rebuild the view per item (annotate_group instead
+    of annotate_group_on) -> build_diff_view runs more than once."""
+    pv._clear_view_caches()
+    calls = {"n": 0}
+    real = pv.build_diff_view
+
+    def counting(atlas: Any, diff_id: str, *a: Any, **k: Any) -> Any:
+        calls["n"] += 1
+        return real(atlas, diff_id, *a, **k)
+
+    monkeypatch.setattr(pv, "build_diff_view", counting)
+    monkeypatch.setattr(gf, "build_diff_view", counting)
+    monkeypatch.setattr(da, "build_diff_view", counting)
+    tools = mcp_app.make_tools(world.path)
+    a1 = _entry_anchor(world, "00001000")
+    a2 = _entry_anchor(world, "00009000")
+    gref = _group_ref(world, LISTED)  # computed before counting matters (own build)
+    calls["n"] = 0
+    out = tools["annotate_diff_batch"](
+        DIFF,
+        [
+            {"anchor_ref": a1, "verdict": "changed_real", "rationale": "x", "group_ref": gref},
+            {"anchor_ref": a2, "verdict": "changed_real", "rationale": "y"},
+        ],
+    )
+    assert out["written"] is True
+    assert calls["n"] == 1, calls["n"]
+
+
+def test_a_group_ref_counts_as_a_checked_anchor_even_for_another_entry(world: World) -> None:
+    """A group_ref used in ``checked`` proves a group was READ; it need not be about the judged
+    entry (is_diff_anchor stops before the "about this entry" relation).
+
+    MUTATION (verified RED): include the _relation check in group_in_diff -> a group_ref read for
+    one entry no longer counts as checked on another, and the write is refused."""
+    from treasure_map.lib.query import diff_review as drv
+
+    tools = mcp_app.make_tools(world.path)
+    gref = _group_ref(world, LISTED)  # a current group about 00001000 (own_call)
+    other = _entry_anchor(world, "00009000")  # a different entry the group is NOT about
+    out = tools["annotate_diff_batch"](
+        DIFF,
+        [
+            {
+                "anchor_ref": other,
+                "verdict": "no_real_change",
+                "why_unchanged": "w",
+                "checked": [gref],
+            }
+        ],
+    )
+    assert out["written"] is True, out
+    assert drv is not None

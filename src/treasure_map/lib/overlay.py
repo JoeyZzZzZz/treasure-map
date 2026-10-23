@@ -223,14 +223,22 @@ def _validate_verdict_basis(verdict: str, vb: dict[str, Any] | None) -> str | No
 
 
 def _validate_diff_verdict_basis(verdict: str, vb: dict[str, Any] | None) -> str | None:
-    """The diff side's counterpart of ``_validate_verdict_basis``, and the same kind of check.
+    """The diff side's counterpart of ``_validate_verdict_basis`` — SHAPE only.
 
-    ``no_real_change`` REQUIRES ``checked`` (two or more facts or anchors that were read) and
-    ``why_unchanged``, wherever the entry sits. It is the verdict that sinks an entry, and like
-    ``safe`` a wrong one only comes back when the diff's facts move — so it has to say what was
-    looked at and why that shows nothing real changed. The other two carry no basis.
+    ``no_real_change`` REQUIRES ``checked`` (a non-empty list of non-blank items — the facts or
+    anchors read) and ``why_unchanged``. It is the verdict that sinks an entry, and like ``safe`` a
+    wrong one only comes back when the diff's facts move, so it has to say what was looked at and
+    why nothing real changed. ``changed_real`` MAY carry ``evidence`` (a non-empty list of non-blank
+    items it rests on) and nothing else; the other verdicts carry no basis.
 
-    ★ Same honest limit as above: non-blank checks, which filler passes."""
+    ★ Shape only. The anchor threshold — that an item which looks like an anchor actually resolves
+    in the diff's current view, and that at least one does — is enforced separately against the
+    built view (diff_annotations.require_checked_anchor); it cannot be checked here. An anchor only
+    proves the object exists in the current view, never that it was read; and the entry's own anchor
+    always resolves, so these are a ranking aid, never a proof the judgement is right."""
+    vb = vb or None
+    if vb is not None and "evidence" in vb and verdict != "changed_real":
+        raise ConfigError("evidence applies to changed_real only")
     if verdict == "no_real_change":
         if not vb:
             raise ConfigError(
@@ -240,11 +248,11 @@ def _validate_diff_verdict_basis(verdict: str, vb: dict[str, Any] | None) -> str
         checked = vb.get("checked")
         if not (
             isinstance(checked, list)
-            and len(checked) >= 2
+            and checked
             and all(isinstance(c, str) and c.strip() for c in checked)
         ):
             raise ConfigError(
-                "no_real_change.checked needs at least 2 non-blank items — the facts or anchors "
+                "no_real_change.checked needs at least one non-blank item — the facts or anchors "
                 "that were read to reach it"
             )
         why = vb.get("why_unchanged")
@@ -257,8 +265,32 @@ def _validate_diff_verdict_basis(verdict: str, vb: dict[str, Any] | None) -> str
                 "why_unchanged": why.strip(),
             }
         )
+    if verdict == "changed_real":
+        if vb is None:
+            return None
+        extra = set(vb) - {"evidence"}
+        if extra:
+            raise ConfigError(
+                "changed_real takes evidence only, not checked / why_unchanged — record what the "
+                "change does in rationale"
+            )
+        evidence = vb.get("evidence")
+        if evidence is None:
+            return None
+        if not (
+            isinstance(evidence, list)
+            and evidence
+            and all(isinstance(e, str) and e.strip() for e in evidence)
+        ):
+            raise ConfigError(
+                "changed_real.evidence needs at least one non-blank item — the facts or anchors it "
+                "rests on"
+            )
+        return json.dumps({"kind": "changed_real", "evidence": [e.strip() for e in evidence]})
     if vb is not None:
-        raise ConfigError(f"verdict_basis applies to no_real_change only, not {verdict!r}")
+        raise ConfigError(
+            f"verdict_basis applies to no_real_change or changed_real only, not {verdict!r}"
+        )
     return None
 
 
@@ -516,6 +548,93 @@ def upsert_overlay(
     return result
 
 
+@dataclass(frozen=True)
+class PreparedDiffWrite:
+    """One diff annotation validated and snapshotted but NOT yet written — the output of the
+    prepare step, the input of the write step. Splitting the two is what lets a batch validate every
+    entry before it writes any (all of them or none)."""
+
+    anchor_ref: str
+    verdict: str
+    rationale: str
+    attributed_to: str | None
+    basis_state: str
+    verdict_basis: str | None
+
+
+def prepare_diff_annotation(
+    atlas: sqlite3.Connection,
+    built: Any,
+    meta: dict[str, Any],
+    side_meta: Any,
+    *,
+    diff_id: str,
+    anchor_ref: str,
+    verdict: str,
+    rationale: str,
+    attributed_to: str | None,
+    verdict_basis: dict[str, Any] | None,
+    group_ref: str | None,
+) -> PreparedDiffWrite:
+    """Validate and snapshot one diff annotation against an already-built view — READ ONLY, no
+    write, no commit. ``built`` / ``meta`` are the diff_annotations ``_built`` / ``_binary_diff``;
+    ``side_meta`` is same_shape_siblings ``_meta`` (needed for a group_ref). Raises ConfigError on
+    any problem. Shared by the single ``annotate_diff`` and the batch, so both validate alike."""
+    if verdict not in _DIFF_VERDICTS:
+        if verdict in _VERDICTS:
+            raise ConfigError(
+                f"verdict must be one of {list(_DIFF_VERDICTS)} on a diff entry; {verdict!r} is a "
+                "candidate verdict — annotate the candidate, or carry this entry's judgement to "
+                "one of its candidates with promote"
+            )
+        raise ConfigError(f"verdict must be one of {list(_DIFF_VERDICTS)}; got {verdict!r}")
+    basis_json = _validate_diff_verdict_basis(verdict, verdict_basis)
+    _check_text_and_attribution(rationale, attributed_to)
+    # Imported here, not at the top: the query package imports this module on its own import, so a
+    # top-level import from it would run before this module had finished loading.
+    from treasure_map.lib.query.diff_annotations import (
+        capture_diff_basis_on,
+        require_checked_anchor,
+    )
+
+    snapshot = capture_diff_basis_on(atlas, built, meta, diff_id, anchor_ref)
+    if group_ref is not None:
+        from treasure_map.lib.query.diff_group_freshness import annotate_group_on
+
+        snapshot["group"] = annotate_group_on(
+            atlas, built, side_meta, diff_id, anchor_ref, group_ref
+        )
+    if verdict == "no_real_change" and verdict_basis is not None:
+        require_checked_anchor(atlas, built, meta, side_meta, verdict_basis["checked"], "checked")
+    elif verdict == "changed_real" and verdict_basis is not None and "evidence" in verdict_basis:
+        require_checked_anchor(atlas, built, meta, side_meta, verdict_basis["evidence"], "evidence")
+    return PreparedDiffWrite(
+        anchor_ref=anchor_ref,
+        verdict=verdict,
+        rationale=rationale,
+        attributed_to=attributed_to,
+        basis_state=json.dumps(snapshot, sort_keys=True),
+        verdict_basis=basis_json,
+    )
+
+
+def write_prepared(atlas: sqlite3.Connection, p: PreparedDiffWrite) -> UpsertResult:
+    """Write one prepared diff annotation (upsert, no commit). ``promoted_from`` is NULL and
+    ``basis_resolved`` True, as a diff write always is."""
+    return _write_row(
+        atlas,
+        anchor_kind="diff_subject",
+        anchor_ref=p.anchor_ref,
+        verdict=p.verdict,
+        rationale=p.rationale,
+        attributed_to=p.attributed_to,
+        basis_state=p.basis_state,
+        verdict_basis=p.verdict_basis,
+        promoted_from=None,
+        basis_resolved=True,
+    )
+
+
 def annotate_diff(
     atlas: sqlite3.Connection,
     *,
@@ -537,8 +656,11 @@ def annotate_diff(
     candidate rows), and with nothing to snapshot there would be nothing to re-check later.
 
     Diff verdicts only (``_DIFF_VERDICTS``); ``no_real_change`` owes a basis (see
-    ``_validate_diff_verdict_basis``). The degraded-anchor refusal of a candidate write does not
-    apply: it reads a candidate's flow evidence, which a diff entry does not have.
+    ``_validate_diff_verdict_basis``), and its ``checked`` must name at least one anchor that
+    resolves in the view now (an item that looks like an anchor but names nothing is refused).
+    ``changed_real`` may carry ``evidence``, held to the same anchor rule. The degraded-anchor
+    refusal of a candidate write does not apply: it reads a candidate's flow evidence, which a diff
+    entry does not have.
 
     ``group_ref`` (from a same_shape_siblings result) declares that this judgement also leaned on a
     same-shape group — "the other calls of this shape did not change". The group it names must be
@@ -546,37 +668,26 @@ def annotate_diff(
     A snapshot of the group is stored beside the facts, and get_diff_patch_view re-checks it: a
     member moving, joining or leaving puts the judgement back in needs_recheck. Overwriting the
     judgement without ``group_ref`` again drops the group — pass it each time to keep it."""
-    if verdict not in _DIFF_VERDICTS:
-        if verdict in _VERDICTS:
-            raise ConfigError(
-                f"verdict must be one of {list(_DIFF_VERDICTS)} on a diff entry; {verdict!r} is a "
-                "candidate verdict — annotate the candidate, or carry this entry's judgement to "
-                "one of its candidates with promote"
-            )
-        raise ConfigError(f"verdict must be one of {list(_DIFF_VERDICTS)}; got {verdict!r}")
-    basis_json = _validate_diff_verdict_basis(verdict, verdict_basis)
-    _check_text_and_attribution(rationale, attributed_to)
-    # Imported here, not at the top: the query package imports this module on its own import, so a
-    # top-level import from it would run before this module had finished loading.
-    from treasure_map.lib.query.diff_annotations import capture_diff_basis
+    from treasure_map.lib.query.diff_annotations import _binary_diff, _built
+    from treasure_map.lib.query.same_shape_siblings import _meta as _side_meta
 
-    snapshot = capture_diff_basis(atlas, diff_id, anchor_ref)
-    if group_ref is not None:
-        from treasure_map.lib.query.diff_group_freshness import annotate_group
-
-        snapshot["group"] = annotate_group(atlas, diff_id, anchor_ref, group_ref)
-    result = _write_row(
+    meta = _binary_diff(atlas, diff_id)
+    built = _built(atlas, diff_id)
+    side_meta = _side_meta(atlas, diff_id)
+    prepared = prepare_diff_annotation(
         atlas,
-        anchor_kind="diff_subject",
+        built,
+        meta,
+        side_meta,
+        diff_id=diff_id,
         anchor_ref=anchor_ref,
         verdict=verdict,
         rationale=rationale,
         attributed_to=attributed_to,
-        basis_state=json.dumps(snapshot, sort_keys=True),
-        verdict_basis=basis_json,
-        promoted_from=None,
-        basis_resolved=True,
+        verdict_basis=verdict_basis,
+        group_ref=group_ref,
     )
+    result = write_prepared(atlas, prepared)
     if commit:
         atlas.commit()
     return result
