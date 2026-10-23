@@ -5802,6 +5802,7 @@ _S_REDUCED_OR_DERIVED = {
     "demoted",
     "anchored_micro_side",
     "proposed_pair_summary",
+    "entry_words",
 }
 _S_ENTRY_KEYS = set(_S_COPY) | _S_REDUCED_OR_DERIVED
 # Never in a summary entry, at any depth: the rows, the bodies, the guards and their listing.
@@ -5834,6 +5835,11 @@ _S_NEVER = {
     "named_callees_differ",
     "only_in_a",
     "only_in_b",
+    "words",
+    "words_shown",
+    "count_in_executable",
+    "count_inside_string",
+    "record_ascii_runs",
 }
 
 
@@ -5895,6 +5901,14 @@ def _s_bodies(b: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _s_entry_words(block: dict[str, Any]) -> dict[str, Any]:
+    side_keys = ("state", "reason", "count", "count_by_class", "may_be_incomplete")
+    return {
+        k: v if k == "delta" else {kk: v[kk] for kk in side_keys if kk in v}
+        for k, v in block.items()
+    }
+
+
 def _s_proposed(pr: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {"state": pr["state"]}
     if pr.get("text_unverified_reasons"):
@@ -5943,6 +5957,7 @@ def _rules_summary(full: dict[str, Any], micro: bool) -> dict[str, Any]:
         ("hidden_region", _s_hidden, "hidden_region"),
         ("bodies", _s_bodies, "bodies"),
         ("pseudocode_delta", _s_delta, "delta_summary"),
+        ("entry_words", _s_entry_words, "entry_words"),
     ):
         if key in full:
             out[name] = fn(full[key])

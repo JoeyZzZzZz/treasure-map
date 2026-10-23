@@ -3066,7 +3066,8 @@ def _not_listed_counts(built: BuiltDiff, readings: _Readings) -> dict[str, dict[
 # ── entry_words: each side's data words holding the entry value (a read-face reading) ─────────
 #
 # Never built into build_diff_view, never in an entry's facts, its bucket, its order or its review
-# state: it rides the rendered copy of a full page only (lib/query/entry_words).
+# state: it rides the rendered copy of a sink_patch page only (lib/query/entry_words); a summary
+# page carries it as counts (_summary_entry_words).
 
 # One side's image (blocks, entries, labels, strings) with its word index, per (the run's stamps,
 # the binary's content hash): read once, reused by every page of every diff of that binary.
@@ -3438,6 +3439,24 @@ def _proposed_summary(reading: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+# What a summary keeps of each entry_words side: its state and counts, never the words. count is
+# every class together while delta compares the comparable classes only, so count_by_class stays.
+_SUMMARY_WORDS_SIDE = ("state", "reason", "count", "count_by_class", "may_be_incomplete")
+
+
+def _summary_entry_words(block: dict[str, Any]) -> dict[str, Any]:
+    """An entry's entry_words as a summary prints it: the delta (a pair only) and each rendered
+    side's state, reason, count, count_by_class and may_be_incomplete, with no word listed."""
+    return {
+        key: (
+            _copy(value)
+            if key == "delta"
+            else {k: _copy(value[k]) for k in _SUMMARY_WORDS_SIDE if k in value}
+        )
+        for key, value in block.items()
+    }
+
+
 def _summary_entry(full: dict[str, Any], *, micro_side: bool) -> dict[str, Any]:
     """One listed entry as ``detail='summary'`` prints it, projected from ``full`` (what _render
     printed with no inline row), field by field in its order. ``micro_side``: the entry is an
@@ -3480,6 +3499,8 @@ def _summary_entry(full: dict[str, Any], *, micro_side: bool) -> dict[str, Any]:
             out[key] = _summary_hidden(value)
         elif key == "bodies":
             out[key] = _summary_bodies(value)
+        elif key == "entry_words":
+            out[key] = _summary_entry_words(value)
         elif key == "pseudocode_delta":
             out["delta_summary"] = _summary_delta(value)
         elif key == "proposed_pair_reading":
@@ -4092,11 +4113,9 @@ def get_diff_patch_view(
     )
     review = ViewReview(atlas, built)
     unknown_filter = _unknown_filter_value(entries, subclass, blind_spot)
-    # entry_words: a full sink_patch page only (the listed entries' blocks and the whole diff's
-    # counts); a summary page and the other views carry neither.
-    words_view = (
-        _entry_words_view(atlas, built) if view == "sink_patch" and detail == "full" else None
-    )
+    # entry_words: a sink_patch page only (the listed entries' blocks, reduced to counts on a
+    # summary page, and the whole diff's counts on every page); the other views carry neither.
+    words_view = _entry_words_view(atlas, built) if view == "sink_patch" else None
     envelope: dict[str, Any] = {
         "diff_id": diff_id,
         "lens": {

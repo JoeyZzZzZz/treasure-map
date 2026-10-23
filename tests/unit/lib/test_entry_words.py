@@ -892,7 +892,8 @@ def _set_arch(w: DiffWorld, arch: str | None) -> None:
 def test_diff_entry_words_change_nothing_else(tmp_path: Path, current: None) -> None:
     """Rendering entry_words moves no bucket, order, total or other field: with the side images
     unreadable (nothing rendered) and readable, every sort order gives the same entries but for the
-    entry_words key; a summary page carries none of it. A judgement written while nothing was
+    entry_words key, and its summary page the same entries, with the same envelope counts. A
+    judgement written while nothing was
     rendered stays concluded once entry_words is: it is not part of what a judgement rests on.
 
     MUTATION (verified RED): put the entry's entry_words into its judgement facts
@@ -917,8 +918,10 @@ def test_diff_entry_words_change_nothing_else(tmp_path: Path, current: None) -> 
         _set_arch(w, "MIPS:LE:32:default")
         with_words = w.view(**kw)
         summary = w.view(detail="summary", **kw)
-        assert "entry_words_counts" not in summary
-        assert not any("entry_words" in e for e in summary["entries"])
+        assert summary.get("entry_words_counts") == with_words["entry_words_counts"]
+        assert [e["entry_id"] for e in summary["entries"]] == [
+            e["entry_id"] for e in with_words["entries"]
+        ]
         assert any("entry_words" in e for e in with_words["entries"])
         assert [e["entry_id"] for e in with_words["entries"]] == [
             e["entry_id"] for e in without["entries"]
@@ -929,6 +932,70 @@ def test_diff_entry_words_change_nothing_else(tmp_path: Path, current: None) -> 
             assert {k: v for k, v in a.items() if k != "entry_words"} == b
     judged = _by_addr(w.view(), fn)["shape"]
     assert "entry_words" in judged and judged["review_state"] == "concluded"
+
+
+def test_a_summary_page_carries_entry_words_as_counts(tmp_path: Path, current: None) -> None:
+    """A summary entry carries entry_words wherever its full entry does, reduced to the delta and
+    each side's state / reason / count / count_by_class / may_be_incomplete with no word listed
+    (the field rules of test_patch_view, the whole entry compared); a function with no counterpart
+    keeps its one side; the envelope's entry_words_counts is the full page's, on the summary too.
+
+    MUTATIONS (verified RED): words only on a full page again -> no summary block or counts;
+    copy the whole block -> words reach the summary; leave count_by_class out -> the meta pair's
+    linkage words are lost; leave may_be_incomplete or reason out -> the truncated side loses it;
+    leave delta out -> RED; drop the counts from a summary envelope -> RED."""
+    from tests.unit.lib.test_patch_view import _S_ENTRY_KEYS, _S_NEVER, _deep_keys, _rules_summary
+
+    w, fn = _diff_world(tmp_path)
+    ponly = w.side["a"].fn(0x470000, "ponly")
+    w.side["a"].block(".data.ponly", 0x60000, w.side["a"].w(ponly))
+    w.atlas.execute(
+        "INSERT INTO function_presence (diff_id, side, addr, presence_state) "
+        "VALUES (?, 'a', ?, 'absent')",
+        (DIFF, f"{ponly:08x}"),
+    )
+
+    def check() -> dict[str, dict[str, Any]]:
+        full = w.view(rows_limit=0)
+        summary = w.view(detail="summary")
+        assert summary.get("entry_words_counts") == full["entry_words_counts"]
+        assert full["entry_words_counts"]["listed"]
+        f_by = {e["entry_id"]: e for e in full["entries"]}
+        s_by = {e["entry_id"]: e for e in summary["entries"]}
+        assert list(s_by) == list(f_by)
+        for eid, s in s_by.items():
+            assert s == _rules_summary(f_by[eid], False), eid
+            assert set(s) <= _S_ENTRY_KEYS and not _deep_keys(s) & _S_NEVER, eid
+            assert ("entry_words" in s) == ("entry_words" in f_by[eid]), eid
+        assert sum("entry_words" in s for s in s_by.values()) >= 8
+        return s_by
+
+    s_by = check()
+    by = {
+        k: s_by[f"pair:{a:08x}:{a:08x}"] for k, a in fn.items() if f"pair:{a:08x}:{a:08x}" in s_by
+    }
+    assert by["shape"]["entry_words"] == {
+        "delta": "run_shape_differs",
+        "a": {"state": "found", "count": 1, "count_by_class": {"data": 1}},
+        "b": {"state": "found", "count": 1, "count_by_class": {"data": 1}},
+    }
+    meta = by["meta"]["entry_words"]
+    assert meta["delta"] == "same_shape"
+    assert meta["b"]["count_by_class"] == {"data": 1, "linkage": 3, "symbol_table": 3}
+    p_entry = s_by[f"a:{ponly:08x}"]
+    assert p_entry["bucket"] == "P"
+    assert p_entry["entry_words"] == {
+        "a": {"state": "found", "count": 1, "count_by_class": {"data": 1}}
+    }
+
+    w.side["b"].block(".bss_like", 0x90000, b"\0" * 8, size=0x100, truncated=1)
+    pv._clear_view_caches()
+    s_by = check()
+    gotb = s_by[f"pair:{fn['gotb']:08x}:{fn['gotb']:08x}"]["entry_words"]
+    assert gotb["delta"] == "undetermined"
+    assert gotb["b"].get("may_be_incomplete") is True
+    a_only = s_by[f"pair:{fn['a_only']:08x}:{fn['a_only']:08x}"]["entry_words"]
+    assert a_only["b"].get("reason") == "data_blocks_truncated"
 
 
 def test_entry_words_labels_say_nothing_of_what_a_change_means(
