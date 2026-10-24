@@ -358,7 +358,8 @@ _LEGEND = {
         "per side: the aligned data words whose value is the function's entry address (ARM: also "
         "entry|1), by block_class; delta and next are over the comparable classes (data / unnamed "
         "/ init_fini) with words that fall inside a stored string excluded; linkage, symbol "
-        "tables and unwind info are counted per side, not compared. Left out = both sides read in "
+        "tables and unwind info are counted per side, not compared; a side read from a truncated "
+        "image never reads same_shape. Left out = both sides read in "
         "full with no comparable word (a function with no counterpart: its one side). A side "
         "that could not be read at all is named once, in entry_words_counts.unavailable"
     ),

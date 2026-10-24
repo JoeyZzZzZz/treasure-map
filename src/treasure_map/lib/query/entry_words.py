@@ -712,6 +712,7 @@ def entry_words_block(image: Image, entry: int) -> dict[str, Any]:
     out["next"] = (
         {
             "tool": "get_data_table",
+            "surface": "mcp",
             "args": {"address": _hex(nxt.address), "binary": image.sha256},
         }
         if nxt is not None
@@ -1142,9 +1143,10 @@ def undetermined_for_delta(side: SideReading) -> bool:
 def entry_delta(a: SideReading, b: SideReading) -> str | None:
     """The comparison of two sides' comparable words, in this order (each step decides):
     ``not_in_inventory`` on either side; ``undetermined`` on either side; nothing comparable on
-    either side (None: not rendered); ``a_only`` / ``b_only``; ``count_differs``; and
-    ``run_shape_differs`` or ``same_shape`` by the (stride, records, slot) of the words paired in
-    address order."""
+    either side (None: not rendered); ``a_only`` / ``b_only``; ``count_differs``;
+    ``run_shape_differs`` by the (stride, records, slot) of the words paired in address order; and
+    else ``same_shape`` — or ``undetermined`` when either side is read from an incomplete image,
+    whose stored-short blocks may hide a word or cut a series short."""
     if a.state == "not_in_inventory" or b.state == "not_in_inventory":
         return "not_in_inventory"
     if undetermined_for_delta(a) or undetermined_for_delta(b):
@@ -1163,6 +1165,8 @@ def entry_delta(a: SideReading, b: SideReading) -> str | None:
         sb = wb.run.shape() if wb.run is not None else None
         if sa != sb:
             return "run_shape_differs"
+    if a.may_be_incomplete or b.may_be_incomplete:
+        return "undetermined"
     return "same_shape"
 
 

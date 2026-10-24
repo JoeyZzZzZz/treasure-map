@@ -49,6 +49,16 @@ def test_get_diff_meta_note_ends_with_the_workflow() -> None:
     assert diff_align._META_NOTE.endswith(" " + DIFF_WORKFLOW)
 
 
+def test_get_diff_meta_note_names_skipped_micro_beside_unavailable() -> None:
+    """get_diff_meta sends this note on every call: it names skipped_micro among the unverified
+    counts and unavailable_by_cause as their split.
+
+    MUTATION (verified RED, 1 failed): drop the skipped_micro sentence from _META_NOTE -> RED."""
+    note = diff_align._META_NOTE
+    assert "skipped_micro (a side is a micro-function" in note
+    assert "unavailable_by_cause splits these two" in note
+
+
 def _summary() -> DiffSummary:
     return DiffSummary(
         diff_id="runA::runB::libx",

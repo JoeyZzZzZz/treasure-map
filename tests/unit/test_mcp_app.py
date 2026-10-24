@@ -364,6 +364,31 @@ def test_the_tools_and_the_instructions_say_pseudocode_is_paged_and_detail_summa
     assert "anchor_ref_template" in mcp_app._AGENT_INSTRUCTIONS
 
 
+def test_the_descriptions_name_skipped_micro_and_pseudocode_status() -> None:
+    """get_diff_patch_view lists skipped_micro as a pseudocode_sameness value of its own, apart
+    from unavailable; get_pseudocode says what an empty text carries.
+
+    MUTATION (verified RED, 1 failed): drop the skipped_micro value from the get_diff_patch_view
+    list -> RED; MUTATION (verified RED, 1 failed): drop the pseudocode_status sentence from
+    get_pseudocode -> RED."""
+    tools = mcp_app.make_tools(Path("unused.db"))
+
+    def doc(name: str) -> str:
+        return " ".join((tools[name].__doc__ or "").split())
+
+    view = doc("get_diff_patch_view")
+    assert (
+        "``skipped_micro`` (no text to compare only because a side is under ~10 bytes, which tmap "
+        "does not decompile BY DESIGN"
+    ) in view
+    assert "or ``unavailable`` (a side's text could not be read" in view
+    pseudo = doc("get_pseudocode")
+    assert (
+        "An empty text comes with ``pseudocode_status`` and its note: ``skipped_micro``" in pseudo
+    )
+    assert "``decompile_empty`` or ``size_unknown``" in pseudo
+
+
 # ── contract 1: no anchor, no output ────────────────────────────────────────────────
 
 

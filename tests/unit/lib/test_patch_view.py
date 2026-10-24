@@ -2941,6 +2941,42 @@ def test_cause_of_splits_the_unavailable_pairs_strongest_gap_first(
     assert pv._cause_of(None) == "db_unavailable"
 
 
+def test_a_pair_with_no_reading_reads_unavailable_never_skipped_micro(
+    tmp_path: Path, current: None
+) -> None:
+    """A pair the readings hold no result for falls back to ``unavailable`` — nothing was read, so
+    nothing says the side is a design-skipped micro-function: an aligned pair's
+    pseudocode_sameness and an undetermined pair's proposed reading alike, its cause
+    db_unavailable.
+
+    MUTATION (verified RED): make the fallback read skipped_micro -> RED."""
+    from dataclasses import replace
+
+    w = World(tmp_path)
+    w.pair("00050000", "00050000", 0.97, 0.9)  # aligned, both texts present, same callees
+    w.fn("a", "00050000", ["foo"], pseudocode="y = f();", size_bytes=200)
+    w.fn("b", "00050000", ["foo"], pseudocode="y = g();", size_bytes=200)
+    w.pair("00051000", "00051000", 0.5, 0.8)  # undetermined
+    w.fn("a", "00051000", ["foo"], pseudocode="y = h();", size_bytes=200)
+    w.fn("b", "00051000", ["foo"], pseudocode="y = k();", size_bytes=200)
+    w.commit()
+    built = pv.build_diff_view(w.atlas, DIFF)
+    assert built is not None
+    readings = pv._pseudo_readings(w.atlas, built)
+    by_id = {e.entry_id: e for e in built.entries}
+    aligned, undetermined = (
+        by_id[_pair_id("00050000", "00050000")],
+        by_id[_pair_id("00051000", "00051000")],
+    )
+    assert (aligned.callee_set or {}).get("state") == "equal"
+    assert pv._sameness_of(aligned, readings) == sameness.DIFFERS  # read: a real reading
+    unread = replace(readings, aligned={}, undetermined={})
+    assert pv._sameness_of(aligned, unread) == sameness.UNAVAILABLE
+    proposed = pv._proposed_of(undetermined, unread)
+    assert proposed is not None and proposed[0] == sameness.U_UNAVAILABLE
+    assert pv._cause_of(None) == "db_unavailable"
+
+
 def test_unavailable_by_cause_sums_to_unavailable_and_skipped_micro(
     tmp_path: Path, current: None
 ) -> None:

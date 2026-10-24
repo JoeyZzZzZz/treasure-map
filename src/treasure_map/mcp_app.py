@@ -2147,11 +2147,11 @@ def make_tools(
         structural_spans, substitutions_total, calls_differ, line_number_form, and the hunk's
         gate counts or why it is withheld), ``guard_scan`` without ``shown_rule``,
         ``hidden_region`` (body, marker count), ``bodies`` (each side's status and size),
-        ``entry_words`` (its delta and each side's state, count and count_by_class, no word; the
-        envelope's ``entry_words_counts`` is on every page). An undetermined pair's reading comes
-        as ``proposed_pair_summary``, with its anchored_differs / anchor / in_read_first /
-        demoted on the entry, and an anchored micro-side pair carries
-        ``anchored_micro_side: true``. In detail='summary' a missing count
+        ``entry_words`` (its delta and each side's state, reason, count, count_by_class and
+        may_be_incomplete, no word; the envelope's ``entry_words_counts`` is on every page). An
+        undetermined pair's reading comes as ``proposed_pair_summary``, with its
+        anchored_differs / anchor / in_read_first / demoted on the entry, and an anchored
+        micro-side pair carries ``anchored_micro_side: true``. In detail='summary' a missing count
         is 0 — except inside a delta_summary whose kind is not_computed, or a guard_scan that
         carries a reason: there nothing was counted. A body-elsewhere count that could not be
         read is null, not missing. Every boolean (callees_complete, narrow, in_read_first,
@@ -2974,7 +2974,8 @@ def make_tools(
         segments, listed first; linkage (GOT/PLT/relocations), symbol tables and unwind info are
         counted apart, and a word inside a stored string is flagged. Each word carries its nearest
         recorded label and, when it sits in an evenly spaced series of such words, that series;
-        ``next`` names a get_data_table call for the first comparable one. A stored value, not
+        ``next`` names a get_data_table call (an MCP tool: ``surface`` mcp) for the first
+        comparable one. A stored value, not
         proof of a call; ``none_found`` only when every block was stored in full.
 
         Run-aware: ``run_id`` + ``function`` or ``evidence_ref``; echoes ``resolved_run``.

@@ -181,6 +181,7 @@ def test_be32_series_and_label(tmp_path: Path) -> None:
     }
     assert block["next"] == {
         "tool": "get_data_table",
+        "surface": "mcp",
         "args": {"address": "0x10030", "binary": SHA},
     }
     # fn_0: the label sits on its own .data word; its .rodata word is in another block -> none
@@ -244,6 +245,64 @@ def test_be32_table_pages_by_record(tmp_path: Path) -> None:
     t = _table(b, "0x10010", offset=4, limit=2)
     assert [r["index"] for r in t["records"]] == [4, 5] and t["total_records"] == 6
     assert _table(b, "0x10010", limit=0)["note"] == "invalid_page"
+
+
+def test_a_field_offset_at_or_past_the_stride_is_refused(tmp_path: Path) -> None:
+    """A given field_offset must lie inside one record: at or past the stride it is
+    ``invalid_field_offset``, not a table read from another record's bytes.
+
+    MUTATION (verified RED): drop the ``fo >= s`` check -> a table comes back -> RED."""
+    b = _be32(tmp_path)
+    assert _table(b, "0x10010", field_offset=15).get("found") is True
+    for fo in (16, 17):
+        assert _table(b, "0x10010", field_offset=fo).get("note") == "invalid_field_offset", fo
+
+
+def test_an_address_in_bss_is_uninitialized_as_get_data_bytes_says(tmp_path: Path) -> None:
+    """An address inside a .bss extent (an uninitialized block, no bytes stored) is
+    ``uninitialized_bss`` for get_data_table, the same name get_data_bytes gives it.
+
+    MUTATION (verified RED): drop the ``initialized`` check -> the table reads on and names
+    another reason -> RED."""
+    b = _be32(tmp_path)
+    b.block(".bss", 0x30000, b"", size=0x100, initialized=0)
+    t = _table(b, "0x30010")
+    conn = b.ro()
+    try:
+        raw = facts.get_data_bytes(conn, binary=SHA, address="0x30010", length=4)
+    finally:
+        conn.close()
+    assert t.get("note") == "uninitialized_bss" == raw.get("note"), (t, raw)
+
+
+def test_a_function_at_address_zero_is_not_read_in_a_diff(tmp_path: Path) -> None:
+    """An entry of 0 would equal every zeroed word, so a diff side never reads it: the function
+    at 0 is not_in_inventory there, beside a function whose one word is read as found.
+
+    MUTATION (verified RED): keep an entry of 0 (``if value is not None``) -> the zero function
+    reads found with every zero word -> RED."""
+    b = Bin(tmp_path / "z.db", "MIPS:LE:32:default")
+    b.fn(0, "zero_fn")
+    b.fn(0x400100, "real_fn")
+    b.block(".data", 0x10000, b"\0" * 0x40 + b.w(0x400100) + b"\0" * 0x40)
+    image = b.image()
+    zero = ew.side_reading(image, "00000000")
+    assert (zero.state, zero.words) == ("not_in_inventory", ())
+    assert ew.side_reading(image, "00400100").state == "found"
+
+
+def test_a_point_query_shows_twenty_words_and_counts_them_all(tmp_path: Path) -> None:
+    """A function whose entry is in 21 aligned words: the point query counts 21 and lists the
+    first ``POINT_WORDS_SHOWN`` (20), words_shown saying so.
+
+    MUTATION (verified RED): drop the ``[:POINT_WORDS_SHOWN]`` cut -> 21 words listed -> RED."""
+    b = Bin(tmp_path / "many.db", "MIPS:LE:32:default")
+    b.fn(0x400100, "many_fn")
+    b.block(".data", 0x10000, b"".join(b.w(0x400100) + b"\0" * 0x3C for _ in range(21)))
+    block = _point(b, "many_fn")["entry_words"]
+    assert ew.POINT_WORDS_SHOWN == 20
+    assert block["count"] == 21
+    assert len(block["words"]) == block["words_shown"] == 20
 
 
 # ── tbl_le32_thumb: ARM, entries stored as entry|1 ───────────────────────────────────────────
@@ -998,6 +1057,120 @@ def test_a_summary_page_carries_entry_words_as_counts(tmp_path: Path, current: N
     assert a_only["b"].get("reason") == "data_blocks_truncated"
 
 
+def test_a_function_with_no_counterpart_renders_only_a_word_or_an_unknown(
+    tmp_path: Path, current: None
+) -> None:
+    """A function with no counterpart renders its one side when that side holds a comparable word
+    (or cannot say); one read in full with no comparable word renders nothing.
+
+    MUTATION (verified RED): render every such side (``if True:``) -> the wordless one renders ->
+    RED."""
+    w, _fn = _diff_world(tmp_path)
+    a = w.side["a"]
+    with_word, without = a.fn(0x470000, "pword"), a.fn(0x470100, "pnone")
+    a.block(".data.p", 0x60000, a.w(with_word))
+    for addr in (with_word, without):
+        w.atlas.execute(
+            "INSERT INTO function_presence (diff_id, side, addr, presence_state) "
+            "VALUES (?, 'a', ?, 'absent')",
+            (DIFF, f"{addr:08x}"),
+        )
+    by_id = {e["entry_id"]: e for e in w.view()["entries"]}
+    assert by_id[f"a:{with_word:08x}"]["entry_words"]["a"]["state"] == "found"
+    assert by_id[f"a:{without:08x}"]["bucket"] == "P"
+    assert "entry_words" not in by_id[f"a:{without:08x}"]
+
+
+def test_not_in_inventory_is_named_before_an_unreadable_other_side() -> None:
+    """A side missing from its inventory names the pair not_in_inventory even when the other side
+    could not be read at all, whichever side is which: it is counted apart, never folded into
+    undetermined.
+
+    MUTATION (verified RED): decide undetermined before not_in_inventory -> RED."""
+    missing = ew.SideReading("not_in_inventory", None, (), False)
+    unreadable = ew.side_reading(None, "00400000", "side_unreadable")
+    assert unreadable.state == "undetermined"
+    assert ew.entry_delta(missing, unreadable) == "not_in_inventory"
+    assert ew.entry_delta(unreadable, missing) == "not_in_inventory"
+
+
+def test_an_unreadable_side_still_counts_a_missing_function_apart(
+    tmp_path: Path, current: None
+) -> None:
+    """With the A side unreadable as a whole, the pair whose function B's inventory lacks is
+    still counted not_in_inventory, the rest undetermined.
+
+    MUTATION (verified RED): decide undetermined before not_in_inventory -> RED."""
+    w, _fn = _diff_world(tmp_path)
+    w.side["a"].conn.execute("DELETE FROM data_blocks")
+    counts = w.view()["entry_words_counts"]
+    assert counts["unavailable"] == {"a": "data_blocks_not_exported"}
+    assert counts["listed"] == {"undetermined": 9, "not_in_inventory": 1}
+
+
+def test_a_diff_side_shows_five_words_and_counts_them_all(tmp_path: Path, current: None) -> None:
+    """A function whose entry is in six aligned words on each side: each side counts 6 and lists
+    the first ``DIFF_WORDS_SHOWN`` (5).
+
+    MUTATION (verified RED): drop the ``[:DIFF_WORDS_SHOWN]`` cut -> six words listed -> RED."""
+    w, fn = _diff_world(tmp_path)
+    for b in w.side.values():
+        b.block(".data.many", 0x70000, b"".join(b.w(fn["same"]) + b"\0" * 0x3C for _ in range(5)))
+    block = _by_addr(w.view(), fn)["same"]["entry_words"]
+    assert ew.DIFF_WORDS_SHOWN == 5
+    for side in ("a", "b"):
+        assert block[side]["count"] == 6, side
+        assert len(block[side]["words"]) == block[side]["words_shown"] == 5, side
+
+
+def test_a_side_read_from_a_truncated_image_never_reads_same_shape(
+    tmp_path: Path, current: None
+) -> None:
+    """Two sides whose comparable words agree in number and shape read same_shape — unless a side
+    was read from an incomplete image, whose stored-short blocks could hide a word or cut a series:
+    then undetermined. A difference read there is still given.
+
+    MUTATION (verified RED): give same_shape whatever the images -> RED."""
+    w, fn = _diff_world(tmp_path)
+    by = _by_addr(w.view(), fn)
+    assert by["same"]["entry_words"]["delta"] == "same_shape"
+    w.side["b"].block(".bss_like", 0x90000, b"\0" * 8, size=0x100, truncated=1)
+    pv._clear_view_caches()
+    by = _by_addr(w.view(), fn)
+    same = by["same"]["entry_words"]
+    assert same["delta"] == "undetermined"
+    assert same["b"]["may_be_incomplete"] is True and same["b"]["state"] == "found"
+    assert by["shape"]["entry_words"]["delta"] == "run_shape_differs"
+    assert by["count"]["entry_words"]["delta"] == "count_differs"
+
+
+@pytest.mark.parametrize("view", ["string_edge", "candidate_flat"])
+@pytest.mark.parametrize("detail", ["full", "summary"])
+def test_the_other_views_carry_no_entry_words(
+    tmp_path: Path, current: None, monkeypatch: pytest.MonkeyPatch, view: str, detail: str
+) -> None:
+    """entry_words belongs to the function-pair view: the string_edge and candidate_flat views, full
+    or summary, carry neither the envelope's entry_words_counts nor an entry's block (and read no
+    side image for it), on a diff whose sink_patch page carries both.
+
+    MUTATION (verified RED, 4 failed): compute entry_words on every view -> RED."""
+    w, _fn = _diff_world(tmp_path)
+    assert "entry_words_counts" in w.view()
+    calls: list[str] = []
+    real = pv._entry_words_view
+
+    def spy(atlas: Any, built: Any) -> Any:
+        calls.append("read")
+        return real(atlas, built)
+
+    monkeypatch.setattr(pv, "_entry_words_view", spy)
+    out = w.view(view=view, detail=detail)
+    assert "error" not in out, out
+    assert "entry_words_counts" not in out
+    assert not any("entry_words" in e for e in out.get("entries") or ())
+    assert calls == []
+
+
 def test_entry_words_labels_say_nothing_of_what_a_change_means(
     tmp_path: Path, current: None
 ) -> None:
@@ -1067,6 +1240,7 @@ def test_mcp_get_xrefs_next_names_the_run(tmp_path: Path, monkeypatch: pytest.Mo
     tools = mcp_app.make_tools(_mcp_world(tmp_path))
     out = tools["get_xrefs"](function="fn_2", run_id="run_t")
     step = out["entry_words"]["next"]
+    assert step["surface"] == "mcp"
     assert step["args"] == {"address": "0x10030", "binary": SHA, "run_id": "run_t"}
     table = tools[step["tool"]](**step["args"])
     assert table["total_records"] == 6 and table["resolved_run"] == "run_t"
