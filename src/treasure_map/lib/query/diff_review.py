@@ -18,6 +18,7 @@ ANCHORS. A judgement is keyed by an anchor that names its subject, not its posit
     {run_a}::{run_b}#function_pair#{binary}::{addr_a}::{addr_b}
     {run_a}::{run_b}#function_presence#{binary}::{side}:{addr}
     {run_a}::{run_b}#candidate#{subject_key}
+    {run_a}::{run_b}#non_binary#{path}
 
 ``binary`` is the diff's short binary name (diff_meta.binary_a): two binaries of one run pair can
 hold a function at the same address, and without it their entries would share one judgement. A
@@ -25,6 +26,10 @@ candidate's ``subject_key`` already names the evidence_ref of each side. Everyth
 ``#`` is the run pair, which is what the overlay's run_id column holds, so one run pair's
 judgements are one exact-match filter. Keys are read from the right (``rsplit``), and a run pair is
 only ever matched whole, never split.
+
+A ``non_binary`` anchor names one non-binary file of the run pair by its path (lib/query/file_diff).
+It belongs to no binary diff: ``belongs_to`` is False for it, so a binary diff's view never reads
+it, and it is read on its own path (file_diff.file_review) against the pair's file comparison.
 
 THE BASIS is the entry's own diff facts at write time — for a pair its alignment state,
 similarity, export gaps, bucket and the (a_ref, b_ref, presence, reason, counterpart call) of every
@@ -58,7 +63,7 @@ from treasure_map.lib.query.sink_overlay import _subject_key
 if TYPE_CHECKING:  # typing only — patch_view imports this module
     from treasure_map.lib.query.patch_view import _Entry
 
-SUBJECT_KINDS = ("function_pair", "function_presence", "candidate")
+SUBJECT_KINDS = ("function_pair", "function_presence", "candidate", "non_binary")
 STATES = (UNSEEN, OPEN, CONCLUDED, NEEDS_RELABEL, NEEDS_RECHECK)
 BUCKET_ORDER = ("A", "B", "C", "R", "P", "E")
 
@@ -76,7 +81,9 @@ CHECKED_RULE = (
     "checked needs at least one anchor read in this diff's current view — an entry's anchor_ref "
     "(function_pair / function_presence), a candidate anchor, an entry_id, a row_ref (a row's "
     "a_ref / b_ref), or a group_ref from same_shape_siblings; an item that looks like an anchor "
-    "but names nothing in the view is refused. Plain-text notes are kept but do not count."
+    "but names nothing in the view is refused. Plain-text notes are kept but do not count. On a "
+    "non-binary file, a file's anchor_ref (non_binary) from get_file_diff counts too; with "
+    "run_pair alone only those resolve — a function or candidate anchor needs diff_id."
 )
 
 
@@ -97,6 +104,10 @@ def presence_anchor(run_a: str, run_b: str, binary: str, side: str, addr: str) -
 
 def candidate_anchor(run_a: str, run_b: str, subject_key: str) -> str:
     return f"{run_pair(run_a, run_b)}#candidate#{subject_key}"
+
+
+def non_binary_anchor(run_a: str, run_b: str, path: str) -> str:
+    return f"{run_pair(run_a, run_b)}#non_binary#{path}"
 
 
 def entry_anchor(e: _Entry, run_a: str, run_b: str, binary: str) -> str:
@@ -120,7 +131,8 @@ def split_anchor(anchor_ref: str, run_a: str, run_b: str) -> tuple[str, str] | N
 
 def key_binary(kind: str, key: str) -> str | None:
     """The binary named by a function_pair / function_presence key, read from the right; None for
-    a candidate key (it names the binary only through its refs) or a key of the wrong shape."""
+    a candidate key (it names the binary only through its refs), a non_binary key (a file of the
+    run pair, in no binary) or a key of the wrong shape."""
     if kind == "function_pair":
         parts = key.rsplit("::", 2)
         return parts[0] if len(parts) == 3 else None
@@ -170,11 +182,12 @@ def row_facts(view: dict[str, Any]) -> dict[str, Any]:
 
 @dataclass(frozen=True)
 class Subject:
-    """One thing in a diff's current view that a judgement can be anchored on."""
+    """One thing in a diff's current view that a judgement can be anchored on. ``entry`` is the
+    view's entry for a function or candidate subject; a non_binary file has none."""
 
     kind: str
     facts: dict[str, Any]
-    entry: _Entry
+    entry: _Entry | None = None
     row_view: dict[str, Any] | None = None  # the row, for a candidate subject
 
 
@@ -192,6 +205,28 @@ def subjects_of(placed: list[_Entry], run_a: str, run_b: str, binary: str) -> di
                 "candidate", row_facts(v), e, v
             )
     return out
+
+
+def non_binary_subjects_of(
+    facts_by_path: dict[str, dict[str, Any]], run_a: str, run_b: str
+) -> dict[str, Subject]:
+    """anchor -> subject, for every aligned non-binary file of the run pair (``same`` included, so
+    a judged file whose two sides have since become equal reads as moved, not as gone). The facts
+    are lib/query/file_diff.subject_facts of each file."""
+    return {
+        non_binary_anchor(run_a, run_b, path): Subject("non_binary", facts)
+        for path, facts in facts_by_path.items()
+    }
+
+
+def file_snapshot(run_a: str, run_b: str, subject: Subject) -> dict[str, Any]:
+    """What is stored as a judgement on a non-binary file: its facts and the run pair they were
+    read from (it has no diff id)."""
+    return {
+        "run_pair": run_pair(run_a, run_b),
+        "subject": subject.kind,
+        "facts": _plain(subject.facts),
+    }
 
 
 def snapshot(diff_id: str, subject: Subject) -> dict[str, Any]:

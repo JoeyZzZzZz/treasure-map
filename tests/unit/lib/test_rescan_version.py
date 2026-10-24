@@ -495,6 +495,20 @@ def test_the_entry_words_reader_is_in_no_rescan_closure() -> None:
             assert module not in closure, (root, module)
 
 
+def test_the_file_comparison_is_in_no_rescan_closure() -> None:
+    """lib.query.file_diff reads two scans' non-binary records at view time: no rescan stamp
+    hashes it, nor the modules that judge a file."""
+    for root in ROOTS:
+        closure = rv._closure(PKG, root)
+        for module in (
+            "lib.query.file_diff",
+            "lib.query.diff_review",
+            "lib.query.diff_annotations",
+            "lib.overlay",
+        ):
+            assert module not in closure, (root, module)
+
+
 def test_hoisting_the_rx_warning_moves_no_stamp(tmp_path: Path) -> None:
     """The RX warning was hoisted out of get_data_bytes into a top-level constant so the data-table
     reader shares it. With the warning put back inline, all four stamps — pipeline, hunt, diff,

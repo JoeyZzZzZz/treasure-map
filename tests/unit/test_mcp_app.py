@@ -54,6 +54,7 @@ _EXPECTED_TOOLS = {
     "get_diff_capabilities",
     "list_diffs",
     "list_diff_blindspots",
+    "get_file_diff",
     "cross_firmware_patterns",
     "pattern_density",
     "get_pseudocode",

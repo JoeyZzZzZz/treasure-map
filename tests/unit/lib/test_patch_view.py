@@ -7337,7 +7337,16 @@ def test_the_default_order_places_each_shape(tmp_path: Path, current: None) -> N
 
 # ── start_diff_review: the entries to read first, composed from the view and the meta ──────────
 
-_START_KEYS = {"diff_id", "workflow", "meta", "headline", "headline_note", "view", "read_next"}
+_START_KEYS = {
+    "diff_id",
+    "workflow",
+    "meta",
+    "headline",
+    "headline_note",
+    "view",
+    "read_next",
+    "non_binary",
+}
 _START_META_KEYS = {
     "functions",
     "banners",
@@ -7376,6 +7385,9 @@ def test_start_diff_review_is_the_view_and_the_meta_as_they_are(
         assert out["headline"]["entry_id"] == view["entries"][0]["entry_id"]
         meta = meta_tool(DIFF)
         assert set(out["meta"]) == _START_META_KEYS
+        # the run pair's file block is get_diff_meta's own
+        assert json.dumps(out.get("non_binary")) == json.dumps(meta.get("non_binary"))
+        assert "non_binary" in out
         for key in _START_META_KEYS - {"version_skew"}:
             assert json.dumps(out["meta"][key]) == json.dumps(meta[key]), key
         assert out["meta"]["version_skew"] == meta["meta"]["version_skew"]

@@ -783,7 +783,6 @@ def test_batch_echoes_a_leaned_on_group_once_and_carries_the_ref(world: World) -
     gref = _group_ref(world, LISTED)
     anchors = [_entry_anchor(world, a) for a in _SHARING]
     out = tools["annotate_diff_batch"](
-        DIFF,
         [
             {
                 "anchor_ref": a,
@@ -793,6 +792,7 @@ def test_batch_echoes_a_leaned_on_group_once_and_carries_the_ref(world: World) -
             }
             for a in anchors
         ],
+        diff_id=DIFF,
     )
     assert out["written"] is True, out
     for res in out["results"]:
@@ -826,11 +826,11 @@ def test_batch_builds_the_diff_view_once(world: World, monkeypatch: pytest.Monke
     gref = _group_ref(world, LISTED)  # computed before counting matters (own build)
     calls["n"] = 0
     out = tools["annotate_diff_batch"](
-        DIFF,
         [
             {"anchor_ref": a1, "verdict": "changed_real", "rationale": "x", "group_ref": gref},
             {"anchor_ref": a2, "verdict": "changed_real", "rationale": "y"},
         ],
+        diff_id=DIFF,
     )
     assert out["written"] is True
     assert calls["n"] == 1, calls["n"]
@@ -849,7 +849,6 @@ def test_a_group_ref_counts_as_a_checked_anchor_even_for_another_entry(world: Wo
     with pytest.raises(ConfigError, match="not about this entry"):
         gf.annotate_group(world.atlas, DIFF, other, gref)
     out = tools["annotate_diff_batch"](
-        DIFF,
         [
             {
                 "anchor_ref": other,
@@ -858,6 +857,7 @@ def test_a_group_ref_counts_as_a_checked_anchor_even_for_another_entry(world: Wo
                 "checked": [gref],
             }
         ],
+        diff_id=DIFF,
     )
     assert out["written"] is True, out
 
@@ -896,7 +896,7 @@ def test_batch_rows_leaning_on_a_shared_group_equal_per_entry_writes(world: Worl
             "group_ref": gref,
         }
 
-    out = tools["annotate_diff_batch"](DIFF, [item(a) for a in anchors.values()])
+    out = tools["annotate_diff_batch"]([item(a) for a in anchors.values()], diff_id=DIFF)
     assert out["written"] is True, out
     batched = rows()
     assert set(batched) == set(anchors.values())
@@ -906,7 +906,7 @@ def test_batch_rows_leaning_on_a_shared_group_equal_per_entry_writes(world: Worl
         assert tools["clear_overlay"](anchor_kind="diff_subject", anchor_ref=anchor)["cleared"] == 1
     for anchor in anchors.values():
         one = item(anchor)
-        single = tools["annotate_diff"](DIFF, **one)
+        single = tools["annotate_diff"](**one, diff_id=DIFF)
         assert single["written"] is True, single
     assert rows() == batched
 
@@ -929,11 +929,11 @@ def test_batch_snapshots_a_shared_group_once(world: World, monkeypatch: pytest.M
 
     monkeypatch.setattr(gf, "group_snapshot", counting)
     out = tools["annotate_diff_batch"](
-        DIFF,
         [
             {"anchor_ref": a, "verdict": "changed_real", "rationale": "x", "group_ref": gref}
             for a in anchors
         ],
+        diff_id=DIFF,
     )
     assert out["written"] is True, out
     assert snaps["n"] == 1, snaps["n"]

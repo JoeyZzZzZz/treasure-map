@@ -61,6 +61,7 @@ from treasure_map.lib.query import density as _density
 from treasure_map.lib.query import effective_float_filters as _effective_float_filters
 from treasure_map.lib.query import entry_words
 from treasure_map.lib.query import explain_candidate as _explain_candidate
+from treasure_map.lib.query import file_diff as _fd
 from treasure_map.lib.query import filter_candidates as _filter_candidates
 from treasure_map.lib.query import filter_match_count as _filter_match_count
 from treasure_map.lib.query import get_nvram_key_flow as _get_nvram_key_flow
@@ -468,14 +469,19 @@ _AGENT_INSTRUCTIONS = (
     "ranking with it, then read the entries you pick with entry_id), "
     "before you page one entry's rows: every entry "
     "carries its anchor_ref (a summary entry rebuilds it from annotation.anchor_ref_template) and "
-    "review_state; annotate_diff(diff_id, anchor_ref, verdict="
-    "changed_real|no_real_change|change_inconclusive, rationale) records your judgement on one "
-    "entry, promote(diff_id, entry_id, row_ref, verdict, rationale) carries it onto one of the "
-    "entry's candidates as a candidate verdict (an entry shows 20 rows inline: to find a row_ref "
-    "past them, page its rows with get_diff_patch_view(diff_id, entry_id=..., rows_offset=...)), "
+    "review_state; annotate_diff(anchor_ref, "
+    "verdict=changed_real|no_real_change|change_inconclusive, rationale, diff_id=...) records your "
+    "judgement on one entry, promote(diff_id, entry_id, row_ref, verdict, rationale) carries it "
+    "onto one of the entry's candidates as a candidate verdict (an entry shows 20 rows inline: to "
+    "find a row_ref past them, page its rows with get_diff_patch_view(diff_id, entry_id=..., "
+    "rows_offset=...)), "
     "and list_overlays(anchor_kind='diff_subject', run_id='<run_a>::<run_b>') reviews them with "
     "the progress over the whole run pair. same_shape_siblings(diff_id, evidence_ref=...) names "
-    "the other calls of one call's shape in the same binary and where each landed in the diff."
+    "the other calls of one call's shape in the same binary and where each landed in the diff. "
+    "The non-binary files (scripts, configs, credentials, web assets) are compared by "
+    "get_file_diff(run_pair='<run_a>::<run_b>') — any two runs from list_runs, with or without a "
+    "binary diff — and one file is judged with annotate_diff(anchor_ref, verdict, rationale, "
+    "run_pair=...)."
 )
 
 
@@ -1006,6 +1012,45 @@ def make_tools(
             "SELECT diff_id FROM diff_meta WHERE run_a_id || '::' || run_b_id = ? LIMIT 1", (pair,)
         ).fetchone()
         return _refuse_stale_diff(atlas, row[0]) if row is not None else None
+
+    def _file_pair_gate(
+        atlas: sqlite3.Connection, pair: str
+    ) -> tuple[dict[str, Any] | None, tuple[str, str] | None]:
+        """``(refusal, None)`` or ``(None, (run_a, run_b))`` for a call on a run pair's non-binary
+        files. Checked per run, never through diff_meta: a pair with no binary diff has files all
+        the same, and a stale side must be refused there too."""
+        unknown = _unknown_pair(atlas, pair)
+        if unknown is not None:
+            return unknown, None
+        runs = _fd.split_run_pair(atlas, pair)
+        assert runs is not None  # _unknown_pair passed
+        for run_id in runs:
+            refusal = _refuse_stale_run(atlas, run_id)
+            if refusal is not None:
+                return refusal, None
+        return None, runs
+
+    def _file_staleness(atlas: sqlite3.Connection) -> Any:
+        """The ``source_stale`` reading of a run pair's two runs, for the judgements on its files:
+        false when both pass the stale-run gate, else true with the refused run named."""
+
+        def read(run_a: str, run_b: str) -> dict[str, Any]:
+            for run_id in (run_a, run_b):
+                if _refuse_stale_run(atlas, run_id) is not None:
+                    return {"source_stale": True, "source_stale_reason": f"stale_scan:{run_id}"}
+            return {"source_stale": False, "source_stale_reason": None}
+
+        return read
+
+    def _file_block(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] | None:
+        """The ``non_binary`` block of one binary diff's meta / review start: its run pair's file
+        counts and the get_file_diff call that lists them. None for an unknown diff."""
+        row = atlas.execute(
+            "SELECT run_a_id, run_b_id FROM diff_meta WHERE diff_id = ?", (diff_id,)
+        ).fetchone()
+        if row is None or not row[0] or not row[1]:
+            return None
+        return _fd.file_summary(atlas, str(row[0]), str(row[1]))
 
     def _reverse_hint(
         atlas: sqlite3.Connection, run_a: str | None, run_b: str | None, names: tuple[str, str]
@@ -1974,7 +2019,9 @@ def make_tools(
         get_diff_patch_view(diff_id, detail="summary", limit=limit) as that call returns it —
         ``limit`` (1-200, default 20) entries in the default order, with the progress and annotation
         blocks. ``read_next``: the call that reads one entry in full (``one_entry``) and, when the
-        summary has more entries, the call for the next page (``more``).
+        summary has more entries, the call for the next page (``more``). ``non_binary``: the run
+        pair's non-binary file counts by kind and the get_file_diff call that lists them — not part
+        of this diff's entries or of its review progress.
 
         The response aims at the byte budget (~48KB): the view page is cut as get_diff_patch_view
         cuts it, then the headline's inline_hunk is withheld (``page_budget``) when the headline
@@ -1999,6 +2046,7 @@ def make_tools(
                 return view
             head = _get_diff_patch_view(conn, diff_id, limit=1, rows_limit=0)
             meta_full = _get_diff_meta(conn, diff_id)
+            files = _file_block(conn, diff_id)
         finally:
             conn.close()
         meta = {k: meta_full[k] for k in _START_META_KEYS if k in meta_full}
@@ -2012,6 +2060,8 @@ def make_tools(
             "meta": meta,
             "headline": headline,
         }
+        if files is not None:
+            out["non_binary"] = files
         if headline is None:
             withheld = bool((view.get("review_progress") or {}).get("withheld"))
             out["headline_note"] = _HEADLINE_WITHHELD if withheld else _HEADLINE_NONE
@@ -2727,15 +2777,98 @@ def make_tools(
         ``diff_status_reason`` = why, ``diff_attempts`` = tries): an empty get_diff_deltas for it
         is a BLIND SPOT, never 'no change' (list_diff_blindspots).
         ``source_stale`` / ``source_stale_reason``: whether the diff still describes what it was
-        computed from (true / null = unverified / false; reasons in list_diffs)."""
+        computed from (true / null = unverified / false; reasons in list_diffs). ``non_binary``:
+        the run pair's non-binary file counts by kind (``counts_by_kind``) and the get_file_diff
+        call that lists them."""
         conn = open_atlas(atlas_path)
         try:
             refusal = _refuse_stale_diff(conn, diff_id)
             if refusal is not None:
                 return refusal
-            return _get_diff_meta(conn, diff_id)
+            out = _get_diff_meta(conn, diff_id)
+            if out.get("found"):
+                files = _file_block(conn, diff_id)
+                if files is not None:
+                    out["non_binary"] = files
+            return out
         finally:
             conn.close()
+
+    def get_file_diff(
+        run_pair: str,
+        kind: str | None = None,
+        change: str | None = None,
+        path: str | None = None,
+        offset: int = 0,
+        limit: int = _fd.DEFAULT_LIMIT,
+        hunk_offset: int = 0,
+        detail: str = "full",
+    ) -> dict[str, Any]:
+        """The NON-BINARY files of two runs compared by path (``run_pair`` = ``{run_a}::{run_b}``,
+        any two runs from list_runs — with or without a binary diff between them): shell scripts,
+        config files, credentials, web assets. Computed at read time; nothing is stored.
+
+        Per path, ``change``: ``a_only`` / ``b_only`` (recorded on one side only — not proof it was
+        created or deleted), ``content_differs`` (sha256 differs), ``same``, ``undetermined`` (a
+        side recorded no sha256). ``counts_by_kind`` / ``counts`` count every aligned path;
+        ``unaligned_null_path`` the rows with no path. A page lists the files that differ (``same``
+        only with ``change="same"``), filtered by ``kind`` / ``change``, each with ``structured`` —
+        the difference of the rows the scan recorded for it (``recorded_scope`` says which: a
+        filtered subset, so read the hunk too), as multiset differences with ``count`` — and
+        ``hunk_stats`` (plus_lines / minus_lines / segments / bytes) of its line difference.
+        ``path`` reads one file: every structured item and the line difference itself
+        (``hunk.lines``, 3 lines of context), paged by ``hunk_offset`` = ``next_hunk_offset``; a
+        line too long for a page is cut into pieces (``line_cut``, ``cut_at`` = the pieces that
+        continue in the next). ``detail="summary"`` gives the structured comparison as counts.
+
+        The text is not given for a credential file, a file with a sensitive recorded entry, or a
+        difference holding a private-key header or a full crypt hash — only its shape
+        (``hunk_suppressed`` + ``hunk_shape``); credential material, its hashes and a sensitive
+        config value are never given. ``hunk_unavailable`` names why no line difference was read
+        (the file is missing, outside the firmware root, not the bytes the scan hashed, binary...).
+
+        Each file has an ``anchor_ref`` and ``review_state``: judge one with annotate_diff(
+        anchor_ref, verdict, rationale, run_pair=...). A stale run on either side is refused."""
+        atlas = open_atlas(atlas_path)
+        try:
+            refusal, runs = _file_pair_gate(atlas, run_pair)
+            if refusal is not None:
+                return refusal
+            assert runs is not None
+            run_a, run_b = runs
+            try:
+                pf = _fd.read_pair(atlas, run_a, run_b)
+                judged = _fd.file_review(atlas, run_a, run_b, source_stale=False, pf=pf)
+                result = _fd.file_diff(
+                    atlas,
+                    run_a,
+                    run_b,
+                    kind=kind,
+                    change=change,
+                    path=path,
+                    offset=offset,
+                    limit=limit,
+                    hunk_offset=hunk_offset,
+                    detail=detail,
+                    review={a: j.state for a, j in judged.items()},
+                    pf=pf,
+                )
+            except _fd.FileDiffError as exc:
+                return {"run_pair": run_pair, "error": str(exc)}
+        finally:
+            atlas.close()
+        if "entries" in result:
+            return _fit_page(
+                result,
+                offset,
+                rows="entries",
+                total="total_entries",
+                next_offset="next_offset",
+                truncated="truncated_by_bytes",
+            )
+        if len(json.dumps(result)) > _RESPONSE_BYTE_BUDGET:
+            result["over_budget"] = True
+        return result
 
     def get_function_alignment(diff_id: str, addr: str, side: str = "a") -> dict[str, Any]:
         """The BinDiff-aligned counterpart of one function address in a diff. ``side="a"`` resolves
@@ -3452,7 +3585,6 @@ def make_tools(
         return result
 
     def annotate_diff(
-        diff_id: str,
         anchor_ref: str,
         verdict: str,
         rationale: str | None = None,
@@ -3460,10 +3592,20 @@ def make_tools(
         why_unchanged: str | None = None,
         group_ref: str | None = None,
         evidence: list[str] | None = None,
+        diff_id: str | None = None,
+        run_pair: str | None = None,
     ) -> dict[str, Any]:
         """Record YOUR OWN judgement about one entry of a diff's function-level view
-        (get_diff_patch_view) — did this change do something real. A writable layer over the
-        read-only view: the view's facts are unchanged whether it is empty or full.
+        (get_diff_patch_view), or about one non-binary file of a run pair (get_file_diff) — did
+        this change do something real. A writable layer over the read-only views: their facts are
+        unchanged whether it is empty or full.
+
+        Pass exactly one of ``diff_id`` (one binary's diff, ``{run_a}::{run_b}::{binary}``) and
+        ``run_pair`` (``{run_a}::{run_b}``). A function or candidate anchor needs ``diff_id``. A
+        file's ``anchor_ref`` (``{run_a}::{run_b}#non_binary#{path}``, printed by get_file_diff)
+        takes ``run_pair`` — any two runs, with or without a binary diff — or the ``diff_id`` of a
+        binary diff of the same pair; what it rests on is the file's change, kind, two sha256
+        values and structured counts. A file takes no ``group_ref`` and cannot be promoted.
 
         ``anchor_ref`` is the entry's ``anchor_ref`` as get_diff_patch_view prints it (a function
         pair, or a function with no counterpart), or a candidate row's
@@ -3479,7 +3621,9 @@ def make_tools(
         diff's current view — an entry's anchor_ref (function_pair / function_presence), a candidate
         anchor, an entry_id, a row_ref (a row's a_ref / b_ref), or a group_ref from
         same_shape_siblings; an item that looks like an anchor but names nothing in the view is
-        refused. Plain-text notes are kept but do not count.), ``change_inconclusive`` (looked,
+        refused. Plain-text notes are kept but do not count. On a non-binary file, a file's
+        anchor_ref (non_binary) from get_file_diff counts too; with run_pair alone only those
+        resolve — a function or candidate anchor needs diff_id.), ``change_inconclusive`` (looked,
         could not decide — it stays in view; put the next step in the rationale). Candidate verdicts
         are refused here; to carry this judgement onto one of the entry's candidates, use promote.
 
@@ -3499,16 +3643,27 @@ def make_tools(
         at once, use annotate_diff_batch."""
         supplied = {"checked": checked, "why_unchanged": why_unchanged, "evidence": evidence}
         given = {k: v for k, v in supplied.items() if v is not None}
+        if (diff_id is None) == (run_pair is None):
+            return {
+                "written": False,
+                "error": "pass exactly one of diff_id (one binary's diff, from list_diffs) or "
+                "run_pair ({run_a}::{run_b}, for a non-binary file's anchor)",
+            }
         atlas = open_atlas(atlas_path)
         group_echo: dict[str, Any] | None = None
         try:
-            refusal = _refuse_stale_diff(atlas, diff_id)
+            if diff_id is not None:
+                refusal = _refuse_stale_diff(atlas, diff_id)
+            else:
+                assert run_pair is not None
+                refusal, _runs = _file_pair_gate(atlas, run_pair)
             if refusal is not None:
                 return refusal
             try:
                 res = _annotate_diff(
                     atlas,
                     diff_id=diff_id,
+                    run_pair=run_pair,
                     anchor_ref=anchor_ref,
                     verdict=verdict,
                     rationale=_resolve_diff_rationale(verdict, rationale, why_unchanged),
@@ -3534,6 +3689,8 @@ def make_tools(
             "unchanged; list_overlays(anchor_kind='diff_subject', run_id=<run pair>) resumes "
             "these.",
         }
+        if run_pair is not None:
+            result["run_pair"] = run_pair
         if group_echo is not None:
             result["group"] = group_echo
         if res.action == "updated":
@@ -3543,15 +3700,19 @@ def make_tools(
             }
         return result
 
-    def annotate_diff_batch(diff_id: str, annotations: list[dict[str, Any]]) -> dict[str, Any]:
+    def annotate_diff_batch(
+        annotations: list[dict[str, Any]], diff_id: str | None = None, run_pair: str | None = None
+    ) -> dict[str, Any]:
         """Record YOUR judgements on many entries of one diff at once — all of them or none.
 
         One ``diff_id`` (one binary's diff) for the whole batch; split across binaries into several
-        calls. ``annotations`` is 1..200 items, each an object with the same per-entry fields as
-        annotate_diff and NO ``diff_id``: ``anchor_ref`` + ``verdict``, optionally ``rationale``
-        (no_real_change defaults it to ``why_unchanged``), ``checked`` / ``why_unchanged``
-        (no_real_change), ``evidence`` (changed_real), ``group_ref``. Only those seven keys — a
-        stray key fails that item, named.
+        calls. Or one ``run_pair`` (``{run_a}::{run_b}``) for a batch of non-binary files' anchors
+        (get_file_diff) — exactly one of the two. With ``diff_id``, a file anchor of the same run
+        pair may sit beside the function anchors. ``annotations`` is 1..200 items, each an object
+        with the same per-entry fields as annotate_diff and NO ``diff_id``: ``anchor_ref`` +
+        ``verdict``, optionally ``rationale`` (no_real_change defaults it to ``why_unchanged``),
+        ``checked`` / ``why_unchanged`` (no_real_change), ``evidence`` (changed_real),
+        ``group_ref``. Only those seven keys — a stray key fails that item, named.
 
         All or none: every item is validated first (``checked`` / ``evidence`` held to the same
         anchor rule as annotate_diff), and if any fails NOTHING is written — the failures are
@@ -3561,8 +3722,12 @@ def make_tools(
         ``{index, anchor_ref, action}`` (an overwrite adds ``overwrote``); an entry that leaned on
         a group carries its ``group_ref``, and each distinct group is echoed once under top-level
         ``groups``."""
-        from treasure_map.lib.overlay import prepare_diff_annotation, write_prepared
-        from treasure_map.lib.query.diff_annotations import _binary_diff, _built
+        from treasure_map.lib.overlay import (
+            prepare_diff_annotation,
+            prepare_file_annotation,
+            write_prepared,
+        )
+        from treasure_map.lib.query.diff_annotations import _binary_diff, _built, file_scope
         from treasure_map.lib.query.same_shape_siblings import _meta as _side_meta
 
         if not isinstance(annotations, list) or not (1 <= len(annotations) <= 200):
@@ -3571,17 +3736,38 @@ def make_tools(
                 "written": False,
                 "error": f"annotations must be a list of 1..200 items; got {n}",
             }
+        if (diff_id is None) == (run_pair is None):
+            return {
+                "written": False,
+                "error": "pass exactly one of diff_id (one binary's diff, from list_diffs) or "
+                "run_pair ({run_a}::{run_b}, for non-binary files' anchors)",
+            }
         atlas = open_atlas(atlas_path)
         try:
-            refusal = _refuse_stale_diff(atlas, diff_id)
+            if diff_id is not None:
+                refusal = _refuse_stale_diff(atlas, diff_id)
+            else:
+                assert run_pair is not None
+                refusal, _runs = _file_pair_gate(atlas, run_pair)
             if refusal is not None:
                 return refusal
+            meta: dict[str, Any] | None = None
+            built: Any = None
+            side_meta: Any = None
             try:
-                meta = _binary_diff(atlas, diff_id)
-                built = _built(atlas, diff_id)
-                side_meta = _side_meta(atlas, diff_id)
+                if diff_id is not None:
+                    meta = _binary_diff(atlas, diff_id)
+                    built = _built(atlas, diff_id)
+                    side_meta = _side_meta(atlas, diff_id)
             except ConfigError as exc:
                 return {"written": False, "error": str(exc)}
+            # the files of the run pair, read once and only when an item names one
+            scope_cache: list[Any] = []
+
+            def files_scope() -> Any:
+                if not scope_cache:
+                    scope_cache.append(file_scope(atlas, diff_id=diff_id, run_pair=run_pair))
+                return scope_cache[0]
 
             # the same anchor_ref more than once -> refuse the whole batch
             anchors_at: dict[str, list[int]] = {}
@@ -3613,22 +3799,41 @@ def make_tools(
                     verdict = item.get("verdict")
                     if not (isinstance(verdict, str) and verdict):
                         raise ConfigError("verdict is required")
-                    p = prepare_diff_annotation(
-                        atlas,
-                        built,
-                        meta,
-                        side_meta,
-                        diff_id=diff_id,
-                        anchor_ref=anchor_ref,
-                        verdict=verdict,
-                        rationale=_resolve_diff_rationale(
-                            verdict, item.get("rationale"), item.get("why_unchanged")
-                        ),
-                        attributed_to="agent-via-mcp",
-                        verdict_basis=_diff_verdict_basis(item),
-                        group_ref=item.get("group_ref"),
-                        group_cache=group_cache,
+                    rationale = _resolve_diff_rationale(
+                        verdict, item.get("rationale"), item.get("why_unchanged")
                     )
+                    if _fd.is_non_binary_anchor(anchor_ref):
+                        p = prepare_file_annotation(
+                            atlas,
+                            files_scope(),
+                            anchor_ref=anchor_ref,
+                            verdict=verdict,
+                            rationale=rationale,
+                            attributed_to="agent-via-mcp",
+                            verdict_basis=_diff_verdict_basis(item),
+                            group_ref=item.get("group_ref"),
+                        )
+                    elif meta is None:
+                        raise ConfigError(
+                            f"{anchor_ref!r} is a function or candidate anchor: pass diff_id "
+                            "(list_diffs) — run_pair takes non-binary files' anchors only"
+                        )
+                    else:
+                        assert diff_id is not None
+                        p = prepare_diff_annotation(
+                            atlas,
+                            built,
+                            meta,
+                            side_meta,
+                            diff_id=diff_id,
+                            anchor_ref=anchor_ref,
+                            verdict=verdict,
+                            rationale=rationale,
+                            attributed_to="agent-via-mcp",
+                            verdict_basis=_diff_verdict_basis(item),
+                            group_ref=item.get("group_ref"),
+                            group_cache=group_cache,
+                        )
                 except ConfigError as exc:
                     raw_errors.append((i, _anchor_placeholder(str(exc), item.get("anchor_ref"))))
                     continue
@@ -3681,13 +3886,13 @@ def make_tools(
                         {"error": f"a write failed, so nothing was written: {exc}", "indexes": []}
                     ],
                 }
+            pair = run_pair if meta is None else f"{meta['run_a_id']}::{meta['run_b_id']}"
             out: dict[str, Any] = {
                 "written": True,
                 "count": len(results),
                 "results": results,
                 "note": "recorded on the diff layer (YOUR judgements). "
-                f"list_overlays(anchor_kind='diff_subject', run_id='{meta['run_a_id']}::"
-                f"{meta['run_b_id']}') resumes these.",
+                f"list_overlays(anchor_kind='diff_subject', run_id='{pair}') resumes these.",
             }
             if groups_echo:
                 out["groups"] = groups_echo
@@ -3810,12 +4015,19 @@ def make_tools(
         ``{run_a}::{run_b}``, and with it the result also carries ``review_progress`` over every
         diff of that pair — with the failed diffs, the diffs undetermined as a whole and the
         binaries no diff covers beside it, without which ``complete`` is never true. That
-        rebuilds every diff's view of the pair: tens of seconds for a pair of a hundred diffs."""
+        rebuilds every diff's view of the pair: tens of seconds for a pair of a hundred diffs. A
+        judgement on a non-binary file (annotate_diff with run_pair) is listed with ``diff_id``
+        null and its ``run_pair``, read against the pair's files; a stale run on either side reads
+        it ``needs_recheck`` (and refuses the call when ``run_id`` names that pair)."""
         atlas = open_atlas(atlas_path)
         try:
             if anchor_kind == "diff_subject":
                 # A misspelled pair is an error naming the runs, not an empty list of judgements.
                 refusal = _refuse_stale_pair(atlas, run_id) or _unknown_pair(atlas, run_id)
+                if refusal is None and run_id is not None:
+                    # Per run too: a pair with no binary diff (only files judged) has no diff_meta
+                    # row for _refuse_stale_pair to find.
+                    refusal, _runs = _file_pair_gate(atlas, run_id)
             else:
                 refusal = _refuse_stale_run(atlas, run_id)
                 # A misspelled run_id is a hard error naming the available runs, not a silent empty
@@ -3827,7 +4039,13 @@ def make_tools(
                     )
             if refusal is not None:
                 return refusal
-            return _list_overlays(atlas, verdict=verdict, run_id=run_id, anchor_kind=anchor_kind)
+            return _list_overlays(
+                atlas,
+                verdict=verdict,
+                run_id=run_id,
+                anchor_kind=anchor_kind,
+                file_staleness=_file_staleness(atlas) if anchor_kind == "diff_subject" else None,
+            )
         finally:
             atlas.close()
 
@@ -3910,6 +4128,7 @@ def make_tools(
         "get_diff_capabilities": get_diff_capabilities,
         "list_diffs": list_diffs,
         "list_diff_blindspots": list_diff_blindspots,
+        "get_file_diff": get_file_diff,
         "cross_firmware_patterns": cross_firmware_patterns,
         "pattern_density": pattern_density,
         "get_pseudocode": get_pseudocode,

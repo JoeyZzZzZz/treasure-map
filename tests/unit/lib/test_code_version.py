@@ -294,3 +294,18 @@ def test_the_empty_text_reading_moves_the_diff_stamp_only_through_the_size_floor
     assert "_DECOMPILE_MIN_SIZE = 10\n" in text
     facts_py.write_text(text.replace("_DECOMPILE_MIN_SIZE = 10\n", "_DECOMPILE_MIN_SIZE = 12\n"))
     assert cv.code_hash(tmp_path, cv.DIFF_CODE_ENTRIES) != before
+
+
+def test_the_file_comparison_is_no_diff_or_overlay_entry() -> None:
+    """lib.query.file_diff is read at view time and stores nothing, and the modules that judge a
+    file (diff_review, diff_annotations, overlay's file write) are no entry either: the four stamps
+    do not move with them."""
+    for entry in cv.DIFF_CODE_ENTRIES + cv.OVERLAY_CODE_ENTRIES:
+        module = entry.partition(":")[0]
+        assert module not in (
+            "lib.query.file_diff",
+            "lib.query.diff_review",
+            "lib.query.diff_annotations",
+            "lib.overlay",
+            "mcp_app",
+        ), entry

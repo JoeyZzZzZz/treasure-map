@@ -280,9 +280,10 @@ def test_a_diff_is_refused_when_either_side_is_stale(atlas: Path, side: str) -> 
         lambda: tools["get_diff_meta"]("d1"),
         lambda: tools["get_diff_capabilities"]("d1"),
         lambda: tools["get_function_alignment"]("d1", "0x1000"),
-        lambda: tools["annotate_diff"]("d1", f"{a_id}::{b_id}#function_pair#x::1::2", "x", "r"),
+        lambda: tools["annotate_diff"](
+            f"{a_id}::{b_id}#function_pair#x::1::2", "x", "r", diff_id="d1"
+        ),
         lambda: tools["annotate_diff_batch"](
-            "d1",
             [
                 {
                     "anchor_ref": f"{a_id}::{b_id}#function_pair#x::1::2",
@@ -290,6 +291,7 @@ def test_a_diff_is_refused_when_either_side_is_stale(atlas: Path, side: str) -> 
                     "rationale": "r",
                 }
             ],
+            diff_id="d1",
         ),
         lambda: tools["promote"]("d1", "pair:1:2", "r#x", "suspicious", "r"),
         lambda: tools["list_overlays"](anchor_kind="diff_subject", run_id=f"{a_id}::{b_id}"),
@@ -367,3 +369,21 @@ def test_the_cli_triage_refuses_a_stale_run_like_the_mcp_does(
     assert "STALE scan" in stale.output and "tmap rescan run_stale" in stale.output
     ok = CliRunner().invoke(hunt_cli.triage, ["run_ok", "--atlas", str(atlas), "--json"])
     assert ok.exit_code == 0, ok.output
+
+
+@pytest.mark.parametrize("pair", ["run_stale::run_ok", "run_ok::run_stale"])
+def test_the_file_readers_refuse_a_stale_run_with_no_diff(atlas: Path, pair: str) -> None:
+    """get_file_diff and the file side of annotate_diff / list_overlays are scoped to a run pair
+    that may have no binary diff at all, so they stand on the per-run gate, either side.
+
+    MUTATION (verified RED): gate them through diff_meta (_refuse_stale_pair) -> served -> RED."""
+    tools = mcp_app.make_tools(atlas)
+    anchor = f"{pair}#non_binary#etc/rc"
+    for result in (
+        tools["get_file_diff"](pair),
+        tools["annotate_diff"](anchor, "changed_real", "r", run_pair=pair),
+        tools["list_overlays"](anchor_kind="diff_subject", run_id=pair),
+    ):
+        assert "stale_scan" in result, result
+        assert result["resolved_run"] == "run_stale"
+    assert "stale_scan" not in tools["get_file_diff"]("run_ok::run_ok")

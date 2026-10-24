@@ -582,21 +582,7 @@ def prepare_diff_annotation(
     ``side_meta`` is same_shape_siblings ``_meta`` (needed for a group_ref). Raises ConfigError on
     any problem. Shared by the single ``annotate_diff`` and the batch, so both validate alike.
     ``group_cache`` (see ``annotate_group_on``) lets a batch snapshot each group once."""
-    if verdict not in _DIFF_VERDICTS:
-        if verdict in _VERDICTS:
-            raise ConfigError(
-                f"verdict must be one of {list(_DIFF_VERDICTS)} on a diff entry; {verdict!r} is a "
-                "candidate verdict — annotate the candidate, or carry this entry's judgement to "
-                "one of its candidates with promote"
-            )
-        raise ConfigError(f"verdict must be one of {list(_DIFF_VERDICTS)}; got {verdict!r}")
-    basis_json = _validate_diff_verdict_basis(verdict, verdict_basis)
-    _check_text_and_attribution(rationale, attributed_to)
-    if group_ref is not None and not isinstance(group_ref, str):
-        raise ConfigError(
-            f"group_ref must be a string, not {type(group_ref).__name__} — copy it from a "
-            "same_shape_siblings result"
-        )
+    basis_json = _check_diff_write(verdict, verdict_basis, rationale, attributed_to, group_ref)
     # Imported here, not at the top: the query package imports this module on its own import, so a
     # top-level import from it would run before this module had finished loading.
     from treasure_map.lib.query.diff_annotations import (
@@ -615,6 +601,84 @@ def prepare_diff_annotation(
         require_checked_anchor(atlas, built, meta, side_meta, verdict_basis["checked"], "checked")
     elif verdict == "changed_real" and verdict_basis is not None and "evidence" in verdict_basis:
         require_checked_anchor(atlas, built, meta, side_meta, verdict_basis["evidence"], "evidence")
+    return PreparedDiffWrite(
+        anchor_ref=anchor_ref,
+        verdict=verdict,
+        rationale=rationale,
+        attributed_to=attributed_to,
+        basis_state=json.dumps(snapshot, sort_keys=True),
+        verdict_basis=basis_json,
+    )
+
+
+def _check_diff_write(
+    verdict: str,
+    verdict_basis: dict[str, Any] | None,
+    rationale: str,
+    attributed_to: str | None,
+    group_ref: Any,
+) -> str | None:
+    """The checks every diff-side write makes before it reads anything: a diff verdict, its basis,
+    the rationale and attribution, and a group_ref that is a string. Returns the basis JSON."""
+    if verdict not in _DIFF_VERDICTS:
+        if verdict in _VERDICTS:
+            raise ConfigError(
+                f"verdict must be one of {list(_DIFF_VERDICTS)} on a diff entry; {verdict!r} is a "
+                "candidate verdict — annotate the candidate, or carry this entry's judgement to "
+                "one of its candidates with promote"
+            )
+        raise ConfigError(f"verdict must be one of {list(_DIFF_VERDICTS)}; got {verdict!r}")
+    basis_json = _validate_diff_verdict_basis(verdict, verdict_basis)
+    _check_text_and_attribution(rationale, attributed_to)
+    if group_ref is not None and not isinstance(group_ref, str):
+        raise ConfigError(
+            f"group_ref must be a string, not {type(group_ref).__name__} — copy it from a "
+            "same_shape_siblings result"
+        )
+    return basis_json
+
+
+def prepare_file_annotation(
+    atlas: sqlite3.Connection,
+    scope: Any,
+    *,
+    anchor_ref: str,
+    verdict: str,
+    rationale: str,
+    attributed_to: str | None,
+    verdict_basis: dict[str, Any] | None,
+    group_ref: str | None,
+) -> PreparedDiffWrite:
+    """Validate and snapshot one judgement on a non-binary file — READ ONLY, like
+    ``prepare_diff_annotation``, and written by the same ``write_prepared``. ``scope`` is
+    diff_annotations ``FileScope`` (the run pair, its file subjects, and the binary diff's view
+    when a ``diff_id`` named the pair). The anchor must name a file get_file_diff lists for the
+    pair now; ``checked`` / ``evidence`` resolve against the pair's files, and against the diff's
+    view too when there is one. A file has no same-shape group, so ``group_ref`` is refused."""
+    basis_json = _check_diff_write(verdict, verdict_basis, rationale, attributed_to, group_ref)
+    if group_ref is not None:
+        raise ConfigError(
+            "group_ref names a same-shape group of a function entry; a non-binary file has none"
+        )
+    from treasure_map.lib.query import diff_review as dr
+    from treasure_map.lib.query.diff_annotations import require_file_checked_anchor
+
+    if dr.split_anchor(anchor_ref, scope.run_a, scope.run_b) is None:
+        raise ConfigError(
+            f"{anchor_ref!r} is not an anchor of the run pair {scope.run_a}::{scope.run_b} — copy "
+            "it from the file's anchor_ref in get_file_diff"
+        )
+    subject = scope.subjects.get(anchor_ref)
+    if subject is None:
+        raise ConfigError(
+            f"{anchor_ref!r} names no file get_file_diff lists for {scope.run_a}::{scope.run_b} "
+            "now (a file is anchored by its path, matched exactly as get_file_diff prints it)"
+        )
+    snapshot = dr.file_snapshot(scope.run_a, scope.run_b, subject)
+    if verdict == "no_real_change" and verdict_basis is not None:
+        require_file_checked_anchor(atlas, scope, verdict_basis["checked"], "checked")
+    elif verdict == "changed_real" and verdict_basis is not None and "evidence" in verdict_basis:
+        require_file_checked_anchor(atlas, scope, verdict_basis["evidence"], "evidence")
     return PreparedDiffWrite(
         anchor_ref=anchor_ref,
         verdict=verdict,
@@ -645,7 +709,6 @@ def write_prepared(atlas: sqlite3.Connection, p: PreparedDiffWrite) -> UpsertRes
 def annotate_diff(
     atlas: sqlite3.Connection,
     *,
-    diff_id: str,
     anchor_ref: str,
     verdict: str,
     rationale: str,
@@ -653,8 +716,17 @@ def annotate_diff(
     verdict_basis: dict[str, Any] | None = None,
     group_ref: str | None = None,
     commit: bool = True,
+    diff_id: str | None = None,
+    run_pair: str | None = None,
 ) -> UpsertResult:
-    """Write (or overwrite) the judgement on one entry of a diff's function-level view.
+    """Write (or overwrite) the judgement on one entry of a diff's function-level view, or on one
+    non-binary file of a run pair.
+
+    Exactly one of ``diff_id`` (one binary's diff) and ``run_pair`` (``{run_a}::{run_b}``) names
+    where ``anchor_ref`` is read. A function or candidate anchor needs ``diff_id``. A non-binary
+    file's anchor (``{run_a}::{run_b}#non_binary#{path}``, from get_file_diff) takes ``run_pair``,
+    or the ``diff_id`` of any binary diff of the same run pair; it is checked against the pair's
+    files (lib/query/file_diff), whether or not a binary diff exists for it.
 
     ``anchor_ref`` names the entry (a function pair, a function with no counterpart, or one
     candidate row of an entry) inside ``diff_id``; get_diff_patch_view prints it on every entry.
@@ -675,9 +747,36 @@ def annotate_diff(
     A snapshot of the group is stored beside the facts, and get_diff_patch_view re-checks it: a
     member moving, joining or leaving puts the judgement back in needs_recheck. Overwriting the
     judgement without ``group_ref`` again drops the group — pass it each time to keep it."""
-    from treasure_map.lib.query.diff_annotations import _binary_diff, _built
+    from treasure_map.lib.query.diff_annotations import _binary_diff, _built, file_scope
+    from treasure_map.lib.query.file_diff import is_non_binary_anchor
     from treasure_map.lib.query.same_shape_siblings import _meta as _side_meta
 
+    if (diff_id is None) == (run_pair is None):
+        raise ConfigError(
+            "pass exactly one of diff_id (one binary's diff, from list_diffs) or run_pair "
+            "({run_a}::{run_b}, for a non-binary file's anchor)"
+        )
+    if is_non_binary_anchor(anchor_ref):
+        scope = file_scope(atlas, diff_id=diff_id, run_pair=run_pair)
+        prepared = prepare_file_annotation(
+            atlas,
+            scope,
+            anchor_ref=anchor_ref,
+            verdict=verdict,
+            rationale=rationale,
+            attributed_to=attributed_to,
+            verdict_basis=verdict_basis,
+            group_ref=group_ref,
+        )
+        result = write_prepared(atlas, prepared)
+        if commit:
+            atlas.commit()
+        return result
+    if diff_id is None:
+        raise ConfigError(
+            f"{anchor_ref!r} is a function or candidate anchor: pass diff_id (list_diffs) — "
+            "run_pair takes a non-binary file's anchor only"
+        )
     meta = _binary_diff(atlas, diff_id)
     built = _built(atlas, diff_id)
     side_meta = _side_meta(atlas, diff_id)
@@ -917,6 +1016,7 @@ def list_overlays(
     verdict: str | None = None,
     run_id: str | None = None,
     anchor_kind: str = "evidence_ref",
+    file_staleness: Any = None,
 ) -> dict[str, Any]:
     """Every annotation of one ``anchor_kind``, optionally narrowed to one verdict and/or one
     firmware run (the resume view: 'what did I mark inconclusive / suspicious / excluded, on THIS
@@ -930,12 +1030,15 @@ def list_overlays(
     Candidate annotations by default. A promoted one also carries ``promoted_from`` (the diff it
     came from, the carrying row's landing + subclass, and whether that diff is current now); when it
     is not, the row reads ``source_diff_stale`` (see ``effective_basis_state``). ``diff_subject``
-    lists the diff-entry annotations instead, through lib/query/diff_annotations."""
+    lists the diff-entry annotations instead, through lib/query/diff_annotations
+    (``file_staleness`` is passed to it for the judgements on non-binary files)."""
     _check_anchor_kind(anchor_kind)
     if anchor_kind == "diff_subject":
         from treasure_map.lib.query.diff_annotations import list_diff_overlays
 
-        return list_diff_overlays(atlas, verdict=verdict, run_id=run_id)
+        return list_diff_overlays(
+            atlas, verdict=verdict, run_id=run_id, file_staleness=file_staleness
+        )
     params: list[str] = [anchor_kind]
     conds: list[str] = ["anchor_kind = ?"]
     if verdict is not None:

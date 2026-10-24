@@ -1262,10 +1262,10 @@ def test_the_tools_write_list_and_refuse_with_the_facts(world: World) -> None:
     tools = mcp_app.make_tools(world.path)
     view = tools["get_diff_patch_view"](DX)
     anchor = view["entries"][0]["anchor_ref"]
-    r = tools["annotate_diff"](DX, anchor, "no_real_change", "why", checked=[anchor])
+    r = tools["annotate_diff"](anchor, "no_real_change", "why", checked=[anchor], diff_id=DX)
     assert r["written"] is False and "why_unchanged" in r["error"]
     r = tools["annotate_diff"](
-        DX, anchor, "no_real_change", "why", checked=[anchor], why_unchanged="renamed"
+        anchor, "no_real_change", "why", checked=[anchor], why_unchanged="renamed", diff_id=DX
     )
     assert r["written"] is True and r["action"] == "inserted"
 
@@ -1309,7 +1309,7 @@ def test_batch_writes_every_valid_entry_and_echoes_compactly(world: World) -> No
     items = [
         {"anchor_ref": a, "verdict": "changed_real", "rationale": "it does X"} for a in anchors
     ]
-    out = tools["annotate_diff_batch"](DX, items)
+    out = tools["annotate_diff_batch"](items, diff_id=DX)
     assert out["written"] is True and out["count"] == 50
     assert {r["index"] for r in out["results"]} == set(range(50))
     assert all(r["action"] == "inserted" for r in out["results"])
@@ -1332,7 +1332,7 @@ def test_batch_all_or_none_one_bad_item_writes_nothing(world: World) -> None:
         "verdict": "suspicious",
         "rationale": "x",
     }  # candidate verdict
-    out = tools["annotate_diff_batch"](DX, items)
+    out = tools["annotate_diff_batch"](items, diff_id=DX)
     assert out["written"] is False and out["count"] == 0
     assert any(7 in e["indexes"] for e in out["errors"])
     assert _overlay_rows(world) == 0
@@ -1352,7 +1352,6 @@ def test_batch_equals_per_entry_field_for_field(world: World) -> None:
         ).fetchone()
 
     tools["annotate_diff_batch"](
-        DX,
         [
             {
                 "anchor_ref": anchor,
@@ -1361,11 +1360,17 @@ def test_batch_equals_per_entry_field_for_field(world: World) -> None:
                 "checked": [anchor, "a note"],
             }
         ],
+        diff_id=DX,
     )
     batched = tuple(row())
     tools["clear_overlay"](anchor_kind="diff_subject", anchor_ref=anchor)
     tools["annotate_diff"](
-        DX, anchor, "no_real_change", None, checked=[anchor, "a note"], why_unchanged="renamed only"
+        anchor,
+        "no_real_change",
+        None,
+        checked=[anchor, "a note"],
+        why_unchanged="renamed only",
+        diff_id=DX,
     )
     assert tuple(row()) == batched
 
@@ -1377,7 +1382,7 @@ def test_batch_duplicate_anchor_refuses_the_whole_batch(world: World) -> None:
     tools, anchors = _batch_world(world, 3)
     items = [{"anchor_ref": a, "verdict": "changed_real", "rationale": "x"} for a in anchors]
     items.append({"anchor_ref": anchors[0], "verdict": "changed_real", "rationale": "y"})
-    out = tools["annotate_diff_batch"](DX, items)
+    out = tools["annotate_diff_batch"](items, diff_id=DX)
     assert out["written"] is False
     dup = next(e for e in out["errors"] if sorted(e["indexes"]) == [0, 3])
     assert anchors[0] in dup["error"]
@@ -1387,8 +1392,8 @@ def test_batch_duplicate_anchor_refuses_the_whole_batch(world: World) -> None:
 def test_batch_rejects_over_two_hundred(world: World) -> None:
     tools, anchors = _batch_world(world, 1)
     item = {"anchor_ref": anchors[0], "verdict": "changed_real", "rationale": "x"}
-    assert tools["annotate_diff_batch"](DX, [item] * 201)["written"] is False
-    assert tools["annotate_diff_batch"](DX, [])["written"] is False
+    assert tools["annotate_diff_batch"]([item] * 201, diff_id=DX)["written"] is False
+    assert tools["annotate_diff_batch"]([], diff_id=DX)["written"] is False
 
 
 def test_batch_checked_needs_a_resolving_anchor_and_names_a_fake_one(world: World) -> None:
@@ -1404,7 +1409,7 @@ def test_batch_checked_needs_a_resolving_anchor_and_names_a_fake_one(world: Worl
         "why_unchanged": "w",
         "checked": [anchors[0], "a plain note"],
     }
-    assert tools["annotate_diff_batch"](DX, [ok])["written"] is True
+    assert tools["annotate_diff_batch"]([ok], diff_id=DX)["written"] is True
     tools["clear_overlay"](anchor_kind="diff_subject", anchor_ref=anchors[0])
 
     plain = {
@@ -1413,7 +1418,7 @@ def test_batch_checked_needs_a_resolving_anchor_and_names_a_fake_one(world: Worl
         "why_unchanged": "w",
         "checked": ["just a note", "another note"],
     }
-    out = tools["annotate_diff_batch"](DX, [plain])
+    out = tools["annotate_diff_batch"]([plain], diff_id=DX)
     assert out["written"] is False
     assert "at least one anchor" in out["errors"][0]["error"]
 
@@ -1424,7 +1429,7 @@ def test_batch_checked_needs_a_resolving_anchor_and_names_a_fake_one(world: Worl
         "why_unchanged": "w",
         "checked": [anchors[0], fake],
     }
-    out = tools["annotate_diff_batch"](DX, [item])
+    out = tools["annotate_diff_batch"]([item], diff_id=DX)
     assert out["written"] is False
     assert (
         "looks like" in out["errors"][0]["error"] and "names nothing" in out["errors"][0]["error"]
@@ -1437,7 +1442,6 @@ def test_batch_rationale_is_optional_for_no_real_change(world: World) -> None:
     changed_real with no rationale is refused."""
     tools, anchors = _batch_world(world, 2)
     out = tools["annotate_diff_batch"](
-        DX,
         [
             {
                 "anchor_ref": anchors[0],
@@ -1446,13 +1450,16 @@ def test_batch_rationale_is_optional_for_no_real_change(world: World) -> None:
                 "checked": [anchors[0]],
             }
         ],
+        diff_id=DX,
     )
     assert out["written"] is True
     stored = world.atlas.execute(
         "SELECT rationale FROM overlay WHERE anchor_ref = ?", (anchors[0],)
     ).fetchone()[0]
     assert stored == "same call, renamed"
-    out = tools["annotate_diff_batch"](DX, [{"anchor_ref": anchors[1], "verdict": "changed_real"}])
+    out = tools["annotate_diff_batch"](
+        [{"anchor_ref": anchors[1], "verdict": "changed_real"}], diff_id=DX
+    )
     assert out["written"] is False and "rationale is required" in out["errors"][0]["error"]
 
 
@@ -1461,7 +1468,6 @@ def test_batch_changed_real_evidence_is_recorded_and_echoed(world: World) -> Non
     evidence, not checked / why_unchanged."""
     tools, anchors = _batch_world(world, 2)
     out = tools["annotate_diff_batch"](
-        DX,
         [
             {
                 "anchor_ref": anchors[0],
@@ -1470,6 +1476,7 @@ def test_batch_changed_real_evidence_is_recorded_and_echoed(world: World) -> Non
                 "evidence": [anchors[0]],
             }
         ],
+        diff_id=DX,
     )
     assert out["written"] is True
     stored = json.loads(
@@ -1481,7 +1488,8 @@ def test_batch_changed_real_evidence_is_recorded_and_echoed(world: World) -> Non
     # K4: evidence does not move basis_state / review_state vs the same verdict without it
     without = _pair_anchor(DX, f"{0x1000 + 1:08x}", f"{0x9000 + 1:08x}")
     tools["annotate_diff_batch"](
-        DX, [{"anchor_ref": without, "verdict": "changed_real", "rationale": "adds a system call"}]
+        [{"anchor_ref": without, "verdict": "changed_real", "rationale": "adds a system call"}],
+        diff_id=DX,
     )
 
     def basis_and_state(a: str) -> tuple[str, str]:
@@ -1491,7 +1499,6 @@ def test_batch_changed_real_evidence_is_recorded_and_echoed(world: World) -> Non
 
     assert basis_and_state(anchors[0]) == basis_and_state(without)
     bad = tools["annotate_diff_batch"](
-        DX,
         [
             {
                 "anchor_ref": anchors[1],
@@ -1500,6 +1507,7 @@ def test_batch_changed_real_evidence_is_recorded_and_echoed(world: World) -> Non
                 "checked": [anchors[1]],
             }
         ],
+        diff_id=DX,
     )
     assert bad["written"] is False and "evidence only" in bad["errors"][0]["error"]
 
@@ -1515,7 +1523,7 @@ def test_batch_unknown_key_and_missing_fields_fail_that_item(world: World) -> No
         {"verdict": "changed_real", "rationale": "x"},
         {"anchor_ref": anchors[1], "rationale": "x"},
     ]
-    out = tools["annotate_diff_batch"](DX, items)
+    out = tools["annotate_diff_batch"](items, diff_id=DX)
     assert out["written"] is False and _overlay_rows(world) == 0
     joined = json.dumps(out["errors"])
     assert (
@@ -1542,7 +1550,7 @@ def test_batch_failures_merge_by_message_within_budget(world: World) -> None:
         }
         for a in anchors
     ]
-    out = tools["annotate_diff_batch"](DX, plain)
+    out = tools["annotate_diff_batch"](plain, diff_id=DX)
     assert (
         out["written"] is False
         and len(out["errors"]) == 1
@@ -1559,7 +1567,7 @@ def test_batch_failures_merge_by_message_within_budget(world: World) -> None:
         }
         for i in range(200)
     ]
-    out = tools["annotate_diff_batch"](DX, missing)
+    out = tools["annotate_diff_batch"](missing, diff_id=DX)
     assert (
         out["written"] is False
         and len(out["errors"]) == 1
@@ -1653,7 +1661,6 @@ def test_each_anchor_kind_alone_satisfies_checked(world: World, kind: str) -> No
     item, expected = _checked_kinds()[kind]
 
     out = tools["annotate_diff_batch"](
-        DX,
         [
             {
                 "anchor_ref": anchors[0],
@@ -1662,6 +1669,7 @@ def test_each_anchor_kind_alone_satisfies_checked(world: World, kind: str) -> No
                 "checked": [item, "a plain note"],
             }
         ],
+        diff_id=DX,
     )
     assert out["written"] is True, out
     stored = json.loads(
@@ -1694,14 +1702,14 @@ def test_checked_refuses_an_anchor_of_another_run_pair_by_position(world: World)
         "why_unchanged": "w",
         "checked": [anchors[0], "a plain note", wrong_run],
     }
-    out = tools["annotate_diff_batch"](DX, [item])
+    out = tools["annotate_diff_batch"]([item], diff_id=DX)
     assert out["written"] is False
     (err,) = out["errors"]
     assert err["indexes"] == [0]
     assert "checked[2]" in err["error"] and "anchor_ref anchor" in err["error"]
     assert "names nothing" in err["error"]
     single = tools["annotate_diff"](
-        DX, anchors[0], "no_real_change", checked=item["checked"], why_unchanged="w"
+        anchors[0], "no_real_change", checked=item["checked"], why_unchanged="w", diff_id=DX
     )
     assert single["written"] is False and "checked[2]" in single["error"]
     assert _overlay_rows(world) == 0
@@ -1727,11 +1735,11 @@ def test_evidence_on_any_verdict_but_changed_real_is_refused(world: World, verdi
     }
     if verdict == "no_real_change":
         item.update(checked=[anchors[0]], why_unchanged="w")
-    out = tools["annotate_diff_batch"](DX, [item])
+    out = tools["annotate_diff_batch"]([item], diff_id=DX)
     assert out["written"] is False, out
     assert out["errors"][0]["error"] == "evidence applies to changed_real only"
     single = tools["annotate_diff"](
-        DX, **{k: v for k, v in item.items() if k != "anchor_ref"}, anchor_ref=anchors[0]
+        **{k: v for k, v in item.items() if k != "anchor_ref"}, anchor_ref=anchors[0], diff_id=DX
     )
     assert single["written"] is False and single["error"] == "evidence applies to changed_real only"
     assert _overlay_rows(world) == 0
@@ -1745,11 +1753,11 @@ def test_change_inconclusive_without_a_rationale_is_refused(world: World) -> Non
     does -> the refusal no longer names the missing rationale."""
     tools, anchors = _batch_world(world, 1)
     out = tools["annotate_diff_batch"](
-        DX, [{"anchor_ref": anchors[0], "verdict": "change_inconclusive"}]
+        [{"anchor_ref": anchors[0], "verdict": "change_inconclusive"}], diff_id=DX
     )
     assert out["written"] is False
     assert "rationale is required for change_inconclusive" in out["errors"][0]["error"]
-    single = tools["annotate_diff"](DX, anchors[0], "change_inconclusive")
+    single = tools["annotate_diff"](anchors[0], "change_inconclusive", diff_id=DX)
     assert single["written"] is False
     assert "rationale is required for change_inconclusive" in single["error"]
     assert _overlay_rows(world) == 0
@@ -1762,10 +1770,12 @@ def test_a_candidate_verdict_without_a_rationale_names_the_right_tool(world: Wor
     MUTATION (verified RED): resolve the rationale before the verdict is known to be a diff verdict
     -> the refusal reads "rationale is required for suspicious"."""
     tools, anchors = _batch_world(world, 1)
-    out = tools["annotate_diff_batch"](DX, [{"anchor_ref": anchors[0], "verdict": "suspicious"}])
+    out = tools["annotate_diff_batch"](
+        [{"anchor_ref": anchors[0], "verdict": "suspicious"}], diff_id=DX
+    )
     assert out["written"] is False
     assert "candidate verdict" in out["errors"][0]["error"]
-    single = tools["annotate_diff"](DX, anchors[0], "suspicious")
+    single = tools["annotate_diff"](anchors[0], "suspicious", diff_id=DX)
     assert single["written"] is False and "candidate verdict" in single["error"]
     assert _overlay_rows(world) == 0
 
@@ -1785,7 +1795,7 @@ def test_a_non_string_group_ref_fails_that_item(world: World, bad: Any) -> None:
         {"anchor_ref": anchors[0], "verdict": "changed_real", "rationale": "x", "group_ref": bad},
         {"anchor_ref": anchors[1], "rationale": "x"},  # missing verdict
     ]
-    out = tools["annotate_diff_batch"](DX, items)
+    out = tools["annotate_diff_batch"](items, diff_id=DX)
     assert out["written"] is False
     by_index = {i: e["error"] for e in out["errors"] for i in e["indexes"]}
     assert set(by_index) == {0, 1}
@@ -1807,7 +1817,7 @@ def test_a_write_failing_mid_batch_leaves_nothing_written(
     MUTATIONS (verified RED): commit after each write -> the writes before k persist and the prior
     judgement is overwritten; open the batch's connection in autocommit mode -> the same."""
     tools, anchors = _batch_world(world, 5)
-    before = tools["annotate_diff"](DX, anchors[0], "changed_real", "before the batch")
+    before = tools["annotate_diff"](anchors[0], "changed_real", "before the batch", diff_id=DX)
     assert before["written"] is True
     real = overlay.write_prepared
     calls = {"n": 0}
@@ -1823,7 +1833,7 @@ def test_a_write_failing_mid_batch_leaves_nothing_written(
         {"anchor_ref": a, "verdict": "change_inconclusive", "rationale": "in the batch"}
         for a in anchors
     ]
-    out = tools["annotate_diff_batch"](DX, items)
+    out = tools["annotate_diff_batch"](items, diff_id=DX)
     assert calls["n"] == fail_at + 1  # the injection fired, at the k-th write
     assert out["written"] is False and out["count"] == 0
     assert "nothing was written" in out["errors"][0]["error"]

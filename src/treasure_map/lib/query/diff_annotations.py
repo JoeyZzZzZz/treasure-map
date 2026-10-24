@@ -12,7 +12,10 @@ a reader was shown.
   * ``check_promotion`` — whether a judgement on an entry may be carried onto one of its
     candidates (see its docstring for the rules and why each exists).
   * ``list_diff_overlays`` — every diff-side judgement with its live state; for one run pair,
-    also the progress over every diff of that pair, with what no diff covers beside it.
+    also the progress over every diff of that pair, with what no diff covers beside it. A judgement
+    on a non-binary file is read on its own path (file_diff.file_review), never by a binary diff.
+  * ``file_scope`` / ``require_file_checked_anchor`` — where a judgement on a non-binary file is
+    checked: the run pair's files, and a binary diff's view when a ``diff_id`` named the pair.
 
 Nothing here writes.
 """
@@ -22,7 +25,8 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from dataclasses import replace
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from typing import Any
 
 from treasure_map.lib.errors import ConfigError
@@ -258,11 +262,114 @@ def require_checked_anchor(
         raise ConfigError(_rule_for(field))
 
 
+# ── a judgement on a non-binary file ─────────────────────────────────────────────────────────
+
+_NON_BINARY_MARKER = re.compile(r"^[^\s#]+::[^\s#]+#non_binary#")
+
+
+@dataclass
+class FileScope:
+    """Where a judgement on a non-binary file is checked: the run pair, its files' subjects, and —
+    when a ``diff_id`` named the pair — that diff's view (None when withheld or not asked for)."""
+
+    run_a: str
+    run_b: str
+    subjects: dict[str, dr.Subject]
+    diff_id: str | None = None
+    built: BuiltDiff | None = None
+    meta: dict[str, Any] | None = None
+    side_meta: Any = None
+
+
+def file_scope(
+    atlas: sqlite3.Connection, *, diff_id: str | None = None, run_pair: str | None = None
+) -> FileScope:
+    """The scope of a non-binary file's judgement, named by ``run_pair`` or by the ``diff_id`` of a
+    binary diff of the same pair. A diff undetermined as a whole still names its pair: its files
+    are read all the same, only its function anchors cannot resolve in ``checked``."""
+    from treasure_map.lib.query.file_diff import (
+        FileDiffError,
+        file_subjects,
+        read_pair,
+        split_run_pair,
+    )
+    from treasure_map.lib.query.same_shape_siblings import _meta as _side_meta
+
+    built: BuiltDiff | None = None
+    meta: dict[str, Any] | None = None
+    side_meta: Any = None
+    if diff_id is not None:
+        meta = _binary_diff(atlas, diff_id)
+        run_a, run_b = str(meta["run_a_id"]), str(meta["run_b_id"])
+        try:
+            built = _built(atlas, diff_id)
+            side_meta = _side_meta(atlas, diff_id)
+        except ConfigError:
+            built = None
+    else:
+        assert run_pair is not None
+        runs = split_run_pair(atlas, run_pair)
+        if runs is None:
+            raise ConfigError(
+                f"run pair {run_pair!r} does not name two runs in this atlas — pass "
+                "'{run_a}::{run_b}' with both taken from list_runs"
+            )
+        run_a, run_b = runs
+    try:
+        subjects = file_subjects(read_pair(atlas, run_a, run_b))
+    except FileDiffError as exc:
+        raise ConfigError(str(exc)) from exc
+    return FileScope(run_a, run_b, subjects, diff_id, built, meta, side_meta)
+
+
+def require_file_checked_anchor(
+    atlas: sqlite3.Connection, scope: FileScope, items: list[str], field: str
+) -> None:
+    """The ``checked`` / ``evidence`` rule on a non-binary file's judgement: an item resolves when
+    it is a file anchor get_file_diff lists for the pair now, or — when a diff_id named the pair —
+    an anchor of that diff's current view. A file anchor that names no file, or a function /
+    candidate anchor with no diff view to read it in, is refused by name; plain text is kept but
+    does not count; at least one anchor must resolve."""
+    hits = 0
+    for i, raw in enumerate(items):
+        item = raw.strip()
+        if item in scope.subjects:
+            hits += 1
+            continue
+        if scope.built is not None and scope.meta is not None:
+            if is_diff_anchor(atlas, scope.built, scope.meta, scope.side_meta, item) is not None:
+                hits += 1
+                continue
+        if _NON_BINARY_MARKER.match(item):
+            raise ConfigError(
+                f"{field}[{i}] looks like a non_binary anchor but names no file get_file_diff "
+                f"lists for {scope.run_a}::{scope.run_b} now"
+            )
+        marker = _anchor_marker(item)
+        if marker is not None:
+            if scope.built is None:
+                raise ConfigError(
+                    f"{field}[{i}] looks like a {marker} anchor: a function or candidate anchor "
+                    "resolves only in a binary diff's view — pass diff_id instead of run_pair"
+                )
+            raise ConfigError(
+                f"{field}[{i}] looks like a {marker} anchor but names nothing in this diff's "
+                "current view"
+            )
+    if hits == 0:
+        raise ConfigError(_rule_for(field))
+
+
 # ── promotion ──────────────────────────────────────────────────────────────────────────────
 
 
 def _entry(built: BuiltDiff, meta: dict[str, Any], entry_id: str) -> _Entry:
     """The listed entry named by its entry_id, or by its anchor_ref."""
+    if entry_id.split("#", 2)[1:2] == ["non_binary"]:
+        raise ConfigError(
+            "promote carries a judgement onto a candidate of a function entry; a non-binary file "
+            "has no candidate rows"
+        )
     by_id = {e.entry_id: e for e in built.entries}
     if entry_id in by_id:
         return by_id[entry_id]
@@ -390,6 +497,61 @@ _LIST_NOTE = (
 )
 
 
+def _is_file_row(row: dict[str, Any]) -> bool:
+    from treasure_map.lib.query.file_diff import is_non_binary_anchor
+
+    return is_non_binary_anchor(str(row["anchor_ref"]))
+
+
+def _file_judgements(
+    atlas: sqlite3.Connection,
+    rows: list[dict[str, Any]],
+    file_staleness: Callable[[str, str], dict[str, Any]] | None,
+) -> dict[int, dr.DiffAnnotation]:
+    """Each non-binary file judgement (overlay row id ->) read on the file path, its run pair's
+    files read once. A pair whose runs or files cannot be read leaves its judgements unresolved,
+    with the reason."""
+    from treasure_map.lib.query.file_diff import (
+        FileDiffError,
+        file_review,
+        read_pair,
+        split_run_pair,
+    )
+
+    out: dict[int, dr.DiffAnnotation] = {}
+    by_pair: dict[str, list[dict[str, Any]]] = {}
+    for r in rows:
+        by_pair.setdefault(str(r["run_id"]), []).append(r)
+    for pair, members in by_pair.items():
+        runs = split_run_pair(atlas, pair)
+        judged: dict[str, dr.DiffAnnotation] = {}
+        why = "run_pair_unknown"
+        if runs is not None:
+            run_a, run_b = runs
+            staleness = file_staleness(run_a, run_b) if file_staleness is not None else {}
+            try:
+                judged = file_review(
+                    atlas,
+                    run_a,
+                    run_b,
+                    source_stale=staleness.get("source_stale"),
+                    source_stale_reason=staleness.get("source_stale_reason"),
+                    pf=read_pair(atlas, run_a, run_b),
+                )
+            except FileDiffError:
+                why = "files_unreadable"
+        for r in members:
+            out[r["id"]] = judged.get(r["anchor_ref"]) or dr.DiffAnnotation(
+                anchor_ref=r["anchor_ref"],
+                verdict=r["verdict"],
+                basis_state=dr.ANCHOR_UNRESOLVED,
+                moved={},
+                source_stale=None,
+                source_stale_reason=why,
+            )
+    return out
+
+
 def _pair_diffs(atlas: sqlite3.Connection, pair: str) -> list[dict[str, Any]]:
     """Every binary diff of one run pair, matched on the pair as a whole."""
     return dr.as_dicts(
@@ -418,10 +580,20 @@ def _diff_of(row: dict[str, Any], diffs: list[dict[str, Any]]) -> str | None:
 
 
 def list_diff_overlays(
-    atlas: sqlite3.Connection, *, verdict: str | None = None, run_id: str | None = None
+    atlas: sqlite3.Connection,
+    *,
+    verdict: str | None = None,
+    run_id: str | None = None,
+    file_staleness: Callable[[str, str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Every judgement on a diff entry, optionally one verdict and/or one run pair
     (``run_id`` = ``{run_a}::{run_b}``), each read against its diff's view as it is now.
+
+    A judgement on a non-binary file is read apart, against the run pair's files
+    (file_diff.file_review), never through a binary diff: it carries ``diff_id`` null and its
+    ``run_pair``. ``file_staleness(run_a, run_b)`` gives its ``source_stale`` /
+    ``source_stale_reason`` — the caller's reading of the two runs; without it they are unknown
+    (None), which reads ``needs_recheck``.
 
     With ``run_id`` it also carries ``review_progress`` over EVERY diff of that pair — which
     rebuilds every one of their views: seconds per hundred diffs (about 10 s for a pair of 126
@@ -444,11 +616,14 @@ def list_diff_overlays(
             params,
         )
     )
-    named = {str(r["run_id"]) for r in rows if r["run_id"]}
+    file_judged = _file_judgements(atlas, [r for r in rows if _is_file_row(r)], file_staleness)
+    named = {str(r["run_id"]) for r in rows if r["run_id"] and not _is_file_row(r)}
     if run_id is not None:
         named.add(run_id)
     pairs = {pair: _pair_diffs(atlas, pair) for pair in sorted(named)}
-    of_row = {r["id"]: _diff_of(r, pairs.get(r["run_id"], [])) for r in rows}
+    of_row = {
+        r["id"]: None if _is_file_row(r) else _diff_of(r, pairs.get(r["run_id"], [])) for r in rows
+    }
     wanted = {d for d in of_row.values() if d is not None}
     if run_id is not None:
         wanted |= {str(d["diff_id"]) for d in pairs[run_id]}
@@ -465,6 +640,8 @@ def list_diff_overlays(
         diff_id = of_row[r["id"]]
         review = reviews.get(diff_id) if diff_id is not None else None
         judged = review.judged.get(r["anchor_ref"]) if review is not None else None
+        if _is_file_row(r):
+            judged = file_judged[r["id"]]
         if judged is None:  # its diff is gone, or the anchor names none of the pair's diffs
             judged = dr.DiffAnnotation(
                 anchor_ref=r["anchor_ref"],
@@ -476,13 +653,18 @@ def list_diff_overlays(
             )
         parts = r["anchor_ref"].split("#", 2)
         state = judged.state
+        row_out: dict[str, Any] = {
+            "id": r["id"],
+            "anchor_kind": r["anchor_kind"],
+            "anchor_ref": r["anchor_ref"],
+            "run_id": r["run_id"],
+            "diff_id": diff_id,
+        }
+        if _is_file_row(r):
+            row_out["run_pair"] = r["run_id"]
         out.append(
             {
-                "id": r["id"],
-                "anchor_kind": r["anchor_kind"],
-                "anchor_ref": r["anchor_ref"],
-                "run_id": r["run_id"],
-                "diff_id": diff_id,
+                **row_out,
                 "subject_kind": parts[1] if len(parts) == 3 else None,
                 "verdict": r["verdict"],
                 "attributed_to": r["attributed_to"],

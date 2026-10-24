@@ -292,7 +292,7 @@ def _subject_side_refs(built: BuiltDiff, anchor_ref: str, side: str) -> tuple[se
         return ({ref} if ref else set()), True
     subjects = dr.subjects_of(built.placed, diff.run_a, diff.run_b, diff.binary or "")
     subject = subjects.get(anchor_ref)
-    if subject is None:
+    if subject is None or subject.entry is None:
         return set(), False
     refs = {(r.a_ref if side == "a" else r.b_ref) for r in subject.entry.rows}
     return {r for r in refs if r}, False
