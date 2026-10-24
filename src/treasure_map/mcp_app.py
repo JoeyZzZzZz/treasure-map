@@ -2816,16 +2816,22 @@ def make_tools(
         the difference of the rows the scan recorded for it (``recorded_scope`` says which: a
         filtered subset, so read the hunk too), as multiset differences with ``count`` — and
         ``hunk_stats`` (plus_lines / minus_lines / segments / bytes) of its line difference.
-        ``path`` reads one file: every structured item and the line difference itself
-        (``hunk.lines``, 3 lines of context), paged by ``hunk_offset`` = ``next_hunk_offset``; a
-        line too long for a page is cut into pieces (``line_cut``, ``cut_at`` = the pieces that
-        continue in the next). ``detail="summary"`` gives the structured comparison as counts.
+        ``path`` reads one file: every structured item, paged by ``offset`` =
+        ``structured.lists_paging.next_offset`` (each list from that item on), and the line
+        difference itself (``hunk.lines``, 3 lines of context), paged by ``hunk_offset`` =
+        ``next_hunk_offset`` — the lists are on the pages with ``hunk_offset`` 0, the text on the
+        pages with ``offset`` 0, so pass one above 0, not both; a line too long for a page is cut
+        into pieces (``line_cut``, ``cut_at`` = the pieces that continue in the next).
+        ``detail="summary"`` gives the structured comparison as counts.
 
         The text is not given for a credential file, a file with a sensitive recorded entry, or a
         difference holding a private-key header or a full crypt hash — only its shape
-        (``hunk_suppressed`` + ``hunk_shape``); credential material, its hashes and a sensitive
-        config value are never given. ``hunk_unavailable`` names why no line difference was read
-        (the file is missing, outside the firmware root, not the bytes the scan hashed, binary...).
+        (``hunk_suppressed`` + ``hunk_shape.segments``, paged as the text is). Credential material
+        and a sensitive config value are never given; every file carries its file-level sha256
+        (``sha_a`` / ``sha_b``), so for a file whose whole content is one credential (a single-key
+        PEM file) that sha256 is also the material's. ``hunk_unavailable`` names why no line
+        difference was read (the file is missing, outside the firmware root, not the bytes the scan
+        hashed, binary...).
 
         Each file has an ``anchor_ref`` and ``review_state``: judge one with annotate_diff(
         anchor_ref, verdict, rationale, run_pair=...). A stale run on either side is refused."""

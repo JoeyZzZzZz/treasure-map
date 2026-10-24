@@ -598,7 +598,9 @@ def annotation_block(
             "A writable layer of YOUR judgements over this read-only view: one per entry "
             "(anchor_ref on every entry), or per candidate row. The view's facts never change "
             "because of it; with band=true it reorders entries only inside the groups the "
-            "page's order already forms."
+            "page's order already forms. A non-binary file of the run pair is judged too: "
+            "get_file_diff(run_pair) lists them with their anchor_ref, and annotate_diff(..., "
+            "run_pair=...) records one."
         ),
         "annotate_diff": _call(
             "annotate_diff",

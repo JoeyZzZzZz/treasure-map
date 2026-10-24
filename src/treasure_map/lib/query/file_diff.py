@@ -18,9 +18,12 @@ filtered subset of what they hold (``script_calls``, ``config_entries``, ``crede
     a file with a sensitive recorded entry, and a file whose difference holds a private-key header
     or a full crypt hash give the shape of their difference only, never its text.
 
-Credential material and its hashes, and the value of a sensitive config entry, are never part of
-any output. Entry point: a run pair ``{run_a}::{run_b}``, whether or not a binary diff exists for
-it. Read-only: the analysis databases are opened read-only and the firmware roots are only read.
+Credential material and the value of a sensitive config entry are never part of any output, and this
+reading computes no hash of them. Every file carries its file-level sha256 (``sha_a`` / ``sha_b``),
+as the scan recorded it: when a file's whole content is one credential's material (a single-key PEM
+file), that sha256 is also the sha256 of the material. Entry point: a run pair ``{run_a}::{run_b}``,
+whether or not a binary diff exists for it. Read-only: the analysis databases are opened read-only
+and the firmware roots are only read.
 """
 
 from __future__ import annotations
@@ -49,10 +52,13 @@ DEFAULT_LIMIT = 50
 MAX_LIMIT = 200
 # A list page's structured lists keep this many items; the file's own page keeps every one.
 LIST_PAGE_ITEMS = 10
-# Hunk text paging: one piece (a line, or a part of a longer one) and one page, in bytes of its
-# compact JSON encoding. A page leaves the rest of the 48,000-byte response for its envelope.
+# A file's own page, in bytes of the JSON encoding the response is measured in: one hunk piece (a
+# line, or a part of a longer one), the hunk text (or suppressed shape) of one page, and the
+# structured lists of one page. Together with the envelope they stay within the 48,000-byte
+# response.
 HUNK_PIECE_BYTES = 16_000
-HUNK_PAGE_BYTES = 32_000
+HUNK_PAGE_BYTES = 28_000
+STRUCT_PAGE_BYTES = 12_000
 HUNK_CONTEXT = 3
 
 SCOPES = {
@@ -83,8 +89,9 @@ LEGEND = {
     "hunk": (
         "the line difference of the two files as the firmware root holds them, with 3 lines of "
         "context; a list page gives hunk_stats only (plus_lines / minus_lines / segments / bytes), "
-        "a file's own page (path) gives the text, paged by hunk_offset; a file on one side only is "
-        "compared with an empty file"
+        "a file's own page (path) gives the text, paged by hunk_offset, and its structured lists "
+        "in full, paged by offset (lists_paging); a file on one side only is compared with an "
+        "empty file"
     ),
     "hunk_suppressed": (
         "the text is not given, only its shape (each segment's line ranges and its plus_lines / "
@@ -111,8 +118,13 @@ CAVEATS = {
     ),
 }
 
-_PEM_PRIVATE = re.compile(r"^-----BEGIN [A-Z ]*PRIVATE KEY-----$")
-_CRYPT_HASH = re.compile(r"(?:^|[:=,\s])\$(1|2[aby]?|5|6)\$[./A-Za-z0-9]{1,}\$[./A-Za-z0-9]{10,}")
+# A private-key header anywhere in a line (quoted, echoed, inside a string literal), and a crypt
+# hash in its complete format — id, an optional rounds= field, salt, hash — not preceded by a word
+# character or a ``$``: a regex replacement holding ``$1$`` (``s/$1$abc/``, ``$1$2``) is not one.
+_PEM_PRIVATE = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
+_CRYPT_HASH = re.compile(
+    r"(?<![\w$])\$(1|2[aby]?|5|6)\$(?:rounds=\d+\$)?[./A-Za-z0-9]{1,22}\$[./A-Za-z0-9]{8,}"
+)
 
 
 class FileDiffError(ValueError):
@@ -487,7 +499,48 @@ def _cut_lists(block: dict[str, Any], keep: int) -> dict[str, Any]:
                 cut[name] = len(items)
                 out[name] = items[:keep]
     if cut:
-        out["lists_cut"] = {"shown": keep, "totals": cut, "read_all_with": "path"}
+        out["lists_cut"] = {
+            "shown": keep,
+            "totals": cut,
+            "read_all_with": "path (its lists paged by offset)",
+        }
+    return out
+
+
+def structured_page(block: dict[str, Any], offset: int, limit: int) -> dict[str, Any]:
+    """A file's structured block with each list cut to items ``offset`` .. ``offset + k``: ``k`` at
+    most ``limit``, and the largest that keeps the block within STRUCT_PAGE_BYTES (always one).
+    ``lists_paging`` says where the cut is and where the next page starts."""
+    names = [n for ns in _LISTS.values() for n in ns if isinstance(block.get(n), list)]
+    longest = max((len(block[n]) for n in names), default=0)
+    if longest == 0:
+        if offset > 0:
+            raise FileDiffError(f"offset {offset} is past this file's structured lists (none)")
+        return block
+    if offset >= longest:
+        raise FileDiffError(f"offset {offset} is past this file's longest list ({longest} items)")
+
+    def cut(k: int) -> dict[str, Any]:
+        out = dict(block)
+        for n in names:
+            out[n] = block[n][offset : offset + k]
+        return out
+
+    lo, hi = 1, max(1, min(limit, longest - offset))
+    while lo < hi:  # the largest k whose block fits; the size grows with k
+        mid = (lo + hi + 1) // 2
+        if len(json.dumps(cut(mid))) <= STRUCT_PAGE_BYTES:
+            lo = mid
+        else:
+            hi = mid - 1
+    out = cut(lo)
+    end = offset + lo
+    out["lists_paging"] = {
+        "offset": offset,
+        "per_list": lo,
+        "totals": {n: len(block[n]) for n in names},
+        "next_offset": end if end < longest else None,
+    }
     return out
 
 
@@ -566,7 +619,7 @@ def _embedded_secret(lines: list[str]) -> bool:
         if x.startswith("@@"):
             continue
         text = x[1:] if x[:1] in ("+", "-", " ") else x
-        if _PEM_PRIVATE.match(text.strip()) or _CRYPT_HASH.search(text):
+        if _PEM_PRIVATE.search(text) or _CRYPT_HASH.search(text):
             return True
     return False
 
@@ -614,7 +667,8 @@ def _hunk_fields(h: Hunk) -> dict[str, Any]:
 
 
 def _encoded(text: str) -> int:
-    return len(json.dumps(text, separators=(",", ":")))
+    """The bytes one string takes in the response's JSON encoding."""
+    return len(json.dumps(text))
 
 
 def _pieces(lines: list[str]) -> list[tuple[str, bool]]:
@@ -651,7 +705,7 @@ def hunk_page(h: Hunk, offset: int) -> dict[str, Any]:
     i = offset
     while i < len(pieces):
         text, continues = pieces[i]
-        cost = _encoded(text) + 1
+        cost = _encoded(text) + 2  # the ", " between list items
         if page and size + cost > HUNK_PAGE_BYTES:
             break
         page.append(text)
@@ -669,6 +723,29 @@ def hunk_page(h: Hunk, offset: int) -> dict[str, Any]:
         out["line_cut"] = True
         out["cut_at"] = cut
     return out
+
+
+def shape_page(h: Hunk, offset: int) -> dict[str, Any]:
+    """One page of a suppressed hunk's shape from segment ``offset``, within HUNK_PAGE_BYTES."""
+    segments = h.shape()
+    if offset < 0 or (offset > 0 and offset >= len(segments)):
+        raise FileDiffError(f"hunk_offset {offset} is past the hunk's {len(segments)} segments")
+    page: list[dict[str, Any]] = []
+    size = 0
+    i = offset
+    while i < len(segments):
+        cost = len(json.dumps(segments[i])) + 2
+        if page and size + cost > HUNK_PAGE_BYTES:
+            break
+        page.append(segments[i])
+        size += cost
+        i += 1
+    return {
+        "segments": page,
+        "hunk_offset": offset,
+        "next_hunk_offset": i if i < len(segments) else None,
+        "total_segments": len(segments),
+    }
 
 
 # ── the reading ───────────────────────────────────────────────────────────────────────────
@@ -769,11 +846,12 @@ def file_diff(
 ) -> dict[str, Any]:
     """The run pair's non-binary files (see the module docstring). Without ``path``: a page of the
     files that differ (``change`` / ``kind`` filter; ``same`` only when asked for), each with its
-    structured comparison and its hunk stats. With ``path``: that file in full, its hunk text paged
-    by ``hunk_offset``. ``review`` maps an anchor to its review state (the caller's judgement read);
-    a file with none reads the unjudged state, as an unjudged entry of a binary diff does. ``pf`` is
-    the pair's files when the caller has read them already. Raises FileDiffError on an argument or a
-    side it cannot read."""
+    structured comparison and its hunk stats. With ``path``: that file in full — its structured
+    lists paged by ``offset`` / ``limit`` (on the page with ``hunk_offset`` 0), its hunk text or
+    suppressed shape paged by ``hunk_offset`` (on the page with ``offset`` 0). ``review`` maps an
+    anchor to its review state (the caller's judgement read); a file with none reads the unjudged
+    state, as an unjudged entry of a binary diff does. ``pf`` is the pair's files when the caller
+    has read them already. Raises FileDiffError on an argument or a side it cannot read."""
     if detail not in DETAILS:
         raise FileDiffError(f"detail must be one of {list(DETAILS)}; got {detail!r}")
     if change is not None and change not in CHANGES:
@@ -824,13 +902,27 @@ def file_diff(
     if path is not None:
         if path not in pf.a.files and path not in pf.b.files:
             raise FileDiffError(f"no file with path {path!r} is recorded on either side of {pair}")
+        if offset > 0 and hunk_offset > 0:
+            raise FileDiffError(
+                "offset pages a file's structured lists and hunk_offset its line difference: "
+                "pass one of them above 0, not both"
+            )
         entry = decorate(file_entry(pf, path), full=True)
-        if entry["change"] != "same" and detail == "full":
-            h = hunk(pf, path)
-            if h.lines is not None and h.suppressed is not None:
-                entry["hunk_shape"] = h.shape()
-            elif h.lines is not None:
-                entry["hunk"] = hunk_page(h, hunk_offset)
+        if detail == "full":
+            block = entry.pop("structured", None)
+            if block is not None:
+                if hunk_offset == 0:
+                    entry["structured"] = structured_page(block, offset, limit)
+                else:
+                    entry["structured_on_page"] = "hunk_offset=0"
+            if entry["change"] != "same":
+                h = hunk(pf, path)
+                if h.lines is not None and offset > 0:
+                    entry["hunk_on_page"] = "offset=0"
+                elif h.lines is not None and h.suppressed is not None:
+                    entry["hunk_shape"] = shape_page(h, hunk_offset)
+                elif h.lines is not None:
+                    entry["hunk"] = hunk_page(h, hunk_offset)
         return {**envelope, "entry": entry}
 
     wanted = (change,) if change is not None else LISTED_CHANGES

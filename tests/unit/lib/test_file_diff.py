@@ -272,7 +272,9 @@ def test_a_config_value_is_shown_unless_sensitive_and_no_rows_say_so(fw: FW) -> 
 def test_credentials_by_identifier_or_by_row_never_with_material(fw: FW) -> None:
     """Credentials compare per (cred_type, algorithm): by identifier when each side's identifiers
     are non-empty and unique (material_changed for one whose material moved), else as a multiset
-    of rows (identity_not_unique). Neither the material nor its hash is in any output.
+    of rows (identity_not_unique). The material is in no output, nor any hash computed over it;
+    the one hash of it that is given is a file's own sha256 when the file's whole content is that
+    material (a single-key PEM file) — the file-level sha256 every file carries.
 
     MUTATION (verified RED): compare the rows as a set -> a third identical certificate on B is
     invisible -> RED. MUTATION (verified RED): fall back to rows when identifiers are unique ->
@@ -349,6 +351,34 @@ def test_credentials_by_identifier_or_by_row_never_with_material(fw: FW) -> None
     ]
     text = json.dumps(out) + json.dumps(fw.diff(path="etc/shadow"))
     assert MATERIAL not in text and "hash-a" not in text
+    # a single-key file: its sha256 is the material's, given as the file's own and nowhere else
+    pem = MATERIAL + "-pem"
+    e = fw.file("a", "etc/key.pem", "credential", pem)
+    f = fw.file("b", "etc/key.pem", "credential", pem + "2")
+    fw.row(
+        "a",
+        "credentials",
+        e,
+        cred_type="private_key",
+        identifier=None,
+        algorithm="rsa",
+        material=pem,
+        is_sensitive=1,
+    )
+    fw.row(
+        "b",
+        "credentials",
+        f,
+        cred_type="private_key",
+        identifier=None,
+        algorithm="rsa",
+        material=pem + "2",
+        is_sensitive=1,
+    )
+    key_page = fw.diff(path="etc/key.pem")
+    assert key_page["entry"]["sha_a"] == _sha(pem.encode())
+    assert pem not in json.dumps(key_page)
+    assert json.dumps(key_page).count(_sha(pem.encode())) == 1
     for m in (MATERIAL, MATERIAL + "hash-a", MATERIAL + "hash-b"):
         assert _sha(m.encode()) not in text
         assert hashlib.md5(m.encode()).hexdigest() not in text  # noqa: S324 -- a probe only
@@ -435,7 +465,19 @@ def test_a_hunk_is_read_only_inside_the_root_and_only_as_scanned(fw: FW, tmp_pat
 
 
 _PEM = "-----BEGIN RSA PRIVATE KEY-----"
-_CRYPT = "root:$6$saltsalt$" + "A" * 40 + ":0:0"
+_HASH = "$saltsalt$" + "A" * 22
+_CRYPT = f"root:$6{_HASH}:0:0"
+# The ways a key or a hash sits inside a script or an asset: quoted, echoed, in a string literal
+# with an escaped newline, printed, assigned, passed as an argument, in JSON, with rounds=.
+_EMBEDDED = [
+    f'echo "{_PEM}" > /tmp/k',
+    'var k = "-----BEGIN PRIVATE KEY-----\\nMIIE";',
+    "printf '-----BEGIN EC PRIVATE KEY-----\\n'",
+    f'PASS="$1{_HASH}"',
+    f"usermod -p '$1{_HASH}' root",
+    f'{{"pw":"$1{_HASH}"}}',
+    f"x $6$rounds=5000{_HASH}",
+]
 
 
 @pytest.mark.parametrize(
@@ -444,6 +486,7 @@ _CRYPT = "root:$6$saltsalt$" + "A" * 40 + ":0:0"
         ("credential", "key2\n", "credential_material"),
         ("shell_script", f"echo\n{_PEM}\nMIIB\n", "embedded_secret"),
         ("shell_script", f"echo\n{_CRYPT}\n", "embedded_secret"),
+        *(("shell_script", f"echo\n{line}\n", "embedded_secret") for line in _EMBEDDED),
     ],
 )
 def test_a_secret_bearing_difference_gives_its_shape_only(
@@ -452,14 +495,18 @@ def test_a_secret_bearing_difference_gives_its_shape_only(
     """A credential file, or a difference holding a full private-key header or crypt hash, gives
     no text — on the list page or its own page — only the shape of each segment.
 
-    MUTATION (verified RED): leave the content scan out -> the key's text is given -> RED."""
+    MUTATION (verified RED): leave the content scan out -> the key's text is given -> RED.
+    MUTATION (verified RED): anchor the key header to a whole line, or read a hash only after a
+    line start / ``:`` / ``=`` / ``,`` / space, without rounds= -> the embedded forms are given ->
+    RED."""
     fw.file("a", "etc/f", kind, "echo\n")
     fw.file("b", "etc/f", kind, b_text)
     listed = _by_path(fw.diff())["etc/f"]
     assert listed.get("hunk_suppressed") == reason and "bytes" not in listed["hunk_stats"]
     one = fw.diff(path="etc/f")["entry"]
     assert "hunk" not in one and one["hunk_suppressed"] == reason
-    assert one["hunk_shape"] and set(one["hunk_shape"][0]) == {"range", "plus_lines", "minus_lines"}
+    segments = one["hunk_shape"]["segments"]
+    assert segments and set(segments[0]) == {"range", "plus_lines", "minus_lines"}
     text = json.dumps(one)
     assert "PRIVATE KEY" not in text and "saltsalt" not in text and "key2" not in text
 
@@ -479,7 +526,7 @@ def test_a_bare_dollar_one_is_not_a_secret(fw: FW) -> None:
 
     MUTATION (verified RED): match a bare ``$1$`` substring -> RED."""
     fw.file("a", "etc/fix.sh", "shell_script", "echo\n")
-    fw.file("b", "etc/fix.sh", "shell_script", "sed -e 's/\\$1\\$/x/' -e 's/$1$abc/y/' f\n")
+    fw.file("b", "etc/fix.sh", "shell_script", "sed -e 's/\\$1\\$/x/' -e 's/$1$abc/y/' f $1$2\n")
     one = fw.diff(path="etc/fix.sh")["entry"]
     assert "hunk_suppressed" not in one and one["hunk"]["lines"][-1].startswith("+sed")
 
@@ -519,6 +566,121 @@ def test_a_long_difference_pages_and_a_long_line_is_cut(fw: FW) -> None:
     first_plus = next(i for i, p in enumerate(pieces) if p.startswith("+v="))
     joined = "".join(pieces[first_plus : max(cut) + 2])
     assert joined == "+" + line
+
+
+def _walk_file(tools: dict[str, Any], path: str) -> tuple[list[dict[str, Any]], list[int]]:
+    """Every page of one file through the MCP tool — its structured lists by offset, then its
+    text by hunk_offset — and each page's size in bytes."""
+    pages, sizes = [], []
+    offset: int | None = 0
+    while offset is not None:
+        page = tools["get_file_diff"](PAIR, path=path, offset=offset, limit=200)
+        assert "error" not in page, page
+        pages.append(page)
+        sizes.append(len(json.dumps(page)))
+        offset = page["entry"]["structured"]["lists_paging"]["next_offset"]
+    hunk_offset = pages[0]["entry"].get("hunk", {}).get("next_hunk_offset")
+    while hunk_offset is not None:
+        page = tools["get_file_diff"](PAIR, path=path, hunk_offset=hunk_offset)
+        assert "error" not in page, page
+        assert "structured" not in page["entry"]
+        assert page["entry"]["structured_on_page"] == "hunk_offset=0"
+        pages.append(page)
+        sizes.append(len(json.dumps(page)))
+        hunk_offset = page["entry"]["hunk"]["next_hunk_offset"]
+    return pages, sizes
+
+
+def test_a_file_with_many_recorded_rows_pages_within_the_budget(fw: FW) -> None:
+    """A script with 600 recorded lines per side and a long difference: through the MCP tool its
+    own page gives the structured lists a page at a time (offset) and the text a page at a time
+    (hunk_offset), each page within 48,000 bytes, the lists only on the pages with hunk_offset 0
+    and the text only on those with offset 0; the pages together hold every item once.
+
+    MUTATION (verified RED): give the whole structured block on every page -> pages over the
+    budget -> RED."""
+    a_lines = [f"/usr/sbin/tool --set opt_{i} {'v' * 60} &" for i in range(600)]
+    b_lines = [f"/usr/sbin/tool --set opt_{i} {'w' * 60} &" for i in range(600)]
+    a = fw.file("a", "etc/init.sh", "shell_script", "\n".join(a_lines) + "\n")
+    b = fw.file("b", "etc/init.sh", "shell_script", "\n".join(b_lines) + "\n")
+    for side, fid, lines in (("a", a, a_lines), ("b", b, b_lines)):
+        for n, line in enumerate(lines, start=1):
+            fw.row(
+                side, "script_calls", fid, command="/usr/sbin/tool", raw_line=line, line_number=n
+            )
+    pages, sizes = _walk_file(fw.tools(), "etc/init.sh")
+    assert len(pages) > 4 and max(sizes) <= 48_000, sizes
+    assert not any(p.get("over_budget") for p in pages)
+    seen_a = [
+        i["raw_line"]
+        for p in pages
+        if "structured" in p["entry"]
+        for i in p["entry"]["structured"]["commands_a_only"]
+    ]
+    seen_b = [
+        i["raw_line"]
+        for p in pages
+        if "structured" in p["entry"]
+        for i in p["entry"]["structured"]["commands_b_only"]
+    ]
+    assert seen_a == a_lines and seen_b == b_lines
+    with_text = [p for p in pages if "hunk" in p["entry"]]
+    assert all(p["entry"].get("hunk_on_page") is None for p in with_text)
+    assert any(p["entry"].get("hunk_on_page") == "offset=0" for p in pages)
+    text = [x for p in with_text for x in p["entry"]["hunk"]["lines"]]
+    expected = list(difflib.unified_diff(a_lines, b_lines, n=3, lineterm=""))[2:]
+    assert text == expected
+
+
+def test_a_suppressed_shape_pages_and_both_offsets_are_refused(fw: FW) -> None:
+    """A suppressed difference of many segments gives its shape a page at a time; offset and
+    hunk_offset both above 0 is refused, naming which pages what."""
+    a = "".join(f"k{i}=1\n" + "".join(f"# {i}.{j}\n" for j in range(7)) for i in range(600))
+    b = a.replace("=1", "=2") + _PEM + "\n"
+    fw.file("a", "etc/big.conf", "config_file", a)
+    fw.file("b", "etc/big.conf", "config_file", b)
+    tools = fw.tools()
+    sizes, segments = [], 0
+    hunk_offset: int | None = 0
+    while hunk_offset is not None:
+        page = tools["get_file_diff"](PAIR, path="etc/big.conf", hunk_offset=hunk_offset)
+        shape = page["entry"]["hunk_shape"]
+        sizes.append(len(json.dumps(page)))
+        segments += len(shape["segments"])
+        hunk_offset = shape["next_hunk_offset"]
+    assert len(sizes) > 1 and max(sizes) <= 48_000 and segments == shape["total_segments"]
+    both = tools["get_file_diff"](PAIR, path="etc/big.conf", offset=1, hunk_offset=1)
+    assert "error" in both and "not both" in both["error"]
+
+
+def test_a_list_page_cuts_each_list_to_ten_and_says_so(fw: FW) -> None:
+    """On a list page each structured list keeps 10 items, its total under lists_cut; the file's
+    own page holds them all.
+
+    MUTATION (verified RED): leave the list-page lists whole -> RED."""
+    a = fw.file("a", "www/app.js", "web_asset", "1\n")
+    fw.file("b", "www/app.js", "web_asset", "2\n")
+    for i in range(14):
+        fw.row("a", "web_form_fields", a, field_keyword=f"field_{i:02d}")
+    block = _by_path(fw.diff())["www/app.js"]["structured"]
+    assert len(block["form_fields_a_only"]) == fd.LIST_PAGE_ITEMS == 10
+    assert block["lists_cut"]["totals"] == {"form_fields_a_only": 14}
+    own = fw.diff(path="www/app.js")["entry"]["structured"]
+    assert len(own["form_fields_a_only"]) == 14
+
+
+def test_a_path_recorded_twice_keeps_its_first_row_and_counts_the_rest(fw: FW) -> None:
+    """A second record of a path already seen on a side does not replace the first: the first
+    row is the file, the second is counted under duplicate_path_rows.
+
+    MUTATION (verified RED): let the last record of a path stand -> RED."""
+    fw.file("a", "etc/twice", "shell_script", "one\n")
+    fw.file("a", "etc/twice", "shell_script", "two\n", write=False)
+    fw.file("b", "etc/twice", "shell_script", "one\n")
+    out = fw.diff(change="same")
+    assert out["duplicate_path_rows"] == {"a": 1, "b": 0}
+    assert [e["path"] for e in out["entries"]] == ["etc/twice"]
+    assert out["counts"]["same"] == 1 and out["counts"]["content_differs"] == 0
 
 
 def test_a_list_page_fits_the_response_budget(fw: FW) -> None:
@@ -604,6 +766,37 @@ def test_file_review_takes_the_callers_staleness(fw: FW) -> None:
     finally:
         conn.close()
     assert states == {False: "concluded", True: "needs_recheck", None: "needs_recheck"}
+
+
+def test_list_overlays_reads_a_stale_side_as_needs_recheck(fw: FW) -> None:
+    """Listed with no run pair, a file judgement whose pair has a stale run reads needs_recheck
+    with the run named, beside one on a current pair that reads concluded — the MCP layer's
+    reading of each pair's two runs.
+
+    MUTATION (verified RED): let the MCP staleness reading always say current -> the stale pair's
+    judgement reads concluded -> RED."""
+    for side, path in (("a", "etc/rc"), ("b", "etc/rc"), ("s", "etc/rc")):
+        fw.file(side, path, "shell_script", f"{side}\n")
+    conn = fw.atlas()
+    try:
+        for pair in (PAIR, "runA::runS"):
+            overlay.annotate_diff(
+                conn,
+                anchor_ref=f"{pair}#non_binary#etc/rc",
+                verdict="changed_real",
+                rationale="r",
+                run_pair=pair,
+            )
+    finally:
+        conn.close()
+    rows = {
+        o["run_pair"]: o
+        for o in fw.tools()["list_overlays"](anchor_kind="diff_subject")["overlays"]
+    }
+    assert (rows[PAIR]["review_state"], rows[PAIR]["source_stale"]) == ("concluded", False)
+    stale = rows["runA::runS"]
+    assert (stale["review_state"], stale["source_stale"]) == ("needs_recheck", True)
+    assert stale["source_stale_reason"] == "stale_scan:runS"
 
 
 def test_annotate_diff_takes_exactly_one_of_diff_id_and_run_pair(fw: FW) -> None:
