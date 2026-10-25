@@ -509,6 +509,16 @@ def test_the_file_comparison_is_in_no_rescan_closure() -> None:
             assert module not in closure, (root, module)
 
 
+def test_the_tool_cards_are_in_no_rescan_closure() -> None:
+    """mcp_cards is the server's short tool descriptions and call rules: text the server sends, read
+    by nothing that scans, hunts or diffs — so no rescan stamp hashes it, nor the alignment
+    reader the name lookup lives in."""
+    for root in ROOTS:
+        closure = rv._closure(PKG, root)
+        for module in ("mcp_cards", "mcp_app", "lib.query.diff_align"):
+            assert module not in closure, (root, module)
+
+
 def test_hoisting_the_rx_warning_moves_no_stamp(tmp_path: Path) -> None:
     """The RX warning was hoisted out of get_data_bytes into a top-level constant so the data-table
     reader shares it. With the warning put back inline, all four stamps — pipeline, hunt, diff,

@@ -218,6 +218,9 @@ Config files: Cursor `~/.cursor/mcp.json`; Claude Desktop
 `-s user`: a project-local entry of the same name hides it inside that project (`tmap doctor` points
 such entries out).
 
+Parameter names, what each means and where it differs between tools:
+`get_tool_reference(name="parameters")`.
+
 ---
 
 ## Upgrading

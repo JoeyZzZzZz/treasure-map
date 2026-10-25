@@ -629,8 +629,8 @@ def test_the_tool_and_the_instructions_say_how_to_read_a_hunk_and_scan() -> None
         "original text",
     ):
         assert phrase in doc, phrase
-    assert "rows_limit=0" in mcp_app._AGENT_INSTRUCTIONS
-    assert "inline_hunk" in mcp_app._AGENT_INSTRUCTIONS
+    assert "rows_limit=0" in mcp_app._AGENT_GUIDE
+    assert "inline_hunk" in mcp_app._AGENT_GUIDE
 
 
 def _axes_entry(n_rows: int, axes_bytes: int, hunk_bytes: int) -> dict[str, Any]:

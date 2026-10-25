@@ -176,6 +176,8 @@ Record each judgement with annotate_diff.
 `~/.codeium/windsurf/mcp_config.json`；Gemini CLI `~/.gemini/settings.json`。Claude Code 请用
 `-s user`：项目内同名的本地条目会在该项目里覆盖它（`tmap doctor` 会指出这类条目）。
 
+各参数名的含义、以及它们在不同工具之间的差别：`get_tool_reference(name="parameters")`。
+
 ---
 
 ## 升级

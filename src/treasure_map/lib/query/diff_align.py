@@ -3,7 +3,8 @@
 """Read-only query face over the layer-0 (alignment) and layer-2 (dimension-delta) diff tables.
 
 The 80%-case alignment workflow: "I found something at A-side address X -- did B patch it?" So a
-single-side address resolves to its aligned counterpart, carrying BOTH the raw
+single-side address (or a function name, which may match several functions -- all listed, none
+picked) resolves to its aligned counterpart, carrying BOTH the raw
 ``alignment_confidence`` (trust in the pairing) and ``similarity`` (change magnitude) plus the
 honest ``alignment_state`` -- never only the thresholded state (a continuous quantity must not
 collapse to a binary one). Names ride along as a pairing SANITY signal a consumer reads, never a
@@ -433,6 +434,111 @@ def _align_by_side(atlas: sqlite3.Connection, diff_id: str, addr: str, side: str
         "pairs": [_row_to_pair(r) for r in rows],
         **diff_source_staleness(atlas, diff_id),
         "note": _ALIGN_NOTE,
+    }
+
+
+_ALIGN_COLUMNS = (
+    "addr_a, addr_b, name_a, name_b, alignment_confidence, similarity, alignment_state, "
+    "basicblocks, edges, instructions, export_gap_a, export_gap_b"
+)
+
+_NOT_PROOF = (
+    "That is NOT proof the function was added/removed -- an unmatched function is listed in "
+    "function_presence, and a diff covers only the tool's view, never all changes. "
+)
+
+
+def align_by_function(
+    atlas: sqlite3.Connection, diff_id: str, function: str, side: str
+) -> dict[str, Any]:
+    """One function's aligned counterpart(s), the function named by a name OR an address.
+
+    The address forms are the ones every function tool reads (``facts._addr_candidates``: 0x /
+    FUN_ hex, a digits-only value as hex and as decimal); the name is matched exactly against the
+    side's stored name. Both are tried at once — a hex-looking name is looked up both ways — and
+    ``query.matched_by`` says which hit. The one difference from the function tools: a name can
+    match more than one function on a side (an import stub and the body beside it), and then the
+    answer lists every candidate (``reason: ambiguous``) instead of picking one. So does a
+    digits-only value read as two addresses that both exist. No match lists the side's unmatched
+    functions of that name or address under ``presence`` (function_presence)."""
+    from treasure_map.lib.facts import _addr_candidates
+
+    addr_col, name_col = ("addr_a", "name_a") if side == "a" else ("addr_b", "name_b")
+    cands = sorted(_addr_candidates(function))
+    marks = ", ".join("?" * len(cands))
+    by_addr = f" OR {addr_col} IN ({marks})" if cands else ""
+    presence_by_addr = f" OR addr IN ({marks})" if cands else ""
+    rows = atlas.execute(
+        f"SELECT {_ALIGN_COLUMNS} FROM function_alignment "  # noqa: S608 -- literal columns
+        f"WHERE diff_id = ? AND ({name_col} = ?{by_addr}) ORDER BY {addr_col}, addr_a, addr_b",
+        (diff_id, function, *cands),
+    ).fetchall()
+    by_name = any(r[name_col] == function for r in rows)
+    by_number = any(r[addr_col] in cands for r in rows)
+    matched_by = (
+        "name+addr"
+        if by_name and by_number
+        else "name"
+        if by_name
+        else "addr"
+        if by_number
+        else None
+    )
+    query = {"side": side, "input": function, "matched_by": matched_by, "addr_candidates": cands}
+    head: dict[str, Any] = {"diff_id": diff_id, "query": query}
+    groups: dict[str, list[sqlite3.Row]] = {}
+    for r in rows:
+        groups.setdefault(r[addr_col], []).append(r)
+    if len(groups) == 1:
+        return {
+            "found": True,
+            **head,
+            "pairs": [_row_to_pair(r) for r in rows],
+            **diff_source_staleness(atlas, diff_id),
+            "note": _ALIGN_NOTE,
+        }
+    if len(groups) > 1:
+        return {
+            "found": False,
+            "reason": "ambiguous",
+            **head,
+            "candidates": [
+                {
+                    addr_col: addr,
+                    name_col: group[0][name_col],
+                    "instructions": group[0]["instructions"],
+                    "basicblocks": group[0]["basicblocks"],
+                    "pairs": [_row_to_pair(r) for r in group],
+                }
+                for addr, group in sorted(groups.items())
+            ],
+            **diff_source_staleness(atlas, diff_id),
+            "note": (
+                f"{len(groups)} functions on side {side} match this input; none is picked. A name "
+                "can match an import stub and the function body beside it (a stub usually has a "
+                "few instructions and 1 basic block), and a digits-only value reads as hex and as "
+                "decimal. Re-issue with one candidate's address. " + _NOT_PROOF + _ALIGN_NOTE
+            ),
+        }
+    presence = atlas.execute(
+        f"SELECT addr, name, presence_state, export_gap FROM function_presence "  # noqa: S608
+        f"WHERE diff_id = ? AND side = ? AND (name = ?{presence_by_addr}) "
+        "ORDER BY addr",
+        (diff_id, side, function, *cands),
+    ).fetchall()
+    miss = (
+        "no matched pair for this address in this diff. "
+        if cands
+        else f"this diff's export holds no function of that name on side {side}; pass an address. "
+    )
+    return {
+        "found": False,
+        **head,
+        # each unmatched function of this name or address; export_gap is non-null when it is
+        # unmatched because its export did not hold it as it is
+        "presence": [dict(p) for p in presence],
+        **diff_source_staleness(atlas, diff_id),
+        "note": miss + _NOT_PROOF + _ALIGN_NOTE,
     }
 
 

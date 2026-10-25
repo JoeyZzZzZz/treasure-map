@@ -75,6 +75,7 @@ _EXPECTED_TOOLS = {
     "list_overlays",
     "clear_overlay",
     "list_verified_exploits",
+    "get_tool_reference",
     "legal_notice",
 }
 
@@ -352,7 +353,8 @@ def test_the_command_line_prints_the_whole_function(tmp_path: Path) -> None:
 
 def test_the_tools_and_the_instructions_say_pseudocode_is_paged_and_detail_summarises() -> None:
     """The get_pseudocode description says how a long function is paged and that its line
-    numbers are the diff's; the server instructions name the paging and the summary detail."""
+    numbers are the diff's; the full guide (get_tool_reference(name="guide")) names the paging
+    and the summary detail."""
     doc = " ".join((mcp_app.make_tools(Path("unused.db"))["get_pseudocode"].__doc__ or "").split())
     assert (
         "Paged by line: a function longer than ~20k characters comes in segments — pass "
@@ -360,9 +362,9 @@ def test_the_tools_and_the_instructions_say_pseudocode_is_paged_and_detail_summa
         "blank lines counted) are the ones inline_hunk and guards use."
     ) in doc
     assert "paging.total_chars" in doc
-    assert "get_pseudocode (paged by line (offset);" in mcp_app._AGENT_INSTRUCTIONS
-    assert "detail='summary'" in mcp_app._AGENT_INSTRUCTIONS
-    assert "anchor_ref_template" in mcp_app._AGENT_INSTRUCTIONS
+    assert "get_pseudocode (paged by line (offset);" in mcp_app._AGENT_GUIDE
+    assert "detail='summary'" in mcp_app._AGENT_GUIDE
+    assert "anchor_ref_template" in mcp_app._AGENT_GUIDE
 
 
 def test_the_descriptions_name_skipped_micro_and_pseudocode_status() -> None:
@@ -1468,7 +1470,7 @@ def test_public_server_files_carry_no_private_references() -> None:
     # server instructions.
     src = Path(__file__).resolve().parents[2] / "src" / "treasure_map"
     privdoc = re.compile(r"private (design )?notes", re.IGNORECASE)
-    for rel in ("lib/facts.py", "mcp_app.py", "cli/mcp_cli.py"):
+    for rel in ("lib/facts.py", "mcp_app.py", "mcp_cards.py", "cli/mcp_cli.py"):
         text = (src / rel).read_text()
         assert not privdoc.search(text), f"private-note reference in {rel}"
         assert not listed_words_in(text), f"private-note reference in {rel}"
