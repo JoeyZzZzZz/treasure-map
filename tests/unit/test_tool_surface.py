@@ -381,6 +381,18 @@ def test_a_card_asks_for_nothing_the_tool_does_without(
         assert "error" in res, (name, dropped, res)
 
 
+def test_a_zero_is_given_and_a_default_is_not() -> None:
+    """``0`` is a real value (an offset, an index), so it counts as given; None, False and a blank
+    string do not. No card names an integer parameter yet, so this is checked directly.
+
+    MUTATION (verified RED, 1 failed — this test alone): read a value as given by its truth
+    (``bool(value)``) -> 0 reads as not given -> RED."""
+    assert cards.is_given(0) and cards.is_given(0.0) and cards.is_given("0")
+    assert cards.is_given(True) and cards.is_given([]) is True
+    for value in (None, False, "", "   "):
+        assert cards.is_given(value) is False, value
+
+
 def test_a_schema_required_parameter_is_refused_before_the_tool(atlas: Path) -> None:
     server = mcp_app.build_server(atlas)
     for name, args in (
@@ -828,6 +840,25 @@ REPLACED = {
     "get_function_alignment": {
         "The BinDiff-aligned counterpart of one function address in a diff.": (
             "the lookup takes a function name or an address now, so it says function"
+        ),
+    },
+    "start_diff_review": {
+        '``view``: get_diff_patch_view(diff_id, detail="summary", limit=limit) as that call '
+        "returns it — ``limit`` (1-200, default 20) entries in the default order, with the "
+        "progress and annotation blocks.": (
+            "the view is now cut to the bytes the other blocks leave; the sentence says so"
+        ),
+        "The response aims at the byte budget (~48KB): the view page is cut as "
+        "get_diff_patch_view cuts it, then the headline's inline_hunk is withheld "
+        "(``page_budget``) when the headline does not fit beside the rest.": (
+            "the headline now comes first and the view gets what is left; the hunk is withheld "
+            "only when even one view entry cannot fit beside it"
+        ),
+        "A large ``limit`` can still carry a ``view`` page that fills the budget on its own, so "
+        "the whole response may not fit — then it carries ``over_budget: true`` (at the default "
+        "``limit`` it fits).": (
+            "it was not true: four live diffs went over at the default limit; the response now "
+            "fits at every limit"
         ),
     },
     "get_strings": {

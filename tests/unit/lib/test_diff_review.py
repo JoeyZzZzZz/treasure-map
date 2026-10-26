@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -1510,6 +1511,78 @@ def test_batch_changed_real_evidence_is_recorded_and_echoed(world: World) -> Non
         diff_id=DX,
     )
     assert bad["written"] is False and "evidence only" in bad["errors"][0]["error"]
+
+
+_WORDS = {"removed", "added", "gone", "new", "bounded", "safe", "fix", "patch", "regression"}
+_LABEL = re.compile(r"[a-z][a-z0-9_]*")
+
+
+def _labels(value: Any, out: set[str]) -> set[str]:
+    """Every key in ``value``, at any depth, and every string value shaped like a label."""
+    if isinstance(value, dict):
+        for k, v in value.items():
+            out.add(str(k))
+            _labels(v, out)
+    elif isinstance(value, list):
+        for v in value:
+            _labels(v, out)
+    elif isinstance(value, str) and _LABEL.fullmatch(value):
+        out.add(value)
+    return out
+
+
+def test_no_batch_or_evidence_label_says_what_a_change_means(world: World) -> None:
+    """Every key and label value the batch write returns — written, refused, a duplicate anchor —
+    the single write's evidence echo, and the stored basis of each verdict are free of words that
+    say what a change means.
+
+    MUTATION (verified RED, 5 failed — this test and four that pin the action's value): name a
+    batch result's action 'added' -> RED."""
+    tools, anchors = _batch_world(world, 4)
+    batch = tools["annotate_diff_batch"]
+    wrote = batch(
+        [
+            {"anchor_ref": anchors[0], "verdict": "changed_real", "rationale": "x"},
+            {
+                "anchor_ref": anchors[1],
+                "verdict": "changed_real",
+                "rationale": "x",
+                "evidence": [anchors[1]],
+            },
+            {"anchor_ref": anchors[2], "verdict": "no_real_change", **_nrc(anchors[2])},
+        ],
+        diff_id=DX,
+    )
+    assert wrote["written"] is True
+    again = batch(
+        [{"anchor_ref": anchors[0], "verdict": "changed_real", "rationale": "y"}], diff_id=DX
+    )
+    refused = batch(
+        [
+            {"anchor_ref": anchors[3], "verdict": "suspicious", "rationale": "x"},
+            {"anchor_ref": anchors[3], "verdict": "changed_real", "rationale": "x"},
+        ],
+        diff_id=DX,
+    )
+    assert refused["written"] is False
+    plain = batch([{"anchor_ref": anchors[3], "verdict": "changed_real"}], diff_id=DX)
+    single = tools["annotate_diff"](
+        anchors[3], "changed_real", "x", diff_id=DX, evidence=[anchors[3]]
+    )
+    assert "error" not in single, single
+    labels: set[str] = set()
+    for out in (wrote, again, refused, plain, single):
+        _labels(out, labels)
+    for (basis,) in world.atlas.execute(
+        "SELECT verdict_basis FROM overlay WHERE anchor_kind = 'diff_subject' "
+        "AND verdict_basis IS NOT NULL"
+    ):
+        _labels(json.loads(basis), labels)
+    assert {"written", "results", "action", "inserted", "updated", "errors", "indexes"} <= labels
+    assert {"evidence", "kind", "checked", "why_unchanged"} <= labels
+    for label in labels:
+        words = set(re.split(r"[^a-z0-9]+", label.lower()))
+        assert not words & _WORDS, label
 
 
 def test_batch_unknown_key_and_missing_fields_fail_that_item(world: World) -> None:

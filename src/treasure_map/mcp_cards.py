@@ -385,8 +385,9 @@ TOOL_CARDS: dict[str, ToolCard] = {
             "START HERE for one diff: the entries to read first and the calls to read and judge "
             "them, composed from get_diff_patch_view and get_diff_meta, nothing computed of its "
             "own. diff_id = {run_a}::{run_b}::{binary} (list_diffs gives the ids). Returns "
-            "workflow, meta, headline (the first entry in full), view (a summary page of limit "
-            "entries), read_next and non_binary. A diff with a proven-stale side is refused."
+            "workflow, meta, headline (the first entry in full), view (a summary page of up to "
+            "limit entries, cut to fit beside the rest), read_next and non_binary. A diff with a "
+            "proven-stale side is refused."
         ),
     ),
     "get_diff_patch_view": ToolCard(

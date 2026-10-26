@@ -318,10 +318,10 @@ _CAVEATS = {
         "A stored word equal to an entry address, read at word-aligned positions. Not proof the "
         "word is a pointer, that the function is used through it, or that it is reached. "
         "block_class splits linkage / symbol-table / unwind metadata from data segments; only "
-        "data / unnamed / init_fini feed delta and next, and a word whose bytes fall inside a "
+        "data / unnamed / init_fini feed delta, and a word whose bytes fall inside a "
         "stored string is excluded. On an only-segment-name binary the read/write segments are "
         "`unnamed` and the executable segments are `code`; a read-only table merged into an "
-        "executable segment is counted, not compared, and gets no next. none_found only when "
+        "executable segment is counted, not compared. none_found only when "
         "every initialized block was stored in full. a_only = A has such a word, B none found — "
         "not that B cannot reach the function."
     ),
@@ -356,7 +356,7 @@ _LEGEND = {
     ),
     "entry_words": (
         "per side: the aligned data words whose value is the function's entry address (ARM: also "
-        "entry|1), by block_class; delta and next are over the comparable classes (data / unnamed "
+        "entry|1), by block_class; delta is over the comparable classes (data / unnamed "
         "/ init_fini) with words that fall inside a stored string excluded; linkage, symbol "
         "tables and unwind info are counted per side, not compared; a side read from a truncated "
         "image never reads same_shape. Left out = both sides read in "

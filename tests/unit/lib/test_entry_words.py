@@ -1123,25 +1123,44 @@ def test_a_diff_side_shows_five_words_and_counts_them_all(tmp_path: Path, curren
         assert len(block[side]["words"]) == block[side]["words_shown"] == 5, side
 
 
+@pytest.mark.parametrize("side", ["a", "b"])
 def test_a_side_read_from_a_truncated_image_never_reads_same_shape(
-    tmp_path: Path, current: None
+    tmp_path: Path, current: None, side: str
 ) -> None:
     """Two sides whose comparable words agree in number and shape read same_shape — unless a side
     was read from an incomplete image, whose stored-short blocks could hide a word or cut a series:
-    then undetermined. A difference read there is still given.
+    then undetermined, whichever side it is. A difference read there is still given.
 
-    MUTATION (verified RED): give same_shape whatever the images -> RED."""
+    MUTATION (verified RED): give same_shape whatever the images -> RED.
+    MUTATION (verified RED, 1 failed — the a case alone): check only the b side's image -> RED."""
     w, fn = _diff_world(tmp_path)
     by = _by_addr(w.view(), fn)
     assert by["same"]["entry_words"]["delta"] == "same_shape"
-    w.side["b"].block(".bss_like", 0x90000, b"\0" * 8, size=0x100, truncated=1)
+    w.side[side].block(".bss_like", 0x90000, b"\0" * 8, size=0x100, truncated=1)
     pv._clear_view_caches()
     by = _by_addr(w.view(), fn)
     same = by["same"]["entry_words"]
     assert same["delta"] == "undetermined"
-    assert same["b"]["may_be_incomplete"] is True and same["b"]["state"] == "found"
+    assert same[side]["may_be_incomplete"] is True and same[side]["state"] == "found"
+    other = "b" if side == "a" else "a"
+    assert "may_be_incomplete" not in same[other]
     assert by["shape"]["entry_words"]["delta"] == "run_shape_differs"
     assert by["count"]["entry_words"]["delta"] == "count_differs"
+
+
+def test_the_diff_view_names_no_next_step(tmp_path: Path, current: None) -> None:
+    """The diff view's entry_words blocks carry a delta and the two sides, never a ``next`` step
+    (that is get_xrefs' entry_words): the view's legend and caveat do not name one.
+
+    MUTATION (verified RED, 1 failed — this test alone): legend back to "delta and next are over
+    the comparable classes" -> RED."""
+    w, _fn = _diff_world(tmp_path)
+    view = w.view()
+    blocks = [e["entry_words"] for e in view["entries"] if "entry_words" in e]
+    assert blocks and all("next" not in b for b in blocks)
+    assert all("next" not in b.get(s, {}) for b in blocks for s in ("a", "b"))
+    for text in (view["legend"]["entry_words"], view["caveats"]["entry_words"]):
+        assert "delta" in text and not re.search(r"\bnext\b", text), text
 
 
 @pytest.mark.parametrize("view", ["string_edge", "candidate_flat"])

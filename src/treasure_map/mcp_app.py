@@ -192,10 +192,18 @@ def _fit_candidates(
 
 
 def _fit_page(
-    result: dict[str, Any], offset: int, *, rows: str, total: str, next_offset: str, truncated: str
+    result: dict[str, Any],
+    offset: int,
+    *,
+    rows: str,
+    total: str,
+    next_offset: str,
+    truncated: str,
+    budget: int | None = None,
 ) -> dict[str, Any]:
     """A page of ``result[rows]`` (``result[total]`` rows in all, this page from ``offset``) fitted
-    to the response budget.
+    to the response budget (or to ``budget`` bytes, when the page is one block of a larger
+    response).
 
     The paging fields are set to placeholders at least as wide as their final values BEFORE the
     envelope is measured (``truncated`` false is wider than true; ``next_offset`` is the wider of
@@ -208,15 +216,16 @@ def _fit_page(
     it; that page says so with ``over_budget: true`` (absent on every page within the budget)."""
     if "error" in result or rows not in result:
         return result
+    limit = _RESPONSE_BYTE_BUDGET if budget is None else budget
     n = result[total]
     result[next_offset] = n if len(json.dumps(n)) > len(json.dumps(None)) else None
     result[truncated] = False
-    kept, cut = _fit_candidates(result, result[rows], _RESPONSE_BYTE_BUDGET, key=rows)
+    kept, cut = _fit_candidates(result, result[rows], limit, key=rows)
     end = offset + len(kept)
     result[rows] = kept
     result[next_offset] = end if end < n else None
     result[truncated] = cut
-    if len(json.dumps(result)) > _RESPONSE_BYTE_BUDGET:
+    if len(json.dumps(result)) > limit:
         result["over_budget"] = True
     return result
 
@@ -352,13 +361,17 @@ _HEADLINE_WITHHELD = "diff_undetermined (meta.banners)"
 _HEADLINE_NONE = "no listed entry"
 
 
-def _entry_within_budget(entry: dict[str, Any], base: int) -> dict[str, Any]:
-    """One rendered entry fitted beside an envelope of ``base`` bytes: as it is when it fits, else
-    a copy with each row's ``sink_axes`` withheld (``page_budget``) from the LAST row of the window
-    backwards, re-measured after each, stopping as soon as it fits (``sink_axes_withheld_rows``
-    counts them; guard_links stay); only when every row's axes are withheld and it still does not
-    fit are its inline_hunks withheld too. The rows and objects it came from are never written."""
-    if base + len(json.dumps(entry)) <= _RESPONSE_BYTE_BUDGET:
+def _entry_within_budget(
+    entry: dict[str, Any], base: int, budget: int | None = None
+) -> dict[str, Any]:
+    """One rendered entry fitted beside an envelope of ``base`` bytes, within the response budget
+    (or ``budget`` bytes): as it is when it fits, else a copy with each row's ``sink_axes``
+    withheld (``page_budget``) from the LAST row of the window backwards, re-measured after each,
+    stopping as soon as it fits (``sink_axes_withheld_rows`` counts them; guard_links stay); only
+    when every row's axes are withheld and it still does not fit are its inline_hunks withheld
+    too. The rows and objects it came from are never written."""
+    limit = _RESPONSE_BYTE_BUDGET if budget is None else budget
+    if base + len(json.dumps(entry)) <= limit:
         return entry
     out = dict(entry)
     rows = list(out.get("rows") or [])
@@ -373,13 +386,14 @@ def _entry_within_budget(entry: dict[str, Any], base: int) -> dict[str, Any]:
         withheld += 1
         out["rows"] = rows
         out["sink_axes_withheld_rows"] = withheld
-        if base + len(json.dumps(out)) <= _RESPONSE_BYTE_BUDGET:
+        if base + len(json.dumps(out)) <= limit:
             return out
     return _entry_without_hunks(out)
 
 
-def _fit_entries(result: dict[str, Any], offset: int) -> dict[str, Any]:
-    """A get_diff_patch_view page fitted to the response budget, in every view (``_fit_page``).
+def _fit_entries(result: dict[str, Any], offset: int, budget: int | None = None) -> dict[str, Any]:
+    """A get_diff_patch_view page fitted to the response budget, in every view (``_fit_page``) —
+    or to ``budget`` bytes, when the page is one block of a larger response (start_diff_review).
 
     First, defensively: an entry that would not fit the page even ALONE beside its envelope
     (envelope + that entry > budget — the envelope is 10-20KB, so the test is not "one entry over
@@ -393,7 +407,7 @@ def _fit_entries(result: dict[str, Any], offset: int) -> dict[str, Any]:
         widest = n if len(json.dumps(n)) > len(json.dumps(None)) else None
         envelope = {**result, "entries": [], "next_offset": widest, "entries_truncated": False}
         base = len(json.dumps(envelope))
-        result["entries"] = [_entry_within_budget(e, base) for e in result["entries"]]
+        result["entries"] = [_entry_within_budget(e, base, budget) for e in result["entries"]]
     return _fit_page(
         result,
         offset,
@@ -401,6 +415,7 @@ def _fit_entries(result: dict[str, Any], offset: int) -> dict[str, Any]:
         total="total_entries",
         next_offset="next_offset",
         truncated="entries_truncated",
+        budget=budget,
     )
 
 
@@ -2096,17 +2111,19 @@ def make_tools(
         whole diff is undetermined, else ``no listed entry``). ``view``:
         get_diff_patch_view(diff_id, detail="summary", limit=limit) as that call returns it —
         ``limit`` (1-200, default 20) entries in the default order, with the progress and annotation
-        blocks. ``read_next``: the call that reads one entry in full (``one_entry``) and, when the
+        blocks — cut shorter when the rest of this response leaves it less room (below).
+        ``read_next``: the call that reads one entry in full (``one_entry``) and, when the
         summary has more entries, the call for the next page (``more``). ``non_binary``: the run
         pair's non-binary file counts by kind and the get_file_diff call that lists them — not part
         of this diff's entries or of its review progress.
 
-        The response aims at the byte budget (~48KB): the view page is cut as get_diff_patch_view
-        cuts it, then the headline's inline_hunk is withheld (``page_budget``) when the headline
-        does not fit beside the rest. A large ``limit`` can still carry a ``view`` page that fills
-        the budget on its own, so the whole response may not fit — then it carries
-        ``over_budget: true`` (at the default ``limit`` it fits). A diff whose A or B side is a
-        proven-stale scan is refused, as on every diff tool."""
+        The response keeps to the byte budget (~48KB) at every ``limit``: the view page gets the
+        bytes the other blocks leave and is cut there as get_diff_patch_view cuts a page
+        (``entries_truncated``; ``next_offset`` and ``read_next.more`` resume after its last
+        entry). Only when even the view's first entry does not fit beside the headline is the
+        headline's inline_hunk withheld (``page_budget``); a response still over the budget then
+        carries ``over_budget: true``. A diff whose A or B side is a proven-stale scan is
+        refused, as on every diff tool."""
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
             return {
                 "diff_id": diff_id,
@@ -2117,11 +2134,9 @@ def make_tools(
             refusal = _refuse_stale_diff(conn, diff_id)
             if refusal is not None:
                 return refusal
-            view = _fit_entries(
-                _get_diff_patch_view(conn, diff_id, detail="summary", limit=limit), 0
-            )
-            if "error" in view:
-                return view
+            page = _get_diff_patch_view(conn, diff_id, detail="summary", limit=limit)
+            if "error" in page:
+                return page
             head = _get_diff_patch_view(conn, diff_id, limit=1, rows_limit=0)
             meta_full = _get_diff_meta(conn, diff_id)
             files = _file_block(conn, diff_id)
@@ -2132,29 +2147,48 @@ def make_tools(
             meta["version_skew"] = meta_full["meta"]["version_skew"]
         entries = head.get("entries") or []
         headline = entries[0] if entries else None
-        out: dict[str, Any] = {
-            "diff_id": diff_id,
-            "workflow": DIFF_WORKFLOW,
-            "meta": meta,
-            "headline": headline,
-        }
-        if files is not None:
-            out["non_binary"] = files
+        note = None
         if headline is None:
-            withheld = bool((view.get("review_progress") or {}).get("withheld"))
-            out["headline_note"] = _HEADLINE_WITHHELD if withheld else _HEADLINE_NONE
-        out["view"] = view
-        read_next: dict[str, Any] = {"one_entry": (view.get("detail_with") or {}).get("one_entry")}
-        if view.get("next_offset") is not None:
-            read_next["more"] = (
-                f'get_diff_patch_view(diff_id={json.dumps(diff_id)}, detail="summary", '
-                f"offset={view['next_offset']})"
-            )
-        out["read_next"] = read_next
-        if headline is not None:
-            # The rest of the response, measured with the headline's place left as null.
+            withheld = bool((page.get("review_progress") or {}).get("withheld"))
+            note = _HEADLINE_WITHHELD if withheld else _HEADLINE_NONE
+
+        def read_next(view: dict[str, Any], offset: Any) -> dict[str, Any]:
+            calls: dict[str, Any] = {"one_entry": (view.get("detail_with") or {}).get("one_entry")}
+            if offset is not None:
+                calls["more"] = (
+                    f'get_diff_patch_view(diff_id={json.dumps(diff_id)}, detail="summary", '
+                    f"offset={offset})"
+                )
+            return calls
+
+        def compose(head_entry: dict[str, Any] | None) -> dict[str, Any]:
+            out: dict[str, Any] = {
+                "diff_id": diff_id,
+                "workflow": DIFF_WORKFLOW,
+                "meta": meta,
+                "headline": head_entry,
+            }
+            if files is not None:
+                out["non_binary"] = files
+            if note is not None:
+                out["headline_note"] = note
+            # The other blocks are measured with the view's place left as null and read_next at
+            # its widest (a ``more`` resuming at the total), so the view gets what they leave.
+            out["view"] = None
+            out["read_next"] = read_next(page, page.get("total_entries"))
+            room = _RESPONSE_BYTE_BUDGET - (len(json.dumps(out)) - len(json.dumps(None)))
+            view = _fit_entries({**page, "entries": list(page.get("entries") or [])}, 0, room)
+            view.pop("over_budget", None)  # said for the whole response, below
+            out["view"] = view
+            out["read_next"] = read_next(view, view.get("next_offset"))
+            return out
+
+        out = compose(headline)
+        if headline is not None and len(json.dumps(out)) > _RESPONSE_BYTE_BUDGET:
+            # Even the view's first entry does not fit beside the whole headline: the headline is
+            # fitted beside the rest, then the view gets what is left again.
             base = len(json.dumps({**out, "headline": None})) - len(json.dumps(None))
-            out["headline"] = _entry_within_budget(headline, base)
+            out = compose(_entry_within_budget(headline, base))
         if len(json.dumps(out)) > _RESPONSE_BYTE_BUDGET:
             out["over_budget"] = True
         return out
@@ -2279,19 +2313,20 @@ def make_tools(
         may_be_incomplete, no word; the envelope's ``entry_words_counts`` is on every page). An
         undetermined pair's reading comes as ``proposed_pair_summary``, with its
         anchored_differs / anchor / in_read_first / demoted on the entry, and an anchored
-        micro-side pair carries ``anchored_micro_side: true``. In detail='summary' a missing count
-        is 0 — except inside a delta_summary whose kind is not_computed, or a guard_scan that
-        carries a reason: there nothing was counted. A body-elsewhere count that could not be
-        read is null, not missing. Every boolean (callees_complete, narrow, in_read_first,
-        demoted, b_other_fn_mentions) is given true or false. The order, filters, counts and
-        review_progress are those of ``detail='full'``; ``rows_limit`` is ignored (a summary
-        entry carries no row), and ``entry_id`` reads one entry in full only — with
-        ``detail='summary'`` it is an error. Walk the whole ranking with it, then read the
-        entries you pick with the call in ``detail_with``. ``not_listed_page`` pairs get the same
-        counts; ``view='candidate_flat'`` gives get_diff_sink_overlay's ``summary`` counts and no
-        row (``offset`` must be 0); ``string_edge`` rows are unchanged. ``detail`` here is
-        ``full`` / ``summary``; get_diff_sink_overlay's ``detail`` is ``summary`` / ``rows`` — a
-        different switch.
+        micro-side pair carries ``anchored_micro_side: true``. A summary's ``facts`` also leave out
+        ``callee_set_unchanged``, which its ``callee_set`` state already says. In detail='summary' a
+        missing count is 0 — except inside a delta_summary whose kind is not_computed, or a
+        guard_scan that carries a reason: there nothing was counted. A body-elsewhere count that
+        could not be read is null, not missing. Every boolean (callees_complete, narrow,
+        in_read_first, demoted, b_other_fn_mentions) is given true or false. The order, filters,
+        counts and review_progress are those of ``detail='full'``; ``rows_limit`` is ignored (a
+        summary entry carries no row), and ``entry_id`` reads one entry in full only — with
+        ``detail='summary'`` it is an error. Walk the whole ranking with it, then read the entries
+        you pick with the call in ``detail_with``. ``not_listed_page`` pairs get the same counts;
+        ``view='candidate_flat'`` gives get_diff_sink_overlay's ``summary`` counts and no row
+        (``offset`` must be 0); ``string_edge`` rows are unchanged. ``detail`` here is ``full`` /
+        ``summary``; get_diff_sink_overlay's ``detail`` is ``summary`` / ``rows`` — a different
+        switch.
 
         Every page carries the counts, ``blind_spots``, ``legend`` and ``caveats``. The long texts
         that are the same on every page of a scope — ``lens.order`` and the filter texts,

@@ -531,6 +531,23 @@ def test_a_bare_dollar_one_is_not_a_secret(fw: FW) -> None:
     assert "hunk_suppressed" not in one and one["hunk"]["lines"][-1].startswith("+sed")
 
 
+def test_a_whole_crypt_form_glued_to_a_word_or_a_dollar_is_not_a_secret(fw: FW) -> None:
+    """A complete crypt format right after a word character or a ``$`` (a shell or regex variable
+    run into it) is not read as a hash: the difference is given. The same text after a ``:`` is
+    one, so the rule itself still reads it.
+
+    MUTATION (verified RED, 1 failed — this test alone): drop the rule's lookbehind -> RED."""
+    glued = "echo foo$1$saltsalt$abcdefghij x$$6$saltsalt$abcdefghij\n"
+    fw.file("a", "etc/glue.sh", "shell_script", "echo\n")
+    fw.file("b", "etc/glue.sh", "shell_script", glued)
+    one = fw.diff(path="etc/glue.sh")["entry"]
+    assert "hunk_suppressed" not in one, one.get("hunk_suppressed")
+    assert one["hunk"]["lines"][-1] == "+" + glued.rstrip("\n")
+    fw.file("a", "etc/shadow.sh", "shell_script", "echo\n")
+    fw.file("b", "etc/shadow.sh", "shell_script", "echo root:$1$saltsalt$abcdefghij\n")
+    assert fw.diff(path="etc/shadow.sh")["entry"].get("hunk_suppressed") == "embedded_secret"
+
+
 def test_a_secret_past_the_first_page_still_suppresses(fw: FW) -> None:
     """The scan reads the whole difference before it is paged: a key on a later page holds back
     every page.

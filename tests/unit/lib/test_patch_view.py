@@ -6760,10 +6760,19 @@ def test_a_summary_keeps_every_fact_but_the_two_said_elsewhere(
 
 def test_the_tool_says_how_a_summary_reads_and_which_detail_it_is() -> None:
     """The tool's description carries the reading rule of a summary word for word — with its two
-    shapes that count nothing and its null — and says the two tools' detail switches differ."""
+    shapes that count nothing and its null — names both facts a summary leaves out, and says the
+    two tools' detail switches differ.
+
+    MUTATION (verified RED, 1 failed — this test alone): drop the callee_set_unchanged sentence
+    -> RED."""
     doc = " ".join(
         (mcp_app.make_tools(Path("unused.db"))["get_diff_patch_view"].__doc__ or "").split()
     )
+    assert "``facts`` (less the source gaps already in blind_spots)" in doc
+    assert (
+        f"A summary's ``facts`` also leave out ``{pv._SUMMARY_FACT_CALLEES_UNCHANGED}``, which its "
+        "``callee_set`` state already says."
+    ) in doc
     assert (
         "In detail='summary' a missing count is 0 — except inside a delta_summary whose kind is "
         "not_computed, or a guard_scan that carries a reason: there nothing was counted. A "
@@ -7361,10 +7370,11 @@ def test_start_diff_review_is_the_view_and_the_meta_as_they_are(
     tmp_path: Path, current: None
 ) -> None:
     """★ start_diff_review computes nothing of its own: ``view`` is byte for byte the tool's
-    summary page, ``headline`` the tool's first entry with rows_limit=0 (no inline rows, its
-    inline_hunk kept), each ``meta`` value get_diff_meta's own (version_skew from its ``meta``),
-    and no key comes from anywhere else. ``read_next.more`` is the call for the summary's next page
-    (copied, it reads that page) and is absent when there is none.
+    summary page when the rest leaves it room (cut otherwise, below), ``headline`` the tool's
+    first entry with rows_limit=0 (no inline rows, its inline_hunk kept), each ``meta`` value
+    get_diff_meta's own (version_skew from its ``meta``), and no key comes from anywhere else.
+    ``read_next.more`` is the call for the summary's next page (copied, it reads that page) and is
+    absent when there is none.
 
     MUTATION (verified RED, 1 failed — this test alone): put a key of its own into ``view`` ->
     RED; MUTATION (verified RED, 1 failed): read the headline without rows_limit=0 -> RED."""
@@ -7432,27 +7442,132 @@ def test_start_diff_review_refuses_what_it_cannot_read(tmp_path: Path, current: 
     assert missing.get("found") is False and "error" in missing
 
 
-def test_start_diff_review_keeps_to_the_page_budget(
+def _start_fits(out: dict[str, Any], page: dict[str, Any], budget: int) -> None:
+    """``out`` is within ``budget``; its view a prefix of ``page`` (the tool's own summary page at
+    the full budget) whose paging fields and ``read_next.more`` resume after its last entry."""
+    assert len(json.dumps(out)) <= budget and "over_budget" not in out, len(json.dumps(out))
+    view = out["view"]
+    assert "over_budget" not in view
+    shown = [e["entry_id"] for e in view["entries"]]
+    assert shown and shown == [e["entry_id"] for e in page["entries"][: len(shown)]]
+    assert view["total_entries"] == page["total_entries"]
+    cut = len(shown) < len(page["entries"])
+    assert view["entries_truncated"] is cut
+    if cut or page["next_offset"] is not None:
+        assert view["next_offset"] == len(shown)
+        more = out["read_next"].get("more")
+        assert more is not None
+        name, args = _copied_call(more)
+        assert name == "get_diff_patch_view" and args["offset"] == len(shown)
+    else:
+        assert view["next_offset"] is None and "more" not in out["read_next"]
+
+
+def test_start_diff_review_gives_the_view_what_the_rest_leaves(
     tmp_path: Path, current: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The headline is fitted beside the rest of the response: when it does not fit, its
-    inline_hunk is withheld (page_budget) and the view stays as the tool gives it; when even that
-    does not fit, the response says over_budget."""
+    """★ The response keeps to the budget at every limit: the headline, meta, workflow and
+    non_binary blocks come first and the view page is cut to the bytes they leave — a prefix of the
+    tool's own page, with ``entries_truncated`` and a ``next_offset`` / ``read_next.more`` that
+    resume after its last entry. Checked over a sweep of budgets from the smallest that holds the
+    whole headline and one view entry up to the whole response, at three limits.
+
+    MUTATION (verified RED, 2 failed — this test and the next): cut the view to the full budget,
+    not to what the rest leaves -> over the budget -> RED; MUTATION (verified RED, 1 failed — this
+    test alone): measure read_next without the ``more`` the cut adds -> RED; MUTATION (verified
+    RED, 2 failed): build ``read_next.more`` from the uncut page -> RED."""
     w = _summary_world(tmp_path)
-    start = mcp_app.make_tools(w.path)["start_diff_review"]
-    whole = start(DIFF)
-    hunk = whole["headline"]["pseudocode_delta"]["inline_hunk"]
-    assert "withheld" not in hunk  # the headline really carries a hunk to withhold
-    rest = len(json.dumps({**whole, "headline": None})) - len("null")
-    monkeypatch.setattr(
-        mcp_app, "_RESPONSE_BYTE_BUDGET", rest + len(json.dumps(whole["headline"])) - 1
-    )
-    cut = start(DIFF)
-    assert json.dumps(cut["view"]) == json.dumps(whole["view"])
-    assert cut["headline"]["pseudocode_delta"]["inline_hunk"]["withheld"] == "page_budget"
+    tools = mcp_app.make_tools(w.path)
+    start, view_tool = tools["start_diff_review"], tools["get_diff_patch_view"]
+    budget = mcp_app._RESPONSE_BYTE_BUDGET
+    for limit in (4, 20, 200):
+        page = view_tool(DIFF, detail="summary", limit=limit)
+        whole = start(DIFF, limit=limit)
+        assert "withheld" not in whole["headline"]["pseudocode_delta"]["inline_hunk"]
+        one = {**whole["view"], "entries": whole["view"]["entries"][:1]}
+        more = f'get_diff_patch_view(diff_id="{DIFF}", detail="summary", offset={limit})'
+        widest = {**whole["read_next"], "more": more}
+        # the smallest budget that holds the whole headline beside a one-entry view
+        floor = len(json.dumps({**whole, "view": one, "read_next": widest})) + 16
+        top = len(json.dumps(whole))
+        assert floor < top - 500, (floor, top)  # the sweep has a range to cover
+        cuts = 0
+        for b in range(floor, top + 1, max(1, (top - floor) // 60)):
+            monkeypatch.setattr(mcp_app, "_RESPONSE_BYTE_BUDGET", b)
+            out = start(DIFF, limit=limit)
+            _start_fits(out, page, b)
+            assert json.dumps(out["headline"]) == json.dumps(whole["headline"])
+            cuts += out["view"]["entries_truncated"]
+        assert cuts > 0
+        monkeypatch.setattr(mcp_app, "_RESPONSE_BYTE_BUDGET", budget)
+
+
+def test_start_diff_review_withholds_the_headline_hunk_only_when_one_entry_cannot_fit(
+    tmp_path: Path, current: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When even the view's first entry does not fit beside the whole headline, the headline's
+    inline_hunk is withheld (page_budget) and the view gets what is left again; when even that
+    does not fit, the response says over_budget.
+
+    MUTATION (verified RED, 1 failed — this test alone): say over_budget instead of withholding
+    the hunk -> RED; MUTATION (verified RED, 1 failed — this test alone): withhold the hunk but
+    keep the view cut beside the whole headline -> RED; MUTATION (verified RED, 1 failed — this
+    test alone): leave the view's own over_budget in it -> RED."""
+    w = _summary_world(tmp_path)
+    # the headline pair's bodies differ in many lines, so its hunk is worth withholding
+    pad = "x" * 60
+    body = "".join(f'v{i} = f{i}(a, "{pad}");\n' for i in range(12))
+    for side, addr, call in (("a", "00005000", "strcpy(d, s);"), ("b", "00006000", "")):
+        text = body.replace("f", "g") if side == "b" else body
+        w.adb[side].execute(
+            "UPDATE functions SET pseudocode = pseudocode || ? WHERE address = ?",
+            ("\n" + text + call, addr),
+        )
+    w.commit()
+    pv._clear_view_caches()
+    tools = mcp_app.make_tools(w.path)
+    start, view_tool = tools["start_diff_review"], tools["get_diff_patch_view"]
+    page = view_tool(DIFF, detail="summary", limit=20)
+    whole = start(DIFF, limit=20)
+    assert whole["headline"]["addr_a"] == "00005000"
+    assert "withheld" not in whole["headline"]["pseudocode_delta"]["inline_hunk"]
+    one = {**whole["view"], "entries": whole["view"]["entries"][:1]}
+    tight = len(json.dumps({**whole, "view": one})) - 1
+    lean = mcp_app._entry_without_hunks(whole["headline"])
+    room = len(json.dumps(whole["headline"])) - len(json.dumps(lean))
+    assert room > 300  # the hunk frees room for more than the one entry
+    monkeypatch.setattr(mcp_app, "_RESPONSE_BYTE_BUDGET", tight)
+    cut = start(DIFF, limit=20)
     assert "over_budget" not in cut
+    assert cut["headline"]["pseudocode_delta"]["inline_hunk"].get("withheld") == "page_budget"
+    assert json.dumps(cut["headline"]) == json.dumps(lean)
+    _start_fits(cut, page, tight)
+    assert len(cut["view"]["entries"]) > 1  # the view got the room the hunk left
     monkeypatch.setattr(mcp_app, "_RESPONSE_BYTE_BUDGET", 2000)
-    assert start(DIFF)["over_budget"] is True
+    over = start(DIFF)
+    assert over["over_budget"] is True and "over_budget" not in over["view"]
+
+
+def test_start_diff_review_without_a_headline_keeps_to_the_budget(
+    tmp_path: Path, current: None
+) -> None:
+    """The shapes with no headline — nothing listed, and the whole diff undetermined — stay within
+    the budget and carry no over_budget."""
+    w = World(tmp_path)
+    w.commit()
+    start = mcp_app.make_tools(w.path)["start_diff_review"]
+    shapes = [start(DIFF)]
+    w.atlas.execute("UPDATE diff_meta SET version_skew = 1")
+    w.commit()
+    pv._clear_view_caches()
+    shapes.append(start(DIFF))
+    assert [o["headline_note"] for o in shapes] == [
+        "no listed entry",
+        "diff_undetermined (meta.banners)",
+    ]
+    for out in shapes:
+        assert len(json.dumps(out)) <= mcp_app._RESPONSE_BYTE_BUDGET and "over_budget" not in out
+        assert out["view"]["entries"] == [] and "more" not in out["read_next"]
 
 
 def test_start_diff_review_is_registered_read_only_beside_the_view() -> None:
