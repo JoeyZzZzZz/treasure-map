@@ -97,6 +97,12 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("binaries", "stub_names", "TEXT"),
     # which additive detectors threw on a function (older DBs: '[]', i.e. none recorded)
     ("functions", "detector_errors", "TEXT DEFAULT '[]'"),
+    # where a script_calls command came from (literal / function_arg / variable / inline) and the
+    # line it was derived from. Back-fill NULL on older DBs, which reads as literal: every row an
+    # older scan wrote named its command on the line. Not indexed: a schema index on a column an
+    # older table lacks would fail before this ALTER runs. Must match schema.sql.
+    ("script_calls", "via", "TEXT"),
+    ("script_calls", "via_line", "INTEGER"),
 )
 
 

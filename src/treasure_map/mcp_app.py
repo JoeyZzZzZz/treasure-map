@@ -3554,15 +3554,24 @@ def make_tools(
         binary: str | None = None,
         run_id: str | None = None,
         evidence_ref: str | None = None,
+        offset: int = 0,
     ) -> dict[str, Any]:
         """Rootfs scripts that invoke this binary — entry-reach evidence (script + line + args).
 
         Run-aware: ``run_id`` + ``binary`` or ``evidence_ref``; echoes ``resolved_run``.
 
+        Each site's ``via`` says where its command came from: ``literal`` (the line names it),
+        ``function_arg`` (a same-file function runs its positional parameter and this line passes
+        the name), ``variable`` (a variable assigned the name) or ``inline`` (the first command of
+        a command substitution); ``via_line`` is the line it was derived from (null for literal).
+        ``via`` is a mechanical provenance label, not a reachability verdict. Paged losslessly by
+        size under ``paging`` — pass ``offset`` = ``paging.next_offset`` for the rest; ``by_via``
+        counts every matching site, not just this page.
+
         Without binary (or an evidence_ref that supplies one) it is an error naming the run, not an
         empty answer."""
         return _fact(
-            lambda c, fn, bn: facts.get_script_callsites(c, binary=bn or ""),
+            lambda c, fn, bn: facts.get_script_callsites(c, binary=bn or "", offset=offset),
             run_id=run_id,
             evidence_ref=evidence_ref,
             binary=binary,

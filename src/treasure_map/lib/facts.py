@@ -1620,16 +1620,36 @@ def get_data_bytes(
     return result
 
 
-def get_script_callsites(conn: sqlite3.Connection, *, binary: str) -> dict[str, Any]:
+def get_script_callsites(
+    conn: sqlite3.Connection, *, binary: str, offset: int = 0, max_chars: int = _FACT_PAGE_CHARS
+) -> dict[str, Any]:
     """Cross-artifact call sites: rootfs scripts that invoke this binary (entry-reach evidence).
 
     Each site carries the script path + line + the coarse args_pattern (literal / var_expansion /
-    piped) and the raw_line (the script's OWN source line — evidence, never a generated payload).
-    A binary referenced by a startup/maintenance script is reachable from that entry point."""
+    piped) and the raw_line (the script's OWN source line — evidence, never a generated payload),
+    plus ``via`` — where the command came from: ``literal`` (named on the line), ``function_arg``
+    (a function's positional parameter, given a literal argument here), ``variable`` (a variable's
+    literal value) or ``inline`` (the first command of a command substitution) — and ``via_line``,
+    the line it was derived from (null for literal). ``via`` is a mechanical provenance label, not a
+    reachability verdict. A binary referenced by a startup/maintenance script is reachable from
+    that entry point. Paged losslessly by size under ``paging`` (``offset`` /
+    ``next_offset``); ``by_via`` counts every matching site, not just this page."""
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        return {
+            "found": False,
+            "binary": binary,
+            "error": f"offset must be an integer >= 0, got {offset!r}",
+        }
+    # An analysis.db scanned before via existed has no such columns, and this connection is
+    # read-only (no migration runs): ask for them only when present, else every row reads literal.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(script_calls)")}
+    via_cols = (
+        "c.via, c.via_line" if {"via", "via_line"} <= cols else "NULL AS via, NULL AS via_line"
+    )
     rows = conn.execute(
-        "SELECT f.path AS script, c.command, c.raw_line, c.line_number, c.args_pattern "
-        "FROM script_calls c JOIN non_binary_files f ON f.id = c.file_id "
-        "ORDER BY f.path, c.line_number"
+        "SELECT f.path AS script, c.command, c.raw_line, c.line_number, c.args_pattern, "  # noqa: S608
+        f"{via_cols} FROM script_calls c JOIN non_binary_files f ON f.id = c.file_id "
+        "ORDER BY f.path, c.line_number, c.id"
     ).fetchall()
     name = binary.rsplit("/", 1)[-1]
     sites = [
@@ -1639,11 +1659,17 @@ def get_script_callsites(conn: sqlite3.Connection, *, binary: str) -> dict[str, 
             "line_number": r["line_number"],
             "args_pattern": r["args_pattern"],
             "raw_line": r["raw_line"],
+            "via": r["via"] or "literal",
+            "via_line": r["via_line"],
         }
         for r in rows
         if (r["command"] or "").rsplit("/", 1)[-1] == name or (r["command"] or "") == binary
     ]
-    return {"found": True, "binary": binary, "callsites": sites}
+    by_via: dict[str, int] = {}
+    for site in sites:
+        by_via[site["via"]] = by_via.get(site["via"], 0) + 1
+    page, paging = _byte_page(sites, offset, max_chars)
+    return {"found": True, "binary": binary, "callsites": page, "paging": paging, "by_via": by_via}
 
 
 def _byte_reader(

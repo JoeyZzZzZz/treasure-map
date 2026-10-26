@@ -226,12 +226,73 @@ def test_a_script_line_dropped_once_of_two_is_seen_with_its_count(fw: FW) -> Non
     fw.row("b", "script_calls", b, command="/sbin/up", raw_line="/sbin/up -c 2", line_number=12)
     block = _by_path(fw.diff())["sbin/run.sh"]["structured"]
     assert block["recorded_scope"] == fd.SCOPES["shell_script"]
+    lit = {"via": "literal"}
     assert block["commands_a_only"] == [
-        {"command": "/sbin/ctl", "raw_line": "/sbin/ctl reboot &", "line_number": 3, "count": 1},
-        {"command": "/sbin/up", "raw_line": "/sbin/up -c 1", "line_number": 12, "count": 1},
+        {
+            "command": "/sbin/ctl",
+            **lit,
+            "raw_line": "/sbin/ctl reboot &",
+            "line_number": 3,
+            "count": 1,
+        },
+        {"command": "/sbin/up", **lit, "raw_line": "/sbin/up -c 1", "line_number": 12, "count": 1},
     ]
     assert block["commands_b_only"] == [
-        {"command": "/sbin/up", "raw_line": "/sbin/up -c 2", "line_number": 12, "count": 1}
+        {"command": "/sbin/up", **lit, "raw_line": "/sbin/up -c 2", "line_number": 12, "count": 1}
+    ]
+
+
+def test_a_line_stored_as_two_rows_is_one_line_and_repeated_text_still_counts(fw: FW) -> None:
+    """A line that launches two binaries is stored as two rows and is still one line: against the
+    same line stored once it is no difference. The same text on two lines stays two occurrences,
+    so a side holding it once more is still a difference.
+
+    MUTATION (verified RED): dedupe by raw_line text instead of merging by line number first ->
+    RED (the repeated text reads as no change)."""
+    a = fw.file("a", "sbin/two.sh", "shell_script", "a\n")
+    b = fw.file("b", "sbin/two.sh", "shell_script", "b\n")
+    line = "/sbin/svc_a $(svc_b)"
+    fw.row(
+        "a", "script_calls", a, command="/sbin/svc_a", raw_line=line, line_number=3, via="literal"
+    )
+    fw.row("a", "script_calls", a, command="svc_b", raw_line=line, line_number=3, via="inline")
+    fw.row("b", "script_calls", b, command="/sbin/svc_a", raw_line=line, line_number=3)
+    for n in (7, 9):
+        fw.row("a", "script_calls", a, command="/sbin/ctl", raw_line="/sbin/ctl up", line_number=n)
+    fw.row("b", "script_calls", b, command="/sbin/ctl", raw_line="/sbin/ctl up", line_number=8)
+    block = _by_path(fw.diff())["sbin/two.sh"]["structured"]
+    assert block["commands_b_only"] == []
+    assert block["commands_a_only"] == [
+        {
+            "command": "/sbin/ctl",
+            "via": "literal",
+            "raw_line": "/sbin/ctl up",
+            "line_number": 7,
+            "count": 1,
+        }
+    ]
+
+
+def test_a_side_scanned_before_via_existed_is_still_compared(fw: FW) -> None:
+    """An older analysis.db has no script_calls.via (read-only, no migration): it reads as literal
+    rather than failing the pair.
+
+    MUTATION (verified RED): drop _read_side's column check -> FileDiffError -> RED."""
+    a = fw.file("a", "sbin/old.sh", "shell_script", "a\n")
+    b = fw.file("b", "sbin/old.sh", "shell_script", "b\n")
+    fw.db["a"].execute("ALTER TABLE script_calls DROP COLUMN via")
+    fw.db["a"].execute("ALTER TABLE script_calls DROP COLUMN via_line")
+    fw.db["a"].commit()
+    fw.row("a", "script_calls", a, command="/sbin/up", raw_line="/sbin/up -c 1", line_number=2)
+    fw.row("b", "script_calls", b, command="/sbin/up", raw_line="/sbin/up -c 2", line_number=2)
+    try:
+        out = fw.diff()
+    except fd.FileDiffError as exc:  # read as a failed assertion, not a crash
+        out = {"error": str(exc)}
+    assert "entries" in out, out
+    block = _by_path(out)["sbin/old.sh"]["structured"]
+    assert [(r["via"], r["raw_line"]) for r in block["commands_a_only"]] == [
+        ("literal", "/sbin/up -c 1")
     ]
 
 

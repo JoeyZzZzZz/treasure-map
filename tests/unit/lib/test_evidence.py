@@ -334,8 +334,15 @@ def test_evidence_is_deterministic() -> None:
 def test_entry_index_matches_script_call_by_command_token() -> None:
     idx = EntryIndex(
         script_calls=[
-            ("/etc/init.d/netd", "/sbin/netd", 5, "var_expansion"),  # absolute path form
-            ("/etc/init.d/other", "busybox", 9, "literal"),  # unrelated
+            (
+                "/etc/init.d/netd",
+                "/sbin/netd",
+                5,
+                "var_expansion",
+                None,
+                None,
+            ),  # absolute path form
+            ("/etc/init.d/other", "busybox", 9, "literal", None, None),  # unrelated
         ],
         web_endpoints=[],
     )
@@ -358,7 +365,7 @@ def test_entry_index_matches_web_endpoint_by_path() -> None:
 
 
 def test_entry_index_no_match_is_empty() -> None:
-    idx = EntryIndex(script_calls=[("/s", "telnetd", 1, "literal")], web_endpoints=[])
+    idx = EntryIndex(script_calls=[("/s", "telnetd", 1, "literal", None, None)], web_endpoints=[])
     assert idx.sites_for("httpd", None) == []
 
 

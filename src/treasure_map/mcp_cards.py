@@ -745,8 +745,10 @@ TOOL_CARDS: dict[str, ToolCard] = {
         example='get_script_callsites(run_id="<run_id>", binary="<binary>")',
         boundary=("entry-reach evidence",),
         summary=(
-            "Rootfs scripts that invoke one binary — entry-reach evidence (script + line + args). "
-            f"{_NO_BINARY}"
+            "Rootfs scripts that invoke one binary — entry-reach evidence (script + line + args), "
+            "paged by offset. Each site's via says where the command came from (literal / "
+            "function_arg / variable / inline) and via_line the line it was derived from; via is "
+            f"a mechanical provenance label, not a reachability verdict. {_NO_BINARY}"
         ),
     ),
     "get_disassembly": ToolCard(
@@ -1217,6 +1219,7 @@ PARAMETER_NAMES: list[dict[str, Any]] = [
             "get_strings",
             "get_data_table",
             "get_disassembly",
+            "get_script_callsites",
         ),
         _KEPT,
         "the unit is each tool's own (rows, lines, bytes, records); copy the value a page gives",

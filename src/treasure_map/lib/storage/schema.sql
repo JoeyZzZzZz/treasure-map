@@ -381,6 +381,8 @@ CREATE TABLE IF NOT EXISTS script_calls (
     raw_line        TEXT,             -- script's OWN source line; analysis evidence, never a generated payload
     line_number     INTEGER,
     args_pattern    TEXT,             -- coarse structural token only: literal / var_expansion / piped
+    via             TEXT,             -- where command came from: literal / function_arg / variable / inline; NULL reads as literal
+    via_line        INTEGER,          -- the line it was derived from (function definition / assignment / substitution); NULL for literal
     FOREIGN KEY(file_id) REFERENCES non_binary_files(id) ON DELETE CASCADE
 );
 

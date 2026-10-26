@@ -158,7 +158,7 @@ class _Side:
 
 
 _SUB_TABLES = {
-    "script_calls": "file_id, command, raw_line, line_number",
+    "script_calls": "file_id, command, raw_line, line_number, via",
     "config_entries": "file_id, section, key, value, is_sensitive",
     "credentials": "file_id, cred_type, identifier, algorithm, material, is_sensitive",
     "web_endpoints": "file_id, asset_type, method, path, source",
@@ -192,7 +192,12 @@ def _read_side(atlas: sqlite3.Connection, run_id: str) -> _Side:
                 continue
             files[row["path"]] = row
         rows: dict[str, dict[int, list[dict[str, Any]]]] = {}
+        # An analysis.db scanned before script_calls.via existed has no such column (this read
+        # runs no migration): read it there as NULL, which means literal.
+        script_cols = {r[1] for r in conn.execute("PRAGMA table_info(script_calls)")}
         for table, cols in _SUB_TABLES.items():
+            if table == "script_calls" and "via" not in script_cols:
+                cols = cols.replace(", via", ", NULL AS via")
             by_file: dict[int, list[dict[str, Any]]] = {}
             for r in conn.execute(f"SELECT {cols} FROM {table} ORDER BY id"):  # noqa: S608
                 by_file.setdefault(r["file_id"], []).append(dict(r))
@@ -281,7 +286,25 @@ def _multiset_delta(
     return ca - cb, cb - ca
 
 
+def _one_per_line(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One record per source line: a line that launches two binaries is stored as two rows, and
+    is still one line of the script. The first row stands (its command and via)."""
+    out: list[dict[str, Any]] = []
+    seen: set[Any] = set()
+    for r in rows:
+        if r["line_number"] in seen:
+            continue
+        seen.add(r["line_number"])
+        out.append(r)
+    return out
+
+
 def _script_block(rows_a: list[dict[str, Any]], rows_b: list[dict[str, Any]]) -> dict[str, Any]:
+    # ★ Merged by line number FIRST, then counted by text as a multiset: the same text on two
+    # lines is two occurrences, and a line one side has once more is a difference. Deduping by
+    # text alone would read that extra occurrence as no change.
+    rows_a, rows_b = _one_per_line(rows_a), _one_per_line(rows_b)
+
     def key(r: dict[str, Any]) -> str:
         return (r["raw_line"] or r["command"] or "").strip()
 
@@ -294,6 +317,7 @@ def _script_block(rows_a: list[dict[str, Any]], rows_b: list[dict[str, Any]]) ->
                 out.append(
                     {
                         "command": r["command"],
+                        "via": r.get("via") or "literal",
                         "raw_line": k,
                         "line_number": r["line_number"],
                         "count": only[k],

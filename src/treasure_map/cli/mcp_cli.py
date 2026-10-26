@@ -170,12 +170,13 @@ def xrefs(function: str, direction: str, binary: str | None, analysis_db: str) -
 
 @fact.command(name="script-callsites")
 @click.argument("binary")
+@click.option("--offset", default=0, type=int, help="Site offset to page from.")
 @click.option("--analysis-db", default="analysis.db", help="Path to the analysis database.")
-def script_callsites(binary: str, analysis_db: str) -> None:
-    """Print the rootfs scripts that invoke BINARY (entry-reach evidence)."""
+def script_callsites(binary: str, offset: int, analysis_db: str) -> None:
+    """Print the rootfs scripts that invoke BINARY (entry-reach evidence), one page at a time."""
     conn = _open_fact_db(analysis_db)
     try:
-        _emit_fact(conn, facts.get_script_callsites(conn, binary=binary))
+        _emit_fact(conn, facts.get_script_callsites(conn, binary=binary, offset=offset))
     finally:
         conn.close()
 

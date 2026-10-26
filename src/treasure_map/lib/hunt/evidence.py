@@ -576,7 +576,9 @@ class EntryIndex:
 
     def __init__(
         self,
-        script_calls: list[tuple[str | None, str | None, int | None, str | None]],
+        script_calls: list[
+            tuple[str | None, str | None, int | None, str | None, str | None, int | None]
+        ],
         web_endpoints: list[tuple[str | None, str | None, str | None, str | None, str | None]],
         exec_sites: dict[str, list[dict[str, Any]]] | None = None,
     ) -> None:
@@ -602,19 +604,25 @@ class EntryIndex:
         if not names:
             return []
         sites: list[dict[str, Any]] = []
-        for script, command, line, args_pattern in self._script_calls:
+        for script, command, line, args_pattern, via, via_line in self._script_calls:
             cmd = command or ""
             # References the binary when the command token is, or ends in, the binary name
             # (handles bare-name and absolute-path forms in the script).
             if cmd.rsplit("/", 1)[-1] in names or cmd in names:
-                sites.append(
-                    {
-                        "kind": "script_call",
-                        "script": script,
-                        "line": line,
-                        "arg_source": args_pattern,
-                    }
-                )
+                site: dict[str, Any] = {
+                    "kind": "script_call",
+                    "script": script,
+                    "line": line,
+                    "arg_source": args_pattern,
+                }
+                # ★ Only a command the line does not name itself says where it came from. A
+                # literal site stays the exact dict it always was: it is stored inside the
+                # candidate's flow_evidence, which an overlay judgement's basis compares as text,
+                # so a re-scan of unchanged content must not move it.
+                if via not in (None, "literal"):
+                    site["via"] = via
+                    site["via_line"] = via_line
+                sites.append(site)
         for asset, asset_type, method, endpoint, source in self._web_endpoints:
             ep = endpoint or ""
             # Path/word-boundary match, NOT bare substring: a short binary name ("rc") must sit on
@@ -650,11 +658,19 @@ def load_entry_index(
     ``exec_sites`` comes from a different source than the two tables here — it is computed during
     the hunt from the call provenance, keyed by the binary being launched. Omitting it degrades to
     the rootfs-only index rather than failing, so the two sources stay independent."""
+    # ★ An older analysis.db has no via / via_line columns, and this read is read-only so no
+    # migration adds them. Asking for them there would raise, and the except below would turn
+    # every script entry into "none found" — so the columns are asked for only when present.
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(script_calls)")}
+    except sqlite3.OperationalError:
+        cols = set()
+    via_cols = "c.via, c.via_line" if {"via", "via_line"} <= cols else "NULL, NULL"
     try:
         sc = conn.execute(
-            "SELECT f.path, c.command, c.line_number, c.args_pattern "
+            f"SELECT f.path, c.command, c.line_number, c.args_pattern, {via_cols} "  # noqa: S608
             "FROM script_calls c JOIN non_binary_files f ON f.id = c.file_id "
-            "ORDER BY f.path, c.line_number"
+            "ORDER BY f.path, c.line_number, c.id"
         ).fetchall()
     except sqlite3.OperationalError:
         sc = []
@@ -667,7 +683,7 @@ def load_entry_index(
     except sqlite3.OperationalError:
         we = []
     return EntryIndex(
-        [(r[0], r[1], r[2], r[3]) for r in sc],
+        [(r[0], r[1], r[2], r[3], r[4], r[5]) for r in sc],
         [(r[0], r[1], r[2], r[3], r[4]) for r in we],
         exec_sites=exec_sites,
     )
