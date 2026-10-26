@@ -29,14 +29,16 @@ It does two things:
 
 **1. Install.** One command installs `tmap` and then runs `tmap init`, which sets up the toolchain
 (JDK 21, Ghidra 11.4.3, BinExport, BinDiff 8 — reusing what you already have) and registers the MCP
-server with the agents you pick. No API key is needed. Restart your agent when it finishes.
+server with the agents you pick. No API key is needed. Restart your agent when it finishes and check
+that treasure-map is connected.
 
 ```bash
 curl -LsSf https://github.com/JoeyZzZzZz/treasure-map/releases/latest/download/install.sh | sh
 ```
 
 **2. Map a firmware.** The input is an *already-extracted* filesystem — unpack the image first with
-any extraction tool you like.
+any extraction tool you like (or ask your agent to unpack it into its filesystem). `-w` is the name
+you give this firmware; use it whenever you mention the firmware to your agent.
 
 ```bash
 tmap scan ./firmware.extracted -w my-fw
@@ -51,6 +53,7 @@ Choose for yourself which views of its candidate map to review
 open a lead's pseudocode, trace where its input comes from, and judge it yourself.
 The candidates are leads to verify, not confirmed bugs.
 Record each conclusion with annotate so the next session starts from it.
+End with the leads worth following up, each with its evidence_ref and why.
 ```
 
 **3. Or diff two versions.**
@@ -61,18 +64,23 @@ tmap scan ./fw_v2.extracted -w fw-v2
 tmap diff --before fw-v1 --after fw-v2
 ```
 
+A firmware pair splits into one diff per changed binary; the non-binary files are compared on their
+own.
+
 ```text
-Review the diff fw-v1 → fw-v2 using treasure-map.
-Start from start_diff_review:
-for each changed function, compare the pseudocode of both versions
-and decide whether the change does something real, such as a new check or a changed bound.
-Record each judgement with annotate_diff.
+Review the firmware diff fw-v1 → fw-v2 using treasure-map, starting from start_diff_review,
+across every changed binary and the non-binary files.
+Judge whether each change does something real; say inconclusive when you cannot tell.
+For a real one: what weakness in fw-v1 does it address, and does the same pattern survive elsewhere?
+Record each judgement with annotate_diff, and end with what you reviewed,
+what you did not reach or could not diff, and the changes that look security-relevant.
 ```
 
 That is all you run by hand. `scan` is the slow part — one Ghidra pass per binary, with progress shown.
 Re-running with the same `-w` resumes where it stopped; a different `-w` keeps another firmware
 alongside. Everything you scan and diff accumulates in one **atlas** (`~/.treasure-map/atlas.db`),
-and the agent picks which firmware or diff to work on — no reconfiguration per scan.
+and the agent picks which firmware or diff to work on — no reconfiguration per scan. `tmap runs`
+lists every firmware scanned so far, by the name you gave it.
 
 ---
 
@@ -100,8 +108,8 @@ BinDiff end to end — you never handle an intermediate file. (`--binary NAME` l
 
 - **A function-level patch view.** One entry per changed function pair, grouped by what happened
   around its dangerous calls: a call that now goes somewhere else, a dangerous call that is still
-  there, a reading that could not be decided. An optional ordering puts the entries most likely to
-  matter first.
+  there, a reading that could not be decided. By default the entries most likely to matter come
+  first; other orderings are a switch away.
 - **What a similarity score misses.** BinDiff's similarity ignores constants: a function can read
   `similarity=1.0` while a buffer length went from `0x40` to `0x3f`. tmap adds an
   address-normalized pseudocode comparison (truly identical, or only similar) and flags a changed
@@ -109,6 +117,8 @@ BinDiff end to end — you never handle an intermediate file. (`--binary NAME` l
 - **Blind spots stated, not hidden.** A binary that could not be diffed is listed as such, never
   counted as unchanged. A function with no counterpart is *undetermined* — it may have been inlined
   or moved — never reported as removed or added.
+- **Non-binary files too.** Scripts, configs and web files are compared by path between the two
+  versions, and your agent can record a judgment on each file.
 - **Judgments that stay.** Your agent records on each entry whether the change does something real,
   and can carry that judgment over to the affected candidate in the firmware map.
 
@@ -233,14 +243,14 @@ tmap diff --before fw-v1 --after fw-v2      # re-runs the diffs that are out of 
 
 `tmap update` checks PyPI for the newest version, shows its plan and asks once (`--check` only
 reports, `--yes` skips the question). It replaces the installed version, names any other `tmap` on
-PATH that would shadow the new one, and then starts the new version's `tmap init` by itself — you do not type it. That init also
-tells you how many of your runs predate the new version. A diff made by an older tmap, or with
-another toolchain, is recomputed once.
+PATH that would shadow the new one, and then starts the new version's `tmap init` by itself — you
+do not type it. That init also tells you how many of your runs predate the new version. A diff made
+by an older tmap, or with another toolchain, is recomputed once.
 
 With no arguments, `tmap rescan` re-scans every run the installed tmap's code would produce
-differently. To rescan a single firmware,
-name its run — the `-w` name you scanned it with, unless you set `--run-id` — for example
-`tmap rescan fw-v1`. `--dry-run` lists what would be rescanned and why, without running anything.
+differently. To rescan a single firmware, name its run — the `-w` name you scanned it with, unless
+you set `--run-id` — for example `tmap rescan fw-v1`. `--dry-run` lists what would be rescanned and
+why, without running anything.
 
 `tmap update` works on the install the one-line installer makes (`uv tool`). Installed another way,
 update it the same way you installed it.

@@ -20,27 +20,28 @@ Code、Codex、Cursor 等）：它认得的每一处危险调用，流到那里�
 
 **1. 安装。** 一条命令装好 `tmap`，随后自动运行 `tmap init`：它会配置工具链（JDK 21、Ghidra
 11.4.3、BinExport、BinDiff 8，已经装好的会直接复用），并把 MCP 服务器注册到你选择的 agent。不需要任何
-API key。完成后重启你的 agent。
+API key。完成后重启你的 agent，确认 treasure-map 已经连上。
 
 ```bash
 curl -LsSf https://github.com/JoeyZzZzZz/treasure-map/releases/latest/download/install.sh | sh
 ```
 
-**2. 给一个固件画地图。** 输入是**已经解包**的文件系统，请先用你习惯的工具解包固件镜像。
+**2. 给一个固件画地图。** 输入是**已经解包**的文件系统，请先用你习惯的工具解包固件镜像（或直接让你的 agent 把固件解包成对应的文件系统）。`-w`
+是给这个固件起的名字，之后对 agent 提到这个固件时就用它。
 
 ```bash
 tmap scan ./firmware.extracted -w my-fw
 ```
 
-然后对你的 agent 说（下面是 `tmap init` 打印的提示词，用中文说同样的意思也可以）：
+然后对你的 agent 说：
 
 ```text
-Audit firmware my-fw using treasure-map.
-Choose for yourself which views of its candidate map to review
-(by sink, by data source, or by any other layer) and find the issues in them:
-open a lead's pseudocode, trace where its input comes from, and judge it yourself.
-The candidates are leads to verify, not confirmed bugs.
-Record each conclusion with annotate so the next session starts from it.
+用 treasure-map 审计固件 my-fw。
+自己决定看候选地图的哪些视图（按 sink、按数据来源或其他任何图层），从中找出问题：
+打开线索的伪代码，追查它的输入从哪来，自己做判断。
+候选是待验证的线索，不是确认的漏洞。
+每条结论都用 annotate 记录下来，下次会话从这里接着做。
+最后列出值得跟进的线索，每条附上 evidence_ref 和理由。
 ```
 
 **3. 或者对比两个版本。**
@@ -51,16 +52,19 @@ tmap scan ./fw_v2.extracted -w fw-v2
 tmap diff --before fw-v1 --after fw-v2
 ```
 
+一对固件会按二进制分成多个对比，非二进制文件单独对比。
+
 ```text
-Review the diff fw-v1 → fw-v2 using treasure-map.
-Start from start_diff_review:
-for each changed function, compare the pseudocode of both versions
-and decide whether the change does something real, such as a new check or a changed bound.
-Record each judgement with annotate_diff.
+用 treasure-map 审查固件对比 fw-v1 → fw-v2，从 start_diff_review 开始，
+覆盖每个有变化的二进制和非二进制文件。
+判断每处改动有没有实际作用；判断不了就标为 inconclusive。
+对有实际作用的改动：它针对 fw-v1 的什么弱点，同样的写法在别处还在不在？
+每个判断都用 annotate_diff 记录下来。最后说明看了哪些、哪些没看到或没能对比，以及哪些改动看起来和安全相关。
 ```
 
 需要你手动运行的就这些。`scan` 是最慢的一步：每个二进制跑一遍 Ghidra，会显示进度。用同一个 `-w` 重新运行会从中断处继续；换一个 `-w` 就能并排保存另一个固件。你扫过、比过的所有结果都积累在同一个
-**atlas**（`~/.treasure-map/atlas.db`）里，由 agent 自己选择看哪个固件、哪次对比，每次扫描后都不用重新配置。
+**atlas**（`~/.treasure-map/atlas.db`）里，由 agent 自己选择看哪个固件、哪次对比，每次扫描后都不用重新配置。`tmap runs`
+会按你起的名字列出扫过的所有固件。
 
 ---
 
@@ -79,10 +83,11 @@ Record each judgement with annotate_diff.
 
 `tmap diff` 会并行对比所有内容有变化的二进制，从 Ghidra、BinExport 到 BinDiff 全程自动完成，你不用碰任何中间文件。（`--binary NAME` 只对比指定的一个。）
 
-- **函数级补丁视图。** 每对改动过的函数一条，按危险调用附近发生了什么分组：调用的目标换了，危险调用还在原处，或者无法判定。可选的排序会把最可能重要的条目放在前面。
+- **函数级补丁视图。** 每对改动过的函数一条，按危险调用附近发生了什么分组：调用的目标换了，危险调用还在原处，或者无法判定。默认把最可能重要的条目排在前面，也可以换成别的排序。
 - **相似度看不到的改动。** BinDiff 的相似度会忽略常量：一个函数可能显示 `similarity=1.0`，而缓冲区长度已经从 `0x40` 改成了 `0x3f`。tmap 额外做了地址归一化后的伪代码比较（真正相同，还是只是相似），并标出拷贝或格式化调用处被改动的长度常量。
 - **盲区明说，不藏。** 没能对比的二进制会单独列出，绝不计为"没变"。找不到对应函数的，标为"未定"
   （可能被内联或挪走了），绝不报成"删除"或"新增"。
+- **非二进制文件也比。** 两个版本的脚本、配置和 web 文件按路径对比，agent 可以对每个文件记录判断。
 - **判断留得下来。** agent 在每个条目上记录这处改动有没有实际作用，并可以把判断带到固件地图里对应的候选上。
 
 如果已存的扫描或对比结果是旧版 tmap 生成的，`tmap diff` 会先把它们更新到最新，并在开始前说明需要做哪些工作。
@@ -127,7 +132,7 @@ Record each judgement with annotate_diff.
 3. **列出你的 agent**（Claude Code、Codex、Cursor、Claude Desktop、dsh），本机已安装的默认勾选——空格取消勾选，回车确认；
 4. **展示计划**（每个下载的 URL、大小和 sha256，以及每个将要修改的文件），并询问
    `Apply N changes? [Y/n]`；
-5. **执行**计划，运行 **doctor** 检查，并打印[快速开始](#快速开始)里的那两段提示词。
+5. **执行**计划，运行 **doctor** 检查，并打印[快速开始](#快速开始)里那两段提示词的英文版。
 
 随时可以再运行一次；配置已是最新时，它会报告 "everything current, nothing to do"。
 
@@ -184,14 +189,14 @@ Record each judgement with annotate_diff.
 
 ```bash
 tmap update                                 # 装上最新版 tmap
-tmap rescan                                 # 重新扫描旧版 tmap 生成的所有 run
+tmap rescan                                 # 重新扫描当前代码会扫出不同结果的所有 run
 tmap diff --before fw-v1 --after fw-v2      # 重新运行已过期的对比
 ```
 
 `tmap update` 会到 PyPI 查询最新版本，展示计划并询问一次（`--check` 只报告不安装，`--yes` 跳过询问）。它会替换已安装的版本；如果 PATH 上还有别的 `tmap` 会遮住新版本，会把它们指出来；最后自动启动新版本的 `tmap init`，你不用自己输入。这次 init 也会告诉你有多少个
 run 早于新版本。旧版 tmap 或其他工具链生成的对比，会重新计算一次。
 
-不带参数时，`tmap rescan` 会重新扫描所有由旧版 tmap 生成的 run。只想重扫某一个固件，就写上它的 run 名：默认就是扫描时用的 `-w` 名字（除非你另外设置了 `--run-id`），例如 `tmap rescan fw-v1`。加上 `--dry-run`
+不带参数时，`tmap rescan` 会重新扫描当前 tmap 的代码会扫出不同结果的所有 run。只想重扫某一个固件，就写上它的 run 名：默认就是扫描时用的 `-w` 名字（除非你另外设置了 `--run-id`），例如 `tmap rescan fw-v1`。加上 `--dry-run`
 会列出将要重扫哪些、为什么，但不实际运行。
 
 `tmap update` 适用于一键安装脚本装好的版本（`uv tool`）。如果是用其他方式安装的，请用同样的方式升级。
