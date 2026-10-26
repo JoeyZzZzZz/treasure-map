@@ -302,7 +302,7 @@ def test_the_two_tiers_are_reported_separately_with_what_they_cost(tmp_path: Pat
     out = CliRunner().invoke(rescan, ["--atlas", str(db), "--dry-run"])
     assert out.exit_code == 0, out.output
     assert "needs re-extraction (1)" in out.output
-    assert "decompiler runs over every binary again" in out.output
+    assert "decompiler runs over every binary the running pass has not extracted yet" in out.output
     assert "old_extract:" in out.output and "[37 binaries]" in out.output
     assert "needs re-hunt (1)" in out.output
     # The hunt tier states BOTH halves: no decompiler on a cache hit, and the rebuild that happens
@@ -1174,3 +1174,337 @@ def test_a_direct_scan_still_reports_three_stages_and_keeps_its_triage_list(
     assert "[2/3] hunting" in out.output, out.output
     assert "[3/3] triage" in out.output, out.output
     assert "[1/2] analyzing" not in out.output, out.output
+
+
+# ── which pass last ATTEMPTED each binary decides the extraction tier (S5) ────────────────────
+
+_OLD_PASS = "0ldpass0ldpass00"
+
+
+def _attempts_db(
+    path: Path,
+    *,
+    ok: int = 3,
+    failed: list[tuple[str, str | None, str | None]] = (),  # type: ignore[assignment]
+    earlier_pass: str | None = _OLD_PASS,
+) -> Path:
+    """An analysis.db: ``ok`` binaries extracted by the running pass, plus one per ``failed`` entry
+    ``(name, reason, the pass its last attempt ran under)`` that still holds ``earlier_pass``'s
+    rows (one function)."""
+    cur = current_pass_version()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = open_db(path)
+    for i in range(ok):
+        conn.execute(
+            "INSERT INTO binaries (name, sha256, ghidra_ok, ghidra_status, pass_version, "
+            "last_seen_at) VALUES (?, ?, 1, 'ok', ?, '2026-10-01')",
+            (f"svc_{i}", f"{i:064x}", cur),
+        )
+        conn.execute(
+            "INSERT INTO functions (binary_id, name) SELECT id, 'f' FROM binaries WHERE name = ?",
+            (f"svc_{i}",),
+        )
+    for j, (name, reason, attempted) in enumerate(failed):
+        conn.execute(
+            "INSERT INTO binaries (name, sha256, ghidra_ok, ghidra_status, ghidra_status_reason, "
+            "pass_version, timeout_pass_version, last_seen_at) "
+            "VALUES (?, ?, 0, 'failed', ?, ?, ?, '2026-10-01')",
+            (name, f"f{j:063x}", reason, earlier_pass, attempted),
+        )
+        conn.execute(
+            "INSERT INTO functions (binary_id, name) SELECT id, 'old' FROM binaries WHERE name = ?",
+            (name,),
+        )
+    conn.commit()
+    conn.close()
+    return path
+
+
+def _attempt_run(tmp_path: Path, db: Path, build_hash: str, **over: object) -> RunRow:
+    fw = tmp_path / "fw"
+    fw.mkdir(exist_ok=True)
+    base: dict[str, object] = {
+        "run_id": "kept",
+        "firmware_path": str(fw),
+        "hunt_commit": COMMIT,
+        "hunt_code_version": _running().hunt,
+        "scan_stamp": _running().scan,
+        "hunt_instances": 0,
+        "build_hash": build_hash,
+        "scan_status": "complete",
+        "analysis_db_path": str(db),
+    }
+    base.update(over)
+    return RunRow(**base)  # type: ignore[arg-type]
+
+
+def _atlas_for(tmp_path: Path, run: RunRow) -> Path:
+    from dataclasses import asdict
+
+    cols = {
+        k: v
+        for k, v in asdict(run).items()
+        if k
+        in (
+            "run_id",
+            "firmware_path",
+            "hunt_commit",
+            "hunt_code_version",
+            "scan_stamp",
+            "hunt_instances",
+            "build_hash",
+            "scan_status",
+            "analysis_db_path",
+        )
+    }
+    return _atlas_with(tmp_path, [cols])
+
+
+def _reason_now(run: RunRow) -> tuple[str, str] | None:
+    return _rescan_reason(
+        run, current_build=current_pass_version(), current=_running(), live_instances=0
+    )
+
+
+def test_a_binary_the_running_pass_failed_on_does_not_hold_its_run_stale(
+    tmp_path: Path,
+) -> None:
+    """T-M1. Every binary was attempted by the running pass; one failed and keeps an earlier
+    pass's rows, so the run reads ``mixed:2`` — and will forever, since running the same pass again
+    gives the same failure. It is not offered for re-extraction: it is up to date, and `tmap
+    rescan`, `tmap runs` (text and --json) and `tmap init` all name the kept-earlier binary in one
+    and the same sentence.
+
+    MUTATION (verified RED): drop the attempt check (a differing hash is extraction again) -> the
+    run lands in the extraction tier."""
+    from treasure_map.cli.hunt_cli import runs
+    from treasure_map.cli.init_cli import runs_currency
+    from treasure_map.lib.config.config import AtlasConfig, Config
+
+    db = _attempts_db(
+        tmp_path / "ws" / "analysis.db", failed=[("svc_x", "incomplete", current_pass_version())]
+    )
+    run = _attempt_run(tmp_path, db, "mixed:2")
+    assert _reason_now(run) is None
+    atlas = _atlas_for(tmp_path, run)
+    line = (
+        "kept: 1 binaries keep an earlier extraction — the running pass failed on them "
+        "(svc_x: incomplete); a rescan cannot change this"
+    )
+
+    dry = CliRunner().invoke(rescan, ["--atlas", str(atlas), "--dry-run"])
+    assert dry.exit_code == 0, dry.output
+    assert "up to date (1): kept" in dry.output
+    assert line in dry.output.splitlines()
+
+    text = CliRunner().invoke(runs, ["--atlas", str(atlas)])
+    assert text.exit_code == 0, text.output
+    assert "up to date (1)" in text.output
+    assert line in text.output.splitlines()
+
+    js = CliRunner().invoke(runs, ["--atlas", str(atlas), "--json"])
+    assert js.exit_code == 0, js.output
+    (row,) = json.loads(js.output)
+    assert row.get("staleness") is None
+    assert row.get("kept_earlier") == [
+        {"binary": "svc_x", "reason": "incomplete", "earlier_pass": _OLD_PASS, "has_rows": True}
+    ]
+
+    probe = runs_currency(Config(atlas=AtlasConfig(db_path=atlas)))
+    assert probe.count == 0
+    assert probe.kept_earlier == (line,)
+
+
+def test_a_binary_the_running_pass_never_attempted_is_extraction_work(tmp_path: Path) -> None:
+    """T-M2. The failed binary's last attempt ran under an older pass: the running pass has not
+    tried it, so this is a decompile — of that one binary, which is what the reason and the tier
+    line both say.
+
+    MUTATION (verified RED): count every binary as work again -> "[4 binaries]"."""
+    from treasure_map.cli.hunt_cli import _tier_line
+
+    db = _attempts_db(tmp_path / "ws" / "analysis.db", failed=[("svc_x", "timeout", _OLD_PASS)])
+    run = _attempt_run(tmp_path, db, "mixed:2", binaries=4)
+    res = _reason_now(run)
+    assert res is not None and res[0] == "extraction"
+    assert res[1].startswith("extracted by ") and "1 of 4 binaries" in res[1]
+    assert _tier_line(run, res[1], "extraction").endswith("[1 of 4 binaries]")
+
+
+@pytest.mark.parametrize("reason", ["launch_failed", None])
+def test_a_failure_that_never_ran_ghidra_is_not_an_attempt(
+    tmp_path: Path, reason: str | None
+) -> None:
+    """T-M3. ``launch_failed`` (Ghidra never started) and a failure recorded before reasons were
+    are not attempts by the pass named beside them: still work for the decompiler.
+
+    MUTATION (verified RED): count every recorded timeout_pass_version as an attempt -> None."""
+    db = _attempts_db(
+        tmp_path / "ws" / "analysis.db", failed=[("svc_x", reason, current_pass_version())]
+    )
+    res = _reason_now(_attempt_run(tmp_path, db, "mixed:2"))
+    assert res is not None and res[0] == "extraction" and "1 of 4 binaries" in res[1]
+
+
+@pytest.mark.parametrize("state", ["missing", "empty", "no_columns"])
+def test_an_analysis_db_that_cannot_answer_keeps_the_old_reading(
+    tmp_path: Path, state: str
+) -> None:
+    """T-M4. No answer from the database (absent, empty, or from before the columns): the
+    differing hash is read as extraction work, exactly as before.
+
+    MUTATION (verified RED): read an unanswerable database as "nothing to do" -> None."""
+    import sqlite3
+
+    db = tmp_path / "ws" / "analysis.db"
+    db.parent.mkdir(parents=True)
+    if state == "empty":
+        db.touch()
+    elif state == "no_columns":
+        conn = sqlite3.connect(db)
+        conn.execute("CREATE TABLE binaries (id INTEGER PRIMARY KEY, name TEXT, ghidra_ok INT)")
+        conn.execute("CREATE VIEW current_binaries AS SELECT * FROM binaries")
+        conn.commit()
+        conn.close()
+    res = _reason_now(_attempt_run(tmp_path, db, OTHER_BUILD))
+    assert res == (
+        "extraction",
+        f"extracted by {OTHER_BUILD[:12]}, running {current_pass_version()[:12]}",
+    )
+
+
+def test_an_extraction_redone_since_the_hunt_is_a_rehunt(tmp_path: Path) -> None:
+    """T-M5. Every binary was attempted by the running pass, but the analysis.db's hash is no
+    longer the one the run was hunted from: the candidates are from the earlier extraction, and
+    re-hunting — no decompile — is the fix.
+
+    MUTATION (verified RED): fall through to the hunt checks without comparing the hashes -> None.
+    """
+    from treasure_map.cli.hunt_cli import _reason_human
+
+    db = _attempts_db(tmp_path / "ws" / "analysis.db")
+    res = _reason_now(_attempt_run(tmp_path, db, "mixed:2"))
+    assert res is not None and res[0] == "hunt"
+    assert res[1] == (
+        f"analysis.db re-extracted since the hunt (now {current_pass_version()}, hunted from "
+        "mixed:2)"
+    )
+    assert _reason_human(*res).endswith("re-hunt needs no decompile")
+
+
+def test_attempted_by_the_running_pass_reads_the_same_as_the_hunts_extraction_notes(
+    tmp_path: Path,
+) -> None:
+    """T-M7. The rescan side and the hunt side read the same columns the same way: the failed
+    binaries the rescan counts as attempted by the running pass are exactly those whose candidates
+    the hunt marks ``attempted_pass`` = the running pass, less the two kinds of failure that never
+    ran Ghidra.
+
+    MUTATION (verified RED): read timeout_pass_version for every failure, launch_failed included."""
+    from treasure_map.lib.hunt.analyzer2 import _load_extraction_notes
+    from treasure_map.lib.query.runs import extraction_attempt_state
+
+    cur = current_pass_version()
+    failed = [
+        ("svc_t", "timeout", cur),
+        ("svc_i", "import_failed", cur),
+        ("svc_o", "no_output", cur),
+        ("svc_c", "incomplete", cur),
+        ("svc_s", "stale_output", cur),
+        ("svc_old", "timeout", _OLD_PASS),
+        ("svc_l", "launch_failed", cur),
+        ("svc_n", None, cur),
+    ]
+    db = _attempts_db(tmp_path / "analysis.db", ok=12, failed=failed)
+    state = extraction_attempt_state(db, cur)
+    assert state is not None
+    failed_names = {n for n, _r, _a in failed}
+    rescan_side = failed_names - set(state.not_attempted)
+
+    import sqlite3
+
+    conn = sqlite3.connect(db)
+    names = dict(conn.execute("SELECT id, name FROM binaries").fetchall())
+    conn.close()
+    notes = _load_extraction_notes(db)
+    hunt_side = {names[bid] for bid, note in notes.items() if note.get("attempted_pass") == cur} - {
+        "svc_l",
+        "svc_n",
+    }
+    assert rescan_side == hunt_side == {"svc_t", "svc_i", "svc_o", "svc_c", "svc_s"}
+
+
+# ── a refresh is not a new "last run" (S7) ─────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("pointer_before", [True, False])
+def test_rescan_leaves_the_last_run_pointer_as_it_found_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pointer_before: bool
+) -> None:
+    """T-L1. Each scan a rescan drives re-points last_run.json; after the rescan the pointer is
+    what it was, byte for byte. With no pointer before, the one the scans wrote is kept.
+
+    MUTATION (verified RED): drop the restore -> the pointer names the last run rescanned."""
+    from treasure_map.lib import last_run
+
+    db = _two_runnable(tmp_path, monkeypatch)
+    pointer = last_run.pointer_path()
+    before = b'{"analysis_db": "/somewhere/else.db", "run_id": "chosen"}\n'
+    if pointer_before:
+        pointer.parent.mkdir(parents=True, exist_ok=True)
+        pointer.write_bytes(before)
+    else:
+        pointer.unlink(missing_ok=True)
+
+    def _fake_scan(
+        fs_root: Path,
+        workspace: str | None,
+        run_id: str | None,
+        atlas_path: Path | None,
+        config: Path | None,
+        rehunt: bool,
+        top_n: int | None,
+    ) -> None:
+        last_run.write_last_run(tmp_path / f"{workspace}.db", Path(str(atlas_path)), str(run_id))
+
+    monkeypatch.setattr(hunt_cli, "scan", _fake_scan)
+    out = CliRunner().invoke(rescan, ["--atlas", str(db)])
+    assert out.exit_code == 0, out.output
+    assert pointer.is_file()
+    if pointer_before:
+        assert pointer.read_bytes() == before
+    else:
+        assert b'"two"' in pointer.read_bytes()
+
+
+def test_an_interrupted_rescan_puts_the_pointer_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T-L1 (interrupted). Ctrl-C during the second run's scan: the pointer is still restored.
+
+    MUTATION (verified RED): restore after the loop instead of in a ``finally``."""
+    from treasure_map.lib import last_run
+
+    db = _two_runnable(tmp_path, monkeypatch)
+    pointer = last_run.pointer_path()
+    before = b'{"run_id": "chosen"}\n'
+    pointer.parent.mkdir(parents=True, exist_ok=True)
+    pointer.write_bytes(before)
+
+    def _fake_scan(
+        fs_root: Path,
+        workspace: str | None,
+        run_id: str | None,
+        atlas_path: Path | None,
+        config: Path | None,
+        rehunt: bool,
+        top_n: int | None,
+    ) -> None:
+        last_run.write_last_run(tmp_path / f"{workspace}.db", Path(str(atlas_path)), str(run_id))
+        if run_id == "two":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(hunt_cli, "scan", _fake_scan)
+    out = CliRunner().invoke(rescan, ["--atlas", str(db)])
+    assert out.exit_code != 0
+    assert pointer.read_bytes() == before

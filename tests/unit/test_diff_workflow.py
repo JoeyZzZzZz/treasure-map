@@ -93,3 +93,36 @@ def test_the_full_diff_closes_with_the_workflow(capsys: pytest.CaptureFixture[st
     assert DIFF_WORKFLOW in out
     assert "list_diff_blindspots for un-diffed binaries" in out
     assert "sort_by='significance'" not in out
+
+
+def test_an_interrupted_full_diff_counts_only_what_it_finished_as_new(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """T-I2. Cancelled after 5 of 15 planned new binaries: the roll-up says 5 new, not 15 — the
+    other ten were never diffed and are left for the next run.
+
+    MUTATION (verified RED): quote ``len(plan.to_diff)`` again -> "15 new"."""
+    from treasure_map.lib.diff.driver import BinaryDiffOutcome, DiffSummary
+
+    names = tuple(f"lib{i:02d}" for i in range(15))
+    plan = FullDiffPlan(changed=names, unchanged=(), only_in_a=(), only_in_b=(), to_diff=names)
+
+    def ok(name: str) -> BinaryDiffOutcome:
+        summary = DiffSummary(
+            diff_id=f"a::b::{name}",
+            binary=name,
+            matched_pairs=1,
+            version_skew=False,
+            delta_layer_changed=0,
+            delta_layer_unchanged=0,
+            delta_undetermined=0,
+            warnings=(),
+        )
+        return BinaryDiffOutcome(name, summary, None)
+
+    outcomes = tuple(ok(n) for n in names[:5])
+    hunt_cli._echo_full_diff(
+        FullDiffSummary(plan=plan, outcomes=outcomes, cancelled=True), Path("a.db")
+    )
+    out = capsys.readouterr().out
+    assert "5 ok (5 new, 0 skipped-already-ok), 0 failed this run" in out

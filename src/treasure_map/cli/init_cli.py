@@ -30,7 +30,11 @@ def runs_currency(cfg: Config | None) -> RunsCurrency:
     """How many runs in the atlas the installed tmap's code would scan differently — the same
     classifier ``tmap rescan`` uses, read through a READ-ONLY connection (init never migrates the
     atlas)."""
-    from treasure_map.cli.hunt_cli import _live_instance_counts, _staleness_tiers
+    from treasure_map.cli.hunt_cli import (
+        _kept_earlier_lines,
+        _live_instance_counts,
+        _staleness_tiers,
+    )
     from treasure_map.lib import rescan_version
     from treasure_map.lib.analyze.ghidra_runner import current_pass_version
     from treasure_map.lib.config.config import Config as _Config
@@ -57,13 +61,17 @@ def runs_currency(cfg: Config | None) -> RunsCurrency:
         return RunsCurrency(None, why="atlas needs migration; any tmap command will migrate it")
     finally:
         conn.close()
+    build = current_pass_version()
     tiers, _current = _staleness_tiers(
         runs,
-        current_build=current_pass_version(),
+        current_build=build,
         current=rescan_version.current_code_stamp(cfg or _Config()),
         live=live,
     )
-    return RunsCurrency(sum(len(v) for v in tiers.values()))
+    return RunsCurrency(
+        sum(len(v) for v in tiers.values()),
+        kept_earlier=tuple(_kept_earlier_lines(runs, current_build=build)),
+    )
 
 
 def _prompt_fn(msg: str) -> str:
@@ -131,6 +139,10 @@ def _next_steps(result: InitResult, any_red: bool) -> None:
     if stale_first:
         click.echo(f"{runs.count} runs predate this tmap.")
         for line in upgrade:
+            click.echo(line)
+        click.echo("")
+    if runs is not None and runs.kept_earlier:
+        for line in runs.kept_earlier:
             click.echo(line)
         click.echo("")
     click.echo("Ready. Two things you can do:" if not any_red else "Once that is done:")

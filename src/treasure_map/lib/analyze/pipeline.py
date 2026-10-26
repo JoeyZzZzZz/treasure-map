@@ -7,10 +7,14 @@ records — a binary that is new, has no successful extraction yet, was extracte
 pass_version, timed out under a different pass, or is cached but code-rich and empty (the
 self-heal in db_ingest). The database is the source of truth; there are no step checkpoints.
 xrefs, string classification and the non-binary ingesters are rebuilt on every run.
+
+Each binary's result is committed the moment it arrives, so a scan that is interrupted keeps every
+binary it finished: re-running the same command decompiles only the rest.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import time
 from collections.abc import Callable
@@ -22,7 +26,7 @@ from treasure_map.lib import rescan_version
 from treasure_map.lib.analyze.db_ingest import ingest_elfs
 from treasure_map.lib.analyze.elf_inventory import ElfRecord, scan_filesystem
 from treasure_map.lib.analyze.ghidra_ingest import IngestStats, ingest_ghidra_output
-from treasure_map.lib.analyze.ghidra_runner import GhidraRunner
+from treasure_map.lib.analyze.ghidra_runner import _INTERRUPTED, GhidraResult, GhidraRunner
 from treasure_map.lib.analyze.non_binary.orchestrator import NonBinaryStats, run_all_ingesters
 from treasure_map.lib.analyze.symlinks import SymlinkCollector, write_symlinks
 from treasure_map.lib.analyze.xrefs import XrefStats, build_xrefs
@@ -72,6 +76,19 @@ class AnalyzeResult:
     # are still counted incomplete and still named by ``incomplete_binaries`` — this list says why
     # no Ghidra time was spent on them, so "it went fast" is never mistaken for "it went clean".
     timeout_skipped: list[dict[str, Any]] = field(default_factory=list)
+    # Current-scan binaries whose extraction ran to the end but recovered no function from code
+    # that is there (``ghidra_status='no_functions'``). Also named by ``incomplete_binaries``; this
+    # list says why re-running the same pass will not change them.
+    no_functions_binaries: list[str] = field(default_factory=list)
+    # Current-scan binaries this scan's pass FAILED on while they still hold the rows an earlier
+    # pass wrote. Each is ``{binary, reason, earlier_pass}``; their candidates read
+    # ``extraction_current=false``.
+    kept_earlier_binaries: list[dict[str, Any]] = field(default_factory=list)
+    # Current-scan binaries still marked by an unfinished bare ``--reanalyze``: they were asked to
+    # be re-extracted and have not been yet. A later bare ``--reanalyze`` continues with them.
+    reanalyze_pending: int = 0
+    # Of ``ghidra_ok``, how many finished as ``no_functions`` (code present, no function recovered).
+    ghidra_no_functions: int = 0
 
 
 def run_analyze(
@@ -129,7 +146,11 @@ def run_analyze(
     dirty_records: list[ElfRecord] = []
     ghidra_ok = 0
     ghidra_failed = 0
+    ghidra_no_functions = 0
     incomplete_binaries: list[str] = []
+    no_functions_binaries: list[str] = []
+    kept_earlier_binaries: list[dict[str, Any]] = []
+    reanalyze_pending = 0
     timeout_skipped: list[dict[str, Any]] = []
     ingest_stats = IngestStats()
     symlinks_recorded = 0
@@ -147,6 +168,7 @@ def run_analyze(
             pass_version=pass_version,
             timeout_base=config.ghidra.headless_timeout_seconds,
             force_retry=force_retry,
+            ghidra_version=ghidra_version,
         )
         dirty_records = [r for r in records if r.sha256 in dirty_shas]
 
@@ -175,42 +197,62 @@ def run_analyze(
             len(records) - len(dirty_records),
         )
 
-        # Only binaries whose Ghidra run SUCCEEDED in this scan are ingested: a failed one keeps the
-        # rows of its last good extraction (flagged at hunt time as not from this pass) instead of
-        # ingesting whatever JSON an earlier run left behind.
-        ingest_records: list[ElfRecord] = []
         if dirty_records:
-            ghidra_output_dir = workspace.path / "ghidra_output"
-            ghidra_output_dir.mkdir(parents=True, exist_ok=True)
-            results = runner.run_all(dirty_records, ghidra_output_dir, progress_callback)
+            kept = 0  # binaries whose final result is committed this scan
 
-            if len(results) != len(dirty_records):
-                logger.warning(
-                    "ghidra: run_all returned %d results for %d dirty records",
-                    len(results),
-                    len(dirty_records),
-                )
+            def _persist_final(rec: ElfRecord, res: GhidraResult) -> None:
+                """Store one binary's FINAL result and commit it, before the next one arrives.
 
-            # ★ the SUCCESS stamp (ghidra_ok/status/pass_version) is NOT written here. It is
-            # written inside ingest_ghidra_output, in the same transaction as the function rows, so
-            # a binary is never marked extracted while its functions are missing. A FAILURE has no
-            # functions to lose, so it is stamped and committed here as before.
-            success_stamp: dict[str, tuple[str, str]] = {}
-            for rec, res in zip(dirty_records, results, strict=False):
+                ★ The SUCCESS stamp (ghidra_ok/status/pass_version) is written inside
+                ingest_ghidra_output, in the same transaction as the function rows, so a binary is
+                never marked extracted while its functions are missing. A FAILURE has no functions
+                to lose, so it is stamped and committed here. Either way the binary is committed
+                before the next result is handled, so an interrupt keeps what already finished."""
+                nonlocal ghidra_ok, ghidra_failed, ghidra_no_functions, kept
+                if res.reason == _INTERRUPTED:
+                    return  # cut off, not finished: nothing is recorded and it runs again next time
                 if res.success:
-                    success_stamp[rec.sha256] = (res.analysis_status, ghidra_version)
+                    ghidra_ok += 1
+                    if res.analysis_status == "no_functions":
+                        ghidra_no_functions += 1
+                    one = ingest_ghidra_output(
+                        conn,
+                        ghidra_output_dir,
+                        [rec],
+                        sha_to_id,
+                        pass_version=pass_version,
+                        success_stamp={rec.sha256: (res.analysis_status, ghidra_version)},
+                    )
+                    for f in dataclasses.fields(IngestStats):
+                        setattr(
+                            ingest_stats,
+                            f.name,
+                            getattr(ingest_stats, f.name) + getattr(one, f.name),
+                        )
+                    if one.binaries_processed == 1:
+                        kept += 1
+                        # A second transaction: the stamp and rows above are committed inside the
+                        # ingest, which cannot take this column with them. An interrupt between the
+                        # two commits only means this one binary is re-extracted by a continued
+                        # --reanalyze.
+                        conn.execute(
+                            "UPDATE binaries SET reanalyze_pending = 0 WHERE sha256 = ?",
+                            (rec.sha256,),
+                        )
+                        conn.commit()
                 else:
                     # record WHY it failed (timeout/import_failed/no_output/incomplete/
                     # stale_output) so the incomplete surfacing can tell a recoverable timeout
                     # from a structural failure.
                     # ...and record what this attempt RAN UNDER: the budget it was given and
-                    # the extraction fingerprint behind it. pass_version stays untouched above
-                    # because it describes a row's OUTPUT and there is none; these two describe the
-                    # ATTEMPT, which is what the next scan compares against to decide whether
-                    # re-running would be a different attempt or the same one twice.
+                    # the extraction fingerprint behind it. pass_version stays untouched because it
+                    # describes a row's OUTPUT and there is none; these two describe the ATTEMPT,
+                    # which is what the next scan compares against to decide whether re-running
+                    # would be a different attempt or the same one twice.
                     conn.execute(
                         "UPDATE binaries SET ghidra_ok=?, ghidra_status=?, ghidra_status_reason=?, "
-                        "timeout_budget=?, timeout_pass_version=? WHERE sha256=?",
+                        "timeout_budget=?, timeout_pass_version=?, reanalyze_pending=0 "
+                        "WHERE sha256=?",
                         (
                             0,
                             res.analysis_status,
@@ -220,24 +262,46 @@ def run_analyze(
                             rec.sha256,
                         ),
                     )
-                if res.success:
-                    ghidra_ok += 1
-                    ingest_records.append(rec)
-                else:
+                    conn.commit()
                     ghidra_failed += 1
-            conn.commit()  # the FAILURE stamps only; successes commit with their functions below
+                    kept += 1
+                finalized.add(rec.sha256)
+
+            finalized: set[str] = set()
+            ghidra_output_dir = workspace.path / "ghidra_output"
+            ghidra_output_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                results = runner.run_all(
+                    dirty_records, ghidra_output_dir, progress_callback, on_final=_persist_final
+                )
+            except KeyboardInterrupt:
+                logger.warning(
+                    "interrupted: %d binaries kept this run, %d left for the next run; "
+                    "binaries cut off mid-decompile start over",
+                    kept,
+                    len(dirty_records) - kept,
+                )
+                raise
+
+            if len(results) != len(dirty_records):
+                logger.warning(
+                    "ghidra: run_all returned %d results for %d dirty records",
+                    len(results),
+                    len(dirty_records),
+                )
+            # Whatever the runner returned without handing it over is stored now, once.
+            for rec, res in zip(dirty_records, results, strict=False):
+                if rec.sha256 not in finalized:
+                    _persist_final(rec, res)
+            logger.info(
+                "pipeline: %d of %d dirty binaries stored (%d ok, %d failed)",
+                kept,
+                len(dirty_records),
+                ghidra_ok,
+                ghidra_failed,
+            )
         else:
             logger.info("ghidra: all binaries up-to-date (0 dirty)")
-
-        # ingest Ghidra JSON output into functions/imports/exports/strings
-        ingest_stats = ingest_ghidra_output(
-            conn,
-            workspace.path / "ghidra_output",
-            ingest_records,
-            sha_to_id,
-            pass_version=pass_version,
-            success_stamp=success_stamp if dirty_records else None,
-        )
 
         # build cross-binary xrefs + classify strings (wipe-and-rebuild)
         xref_stats = build_xrefs(conn, fold_edge_threshold=config.xref_fold_edge_threshold)
@@ -255,6 +319,31 @@ def run_analyze(
                 "ORDER BY b.name"
             ).fetchall()
         ]
+        no_functions_binaries = [
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM current_binaries WHERE ghidra_status = 'no_functions' "
+                "ORDER BY name"
+            ).fetchall()
+        ]
+        # The same "this scan" as above. A failed binary whose pass_version still names another pass
+        # holds that pass's rows, which the hunt reads as not from this extraction.
+        kept_earlier_binaries = [
+            {
+                "binary": row["name"],
+                "reason": row["ghidra_status_reason"],
+                "earlier_pass": row["pass_version"],
+            }
+            for row in conn.execute(
+                "SELECT name, ghidra_status_reason, pass_version FROM current_binaries "
+                "WHERE ghidra_ok = 0 AND pass_version IS NOT NULL AND pass_version != ? "
+                "ORDER BY name",
+                (pass_version,),
+            ).fetchall()
+        ]
+        reanalyze_pending = conn.execute(
+            "SELECT COUNT(*) FROM current_binaries WHERE reanalyze_pending = 1"
+        ).fetchone()[0]
 
         # non-binary ingester framework (wipe-and-rebuild)
         nb_stats = run_all_ingesters(conn, fs_root, progress_callback=progress_callback)
@@ -293,4 +382,8 @@ def run_analyze(
         incomplete_binaries=incomplete_binaries,
         timeout_skipped=timeout_skipped,
         symlinks_recorded=symlinks_recorded,
+        no_functions_binaries=no_functions_binaries,
+        kept_earlier_binaries=kept_earlier_binaries,
+        reanalyze_pending=reanalyze_pending,
+        ghidra_no_functions=ghidra_no_functions,
     )

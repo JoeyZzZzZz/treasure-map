@@ -32,8 +32,8 @@ _DROPPED_TABLES: tuple[str, ...] = ("library_summaries", "cve_matches", "compone
 # table, so a database built before the column existed needs an explicit, idempotent ALTER. Each
 # entry is (table, column, column_def). Guarded by a presence check so it runs at most once.
 _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
-    # tri-state Ghidra outcome (ok / ok_empty / failed); back-fills as NULL on older DBs, which the
-    # ingest self-heal treats as needing re-analysis when a claimed-done binary has 0 functions.
+    # Ghidra outcome (ok / ok_empty / no_functions / failed); back-fills as NULL on older DBs, which
+    # the ingest self-heal treats as needing re-analysis when a claimed-done binary has 0 functions.
     ("binaries", "ghidra_status", "TEXT"),
     # sink_arg_provenance transport column; back-fills as '[]' on DBs built before it existed so
     # ghidra_ingest can write it without "no column named sink_provenance". Must match schema.sql.
@@ -103,6 +103,10 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # older table lacks would fail before this ALTER runs. Must match schema.sql.
     ("script_calls", "via", "TEXT"),
     ("script_calls", "via_line", "INTEGER"),
+    # 1 = a bare --reanalyze asked for this binary to be re-extracted and its result is not in yet;
+    # 0 = not part of any unfinished re-extraction request. Back-fills 0 on older DBs (no request
+    # was ever left unfinished there). Not indexed (see script_calls.via). Must match schema.sql.
+    ("binaries", "reanalyze_pending", "INTEGER DEFAULT 0"),
 )
 
 

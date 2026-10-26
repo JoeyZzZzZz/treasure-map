@@ -49,7 +49,14 @@ def _fake_analyze_result(db_path: Path) -> AnalyzeResult:
     A hand-listed namespace goes stale the moment the command reads one more field, and it fails as
     an AttributeError buried inside a CliRunner result rather than as anything readable. Deriving
     the counters from ``AnalyzeResult`` means a new field cannot make this stub incomplete."""
-    non_counter = {"db_path", "elapsed", "incomplete_binaries", "timeout_skipped"}
+    non_counter = {
+        "db_path",
+        "elapsed",
+        "incomplete_binaries",
+        "timeout_skipped",
+        "no_functions_binaries",
+        "kept_earlier_binaries",
+    }
     counters = {f.name: 0 for f in _dataclass_fields(AnalyzeResult) if f.name not in non_counter}
     counters.update(binary_count=2, functions_ingested=9)
     return AnalyzeResult(
@@ -57,6 +64,8 @@ def _fake_analyze_result(db_path: Path) -> AnalyzeResult:
         elapsed=0.1,
         incomplete_binaries=[],
         timeout_skipped=[],
+        no_functions_binaries=[],
+        kept_earlier_binaries=[],
         **counters,
     )
 
@@ -587,3 +596,57 @@ def test_the_removed_skip_options_are_rejected(tmp_path: Path) -> None:
         out = CliRunner().invoke(scan, [str(tmp_path), opt])
         assert out.exit_code != 0
         assert "No such option" in out.output, (opt, out.output)
+
+
+def test_scan_says_what_its_extraction_left_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one-shot path prints the same three lines the analyze command does (no_functions,
+    kept-earlier, an unfinished --reanalyze).
+
+    MUTATION (verified RED): drop ``report_extraction_state`` from scan -> none printed."""
+    _base_patches(monkeypatch)
+
+    def _fake_analyze(*_: Any, **__: Any) -> AnalyzeResult:
+        res = _fake_analyze_result(tmp_path / "analysis.db")
+        res.incomplete_binaries.extend(["svc_b", "svc_c"])
+        res.no_functions_binaries.append("svc_b")
+        res.kept_earlier_binaries.append(
+            {"binary": "svc_c", "reason": "incomplete", "earlier_pass": "0ldpass0ldpass00"}
+        )
+        res.reanalyze_pending = 2
+        return res
+
+    monkeypatch.setattr("treasure_map.lib.analyze.pipeline.run_analyze", _fake_analyze)
+    monkeypatch.setattr("treasure_map.lib.hunt.run_analyzer2", lambda *a, **k: _hunt_stats())
+    monkeypatch.setattr("treasure_map.lib.query.triage", lambda conn, **_: [])
+    result = CliRunner().invoke(
+        scan, [str(_mkfs(tmp_path)), "-w", "router_v1", "--atlas", str(tmp_path / "atlas.db")]
+    )
+    assert result.exit_code == 0, result.output
+    assert "binaries have executable code but Ghidra recovered no function" in result.output
+    assert "kept their earlier extraction because this pass failed on them: svc_c" in result.output
+    assert "an interrupted --reanalyze left 2 binaries not yet re-extracted" in result.output
+
+
+def test_an_interrupted_decompile_says_the_finished_binaries_are_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S3. Ctrl-C in the decompile stage: exit 130, and the message says what was kept and how to
+    continue.
+
+    MUTATION (verified RED): print only "Aborted — all Ghidra processes terminated." again."""
+    _base_patches(monkeypatch)
+
+    def _interrupted(*_: Any, **__: Any) -> AnalyzeResult:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("treasure_map.lib.analyze.pipeline.run_analyze", _interrupted)
+    result = CliRunner().invoke(
+        scan, [str(_mkfs(tmp_path)), "-w", "router_v1", "--atlas", str(tmp_path / "atlas.db")]
+    )
+    assert result.exit_code == 130, result.output
+    assert (
+        "Aborted — all Ghidra processes terminated. Finished binaries are kept; re-run the "
+        "same command to continue."
+    ) in result.output

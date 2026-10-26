@@ -556,6 +556,26 @@ def test_list_incomplete_binaries_flags_failed_not_codefree(tmp_path: Path) -> N
     ro.close()
 
 
+def test_list_incomplete_binaries_names_no_functions_as_its_reason(tmp_path: Path) -> None:
+    """T-N4. A binary recorded ``no_functions`` (finished, code present, no function) carries no
+    failure reason; it is still incomplete, and its reason reads ``no_functions``.
+
+    MUTATION (verified RED): read ghidra_status_reason alone again -> reason None."""
+    from treasure_map.lib.storage.connection import open_db
+
+    db = tmp_path / "incomplete.db"
+    conn = open_db(db)
+    conn.execute(
+        "INSERT INTO binaries (id, name, path, sha256, ghidra_ok, ghidra_status, last_seen_at) "
+        "VALUES (1, 'svc_a', 'bin/svc_a', 'x', 1, 'no_functions', '2026-01-01')"
+    )
+    conn.commit()
+    conn.close()
+    ro = facts.open_analysis_ro(db)
+    assert facts.list_incomplete_binaries(ro) == [{"binary": "svc_a", "reason": "no_functions"}]
+    ro.close()
+
+
 def test_list_partially_incomplete_binaries_counts_failed_decompiles(tmp_path: Path) -> None:
     # ★ Red-line: a binary analyzed 'ok' with functions is still INCOMPLETE if some >=10-byte
     # functions never decompiled (empty pseudocode). A <10-byte thunk with no pseudocode is

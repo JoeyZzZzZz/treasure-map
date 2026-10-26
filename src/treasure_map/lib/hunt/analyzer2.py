@@ -152,7 +152,11 @@ def _load_extraction_notes(db_path: Path | str) -> dict[int, dict[str, Any]]:
     scan's pass is the value most current binaries' last attempts carry (a strict majority; a tie
     names none). ``run.build_hash`` cannot serve: it is the distinct pass_version over the binaries,
     so a single failed binary turns it into ``mixed:2``. When no scan pass can be named, only the
-    failed binaries are marked."""
+    failed binaries are marked.
+
+    ``lib.query.runs.extraction_attempt_state`` reads the same columns the same way for `tmap
+    rescan` / `tmap runs`, to tell a binary the running pass has not attempted from one it
+    attempted and failed on."""
     conn = ro_connect(Path(db_path))
     try:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(binaries)")}

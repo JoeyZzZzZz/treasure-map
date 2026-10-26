@@ -61,6 +61,9 @@ class RunsCurrency:
     count: int | None
     absent: bool = False
     why: str = ""
+    # One line per run holding binaries the running pass failed on and left with an earlier pass's
+    # extraction (worded as `tmap runs` and `tmap rescan` word it).
+    kept_earlier: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

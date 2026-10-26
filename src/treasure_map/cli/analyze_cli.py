@@ -18,21 +18,71 @@ from treasure_map.cli.interrupts import interrupt_exit_code
 logger = logging.getLogger(__name__)
 
 
-def _warn_incomplete(incomplete: list[str]) -> None:
+def _shown(names: list[str]) -> str:
+    return ", ".join(names[:20]) + (" …" if len(names) > 20 else "")
+
+
+def _warn_incomplete(incomplete: list[str], no_functions: list[str] | None = None) -> None:
     """Warn (on stderr) when binaries produced no functions — analysis is incomplete, NOT clean.
 
     ★ Red-line (degrade must be visible): a binary Ghidra failed on holds 0 functions, so it looks
     'clean' to every downstream reader. Naming it here — and pointing at --reanalyze — stops a
-    failed analysis from being mistaken for 'nothing to find'."""
+    failed analysis from being mistaken for 'nothing to find'.
+
+    Of the four analysis states only ``ok`` and ``ok_empty`` are clean. ``no_functions`` (the
+    extraction finished on a binary that has code, and recovered no function) is incomplete too,
+    but re-running the same pass gives the same answer, so those are named on a line of their own
+    that says what WOULD change it instead of advising a retry."""
+    no_functions = no_functions or []
     if not incomplete:
         return
-    shown = ", ".join(incomplete[:20]) + (" …" if len(incomplete) > 20 else "")
     click.echo(
         f"\n⚠ {len(incomplete)} binaries produced no functions "
-        f"(analysis incomplete, NOT clean): {shown}\n"
+        f"(analysis incomplete, NOT clean): {_shown(incomplete)}\n"
         "  rerun with --reanalyze (or --reanalyze <name>) to retry them.",
         err=True,
     )
+    if no_functions:
+        click.echo(
+            f"  {len(no_functions)} binaries have executable code but Ghidra recovered no function "
+            "from it — re-running with the same pass does not change this; after a Ghidra or "
+            "architecture-detection change, --reanalyze <name> retries it: "
+            f"{_shown(no_functions)}",
+            err=True,
+        )
+
+
+def _warn_kept_earlier(kept: list[dict[str, Any]]) -> None:
+    """Name (on stderr) the binaries that still hold an EARLIER pass's extraction because this
+    pass failed on them — their candidates come from that earlier extraction."""
+    if not kept:
+        return
+    shown = ", ".join(f"{k['binary']} ({k.get('reason') or 'unknown'})" for k in kept[:20])
+    if len(kept) > 20:
+        shown += ", …"
+    click.echo(
+        f"⚠ {len(kept)} binaries kept their earlier extraction because this pass failed on them: "
+        f"{shown} — their candidates read extraction_current=false.",
+        err=True,
+    )
+
+
+def _warn_reanalyze_pending(pending: int, reanalyze: str | None) -> None:
+    """Point at an unfinished bare --reanalyze that this run did not continue."""
+    if pending <= 0 or reanalyze == "__all__":
+        return
+    click.echo(
+        f"⚠ an interrupted --reanalyze left {pending} binaries not yet re-extracted; run the "
+        "same command with --reanalyze to finish it.",
+        err=True,
+    )
+
+
+def report_extraction_state(result: Any, reanalyze: str | None) -> None:
+    """The stderr warnings both `tmap analyze` and `tmap scan` print after the extraction."""
+    _warn_incomplete(result.incomplete_binaries, result.no_functions_binaries)
+    _warn_kept_earlier(result.kept_earlier_binaries)
+    _warn_reanalyze_pending(result.reanalyze_pending, reanalyze)
 
 
 def _report_timeout_skips(skipped: list[dict[str, Any]]) -> None:
@@ -75,10 +125,14 @@ Examples:
 
 \b
   tmap analyze ./_fw.extracted -w router_v1          # managed name -> <base>/router_v1
-  tmap analyze ./_fw.extracted -w /mnt/scratch/fw1   # literal path (large/scratch disk)
   tmap analyze ./_fw.extracted                       # auto name (re-run resumes)
 
-Re-running with the same -w (same name or path) resumes from the last checkpoint.
+-w takes a NAME under workspace_dir. To keep workspaces on a large or scratch
+disk, point workspace_dir there in config.yaml and keep using -w <name>.
+
+Re-running with the same -w resumes: binaries whose extraction finished are
+kept and only the rest run (a binary cut off mid-decompile starts that binary
+over).
 
 Iterating on the Ghidra extraction pass (ExportFunctions):
 
@@ -191,7 +245,11 @@ def analyze(
                 force_retry=force_retry,
             )
     except KeyboardInterrupt:
-        click.echo("\nAborted — all Ghidra processes terminated.", err=True)
+        click.echo(
+            "\nAborted — all Ghidra processes terminated. Finished binaries are kept; re-run the "
+            "same command to continue.",
+            err=True,
+        )
         raise SystemExit(interrupt_exit_code()) from None
     except GhidraNotFoundError as exc:
         raise click.ClickException(str(exc)) from exc
@@ -209,7 +267,10 @@ def analyze(
     click.echo(f"\nDone in {result.elapsed:.1f}s")
     click.echo(f"  Binaries : {result.binary_count}")
     click.echo(f"  Dirty    : {result.dirty_count}")
-    click.echo(f"  Ghidra OK: {result.ghidra_ok}")
+    nf = result.ghidra_no_functions
+    click.echo(
+        f"  Ghidra OK: {result.ghidra_ok}" + (f" (of which {nf} no_functions)" if nf else "")
+    )
     click.echo(f"  Failed   : {result.ghidra_failed}")
     click.echo(f"  Skipped  : {result.ghidra_skipped} (cache hit)")
     click.echo(f"  Functions ingested: {result.functions_ingested}")
@@ -230,4 +291,4 @@ def analyze(
     click.echo(f"  Symlinks recorded: {result.symlinks_recorded}")
     click.echo(f"  DB       : {result.db_path}")
     _report_timeout_skips(result.timeout_skipped)
-    _warn_incomplete(result.incomplete_binaries)
+    report_extraction_state(result, reanalyze)

@@ -93,6 +93,18 @@ def _timeout_skips(
     return skips
 
 
+def _pending(conn: sqlite3.Connection, shas: list[str], ph: str) -> set[str]:
+    """The binaries among ``shas`` an unfinished bare --reanalyze still has to re-extract."""
+    return {
+        row["sha256"]
+        for row in conn.execute(
+            f"SELECT sha256 FROM binaries WHERE sha256 IN ({ph}) "  # noqa: S608
+            "AND reanalyze_pending = 1",
+            shas,
+        ).fetchall()
+    }
+
+
 def ingest_elfs(
     conn: sqlite3.Connection,
     records: list[ElfRecord],
@@ -101,6 +113,7 @@ def ingest_elfs(
     pass_version: str | None = None,
     timeout_base: int | None = None,
     force_retry: bool = False,
+    ghidra_version: str | None = None,
 ) -> tuple[dict[str, int], set[str]]:
     """Ingest ELF records into the binaries table.
 
@@ -109,8 +122,12 @@ def ingest_elfs(
     content-identity) so the current_binaries view reflects this run and a cached (unchanged)
     binary still records the path THIS scan saw it at.
 
-    ``reanalyze`` forces re-analysis ignoring the cache. ``REANALYZE_ALL`` re-runs every binary. A
-    name or path SCOPES the run to only the matching binary/binaries and ignores all other
+    ``reanalyze`` forces re-analysis ignoring the cache. ``REANALYZE_ALL`` re-runs every binary, and
+    is RESUMABLE: the request marks every binary of the scan ``reanalyze_pending``, each binary's
+    final result clears its mark, and a bare ``--reanalyze`` that finds marks left continues with
+    them instead of starting over (``ghidra_version``, this scan's decompiler, re-marks a binary a
+    different Ghidra re-extracted in the meantime). A name or path SCOPES the run to only the
+    matching binary/binaries and ignores all other
     staleness — including Fix A's pass_version invalidation — so editing the extraction pass and
     then ``--reanalyze rc`` re-runs just rc (the fast iteration path), not the whole firmware. It
     is also the escape hatch for a single binary frozen in a bad cached state.
@@ -124,8 +141,9 @@ def ingest_elfs(
     TIMED OUT is left out of the dirty set while nothing that could change the outcome has changed
     — see ``_timeout_skips``, which owns that judgement and every reason it declines to make it.
     When None (callers that do not run Ghidra) no binary is skipped on that ground, so the default
-    behaviour is exactly what it was. ``force_retry`` overrides it and re-runs them; ``reanalyze``
-    already bypasses the whole cache and bypasses this with it.
+    behaviour is exactly what it was. ``force_retry`` overrides it and re-runs them; a named
+    ``reanalyze`` bypasses the whole cache and this with it, and a bare one bypasses it for every
+    binary it still has to re-extract.
 
     ★ Skipping the RE-RUN is not skipping the SURFACING. A skipped binary keeps ghidra_ok=0, keeps
     ``ghidra_status='failed'``, keeps its 0 functions and keeps its row in this scan — so it goes on
@@ -161,13 +179,12 @@ def ingest_elfs(
             ).fetchall()
         already_done = {row["sha256"] for row in done_rows}
 
-    # Step 1a: --reanalyze escape hatch. REANALYZE_ALL clears already_done so every binary re-runs.
-    # A SPECIFIC name/path is NOT handled by subtracting from already_done — that only narrows the
-    # dirty set when everything else is already_done, and Fix A's pass_version invalidation empties
-    # already_done after a pass edit, so a subtractive drop would leave the whole firmware dirty.
-    # A specific target is scoped in Step 5 instead (run ONLY the match).
-    if reanalyze == REANALYZE_ALL:
-        already_done = set()
+    # Step 1a: --reanalyze escape hatch. Neither form subtracts from already_done here. A SPECIFIC
+    # name/path would only narrow the dirty set when everything else is already_done, and Fix A's
+    # pass_version invalidation empties already_done after a pass edit, so a subtractive drop would
+    # leave the whole firmware dirty; it is scoped in Step 5 instead (run ONLY the match).
+    # REANALYZE_ALL is decided in Step 4b from the binaries still marked reanalyze_pending, so an
+    # interrupted full re-extraction continues where it stopped instead of starting over.
 
     # Step 1b: ★ Red-line self-heal — the "cached" flag (ghidra_ok=1) must not outlive the ARTIFACT
     # it claims. A row marked done but holding 0 functions has no artifact; whether that is a real
@@ -184,12 +201,18 @@ def ingest_elfs(
     # file is code-rich NOW is re-dirtied (recovered on the re-run, no DB deletion), regardless of
     # its stored label; one whose file is genuinely code-free NOW is (re)marked ok_empty and left
     # cached (never churned). The current file is the authority; a label can be stale, bytes cannot.
+    #
+    # ★ Except ``no_functions``: that label is not derived from has_substantial_text alone — it was
+    # recorded because an extraction this pass ran to the end found no function in code that IS
+    # there. Re-running it under the same pass gives the same answer, and relabelling it ok_empty
+    # would call it clean. It is left exactly as recorded, whatever the file reads as now.
     if already_done:
         done_ph = ",".join("?" * len(already_done))
         zero_fn = {
             row["sha256"]
             for row in conn.execute(
                 f"SELECT b.sha256 FROM binaries b WHERE b.sha256 IN ({done_ph}) "  # noqa: S608
+                "AND COALESCE(b.ghidra_status, '') != 'no_functions' "
                 "AND NOT EXISTS (SELECT 1 FROM functions f WHERE f.binary_id = b.id)",
                 list(already_done),
             ).fetchall()
@@ -267,6 +290,35 @@ def ingest_elfs(
         ).fetchall()
         sha_to_id = {row["sha256"]: row["id"] for row in id_rows}
 
+    # Step 4b: a bare --reanalyze is a REQUEST that outlives the process running it. P is what is
+    # left of it: the binaries of this scan still marked. None marked = a new request, which marks
+    # them all. Some marked = an earlier request was cut off; it continues with those, plus any
+    # binary re-extracted since by a Ghidra other than this scan's (the request was for this one).
+    pending: set[str] = set()
+    if reanalyze == REANALYZE_ALL and shas:
+        pending = _pending(conn, shas, ph)
+        if not pending:
+            conn.execute(
+                f"UPDATE binaries SET reanalyze_pending = 1 WHERE sha256 IN ({ph})",  # noqa: S608
+                shas,
+            )
+            pending = set(shas)
+            logger.info("--reanalyze: starting a full re-extraction of %d binaries", len(shas))
+        else:
+            if ghidra_version is not None:
+                conn.execute(
+                    f"UPDATE binaries SET reanalyze_pending = 1 WHERE sha256 IN ({ph}) "  # noqa: S608
+                    "AND ghidra_ok = 1 AND COALESCE(ghidra_version, '') != ?",
+                    [*shas, ghidra_version],
+                )
+            pending = _pending(conn, shas, ph)
+            logger.info(
+                "--reanalyze: continuing an interrupted re-extraction: %d of %d binaries left",
+                len(pending),
+                len(shas),
+            )
+        conn.commit()
+
     # Step 5: dirty set.
     if reanalyze and reanalyze != REANALYZE_ALL:
         # Targeted re-extraction — the fast iteration path. Run ONLY the binary/binaries whose name
@@ -279,12 +331,15 @@ def ingest_elfs(
             logger.warning("reanalyze target %r matched no binary — nothing to re-run", reanalyze)
     else:
         # Binaries that timed out under conditions this scan reproduces exactly: re-running them
-        # buys the identical failure at the identical cost. Not consulted under either --reanalyze
-        # form (the cache-bypass escape hatch bypasses this too) or --force-retry.
+        # buys the identical failure at the identical cost. Not consulted under --force-retry, and
+        # never for a binary a bare --reanalyze still has to re-extract (pending): the request is
+        # for every binary, a timed-out one included. A binary the request already re-extracted is
+        # under the ordinary rule again.
         skipped: set[str] = set()
-        if timeout_base is not None and not force_retry and reanalyze is None:
-            skipped = _timeout_skips(
-                conn, records, pass_version=pass_version, timeout_base=timeout_base
+        if timeout_base is not None and not force_retry:
+            skipped = (
+                _timeout_skips(conn, records, pass_version=pass_version, timeout_base=timeout_base)
+                - pending
             )
             if skipped:
                 logger.info(
@@ -292,7 +347,7 @@ def ingest_elfs(
                     "(still reported incomplete; --force-retry or a larger budget re-attempts)",
                     len(skipped),
                 )
-        dirty_shas = {
+        dirty_shas = pending | {
             r.sha256 for r in records if r.sha256 not in already_done and r.sha256 not in skipped
         }
 

@@ -9,6 +9,7 @@ top-level commands; not a file-per-analyzer.
 from __future__ import annotations
 
 import logging
+import re
 import shlex
 import sqlite3
 from dataclasses import dataclass
@@ -22,9 +23,10 @@ from treasure_map.cli.interrupts import (
     interrupt_exit_code,
     is_interrupt_exit,
 )
-from treasure_map.lib import rescan_version
+from treasure_map.lib import last_run, rescan_version
 from treasure_map.lib.errors import ConfigError, TreasureMapError
 from treasure_map.lib.query.diff_workflow import DIFF_WORKFLOW
+from treasure_map.lib.query.runs import extraction_attempt_state
 from treasure_map.lib.ro_db import ro_connect
 from treasure_map.version import UNKNOWN_VERSION, installed_commit
 
@@ -250,8 +252,12 @@ def _echo_full_diff(
             "another (not compared — diff them by sha256 or path): "
             f"{', '.join(plan.ambiguous_by_name)}"
         )
+    # "new" counts what this run actually diffed out of the planned new ones: an interrupted run
+    # completes only part of plan.to_diff, and quoting the plan would claim the rest as done.
+    to_diff = set(plan.to_diff)
+    new_ok = sum(1 for o in ok if o.binary in to_diff)
     click.echo(
-        f"  diffed        : {len(ok)} ok ({len(plan.to_diff)} new, {len(plan.already_ok)} "
+        f"  diffed        : {len(ok)} ok ({new_ok} new, {len(plan.already_ok)} "
         f"skipped-already-ok), {len(failed)} failed this run"
     )
     if recovered:
@@ -1490,6 +1496,7 @@ def runs(config: Path | None, atlas_path: Path | None, as_json: bool) -> None:
         axis_reason: dict[str, tuple[str, str]] = {}
         for axis in _TIER_ORDER:
             axis_reason.update({r.run_id: (axis, why) for r, why in tiers[axis]})
+        kept = _kept_earlier_by_run(run_rows, current_build=current_build)
         rows = []
         for r in run_rows:
             found = axis_reason.get(r.run_id)
@@ -1499,6 +1506,7 @@ def runs(config: Path | None, atlas_path: Path | None, as_json: bool) -> None:
                     "staleness": (
                         None if found is None else {"axis": found[0], "reason": found[1]}
                     ),
+                    "kept_earlier": kept.get(r.run_id, []),
                 }
             )
         click.echo(json.dumps(rows, indent=2, default=str))
@@ -1533,6 +1541,11 @@ def runs(config: Path | None, atlas_path: Path | None, as_json: bool) -> None:
             click.echo(
                 f"  {_run_lineage_line(r, id_width=id_w, status_width=status_w, bins_width=bins_w)}"
             )
+    kept_lines = _kept_earlier_lines(run_rows, current_build=current_build)
+    if kept_lines:
+        click.echo("")
+        for line in kept_lines:
+            click.echo(line)
     # ★ EVERY tier, not the two that happen to be named. The closing line claims what `tmap
     # rescan` can do about what was just listed, so a tier left out of this check is a tier whose
     # runs are quietly assumed refreshable — and the tier most likely to hold un-refreshable runs
@@ -2007,7 +2020,7 @@ def scan(
     # analysis.db, and a second scan of this workspace re-extracting it mid-hunt would hand the
     # hunt part of each extraction. Released before triage, which reads only the atlas.
     with progress, contextlib.ExitStack() as held:
-        from treasure_map.cli.analyze_cli import _report_timeout_skips, _warn_incomplete
+        from treasure_map.cli.analyze_cli import _report_timeout_skips, report_extraction_state
         from treasure_map.lib.atlas.connection import open_atlas
         from treasure_map.lib.config.config import load_config
         from treasure_map.lib.errors import GhidraNotFoundError, TreasureMapError
@@ -2081,7 +2094,11 @@ def scan(
                 force_retry=force_retry,
             )
         except KeyboardInterrupt:
-            click.echo("\nAborted — all Ghidra processes terminated.", err=True)
+            click.echo(
+                "\nAborted — all Ghidra processes terminated. Finished binaries are kept; re-run "
+                "the same command to continue.",
+                err=True,
+            )
             raise SystemExit(interrupt_exit_code()) from None
         except GhidraNotFoundError as exc:
             raise click.ClickException(str(exc)) from exc
@@ -2092,7 +2109,7 @@ def scan(
             f"{result.functions_ingested} functions"
         )
         _report_timeout_skips(result.timeout_skipped)
-        _warn_incomplete(result.incomplete_binaries)
+        report_extraction_state(result, reanalyze)
 
         # Stage 2 — hunt call-sequence shapes -> atlas.
         click.echo(
@@ -2250,11 +2267,36 @@ def _rescan_reason(
     # hunt axis rather than being claimed for the expensive one on no evidence. Re-extracting
     # re-hunts as a matter of course, so a run whose extraction AND stamp both moved belongs here
     # only — listing it as a fast re-hunt would promise a few seconds and then run a decompiler.
+    #
+    # A differing hash is not yet proof that the decompiler has work to do, though: a run whose
+    # binaries were ALL attempted by the running pass, one of which failed and kept an earlier
+    # pass's rows, reads ``mixed:2`` forever — and offering it for re-extraction would promise a
+    # decompile that re-runs that one failure to the same end. So the analysis.db is asked which
+    # pass last attempted each binary; only binaries the running pass has not attempted are work.
+    # A database that cannot answer keeps the old reading.
     if run.build_hash and current_build and run.build_hash != current_build:
-        return (
-            "extraction",
-            f"extracted by {run.build_hash[:12]}, running {current_build[:12]}",
+        legacy = ("extraction", f"extracted by {run.build_hash[:12]}, running {current_build[:12]}")
+        state = (
+            extraction_attempt_state(run.analysis_db_path, current_build)
+            if run.analysis_db_path
+            else None
         )
+        if state is None:
+            return legacy
+        if state.not_attempted:
+            return (
+                "extraction",
+                f"{legacy[1]} ({len(state.not_attempted)} of {state.total} binaries not yet "
+                "attempted by it)",
+            )
+        if state.db_build_hash != run.build_hash:
+            return (
+                "hunt",
+                f"analysis.db re-extracted since the hunt (now {state.db_build_hash}, hunted "
+                f"from {run.build_hash})",
+            )
+        # Every binary was attempted by the running pass and the hunt read this very extraction:
+        # nothing to decompile. Whatever else moved is the hunt axis's to find below.
     if run.hunt_code_version is None:
         return ("hunt", "hunted before the code stamp existed")
     if run.hunt_code_version != current.hunt:
@@ -2304,7 +2346,7 @@ _TIER_COST = {
     # would be a promise about work nobody has looked at. Over-stating costs the reader a pause;
     # under-stating costs them a Ghidra run they were told would not happen.
     "incomplete": "a full scan, the decompiler runs (time not measured; assume the slow case)",
-    "extraction": "slower: the decompiler runs over every binary again",
+    "extraction": "the decompiler runs over every binary the running pass has not extracted yet",
     # ★ Says what IS redone, not only what is skipped. build_hash covers the per-binary extraction
     # and nothing else, so the ELF inventory, the symlink table, the xrefs and the non-binary
     # ingesters are rebuilt every time — a re-hunt is cheap because no decompiler starts, not
@@ -2326,6 +2368,10 @@ _TIER_COST = {
 # and a one-word promise of speed over a rebuild nobody has timed is the kind of claim this file
 # exists to avoid making.
 _REASON_HUMAN: tuple[tuple[str, str], ...] = (
+    (
+        "analysis.db re-extracted since the hunt",
+        "the analysis.db was re-extracted after this run was hunted; re-hunt needs no decompile",
+    ),
     (
         "hunted by hunt code ",
         "the hunt code changed since this run was hunted; re-hunt needs no decompile",
@@ -2356,6 +2402,9 @@ def _reason_human(axis: str, reason: str, *, binaries: int | None = None) -> str
     is how a new one becomes invisible: the reader would see a familiar sentence describing a
     situation nobody had considered. Verbatim is worse prose and a true statement.
     """
+    todo = _extraction_todo(reason) if axis == "extraction" else None
+    if todo is not None and binaries is None:
+        binaries = todo[0]
     scale = f" (decompiles {binaries} binaries)" if binaries else ""
     if axis == "extraction" and reason.startswith("extracted by "):
         return f"extracted by an older tmap; re-extraction is slow{scale}"
@@ -2379,8 +2428,9 @@ def _reasons_grouped(tier: list[tuple[RunRow, str]], axis: str) -> dict[str, lis
     """``{human reason -> the run ids it covers}`` for one tier, in first-appearance order.
 
     The extraction sentence names how many binaries would be decompiled, which is a property of
-    the whole tier rather than of one run, so it is summed here."""
-    total_bins = sum(r.binaries or 0 for r, _why in tier)
+    the whole tier rather than of one run, so it is summed here — per run, the binaries its
+    running pass has not attempted when the reason knows them, else all of its binaries."""
+    total_bins = sum(_binaries_to_decompile(r, why, axis) or 0 for r, why in tier)
     out: dict[str, list[str]] = {}
     for r, why in tier:
         out.setdefault(_reason_human(axis, why, binaries=total_bins or None), []).append(r.run_id)
@@ -2431,8 +2481,60 @@ def _tier_line(r: RunRow, why: str, axis: str) -> str:
     """One tier entry: the run, why it is in that tier, and how big the work is when known."""
     # Both decompiling tiers carry the size of the work; the hunt tier does not decompile.
     sized = axis in ("extraction", "incomplete")
-    scale = f" [{r.binaries} binaries]" if sized and r.binaries is not None else ""
+    todo = _extraction_todo(why) if axis == "extraction" else None
+    if todo is not None:
+        scale = f" [{todo[0]} of {todo[1]} binaries]"
+    else:
+        scale = f" [{r.binaries} binaries]" if sized and r.binaries is not None else ""
     return f"{r.run_id}: {why}{scale}"
+
+
+# The "k of N binaries not yet attempted" an extraction reason carries (see _rescan_reason). Read
+# back from the reason the reader is shown, so the size quoted can never disagree with it.
+_TODO_RE = re.compile(r"\((\d+) of (\d+) binaries not yet attempted by it\)")
+
+
+def _extraction_todo(why: str) -> tuple[int, int] | None:
+    """``(k, N)`` from an extraction reason that names them, else None (the size is not known)."""
+    m = _TODO_RE.search(why)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def _binaries_to_decompile(r: RunRow, why: str, axis: str) -> int | None:
+    """How many binaries redoing ``r`` decompiles: k for an extraction reason that knows it, else
+    the run's whole binary count."""
+    todo = _extraction_todo(why) if axis == "extraction" else None
+    return todo[0] if todo is not None else r.binaries
+
+
+def _kept_earlier_by_run(run_rows: list[RunRow], *, current_build: str | None) -> dict[str, Any]:
+    """``{run_id: [{binary, reason, earlier_pass, has_rows}, …]}`` — per run, the binaries the
+    running pass attempted, failed on, and left holding an earlier pass's extraction. Every run is
+    asked, whichever tier it lands in (an up-to-date run can hold one); a run whose analysis.db
+    cannot be read maps to []."""
+    out: dict[str, Any] = {}
+    for r in run_rows:
+        state = (
+            extraction_attempt_state(r.analysis_db_path, current_build)
+            if r.analysis_db_path and current_build
+            else None
+        )
+        out[r.run_id] = list(state.kept_earlier) if state is not None else []
+    return out
+
+
+def _kept_earlier_line(run_id: str, kept: list[dict[str, Any]]) -> str:
+    """The one sentence `tmap runs`, `tmap rescan` and `tmap init` all print for such a run."""
+    named = ", ".join(f"{k['binary']}: {k.get('reason') or 'unknown'}" for k in kept)
+    return (
+        f"{run_id}: {len(kept)} binaries keep an earlier extraction — the running pass failed on "
+        f"them ({named}); a rescan cannot change this"
+    )
+
+
+def _kept_earlier_lines(run_rows: list[RunRow], *, current_build: str | None) -> list[str]:
+    kept = _kept_earlier_by_run(run_rows, current_build=current_build)
+    return [_kept_earlier_line(r.run_id, kept[r.run_id]) for r in run_rows if kept.get(r.run_id)]
 
 
 def _recorded_workspace_name(run: RunRow, *, workspace_dir: Path) -> str | None:
@@ -2656,6 +2758,11 @@ def rescan(
 
     if current:
         click.echo(f"\nup to date ({len(current)}): {', '.join(r.run_id for r in current)}")
+    kept_lines = _kept_earlier_lines(selected, current_build=current_build)
+    if kept_lines:
+        click.echo("")
+        for line in kept_lines:
+            click.echo(line)
     if unrunnable:
         click.echo(f"\nCANNOT rescan ({len(unrunnable)}) — out of date but not re-readable:")
         for r, why in unrunnable:
@@ -2678,6 +2785,43 @@ def rescan(
         click.echo("\n--dry-run: nothing was run.")
         return
 
+    # ★ A refresh is not a new "last run". Each scan it drives re-points last_run.json at the run
+    # it just scanned, so a rescan of several runs would leave `tmap mcp` serving whichever came
+    # last — not the run the user last chose. The pointer as it was is put back once the loop
+    # ends, however it ends; with none before, the one the scans wrote is kept.
+    pointer = last_run.pointer_path()
+    try:
+        saved_pointer: bytes | None = pointer.read_bytes()
+    except FileNotFoundError:
+        saved_pointer = None
+    try:
+        failed = _rescan_each(ctx, runnable, axis_of, cfg, config, resolved_atlas, force)
+    finally:
+        if saved_pointer is not None:
+            pointer.parent.mkdir(parents=True, exist_ok=True)
+            pointer.write_bytes(saved_pointer)
+
+    click.echo(f"\nrescanned {len(runnable) - len(failed)}/{len(runnable)}")
+    if failed:
+        click.echo(f"failed ({len(failed)}):")
+        for rid, msg in failed:
+            click.echo(f"  {rid}: {msg}")
+    click.echo("`tmap triage <run-id>` for the refreshed candidate list.")
+    if failed:
+        # Not 0: a script must be able to tell "everything refreshed" from "some runs did not".
+        raise SystemExit(RESCAN_PARTIAL_EXIT)
+
+
+def _rescan_each(
+    ctx: click.Context,
+    runnable: list[tuple[RunRow, str]],
+    axis_of: dict[str, str],
+    cfg: Config,
+    config: Path | None,
+    resolved_atlas: Path,
+    force: bool,
+) -> list[tuple[str, str]]:
+    """Scan each runnable run in place, in order; returns the runs that failed, with why."""
     failed: list[tuple[str, str]] = []
     for i, (r, _why) in enumerate(runnable, start=1):
         click.echo(f"\n=== [{i}/{len(runnable)}] rescanning {r.run_id} ===")
@@ -2731,13 +2875,4 @@ def rescan(
             msg = f"recorded analysis.db is not a readable database ({exc}) — left untouched"
             click.echo(f"  FAILED: {msg}", err=True)
             failed.append((r.run_id, msg))
-
-    click.echo(f"\nrescanned {len(runnable) - len(failed)}/{len(runnable)}")
-    if failed:
-        click.echo(f"failed ({len(failed)}):")
-        for rid, msg in failed:
-            click.echo(f"  {rid}: {msg}")
-    click.echo("`tmap triage <run-id>` for the refreshed candidate list.")
-    if failed:
-        # Not 0: a script must be able to tell "everything refreshed" from "some runs did not".
-        raise SystemExit(RESCAN_PARTIAL_EXIT)
+    return failed

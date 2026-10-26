@@ -15,8 +15,10 @@ Gate A — never wrongly downweight (self-consistency):
 
 Gate B — degrade must be visible (no silent failure):
     NO binary may claim ``ghidra_status='ok'`` (functions were produced) yet hold 0 rows in the
-    functions table. A partial/empty run must be recorded ``failed`` (retried) or, when genuinely
-    code-free, ``ok_empty`` — never a functionless "ok" frozen as clean.
+    functions table. A partial/empty run must be recorded ``failed`` (retried); ``ok_empty`` when
+    genuinely code-free; or ``no_functions`` when the extraction finished on a binary that has code
+    and recovered no function (recorded, NOT clean — it is still listed incomplete) — never a
+    functionless "ok" frozen as clean.
 
 Gate C — old data must not pass as current (one authority on which runs exist):
     NO instance may name a source_run_id that has no row in ``run``. Such rows are a scan whose

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 from pathlib import Path
 from typing import Any
@@ -186,13 +187,191 @@ def test_classify_failed_when_malformed(tmp_path: Path) -> None:
     assert _classify_analysis(out, tmp_path / "b") == ("failed", 0)
 
 
-def test_classify_empty_functions_on_code_binary_is_failed(tmp_path: Path) -> None:
-    # ★ Red-line: a >200-byte but functionless shell for a binary that HAS code is a FAILED
-    # analysis, never "clean" — it must not be frozen as done.
+def _marked_json(functions: list[Any], *, pass_version: str = "p1", sha8: str = "aabb1122") -> str:
+    """An extractor output carrying all three markers (no stub table: ``none``)."""
+    return json.dumps(
+        {
+            "pass_version": pass_version,
+            "sha8": sha8,
+            "stub_marker": "none",
+            "functions": functions,
+            "imports": [],
+            "exports": [],
+            "strings": [],
+        }
+    )
+
+
+def test_classify_empty_functions_on_code_binary_is_no_functions(tmp_path: Path) -> None:
+    """T-N1. A parsed output whose three markers are this run's, on a binary WITH code, holding 0
+    functions: the extraction finished and found nothing it could call a function. That is
+    ``no_functions`` — recorded, not retried by the same pass, and not clean. Everything that is
+    not that exact case stays as it was: a marker mismatch and a malformed file are ``failed``, a
+    code-free object is ``ok_empty``.
+
+    MUTATION (verified RED): return ``("failed", 0)`` for code + 0 functions again."""
     out = tmp_path / "b_ghidra.json"
-    out.write_text(json.dumps({"functions": [], "imports": [], "exports": [], "strings": []}))
+    out.write_text(_marked_json([]))
     with patch(f"{MODULE}.has_substantial_text", lambda _b: True):
-        assert _classify_analysis(out, tmp_path / "b") == ("failed", 0)
+        assert _classify_analysis(out, tmp_path / "b", "p1", "aabb1122", "none") == (
+            "no_functions",
+            0,
+        )
+        # another pass's / binary's / stub table's output is never this run's result
+        assert _classify_analysis(out, tmp_path / "b", "p2", "aabb1122", "none") == ("failed", 0)
+        assert _classify_analysis(out, tmp_path / "b", "p1", "deadbeef", "none") == ("failed", 0)
+        assert _classify_analysis(out, tmp_path / "b", "p1", "aabb1122", "abc") == ("failed", 0)
+        out.write_text("{ truncated shell, not json")
+        assert _classify_analysis(out, tmp_path / "b", "p1", "aabb1122", "none") == ("failed", 0)
+    out.write_text(_marked_json([]))
+    with patch(f"{MODULE}.has_substantial_text", lambda _b: False):
+        assert _classify_analysis(out, tmp_path / "b", "p1", "aabb1122", "none") == ("ok_empty", 0)
+
+
+def _no_functions_sub(output_dir: Path, sha8: str, log_lines: str = ""):  # type: ignore[no-untyped-def]
+    """A stand-in Ghidra run that exports a marker-correct, functionless JSON and appends
+    ``log_lines`` to the run's log (``-log`` appends)."""
+
+    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+        out = output_dir / f"httpd_{sha8}_ghidra.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(_marked_json([], pass_version=env["PASS_VERSION"], sha8=env["SHA8"]))
+        if log_lines:
+            with (output_dir / f"httpd_{sha8}.log").open("a") as f:
+                f.write(log_lines)
+        return 0, ""
+
+    return fake_sub
+
+
+def test_a_no_functions_run_is_a_success_and_a_timeout_in_its_own_log_is_not(
+    tmp_path: Path,
+) -> None:
+    """T-N1 (the run). ``_run_once`` records no_functions as a success with no failure reason; the
+    same output under an analysis timeout THIS run logged is a timeout failure, as before.
+
+    MUTATION (verified RED): leave no_functions out of the success statuses."""
+    output_dir = tmp_path / "output"
+    binary = tmp_path / "httpd"
+    _write_small_elf(binary)
+    sha8 = "aabb1122"
+    runner = _make_runner(tmp_path)
+    with (
+        patch(f"{MODULE}.has_substantial_text", lambda _b: True),
+        patch(f"{MODULE}._run_subprocess", _no_functions_sub(output_dir, sha8)),
+    ):
+        r = runner.run_ghidra(binary, output_dir, 60, "x86:LE:64:default", sha8, retry=False)
+    assert (r.success, r.analysis_status, r.reason) == (True, "no_functions", None)
+
+    timed_out = "INFO  REPORT: Analysis timed out at 60 seconds\n"
+    with (
+        patch(f"{MODULE}.has_substantial_text", lambda _b: True),
+        patch(f"{MODULE}._run_subprocess", _no_functions_sub(output_dir, sha8, timed_out)),
+    ):
+        r = runner.run_ghidra(binary, output_dir, 60, "x86:LE:64:default", sha8, retry=False)
+    assert (r.success, r.reason) == (False, "timeout")
+
+
+# ── the log is appended to: only this attempt's part of it is read (S10) ──────────────────────
+
+
+def _ok_sub(output_dir: Path, sha8: str, log_lines: str):  # type: ignore[no-untyped-def]
+    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+        out = output_dir / f"httpd_{sha8}_ghidra.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(_good_json(env))
+        with (output_dir / f"httpd_{sha8}.log").open("a") as f:
+            f.write(log_lines)
+        return 0, ""
+
+    return fake_sub
+
+
+def test_an_earlier_runs_timeout_line_does_not_fail_this_run(tmp_path: Path) -> None:
+    """T-G1. ``-log`` appends, so an earlier run's analysis-timeout line is still in the file. A run
+    that only adds ordinary lines and exports a good output is ``ok``; a run that writes the line
+    itself is a timeout.
+
+    MUTATION (verified RED): search the whole log again (offset ignored) -> the first run reads as
+    a timeout."""
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    binary = tmp_path / "httpd"
+    _write_small_elf(binary)
+    sha8 = "aabb1122"
+    log = output_dir / f"httpd_{sha8}.log"
+    log.write_text("INFO  earlier run\nINFO  REPORT: Analysis timed out at 300 seconds\n")
+    runner = _make_runner(tmp_path)
+    with patch(f"{MODULE}._run_subprocess", _ok_sub(output_dir, sha8, "INFO  analysis done\n")):
+        r = runner.run_ghidra(binary, output_dir, 60, "x86:LE:64:default", sha8, retry=False)
+    assert (r.success, r.analysis_status, r.function_count) == (True, "ok", 1)
+    assert r.log_offset > 0  # really measured past the earlier run's lines
+
+    own = "INFO  REPORT: Analysis timed out at 60 seconds\n"
+    with patch(f"{MODULE}._run_subprocess", _ok_sub(output_dir, sha8, own)):
+        r = runner.run_ghidra(binary, output_dir, 60, "x86:LE:64:default", sha8, retry=False)
+    assert (r.success, r.reason) == (False, "timeout")
+
+
+def test_a_rolled_over_log_is_read_whole(tmp_path: Path) -> None:
+    """A log now SHORTER than where this attempt started was rolled over (Ghidra starts a fresh
+    file past its size limit): all of it is this attempt's, so its timeout line still counts.
+
+    MUTATION (verified RED): drop the "file smaller than the offset -> read from 0" fallback -> the
+    seek lands past the end, nothing is read, the half analysis is cached as ok."""
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    binary = tmp_path / "httpd"
+    _write_small_elf(binary)
+    sha8 = "aabb1122"
+    log = output_dir / f"httpd_{sha8}.log"
+    log.write_text("x" * 4096)  # an earlier run's large log
+
+    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+        (output_dir / f"httpd_{sha8}_ghidra.json").write_text(_good_json(env))
+        log.write_text("INFO  REPORT: Analysis timed out at 60 seconds\n")  # the fresh file
+        return 0, ""
+
+    with patch(f"{MODULE}._run_subprocess", fake_sub):
+        r = _make_runner(tmp_path).run_ghidra(
+            binary, output_dir, 60, "x86:LE:64:default", sha8, retry=False
+        )
+    assert r.log_offset == 4096
+    assert (r.success, r.reason) == (False, "timeout")
+
+
+def test_an_earlier_runs_import_failure_does_not_send_a_timeout_down_the_patch_path(
+    tmp_path: Path,
+) -> None:
+    """T-G2. An "Import failed" an earlier run left in the appended log says nothing about this
+    run, which timed out: no ELF patch, no patched re-run, reason timeout.
+
+    MUTATION (verified RED): read the whole log for "Import failed" again -> the patch path runs
+    and the reason becomes import_failed."""
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    binary = tmp_path / "httpd"
+    _write_small_elf(binary)
+    sha8 = "aabb1122"
+    (output_dir / f"httpd_{sha8}.log").write_text("ERROR Import failed for httpd\n")
+    patched: list[Path] = []
+
+    def fake_patch(src: Path) -> None:
+        patched.append(src)
+        return None
+
+    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+        return -1, "timeout"
+
+    with (
+        patch(f"{MODULE}._run_subprocess", fake_sub),
+        patch(f"{MODULE}._patch_elf_for_ghidra", fake_patch),
+    ):
+        r = _make_runner(tmp_path).run_ghidra(
+            binary, output_dir, 60, "x86:LE:64:default", sha8, retry=False
+        )
+    assert patched == []
+    assert (r.success, r.reason) == (False, "timeout")
 
 
 def test_classify_empty_functions_on_codefree_object_is_ok_empty(tmp_path: Path) -> None:
@@ -1104,3 +1283,174 @@ def test_ghidras_own_analysis_timeout_is_a_timeout_not_ok(
         )
     assert result.success is False and result.reason == "timeout"
     assert any("httpd failed (timeout)" in r.getMessage() for r in caplog.records)
+
+
+# ── run_all hands each record's FINAL result to on_final as it arrives (S1) ────────────────────
+
+
+def _named_records(tmp_path: Path, names: list[str]) -> list[ElfRecord]:
+    recs = [
+        ElfRecord(
+            path=tmp_path / n,
+            name=n,
+            arch="x86:LE:64:default",
+            elf_type="executable",
+            sha256=hashlib.sha256(n.encode()).hexdigest(),
+        )
+        for n in names
+    ]
+    for r in recs:
+        _write_small_elf(r.path)
+    return recs
+
+
+def test_every_record_reaches_on_final_once_with_its_returned_result(tmp_path: Path) -> None:
+    """T-S1. Five records: three succeed at once, one fails phase 1 and succeeds in phase 2, one
+    fails phase 1 and its phase-2 retry crashes (phase 1's result stands). Each record is handed
+    over exactly once, with the very object the returned list holds; a success before its own
+    progress event; a phase-1 failure only once phase 1 is over.
+
+    MUTATION (verified RED): call on_final for phase-1 failures too -> twice for two records.
+    MUTATION (verified RED): skip on_final on a crashed retry -> one record never handed over."""
+    names = ["ok_1", "ok_2", "ok_3", "late_ok", "never_ok"]
+    recs = _named_records(tmp_path, names)
+    attempts: dict[str, int] = {}
+
+    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+        name = Path(cmd[-1]).name
+        attempts[name] = attempts.get(name, 0) + 1
+        if name == "never_ok" and attempts[name] == 2:
+            raise RuntimeError("the retry crashed")
+        if name.startswith("ok_") or (name == "late_ok" and attempts[name] == 2):
+            out = Path(env["OUTPUT_DIR"]) / f"{name}_{env['SHA8']}_ghidra.json"
+            out.write_text(_good_json(env))
+            return 0, ""
+        return -1, "timeout"
+
+    events: list[tuple[str, str, Any]] = []
+    runner = _make_runner(tmp_path)
+    with patch(f"{MODULE}._run_subprocess", fake_sub):
+        results = runner.run_all(
+            recs,
+            tmp_path / "out",
+            progress_callback=lambda step, m: events.append(("progress", step, m["name"])),
+            on_final=lambda rec, res: events.append(("final", rec.name, res)),
+        )
+    finals = [(n, res) for kind, n, res in events if kind == "final"]
+    assert sorted(n for n, _ in finals) == sorted(names)  # each exactly once
+    by_name = dict(finals)
+    for i, rec in enumerate(recs):
+        assert by_name[rec.name] is results[i]
+    assert [results[i].success for i in range(5)] == [True, True, True, True, False]
+    assert results[4].reason == "timeout"  # phase 1's result, the retry having crashed
+    last_phase1 = max(i for i, e in enumerate(events) if e[:2] == ("progress", "ghidra"))
+    for n in ("late_ok", "never_ok"):
+        assert events.index(("final", n, by_name[n])) > last_phase1
+    for n in ("ok_1", "ok_2", "ok_3"):
+        assert events.index(("final", n, by_name[n])) < events.index(("progress", "ghidra", n))
+
+
+def test_an_interrupt_in_phase_one_hands_over_only_what_finished(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """T-S2. A Ctrl-C arrives on the calling thread at the k-th progress event while a JVM is still
+    running: on_final has been called k times (a success is handed over before its progress
+    event), the interrupt propagates, and no process group is left registered or alive. The binary
+    cut off is not reported as a failure.
+
+    MUTATION (verified RED): hand a success over AFTER its progress event -> k-1 calls."""
+    from treasure_map.lib.analyze import ghidra_runner
+
+    real_sub = ghidra_runner._run_subprocess
+    recs = _named_records(tmp_path, ["ok_1", "ok_2", "ok_3", "slow"])
+    pids: list[int] = []
+
+    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+        name = Path(cmd[-1]).name
+        if name == "slow":
+            return real_sub(["sleep", "30"], dict(env), 60)
+        out = Path(env["OUTPUT_DIR"]) / f"{name}_{env['SHA8']}_ghidra.json"
+        out.write_text(_good_json(env))
+        return 0, ""
+
+    k = 2
+    seen = {"n": 0}
+
+    def progress(step: str, meta: dict[str, Any]) -> None:
+        if step != "ghidra":
+            return
+        seen["n"] += 1
+        if seen["n"] == k:
+            # wait until the slow JVM stand-in is really running, so the teardown has one to kill
+            import time
+
+            deadline = time.monotonic() + 10
+            while not ghidra_runner._active_pgids and time.monotonic() < deadline:
+                time.sleep(0.02)
+            pids.extend(ghidra_runner._active_pgids)
+            raise KeyboardInterrupt
+
+    finals: list[str] = []
+    runner = GhidraRunner(GhidraConfig(max_parallel_jvms=4), headless=tmp_path / "hl")
+    try:
+        with (
+            caplog.at_level("WARNING"),
+            patch(f"{MODULE}._run_subprocess", fake_sub),
+            patch(f"{MODULE}.clamp_parallelism_to_memory", lambda n: (n, None)),
+            pytest.raises(KeyboardInterrupt),
+        ):
+            runner.run_all(
+                recs,
+                tmp_path / "out",
+                progress_callback=progress,
+                on_final=lambda rec, res: finals.append(rec.name),
+            )
+    finally:
+        ghidra_runner._reset_shutdown()
+    assert len(finals) == k
+    assert pids, "the slow stand-in never started; the teardown had nothing to kill"
+    assert not ghidra_runner._active_pgids
+    for pid in pids:
+        with pytest.raises(ProcessLookupError):
+            os.killpg(pid, 0)
+    assert not any("slow failed" in r.getMessage() for r in caplog.records)
+
+
+def test_a_failing_on_final_tears_the_pool_down(tmp_path: Path) -> None:
+    """T-S3. ``on_final`` raising (a failed store) is handled like an interrupt: launches are
+    refused, the live groups are killed, and the error propagates.
+
+    MUTATION (verified RED): catch only KeyboardInterrupt again -> no shutdown is begun."""
+    from treasure_map.lib.analyze import ghidra_runner
+
+    recs = _named_records(tmp_path, ["ok_1", "ok_2", "ok_3"])
+
+    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+        name = Path(cmd[-1]).name
+        (Path(env["OUTPUT_DIR"]) / f"{name}_{env['SHA8']}_ghidra.json").write_text(_good_json(env))
+        return 0, ""
+
+    calls = {"n": 0, "terminate": 0}
+    real_terminate = ghidra_runner.terminate_all
+
+    def spy_terminate(grace: float = 2.0) -> None:
+        calls["terminate"] += 1
+        real_terminate(grace)
+
+    def failing_final(rec: ElfRecord, res: Any) -> None:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("the store failed")
+
+    runner = _make_runner(tmp_path)
+    try:
+        with (
+            patch(f"{MODULE}._run_subprocess", fake_sub),
+            patch(f"{MODULE}.terminate_all", spy_terminate),
+            pytest.raises(RuntimeError, match="the store failed"),
+        ):
+            runner.run_all(recs, tmp_path / "out", on_final=failing_final)
+        assert ghidra_runner._shutting_down is True
+        assert calls["terminate"] >= 1
+    finally:
+        ghidra_runner._reset_shutdown()

@@ -30,7 +30,8 @@ THE FIXTURE, assembled fresh under ``--work`` on every run:
 
 THE RUN: ``pipeline.GhidraRunner`` is replaced by a stand-in whose ``run_all`` writes each binary's
 hand-written JSON (stamped with this pass, the binary's sha8 and its stub marker, as the extractor
-does) into the output directory; then the real ``run_analyze`` and ``run_analyzer2`` run, into a
+does) into the output directory, handing each result to ``on_final`` when the pipeline passes one;
+then the real ``run_analyze`` and ``run_analyzer2`` run, into a
 fresh workspace and a fresh atlas.
 
 THE DIGEST covers every table of the analysis.db and every table of the atlas. The atlas is fresh
@@ -127,7 +128,12 @@ def _runner_class() -> type:
         def ghidra_version(self) -> str:
             return GHIDRA_VERSION
 
-        def run_all(self, records: list[Any], out_dir: Path, *_a: Any, **_k: Any) -> list[Any]:
+        def run_all(
+            self, records: list[Any], out_dir: Path, *_a: Any, on_final: Any = None, **_k: Any
+        ) -> list[Any]:
+            # ``on_final`` is handed each result as it is made, the way the real runner does, so
+            # a pipeline that stores each binary as it arrives is digested through that path. A
+            # pipeline that does not pass it is run exactly as before.
             results = []
             for rec in records:
                 src = FIXTURE / "ghidra" / f"{rec.name}.json"
@@ -141,16 +147,17 @@ def _runner_class() -> type:
                 data["stub_marker"] = stub_table_marker(None if stubs is None else stubs.names)
                 out = out_dir / f"{rec.name}_{rec.sha256[:8]}_ghidra.json"
                 out.write_text(json.dumps(data, indent=1), encoding="utf-8")
-                results.append(
-                    GhidraResult(
-                        binary=rec.path,
-                        output_file=out,
-                        success=True,
-                        elapsed=0.0,
-                        analysis_status="ok",
-                        function_count=len(data.get("functions", [])),
-                    )
+                result = GhidraResult(
+                    binary=rec.path,
+                    output_file=out,
+                    success=True,
+                    elapsed=0.0,
+                    analysis_status="ok",
+                    function_count=len(data.get("functions", [])),
                 )
+                results.append(result)
+                if on_final is not None:
+                    on_final(rec, result)
             return results
 
     return FixtureRunner

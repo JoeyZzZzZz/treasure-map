@@ -168,3 +168,41 @@ def test_a_new_run_clears_the_previous_runs_teardown(tmp_path: Path) -> None:
         gr.validate_registry = real_validate
         ghidra_runner._reset_shutdown()
     assert seen == [False]
+
+
+# ── an attempt the teardown cut off is not a failure of the binary (S8) ────────────────────────
+
+
+@pytest.mark.parametrize("rc", [0, ghidra_runner.LAUNCH_FAILED_RC])
+def test_an_attempt_cut_off_by_the_teardown_reads_interrupted_not_failed(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, rc: int
+) -> None:
+    """T-I1. The teardown begins while the attempt is out (the JVM then exits, or never starts):
+    whatever the return code, the result is ``interrupted`` — not classified, not retried, not
+    warned about — so it is never recorded as a timeout or an import failure of the binary.
+
+    MUTATION (verified RED): drop the post-subprocess shutdown check -> classified (no_output),
+    retried, and warned about."""
+    from unittest.mock import patch
+
+    binary = tmp_path / "svc_a"
+    binary.write_bytes(b"\x7fELF" + b"\x00" * 100)
+    calls = {"n": 0}
+
+    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+        calls["n"] += 1
+        ghidra_runner.begin_shutdown()
+        return rc, "" if rc == 0 else "not started"
+
+    runner = ghidra_runner.GhidraRunner(GhidraConfig(), headless=tmp_path / "hl")
+    try:
+        with (
+            caplog.at_level("DEBUG"),
+            patch.object(ghidra_runner, "_run_subprocess", fake_sub),
+        ):
+            r = runner.run_ghidra(binary, tmp_path / "out", 60, "x86:LE:64:default", "aabb1122")
+    finally:
+        ghidra_runner._reset_shutdown()
+    assert (r.success, r.reason, r.timeout_budget) == (False, "interrupted", None)
+    assert calls["n"] == 1  # no retry of any kind
+    assert not [rec for rec in caplog.records if rec.levelname == "WARNING"]

@@ -89,11 +89,14 @@ def list_incomplete_binaries(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     ★ Red-line (degrade must be visible AND explicable): a binary Ghidra failed on holds 0
     functions, so it looks 'clean' to every reader. This surfaces each as ``{binary, reason}`` so a
     consumer knows the analysis is INCOMPLETE for it — and WHY (``timeout`` may finish on a re-scan;
-    ``import_failed`` / ``incomplete`` is structural). ``reason`` is None on a failure recorded
-    before it was captured. Empty on an older analysis.db predating the columns (degrades)."""
+    ``import_failed`` / ``incomplete`` is structural; ``no_functions`` = the extraction finished on
+    a binary with code and recovered no function, which re-running the same pass does not change).
+    ``reason`` is None on a failure recorded before it was captured. Empty on an older analysis.db
+    predating the columns (degrades)."""
     try:
         rows = conn.execute(
-            "SELECT b.name, b.ghidra_status_reason AS reason FROM current_binaries b "
+            "SELECT b.name, COALESCE(b.ghidra_status_reason, CASE WHEN b.ghidra_status = "
+            "'no_functions' THEN 'no_functions' END) AS reason FROM current_binaries b "
             "WHERE COALESCE(b.ghidra_status, '') != 'ok_empty' "
             "AND NOT EXISTS (SELECT 1 FROM functions f WHERE f.binary_id = b.id) "
             "ORDER BY b.name"
@@ -276,6 +279,31 @@ def analysis_run_counts(conn: sqlite3.Connection) -> dict[str, Any]:
         "build_hash": build_hash,
         "ghidra_version": _run_ghidra_version(conn),
     }
+
+
+def analysis_build_hash(conn: sqlite3.Connection) -> str | None:
+    """The ``build_hash`` of ``analysis_run_counts``, alone: one pass_version, ``mixed:<n>``, or
+    None — the same derivation over the same rows.
+
+    For a reader that needs only the hash. ``analysis_run_counts`` also counts the functions that
+    failed to decompile, which reads every function's pseudocode: on a large analysis.db not yet in
+    the page cache that alone takes seconds, and a command that asks this of every run would pay it
+    once per run. ``test_runs_extraction_attempts`` pins the two to the same answer."""
+    try:
+        versions = [
+            r[0]
+            for r in conn.execute(
+                "SELECT DISTINCT pass_version FROM current_binaries "
+                "WHERE pass_version IS NOT NULL ORDER BY pass_version"
+            ).fetchall()
+        ]
+    except sqlite3.OperationalError:
+        versions = []
+    if len(versions) == 1:
+        return str(versions[0])
+    if len(versions) > 1:
+        return f"mixed:{len(versions)}"
+    return None
 
 
 def _run_ghidra_version(conn: sqlite3.Connection) -> str:

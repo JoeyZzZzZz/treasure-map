@@ -13,10 +13,13 @@ complete. Read-only; no verdict.
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
 from treasure_map.lib import rescan_version
 from treasure_map.lib.atlas.models import RunRow
+from treasure_map.lib.ro_db import ro_connect
 from treasure_map.version import UNKNOWN_VERSION
 
 _RUN_COLUMNS = (
@@ -268,3 +271,105 @@ def run_staleness(
             _remedy_for(run),
         )
     return Staleness(False, None, "extraction hash and code stamps all match the running tmap.", "")
+
+
+# The failure reasons a Ghidra attempt records after it actually RAN: the attempt's fingerprint is
+# then in timeout_pass_version. 'launch_failed' (Ghidra never started) and a NULL reason (a failure
+# recorded before reasons were) are not attempts by the pass named there.
+_ATTEMPTED_FAILURES: frozenset[str] = frozenset(
+    {"timeout", "import_failed", "no_output", "incomplete", "stale_output"}
+)
+
+# Tables holding a binary's extracted rows. A missing one (an older analysis.db) counts as none.
+_ROW_TABLES: tuple[str, ...] = ("functions", "strings", "imports", "exports", "data_blocks")
+
+
+@dataclass(frozen=True)
+class ExtractionAttempts:
+    """Per binary, which extraction pass made its LAST attempt — read from an analysis.db.
+
+    ``not_attempted`` names the binaries whose last attempt was not made by the running pass (or
+    that were never attempted); a rescan decompiles exactly those. ``kept_earlier`` is the binaries
+    the running pass DID attempt and failed on while they still carry an earlier pass's
+    ``pass_version``: their rows (``has_rows``) are that earlier extraction's, and running the same
+    pass again will not replace them. ``db_build_hash`` is the analysis.db's own build hash now."""
+
+    total: int
+    not_attempted: list[str] = field(default_factory=list)
+    kept_earlier: list[dict[str, Any]] = field(default_factory=list)
+    db_build_hash: str | None = None
+
+
+def extraction_attempt_state(
+    analysis_db_path: str | Path, current_pass: str
+) -> ExtractionAttempts | None:
+    """Which pass last attempted each current-scan binary of ``analysis_db_path``. Read-only.
+
+    A binary's last attempt ran under ``pass_version`` when it succeeded (``ghidra_ok = 1``) and
+    under ``timeout_pass_version`` when it failed for a reason recorded after Ghidra actually ran
+    (``_ATTEMPTED_FAILURES``); any other failure counts as not attempted. This is the same reading
+    of the same columns as the hunt's ``analyzer2._load_extraction_notes``, which marks the
+    candidates of a failed binary with the pass it attempted.
+
+    None when the database cannot be read or lacks one of the columns this reads — the caller then
+    falls back to comparing build hashes, as before this existed."""
+    try:
+        conn = ro_connect(analysis_db_path, row_factory=True)
+    except sqlite3.Error:
+        return None
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(current_binaries)")}
+        need = {"ghidra_ok", "pass_version", "timeout_pass_version", "ghidra_status_reason"}
+        if not need <= cols:
+            return None
+        rows = conn.execute(
+            "SELECT id, name, ghidra_ok, pass_version, timeout_pass_version, "
+            "ghidra_status_reason FROM current_binaries ORDER BY name"
+        ).fetchall()
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        not_attempted: list[str] = []
+        kept_earlier: list[dict[str, Any]] = []
+        for r in rows:
+            if r["ghidra_ok"] == 1:
+                attempt = r["pass_version"]
+            elif r["ghidra_status_reason"] in _ATTEMPTED_FAILURES:
+                attempt = r["timeout_pass_version"]
+            else:
+                attempt = None
+            if attempt is None or attempt != current_pass:
+                not_attempted.append(r["name"])
+                continue
+            earlier = r["pass_version"]
+            if r["ghidra_ok"] != 1 and earlier is not None and earlier != current_pass:
+                has_rows = any(
+                    conn.execute(
+                        f"SELECT 1 FROM {t} WHERE binary_id = ? LIMIT 1",  # noqa: S608
+                        (r["id"],),
+                    ).fetchone()
+                    is not None
+                    for t in _ROW_TABLES
+                    if t in tables
+                )
+                kept_earlier.append(
+                    {
+                        "binary": r["name"],
+                        "reason": r["ghidra_status_reason"],
+                        "earlier_pass": earlier,
+                        "has_rows": has_rows,
+                    }
+                )
+        # Imported here: lib.facts reaches lib.query through the hunt package at import time.
+        # The hash alone, not analysis_run_counts: its counts read every function's pseudocode.
+        from treasure_map.lib.facts import analysis_build_hash
+
+        db_build_hash = analysis_build_hash(conn)
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+    return ExtractionAttempts(
+        total=len(rows),
+        not_attempted=not_attempted,
+        kept_earlier=kept_earlier,
+        db_build_hash=db_build_hash,
+    )

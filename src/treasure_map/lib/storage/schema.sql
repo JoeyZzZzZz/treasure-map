@@ -30,7 +30,12 @@ CREATE TABLE IF NOT EXISTS binaries (
     dt_needed    TEXT    DEFAULT '[]',     -- JSON: DT_NEEDED shared-library dependencies
     size_bytes   INTEGER DEFAULT 0,        -- ELF file size (bytes)
     ghidra_ok    INTEGER NOT NULL DEFAULT 0, -- partial-invalidation flag (1 = usable output)
-    ghidra_status TEXT,                    -- tri-state analysis outcome: ok / ok_empty / failed / NULL
+    ghidra_status TEXT,                    -- analysis outcome: ok / ok_empty / no_functions /
+                                           --   failed / NULL. no_functions = the extraction
+                                           --   finished, the binary has code, Ghidra recovered no
+                                           --   function: recorded (ghidra_ok=1) so the same pass
+                                           --   does not re-run it, and NOT clean (still listed
+                                           --   incomplete)
     ghidra_status_reason TEXT,             -- WHY a failed run failed: timeout / import_failed /
                                            --   no_output / incomplete / stale_output; NULL on
                                            --   success. Lets the
@@ -65,6 +70,10 @@ CREATE TABLE IF NOT EXISTS binaries (
     -- (not MIPS, unreadable, or ingested before this column existed); '{}' = the ELF was read
     -- and no stub resolved; a JSON object = the stubs that did. NULL never reads as 'no stubs'.
     stub_names   TEXT,
+    reanalyze_pending INTEGER DEFAULT 0,   -- 1 = an unfinished bare --reanalyze still has to
+                                           --   re-extract this binary; 0 = not part of any
+                                           --   unfinished re-extraction request. Cleared by the
+                                           --   binary's final result
     last_seen_at DATETIME,                 -- timestamp of most recent ingest scan
     analyzed_at  DATETIME DEFAULT CURRENT_TIMESTAMP
 );

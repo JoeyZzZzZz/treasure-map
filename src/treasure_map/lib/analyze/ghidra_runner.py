@@ -106,6 +106,8 @@ def terminate_all(grace: float = 2.0) -> None:
 
 
 ProgressCallback = Callable[[str, dict[str, Any]], None]
+# Called once per record with its FINAL result (see GhidraRunner.run_all).
+FinalCallback = Callable[[ElfRecord, "GhidraResult"], None]
 
 _SCRIPT_DIR = Path(__file__).parent / "ghidra"
 _GHIDRA_RELEASES_URL = "https://github.com/NationalSecurityAgency/ghidra/releases"
@@ -225,12 +227,16 @@ class GhidraResult:
     retried: bool = False
     log_path: Path | None = None
     stderr_tail: str | None = None  # last 500 chars of stderr for debugging
-    # ★ Red-line (degrade must be visible): the tri-state analysis outcome, so a partial/empty run
+    # ★ Red-line (degrade must be visible): the four-state analysis outcome, so a partial/empty run
     # is never frozen as "clean". "ok" = functions produced; "ok_empty" = a legitimately code-free
-    # object (no substantial .text) with 0 functions (do not re-churn); "failed" = no usable output
-    # OR code present but 0 functions decompiled. ``success`` is True for ok / ok_empty only.
+    # object (no substantial .text) with 0 functions (do not re-churn); "no_functions" = the
+    # extraction ran to the end with its markers right, the binary HAS executable code, and Ghidra
+    # recovered no function from it — a finished extraction, NOT a clean one (it is still listed
+    # incomplete), recorded so the same pass does not re-run it for the same answer; "failed" = no
+    # usable output (timed out, malformed, missing, another run's file). ``success`` is True for
+    # ok / ok_empty / no_functions.
     analysis_status: str = "failed"
-    function_count: int = 0  # functions in the output JSON (0 for ok_empty / failed)
+    function_count: int = 0  # functions in the output JSON (0 for ok_empty / no_functions / failed)
     # WHY a failed run failed, so a consumer distinguishes a recoverable timeout (re-scan may finish
     # it) from a structural failure. None on success. One of: 'timeout' / 'import_failed' /
     # 'no_output' / 'incomplete' / 'stale_output' (a JSON another pass or binary wrote). Recorded
@@ -243,6 +249,10 @@ class GhidraResult:
     # crashed) records the smaller budget it really got, and next scan re-runs it. None when the
     # result did not come from an attempt (a crash placeholder).
     timeout_budget: int | None = None
+    # Size of the Ghidra log before THIS attempt started. ``-log`` appends, so every earlier run's
+    # lines are still in the file; the timeout and import-failure checks read only what this attempt
+    # wrote, from here on.
+    log_offset: int = 0
 
 
 # ★ A binary that cannot finish within this even on an isolated retry is a genuine hang, not a
@@ -496,13 +506,16 @@ def _classify_analysis(
     expected_sha8: str | None = None,
     expected_stub: str | None = None,
 ) -> tuple[str, int]:
-    """Classify a finished run into (analysis_status, function_count).
+    """Classify a finished run into (analysis_status, function_count) — one of four states.
 
-    ★ Red-line: success requires a NON-EMPTY functions array, not merely a >200-byte file — a
-    truncated/partial run can leave a well-formed-but-empty shell (``{"functions": []}``), and
-    counting that as success froze the binary as analyzed so it never re-ran. A code-free object
-    (no substantial .text) with 0 functions is ``ok_empty`` (legitimate; do not re-churn); a binary
-    with code but 0 functions is ``failed`` (not clean).
+    ★ Red-line: ``ok`` requires a NON-EMPTY functions array, not merely a >200-byte file. A
+    code-free object (no substantial .text) with 0 functions is ``ok_empty`` (legitimate; do not
+    re-churn). A binary WITH code whose extraction parsed and carries all three markers right but
+    holds 0 functions is ``no_functions``: the extraction finished and Ghidra found nothing it could
+    call a function, which the same pass will find again — so it is recorded as done for this pass,
+    and it is NOT clean (every incomplete surfacing still lists it). Everything else is ``failed``:
+    a missing or unparseable file, or one whose markers say another run wrote it. A timeout never
+    reaches here; the caller decides it from this attempt's log first.
 
     ★ Freshness: the output directory outlives a scan, so the file at ``output_file`` may be one an
     EARLIER run wrote — a run that timed out never replaces it. When ``expected_pass`` /
@@ -521,7 +534,7 @@ def _classify_analysis(
         return "failed", 0
     if count > 0:
         return "ok", count
-    return ("failed", 0) if has_substantial_text(binary) else ("ok_empty", 0)
+    return ("no_functions", 0) if has_substantial_text(binary) else ("ok_empty", 0)
 
 
 def _build_cmd(
@@ -556,6 +569,12 @@ def _build_cmd(
     ]
 
 
+# The analysis states a finished extraction is recorded under (see GhidraResult.analysis_status).
+_SUCCESS_STATUSES: tuple[str, ...] = ("ok", "ok_empty", "no_functions")
+
+# GhidraResult.reason of an attempt the run's own teardown cut off: not a failure of the binary.
+_INTERRUPTED = "interrupted"
+
 # returncode of a process that could not be started at all (the launcher missing, not executable):
 # never a timeout — a timeout settles a budget and is skipped at that budget on the next scan.
 LAUNCH_FAILED_RC = -2
@@ -566,9 +585,31 @@ LAUNCH_FAILED_RC = -2
 _ANALYSIS_TIMED_OUT = re.compile(rb"REPORT: Analysis timed out at \d+ seconds")
 
 
-def _analysis_timed_out(log_path: Path) -> bool:
+def _log_size(log_path: Path) -> int:
+    """The log's size now (0 when there is none yet): where the next attempt's lines will start."""
     try:
-        return bool(_ANALYSIS_TIMED_OUT.search(log_path.read_bytes()))
+        return log_path.stat().st_size
+    except OSError:
+        return 0
+
+
+def _log_since(log_path: Path, offset: int) -> bytes:
+    """What was written to ``log_path`` from byte ``offset`` on — this attempt's part of a log that
+    ``-log`` appends to. A file now SMALLER than the offset was rolled over (Ghidra starts a fresh
+    log past its size limit), so the whole of it is this attempt's and it is read whole."""
+    with log_path.open("rb") as f:
+        f.seek(0, os.SEEK_END)
+        if f.tell() < offset:
+            offset = 0
+        f.seek(offset)
+        return f.read()
+
+
+def _analysis_timed_out(log_path: Path, offset: int = 0) -> bool:
+    """Whether THIS attempt's part of the log (from ``offset`` on) reports the analysis timeout. An
+    earlier run's timeout line, still in the appended log, says nothing about this one."""
+    try:
+        return bool(_ANALYSIS_TIMED_OUT.search(_log_since(log_path, offset)))
     except OSError:
         return False
 
@@ -686,11 +727,18 @@ class GhidraRunner:
         r1 = self._run_once(binary, output_dir, arch, sha8, timeout, headless)
         if r1.success:
             return r1
+        if r1.reason == _INTERRUPTED:
+            # Cut off by the run's teardown: not a failure of this binary, so no retry and no
+            # warning. It is not recorded either; the next scan starts it over.
+            logger.debug("ghidra: %s interrupted", binary.name)
+            return r1
 
         import_failed = False
         if r1.log_path is not None and r1.log_path.exists():
             try:
-                import_failed = "Import failed" in r1.log_path.read_text(errors="replace")
+                # This attempt's lines only: an "Import failed" an earlier run left in the appended
+                # log would send a timeout down the patch-and-retry path.
+                import_failed = b"Import failed" in _log_since(r1.log_path, r1.log_offset)
             except OSError:
                 pass
 
@@ -710,6 +758,10 @@ class GhidraRunner:
                     did_retry = True
                     total_elapsed += r2.elapsed
                     last = r2
+                    if r2.reason == _INTERRUPTED:
+                        logger.debug("ghidra: %s interrupted", binary.name)
+                        r2.binary = binary
+                        return r2
                     if r2.success:
                         r2.binary = binary
                         r2.elapsed = total_elapsed
@@ -724,6 +776,9 @@ class GhidraRunner:
             did_retry = True
             total_elapsed += r2.elapsed
             last = r2
+            if r2.reason == _INTERRUPTED:
+                logger.debug("ghidra: %s interrupted", binary.name)
+                return r2
             if r2.success:
                 r2.elapsed = total_elapsed
                 r2.retried = True
@@ -751,6 +806,7 @@ class GhidraRunner:
             # ran, ``r1`` when none did. Taking r1's would under-report the time this binary was
             # given and make the next scan skip it on a budget it never had.
             timeout_budget=last.timeout_budget,
+            log_offset=r1.log_offset,
         )
 
     def _run_once(
@@ -798,6 +854,8 @@ class GhidraRunner:
                 output_dir.mkdir(parents=True, exist_ok=True)
                 stub_table.write_text(serialize_stub_table(resolution.names), encoding="utf-8")
 
+            # Where this attempt's lines will start in the appended log (see GhidraResult).
+            log_offset = _log_size(output_dir / f"{binary.name}_{sha8}.log")
             heap_mb, xms_mb = adaptive_heap_mb(binary.stat().st_size)
             env: dict[str, str] = {
                 **dict(os.environ),
@@ -824,6 +882,25 @@ class GhidraRunner:
         elapsed = time.monotonic() - t0
         log_path = output_dir / f"{binary.name}_{sha8}.log"
 
+        # ★ Read under the lock the teardown sets it with, whatever the return code: a JVM killed by
+        # an interrupt exits with a signal code (or never started), and classifying that would
+        # record a failure of a binary that was only cut off — the next scan would then skip a
+        # "timed out" one or retry an "import failed" one for no reason.
+        with _active_lock:
+            interrupted = _shutting_down
+        if interrupted:
+            return GhidraResult(
+                binary=binary,
+                output_file=None,
+                success=False,
+                elapsed=elapsed,
+                log_path=log_path if log_path.exists() else None,
+                stderr_tail=stderr_raw if stderr_raw else None,
+                reason=_INTERRUPTED,
+                timeout_budget=None,
+                log_offset=log_offset,
+            )
+
         reason: str | None = None
         budget: int | None = timeout
         if rc == -1:
@@ -836,7 +913,7 @@ class GhidraRunner:
             # again instead of skipping this binary as one that "would only time out again".
             analysis_status, function_count = "failed", 0
             reason, budget = "launch_failed", None
-        elif log_path.exists() and _analysis_timed_out(log_path):
+        elif log_path.exists() and _analysis_timed_out(log_path, log_offset):
             # Ghidra stopped its own analysis at -analysisTimeoutPerFile and exported what it had:
             # a timeout at this budget, whatever the JSON says.
             analysis_status, function_count = "failed", 0
@@ -845,7 +922,7 @@ class GhidraRunner:
             analysis_status, function_count = _classify_analysis(
                 expected_out, binary, expected_pass, sha8, expected_stub
             )
-            if analysis_status not in ("ok", "ok_empty"):
+            if analysis_status not in _SUCCESS_STATUSES:
                 # failure reason by cause (import_failed is decided by run_ghidra from the log)
                 if not expected_out.exists():
                     reason = "no_output"  # ran but produced no JSON
@@ -858,8 +935,8 @@ class GhidraRunner:
                     ):
                         reason = "stale_output"  # a JSON is there, but another pass/binary wrote it
                     else:
-                        reason = "incomplete"  # malformed / 0 functions on a binary with code
-        success = analysis_status in ("ok", "ok_empty")
+                        reason = "incomplete"  # malformed (parsed, but no functions array)
+        success = analysis_status in _SUCCESS_STATUSES
         return GhidraResult(
             binary=binary,
             output_file=expected_out if success else None,
@@ -871,6 +948,7 @@ class GhidraRunner:
             stderr_tail=stderr_raw if stderr_raw else None,
             reason=reason,
             timeout_budget=budget,
+            log_offset=log_offset,
         )
 
     def run_all(
@@ -878,6 +956,8 @@ class GhidraRunner:
         records: list[ElfRecord],
         output_dir: Path,
         progress_callback: ProgressCallback | None = None,
+        *,
+        on_final: FinalCallback | None = None,
     ) -> list[GhidraResult]:
         """Two-phase Ghidra dispatch.
 
@@ -887,6 +967,13 @@ class GhidraRunner:
         because the pool was CPU-saturated now retries with the whole machine to itself. This is the
         real fix (a per-call 'longer timeout' flag would not help: the retry would still compete in
         the pool). A phase-2 failure stays a failure with its ``reason`` (surfaced downstream).
+
+        ``on_final(record, result)`` is called on the calling thread as soon as a record's result is
+        FINAL — a phase-1 success, or whatever phase 2 settles for a phase-1 failure — so a caller
+        can store each binary the moment it is done instead of after the whole batch. On a normal
+        return it has been called exactly once per record, with the very object the returned list
+        holds at that record's index. When this raises (an interrupt, or ``on_final`` itself
+        failing), only the records that had already reached their final result were passed to it.
 
         Discovers analyzeHeadless once before spawning threads so GhidraNotFoundError is raised
         immediately rather than N times.
@@ -933,6 +1020,9 @@ class GhidraRunner:
                             binary=rec.path, output_file=None, success=False, elapsed=0.0
                         )
                     by_idx[i] = result
+                    # A success is final here; a failure is settled by phase 2, which reports it.
+                    if result.success and on_final is not None:
+                        on_final(rec, result)
                     if progress_callback is not None:
                         progress_callback(
                             "ghidra",
@@ -940,9 +1030,12 @@ class GhidraRunner:
                         )
                     status = "ok" if result.success else "fail"
                     logger.info("[%d/%d] %s %s (%.0fs)", done, n, rec.name, status, result.elapsed)
-            except KeyboardInterrupt:
+            except BaseException as exc:
+                # Not only an interrupt: ``on_final`` (or the progress callback) failing must tear
+                # the pool down the same way, or the JVMs still running outlive the exception.
                 logger.warning(
-                    "interrupted — terminating %d live Ghidra process group(s)",
+                    "%s — terminating %d live Ghidra process group(s)",
+                    "interrupted" if isinstance(exc, KeyboardInterrupt) else "aborted",
                     len(_active_pgids),
                 )
                 # Refuse new launches FIRST, then drop the queue, then kill what is running: a
@@ -981,9 +1074,15 @@ class GhidraRunner:
                         )
                     except Exception as exc:
                         logger.error("Ghidra retry crashed for %s: %s", rec.name, exc)
+                        # Phase 1's result stands as the final one. Reported outside the try
+                        # above, so a failure of the callback is never taken for a crashed retry.
+                        if on_final is not None:
+                            on_final(rec, by_idx[i])
                         continue
                     r.retried = True
                     by_idx[i] = r
+                    if on_final is not None:
+                        on_final(rec, r)
                     if progress_callback is not None:
                         progress_callback(
                             "ghidra_retry",
@@ -997,9 +1096,10 @@ class GhidraRunner:
                         "ok" if r.success else "fail",
                         r.elapsed,
                     )
-            except KeyboardInterrupt:
+            except BaseException as exc:
                 logger.warning(
-                    "interrupted during serial retry — terminating live process group(s)"
+                    "%s during serial retry — terminating live process group(s)",
+                    "interrupted" if isinstance(exc, KeyboardInterrupt) else "aborted",
                 )
                 begin_shutdown()
                 terminate_all()

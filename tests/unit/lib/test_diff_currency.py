@@ -2148,3 +2148,45 @@ def test_the_golden_diff_writes_what_it_wrote(
         f"the diff code's output for the golden input changed to {digest[:12]}; if intended, "
         "update _GOLDEN_OUTPUT (stored diffs read as stale through the code hash either way)"
     )
+
+
+# ── an interrupted full diff resumes at the binary level (no cache needed) ─────────────────────
+
+
+def test_an_interrupted_full_diff_resumes_with_the_binaries_it_did_not_finish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T-D1. Three changed binaries, one worker, Ctrl-C right after the first completes. The next
+    plan counts exactly that one as already done, the next full diff diffs only the other two, and
+    after it nothing is left to run. (A resumed diff needs no artifact cache: each binary's diff is
+    committed as it completes.)
+
+    MUTATION (verified RED): roll back the completed binary's persist on the interrupt -> the second
+    plan has nothing already done."""
+    names = ("liba", "libb", "libc")
+    w = _world(
+        tmp_path,
+        {n: (_sha(f"a-{n}"), _PV) for n in names},
+        {n: (_sha(f"b-{n}"), _PV) for n in names},
+    )
+    _stub(monkeypatch, w)
+    monkeypatch.setattr(driver, "_effective_diff_workers", lambda configured, resolved: 1)
+    real_as_completed = driver.as_completed
+
+    def one_then_interrupt(fut_map: Any) -> Any:
+        for fut in real_as_completed(fut_map):
+            yield fut
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(driver, "as_completed", one_then_interrupt)
+    first = _full(w)
+    assert first.cancelled is True
+    assert len(first.outcomes) == 1 and first.outcomes[0].error is None
+    finished = first.outcomes[0].binary
+    monkeypatch.setattr(driver, "as_completed", real_as_completed)
+
+    plan = _plan(w)
+    assert plan.already_ok == (finished,)
+    second = _full(w)
+    assert sorted(o.binary for o in second.outcomes) == sorted(set(names) - {finished})
+    assert _plan(w).binaries_to_run() == ()

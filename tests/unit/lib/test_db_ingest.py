@@ -1169,3 +1169,169 @@ def test_ingest_stores_the_listing_and_marks_the_binary(tmp_path: Path) -> None:
     assert json.loads(de) == ["sink_provenance"]
     assert tuple(fl) == (1, 1)
     assert status is not None and status[0] == 1
+
+
+# ── no_functions is a recorded result, not a frozen bad state (S9) ─────────────────────────────
+
+
+@pytest.mark.parametrize("code_rich_now", [True, False])
+def test_a_no_functions_row_is_left_as_recorded_by_the_self_heal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code_rich_now: bool
+) -> None:
+    """T-N3. ``no_functions`` was recorded by an extraction of THIS pass that ran to the end on a
+    binary with code: re-running it buys the same answer, and calling it ``ok_empty`` would call it
+    clean. Whatever the file reads as now, the self-heal neither re-dirties nor relabels it.
+
+    MUTATION (verified RED, both params): drop the ``!= 'no_functions'`` exemption from the
+    self-heal query -> True: re-dirtied; False: relabelled ok_empty."""
+    conn = open_db(tmp_path / "analysis.db")
+    rec = _make_record("svc_a", "deadbeef")
+    ingest_elfs(conn, [rec], pass_version="p1")
+    conn.execute(
+        "UPDATE binaries SET ghidra_ok=1, ghidra_status='no_functions', pass_version='p1' "
+        "WHERE sha256='deadbeef'"
+    )
+    conn.commit()  # 0 functions, by the record
+    monkeypatch.setattr(_DB_INGEST, lambda _p: code_rich_now)
+    _, dirty = ingest_elfs(conn, [rec], pass_version="p1")
+    assert "deadbeef" not in dirty
+    row = conn.execute("SELECT ghidra_status FROM binaries WHERE sha256='deadbeef'").fetchone()
+    assert row[0] == "no_functions"
+    conn.close()
+
+
+# ── a bare --reanalyze is a request that survives an interrupt (S4) ───────────────────────────
+
+
+def _pending_of(conn: sqlite3.Connection) -> dict[str, int]:
+    return {
+        r["name"]: r["reanalyze_pending"]
+        for r in conn.execute("SELECT name, reanalyze_pending FROM binaries")
+    }
+
+
+def test_a_new_full_reanalyze_marks_every_binary_and_redoes_them_all(tmp_path: Path) -> None:
+    """T-R1 (ingest side). No mark left = a new request: every binary of the scan is marked and
+    every one is dirty, cached or not.
+
+    MUTATION (verified RED): skip the marking UPDATE -> the marks stay 0."""
+    conn = open_db(tmp_path / "analysis.db")
+    recs = [_make_record("svc_a", "aa"), _make_record("svc_b", "bb")]
+    ingest_elfs(conn, recs, pass_version="p1")
+    _mark_done_with_functions(conn)
+    conn.execute("UPDATE binaries SET pass_version='p1'")
+    conn.commit()
+    _, dirty = ingest_elfs(
+        conn, recs, pass_version="p1", reanalyze=REANALYZE_ALL, ghidra_version="g1"
+    )
+    assert dirty == {"aa", "bb"}
+    assert _pending_of(conn) == {"svc_a": 1, "svc_b": 1}
+    conn.close()
+
+
+def test_a_continued_reanalyze_remarks_what_another_ghidra_redid(tmp_path: Path) -> None:
+    """T-R4. Continuing a request re-marks a binary that a DIFFERENT Ghidra re-extracted in the
+    meantime (the request is for this scan's decompiler), and leaves one this Ghidra already did.
+
+    svc_a: re-extracted under g-old (cleared) -> re-marked; svc_b: re-extracted under g-new
+    (cleared) -> stays done; svc_c: still marked -> dirty.
+
+    MUTATION (verified RED): drop the version re-mark -> svc_a missing from dirty."""
+    conn = open_db(tmp_path / "analysis.db")
+    recs = [_make_record("svc_a", "aa"), _make_record("svc_b", "bb"), _make_record("svc_c", "cc")]
+    ingest_elfs(conn, recs, pass_version="p1")
+    _mark_done_with_functions(conn)
+    conn.execute("UPDATE binaries SET pass_version='p1', ghidra_version='g-new'")
+    conn.execute("UPDATE binaries SET ghidra_version='g-old' WHERE sha256='aa'")
+    conn.execute("UPDATE binaries SET reanalyze_pending=1 WHERE sha256='cc'")
+    conn.commit()
+    _, dirty = ingest_elfs(
+        conn, recs, pass_version="p1", reanalyze=REANALYZE_ALL, ghidra_version="g-new"
+    )
+    assert dirty == {"aa", "cc"}
+    assert _pending_of(conn) == {"svc_a": 1, "svc_b": 0, "svc_c": 1}
+    conn.close()
+
+
+def test_a_continued_reanalyze_skips_timeouts_only_outside_the_request(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """T-R6. Continuing: a binary the request still has to redo (marked) runs even though it timed
+    out at the budget this scan repeats; one the request already redid (mark cleared, timed out)
+    is under the ordinary skip again, and only that one is reported skipped. --force-retry skips
+    nothing.
+
+    MUTATION (verified RED): skip timeouts inside the request too (no ``- pending``) -> the log
+    reports 2 skipped (the dirty set is the same: the request's binaries are added back to it).
+    MUTATION (verified RED): apply the skip only when ``reanalyze is None`` (as before) -> svc_a
+    dirty."""
+    from treasure_map.lib.analyze.ghidra_runner import retry_budget_seconds
+
+    conn = open_db(tmp_path / "analysis.db")
+    a = _rec_for(_sized_file(tmp_path, "svc_a", 4096), "aa")
+    e = _rec_for(_sized_file(tmp_path, "svc_e", 4096), "ee")
+    c = _rec_for(_sized_file(tmp_path, "svc_c", 4096), "cc")
+    recs = [a, e, c]
+    ingest_elfs(conn, recs, pass_version="p1", timeout_base=_BASE)
+    _mark_done_with_functions(conn)
+    conn.execute("UPDATE binaries SET pass_version='p1', ghidra_version='g1'")
+    conn.commit()
+    budget = retry_budget_seconds(a.path, _BASE)
+    _record_failure(conn, "aa", budget=budget, pass_version="p1")  # redone by the request
+    _record_failure(conn, "ee", budget=budget, pass_version="p1")  # still to redo
+    conn.execute("UPDATE binaries SET reanalyze_pending=1 WHERE sha256 IN ('ee', 'cc')")
+    conn.commit()
+    kw = {"pass_version": "p1", "timeout_base": _BASE, "ghidra_version": "g1"}
+    with caplog.at_level("INFO"):
+        _, dirty = ingest_elfs(conn, recs, reanalyze=REANALYZE_ALL, **kw)  # type: ignore[arg-type]
+    assert dirty == {"ee", "cc"}
+    skip_logs = [
+        r.getMessage() for r in caplog.records if "timed out at a budget" in r.getMessage()
+    ]
+    assert len(skip_logs) == 1 and skip_logs[0].startswith("1 binary/ies")
+    _, forced = ingest_elfs(
+        conn,
+        recs,
+        reanalyze=REANALYZE_ALL,
+        force_retry=True,
+        **kw,  # type: ignore[arg-type]
+    )
+    assert forced == {"aa", "ee", "cc"}
+    conn.close()
+
+
+def test_a_plain_scan_and_a_named_reanalyze_neither_read_nor_set_the_marks(tmp_path: Path) -> None:
+    """Only a bare --reanalyze reads the request: a plain scan leaves marked-but-cached binaries
+    cached (and marked), and a named one marks nothing.
+
+    MUTATION (verified RED): read the marks into the dirty set for every mode -> svc_b dirty."""
+    conn = open_db(tmp_path / "analysis.db")
+    recs = [_make_record("svc_a", "aa"), _make_record("svc_b", "bb")]
+    ingest_elfs(conn, recs, pass_version="p1")
+    _mark_done_with_functions(conn)
+    conn.execute("UPDATE binaries SET pass_version='p1'")
+    conn.execute("UPDATE binaries SET reanalyze_pending=1 WHERE sha256='bb'")
+    conn.commit()
+    _, plain = ingest_elfs(conn, recs, pass_version="p1", ghidra_version="g1")
+    assert plain == set()
+    _, named = ingest_elfs(conn, recs, pass_version="p1", reanalyze="svc_a", ghidra_version="g1")
+    assert named == {"aa"}
+    assert _pending_of(conn) == {"svc_a": 0, "svc_b": 1}
+    conn.close()
+
+
+def test_migration_adds_reanalyze_pending_to_old_db(tmp_path: Path) -> None:
+    """An analysis.db from before the column gains it, defaulted 0, and keeps its rows.
+
+    MUTATION (verified RED): drop the column from ``_ADDED_COLUMNS``."""
+    db = tmp_path / "old.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(_SCHEMA_PATH.read_text())
+    conn.execute("ALTER TABLE binaries DROP COLUMN reanalyze_pending")
+    conn.execute("INSERT INTO binaries (name, sha256) VALUES ('svc_a', 'aa')")
+    conn.commit()
+    conn.close()
+    conn = open_db(db)
+    assert "reanalyze_pending" in {r[1] for r in conn.execute("PRAGMA table_info(binaries)")}
+    assert _pending_of(conn) == {"svc_a": 0}
+    conn.close()
