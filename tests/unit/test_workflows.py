@@ -174,3 +174,91 @@ def test_the_release_lock_check_exits_nonzero_on_a_placeholder(tmp_path: Path) -
 
     good = run_over(_clean_lock(), "good")
     assert good.returncode == 0, f"clean lock must pass; out={good.stdout!r} err={good.stderr!r}"
+
+
+_ROOT = Path(__file__).resolve().parents[2]
+_SECTION = _ROOT / "scripts" / "changelog_section.py"
+
+
+def _changelog_section(version: str, changelog: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(  # noqa: S603 -- this repository's own script
+        [sys.executable, str(_SECTION), version, str(changelog)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+def test_changelog_section_prints_one_version_body_and_refuses_a_missing_one(
+    tmp_path: Path,
+) -> None:
+    """The release body is one version's section: heading left out, stopping at the next version
+    or the link-reference block, never a neighbouring version whose number starts the same. A
+    missing or empty section exits non-zero with nothing on stdout, so the release step stops.
+
+    MUTATION: stop only at ``## [`` headings (not the link block) -> RED. MUTATION: match the
+    heading as a bare prefix (``0.1.1`` finds ``0.1.10``) -> RED. MUTATION: return the empty
+    section instead of raising -> RED."""
+    changelog = tmp_path / "CHANGELOG.md"
+    changelog.write_text(
+        "# Changelog\n\nPreamble.\n\n"
+        "## [0.1.10] - 2026-12-01\n\nTen.\n\n"
+        "## [0.1.2] - 2026-11-01\n\n\n"
+        "## [0.1.1] - 2026-10-26\n\nOne.\n\n### Fixed\n\n- a fix\n\n"
+        "[0.1.10]: https://example.invalid/0.1.10\n"
+        "[0.1.1]: https://example.invalid/0.1.1\n",
+        encoding="utf-8",
+    )
+    one = _changelog_section("0.1.1", changelog)
+    assert one.returncode == 0, one.stderr
+    assert one.stdout == "One.\n\n### Fixed\n\n- a fix\n"
+    ten = _changelog_section("0.1.10", changelog)
+    assert ten.returncode == 0, ten.stderr
+    assert ten.stdout == "Ten.\n"
+    for version in ("0.1.2", "0.1", "9.9.9"):  # empty section; prefix only; absent
+        res = _changelog_section(version, changelog)
+        assert res.returncode != 0, version
+        assert res.stdout == "", version
+        assert f"[{version}]" in res.stderr, version
+
+
+def test_the_current_version_has_a_release_body() -> None:
+    """Bumping __version__ without its CHANGELOG section would fail the release mid-way; this
+    fails it in CI first. The body is the section's text, not the heading or the next version.
+
+    MUTATION: rename the current version's heading in CHANGELOG.md -> RED."""
+    import runpy
+
+    version = runpy.run_path(str(_ROOT / "src" / "treasure_map" / "version.py"))["__version__"]
+    res = _changelog_section(version, _ROOT / "CHANGELOG.md")
+    assert res.returncode == 0, res.stderr
+    assert res.stdout.strip()
+    assert not re.search(r"^## ", res.stdout, re.MULTILINE)
+
+
+def test_the_release_body_comes_from_the_changelog_before_anything_is_built() -> None:
+    """The notes are taken in the first step (so a missing section stops the release before the
+    build and the PyPI upload), and the draft gets them both when it is created and when a re-run
+    finds it already there. Before this, the body was one fixed line, edited by hand afterwards.
+
+    MUTATION: create the draft with ``--notes "..."`` -> RED. MUTATION: drop the ``gh release
+    edit --notes-file`` from the re-run branch -> RED. MUTATION: take the notes after the
+    PyPI upload -> RED."""
+    steps = _steps("release.yml")
+    take = re.compile(
+        r'^\s*python scripts/changelog_section\.py "\$V" CHANGELOG\.md > "(?P<f>[^"]+)"$',
+        re.MULTILINE,
+    )
+    taken = [(i, m.group("f")) for i, s in enumerate(steps) if (m := take.search(s.get("run", "")))]
+    assert len(taken) == 1, taken
+    at, notes = taken[0]
+    build = next(i for i, s in enumerate(steps) if "python -m build" in s.get("run", ""))
+    publish = next(i for i, s in enumerate(steps) if "pypi-publish" in s.get("uses", ""))
+    assert at < build < publish
+    assert "set -e" in steps[at]["run"]
+    run = next(s["run"] for s in steps if "gh release create" in s.get("run", ""))
+    rerun, _, create = run.partition("else")
+    assert "gh release create" in create and "gh release upload" in rerun
+    assert f'--notes-file "{notes}"' in create
+    assert re.search(rf'gh release edit [^\n]*--notes-file "{re.escape(notes)}"', rerun)
+    assert "--notes " not in run
