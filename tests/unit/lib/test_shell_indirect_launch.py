@@ -150,10 +150,33 @@ def test_a_quoted_parameter_takes_the_whole_argument_which_names_no_binary(
     assert _launches(tmp_path, text) == [(6, "svc_b", "function_arg", 1)]
 
 
+def test_only_the_launch_lines_quoting_decides_how_the_argument_splits(tmp_path: Path) -> None:
+    """A quoted ``"... $1"`` on a line that does not run ``$1`` (a log line) says nothing about the
+    line that does: there ``$1`` is bare, the shell splits ``"svc_a -x"``, and ``svc_a`` runs.
+
+    MUTATION (verified RED): decide the quoting from any line of the body again -> no row."""
+    text = 'check() {\n  logger "start $1"\n  $BASE/$1 &\n}\ncheck "svc_a -x"\n'
+    assert _launches(tmp_path, text) == [(5, "svc_a", "function_arg", 1)]
+
+
+def test_launch_lines_that_quote_the_parameter_differently_leave_a_spaced_argument_unread(
+    tmp_path: Path,
+) -> None:
+    """One launch line runs ``"$1"``, another ``$1``: a spaced argument has two readings and is
+    not read; a one-word argument reads the same either way and is.
+
+    MUTATION (verified RED): read the mixed case as unquoted -> svc_a recorded from line 6."""
+    text = 'check() {\n  "$1" &\n  $1 -d &\n}\ncheck svc_b\ncheck "svc_a -x"\n'
+    assert _launches(tmp_path, text) == [(5, "svc_b", "function_arg", 1)]
+
+
 def test_a_variable_argument_or_another_parameter_is_not_read(tmp_path: Path) -> None:
+    """The variable argument's last segment is a binary's name, so only the ``$`` rule keeps it out.
+
+    MUTATION (verified RED): drop the ``"$" in arg`` check -> svc_a recorded."""
     text = (
         "check() {\n  $BASE/$1 &\n}\n"
-        "check $NAME\n"
+        "check $DIR/svc_a\n"
         "two() {\n  $BASE/$2 &\n}\n"
         "two svc_a\n"
         "all() {\n  $@ &\n}\n"

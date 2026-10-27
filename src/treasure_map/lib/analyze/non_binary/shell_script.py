@@ -143,8 +143,11 @@ class _SymbolTable:
 
     # function name -> (positional parameter it runs, 1-based line of the definition)
     functions: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
-    # (function, parameter) pairs whose body runs the parameter inside double quotes
+    # (function, parameter) pairs whose every launch line runs the parameter inside double quotes
     quoted: set[tuple[str, int]] = field(default_factory=set)
+    # (function, parameter) pairs whose launch lines disagree on the quoting (or one could not be
+    # read): an argument with a space in it has no single reading and is not read
+    unsure: set[tuple[str, int]] = field(default_factory=set)
     # variable -> every literal value assigned to it, with its 1-based assignment line
     literals: dict[str, list[tuple[str, int]]] = field(default_factory=dict)
     # functions whose braces do not pair (or whose body is a subshell): not read
@@ -204,6 +207,23 @@ def _function_spans(lines: list[str]) -> list[tuple[str, int, int | None]]:
     return out
 
 
+def _launch_token_quoting(line: str, tok: str) -> str:
+    """How ``line`` writes its launch token ``tok`` (as ``launched_command`` read it, quotes
+    removed): ``bare``, ``double`` (inside double quotes, so not word-split) or ``unknown`` (single
+    quotes, or the token cannot be found in the line as written)."""
+    try:
+        raw = shlex.split(line, posix=False)
+    except ValueError:
+        return "unknown"
+    for t in raw:
+        if t.replace('"', "").replace("'", "").rstrip("&;") != tok:
+            continue
+        if "'" in t:
+            return "unknown"
+        return "double" if '"' in t else "bare"
+    return "unknown"
+
+
 def _scan_symbols(text: str) -> _SymbolTable:
     """One file's functions that run a positional parameter as their command, and its variables
     assigned a literal value — the same file only (``.`` / ``source`` are not followed)."""
@@ -213,7 +233,8 @@ def _scan_symbols(text: str) -> _SymbolTable:
         if end is None:
             table.unpaired += 1
             continue
-        positions: list[int] = []
+        # per positional parameter, how each line that launches it quotes the launch token
+        quoting: dict[int, set[str]] = {}
         for li in range(start, end + 1):
             s = lines[li].strip()
             if li == start:
@@ -227,13 +248,16 @@ def _scan_symbols(text: str) -> _SymbolTable:
                 m = _POSITIONAL.match(cand)
                 if m:
                     k = int(m.group(1) or m.group(2))
-                    positions.append(k)
+                    quoting.setdefault(k, set()).add(_launch_token_quoting(s, tok))
                     table.functions.setdefault(name, []).append((k, start + 1))
                     break
-        for k in positions:
-            quoted = re.compile(r'"[^"]*\$\{?' + str(k) + r'\}?[^"]*"')
-            if any(quoted.search(lines[li]) for li in range(start, end + 1)):
+        # Only the launch token's own quoting counts: a "... $1 ..." elsewhere in the body (a log
+        # line, a test) says nothing about how the line that RUNS $1 splits it.
+        for k, kinds in quoting.items():
+            if kinds == {"double"}:
                 table.quoted.add((name, k))
+            elif kinds != {"bare"}:
+                table.unsure.add((name, k))
     for li, raw in enumerate(lines):
         m = _LITERAL_ASSIGN.match(raw.strip())
         if m:
@@ -358,10 +382,15 @@ def _launches_from_line(line: str, symtab: _SymbolTable, lineno: int) -> list[_L
                     continue
                 # An unquoted "$1" is word-split by the shell, so it runs the argument's first
                 # word; a quoted one runs the whole argument as one name — and a name with a space
-                # in it is no binary's (its last path segment is not the command).
-                if (lit, k) not in symtab.quoted:
+                # in it is no binary's (its last path segment is not the command). Launch lines
+                # that quote it differently leave a spaced argument with no one reading: not read.
+                spaced = any(ch.isspace() for ch in arg)
+                if (lit, k) in symtab.unsure:
+                    if spaced:
+                        continue
+                elif (lit, k) not in symtab.quoted:
                     arg = arg.split()[0]
-                elif any(ch.isspace() for ch in arg):
+                elif spaced:
                     continue
                 out.append(_Launch(arg.rsplit("/", 1)[-1], "function_arg", defline))
     if lit:
