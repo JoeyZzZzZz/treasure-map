@@ -13,6 +13,7 @@ from click.testing import CliRunner
 
 from treasure_map.lib.setup import update as up
 from treasure_map.lib.setup.discover import RunResult
+from treasure_map.version import __version__
 
 from . import fakes
 
@@ -175,7 +176,8 @@ def test_a_failed_install_puts_the_current_version_back(
     uv = _Uv(tools, _LISTING, fail="tmap-agents==0.2.0")
     out, code, execs = _cli(monkeypatch, tmp_path, uv, ["--yes"], "0.2.0")
     assert code == 1 and execs == [] and "put back" in out
-    assert uv.calls[-1][-1] == "tmap-agents==0.1.0"
+    # the version running now — the one a failed update must leave installed
+    assert uv.calls[-1][-1] == f"tmap-agents=={__version__}"
 
 
 def test_up_to_date_and_nothing_old_means_nothing_runs(
@@ -183,8 +185,8 @@ def test_up_to_date_and_nothing_old_means_nothing_runs(
 ) -> None:
     tools = tmp_path / "tools"
     (tools / "tmap-agents").mkdir(parents=True)
-    uv = _Uv(tools, "tmap-agents v0.1.0\n- tmap\n")
-    out, code, execs = _cli(monkeypatch, tmp_path, uv, ["--yes"], "0.1.0")
+    uv = _Uv(tools, f"tmap-agents v{__version__}\n- tmap\n")
+    out, code, execs = _cli(monkeypatch, tmp_path, uv, ["--yes"], __version__)
     assert "up to date" in out and code == 0 and execs == []
 
 

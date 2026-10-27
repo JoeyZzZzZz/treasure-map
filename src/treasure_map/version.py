@@ -9,7 +9,7 @@ import re
 from importlib.metadata import Distribution, distribution
 
 # The one place the version is written: pyproject.toml reads it from here (dynamic version).
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 # The explicit "we could not confirm which version produced this" sentinel for any recorded
 # analysis-tool version. It is a VALUE, never None: a missing/undetectable version must stay
