@@ -19,6 +19,7 @@ ANCHORS. A judgement is keyed by an anchor that names its subject, not its posit
     {run_a}::{run_b}#function_presence#{binary}::{side}:{addr}
     {run_a}::{run_b}#candidate#{subject_key}
     {run_a}::{run_b}#non_binary#{path}
+    {run_a}::{run_b}#binary_presence#{a_only|b_only}:{path}
 
 ``binary`` is the diff's short binary name (diff_meta.binary_a): two binaries of one run pair can
 hold a function at the same address, and without it their entries would share one judgement. A
@@ -30,6 +31,11 @@ only ever matched whole, never split.
 A ``non_binary`` anchor names one non-binary file of the run pair by its path (lib/query/file_diff).
 It belongs to no binary diff: ``belongs_to`` is False for it, so a binary diff's view never reads
 it, and it is read on its own path (file_diff.file_review) against the pair's file comparison.
+
+A ``binary_presence`` anchor names a binary held by one run of the pair only — in neither the other
+run's binaries, nor its non-binary files, nor its symlinks — by its side and its path under the
+firmware root (lib/query/binary_presence). Like a file, it belongs to no binary diff and is read
+on its own path (binary_presence.presence_review) against the pair.
 
 THE BASIS is the entry's own diff facts at write time — for a pair its alignment state,
 similarity, export gaps, bucket and the (a_ref, b_ref, presence, reason, counterpart call) of every
@@ -63,9 +69,11 @@ from treasure_map.lib.query.sink_overlay import _subject_key
 if TYPE_CHECKING:  # typing only — patch_view imports this module
     from treasure_map.lib.query.patch_view import _Entry
 
-SUBJECT_KINDS = ("function_pair", "function_presence", "candidate", "non_binary")
+SUBJECT_KINDS = ("function_pair", "function_presence", "candidate", "non_binary", "binary_presence")
 STATES = (UNSEEN, OPEN, CONCLUDED, NEEDS_RELABEL, NEEDS_RECHECK)
-BUCKET_ORDER = ("A", "B", "C", "R", "P", "E")
+BUCKET_ORDER = ("A", "B", "C", "R", "P", "E", "S")
+# The two sides a binary_presence anchor names (a binary in run A only, or in run B only).
+PRESENCE_SIDES = ("a_only", "b_only")
 
 # The basis states a judgement on a diff entry can read with. Only ``unchanged`` leaves its review
 # state to the verdict; ``anchor_unresolved`` is what dangling means.
@@ -108,6 +116,24 @@ def candidate_anchor(run_a: str, run_b: str, subject_key: str) -> str:
 
 def non_binary_anchor(run_a: str, run_b: str, path: str) -> str:
     return f"{run_pair(run_a, run_b)}#non_binary#{path}"
+
+
+def binary_presence_anchor(run_a: str, run_b: str, side: str, rel_path: str) -> str:
+    """The anchor of a binary held by one run of the pair only: ``side`` is ``a_only`` or
+    ``b_only``, ``rel_path`` its path under that run's firmware root."""
+    return f"{run_pair(run_a, run_b)}#binary_presence#{side}:{rel_path}"
+
+
+def is_binary_presence_anchor(anchor_ref: str) -> bool:
+    """Whether ``anchor_ref`` is shaped as a binary_presence anchor (of any run pair): the subject
+    kind sits between the first two ``#`` and the key starts with a side."""
+    _pair, sep, rest = anchor_ref.partition("#")
+    kind, sep2, key = rest.partition("#")
+    return (
+        bool(sep and sep2)
+        and kind == "binary_presence"
+        and key.startswith(tuple(f"{side}:" for side in PRESENCE_SIDES))
+    )
 
 
 def entry_anchor(e: _Entry, run_a: str, run_b: str, binary: str) -> str:
@@ -216,6 +242,17 @@ def non_binary_subjects_of(
     return {
         non_binary_anchor(run_a, run_b, path): Subject("non_binary", facts)
         for path, facts in facts_by_path.items()
+    }
+
+
+def binary_presence_subjects_of(
+    facts_by_key: dict[tuple[str, str], dict[str, Any]], run_a: str, run_b: str
+) -> dict[str, Subject]:
+    """anchor -> subject, for every binary held by one run of the pair only, keyed by (side,
+    rel_path); the facts are lib/query/binary_presence's ``subject_facts`` of each."""
+    return {
+        binary_presence_anchor(run_a, run_b, side, rel): Subject("binary_presence", facts)
+        for (side, rel), facts in facts_by_key.items()
     }
 
 

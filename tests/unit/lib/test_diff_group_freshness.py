@@ -265,6 +265,27 @@ def test_both_read_paths_agree_on_the_state_after_a_member_moves(world: World) -
     assert _overlay(world, anchor)["basis_moved"]["group"]["changed"] >= 1
 
 
+def test_a_member_entering_bucket_s_moves_the_group(world: World) -> None:
+    """A member's pair starting to read differs puts its entry in bucket S, which is listed: the
+    group a judgement leaned on moved (its member now reads listed), so the judgement reads
+    needs_recheck in both read paths — it read concluded before.
+
+    MUTATION (verified RED, 1 failed): read a member fact's ``listed`` as ``bool(bucket)`` -> the
+    group does not move -> RED."""
+    anchor = _entry_anchor(world, "00001000")
+    _annotate(world, anchor, _group_ref(world, LISTED))
+    assert _state_in_view(world, anchor) == "concluded"
+    for side, addr, text in (("a", "00003000", "x = f(1);"), ("b", "00004000", "x = f(2);")):
+        world.adb[side].execute(
+            "UPDATE functions SET pseudocode = ? WHERE address = ?", (text, addr)
+        )
+    world.commit()
+    pv._clear_view_caches()
+    assert _state_in_view(world, anchor) == "needs_recheck"
+    assert _overlay(world, anchor)["review_state"] == "needs_recheck"
+    assert _overlay(world, anchor)["basis_moved"]["group"]["changed"] >= 1
+
+
 # ── a move is a move: landing, join, leave, fingerprint ───────────────────────────────────────
 
 
@@ -531,6 +552,7 @@ def test_a_readable_member_fact_writes_unreadable_null_not_a_missing_key() -> No
     class _View:
         def __init__(self) -> None:
             self.bucket = "A"
+            self.listed = True  # patch_view._Entry.listed: its own bucket (or S) lists it
             self.pair = type("P", (), {"similarity": 0.5466})()
 
     st = ss._State(

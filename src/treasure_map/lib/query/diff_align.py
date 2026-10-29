@@ -19,8 +19,10 @@ annotations, an ``layer_changed`` is not 'this matters', and an empty result is 
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any
 
 from treasure_map.lib.diff.code_version import diff_code_version, export_code_hash
@@ -761,6 +763,9 @@ def get_diff_meta(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any]:
     from treasure_map.lib.query.patch_view import anchored_differs_banner, function_states
 
     meta = dict(zip(_META_COLS, row, strict=True))
+    runs = atlas.execute(
+        "SELECT run_a_id, run_b_id FROM diff_meta WHERE diff_id = ?", (diff_id,)
+    ).fetchone()
     functions = function_states(atlas, diff_id)
     if functions is not None and functions.get("withheld") and not meta["diff_ok"]:
         functions["blind_spot"] = "did_not_diff"
@@ -775,8 +780,31 @@ def get_diff_meta(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any]:
         "meta": meta,
         "functions": functions,
         "banners": banners,
+        "binary_presence": binary_presence_counts(atlas, *runs) if runs is not None else None,
         **diff_source_staleness(atlas, diff_id),
         "note": _META_NOTE,
+    }
+
+
+def binary_presence_counts(
+    atlas: sqlite3.Connection, run_a: str | None, run_b: str | None
+) -> dict[str, Any] | None:
+    """Per side of the diff's run pair: the binaries that run holds alone
+    (lib/query/binary_presence), their candidates, and how many have no judgment yet — with where
+    they are listed. None when the diff names no run pair."""
+    if not run_a or not run_b:
+        return None
+    from treasure_map.lib.query import binary_presence as bp
+
+    presence = bp.find_presence(atlas, run_a, run_b)
+    judged = bp.presence_review(atlas, presence, source_stale=None, source_stale_reason=None)
+    pair = json.dumps(f"{run_a}::{run_b}")
+    return {
+        **bp.presence_counts(presence, judged),
+        "listed_in": (
+            f'list_overlays(anchor_kind="diff_subject", run_id={pair}) review_progress.'
+            "binary_presence, or list_diffs(run_a, run_b) coverage.binary_presence"
+        ),
     }
 
 
@@ -961,22 +989,35 @@ def run_pair_coverage(
     """What the diffs of one run pair cannot see, beside their counts: the diffs that failed, and
     the candidate-holding binaries no diff covers — the genuine blind spots (one side only, or
     shadowed by a same-named binary that was diffed) apart from the binaries byte-identical in both
-    runs, which needed no diff and are only a pointer to the scan's candidate map.
-    ``all_candidate_binaries_covered`` is false while a failed diff or a genuine blind spot
-    remains; an identical binary never makes it false."""
-    blind, identical = split_not_diffed(not_diffed_binaries(atlas, run_a, run_b))
+    runs, which needed no diff and are only a pointer to the scan's candidate map — and the binaries
+    held by one run only (``binary_presence``, lib/query/binary_presence: the other run holds no
+    binary, file or symlink like them), taken out of the blind spots as subjects of their own.
+    ``all_candidate_binaries_covered`` is false while a failed diff, a genuine blind spot or a
+    binary_presence binary remains (none of those has a diff to cover it); an identical binary
+    never makes it false."""
+    from treasure_map.lib.query import binary_presence as bp
+
+    groups = not_diffed_groups(atlas, run_a, run_b)
+    presence = bp.find_presence(atlas, run_a, run_b, groups)
+    blind, identical = split_not_diffed(
+        not_diffed_binaries(atlas, run_a, run_b, exclude=presence.excluded, groups=groups)
+    )
+    judged = bp.presence_review(atlas, presence, source_stale=None, source_stale_reason=None)
     failed = [d["diff_id"] for d in diffs if not d["diff_ok"]]
     return {
         "failed_diffs": failed,
         "not_diffed_binaries": blind,
         "identical_binaries": identical,
-        "all_candidate_binaries_covered": not failed and not blind,
+        "binary_presence": bp.presence_block(presence, judged),
+        "all_candidate_binaries_covered": not failed and not blind and not presence.items,
         "see": (
             "list_diff_blindspots for the failed diffs. identical_binaries are byte-identical in "
             f"both runs, so no diff covers them and none can show what is in them — their "
             f"candidates are on the scan's candidate map: list_candidates(run_id={run_b!r}). "
             "get_diff_sink_overlay's binary_not_diffed rows still include those identical "
-            "binaries; this split is the one to read as blind spots."
+            "binaries; this split is the one to read as blind spots. binary_presence: no diff can "
+            "cover a binary one run holds alone, so it keeps all_candidate_binaries_covered "
+            "false; its review is done through its own judgment (annotate_diff with run_pair)."
         ),
     }
 
@@ -1091,15 +1132,21 @@ def not_diffed_reason(
     return "binary_not_diffed"
 
 
-def not_diffed_binaries(atlas: sqlite3.Connection, run_a: str, run_b: str) -> dict[str, Any]:
-    """The binaries holding candidates that no diff of the pair covers, read straight from the atlas
-    — diff_meta for what was diffed, instance for every candidate — WITHOUT recomputing the pair's
-    sink overlay (which rebuilds every diff; this reads the same set, by content hash).
+@dataclass
+class NotDiffedBinary:
+    """One candidate-holding binary no diff of a pair covers: its content hash, its candidates'
+    evidence_refs, and those refs by sink class."""
 
-    Per side and reason: how many binaries (by path), how many candidates, and every binary's short
-    name. A candidate whose binary content is present on the OTHER side too is identical across the
-    pair and reads as ``identical_both_sides``, kept apart from the two genuine blind-spot reasons
-    (``binary_not_diffed``, ``shadowed_by_name_collision``) so it never counts as one."""
+    sha: str | None
+    refs: set[str]
+    by_class: dict[str, set[str]]
+
+
+def not_diffed_groups(
+    atlas: sqlite3.Connection, run_a: str, run_b: str
+) -> dict[str, dict[str, dict[str | None, NotDiffedBinary]]]:
+    """side -> reason -> binary path -> the binary, for every candidate-holding binary no diff of
+    the pair covers (the per-binary detail :func:`not_diffed_binaries` counts)."""
     diffs = atlas.execute(
         "SELECT sha256_a, sha256_b, binary_a, binary_b FROM diff_meta "
         "WHERE run_a_id = ? AND run_b_id = ?",
@@ -1115,15 +1162,16 @@ def not_diffed_binaries(atlas: sqlite3.Connection, run_a: str, run_b: str) -> di
         }
         for side, run in (("a", run_a), ("b", run_b))
     }
-    out: dict[str, Any] = {}
+    out: dict[str, dict[str, dict[str | None, NotDiffedBinary]]] = {}
     for side, run, sha_col, name_col in (("a", run_a, 0, 2), ("b", run_b, 1, 3)):
         diffed_sha = {d[sha_col] for d in diffs if d[sha_col]}
         diffed_names = {d[name_col] for d in diffs if d[name_col]}
         other_shas = run_shas["b" if side == "a" else "a"]
-        groups: dict[str, dict[str, set[str | None]]] = {}
-        for ref, sha, path in atlas.execute(
-            "SELECT evidence_ref, binary_content_hash, binary_path FROM instance "
-            "WHERE source_run_id = ?",
+        groups: dict[str, dict[str | None, NotDiffedBinary]] = {}
+        for ref, sha, path, sink_class in atlas.execute(
+            "SELECT i.evidence_ref, i.binary_content_hash, i.binary_path, p.sink_class "
+            "FROM instance i LEFT JOIN pattern p ON p.pattern_id = i.pattern_id "
+            "WHERE i.source_run_id = ?",
             (run,),
         ):
             if sha is not None and sha in diffed_sha:
@@ -1131,14 +1179,47 @@ def not_diffed_binaries(atlas: sqlite3.Connection, run_a: str, run_b: str) -> di
             reason = not_diffed_reason(
                 sha, _short_name(path), diffed_names=diffed_names, other_shas=other_shas
             )
-            g = groups.setdefault(reason, {"refs": set(), "paths": set()})
-            g["refs"].add(ref)
-            g["paths"].add(path)
-        for reason, g in sorted(groups.items()):
+            b = groups.setdefault(reason, {}).get(path)
+            if b is None:
+                b = groups[reason][path] = NotDiffedBinary(sha, set(), {})
+            b.refs.add(ref)
+            if sink_class:
+                b.by_class.setdefault(sink_class, set()).add(ref)
+        out[side] = groups
+    return out
+
+
+def not_diffed_binaries(
+    atlas: sqlite3.Connection,
+    run_a: str,
+    run_b: str,
+    *,
+    exclude: frozenset[tuple[str, str | None]] = frozenset(),
+    groups: dict[str, dict[str, dict[str | None, NotDiffedBinary]]] | None = None,
+) -> dict[str, Any]:
+    """The binaries holding candidates that no diff of the pair covers, read straight from the atlas
+    — diff_meta for what was diffed, instance for every candidate — WITHOUT recomputing the pair's
+    sink overlay (which rebuilds every diff; this reads the same set, by content hash).
+
+    Per side and reason: how many binaries (by path), how many candidates, and every binary's short
+    name. A candidate whose binary content is present on the OTHER side too is identical across the
+    pair and reads as ``identical_both_sides``, kept apart from the two genuine blind-spot reasons
+    (``binary_not_diffed``, ``shadowed_by_name_collision``) so it never counts as one. ``exclude``
+    takes (side, binary path) pairs out — the binaries lib/query/binary_presence shows the other run
+    holds nothing like, which are subjects of their own rather than blind spots. ``groups`` is
+    :func:`not_diffed_groups`' result when the caller holds it."""
+    if groups is None:
+        groups = not_diffed_groups(atlas, run_a, run_b)
+    out: dict[str, Any] = {}
+    for side in ("a", "b"):
+        for reason, by_path in sorted(groups.get(side, {}).items()):
+            kept = {p: b for p, b in by_path.items() if (side, p) not in exclude}
+            if not kept:
+                continue
             out.setdefault(side, {})[reason] = {
-                "binaries": len(g["paths"]),
-                "candidates": len(g["refs"]),
-                "names": sorted({_short_name(p) or "(no path recorded)" for p in g["paths"]}),
+                "binaries": len(kept),
+                "candidates": len({r for b in kept.values() for r in b.refs}),
+                "names": sorted({_short_name(p) or "(no path recorded)" for p in kept}),
             }
     return out
 

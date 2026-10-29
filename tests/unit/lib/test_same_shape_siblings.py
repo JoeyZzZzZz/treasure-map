@@ -358,6 +358,28 @@ def _group(w: World, ref: str, **kw: Any) -> dict[str, Any]:
     return out
 
 
+def test_a_member_in_a_bucket_s_entry_is_listed_with_its_entry(world: World) -> None:
+    """A member whose similarity-1 pair reads differs is in a bucket S entry, which the view lists:
+    the member reads listed, names its entry_id / row_ref / candidate_anchor, and no longer counts
+    as not listed (the same reading as get_diff_patch_view).
+
+    MUTATION (verified RED, 1 failed): read ``listed`` as ``bool(e.bucket)`` again -> the S member
+    reads not listed -> RED."""
+    for side, addr, text in (("a", "00003000", "x = f(1);"), ("b", "00004000", "x = f(2);")):
+        world.adb[side].execute(
+            "UPDATE functions SET pseudocode = ? WHERE address = ?", (text, addr)
+        )
+    world.commit()
+    g = _group(world, LISTED)
+    assert g["not_listed_sim1"] == 2
+    by_ref = {m["evidence_ref"]: m for m in _members(world, LISTED)}
+    s_member = by_ref[UNLISTED[0]]
+    assert s_member["listed"] is True
+    assert s_member["entry_id"] == "pair:00003000:00004000"
+    assert s_member["row_ref"] == UNLISTED[0]
+    assert [by_ref[r]["listed"] for r in UNLISTED[1:]] == [False, False]
+
+
 # ── the shape ────────────────────────────────────────────────────────────────────────────────
 
 

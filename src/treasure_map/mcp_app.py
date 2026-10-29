@@ -353,6 +353,7 @@ _AXES_PAGE_BUDGET = {"withheld": "page_budget", "read_with": "entry_id + rows_of
 _START_META_KEYS = (
     "functions",
     "banners",
+    "binary_presence",
     "source_stale",
     "source_stale_reason",
     "toolchain_checked",
@@ -555,7 +556,10 @@ _AGENT_INSTRUCTIONS = (
     "verdict=changed_real|no_real_change|change_inconclusive, rationale, diff_id=...) records a "
     "judgment on one entry, promote(diff_id, entry_id, row_ref, verdict, rationale) carries it "
     "onto one of the entry's candidates, and list_overlays(anchor_kind='diff_subject', "
-    "run_id='<run_a>::<run_b>') reviews them. Every tool's first line lists its required "
+    "run_id='<run_a>::<run_b>') reviews them. Unread is not 'nothing found': read every P entry, "
+    "attention-1 entry with a lift_basis, bucket S entry, binary_presence binary and every "
+    "candidate row of a function; sink_candidate_counts counts hunt candidates (unknown is not "
+    "'no change'). Every tool's first line lists its required "
     "parameters; get_tool_reference(name) returns a tool's full description, "
     'get_tool_reference(name="guide") the full guide, get_tool_reference(name="parameters") the '
     "parameter-name table."
@@ -2115,7 +2119,13 @@ def make_tools(
         ``read_next``: the call that reads one entry in full (``one_entry``) and, when the
         summary has more entries, the call for the next page (``more``). ``non_binary``: the run
         pair's non-binary file counts by kind and the get_file_diff call that lists them — not part
-        of this diff's entries or of its review progress.
+        of this diff's entries or of its review progress. ``meta.binary_presence``: the binaries
+        one run of the pair holds alone, per side, with how many carry no judgment yet.
+
+        An entry nobody judged is UNREAD, which is not "nothing found": the view's first page is
+        where reading starts, not where it ends. Read the P entries, every attention-1 entry with
+        a ``lift_basis``, every bucket S entry and each ``binary_presence`` binary (judged with
+        annotate_diff(..., run_pair=...)), and in an entry every candidate row of the function.
 
         The response keeps to the byte budget (~48KB) at every ``limit``: the view page gets the
         bytes the other blocks leave and is cut there as get_diff_patch_view cuts a page
@@ -2230,10 +2240,13 @@ def make_tools(
         either side (``no_sink_candidate_unchecked`` when the callee lists could not be read);
         ``P`` = a function with no counterpart; ``E`` = a similarity-1 pair whose function has a
         direct caller on the A side and none found (or none provable) on the B side — a caller-set
-        edge (``callers_a`` / ``callers_b``) similarity is blind to. A similarity-1 pair whose
-        candidates line up, or that has none, is not listed UNLESS a length constant changed or its
-        caller-set edge reads lost-or-undetermined (then E); the rest are counted under
-        ``not_listed`` by ``pseudocode_sameness`` (below).
+        edge (``callers_a`` / ``callers_b``) similarity is blind to. ``S`` = an aligned similarity-1
+        pair that places no other bucket and whose normalized pseudocode differs (subclass
+        ``aligned_pseudocode_differs``: similarity is blind to the change). A similarity-1 pair
+        whose candidates line up, or that has none, is listed only when a length constant changed,
+        its caller-set edge reads lost-or-undetermined (then E) or its pseudocode differs (then
+        S); the rest are counted under ``not_listed`` by ``pseudocode_sameness`` (below). Bucket S
+        is decided by the view (it reads pseudocode); a judgment's basis reads its bucket as none.
 
         Order: with no ``sort_by`` the page is in the ``significance`` order (below);
         ``lens.sort_by`` names the order a page is in (``anchored_differs=true`` with no
@@ -2242,26 +2255,32 @@ def make_tools(
         candidates' sink-impact tier — then R, B, E in that order), then the entries with no
         candidate (recall_gap_sink, R, C, then E by caller relevance: a callee the hunt does not
         recall as a sink, then a callee that itself holds a candidate, then the rest), then P;
-        each entry's ``rank_key`` (``detail='full'``) names the components. In the significance
+        each entry's ``rank_key`` (``detail='full'``) names the components. Bucket S follows E in
+        both halves, and inside B an aligned ``sink_callee_swap`` sorts with
+        ``sink_presence_signal``. In the significance
         order an E lane reads first
         the functions no other B function names (``b_other_fn_mentions`` false) — that key never
         enters the candidate_tier order or ``rank_key``. ``sort_by``: ``candidate_tier``, or
         ``tier`` / ``similarity`` / ``address`` (each puts that one component ahead of the
         candidate_tier order), or ``significance``. The significance order is a lens, not a
-        relabel: attention 0 = bucket A or a row carrying ``sink_arg_constant_delta``; 2 (sunk,
-        still listed) = pseudocode_sameness ``identical`` or bucket C, except a bucket C entry
-        carrying a narrow ``sink_callee_swap`` (basis ``sink_callee_swap_never_sunk``; a wide one
-        still sinks); 1 = the
-        rest, lowest similarity first, R and B entries ordered together — the entries carrying a
-        narrow ``sink_callee_swap`` first inside it (``rank_key.sink_callee_swap`` = 1; their
-        basis stays their own), then the ``anchored_differs`` pairs at or above the read-first
-        floor, then those below it (and the demoted ``__FILE__``/``__LINE__`` and micro-side
-        pairs), then the rest. Attention 0 holds
-        B entries too (a row's ``sink_arg_constant_delta``) beside A. Never sunk: an R entry
+        relabel: attention 0 = bucket A, a row carrying ``sink_arg_constant_delta``, then an
+        ALIGNED pair (never an R entry) whose callee-set difference holds a sink name (basis
+        ``sink_callee_swap`` — narrow or wide, either side, whatever its judgment) or whose
+        ``sink_candidate_counts`` has a delta (basis ``sink_candidate_counts``); 2 (sunk, still
+        listed) = pseudocode_sameness ``identical`` or bucket C (a C entry with an aligned swap
+        floats instead; the basis ``sink_callee_swap_never_sunk`` is no longer produced); 1 = the
+        rest, lowest similarity first, R and B entries ordered together — the entries with a
+        ``lift_basis`` first inside it (``rank_key.sink_callee_swap`` = 1, ``lift_basis``
+        ``sink_callee_swap`` / ``sink_candidate_counts``: an R entry's proposed swap or count
+        delta, with ``swap_pairing_note``; their basis stays their own), then the
+        ``anchored_differs`` pairs at or above the read-first floor, then those below it (and the
+        demoted ``__FILE__``/``__LINE__`` and micro-side pairs), then the rest. Attention 0 holds
+        B entries too (a row's ``sink_arg_constant_delta``) beside A. An aligned swap or count
+        delta floats C and S entries there as well. Never sunk: an R entry
         (attention 2 never holds one; one whose proposed reading is ``identical_unique`` closes
         attention 1), a ``sink_present_no_visible_delta`` B (labelled
-        ``recheckable_no_visible_delta``), an ``identical_text_unverified`` entry outside bucket
-        C, a bucket C entry with a narrow ``sink_callee_swap``, a bucket E entry or any entry whose
+        ``recheckable_no_visible_delta``), an S entry (``aligned_pseudocode_differs``), an
+        ``identical_text_unverified`` entry outside bucket C, a bucket E entry or any entry whose
         B side lost every direct caller (caller-set edge: basis
         ``lost_every_direct_caller_never_sunk``, or ``caller_signal_undetermined_never_sunk`` for an
         E whose B side could not be proven empty), and an entry judged changed_real,
@@ -2271,7 +2290,8 @@ def make_tools(
         ``lens.sunk_with_body_size_differs`` counts the sunk ones whose body byte counts differ,
         with the ``body`` filter that lists them, counted over the entries the current filters
         keep.
-        Each entry then carries ``significance`` (its tier and why) — never a verdict. Filters:
+        Each entry then carries ``significance`` (its tier and why) — never a verdict. It also
+        carries ``lift_basis`` (null unless it leads attention 1). Filters:
         ``bucket``, ``subclass`` (an entry's or any of its rows'), ``tier`` (a number, ``no_sink``
         or ``unknown``), ``blind_spot`` (a key of the ``blind_spots`` ledger — page through the
         entries it covers). Page with ``limit``
@@ -2310,7 +2330,9 @@ def make_tools(
         gate counts or why it is withheld), ``guard_scan`` without ``shown_rule``,
         ``hidden_region`` (body, marker count), ``bodies`` (each side's status and size),
         ``entry_words`` (its delta and each side's state, reason, count, count_by_class and
-        may_be_incomplete, no word; the envelope's ``entry_words_counts`` is on every page). An
+        may_be_incomplete, no word; the envelope's ``entry_words_counts`` is on every page). It
+        keeps ``lift_basis`` and ``swap_pairing_note`` too, and ``sink_candidate_counts`` as its
+        pairing, its whole delta and ``unknown: {n, reasons}``. An
         undetermined pair's reading comes as ``proposed_pair_summary``, with its
         anchored_differs / anchor / in_read_first / demoted on the entry, and an anchored
         micro-side pair carries ``anchored_micro_side: true``. A summary's ``facts`` also leave out
@@ -2327,6 +2349,18 @@ def make_tools(
         (``offset`` must be 0); ``string_edge`` rows are unchanged. ``detail`` here is ``full`` /
         ``summary``; get_diff_sink_overlay's ``detail`` is ``summary`` / ``rows`` — a different
         switch.
+
+        Bucket S entries count in ``review_progress`` like any entry, and each ``binary_presence``
+        binary in its run pair's progress, so a diff or run pair that read complete before may read
+        not complete now; the judgments already written are unchanged.
+
+        Reading a diff through: an entry nobody has opened is UNREAD, which is not "nothing found"
+        — only a judgment (annotate_diff) moves it. Read every P entry, every attention-1 entry
+        with a ``lift_basis``, every bucket S entry, and each ``binary_presence`` binary of the run
+        pair (get_diff_meta / start_diff_review ``meta.binary_presence``; judged with
+        ``run_pair``); in an entry, walk every candidate row of the function (``rows_total``, page
+        with ``entry_id`` + ``rows_offset``), not only the first. ``sink_candidate_counts`` counts
+        hunt candidates, and an ``unknown`` there is not "no change".
 
         Every page carries the counts, ``blind_spots``, ``legend`` and ``caveats``. The long texts
         that are the same on every page of a scope — ``lens.order`` and the filter texts,
@@ -2351,7 +2385,18 @@ def make_tools(
         identified part), and ``narrow`` (read in full and at most two names on either side;
         ``not_narrow`` says why not). Only the hunt's sink names count, and the field is absent
         whenever no sink is in the difference OR no difference could be read — absent is not "no
-        sink changed". It moves an entry only in the significance order.
+        sink changed". It moves an entry only in the significance order. An aligned one floats it
+        to attention 0, a proposed one lifts it inside attention 1 (``swap_pairing_note``: not
+        floated until the pairing is corroborated). ``sink_candidate_counts`` (on a pair whose
+        functions hold candidates): per sink name, how many hunt candidates each function holds —
+        ``unit`` says it: callsite / wrapper_callsite keys, NOT every call of the name, so 0 means
+        "no such candidate there", never "no such call". ``delta`` lists the sinks both sides count
+        and count differently; ``unknown`` the side / sink pairs that cannot be counted, with why
+        (``side_unreadable``, ``function_not_in_scan_inventory``, ``granularity_not_per_call`` —
+        that sink has a function-level key there —, ``sink_ambiguous`` — a candidate whose sink
+        name is unreadable, ``sink: null`` when no sink of that side is named). An ``unknown`` is
+        not "no change". Counted over every candidate the function holds, whichever entry its row
+        sits in; an aligned delta floats the entry like a swap, a proposed one lifts it.
 
         Two signals BinDiff similarity is blind to, on the function-pair view: each aligned entry
         carries ``pseudocode_sameness`` — ``identical`` (address-normalised pseudocode AND callees
@@ -2367,7 +2412,9 @@ def make_tools(
         decompile, an unrecorded size or an unreadable analysis.db; get_diff_meta's
         functions.unavailable_by_cause splits these two states by why);
         the similarity-1 pairs that place no entry are counted by it under ``not_listed``
-        (``not_listed_page=<name>`` walks one category, e.g. ``aligned_pseudocode_differs``). A
+        (``not_listed_page=<name>`` walks one category), except those reading ``differs``, which
+        are listed as bucket S — their category keeps a count of 0 with ``listed_as``, and its page
+        is empty and names ``bucket="S"``. A
         qualified match carries ``hidden_region``: each decompiler warning with the address it
         names and whether that lies in the function's own body, ``body`` (``structure_differs``
         when the byte counts differ, else ``unknown`` — never ``identical``), the byte counts,
@@ -2892,7 +2939,14 @@ def make_tools(
         ``source_stale`` / ``source_stale_reason``: whether the diff still describes what it was
         computed from (true / null = unverified / false; reasons in list_diffs). ``non_binary``:
         the run pair's non-binary file counts by kind (``counts_by_kind``) and the get_file_diff
-        call that lists them."""
+        call that lists them. ``binary_presence``: per side (``a_only`` / ``b_only``) of the run
+        pair, the binaries that run holds alone — the other holds no binary, non-binary file or
+        symlink like them, so no diff can cover them — with their candidates and how many carry no
+        judgment yet (``not_looked_at``); each is a subject of its own, listed where
+        ``listed_in`` says and judged with annotate_diff(..., run_pair=...).
+        ``functions.changed`` also counts the pairs carrying a ``sink_callee_swap`` (by pairing and
+        by side), a ``sink_candidate_counts`` delta or unknown, and ``listed_as_s`` — the aligned
+        similarity-1 pairs listed as bucket S."""
         conn = open_atlas(atlas_path)
         try:
             refusal = _refuse_stale_diff(conn, diff_id)
@@ -3315,7 +3369,9 @@ def make_tools(
         Run-aware: pass ``run_id`` (or an ``evidence_ref`` that supplies run + binary). ``value``
         searches string CONTENT and returns each hit with its address + owning binary (one-call
         locate); reference-site (which function uses a string) is not indexed — the result says so
-        honestly. Large results are paged LOSSLESSLY by byte size under
+        honestly. Its note names get_functions_referencing_string (the functions whose pseudocode
+        holds the text) and get_string_reference_anchors (the recorded reference anchors of an
+        exact value), which answer that. Large results are paged LOSSLESSLY by byte size under
         ``paging``: pass ``offset`` = ``paging.next_offset`` to page the tail (never summarized).
         HONEST BOUND: a binary's string export is capped, so results carry ``truncated`` / ``total``
         (by-binary) or ``search_may_be_incomplete`` (by-value) when a scanned binary was capped — a
@@ -3785,7 +3841,13 @@ def make_tools(
         file's ``anchor_ref`` (``{run_a}::{run_b}#non_binary#{path}``, printed by get_file_diff)
         takes ``run_pair`` — any two runs, with or without a binary diff — or the ``diff_id`` of a
         binary diff of the same pair; what it rests on is the file's change, kind, two sha256
-        values and structured counts. A file takes no ``group_ref`` and cannot be promoted.
+        values and structured counts. A file takes no ``group_ref`` and cannot be promoted. A
+        binary one run of the pair holds alone has its ``anchor_ref``
+        (``{run_a}::{run_b}#binary_presence#{a_only|b_only}:{path}``, printed in
+        ``binary_presence`` by list_diffs coverage and list_overlays' run-pair progress) and takes
+        ``run_pair`` only (no binary diff covers it); it rests on its side, path, name, sha256,
+        candidates by sink class and recorded references, and its ``checked`` cites its own
+        anchor_ref or one of its candidates' evidence_ref in its own run.
 
         ``anchor_ref`` is the entry's ``anchor_ref`` as get_diff_patch_view prints it (a function
         pair, or a function with no counterpart), or a candidate row's
@@ -3887,9 +3949,11 @@ def make_tools(
 
         One ``diff_id`` (one binary's diff) for the whole batch; split across binaries into several
         calls. Or one ``run_pair`` (``{run_a}::{run_b}``) for a batch of non-binary files' anchors
-        (get_file_diff) — exactly one of the two. With ``diff_id``, a file anchor of the same run
-        pair may sit beside the function anchors. ``annotations`` is 1..200 items, each an object
-        with the same per-entry fields as annotate_diff and NO ``diff_id``: ``anchor_ref`` +
+        (get_file_diff) — exactly one of the two. A binary_presence anchor goes with ``run_pair``
+        too. With ``diff_id``, a file anchor of the same run pair may sit beside the function
+        anchors. ``annotations`` is
+        1..200 items, each an object with the same per-entry fields as annotate_diff and NO
+        ``diff_id``: ``anchor_ref`` +
         ``verdict``, optionally ``rationale`` (no_real_change defaults it to ``why_unchanged``),
         ``checked`` / ``why_unchanged`` (no_real_change), ``evidence`` (changed_real),
         ``group_ref``. Only those seven keys — a stray key fails that item, named.
@@ -3905,9 +3969,16 @@ def make_tools(
         from treasure_map.lib.overlay import (
             prepare_diff_annotation,
             prepare_file_annotation,
+            prepare_presence_annotation,
             write_prepared,
         )
-        from treasure_map.lib.query.diff_annotations import _binary_diff, _built, file_scope
+        from treasure_map.lib.query import diff_review as _dr
+        from treasure_map.lib.query.diff_annotations import (
+            _binary_diff,
+            _built,
+            file_scope,
+            presence_scope,
+        )
         from treasure_map.lib.query.same_shape_siblings import _meta as _side_meta
 
         if not isinstance(annotations, list) or not (1 <= len(annotations) <= 200):
@@ -3949,6 +4020,15 @@ def make_tools(
                     scope_cache.append(file_scope(atlas, diff_id=diff_id, run_pair=run_pair))
                 return scope_cache[0]
 
+            # the binaries one run of the pair holds alone, read once, only when an item names one
+            presence_cache: list[Any] = []
+
+            def presence() -> Any:
+                if not presence_cache:
+                    assert run_pair is not None
+                    presence_cache.append(presence_scope(atlas, run_pair))
+                return presence_cache[0]
+
             # the same anchor_ref more than once -> refuse the whole batch
             anchors_at: dict[str, list[int]] = {}
             for i, item in enumerate(annotations):
@@ -3982,7 +4062,24 @@ def make_tools(
                     rationale = _resolve_diff_rationale(
                         verdict, item.get("rationale"), item.get("why_unchanged")
                     )
-                    if _fd.is_non_binary_anchor(anchor_ref):
+                    if _dr.is_binary_presence_anchor(anchor_ref):
+                        if run_pair is None:
+                            raise ConfigError(
+                                f"{anchor_ref!r} names a binary one run of the pair holds alone, "
+                                "which no binary diff covers: pass run_pair ({run_a}::{run_b}) "
+                                "instead of diff_id"
+                            )
+                        p = prepare_presence_annotation(
+                            atlas,
+                            presence(),
+                            anchor_ref=anchor_ref,
+                            verdict=verdict,
+                            rationale=rationale,
+                            attributed_to="agent-via-mcp",
+                            verdict_basis=_diff_verdict_basis(item),
+                            group_ref=item.get("group_ref"),
+                        )
+                    elif _fd.is_non_binary_anchor(anchor_ref):
                         p = prepare_file_annotation(
                             atlas,
                             files_scope(),
@@ -3996,7 +4093,8 @@ def make_tools(
                     elif meta is None:
                         raise ConfigError(
                             f"{anchor_ref!r} is a function or candidate anchor: pass diff_id "
-                            "(list_diffs) — run_pair takes non-binary files' anchors only"
+                            "(list_diffs) — run_pair takes non-binary files' and binary_presence "
+                            "anchors only"
                         )
                     else:
                         assert diff_id is not None

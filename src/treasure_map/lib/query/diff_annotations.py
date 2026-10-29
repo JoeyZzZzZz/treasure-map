@@ -36,9 +36,16 @@ from treasure_map.lib.query.coverage import NEEDS_RECHECK
 from treasure_map.lib.query.diff_align import (
     list_diff_blindspots,
     not_diffed_binaries,
+    not_diffed_groups,
     split_not_diffed,
 )
-from treasure_map.lib.query.patch_view import BuiltDiff, ViewReview, _Entry, build_diff_view
+from treasure_map.lib.query.patch_view import (
+    BuiltDiff,
+    ViewReview,
+    _Entry,
+    build_diff_view,
+    listed_view,
+)
 
 # Where a candidate row has to land for its entry's judgement to be carried onto it. A row that
 # lands A, or persisted, or P as a function whose counterpart is established to be missing, says
@@ -109,6 +116,11 @@ def _check_anchor(anchor_ref: str, meta: dict[str, Any]) -> tuple[str, str]:
             f"({dr.run_pair(run_a, run_b)}#<subject>#<key>) — copy it from the entry's anchor_ref"
         )
     kind, key = parts
+    if kind == "binary_presence":
+        raise ConfigError(
+            f"{anchor_ref!r} names a binary one run of the pair holds alone, which no binary diff "
+            f"covers: pass run_pair={dr.run_pair(run_a, run_b)!r} instead of diff_id"
+        )
     named = dr.key_binary(kind, key)
     if kind != "candidate" and named != binary:
         raise ConfigError(
@@ -136,7 +148,8 @@ def capture_diff_basis_on(
     """``capture_diff_basis`` against an already-built view and ``_binary_diff`` meta — the batch
     builds both once and reuses them. Same anchor check, same refusal, same snapshot."""
     _check_anchor(anchor_ref, meta)
-    subjects = dr.subjects_of(built.entries, meta["run_a_id"], meta["run_b_id"], meta["binary_a"])
+    entries = listed_view(atlas, built).entries
+    subjects = dr.subjects_of(entries, meta["run_a_id"], meta["run_b_id"], meta["binary_a"])
     subject = subjects.get(anchor_ref)
     if subject is None:
         raise ConfigError(
@@ -197,12 +210,13 @@ def is_diff_anchor(
     from treasure_map.lib.query.diff_group_freshness import group_in_diff
 
     run_a, run_b, binary = meta["run_a_id"], meta["run_b_id"], meta["binary_a"]
+    entries = listed_view(atlas, built).entries
     if subjects is None:
-        subjects = dr.subjects_of(built.entries, run_a, run_b, binary)
+        subjects = dr.subjects_of(entries, run_a, run_b, binary)
     if entry_ids is None:
-        entry_ids = {e.entry_id for e in built.entries}
+        entry_ids = {e.entry_id for e in entries}
     if row_refs is None:
-        row_refs = {ref for e in built.entries for r in e.rows for ref in (r.a_ref, r.b_ref) if ref}
+        row_refs = {ref for e in entries for r in e.rows for ref in (r.a_ref, r.b_ref) if ref}
     parts = dr.split_anchor(item, run_a, run_b)
     if parts is not None and subjects.get(item) is not None:
         return parts[0]  # function_pair / function_presence / candidate
@@ -232,9 +246,10 @@ def require_checked_anchor(
     anchor must resolve in the view (else a named refusal), plain text is kept but does not count,
     and at least one anchor must resolve. ``field`` is the key name, for the message wording."""
     run_a, run_b, binary = meta["run_a_id"], meta["run_b_id"], meta["binary_a"]
-    subjects = dr.subjects_of(built.entries, run_a, run_b, binary)
-    entry_ids = {e.entry_id for e in built.entries}
-    row_refs = {ref for e in built.entries for r in e.rows for ref in (r.a_ref, r.b_ref) if ref}
+    entries = listed_view(atlas, built).entries
+    subjects = dr.subjects_of(entries, run_a, run_b, binary)
+    entry_ids = {e.entry_id for e in entries}
+    row_refs = {ref for e in entries for r in e.rows for ref in (r.a_ref, r.b_ref) if ref}
     hits = 0
     for i, raw in enumerate(items):
         item = raw.strip()
@@ -363,14 +378,15 @@ def require_file_checked_anchor(
 # ── promotion ──────────────────────────────────────────────────────────────────────────────
 
 
-def _entry(built: BuiltDiff, meta: dict[str, Any], entry_id: str) -> _Entry:
-    """The listed entry named by its entry_id, or by its anchor_ref."""
+def _entry(built: BuiltDiff, meta: dict[str, Any], entry_id: str, entries: list[_Entry]) -> _Entry:
+    """The listed entry named by its entry_id, or by its anchor_ref. ``entries`` is listed_view's
+    (bucket S included)."""
     if entry_id.split("#", 2)[1:2] == ["non_binary"]:
         raise ConfigError(
             "promote carries a judgment onto a candidate of a function entry; a non-binary file "
             "has no candidate rows"
         )
-    by_id = {e.entry_id: e for e in built.entries}
+    by_id = {e.entry_id: e for e in entries}
     if entry_id in by_id:
         return by_id[entry_id]
     if "#" in entry_id:
@@ -381,7 +397,7 @@ def _entry(built: BuiltDiff, meta: dict[str, Any], entry_id: str) -> _Entry:
                 "name the candidate with row_ref"
             )
         run_a, run_b, binary = meta["run_a_id"], meta["run_b_id"], meta["binary_a"]
-        for e in built.entries:
+        for e in entries:
             if dr.entry_anchor(e, run_a, run_b, binary) == entry_id:
                 return e
     raise ConfigError(f"{entry_id!r} is not an entry get_diff_patch_view lists for this diff now")
@@ -418,7 +434,7 @@ def check_promotion(
     """
     meta = _binary_diff(atlas, diff_id)
     built = _built(atlas, diff_id)
-    e = _entry(built, meta, entry_id)
+    e = _entry(built, meta, entry_id, listed_view(atlas, built).entries)
     anchor = dr.entry_anchor(e, meta["run_a_id"], meta["run_b_id"], meta["binary_a"])
     carrying = [
         v for r, v in zip(e.rows, e.row_views, strict=True) if row_ref in (r.a_ref, r.b_ref)
@@ -501,6 +517,71 @@ def _is_file_row(row: dict[str, Any]) -> bool:
     from treasure_map.lib.query.file_diff import is_non_binary_anchor
 
     return is_non_binary_anchor(str(row["anchor_ref"]))
+
+
+def _is_presence_row(row: dict[str, Any]) -> bool:
+    return dr.is_binary_presence_anchor(str(row["anchor_ref"]))
+
+
+def _pair_scoped(row: dict[str, Any]) -> bool:
+    """A judgement scoped to a run pair, read on its own path and never through a binary diff: a
+    non-binary file's, or a binary_presence one's."""
+    return _is_file_row(row) or _is_presence_row(row)
+
+
+def presence_scope(atlas: sqlite3.Connection, run_pair: str) -> Any:
+    """The binaries of ``run_pair`` held by one run only (binary_presence.Presence) — where a
+    judgement on a binary_presence anchor is checked. Refused when the pair does not name two
+    runs."""
+    from treasure_map.lib.query import binary_presence as bp
+    from treasure_map.lib.query.file_diff import split_run_pair
+
+    runs = split_run_pair(atlas, run_pair)
+    if runs is None:
+        raise ConfigError(
+            f"run pair {run_pair!r} does not name two runs in this atlas — pass "
+            "'{run_a}::{run_b}' with both taken from list_runs"
+        )
+    return bp.find_presence(atlas, runs[0], runs[1])
+
+
+def _presence_judgements(
+    atlas: sqlite3.Connection,
+    rows: list[dict[str, Any]],
+    file_staleness: Callable[[str, str], dict[str, Any]] | None,
+) -> dict[int, dr.DiffAnnotation]:
+    """Each binary_presence judgement (overlay row id ->) read against its run pair's binaries as
+    they are now, the pair read once. A pair whose runs cannot be named leaves its judgements
+    unresolved, with the reason."""
+    from treasure_map.lib.query import binary_presence as bp
+    from treasure_map.lib.query.file_diff import split_run_pair
+
+    out: dict[int, dr.DiffAnnotation] = {}
+    by_pair: dict[str, list[dict[str, Any]]] = {}
+    for r in rows:
+        by_pair.setdefault(str(r["run_id"]), []).append(r)
+    for pair, members in by_pair.items():
+        runs = split_run_pair(atlas, pair)
+        judged: dict[str, dr.DiffAnnotation] = {}
+        if runs is not None:
+            run_a, run_b = runs
+            staleness = file_staleness(run_a, run_b) if file_staleness is not None else {}
+            judged = bp.presence_review(
+                atlas,
+                bp.find_presence(atlas, run_a, run_b),
+                source_stale=staleness.get("source_stale"),
+                source_stale_reason=staleness.get("source_stale_reason"),
+            )
+        for r in members:
+            out[r["id"]] = judged.get(r["anchor_ref"]) or dr.DiffAnnotation(
+                anchor_ref=r["anchor_ref"],
+                verdict=r["verdict"],
+                basis_state=dr.ANCHOR_UNRESOLVED,
+                moved={},
+                source_stale=None,
+                source_stale_reason="run_pair_unknown" if runs is None else None,
+            )
+    return out
 
 
 def _file_judgements(
@@ -596,9 +677,11 @@ def list_diff_overlays(
     (None), which reads ``needs_recheck``.
 
     With ``run_id`` it also carries ``review_progress`` over EVERY diff of that pair — which
-    rebuilds every one of their views: seconds per hundred diffs (about 10 s for a pair of 126
-    diffs). The binaries no diff covers are read straight from the atlas, not by recomputing the
-    pair's sink overlay."""
+    rebuilds every one of their views and, the first time in a process, reads each diff's
+    pseudocode once (which pairs are bucket S): measured on a pair of 126 diffs whose stored
+    overlay baselines all had to be recomputed, about 80 s the first time and 50 s after; less when
+    the baselines are current. The binaries no diff covers are read straight from the atlas, not
+    by recomputing the pair's sink overlay."""
     if verdict is not None and verdict not in _DIFF_VERDICTS:
         raise ConfigError(f"verdict must be one of {list(_DIFF_VERDICTS)}; got {verdict!r}")
     conds, params = ["anchor_kind = 'diff_subject'"], []
@@ -617,12 +700,15 @@ def list_diff_overlays(
         )
     )
     file_judged = _file_judgements(atlas, [r for r in rows if _is_file_row(r)], file_staleness)
-    named = {str(r["run_id"]) for r in rows if r["run_id"] and not _is_file_row(r)}
+    file_judged.update(
+        _presence_judgements(atlas, [r for r in rows if _is_presence_row(r)], file_staleness)
+    )
+    named = {str(r["run_id"]) for r in rows if r["run_id"] and not _pair_scoped(r)}
     if run_id is not None:
         named.add(run_id)
     pairs = {pair: _pair_diffs(atlas, pair) for pair in sorted(named)}
     of_row = {
-        r["id"]: None if _is_file_row(r) else _diff_of(r, pairs.get(r["run_id"], [])) for r in rows
+        r["id"]: None if _pair_scoped(r) else _diff_of(r, pairs.get(r["run_id"], [])) for r in rows
     }
     wanted = {d for d in of_row.values() if d is not None}
     if run_id is not None:
@@ -640,7 +726,7 @@ def list_diff_overlays(
         diff_id = of_row[r["id"]]
         review = reviews.get(diff_id) if diff_id is not None else None
         judged = review.judged.get(r["anchor_ref"]) if review is not None else None
-        if _is_file_row(r):
+        if _pair_scoped(r):
             judged = file_judged[r["id"]]
         if judged is None:  # its diff is gone, or the anchor names none of the pair's diffs
             judged = dr.DiffAnnotation(
@@ -660,7 +746,7 @@ def list_diff_overlays(
             "run_id": r["run_id"],
             "diff_id": diff_id,
         }
-        if _is_file_row(r):
+        if _pair_scoped(r):
             row_out["run_pair"] = r["run_id"]
         out.append(
             {
@@ -689,8 +775,20 @@ def list_diff_overlays(
         "note": _LIST_NOTE,
     }
     if run_id is not None:
-        result["review_progress"] = pair_progress(atlas, run_id, pairs[run_id], reviews)
+        staleness: dict[str, Any] = {}
+        runs = file_runs(atlas, run_id)
+        if runs is not None and file_staleness is not None:
+            staleness = file_staleness(*runs)
+        result["review_progress"] = pair_progress(
+            atlas, run_id, pairs[run_id], reviews, presence_staleness=staleness
+        )
     return result
+
+
+def file_runs(atlas: sqlite3.Connection, pair: str) -> tuple[str, str] | None:
+    from treasure_map.lib.query.file_diff import split_run_pair
+
+    return split_run_pair(atlas, pair)
 
 
 # ── progress over a whole run pair ─────────────────────────────────────────────────────────
@@ -701,11 +799,17 @@ def pair_progress(
     pair: str,
     diffs: list[dict[str, Any]],
     reviews: dict[str, ViewReview],
+    presence_staleness: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Progress over every listed entry of every diff of one run pair, and — inseparable from it —
-    what none of those entries can cover: the diffs that failed, the diffs undetermined as a whole,
-    and the binaries no diff covers. ``complete`` is never true while any of the three is
-    non-empty, whatever the count of entries says."""
+    """Progress over every listed entry of every diff of one run pair — bucket S included — and
+    over every binary one run of the pair holds alone (``binary_presence``, each a subject judged
+    on its own), and — inseparable from it — what none of those can cover: the diffs that failed,
+    the diffs undetermined as a whole, and the binaries no diff covers. ``complete`` is never true
+    while any of the three is non-empty, or a binary_presence binary is unjudged, whatever the
+    count of entries says. ``presence_staleness`` is the caller's reading of the two runs for the
+    binary_presence judgements (unknown reads needs_recheck)."""
+    from treasure_map.lib.query import binary_presence as bp
+
     if not diffs:
         return {
             "unit": "entry",
@@ -731,7 +835,7 @@ def pair_progress(
             continue
         dangling += review.dangling
         mine = [
-            replace(i, order=(diff_id, *i.order), diff_id=diff_id) for i in review.items.values()
+            replace(i, order=(0, diff_id, *i.order), diff_id=diff_id) for i in review.items.values()
         ]
         items += mine
         n = dr.counts(mine)
@@ -745,8 +849,20 @@ def pair_progress(
         {k: b[k] for k in ("diff_id", "binary", "diff_status_reason", "diff_attempts")}
         for b in blind["blindspots"]
     ]
+    groups = not_diffed_groups(atlas, run_a, run_b)
+    presence = bp.find_presence(atlas, run_a, run_b, groups)
+    staleness = presence_staleness or {}
+    presence_judged = bp.presence_review(
+        atlas,
+        presence,
+        source_stale=staleness.get("source_stale"),
+        source_stale_reason=staleness.get("source_stale_reason"),
+    )
+    # Each binary_presence binary is one more subject to judge: in the denominator, after every
+    # diff's entries in the order next_page names them.
+    items += bp.presence_items(presence, presence_judged)
     blind_not_diffed, identical_not_diffed = split_not_diffed(
-        not_diffed_binaries(atlas, run_a, run_b)
+        not_diffed_binaries(atlas, run_a, run_b, exclude=presence.excluded, groups=groups)
     )
     numbers = dr.counts(items)
     return {
@@ -761,6 +877,9 @@ def pair_progress(
         # binaries byte-identical on both sides: no diff was warranted, so no blind spot — kept out
         # of 'complete' and apart from the genuine not-diffed binaries below.
         "identical_not_diffed_binaries": identical_not_diffed,
+        # binaries one run holds alone (the other holds no binary, file or symlink like them):
+        # judged one by one, counted in the totals above and in 'complete'.
+        "binary_presence": bp.presence_block(presence, presence_judged),
         "blind_spots": {
             "failed_diffs": failed,
             "withheld_diffs": withheld,
@@ -781,8 +900,11 @@ def pair_progress(
             + " Over a run pair, 'complete' also needs no failed diff, no diff undetermined as a "
             "whole, and no binary that no diff covers: entries cannot be listed for those, so "
             "having judged every listed entry does not reach them. A binary byte-identical on both "
-            "sides is not one of those — it needed no diff (identical_not_diffed_binaries). "
-            "next_page here is in the candidate_tier order; get_diff_patch_view names the next "
-            "ones in the order its page is read in."
+            "sides is not one of those — it needed no diff (identical_not_diffed_binaries). A "
+            "binary one run holds alone is a subject of its own (binary_presence, bucket "
+            "binary_presence in the counts): 'complete' needs a judgment on each, written with "
+            "annotate_diff(anchor_ref=<its anchor_ref>, run_pair=...). next_page here is in the "
+            "candidate_tier order, the binary_presence binaries after every diff's entries; "
+            "get_diff_patch_view names the next ones in the order its page is read in."
         ),
     }

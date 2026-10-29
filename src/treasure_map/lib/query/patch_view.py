@@ -30,10 +30,15 @@ BUCKETS (``bucket``):
   E  an aligned, similarity-1 pair that would otherwise place no entry, whose called function has a
      direct caller on the A side and none found (or none provable) on the B side — a caller-set edge
      fact (``callers_a`` / ``callers_b``) similarity is blind to. The ONE bucket this build adds.
+  S  an aligned, similarity-1 pair that places no bucket and whose normalized pseudocode differs
+     (subclass ``aligned_pseudocode_differs``). Listed by the read face (``listed_view``), which
+     reads pseudocode; never written to the build's ``bucket``, so a judgement's basis reads it
+     as no bucket.
 A similarity-1 pair whose candidates all line up, or that has none, places no entry UNLESS a length
 constant changed on one of its candidates (then it is B ``sink_arg_constant_delta``), or its
-caller-set edge reads lost-or-undetermined (then it is E, above); the rest are counted under
-``not_listed`` by ``pseudocode_sameness`` (below), never dropped. Where each overlay
+caller-set edge reads lost-or-undetermined (then it is E, above); its pseudocode differing lists it
+as S; the rest are counted under ``not_listed`` by ``pseudocode_sameness`` (below), never
+dropped. Where each overlay
 ``presence_reason`` lands is ``row_landing``; a reason it does not know lands in B as
 ``unmapped_reason:<reason>`` and is counted, never dropped.
 
@@ -55,8 +60,9 @@ TWO SIGNALS SIMILARITY IS BLIND TO (lib/query/sameness), read on the function-pa
   ``unavailable`` (in the table, a side's text could not be read: an empty decompile, an
   unrecorded size, an unreadable analysis.db). None of the unverified states is ever read as
   "unchanged". On every listed aligned entry as a fact; the similarity-1 pairs that place no entry
-  are counted by it under ``not_listed`` (``not_listed_page=<name>`` walks one category,
-  ``aligned_pseudocode_differs`` above all). A pair
+  are counted by it under ``not_listed`` (``not_listed_page=<name>`` walks one category), except
+  the ones reading differs, which are listed as bucket S (that category keeps a count of 0 and
+  ``listed_as``). A pair
   whose texts differ carries ``pseudocode_delta``, the lexical shape of the difference, with its
   ``inline_hunk`` (the changed lines themselves from the original text, or why withheld). An
   undetermined pair carries ``proposed_pair_reading`` instead — the same reading as if it were
@@ -79,10 +85,10 @@ TWO SIGNALS SIMILARITY IS BLIND TO (lib/query/sameness), read on the function-pa
 
 ORDER: with no ``sort_by`` the function-pair view reads in the significance order (:func:`_sort`;
 ``anchored_differs`` keeps its own). The ``candidate_tier`` order, which was the default before it:
-A first, then the R and B entries that carry a sink candidate (E among them when it carries
-one, in its own lane), then the entries with none (recall_gap_sink, R, C, then the E with none),
-then P; inside each, by the named components of ``rank_key`` (on every entry of a
-``detail='full'`` page). ``tier`` is the sink-impact tier of the entry's candidates
+A first, then the R and B entries that carry a sink candidate (E and S among them when they carry
+one, each in its own lane), then the entries with none (recall_gap_sink, R, C, then the E with
+none, then the S with none), then P; inside each, by the named components of ``rank_key`` (on
+every entry of a ``detail='full'`` page). ``tier`` is the sink-impact tier of the entry's candidates
 (lib/query/sink_impact), ``no_sink`` without any.
 
 DETAIL: ``detail='summary'`` prints each listed entry as a projection of its full rendering —
@@ -108,6 +114,7 @@ from collections import OrderedDict
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Generic, TypeVar
 
+from treasure_map.lib.diff.code_version import diff_code_version, sink_overlay_logic_version
 from treasure_map.lib.diff.layer0 import norm_hex
 from treasure_map.lib.pattern import classes
 from treasure_map.lib.query import diff_review, diff_sink_axes, entry_words, sameness
@@ -130,7 +137,10 @@ VIEWS = ("sink_patch", "string_edge", "candidate_flat")
 # How much of each entry a page prints: ``full`` (every field, the default) or ``summary`` (counts,
 # states and the fields an entry is chosen by; see _summary_entry).
 DETAILS = ("full", "summary")
-BUCKETS = ("A", "B", "C", "R", "P", "E")
+BUCKETS = ("A", "B", "C", "R", "P", "E", "S")
+# The subclass of an S entry (``listed_view``): an aligned, similarity-1 pair that places no bucket
+# and whose normalized pseudocode differs.
+S_SUBCLASS = "aligned_pseudocode_differs"
 # ``sort_by`` unset reads ``significance`` on view="sink_patch" (anchored_differs=true aside, which
 # keeps its own order); ``candidate_tier`` names the order that was the default before it.
 SORT_BY = ("tier", "similarity", "address", "significance", "candidate_tier")
@@ -172,6 +182,17 @@ _CALLER_SAMPLE = 10
 # A sink_callee_swap is narrow when both lists were read in full and neither side differs by more
 # than this many names.
 _SWAP_NARROW_NAMES = 2
+# sink_candidate_counts: per sink name, how many hunt candidates each function of a pair holds. Only
+# per-call keys are counted; a function-level key of a sink makes that sink's count on that side
+# unknown, never a number.
+_COUNTED_GRANULARITIES = frozenset({"callsite", "wrapper_callsite"})
+_NOT_PER_CALL_GRANULARITIES = frozenset({"degraded_out_of_body", "function_fallback", "wrapper"})
+SINK_COUNTS_UNIT = "hunt candidates (callsite / wrapper_callsite keys), not every call of the name"
+# The fixed note on an entry whose sink_callee_swap is read on an undetermined pairing.
+SWAP_PAIRING_NOTE = (
+    "pairing proposed by BinDiff below the alignment threshold; compared against the proposed "
+    "counterpart and not floated until the pairing is corroborated"
+)
 # Callee-name prefixes of an input source the hunt does not model. Only tagged on A / B entries
 # (``source_gap:<family>``); never moves an entry.
 SOURCE_GAP_PREFIXES: dict[str, tuple[str, ...]] = {"uci_ubus": ("uci_", "ubus_")}
@@ -339,6 +360,10 @@ _LEGEND = {
     "E": (
         "similarity-1 pair whose function has a direct caller on the A side and none found (or "
         "none provable) on the B side — a caller-set edge (callers_a / callers_b)"
+    ),
+    "S": (
+        "aligned similarity-1 pair whose normalized pseudocode differs; similarity is blind to "
+        "the change"
     ),
     "guard_scan": (
         "beside pseudocode_delta: the comparisons of a variable with a constant the B side's "
@@ -565,8 +590,66 @@ def read_overlay_rows(atlas: sqlite3.Connection, diff_id: str, run_a: str, run_b
         if rows is not None:
             return _Overlay(rows, "fresh", None)
         state = "recomputed_mismatch"
-    result = compute_sink_overlay(atlas, diff_id)
-    return _Overlay(list(result.rows), state, asdict(result.coverage))
+    # The recomputed overlay is kept per process (bounded) under everything it is read from: the
+    # two runs' stamps, the diff's own inputs and when it was written, and the code that computes
+    # it — so paging a diff whose baseline is not current computes it once, not once per page, and
+    # a re-hunt, a re-run diff or newer code is never served the old rows.
+    key = _overlay_key(atlas, diff_id, run_a, run_b)
+    hit = _OVERLAY_CACHE.get(key)
+    if hit is None:
+        result = compute_sink_overlay(atlas, diff_id)
+        hit = (tuple(result.rows), asdict(result.coverage))
+        _OVERLAY_CACHE[key] = hit
+    rows_cached, coverage = hit
+    return _Overlay(list(rows_cached), state, json.loads(json.dumps(coverage)))
+
+
+# The diff_meta columns the recomputed overlay rests on, beside the two runs' stamps.
+_OVERLAY_INPUT_COLS = (
+    "created_at",
+    "callsite_facts_a",
+    "callsite_facts_b",
+    "callsite_facts_hash_a",
+    "callsite_facts_hash_b",
+    "hunt_inputs_hash_a",
+    "hunt_inputs_hash_b",
+)
+
+
+def _overlay_key(
+    atlas: sqlite3.Connection, diff_id: str, run_a: str, run_b: str
+) -> tuple[str, ...]:
+    """What a recomputed overlay is cached under (``_OVERLAY_CACHE``)."""
+    cols = {r[1] for r in atlas.execute("PRAGMA table_info(diff_meta)")}
+    picked = [c for c in _OVERLAY_INPUT_COLS if c in cols]
+    row = (
+        atlas.execute(
+            f"SELECT {', '.join(picked)} FROM diff_meta WHERE diff_id = ?",  # noqa: S608
+            (diff_id,),
+        ).fetchone()
+        if picked
+        else None
+    )
+    meta = dict(zip(picked, row, strict=True)) if row is not None else {}
+    # Each run's instance rows as a stamp too (how many, the greatest id): a re-hunt deletes and
+    # re-inserts them with fresh ids, so it moves even when two hunts share a second of updated_at.
+    stamps = [
+        atlas.execute(
+            "SELECT COUNT(*), COALESCE(MAX(instance_id), 0) FROM instance WHERE source_run_id = ?",
+            (run,),
+        ).fetchone()
+        for run in (run_a, run_b)
+    ]
+    return (
+        _atlas_identity(atlas),
+        diff_id,
+        *_run_key(atlas, run_a),
+        *_run_key(atlas, run_b),
+        *(f"{n}:{top}" for n, top in stamps),
+        diff_code_version(),
+        sink_overlay_logic_version(),
+        *(f"{c}={meta.get(c)!s}" for c in _OVERLAY_INPUT_COLS),
+    )
 
 
 # ── the diff's functions ────────────────────────────────────────────────────────────────────
@@ -770,6 +853,10 @@ def _atlas_identity(atlas: sqlite3.Connection) -> str:
 _SIZE_FACT_CACHE: _BoundedCache[tuple[str, ...], dict[str, tuple[str, str | None]]] = _BoundedCache(
     16
 )
+# A diff's overlay as computed in memory when its stored baseline is not current, per everything it
+# is read from (_overlay_key): rows and coverage, never stored in the atlas.
+_OverlayHit = tuple[tuple[SinkOverlayRow, ...], dict[str, Any]]
+_OVERLAY_CACHE: _BoundedCache[tuple[str, ...], _OverlayHit] = _BoundedCache(16)
 # evidence_ref function-entries that hold a candidate, per (run, binary): the caller-set edge's
 # one-hop relevance lands on these. Keyed by the run's stamps so a re-hunt is not served stale.
 _CANDIDATE_ENTRY_CACHE: _BoundedCache[tuple[str, ...], frozenset[str]] = _BoundedCache(16)
@@ -969,6 +1056,27 @@ class _Entry:
     callers_b: dict[str, Any] | None = None
     pairing: str | None = None
     caller_relevance: int = 2
+    # Each sink's hunt-candidate count in the two functions (``_sink_candidate_counts``): None for a
+    # function with no counterpart, or when both sides count alike with nothing unknown.
+    sink_candidate_counts: dict[str, Any] | None = None
+    # "S" when the read face lists this entry as an aligned similarity-1 pair whose normalized
+    # pseudocode differs (``listed_view``) — never written by the build, so ``bucket`` (and the
+    # judgement basis read from it) stays empty for such a pair.
+    listed_as: str = ""
+
+    @property
+    def shown_bucket(self) -> str:
+        """The bucket this entry is shown, counted and filtered under: its own, or ``S``."""
+        return self.bucket or self.listed_as
+
+    @property
+    def shown_subclass(self) -> str:
+        return S_SUBCLASS if not self.bucket and self.listed_as == "S" else self.subclass
+
+    @property
+    def listed(self) -> bool:
+        """Whether get_diff_patch_view lists this entry (its own bucket, or ``S``)."""
+        return bool(self.bucket or self.listed_as)
 
     @property
     def entry_id(self) -> str:
@@ -1023,6 +1131,9 @@ class _Builder:
         # SQL. ``maybe_truncated`` is True when ANY function's list was cut, unreadable or does not
         # record truncation, so a function with no caller there cannot be proven to have none.
         self._rev: dict[str, tuple[dict[str, set[str]], bool]] = {}
+        # side -> function entry -> evidence_ref -> its key granularities: every candidate ref of
+        # the diff's overlay rows, whichever entry its row was placed in (sink_candidate_counts).
+        self._refs_by_fn: dict[str, dict[str, dict[str, set[str]]]] = {}
 
     # ── per-ref facts ──
 
@@ -1085,6 +1196,8 @@ class _Builder:
             e.tier = self._tier(e.rows)
         if p is not None and p.aligned:
             e.callee_set = self._callee_set(e)
+        if p is not None:
+            e.sink_candidate_counts = self._sink_candidate_counts(p)
         landings = [v["landing"] for v in e.row_views]
         if e.unpaired is not None:
             e.bucket, e.subclass = "P", e.unpaired.presence_state
@@ -1165,6 +1278,102 @@ class _Builder:
             if fn.truncated is not False:
                 unchecked = True
         return names, unchecked
+
+    # ── sink_candidate_counts: each sink's hunt candidates in the two functions ──
+
+    def _refs_of(self, side: str) -> dict[str, dict[str, set[str]]]:
+        """function entry -> evidence_ref -> its key granularities, over every candidate ref of
+        ``side`` in the diff's overlay rows — counted by the function the ref names, never by the
+        entry its row was placed in."""
+        hit = self._refs_by_fn.get(side)
+        if hit is not None:
+            return hit
+        out: dict[str, dict[str, set[str]]] = {}
+        for r in self.overlay.rows:
+            ref = r.a_ref if side == "a" else r.b_ref
+            fe = _func_entry_hex(ref) if ref else None
+            if ref is None or fe is None:
+                continue
+            out.setdefault(fe, {}).setdefault(ref, set()).add(r.key_granularity)
+        self._refs_by_fn[side] = out
+        return out
+
+    def _sink_candidate_counts(self, p: _Pair) -> dict[str, Any] | None:
+        """Per sink name, the hunt candidates each function of the pair holds: ``delta`` the sinks
+        both sides count and count differently, ``unknown`` the side / sink pairs that cannot be
+        counted, with why. None when neither function holds a candidate, or every sink counts
+        alike.
+
+        Only per-call keys (callsite / wrapper_callsite) are counted, by distinct evidence_ref; 0 is
+        a count (no such candidate there), never "no such call". A side is unknown, in this order:
+        ``side_unreadable`` (its analysis.db could not be read), ``function_not_in_scan_inventory``
+        (that scan does not hold the function), then per sink ``granularity_not_per_call`` (the
+        side holds a function-level key of that sink), then ``sink_ambiguous`` (a candidate of the
+        function whose sink name cannot be read: every sink of that side is unknown, and a side
+        with no named sink at all says so with ``sink: null``). Direction-neutral."""
+        refs = {
+            "a": self._refs_of("a").get(p.addr_a, {}),
+            "b": self._refs_of("b").get(p.addr_b, {}),
+        }
+        if not refs["a"] and not refs["b"]:
+            return None
+        sides: dict[str, tuple[str | None, dict[str, int], set[str], bool, set[str]]] = {}
+        names: set[str] = set()
+        for side, addr in (("a", p.addr_a), ("b", p.addr_b)):
+            counts: dict[str, int] = {}
+            coarse: set[str] = set()
+            named: set[str] = set()
+            ambiguous = False
+            for ref, grans in refs[side].items():
+                sink = self.sink_of(side, ref)
+                if sink is None:
+                    ambiguous = True
+                    continue
+                named.add(sink)
+                if grans & _COUNTED_GRANULARITIES:
+                    counts[sink] = counts.get(sink, 0) + 1
+                if grans & _NOT_PER_CALL_GRANULARITIES:
+                    coarse.add(sink)
+            # side_unreadable first: an unread side answers None for every function, which would
+            # otherwise read as "not in that scan's inventory".
+            why: str | None = None
+            if self.sides[side].error is not None:
+                why = "side_unreadable"
+            elif self.sides[side].fn(addr) is None:
+                why = "function_not_in_scan_inventory"
+            sides[side] = (why, counts, coarse, ambiguous, named)
+            names |= named
+        delta: list[dict[str, Any]] = []
+        unknown: list[dict[str, Any]] = []
+        for sink in sorted(names):
+            known: dict[str, int | None] = {}
+            for side in ("a", "b"):
+                why, counts, coarse, ambiguous, _named = sides[side]
+                reason = why
+                if reason is None and sink in coarse:
+                    reason = "granularity_not_per_call"
+                if reason is None and ambiguous:
+                    reason = "sink_ambiguous"
+                if reason is not None:
+                    unknown.append({"sink": sink, "side": side, "reason": reason})
+                    known[side] = None
+                else:
+                    known[side] = counts.get(sink, 0)
+            a, b = known["a"], known["b"]
+            if a is not None and b is not None and a != b:
+                delta.append({"sink": sink, "a": a, "b": b})
+        for side in ("a", "b"):
+            why, _counts, _coarse, ambiguous, named = sides[side]
+            if ambiguous and not named:
+                unknown.append({"sink": None, "side": side, "reason": why or "sink_ambiguous"})
+        if not delta and not unknown:
+            return None
+        return {
+            "unit": SINK_COUNTS_UNIT,
+            "pairing": "aligned" if p.aligned else "proposed",
+            "delta": delta,
+            "unknown": unknown,
+        }
 
     def _tag_source_gap(self, e: _Entry) -> None:
         if e.pair is None or self.callee_block is not None:
@@ -1621,9 +1830,15 @@ def _rank(e: _Entry) -> dict[str, Any]:
             v["landing"] == "B" and "wrapper_granularity_blind" in v.get("facts", ())
             for v in e.row_views
         )
-        # sink_presence_signal first, then sink_arg_constant_delta (a visible length change),
-        # then the rest (sink_present_no_visible_delta and the undetermined B subclasses).
-        if e.subclass.startswith(_SPS) or wrapper_b:
+        # sink_presence_signal first (with a sink name in the aligned callee-set difference), then
+        # sink_arg_constant_delta (a visible length change), then the rest
+        # (sink_present_no_visible_delta and the undetermined B subclasses).
+        swap = _sink_callee_swap(e)
+        if (
+            e.subclass.startswith(_SPS)
+            or wrapper_b
+            or (swap is not None and swap["pairing"] == "aligned")
+        ):
             b_rank = 0
         elif e.subclass == "sink_arg_constant_delta":
             b_rank = 1
@@ -1651,6 +1866,26 @@ def _rank(e: _Entry) -> dict[str, Any]:
             "segment": 3,
             "lane": 3,
             "subclass_rank": e.caller_relevance,
+            "similarity": sim_key,
+            "address": e.address,
+        }
+    if e.shown_bucket == "S":
+        # The aligned similarity-1 pair whose pseudocode differs (listed_view): in segment 2 after
+        # R, B and E (lane 3) when it carries a candidate, else in segment 3 after B, R, C and E
+        # (lane 4). Lanes 3 / 4 are S's alone.
+        if e.tier != NO_SINK:
+            return {
+                "segment": 2,
+                "tier": t,
+                "lane": 3,
+                "subclass_rank": 0,
+                "similarity": sim_key,
+                "address": e.address,
+            }
+        return {
+            "segment": 3,
+            "lane": 4,
+            "subclass_rank": 0,
             "similarity": sim_key,
             "address": e.address,
         }
@@ -1902,6 +2137,18 @@ def _sink_callee_swap(e: _Entry) -> dict[str, Any] | None:
     }
 
 
+def _lift_basis(e: _Entry) -> str | None:
+    """Why an attention-1 entry leads its tier (``swap_lift``): ``sink_callee_swap`` (a sink name
+    in its callee-set difference), else ``sink_candidate_counts`` (a sink's candidate count
+    differs), else None."""
+    if _sink_callee_swap(e) is not None:
+        return "sink_callee_swap"
+    counts = e.sink_candidate_counts
+    if counts is not None and counts["delta"]:
+        return "sink_candidate_counts"
+    return None
+
+
 def _held_up(item: diff_review.Item | None) -> bool:
     """A judgement that must keep its entry off the bottom tier: judged changed_real, due a
     re-check or a relabel, or left inconclusive. A lens never buries what an agent marked."""
@@ -1924,18 +2171,22 @@ def significance(
     In order:
 
       * bucket A, or a row carrying sink_arg_constant_delta -> 0 (wins over everything below);
+      * a sink name in an ALIGNED pair's callee-set difference (:func:`_sink_callee_swap`,
+        pairing aligned, either direction, narrow or not, whatever the judgement) -> 0, labelled
+        ``sink_callee_swap``; then an aligned pair whose ``sink_candidate_counts`` has a delta ->
+        0, labelled ``sink_candidate_counts``. Never an R entry: an R entry is never floated (a
+        proposed swap or count delta lifts it inside attention 1 instead, ``swap_lift`` in
+        :func:`_sort`);
       * B ``sink_present_no_visible_delta`` -> 1, labelled ``recheckable_no_visible_delta``: it
-        stays where similarity puts it, neither floated nor sunk;
+        stays where similarity puts it, neither floated nor sunk; an S entry (``listed_view``)
+        -> 1, labelled ``aligned_pseudocode_differs``, the same way;
       * an aligned pair carrying ``one_side_skipped_micro`` (one side a design-skipped micro-stub,
         the other a real body) -> 1, labelled ``one_side_skipped_micro``: held at attention 1, never
         sunk to 2 as an otherwise identical / bucket-C pair would be;
       * pseudocode ``identical``, a proposed ``identical_unique``, or bucket C -> 2 — unless the
         entry is R (an undetermined pair is never buried under the pairs that were read) or its
         judgement is held up (changed_real, needs_recheck / needs_relabel, inconclusive), which
-        stops it at 1; or, after both, a bucket C entry carrying a narrow
-        :func:`_sink_callee_swap` -> 1, labelled ``sink_callee_swap_never_sunk`` (the only basis
-        the swap ever takes: elsewhere it is a field, and orders entries inside attention 1
-        through ``_sort``); or, last, the caller-set edge: an E entry -> 1 (basis
+        stops it at 1; or, last, the caller-set edge: an E entry -> 1 (basis
         ``lost_every_direct_caller_never_sunk`` for a proven-none B side, else
         ``caller_signal_undetermined_never_sunk``), and any other entry whose B side is a proven
         none_found -> 1, ``lost_every_direct_caller_never_sunk`` (an undetermined edge on an
@@ -1964,8 +2215,20 @@ def significance(
         return ATTENTION_FLOAT, "matched_call_other_callee"
     if any("sink_arg_constant_delta" in v for v in e.row_views):
         return ATTENTION_FLOAT, "sink_arg_constant_delta"
+    # A sink in an aligned pair's callee-set difference, then a changed candidate count on an
+    # aligned pair: floated whatever the direction, narrowness or judgement. Never an R entry — a
+    # pair can be aligned and still sit in R through a row's landing, and R is never floated.
+    if e.bucket != "R":
+        swap = _sink_callee_swap(e)
+        if swap is not None and swap["pairing"] == "aligned":
+            return ATTENTION_FLOAT, "sink_callee_swap"
+        counts = e.sink_candidate_counts
+        if counts is not None and counts["pairing"] == "aligned" and counts["delta"]:
+            return ATTENTION_FLOAT, "sink_candidate_counts"
     if e.subclass == "sink_present_no_visible_delta":
         return ATTENTION_MIDDLE, "recheckable_no_visible_delta"
+    if not e.bucket and e.listed_as == "S":
+        return ATTENTION_MIDDLE, S_SUBCLASS
     if "one_side_skipped_micro" in e.facts:
         # an aligned pair gutted to (or grown from) a micro-stub on one side: held at attention 1,
         # never sunk to 2 as an identical / bucket-C pair would be.
@@ -1976,10 +2239,6 @@ def significance(
             return ATTENTION_MIDDLE, "undetermined_never_sunk"
         if _held_up(item):
             return ATTENTION_MIDDLE, "judged_never_sunk"
-        # After R and a held-up judgement, so neither basis is ever replaced by the swap: only a
-        # bucket C entry that would otherwise sink is held at 1 by it.
-        if e.bucket == "C" and (swap := _sink_callee_swap(e)) is not None and swap["narrow"]:
-            return ATTENTION_MIDDLE, "sink_callee_swap_never_sunk"
         # The caller-set edge (S3) holds a NON-E entry off the bottom too, LAST so it never replaces
         # a basis above, and only when the B side is a proven none — an undetermined edge on an
         # already-listed entry does not move it (E, which IS listed for the edge, is handled first).
@@ -2013,10 +2272,11 @@ def _sort(
 
     ``sort_by="significance"`` orders by ``(attention, swap_lift, read_first, band, settled,
     similarity, candidate_tier key)`` — ``attention`` from :func:`significance`; ``swap_lift`` (1
-    for an attention-1 entry carrying a narrow :func:`_sink_callee_swap`, whatever its basis or
-    judgement) first inside the tier; ``read_first`` (:func:`_read_first_order`, highest first) so
-    that next the anchored_differs pairs at or above the floor come, then those below it, then the
-    rest; the band only when it is on
+    for an attention-1 entry carrying a :func:`_sink_callee_swap` or a ``sink_candidate_counts``
+    delta — an R entry's proposed one above all — whatever its basis or judgement; its
+    ``lift_basis`` names which) first inside the tier; ``read_first`` (:func:`_read_first_order`,
+    highest first) so that next the anchored_differs pairs at or above the floor come, then those
+    below it, then the rest; the band only when it is on
     (judgements move nothing unless asked); ``settled`` (1 for an R entry whose proposed reading
     is ``identical_unique``, so it closes its tier, still ahead of every sunk entry); similarity
     lowest first; then the candidate_tier order."""
@@ -2080,8 +2340,8 @@ def _string_edges(atlas: sqlite3.Connection, diff_id: str) -> tuple[int, dict[st
 def _entry_json(e: _Entry) -> dict[str, Any]:
     out: dict[str, Any] = {
         "entry_id": e.entry_id,
-        "bucket": e.bucket,
-        "subclass": e.subclass,
+        "bucket": e.shown_bucket,
+        "subclass": e.shown_subclass,
         "subclasses": sorted({v["subclass"] for v in e.row_views if v["subclass"]}),
         "tier": e.tier,
         "rank_key": e.rank,
@@ -2123,6 +2383,16 @@ def _entry_json(e: _Entry) -> dict[str, Any]:
             "coclaimed_by": coclaimed or None,
             "callee_set": e.callee_set,
             **({"sink_callee_swap": swap} if swap is not None else {}),
+            **(
+                {"swap_pairing_note": SWAP_PAIRING_NOTE}
+                if swap is not None and swap["pairing"] == "proposed"
+                else {}
+            ),
+            **(
+                {"sink_candidate_counts": e.sink_candidate_counts}
+                if e.sink_candidate_counts is not None
+                else {}
+            ),
             # The caller-set edge (S3): present only when it exists; a field on any pair entry,
             # never in diff_review.entry_facts, so it moves no existing judgement.
             **(
@@ -2304,6 +2574,8 @@ class BuiltDiff:
     unavailable: dict[str, str]
     b_names: dict[str, str]  # the B side's function addr -> extracted name (the caller-set edge's
     # no-mention reading tokenises the B bodies for these names); empty when withheld
+    # What listed_view found for this build (bucket S added), once it has been asked; None before.
+    listed: ListedView | None = None
 
 
 def build_diff_view(atlas: sqlite3.Connection, diff_id: str) -> BuiltDiff | None:
@@ -2457,6 +2729,8 @@ def _clear_view_caches() -> None:
     _SIZE_FACT_CACHE.clear()
     _CANDIDATE_ENTRY_CACHE.clear()
     _ENTRY_WORDS_IMAGE_CACHE.clear()
+    _OVERLAY_CACHE.clear()
+    _DIFFERS_CACHE.clear()
     # S6's process-wide call-list cache (in a module that imports this one, so imported here).
     from treasure_map.lib.query.diff_group_freshness import _clear_cache
 
@@ -2541,6 +2815,28 @@ def _read_undetermined(
     return out
 
 
+def _readings_key(atlas: sqlite3.Connection, d: _Diff) -> tuple[str, ...]:
+    """The key every pair's pseudocode reading of one diff is cached under: the atlas, the diff,
+    the diff code that wrote its pairs and when it was written (a diff re-run, even by the same
+    code, can pair functions anew), both content hashes and both build hashes (a re-extraction can
+    rewrite the pseudocode under one content hash)."""
+    _pa, ha = _run_source(atlas, d.run_a)
+    _pb, hb = _run_source(atlas, d.run_b)
+    meta = atlas.execute(
+        "SELECT diff_code_version, created_at FROM diff_meta WHERE diff_id = ?", (d.diff_id,)
+    ).fetchone()
+    return (
+        _atlas_identity(atlas),
+        d.diff_id,
+        str(meta[0] or "") if meta else "",
+        str(meta[1] or "") if meta else "",
+        d.sha_a or "",
+        d.sha_b or "",
+        ha or "",
+        hb or "",
+    )
+
+
 def _pseudo_readings(atlas: sqlite3.Connection, built: BuiltDiff) -> _Readings:
     """Every placed pair's pseudocode reading — aligned and undetermined apart. Reads both runs'
     analysis.db pseudocode and image extents once and caches by (diff_id, sha_a, sha_b,
@@ -2549,22 +2845,9 @@ def _pseudo_readings(atlas: sqlite3.Connection, built: BuiltDiff) -> _Readings:
     This is the cost lib/query/sameness keeps out of build_diff_view (and so out of annotate /
     promote / the cross-scope progress block)."""
     d = built.diff
-    pa, ha = _run_source(atlas, d.run_a)
-    pb, hb = _run_source(atlas, d.run_b)
-    # The atlas and the diff code that wrote the pairs are in the key too: one process can serve
-    # two atlases with the same diff id, and a diff re-run by newer code can pair functions anew.
-    dcv = atlas.execute(
-        "SELECT diff_code_version FROM diff_meta WHERE diff_id = ?", (d.diff_id,)
-    ).fetchone()
-    key = (
-        _atlas_identity(atlas),
-        d.diff_id,
-        str(dcv[0] or "") if dcv else "",
-        d.sha_a or "",
-        d.sha_b or "",
-        ha or "",
-        hb or "",
-    )
+    pa, _ha = _run_source(atlas, d.run_a)
+    pb, _hb = _run_source(atlas, d.run_b)
+    key = _readings_key(atlas, d)
     aligned = _PSEUDO_READING_CACHE.get(key)
     undetermined = _UNDETERMINED_READING_CACHE.get(key)
     # The no-mention set covers the E entries of THIS build; which pairs are E moves with the
@@ -2671,6 +2954,80 @@ def _u_state(e: _Entry, readings: _Readings) -> str | None:
     """The state of an undetermined pair's proposed reading; None for any other entry."""
     proposed = _proposed_of(e, readings)
     return proposed[0] if proposed is not None else None
+
+
+# ── bucket S: the listed face of an aligned similarity-1 pair whose pseudocode differs ─────────
+
+# The aligned pairs of a diff whose pseudocode_sameness reads differs, per (the readings' key, the
+# diff's source_stale): a small set per diff, so every consumer that has no reading of its own — a
+# judgement written, promoted or listed, the progress over a run pair — learns which pairs are S
+# without reading pseudocode again. Whether a pair places a bucket is never cached: it moves with
+# the candidate rows, so it is read from each build.
+_DIFFERS_CACHE: _BoundedCache[tuple[str, ...], frozenset[tuple[str, str]]] = _BoundedCache(4096)
+
+
+@dataclass(frozen=True)
+class ListedView:
+    """The entries get_diff_patch_view lists: the build's bucketed entries and the S entries, and
+    the ids of the latter."""
+
+    entries: list[_Entry]
+    s_ids: frozenset[str]
+
+
+def _differs_of(readings: _Readings, built: BuiltDiff) -> frozenset[tuple[str, str]]:
+    return frozenset(
+        (e.pair.addr_a, e.pair.addr_b)
+        for e in built.placed
+        if e.pair is not None and e.pair.aligned and _sameness_of(e, readings) == sameness.DIFFERS
+    )
+
+
+def listed_view(
+    atlas: sqlite3.Connection, built: BuiltDiff, readings: _Readings | None = None
+) -> ListedView:
+    """The listed entries of one built diff: ``built.entries`` plus bucket S — every placed entry
+    that places no bucket, is an aligned pair (so of similarity 1) and whose pseudocode_sameness
+    reads ``differs``. The one place S is decided, for every reader of the view.
+
+    The first two conditions are read from this build every time, so a re-hunt that moves a pair
+    into or out of a bucket moves it out of or into S. The third comes from ``readings`` when the
+    caller holds them (one reading per view, never a second); otherwise from ``_DIFFERS_CACHE``,
+    computed from the pseudocode readings on a miss. S is never written to ``bucket``: an S entry's
+    ``listed_as`` is ``S`` and its judgement basis keeps ``bucket`` null. Called again on the same
+    build without readings, it returns what it found the first time."""
+    if readings is None and built.listed is not None:
+        return built.listed
+    for e in built.placed:
+        e.listed_as = ""
+    s: list[_Entry] = []
+    open_pairs = [e for e in built.placed if not e.bucket and e.pair is not None and e.pair.aligned]
+    if built.withheld is None and open_pairs:
+        if readings is not None:
+            # The view's own readings decide, and the cache is neither read nor written here: it
+            # has one writer (the miss below), so what it holds is always what that path computed.
+            differs = _differs_of(readings, built)
+        else:
+            key = (
+                *_readings_key(atlas, built.diff),
+                f"stale={built.staleness.get('source_stale')!s}",
+            )
+            hit = _DIFFERS_CACHE.get(key)
+            if hit is None:
+                hit = _differs_of(_pseudo_readings(atlas, built), built)
+                _DIFFERS_CACHE[key] = hit
+            differs = hit
+        for e in open_pairs:
+            assert e.pair is not None
+            if (e.pair.addr_a, e.pair.addr_b) in differs:
+                e.listed_as = "S"
+                e.string_edges = built.edges_by_anchor.get(f"a:{e.pair.addr_a}")
+                e.rank = _rank(e)
+                s.append(e)
+    s.sort(key=lambda e: e.entry_id)
+    listed = ListedView([*built.entries, *s], frozenset(e.entry_id for e in s))
+    built.listed = listed
+    return listed
 
 
 # The 5-bucket cause of a pair with no text to compare (reading UNAVAILABLE or SKIPPED_MICRO_STATE),
@@ -3051,12 +3408,13 @@ def _proposed_json(
 
 
 def _not_listed_counts(built: BuiltDiff, readings: _Readings) -> dict[str, dict[str, Any]]:
-    """The aligned, similarity-1 pairs that place no entry, counted by pseudocode_sameness. The
-    'differs' count carries a ``page_with`` recipe: the view's filters only reach LISTED entries,
-    so a dedicated ``not_listed_page`` is the way to walk these."""
+    """The aligned, similarity-1 pairs that place no entry, counted by pseudocode_sameness — after
+    listed_view, which lists the ones reading differs as bucket S. That category keeps its key with
+    a count of 0 and says where its pairs are (``listed_as``, read with ``bucket="S"``), so the
+    listed entries and these counts still add up to every placed pair."""
     tally: dict[str, int] = {}
     for e in built.placed:
-        if e.bucket:
+        if e.listed:
             continue
         state = _sameness_of(e, readings)
         if state is not None:
@@ -3065,8 +3423,12 @@ def _not_listed_counts(built: BuiltDiff, readings: _Readings) -> dict[str, dict[
         name: {"count": tally.get(state, 0)} for state, name in sameness.NOT_LISTED_NAME.items()
     }
     differs = sameness.NOT_LISTED_NAME[sameness.DIFFERS]
-    out[differs]["page_with"] = f"not_listed_page={differs}"
+    out[differs].update(_S_LISTED_AS)
     return out
+
+
+# Where the not-listed 'differs' category went: every such pair is listed, as bucket S.
+_S_LISTED_AS = {"listed_as": "bucket S", "page_with": 'bucket="S"'}
 
 
 # ── entry_words: each side's data words holding the entry value (a read-face reading) ─────────
@@ -3160,7 +3522,7 @@ def _entry_words_view(atlas: sqlite3.Connection, built: BuiltDiff) -> _EntryWord
             delta = entry_words.entry_delta(ra, rb)
             if delta is None:
                 continue
-            if not e.bucket:
+            if not e.listed:
                 if delta in _ENTRY_WORDS_NOT_LISTED:
                     not_listed[delta] = not_listed.get(delta, 0) + 1
                 continue
@@ -3172,7 +3534,7 @@ def _entry_words_view(atlas: sqlite3.Connection, built: BuiltDiff) -> _EntryWord
                 "a": entry_words.side_json(img_a, ra, e.pair.addr_a),
                 "b": entry_words.side_json(img_b, rb, e.pair.addr_b),
             }
-        elif e.unpaired is not None and e.bucket:
+        elif e.unpaired is not None and e.listed:
             side = e.unpaired.side
             image, why = sides.get(side, (None, "side_unreadable"))
             if side in unavailable:
@@ -3209,7 +3571,7 @@ def _not_listed_page(
         (
             e
             for e in built.placed
-            if not e.bucket
+            if not e.listed
             and _sameness_of(e, readings) == state
             and (body is None or _body_of(e, readings) == body)
         ),
@@ -3248,11 +3610,18 @@ def _not_listed_page(
             scan = scans[(e.pair.addr_a, e.pair.addr_b)]
             row.update(_entry_guards(e, scan, [], {})[0])
         rows.append(row)
-    return {
+    out: dict[str, Any] = {
         "entries": rows,
         "total_entries": len(pairs),
         "next_offset": end if end < len(pairs) else None,
     }
+    if state == sameness.DIFFERS:
+        # Listed now, as bucket S: this page is empty by construction and says where they are.
+        out.update(_S_LISTED_AS)
+        out["read_with"] = (
+            f'get_diff_patch_view(diff_id={json.dumps(built.diff.diff_id)}, bucket="S")'
+        )
+    return out
 
 
 # ── detail='summary': a projection of the rendered entry ─────────────────────────────────────
@@ -3311,6 +3680,8 @@ _SUMMARY_COPY = frozenset(
         "pseudocode_sameness",
         "text_unverified_reasons",
         "significance",
+        "lift_basis",
+        "swap_pairing_note",
         "rows_total",
         "rows_by_presence",
     }
@@ -3463,6 +3834,16 @@ def _summary_entry_words(block: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _summary_sink_counts(counts: dict[str, Any]) -> dict[str, Any]:
+    """sink_candidate_counts as a summary prints it: its pairing and whole delta, and of the
+    unknown side / sink pairs only how many and why (``unknown: {n, reasons}``)."""
+    out: dict[str, Any] = {"pairing": counts["pairing"], "delta": _copy(counts["delta"])}
+    unknown = counts["unknown"]
+    if unknown:
+        out["unknown"] = {"n": len(unknown), "reasons": sorted({u["reason"] for u in unknown})}
+    return out
+
+
 def _summary_entry(full: dict[str, Any], *, micro_side: bool) -> dict[str, Any]:
     """One listed entry as ``detail='summary'`` prints it, projected from ``full`` (what _render
     printed with no inline row), field by field in its order. ``micro_side``: the entry is an
@@ -3493,6 +3874,8 @@ def _summary_entry(full: dict[str, Any], *, micro_side: bool) -> dict[str, Any]:
                 out[key] = cs
         elif key == "sink_callee_swap":
             out[key] = _kept({k: value[k] for k in _SUMMARY_SWAP if k in value})
+        elif key == "sink_candidate_counts":
+            out[key] = _summary_sink_counts(value)
         elif key == "callers_a":
             if value:
                 out[key] = _kept({"count": value.get("count")})
@@ -3608,17 +3991,18 @@ def _detail_fields(
 # The candidate_tier order (lens.order on such a page's first page).
 _ORDER_CANDIDATE_TIER = (
     "A; then the entries carrying a sink candidate (tier; R, then B with "
-    "sink_presence_signal first, then E; similarity, address); then the entries with "
-    "none (recall_gap_sink, R, C, then E by caller relevance: a recall-gap callee, a "
-    "callee that is itself a candidate, the rest); then P"
+    "sink_presence_signal or an aligned sink_callee_swap first, then E, then S; similarity, "
+    "address); then the entries with none (recall_gap_sink, R, C, then E by caller relevance: a "
+    "recall-gap callee, a callee that is itself a candidate, the rest; then S); then P"
 )
 # The significance order (lens.order on such a page's first page); its rules are in the tool's
 # description, the short reading in lens.significance on every page.
 _ORDER_SIGNIFICANCE = (
-    "significance: attention 0, then 1, then 2 (lens.significance); inside 1 — a narrow "
-    "sink_callee_swap first, then the anchored_differs pairs at or above the floor, then those "
-    "below it (and the demoted __FILE__/__LINE__ and micro-side pairs), then lowest similarity "
-    "first; an R entry reading identical_unique closes 1; P last."
+    "significance: attention 0, then 1, then 2 (lens.significance); inside 1 — the entries with a "
+    "lift_basis first (a sink name in the callee-set difference, or a changed sink candidate "
+    "count, on a proposed pairing), then the anchored_differs pairs at or above the floor, then "
+    "those below it (and the demoted __FILE__/__LINE__ and micro-side pairs), then lowest "
+    "similarity first; an R entry reading identical_unique closes 1; P last."
 )
 # lens.band (band on, first page): the groups the page's order forms.
 _BAND_CANDIDATE_TIER = (
@@ -3680,9 +4064,13 @@ def function_states(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] |
     ``alignment_undetermined_anchored_micro_side`` counts undetermined pairs anchored with one side
     a micro-stub and the other a real body; ``alignment_undetermined_unavailable_by_cause`` splits
     the pairs proposed unavailable or skipped_micro the same way, summing to those two counts.
-    Functions with no counterpart are counted by presence_state, never "added"/"removed". A diff
-    undetermined as a whole is ``withheld`` with its banners and NO
-    counts — a blind spot, not zero changes. None when there is no such diff."""
+    Functions with no counterpart are counted by presence_state, never "added"/"removed".
+    ``changed`` also counts, over every pair the diff placed (a proposed pairing is an undetermined
+    pair, outside ``changed.total``): ``with_sink_callee_swap`` by pairing and by which side holds
+    the sink, ``with_sink_candidate_counts_delta`` by pairing,
+    ``with_sink_candidate_counts_unknown`` and ``listed_as_s`` (bucket S, from this call's own
+    readings). A diff undetermined as a whole is ``withheld`` with its banners and NO counts — a
+    blind spot, not zero changes. None when there is no such diff."""
     built = build_diff_view(atlas, diff_id)
     if built is None:
         return None
@@ -3697,6 +4085,7 @@ def function_states(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] |
     undetermined = sum(1 for p in d.pairs if not p.aligned)
     readings = _pseudo_readings(atlas, built)
     _annotate_entries(built, readings)
+    listed = listed_view(atlas, built, readings)
     tally: dict[str, int] = {}
     by_body = {cls: 0 for cls in sameness.BODY_CLASSES}
     proposed = {state: 0 for state in sameness.U_STATES}
@@ -3705,7 +4094,20 @@ def function_states(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] |
     # aligned pairs reading unavailable or skipped_micro; undetermined pairs proposed either
     unavail_cause = {k: 0 for k in _UNAVAILABLE_CAUSES}
     u_unavail_cause = {k: 0 for k in _UNAVAILABLE_CAUSES}
+    swaps = {pairing: {"a_only": 0, "b_only": 0, "both": 0} for pairing in ("aligned", "proposed")}
+    count_deltas = {"aligned": 0, "proposed": 0}
+    count_unknown = 0
     for e in built.placed:
+        swap = _sink_callee_swap(e)
+        if swap is not None:
+            a, b = bool(swap["sinks_only_in_a"]), bool(swap["sinks_only_in_b"])
+            swaps[swap["pairing"]]["both" if a and b else "a_only" if a else "b_only"] += 1
+        sc = e.sink_candidate_counts
+        if sc is not None:
+            if sc["delta"]:
+                count_deltas[sc["pairing"]] += 1
+            if sc["unknown"]:
+                count_unknown += 1
         reading = _proposed_of(e, readings)
         if reading is not None:
             ustate = reading[0]
@@ -3760,6 +4162,12 @@ def function_states(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] |
             "total": changed,
             "with_scoped_sink_delta": scoped,
             "no_scoped_signal": changed - scoped,
+            # Counted over every pair the diff placed, by pairing: a proposed one is an
+            # undetermined pair, so it is not among the aligned pairs counted in ``total``.
+            "with_sink_callee_swap": swaps,
+            "with_sink_candidate_counts_delta": count_deltas,
+            "with_sink_candidate_counts_unknown": count_unknown,
+            "listed_as_s": len(listed.s_ids),
         },
         "unverified": {"total": sum(unverified.values()), **unverified},
         "identical_text_unverified_by_body": by_body,
@@ -3839,14 +4247,15 @@ def anchored_differs_banner(states: dict[str, Any] | None) -> str | None:
     return " ".join(parts)
 
 
-def _resolve_entry(built: BuiltDiff, entry_id: str) -> _Entry | str:
+def _resolve_entry(built: BuiltDiff, entry_id: str, entries: list[_Entry]) -> _Entry | str:
     """The listed entry ``entry_id`` names — by its entry_id, or by its anchor_ref — or why none.
+    ``entries`` is listed_view's (bucket S included).
 
     Read the way promote reads its entry (lib/query/diff_annotations), whose wording the refusals
     share: an anchor of another run pair or binary, or a candidate anchor, is refused by what it
     is. An entry that is placed but not listed is named as such, with where it is counted."""
     d = built.diff
-    for e in built.entries:
+    for e in entries:
         if e.entry_id == entry_id:
             return e
     if "#" in entry_id:
@@ -3863,6 +4272,11 @@ def _resolve_entry(built: BuiltDiff, entry_id: str) -> _Entry | str:
                 "entry's anchor_ref"
             )
         kind, key = parts
+        if kind in ("non_binary", "binary_presence"):
+            return (
+                f"{entry_id!r} is a {kind} anchor, read on the run pair (not an entry of this "
+                "diff): see get_file_diff / binary_presence"
+            )
         named = diff_review.key_binary(kind, key)
         if kind != "candidate" and named != d.binary:
             return f"{entry_id!r} names binary {named!r}, but diff {d.diff_id!r} is of {d.binary!r}"
@@ -3871,11 +4285,11 @@ def _resolve_entry(built: BuiltDiff, entry_id: str) -> _Entry | str:
                 "entry_id takes an entry (its entry_id or anchor_ref), not a candidate anchor — a "
                 "candidate is read in its entry's rows"
             )
-        for e in built.entries:
+        for e in entries:
             if diff_review.entry_anchor(e, d.run_a, d.run_b, d.binary) == entry_id:
                 return e
     for e in built.placed:
-        if e.bucket:
+        if e.listed:
             continue
         anchor = diff_review.entry_anchor(e, d.run_a, d.run_b, d.binary) if d.binary else None
         if entry_id in (e.entry_id, anchor):
@@ -4050,17 +4464,20 @@ def get_diff_patch_view(
     if built is None:
         return {"diff_id": diff_id, "found": False, "error": "no such diff (see list_diffs)"}
     one: _Entry | None = None
+    if entry_id is not None and built.withheld is not None:
+        return {
+            "diff_id": diff_id,
+            "error": (
+                "the whole diff is undetermined (banners): it lists no entry until that is resolved"
+            ),
+            "banners": built.banners,
+        }
+    readings = _pseudo_readings(atlas, built)
+    _annotate_entries(built, readings)
+    # The listed entries, bucket S included, decided from this view's own readings.
+    shown = listed_view(atlas, built, readings)
     if entry_id is not None:
-        if built.withheld is not None:
-            return {
-                "diff_id": diff_id,
-                "error": (
-                    "the whole diff is undetermined (banners): it lists no entry until that is "
-                    "resolved"
-                ),
-                "banners": built.banners,
-            }
-        found = _resolve_entry(built, entry_id)
+        found = _resolve_entry(built, entry_id, shown.entries)
         if isinstance(found, str):
             return {"diff_id": diff_id, "error": found}
         one = found
@@ -4071,9 +4488,7 @@ def get_diff_patch_view(
                 "error": f"rows_offset {rows_offset} is past the entry's last row",
                 "rows_total": n_rows,
             }
-    overlay, banners, entries = built.overlay, built.banners, built.entries
-    readings = _pseudo_readings(atlas, built)
-    _annotate_entries(built, readings)
+    overlay, banners, entries = built.overlay, built.banners, shown.entries
 
     # Counted over every overlay row of the diff, listed entry or not.
     rows_by_spot = {
@@ -4091,8 +4506,8 @@ def get_diff_patch_view(
         ),
     }
     counts = {
-        "by_bucket": _count(e.bucket for e in entries),
-        "by_subclass": _count(f"{e.bucket}|{e.subclass}" for e in entries),
+        "by_bucket": _count(e.shown_bucket for e in entries),
+        "by_subclass": _count(f"{e.shown_bucket}|{e.shown_subclass}" for e in entries),
         "by_tier": _count(str(e.tier) for e in entries),
         "by_row_subclass": _count(
             f"{v['landing']}|{v['subclass']}"
@@ -4121,7 +4536,7 @@ def get_diff_patch_view(
             and (not anchored_micro_side or _anchored_micro_side(e))
         ]
     )
-    review = ViewReview(atlas, built)
+    review = ViewReview(atlas, built, shown)
     unknown_filter = _unknown_filter_value(entries, subclass, blind_spot)
     # entry_words: a sink_patch page only (the listed entries' blocks, reduced to counts on a
     # summary page, and the whole diff's counts on every page); the other views carry neither.
@@ -4243,6 +4658,7 @@ def get_diff_patch_view(
     lens: dict[str, tuple[int, str]] = {}
     settled: dict[str, int] = {}
     swap_lift: dict[str, int] = {}
+    lift_basis: dict[str, str] = {}
     if effective == "significance":
         lens = {
             e.entry_id: significance(
@@ -4256,16 +4672,16 @@ def get_diff_patch_view(
         settled = {
             k: 1 for k, (state, _read) in proposed.items() if state == sameness.U_IDENTICAL_UNIQUE
         }
-        # After the attention is known (a bucket C entry reaches 1 through its swap). Every
-        # attention-1 entry with a narrow swap leads its tier, whatever its basis — a judgement
-        # changes the basis it reads, never its place.
-        swap_lift = {
-            e.entry_id: 1
+        # After the attention is known. Every attention-1 entry carrying a sink name in its
+        # callee-set difference, or a changed sink candidate count, leads its tier whatever its
+        # basis — a judgement changes the basis it reads, never its place. On an aligned pair either
+        # has floated it to 0 already, so what is lifted here is an R entry's proposed pairing.
+        lift_basis = {
+            e.entry_id: basis
             for e in chosen
-            if lens[e.entry_id][0] == ATTENTION_MIDDLE
-            and (swap := _sink_callee_swap(e)) is not None
-            and swap["narrow"]
+            if lens[e.entry_id][0] == ATTENTION_MIDDLE and (basis := _lift_basis(e)) is not None
         }
+        swap_lift = {k: 1 for k in lift_basis}
         envelope["lens"]["significance"] = _SIGNIFICANCE_LENS_SHORT
         envelope["lens"]["sunk_with_body_size_differs"] = {
             "count": sum(
@@ -4370,6 +4786,7 @@ def get_diff_patch_view(
                 "sink_callee_swap": swap_lift.get(e.entry_id, 0),
             }
             out["significance"] = {"attention": attention, "basis": basis}
+            out["lift_basis"] = lift_basis.get(e.entry_id)
         return out
 
     rendered = [_render(e) for e in page]
@@ -4391,11 +4808,18 @@ def get_diff_patch_view(
 
 class ViewReview:
     """The judgements on one built diff, read against it: each listed entry's anchor and review
-    state, the progress over a scope of entries, and the annotation block."""
+    state, the progress over a scope of entries, and the annotation block. ``listed`` is
+    listed_view's result when the caller holds it (read from its own readings); else it is asked
+    for here."""
 
-    def __init__(self, atlas: sqlite3.Connection, built: BuiltDiff) -> None:
+    def __init__(
+        self, atlas: sqlite3.Connection, built: BuiltDiff, listed: ListedView | None = None
+    ) -> None:
         d = built.diff
         self.built = built
+        # Bucket S marks its entries in place, and the same-shape group re-check below reads which
+        # entries are listed: decide it before anything else reads the build.
+        self.listed = listed if listed is not None else listed_view(atlas, built)
         self.binary = d.binary
         self.withheld = built.withheld is not None
         rows = diff_review.read_judgements(atlas, d.run_a, d.run_b)
@@ -4425,22 +4849,23 @@ class ViewReview:
             staleness=built.staleness,
             group_review=_group_review,
         )
+        entries = self.listed.entries
         self.anchor: dict[str, str | None] = {
             e.entry_id: (
                 diff_review.entry_anchor(e, d.run_a, d.run_b, d.binary) if d.binary else None
             )
-            for e in built.entries
+            for e in entries
         }
-        position = {e.entry_id: i for i, e in enumerate(_sort(built.entries, None))}
+        position = {e.entry_id: i for i, e in enumerate(_sort(entries, None))}
         self.items: dict[str, diff_review.Item] = {}
-        for e in built.entries:
+        for e in entries:
             anchor = self.anchor[e.entry_id]
             judged = self.judged.get(anchor) if anchor is not None else None
             self.items[e.entry_id] = diff_review.Item(
                 entry_id=e.entry_id,
                 anchor_ref=anchor or "",
-                bucket=e.bucket,
-                subclass=e.subclass,
+                bucket=e.shown_bucket,
+                subclass=e.shown_subclass,
                 tier=e.tier,
                 state=diff_review.review_state(judged),
                 verdict=judged.verdict if judged is not None else None,
@@ -4553,9 +4978,9 @@ def _matches(
     tier: str | int | None,
     blind_spot: str | None,
 ) -> bool:
-    if bucket is not None and e.bucket != bucket:
+    if bucket is not None and e.shown_bucket != bucket:
         return False
-    if subclass is not None and subclass != e.subclass:
+    if subclass is not None and subclass != e.shown_subclass:
         if subclass not in {v["subclass"] for v in e.row_views}:
             return False
     if tier is not None and str(tier) != str(e.tier):
@@ -4573,7 +4998,7 @@ def _unknown_filter_value(
     notes = []
     if subclass is not None:
         present = sorted(
-            {e.subclass for e in entries if e.subclass}
+            {e.shown_subclass for e in entries if e.shown_subclass}
             | {v["subclass"] for e in entries for v in e.row_views if v["subclass"]}
         )
         if subclass not in present:

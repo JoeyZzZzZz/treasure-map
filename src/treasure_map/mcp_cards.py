@@ -380,14 +380,21 @@ TOOL_CARDS: dict[str, ToolCard] = {
     "start_diff_review": ToolCard(
         required=("diff_id",),
         example='start_diff_review(diff_id="<run_a>::<run_b>::<binary>")',
-        boundary=("START HERE for one diff", "nothing computed of its own"),
+        boundary=(
+            "START HERE for one diff",
+            "nothing computed of its own",
+            'UNREAD, which is not "nothing found"',
+        ),
         summary=(
             "START HERE for one diff: the entries to read first and the calls to read and judge "
             "them, composed from get_diff_patch_view and get_diff_meta, nothing computed of its "
             "own. diff_id = {run_a}::{run_b}::{binary} (list_diffs gives the ids). Returns "
-            "workflow, meta, headline (the first entry in full), view (a summary page of up to "
-            "limit entries, cut to fit beside the rest), read_next and non_binary. A diff with a "
-            "proven-stale side is refused."
+            "workflow, meta (with binary_presence: the binaries one run holds alone), headline "
+            "(the first entry in full), view (a summary page of up to limit entries, cut to fit "
+            "beside the rest), read_next and non_binary. An entry nobody judged is UNREAD, which "
+            'is not "nothing found": read the P entries, the attention-1 entries with a '
+            "lift_basis, bucket S and each binary_presence binary too. A diff with a proven-stale "
+            "side is refused."
         ),
     ),
     "get_diff_patch_view": ToolCard(
@@ -398,11 +405,15 @@ TOOL_CARDS: dict[str, ToolCard] = {
             'A withheld hunk is never "no change"',
             'absent is not "no sink changed"',
             "A differing list is NOT proof a call was made or dropped",
+            'UNREAD, which is not "nothing found"',
         ),
         summary=(
             "One diff's function-level view: an entry per function pair that changed, sorted into "
-            "buckets (A, B, R = undetermined pair, C, P = no counterpart, E = caller-set edge), "
-            "plus a blind_spots ledger — evidence, never a verdict or a score. Default order: "
+            "buckets (A, B, R = undetermined pair, C, P = no counterpart, E = caller-set edge, S = "
+            "similarity-1 pair whose pseudocode differs), plus a blind_spots ledger — evidence, "
+            "never a verdict or a score. An entry nobody judged is UNREAD, which is not "
+            '"nothing found". sink_candidate_counts counts hunt candidates, not calls. '
+            "Default order: "
             "significance; also sort_by, the bucket / subclass / tier / blind_spot filters and "
             "limit / offset (follow next_offset). rows_limit=0 scans every entry with its summary "
             "and inline_hunk; detail='summary' gives counts only; entry_id (+ rows_offset) reads "

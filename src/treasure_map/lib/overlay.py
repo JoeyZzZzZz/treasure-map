@@ -689,6 +689,64 @@ def prepare_file_annotation(
     )
 
 
+def prepare_presence_annotation(
+    atlas: sqlite3.Connection,
+    presence: Any,
+    *,
+    anchor_ref: str,
+    verdict: str,
+    rationale: str,
+    attributed_to: str | None,
+    verdict_basis: dict[str, Any] | None,
+    group_ref: str | None,
+) -> PreparedDiffWrite:
+    """Validate and snapshot one judgement on a binary one run of the pair holds alone — READ ONLY,
+    like ``prepare_file_annotation``, and written by the same ``write_prepared``. ``presence`` is
+    lib/query/binary_presence ``Presence`` (diff_annotations.presence_scope). The anchor must name
+    a binary listed there now; its basis is that binary's facts (side, path, name, content hash,
+    candidates and their classes, recorded references). ``checked`` / ``evidence`` resolve to its
+    own anchor or one of its candidates in its own run. It has no same-shape group, so
+    ``group_ref`` is refused."""
+    basis_json = _check_diff_write(verdict, verdict_basis, rationale, attributed_to, group_ref)
+    if group_ref is not None:
+        raise ConfigError(
+            "group_ref names a same-shape group of a function entry; a binary one run holds alone "
+            "has none"
+        )
+    from treasure_map.lib.query import binary_presence as bp
+    from treasure_map.lib.query import diff_review as dr
+
+    run_a, run_b = presence.run_a, presence.run_b
+    if dr.split_anchor(anchor_ref, run_a, run_b) is None:
+        raise ConfigError(
+            f"{anchor_ref!r} is not an anchor of the run pair {run_a}::{run_b} — copy it from "
+            "binary_presence.anchor_ref (get_diff_meta, list_diffs coverage, or the run pair's "
+            "review_progress)"
+        )
+    subject = bp.presence_subjects(presence).get(anchor_ref)
+    if subject is None:
+        raise ConfigError(
+            f"{anchor_ref!r} names no binary that only one run of {run_a}::{run_b} holds now"
+        )
+    snapshot = dr.file_snapshot(run_a, run_b, subject)
+    if verdict == "no_real_change" and verdict_basis is not None:
+        bp.require_presence_checked(
+            atlas, presence, anchor_ref, verdict_basis["checked"], "checked"
+        )
+    elif verdict == "changed_real" and verdict_basis is not None and "evidence" in verdict_basis:
+        bp.require_presence_checked(
+            atlas, presence, anchor_ref, verdict_basis["evidence"], "evidence"
+        )
+    return PreparedDiffWrite(
+        anchor_ref=anchor_ref,
+        verdict=verdict,
+        rationale=rationale,
+        attributed_to=attributed_to,
+        basis_state=json.dumps(snapshot, sort_keys=True),
+        verdict_basis=basis_json,
+    )
+
+
 def write_prepared(atlas: sqlite3.Connection, p: PreparedDiffWrite) -> UpsertResult:
     """Write one prepared diff annotation (upsert, no commit). ``promoted_from`` is NULL and
     ``basis_resolved`` True, as a diff write always is."""
@@ -719,14 +777,16 @@ def annotate_diff(
     diff_id: str | None = None,
     run_pair: str | None = None,
 ) -> UpsertResult:
-    """Write (or overwrite) the judgement on one entry of a diff's function-level view, or on one
-    non-binary file of a run pair.
+    """Write (or overwrite) the judgement on one entry of a diff's function-level view, on one
+    non-binary file of a run pair, or on one binary only one run of the pair holds.
 
     Exactly one of ``diff_id`` (one binary's diff) and ``run_pair`` (``{run_a}::{run_b}``) names
     where ``anchor_ref`` is read. A function or candidate anchor needs ``diff_id``. A non-binary
     file's anchor (``{run_a}::{run_b}#non_binary#{path}``, from get_file_diff) takes ``run_pair``,
     or the ``diff_id`` of any binary diff of the same run pair; it is checked against the pair's
-    files (lib/query/file_diff), whether or not a binary diff exists for it.
+    files (lib/query/file_diff), whether or not a binary diff exists for it. A binary_presence
+    anchor (``{run_a}::{run_b}#binary_presence#{a_only|b_only}:{path}``) takes ``run_pair`` only:
+    no binary diff covers such a binary.
 
     ``anchor_ref`` names the entry (a function pair, a function with no counterpart, or one
     candidate row of an entry) inside ``diff_id``; get_diff_patch_view prints it on every entry.
@@ -747,15 +807,41 @@ def annotate_diff(
     A snapshot of the group is stored beside the facts, and get_diff_patch_view re-checks it: a
     member moving, joining or leaving puts the judgement back in needs_recheck. Overwriting the
     judgement without ``group_ref`` again drops the group — pass it each time to keep it."""
-    from treasure_map.lib.query.diff_annotations import _binary_diff, _built, file_scope
+    from treasure_map.lib.query import diff_review as dr
+    from treasure_map.lib.query.diff_annotations import (
+        _binary_diff,
+        _built,
+        file_scope,
+        presence_scope,
+    )
     from treasure_map.lib.query.file_diff import is_non_binary_anchor
     from treasure_map.lib.query.same_shape_siblings import _meta as _side_meta
 
     if (diff_id is None) == (run_pair is None):
         raise ConfigError(
             "pass exactly one of diff_id (one binary's diff, from list_diffs) or run_pair "
-            "({run_a}::{run_b}, for a non-binary file's anchor)"
+            "({run_a}::{run_b}, for a non-binary file's or a binary_presence anchor)"
         )
+    if dr.is_binary_presence_anchor(anchor_ref):
+        if run_pair is None:
+            raise ConfigError(
+                f"{anchor_ref!r} names a binary one run of the pair holds alone, which no binary "
+                "diff covers: pass run_pair ({run_a}::{run_b}) instead of diff_id"
+            )
+        prepared = prepare_presence_annotation(
+            atlas,
+            presence_scope(atlas, run_pair),
+            anchor_ref=anchor_ref,
+            verdict=verdict,
+            rationale=rationale,
+            attributed_to=attributed_to,
+            verdict_basis=verdict_basis,
+            group_ref=group_ref,
+        )
+        result = write_prepared(atlas, prepared)
+        if commit:
+            atlas.commit()
+        return result
     if is_non_binary_anchor(anchor_ref):
         scope = file_scope(atlas, diff_id=diff_id, run_pair=run_pair)
         prepared = prepare_file_annotation(
@@ -775,7 +861,7 @@ def annotate_diff(
     if diff_id is None:
         raise ConfigError(
             f"{anchor_ref!r} is a function or candidate anchor: pass diff_id (list_diffs) — "
-            "run_pair takes a non-binary file's anchor only"
+            "run_pair takes a non-binary file's or a binary_presence anchor only"
         )
     meta = _binary_diff(atlas, diff_id)
     built = _built(atlas, diff_id)

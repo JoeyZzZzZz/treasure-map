@@ -861,6 +861,60 @@ REPLACED = {
             "fits at every limit"
         ),
     },
+    "get_diff_patch_view": {
+        "A similarity-1 pair whose candidates line up, or that has none, is not listed UNLESS a "
+        "length constant changed or its caller-set edge reads lost-or-undetermined (then E); the "
+        "rest are counted under ``not_listed`` by ``pseudocode_sameness`` (below).": (
+            "a similarity-1 pair whose pseudocode differs is listed now, as bucket S"
+        ),
+        "The significance order is a lens, not a relabel: attention 0 = bucket A or a row "
+        "carrying ``sink_arg_constant_delta``; 2 (sunk, still listed) = pseudocode_sameness "
+        "``identical`` or bucket C, except a bucket C entry carrying a narrow ``sink_callee_swap`` "
+        "(basis ``sink_callee_swap_never_sunk``; a wide one still sinks); 1 = the rest, lowest "
+        "similarity first, R and B entries ordered together — the entries carrying a narrow "
+        "``sink_callee_swap`` first inside it (``rank_key.sink_callee_swap`` = 1; their basis "
+        "stays their own), then the ``anchored_differs`` pairs at or above the read-first floor, "
+        "then those below it (and the demoted ``__FILE__``/``__LINE__`` and micro-side pairs), "
+        "then the rest.": (
+            "an aligned sink swap or candidate-count delta now floats its entry to attention 0 "
+            "whatever its width; the attention-1 lift is for a proposed one, and "
+            "sink_callee_swap_never_sunk is no longer a basis"
+        ),
+        "Never sunk: an R entry (attention 2 never holds one; one whose proposed reading is "
+        "``identical_unique`` closes attention 1), a ``sink_present_no_visible_delta`` B "
+        "(labelled ``recheckable_no_visible_delta``), an ``identical_text_unverified`` entry "
+        "outside bucket C, a bucket C entry with a narrow ``sink_callee_swap``, a bucket E entry "
+        "or any entry whose B side lost every direct caller (caller-set edge: basis "
+        "``lost_every_direct_caller_never_sunk``, or ``caller_signal_undetermined_never_sunk`` for "
+        "an E whose B side could not be proven empty), and an entry judged changed_real, "
+        "inconclusive or due a re-check / relabel — none of them reaches attention 2, whether "
+        "``band`` is on or off; only with ``band=true`` does the judgment band order entries "
+        "inside each tier.": (
+            "a bucket C entry with a swap is floated now, not held; the list names bucket S instead"
+        ),
+        "Two signals BinDiff similarity is blind to, on the function-pair view: each aligned "
+        "entry carries ``pseudocode_sameness`` — ``identical`` (address-normalised pseudocode AND "
+        "callees match, nothing left unverified), ``identical_text_unverified`` (the text matches "
+        "but the match rests on something unchecked; ``text_unverified_reasons``: "
+        "``literal_basis_unknown`` = a large literal read as an address only because a side's "
+        "image extent is unknown, "
+        "``decompile_incomplete:<tag>`` = the decompiler marked its output incomplete, "
+        "``body_size_differs`` = the two body byte counts differ), ``identical_callee_unverified`` "
+        '(text matches, callees not verified — NOT "unchanged"), ``differs``, ``no_body`` (an '
+        "import/PLT stub, not in the functions table), ``skipped_micro`` (no text to compare only "
+        "because a side is under ~10 bytes, which tmap does not decompile BY DESIGN — a binary "
+        "property, NOT a read failure) or ``unavailable`` (a side's text could not be read: an "
+        "empty decompile, an unrecorded size or an unreadable analysis.db; get_diff_meta's "
+        "functions.unavailable_by_cause splits these two states by why); the similarity-1 pairs "
+        "that place no entry are counted by it under ``not_listed`` (``not_listed_page=<name>`` "
+        "walks one category, e.g.": (
+            "the pairs reading differs are listed as bucket S now, so that category's page is "
+            "empty; the sentence says so"
+        ),
+        "``aligned_pseudocode_differs``).": (
+            "the tail of the sentence above (split at 'e.g.'), replaced with it"
+        ),
+    },
     "get_strings": {
         "When ``function`` resolves, ITS binary is used and ``binary`` does not re-select.": (
             "true in value mode only; listing a binary's strings needs binary, which function "
@@ -962,12 +1016,17 @@ BOUNDARY: dict[str, tuple[str, ...]] = {
         "These are ENUMERATED FACTS, NOT a reachability verdict",
         "An EMPTY result is NOT proof that nothing launches the binary",
     ),
-    "start_diff_review": ("START HERE for one diff", "nothing computed of its own"),
+    "start_diff_review": (
+        "START HERE for one diff",
+        "nothing computed of its own",
+        'UNREAD, which is not "nothing found"',
+    ),
     "get_diff_patch_view": (
         "evidence, never a verdict or a score",
         'A withheld hunk is never "no change"',
         'absent is not "no sink changed"',
         "A differing list is NOT proof a call was made or dropped",
+        'UNREAD, which is not "nothing found"',
     ),
     "get_diff_deltas": (
         "NOT a change/quality verdict",

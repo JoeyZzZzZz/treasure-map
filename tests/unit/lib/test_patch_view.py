@@ -553,17 +553,23 @@ def test_pseudocode_sameness_reads_its_seven_states(tmp_path: Path, current: Non
     w.fn("a", "0000b000", ["foo"], pseudocode=body)
     w.fn("b", "0000c000", ["foo"], pseudocode=body)
     w.commit()
-    nl = pv.get_diff_patch_view(w.atlas, DIFF)["not_listed"]
+    v = pv.get_diff_patch_view(w.atlas, DIFF)
+    nl = v["not_listed"]
     counts = {k.replace("aligned_pseudocode_", ""): c["count"] for k, c in nl.items()}
+    # the pair whose text differs is listed as bucket S; its category keeps its key at 0
     assert counts == {
         "identical": 1,
         "identical_text_unverified": 1,
         "identical_callee_unverified": 1,
-        "differs": 1,
+        "differs": 0,
         "no_body": 1,
         "skipped_micro": 1,
         "unavailable": 1,
     }
+    assert nl["aligned_pseudocode_differs"]["listed_as"] == "bucket S"
+    listed = {e["entry_id"]: e for e in v["entries"]}
+    assert set(listed) == {_pair_id("00005000", "00006000")}
+    assert listed[_pair_id("00005000", "00006000")]["bucket"] == "S"
 
 
 def test_a_changed_length_constant_lists_an_otherwise_identical_pair(
@@ -666,8 +672,11 @@ def test_what_the_length_signal_cannot_see_is_declared_not_guessed(
     w.fn("b", "00002000", ["strncpy"], pseudocode="char buf[4096]; strncpy(buf,s,0x200);")
     w.commit()
     v = pv.get_diff_patch_view(w.atlas, DIFF)
-    assert _pair_id("00001000", "00002000") not in {e["entry_id"] for e in v["entries"]}
-    assert v["not_listed"]["aligned_pseudocode_differs"]["count"] == 1  # the body did change
+    by_id = {e["entry_id"]: e for e in v["entries"]}
+    # the body did change, so the pair is listed — as bucket S, never as a length delta (B)
+    assert _pair_id("00001000", "00002000") in by_id
+    assert by_id[_pair_id("00001000", "00002000")]["bucket"] == "S"
+    assert v["not_listed"]["aligned_pseudocode_differs"]["count"] == 0
     keys = {s["key"] for s in v["blind_spots"] if s.get("count") is None}
     assert {"size_constant_outside_sink_arg", "local_buffer_size_unread"} <= keys
 
@@ -688,8 +697,10 @@ def test_a_re_extraction_is_not_served_a_stale_reading(tmp_path: Path, current: 
     w.adb["b"].execute("UPDATE functions SET pseudocode = 'p = foo(0x3f);'")
     w.atlas.execute("UPDATE run SET build_hash = 'rebuilt'")  # both runs: no generation mismatch
     w.commit()
-    nl = pv.get_diff_patch_view(w.atlas, DIFF)["not_listed"]
-    assert nl["aligned_pseudocode_differs"]["count"] == 1
+    v = pv.get_diff_patch_view(w.atlas, DIFF)
+    # the new reading differs: the pair is listed as bucket S
+    assert v["not_listed"]["aligned_pseudocode_identical"]["count"] == 0
+    assert [e["bucket"] for e in v["entries"]] == ["S"]
 
 
 def _size(kind: str, arg: str) -> str:
@@ -760,7 +771,21 @@ def test_function_states_count_each_function_once_by_the_views_own_facts(
     s = pv.function_states(w.atlas, DIFF)
     assert s is not None and s["withheld"] is False
     assert s["unchanged"] == 1
-    assert s["changed"] == {"total": 3, "with_scoped_sink_delta": 2, "no_scoped_signal": 1}
+    assert s["changed"] == {
+        "total": 3,
+        "with_scoped_sink_delta": 2,
+        "no_scoped_signal": 1,
+        # bucket A's pair: system only on A, popen only on B — one swap with a sink on each side,
+        # and each sink's candidate count differs (1 / 0)
+        "with_sink_callee_swap": {
+            "aligned": {"a_only": 0, "b_only": 0, "both": 1},
+            "proposed": {"a_only": 0, "b_only": 0, "both": 0},
+        },
+        "with_sink_candidate_counts_delta": {"aligned": 1, "proposed": 0},
+        "with_sink_candidate_counts_unknown": 0,
+        # the similarity-1 pair whose local buffer moved reads differs: listed as bucket S
+        "listed_as_s": 1,
+    }
     assert s["unverified"] == {
         "total": 2,
         "identical_text_unverified": 0,
@@ -892,6 +917,9 @@ def test_the_lens_and_the_counts_read_each_fact_through_their_wiring(
     for fa, fb in (("00001000", "00002000"), ("00003000", "00004000")):  # (a), (b): identical
         w.pair(fa, fb, 0.97, 0.9)
         w.inst("a", _ref(a, fa, "cmd", "0x30"), "cmd", "system")  # its call matched to nothing
+        # the B side holds its own (unmatched) candidate too, so the two sink candidate counts are
+        # equal and only the pseudocode reading decides where it sits
+        w.inst("b", _ref(b, fb, "cmd", "0x30"), "cmd", "system")
         w.fn("a", fa, ["system"], pseudocode="system(c);")
         w.fn("b", fb, ["system"], pseudocode="system(c);")
     w.pair("00005000", "00006000", 0.97, 0.9)  # (c): a changed body, a constant row beside it
@@ -901,6 +929,7 @@ def test_the_lens_and_the_counts_read_each_fact_through_their_wiring(
     )
     w.im("00005010", "00006010", "00005000")
     w.inst("a", _ref(a, "00005000", "cmd", "0x30"), "cmd", "system")  # matched to nothing
+    w.inst("b", _ref(b, "00006000", "cmd", "0x30"), "cmd", "system")  # equal counts, as above
     w.fn("a", "00005000", ["snprintf", "system"], pseudocode="snprintf(d,0x80,f); system(c);")
     w.fn("b", "00006000", ["snprintf", "system"], pseudocode="snprintf(d,0x100,f); system(c);")
     w.commit()
@@ -923,7 +952,13 @@ def test_the_lens_and_the_counts_read_each_fact_through_their_wiring(
     assert lens[ids["c"]]["pseudocode_sameness"] == "differs"
     s = pv.function_states(w.atlas, DIFF)
     assert s is not None
-    assert s["changed"] == {"total": 1, "with_scoped_sink_delta": 1, "no_scoped_signal": 0}
+    assert {
+        k: s["changed"][k] for k in ("total", "with_scoped_sink_delta", "no_scoped_signal")
+    } == {
+        "total": 1,
+        "with_scoped_sink_delta": 1,
+        "no_scoped_signal": 0,
+    }
     assert s["unchanged"] == 2
 
 
@@ -944,6 +979,7 @@ def test_a_qualified_match_outside_c_is_never_sunk(tmp_path: Path, current: None
     for fa, fb, text, size_a, size_b in rows.values():
         w.pair(fa, fb, 0.97, 0.9)
         w.inst("a", _ref("runA", fa, "cmd", "0x30"), "cmd", "system")  # matched to nothing
+        w.inst("b", _ref("runB", fb, "cmd", "0x30"), "cmd", "system")  # equal candidate counts
         w.fn("a", fa, ["system"], pseudocode=text, size_bytes=size_a)
         w.fn("b", fb, ["system"], pseudocode=text, size_bytes=size_b)
     w.commit()
@@ -1849,7 +1885,9 @@ def test_sort_by_puts_one_component_first_and_p_stays_last() -> None:
 
 
 def test_each_entry_names_its_order(world: World) -> None:
-    v = _view(world)
+    # the candidate_tier order, whose segments the rank_key names (under significance an aligned
+    # sink swap floats a B entry into attention 0 beside A)
+    v = _view(world, sort_by="candidate_tier")
     first = v["entries"][0]
     assert first["bucket"] == "A" and first["rank_key"]["segment"] == 1
     assert v["entries"][-1]["bucket"] == "P"
@@ -4320,11 +4358,12 @@ def test_one_entry_is_named_the_way_promote_names_it(
         _IDENTICAL_ID: None,
         "runA::runB#function_pair#libx::00003000::00004000": None,
     }
+    entries = pv.listed_view(w.atlas, built).entries
     for name, want in names.items():
-        found = pv._resolve_entry(built, name)
+        found = pv._resolve_entry(built, name, entries)
         view_says = None if isinstance(found, str) else found.entry_id
         try:
-            promote_says: str | None = dann._entry(built, meta, name).entry_id
+            promote_says: str | None = dann._entry(built, meta, name, entries).entry_id
         except ConfigError:
             promote_says = None
         assert (view_says, promote_says) == (want, want), name
@@ -4542,12 +4581,13 @@ def test_a_sink_only_one_side_calls_is_narrow(tmp_path: Path, current: None) -> 
     )
 
 
-def test_more_than_two_names_on_a_side_is_not_narrow_and_still_sinks(
+def test_more_than_two_names_on_a_side_is_not_narrow_and_still_floats(
     tmp_path: Path, current: None
 ) -> None:
-    """Three names on a side: the field stays, not narrow, and a bucket C entry still sinks.
+    """Three names on a side: the field stays, not narrow — and the bucket C entry floats all the
+    same: narrowness no longer decides anything about the order.
 
-    MUTATION (verified RED, 1 failed): allow three names -> RED."""
+    MUTATION (verified RED, 1 failed): float only a narrow aligned swap -> RED."""
     w, ids = _swap_world(tmp_path)
     swap = _swap(_swap_view(w), ids, "c_wide")
     assert swap is not None
@@ -4557,7 +4597,7 @@ def test_more_than_two_names_on_a_side_is_not_narrow_and_still_sinks(
         "names_exceed_two",
     )
     e = _swap_view(w, sort_by="significance")["by_id"][ids["c_wide"]]
-    assert e["significance"] == {"attention": 2, "basis": "no_sink_candidate"}
+    assert e["significance"] == {"attention": 0, "basis": "sink_callee_swap"}
 
 
 def test_a_difference_read_in_part_is_never_narrow(tmp_path: Path, current: None) -> None:
@@ -4651,32 +4691,39 @@ def test_only_the_hunts_sink_names_count(tmp_path: Path, current: None) -> None:
     assert (swap["sinks_only_in_a"], swap["sinks_only_in_b"]) == ([], ["strcpy"])
 
 
-def test_a_bucket_c_entry_with_a_narrow_swap_is_not_sunk(tmp_path: Path, current: None) -> None:
-    """★ Under the lens a bucket C entry with a narrow swap stays at attention 1, basis
-    sink_callee_swap_never_sunk; a wide one still sinks.
+def test_a_bucket_c_entry_with_an_aligned_swap_floats(tmp_path: Path, current: None) -> None:
+    """★ A bucket C entry (an aligned changed pair, no candidate) whose callee-set difference holds
+    a sink floats to attention 0, basis sink_callee_swap — narrow or wide, whichever side holds the
+    sink. ``sink_callee_swap_never_sunk`` is no longer a basis.
 
-    MUTATION (verified RED, 1 failed each): hold every swap, narrow or not -> RED; drop the swap
-    branch -> RED."""
+    MUTATION (verified RED, 1 failed each): drop the aligned-swap branch from ``significance`` ->
+    RED; float a swap only when its sink is on side A -> c_add (sink only in B) does not -> RED."""
     w, ids = _swap_world(tmp_path)
     v = _swap_view(w, sort_by="significance")
-    assert v["by_id"][ids["c_narrow"]]["significance"] == {
-        "attention": 1,
-        "basis": "sink_callee_swap_never_sunk",
-    }
-    assert v["by_id"][ids["c_wide"]]["significance"]["attention"] == 2
+    for key in ("c_narrow", "c_wide", "c_delete", "c_add", "c_tosink", "c_partial"):
+        e = v["by_id"][ids[key]]
+        assert e["bucket"] == "C", key
+        assert e["significance"] == {"attention": 0, "basis": "sink_callee_swap"}, key
+    assert not any(
+        e["significance"]["basis"] == "sink_callee_swap_never_sunk" for e in v["entries"]
+    )
+    # a difference with no sink name in it floats nothing
+    assert v["by_id"][ids["c_nonsink"]]["significance"]["attention"] == 2
 
 
-def test_an_earlier_basis_of_a_bucket_c_entry_is_kept(tmp_path: Path, current: None) -> None:
-    """A bucket C entry whose one side is a design-skipped micro-stub keeps that basis, though its
-    callees swap a sink (the swap still orders it).
+def test_an_aligned_swap_floats_over_a_micro_stub_basis(tmp_path: Path, current: None) -> None:
+    """A bucket C entry whose one side is a design-skipped micro-stub, and whose callees swap a
+    sink, floats on the swap: the swap is read before the micro-stub basis (which still holds an
+    entry with no swap at attention 1). Floated, it is not lifted inside attention 1.
 
-    MUTATION (verified RED, 1 failed): test the swap before the micro-stub branch -> RED."""
+    MUTATION (verified RED, 1 failed): test the micro-stub branch before the aligned swap -> RED."""
     w, ids = _swap_world(tmp_path)
     e = _swap_view(w, sort_by="significance")["by_id"][ids["c_micro"]]
     assert "one_side_skipped_micro" in e["facts"]
     assert e["bucket"] == "C"
-    assert e["significance"] == {"attention": 1, "basis": "one_side_skipped_micro"}
-    assert e["rank_key"]["sink_callee_swap"] == 1
+    assert e["significance"] == {"attention": 0, "basis": "sink_callee_swap"}
+    assert e["rank_key"]["sink_callee_swap"] == 0
+    assert e["lift_basis"] is None
 
 
 def _judge_entry(w: World, entry: dict[str, Any], verdict: str) -> None:
@@ -4684,61 +4731,69 @@ def _judge_entry(w: World, entry: dict[str, Any], verdict: str) -> None:
     w.commit()
 
 
-def test_a_held_up_judgement_keeps_its_basis_over_the_swap(tmp_path: Path, current: None) -> None:
-    """★ A bucket C entry with a narrow swap and a changed_real judgement reads judged_never_sunk:
-    the swap never replaces a judgement's basis.
+def test_a_judgement_does_not_hold_an_aligned_swap_back(tmp_path: Path, current: None) -> None:
+    """★ The float reads no judgement: a bucket C entry with an aligned swap stays at attention 0,
+    basis sink_callee_swap, whatever verdict it carries.
 
-    MUTATION (verified RED, 1 failed): test the swap before the held-up judgement -> RED."""
+    MUTATION (verified RED, 1 failed): test the held-up judgement before the aligned swap -> the
+    judged entry reads judged_never_sunk -> RED."""
     w, ids = _swap_world(tmp_path)
-    e = _swap_view(w, sort_by="significance")["by_id"][ids["c_narrow"]]
-    _judge_entry(w, e, "changed_real")
-    e = _swap_view(w, sort_by="significance")["by_id"][ids["c_narrow"]]
-    assert e["review_state"] == "concluded"
-    assert e["significance"] == {"attention": 1, "basis": "judged_never_sunk"}
+    for verdict in ("changed_real", "change_inconclusive"):
+        e = _swap_view(w, sort_by="significance")["by_id"][ids["c_narrow"]]
+        _judge_entry(w, e, verdict)
+        e = _swap_view(w, sort_by="significance")["by_id"][ids["c_narrow"]]
+        assert e["review_state"] in ("concluded", "inconclusive")
+        assert e["significance"] == {"attention": 0, "basis": "sink_callee_swap"}, verdict
 
 
 def test_a_judgement_moves_no_entry_inside_its_tier(tmp_path: Path, current: None) -> None:
-    """★ Judgements move nothing unless band is on: the bucket C entry with a narrow swap keeps its
-    place when a held-up judgement changes its basis, and an entry whose basis is a micro-stub is
-    lifted like any other.
+    """★ Judgements move nothing unless band is on: judging the bucket C entry with a swap leaves
+    the page order as it was, and the entry where it was (attention 0, never lifted).
 
-    MUTATION (verified RED, 1 failed): leave the judged_never_sunk / one_side_skipped_micro bases
-    out of the lift -> the judged entry drops behind the read-first pairs -> RED."""
+    MUTATION (verified RED, 1 failed): let a held-up judgement replace the swap's basis -> the
+    judged entry drops out of attention 0 -> RED."""
     w, ids = _swap_world(tmp_path)
     before = _swap_view(w, sort_by="significance")
     order_before = [e["entry_id"] for e in before["entries"]]
     e = before["by_id"][ids["c_narrow"]]
-    assert e["rank_key"]["sink_callee_swap"] == 1
+    assert e["significance"]["attention"] == 0 and e["rank_key"]["sink_callee_swap"] == 0
     _judge_entry(w, e, "changed_real")
     after = _swap_view(w, sort_by="significance")
     judged = after["by_id"][ids["c_narrow"]]
-    assert judged["significance"]["basis"] == "judged_never_sunk"
-    assert judged["rank_key"]["sink_callee_swap"] == 1
+    assert judged["significance"] == {"attention": 0, "basis": "sink_callee_swap"}
     assert [x["entry_id"] for x in after["entries"]] == order_before
-    assert after["by_id"][ids["c_micro"]]["rank_key"]["sink_callee_swap"] == 1
 
 
-def test_a_narrow_swap_leads_attention_one_ahead_of_the_read_first_pairs(
+def test_an_r_swap_leads_attention_one_ahead_of_the_read_first_pairs(
     tmp_path: Path, current: None
 ) -> None:
-    """★ Inside attention 1: the entries with a narrow swap, then the read-first anchored_differs
-    pairs, then the rest.
+    """★ An R entry with a swap (a proposed pairing) is never floated or sunk: it stays at
+    attention 1 and leads it — swap_lift 1, lift_basis sink_callee_swap — ahead of the read-first
+    anchored_differs pairs, then the rest.
 
-    MUTATION (verified RED, 1 failed): order by read_first before the swap -> RED."""
+    MUTATION (verified RED, 1 failed each): order by read_first before the lift -> RED; drop the R
+    guard and read any pairing as floating -> r_proposed reaches attention 0 -> RED."""
     w, ids = _swap_world(tmp_path)
     v = _swap_view(w, sort_by="significance")
     tier = [e for e in v["entries"] if e["significance"]["attention"] == 1]
     lifted = [e["rank_key"]["sink_callee_swap"] for e in tier]
     assert lifted == sorted(lifted, reverse=True) and 1 in lifted and 0 in lifted
     pos = {e["entry_id"]: i for i, e in enumerate(tier)}
+    assert ids["r_proposed"] in pos and ids["r_head"] in pos and ids["r_plain"] in pos
     assert pos[ids["r_proposed"]] < pos[ids["r_head"]] < pos[ids["r_plain"]]
+    r = v["by_id"][ids["r_proposed"]]
+    assert r["bucket"] == "R" and r["sink_callee_swap"]["pairing"] == "proposed"
+    assert (r["rank_key"]["sink_callee_swap"], r["lift_basis"]) == (1, "sink_callee_swap")
+    assert r["swap_pairing_note"] == pv.SWAP_PAIRING_NOTE
+    assert v["by_id"][ids["r_head"]]["lift_basis"] is None
 
 
 def test_a_read_first_pair_with_a_swap_stays_read_first(
     tmp_path: Path, current: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A read-first anchored_differs pair whose callees swap a sink is still read first, and the
-    read-first counts are those of the same world with no swap read at all.
+    read-first counts are those of the same world with no swap read at all (only the swap tally
+    itself moves).
 
     MUTATION (verified RED, 1 failed): fold the swap into _read_first_order (order 3) -> RED."""
     w, ids = _swap_world(tmp_path)
@@ -4746,10 +4801,16 @@ def test_a_read_first_pair_with_a_swap_stays_read_first(
     reading = _reading(v, ids["r_head_swap"])
     assert (reading.get("anchored_differs"), reading.get("in_read_first")) == (True, True)
     assert v["by_id"][ids["r_head_swap"]]["rank_key"]["sink_callee_swap"] == 1
+
+    def without_swaps(states: dict[str, Any] | None) -> dict[str, Any]:
+        assert states is not None
+        changed = {k: v for k, v in states["changed"].items() if k != "with_sink_callee_swap"}
+        return {**states, "changed": changed}
+
     states = pv.function_states(w.atlas, DIFF)
     pv._clear_view_caches()
     monkeypatch.setattr(pv, "_sink_callee_swap", lambda e: None)
-    assert pv.function_states(w.atlas, DIFF) == states
+    assert without_swaps(pv.function_states(w.atlas, DIFF)) == without_swaps(states)
     assert _reading(_swap_view(w, sort_by="significance"), ids["r_head_swap"]) == reading
 
 
@@ -4765,20 +4826,22 @@ def test_attention_zero_is_not_reordered_by_a_swap(tmp_path: Path, current: None
     assert e["rank_key"]["sink_callee_swap"] == 0
 
 
-def test_a_swap_never_replaces_a_b_entrys_basis(tmp_path: Path, current: None) -> None:
-    """A B entry keeps its basis: a changed length constant stays at attention 0, a pair whose
-    candidates line up stays recheckable_no_visible_delta — lifted inside attention 1.
+def test_a_swap_floats_a_b_entry_after_a_changed_constant(tmp_path: Path, current: None) -> None:
+    """A B entry with a changed length constant keeps that basis (read first); a B pair whose
+    candidates line up but whose callees add a sink floats on the swap, ahead of
+    recheckable_no_visible_delta — floated, never lifted.
 
-    MUTATION (verified RED, 1 failed): let a narrow swap decide the basis ahead of the others ->
-    RED."""
+    MUTATION (verified RED, 1 failed each): read the swap before the constant delta -> RED; read
+    sink_present_no_visible_delta before the swap -> RED."""
     w, ids = _swap_world(tmp_path)
     v = _swap_view(w, sort_by="significance")
     delta, novis = v["by_id"][ids["b_delta"]], v["by_id"][ids["b_novis"]]
-    assert (delta.get("sink_callee_swap") or {}).get("narrow") is True
-    assert (novis.get("sink_callee_swap") or {}).get("narrow") is True
+    assert (delta.get("sink_callee_swap") or {}).get("pairing") == "aligned"
+    assert (novis.get("sink_callee_swap") or {}).get("pairing") == "aligned"
     assert delta["significance"] == {"attention": 0, "basis": "sink_arg_constant_delta"}
-    assert novis["significance"] == {"attention": 1, "basis": "recheckable_no_visible_delta"}
-    assert novis["rank_key"]["sink_callee_swap"] == 1
+    assert novis["subclass"] == "sink_present_no_visible_delta"
+    assert novis["significance"] == {"attention": 0, "basis": "sink_callee_swap"}
+    assert novis["rank_key"]["sink_callee_swap"] == 0
 
 
 @pytest.mark.parametrize(
@@ -4835,8 +4898,12 @@ def test_the_sink_names_are_the_sink_classes_and_the_unrecalled_sinks() -> None:
 def test_the_lens_and_the_tool_name_the_swap() -> None:
     assert "sink_callee_swap" in pv._CAVEATS
     tool = mcp_app.make_tools(Path("unused.db"))["get_diff_patch_view"]
-    assert "sink_callee_swap_never_sunk" in (tool.__doc__ or "")
+    doc = " ".join((tool.__doc__ or "").split())
+    # named only to say it is gone
+    assert "the basis ``sink_callee_swap_never_sunk`` is no longer produced" in doc
+    assert doc.count("sink_callee_swap_never_sunk") == 1
     assert "sink_callee_swap" in (tool.__doc__ or "")
+    assert "lift_basis" in (tool.__doc__ or "")
     assert "named_callees_differ" in (tool.__doc__ or "")
 
 
@@ -5205,9 +5272,10 @@ def test_the_mcp_tool_passes_rows_limit_zero_through_as_a_scan(
 
 
 def test_the_hunk_rides_on_every_delta_the_view_prints(tmp_path: Path, current: None) -> None:
-    """The view prints pseudocode_delta in three places — an aligned entry, an undetermined pair's
-    proposed_pair_reading, a not-listed page row — and each carries its inline_hunk, shown from the
-    original text."""
+    """The view prints pseudocode_delta on an aligned entry, an undetermined pair's
+    proposed_pair_reading and a bucket S entry (the similarity-1 pair whose text differs, which a
+    not-listed page used to carry) — and each carries its inline_hunk, shown from the original
+    text."""
     w = World(tmp_path)
     body_a = "void f(void)\n{\n  int n;\n  n = get();\n  FUN_00409748(n);\n  put(n);\n  return;\n}"
     body_b = "void f(void)\n{\n  int n;\n  n = get();\n  put(n);\n  return;\n}"
@@ -5226,9 +5294,11 @@ def test_the_hunk_rides_on_every_delta_the_view_prints(tmp_path: Path, current: 
     assert want in aligned["structural"][0]
     proposed = by_id[_pair_id("00003000", "00004000")]["proposed_pair_reading"]
     assert want in proposed["pseudocode_delta"]["inline_hunk"]["structural"][0]
+    s_entry = by_id[_pair_id("00005000", "00006000")]
+    assert s_entry["bucket"] == "S"
+    assert want in s_entry["pseudocode_delta"]["inline_hunk"]["structural"][0]
     page = pv.get_diff_patch_view(w.atlas, DIFF, not_listed_page="aligned_pseudocode_differs")
-    (row,) = page["entries"]
-    assert want in row["pseudocode_delta"]["inline_hunk"]["structural"][0]
+    assert page["entries"] == [] and page["listed_as"] == "bucket S"
 
 
 # ── S3 audit follow-up: what the caller-set edge's tests did not yet hold ──────────────────────
@@ -5302,8 +5372,9 @@ def test_the_order_lens_and_the_tool_name_the_edge(tmp_path: Path, current: None
     w.commit()
     v = pv.get_diff_patch_view(w.atlas, DIFF, sort_by="candidate_tier")
     order = v["lens"]["order"]
-    assert "sink_presence_signal first, then E;" in order  # with a candidate: after R and B
-    assert "C, then E by caller relevance" in order  # with none: the last lane
+    # with a candidate: after R and B, before S
+    assert "or an aligned sink_callee_swap first, then E, then S;" in order
+    assert "C, then E by caller relevance" in order  # with none: after C, before S
     assert {"callers_b", "E"} <= set(v["caveats"])
     assert "E" in v["legend"]
     doc = " ".join(
@@ -5359,7 +5430,10 @@ def test_a_self_call_is_not_a_caller_on_either_side(tmp_path: Path, current: Non
     w.fn("a", "00000100", ["self_b"], name="a_caller")
     w.commit()
     v = _view(w)["by_id"]
-    assert _pair_id("00001000", "00002000") not in v
+    # no E for the pair whose A side calls only itself (its callees differ, so it is listed as S,
+    # with no caller-set edge)
+    assert (v.get(_pair_id("00001000", "00002000")) or {}).get("bucket") in (None, "S")
+    assert "callers_b" not in (v.get(_pair_id("00001000", "00002000")) or {})
     assert v[_pair_id("00003000", "00004000")]["callers_b"] == {"state": "none_found"}
 
 
@@ -5409,26 +5483,27 @@ def test_the_edge_lane_orders_by_caller_relevance(tmp_path: Path, current: None)
     assert order == [gap, hop, plain]
 
 
-def test_only_a_narrow_swap_lifts_and_never_above_attention_zero(
+def test_any_swap_lifts_inside_attention_one_and_never_above_attention_zero(
     tmp_path: Path, current: None
 ) -> None:
-    """★ (S2, held here because S3 re-touched the significance tuple.) Inside attention 1 only a
-    NARROW sink_callee_swap lifts an entry (rank_key.sink_callee_swap 1); a wide swap reads 0 and
-    is not ordered ahead of the narrow one, even at a lower similarity. And the lift orders inside
-    attention 1 only: every attention 0 entry still comes first.
+    """★ An aligned sink swap, narrow or wide, floats its entry to attention 0 with an A entry. A
+    proposed one (an R entry) lifts inside attention 1 — a WIDE one too, ahead of an R entry with
+    no swap even at a higher similarity — and never above attention 0: every attention 0 entry
+    still comes first.
 
-    MUTATION (verified RED): lift a wide swap too (drop ``and swap["narrow"]``) -> RED; put
-    -swap_lift ahead of attention in the tuple -> the narrow swap precedes the A entry -> RED."""
+    MUTATION (verified RED): lift only a narrow swap (restore ``and swap["narrow"]``) -> the wide
+    R swap is not lifted -> RED; put -swap_lift ahead of attention in the tuple -> the lifted R
+    entry precedes the attention 0 entries -> RED."""
     w = World(tmp_path)
     a, b = "runA", "runB"
-    # B sink_present_no_visible_delta (attention 1) with a WIDE swap, at the lower similarity
+    # B sink_present_no_visible_delta with a WIDE aligned swap
     w.pair("00001000", "00002000", 0.97, 0.5)
     w.inst("a", _ref(a, "00001000", "cmd", "0x10"), "cmd", "system")
     w.inst("b", _ref(b, "00002000", "cmd", "0x10"), "cmd", "system")
     w.im("00001010", "00002010", "00001000")
     w.fn("a", "00001000", ["system"])
     w.fn("b", "00002000", ["system", "popen", "execl", "log_a"])
-    # C with a NARROW swap (attention 1), at the higher similarity
+    # C with a NARROW aligned swap
     w.pair("00003000", "00004000", 0.97, 0.9)
     w.fn("a", "00003000", ["memcpy"])
     w.fn("b", "00004000", ["strcpy"])
@@ -5439,20 +5514,41 @@ def test_only_a_narrow_swap_lifts_and_never_above_attention_zero(
     w.im("00005010", "00006010", "00005000")
     w.fn("a", "00005000", ["system"])
     w.fn("b", "00006000", ["popen"])
+    # R: a WIDE proposed swap at the higher similarity, and one with no swap at the lower
+    w.pair("00007000", "00008000", 0.5, 0.9)
+    w.fn("a", "00007000", ["memcpy"])
+    w.fn("b", "00008000", ["strcpy", "log_a", "log_b"])
+    w.pair("00009000", "0000a000", 0.5, 0.2)
+    w.fn("a", "00009000", ["foo"])
+    w.fn("b", "0000a000", ["foo"])
     w.commit()
     v = _view(w, sort_by="significance")
     by = v["by_id"]
-    wide, narrow, a_id = (
+    wide, narrow, a_id, r_wide, r_plain = (
         _pair_id(x, y)
-        for x, y in (("00001000", "00002000"), ("00003000", "00004000"), ("00005000", "00006000"))
+        for x, y in (
+            ("00001000", "00002000"),
+            ("00003000", "00004000"),
+            ("00005000", "00006000"),
+            ("00007000", "00008000"),
+            ("00009000", "0000a000"),
+        )
     )
     assert by[wide]["sink_callee_swap"]["narrow"] is False
-    assert by[wide]["significance"]["attention"] == 1
-    assert by[wide]["rank_key"]["sink_callee_swap"] == 0
-    assert by[narrow]["rank_key"]["sink_callee_swap"] == 1
+    assert by[wide]["significance"] == {"attention": 0, "basis": "sink_callee_swap"}
+    assert by[narrow]["significance"] == {"attention": 0, "basis": "sink_callee_swap"}
     assert by[a_id]["significance"]["attention"] == 0
+    assert by[r_wide]["sink_callee_swap"]["narrow"] is False
+    assert by[r_wide]["significance"]["attention"] == 1
+    assert (by[r_wide]["rank_key"]["sink_callee_swap"], by[r_wide]["lift_basis"]) == (
+        1,
+        "sink_callee_swap",
+    )
+    assert by[r_plain]["rank_key"]["sink_callee_swap"] == 0
     order = [e["entry_id"] for e in v["entries"]]
-    assert order.index(a_id) < order.index(narrow) < order.index(wide)
+    zeros = {wide, narrow, a_id}
+    assert set(order[:3]) == zeros  # every attention 0 entry first
+    assert order.index(r_wide) < order.index(r_plain)  # lifted, though at a higher similarity
 
 
 # ── S7: the guard scan on the view, its row links, and the sink axes ──────────────────────────
@@ -5675,19 +5771,21 @@ def test_reading_one_entry_gives_each_row_both_sides_axes(tmp_path: Path, curren
 
 
 def test_with_no_row_to_link_the_guards_are_shown_in_b_order(tmp_path: Path, current: None) -> None:
-    """L9c: a scan (rows_limit=0) renders no row, and a not-listed pair has none: both show their
-    guards in B order (shown_rule b_order), and no row carries links."""
+    """L9c: a scan (rows_limit=0) renders no row, and a bucket S entry (the similarity-1 pair whose
+    text differs) has none: both show their guards in B order (shown_rule b_order), and no row
+    carries links."""
     w = _guard_world(tmp_path)
     scan = _view(w, rows_limit=0)["by_id"][ALIGNED]
     assert scan["rows"] == []
     assert scan["guard_scan"]["shown_rule"] == "b_order"
     assert scan.get("sink_axes_with") == "entry_id"
-    page = pv.get_diff_patch_view(w.atlas, DIFF, not_listed_page="aligned_pseudocode_differs")
-    (row,) = page["entries"]
+    v = pv.get_diff_patch_view(w.atlas, DIFF, bucket="S")
+    (row,) = v["entries"]
+    assert row["rows"] == [] and row["bucket"] == "S"
     assert row["guard_scan"]["shown_rule"] == "b_order"
     assert [(g["var"], g["relation"], g["const"]) for g in row["guards"]] == [("n", "<", "0x10")]
     assert "guards_body_ref" not in row
-    assert (page.get("guards_read_with") or {}).get("function") == "entry.addr_b"
+    assert (v.get("guards_read_with") or {}).get("function") == "entry.addr_b"
     assert row["addr_b"] == "00008000"
 
 
@@ -5885,7 +5983,7 @@ _S_COPY = (
     "entry_id bucket subclass tier blind_spots review_state addr_a addr_b name_a name_b "
     "similarity export_gap_a export_gap_b side addr name presence_state export_gap pairing "
     "callers_b b_other_fn_mentions pseudocode_sameness text_unverified_reasons significance "
-    "rows_total rows_by_presence"
+    "lift_basis swap_pairing_note rows_total rows_by_presence"
 ).split()
 _S_COUNTS = {
     "rows_total",
@@ -5925,6 +6023,7 @@ _S_REDUCED_OR_DERIVED = {
     "anchored_micro_side",
     "proposed_pair_summary",
     "entry_words",
+    "sink_candidate_counts",
 }
 _S_ENTRY_KEYS = set(_S_COPY) | _S_REDUCED_OR_DERIVED
 # Never in a summary entry, at any depth: the rows, the bodies, the guards and their listing.
@@ -6070,6 +6169,14 @@ def _rules_summary(full: dict[str, Any], micro: bool) -> dict[str, Any]:
     if "sink_callee_swap" in full:
         swap = full["sink_callee_swap"]
         out["sink_callee_swap"] = _s_kept({k: swap[k] for k in _S_SWAP})
+    if "sink_candidate_counts" in full:
+        sc = full["sink_candidate_counts"]
+        out["sink_candidate_counts"] = {"pairing": sc["pairing"], "delta": sc["delta"]}
+        if sc["unknown"]:
+            out["sink_candidate_counts"]["unknown"] = {
+                "n": len(sc["unknown"]),
+                "reasons": sorted({u["reason"] for u in sc["unknown"]}),
+            }
     if full.get("callers_a"):
         out["callers_a"] = {"count": full["callers_a"]["count"]}
     if full["string_edges"] and full["string_edges"]["by_delta_kind"]:
@@ -6248,12 +6355,15 @@ def test_the_anchor_template_rebuilds_every_entrys_anchor(
 # Recorded from the code before ``detail`` existed: the summary world's entries through the MCP
 # tool, one key per call below. Re-record it only when a full entry changes on purpose. "default"
 # and "scan" were recorded with no sort_by, when that was the order now named candidate_tier.
+# Re-recorded when bucket S, sink_candidate_counts, lift_basis and swap_pairing_note were added
+# (the diff against the earlier recording held only those, checked entry by entry); the
+# not-listed page it read then is empty now — its pair is the bucket S entry ("bucket_s").
 _FULL_GOLDEN = Path(__file__).resolve().parents[2] / "fixtures" / "patch_view_full_entries.json"
 _GOLDEN_CALLS: dict[str, dict[str, Any]] = {
     "default": {"sort_by": "candidate_tier"},
     "scan": {"rows_limit": 0, "sort_by": "candidate_tier"},
     "significance": {"sort_by": "significance"},
-    "not_listed": {"not_listed_page": "aligned_pseudocode_differs"},
+    "bucket_s": {"bucket": "S"},
 }
 
 
@@ -6515,12 +6625,34 @@ def test_a_summary_ignores_a_valid_rows_limit(tmp_path: Path, current: None) -> 
     assert len(seen) == 1
 
 
+def test_the_not_listed_differs_page_is_empty_and_names_bucket_s(
+    tmp_path: Path, current: None
+) -> None:
+    """The pairs reading differs are listed as bucket S, so their not-listed page — still callable
+    — is empty in either detail, says where they went and how to read them, and the S entry is
+    there under bucket="S".
+
+    MUTATION (verified RED, 1 failed): drop the listed_as / read_with fields from the differs
+    page -> RED."""
+    w = _summary_world(tmp_path)
+    name = "aligned_pseudocode_differs"
+    for detail in ("full", "summary"):
+        page = pv.get_diff_patch_view(w.atlas, DIFF, not_listed_page=name, detail=detail)
+        assert (page["entries"], page["total_entries"], page["next_offset"]) == ([], 0, None)
+        assert page.get("listed_as") == "bucket S"
+        assert page.get("read_with") == f'get_diff_patch_view(diff_id="{DIFF}", bucket="S")'
+        assert page["not_listed"][name] == {
+            "count": 0,
+            "listed_as": "bucket S",
+            "page_with": 'bucket="S"',
+        }
+    s_page = pv.get_diff_patch_view(w.atlas, DIFF, bucket="S")
+    assert [e["entry_id"] for e in s_page["entries"]] == [_pair_id("00007000", "00008000")]
+
+
 @pytest.mark.parametrize(
     ("make", "name"),
-    [
-        (_summary_world, "aligned_pseudocode_differs"),
-        (_qualified_world, "aligned_pseudocode_identical_text_unverified"),
-    ],
+    [(_qualified_world, "aligned_pseudocode_identical_text_unverified")],
 )
 def test_a_not_listed_summary_gives_each_pair_its_counts(
     tmp_path: Path, current: None, make: Any, name: str
@@ -6846,6 +6978,9 @@ def test_a_summary_page_says_how_to_read_what_it_left_out(tmp_path: Path, curren
 # The entry ids the candidate_tier order took on the summary world before significance became the
 # default, per sort (recorded beside the fixture file's entries, which hold every one of them: on
 # these pages an entry renders the same whatever the order, outside significance).
+# The orders recorded before significance became the default; the bucket S entry
+# (pair:00007000:00008000, a similarity-1 pair whose text differs, not listed then) added where each
+# order now places it, every other entry where it was.
 _ORDERS_BEFORE: dict[str, tuple[dict[str, Any], list[str]]] = {
     "tier": (
         {"sort_by": "tier"},
@@ -6863,6 +6998,7 @@ _ORDERS_BEFORE: dict[str, tuple[dict[str, Any], list[str]]] = {
             "pair:00141000:00142000",
             "pair:00151000:00152000",
             "pair:00111000:00112000",
+            "pair:00007000:00008000",
             "a:00121000",
             "a:00122000",
         ],
@@ -6883,6 +7019,7 @@ _ORDERS_BEFORE: dict[str, tuple[dict[str, Any], list[str]]] = {
             "pair:00134000:00134000",
             "pair:00151000:00152000",
             "pair:00111000:00112000",
+            "pair:00007000:00008000",
             "a:00121000",
             "a:00122000",
         ],
@@ -6893,6 +7030,7 @@ _ORDERS_BEFORE: dict[str, tuple[dict[str, Any], list[str]]] = {
             "pair:00001000:00002000",
             "pair:00003000:00004000",
             "pair:00005000:00006000",
+            "pair:00007000:00008000",
             "pair:00101000:00102000",
             "pair:00111000:00112000",
             "pair:00131000:00131000",
@@ -7057,7 +7195,7 @@ def test_the_short_significance_text_keeps_what_the_lens_cannot_see() -> None:
         (mcp_app.make_tools(Path("unused.db"))["get_diff_patch_view"].__doc__ or "").split()
     )
     for rule in (
-        "a wide one still sinks",
+        "narrow or wide, either side, whatever its judgment",
         "a constant in an allocation expression or a local buffer's declared size",
         "anything in a binary the two runs hold byte-identical",
         "then those below it",
@@ -7160,8 +7298,8 @@ def test_the_run_pair_progress_stays_in_the_candidate_tier_order(
     assert named == unjudged[: progress["page_size"]]
     assert named[0] == _T2_FIRST["candidate_tier"]
     assert progress["note"].endswith(
-        "next_page here is in the candidate_tier order; get_diff_patch_view names the next ones "
-        "in the order its page is read in."
+        "next_page here is in the candidate_tier order, the binary_presence binaries after every "
+        "diff's entries; get_diff_patch_view names the next ones in the order its page is read in."
     )
 
 
@@ -7359,11 +7497,20 @@ _START_KEYS = {
 _START_META_KEYS = {
     "functions",
     "banners",
+    "binary_presence",
     "source_stale",
     "source_stale_reason",
     "toolchain_checked",
     "version_skew",
 }
+
+
+def _a_entry_first(w: World) -> None:
+    """Make the summary world's A entry (00005000, which carries rows) the first one read: the
+    bucket C pair whose callees swap a sink (00141000) floats to attention 0 beside it at a lower
+    similarity, so it would lead; at a higher one it reads after A."""
+    w.atlas.execute("UPDATE function_alignment SET similarity = 0.95 WHERE addr_a = '00141000'")
+    w.commit()
 
 
 def test_start_diff_review_is_the_view_and_the_meta_as_they_are(
@@ -7379,6 +7526,7 @@ def test_start_diff_review_is_the_view_and_the_meta_as_they_are(
     MUTATION (verified RED, 1 failed — this test alone): put a key of its own into ``view`` ->
     RED; MUTATION (verified RED, 1 failed): read the headline without rows_limit=0 -> RED."""
     w = _summary_world(tmp_path)
+    _a_entry_first(w)  # a headline with rows, so rows_limit=0 shows
     tools = mcp_app.make_tools(w.path)
     start, view_tool = tools["start_diff_review"], tools["get_diff_patch_view"]
     meta_tool = tools["get_diff_meta"]
@@ -7514,6 +7662,7 @@ def test_start_diff_review_withholds_the_headline_hunk_only_when_one_entry_canno
     keep the view cut beside the whole headline -> RED; MUTATION (verified RED, 1 failed — this
     test alone): leave the view's own over_budget in it -> RED."""
     w = _summary_world(tmp_path)
+    _a_entry_first(w)
     # the headline pair's bodies differ in many lines, so its hunk is worth withholding
     pad = "x" * 60
     body = "".join(f'v{i} = f{i}(a, "{pad}");\n' for i in range(12))

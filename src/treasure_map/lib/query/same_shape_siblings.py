@@ -81,6 +81,7 @@ from treasure_map.lib.query.patch_view import (
     _read_side,
     _Side,
     build_diff_view,
+    listed_view,
     split_subject_key,
 )
 from treasure_map.lib.query.runs import get_run, run_staleness
@@ -521,7 +522,7 @@ def _member_row(
     else:
         assert st.entry is not None and st.row is not None
         e = st.entry
-        listed = bool(e.bucket)
+        listed = e.listed  # its own bucket, or bucket S (listed_view, applied with the build)
         row.update(
             {
                 "landing": st.view["landing"],
@@ -569,7 +570,7 @@ def _group_counts(members: list[_Call], states: dict[str, _State]) -> dict[str, 
         assert st.entry is not None
         sub = st.view["subclass"] or _NO_SUBCLASS
         by_landing.setdefault(st.view["landing"], Counter())[sub] += 1
-        if not st.entry.bucket:
+        if not st.entry.listed:
             not_listed += 1
         if st.entry.pair is not None and _changed(st.entry.pair):
             below_1 += 1
@@ -774,6 +775,7 @@ def same_shape_siblings(
     members = groups[key]
     built = build_diff_view(atlas, diff_id)
     assert built is not None  # the diff_meta row was just read
+    listed_view(atlas, built)  # which members' entries are listed: bucket S counts as listed
     states = _states(built, side, members)
     side_db = _read_side(atlas, meta.run[side], meta.sha[side])
     if members_offset is None:

@@ -866,8 +866,9 @@ def _binary_name_path_by_id(
 # not export string xrefs). Said honestly on every result so a consumer does not assume a reverse
 # lookup the substrate cannot back.
 _STRING_REF_NOTE = (
-    "string reference sites (which function uses this string) are not indexed; resolve the "
-    "address in a disassembler's xref view"
+    "string reference sites (which function uses this string) are not indexed in this listing; "
+    "get_functions_referencing_string (run_id, value) finds the functions whose pseudocode holds "
+    "the text, and get_string_reference_anchors the recorded reference anchors of an exact value"
 )
 
 # ★ Honesty (declared≠actual): `function` is ECHOED on a strings result but does NOT scope it. A

@@ -156,6 +156,18 @@ def _function_line(states: dict[str, Any] | None) -> str:
             read += f", anchored_micro_side={micro}"
     if states["alignment_undetermined"] and read:
         line += f" (read: {read})"
+    # The sink signals the view floats or lifts, and the similarity-1 pairs it lists as bucket S.
+    swaps = changed.get("with_sink_callee_swap")
+    deltas = changed.get("with_sink_candidate_counts_delta")
+    if swaps is not None and deltas is not None:
+        n_swap = {k: sum(v.values()) for k, v in swaps.items()}
+        line += (
+            f"; sink callee swaps {n_swap.get('aligned', 0)} aligned / "
+            f"{n_swap.get('proposed', 0)} proposed, sink candidate count deltas "
+            f"{deltas.get('aligned', 0)} aligned / {deltas.get('proposed', 0)} proposed "
+            f"({changed.get('with_sink_candidate_counts_unknown', 0)} with a count unknown), "
+            f"{changed.get('listed_as_s', 0)} listed as S"
+        )
     sides = "; ".join(
         f"{side.upper()} " + ", ".join(f"{n} {state}" for state, n in by_state.items())
         for side, by_state in states["one_sided"].items()
@@ -202,6 +214,21 @@ def _echo_coverage(coverage: dict[str, Any] | None, after: str) -> None:
                 f"  not diffed    : {side.upper()} {g['binaries']} binaries / {g['candidates']} "
                 f"candidates ({reason}) — {', '.join(g['names'])}"
             )
+    from treasure_map.lib.query.coverage import UNSEEN
+
+    presence = coverage.get("binary_presence") or {}
+    for tag, label in (("a_only", "A"), ("b_only", "B")):
+        items = presence.get(tag) or []
+        if not items:
+            click.echo(f"  only in {label}     : none")
+            continue
+        unjudged = sum(1 for b in items if b.get("review_state") == UNSEEN)
+        click.echo(
+            f"  only in {label}     : {len(items)} binaries / "
+            f"{sum(b['candidates'] for b in items)} candidates, {unjudged} not looked at — "
+            f"{', '.join(b['rel_path'] for b in items)} (the other run holds no binary, file or "
+            "symlink like them; judge each by its binary_presence anchor_ref with run_pair)"
+        )
     if coverage["all_candidate_binaries_covered"]:
         click.echo(
             "  coverage      : every candidate-holding binary is diffed or byte-identical in "
@@ -209,8 +236,9 @@ def _echo_coverage(coverage: dict[str, Any] | None, after: str) -> None:
         )
     else:
         click.echo(
-            "  coverage      : NOT every candidate-holding binary is covered — the failed diffs "
-            "and the not-diffed binaries above are blind spots"
+            "  coverage      : NOT every candidate-holding binary is covered by a diff — the "
+            "failed diffs and the not-diffed binaries above are blind spots, and a binary only "
+            "one run holds has no diff (its review is its own judgment)"
         )
 
 

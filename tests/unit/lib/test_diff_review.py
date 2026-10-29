@@ -104,6 +104,23 @@ def a_row(func_a: str, *, elsewhere: bool | None = False) -> so.SinkOverlayRow:
     )
 
 
+class _Rehunted(dict[str, list[so.SinkOverlayRow]]):
+    """``World.rows``: giving a diff new candidate rows is a re-hunt, and a re-hunt moves both
+    runs' stamps — so a view computed from the old rows (the overlay recomputed in memory is
+    cached under those stamps) is never served for the new ones, as on a real atlas."""
+
+    def __init__(self, atlas: sqlite3.Connection, rows: dict[str, list[so.SinkOverlayRow]]) -> None:
+        super().__init__(rows)
+        self._atlas = atlas
+        self._hunts = 0
+
+    def __setitem__(self, key: str, value: list[so.SinkOverlayRow]) -> None:
+        super().__setitem__(key, value)
+        self._hunts += 1
+        self._atlas.execute("UPDATE run SET updated_at = ?", (f"rehunt-{self._hunts}",))
+        self._atlas.commit()
+
+
 class World:
     """Two diffs of one run pair, with each run's analysis.db holding both binaries."""
 
@@ -111,7 +128,7 @@ class World:
         self.tmp = tmp
         self.path = tmp / "atlas.db"
         self.atlas = open_atlas(self.path)
-        self.rows: dict[str, list[so.SinkOverlayRow]] = {DX: [], DY: []}
+        self.rows: dict[str, list[so.SinkOverlayRow]] = _Rehunted(self.atlas, {DX: [], DY: []})
         self.stale: dict[str, dict[str, Any]] = {}
         for side, run in (("a", "runA"), ("b", "runB")):
             db = tmp / f"analysis_{side}.db"
@@ -1011,7 +1028,7 @@ def test_a_run_pair_is_never_complete_while_a_binary_is_not_covered(
     MUTATION: compute ``complete`` from the entry count alone -> RED on both parameters."""
     world.pair(DX, "00001000", "00002000")
     world.rows[DX] = [a_row("00001000")]
-    monkeypatch.setattr(dann, "not_diffed_binaries", lambda *a: {})
+    monkeypatch.setattr(dann, "not_diffed_binaries", lambda *a, **k: {})
     world.atlas.execute("DELETE FROM diff_meta WHERE diff_id = ?", (DY,))
     world.judge(DX, _pair_anchor(DX, "00001000", "00002000"), "changed_real")
     clean = overlay.list_overlays(world.atlas, anchor_kind="diff_subject", run_id=PAIR)
@@ -1032,7 +1049,9 @@ def test_a_run_pair_is_never_complete_while_a_binary_is_not_covered(
     monkeypatch.setattr(
         dann,
         "not_diffed_binaries",
-        lambda *a: {"b": {"binary_not_diffed": {"binaries": 1, "candidates": 2, "names": ["z"]}}},
+        lambda *a, **k: {
+            "b": {"binary_not_diffed": {"binaries": 1, "candidates": 2, "names": ["z"]}}
+        },
     )
     undiffed = overlay.list_overlays(world.atlas, anchor_kind="diff_subject", run_id=PAIR)
     assert undiffed["review_progress"]["complete"] is False
@@ -1200,7 +1219,7 @@ def test_a_binary_identical_on_both_sides_does_not_keep_a_pair_incomplete(
     monkeypatch.setattr(
         dann,
         "not_diffed_binaries",
-        lambda *a: {
+        lambda *a, **k: {
             "a": {"identical_both_sides": {"binaries": 2, "candidates": 9, "names": ["x", "y"]}}
         },
     )

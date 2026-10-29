@@ -50,6 +50,7 @@ from treasure_map.lib.query.patch_view import (
     _atlas_identity,
     _BoundedCache,
     build_diff_view,
+    listed_view,
     split_subject_key,
 )
 
@@ -107,7 +108,7 @@ def _member_fact(st: sss._State) -> dict[str, Any]:
     return {
         "landing": st.view["landing"],
         "subclass": st.view["subclass"],
-        "listed": bool(st.entry.bucket),
+        "listed": st.entry.listed,
         "similarity": st.entry.pair.similarity if st.entry.pair is not None else None,
         "unreadable": None,
     }
@@ -136,6 +137,7 @@ def _current(
     if not members:
         cache[(side, f2_key)] = None
         return None
+    listed_view(atlas, built)  # a member in a bucket S entry is listed (memoised per build)
     states = sss._states(built, side, members)
     counts = sss._group_counts(members, states)
     member_hashes: dict[str, str] = {}
