@@ -1,20 +1,21 @@
 # Treasure Map: A firmware map for your AI agent
 
-English | [中文](README.zh.md)
+**English** | [中文](README.zh.md)
 
-### Treasure Map draws the map; your agent finds the treasure.
+## Treasure Map draws the map; your agent finds the treasure.
 
 [![PyPI](https://img.shields.io/pypi/v/tmap-agents?style=flat-square&color=3775a9)](https://pypi.org/project/tmap-agents/)
 [![Python](https://img.shields.io/pypi/pyversions/tmap-agents?style=flat-square&logo=python&logoColor=white)](https://pypi.org/project/tmap-agents/)
 [![MCP server](https://img.shields.io/badge/MCP-server-5c4ee5?style=flat-square)](#connect-your-agent)
-[![Platform](https://img.shields.io/badge/platform-Linux_x86__64_%7C_macOS_arm64-555?style=flat-square)](#install-details)
 [![License](https://img.shields.io/github/license/JoeyZzZzZz/treasure-map?style=flat-square)](LICENSE)
 
 Treasure Map turns an unpacked firmware filesystem into facts your coding agent (Claude Code, Codex,
 Cursor and others) reads through a bundled MCP server: every dangerous call it recognizes, where the
 data reaching it comes from, and — just as important — what it could not determine. Every fact points
 at an exact binary, function and address. It has no agent of its own and runs no model; deciding which
-lead is a real bug is your agent's job. **Facts are the tool's job; judgment is the model's.**
+lead is a real bug is your agent's job.
+
+**Facts are the tool's job; judgment is the model's.**
 
 ![tmap scan and tmap diff turn your firmware into facts; your agent reads them over MCP and writes its judgments to a separate layer](https://raw.githubusercontent.com/JoeyZzZzZz/treasure-map/main/docs/images/architecture.svg)
 

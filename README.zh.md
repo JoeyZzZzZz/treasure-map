@@ -1,17 +1,18 @@
 # Treasure Map：给 AI agent 的固件地图
 
-[English](README.md) | 中文
+[English](README.md) | **中文**
 
-### 地图标出地形，宝藏由你的 agent 去挖。
+## 地图标出地形，宝藏由你的 agent 去挖。
 
 [![PyPI](https://img.shields.io/pypi/v/tmap-agents?style=flat-square&color=3775a9)](https://pypi.org/project/tmap-agents/)
 [![Python](https://img.shields.io/pypi/pyversions/tmap-agents?style=flat-square&logo=python&logoColor=white)](https://pypi.org/project/tmap-agents/)
 [![MCP server](https://img.shields.io/badge/MCP-server-5c4ee5?style=flat-square)](#连接你的-agent)
-[![Platform](https://img.shields.io/badge/platform-Linux_x86__64_%7C_macOS_arm64-555?style=flat-square)](#安装细节)
 [![License](https://img.shields.io/github/license/JoeyZzZzZz/treasure-map?style=flat-square)](LICENSE)
 
 Treasure Map 把解包后的固件文件系统变成一组事实，通过内置的 MCP 服务器交给你的编程 agent（Claude
-Code、Codex、Cursor 等）：它认得的每一处危险调用，流到那里的数据从哪来，以及同样重要的——哪些它没能查清。每条事实都指向具体的二进制、函数和地址。它不带自己的 agent，也不运行任何模型；哪条线索是真漏洞，由你的 agent 来定。**事实归工具，判断归模型。**
+Code、Codex、Cursor 等）：它认得的每一处危险调用，流到那里的数据从哪来，以及同样重要的——哪些它没能查清。每条事实都指向具体的二进制、函数和地址。它不带自己的 agent，也不运行任何模型；哪条线索是真漏洞，由你的 agent 来定。
+
+**事实归工具，判断归模型。**
 
 ![tmap scan 和 tmap diff 把固件变成事实；你的 agent 通过 MCP 读取，并把判断写到单独的一层](https://raw.githubusercontent.com/JoeyZzZzZz/treasure-map/main/docs/images/architecture.zh.svg)
 
