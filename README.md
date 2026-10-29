@@ -32,8 +32,6 @@ It does two things:
 > **Developer preview.** Commands, config, the atlas database and MCP tool fields may change
 > incompatibly between versions. After upgrading, see [Upgrading](#upgrading).
 
----
-
 ## Quick start
 
 **1. Install.** One command installs `tmap` and then runs `tmap init`, which sets up the toolchain
@@ -110,8 +108,6 @@ up to date (1):
 `tmap rescan` refreshes them.
 ```
 
----
-
 ## What your agent gets
 
 ### The firmware map
@@ -153,8 +149,6 @@ BinDiff end to end — you never handle an intermediate file. (`--binary NAME` l
 If the stored scans or diffs were made by an older tmap, `tmap diff` brings them up to date first and
 says what that involves before it starts.
 
----
-
 ## Why facts, not verdicts
 
 A scanner hands you findings and a severity score — a verdict you then have to trust or re-check. A
@@ -170,8 +164,6 @@ did not look. That is the half Treasure Map does.
 - **Judgments that accumulate.** Your agent's conclusions live in an annotation layer over the
   read-only facts, so a multi-session audit picks up where it left off — with any model or agent. A
   judgment is flagged for review again the moment the facts under it change.
-
----
 
 ## Install details
 
@@ -196,8 +188,6 @@ unpacked; they go to `~/.treasure-map/toolchain/`.
 
 `tmap init` shows what it found and what it will download, and changes nothing until you confirm;
 `--dry-run` prints the full plan.
-
----
 
 ## Connect your agent
 
@@ -234,8 +224,6 @@ such entries out).
 Parameter names, what each means and where it differs between tools:
 `get_tool_reference(name="parameters")`.
 
----
-
 ## Upgrading
 
 ```bash
@@ -259,8 +247,6 @@ why, without running anything.
 `tmap update` works on the install the one-line installer makes (`uv tool`). Installed another way,
 update it the same way you installed it.
 
----
-
 ## Troubleshooting
 
 Run `tmap doctor` first. Each check shows ✅, ⚠ (works, worth knowing), `·` (information), ❌, or `?`
@@ -279,8 +265,6 @@ Run `tmap doctor` first. Each check shows ✅, ⚠ (works, worth knowing), `·` 
 - **Your own Ghidra 11.4.3 starts with an unexpected JDK** — Ghidra remembers the JDK it last ran with
   (`java_home.save` in its settings directory), and tmap's runs record the JDK tmap uses there. Set
   `JAVA_HOME` when you start Ghidra yourself.
-
----
 
 ## Uninstalling
 
@@ -313,8 +297,6 @@ listed.
 
 </details>
 
----
-
 ## Intended use & legal
 
 **Purpose.** Treasure Map supports defensive security auditing and vulnerability research on
@@ -331,8 +313,6 @@ a confirmed vulnerability.
 
 **No warranty.** The tool is provided "as is". You are solely responsible for how you use it and for
 ensuring your activity is lawful in your jurisdiction. If unsure, consult qualified legal counsel.
-
----
 
 ## Contributing
 
