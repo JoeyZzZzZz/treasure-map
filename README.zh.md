@@ -1,18 +1,26 @@
-# Treasure Map（藏宝图）
+# Treasure Map：给 AI agent 的固件地图
 
-[English](README.md) | [中文](README.zh.md)
+[English](README.md) | 中文
 
-**给 AI agent 的固件藏宝图：地图标出地形，宝藏由你的 agent 去挖。**
+### 地图标出地形，宝藏由你的 agent 去挖。
+
+[![PyPI](https://img.shields.io/pypi/v/tmap-agents?style=flat-square&color=3775a9)](https://pypi.org/project/tmap-agents/)
+[![Python](https://img.shields.io/pypi/pyversions/tmap-agents?style=flat-square&logo=python&logoColor=white)](https://pypi.org/project/tmap-agents/)
+[![MCP server](https://img.shields.io/badge/MCP-server-5c4ee5?style=flat-square)](#连接你的-agent)
+[![Platform](https://img.shields.io/badge/platform-Linux_x86__64_%7C_macOS_arm64-555?style=flat-square)](#安装细节)
+[![License](https://img.shields.io/github/license/JoeyZzZzZz/treasure-map?style=flat-square)](LICENSE)
 
 Treasure Map 把解包后的固件文件系统变成一组事实，通过内置的 MCP 服务器交给你的编程 agent（Claude
-Code、Codex、Cursor 等）：它认得的每一处危险调用，流到那里的数据从哪来，以及同样重要的——哪些它没能查清。每条事实都指向具体的二进制、函数和地址。它不带自己的 agent，也不运行任何模型；哪条线索是真漏洞，由你的 agent 来判断。**事实归工具，推理归模型。**
+Code、Codex、Cursor 等）：它认得的每一处危险调用，流到那里的数据从哪来，以及同样重要的——哪些它没能查清。每条事实都指向具体的二进制、函数和地址。它不带自己的 agent，也不运行任何模型；哪条线索是真漏洞，由你的 agent 来定。**事实归工具，判断归模型。**
+
+![tmap scan 和 tmap diff 把固件变成事实；你的 agent 通过 MCP 读取，并把判断写到单独的一层](https://raw.githubusercontent.com/JoeyZzZzZz/treasure-map/main/docs/images/architecture.zh.svg)
 
 它做两件事：
 
 - **给一个固件画地图。** 编译后的代码里每一处执行 shell 命令、拷贝内存缓冲区、格式化字符串、按路径打开文件的地方，都标明哪些已经查清、哪些还不知道、为什么。你的 agent 自己挑要看的视图，读代码，记下结论。
 - **对比两个版本。** 两个版本之间所有改动过的函数，按危险调用附近发生了什么分好类。agent 不用在几千个函数里大海捞针，只需审改过的那几个：这是不是一次安全修补，它修掉的是旧版本里的哪个 1day？修得够不够，同样的调用是不是还留在别处？新加的检查能不能被绕过？
 
-> **开发者预览版。** 命令、配置文件、atlas 数据库和 MCP 工具的字段，在版本之间可能出现不兼容的变化。升级后请看 [升级](#升级)。
+> **开发者预览版。** 命令、配置文件、atlas 数据库和 MCP 工具的字段，在版本之间可能出现不兼容的变化。升级后请看[升级](#升级)。
 
 ---
 
@@ -62,9 +70,26 @@ tmap diff --before fw-v1 --after fw-v2
 每个判断都用 annotate_diff 记录下来。最后说明看了哪些、哪些没看到或没能对比，以及哪些改动看起来和安全相关。
 ```
 
-需要你手动运行的就这些。`scan` 是最慢的一步：每个二进制跑一遍 Ghidra，会显示进度。用同一个 `-w` 重新运行会从中断处继续；换一个 `-w` 就能并排保存另一个固件。你扫过、比过的所有结果都积累在同一个
-**atlas**（`~/.treasure-map/atlas.db`）里，由 agent 自己选择看哪个固件、哪次对比，每次扫描后都不用重新配置。`tmap runs`
-会按你起的名字列出扫过的所有固件。
+上手需要的就这些。`scan` 是最慢的一步：每个二进制跑一遍 Ghidra，会显示进度。用同一个 `-w` 重新运行会从中断处继续；换一个 `-w` 就能并排保存另一个固件。你扫过、比过的所有结果都积累在同一个
+**atlas**（`~/.treasure-map/atlas.db`）里，由 agent 自己选择看哪个固件、哪次对比，每次扫描后都不用重新配置。
+
+### 固件列表
+
+`tmap runs` 会按你起的名字列出扫过的所有固件，并按当前安装的 tmap 是否需要重做来分组：
+
+```text
+3 run(s) in /home/you/.treasure-map/atlas.db:
+
+needs re-hunt (2):
+  fw-v1   complete   scanned 2026-10-20    58 bins / 10437 fns
+  fw-v2   complete   scanned 2026-10-20    58 bins / 10419 fns
+  → the hunt code changed since this run was hunted; re-hunt needs no decompile
+
+up to date (1):
+  my-fw   complete   scanned 2026-10-27   145 bins / 43643 fns
+
+`tmap rescan` refreshes them.
+```
 
 ---
 
@@ -124,29 +149,7 @@ tmap diff --before fw-v1 --after fw-v2
 | Intel 的 macOS | 使用同一套工具链，未做验收测试 |
 | Linux arm64、原生 Windows | 不支持（没有 Ghidra 反编译器 / BinDiff 的构建）；Windows 请用 WSL2 |
 
-`tmap init` 的步骤：
-
-1. **查找**已有的 JDK 21、Ghidra 11.4.3、BinExport 和 BinDiff 8（配置文件、`GHIDRA_HOME`、
-   `JAVA_HOME`、PATH、常见安装位置），并逐个在文件层面检查；
-2. 缺少的部分，**询问**路径，或提供固定版本的下载；
-3. **列出你的 agent**（Claude Code、Codex、Cursor、Claude Desktop、dsh），本机已安装的默认勾选——空格取消勾选，回车确认；
-4. **展示计划**（每个下载的 URL、大小和 sha256，以及每个将要修改的文件），并询问
-   `Apply N changes? [Y/n]`；
-5. **执行**计划，运行 **doctor** 检查，并打印[快速开始](#快速开始)里那两段提示词的英文版。
-
-随时可以再运行一次；配置已是最新时，它会报告 "everything current, nothing to do"。
-
-<details>
-<summary>参数和其他安装方式</summary>
-
-- `install.sh --dry-run` 只打印计划，不做任何改动。脚本会在缺少 [uv](https://docs.astral.sh/uv/)
-  时安装它（不修改你的 shell rc），然后用 uv 管理的 Python 3.11 安装 `tmap`（PyPI 包名 `tmap-agents`）。
-- 已经有 uv：`uv tool install --python 3.11 tmap-agents`，然后运行 `tmap init`。
-- `tmap init` 的参数：`--dry-run`（只看计划）、`--yes`（不提问，包括下载；只注册 `--client` 指定的
-  agent）、`--non-interactive`（不提问，不下载）、`--ghidra / --java-home / --bindiff PATH`（指定使用某个路径）、`--offline DIR` / `--mirror URL`（从其他位置获取安装包，校验和不变）。
-- `tmap doctor` 重新运行检查，不写入任何内容。
-
-</details>
+`tmap init` 会列出找到了什么、要下载什么，在你确认之前不会做任何改动；`--dry-run` 会打印完整计划。
 
 ---
 
@@ -194,7 +197,7 @@ tmap diff --before fw-v1 --after fw-v2      # 重新运行已过期的对比
 ```
 
 `tmap update` 会到 PyPI 查询最新版本，展示计划并询问一次（`--check` 只报告不安装，`--yes` 跳过询问）。它会替换已安装的版本；如果 PATH 上还有别的 `tmap` 会遮住新版本，会把它们指出来；最后自动启动新版本的 `tmap init`，你不用自己输入。这次 init 也会告诉你有多少个
-run 早于新版本。旧版 tmap 或其他工具链生成的对比，会重新计算一次。
+run 早于新版本，具体是哪些、重做各要多少工夫，用 `tmap runs` 查看（见[固件列表](#固件列表)）。旧版 tmap 或其他工具链生成的对比，会重新计算一次。
 
 不带参数时，`tmap rescan` 会重新扫描当前 tmap 的代码会扫出不同结果的所有 run。只想重扫某一个固件，就写上它的 run 名：默认就是扫描时用的 `-w` 名字（除非你另外设置了 `--run-id`），例如 `tmap rescan fw-v1`。加上 `--dry-run`
 会列出将要重扫哪些、为什么，但不实际运行。

@@ -1,20 +1,28 @@
-# Treasure Map
+# Treasure Map: A firmware map for your AI agent
 
-[English](README.md) | [中文](README.zh.md)
+English | [中文](README.zh.md)
 
-**A firmware map for your AI agent. Treasure Map draws the map; your agent finds the treasure.**
+### Treasure Map draws the map; your agent finds the treasure.
+
+[![PyPI](https://img.shields.io/pypi/v/tmap-agents?style=flat-square&color=3775a9)](https://pypi.org/project/tmap-agents/)
+[![Python](https://img.shields.io/pypi/pyversions/tmap-agents?style=flat-square&logo=python&logoColor=white)](https://pypi.org/project/tmap-agents/)
+[![MCP server](https://img.shields.io/badge/MCP-server-5c4ee5?style=flat-square)](#connect-your-agent)
+[![Platform](https://img.shields.io/badge/platform-Linux_x86__64_%7C_macOS_arm64-555?style=flat-square)](#install-details)
+[![License](https://img.shields.io/github/license/JoeyZzZzZz/treasure-map?style=flat-square)](LICENSE)
 
 Treasure Map turns an unpacked firmware filesystem into facts your coding agent (Claude Code, Codex,
 Cursor and others) reads through a bundled MCP server: every dangerous call it recognizes, where the
 data reaching it comes from, and — just as important — what it could not determine. Every fact points
 at an exact binary, function and address. It has no agent of its own and runs no model; deciding which
-lead is a real bug is your agent's job. **Facts are the tool's job; reasoning is the model's.**
+lead is a real bug is your agent's job. **Facts are the tool's job; judgment is the model's.**
+
+![tmap scan and tmap diff turn your firmware into facts; your agent reads them over MCP and writes its judgments to a separate layer](https://raw.githubusercontent.com/JoeyZzZzZz/treasure-map/main/docs/images/architecture.svg)
 
 It does two things:
 
 - **Map one firmware.** Every place the compiled code runs a shell command, copies into a memory
   buffer, formats a string or opens a file by path — each marked with what is known, what is not, and
-  why. Your agent picks the views it needs, reads the code, and records its verdicts.
+  why. Your agent picks the views it needs, reads the code, and records its judgments.
 - **Diff two versions.** Every function that changed between two releases, grouped by what happened
   around its dangerous calls. Instead of thousands of functions, your agent reviews the few that
   changed: is this a security fix, and which 1-day does it close in the old version? Is the fix
@@ -72,15 +80,34 @@ Review the firmware diff fw-v1 → fw-v2 using treasure-map, starting from start
 across every changed binary and the non-binary files.
 Judge whether each change does something real; say inconclusive when you cannot tell.
 For a real one: what weakness in fw-v1 does it address, and does the same pattern survive elsewhere?
-Record each judgement with annotate_diff, and end with what you reviewed,
+Record each judgment with annotate_diff, and end with what you reviewed,
 what you did not reach or could not diff, and the changes that look security-relevant.
 ```
 
-That is all you run by hand. `scan` is the slow part — one Ghidra pass per binary, with progress shown.
-Re-running with the same `-w` resumes where it stopped; a different `-w` keeps another firmware
-alongside. Everything you scan and diff accumulates in one **atlas** (`~/.treasure-map/atlas.db`),
-and the agent picks which firmware or diff to work on — no reconfiguration per scan. `tmap runs`
-lists every firmware scanned so far, by the name you gave it.
+That is all you need to get started. `scan` is the slow part — one Ghidra pass per binary, with
+progress shown. Re-running with the same `-w` resumes where it stopped; a different `-w` keeps
+another firmware alongside. Everything you scan and diff accumulates in one **atlas**
+(`~/.treasure-map/atlas.db`), and the agent picks which firmware or diff to work on — no
+reconfiguration per scan.
+
+### Your runs
+
+`tmap runs` lists every firmware you have scanned, by the name you gave it, grouped by whether the
+installed tmap would redo it:
+
+```text
+3 run(s) in /home/you/.treasure-map/atlas.db:
+
+needs re-hunt (2):
+  fw-v1   complete   scanned 2026-10-20    58 bins / 10437 fns
+  fw-v2   complete   scanned 2026-10-20    58 bins / 10419 fns
+  → the hunt code changed since this run was hunted; re-hunt needs no decompile
+
+up to date (1):
+  my-fw   complete   scanned 2026-10-27   145 bins / 43643 fns
+
+`tmap rescan` refreshes them.
+```
 
 ---
 
@@ -166,33 +193,8 @@ unpacked; they go to `~/.treasure-map/toolchain/`.
 | macOS on Intel | runs the same toolchain; not acceptance-tested |
 | Linux arm64, native Windows | not supported (no Ghidra decompiler / BinDiff build) — on Windows use WSL2 |
 
-`tmap init`, step by step:
-
-1. **finds** an existing JDK 21, Ghidra 11.4.3, BinExport and BinDiff 8 (config, `GHIDRA_HOME`,
-   `JAVA_HOME`, PATH, common install locations) and checks each at file level;
-2. **asks** for a path, or offers the pinned download, for anything missing;
-3. **lists your agents** (Claude Code, Codex, Cursor, Claude Desktop, dsh), pre-selecting those
-   installed here — Space to unselect, Enter to confirm;
-4. **shows the plan** (every download with URL, size and sha256; every file it will change) and asks
-   `Apply N changes? [Y/n]`;
-5. **applies** it, runs the **doctor**, and prints the two prompts shown in [Quick start](#quick-start).
-
-Run it again any time; an up-to-date setup reports "everything current, nothing to do".
-
-<details>
-<summary>Flags and other ways to install</summary>
-
-- `install.sh --dry-run` prints the plan and changes nothing. The script installs
-  [uv](https://docs.astral.sh/uv/) if it is missing (without editing your shell rc), then `tmap`
-  (PyPI package `tmap-agents`) with a uv-managed Python 3.11.
-- Already have uv: `uv tool install --python 3.11 tmap-agents`, then `tmap init`.
-- `tmap init` flags: `--dry-run` (plan only), `--yes` (no questions, downloads included; registers
-  only the agents named with `--client`), `--non-interactive` (no questions, no downloads),
-  `--ghidra / --java-home / --bindiff PATH` (use exactly this), `--offline DIR` / `--mirror URL`
-  (archives from elsewhere, same checksums).
-- `tmap doctor` re-runs the checks and writes nothing.
-
-</details>
+`tmap init` shows what it found and what it will download, and changes nothing until you confirm;
+`--dry-run` prints the full plan.
 
 ---
 
@@ -244,8 +246,9 @@ tmap diff --before fw-v1 --after fw-v2      # re-runs the diffs that are out of 
 `tmap update` checks PyPI for the newest version, shows its plan and asks once (`--check` only
 reports, `--yes` skips the question). It replaces the installed version, names any other `tmap` on
 PATH that would shadow the new one, and then starts the new version's `tmap init` by itself — you
-do not type it. That init also tells you how many of your runs predate the new version. A diff made
-by an older tmap, or with another toolchain, is recomputed once.
+do not type it. That init also tells you how many of your runs predate the new version; `tmap runs`
+shows which ones and what redoing each costs (see [Your runs](#your-runs)). A diff made by an older
+tmap, or with another toolchain, is recomputed once.
 
 With no arguments, `tmap rescan` re-scans every run the installed tmap's code would produce
 differently. To rescan a single firmware, name its run — the `-w` name you scanned it with, unless
