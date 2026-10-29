@@ -535,11 +535,11 @@ PROGRESS_NOTE_COMPLETE = (
 )
 PROGRESS_NOTE = (
     "Progress over the view's ENTRIES, per page, with the remainder stated every time. An entry "
-    "counts as looked at once a judgement exists on its anchor (annotate_diff). "
+    "counts as looked at once a judgment exists on its anchor (annotate_diff). "
     + PROGRESS_NOTE_COMPLETE
-    + " 'needs_recheck' = the entry's facts moved since the judgement, or the diff "
+    + " 'needs_recheck' = the entry's facts moved since the judgment, or the diff "
     "is not current (source_stale not false), or the diff is withheld; 'needs_relabel' = the "
-    "verdict word is retired. A judgement that cannot be settled is 'change_inconclusive': it "
+    "verdict word is retired. A judgment that cannot be settled is 'change_inconclusive': it "
     "stays in view."
 )
 
@@ -595,7 +595,7 @@ def annotation_block(
     return {
         "available": True,
         "what": (
-            "A writable layer of YOUR judgements over this read-only view: one per entry "
+            "A writable layer of YOUR judgments over this read-only view: one per entry "
             "(anchor_ref on every entry), or per candidate row. The view's facts never change "
             "because of it; with band=true it reorders entries only inside the groups the "
             "page's order already forms. A non-binary file of the run pair is judged too: "
@@ -623,7 +623,7 @@ def annotation_block(
             rationale='"..."',
         ),
         "promote_note": (
-            "carries the judgement onto one candidate, as a candidate verdict. Only from a row "
+            "carries the judgment onto one candidate, as a candidate verdict. Only from a row "
             "that lands A or persisted, or P with subclass unmatched_analysis_complete, in an "
             "entry whose counterpart is determined, on a diff that is current (source_stale "
             "false)."

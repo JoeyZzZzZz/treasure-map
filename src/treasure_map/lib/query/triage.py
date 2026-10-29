@@ -277,7 +277,7 @@ def _source_kind_from_evidence(flow_evidence: Evidence) -> str:
 
 _DEGRADED_ANCHOR_NOTE = (
     "this ref is a FUNCTION-level degraded anchor: the call could not be pinned to an address, so "
-    "several callsites of this function may share it; it cannot carry a per-callsite judgement"
+    "several callsites of this function may share it; it cannot carry a per-callsite judgment"
 )
 _FAILED_EXTRACTION_NOTE = (
     "this candidate comes from an earlier extraction: this scan's extraction of its binary did "
@@ -2346,7 +2346,7 @@ def _dim_sink_impact(sink_class: str, overrides: dict[str, int] | None = None) -
         sink_class or "unknown",
         "sink callee classification",
         f"impact tier {tier} ({tname}); default order cmd=fmt>copy>log — a visible, OVERRIDABLE "
-        "judgement, not a magnitude-of-harm claim",
+        "judgment, not a magnitude-of-harm claim",
     )
 
 
@@ -3392,7 +3392,7 @@ def _explain_in_run(
     )
     claims_does_not = (
         "declare the candidate attackable, reachable, or real — every layer is a fact; the "
-        "judgement is yours;",
+        "judgment is yours;",
         "trace cross-function flow (who calls this function is not followed here);",
         "prove safety on a '?' layer — a '?' is a coverage gap, never 'safe'.",
     )

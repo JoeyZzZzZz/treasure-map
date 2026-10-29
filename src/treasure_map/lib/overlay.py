@@ -425,7 +425,7 @@ def _refuse_degraded_anchor(atlas: sqlite3.Connection, evidence_ref: str) -> Non
             raise ConfigError(
                 f"evidence_ref {evidence_ref!r} is a function-level degraded anchor "
                 f"(callsite_located=false, anchor_degraded={data.get('anchor_degraded')!r}): "
-                "several callsites may share it, so it cannot carry a per-callsite judgement"
+                "several callsites may share it, so it cannot carry a per-callsite judgment"
             )
 
 
@@ -624,7 +624,7 @@ def _check_diff_write(
         if verdict in _VERDICTS:
             raise ConfigError(
                 f"verdict must be one of {list(_DIFF_VERDICTS)} on a diff entry; {verdict!r} is a "
-                "candidate verdict — annotate the candidate, or carry this entry's judgement to "
+                "candidate verdict — annotate the candidate, or carry this entry's judgment to "
                 "one of its candidates with promote"
             )
         raise ConfigError(f"verdict must be one of {list(_DIFF_VERDICTS)}; got {verdict!r}")
@@ -840,7 +840,7 @@ def promote(
     if verdict == "exploitable" and verdict_basis is None:
         raise ConfigError(
             "promoting as exploitable requires verdict_basis (chain + verification_gaps): the "
-            "judgement rests on a diff, and its reason has to be written down with it"
+            "judgment rests on a diff, and its reason has to be written down with it"
         )
     _validate_verdict_basis(verdict, verdict_basis)
     _check_text_and_attribution(rationale, attributed_to)

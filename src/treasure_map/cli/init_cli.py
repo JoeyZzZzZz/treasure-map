@@ -107,7 +107,7 @@ _DIFF_PROMPT = (
     "Judge whether each change does something real; say inconclusive when you cannot tell.",
     "For a real one: what weakness in fw-v1 does it address, and does the same pattern survive"
     " elsewhere?",
-    "Record each judgement with annotate_diff, and end with what you reviewed,",
+    "Record each judgment with annotate_diff, and end with what you reviewed,",
     "what you did not reach or could not diff, and the changes that look security-relevant.",
 )
 

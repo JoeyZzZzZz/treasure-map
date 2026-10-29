@@ -593,7 +593,7 @@ _META_NOTE = (
 
 _CAP_NOTE = (
     "delta_supported=0 for a dimension means it is VISIBLE but this diff produces no per-subject "
-    "delta for it -- an EXPLICIT non-judgement, never a silent omission. state_a/state_b are each "
+    "delta for it -- an EXPLICIT non-judgment, never a silent omission. state_a/state_b are each "
     "side's analysis capability (present / declared_absent / registration_unknown)."
 )
 

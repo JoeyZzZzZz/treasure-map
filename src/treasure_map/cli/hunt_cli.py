@@ -1639,7 +1639,7 @@ def runs(config: Path | None, atlas_path: Path | None, as_json: bool) -> None:
     "impact_order",
     default=None,
     help="Override the impact tiers, e.g. 'cmd=fmt_string,copy,log' (comma = descending tier, "
-    "'=' co-ranks). Overridable judgement.",
+    "'=' co-ranks). Overridable judgment.",
 )
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit structured JSON.")
 @click.option(

@@ -8,7 +8,7 @@ DIFF_WORKFLOW = (
     "For a version diff: list_diffs names the diff ids; start_diff_review(diff_id) gives the "
     "entries to read first, in the default order; read one in full with "
     "get_diff_patch_view(diff_id, entry_id=...), judge it from its pseudocode_delta / "
-    "inline_hunk, record the judgement with annotate_diff (or annotate_diff_batch for many "
+    "inline_hunk, record the judgment with annotate_diff (or annotate_diff_batch for many "
     "entries of one diff), and carry a finding onto one of its candidates with promote. The "
     "non-binary files of the two runs (scripts, configs, credentials, web assets) are compared "
     "by get_file_diff(run_pair) and one is judged with annotate_diff(..., run_pair=...)."

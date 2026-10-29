@@ -367,7 +367,7 @@ def _entry(built: BuiltDiff, meta: dict[str, Any], entry_id: str) -> _Entry:
     """The listed entry named by its entry_id, or by its anchor_ref."""
     if entry_id.split("#", 2)[1:2] == ["non_binary"]:
         raise ConfigError(
-            "promote carries a judgement onto a candidate of a function entry; a non-binary file "
+            "promote carries a judgment onto a candidate of a function entry; a non-binary file "
             "has no candidate rows"
         )
     by_id = {e.entry_id: e for e in built.entries}
@@ -476,7 +476,7 @@ def check_promotion(
             raise PromotionRefusedError(
                 f"diff {diff_id!r} is not current (source_stale={stale!r}, reason "
                 f"{now['source_stale_reason']!r}): re-run it and promote again, or pass "
-                "allow_stale_source=true, which is recorded with the judgement",
+                "allow_stale_source=true, which is recorded with the judgment",
                 now,
             )
         origin["promoted_while_source_stale"] = now
@@ -487,12 +487,12 @@ def check_promotion(
 
 
 _LIST_NOTE = (
-    "YOUR judgements on diff entries (annotate_diff) — decisions, not tool facts; the diff and its "
+    "YOUR judgments on diff entries (annotate_diff) — decisions, not tool facts; the diff and its "
     "view are unchanged whether this is empty or full. review_state is the entry's state in the "
     "progress count: 'needs_recheck' when basis_state is not 'unchanged' (basis_moved names what "
     "moved; 'diff_withheld' = the diff is undetermined as a whole now) or when the diff is not "
     "current (source_stale not false). basis_state 'anchor_unresolved' = the subject is gone (the "
-    "functions were paired differently, or a candidate was re-keyed): the judgement is dangling. "
+    "functions were paired differently, or a candidate was re-keyed): the judgment is dangling. "
     "Nothing is dropped."
 )
 

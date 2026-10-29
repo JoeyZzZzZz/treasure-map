@@ -381,7 +381,7 @@ def test_a_group_ref_of_another_diff_is_refused(world: World) -> None:
     other = _group_ref(world, liby[0], DIFF2)
     assert gf._f2_from_ref(other) == _STRCPY_KEY
     message = _refusal(world, _entry_anchor(world, "00001000"), other)
-    assert f"group_ref names diff {DIFF2!r}, but this judgement is on {DIFF!r}" in message
+    assert f"group_ref names diff {DIFF2!r}, but this judgment is on {DIFF!r}" in message
 
 
 def test_a_group_ref_of_another_recipe_version_is_refused(world: World) -> None:

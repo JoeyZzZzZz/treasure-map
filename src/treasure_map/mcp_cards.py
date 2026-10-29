@@ -461,7 +461,7 @@ TOOL_CARDS: dict[str, ToolCard] = {
             "For one sink call of a diff (evidence_ref, or candidate_anchor): the other calls of "
             "the same shape in the same binary on the same side, and where each landed in this "
             "diff — counts, never a verdict. The group carries group_ref (pass it to annotate_diff "
-            "when a judgement leaned on the group), shape, member_count, by_landing and "
+            "when a judgment leaned on the group), shape, member_count, by_landing and "
             "states_unreadable: a member that could not be read is never counted as not listed. "
             "sibling_set_bounds names what can make the group look smaller; members_offset pages "
             "the members."
@@ -511,13 +511,13 @@ TOOL_CARDS: dict[str, ToolCard] = {
         required=("diff_id",),
         example='get_diff_capabilities(diff_id="<diff_id>")',
         boundary=(
-            "is an EXPLICIT non-judgement",
+            "is an EXPLICIT non-judgment",
             "which is NOT the same as 'nothing changed'",
         ),
         summary=(
             "Per-dimension capability state of one diff: which dimensions each side could analyse "
             "(state_a / state_b) and whether the diff can delta them. delta_supported=0 is an "
-            "EXPLICIT non-judgement: the dimension is visible but this diff produces no "
+            "EXPLICIT non-judgment: the dimension is visible but this diff produces no "
             "per-subject delta for it. Read it beside an empty get_diff_deltas — 'this diff does "
             "not delta that dimension', which is NOT the same as 'nothing changed'."
         ),
@@ -776,7 +776,7 @@ TOOL_CARDS: dict[str, ToolCard] = {
             "worth keeping past THIS session",
         ),
         summary=(
-            "Record YOUR OWN judgement on one candidate onto the overlay; the base map is "
+            "Record YOUR OWN judgment on one candidate onto the overlay; the base map is "
             "unchanged. This is YOUR decision, not a tool fact. verdict: inconclusive, suspicious "
             "(floats), excluded (sinks), safe (sinks; needs block_source + block_point + "
             "block_why) or exploitable (floats above suspicious; chain + verification_gaps "
@@ -803,13 +803,13 @@ TOOL_CARDS: dict[str, ToolCard] = {
             "re-annotating OVERWRITES",
         ),
         summary=(
-            "Record YOUR OWN judgement on one diff entry (get_diff_patch_view) or one non-binary "
+            "Record YOUR OWN judgment on one diff entry (get_diff_patch_view) or one non-binary "
             "file (get_file_diff): did this change do something real. anchor_ref must name "
             "something the view lists now — never a blind write. verdict: changed_real (may carry "
             "evidence), no_real_change (why_unchanged + checked, at least one anchor read in the "
             "current view; Plain-text notes are kept but do not count) or change_inconclusive. "
             "rationale is required except for no_real_change (it defaults to why_unchanged). "
-            "group_ref records a same-shape group the judgement leaned on. One judgement per "
+            "group_ref records a same-shape group the judgment leaned on. One judgment per "
             "anchor: re-annotating OVERWRITES. Many entries at once: annotate_diff_batch."
         ),
     ),
@@ -823,7 +823,7 @@ TOOL_CARDS: dict[str, ToolCard] = {
         ),
         boundary=("all of them or none", "Only those seven keys"),
         summary=(
-            "Record YOUR judgements on many entries of one diff at once — all of them or none. "
+            "Record YOUR judgments on many entries of one diff at once — all of them or none. "
             "annotations is 1..200 objects with annotate_diff's per-entry fields and no diff_id: "
             "anchor_ref + verdict, optionally rationale, checked, why_unchanged, evidence, "
             "group_ref. Only those seven keys — a stray key fails that item. Every item is "
@@ -846,7 +846,7 @@ TOOL_CARDS: dict[str, ToolCard] = {
             "it reads ``source_diff_stale`` there",
         ),
         summary=(
-            "Carry a judgement reached on a diff entry onto ONE of its candidates, as that "
+            "Carry a judgment reached on a diff entry onto ONE of its candidates, as that "
             "candidate's own annotation: entry_id (the entry's entry_id or anchor_ref), row_ref "
             "(a row's a_ref or b_ref); verdict, rationale and the basis fields are annotate's, and "
             "exploitable needs chain + verification_gaps here. Refused, with the facts that "
@@ -869,7 +869,7 @@ TOOL_CARDS: dict[str, ToolCard] = {
             "the delta names what moved), unverifiable (an honest can't-say, never a clean bill) "
             "or anchor_unresolved; a promoted one carries promoted_from. Stale rows are surfaced, "
             "never dropped. These are AGENT decisions on the overlay, not tool facts. "
-            "anchor_kind='diff_subject' lists your diff judgements instead (run_id is then a run "
+            "anchor_kind='diff_subject' lists your diff judgments instead (run_id is then a run "
             "pair, with review_progress)."
         ),
     ),
@@ -881,7 +881,7 @@ TOOL_CARDS: dict[str, ToolCard] = {
         summary=(
             "Delete overlay annotations and report how many went. The base map is untouched. Pass "
             "ONE scope: run_id (one firmware), evidence_ref (one candidate) or, with "
-            "anchor_kind='diff_subject', anchor_ref (one diff judgement; run_id is then a run "
+            "anchor_kind='diff_subject', anchor_ref (one diff judgment; run_id is then a run "
             "pair). No scope deletes nothing unless clear_all=true, which wipes every annotation "
             "of that kind — it cannot be undone."
         ),
@@ -1127,13 +1127,13 @@ PARAMETER_NAMES: list[dict[str, Any]] = [
     ),
     _param(
         "anchor_kind",
-        "evidence_ref (candidate annotations) or diff_subject (diff judgements)",
+        "evidence_ref (candidate annotations) or diff_subject (diff judgments)",
         ("list_overlays", "clear_overlay"),
         _CONSISTENT,
     ),
     _param(
         "verdict",
-        "a judgement's verdict",
+        "a judgment's verdict",
         ("annotate", "annotate_diff", "promote", "list_overlays"),
         _KEPT,
         "candidate verdicts on annotate / promote / list_overlays, diff verdicts on "
@@ -1148,7 +1148,7 @@ PARAMETER_NAMES: list[dict[str, Any]] = [
         "annotate_diff lets no_real_change leave it out (it defaults to why_unchanged)",
     ),
     *[
-        _param(p, "a candidate judgement's basis field", _BASIS, _CONSISTENT)
+        _param(p, "a candidate judgment's basis field", _BASIS, _CONSISTENT)
         for p in (
             "block_source",
             "block_point",

@@ -370,7 +370,7 @@ def _checked_group(
         )
     g_diff, f2_key, side, fpv, recipe = parsed
     if g_diff != diff_id:
-        raise ConfigError(f"group_ref names diff {g_diff!r}, but this judgement is on {diff_id!r}")
+        raise ConfigError(f"group_ref names diff {g_diff!r}, but this judgment is on {diff_id!r}")
     if side not in ("a", "b"):
         raise ConfigError(f"group_ref names side {side!r}; a group is on side 'a' or 'b'")
     if recipe != sss.F2_RECIPE_VERSION:
