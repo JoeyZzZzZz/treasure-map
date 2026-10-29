@@ -2,7 +2,7 @@
 
 [English](README.md) | **中文**
 
-## 地图标出地形，宝藏由你的 agent 去挖。
+### 地图标出地形，宝藏由你的 agent 去挖。
 
 [![PyPI](https://img.shields.io/pypi/v/tmap-agents?style=flat-square&color=3775a9)](https://pypi.org/project/tmap-agents/)
 [![Python](https://img.shields.io/pypi/pyversions/tmap-agents?style=flat-square&logo=python&logoColor=white)](https://pypi.org/project/tmap-agents/)

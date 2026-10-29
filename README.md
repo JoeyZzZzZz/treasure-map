@@ -2,7 +2,7 @@
 
 **English** | [中文](README.zh.md)
 
-## Treasure Map draws the map; your agent finds the treasure.
+### Treasure Map draws the map; your agent finds the treasure.
 
 [![PyPI](https://img.shields.io/pypi/v/tmap-agents?style=flat-square&color=3775a9)](https://pypi.org/project/tmap-agents/)
 [![Python](https://img.shields.io/pypi/pyversions/tmap-agents?style=flat-square&logo=python&logoColor=white)](https://pypi.org/project/tmap-agents/)
