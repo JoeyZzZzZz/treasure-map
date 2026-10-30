@@ -15,6 +15,7 @@ binary it finished: re-running the same command decompiles only the rest.
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import time
 from collections.abc import Callable
@@ -23,14 +24,39 @@ from pathlib import Path
 from typing import Any
 
 from treasure_map.lib import rescan_version
-from treasure_map.lib.analyze.db_ingest import ingest_elfs
+from treasure_map.lib.analyze.db_ingest import ExportCheck, ingest_elfs, toolchain_changed
 from treasure_map.lib.analyze.elf_inventory import ElfRecord, scan_filesystem
-from treasure_map.lib.analyze.ghidra_ingest import IngestStats, ingest_ghidra_output
-from treasure_map.lib.analyze.ghidra_runner import _INTERRUPTED, GhidraResult, GhidraRunner
+from treasure_map.lib.analyze.file_inventory import build_file_inventory
+from treasure_map.lib.analyze.ghidra_ingest import (
+    IngestStats,
+    drop_extraction,
+    ingest_ghidra_output,
+)
+from treasure_map.lib.analyze.ghidra_runner import (
+    _INTERRUPTED,
+    GhidraResult,
+    GhidraRunner,
+    export_paths,
+)
 from treasure_map.lib.analyze.non_binary.orchestrator import NonBinaryStats, run_all_ingesters
 from treasure_map.lib.analyze.symlinks import SymlinkCollector, write_symlinks
 from treasure_map.lib.analyze.xrefs import XrefStats, build_xrefs
+from treasure_map.lib.binexport_archive import (
+    USABLE_STATUSES,
+    archive_dir,
+    remove_other_archives,
+    write_archive,
+)
 from treasure_map.lib.config.config import Config
+
+# The export stamp is its own axis, outside the scan stamp (lib/export_stamp).
+from treasure_map.lib.export_stamp import (
+    SCAN_BUILDER,
+    ScanExtension,
+    export_code_hash,
+    export_hash,
+    scan_extension,
+)
 from treasure_map.lib.storage.connection import open_db
 from treasure_map.lib.workspace.workspace import Workspace
 
@@ -89,6 +115,77 @@ class AnalyzeResult:
     reanalyze_pending: int = 0
     # Of ``ghidra_ok``, how many finished as ``no_functions`` (code present, no function recovered).
     ghidra_no_functions: int = 0
+    # The BinExport export: exports_by_status counts this scan's binaries by binexport_status;
+    # extension_note says why the extension was or was not used (None when nothing to say).
+    exports_by_status: dict[str, int] = field(default_factory=dict)
+    extension_note: str | None = None
+
+
+@dataclass(frozen=True)
+class _ExportContext:
+    """What every export of this scan is stamped with."""
+
+    extension: ScanExtension
+    script_hash: str
+    export_hash: str | None  # None when the extension is not available
+    archive_dir: Path
+    pass_version: str
+    ghidra_version: str
+
+
+def _export_meta(
+    ctx: _ExportContext, res: GhidraResult, archived: tuple[str, str, int] | None
+) -> str:
+    """The ``binexport_scan_meta`` JSON of one binary's export outcome."""
+    report = res.export_report or {}
+    degraded = report.get("operand_markup_degraded") or {}
+    meta: dict[str, Any] = {
+        "export_hash": ctx.export_hash,
+        "script_hash": ctx.script_hash,
+        "binexport": ctx.extension.stamp,
+        "builder": SCAN_BUILDER,
+        "pass_version": ctx.pass_version,
+        "ghidra_version": ctx.ghidra_version,
+        "budget_seconds": res.export_budget,
+        "archive": archived[0] if archived else None,
+        "report_archive": archived[1] if archived else None,
+        "archive_bytes": archived[2] if archived else None,
+    }
+    if archived:
+        meta["report"] = {
+            "functions_before_build": report.get("functions_before_build"),
+            "functions_after_build": report.get("functions_after_build"),
+            "entry_addresses_added": report.get("entry_addresses_added"),
+            "flow_graphs_dropped": report.get("flow_graphs_dropped"),
+            "degenerate_functions": len(report.get("degenerate_functions") or []),
+            "operand_markup_degraded_instructions": degraded.get("instructions"),
+            "operand_markup_degraded_functions": len(degraded.get("functions") or []),
+        }
+    return json.dumps(meta, sort_keys=True)
+
+
+def _archive_export(
+    ctx: _ExportContext, rec: ElfRecord, res: GhidraResult
+) -> tuple[str, str | None, tuple[str, str, int] | None]:
+    """(status, meta JSON, archived names) for one binary's export: a usable export is compressed
+    into the archive FIRST (the row naming it is written after), and an archive that cannot be
+    written leaves the export failed:archive_error."""
+    status = res.export_status or "failed:unknown"
+    archived: tuple[str, str, int] | None = None
+    if status in USABLE_STATUSES and res.export_file and res.export_report_file:
+        try:
+            a = write_archive(
+                res.export_file,
+                res.export_report_file,
+                ctx.archive_dir,
+                rec.sha256,
+                ctx.pass_version,
+            )
+            archived = (a.export_name, a.report_name, a.export_bytes)
+        except OSError as exc:
+            logger.warning("binexport: cannot archive the export of %s: %s", rec.name, exc)
+            status = "failed:archive_error"
+    return status, _export_meta(ctx, res, archived), archived
 
 
 def run_analyze(
@@ -130,6 +227,27 @@ def run_analyze(
     # that DID the work — not whatever happens to be installed later when the run is hunted.
     ghidra_version = runner.ghidra_version()
 
+    # The BinExport copy this scan's JVMs load, decided once before any JVM: the export runs in the
+    # same session as each extraction. Without one the scan still runs; its binaries are recorded
+    # extension_missing, and a diff of them is a declared blind spot.
+    extension = scan_extension(runner.get_headless().resolve().parent.parent)
+    runner.set_extension(extension)
+    if extension.note:
+        logger.warning("binexport: %s", extension.note)
+    script_hash = export_code_hash(SCAN_BUILDER)
+    export_ctx = _ExportContext(
+        extension=extension,
+        script_hash=script_hash,
+        export_hash=(
+            export_hash(script_hash, extension.stamp or "unknown")
+            if extension.ext_dir is not None
+            else None
+        ),
+        archive_dir=archive_dir(workspace.db_path),
+        pass_version=pass_version,
+        ghidra_version=ghidra_version,
+    )
+
     # The ELF walk already tests every entry for being a symlink; hand it a collector so those
     # links become an inventory instead of being dropped. This walk always runs, so the inventory
     # does not depend on an optional stage.
@@ -156,11 +274,15 @@ def run_analyze(
     symlinks_recorded = 0
     xref_stats = XrefStats()
     nb_stats = NonBinaryStats()
+    exports_by_status: dict[str, int] = {}
     try:
         # Wipe-and-rebuild the link inventory (the cross-binary exec edge resolves its targets
         # through it). Independent of Ghidra, so it lands even on a fully-cached re-analyze.
         symlinks_recorded = write_symlinks(conn, symlink_collector.records)
 
+        # Extracted by another Ghidra than this scan's: re-extracted, and if that fails its earlier
+        # rows go (they were produced by a decompiler no longer installed).
+        upgraded = toolchain_changed(conn, [r.sha256 for r in records], ghidra_version)
         sha_to_id, dirty_shas = ingest_elfs(
             conn,
             records,
@@ -169,6 +291,11 @@ def run_analyze(
             timeout_base=config.ghidra.headless_timeout_seconds,
             force_retry=force_retry,
             ghidra_version=ghidra_version,
+            export_check=ExportCheck(
+                export_ctx.export_hash,
+                export_ctx.archive_dir,
+                config.ghidra.headless_timeout_seconds,
+            ),
         )
         dirty_records = [r for r in records if r.sha256 in dirty_shas]
 
@@ -215,14 +342,7 @@ def run_analyze(
                     ghidra_ok += 1
                     if res.analysis_status == "no_functions":
                         ghidra_no_functions += 1
-                    one = ingest_ghidra_output(
-                        conn,
-                        ghidra_output_dir,
-                        [rec],
-                        sha_to_id,
-                        pass_version=pass_version,
-                        success_stamp={rec.sha256: (res.analysis_status, ghidra_version)},
-                    )
+                    one = _store_extraction(rec, res)
                     for f in dataclasses.fields(IngestStats):
                         setattr(
                             ingest_stats,
@@ -251,7 +371,8 @@ def run_analyze(
                     # would be a different attempt or the same one twice.
                     conn.execute(
                         "UPDATE binaries SET ghidra_ok=?, ghidra_status=?, ghidra_status_reason=?, "
-                        "timeout_budget=?, timeout_pass_version=?, reanalyze_pending=0 "
+                        "timeout_budget=?, timeout_pass_version=?, reanalyze_pending=0, "
+                        "binexport_status=?, binexport_scan_meta=? "
                         "WHERE sha256=?",
                         (
                             0,
@@ -259,20 +380,74 @@ def run_analyze(
                             res.reason,
                             res.timeout_budget,
                             pass_version,
+                            res.export_status or f"scan_failed:{res.reason or 'unknown'}",
+                            _export_meta(export_ctx, res, None),
                             rec.sha256,
                         ),
                     )
+                    if rec.sha256 in upgraded:
+                        # Re-extracted because the decompiler changed, and that failed: the rows the
+                        # old decompiler produced are not served as this one's.
+                        drop_extraction(conn, rec.sha256)
                     conn.commit()
+                    # No export stands for this binary now (its session's was never kept).
+                    remove_other_archives(export_ctx.archive_dir, rec.sha256)
                     ghidra_failed += 1
                     kept += 1
                 finalized.add(rec.sha256)
+
+            def _store_extraction(rec: ElfRecord, res: GhidraResult) -> IngestStats:
+                """Archive the session's export (when usable), then store the extraction with its
+                success stamp AND its export outcome in one transaction; then drop every other
+                archive of the binary and the session's raw export files."""
+                status, meta, archived = _archive_export(export_ctx, rec, res)
+                one = ingest_ghidra_output(
+                    conn,
+                    ghidra_output_dir,
+                    [rec],
+                    sha_to_id,
+                    pass_version=pass_version,
+                    success_stamp={rec.sha256: (res.analysis_status, ghidra_version)},
+                    export_stamp={rec.sha256: (status, meta)},
+                )
+                stored = one.binaries_processed == 1
+                keep = (archived[0], archived[1]) if archived and stored else ()
+                remove_other_archives(export_ctx.archive_dir, rec.sha256, keep)
+                _drop_raw_export(rec)
+                return one
+
+            def _drop_raw_export(rec: ElfRecord) -> None:
+                for path in export_paths(ghidra_output_dir, rec.path, rec.sha256[:8]):
+                    path.unlink(missing_ok=True)
+                    path.with_name(path.name + ".tmp").unlink(missing_ok=True)
+
+            def _persist_export(rec: ElfRecord, res: GhidraResult) -> None:
+                """Store what a phase-2 re-run settled for a binary whose extraction phase 1 stored:
+                a whole new session (extraction and usable export) in place of phase 1's, or only
+                the export outcome."""
+                if res.reason == _INTERRUPTED:
+                    return
+                if not res.export_only:
+                    _store_extraction(rec, res)
+                    return
+                conn.execute(
+                    "UPDATE binaries SET binexport_status = ?, binexport_scan_meta = ? "
+                    "WHERE sha256 = ?",
+                    (res.export_status, _export_meta(export_ctx, res, None), rec.sha256),
+                )
+                conn.commit()
+                _drop_raw_export(rec)
 
             finalized: set[str] = set()
             ghidra_output_dir = workspace.path / "ghidra_output"
             ghidra_output_dir.mkdir(parents=True, exist_ok=True)
             try:
                 results = runner.run_all(
-                    dirty_records, ghidra_output_dir, progress_callback, on_final=_persist_final
+                    dirty_records,
+                    ghidra_output_dir,
+                    progress_callback,
+                    on_final=_persist_final,
+                    on_export=_persist_export,
                 )
             except KeyboardInterrupt:
                 logger.warning(
@@ -344,9 +519,20 @@ def run_analyze(
         reanalyze_pending = conn.execute(
             "SELECT COUNT(*) FROM current_binaries WHERE reanalyze_pending = 1"
         ).fetchone()[0]
+        exports_by_status = {
+            str(row[0]): int(row[1])
+            for row in conn.execute(
+                "SELECT COALESCE(binexport_status, 'not_recorded'), COUNT(*) "
+                "FROM current_binaries GROUP BY 1 ORDER BY 1"
+            ).fetchall()
+        }
 
         # non-binary ingester framework (wipe-and-rebuild)
         nb_stats = run_all_ingesters(conn, fs_root, progress_callback=progress_callback)
+
+        # Every file under the root and whether the two inventories above took it in
+        # (wipe-and-rebuild). After both, so it reads what they actually took.
+        build_file_inventory(conn, fs_root, records, ingest_failed=nb_stats.ingest_failed)
 
         # The scan finished. Record what built this analysis.db — the stamp grabbed at the start,
         # so it names the code this process ran. Last, inside the try, so it is written only on a
@@ -386,4 +572,6 @@ def run_analyze(
         kept_earlier_binaries=kept_earlier_binaries,
         reanalyze_pending=reanalyze_pending,
         ghidra_no_functions=ghidra_no_functions,
+        exports_by_status=exports_by_status,
+        extension_note=extension.note,
     )

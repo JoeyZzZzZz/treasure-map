@@ -22,7 +22,7 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -35,6 +35,15 @@ from treasure_map.lib.analyze.stub_resolve import (
 )
 from treasure_map.lib.config.config import GhidraConfig
 from treasure_map.lib.errors import GhidraNotFoundError
+
+# The export stamp is its own axis, never part of the scan stamp: imported from a standard-library
+# module the scan stamp's closure does not enter (rescan_version.CLOSURE_EXCLUDED).
+from treasure_map.lib.export_stamp import (
+    EXPORT_SCRIPT,
+    EXPORT_SCRIPT_DIR,
+    ScanExtension,
+    link_into_home,
+)
 from treasure_map.lib.machine import clamp_parallelism_to_memory
 from treasure_map.lib.pattern.extractor_names import validate_registry
 from treasure_map.version import UNKNOWN_VERSION
@@ -106,8 +115,11 @@ def terminate_all(grace: float = 2.0) -> None:
 
 
 ProgressCallback = Callable[[str, dict[str, Any]], None]
-# Called once per record with its FINAL result (see GhidraRunner.run_all).
+# Called once per record with its FINAL extraction result (see GhidraRunner.run_all).
 FinalCallback = Callable[[ElfRecord, "GhidraResult"], None]
+# Called at most once per record, after a phase-2 re-run of a binary whose extraction phase 1 had
+# already finalized but whose export failed (see GhidraRunner.run_all).
+ExportCallback = Callable[[ElfRecord, "GhidraResult"], None]
 
 _SCRIPT_DIR = Path(__file__).parent / "ghidra"
 _GHIDRA_RELEASES_URL = "https://github.com/NationalSecurityAgency/ghidra/releases"
@@ -165,12 +177,14 @@ def compute_pass_version(script_dir: Path) -> str:
     fingerprint now spans the whole pipeline. A missing/unreadable file is skipped so a scan still
     runs (treating everything as needing a first extraction) rather than crashing.
 
-    ★ It hashes the extraction CODE, not the version of libraries the code calls: pyelftools (which
-    stub_resolve parses ELF with) and Ghidra are NOT in this hash, so upgrading one can change the
-    extracted result while the fingerprint stays put — a same-content re-scan would then skip it.
-    That is the same shape of blind spot, from a dependency rather than our own code; a
-    library/tool upgrade still needs a manual --reanalyze. Folding tool versions into the dirty
-    check is a larger, separate decision (each dependency bump would force a full re-extraction)."""
+    ★ It hashes the extraction CODE, not the version of the tools the code calls. The Ghidra
+    version is deliberately NOT in it: an upgraded decompiler is caught on an axis of its own —
+    every binary another Ghidra extracted is re-extracted by a plain scan (db_ingest's toolchain
+    check), and a run another Ghidra produced is refused until then (run_staleness' toolchain
+    axis). pyelftools (which stub_resolve parses ELF with) is not in it either, and an upgrade of
+    it still needs a manual --reanalyze. The BinExport export scripts the session also runs are
+    kept out on purpose: they change no extracted fact, and are hashed into the export hash
+    (lib/export_stamp) instead."""
     h = hashlib.sha256()
     for p in pass_version_source_files(script_dir):
         try:
@@ -253,6 +267,22 @@ class GhidraResult:
     # lines are still in the file; the timeout and import-failure checks read only what this attempt
     # wrote, from here on.
     log_offset: int = 0
+    # ── the BinExport export written in the same session (lib/binexport_archive) ──
+    # ok / degraded / failed:<why> / scan_failed:<why> / extension_missing; None when the result did
+    # not come from an attempt that could export (a crash placeholder, an interrupted attempt).
+    export_status: str | None = None
+    # The export and its report when export_status is ok / degraded (in the output directory, not
+    # yet archived); None otherwise.
+    export_file: Path | None = None
+    export_report_file: Path | None = None
+    # The export's parsed report (ok / degraded only).
+    export_report: dict[str, Any] | None = None
+    # The export budget this attempt ran under (seconds past the analysis budget); None when the
+    # attempt did not export.
+    export_budget: int | None = None
+    # True on a result handed to ``on_export`` that carries only an export outcome: the extraction
+    # phase 1 finalized stands, and only the export status is to be updated.
+    export_only: bool = False
 
 
 # ★ A binary that cannot finish within this even on an isolated retry is a genuine hang, not a
@@ -537,6 +567,21 @@ def _classify_analysis(
     return ("no_functions", 0) if has_substantial_text(binary) else ("ok_empty", 0)
 
 
+# The decompile-retry budget of a session that does not export (its wall clock has no E share).
+_DECOMPILE_RETRY_NO_EXPORT_S = 30
+
+# The scripts a scan runs after Ghidra's analysis, in this order: create the functions the analysis
+# left out, extract, then (when the BinExport extension is available) export.
+PROMOTE_SCRIPT = "PromoteUndefined.java"
+EXTRACT_SCRIPT = "ExportFunctions.java"
+
+
+def export_paths(output_dir: Path, binary: Path, sha8: str) -> tuple[Path, Path]:
+    """(export, report) a scan's export of ``binary`` is written to, in the output directory."""
+    stem = f"{binary.name}_{sha8}"
+    return output_dir / f"{stem}.BinExport", output_dir / f"{stem}.export_report.json"
+
+
 def _build_cmd(
     headless: Path,
     binary: Path,
@@ -546,19 +591,27 @@ def _build_cmd(
     script_dir: Path,
     sha8: str,
     timeout_s: int,
+    export: tuple[Path, Path] | None = None,
 ) -> list[str]:
-    """Build the analyzeHeadless invocation command list."""
+    """Build the analyzeHeadless invocation command list. With ``export`` (the export and report
+    paths) the session also writes the BinExport export, after the extraction."""
     log_path = output_dir / f"{binary.name}_{sha8}.log"
+    post = ["-postScript", PROMOTE_SCRIPT, "-postScript", EXTRACT_SCRIPT]
+    script_path = str(script_dir)
+    if export is not None:
+        post += ["-postScript", EXPORT_SCRIPT, str(export[0]), str(export[1]), "scan"]
+        # Ghidra takes several script directories separated by ';'. The export scripts stay beside
+        # the diff code and out of the extraction pass's fingerprint (lib/export_stamp).
+        script_path = f"{script_dir};{EXPORT_SCRIPT_DIR}"
     return [
         str(headless),
         str(proj_dir),
         "Proj",
         "-processor",
         arch,
-        "-postScript",
-        "ExportFunctions.java",
+        *post,
         "-scriptPath",
-        str(script_dir),
+        script_path,
         "-deleteProject",
         "-log",
         str(log_path),
@@ -614,7 +667,51 @@ def _analysis_timed_out(log_path: Path, offset: int = 0) -> bool:
         return False
 
 
-def _run_subprocess(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+# A Java exception class name and its message, as Ghidra logs a script that threw.
+_EXCEPTION_LINE = re.compile(
+    rb"((?:[a-z][\w$]*\.)+[A-Z][\w$]*(?:Exception|Error))(?::\s*([^\r\n]*))?"
+)
+
+
+def _export_failure_reason(log_path: Path, offset: int) -> str:
+    """Why this attempt's export left no file: the first exception the log shows from the export
+    script on (its class and the first part of its message), else ``no_file``."""
+    try:
+        text = _log_since(log_path, offset)
+    except OSError:
+        return "no_file"
+    start = text.find(EXPORT_SCRIPT.encode())
+    match = _EXCEPTION_LINE.search(text, start if start >= 0 else 0)
+    if match is None:
+        return "no_file"
+    name = match.group(1).decode(errors="replace").rsplit(".", 1)[-1]
+    msg = (match.group(2) or b"").decode(errors="replace").strip()
+    reason = f"{name}: {msg}" if msg else name
+    return reason[:160]
+
+
+def _read_export(export_file: Path, report_file: Path) -> tuple[str, dict[str, Any] | None]:
+    """(status, report) of an export the session wrote: ok, degraded (some operand written in its
+    default form), or failed when the files are missing or the report is not what the export script
+    writes."""
+    if not export_file.is_file() or export_file.stat().st_size == 0 or not report_file.is_file():
+        return "failed:no_file", None
+    try:
+        report = json.loads(report_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "failed:report_unreadable", None
+    if not isinstance(report, dict):
+        return "failed:report_unreadable", None
+    degraded = report.get("operand_markup_degraded")
+    n = degraded.get("instructions") if isinstance(degraded, dict) else None
+    if isinstance(n, bool) or not isinstance(n, int):
+        return "failed:report_unreadable", None
+    return ("degraded" if n > 0 else "ok"), report
+
+
+def _run_subprocess(
+    cmd: list[str], env: dict[str, str], timeout: int, cwd: Path | None = None
+) -> tuple[int, str]:
     """Spawn cmd in a new session/process group; kill the whole group on timeout
     or interrupt.
 
@@ -631,12 +728,15 @@ def _run_subprocess(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[
         with _active_lock:
             if _shutting_down:
                 return LAUNCH_FAILED_RC, "not started: the run is being interrupted"
+            # A working directory of our own: analyzeHeadless resolves a bare script name against
+            # the directory it is started from first, so a same-named file there would be run.
             proc = subprocess.Popen(
                 cmd,
                 env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 start_new_session=True,
+                cwd=cwd,
             )
             pgid = proc.pid  # session leader: pgid == pid
             _register_pgid(pgid)
@@ -675,10 +775,21 @@ class GhidraRunner:
         *,
         script_dir: Path | None = None,
         headless: Path | None = None,
+        extension: ScanExtension | None = None,
     ) -> None:
         self._config = config
         self._script_dir = script_dir or _SCRIPT_DIR
         self._headless = headless  # None = lazy-discovered on first use
+        # The BinExport copy this scan loads, decided once before any JVM (lib/export_stamp).
+        # None, or one with no ext_dir, = no export: binaries are recorded extension_missing.
+        self._extension = extension
+
+    def set_extension(self, extension: ScanExtension | None) -> None:
+        """The BinExport copy the scan's JVMs load (None = none: no export is attempted)."""
+        self._extension = extension
+
+    def _exporting(self) -> bool:
+        return self._extension is not None and self._extension.ext_dir is not None
 
     def get_headless(self) -> Path:
         """Return cached headless path, discovering it on first call."""
@@ -785,6 +896,7 @@ class GhidraRunner:
                 return r2
 
         failed_reason = "import_failed" if import_failed else last.reason
+        export_status = f"scan_failed:{failed_reason or 'unknown'}"
         # Said where a person sees it: the reason, the end of Ghidra's stderr and its log.
         logger.warning(
             "ghidra: %s failed (%s)%s%s",
@@ -807,6 +919,7 @@ class GhidraRunner:
             # given and make the next scan skip it on a budget it never had.
             timeout_budget=last.timeout_budget,
             log_offset=r1.log_offset,
+            export_status=export_status,
         )
 
     def _run_once(
@@ -827,20 +940,19 @@ class GhidraRunner:
             proj_dir = Path(tempfile.mkdtemp(prefix="tm_ghidra_proj_"))
             ghidra_home_dir = Path(tempfile.mkdtemp(prefix="tm_ghidra_home_"))
 
+            exporting = self._exporting()
+            exp = export_paths(output_dir, binary, sha8) if exporting else None
             cmd = _build_cmd(
-                headless, binary, arch, proj_dir, output_dir, self._script_dir, sha8, timeout
+                headless, binary, arch, proj_dir, output_dir, self._script_dir, sha8, timeout, exp
             )
             expected_out = output_dir / f"{binary.name}_{sha8}_ghidra.json"
             stub_table = output_dir / f"{binary.name}_{sha8}.stubs.tsv"
             # A file left at the target path by an earlier run must never be read as this run's
-            # output: clear it (and its in-flight .tmp, and an earlier run's stub table) before
-            # starting, so the only files present afterwards are ones THIS run wrote. The markers
-            # checked below catch every other way a foreign file appears.
-            for leftover in (
-                expected_out,
-                expected_out.with_name(expected_out.name + ".tmp"),
-                stub_table,
-            ):
+            # output: clear it (and its in-flight .tmp, and an earlier run's stub table and export)
+            # before starting, so the only files present afterwards are ones THIS run wrote. The
+            # markers checked below catch every other way a foreign file appears.
+            leftovers = [expected_out, stub_table, *export_paths(output_dir, binary, sha8)]
+            for leftover in [*leftovers, *(f.with_name(f.name + ".tmp") for f in leftovers)]:
                 leftover.unlink(missing_ok=True)
             expected_pass = self.pass_version()
             # This binary's lazy-binding stubs, resolved from ELF structure and handed to the
@@ -870,10 +982,27 @@ class GhidraRunner:
             }
             # Never inherit a table from the parent environment: this binary's table, or none.
             env.pop("TMAP_STUB_NAMES", None)
+            # Every Ghidra setting stays inside the temporary user home: with XDG_CONFIG_HOME
+            # inherited, Ghidra would write its settings into the user's real configuration tree.
+            env.pop("XDG_CONFIG_HOME", None)
             if resolution is not None:
                 env["TMAP_STUB_NAMES"] = str(stub_table)
+            if exporting and self._extension is not None:
+                # A copy in the user settings directory is not seen under this JVM's temporary
+                # user home: link it there (lib/export_stamp.link_into_home).
+                link_into_home(self._extension, headless.resolve().parent.parent, ghidra_home_dir)
 
-            rc, stderr_raw = _run_subprocess(cmd, env, timeout + 60)
+            # The export has a budget of its own, as long as the analysis's: sharing the analysis's
+            # wall clock pushed binaries that analyse close to their limit over it at the export.
+            export_budget = timeout if exporting else None
+            wall = timeout + 60 + (export_budget or 0)
+            # The one budget the extraction's decompile retries share (ExportFunctions): half the
+            # analysis budget when the session exports (its wall clock carries E besides), a little
+            # when it does not (its wall clock is T + 60).
+            env["TMAP_DECOMPILE_RETRY_BUDGET_S"] = str(
+                timeout // 2 if exporting else _DECOMPILE_RETRY_NO_EXPORT_S
+            )
+            rc, stderr_raw = _run_subprocess(cmd, env, wall, cwd=proj_dir)
         finally:
             for d in (proj_dir, ghidra_home_dir):
                 if d is not None:
@@ -903,17 +1032,32 @@ class GhidraRunner:
 
         reason: str | None = None
         budget: int | None = timeout
+        export_status: str | None = None
+        export_report: dict[str, Any] | None = None
+        timed_out = log_path.exists() and _analysis_timed_out(log_path, log_offset)
         if rc == -1:
-            # Killed at the wall-clock budget: a failure no matter what file is on disk. The
-            # extractor never reached its atomic move, so any JSON present is not this run's.
-            analysis_status, function_count = "failed", 0
-            reason = "timeout"
+            # Killed at the wall-clock budget. The analysis timing out decides it first: then
+            # whatever was written describes a half analysis. Otherwise the extraction may have
+            # finished before the kill (it writes its JSON by an atomic move, and every earlier file
+            # was cleared above), so its JSON decides — with its markers, as always. A finished
+            # extraction is this run's success, and only the export (cut off) is lost.
+            if timed_out:
+                analysis_status, function_count = "failed", 0
+            else:
+                analysis_status, function_count = _classify_analysis(
+                    expected_out, binary, expected_pass, sha8, expected_stub
+                )
+            if analysis_status in _SUCCESS_STATUSES:
+                export_status = "failed:timeout" if exporting else "extension_missing"
+            else:
+                analysis_status, function_count = "failed", 0
+                reason = "timeout"
         elif rc == LAUNCH_FAILED_RC:
             # Ghidra never ran. No budget was spent, so none is recorded: the next scan tries
             # again instead of skipping this binary as one that "would only time out again".
             analysis_status, function_count = "failed", 0
-            reason, budget = "launch_failed", None
-        elif log_path.exists() and _analysis_timed_out(log_path, log_offset):
+            reason, budget, export_budget = "launch_failed", None, None
+        elif timed_out:
             # Ghidra stopped its own analysis at -analysisTimeoutPerFile and exported what it had:
             # a timeout at this budget, whatever the JSON says.
             analysis_status, function_count = "failed", 0
@@ -936,7 +1080,17 @@ class GhidraRunner:
                         reason = "stale_output"  # a JSON is there, but another pass/binary wrote it
                     else:
                         reason = "incomplete"  # malformed (parsed, but no functions array)
+            elif exp is not None:
+                export_status, export_report = _read_export(*exp)
+                if export_status == "failed:no_file":
+                    export_status = f"failed:{_export_failure_reason(log_path, log_offset)}"
+            else:
+                export_status = "extension_missing"
         success = analysis_status in _SUCCESS_STATUSES
+        if not success and reason is not None:
+            # The export of a session whose extraction failed is never kept, whatever was written.
+            export_status = f"scan_failed:{reason}"
+        usable = export_status in ("ok", "degraded") and exp is not None
         return GhidraResult(
             binary=binary,
             output_file=expected_out if success else None,
@@ -949,6 +1103,11 @@ class GhidraRunner:
             reason=reason,
             timeout_budget=budget,
             log_offset=log_offset,
+            export_status=export_status,
+            export_file=exp[0] if usable and exp is not None else None,
+            export_report_file=exp[1] if usable and exp is not None else None,
+            export_report=export_report if usable else None,
+            export_budget=export_budget,
         )
 
     def run_all(
@@ -958,6 +1117,7 @@ class GhidraRunner:
         progress_callback: ProgressCallback | None = None,
         *,
         on_final: FinalCallback | None = None,
+        on_export: ExportCallback | None = None,
     ) -> list[GhidraResult]:
         """Two-phase Ghidra dispatch.
 
@@ -968,12 +1128,22 @@ class GhidraRunner:
         real fix (a per-call 'longer timeout' flag would not help: the retry would still compete in
         the pool). A phase-2 failure stays a failure with its ``reason`` (surfaced downstream).
 
-        ``on_final(record, result)`` is called on the calling thread as soon as a record's result is
-        FINAL — a phase-1 success, or whatever phase 2 settles for a phase-1 failure — so a caller
-        can store each binary the moment it is done instead of after the whole batch. On a normal
-        return it has been called exactly once per record, with the very object the returned list
-        holds at that record's index. When this raises (an interrupt, or ``on_final`` itself
-        failing), only the records that had already reached their final result were passed to it.
+        ``on_final(record, result)`` is called on the calling thread as soon as a record's
+        EXTRACTION is final — a phase-1 success, or whatever phase 2 settles for a phase-1 failure —
+        so a caller can store each binary the moment it is done instead of after the whole batch.
+        On a normal return it has been called exactly once per record. When this raises (an
+        interrupt, or a callback itself failing), only the records that had already reached their
+        final result were passed to it.
+
+        ★ The export is settled in two steps. A phase-1 success whose export FAILED (cut off at its
+        budget, or any other failure) is finalized for its extraction at once, and re-run once more
+        in phase 2 at the doubled budget, like a failure. ``on_export(record, result)`` then
+        reports that re-run, at most once per record: a result with ``export_only=False`` is a
+        whole new session (extraction AND usable export) to store in place of phase 1's; one with
+        ``export_only=True`` carries only the export outcome to record, phase 1's extraction
+        standing (the re-run's export failed again, or its extraction did — then its export is
+        dropped with it, and phase 1's export outcome and budget stand). The returned list holds
+        each record's latest result.
 
         Discovers analyzeHeadless once before spawning threads so GhidraNotFoundError is raised
         immediately rather than N times.
@@ -1053,8 +1223,16 @@ class GhidraRunner:
             terminate_all()
             pool.shutdown(wait=True, cancel_futures=True)
 
-        # Phase 2: serial isolated retry of the failures, at a doubled (ceiling-capped) budget.
-        failed = [i for i in range(n) if not by_idx[i].success]
+        # Phase 2: serial isolated retry of the failures, at a doubled (ceiling-capped) budget — and
+        # of the binaries whose extraction finished but whose export did not. Those get the larger
+        # budget too: one cut off at its export would be cut off again at the same budget on every
+        # later scan, never reaching the larger one.
+        export_retry = {
+            i
+            for i in range(n)
+            if by_idx[i].success and (by_idx[i].export_status or "").startswith("failed:")
+        }
+        failed = [i for i in range(n) if not by_idx[i].success or i in export_retry]
         if failed:
             logger.info(
                 "ghidra: retrying %d failed binary/ies serially (isolated CPU)", len(failed)
@@ -1076,13 +1254,22 @@ class GhidraRunner:
                         logger.error("Ghidra retry crashed for %s: %s", rec.name, exc)
                         # Phase 1's result stands as the final one. Reported outside the try
                         # above, so a failure of the callback is never taken for a crashed retry.
-                        if on_final is not None:
+                        # (An export re-run's binary was finalized in phase 1 already.)
+                        if on_final is not None and i not in export_retry:
                             on_final(rec, by_idx[i])
                         continue
                     r.retried = True
-                    by_idx[i] = r
-                    if on_final is not None:
-                        on_final(rec, r)
+                    if i in export_retry:
+                        if r.reason == _INTERRUPTED:
+                            continue  # phase 1's extraction and export outcome stand
+                        settled = self._settle_export(by_idx[i], r)
+                        by_idx[i] = settled
+                        if on_export is not None:
+                            on_export(rec, settled)
+                    else:
+                        by_idx[i] = r
+                        if on_final is not None:
+                            on_final(rec, r)
                     if progress_callback is not None:
                         progress_callback(
                             "ghidra_retry",
@@ -1106,3 +1293,25 @@ class GhidraRunner:
                 raise
 
         return [by_idx[i] for i in range(n)]
+
+    @staticmethod
+    def _settle_export(first: GhidraResult, rerun: GhidraResult) -> GhidraResult:
+        """What a phase-2 re-run of an export settles for a binary phase 1 extracted: the whole
+        re-run when it extracted AND exported; otherwise only an export outcome — the re-run's
+        failed export, or, when the re-run's extraction failed, phase 1's export outcome and budget
+        (the re-run's export is dropped with its extraction: an export is only kept with the
+        extraction of its own session)."""
+        if rerun.success and rerun.export_status in ("ok", "degraded"):
+            return rerun
+        if rerun.success:
+            return replace(
+                first,
+                export_status=rerun.export_status,
+                export_budget=rerun.export_budget,
+                export_file=None,
+                export_report_file=None,
+                export_report=None,
+                retried=True,
+                export_only=True,
+            )
+        return replace(first, retried=True, export_only=True)

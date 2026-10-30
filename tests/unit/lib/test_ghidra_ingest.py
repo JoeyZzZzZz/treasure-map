@@ -245,7 +245,7 @@ def test_ingest_parses_string_tables(tmp_path: Path) -> None:
                 ],
                 "completeness": {
                     "status": "incomplete",
-                    "reason": "got_relative_and_three_field_and_mips_not_detected",
+                    "reason": _COMP["reason"],
                     "scope": "absolute_2field_only",
                 },
             },
@@ -288,7 +288,7 @@ def _ingest_string_tables(tmp_path: Path, st: object):  # type: ignore[no-untype
 
 _COMP = {
     "status": "incomplete",
-    "reason": "got_relative_and_three_field_and_mips_not_detected",
+    "reason": "got_relative_and_three_field_not_detected_handler_must_be_defined_function",
     "scope": "absolute_2field_only",
     "cap_hit": False,
 }

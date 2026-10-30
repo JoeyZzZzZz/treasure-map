@@ -20,6 +20,7 @@ from typing import Any
 
 import pytest
 
+from tests.unit.lib.binexport_seed import archive_exports
 from treasure_map.lib.analyze import ghidra_runner
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.writer import begin_run, finish_run
@@ -328,6 +329,7 @@ def _analysis(w: _World, side: str, sha: str, funcs: dict[int, str]) -> Path:
         )
     conn.commit()
     conn.close()
+    archive_exports(path)
     return path
 
 
@@ -411,8 +413,10 @@ def _stub(monkeypatch: pytest.MonkeyPatch, w: _World) -> None:
     monkeypatch.setattr(driver, "_current_pass_version", lambda: _PV)
     monkeypatch.setattr(driver, "_installed_commit", lambda: _COMMIT)
 
-    def binexport(so_path: Path, cfg: Any, out: Path, side: str, timeout: int) -> Path:
-        (out / f"{side}.so").write_text(str(so_path))
+    def binexport(stored: Any, out: Path, side: str) -> Path:
+        sha = stored.meta["sha256"]  # the seeded meta names its binary (tests binexport_seed)
+        so_path = next(p for p, s in w.so_sha.items() if s == sha)
+        (out / f"{side}.so").write_text(so_path)
         p = out / f"{side}.BinExport"
         p.write_bytes(b"")
         rep = w.reports.get(side)
@@ -429,7 +433,7 @@ def _stub(monkeypatch: pytest.MonkeyPatch, w: _World) -> None:
         (out / "bindiff.log").write_bytes(log)
         return _bindiff(w, out / "x.BinDiff", w.so_sha[so_a], w.so_sha[so_b])
 
-    monkeypatch.setattr(driver, "_run_binexport", binexport)
+    monkeypatch.setattr(driver, "_obtain_export", binexport)
     monkeypatch.setattr(driver, "_run_bindiff", bindiff)
 
 

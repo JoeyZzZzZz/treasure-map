@@ -17,9 +17,11 @@ import zipfile
 # (package, resource) for every non-.py file the runtime loads from disk.
 ASSETS: tuple[tuple[str, str], ...] = (
     ("treasure_map.lib.analyze.ghidra", "ExportFunctions.java"),
+    ("treasure_map.lib.analyze.ghidra", "PromoteUndefined.java"),
     ("treasure_map.lib.analyze.ghidra", "extractor_names.tsv"),
     ("treasure_map.lib.diff.ghidra", "ExportBinExport.java"),
     ("treasure_map.lib.diff.ghidra", "FallbackBinExport2Builder.java"),
+    ("treasure_map.lib.diff.ghidra", "StackVarnodeMarkup.java"),
     ("treasure_map.lib.storage", "atlas_schema.sql"),
     ("treasure_map.lib.storage", "schema.sql"),
     ("treasure_map.lib.setup", "toolchain_lock.json"),

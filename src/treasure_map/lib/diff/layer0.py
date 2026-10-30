@@ -97,6 +97,8 @@ def parse_bindiff(
     threshold: float = ALIGN_THRESHOLD,
     gaps_a: dict[str, str] | None = None,
     gaps_b: dict[str, str] | None = None,
+    markup_a: frozenset[str] = frozenset(),
+    markup_b: frozenset[str] = frozenset(),
 ) -> AlignmentParse:
     """Parse a ``.BinDiff`` SQLite's ``function`` table into alignment-fact rows.
 
@@ -108,7 +110,11 @@ def parse_bindiff(
     ``gaps_a`` / ``gaps_b``: the functions each side's export could not represent faithfully
     (lib/diff/export_report, entry -> gap kind). A pair with either side among them is recorded with
     the gap and is ``alignment_undetermined`` whatever BinDiff's confidence: BinDiff matched what
-    the export held, and the export did not hold that function as it is."""
+    the export held, and the export did not hold that function as it is.
+
+    ``markup_a`` / ``markup_b``: the functions each side's export wrote an operand of in its
+    default form. Recorded on the pair as ``operand_markup_incomplete`` and nothing else: the
+    export held the function's instructions, blocks and calls as they are."""
     gaps_a = gaps_a or {}
     gaps_b = gaps_b or {}
     con = ro_connect(bindiff_path)
@@ -148,6 +154,8 @@ def parse_bindiff(
                 instructions=r["instructions"],
                 export_gap_a=gap_a,
                 export_gap_b=gap_b,
+                operand_markup_incomplete_a=1 if addr_a in markup_a else 0,
+                operand_markup_incomplete_b=1 if addr_b in markup_b else 0,
             )
         )
         a_addrs.add(addr_a)
@@ -386,6 +394,7 @@ def compute_side_presence(
     matched_addrs: frozenset[str],
     baseline: BaselineDomain,
     gaps: dict[str, str] | None = None,
+    markup: frozenset[str] = frozenset(),
 ) -> SidePresence:
     """Per-side presence: baseline functions with no matched pair become explicit, countable rows;
     matched addrs NOT in the baseline are out_of_inventory (counted, never a presence row, never an
@@ -413,6 +422,7 @@ def compute_side_presence(
                 presence_state=_presence_state(status, gap),
                 decompiled=_DECOMPILED_FLAG[status],
                 export_gap=gap,
+                operand_markup_incomplete=1 if addr in markup else 0,
             )
         )
     # inventory_mismatch is a cross-side-domain state, not derived per-side here (different builds
@@ -630,11 +640,13 @@ def run_layer0_parse(
 
     gaps_a = report_a.gaps() if report_a is not None else {}
     gaps_b = report_b.gaps() if report_b is not None else {}
-    parsed = parse_bindiff(bindiff_path, did, threshold, gaps_a, gaps_b)
+    markup_a = report_a.operand_markup_degraded if report_a is not None else frozenset()
+    markup_b = report_b.operand_markup_degraded if report_b is not None else frozenset()
+    parsed = parse_bindiff(bindiff_path, did, threshold, gaps_a, gaps_b, markup_a, markup_b)
     baseline_a = load_baseline(run_a.analysis_db_path, bin_a)
     baseline_b = load_baseline(run_b.analysis_db_path, bin_b)
-    pres_a = compute_side_presence(did, "a", parsed.matched_addrs_a, baseline_a, gaps_a)
-    pres_b = compute_side_presence(did, "b", parsed.matched_addrs_b, baseline_b, gaps_b)
+    pres_a = compute_side_presence(did, "a", parsed.matched_addrs_a, baseline_a, gaps_a, markup_a)
+    pres_b = compute_side_presence(did, "b", parsed.matched_addrs_b, baseline_b, gaps_b, markup_b)
 
     # sha256 of the diffed content on each side, recorded so the next full diff can skip an
     # unchanged binary (incremental) and reset the attempts counter when the content changed. Read

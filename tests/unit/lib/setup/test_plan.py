@@ -20,6 +20,7 @@ from treasure_map.lib.setup.initializer import PlatformUnsupportedError, run_ini
 from . import fakes
 
 _REAL_DETECT = tc.detect_toolchain
+_REAL_BINDIFF = tc.bindiff_version  # captured before the conftest blanks it
 
 
 @pytest.fixture()
@@ -140,6 +141,7 @@ def test_a_fresh_install_reads_as_a_readable_toolchain_in_the_same_process(
     MUTATION: skip re-applying the toolchain env after writing config -> no bindiff on PATH ->
     diff_toolchain_readable 'wrong' -> RED."""
     monkeypatch.setattr(tc, "detect_toolchain", _REAL_DETECT)
+    monkeypatch.setattr(tc, "bindiff_version", _REAL_BINDIFF)
     empty = tmp_path / "emptybin"
     empty.mkdir()
     monkeypatch.setenv("PATH", str(empty))  # no machine bindiff can answer for ours

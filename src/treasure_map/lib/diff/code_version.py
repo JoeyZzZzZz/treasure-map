@@ -3,20 +3,21 @@
 """Which code a stored diff, or a stored sink-overlay baseline, was computed by.
 
 Both are versioned by hashing the code itself, so a change to it makes what it wrote read as stale
-without anyone remembering to bump a number. Three hashes:
+without anyone remembering to bump a number. Two hashes:
 
   * ``diff_code_version()`` — the Python code whose output a diff writes (``DIFF_CODE_ENTRIES``).
   * ``sink_overlay_logic_version()`` — the Python code a stored baseline row is computed by
     (``OVERLAY_CODE_ENTRIES``).
-  * ``export_code_hash(builder)`` — the export script Ghidra ran for one side, by the path the
-    export took (``ExportBinExport.java`` alone, or with ``FallbackBinExport2Builder.java``).
+
+The export scripts each side's export was made by are hashed by the scan that made it and recorded
+with the archive (lib/export_stamp); a diff compares those (lib/diff/currency).
 
 An entry is a module of the ``treasure_map`` package (``lib.diff.layer0``) or one top-level name in
 it (``lib.atlas.writer:add_diff_meta``), for a large shared module of which only that function,
 class or constant feeds the rows. Python source is hashed after normalisation: parsed, docstrings
 dropped, and dumped without positions and without empty fields — so comments, docstrings and
 formatting do not count, and the value is the same under the Python versions tmap supports (a newer
-version adding an optional AST field leaves it empty here). The Java files are hashed byte for byte.
+version adding an optional AST field leaves it empty here).
 
 The entries are locked against their criterion by tests/unit/lib/test_code_version.py: every name
 a listed entry takes from another ``treasure_map`` module, outside type annotations, must be listed
@@ -38,9 +39,6 @@ from pathlib import Path
 
 # the treasure_map package directory, the root every entry is relative to
 _PACKAGE = Path(__file__).resolve().parents[2]
-_SCRIPT_DIR = Path(__file__).resolve().parent / "ghidra"
-_EXPORT_SCRIPT = "ExportBinExport.java"
-_FALLBACK_BUILDER = "FallbackBinExport2Builder.java"
 
 # The code a stored diff row is produced by: the diff modules, and what they take from shared
 # modules into what they write.
@@ -54,6 +52,7 @@ DIFF_CODE_ENTRIES: tuple[str, ...] = (
     "lib.diff.layer0",
     "lib.diff.layer2",
     "lib.binary_id",
+    "lib.binexport_archive",
     "lib.callsite_ref",
     "lib.hunt.refs",
     "lib.query.runs:get_run",
@@ -127,6 +126,11 @@ _EXCLUDED: dict[str, str] = {
         "written"
     ),
     "version:installed_commit": "the installed build, compared for the run currency refusal",
+    "lib.export_stamp": (
+        "the standalone export's script names and location (_run_binexport, kept for smoke tests); "
+        "the scripts each side's export was made by are recorded with its archive and compared "
+        "per side, never read from here"
+    ),
 }
 
 
@@ -210,31 +214,3 @@ def diff_code_version() -> str:
 def sink_overlay_logic_version() -> str:
     """The version stamped on every stored candidate baseline row (``overlay_version``)."""
     return f"src-{code_hash(_PACKAGE, OVERLAY_CODE_ENTRIES)}"
-
-
-def export_files(builder: str | None) -> tuple[str, ...]:
-    """The script files an export took, by its builder; an unknown builder (a failed attempt, a
-    diff recorded before the builder was) takes both, everything it could have used."""
-    if builder == "extension":
-        return (_EXPORT_SCRIPT,)
-    return (_EXPORT_SCRIPT, _FALLBACK_BUILDER)
-
-
-@cache
-def export_code_hash(builder: str | None) -> str:
-    """The hash of the export script files ``builder`` took (by name and bytes, never by path, so
-    an editable and an installed copy agree), for the scripts this package ships."""
-    return export_code_hash_in(builder, _SCRIPT_DIR)
-
-
-def export_code_hash_in(builder: str | None, script_dir: Path) -> str:
-    """``export_code_hash`` for the scripts in ``script_dir``."""
-    h = hashlib.sha256()
-    for name in export_files(builder):
-        h.update(name.encode() + b"\0")
-        try:
-            h.update((script_dir / name).read_bytes())
-        except OSError:
-            h.update(b"\0missing\0")
-        h.update(b"\0")
-    return h.hexdigest()[:16]

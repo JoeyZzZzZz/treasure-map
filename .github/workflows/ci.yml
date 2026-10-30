@@ -175,6 +175,22 @@ jobs:
           G="$RUNNER_TEMP/${{ steps.ghidra.outputs.root }}"
           echo "GHIDRA_HOME=$G" >> "$GITHUB_ENV"
           echo "$G/support" >> "$GITHUB_PATH"
+      # A scan exports each binary in the same Ghidra session as its extraction, and that export
+      # needs the BinExport extension: without it every scan here would take the
+      # extension_missing branch and the export path would go untested.
+      - name: BinExport extension (pinned in the toolchain lock), sha256-checked
+        run: |
+          set -e
+          eval "$(python - <<'PY'
+          from treasure_map.lib.setup.toolchain_lock import asset_for, load_lock
+          a = asset_for(load_lock(), "binexport", "linux-x86_64")
+          print(f"BE_URL={a.url}\nBE_SHA={a.sha256}\nBE_ROOT={a.root}")
+          PY
+          )"
+          curl -LsSf -o binexport.zip "$BE_URL"
+          echo "$BE_SHA  binexport.zip" | sha256sum -c -
+          unzip -q binexport.zip -d "$GHIDRA_HOME/Ghidra/Extensions"
+          test -f "$GHIDRA_HOME/Ghidra/Extensions/$BE_ROOT/lib/BinExport.jar"
       - name: Run integration tests
         run: python -m pytest tests/integration/ -v
 

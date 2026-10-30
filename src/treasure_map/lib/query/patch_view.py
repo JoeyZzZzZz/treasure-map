@@ -667,6 +667,9 @@ class _Pair:
     export_gap_a: str | None
     export_gap_b: str | None
     instructions: int | None = None  # BinDiff's matched-instruction count, as stored
+    # 1 when that side's export wrote an operand of the function in its default form
+    markup_a: int = 0
+    markup_b: int = 0
 
     @property
     def aligned(self) -> bool:
@@ -680,6 +683,7 @@ class _Unpaired:
     name: str | None
     presence_state: str  # from function_presence; ``absent`` with no record
     export_gap: str | None
+    markup: int = 0  # 1 when its export wrote an operand of it in its default form
 
 
 @dataclass(frozen=True)
@@ -690,6 +694,8 @@ class _Fn:
     callees: tuple[str, ...] | None  # None: the list could not be read
     truncated: bool | None  # None: not recorded by that analysis.db
     unresolved: frozenset[str] | None  # stub addresses the extractor could not name; None: unknown
+    # What its decompile came to (ok / timeout / error:<why> / skipped_micro); None: not recorded.
+    decompile: str | None = None
 
 
 @dataclass
@@ -721,7 +727,7 @@ def _json_list(raw: Any) -> list[Any] | None:
 
 
 def _parse_fn(raw: tuple[Any, ...]) -> _Fn:
-    name, callees_raw, truncated, unresolved_raw, has_truncated, has_unresolved = raw
+    name, callees_raw, truncated, unresolved_raw, has_truncated, has_unresolved, decompile = raw
     callees = _json_list(callees_raw)
     unresolved = _json_list(unresolved_raw) if has_unresolved else None
     norm_unresolved = (
@@ -734,7 +740,18 @@ def _parse_fn(raw: tuple[Any, ...]) -> _Fn:
         callees=tuple(str(c) for c in callees) if callees is not None else None,
         truncated=bool(truncated) if has_truncated and truncated is not None else None,
         unresolved=norm_unresolved,
+        decompile=decompile if isinstance(decompile, str) else None,
     )
+
+
+def _decompile_gap(fn: _Fn | None) -> str | None:
+    """'timeout' / 'error' when the function's decompile did not complete (its pseudocode — and
+    the candidates the hunt reads from it — are then missing, not empty), else None."""
+    if fn is None or fn.decompile is None:
+        return None
+    if fn.decompile == "timeout":
+        return "timeout"
+    return "error" if fn.decompile.startswith("error:") else None
 
 
 def _read_side(atlas: sqlite3.Connection, run_id: str, sha: str | None) -> _Side:
@@ -757,17 +774,18 @@ def _read_side(atlas: sqlite3.Connection, run_id: str, sha: str | None) -> _Side
         select = "SELECT address, name, callees"
         select += ", callees_truncated" if has_t else ", NULL"
         select += ", unresolved_external_calls" if has_u else ", NULL"
+        select += ", decompile_status" if "decompile_status" in cols else ", NULL"
         rows = conn.execute(select + " FROM functions WHERE binary_id = ?", (found[0],)).fetchall()
     except sqlite3.Error as e:
         return _Side(error=f"analysis.db could not be read: {e}")
     finally:
         conn.close()
     side = _Side()
-    for address, name, callees, truncated, unresolved in rows:
+    for address, name, callees, truncated, unresolved, decompile in rows:
         addr = norm_hex(address) if address else None
         if addr is None:
             continue
-        side.raw[addr] = (name, callees, truncated, unresolved, has_t, has_u)
+        side.raw[addr] = (name, callees, truncated, unresolved, has_t, has_u, decompile)
         if name:
             side.names[addr] = name
             side.by_name.setdefault(name, []).append(addr)
@@ -984,16 +1002,17 @@ def _load_diff(atlas: sqlite3.Connection, diff_id: str) -> _Diff | None:
         _Pair(*r)
         for r in atlas.execute(
             "SELECT addr_a, addr_b, name_a, name_b, alignment_confidence, similarity, "
-            "alignment_state, export_gap_a, export_gap_b, instructions FROM function_alignment "
-            "WHERE diff_id = ? ORDER BY addr_a, addr_b",
+            "alignment_state, export_gap_a, export_gap_b, instructions, "
+            "COALESCE(operand_markup_incomplete_a, 0), COALESCE(operand_markup_incomplete_b, 0) "
+            "FROM function_alignment WHERE diff_id = ? ORDER BY addr_a, addr_b",
             (diff_id,),
         )
     ]
     unpaired = {
-        (side, addr): _Unpaired(side, addr, name, state, gap)
-        for side, addr, name, state, gap in atlas.execute(
-            "SELECT side, addr, name, presence_state, export_gap FROM function_presence "
-            "WHERE diff_id = ?",
+        (side, addr): _Unpaired(side, addr, name, state, gap, markup)
+        for side, addr, name, state, gap, markup in atlas.execute(
+            "SELECT side, addr, name, presence_state, export_gap, "
+            "COALESCE(operand_markup_incomplete, 0) FROM function_presence WHERE diff_id = ?",
             (diff_id,),
         )
     }
@@ -1224,6 +1243,7 @@ class _Builder:
             self._place_no_candidate(e)
         if e.bucket in ("A", "B"):
             self._tag_source_gap(e)
+        self._tag_decompile_gap(e)
         if p is not None:
             # The caller-set edge is a field on any pair entry (A/B/C/R); on an aligned pair that
             # would otherwise place no entry it also PLACES the entry, in the one bucket this build
@@ -1307,7 +1327,9 @@ class _Builder:
         Only per-call keys (callsite / wrapper_callsite) are counted, by distinct evidence_ref; 0 is
         a count (no such candidate there), never "no such call". A side is unknown, in this order:
         ``side_unreadable`` (its analysis.db could not be read), ``function_not_in_scan_inventory``
-        (that scan does not hold the function), then per sink ``granularity_not_per_call`` (the
+        (that scan does not hold the function), ``decompile_timeout`` / ``decompile_error`` (its
+        decompile did not complete, so the candidates the hunt reads from the pseudocode are
+        missing, never 0), then per sink ``granularity_not_per_call`` (the
         side holds a function-level key of that sink), then ``sink_ambiguous`` (a candidate of the
         function whose sink name cannot be read: every sink of that side is unknown, and a side
         with no named sink at all says so with ``sink: null``). Direction-neutral."""
@@ -1316,7 +1338,22 @@ class _Builder:
             "b": self._refs_of("b").get(p.addr_b, {}),
         }
         if not refs["a"] and not refs["b"]:
-            return None
+            # No candidate either side — unless a side's decompile did not complete: its candidates
+            # are then missing, and "none either side" would read as a count.
+            gaps = [
+                {"sink": None, "side": side, "reason": f"decompile_{gap}"}
+                for side, addr in (("a", p.addr_a), ("b", p.addr_b))
+                if self.sides[side].error is None
+                and (gap := _decompile_gap(self.sides[side].fn(addr))) is not None
+            ]
+            if not gaps:
+                return None
+            return {
+                "unit": SINK_COUNTS_UNIT,
+                "pairing": "aligned" if p.aligned else "proposed",
+                "delta": [],
+                "unknown": gaps,
+            }
         sides: dict[str, tuple[str | None, dict[str, int], set[str], bool, set[str]]] = {}
         names: set[str] = set()
         for side, addr in (("a", p.addr_a), ("b", p.addr_b)):
@@ -1341,6 +1378,8 @@ class _Builder:
                 why = "side_unreadable"
             elif self.sides[side].fn(addr) is None:
                 why = "function_not_in_scan_inventory"
+            elif (gap := _decompile_gap(self.sides[side].fn(addr))) is not None:
+                why = f"decompile_{gap}"
             sides[side] = (why, counts, coarse, ambiguous, named)
             names |= named
         delta: list[dict[str, Any]] = []
@@ -1374,6 +1413,22 @@ class _Builder:
             "delta": delta,
             "unknown": unknown,
         }
+
+    def _tag_decompile_gap(self, e: _Entry) -> None:
+        """Name, on the entry, a side whose function's decompile did not complete:
+        ``decompile_timeout:<side>`` / ``decompile_error:<side>`` (also a blind spot of it)."""
+        ends: list[tuple[str, str]]
+        if e.pair is not None:
+            ends = [("a", e.pair.addr_a), ("b", e.pair.addr_b)]
+        elif e.unpaired is not None:
+            ends = [(e.unpaired.side, e.unpaired.addr)]
+        else:
+            return
+        for side, addr in ends:
+            if self.sides[side].error is None:
+                gap = _decompile_gap(self.sides[side].fn(addr))
+                if gap is not None:
+                    e.facts.append(f"decompile_{gap}:{side}")
 
     def _tag_source_gap(self, e: _Entry) -> None:
         if e.pair is None or self.callee_block is not None:
@@ -1775,7 +1830,7 @@ class _Builder:
             spots.append(e.subclass)
         if e.subclass.startswith("recall_gap_sink:"):
             spots.append(e.subclass)
-        spots += [f for f in e.facts if f.startswith("source_gap:")]
+        spots += [f for f in e.facts if f.startswith(("source_gap:", "decompile_"))]
         if e.callers_b is not None and e.callers_b["state"] == "undetermined":
             # The B side's caller set could not be proven empty — a countable blind spot on THIS
             # entry (the structural ones a caller is missed through are in _STRUCTURAL_BLIND_SPOTS).
@@ -2361,6 +2416,11 @@ def _entry_json(e: _Entry) -> dict[str, Any]:
                 "export_gap_b": p.export_gap_b,
             }
         )
+        markup = [s for s, v in (("a", p.markup_a), ("b", p.markup_b)) if v]
+        if markup:
+            # Said only when true: an operand of the function written in its default form by
+            # those sides' exports. An additional fact — the entry's state does not rest on it.
+            out["operand_markup_incomplete"] = markup
     else:
         assert e.unpaired is not None
         u = e.unpaired
@@ -2373,6 +2433,8 @@ def _entry_json(e: _Entry) -> dict[str, Any]:
                 "export_gap": u.export_gap,
             }
         )
+        if u.markup:
+            out["operand_markup_incomplete"] = [u.side]
     coclaimed = sorted(
         {f"a:{f}" for v in e.row_views for f in v["coclaimed_by"] or ()}
         | {f"b:{f}" for v in e.row_views for f in v["coclaimed_by_b"] or ()}

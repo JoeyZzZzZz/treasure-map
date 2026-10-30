@@ -915,6 +915,18 @@ REPLACED = {
             "the tail of the sentence above (split at 'e.g.'), replaced with it"
         ),
     },
+    "list_diffs": {
+        "true, with ``source_stale_reason``: ``source_binary_absent`` / ``source_content_changed`` "
+        "(a side's binary is gone or its bytes changed), ``diff_logic_changed`` (computed by "
+        "different diff code, or another export script), ``toolchain_changed`` (computed by "
+        "another Ghidra / BinExport / BinDiff version than is installed), ``extraction_changed`` / "
+        "``ghidra_changed`` (the binary was re-extracted), ``hunt_inputs_changed`` (the hunt "
+        "output the diff read changed) — re-run the diff.": (
+            "a diff now reads the exports the two scans archived and runs only BinDiff: the export "
+            "scripts and the Ghidra / BinExport it is compared on are the archives', not the "
+            "installed ones"
+        ),
+    },
     "get_strings": {
         "When ``function`` resolves, ITS binary is used and ``binary`` does not re-select.": (
             "true in value mode only; listing a binary's strings needs binary, which function "

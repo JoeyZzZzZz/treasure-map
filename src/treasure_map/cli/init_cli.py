@@ -33,6 +33,7 @@ def runs_currency(cfg: Config | None) -> RunsCurrency:
     from treasure_map.cli.hunt_cli import (
         _kept_earlier_lines,
         _live_instance_counts,
+        _scan_tools,
         _staleness_tiers,
     )
     from treasure_map.lib import rescan_version
@@ -67,6 +68,7 @@ def runs_currency(cfg: Config | None) -> RunsCurrency:
         current_build=build,
         current=rescan_version.current_code_stamp(cfg or _Config()),
         live=live,
+        tools=_scan_tools(cfg or _Config()),
     )
     return RunsCurrency(
         sum(len(v) for v in tiers.values()),

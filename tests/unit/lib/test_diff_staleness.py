@@ -327,8 +327,9 @@ def test_a_failed_per_binary_diff_stays_a_visible_blind_spot(tmp_path: Path) -> 
 
 def test_the_generation_of_each_run_is_read_once(tmp_path: Path) -> None:
     # A listing spans many diffs over few runs; resolving each run's analysis.db per row would
-    # reopen the same database for every binary. Each run's database is read by two lookups (the
-    # content generation, and the binaries' extraction stamps), each once per run.
+    # reopen the same database for every binary. Each run's database is read by three lookups (the
+    # content generation, the binaries' extraction stamps, their archived exports), each once per
+    # run.
     atlas_path = tmp_path / "atlas.db"
     shas = [f"{i}{'d' * 63}" for i in range(5)]
     analysis = _analysis(tmp_path / "analysis.db", [(f"lib{i}.so", shas[i]) for i in range(5)])
@@ -378,7 +379,7 @@ def test_the_generation_of_each_run_is_read_once(tmp_path: Path) -> None:
             sqlite3.connect = real_connect  # type: ignore[assignment]
         assert served["count"] == 5
         assert all(d["source_stale"] is False for d in served["diffs"])
-        # two runs x two lookups — not one per row (that would be 5 x 2 x 2)
-        assert len(opened) == 4, opened
+        # two runs x three lookups — not one per row (that would be 5 x 2 x 3)
+        assert len(opened) == 6, opened
     finally:
         conn.close()

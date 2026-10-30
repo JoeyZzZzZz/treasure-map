@@ -187,8 +187,9 @@ def test_the_exported_callees_are_not_rewritten_by_the_stub_table() -> None:
     """The callees list each function exports is built from resolveCallee, untouched by the table:
     the ingest relabels it on its own, and a non-stub binary's export stays byte-for-byte."""
     src = _source()
-    run = src[src.index("public void run()") :]
-    callee_block = run[run.index("PIC intra-.so calls go through PLT stubs") :]
+    # each function's record is built by exportFunction (called from run()'s main loop)
+    body = src[src.index("private String exportFunction(") :]
+    callee_block = body[body.index("PIC intra-.so calls go through PLT stubs") :]
     callee_block = callee_block[: callee_block.index("resolveCallee(") + 200]
     assert "stubLookup" not in callee_block
 

@@ -2392,7 +2392,10 @@ def make_tools(
         ``unit`` says it: callsite / wrapper_callsite keys, NOT every call of the name, so 0 means
         "no such candidate there", never "no such call". ``delta`` lists the sinks both sides count
         and count differently; ``unknown`` the side / sink pairs that cannot be counted, with why
-        (``side_unreadable``, ``function_not_in_scan_inventory``, ``granularity_not_per_call`` —
+        (``side_unreadable``, ``function_not_in_scan_inventory``, ``decompile_timeout`` /
+        ``decompile_error`` — that function's decompile did not complete, so its candidates are
+        missing, not 0, and the entry's facts and blind_spots say ``decompile_<why>:<side>`` —,
+        ``granularity_not_per_call`` —
         that sink has a function-level key there —, ``sink_ambiguous`` — a candidate whose sink
         name is unreadable, ``sink: null`` when no sink of that side is named). An ``unknown`` is
         not "no change". Counted over every candidate the function holds, whichever entry its row
@@ -3152,9 +3155,11 @@ def make_tools(
         ★ Each row's ``source_stale`` says whether the diff still describes what it was computed
         from. true, with ``source_stale_reason``: ``source_binary_absent`` /
         ``source_content_changed`` (a side's binary is gone or its bytes changed),
-        ``diff_logic_changed`` (computed by different diff code, or another export script),
-        ``toolchain_changed`` (computed by another Ghidra / BinExport / BinDiff version than is
-        installed), ``extraction_changed`` / ``ghidra_changed`` (the binary was re-extracted),
+        ``diff_logic_changed`` (computed by different diff code, or a side's archived export was
+        re-made by other export scripts or is gone), ``toolchain_changed`` (a side's export was
+        re-made by another Ghidra / BinExport, or another BinDiff is installed — a diff runs only
+        BinDiff, on the exports the two scans archived), ``extraction_changed`` /
+        ``ghidra_changed`` (the binary was re-extracted),
         ``hunt_inputs_changed`` (the hunt output the diff read changed) — re-run the diff. null:
         ``generation_unstamped`` (written before the stamps were recorded) / ``source_unavailable``
         (the source could not be read) — NOT a clean bill. false: checked and current. The first
@@ -3192,7 +3197,13 @@ def make_tools(
         force_retry; a HINT from repeated identical-content failures, never proof the binary is
         undiffable — its content changing resets the count). Read this alongside get_diff_deltas so
         a consumer of the change map always sees the coverage gaps too. ``extraction_unstamped`` =
-        the binary has no recorded extraction (re-scan the run). ``baseline_dropped=1`` = the
+        the binary has no recorded extraction (re-scan the run). ``binexport_missing:<status>`` =
+        a side has no usable archived export (the scan recorded <status>: not_recorded,
+        extension_missing, failed:<why>, scan_failed:<why>, archive_missing) — a diff never
+        re-analyses a binary to make one, so re-scan the run (installing BinExport first when it
+        was missing); ``export_skew`` = the two sides' exports were made by different export
+        scripts or BinExport builds (re-scan both, or diff with --force: undetermined). Neither
+        counts toward the retry cap. ``baseline_dropped=1`` = the
         diff had a stored candidate baseline, dropped by this failure or an earlier re-diff and not
         stored again. Each row also
         carries ``source_stale`` / ``source_stale_reason`` (as in list_diffs).

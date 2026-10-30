@@ -156,8 +156,10 @@ def test_build_cmd_structure(tmp_path: Path) -> None:
     assert cmd[cmd.index("-processor") + 1] == arch
     assert "-import" in cmd
     assert cmd[cmd.index("-import") + 1] == str(binary)
-    assert "-postScript" in cmd
-    assert cmd[cmd.index("-postScript") + 1] == "ExportFunctions.java"
+    # The functions the analysis left out are created first, then the extraction runs. With no
+    # export asked for, nothing else runs and only the extraction scripts' directory is searched.
+    posts = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-postScript"]
+    assert posts == ["PromoteUndefined.java", "ExportFunctions.java"]
     assert "-scriptPath" in cmd
     assert cmd[cmd.index("-scriptPath") + 1] == str(script_dir)
     assert "-deleteProject" in cmd
@@ -232,7 +234,9 @@ def _no_functions_sub(output_dir: Path, sha8: str, log_lines: str = ""):  # type
     """A stand-in Ghidra run that exports a marker-correct, functionless JSON and appends
     ``log_lines`` to the run's log (``-log`` appends)."""
 
-    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+    def fake_sub(
+        cmd: list[str], env: dict[str, str], timeout: int, cwd: Path | None = None
+    ) -> tuple[int, str]:
         out = output_dir / f"httpd_{sha8}_ghidra.json"
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(_marked_json([], pass_version=env["PASS_VERSION"], sha8=env["SHA8"]))
@@ -276,7 +280,9 @@ def test_a_no_functions_run_is_a_success_and_a_timeout_in_its_own_log_is_not(
 
 
 def _ok_sub(output_dir: Path, sha8: str, log_lines: str):  # type: ignore[no-untyped-def]
-    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+    def fake_sub(
+        cmd: list[str], env: dict[str, str], timeout: int, cwd: Path | None = None
+    ) -> tuple[int, str]:
         out = output_dir / f"httpd_{sha8}_ghidra.json"
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(_good_json(env))
@@ -327,7 +333,9 @@ def test_a_rolled_over_log_is_read_whole(tmp_path: Path) -> None:
     log = output_dir / f"httpd_{sha8}.log"
     log.write_text("x" * 4096)  # an earlier run's large log
 
-    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+    def fake_sub(
+        cmd: list[str], env: dict[str, str], timeout: int, cwd: Path | None = None
+    ) -> tuple[int, str]:
         (output_dir / f"httpd_{sha8}_ghidra.json").write_text(_good_json(env))
         log.write_text("INFO  REPORT: Analysis timed out at 60 seconds\n")  # the fresh file
         return 0, ""
@@ -360,7 +368,9 @@ def test_an_earlier_runs_import_failure_does_not_send_a_timeout_down_the_patch_p
         patched.append(src)
         return None
 
-    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+    def fake_sub(
+        cmd: list[str], env: dict[str, str], timeout: int, cwd: Path | None = None
+    ) -> tuple[int, str]:
         return -1, "timeout"
 
     with (
@@ -393,7 +403,9 @@ def test_run_ghidra_success(tmp_path: Path) -> None:
     _write_small_elf(binary)
     sha8 = "aabb1122"
 
-    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+    def fake_sub(
+        cmd: list[str], env: dict[str, str], timeout: int, cwd: Path | None = None
+    ) -> tuple[int, str]:
         out = output_dir / f"httpd_{sha8}_ghidra.json"
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(_good_json(env))
@@ -417,7 +429,9 @@ def test_run_ghidra_failure_no_output(tmp_path: Path) -> None:
     binary = tmp_path / "httpd"
     _write_small_elf(binary)
 
-    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+    def fake_sub(
+        cmd: list[str], env: dict[str, str], timeout: int, cwd: Path | None = None
+    ) -> tuple[int, str]:
         return 1, "ERROR"
 
     runner = _make_runner(tmp_path)
@@ -437,7 +451,9 @@ def test_run_ghidra_timeout(tmp_path: Path) -> None:
     binary = tmp_path / "httpd"
     _write_small_elf(binary)
 
-    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+    def fake_sub(
+        cmd: list[str], env: dict[str, str], timeout: int, cwd: Path | None = None
+    ) -> tuple[int, str]:
         return -1, "timeout"
 
     runner = _make_runner(tmp_path)
@@ -458,7 +474,9 @@ def test_run_ghidra_retries_on_import_failed(tmp_path: Path) -> None:
     sha8 = "cafebabe"
     call_count = 0
 
-    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+    def fake_sub(
+        cmd: list[str], env: dict[str, str], timeout: int, cwd: Path | None = None
+    ) -> tuple[int, str]:
         nonlocal call_count
         call_count += 1
         if call_count == 1:
@@ -502,7 +520,9 @@ def test_run_ghidra_retries_once_on_non_import_failure(tmp_path: Path) -> None:
     sha8 = "deadc0de"
     timeouts: list[int] = []
 
-    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+    def fake_sub(
+        cmd: list[str], env: dict[str, str], timeout: int, cwd: Path | None = None
+    ) -> tuple[int, str]:
         timeouts.append(timeout)
         return -1, "timeout"
 
@@ -527,7 +547,9 @@ def test_run_ghidra_timeout_retry_then_success(tmp_path: Path) -> None:
     sha8 = "0badf00d"
     call_count = 0
 
-    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+    def fake_sub(
+        cmd: list[str], env: dict[str, str], timeout: int, cwd: Path | None = None
+    ) -> tuple[int, str]:
         nonlocal call_count
         call_count += 1
         if call_count == 1:
@@ -566,7 +588,9 @@ def test_run_all_calls_progress_callback(tmp_path: Path) -> None:
     for r in records:
         _write_small_elf(r.path)
 
-    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+    def fake_sub(
+        cmd: list[str], env: dict[str, str], timeout: int, cwd: Path | None = None
+    ) -> tuple[int, str]:
         return 1, ""
 
     progress: list[tuple[str, dict[str, Any]]] = []
@@ -598,7 +622,9 @@ def test_run_all_returns_one_result_per_record(tmp_path: Path) -> None:
     for r in records:
         _write_small_elf(r.path)
 
-    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+    def fake_sub(
+        cmd: list[str], env: dict[str, str], timeout: int, cwd: Path | None = None
+    ) -> tuple[int, str]:
         return 0, ""
 
     runner = _make_runner(tmp_path)
@@ -811,7 +837,9 @@ def test_run_ghidra_reason_timeout(tmp_path: Path) -> None:
     binary = tmp_path / "b"
     _write_small_elf(binary)
 
-    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+    def fake_sub(
+        cmd: list[str], env: dict[str, str], timeout: int, cwd: Path | None = None
+    ) -> tuple[int, str]:
         return -1, "timeout"
 
     runner = _make_runner(tmp_path)
@@ -829,7 +857,9 @@ def test_run_ghidra_reason_no_output(tmp_path: Path) -> None:
     binary = tmp_path / "b"
     _write_small_elf(binary)
 
-    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+    def fake_sub(
+        cmd: list[str], env: dict[str, str], timeout: int, cwd: Path | None = None
+    ) -> tuple[int, str]:
         return 1, "err"
 
     runner = _make_runner(tmp_path)
@@ -849,7 +879,9 @@ def test_run_ghidra_retry_false_skips_the_timeout_retry(tmp_path: Path) -> None:
     _write_small_elf(binary)
     calls = {"n": 0}
 
-    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+    def fake_sub(
+        cmd: list[str], env: dict[str, str], timeout: int, cwd: Path | None = None
+    ) -> tuple[int, str]:
         calls["n"] += 1
         return -1, "timeout"
 
@@ -886,7 +918,9 @@ def test_run_all_two_phase_serial_retry_recovers(tmp_path: Path) -> None:
     rec = _big_rec(tmp_path)
     calls = {"n": 0}
 
-    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+    def fake_sub(
+        cmd: list[str], env: dict[str, str], timeout: int, cwd: Path | None = None
+    ) -> tuple[int, str]:
         calls["n"] += 1
         if calls["n"] == 1:
             return -1, "timeout"  # phase 1: fail
@@ -911,7 +945,9 @@ def test_run_all_phase2_failure_stays_failed_with_reason(tmp_path: Path) -> None
     rec = _big_rec(tmp_path)
     calls = {"n": 0}
 
-    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+    def fake_sub(
+        cmd: list[str], env: dict[str, str], timeout: int, cwd: Path | None = None
+    ) -> tuple[int, str]:
         calls["n"] += 1
         return -1, "timeout"
 
@@ -944,7 +980,9 @@ def test_retry_budget_is_the_isolated_retrys_and_it_is_what_run_all_spends(
     base = GhidraConfig().headless_timeout_seconds
     seen: list[int] = []
 
-    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+    def fake_sub(
+        cmd: list[str], env: dict[str, str], timeout: int, cwd: Path | None = None
+    ) -> tuple[int, str]:
         seen.append(timeout)
         return -1, "timeout"
 
@@ -972,7 +1010,9 @@ def test_a_failure_records_the_budget_its_last_attempt_ran_under(tmp_path: Path)
     binary = tmp_path / "b"
     _write_small_elf(binary)
 
-    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+    def fake_sub(
+        cmd: list[str], env: dict[str, str], timeout: int, cwd: Path | None = None
+    ) -> tuple[int, str]:
         return -1, "timeout"
 
     runner = _make_runner(tmp_path)
@@ -1023,21 +1063,56 @@ def _run_once_with(tmp_path: Path, fake_sub, sha8: str = "deadbeef"):  # type: i
     return result, output_dir / f"httpd_{sha8}_ghidra.json"
 
 
-def test_a_timeout_is_a_failure_even_when_a_valid_output_is_on_disk(tmp_path: Path) -> None:
-    """Killed at the budget = failed, whatever file is present. Here the file even carries THIS
-    run's correct markers (the strongest case: a JSON that looks perfect), and still does not count.
+def test_a_kill_after_the_analysis_timed_out_is_a_failure_whatever_is_on_disk(
+    tmp_path: Path,
+) -> None:
+    """Killed at the wall clock in a session whose analysis timed out = a failed scan, whatever
+    file is present — here the JSON even carries THIS run's correct markers — and its export is
+    never kept (scan_failed:timeout).
 
-    MUTATION (must go RED): drop the ``rc == -1`` branch in ``_run_once``."""
+    MUTATION (verified RED): judge a killed run by its JSON before the analysis timeout ->
+    success -> RED."""
 
-    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+    def fake_sub(
+        cmd: list[str], env: dict[str, str], timeout: int, cwd: Path | None = None
+    ) -> tuple[int, str]:
+        out = Path(env["OUTPUT_DIR"]) / f"httpd_{env['SHA8']}_ghidra.json"
+        out.write_text(_good_json(env))
+        log = Path(env["OUTPUT_DIR"]) / f"httpd_{env['SHA8']}.log"
+        log.write_text("INFO  REPORT: Analysis timed out at 60 seconds\n")
+        return -1, "timeout"
+
+    result, _ = _run_once_with(tmp_path, fake_sub)
+    assert (result.success, result.reason, result.output_file) == (False, "timeout", None)
+    assert result.export_status == "scan_failed:timeout"
+
+
+def test_a_kill_after_the_extraction_finished_keeps_the_extraction(tmp_path: Path) -> None:
+    """★ Killed at the wall clock after the extraction wrote this run's JSON (no analysis
+    timeout): the scan of the binary succeeded — only the export, which runs after it, was cut off
+    (failed:timeout when an export was asked for; extension_missing when none could be). With no
+    JSON written the kill is a timeout failure, as before.
+
+    MUTATION (verified RED): fail every killed run -> RED."""
+
+    def killed_after_json(
+        cmd: list[str], env: dict[str, str], timeout: int, cwd: Path | None = None
+    ) -> tuple[int, str]:
         out = Path(env["OUTPUT_DIR"]) / f"httpd_{env['SHA8']}_ghidra.json"
         out.write_text(_good_json(env))
         return -1, "timeout"
 
-    result, _ = _run_once_with(tmp_path, fake_sub)
-    assert result.success is False
-    assert result.reason == "timeout"
-    assert result.output_file is None
+    def killed_before_json(
+        cmd: list[str], env: dict[str, str], timeout: int, cwd: Path | None = None
+    ) -> tuple[int, str]:
+        return -1, "timeout"
+
+    result, json_path = _run_once_with(tmp_path / "a", killed_after_json)
+    assert (result.success, result.output_file) == (True, json_path)
+    assert result.export_status == "extension_missing"  # the runner has no extension here
+    result, _ = _run_once_with(tmp_path / "b", killed_before_json)
+    assert (result.success, result.reason) == (False, "timeout")
+    assert result.export_status == "scan_failed:timeout"
 
 
 def test_an_output_left_by_an_earlier_run_is_cleared_before_the_run(tmp_path: Path) -> None:
@@ -1051,7 +1126,9 @@ def test_an_output_left_by_an_earlier_run_is_cleared_before_the_run(tmp_path: Pa
     preset.parent.mkdir(parents=True)
     preset.write_text(_foreign_json("feedfacefeedface", sha8))  # an older pass, functions > 0
 
-    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+    def fake_sub(
+        cmd: list[str], env: dict[str, str], timeout: int, cwd: Path | None = None
+    ) -> tuple[int, str]:
         return 0, ""  # exits cleanly, writes nothing
 
     result, out = _run_once_with(tmp_path, fake_sub, sha8)
@@ -1072,6 +1149,7 @@ def test_an_output_with_foreign_markers_is_stale_not_success(tmp_path: Path) -> 
             cmd: list[str],
             env: dict[str, str],
             timeout: int,
+            cwd: Path | None = None,
             wp: bool = wrong_pass,
             ws: bool = wrong_sha8,
         ) -> tuple[int, str]:
@@ -1120,7 +1198,9 @@ def _run_with(
     output_dir = tmp_path / "out"
     seen: dict[str, str] = {}
 
-    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+    def fake_sub(
+        cmd: list[str], env: dict[str, str], timeout: int, cwd: Path | None = None
+    ) -> tuple[int, str]:
         seen.update(env)
         data = json.loads(_good_json(env))
         data["stub_marker"] = echo(env)
@@ -1212,7 +1292,9 @@ def test_run_all_refuses_a_malformed_registry_before_any_jvm(tmp_path: Path) -> 
     _write_small_elf(rec.path)
     calls: list[list[str]] = []
 
-    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+    def fake_sub(
+        cmd: list[str], env: dict[str, str], timeout: int, cwd: Path | None = None
+    ) -> tuple[int, str]:
         calls.append(cmd)
         return 1, ""
 
@@ -1236,7 +1318,9 @@ def test_a_launch_failure_is_not_a_timeout(tmp_path: Path) -> None:
     binary = tmp_path / "httpd"
     _write_small_elf(binary)
 
-    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+    def fake_sub(
+        cmd: list[str], env: dict[str, str], timeout: int, cwd: Path | None = None
+    ) -> tuple[int, str]:
         return LAUNCH_FAILED_RC, "[Errno 13] Permission denied: 'analyzeHeadless'"
 
     with patch(f"{MODULE}._run_subprocess", fake_sub):
@@ -1268,7 +1352,9 @@ def test_ghidras_own_analysis_timeout_is_a_timeout_not_ok(
     _write_small_elf(binary)
     sha8 = "aabb1122"
 
-    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+    def fake_sub(
+        cmd: list[str], env: dict[str, str], timeout: int, cwd: Path | None = None
+    ) -> tuple[int, str]:
         out = output_dir / f"httpd_{sha8}_ghidra.json"
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(_good_json(env))
@@ -1316,7 +1402,9 @@ def test_every_record_reaches_on_final_once_with_its_returned_result(tmp_path: P
     recs = _named_records(tmp_path, names)
     attempts: dict[str, int] = {}
 
-    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+    def fake_sub(
+        cmd: list[str], env: dict[str, str], timeout: int, cwd: Path | None = None
+    ) -> tuple[int, str]:
         name = Path(cmd[-1]).name
         attempts[name] = attempts.get(name, 0) + 1
         if name == "never_ok" and attempts[name] == 2:
@@ -1365,7 +1453,9 @@ def test_an_interrupt_in_phase_one_hands_over_only_what_finished(
     recs = _named_records(tmp_path, ["ok_1", "ok_2", "ok_3", "slow"])
     pids: list[int] = []
 
-    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+    def fake_sub(
+        cmd: list[str], env: dict[str, str], timeout: int, cwd: Path | None = None
+    ) -> tuple[int, str]:
         name = Path(cmd[-1]).name
         if name == "slow":
             return real_sub(["sleep", "30"], dict(env), 60)
@@ -1425,7 +1515,9 @@ def test_a_failing_on_final_tears_the_pool_down(tmp_path: Path) -> None:
 
     recs = _named_records(tmp_path, ["ok_1", "ok_2", "ok_3"])
 
-    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+    def fake_sub(
+        cmd: list[str], env: dict[str, str], timeout: int, cwd: Path | None = None
+    ) -> tuple[int, str]:
         name = Path(cmd[-1]).name
         (Path(env["OUTPUT_DIR"]) / f"{name}_{env['SHA8']}_ghidra.json").write_text(_good_json(env))
         return 0, ""

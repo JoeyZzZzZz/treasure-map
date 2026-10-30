@@ -1197,7 +1197,8 @@ def _attempts_db(
     for i in range(ok):
         conn.execute(
             "INSERT INTO binaries (name, sha256, ghidra_ok, ghidra_status, pass_version, "
-            "last_seen_at) VALUES (?, ?, 1, 'ok', ?, '2026-10-01')",
+            "binexport_status, last_seen_at) "
+            "VALUES (?, ?, 1, 'ok', ?, 'extension_missing', '2026-10-01')",
             (f"svc_{i}", f"{i:064x}", cur),
         )
         conn.execute(

@@ -60,6 +60,14 @@ def _no_external_toolchain(monkeypatch: pytest.MonkeyPatch) -> None:
     one."""
     monkeypatch.setattr(_toolchain, "_current", [None])
     monkeypatch.setattr(_toolchain, "detect_toolchain", lambda config: None)
+    # A diff's own tool (BinDiff) and the scan's Ghidra, each read on its own.
+    monkeypatch.setattr(_toolchain, "bindiff_version", lambda: None)
+    monkeypatch.setattr(_toolchain, "_current_bindiff", [None])
+    monkeypatch.setattr(_toolchain, "_current_ghidra", [None])
+    # What a scan here would be made by (Ghidra version, export hash): not this machine's.
+    from treasure_map.cli import hunt_cli
+
+    monkeypatch.setattr(hunt_cli, "_scan_tools", lambda cfg: hunt_cli._ScanTools(None, None))
 
 
 @pytest.fixture(autouse=True)

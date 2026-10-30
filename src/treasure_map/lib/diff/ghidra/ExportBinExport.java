@@ -5,6 +5,17 @@
 // FIRST -postScript argument, and a JSON report of what the export could not represent to the
 // SECOND. Export half of the version-diff pipeline.
 //
+// ★ TWO MODES, by the optional THIRD argument:
+//   - "scan": the export a scan writes in the same session as its extraction, after PromoteUndefined
+//     and ExportFunctions. FallbackBinExport2Builder is the only builder, with its own promotion
+//     pass OFF: the session has already created the functions, and the export must hold exactly the
+//     functions the extraction wrote. builder = "fallback".
+//   - anything else (absent): a standalone export of a freshly analysed program. The extension's
+//     own builder first (it promotes undefined functions itself); FallbackBinExport2Builder, with
+//     promotion on, only when that builder fails on a missing block index.
+// Both files are written under a .tmp name and then moved into place, the report first: a run
+// killed part way leaves no export file behind that reads as complete.
+//
 // ★ WHY THIS SCRIPT EXISTS (do not replace with the extension's own BinExport.java): that one is
 // INTERACTIVE (askFile/askChoices), resolves answers from a sibling .properties the extension does
 // not ship, and never calls getScriptArgs() -- so a path after -postScript is IGNORED. Under
@@ -20,9 +31,10 @@
 // ★ TWO REPAIRS, each limited to what BinDiff cannot load:
 //   1. The extension's builder fails on a basic block that a function body yields but the
 //      program-wide block iteration did not (it indexes blocks before it promotes undefined
-//      functions, and looks the block up without a null check). On exactly that failure the export
-//      is rebuilt with FallbackBinExport2Builder (a modified copy of the extension's builder), and
-//      the functions holding a degenerate block are listed in the report.
+//      functions, and looks the block up without a null check). FallbackBinExport2Builder (a
+//      modified copy of the extension's builder) does not; the functions holding a degenerate block
+//      are listed in the report, and so are the instructions whose operand markup it had to write
+//      in its default form (operand_markup_degraded).
 //   2. Every export is then checked for two kinds of flow graph BinDiff rejects, and repaired:
 //      (a) a flow graph whose entry instruction carries no explicit address (BinDiff reads the
 //          flow graph's address from that field, so it reads 0): the address the reader would
@@ -180,6 +192,16 @@ public class ExportBinExport extends GhidraScript {
     return sb.append(']').toString();
   }
 
+  /**
+   * Moves {@code from} onto {@code to}: a rename within one directory, which replaces the target
+   * in one step on POSIX. A failed rename throws (the export then reads as failed).
+   */
+  private static void moveIntoPlace(File from, File to) {
+    if (!from.renameTo(to)) {
+      throw new IllegalStateException("ExportBinExport: cannot move " + from + " to " + to);
+    }
+  }
+
   @Override
   protected void run() throws Exception {
     String[] args = getScriptArgs();
@@ -194,44 +216,72 @@ public class ExportBinExport extends GhidraScript {
     }
     File out = new File(args[0]);
     File report = new File(args[1]);
-    println("ExportBinExport: exporting " + program.getName() + " -> " + out.getAbsolutePath());
-    BinExport2 proto;
+    boolean scanMode = args.length > 2 && "scan".equals(args[2]);
+    println("ExportBinExport: exporting " + program.getName() + " -> " + out.getAbsolutePath()
+        + (scanMode ? " (scan mode)" : ""));
+    int functionsBefore = program.getFunctionManager().getFunctionCount();
+    BinExport2 proto = null;
     String builderUsed = "extension";
     Collection<Long> degenerate = new TreeSet<>();
-    try {
-      proto = new BinExport2Builder(program, program.getMemory()).build();
-    } catch (NullPointerException e) {
-      if (!isMissingBlockIndex(e)) {
-        throw e;
+    Collection<Long> degradedInstructions = new TreeSet<>();
+    Collection<Long> degradedFunctions = new TreeSet<>();
+    boolean useFallback = scanMode;
+    if (!scanMode) {
+      try {
+        proto = new BinExport2Builder(program, program.getMemory()).build();
+      } catch (NullPointerException e) {
+        if (!isMissingBlockIndex(e)) {
+          throw e;
+        }
+        println("ExportBinExport: the extension's builder missed a basic block in its index ("
+            + e.getMessage() + "); rebuilding with FallbackBinExport2Builder");
+        useFallback = true;
       }
-      println("ExportBinExport: the extension's builder missed a basic block in its index ("
-          + e.getMessage() + "); rebuilding with FallbackBinExport2Builder");
+    }
+    if (useFallback) {
       FallbackBinExport2Builder fallback =
-          new FallbackBinExport2Builder(program, program.getMemory());
+          new FallbackBinExport2Builder(program, program.getMemory())
+              .setPromoteUndefined(!scanMode);
       proto = fallback.build();
       degenerate = fallback.getDegenerateFunctionEntries();
+      degradedInstructions = fallback.getOperandMarkupDegradedInstructions();
+      degradedFunctions = fallback.getOperandMarkupDegradedFunctions();
       builderUsed = "fallback";
     }
+    int functionsAfter = program.getFunctionManager().getFunctionCount();
     Repair repair = repairFlowGraphs(proto, program);
-    // The report first: an export file without its report is never left behind as complete.
     String json = "{\"builder\": \"" + builderUsed + "\""
+        + ", \"mode\": \"" + (scanMode ? "scan" : "standalone") + "\""
+        + ", \"functions_before_build\": " + functionsBefore
+        + ", \"functions_after_build\": " + functionsAfter
         + ", \"entry_addresses_added\": " + repair.entryAddressesAdded
         + ", \"flow_graphs_dropped\": " + repair.droppedFunctions.size()
         + ", \"dropped_functions\": " + jsonList(repair.droppedFunctions)
-        + ", \"degenerate_functions\": " + jsonList(degenerate) + "}\n";
-    try (FileOutputStream rs = new FileOutputStream(report)) {
+        + ", \"degenerate_functions\": " + jsonList(degenerate)
+        + ", \"operand_markup_degraded\": {\"instructions\": " + degradedInstructions.size()
+        + ", \"instruction_addresses\": " + jsonList(degradedInstructions)
+        + ", \"functions\": " + jsonList(degradedFunctions) + "}}\n";
+    File reportTmp = new File(report.getPath() + ".tmp");
+    File outTmp = new File(out.getPath() + ".tmp");
+    try (FileOutputStream rs = new FileOutputStream(reportTmp)) {
       rs.write(json.getBytes("UTF-8"));
     }
-    try (FileOutputStream os = new FileOutputStream(out)) {
+    try (FileOutputStream os = new FileOutputStream(outTmp)) {
       repair.proto.writeTo(os);
     }
-    if (!out.isFile() || out.length() == 0) {
-      printerr("ExportBinExport: wrote no bytes to " + out.getAbsolutePath());
+    if (!outTmp.isFile() || outTmp.length() == 0) {
+      printerr("ExportBinExport: wrote no bytes to " + outTmp.getAbsolutePath());
       throw new IllegalStateException("ExportBinExport: empty export");
     }
+    // The report first: an export file without its report is never left behind as complete.
+    moveIntoPlace(reportTmp, report);
+    moveIntoPlace(outTmp, out);
     println("ExportBinExport: wrote " + out.length() + " bytes; builder=" + builderUsed
+        + " functions=" + functionsBefore + "->" + functionsAfter
         + " entry_addresses_added=" + repair.entryAddressesAdded
         + " flow_graphs_dropped=" + repair.droppedFunctions.size()
-        + " degenerate_functions=" + degenerate.size());
+        + " degenerate_functions=" + degenerate.size()
+        + " operand_markup_degraded=" + degradedInstructions.size() + "/"
+        + degradedFunctions.size());
   }
 }

@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.unit.lib.binexport_seed import archive_exports
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.writer import begin_run
 from treasure_map.lib.binary_id import BinaryRow
@@ -229,6 +230,7 @@ def _analysis_db(
         )
     conn.commit()
     conn.close()
+    archive_exports(path)
     return BinaryRow(id=1, name="libx", path="/x/libx", sha256="feed")
 
 
@@ -407,7 +409,7 @@ def _run_diff(atlas: sqlite3.Connection, tmp_path: Path, monkeypatch, exports: b
     monkeypatch.setattr(driver, "_current_pass_version", lambda: "pv1")
     monkeypatch.setattr(driver, "_installed_commit", lambda: "facefeed")
     monkeypatch.setattr(
-        driver, "_run_binexport", lambda so, cfg, out, side, t: tmp_path / f"{side}.BinExport"
+        driver, "_obtain_export", lambda stored, out, side: tmp_path / f"{side}.BinExport"
     )
     monkeypatch.setattr(driver, "_run_bindiff", lambda ea, eb, out, t: bd)
     return driver.run_version_diff(atlas, "run_a", "run_b", "libx", config=Config())

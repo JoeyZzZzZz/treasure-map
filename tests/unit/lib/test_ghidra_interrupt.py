@@ -189,7 +189,9 @@ def test_an_attempt_cut_off_by_the_teardown_reads_interrupted_not_failed(
     binary.write_bytes(b"\x7fELF" + b"\x00" * 100)
     calls = {"n": 0}
 
-    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+    def fake_sub(
+        cmd: list[str], env: dict[str, str], timeout: int, cwd: Path | None = None
+    ) -> tuple[int, str]:
         calls["n"] += 1
         ghidra_runner.begin_shutdown()
         return rc, "" if rc == 0 else "not started"

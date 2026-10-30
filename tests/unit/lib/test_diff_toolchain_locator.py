@@ -22,6 +22,7 @@ from .setup import fakes
 
 # conftest replaces detect_toolchain module-wide; the real one is what these tests are about.
 _REAL_DETECT = tc.detect_toolchain
+_REAL_BINDIFF = tc.bindiff_version  # captured before the conftest blanks it
 
 
 @pytest.fixture()
@@ -134,6 +135,7 @@ def test_a_symlinked_launcher_reads_the_same_as_the_stamp(
     shim.symlink_to(ghidra / "support" / "analyzeHeadless")
     bindiff = fakes.make_bindiff(tmp_path / "bin" / "bindiff")
     monkeypatch.setenv("PATH", f"{bindiff.parent}:/usr/bin:/bin")
+    monkeypatch.setattr(tc, "bindiff_version", _REAL_BINDIFF)
     cfg = Config(ghidra=GhidraConfig(local=GhidraLocalConfig(home=ghidra)))
     found = _REAL_DETECT(cfg)
     assert found is not None and found.binexport.startswith("11.4.3+lib:")

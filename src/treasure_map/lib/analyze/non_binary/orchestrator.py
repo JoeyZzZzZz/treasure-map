@@ -35,6 +35,9 @@ class NonBinaryStats:
     files_ingested: int = 0
     by_kind: dict[str, int] = field(default_factory=dict)
     sub_rows: dict[str, int] = field(default_factory=dict)
+    # Relative paths an ingester claimed and then failed on (its master row rolled back): the file
+    # inventory names them ingest_failed rather than no_ingester.
+    ingest_failed: list[str] = field(default_factory=list)
 
 
 def _walk_non_binary(fs_root: Path) -> list[NonBinaryFile]:
@@ -159,6 +162,7 @@ def run_all_ingesters(
                 # Roll back the orphan master row so the file leaves no partial entry
                 # and the next ingester does not double-register it.
                 conn.execute("DELETE FROM non_binary_files WHERE id = ?", (file_id,))
+                stats.ingest_failed.append(f.rel_path)
                 continue
 
             stats.files_ingested += 1

@@ -24,6 +24,7 @@ from typing import Literal, NamedTuple
 
 from treasure_map.lib.config.config import Config
 from treasure_map.lib.diff import toolchain as _toolchain
+from treasure_map.lib.export_stamp import scan_extension
 from treasure_map.lib.setup import clients as _clients
 from treasure_map.lib.setup.discover import (
     Host,
@@ -265,10 +266,23 @@ def _binexport_checks(inp: DoctorInputs, home: Path) -> list[Check]:
         where = [str(home / "Ghidra" / "Extensions")]
         if finding.settings_dir is not None:
             where.append(str(finding.settings_dir / "Extensions"))
-        out.append(check("binexport", "missing", "not loaded; looked in " + ", ".join(where)))
+        out.append(
+            check(
+                "binexport",
+                "missing",
+                "not loaded; looked in "
+                + ", ".join(where)
+                + ". Scans and diffs both need it: a scan without it records its binaries "
+                "extension_missing, and they cannot be diffed",
+            )
+        )
     elif len(finding.candidates) > 1:
         dirs = ", ".join(str(c.path) for c in finding.candidates)
-        out.append(check("binexport", "wrong", f"two copies; Ghidra may load either: {dirs}"))
+        # A scan runs Ghidra under a home of its own and so loads only the installation's copy
+        # (lib/export_stamp.scan_extension); the GUI may still load either.
+        scan = scan_extension(home).ext_dir
+        used = f"; a scan uses {scan}" if scan is not None else ""
+        out.append(check("binexport", "wrong", f"two copies; Ghidra may load either: {dirs}{used}"))
     else:
         c = finding.candidates[0]
         if not c.ok:

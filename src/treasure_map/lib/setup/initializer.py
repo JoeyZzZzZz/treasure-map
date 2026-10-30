@@ -880,7 +880,11 @@ def run_init(
             for c in finding.candidates:
                 plan.needs_you.append(f"BinExport at {c.path}: {c.why_not}")
         elif mode == "non-interactive":
-            echo("  BinExport: not installed; left (--non-interactive does not download).")
+            echo(
+                "  BinExport: not installed; left (--non-interactive does not download). Scans "
+                "and diffs both need it: without it a scan still runs, records its binaries "
+                "extension_missing, and none of them can be diffed."
+            )
         else:
             target = binexport_target(host, g.path, ledger)
             if target is None:

@@ -436,6 +436,7 @@ def _diff_rescan_plan(
     build = current_pass_version()
     commit = installed_commit()
     current = rescan_version.current_code_stamp(cfg)
+    tools = _scan_tools(cfg)
     roles = (("before", "A", before), ("after", "B", after))
     warnings: list[str] = []
     stale: list[tuple[str, RunRow, Staleness]] = []
@@ -462,6 +463,8 @@ def _diff_rescan_plan(
         # Resolved here as well as in the driver, so a mistyped name is refused before it has cost
         # a rescan; the short name is what this command's own diff id is made from.
         this_diff: str | None = None
+        # The binaries whose exports this diff reads, per role (None: every binary of the run).
+        export_shas: dict[str, set[str] | None] = {role: None for role, _s, _r in roles}
         if binary_name is not None:
             names: list[str] = []
             for role, _side, rid in roles:
@@ -475,6 +478,7 @@ def _diff_rescan_plan(
                     )
                     raise click.ClickException(f"{type(refusal).__name__}: {refusal}{unreadable}")
                 names.append(row.name)
+                export_shas[role] = {row.sha256} if row.sha256 else set()
             this_diff = make_diff_id(before, after, names[0])
 
         for role, side, rid in roles:
@@ -509,11 +513,23 @@ def _diff_rescan_plan(
                 )
             st = run_staleness(run, build_hash=build, current=current, commit=commit)
             if not st.stale:
-                if st.remedy:  # named exactly when the run could not be confirmed current
-                    warnings.append(
-                        f"{label}: {st.detail} Not rescanned: it is not shown to be out of date."
-                    )
-                continue
+                # Its facts are current; the exports the diff reads may not be (an edited export
+                # script, another BinExport build): those binaries are re-scanned first, after the
+                # cost is said — the diff compares only exports made by this install's exporter.
+                stale_export = (
+                    _export_reason(run, tools.export_hash, export_shas[role])
+                    if tools.export_hash is not None
+                    else None
+                )
+                if stale_export is not None:
+                    st = Staleness(True, "export", stale_export, _remedy_for(run))
+                else:
+                    if st.remedy:  # named exactly when the run could not be confirmed current
+                        warnings.append(
+                            f"{label}: {st.detail} Not rescanned: it is not shown to be out of "
+                            "date."
+                        )
+                    continue
             if no_rescan:
                 raise click.ClickException(
                     f"ConfigError: run {side} '{rid}' is out of date ({st.axis}): {st.detail} "
@@ -542,16 +558,21 @@ def _diff_rescan_plan(
         live = _live_instance_counts(conn)
         plan: list[_DiffRescan] = []
         for role, run, st in stale:
-            reason = _rescan_reason(
-                run,
-                current_build=build,
-                current=current,
-                live_instances=live.get(run.run_id, 0),
+            reason = (
+                ("export", st.detail)
+                if st.axis == "export"
+                else _rescan_reason(
+                    run,
+                    current_build=build,
+                    current=current,
+                    live_instances=live.get(run.run_id, 0),
+                    tools=tools,
+                )
             )
             # The looser rescan rule never confirms a proven-stale run current; were it to, the
             # proof itself is what is reported.
             axis, why = reason or (st.axis or "hunt", st.detail)
-            rebuilds = axis in ("incomplete", "extraction")
+            rebuilds = axis in ("incomplete", "extraction", "toolchain", "export")
             if not rebuilds:
                 try:
                     rebuilds = _no_stored_facts(Path(str(run.analysis_db_path))) is not None
@@ -1512,6 +1533,7 @@ def runs(config: Path | None, atlas_path: Path | None, as_json: bool) -> None:
         current_build=current_build,
         current=rescan_version.current_code_stamp(cfg),
         live=live,
+        tools=_scan_tools(cfg),
     )
     if as_json:
         # The same classification the human view groups on, per run, so a script does not have to
@@ -2234,12 +2256,65 @@ def scan(
         )
 
 
+@dataclass(frozen=True)
+class _ScanTools:
+    """What a scan run on this machine would be made by, beside the code: the Ghidra version and
+    the export hash (lib/export_stamp; None when no BinExport extension is available — a re-scan
+    would then make no export). Either None = not known here, and decides nothing."""
+
+    ghidra: str | None
+    export_hash: str | None
+
+
+def _scan_tools(cfg: Config) -> _ScanTools:
+    """The Ghidra and export hash a scan here would use, read once per command."""
+    from treasure_map.lib.analyze.ghidra_runner import detect_ghidra_version, find_headless
+    from treasure_map.lib.errors import GhidraNotFoundError
+    from treasure_map.lib.export_stamp import (
+        SCAN_BUILDER,
+        export_code_hash,
+        export_hash,
+        scan_extension,
+    )
+
+    try:
+        headless = find_headless(cfg.ghidra)
+    except GhidraNotFoundError:
+        return _ScanTools(None, None)
+    ghidra = detect_ghidra_version(headless)
+    ext = scan_extension(headless.resolve().parent.parent)
+    exp = (
+        export_hash(export_code_hash(SCAN_BUILDER), ext.stamp or "unknown")
+        if ext.ext_dir is not None
+        else None
+    )
+    return _ScanTools(None if ghidra == UNKNOWN_VERSION else ghidra, exp)
+
+
+def _export_reason(
+    run: RunRow, export_hash: str | None, shas: set[str] | None = None
+) -> str | None:
+    """Why a scan here would re-make some of the run's BinExport exports, or None."""
+    from treasure_map.lib.binexport_archive import stale_exports
+
+    if not run.analysis_db_path:
+        return None
+    counted = stale_exports(run.analysis_db_path, export_hash, shas)
+    if counted is None or counted[0] == 0:
+        return None
+    return (
+        f"BinExport exports out of date: {counted[0]} of {counted[1]} binaries' exports were made "
+        "by other export scripts or another BinExport build, or not at all"
+    )
+
+
 def _rescan_reason(
     run: RunRow,
     *,
     current_build: str | None,
     current: rescan_version.CodeStamp,
     live_instances: int | None,
+    tools: _ScanTools | None = None,
 ) -> tuple[str, str] | None:
     """WHICH input is out of date and why, or None when both are confirmed current.
 
@@ -2289,6 +2364,16 @@ def _rescan_reason(
             else f"previous run did not finish (scan_status={run.scan_status})"
         )
         return ("incomplete", why)
+    # The decompiler: a run extracted by another Ghidra than the installed one is re-extracted
+    # whole (every binary's rows came from it). Both versions known, or it decides nothing.
+    if (
+        tools is not None
+        and tools.ghidra
+        and run.ghidra_version
+        and run.ghidra_version != UNKNOWN_VERSION
+        and run.ghidra_version != tools.ghidra
+    ):
+        return ("toolchain", f"scanned with Ghidra {run.ghidra_version}, {tools.ghidra} installed")
     # Extraction is next because it is the only remaining axis that can be PROVEN here, and the
     # axis is a claim about how long the work takes. Both values present and different is that
     # proof; a run with no stored hash, or an install that cannot compute one, falls through to the
@@ -2325,6 +2410,13 @@ def _rescan_reason(
             )
         # Every binary was attempted by the running pass and the hunt read this very extraction:
         # nothing to decompile. Whatever else moved is the hunt axis's to find below.
+    # The exports the scan writes with each extraction: an edited export script or another
+    # BinExport build re-scans the binaries whose export it made (a diff of them reads stale until
+    # then). Not a refusal — the facts are unchanged — but a decompile of those binaries.
+    if tools is not None:
+        stale = _export_reason(run, tools.export_hash)
+        if stale is not None:
+            return ("export", stale)
     if run.hunt_code_version is None:
         return ("hunt", "hunted before the code stamp existed")
     if run.hunt_code_version != current.hunt:
@@ -2364,7 +2456,9 @@ def _live_instance_counts(conn: sqlite3.Connection) -> dict[str, int]:
 # that from "out of date".
 _TIER_LABEL = {
     "incomplete": "needs a full re-scan",
+    "toolchain": "needs re-extraction (Ghidra upgraded)",
     "extraction": "needs re-extraction",
+    "export": "needs re-export",
     "hunt": "needs re-hunt",
 }
 _TIER_COST = {
@@ -2374,7 +2468,12 @@ _TIER_COST = {
     # would be a promise about work nobody has looked at. Over-stating costs the reader a pause;
     # under-stating costs them a Ghidra run they were told would not happen.
     "incomplete": "a full scan, the decompiler runs (time not measured; assume the slow case)",
+    "toolchain": "the decompiler runs over every binary of the run (each was extracted by the old "
+    "Ghidra); until then the run is refused",
     "extraction": "the decompiler runs over every binary the running pass has not extracted yet",
+    # An export is written only in the session of its extraction, so a binary is re-scanned whole.
+    "export": "the decompiler runs over the binaries whose export is out of date (an export is "
+    "made only in the session that extracts its binary); the run's facts stay served meanwhile",
     # ★ Says what IS redone, not only what is skipped. build_hash covers the per-binary extraction
     # and nothing else, so the ELF inventory, the symlink table, the xrefs and the non-binary
     # ingesters are rebuilt every time — a re-hunt is cheap because no decompiler starts, not
@@ -2468,7 +2567,7 @@ def _reasons_grouped(tier: list[tuple[RunRow, str]], axis: str) -> dict[str, lis
 # The tiers in the order a reader should meet them: most work first, so the thing that will take
 # longest is not the last thing found. Every consumer iterates this, so adding a tier is one edit
 # rather than a hunt for the places that enumerate them by hand.
-_TIER_ORDER: tuple[str, ...] = ("incomplete", "extraction", "hunt")
+_TIER_ORDER: tuple[str, ...] = ("incomplete", "toolchain", "extraction", "export", "hunt")
 
 
 def _staleness_tiers(
@@ -2477,6 +2576,7 @@ def _staleness_tiers(
     current_build: str | None,
     current: rescan_version.CodeStamp,
     live: dict[str, int],
+    tools: _ScanTools | None = None,
 ) -> tuple[dict[str, list[tuple[RunRow, str]]], list[RunRow]]:
     """Split runs into ``{axis -> [(run, reason)]}`` plus the confirmed-current ones.
 
@@ -2491,7 +2591,11 @@ def _staleness_tiers(
     confirmed: list[RunRow] = []
     for r in run_rows:
         res = _rescan_reason(
-            r, current_build=current_build, current=current, live_instances=live.get(r.run_id, 0)
+            r,
+            current_build=current_build,
+            current=current,
+            live_instances=live.get(r.run_id, 0),
+            tools=tools,
         )
         if res is None:
             confirmed.append(r)
@@ -2507,8 +2611,8 @@ def _staleness_tiers(
 
 def _tier_line(r: RunRow, why: str, axis: str) -> str:
     """One tier entry: the run, why it is in that tier, and how big the work is when known."""
-    # Both decompiling tiers carry the size of the work; the hunt tier does not decompile.
-    sized = axis in ("extraction", "incomplete")
+    # The decompiling tiers carry the size of the work; the hunt tier does not decompile.
+    sized = axis in ("extraction", "incomplete", "toolchain")
     todo = _extraction_todo(why) if axis == "extraction" else None
     if todo is not None:
         scale = f" [{todo[0]} of {todo[1]} binaries]"
@@ -2694,12 +2798,14 @@ def rescan(
     some selected runs failed to refresh.
 
     WHAT --force CAN AND CANNOT REFRESH. It re-runs the scan, so a changed config or a firmware
-    directory whose contents moved is picked up. It does NOT re-extract: the scan it drives carries
-    no --reanalyze, and the extraction fingerprint hashes tmap's own pipeline code, not the version
-    of the libraries that code calls. After upgrading pyelftools (which the stub-resolve step parses
-    ELF with) or Ghidra, the stored extraction is stale in a way nothing here can see — that one
-    needs `tmap scan <firmware-root> --run-id <run> --reanalyze`. The run-level scan stamp records
-    the pyelftools version, but it covers only the inventory/non-binary rebuild, not the per-binary
+    directory whose contents moved is picked up. It does NOT re-extract on its own: the scan it
+    drives carries no --reanalyze. The scan does re-extract every binary the installed Ghidra did
+    not extract (an upgraded decompiler; until then such a run is refused), and re-scans the
+    binaries whose BinExport export another export script or BinExport build made (their facts stay
+    served meanwhile). After upgrading pyelftools (which the stub-resolve step parses ELF with) the
+    stored extraction is stale in a way nothing here can see — that one needs
+    `tmap scan <firmware-root> --run-id <run> --reanalyze`. The run-level scan stamp records the
+    pyelftools version, but it covers only the inventory/non-binary rebuild, not the per-binary
     decompile cache (keyed on the extraction fingerprint), so it does not stand in for --reanalyze.
 
     A run whose firmware root was never recorded, or is no longer on disk, CANNOT be rescanned —
@@ -2750,7 +2856,7 @@ def rescan(
     click.echo(f"hunt code {stamp.hunt} / scan code {rescan_version.pipeline_code_version()}")
 
     tiers, current = _staleness_tiers(
-        selected, current_build=current_build, current=stamp, live=live
+        selected, current_build=current_build, current=stamp, live=live, tools=_scan_tools(cfg)
     )
     # ★ Both maps filled from EVERY tier. Missing a tier here fails in two different ways, and
     # neither is loud: leaving it out of ``todo`` drops its runs from the report altogether, while

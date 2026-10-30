@@ -24,9 +24,11 @@ from typing import Any
 import pytest
 from click.testing import CliRunner
 
+from tests.unit.lib.binexport_seed import BINEXPORT, archive_exports, export_meta
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import DiffMetaRow, RunRow
 from treasure_map.lib.atlas.writer import add_diff_meta, begin_run, finish_run
+from treasure_map.lib.binexport_archive import read_stored_export
 from treasure_map.lib.config.config import Config
 from treasure_map.lib.diff import code_version, currency, driver, toolchain
 from treasure_map.lib.diff.driver import DiffToolchainError
@@ -139,6 +141,7 @@ def _analysis(w: _World, side: str, rows: dict[str, tuple[str, str | None]]) -> 
         )
     conn.commit()
     conn.close()
+    archive_exports(path)
     return path
 
 
@@ -235,8 +238,10 @@ def _stub(
     monkeypatch.setattr(driver, "_current_pass_version", lambda: build)
     monkeypatch.setattr(driver, "_installed_commit", lambda: commit)
 
-    def binexport(so_path: Path, cfg: Any, out: Path, side: str, timeout: int) -> Path:
-        (out / f"{side}.so").write_text(str(so_path))
+    def binexport(stored: Any, out: Path, side: str) -> Path:
+        sha = stored.meta["sha256"]  # the seeded meta names its binary (tests binexport_seed)
+        so_path = next(p for p, s in w.so_sha.items() if s == sha)
+        (out / f"{side}.so").write_text(so_path)
         p = out / f"{side}.BinExport"
         p.write_bytes(_insn(0x1010, (0x9000,)))
         return p
@@ -250,7 +255,7 @@ def _stub(
             )
         return _bindiff(out / "x.BinDiff", w.so_sha[so_a], w.so_sha[so_b])
 
-    monkeypatch.setattr(driver, "_run_binexport", binexport)
+    monkeypatch.setattr(driver, "_obtain_export", binexport)
     monkeypatch.setattr(driver, "_run_bindiff", bindiff)
 
 
@@ -273,11 +278,13 @@ def _row(w: _World, binary: str = "liba") -> sqlite3.Row:
 
 
 def _set_binary(w: _World, side: str, name: str, column: str, value: str | None) -> None:
-    """Change one binaries column of a side's analysis.db (what a re-extraction does)."""
+    """Change one binaries column of a side's analysis.db (what a re-extraction does; the scan
+    re-makes the binary's archived export with it)."""
     conn = sqlite3.connect(w.tmp / f"{side}.db")
     conn.execute(f"UPDATE binaries SET {column} = ? WHERE name = ?", (value, name))  # noqa: S608
     conn.commit()
     conn.close()
+    archive_exports(w.tmp / f"{side}.db")
 
 
 def _rehunt(w: _World, run: str) -> None:
@@ -374,8 +381,22 @@ def test_equal_extraction_stamps_are_current_including_none_and_unknown(tmp_path
     _set_binary(w, "b", "liba", "pass_version", None)
     _set_binary(w, "b", "liba", "ghidra_version", UNKNOWN_VERSION)
     dbs = {r: str(w.tmp / f"{r[-1]}.db") for r in ("run_a", "run_b")}
-    st_a = currency.side_stamp(w.atlas, "run_a", dbs["run_a"], _sha("a"), "liba")
-    st_b = currency.side_stamp(w.atlas, "run_b", dbs["run_b"], _sha("b"), "liba")
+    st_a = currency.side_stamp(
+        w.atlas,
+        "run_a",
+        dbs["run_a"],
+        _sha("a"),
+        "liba",
+        read_stored_export(dbs["run_a"], _sha("a")),
+    )
+    st_b = currency.side_stamp(
+        w.atlas,
+        "run_b",
+        dbs["run_b"],
+        _sha("b"),
+        "liba",
+        read_stored_export(dbs["run_b"], _sha("b")),
+    )
     assert (st_b.extraction_pass, st_b.ghidra_version) == (None, UNKNOWN_VERSION)
     add_diff_meta(
         w.atlas,
@@ -742,6 +763,9 @@ class _TwoNameCache:
     def hunt_marks(self, run_id: str) -> tuple[str | None, int | None, int]:
         return ("t0", 1, 1)
 
+    def export_state(self, run_id: str | None, sha: str | None) -> tuple[bool, None]:
+        return True, None  # read, and no archived export: the stored export hashes are None too
+
 
 def test_each_side_is_looked_up_by_its_own_binary_name() -> None:
     """MUTATION (verified RED): look side b up by ``binary_a`` -> its binary reads as gone."""
@@ -755,8 +779,8 @@ def test_each_side_is_looked_up_by_its_own_binary_name() -> None:
         "diff_code_version": code_version.diff_code_version(),
         "export_builder_a": None,
         "export_builder_b": None,
-        "export_code_hash_a": code_version.export_code_hash(None),
-        "export_code_hash_b": code_version.export_code_hash(None),
+        "export_code_hash_a": None,
+        "export_code_hash_b": None,
         "toolchain_ghidra": None,
         "toolchain_binexport": None,
         "toolchain_bindiff": None,
@@ -1797,7 +1821,7 @@ def test_the_diff_listing_counts_functions_and_leaves_edges_to_their_view(tmp_pa
 
 
 def _two_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _World:
-    """liba exported by the extension's builder, libb by the fallback builder, both diffed."""
+    """liba and libb, both diffed."""
     w = _world(
         tmp_path,
         {"liba": (_sha("a"), _PV), "libb": (_sha("c"), _PV)},
@@ -1805,29 +1829,26 @@ def _two_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _World:
     )
     _stub(monkeypatch, w)
     _full(w)
-    for binary, builder in (("liba", "extension"), ("libb", "fallback")):
-        h = code_version.export_code_hash(builder)
-        w.atlas.execute(
-            "UPDATE diff_meta SET export_builder_a = ?, export_builder_b = ?, "
-            "export_code_hash_a = ?, export_code_hash_b = ? WHERE diff_id = ?",
-            (builder, builder, h, h, _did(binary)),
-        )
-    w.atlas.commit()
     assert _plan(w).already_ok == ("liba", "libb")
     return w
 
 
-def _scripts_changed(monkeypatch: pytest.MonkeyPatch, *, which: str) -> None:
-    """The export script files as they would hash after an edit to ``which``."""
-    real = code_version.export_code_hash
-
-    def changed(builder: str | None) -> str:
-        if which == "fallback" and builder == "extension":
-            return real(builder)  # the extension path does not take the fallback builder
-        return "edited-" + real(builder)
-
-    monkeypatch.setattr(driver, "export_code_hash", changed)
-    monkeypatch.setattr(diff_align, "export_code_hash", changed)
+def _rescanned(w: _World, side: str, binary: str, **meta_kw: Any) -> None:
+    """One side's binary re-scanned: its archived export re-made, with ``meta_kw`` naming what it
+    was made by this time (other export scripts, another BinExport build)."""
+    db = w.tmp / f"{side}.db"
+    sha = (
+        sqlite3.connect(db)
+        .execute("SELECT sha256 FROM binaries WHERE name = ?", (binary,))
+        .fetchone()[0]
+    )
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "UPDATE binaries SET binexport_scan_meta = ? WHERE sha256 = ?",
+        (json.dumps(export_meta(sha, _PV, **meta_kw), sort_keys=True), sha),
+    )
+    conn.commit()
+    conn.close()
 
 
 def _listed_reasons(w: _World) -> dict[str, tuple[bool | None, str | None]]:
@@ -1837,25 +1858,61 @@ def _listed_reasons(w: _World) -> dict[str, tuple[bool | None, str | None]]:
     }
 
 
-def test_an_edit_to_the_fallback_builder_reruns_only_the_fallback_exports(
+def test_a_rescan_with_other_export_scripts_reruns_only_its_diffs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """MUTATION (verified RED): compare one export hash for every diff, whatever its path -> the
-    extension export is re-diffed too."""
+    """★ A diff reads the exports each side's scan archived: re-scanning both sides of libb with
+    edited export scripts makes libb's diff stale (diff_logic_changed) and re-diffs it, and leaves
+    liba's — whose archives did not change — current. Editing a script without re-scanning changes
+    nothing a diff compares.
+
+    MUTATION (verified RED): compare the export scripts installed now instead of each side's
+    archive -> nothing is re-diffed; leave the export hash out of the plan -> libb is kept."""
     w = _two_paths(tmp_path, monkeypatch)
-    _scripts_changed(monkeypatch, which="fallback")
+    for side in "ab":
+        _rescanned(w, side, "libb", script_hash="edited00000000aa")
     plan = _plan(w)
     assert (plan.to_diff, plan.already_ok) == (("libb",), ("liba",))
     assert _listed_reasons(w) == {"liba": (False, None), "libb": (True, "diff_logic_changed")}
 
 
-def test_an_edit_to_the_export_script_reruns_every_export(
+def test_a_rescan_with_another_binexport_build_reruns_its_diffs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Both sides of libb re-scanned with another BinExport build: the toolchain its diff was
+    computed by changed (toolchain_changed), so it is re-diffed; liba stays current.
+
+    MUTATION (verified RED): read the BinExport the diff compares from the machine instead of the
+    archives -> libb reads current."""
+    _installed(monkeypatch, _TOOLS)
     w = _two_paths(tmp_path, monkeypatch)
-    _scripts_changed(monkeypatch, which="export")
-    assert _plan(w).to_diff == ("liba", "libb")
-    assert set(_listed_reasons(w).values()) == {(True, "diff_logic_changed")}
+    for side in "ab":
+        _rescanned(w, side, "libb", binexport="11.4.3+lib:111111111111")
+    plan = _plan(w, bindiff=_TOOLS.bindiff)
+    assert (plan.to_diff, plan.already_ok) == (("libb",), ("liba",))
+    assert _listed_reasons(w)["libb"] == (True, "toolchain_changed")
+
+
+def test_two_sides_exported_by_different_exporters_are_refused_without_force(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ Check 3 covers the exporter: only side b of libb re-scanned with edited export scripts —
+    BinDiff would read the exporters' difference as a change. Refused without --force (and recorded
+    as an export_skew blind spot by a full diff, not counted toward the retry cap); with --force the
+    diff runs and every delta reads version_skew.
+
+    MUTATION (verified RED): drop the exporter comparison from preflight -> the diff runs as
+    comparable."""
+    w = _two_paths(tmp_path, monkeypatch)
+    _rescanned(w, "b", "libb", script_hash="edited00000000aa")
+    with pytest.raises(driver.ExportSkewError, match="different exporters"):
+        driver.run_version_diff(w.atlas, "run_a", "run_b", "libb", config=Config())
+    fs = _full(w)
+    (oc,) = [o for o in fs.outcomes if o.binary == "libb"]
+    assert (oc.reason, oc.attempts) == ("export_skew", 0)
+    forced = driver.run_version_diff(w.atlas, "run_a", "run_b", "libb", config=Config(), force=True)
+    assert forced.version_skew is True
+    assert any("different exporters" in x for x in forced.warnings)
 
 
 def test_an_edit_to_the_diff_code_reruns_every_diff(
@@ -1894,12 +1951,15 @@ def test_an_edit_to_the_overlay_logic_restores_every_baseline(
     assert versions == {"src-other"}
 
 
-_TOOLS = toolchain.Toolchain("11.4.3", "11.4.3", "BinDiff 8 (@568181968, Sep 25 2023)")
+_TOOLS = toolchain.Toolchain("11.4.3", BINEXPORT, "BinDiff 8 (@568181968, Sep 25 2023)")
 
 
 def _installed(monkeypatch: pytest.MonkeyPatch, tools: toolchain.Toolchain | None) -> None:
-    monkeypatch.setattr(toolchain, "detect_toolchain", lambda config: tools)
-    monkeypatch.setattr(toolchain, "_current", [tools])
+    """The BinDiff installed (a diff's only tool of its own: the Ghidra and BinExport behind it
+    are its exports', from their archives)."""
+    bindiff = tools.bindiff if tools is not None else None
+    monkeypatch.setattr(toolchain, "bindiff_version", lambda: bindiff)
+    monkeypatch.setattr(toolchain, "_current_bindiff", [bindiff])
 
 
 def test_a_diff_records_its_toolchain_and_an_upgrade_reruns_it(
@@ -1916,7 +1976,7 @@ def test_a_diff_records_its_toolchain_and_an_upgrade_reruns_it(
     (listed,) = diff_align.list_diffs(w.atlas)["diffs"]
     assert (listed["source_stale"], listed["toolchain_checked"]) == (False, True)
     _installed(monkeypatch, toolchain.Toolchain("11.4.3", "11.4.3", "BinDiff 9"))
-    assert _plan(w, toolchain=toolchain.detect_toolchain(Config())).to_diff == ("liba",)
+    assert _plan(w, bindiff="BinDiff 9").to_diff == ("liba",)
     (listed,) = diff_align.list_diffs(w.atlas)["diffs"]
     assert (listed["source_stale"], listed["source_stale_reason"]) == (True, "toolchain_changed")
     assert diff_align.get_diff_meta(w.atlas, _did())["source_stale_reason"] == "toolchain_changed"
@@ -1935,7 +1995,7 @@ def test_a_toolchain_that_cannot_be_read_is_said_and_decides_nothing(
     _installed(monkeypatch, _TOOLS)
     _full(w)
     _installed(monkeypatch, None)
-    assert _plan(w, toolchain=None).already_ok == ("liba",)
+    assert _plan(w, bindiff=None).already_ok == ("liba",)
     (listed,) = diff_align.list_diffs(w.atlas)["diffs"]
     assert (listed["source_stale"], listed["toolchain_checked"]) == (False, False)
     meta = diff_align.get_diff_meta(w.atlas, _did())
@@ -1968,7 +2028,7 @@ _GOLDEN_SKIP = frozenset(
 )
 # The digest of the golden diff's output. An output regression test: the version stamped on a diff
 # is a hash of the code itself (lib/diff/code_version), not this value.
-_GOLDEN_OUTPUT = "0f7ac1cdb02b"
+_GOLDEN_OUTPUT = "3c08cd668cf1"
 
 
 def _golden_analysis(path: Path, sha: str, side: str) -> None:
@@ -2007,6 +2067,7 @@ def _golden_analysis(path: Path, sha: str, side: str) -> None:
         )
     conn.commit()
     conn.close()
+    archive_exports(path)
 
 
 def _golden_atlas(tmp_path: Path) -> sqlite3.Connection:
@@ -2100,7 +2161,7 @@ def test_the_golden_diff_writes_what_it_wrote(
     """
     atlas = _golden_atlas(tmp_path)
 
-    def binexport(so_path: Path, cfg: Any, out: Path, side: str, timeout: int) -> Path:
+    def binexport(stored: Any, out: Path, side: str) -> Path:
         walk_call = 0x101318 if side == "a" else 0x101329
         p = out / f"{side}.BinExport"
         p.write_bytes(_insn(0x1012B1, (0x101080,)) + _insn(walk_call, (0x101070,)))
@@ -2109,7 +2170,7 @@ def test_the_golden_diff_writes_what_it_wrote(
     monkeypatch.setattr(driver, "_check_toolchain", lambda config: None)
     monkeypatch.setattr(driver, "_current_pass_version", lambda: "pvgolden")
     monkeypatch.setattr(driver, "_installed_commit", lambda: UNKNOWN_VERSION)
-    monkeypatch.setattr(driver, "_run_binexport", binexport)
+    monkeypatch.setattr(driver, "_obtain_export", binexport)
     monkeypatch.setattr(driver, "_run_bindiff", lambda ea, eb, out, t: _FIXTURE)
     summary = driver.run_version_diff(atlas, "run_a", "run_b", "libshapes.so", config=Config())
     did = summary.diff_id

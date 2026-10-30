@@ -781,7 +781,9 @@ def test_results_not_handed_over_are_stored_once_after_the_batch(
     results = [_ok_ghidra(a), _ok_ghidra(b), _ok_ghidra(c)]
     runner = _mock_runner(results)
 
-    def run_all(records: list[ElfRecord], out: Path, cb: Any, *, on_final: Any) -> list[Any]:
+    def run_all(
+        records: list[ElfRecord], out: Path, cb: Any, *, on_final: Any, on_export: Any = None
+    ) -> list[Any]:
         on_final(records[0], results[0])
         return results
 
@@ -815,7 +817,9 @@ def test_an_interrupted_result_handed_over_is_not_stored(tmp_path: Path) -> None
     )
     runner = _mock_runner([cut])
 
-    def run_all(records: list[ElfRecord], out: Path, cb: Any, *, on_final: Any) -> list[Any]:
+    def run_all(
+        records: list[ElfRecord], out: Path, cb: Any, *, on_final: Any, on_export: Any = None
+    ) -> list[Any]:
         on_final(records[0], cut)
         return [cut]
 

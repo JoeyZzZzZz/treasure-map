@@ -18,12 +18,14 @@ from pathlib import Path
 
 import pytest
 
+from tests.unit.lib.binexport_seed import archive_exports
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import DiffMetaRow
 from treasure_map.lib.atlas.writer import (
     add_diff_meta,
     begin_run,
 )
+from treasure_map.lib.binexport_archive import read_stored_export
 from treasure_map.lib.diff import code_version, currency, driver
 from treasure_map.lib.diff.driver import _DIFF_RETRY_LIMIT, DiffToolchainError
 from treasure_map.lib.diff.layer0 import make_diff_id
@@ -108,6 +110,8 @@ def _seed_pair(
     ca.close()
     cb.commit()
     cb.close()
+    archive_exports(da)
+    archive_exports(db)
     atlas_path = tmp_path / "atlas.db"
     con = open_atlas(atlas_path)
     begin_run(con, "run_a", analysis_db_path=str(da), tool_version="0.0.1", ghidra_version="11.4.3")
@@ -133,8 +137,12 @@ def _seed_committed_status(
         r: con.execute("SELECT analysis_db_path FROM run WHERE run_id = ?", (r,)).fetchone()[0]
         for r in ("run_a", "run_b")
     }
-    st_a = currency.side_stamp(con, "run_a", db["run_a"], sha_a, binary)
-    st_b = currency.side_stamp(con, "run_b", db["run_b"], sha_b, binary)
+    st_a = currency.side_stamp(
+        con, "run_a", db["run_a"], sha_a, binary, read_stored_export(db["run_a"], sha_a)
+    )
+    st_b = currency.side_stamp(
+        con, "run_b", db["run_b"], sha_b, binary, read_stored_export(db["run_b"], sha_b)
+    )
     add_diff_meta(
         con,
         DiffMetaRow(
@@ -277,7 +285,7 @@ def test_run_version_diff_layer2_failure_no_dirty_ok1(
     con = open_atlas(atlas_path)
     monkeypatch.setattr(driver, "_check_toolchain", lambda config: None)
     monkeypatch.setattr(
-        driver, "_run_binexport", lambda so, cfg, out, side, t: out / f"{side}.BinExport"
+        driver, "_obtain_export", lambda stored, out, side: out / f"{side}.BinExport"
     )
     monkeypatch.setattr(driver, "_run_bindiff", lambda ea, eb, out, t: bd)
 
@@ -313,7 +321,7 @@ def test_run_version_diff_success_sets_diff_ok_1(
     con = open_atlas(atlas_path)
     monkeypatch.setattr(driver, "_check_toolchain", lambda config: None)
     monkeypatch.setattr(
-        driver, "_run_binexport", lambda so, cfg, out, side, t: out / f"{side}.BinExport"
+        driver, "_obtain_export", lambda stored, out, side: out / f"{side}.BinExport"
     )
     monkeypatch.setattr(driver, "_run_bindiff", lambda ea, eb, out, t: bd)
 

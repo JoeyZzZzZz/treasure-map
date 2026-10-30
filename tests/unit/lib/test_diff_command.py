@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import inspect
 import re
+import sqlite3
 from pathlib import Path
 
 import pytest
 
+from tests.unit.lib.binexport_seed import archive_exports, stored_export
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import DimensionDeltaRow
 from treasure_map.lib.atlas.writer import add_dimension_deltas, begin_run
@@ -33,9 +35,9 @@ _SRC = Path(__file__).resolve().parents[3] / "src" / "treasure_map"
 # ── fixtures ─────────────────────────────────────────────────────────────────────────
 
 
-def _mk_analysis(path: Path, binary: str, so_path: str | None) -> Path:
+def _mk_analysis(path: Path, binary: str, so_path: str | None, *, export: bool = True) -> Path:
     """A synthetic analysis.db with one binary; ``so_path`` is what ``binaries.path`` records (None
-    => the bare name, i.e. an unlocatable relative path)."""
+    => the bare name). ``export``: the binary has the archived export its scan made."""
     con = open_db(path)
     con.execute(
         "INSERT INTO binaries (id, name, path, sha256, pass_version, ghidra_version, last_seen_at) "
@@ -44,6 +46,8 @@ def _mk_analysis(path: Path, binary: str, so_path: str | None) -> Path:
     )
     con.commit()
     con.close()
+    if export:
+        archive_exports(path)
     return path
 
 
@@ -59,13 +63,14 @@ def _seed(
     resolved_b: bool = True,
     so_a: str | None = None,
     so_b: str | None = None,
+    export_b: bool = True,
 ) -> Path:
     """Two runs (run_a/run_b) each resolving to a synthetic analysis.db carrying 'lib.so'. Knobs let
     a test break exactly one preflight precondition."""
     dba = tmp_path / "a.db"
     dbb = tmp_path / "b.db"
     _mk_analysis(dba, "lib.so", so_a)
-    _mk_analysis(dbb, "lib.so", so_b)
+    _mk_analysis(dbb, "lib.so", so_b, export=export_b)
     if not db_a_exists:
         dba.unlink()
     if not db_b_exists:
@@ -158,23 +163,44 @@ def test_check3_version_skew_with_force_proceeds_and_warns(
     con.close()
 
 
-def test_check4_so_unlocatable_hard_blocks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_check4_a_side_with_no_usable_export_hard_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ A diff reads the export each side's scan archived, and never re-analyses a binary to make
+    one: a side with none is refused by name, with its recorded export status and the fix —
+    nothing recorded (a scan before exports), the extension missing at scan time (install it,
+    then re-scan), or an ok status whose archive is gone.
+
+    MUTATION (verified RED): fall back to an export of the .so -> no refusal -> RED; accept an ok
+    status without its archive file -> RED."""
     _no_toolchain_gate(monkeypatch)
-    # so_a/so_b default None -> binaries.path is the bare relative name, unresolvable -> hard block
-    atlas_path = _seed(tmp_path)
+    atlas_path = _seed(tmp_path, export_b=False)
     con = open_atlas(atlas_path)
-    with pytest.raises(ConfigError, match="cannot be located on this machine"):
+    with pytest.raises(driver.BinexportMissingError, match="recorded status: not_recorded") as e:
         preflight(con, "run_a", "run_b", "lib.so", config=_cfg(), force=False)
+    assert e.value.reason == "binexport_missing:not_recorded"
+    dbb = tmp_path / "b.db"
+    raw = sqlite3.connect(dbb)
+    raw.execute("UPDATE binaries SET binexport_status = 'extension_missing'")
+    raw.commit()
+    raw.close()
+    with pytest.raises(driver.BinexportMissingError, match="install the BinExport extension"):
+        preflight(con, "run_a", "run_b", "lib.so", config=_cfg(), force=False)
+    archive_exports(dbb)
+    for f in (dbb.parent / "binexport").glob("*.BinExport.gz"):
+        f.unlink()
+    with pytest.raises(driver.BinexportMissingError, match="archive_missing") as e:
+        preflight(con, "run_a", "run_b", "lib.so", config=_cfg(), force=False)
+    assert e.value.reason == "binexport_missing:archive_missing"
     con.close()
 
 
-def test_check5_toolchain_missing_hard_blocks(
+def test_check5_bindiff_missing_hard_blocks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # checks 1-4 pass (valid runs + real .so + same version); check 5 fails deterministically.
-    so = tmp_path / "lib.so"
-    so.write_bytes(b"\x7fELF")
-    atlas_path = _seed(tmp_path, so_a=str(so), so_b=str(so))
+    """Checks 1-4 pass; the diff's one tool of its own (BinDiff) is missing. No Ghidra or BinExport
+    is asked for: those are the scan's tools."""
+    atlas_path = _seed(tmp_path)
 
     def _raise(_config):  # type: ignore[no-untyped-def]
         raise GhidraNotFoundError("no headless")
@@ -182,72 +208,27 @@ def test_check5_toolchain_missing_hard_blocks(
     monkeypatch.setattr("treasure_map.lib.analyze.ghidra_runner.find_headless", _raise)
     monkeypatch.setattr(driver, "_find_bindiff", lambda: None)
     con = open_atlas(atlas_path)
-    with pytest.raises(DiffToolchainError, match="toolchain is not available"):
+    with pytest.raises(DiffToolchainError, match="toolchain is not available") as e:
         preflight(con, "run_a", "run_b", "lib.so", config=_cfg(), force=False)
-    con.close()
-
-
-def test_check5_own_export_script_missing_is_a_packaging_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # ★ tmap's own ExportBinExport.java is a runtime .java asset; a wheel that dropped the
-    # package-data glob would ship without it. Point _SCRIPT_DIR at an empty dir (all third-party
-    # tools present) -> preflight hard-blocks with a "packaging problem: reinstall tmap" message,
-    # not a deep crash inside BinExport.
-    so = tmp_path / "lib.so"
-    so.write_bytes(b"\x7fELF")
-    atlas_path = _seed(tmp_path, so_a=str(so), so_b=str(so))
-    monkeypatch.setattr(
-        "treasure_map.lib.analyze.ghidra_runner.find_headless", lambda c: Path("/x")
-    )
-    monkeypatch.setattr(driver, "_binexport_present", lambda h: True)
-    monkeypatch.setattr(driver, "_find_bindiff", lambda: Path("/usr/bin/bindiff"))
-    monkeypatch.setattr(driver, "_SCRIPT_DIR", tmp_path / "no_scripts_here")  # script absent
-    con = open_atlas(atlas_path)
-    with pytest.raises(DiffToolchainError, match="packaging problem"):
-        preflight(con, "run_a", "run_b", "lib.so", config=_cfg(), force=False)
-    con.close()
-
-
-def test_check5_missing_fallback_builder_is_a_packaging_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # The export script compiles with the fallback builder beside it; without it every export
-    # fails inside Ghidra. Only the script present -> the same packaging refusal, naming the
-    # builder.
-    so = tmp_path / "lib.so"
-    so.write_bytes(b"\x7fELF")
-    atlas_path = _seed(tmp_path, so_a=str(so), so_b=str(so))
-    monkeypatch.setattr(
-        "treasure_map.lib.analyze.ghidra_runner.find_headless", lambda c: Path("/x")
-    )
-    monkeypatch.setattr(driver, "_binexport_present", lambda h: True)
-    monkeypatch.setattr(driver, "_find_bindiff", lambda: Path("/usr/bin/bindiff"))
-    scripts = tmp_path / "scripts"
-    scripts.mkdir()
-    (scripts / "ExportBinExport.java").write_text("")
-    monkeypatch.setattr(driver, "_SCRIPT_DIR", scripts)
-    con = open_atlas(atlas_path)
-    with pytest.raises(DiffToolchainError, match="FallbackBinExport2Builder.java"):
-        preflight(con, "run_a", "run_b", "lib.so", config=_cfg(), force=False)
+    assert "bindiff" in str(e.value) and "Ghidra" not in str(e.value).split("Missing:")[1]
     con.close()
 
 
 def test_check5_all_present_preflight_succeeds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    so = tmp_path / "lib.so"
-    so.write_bytes(b"\x7fELF")
-    atlas_path = _seed(tmp_path, so_a=str(so), so_b=str(so))
-    monkeypatch.setattr(
-        "treasure_map.lib.analyze.ghidra_runner.find_headless", lambda c: Path("/x")
-    )
-    monkeypatch.setattr(driver, "_binexport_present", lambda h: True)
+    """With no Ghidra installed at all: a diff needs only BinDiff and the archived exports."""
+    atlas_path = _seed(tmp_path)
+
+    def _raise(_config):  # type: ignore[no-untyped-def]
+        raise GhidraNotFoundError("no headless")
+
+    monkeypatch.setattr("treasure_map.lib.analyze.ghidra_runner.find_headless", _raise)
     monkeypatch.setattr(driver, "_find_bindiff", lambda: Path("/usr/bin/bindiff"))
     con = open_atlas(atlas_path)
     pf = preflight(con, "run_a", "run_b", "lib.so", config=_cfg(), force=False)
     assert pf.binary_a == "lib.so" and pf.binary_b == "lib.so"
-    assert pf.so_a == so and pf.so_b == so
+    assert (pf.export_a.status, pf.export_b.status) == ("ok", "ok")
     assert pf.version_skew is False and pf.warnings == ()
     con.close()
 
@@ -476,10 +457,8 @@ def _fake_preflight(tmp_path: Path):  # type: ignore[no-untyped-def]
     from treasure_map.lib.binary_id import BinaryRow
 
     def _pf(atlas, run_a_id, run_b_id, binary_name, *, config, force):  # type: ignore[no-untyped-def]
-        so_a = tmp_path / f"{binary_name}_a.so"
-        so_b = tmp_path / f"{binary_name}_b.so"
-        so_a.write_bytes(b"\x7fELF")
-        so_b.write_bytes(b"\x7fELF")
+        so_a = stored_export(tmp_path / "binexport", binary_name, "a")
+        so_b = stored_export(tmp_path / "binexport", binary_name, "b")
         # The stub mirrors what the real preflight now returns: the RESOLVED rows travel with
         # the result, so nothing downstream re-resolves the selector. A stub that omitted them
         # would let a signature change through unnoticed.
@@ -491,8 +470,8 @@ def _fake_preflight(tmp_path: Path):  # type: ignore[no-untyped-def]
             binary_b=binary_name,
             bin_a=row,
             bin_b=row,
-            so_a=so_a,
-            so_b=so_b,
+            export_a=so_a,
+            export_b=so_b,
             version_skew=False,
             warnings=(),
         )
@@ -515,7 +494,7 @@ def test_run_full_diff_continues_past_a_single_failure(
     monkeypatch.setattr(driver, "preflight", _fake_preflight(tmp_path))
 
     def _fake_compute(so_a, so_b, td, config):  # type: ignore[no-untyped-def]
-        if "libb" in so_a.name:
+        if "libb" in so_a.meta["name"]:
             raise DiffToolchainError("BinExport subprocess failed (rc=1) for libb")
         return driver.DiffArtifacts(so_a, so_b, td / "x.BinDiff")
 

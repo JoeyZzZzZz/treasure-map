@@ -230,37 +230,6 @@ _PINNED_FIXED = "a98234152679dbf1"
 # ── the export script, by the path an export took ───────────────────────────────────────────────
 
 
-def _scripts(tmp_path: Path) -> Path:
-    d = tmp_path / "ghidra"
-    d.mkdir()
-    for name in ("ExportBinExport.java", "FallbackBinExport2Builder.java"):
-        shutil.copyfile(_SCRIPTS / name, d / name)
-    return d
-
-
-def test_a_change_to_the_fallback_builder_moves_only_the_fallback_exports(tmp_path: Path) -> None:
-    """MUTATION (verified RED): hash both files whatever the path -> the extension export moves
-    too."""
-    d = _scripts(tmp_path)
-    ext, fb, unknown = (cv.export_code_hash_in(b, d) for b in ("extension", "fallback", None))
-    assert cv.export_code_hash_in("extension", _SCRIPTS) == cv.export_code_hash("extension")
-    f = d / "FallbackBinExport2Builder.java"
-    f.write_bytes(f.read_bytes() + b" ")
-    assert cv.export_code_hash_in("extension", d) == ext
-    assert cv.export_code_hash_in("fallback", d) != fb
-    assert cv.export_code_hash_in(None, d) != unknown
-
-
-def test_a_change_to_the_export_script_moves_every_export(tmp_path: Path) -> None:
-    """MUTATION (verified RED): leave the export script out of the extension path's files -> the
-    extension export does not move."""
-    d = _scripts(tmp_path)
-    before = {b: cv.export_code_hash_in(b, d) for b in ("extension", "fallback", None)}
-    f = d / "ExportBinExport.java"
-    f.write_bytes(f.read_bytes() + b" ")
-    assert all(cv.export_code_hash_in(b, d) != h for b, h in before.items())
-
-
 def test_the_entry_words_reader_is_no_diff_or_overlay_entry() -> None:
     """The entry-words reader (and patch_view / mcp_app, which compose it) is read on demand at
     view time and stored nowhere, so it is no entry of the diff or overlay stamp."""

@@ -1177,15 +1177,31 @@ public class ExportFunctions extends GhidraScript {
     }
 
     // ============ static string tables (detector A: {string, funcptr} dispatch tables) ============
-    // Scan initialized, non-executable data blocks (.rodata/.data) for a run of >= MIN_RUN records at
-    // a fixed 2*ptrsize stride where word[0] resolves to a .rodata string (the key) and word[ptrsize]
-    // resolves to a .text function entry (the handler). A DETERMINISTIC EDGE FACT — a static
-    // {key -> handler} dispatch table — never a reachability verdict; the reachability layer reads it
-    // as a key lead, the candidate stays unknown. ★ rather-miss-than-err: a table is collected ONLY
-    // when EVERY record in the run resolves BOTH pointers (a string AND a real function), so a random
-    // {ptr,ptr} array or a data/JSON fragment is never mistaken for a table. MVP recognizes
-    // ABSOLUTE-addressed 2-field tables only; GOT/PIC-relative, MIPS, and 3-field ({name,int,func})
-    // forms are NOT detected and are marked incomplete (missed honestly, never misreported).
+    // Scan every initialized block for a run of >= MIN_RUN records at a fixed 2*ptrsize stride where
+    // word[0] resolves to a string (the key) and word[ptrsize] to a FUNCTION ENTRY (the handler). A
+    // DETERMINISTIC EDGE FACT — a static {key -> handler} dispatch table — never a reachability
+    // verdict; the reachability layer reads it as a key lead, the candidate stays unknown.
+    //
+    // ★ Executable blocks are scanned too: an ELF stripped of section headers gets one block per
+    // PT_LOAD, so its read-only data — key strings and pointer arrays alike — sits inside the RX
+    // segment, and a data-blocks-only walk finds no table in such a binary at all.
+    //
+    // ★ rather-miss-than-err, held by two rules:
+    //   * the handler must be the entry of a function Ghidra defined (after the session's promotion
+    //     of unreferenced code). An aligned address in an executable block is NOT enough: in a
+    //     section-less binary the "next string" pointer of a {string, string} array is exactly that,
+    //     and accepting it turned string arrays into tables.
+    //   * a key in an executable block is read in two strengths. Strict: a defined string at the
+    //     pointer, or the tail of one (a suffix-merged key). Loose: any NUL-terminated printable run.
+    //     A loose key counts only when it is identifier-shaped (>= 2 bytes, a letter or '_' first,
+    //     then letters, digits, '_', '-' or '.') — a pointer that happens to land on one printable
+    //     byte and a NUL is not a key — or when the run around it is mostly strict (>= MIN_RUN
+    //     strict records and at least half of the run), which keeps a real table whole across its
+    //     few short keys. A key in a data block is read as before (strAtRodata).
+    // A table is a maximal run of kept records, >= MIN_RUN long. Only ABSOLUTE-addressed 2-field
+    // tables are recognized; GOT/PIC-relative and 3-field ({name,int,func}) forms are NOT detected,
+    // nor is a table whose handler Ghidra did not define, so every run is marked incomplete (missed
+    // honestly, never misreported).
     private static final int STRTBL_MIN_RUN = 4;             // >= 4 consecutive records = a real table
     private static final int STRTBL_MAX_ENTRIES = 4096;      // per-table cap (bounds a runaway walk)
     private static final long STRTBL_MAX_PROBES = 2_000_000L; // total aligned probes per binary
@@ -1201,7 +1217,7 @@ public class ExportFunctions extends GhidraScript {
         boolean capHit = false;   // a probe/entry cap truncated the walk (situation 3: a supported
                                   //   table beyond the cap is dropped and must NOT read as clean 0)
         for (MemoryBlock blk : mem.getBlocks()) {
-            if (!blk.isInitialized() || blk.isExecute()) continue;   // data only, never code
+            if (!blk.isInitialized()) continue;   // data AND code blocks (see the header above)
             Address end = blk.getEnd();
             Address a = blk.getStart();
             while (a != null && end.subtract(a) >= stride - 1) {
@@ -1226,21 +1242,25 @@ public class ExportFunctions extends GhidraScript {
                         && end.subtract(b) >= stride - 1 && tableRecord(b, ps, mem, fm) != null) {
                     capHit = true;
                 }
-                if (entries.size() >= STRTBL_MIN_RUN) {
-                    if (!firstT) tables.append(",");
-                    firstT = false;
-                    tables.append("{\"table_addr\":\"0x").append(Long.toHexString(a.getOffset()))
-                          .append("\",\"stride\":").append(stride)
-                          .append(",\"count\":").append(entries.size()).append(",\"entries\":[");
-                    for (int i = 0; i < entries.size(); i++) {
-                        String[] e = entries.get(i);
-                        if (i > 0) tables.append(",");
-                        tables.append("{\"key\":\"").append(esc(e[0]))
-                              .append("\",\"func_name\":\"").append(esc(e[1]))
-                              .append("\",\"func_addr\":\"").append(esc(e[2]))
-                              .append("\",\"func_kind\":\"").append(esc(e[3])).append("\"}");
+                // Which records of the run are kept (a data or strict key always; a loose key by its
+                // shape, or by a mostly-strict run); each maximal kept stretch >= MIN_RUN is a table.
+                boolean[] kept = keptRecords(entries);
+                boolean anyTable = false;
+                int i = 0;
+                while (i < entries.size()) {
+                    if (!kept[i]) { i++; continue; }
+                    int j = i;
+                    while (j < entries.size() && kept[j]) j++;
+                    Address at = safeAdd(a, (long) i * stride);
+                    if (j - i >= STRTBL_MIN_RUN && at != null) {
+                        anyTable = true;
+                        if (!firstT) tables.append(",");
+                        firstT = false;
+                        appendTable(tables, at, stride, entries.subList(i, j));
                     }
-                    tables.append("]}");
+                    i = j;
+                }
+                if (anyTable) {
                     a = b;   // resume past the whole run (b may be null at the block edge)
                 } else {
                     a = safeAdd(a, ps);   // too short to be a table: advance minimally
@@ -1248,11 +1268,108 @@ public class ExportFunctions extends GhidraScript {
             }
         }
         tables.append("]");
-        // The detector is structurally incomplete (MVP absolute-2-field only); say so on EVERY run so
-        // a cross-version table delta in an unhandled form reads as undetermined, not a real change.
+        // The detector is structurally incomplete (absolute 2-field tables with defined handlers
+        // only); say so on EVERY run so a cross-version table delta in an unhandled form reads as
+        // undetermined, not a real change.
         return "{\"tables\":" + tables + ",\"completeness\":{\"status\":\"incomplete\",\"reason\":"
-             + "\"got_relative_and_three_field_and_mips_not_detected\",\"scope\":"
+             + "\"" + STRTBL_INCOMPLETE_REASON + "\",\"scope\":"
              + "\"absolute_2field_only\",\"cap_hit\":" + capHit + "}}";
+    }
+
+    // What the detector does not see, as one token: tables addressed GOT/PIC-relative, 3-field
+    // records, and a table whose handler is not a function Ghidra defined (such a record breaks the
+    // run, and a fragment shorter than MIN_RUN is dropped).
+    private static final String STRTBL_INCOMPLETE_REASON =
+        "got_relative_and_three_field_not_detected_handler_must_be_defined_function";
+
+    private void appendTable(StringBuilder tables, Address at, long stride, List<String[]> entries) {
+        tables.append("{\"table_addr\":\"0x").append(Long.toHexString(at.getOffset()))
+              .append("\",\"stride\":").append(stride)
+              .append(",\"count\":").append(entries.size()).append(",\"entries\":[");
+        for (int i = 0; i < entries.size(); i++) {
+            String[] e = entries.get(i);
+            if (i > 0) tables.append(",");
+            tables.append("{\"key\":\"").append(esc(e[0]))
+                  .append("\",\"func_name\":\"").append(esc(e[1]))
+                  .append("\",\"func_addr\":\"").append(esc(e[2]))
+                  .append("\",\"func_kind\":\"").append(esc(e[3])).append("\"}");
+        }
+        tables.append("]}");
+    }
+
+    // The key strengths a record can carry (index 4 of a tableRecord): a data-block key read the way
+    // strAtRodata reads it, a strict key in an executable block, a loose one.
+    private static final String KEY_DATA = "data";
+    private static final String KEY_STRICT = "strict";
+    private static final String KEY_LOOSE = "loose";
+
+    // Which records of one run are kept: a data-block or strict key always; a loose key when it is
+    // identifier-shaped, or when the run holds >= MIN_RUN data-or-strict records and they are at
+    // least half of it (a real table with a few short keys stays whole).
+    private static boolean[] keptRecords(List<String[]> entries) {
+        int firm = 0;
+        for (String[] e : entries) if (!KEY_LOOSE.equals(e[4])) firm++;
+        boolean mostlyFirm = firm >= STRTBL_MIN_RUN && firm * 2 >= entries.size();
+        boolean[] kept = new boolean[entries.size()];
+        for (int i = 0; i < entries.size(); i++) {
+            String[] e = entries.get(i);
+            kept[i] = !KEY_LOOSE.equals(e[4]) || mostlyFirm || identifierShaped(e[0]);
+        }
+        return kept;
+    }
+
+    // >= 2 characters, an ASCII letter or '_' first, then ASCII letters, digits, '_', '-' or '.'.
+    private static boolean identifierShaped(String key) {
+        if (key == null || key.length() < 2) return false;
+        char c0 = key.charAt(0);
+        boolean first = (c0 >= 'A' && c0 <= 'Z') || (c0 >= 'a' && c0 <= 'z') || c0 == '_';
+        if (!first) return false;
+        for (int i = 1; i < key.length(); i++) {
+            char c = key.charAt(i);
+            boolean ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+                         || c == '_' || c == '-' || c == '.';
+            if (!ok) return false;
+        }
+        return true;
+    }
+
+    // The key at a table record's word[0] with its strength, or null when there is no key there. A
+    // data block is read by strAtRodata exactly as before; an executable block by the strict / loose
+    // reading described above the table walk.
+    private String[] tableKey(Address k, Memory mem) {
+        MemoryBlock kb = mem.getBlock(k);
+        if (kb == null || !kb.isInitialized()) return null;
+        if (!kb.isExecute()) {
+            String key = strAtRodata(k, mem);
+            return key == null || key.isEmpty() ? null : new String[]{ key, KEY_DATA };
+        }
+        Listing listing = currentProgram.getListing();
+        Data at = listing.getDefinedDataAt(k);
+        if (at != null && at.getValue() instanceof String) {
+            String v = (String) at.getValue();
+            return v.isEmpty() ? null : new String[]{ v, KEY_STRICT };
+        }
+        String run = nulTerminatedPrintable(k, mem);
+        if (run == null) return null;
+        Data around = listing.getDataContaining(k);
+        boolean inString = around != null && around.getValue() instanceof String;
+        return new String[]{ run, inString ? KEY_STRICT : KEY_LOOSE };
+    }
+
+    // A printable run ended by a NUL within STR_TEXT_LIMIT bytes, or null.
+    private String nulTerminatedPrintable(Address a, Memory mem) {
+        StringBuilder sb = new StringBuilder();
+        try {
+            for (int i = 0; i < STR_TEXT_LIMIT; i++) {
+                byte b = mem.getByte(a.add(i));
+                if (b == 0) return sb.length() > 0 ? sb.toString() : null;
+                if (b < 0x20 || b > 0x7e) return null;
+                sb.append((char) b);
+            }
+        } catch (Exception e) {
+            return null;
+        }
+        return null;   // no NUL within the limit: not a key
     }
 
     // ============ raw segment bytes: a slicing substrate, not a reading ============
@@ -1339,22 +1456,24 @@ public class ExportFunctions extends GhidraScript {
         return "{\"blocks\":" + blocks + ",\"cap_hit\":" + capHit + "}";
     }
 
-    // One {string_ptr, func_ptr} record at address a -> {key, func_name, func_addr, func_kind}, or
-    // null when either pointer does not resolve. The key ptr is read + resolved FIRST (the cheap,
-    // usually-failing test) so the common non-record probe costs one read, not a function lookup.
+    // One {string_ptr, func_ptr} record at address a -> {key, func_name, func_addr, func_kind,
+    // key strength}, or null when either pointer does not resolve. The key ptr is read + resolved
+    // FIRST (the cheap, usually-failing test) so the common non-record probe costs one read, not a
+    // function lookup.
     private String[] tableRecord(Address a, int ps, Memory mem, FunctionManager fm) {
         long p0;
         try { p0 = readPtr(a, ps, mem); } catch (Exception e) { return null; }
         if (p0 == 0) return null;
-        String key;
-        try { key = strAtRodata(toAddr(p0), mem); } catch (Exception e) { key = null; }
-        if (key == null || key.isEmpty()) return null;
+        String[] key;
+        try { key = tableKey(toAddr(p0), mem); } catch (Exception e) { key = null; }
+        if (key == null) return null;
         long p1;
         try { p1 = readPtr(a.add(ps), ps, mem); } catch (Exception e) { return null; }
         if (p1 == 0) return null;
-        String[] fn = funcAtPtr(toAddr(p1), fm, mem);
+        String[] fn;
+        try { fn = funcAtPtr(toAddr(p1), fm); } catch (Exception e) { fn = null; }
         if (fn == null) return null;
-        return new String[]{ key, fn[0], fn[1], fn[2] };
+        return new String[]{ key[0], fn[0], fn[1], fn[2], key[1] };
     }
 
     private long readPtr(Address a, int ps, Memory mem) throws Exception {
@@ -1362,46 +1481,26 @@ public class ExportFunctions extends GhidraScript {
         return mem.getInt(a) & 0xFFFFFFFFL;
     }
 
-    // Resolve a data pointer to a {name, entry-addr, kind} handler anchor, or null when it is not a
-    // plausible .text function ENTRY — so a {string_ptr, non-handler-ptr} pair is rejected.
+    // Resolve a data pointer to a {name, entry-addr, kind} handler anchor, or null when it is not the
+    // entry of a function Ghidra defined — so a {string_ptr, non-handler-ptr} pair is rejected.
     //
-    // ★ The predicate is "points at a function ENTRY IN .text", NOT "Ghidra already made a Function
-    // object here". A dispatch table is very often the ONLY reference to its handler, so nothing
-    // calls it directly and auto-analysis never defines it. Requiring a defined Function silently
-    // TERMINATED a table at every such slot, cutting one real table into fragments and dropping any
-    // fragment shorter than the run minimum — measured on firmware: of one 32-entry handler
-    // table (all 32 strictly contiguous, every word0 a .rodata string, every word1 inside .text),
-    // only 17 handlers were Ghidra-defined, so the table shattered and even DEFINED handlers were
-    // lost when their undefined neighbours broke the run around them.
-    //
-    // rather-miss-than-err is preserved by keeping the entry test strict: the target must sit in an
-    // initialized EXECUTABLE block (a .rodata/.data pointer is still rejected — that kills {str,str}
-    // and {ptr,ptr} arrays), be instruction-aligned, and not point into the middle of an existing
-    // function's body. Combined with the >= MIN_RUN consecutive-slot requirement, a false table
-    // stays vanishingly unlikely.
-    private String[] funcAtPtr(Address to, FunctionManager fm, Memory mem) {
+    // ★ A defined function, and nothing weaker. An earlier version also took any instruction-aligned
+    // address in an executable block that was not mid-body, because a dispatch table is often its
+    // handler's only reference and auto-analysis left the handler undefined. The session now
+    // promotes such unreferenced code to functions before this pass runs, and the weaker test was
+    // measured to accept the "next string" pointer of a {string, string} array in a section-less
+    // binary, where read-only data sits in the executable segment — string arrays read as tables
+    // by the hundred. A handler Ghidra still did not define breaks the run.
+    private String[] funcAtPtr(Address to, FunctionManager fm) {
         if (to == null) return null;
         Function f = fm.getFunctionAt(to);
-        if (f != null) {
-            if (f.isThunk()) {
-                Function th = f.getThunkedFunction(true);
-                if (th != null)
-                    return new String[]{ th.getName(), addrHex(th.getEntryPoint()), "thunk" };
-            }
-            return new String[]{ f.getName(), addrHex(f.getEntryPoint()), "direct" };
+        if (f == null) return null;
+        if (f.isThunk()) {
+            Function th = f.getThunkedFunction(true);
+            if (th != null)
+                return new String[]{ th.getName(), addrHex(th.getEntryPoint()), "thunk" };
         }
-        // No Function object here. Accept it only as a plausible, undefined .text entry.
-        MemoryBlock blk = mem.getBlock(to);
-        if (blk == null || !blk.isInitialized() || !blk.isExecute()) return null;  // not code
-        int align = 1;
-        try { align = currentProgram.getLanguage().getInstructionAlignment(); } catch (Exception ignore) {}
-        if (align > 1 && (to.getOffset() % align) != 0) return null;   // not an instruction boundary
-        Function host = fm.getFunctionContaining(to);
-        if (host != null && !to.equals(host.getEntryPoint())) return null;  // mid-body, not an entry
-        // Name it the way Ghidra names an undefined function (address-derived, so the anchor is the
-        // address either way); kind says plainly that no Function object backs it.
-        return new String[]{ String.format("FUN_%08x", to.getOffset()), addrHex(to),
-                             "undefined_text" };
+        return new String[]{ f.getName(), addrHex(f.getEntryPoint()), "direct" };
     }
 
     private String addrHex(Address a) {
@@ -2339,6 +2438,269 @@ public class ExportFunctions extends GhidraScript {
         return "0x" + Long.toHexString(op.getSeqnum().getTarget().getOffset());
     }
 
+    // The decompile limit of the main loop, and of the one retry a timed-out function gets after it.
+    private static final int DECOMPILE_TIMEOUT_S = 20;
+    private static final int DECOMPILE_RETRY_TIMEOUT_S = 120;
+    private static final String DECOMPILE_OK = "ok";
+    private static final String DECOMPILE_TIMEOUT = "timeout";
+    private static final String DECOMPILE_SKIPPED_MICRO = "skipped_micro";
+
+    /** The retry budget the driver set (TMAP_DECOMPILE_RETRY_BUDGET_S), 0 when unset or bad. */
+    private static long retryBudgetSeconds() {
+        String raw = System.getenv("TMAP_DECOMPILE_RETRY_BUDGET_S");
+        if (raw == null) return 0;
+        try {
+            return Math.max(0, Long.parseLong(raw.trim()));
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+    }
+
+    /** The first line of a message, at most 200 characters ("unknown" when there is none). */
+    private static String firstLine(String msg) {
+        if (msg == null || msg.trim().isEmpty()) return "unknown";
+        String line = msg.trim().split("\\R", 2)[0];
+        return line.length() > 200 ? line.substring(0, 200) : line;
+    }
+
+    /**
+     * One function's record for the "functions" array, decompiled with {@code timeoutSec}. Its
+     * decompile outcome is put in {@code statusOut[0]} (ok / timeout / error:<why> / skipped_micro),
+     * so the caller can retry a timed-out function once at a larger limit.
+     */
+    private String exportFunction(Function func, DecompInterface decomp, FunctionManager fm,
+            Set<String> knownNames, int timeoutSec, boolean retried, String[] statusOut) {
+        String funcName  = func.getName();
+        String funcAddr  = func.getEntryPoint().toString();
+        long   funcSize  = func.getBody().getNumAddresses();
+        // NOTE: this export deliberately carries no is_exported flag. Whether a function is an
+        // ELF export is read from the binary's dynamic symbol table at ingest time (see
+        // analyze/elf_exports.py). isGlobal() answers a SYMBOL NAMESPACE question instead,
+        // which is not the same fact and measured as a constant 0 on every firmware scanned.
+
+        // Skip micro-functions (< 10 bytes): trampolines, alignment stubs, etc.
+        // Not worth decompiling; they carry no logic and slow down the batch.
+        String pseudocode = "";
+        HighFunction hf = null;   // Varnode/def-use + block graph from the SAME decompile (design B)
+        DecompileResults drKeep = null;   // D4 bridge: kept so the C markup can be walked below
+        // What the decompile of this function came to, as a fact: ok / timeout / error:<why> /
+        // skipped_micro. An empty pseudocode alone cannot tell those apart.
+        String decompileStatus;
+        if (funcSize < 10) {
+            // Leave pseudocode empty — ghidra_ingest handles null pseudocode fine.
+            decompileStatus = DECOMPILE_SKIPPED_MICRO;
+        } else try {
+            DecompileResults dr = decomp.decompileFunction(func, timeoutSec, monitor);
+            if (dr == null) {
+                decompileStatus = "error:no_result";
+            } else if (dr.decompileCompleted()) {
+                DecompiledFunction df = dr.getDecompiledFunction();
+                if (df != null) {
+                    pseudocode = df.getC();
+                }
+                hf = dr.getHighFunction();   // reused, not a second decompile
+                drKeep = dr;                 // D4 bridge: same decompile, no second pass
+                decompileStatus = df != null ? DECOMPILE_OK : "error:no_decompiled_function";
+            } else if (dr.isTimedOut()) {
+                decompileStatus = DECOMPILE_TIMEOUT;
+            } else {
+                decompileStatus = "error:" + firstLine(
+                    dr.isCancelled() ? "cancelled" : dr.getErrorMessage());
+            }
+        } catch (Exception e) {
+            pseudocode = "/* decompile_error: " + e.getMessage() + " */";
+            decompileStatus = "error:" + firstLine(e.getMessage());
+        }  // end if (funcSize >= 10)
+        statusOut[0] = decompileStatus;
+
+        // Collect callee edges. Broaden beyond "CALL ref whose target is a Function AT that
+        // address": PIC intra-.so calls go through PLT stubs / GOT slots, so the ref target is a
+        // thunk/pointer/label, not the callee body → old getFunctionAt() returned null → the
+        // edge was dropped (observed: an exported wrapper's callees came back empty while a
+        // shared library showed a far higher empty-callees rate than its main daemon). Resolve
+        // the target through: Function → thunked function → GOT pointer → symbol. Genuinely
+        // register-indirect / runtime-computed targets stay omitted (honest: no static target).
+        // ReferenceManager is used (not getCalledFunctions()) for OSGi compatibility.
+        StringBuilder calleesArr = new StringBuilder("[");   // names only — existing consumer format, unchanged
+        StringBuilder edgesArr   = new StringBuilder("[");   // {name,kind} — staged for optional call_edges, unemitted for now
+        boolean firstCallee = true;
+        int calleeCount = 0;
+        // CALLEE_LIMIT caps the callee list (was 200 -> 300; dispatchers fan out wide). When it
+        // IS hit the extra edges are NOT silently dropped: callees_truncated flags the record so
+        // get_callees / get_xrefs never read a clipped callee (or synthesized-caller) set as the
+        // complete call graph — the same silent-drop red line as strings/readers/data-gap.
+        final int CALLEE_LIMIT = 300;
+        boolean calleesTruncated = false;
+        Set<String> seenCallees = new HashSet<>();   // shared across both callee data sources
+        try {
+            ReferenceManager refMgr = currentProgram.getReferenceManager();
+            SymbolTable       symtab = currentProgram.getSymbolTable();
+            Listing           listing = currentProgram.getListing();
+            InstructionIterator instrIter = listing.getInstructions(func.getBody(), true);
+            scanRefs:
+            while (instrIter.hasNext()) {
+                Instruction instr = instrIter.next();
+                Reference[] refs = refMgr.getReferencesFrom(instr.getAddress());
+                for (Reference ref : refs) {
+                    RefType rt = ref.getReferenceType();
+                    if (!rt.isCall()) continue;                  // isCall() already includes COMPUTED_CALL
+                    String[] nk = resolveCallee(ref.getToAddress(), rt, fm, symtab, listing);
+                    if (nk == null) continue;                    // unresolved indirect — honest omission
+                    String calleeName = nk[0];
+                    if (calleeName == null || calleeName.isEmpty()) continue;
+                    if (calleeName.equals(funcName)) continue;    // drop self-name (self-ref noise)
+                    if (!seenCallees.add(calleeName)) continue;   // dedupe by name
+                    if (calleeCount >= CALLEE_LIMIT) { calleesTruncated = true; break scanRefs; }
+                    if (!firstCallee) { calleesArr.append(","); edgesArr.append(","); }
+                    firstCallee = false;
+                    calleesArr.append("\"").append(esc(calleeName)).append("\"");
+                    edgesArr.append("{\"name\":\"").append(esc(calleeName))
+                            .append("\",\"kind\":\"").append(esc(nk[1])).append("\"}");
+                    calleeCount++;
+                }
+            }
+        } catch (Exception ignored) {}
+
+        // Second data source: recover callee names from the decompiled text itself. PIC
+        // intra-.so calls via PLT/GOT often carry NO call reference, so the reference scan
+        // above misses them even though the pseudocode plainly shows name(...) calls. Scan for
+        // `identifier(` and keep only tokens that are known function / import names (the
+        // intersection is the filter). Merge-deduped into the shared seenCallees set, so a name
+        // already found via reference is never repeated. Boundary: a failed decompile leaves no
+        // usable text, and function-pointer calls `(*p)(...)` expose no name — both honestly
+        // omitted here.
+        try {
+            if (pseudocode != null && !pseudocode.isEmpty()
+                    && !pseudocode.startsWith("/* decompile_error")) {
+                Matcher m = CALL_NAME.matcher(pseudocode);
+                scanText:
+                while (m.find()) {
+                    String cand = m.group(1);
+                    if (cand == null || cand.isEmpty()) continue;
+                    if (C_KEYWORDS.contains(cand)) continue;
+                    if (!knownNames.contains(cand)) continue;   // the real filter
+                    if (cand.equals(funcName)) continue;         // drop self-name (self-ref noise)
+                    if (!seenCallees.add(cand)) continue;        // dedupe vs the reference source
+                    if (calleeCount >= CALLEE_LIMIT) { calleesTruncated = true; break scanText; }
+                    if (!firstCallee) { calleesArr.append(","); edgesArr.append(","); }
+                    firstCallee = false;
+                    calleesArr.append("\"").append(esc(cand)).append("\"");
+                    edgesArr.append("{\"name\":\"").append(esc(cand))
+                            .append("\",\"kind\":\"pcode\"}");
+                    calleeCount++;
+                }
+            }
+        } catch (Exception ignored) {}
+        calleesArr.append("]");
+        edgesArr.append("]");
+
+        // Which additive detectors threw on this function. A detector that FAILED returns its
+        // empty value just like one that genuinely found nothing; without this list a reader
+        // cannot tell "looked, found none" from "the look crashed", and a crash would read as a
+        // clean result. Each catch below names itself here.
+        List<String> detectorErrors = new ArrayList<>();
+
+        // sink_arg_provenance: Ghidra def-use fact for each command/format sink's key argument.
+        // Reuses the decompile above (hf); empty [] when unavailable or no sink present. Never
+        // throws out of the loop — provenance is additive evidence, not a gate.
+        String sinkProv = "[]";
+        try {
+            if (hf != null) sinkProv = buildSinkProvenance(hf);
+        } catch (Throwable ignore) {
+            sinkProv = "[]";
+            detectorErrors.add("sink_provenance");
+        }
+
+        // per-function nvram read/write ops. Additive evidence, never a gate.
+        String nvramOps = "[]";
+        try {
+            if (hf != null) nvramOps = buildNvramOps(hf);
+        } catch (Throwable ignore) {
+            nvramOps = "[]";
+            detectorErrors.add("nvram_ops");
+        }
+
+        // detector B: string-keyed edges (strcmp-ladder dispatch). Additive, isolated fact
+        // enumeration; a failure here just yields no edges, never breaking the scan.
+        String strKeyedEdges = "{\"edges\":[]}";
+        try {
+            if (hf != null) strKeyedEdges = buildStringKeyedEdges(hf);
+        } catch (Throwable ignore) {
+            strKeyedEdges = "{\"edges\":[]}";
+            detectorErrors.add("string_keyed_edges");
+        }
+
+        // address-taken: who references THIS function's entry as data/pointer (non-call, non-flow)
+        // — a static-table slot or a literal-pool `ldr =F`. Reference-driven (no decompile needed),
+        // additive and isolated; a failure just yields no takes, never breaking the scan.
+        String addressTaken = "{\"edges\":[],\"truncated\":false}";
+        try {
+            addressTaken = buildAddressTaken(func);
+        } catch (Throwable ignore) {
+            addressTaken = "{\"edges\":[],\"truncated\":false}";
+            detectorErrors.add("address_taken");
+        }
+
+        // thin-nvram-wrapper flag + its callers' resolved literal keys. Additive and
+        // isolated — a wrapper edge is recovered cross-function at hunt time; a failure here
+        // just yields no wrapper data, never breaking the scan (honesty > coverage).
+        String nvramWrapper = "";
+        String wrapperCallArgs = ",\"wrapper_call_args\":[]";
+        try {
+            if (hf != null) {
+                nvramWrapper = buildNvramWrapper(hf);
+                wrapperCallArgs = buildWrapperCallArgs(hf, knownNames);
+            }
+        } catch (Throwable ignore) {
+            nvramWrapper = "";
+            wrapperCallArgs = ",\"wrapper_call_args\":[]";
+        }
+
+        // D4 bridge payloads: per-call name tokens + real body ranges (see build* below).
+        String callTokens = "[]";
+        try { if (drKeep != null) callTokens = buildCallTokens(func, drKeep); }
+        catch (Throwable ignore) { callTokens = "[]"; }
+        String bodyRanges = "[]";
+        try { bodyRanges = buildBodyRanges(func); }
+        catch (Throwable ignore) { bodyRanges = "[]"; detectorErrors.add("body_ranges"); }
+
+        // Ghidra's listing for this function (the get_disassembly source), deflated+Base64.
+        String listing = ",\"listing\":null";
+        try { listing = buildListing(func); }
+        catch (Throwable ignore) { listing = ",\"listing\":null"; detectorErrors.add("listing"); }
+
+        StringBuilder deArr = new StringBuilder("[");
+        for (int di = 0; di < detectorErrors.size(); di++) {
+            if (di > 0) deArr.append(",");
+            deArr.append("\"").append(esc(detectorErrors.get(di))).append("\"");
+        }
+        deArr.append("]");
+
+        StringBuilder obj = new StringBuilder();
+        obj.append("{")
+                 .append("\"name\":")        .append("\"").append(esc(funcName))  .append("\",")
+                 .append("\"address\":")     .append("\"").append(esc(funcAddr))  .append("\",")
+                 .append("\"size\":")        .append(funcSize).append(",")
+                 .append("\"callees\":")     .append(calleesArr).append(",")
+                 .append("\"callees_truncated\":").append(calleesTruncated).append(",")
+                 .append("\"sink_provenance\":").append(sinkProv).append(",")
+                 .append("\"nvram_ops\":")   .append(nvramOps)
+                 .append(nvramWrapper)       // ",\"nvram_wrapper\":{...}" or ""
+                 .append(wrapperCallArgs)    // ",\"wrapper_call_args\":[...]"
+                 .append(",")
+                 .append("\"string_keyed_edges\":").append(strKeyedEdges).append(",")
+                 .append("\"address_taken\":").append(addressTaken).append(",")
+                 .append("\"call_tokens\":").append(callTokens).append(",")
+                 .append("\"body_ranges\":").append(bodyRanges)
+                 .append(listing)             // ",\"listing\":{...}" or ",\"listing\":null"
+                 .append(",\"detector_errors\":").append(deArr).append(",")
+                 .append("\"decompile_status\":\"").append(esc(decompileStatus)).append("\",")
+                 .append("\"decompile_retried\":").append(retried).append(",")
+                 .append("\"pseudocode\":")  .append("\"").append(esc(pseudocode)).append("\"")
+                 .append("}");
+        return obj.toString();
+    }
+
     @Override
     public void run() throws Exception {
 
@@ -2405,8 +2767,6 @@ public class ExportFunctions extends GhidraScript {
         ExternalManager  extMgr = currentProgram.getExternalManager();
 
         // 1. Functions + pseudocode
-        StringBuilder funcsJson = new StringBuilder("[");
-        boolean firstFunc = true;
         int funcCount = 0;
 
         // Name universe for the pseudocode-derived callee source: every defined function name in
@@ -2432,228 +2792,48 @@ public class ExportFunctions extends GhidraScript {
         // the lower address.
         buildCmdWrapperRegistry(decomp, fm);
 
+        List<String> entries = new ArrayList<>();       // one record per exported function
+        List<Function> entryFunctions = new ArrayList<>();
+        List<Integer> timedOut = new ArrayList<>();     // indices whose decompile timed out
         for (Function func : fm.getFunctions(true)) {
             if (monitor.isCancelled()) break;
 
             // Skip PLT thunks and external symbols (no real code body)
             if (func.isThunk() || func.isExternal()) continue;
 
-            String funcName  = func.getName();
-            String funcAddr  = func.getEntryPoint().toString();
-            long   funcSize  = func.getBody().getNumAddresses();
-            // NOTE: this export deliberately carries no is_exported flag. Whether a function is an
-            // ELF export is read from the binary's dynamic symbol table at ingest time (see
-            // analyze/elf_exports.py). isGlobal() answers a SYMBOL NAMESPACE question instead,
-            // which is not the same fact and measured as a constant 0 on every firmware scanned.
-
-            // Skip micro-functions (< 10 bytes): trampolines, alignment stubs, etc.
-            // Not worth decompiling; they carry no logic and slow down the batch.
-            String pseudocode = "";
-            HighFunction hf = null;   // Varnode/def-use + block graph from the SAME decompile (design B)
-            DecompileResults drKeep = null;   // D4 bridge: kept so the C markup can be walked below
-            if (funcSize < 10) {
-                // Leave pseudocode empty — ghidra_ingest handles null pseudocode fine.
-            } else try {
-                DecompileResults dr = decomp.decompileFunction(func, 20, monitor);
-                if (dr != null && dr.decompileCompleted()) {
-                    DecompiledFunction df = dr.getDecompiledFunction();
-                    if (df != null) {
-                        pseudocode = df.getC();
-                    }
-                    hf = dr.getHighFunction();   // reused, not a second decompile
-                    drKeep = dr;                 // D4 bridge: same decompile, no second pass
-                }
-            } catch (Exception e) {
-                pseudocode = "/* decompile_error: " + e.getMessage() + " */";
-            }  // end if (funcSize >= 10)
-
-            // Collect callee edges. Broaden beyond "CALL ref whose target is a Function AT that
-            // address": PIC intra-.so calls go through PLT stubs / GOT slots, so the ref target is a
-            // thunk/pointer/label, not the callee body → old getFunctionAt() returned null → the
-            // edge was dropped (observed: an exported wrapper's callees came back empty while a
-            // shared library showed a far higher empty-callees rate than its main daemon). Resolve
-            // the target through: Function → thunked function → GOT pointer → symbol. Genuinely
-            // register-indirect / runtime-computed targets stay omitted (honest: no static target).
-            // ReferenceManager is used (not getCalledFunctions()) for OSGi compatibility.
-            StringBuilder calleesArr = new StringBuilder("[");   // names only — existing consumer format, unchanged
-            StringBuilder edgesArr   = new StringBuilder("[");   // {name,kind} — staged for optional call_edges, unemitted for now
-            boolean firstCallee = true;
-            int calleeCount = 0;
-            // CALLEE_LIMIT caps the callee list (was 200 -> 300; dispatchers fan out wide). When it
-            // IS hit the extra edges are NOT silently dropped: callees_truncated flags the record so
-            // get_callees / get_xrefs never read a clipped callee (or synthesized-caller) set as the
-            // complete call graph — the same silent-drop red line as strings/readers/data-gap.
-            final int CALLEE_LIMIT = 300;
-            boolean calleesTruncated = false;
-            Set<String> seenCallees = new HashSet<>();   // shared across both callee data sources
-            try {
-                ReferenceManager refMgr = currentProgram.getReferenceManager();
-                SymbolTable       symtab = currentProgram.getSymbolTable();
-                Listing           listing = currentProgram.getListing();
-                InstructionIterator instrIter = listing.getInstructions(func.getBody(), true);
-                scanRefs:
-                while (instrIter.hasNext()) {
-                    Instruction instr = instrIter.next();
-                    Reference[] refs = refMgr.getReferencesFrom(instr.getAddress());
-                    for (Reference ref : refs) {
-                        RefType rt = ref.getReferenceType();
-                        if (!rt.isCall()) continue;                  // isCall() already includes COMPUTED_CALL
-                        String[] nk = resolveCallee(ref.getToAddress(), rt, fm, symtab, listing);
-                        if (nk == null) continue;                    // unresolved indirect — honest omission
-                        String calleeName = nk[0];
-                        if (calleeName == null || calleeName.isEmpty()) continue;
-                        if (calleeName.equals(funcName)) continue;    // drop self-name (self-ref noise)
-                        if (!seenCallees.add(calleeName)) continue;   // dedupe by name
-                        if (calleeCount >= CALLEE_LIMIT) { calleesTruncated = true; break scanRefs; }
-                        if (!firstCallee) { calleesArr.append(","); edgesArr.append(","); }
-                        firstCallee = false;
-                        calleesArr.append("\"").append(esc(calleeName)).append("\"");
-                        edgesArr.append("{\"name\":\"").append(esc(calleeName))
-                                .append("\",\"kind\":\"").append(esc(nk[1])).append("\"}");
-                        calleeCount++;
-                    }
-                }
-            } catch (Exception ignored) {}
-
-            // Second data source: recover callee names from the decompiled text itself. PIC
-            // intra-.so calls via PLT/GOT often carry NO call reference, so the reference scan
-            // above misses them even though the pseudocode plainly shows name(...) calls. Scan for
-            // `identifier(` and keep only tokens that are known function / import names (the
-            // intersection is the filter). Merge-deduped into the shared seenCallees set, so a name
-            // already found via reference is never repeated. Boundary: a failed decompile leaves no
-            // usable text, and function-pointer calls `(*p)(...)` expose no name — both honestly
-            // omitted here.
-            try {
-                if (pseudocode != null && !pseudocode.isEmpty()
-                        && !pseudocode.startsWith("/* decompile_error")) {
-                    Matcher m = CALL_NAME.matcher(pseudocode);
-                    scanText:
-                    while (m.find()) {
-                        String cand = m.group(1);
-                        if (cand == null || cand.isEmpty()) continue;
-                        if (C_KEYWORDS.contains(cand)) continue;
-                        if (!knownNames.contains(cand)) continue;   // the real filter
-                        if (cand.equals(funcName)) continue;         // drop self-name (self-ref noise)
-                        if (!seenCallees.add(cand)) continue;        // dedupe vs the reference source
-                        if (calleeCount >= CALLEE_LIMIT) { calleesTruncated = true; break scanText; }
-                        if (!firstCallee) { calleesArr.append(","); edgesArr.append(","); }
-                        firstCallee = false;
-                        calleesArr.append("\"").append(esc(cand)).append("\"");
-                        edgesArr.append("{\"name\":\"").append(esc(cand))
-                                .append("\",\"kind\":\"pcode\"}");
-                        calleeCount++;
-                    }
-                }
-            } catch (Exception ignored) {}
-            calleesArr.append("]");
-            edgesArr.append("]");
-
-            // Which additive detectors threw on this function. A detector that FAILED returns its
-            // empty value just like one that genuinely found nothing; without this list a reader
-            // cannot tell "looked, found none" from "the look crashed", and a crash would read as a
-            // clean result. Each catch below names itself here.
-            List<String> detectorErrors = new ArrayList<>();
-
-            // sink_arg_provenance: Ghidra def-use fact for each command/format sink's key argument.
-            // Reuses the decompile above (hf); empty [] when unavailable or no sink present. Never
-            // throws out of the loop — provenance is additive evidence, not a gate.
-            String sinkProv = "[]";
-            try {
-                if (hf != null) sinkProv = buildSinkProvenance(hf);
-            } catch (Throwable ignore) {
-                sinkProv = "[]";
-                detectorErrors.add("sink_provenance");
-            }
-
-            // per-function nvram read/write ops. Additive evidence, never a gate.
-            String nvramOps = "[]";
-            try {
-                if (hf != null) nvramOps = buildNvramOps(hf);
-            } catch (Throwable ignore) {
-                nvramOps = "[]";
-                detectorErrors.add("nvram_ops");
-            }
-
-            // detector B: string-keyed edges (strcmp-ladder dispatch). Additive, isolated fact
-            // enumeration; a failure here just yields no edges, never breaking the scan.
-            String strKeyedEdges = "{\"edges\":[]}";
-            try {
-                if (hf != null) strKeyedEdges = buildStringKeyedEdges(hf);
-            } catch (Throwable ignore) {
-                strKeyedEdges = "{\"edges\":[]}";
-                detectorErrors.add("string_keyed_edges");
-            }
-
-            // address-taken: who references THIS function's entry as data/pointer (non-call, non-flow)
-            // — a static-table slot or a literal-pool `ldr =F`. Reference-driven (no decompile needed),
-            // additive and isolated; a failure just yields no takes, never breaking the scan.
-            String addressTaken = "{\"edges\":[],\"truncated\":false}";
-            try {
-                addressTaken = buildAddressTaken(func);
-            } catch (Throwable ignore) {
-                addressTaken = "{\"edges\":[],\"truncated\":false}";
-                detectorErrors.add("address_taken");
-            }
-
-            // thin-nvram-wrapper flag + its callers' resolved literal keys. Additive and
-            // isolated — a wrapper edge is recovered cross-function at hunt time; a failure here
-            // just yields no wrapper data, never breaking the scan (honesty > coverage).
-            String nvramWrapper = "";
-            String wrapperCallArgs = ",\"wrapper_call_args\":[]";
-            try {
-                if (hf != null) {
-                    nvramWrapper = buildNvramWrapper(hf);
-                    wrapperCallArgs = buildWrapperCallArgs(hf, knownNames);
-                }
-            } catch (Throwable ignore) {
-                nvramWrapper = "";
-                wrapperCallArgs = ",\"wrapper_call_args\":[]";
-            }
-
-            // D4 bridge payloads: per-call name tokens + real body ranges (see build* below).
-            String callTokens = "[]";
-            try { if (drKeep != null) callTokens = buildCallTokens(func, drKeep); }
-            catch (Throwable ignore) { callTokens = "[]"; }
-            String bodyRanges = "[]";
-            try { bodyRanges = buildBodyRanges(func); }
-            catch (Throwable ignore) { bodyRanges = "[]"; detectorErrors.add("body_ranges"); }
-
-            // Ghidra's listing for this function (the get_disassembly source), deflated+Base64.
-            String listing = ",\"listing\":null";
-            try { listing = buildListing(func); }
-            catch (Throwable ignore) { listing = ",\"listing\":null"; detectorErrors.add("listing"); }
-
-            StringBuilder deArr = new StringBuilder("[");
-            for (int di = 0; di < detectorErrors.size(); di++) {
-                if (di > 0) deArr.append(",");
-                deArr.append("\"").append(esc(detectorErrors.get(di))).append("\"");
-            }
-            deArr.append("]");
-
-            if (!firstFunc) funcsJson.append(",");
-            firstFunc = false;
-            funcsJson.append("{")
-                     .append("\"name\":")        .append("\"").append(esc(funcName))  .append("\",")
-                     .append("\"address\":")     .append("\"").append(esc(funcAddr))  .append("\",")
-                     .append("\"size\":")        .append(funcSize).append(",")
-                     .append("\"callees\":")     .append(calleesArr).append(",")
-                     .append("\"callees_truncated\":").append(calleesTruncated).append(",")
-                     .append("\"sink_provenance\":").append(sinkProv).append(",")
-                     .append("\"nvram_ops\":")   .append(nvramOps)
-                     .append(nvramWrapper)       // ",\"nvram_wrapper\":{...}" or ""
-                     .append(wrapperCallArgs)    // ",\"wrapper_call_args\":[...]"
-                     .append(",")
-                     .append("\"string_keyed_edges\":").append(strKeyedEdges).append(",")
-                     .append("\"address_taken\":").append(addressTaken).append(",")
-                     .append("\"call_tokens\":").append(callTokens).append(",")
-                     .append("\"body_ranges\":").append(bodyRanges)
-                     .append(listing)             // ",\"listing\":{...}" or ",\"listing\":null"
-                     .append(",\"detector_errors\":").append(deArr).append(",")
-                     .append("\"pseudocode\":")  .append("\"").append(esc(pseudocode)).append("\"")
-                     .append("}");
+            String[] status = new String[1];
+            entries.add(exportFunction(func, decomp, fm, knownNames, DECOMPILE_TIMEOUT_S, false,
+                    status));
+            if (DECOMPILE_TIMEOUT.equals(status[0])) timedOut.add(entries.size() - 1);
+            entryFunctions.add(func);
             funcCount++;
         }
-        funcsJson.append("]");
+        // A decompile that timed out in the loop is retried once here, at a larger limit and one
+        // at a time: under load a function can need more than the loop's limit, and its empty
+        // pseudocode would otherwise silently take its sink calls and provenance with it. Still
+        // timing out, it is recorded as timeout (retried) — never as an empty function.
+        // The retries share one budget (TMAP_DECOMPILE_RETRY_BUDGET_S, set by the driver from the
+        // session's wall clock): past it, the rest stay timeout, not retried — retrying past the
+        // wall clock would lose the whole extraction instead of a few functions' pseudocode.
+        long retryBudgetMs = retryBudgetSeconds() * 1000L;
+        long retryStart = System.currentTimeMillis();
+        int recovered = 0;
+        int retried = 0;
+        for (int k : timedOut) {
+            if (monitor.isCancelled()) break;
+            long left = retryBudgetMs - (System.currentTimeMillis() - retryStart);
+            if (left < 1000L) break;
+            int limit = (int) Math.min(DECOMPILE_RETRY_TIMEOUT_S, left / 1000L);
+            String[] status = new String[1];
+            entries.set(k, exportFunction(entryFunctions.get(k), decomp, fm, knownNames,
+                    limit, true, status));
+            retried++;
+            if (DECOMPILE_OK.equals(status[0])) recovered++;
+        }
+        if (!timedOut.isEmpty()) {
+            println("[ExportFunctions] decompile timeouts: " + timedOut.size() + ", retried: "
+                    + retried + ", recovered: " + recovered);
+        }
         println("[ExportFunctions] functions: " + funcCount);
 
         // 2. Import symbols. Enumerate ALL external symbols via the SymbolTable, not only the
@@ -2869,7 +3049,13 @@ public class ExportFunctions extends GhidraScript {
             // Which stub table this run actually read (content hash, or "none" when none was handed
             // in). The driver and the ingest compare it with the table they meant for this binary.
             pw.print("\"stub_marker\":\"" + esc(stubMarker) + "\",");
-            pw.print("\"functions\":"  + funcsJson   + ",");
+            // Written record by record: no second copy of the array is built.
+            pw.print("\"functions\":[");
+            for (int k = 0; k < entries.size(); k++) {
+                if (k > 0) pw.print(",");
+                pw.print(entries.get(k));
+            }
+            pw.print("],");
             pw.print("\"imports\":"    + importsJson  + ",");
             pw.print("\"exports\":"    + exportsJson  + ",");
             pw.print("\"strings\":"    + stringsJson + ",");

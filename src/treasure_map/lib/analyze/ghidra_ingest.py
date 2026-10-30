@@ -58,6 +58,7 @@ def ingest_ghidra_output(
     sha_to_id: dict[str, int],
     pass_version: str | None = None,
     success_stamp: dict[str, tuple[str, str]] | None = None,
+    export_stamp: dict[str, tuple[str, str | None]] | None = None,
 ) -> IngestStats:
     """For each dirty binary, locate its <name>_<sha8>_ghidra.json,
     parse, and write to functions/imports/exports/strings tables.
@@ -79,6 +80,9 @@ def ingest_ghidra_output(
             the hash of THIS binary's resolved stub table, or "none" when none resolves. The scan
             pipeline always passes it; None skips the checks (a caller with no pass to compare
             against).
+        export_stamp: sha256 -> (binexport_status, binexport_scan_meta JSON) of the export
+            written in the same session, stored with the success stamp in the same transaction —
+            a binary is never left marked extracted with its export outcome missing.
 
     Returns:
         IngestStats summarizing what was written
@@ -166,6 +170,12 @@ def ingest_ghidra_output(
                 "ghidra_status_reason = NULL, pass_version = ?, ghidra_version = ? WHERE id = ?",
                 (analysis_status, pass_version, ghidra_version, binary_id),
             )
+        export = (export_stamp or {}).get(rec.sha256)
+        if export is not None:
+            conn.execute(
+                "UPDATE binaries SET binexport_status = ?, binexport_scan_meta = ? WHERE id = ?",
+                (export[0], export[1], binary_id),
+            )
         stats.binaries_processed += 1
 
     conn.commit()
@@ -183,6 +193,48 @@ def ingest_ghidra_output(
         stats.strings_ingested,
     )
     return stats
+
+
+# Every table an extraction fills for one binary (keyed by binary_id).
+_EXTRACTION_TABLES: tuple[str, ...] = (
+    "functions",
+    "imports",
+    "exports",
+    "strings",
+    "nvram_defaults",
+    "string_tables",
+    "string_refs",
+    "data_blocks",
+    "detector_scan_status",
+)
+
+
+def _delete_extraction_rows(conn: sqlite3.Connection, binary_id: int) -> None:
+    for table in _EXTRACTION_TABLES:
+        conn.execute(f"DELETE FROM {table} WHERE binary_id = ?", (binary_id,))  # noqa: S608
+
+
+def drop_extraction(conn: sqlite3.Connection, sha256: str) -> None:
+    """Remove what an earlier extraction stored for this binary — its rows, and the pass that
+    wrote them (``pass_version`` NULL), so it reads as having no extraction rather than as one kept
+    from an earlier pass. Not committed here."""
+    row = conn.execute("SELECT id FROM binaries WHERE sha256 = ?", (sha256,)).fetchone()
+    if row is None:
+        return
+    _delete_extraction_rows(conn, int(row[0]))
+    conn.execute(
+        "UPDATE binaries SET pass_version = NULL, ghidra_version = NULL WHERE id = ?", (row[0],)
+    )
+
+
+def _decompile_status(value: Any) -> str | None:
+    """A function's recorded decompile outcome, or None when the export carries none (or carries
+    something that is not one of its forms: ok / timeout / skipped_micro / error:<why>)."""
+    if not isinstance(value, str):
+        return None
+    if value in ("ok", "timeout", "skipped_micro") or value.startswith("error:"):
+        return value
+    return None
 
 
 def _exported_flag(func_name: Any, exports: frozenset[str] | None) -> int:
@@ -250,18 +302,7 @@ def _ingest_one_binary(
     """Replace this binary's rows in functions/imports/exports/strings."""
 
     # DELETE existing rows for this binary_id (idempotent re-ingest)
-    for table in (
-        "functions",
-        "imports",
-        "exports",
-        "strings",
-        "nvram_defaults",
-        "string_tables",
-        "string_refs",
-        "data_blocks",
-        "detector_scan_status",
-    ):
-        conn.execute(f"DELETE FROM {table} WHERE binary_id = ?", (binary_id,))
+    _delete_extraction_rows(conn, binary_id)
 
     # functions
     func_rows = []
@@ -324,6 +365,10 @@ def _ingest_one_binary(
                 # which additive detectors threw on this function: a crash is named
                 # here, never read as a clean empty by the layer that consumes the detector.
                 json.dumps(func.get("detector_errors", []), ensure_ascii=False),
+                # what the decompile came to (ok / timeout / error:<why> / skipped_micro) and
+                # whether it was retried; an export predating them leaves NULL / 0 (not recorded).
+                _decompile_status(func.get("decompile_status")),
+                1 if func.get("decompile_retried") is True else 0,
             )
         )
     if func_rows:
@@ -333,8 +378,9 @@ def _ingest_one_binary(
                 pseudocode_hash, callees, callees_truncated, is_exported,
                 sink_provenance, nvram_ops, nvram_wrapper, wrapper_call_args,
                 string_keyed_edges, address_taken, unresolved_external_calls,
-                call_tokens, body_ranges, detector_errors)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                call_tokens, body_ranges, detector_errors, decompile_status,
+                decompile_retried)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             func_rows,
         )
         stats.functions_ingested += len(func_rows)

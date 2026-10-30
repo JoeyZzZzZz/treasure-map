@@ -83,6 +83,37 @@ def report_extraction_state(result: Any, reanalyze: str | None) -> None:
     _warn_incomplete(result.incomplete_binaries, result.no_functions_binaries)
     _warn_kept_earlier(result.kept_earlier_binaries)
     _warn_reanalyze_pending(result.reanalyze_pending, reanalyze)
+    _report_exports(
+        getattr(result, "exports_by_status", {}), getattr(result, "extension_note", None)
+    )
+
+
+# binexport_status values a diff can read (lib/binexport_archive.USABLE_STATUSES).
+_DIFFABLE = ("ok", "degraded")
+
+
+def _report_exports(by_status: dict[str, int], note: str | None) -> None:
+    """What this run's BinExport exports came to, and — said on stderr — how many of its binaries
+    cannot be diffed and why: a scan without an export is still a scan, and its binaries only show
+    up as blind spots when someone diffs them."""
+    if not by_status:
+        return
+    parts = ", ".join(f"{n} {status}" for status, n in sorted(by_status.items()))
+    click.echo(f"      → exports (for tmap diff): {parts}")
+    no_diff = sum(n for status, n in by_status.items() if status not in _DIFFABLE)
+    if note:
+        click.echo(f"  ⚠ BinExport: {note}", err=True)
+    if no_diff:
+        click.echo(
+            f"  ⚠ {no_diff} binaries have no usable export and cannot be diffed until they are "
+            "re-scanned"
+            + (
+                " with the BinExport extension installed (tmap init)"
+                if by_status.get("extension_missing")
+                else ""
+            ),
+            err=True,
+        )
 
 
 def _report_timeout_skips(skipped: list[dict[str, Any]]) -> None:

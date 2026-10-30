@@ -26,11 +26,11 @@ from pathlib import Path
 from typing import Literal, Protocol
 
 from treasure_map.lib.diff.toolchain import (
-    _properties_value,
     binexport_dirs,
     binexport_lib_digest,
     ghidra_settings_dir,
 )
+from treasure_map.lib.export_stamp import properties_value as _properties_value
 from treasure_map.lib.setup.platform import CPU_ARM64, Platform, macho_cputypes
 
 ComponentName = Literal["jdk", "ghidra", "binexport", "bindiff"]

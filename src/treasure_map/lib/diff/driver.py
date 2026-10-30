@@ -45,18 +45,28 @@ from treasure_map.lib.analyze.ghidra_runner import current_pass_version as _curr
 from treasure_map.lib.atlas.models import DiffMetaRow
 from treasure_map.lib.atlas.writer import add_diff_meta, delete_diff
 from treasure_map.lib.binary_id import BinaryRow, resolve_binary_in_db
+from treasure_map.lib.binexport_archive import (
+    USABLE_STATUSES,
+    StoredExport,
+    archive_files,
+    extract_archive,
+    read_all_stored_exports,
+    read_stored_export,
+    uncompressed_size,
+)
 from treasure_map.lib.diff import toolchain as _toolchain
 from treasure_map.lib.diff.binexport2 import BinExportDecodeError, decode_call_targets
 from treasure_map.lib.diff.callsite_facts import (
     _build_hash_with_rows,
     derive_and_store_callsite_facts,
 )
-from treasure_map.lib.diff.code_version import diff_code_version, export_code_hash
+from treasure_map.lib.diff.code_version import diff_code_version
 from treasure_map.lib.diff.currency import (
     COMPARED_COLUMNS,
     TOOLCHAIN_COLUMNS,
     DiffStamps,
     SideStamp,
+    diff_toolchain,
     extraction_stamp,
     hunt_inputs_digest,
     read_extraction,
@@ -81,7 +91,8 @@ from treasure_map.lib.diff.layer0 import (
     run_layer0_parse,
 )
 from treasure_map.lib.diff.layer2 import run_layer2_delta
-from treasure_map.lib.errors import ConfigError, GhidraNotFoundError, TreasureMapError
+from treasure_map.lib.errors import ConfigError, TreasureMapError
+from treasure_map.lib.export_stamp import EXPORT_SCRIPT, EXPORT_SCRIPT_DIR, FALLBACK_BUILDER
 from treasure_map.lib.machine import clamp_parallelism_to_memory
 from treasure_map.lib.query.runs import run_staleness
 from treasure_map.lib.query.sink_overlay import persist_sink_overlay, read_sink_overlay_baseline
@@ -94,32 +105,23 @@ if TYPE_CHECKING:
     from treasure_map.lib.atlas.models import RunRow
     from treasure_map.lib.config.config import Config
 
-# tmap's OWN headless BinExport script. Kept OUT of lib/analyze/ghidra on purpose:
-# compute_pass_version hashes EVERY *.java in that dir, so a file added there would change the
-# extraction pass_version and re-extract every binary of every firmware on the next scan. This dir
-# is not on that hash path.
-_SCRIPT_DIR = Path(__file__).parent / "ghidra"
-_BINEXPORT_SCRIPT = "ExportBinExport.java"
-# The modified copy of the extension's builder the script falls back to; compiled with it.
-_FALLBACK_BUILDER = "FallbackBinExport2Builder.java"
+# tmap's OWN headless BinExport script and the modified builder it falls back to (lib/export_stamp).
+# A scan runs it in its own session and archives the export; a diff reads that archive. The
+# standalone export below (_run_binexport) is kept for smoke tests and emergencies only.
+_SCRIPT_DIR = EXPORT_SCRIPT_DIR
+_BINEXPORT_SCRIPT = EXPORT_SCRIPT
+_FALLBACK_BUILDER = FALLBACK_BUILDER
 
-# BinExport JVM heap for a diff. Deliberately a conservative fixed ceiling, NOT the per-binary
-# adaptive_heap_mb ladder scan uses: RSS (~950MB measured) is not the -Xmx a peak analysis needs,
-# and the export path here (ExportBinExport.java) differs from scan's (ExportFunctions.java), so its
-# peak-heap demand is unmeasured. Downsizing to the ladder (max(size_a,size_b)) is a pending
-# optimization — it awaits a measured peak-heap / OOM point on the largest diffed binary; until then
-# 4096 stays (slower under parallelism, but never an OOM mid-sweep).
+# BinExport JVM heap for a standalone export (_run_binexport). A conservative fixed ceiling, not
+# the per-binary adaptive_heap_mb ladder a scan uses: its peak-heap demand is unmeasured, and 4096
+# never runs out of memory mid-export.
 _DIFF_BINEXPORT_HEAP_MB = 4096
 
-# The memory a single diff BinExport JVM is budgeted at for the RUNTIME parallelism clamp — DIFF's
-# own value, deliberately NOT machine.PER_JVM_MB (the shared init/scan 1024). BinExport's measured
-# peak RSS on the two largest binaries here is ~1320MB (scan's ExportFunctions runs lighter at
-# ~950MB, so it keeps 1024), and this is 1.2x that as a thin margin. It is a CLAMP UNIT, not a
-# steady-state cap: clamp_parallelism_to_memory divides current MemAvailable by it, so on an idle
-# machine diff still runs at the configured knee, and only when free memory is genuinely tight does
-# it back off to ~this-many-MB per JVM. Raising the shared constant instead would drop scan's pool
-# too (479-library scans would slow), so diff passes its own value explicitly.
-_DIFF_PER_JVM_MB = 1600
+# The memory one diff's compute is budgeted at for the RUNTIME parallelism clamp: a BinDiff process
+# and the two exports it holds (a diff runs no JVM). A CLAMP UNIT, not a cap:
+# clamp_parallelism_to_memory divides current MemAvailable by it, so on an idle machine diff runs
+# at the configured pool size and only backs off when free memory is genuinely tight.
+_DIFF_PER_BINDIFF_MB = 1024
 
 
 # What a toolchain failure is, as recorded in a failed diff's diff_status_reason. Set where the
@@ -130,6 +132,7 @@ FAIL_BINEXPORT_NO_FILE = "binexport_no_file"  # Ghidra exited 0, but the export 
 FAIL_BINEXPORT_CRASH = "binexport_ghidra_crash"  # Ghidra exited non-zero
 FAIL_BINDIFF_FLOWGRAPH = "bindiff_flowgraph"  # BinDiff rejected a flow graph of an export
 FAIL_BINDIFF = "bindiff_failed"  # any other BinDiff failure (or no .BinDiff written)
+FAIL_BINEXPORT_ARCHIVE = "binexport_archive_unreadable"  # a recorded archive did not decompress
 FAIL_OTHER = "other"
 
 
@@ -178,8 +181,10 @@ class PreflightResult:
     # different row when the name repeated.
     bin_a: BinaryRow
     bin_b: BinaryRow
-    so_a: Path  # the located, existing .so file for side A
-    so_b: Path
+    # Each side's export, archived by the scan that extracted the binary (lib/binexport_archive):
+    # a usable status, with its archive on disk.
+    export_a: StoredExport
+    export_b: StoredExport
     version_skew: bool
     warnings: tuple[str, ...]
 
@@ -240,6 +245,31 @@ class ExtractionUnstampedError(ConfigError):
     AmbiguousBinarySelectorError: a full diff records it as that binary's blind spot and goes on."""
 
 
+# The marker prefix recorded when a side has no usable export: the binary's recorded
+# binexport_status follows the colon (not_recorded / extension_missing / failed:<why> /
+# scan_failed:<why> / archive_missing). A diff never falls back to analysing the binary itself:
+# both sides must be the exports their own scans made.
+BINEXPORT_MISSING_PREFIX = "binexport_missing:"
+# The marker recorded when the two sides' exports were made by different export scripts or
+# BinExport builds: comparing them would read the exporters' difference as a code change.
+EXPORT_SKEW_REASON = "export_skew"
+
+
+class BinexportMissingError(ConfigError):
+    """A side's binary has no usable archived export. Fixed by re-scanning the run (after
+    installing the BinExport extension, when that is why), never by retrying the diff — so it is
+    recorded as a blind spot and does NOT count toward the retry cap."""
+
+    def __init__(self, message: str, *, status: str) -> None:
+        super().__init__(message)
+        self.reason = f"{BINEXPORT_MISSING_PREFIX}{status}"
+
+
+class ExportSkewError(ConfigError):
+    """The two sides' exports were made by different export scripts or BinExport builds, and
+    --force was not given. Recorded as a blind spot; not counted toward the retry cap."""
+
+
 def _classify_failure_reason(exc: BaseException) -> str:
     """Bucket a diff failure so a consumer can tell a likely-transient failure from a hard boundary.
 
@@ -251,6 +281,10 @@ def _classify_failure_reason(exc: BaseException) -> str:
         return AMBIGUOUS_SELECTOR_REASON
     if isinstance(exc, ExtractionUnstampedError):
         return EXTRACTION_UNSTAMPED_REASON
+    if isinstance(exc, BinexportMissingError):
+        return exc.reason
+    if isinstance(exc, ExportSkewError):
+        return EXPORT_SKEW_REASON
     if isinstance(exc, DiffToolchainError):
         return exc.kind
     return FAIL_OTHER
@@ -295,6 +329,10 @@ def _record_diff_failure(
     sha_a, sha_b = _current_shas(atlas, run_a_id, run_b_id, binary_short)
     stamps = _failure_stamps(atlas, run_a_id, run_b_id, binary_short, sha_a, sha_b, toolchain)
     attempts = _next_attempts(atlas, diff_id, sha_a, sha_b, stamps)  # read prior BEFORE delete
+    if isinstance(exc, (BinexportMissingError, ExportSkewError)):
+        # Not a toolchain attempt: no diff ran. Re-scanning fixes it, so it never escalates toward
+        # the retry cap, and a full diff tries it again (cheaply) every time.
+        attempts = 0
     dropped = _baseline_dropped_by_replacing(atlas, diff_id)  # ditto
     reason = _classify_failure_reason(exc)
     tools = toolchain_columns(stamps.toolchain)
@@ -378,13 +416,19 @@ def _failure_stamps(
     def one(run_id: str, side: str, sha: str | None) -> SideStamp:
         try:
             db = _resolve_run(atlas, run_id, side).analysis_db_path
-            return side_stamp(atlas, run_id, db, sha, binary)
+            return side_stamp(atlas, run_id, db, sha, binary, _usable_export(db, sha))
         except (ConfigError, sqlite3.Error, OSError, ValueError):
-            return SideStamp(None, None, None, None, None, export_code_hash(None))
+            return SideStamp(None, None, None, None, None, None)
 
     return DiffStamps(
         one(run_a_id, "a", sha_a), one(run_b_id, "b", sha_b), diff_code_version(), toolchain
     )
+
+
+def _usable_export(analysis_db_path: str | None, sha: str | None) -> StoredExport | None:
+    """The binary's recorded export when it is usable (ok / degraded), else None."""
+    stored = read_stored_export(analysis_db_path, sha)
+    return stored if stored is not None and stored.status in USABLE_STATUSES else None
 
 
 def _current_stamps(
@@ -393,16 +437,16 @@ def _current_stamps(
     run_b_id: str,
     bin_a: BinaryRow,
     bin_b: BinaryRow,
-    builders: tuple[str | None, str | None],
+    exports: tuple[StoredExport | None, StoredExport | None],
     toolchain: _toolchain.Toolchain | None,
 ) -> DiffStamps:
     """The input stamps of a diff about to be written (called inside its write transaction).
-    ``builders`` is the path each side's export took, which picks the export script files hashed."""
+    ``exports`` is each side's archived export, whose metadata names the export scripts."""
     db_a = _resolve_run(atlas, run_a_id, "a").analysis_db_path
     db_b = _resolve_run(atlas, run_b_id, "b").analysis_db_path
     return DiffStamps(
-        side_stamp(atlas, run_a_id, db_a, bin_a.sha256, bin_a.name, builders[0]),
-        side_stamp(atlas, run_b_id, db_b, bin_b.sha256, bin_b.name, builders[1]),
+        side_stamp(atlas, run_a_id, db_a, bin_a.sha256, bin_a.name, exports[0]),
+        side_stamp(atlas, run_b_id, db_b, bin_b.sha256, bin_b.name, exports[1]),
         diff_code_version(),
         toolchain,
     )
@@ -576,36 +620,68 @@ def _binexport_present(headless: Path) -> bool:
 
 
 def _check_toolchain(config: Config) -> None:
-    """HARD check 5: Ghidra headless + the BinExport plugin + the ``bindiff`` CLI must all be
-    available. Raises DiffToolchainError listing exactly what is missing and pointing at the
-    toolchain install, so a missing tool fails fast here instead of deep inside a subprocess."""
-    from treasure_map.lib.analyze.ghidra_runner import find_headless
-
-    missing: list[str] = []
-    headless: Path | None = None
-    try:
-        headless = find_headless(config.ghidra)
-    except GhidraNotFoundError:
-        missing.append("Ghidra analyzeHeadless (set ghidra.local.home or $GHIDRA_HOME)")
-    if headless is not None and not _binexport_present(headless):
-        missing.append("the BinExport Ghidra extension (install the prebuilt BinExport for 11.4.3)")
-    # tmap's OWN export script is a runtime .java asset — a wheel that dropped the package-data glob
-    # would ship without it, so verify it here (a packaging problem, not a missing 3rd-party tool).
-    for script in (_BINEXPORT_SCRIPT, _FALLBACK_BUILDER):
-        if not (_SCRIPT_DIR / script).is_file():
-            missing.append(
-                f"tmap's own {script} (expected at {_SCRIPT_DIR}) — a packaging problem, "
-                "not a missing third-party tool: reinstall tmap"
-            )
+    """HARD check 5: the ``bindiff`` CLI must be available. A diff reads the exports the scans
+    archived and runs only BinDiff on them; Ghidra and the BinExport extension are the SCAN's
+    tools (a binary scanned without the extension has no export, which preflight reports for that
+    binary). Raises DiffToolchainError pointing at the install, so a missing tool fails fast here
+    instead of deep inside a subprocess."""
     if _find_bindiff() is None:
-        missing.append("the 'bindiff' CLI on PATH (install BinDiff 8)")
-    if missing:
-        joined = "\n".join(f"  - {m}" for m in missing)
         raise DiffToolchainError(
             "the version-diff toolchain is not available. Missing:\n"
-            f"{joined}\n\nInstall the diff toolchain (Ghidra 11.4.3 + BinDiff 8 + the prebuilt "
-            "BinExport) and retry."
+            "  - the 'bindiff' CLI on PATH (install BinDiff 8)\n\n"
+            "Install BinDiff 8 and retry (tmap init installs it)."
         )
+
+
+def _side_export(run: RunRow, run_id: str, row: BinaryRow) -> StoredExport:
+    """One side's archived export for a resolved binary, or BinexportMissingError naming the
+    binary's recorded export status. Usable means: status ok / degraded and both archive files on
+    disk (whether they decompress is found out when they are read)."""
+    stored = read_stored_export(run.analysis_db_path, row.sha256)
+    status = (stored.status if stored is not None else None) or "not_recorded"
+    if stored is not None and stored.status in USABLE_STATUSES:
+        files = archive_files(stored.dest_dir, stored.meta)
+        if files is not None and all(f.is_file() for f in files):
+            return stored
+        status = "archive_missing"
+    raise BinexportMissingError(
+        f"run '{run_id}': binary '{row.name}' has no usable BinExport export (recorded status: "
+        f"{status}). A diff compares the exports each side's scan made in the session that "
+        f"extracted it, and never re-analyses the binary to make one. Fix: "
+        f"{_export_remedy(status, run_id, row.name)}",
+        status=status,
+    )
+
+
+def _export_remedy(status: str, run_id: str, binary: str) -> str:
+    """What makes a usable export for a binary recorded with ``status``."""
+    if status == "extension_missing":
+        return f"install the BinExport extension (tmap init), then `tmap rescan {run_id}`."
+    if status in ("not_recorded", "archive_missing", "failed:archive_error"):
+        return f"`tmap rescan {run_id}` re-makes it."
+    if status == "failed:timeout":
+        return (
+            "the export ran past its budget; raise ghidra.headless_timeout_seconds and "
+            f"`tmap rescan {run_id}` (a rescan at the same budget is not re-run)."
+        )
+    if status.startswith("scan_failed:"):
+        return f"the binary's extraction failed; see `tmap runs` for {run_id}."
+    return (
+        "the export failed the same way it would again under this tmap and BinExport; it is "
+        "re-made when either changes, or with `tmap scan <firmware-root> "
+        f"--run-id {run_id} --reanalyze {binary}`."
+    )
+
+
+def _export_skew(export_a: StoredExport, export_b: StoredExport) -> str | None:
+    """Why the two sides' exports cannot be compared as they are — made by different export
+    scripts, or a different BinExport build — or None. BinDiff would read the exporters'
+    difference as a change of the code."""
+    meta_a, meta_b = export_a.meta or {}, export_b.meta or {}
+    for key, what in (("script_hash", "export scripts"), ("binexport", "BinExport build")):
+        if meta_a.get(key) != meta_b.get(key):
+            return f"{what} differ ({meta_a.get(key)} vs {meta_b.get(key)})"
+    return None
 
 
 # ── preflight (five cheap checks, fail-fast, no judgement) ────────────────────────────
@@ -628,10 +704,13 @@ def preflight(
     3. version consistency (``_confirmed_same_version`` via ``_version_skew``) — WARN + require
        ``--force`` (the sole soft check: the skew mark keeps the result honest, so an informed "I
        know the versions differ but want to look" stays allowed).
-    4. the target binary's ``.so`` is locatable + exists — hard block (finding 1). Before that,
-       each side's binary must have a recorded extraction pass (``ExtractionUnstampedError``): a
-       binary no extraction ever succeeded on has nothing a diff could be tied to.
-    5. the toolchain is available — hard block (finding 4).
+    4. each side's binary has a usable archived export (``BinexportMissingError``, naming its
+       recorded export status) — hard block. Before that, each side's binary must have a recorded
+       extraction pass (``ExtractionUnstampedError``): a binary no extraction ever succeeded on has
+       nothing a diff could be tied to. Then the two exports must have been made by the same export
+       scripts and BinExport build — like check 3, refused without ``--force``
+       (``ExportSkewError``), degraded to version_skew with it.
+    5. the toolchain (BinDiff) is available — hard block (finding 4).
     """
     run_a = _resolve_run(atlas, run_a_id, "a")  # check 1
     run_b = _resolve_run(atlas, run_b_id, "b")
@@ -672,12 +751,20 @@ def preflight(
                 "not be tied to the code that produced its functions. Re-scan the run."
             )
 
-    so_a = _locate_binary_so(run_a, bin_a)
-    if so_a is None:
-        raise ConfigError(_so_not_found_msg(run_a_id, binary_name, bin_a))
-    so_b = _locate_binary_so(run_b, bin_b)
-    if so_b is None:
-        raise ConfigError(_so_not_found_msg(run_b_id, binary_name, bin_b))
+    export_a = _side_export(run_a, run_a_id, bin_a)
+    export_b = _side_export(run_b, run_b_id, bin_b)
+    export_skew = _export_skew(export_a, export_b)
+    if export_skew:
+        note = (
+            f"the two sides' exports of '{bin_a.name}' were made by different exporters "
+            f"({export_skew}), so BinDiff would read the exporters' difference as a code change "
+            "and every delta would be undetermined. Re-scan both runs with the same tmap and "
+            "BinExport, or pass --force to diff anyway (the result stays honestly degraded)."
+        )
+        if not force:
+            raise ExportSkewError(note)
+        warnings.append(note)
+        skew = True
 
     _check_toolchain(config)  # check 5
 
@@ -688,8 +775,8 @@ def preflight(
         binary_b=bin_b.name,
         bin_a=bin_a,
         bin_b=bin_b,
-        so_a=so_a,
-        so_b=so_b,
+        export_a=export_a,
+        export_b=export_b,
         version_skew=skew,
         warnings=tuple(warnings),
     )
@@ -1028,16 +1115,33 @@ def _decode_targets(path: Path, side: str) -> tuple[dict[str, list[str]] | None,
         return None, f"call targets not decoded for side {side} ({path.name}): {exc}"
 
 
-def compute_diff(so_a: Path, so_b: Path, td: Path, config: Config) -> DiffArtifacts:
-    """The CPU-heavy middle phase for ONE binary: BinExport x2 + BinDiff, into ``td``. ZERO atlas.
+def _obtain_export(stored: StoredExport, td: Path, side: str) -> Path:
+    """One side's archived export, decompressed into ``td`` as ``<side>.BinExport`` with its
+    report beside it. An archive that does not decompress fails the diff (recorded under
+    ``binexport_archive_unreadable``; the next scan re-makes it, see db_ingest)."""
+    try:
+        export_path, _report = extract_archive(stored.dest_dir, stored.meta, td, side)
+    except OSError as exc:
+        raise DiffToolchainError(
+            f"the archived export for side {side} cannot be read: {exc}",
+            kind=FAIL_BINEXPORT_ARCHIVE,
+        ) from exc
+    return export_path
 
-    ★ Takes only Paths + config — NO atlas connection and NO run id — so it is safe to run in a
-    worker thread (the atlas is check_same_thread and must be written serially; this function never
-    touches it). Raises DiffToolchainError on any toolchain step failure; the caller records that
+
+def compute_diff(
+    export_a_src: StoredExport, export_b_src: StoredExport, td: Path, config: Config
+) -> DiffArtifacts:
+    """The CPU-heavy middle phase for ONE binary: the two archived exports decompressed, then
+    BinDiff, into ``td``. ZERO atlas.
+
+    ★ Takes only file locations + config — NO atlas connection and NO run id — so it is safe to run
+    in a worker thread (the atlas is check_same_thread and must be written serially; this function
+    never touches it). Raises DiffToolchainError on any step failure; the caller records that
     against the atlas in the serial phase. The caller owns ``td`` (creates and removes it)."""
     timeout_s = config.ghidra.headless_timeout_seconds
-    export_a = _run_binexport(so_a, config, td, "a", timeout_s)
-    export_b = _run_binexport(so_b, config, td, "b", timeout_s)
+    export_a = _obtain_export(export_a_src, td, "a")
+    export_b = _obtain_export(export_b_src, td, "b")
     report_a = _read_report(export_a, "a")
     report_b = _read_report(export_b, "b")
     bindiff_path = _run_bindiff(export_a, export_b, td, timeout_s)
@@ -1087,6 +1191,7 @@ def _persist_success(
     report_b: ExportReport | None = None,
     bindiff_vertex0_fallbacks: int | None = None,
     toolchain: _toolchain.Toolchain | None = None,
+    exports: tuple[StoredExport | None, StoredExport | None] = (None, None),
 ) -> DiffSummary:
     """The serial persist phase for a SUCCESSFUL compute: parse the .BinDiff into the atlas (layer0)
     and project the deltas (layer2), as ONE atomic write. The call-site facts for the chosen
@@ -1113,11 +1218,7 @@ def _persist_success(
         if not atlas.in_transaction:
             atlas.execute("BEGIN IMMEDIATE")
         had_baseline = _has_candidate_baseline(atlas, diff_id) or _marked_dropped(atlas, diff_id)
-        builders = (
-            report_a.builder if report_a is not None else None,
-            report_b.builder if report_b is not None else None,
-        )
-        stamps = _current_stamps(atlas, run_a_id, run_b_id, bin_a, bin_b, builders, toolchain)
+        stamps = _current_stamps(atlas, run_a_id, run_b_id, bin_a, bin_b, exports, toolchain)
         l0 = run_layer0_parse(
             atlas,
             bindiff_path=bindiff_path,
@@ -1252,7 +1353,7 @@ def run_version_diff(
     )
     _SWEEP_CANCELLED.clear()  # an earlier interrupted sweep in this process must not refuse this
     pf = preflight(atlas, run_a_id, run_b_id, binary_name, config=config, force=force)
-    toolchain = _toolchain.detect_toolchain(config)
+    toolchain = diff_toolchain(pf.export_a, pf.export_b, _toolchain.bindiff_version())
     # pf.binary_a is the normalized short name (preflight resolved it, asserted non-None). Include
     # it in the diff_id so this binary's diff does not overwrite another binary's under the same
     # run-pair (make_diff_id / delete_diff then scope to this one binary).
@@ -1261,7 +1362,7 @@ def run_version_diff(
     td = Path(tempfile.mkdtemp(prefix="tm_diff_"))
     try:
         try:
-            artifacts = compute_diff(pf.so_a, pf.so_b, td, config)
+            artifacts = compute_diff(pf.export_a, pf.export_b, td, config)
         except TreasureMapError as exc:
             _record_diff_failure(
                 atlas,
@@ -1290,6 +1391,7 @@ def run_version_diff(
             report_b=artifacts.report_b,
             bindiff_vertex0_fallbacks=artifacts.bindiff_vertex0_fallbacks,
             toolchain=toolchain,
+            exports=(pf.export_a, pf.export_b),
         )
     finally:
         shutil.rmtree(td, ignore_errors=True)
@@ -1391,15 +1493,23 @@ def _inputs_unchanged(
     binary: str,
     ext_a: dict[str, tuple[str | None, str | None]],
     ext_b: dict[str, tuple[str | None, str | None]],
-    toolchain: _toolchain.Toolchain | None,
+    exports_a: dict[str, StoredExport],
+    exports_b: dict[str, StoredExport],
+    bindiff: str | None,
 ) -> bool:
     """Whether every input stamp recorded with this binary's diff equals the current one (plain
     equality, lib/diff/currency). The extraction, code and toolchain stamps are compared first; the
     hunt-input digests, the one part that costs a query, only when those already agree. The export
-    script files are those the diff's own export path took. A toolchain that cannot be read now is
-    not compared: the recorded one stands (nothing could be diffed without it anyway)."""
+    scripts and the Ghidra / BinExport behind them are each side's CURRENT archived export (a
+    re-scan that re-made it with other scripts, Ghidra or BinExport makes the diff stale; one
+    re-made with the same ones is not told apart here). A toolchain
+    that cannot be read now (no BinDiff version, or a side with no usable export) is not compared:
+    the recorded one stands."""
     pv_a, gv_a = ext_a.get(rec.sha256_a or "", (None, None))
     pv_b, gv_b = ext_b.get(rec.sha256_b or "", (None, None))
+    exp_a = _usable(exports_a.get(rec.sha256_a or ""))
+    exp_b = _usable(exports_b.get(rec.sha256_b or ""))
+    toolchain = diff_toolchain(exp_a, exp_b, bindiff)
     tools = (
         toolchain_columns(toolchain)
         if toolchain is not None
@@ -1411,8 +1521,8 @@ def _inputs_unchanged(
         "ghidra_version_a": gv_a,
         "ghidra_version_b": gv_b,
         "diff_code_version": diff_code_version(),
-        "export_code_hash_a": export_code_hash(rec.builders[0]),
-        "export_code_hash_b": export_code_hash(rec.builders[1]),
+        "export_code_hash_a": (exp_a.meta or {}).get("script_hash") if exp_a else None,
+        "export_code_hash_b": (exp_b.meta or {}).get("script_hash") if exp_b else None,
         **tools,
     }
     if any(rec.stamps.get(c) != v for c, v in cheap.items()):
@@ -1425,6 +1535,10 @@ def _inputs_unchanged(
     return stamps_equal(rec.stamps, current)
 
 
+def _usable(stored: StoredExport | None) -> StoredExport | None:
+    return stored if stored is not None and stored.status in USABLE_STATUSES else None
+
+
 def plan_full_diff(
     atlas: sqlite3.Connection,
     run_a_id: str,
@@ -1432,7 +1546,7 @@ def plan_full_diff(
     *,
     retry_limit: int = _DIFF_RETRY_LIMIT,
     assume_current: bool = False,
-    toolchain: _toolchain.Toolchain | None = None,
+    bindiff: str | None = None,
 ) -> FullDiffPlan:
     """Decide which binaries a full diff should diff: those present in BOTH runs whose content
     (sha256) differs, PARTITIONED by their recorded diff status so the sweep is incremental +
@@ -1466,6 +1580,8 @@ def plan_full_diff(
     status = _read_diff_status_map(atlas, run_a_id, run_b_id)
     ext_a = read_extraction(run_a.analysis_db_path) or {}
     ext_b = read_extraction(run_b.analysis_db_path) or {}
+    exports_a = read_all_stored_exports(run_a.analysis_db_path) or {}
+    exports_b = read_all_stored_exports(run_b.analysis_db_path) or {}
 
     to_diff: list[str] = []
     retry: list[str] = []
@@ -1482,7 +1598,9 @@ def plan_full_diff(
             to_diff.append(n)  # content changed (or unrecorded sha) -> re-diff, attempts reset
         elif not (
             assume_current
-            or _inputs_unchanged(atlas, rec, run_a_id, run_b_id, n, ext_a, ext_b, toolchain)
+            or _inputs_unchanged(
+                atlas, rec, run_a_id, run_b_id, n, ext_a, ext_b, exports_a, exports_b, bindiff
+            )
         ):
             to_diff.append(n)  # what it was computed from changed -> re-diff, attempts reset
         elif rec.diff_ok == 1:
@@ -1527,13 +1645,14 @@ class _ResolvedDiff:
     # persist step must write about the same binary the compute step exported.
     bin_a: BinaryRow
     bin_b: BinaryRow
-    so_a: Path
-    so_b: Path
+    export_a: StoredExport
+    export_b: StoredExport
     version_skew: bool
     warnings: tuple[str, ...]
     diff_id: str
-    size_bytes: int  # max(so_a, so_b) on-disk size -> disk-headroom estimate
+    size_bytes: int  # the larger export, decompressed -> disk-headroom estimate
     prior_failed: bool  # entered this run as a retry (diff_ok=0) -> a success is a recovery
+    toolchain: _toolchain.Toolchain | None = None  # what this one diff is computed by
 
 
 def _persist_outcome(
@@ -1590,6 +1709,7 @@ def _persist_outcome(
             report_b=artifacts.report_b,
             bindiff_vertex0_fallbacks=artifacts.bindiff_vertex0_fallbacks,
             toolchain=toolchain,
+            exports=(rd.export_a, rd.export_b),
         )
     except (TreasureMapError, sqlite3.Error) as exc:
         # Isolate this one binary's persist failure so the sweep continues to the next. A
@@ -1638,25 +1758,29 @@ def _persist_outcome(
     )
 
 
+def _export_size(stored: StoredExport) -> int:
+    """The decompressed size of one side's archived export (0 when it cannot be read)."""
+    files = archive_files(stored.dest_dir, stored.meta)
+    return uncompressed_size(files[0]) if files is not None else 0
+
+
 def _effective_diff_workers(configured: int, resolved: list[_ResolvedDiff]) -> int:
     """Clamp the configured pool size DOWN to what current memory AND disk allow for this run.
 
     Memory: the config value is a stable MemTotal derivation; if free RAM is low right now, running
-    that many BinExport JVMs would OOM (see clamp_parallelism_to_memory). ``_DIFF_PER_JVM_MB`` is
-    passed EXPLICITLY here — BinExport's measured peak is heavier than scan's, so diff budgets its
-    own per-JVM memory without touching the shared machine.PER_JVM_MB (which would shrink scan's
-    pool too). Disk: N concurrent computes each write ~2x the binary (two .BinExport + a .BinDiff)
-    into a temp dir; if free disk cannot hold ``workers`` of the largest such set, reduce (the
-    interleaved persist keeps only ~workers sets on disk at once). Both clamps only lower it,
-    never below 1."""
-    workers, note = clamp_parallelism_to_memory(max(1, configured), per_jvm_mb=_DIFF_PER_JVM_MB)
+    that many BinDiff processes would swap (see clamp_parallelism_to_memory), budgeted at
+    ``_DIFF_PER_BINDIFF_MB`` each. Disk: N concurrent computes each write ~3x the larger export (two
+    decompressed exports + a .BinDiff) into a temp dir; if free disk cannot hold ``workers`` of the
+    largest such set, reduce (the interleaved persist keeps only ~workers sets on disk at once).
+    Both clamps only lower it, never below 1."""
+    workers, note = clamp_parallelism_to_memory(max(1, configured), per_jvm_mb=_DIFF_PER_BINDIFF_MB)
     if note:
         logger.warning("diff: %s", note)
     try:
         free = shutil.disk_usage(tempfile.gettempdir()).free
         biggest = max((rd.size_bytes for rd in resolved), default=0)
         if biggest > 0:
-            per_slot = biggest * 2  # 2 exports + a .BinDiff, conservatively <= 2x the binary
+            per_slot = biggest * 3  # 2 decompressed exports + a .BinDiff, <= 3x the larger
             disk_cap = max(1, int(free * 0.8) // per_slot)
             if disk_cap < workers:
                 logger.warning(
@@ -1720,15 +1844,17 @@ def run_full_diff(
         )
     warnings = check_run_pair_currency(run_a, run_b, config=config)
     _SWEEP_CANCELLED.clear()  # a fresh sweep: an earlier interrupted one must not refuse this one
-    # Read before the plan: the plan compares it with the toolchain each diff was computed by.
-    toolchain = _toolchain.detect_toolchain(config)
+    # Read before the plan: the plan compares it with the BinDiff each diff was computed by. The
+    # Ghidra and BinExport behind a diff are its two exports', read per binary.
+    bindiff = _toolchain.bindiff_version()
+    toolchain: _toolchain.Toolchain | None = None  # a binary that fails before resolving has none
     plan = plan_full_diff(
         atlas,
         run_a_id,
         run_b_id,
         retry_limit=retry_limit,
         assume_current=assume_current,
-        toolchain=toolchain,
+        bindiff=bindiff,
     )
     to_run = plan.binaries_to_run(force_retry=force_retry)
     # Before the "nothing to diff" return: a re-hunt that reproduced its output leaves every diff
@@ -1799,7 +1925,15 @@ def run_full_diff(
                     )
                 except sqlite3.Error:
                     attempts, reason = None, None
-            elif isinstance(exc, (AmbiguousBinarySelectorError, ExtractionUnstampedError)):
+            elif isinstance(
+                exc,
+                (
+                    AmbiguousBinarySelectorError,
+                    ExtractionUnstampedError,
+                    BinexportMissingError,
+                    ExportSkewError,
+                ),
+            ):
                 # Persist it as this binary's blind spot, the same shape a toolchain failure gets.
                 # A refusal that lives only in the console scrolls away; recorded, it shows up in
                 # list_diff_blindspots with a reason that names the fix.
@@ -1829,23 +1963,21 @@ def run_full_diff(
             outcomes.append(oc)
             on_outcome(done, total, oc)
             continue
-        try:
-            size_bytes = max(pf.so_a.stat().st_size, pf.so_b.stat().st_size)
-        except OSError:
-            size_bytes = 0
+        size_bytes = max(_export_size(pf.export_a), _export_size(pf.export_b))
         resolved.append(
             _ResolvedDiff(
                 binary=binary,
                 binary_short=pf.binary_a,
                 bin_a=pf.bin_a,
                 bin_b=pf.bin_b,
-                so_a=pf.so_a,
-                so_b=pf.so_b,
+                export_a=pf.export_a,
+                export_b=pf.export_b,
                 version_skew=pf.version_skew,
                 warnings=pf.warnings,
                 diff_id=make_diff_id(run_a_id, run_b_id, pf.binary_a),
                 size_bytes=size_bytes,
                 prior_failed=binary in was_failed_before,
+                toolchain=diff_toolchain(pf.export_a, pf.export_b, bindiff),
             )
         )
 
@@ -1858,7 +1990,9 @@ def run_full_diff(
         fut_to_id: dict[Any, str] = {}  # pre-bound so an interrupt mid-submit finds it defined
         try:
             fut_to_id = {
-                pool.submit(compute_diff, rd.so_a, rd.so_b, tds[rd.diff_id], config): rd.diff_id
+                pool.submit(
+                    compute_diff, rd.export_a, rd.export_b, tds[rd.diff_id], config
+                ): rd.diff_id
                 for rd in resolved
             }
             for fut in as_completed(fut_to_id):
@@ -1885,7 +2019,7 @@ def run_full_diff(
                         run_b_id,
                         artifacts=artifacts,
                         compute_exc=compute_exc,
-                        toolchain=toolchain,
+                        toolchain=rd.toolchain,
                     )
                 finally:
                     # consume-and-clean: the orchestrator owns each temp dir (compute produced into
@@ -1928,7 +2062,7 @@ def run_full_diff(
         td = Path(tempfile.mkdtemp(prefix="tm_diff_retry_"))
         try:
             try:
-                artifacts = compute_diff(rd.so_a, rd.so_b, td, config)
+                artifacts = compute_diff(rd.export_a, rd.export_b, td, config)
                 compute_exc = None
             except Exception as exc:
                 artifacts, compute_exc = None, exc
@@ -1939,7 +2073,7 @@ def run_full_diff(
                 run_b_id,
                 artifacts=artifacts,
                 compute_exc=compute_exc,
-                toolchain=toolchain,
+                toolchain=rd.toolchain,
             )
         except KeyboardInterrupt:
             # Ctrl-C during the serial retry: kill the one in-flight BinExport group, drop the

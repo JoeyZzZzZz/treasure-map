@@ -74,6 +74,17 @@ CREATE TABLE IF NOT EXISTS binaries (
                                            --   re-extract this binary; 0 = not part of any
                                            --   unfinished re-extraction request. Cleared by the
                                            --   binary's final result
+    -- The BinExport export written in the same session as this row's extraction (see
+    -- lib/binexport_archive): ok / degraded (an operand written in its default form) /
+    -- failed:<why> (the extraction succeeded, no export) / scan_failed:<why> (the extraction did
+    -- not succeed; its session's export is never kept) / extension_missing (the BinExport
+    -- extension was not available to the scan). NULL = recorded before exports existed: no
+    -- export, re-scanned. Only ok and degraded have an archive under binexport/.
+    binexport_status TEXT,
+    -- JSON object: what the export was made by and where it is archived (export_hash,
+    -- script_hash, binexport, builder, pass_version, ghidra_version, budget_seconds, archive,
+    -- report_archive, report summary). NULL with a NULL status.
+    binexport_scan_meta TEXT,
     last_seen_at DATETIME,                 -- timestamp of most recent ingest scan
     analyzed_at  DATETIME DEFAULT CURRENT_TIMESTAMP
 );
@@ -149,6 +160,11 @@ CREATE TABLE IF NOT EXISTS functions (
     -- ["sink_provenance"]). A detector that failed returns its empty value like one that found
     -- nothing; this names the ones that crashed so a reader does not read a crash as a clean empty.
     detector_errors TEXT DEFAULT '[]',
+    -- What this function's decompile came to: ok / timeout (still past the limit on the one
+    -- retry it gets) / error:<why> / skipped_micro (under 10 bytes, not decompiled). An empty
+    -- pseudocode alone cannot tell those apart. NULL = extracted before this was recorded.
+    decompile_status TEXT,
+    decompile_retried INTEGER DEFAULT 0,   -- 1 = it timed out once and was retried
     FOREIGN KEY(binary_id) REFERENCES binaries(id) ON DELETE CASCADE
 );
 
@@ -291,9 +307,9 @@ CREATE TABLE IF NOT EXISTS string_tables (
     key                 TEXT,       -- the dispatch string key (attacker-influenceable)
     func_name           TEXT,       -- the handler function name (BinDiff-alignable anchor)
     func_addr           TEXT,       -- the handler entry address (0x…)
-    func_kind           TEXT,       -- direct | thunk | undefined_text (a .text entry Ghidra never
-                                    --   turned into a function — a dispatch table is often the
-                                    --   handler's ONLY reference, so nothing calls it directly)
+    func_kind           TEXT,       -- direct | thunk. undefined_text only in a scan by an older
+                                    --   detector, which also took an aligned .text address no
+                                    --   function started at; a handler is now a defined function
     completeness_status TEXT,       -- always 'incomplete' this phase (MVP absolute-2-field only)
     completeness_reason TEXT,
     completeness_scope  TEXT,
@@ -478,3 +494,21 @@ CREATE TABLE IF NOT EXISTS web_form_fields (
 
 CREATE INDEX IF NOT EXISTS idx_web_form_fields_file ON web_form_fields(file_id);
 CREATE INDEX IF NOT EXISTS idx_web_form_fields_kw   ON web_form_fields(field_keyword);
+
+-- file_inventory: every regular or special file under the firmware root and whether this scan took
+-- it in (WIPE-AND-REBUILD each analyze run; lib/analyze/file_inventory.py). inventoried_as is what
+-- the ELF walk or a non-binary ingester actually took it in as (elf / non_binary:<kind>);
+-- not_inventoried_reason says why neither did (et_rel / no_loadable_segments / unsupported_arch /
+-- elf_unreadable / duplicate_content / too_large / ingest_failed / no_ingester / not_regular_file /
+-- unreadable) — exactly one of the two is set. Symbolic links are in fs_symlinks, not here.
+CREATE TABLE IF NOT EXISTS file_inventory (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    path                   TEXT    NOT NULL,   -- relative to firmware fs_root
+    sha256                 TEXT,               -- NULL for a special or unreadable file
+    size                   INTEGER,            -- NULL for a special file
+    file_type              TEXT    NOT NULL,   -- elf_exec/elf_dyn/elf_rel/elf_core/elf_other/script/text/binary/empty/special/unreadable
+    inventoried_as         TEXT,
+    not_inventoried_reason TEXT,
+    CHECK ((inventoried_as IS NULL) != (not_inventoried_reason IS NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_file_inventory_path ON file_inventory(path);

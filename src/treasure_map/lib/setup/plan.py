@@ -331,7 +331,7 @@ def binexport_target(host: Host, ghidra_home: Path, ledger: Ledger) -> Path | No
 
 
 def verify_binexport(host: Host, ghidra_home: Path, ext_dir: Path, want: str) -> str | None:
-    from treasure_map.lib.diff.toolchain import _properties_value
+    from treasure_map.lib.export_stamp import properties_value as _properties_value
 
     dirs = binexport_dirs(
         ghidra_home,

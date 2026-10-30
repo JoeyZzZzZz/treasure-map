@@ -128,6 +128,9 @@ def _runner_class() -> type:
         def ghidra_version(self) -> str:
             return GHIDRA_VERSION
 
+        def set_extension(self, extension: Any) -> None:
+            pass  # no export is written by the fixture runner
+
         def run_all(
             self, records: list[Any], out_dir: Path, *_a: Any, on_final: Any = None, **_k: Any
         ) -> list[Any]:

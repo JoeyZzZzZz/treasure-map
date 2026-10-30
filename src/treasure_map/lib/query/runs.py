@@ -187,6 +187,13 @@ def _remedy_for(run: RunRow) -> str:
     )
 
 
+def _installed_ghidra() -> str | None:
+    """The installed Ghidra's version (lib/diff/toolchain, read once per process), or None."""
+    from treasure_map.lib.diff.toolchain import current_ghidra_version
+
+    return current_ghidra_version()
+
+
 def run_staleness(
     run: RunRow, *, build_hash: str | None, current: rescan_version.CodeStamp, commit: str
 ) -> Staleness:
@@ -194,9 +201,10 @@ def run_staleness(
 
     ``build_hash`` is the extraction pipeline's current content hash; ``current`` is the running
     code's stamp (hunt code hash + scan stamp). ``commit`` is the running install's commit, used
-    ONLY to fall back for a run hunted before the code stamps existed. A positive mismatch is the
-    bar — a failure to confirm a match (a missing stamp, an unknown dependency) is a caveat, never a
-    refusal.
+    ONLY to fall back for a run hunted before the code stamps existed. The installed Ghidra is read
+    here too (lib/diff/toolchain, once per process): a run another Ghidra produced is stale on the
+    ``toolchain`` axis. A positive mismatch is the bar — a failure to confirm a match (a missing
+    stamp, an unknown dependency or version) is a caveat, never a refusal.
     """
     stored_build = run.build_hash
     if (
@@ -213,6 +221,25 @@ def run_staleness(
             "extraction",
             f"extracted by pipeline {stored_build}, running {build_hash} — the facts stored for "
             "this run would be re-derived differently by the code answering you now.",
+            _remedy_for(run),
+        )
+    # The decompiler itself: a run whose facts another Ghidra produced than the one installed is
+    # provably stale — they would be extracted differently. Read run-level (a per-binary roll-up;
+    # mixed versions read 'unknown', which proves nothing). The installed version is read once per
+    # process, so a server started before an upgrade keeps answering until it is restarted.
+    local_ghidra = _installed_ghidra()
+    if (
+        run.ghidra_version
+        and local_ghidra
+        and UNKNOWN_VERSION not in (run.ghidra_version, local_ghidra)
+        and run.ghidra_version != local_ghidra
+    ):
+        return Staleness(
+            True,
+            "toolchain",
+            f"scanned with Ghidra {run.ghidra_version}, Ghidra {local_ghidra} is installed — the "
+            "decompiler that produced the facts stored for this run is not the one answering you "
+            "now, and would extract them differently.",
             _remedy_for(run),
         )
     if run.hunt_code_version is None:

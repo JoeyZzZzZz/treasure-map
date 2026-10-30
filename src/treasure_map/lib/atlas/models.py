@@ -308,6 +308,10 @@ class FunctionAlignmentRow:
     # or None. A marked pair is always 'alignment_undetermined'.
     export_gap_a: str | None = None
     export_gap_b: str | None = None
+    # 1 when a side's export wrote an operand of this function in its default form (an additional
+    # fact; it changes neither the state nor the gap).
+    operand_markup_incomplete_a: int = 0
+    operand_markup_incomplete_b: int = 0
     id: int | None = None
 
 
@@ -327,6 +331,8 @@ class FunctionPresenceRow:
     # Why this function is not represented faithfully in its export, or None; a marked function is
     # always 'unmatched_analysis_incomplete'.
     export_gap: str | None = None
+    # 1 when its export wrote an operand of this function in its default form (additional fact).
+    operand_markup_incomplete: int = 0
     id: int | None = None
 
 

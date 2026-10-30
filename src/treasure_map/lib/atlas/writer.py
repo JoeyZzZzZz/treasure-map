@@ -415,8 +415,9 @@ def add_function_alignment(
     conn.executemany(
         """INSERT INTO function_alignment
            (diff_id, addr_a, addr_b, name_a, name_b, alignment_confidence, similarity,
-            alignment_state, basicblocks, edges, instructions, export_gap_a, export_gap_b)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            alignment_state, basicblocks, edges, instructions, export_gap_a, export_gap_b,
+            operand_markup_incomplete_a, operand_markup_incomplete_b)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         [
             (
                 r.diff_id,
@@ -432,6 +433,8 @@ def add_function_alignment(
                 r.instructions,
                 r.export_gap_a,
                 r.export_gap_b,
+                r.operand_markup_incomplete_a,
+                r.operand_markup_incomplete_b,
             )
             for r in rows
         ],
@@ -450,10 +453,20 @@ def add_function_presence(
         return 0
     conn.executemany(
         """INSERT INTO function_presence
-           (diff_id, side, addr, name, presence_state, decompiled, export_gap)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+           (diff_id, side, addr, name, presence_state, decompiled, export_gap,
+            operand_markup_incomplete)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         [
-            (r.diff_id, r.side, r.addr, r.name, r.presence_state, r.decompiled, r.export_gap)
+            (
+                r.diff_id,
+                r.side,
+                r.addr,
+                r.name,
+                r.presence_state,
+                r.decompiled,
+                r.export_gap,
+                r.operand_markup_incomplete,
+            )
             for r in rows
         ],
     )

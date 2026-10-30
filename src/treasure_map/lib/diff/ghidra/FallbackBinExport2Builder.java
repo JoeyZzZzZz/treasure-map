@@ -16,16 +16,24 @@
 // extension, version 11.4.3 (https://github.com/google/binexport). Changes:
 //   - renamed to FallbackBinExport2Builder and moved to the default package, so it compiles next to
 //     the export script (it imports MnemonicMapper / IdentityMnemonicMapper from the extension);
-//   - build() promotes undefined functions BEFORE exporting instructions and indexing basic blocks,
-//     so the block index and the explicit entry addresses describe the promoted program;
+//   - build() can promote undefined functions BEFORE exporting instructions and indexing basic
+//     blocks, so the block index and the explicit entry addresses describe the promoted program.
+//     Off by default (setPromoteUndefined): in a scan the PromoteUndefined script has already
+//     created those functions in this session, and a second pass here would create others the
+//     extraction never saw;
 //   - buildFlowGraphs() first registers every basic block of every function body that the
 //     program-wide block iteration did not return (one entry per start address, also when shared),
 //     so an edge to a block of a later function still finds its target index, instead of failing
 //     on the missing index;
 //   - functions that contain a multi-entry basic block whose non-first entry is a delay-slot
 //     instruction are recorded (getDegenerateFunctionEntries) so the caller can treat them as
-//     unreliable.
-// It is used only when the extension's own builder fails on that missing index.
+//     unreliable;
+//   - an operand whose markup Ghidra cannot build (StackVarnodeMarkup.isFailure: a variable whose
+//     storage starts on the stack but does not end there) is written in its default, unmarked form,
+//     and the instruction and its function are recorded (getOperandMarkupDegradedInstructions /
+//     getOperandMarkupDegradedFunctions). Instructions, blocks and calls are unchanged.
+// In a scan it is the only builder; a standalone export uses it when the extension's own builder
+// fails (ExportBinExport).
 
 import static java.util.stream.Collectors.joining;
 
@@ -120,6 +128,9 @@ public class FallbackBinExport2Builder {
 
   private Map<Long, Integer> instructionIndicesForBlocks;
   private final TreeSet<Long> degenerateFunctionEntries = new TreeSet<>();
+  private final TreeSet<Long> operandMarkupDegradedInstructions = new TreeSet<>();
+  private final TreeSet<Long> operandMarkupDegradedFunctions = new TreeSet<>();
+  private boolean promoteUndefined = false;
 
   public FallbackBinExport2Builder(Program ghidraProgram, AddressSetView ghidraAddrSet) {
     program = ghidraProgram;
@@ -141,6 +152,22 @@ public class FallbackBinExport2Builder {
   public FallbackBinExport2Builder setPrependNamespace(boolean isPrepended) {
     prependNamespace = isPrepended;
     return this;
+  }
+
+  /** Whether build() first creates a function for every block outside one (default: no). */
+  public FallbackBinExport2Builder setPromoteUndefined(boolean promote) {
+    promoteUndefined = promote;
+    return this;
+  }
+
+  /** Addresses of the instructions written with at least one operand in its default form. */
+  public TreeSet<Long> getOperandMarkupDegradedInstructions() {
+    return operandMarkupDegradedInstructions;
+  }
+
+  /** Entry addresses of the functions holding such an instruction. */
+  public TreeSet<Long> getOperandMarkupDegradedFunctions() {
+    return operandMarkupDegradedFunctions;
   }
 
   private Address getAddressFromLong(long offset) {
@@ -572,8 +599,24 @@ public class FallbackBinExport2Builder {
     var opIndices = new ArrayList<Integer>();
     for (int i = 0; i < instr.getNumOperands(); i++) {
       var operandComments = new ArrayList<BinExport2.Comment.Builder>();
-      var operandString = cuf.getOperandRepresentationString(instr, i);
-      var operandMarkupList = ImmutableList.copyOf(cuf.getOperandRepresentationList(instr, i));
+      String operandString;
+      ImmutableList<Object> operandMarkupList;
+      try {
+        operandString = cuf.getOperandRepresentationString(instr, i);
+        operandMarkupList = ImmutableList.copyOf(cuf.getOperandRepresentationList(instr, i));
+      } catch (UnsupportedOperationException e) {
+        if (!StackVarnodeMarkup.isFailure(e)) {
+          throw e;
+        }
+        // The markup of this one operand cannot be built: it is written in its default form.
+        operandString = instr.getDefaultOperandRepresentation(i);
+        operandMarkupList = ImmutableList.copyOf(instr.getDefaultOperandRepresentationList(i));
+        operandMarkupDegradedInstructions.add(getMappedAddress(instr));
+        Function owner = listing.getFunctionContaining(instr.getAddress());
+        if (owner != null) {
+          operandMarkupDegradedFunctions.add(getMappedAddress(owner.getEntryPoint()));
+        }
+      }
       var operandList = ImmutableList.copyOf(instr.getDefaultOperandRepresentationList(i));
       Boolean addComment = operandMarkupList.size() == operandList.size();
 
@@ -1269,9 +1312,11 @@ public class FallbackBinExport2Builder {
 
     buildMetaInformation();
 
-    // Promote first: the extension's builder has already done so on this program before it failed,
-    // and every later step must see the same function set.
-    promoteUndefinedFunctions();
+    // Promote first when asked (a standalone export: the extension's builder has already done so on
+    // this program before it failed, and every later step must see the same function set).
+    if (promoteUndefined) {
+      promoteUndefinedFunctions();
+    }
 
     var mnemonics = new TreeMap<String, Integer>();
     buildMnemonics(mnemonics);

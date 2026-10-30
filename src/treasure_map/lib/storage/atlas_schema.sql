@@ -489,6 +489,9 @@ CREATE TABLE IF NOT EXISTS function_alignment (
     export_gap_b          TEXT,            --   faithfully in its export: 'degenerate_block' /
                                            --   'flow_graph_dropped' (lib/diff/export_report). Such
                                            --   a pair is always 'alignment_undetermined'.
+    operand_markup_incomplete_a INTEGER DEFAULT 0, -- 1 = that side's export wrote an operand of
+    operand_markup_incomplete_b INTEGER DEFAULT 0, --   the function in its default form: an
+                                           --   additional fact; changes no state and no gap
     UNIQUE(diff_id, addr_a, addr_b)
 );
 CREATE INDEX IF NOT EXISTS idx_falign_diff ON function_alignment(diff_id);
@@ -531,6 +534,8 @@ CREATE TABLE IF NOT EXISTS function_presence (
     export_gap     TEXT,            -- NULL, or why this function is not represented faithfully
                                     --   in its export ('degenerate_block' / 'flow_graph_dropped');
                                     --   such a function is always 'unmatched_analysis_incomplete'
+    operand_markup_incomplete INTEGER DEFAULT 0, -- 1 = its export wrote an operand of it in its
+                                    --   default form: an additional fact, never a state
     UNIQUE(diff_id, side, addr)
 );
 CREATE INDEX IF NOT EXISTS idx_fpres ON function_presence(diff_id, side);

@@ -98,6 +98,10 @@ def _rescan_funcs(
     conn.close()
 
 
+# The string_tables completeness reason a fixture table carries unless it names one.
+_TABLE_REASON = "got_relative_and_three_field_not_detected_handler_must_be_defined_function"
+
+
 def _make_db(
     tmp_path: Path,
     binaries: list[dict[str, object]],
@@ -144,7 +148,7 @@ def _make_db(
                     e.get("func_addr"),
                     e.get("func_kind", "direct"),
                     e.get("status", "incomplete"),
-                    e.get("reason", "got_relative_and_three_field_and_mips_not_detected"),
+                    e.get("reason", _TABLE_REASON),
                     e.get("scope", "absolute_2field_only"),
                 ),
             )

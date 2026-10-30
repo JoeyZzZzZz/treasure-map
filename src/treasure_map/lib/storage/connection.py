@@ -107,6 +107,14 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # 0 = not part of any unfinished re-extraction request. Back-fills 0 on older DBs (no request
     # was ever left unfinished there). Not indexed (see script_calls.via). Must match schema.sql.
     ("binaries", "reanalyze_pending", "INTEGER DEFAULT 0"),
+    # The BinExport export of the binary's last extraction and what made it. Back-fill NULL on
+    # older DBs, which reads as "no export" and re-scans the binary once. Must match schema.sql.
+    ("binaries", "binexport_status", "TEXT"),
+    ("binaries", "binexport_scan_meta", "TEXT"),
+    # What each function's decompile came to. Back-fill NULL / 0 on older DBs: not recorded until
+    # a re-scan (an empty pseudocode there stays unexplained). Must match schema.sql.
+    ("functions", "decompile_status", "TEXT"),
+    ("functions", "decompile_retried", "INTEGER DEFAULT 0"),
 )
 
 

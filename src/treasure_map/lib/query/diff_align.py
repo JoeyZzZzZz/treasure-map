@@ -25,8 +25,14 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
-from treasure_map.lib.diff.code_version import diff_code_version, export_code_hash
+from treasure_map.lib.binexport_archive import (
+    USABLE_STATUSES,
+    StoredExport,
+    read_all_stored_exports,
+)
+from treasure_map.lib.diff.code_version import diff_code_version
 from treasure_map.lib.diff.currency import (
+    diff_toolchain,
     hunt_inputs_digest,
     read_extraction,
     run_hunt_marks,
@@ -34,7 +40,7 @@ from treasure_map.lib.diff.currency import (
 )
 from treasure_map.lib.diff.driver import _DIFF_RETRY_LIMIT
 from treasure_map.lib.diff.layer0 import norm_hex
-from treasure_map.lib.diff.toolchain import current_toolchain
+from treasure_map.lib.diff.toolchain import current_bindiff_version
 from treasure_map.lib.query.diff_workflow import DIFF_WORKFLOW
 from treasure_map.lib.ro_db import ro_connect
 
@@ -75,7 +81,8 @@ STALE_GONE = "source_binary_absent"
 # and the hunt's output for it, and it is produced by the diff code — each recorded with the diff
 # as a stamp (lib/diff/currency) and compared here with what it is now, by plain equality.
 STALE_DIFF_LOGIC = "diff_logic_changed"  # computed by different diff code than is running
-STALE_TOOLCHAIN = "toolchain_changed"  # computed by another Ghidra / BinExport / BinDiff version
+STALE_TOOLCHAIN = "toolchain_changed"  # a side's export re-made by another Ghidra / BinExport, or
+#   another BinDiff installed
 STALE_EXTRACTION = "extraction_changed"  # the binary's extraction pass differs
 STALE_GHIDRA = "ghidra_changed"  # the binary's recorded decompiler version differs
 STALE_HUNT_INPUTS = "hunt_inputs_changed"  # the hunt output the diff read differs
@@ -184,6 +191,7 @@ class _GenerationCache:
         self._extraction: dict[str, dict[str, tuple[str | None, str | None]] | None] = {}
         self._marks: dict[str, tuple[str | None, int | None, int] | None] = {}
         self._digests: dict[tuple[str, str | None, str | None], str] = {}
+        self._exports: dict[str, dict[str, StoredExport] | None] = {}
 
     def for_run(self, run_id: str | None) -> dict[str, set[str]] | None:
         if not run_id:
@@ -200,6 +208,22 @@ class _GenerationCache:
             ).fetchone()
             self._extraction[run_id] = read_extraction(row[0] if row is not None else None)
         return self._extraction[run_id]
+
+    def export_state(self, run_id: str | None, sha: str | None) -> tuple[bool, StoredExport | None]:
+        """(readable, export): whether the run's recorded exports could be read at all, and the
+        binary's archived export as recorded now when it is usable (ok / degraded)."""
+        if not run_id or not sha:
+            return False, None
+        if run_id not in self._exports:
+            row = self._atlas.execute(
+                "SELECT analysis_db_path FROM run WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            self._exports[run_id] = read_all_stored_exports(row[0] if row is not None else None)
+        exports = self._exports[run_id]
+        if exports is None:
+            return False, None
+        stored = exports.get(sha)
+        return True, stored if stored is not None and stored.status in USABLE_STATUSES else None
 
     def hunt_marks(self, run_id: str) -> tuple[str | None, int | None, int] | None:
         """``(scanned_at, hunt_instances, live instance rows)`` of a run; None when it is gone."""
@@ -282,12 +306,21 @@ def diff_staleness(cache: _GenerationCache, meta: Any) -> tuple[bool | None, str
     unreadable), and false only when every axis was checked and matched."""
     reasons = _side_reasons(cache, meta, "a") | _side_reasons(cache, meta, "b")
     if meta["diff_code_version"] is not None:
+        # Each side's export as it is archived NOW: a re-scan that re-made it with other export
+        # scripts, or another Ghidra / BinExport, makes the diff describe exports that are gone. A
+        # side whose recorded exports cannot be read decides nothing (it is reported unavailable
+        # on its own axis).
+        state = {s: cache.export_state(meta[f"run_{s}_id"], meta[f"sha256_{s}"]) for s in "ab"}
         if meta["diff_code_version"] != diff_code_version() or any(
-            meta[f"export_code_hash_{s}"] != export_code_hash(meta[f"export_builder_{s}"])
-            for s in "ab"
+            readable and meta[f"export_code_hash_{s}"] != _script_hash(exp)
+            for s, (readable, exp) in state.items()
         ):
             reasons.add(STALE_DIFF_LOGIC)
-        toolchain = current_toolchain()
+        toolchain = (
+            diff_toolchain(state["a"][1], state["b"][1], current_bindiff_version())
+            if state["a"][0] and state["b"][0]
+            else None
+        )
         if toolchain is not None and any(
             meta[c] != v for c, v in toolchain_columns(toolchain).items()
         ):
@@ -337,10 +370,16 @@ def diff_source_staleness(
 
 
 def toolchain_checked() -> bool:
-    """Whether this reader can read the installed Ghidra / BinExport / BinDiff versions. When it
-    cannot, a diff computed by other versions cannot be told apart, and the answer says so here
-    instead of turning every diff's source_stale into null."""
-    return current_toolchain() is not None
+    """Whether this reader can read the installed BinDiff version (the Ghidra and BinExport behind
+    a diff are its exports', read from their archives). When it cannot, a diff computed by another
+    BinDiff cannot be told apart, and the answer says so here instead of turning every diff's
+    source_stale into null."""
+    return current_bindiff_version() is not None
+
+
+def _script_hash(export: StoredExport | None) -> str | None:
+    value = (export.meta or {}).get("script_hash") if export is not None else None
+    return value if isinstance(value, str) else None
 
 
 def _is_whole_run_row(diff_id: str, run_a_id: str, run_b_id: str) -> bool:
@@ -399,6 +438,10 @@ def _row_to_pair(r: sqlite3.Row) -> dict[str, Any]:
         # alignment_undetermined whatever its confidence)
         "export_gap_a": r["export_gap_a"],
         "export_gap_b": r["export_gap_b"],
+        # 1 when that side's export wrote an operand of the function in its default form: an
+        # additional fact, never a gap (the pair's state does not depend on it)
+        "operand_markup_incomplete_a": r["operand_markup_incomplete_a"],
+        "operand_markup_incomplete_b": r["operand_markup_incomplete_b"],
     }
 
 
@@ -407,13 +450,15 @@ def _align_by_side(atlas: sqlite3.Connection, diff_id: str, addr: str, side: str
     norm = norm_hex(addr)
     rows = atlas.execute(
         f"SELECT addr_a, addr_b, name_a, name_b, alignment_confidence, similarity, "  # noqa: S608
-        f"alignment_state, basicblocks, edges, instructions, export_gap_a, export_gap_b "
+        f"alignment_state, basicblocks, edges, instructions, export_gap_a, export_gap_b, "
+        f"operand_markup_incomplete_a, operand_markup_incomplete_b "
         f"FROM function_alignment WHERE diff_id = ? AND {col} = ?",  # noqa: S608 -- col is a literal
         (diff_id, norm),
     ).fetchall()
     if not rows:
         gap = atlas.execute(
-            "SELECT export_gap FROM function_presence WHERE diff_id = ? AND side = ? AND addr = ?",
+            "SELECT export_gap, operand_markup_incomplete FROM function_presence "
+            "WHERE diff_id = ? AND side = ? AND addr = ?",
             (diff_id, side, norm),
         ).fetchone()
         return {
@@ -422,6 +467,7 @@ def _align_by_side(atlas: sqlite3.Connection, diff_id: str, addr: str, side: str
             "query": {"side": side, "addr": norm},
             # non-null when the function is unmatched because its export did not hold it as it is
             "export_gap": gap[0] if gap is not None else None,
+            "operand_markup_incomplete": gap[1] if gap is not None else None,
             **diff_source_staleness(atlas, diff_id),
             "note": (
                 "no matched pair for this address in this diff. That is NOT proof the function was "
@@ -441,7 +487,8 @@ def _align_by_side(atlas: sqlite3.Connection, diff_id: str, addr: str, side: str
 
 _ALIGN_COLUMNS = (
     "addr_a, addr_b, name_a, name_b, alignment_confidence, similarity, alignment_state, "
-    "basicblocks, edges, instructions, export_gap_a, export_gap_b"
+    "basicblocks, edges, instructions, export_gap_a, export_gap_b, operand_markup_incomplete_a, "
+    "operand_markup_incomplete_b"
 )
 
 _NOT_PROOF = (
@@ -848,8 +895,9 @@ _LIST_DIFFS_NOTE = (
     "per-function split). "
     "★ source_stale says whether the diff still describes what it was computed from: true = a "
     "side's binary content changed or is gone (source_content_changed / source_binary_absent), "
-    "the diff code or the export script it ran changed (diff_logic_changed), the diff was "
-    "computed by another Ghidra / BinExport / BinDiff than is installed (toolchain_changed), the "
+    "the diff code changed or a side's archived export was re-made by other export scripts "
+    "(diff_logic_changed), a side's export was re-made by another Ghidra / BinExport or another "
+    "BinDiff is installed (toolchain_changed), the "
     "binary was re-extracted (extraction_changed / ghidra_changed), or the hunt output the diff "
     "read changed (hunt_inputs_changed) — re-run the diff before reading its deltas as current. "
     "toolchain_checked=false = this reader could not read the installed toolchain, so a diff "

@@ -19,11 +19,13 @@ with what the same input is now:
   * hunt inputs — a digest of exactly the hunt output the diff reads (``hunt_inputs_digest``), so
     a re-hunt that reproduces the same output leaves the diff current.
   * diff code — ``diff_code_version()``, a hash of the Python code that writes the diff
-    (lib/diff/code_version), and per side ``export_code_hash``, a hash of the export script files
-    that side's export took.
-  * the external toolchain — the versions of Ghidra, the BinExport extension and BinDiff used
-    (lib/diff/toolchain). Compared only when the current ones can be read; a machine that cannot
-    read them does not reset or force anything on their account.
+    (lib/diff/code_version), and per side ``export_code_hash``, the hash of the export scripts
+    that made that side's archived export (its ``binexport_scan_meta``; lib/export_stamp).
+  * the external toolchain — the Ghidra and BinExport the two sides' scans exported with (from
+    their archives' metadata; a diff runs neither) and the BinDiff installed now
+    (lib/diff/toolchain).
+    Compared only when they can be read; a machine that cannot read them does not reset or force
+    anything on their account.
 
 Equality is plain equality: None equals None. A binary that has never been extracted has no pass
 on either occasion, and that is the same answer twice, not an unknown.
@@ -42,7 +44,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from treasure_map.lib.diff.code_version import export_code_hash
+from treasure_map.lib.binexport_archive import USABLE_STATUSES, StoredExport
 from treasure_map.lib.diff.toolchain import Toolchain
 from treasure_map.lib.ro_db import ro_connect
 
@@ -228,17 +230,45 @@ def side_stamp(
     analysis_db_path: str | None,
     sha: str | None,
     binary: str | None,
-    export_builder: str | None = None,
+    export: StoredExport | None = None,
 ) -> SideStamp:
-    """The current stamps of one side; ``export_builder`` is the path its export took (None when
-    not known: a failed attempt), which picks the export script files hashed."""
+    """The current stamps of one side; ``export`` is that side's archived export (None, or not
+    usable, when there is none), whose metadata names the export scripts that made it."""
     pv, gv = extraction_stamp(analysis_db_path, sha)
     marks = run_hunt_marks(atlas, run_id) or (None, None)
+    script_hash = (
+        (export.meta or {}).get("script_hash")
+        if export is not None and export.status in USABLE_STATUSES
+        else None
+    )
     return SideStamp(
         extraction_pass=pv,
         ghidra_version=gv,
         hunt_inputs_hash=hunt_inputs_digest(atlas, run_id, sha, binary),
         scanned_at=marks[0],
         hunt_instances=marks[1],
-        export_code_hash=export_code_hash(export_builder),
+        export_code_hash=script_hash if isinstance(script_hash, str) else None,
     )
+
+
+def _join_sides(a: object, b: object) -> str | None:
+    """One value for a toolchain column from the two sides' exports: the value when they agree,
+    ``a|b`` when they do not, None when either is unknown."""
+    if not isinstance(a, str) or not isinstance(b, str):
+        return None
+    return a if a == b else f"{a}|{b}"
+
+
+def diff_toolchain(
+    export_a: StoredExport | None, export_b: StoredExport | None, bindiff: str | None
+) -> Toolchain | None:
+    """The toolchain one diff is computed by: the Ghidra and BinExport the two sides' scans
+    exported with (from their archives' metadata — a diff runs neither), and the BinDiff installed
+    now. None — not checked — when the BinDiff version or either side's cannot be read."""
+    meta_a = (export_a.meta if export_a else None) or {}
+    meta_b = (export_b.meta if export_b else None) or {}
+    ghidra = _join_sides(meta_a.get("ghidra_version"), meta_b.get("ghidra_version"))
+    binexport = _join_sides(meta_a.get("binexport"), meta_b.get("binexport"))
+    if bindiff is None or ghidra is None or binexport is None:
+        return None
+    return Toolchain(ghidra=ghidra, binexport=binexport, bindiff=bindiff)

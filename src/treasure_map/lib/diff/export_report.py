@@ -15,6 +15,13 @@ Layer 0 marks these functions on their presence / alignment rows, and every read
 undetermined with reason ``degenerate_block_source`` — never as matched, unmatched, changed or
 unchanged. The two counts that change nothing (explicit entry addresses written where the reader
 would have derived the same value) are recorded on diff_meta only.
+
+A third list is NOT a blind spot: ``operand_markup_degraded`` names the functions holding an
+instruction one of whose operands the builder had to write in its default, unmarked form (a
+variable whose storage starts on the stack but does not end there). Instructions, blocks and calls
+are exported as they are; only that operand's text lacks its markup. Layer 0 records the function
+as ``operand_markup_incomplete`` on its rows, an additional fact that changes no state, no bucket
+and no undetermined count.
 """
 
 from __future__ import annotations
@@ -46,6 +53,9 @@ class ExportReport:
     flow_graphs_dropped: int
     dropped_functions: frozenset[str]  # function entries, normalized hex
     degenerate_functions: frozenset[str]
+    # Functions with an operand written in its default form (an additional fact, not a gap). Empty
+    # for a report written before the field existed.
+    operand_markup_degraded: frozenset[str] = frozenset()
 
     def gaps(self) -> dict[str, str]:
         """Function entry (normalized hex) -> gap kind. A dropped flow graph wins over a degenerate
@@ -101,7 +111,29 @@ def parse_export_report(text: str) -> ExportReport:
         flow_graphs_dropped=n_dropped,
         dropped_functions=dropped,
         degenerate_functions=_addrs(data, "degenerate_functions"),
+        operand_markup_degraded=_markup_degraded(data),
     )
+
+
+def _markup_degraded(data: dict[str, Any]) -> frozenset[str]:
+    """The functions of ``operand_markup_degraded``, read strictly: absent (a report from before
+    the field) is empty; present, it must be an object whose instruction count matches its
+    instruction list, with a function list."""
+    if "operand_markup_degraded" not in data:
+        return frozenset()
+    block = data["operand_markup_degraded"]
+    if not isinstance(block, dict):
+        raise ExportReportError(f"'operand_markup_degraded' is not an object: {block!r}")
+    n = _count(block, "instructions")
+    addresses = _addrs(block, "instruction_addresses")
+    if n != len(addresses):
+        raise ExportReportError(
+            f"operand_markup_degraded counts {n} instructions but lists {len(addresses)}"
+        )
+    functions = _addrs(block, "functions")
+    if addresses and not functions:
+        raise ExportReportError("operand_markup_degraded lists instructions but no function")
+    return functions
 
 
 def report_path(export_path: Path) -> Path:

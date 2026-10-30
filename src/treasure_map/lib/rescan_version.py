@@ -67,7 +67,12 @@ HUNT_ROOT = "lib.hunt.analyzer2"
 CLOSURE_EXCLUDED: dict[str, str] = {
     "lib.rescan_version": (
         "computes the stamp itself; nothing it returns is written into a content row"
-    )
+    ),
+    "lib.export_stamp": (
+        "the export hash (export scripts + BinExport extension) is its own re-scan axis, recorded "
+        "per binary in binexport_scan_meta and compared there; in the scan stamp, an edit to an "
+        "export script or an extension upgrade would read every run's facts as stale"
+    ),
 }
 
 # Large shared modules hashed by only the names the closure uses, not whole. Each is reached by a
@@ -83,6 +88,8 @@ ASSET_READERS: dict[str, tuple[str, ...]] = {
     "lib.storage.connection": ("lib/storage/schema.sql",),
     "lib.atlas.connection": ("lib/storage/atlas_schema.sql",),
     "lib.pattern.extractor_names": ("lib/analyze/ghidra/extractor_names.tsv",),
+    # Deliberately NOT lib/diff/ghidra/*.java: the export scripts the scan also runs change no
+    # extracted fact, and are hashed into the export hash instead (lib/export_stamp).
     "lib.analyze.ghidra_runner": ("lib/analyze/ghidra/*.java", "lib/analyze/ghidra/*.tsv"),
 }
 

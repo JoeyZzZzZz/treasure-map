@@ -4,11 +4,24 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from collections import Counter
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 
 from treasure_map.lib.analyze.elf_inventory import ElfRecord, has_substantial_text
 from treasure_map.lib.analyze.fs_names import db_text
 from treasure_map.lib.analyze.ghidra_runner import retry_budget_seconds
+from treasure_map.lib.binexport_archive import (
+    FAILED_ARCHIVE_ERROR,
+    FAILED_PREFIX,
+    FAILED_TIMEOUT,
+    STATUS_EXTENSION_MISSING,
+    USABLE_STATUSES,
+    archive_intact,
+    parse_meta,
+)
+from treasure_map.version import UNKNOWN_VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +40,7 @@ def _timeout_skips(
     *,
     pass_version: str | None,
     timeout_base: int,
+    ghidra_version: str | None = None,
 ) -> set[str]:
     """sha256 of binaries that timed out and would only be handed the same budget again.
 
@@ -53,18 +67,18 @@ def _timeout_skips(
     read as "nothing changed". The unmeasurable case is logged, because a binary quietly re-running
     forever and a binary quietly skipped forever are both invisible from the outside.
 
-    ★ NOT in the comparison: the Ghidra version. Upgrading the decompiler can change how long a
-    binary takes, and this will not notice — the same blind spot ``compute_pass_version`` documents
-    for tool versions (it hashes our code, not the tools it calls). ``--force-retry`` is the answer,
-    the same as there.
+    * the DECOMPILER — the Ghidra version the attempt ran under (recorded with its export outcome,
+      ``binexport_scan_meta.ghidra_version``) against this scan's: another decompiler can take a
+      different time, so the attempt is a different one. Re-run once; a version that was not
+      recorded, or an unknown one, compares nothing.
     """
     shas = [r.sha256 for r in records]
     if not shas:
         return set()
     ph = ",".join("?" * len(shas))
     rows = conn.execute(
-        f"SELECT sha256, timeout_budget, timeout_pass_version FROM binaries "  # noqa: S608
-        f"WHERE sha256 IN ({ph}) AND ghidra_ok = 0 AND ghidra_status_reason = ?",
+        f"SELECT sha256, timeout_budget, timeout_pass_version, binexport_scan_meta "  # noqa: S608
+        f"FROM binaries WHERE sha256 IN ({ph}) AND ghidra_ok = 0 AND ghidra_status_reason = ?",
         [*shas, _TIMEOUT_REASON],
     ).fetchall()
     if not rows:
@@ -79,6 +93,14 @@ def _timeout_skips(
             continue  # nothing recorded to compare against -> re-run, do not assume
         if pass_version is None or row["timeout_pass_version"] != pass_version:
             continue  # the extractor is not confirmed to be the one that timed out -> re-run
+        attempted_on = (parse_meta(row["binexport_scan_meta"]) or {}).get("ghidra_version")
+        if (
+            isinstance(attempted_on, str)
+            and ghidra_version
+            and UNKNOWN_VERSION not in (attempted_on, ghidra_version)
+            and attempted_on != ghidra_version
+        ):
+            continue  # another decompiler timed out on it -> this one is a different attempt
         rec = rec_by_sha.get(sha)
         current = retry_budget_seconds(rec.path, timeout_base) if rec is not None else None
         if current is None:
@@ -91,6 +113,121 @@ def _timeout_skips(
             continue  # it would get more time now -> the retry is a different attempt
         skips.add(sha)
     return skips
+
+
+@dataclass(frozen=True)
+class ExportCheck:
+    """What this scan would export with, for deciding which already-extracted binaries must be
+    re-scanned for their export (see ``_export_redo``).
+
+    ``export_hash`` is the export hash this scan would record (lib/export_stamp), None when the
+    BinExport extension is not available to it; ``archive_dir`` is where the workspace keeps its
+    archived exports; ``timeout_base`` is this scan's base timeout."""
+
+    export_hash: str | None
+    archive_dir: Path
+    timeout_base: int | None
+
+
+def _export_redo(
+    conn: sqlite3.Connection,
+    records: list[ElfRecord],
+    done: set[str],
+    check: ExportCheck,
+) -> dict[str, str]:
+    """sha256 -> why, for the binaries among ``done`` (extracted by this pass) whose EXPORT asks
+    for a re-scan. An export is written only in the session of its extraction, so a binary is
+    re-scanned whole; each status says when that buys a different export:
+
+    * none recorded (a row from before exports) — re-scan;
+    * ok / degraded — when the export hash differs from this scan's (an edited export script, an
+      upgraded extension), or when the archive it claims is missing or does not decompress (the
+      recorded status must not outlive the file it stands for);
+    * extension_missing — only when this scan has the extension: without it the same answer comes
+      back, at the price of a full re-analysis on every scan;
+    * failed:timeout — when this scan would give it MORE time than the attempt recorded (an export
+      cut off at a budget is cut off again at the same one), or the export hash changed;
+    * failed:archive_error — when the extension is available: the export was made and only the
+      local write of its archive failed (disk, permissions), which says nothing about the export;
+    * any other failure — only when the export hash changed: within one pass the same export fails
+      the same way (it had its one retry in the scan that failed it).
+
+    With no extension here, only what a scan without it can still settle is re-run: a binary with
+    no export recorded (once: it then reads extension_missing), and an ok / degraded binary whose
+    archive is gone (its status is corrected to what the scan can say)."""
+    if not done:
+        return {}
+    ph = ",".join("?" * len(done))
+    rows = conn.execute(
+        f"SELECT sha256, binexport_status, binexport_scan_meta FROM binaries "  # noqa: S608
+        f"WHERE sha256 IN ({ph})",
+        list(done),
+    ).fetchall()
+    rec_by_sha = {r.sha256: r for r in records}
+    available = check.export_hash is not None
+    redo: dict[str, str] = {}
+    for row in rows:
+        sha, status = row["sha256"], row["binexport_status"]
+        meta = parse_meta(row["binexport_scan_meta"])
+        hash_moved = available and (meta or {}).get("export_hash") != check.export_hash
+        if status is None:
+            redo[sha] = "no_export_recorded"
+        elif status in USABLE_STATUSES:
+            if hash_moved:
+                redo[sha] = "export_hash_changed"
+            elif not archive_intact(check.archive_dir, meta):
+                redo[sha] = "archive_missing"
+        elif status == STATUS_EXTENSION_MISSING:
+            if available:
+                redo[sha] = "extension_now_available"
+        elif status == FAILED_ARCHIVE_ERROR:
+            if available:
+                redo[sha] = "archive_error"
+        elif status == FAILED_TIMEOUT:
+            if hash_moved:
+                redo[sha] = "export_hash_changed"
+            elif available:
+                recorded = (meta or {}).get("budget_seconds")
+                rec = rec_by_sha.get(sha)
+                current = (
+                    retry_budget_seconds(rec.path, check.timeout_base)
+                    if rec is not None and check.timeout_base is not None
+                    else None
+                )
+                if current is None and rec is not None:
+                    logger.warning(
+                        "export re-run: cannot measure %s -> re-running it rather than assuming "
+                        "its budget",
+                        sha[:8],
+                    )
+                if not isinstance(recorded, int) or current is None or current > recorded:
+                    redo[sha] = "export_budget_larger"
+        elif status.startswith(FAILED_PREFIX):
+            if hash_moved:
+                redo[sha] = "export_hash_changed"
+        else:
+            redo[sha] = "export_status_unknown"
+    return redo
+
+
+def toolchain_changed(
+    conn: sqlite3.Connection, shas: list[str], ghidra_version: str | None
+) -> set[str]:
+    """The binaries among ``shas`` whose stored extraction was produced by another Ghidra than
+    ``ghidra_version`` — both versions known. Upgrading the decompiler changes what it extracts, and
+    those rows would otherwise be served until someone thought to --reanalyze. An unknown version on
+    either side is a can't-tell, never a mismatch."""
+    if not shas or not ghidra_version or ghidra_version == UNKNOWN_VERSION:
+        return set()
+    ph = ",".join("?" * len(shas))
+    return {
+        row["sha256"]
+        for row in conn.execute(
+            f"SELECT sha256 FROM binaries WHERE sha256 IN ({ph}) AND ghidra_ok = 1 "  # noqa: S608
+            "AND ghidra_version IS NOT NULL AND ghidra_version NOT IN (?, ?)",
+            [*shas, ghidra_version, UNKNOWN_VERSION],
+        ).fetchall()
+    }
 
 
 def _pending(conn: sqlite3.Connection, shas: list[str], ph: str) -> set[str]:
@@ -114,6 +251,7 @@ def ingest_elfs(
     timeout_base: int | None = None,
     force_retry: bool = False,
     ghidra_version: str | None = None,
+    export_check: ExportCheck | None = None,
 ) -> tuple[dict[str, int], set[str]]:
     """Ingest ELF records into the binaries table.
 
@@ -136,6 +274,12 @@ def ingest_elfs(
     stored pass_version differs (or is NULL, i.e. unknown) is treated as NOT done, so editing the
     Ghidra pass re-extracts every binary automatically without any manual JSON/db deletion. When
     None (callers that do not track the pass), only sha256 / ghidra_ok gate the cache, as before.
+
+    ``ghidra_version`` is this scan's Ghidra. A binary extracted by another (both known) is not
+    done (``toolchain_changed``).
+
+    ``export_check`` is what this scan would export with. When given, an extracted binary whose
+    export asks for a re-scan is not done (``_export_redo`` owns that judgement).
 
     ``timeout_base`` is this scan's configured base timeout. When given, a binary that previously
     TIMED OUT is left out of the dirty set while nothing that could change the outcome has changed
@@ -233,6 +377,27 @@ def ingest_elfs(
                 [(s,) for s in code_free],
             )
         already_done -= heal
+
+    # Step 1c: extracted by another Ghidra than this scan's — re-extracted, whatever its pass.
+    upgraded = toolchain_changed(conn, list(already_done), ghidra_version)
+    if upgraded:
+        logger.info(
+            "%d binary/ies were extracted by another Ghidra than %s -> re-analyze",
+            len(upgraded),
+            ghidra_version,
+        )
+        already_done -= upgraded
+
+    # Step 1d: the export written with the extraction asks for a re-scan (see _export_redo).
+    if export_check is not None:
+        redo = _export_redo(conn, records, already_done, export_check)
+        if redo:
+            logger.info(
+                "%d binary/ies re-scanned for their BinExport export (%s)",
+                len(redo),
+                ", ".join(f"{why} {n}" for why, n in sorted(Counter(redo.values()).items())),
+            )
+        already_done -= set(redo)
 
     # Step 2: INSERT OR IGNORE new rows (existing sha256 rows are untouched)
     for rec in records:
@@ -338,7 +503,13 @@ def ingest_elfs(
         skipped: set[str] = set()
         if timeout_base is not None and not force_retry:
             skipped = (
-                _timeout_skips(conn, records, pass_version=pass_version, timeout_base=timeout_base)
+                _timeout_skips(
+                    conn,
+                    records,
+                    pass_version=pass_version,
+                    timeout_base=timeout_base,
+                    ghidra_version=ghidra_version,
+                )
                 - pending
             )
             if skipped:

@@ -273,12 +273,22 @@ def _migrate(conn: sqlite3.Connection) -> None:
         if dm_cols and _dmcol not in dm_cols:
             conn.execute(f"ALTER TABLE diff_meta ADD COLUMN {_dmcol} {_dmtype}")  # noqa: S608
     fa_cols = _column_names(conn, "function_alignment")
-    for _facol in ("export_gap_a", "export_gap_b"):
+    for _facol, _fatype in (
+        ("export_gap_a", "TEXT"),
+        ("export_gap_b", "TEXT"),
+        # an operand of the function written in its default form by that side's export
+        ("operand_markup_incomplete_a", "INTEGER DEFAULT 0"),
+        ("operand_markup_incomplete_b", "INTEGER DEFAULT 0"),
+    ):
         if fa_cols and _facol not in fa_cols:
-            conn.execute(f"ALTER TABLE function_alignment ADD COLUMN {_facol} TEXT")  # noqa: S608
+            conn.execute(f"ALTER TABLE function_alignment ADD COLUMN {_facol} {_fatype}")  # noqa: S608
     fp_cols = _column_names(conn, "function_presence")
     if fp_cols and "export_gap" not in fp_cols:
         conn.execute("ALTER TABLE function_presence ADD COLUMN export_gap TEXT")
+    if fp_cols and "operand_markup_incomplete" not in fp_cols:
+        conn.execute(
+            "ALTER TABLE function_presence ADD COLUMN operand_markup_incomplete INTEGER DEFAULT 0"
+        )
 
     # instruction_match.facts_a/b: the call-site facts at each side's matched address (JSON).
     # Nullable TEXT, no index references them; existing rows carry NULL. Idempotent.

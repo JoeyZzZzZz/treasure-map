@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.unit.lib.binexport_seed import stored_export
 from treasure_map.lib.analyze.ghidra_runner import adaptive_heap_mb
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.writer import begin_run
@@ -59,10 +60,8 @@ def _fake_preflight(tmp_path: Path):  # type: ignore[no-untyped-def]
     from treasure_map.lib.binary_id import BinaryRow
 
     def _pf(atlas, run_a_id, run_b_id, binary_name, *, config, force):  # type: ignore[no-untyped-def]
-        so_a = tmp_path / f"{binary_name}_a.so"
-        so_b = tmp_path / f"{binary_name}_b.so"
-        so_a.write_bytes(b"\x7fELF")
-        so_b.write_bytes(b"\x7fELF")
+        so_a = stored_export(tmp_path / "binexport", binary_name, "a")
+        so_b = stored_export(tmp_path / "binexport", binary_name, "b")
         # The stub mirrors what the real preflight now returns: the RESOLVED rows travel with
         # the result, so nothing downstream re-resolves the selector. A stub that omitted them
         # would let a signature change through unnoticed.
@@ -74,8 +73,8 @@ def _fake_preflight(tmp_path: Path):  # type: ignore[no-untyped-def]
             binary_b=binary_name,
             bin_a=row,
             bin_b=row,
-            so_a=so_a,
-            so_b=so_b,
+            export_a=so_a,
+            export_b=so_b,
             version_skew=False,
             warnings=(),
         )
@@ -130,10 +129,11 @@ def test_diff_heap_stays_conservative_pending_measurement() -> None:
 
 
 def test_compute_diff_signature_has_no_atlas_or_run_id() -> None:
-    # ★ MAJOR-1 defence: compute takes only Paths + config — no atlas connection, no run id — so it
-    # is safe to hand to a worker thread (the atlas is check_same_thread and written serially).
+    # ★ MAJOR-1 defence: compute takes only the two archived exports' locations + config — no
+    # atlas connection, no run id — so it is safe to hand to a worker thread (the atlas is
+    # check_same_thread and written serially).
     params = list(inspect.signature(compute_diff).parameters)
-    assert params == ["so_a", "so_b", "td", "config"]
+    assert params == ["export_a_src", "export_b_src", "td", "config"]
     assert not any("atlas" in p or "run" in p for p in params)
 
 
@@ -145,7 +145,7 @@ def test_compute_diff_runs_in_worker_without_touching_atlas(
     from concurrent.futures import ThreadPoolExecutor
 
     monkeypatch.setattr(
-        driver, "_run_binexport", lambda so, cfg, out, side, t: out / f"{side}.BinExport"
+        driver, "_obtain_export", lambda stored, out, side: out / f"{side}.BinExport"
     )
     monkeypatch.setattr(driver, "_run_bindiff", lambda ea, eb, out, t: out / "x.BinDiff")
     seen: dict[str, object] = {}
@@ -207,7 +207,7 @@ def test_full_diff_preflight_failure_skips_parallel(
     computed: list[str] = []
 
     def _compute(so_a, so_b, td, config):  # type: ignore[no-untyped-def]
-        computed.append(so_a.name)
+        computed.append(so_a.meta["name"])
         return driver.DiffArtifacts(so_a, so_b, td)
 
     monkeypatch.setattr(driver, "preflight", _pf)
@@ -259,7 +259,7 @@ def test_full_diff_one_failure_does_not_corrupt_others(
     monkeypatch.setattr(driver, "preflight", _fake_preflight(tmp_path))
 
     def _compute(so_a, so_b, td, config):  # type: ignore[no-untyped-def]
-        if "boom" in so_a.name:
+        if "boom" in so_a.meta["name"]:
             raise DiffToolchainError(
                 "BinExport subprocess failed (rc=1)", kind=driver.FAIL_BINEXPORT_CRASH
             )
@@ -297,7 +297,7 @@ def test_full_diff_retries_a_transient_compute_failure_in_run(
     calls = {"boom": 0}
 
     def _compute(so_a, so_b, td, config):  # type: ignore[no-untyped-def]
-        if "boom" in so_a.name:
+        if "boom" in so_a.meta["name"]:
             calls["boom"] += 1
             if calls["boom"] == 1:  # first attempt fails transiently; the retry succeeds
                 raise DiffToolchainError(
@@ -532,8 +532,11 @@ def test_a_sqlite_error_in_preflight_is_that_binarys_blind_spot(
 # ── diff-side memory budget is decoupled from the shared scan/init constant ─────────────
 
 
-def test_effective_diff_workers_uses_diff_per_jvm(monkeypatch: pytest.MonkeyPatch) -> None:
-    # ★ diff passes its OWN heavier per-JVM budget to the clamp, never the shared PER_JVM_MB.
+def test_effective_diff_workers_uses_diff_per_jvm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ★ diff passes its OWN per-compute budget (a BinDiff process: a diff runs no JVM) to the
+    # clamp, never the shared PER_JVM_MB.
     captured: dict[str, object] = {}
 
     def _fake_clamp(configured, *, per_jvm_mb=None, **kw):  # type: ignore[no-untyped-def]
@@ -547,8 +550,8 @@ def test_effective_diff_workers_uses_diff_per_jvm(monkeypatch: pytest.MonkeyPatc
         binary_short="x",
         bin_a=row,
         bin_b=row,
-        so_a=Path("/x"),
-        so_b=Path("/x"),
+        export_a=stored_export(tmp_path, "x", "a"),
+        export_b=stored_export(tmp_path, "x", "b"),
         version_skew=False,
         warnings=(),
         diff_id="d",
@@ -556,7 +559,7 @@ def test_effective_diff_workers_uses_diff_per_jvm(monkeypatch: pytest.MonkeyPatc
         prior_failed=False,
     )
     driver._effective_diff_workers(4, [rd])
-    assert captured["per_jvm_mb"] == driver._DIFF_PER_JVM_MB == 1600
+    assert captured["per_jvm_mb"] == driver._DIFF_PER_BINDIFF_MB == 1024
 
 
 def test_shared_per_jvm_stays_1024_so_scan_is_not_shrunk() -> None:
