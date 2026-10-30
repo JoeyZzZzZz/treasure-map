@@ -3168,7 +3168,7 @@ def make_tools(
         swapped."""
         conn = open_atlas(atlas_path)
         try:
-            out = _list_diffs(conn, run_a_id, run_b_id)
+            out = _list_diffs(conn, run_a_id, run_b_id, file_staleness=_file_staleness(conn))
             out.update(_reverse_hint(conn, run_a_id, run_b_id, ("run_a_id", "run_b_id")))
             return out
         finally:

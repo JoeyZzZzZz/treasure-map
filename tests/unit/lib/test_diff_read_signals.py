@@ -336,6 +336,43 @@ def test_an_aligned_count_delta_floats_and_a_proposed_one_lifts(
     assert noinv["significance"]["attention"] == 1 and noinv["lift_basis"] is None
 
 
+def test_a_swap_names_the_basis_before_a_count_delta(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When an entry has both a sink swap and a count delta, the swap is read first: an aligned
+    pair floats with basis sink_callee_swap, and an undetermined pair is lifted with lift_basis
+    sink_callee_swap.
+
+    MUTATION (verified RED, 1 failed each): test the counts before the swap in ``significance``
+    -> basis sink_candidate_counts -> RED; the same in ``_lift_basis`` -> RED."""
+    w = World(tmp_path)
+    rows: list[so.SinkOverlayRow] = []
+    for a, b, conf in (("00001000", "00002000", 0.97), ("00003000", "00004000", 0.5)):
+        w.pair(a, b, conf, 0.8)
+        w.fn("a", a, ["system", "popen"])
+        w.fn("b", b, ["system"])
+        for side, func, n in (("a", a, 2), ("b", b, 1)):
+            for i in range(n):
+                ref = _cmd(side, func, f"0x{0x10 + i * 4:x}")
+                w.inst(side, ref, "cmd", "system")
+                rows.append(
+                    _overlay_row(ref, None, "callsite", "cmd")
+                    if side == "a"
+                    else _overlay_row(None, ref, "callsite", "cmd")
+                )
+    w.commit()
+    _rows(monkeypatch, rows)
+    v = _view(w, sort_by="significance")["by_id"]
+    aligned, proposed = v[_pair_id("00001000", "00002000")], v[_pair_id("00003000", "00004000")]
+    for e, pairing in ((aligned, "aligned"), (proposed, "proposed")):
+        assert e["sink_callee_swap"]["pairing"] == pairing
+        assert e["sink_candidate_counts"]["pairing"] == pairing
+        assert e["sink_candidate_counts"]["delta"] == [{"sink": "system", "a": 2, "b": 1}]
+    assert aligned["significance"] == {"attention": 0, "basis": "sink_callee_swap"}
+    assert proposed["significance"]["attention"] == 1
+    assert proposed["lift_basis"] == "sink_callee_swap"
+
+
 def test_a_summary_carries_the_counts_lift_and_note_as_counts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -403,7 +440,7 @@ def test_an_aligned_similarity_one_pair_whose_text_differs_is_listed_as_s(tmp_pa
 
     MUTATION (verified RED, 1 failed each): list every unbucketed aligned pair as S (drop the
     differs test) -> the identical pair is listed -> RED; write "S" to ``e.bucket`` -> the basis
-    reads S -> RED."""
+    reads S -> RED; sink S to attention 2 -> RED."""
     w = _s_world(tmp_path)
     v = _view(w)
     assert S1 in v["by_id"] and S_ROW in v["by_id"] and IDENT not in v["by_id"]
@@ -412,6 +449,10 @@ def test_an_aligned_similarity_one_pair_whose_text_differs_is_listed_as_s(tmp_pa
             "S",
             "aligned_pseudocode_differs",
         )
+        assert v["by_id"][eid]["significance"] == {
+            "attention": 1,
+            "basis": "aligned_pseudocode_differs",
+        }
     assert v["counts"]["by_bucket"] == {"S": 2}
     assert v["not_listed"]["aligned_pseudocode_differs"] == {
         "count": 0,
@@ -549,6 +590,71 @@ def test_an_s_anchor_counts_as_checked_evidence(tmp_path: Path) -> None:
                 "checked": [cited["anchor_ref"].replace("00006000", "00007000")],
             },
         )
+
+
+def test_an_s_anchor_counts_as_checked_for_a_file_judgement(tmp_path: Path) -> None:
+    """A no_real_change on a non-binary file of the pair, written through the diff's id, may cite
+    an S entry's anchor in ``checked``: it resolves in that diff's current view.
+
+    MUTATION (verified RED, 1 failed): resolve such an anchor in ``built.entries`` (is_diff_anchor
+    with no precomputed lookups) -> refused as naming nothing -> RED."""
+    from tests.unit.lib.test_file_diff import _add_files
+
+    w = _s_world(tmp_path)
+    _add_files(w)
+    cited = _view(w)["by_id"][S1]["anchor_ref"]
+    try:
+        res = overlay.annotate_diff(
+            w.atlas,
+            anchor_ref="runA::runB#non_binary#etc/rc",
+            verdict="no_real_change",
+            rationale="r",
+            verdict_basis={"why_unchanged": "a comment", "checked": [cited]},
+            diff_id=DIFF,
+        )
+    except ConfigError as exc:
+        pytest.fail(f"the S anchor did not resolve for a file judgement: {exc}")
+    assert res.action == "inserted"
+
+
+def test_the_differs_set_is_kept_per_staleness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The differs set a reader with no readings of its own takes from the cache is kept apart per
+    the diff's source_stale: a pair whose text is the same and whose callee set differs reads
+    differs (S) while the diff is current, and not once it is stale (its callee set is
+    undetermined) — the stale reader is never served the current answer.
+
+    MUTATION (verified RED, 1 failed): leave source_stale out of the differs cache key -> the
+    stale read is served the current set -> RED."""
+    stale = {"v": False}
+    monkeypatch.setattr(
+        pv,
+        "diff_source_staleness",
+        lambda atlas, diff_id: {
+            "source_stale": stale["v"],
+            "source_stale_reason": "diff_logic_changed" if stale["v"] else None,
+            "toolchain_checked": True,
+        },
+    )
+    w = World(tmp_path)
+    w.pair("00001000", "00002000", 0.97, 1.0)
+    w.fn("a", "00001000", ["foo"], pseudocode="x = foo(1);")
+    w.fn("b", "00002000", ["bar"], pseudocode="x = foo(1);")
+    w.pair("00003000", "00004000", 0.97, 1.0)
+    w.fn("a", "00003000", ["foo"], pseudocode="x = foo(1);")
+    w.fn("b", "00004000", ["foo"], pseudocode="x = foo(2);")
+    w.commit()
+    callees, text = _pair_id("00001000", "00002000"), _pair_id("00003000", "00004000")
+
+    def s_ids() -> frozenset[str]:
+        built = pv.build_diff_view(w.atlas, DIFF)
+        assert built is not None
+        return pv.listed_view(w.atlas, built).s_ids
+
+    assert s_ids() == {callees, text}
+    stale["v"] = True
+    assert s_ids() == {text}
 
 
 def test_a_rehunt_moves_pairs_between_s_and_b_and_every_pair_is_counted_once(
@@ -724,7 +830,8 @@ def test_a_recomputed_overlay_is_computed_once_per_inputs(
     call-site facts, a re-hunt (the run's stamp or its instance rows) — computes it again.
 
     MUTATION (verified RED, 1 failed each): drop created_at from the key -> RED; drop
-    callsite_facts_hash_a -> RED; drop the instance stamp -> RED; drop the cache -> RED."""
+    callsite_facts_hash_a -> RED; drop hunt_inputs_hash_b -> RED; drop the diff code version ->
+    RED; drop the instance stamp -> RED; drop the cache -> RED."""
     w = _s_world(tmp_path)
     calls: list[str] = []
     real = pv.compute_sink_overlay
@@ -742,6 +849,9 @@ def test_a_recomputed_overlay_is_computed_once_per_inputs(
     for change in (
         "UPDATE diff_meta SET created_at = '2099-01-01 00:00:00'",
         "UPDATE diff_meta SET callsite_facts_hash_a = 'moved'",
+        "UPDATE diff_meta SET callsite_facts_hash_b = 'moved'",
+        "UPDATE diff_meta SET hunt_inputs_hash_a = 'moved'",
+        "UPDATE diff_meta SET hunt_inputs_hash_b = 'moved'",
         "UPDATE run SET updated_at = 'rehunt-1' WHERE run_id = 'runB'",
     ):
         before = len(calls)
@@ -753,5 +863,9 @@ def test_a_recomputed_overlay_is_computed_once_per_inputs(
     before = len(calls)
     w.inst("b", _cmd("b", "00002000", "0x40"), "cmd", "system")
     w.commit()
+    pv.get_diff_patch_view(w.atlas, DIFF, limit=1)
+    assert len(calls) == before + 1
+    before = len(calls)
+    monkeypatch.setattr(pv, "diff_code_version", lambda: "src-newer")  # newer diff code
     pv.get_diff_patch_view(w.atlas, DIFF, limit=1)
     assert len(calls) == before + 1

@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -906,11 +906,14 @@ def list_diffs(
     atlas: sqlite3.Connection,
     run_a_id: str | None = None,
     run_b_id: str | None = None,
+    *,
+    file_staleness: Callable[[str, str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Every binary diffed between two runs, with each one's change profile AND its diff status —
     the browse view after a full diff. Optionally filter to a run-pair. Read-only; counts tri-state
     projections, never a verdict or a ranking (a diff is a map, not a score). diff_ok/diff_status
-    ride each row so a failed (un-diffed) binary is visible, never mistaken for 'no change'."""
+    ride each row so a failed (un-diffed) binary is visible, never mistaken for 'no change'.
+    ``file_staleness`` is passed on to run_pair_coverage."""
     where: list[str] = []
     params: list[Any] = []
     if run_a_id is not None:
@@ -979,12 +982,19 @@ def list_diffs(
         "note": _LIST_DIFFS_NOTE,
     }
     if run_a_id is not None and run_b_id is not None:
-        result["coverage"] = run_pair_coverage(atlas, run_a_id, run_b_id, diffs)
+        result["coverage"] = run_pair_coverage(
+            atlas, run_a_id, run_b_id, diffs, file_staleness=file_staleness
+        )
     return result
 
 
 def run_pair_coverage(
-    atlas: sqlite3.Connection, run_a: str, run_b: str, diffs: list[dict[str, Any]]
+    atlas: sqlite3.Connection,
+    run_a: str,
+    run_b: str,
+    diffs: list[dict[str, Any]],
+    *,
+    file_staleness: Callable[[str, str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """What the diffs of one run pair cannot see, beside their counts: the diffs that failed, and
     the candidate-holding binaries no diff covers — the genuine blind spots (one side only, or
@@ -994,7 +1004,9 @@ def run_pair_coverage(
     binary, file or symlink like them), taken out of the blind spots as subjects of their own.
     ``all_candidate_binaries_covered`` is false while a failed diff, a genuine blind spot or a
     binary_presence binary remains (none of those has a diff to cover it); an identical binary
-    never makes it false."""
+    never makes it false. Each binary_presence ``review_state`` reads its judgement against
+    ``file_staleness(run_a, run_b)`` — the same reading list_overlays gives the pair — and, when
+    none is given, as needs_recheck (the two runs unread)."""
     from treasure_map.lib.query import binary_presence as bp
 
     groups = not_diffed_groups(atlas, run_a, run_b)
@@ -1002,7 +1014,13 @@ def run_pair_coverage(
     blind, identical = split_not_diffed(
         not_diffed_binaries(atlas, run_a, run_b, exclude=presence.excluded, groups=groups)
     )
-    judged = bp.presence_review(atlas, presence, source_stale=None, source_stale_reason=None)
+    staleness = file_staleness(run_a, run_b) if file_staleness is not None else {}
+    judged = bp.presence_review(
+        atlas,
+        presence,
+        source_stale=staleness.get("source_stale"),
+        source_stale_reason=staleness.get("source_stale_reason"),
+    )
     failed = [d["diff_id"] for d in diffs if not d["diff_ok"]]
     return {
         "failed_diffs": failed,

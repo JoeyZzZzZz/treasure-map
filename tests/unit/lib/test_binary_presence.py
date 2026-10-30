@@ -142,9 +142,10 @@ class World:
 def _build(w: World) -> None:
     """A: app.cgi alone (two candidates: cmd, copy); three that the other run holds something like
     (a file, a symlink, a binary of the same name elsewhere); two binaries named dup at two paths.
-    B: qctl alone, called by a script A does not have; libqctl.so alone, which "qctl" must not
-    match; tool1 / tool2 / tool3 alone, each called by a script whose state on A differs; app2.cgi
-    alone, named by a web endpoint with a query."""
+    B: qctl alone, called by a script A does not have (which also calls qctl-helper, a command
+    qctl must not match); libqctl.so alone, which "qctl" must not match; tool1 / tool2 / tool3
+    alone, each called by a script whose state on A differs; app2.cgi alone, named by a web
+    endpoint with a query (and a page naming app2.cgi.bak, which it must not match)."""
     w.binary("a", "web/app/app.cgi", _sha("3"))
     w.cand("a", "web/app/app.cgi", _sha("3"), "cmd")
     w.cand("a", "web/app/app.cgi", _sha("3"), "copy")
@@ -169,6 +170,7 @@ def _build(w: World) -> None:
         w.cand("b", rel, _sha(sha))
     info = w.file("b", "usr/sbin/info.sh", "51" * 32)
     w.call("b", info, "qctl", 360)
+    w.call("b", info, "/usr/sbin/qctl-helper", 361)
     same = w.file("b", "etc/init.sh", "52" * 32)
     w.call("b", same, "/usr/bin/tool1", 7)
     w.file("a", "etc/init.sh", "52" * 32)  # the same content on A
@@ -181,6 +183,7 @@ def _build(w: World) -> None:
     w.file("a", "etc/other.sh", "56" * 32)  # A holds the file, records nothing of it
     page = w.file("b", "www/index.html", "57" * 32, "web_asset")
     w.endpoint("b", page, "/cgi-bin/app2.cgi?cur_time=")
+    w.endpoint("b", page, "/cgi-bin/app2.cgi.bak")
     w.commit()
 
 
@@ -297,6 +300,27 @@ def test_an_unread_other_run_keeps_every_binary_a_blind_spot(
     assert _presence(world).items == []
 
 
+def test_a_counterpart_by_content_or_by_path_alone_keeps_a_blind_spot(world: World) -> None:
+    """Each criterion keeps a binary a blind spot on its own: the other run holds a binary of the
+    same content under another name and path (holding no candidate, so the pair does not read it
+    identical), or a binary at the same path recorded under another name.
+
+    MUTATION (verified RED, 1 failed each): drop the content-hash criterion -> oldname moves to
+    binary_presence -> RED; drop the path criterion -> relabel moves -> RED."""
+    moved, kept = "e1" * 32, "e2" * 32
+    world.binary("a", "bin/oldname", moved)
+    world.cand("a", "bin/oldname", moved)
+    world.binary("b", "usr/libexec/newname", moved)  # same content, no candidate on B
+    world.binary("a", "sbin/relabel", kept)
+    world.cand("a", "sbin/relabel", kept)
+    world.binary("b", "sbin/relabel", "e3" * 32, name="relabel.real")  # same path, other name
+    world.commit()
+    rels = {rel for _tag, rel in _by_rel(_presence(world))}
+    assert not {"bin/oldname", "sbin/relabel"} & rels
+    blind, _same = da.split_not_diffed(da.not_diffed_binaries(world.atlas, "runA", "runB"))
+    assert {"oldname", "relabel"} <= set(blind["a"]["binary_not_diffed"]["names"])
+
+
 def test_a_binary_whose_path_is_not_under_its_root_stays_a_blind_spot(world: World) -> None:
     """A binary recorded outside its own run's firmware root cannot be placed: blind spot."""
     world.atlas.execute("UPDATE run SET firmware_path = '/elsewhere/root' WHERE run_id = 'runA'")
@@ -314,9 +338,11 @@ def test_each_reference_carries_its_state_on_the_other_run(world: World) -> None
     file_absent (no such file). A command with a path matches by its basename; a web endpoint by
     its path's last segment, query left off.
 
-    MUTATION (verified RED, 1 failed each): match by substring -> libqctl.so is named by the
-    qctl call -> RED; read a file with no records as not_recorded -> RED; keep the endpoint's query
-    in its last segment -> app2.cgi has no reference -> RED."""
+    MUTATION (verified RED, 1 failed each): match a command by substring, either way round ->
+    libqctl.so is named by the qctl call, or qctl by the qctl-helper call -> RED; match an
+    endpoint by substring -> app2.cgi is named by app2.cgi.bak too -> RED; read a file with no
+    records as not_recorded -> RED; keep the endpoint's query in its last segment -> app2.cgi has
+    no reference -> RED."""
     by = _by_rel(_presence(world))
     assert by[("b_only", "bin/qctl")].referenced_by == [
         {
@@ -543,6 +569,59 @@ def test_a_moved_basis_or_a_stale_run_reads_needs_recheck(world: World) -> None:
     moved = row()
     assert moved["review_state"] == "needs_recheck"
     assert set(moved["basis_moved"]) == {"candidates", "candidates_by_sink_class"}
+
+
+def test_a_reference_added_moves_the_basis(world: World) -> None:
+    """The recorded references are part of the basis: a new call to the binary moves a judgement
+    on it to needs_recheck, naming referenced_by and nothing else.
+
+    MUTATION (verified RED, 1 failed): leave referenced_by out of the basis -> unchanged -> RED."""
+    qctl = _anchor("b_only", "bin/qctl")
+    overlay.annotate_diff(
+        world.atlas, anchor_ref=qctl, verdict="changed_real", rationale="x", run_pair=PAIR
+    )
+
+    def row() -> dict[str, Any]:
+        out = overlay.list_overlays(
+            world.atlas, anchor_kind="diff_subject", run_id=PAIR, file_staleness=_fresh_files
+        )
+        return next(r for r in out["overlays"] if r["anchor_ref"] == qctl)
+
+    assert row()["review_state"] == "concluded"
+    boot = world.file("b", "etc/boot.sh", "58" * 32)
+    world.call("b", boot, "qctl", 9)
+    world.commit()
+    moved = row()
+    assert moved["review_state"] == "needs_recheck"
+    assert set(moved["basis_moved"]) == {"referenced_by"}
+
+
+def test_list_diffs_and_list_overlays_read_one_state_for_a_judgement(world: World) -> None:
+    """★ One binary_presence judgement reads the same review state on list_diffs' coverage as on
+    list_overlays (both MCP, the overlays listed without a run): concluded while both runs are
+    current, needs_recheck on both once either run is a stale scan.
+
+    MUTATION (verified RED, 1 failed): coverage passes no staleness reading (both runs unread) ->
+    list_diffs reads needs_recheck beside list_overlays' concluded -> RED."""
+    app = _anchor("a_only", "web/app/app.cgi")
+    overlay.annotate_diff(
+        world.atlas, anchor_ref=app, verdict="changed_real", rationale="x", run_pair=PAIR
+    )
+    world.commit()
+
+    def states() -> tuple[str, str]:
+        tools = mcp_app.make_tools(world.path)
+        cov = tools["list_diffs"](run_a_id="runA", run_b_id="runB")["coverage"]
+        (in_cov,) = [b for b in cov["binary_presence"]["a_only"] if b["anchor_ref"] == app]
+        # no run_id: list_overlays scoped to a pair with a stale run refuses outright
+        rows = tools["list_overlays"](anchor_kind="diff_subject")["overlays"]
+        (in_ov,) = [r for r in rows if r["anchor_ref"] == app]
+        return in_cov["review_state"], in_ov["review_state"]
+
+    assert states() == ("concluded", "concluded")
+    world.atlas.execute("UPDATE run SET build_hash = '0000staleaaaa000' WHERE run_id = 'runB'")
+    world.commit()
+    assert states() == ("needs_recheck", "needs_recheck")
 
 
 def test_checked_cites_its_own_anchor_or_its_own_candidates(world: World) -> None:
