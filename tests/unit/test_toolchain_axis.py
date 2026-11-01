@@ -53,6 +53,44 @@ def test_a_run_scanned_by_another_ghidra_is_refused(
     assert (st.axis == "toolchain") is stale
 
 
+@pytest.mark.parametrize(
+    ("stored", "installed", "caveat"),
+    [
+        ("11.4.3", "11.4.3", False),
+        ("unknown", "11.4.3", True),  # two Ghidras extracted the run's binaries
+        (None, "11.4.3", True),  # recorded before versions were
+        ("11.4.3", None, True),  # no Ghidra readable here
+        ("11.4.3", "unknown", True),
+    ],
+)
+def test_a_ghidra_version_that_cannot_be_compared_is_a_caveat(
+    monkeypatch: pytest.MonkeyPatch, stored: str | None, installed: str | None, caveat: bool
+) -> None:
+    """Every other axis matches: an unconfirmable Ghidra version is served (never refused) but
+    said, so "not stale" is never read as "current"; two equal versions are the only "all match".
+
+    MUTATION (verified RED): leave the Ghidra version out of the caveats -> "all match" -> RED;
+    drop the unknown check -> the 'unknown' rows RED; drop the missing check -> the None rows
+    RED."""
+    monkeypatch.setattr(toolchain, "_current_ghidra", [installed])
+    cur = rescan_version.current_code_stamp(Config())
+    run = RunRow(
+        run_id="r",
+        build_hash="B",
+        ghidra_version=stored,
+        hunt_code_version=cur.hunt,
+        scan_stamp=cur.scan,
+    )
+    st = run_staleness(run, build_hash="B", current=cur, commit="c")
+    assert st.stale is False
+    if caveat:
+        assert st.detail.startswith("could not compare Ghidra version for this run"), st.detail
+        assert "tmap" in st.remedy
+    else:
+        assert "all match" in st.detail and "Ghidra version" in st.detail
+        assert st.remedy == ""
+
+
 def test_an_export_script_change_never_refuses_a_run(monkeypatch: pytest.MonkeyPatch) -> None:
     """P-1=A: run_staleness reads no export: a run whose exports another export script made is
     served — only its binaries are re-scanned for their export."""

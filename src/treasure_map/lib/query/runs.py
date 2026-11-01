@@ -188,7 +188,10 @@ def _remedy_for(run: RunRow) -> str:
 
 
 def _installed_ghidra() -> str | None:
-    """The installed Ghidra's version (lib/diff/toolchain, read once per process), or None."""
+    """The installed Ghidra's version (lib/diff/toolchain, read once per process), or None.
+
+    The Ghidra of the DEFAULT config: a run scanned with another config's Ghidra is compared
+    against this one, not against its own."""
     from treasure_map.lib.diff.toolchain import current_ghidra_version
 
     return current_ghidra_version()
@@ -289,6 +292,13 @@ def run_staleness(
         cmp = rescan_version.compare_scan_stamps(run.scan_stamp, current.scan)
         if cmp.unknown:
             unknowns.append(f"scan stamp ({', '.join(cmp.unknown)})")
+    # The toolchain axis refuses only on two known, differing versions; anything less (a run whose
+    # binaries two Ghidras extracted, one recorded before versions were, or no Ghidra readable
+    # here) is unconfirmable and said so, like every other axis.
+    if UNKNOWN_VERSION in (run.ghidra_version, local_ghidra) or not (
+        run.ghidra_version and local_ghidra
+    ):
+        unknowns.append("Ghidra version")
     if unknowns:
         return Staleness(
             False,
@@ -297,7 +307,12 @@ def run_staleness(
             "which is not the same as shown to be current.",
             _remedy_for(run),
         )
-    return Staleness(False, None, "extraction hash and code stamps all match the running tmap.", "")
+    return Staleness(
+        False,
+        None,
+        "extraction hash, Ghidra version and code stamps all match the running tmap.",
+        "",
+    )
 
 
 # The failure reasons a Ghidra attempt records after it actually RAN: the attempt's fingerprint is

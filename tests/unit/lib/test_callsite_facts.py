@@ -408,6 +408,11 @@ def _run_diff(atlas: sqlite3.Connection, tmp_path: Path, monkeypatch, exports: b
     # running ones, so both runs are confirmed current
     monkeypatch.setattr(driver, "_current_pass_version", lambda: "pv1")
     monkeypatch.setattr(driver, "_installed_commit", lambda: "facefeed")
+    # ... and scanned by the installed Ghidra, so that axis is confirmed too
+    from treasure_map.lib.diff import toolchain
+
+    monkeypatch.setattr(toolchain, "_current_ghidra", ["11.4.3"])
+    atlas.execute("UPDATE run SET ghidra_version = '11.4.3'")
     monkeypatch.setattr(
         driver, "_obtain_export", lambda stored, out, side: tmp_path / f"{side}.BinExport"
     )

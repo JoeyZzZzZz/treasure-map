@@ -1071,9 +1071,10 @@ def test_a_confirmed_current_pair_diffs_without_warnings(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     w = _two(tmp_path, hunt_commit=_COMMIT)
-    w.atlas.execute("UPDATE run SET build_hash = ?", (_PV,))
+    w.atlas.execute("UPDATE run SET build_hash = ?, ghidra_version = '11.4.3'", (_PV,))
     w.atlas.commit()
     _stub(monkeypatch, w)
+    monkeypatch.setattr(toolchain, "_current_ghidra", ["11.4.3"])
     fs = _full(w)
     assert [o.error for o in fs.outcomes] == [None] and fs.warnings == ()
 
@@ -1093,6 +1094,7 @@ def _runrow(**over: object) -> RunRow:
         "analysis_db_path": "/x/analysis.db",
         "firmware_path": "/fw",
         "build_hash": _PV,
+        "ghidra_version": "11.4.3",
     }
     base.update(over)
     return RunRow(**base)  # type: ignore[arg-type]
@@ -1114,6 +1116,7 @@ def test_pair_currency_reads_the_code_stamp_not_the_commit(
     monkeypatch.setattr(driver, "_current_pass_version", lambda: _PV)
     monkeypatch.setattr(driver, "_installed_commit", lambda: "running0commit")
     monkeypatch.setattr(driver, "_analysis_build_hash", lambda _path: _PV)
+    monkeypatch.setattr(toolchain, "_current_ghidra", ["11.4.3"])
     monkeypatch.setattr(
         driver.rescan_version,
         "current_code_stamp",
